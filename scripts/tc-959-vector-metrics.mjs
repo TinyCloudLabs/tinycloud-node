@@ -17,9 +17,9 @@ function parseLabels(serialized) {
   return labels;
 }
 
-export function parseGelfReceivedCounter(metrics) {
+export function parseGelfReceivedSample(metrics) {
   for (const line of metrics.split(/\r?\n/)) {
-    const sample = line.match(/^vector_component_received_events_total\{([^}]*)\}\s+(\d+)(?:\s+\d+)?\s*$/);
+    const sample = line.match(/^vector_component_received_events_total\{([^}]*)\}\s+(\d+)\s+(\d+)\s*$/);
     if (!sample) continue;
     const labels = parseLabels(sample[1]);
     if (!labels) continue;
@@ -27,9 +27,14 @@ export function parseGelfReceivedCounter(metrics) {
     if (names.length !== expectedLabels.length || names.some((name, index) => name !== expectedLabels[index])) continue;
     if (labels.component_id !== "gelf_in" || labels.component_kind !== "source" || labels.component_type !== "socket" || labels.mode !== "udp" || labels.host.length === 0) continue;
     const value = Number(sample[2]);
-    if (Number.isSafeInteger(value)) return value;
+    const timestamp = Number(sample[3]);
+    if (Number.isSafeInteger(value) && Number.isSafeInteger(timestamp)) return { value, timestamp };
   }
   return null;
+}
+
+export function parseGelfReceivedCounter(metrics) {
+  return parseGelfReceivedSample(metrics)?.value ?? null;
 }
 
 function parsedEvents(logs) {
@@ -60,11 +65,13 @@ if (fileURLToPath(import.meta.url) === process.argv[1]) {
   if (operation === "received-counter") {
     const value = parseGelfReceivedCounter(input);
     process.stdout.write(value === null ? "missing" : String(value));
+  } else if (operation === "received-sample") {
+    process.stdout.write(sample === null ? "missing" : `${sample.value} ${sample.timestamp}`);
   } else if (operation === "shipped-count") {
     process.stdout.write(String(countShippedEvents(input)));
   } else if (operation === "event-count" && event) {
     process.stdout.write(String(countShippedEvent(input, event)));
   } else {
-    throw new Error("usage: tc-959-vector-metrics.mjs received-counter|shipped-count|event-count EVENT");
+    throw new Error("usage: tc-959-vector-metrics.mjs received-counter|received-sample|shipped-count|event-count EVENT");
   }
 }

@@ -283,7 +283,7 @@ function isComposeMapping(value) {
 export function checkComposeDeploymentPackaging(compose) {
   let definition;
   try {
-    definition = parse(compose);
+    definition = parse(compose, { merge: true });
   } catch (error) {
     throw new Error("Compose packaging must be valid YAML", { cause: error });
   }

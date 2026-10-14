@@ -131,6 +131,30 @@ test("rejects flow-style relative long bind sources", () => {
     /relative bind sources/,
   );
 });
+test("rejects aliased service env_file values", () => {
+  const compose = `x-review-env: &review-env ./.review.env\n${minimalCompose}  probe:\n    env_file: *review-env\n`;
+  assert.throws(() => checkComposeDeploymentPackaging(compose), /env_file/);
+});
+test("rejects merged service env_file values", () => {
+  const compose = `x-review-service: &review-service\n  env_file: ./.review.env\n${minimalCompose}  probe:\n    <<: *review-service\n`;
+  assert.throws(() => checkComposeDeploymentPackaging(compose), /env_file/);
+});
+test("rejects aliased configs.file values", () => {
+  const compose = `x-review-config: &review-config {file: ./outside.yaml}\n${minimalCompose}\nconfigs:\n  review: *review-config\n`;
+  assert.throws(() => checkComposeDeploymentPackaging(compose), /configs\.\*\.file/);
+});
+test("rejects merged configs.file values", () => {
+  const compose = `x-review-config: &review-config {file: ./outside.yaml}\n${minimalCompose}\nconfigs:\n  review:\n    <<: *review-config\n`;
+  assert.throws(() => checkComposeDeploymentPackaging(compose), /configs\.\*\.file/);
+});
+test("rejects aliased relative short bind sources", () => {
+  const compose = `x-review-volume: &review-volume ./relative:/etc/review.yaml:ro\n${minimalCompose}    volumes:\n      - *review-volume\n`;
+  assert.throws(() => checkComposeDeploymentPackaging(compose), /relative bind sources/);
+});
+test("rejects merged relative long bind sources", () => {
+  const compose = `x-review-volume: &review-volume {type: bind, source: ./relative, target: /etc/review.yaml}\n${minimalCompose}    volumes:\n      - <<: *review-volume\n`;
+  assert.throws(() => checkComposeDeploymentPackaging(compose), /relative bind sources/);
+});
 test("accepts canonical Compose packaging", () => {
   assert.doesNotThrow(() => checkComposeDeploymentPackaging(compose));
 });

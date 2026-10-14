@@ -23,6 +23,8 @@ NODE_ID=""
 PG_ID=""
 STARTED=0
 SAMPLER_PID=""
+METRICS_SCRAPE_INTERVAL_SECONDS=1
+ISOLATION_SETTLE_SECONDS=2
 SAMPLER_STOP="$WORK/sample-memory"
 
 record() { printf '%s\n' "$*" | tee -a "$REPORT"; }
@@ -94,7 +96,7 @@ fs.writeFileSync(targetPath, config, { mode: 0o600 });
 NODE
 node "$ROOT/scripts/node-vector-schema.mjs" --check || fail "generated schema check failed"
 node "$ROOT/scripts/node-vector-schema.mjs" --check-compose || fail "embedded Compose parity failed"
-node --test "$ROOT/scripts/node-vector-schema.test.mjs" || fail "schema/packaging tests failed"
+node --test "$ROOT/scripts/node-vector-schema.test.mjs" "$ROOT/scripts/tc-959-vector-metrics.test.mjs" || fail "schema, packaging, and metrics tests failed"
 "$VECTOR_BIN" validate --no-environment "$NATIVE_VECTOR_CONFIG" || fail "native Vector validation failed"
 "$VECTOR_BIN" test "$NATIVE_VECTOR_CONFIG" "$ROOT/log-shipper/vector.tests.yaml" || fail "native Vector tests failed"
 record "PASS: native checks used only a disposable dummy token fixture before any Docker operation"
@@ -121,7 +123,7 @@ const [sourcePath, targetPath] = process.argv.slice(2);
 let config = fs.readFileSync(sourcePath, 'utf8');
 const sinkAt = config.lastIndexOf('\nsinks:\n');
 if (sinkAt < 0) throw new Error('canonical sink block not found');
-const metricSource = '  internal_metrics:\n    type: internal_metrics\n';
+const metricSource = '  internal_metrics:\n    type: internal_metrics\n    scrape_interval_secs: 1\n';
 if (!config.includes('\ntransforms:\n')) throw new Error('canonical transforms block not found');
 config = config.replace('\ntransforms:\n', `\n${metricSource}transforms:\n`);
 const updatedSinkAt = config.lastIndexOf('\nsinks:\n');
@@ -171,28 +173,32 @@ services:
       - "host.docker.internal:host-gateway"
   dstack-ingress:
     image: alpine:3.21
-    entrypoint: ["/bin/sh", "-ec"]
-    command: |
-      emit() { printf '%s\n' '{"time":"2026-10-14T10:00:00+00:00","method":"GET","route":"/info","protocol":"HTTP/1.1","status":200,"bytes":32,"request_time":1.25,"upstream_status":"200"}; }
-      while :; do
-        if [ -f /control/burst ]; then
-          count=\$\$(cat /control/burst)
-          rm -f /control/burst
-          i=0
-          while [ "\$\$i" -lt "\$\$count" ]; do emit; i=\$\$((i + 1)); done
-          touch /control/burst-done
-        elif [ -f /control/pulse ]; then
-          rm -f /control/pulse
-          emit
-        fi
-        sleep 0.05
-      done
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        emit() { printf '%s\n' '{"time":"2026-10-14T10:00:00+00:00","method":"GET","route":"/info","protocol":"HTTP/1.1","status":200,"bytes":32,"request_time":1.25,"upstream_status":"200"}'; }
+        while :; do
+          if [ -f /control/burst ]; then
+            count=\$\$(cat /control/burst)
+            rm -f /control/burst
+            i=0
+            while [ "\$\$i" -lt "\$\$count" ]; do emit; i=\$\$((i + 1)); done
+            touch /control/burst-done
+          elif [ -f /control/pulse ]; then
+            rm -f /control/pulse
+            emit
+          fi
+          sleep 0.05
+        done
     volumes: !override
       - "$CONTROL:/control"
     ports: !override []
   vector:
-    entrypoint: ["/bin/sh", "-ec"]
-    command: "mkdir -p /var/lib/vector/secrets && printf '%s\\n' tc959-dummy-token-only > /var/lib/vector/secrets/bs_token && chmod 0644 /var/lib/vector/secrets/bs_token && exec vector --config /etc/vector/acceptance.yaml"
+    command:
+      - /bin/sh
+      - -ec
+      - mkdir -p /var/lib/vector/secrets && printf '%s\\n' tc959-dummy-token-only > /var/lib/vector/secrets/bs_token && chmod 0644 /var/lib/vector/secrets/bs_token && exec vector --config /etc/vector/acceptance.yaml
     volumes:
       - "$VECTOR_TEST_CONFIG:/etc/vector/acceptance.yaml:ro"
     ports:
@@ -214,40 +220,41 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
-  app-net-probe:
-    image: alpine:3.21
-    network_mode: "service:tinycloud"
-    depends_on:
-      - tinycloud
-    command: ["/bin/sh", "-ec", "while :; do sleep 3600; done"]
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
 EOF
-node - "$OVERRIDE" <<'NODE'
+node - "$OVERRIDE" "$ROOT" <<'NODE'
 const fs = require('node:fs');
-const override = fs.readFileSync(process.argv[2], 'utf8');
+const { spawnSync } = require('node:child_process');
+const { createRequire } = require('node:module');
+const requireFromRoot = createRequire(`${process.argv[3]}/package.json`);
+const { parse } = requireFromRoot('yaml');
+const path = process.argv[2];
+const text = fs.readFileSync(path, 'utf8');
+const compose = parse(text.replaceAll('!override', ''));
+for (const service of ['dstack-ingress', 'vector']) {
+  const argv = compose.services?.[service]?.command;
+  if (!Array.isArray(argv) || argv.length !== 3 || argv[0] !== '/bin/sh' || argv[1] !== '-ec' || typeof argv[2] !== 'string') {
+    throw new Error(`${service} rendered Compose argv must be [/bin/sh, -ec, script]`);
+  }
+  const renderedArgv = argv.map((argument) => argument.replaceAll('$$', '$'));
+  if (renderedArgv[0] !== '/bin/sh' || renderedArgv[1] !== '-ec') throw new Error(`${service} rendered argv changed`);
+  const syntax = spawnSync('sh', ['-n'], { input: renderedArgv[2], encoding: 'utf8' });
+  if (syntax.status !== 0) throw new Error(`${service} generated shell is invalid: ${syntax.stderr}`);
+}
+const ingress = compose.services['dstack-ingress'].command[2];
 for (const fragment of [
   'count=$$(cat /control/burst)',
   'while [ "$$i" -lt "$$count" ]',
   'i=$$((i + 1))',
 ]) {
-  if (!override.includes(fragment)) throw new Error(`rendered producer command lost Compose escaping: ${fragment}`);
+  if (!ingress.includes(fragment)) throw new Error(`rendered producer command lost Compose escaping: ${fragment}`);
 }
 NODE
-
 if [[ "$DRY_RUN" == 1 ]]; then
   record "DRY-RUN: no Docker command invoked"
-  record "DRY-RUN: start local Postgres, test-only Static-key/TEE-Off node, labelled ingress producer, isolated Vector and network probes"
-  record "DRY-RUN: 5x restart, 5x SIGKILL/restart-policy recovery, 5x Vector recreate; each next labelled line <=20s and no duplicate output"
-  record "DRY-RUN: 3x Vector-down 500-line bursts; recover and verify next labelled line <=20s"
-  record "DRY-RUN: app restart count unchanged; /version responds 10/10 while Vector is stopped"
-  record "DRY-RUN: positive host-loopback and logship-control-container probes require source +1 and shipped +1"
-  record "DRY-RUN: node/ingress/Postgres sibling and host external-interface probes require source +0 and shipped +0, using parsed Prometheus values"
+  record "DRY-RUN: acceptance self-test expects an allowed host-loopback packet to make the negative check fail"
+  record "DRY-RUN: positive host-loopback and logship-control-container probes require fresh source +1 and shipped +1"
+  record "DRY-RUN: node/ingress/Postgres sibling and host external-interface probes require two newer stable source samples and shipped +0"
+  record "DRY-RUN: metric freshness internal_metrics=${METRICS_SCRAPE_INTERVAL_SECONDS}s; isolation settle=${ISOLATION_SETTLE_SECONDS}s"
   record "DRY-RUN: sample Vector peak RSS; 5,000-line delivery-loss percentage is informational"
   record "DRY-RUN: actual Docker, network and memory checks NOT run"
   exit 0
@@ -257,11 +264,12 @@ require docker
 require curl
 require ip
 docker compose version >/dev/null || fail "Docker Compose v2 is required"
-record "Preflight: no DockerRootDir assumption; this GELF topology has no host Docker-directory access."
+record "Preflight: no DockerRootDir assumption; no host Docker-directory access."
+record "Metrics freshness: internal_metrics scrape interval=${METRICS_SCRAPE_INTERVAL_SECONDS}s; isolation settle=${ISOLATION_SETTLE_SECONDS}s; require two strictly newer timestamps with stable source value."
 
 # Continue below only on an explicitly Docker-authorized acceptance host.
 STARTED=1
-compose_cmd up -d --wait postgres tinycloud dstack-ingress vector app-net-probe
+compose_cmd up -d --wait postgres tinycloud dstack-ingress vector
 touch "$SAMPLER_STOP"
 memory_sampler &
 SAMPLER_PID=$!
@@ -275,16 +283,34 @@ wait_vector() {
   done
   fail "Vector did not become running within 20 seconds"
 }
-wait_node() {
-  local deadline=$((SECONDS + 30))
-  while (( SECONDS < deadline )); do
-    if curl --fail --silent --max-time 2 http://127.0.0.1:18000/version >/dev/null; then return 0; fi
-    sleep 0.5
-  done
-  fail "node did not serve /version within 30 seconds"
-}
 read_metric() {
   curl --fail --silent http://127.0.0.1:9598/metrics | node "$ROOT/scripts/tc-959-vector-metrics.mjs" received-counter
+}
+read_metric_sample() {
+  curl --fail --silent http://127.0.0.1:9598/metrics | node "$ROOT/scripts/tc-959-vector-metrics.mjs" received-sample
+}
+metric_now_ms() { node -p 'Date.now()'; }
+wait_fresh_stable_metric() {
+  local after_ms=$1 deadline=$((SECONDS + 20)) settle_until=$((after_ms + ISOLATION_SETTLE_SECONDS * 1000))
+  local sample value timestamp previous_timestamp=-1 previous_value=-1 now
+  while (( SECONDS < deadline )); do
+    sample=$(read_metric_sample)
+    if [[ "$sample" =~ ^([0-9]+)[[:space:]]([0-9]+)$ ]]; then
+      value=${BASH_REMATCH[1]}
+      timestamp=${BASH_REMATCH[2]}
+      if (( timestamp > after_ms && timestamp > previous_timestamp )); then
+        now=$(metric_now_ms)
+        if (( value == previous_value && now >= settle_until )); then
+          printf '%s\n' "$value"
+          return 0
+        fi
+        previous_value=$value
+        previous_timestamp=$timestamp
+      fi
+    fi
+    sleep 0.2
+  done
+  fail "Vector source metric did not produce two fresh, stable samples after timestamp $after_ms"
 }
 wait_metric() {
   local deadline=$((SECONDS + 20)) value
@@ -410,80 +436,105 @@ send_from_container() {
   local network=$1 target=$2
   docker_cmd run --rm --network "$network" --mount "type=bind,src=$SENDER,dst=/sender.mjs,readonly" node:20-alpine node /sender.mjs "$target" 12201 "$payload"
 }
+fresh_metric_baseline() {
+  local started
+  started=$(metric_now_ms)
+  wait_fresh_stable_metric "$started"
+}
+send_probe() {
+  local sender=$1 network=$2 target=$3
+  if [[ "$sender" == host ]]; then
+    node "$SENDER" "$target" 12201 "$payload"
+  else
+    send_from_container "$network" "$target"
+  fi
+}
 assert_positive_delivery() {
-  local source_before=$1 shipped_before=$2 description=$3 deadline=$((SECONDS + 20)) source_after shipped_after source_delta shipped_delta
+  local source_before=$1 shipped_before=$2 sent_at=$3 description=$4
+  local source_after source_delta deadline=$((SECONDS + 20)) shipped_after shipped_delta
+  source_after=$(wait_fresh_stable_metric "$sent_at")
+  source_delta=$((source_after - source_before))
+  (( source_delta == 1 )) || fail "$description positive control source delta was $source_delta, expected +1"
   while (( SECONDS < deadline )); do
-    source_after=$(read_metric)
     shipped_after=$(vector_shipped_count)
-    [[ "$source_after" =~ ^[0-9]+$ && "$shipped_after" =~ ^[0-9]+$ ]] || fail "invalid Vector counters during $description"
-    source_delta=$((source_after - source_before))
     shipped_delta=$((shipped_after - shipped_before))
-    if (( source_delta == 1 && shipped_delta == 1 )); then
-      record "PASS: $description positive control; source +1 and shipped +1"
+    if (( shipped_delta == 1 )); then
+      record "PASS: $description positive control; fresh source +1 and shipped +1"
       return 0
     fi
-    (( source_delta <= 1 && shipped_delta <= 1 )) || fail "$description produced duplicate source/shipped events: source +$source_delta, shipped +$shipped_delta"
+    (( shipped_delta <= 1 )) || fail "$description produced duplicate shipped events: +$shipped_delta"
     sleep 0.2
   done
-  fail "$description positive control failed: source +$source_delta, shipped +$shipped_delta"
+  fail "$description positive control shipped delta was $shipped_delta, expected +1"
 }
 
-# Positive controls prove both paths before attempting forbidden sibling/external sources.
-source_before=$(wait_metric 0)
+# Positive controls precede the leak self-test and every forbidden-source assertion.
+source_before=$(fresh_metric_baseline)
 shipped_before=$(vector_shipped_count)
+sent_at=$(metric_now_ms)
 node "$SENDER" 127.0.0.1 12201 "$payload"
-assert_positive_delivery "$source_before" "$shipped_before" "host loopback"
+assert_positive_delivery "$source_before" "$shipped_before" "$sent_at" "host loopback"
 
-source_before=$(wait_metric 0)
+source_before=$(fresh_metric_baseline)
 shipped_before=$(vector_shipped_count)
+sent_at=$(metric_now_ms)
 send_from_container "${PROJECT}_logship" "$vector_ip"
-assert_positive_delivery "$source_before" "$shipped_before" "logship-network control container"
+assert_positive_delivery "$source_before" "$shipped_before" "$sent_at" "logship-network control container"
 
-assert_isolated_probe() {
-  local description=$1 network=$2 target=$3 source_before shipped_before send_status=0 source_after shipped_after
-  source_before=$(wait_metric 0)
+check_isolated_probe() {
+  local description=$1 sender=$2 network=$3 target=$4
+  local source_before shipped_before sent_at source_after shipped_after source_delta shipped_delta send_status=0
+  source_before=$(fresh_metric_baseline)
   shipped_before=$(vector_shipped_count)
-  if send_from_container "$network" "$target"; then
+  sent_at=$(metric_now_ms)
+  if send_probe "$sender" "$network" "$target"; then
     record "INFO: $description sender completed"
   else
     send_status=$?
     record "INFO: $description sender reported transport error exit=$send_status"
   fi
-  sleep 0.5
-  source_after=$(read_metric)
+  source_after=$(wait_fresh_stable_metric "$sent_at")
   shipped_after=$(vector_shipped_count)
-  [[ "$source_after" =~ ^[0-9]+$ && "$shipped_after" =~ ^[0-9]+$ ]] || fail "invalid Vector counters during $description"
-  [[ "$source_after" == "$source_before" ]] || fail "$description isolation leak: source counter changed $source_before -> $source_after"
-  [[ "$shipped_after" == "$shipped_before" ]] || fail "$description isolation leak: shipped count changed $shipped_before -> $shipped_after"
-  record "PASS: $description isolation; source +0 and shipped +0"
+  source_delta=$((source_after - source_before))
+  shipped_delta=$((shipped_after - shipped_before))
+  record "INFO: $description fresh deltas source=$source_delta shipped=$shipped_delta"
+  (( send_status == 0 )) || return 2
+  if (( source_delta == 0 && shipped_delta == 0 )); then
+    return 0
+  fi
+  return 1
 }
+assert_isolated_probe() {
+  local description=$1 sender=$2 network=$3 target=$4 status
+  if check_isolated_probe "$description" "$sender" "$network" "$target"; then
+    record "PASS: $description isolation; fresh source +0 and shipped +0"
+    return 0
+  else
+    status=$?
+    fail "$description isolation check failed (status=$status)"
+  fi
+}
+
+if check_isolated_probe "intentional host-loopback leak self-test" host host 127.0.0.1; then
+  fail "isolation leak self-test passed unexpectedly"
+else
+  status=$?
+  (( status == 1 )) || fail "isolation leak self-test could not deliver its allowed host-loopback packet (status=$status)"
+  record "PASS: negative isolation check rejected a deliberately allowed host-loopback packet"
+fi
 
 probe_targets=("$vector_ip" "$app_gateway" vector host.docker.internal 127.0.0.1)
 for target in "${probe_targets[@]}"; do
-  assert_isolated_probe "node->$target" "container:$NODE_ID" "$target"
-  assert_isolated_probe "ingress->$target" "container:$INGRESS_ID" "$target"
-  assert_isolated_probe "postgres->$target" "container:$PG_ID" "$target"
+  assert_isolated_probe "node->$target" container "container:$NODE_ID" "$target"
+  assert_isolated_probe "ingress->$target" container "container:$INGRESS_ID" "$target"
+  assert_isolated_probe "postgres->$target" container "container:$PG_ID" "$target"
 done
 
 host_ips=$(ip -o -4 addr show scope global | awk '{split($4,a,"/"); print a[1]}')
 [[ -n "$host_ips" ]] || fail "no non-loopback IPv4 interface available for external-interface isolation probes"
 while read -r host_ip; do
   [[ -n "$host_ip" ]] || continue
-  source_before=$(wait_metric 0)
-  shipped_before=$(vector_shipped_count)
-  if node "$SENDER" "$host_ip" 12201 "$payload"; then
-    record "INFO: host external-interface sender completed to $host_ip"
-  else
-    send_status=$?
-    record "INFO: host external-interface sender reported transport error exit=$send_status for $host_ip"
-  fi
-  sleep 0.5
-  source_after=$(read_metric)
-  shipped_after=$(vector_shipped_count)
-  [[ "$source_after" =~ ^[0-9]+$ && "$shipped_after" =~ ^[0-9]+$ ]] || fail "invalid Vector counters during host interface $host_ip probe"
-  [[ "$source_after" == "$source_before" ]] || fail "host interface $host_ip isolation leak: source $source_before -> $source_after"
-  [[ "$shipped_after" == "$shipped_before" ]] || fail "host interface $host_ip isolation leak: shipped $shipped_before -> $shipped_after"
-  record "PASS: host external interface $host_ip isolation; source +0 and shipped +0"
+  assert_isolated_probe "host external interface $host_ip" host host "$host_ip"
 done <<<"$host_ips"
 
 compose_cmd stop vector >/dev/null
