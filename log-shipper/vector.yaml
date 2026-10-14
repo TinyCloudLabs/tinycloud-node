@@ -170,7 +170,7 @@ transforms:
       reason = .gate_reason
       if !includes(["malformed_envelope", "unknown_message", "unlabelled"], reason) { abort }
       minute = format_timestamp!(now(), format: "%Y-%m-%dT%H:%M")
-      . = {"event": "logship_gate_dropped_total", "reason": reason, "minute": minute, "count": 1}
+      . = {"minute": minute, "reason": reason, "count": 1}
   logship_unexpected_counter:
     type: remap
     inputs: [logship_result_route.unexpected]
@@ -178,37 +178,70 @@ transforms:
     drop_on_abort: true
     source: |
       minute = format_timestamp!(now(), format: "%Y-%m-%dT%H:%M")
-      . = {"event": "logship_unexpected_label", "reason": "unexpected_label", "minute": minute, "count": 1}
+      . = {"minute": minute, "reason": "unexpected_label", "count": 1}
+  logship_summary_input:
+    type: remap
+    inputs: [logship_drop_counter, logship_unexpected_counter]
+    drop_on_error: true
+    drop_on_abort: true
+    source: |
+      reason = .reason
+      minute = .minute
+      count = .count
+      if !is_string(reason) || !is_string(minute) { abort }
+      if !includes(["malformed_envelope", "unexpected_label", "unknown_message", "unlabelled"], reason) { abort }
+      if !is_integer(count) { abort }
+      count = to_int(count) ?? 0
+      if count < 1 || count > 1000000000 { abort }
+      . = {
+        "minute": .minute,
+        "malformed_envelope_count": 0,
+        "unknown_message_count": 0,
+        "unlabelled_count": 0,
+        "unexpected_label_count": 0
+      }
+      if reason == "malformed_envelope" { .malformed_envelope_count = count }
+      else if reason == "unknown_message" { .unknown_message_count = count }
+      else if reason == "unlabelled" { .unlabelled_count = count }
+      else { .unexpected_label_count = count }
   logship_counter_reduce:
     type: reduce
-    inputs: [logship_drop_counter, logship_unexpected_counter]
-    group_by: [event, reason, minute]
+    inputs: [logship_summary_input]
+    group_by: [minute]
     expire_after_ms: 75000
     end_every_period_ms: 60000
     flush_period_ms: 1000
     merge_strategies:
-      count: sum
+      malformed_envelope_count: sum
+      unknown_message_count: sum
+      unlabelled_count: sum
+      unexpected_label_count: sum
   logship_counter_output:
     type: remap
     inputs: [logship_counter_reduce]
     drop_on_error: true
     drop_on_abort: true
     source: |
-      event = .event
-      reason = .reason
-      count = .count
-      if !includes(["logship_gate_dropped_total", "logship_unexpected_label"], event) { abort }
-      if !includes(["malformed_envelope", "unexpected_label", "unknown_message", "unlabelled"], reason) { abort }
-      if !is_integer(count) { abort }
-      count = to_int(count) ?? 0
-      if count < 1 || count > 1000000000 { abort }
+      malformed = .malformed_envelope_count
+      unknown = .unknown_message_count
+      unlabelled = .unlabelled_count
+      unexpected = .unexpected_label_count
+      if !is_integer(malformed) || !is_integer(unknown) || !is_integer(unlabelled) || !is_integer(unexpected) { abort }
+      malformed = to_int(malformed) ?? 0
+      unknown = to_int(unknown) ?? 0
+      unlabelled = to_int(unlabelled) ?? 0
+      unexpected = to_int(unexpected) ?? 0
+      if malformed < 0 || malformed > 1000000000 || unknown < 0 || unknown > 1000000000 || unlabelled < 0 || unlabelled > 1000000000 || unexpected < 0 || unexpected > 1000000000 { abort }
+      if malformed + unknown + unlabelled + unexpected < 1 { abort }
       . = {
         "level": "warn",
         "ts": format_timestamp!(now(), format: "%Y-%m-%dT%H:%M:%S%.3fZ"),
-        "event": event,
+        "event": "logship_gate_summary_total",
         "svc": "logship",
-        "reason": reason,
-        "count": count
+        "malformed_envelope_count": malformed,
+        "unknown_message_count": unknown,
+        "unlabelled_count": unlabelled,
+        "unexpected_label_count": unexpected
       }
   allowlist:
     type: remap
@@ -367,7 +400,8 @@ transforms:
     route:
       panic: .event == "node_fatal_panic"
       app_error: .event == "node_error"
-      app_warning: .event == "node_warning" || .event == "logship_gate_dropped_total" || .event == "logship_unexpected_label"
+      app_warning: .event == "node_warning"
+      logship_summary: .event == "logship_gate_summary_total"
       ingress_summary: .event == "ingress_failure_count" || .event == "ingress_success_count"
       ingress_slow: .event == "ingress_request_slow"
   split_requests:
@@ -458,14 +492,19 @@ transforms:
     inputs: [classify_by_budget.app_warning]
     window_secs: 60
     threshold: 5
+  throttle_logship_summary:
+    type: throttle
+    inputs: [classify_by_budget.logship_summary]
+    window_secs: 60
+    threshold: 1
   throttle_ingress:
     type: throttle
     inputs: [request_output, classify_by_budget.ingress_slow, slow_success]
     window_secs: 60
-    threshold: 27
+    threshold: 26
   budget_size_guard:
     type: remap
-    inputs: [throttle_panic, throttle_app_error, throttle_app_warning, throttle_ingress]
+    inputs: [throttle_panic, throttle_app_error, throttle_app_warning, throttle_logship_summary, throttle_ingress]
     drop_on_error: true
     drop_on_abort: true
     source: |

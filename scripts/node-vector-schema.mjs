@@ -1,5 +1,7 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { isAbsolute } from "node:path";
+import { parse } from "yaml";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const schemaPath = `${root}log-shipper/fields.json`;
@@ -242,37 +244,75 @@ export function checkVectorFile(schema, yaml = readFileSync(vectorPath, "utf8"))
   const requiredBudgetConfig = [
     "panic: .event == \"node_fatal_panic\"",
     "app_error: .event == \"node_error\"",
-    "app_warning: .event == \"node_warning\" || .event == \"logship_gate_dropped_total\" || .event == \"logship_unexpected_label\"",
+    "app_warning: .event == \"node_warning\"",
+    "logship_summary: .event == \"logship_gate_summary_total\"",
     "inputs: [logship_gate_route.node, logship_gate_route.ingress]",
     "inputs: [logship_gate_route.rejected, logship_inner]",
+    "inputs: [logship_drop_counter, logship_unexpected_counter]",
+    "inputs: [logship_summary_input]",
+    "group_by: [minute]",
+    "malformed_envelope_count: sum",
+    "unknown_message_count: sum",
+    "unlabelled_count: sum",
+    "unexpected_label_count: sum",
     "inputs: [allowlist, logship_counter_output]",
     "inputs: [logship_result_route.validated]",
-    "group_by: [route, status_class, event, minute]",
     "inputs: [classify_by_budget.panic]",
     "threshold: 2",
     "inputs: [classify_by_budget.app_error]",
     "threshold: 5",
     "inputs: [classify_by_budget.app_warning]",
+    "inputs: [classify_by_budget.logship_summary]",
+    "threshold: 1",
     "inputs: [request_output, classify_by_budget.ingress_slow, slow_success]",
-    "threshold: 27",
+    "threshold: 26",
     "expire_after_ms: 75000",
     "end_every_period_ms: 60000",
     "flush_period_ms: 1000",
     "if length(encode_json(.)) > 280 { abort }",
-    "inputs: [throttle_panic, throttle_app_error, throttle_app_warning, throttle_ingress]",
+    "inputs: [throttle_panic, throttle_app_error, throttle_app_warning, throttle_logship_summary, throttle_ingress]",
   ];
   if (requiredBudgetConfig.some((line) => !yaml.includes(line))) throw new Error("Vector priority lanes, counters, reduce timers, or event-size bound differ from reviewed budget");
-  const monthlyBudgetBytes = (2 + 5 + 5 + 27) * 60 * 24 * 30 * 281;
-  if (monthlyBudgetBytes > 480000000) throw new Error(`Vector event budget exceeds 0.48 GB/month: ${monthlyBudgetBytes} bytes`);
-  if ((yaml.match(/threshold: 5\n/g) ?? []).length !== 2) throw new Error("node error and warning lanes must each be capped at five events/minute");
+  const monthlyBudgetBytes = (2 + 5 + 5 + 1 + 26) * 60 * 24 * 30 * 281;
+}
+
+function isComposeMapping(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 export function checkComposeDeploymentPackaging(compose) {
-  if (/^\s*env_file\s*:/m.test(compose)) throw new Error("Compose packaging must not use env_file");
-  const configs = compose.match(/^configs:\n([\s\S]*?)(?=\n\S|$)/)?.[1];
-  if (configs && /^\s+file\s*:/m.test(configs)) throw new Error("Compose packaging must not use configs.*.file");
-  if (/^\s*-\s*(?:\.\/|\.\.\/)/m.test(compose) || /^\s*source:\s*(?!\/|\|)[^\s]+/m.test(compose)) {
-    throw new Error("Compose packaging must not use relative bind sources");
+  let definition;
+  try {
+    definition = parse(compose);
+  } catch (error) {
+    throw new Error("Compose packaging must be valid YAML", { cause: error });
+  }
+  if (!isComposeMapping(definition)) throw new Error("Compose packaging must be a YAML mapping");
+
+  for (const config of Object.values(definition.configs ?? {})) {
+    if (isComposeMapping(config) && Object.hasOwn(config, "file")) {
+      throw new Error("Compose packaging must not use configs.*.file");
+    }
+  }
+
+  const namedVolumes = definition.volumes ?? {};
+  for (const service of Object.values(definition.services ?? {})) {
+    if (!isComposeMapping(service)) continue;
+    if (Object.hasOwn(service, "env_file")) throw new Error("Compose packaging must not use env_file");
+    if (!Array.isArray(service.volumes)) continue;
+
+    for (const volume of service.volumes) {
+      if (typeof volume === "string") {
+        const separator = volume.indexOf(":");
+        if (separator < 0) continue;
+        const source = volume.slice(0, separator);
+        if (source && (isAbsolute(source) || Object.hasOwn(namedVolumes, source))) continue;
+        throw new Error("Compose packaging must not use relative bind sources");
+      }
+      if (isComposeMapping(volume) && volume.type === "bind" && (typeof volume.source !== "string" || !isAbsolute(volume.source))) {
+        throw new Error("Compose packaging must not use relative bind sources");
+      }
+    }
   }
 }
 
@@ -311,19 +351,20 @@ export function checkNodeSchema(schema) {
   if (JSON.stringify(schema.common.level) !== JSON.stringify({ type: "enum", values: ["debug", "info", "warn", "error"] })) throw new Error("common.level differs from the emitted level allowlist");
   if (JSON.stringify(schema.common.ts) !== JSON.stringify({ type: "string", regex: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$", max_len: 24 })) throw new Error("common.ts differs from the emitted timestamp format");
   if (schema.common.event?.type !== "event") throw new Error("common.event must use event type");
-  if (service.events.join(",") !== "node_fatal_panic,node_warning,node_error,ingress_failure_count,ingress_request_slow,ingress_success_count,logship_gate_dropped_total,logship_unexpected_label") throw new Error("tinycloud-node event set differs from the reviewed set");
+  if (service.events.join(",") !== "node_fatal_panic,node_warning,node_error,ingress_failure_count,ingress_request_slow,ingress_success_count,logship_gate_summary_total") throw new Error("tinycloud-node event set differs from the reviewed set");
   if (Object.values(sourceMessages).some(([, code]) => !new Set(service.fields.event_code?.values ?? []).has(code))) throw new Error("source message map contains an event_code missing from fields.json");
   if (Object.keys(service.fields).sort().join(",") !== [
-    "bytes_sent", "count", "event_code", "method", "reason", "request_count", "request_time_seconds", "route", "status", "status_class", "svc", "upstream_status",
+    "bytes_sent", "event_code", "malformed_envelope_count", "method", "request_count", "request_time_seconds", "route", "status", "status_class", "svc", "unknown_message_count", "unlabelled_count", "unexpected_label_count", "upstream_status",
   ].sort().join(",")) throw new Error("tinycloud-node fields differ from the reviewed field set");
   if (service.fields.request_count?.type !== "integer" || service.fields.request_count.min !== 1 || service.fields.request_count.max !== 1000000) throw new Error("request_count must remain bounded to 1..1000000");
-  if (service.fields.count?.type !== "integer" || service.fields.count.min !== 1 || service.fields.count.max !== 1000000000) throw new Error("logship count must remain bounded to 1..1000000000");
-  if (JSON.stringify(service.fields.reason) !== JSON.stringify({ type: "enum", values: ["malformed_envelope", "unexpected_label", "unknown_message", "unlabelled"] })) throw new Error("logship reason enum differs from emitted values");
+  for (const field of ["malformed_envelope_count", "unknown_message_count", "unlabelled_count", "unexpected_label_count"]) {
+    if (JSON.stringify(service.fields[field]) !== JSON.stringify({ type: "integer", min: 0, max: 1000000000 })) throw new Error(`${field} must be bounded to 0..1000000000`);
+  }
   if (service.fields.route?.type !== "enum" || service.fields.route.values.length !== 36 || !service.fields.route.values.includes("<unmatched>")) throw new Error("route output must be a 36-value bounded enum including <unmatched>");
   if (JSON.stringify(service.fields.svc) !== JSON.stringify({ type: "enum", values: ["api", "ingress", "logship"] })) throw new Error("svc enum differs from emitted values");
   if (JSON.stringify(service.fields.status_class) !== JSON.stringify({ type: "enum", values: ["1xx", "2xx", "3xx", "4xx", "5xx"] })) throw new Error("status_class enum differs from emitted values");
   if (service.fields.event_code?.type !== "enum" || !service.fields.event_code.values.includes("other")) throw new Error("event_code must preserve the fixed panic other value");
-  for (const event of ["logship_gate_dropped_total", "logship_unexpected_label"]) {
+  for (const event of ["logship_gate_summary_total"]) {
     if (!service.events.includes(event)) throw new Error(`tinycloud-node is missing ${event}`);
   }
 }

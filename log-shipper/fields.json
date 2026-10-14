@@ -70,8 +70,7 @@
         "ingress_failure_count",
         "ingress_request_slow",
         "ingress_success_count",
-        "logship_gate_dropped_total",
-        "logship_unexpected_label"
+        "logship_gate_summary_total"
       ],
       "fields": {
         "svc": { "type": "enum", "values": ["api", "ingress", "logship"] },
@@ -83,8 +82,10 @@
         "request_count": { "type": "integer", "min": 1, "max": 1000000 },
         "bytes_sent": { "type": "integer", "min": 0, "max": 1000000000 },
         "upstream_status": { "type": "string", "regex": "^(|[1-5][0-9]{2})$", "max_len": 3 },
-        "count": { "type": "integer", "min": 1, "max": 1000000000 },
-        "reason": { "type": "enum", "values": ["malformed_envelope", "unexpected_label", "unknown_message", "unlabelled"] },
+        "malformed_envelope_count": { "type": "integer", "min": 0, "max": 1000000000 },
+        "unknown_message_count": { "type": "integer", "min": 0, "max": 1000000000 },
+        "unlabelled_count": { "type": "integer", "min": 0, "max": 1000000000 },
+        "unexpected_label_count": { "type": "integer", "min": 0, "max": 1000000000 },
         "event_code": { "type": "enum", "values": ["invocation_replay_insert_failed", "invocation_replay_cleanup_failed", "dstack_get_info_failed", "share_local_tee_identity", "retention_hook_delivery_prune_failed", "retention_dead_letter_prune_failed", "retention_signed_ticket_prune_failed", "quota_invalid_body", "quota_fallback", "tunnel_state_load_failed", "tunnel_address_invalid", "link_state_load_failed", "link_bind_invalid", "link_bind_failed", "link_bind_state_write_failed", "link_tls_config_failed", "link_listener_error", "link_listener_state_write_failed", "link_auto_renew_config_failed", "link_auto_renew_failed", "link_cert_reload_failed", "link_listener_cert_reload_failed", "link_disable_failed", "link_connection_error", "link_listener_accept_failed", "webhook_delivery_failed", "webhook_dispatcher_failed", "share_authorization_failed", "share_native_authorization_denied", "share_native_kv_put_failed", "share_v2_readiness_failed", "share_invitation_key_missing", "share_invitation_key_mismatch", "share_policy_denied", "attestation_quote_failed", "hook_events_read_failed", "hook_rows_load_failed", "missing_committed_hook_row", "webhook_enqueue_failed", "tunnel_connection_prepare_failed", "tunnel_idle_timeout", "tunnel_read_failed", "tunnel_malformed_frame", "tunnel_relay_error", "tunnel_write_failed", "tunnel_state_record_failed", "tunnel_state_clear_failed", "tunnel_auth_rejected", "other"] }
       }
     },

@@ -60,6 +60,7 @@ pub mod signed_urls;
 pub mod storage;
 pub mod tee;
 mod tracing;
+pub use tracing::{cap_json_log_line, MAX_JSON_LOG_LINE_BYTES};
 pub mod tunnel;
 pub mod webhook_dispatcher;
 

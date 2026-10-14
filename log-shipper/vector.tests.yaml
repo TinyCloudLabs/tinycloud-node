@@ -701,7 +701,7 @@ tests:
             source: |
               assert_eq!(.event, "ingress_failure_count")
               assert_eq!(.route, "/info")
-  - name: "unlabelled GELF canaries are reduced to bounded counters"
+  - name: "unlabelled GELF canaries are reduced into a bounded summary"
     inputs:
       - &unlabelled_canary
         insert_at: logship_gate
@@ -715,14 +715,16 @@ tests:
         conditions:
           - type: vrl
             source: |
-              assert_eq!(.event, "logship_gate_dropped_total")
-              assert_eq!(.reason, "unlabelled")
-              assert_eq!(.count, 2)
+              assert_eq!(.event, "logship_gate_summary_total")
+              assert_eq!(.unlabelled_count, 2)
+              assert_eq!(.malformed_envelope_count, 0)
+              assert_eq!(.unknown_message_count, 0)
+              assert_eq!(.unexpected_label_count, 0)
               assert!(!contains(encode_json(.), "signed-kv-ticket-probe"))
               assert!(!contains(encode_json(.), "auth-probe"))
               assert!(!contains(encode_json(.), "did:key:owner-probe"))
               assert!(!contains(encode_json(.), "space-probe@example.invalid"))
-  - name: "wrong and postgres labels produce only a fixed unexpected-label event"
+  - name: "wrong and postgres labels increment only the fixed unexpected-label summary"
     inputs:
       - insert_at: logship_gate
         type: log
@@ -740,9 +742,11 @@ tests:
         conditions:
           - type: vrl
             source: |
-              assert_eq!(.event, "logship_unexpected_label")
-              assert_eq!(.reason, "unexpected_label")
-              assert_eq!(.count, 2)
+              assert_eq!(.event, "logship_gate_summary_total")
+              assert_eq!(.unexpected_label_count, 2)
+              assert_eq!(.malformed_envelope_count, 0)
+              assert_eq!(.unknown_message_count, 0)
+              assert_eq!(.unlabelled_count, 0)
               assert!(!contains(encode_json(.), "private-untrusted-label"))
               assert!(!contains(encode_json(.), "postgres"))
               assert!(!contains(encode_json(.), "ticket-probe"))
@@ -759,9 +763,11 @@ tests:
         conditions:
           - type: vrl
             source: |
-              assert_eq!(.event, "logship_gate_dropped_total")
-              assert_eq!(.reason, "unlabelled")
-              assert_eq!(.count, 1)
+              assert_eq!(.event, "logship_gate_summary_total")
+              assert_eq!(.unlabelled_count, 1)
+              assert_eq!(.malformed_envelope_count, 0)
+              assert_eq!(.unknown_message_count, 0)
+              assert_eq!(.unexpected_label_count, 0)
               assert!(!contains(encode_json(.), "node fatal panic"))
   - name: "split GELF fragments with invalid JSON are counted without content"
     inputs:
@@ -777,9 +783,11 @@ tests:
         conditions:
           - type: vrl
             source: |
-              assert_eq!(.event, "logship_gate_dropped_total")
-              assert_eq!(.reason, "malformed_envelope")
-              assert_eq!(.count, 1)
+              assert_eq!(.event, "logship_gate_summary_total")
+              assert_eq!(.malformed_envelope_count, 1)
+              assert_eq!(.unknown_message_count, 0)
+              assert_eq!(.unlabelled_count, 0)
+              assert_eq!(.unexpected_label_count, 0)
               assert!(!contains(encode_json(.), "token-fragment-probe"))
   - name: "labelled ingress non-JSON messages are dropped after the gate"
     inputs:
@@ -795,8 +803,99 @@ tests:
         conditions:
           - type: vrl
             source: |
-              assert_eq!(.event, "logship_gate_dropped_total")
-              assert_eq!(.reason, "malformed_envelope")
-              assert_eq!(.count, 1)
+              assert_eq!(.event, "logship_gate_summary_total")
+              assert_eq!(.malformed_envelope_count, 1)
+              assert_eq!(.unknown_message_count, 0)
+              assert_eq!(.unlabelled_count, 0)
+              assert_eq!(.unexpected_label_count, 0)
               assert!(!contains(encode_json(.), "private-non-json-ingress-probe"))
               assert!(!contains(encode_json(.), "container-non-json-probe"))
+  - name: "all gate reasons use their summary lane without consuming five WARN slots"
+    inputs:
+      - insert_at: logship_gate
+        type: log
+        log_fields:
+          message: "unlabelled-probe"
+      - insert_at: logship_gate
+        type: log
+        log_fields:
+          '."_tc.logship"': "wrong-label-probe"
+          message: "wrong-label-probe"
+      - insert_at: logship_gate
+        type: log
+        log_fields:
+          '."_tc.logship"': "tinycloud-node"
+          message: "malformed-probe"
+      - insert_at: logship_gate
+        type: log
+        log_fields:
+          '."_tc.logship"': "tinycloud-node"
+          message: '{"timestamp":"2026-10-14T10:00:00.000Z","level":"WARN","fields":{"message":"unknown-message-probe"}}'
+      - &summary_warn
+        insert_at: logship_gate
+        type: log
+        log_fields:
+          '."_tc.logship"': "tinycloud-node"
+          message: '{"timestamp":"2026-10-14T10:00:00.000Z","level":"WARN","fields":{"message":"invocation replay insert failed"}}'
+      - *summary_warn
+      - *summary_warn
+      - *summary_warn
+      - *summary_warn
+    outputs:
+      - extract_from: logship_counter_output
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "logship_gate_summary_total")
+              assert_eq!(.svc, "logship")
+              assert_eq!(.level, "warn")
+              assert_eq!(.malformed_envelope_count, 1)
+              assert_eq!(.unexpected_label_count, 1)
+              assert_eq!(.unknown_message_count, 1)
+              assert_eq!(.unlabelled_count, 1)
+              assert!(!exists(.reason))
+              assert!(!exists(.message))
+      - extract_from: throttle_logship_summary
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "logship_gate_summary_total")
+              assert_eq!(.malformed_envelope_count, 1)
+              assert_eq!(.unexpected_label_count, 1)
+              assert_eq!(.unknown_message_count, 1)
+              assert_eq!(.unlabelled_count, 1)
+      - extract_from: throttle_app_warning
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "node_warning")
+              assert_eq!(.event_code, "invocation_replay_insert_failed")
+              assert_eq!(.level, "warn")
+      - extract_from: throttle_app_warning
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "node_warning")
+              assert_eq!(.event_code, "invocation_replay_insert_failed")
+              assert_eq!(.level, "warn")
+      - extract_from: throttle_app_warning
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "node_warning")
+              assert_eq!(.event_code, "invocation_replay_insert_failed")
+              assert_eq!(.level, "warn")
+      - extract_from: throttle_app_warning
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "node_warning")
+              assert_eq!(.event_code, "invocation_replay_insert_failed")
+              assert_eq!(.level, "warn")
+      - extract_from: throttle_app_warning
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "node_warning")
+              assert_eq!(.event_code, "invocation_replay_insert_failed")
+              assert_eq!(.level, "warn")

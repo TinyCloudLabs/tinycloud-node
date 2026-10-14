@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
-import { checkComposeDeploymentPackaging, checkVectorFile, renderAllowlist, renderComposeVectorConfig } from "./node-vector-schema.mjs";
+import { checkComposeDeploymentPackaging, checkComposeVectorConfig, checkVectorFile, renderAllowlist, renderComposeVectorConfig } from "./node-vector-schema.mjs";
 
 const workflow = readFileSync(new URL("../.github/workflows/rust.yml", import.meta.url), "utf8");
 const schema = JSON.parse(readFileSync(new URL("../log-shipper/fields.json", import.meta.url), "utf8"));
@@ -94,16 +94,44 @@ test("CI runs native Vector validation and tests after checking the pinned relea
   assert.match(workflow, /test log-shipper\/vector\.yaml log-shipper\/vector\.tests\.yaml/);
 });
 
-test("deployed compose rejects file-backed configs, env_file, and relative bind sources", () => {
-  for (const invalid of [
-    "services:\n  vector:\n    env_file: .env",
-    "configs:\n  vector:\n    file: ./vector.yaml",
-    "services:\n  vector:\n    volumes:\n      - ./vector.yaml:/etc/vector/vector.yaml:ro",
-    "services:\n  vector:\n    volumes:\n      - type: bind\n        source: ../vector.yaml\n        target: /etc/vector/vector.yaml",
-    "services:\n  vector:\n    volumes:\n      - type: bind\n        source: ${LOCAL_CONFIG_PATH}\n        target: /etc/vector/vector.yaml",
-  ]) {
-    assert.throws(() => checkComposeDeploymentPackaging(invalid), /Compose packaging/);
-  }
+const minimalCompose = `services:
+  vector:
+    environment:
+      VECTOR_CONFIG_YAML: |
+        sources: {}
+    entrypoint: ["vector"]
+`;
+test("rejects an appended block-style configs.file entry", () => {
+  assert.throws(
+    () => checkComposeVectorConfig(`${minimalCompose}\nconfigs:\n  x:\n    file: ./outside.yaml\n`, "sources: {}"),
+    /configs\.\*\.file/,
+  );
+});
+test("rejects flow-style configs.file entries", () => {
+  assert.throws(
+    () => checkComposeVectorConfig(`${minimalCompose}\nconfigs: {x: {file: ./outside.yaml}}\n`, "sources: {}"),
+    /configs\.\*\.file/,
+  );
+});
+test("rejects quoted service env_file values", () => {
+  assert.throws(
+    () => checkComposeVectorConfig(`${minimalCompose}  probe:\n    env_file: '.env'\n`, "sources: {}"),
+    /env_file/,
+  );
+});
+test("rejects quoted relative short bind sources", () => {
+  assert.throws(
+    () => checkComposeVectorConfig(`${minimalCompose}    volumes:\n      - './vector.yaml:/etc/vector/vector.yaml:ro'\n`, "sources: {}"),
+    /relative bind sources/,
+  );
+});
+test("rejects flow-style relative long bind sources", () => {
+  assert.throws(
+    () => checkComposeVectorConfig(`${minimalCompose}    volumes: [{type: bind, source: ../vector.yaml, target: /etc/vector/vector.yaml}]\n`, "sources: {}"),
+    /relative bind sources/,
+  );
+});
+test("accepts canonical Compose packaging", () => {
   assert.doesNotThrow(() => checkComposeDeploymentPackaging(compose));
 });
 test("compose embeds source Vector config without allowing Compose to interpolate its regexes", () => {
@@ -132,19 +160,22 @@ test("missing Better Stack token leaves node and ingress startup independent", (
     "allowed_envs sync must not gate compose startup",
   );
 });
-test("WARN lane bypasses the ingress throttle and stays behind the size guard", () => {
+test("WARN, gate-summary, and ingress lanes stay independent behind the size guard", () => {
   assert.match(vector, /throttle_app_warning:\n    type: throttle\n    inputs: \[classify_by_budget\.app_warning\]\n    window_secs: 60\n    threshold: 5/);
-  assert.match(vector, /throttle_ingress:\n    type: throttle\n    inputs: \[request_output, classify_by_budget\.ingress_slow, slow_success\]\n    window_secs: 60\n    threshold: 27/);
-  assert.match(vector, /budget_size_guard:\n    type: remap\n    inputs: \[throttle_panic, throttle_app_error, throttle_app_warning, throttle_ingress\]/);
+  assert.match(vector, /throttle_logship_summary:\n    type: throttle\n    inputs: \[classify_by_budget\.logship_summary\]\n    window_secs: 60\n    threshold: 1/);
+  assert.match(vector, /throttle_ingress:\n    type: throttle\n    inputs: \[request_output, classify_by_budget\.ingress_slow, slow_success\]\n    window_secs: 60\n    threshold: 26/);
+  assert.match(vector, /budget_size_guard:\n    type: remap\n    inputs: \[throttle_panic, throttle_app_error, throttle_app_warning, throttle_logship_summary, throttle_ingress\]/);
   assert.match(vector, /sinks:\n  betterstack:\n    type: http\n    inputs: \[budget_size_guard\]/);
+  assert.equal((2 + 5 + 5 + 1 + 26) * 60 * 24 * 30 * 281, 473428800);
 });
 
-test("node schema includes bounded fixed logship counter events", () => {
-  assert.ok(schema.services["tinycloud-node"].events.includes("logship_gate_dropped_total"));
-  assert.ok(schema.services["tinycloud-node"].events.includes("logship_unexpected_label"));
-  assert.deepEqual(schema.services["tinycloud-node"].fields.svc.values, ["api", "ingress", "logship"]);
-  assert.deepEqual(schema.services["tinycloud-node"].fields.reason.values, ["malformed_envelope", "unexpected_label", "unknown_message", "unlabelled"]);
-  assert.deepEqual(schema.services["tinycloud-node"].fields.count, { type: "integer", min: 1, max: 1000000000 });
+test("node schema bounds the fixed per-minute gate summary counts", () => {
+  const node = schema.services["tinycloud-node"];
+  assert.ok(node.events.includes("logship_gate_summary_total"));
+  for (const field of ["malformed_envelope_count", "unknown_message_count", "unlabelled_count", "unexpected_label_count"]) {
+    assert.deepEqual(node.fields[field], { type: "integer", min: 0, max: 1000000000 });
+  }
+  assert.deepEqual(node.fields.svc.values, ["api", "ingress", "logship"]);
 });
 
 test("first transform gates GELF labels before field stripping and JSON parsing", () => {
@@ -179,4 +210,20 @@ test("first transform gates GELF labels before field stripping and JSON parsing"
   assert.doesNotMatch(vectorService, /labels:\n\s+tc\.logship:/);
   assert.doesNotMatch(compose, /fluentd|\/var\/lib\/docker|docker\.sock/);
   assert.match(compose, /networks:\n  logship:\n    driver: bridge\n    ipam:\n      config:\n        - subnet: 10\.255\.253\.0\/28/);
+});
+const acceptance = readFileSync(new URL("../tc-959-node-docker-check.review.sh", import.meta.url), "utf8");
+test("GELF source metric parser reads the value before its timestamp", async () => {
+  const metrics = await import("./tc-959-vector-metrics.mjs");
+  const sample = 'vector_component_received_events_total{component_id="gelf_in",component_kind="source",component_type="socket",host="node-1",mode="udp"} 1 1791992950070';
+  assert.equal(metrics.parseGelfReceivedCounter(sample), 1);
+  assert.equal(metrics.parseGelfReceivedCounter(sample.replace('component_id="gelf_in"', 'component_id="other"')), null);
+  assert.equal(metrics.parseGelfReceivedCounter(sample.replace(',host="node-1"', "")), null);
+  assert.equal(metrics.countShippedEvents('{"event":"node_warning"}\n{"event":"logship_gate_summary_total"}\nnot-json'), 2);
+  assert.equal(metrics.countShippedEvent('{"event":"node_warning"}\n{"event":"logship_gate_summary_total"}', "node_warning"), 1);
+});
+
+test("acceptance producer asserts the rendered Compose-escaped shell command", () => {
+  assert.ok(acceptance.includes("count=\\$\\$(cat /control/burst)"));
+  assert.ok(acceptance.includes('while [ "\\$\\$i" -lt "\\$\\$count" ]'));
+  assert.ok(acceptance.includes("rendered producer command"));
 });
