@@ -181,29 +181,34 @@ fresh_sample() {
 }
 
 assert_positive_delivery() {
-  local source_before=$1 shipped_before=$2 sent_at=$3 description=$4
-  local source_after source_delta deadline=$((SECONDS + 20)) shipped_after shipped_delta
+  local source_before=$1 shipped_before=$2 sent_at=$3 description=$4 shipped_names_before=$5
+  local source_after source_delta deadline=$((SECONDS + 20)) shipped_after shipped_delta shipped_names_after
   source_after=$(wait_fresh_stable_metric "$sent_at")
   source_delta=$((source_after - source_before))
   (( source_delta == 1 )) || fail "$description positive control source delta was $source_delta, expected +1"
   while (( SECONDS < deadline )); do
     shipped_after=$(vector_shipped_count)
     shipped_delta=$((shipped_after - shipped_before))
+    if (( shipped_delta != 0 )); then
+      shipped_names_after=$(vector_shipped_name_counts)
+      report_shipped_event_delta "$shipped_names_before" "$shipped_names_after"
+    fi
     if (( shipped_delta == 1 )); then
-      record "PASS: $description positive control; fresh source +1 and shipped +1"
+      record "PASS: $description positive control; fresh source +1 and shipped probe +1"
       return 0
     fi
-    (( shipped_delta <= 1 )) || fail "$description produced duplicate shipped events: +$shipped_delta"
+    (( shipped_delta <= 1 )) || fail "$description produced duplicate probe events: +$shipped_delta"
     sleep 0.2
   done
-  fail "$description positive control shipped delta was $shipped_delta, expected +1"
+  fail "$description positive control shipped probe delta was $shipped_delta, expected +1"
 }
 
 check_isolated_probe() {
   local description=$1 sender=$2 network=$3 target=$4
-  local source_before shipped_before sent_at source_after shipped_after source_delta shipped_delta send_status=0
+  local source_before shipped_before shipped_names_before sent_at source_after shipped_after shipped_names_after source_delta shipped_delta send_status=0
   source_before=$(fresh_sample)
   shipped_before=$(vector_shipped_count)
+  shipped_names_before=$(vector_shipped_name_counts)
   sent_at=$(metric_now_ms)
   if send_probe "$sender" "$network" "$target"; then
     record "INFO: $description sender completed"
@@ -213,13 +218,16 @@ check_isolated_probe() {
   fi
   source_after=$(wait_fresh_stable_metric "$sent_at")
   shipped_after=$(vector_shipped_count)
+  shipped_names_after=$(vector_shipped_name_counts)
   source_delta=$((source_after - source_before))
   shipped_delta=$((shipped_after - shipped_before))
-  record "INFO: $description fresh deltas source=$source_delta shipped=$shipped_delta"
+  if (( shipped_delta != 0 )); then report_shipped_event_delta "$shipped_names_before" "$shipped_names_after"; fi
+  record "INFO: $description fresh deltas source=$source_delta shipped_probe=$shipped_delta"
   (( send_status == 0 )) || return 2
   if (( source_delta == 0 && shipped_delta == 0 )); then return 0; fi
   return 1
 }
+
 
 assert_isolated_probe() {
   local description=$1 sender=$2 network=$3 target=$4 status

@@ -8,7 +8,7 @@ METRICS_SCRAPE_INTERVAL_SECONDS=1
 ISOLATION_SETTLE_SECONDS=2
 TEST_NOW_MS=3000
 METRIC_SAMPLES=()
-SHIPPED_SAMPLES=()
+SHIPPED_NAME_SAMPLES=()
 SEND_COUNT=0
 
 read_metric_sample() {
@@ -22,6 +22,12 @@ vector_shipped_count() {
   IFS= read -r sample <&4 || { printf 'no captured shipped count\n' >&2; return 1; }
   printf '%s\n' "$sample"
 }
+vector_shipped_name_counts() {
+  local sample
+  IFS= read -r sample <&6 || { printf 'no captured event names\n' >&2; return 1; }
+  printf '%s\n' "$sample"
+}
+report_shipped_event_delta() { :; }
 compose_cmd() { printf '%s\n' test-vector; }
 docker_cmd() { [[ "$1" == inspect ]] && printf '%s\n' true; }
 curl() { return 0; }
@@ -43,6 +49,7 @@ reset_fixtures() {
   SEND_COUNT=0
   exec 3< <(printf '%s\n' "${METRIC_SAMPLES[@]}")
   exec 4< <(printf '%s\n' "${SHIPPED_SAMPLES[@]}")
+  exec 6< <(printf '%s\n' "${SHIPPED_NAME_SAMPLES[@]}")
 }
 wait_vector
 wait_node
@@ -62,14 +69,16 @@ TEST_NOW_MS=6000
 ISOLATION_SETTLE_SECONDS=0
 METRIC_SAMPLES=('6 5000' '6 6000')
 SHIPPED_SAMPLES=(5)
+SHIPPED_NAME_SAMPLES=('[]')
 reset_fixtures
-assert_positive_delivery 5 4 4000 'captured positive control'
+assert_positive_delivery 5 4 4000 'captured positive control' '[]'
 
 # A negative probe remains isolated when fresh source and sink counts do not move.
 reset_fixtures
 TEST_NOW_MS=7000
 METRIC_SAMPLES=('10 8000' '10 9000' '10 10000' '10 11000')
 SHIPPED_SAMPLES=(5 5)
+SHIPPED_NAME_SAMPLES=('[]' '[]')
 reset_fixtures
 assert_isolated_probe 'captured isolated probe' container test-network 127.0.0.1
 assert_eq "$SEND_COUNT" 1
@@ -79,6 +88,7 @@ reset_fixtures
 TEST_NOW_MS=12000
 METRIC_SAMPLES=('10 13000' '10 14000' '11 15000' '11 16000')
 SHIPPED_SAMPLES=(5 6)
+SHIPPED_NAME_SAMPLES=('[]' '[{"event":"node_warning","event_code":"invocation_replay_insert_failed","count":1}]')
 reset_fixtures
 run_isolation_leak_self_test host host 127.0.0.1
 assert_eq "$SEND_COUNT" 1

@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-set -Eeuo pipefail
+umask 077
 
 ROOT=$(git rev-parse --show-toplevel)
 BASE_COMPOSE="$ROOT/docker-compose.dstack-postgres.yaml"
 VECTOR_BIN=${TC_VECTOR_BIN:-/tmp/tc959-vector-0.59.0/vector-x86_64-unknown-linux-musl/bin/vector}
 DRY_RUN=${TC_DRY_RUN:-0}
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/tc959-gelf-check.XXXXXX")
+CPU_OVERRIDE="$WORK/compose.cpu-override.yaml"
 CONTROL="$WORK/control"
 mkdir -p "$CONTROL"
 PROJECT="tc959-gelf-$$"
@@ -18,6 +19,8 @@ NATIVE_DATA_DIR="$WORK/native-data"
 SENDER="$WORK/send-gelf.mjs"
 ENV_FILE="$WORK/acceptance.env"
 REPORT=${TC_REPORT:-"/tmp/tc959-node-gelf-check-$$.txt"}
+touch "$REPORT"
+chmod 0600 "$REPORT"
 COMPOSE=(docker compose --env-file "$ENV_FILE" --project-directory "$ROOT" -p "$PROJECT" -f "$BASE_COMPOSE" -f "$OVERRIDE")
 VECTOR_ID=""
 NODE_ID=""
@@ -48,6 +51,13 @@ compose_cmd() {
     return 0
   fi
   "${COMPOSE[@]}" "$@"
+}
+compose_half_cpu_cmd() {
+  if [[ "$DRY_RUN" == 1 ]]; then
+    record "DRY-RUN compose -f $OVERRIDE -f $CPU_OVERRIDE $*"
+    return 0
+  fi
+  "${COMPOSE[@]}" -f "$CPU_OVERRIDE" "$@"
 }
 memory_sampler() {
   local peak=0 container running current
@@ -242,15 +252,22 @@ services:
         max-size: "10m"
         max-file: "3"
 EOF
-node - "$OVERRIDE" "$ROOT" "$ROOT/tc-959-node-docker-check.review.sh" "$VECTOR_TEST_CONFIG" <<'NODE'
+cat >"$CPU_OVERRIDE" <<'EOF'
+services:
+  vector:
+    cpus: 0.5
+EOF
+node - "$OVERRIDE" "$CPU_OVERRIDE" "$ROOT" "$ROOT/tc-959-node-docker-check.review.sh" "$VECTOR_TEST_CONFIG" <<'NODE'
 const fs = require('node:fs');
 const { spawnSync } = require('node:child_process');
 const { createRequire } = require('node:module');
-const requireFromRoot = createRequire(`${process.argv[3]}/package.json`);
+const requireFromRoot = createRequire(`${process.argv[4]}/package.json`);
 const { parse } = requireFromRoot('yaml');
-const [overridePath, root, harnessPath, vectorConfigPath] = process.argv.slice(2);
+const [overridePath, cpuOverridePath, root, harnessPath, vectorConfigPath] = process.argv.slice(2);
 const composeText = fs.readFileSync(overridePath, 'utf8');
+const cpuOverride = parse(fs.readFileSync(cpuOverridePath, 'utf8'));
 const compose = parse(composeText.replaceAll('!override', ''));
+if (cpuOverride.services?.vector?.cpus !== 0.5) throw new Error('half-CPU override must set only Vector cpus: 0.5');
 const baseCompose = parse(fs.readFileSync(`${root}/docker-compose.dstack-postgres.yaml`, 'utf8'));
 const baseVectorEnv = baseCompose.services.vector.environment ?? {};
 if (!Object.hasOwn(baseVectorEnv, 'VECTOR_CONFIG_YAML') || !Object.hasOwn(baseVectorEnv, 'BETTERSTACK_SOURCE_TOKEN')) {
@@ -259,6 +276,7 @@ if (!Object.hasOwn(baseVectorEnv, 'VECTOR_CONFIG_YAML') || !Object.hasOwn(baseVe
 if (baseCompose.services?.vector?.init !== true) {
   throw new Error('production Vector service must set init: true for restart supervision');
 }
+if (baseCompose.services?.vector?.cpus !== 0.25) throw new Error('production Vector CPU setting changed unexpectedly');
 const vectorEnv = compose.services?.vector?.environment;
 if (!vectorEnv || Object.keys(vectorEnv).length !== 0) throw new Error('acceptance Vector environment must be explicitly empty');
 const ingressEnv = compose.services?.['dstack-ingress']?.environment;
@@ -317,9 +335,10 @@ const declared = new Set(shellSources.flatMap((source) =>
 const calledHelpers = [
   'record', 'docker_cmd', 'compose_cmd', 'memory_sampler', 'cleanup', 'fail', 'require',
   'check_host_ports_free', 'crash_vector',
-  'wait_vector', 'wait_node', 'read_metric', 'read_metric_sample', 'metric_now_ms',
   'wait_fresh_stable_metric', 'fresh_sample', 'wait_metric', 'vector_shipped_count',
-  'vector_event_count', 'wait_next_line', 'send_from_container', 'send_probe',
+  'vector_shipped_name_counts', 'report_shipped_event_delta', 'vector_event_count',
+  'wait_next_line', 'send_from_container', 'send_probe', 'compose_half_cpu_cmd',
+  'measure_burst',
   'assert_positive_delivery', 'check_isolated_probe', 'assert_isolated_probe',
   'run_isolation_leak_self_test',
 ];
@@ -335,10 +354,10 @@ if [[ "$DRY_RUN" == 1 ]]; then
   docker_cmd version
   compose_cmd config
   record "DRY-RUN: acceptance self-test expects an allowed host-loopback packet to make the negative check fail"
-  record "DRY-RUN: positive host-loopback and logship-control-container probes require fresh source +1 and shipped +1"
-  record "DRY-RUN: node/ingress/Postgres sibling and host external-interface probes require two newer stable source samples and shipped +0"
-  record "DRY-RUN: metric freshness internal_metrics=${METRICS_SCRAPE_INTERVAL_SECONDS}s; isolation settle=${ISOLATION_SETTLE_SECONDS}s"
-  record "DRY-RUN: sample Vector peak RSS; 5,000-line delivery-loss percentage is informational"
+  record "DRY-RUN: positive controls require source +1 and exact event=node_warning/event_code=invocation_replay_insert_failed shipped +1"
+  record "DRY-RUN: negative probes require source +0 and exact probe shipped +0; unrelated event deltas print event/event_code enums"
+  record "DRY-RUN: 5,000-line bursts measured with fresh source samples at production cpus=0.25 and temporary cpus=0.5"
+  record "DRY-RUN: half-CPU Vector is recreated only for the second burst and production cpus=0.25 restored before isolation"
   record "DRY-RUN: actual Docker, network and memory checks NOT run"
   exit 0
 fi
@@ -372,11 +391,36 @@ read_metric_sample() {
 metric_now_ms() { node -p 'Date.now()'; }
 vector_shipped_count() {
   [[ "$(docker_cmd inspect -f '{{.State.Running}}' "$VECTOR_ID")" == true ]] || fail "refusing to read events from a stopped Vector container"
-  docker_cmd logs "$VECTOR_ID" 2>&1 | node "$ROOT/scripts/tc-959-vector-metrics.mjs" shipped-count
+  docker_cmd logs "$VECTOR_ID" 2>&1 | node "$ROOT/scripts/tc-959-vector-metrics.mjs" probe-count
+}
+vector_shipped_name_counts() {
+  [[ "$(docker_cmd inspect -f '{{.State.Running}}' "$VECTOR_ID")" == true ]] || fail "refusing to read events from a stopped Vector container"
+  docker_cmd logs "$VECTOR_ID" 2>&1 | node "$ROOT/scripts/tc-959-vector-metrics.mjs" event-name-counts
+}
+report_shipped_event_delta() {
+  printf '%s\n%s\n' "$1" "$2" | node "$ROOT/scripts/tc-959-vector-metrics.mjs" event-name-delta |
+    while IFS= read -r event; do record "INFO: newly shipped console $event"; done
 }
 vector_event_count() {
   [[ "$(docker_cmd inspect -f '{{.State.Running}}' "$VECTOR_ID")" == true ]] || fail "refusing to read events from a stopped Vector container"
   docker_cmd logs "$VECTOR_ID" 2>&1 | node "$ROOT/scripts/tc-959-vector-metrics.mjs" event-count ingress_request_slow
+}
+measure_burst() {
+  local cpus=$1 before sent_at after received deadline loss
+  before=$(fresh_sample)
+  sent_at=$(metric_now_ms)
+  rm -f "$CONTROL/burst-done"
+  printf '%s\n' 5000 >"$CONTROL/burst"
+  deadline=$((SECONDS + 30))
+  while [[ ! -f "$CONTROL/burst-done" ]] && (( SECONDS < deadline )); do sleep 0.1; done
+  [[ -f "$CONTROL/burst-done" ]] || fail "5,000-line producer burst did not complete at cpus=$cpus"
+  rm -f "$CONTROL/burst-done"
+  after=$(wait_fresh_stable_metric "$sent_at")
+  received=$((after - before))
+  (( received >= 0 )) || fail "GELF receive counter regressed during cpus=$cpus burst"
+  loss=$(( (5000 - received) * 100 / 5000 ))
+  (( loss >= 0 )) || loss=0
+  record "INFO: 5,000-line burst cpus=$cpus received=$received loss=${loss}%"
 }
 
 compose_cmd ps -q tinycloud >/dev/null
@@ -432,23 +476,15 @@ node_restarts_after=$(docker_cmd inspect -f '{{.RestartCount}}' "$NODE_ID")
 [[ "$node_restarts" == "$node_restarts_after" ]] || fail "node restarted during Vector recovery matrix"
 record "PASS: app restart count unchanged across all Vector recovery tests"
 
-before_metric=$(wait_metric 0)
-printf '%s\n' 5000 >"$CONTROL/burst"
-deadline=$((SECONDS + 30))
-while [[ ! -f "$CONTROL/burst-done" ]] && (( SECONDS < deadline )); do sleep 0.1; done
-[[ -f "$CONTROL/burst-done" ]] || fail "5,000-line producer burst did not complete"
-rm -f "$CONTROL/burst-done"
-deadline=$((SECONDS + 20))
-after_metric=$before_metric
-while (( SECONDS < deadline )); do
-  after_metric=$(read_metric)
-  [[ "$after_metric" =~ ^[0-9]+$ ]] || after_metric=$before_metric
-  (( after_metric >= before_metric + 5000 )) && break
-  sleep 0.5
-done
-loss=100
-if (( after_metric >= before_metric )); then loss=$(( (5000 - (after_metric - before_metric)) * 100 / 5000 )); (( loss < 0 )) && loss=0; fi
-record "INFO: 5,000-line receive count delta=$((after_metric - before_metric)); estimated transport loss=${loss}% (informational)"
+measure_burst 0.25
+compose_half_cpu_cmd up -d --force-recreate --no-deps vector >/dev/null
+wait_vector
+wait_next_line 0
+measure_burst 0.5
+compose_cmd up -d --force-recreate --no-deps vector >/dev/null
+wait_vector
+wait_next_line 0
+record "INFO: restored production Vector cpus=0.25 before isolation, node-latency, and memory checks"
 
 # Keep the idle synthetic ingress up so its network namespace is available for sibling probes.
 sleep 1
@@ -474,15 +510,17 @@ send_probe() {
 # Positive controls precede the leak self-test and every forbidden-source assertion.
 source_before=$(fresh_sample)
 shipped_before=$(vector_shipped_count)
+shipped_names_before=$(vector_shipped_name_counts)
 sent_at=$(metric_now_ms)
 node "$SENDER" 127.0.0.1 12201 "$payload"
-assert_positive_delivery "$source_before" "$shipped_before" "$sent_at" "host loopback"
+assert_positive_delivery "$source_before" "$shipped_before" "$sent_at" "host loopback" "$shipped_names_before"
 
 source_before=$(fresh_sample)
 shipped_before=$(vector_shipped_count)
+shipped_names_before=$(vector_shipped_name_counts)
 sent_at=$(metric_now_ms)
 send_from_container "${PROJECT}_logship" "$vector_ip"
-assert_positive_delivery "$source_before" "$shipped_before" "$sent_at" "logship-network control container"
+assert_positive_delivery "$source_before" "$shipped_before" "$sent_at" "logship-network control container" "$shipped_names_before"
 
 
 run_isolation_leak_self_test host host 127.0.0.1

@@ -57,6 +57,31 @@ export function countShippedEvents(logs) {
 export function countShippedEvent(logs, event) {
   return parsedEvents(logs).filter((record) => record.event === event).length;
 }
+export function countShippedProbeEvents(logs) {
+  return parsedEvents(logs).filter((record) => record.event === "node_warning" && record.event_code === "invocation_replay_insert_failed").length;
+}
+
+export function shippedEventNameCounts(logs) {
+  const counts = new Map();
+  for (const record of parsedEvents(logs)) {
+    if (typeof record.event !== "string" || typeof record.event_code !== "string") continue;
+    if (!/^[a-z][a-z0-9_]*$/.test(record.event) || !/^[a-z][a-z0-9_]*$/.test(record.event_code)) continue;
+    const key = `${record.event}\t${record.event_code}`;
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  return [...counts].map(([key, count]) => {
+    const [event, event_code] = key.split("\t");
+    return { event, event_code, count };
+  });
+}
+
+export function shippedEventNameDelta(before, after) {
+  const prior = new Map(before.map(({ event, event_code, count }) => [`${event}\t${event_code}`, count]));
+  return after.flatMap(({ event, event_code, count }) => {
+    const delta = count - (prior.get(`${event}\t${event_code}`) ?? 0);
+    return delta > 0 ? [{ event, event_code, count: delta }] : [];
+  });
+}
 
 if (fileURLToPath(import.meta.url) === process.argv[1]) {
   const [operation, event] = process.argv.slice(2);
@@ -72,7 +97,16 @@ if (fileURLToPath(import.meta.url) === process.argv[1]) {
     process.stdout.write(String(countShippedEvents(input)));
   } else if (operation === "event-count" && event) {
     process.stdout.write(String(countShippedEvent(input, event)));
+  } else if (operation === "probe-count") {
+    process.stdout.write(String(countShippedProbeEvents(input)));
+  } else if (operation === "event-name-counts") {
+    process.stdout.write(JSON.stringify(shippedEventNameCounts(input)));
+  } else if (operation === "event-name-delta") {
+    const [before, after] = input.trimEnd().split(/\r?\n/).map((line) => JSON.parse(line));
+    for (const { event, event_code, count } of shippedEventNameDelta(before, after)) {
+      process.stdout.write(`event=${event} event_code=${event_code} count=${count}\n`);
+    }
   } else {
-    throw new Error("usage: tc-959-vector-metrics.mjs received-counter|received-sample|shipped-count|event-count EVENT");
+    throw new Error("usage: tc-959-vector-metrics.mjs received-counter|received-sample|shipped-count|event-count EVENT|probe-count|event-name-counts|event-name-delta");
   }
 }
