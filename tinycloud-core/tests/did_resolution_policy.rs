@@ -11,7 +11,10 @@ use support::*;
 use tinycloud_auth::{
     resolver::DID_METHODS,
     ssi::{
-        dids::{DIDBuf, DIDResolver},
+        dids::{
+            resolution::{DerefError, Error as ResolutionError, Options},
+            DIDBuf, DIDResolver, DIDURLBuf,
+        },
         jwk::{Algorithm, JWK},
         ucan::UcanRevocation,
     },
@@ -54,6 +57,55 @@ async fn default_refuses_web_variants_before_connecting() {
         );
     }
     assert_no_connections(&[&first, &second]).await;
+}
+
+#[tokio::test]
+async fn default_direct_representation_refuses_valid_web_before_connecting() {
+    let _lock = policy_lock().await;
+    assert_eq!(policy(), DidResolutionPolicy::default());
+    let listener = bound_listener();
+    let did: DIDBuf = format!(
+        "did:web:127.0.0.1%3A{}",
+        listener.local_addr().unwrap().port()
+    )
+    .parse()
+    .unwrap();
+    let resolver = NodeDidResolver::current();
+    // Bound the test if the resolver's second guard regresses and SSI waits for HTTP.
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        resolver.resolve_representation(&did, Options::default()),
+    )
+    .await;
+    assert_no_connections(&[&listener]).await;
+    let expected = UcanVerifyError::MethodDisabled {
+        method: "web".into(),
+    }
+    .to_string();
+    assert!(matches!(result, Ok(Err(ResolutionError::Internal(message))) if message == expected));
+}
+
+#[tokio::test]
+async fn default_direct_dereference_refuses_valid_web_before_connecting() {
+    let _lock = policy_lock().await;
+    assert_eq!(policy(), DidResolutionPolicy::default());
+    let listener = bound_listener();
+    let issuer: DIDURLBuf = format!(
+        "did:web:127.0.0.1%3A{}#key",
+        listener.local_addr().unwrap().port()
+    )
+    .parse()
+    .unwrap();
+    let resolver = NodeDidResolver::current();
+    let result = tokio::time::timeout(Duration::from_secs(1), resolver.dereference(&issuer)).await;
+    assert_no_connections(&[&listener]).await;
+    let expected = UcanVerifyError::MethodDisabled {
+        method: "web".into(),
+    }
+    .to_string();
+    assert!(
+        matches!(result, Ok(Err(DerefError::Resolution(ResolutionError::Internal(message)))) if message == expected)
+    );
 }
 
 #[tokio::test]
