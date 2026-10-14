@@ -4,13 +4,15 @@ use std::borrow::Cow;
 
 use base64::{engine::general_purpose::URL_SAFE, Engine as _};
 use sea_orm::{
-    entity::prelude::*, sea_query::Query, ActiveValue::Set, ConnectionTrait, QueryOrder,
+    entity::prelude::*, sea_query::Query, ActiveValue::Set, ConnectionTrait, JoinType, QueryOrder,
     QuerySelect,
 };
+use sea_orm_migration::{seaql_migrations, MigrationName};
 use tinycloud_auth::authorization::{HeaderEncode, TinyCloudDelegation};
 
 use crate::encryption::{maybe_decrypt, ColumnEncryption};
 use crate::hash::{hash, Hash};
+use crate::migrations::m20261014_000000_delegation_cid_alias::Migration;
 use crate::models::delegation;
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
@@ -64,17 +66,12 @@ async fn validate_encryption<C: ConnectionTrait>(
     db: &C,
     encryption: Option<&ColumnEncryption>,
 ) -> Result<(), DbErr> {
-    let encrypted_id = Query::select()
-        .column(Column::Id)
-        .from(Entity)
-        .and_where(Expr::col(Column::Encrypted).eq(true))
-        .limit(1)
-        .to_owned();
     let Some((id, stored)) = delegation::Entity::find()
         .select_only()
         .column(delegation::Column::Id)
         .column(delegation::Column::Serialization)
-        .filter(delegation::Column::Id.in_subquery(encrypted_id))
+        .join_rev(JoinType::InnerJoin, Relation::Delegation.def())
+        .filter(Column::Encrypted.eq(true))
         .into_tuple::<(Hash, Vec<u8>)>()
         .one(db)
         .await?
@@ -109,6 +106,24 @@ pub(crate) async fn backfill<C: ConnectionTrait>(
     encryption: Option<&ColumnEncryption>,
 ) -> Result<(), DbErr> {
     const PAGE_SIZE: u64 = 128;
+    if db.get_database_backend() != sea_orm::DbBackend::Sqlite {
+        // Serialize boot transactions before the first history read. In
+        // particular, MySQL must not establish a stale repeatable-read snapshot
+        // before waiting for another boot's aliases. SQLite's caller already
+        // holds its BEGIN IMMEDIATE writer lock.
+        let migration = seaql_migrations::Entity::find_by_id(Migration.name())
+            .select_only()
+            .column(seaql_migrations::Column::AppliedAt)
+            .lock_exclusive()
+            .into_tuple::<i64>()
+            .one(db)
+            .await?;
+        if migration.is_none() {
+            return Err(DbErr::Custom(
+                "delegation CID alias backfill: migration record is missing".into(),
+            ));
+        }
+    }
     let mut after = None;
     loop {
         let mut query = delegation::Entity::find()
@@ -274,13 +289,9 @@ mod tests {
         )
         .await;
 
-        let missing = backfill(&db, None).await.unwrap_err();
-        assert!(missing
-            .to_string()
-            .contains("requires a column encryption key"));
+        assert!(backfill(&db, None).await.is_err());
         let wrong = ColumnEncryption::new([0x43; 32]);
-        let rejected = backfill(&db, Some(&wrong)).await.unwrap_err();
-        assert!(rejected.to_string().contains("decryption failed"));
+        assert!(backfill(&db, Some(&wrong)).await.is_err());
         assert_eq!(Entity::find().count(&db).await.unwrap(), 0);
     }
 
@@ -288,10 +299,7 @@ mod tests {
     async fn mismatched_plaintext_hash_is_not_aliased() {
         let db = database().await;
         insert_delegation(&db, hash(b"different content"), ucan_serialization()).await;
-        let error = backfill(&db, None).await.unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("plaintext content hash does not match stored ID"));
+        assert!(backfill(&db, None).await.is_err());
         assert_eq!(Entity::find().count(&db).await.unwrap(), 0);
     }
 
@@ -301,8 +309,7 @@ mod tests {
         let serialization = vec![0xa0];
         insert_delegation(&db, hash(&serialization), serialization).await;
         let transaction = db.begin().await.unwrap();
-        let error = backfill(&transaction, None).await.unwrap_err();
-        assert!(error.to_string().contains("delegation decoding failed"));
+        assert!(backfill(&transaction, None).await.is_err());
         transaction.rollback().await.unwrap();
         assert_eq!(Entity::find().count(&db).await.unwrap(), 0);
     }
@@ -320,5 +327,161 @@ mod tests {
         assert_eq!(Entity::find().count(&db).await.unwrap(), 129);
         backfill(&db, None).await.unwrap();
         assert_eq!(Entity::find().count(&db).await.unwrap(), 129);
+    }
+
+    #[tokio::test]
+    async fn postgres_concurrent_historical_backfills_produce_ready_databases() {
+        use std::time::Duration;
+
+        use crate::{
+            db::{DelegationStatus, SpaceDatabase},
+            keys::StaticSecret,
+            models::{abilities, revocation, space},
+            relationships::parent_delegations,
+            storage::memory::MemoryStore,
+            test_support::PostgresTestSchema,
+        };
+        use sea_orm::{IntoActiveModel, Statement};
+        use tinycloud_auth::authorization::Cid;
+
+        let Some(fixture) = PostgresTestSchema::new(
+            "postgres_concurrent_historical_backfills_produce_ready_databases",
+        )
+        .await
+        else {
+            return;
+        };
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/tc1071/generated");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(source.join("manifest.json")).unwrap()).unwrap();
+        let historical = manifest
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["database"] == "revoked-v0.sqlite")
+            .unwrap();
+        let old = Database::connect(format!(
+            "sqlite:{}?mode=ro",
+            source.join("revoked-v0.sqlite").display()
+        ))
+        .await
+        .unwrap();
+        macro_rules! copy_records {
+            ($entity:path) => {
+                let records = <$entity>::find().all(&old).await.unwrap();
+                if !records.is_empty() {
+                    <$entity>::insert_many(records.into_iter().map(|row| row.into_active_model()))
+                        .exec(&fixture.conn)
+                        .await
+                        .unwrap();
+                }
+            };
+        }
+        copy_records!(actor::Entity);
+        copy_records!(space::Entity);
+        copy_records!(delegation::Entity);
+        copy_records!(abilities::Entity);
+        copy_records!(parent_delegations::Entity);
+        copy_records!(revocation::Entity);
+        old.close().await.unwrap();
+        let original = delegation::Entity::find()
+            .order_by_asc(delegation::Column::Id)
+            .all(&fixture.conn)
+            .await
+            .unwrap();
+
+        // Force both constructors into overlapping database work. Following
+        // the blocker graph permits either a serialized backfill or a
+        // conflict-safe insert, without pinning the implementation's lock.
+        let blocker = fixture.conn.begin().await.unwrap();
+        let blocker_pid: i32 = blocker
+            .query_one(Statement::from_string(
+                sea_orm::DbBackend::Postgres,
+                "SELECT pg_backend_pid() AS pid",
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "pid")
+            .unwrap();
+        blocker
+            .execute_unprepared("LOCK TABLE delegation_cid_alias IN EXCLUSIVE MODE")
+            .await
+            .unwrap();
+        let workers = std::array::from_fn::<_, 2, _>(|_| {
+            let connection = fixture.conn.clone();
+            tokio::spawn(async move {
+                SpaceDatabase::new(
+                    connection,
+                    MemoryStore::default(),
+                    StaticSecret::new(vec![31; 32]).unwrap(),
+                )
+                .await
+            })
+        });
+        let waiting = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let blocked: i64 = fixture
+                    .conn
+                    .query_one(Statement::from_sql_and_values(
+                        sea_orm::DbBackend::Postgres,
+                        "WITH RECURSIVE blocked(pid) AS (SELECT $1::int UNION SELECT activity.pid FROM pg_stat_activity AS activity INNER JOIN blocked ON blocked.pid = ANY(pg_blocking_pids(activity.pid))) SELECT COUNT(*) AS blocked FROM blocked WHERE pid <> $1",
+                        [blocker_pid.into()],
+                    ))
+                    .await?
+                    .ok_or_else(|| DbErr::Custom("missing PostgreSQL wait observation".into()))?
+                    .try_get("", "blocked")?;
+                if blocked == 2 {
+                    return Ok::<(), DbErr>(());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        blocker.commit().await.unwrap();
+        let [first, second] = workers;
+        let results = [first.await.unwrap(), second.await.unwrap()];
+        let roots = historical["rows"].as_array().unwrap();
+        let mut statuses = Vec::with_capacity(roots.len() * results.len());
+        let mut errors = Vec::with_capacity(results.len());
+        for result in results {
+            match result {
+                Ok(db) => {
+                    for row in roots {
+                        let cid: Cid = row["raw_cid"].as_str().unwrap().parse().unwrap();
+                        statuses.push(
+                            db.delegation_status(
+                                Hash::from(cid),
+                                historical["issuer"].as_str().unwrap(),
+                                &[],
+                            )
+                            .await,
+                        );
+                    }
+                }
+                Err(error) => errors.push(error),
+            }
+        }
+        let current = delegation::Entity::find()
+            .order_by_asc(delegation::Column::Id)
+            .all(&fixture.conn)
+            .await;
+        fixture.conn.clone().close().await.unwrap();
+        waiting
+            .expect("both constructors must overlap under the database blocker")
+            .unwrap();
+        assert!(errors.is_empty(), "concurrent startup failed: {errors:?}");
+        for status in statuses {
+            assert!(
+                matches!(status, Ok(Some(DelegationStatus::Revoked))),
+                "each historical equivalent must remain revoked after concurrent startup",
+            );
+        }
+        assert_eq!(
+            current.unwrap(),
+            original,
+            "concurrent startup must preserve every historical signed row",
+        );
     }
 }

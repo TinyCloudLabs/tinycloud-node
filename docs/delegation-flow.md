@@ -409,6 +409,18 @@ failures, and plaintext hash mismatches fail startup rather than silently
 leaving an active alias. Completed backfills do not re-decode indexed history;
 one indexed encrypted record is checked on each boot to validate the key.
 
+Concurrent PostgreSQL and MySQL boot transactions lock this migration's history
+row before their first history read. This also prevents a waiting MySQL boot
+from establishing a stale repeatable-read snapshot. SQLite keeps its existing
+`BEGIN IMMEDIATE` writer serialization. Failures roll back the boot transaction;
+alias conflicts are not ignored. MySQL stores complete, unpadded multihashes in
+indexed `VARBINARY(255)` columns, and the one-row encrypted-key check uses a join
+with an outer limit rather than MySQL's unsupported limited `IN` subquery.
+
+Stop old-version writers before upgrading the shared database. Older binaries
+do not maintain the alias index; mixed-version writes are not a supported
+security cutover. Do not accept requests until the new constructors complete.
+
 Revocation status, invocation authorization, and ancestor checks union owner
 revocations across equivalent stored CIDs through indexed lookups. Historical
 delegation IDs, signed bytes, revocation targets, and child proof edges are
@@ -427,6 +439,24 @@ the exact stored raw header, not a re-encoding of the decoded CACAO. Their
 parent CID fields retain the signed child references. Existing legacy list
 ancestor-visibility behavior is unchanged; authorization always checks the
 complete chain.
+
+Rust callers must supply column encryption at construction through
+`SpaceDatabase::new_with_encryption`, not a post-open setter.
+`InvocationOutcome::OpenSessions` and `DelegationChain` retain serialized
+delegation wrappers so callers can preserve the original headers rather than
+re-encode them. SDK session setup validates and normalizes wallet signatures
+before deriving its delegation CID, including direct Rust `SignedSession`
+values that bypass JSON deserialization. Recovery IDs 0/1 and 27/28 therefore
+produce the node's same proof CID; invalid encodings and high-s signatures are
+rejected. Rust exhaustive matches must account for
+`session::Error::InvalidSIWESignature`.
+
+MySQL coverage remains bounded: native MySQL 8.0.46 alias-migration, backfill,
+concurrent-boot, and key-validation checks do not establish full-constructor
+support. On the same `utf8mb4`/default-strict configuration, unmodified
+`f9d700bf` fails the older initial schema with error 1074 on `id`, before the
+alias migration exists. That separate full-schema prerequisite must be resolved
+and exercised before claiming end-to-end support for that configuration.
 
 ## Child Delegation (UCAN) Creation
 

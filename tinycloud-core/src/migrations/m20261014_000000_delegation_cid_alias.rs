@@ -8,22 +8,24 @@ pub struct Migration;
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let mut id = ColumnDef::new(delegation_cid_alias::Column::Id);
+        let mut canonical = ColumnDef::new(delegation_cid_alias::Column::Canonical);
+        if manager.get_database_backend() == sea_orm::DbBackend::MySql {
+            // Encoded multihashes have variable length; MySQL's bare BINARY
+            // defaults to one byte, and fixed-width BINARY would pad the ID.
+            id.var_binary(255);
+            canonical.var_binary(255);
+        } else {
+            id.binary();
+            canonical.binary();
+        }
         manager
             .create_table(
                 Table::create()
                     .table(delegation_cid_alias::Entity)
                     .if_not_exists()
-                    .col(
-                        ColumnDef::new(delegation_cid_alias::Column::Id)
-                            .binary()
-                            .not_null()
-                            .primary_key(),
-                    )
-                    .col(
-                        ColumnDef::new(delegation_cid_alias::Column::Canonical)
-                            .binary()
-                            .not_null(),
-                    )
+                    .col(id.not_null().primary_key())
+                    .col(canonical.not_null())
                     .col(
                         ColumnDef::new(delegation_cid_alias::Column::Encrypted)
                             .boolean()

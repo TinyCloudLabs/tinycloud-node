@@ -6,6 +6,9 @@
 - Synchronize the standalone M1, W5 and load-signer Cargo locks with CACAO's `k256` dependency so `--locked` dependency resolution succeeds (TC-1071).
 
 - Historical CACAO revocations now apply to every stored encoding of the same delegation, in both directions (TC-1071). A persisted CID-alias index derives identities from current ingestion's canonical bytes, including recovery-ID, issuer-address/chain, and accepted CBOR representation normalization. Startup backfills aliases transactionally after loading the column encryption key and fails closed on undecodable or mismatched history or missing/wrong keys. Historical IDs, signed bytes, revocation targets, and signed child proof references remain unchanged; legacy list/chain responses retain their exact raw-header/CID relationship. This closes reuse of an already owner-signed grant under another accepted encoding; it does not involve forging new rights.
+- CACAO issuer address casing and numeric chain spelling now serialize to the verifier's same EIP-55/u64 identity without changing the signed SIWE message. SDK session setup checks and normalizes wallet signatures before deriving its proof CID, including direct Rust sessions; low-v wallet signatures no longer produce `MissingParents` (TC-1071).
+- Serialize concurrent PostgreSQL/MySQL historical backfills before their first history read; failed startup still rolls back aliases and preserves signed records. MySQL alias columns retain full variable-length multihashes, and encrypted-key validation avoids its unsupported limited `IN` subquery. Native alias checks do not waive the separately reproduced older MySQL 8.0.46 full-schema error 1074 (TC-1071).
+- Rust API cutover: pass encryption through `SpaceDatabase::new_with_encryption`; list/chain outcomes carry serialized delegation wrappers. SDK exhaustive error matches must handle the new `session::Error::InvalidSIWESignature` variant (TC-1071).
 
 ## [1.20.6] - 2026-10-14
 
