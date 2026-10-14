@@ -204,6 +204,7 @@ services:
       - "$CONTROL:/control"
     ports: !override []
   vector:
+    init: true
     entrypoint: !override ["/bin/sh", "-ec"]
     environment: !override {}
     command:
@@ -244,6 +245,9 @@ const baseVectorEnv = baseCompose.services.vector.environment ?? {};
 if (!Object.hasOwn(baseVectorEnv, 'VECTOR_CONFIG_YAML') || !Object.hasOwn(baseVectorEnv, 'BETTERSTACK_SOURCE_TOKEN')) {
   throw new Error('base Vector environment regression fixture is missing');
 }
+if (baseCompose.services?.vector?.init !== true) {
+  throw new Error('production Vector service must set init: true for restart supervision');
+}
 const vectorEnv = compose.services?.vector?.environment;
 if (!vectorEnv || Object.keys(vectorEnv).length !== 0) throw new Error('acceptance Vector environment must be explicitly empty');
 const ingressEnv = compose.services?.['dstack-ingress']?.environment;
@@ -261,7 +265,7 @@ const envCheck = spawnSync(process.execPath, [`${root}/scripts/tc-959-compose-en
     tinycloud: { environment: nodeEnv },
     'dstack-ingress': { environment: ingressEnv },
     postgres: { environment: postgresEnv },
-    vector: { environment: vectorEnv },
+    vector: { init: true, environment: vectorEnv },
   } }),
   encoding: 'utf8',
 });
@@ -272,6 +276,7 @@ if (!Array.isArray(ingressCommand) || ingressCommand.length !== 3 ||
   throw new Error('dstack-ingress effective Compose argv must be [/bin/sh, -ec, script]');
 }
 const vector = compose.services?.vector;
+if (vector?.init !== true) throw new Error('acceptance Vector service must set init: true');
 if (JSON.stringify(vector?.entrypoint) !== JSON.stringify(['/bin/sh', '-ec']) ||
     !Array.isArray(vector.command) || vector.command.length !== 1 || typeof vector.command[0] !== 'string') {
   throw new Error('vector must override the production entrypoint and use a one-script command');

@@ -49,7 +49,10 @@ export function assertAcceptanceEnvironment(compose) {
     throw new Error("Postgres environment differs from the test-only override");
   }
 
+
   const vector = serviceEnvironment(compose, "vector");
+  const vectorService = compose.services.vector;
+  if (vectorService.init !== true) throw new Error("Compose Vector service must set init: true");
   const forbiddenVectorKeys = Object.keys(vector).filter((name) => name.startsWith("VECTOR_") || name.includes("TOKEN"));
   if (forbiddenVectorKeys.length || Object.keys(vector).length) {
     throw new Error(`vector environment contains inherited keys${forbiddenVectorKeys.length ? `: ${forbiddenVectorKeys.join(", ")}` : ""}`);

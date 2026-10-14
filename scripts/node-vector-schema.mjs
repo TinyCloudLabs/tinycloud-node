@@ -289,6 +289,12 @@ export function checkComposeDeploymentPackaging(compose) {
   }
   if (!isComposeMapping(definition)) throw new Error("Compose packaging must be a YAML mapping");
 
+  const services = definition.services;
+  if (isComposeMapping(services) && Object.hasOwn(services, "vector") &&
+      (!isComposeMapping(services.vector) || services.vector.init !== true)) {
+    throw new Error("Compose Vector service must set init: true");
+  }
+
   for (const config of Object.values(definition.configs ?? {})) {
     if (isComposeMapping(config) && Object.hasOwn(config, "file")) {
       throw new Error("Compose packaging must not use configs.*.file");

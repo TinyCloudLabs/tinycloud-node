@@ -101,36 +101,98 @@ docker_cmd() {
 port_error=$(check_host_ports_free 2>&1) && fail "busy host port passed preflight"
 [[ "$port_error" == *"127.0.0.1:18000"* && "$port_error" == *"tc959-existing-compose"* ]] || fail "port preflight omitted listener owner: $port_error"
 
-# A real crash sends SIGKILL to the host PID and requires exactly one restart.
-VECTOR_ID=vector-test
-RESTART_COUNT=4
-KILLED_PID=""
+# Container-scoped crash proofs use an exact container ID and never host PIDs.
+VECTOR_ID=0123456789abcdef-vector
+SNAPSHOT_ID=$VECTOR_ID
+SNAPSHOT_RESTARTS=4
+SNAPSHOT_STARTED=2026-10-14T10:00:00.000000000Z
+CURRENT_ID=$VECTOR_ID
+CURRENT_RESTARTS=5
+CURRENT_STARTED=2026-10-14T10:01:00.000000000Z
+CURRENT_RUNNING=true
+VECTOR_PIDS=42
+VECTOR_COMM=vector
+SIGNALS=0
 RECOVERED_LINE_COUNT=""
 docker_cmd() {
-  if [[ "$1" != inspect ]]; then return 1; fi
-  case "$3" in
-    '{{.RestartCount}}') printf '%s\n' "$RESTART_COUNT" ;;
-    '{{.State.Pid}}') printf '%s\n' 4242 ;;
-    '{{.State.Running}}') printf '%s\n' true ;;
-    *) return 1 ;;
-  esac
-}
-kill() {
-  [[ "$1" == -KILL && "$2" == 4242 ]] || fail "crash helper did not SIGKILL the host container PID"
-  KILLED_PID=$2
-  RESTART_COUNT=5
+  if [[ "$1" == inspect ]]; then
+    case "$3" in
+      '{{.Id}}|{{.RestartCount}}|{{.State.StartedAt}}')
+        printf '%s|%s|%s\n' "$SNAPSHOT_ID" "$SNAPSHOT_RESTARTS" "$SNAPSHOT_STARTED"
+        ;;
+      '{{.Id}}|{{.RestartCount}}|{{.State.StartedAt}}|{{.State.Running}}')
+        printf '%s|%s|%s|%s\n' "$CURRENT_ID" "$CURRENT_RESTARTS" "$CURRENT_STARTED" "$CURRENT_RUNNING"
+        ;;
+      *) return 1 ;;
+    esac
+    return 0
+  fi
+  if [[ "$1" == exec && "$2" == --user && "$3" == 10001:10001 && "$4" == "$VECTOR_ID" ]]; then
+    case "$5" in
+      busybox)
+        case "$6" in
+          pidof)
+            [[ "$7" == vector && -n "$VECTOR_PIDS" ]] || return 1
+            printf '%s\n' "$VECTOR_PIDS"
+            ;;
+          kill)
+            [[ "$7" == -KILL && "$8" == "${VECTOR_PIDS%% *}" ]] || return 1
+            SIGNALS=$((SIGNALS + 1))
+            printf '%s\n' SIGNAL_SENT >&2
+            ;;
+          *) return 1 ;;
+        esac
+        ;;
+      cat)
+        [[ "$6" == "/proc/${VECTOR_PIDS%% *}/comm" ]] || return 1
+        printf '%s\n' "$VECTOR_COMM"
+        ;;
+      *) return 1 ;;
+    esac
+    return 0
+  fi
+  return 1
 }
 wait_vector() { :; }
 wait_next_line() { RECOVERED_LINE_COUNT=$1; }
+sleep() { SECONDS=$((SECONDS + 20)); }
+record() { :; }
+expect_crash_failure() {
+  local expected=$1 signal_expected=${2:-no} output
+  SECONDS=0
+  output=$(crash_vector 17 2>&1) && fail "crash helper accepted $expected"
+  [[ "$output" == *"$expected"* ]] || fail "crash helper failure did not explain $expected: $output"
+  if [[ "$signal_expected" == no ]]; then
+    [[ "$output" != *SIGNAL_SENT* ]] || fail "crash helper signalled before rejecting $expected"
+  else
+    [[ "$output" == *SIGNAL_SENT* ]] || fail "crash helper did not signal before checking $expected"
+  fi
+}
 crash_vector 17
-assert_eq "$KILLED_PID" 4242
+assert_eq "$SIGNALS" 1
 assert_eq "$RECOVERED_LINE_COUNT" 17
 
-# A SIGKILL without a restart must fail rather than look like a successful crash.
-kill() { :; }
-sleep() { SECONDS=$((SECONDS + 20)); }
-RESTART_COUNT=5
-SECONDS=0
-restart_error=$(crash_vector 18 2>&1) && fail "crash helper accepted a kill without a restart"
-[[ "$restart_error" == *"RestartCount did not increase by exactly one"* ]] || fail "crash helper gave no explicit restart-count failure: $restart_error"
-printf '%s\n' 'PASS: port ownership preflight and SIGKILL restart-count checks'
+VECTOR_PIDS=""
+expect_crash_failure "exactly one Vector PID"
+VECTOR_PIDS="42 43"
+expect_crash_failure "exactly one Vector PID"
+VECTOR_PIDS=1
+expect_crash_failure "PID must be greater than 1"
+VECTOR_PIDS=42
+VECTOR_COMM=nginx
+expect_crash_failure "comm is not vector"
+VECTOR_COMM=vector
+SNAPSHOT_ID=another-container-id
+expect_crash_failure "container ID changed before crash"
+SNAPSHOT_ID=$VECTOR_ID
+CURRENT_ID=another-container-id
+expect_crash_failure "container ID changed" after-signal
+CURRENT_ID=$VECTOR_ID
+CURRENT_RESTARTS=4
+expect_crash_failure "RestartCount did not increase by exactly one" after-signal
+CURRENT_RESTARTS=6
+expect_crash_failure "RestartCount advanced past expected +1" after-signal
+CURRENT_RESTARTS=5
+CURRENT_STARTED=$SNAPSHOT_STARTED
+expect_crash_failure "StartedAt did not advance" after-signal
+printf '%s\n' 'PASS: exact-container crash identity and restart proofs'

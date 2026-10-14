@@ -21,6 +21,8 @@
         "POSTGRES_HOST_AUTH_METHOD": "trust"
       }
     },
-    "vector": {}
+    "vector": {
+      "init": true
+    }
   }
 }

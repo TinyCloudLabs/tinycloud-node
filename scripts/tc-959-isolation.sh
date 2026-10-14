@@ -11,32 +11,56 @@ check_host_ports_free() {
 }
 
 crash_vector() {
-  local previous_line_count=$1 restart_before container_pid target_restart
-  local restart_count="" running="" deadline
-  restart_before=$(docker_cmd inspect -f '{{.RestartCount}}' "$VECTOR_ID")
-  container_pid=$(docker_cmd inspect -f '{{.State.Pid}}' "$VECTOR_ID")
-  [[ "$restart_before" =~ ^[0-9]+$ ]] || fail "Vector RestartCount is invalid before SIGKILL: $restart_before"
-  [[ "$container_pid" =~ ^[1-9][0-9]*$ ]] || fail "Vector host PID is invalid before SIGKILL: $container_pid"
+  local previous_line_count=$1 snapshot snapshot_id restart_before started_before
+  local pids vector_pid comm target_restart current current_id current_restart current_started current_running
+  local deadline
+  local -a vector_pids=()
+
+  snapshot=$(docker_cmd inspect -f '{{.Id}}|{{.RestartCount}}|{{.State.StartedAt}}' "$VECTOR_ID") ||
+    fail "could not snapshot Vector container before crash"
+  IFS='|' read -r snapshot_id restart_before started_before <<<"$snapshot"
+  [[ "$snapshot_id" == "$VECTOR_ID" ]] || fail "Vector container ID changed before crash"
+  [[ "$restart_before" =~ ^[0-9]+$ && -n "$started_before" ]] || fail "Vector crash snapshot is invalid"
+
+  pids=$(docker_cmd exec --user 10001:10001 "$VECTOR_ID" busybox pidof vector 2>/dev/null || true)
+  read -r -a vector_pids <<<"$pids"
+  (( ${#vector_pids[@]} == 1 )) || fail "expected exactly one Vector PID in container, found ${#vector_pids[@]}"
+  vector_pid=${vector_pids[0]}
+  [[ "$vector_pid" =~ ^[0-9]+$ ]] || fail "Vector PID is not numeric: $vector_pid"
+  (( vector_pid > 1 )) || fail "Vector PID must be greater than 1"
+  comm=$(docker_cmd exec --user 10001:10001 "$VECTOR_ID" cat "/proc/$vector_pid/comm" 2>/dev/null) ||
+    fail "could not read Vector process comm"
+  [[ "$comm" == vector ]] || fail "container process PID $vector_pid comm is not vector"
+
   target_restart=$((restart_before + 1))
-  kill -KILL "$container_pid" || fail "could not SIGKILL Vector host PID $container_pid"
+  docker_cmd exec --user 10001:10001 "$VECTOR_ID" busybox kill -KILL "$vector_pid" >/dev/null ||
+    fail "container-scoped SIGKILL failed; crash signal was not retried"
 
   deadline=$((SECONDS + 20))
+  current=""
   while (( SECONDS < deadline )); do
-    restart_count=$(docker_cmd inspect -f '{{.RestartCount}}' "$VECTOR_ID" 2>/dev/null || true)
-    [[ "$restart_count" =~ ^[0-9]+$ ]] || { sleep 0.2; continue; }
-    if (( restart_count > target_restart )); then
-      fail "Vector RestartCount advanced past expected +1 after SIGKILL: before=$restart_before after=$restart_count"
+    current=$(docker_cmd inspect -f '{{.Id}}|{{.RestartCount}}|{{.State.StartedAt}}|{{.State.Running}}' "$VECTOR_ID" 2>/dev/null || true)
+    IFS='|' read -r current_id current_restart current_started current_running <<<"$current"
+    [[ -n "$current_id" ]] || { sleep 0.2; continue; }
+    [[ "$current_id" == "$snapshot_id" ]] || fail "Vector container ID changed during crash recovery"
+    [[ "$current_restart" =~ ^[0-9]+$ ]] || { sleep 0.2; continue; }
+    if (( current_restart > target_restart )); then
+      fail "Vector RestartCount advanced past expected +1: before=$restart_before after=$current_restart"
     fi
-    if (( restart_count == target_restart )); then
-      running=$(docker_cmd inspect -f '{{.State.Running}}' "$VECTOR_ID" 2>/dev/null || true)
-      [[ "$running" == true ]] && break
+    if (( current_restart == target_restart )) &&
+       [[ "$current_started" > "$started_before" && "$current_running" == true ]]; then
+      break
     fi
     sleep 0.2
   done
-  [[ "$restart_count" == "$target_restart" ]] ||
-    fail "Vector RestartCount did not increase by exactly one after SIGKILL: before=$restart_before after=${restart_count:-unavailable}"
-  [[ "$running" == true ]] || fail "Vector RestartCount increased but Vector is not running after SIGKILL"
+
+  [[ "$current_id" == "$snapshot_id" ]] || fail "Vector container ID changed during crash recovery"
+  [[ "$current_restart" =~ ^[0-9]+$ ]] && (( current_restart == target_restart )) ||
+    fail "Vector RestartCount did not increase by exactly one: before=$restart_before after=${current_restart:-unavailable}"
+  [[ "$current_started" > "$started_before" ]] || fail "Vector StartedAt did not advance after crash"
+  [[ "$current_running" == true ]] || fail "Vector was not running after crash recovery"
   wait_vector
+  [[ "$VECTOR_ID" == "$snapshot_id" ]] || fail "Vector container ID changed while waiting for output"
   wait_next_line "$previous_line_count"
 }
 

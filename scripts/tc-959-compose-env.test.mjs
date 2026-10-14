@@ -23,14 +23,25 @@ const safe = {
     tinycloud: { environment: nodeEnvironment },
     "dstack-ingress": { environment: {} },
     postgres: { environment: { POSTGRES_HOST_AUTH_METHOD: "trust" } },
-    vector: { environment: {} },
+    vector: { init: true, environment: {} },
   },
 };
 
 test("accepts the sanitized real Compose rendering with omitted cleared environments", () => {
   assert.equal(Object.hasOwn(rendered.services["dstack-ingress"], "environment"), false);
   assert.equal(Object.hasOwn(rendered.services.vector, "environment"), false);
+  assert.equal(rendered.services.vector.init, true);
   assert.doesNotThrow(() => assertAcceptanceEnvironment(rendered));
+});
+
+test("requires init on the rendered Vector service", () => {
+  const missing = structuredClone(safe);
+  delete missing.services.vector.init;
+  assert.throws(() => assertAcceptanceEnvironment(missing), /Vector service must set init: true/);
+  const disabled = structuredClone(safe);
+  disabled.services.vector.init = false;
+  assert.throws(() => assertAcceptanceEnvironment(disabled), /Vector service must set init: true/);
+  assert.doesNotThrow(() => assertAcceptanceEnvironment(safe));
 });
 
 test("rejects forbidden environment entries added to the rendered Compose snapshot", () => {

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
+import { parse } from "yaml";
 import { checkComposeDeploymentPackaging, checkComposeVectorConfig, checkVectorFile, renderAllowlist, renderComposeVectorConfig } from "./node-vector-schema.mjs";
 
 const workflow = readFileSync(new URL("../.github/workflows/rust.yml", import.meta.url), "utf8");
@@ -96,11 +97,18 @@ test("CI runs native Vector validation and tests after checking the pinned relea
 
 const minimalCompose = `services:
   vector:
+    init: true
     environment:
       VECTOR_CONFIG_YAML: |
         sources: {}
     entrypoint: ["vector"]
 `;
+
+test("Vector deployment enables init and rejects a missing init guard", () => {
+  assert.equal(parse(compose).services.vector.init, true);
+  assert.doesNotThrow(() => checkComposeVectorConfig(compose, vector));
+  assert.throws(() => checkComposeDeploymentPackaging(compose.replace("    init: true\n", "")), /init: true/);
+});
 test("rejects an appended block-style configs.file entry", () => {
   assert.throws(
     () => checkComposeVectorConfig(`${minimalCompose}\nconfigs:\n  x:\n    file: ./outside.yaml\n`, "sources: {}"),
