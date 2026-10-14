@@ -294,6 +294,13 @@ When `keys.type` is `Static` the instance will use an array of bytes as a static
 
 The secret MUST contain at least 32 bytes of entropy (either randomly generated or derived in a cryptographically secure way). It is STRONGLY RECOMMENDED that the secret be given via environment variables and NOT in the `tinycloud.toml` config file. Additionally it is STRONGLY RECOMMENDED that the secret be backed up in a secure place if used in production. Loss of the secret will result in total loss of function for the TinyCloud Protocol instance.
 
+## Production log shipping
+
+The production Compose file sends redacted JSON records through Vector to Better Stack. A missing source token leaves only Vector idle; the node and ingress start independently and use asynchronous Fluentd logging.
+
+Node output is bounded to 280 JSON bytes plus one line separator. The caps are 2 panic/min, 5 app ERROR/min, 5 WARN/min, and 27/min through the shared request lane. WARN records first pass their 5/min cap, then share the request lane with aggregates and slow requests; ERROR and panic remain isolated. The conservative monthly ceiling charges all lane caps separately: `(2 + 5 + 5 + 27) × 60 × 24 × 30 × 281 = 473,428,800 bytes` (about 0.473 GB per 30 days), below the node's 0.48 GB allocation of the shared free-plan quota. Ingress 4xx/5xx counts aggregate by route template and status class; successful requests aggregate by route. There are 36 route values, including `<unmatched>` for unknown paths.
+The Docker review check pulls the registry `dstack` image; its Linux/amd64 manifest measured 17,115,015 compressed bytes across seven layers.
+
 ## Running
 
 TinyCloud Protocol instances can be started via command line, e.g.:

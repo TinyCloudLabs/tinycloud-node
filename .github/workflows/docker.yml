@@ -622,7 +622,6 @@ jobs:
             PHALA_ENV_CLOUDFLARE_API_TOKEN
             PHALA_ENV_DSTACK_GATEWAY_DOMAIN
             PHALA_ENV_CERTBOT_EMAIL
-            PHALA_ENV_BETTERSTACK_SOURCE_TOKEN
             PHALA_ENV_SQL_IDENTITY_FENCE
           )
 
@@ -662,6 +661,7 @@ jobs:
             -f docker-compose.dstack-postgres.yaml config --quiet
 
           phala deploy --cvm-id tinycloud-node -c docker-compose.dstack-postgres.yaml -e .phala-prod.env --no-public-logs --no-public-sysinfo --wait
+      # Run only after the compose deploy so a Phala allowed_envs sync failure cannot gate node startup.
       - name: Sync production allowed_envs
         env:
           PHALA_CLOUD_API_KEY: ${{ secrets.PHALA_CLOUD_API_KEY }}

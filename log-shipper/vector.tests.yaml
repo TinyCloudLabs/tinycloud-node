@@ -273,17 +273,32 @@ tests:
         conditions:
           - type: vrl
             source: |
-              assert_eq!(.event, "ingress_request_failed")
+              assert_eq!(.event, "ingress_failure_count")
               assert_eq!(.status, 401)
               assert_eq!(.route, "/signed/kv/<ticket_id>")
               assert!(!contains(encode_json(.), "ticket-probe"))
-  - name: "ingress raw route, IP, and identifier values are rejected"
+  - name: "unknown ingress path is collapsed to bounded unmatched route"
     inputs:
       - insert_at: allowlist
         type: log
         log_fields:
           tag: "tinycloud.ingress"
           log: '{"time":"2026-10-14T10:00:00+00:00","method":"GET","route":"/signed/kv/ticket-probe","status":404,"bytes":0,"request_time":0.02,"remote_addr":"198.51.100.8"}'
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "ingress_failure_count")
+              assert_eq!(.route, "<unmatched>")
+              assert!(!contains(encode_json(.), "ticket-probe"))
+  - name: "oversized raw ingress route is rejected before normalization"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.ingress"
+          log: '{"time":"2026-10-14T10:00:00+00:00","method":"GET","route":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx","status":404,"bytes":0,"request_time":0.02}'
     no_outputs_from: [allowlist]
   - name: "ingress success emits bounded counter input by route only"
     inputs:
@@ -307,7 +322,7 @@ tests:
         type: log
         log_fields:
           tag: "tinycloud.ingress"
-          log: '{"time":"2026-10-14T10:00:00+00:00","method":"GET","route":"/info","status":200,"bytes":30,"request_time":1.2,"upstream_status":"200"}'
+          log: '{"time":"2026-10-14T10:00:00+00:00","method":"GET","route":"/info","status":200,"bytes":30,"request_time":1.2,"upstream_status":"200","remote_addr":"2001:db8::1"}'
     outputs:
       - extract_from: allowlist
         conditions:
@@ -322,20 +337,215 @@ tests:
               assert_eq!(.event, "ingress_request_slow")
               assert_eq!(.request_time_seconds, 1.2)
               assert_eq!(.route, "/info")
-  - name: "per-minute success output is rebuilt from the route counter"
+  - name: "per-minute request output retains route status class and count"
     inputs:
-      - insert_at: success_reduce
+      - insert_at: request_reduce
         type: log
         log_fields:
           route: "/info"
+          status_class: "5xx"
+          event: "ingress_failure_count"
           request_count: 120
           minute: "2026-10-14T10:00"
     outputs:
-      - extract_from: success_output
+      - extract_from: request_output
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "ingress_failure_count")
+              assert_eq!(.status_class, "5xx")
+              assert_eq!(.request_count, 120)
+              assert_eq!(.route, "/info")
+              assert_eq!(.level, "error")
+              assert_eq!(length(keys(.)), 7)
+  - name: "404 and slow 2xx floods cannot consume panic or app error lanes"
+    inputs:
+      - &slow2xx
+        insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.ingress"
+          log: '{"time":"2026-10-14T10:00:00+00:00","method":"GET","route":"/info","status":200,"bytes":0,"request_time":2.0,"upstream_status":"200"}'
+      - *slow2xx
+      - *slow2xx
+      - *slow2xx
+      - *slow2xx
+      - *slow2xx
+      - *slow2xx
+      - *slow2xx
+      - *slow2xx
+      - *slow2xx
+      - *slow2xx
+      - *slow2xx
+      - *slow2xx
+      - *slow2xx
+      - *slow2xx
+      - *slow2xx
+      - *slow2xx
+      - *slow2xx
+      - *slow2xx
+      - *slow2xx
+      - *slow2xx
+      - *slow2xx
+      - *slow2xx
+      - *slow2xx
+      - *slow2xx
+      - *slow2xx
+      - *slow2xx
+      - *slow2xx
+      - *slow2xx
+      - *slow2xx
+      - &failure404
+        insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.ingress"
+          log: '{"time":"2026-10-14T10:00:00+00:00","method":"GET","route":"/info","status":404,"bytes":0,"request_time":0.02,"upstream_status":"-"}'
+      - *failure404
+      - *failure404
+      - *failure404
+      - *failure404
+      - *failure404
+      - *failure404
+      - *failure404
+      - *failure404
+      - *failure404
+      - *failure404
+      - *failure404
+      - *failure404
+      - *failure404
+      - *failure404
+      - *failure404
+      - *failure404
+      - *failure404
+      - *failure404
+      - *failure404
+      - *failure404
+      - *failure404
+      - *failure404
+      - *failure404
+      - *failure404
+      - *failure404
+      - *failure404
+      - *failure404
+      - *failure404
+      - *failure404
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.node"
+          log: '{"timestamp":"2026-10-14T10:00:00.000Z","level":"ERROR","fields":{"message":"addressed delegation authorization failed"}}'
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.node"
+          log: '{"timestamp":"2026-10-14T10:00:00.000Z","level":"ERROR","fields":{"message":"node fatal panic"}}'
+    outputs:
+      - extract_from: throttle_panic
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "node_fatal_panic")
+              assert_eq!(.level, "error")
+      - extract_from: throttle_app_error
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "node_error")
+              assert_eq!(.level, "error")
+  - name: "WARN cannot forge the fatal panic alert"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.node"
+          log: '{"timestamp":"2026-10-14T10:00:00.000Z","level":"WARN","fields":{"message":"node fatal panic"}}'
+    no_outputs_from: [allowlist]
+  - name: "node WARN events pass through both their cap and the shared request lane"
+    inputs:
+      - insert_at: throttle_app_warning
+        type: log
+        log_fields:
+          level: "warn"
+          ts: "2026-10-14T10:00:00.000Z"
+          event: "node_warning"
+          svc: "api"
+          event_code: "quota_fallback"
+    outputs:
+      - extract_from: throttle_ingress
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "node_warning")
+              assert_eq!(.level, "warn")
+  - name: "multiple upstream statuses normalize to a bounded 5xx code"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.ingress"
+          log: '{"time":"2026-10-14T10:00:00+00:00","method":"POST","route":"/invoke","status":502,"bytes":0,"request_time":0.2,"upstream_status":"502, 502"}'
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "ingress_failure_count")
+              assert_eq!(.level, "error")
+              assert_eq!(.status_class, "5xx")
+              assert_eq!(.upstream_status, "502")
+  - name: "UCAN SIWE and delegation text is dropped"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.node"
+          log: '{"timestamp":"2026-10-14T10:00:00.000Z","level":"ERROR","fields":{"message":"UCAN ucan-probe"}}'
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.node"
+          log: '{"timestamp":"2026-10-14T10:00:00.000Z","level":"ERROR","fields":{"message":"SIWE signed-message-probe"}}'
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.node"
+          log: '{"timestamp":"2026-10-14T10:00:00.000Z","level":"ERROR","fields":{"message":"delegation private-delegation-probe"}}'
+    no_outputs_from: [allowlist]
+  - name: "ingress forwarding headers nested envelope and IPv6 are excluded"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.ingress"
+          log: '{"time":"2026-10-14T10:00:00+00:00","method":"GET","route":"/info","status":404,"bytes":0,"request_time":0.02,"remote_addr":"2001:db8::1","headers":{"X-Forwarded-For":"198.51.100.9","CF-Connecting-IP":"2001:db8::2","Authorization":"UCAN private-ucan-probe"},"envelope":{"owner":"did:key:nested-did-probe","email":"nested@example.invalid"}}'
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "ingress_failure_count")
+              assert_eq!(.route, "/info")
+              assert!(!contains(encode_json(.), "2001:db8::1"))
+              assert!(!contains(encode_json(.), "198.51.100.9"))
+              assert!(!contains(encode_json(.), "2001:db8::2"))
+              assert!(!contains(encode_json(.), "private-ucan-probe"))
+              assert!(!contains(encode_json(.), "nested-did-probe"))
+              assert!(!contains(encode_json(.), "nested@example.invalid"))
+              assert!(!exists(.headers))
+              assert!(!exists(.envelope))
+  - name: "raw request path on 2xx is replaced by unmatched template"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.ingress"
+          log: '{"time":"2026-10-14T10:00:00+00:00","method":"GET","route":"/signed/kv/ticket-probe","status":200,"bytes":0,"request_time":0.02}'
+    outputs:
+      - extract_from: allowlist
         conditions:
           - type: vrl
             source: |
               assert_eq!(.event, "ingress_success_count")
-              assert_eq!(.request_count, 120)
-              assert_eq!(.route, "/info")
-              assert_eq!(length(keys(.)), 6)
+              assert_eq!(.route, "<unmatched>")
+              assert!(!contains(encode_json(.), "ticket-probe"))
