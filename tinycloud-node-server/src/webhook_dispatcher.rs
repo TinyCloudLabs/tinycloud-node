@@ -1,9 +1,12 @@
-use crate::{config::HooksConfig, TinyCloud};
+use crate::{
+    config::HooksConfig,
+    egress::{self, EgressPolicy},
+    TinyCloud,
+};
 use anyhow::{Context, Result};
 use hmac::{Hmac, Mac};
-use reqwest::{redirect::Policy, Client, Url};
 use sha2::Sha256;
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use time::{Duration as TimeDuration, OffsetDateTime};
 use tinycloud_core::ColumnEncryption;
 
@@ -19,6 +22,7 @@ pub struct WebhookDispatcher {
     encryption: ColumnEncryption,
     max_attempts: i64,
     timeout: Duration,
+    egress: Arc<EgressPolicy>,
 }
 
 impl WebhookDispatcher {
@@ -26,12 +30,15 @@ impl WebhookDispatcher {
         tinycloud: TinyCloud,
         config: HooksConfig,
         encryption: ColumnEncryption,
+        egress: Arc<EgressPolicy>,
     ) -> Result<Self> {
+        config.validate().map_err(anyhow::Error::msg)?;
         Ok(Self {
             tinycloud,
             encryption,
             max_attempts: config.webhook_max_attempts.max(1) as i64,
             timeout: Duration::from_secs(config.webhook_timeout_seconds.max(1)),
+            egress,
         })
     }
 
@@ -130,13 +137,14 @@ impl WebhookDispatcher {
         };
         let signature = sign_payload(&secret, delivery.payload_json.as_bytes())?;
 
-        let url = crate::routes::hooks::validate_webhook_callback_url(&delivery.callback_url)
-            .await
-            .map_err(|(_, message)| anyhow::anyhow!(message));
-        let client = match url {
-            Ok(url) => self
-                .pinned_client(&url)
-                .context("building pinned webhook client")?,
+        let url = crate::routes::hooks::validate_webhook_callback_url(
+            &delivery.callback_url,
+            &self.egress,
+        )
+        .await
+        .map_err(|(_, message)| anyhow::anyhow!(message));
+        let (url, destination) = match url {
+            Ok(destination) => destination,
             Err(error) => {
                 self.record_terminal_failure(
                     delivery.id,
@@ -147,15 +155,17 @@ impl WebhookDispatcher {
                 return Ok(());
             }
         };
+        let client = egress::client(self.egress.clone(), destination, self.timeout)
+            .context("building webhook client")?;
 
         match client
-            .post(&delivery.callback_url)
+            .post(url)
             .header("Content-Type", "application/json")
             .header("X-TinyCloud-Delivery-Id", &delivery.id)
             .header("X-TinyCloud-Event-Id", &delivery.event_id)
             .header("X-TinyCloud-Subscription-Id", &delivery.subscription_id)
             .header("X-TinyCloud-Signature", signature)
-            .body(delivery.payload_json.clone())
+            .body(delivery.payload_json)
             .send()
             .await
         {
@@ -180,26 +190,6 @@ impl WebhookDispatcher {
         }
 
         Ok(())
-    }
-
-    fn pinned_client(&self, url: &Url) -> Result<Client> {
-        let host = url.host_str().context("callback URL host missing")?;
-        let port = url
-            .port_or_known_default()
-            .context("callback URL port missing")?;
-        let address = std::net::ToSocketAddrs::to_socket_addrs(&(host, port))
-            .context("resolving callback URL")?
-            .find(|address| {
-                !crate::routes::hooks::blocked_webhook_ip(address.ip())
-                    || (cfg!(test) && address.ip().is_loopback())
-            })
-            .context("callback URL has no public address")?;
-        Client::builder()
-            .timeout(self.timeout)
-            .redirect(Policy::none())
-            .resolve(host, address)
-            .build()
-            .context("building pinned callback client")
     }
 
     async fn record_terminal_failure(
@@ -263,7 +253,7 @@ fn retry_delay_for_attempt(attempt_number: i64) -> TimeDuration {
         2 => TimeDuration::seconds(30),
         3 => TimeDuration::minutes(2),
         4 => TimeDuration::minutes(10),
-        5 => TimeDuration::hours(1),
+        5.. => TimeDuration::hours(1),
         _ => TimeDuration::seconds(0),
     }
 }
@@ -291,6 +281,7 @@ mod tests {
         service::{make_service_fn, service_fn},
         Body, Request, Response, Server, StatusCode,
     };
+    use reqwest::Url;
     use std::{convert::Infallible, net::TcpListener};
     use tempfile::TempDir;
     use tinycloud_core::{
@@ -437,12 +428,79 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn tc1132_later_attempts_keep_hour_backoff() {
+        for attempt in [5, 6, 7, 10, i64::MAX] {
+            assert_eq!(
+                retry_delay_for_attempt(attempt),
+                TimeDuration::hours(1),
+                "{attempt}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tc1132_dispatcher_rejects_excessive_attempt_config() -> Result<()> {
+        let (tinycloud, _, encryption) = test_tinycloud().await?;
+        assert!(WebhookDispatcher::new(
+            tinycloud,
+            HooksConfig {
+                webhook_max_attempts: 11,
+                ..HooksConfig::default()
+            },
+            encryption,
+            EgressPolicy::test_loopback()
+        )
+        .is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tc1132_sixth_failure_schedules_hour_backoff() -> Result<()> {
+        let (tinycloud, db, encryption) = test_tinycloud().await?;
+        let (callback, _receiver) =
+            spawn_callback_server(StatusCode::INTERNAL_SERVER_ERROR).await?;
+        let id = insert_pending_delivery(&db, &encryption, &callback, 5).await?;
+        let before = OffsetDateTime::now_utc();
+        WebhookDispatcher::new(
+            tinycloud,
+            HooksConfig {
+                webhook_max_attempts: 10,
+                ..HooksConfig::default()
+            },
+            encryption,
+            EgressPolicy::test_loopback(),
+        )?
+        .dispatch_due_once()
+        .await?;
+        let row = hook_delivery::Entity::find_by_id(id)
+            .one(&db)
+            .await?
+            .unwrap();
+        assert_eq!(
+            row.status,
+            tinycloud_core::db::HOOK_DELIVERY_STATUS_RETRYING
+        );
+        assert_eq!(row.attempts, 6);
+        let next = OffsetDateTime::parse(
+            row.next_attempt_at.as_deref().unwrap(),
+            &time::format_description::well_known::Rfc3339,
+        )?;
+        assert!((next - before).whole_seconds() >= 3600);
+        assert!((next - before).whole_seconds() <= 3602);
+        Ok(())
+    }
     #[tokio::test]
     async fn dispatches_due_delivery_and_marks_it_delivered() -> Result<()> {
         let (tinycloud, db, encryption) = test_tinycloud().await?;
         let (callback_url, mut receiver) = spawn_callback_server(StatusCode::OK).await?;
         let delivery_id = insert_pending_delivery(&db, &encryption, &callback_url, 0).await?;
-        let dispatcher = WebhookDispatcher::new(tinycloud, HooksConfig::default(), encryption)?;
+        let dispatcher = WebhookDispatcher::new(
+            tinycloud,
+            HooksConfig::default(),
+            encryption,
+            EgressPolicy::test_loopback(),
+        )?;
 
         dispatcher.dispatch_due_once().await?;
 
@@ -483,6 +541,7 @@ mod tests {
                 ..HooksConfig::default()
             },
             encryption,
+            EgressPolicy::test_loopback(),
         )?;
 
         dispatcher.dispatch_due_once().await?;
@@ -547,7 +606,12 @@ mod tests {
         )
         .await?
         .with_encryption(Some(encryption.clone()));
-        let dispatcher = WebhookDispatcher::new(tinycloud, HooksConfig::default(), encryption)?;
+        let dispatcher = WebhookDispatcher::new(
+            tinycloud,
+            HooksConfig::default(),
+            encryption,
+            EgressPolicy::test_loopback(),
+        )?;
 
         dispatcher.dispatch_due_once().await?;
 
@@ -808,6 +872,7 @@ mod tests {
                     self.tinycloud.clone(),
                     HooksConfig::default(),
                     self.encryption.clone(),
+                    EgressPolicy::test_loopback(),
                 )
                 .unwrap()
             }

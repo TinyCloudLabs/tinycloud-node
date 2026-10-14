@@ -30,6 +30,7 @@ pub mod authorization;
 pub mod config;
 #[cfg(feature = "dstack")]
 pub mod dstack;
+pub mod egress;
 pub mod hooks;
 pub mod invocation_replay;
 pub mod link;
@@ -423,6 +424,7 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
 /// The deploy job invokes this on the candidate image before stopping the node.
 pub fn resolve_runtime_config(tinycloud_config: &Config) -> Result<Config> {
     let mut resolved = tinycloud_config.clone();
+    resolved.hooks.validate().map_err(anyhow::Error::msg)?;
     resolved.storage.resolve();
     resolved.share_email = resolved
         .share_email
@@ -490,6 +492,14 @@ pub async fn app_with_control(
     control: Option<ControlPlaneHandle>,
 ) -> Result<Rocket<Build>> {
     let tinycloud_config = resolve_runtime_config(tinycloud_config)?;
+    let quota_url = std::env::var("TINYCLOUD_QUOTA_URL").ok();
+    let egress_policy = Arc::new(egress::EgressPolicy::from_config(
+        &tinycloud_config,
+        quota_url.as_deref(),
+    )?);
+    if egress_policy.refresh().await.is_err() {
+        ::tracing::warn!("webhook egress closed: internal endpoint lookup failed");
+    }
     tinycloud_core::did_resolution::configure(
         tinycloud_core::did_resolution::DidResolutionPolicy {
             network_methods: tinycloud_config.did_resolution.network_methods,
@@ -694,11 +704,8 @@ pub async fn app_with_control(
 
     // Billing shares TINYCLOUD_ADMIN_SECRET with the node (it calls the
     // node's admin API with it) and accepts it on quota fetches (TC-627).
-    let quota_cache = QuotaCache::new(
-        tinycloud_config.storage.limit,
-        std::env::var("TINYCLOUD_QUOTA_URL").ok(),
-    )
-    .with_service_secret(std::env::var("TINYCLOUD_ADMIN_SECRET").ok());
+    let quota_cache = QuotaCache::new(tinycloud_config.storage.limit, quota_url)
+        .with_service_secret(std::env::var("TINYCLOUD_ADMIN_SECRET").ok());
     let invocation_replay_cache = node_replay_cache(&tinycloud);
     let replay_cleanup = invocation_replay_cache.clone();
     // TC-341: the periodic sweep also reclaims rows beyond the lifetime cap.
@@ -709,6 +716,7 @@ pub async fn app_with_control(
         tinycloud.clone(),
         tinycloud_config.hooks.clone(),
         webhook_encryption.clone(),
+        egress_policy.clone(),
     )?;
     spawn_webhook_dispatcher(webhook_dispatcher);
 
@@ -718,6 +726,16 @@ pub async fn app_with_control(
     let telemetry_tinycloud = tinycloud.clone();
 
     let rocket = rocket::custom(config)
+        .attach(AdHoc::on_liftoff("webhook-egress-refresh", {
+            let policy = egress_policy.clone();
+            move |rocket| {
+                let policy = policy.clone();
+                let shutdown = rocket.shutdown();
+                Box::pin(async move {
+                    tokio::spawn(egress::run_refresh(policy, shutdown));
+                })
+            }
+        }))
         .mount("/", routes)
         .attach(AdHoc::config::<Config>())
         .attach(tracing::TracingFairing::new(&tinycloud_config.log.tracing))
@@ -765,6 +783,7 @@ pub async fn app_with_control(
         .manage(hook_runtime)
         .manage(signed_url_runtime)
         .manage(webhook_encryption)
+        .manage(egress_policy)
         .manage(rate_limiter)
         .manage(tee_context)
         .manage(encryption_service)

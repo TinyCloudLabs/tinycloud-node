@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+- Security (TC-1132, TC-1080 Parts C–D): webhook registration and every delivery attempt share an egress policy covering special-use IPv4/IPv6, embedded IPv4 (mapped, compatible, NAT64 and 6to4), Teredo and site-local IPv6. Corrected public controls such as `192.2.1.1` and `198.51.0.1` are no longer over-blocked. Mixed DNS answers retain only permitted addresses.
+- Webhooks deny the resolved addresses of the configured network database, quota URL, space allowlist and explicit S3 endpoint on every port, including aliases and embedded IPv4 forms. The service deny-set refreshes every ten minutes; failed or stale resolution closes webhook egress until a successful refresh, and attempts rejected by URL validation dead-letter. Literal callbacks are checked too. Existing subscriptions whose destinations become forbidden dead-letter on the next attempt.
+- Webhook DNS is bounded to one second. Each delivery resolves once and gives only vetted addresses to reqwest, ignores proxy environment variables, refuses redirects and non-HTTPS destinations, caps connect time at two seconds, and keeps the configured total request timeout. No production private-destination/development flag was added; body bytes, headers and HMAC signing are unchanged.
+- Registration caps both raw and canonical callback URLs at 2,048 bytes and secrets at 256 bytes. Retry attempts 6 and later keep the one-hour backoff; `hooks.webhook_max_attempts` must not exceed 10.
+- Quota requests encode the original SpaceId as one path segment and do not follow redirects; cache/override keys and fallback remain unchanged. Tunnel upstream requests do not follow redirects and have a 30-second total timeout, including body reads; 3xx responses and existing per-request errors retain their framing.
+- Network DID methods remain disabled by default. Full TC-1080 Part B (node-owned did:web fetcher, destination policy, timeouts, body limits, and refusal tests) is **required before any future re-enable**; this change does not implement or enable that fetcher. No schema migration.
+
 ## [1.20.6] - 2026-10-14
 
 A security fix (TC-1080, Part A). UCAN issuer resolution no longer dereferences network DID methods by default, so a request can't make the node fetch arbitrary or internal hosts through a crafted issuer DID (#284).

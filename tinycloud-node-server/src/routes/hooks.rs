@@ -1,6 +1,7 @@
 use crate::{
     authorization::AuthHeaderGetter,
     config::Config,
+    egress::{EgressPolicy, VettedDestination},
     hooks::{
         hook_scope_path, matches_scope, normalize_path_prefix_for_service, HookRuntime,
         HookSubscription, HookTicketClaims, HookTicketRequest, HookTicketResponse,
@@ -431,6 +432,7 @@ pub async fn create_webhook(
     policy_v3: &State<PolicyV3Runtime>,
     replay: &State<InvocationReplayCache>,
     config: &State<Config>,
+    egress: &State<std::sync::Arc<EgressPolicy>>,
 ) -> Result<Json<HookWebhookResponse>, (Status, String)> {
     let invocation = authorize_hook_request(
         "server.hooks.webhook_register.auth",
@@ -440,7 +442,7 @@ pub async fn create_webhook(
         config,
     )
     .await?;
-    let normalized = normalize_webhook_request(&request)?;
+    let normalized = normalize_webhook_request(&request, egress)?;
     if !is_hook_action_authorized(&invocation, &normalized, "tinycloud.hooks/register") {
         return Err((
             Status::Forbidden,
@@ -448,7 +450,7 @@ pub async fn create_webhook(
         ));
     }
     // Resolve the callback host only for an authorized caller.
-    let callback_url = validate_webhook_callback_url(&request.callback_url).await?;
+    let (callback_url, _) = validate_webhook_callback_url(&request.callback_url, egress).await?;
 
     let active_count = tinycloud
         .count_active_hook_subscriptions(&normalized.space)
@@ -704,6 +706,7 @@ fn invocation_expiry(invocation: &InvocationInfo) -> Result<i64, (Status, String
 
 pub fn normalize_webhook_request(
     request: &HookWebhookRequest,
+    policy: &EgressPolicy,
 ) -> Result<HookSubscription, (Status, String)> {
     let path_prefix =
         normalize_path_prefix_for_service(&request.service, request.path_prefix.clone());
@@ -722,10 +725,15 @@ pub fn normalize_webhook_request(
     if request.secret.is_empty() {
         return Err((Status::BadRequest, "secret is required".to_string()));
     }
+    if request.secret.len() > 256 {
+        return Err((Status::BadRequest, "secret exceeds 256 bytes".to_string()));
+    }
+    validate_callback_length(&request.callback_url)?;
 
     let url = reqwest::Url::parse(&request.callback_url)
         .map_err(|e| (Status::BadRequest, format!("invalid callbackUrl: {e}")))?;
-    validate_webhook_url_shape(&url)?;
+    validate_callback_length(url.as_str())?;
+    validate_webhook_shape(&url, policy)?;
 
     Ok(subscription)
 }
@@ -767,82 +775,61 @@ fn validate_webhook_url_shape(url: &reqwest::Url) -> Result<(), (Status, String)
 }
 
 pub(crate) fn blocked_webhook_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(ip) => {
-            let octets = ip.octets();
-            let first = octets[0];
-            let second = octets[1];
-            (first == 0)
-                || (first == 10)
-                || (first == 100 && (64..=127).contains(&second))
-                || (first == 127)
-                || (first == 169 && second == 254)
-                || (first == 172 && (16..=31).contains(&second))
-                || (first == 192 && (second == 0 || second == 2 || second == 168))
-                || (first == 192 && second == 88 && octets[2] == 99)
-                || (first == 198 && (second == 18 || second == 19 || second == 51))
-                || (first == 203 && second == 0 && octets[2] == 113)
-                || first >= 224
-        }
-        IpAddr::V6(ip) => {
-            let segments = ip.segments();
-            ip.is_unspecified()
-                || ip.is_loopback()
-                || ip.is_multicast()
-                || (segments[0] & 0xfe00) == 0xfc00
-                || (segments[0] & 0xffc0) == 0xfe80
-                || (segments[0] == 0x2001 && segments[1] == 0x0db8)
-                || ip
-                    .to_ipv4_mapped()
-                    .is_some_and(|mapped| blocked_webhook_ip(mapped.into()))
-        }
-    }
+    EgressPolicy::forbidden(ip).is_some()
 }
 
+fn validate_webhook_shape(
+    url: &reqwest::Url,
+    policy: &EgressPolicy,
+) -> Result<(), (Status, String)> {
+    #[cfg(test)]
+    if policy.permits_test_http()
+        && matches!(url.scheme(), "http" | "https")
+        && url.host_str().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.fragment().is_none()
+    {
+        return Ok(());
+    }
+    #[cfg(not(test))]
+    let _ = policy;
+    validate_webhook_url_shape(url)
+}
+
+/// Validate a callback and resolve it once through the shared destination policy.
+/// Callers must authorize registration before invoking this bounded DNS lookup.
 pub async fn validate_webhook_callback_url(
     callback_url: &str,
-) -> Result<reqwest::Url, (Status, String)> {
+    policy: &EgressPolicy,
+) -> Result<(reqwest::Url, VettedDestination), (Status, String)> {
+    validate_callback_length(callback_url)?;
     let url = reqwest::Url::parse(callback_url)
         .map_err(|e| (Status::BadRequest, format!("invalid callbackUrl: {e}")))?;
-    #[cfg(test)]
-    if url.scheme() == "http"
-        && url
-            .host_str()
-            .and_then(|host| host.trim_matches(['[', ']']).parse::<IpAddr>().ok())
-            .is_some_and(|ip| ip.is_loopback())
-    {
-        return Ok(url);
-    }
-    validate_webhook_url_shape(&url)?;
-    let host = url.host_str().ok_or_else(|| {
-        (
-            Status::BadRequest,
-            "callbackUrl host is required".to_string(),
-        )
-    })?;
-    let port = url
-        .port_or_known_default()
-        .expect("HTTPS has a default port");
-    let addresses = tokio::net::lookup_host((host, port))
+    validate_callback_length(url.as_str())?;
+    validate_webhook_shape(&url, policy)?;
+    let destination = policy
+        .resolve_url(&url)
         .await
-        .map_err(|_| {
-            (
-                Status::BadRequest,
-                "callbackUrl host cannot be resolved".to_string(),
-            )
-        })?
-        .collect::<Vec<_>>();
-    if addresses.is_empty()
-        || addresses
-            .iter()
-            .any(|address| blocked_webhook_ip(address.ip()))
-    {
+        .map_err(|error| (Status::BadRequest, format!("callbackUrl rejected: {error}")))?;
+    #[cfg(test)]
+    if url.scheme() == "http" && !destination.is_loopback() {
         return Err((
             Status::BadRequest,
-            "callbackUrl resolves to a reserved address".to_string(),
+            "test HTTP callback must resolve only to loopback".into(),
         ));
     }
-    Ok(url)
+    Ok((url, destination))
+}
+
+fn validate_callback_length(callback_url: &str) -> Result<(), (Status, String)> {
+    if callback_url.len() > 2048 {
+        return Err((
+            Status::BadRequest,
+            "callbackUrl exceeds 2048 bytes".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 pub fn webhook_response_from_model(
@@ -1150,7 +1137,9 @@ mod tests {
             secret: "dev-secret".to_string(),
         };
 
-        let normalized = normalize_webhook_request(&request).expect("valid webhook request");
+        let policy = EgressPolicy::from_config(&Config::default(), None).unwrap();
+        let normalized =
+            normalize_webhook_request(&request, &policy).expect("valid webhook request");
         assert_eq!(normalized.path_prefix.as_deref(), Some("documents"));
     }
 
@@ -1173,7 +1162,11 @@ mod tests {
                 secret: "dev-secret".to_string(),
             };
             assert!(
-                normalize_webhook_request(&request).is_err(),
+                normalize_webhook_request(
+                    &request,
+                    &EgressPolicy::from_config(&Config::default(), None).unwrap()
+                )
+                .is_err(),
                 "{callback_url}"
             );
         }
@@ -1194,6 +1187,355 @@ mod tests {
         ] {
             assert!(blocked_webhook_ip(address.parse().unwrap()), "{address}");
         }
+    }
+
+    #[test]
+    fn tc1132_callback_shape_rejects_embedded_private_and_allows_public_controls() {
+        for address in [
+            "::127.0.0.1",
+            "64:ff9b::a9fe:a9fe",
+            "64:ff9b:1::a00:1",
+            "2002:7f00:1::",
+            "2001::1",
+            "fec0::1",
+        ] {
+            let url = reqwest::Url::parse(&format!("https://[{address}]/hooks")).unwrap();
+            assert_eq!(
+                validate_webhook_url_shape(&url).unwrap_err().0,
+                Status::BadRequest
+            );
+        }
+        for address in ["192.2.1.1", "198.51.0.1", "1.1.1.1", "2606:4700::1111"] {
+            assert!(!blocked_webhook_ip(address.parse().unwrap()), "{address}");
+        }
+    }
+
+    #[tokio::test]
+    async fn tc1132_registration_enforces_callback_and_secret_byte_limits() -> Result<()> {
+        let fixture =
+            hook_route_fixture(&[("hooks", "kv/documents", "tinycloud.hooks/register")]).await?;
+        for (callback, secret) in [
+            (
+                format!("https://1.1.1.1/{}", "x".repeat(2049)),
+                "secret".to_string(),
+            ),
+            ("https://1.1.1.1/hooks".to_string(), "é".repeat(129)),
+            (
+                format!("https://1.1.1.1/{}", "é".repeat(400)),
+                "secret".to_string(),
+            ),
+        ] {
+            let header = fixture.session_header(&[(
+                fixture.hooks("kv/documents")?,
+                &["tinycloud.hooks/register"],
+            )])?;
+            let response = fixture.client.post("/hooks/webhooks")
+                .header(rocket::http::Header::new("Authorization", header))
+                .header(rocket::http::ContentType::JSON)
+                .body(serde_json::json!({
+                    "space": fixture.space.to_string(), "service": "kv", "pathPrefix": "documents",
+                    "callbackUrl": callback, "secret": secret,
+                }).to_string()).dispatch().await;
+            assert_eq!(response.status(), Status::BadRequest);
+        }
+        assert_eq!(fixture.persisted_rows().await?[4], 0);
+        Ok(())
+    }
+
+    #[derive(Deserialize)]
+    struct RegisteredWebhook {
+        id: String,
+    }
+
+    async fn tc1132_register_url(
+        fixture: &HookRouteFixture,
+        callback: &str,
+        secret: &str,
+    ) -> Result<(Status, String)> {
+        let header = fixture.session_header(&[(
+            fixture.hooks("kv/documents")?,
+            &["tinycloud.hooks/register"],
+        )])?;
+        let response = fixture
+            .client
+            .post("/hooks/webhooks")
+            .header(rocket::http::Header::new("Authorization", header))
+            .header(rocket::http::ContentType::JSON)
+            .body(
+                serde_json::json!({
+                    "space": fixture.space.to_string(), "service": "kv", "pathPrefix": "documents",
+                    "callbackUrl": callback, "secret": secret,
+                })
+                .to_string(),
+            )
+            .dispatch()
+            .await;
+        Ok((
+            response.status(),
+            response.into_string().await.unwrap_or_default(),
+        ))
+    }
+
+    async fn tc1132_queue(fixture: &HookRouteFixture, subscription: &str, id: &str) -> Result<()> {
+        use tinycloud_core::{models::hook_delivery, sea_orm::ActiveModelTrait};
+        hook_delivery::ActiveModel::from(hook_delivery::Model {
+            id: id.into(),
+            subscription_id: subscription.into(),
+            event_id: "event_egress".into(),
+            payload_json: r#"{"id":"event_egress","key":"documents/note"}"#.into(),
+            status: tinycloud_core::db::HOOK_DELIVERY_STATUS_PENDING.into(),
+            attempts: 0,
+            next_attempt_at: None,
+            last_error: None,
+            delivered_at: None,
+            created_at: "2026-10-14T00:00:00Z".into(),
+        })
+        .insert(&fixture.db)
+        .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tc1132_registration_and_delivery_refuse_private_metadata_and_embedded_forms(
+    ) -> Result<()> {
+        use crate::egress::test_support::TestLookup;
+        use tinycloud_core::models::hook_delivery;
+        let lookup = std::sync::Arc::new(TestLookup::default());
+        let policy = std::sync::Arc::new(EgressPolicy::for_test(vec![], lookup.clone(), false));
+        let fixture = hook_route_fixture_with_policy(
+            &[("hooks", "kv/documents", "tinycloud.hooks/register")],
+            policy.clone(),
+        )
+        .await?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let callbacks = [
+            ("https://callback.test/hooks", Some("127.0.0.1")),
+            ("https://callback.test/hooks", Some("10.0.0.1")),
+            ("https://callback.test/hooks", Some("169.254.169.254")),
+            ("https://callback.test/hooks", Some("::127.0.0.1")),
+            ("https://callback.test/hooks", Some("64:ff9b::a9fe:a9fe")),
+            ("https://callback.test/hooks", Some("2002:7f00:1::")),
+            ("https://[::ffff:7f00:1]/hooks", None),
+            ("https://[64:ff9b:1::a00:1]/hooks", None),
+        ];
+        for (index, (callback, answer)) in callbacks.iter().enumerate() {
+            if let Some(answer) = answer {
+                lookup.set("callback.test", &[answer]).await;
+            }
+            let (status, body) = tc1132_register_url(&fixture, callback, "secret").await?;
+            assert_eq!(status, Status::BadRequest, "{callback}: {body}");
+            let id = format!("sub_egress_{index}");
+            fixture
+                .tinycloud
+                .create_hook_subscription(hook_subscription::Model {
+                    id: id.clone(),
+                    subscriber_did: did_of(&fixture.session.1).into(),
+                    space_id: fixture.space.to_string(),
+                    target_service: "kv".into(),
+                    path_prefix: Some("documents".into()),
+                    abilities_json: None,
+                    callback_url: (*callback).into(),
+                    encrypted_secret: ColumnEncryption::new([3; 32]).encrypt(b"secret"),
+                    secret_key_id: "primary".into(),
+                    active: true,
+                    created_at: "2026-10-14T00:00:00Z".into(),
+                })
+                .await?;
+            let delivery_id = format!("delivery_egress_{index}");
+            tc1132_queue(&fixture, &id, &delivery_id).await?;
+            crate::webhook_dispatcher::WebhookDispatcher::new(
+                fixture.tinycloud.clone(),
+                crate::config::HooksConfig::default(),
+                ColumnEncryption::new([3; 32]),
+                policy.clone(),
+            )?
+            .dispatch_due_once()
+            .await?;
+            let delivery = hook_delivery::Entity::find_by_id(delivery_id)
+                .one(&fixture.db)
+                .await?
+                .unwrap();
+            assert_eq!(
+                delivery.status,
+                tinycloud_core::db::HOOK_DELIVERY_STATUS_DEAD_LETTER
+            );
+            assert_eq!(delivery.attempts, 1);
+            assert!(delivery
+                .last_error
+                .unwrap()
+                .starts_with("callback URL rejected:"));
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tc1132_rebinding_is_refused_after_successful_registration() -> Result<()> {
+        use crate::egress::test_support::TestLookup;
+        use tinycloud_core::models::hook_delivery;
+        let lookup = std::sync::Arc::new(TestLookup::default());
+        lookup
+            .sequence("callback.test", &[&["1.1.1.1"], &["127.0.0.1"]])
+            .await;
+        let policy = std::sync::Arc::new(EgressPolicy::for_test(vec![], lookup.clone(), false));
+        let fixture = hook_route_fixture_with_policy(
+            &[("hooks", "kv/documents", "tinycloud.hooks/register")],
+            policy.clone(),
+        )
+        .await?;
+        let (status, body) =
+            tc1132_register_url(&fixture, "https://callback.test/hooks", "secret").await?;
+        assert_eq!(status, Status::Ok, "{body}");
+        let subscription: RegisteredWebhook = serde_json::from_str(&body)?;
+        tc1132_queue(&fixture, &subscription.id, "delivery_rebind").await?;
+        crate::webhook_dispatcher::WebhookDispatcher::new(
+            fixture.tinycloud.clone(),
+            crate::config::HooksConfig::default(),
+            ColumnEncryption::new([3; 32]),
+            policy,
+        )?
+        .dispatch_due_once()
+        .await?;
+        let delivery = hook_delivery::Entity::find_by_id("delivery_rebind")
+            .one(&fixture.db)
+            .await?
+            .unwrap();
+        assert_eq!(
+            delivery.status,
+            tinycloud_core::db::HOOK_DELIVERY_STATUS_DEAD_LETTER
+        );
+        assert!(delivery
+            .last_error
+            .unwrap()
+            .starts_with("callback URL rejected:"));
+        assert_eq!(lookup.call_count(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tc1132_registration_accepts_corrected_public_ranges_and_exact_byte_limits(
+    ) -> Result<()> {
+        for callback in [
+            "https://192.2.1.1/hooks".to_string(),
+            "https://198.51.0.1/hooks".to_string(),
+            format!(
+                "https://1.1.1.1/{}",
+                "x".repeat(2048 - "https://1.1.1.1/".len())
+            ),
+        ] {
+            let fixture =
+                hook_route_fixture(&[("hooks", "kv/documents", "tinycloud.hooks/register")])
+                    .await?;
+            let secret = "é".repeat(128);
+            let (status, body) = tc1132_register_url(&fixture, &callback, &secret).await?;
+            assert_eq!(status, Status::Ok, "{body}");
+            let subscription: RegisteredWebhook = serde_json::from_str(&body)?;
+            let stored = fixture
+                .tinycloud
+                .find_hook_subscription(&subscription.id)
+                .await?
+                .unwrap();
+            assert_eq!(stored.callback_url, callback);
+            assert_eq!(
+                ColumnEncryption::new([3; 32]).decrypt(&stored.encrypted_secret)?,
+                secret.as_bytes()
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tc1132_unauthorized_registration_never_resolves_callback() -> Result<()> {
+        use crate::egress::test_support::TestLookup;
+        let lookup = std::sync::Arc::new(TestLookup::default());
+        let policy = std::sync::Arc::new(EgressPolicy::for_test(vec![], lookup.clone(), false));
+        let fixture = hook_route_fixture_with_policy(
+            &[("hooks", "kv/documents", "tinycloud.hooks/subscribe")],
+            policy,
+        )
+        .await?;
+        let (status, _) =
+            tc1132_register_url(&fixture, "https://callback.test/hooks", "secret").await?;
+        assert_eq!(status, Status::Unauthorized);
+        assert_eq!(lookup.call_count(), 0);
+        Ok(())
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn tc1132_registered_delivery_uses_vetted_dns_without_proxy_and_preserves_hmac(
+    ) -> Result<()> {
+        use crate::{
+            egress::test_support::{callback_server, TestLookup},
+            test_support::{env_lock, EnvGuard},
+        };
+        use tinycloud_core::models::hook_delivery;
+        #[allow(clippy::await_holding_lock)]
+        let _lock = env_lock();
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let _proxy = EnvGuard::set("HTTPS_PROXY", format!("http://{}", proxy.local_addr()?));
+        let _no_proxy = EnvGuard::set("NO_PROXY", "");
+        let _no_proxy_lower = EnvGuard::set("no_proxy", "");
+        let mut callback = callback_server(200, None).await?;
+        let lookup = std::sync::Arc::new(TestLookup::default());
+        lookup
+            .set("callback.test", &["10.0.0.1", "127.0.0.1"])
+            .await;
+        let policy = std::sync::Arc::new(
+            EgressPolicy::for_test(vec![], lookup.clone(), true)
+                .with_test_root(callback.certificate.clone()),
+        );
+        let fixture = hook_route_fixture_with_policy(
+            &[("hooks", "kv/documents", "tinycloud.hooks/register")],
+            policy.clone(),
+        )
+        .await?;
+        let (status, body) = tc1132_register_url(&fixture, &callback.url, "secret").await?;
+        assert_eq!(status, Status::Ok, "{body}");
+        let subscription: RegisteredWebhook = serde_json::from_str(&body)?;
+        tc1132_queue(&fixture, &subscription.id, "delivery_tls").await?;
+        crate::webhook_dispatcher::WebhookDispatcher::new(
+            fixture.tinycloud.clone(),
+            crate::config::HooksConfig::default(),
+            ColumnEncryption::new([3; 32]),
+            policy,
+        )?
+        .dispatch_due_once()
+        .await?;
+        let (body, headers) =
+            tokio::time::timeout(Duration::from_secs(2), callback.requests.recv())
+                .await?
+                .unwrap();
+        assert_eq!(body, br#"{"id":"event_egress","key":"documents/note"}"#);
+        let mut mac = <hmac::Hmac<sha2::Sha256> as hmac::Mac>::new_from_slice(b"secret")?;
+        hmac::Mac::update(&mut mac, &body);
+        let signature = format!(
+            "sha256={}",
+            hex::encode(hmac::Mac::finalize(mac).into_bytes())
+        );
+        assert_eq!(headers["X-TinyCloud-Signature"], signature);
+        assert_eq!(headers["X-TinyCloud-Delivery-Id"], "delivery_tls");
+        assert_eq!(headers["X-TinyCloud-Event-Id"], "event_egress");
+        assert_eq!(headers["X-TinyCloud-Subscription-Id"], subscription.id);
+        let delivery = hook_delivery::Entity::find_by_id("delivery_tls")
+            .one(&fixture.db)
+            .await?
+            .unwrap();
+        assert_eq!(
+            delivery.status,
+            tinycloud_core::db::HOOK_DELIVERY_STATUS_DELIVERED
+        );
+        assert_eq!(lookup.call_count(), 2, "registration once, delivery once");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), proxy.accept())
+                .await
+                .is_err()
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -1498,6 +1840,17 @@ mod tests {
     /// ability)` on the owner's space, plus a second owner's space for
     /// cross-space attempts.
     async fn hook_route_fixture(grants: &[(&str, &str, &str)]) -> Result<HookRouteFixture> {
+        hook_route_fixture_with_policy(
+            grants,
+            std::sync::Arc::new(EgressPolicy::from_config(&Config::default(), None)?),
+        )
+        .await
+    }
+
+    async fn hook_route_fixture_with_policy(
+        grants: &[(&str, &str, &str)],
+        policy: std::sync::Arc<EgressPolicy>,
+    ) -> Result<HookRouteFixture> {
         use tinycloud_core::{
             models::{abilities, actor, space},
             sea_orm::{ActiveModelTrait, ActiveValue::Set},
@@ -1582,6 +1935,7 @@ mod tests {
             .manage(ColumnEncryption::new([3u8; 32]))
             .manage(PolicyV3Runtime::new(db.clone(), node.node_did(), node))
             .manage(InvocationReplayCache::new(db.clone()))
+            .manage(policy)
             .manage(Config::default());
 
         Ok(HookRouteFixture {
