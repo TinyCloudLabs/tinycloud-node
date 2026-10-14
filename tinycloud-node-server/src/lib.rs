@@ -490,6 +490,15 @@ pub async fn app_with_control(
     control: Option<ControlPlaneHandle>,
 ) -> Result<Rocket<Build>> {
     let tinycloud_config = resolve_runtime_config(tinycloud_config)?;
+    tinycloud_core::did_resolution::configure(
+        tinycloud_core::did_resolution::DidResolutionPolicy {
+            network_methods: tinycloud_config.did_resolution.network_methods,
+        },
+    );
+    tinycloud_core::did_resolution::set_refusal_observer(
+        prometheus::observe_did_resolution_refused,
+    );
+    lazy_static::initialize(&prometheus::DID_RESOLUTION_REFUSED);
 
     // Ensure local storage directories exist.
     // SQLite file paths and local dirs are resources the server owns — auto-create them.
@@ -504,6 +513,12 @@ pub async fn app_with_control(
         &tinycloud_config.log,
         config.extract_inner::<rocket::config::LogLevel>("log_level")?,
     )?;
+
+    ::tracing::info!(network_methods = tinycloud_config.did_resolution.network_methods,
+        offline_methods = ?tinycloud_core::did_resolution::OFFLINE_DID_METHODS, "did resolution policy");
+    if tinycloud_config.did_resolution.network_methods {
+        ::tracing::warn!("network DID resolution enabled: did:web/did:tz fetches use the unhardened ssi client (TC-1080)");
+    }
 
     let routes = production_routes();
     #[cfg(feature = "tc-bench-v1")]
@@ -1539,6 +1554,11 @@ mod cors_fairing_tests {
             .get_one("Access-Control-Max-Age")
             .is_none());
     }
+}
+
+#[cfg(test)]
+mod did_resolution_test_support {
+    include!("../../tinycloud-core/tests/support/did_resolution.rs");
 }
 
 #[cfg(test)]

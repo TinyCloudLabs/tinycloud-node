@@ -1310,6 +1310,20 @@ async fn postgres_info(node: &Node) -> Result<(u64, u64)> {
         keys == ["connections_opened", "sockets_configured"],
         "counts only: {postgres:?}"
     );
+    // TC-1080 + TC-1054: both public evidence objects survive the merge.
+    let did_resolution = info["did_resolution"]
+        .as_object()
+        .context("/info has a did_resolution object")?;
+    ensure!(did_resolution.len() == 2, "boolean and count only");
+    ensure!(did_resolution["network_methods"] == false, "default policy");
+    ensure!(
+        did_resolution["refused_total"].as_u64().is_some(),
+        "refusal count"
+    );
+    println!(
+        "TC-1080/TC-1054 /info evidence: {}",
+        serde_json::json!({"postgres": postgres, "did_resolution": did_resolution})
+    );
     let count = |key: &str| {
         postgres[key]
             .as_u64()

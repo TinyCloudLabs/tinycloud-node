@@ -387,7 +387,7 @@ impl EncryptionService {
         }
 
         self.validate_invocation_time(invocation.not_before, invocation.exp)?;
-        self.verify_signature(
+        self.verify_decryption_signature(
             &invocation.issuer,
             &invocation.sig,
             &invocation.unsigned_payload(),
@@ -854,14 +854,14 @@ impl EncryptionService {
         &self,
         invocation: &DecryptInvocation,
     ) -> Result<(), EncryptionServiceError> {
-        self.verify_signature(
+        self.verify_decryption_signature(
             &invocation.issuer,
             &invocation.sig,
             &invocation.unsigned_payload(),
         )
     }
 
-    fn verify_signature(
+    fn verify_decryption_signature(
         &self,
         issuer: &str,
         sig: &str,

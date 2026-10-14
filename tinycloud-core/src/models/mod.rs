@@ -6,7 +6,7 @@ pub mod database_artifact;
 pub mod database_identity_fence;
 pub mod database_legacy_artifact;
 pub mod delegation;
-pub(crate) mod did_resolution;
+pub(crate) use crate::did_resolution;
 pub mod encryption_audit;
 pub mod encryption_ceremony;
 pub mod encryption_network;

@@ -301,3 +301,33 @@ If the TinyCloud Protocol instance is not able to find or establish a connection
 ## Usage
 
 TinyCloud Protocol is most easily used via the TinyCloud Protocol SDK. See the example DApps and tutorials for detailed information.
+
+### UCAN DID resolution (TC-1080)
+
+UCAN signature verification resolves only `did:key`, `did:pkh` and `did:jwk`
+by default. Other methods fail before resolution with `did_method_disabled:`.
+Issuer DID URLs carrying a query fail with `did_url_query_rejected:` under every
+setting. DID parsing and string comparisons, including share-email `did:web`
+identifiers, are unchanged. Existing route status codes and policy machine codes
+are preserved.
+
+Configure `[global.did_resolution] network_methods = false` in `tinycloud.toml`
+or use the canonical environment variable
+`TINYCLOUD_DID_RESOLUTION__NETWORK_METHODS`. For rollback without rebuilding,
+set `TINYCLOUD_DID_RESOLUTION__NETWORK_METHODS=true` and restart the node.
+This restores the previous methods with the unhardened SSI client, while issuer
+queries remain refused. The previous image is the fallback rollback.
+
+The startup log records the effective policy. Refusals increment
+`tinycloud_did_resolution_refused_total{method,reason}` (even when latency
+telemetry is disabled), with reasons `method_disabled` and `query_rejected`.
+Unknown methods use the bounded label `unknown`. Warnings contain only the
+method, sanitized host and reason, with one warning per method/host per minute
+and at most ten per minute globally; the next warning reports suppressed counts.
+
+Public `GET /info` also exposes only counts and booleans:
+`"did_resolution": { "network_methods": false, "refused_total": 0 }`.
+Both values use relaxed atomic reads; `refused_total` counts every refusal for
+this process lifetime and resets on restart. Post-deploy, check
+`GET /info` gives `did_resolution.network_methods == false`, and compare
+`refused_total` over time. No DIDs, hosts, URLs or per-method data are exposed.

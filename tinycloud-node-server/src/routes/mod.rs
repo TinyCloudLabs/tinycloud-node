@@ -183,6 +183,12 @@ fn identity_resolution_error(error: database_migration::MigrationError) -> (Stat
 }
 
 #[derive(Serialize)]
+pub struct DidResolutionInfo {
+    pub network_methods: bool,
+    pub refused_total: u64,
+}
+
+#[derive(Serialize)]
 pub struct NodeInfo {
     pub protocol: u32,
     pub version: String,
@@ -193,6 +199,7 @@ pub struct NodeInfo {
     pub in_tee: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quota_url: Option<String>,
+    pub did_resolution: DidResolutionInfo,
     /// PostgreSQL connection counters (TC-1054), so a deploy can check that
     /// every connection got its TCP keepalive options:
     /// `sockets_configured >= connections_opened > 0`. Counts only; omitted
@@ -236,6 +243,10 @@ fn build_info(
         node_id: encryption.node_did().to_string(),
         in_tee: tee.inner().is_some(),
         quota_url: quota_cache.quota_url().map(|s| s.to_string()),
+        did_resolution: DidResolutionInfo {
+            network_methods: tinycloud_core::did_resolution::policy().network_methods,
+            refused_total: tinycloud_core::did_resolution::refused_total(),
+        },
         // Two relaxed atomic loads: `/info` is public and polled.
         postgres: database
             .is_some_and(|db| {

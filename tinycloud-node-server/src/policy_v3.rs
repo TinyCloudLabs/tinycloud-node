@@ -21,7 +21,7 @@ use tinycloud_auth::authorization::TinyCloudDelegation;
 use tinycloud_auth::multihash_codetable::MultihashDigest;
 use tinycloud_auth::share_email_evidence::{verify_detached_ed25519, IssuerKey};
 use tinycloud_auth::ssi::{
-    dids::{AnyDidMethod, DIDBuf},
+    dids::DIDBuf,
     jwk::{Algorithm, Base64urlUInt, OctetParams, Params, JWK},
 };
 use tinycloud_auth::{
@@ -4299,13 +4299,9 @@ async fn verify_signed_delegation(delegation: &TinyCloudDelegation) -> Result<()
     let TinyCloudDelegation::Ucan(ucan) = delegation else {
         return Err(());
     };
-    tokio::time::timeout(
-        std::time::Duration::from_secs(3),
-        ucan.verify_signature(&AnyDidMethod::default()),
-    )
-    .await
-    .map_err(|_| ())?
-    .map_err(|_| ())?;
+    tinycloud_core::did_resolution::verify_ucan_signature(ucan)
+        .await
+        .map_err(|_| ())?;
     ucan.payload().validate_time(None).map_err(|_| ())
 }
 
@@ -6383,10 +6379,117 @@ fn db_error(error: impl std::fmt::Display) -> (Status, String) {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn policy_registration_refuses_both_local_web_roots_before_resolution() {
+        use crate::did_resolution_test_support::*;
+        use rocket::{
+            figment::providers::Serialized, http::ContentType, local::asynchronous::Client,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config::default();
+        config.storage.datadir = dir.path().into();
+        config.storage.database = Some("sqlite::memory:".into());
+        config.keys = serde_json::from_value(serde_json::json!({"type":"static", "secret":base64::encode_config([41; 32], base64::URL_SAFE_NO_PAD)})).unwrap();
+        let figment = rocket::figment::Figment::from(rocket::Config {
+            address: "127.0.0.1".parse().unwrap(),
+            log_level: rocket::config::LogLevel::Off,
+            ..rocket::Config::default()
+        })
+        .merge(Serialized::defaults(&config));
+        let client = Client::tracked(
+            crate::app_with_control(&figment, &config, None)
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let first = bound_listener();
+        let second = bound_listener();
+        let key = JWK::generate_ed25519().unwrap();
+        let roots: Vec<_> = [&first, &second]
+            .into_iter()
+            .map(|listener| {
+                signed_ucan_with_proof(
+                    &format!(
+                        "did:web:127.0.0.1%3A{}",
+                        listener.local_addr().unwrap().port()
+                    ),
+                    &key,
+                    Algorithm::EdDSA,
+                    false,
+                )
+                .encode()
+                .unwrap()
+            })
+            .collect();
+        let vector: Value = serde_json::from_str(include_str!(
+            "../test-fixtures/tc-405-compact-authorization.json"
+        ))
+        .unwrap();
+        let mut policy = vector["policy"]["value"].clone();
+        let owner = StaticSecret::new(vec![43; 32]).unwrap();
+        let now = OffsetDateTime::now_utc();
+        policy["ownerDid"] = serde_json::json!(owner.node_did());
+        policy["createdAt"] = serde_json::json!(format_time(now - Duration::seconds(10)));
+        policy["expiresAt"] = serde_json::json!(format_time(now + Duration::minutes(10)));
+        let unsigned = policy.as_object_mut().unwrap();
+        unsigned.remove("signature");
+        unsigned.remove("policyId");
+        let mut preimage = POLICY_V1_SCHEMA.as_bytes().to_vec();
+        preimage.push(0);
+        preimage.extend(canonical_json_value(&policy));
+        let digest = Sha256::digest(preimage);
+        policy["policyId"] = serde_json::json!(format!("pol_{}", base32_lower(&digest)));
+        policy["signature"] = serde_json::json!({"suite":"Ed25519", "signerDid":owner.node_did(),
+            "value":encode_config(owner.node_keypair().sign(&digest).unwrap(), URL_SAFE_NO_PAD)});
+        let policy_cid = tinycloud_auth::ipld_core::cid::Cid::new_v1(
+            0x55,
+            tinycloud_auth::multihash_codetable::Code::Sha2_256
+                .digest(&canonical_json_value(&policy)),
+        )
+        .to_string();
+        let projections = registration_projections(&policy).unwrap();
+        let request = serde_json::json!({
+            "policyCid":policy_cid, "policy":policy, "policyRoot":roots[0], "enforcementRoot":roots[1],
+            "contentSourceDigestHex":projections.content_source_digest_hex,
+            "nativeProjectionHashHex":projections.native_projection_hash_hex,
+            "attestedEnforcerBinding":null,
+        });
+        let response = client
+            .post("/policy/v3/policies")
+            .header(ContentType::JSON)
+            .body(request.to_string())
+            .dispatch()
+            .await;
+        let status = response.status();
+        let body = response.into_string().await.unwrap();
+        assert_eq!(status, Status::Forbidden, "{body}");
+        assert_eq!(body, "policy-root-signature-invalid");
+        assert_no_connections(&[&first, &second]).await;
+    }
+
+    #[tokio::test]
+    async fn did_web_refusal_precedes_resolution() {
+        use crate::did_resolution_test_support::*;
+        use tinycloud_auth::ssi::jwk::{Algorithm, JWK};
+        let listener = bound_listener();
+        let issuer = format!(
+            "did:web:127.0.0.1%3A{}",
+            listener.local_addr().unwrap().port()
+        );
+        let ucan = signed_ucan(&issuer, &JWK::generate_ed25519().unwrap(), Algorithm::EdDSA);
+        assert!(
+            super::verify_signed_delegation(&TinyCloudDelegation::Ucan(Box::new(ucan)))
+                .await
+                .is_err()
+        );
+        assert_no_connections(&[&listener]).await;
+    }
     use super::*;
     use base64::encode_config;
     use serde_json::json;
     use tinycloud_auth::authorization::HeaderEncode;
+    use tinycloud_auth::ssi::dids::AnyDidMethod;
     use tinycloud_auth::ssi::{claims::jwt::NumericDate, ucan::Payload};
     use tinycloud_core::migrations::Migrator;
     use tinycloud_core::sea_orm::{Database, EntityTrait, TransactionTrait};

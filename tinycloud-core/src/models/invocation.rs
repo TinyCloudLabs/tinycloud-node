@@ -6,7 +6,7 @@ use super::super::{
     util,
 };
 use crate::encryption::ColumnEncryption;
-use crate::models::did_resolution::did_resolution_timeout;
+use crate::models::did_resolution::{verify_ucan_signature, UcanVerifyError};
 use crate::policy_capability::sql_caveat;
 use crate::types::{Caveats, Facts, Resource, SpaceIdWrap};
 use crate::write_hooks::{hook_delivery_id, subscription_matches_event};
@@ -21,7 +21,6 @@ use std::collections::HashMap;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tinycloud_auth::{
     authorization::TinyCloudInvocation, identity::did_principal_matches, resource::Path,
-    ssi::dids::AnyDidMethod,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
@@ -77,6 +76,10 @@ pub enum InvocationError {
     InvalidTime,
     #[error("Failed to verify signature")]
     InvalidSignature,
+    #[error("did_method_disabled: DID method `{0}` is not resolvable on this node")]
+    UnsupportedDidMethod(String),
+    #[error("did_url_query_rejected: issuer DID URL must not carry a query")]
+    DidUrlQueryRejected,
     #[error("Unauthorized Invoker")]
     UnauthorizedInvoker(String),
     #[error("Unauthorized Action: {0} / {1}")]
@@ -193,15 +196,17 @@ pub(crate) async fn authorize_admitted<C: ConnectionTrait>(
 }
 
 pub async fn verify_invocation(invocation: &TinyCloudInvocation) -> Result<(), Error> {
-    tokio::time::timeout(
-        did_resolution_timeout(),
-        invocation
-            // TODO go back to static DID_METHODS
-            .verify_signature(&AnyDidMethod::default()),
-    )
-    .await
-    .map_err(|_| InvocationError::InvalidSignature)?
-    .map_err(|_| InvocationError::InvalidSignature)?;
+    verify_ucan_signature(invocation)
+        .await
+        .map_err(|error| match error {
+            UcanVerifyError::MethodDisabled { method } => {
+                InvocationError::UnsupportedDidMethod(method)
+            }
+            UcanVerifyError::QueryRejected => InvocationError::DidUrlQueryRejected,
+            UcanVerifyError::Timeout | UcanVerifyError::Invalid => {
+                InvocationError::InvalidSignature
+            }
+        })?;
     invocation
         .payload()
         .validate_time(None)
@@ -1008,6 +1013,22 @@ async fn enqueue_kv_webhook_deliveries<C: ConnectionTrait>(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn did_web_refusal_precedes_resolution() {
+        use crate::test_support::did_resolution::*;
+        use tinycloud_auth::ssi::jwk::{Algorithm, JWK};
+        let listener = bound_listener();
+        let issuer = format!(
+            "did:web:127.0.0.1%3A{}",
+            listener.local_addr().unwrap().port()
+        );
+        let ucan = signed_ucan(&issuer, &JWK::generate_ed25519().unwrap(), Algorithm::EdDSA);
+        let result = super::verify_invocation(&ucan).await;
+        assert!(
+            matches!(result, Err(super::Error::InvalidInvocation(super::InvocationError::UnsupportedDidMethod(method))) if method == "web")
+        );
+        assert_no_connections(&[&listener]).await;
+    }
     use super::*;
     use crate::migrations::Migrator;
     use sea_orm::{

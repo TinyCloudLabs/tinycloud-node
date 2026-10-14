@@ -113,6 +113,10 @@ default-features = false
 features = ["sqlite", "postgres", "mysql", "tokio", "verification-count-test-hook"]
 
 [dev-dependencies]
+# Parse production Rust items in the DID resolver source guard (tests only).
+syn = { version = "2", features = ["full", "visit"] }
+quote = "1"
+proc-macro2 = "1"
 # Reads socket options back in tests/postgres_pool_timeouts.rs.
 socket2 = { version = "0.5", features = ["all"] }
 rusqlite.workspace = true

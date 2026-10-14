@@ -55,3 +55,9 @@ cors = true
     ## Enable Prometheus latency metrics on global.prometheus.port.
     ## Env: TINYCLOUD_TELEMETRY__ENABLED
     enabled = false
+
+[global.did_resolution]
+    ## UCAN issuers resolve only key, pkh and jwk by default.
+    ## Rollback: TINYCLOUD_DID_RESOLUTION__NETWORK_METHODS=true, then restart.
+    ## Issuer queries remain refused. Opt-in uses the unhardened SSI client (TC-1080).
+    # network_methods = false

@@ -206,6 +206,10 @@ fn assert_request_data_stays_out_of_logs(extra_env: &[(&str, &str)]) {
     std::thread::sleep(Duration::from_millis(200));
     drop(server);
     let logs = read_logs(dir.path());
+    assert!(
+        logs.contains("did resolution policy"),
+        "startup must report the DID policy"
+    );
 
     for (what, needle) in [
         ("signed-KV ticket id", ticket.as_str()),

@@ -1,6 +1,6 @@
 use super::super::{events::Revocation, models::*, relationships::*};
 use crate::hash::{hash, Hash};
-use crate::models::did_resolution::did_resolution_timeout;
+use crate::models::did_resolution::{verify_ucan_signature, UcanVerifyError};
 use crate::types::Resource;
 use sea_orm::{
     entity::prelude::*, sea_query::OnConflict, ConnectionTrait, QueryOrder, QuerySelect,
@@ -10,7 +10,6 @@ use time::OffsetDateTime;
 use tinycloud_auth::{
     authorization::{Cid, TinyCloudRevocation},
     identity::did_principal_matches,
-    ssi::dids::AnyDidMethod,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
@@ -244,6 +243,10 @@ pub enum RevocationError {
     InvalidTime,
     #[error("Failed to verify signature")]
     InvalidSignature,
+    #[error("did_method_disabled: DID method `{0}` is not resolvable on this node")]
+    UnsupportedDidMethod(String),
+    #[error("did_url_query_rejected: issuer DID URL must not carry a query")]
+    DidUrlQueryRejected,
     #[error("Unauthorized Revoker")]
     UnauthorizedRevoker(String),
     #[error("Cannot find parent delegation")]
@@ -272,13 +275,17 @@ pub(crate) async fn process<C: ConnectionTrait>(
             };
         }
         TinyCloudRevocation::Ucan(u) => {
-            tokio::time::timeout(
-                did_resolution_timeout(),
-                u.verify_signature(&AnyDidMethod::default()),
-            )
-            .await
-            .map_err(|_| RevocationError::InvalidSignature)?
-            .map_err(|_| RevocationError::InvalidSignature)?;
+            verify_ucan_signature(u)
+                .await
+                .map_err(|error| match error {
+                    UcanVerifyError::MethodDisabled { method } => {
+                        RevocationError::UnsupportedDidMethod(method)
+                    }
+                    UcanVerifyError::QueryRejected => RevocationError::DidUrlQueryRejected,
+                    UcanVerifyError::Timeout | UcanVerifyError::Invalid => {
+                        RevocationError::InvalidSignature
+                    }
+                })?;
             u.payload()
                 .validate_time(None)
                 .map_err(|_| RevocationError::InvalidTime)?;
@@ -386,6 +393,28 @@ async fn revoker_is_authorized<C: ConnectionTrait>(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn did_web_refusal_precedes_resolution() {
+        use crate::test_support::did_resolution::*;
+        use tinycloud_auth::ssi::jwk::{Algorithm, JWK};
+        let listener = bound_listener();
+        let issuer = format!(
+            "did:web:127.0.0.1%3A{}",
+            listener.local_addr().unwrap().port()
+        );
+        let ucan = signed_ucan(&issuer, &JWK::generate_ed25519().unwrap(), Algorithm::EdDSA);
+        let db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
+        let token = ucan.encode().unwrap();
+        let event = crate::events::Revocation::from_header_ser::<
+            tinycloud_auth::authorization::TinyCloudRevocation,
+        >(&token)
+        .unwrap();
+        let result = super::process(&db, event).await;
+        assert!(
+            matches!(result, Err(super::Error::InvalidRevocation(super::RevocationError::UnsupportedDidMethod(method))) if method == "web")
+        );
+        assert_no_connections(&[&listener]).await;
+    }
     use super::*;
     use crate::migrations::Migrator;
     use sea_orm::{ActiveModelTrait, ActiveValue::Set, ConnectOptions, Database};

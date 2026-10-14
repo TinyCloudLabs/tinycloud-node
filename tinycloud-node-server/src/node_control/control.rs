@@ -499,6 +499,11 @@ pub async fn spawn_control_plane(
 ) -> Result<ControlPlaneServer> {
     let mut effective_config = config.clone();
     effective_config.storage.resolve();
+    tinycloud_core::did_resolution::configure(
+        tinycloud_core::did_resolution::DidResolutionPolicy {
+            network_methods: effective_config.did_resolution.network_methods,
+        },
+    );
 
     let pid = std::process::id();
     let data_path = effective_config.storage.datadir.clone();
@@ -1115,6 +1120,8 @@ fn effective_public_config(base_config_path: &Path) -> ControlResult<ControlConf
         let figment = crate::runtime::serve_config_figment(base_config_path)?;
         let mut config = figment.extract::<Config>()?;
         config.storage.resolve();
+        // Read-only config inspection must not change the running DID policy.
+        // Startup/restart paths configure it in spawn_control_plane and app_with_control.
 
         let identity = key_provider::resolve_identity_state(
             Some(&config.keys),
@@ -1907,6 +1914,11 @@ mod tests {
         let figment = runtime::serve_config_figment(&base_config_path).unwrap();
         let mut config = figment.extract::<Config>().unwrap();
         config.storage.resolve();
+        tinycloud_core::did_resolution::configure(
+            tinycloud_core::did_resolution::DidResolutionPolicy {
+                network_methods: config.did_resolution.network_methods,
+            },
+        );
         let server = spawn_control_plane(&config, base_config_path, profile)
             .await
             .unwrap();
