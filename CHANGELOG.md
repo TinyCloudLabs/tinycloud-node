@@ -5,6 +5,8 @@
 - CACAO/SIWE delegation ingestion normalizes ECDSA recovery IDs 0/1 to 27/28 before hashing and persisting the canonical DAG-CBOR bytes (TC-1071). Equivalent low-s signatures now share one delegation CID, including the CID used for revocation lookup. High-s signatures are rejected during decoding, matching the existing EIP-191 verifier and EIP-2 low-s convention; UCAN/JWS bytes remain unchanged. Existing stored delegation IDs are not rewritten.
 - Synchronize the standalone M1, W5 and load-signer Cargo locks with CACAO's `k256` dependency so `--locked` dependency resolution succeeds (TC-1071).
 
+- Historical CACAO revocations now apply to every stored encoding of the same delegation, in both directions (TC-1071). A persisted CID-alias index derives identities from current ingestion's canonical bytes, including recovery-ID, issuer-address/chain, and accepted CBOR representation normalization. Startup backfills aliases transactionally after loading the column encryption key and fails closed on undecodable or mismatched history or missing/wrong keys. Historical IDs, signed bytes, revocation targets, and signed child proof references remain unchanged; legacy list/chain responses retain their exact raw-header/CID relationship. This closes reuse of an already owner-signed grant under another accepted encoding; it does not involve forging new rights.
+
 ## [1.20.6] - 2026-10-14
 
 A security fix (TC-1080, Part A). UCAN issuer resolution no longer dereferences network DID methods by default, so a request can't make the node fetch arbitrary or internal hosts through a crafted issuer DID (#284).

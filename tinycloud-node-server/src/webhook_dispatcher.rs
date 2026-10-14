@@ -313,13 +313,13 @@ mod tests {
         let storage = NodeFileSystemConfig::new(tempdir.path()).open().await?;
         let _persisted = tempdir.keep();
         let encryption = ColumnEncryption::new([9u8; 32]);
-        let tinycloud = TinyCloud::new(
+        let tinycloud = TinyCloud::new_with_encryption(
             db.clone().into(),
             Either::B(storage),
             StaticSecret::new(vec![0u8; 32]).unwrap(),
+            Some(encryption.clone()),
         )
-        .await?
-        .with_encryption(Some(encryption.clone()));
+        .await?;
         Ok((tinycloud, db, encryption))
     }
 
@@ -540,13 +540,13 @@ mod tests {
         let tempdir = TempDir::new()?;
         let storage = NodeFileSystemConfig::new(tempdir.path()).open().await?;
         let _persisted = tempdir.keep();
-        let tinycloud = TinyCloud::new(
+        let tinycloud = TinyCloud::new_with_encryption(
             db.clone().into(),
             Either::B(storage),
             StaticSecret::new(vec![0u8; 32]).unwrap(),
+            Some(encryption.clone()),
         )
-        .await?
-        .with_encryption(Some(encryption.clone()));
+        .await?;
         let dispatcher = WebhookDispatcher::new(tinycloud, HooksConfig::default(), encryption)?;
 
         dispatcher.dispatch_due_once().await?;
@@ -762,14 +762,14 @@ mod tests {
                     .unwrap();
                 let _persisted = tempdir.keep();
                 let encryption = ColumnEncryption::new([9u8; 32]);
-                let tinycloud = TinyCloud::new(
+                let tinycloud = TinyCloud::new_with_encryption(
                     conn,
                     Either::B(storage),
                     StaticSecret::new(vec![0u8; 32]).unwrap(),
+                    Some(encryption.clone()),
                 )
                 .await
-                .unwrap()
-                .with_encryption(Some(encryption.clone()));
+                .unwrap();
 
                 let mut setup_options = ConnectOptions::new(url.to_owned());
                 setup_options

@@ -4532,26 +4532,30 @@ mod tests {
         let runtime = compose_test_runtime(&key_setup, Some(tee_context.clone()), true).await;
         let conn = runtime.conn.clone();
 
-        actor::ActiveModel {
-            id: Set("did:key:tc349-restart".to_owned()),
-        }
-        .insert(&conn)
-        .await
-        .expect("actor row");
-        let delegation_id = hash(b"tc349-restart-delegation");
-        delegation::ActiveModel {
-            id: Set(delegation_id),
-            delegator: Set("did:key:tc349-restart".to_owned()),
-            delegatee: Set("did:key:tc349-restart".to_owned()),
-            expiry: Set(None),
-            issued_at: Set(None),
-            not_before: Set(None),
-            facts: Set(None),
-            serialization: Set(delegation_id.as_ref().to_vec()),
-        }
-        .insert(&conn)
-        .await
-        .expect("delegation row");
+        use tinycloud_auth::{
+            resolver::DID_METHODS,
+            ssi::jwk::{Algorithm, JWK},
+        };
+        let jwk = JWK::generate_ed25519().expect("local test signer");
+        let did = DID_METHODS.generate(&jwk, "key").unwrap().to_string();
+        let issuer = format!("{did}#{}", did.trim_start_matches("did:key:"));
+        let signed = crate::did_resolution_test_support::signed_ucan_with_proof(
+            &issuer,
+            &jwk,
+            Algorithm::EdDSA,
+            false,
+        );
+        let delegation =
+            tinycloud_core::events::Delegation::from_header_ser::<TinyCloudDelegation>(
+                &signed.encode().unwrap(),
+            )
+            .unwrap();
+        runtime
+            .tinycloud
+            .delegate(delegation)
+            .await
+            .map_err(|error| error.to_string())
+            .expect("valid signed delegation persisted before restart");
 
         // Re-compose over the same, now-populated connection: the restart shape.
         let directory = tempfile::tempdir().expect("tempdir for local block store");

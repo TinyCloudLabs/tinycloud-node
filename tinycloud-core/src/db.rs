@@ -20,7 +20,7 @@ use crate::types::{
     DelegationQueryPage, DelegationQueryStatus, DelegationResource, ListFilters, Metadata,
     Resource, SpaceIdWrap,
 };
-use crate::util::{Capability, DelegationInfo, DelegationMode};
+use crate::util::DelegationInfo;
 use sea_orm::{
     entity::prelude::*,
     error::{DbErr, RuntimeErr, SqlxError},
@@ -343,11 +343,32 @@ impl<C, B, K> SpaceDatabase<C, B, K>
 where
     C: ConnectionTrait + Clone + Into<RecoveringConnection>,
 {
+    /// Open an unencrypted delegation database and complete historical CID
+    /// indexing before accepting requests.
     pub async fn new(conn: C, storage: B, secrets: K) -> Result<Self, DbErr> {
+        Self::new_with_encryption(conn, storage, secrets, None).await
+    }
+
+    /// Open a database with its column encryption key available before the
+    /// historical CID backfill. Missing/wrong keys or undecodable history fail
+    /// startup; signed records and proof edges are never rewritten.
+    pub async fn new_with_encryption(
+        conn: C,
+        storage: B,
+        secrets: K,
+        encryption: Option<ColumnEncryption>,
+    ) -> Result<Self, DbErr> {
         let pool: RecoveringConnection = conn.clone().into();
         // sea-orm-migration's schema manager accepts only the raw sea-orm
         // connection. Migrations run once at boot, before any request.
         migrate(&pool).await?;
+        let tx = begin_write_transaction(&pool, None).await?;
+        if pool.get_database_backend() == DbBackend::Postgres {
+            tx.execute_unprepared(crate::db_pool::EXEMPT_STATEMENT_TIMEOUT)
+                .await?;
+        }
+        delegation_cid_alias::backfill(&tx, encryption.as_ref()).await?;
+        tx.commit().await?;
         let writer_lock = (pool.get_database_backend() == sea_orm::DatabaseBackend::Sqlite)
             .then(|| Arc::new(tokio::sync::Mutex::new(())));
         let read_audit = ReadAuditPipeline::start(pool, writer_lock.clone());
@@ -355,7 +376,7 @@ where
             conn,
             storage,
             secrets,
-            encryption: None,
+            encryption,
             sql_sizes: SqlSizes::default(),
             revocation_chain_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             kv_object_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -366,11 +387,6 @@ where
                 crate::database_migration::EffectiveFenceCache::default(),
             ),
         })
-    }
-
-    pub fn with_encryption(mut self, encryption: Option<ColumnEncryption>) -> Self {
-        self.encryption = encryption;
-        self
     }
 
     pub fn with_sql_sizes(mut self, sql_sizes: SqlSizes) -> Self {
@@ -592,10 +608,7 @@ where
         };
         let bytes = crate::encryption::maybe_decrypt(self.encryption.as_ref(), &row.serialization)
             .map_err(|error| error.to_string())?;
-        let delegation =
-            TinyCloudDelegation::from_bytes(&bytes).map_err(|error| error.to_string())?;
-        let info = DelegationInfo::try_from(delegation).map_err(|error| error.to_string())?;
-        let event = SerializedEvent(info, bytes);
+        let event = decode_stored_delegation(bytes).map_err(|error| error.to_string())?;
         if event.content_hash() != row.id || event.content_hash() != Hash::from(cid) {
             return Err("delegation-signed-bytes-mismatch".to_string());
         }
@@ -1292,7 +1305,7 @@ where
         &self,
         roots: &[Hash],
     ) -> Result<Vec<ExclusiveChainGuard>, TxError<B, K>> {
-        let keys = revocation::ancestor_chain_ids_for_roots(&self.conn, roots)
+        let keys = crate::auth_graph::load_chain_lock_ids(&self.conn, roots)
             .await
             .map_err(|error| match error {
                 revocation::ChainTraversalError::Db(error) => TxError::Db(error),
@@ -1980,9 +1993,8 @@ where
         );
         let authz_start = Instant::now();
         let closure_start = Instant::now();
-        let lock_keys = crate::auth_graph::load_closure_edges(&self.conn, &guard_roots)
+        let lock_keys = crate::auth_graph::load_chain_lock_ids(&self.conn, &guard_roots)
             .await
-            .map(|(keys, _)| keys)
             .map_err(|error| match error {
                 revocation::ChainTraversalError::Db(error) => TxError::Db(error),
                 revocation::ChainTraversalError::LimitExceeded => {
@@ -2880,9 +2892,9 @@ pub enum InvocationOutcome<R> {
     KvBatchWrite(Vec<Path>),
     KvBatchRead(Vec<KvBatchReadItem>),
     KvRead(Option<(Metadata, Hash, Content<R>)>),
-    OpenSessions(HashMap<Hash, DelegationInfo>),
-    /// Ordered delegation chain from leaf to root
-    DelegationChain(Vec<DelegationInfo>),
+    OpenSessions(HashMap<Hash, Delegation>),
+    /// Ordered delegation chain from leaf to root, retaining exact signed bytes.
+    DelegationChain(Vec<Delegation>),
     SqlResult(serde_json::Value),
     SqlExport(Vec<u8>),
     DuckDbResult(serde_json::Value),
@@ -3912,15 +3924,25 @@ fn delegations_touching_space(backend: DbBackend, space_id: &SpaceId) -> SimpleE
     )
 }
 
+/// Reparse response projections from their signed source, preserving complete
+/// proof CIDs (including codecs and order) rather than reconstructing them from
+/// the graph's hash-only edges.
+fn decode_stored_delegation(serialization: Vec<u8>) -> Result<Delegation, DbErr> {
+    let delegation = TinyCloudDelegation::from_bytes(&serialization)
+        .map_err(|_| DbErr::Custom("delegation-signed-bytes-invalid".into()))?;
+    let info = DelegationInfo::try_from(delegation)
+        .map_err(|_| DbErr::Custom("delegation-signed-info-invalid".into()))?;
+    Ok(SerializedEvent(info, serialization))
+}
+
 async fn get_valid_delegations<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
     db: &C,
     space_id: &SpaceId,
     encryption: Option<&ColumnEncryption>,
-) -> Result<HashMap<Hash, DelegationInfo>, TxError<S, K>> {
+) -> Result<HashMap<Hash, Delegation>, TxError<S, K>> {
     let (dels, abilities): (Vec<delegation::Model>, Vec<Vec<abilities::Model>>) =
         delegation::Entity::find()
-            .left_join(revocation::Entity)
-            .filter(revocation::Column::Id.is_null())
+            .filter(revocation::unrevoked_condition())
             .filter(delegations_touching_space(
                 db.get_database_backend(),
                 space_id,
@@ -3930,12 +3952,10 @@ async fn get_valid_delegations<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
             .await?
             .into_iter()
             .unzip();
-    let parents = dels.load_many(parent_delegations::Entity, db).await?;
     let now = time::OffsetDateTime::now_utc();
     dels.into_iter()
         .zip(abilities)
-        .zip(parents)
-        .filter_map(|((del, ability), parents)| {
+        .filter_map(|(del, ability)| {
             // `delegations_touching_space` has already narrowed this to the
             // delegations whose resources fall in the space's prefix range;
             // the space check below is the exact filter over that superset.
@@ -3948,51 +3968,16 @@ async fn get_valid_delegations<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                         Ok(s) => s,
                         Err(e) => return Some(Err(TxError::Encryption(e))),
                     };
-                Some(match TinyCloudDelegation::from_bytes(&serialization) {
-                    Ok(delegation) => Ok((
-                        del.id,
-                        DelegationInfo {
-                            delegator: del.delegator,
-                            delegate: del.delegatee,
-                            parents: parents.into_iter().map(|p| p.parent.to_cid(0x55)).collect(),
-                            expiry: del.expiry,
-                            not_before: del.not_before,
-                            issued_at: del.issued_at,
-                            delegation_mode: mode_from_facts(&del.facts),
-                            capabilities: ability
-                                .into_iter()
-                                .map(|a| Capability {
-                                    resource: a.resource,
-                                    ability: a.ability,
-                                    caveats: a.caveats,
-                                })
-                                .collect(),
-                            delegation,
-                        },
-                    )),
-                    Err(e) => Err(TxError::Encoding(e)),
-                })
+                Some(
+                    decode_stored_delegation(serialization)
+                        .map(|event| (del.id, event))
+                        .map_err(TxError::Db),
+                )
             } else {
                 None
             }
         })
-        .collect::<Result<HashMap<Hash, DelegationInfo>, TxError<S, K>>>()
-}
-
-/// Decode the persisted `xyz.tinycloud.policy/delegationMode` marker from
-/// a stored delegation row's facts column.
-fn mode_from_facts(facts: &Option<crate::types::Facts>) -> DelegationMode {
-    facts
-        .as_ref()
-        .and_then(|f| f.0.get(DelegationMode::FACT_KEY).and_then(|v| v.as_str()))
-        .map(|s| {
-            if s == "terminal" {
-                DelegationMode::Terminal
-            } else {
-                DelegationMode::Attenuable
-            }
-        })
-        .unwrap_or(DelegationMode::Attenuable)
+        .collect::<Result<HashMap<Hash, Delegation>, TxError<S, K>>>()
 }
 
 /// Resolve a session key DID (did:key:...) to its root PKH DID (did:pkh:...).
@@ -4297,17 +4282,14 @@ async fn load_account_ancestor_state<C: ConnectionTrait>(
         .filter(delegation::Column::Id.is_in(ids.iter().copied()))
         .all(db)
         .await?;
-    let revocation_rows = revocation::Entity::find()
-        .filter(revocation::Column::Revoked.is_in(ids))
-        .all(db)
-        .await?;
+    let revocation_rows = revocation::effective_rows(db, &ids).await?;
     let delegations = delegation_rows
         .into_iter()
         .map(|row| (row.id, row))
         .collect();
     let mut revocations: HashMap<Hash, Vec<revocation::Model>> = HashMap::new();
-    for row in revocation_rows {
-        revocations.entry(row.revoked).or_default().push(row);
+    for (id, row) in revocation_rows {
+        revocations.entry(id).or_default().push(row);
     }
     for values in revocations.values_mut() {
         values.sort_by(|left, right| left.id.as_ref().cmp(right.id.as_ref()));
@@ -4327,7 +4309,7 @@ async fn get_filtered_delegations<C: ConnectionTrait, S: StorageSetup, K: Secret
     invoker: &str,
     filters: Option<&ListFilters>,
     encryption: Option<&ColumnEncryption>,
-) -> Result<HashMap<Hash, DelegationInfo>, TxError<S, K>> {
+) -> Result<HashMap<Hash, Delegation>, TxError<S, K>> {
     // Resolve session key DID to PKH DID for direction filtering
     let pkh_did = resolve_pkh_did(db, invoker)
         .await
@@ -4335,8 +4317,7 @@ async fn get_filtered_delegations<C: ConnectionTrait, S: StorageSetup, K: Secret
 
     let (dels, abilities): (Vec<delegation::Model>, Vec<Vec<abilities::Model>>) =
         delegation::Entity::find()
-            .left_join(revocation::Entity)
-            .filter(revocation::Column::Id.is_null())
+            .filter(revocation::unrevoked_condition())
             .filter(delegations_touching_space(
                 db.get_database_backend(),
                 space_id,
@@ -4346,7 +4327,6 @@ async fn get_filtered_delegations<C: ConnectionTrait, S: StorageSetup, K: Secret
             .await?
             .into_iter()
             .unzip();
-    let parents = dels.load_many(parent_delegations::Entity, db).await?;
     let now = time::OffsetDateTime::now_utc();
 
     // Extract filter values
@@ -4356,8 +4336,7 @@ async fn get_filtered_delegations<C: ConnectionTrait, S: StorageSetup, K: Secret
 
     dels.into_iter()
         .zip(abilities)
-        .zip(parents)
-        .filter_map(|((del, ability), parents)| {
+        .filter_map(|(del, ability)| {
             // Time validity check
             if !(del.expiry.map(|e| e > now).unwrap_or(true)
                 && del.not_before.map(|n| n <= now).unwrap_or(true))
@@ -4414,32 +4393,13 @@ async fn get_filtered_delegations<C: ConnectionTrait, S: StorageSetup, K: Secret
                     Ok(s) => s,
                     Err(e) => return Some(Err(TxError::Encryption(e))),
                 };
-            Some(match TinyCloudDelegation::from_bytes(&serialization) {
-                Ok(delegation) => Ok((
-                    del.id,
-                    DelegationInfo {
-                        delegator: del.delegator,
-                        delegate: del.delegatee,
-                        parents: parents.into_iter().map(|p| p.parent.to_cid(0x55)).collect(),
-                        expiry: del.expiry,
-                        not_before: del.not_before,
-                        issued_at: del.issued_at,
-                        delegation_mode: mode_from_facts(&del.facts),
-                        capabilities: ability
-                            .into_iter()
-                            .map(|a| Capability {
-                                resource: a.resource,
-                                ability: a.ability,
-                                caveats: a.caveats,
-                            })
-                            .collect(),
-                        delegation,
-                    },
-                )),
-                Err(e) => Err(TxError::Encoding(e)),
-            })
+            Some(
+                decode_stored_delegation(serialization)
+                    .map(|event| (del.id, event))
+                    .map_err(TxError::Db),
+            )
         })
-        .collect::<Result<HashMap<Hash, DelegationInfo>, TxError<S, K>>>()
+        .collect::<Result<HashMap<Hash, Delegation>, TxError<S, K>>>()
 }
 
 /// Get the delegation chain for a specific delegation, ordered from leaf to root.
@@ -4449,7 +4409,7 @@ async fn get_delegation_chain<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
     space_id: &SpaceId,
     delegation_cid: &str,
     encryption: Option<&ColumnEncryption>,
-) -> Result<Vec<DelegationInfo>, TxError<S, K>> {
+) -> Result<Vec<Delegation>, TxError<S, K>> {
     use tinycloud_auth::ipld_core::cid::Cid;
 
     // Parse the delegation CID
@@ -4466,8 +4426,7 @@ async fn get_delegation_chain<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
     loop {
         // Find the delegation with this hash
         let del_with_abilities = delegation::Entity::find_by_id(current_hash)
-            .left_join(revocation::Entity)
-            .filter(revocation::Column::Id.is_null())
+            .filter(revocation::unrevoked_condition())
             .find_with_related(abilities::Entity)
             .all(db)
             .await?;
@@ -4496,31 +4455,8 @@ async fn get_delegation_chain<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
             .all(db)
             .await?;
 
-        let parent_cids: Vec<Cid> = parents.iter().map(|p| p.parent.to_cid(0x55)).collect();
-
-        // Create DelegationInfo
         let serialization = crate::encryption::maybe_decrypt(encryption, &del.serialization)?;
-        let delegation = TinyCloudDelegation::from_bytes(&serialization)?;
-        let info = DelegationInfo {
-            delegator: del.delegator,
-            delegate: del.delegatee,
-            parents: parent_cids.clone(),
-            expiry: del.expiry,
-            not_before: del.not_before,
-            issued_at: del.issued_at,
-            delegation_mode: mode_from_facts(&del.facts),
-            capabilities: ability
-                .into_iter()
-                .map(|a| Capability {
-                    resource: a.resource,
-                    ability: a.ability,
-                    caveats: a.caveats,
-                })
-                .collect(),
-            delegation,
-        };
-
-        chain.push(info);
+        chain.push(decode_stored_delegation(serialization)?);
 
         // Move to the first parent (if any) to continue the chain
         // Note: We follow the first parent; for multiple parents, this gives one path
@@ -6083,9 +6019,8 @@ mod test {
     /// Resolve the ancestor closure exactly as `invoke_with_options_mode`
     /// does, then take the guards shared — the production invocation path.
     async fn invocation_chain_keys(db: &TestDb, roots: &[Hash]) -> Vec<Hash> {
-        crate::auth_graph::load_closure_edges(&db.conn, roots)
+        crate::auth_graph::load_chain_lock_ids(&db.conn, roots)
             .await
-            .map(|(keys, _)| keys)
             .expect("chain closure query")
     }
 
@@ -6113,6 +6048,49 @@ mod test {
     async fn settle() {
         tokio::task::yield_now().await;
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+
+    /// Equivalent historical parents and an as-yet unregistered canonical CID
+    /// must contend on the same guard as an invocation citing the signed child.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn historical_alias_revocation_waits_for_signed_child_invocation() {
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set};
+
+        let db = get_db().await.unwrap();
+        insert_chain_guard_actors(&db).await;
+        let (legacy, child) = insert_test_chain(&db, "historical-alias-lock").await;
+        let (other_legacy, _) = insert_test_chain(&db, "other-historical-alias-lock").await;
+        let canonical = crate::hash::hash(b"canonical parent not registered as a delegation");
+        for id in [legacy, other_legacy] {
+            delegation_cid_alias::ActiveModel {
+                id: Set(id),
+                canonical: Set(canonical),
+                encrypted: Set(false),
+            }
+            .insert(&db.conn)
+            .await
+            .unwrap();
+        }
+
+        for target in [legacy, other_legacy, canonical] {
+            let in_flight = acquire_invocation_guards(&db, &[child]).await;
+            let revoke_db = db.clone();
+            let revoke =
+                tokio::spawn(async move { revoke_db.acquire_chain_guards(&[target]).await });
+            settle().await;
+            assert!(
+                !revoke.is_finished(),
+                "equivalent ancestor revocation must wait for the signed child's invocation"
+            );
+            drop(in_flight);
+            let guards = tokio::time::timeout(std::time::Duration::from_secs(10), revoke)
+                .await
+                .expect("alias revocation proceeds after the child releases its guards")
+                .unwrap()
+                .ok()
+                .expect("alias revocation guards");
+            drop(guards);
+        }
     }
 
     /// TC-324 requirement 1: invocations sharing one root delegation must

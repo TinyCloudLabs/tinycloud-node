@@ -393,6 +393,41 @@ export class Authenticator {
 }
 ```
 
+## Historical CACAO CIDs and Revocation
+
+New CACAO imports hash the canonical bytes returned by
+`TinyCloudDelegation::decode`: accepted recovery IDs, issuer address/chain
+representations, and DAG-CBOR encodings share the same ingestion identity.
+UCAN/JWS bytes remain exact.
+
+At startup, `m20261014_000000_delegation_cid_alias` creates the persisted alias
+index. The database then backfills missing entries in a transaction from each
+stored delegation's exact plaintext serialization, using that same decoder.
+Encrypted databases must open with `SpaceDatabase::new_with_encryption`; the
+column key must be available before backfill. Missing/wrong keys, decoding
+failures, and plaintext hash mismatches fail startup rather than silently
+leaving an active alias. Completed backfills do not re-decode indexed history;
+one indexed encrypted record is checked on each boot to validate the key.
+
+Revocation status, invocation authorization, and ancestor checks union owner
+revocations across equivalent stored CIDs through indexed lookups. Historical
+delegation IDs, signed bytes, revocation targets, and child proof edges are
+never rewritten. A child signed against an old CID remains valid until the
+owner revokes that identity; revocation also denies descendants and new
+redelegations citing any equivalent root.
+
+Canonical chain guards use indexed alias joins in the existing bounded closure
+query, so equivalent revocations serialize against in-flight ancestor
+authorization without an extra request round trip. New delegations and their
+alias commit together; PostgreSQL uses a dependent insert CTE to preserve the
+existing registration round-trip budget.
+
+Legacy capability list/chain responses advertise the stored CID and return
+the exact stored raw header, not a re-encoding of the decoded CACAO. Their
+parent CID fields retain the signed child references. Existing legacy list
+ancestor-visibility behavior is unchanged; authorization always checks the
+complete chain.
+
 ## Child Delegation (UCAN) Creation
 
 For sharing, child UCANs are created that delegate from the session key to another DID.
