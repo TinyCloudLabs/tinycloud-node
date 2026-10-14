@@ -193,10 +193,26 @@ impl AsRef<[u8]> for Signature {
     }
 }
 
+impl Signature {
+    fn decode(mut bytes: [u8; 65]) -> Result<Self, SIWESignatureDecodeError> {
+        let signature = k256::ecdsa::Signature::from_slice(&bytes[..64])
+            .map_err(|_| SIWESignatureDecodeError::InvalidSignature)?;
+        if signature.normalize_s().is_some() {
+            return Err(SIWESignatureDecodeError::NonCanonicalS);
+        }
+        bytes[64] = match bytes[64] {
+            0 | 1 => bytes[64] + 27,
+            27 | 28 => bytes[64],
+            _ => return Err(SIWESignatureDecodeError::InvalidRecoveryId(bytes[64])),
+        };
+        Ok(Self(bytes))
+    }
+}
+
 impl TryFrom<Vec<u8>> for Signature {
     type Error = SIWESignatureDecodeError;
     fn try_from(s: Vec<u8>) -> Result<Self, Self::Error> {
-        Ok(Self(s.try_into().map_err(SIWESignatureDecodeError::from)?))
+        Self::decode(s.try_into().map_err(SIWESignatureDecodeError::from)?)
     }
 }
 
@@ -206,6 +222,12 @@ pub enum SIWESignatureDecodeError {
     InvalidLength(usize),
     #[error("Invalid Type, expected 'eip191', got {0}")]
     InvalidType(String),
+    #[error("Invalid ECDSA signature")]
+    InvalidSignature,
+    #[error("Non-canonical high-s ECDSA signature")]
+    NonCanonicalS,
+    #[error("Invalid recovery ID: {0}")]
+    InvalidRecoveryId(u8),
 }
 
 impl From<Vec<u8>> for SIWESignatureDecodeError {
@@ -286,11 +308,12 @@ impl<'de> Deserialize<'de> for Signature {
                 SIWESignatureDecodeError::InvalidLength(l),
             ));
         }
-        Ok(Signature(
+        Signature::decode(
             ds.s.try_into()
                 .map_err(|_| SIWESignatureDecodeError::InvalidLength(l))
                 .map_err(serde::de::Error::custom)?,
-        ))
+        )
+        .map_err(serde::de::Error::custom)
     }
 }
 

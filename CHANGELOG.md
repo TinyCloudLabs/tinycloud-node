@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- CACAO/SIWE delegation ingestion normalizes ECDSA recovery IDs 0/1 to 27/28 before hashing and persisting the canonical DAG-CBOR bytes (TC-1071). Equivalent low-s signatures now share one delegation CID, including the CID used for revocation lookup. High-s signatures are rejected during decoding, matching the existing EIP-191 verifier and EIP-2 low-s convention; UCAN/JWS bytes remain unchanged. Existing stored delegation IDs are not rewritten.
+
 ## [1.20.6] - 2026-10-14
 
 A security fix (TC-1080, Part A). UCAN issuer resolution no longer dereferences network DID methods by default, so a request can't make the node fetch arbitrary or internal hosts through a crafted issuer DID (#284).
