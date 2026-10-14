@@ -187,6 +187,11 @@ jobs:
       uses: actions/setup-node@v4
       with:
         node-version: 20
+    - name: Check generated log allowlist and compose parity
+      run: |
+        node scripts/node-vector-schema.mjs --check
+        node scripts/node-vector-schema.mjs --check-compose
+        node --test scripts/node-vector-schema.test.mjs
     - name: Verify generated capability artifacts match capabilities.json
       run: node scripts/gen-capabilities.mjs --check
     - name: Verify deployed Policy/v3 probe contract

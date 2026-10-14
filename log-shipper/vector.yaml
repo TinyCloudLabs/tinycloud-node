@@ -1,0 +1,197 @@
+data_dir: /var/lib/vector
+secret:
+  bs: { type: directory, path: /run/vector-secrets, remove_trailing_whitespace: true }
+sources:
+  docker_fluent: { type: fluent, mode: tcp, address: 0.0.0.0:24224 }
+transforms:
+  allowlist:
+    type: remap
+    inputs: [docker_fluent]
+    drop_on_abort: true
+    drop_on_error: true
+    source: |
+      # BEGIN GENERATED FROM fields.json
+      if exists(.partial_message) { abort }
+      if !is_string(.tag) { abort }
+      tag = .tag
+      if !is_string(.log) { abort }
+      j, parse_err = parse_json(.log)
+      if parse_err != null || !is_object(j) { abort }
+      out = {}
+      if tag == "tinycloud.node" {
+        fields = get(j, ["fields"]) ?? null
+        if !is_object(fields) { abort }
+        level = get(j, ["level"]) ?? null
+        if !is_string(level) { abort }
+        level = downcase(level)
+        if !includes(["warn", "error"], level) { abort }
+        msg = get(fields, ["message"]) ?? null
+        if !is_string(msg) { abort }
+        if msg == "invocation replay insert failed" { event = "node_warning"; event_code = "invocation_replay_insert_failed" }
+        else if msg == "invocation replay cleanup failed" { event = "node_warning"; event_code = "invocation_replay_cleanup_failed" }
+        else if starts_with(msg, "dstack socket available but get_info failed: ") { event = "node_warning"; event_code = "dstack_get_info_failed" }
+        else if msg == "share-v2 local-tee feature active: deriving a deterministic, non-attested TEE identity from node key material" { event = "node_warning"; event_code = "share_local_tee_identity" }
+        else if msg == "retention: delivered hook delivery prune failed" { event = "node_warning"; event_code = "retention_hook_delivery_prune_failed" }
+        else if msg == "retention: dead-letter hook delivery prune failed" { event = "node_warning"; event_code = "retention_dead_letter_prune_failed" }
+        else if msg == "retention: signed KV ticket prune failed" { event = "node_warning"; event_code = "retention_signed_ticket_prune_failed" }
+        else if starts_with(msg, "quota service returned an invalid body: ") { event = "node_warning"; event_code = "quota_invalid_body" }
+        else if starts_with(msg, "quota service returned ") { event = "node_warning"; event_code = "quota_fallback" }
+        else if msg == "failed to load tunnel state; tunnel not started" { event = "node_warning"; event_code = "tunnel_state_load_failed" }
+        else if msg == "invalid loopback API address; tunnel not started" { event = "node_warning"; event_code = "tunnel_address_invalid" }
+        else if msg == "failed to load link state; LAN listener not started" { event = "node_warning"; event_code = "link_state_load_failed" }
+        else if msg == "failed to bind link LAN listener; LAN listener not started" { event = "node_warning"; event_code = "link_bind_failed" }
+        else if msg == "failed to build TLS config; LAN listener not started" { event = "node_warning"; event_code = "link_tls_config_failed" }
+        else if msg == "link LAN listener exited with error" { event = "node_error"; event_code = "link_listener_error" }
+        else if msg == "failed to record link listener bind state" { event = "node_warning"; event_code = "link_listener_state_write_failed" }
+        else if msg == "failed to record link listener bind failure" { event = "node_warning"; event_code = "link_bind_state_write_failed" }
+        else if msg == "failed to load config for auto-renew" { event = "node_warning"; event_code = "link_auto_renew_config_failed" }
+        else if msg == "link auto-renew failed" { event = "node_warning"; event_code = "link_auto_renew_failed" }
+        else if msg == "failed to hot-reload renewed link cert" { event = "node_warning"; event_code = "link_cert_reload_failed" }
+        else if msg == "failed to reload TLS material after link auto-renew" { event = "node_warning"; event_code = "link_listener_cert_reload_failed" }
+        else if msg == "link disable: service delete failed; local state removed anyway" { event = "node_warning"; event_code = "link_disable_failed" }
+        else if msg == "link connection error" { event = "node_warning"; event_code = "link_connection_error" }
+        else if msg == "link listener accept error" { event = "node_warning"; event_code = "link_listener_accept_failed" }
+        else if msg == "webhook delivery attempt failed" { event = "node_warning"; event_code = "webhook_delivery_failed" }
+        else if msg == "webhook dispatcher loop failed" { event = "node_warning"; event_code = "webhook_dispatcher_failed" }
+        else if msg == "addressed delegation authorization failed" { event = "node_error"; event_code = "share_authorization_failed" }
+        else if msg == "native share authorization denied" { event = "node_error"; event_code = "share_native_authorization_denied" }
+        else if msg == "native share KV put failed" { event = "node_error"; event_code = "share_native_kv_put_failed" }
+        else if msg == "share v2 readiness probe failed" { event = "node_error"; event_code = "share_v2_readiness_failed" }
+        else if msg == "share v2 is enabled but shareEmail.invitationPublicKey is unset" { event = "node_error"; event_code = "share_invitation_key_missing" }
+        else if msg == "configured share invitation key does not match the node's derived signing key" { event = "node_error"; event_code = "share_invitation_key_mismatch" }
+        else if msg == "share/v2 policy challenge denied" { event = "node_warning"; event_code = "share_policy_denied" }
+        else if starts_with(msg, "Failed to get TDX quote: ") { event = "node_error"; event_code = "attestation_quote_failed" }
+        else if msg == "failed to read committed hook events" { event = "node_warning"; event_code = "hook_events_read_failed" }
+        else if msg == "failed to load kv write hook rows" { event = "node_warning"; event_code = "hook_rows_load_failed" }
+        else if msg == "failed to load kv delete hook rows" { event = "node_warning"; event_code = "hook_rows_load_failed" }
+        else if msg == "missing committed kv hook row for invocation" { event = "node_warning"; event_code = "missing_committed_hook_row" }
+        else if msg == "database write committed but webhook enqueue failed" { event = "node_warning"; event_code = "webhook_enqueue_failed" }
+        else if msg == "tunnel: failed to prepare connection attempt" { event = "node_warning"; event_code = "tunnel_connection_prepare_failed" }
+        else if msg == "tunnel: no frame within idle timeout; treating connection as dead" { event = "node_warning"; event_code = "tunnel_idle_timeout" }
+        else if msg == "tunnel: read error" { event = "node_warning"; event_code = "tunnel_read_failed" }
+        else if msg == "tunnel: dropping malformed frame" { event = "node_warning"; event_code = "tunnel_malformed_frame" }
+        else if msg == "tunnel: relay sent an error frame" { event = "node_warning"; event_code = "tunnel_relay_error" }
+        else if msg == "tunnel: failed to write frame" { event = "node_warning"; event_code = "tunnel_write_failed" }
+        else if msg == "tunnel: failed to record runtime state" { event = "node_warning"; event_code = "tunnel_state_record_failed" }
+        else if msg == "tunnel: failed to clear runtime state after disable" { event = "node_warning"; event_code = "tunnel_state_clear_failed" }
+        else if msg == "tunnel authentication rejected" { event = "node_warning"; event_code = "tunnel_auth_rejected" }
+        else if msg == "node fatal panic" { event = "node_fatal_panic"; event_code = "other"; level = "error" }
+        else { abort }
+        if event == "node_warning" && level != "warn" { abort }
+        if (event == "node_error" || event == "node_fatal_panic") && level != "error" { abort }
+        out.svc = "api"
+        out.level = level
+        out.event = event
+        out.event_code = event_code
+        ts = get(j, ["timestamp"]) ?? null
+        if !is_string(ts) { abort }
+        parsed_ts, time_err = parse_timestamp(ts, format: "%+")
+        if time_err != null { abort }
+        out.ts = format_timestamp!(parsed_ts, format: "%Y-%m-%dT%H:%M:%S%.3fZ")
+      } else if tag == "tinycloud.ingress" {
+        out.svc = "ingress"
+        ts = get(j, ["time"]) ?? null
+        if !is_string(ts) { abort }
+        parsed_ts, time_err = parse_timestamp(ts, format: "%+")
+        if time_err != null { abort }
+        out.ts = format_timestamp!(parsed_ts, format: "%Y-%m-%dT%H:%M:%S%.3fZ")
+        route = get(j, ["route"]) ?? null
+        if !(is_string(route) && includes(["/healthz","/info","/version","/invoke","/delegate","/revoke","/attestation","/signed/kv","/signed/kv/<ticket_id>","/admin/quota","/admin/quota/<space_id>","/admin/usage","/hooks/events","/hooks/tickets","/hooks/webhooks","/hooks/webhooks/<subscription_id>","/delegation/query","/delegation/status","/encryption/networks","/encryption/networks/<network_id>","/encryption/networks/<network_id>/revoke","/encryption/networks/<network_id>/decrypt","/policy/v3/status","/policy/v3/status/<root_cid>","/policy/v3/policies","/policy/v3/challenges","/policy/v3/delegations","/policy/v3/enforcer-bindings","/policy/v3/deliveries/authorize","/.well-known/tinycloud/node-keys","/.well-known/encryption/network/<name>","/public/<space_id>/kv","/public/<space_id>/kv/<key..>","/peer/generate/<space>","/evidences/<file>","<other>"], route)) { abort }
+        out.route = route
+        method = get(j, ["method"]) ?? null
+        if !(is_string(method) && includes(["GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS","<other>"], method)) { abort }
+        out.method = method
+        status = get(j, ["status"]) ?? null
+        if !(is_integer(status) && status >= 100 && status <= 599) { abort }
+        out.status = status
+        bytes = get(j, ["bytes"]) ?? null
+        if !(is_integer(bytes) && bytes >= 0 && bytes <= 1000000000) { abort }
+        out.bytes_sent = bytes
+        upstream_status = get(j, ["upstream_status"]) ?? ""
+        if upstream_status == "-" { upstream_status = "" }
+        if !(is_string(upstream_status) && length(upstream_status) <= 3 && match(upstream_status, r'^(|[1-5][0-9]{2})$')) { abort }
+        out.upstream_status = upstream_status
+        request_time = get(j, ["request_time"]) ?? null
+        if !((is_integer(request_time) || is_float(request_time)) && request_time >= 0 && request_time <= 86400) { abort }
+        out.request_time_seconds = request_time
+        status_class = if status >= 500 { "5xx" } else if status >= 400 { "4xx" } else if status >= 300 { "3xx" } else if status >= 200 { "2xx" } else { "1xx" }
+        out.status_class = status_class
+        if status >= 400 { out.level = if status >= 500 { "error" } else { "warn" }; out.event = "ingress_request_failed" }
+        else if status >= 200 && status < 300 { out.level = "info"; out.event = "ingress_success_count"; out.request_count = 1 }
+        else if request_time >= 1 { out.level = "warn"; out.event = "ingress_request_slow" }
+        else { abort }
+      } else { abort }
+      . = out
+      # END GENERATED FROM fields.json
+  split_success:
+    type: route
+    inputs: [allowlist]
+    route:
+      success: .event == "ingress_success_count"
+      slow_success: .event == "ingress_success_count" && .request_time_seconds >= 1
+      other: .event != "ingress_success_count"
+  slow_success:
+    type: remap
+    inputs: [split_success.slow_success]
+    drop_on_error: true
+    source: |
+      . = {
+        "level": "warn",
+        "ts": .ts,
+        "event": "ingress_request_slow",
+        "svc": "ingress",
+        "route": .route,
+        "method": .method,
+        "status": .status,
+        "status_class": .status_class,
+        "request_time_seconds": .request_time_seconds,
+        "bytes_sent": .bytes_sent,
+        "upstream_status": .upstream_status
+      }
+  success_minute:
+    type: remap
+    inputs: [split_success.success]
+    drop_on_error: true
+    source: |
+      .minute = slice!(.ts, 0, 16)
+  success_reduce:
+    type: reduce
+    inputs: [success_minute]
+    group_by: [route, minute]
+    expire_after_secs: 75
+    flush_period_secs: 60
+    merge_strategies:
+      request_count: sum
+  success_output:
+    type: remap
+    inputs: [success_reduce]
+    drop_on_error: true
+    drop_on_abort: true
+    source: |
+      route = .route
+      count = .request_count
+      if !is_integer(count) || count < 1 || count > 1000000 { abort }
+      . = {
+        "level": "info",
+        "ts": format_timestamp!(now(), format: "%Y-%m-%dT%H:%M:%S%.3fZ"),
+        "event": "ingress_success_count",
+        "svc": "ingress",
+        "route": route,
+        "request_count": count
+      }
+  throttle:
+    type: throttle
+    inputs: [success_output, slow_success, split_success.other]
+    window_secs: 60
+    threshold: 300
+sinks:
+  betterstack:
+    type: http
+    inputs: [throttle]
+    method: post
+    uri: "https://betterstack-placeholder.invalid/"
+    encoding: { codec: json }
+    compression: gzip
+    auth: { strategy: bearer, token: "SECRET[bs.bs_token]" }
+    batch: { max_bytes: 4000000, timeout_secs: 5 }
+    buffer: { type: memory, max_events: 1000, when_full: drop_newest }

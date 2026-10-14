@@ -351,7 +351,7 @@ async fn connect_and_serve(
                 );
                 return AttemptResult::Superseded;
             }
-            tracing::warn!(%message);
+            tracing::warn!(close_code = code, "tunnel authentication rejected");
             record_state(
                 &ctx.data_root,
                 TunnelRuntimeState {

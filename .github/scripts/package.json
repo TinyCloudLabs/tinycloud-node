@@ -1,0 +1,9 @@
+{
+  "name": "tinycloud-node-deploy-tools",
+  "private": true,
+  "description": "Deploy tooling installed from a lockfile before production secrets are in scope.",
+  "dependencies": {
+    "@phala/cloud": "0.3.0",
+    "phala": "1.1.19"
+  }
+}

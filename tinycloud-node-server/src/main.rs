@@ -26,26 +26,23 @@ fn build_config_figment() -> rocket::figment::Figment {
         .merge(Env::prefixed("ROCKET_").global())
 }
 
-/// Report panics off the main thread (request handlers and background tasks)
-/// by location only. Their messages can format request data, and production
-/// logs are public (TC-961). Startup panics on the main thread keep the
-/// default report, which operators need to fix a bad configuration.
+/// Emit only a fixed panic record: panic messages and source locations can
+/// contain request data, while production logs are public (TC-961).
+fn panic_log_line() -> String {
+    let timestamp = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .expect("current UTC timestamp is RFC3339-formattable");
+    serde_json::json!({
+        "timestamp": timestamp,
+        "level": "ERROR",
+        "fields": { "message": "node fatal panic" },
+    })
+    .to_string()
+}
+
 fn install_panic_hook() {
-    let default_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        let thread = std::thread::current();
-        if thread.name() == Some("main") {
-            default_hook(info);
-            return;
-        }
-        let location = info
-            .location()
-            .map(|location| format!("{}:{}", location.file(), location.line()));
-        eprintln!(
-            "thread '{}' panicked at {}: <message withheld from the log>",
-            thread.name().unwrap_or("<unnamed>"),
-            location.as_deref().unwrap_or("<unknown>"),
-        );
+    std::panic::set_hook(Box::new(|_info| {
+        eprintln!("{}", panic_log_line());
     }));
 }
 
@@ -261,5 +258,18 @@ mod tests {
             .expect("config should parse");
 
         assert_eq!(cfg.share_email.readiness_max_age_seconds, 42);
+    }
+    #[test]
+    fn panic_log_record_is_json_and_contains_only_a_fixed_message() {
+        let line = panic_log_line();
+        let record: serde_json::Value = serde_json::from_str(&line).expect("panic record JSON");
+        assert!(record["timestamp"].as_str().is_some());
+        assert_eq!(record["level"], "ERROR");
+        assert_eq!(record["fields"]["message"], "node fatal panic");
+        assert_eq!(
+            record["fields"].as_object().expect("fields object").len(),
+            1
+        );
+        assert_eq!(record.as_object().expect("record object").len(), 3);
     }
 }
