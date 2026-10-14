@@ -10984,6 +10984,7 @@ mod tests {
                     rocket::routes![hooks::create_webhook, hooks::delete_webhook],
                 )
                 .manage(ColumnEncryption::new(F43_WEBHOOK_KEY))
+                .manage(crate::egress::EgressPolicy::test_loopback())
         })
         .await?;
         let tinycloud = f
@@ -10996,6 +10997,7 @@ mod tests {
             tinycloud,
             HooksConfig::default(),
             ColumnEncryption::new(F43_WEBHOOK_KEY),
+            crate::egress::EgressPolicy::test_loopback(),
         )?;
         Ok((f, dispatcher))
     }

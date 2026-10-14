@@ -863,6 +863,16 @@ impl Default for HooksConfig {
     }
 }
 
+impl HooksConfig {
+    /// Reject retry budgets outside the supported bound rather than silently truncating.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.webhook_max_attempts > 10 {
+            return Err("hooks.webhook_max_attempts must not exceed 10");
+        }
+        Ok(())
+    }
+}
+
 /// Retention sweep policy for terminal `hook_delivery` rows and expired
 /// `signed_kv_ticket` rows (TC-287).
 ///
@@ -1424,6 +1434,20 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn tc1132_startup_validates_retry_budget_bounds() {
+        for attempts in [0, 1, 10] {
+            let mut config = Config::default();
+            config.hooks.webhook_max_attempts = attempts;
+            assert!(crate::resolve_runtime_config(&config).is_ok());
+        }
+        for attempts in [11, usize::MAX] {
+            let mut config = Config::default();
+            config.hooks.webhook_max_attempts = attempts;
+            assert!(crate::resolve_runtime_config(&config).is_err());
+        }
+    }
 
     fn enabled_config() -> ShareEmailConfig {
         ShareEmailConfig {
