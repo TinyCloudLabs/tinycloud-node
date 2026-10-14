@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import { assertAcceptanceEnvironment } from "./tc-959-compose-env.mjs";
+
+const rendered = JSON.parse(readFileSync(new URL("./tc-959-compose-env.rendered.json", import.meta.url), "utf8"));
 
 const nodeEnvironment = {
   TINYCLOUD_KEYS_TYPE: "Static",
@@ -23,6 +26,36 @@ const safe = {
     vector: { environment: {} },
   },
 };
+
+test("accepts the sanitized real Compose rendering with omitted cleared environments", () => {
+  assert.equal(Object.hasOwn(rendered.services["dstack-ingress"], "environment"), false);
+  assert.equal(Object.hasOwn(rendered.services.vector, "environment"), false);
+  assert.doesNotThrow(() => assertAcceptanceEnvironment(rendered));
+});
+
+test("rejects forbidden environment entries added to the rendered Compose snapshot", () => {
+  const contaminated = structuredClone(rendered);
+  contaminated.services.vector.environment = { VECTOR_CONFIG_YAML: "must-not-be-exposed" };
+  assert.throws(() => assertAcceptanceEnvironment(contaminated), /vector environment/);
+});
+
+test("rejects missing services and malformed present environments", () => {
+  const missingService = structuredClone(rendered);
+  delete missingService.services.vector;
+  assert.throws(() => assertAcceptanceEnvironment(missingService), /vector service/);
+
+  for (const environment of [null, "bad", [], { VECTOR_CONFIG_YAML: 4 }, { VECTOR_CONFIG_YAML: {} }]) {
+    const malformed = structuredClone(rendered);
+    malformed.services.vector.environment = environment;
+    assert.throws(() => assertAcceptanceEnvironment(malformed), /vector environment/);
+  }
+});
+
+test("accepts null Compose environment values", () => {
+  const compose = structuredClone(safe);
+  compose.services.tinycloud.environment.ROCKET_ADDRESS = null;
+  assert.doesNotThrow(() => assertAcceptanceEnvironment(compose));
+});
 
 test("accepts only the test node environment and isolated helper environments", () => {
   assert.doesNotThrow(() => assertAcceptanceEnvironment(safe));

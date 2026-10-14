@@ -15,9 +15,19 @@ const expectedNodeKeys = [
 ].sort();
 
 function serviceEnvironment(compose, serviceName) {
-  const environment = compose?.services?.[serviceName]?.environment;
+  const service = compose?.services?.[serviceName];
+  if (!service || typeof service !== "object" || Array.isArray(service)) {
+    throw new Error(`${serviceName} service must be an object`);
+  }
+  const environment = service.environment;
+  if (environment === undefined) return {};
   if (environment === null || typeof environment !== "object" || Array.isArray(environment)) {
     throw new Error(`${serviceName} environment must be an object`);
+  }
+  for (const value of Object.values(environment)) {
+    if (value !== null && typeof value !== "string") {
+      throw new Error(`${serviceName} environment values must be strings or null`);
+    }
   }
   return environment;
 }
