@@ -13,9 +13,12 @@ use rocket::{
     delete,
     form::FromForm,
     get,
-    http::Status,
+    http::{Header, Status},
     post,
-    response::stream::{Event, EventStream},
+    response::{
+        stream::{Event, EventStream},
+        Responder,
+    },
     serde::json::Json,
     State,
 };
@@ -289,12 +292,32 @@ where
     Ok(rocket::tokio::time::Instant::now() + remaining)
 }
 
+/// A hook SSE stream with headers that keep reverse proxies from holding it
+/// back: nginx buffers proxied responses unless told `X-Accel-Buffering: no`,
+/// which would delay every event until the stream closes (TC-720).
+#[derive(Responder)]
+pub struct HookEventStream<R> {
+    stream: R,
+    accel_buffering: Header<'static>,
+    cache_control: Header<'static>,
+}
+
+impl<R> HookEventStream<R> {
+    fn new(stream: R) -> Self {
+        Self {
+            stream,
+            accel_buffering: Header::new("X-Accel-Buffering", "no"),
+            cache_control: Header::new("Cache-Control", "no-cache"),
+        }
+    }
+}
+
 #[get("/hooks/events?<ticket>")]
 pub async fn hook_events<'r>(
     ticket: &'r str,
     hooks: &'r State<HookRuntime>,
     tinycloud: &'r State<TinyCloud>,
-) -> Result<EventStream![Event + 'r], (Status, String)> {
+) -> Result<HookEventStream<EventStream![Event + 'r]>, (Status, String)> {
     let claims = hooks
         .verify_ticket(ticket)
         .map_err(|e| (Status::Unauthorized, e))?;
@@ -324,7 +347,7 @@ pub async fn hook_events<'r>(
 
     let mut receiver = hooks.bus().subscribe();
 
-    Ok(EventStream! {
+    let stream = EventStream! {
         let _lease = lease;
         let deadline_sleep = rocket::tokio::time::sleep_until(stream_deadline);
         rocket::tokio::pin!(deadline_sleep);
@@ -355,7 +378,9 @@ pub async fn hook_events<'r>(
             }
         }
     }
-    .heartbeat(Duration::from_secs(30)))
+    .heartbeat(Duration::from_secs(30));
+
+    Ok(HookEventStream::new(stream))
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2295,6 +2320,43 @@ mod tests {
         assert_eq!(
             response.into_string().await.as_deref(),
             Some("hook ticket authority revoked")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hook_stream_disables_proxy_buffering() -> Result<()> {
+        let fixture =
+            hook_route_fixture(&[("hooks", "kv/documents", "tinycloud.hooks/subscribe")]).await?;
+        let claim = [(fixture.hooks("kv/documents")?, SUBSCRIBE)];
+        let (status, body) = fixture
+            .ticket(
+                fixture.session_header(&claim)?,
+                &fixture.space,
+                "kv",
+                "documents",
+            )
+            .await;
+        assert_eq!(status, Status::Ok, "{body}");
+        let ticket: serde_json::Value = serde_json::from_str(&body)?;
+        let response = fixture
+            .client
+            .get(format!(
+                "/hooks/events?ticket={}",
+                ticket["ticket"].as_str().expect("signed ticket")
+            ))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        assert_eq!(
+            response.content_type(),
+            Some(rocket::http::ContentType::EventStream)
+        );
+        let headers = response.headers();
+        assert_eq!(headers.get("X-Accel-Buffering").collect::<Vec<_>>(), ["no"]);
+        assert_eq!(
+            headers.get("Cache-Control").collect::<Vec<_>>(),
+            ["no-cache"]
         );
         Ok(())
     }
