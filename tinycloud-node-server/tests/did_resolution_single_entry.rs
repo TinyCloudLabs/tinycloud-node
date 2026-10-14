@@ -55,9 +55,32 @@ fn resolver_entry(name: &str) -> bool {
             | "resolve_representation"
             | "resolve_method_representation"
             | "resolve_into_any_verification_method"
-            | "resolve_verification_method"
     ) || name == "dereference"
         || name.starts_with("dereference_")
+        || name.starts_with("resolve_verification_method")
+        || name.starts_with("into_vm_resolver")
+}
+
+fn raw_resolver_ident(name: &str) -> bool {
+    matches!(
+        name,
+        "AnyDidMethod"
+            | "DID_METHODS"
+            | "DIDWeb"
+            | "DIDTz"
+            | "DIDION"
+            | "DIDEthr"
+            | "VerificationMethodDIDResolver"
+            | "VerificationParameters"
+            | "did_web"
+            | "did_tz"
+            | "did_ion"
+            | "did_ethr"
+    )
+}
+
+fn network_did_module(name: &str) -> bool {
+    matches!(name, "web" | "tz" | "ion" | "ethr")
 }
 
 #[derive(Default)]
@@ -111,20 +134,64 @@ impl Guard {
     fn scan_macro(&mut self, tokens: TokenStream) {
         // syn leaves macro bodies opaque. Inspect their tokens too, so a raw
         // resolver call inside a production macro cannot evade the guard.
+        let tokens: Vec<_> = tokens.into_iter().collect();
+        for window in tokens.windows(4) {
+            if matches!(&window[0], TokenTree::Ident(ident) if ident == "dids")
+                && matches!(&window[1], TokenTree::Punct(punct) if punct.as_char() == ':')
+                && matches!(&window[2], TokenTree::Punct(punct) if punct.as_char() == ':')
+            {
+                match &window[3] {
+                    TokenTree::Ident(ident) if network_did_module(&ident.to_string()) => {
+                        self.violations
+                            .push(format!("network DID module dids::{ident} in macro"));
+                    }
+                    TokenTree::Group(_) => {
+                        // Preserve grouped import paths such as
+                        // dids::{web as resolver, key::{self, DIDKey}}.
+                        if let Ok(tree) = syn::parse2(window.iter().cloned().collect()) {
+                            self.scan_use_tree(&tree, false);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
         for token in tokens {
             match token {
                 TokenTree::Group(group) => self.scan_macro(group.stream()),
                 TokenTree::Ident(ident) => {
                     let name = ident.to_string();
-                    if matches!(name.as_str(), "AnyDidMethod" | "DID_METHODS")
-                        || resolver_entry(&name)
-                    {
+                    if raw_resolver_ident(&name) || resolver_entry(&name) {
                         self.violations
                             .push(format!("resolver token {name} in macro"));
                     }
                 }
                 _ => {}
             }
+        }
+    }
+
+    fn scan_use_tree(&mut self, tree: &syn::UseTree, parent_is_dids: bool) {
+        match tree {
+            syn::UseTree::Path(path) => {
+                self.check_module(&path.ident, parent_is_dids);
+                self.scan_use_tree(&path.tree, path.ident == "dids");
+            }
+            syn::UseTree::Name(name) => self.check_module(&name.ident, parent_is_dids),
+            syn::UseTree::Rename(rename) => self.check_module(&rename.ident, parent_is_dids),
+            syn::UseTree::Group(group) => {
+                for tree in &group.items {
+                    self.scan_use_tree(tree, parent_is_dids);
+                }
+            }
+            syn::UseTree::Glob(_) => {}
+        }
+    }
+
+    fn check_module(&mut self, ident: &syn::Ident, parent_is_dids: bool) {
+        if parent_is_dids && network_did_module(&ident.to_string()) {
+            self.violations
+                .push(format!("network DID module dids::{ident}"));
         }
     }
 }
@@ -183,9 +250,21 @@ impl<'ast> Visit<'ast> for Guard {
     }
 
     fn visit_ident(&mut self, ident: &'ast syn::Ident) {
-        if matches!(ident.to_string().as_str(), "AnyDidMethod" | "DID_METHODS") {
+        if raw_resolver_ident(&ident.to_string()) {
             self.violations.push(format!("raw resolver {ident}"));
         }
+    }
+
+    fn visit_path(&mut self, path: &'ast syn::Path) {
+        for (parent, child) in path.segments.iter().zip(path.segments.iter().skip(1)) {
+            self.check_module(&child.ident, parent.ident == "dids");
+        }
+        visit::visit_path(self, path);
+    }
+
+    fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+        self.scan_use_tree(&item.tree, false);
+        visit::visit_item_use(self, item);
     }
 
     fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
@@ -322,4 +401,114 @@ fn only_test_items_are_excluded_and_all_raw_entry_points_are_checked() {
     assert!(guard.violations.is_empty());
     guard.visit_file(&syn::parse_file("fn other() { range.resolve(total_size); }").unwrap());
     assert_eq!(guard.violations.len(), 1);
+}
+
+fn scan_fixture(code: &str) -> Guard {
+    let mut guard = Guard::new("fixture.rs");
+    guard.visit_file(&syn::parse_file(code).unwrap());
+    guard
+}
+
+#[test]
+fn vm_and_claims_bypasses_and_existing_raw_spellings_are_refused() {
+    // Review 5513828343's four surviving spellings and two already killed
+    // spellings. Parsing these fixtures never invokes a resolver or claims verifier.
+    let cases = [
+        ("web VM", "DIDWeb.into_vm_resolver::<AnyMethod>().resolve_verification_method_with(id, None, options).await;"),
+        ("tz VM", "DIDTz::default().into_vm_resolver::<AnyMethod>().resolve_verification_method_with(id, None, options).await;"),
+        ("web claims", "jws.verify(VerificationParameters::from_resolver(DIDWeb.into_vm_resolver::<AnyJwkMethod>())).await;"),
+        ("tz claims", "jws.verify(VerificationParameters::from_resolver(DIDTz::default().into_vm_resolver::<AnyJwkMethod>())).await;"),
+        ("raw signature", "u.verify_signature(&AnyDidMethod::default()).await;"),
+        ("raw resolve", "DID_METHODS.resolve(d).await;"),
+    ];
+    for (name, expression) in cases {
+        let production = format!("async fn production() {{ {expression} }}");
+        let guard = scan_fixture(&production);
+        assert!(!guard.violations.is_empty(), "{name} bypass survived");
+        let test_only = format!("#[cfg(test)] mod fixture {{ {production} }}");
+        assert!(
+            scan_fixture(&test_only).violations.is_empty(),
+            "{name} test fixture was scanned"
+        );
+    }
+}
+
+#[test]
+fn vm_method_families_are_refused_without_concrete_type_names() {
+    for expression in [
+        "adapter.into_vm_resolver::<Method>();",
+        "adapter.into_vm_resolver_with::<Method>(options);",
+        "adapter.resolve_verification_method(id).await;",
+        "adapter.resolve_verification_method_with(id, None, options).await;",
+        "DIDResolver::into_vm_resolver::<Method>(adapter);",
+        "DIDResolver::into_vm_resolver_with::<Method>(adapter, options);",
+        "VerificationMethodResolver::resolve_verification_method_with(&adapter, id, None, options).await;",
+        "wrapper!(adapter.into_vm_resolver_with::<Method>(options));",
+        "wrapper!(adapter.resolve_verification_method_with(id, None, options));",
+    ] {
+        let guard = scan_fixture(&format!("async fn production() {{ {expression} }}"));
+        assert!(!guard.violations.is_empty(), "method bypass survived: {expression}");
+    }
+}
+
+#[test]
+fn network_resolver_imports_paths_and_claims_parameters_are_refused() {
+    for ident in [
+        "DIDWeb",
+        "DIDTz",
+        "DIDION",
+        "DIDEthr",
+        "VerificationMethodDIDResolver",
+        "VerificationParameters",
+        "did_web",
+        "did_tz",
+        "did_ion",
+        "did_ethr",
+    ] {
+        for source in [
+            format!("use provider::{ident} as Renamed;"),
+            format!("type Adapter = provider::{ident};"),
+            format!("wrapper!(provider::{ident});"),
+        ] {
+            assert!(
+                !scan_fixture(&source).violations.is_empty(),
+                "identifier bypass survived: {source}"
+            );
+        }
+    }
+    for module in ["web", "tz", "ion", "ethr"] {
+        for source in [
+            format!("use provider::dids::{module} as Renamed;"),
+            format!("use provider::dids::{{{module} as Renamed, key::DIDKey}};"),
+            format!("use provider::dids::{{{module}::*, key::DIDKey}};"),
+            format!("type Adapter = provider::dids::{module}::Resolver;"),
+            format!("wrapper!(provider::dids::{module}::Resolver);"),
+            format!("wrapper!(use provider::dids::{{{module} as Renamed, key::DIDKey}});"),
+        ] {
+            assert!(
+                !scan_fixture(&source).violations.is_empty(),
+                "module bypass survived: {source}"
+            );
+        }
+    }
+}
+
+#[test]
+fn non_did_module_names_comments_and_strings_remain_allowed() {
+    let source = r#"
+        // DIDWeb.into_vm_resolver::<AnyMethod>() is documentation, not a call.
+        use provider::{web, tz, ion, ethr};
+        use provider::dids::{key::web as key_web, pkh};
+        fn production() {
+            let _description = "VerificationParameters and provider::dids::web";
+            web::request();
+            tz::offset();
+            ion::charge();
+            ethr::lookup();
+            wrapper!(provider::dids::key::web);
+            wrapper!(use provider::dids::{key::web as key_web});
+        }
+    "#;
+    let guard = scan_fixture(source);
+    assert!(guard.violations.is_empty(), "{:?}", guard.violations);
 }
