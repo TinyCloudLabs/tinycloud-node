@@ -167,11 +167,13 @@ cat >"$SENDER" <<'NODE'
 import { createSocket } from 'node:dgram';
 const [host, portText, payload] = process.argv.slice(2);
 if (!host || !portText || !payload) throw new Error('usage: send-gelf HOST PORT JSON');
+const recognizedCodes = new Set(['ENOTFOUND', 'EAI_AGAIN', 'ENETUNREACH', 'EHOSTUNREACH', 'ECONNREFUSED']);
 const socket = createSocket('udp4');
 socket.send(Buffer.from(payload), Number(portText), host, (error) => {
   socket.close();
   if (error) {
-    console.error(`GELF UDP send failed to ${host}:${portText}: ${error.code ?? error.message}`);
+    const code = recognizedCodes.has(error.code) ? error.code : 'other';
+    console.error(`GELF_SEND_ERROR code=${code}`);
     process.exitCode = 1;
   }
 });
@@ -256,7 +258,7 @@ EOF
 cat >"$CPU_OVERRIDE" <<'EOF'
 services:
   vector:
-    cpus: 0.5
+    cpus: 0.25
 EOF
 node - "$OVERRIDE" "$CPU_OVERRIDE" "$ROOT" "$ROOT/tc-959-node-docker-check.review.sh" "$VECTOR_TEST_CONFIG" <<'NODE'
 const fs = require('node:fs');
@@ -268,7 +270,7 @@ const [overridePath, cpuOverridePath, root, harnessPath, vectorConfigPath] = pro
 const composeText = fs.readFileSync(overridePath, 'utf8');
 const cpuOverride = parse(fs.readFileSync(cpuOverridePath, 'utf8'));
 const compose = parse(composeText.replaceAll('!override', ''));
-if (cpuOverride.services?.vector?.cpus !== 0.5) throw new Error('half-CPU override must set only Vector cpus: 0.5');
+if (cpuOverride.services?.vector?.cpus !== 0.25) throw new Error('half-CPU override must set only Vector cpus: 0.25');
 const baseCompose = parse(fs.readFileSync(`${root}/docker-compose.dstack-postgres.yaml`, 'utf8'));
 const baseVectorEnv = baseCompose.services.vector.environment ?? {};
 if (!Object.hasOwn(baseVectorEnv, 'VECTOR_CONFIG_YAML') || !Object.hasOwn(baseVectorEnv, 'BETTERSTACK_SOURCE_TOKEN')) {
@@ -277,7 +279,7 @@ if (!Object.hasOwn(baseVectorEnv, 'VECTOR_CONFIG_YAML') || !Object.hasOwn(baseVe
 if (baseCompose.services?.vector?.init !== true) {
   throw new Error('production Vector service must set init: true for restart supervision');
 }
-if (baseCompose.services?.vector?.cpus !== 0.25) throw new Error('production Vector CPU setting changed unexpectedly');
+if (baseCompose.services?.vector?.cpus !== 0.5) throw new Error('production Vector CPU setting changed unexpectedly');
 const vectorEnv = compose.services?.vector?.environment;
 if (!vectorEnv || Object.keys(vectorEnv).length !== 0) throw new Error('acceptance Vector environment must be explicitly empty');
 const ingressEnv = compose.services?.['dstack-ingress']?.environment;
@@ -343,6 +345,7 @@ const calledHelpers = [
   'wait_fresh_stable_metric', 'fresh_sample', 'wait_metric', 'vector_shipped_count',
   'vector_shipped_name_counts', 'report_shipped_event_delta', 'vector_event_count',
   'assert_no_console_marker', 'wait_next_line', 'send_from_container', 'send_probe',
+  'send_positive_probe', 'run_probe_sender', 'sender_error_code', 'probe_routing_error_matches_target',
   'compose_half_cpu_cmd', 'measure_burst', 'run_isolation_leak_self_test',
 ];
 const missing = calledHelpers.filter((name) => !declared.has(name));
@@ -359,8 +362,8 @@ if [[ "$DRY_RUN" == 1 ]]; then
   record "DRY-RUN: acceptance self-test expects an allowed host-loopback packet to make the negative check fail"
   record "DRY-RUN: positive controls require source +1 and exact event=node_warning/event_code=invocation_replay_insert_failed shipped +1"
   record "DRY-RUN: negative probes require source +0 and exact probe shipped +0; unrelated event deltas print event/event_code enums"
-  record "DRY-RUN: 5,000-line bursts measured with fresh source samples at production cpus=0.25 and temporary cpus=0.5"
-  record "DRY-RUN: half-CPU Vector is recreated only for the second burst and production cpus=0.25 restored before isolation"
+  record "DRY-RUN: 5,000-line bursts measured with fresh source samples at production cpus=0.5 and temporary cpus=0.25"
+  record "DRY-RUN: half-CPU Vector is recreated only for the second burst and production cpus=0.5 restored before isolation"
   record "DRY-RUN: actual Docker, network and memory checks NOT run"
   exit 0
 fi
@@ -467,17 +470,17 @@ node_restarts_after=$(docker_cmd inspect -f '{{.RestartCount}}' "$NODE_ID")
 [[ "$node_restarts" == "$node_restarts_after" ]] || fail "node restarted during Vector recovery matrix"
 record "PASS: app restart count unchanged across all Vector recovery tests"
 
-measure_burst 0.25
+measure_burst 0.5
 compose_half_cpu_cmd up -d --force-recreate --no-deps vector >/dev/null
 wait_vector
 wait_next_line 0
-measure_burst 0.5
+measure_burst 0.25
 compose_cmd up -d --force-recreate --no-deps vector >/dev/null
 wait_vector
 wait_next_line 0
 restored_nano_cpus=$(docker_cmd inspect -f '{{.HostConfig.NanoCpus}}' "$VECTOR_ID")
-[[ "$restored_nano_cpus" == 250000000 ]] || fail "Vector CPU limit after restore is $restored_nano_cpus, expected 250000000"
-record "PASS: restored production Vector NanoCpus=250000000 before isolation, node-latency, and memory checks"
+[[ "$restored_nano_cpus" == 500000000 ]] || fail "Vector CPU limit after restore is $restored_nano_cpus, expected 500000000"
+record "PASS: restored production Vector NanoCpus=500000000 before isolation, node-latency, and memory checks"
 
 # Keep the idle synthetic ingress up so its network namespace is available for sibling probes.
 PROBE_CANARY=TC959_FORGED_PROBE_CANARY_UNEXPECTED_FIELD
@@ -505,14 +508,14 @@ source_before=$(fresh_sample)
 shipped_before=$(vector_shipped_count)
 shipped_names_before=$(vector_shipped_name_counts)
 sent_at=$(metric_now_ms)
-node "$SENDER" 127.0.0.1 12201 "$payload"
+send_positive_probe "host loopback" host host 127.0.0.1
 assert_positive_delivery "$source_before" "$shipped_before" "$sent_at" "host loopback" "$shipped_names_before"
 
 source_before=$(fresh_sample)
 shipped_before=$(vector_shipped_count)
 shipped_names_before=$(vector_shipped_name_counts)
 sent_at=$(metric_now_ms)
-send_from_container "${PROJECT}_logship" "$vector_ip"
+send_positive_probe "logship-network control container" container "${PROJECT}_logship" "$vector_ip"
 assert_positive_delivery "$source_before" "$shipped_before" "$sent_at" "logship-network control container" "$shipped_names_before"
 
 

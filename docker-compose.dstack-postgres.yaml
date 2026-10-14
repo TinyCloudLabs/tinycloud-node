@@ -145,7 +145,7 @@ services:
     security_opt: ["no-new-privileges:true"]
     mem_limit: 64m
     memswap_limit: 64m
-    cpus: 0.25
+    cpus: 0.5
     ports:
       - "127.0.0.1:12201:12201/udp"
     networks:

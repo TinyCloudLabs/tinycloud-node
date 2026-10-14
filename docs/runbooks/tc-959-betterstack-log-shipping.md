@@ -24,7 +24,7 @@ At the 281-byte final event-size limit, the worst case is `(2 + 5 + 5 + 1 + 26) 
 
 ## CVM resource and disk budget
 
-The CVM is tdx.medium: 2 vCPU, 4 GiB RAM, 20 GB disk. Vector runs as UID 10001 with 64 MiB memory/swap and 0.25 CPU limits, read-only root, all capabilities dropped, and `no-new-privileges`. Its `data_dir` is an 8 MiB tmpfs; the token file is mode 0600 under that same tmpfs. There is no volume initializer, Docker log-tree mount, or persistent checkpoint volume. Vector and ssh-gateway each have capped `json-file` logs (`10m × 3`), a 60 MB combined retention ceiling. Node and ingress logs travel through GELF rather than a local log file. The review-only acceptance harness measures Vector peak memory and reports 5,000-line burst loss; neither value has been measured by this change.
+The CVM is tdx.medium: 2 vCPU, 4 GiB RAM, 20 GB disk. Vector runs as UID 10001 with 64 MiB memory/swap and a CPU limit of ≤0.5 CPU (25% of the 2-vCPU CVM), read-only root, all capabilities dropped, and `no-new-privileges`. Its `data_dir` is an 8 MiB tmpfs; the token file is mode 0600 under that same tmpfs. There is no volume initializer, Docker log-tree mount, or persistent checkpoint volume. Vector and ssh-gateway each have capped `json-file` logs (`10m × 3`), a 60 MB combined retention ceiling. Node and ingress logs travel through GELF rather than a local log file. The review-only acceptance harness measures Vector peak memory and reports 5,000-line burst loss; neither value has been measured by this change.
 
 ## Secrets and local-log exceptions
 

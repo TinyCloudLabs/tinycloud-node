@@ -203,19 +203,81 @@ assert_positive_delivery() {
   fail "$description positive control shipped probe delta was $shipped_delta, expected +1"
 }
 
+run_probe_sender() {
+  local sender=$1 network=$2 target=$3
+  if send_probe "$sender" "$network" "$target" >"$CONTROL/probe-sender.out" 2>&1; then
+    LAST_PROBE_SEND_STATUS=0
+  else
+    LAST_PROBE_SEND_STATUS=$?
+  fi
+  LAST_PROBE_SEND_OUTPUT=$(<"$CONTROL/probe-sender.out")
+  (( LAST_PROBE_SEND_STATUS == 0 ))
+}
+
+send_positive_probe() {
+  local description=$1 sender=$2 network=$3 target=$4 error_code
+  if run_probe_sender "$sender" "$network" "$target"; then
+    return 0
+  fi
+  if error_code=$(sender_error_code "$LAST_PROBE_SEND_STATUS" "$LAST_PROBE_SEND_OUTPUT"); then
+    record "INFO: $description sender error code=$error_code exit=$LAST_PROBE_SEND_STATUS"
+  fi
+  fail "$description positive control sender failed (exit=$LAST_PROBE_SEND_STATUS)"
+}
+
+sender_error_code() {
+  local exit_status=$1 output=$2
+  (( exit_status == 1 )) || return 1
+  [[ "$output" =~ ^GELF_SEND_ERROR\ code=(ENOTFOUND|EAI_AGAIN|ENETUNREACH|EHOSTUNREACH|ECONNREFUSED|other)$ ]] || return 1
+  printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
+probe_routing_error_matches_target() {
+  local code=$1 target=$2
+  case "$code" in
+    ENOTFOUND) [[ "$target" == vector || "$target" == host.docker.internal ]] ;;
+    ENETUNREACH|EHOSTUNREACH) [[ "$target" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] ;;
+    *) return 1 ;;
+  esac
+}
+
 check_isolated_probe() {
   local description=$1 sender=$2 network=$3 target=$4
-  local source_before shipped_before shipped_names_before sent_at source_after shipped_after shipped_names_after source_delta shipped_delta send_status=0
+  local sender_errors=${5:-allow-routing-errors}
+  local source_before shipped_before shipped_names_before sent_at source_after shipped_after shipped_names_after
+  local source_delta shipped_delta send_status=0 sender_code="" routing_code="" eai_attempts=0
   source_before=$(fresh_sample)
   shipped_before=$(vector_shipped_count)
   shipped_names_before=$(vector_shipped_name_counts)
   sent_at=$(metric_now_ms)
-  if send_probe "$sender" "$network" "$target"; then
-    record "INFO: $description sender completed"
-  else
-    send_status=$?
-    record "INFO: $description sender reported transport error exit=$send_status"
-  fi
+  while true; do
+    if run_probe_sender "$sender" "$network" "$target"; then
+      record "INFO: $description sender completed"
+      break
+    fi
+    send_status=$LAST_PROBE_SEND_STATUS
+    if ! sender_code=$(sender_error_code "$send_status" "$LAST_PROBE_SEND_OUTPUT"); then
+      record "INFO: $description sender error is unclassified (exit=$send_status)"
+      return 2
+    fi
+    record "INFO: $description sender error code=$sender_code exit=$send_status"
+    if [[ "$sender_code" == EAI_AGAIN ]]; then
+      eai_attempts=$((eai_attempts + 1))
+      if (( eai_attempts >= 3 )); then
+        record "INFO: $description EAI_AGAIN remained after 3 attempts"
+        return 2
+      fi
+      record "INFO: $description retrying EAI_AGAIN attempt $((eai_attempts + 1))/3"
+      continue
+    fi
+    if [[ "$sender_errors" == allow-routing-errors ]] && probe_routing_error_matches_target "$sender_code" "$target"; then
+      routing_code=$sender_code
+      record "INFO: $description not routable ($routing_code)"
+      break
+    fi
+    record "INFO: $description sender error code=$sender_code is not acceptable for this target/context"
+    return 2
+  done
   source_after=$(wait_fresh_stable_metric "$sent_at")
   shipped_after=$(vector_shipped_count)
   shipped_names_after=$(vector_shipped_name_counts)
@@ -223,8 +285,13 @@ check_isolated_probe() {
   shipped_delta=$((shipped_after - shipped_before))
   if (( shipped_delta != 0 )); then report_shipped_event_delta "$shipped_names_before" "$shipped_names_after"; fi
   record "INFO: $description fresh deltas source=$source_delta shipped_probe=$shipped_delta"
-  (( send_status == 0 )) || return 2
-  if (( source_delta == 0 && shipped_delta == 0 )); then return 0; fi
+  if (( source_delta == 0 && shipped_delta == 0 )); then
+    if [[ -n "$routing_code" ]]; then
+      record "PASS: $description isolated: not routable ($routing_code); fresh source +0 and shipped +0"
+      return 3
+    fi
+    return 0
+  fi
   return 1
 }
 
@@ -263,13 +330,14 @@ assert_isolated_probe() {
     return 0
   else
     status=$?
-    fail "$description isolation check failed (status=$status)"
   fi
+  if (( status == 3 )); then return 0; fi
+  fail "$description isolation check failed (status=$status)"
 }
 
 run_isolation_leak_self_test() {
   local sender=$1 network=$2 target=$3 status
-  if check_isolated_probe "intentional host-loopback leak self-test" "$sender" "$network" "$target"; then
+  if check_isolated_probe "intentional host-loopback leak self-test" "$sender" "$network" "$target" must-deliver; then
     fail "isolation leak self-test passed unexpectedly"
   else
     status=$?

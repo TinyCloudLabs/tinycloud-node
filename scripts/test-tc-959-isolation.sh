@@ -45,14 +45,40 @@ vector_event_count() {
   IFS= read -r sample <&5 || return 1
   printf '%s\n' "$sample"
 }
+SENDER_EXIT=0
+SENDER_OUTPUT=""
+SEND_COUNT_FILE=""
+RECORD_LINES=()
 sleep() { :; }
 CONTROL=$(mktemp -d)
 trap 'rm -rf "$CONTROL"' EXIT
 
-send_probe() { SEND_COUNT=$((SEND_COUNT + 1)); }
-record() { :; }
+send_probe() {
+  SEND_COUNT=$((SEND_COUNT + 1))
+  [[ -n "$SEND_COUNT_FILE" ]] && printf x >>"$SEND_COUNT_FILE"
+  printf '%s' "$SENDER_OUTPUT"
+  return "$SENDER_EXIT"
+}
+record() { RECORD_LINES+=("$*"); }
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 assert_eq() { [[ "$1" == "$2" ]] || fail "expected '$2', got '$1'"; }
+expect_probe_failure() {
+  local expected=$1 target=$2 status=$3 output_text=$4 actual
+  SENDER_EXIT=$status
+  SENDER_OUTPUT=$output_text
+  if actual=$(assert_isolated_probe "stub failure" container test-network "$target" 2>&1); then
+    fail "probe failure was accepted: $expected"
+  fi
+  [[ "$actual" == *"$expected"* ]] || fail "probe failure did not explain $expected: $actual"
+}
+
+prepare_sender_error_probe() {
+  TEST_NOW_MS=50000
+  METRIC_SAMPLES=('10 51000' '10 52000')
+  SHIPPED_SAMPLES=(5)
+  SHIPPED_NAME_SAMPLES=('[]')
+  reset_fixtures
+}
 reset_fixtures() {
   SEND_COUNT=0
   exec 3< <(printf '%s\n' "${METRIC_SAMPLES[@]}")
@@ -100,6 +126,98 @@ SHIPPED_NAME_SAMPLES=('[]' '[{"event":"node_warning","event_code":"invocation_re
 reset_fixtures
 run_isolation_leak_self_test host host 127.0.0.1
 assert_eq "$SEND_COUNT" 1
+# Not-routable sender errors pass only after fresh +0/+0 samples for a matching target type.
+TEST_NOW_MS=20000
+METRIC_SAMPLES=('10 21000' '10 22000' '10 23000' '10 24000')
+SHIPPED_SAMPLES=(5 5)
+SHIPPED_NAME_SAMPLES=('[]' '[]')
+SENDER_EXIT=1
+SENDER_OUTPUT='GELF_SEND_ERROR code=ENOTFOUND'
+reset_fixtures
+RECORD_LINES=()
+assert_isolated_probe 'name target' container test-network vector
+[[ "${RECORD_LINES[*]}" == *"name target not routable (ENOTFOUND)"* ]] || fail "name target ENOTFOUND was not reported as not routable"
+[[ "${RECORD_LINES[*]}" == *"source=0 shipped_probe=0"* ]] || fail "name target did not require zero deltas"
+
+# ENOTFOUND is only valid for names; reachability errors are only valid for IP literals.
+prepare_sender_error_probe
+expect_probe_failure 'isolation check failed' 10.255.253.2 1 'GELF_SEND_ERROR code=ENOTFOUND'
+
+TEST_NOW_MS=30000
+METRIC_SAMPLES=('10 31000' '10 32000' '10 33000' '10 34000')
+SHIPPED_SAMPLES=(5 5)
+SHIPPED_NAME_SAMPLES=('[]' '[]')
+SENDER_OUTPUT='GELF_SEND_ERROR code=EHOSTUNREACH'
+reset_fixtures
+RECORD_LINES=()
+assert_isolated_probe 'IP target' container test-network 10.255.253.2
+[[ "${RECORD_LINES[*]}" == *"IP target not routable (EHOSTUNREACH)"* ]] || fail "IP EHOSTUNREACH was not reported as not routable"
+
+TEST_NOW_MS=35000
+METRIC_SAMPLES=('10 36000' '10 37000' '10 38000' '10 39000')
+SHIPPED_SAMPLES=(5 5)
+SHIPPED_NAME_SAMPLES=('[]' '[]')
+SENDER_OUTPUT='GELF_SEND_ERROR code=ENETUNREACH'
+reset_fixtures
+RECORD_LINES=()
+assert_isolated_probe 'unreachable IP target' container test-network 10.255.253.2
+[[ "${RECORD_LINES[*]}" == *"unreachable IP target not routable (ENETUNREACH)"* ]] || fail "IP ENETUNREACH was not reported as not routable"
+SENDER_OUTPUT='GELF_SEND_ERROR code=EHOSTUNREACH'
+prepare_sender_error_probe
+expect_probe_failure 'status=2' vector 1 "$SENDER_OUTPUT"
+
+# Transient DNS failures retry exactly three times, then fail closed.
+SENDER_OUTPUT='GELF_SEND_ERROR code=EAI_AGAIN'
+SEND_COUNT=0
+RECORD_LINES=()
+SEND_COUNT_FILE="$CONTROL/sender-attempts"
+: >"$SEND_COUNT_FILE"
+prepare_sender_error_probe
+if check_isolated_probe 'EAI_AGAIN target' container test-network vector; then
+  fail "EAI_AGAIN passed after retries"
+else
+  assert_eq "$?" 2
+fi
+assert_eq "$SEND_COUNT" 3
+assert_eq "$(wc -c <"$SEND_COUNT_FILE")" 3
+[[ "${RECORD_LINES[*]}" == *"EAI_AGAIN remained after 3 attempts"* ]] || fail "EAI_AGAIN retry exhaustion was not reported"
+SEND_COUNT_FILE=""
+
+prepare_sender_error_probe
+expect_probe_failure 'status=2' vector 1 'GELF_SEND_ERROR code=ETIMEDOUT'
+prepare_sender_error_probe
+expect_probe_failure 'status=2' vector 124 'GELF_SEND_ERROR code=ETIMEDOUT'
+prepare_sender_error_probe
+expect_probe_failure 'status=2' vector 125 'docker run failed'
+prepare_sender_error_probe
+expect_probe_failure 'status=2' vector 126 'docker run failed'
+prepare_sender_error_probe
+expect_probe_failure 'status=2' vector 1 'usage: send-gelf HOST PORT JSON'
+
+# A not-routable error contradicts a received probe and therefore cannot pass.
+TEST_NOW_MS=40000
+METRIC_SAMPLES=('10 41000' '10 42000' '11 43000' '11 44000')
+SHIPPED_SAMPLES=(5 6)
+SHIPPED_NAME_SAMPLES=('[]' '[{"event":"node_warning","event_code":"invocation_replay_insert_failed","count":1}]')
+SENDER_OUTPUT='GELF_SEND_ERROR code=ENOTFOUND'
+reset_fixtures
+expect_probe_failure 'isolation check failed' vector 1 "$SENDER_OUTPUT"
+
+# Positive controls and the isolation leak self-test never accept sender errors.
+SENDER_OUTPUT='GELF_SEND_ERROR code=ENOTFOUND'
+if output=$(send_positive_probe 'host loopback' host host 127.0.0.1 2>&1); then
+  fail "positive-control sender error passed"
+fi
+[[ "$output" == *"positive control sender failed"* ]] || fail "positive-control sender error was not fatal: $output"
+SENDER_OUTPUT='GELF_SEND_ERROR code=EHOSTUNREACH'
+prepare_sender_error_probe
+if output=$(run_isolation_leak_self_test host host 127.0.0.1 2>&1); then
+  fail "leak self-test accepted a sender error"
+fi
+[[ "$output" == *"could not deliver its allowed packet"* ]] || fail "leak self-test sender error was not fatal: $output"
+SENDER_EXIT=0
+SENDER_OUTPUT=""
+printf '%s\n' 'PASS: sender failures are classified by exact code, target type, and context'
 printf '%s\n' 'PASS: isolation freshness, positive controls, and leak self-test'
 
 # The raw console scan catches a marker hidden in an unexpected field even when the probe filter returns zero.
