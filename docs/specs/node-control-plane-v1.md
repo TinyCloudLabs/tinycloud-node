@@ -1162,6 +1162,11 @@ Connection lifecycle (owned by `serve`, not the CLI):
   response streamed back as `response` + `responseBody...` frames. A
   per-request failure sends an `error` frame for that request's `id` only —
   it never closes the socket.
+- The loopback HTTP client never follows redirects. A `3xx` response, its
+  `Location` header and body are returned through the ordinary response frames;
+  the node makes no request to the redirect target. Each upstream request has
+  a 30-second total deadline, including response-body reads. A timeout uses the
+  existing per-request `error` frame and leaves the tunnel socket open.
 - The relay pings every 30s; the underlying WebSocket library answers pings
   automatically. If no frame (data, ping, or close) arrives for an extended
   idle window, the node treats the connection as dead and reconnects.

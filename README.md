@@ -104,6 +104,12 @@ containing only `storage_limit_bytes` remain supported. Local testing can
 set an in-memory limit with authenticated
 `PUT /admin/quota/<space>` and `{"limit_bytes":1}`; overrides reset on restart.
 
+The billing request percent-encodes the original space ID as one path segment;
+the quota/cache key itself is unchanged. The client never follows redirects,
+so the service bearer is sent only on the configured billing request. A `3xx`
+answer uses the existing quota fallback policy, with the existing 3-second total
+and 2-second connect deadlines.
+
 ### Signed KV URLs
 
 `POST /signed/kv` accepts a normal TinyCloud invocation whose authorized capabilities include a `tinycloud.kv/get` capability that can be attenuated to the requested `{space, path}`. The invocation may include other capabilities. The JSON body is:
@@ -311,12 +317,18 @@ setting. DID parsing and string comparisons, including share-email `did:web`
 identifiers, are unchanged. Existing route status codes and policy machine codes
 are preserved.
 
-Configure `[global.did_resolution] network_methods = false` in `tinycloud.toml`
-or use the canonical environment variable
-`TINYCLOUD_DID_RESOLUTION__NETWORK_METHODS`. For rollback without rebuilding,
-set `TINYCLOUD_DID_RESOLUTION__NETWORK_METHODS=true` and restart the node.
-This restores the previous methods with the unhardened SSI client, while issuer
-queries remain refused. The previous image is the fallback rollback.
+Keep `[global.did_resolution] network_methods = false` in `tinycloud.toml`
+or the canonical environment variable
+`TINYCLOUD_DID_RESOLUTION__NETWORK_METHODS=false`. Network DID methods, including
+`did:web`, remain disabled under the current policy.
+
+**Full TC-1080 Part B hardening is REQUIRED before any future re-enable**,
+including setting the existing `network_methods` option to `true`. The
+unhardened SSI client is not an acceptable rollback path. Part B is not
+implemented here, and there is no Part B development bypass. The required
+node-side fetcher, destination enforcement, resource limits and local-listener
+acceptance checks are described in the
+[developer gate](docs/delegation-flow.md#network-did-method-future-enable-gate-tc-1132).
 
 The startup log records the effective policy. Refusals increment
 `tinycloud_did_resolution_refused_total{method,reason}` (even when latency
