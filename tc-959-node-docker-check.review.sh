@@ -52,7 +52,7 @@ memory_sampler() {
       if [[ "$running" == true ]]; then
         current=$(command docker stats --no-stream --format '{{.MemUsage}}' "$container" 2>/dev/null | awk '{value=$1; amount=value; sub(/[A-Za-z].*$/, "", amount); unit=substr(value, length(amount)+1); multiplier=unit=="GiB"?1073741824:unit=="MiB"?1048576:unit=="KiB"?1024:1; printf "%.0f", amount*multiplier}' || true)
         [[ "$current" =~ ^[0-9]+$ ]] || current=0
-        (( current > peak )) && peak=$current
+        if (( current > peak )); then peak=$current; fi
       fi
     fi
     printf '%s\n' "$peak" >"$WORK/vector-peak-bytes"
@@ -300,6 +300,7 @@ const declared = new Set(shellSources.flatMap((source) =>
   [...source.matchAll(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(\)\s*\{/gm)].map((match) => match[1])));
 const calledHelpers = [
   'record', 'docker_cmd', 'compose_cmd', 'memory_sampler', 'cleanup', 'fail', 'require',
+  'check_host_ports_free', 'crash_vector',
   'wait_vector', 'wait_node', 'read_metric', 'read_metric_sample', 'metric_now_ms',
   'wait_fresh_stable_metric', 'fresh_sample', 'wait_metric', 'vector_shipped_count',
   'vector_event_count', 'wait_next_line', 'send_from_container', 'send_probe',
@@ -329,6 +330,8 @@ fi
 require docker
 require curl
 require ip
+require ss
+check_host_ports_free
 docker compose version >/dev/null || fail "Docker Compose v2 is required"
 if ! "${COMPOSE[@]}" config --format json | node "$ROOT/scripts/tc-959-compose-env.mjs"; then
   fail "rendered Compose environment isolation failed"
@@ -382,14 +385,7 @@ for mode in restart crash recreate; do
         ;;
       crash)
         before=$(vector_event_count)
-        docker_cmd kill --signal KILL "$VECTOR_ID" >/dev/null
-        deadline=$((SECONDS + 20))
-        while (( SECONDS < deadline )); do
-          if [[ "$(docker_cmd inspect -f '{{.State.Running}}' "$VECTOR_ID" 2>/dev/null || true)" == true ]]; then break; fi
-          sleep 0.2
-        done
-        wait_vector
-        wait_next_line "$before"
+        crash_vector "$before"
         ;;
       recreate)
         compose_cmd up -d --force-recreate --no-deps vector >/dev/null

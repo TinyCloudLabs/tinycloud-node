@@ -83,3 +83,54 @@ reset_fixtures
 run_isolation_leak_self_test host host 127.0.0.1
 assert_eq "$SEND_COUNT" 1
 printf '%s\n' 'PASS: isolation freshness, positive controls, and leak self-test'
+
+# Host-port preflight reports the owning Compose service before startup.
+PORT_HOLDER_MODE=container
+ss() {
+  if [[ "$3" == "sport = :18000" && "$PORT_HOLDER_MODE" == container ]]; then
+    printf '%s\n' 'LISTEN 0 4096 127.0.0.1:18000 0.0.0.0:* users:(("docker-proxy",pid=123,fd=4))'
+  fi
+}
+docker_cmd() {
+  if [[ "$1" == ps && "$3" == publish=18000 ]]; then
+    printf '%s\n' 'tc959-existing-compose'
+    return 0
+  fi
+  return 1
+}
+port_error=$(check_host_ports_free 2>&1) && fail "busy host port passed preflight"
+[[ "$port_error" == *"127.0.0.1:18000"* && "$port_error" == *"tc959-existing-compose"* ]] || fail "port preflight omitted listener owner: $port_error"
+
+# A real crash sends SIGKILL to the host PID and requires exactly one restart.
+VECTOR_ID=vector-test
+RESTART_COUNT=4
+KILLED_PID=""
+RECOVERED_LINE_COUNT=""
+docker_cmd() {
+  if [[ "$1" != inspect ]]; then return 1; fi
+  case "$3" in
+    '{{.RestartCount}}') printf '%s\n' "$RESTART_COUNT" ;;
+    '{{.State.Pid}}') printf '%s\n' 4242 ;;
+    '{{.State.Running}}') printf '%s\n' true ;;
+    *) return 1 ;;
+  esac
+}
+kill() {
+  [[ "$1" == -KILL && "$2" == 4242 ]] || fail "crash helper did not SIGKILL the host container PID"
+  KILLED_PID=$2
+  RESTART_COUNT=5
+}
+wait_vector() { :; }
+wait_next_line() { RECOVERED_LINE_COUNT=$1; }
+crash_vector 17
+assert_eq "$KILLED_PID" 4242
+assert_eq "$RECOVERED_LINE_COUNT" 17
+
+# A SIGKILL without a restart must fail rather than look like a successful crash.
+kill() { :; }
+sleep() { SECONDS=$((SECONDS + 20)); }
+RESTART_COUNT=5
+SECONDS=0
+restart_error=$(crash_vector 18 2>&1) && fail "crash helper accepted a kill without a restart"
+[[ "$restart_error" == *"RestartCount did not increase by exactly one"* ]] || fail "crash helper gave no explicit restart-count failure: $restart_error"
+printf '%s\n' 'PASS: port ownership preflight and SIGKILL restart-count checks'

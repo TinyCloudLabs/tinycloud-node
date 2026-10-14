@@ -1,3 +1,45 @@
+check_host_ports_free() {
+  local port listeners containers owner
+  for port in 18000 9598; do
+    listeners=$(ss -H -ltnp "sport = :$port") || fail "could not inspect host port 127.0.0.1:$port"
+    [[ -n "$listeners" ]] || continue
+    containers=$(docker_cmd ps --filter "publish=$port" --format '{{.Names}}' 2>/dev/null || true)
+    owner=$listeners
+    [[ -z "$containers" ]] || owner="$containers; $listeners"
+    fail "host port 127.0.0.1:$port is already in use: $owner"
+  done
+}
+
+crash_vector() {
+  local previous_line_count=$1 restart_before container_pid target_restart
+  local restart_count="" running="" deadline
+  restart_before=$(docker_cmd inspect -f '{{.RestartCount}}' "$VECTOR_ID")
+  container_pid=$(docker_cmd inspect -f '{{.State.Pid}}' "$VECTOR_ID")
+  [[ "$restart_before" =~ ^[0-9]+$ ]] || fail "Vector RestartCount is invalid before SIGKILL: $restart_before"
+  [[ "$container_pid" =~ ^[1-9][0-9]*$ ]] || fail "Vector host PID is invalid before SIGKILL: $container_pid"
+  target_restart=$((restart_before + 1))
+  kill -KILL "$container_pid" || fail "could not SIGKILL Vector host PID $container_pid"
+
+  deadline=$((SECONDS + 20))
+  while (( SECONDS < deadline )); do
+    restart_count=$(docker_cmd inspect -f '{{.RestartCount}}' "$VECTOR_ID" 2>/dev/null || true)
+    [[ "$restart_count" =~ ^[0-9]+$ ]] || { sleep 0.2; continue; }
+    if (( restart_count > target_restart )); then
+      fail "Vector RestartCount advanced past expected +1 after SIGKILL: before=$restart_before after=$restart_count"
+    fi
+    if (( restart_count == target_restart )); then
+      running=$(docker_cmd inspect -f '{{.State.Running}}' "$VECTOR_ID" 2>/dev/null || true)
+      [[ "$running" == true ]] && break
+    fi
+    sleep 0.2
+  done
+  [[ "$restart_count" == "$target_restart" ]] ||
+    fail "Vector RestartCount did not increase by exactly one after SIGKILL: before=$restart_before after=${restart_count:-unavailable}"
+  [[ "$running" == true ]] || fail "Vector RestartCount increased but Vector is not running after SIGKILL"
+  wait_vector
+  wait_next_line "$previous_line_count"
+}
+
 wait_vector() {
   local deadline=$((SECONDS + 20))
   while (( SECONDS < deadline )); do
