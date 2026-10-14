@@ -193,12 +193,28 @@ pub struct NodeInfo {
     pub in_tee: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quota_url: Option<String>,
+    /// PostgreSQL connection counters (TC-1054), so a deploy can check that
+    /// every connection got its TCP keepalive options:
+    /// `sockets_configured >= connections_opened > 0`. Counts only; omitted
+    /// when the node's database is not PostgreSQL.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub postgres: Option<PostgresInfo>,
+}
+
+/// Process-wide PostgreSQL connection counters in [`NodeInfo`].
+#[derive(Serialize)]
+pub struct PostgresInfo {
+    /// Sockets the vendored sqlx-core set keepalive and `TCP_USER_TIMEOUT` on.
+    pub sockets_configured: u64,
+    /// Connections the node's pools have opened.
+    pub connections_opened: u64,
 }
 
 fn build_info(
     tee: &State<Option<crate::tee::TeeContext>>,
     quota_cache: &State<QuotaCache>,
     encryption: &State<EncryptionService>,
+    database: Option<&tinycloud_core::RecoveringConnection>,
 ) -> NodeInfo {
     #[allow(unused_mut)]
     let mut features = vec!["kv", "delegation", "sharing", "sql"];
@@ -220,6 +236,35 @@ fn build_info(
         node_id: encryption.node_did().to_string(),
         in_tee: tee.inner().is_some(),
         quota_url: quota_cache.quota_url().map(|s| s.to_string()),
+        // Two relaxed atomic loads: `/info` is public and polled.
+        postgres: database
+            .is_some_and(|db| {
+                use tinycloud_core::sea_orm::ConnectionTrait as _;
+                db.get_database_backend() == tinycloud_core::sea_orm::DbBackend::Postgres
+            })
+            .then(|| PostgresInfo {
+                sockets_configured: sqlx_core::net::tcp_keepalive::sockets_configured(),
+                connections_opened: crate::postgres_connections_opened(),
+            }),
+    }
+}
+
+/// The node's pool, if it manages one. Unlike a `State` guard it never
+/// fails, so a node without a pool (a test fixture) still launches.
+pub struct NodePool<'r>(Option<&'r tinycloud_core::RecoveringConnection>);
+
+#[rocket::async_trait]
+impl<'r> rocket::request::FromRequest<'r> for NodePool<'r> {
+    type Error = std::convert::Infallible;
+
+    async fn from_request(
+        request: &'r rocket::Request<'_>,
+    ) -> rocket::request::Outcome<Self, Self::Error> {
+        rocket::request::Outcome::Success(NodePool(
+            request
+                .rocket()
+                .state::<tinycloud_core::RecoveringConnection>(),
+        ))
     }
 }
 
@@ -228,8 +273,9 @@ pub fn info(
     tee: &State<Option<crate::tee::TeeContext>>,
     quota_cache: &State<QuotaCache>,
     encryption: &State<EncryptionService>,
+    pool: NodePool<'_>,
 ) -> Json<NodeInfo> {
-    Json(build_info(tee, quota_cache, encryption))
+    Json(build_info(tee, quota_cache, encryption, pool.0))
 }
 
 #[get("/version")]
@@ -237,8 +283,9 @@ pub fn version(
     tee: &State<Option<crate::tee::TeeContext>>,
     quota_cache: &State<QuotaCache>,
     encryption: &State<EncryptionService>,
+    pool: NodePool<'_>,
 ) -> Json<NodeInfo> {
-    Json(build_info(tee, quota_cache, encryption))
+    Json(build_info(tee, quota_cache, encryption, pool.0))
 }
 
 #[allow(clippy::let_unit_value)]
@@ -9225,6 +9272,8 @@ mod tests {
             .unwrap()
             .iter()
             .any(|feature| feature == "kv-sync-root"));
+        // TC-1054: the PostgreSQL counters are omitted off PostgreSQL.
+        assert!(info.get("postgres").is_none(), "{info}");
 
         fixture.owner_write("notes/a", Some(b"note")).await?;
         fixture

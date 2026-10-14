@@ -1295,3 +1295,90 @@ async fn postgres_write_routes_tell_retryable_failures_from_unknown_outcomes() {
         .expect("drop the isolated schema");
     result.expect("route outcomes");
 }
+
+/// The `postgres` object of `/info`: exactly the two counters.
+async fn postgres_info(node: &Node) -> Result<(u64, u64)> {
+    let (status, body, _) = dispatch(node.client.get("/info")).await;
+    ensure!(status == Status::Ok, "/info: {status} {body}");
+    let info: serde_json::Value = serde_json::from_str(&body)?;
+    let postgres = info["postgres"]
+        .as_object()
+        .with_context(|| format!("/info has a postgres object: {info}"))?;
+    let mut keys: Vec<&str> = postgres.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    ensure!(
+        keys == ["connections_opened", "sockets_configured"],
+        "counts only: {postgres:?}"
+    );
+    let count = |key: &str| {
+        postgres[key]
+            .as_u64()
+            .with_context(|| format!("{key} is a count"))
+    };
+    Ok((count("sockets_configured")?, count("connections_opened")?))
+}
+
+/// TC-1054: with logs private, the deploy checks keepalive through the
+/// public `/info`: `postgres.sockets_configured >= connections_opened > 0`,
+/// and both move when the pool opens connections.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_info_reports_connection_counters() {
+    let Some(url) = postgres_test_url("postgres_info_reports_connection_counters") else {
+        return;
+    };
+    let admin = Database::connect(url.as_str())
+        .await
+        .expect("connect to PostgreSQL");
+    let schema = format!(
+        "tc1054_info_{}_{}",
+        std::process::id(),
+        time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+    );
+    admin
+        .execute(Statement::from_string(
+            DbBackend::Postgres,
+            format!("CREATE SCHEMA {schema}"),
+        ))
+        .await
+        .expect("create the isolated schema");
+    let (node, _datadir) = start_node(&url, &schema, Cut::default())
+        .await
+        .expect("start the node");
+
+    let result = async {
+        let (sockets, opened) = postgres_info(&node).await?;
+        ensure!(opened > 0, "the pool connected at startup: {opened}");
+        ensure!(
+            sockets >= opened,
+            "{sockets} sockets for {opened} connections"
+        );
+
+        // Hold more connections than the pool has, so it opens new ones.
+        node.settle().await?;
+        let pool = node.pool();
+        let wanted = pool.size() + 2;
+        let mut held = Vec::new();
+        for _ in 0..wanted {
+            held.push(pool.acquire().await?);
+        }
+        drop(held);
+        let (sockets_after, opened_after) = postgres_info(&node).await?;
+        ensure!(opened_after > opened, "{opened} -> {opened_after}");
+        ensure!(sockets_after > sockets, "{sockets} -> {sockets_after}");
+        ensure!(
+            sockets_after >= opened_after,
+            "{sockets_after} sockets for {opened_after} connections"
+        );
+        Ok(())
+    }
+    .await;
+    node.pool().close().await;
+    admin
+        .execute(Statement::from_string(
+            DbBackend::Postgres,
+            format!("DROP SCHEMA {schema} CASCADE"),
+        ))
+        .await
+        .expect("drop the isolated schema");
+    result.expect("postgres counters in /info");
+}
