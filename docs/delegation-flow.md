@@ -23,6 +23,44 @@ The delegation hierarchy enables:
 | Session Key | `did:key:z6Mk...#z6Mk...` | `did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK#z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK` |
 | PKH (Wallet) | `did:pkh:eip155:{chainId}:{address}` | `did:pkh:eip155:1:0x742d35Cc6634C0532925a3b844Bc9e7595f1Ac8b` |
 
+### Network DID method future-enable gate (TC-1132)
+
+The node's UCAN issuer resolver currently permits only offline `did:key`,
+`did:pkh` and `did:jwk` resolution by default. Network methods, including
+`did:web`, remain disabled with `network_methods = false`. DID identifiers used
+for parsing or identity comparisons (for example share-email `did:web` values)
+are unaffected; this gate concerns network resolution during verification.
+
+**Full TC-1080 plan Part B is REQUIRED before any future re-enable**, including
+the existing `network_methods = true` setting. Do not restore the unhardened SSI
+fetcher as a rollback. Part B is not implemented by TC-1132 Parts C/D, and no
+Part B development flag or bypass is provided.
+
+Before a future change enables `did:web`, it must implement and verify all of
+Part B:
+
+- A node-owned DID-web fetcher behind the node resolver, not an SSI-fork change;
+  absent a hardened fetcher, network resolution must stay refused.
+- Strict DID-to-HTTPS URL construction and document identity checks, with
+  IP-literal hosts, unsafe path segments, unexpected ports and issuer queries
+  refused.
+- Destination policy enforced on the exact DNS addresses used to connect:
+  forbidden IPv4/IPv6 classes (including embedded IPv4), metadata/link-local
+  destinations and the node's database/internal endpoint deny-set. No second
+  unchecked DNS lookup, environment-proxy bypass or redirect following.
+- Bounded DNS, connect and total request time; status/content-type checks; a
+  64 KiB response cap; concurrency and per-host rate limits; bounded positive
+  and negative caches with in-flight deduplication; count-only refusal evidence.
+- Local-listener and injected-resolver regressions for every refused address
+  class, database/internal destinations, URL construction, ignored proxies,
+  DNS rebinding, redirects, oversized bodies, timeouts and rate/cache behavior.
+  Retain Part A refusal checks and prove a permitted DID document verifies
+  end-to-end only after the hardened fetcher is installed.
+
+Any development exception described by the original Part B plan is itself
+subject to this gate; it must never exempt metadata/link-local addresses or
+the internal endpoint deny-set. This documentation does not enable one.
+
 ### Space ID Format
 
 Spaces are identified using the format:

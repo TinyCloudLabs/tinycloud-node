@@ -234,6 +234,7 @@ impl QuotaCache {
             reqwest::Client::builder()
                 .timeout(FETCH_TIMEOUT)
                 .connect_timeout(CONNECT_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("failed to build quota reqwest client")
         });
@@ -447,7 +448,13 @@ async fn fetch_remote(
     secret: Option<&str>,
     key: &str,
 ) -> Option<RemoteQuota> {
-    let mut request = client.get(format!("{}/api/quota/{}", url, key));
+    // Encode only the space key, not the operator-controlled base URL.
+    // Cache/override keys remain the original SpaceId string.
+    let mut request = client.get(format!(
+        "{}/api/quota/{}",
+        url,
+        percent_encoding::utf8_percent_encode(key, percent_encoding::NON_ALPHANUMERIC),
+    ));
     if let Some(secret) = secret {
         request = request.bearer_auth(secret);
     }
@@ -516,7 +523,7 @@ async fn record_fetch(
 #[cfg(test)]
 mod test {
     use super::*;
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn space(n: u8) -> SpaceId {
         format!("tinycloud:pkh:eip155:1:0x7BD63AA37326a64d458559F44432103e3d6eEDE9:s{n}")
@@ -567,6 +574,143 @@ mod test {
                 .is_err(),
             "the fresh cached entry must avoid a second network request",
         );
+    }
+
+    async fn read_request(stream: &mut tokio::net::TcpStream) -> String {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let len = stream.read(&mut buffer).await.expect("read request");
+                assert_ne!(len, 0, "request ended before its headers");
+                request.extend_from_slice(&buffer[..len]);
+                assert!(request.len() <= 65536, "request headers too large");
+            }
+            String::from_utf8(request).expect("HTTP request")
+        })
+        .await
+        .expect("request headers timed out")
+    }
+
+    #[tokio::test]
+    async fn billing_path_keeps_special_character_space_id_in_one_segment() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind quota listener");
+        let quota_url = format!("http://{}/billing", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept quota request");
+            let request = read_request(&mut stream).await;
+            let body = r#"{"storage_limit_bytes":500}"#;
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("write quota response");
+            request
+        });
+        // The public constructor permits characters that the URI parser
+        // refuses. Encoding must protect every SpaceId without changing its key.
+        let sid = SpaceId::new(
+            space(1).did().to_owned(),
+            "a/b?c#d%2F../é".parse().expect("space name"),
+        );
+        let key = sid.to_string();
+        let cache = QuotaCache::new(Some(ByteUnit::Byte(100)), Some(quota_url));
+        assert_eq!(cache.get_limit(&sid).await, Some(ByteUnit::Byte(500)));
+        let request = server.await.expect("quota server");
+        assert_eq!(
+            request.lines().next(),
+            Some("GET /billing/api/quota/tinycloud%3Apkh%3Aeip155%3A1%3A0x7BD63AA37326a64d458559F44432103e3d6eEDE9%3Aa%2Fb%3Fc%23d%252F%2E%2E%2F%C3%A9 HTTP/1.1"),
+            "the complete space key must be one encoded path segment",
+        );
+        assert_eq!(cache.remote_entry(&key).await, Some((Some(500), false)));
+        cache.set_limit(&sid, 700).await;
+        assert_eq!(cache.get_limit(&sid).await, Some(ByteUnit::Byte(700)));
+        assert_eq!(cache.get_override(&sid).await, Some(700));
+    }
+
+    #[tokio::test]
+    async fn billing_redirect_never_requests_target_or_forwards_bearer() {
+        for same_origin in [true, false] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind quota listener");
+            let quota_addr = listener.local_addr().unwrap();
+            let target = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind redirect target");
+            let target_addr = if same_origin {
+                quota_addr
+            } else {
+                target.local_addr().unwrap()
+            };
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept quota request");
+                let first_request = read_request(&mut stream).await;
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 302 Found\r\nLocation: http://{target_addr}/redirected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .expect("write redirect");
+                drop(stream);
+                let target = if same_origin { listener } else { target };
+                let redirected_request = match tokio::time::timeout(
+                    Duration::from_millis(500),
+                    target.accept(),
+                )
+                .await
+                {
+                    Ok(Ok((mut stream, _))) => {
+                        let request = read_request(&mut stream).await;
+                        let body = r#"{"storage_limit_bytes":900}"#;
+                        stream
+                                .write_all(
+                                    format!(
+                                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                        body.len()
+                                    )
+                                    .as_bytes(),
+                                )
+                                .await
+                                .expect("write redirected response");
+                        Some(request)
+                    }
+                    Err(_) => None,
+                    Ok(Err(err)) => panic!("redirect target accept failed: {err}"),
+                };
+                (first_request, redirected_request)
+            });
+            let cache = QuotaCache::new(
+                Some(ByteUnit::Byte(100)),
+                Some(format!("http://{quota_addr}")),
+            )
+            .with_service_secret(Some("quota-test-service-secret".into()));
+            let sid = space(1);
+            let limit = cache.get_limit(&sid).await;
+            let (first_request, redirected_request) = server.await.expect("quota server");
+            assert!(first_request
+                .to_ascii_lowercase()
+                .contains("\r\nauthorization: bearer quota-test-service-secret\r\n"));
+            assert!(
+                redirected_request.is_none(),
+                "no redirect target may receive a request or bearer (same_origin={same_origin}): {redirected_request:?}",
+            );
+            assert_eq!(limit, Some(ByteUnit::Byte(100)), "redirect uses fallback");
+            assert_eq!(
+                cache.remote_entry(&sid.to_string()).await,
+                Some((None, false))
+            );
+        }
     }
 
     #[test]

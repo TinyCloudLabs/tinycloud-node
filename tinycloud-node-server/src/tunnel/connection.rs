@@ -52,6 +52,10 @@ const AUTH_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 /// heartbeats are tolerated before we give up on the socket.
 const IDLE_READ_TIMEOUT: Duration = Duration::from_secs(90);
 
+/// Total budget for a loopback HTTP request, including its response body.
+/// A stalled upstream must release its request task without closing the tunnel.
+const UPSTREAM_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Default cap on the number of requests concurrently being reassembled
 /// (head received, body not yet complete) per tunnel connection. Bounds
 /// `pending`'s memory usage against a relay that opens many requests without
@@ -455,7 +459,17 @@ async fn serve_requests(
 ) -> AttemptResult {
     let mut pending: HashMap<String, PendingRequest> = HashMap::new();
     let upstream_addr = ctx.upstream_addr;
-    let http_client = reqwest::Client::new();
+    let http_client = match reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(UPSTREAM_REQUEST_TIMEOUT)
+        .build()
+    {
+        Ok(client) => client,
+        Err(err) => {
+            tracing::warn!(%err, "tunnel: failed to build upstream HTTP client");
+            return AttemptResult::Outcome(AttemptOutcome::TransportError);
+        }
+    };
     let max_pending = max_pending_requests();
 
     loop {

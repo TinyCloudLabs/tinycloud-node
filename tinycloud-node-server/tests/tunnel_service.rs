@@ -51,6 +51,7 @@ use tinycloud::{
         protocol::{TunnelFrame, BODY_CHUNK_BYTES, CLOSE_STALE_SEQUENCE, CLOSE_SUPERSEDED},
     },
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{oneshot, watch};
 
 /// Serializes tests that mutate the process-wide `TINYCLOUD_KEYS_SECRET` env
@@ -1244,4 +1245,251 @@ impl Drop for EnvVarGuard {
             None => std::env::remove_var(self.key),
         }
     }
+}
+
+/// Runs the real tunnel connection against a local relay, recording complete
+/// response/error frame sequences for each request on the same WebSocket.
+async fn proxy_local_requests(
+    upstream_addr: SocketAddr,
+    paths: Vec<&'static str>,
+    deadline: Duration,
+) -> Vec<Vec<TunnelFrame>> {
+    let observations = Arc::new(Mutex::new(RelayObservations::default()));
+    let (result_tx, result_rx) = oneshot::channel();
+    let result_tx = Arc::new(tokio::sync::Mutex::new(Some(result_tx)));
+    let ws_handler = move |ws: WebSocketUpgrade, Path(_name): Path<String>| {
+        let obs = observations.clone();
+        let result_tx = result_tx.clone();
+        let paths = paths.clone();
+        async move {
+            ws.on_upgrade(move |mut socket| async move {
+                recv_auth_frame(&mut socket, &obs).await;
+                send_ack(&mut socket).await;
+                let mut results = Vec::new();
+                for (index, path) in paths.into_iter().enumerate() {
+                    let id = format!("req-{index}");
+                    for frame in [
+                        TunnelFrame::Request {
+                            id: id.clone(),
+                            method: "GET".into(),
+                            path: path.into(),
+                            headers: vec![(
+                                "authorization".into(),
+                                "Bearer tunnel-test-credential".into(),
+                            )],
+                        },
+                        TunnelFrame::RequestBody {
+                            id,
+                            chunk: String::new(),
+                            done: true,
+                        },
+                    ] {
+                        socket
+                            .send(WsMessage::Text(frame.encode()))
+                            .await
+                            .expect("send relay request");
+                    }
+                    let mut frames = Vec::new();
+                    loop {
+                        let message = socket.recv().await.expect("tunnel closed").unwrap();
+                        let WsMessage::Text(text) = message else {
+                            continue;
+                        };
+                        let frame = TunnelFrame::parse(&text).expect("tunnel frame");
+                        let done = matches!(
+                            frame,
+                            TunnelFrame::ResponseBody { done: true, .. }
+                                | TunnelFrame::Error { .. }
+                        );
+                        frames.push(frame);
+                        if done {
+                            break;
+                        }
+                    }
+                    results.push(frames);
+                }
+                if let Some(tx) = result_tx.lock().await.take() {
+                    let _ = tx.send(results);
+                }
+                let _ = socket.recv().await;
+            })
+        }
+    };
+    let app = Router::new().route("/v1/tunnel/:name", get(ws_handler));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay_addr = listener.local_addr().unwrap();
+    let relay = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let data_root = tempdir().unwrap();
+    seed_enabled_tunnel_state(
+        data_root.path(),
+        "egressnode",
+        &format!("http://{relay_addr}"),
+    );
+    let (shutdown_tx, handle) = spawn_tunnel_client(data_root.path(), upstream_addr).await;
+    let result = tokio::time::timeout(deadline, result_rx).await;
+    stop_and_join(shutdown_tx, handle).await;
+    relay.abort();
+    result
+        .expect("tunnel did not complete requests within the deadline")
+        .expect("relay dropped observations")
+}
+
+async fn read_upstream_request(stream: &mut tokio::net::TcpStream) -> String {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut request = Vec::new();
+        let mut buffer = [0; 1024];
+        while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+            let len = stream.read(&mut buffer).await.expect("read request");
+            assert_ne!(len, 0, "request ended before headers");
+            request.extend_from_slice(&buffer[..len]);
+            assert!(request.len() <= 65536);
+        }
+        String::from_utf8(request).unwrap()
+    })
+    .await
+    .expect("upstream request headers timed out")
+}
+
+#[tokio::test]
+async fn tc1132_redirect_is_returned_without_requesting_target() {
+    let _env_lock = env_lock().await;
+    let _secret = EnvVarGuard::set(
+        "TINYCLOUD_KEYS_SECRET",
+        &base64::encode_config([41; 32], base64::URL_SAFE_NO_PAD),
+    );
+    let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_addr = target.local_addr().unwrap();
+    let location = format!("http://{target_addr}/redirected");
+    let location_for_upstream = location.clone();
+    let app = Router::new().fallback(any(move || {
+        let location = location_for_upstream.clone();
+        async move { (StatusCode::FOUND, [("location", location)], "redirect body") }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = listener.local_addr().unwrap();
+    let upstream = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let target_server = tokio::spawn(async move {
+        match tokio::time::timeout(Duration::from_secs(2), target.accept()).await {
+            Ok(Ok((mut stream, _))) => {
+                let request = read_upstream_request(&mut stream).await;
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nfollowed",
+                    )
+                    .await
+                    .unwrap();
+                Some(request)
+            }
+            Err(_) => None,
+            Ok(Err(err)) => panic!("target accept failed: {err}"),
+        }
+    });
+    let results =
+        proxy_local_requests(upstream_addr, vec!["/redirect"], Duration::from_secs(5)).await;
+    upstream.abort();
+    let redirected_request = target_server.await.unwrap();
+    assert!(
+        redirected_request.is_none(),
+        "redirect target must receive no request or credentials: {redirected_request:?}",
+    );
+    assert!(matches!(
+        &results[0][0],
+        TunnelFrame::Response { id, status: 302, headers }
+            if id == "req-0" && headers.iter().any(|(name, value)| name == "location" && value == &location)
+    ));
+    assert!(matches!(
+        &results[0][1],
+        TunnelFrame::ResponseBody { id, chunk, done: true }
+            if id == "req-0" && base64::decode_config(chunk, base64::STANDARD).unwrap() == b"redirect body"
+    ));
+}
+
+async fn stalled_upstream_times_out_and_socket_survives(send_headers: bool) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stalled, _) = listener.accept().await.unwrap();
+        let request = read_upstream_request(&mut stalled).await;
+        assert_eq!(request.lines().next(), Some("GET /stall HTTP/1.1"));
+        if send_headers {
+            stalled
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\na")
+                .await
+                .unwrap();
+        }
+        // The request timeout must close the stalled connection, including
+        // when response headers arrived but the body never finished.
+        let mut byte = [0];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(35), stalled.read(&mut byte))
+                .await
+                .expect("stalled request was not closed")
+                .expect("read stalled connection"),
+            0,
+        );
+        let (mut healthy, _) = listener.accept().await.unwrap();
+        let request = read_upstream_request(&mut healthy).await;
+        assert_eq!(request.lines().next(), Some("GET /healthy HTTP/1.1"));
+        healthy
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .await
+            .unwrap();
+    });
+    let start = Instant::now();
+    let results = proxy_local_requests(
+        upstream_addr,
+        vec!["/stall", "/healthy"],
+        Duration::from_secs(35),
+    )
+    .await;
+    server.await.unwrap();
+    assert!(start.elapsed() < Duration::from_secs(35));
+    let expected_prefix = if send_headers {
+        "failed to read upstream response body:"
+    } else {
+        "upstream request failed:"
+    };
+    assert!(
+        matches!(
+            &results[0][0],
+            TunnelFrame::Error { id: Some(id), message }
+                if id == "req-0" && message.starts_with(expected_prefix) && message.contains("timed out")
+        ),
+        "expected the existing per-request timeout error, got {:?}",
+        results[0]
+    );
+    assert!(
+        matches!(
+            &results[1][0],
+            TunnelFrame::Response { id, status: 200, .. } if id == "req-1"
+        ),
+        "the same tunnel must serve the next request"
+    );
+    assert!(matches!(
+        &results[1][1],
+        TunnelFrame::ResponseBody { id, chunk, done: true }
+            if id == "req-1" && base64::decode_config(chunk, base64::STANDARD).unwrap() == b"ok"
+    ));
+}
+
+#[tokio::test]
+async fn tc1132_stalled_upstream_headers_time_out_without_closing_tunnel() {
+    let _env_lock = env_lock().await;
+    let _secret = EnvVarGuard::set(
+        "TINYCLOUD_KEYS_SECRET",
+        &base64::encode_config([42; 32], base64::URL_SAFE_NO_PAD),
+    );
+    stalled_upstream_times_out_and_socket_survives(false).await;
+}
+
+#[tokio::test]
+async fn tc1132_stalled_upstream_body_time_out_without_closing_tunnel() {
+    let _env_lock = env_lock().await;
+    let _secret = EnvVarGuard::set(
+        "TINYCLOUD_KEYS_SECRET",
+        &base64::encode_config([43; 32], base64::URL_SAFE_NO_PAD),
+    );
+    stalled_upstream_times_out_and_socket_survives(true).await;
 }
