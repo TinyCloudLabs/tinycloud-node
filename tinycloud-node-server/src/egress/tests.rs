@@ -114,9 +114,12 @@ async fn tc1132_mixed_dns_exposes_only_vetted_addresses_to_reqwest() {
         .resolve_url(&Url::parse("https://mixed.test/").unwrap())
         .await
         .unwrap();
+    let denied = policy.deny.read().await.addresses.clone();
     let resolver = PolicyResolver {
+        host: destination.url().host_str().unwrap().to_owned(),
+        denied,
+        addresses: destination.addresses,
         policy,
-        destination,
     };
     let addresses: Vec<_> = resolver
         .resolve("mixed.test".parse().unwrap())
@@ -203,7 +206,10 @@ async fn tc1132_registration_dns_and_internal_refresh_have_one_second_deadlines(
     let start = Instant::now();
     let result =
         crate::routes::hooks::validate_webhook_callback_url("https://slow.test/", &policy).await;
-    assert_eq!(result.err().unwrap().0, rocket::http::Status::BadRequest);
+    assert_eq!(
+        result.err().unwrap().into_http_error().0,
+        rocket::http::Status::BadRequest
+    );
     assert_eq!(start.elapsed(), DNS_TIMEOUT);
     let policy = EgressPolicy::for_test(vec!["slow.test".into()], Arc::new(StalledLookup), false);
     let start = Instant::now();
@@ -235,8 +241,7 @@ async fn tc1132_redirects_never_reach_another_listener() -> anyhow::Result<()> {
     );
     let url = Url::parse(&callback.url)?;
     let destination = policy.resolve_url(&url).await?;
-    let response = client(policy, destination, Duration::from_secs(3))?
-        .post(url)
+    let response = post(policy, destination, Duration::from_secs(3))
         .body("signed event")
         .send()
         .await?;
@@ -270,8 +275,7 @@ async fn tc1132_connect_time_policy_refuses_a_previously_vetted_now_internal_add
     let destination = policy.resolve_url(&url).await?;
     lookup.set("db.test", &["127.0.0.1"]).await;
     policy.refresh().await?;
-    let error = client(policy, destination, Duration::from_secs(2))?
-        .post(url)
+    let error = post(policy, destination, Duration::from_secs(2))
         .send()
         .await
         .unwrap_err();
@@ -298,14 +302,270 @@ async fn tc1132_tls_connect_stall_is_bounded_before_total_timeout() -> anyhow::R
     let url = Url::parse(&format!("https://callback.test:{}/", address.port()))?;
     let destination = policy.resolve_url(&url).await?;
     let start = Instant::now();
-    let error = client(policy, destination, Duration::from_secs(10))?
-        .post(url)
+    let error = post(policy, destination, Duration::from_secs(10))
         .send()
         .await
         .unwrap_err();
-    assert!(error.is_timeout(), "{error}");
+    assert!(
+        matches!(&error, SendError::Transport(error) if error.is_timeout()),
+        "{error}"
+    );
     assert!(start.elapsed() >= Duration::from_millis(1800));
     assert!(start.elapsed() < Duration::from_secs(3));
     stall.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn tc1132_literal_vetted_before_refresh_never_connects_after_becoming_internal(
+) -> anyhow::Result<()> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let lookup = Arc::new(TestLookup::default());
+    lookup.set("db.test", &["192.2.1.1"]).await;
+    let policy = Arc::new(EgressPolicy::for_test(
+        vec!["db.test".into()],
+        lookup.clone(),
+        true,
+    ));
+    policy.refresh().await?;
+    let url = Url::parse(&format!(
+        "https://127.0.0.1:{}/hooks",
+        listener.local_addr()?.port()
+    ))?;
+    let destination = policy.resolve_url(&url).await?;
+    let request = post(policy.clone(), destination, Duration::from_secs(2));
+    lookup.set("db.test", &["127.0.0.1"]).await;
+    policy.refresh().await?;
+    assert!(matches!(
+        policy.resolve_url(&url).await,
+        Err(EgressError::Forbidden)
+    ));
+    let error = request.send().await.unwrap_err();
+    assert!(
+        error.to_string().contains("no permitted address"),
+        "{error}"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), listener.accept())
+            .await
+            .is_err()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn tc1132_send_rechecks_mixed_snapshot_without_contacting_newly_denied_address(
+) -> anyhow::Result<()> {
+    let mut callback = test_support::callback_server(200, None).await?;
+    let url = Url::parse(&callback.url)?;
+    let denied =
+        tokio::net::TcpListener::bind(format!("127.0.0.2:{}", url.port().unwrap())).await?;
+    let lookup = Arc::new(TestLookup::default());
+    lookup.set("db.test", &["192.2.1.1"]).await;
+    lookup
+        .set("callback.test", &["127.0.0.2", "127.0.0.1"])
+        .await;
+    let policy = Arc::new(
+        EgressPolicy::for_test(vec!["db.test".into()], lookup.clone(), true)
+            .with_test_root(callback.certificate.clone()),
+    );
+    policy.refresh().await?;
+    let destination = policy.resolve_url(&url).await?;
+    let request = post(policy.clone(), destination, Duration::from_secs(3)).body("same body");
+    lookup.set("db.test", &["127.0.0.2"]).await;
+    policy.refresh().await?;
+    assert_eq!(request.send().await?.status(), reqwest::StatusCode::OK);
+    assert_eq!(callback.requests.recv().await.unwrap().0, b"same body");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), denied.accept())
+            .await
+            .is_err()
+    );
+    assert_eq!(lookup.call_count(), 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn tc1132_cancelled_send_releases_lease_before_refresh_commits() -> anyhow::Result<()> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let lookup = Arc::new(TestLookup::default());
+    lookup.set("db.test", &["192.2.1.1"]).await;
+    let policy = Arc::new(EgressPolicy::for_test(
+        vec!["db.test".into()],
+        lookup.clone(),
+        true,
+    ));
+    policy.refresh().await?;
+    let url = Url::parse(&format!(
+        "https://127.0.0.1:{}/",
+        listener.local_addr()?.port()
+    ))?;
+    let destination = policy.resolve_url(&url).await?;
+    let send = tokio::spawn(post(policy.clone(), destination, Duration::from_secs(10)).send());
+    let (_stream, _) = tokio::time::timeout(Duration::from_secs(1), listener.accept()).await??;
+    lookup.set("db.test", &["127.0.0.1"]).await;
+    let mut refresh = {
+        let policy = policy.clone();
+        tokio::spawn(async move { policy.refresh().await })
+    };
+    let early = tokio::time::timeout(Duration::from_millis(100), &mut refresh).await;
+    send.abort();
+    assert!(send.await.unwrap_err().is_cancelled());
+    assert!(
+        early.is_err(),
+        "a refresh may not invalidate an active send lease"
+    );
+    tokio::time::timeout(Duration::from_secs(1), refresh).await???;
+    assert!(matches!(
+        policy.resolve_url(&url).await,
+        Err(EgressError::Forbidden)
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn tc1132_cancellation_while_waiting_for_refresh_opens_no_connection() -> anyhow::Result<()> {
+    use std::sync::atomic::Ordering;
+    use test_support::GatedLookup;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let lookup = Arc::new(GatedLookup::default());
+    lookup.answers.set("db.test", &["192.2.1.1"]).await;
+    let policy = Arc::new(EgressPolicy::for_test(
+        vec!["db.test".into()],
+        lookup.clone(),
+        true,
+    ));
+    policy.refresh().await?;
+    let url = Url::parse(&format!(
+        "https://127.0.0.1:{}/",
+        listener.local_addr()?.port()
+    ))?;
+    let destination = policy.resolve_url(&url).await?;
+    lookup.paused.store(true, Ordering::SeqCst);
+    let refresh = {
+        let policy = policy.clone();
+        tokio::spawn(async move { policy.refresh().await })
+    };
+    tokio::time::timeout(Duration::from_secs(1), lookup.started.notified()).await?;
+    let mut send = tokio::spawn(post(policy.clone(), destination, Duration::from_secs(10)).send());
+    let early = tokio::time::timeout(Duration::from_millis(100), &mut send).await;
+    send.abort();
+    assert!(send.await.unwrap_err().is_cancelled());
+    lookup.paused.store(false, Ordering::SeqCst);
+    lookup.release.add_permits(1);
+    refresh.await??;
+    assert!(early.is_err());
+    assert!(policy.resolve_url(&url).await.is_ok());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), listener.accept())
+            .await
+            .is_err()
+    );
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn tc1132_total_send_deadline_includes_refresh_wait() -> anyhow::Result<()> {
+    use std::sync::atomic::Ordering;
+    use test_support::GatedLookup;
+    let lookup = Arc::new(GatedLookup::default());
+    lookup.answers.set("db.test", &["192.2.1.1"]).await;
+    let policy = Arc::new(EgressPolicy::for_test(
+        vec!["db.test".into()],
+        lookup.clone(),
+        false,
+    ));
+    policy.refresh().await?;
+    let destination = policy
+        .resolve_url(&Url::parse("https://198.51.0.1/")?)
+        .await?;
+    lookup.paused.store(true, Ordering::SeqCst);
+    let refresh = {
+        let policy = policy.clone();
+        tokio::spawn(async move { policy.refresh().await })
+    };
+    lookup.started.notified().await;
+    let start = Instant::now();
+    let error = post(policy, destination, Duration::from_millis(250))
+        .send()
+        .await
+        .unwrap_err();
+    assert!(matches!(error, SendError::Timeout));
+    assert_eq!(start.elapsed(), Duration::from_millis(250));
+    lookup.paused.store(false, Ordering::SeqCst);
+    lookup.release.add_permits(1);
+    refresh.await??;
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn tc1132_cancelled_refresh_preserves_fresh_state_but_never_lifts_stale_failure(
+) -> anyhow::Result<()> {
+    use std::sync::atomic::Ordering;
+    use test_support::GatedLookup;
+    let lookup = Arc::new(GatedLookup::default());
+    lookup.answers.set("db.test", &["192.2.1.1"]).await;
+    let policy = Arc::new(EgressPolicy::for_test(
+        vec!["db.test".into()],
+        lookup.clone(),
+        false,
+    ));
+    policy.refresh().await?;
+    lookup.paused.store(true, Ordering::SeqCst);
+    let refresh = {
+        let policy = policy.clone();
+        tokio::spawn(async move { policy.refresh().await })
+    };
+    lookup.started.notified().await;
+    refresh.abort();
+    assert!(refresh.await.unwrap_err().is_cancelled());
+    let callback = Url::parse("https://198.51.0.1/")?;
+    assert!(policy.resolve_url(&callback).await.is_ok());
+    tokio::time::advance(REFRESH_INTERVAL).await;
+    lookup.paused.store(false, Ordering::SeqCst);
+    lookup.answers.set("db.test", &[]).await;
+    assert!(matches!(
+        policy.resolve_url(&callback).await,
+        Err(EgressError::Unavailable)
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn tc1132_literal_tls_identity_and_healthy_delivery_survive_sealed_api() -> anyhow::Result<()>
+{
+    let mut callback = test_support::callback_server_for_host("127.0.0.1", 200, None).await?;
+    let lookup = Arc::new(TestLookup::default());
+    lookup.set("db.test", &["192.2.1.1"]).await;
+    let policy = Arc::new(
+        EgressPolicy::for_test(vec!["db.test".into()], lookup.clone(), true)
+            .with_test_root(callback.certificate.clone()),
+    );
+    policy.refresh().await?;
+    let url = Url::parse(&callback.url)?;
+    let destination = policy.resolve_url(&url).await?;
+    assert_eq!(
+        post(policy.clone(), destination, Duration::from_secs(2))
+            .body("before refresh")
+            .send()
+            .await?
+            .status(),
+        reqwest::StatusCode::OK
+    );
+    assert_eq!(callback.requests.recv().await.unwrap().0, b"before refresh");
+    let destination = policy.resolve_url(&url).await?;
+    let request =
+        post(policy.clone(), destination, Duration::from_secs(2)).body("must not be sent");
+    lookup.set("db.test", &["127.0.0.1"]).await;
+    policy.refresh().await?;
+    assert!(matches!(
+        request.send().await,
+        Err(SendError::Policy(EgressError::Forbidden))
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), callback.requests.recv())
+            .await
+            .is_err()
+    );
     Ok(())
 }

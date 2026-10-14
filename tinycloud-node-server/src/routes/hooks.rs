@@ -450,7 +450,9 @@ pub async fn create_webhook(
         ));
     }
     // Resolve the callback host only for an authorized caller.
-    let (callback_url, _) = validate_webhook_callback_url(&request.callback_url, egress).await?;
+    let (callback_url, _) = validate_webhook_callback_url(&request.callback_url, egress)
+        .await
+        .map_err(WebhookCallbackError::into_http_error)?;
 
     let active_count = tinycloud
         .count_active_hook_subscriptions(&normalized.space)
@@ -797,25 +799,46 @@ fn validate_webhook_shape(
     validate_webhook_url_shape(url)
 }
 
+/// Callback shape errors are terminal; temporary DNS/policy errors remain typed
+/// so delivery can retry without permitting a forbidden connection.
+#[derive(Debug, thiserror::Error)]
+pub enum WebhookCallbackError {
+    #[error("{0}")]
+    Invalid(String),
+    #[error("callbackUrl rejected: {0}")]
+    Destination(#[from] crate::egress::EgressError),
+}
+
+impl WebhookCallbackError {
+    /// Whether the callback may succeed once a temporary failure clears.
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, Self::Destination(error) if error.is_retryable())
+    }
+
+    /// Preserve the registration endpoint's existing bad-callback status.
+    pub fn into_http_error(self) -> (Status, String) {
+        (Status::BadRequest, self.to_string())
+    }
+}
+
 /// Validate a callback and resolve it once through the shared destination policy.
 /// Callers must authorize registration before invoking this bounded DNS lookup.
 pub async fn validate_webhook_callback_url(
     callback_url: &str,
     policy: &EgressPolicy,
-) -> Result<(reqwest::Url, VettedDestination), (Status, String)> {
-    validate_callback_length(callback_url)?;
+) -> Result<(reqwest::Url, VettedDestination), WebhookCallbackError> {
+    validate_callback_length(callback_url)
+        .map_err(|(_, message)| WebhookCallbackError::Invalid(message))?;
     let url = reqwest::Url::parse(callback_url)
-        .map_err(|e| (Status::BadRequest, format!("invalid callbackUrl: {e}")))?;
-    validate_callback_length(url.as_str())?;
-    validate_webhook_shape(&url, policy)?;
-    let destination = policy
-        .resolve_url(&url)
-        .await
-        .map_err(|error| (Status::BadRequest, format!("callbackUrl rejected: {error}")))?;
+        .map_err(|e| WebhookCallbackError::Invalid(format!("invalid callbackUrl: {e}")))?;
+    validate_callback_length(url.as_str())
+        .map_err(|(_, message)| WebhookCallbackError::Invalid(message))?;
+    validate_webhook_shape(&url, policy)
+        .map_err(|(_, message)| WebhookCallbackError::Invalid(message))?;
+    let destination = policy.resolve_url(&url).await?;
     #[cfg(test)]
     if url.scheme() == "http" && !destination.is_loopback() {
-        return Err((
-            Status::BadRequest,
+        return Err(WebhookCallbackError::Invalid(
             "test HTTP callback must resolve only to loopback".into(),
         ));
     }
@@ -1539,6 +1562,153 @@ mod tests {
                 .await
                 .is_err()
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tc1132_healthy_refresh_preserves_authorized_delivery() -> Result<()> {
+        use crate::egress::test_support::{callback_server, GatedLookup};
+        use std::sync::{atomic::Ordering, Arc};
+        use tinycloud_core::models::hook_delivery;
+        let mut callback = callback_server(200, None).await?;
+        let lookup = Arc::new(GatedLookup::default());
+        lookup.answers.set("db.test", &["192.2.1.1"]).await;
+        lookup.answers.set("callback.test", &["127.0.0.1"]).await;
+        let policy = Arc::new(
+            EgressPolicy::for_test(vec!["db.test".into()], lookup.clone(), true)
+                .with_test_root(callback.certificate.clone()),
+        );
+        policy.refresh().await?;
+        let fixture = hook_route_fixture_with_policy(
+            &[("hooks", "kv/documents", "tinycloud.hooks/register")],
+            policy.clone(),
+        )
+        .await?;
+        let (status, body) = tc1132_register_url(&fixture, &callback.url, "refresh-secret").await?;
+        assert_eq!(status, Status::Ok, "{body}");
+        let subscription: RegisteredWebhook = serde_json::from_str(&body)?;
+        tc1132_queue(&fixture, &subscription.id, "delivery_healthy_refresh").await?;
+        lookup.paused.store(true, Ordering::SeqCst);
+        let refresh = {
+            let policy = policy.clone();
+            tokio::spawn(async move { policy.refresh().await })
+        };
+        tokio::time::timeout(Duration::from_secs(1), lookup.started.notified()).await?;
+        let dispatcher = crate::webhook_dispatcher::WebhookDispatcher::new(
+            fixture.tinycloud.clone(),
+            HooksConfig::default(),
+            ColumnEncryption::new([3; 32]),
+            policy.clone(),
+        )?;
+        let mut dispatch = tokio::spawn(async move { dispatcher.dispatch_due_once().await });
+        let early = tokio::time::timeout(Duration::from_millis(100), &mut dispatch).await;
+        let pending = hook_delivery::Entity::find_by_id("delivery_healthy_refresh")
+            .one(&fixture.db)
+            .await?
+            .unwrap();
+        lookup.paused.store(false, Ordering::SeqCst);
+        lookup.release.add_permits(1);
+        refresh.await??;
+        if let Ok(result) = early {
+            result??;
+        } else {
+            dispatch.await??;
+        }
+        assert_eq!(
+            pending.status,
+            tinycloud_core::db::HOOK_DELIVERY_STATUS_PENDING
+        );
+        assert_eq!(pending.attempts, 0);
+        let (body, _) = tokio::time::timeout(Duration::from_secs(2), callback.requests.recv())
+            .await?
+            .unwrap();
+        assert_eq!(body, br#"{"id":"event_egress","key":"documents/note"}"#);
+        let delivered = hook_delivery::Entity::find_by_id("delivery_healthy_refresh")
+            .one(&fixture.db)
+            .await?
+            .unwrap();
+        assert_eq!(
+            delivered.status,
+            tinycloud_core::db::HOOK_DELIVERY_STATUS_DELIVERED
+        );
+        assert_eq!(delivered.attempts, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tc1132_temporary_policy_failure_retries_and_recovers_with_original_payload(
+    ) -> Result<()> {
+        use crate::egress::test_support::{callback_server, TestLookup};
+        use std::sync::Arc;
+        use tinycloud_core::{
+            models::hook_delivery,
+            sea_orm::{ActiveModelTrait, ActiveValue::Set, IntoActiveModel},
+        };
+        let mut callback = callback_server(200, None).await?;
+        let lookup = Arc::new(TestLookup::default());
+        lookup.set("db.test", &["192.2.1.1"]).await;
+        lookup.set("callback.test", &["127.0.0.1"]).await;
+        let policy = Arc::new(
+            EgressPolicy::for_test(vec!["db.test".into()], lookup.clone(), true)
+                .with_test_root(callback.certificate.clone()),
+        );
+        policy.refresh().await?;
+        let fixture = hook_route_fixture_with_policy(
+            &[("hooks", "kv/documents", "tinycloud.hooks/register")],
+            policy.clone(),
+        )
+        .await?;
+        let (status, body) =
+            tc1132_register_url(&fixture, &callback.url, "retry-policy-secret").await?;
+        assert_eq!(status, Status::Ok, "{body}");
+        let subscription: RegisteredWebhook = serde_json::from_str(&body)?;
+        tc1132_queue(&fixture, &subscription.id, "delivery_policy_retry").await?;
+        lookup.set("db.test", &[]).await;
+        assert!(policy.refresh().await.is_err());
+        let dispatcher = crate::webhook_dispatcher::WebhookDispatcher::new(
+            fixture.tinycloud.clone(),
+            HooksConfig::default(),
+            ColumnEncryption::new([3; 32]),
+            policy.clone(),
+        )?;
+        let before = OffsetDateTime::now_utc();
+        dispatcher.dispatch_due_once().await?;
+        let row = hook_delivery::Entity::find_by_id("delivery_policy_retry")
+            .one(&fixture.db)
+            .await?
+            .unwrap();
+        assert_eq!(
+            row.status,
+            tinycloud_core::db::HOOK_DELIVERY_STATUS_RETRYING
+        );
+        assert_eq!(row.attempts, 1);
+        let next = OffsetDateTime::parse(row.next_attempt_at.as_deref().unwrap(), &Rfc3339)?;
+        assert!((30..=32).contains(&(next - before).whole_seconds()));
+        assert!(
+            callback.requests.try_recv().is_err(),
+            "failed policy must emit no request"
+        );
+        lookup.set("db.test", &["192.2.1.1"]).await;
+        policy.refresh().await?;
+        let mut due = row.into_active_model();
+        due.next_attempt_at = Set(Some("2000-01-01T00:00:00Z".into()));
+        due.update(&fixture.db).await?;
+        dispatcher.dispatch_due_once().await?;
+        let (body, headers) =
+            tokio::time::timeout(Duration::from_secs(2), callback.requests.recv())
+                .await?
+                .unwrap();
+        assert_eq!(body, br#"{"id":"event_egress","key":"documents/note"}"#);
+        assert_eq!(headers["X-TinyCloud-Delivery-Id"], "delivery_policy_retry");
+        let row = hook_delivery::Entity::find_by_id("delivery_policy_retry")
+            .one(&fixture.db)
+            .await?
+            .unwrap();
+        assert_eq!(
+            row.status,
+            tinycloud_core::db::HOOK_DELIVERY_STATUS_DELIVERED
+        );
+        assert_eq!(row.attempts, 2);
         Ok(())
     }
 

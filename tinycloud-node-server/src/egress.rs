@@ -2,6 +2,7 @@
 use crate::{config::Config, BlockConfig};
 use reqwest::{
     dns::{Addrs, Resolve, Resolving},
+    header::{HeaderMap, HeaderName, HeaderValue, InvalidHeaderName, InvalidHeaderValue},
     redirect, Client, Url,
 };
 use std::{
@@ -11,13 +12,14 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    sync::{Mutex, RwLock},
+    sync::{Mutex, RwLock, RwLockReadGuard},
     time::Instant,
 };
 
 const DNS_TIMEOUT: Duration = Duration::from_secs(1);
 const REFRESH_INTERVAL: Duration = Duration::from_secs(600);
 
+/// Fail-closed destination and internal-endpoint resolution errors.
 #[derive(Debug, thiserror::Error)]
 pub enum EgressError {
     #[error("destination DNS lookup failed")]
@@ -30,6 +32,13 @@ pub enum EgressError {
     Unavailable,
     #[error("invalid configured internal endpoint")]
     InvalidEndpoint,
+}
+
+impl EgressError {
+    /// Temporary failures may be retried without permitting a network connection.
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, Self::Dns | Self::DnsTimeout | Self::Unavailable)
+    }
 }
 
 #[async_trait::async_trait]
@@ -128,8 +137,9 @@ impl EgressPolicy {
     }
 
     async fn refresh_locked(&self) -> Result<(), EgressError> {
-        // Close the gate during refresh, including when the previous set is still fresh.
-        self.deny.write().await.healthy = false;
+        // Exclusive state access closes egress while DNS is in progress. Keep
+        // the prior state intact until completion so cancellation is harmless.
+        let mut deny = self.deny.write().await;
         let results = futures::future::join_all(
             self.internal_hosts
                 .iter()
@@ -151,35 +161,69 @@ impl EgressPolicy {
                 _ => success = false,
             }
         }
-        let mut deny = self.deny.write().await;
         deny.refreshed = Some(Instant::now());
         if success {
             deny.addresses = Arc::new(addresses);
             deny.healthy = true;
             Ok(())
         } else {
+            deny.healthy = false;
             Err(EgressError::Unavailable)
         }
+    }
+
+    fn stale(&self, deny: &DenySet) -> bool {
+        !self.internal_hosts.is_empty()
+            && deny
+                .refreshed
+                .is_none_or(|at| at.elapsed() >= REFRESH_INTERVAL)
+    }
+
+    async fn read_state(&self) -> Result<RwLockReadGuard<'_, DenySet>, EgressError> {
+        tokio::time::timeout(DNS_TIMEOUT, self.deny.read())
+            .await
+            .map_err(|_| EgressError::Unavailable)
     }
 
     async fn ensure_fresh(&self) -> Result<(), EgressError> {
         if self.internal_hosts.is_empty() {
             return Ok(());
         }
-        let stale = |deny: &DenySet| {
-            deny.refreshed
-                .is_none_or(|at| at.elapsed() >= REFRESH_INTERVAL)
+        let stale = {
+            let state = self.read_state().await?;
+            self.stale(&state)
         };
-        if stale(&*self.deny.read().await) {
-            let _guard = self.refresh_lock.lock().await;
-            if stale(&*self.deny.read().await) {
+        if stale {
+            let _guard = tokio::time::timeout(DNS_TIMEOUT, self.refresh_lock.lock())
+                .await
+                .map_err(|_| EgressError::Unavailable)?;
+            let stale = {
+                let state = self.read_state().await?;
+                self.stale(&state)
+            };
+            if stale {
                 self.refresh_locked().await?;
             }
         }
-        if !self.deny.read().await.healthy {
+        if !self.read_state().await?.healthy {
             return Err(EgressError::Unavailable);
         }
         Ok(())
+    }
+
+    async fn send_lease(&self) -> Result<RwLockReadGuard<'_, DenySet>, EgressError> {
+        loop {
+            self.ensure_fresh().await?;
+            let lease = self.read_state().await?;
+            if !lease.healthy {
+                return Err(EgressError::Unavailable);
+            }
+            if !self.stale(&lease) {
+                return Ok(lease);
+            }
+            // A refresh may have completed, failed or expired between checks.
+            drop(lease);
+        }
     }
 
     fn permits_ip(&self, ip: IpAddr, denied: &HashSet<IpAddr>) -> bool {
@@ -197,11 +241,7 @@ impl EgressPolicy {
         ips: impl Iterator<Item = IpAddr>,
         port: u16,
     ) -> Result<Vec<SocketAddr>, EgressError> {
-        self.ensure_fresh().await?;
-        let deny = self.deny.read().await;
-        if !deny.healthy {
-            return Err(EgressError::Unavailable);
-        }
+        let deny = self.send_lease().await?;
         let mut addresses = Vec::new();
         for ip in ips {
             let address = SocketAddr::new(ip, port);
@@ -229,7 +269,7 @@ impl EgressPolicy {
             self.permitted(ips.into_iter(), port).await?
         };
         Ok(VettedDestination {
-            host: host.to_owned(),
+            url: url.clone(),
             addresses: addresses.into(),
         })
     }
@@ -357,11 +397,16 @@ fn embedded_v4(ip: IpAddr) -> impl Iterator<Item = Ipv4Addr> {
 
 /// A single lookup's vetted addresses. No caller can insert unvetted addresses.
 pub struct VettedDestination {
-    host: String,
+    url: Url,
     addresses: Arc<[SocketAddr]>,
 }
 
 impl VettedDestination {
+    /// The immutable URL whose addresses were vetted by this lookup.
+    pub fn url(&self) -> &Url {
+        &self.url
+    }
+
     #[cfg(test)]
     pub(crate) fn is_loopback(&self) -> bool {
         self.addresses
@@ -370,34 +415,27 @@ impl VettedDestination {
     }
 }
 
-/// Reqwest resolver returning only the checked lookup, never resolving twice.
-/// Re-checks the shared deny-set immediately before handing addresses to hyper.
-pub struct PolicyResolver {
+/// Resolver for the sealed sender's lease-bound address snapshot. It never
+/// performs a second DNS lookup or reacquires the policy lock.
+struct PolicyResolver {
+    host: String,
+    addresses: Arc<[SocketAddr]>,
     policy: Arc<EgressPolicy>,
-    destination: VettedDestination,
+    denied: Arc<HashSet<IpAddr>>,
 }
 
 impl Resolve for PolicyResolver {
     fn resolve(&self, name: hyper::client::connect::dns::Name) -> Resolving {
         let policy = self.policy.clone();
-        let addresses = self.destination.addresses.clone();
-        let matches = name.as_str() == self.destination.host;
+        let addresses = self.addresses.clone();
+        let denied = self.denied.clone();
+        let matches = name.as_str() == self.host;
         Box::pin(async move {
             if !matches {
                 return Err(
                     Box::new(EgressError::Forbidden) as Box<dyn std::error::Error + Send + Sync>
                 );
             }
-            policy.ensure_fresh().await?;
-            let denied = {
-                let deny = policy.deny.read().await;
-                if !deny.healthy {
-                    return Err(Box::new(EgressError::Unavailable)
-                        as Box<dyn std::error::Error + Send + Sync>);
-                }
-                deny.addresses.clone()
-            };
-            // Keep the lookup's owned address set; filtering needs no second Vec or DNS.
             let mut vetted = (0..addresses.len())
                 .map(move |index| addresses[index])
                 .filter(move |address| policy.permits_ip(address.ip(), &denied));
@@ -407,39 +445,149 @@ impl Resolve for PolicyResolver {
     }
 }
 
-/// Hardened per-attempt client: no proxy, redirects or second DNS lookup.
-/// A fresh client prevents pooled sockets from surviving policy/DNS changes.
-pub fn client(
+/// A failed sealed send retains the destination/transport distinction.
+#[derive(Debug, thiserror::Error)]
+pub enum SendError {
+    #[error(transparent)]
+    Policy(#[from] EgressError),
+    #[error(transparent)]
+    Transport(#[from] reqwest::Error),
+    #[error("invalid request header name: {0}")]
+    HeaderName(#[from] InvalidHeaderName),
+    #[error("invalid request header value: {0}")]
+    HeaderValue(#[from] InvalidHeaderValue),
+    #[error("outbound request timed out")]
+    Timeout,
+}
+
+impl SendError {
+    /// Only a proven forbidden destination is a terminal policy rejection.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::Policy(error) => error.is_retryable(),
+            _ => true,
+        }
+    }
+}
+
+/// A target-bound POST request. No raw client, URL setter, redirect policy or
+/// proxy override is exposed; even literal hosts are rechecked at `send`.
+pub struct EgressRequest {
     policy: Arc<EgressPolicy>,
     destination: VettedDestination,
     timeout: Duration,
-) -> Result<Client, reqwest::Error> {
-    #[cfg(not(test))]
-    let https_only = true;
-    #[cfg(test)]
-    let https_only = !(policy.allow_loopback
-        && destination
+    headers: HeaderMap,
+    body: Option<reqwest::Body>,
+    error: Option<SendError>,
+}
+
+/// Prepare a POST to exactly the URL carried by the vetted destination.
+/// The actual connection is permitted only under a fresh, healthy read lease.
+pub fn post(
+    policy: Arc<EgressPolicy>,
+    destination: VettedDestination,
+    timeout: Duration,
+) -> EgressRequest {
+    EgressRequest {
+        policy,
+        destination,
+        timeout,
+        headers: HeaderMap::new(),
+        body: None,
+        error: None,
+    }
+}
+
+impl EgressRequest {
+    /// Set a header without exposing or changing the target URL.
+    pub fn header(mut self, name: &'static str, value: impl AsRef<str>) -> Self {
+        if self.error.is_none() {
+            match HeaderName::from_bytes(name.as_bytes()) {
+                Ok(name) => match HeaderValue::from_str(value.as_ref()) {
+                    Ok(value) => {
+                        self.headers.insert(name, value);
+                    }
+                    Err(error) => self.error = Some(error.into()),
+                },
+                Err(error) => self.error = Some(error.into()),
+            }
+        }
+        self
+    }
+
+    /// Move the original body bytes into the request.
+    pub fn body(mut self, body: impl Into<reqwest::Body>) -> Self {
+        if self.error.is_none() {
+            self.body = Some(body.into());
+        }
+        self
+    }
+
+    /// Recheck the bound destination and keep refresh from invalidating it
+    /// until the connection/request completes. Cancellation releases the lease.
+    pub async fn send(self) -> Result<reqwest::Response, SendError> {
+        let timeout = self.timeout;
+        let started = Instant::now();
+        tokio::time::timeout(timeout, self.send_under_lease(started))
+            .await
+            .map_err(|_| SendError::Timeout)?
+    }
+
+    async fn send_under_lease(self, started: Instant) -> Result<reqwest::Response, SendError> {
+        if let Some(error) = self.error {
+            return Err(error);
+        }
+        let lease = self.policy.send_lease().await?;
+        if !self
+            .destination
             .addresses
             .iter()
-            .all(|address| address.ip().is_loopback()));
-    let builder = Client::builder()
-        .no_proxy()
-        .https_only(https_only)
-        .redirect(redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(2))
-        .timeout(timeout);
-    #[cfg(test)]
-    let builder = policy
-        .roots
-        .iter()
-        .cloned()
-        .fold(builder, |builder, root| builder.add_root_certificate(root));
-    builder
-        .dns_resolver(Arc::new(PolicyResolver {
-            policy,
-            destination,
-        }))
-        .build()
+            .any(|address| self.policy.permits_ip(address.ip(), &lease.addresses))
+        {
+            return Err(EgressError::Forbidden.into());
+        }
+        let host = self
+            .destination
+            .url
+            .host_str()
+            .ok_or(EgressError::Forbidden)?
+            .to_owned();
+        #[cfg(not(test))]
+        let https_only = true;
+        #[cfg(test)]
+        let https_only = !(self.policy.allow_loopback && self.destination.is_loopback());
+        let builder = Client::builder()
+            .no_proxy()
+            .https_only(https_only)
+            .redirect(redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(self.timeout);
+        #[cfg(test)]
+        let builder = self
+            .policy
+            .roots
+            .iter()
+            .cloned()
+            .fold(builder, |builder, root| builder.add_root_certificate(root));
+        let client = builder
+            .dns_resolver(Arc::new(PolicyResolver {
+                host,
+                addresses: self.destination.addresses,
+                policy: self.policy.clone(),
+                denied: lease.addresses.clone(),
+            }))
+            .build()?;
+        let mut request = client.post(self.destination.url).headers(self.headers);
+        if let Some(body) = self.body {
+            request = request.body(body);
+        }
+        let result = request
+            .timeout(self.timeout.saturating_sub(started.elapsed()))
+            .send()
+            .await;
+        drop(lease);
+        result.map_err(SendError::Transport)
+    }
 }
 
 /// Refresh the service deny-set every ten minutes and stop with Rocket.

@@ -137,29 +137,30 @@ impl WebhookDispatcher {
         };
         let signature = sign_payload(&secret, delivery.payload_json.as_bytes())?;
 
-        let url = crate::routes::hooks::validate_webhook_callback_url(
+        let destination = match crate::routes::hooks::validate_webhook_callback_url(
             &delivery.callback_url,
             &self.egress,
         )
         .await
-        .map_err(|(_, message)| anyhow::anyhow!(message));
-        let (url, destination) = match url {
-            Ok(destination) => destination,
+        {
+            Ok((_, destination)) => destination,
             Err(error) => {
-                self.record_terminal_failure(
-                    delivery.id,
-                    current_attempt,
-                    &format!("callback URL rejected: {error}"),
-                )
-                .await?;
+                if error.is_retryable() {
+                    self.record_retryable_failure(delivery.id, current_attempt, error.to_string())
+                        .await?;
+                } else {
+                    self.record_terminal_failure(
+                        delivery.id,
+                        current_attempt,
+                        &format!("callback URL rejected: {error}"),
+                    )
+                    .await?;
+                }
                 return Ok(());
             }
         };
-        let client = egress::client(self.egress.clone(), destination, self.timeout)
-            .context("building webhook client")?;
 
-        match client
-            .post(url)
+        match egress::post(self.egress.clone(), destination, self.timeout)
             .header("Content-Type", "application/json")
             .header("X-TinyCloud-Delivery-Id", &delivery.id)
             .header("X-TinyCloud-Event-Id", &delivery.event_id)
@@ -184,8 +185,17 @@ impl WebhookDispatcher {
                 .await?;
             }
             Err(error) => {
-                self.record_retryable_failure(delivery.id, current_attempt, error.to_string())
+                if error.is_retryable() {
+                    self.record_retryable_failure(delivery.id, current_attempt, error.to_string())
+                        .await?;
+                } else {
+                    self.record_terminal_failure(
+                        delivery.id,
+                        current_attempt,
+                        &format!("callback URL rejected: {error}"),
+                    )
                     .await?;
+                }
             }
         }
 

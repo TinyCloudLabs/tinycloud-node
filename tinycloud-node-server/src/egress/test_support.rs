@@ -46,6 +46,39 @@ impl LookupHost for TestLookup {
     }
 }
 
+pub(crate) struct GatedLookup {
+    pub answers: TestLookup,
+    pub started: tokio::sync::Notify,
+    pub release: tokio::sync::Semaphore,
+    pub paused: std::sync::atomic::AtomicBool,
+}
+
+impl Default for GatedLookup {
+    fn default() -> Self {
+        Self {
+            answers: TestLookup::default(),
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+            paused: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl LookupHost for GatedLookup {
+    async fn lookup(&self, host: &str) -> Result<Vec<IpAddr>, EgressError> {
+        if host == "db.test" && self.paused.load(Ordering::SeqCst) {
+            self.started.notify_one();
+            self.release
+                .acquire()
+                .await
+                .map_err(|_| EgressError::Dns)?
+                .forget();
+        }
+        self.answers.lookup(host).await
+    }
+}
+
 pub(crate) struct CallbackServer {
     pub url: String,
     pub certificate: reqwest::Certificate,
@@ -63,10 +96,18 @@ pub(crate) async fn callback_server(
     status: u16,
     location: Option<String>,
 ) -> anyhow::Result<CallbackServer> {
+    callback_server_for_host("callback.test", status, location).await
+}
+
+pub(crate) async fn callback_server_for_host(
+    host: &str,
+    status: u16,
+    location: Option<String>,
+) -> anyhow::Result<CallbackServer> {
     use hyper::{service::service_fn, Body, Request, Response};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
-    let generated = rcgen::generate_simple_self_signed(vec!["callback.test".to_owned()])?;
+    let generated = rcgen::generate_simple_self_signed(vec![host.to_owned()])?;
     let certificate = reqwest::Certificate::from_pem(generated.cert.pem().as_bytes())?;
     let key = rustls::pki_types::PrivatePkcs8KeyDer::from(generated.key_pair.serialize_der());
     let tls = rustls::ServerConfig::builder()
@@ -104,7 +145,7 @@ pub(crate) async fn callback_server(
         }
     });
     Ok(CallbackServer {
-        url: format!("https://callback.test:{}/hooks", address.port()),
+        url: format!("https://{host}:{}/hooks", address.port()),
         certificate,
         requests,
         task,
