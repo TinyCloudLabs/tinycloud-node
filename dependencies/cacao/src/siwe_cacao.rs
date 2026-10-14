@@ -25,6 +25,9 @@ pub struct Payload {
     pub scheme: Option<Scheme>,
     #[serde_as(as = "DisplayFromStr")]
     pub domain: Authority,
+    /// Serialized as the verifier's parsed chain ID and EIP-55 address.
+    /// This changes only the DID representation, never the signed SIWE text.
+    #[serde(serialize_with = "serialize_issuer")]
     pub iss: UriAbsoluteString,
     pub statement: Option<String>,
     pub aud: UriString,
@@ -119,15 +122,40 @@ pub enum SIWEPayloadConversionError {
     InvalidDID,
 }
 
+fn parse_issuer(issuer: &str) -> Result<(u64, [u8; 20]), SIWEPayloadConversionError> {
+    let mut parts = issuer.split(':');
+    match [
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ] {
+        [Some("did"), Some("pkh"), Some("eip155"), Some(chain), Some(address), None]
+            if address.starts_with("0x") =>
+        {
+            Ok((chain.parse()?, FromHex::from_hex(&address[2..])?))
+        }
+        _ => Err(SIWEPayloadConversionError::InvalidDID),
+    }
+}
+
+fn serialize_issuer<S>(issuer: &UriAbsoluteString, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    let (chain, address) = parse_issuer(issuer.as_str()).map_err(serde::ser::Error::custom)?;
+    serializer.collect_str(&format_args!(
+        "did:pkh:eip155:{chain}:0x{}",
+        encode_eip55(&address)
+    ))
+}
+
 impl TryInto<Message> for Payload {
     type Error = SIWEPayloadConversionError;
     fn try_into(self) -> Result<Message, Self::Error> {
-        let (chain_id, address) = match &self.iss.as_str().split(':').collect::<Vec<&str>>()[..] {
-            &["did", "pkh", "eip155", c, h] if h.get(..2) == Some("0x") => {
-                (c.parse()?, FromHex::from_hex(&h[2..])?)
-            }
-            _ => return Err(Self::Error::InvalidDID),
-        };
+        let (chain_id, address) = parse_issuer(self.iss.as_str())?;
         Ok(Message {
             scheme: self.scheme,
             domain: self.domain,
