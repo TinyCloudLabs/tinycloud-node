@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+## [1.20.5] - 2026-10-14
+
+A reliability hotfix (TC-1054). A PostgreSQL connection that dies silently (failover, a NAT or proxy idle drop, a network black hole) can no longer hang a request, or the per-database SQL operation lock it holds, for minutes (#283).
+
+- Every pool connection now sets TCP keepalive and `TCP_USER_TIMEOUT` on its own socket as it connects, so a dead connection errors in about 30 s instead of about 15 min. This is done in a vendored crates.io sqlx-core 0.8.6 (the pristine copy plus one small patch commit); setting the options fails the connect rather than silently skipping them.
+- A session `statement_timeout` (30 s) bounds slow statements on live connections.
+- These failures are classified for clients: `503 unavailable_retryable` with `Retry-After` when no write can have taken effect, `500 outcome_unknown` when one may have committed. The per-database lock is released on every one of these paths.
+- `GET /info` reports `postgres: { sockets_configured, connections_opened }` so a deploy can confirm the socket options are applied.
+
 ## [1.20.4] - 2026-10-13
 
 A performance release. The node spends fewer Postgres round trips per request: the pool no longer pings a connection before every statement (#276), and resolve, the read audit and the KV sequence lock each take fewer statements (#277). In the TC-946 lab at a prod-like 65 ms database RTT, an owner SQL `SELECT 1` drops from 3.8 s to 1.25 s, a KV get from 1.77 s to 0.73 s, and an SDK sign-in with a fresh key from 26.8 s to 18.2 s. A connection lost while idle is now recovered by a one-time retry of `BEGIN` and pure reads plus revalidation, not by a ping on every acquire; see the first entry for what can still fail. New metric `tinycloud_db_connection_events_total`. No schema change, so rolling back to 1.20.3 is DB-safe (TC-951).

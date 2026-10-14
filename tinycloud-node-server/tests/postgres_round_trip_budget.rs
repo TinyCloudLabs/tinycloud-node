@@ -402,7 +402,50 @@ impl FrontendParser {
 /// Listens on an ephemeral loopback port and relays every connection to
 /// `upstream`. Client bytes are parsed before they are forwarded, so a reply
 /// from PostgreSQL implies the request that caused it is already logged.
-async fn start_proxy(upstream: (String, u16), wire: Wire) -> Result<SocketAddr> {
+/// Cut the connection that forwards every one of `markers`, in order (TC-1054
+/// route tests): the server receives the last one, the node never sees a
+/// reply to it, and the connection is reset. Armed for `times` connections.
+#[derive(Clone, Default)]
+struct Cut(Arc<Mutex<Armed>>);
+
+/// The markers still to match, in order, and how many connections to cut.
+type Armed = Option<(Vec<Vec<u8>>, usize)>;
+
+impl Cut {
+    fn arm(&self, markers: &[&[u8]], times: usize) {
+        *self.0.lock().unwrap() = Some((markers.iter().map(|m| m.to_vec()).collect(), times));
+    }
+
+    fn armed(&self) -> bool {
+        self.0.lock().unwrap().is_some()
+    }
+
+    /// Advance a connection's `progress` through the armed markers over
+    /// `bytes`; whether the connection must now be cut.
+    fn observe(&self, progress: &mut usize, bytes: &[u8]) -> bool {
+        let mut armed = self.0.lock().unwrap();
+        let Some((markers, times)) = armed.as_mut() else {
+            *progress = 0;
+            return false;
+        };
+        while let Some(marker) = markers.get(*progress) {
+            if !bytes.windows(marker.len()).any(|w| w == marker.as_slice()) {
+                break;
+            }
+            *progress += 1;
+        }
+        if *progress < markers.len() {
+            return false;
+        }
+        *times -= 1;
+        if *times == 0 {
+            *armed = None;
+        }
+        true
+    }
+}
+
+async fn start_proxy(upstream: (String, u16), wire: Wire, cut: Cut) -> Result<SocketAddr> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     tokio::spawn(async move {
@@ -412,19 +455,35 @@ async fn start_proxy(upstream: (String, u16), wire: Wire) -> Result<SocketAddr> 
             let connection = next_connection;
             let upstream = upstream.clone();
             let wire = wire.clone();
+            let cut = cut.clone();
             tokio::spawn(async move {
                 let Ok(server) = TcpStream::connect((upstream.0.as_str(), upstream.1)).await else {
                     return;
                 };
                 let _ = client.set_nodelay(true);
                 let _ = server.set_nodelay(true);
+                // A cut connection is reset, not closed.
+                #[allow(deprecated)]
+                let _ = client.set_linger(Some(Duration::ZERO));
                 let (mut client_read, mut client_write) = client.into_split();
                 let (mut server_read, mut server_write) = server.into_split();
-                let backend = tokio::spawn(async move {
-                    let _ = tokio::io::copy(&mut server_read, &mut client_write).await;
-                    let _ = client_write.shutdown().await;
-                });
+                let severed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let backend = {
+                    let severed = severed.clone();
+                    tokio::spawn(async move {
+                        let mut buf = vec![0; 16 * 1024];
+                        while let Ok(n @ 1..) = server_read.read(&mut buf).await {
+                            if severed.load(std::sync::atomic::Ordering::SeqCst)
+                                || client_write.write_all(&buf[..n]).await.is_err()
+                            {
+                                return;
+                            }
+                        }
+                        let _ = client_write.shutdown().await;
+                    })
+                };
                 let mut parser = FrontendParser::new(wire, connection);
+                let mut progress = 0;
                 let mut buf = vec![0; 16 * 1024];
                 loop {
                     let n = match client_read.read(&mut buf).await {
@@ -432,8 +491,19 @@ async fn start_proxy(upstream: (String, u16), wire: Wire) -> Result<SocketAddr> 
                         Ok(n) => n,
                     };
                     parser.feed(&buf[..n]);
+                    let sever = cut.observe(&mut progress, &buf[..n]);
+                    if sever {
+                        // Before forwarding: no reply may reach the node.
+                        severed.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
                     if server_write.write_all(&buf[..n]).await.is_err() {
                         break;
+                    }
+                    if sever {
+                        // Let the server act on it (commit), then reset.
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        backend.abort();
+                        return;
                     }
                 }
                 let _ = server_write.shutdown().await;
@@ -840,9 +910,10 @@ fn upstream(url: &str) -> Result<(String, u16)> {
     Ok((host, url.port().unwrap_or(5432)))
 }
 
-async fn run(url: &str, schema: &str) -> Result<Vec<Measured>> {
+/// The real node, its pool behind the test proxy (with `cut`), on `schema`.
+async fn start_node(url: &str, schema: &str, cut: Cut) -> Result<(Node, tempfile::TempDir)> {
     let wire = Wire::default();
-    let proxy = start_proxy(upstream(url)?, wire.clone()).await?;
+    let proxy = start_proxy(upstream(url)?, wire.clone(), cut).await?;
     let datadir = tempfile::TempDir::new()?;
     let overlay = format!(
         r#"
@@ -867,6 +938,11 @@ secret = "{}"
             .await?,
         wire,
     };
+    Ok((node, datadir))
+}
+
+async fn run(url: &str, schema: &str) -> Result<Vec<Measured>> {
+    let (node, _datadir) = start_node(url, schema, Cut::default()).await?;
 
     let result = async {
         let mut warm_up = Vec::new();
@@ -962,4 +1038,361 @@ async fn postgres_round_trip_budget() {
         "PostgreSQL round-trip budget exceeded (TC-951):\n  {}\n\n{report}",
         violations.join("\n  ")
     );
+}
+
+/// A signed session for `account`, with the same abilities the SDK asks for.
+fn new_session(account: &Account) -> Result<Session> {
+    let now = time::OffsetDateTime::now_utc();
+    let prepared = prepare_session(SessionConfig {
+        abilities: HashMap::from([(
+            "kv".parse()?,
+            HashMap::from([(
+                "".parse()?,
+                ["get", "put", "del", "list", "metadata"]
+                    .into_iter()
+                    .map(|action| format!("tinycloud.kv/{action}").parse())
+                    .collect::<Result<_, _>>()?,
+            )]),
+        )]),
+        space_abilities: None,
+        raw_abilities: HashMap::new(),
+        address: account.address,
+        chain_id: 1,
+        domain: "localhost".parse()?,
+        issued_at: now.into(),
+        space_id: account.space.clone(),
+        additional_spaces: None,
+        not_before: None,
+        expiration_time: (now + time::Duration::hours(1)).into(),
+        parents: None,
+        jwk: None,
+        delegate_uri: None,
+        nonce: None,
+        invocation_ttl_secs: None,
+    })?;
+    let signature = account.sign(&prepared.siwe)?;
+    Ok(complete_session_setup(SignedSession {
+        session: prepared,
+        signature,
+    })?)
+}
+
+/// Status, body and `Retry-After` of a dispatched request.
+async fn dispatch(request: LocalRequest<'_>) -> (Status, String, Option<String>) {
+    let response = request.dispatch().await;
+    let status = response.status();
+    let retry_after = response.headers().get_one("Retry-After").map(str::to_owned);
+    let body = response.into_string().await.unwrap_or_default();
+    (status, body, retry_after)
+}
+
+/// Create `account`'s space and register a session for it.
+async fn sign_in(node: &Node, account: &Account) -> Result<Session> {
+    let client = &node.client;
+    let (status, peer, _) = dispatch(client.get(format!("/peer/generate/{}", account.space))).await;
+    ensure!(status == Status::Ok, "peer: {status} {peer}");
+    let host = generate_host_siwe_message(HostConfig {
+        address: account.address,
+        chain_id: 1,
+        domain: "localhost".parse()?,
+        issued_at: time::OffsetDateTime::now_utc().into(),
+        space_id: account.space.clone(),
+        peer_id: peer,
+    })?;
+    let signature = account.sign(&host)?;
+    let host = authorization(&siwe_to_delegation_headers(SignedMessage {
+        siwe: host,
+        signature,
+    }))?;
+    let (status, body, _) = dispatch(
+        client
+            .post("/delegate")
+            .header(Header::new("Authorization", host)),
+    )
+    .await;
+    ensure!(status == Status::Ok, "host delegate: {status} {body}");
+    let session = new_session(account)?;
+    let (status, body, _) = dispatch(client.post("/delegate").header(Header::new(
+        "Authorization",
+        authorization(&session.delegation_header)?,
+    )))
+    .await;
+    ensure!(status == Status::Ok, "session delegate: {status} {body}");
+    Ok(session)
+}
+
+async fn kv_put(
+    node: &Node,
+    session: &Session,
+    key: &str,
+) -> Result<(Status, String, Option<String>)> {
+    Ok(dispatch(
+        node.client
+            .post("/invoke")
+            .header(Header::new(
+                "Authorization",
+                invocation(session, "kv", key, "tinycloud.kv/put")?,
+            ))
+            .header(ContentType::JSON)
+            .body(KV_VALUE),
+    )
+    .await)
+}
+
+/// TC-1054 (Opus R5, R6): the KV put and delegate routes report a database
+/// failure before any write as `503 unavailable_retryable` with
+/// `Retry-After`, and one after the `COMMIT` was sent as `500
+/// outcome_unknown` without it, through the real node and its pool. The
+/// proxy cuts a connection: both `BEGIN` attempts (the one retry
+/// included), or a `COMMIT` that the server receives and commits but whose
+/// reply never arrives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_write_routes_tell_retryable_failures_from_unknown_outcomes() {
+    let Some(url) =
+        postgres_test_url("postgres_write_routes_tell_retryable_failures_from_unknown_outcomes")
+    else {
+        return;
+    };
+    let admin = Database::connect(url.as_str())
+        .await
+        .expect("connect to PostgreSQL");
+    let schema = format!(
+        "tc1054_routes_{}_{}",
+        std::process::id(),
+        time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+    );
+    admin
+        .execute(Statement::from_string(
+            DbBackend::Postgres,
+            format!("CREATE SCHEMA {schema}"),
+        ))
+        .await
+        .expect("create the isolated schema");
+    let cut = Cut::default();
+    let (node, _datadir) = start_node(&url, &schema, cut.clone())
+        .await
+        .expect("start the node");
+
+    let result = async {
+        let account = Account::new(42)?;
+        let session = sign_in(&node, &account).await?;
+        let (status, body, _) = kv_put(&node, &session, "tc1054/warm").await?;
+        ensure!(status == Status::Ok, "warm-up put: {status} {body}");
+
+        // KV put: no connection survives BEGIN, so nothing was written.
+        node.settle().await?;
+        cut.arm(&[b"BEGIN"], 2);
+        let (status, body, retry_after) = kv_put(&node, &session, "tc1054/retryable").await?;
+        ensure!(!cut.armed(), "both BEGIN attempts were cut");
+        ensure!(
+            status == Status::ServiceUnavailable && body.starts_with("unavailable_retryable:"),
+            "kv put before any write: {status} {body}"
+        );
+        ensure!(
+            retry_after.as_deref() == Some("1"),
+            "Retry-After: {retry_after:?}"
+        );
+        let (status, body, _) = kv_put(&node, &session, "tc1054/retryable").await?;
+        ensure!(
+            status == Status::Ok,
+            "a fresh put after a retryable failure: {status} {body}"
+        );
+
+        // KV put: the COMMIT reached the server, its reply did not.
+        node.settle().await?;
+        cut.arm(&[b"tc1054/unknown", b"COMMIT"], 1);
+        let (status, body, retry_after) = kv_put(&node, &session, "tc1054/unknown").await?;
+        ensure!(!cut.armed(), "the put's COMMIT was cut");
+        ensure!(
+            status == Status::InternalServerError && body.starts_with("outcome_unknown:"),
+            "kv put after its COMMIT was sent: {status} {body}"
+        );
+        ensure!(
+            retry_after.is_none(),
+            "no Retry-After on outcome_unknown: {retry_after:?}"
+        );
+        node.settle().await?;
+        let (status, read, _) = dispatch(node.client.post("/invoke").header(Header::new(
+            "Authorization",
+            invocation(&session, "kv", "tc1054/unknown", "tinycloud.kv/get")?,
+        )))
+        .await;
+        ensure!(
+            status == Status::Ok && read.as_bytes() == KV_VALUE,
+            "reading back finds the committed put: {status} {read}"
+        );
+
+        // Delegation: no connection survives BEGIN.
+        let retryable = authorization(&new_session(&account)?.delegation_header)?;
+        node.settle().await?;
+        cut.arm(&[b"BEGIN"], 2);
+        let (status, body, retry_after) = dispatch(
+            node.client
+                .post("/delegate")
+                .header(Header::new("Authorization", retryable)),
+        )
+        .await;
+        ensure!(!cut.armed(), "both BEGIN attempts were cut");
+        ensure!(
+            status == Status::ServiceUnavailable && body.starts_with("unavailable_retryable:"),
+            "delegate before any write: {status} {body}"
+        );
+        ensure!(
+            retry_after.as_deref() == Some("1"),
+            "Retry-After: {retry_after:?}"
+        );
+
+        // Delegation: the COMMIT reached the server, its reply did not. The
+        // identical delegation is idempotent, and re-sending it succeeds.
+        let unknown_session = new_session(&account)?;
+        let unknown = authorization(&unknown_session.delegation_header)?;
+        // The delegatee (the session key's DID) is written by the
+        // delegation's own transaction; its COMMIT follows.
+        let delegatee = unknown_session
+            .verification_method
+            .split('#')
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        node.settle().await?;
+        cut.arm(&[delegatee.as_bytes(), b"COMMIT"], 1);
+        let (status, body, retry_after) = dispatch(
+            node.client
+                .post("/delegate")
+                .header(Header::new("Authorization", unknown.clone())),
+        )
+        .await;
+        ensure!(!cut.armed(), "the delegation's COMMIT was cut");
+        ensure!(
+            status == Status::InternalServerError && body.starts_with("outcome_unknown:"),
+            "delegate after its COMMIT was sent: {status} {body}"
+        );
+        ensure!(
+            retry_after.is_none(),
+            "no Retry-After on outcome_unknown: {retry_after:?}"
+        );
+        node.settle().await?;
+        let (status, body, _) = dispatch(
+            node.client
+                .post("/delegate")
+                .header(Header::new("Authorization", unknown)),
+        )
+        .await;
+        ensure!(
+            status == Status::Ok,
+            "re-sending the committed delegation: {status} {body}"
+        );
+        Ok(())
+    }
+    .await;
+    node.pool().close().await;
+    admin
+        .execute(Statement::from_string(
+            DbBackend::Postgres,
+            format!("DROP SCHEMA {schema} CASCADE"),
+        ))
+        .await
+        .expect("drop the isolated schema");
+    result.expect("route outcomes");
+}
+
+/// The `postgres` object of `/info`: exactly the two counters.
+async fn postgres_info(node: &Node) -> Result<(u64, u64)> {
+    let (status, body, _) = dispatch(node.client.get("/info")).await;
+    ensure!(status == Status::Ok, "/info: {status} {body}");
+    let info: serde_json::Value = serde_json::from_str(&body)?;
+    let postgres = info["postgres"]
+        .as_object()
+        .with_context(|| format!("/info has a postgres object: {info}"))?;
+    let mut keys: Vec<&str> = postgres.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    ensure!(
+        keys == ["connections_opened", "sockets_configured"],
+        "counts only: {postgres:?}"
+    );
+    // TC-1080 + TC-1054: both public evidence objects survive the merge.
+    let did_resolution = info["did_resolution"]
+        .as_object()
+        .context("/info has a did_resolution object")?;
+    ensure!(did_resolution.len() == 2, "boolean and count only");
+    ensure!(did_resolution["network_methods"] == false, "default policy");
+    ensure!(
+        did_resolution["refused_total"].as_u64().is_some(),
+        "refusal count"
+    );
+    println!(
+        "TC-1080/TC-1054 /info evidence: {}",
+        serde_json::json!({"postgres": postgres, "did_resolution": did_resolution})
+    );
+    let count = |key: &str| {
+        postgres[key]
+            .as_u64()
+            .with_context(|| format!("{key} is a count"))
+    };
+    Ok((count("sockets_configured")?, count("connections_opened")?))
+}
+
+/// TC-1054: with logs private, the deploy checks keepalive through the
+/// public `/info`: `postgres.sockets_configured >= connections_opened > 0`,
+/// and both move when the pool opens connections.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_info_reports_connection_counters() {
+    let Some(url) = postgres_test_url("postgres_info_reports_connection_counters") else {
+        return;
+    };
+    let admin = Database::connect(url.as_str())
+        .await
+        .expect("connect to PostgreSQL");
+    let schema = format!(
+        "tc1054_info_{}_{}",
+        std::process::id(),
+        time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+    );
+    admin
+        .execute(Statement::from_string(
+            DbBackend::Postgres,
+            format!("CREATE SCHEMA {schema}"),
+        ))
+        .await
+        .expect("create the isolated schema");
+    let (node, _datadir) = start_node(&url, &schema, Cut::default())
+        .await
+        .expect("start the node");
+
+    let result = async {
+        let (sockets, opened) = postgres_info(&node).await?;
+        ensure!(opened > 0, "the pool connected at startup: {opened}");
+        ensure!(
+            sockets >= opened,
+            "{sockets} sockets for {opened} connections"
+        );
+
+        // Hold more connections than the pool has, so it opens new ones.
+        node.settle().await?;
+        let pool = node.pool();
+        let wanted = pool.size() + 2;
+        let mut held = Vec::new();
+        for _ in 0..wanted {
+            held.push(pool.acquire().await?);
+        }
+        drop(held);
+        let (sockets_after, opened_after) = postgres_info(&node).await?;
+        ensure!(opened_after > opened, "{opened} -> {opened_after}");
+        ensure!(sockets_after > sockets, "{sockets} -> {sockets_after}");
+        ensure!(
+            sockets_after >= opened_after,
+            "{sockets_after} sockets for {opened_after} connections"
+        );
+        Ok(())
+    }
+    .await;
+    node.pool().close().await;
+    admin
+        .execute(Statement::from_string(
+            DbBackend::Postgres,
+            format!("DROP SCHEMA {schema} CASCADE"),
+        ))
+        .await
+        .expect("drop the isolated schema");
+    result.expect("postgres counters in /info");
 }

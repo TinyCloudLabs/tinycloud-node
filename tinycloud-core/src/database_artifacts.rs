@@ -5,7 +5,7 @@ use sea_orm::{
 };
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
-use crate::{hash::hash, models::database_artifact};
+use crate::{db_pool::BulkScope, hash::hash, models::database_artifact};
 
 #[derive(Debug, Clone)]
 pub struct DatabaseArtifact {
@@ -120,6 +120,19 @@ pub trait DatabaseArtifactRepository: Send + Sync {
         name: &str,
     ) -> Result<Option<DatabaseArtifact>, DatabaseArtifactError>;
 
+    /// [`Self::load`], told the artifact's stored size when the caller knows
+    /// it, so a repository can skip the bulk statement timeout's extra round
+    /// trips for a small artifact (TC-1054). `None` means unknown.
+    async fn load_sized(
+        &self,
+        service: &str,
+        space: &str,
+        name: &str,
+        _known_size: Option<u64>,
+    ) -> Result<Option<DatabaseArtifact>, DatabaseArtifactError> {
+        self.load(service, space, name).await
+    }
+
     async fn save(
         &self,
         service: &str,
@@ -139,6 +152,23 @@ pub trait DatabaseArtifactRepository: Send + Sync {
     ) -> Result<DeltaSave, DatabaseArtifactError> {
         Err(DatabaseArtifactError::IncrementalPersistenceUnsupported)
     }
+}
+
+/// The largest artifact payload written under the pool's base statement
+/// timeout; a larger checkpoint is written in a
+/// [`RecoveringConnection::begin_bulk`] scope (TC-1054). It matches the SQL
+/// service's WAL delta bound (8 MiB): the server's work on an 8 MiB value
+/// (compression, TOAST, WAL) takes well under a second, far inside the 30 s
+/// default. Loads use the same bound, judged by the stored size.
+///
+/// [`RecoveringConnection::begin_bulk`]: crate::db_pool::RecoveringConnection::begin_bulk
+pub const BASE_TIMEOUT_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
+
+/// The stored metadata a full checkpoint save is checked against.
+struct CurrentArtifact {
+    revision: i64,
+    size_bytes: i64,
+    checkpoint_content_hash: String,
 }
 
 #[derive(Clone)]
@@ -201,14 +231,41 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         space: &str,
         name: &str,
     ) -> Result<Option<DatabaseArtifact>, DatabaseArtifactError> {
-        database_artifact::Entity::find_by_id((
-            service.to_string(),
-            space.to_string(),
-            name.to_string(),
-        ))
-        .one(&self.conn)
-        .await
-        .map(|row| {
+        self.load_sized(service, space, name, None).await
+    }
+
+    async fn load_sized(
+        &self,
+        service: &str,
+        space: &str,
+        name: &str,
+        known_size: Option<u64>,
+    ) -> Result<Option<DatabaseArtifact>, DatabaseArtifactError> {
+        // Hydration reads the whole checkpoint and WAL in one statement. One
+        // that may be larger than a delta runs under the bulk statement
+        // timeout (TC-1054); a known-small one under the base timeout, with
+        // no extra round trip.
+        let bulk = known_size.is_none_or(|size| size > BASE_TIMEOUT_PAYLOAD_BYTES as u64);
+        let find = || {
+            database_artifact::Entity::find_by_id((
+                service.to_string(),
+                space.to_string(),
+                name.to_string(),
+            ))
+        };
+        let row = if bulk {
+            self.conn
+                .bulk_read("load_artifact", |scope| async move {
+                    let row = find().one(&scope).await?;
+                    scope.commit().await?;
+                    Ok(row)
+                })
+                .await
+        } else {
+            // A read-only statement on the pool, retried like any other.
+            find().one(&self.conn).await
+        };
+        row.map(|row| {
             row.map(|model| DatabaseArtifact {
                 payload: model.payload,
                 content_hash: model.content_hash,
@@ -245,13 +302,36 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
             .format(&Rfc3339)
             .expect("current timestamps should format as RFC3339");
 
+        // A checkpoint larger than a WAL delta may take longer to upload than
+        // the pool's base statement timeout allows, so its write runs under
+        // the bulk one (TC-1054). Smaller ones, like every delta, fit the
+        // base timeout and pay no extra round trip.
+        let scope = if payload.len() > BASE_TIMEOUT_PAYLOAD_BYTES {
+            self.conn.begin_bulk().await?
+        } else {
+            BulkScope::Pool(self.conn.clone())
+        };
+        // Only the metadata the CAS and the shrink warning need: reading the
+        // stored checkpoint back would move it a second time.
         let existing = database_artifact::Entity::find_by_id((
             service.to_string(),
             space.to_string(),
             name.to_string(),
         ))
-        .one(&self.conn)
-        .await?;
+        .select_only()
+        .column(database_artifact::Column::Revision)
+        .column(database_artifact::Column::SizeBytes)
+        .column(database_artifact::Column::CheckpointContentHash)
+        .into_tuple::<(i64, i64, String)>()
+        .one(&scope)
+        .await?
+        .map(
+            |(revision, size_bytes, checkpoint_content_hash)| CurrentArtifact {
+                revision,
+                size_bytes,
+                checkpoint_content_hash,
+            },
+        );
 
         expected.check(
             existing
@@ -350,7 +430,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
                         database_artifact::Column::CheckpointContentHash
                             .eq(existing.checkpoint_content_hash.clone()),
                     )
-                    .exec(&self.conn)
+                    .exec(&scope)
                     .await?;
                 if update.rows_affected != 1 {
                     return Err(DatabaseArtifactError::Backend(
@@ -377,10 +457,12 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
                     delta_content_hash: Set(None),
                     delta_size_bytes: Set(0),
                 }
-                .insert(&self.conn)
+                .insert(&scope)
                 .await?;
             }
         }
+
+        scope.commit().await?;
 
         Ok(DatabaseArtifact {
             payload,

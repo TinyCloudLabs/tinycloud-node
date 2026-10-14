@@ -22,3 +22,7 @@ tinycloud-auth = { path = "../../tinycloud-auth" }
 tinycloud-core = { path = "../../tinycloud-core" }
 tinycloud-node = { path = "../../tinycloud-node-server" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+# TC-1054: the node's patched sqlx-core (see vendor/sqlx-core/PATCH.md).
+[patch.crates-io]
+sqlx-core = { path = "../../vendor/sqlx-core" }

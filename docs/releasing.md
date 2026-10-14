@@ -157,6 +157,19 @@ its branch policy before any workflow that names it runs.
      Compare `features` with the previous release (1.20.1 reports `kv`,
      `delegation`, `sharing`, `sql`, `hooks`, `signed-urls`, `encryption`,
      `kv-sync-v1`, `kv-sync-root`, `tee`).
+   - Every PostgreSQL connection got its TCP keepalive options (TC-1054,
+     1.20.5 on). The production logs are private, so this is read from
+     `/info`, which carries two counts (no hosts or errors):
+
+     ```sh
+     curl -fsS https://tee.node.tinycloud.xyz/info \
+       | jq -e '.postgres.sockets_configured >= .postgres.connections_opened
+                and .postgres.connections_opened > 0'
+     ```
+
+     It must print `true`. `connections_opened` without matching
+     `sockets_configured` means the pool connected to a target the vendored
+     sqlx-core was not told about, so its connections run without keepalive.
    - Large headers still reach the node (TC-910 raised the ingress header
      buffers to `4 32k`). A ~30 KB `Authorization` header must get the node's
      own `401 Unauthorized` page, not an nginx `400 Request Header Or Cookie
