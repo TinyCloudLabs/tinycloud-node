@@ -72,6 +72,10 @@ jobs:
           --health-retries 5
     env:
       TINYCLOUD_TEST_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # TC-1054: tests/postgres_pool_timeouts.rs black-holes chosen loopback
+      # connections with exact-4-tuple iptables DROP rules (the runner is a
+      # throwaway VM with passwordless sudo). Unset, they fail under CI.
+      TINYCLOUD_TEST_BLACKHOLE: "1"
     steps:
     - name: Checkout TinyCloud repository
       uses: actions/checkout@v4
@@ -100,6 +104,8 @@ jobs:
         : "${TINYCLOUD_TEST_POSTGRES_URL:?must be set for the PostgreSQL regressions}"
         pg_isready -h localhost -p 5432 -U postgres
         psql "${TINYCLOUD_TEST_POSTGRES_URL}" -c 'SELECT version();'
+        # The TC-1054 black-hole tests need iptables through sudo.
+        sudo -n iptables -w -L OUTPUT -n >/dev/null
 
     - name: Assert the PostgreSQL regressions still exist
       run: |

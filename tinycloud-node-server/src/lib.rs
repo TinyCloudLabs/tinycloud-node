@@ -15,7 +15,14 @@ use rocket::{
     http::{Header, Method},
     Build, Rocket, Route,
 };
-use std::{path::Path, sync::Arc};
+use std::{
+    path::Path,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 pub mod allow_list;
 pub mod auth_guards;
@@ -250,7 +257,16 @@ pub async fn connect_database(tinycloud_config: &Config) -> Result<RecoveringCon
         ));
     }
     let mut connect_opts = ConnectOptions::from(database);
-    connect_opts.max_connections(tinycloud_config.database.max_connections);
+    connect_opts
+        .max_connections(tinycloud_config.database.max_connections)
+        // Recycle connections before a middlebox idle cutoff drops them
+        // silently (TC-1054).
+        .idle_timeout(Duration::from_secs(
+            tinycloud_config.database.idle_timeout_secs,
+        ))
+        .max_lifetime(Duration::from_secs(
+            tinycloud_config.database.max_lifetime_secs,
+        ));
     if database.starts_with("postgres://") || database.starts_with("postgresql://") {
         return postgres_pool(
             connect_opts,
@@ -259,6 +275,7 @@ pub async fn connect_database(tinycloud_config: &Config) -> Result<RecoveringCon
                 .postgres_tls
                 .root_cert_path
                 .as_deref(),
+            &tinycloud_config.database,
         )
         .await;
     }
@@ -268,6 +285,13 @@ pub async fn connect_database(tinycloud_config: &Config) -> Result<RecoveringCon
     Ok(RecoveringConnection::new(
         Database::connect(connect_opts).await?,
     ))
+}
+
+static POSTGRES_CONNECTIONS_OPENED: AtomicU64 = AtomicU64::new(0);
+
+/// PostgreSQL connections the node's pools have opened in this process.
+pub fn postgres_connections_opened() -> u64 {
+    POSTGRES_CONNECTIONS_OPENED.load(Ordering::Relaxed)
 }
 
 /// Build the Postgres pool for `connect_opts` (its URL and pool settings).
@@ -280,15 +304,27 @@ pub async fn connect_database(tinycloud_config: &Config) -> Result<RecoveringCon
 /// and [`RecoveringConnection`] retries the statement that observed a loss
 /// when that is safe.
 ///
-/// sea-orm's `Database::connect` cannot install that hook, so the pool is
+/// Every new connection then gets, from `database` (TC-1054):
+/// - TCP keepalive and `TCP_USER_TIMEOUT` on its socket, set by the vendored
+///   sqlx-core's `connect_tcp` as it connects (`vendor/sqlx-core/PATCH.md`),
+///   so a connection the network drops silently fails within tens of
+///   seconds instead of hanging for up to ~15 min. A connect whose options
+///   cannot be set fails;
+/// - in [`tinycloud_core::db_pool::StatementTimeoutMode::Session`], `SET statement_timeout`, so a
+///   statement stuck on a live connection fails server-side. Migrations and
+///   whole-artifact transfers scope their own limits
+///   ([`tinycloud_core::db::migrate`], [`RecoveringConnection::begin_bulk`]).
+///
+/// sea-orm's `Database::connect` cannot install these hooks, so the pool is
 /// built here with the same connect options it would have applied: the URL,
 /// statement logging, and the configured TLS root certificate. No search
 /// path is configured, and the pool connects eagerly, as before.
 pub async fn postgres_pool(
     connect_opts: ConnectOptions,
     root_cert_path: Option<&str>,
+    database: &config::DatabaseConfig,
 ) -> Result<RecoveringConnection> {
-    postgres_pool_with_recovery(connect_opts, root_cert_path, PoolRecovery::new()).await
+    postgres_pool_with_recovery(connect_opts, root_cert_path, database, PoolRecovery::new()).await
 }
 
 /// [`postgres_pool`] with a given recovery state. Production uses
@@ -297,10 +333,11 @@ pub async fn postgres_pool(
 pub async fn postgres_pool_with_recovery(
     connect_opts: ConnectOptions,
     root_cert_path: Option<&str>,
+    database: &config::DatabaseConfig,
     recovery: Arc<PoolRecovery>,
 ) -> Result<RecoveringConnection> {
     use tinycloud_core::sea_orm::{
-        sqlx::{postgres::PgConnectOptions, ConnectOptions as _, Postgres},
+        sqlx::{postgres::PgConnectOptions, ConnectOptions as _, Executor as _, Postgres},
         SqlxPostgresConnector,
     };
 
@@ -312,18 +349,59 @@ pub async fn postgres_pool_with_recovery(
     if let Some(root_cert_path) = root_cert_path {
         options = options.ssl_root_cert(root_cert_path);
     }
+    // Registered per connect target before the pool opens its first
+    // connection; the vendored sqlx-core applies it in `connect_tcp`.
+    let keepalive = database.tcp_keepalive();
+    sqlx_core::net::tcp_keepalive::set_tcp_keepalive(
+        options.get_host(),
+        options.get_port(),
+        keepalive,
+    );
+    let statement_timeouts = database.statement_timeouts();
+    let session_statement = statement_timeouts.session_statement();
     let pool = recovery
         .install(
             connect_opts
                 .sqlx_pool_options::<Postgres>()
                 .test_before_acquire(false),
         )
+        .after_connect(move |conn, _meta| {
+            let session_statement = session_statement.clone();
+            Box::pin(async move {
+                POSTGRES_CONNECTIONS_OPENED.fetch_add(1, Ordering::Relaxed);
+                if let Some(statement) = session_statement {
+                    conn.execute(statement.as_str()).await?;
+                }
+                Ok(())
+            })
+        })
         .connect_with(options)
         .await?;
+    // After a deploy, `sockets_configured >= connections_opened` shows every
+    // connection got its keepalive options (a connect that cannot set them
+    // fails, with a warning from sqlx-core).
+    ::tracing::info!(
+        statement_timeout_mode = ?statement_timeouts.mode,
+        statement_timeout_ms = statement_timeouts.base.as_millis() as u64,
+        bulk_statement_timeout_ms = statement_timeouts.bulk.as_millis() as u64,
+        retry_window_ms = database.retry_window_ms,
+        tcp_keepalive = keepalive.is_some(),
+        tcp_keepalive_idle_secs = keepalive.map(|k| k.idle.as_secs()),
+        tcp_keepalive_interval_secs = keepalive.map(|k| k.interval.as_secs()),
+        tcp_keepalive_retries = keepalive.map(|k| k.retries),
+        tcp_user_timeout_ms = keepalive
+            .and_then(|k| k.user_timeout)
+            .map(|t| t.as_millis() as u64),
+        sockets_configured = sqlx_core::net::tcp_keepalive::sockets_configured(),
+        connections_opened = postgres_connections_opened(),
+        "PostgreSQL pool connection limits"
+    );
     Ok(RecoveringConnection::with_recovery(
         SqlxPostgresConnector::from_sqlx_postgres_pool(pool),
         recovery,
-    ))
+    )
+    .with_statement_timeouts(statement_timeouts)
+    .with_retry_window(Duration::from_millis(database.retry_window_ms)))
 }
 
 fn node_replay_cache(tinycloud: &TinyCloud) -> InvocationReplayCache {
@@ -774,7 +852,9 @@ pub async fn app_with_control(
         .first()
         .cloned()
         .unwrap_or_else(|| tinycloud_config.share_email.return_origin.clone());
-    let rocket = rocket.attach(share_security_fairing(share_allowed_origin));
+    let rocket = rocket
+        .attach(share_security_fairing(share_allowed_origin))
+        .attach(retry_after_fairing());
 
     if tinycloud_config.cors {
         Ok(rocket.attach(cors_fairing()))
@@ -792,6 +872,32 @@ pub async fn app_with_control(
 /// 600). It also bounds how long a browser can keep acting on a cached
 /// preflight after the policy in [`cors_fairing`] is tightened.
 const CORS_PREFLIGHT_MAX_AGE_SECS: u32 = 7200;
+
+/// `Retry-After` on a database failure that is safe to retry (TC-1054).
+///
+/// Routes report database failures as plain-text `(Status, String)`; a
+/// retryable one is a `503` whose body starts with
+/// [`routes::UNAVAILABLE_RETRYABLE`]. Other `503`s (cutover fence, missing
+/// configuration) and the `500` [`routes::OUTCOME_UNKNOWN`] get no header.
+fn retry_after_fairing() -> AdHoc {
+    AdHoc::on_response("Retry-After", |_, resp| {
+        Box::pin(async move {
+            if resp.status() != rocket::http::Status::ServiceUnavailable {
+                return;
+            }
+            let Ok(body) = resp.body_mut().to_string().await else {
+                return;
+            };
+            if body.starts_with(routes::UNAVAILABLE_RETRYABLE) {
+                resp.set_header(Header::new(
+                    "Retry-After",
+                    routes::RETRY_AFTER_SECS.to_string(),
+                ));
+            }
+            resp.set_sized_body(body.len(), std::io::Cursor::new(body));
+        })
+    })
+}
 
 fn cors_fairing() -> AdHoc {
     AdHoc::on_response("CORS", |request, resp| {
@@ -1432,5 +1538,77 @@ mod cors_fairing_tests {
             .headers()
             .get_one("Access-Control-Max-Age")
             .is_none());
+    }
+}
+
+#[cfg(test)]
+mod retry_after_fairing_tests {
+    use super::{cors_fairing, retry_after_fairing, routes};
+    use rocket::{get, http::Status, local::asynchronous::Client, routes};
+
+    #[get("/retryable")]
+    fn retryable() -> (Status, String) {
+        (
+            Status::ServiceUnavailable,
+            format!("{}: pool exhausted", routes::UNAVAILABLE_RETRYABLE),
+        )
+    }
+
+    #[get("/unknown")]
+    fn unknown() -> (Status, String) {
+        (
+            Status::InternalServerError,
+            format!(
+                "{}: the write may have been applied",
+                routes::OUTCOME_UNKNOWN
+            ),
+        )
+    }
+
+    #[get("/fenced")]
+    fn fenced() -> (Status, String) {
+        (
+            Status::ServiceUnavailable,
+            "SQL identity cutover fence is active".to_string(),
+        )
+    }
+
+    /// TC-1054: clients tell a retryable database failure (503,
+    /// `unavailable_retryable`, `Retry-After`) from one whose write may have
+    /// applied (500, `outcome_unknown`, no `Retry-After`); CORS still applies.
+    #[tokio::test]
+    async fn only_retryable_database_failures_carry_retry_after() {
+        let client = Client::tracked(
+            rocket::build()
+                .mount("/", routes![retryable, unknown, fenced])
+                .attach(retry_after_fairing())
+                .attach(cors_fairing()),
+        )
+        .await
+        .expect("valid Rocket instance");
+
+        let response = client.get("/retryable").dispatch().await;
+        assert_eq!(response.status(), Status::ServiceUnavailable);
+        assert_eq!(response.headers().get_one("Retry-After"), Some("1"));
+        assert_eq!(
+            response.headers().get_one("Access-Control-Allow-Origin"),
+            Some("*")
+        );
+        let body = response.into_string().await.unwrap();
+        assert_eq!(body, "unavailable_retryable: pool exhausted", "body kept");
+
+        for path in ["/unknown", "/fenced"] {
+            let response = client.get(path).dispatch().await;
+            assert!(
+                response.headers().get_one("Retry-After").is_none(),
+                "{path}"
+            );
+            assert_eq!(
+                response.headers().get_one("Access-Control-Allow-Origin"),
+                Some("*"),
+                "{path}"
+            );
+            assert!(!response.into_string().await.unwrap().is_empty(), "{path}");
+        }
     }
 }

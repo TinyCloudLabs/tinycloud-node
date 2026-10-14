@@ -16,7 +16,11 @@ use crate::database_artifacts::{
 /// single writer, the Postgres compose runs one node container.
 #[derive(Debug, Clone, Default)]
 #[allow(clippy::type_complexity)]
-pub struct SqlSizes(Arc<RwLock<HashMap<String, HashMap<(String, String), u64>>>>);
+pub struct SqlSizes(
+    Arc<RwLock<HashMap<String, HashMap<(String, String), u64>>>>,
+    /// Set once [`SqlSizes::seed_from`] has loaded every artifact's size.
+    Arc<std::sync::atomic::AtomicBool>,
+);
 
 impl SqlSizes {
     pub fn new() -> Self {
@@ -52,7 +56,28 @@ impl SqlSizes {
                 .insert((service, name), size.max(0) as u64);
         }
         *self.0.write().await = fresh; // overwrite the map wholesale with DB truth
+        self.1.store(true, std::sync::atomic::Ordering::Release);
         Ok(())
+    }
+
+    /// The stored size of one artifact as far as this node knows: its
+    /// recorded size, `Some(0)` for one absent from a seeded mirror (this
+    /// node is the artifacts' only writer), `None` before the mirror is
+    /// seeded. Stale only after a save whose outcome was unknown, by at most
+    /// that save's delta.
+    pub async fn known_size(&self, service: &str, space: &str, name: &str) -> Option<u64> {
+        if !self.1.load(std::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
+        Some(
+            self.0
+                .read()
+                .await
+                .get(space)
+                .and_then(|inner| inner.get(&(service.to_string(), name.to_string())))
+                .copied()
+                .unwrap_or(0),
+        )
     }
 
     /// Overwrite (not accumulate) the size for one (service, space, db-name).
@@ -103,7 +128,22 @@ impl DatabaseArtifactRepository for SizeTrackingArtifactRepository {
         space: &str,
         name: &str,
     ) -> Result<Option<DatabaseArtifact>, DatabaseArtifactError> {
-        self.inner.load(service, space, name).await
+        let known_size = self.sizes.known_size(service, space, name).await;
+        self.inner
+            .load_sized(service, space, name, known_size)
+            .await
+    }
+
+    async fn load_sized(
+        &self,
+        service: &str,
+        space: &str,
+        name: &str,
+        known_size: Option<u64>,
+    ) -> Result<Option<DatabaseArtifact>, DatabaseArtifactError> {
+        self.inner
+            .load_sized(service, space, name, known_size)
+            .await
     }
 
     async fn save(
@@ -156,6 +196,24 @@ mod tests {
         resolver::DID_METHODS,
         ssi::{dids::DIDBuf, jwk::JWK},
     };
+
+    #[tokio::test]
+    async fn known_sizes_are_unknown_until_seeded() {
+        let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
+            .await
+            .unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        let sizes = SqlSizes::new();
+        assert_eq!(sizes.known_size("sql", "space", "db").await, None);
+        sizes.seed_from(&db).await.unwrap();
+        assert_eq!(
+            sizes.known_size("sql", "space", "db").await,
+            Some(0),
+            "absent"
+        );
+        sizes.update("sql", "space", "db", 9 << 20).await;
+        assert_eq!(sizes.known_size("sql", "space", "db").await, Some(9 << 20));
+    }
 
     fn test_space_id(name: &str) -> SpaceId {
         let jwk = JWK::generate_ed25519().unwrap();

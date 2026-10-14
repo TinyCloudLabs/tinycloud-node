@@ -8306,8 +8306,6 @@ dependencies = [
 [[package]]
 name = "sqlx-core"
 version = "0.8.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee6798b1838b6a0f69c007c133b8df5866302197e404e8b6ee8ed3e3a5e68dc6"
 dependencies = [
  "async-io 1.13.0",
  "async-std",
@@ -8336,6 +8334,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "smallvec",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "time",
  "tokio",
@@ -9735,6 +9734,8 @@ dependencies = [
  "serde_with 3.16.1",
  "sha2 0.10.9",
  "sha3",
+ "socket2 0.5.10",
+ "sqlx-core",
  "subtle",
  "tempfile",
  "thiserror 2.0.18",

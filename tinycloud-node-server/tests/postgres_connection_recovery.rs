@@ -573,7 +573,9 @@ fn delta(before: PoolRecoveryStats, after: PoolRecoveryStats) -> PoolRecoverySta
 struct Proxy {
     addr: SocketAddr,
     cut: watch::Sender<u64>,
-    cut_after: Arc<watch::Sender<Option<Vec<u8>>>>,
+    /// Markers a connection must forward, in order; the connection is cut
+    /// after it forwards the last one.
+    cut_after: Arc<watch::Sender<Option<Vec<Vec<u8>>>>>,
 }
 
 impl Proxy {
@@ -581,7 +583,7 @@ impl Proxy {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (cut, cut_rx) = watch::channel(0u64);
-        let cut_after = Arc::new(watch::Sender::new(None::<Vec<u8>>));
+        let cut_after = Arc::new(watch::Sender::new(None::<Vec<Vec<u8>>>));
         let marker = Arc::clone(&cut_after);
         tokio::spawn(async move {
             while let Ok((client, _)) = listener.accept().await {
@@ -604,7 +606,14 @@ impl Proxy {
     }
 
     fn cut_after_forwarding(&self, marker: &[u8]) {
-        self.cut_after.send_replace(Some(marker.to_vec()));
+        self.cut_after_forwarding_in_order(&[marker]);
+    }
+
+    /// Cut the first connection that forwards every one of `markers`, in
+    /// order, right after it forwards the last.
+    fn cut_after_forwarding_in_order(&self, markers: &[&[u8]]) {
+        self.cut_after
+            .send_replace(Some(markers.iter().map(|m| m.to_vec()).collect()));
     }
 }
 
@@ -612,9 +621,11 @@ async fn pipe(
     mut client: TcpStream,
     mut server: TcpStream,
     mut cut: watch::Receiver<u64>,
-    cut_after: Arc<watch::Sender<Option<Vec<u8>>>>,
+    cut_after: Arc<watch::Sender<Option<Vec<Vec<u8>>>>>,
 ) {
     cut.mark_unchanged();
+    // How many of the armed markers this connection has forwarded.
+    let mut forwarded = 0;
     {
         let (mut client_read, mut client_write) = client.split();
         let (mut server_read, mut server_write) = server.split();
@@ -628,10 +639,23 @@ async fn pipe(
                     if server_write.write_all(&up[..n]).await.is_err() {
                         break;
                     }
-                    let matched = cut_after
-                        .borrow()
-                        .as_deref()
-                        .is_some_and(|m| up[..n].windows(m.len()).any(|w| w == m));
+                    let matched = {
+                        let armed = cut_after.borrow();
+                        match armed.as_deref() {
+                            Some(markers) => {
+                                if markers.get(forwarded).is_some_and(|m| {
+                                    up[..n].windows(m.len()).any(|w| w == m.as_slice())
+                                }) {
+                                    forwarded += 1;
+                                }
+                                forwarded == markers.len()
+                            }
+                            None => {
+                                forwarded = 0;
+                                false
+                            }
+                        }
+                    };
                     if matched {
                         cut_after.send_replace(None);
                         // Let the server run and commit it; never forward the
@@ -892,6 +916,83 @@ async fn postgres_writes_are_never_retried() {
     fixture.drop_schema().await;
 }
 
+/// TC-1054 (Astra's P2): a KV put whose `COMMIT` reached the server but
+/// whose reply was lost has an unknown outcome, and is reported as such, not
+/// as a retryable failure: the put is durable, and a fresh retry would write
+/// a second version. A put that never got a connection is retryable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_kv_put_with_a_lost_commit_reply_has_an_unknown_outcome() {
+    use tinycloud_core::db_pool::{classify_failure, track_writes, TransientFailure};
+    use tinycloud_core::{TxError, TxStoreError};
+
+    let Some(url) = postgres_url("postgres_kv_put_with_a_lost_commit_reply_has_an_unknown_outcome")
+    else {
+        return;
+    };
+    let proxy = Proxy::start(upstream_addr(&url)).await;
+    let mut fixture = Fixture::new("lostcommit", &url, Some(proxy.addr)).await;
+    fixture.warm().await;
+    fixture.settle().await;
+
+    let put = |fixture: &mut Fixture, key: &str| {
+        let key: Path = key.parse().unwrap();
+        let nonce = fixture.nonce();
+        let invocation = fixture
+            .owner
+            .invocation("tinycloud.kv/put", &key, &nonce)
+            .unwrap();
+        let mut inputs = HashMap::new();
+        inputs.insert(
+            (fixture.owner.space.clone(), key),
+            (
+                Metadata(BTreeMap::new()),
+                HashBuffer::new(b"tc1054 value".to_vec()),
+            ),
+        );
+        (fixture.db.clone(), invocation, inputs)
+    };
+    let db_error = |result| match result {
+        Err(TxStoreError::Tx(TxError::Db(error))) => error,
+        Err(other) => panic!("expected a database error, got {other}"),
+        Ok(_) => panic!("expected a database error, got success"),
+    };
+
+    // The put's own connection: its key, then its COMMIT.
+    proxy.cut_after_forwarding_in_order(&[b"tc1054/lost-commit", b"COMMIT"]);
+    let (db, invocation, inputs) = put(&mut fixture, "tc1054/lost-commit");
+    let (result, applied) = track_writes(db.invoke::<MemoryStaging>(invocation, inputs)).await;
+    let error = db_error(result);
+    assert!(is_connection_error(&error), "{error:?}");
+    assert!(applied, "the transaction was begun and its COMMIT sent");
+    assert_eq!(
+        classify_failure(&error, applied),
+        Some(TransientFailure::OutcomeUnknown)
+    );
+    fixture
+        .get("tc1054/lost-commit")
+        .await
+        .expect("the put committed; reading back finds it");
+
+    // No connection to be had: nothing was written, a fresh put is safe.
+    fixture
+        .conn
+        .sea_orm_connection()
+        .clone()
+        .close()
+        .await
+        .unwrap();
+    let (db, invocation, inputs) = put(&mut fixture, "tc1054/no-connection");
+    let (result, applied) = track_writes(db.invoke::<MemoryStaging>(invocation, inputs)).await;
+    let error = db_error(result);
+    assert!(!applied);
+    assert_eq!(
+        classify_failure(&error, applied),
+        Some(TransientFailure::Retryable),
+        "{error:?}"
+    );
+    fixture.drop_schema().await;
+}
+
 /// With no loss, the acquire hook never pings; after one loss it re-validates
 /// the connections that predate it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -956,7 +1057,7 @@ async fn session_pool(
         Some(recovery) => {
             let mut options = ConnectOptions::new(url.to_string());
             options.max_connections(max_connections);
-            tinycloud::postgres_pool_with_recovery(options, None, recovery)
+            tinycloud::postgres_pool_with_recovery(options, None, &Default::default(), recovery)
                 .await
                 .unwrap()
         }
