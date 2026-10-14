@@ -129,7 +129,7 @@ transforms:
         if length(upstream_status_raw) > 63 { abort }
         upstream_status = ""
         if upstream_status_raw != "-" && upstream_status_raw != "" {
-          if !match!(upstream_status_raw, r'^[1-5][0-9]{2}(, ?[1-5][0-9]{2})*$') { abort }
+          if !match!(upstream_status_raw, r'^[1-5][0-9]{2}(, ?[1-5][0-9]{2}| : [1-5][0-9]{2})*$') { abort }
           upstream_status = slice!(upstream_status_raw, 0, 3)
         }
         if !is_string(upstream_status) { abort }
@@ -150,7 +150,6 @@ transforms:
         else { abort }
       } else { abort }
       . = out
-      if length(encode_json(.)) > 280 { abort }
       # END GENERATED FROM fields.json
   classify_by_budget:
     type: route
@@ -190,7 +189,14 @@ transforms:
     inputs: [split_requests.aggregate]
     drop_on_error: true
     source: |
-      .minute = slice!(.ts, 0, 16)
+      minute = slice!(.ts, 0, 16)
+      . = {
+        "route": .route,
+        "status_class": .status_class,
+        "event": .event,
+        "minute": minute,
+        "request_count": .request_count
+      }
   request_reduce:
     type: reduce
     inputs: [request_minute]
@@ -244,12 +250,12 @@ transforms:
     threshold: 5
   throttle_ingress:
     type: throttle
-    inputs: [request_output, classify_by_budget.ingress_slow, slow_success, throttle_app_warning]
+    inputs: [request_output, classify_by_budget.ingress_slow, slow_success]
     window_secs: 60
     threshold: 27
   budget_size_guard:
     type: remap
-    inputs: [throttle_panic, throttle_app_error, throttle_ingress]
+    inputs: [throttle_panic, throttle_app_error, throttle_app_warning, throttle_ingress]
     drop_on_error: true
     drop_on_abort: true
     source: |

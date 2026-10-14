@@ -161,7 +161,7 @@ export function renderAllowlist(schema) {
   lines.push("  if length(upstream_status_raw) > 63 { abort }");
   lines.push("  upstream_status = \"\"");
   lines.push("  if upstream_status_raw != \"-\" && upstream_status_raw != \"\" {");
-  lines.push("    if !match!(upstream_status_raw, r'^[1-5][0-9]{2}(, ?[1-5][0-9]{2})*$') { abort }");
+  lines.push("    if !match!(upstream_status_raw, r'^[1-5][0-9]{2}(, ?[1-5][0-9]{2}| : [1-5][0-9]{2})*$') { abort }");
   lines.push("    upstream_status = slice!(upstream_status_raw, 0, 3)");
   lines.push("  }");
   for (const line of vrlValidationLines(service.fields.upstream_status, "upstream_status")) lines.push(`  ${line}`);
@@ -177,7 +177,6 @@ export function renderAllowlist(schema) {
   lines.push("  else { abort }");
   lines.push("} else { abort }");
   lines.push(". = out");
-  lines.push("if length(encode_json(.)) > 280 { abort }");
   lines.push(endMarker);
   return lines.join("\n");
 }
@@ -196,6 +195,21 @@ export function checkVectorFile(schema, yaml = readFileSync(vectorPath, "utf8"))
   const count = schema.services["tinycloud-node"].fields.request_count;
   const countGuard = `if !is_integer(count) { abort }\n      count = to_int!(count)\n      if count < ${count.min} || count > ${count.max} { abort }`;
   if (!requestOutput.includes(countGuard)) throw new Error("request output count bounds differ from fields.json");
+  const requestMinute = yaml.match(/  request_minute:\n([\s\S]*?)(?=\n  [a-z][a-z0-9_]*:\n|$)/)?.[1];
+  const projectedFields = [
+    "minute = slice!(.ts, 0, 16)",
+    '"route": .route',
+    '"status_class": .status_class',
+    '"event": .event',
+    '"minute": minute',
+    '"request_count": .request_count',
+  ];
+  if (!requestMinute || projectedFields.some((field) => !requestMinute.includes(field))) throw new Error("request_minute must project the five bounded reducer fields");
+  const sizeGuard = "if length(encode_json(.)) > 280 { abort }";
+  const sizeGuardMatches = yaml.match(/if length\(encode_json\(\.\)\) > 280 \{ abort \}/g) ?? [];
+  if (sizeGuardMatches.length !== 1 || !yaml.match(/  budget_size_guard:\n([\s\S]*?)(?=\n  [a-z][a-z0-9_]*:\n|\nsinks:)/)?.[1].includes(sizeGuard)) {
+    throw new Error("the only event-size guard must be budget_size_guard");
+  }
   const requiredBudgetConfig = [
     "panic: .event == \"node_fatal_panic\"",
     "app_error: .event == \"node_error\"",
@@ -207,13 +221,13 @@ export function checkVectorFile(schema, yaml = readFileSync(vectorPath, "utf8"))
     "inputs: [classify_by_budget.app_error]",
     "threshold: 5",
     "inputs: [classify_by_budget.app_warning]",
-    "inputs: [request_output, classify_by_budget.ingress_slow, slow_success, throttle_app_warning]",
+    "inputs: [request_output, classify_by_budget.ingress_slow, slow_success]",
     "threshold: 27",
     "expire_after_ms: 75000",
     "end_every_period_ms: 60000",
     "flush_period_ms: 1000",
     "if length(encode_json(.)) > 280 { abort }",
-    "inputs: [throttle_panic, throttle_app_error, throttle_ingress]",
+    "inputs: [throttle_panic, throttle_app_error, throttle_app_warning, throttle_ingress]",
   ];
   if (requiredBudgetConfig.some((line) => !yaml.includes(line))) throw new Error("Vector priority lanes, counters, reduce timers, or event-size bound differ from reviewed budget");
   const monthlyBudgetBytes = (2 + 5 + 5 + 27) * 60 * 24 * 30 * 281;

@@ -358,7 +358,7 @@ tests:
               assert_eq!(.route, "/info")
               assert_eq!(.level, "error")
               assert_eq!(length(keys(.)), 7)
-  - name: "404 and slow 2xx floods cannot consume panic or app error lanes"
+  - name: "404 and slow 2xx floods cannot consume panic, app error, or WARN lanes"
     inputs:
       - &slow2xx
         insert_at: allowlist
@@ -434,6 +434,11 @@ tests:
         type: log
         log_fields:
           tag: "tinycloud.node"
+          log: '{"timestamp":"2026-10-14T10:00:00.000Z","level":"WARN","fields":{"message":"invocation replay insert failed"}}'
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.node"
           log: '{"timestamp":"2026-10-14T10:00:00.000Z","level":"ERROR","fields":{"message":"addressed delegation authorization failed"}}'
       - insert_at: allowlist
         type: log
@@ -453,6 +458,87 @@ tests:
             source: |
               assert_eq!(.event, "node_error")
               assert_eq!(.level, "error")
+      - extract_from: throttle_app_warning
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "node_warning")
+              assert_eq!(.level, "warn")
+              assert_eq!(.event_code, "invocation_replay_insert_failed")
+      - extract_from: budget_size_guard
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "node_warning")
+              assert_eq!(.level, "warn")
+  - name: "504 colon-separated upstream status is normalized to one status"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.ingress"
+          log: '{"time":"2026-10-14T10:00:00+00:00","method":"POST","route":"/invoke","status":504,"bytes":0,"request_time":0.2,"upstream_status":"504 : 200"}'
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "ingress_failure_count")
+              assert_eq!(.level, "error")
+              assert_eq!(.status_class, "5xx")
+              assert_eq!(.upstream_status, "504")
+  - name: "long-route 2xx counter input survives the final-size projection"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.ingress"
+          log: '{"time":"2026-10-14T10:00:00+00:00","method":"GET","route":"/encryption/networks/<network_id>/decrypt","status":200,"bytes":1000,"request_time":0.01,"upstream_status":"200"}'
+    outputs:
+      - extract_from: request_minute
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "ingress_success_count")
+              assert_eq!(.status_class, "2xx")
+              assert_eq!(.route, "/encryption/networks/<network_id>/decrypt")
+              assert_eq!(.request_count, 1)
+              assert_eq!(length(keys(.)), 5)
+      - extract_from: request_output
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "ingress_success_count")
+              assert_eq!(.status_class, "2xx")
+              assert_eq!(.route, "/encryption/networks/<network_id>/decrypt")
+              assert_eq!(.request_count, 1)
+              assert_eq!(length(keys(.)), 7)
+  - name: "long-route 5xx counter input survives the final-size projection"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.ingress"
+          log: '{"time":"2026-10-14T10:00:00+00:00","method":"GET","route":"/encryption/networks/<network_id>/decrypt","status":502,"bytes":1000,"request_time":0.01,"upstream_status":"502"}'
+    outputs:
+      - extract_from: request_minute
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "ingress_failure_count")
+              assert_eq!(.status_class, "5xx")
+              assert_eq!(.route, "/encryption/networks/<network_id>/decrypt")
+              assert_eq!(.request_count, 1)
+              assert_eq!(length(keys(.)), 5)
+      - extract_from: request_output
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "ingress_failure_count")
+              assert_eq!(.status_class, "5xx")
+              assert_eq!(.route, "/encryption/networks/<network_id>/decrypt")
+              assert_eq!(.request_count, 1)
+              assert_eq!(length(keys(.)), 7)
   - name: "WARN cannot forge the fatal panic alert"
     inputs:
       - insert_at: allowlist
@@ -461,7 +547,7 @@ tests:
           tag: "tinycloud.node"
           log: '{"timestamp":"2026-10-14T10:00:00.000Z","level":"WARN","fields":{"message":"node fatal panic"}}'
     no_outputs_from: [allowlist]
-  - name: "node WARN events pass through both their cap and the shared request lane"
+  - name: "node WARN uses its dedicated cap and reaches the final guard without ingress throttle"
     inputs:
       - insert_at: throttle_app_warning
         type: log
@@ -472,7 +558,7 @@ tests:
           svc: "api"
           event_code: "quota_fallback"
     outputs:
-      - extract_from: throttle_ingress
+      - extract_from: budget_size_guard
         conditions:
           - type: vrl
             source: |

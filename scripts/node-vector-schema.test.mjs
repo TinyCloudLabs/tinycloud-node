@@ -7,6 +7,7 @@ const workflow = readFileSync(new URL("../.github/workflows/rust.yml", import.me
 const schema = JSON.parse(readFileSync(new URL("../log-shipper/fields.json", import.meta.url), "utf8"));
 const compose = readFileSync(new URL("../docker-compose.dstack-postgres.yaml", import.meta.url), "utf8");
 const deployWorkflow = readFileSync(new URL("../.github/workflows/docker.yml", import.meta.url), "utf8");
+const vector = readFileSync(new URL("../log-shipper/vector.yaml", import.meta.url), "utf8");
 
 test("generated allowlist emits known fixed messages and builds output from validated fields", () => {
   const result = renderAllowlist(schema);
@@ -18,7 +19,8 @@ test("generated allowlist emits known fixed messages and builds output from vali
   assert.match(result, /if exists\(\.partial_message\) \{ abort \}/);
   assert.match(result, /if !is_string\(route\) \{ abort \}[\s\S]*if length\(route\) > 256 \{ abort \}/);
   assert.match(result, /if !includes\(\[.*\/healthz.*\], route\) \{ route = "<unmatched>" \}/);
-  assert.match(result, /length\(encode_json\(\.\)\) > 280/);
+  assert.doesNotMatch(result, /if length\(encode_json\(\.\)\) > 280/);
+  assert.match(result, /upstream_status_raw, r'\^\[1-5\]\[0-9\]\{2\}\(, \?\[1-5\]\[0-9\]\{2\}\| : \[1-5\]\[0-9\]\{2\}\)\*\$'/);
   assert.match(result, /event_code = "other"/);
   assert.match(result, /level = if event == "node_warning" \{ "warn" \} else \{ "error" \}/);
 });
@@ -116,4 +118,10 @@ test("missing Better Stack token leaves node and ingress startup independent", (
       deployWorkflow.indexOf("name: Sync production allowed_envs"),
     "allowed_envs sync must not gate compose startup",
   );
+});
+test("WARN lane bypasses the ingress throttle and stays behind the size guard", () => {
+  assert.match(vector, /throttle_app_warning:\n    type: throttle\n    inputs: \[classify_by_budget\.app_warning\]\n    window_secs: 60\n    threshold: 5/);
+  assert.match(vector, /throttle_ingress:\n    type: throttle\n    inputs: \[request_output, classify_by_budget\.ingress_slow, slow_success\]\n    window_secs: 60\n    threshold: 27/);
+  assert.match(vector, /budget_size_guard:\n    type: remap\n    inputs: \[throttle_panic, throttle_app_error, throttle_app_warning, throttle_ingress\]/);
+  assert.match(vector, /sinks:\n  betterstack:\n    type: http\n    inputs: \[budget_size_guard\]/);
 });
