@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+## [1.20.6] - 2026-10-14
+
+A security fix (TC-1080, Part A). UCAN issuer resolution no longer dereferences network DID methods by default, so a request can't make the node fetch arbitrary or internal hosts through a crafted issuer DID (#284).
+
+- Issuer DIDs resolve offline only for `did:key`, `did:pkh` and `did:jwk`. Any other method (`web`, `tz`, `ion`, `ethr`, unknown) is refused with `did_method_disabled:` before any dereference or socket. Issuer DID URL queries are always refused (`did_url_query_rejected:`).
+- New setting `did_resolution.network_methods` (default `false`; env `TINYCLOUD_DID_RESOLUTION__NETWORK_METHODS`). Setting it to `true` and restarting restores the previous method dispatch, except that queries stay refused.
+- `GET /info` reports `did_resolution: { network_methods, refused_total }`. Prometheus counts refusals as `tinycloud_did_resolution_refused_total{method,reason}`.
+- The production deploy now also turns the CVM's public system-info page off (#286).
+
 ## [1.20.5] - 2026-10-14
 
 A reliability hotfix (TC-1054). A PostgreSQL connection that dies silently (failover, a NAT or proxy idle drop, a network black hole) can no longer hang a request, or the per-database SQL operation lock it holds, for minutes (#283).
