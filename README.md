@@ -294,13 +294,6 @@ When `keys.type` is `Static` the instance will use an array of bytes as a static
 
 The secret MUST contain at least 32 bytes of entropy (either randomly generated or derived in a cryptographically secure way). It is STRONGLY RECOMMENDED that the secret be given via environment variables and NOT in the `tinycloud.toml` config file. Additionally it is STRONGLY RECOMMENDED that the secret be backed up in a secure place if used in production. Loss of the secret will result in total loss of function for the TinyCloud Protocol instance.
 
-## Production log shipping
-
-The production Compose file sends redacted JSON records through Vector to Better Stack. A missing source token leaves only Vector idle; the node and ingress start independently and use asynchronous Fluentd logging.
-
-Node output is bounded to 280 JSON bytes plus one line separator. The caps are 2 panic/min, 5 app ERROR/min, 5 WARN/min, and 27/min through the ingress/request lane. WARN bypasses the ingress throttle and joins panic and ERROR directly at the final size guard. The conservative monthly ceiling charges all lane caps independently: `(2 + 5 + 5 + 27) × 60 × 24 × 30 × 281 = 473,428,800 bytes` (about 0.473 GB per 30 days), below the node's 0.48 GB allocation of the shared free-plan quota. Ingress 4xx/5xx counts aggregate by route template and status class; successful requests aggregate by route. There are 36 route values, including `<unmatched>` for unknown paths.
-The Docker review check pulls the registry `dstack` image; its Linux/amd64 manifest measured 17,115,015 compressed bytes across seven layers.
-
 ## Running
 
 TinyCloud Protocol instances can be started via command line, e.g.:
@@ -310,6 +303,16 @@ TINYCLOUD_PORT=8001 tinycloud
 ```
 
 If the TinyCloud Protocol instance is not able to find or establish a connection to the configured storage, the instance will terminate.
+
+### Production log shipping (TC-959)
+
+The node and ingress use the Docker GELF driver with exact `tc.logship` labels and send UDP to host loopback `127.0.0.1:12201`. Vector runs on its own fixed-address bridge network, publishes only that loopback UDP port, and has no Docker socket or host Docker-directory mount. Its first transform gates on `_tc.logship`; only then does it strip GELF metadata and parse the app's JSON line before the existing schema allowlist. Other services, including Postgres, stay unlabelled on capped `json-file` logs. Node and ingress do not depend on Vector; a missing Better Stack token leaves Vector idle.
+
+The separate panic, app ERROR, app WARN, and ingress lanes are capped at 2, 5, 5, and 27 events/minute. With the 281-byte final event limit, the monthly ceiling is `(2 + 5 + 5 + 27) × 60 × 24 × 30 × 281 = 473,428,800 bytes` (0.473 GB/30d), below the node's 0.48 GB share of the 3 GB free quota. Unknown routes collapse to `<unmatched>`. WARN and fixed gate counters bypass the ingress throttle.
+
+On the 2-vCPU/4-GiB/20-GB tdx.medium CVM, Vector is capped at 64 MiB and 0.25 CPU. Its data directory and token file live on an 8 MiB tmpfs; the Vector and ssh-gateway `json-file` logs are capped at `10m × 3` each (60 MB total). The review-only Docker acceptance script measures Vector peak memory and transport loss; neither has been measured by this change.
+
+The production token is GitHub `production` environment secret `PROD_TINYCLOUD_BETTERSTACK_SOURCE_TOKEN`, written to the sealed environment as `BETTERSTACK_SOURCE_TOKEN`. The entrypoint copies it to a mode-0600 `SECRET[]` file on Vector's tmpfs and unsets the variable before executing Vector. Docker daemon/API principals can still inspect container configuration; restrict access. At go-live, create the `node_fatal_panic` alert and a per-service source-silence alert. See [`docs/runbooks/tc-959-betterstack-log-shipping.md`](docs/runbooks/tc-959-betterstack-log-shipping.md) for redaction tests, privilege boundaries, retention, and release checks.
 
 ## Usage
 

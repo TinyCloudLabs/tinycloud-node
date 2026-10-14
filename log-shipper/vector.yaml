@@ -1,12 +1,218 @@
 data_dir: /var/lib/vector
 secret:
-  bs: { type: directory, path: /tmp/vector-secrets, remove_trailing_whitespace: true }
+  bs: { type: directory, path: /var/lib/vector/secrets, remove_trailing_whitespace: true }
 sources:
-  docker_fluent: { type: fluent, mode: tcp, address: 0.0.0.0:24224 }
+  gelf_in:
+    type: socket
+    mode: udp
+    address: 0.0.0.0:12201
+    max_length: 262144
+    framing: { method: chunked_gelf, chunked_gelf: { decompression: Auto } }
+    decoding: { codec: gelf }
 transforms:
+  logship_gate:
+    type: remap
+    inputs: [gelf_in]
+    drop_on_error: true
+    drop_on_abort: true
+    source: |
+      lbl = string(get(., ["_tc.logship"]) ?? null) ?? ""
+      if lbl == "tinycloud-node" || lbl == "tinycloud-ingress" {
+        .gate_action = "candidate"
+        .gate_label = lbl
+      } else if lbl == "" {
+        . = {"gate_action": "drop", "gate_reason": "unlabelled"}
+      } else {
+        . = {"gate_action": "unexpected", "gate_reason": "unexpected_label"}
+      }
+  logship_gate_route:
+    type: route
+    inputs: [logship_gate]
+    route:
+      node: .gate_action == "candidate" && .gate_label == "tinycloud-node"
+      ingress: .gate_action == "candidate" && .gate_label == "tinycloud-ingress"
+      rejected: .gate_action == "drop" || .gate_action == "unexpected"
+  strip_gelf_fields:
+    type: remap
+    inputs: [logship_gate_route.node, logship_gate_route.ingress]
+    drop_on_error: true
+    drop_on_abort: true
+    source: |
+      label = .gate_label
+      raw = get(., ["message"]) ?? null
+      if !is_string(raw) {
+        . = {"gate_action": "drop", "gate_reason": "malformed_envelope"}
+      } else {
+        tag = if label == "tinycloud-node" { "tinycloud.node" } else { "tinycloud.ingress" }
+        . = {"gate_action": "candidate", "gate_label": label, "tag": tag, "message": raw}
+      }
+  parse_gelf_message:
+    type: remap
+    inputs: [strip_gelf_fields]
+    drop_on_error: true
+    drop_on_abort: true
+    source: |
+      if .gate_action == "drop" {
+        reason = .gate_reason
+        . = {"gate_action": "drop", "gate_reason": reason}
+      } else {
+        parsed, parse_err = parse_json(.message)
+        if parse_err != null || !is_object(parsed) {
+          . = {"gate_action": "drop", "gate_reason": "malformed_envelope"}
+        } else {
+          tag = .tag
+          raw = .message
+          . = {"tag": tag, "log": raw, "parsed_log": parsed}
+        }
+      }
+  logship_inner:
+    type: remap
+    inputs: [parse_gelf_message]
+    drop_on_error: true
+    drop_on_abort: true
+    source: |
+      if exists(.gate_action) {
+        action = .gate_action
+        reason = .gate_reason
+        . = {"gate_action": action, "gate_reason": reason}
+      } else if !is_string(.log) {
+        . = {"gate_action": "drop", "gate_reason": "malformed_envelope"}
+      } else {
+        raw = .log
+        parsed = .parsed_log
+        if !is_object(parsed) || exists(parsed.partial_message) {
+          . = {"gate_action": "drop", "gate_reason": "malformed_envelope"}
+        } else if .tag == "tinycloud.node" {
+          fields = get(parsed, ["fields"]) ?? null
+          message = if is_object(fields) { get(fields, ["message"]) ?? null } else { null }
+          if !is_string(message) {
+            . = {"gate_action": "drop", "gate_reason": "malformed_envelope"}
+          } else {
+            message = to_string(message) ?? ""
+            known_message = includes([
+              "invocation replay insert failed",
+              "invocation replay cleanup failed",
+              "share-v2 local-tee feature active: deriving a deterministic, non-attested TEE identity from node key material",
+              "retention: delivered hook delivery prune failed",
+              "retention: dead-letter hook delivery prune failed",
+              "retention: signed KV ticket prune failed",
+              "failed to load tunnel state; tunnel not started",
+              "invalid loopback API address; tunnel not started",
+              "failed to load link state; LAN listener not started",
+              "failed to bind link LAN listener; LAN listener not started",
+              "failed to build TLS config; LAN listener not started",
+              "link LAN listener exited with error",
+              "failed to record link listener bind state",
+              "failed to record link listener bind failure",
+              "failed to load config for auto-renew",
+              "link auto-renew failed",
+              "failed to hot-reload renewed link cert",
+              "failed to reload TLS material after link auto-renew",
+              "link disable: service delete failed; local state removed anyway",
+              "link connection error",
+              "link listener accept error",
+              "webhook delivery attempt failed",
+              "webhook dispatcher loop failed",
+              "addressed delegation authorization failed",
+              "native share authorization denied",
+              "native share KV put failed",
+              "share v2 readiness probe failed",
+              "share v2 is enabled but shareEmail.invitationPublicKey is unset",
+              "configured share invitation key does not match the node's derived signing key",
+              "share/v2 policy challenge denied",
+              "failed to read committed hook events",
+              "failed to load kv write hook rows",
+              "failed to load kv delete hook rows",
+              "missing committed kv hook row for invocation",
+              "database write committed but webhook enqueue failed",
+              "tunnel: failed to prepare connection attempt",
+              "tunnel: no frame within idle timeout; treating connection as dead",
+              "tunnel: read error",
+              "tunnel: dropping malformed frame",
+              "tunnel: relay sent an error frame",
+              "tunnel: failed to write frame",
+              "tunnel: failed to record runtime state",
+              "tunnel: failed to clear runtime state after disable",
+              "tunnel authentication rejected",
+              "node fatal panic"
+            ], message)
+            if !known_message {
+              known_message = starts_with(message, "dstack socket available but get_info failed: ") ||
+                starts_with(message, "quota service returned an invalid body: ") ||
+                starts_with(message, "quota service returned ") ||
+                starts_with(message, "Failed to get TDX quote: ")
+            }
+            if !known_message {
+              . = {"gate_action": "drop", "gate_reason": "unknown_message"}
+            } else {
+              . = {"tag": .tag, "log": raw, "parsed_log": parsed}
+            }
+          }
+        } else if .tag == "tinycloud.ingress" {
+          . = {"tag": .tag, "log": raw, "parsed_log": parsed}
+        } else {
+          . = {"gate_action": "drop", "gate_reason": "unexpected_label"}
+        }
+      }
+  logship_result_route:
+    type: route
+    inputs: [logship_gate_route.rejected, logship_inner]
+    route:
+      dropped: .gate_action == "drop"
+      unexpected: .gate_action == "unexpected"
+      validated: is_string(.tag) && is_string(.log)
+  logship_drop_counter:
+    type: remap
+    inputs: [logship_result_route.dropped]
+    drop_on_error: true
+    drop_on_abort: true
+    source: |
+      reason = .gate_reason
+      if !includes(["malformed_envelope", "unknown_message", "unlabelled"], reason) { abort }
+      minute = format_timestamp!(now(), format: "%Y-%m-%dT%H:%M")
+      . = {"event": "logship_gate_dropped_total", "reason": reason, "minute": minute, "count": 1}
+  logship_unexpected_counter:
+    type: remap
+    inputs: [logship_result_route.unexpected]
+    drop_on_error: true
+    drop_on_abort: true
+    source: |
+      minute = format_timestamp!(now(), format: "%Y-%m-%dT%H:%M")
+      . = {"event": "logship_unexpected_label", "reason": "unexpected_label", "minute": minute, "count": 1}
+  logship_counter_reduce:
+    type: reduce
+    inputs: [logship_drop_counter, logship_unexpected_counter]
+    group_by: [event, reason, minute]
+    expire_after_ms: 75000
+    end_every_period_ms: 60000
+    flush_period_ms: 1000
+    merge_strategies:
+      count: sum
+  logship_counter_output:
+    type: remap
+    inputs: [logship_counter_reduce]
+    drop_on_error: true
+    drop_on_abort: true
+    source: |
+      event = .event
+      reason = .reason
+      count = .count
+      if !includes(["logship_gate_dropped_total", "logship_unexpected_label"], event) { abort }
+      if !includes(["malformed_envelope", "unexpected_label", "unknown_message", "unlabelled"], reason) { abort }
+      if !is_integer(count) { abort }
+      count = to_int(count) ?? 0
+      if count < 1 || count > 1000000000 { abort }
+      . = {
+        "level": "warn",
+        "ts": format_timestamp!(now(), format: "%Y-%m-%dT%H:%M:%S%.3fZ"),
+        "event": event,
+        "svc": "logship",
+        "reason": reason,
+        "count": count
+      }
   allowlist:
     type: remap
-    inputs: [docker_fluent]
+    inputs: [logship_result_route.validated]
     drop_on_abort: true
     drop_on_error: true
     source: |
@@ -14,30 +220,37 @@ transforms:
       if exists(.partial_message) { abort }
       if !is_string(.tag) { abort }
       tag = .tag
-      if !is_string(.log) { abort }
-      j, parse_err = parse_json(.log)
-      if parse_err != null || !is_object(j) { abort }
+      j = null
+      if exists(.parsed_log) {
+        j = .parsed_log
+        if !is_object(j) { abort }
+      } else {
+        if !is_string(.log) { abort }
+        j, parse_err = parse_json(.log)
+        if parse_err != null || !is_object(j) { abort }
+      }
       out = {}
       if tag == "tinycloud.node" {
         fields = get(j, ["fields"]) ?? null
         if !is_object(fields) { abort }
         level = get(j, ["level"]) ?? null
         if !is_string(level) { abort }
-        level = downcase!(level)
+        level = downcase(level) ?? ""
         if !includes(["warn", "error"], level) { abort }
         msg = get(fields, ["message"]) ?? null
         if !is_string(msg) { abort }
+        msg = to_string(msg) ?? ""
         event = null
         event_code = null
         if msg == "invocation replay insert failed" { event = "node_warning"; event_code = "invocation_replay_insert_failed" }
         else if msg == "invocation replay cleanup failed" { event = "node_warning"; event_code = "invocation_replay_cleanup_failed" }
-        else if starts_with!(msg, "dstack socket available but get_info failed: ") { event = "node_warning"; event_code = "dstack_get_info_failed" }
+        else if starts_with(msg, "dstack socket available but get_info failed: ") { event = "node_warning"; event_code = "dstack_get_info_failed" }
         else if msg == "share-v2 local-tee feature active: deriving a deterministic, non-attested TEE identity from node key material" { event = "node_warning"; event_code = "share_local_tee_identity" }
         else if msg == "retention: delivered hook delivery prune failed" { event = "node_warning"; event_code = "retention_hook_delivery_prune_failed" }
         else if msg == "retention: dead-letter hook delivery prune failed" { event = "node_warning"; event_code = "retention_dead_letter_prune_failed" }
         else if msg == "retention: signed KV ticket prune failed" { event = "node_warning"; event_code = "retention_signed_ticket_prune_failed" }
-        else if starts_with!(msg, "quota service returned an invalid body: ") { event = "node_warning"; event_code = "quota_invalid_body" }
-        else if starts_with!(msg, "quota service returned ") { event = "node_warning"; event_code = "quota_fallback" }
+        else if starts_with(msg, "quota service returned an invalid body: ") { event = "node_warning"; event_code = "quota_invalid_body" }
+        else if starts_with(msg, "quota service returned ") { event = "node_warning"; event_code = "quota_fallback" }
         else if msg == "failed to load tunnel state; tunnel not started" { event = "node_warning"; event_code = "tunnel_state_load_failed" }
         else if msg == "invalid loopback API address; tunnel not started" { event = "node_warning"; event_code = "tunnel_address_invalid" }
         else if msg == "failed to load link state; LAN listener not started" { event = "node_warning"; event_code = "link_state_load_failed" }
@@ -62,7 +275,7 @@ transforms:
         else if msg == "share v2 is enabled but shareEmail.invitationPublicKey is unset" { event = "node_error"; event_code = "share_invitation_key_missing" }
         else if msg == "configured share invitation key does not match the node's derived signing key" { event = "node_error"; event_code = "share_invitation_key_mismatch" }
         else if msg == "share/v2 policy challenge denied" { event = "node_warning"; event_code = "share_policy_denied" }
-        else if starts_with!(msg, "Failed to get TDX quote: ") { event = "node_error"; event_code = "attestation_quote_failed" }
+        else if starts_with(msg, "Failed to get TDX quote: ") { event = "node_error"; event_code = "attestation_quote_failed" }
         else if msg == "failed to read committed hook events" { event = "node_warning"; event_code = "hook_events_read_failed" }
         else if msg == "failed to load kv write hook rows" { event = "node_warning"; event_code = "hook_rows_load_failed" }
         else if msg == "failed to load kv delete hook rows" { event = "node_warning"; event_code = "hook_rows_load_failed" }
@@ -100,46 +313,43 @@ transforms:
         out.ts = format_timestamp!(parsed_ts, format: "%Y-%m-%dT%H:%M:%S%.3fZ")
         route = get(j, ["route"]) ?? null
         if !is_string(route) { abort }
-        route = to_string!(route)
+        route = to_string(route) ?? ""
         if length(route) > 256 { abort }
         if !includes(["/healthz","/info","/version","/invoke","/delegate","/revoke","/attestation","/signed/kv","/signed/kv/<ticket_id>","/admin/quota","/admin/quota/<space_id>","/admin/usage","/hooks/events","/hooks/tickets","/hooks/webhooks","/hooks/webhooks/<subscription_id>","/delegation/query","/delegation/status","/encryption/networks","/encryption/networks/<network_id>","/encryption/networks/<network_id>/revoke","/encryption/networks/<network_id>/decrypt","/policy/v3/status","/policy/v3/status/<root_cid>","/policy/v3/policies","/policy/v3/challenges","/policy/v3/delegations","/policy/v3/enforcer-bindings","/policy/v3/deliveries/authorize","/.well-known/tinycloud/node-keys","/.well-known/encryption/network/<name>","/public/<space_id>/kv","/public/<space_id>/kv/<key..>","/peer/generate/<space>","/evidences/<file>"], route) { route = "<unmatched>" }
         if !is_string(route) { abort }
-        route = to_string!(route)
         if !includes(["/healthz","/info","/version","/invoke","/delegate","/revoke","/attestation","/signed/kv","/signed/kv/<ticket_id>","/admin/quota","/admin/quota/<space_id>","/admin/usage","/hooks/events","/hooks/tickets","/hooks/webhooks","/hooks/webhooks/<subscription_id>","/delegation/query","/delegation/status","/encryption/networks","/encryption/networks/<network_id>","/encryption/networks/<network_id>/revoke","/encryption/networks/<network_id>/decrypt","/policy/v3/status","/policy/v3/status/<root_cid>","/policy/v3/policies","/policy/v3/challenges","/policy/v3/delegations","/policy/v3/enforcer-bindings","/policy/v3/deliveries/authorize","/.well-known/tinycloud/node-keys","/.well-known/encryption/network/<name>","/public/<space_id>/kv","/public/<space_id>/kv/<key..>","/peer/generate/<space>","/evidences/<file>","<unmatched>"], route) { abort }
         out.route = route
         method = get(j, ["method"]) ?? null
         if !is_string(method) { abort }
-        method = to_string!(method)
         if !includes(["GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS","<other>"], method) { abort }
         out.method = method
         status = get(j, ["status"]) ?? null
         if !is_integer(status) { abort }
-        status = to_int!(status)
+        status = to_int(status) ?? 0
         if status < 100 || status > 599 { abort }
         out.status = status
         bytes = get(j, ["bytes"]) ?? null
         if !is_integer(bytes) { abort }
-        bytes = to_int!(bytes)
+        bytes = to_int(bytes) ?? 0
         if bytes < 0 || bytes > 1000000000 { abort }
         out.bytes_sent = bytes
         upstream_status_raw = "-"
         if exists(j.upstream_status) { upstream_status_raw = j.upstream_status }
         if !is_string(upstream_status_raw) { abort }
-        upstream_status_raw = to_string!(upstream_status_raw)
+        upstream_status_raw = to_string(upstream_status_raw) ?? ""
         if length(upstream_status_raw) > 63 { abort }
         upstream_status = ""
         if upstream_status_raw != "-" && upstream_status_raw != "" {
-          if !match!(upstream_status_raw, r'^[1-5][0-9]{2}(, ?[1-5][0-9]{2}| : [1-5][0-9]{2})*$') { abort }
+          if !match(upstream_status_raw, r'^[1-5][0-9]{2}(, ?[1-5][0-9]{2}| : [1-5][0-9]{2})*$') { abort }
           upstream_status = slice!(upstream_status_raw, 0, 3)
         }
         if !is_string(upstream_status) { abort }
-        upstream_status = to_string!(upstream_status)
         if length(upstream_status) > 3 { abort }
-        if !match!(upstream_status, r'^(|[1-5][0-9]{2})$') { abort }
+        if !match(upstream_status, r'^(|[1-5][0-9]{2})$') { abort }
         out.upstream_status = upstream_status
         request_time = get(j, ["request_time"]) ?? null
         if !(is_integer(request_time) || is_float(request_time)) { abort }
-        request_time = to_float!(request_time)
+        request_time = to_float(request_time) ?? 0.0
         if request_time < 0 || request_time > 86400 { abort }
         out.request_time_seconds = request_time
         status_class = if status >= 500 { "5xx" } else if status >= 400 { "4xx" } else if status >= 300 { "3xx" } else if status >= 200 { "2xx" } else { "1xx" }
@@ -153,11 +363,11 @@ transforms:
       # END GENERATED FROM fields.json
   classify_by_budget:
     type: route
-    inputs: [allowlist]
+    inputs: [allowlist, logship_counter_output]
     route:
       panic: .event == "node_fatal_panic"
       app_error: .event == "node_error"
-      app_warning: .event == "node_warning"
+      app_warning: .event == "node_warning" || .event == "logship_gate_dropped_total" || .event == "logship_unexpected_label"
       ingress_summary: .event == "ingress_failure_count" || .event == "ingress_success_count"
       ingress_slow: .event == "ingress_request_slow"
   split_requests:

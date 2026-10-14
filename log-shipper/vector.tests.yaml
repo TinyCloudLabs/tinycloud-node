@@ -252,7 +252,7 @@ tests:
           tag: "tinycloud.node"
           log: "[]"
     no_outputs_from: [allowlist]
-  - name: "Docker partial records are dropped"
+  - name: "partial records are dropped"
     inputs:
       - insert_at: allowlist
         type: log
@@ -635,3 +635,168 @@ tests:
               assert_eq!(.event, "ingress_success_count")
               assert_eq!(.route, "<unmatched>")
               assert!(!contains(encode_json(.), "ticket-probe"))
+  - name: "labelled node GELF message passes after dockerd fields are stripped"
+    inputs:
+      - insert_at: logship_gate
+        type: log
+        log_fields:
+          '."_tc.logship"': "tinycloud-node"
+          "_container_id": "container-secret-probe"
+          "_container_name": "tinycloud-probe"
+          "_image_name": "image-secret-probe"
+          "_command": "private-command-probe"
+          "_private_probe": "custom-dockerd-probe"
+          host: "host-secret-probe"
+          version: "1"
+          level: 6
+          timestamp: 1791972000.0
+          source_type: "source-secret-probe"
+          peer_addr: "192.0.2.1"
+          port: 12345
+          message: '{"timestamp":"2026-10-14T10:00:00.000Z","level":"WARN","fields":{"message":"invocation replay insert failed"}}'
+    outputs:
+      - extract_from: logship_gate
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(get(., ["_tc.logship"]) ?? null, "tinycloud-node")
+              assert_eq!(.gate_action, "candidate")
+              assert_eq!(.gate_label, "tinycloud-node")
+      - extract_from: strip_gelf_fields
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.gate_action, "candidate")
+              assert!((get(., ["_tc.logship"]) ?? null) == null)
+              assert!(!exists(._container_id))
+              assert!(!exists(._container_name))
+              assert!(!exists(._image_name))
+              assert!(!exists(._command))
+              assert!(!exists(._private_probe))
+              assert!(!exists(.host))
+              assert!(!exists(.version))
+              assert!(!exists(.level))
+              assert!(!exists(.timestamp))
+              assert!(!exists(.source_type))
+              assert!(!exists(.peer_addr))
+              assert!(!exists(.port))
+              assert!(!contains(encode_json(.), "secret-probe"))
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "node_warning")
+              assert_eq!(.event_code, "invocation_replay_insert_failed")
+  - name: "labelled ingress GELF message passes the allowlist"
+    inputs:
+      - insert_at: logship_gate
+        type: log
+        log_fields:
+          '."_tc.logship"': "tinycloud-ingress"
+          message: '{"time":"2026-10-14T10:00:00+00:00","method":"GET","route":"/info","status":404,"bytes":0,"request_time":0.02,"upstream_status":"-"}'
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "ingress_failure_count")
+              assert_eq!(.route, "/info")
+  - name: "unlabelled GELF canaries are reduced to bounded counters"
+    inputs:
+      - &unlabelled_canary
+        insert_at: logship_gate
+        type: log
+        log_fields:
+          message: 'signed-kv-ticket-probe auth-probe did:key:owner-probe space-probe@example.invalid'
+      - *unlabelled_canary
+    no_outputs_from: [strip_gelf_fields, parse_gelf_message, allowlist]
+    outputs:
+      - extract_from: logship_counter_output
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "logship_gate_dropped_total")
+              assert_eq!(.reason, "unlabelled")
+              assert_eq!(.count, 2)
+              assert!(!contains(encode_json(.), "signed-kv-ticket-probe"))
+              assert!(!contains(encode_json(.), "auth-probe"))
+              assert!(!contains(encode_json(.), "did:key:owner-probe"))
+              assert!(!contains(encode_json(.), "space-probe@example.invalid"))
+  - name: "wrong and postgres labels produce only a fixed unexpected-label event"
+    inputs:
+      - insert_at: logship_gate
+        type: log
+        log_fields:
+          '."_tc.logship"': "private-untrusted-label"
+          message: "ticket-probe auth-probe wrong-label-canary"
+      - insert_at: logship_gate
+        type: log
+        log_fields:
+          '."_tc.logship"': "postgres"
+          message: "sql-password-probe postgres-canary"
+    no_outputs_from: [strip_gelf_fields, parse_gelf_message, allowlist]
+    outputs:
+      - extract_from: logship_counter_output
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "logship_unexpected_label")
+              assert_eq!(.reason, "unexpected_label")
+              assert_eq!(.count, 2)
+              assert!(!contains(encode_json(.), "private-untrusted-label"))
+              assert!(!contains(encode_json(.), "postgres"))
+              assert!(!contains(encode_json(.), "ticket-probe"))
+              assert!(!contains(encode_json(.), "sql-password-probe"))
+  - name: "label text inside a GELF message cannot forge the top-level label"
+    inputs:
+      - insert_at: logship_gate
+        type: log
+        log_fields:
+          message: '{"_tc.logship":"tinycloud-node","timestamp":"2026-10-14T10:00:00.000Z","level":"ERROR","fields":{"message":"node fatal panic"}}'
+    no_outputs_from: [strip_gelf_fields, parse_gelf_message, allowlist]
+    outputs:
+      - extract_from: logship_counter_output
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "logship_gate_dropped_total")
+              assert_eq!(.reason, "unlabelled")
+              assert_eq!(.count, 1)
+              assert!(!contains(encode_json(.), "node fatal panic"))
+  - name: "split GELF fragments with invalid JSON are counted without content"
+    inputs:
+      - insert_at: logship_gate
+        type: log
+        log_fields:
+          '."_tc.logship"': "tinycloud-node"
+          "_container_id": "container-fragment-probe"
+          message: '{"timestamp":"2026-10-14T10:00:00.000Z","level":"ERROR","fields":{"message":"token-fragment-probe'
+    no_outputs_from: [allowlist]
+    outputs:
+      - extract_from: logship_counter_output
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "logship_gate_dropped_total")
+              assert_eq!(.reason, "malformed_envelope")
+              assert_eq!(.count, 1)
+              assert!(!contains(encode_json(.), "token-fragment-probe"))
+  - name: "labelled ingress non-JSON messages are dropped after the gate"
+    inputs:
+      - insert_at: logship_gate
+        type: log
+        log_fields:
+          '."_tc.logship"': "tinycloud-ingress"
+          _container_id: "container-non-json-probe"
+          message: "private-non-json-ingress-probe"
+    no_outputs_from: [allowlist]
+    outputs:
+      - extract_from: logship_counter_output
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "logship_gate_dropped_total")
+              assert_eq!(.reason, "malformed_envelope")
+              assert_eq!(.count, 1)
+              assert!(!contains(encode_json(.), "private-non-json-ingress-probe"))
+              assert!(!contains(encode_json(.), "container-non-json-probe"))

@@ -63,25 +63,23 @@ const quote = (value) => JSON.stringify(value);
 function vrlValidationLines(spec, accessor) {
   if (spec.type === "enum") return [
     `if !is_string(${accessor}) { abort }`,
-    `${accessor} = to_string!(${accessor})`,
     `if !includes(${JSON.stringify(spec.values)}, ${accessor}) { abort }`,
   ];
   if (spec.type === "integer") return [
     `if !is_integer(${accessor}) { abort }`,
-    `${accessor} = to_int!(${accessor})`,
+    `${accessor} = to_int(${accessor}) ?? 0`,
     `if ${accessor} < ${spec.min} || ${accessor} > ${spec.max} { abort }`,
   ];
   if (spec.type === "number") return [
     `if !(is_integer(${accessor}) || is_float(${accessor})) { abort }`,
-    `${accessor} = to_float!(${accessor})`,
+    `${accessor} = to_float(${accessor}) ?? 0.0`,
     `if ${accessor} < ${spec.min} || ${accessor} > ${spec.max} { abort }`,
   ];
   if (spec.type === "boolean") return [`if !is_boolean(${accessor}) { abort }`];
   if (spec.type === "string") return [
     `if !is_string(${accessor}) { abort }`,
-    `${accessor} = to_string!(${accessor})`,
     `if length(${accessor}) > ${spec.max_len} { abort }`,
-    `if !match!(${accessor}, r'${spec.regex}') { abort }`,
+    `if !match(${accessor}, r'${spec.regex}') { abort }`,
   ];
   throw new Error(`unsupported type for ${spec.type}`);
 }
@@ -95,25 +93,32 @@ export function renderAllowlist(schema) {
     "if exists(.partial_message) { abort }",
     "if !is_string(.tag) { abort }",
     "tag = .tag",
-    "if !is_string(.log) { abort }",
-    "j, parse_err = parse_json(.log)",
-    "if parse_err != null || !is_object(j) { abort }",
+    "j = null",
+    "if exists(.parsed_log) {",
+    "  j = .parsed_log",
+    "  if !is_object(j) { abort }",
+    "} else {",
+    "  if !is_string(.log) { abort }",
+    "  j, parse_err = parse_json(.log)",
+    "  if parse_err != null || !is_object(j) { abort }",
+    "}",
     "out = {}",
     "if tag == \"tinycloud.node\" {",
     "  fields = get(j, [\"fields\"]) ?? null",
     "  if !is_object(fields) { abort }",
     "  level = get(j, [\"level\"]) ?? null",
     "  if !is_string(level) { abort }",
-    "  level = downcase!(level)",
+    "  level = downcase(level) ?? \"\"",
     "  if !includes([\"warn\", \"error\"], level) { abort }",
     "  msg = get(fields, [\"message\"]) ?? null",
     "  if !is_string(msg) { abort }",
+    "  msg = to_string(msg) ?? \"\"",
     "  event = null",
     "  event_code = null",
   ];
   const messagePairs = Object.entries(sourceMessages);
   for (const [index, [message, [event, code]]] of messagePairs.entries()) {
-    const condition = message.endsWith(": ") || message === "quota service returned " ? `starts_with!(msg, ${quote(message)})` : `msg == ${quote(message)}`;
+    const condition = message.endsWith(": ") || message === "quota service returned " ? `starts_with(msg, ${quote(message)})` : `msg == ${quote(message)}`;
     lines.push(`  ${index === 0 ? "if" : "else if"} ${condition} { event = ${quote(event)}; event_code = ${quote(code)} }`);
   }
   lines.push("  else if msg == \"node fatal panic\" { event = \"node_fatal_panic\"; event_code = \"other\" }");
@@ -139,7 +144,7 @@ export function renderAllowlist(schema) {
   lines.push("  out.ts = format_timestamp!(parsed_ts, format: \"%Y-%m-%dT%H:%M:%S%.3fZ\")");
   lines.push("  route = get(j, [\"route\"]) ?? null");
   lines.push("  if !is_string(route) { abort }");
-  lines.push("  route = to_string!(route)");
+  lines.push("  route = to_string(route) ?? \"\"");
   lines.push("  if length(route) > 256 { abort }");
   const knownRoutes = service.fields.route.values.filter((value) => value !== "<unmatched>");
   lines.push(`  if !includes(${JSON.stringify(knownRoutes)}, route) { route = "<unmatched>" }`);
@@ -157,11 +162,11 @@ export function renderAllowlist(schema) {
   lines.push("  upstream_status_raw = \"-\"");
   lines.push("  if exists(j.upstream_status) { upstream_status_raw = j.upstream_status }");
   lines.push("  if !is_string(upstream_status_raw) { abort }");
-  lines.push("  upstream_status_raw = to_string!(upstream_status_raw)");
+  lines.push("  upstream_status_raw = to_string(upstream_status_raw) ?? \"\"");
   lines.push("  if length(upstream_status_raw) > 63 { abort }");
   lines.push("  upstream_status = \"\"");
   lines.push("  if upstream_status_raw != \"-\" && upstream_status_raw != \"\" {");
-  lines.push("    if !match!(upstream_status_raw, r'^[1-5][0-9]{2}(, ?[1-5][0-9]{2}| : [1-5][0-9]{2})*$') { abort }");
+  lines.push("    if !match(upstream_status_raw, r'^[1-5][0-9]{2}(, ?[1-5][0-9]{2}| : [1-5][0-9]{2})*$') { abort }");
   lines.push("    upstream_status = slice!(upstream_status_raw, 0, 3)");
   lines.push("  }");
   for (const line of vrlValidationLines(service.fields.upstream_status, "upstream_status")) lines.push(`  ${line}`);
@@ -186,10 +191,34 @@ export function checkVectorFile(schema, yaml = readFileSync(vectorPath, "utf8"))
   if (!match) throw new Error("vector.yaml is missing generated allowlist markers");
   const actual = match[0].split("\n").map((line) => line.replace(/^      /, "")).join("\n");
   if (actual !== renderAllowlist(schema)) throw new Error("vector.yaml allowlist differs from fields.json-generated VRL");
-  for (const name of ["allowlist", "slow_success", "request_minute", "request_output", "budget_size_guard"]) {
+  for (const name of ["logship_gate", "strip_gelf_fields", "parse_gelf_message", "logship_inner", "logship_drop_counter", "logship_unexpected_counter", "logship_counter_output", "allowlist", "slow_success", "request_minute", "request_output", "budget_size_guard"]) {
     const block = yaml.match(new RegExp(`^  ${name}:\\n([\\s\\S]*?)(?=\\n  [a-z][a-z0-9_]*:\\n|\\nsinks:)`, "m"))?.[1];
     if (!block?.includes("type: remap") || !block.includes("drop_on_error: true")) throw new Error(`${name} remap must set drop_on_error: true`);
   }
+  const firstTransform = yaml.match(/transforms:\n  ([a-z][a-z0-9_]*):/)?.[1];
+  const gate = yaml.match(/  logship_gate:\n([\s\S]*?)(?=\n  [a-z][a-z0-9_]*:\n|\nsinks:)/)?.[1];
+  const gelfSource = yaml.match(/  gelf_in:\n([\s\S]*?)(?=\n  [a-z][a-z0-9_]*:\n|\ntransforms:)/)?.[1];
+  if (firstTransform !== "logship_gate" ||
+      !gate?.includes('inputs: [gelf_in]') ||
+      !gate.includes('lbl = string(get(., ["_tc.logship"]) ?? null) ?? ""') ||
+      !gelfSource?.includes("type: socket") ||
+      !gelfSource.includes("mode: udp") ||
+      !gelfSource.includes("address: 0.0.0.0:12201") ||
+      !gelfSource.includes("framing: { method: chunked_gelf, chunked_gelf: { decompression: Auto } }") ||
+      !gelfSource.includes("decoding: { codec: gelf }")) {
+    throw new Error("GELF socket and first-transform label gate differ from the reviewed transport");
+  }
+  const transformOrder = ["logship_gate", "strip_gelf_fields", "parse_gelf_message", "allowlist"];
+  if (transformOrder.some((name, index) => index > 0 && yaml.indexOf(`  ${transformOrder[index - 1]}:`) >= yaml.indexOf(`  ${name}:`))) {
+    throw new Error("GELF gate, field-stripping, parse, and allowlist order changed");
+  }
+  if (/docker_files|parse_docker_envelope|read_from:|\/var\/lib\/docker|fluentd/i.test(yaml)) throw new Error("obsolete Docker file and Fluentd transport remnants remain");
+  const inner = yaml.match(/  logship_inner:\n([\s\S]*?)(?=\n  [a-z][a-z0-9_]*:\n|$)/)?.[1];
+  if (!inner) throw new Error("logship_inner message guard is missing");
+  for (const message of Object.keys(sourceMessages)) {
+    if (!inner.includes(quote(message))) throw new Error(`logship_inner message allowlist is missing ${message}`);
+  }
+  if (!inner.includes('"node fatal panic"') || !inner.includes('"unknown_message"')) throw new Error("logship_inner must count unknown messages and preserve the fixed panic event");
   const requestOutput = yaml.match(/  request_output:\n([\s\S]*?)(?=\n  [a-z][a-z0-9_]*:\n|$)/)?.[1];
   if (!requestOutput?.includes("drop_on_abort: true")) throw new Error("request_output must drop aborts");
   const count = schema.services["tinycloud-node"].fields.request_count;
@@ -213,8 +242,11 @@ export function checkVectorFile(schema, yaml = readFileSync(vectorPath, "utf8"))
   const requiredBudgetConfig = [
     "panic: .event == \"node_fatal_panic\"",
     "app_error: .event == \"node_error\"",
-    "app_warning: .event == \"node_warning\"",
-    "ingress_summary: .event == \"ingress_failure_count\" || .event == \"ingress_success_count\"",
+    "app_warning: .event == \"node_warning\" || .event == \"logship_gate_dropped_total\" || .event == \"logship_unexpected_label\"",
+    "inputs: [logship_gate_route.node, logship_gate_route.ingress]",
+    "inputs: [logship_gate_route.rejected, logship_inner]",
+    "inputs: [allowlist, logship_counter_output]",
+    "inputs: [logship_result_route.validated]",
     "group_by: [route, status_class, event, minute]",
     "inputs: [classify_by_budget.panic]",
     "threshold: 2",
@@ -234,11 +266,22 @@ export function checkVectorFile(schema, yaml = readFileSync(vectorPath, "utf8"))
   if (monthlyBudgetBytes > 480000000) throw new Error(`Vector event budget exceeds 0.48 GB/month: ${monthlyBudgetBytes} bytes`);
   if ((yaml.match(/threshold: 5\n/g) ?? []).length !== 2) throw new Error("node error and warning lanes must each be capped at five events/minute");
 }
+
+export function checkComposeDeploymentPackaging(compose) {
+  if (/^\s*env_file\s*:/m.test(compose)) throw new Error("Compose packaging must not use env_file");
+  const configs = compose.match(/^configs:\n([\s\S]*?)(?=\n\S|$)/)?.[1];
+  if (configs && /^\s+file\s*:/m.test(configs)) throw new Error("Compose packaging must not use configs.*.file");
+  if (/^\s*-\s*(?:\.\/|\.\.\/)/m.test(compose) || /^\s*source:\s*(?!\/|\|)[^\s]+/m.test(compose)) {
+    throw new Error("Compose packaging must not use relative bind sources");
+  }
+}
+
 export function renderComposeVectorConfig(vectorYaml) {
   return vectorYaml.trimEnd().split("\n").map((line) => `        ${line.replaceAll("$", () => "$$")}`).join("\n");
 }
 
 export function checkComposeVectorConfig(compose = readFileSync(`${root}docker-compose.dstack-postgres.yaml`, "utf8"), vectorYaml = readFileSync(vectorPath, "utf8")) {
+  checkComposeDeploymentPackaging(compose);
   const start = compose.indexOf("      VECTOR_CONFIG_YAML: |\n");
   const end = compose.indexOf("    entrypoint:", start);
   if (start < 0 || end < 0) throw new Error("compose Vector config block not found");
@@ -268,16 +311,21 @@ export function checkNodeSchema(schema) {
   if (JSON.stringify(schema.common.level) !== JSON.stringify({ type: "enum", values: ["debug", "info", "warn", "error"] })) throw new Error("common.level differs from the emitted level allowlist");
   if (JSON.stringify(schema.common.ts) !== JSON.stringify({ type: "string", regex: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$", max_len: 24 })) throw new Error("common.ts differs from the emitted timestamp format");
   if (schema.common.event?.type !== "event") throw new Error("common.event must use event type");
-  if (service.events.join(",") !== "node_fatal_panic,node_warning,node_error,ingress_failure_count,ingress_request_slow,ingress_success_count") throw new Error("tinycloud-node event set differs from the reviewed set");
+  if (service.events.join(",") !== "node_fatal_panic,node_warning,node_error,ingress_failure_count,ingress_request_slow,ingress_success_count,logship_gate_dropped_total,logship_unexpected_label") throw new Error("tinycloud-node event set differs from the reviewed set");
   if (Object.values(sourceMessages).some(([, code]) => !new Set(service.fields.event_code?.values ?? []).has(code))) throw new Error("source message map contains an event_code missing from fields.json");
   if (Object.keys(service.fields).sort().join(",") !== [
-    "bytes_sent", "event_code", "method", "request_count", "request_time_seconds", "route", "status", "status_class", "svc", "upstream_status",
+    "bytes_sent", "count", "event_code", "method", "reason", "request_count", "request_time_seconds", "route", "status", "status_class", "svc", "upstream_status",
   ].sort().join(",")) throw new Error("tinycloud-node fields differ from the reviewed field set");
   if (service.fields.request_count?.type !== "integer" || service.fields.request_count.min !== 1 || service.fields.request_count.max !== 1000000) throw new Error("request_count must remain bounded to 1..1000000");
+  if (service.fields.count?.type !== "integer" || service.fields.count.min !== 1 || service.fields.count.max !== 1000000000) throw new Error("logship count must remain bounded to 1..1000000000");
+  if (JSON.stringify(service.fields.reason) !== JSON.stringify({ type: "enum", values: ["malformed_envelope", "unexpected_label", "unknown_message", "unlabelled"] })) throw new Error("logship reason enum differs from emitted values");
   if (service.fields.route?.type !== "enum" || service.fields.route.values.length !== 36 || !service.fields.route.values.includes("<unmatched>")) throw new Error("route output must be a 36-value bounded enum including <unmatched>");
-  if (JSON.stringify(service.fields.svc) !== JSON.stringify({ type: "enum", values: ["api", "ingress"] })) throw new Error("svc enum differs from emitted values");
+  if (JSON.stringify(service.fields.svc) !== JSON.stringify({ type: "enum", values: ["api", "ingress", "logship"] })) throw new Error("svc enum differs from emitted values");
   if (JSON.stringify(service.fields.status_class) !== JSON.stringify({ type: "enum", values: ["1xx", "2xx", "3xx", "4xx", "5xx"] })) throw new Error("status_class enum differs from emitted values");
   if (service.fields.event_code?.type !== "enum" || !service.fields.event_code.values.includes("other")) throw new Error("event_code must preserve the fixed panic other value");
+  for (const event of ["logship_gate_dropped_total", "logship_unexpected_label"]) {
+    if (!service.events.includes(event)) throw new Error(`tinycloud-node is missing ${event}`);
+  }
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

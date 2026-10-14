@@ -69,10 +69,12 @@
         "node_error",
         "ingress_failure_count",
         "ingress_request_slow",
-        "ingress_success_count"
+        "ingress_success_count",
+        "logship_gate_dropped_total",
+        "logship_unexpected_label"
       ],
       "fields": {
-        "svc": { "type": "enum", "values": ["api", "ingress"] },
+        "svc": { "type": "enum", "values": ["api", "ingress", "logship"] },
         "route": { "type": "enum", "values": ["/healthz", "/info", "/version", "/invoke", "/delegate", "/revoke", "/attestation", "/signed/kv", "/signed/kv/<ticket_id>", "/admin/quota", "/admin/quota/<space_id>", "/admin/usage", "/hooks/events", "/hooks/tickets", "/hooks/webhooks", "/hooks/webhooks/<subscription_id>", "/delegation/query", "/delegation/status", "/encryption/networks", "/encryption/networks/<network_id>", "/encryption/networks/<network_id>/revoke", "/encryption/networks/<network_id>/decrypt", "/policy/v3/status", "/policy/v3/status/<root_cid>", "/policy/v3/policies", "/policy/v3/challenges", "/policy/v3/delegations", "/policy/v3/enforcer-bindings", "/policy/v3/deliveries/authorize", "/.well-known/tinycloud/node-keys", "/.well-known/encryption/network/<name>", "/public/<space_id>/kv", "/public/<space_id>/kv/<key..>", "/peer/generate/<space>", "/evidences/<file>", "<unmatched>"] },
         "method": { "type": "enum", "values": ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "<other>"] },
         "status": { "type": "integer", "min": 100, "max": 599 },
@@ -81,6 +83,8 @@
         "request_count": { "type": "integer", "min": 1, "max": 1000000 },
         "bytes_sent": { "type": "integer", "min": 0, "max": 1000000000 },
         "upstream_status": { "type": "string", "regex": "^(|[1-5][0-9]{2})$", "max_len": 3 },
+        "count": { "type": "integer", "min": 1, "max": 1000000000 },
+        "reason": { "type": "enum", "values": ["malformed_envelope", "unexpected_label", "unknown_message", "unlabelled"] },
         "event_code": { "type": "enum", "values": ["invocation_replay_insert_failed", "invocation_replay_cleanup_failed", "dstack_get_info_failed", "share_local_tee_identity", "retention_hook_delivery_prune_failed", "retention_dead_letter_prune_failed", "retention_signed_ticket_prune_failed", "quota_invalid_body", "quota_fallback", "tunnel_state_load_failed", "tunnel_address_invalid", "link_state_load_failed", "link_bind_invalid", "link_bind_failed", "link_bind_state_write_failed", "link_tls_config_failed", "link_listener_error", "link_listener_state_write_failed", "link_auto_renew_config_failed", "link_auto_renew_failed", "link_cert_reload_failed", "link_listener_cert_reload_failed", "link_disable_failed", "link_connection_error", "link_listener_accept_failed", "webhook_delivery_failed", "webhook_dispatcher_failed", "share_authorization_failed", "share_native_authorization_denied", "share_native_kv_put_failed", "share_v2_readiness_failed", "share_invitation_key_missing", "share_invitation_key_mismatch", "share_policy_denied", "attestation_quote_failed", "hook_events_read_failed", "hook_rows_load_failed", "missing_committed_hook_row", "webhook_enqueue_failed", "tunnel_connection_prepare_failed", "tunnel_idle_timeout", "tunnel_read_failed", "tunnel_malformed_frame", "tunnel_relay_error", "tunnel_write_failed", "tunnel_state_record_failed", "tunnel_state_clear_failed", "tunnel_auth_rejected", "other"] }
       }
     },

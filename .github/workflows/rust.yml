@@ -206,10 +206,10 @@ jobs:
         mkdir -p "${RUNNER_TEMP}/vector"
         tar -xzf "${RUNNER_TEMP}/${archive}" -C "${RUNNER_TEMP}/vector"
         vector="${RUNNER_TEMP}/vector/vector-x86_64-unknown-linux-musl/bin/vector"
-        mkdir -m 700 -p /tmp/vector-secrets
-        trap 'rm -rf /tmp/vector-secrets' EXIT
-        printf '%s' 'dummy-vector-test-token' > /tmp/vector-secrets/bs_token
-        chmod 600 /tmp/vector-secrets/bs_token
+        sudo install -d -o "$(id -u)" -g "$(id -g)" -m 700 /var/lib/vector/secrets
+        trap 'sudo rm -rf /var/lib/vector' EXIT
+        printf '%s' 'dummy-vector-test-token' > /var/lib/vector/secrets/bs_token
+        chmod 600 /var/lib/vector/secrets/bs_token
         "${vector}" validate --no-environment log-shipper/vector.yaml
         "${vector}" test log-shipper/vector.yaml log-shipper/vector.tests.yaml
     - name: Verify generated capability artifacts match capabilities.json
