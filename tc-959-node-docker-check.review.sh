@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 umask 077
+set -Eeuo pipefail
 
 ROOT=$(git rev-parse --show-toplevel)
 BASE_COMPOSE="$ROOT/docker-compose.dstack-postgres.yaml"
@@ -329,7 +330,11 @@ for (const fragment of ['count=$$(cat /control/burst)', 'while [ "$$i" -lt "$$co
   if (!ingress.includes(fragment)) throw new Error(`rendered producer command lost Compose escaping: ${fragment}`);
 }
 const libraryPath = `${root}/scripts/tc-959-isolation.sh`;
-const shellSources = [fs.readFileSync(harnessPath, 'utf8'), fs.readFileSync(libraryPath, 'utf8')];
+const harnessSource = fs.readFileSync(harnessPath, 'utf8');
+if (!harnessSource.split(/\r?\n/).slice(1, 3).includes('set -Eeuo pipefail')) {
+  throw new Error('harness must keep set -Eeuo pipefail on line 2 or 3');
+}
+const shellSources = [harnessSource, fs.readFileSync(libraryPath, 'utf8')];
 const declared = new Set(shellSources.flatMap((source) =>
   [...source.matchAll(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(\)\s*\{/gm)].map((match) => match[1])));
 const calledHelpers = [
@@ -387,21 +392,9 @@ read_metric_sample() {
   curl --fail --silent http://127.0.0.1:9598/metrics | node "$ROOT/scripts/tc-959-vector-metrics.mjs" received-sample
 }
 metric_now_ms() { node -p 'Date.now()'; }
-vector_shipped_count() {
-  [[ "$(docker_cmd inspect -f '{{.State.Running}}' "$VECTOR_ID")" == true ]] || fail "refusing to read events from a stopped Vector container"
-  docker_cmd logs "$VECTOR_ID" 2>&1 | node "$ROOT/scripts/tc-959-vector-metrics.mjs" probe-count
-}
-vector_shipped_name_counts() {
-  [[ "$(docker_cmd inspect -f '{{.State.Running}}' "$VECTOR_ID")" == true ]] || fail "refusing to read events from a stopped Vector container"
-  docker_cmd logs "$VECTOR_ID" 2>&1 | node "$ROOT/scripts/tc-959-vector-metrics.mjs" event-name-counts
-}
 report_shipped_event_delta() {
   printf '%s\n%s\n' "$1" "$2" | node "$ROOT/scripts/tc-959-vector-metrics.mjs" event-name-delta |
     while IFS= read -r event; do record "INFO: newly shipped console $event"; done
-}
-vector_event_count() {
-  [[ "$(docker_cmd inspect -f '{{.State.Running}}' "$VECTOR_ID")" == true ]] || fail "refusing to read events from a stopped Vector container"
-  docker_cmd logs "$VECTOR_ID" 2>&1 | node "$ROOT/scripts/tc-959-vector-metrics.mjs" event-count ingress_request_slow
 }
 measure_burst() {
   local cpus=$1 before sent_at after received deadline loss
@@ -482,7 +475,9 @@ measure_burst 0.5
 compose_cmd up -d --force-recreate --no-deps vector >/dev/null
 wait_vector
 wait_next_line 0
-record "INFO: restored production Vector cpus=0.25 before isolation, node-latency, and memory checks"
+restored_nano_cpus=$(docker_cmd inspect -f '{{.HostConfig.NanoCpus}}' "$VECTOR_ID")
+[[ "$restored_nano_cpus" == 250000000 ]] || fail "Vector CPU limit after restore is $restored_nano_cpus, expected 250000000"
+record "PASS: restored production Vector NanoCpus=250000000 before isolation, node-latency, and memory checks"
 
 # Keep the idle synthetic ingress up so its network namespace is available for sibling probes.
 PROBE_CANARY=TC959_FORGED_PROBE_CANARY_UNEXPECTED_FIELD

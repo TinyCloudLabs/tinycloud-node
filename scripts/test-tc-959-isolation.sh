@@ -29,8 +29,13 @@ vector_shipped_name_counts() {
 }
 report_shipped_event_delta() { :; }
 compose_cmd() { printf '%s\n' test-vector; }
+LOGS_SHOULD_FAIL=0
 docker_cmd() {
-  if [[ "$1" == logs ]]; then printf '%s\n' "$RAW_CONSOLE_OUTPUT"; return 0; fi
+  if [[ "$1" == logs ]]; then
+    if (( LOGS_SHOULD_FAIL )); then printf '%s\n' 'stub docker logs failure' >&2; return 1; fi
+    printf '%s\n' "$RAW_CONSOLE_OUTPUT"
+    return 0
+  fi
   [[ "$1" == inspect ]] && printf '%s\n' true
 }
 curl() { return 0; }
@@ -109,6 +114,16 @@ else
 fi
 RAW_CONSOLE_OUTPUT='{"event":"node_warning","event_code":"other_warning"}'
 assert_no_console_marker TC959_FORGED_PROBE_CANARY_UNEXPECTED_FIELD || fail "raw console scan falsely matched absent marker"
+unset -f vector_shipped_count vector_shipped_name_counts vector_event_count assert_no_console_marker
+source "$ROOT/scripts/tc-959-isolation.sh"
+LOGS_SHOULD_FAIL=1
+for reader in vector_shipped_count vector_shipped_name_counts vector_event_count assert_no_console_marker; do
+  if output=$("$reader" TC959_FORGED_PROBE_CANARY_UNEXPECTED_FIELD 2>&1); then
+    fail "$reader passed after docker logs failed"
+  fi
+  [[ "$output" == *"docker logs failed"* ]] || fail "$reader did not fail closed: $output"
+done
+LOGS_SHOULD_FAIL=0
 
 # Host-port preflight reports the owning Compose service before startup.
 PORT_HOLDER_MODE=container

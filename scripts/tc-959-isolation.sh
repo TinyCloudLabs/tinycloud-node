@@ -229,10 +229,31 @@ check_isolated_probe() {
 }
 
 
+vector_shipped_count() {
+  [[ "$(docker_cmd inspect -f '{{.State.Running}}' "$VECTOR_ID")" == true ]] || fail "refusing to read events from a stopped Vector container"
+  local logs
+  logs=$(docker_cmd logs "$VECTOR_ID" 2>&1) || fail "docker logs failed"
+  printf '%s\n' "$logs" | node "$ROOT/scripts/tc-959-vector-metrics.mjs" probe-count
+}
+
+vector_shipped_name_counts() {
+  [[ "$(docker_cmd inspect -f '{{.State.Running}}' "$VECTOR_ID")" == true ]] || fail "refusing to read events from a stopped Vector container"
+  local logs
+  logs=$(docker_cmd logs "$VECTOR_ID" 2>&1) || fail "docker logs failed"
+  printf '%s\n' "$logs" | node "$ROOT/scripts/tc-959-vector-metrics.mjs" event-name-counts
+}
+
+vector_event_count() {
+  [[ "$(docker_cmd inspect -f '{{.State.Running}}' "$VECTOR_ID")" == true ]] || fail "refusing to read events from a stopped Vector container"
+  local logs
+  logs=$(docker_cmd logs "$VECTOR_ID" 2>&1) || fail "docker logs failed"
+  printf '%s\n' "$logs" | node "$ROOT/scripts/tc-959-vector-metrics.mjs" event-count ingress_request_slow
+}
+
 assert_no_console_marker() {
-  local marker=$1 console_output match_count
-  console_output=$(docker_cmd logs "$VECTOR_ID" 2>&1) || return 2
-  match_count=$(printf '%s\n' "$console_output" | grep -cF -- "$marker" || true)
+  local marker=$1 logs match_count
+  logs=$(docker_cmd logs "$VECTOR_ID" 2>&1) || fail "docker logs failed"
+  match_count=$(printf '%s\n' "$logs" | grep -cF -- "$marker" || true)
   [[ "$match_count" == 0 ]]
 }
 assert_isolated_probe() {
