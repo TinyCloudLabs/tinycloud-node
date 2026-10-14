@@ -10,6 +10,7 @@ CONTROL="$WORK/control"
 mkdir -p "$CONTROL"
 PROJECT="tc959-gelf-$$"
 OVERRIDE="$WORK/compose.override.yaml"
+VECTOR_REPLAY_CONFIG="$WORK/vector.acceptance.native.yaml"
 VECTOR_TEST_CONFIG="$WORK/vector.acceptance.yaml"
 NATIVE_VECTOR_CONFIG="$WORK/vector.native.yaml"
 NATIVE_SECRET_DIR="$WORK/native-secrets"
@@ -97,7 +98,7 @@ fs.writeFileSync(targetPath, config, { mode: 0o600 });
 NODE
 node "$ROOT/scripts/node-vector-schema.mjs" --check || fail "generated schema check failed"
 node "$ROOT/scripts/node-vector-schema.mjs" --check-compose || fail "embedded Compose parity failed"
-node --test "$ROOT/scripts/node-vector-schema.test.mjs" "$ROOT/scripts/tc-959-vector-metrics.test.mjs" || fail "schema, packaging, and metrics tests failed"
+node --test "$ROOT/scripts/node-vector-schema.test.mjs" "$ROOT/scripts/tc-959-vector-metrics.test.mjs" "$ROOT/scripts/tc-959-compose-env.test.mjs" || fail "schema, packaging, metrics, and compose environment tests failed"
 bash "$ROOT/scripts/test-tc-959-isolation.sh" || fail "freshness and isolation helper tests failed"
 "$VECTOR_BIN" validate --no-environment "$NATIVE_VECTOR_CONFIG" || fail "native Vector validation failed"
 "$VECTOR_BIN" test "$NATIVE_VECTOR_CONFIG" "$ROOT/log-shipper/vector.tests.yaml" || fail "native Vector tests failed"
@@ -119,9 +120,9 @@ DSTACK_GATEWAY_DOMAIN=invalid.test
 CERTBOT_EMAIL=acceptance@example.invalid
 EOF
 
-node - "$ROOT/log-shipper/vector.yaml" "$VECTOR_TEST_CONFIG" <<'NODE'
+node - "$ROOT/log-shipper/vector.yaml" "$VECTOR_TEST_CONFIG" "$VECTOR_REPLAY_CONFIG" "$NATIVE_SECRET_DIR" "$NATIVE_DATA_DIR" <<'NODE'
 const fs = require('node:fs');
-const [sourcePath, targetPath] = process.argv.slice(2);
+const [sourcePath, targetPath, replayPath, secretDir, dataDir] = process.argv.slice(2);
 let config = fs.readFileSync(sourcePath, 'utf8');
 const sinkAt = config.lastIndexOf('\nsinks:\n');
 if (sinkAt < 0) throw new Error('canonical sink block not found');
@@ -132,8 +133,13 @@ const updatedSinkAt = config.lastIndexOf('\nsinks:\n');
 config = config.slice(0, updatedSinkAt) + `\nsinks:\n  local_console:\n    type: console\n    inputs: [budget_size_guard]\n    encoding: { codec: json }\n  metrics_exporter:\n    type: prometheus_exporter\n    inputs: [internal_metrics]\n    address: 0.0.0.0:9598\n`;
 fs.writeFileSync(targetPath, config, { mode: 0o644 });
 fs.chmodSync(targetPath, 0o644);
+const replayConfig = config.replaceAll('/var/lib/vector/secrets', secretDir).replaceAll('/var/lib/vector', dataDir);
+fs.writeFileSync(replayPath, replayConfig, { mode: 0o644 });
+fs.chmodSync(replayPath, 0o644);
 NODE
 "$VECTOR_BIN" validate --no-environment "$VECTOR_TEST_CONFIG" || fail "acceptance Vector config validation failed"
+"$VECTOR_BIN" validate --no-environment "$VECTOR_REPLAY_CONFIG" || fail "native acceptance replay config validation failed"
+node "$ROOT/scripts/tc-959-vector-env-replay.mjs" "$VECTOR_BIN" "$VECTOR_REPLAY_CONFIG" "$ROOT/log-shipper/vector.yaml" || fail "native Vector environment replay failed"
 
 cat >"$SENDER" <<'NODE'
 import { createSocket } from 'node:dgram';
@@ -175,6 +181,7 @@ services:
       - "host.docker.internal:host-gateway"
   dstack-ingress:
     image: alpine:3.21
+    environment: !override {}
     command:
       - /bin/sh
       - -ec
@@ -198,8 +205,9 @@ services:
     ports: !override []
   vector:
     entrypoint: !override ["/bin/sh", "-ec"]
+    environment: !override {}
     command:
-      - mkdir -p /var/lib/vector/secrets && printf '%s\\n' tc959-dummy-token-only > /var/lib/vector/secrets/bs_token && chmod 0644 /var/lib/vector/secrets/bs_token && exec vector --config /etc/vector/acceptance.yaml
+      - mkdir -p /var/lib/vector/secrets && printf '%s\\n' tc959-dummy-token-only > /var/lib/vector/secrets/bs_token && chmod 0644 /var/lib/vector/secrets/bs_token && exec env -u VECTOR_CONFIG_YAML -u BETTERSTACK_SOURCE_TOKEN -u BETTERSTACK_SOURCE_HOST vector --config /etc/vector/acceptance.yaml
     volumes:
       - "$VECTOR_TEST_CONFIG:/etc/vector/acceptance.yaml:ro"
     ports:
@@ -231,6 +239,33 @@ const { parse } = requireFromRoot('yaml');
 const [overridePath, root, harnessPath, vectorConfigPath] = process.argv.slice(2);
 const composeText = fs.readFileSync(overridePath, 'utf8');
 const compose = parse(composeText.replaceAll('!override', ''));
+const baseCompose = parse(fs.readFileSync(`${root}/docker-compose.dstack-postgres.yaml`, 'utf8'));
+const baseVectorEnv = baseCompose.services.vector.environment ?? {};
+if (!Object.hasOwn(baseVectorEnv, 'VECTOR_CONFIG_YAML') || !Object.hasOwn(baseVectorEnv, 'BETTERSTACK_SOURCE_TOKEN')) {
+  throw new Error('base Vector environment regression fixture is missing');
+}
+const vectorEnv = compose.services?.vector?.environment;
+if (!vectorEnv || Object.keys(vectorEnv).length !== 0) throw new Error('acceptance Vector environment must be explicitly empty');
+const ingressEnv = compose.services?.['dstack-ingress']?.environment;
+if (!ingressEnv || Object.keys(ingressEnv).length !== 0) throw new Error('acceptance ingress environment must be explicitly empty');
+const postgresEnv = compose.services?.postgres?.environment ?? {};
+if (Object.keys(postgresEnv).some((name) => name.startsWith('TINYCLOUD_'))) {
+  throw new Error('acceptance Postgres environment must not inherit TINYCLOUD_* variables');
+}
+const nodeEnv = compose.services?.tinycloud?.environment ?? {};
+if (nodeEnv.TINYCLOUD_KEYS_TYPE !== 'Static' || nodeEnv.TINYCLOUD_TEE__MODE !== 'Off') {
+  throw new Error('acceptance node lost its test-only environment override');
+}
+const envCheck = spawnSync(process.execPath, [`${root}/scripts/tc-959-compose-env.mjs`], {
+  input: JSON.stringify({ services: {
+    tinycloud: { environment: nodeEnv },
+    'dstack-ingress': { environment: ingressEnv },
+    postgres: { environment: postgresEnv },
+    vector: { environment: vectorEnv },
+  } }),
+  encoding: 'utf8',
+});
+if (envCheck.status !== 0) throw new Error(`acceptance service environments failed: ${envCheck.stderr}`);
 const ingressCommand = compose.services?.['dstack-ingress']?.command;
 if (!Array.isArray(ingressCommand) || ingressCommand.length !== 3 ||
     ingressCommand[0] !== '/bin/sh' || ingressCommand[1] !== '-ec' || typeof ingressCommand[2] !== 'string') {
@@ -242,7 +277,7 @@ if (JSON.stringify(vector?.entrypoint) !== JSON.stringify(['/bin/sh', '-ec']) ||
   throw new Error('vector must override the production entrypoint and use a one-script command');
 }
 const effectiveArgv = [...vector.entrypoint, ...vector.command].map((argument) => argument.replaceAll('$$', '$'));
-const expectedVectorScript = String.raw`mkdir -p /var/lib/vector/secrets && printf '%s\n' tc959-dummy-token-only > /var/lib/vector/secrets/bs_token && chmod 0644 /var/lib/vector/secrets/bs_token && exec vector --config /etc/vector/acceptance.yaml`;
+const expectedVectorScript = String.raw`mkdir -p /var/lib/vector/secrets && printf '%s\n' tc959-dummy-token-only > /var/lib/vector/secrets/bs_token && chmod 0644 /var/lib/vector/secrets/bs_token && exec env -u VECTOR_CONFIG_YAML -u BETTERSTACK_SOURCE_TOKEN -u BETTERSTACK_SOURCE_HOST vector --config /etc/vector/acceptance.yaml`;
 const expectedVectorArgv = ['/bin/sh', '-ec', expectedVectorScript];
 if (JSON.stringify(effectiveArgv) !== JSON.stringify(expectedVectorArgv)) {
   throw new Error(`vector effective argv mismatch: ${JSON.stringify(effectiveArgv)}`);
@@ -295,6 +330,9 @@ require docker
 require curl
 require ip
 docker compose version >/dev/null || fail "Docker Compose v2 is required"
+if ! "${COMPOSE[@]}" config --format json | node "$ROOT/scripts/tc-959-compose-env.mjs"; then
+  fail "rendered Compose environment isolation failed"
+fi
 record "Preflight: no DockerRootDir assumption; no host Docker-directory access."
 record "Metrics freshness: internal_metrics scrape interval=${METRICS_SCRAPE_INTERVAL_SECONDS}s; isolation settle=${ISOLATION_SETTLE_SECONDS}s; require two strictly newer timestamps with stable source value."
 
