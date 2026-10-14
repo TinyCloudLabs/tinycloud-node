@@ -349,9 +349,7 @@ fn embedded_v4(ip: IpAddr) -> impl Iterator<Item = Ipv4Addr> {
             if b[8] == 0 && b[13..].iter().all(|byte| *byte == 0) {
                 values[2] = Some(Ipv4Addr::new(b[9], b[10], b[11], b[12]));
             }
-            if values.iter().all(Option::is_none) {
-                values[3] = Some(Ipv4Addr::new(b[12], b[13], b[14], b[15]));
-            }
+            values[3] = Some(Ipv4Addr::new(b[12], b[13], b[14], b[15]));
         }
     }
     values.into_iter().flatten()

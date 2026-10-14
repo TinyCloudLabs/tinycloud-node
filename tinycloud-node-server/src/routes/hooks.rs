@@ -1315,6 +1315,10 @@ mod tests {
             ("https://callback.test/hooks", Some("::127.0.0.1")),
             ("https://callback.test/hooks", Some("64:ff9b::a9fe:a9fe")),
             ("https://callback.test/hooks", Some("2002:7f00:1::")),
+            (
+                "https://callback.test/hooks",
+                Some("64:ff9b:1:808:8:808:7f00:0"),
+            ),
             ("https://[::ffff:7f00:1]/hooks", None),
             ("https://[64:ff9b:1::a00:1]/hooks", None),
         ];
