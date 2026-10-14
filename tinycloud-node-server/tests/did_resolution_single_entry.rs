@@ -3,9 +3,34 @@ use proc_macro2::{TokenStream, TokenTree};
 use quote::ToTokens;
 use std::path::{Path, PathBuf};
 use syn::{
+    ext::IdentExt,
     visit::{self, Visit},
     Attribute, Item,
 };
+
+fn ident_name(ident: &syn::Ident) -> String {
+    ident.unraw().to_string()
+}
+
+fn normalized_tokens(tokens: TokenStream) -> TokenStream {
+    tokens
+        .into_iter()
+        .map(|token| match token {
+            TokenTree::Ident(ident) => TokenTree::Ident(ident.unraw()),
+            TokenTree::Group(group) => {
+                let mut normalized =
+                    proc_macro2::Group::new(group.delimiter(), normalized_tokens(group.stream()));
+                normalized.set_span(group.span());
+                TokenTree::Group(normalized)
+            }
+            other => other,
+        })
+        .collect()
+}
+
+fn canonical_tokens(value: &impl ToTokens) -> String {
+    normalized_tokens(value.to_token_stream()).to_string()
+}
 
 fn source_files(dir: &Path, files: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(dir).unwrap() {
@@ -20,8 +45,8 @@ fn source_files(dir: &Path, files: &mut Vec<PathBuf>) {
 
 fn test_only(attrs: &[Attribute]) -> bool {
     attrs.iter().any(|attr| {
-        attr.path().is_ident("cfg")
-            && matches!(&attr.meta, syn::Meta::List(list) if list.tokens.to_string() == "test")
+        canonical_tokens(attr.path()) == "cfg"
+            && matches!(&attr.meta, syn::Meta::List(list) if canonical_tokens(&list.tokens) == "test")
     })
 }
 
@@ -109,7 +134,7 @@ impl Guard {
     }
 
     fn allowed(&self, call: &syn::ExprMethodCall) -> bool {
-        let expression = call.to_token_stream().to_string();
+        let expression = canonical_tokens(call);
         // Exact pre-existing calls only: storage config, byte ranges, pinned
         // webhook DNS, share authority, and DID reference absolutization.
         // Manifest::resolve is the existing non-UCAN, caller-supplied resolver
@@ -131,17 +156,60 @@ impl Guard {
         )
     }
 
+    fn auth_resolver_import(&self, item: &syn::ItemUse) -> bool {
+        self.file == "tinycloud-auth/src/resolver.rs"
+            && canonical_tokens(item) == "use ssi :: dids :: AnyDidMethod ;"
+    }
+
+    fn auth_resolver_definition(&self, mac: &syn::Macro) -> bool {
+        // Exempt only the existing offline-generation registry declaration,
+        // never the rest of resolver.rs or another lazy_static body.
+        self.file == "tinycloud-auth/src/resolver.rs"
+            && canonical_tokens(&mac.path) == "lazy_static :: lazy_static"
+            && canonical_tokens(&mac.tokens)
+                == "pub static ref DID_METHODS : AnyDidMethod = AnyDidMethod :: default () ;"
+    }
+
+    fn offline_cacao_verification(&self, call: &syn::ExprMethodCall) -> bool {
+        // CACAO's argument-free SIWE verification is offline. Pin these
+        // existing expressions; never exempt a file, function, or receiver.
+        matches!(
+            (
+                self.file.as_str(),
+                self.function.as_str(),
+                canonical_tokens(call).as_str()
+            ),
+            (
+                "tinycloud-core/src/models/delegation.rs",
+                "verify",
+                "cacao . verify ()"
+            ) | (
+                "tinycloud-core/src/models/revocation.rs",
+                "process",
+                "c . verify ()"
+            ) | (
+                "tinycloud-node-server/src/policy_v3.rs",
+                "authenticate_account_owner",
+                "cacao . verify ()"
+            ) | (
+                "tinycloud-node-server/src/share_v2.rs",
+                "verify_delegation_signature",
+                "cacao . verify ()"
+            )
+        )
+    }
+
     fn scan_macro(&mut self, tokens: TokenStream) {
         // syn leaves macro bodies opaque. Inspect their tokens too, so a raw
         // resolver call inside a production macro cannot evade the guard.
         let tokens: Vec<_> = tokens.into_iter().collect();
         for window in tokens.windows(4) {
-            if matches!(&window[0], TokenTree::Ident(ident) if ident == "dids")
+            if matches!(&window[0], TokenTree::Ident(ident) if ident_name(ident) == "dids")
                 && matches!(&window[1], TokenTree::Punct(punct) if punct.as_char() == ':')
                 && matches!(&window[2], TokenTree::Punct(punct) if punct.as_char() == ':')
             {
                 match &window[3] {
-                    TokenTree::Ident(ident) if network_did_module(&ident.to_string()) => {
+                    TokenTree::Ident(ident) if network_did_module(&ident_name(ident)) => {
                         self.violations
                             .push(format!("network DID module dids::{ident} in macro"));
                     }
@@ -160,7 +228,7 @@ impl Guard {
             match token {
                 TokenTree::Group(group) => self.scan_macro(group.stream()),
                 TokenTree::Ident(ident) => {
-                    let name = ident.to_string();
+                    let name = ident_name(&ident);
                     if raw_resolver_ident(&name) || resolver_entry(&name) {
                         self.violations
                             .push(format!("resolver token {name} in macro"));
@@ -175,7 +243,7 @@ impl Guard {
         match tree {
             syn::UseTree::Path(path) => {
                 self.check_module(&path.ident, parent_is_dids);
-                self.scan_use_tree(&path.tree, path.ident == "dids");
+                self.scan_use_tree(&path.tree, ident_name(&path.ident) == "dids");
             }
             syn::UseTree::Name(name) => self.check_module(&name.ident, parent_is_dids),
             syn::UseTree::Rename(rename) => self.check_module(&rename.ident, parent_is_dids),
@@ -189,7 +257,7 @@ impl Guard {
     }
 
     fn check_module(&mut self, ident: &syn::Ident, parent_is_dids: bool) {
-        if parent_is_dids && network_did_module(&ident.to_string()) {
+        if parent_is_dids && network_did_module(&ident_name(ident)) {
             self.violations
                 .push(format!("network DID module dids::{ident}"));
         }
@@ -201,7 +269,7 @@ impl<'ast> Visit<'ast> for Guard {
         if test_only(item_attrs(item)) {
             if let Item::Mod(module) = item {
                 if module.content.is_none() {
-                    let dir = self.module_dir.join(module.ident.to_string());
+                    let dir = self.module_dir.join(ident_name(&module.ident));
                     self.test_modules.push(dir.with_extension("rs"));
                     self.test_modules.push(dir.join("mod.rs"));
                 }
@@ -213,7 +281,7 @@ impl<'ast> Visit<'ast> for Guard {
 
     fn visit_item_mod(&mut self, module: &'ast syn::ItemMod) {
         let previous = self.module_dir.clone();
-        self.module_dir.push(module.ident.to_string());
+        self.module_dir.push(ident_name(&module.ident));
         visit::visit_item_mod(self, module);
         self.module_dir = previous;
     }
@@ -245,24 +313,27 @@ impl<'ast> Visit<'ast> for Guard {
     }
 
     fn visit_signature(&mut self, signature: &'ast syn::Signature) {
-        self.function = signature.ident.to_string();
+        self.function = ident_name(&signature.ident);
         visit::visit_signature(self, signature);
     }
 
     fn visit_ident(&mut self, ident: &'ast syn::Ident) {
-        if raw_resolver_ident(&ident.to_string()) {
+        if raw_resolver_ident(&ident_name(ident)) {
             self.violations.push(format!("raw resolver {ident}"));
         }
     }
 
     fn visit_path(&mut self, path: &'ast syn::Path) {
         for (parent, child) in path.segments.iter().zip(path.segments.iter().skip(1)) {
-            self.check_module(&child.ident, parent.ident == "dids");
+            self.check_module(&child.ident, ident_name(&parent.ident) == "dids");
         }
         visit::visit_path(self, path);
     }
 
     fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+        if self.auth_resolver_import(item) {
+            return;
+        }
         self.scan_use_tree(&item.tree, false);
         visit::visit_item_use(self, item);
     }
@@ -270,28 +341,33 @@ impl<'ast> Visit<'ast> for Guard {
     fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
         // DID generation is offline and does not resolve an issuer. Visit its
         // arguments, but exempt only the DID_METHODS.generate receiver.
-        if call.method == "generate"
+        if ident_name(&call.method) == "generate"
             && matches!(&*call.receiver,
-            syn::Expr::Path(path) if path.path.segments.last().is_some_and(|s| s.ident == "DID_METHODS"))
+            syn::Expr::Path(path) if path.path.segments.last().is_some_and(|s| ident_name(&s.ident) == "DID_METHODS"))
         {
             for argument in &call.args {
                 self.visit_expr(argument);
             }
             return;
         }
-        if resolver_entry(&call.method.to_string()) && !self.allowed(call) {
+        if !self.offline_cacao_verification(call)
+            && resolver_entry(&ident_name(&call.method))
+            && !self.allowed(call)
+        {
             self.violations.push(call.to_token_stream().to_string());
         }
+        // Ordinary verify() also serves fixed-key cryptography; any resolver
+        // types, factories, or calls in its receiver/arguments are still visited.
         visit::visit_expr_method_call(self, call);
     }
 
     fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
         if let syn::Expr::Path(path) = &*call.func {
-            let name = path.path.segments.last().unwrap().ident.to_string();
+            let name = ident_name(&path.path.segments.last().unwrap().ident);
             // Explicit non-DID function paths; aliases and unqualified raw
             // resolve calls still fail. These operate on profile paths or
             // stored SQL/DuckDB publication names, never on issuer DIDs.
-            let function_path = path.to_token_stream().to_string();
+            let function_path = canonical_tokens(path);
             let non_did = matches!(
                 (self.file.as_str(), function_path.as_str()),
                 (
@@ -319,6 +395,9 @@ impl<'ast> Visit<'ast> for Guard {
     }
 
     fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        if self.auth_resolver_definition(mac) {
+            return;
+        }
         self.scan_macro(mac.tokens.clone());
     }
 }
@@ -327,7 +406,11 @@ impl<'ast> Visit<'ast> for Guard {
 fn ucan_resolution_has_one_production_entry_point() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     let mut files = Vec::new();
-    for dir in ["tinycloud-core/src", "tinycloud-node-server/src"] {
+    for dir in [
+        "tinycloud-core/src",
+        "tinycloud-node-server/src",
+        "tinycloud-auth/src",
+    ] {
         source_files(&root.join(dir), &mut files);
     }
     let mut scans = Vec::new();
@@ -407,6 +490,145 @@ fn scan_fixture(code: &str) -> Guard {
     let mut guard = Guard::new("fixture.rs");
     guard.visit_file(&syn::parse_file(code).unwrap());
     guard
+}
+
+#[test]
+fn raw_identifiers_cannot_hide_resolver_names() {
+    for source in [
+        "async fn production() { u.r#verify_signature(&dids::r#AnyDidMethod::default()).await; }",
+        "async fn production() { dids::r#DIDWeb.r#into_vm_resolver::<Method>().r#resolve_verification_method_with(id, None, options).await; }",
+        "async fn production() { adapter.r#resolve(did).await; adapter.r#dereference_with(url, options).await; }",
+        "async fn production() { Adapter::r#into_vm_resolver_with(adapter, options); }",
+        "wrapper!(dids::r#DIDTz.r#into_vm_resolver::<Method>());",
+        "use provider::r#dids::r#web as Renamed;",
+        "use provider::r#dids::{r#tz as Renamed, key::DIDKey};",
+        "type Adapter = provider::r#dids::r#ion::Resolver;",
+        "wrapper!(provider::r#dids::r#ethr::Resolver);",
+        "wrapper!(use provider::r#dids::{r#web as Renamed});",
+    ] {
+        let raw = scan_fixture(source);
+        let ordinary = scan_fixture(&source.replace("r#", ""));
+        assert!(!raw.violations.is_empty(), "raw identifier bypass: {source}");
+        assert_eq!(raw.violations.len(), ordinary.violations.len(), "{source}");
+    }
+    for ident in [
+        "AnyDidMethod",
+        "DID_METHODS",
+        "DIDWeb",
+        "DIDTz",
+        "DIDION",
+        "DIDEthr",
+        "VerificationMethodDIDResolver",
+        "VerificationParameters",
+        "did_web",
+        "did_tz",
+        "did_ion",
+        "did_ethr",
+    ] {
+        for source in [
+            format!("use provider::r#{ident} as Renamed;"),
+            format!("type Adapter = provider::r#{ident};"),
+            format!("wrapper!(provider::r#{ident});"),
+        ] {
+            assert!(!scan_fixture(&source).violations.is_empty(), "{source}");
+        }
+    }
+}
+
+#[test]
+fn raw_identifiers_preserve_exact_offline_and_test_exceptions() {
+    let source = r##"
+        #[r#cfg(r#test)] mod r#tests { fn fixture() { r#AnyDidMethod::default(); } }
+        fn production() {
+            r#DID_METHODS.r#generate(&key, pattern);
+            r#verify_ucan_signature(ucan);
+            wrapper!("r#DIDWeb r#into_vm_resolver r#dids::r#web");
+        }
+    "##;
+    let guard = scan_fixture(source);
+    assert!(guard.violations.is_empty(), "{:?}", guard.violations);
+    assert_eq!(guard.helper_calls, 1);
+    let mut guard = Guard::new("tinycloud-core/src/storage/memory.rs");
+    guard.visit_file(
+        &syn::parse_file("fn r#read_range() { r#range.r#resolve(r#total_size); }").unwrap(),
+    );
+    assert!(guard.violations.is_empty(), "{:?}", guard.violations);
+    guard.visit_file(&syn::parse_file("fn other() { r#range.r#resolve(r#total_size); }").unwrap());
+    assert_eq!(guard.violations.len(), 1);
+
+    let guard = scan_fixture("fn production() { r#DID_METHODS.r#generate(r#DIDWeb, pattern); }");
+    assert!(
+        !guard.violations.is_empty(),
+        "generation arguments were exempted"
+    );
+}
+
+#[test]
+fn auth_registry_exception_cannot_hide_another_resolver_call() {
+    let registry = include_str!("../../tinycloud-auth/src/resolver.rs");
+    for source in [
+        registry.to_string(),
+        registry
+            .replace("AnyDidMethod", "r#AnyDidMethod")
+            .replace("DID_METHODS", "r#DID_METHODS"),
+    ] {
+        let mut guard = Guard::new("tinycloud-auth/src/resolver.rs");
+        guard.visit_file(&syn::parse_file(&source).unwrap());
+        assert!(guard.violations.is_empty(), "{:?}", guard.violations);
+        let mut guard = Guard::new("tinycloud-auth/src/other.rs");
+        guard.visit_file(&syn::parse_file(&source).unwrap());
+        assert!(
+            !guard.violations.is_empty(),
+            "registry exception spread to another file"
+        );
+    }
+    for source in [
+        format!("{registry}\nasync fn verify_with_any(u: &Ucan) {{ u.verify_signature(&*DID_METHODS).await; }}"),
+        registry.replace("AnyDidMethod::default()", "AnyDidMethod::default().resolve(did)"),
+        registry.replace("pub static ref", "static ref"),
+        format!("{registry}\nwrapper!(DID_METHODS.resolve(did));"),
+    ] {
+        let mut guard = Guard::new("tinycloud-auth/src/resolver.rs");
+        guard.visit_file(&syn::parse_file(&source).unwrap());
+        assert!(!guard.violations.is_empty(), "auth bypass: {source}");
+    }
+}
+
+#[test]
+fn offline_cacao_exceptions_are_exact_and_do_not_hide_claims_resolvers() {
+    for (file, function, receiver) in [
+        ("tinycloud-core/src/models/delegation.rs", "verify", "cacao"),
+        ("tinycloud-core/src/models/revocation.rs", "process", "c"),
+        (
+            "tinycloud-node-server/src/policy_v3.rs",
+            "authenticate_account_owner",
+            "cacao",
+        ),
+        (
+            "tinycloud-node-server/src/share_v2.rs",
+            "verify_delegation_signature",
+            "cacao",
+        ),
+    ] {
+        let mut guard = Guard::new(file);
+        guard.function = function.into();
+        let call: syn::ExprMethodCall = syn::parse_str(&format!("{receiver}.verify()")).unwrap();
+        assert!(guard.offline_cacao_verification(&call));
+        guard.visit_expr_method_call(&call);
+        assert!(guard.violations.is_empty());
+        let call: syn::ExprMethodCall = syn::parse_str(&format!(
+            "{receiver}.verify(VerificationParameters::from_resolver(DIDWeb.into_vm_resolver::<Method>()))"
+        )).unwrap();
+        assert!(!guard.offline_cacao_verification(&call));
+        guard.visit_expr_method_call(&call);
+        assert!(
+            !guard.violations.is_empty(),
+            "CACAO exception hid a claims resolver"
+        );
+        guard.function = "another_function".into();
+        let call = syn::parse_str(&format!("{receiver}.verify()")).unwrap();
+        assert!(!guard.offline_cacao_verification(&call));
+    }
 }
 
 #[test]
