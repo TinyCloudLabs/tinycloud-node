@@ -110,6 +110,10 @@ default-features = false
 features = ["sqlite", "postgres", "mysql", "tokio", "verification-count-test-hook"]
 
 [dev-dependencies]
+# Parse production Rust items in the DID resolver source guard (tests only).
+syn = { version = "2", features = ["full", "visit"] }
+quote = "1"
+proc-macro2 = "1"
 rusqlite.workspace = true
 tokio = { version = "1", features = ["test-util"] }
 axum = { version = "0.7", features = ["ws"] }
