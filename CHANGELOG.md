@@ -2,12 +2,17 @@
 
 ## [Unreleased]
 
+## [1.20.7] - 2026-10-14
+
+A security hardening release (TC-1132, #292) for webhook, quota and tunnel egress.
+
 - Security (TC-1132, TC-1080 Parts C–D): webhook registration and every delivery attempt share an egress policy covering special-use IPv4/IPv6, embedded IPv4 (mapped, compatible, NAT64 and 6to4), Teredo and site-local IPv6. Ambiguous local-use NAT64 is refused if any valid IPv4 interpretation is forbidden. Corrected public controls such as `192.2.1.1` and `198.51.0.1` are no longer over-blocked. Mixed DNS answers retain only permitted addresses.
 - Webhooks deny the resolved addresses of the configured network database, quota URL, space allowlist and explicit S3 endpoint on every port, including aliases and embedded IPv4 forms. The service deny-set refreshes every ten minutes; validation waits for an in-progress refresh, and failed/stale resolution closes egress until recovery. Temporary DNS/policy failures retry on the existing bounded schedule; invalid or forbidden callbacks dead-letter. Existing subscriptions whose destinations become forbidden dead-letter on the next attempt.
 - Webhook DNS is bounded to one second. Each delivery resolves once and gives only vetted addresses to reqwest through a sealed, immutable-target sender. A fresh policy lease rechecks literal and hostname addresses and remains held through connection/send, so refresh cannot invalidate a vetted target before it connects. Proxy environment variables are ignored, redirects/non-HTTPS destinations refused, connect time capped at two seconds, and the configured total timeout includes lease/freshness work and sending. No production private-destination/development flag was added; body bytes, headers and HMAC signing are unchanged.
 - Registration caps both raw and canonical callback URLs at 2,048 bytes and secrets at 256 bytes. Retry attempts 6 and later keep the one-hour backoff; `hooks.webhook_max_attempts` must not exceed 10.
 - Quota requests encode the original SpaceId as one path segment and do not follow redirects; cache/override keys and fallback remain unchanged. Tunnel upstream requests do not follow redirects and have a 30-second total timeout, including body reads; 3xx responses and existing per-request errors retain their framing.
 - Network DID methods remain disabled by default. Full TC-1080 Part B (node-owned did:web fetcher, destination policy, timeouts, body limits, and refusal tests) is **required before any future re-enable**; this change does not implement or enable that fetcher. No schema migration.
+- The test-only DID resolution source guard now also covers SSI verification-method adapters, `into_vm_resolver` spellings and production auth-helper paths (#290).
 
 ## [1.20.6] - 2026-10-14
 
