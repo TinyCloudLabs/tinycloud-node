@@ -66,6 +66,7 @@ if (fileURLToPath(import.meta.url) === process.argv[1]) {
     const value = parseGelfReceivedCounter(input);
     process.stdout.write(value === null ? "missing" : String(value));
   } else if (operation === "received-sample") {
+    const sample = parseGelfReceivedSample(input);
     process.stdout.write(sample === null ? "missing" : `${sample.value} ${sample.timestamp}`);
   } else if (operation === "shipped-count") {
     process.stdout.write(String(countShippedEvents(input)));

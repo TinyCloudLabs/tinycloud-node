@@ -75,6 +75,7 @@ trap cleanup EXIT
 
 fail() { record "FAIL: $*"; exit 1; }
 require() { command -v "$1" >/dev/null 2>&1 || fail "missing command: $1"; }
+source "$ROOT/scripts/tc-959-isolation.sh"
 
 record "TC-959 GELF/UDP acceptance; project=$PROJECT; report=$REPORT"
 record "This script is review-only. Run only after the lead authorizes Docker."
@@ -97,6 +98,7 @@ NODE
 node "$ROOT/scripts/node-vector-schema.mjs" --check || fail "generated schema check failed"
 node "$ROOT/scripts/node-vector-schema.mjs" --check-compose || fail "embedded Compose parity failed"
 node --test "$ROOT/scripts/node-vector-schema.test.mjs" "$ROOT/scripts/tc-959-vector-metrics.test.mjs" || fail "schema, packaging, and metrics tests failed"
+bash "$ROOT/scripts/test-tc-959-isolation.sh" || fail "freshness and isolation helper tests failed"
 "$VECTOR_BIN" validate --no-environment "$NATIVE_VECTOR_CONFIG" || fail "native Vector validation failed"
 "$VECTOR_BIN" test "$NATIVE_VECTOR_CONFIG" "$ROOT/log-shipper/vector.tests.yaml" || fail "native Vector tests failed"
 record "PASS: native checks used only a disposable dummy token fixture before any Docker operation"
@@ -195,9 +197,8 @@ services:
       - "$CONTROL:/control"
     ports: !override []
   vector:
+    entrypoint: !override ["/bin/sh", "-ec"]
     command:
-      - /bin/sh
-      - -ec
       - mkdir -p /var/lib/vector/secrets && printf '%s\\n' tc959-dummy-token-only > /var/lib/vector/secrets/bs_token && chmod 0644 /var/lib/vector/secrets/bs_token && exec vector --config /etc/vector/acceptance.yaml
     volumes:
       - "$VECTOR_TEST_CONFIG:/etc/vector/acceptance.yaml:ro"
@@ -221,36 +222,66 @@ services:
         max-size: "10m"
         max-file: "3"
 EOF
-node - "$OVERRIDE" "$ROOT" <<'NODE'
+node - "$OVERRIDE" "$ROOT" "$ROOT/tc-959-node-docker-check.review.sh" "$VECTOR_TEST_CONFIG" <<'NODE'
 const fs = require('node:fs');
 const { spawnSync } = require('node:child_process');
 const { createRequire } = require('node:module');
 const requireFromRoot = createRequire(`${process.argv[3]}/package.json`);
 const { parse } = requireFromRoot('yaml');
-const path = process.argv[2];
-const text = fs.readFileSync(path, 'utf8');
-const compose = parse(text.replaceAll('!override', ''));
-for (const service of ['dstack-ingress', 'vector']) {
-  const argv = compose.services?.[service]?.command;
-  if (!Array.isArray(argv) || argv.length !== 3 || argv[0] !== '/bin/sh' || argv[1] !== '-ec' || typeof argv[2] !== 'string') {
-    throw new Error(`${service} rendered Compose argv must be [/bin/sh, -ec, script]`);
-  }
-  const renderedArgv = argv.map((argument) => argument.replaceAll('$$', '$'));
-  if (renderedArgv[0] !== '/bin/sh' || renderedArgv[1] !== '-ec') throw new Error(`${service} rendered argv changed`);
-  const syntax = spawnSync('sh', ['-n'], { input: renderedArgv[2], encoding: 'utf8' });
-  if (syntax.status !== 0) throw new Error(`${service} generated shell is invalid: ${syntax.stderr}`);
+const [overridePath, root, harnessPath, vectorConfigPath] = process.argv.slice(2);
+const composeText = fs.readFileSync(overridePath, 'utf8');
+const compose = parse(composeText.replaceAll('!override', ''));
+const ingressCommand = compose.services?.['dstack-ingress']?.command;
+if (!Array.isArray(ingressCommand) || ingressCommand.length !== 3 ||
+    ingressCommand[0] !== '/bin/sh' || ingressCommand[1] !== '-ec' || typeof ingressCommand[2] !== 'string') {
+  throw new Error('dstack-ingress effective Compose argv must be [/bin/sh, -ec, script]');
 }
-const ingress = compose.services['dstack-ingress'].command[2];
-for (const fragment of [
-  'count=$$(cat /control/burst)',
-  'while [ "$$i" -lt "$$count" ]',
-  'i=$$((i + 1))',
-]) {
+const vector = compose.services?.vector;
+if (JSON.stringify(vector?.entrypoint) !== JSON.stringify(['/bin/sh', '-ec']) ||
+    !Array.isArray(vector.command) || vector.command.length !== 1 || typeof vector.command[0] !== 'string') {
+  throw new Error('vector must override the production entrypoint and use a one-script command');
+}
+const effectiveArgv = [...vector.entrypoint, ...vector.command].map((argument) => argument.replaceAll('$$', '$'));
+const expectedVectorScript = String.raw`mkdir -p /var/lib/vector/secrets && printf '%s\n' tc959-dummy-token-only > /var/lib/vector/secrets/bs_token && chmod 0644 /var/lib/vector/secrets/bs_token && exec vector --config /etc/vector/acceptance.yaml`;
+const expectedVectorArgv = ['/bin/sh', '-ec', expectedVectorScript];
+if (JSON.stringify(effectiveArgv) !== JSON.stringify(expectedVectorArgv)) {
+  throw new Error(`vector effective argv mismatch: ${JSON.stringify(effectiveArgv)}`);
+}
+const vectorConfig = fs.readFileSync(vectorConfigPath, 'utf8');
+for (const fragment of ['allowlist:', 'budget_size_guard:', 'local_console:', 'metrics_exporter:']) {
+  if (!vectorConfig.includes(fragment)) throw new Error(`acceptance Vector config is missing ${fragment}`);
+}
+for (const [name, argv] of [['dstack-ingress', ingressCommand.map((argument) => argument.replaceAll('$$', '$'))], ['vector', effectiveArgv]]) {
+  const syntax = spawnSync('sh', ['-n'], { input: argv[2], encoding: 'utf8' });
+  if (syntax.status !== 0) throw new Error(`${name} generated shell is invalid: ${syntax.stderr}`);
+}
+const ingress = ingressCommand[2];
+for (const fragment of ['count=$$(cat /control/burst)', 'while [ "$$i" -lt "$$count" ]', 'i=$$((i + 1))']) {
   if (!ingress.includes(fragment)) throw new Error(`rendered producer command lost Compose escaping: ${fragment}`);
+}
+const libraryPath = `${root}/scripts/tc-959-isolation.sh`;
+const shellSources = [fs.readFileSync(harnessPath, 'utf8'), fs.readFileSync(libraryPath, 'utf8')];
+const declared = new Set(shellSources.flatMap((source) =>
+  [...source.matchAll(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(\)\s*\{/gm)].map((match) => match[1])));
+const calledHelpers = [
+  'record', 'docker_cmd', 'compose_cmd', 'memory_sampler', 'cleanup', 'fail', 'require',
+  'wait_vector', 'wait_node', 'read_metric', 'read_metric_sample', 'metric_now_ms',
+  'wait_fresh_stable_metric', 'fresh_sample', 'wait_metric', 'vector_shipped_count',
+  'vector_event_count', 'wait_next_line', 'send_from_container', 'send_probe',
+  'assert_positive_delivery', 'check_isolated_probe', 'assert_isolated_probe',
+  'run_isolation_leak_self_test',
+];
+const missing = calledHelpers.filter((name) => !declared.has(name));
+if (missing.length) throw new Error(`harness calls undefined shell functions: ${missing.join(', ')}`);
+for (const shellFile of [harnessPath, libraryPath, `${root}/scripts/test-tc-959-isolation.sh`]) {
+  const syntax = spawnSync('bash', ['-n', shellFile], { encoding: 'utf8' });
+  if (syntax.status !== 0) throw new Error(`${shellFile} has invalid Bash syntax: ${syntax.stderr}`);
 }
 NODE
 if [[ "$DRY_RUN" == 1 ]]; then
   record "DRY-RUN: no Docker command invoked"
+  docker_cmd version
+  compose_cmd config
   record "DRY-RUN: acceptance self-test expects an allowed host-loopback packet to make the negative check fail"
   record "DRY-RUN: positive host-loopback and logship-control-container probes require fresh source +1 and shipped +1"
   record "DRY-RUN: node/ingress/Postgres sibling and host external-interface probes require two newer stable source samples and shipped +0"
@@ -274,15 +305,6 @@ touch "$SAMPLER_STOP"
 memory_sampler &
 SAMPLER_PID=$!
 
-wait_vector() {
-  local deadline=$((SECONDS + 20))
-  while (( SECONDS < deadline )); do
-    VECTOR_ID=$(compose_cmd ps -q vector)
-    if [[ -n "$VECTOR_ID" ]] && [[ "$(docker_cmd inspect -f '{{.State.Running}}' "$VECTOR_ID")" == true ]] && curl --fail --silent --max-time 1 http://127.0.0.1:9598/metrics >/dev/null; then return 0; fi
-    sleep 0.2
-  done
-  fail "Vector did not become running within 20 seconds"
-}
 read_metric() {
   curl --fail --silent http://127.0.0.1:9598/metrics | node "$ROOT/scripts/tc-959-vector-metrics.mjs" received-counter
 }
@@ -290,37 +312,6 @@ read_metric_sample() {
   curl --fail --silent http://127.0.0.1:9598/metrics | node "$ROOT/scripts/tc-959-vector-metrics.mjs" received-sample
 }
 metric_now_ms() { node -p 'Date.now()'; }
-wait_fresh_stable_metric() {
-  local after_ms=$1 deadline=$((SECONDS + 20)) settle_until=$((after_ms + ISOLATION_SETTLE_SECONDS * 1000))
-  local sample value timestamp previous_timestamp=-1 previous_value=-1 now
-  while (( SECONDS < deadline )); do
-    sample=$(read_metric_sample)
-    if [[ "$sample" =~ ^([0-9]+)[[:space:]]([0-9]+)$ ]]; then
-      value=${BASH_REMATCH[1]}
-      timestamp=${BASH_REMATCH[2]}
-      if (( timestamp > after_ms && timestamp > previous_timestamp )); then
-        now=$(metric_now_ms)
-        if (( value == previous_value && now >= settle_until )); then
-          printf '%s\n' "$value"
-          return 0
-        fi
-        previous_value=$value
-        previous_timestamp=$timestamp
-      fi
-    fi
-    sleep 0.2
-  done
-  fail "Vector source metric did not produce two fresh, stable samples after timestamp $after_ms"
-}
-wait_metric() {
-  local deadline=$((SECONDS + 20)) value
-  while (( SECONDS < deadline )); do
-    value=$(read_metric)
-    if [[ "$value" =~ ^[0-9]+$ ]] && (( value >= ${1:-1} )); then printf '%s\n' "$value"; return 0; fi
-    sleep 0.25
-  done
-  fail "Vector GELF receive metric did not reach ${1:-1}"
-}
 vector_shipped_count() {
   [[ "$(docker_cmd inspect -f '{{.State.Running}}' "$VECTOR_ID")" == true ]] || fail "refusing to read events from a stopped Vector container"
   docker_cmd logs "$VECTOR_ID" 2>&1 | node "$ROOT/scripts/tc-959-vector-metrics.mjs" shipped-count
@@ -328,22 +319,6 @@ vector_shipped_count() {
 vector_event_count() {
   [[ "$(docker_cmd inspect -f '{{.State.Running}}' "$VECTOR_ID")" == true ]] || fail "refusing to read events from a stopped Vector container"
   docker_cmd logs "$VECTOR_ID" 2>&1 | node "$ROOT/scripts/tc-959-vector-metrics.mjs" event-count ingress_request_slow
-}
-wait_next_line() {
-  local previous=${1:-0} deadline=$((SECONDS + 20)) current
-  touch "$CONTROL/pulse"
-  while (( SECONDS < deadline )); do
-    wait_vector
-    current=$(vector_event_count)
-    if (( current > previous )); then
-      sleep 0.4
-      current=$(vector_event_count)
-      (( current == previous + 1 )) || fail "duplicate/flood output after Vector recovery: expected one line, saw $((current - previous))"
-      return 0
-    fi
-    sleep 0.2
-  done
-  fail "next labelled line not observed within 20 seconds"
 }
 
 compose_cmd ps -q tinycloud >/dev/null
@@ -436,11 +411,6 @@ send_from_container() {
   local network=$1 target=$2
   docker_cmd run --rm --network "$network" --mount "type=bind,src=$SENDER,dst=/sender.mjs,readonly" node:20-alpine node /sender.mjs "$target" 12201 "$payload"
 }
-fresh_metric_baseline() {
-  local started
-  started=$(metric_now_ms)
-  wait_fresh_stable_metric "$started"
-}
 send_probe() {
   local sender=$1 network=$2 target=$3
   if [[ "$sender" == host ]]; then
@@ -449,79 +419,22 @@ send_probe() {
     send_from_container "$network" "$target"
   fi
 }
-assert_positive_delivery() {
-  local source_before=$1 shipped_before=$2 sent_at=$3 description=$4
-  local source_after source_delta deadline=$((SECONDS + 20)) shipped_after shipped_delta
-  source_after=$(wait_fresh_stable_metric "$sent_at")
-  source_delta=$((source_after - source_before))
-  (( source_delta == 1 )) || fail "$description positive control source delta was $source_delta, expected +1"
-  while (( SECONDS < deadline )); do
-    shipped_after=$(vector_shipped_count)
-    shipped_delta=$((shipped_after - shipped_before))
-    if (( shipped_delta == 1 )); then
-      record "PASS: $description positive control; fresh source +1 and shipped +1"
-      return 0
-    fi
-    (( shipped_delta <= 1 )) || fail "$description produced duplicate shipped events: +$shipped_delta"
-    sleep 0.2
-  done
-  fail "$description positive control shipped delta was $shipped_delta, expected +1"
-}
 
 # Positive controls precede the leak self-test and every forbidden-source assertion.
-source_before=$(fresh_metric_baseline)
+source_before=$(fresh_sample)
 shipped_before=$(vector_shipped_count)
 sent_at=$(metric_now_ms)
 node "$SENDER" 127.0.0.1 12201 "$payload"
 assert_positive_delivery "$source_before" "$shipped_before" "$sent_at" "host loopback"
 
-source_before=$(fresh_metric_baseline)
+source_before=$(fresh_sample)
 shipped_before=$(vector_shipped_count)
 sent_at=$(metric_now_ms)
 send_from_container "${PROJECT}_logship" "$vector_ip"
 assert_positive_delivery "$source_before" "$shipped_before" "$sent_at" "logship-network control container"
 
-check_isolated_probe() {
-  local description=$1 sender=$2 network=$3 target=$4
-  local source_before shipped_before sent_at source_after shipped_after source_delta shipped_delta send_status=0
-  source_before=$(fresh_metric_baseline)
-  shipped_before=$(vector_shipped_count)
-  sent_at=$(metric_now_ms)
-  if send_probe "$sender" "$network" "$target"; then
-    record "INFO: $description sender completed"
-  else
-    send_status=$?
-    record "INFO: $description sender reported transport error exit=$send_status"
-  fi
-  source_after=$(wait_fresh_stable_metric "$sent_at")
-  shipped_after=$(vector_shipped_count)
-  source_delta=$((source_after - source_before))
-  shipped_delta=$((shipped_after - shipped_before))
-  record "INFO: $description fresh deltas source=$source_delta shipped=$shipped_delta"
-  (( send_status == 0 )) || return 2
-  if (( source_delta == 0 && shipped_delta == 0 )); then
-    return 0
-  fi
-  return 1
-}
-assert_isolated_probe() {
-  local description=$1 sender=$2 network=$3 target=$4 status
-  if check_isolated_probe "$description" "$sender" "$network" "$target"; then
-    record "PASS: $description isolation; fresh source +0 and shipped +0"
-    return 0
-  else
-    status=$?
-    fail "$description isolation check failed (status=$status)"
-  fi
-}
 
-if check_isolated_probe "intentional host-loopback leak self-test" host host 127.0.0.1; then
-  fail "isolation leak self-test passed unexpectedly"
-else
-  status=$?
-  (( status == 1 )) || fail "isolation leak self-test could not deliver its allowed host-loopback packet (status=$status)"
-  record "PASS: negative isolation check rejected a deliberately allowed host-loopback packet"
-fi
+run_isolation_leak_self_test host host 127.0.0.1
 
 probe_targets=("$vector_ip" "$app_gateway" vector host.docker.internal 127.0.0.1)
 for target in "${probe_targets[@]}"; do

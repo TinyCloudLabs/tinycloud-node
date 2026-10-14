@@ -192,7 +192,8 @@ jobs:
         npm ci --ignore-scripts --no-audit --no-fund
         node scripts/node-vector-schema.mjs --check
         node scripts/node-vector-schema.mjs --check-compose
-        node --test scripts/node-vector-schema.test.mjs
+        node --test scripts/node-vector-schema.test.mjs scripts/tc-959-vector-metrics.test.mjs
+        bash scripts/test-tc-959-isolation.sh
     - name: Test Vector allowlist (0.59.0, checksum pinned)
       run: |
         set -eu
