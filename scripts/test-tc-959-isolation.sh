@@ -29,7 +29,10 @@ vector_shipped_name_counts() {
 }
 report_shipped_event_delta() { :; }
 compose_cmd() { printf '%s\n' test-vector; }
-docker_cmd() { [[ "$1" == inspect ]] && printf '%s\n' true; }
+docker_cmd() {
+  if [[ "$1" == logs ]]; then printf '%s\n' "$RAW_CONSOLE_OUTPUT"; return 0; fi
+  [[ "$1" == inspect ]] && printf '%s\n' true
+}
 curl() { return 0; }
 read_metric() { printf '%s\n' 3; }
 vector_event_count() {
@@ -93,6 +96,19 @@ reset_fixtures
 run_isolation_leak_self_test host host 127.0.0.1
 assert_eq "$SEND_COUNT" 1
 printf '%s\n' 'PASS: isolation freshness, positive controls, and leak self-test'
+
+# The raw console scan catches a marker hidden in an unexpected field even when the probe filter returns zero.
+VECTOR_ID=test-vector
+RAW_CONSOLE_OUTPUT='{"event":"node_warning","event_code":"other_warning","unexpected_field":"TC959_FORGED_PROBE_CANARY_UNEXPECTED_FIELD"}'
+filtered_probe_count=$(printf '%s\n' "$RAW_CONSOLE_OUTPUT" | node "$ROOT/scripts/tc-959-vector-metrics.mjs" probe-count)
+assert_eq "$filtered_probe_count" 0
+if assert_no_console_marker TC959_FORGED_PROBE_CANARY_UNEXPECTED_FIELD; then
+  fail "raw console scan missed a marker in an unexpected field"
+else
+  assert_eq "$?" 1
+fi
+RAW_CONSOLE_OUTPUT='{"event":"node_warning","event_code":"other_warning"}'
+assert_no_console_marker TC959_FORGED_PROBE_CANARY_UNEXPECTED_FIELD || fail "raw console scan falsely matched absent marker"
 
 # Host-port preflight reports the owning Compose service before startup.
 PORT_HOLDER_MODE=container

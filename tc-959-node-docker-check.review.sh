@@ -337,10 +337,8 @@ const calledHelpers = [
   'check_host_ports_free', 'crash_vector',
   'wait_fresh_stable_metric', 'fresh_sample', 'wait_metric', 'vector_shipped_count',
   'vector_shipped_name_counts', 'report_shipped_event_delta', 'vector_event_count',
-  'wait_next_line', 'send_from_container', 'send_probe', 'compose_half_cpu_cmd',
-  'measure_burst',
-  'assert_positive_delivery', 'check_isolated_probe', 'assert_isolated_probe',
-  'run_isolation_leak_self_test',
+  'assert_no_console_marker', 'wait_next_line', 'send_from_container', 'send_probe',
+  'compose_half_cpu_cmd', 'measure_burst', 'run_isolation_leak_self_test',
 ];
 const missing = calledHelpers.filter((name) => !declared.has(name));
 if (missing.length) throw new Error(`harness calls undefined shell functions: ${missing.join(', ')}`);
@@ -487,8 +485,8 @@ wait_next_line 0
 record "INFO: restored production Vector cpus=0.25 before isolation, node-latency, and memory checks"
 
 # Keep the idle synthetic ingress up so its network namespace is available for sibling probes.
-sleep 1
-payload='{"version":"1.1","host":"tc959-isolation-probe","short_message":"{\"timestamp\":\"2026-10-14T10:00:00.000Z\",\"level\":\"WARN\",\"fields\":{\"message\":\"invocation replay insert failed\"}}","timestamp":1760436000,"level":4,"_tc.logship":"tinycloud-node"}'
+PROBE_CANARY=TC959_FORGED_PROBE_CANARY_UNEXPECTED_FIELD
+payload='{"version":"1.1","host":"tc959-isolation-probe","short_message":"{\"timestamp\":\"2026-10-14T10:00:00.000Z\",\"level\":\"WARN\",\"fields\":{\"message\":\"invocation replay insert failed\"}}","timestamp":1760436000,"level":4,"_forged_probe_canary":"'"$PROBE_CANARY"'","_tc.logship":"tinycloud-node"}'
 vector_ip=10.255.253.2
 app_gateway=$(docker_cmd inspect -f '{{range .NetworkSettings.Networks}}{{.Gateway}}{{end}}' "$NODE_ID")
 INGRESS_ID=$(compose_cmd ps -q dstack-ingress)
@@ -538,6 +536,8 @@ while read -r host_ip; do
   [[ -n "$host_ip" ]] || continue
   assert_isolated_probe "host external interface $host_ip" host host "$host_ip"
 done <<<"$host_ips"
+assert_no_console_marker "$PROBE_CANARY" || fail "forged probe canary appeared anywhere in Vector console output"
+record "PASS: raw Vector console output contains no forged-probe canary after the isolation matrix"
 
 compose_cmd stop vector >/dev/null
 max_ms=0

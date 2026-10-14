@@ -229,6 +229,12 @@ check_isolated_probe() {
 }
 
 
+assert_no_console_marker() {
+  local marker=$1 console_output match_count
+  console_output=$(docker_cmd logs "$VECTOR_ID" 2>&1) || return 2
+  match_count=$(printf '%s\n' "$console_output" | grep -cF -- "$marker" || true)
+  [[ "$match_count" == 0 ]]
+}
 assert_isolated_probe() {
   local description=$1 sender=$2 network=$3 target=$4 status
   if check_isolated_probe "$description" "$sender" "$network" "$target"; then
