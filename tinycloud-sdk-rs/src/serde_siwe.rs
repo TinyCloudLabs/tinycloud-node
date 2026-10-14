@@ -39,13 +39,18 @@ pub mod signature {
         format!("0x{}", addr.deref().encode_hex::<String>()).serialize(s)
     }
 
+    /// Decode a 65-byte hex wallet signature, with an optional `0x` prefix.
+    ///
+    /// Uses the node's CACAO decoder: low-s signatures with recovery IDs
+    /// `0/1` or `27/28` are accepted and stored as `27/28`; high-s signatures,
+    /// invalid scalars, lengths, and recovery IDs are rejected.
     pub fn deserialize<'de, D>(d: D) -> Result<Signature, D::Error>
     where
         D: Deserializer<'de>,
     {
         let sig = Cow::<'_, str>::deserialize(d)?;
-        <[u8; 65]>::from_hex(sig.strip_prefix("0x").unwrap_or(&sig))
-            .map(Into::into)
-            .map_err(|e| D::Error::custom(format!("failed to parse SIWE signature: {e}")))
+        let bytes = <Vec<u8>>::from_hex(sig.strip_prefix("0x").unwrap_or(&sig))
+            .map_err(|e| D::Error::custom(format!("failed to parse SIWE signature: {e}")))?;
+        Signature::try_from(bytes).map_err(D::Error::custom)
     }
 }
