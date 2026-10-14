@@ -49,8 +49,8 @@ pub mod signature {
         D: Deserializer<'de>,
     {
         let sig = Cow::<'_, str>::deserialize(d)?;
-        let bytes = <Vec<u8>>::from_hex(sig.strip_prefix("0x").unwrap_or(&sig))
+        let bytes = <[u8; 65]>::from_hex(sig.strip_prefix("0x").unwrap_or(&sig))
             .map_err(|e| D::Error::custom(format!("failed to parse SIWE signature: {e}")))?;
-        Signature::try_from(bytes).map_err(D::Error::custom)
+        Signature::decode(bytes).map_err(D::Error::custom)
     }
 }

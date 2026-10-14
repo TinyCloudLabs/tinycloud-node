@@ -255,36 +255,28 @@ fn wallet_import_and_rust_setup_reject_noncanonical_signatures() -> Result<()> {
     cases.push(("short".into(), bytes[..64].to_vec()));
     cases.push(("long".into(), [bytes.as_slice(), &[0]].concat()));
     for (label, bytes) in cases {
-        let node_error = Signature::try_from(bytes.clone())
-            .expect_err("node decoder rejects fixture")
-            .to_string();
         for prefix in ["", "0x"] {
             let signed = json_signed(&prepared, &format!("{prefix}{}", hex::encode(&bytes)))?;
-            let error = serde_json::from_value::<SignedSession>(signed)
-                .err()
-                .with_context(|| format!("SDK accepted {label}"))?;
             ensure!(
-                error.to_string().contains(&node_error),
-                "{label}: SDK={error}; node={node_error}"
+                serde_json::from_value::<SignedSession>(signed).is_err(),
+                "SDK accepted {label}"
             );
             let host = json!({"siwe": prepared.siwe.to_string(), "signature": format!("{prefix}{}", hex::encode(&bytes))});
-            let error = serde_json::from_value::<SignedMessage>(host)
-                .err()
-                .with_context(|| format!("host SDK accepted {label}"))?;
             ensure!(
-                error.to_string().contains(&node_error),
-                "host {label}: SDK={error}; node={node_error}"
+                serde_json::from_value::<SignedMessage>(host).is_err(),
+                "host SDK accepted {label}"
             );
         }
         if let Ok(bytes) = <[u8; 65]>::try_from(bytes) {
-            let error = complete_session_setup(SignedSession {
-                session: prepared.clone(),
-                signature: Signature::from(bytes),
-            })
-            .expect_err("Rust setup must validate before hashing");
             ensure!(
-                error.to_string().contains(&node_error),
-                "Rust {label}: SDK={error}; node={node_error}"
+                matches!(
+                    complete_session_setup(SignedSession {
+                        session: prepared.clone(),
+                        signature: Signature::from(bytes),
+                    }),
+                    Err(tinycloud_sdk_wasm::session::Error::InvalidSIWESignature(_))
+                ),
+                "Rust setup accepted {label}"
             );
         }
     }

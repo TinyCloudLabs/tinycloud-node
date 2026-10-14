@@ -222,7 +222,11 @@ impl AsRef<[u8]> for Signature {
 }
 
 impl Signature {
-    fn decode(mut bytes: [u8; 65]) -> Result<Self, SIWESignatureDecodeError> {
+    /// Validate a fixed-size EIP-191 signature and canonicalize its recovery ID.
+    ///
+    /// Low-s signatures accept `0/1` and `27/28`; invalid scalars, high-s values
+    /// and other recovery IDs are rejected without allocating a byte buffer.
+    pub fn decode(mut bytes: [u8; 65]) -> Result<Self, SIWESignatureDecodeError> {
         let signature = k256::ecdsa::Signature::from_slice(&bytes[..64])
             .map_err(|_| SIWESignatureDecodeError::InvalidSignature)?;
         if signature.normalize_s().is_some() {

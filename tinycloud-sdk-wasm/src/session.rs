@@ -708,7 +708,7 @@ pub fn prepare_session(config: SessionConfig) -> Result<PreparedSession, Error> 
 /// The node still verifies the signature against the SIWE message and checks
 /// the delegation's authority; setup only validates the signature encoding.
 pub fn complete_session_setup(signed_session: SignedSession) -> Result<Session, Error> {
-    let signature = Signature::try_from(signed_session.signature.as_ref().to_vec())?;
+    let signature = Signature::decode(*signed_session.signature)?;
     let delegation = SiweCacao::new(signed_session.session.siwe.into(), signature, SiweHeader);
     let serialised = serde_ipld_dagcbor::to_vec(&delegation)?;
     let hash = Code::Blake3_256.digest(&serialised);
