@@ -519,6 +519,9 @@ continues to revoke a single delegation CID, not a whole key.
 The signed policy-v3 JSON `/revoke` records one root's status, not a
 key-wide cutoff. Fresh root events check the historical policy witness;
 repeating the exact committed event remains idempotent.
+Every witness-backed use checks the loaded roots' signed revocation status,
+including an already-issued signed KV download ticket. This cutoff uses the
+same root rows as provenance verification, without another query or lock.
 
 `targetDid` must be a canonical DID with valid DID syntax, not a DID URL
 or a delegation CID; an empty method-specific ID is rejected.
@@ -529,6 +532,14 @@ signer is revoked or its recovery proof expires. Changed signed bytes with
 the same nonce return `409` only for a still-authorized signer; a signer
 without current target/scope authority receives `403`. First-use request
 and recovery proof validity are checked after blocking authorization locks.
+
+On a fresh recovery request, the node verifies the signed chain before
+locking its persisted proof rows. It then locks every dependency principal
+in canonical DID order, taking the target and request signer exclusively
+and other chain principals shared on their first visit. No principal lock
+is upgraded within the transaction; the locks cover the tombstone and
+receipt commit.
+
 The cutoff remains immutable; successful responses follow its durable commit.
 Later policy mints, delegation admission, and invocations cannot use authority
 derived from the revoked principal. Natural proof expiry is not an explicit

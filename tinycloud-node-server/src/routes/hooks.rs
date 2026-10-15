@@ -988,15 +988,22 @@ mod tests {
     use rocket::http::Status;
     use tempfile::TempDir;
     use tinycloud_auth::{
-        authorization::{make_invocation, InvocationOptions},
+        authorization::{make_invocation, HeaderEncode, InvocationOptions, TinyCloudDelegation},
         ipld_core::cid::Cid,
         multihash_codetable::{Code, MultihashDigest},
         resolver::DID_METHODS,
         resource::{Path, ResourceId, Service, SpaceId},
         siwe_recap::Ability,
-        ssi::{dids::DIDBuf, jwk::JWK},
+        ssi::{
+            claims::jwt::NumericDate,
+            dids::DIDBuf,
+            jwk::{Algorithm, JWK},
+            ucan::Payload,
+        },
+        ucan_capabilities_object::Capabilities,
     };
     use tinycloud_core::{
+        encryption_network::{EncryptionService, LocalOneOfOneBackend},
         keys::StaticSecret,
         sea_orm::{ConnectOptions, Database},
         storage::either::Either,
@@ -2141,6 +2148,13 @@ mod tests {
         }
 
         let node = StaticSecret::new(vec![5u8; 32]).unwrap();
+        let encryption = EncryptionService::new_with_node_keypair(
+            db.clone(),
+            node.node_keypair(),
+            std::sync::Arc::new(LocalOneOfOneBackend::new(ColumnEncryption::new(
+                node.derive_key(b"tinycloud/encryption/network-seal"),
+            ))),
+        );
         let rocket = rocket::build()
             .mount(
                 "/",
@@ -2149,7 +2163,8 @@ mod tests {
                     hook_events,
                     create_webhook,
                     list_webhooks,
-                    delete_webhook
+                    delete_webhook,
+                    crate::key_revoke::revoke_key
                 ],
             )
             .manage(tinycloud.clone())
@@ -2158,6 +2173,7 @@ mod tests {
             .manage(PolicyV3Runtime::new(db.clone(), node.node_did(), node))
             .manage(InvocationReplayCache::new(db.clone()))
             .manage(policy)
+            .manage(encryption)
             .manage(Config::default());
 
         Ok(HookRouteFixture {
@@ -2453,6 +2469,173 @@ mod tests {
             )
             .await;
         assert_eq!(status, Status::NoContent);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn webhook_crud_refuses_revoked_session_key_after_revoke_ack() -> Result<()> {
+        let fixture = hook_route_fixture(&[
+            ("hooks", "kv/documents", "tinycloud.hooks/register"),
+            ("hooks", "kv/documents", "tinycloud.hooks/list"),
+            ("hooks", "kv/documents", "tinycloud.hooks/unregister"),
+        ])
+        .await?;
+        let scope = fixture.hooks("kv/documents")?;
+        let (status, body) = fixture
+            .register(
+                fixture.session_header(&[(scope.clone(), &["tinycloud.hooks/register"])])?,
+                &fixture.space,
+            )
+            .await;
+        assert_eq!(status, Status::Ok, "live webhook POST: {body}");
+        let id = serde_json::from_str::<serde_json::Value>(&body)?["id"]
+            .as_str()
+            .expect("created webhook id")
+            .to_string();
+        let (status, body) = fixture
+            .list(fixture.session_header(&[(scope.clone(), &["tinycloud.hooks/list"])])?)
+            .await;
+        assert_eq!(status, Status::Ok, "live webhook GET: {body}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body)?[0]["id"],
+            id
+        );
+        // DELETE also needs a live, authorized control; keep the original
+        // subscription active for the post-ACK denial.
+        let (status, body) = fixture
+            .register(
+                fixture.session_header(&[(scope.clone(), &["tinycloud.hooks/register"])])?,
+                &fixture.space,
+            )
+            .await;
+        assert_eq!(status, Status::Ok, "second live webhook POST: {body}");
+        let disposable_id = serde_json::from_str::<serde_json::Value>(&body)?["id"]
+            .as_str()
+            .expect("second webhook id")
+            .to_string();
+        assert_ne!(disposable_id, id);
+        let (status, body) = fixture
+            .unregister(
+                fixture.session_header(&[(scope.clone(), &["tinycloud.hooks/unregister"])])?,
+                &disposable_id,
+            )
+            .await;
+        assert_eq!(status, Status::NoContent, "live webhook DELETE: {body}");
+
+        let target_did = did_of(&fixture.session.1);
+        let scope_json = serde_json::json!({"kind": "global"});
+        let mut capabilities = Capabilities::<serde_json::Value>::new();
+        capabilities.with_action(
+            format!("urn:tinycloud:key:{target_did}").parse()?,
+            "tinycloud.key/revoke".parse()?,
+            [serde_json::from_value(serde_json::json!({
+                "version": 1, "targetDid": target_did, "scope": scope_json
+            }))?],
+        );
+        let now = OffsetDateTime::now_utc();
+        let node_did = fixture
+            .client
+            .rocket()
+            .state::<tinycloud_core::encryption_network::EncryptionService>()
+            .expect("mounted node encryption service")
+            .node_did();
+        let authorization = TinyCloudDelegation::Ucan(Box::new(
+            Payload {
+                issuer: fixture.session.1.parse()?,
+                audience: node_did.parse()?,
+                not_before: Some(NumericDate::try_from_seconds(
+                    (now - time::Duration::seconds(1)).unix_timestamp() as f64,
+                )?),
+                expiration: NumericDate::try_from_seconds(
+                    (now + time::Duration::seconds(45)).unix_timestamp() as f64,
+                )?,
+                nonce: Some("webhook-crud-self-revoke".into()),
+                facts: Some(Vec::new()),
+                proof: Vec::new(),
+                attenuation: capabilities,
+            }
+            .sign(Algorithm::EdDSA, &fixture.session.0)?,
+        ))
+        .encode()?;
+        let revoked = fixture
+            .client
+            .post("/keys/revoke")
+            .header(rocket::http::ContentType::JSON)
+            .body(
+                serde_json::json!({
+                    "targetDid": target_did, "scope": scope_json, "authorization": authorization
+                })
+                .to_string(),
+            )
+            .dispatch()
+            .await;
+        let revoked_status = revoked.status();
+        let revoked_body = revoked.into_string().await.unwrap_or_default();
+        assert_eq!(revoked_status, Status::Ok, "key revoke ACK: {revoked_body}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&revoked_body)?["revoked"],
+            true
+        );
+
+        let (status, body) = fixture
+            .register(
+                fixture.session_header(&[(scope.clone(), &["tinycloud.hooks/register"])])?,
+                &fixture.space,
+            )
+            .await;
+        assert_eq!(status, Status::Unauthorized, "revoked webhook POST: {body}");
+        let (status, body) = fixture
+            .list(fixture.session_header(&[(scope.clone(), &["tinycloud.hooks/list"])])?)
+            .await;
+        assert_eq!(status, Status::Unauthorized, "revoked webhook GET: {body}");
+        let (status, body) = fixture
+            .unregister(
+                fixture.session_header(&[(scope.clone(), &["tinycloud.hooks/unregister"])])?,
+                &id,
+            )
+            .await;
+        assert_eq!(
+            status,
+            Status::Unauthorized,
+            "revoked webhook DELETE: {body}"
+        );
+        assert!(
+            fixture
+                .tinycloud
+                .find_hook_subscription(&id)
+                .await?
+                .unwrap()
+                .active,
+            "denied DELETE must leave the subscription active"
+        );
+
+        let owner_header = |ability| {
+            signed_header(
+                &fixture.owner.0,
+                &fixture.owner.1,
+                vec![],
+                &[(scope.clone(), &[ability])],
+            )
+        };
+        let (status, body) = fixture
+            .register(owner_header("tinycloud.hooks/register")?, &fixture.space)
+            .await;
+        assert_eq!(status, Status::Ok, "unrevoked signer POST: {body}");
+        let control_id = serde_json::from_str::<serde_json::Value>(&body)?["id"]
+            .as_str()
+            .expect("control webhook id")
+            .to_string();
+        let (status, body) = fixture.list(owner_header("tinycloud.hooks/list")?).await;
+        assert_eq!(status, Status::Ok, "unrevoked signer GET: {body}");
+        assert!(serde_json::from_str::<serde_json::Value>(&body)?
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["id"] == control_id));
+        let (status, body) = fixture
+            .unregister(owner_header("tinycloud.hooks/unregister")?, &control_id)
+            .await;
+        assert_eq!(status, Status::NoContent, "unrevoked signer DELETE: {body}");
         Ok(())
     }
 
@@ -2965,6 +3148,19 @@ mod tests {
             denied.into_string().await.as_deref(),
             Some("authorization-key-revoked")
         );
+        let (status, body) = fixture
+            .ticket(
+                fixture.session_header(&claim)?,
+                &fixture.space,
+                "kv",
+                "documents",
+            )
+            .await;
+        assert_eq!(
+            status,
+            Status::Unauthorized,
+            "new ticket after key revoke: {body}"
+        );
         let control = fixture
             .client
             .get(format!("/hooks/events?ticket={}", independent.ticket))
@@ -3025,6 +3221,20 @@ mod tests {
         assert_eq!(
             denied.into_string().await.as_deref(),
             Some("authorization-key-revoked")
+        );
+        let owner_header = signed_header(
+            &fixture.owner.0,
+            &fixture.owner.1,
+            vec![],
+            &[(fixture.hooks("kv/documents")?, SUBSCRIBE)],
+        )?;
+        let (status, body) = fixture
+            .ticket(owner_header, &fixture.space, "kv", "documents")
+            .await;
+        assert_eq!(
+            status,
+            Status::Unauthorized,
+            "new root ticket after key revoke: {body}"
         );
         let control = independent
             .client

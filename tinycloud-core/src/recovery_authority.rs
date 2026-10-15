@@ -239,14 +239,11 @@ pub async fn is_authorized(
         principals.push(signer);
         principals.push(audience);
     }
-    // The issuer and target receive exclusive locks at the cutoff. Other
-    // recovery dependencies remain shared through that commit.
-    let shared = principals
-        .iter()
-        .filter(|did| *did != &request.target_did && *did != &request.issuer_did)
-        .cloned()
-        .collect::<Vec<_>>();
-    key_authority::lock_targets(db, &shared, false).await?;
+    // The target and issuer need UPDATE, while other proof principals need
+    // SHARE. Lock the complete set once in canonical order; never upgrade an
+    // already-held intermediate SHARE lock to UPDATE in this transaction.
+    key_authority::lock_recovery_targets(db, &principals, &request.target_did, &request.issuer_did)
+        .await?;
     // The graph and principal locks may have waited past a signed proof's
     // window. Recheck every bound under those locks rather than trusting the
     // entry timestamp passed by the caller.

@@ -196,6 +196,13 @@ pub(crate) async fn authorize_admitted<C: ConnectionTrait>(
 }
 
 pub async fn verify_invocation(invocation: &TinyCloudInvocation) -> Result<(), Error> {
+    verify_invocation_at(invocation, None).await
+}
+
+async fn verify_invocation_at(
+    invocation: &TinyCloudInvocation,
+    signed_time: Option<f64>,
+) -> Result<(), Error> {
     verify_ucan_signature(invocation)
         .await
         .map_err(|error| match error {
@@ -209,7 +216,7 @@ pub async fn verify_invocation(invocation: &TinyCloudInvocation) -> Result<(), E
         })?;
     invocation
         .payload()
-        .validate_time(None)
+        .validate_time(signed_time)
         .map_err(|_| InvocationError::InvalidTime)?;
 
     // TC-409: this is the single cryptographic-verification primitive
@@ -235,6 +242,21 @@ pub async fn verify_and_authorize<C: ConnectionTrait>(
     now: OffsetDateTime,
 ) -> Result<(), Error> {
     verify_and_authorize_with_graph(db, invocation, now, None).await
+}
+
+/// Evaluate a reconstructed signed invocation at its historical proof time.
+/// Live routes use [`verify_and_authorize`], which always checks the signature
+/// against the actual clock. The supplied time applies to both the invocation
+/// and its cited delegation chain; neither check is bypassed.
+#[cfg(feature = "historical-invocation-test-clock")]
+pub async fn verify_and_authorize_with_signed_time<C: ConnectionTrait>(
+    db: &C,
+    invocation: &util::InvocationInfo,
+    now: OffsetDateTime,
+    signed_time: f64,
+) -> Result<(), Error> {
+    verify_invocation_at(&invocation.invocation, Some(signed_time)).await?;
+    validate(db, invocation, Some(now), None).await
 }
 
 /// [`verify_and_authorize`] against a caller-loaded authorization snapshot,

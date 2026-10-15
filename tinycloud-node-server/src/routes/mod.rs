@@ -4995,6 +4995,20 @@ mod tests {
             Status::Conflict,
             "exact invocation replay must be rejected"
         );
+        let live = client
+            .post("/invoke")
+            .header(Header::new(
+                "Authorization",
+                make_auth_header("urn:uuid:00000000-0000-4000-8000-000000000003")?,
+            ))
+            .header(ContentType::JSON)
+            .body(serde_json::to_string(&SqlRequest::ExecuteStatement {
+                name: "get_val".to_string(),
+                params: vec![],
+            })?)
+            .dispatch()
+            .await;
+        assert_eq!(live.status(), Status::Ok, "fresh SQL read before revoke");
 
         let revocation_hash = tinycloud_core::hash::hash(b"w1-rocket-http-revocation");
         revo_model::ActiveModel {

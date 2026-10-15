@@ -70,8 +70,20 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 5
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -u root"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     env:
       TINYCLOUD_TEST_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/postgres
+      TINYCLOUD_TEST_MYSQL_URL: mysql://root@127.0.0.1:3306/mysql
       # TC-1054: tests/postgres_pool_timeouts.rs black-holes chosen loopback
       # connections with exact-4-tuple iptables DROP rules (the runner is a
       # throwaway VM with passwordless sudo). Unset, they fail under CI.

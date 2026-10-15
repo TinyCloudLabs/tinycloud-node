@@ -16,12 +16,17 @@ use tinycloud_core::{
     types::{Ability, Caveats, SpaceIdWrap},
 };
 
-// Registration and challenge/session creation closed September 30. The
-// signed synthetic policy and delegation are inserted as a reconstruction of
-// a historically registered policy, not sent to today's closed creation
-// route. Reads remain open until January 5; new challenge/mint requests
-// continue returning 410. A real pre-cutoff five-minute session cannot still
-// be live today, so its short-lived signed binding is reconstructed separately.
+// Registration and challenge/session creation closed September 30. This
+// signed fixture reconstructs a historical registration and short-lived
+// session. A test-only clock should pin evaluation to October 13, 2026
+// 12:00 UTC. Its October 14 expiry is already past under today's real clock;
+// reads remain open until January 5, while challenge/mint still return 410.
+const HISTORICAL_EVALUATION_AT: &str = "2026-10-13T12:00:00.000Z";
+
+fn historical_evaluation_time() -> OffsetDateTime {
+    OffsetDateTime::parse(HISTORICAL_EVALUATION_AT, &Rfc3339).unwrap()
+}
+
 struct HistoricalShare {
     challenge: Value,
     session_id: String,
@@ -60,7 +65,7 @@ async fn historical_share(
         "applications".parse().expect("space name"),
     );
     let space_id_string = space_id.to_string();
-    let expires_at = "2026-12-28T00:00:00.000Z".to_owned();
+    let expires_at = "2026-10-14T00:00:00.000Z".to_owned();
     let actions = vec![
         "tinycloud.kv/get".to_owned(),
         "tinycloud.kv/list".to_owned(),
@@ -82,7 +87,7 @@ async fn historical_share(
             .expect("owner verification method"),
         audience: share_did.parse::<DIDBuf>().expect("share DID"),
         not_before: None,
-        expiration: NumericDate::try_from_seconds(1_798_416_000.0).expect("December 2026"),
+        expiration: NumericDate::try_from_seconds(1_791_936_000.0).expect("October 14, 2026"),
         nonce: Some(format!("historical-{share_id}")),
         facts: Some(Vec::<Value>::new()),
         proof: vec![],
@@ -140,7 +145,7 @@ async fn historical_share(
         issuer: owner_vm.parse::<DIDURLBuf>().unwrap(),
         audience: sender_did.parse::<DIDBuf>().unwrap(),
         not_before: None,
-        expiration: NumericDate::try_from_seconds(1_798_416_000.0).unwrap(),
+        expiration: NumericDate::try_from_seconds(1_791_936_000.0).unwrap(),
         nonce: Some(format!("historical-sender-{share_id}")),
         facts: Some(Vec::<Value>::new()),
         proof: vec![],
@@ -273,7 +278,7 @@ async fn historical_share(
         enforcement_delegation_bytes: Set(runtime
             .policy_encryption
             .encrypt(&serde_json::to_vec(&enforcement).unwrap())),
-        policy_proof: Set(policy_proof),
+        policy_proof: Set(policy_proof.clone()),
         policy_digest: Set(b64_digest(&policy_bytes)),
         matcher_digest: Set(b64_digest(&jcs::canonicalize(matcher))),
         content_source_digest: Set(source_digest.clone()),
@@ -290,15 +295,24 @@ async fn historical_share(
         expires_at: Set(expires_at.clone()),
         revoked_at: Set(None),
     };
-    row.insert(&runtime.conn)
+    let row = row
+        .insert(&runtime.conn)
         .await
         .expect("historical policy registration row");
-    let registered = registered_policy(runtime, &registration_cid, &policy_cid)
-        .await
-        .expect("signed historical registration passes real DB and signature checks");
-    verify_registered_ancestors(runtime, &registered, Some(&enforcement))
-        .await
-        .expect("signed owner and enforcement ancestors pass real verification");
+    // The live-clock registration/ancestor helpers reject this expired fixture
+    // before the route assertions. The routes verify its signed ancestors at
+    // the historical evaluation time once the test clock is injected.
+    verify_policy_proof(&share_did, &policy_bytes, &policy_proof)
+        .expect("historically signed policy verifies");
+    let envelope: PolicyEnvelope = serde_json::from_value(policy.clone()).unwrap();
+    verify_enforcement_delegation(runtime, &envelope, &policy_cid, &enforcement)
+        .expect("historically signed enforcement verifies");
+    let registered = RegisteredPolicy {
+        row,
+        envelope,
+        matcher: TypedRecipientMatcher::ExactEmail("alice@example.com".to_owned()),
+        expiry: OffsetDateTime::parse(&expires_at, &Rfc3339).unwrap(),
+    };
 
     let target = policy["policy"]["target"].clone();
     let envelope_identity = serde_json::json!({
@@ -338,18 +352,20 @@ async fn historical_share(
         .unwrap()
         .insert("requestBodyDigest".into(), Value::String(digest));
     let challenge_request: V2ChallengeRequest = serde_json::from_value(challenge.clone()).unwrap();
-    verify_outer_envelope(
-        &challenge_request.outer_envelope,
-        &challenge_request,
-        &share_did,
-        None,
+    let outer_signature = decode_config(
+        challenge_request.outer_envelope["signature"]["value"]
+            .as_str()
+            .expect("signed outer envelope"),
+        URL_SAFE_NO_PAD,
     )
-    .expect("historically signed outer envelope verifies");
+    .expect("canonical signed outer envelope");
+    verify_detached_ed25519(&share_did, &signed_outer, &outer_signature)
+        .expect("historically signed outer envelope verifies");
     // No post-cutoff mint route exists. Reconstruct only its durable binding
     // from the real node signer and a genuine holder-signed presentation.
     let session_id = format!("historical-session-{share_id}");
-    let session_issued = timestamp(OffsetDateTime::now_utc());
-    let session_expires = timestamp(OffsetDateTime::now_utc() + Duration::minutes(4));
+    let session_issued = timestamp(historical_evaluation_time());
+    let session_expires = timestamp(historical_evaluation_time() + Duration::minutes(4));
     let credential_digest = b64_digest(b"synthetic credential bound to test-only session");
     let presentation = serde_json::json!({
         "type": "TinyCloudSharePolicyPresentation", "version": 2,
@@ -414,7 +430,7 @@ async fn historical_share(
 
 async fn invoke(client: &Client, share: &HistoricalShare, jti: &str) -> (Status, Value) {
     let challenge = &share.challenge;
-    let now = OffsetDateTime::now_utc();
+    let now = historical_evaluation_time();
     let mut invocation = serde_json::json!({
         "type": "TinyCloudShareReadInvocation", "version": 2,
         "sessionId": share.session_id, "envelopeCid": challenge["envelopeCid"],
@@ -474,7 +490,7 @@ async fn authorize_delivery(client: &Client, share: &HistoricalShare, jti: u8) -
         "shareUrl": format!("https://share.tinycloud.xyz/s/{}", challenge["shareCid"].as_str().unwrap()),
         "documentName": "historical document",
         "jti": encode_config([jti; 16], URL_SAFE_NO_PAD),
-        "expiresAt": timestamp(OffsetDateTime::now_utc() + Duration::minutes(4))
+        "expiresAt": timestamp(historical_evaluation_time() + Duration::minutes(4))
     });
     let digest = request_digest_without(&request, "requestBodyDigest").expect("delivery digest");
     request
@@ -502,7 +518,7 @@ async fn authorize_delivery(client: &Client, share: &HistoricalShare, jti: u8) -
         &share.sender_delegation_cid,
         &share.sender,
         &share.sender_vm,
-        (OffsetDateTime::now_utc() + Duration::seconds(45)).unix_timestamp() as f64,
+        (historical_evaluation_time() + Duration::seconds(45)).unix_timestamp() as f64,
         InvocationOptions::default(),
     )
     .expect("real sender-signed ordinary invocation");
@@ -541,8 +557,9 @@ async fn creation_closed(client: &Client, route: &str, body: &Value) {
 async fn historical_signed_share_invoke_and_delivery_stop_after_share_key_tombstone_without_affecting_other_shares(
 ) {
     let key_setup = StaticSecret::new(vec![0x59u8; 32]).expect("node test key");
-    let runtime =
+    let mut runtime =
         compose_test_runtime(&key_setup, Some(TeeContext::derive_local(&key_setup)), true).await;
+    runtime.evaluation_time = Some(historical_evaluation_time());
     assert!(
         runtime.live().await,
         "composed node must accept read requests"
@@ -568,6 +585,16 @@ async fn historical_signed_share_invoke_and_delivery_stop_after_share_key_tombst
     let unaffected =
         historical_share(&runtime, &owner, &owner_did, &owner_vm, "legacy-control").await;
     let share_did = revoked.registered.row.share_key_did.clone();
+    let historically_registered = registered_policy(
+        &runtime,
+        &revoked.registered.row.registration_cid,
+        &revoked.registered.row.policy_cid,
+    )
+    .await
+    .expect("unrevoked historical policy must validate at the pinned evaluation time");
+    verify_registered_ancestors(&runtime, &historically_registered, None)
+        .await
+        .expect("unrevoked historical signed ancestors must validate");
     let client = Client::tracked(
         rocket::build()
             .manage(Some(runtime.clone()))
@@ -601,6 +628,26 @@ async fn historical_signed_share_invoke_and_delivery_stop_after_share_key_tombst
         invoke(&client, &unaffected, "control-before").await.0,
         Status::Ok
     );
+    // This same signed fixture cannot reopen the read route after its
+    // production January 5, 2027 sunset; the cutoff precedes session lookup.
+    let mut after_sunset = runtime.clone();
+    after_sunset.evaluation_time = Some(
+        OffsetDateTime::parse("2027-01-06T00:00:00.000Z", &Rfc3339)
+            .expect("post-sunset evaluation time"),
+    );
+    let sunset_client = Client::tracked(
+        rocket::build()
+            .manage(Some(after_sunset))
+            .manage(crate::BlockStage::from(
+                crate::config::StagingStorage::Memory,
+            ))
+            .mount("/", rocket::routes![invoke_v2]),
+    )
+    .await
+    .expect("post-sunset Rocket route");
+    let (status, body) = invoke(&sunset_client, &revoked, "after-read-sunset").await;
+    assert_eq!(status, Status::Gone, "legacy read sunset: {body}");
+    assert_eq!(body["error"]["code"], "legacy_v2_reads_closed");
     let (status, body) = authorize_delivery(&client, &revoked, 1).await;
     assert_eq!(
         status,
@@ -658,9 +705,10 @@ async fn historical_signed_share_invoke_and_delivery_stop_after_share_key_tombst
 async fn historical_signed_delivery_denies_revoked_owner_enforcer_or_sender() {
     for (index, target) in ["owner", "enforcer", "sender"].iter().enumerate() {
         let key_setup = StaticSecret::new(vec![0x59u8; 32]).expect("node test key");
-        let runtime =
+        let mut runtime =
             compose_test_runtime(&key_setup, Some(TeeContext::derive_local(&key_setup)), true)
                 .await;
+        runtime.evaluation_time = Some(historical_evaluation_time());
         assert!(
             runtime.live().await,
             "composed node must accept read requests"

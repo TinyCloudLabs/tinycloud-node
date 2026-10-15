@@ -2097,6 +2097,20 @@ where
             write_may_have_applied,
         };
         let nonce_key = (request.issuer_did.clone(), request.nonce.clone());
+        let exact_receipt = |row: &key_revocation::nonce::Model| {
+            if row.authorization_hash != request.authorization_hash
+                || row.target_did != request.target_did
+            {
+                return Ok(None);
+            }
+            let receipt: key_revocation::KeyRevokeReceipt =
+                serde_json::from_slice(&row.receipt_bytes)
+                    .map_err(|_| db_error(DbErr::Custom("key-receipt-invalid".into()), false))?;
+            if receipt.scope != request.scope || receipt.target_did != request.target_did {
+                return Err(KeyRevokeError::Forbidden);
+            }
+            Ok(Some(receipt))
+        };
         // This read never discloses a target. The original signed request
         // proves possession of the same issuer key even after its revocation.
         let existing = key_revocation::nonce::Entity::find_by_id(nonce_key.clone())
@@ -2104,17 +2118,8 @@ where
             .await
             .map_err(|error| db_error(error, false))?;
         if let Some(row) = &existing {
-            if row.authorization_hash == request.authorization_hash
-                && row.target_did == request.target_did
-            {
-                let receipt: key_revocation::KeyRevokeReceipt =
-                    serde_json::from_slice(&row.receipt_bytes).map_err(|_| {
-                        db_error(DbErr::Custom("key-receipt-invalid".into()), false)
-                    })?;
-                if receipt.scope == request.scope && receipt.target_did == request.target_did {
-                    return Ok(receipt);
-                }
-                return Err(KeyRevokeError::Forbidden);
+            if let Some(receipt) = exact_receipt(row)? {
+                return Ok(receipt);
             }
         }
 
@@ -2133,22 +2138,13 @@ where
             .map_err(|error| db_error(error, false))?;
         // A concurrent request may have committed the identical self-revoke
         // while this one waited for its target lock. Its receipt remains
-        // retryable even though fresh issuer authority is now gone.
         if let Some(row) = key_revocation::nonce::Entity::find_by_id(nonce_key.clone())
             .one(&tx)
             .await
             .map_err(|error| db_error(error, false))?
         {
-            if row.authorization_hash == request.authorization_hash
-                && row.target_did == request.target_did
-            {
-                let receipt: key_revocation::KeyRevokeReceipt =
-                    serde_json::from_slice(&row.receipt_bytes).map_err(|_| {
-                        db_error(DbErr::Custom("key-receipt-invalid".into()), false)
-                    })?;
-                if receipt.scope == request.scope && receipt.target_did == request.target_did {
-                    return Ok(receipt);
-                }
+            if let Some(receipt) = exact_receipt(&row)? {
+                return Ok(receipt);
             }
         }
         let now = OffsetDateTime::now_utc();
@@ -2200,17 +2196,45 @@ where
             .map_err(|error| db_error(error, false))?
         };
         if !authorized {
+            // A second process may have committed the same signed request
+            // before this authority read. Its receipt is still retryable even
+            // when that commit has revoked the issuer itself.
+            if let Some(row) = key_revocation::nonce::Entity::find_by_id(nonce_key.clone())
+                .one(&tx)
+                .await
+                .map_err(|error| db_error(error, false))?
+            {
+                if let Some(receipt) = exact_receipt(&row)? {
+                    return Ok(receipt);
+                }
+            }
             return Err(KeyRevokeError::Forbidden);
         }
-        // Both the target and nonce issuer use the same sorted row-lock
-        // namespace; global and scoped revokes cannot pass each other.
-        crate::key_authority::lock_targets(
-            &tx,
-            &[request.target_did.clone(), request.issuer_did.clone()],
-            true,
-        )
-        .await
-        .map_err(|error| db_error(error, false))?;
+        // Recovery already holds the target and issuer UPDATE locks along
+        // with shared proof principals in one canonical order. Direct
+        // self/space-owner revokes have no proof principal locks to upgrade.
+        if direct {
+            crate::key_authority::lock_targets(
+                &tx,
+                &[request.target_did.clone(), request.issuer_did.clone()],
+                true,
+            )
+            .await
+            .map_err(|error| db_error(error, false))?;
+        }
+        // The issuer/target database row locks are the cross-process
+        // serialization point. Re-read the durable nonce before fresh
+        // liveness or time checks: a simultaneous self-revoke cannot turn an
+        // identical committed request into a 403.
+        let post_lock_nonce = key_revocation::nonce::Entity::find_by_id(nonce_key.clone())
+            .one(&tx)
+            .await
+            .map_err(|error| db_error(error, false))?;
+        if let Some(row) = &post_lock_nonce {
+            if let Some(receipt) = exact_receipt(row)? {
+                return Ok(receipt);
+            }
+        }
         let spaces = match &request.scope {
             KeyRevokeScope::Global => Vec::new(),
             KeyRevokeScope::Space { space_id } => vec![space_id.clone()],
@@ -2242,22 +2266,9 @@ where
         {
             return Err(KeyRevokeError::Forbidden);
         }
-        if let Some(row) = key_revocation::nonce::Entity::find_by_id(nonce_key.clone())
-            .one(&tx)
-            .await
-            .map_err(|error| db_error(error, false))?
-        {
-            if row.authorization_hash == request.authorization_hash
-                && row.target_did == request.target_did
-            {
-                let receipt: key_revocation::KeyRevokeReceipt =
-                    serde_json::from_slice(&row.receipt_bytes).map_err(|_| {
-                        db_error(DbErr::Custom("key-receipt-invalid".into()), false)
-                    })?;
-                if receipt.scope == request.scope && receipt.target_did == request.target_did {
-                    return Ok(receipt);
-                }
-            }
+        // A changed nonce is disclosed only after the fresh signer and
+        // signed-time checks, never to a revoked or unrelated signer.
+        if post_lock_nonce.is_some() {
             return Err(KeyRevokeError::Conflict);
         }
         let scope_key = request.scope.storage_key();
@@ -6620,6 +6631,13 @@ mod test {
         .insert(&db.conn)
         .await
         .unwrap();
+
+        assert!(
+            !crate::models::revocation::is_revoked(&db.conn, &parent_id)
+                .await
+                .unwrap(),
+            "the issue and existing-use checks must see a live parent before revoke"
+        );
 
         let revoke_guard = db
             .acquire_chain_guards(&[parent_id])

@@ -110,7 +110,7 @@ path = "../tinycloud-auth/"
 [dev-dependencies.tinycloud-core]
 path = "../tinycloud-core/"
 default-features = false
-features = ["sqlite", "postgres", "mysql", "tokio", "verification-count-test-hook"]
+features = ["sqlite", "postgres", "mysql", "tokio", "verification-count-test-hook", "historical-invocation-test-clock"]
 
 [dev-dependencies]
 # Parse production Rust items in the DID resolver source guard (tests only).

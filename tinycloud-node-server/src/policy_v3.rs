@@ -8457,7 +8457,15 @@ mod tests {
             issued + Duration::seconds(301),
         )
         .is_err());
-        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let mut db = Database::connect("sqlite::memory:").await.unwrap();
+        // The measured-head fixture executes 68 SQL statements for a policy
+        // descendant KV read and 23 for a signed GET. A signed-root cutoff
+        // must reuse its already-loaded root rows, not add read-path I/O.
+        let query_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&query_count);
+        db.set_metric_callback(move |_| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
         let delivery_config = ShareEmailConfig {
             enabled: true,
             target_origin: "https://node.example".into(),
@@ -9149,6 +9157,87 @@ mod tests {
             assert_eq!(live_challenge.status(), Status::Ok);
             assert!(live_challenge.into_json::<Value>().await.unwrap()["challengeId"].is_string());
 
+            // The owner grant is already registered and the content is seeded:
+            // exercise signed URLs before either its signer or its holder key
+            // is cut off, independently of the later policy-session mint.
+            let owner_grant_cid: tinycloud_auth::ipld_core::cid::Cid = owner_delegation_cid
+                .as_deref()
+                .expect("key-cutoff owner has a registered content grant")
+                .parse()?;
+            let signed_request = json!({
+                "space": content_space.to_string(),
+                "path": "shares/tc-470/document.txt",
+            })
+            .to_string();
+            let owner_signed_invocation = |nonce: &str| -> anyhow::Result<String> {
+                Ok(make_invocation(
+                    [(
+                        content_resource.clone(),
+                        ["tinycloud.kv/get".parse::<RecapAbility>()?],
+                    )],
+                    &owner_grant_cid,
+                    &owner_jwk,
+                    &owner_vm,
+                    (OffsetDateTime::now_utc() + Duration::seconds(30)).unix_timestamp() as f64,
+                    InvocationOptions {
+                        nonce: Some(nonce.into()),
+                        ..InvocationOptions::default()
+                    },
+                )?
+                .encode()?)
+            };
+            let live_signed = client
+                .post("/signed/kv")
+                .header(ContentType::JSON)
+                .header(rocket::http::Header::new(
+                    "Authorization",
+                    owner_signed_invocation("tc1149-key-cutoff-signed-before")?,
+                ))
+                .body(signed_request.clone())
+                .dispatch()
+                .await;
+            let live_status = live_signed.status();
+            let live_body = live_signed.into_string().await.unwrap_or_default();
+            assert_eq!(
+                live_status,
+                Status::Ok,
+                "live signed URL before key revoke: {live_body}"
+            );
+            let signed_url = serde_json::from_str::<Value>(&live_body)?["url"]
+                .as_str()
+                .expect("signed URL")
+                .to_owned();
+            let live_read = client.get(&signed_url).dispatch().await;
+            assert_eq!(live_read.status(), Status::Ok);
+            let etag = live_read
+                .headers()
+                .get_one("ETag")
+                .expect("live signed GET ETag")
+                .to_owned();
+            assert_eq!(
+                live_read.into_bytes().await.unwrap_or_default(),
+                b"tc-470-real-content"
+            );
+            for (label, header, expected) in [
+                (
+                    "range",
+                    rocket::http::Header::new("Range", "bytes=0-1"),
+                    Status::PartialContent,
+                ),
+                (
+                    "304",
+                    rocket::http::Header::new("If-None-Match", etag.clone()),
+                    Status::NotModified,
+                ),
+            ] {
+                let response = client.get(&signed_url).header(header).dispatch().await;
+                assert_eq!(
+                    response.status(),
+                    expected,
+                    "live {label} signed GET before key revoke"
+                );
+            }
+
             let (target_did, target_vm, target_jwk) =
                 if policy_owner == PolicyOwner::RegistrarKeyCutoff {
                     (&owner_did, &owner_vm, &owner_jwk)
@@ -9212,6 +9301,40 @@ mod tests {
             assert_eq!(
                 serde_json::from_str::<Value>(&revoked_body)?["revoked"],
                 true
+            );
+            let old_ticket = client.get(&signed_url).dispatch().await;
+            assert_eq!(
+                old_ticket.status(),
+                Status::Forbidden,
+                "pre-revoke signed URL after owner or ancestor key cutoff"
+            );
+            for (label, header) in [
+                ("range", rocket::http::Header::new("Range", "bytes=0-1")),
+                ("304", rocket::http::Header::new("If-None-Match", etag)),
+            ] {
+                let response = client.get(&signed_url).header(header).dispatch().await;
+                assert_eq!(
+                    response.status(),
+                    Status::Forbidden,
+                    "{label} signed GET after key revoke"
+                );
+            }
+            let fresh_signed = client
+                .post("/signed/kv")
+                .header(ContentType::JSON)
+                .header(rocket::http::Header::new(
+                    "Authorization",
+                    owner_signed_invocation("tc1149-key-cutoff-fresh-signed-after")?,
+                ))
+                .body(signed_request)
+                .dispatch()
+                .await;
+            let status = fresh_signed.status();
+            let body = fresh_signed.into_string().await.unwrap_or_default();
+            assert_eq!(
+                status,
+                Status::Unauthorized,
+                "fresh signed URL after key revoke: {body}"
             );
             for root_field in ["policyRootCid", "enforcementRootCid"] {
                 let cid = registered[root_field]
@@ -9993,6 +10116,7 @@ mod tests {
             .sign(Algorithm::EdDSA, &reader_b_jwk)?
             .encode()?)
         };
+        let kv_queries_before = query_count.load(std::sync::atomic::Ordering::Relaxed);
         let grandchild_read = client
             .post("/invoke")
             .header(rocket::http::Header::new(
@@ -10005,6 +10129,11 @@ mod tests {
         assert_eq!(
             grandchild_read.into_bytes().await.unwrap_or_default(),
             b"tc-470-real-content"
+        );
+        assert_eq!(
+            query_count.load(std::sync::atomic::Ordering::Relaxed) - kv_queries_before,
+            68,
+            "ordinary KV read gained SQL round trips against the measured head"
         );
 
         // /signed/kv runs the same policy gate as /invoke. A policy
@@ -10032,11 +10161,17 @@ mod tests {
             .as_str()
             .unwrap()
             .to_owned();
-        let signed_read = client.get(signed_url).dispatch().await;
+        let signed_queries_before = query_count.load(std::sync::atomic::Ordering::Relaxed);
+        let signed_read = client.get(signed_url.clone()).dispatch().await;
         assert_eq!(signed_read.status(), Status::Ok);
         assert_eq!(
             signed_read.into_bytes().await.unwrap_or_default(),
             b"tc-470-real-content"
+        );
+        assert_eq!(
+            query_count.load(std::sync::atomic::Ordering::Relaxed) - signed_queries_before,
+            23,
+            "signed GET gained SQL round trips against the measured head"
         );
         let long_signed = client
             .post("/signed/kv")
@@ -10045,7 +10180,7 @@ mod tests {
                 "Authorization",
                 reader_b_invocation(90, "tc529-grandchild-long-signed-url")?,
             ))
-            .body(signed_request)
+            .body(signed_request.clone())
             .dispatch()
             .await;
         assert_eq!(long_signed.status(), Status::Forbidden);
@@ -10165,6 +10300,37 @@ mod tests {
             b"descendant-before"
         );
 
+        let live_ticket_before_owner_grant_revoke = if owner_delegation_cid.is_some() {
+            let minted = client
+                .post("/signed/kv")
+                .header(ContentType::JSON)
+                .header(rocket::http::Header::new(
+                    "Authorization",
+                    reader_b_invocation(30, "tc1149-live-signed-url-before-owner-grant-revoke")?,
+                ))
+                .body(signed_request.clone())
+                .dispatch()
+                .await;
+            let status = minted.status();
+            let body = minted.into_string().await.unwrap_or_default();
+            assert_eq!(
+                status,
+                Status::Ok,
+                "current signed URL before owner grant revoke: {body}"
+            );
+            let url = serde_json::from_str::<Value>(&body)?["url"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("missing current signed URL"))?
+                .to_owned();
+            assert_eq!(
+                client.get(&url).dispatch().await.status(),
+                Status::Ok,
+                "current ticket must redeem before owner grant revoke"
+            );
+            Some(url)
+        } else {
+            None
+        };
         if let Some(owner_delegation_cid) = owner_delegation_cid.as_deref() {
             // Revoking the delegation the policy owner held stops new
             // sessions, although the policy and its roots are untouched.
@@ -10205,6 +10371,32 @@ mod tests {
                 "owner session revoke: {revoked_body}"
             );
 
+            let old_ticket = client
+                .get(live_ticket_before_owner_grant_revoke.expect("live owner-grant ticket"))
+                .dispatch()
+                .await;
+            assert_eq!(
+                old_ticket.status(),
+                Status::Forbidden,
+                "pre-revoke signed URL must not redeem after owner proof revoke"
+            );
+            let fresh_signed = client
+                .post("/signed/kv")
+                .header(ContentType::JSON)
+                .header(rocket::http::Header::new(
+                    "Authorization",
+                    reader_b_invocation(30, "tc1149-fresh-signed-url-after-owner-proof-revoke")?,
+                ))
+                .body(signed_request.clone())
+                .dispatch()
+                .await;
+            let status = fresh_signed.status();
+            let body = fresh_signed.into_string().await.unwrap_or_default();
+            assert_eq!(
+                status,
+                Status::Unauthorized,
+                "fresh signed URL after proof revoke: {body}"
+            );
             // The revoke ACK is the cutoff. Old signatures and registered
             // descendants must no longer authorize reads, writes, or children.
             for (key, principal, parent, label) in [
@@ -10300,44 +10492,49 @@ mod tests {
         // Prepare a fresh, unused admission while both roots are live. It
         // cannot be created after root revoke because challenge itself closes.
         let fresh_root_mint = if space_owner {
-            let response = client
-                .post("/policy/v3/challenges")
-                .header(ContentType::JSON)
-                .body(
-                    json!({
-                        "policyCid": policy_cid,
-                        "recipientDid": holder_did,
-                        "requestedCapabilities": requested,
-                    })
-                    .to_string(),
-                )
-                .dispatch()
-                .await;
-            assert_eq!(response.status(), Status::Ok);
-            let challenge: Value = response.into_json().await.unwrap();
-            let mut signed = presentation.clone();
-            signed["schema"] = json!(CREDENTIAL_PRESENTATION_V4_SCHEMA);
-            signed["jti"] = json!("presentation-tc1149-after-root-revoke");
-            signed["challengeId"] = challenge["challengeId"].clone();
-            signed["nonce"] = challenge["nonce"].clone();
-            signed
-                .as_object_mut()
-                .unwrap()
-                .remove("credentialSpaceOwnerDid");
-            signed["issuedAt"] = json!(format_time(OffsetDateTime::now_utc()));
-            signed["expiresAt"] = json!(format_time(
-                OffsetDateTime::now_utc() + Duration::seconds(45)
-            ));
-            let mut unsigned = signed.clone();
-            unsigned.as_object_mut().unwrap().remove("signature");
-            let mut preimage = CREDENTIAL_PRESENTATION_V4_DOMAIN.to_vec();
-            preimage.extend_from_slice(&canonical_json_value(&unsigned));
-            signed["signature"]["value"] = json!(encode_config(
-                holder_key.sign(&Sha256::digest(preimage)),
-                URL_SAFE_NO_PAD
-            ));
-            Some(
-                json!({
+            let mut pending = None;
+            for (label, mint_before_revoke) in [("live", true), ("after", false)] {
+                let response = client
+                    .post("/policy/v3/challenges")
+                    .header(ContentType::JSON)
+                    .body(
+                        json!({
+                            "policyCid": policy_cid,
+                            "recipientDid": holder_did,
+                            "requestedCapabilities": requested,
+                        })
+                        .to_string(),
+                    )
+                    .dispatch()
+                    .await;
+                assert_eq!(
+                    response.status(),
+                    Status::Ok,
+                    "fresh root challenge: {label}"
+                );
+                let challenge: Value = response.into_json().await.unwrap();
+                let mut signed = presentation.clone();
+                signed["schema"] = json!(CREDENTIAL_PRESENTATION_V4_SCHEMA);
+                signed["jti"] = json!(format!("presentation-tc1149-{label}-root-revoke"));
+                signed["challengeId"] = challenge["challengeId"].clone();
+                signed["nonce"] = challenge["nonce"].clone();
+                signed
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("credentialSpaceOwnerDid");
+                signed["issuedAt"] = json!(format_time(OffsetDateTime::now_utc()));
+                signed["expiresAt"] = json!(format_time(
+                    OffsetDateTime::now_utc() + Duration::seconds(45)
+                ));
+                let mut unsigned = signed.clone();
+                unsigned.as_object_mut().unwrap().remove("signature");
+                let mut preimage = CREDENTIAL_PRESENTATION_V4_DOMAIN.to_vec();
+                preimage.extend_from_slice(&canonical_json_value(&unsigned));
+                signed["signature"]["value"] = json!(encode_config(
+                    holder_key.sign(&Sha256::digest(preimage)),
+                    URL_SAFE_NO_PAD
+                ));
+                let body = json!({
                     "policyCid": policy_cid,
                     "challengeId": challenge["challengeId"],
                     "nonce": challenge["nonce"],
@@ -10345,8 +10542,26 @@ mod tests {
                     "credential": credential,
                     "presentation": signed,
                 })
-                .to_string(),
-            )
+                .to_string();
+                if mint_before_revoke {
+                    let minted = client
+                        .post("/policy/v3/delegations")
+                        .header(ContentType::JSON)
+                        .body(body)
+                        .dispatch()
+                        .await;
+                    let status = minted.status();
+                    let response_body = minted.into_string().await.unwrap_or_default();
+                    assert_eq!(
+                        status,
+                        Status::Ok,
+                        "fresh mint before root revoke: {response_body}"
+                    );
+                } else {
+                    pending = Some(body);
+                }
+            }
+            pending
         } else {
             None
         };
@@ -10358,6 +10573,61 @@ mod tests {
         } else {
             "policyRootCid"
         };
+        // Earlier test writes may have changed the KV object's content after
+        // the first ticket was minted. Issue and redeem a CURRENT ticket so a
+        // post-ACK 403 proves revocation rather than an unrelated stale-hash
+        // precondition failure.
+        let live_ticket_before_root = if space_owner {
+            let minted = client
+                .post("/signed/kv")
+                .header(ContentType::JSON)
+                .header(rocket::http::Header::new(
+                    "Authorization",
+                    reader_b_invocation(
+                        30,
+                        &format!("tc1149-live-signed-url-before-{root_field}-revoke"),
+                    )?,
+                ))
+                .body(signed_request.clone())
+                .dispatch()
+                .await;
+            let status = minted.status();
+            let body = minted.into_string().await.unwrap_or_default();
+            assert_eq!(
+                status,
+                Status::Ok,
+                "current signed URL before {root_field} revoke: {body}"
+            );
+            let url = serde_json::from_str::<Value>(&body)?["url"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("missing current signed URL"))?
+                .to_owned();
+            let still_live_status = client.get(&url).dispatch().await.status();
+            assert_eq!(
+                still_live_status,
+                Status::Ok,
+                "current ticket must redeem before revoke"
+            );
+            Some(url)
+        } else {
+            None
+        };
+        let status_path = format!(
+            "/policy/v3/status/{}",
+            registered[root_field].as_str().unwrap()
+        );
+        if space_owner {
+            let active_status = client.get(&status_path).dispatch().await;
+            assert_eq!(
+                active_status.status(),
+                Status::Ok,
+                "root status before revoke"
+            );
+            assert_eq!(
+                active_status.into_json::<Value>().await.unwrap()["state"],
+                "active"
+            );
+        }
         let revoked_root_cid = registered[root_field]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("missing {root_field}"))?
@@ -10437,8 +10707,71 @@ mod tests {
         let revoke_status = revoke_response.status();
         let revoke_body = revoke_response.into_string().await.unwrap_or_default();
         assert_eq!(revoke_status, Status::Ok, "SDK root revoke: {revoke_body}");
+        if space_owner {
+            let public_status = client.get(&status_path).dispatch().await;
+            assert_eq!(
+                public_status.status(),
+                Status::Ok,
+                "root checkpoint after revoke"
+            );
+            let public_status: Value = public_status.into_json().await.unwrap();
+            assert_eq!(public_status["state"], "revoked");
+            if signed_root_revoke {
+                assert!(
+                    public_status["revocation"].is_object(),
+                    "signed root revocation checkpoint"
+                );
+            }
+        }
+
+        if let Some(signed_url) = live_ticket_before_root {
+            let old_ticket = client.get(signed_url).dispatch().await;
+            assert_eq!(
+                old_ticket.status(),
+                Status::Forbidden,
+                "pre-revoke signed URL must not redeem after {root_field} revoke"
+            );
+            let fresh_signed = client
+                .post("/signed/kv")
+                .header(ContentType::JSON)
+                .header(rocket::http::Header::new(
+                    "Authorization",
+                    reader_b_invocation(
+                        30,
+                        &format!("tc1149-fresh-signed-url-after-{root_field}-revoke"),
+                    )?,
+                ))
+                .body(signed_request)
+                .dispatch()
+                .await;
+            let status = fresh_signed.status();
+            let body = fresh_signed.into_string().await.unwrap_or_default();
+            assert_eq!(
+                status,
+                Status::Unauthorized,
+                "fresh signed URL after {root_field} revoke: {body}"
+            );
+        }
 
         if space_owner {
+            let challenge = client
+                .post("/policy/v3/challenges")
+                .header(ContentType::JSON)
+                .body(
+                    json!({
+                        "policyCid": policy_cid,
+                        "recipientDid": holder_did,
+                        "requestedCapabilities": requested,
+                    })
+                    .to_string(),
+                )
+                .dispatch()
+                .await;
+            assert_eq!(
+                challenge.status(),
+                Status::Forbidden,
+                "{root_field} fresh challenge after revoke"
+            );
             for (key, principal, parent, label) in [
                 (&holder_jwk, holder_did.as_str(), s0_cid, "s0"),
                 (

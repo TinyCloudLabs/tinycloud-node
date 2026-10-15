@@ -119,22 +119,7 @@ pub async fn lock_targets(
     // Insert and lock in canonical order across all node processes. A single
     // batched insert plus one ordered shared/exclusive row-lock query avoids
     // serial DB round trips for every signer in a proof closure.
-    match target::Entity::insert_many(principals.iter().cloned().map(|target_did| {
-        target::ActiveModel {
-            target_did: Set(target_did),
-        }
-    }))
-    .on_conflict(
-        OnConflict::column(target::Column::TargetDid)
-            .do_nothing()
-            .to_owned(),
-    )
-    .exec(tx)
-    .await
-    {
-        Ok(_) | Err(DbErr::RecordNotInserted) => (),
-        Err(error) => return Err(error),
-    }
+    ensure_target_rows(tx, &principals).await?;
     if tx.get_database_backend() != DbBackend::Sqlite {
         let query = target::Entity::find()
             .filter(target::Column::TargetDid.is_in(principals.iter().cloned()))
@@ -149,6 +134,64 @@ pub async fn lock_targets(
         }
     }
     Ok(())
+}
+
+/// Recovery authorization must lock the target and signer exclusively while
+/// keeping every other live proof principal shared. Acquire the strongest
+/// mode each principal needs on its first visit, across one canonical order:
+/// taking intermediate SHARE locks before target UPDATE locks can deadlock
+/// when two otherwise valid recovery chains cross.
+pub(crate) async fn lock_recovery_targets(
+    tx: &DatabaseTransaction,
+    principals: &[String],
+    target_did: &str,
+    issuer_did: &str,
+) -> Result<(), DbErr> {
+    let invalid = || DbErr::Custom("authorization-principal-invalid".into());
+    let target_did = principal_did(target_did).map_err(|_| invalid())?;
+    let issuer_did = principal_did(issuer_did).map_err(|_| invalid())?;
+    let mut ordered = Vec::with_capacity(principals.len() + 2);
+    for principal in principals {
+        ordered.push(principal_did(principal).map_err(|_| invalid())?);
+    }
+    ordered.push(target_did.clone());
+    ordered.push(issuer_did.clone());
+    ordered.sort_unstable();
+    ordered.dedup();
+    ensure_target_rows(tx, &ordered).await?;
+    if tx.get_database_backend() != DbBackend::Sqlite {
+        for principal in ordered {
+            let query = target::Entity::find_by_id(principal.clone());
+            let locked = if principal == target_did || principal == issuer_did {
+                query.lock_exclusive().one(tx).await?
+            } else {
+                query.lock_shared().one(tx).await?
+            };
+            if locked.is_none() {
+                return Err(DbErr::Custom("authorization-key-lock-missing".into()));
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn ensure_target_rows(tx: &DatabaseTransaction, principals: &[String]) -> Result<(), DbErr> {
+    match target::Entity::insert_many(principals.iter().cloned().map(|target_did| {
+        target::ActiveModel {
+            target_did: Set(target_did),
+        }
+    }))
+    .on_conflict(
+        OnConflict::column(target::Column::TargetDid)
+            .do_nothing()
+            .to_owned(),
+    )
+    .exec(tx)
+    .await
+    {
+        Ok(_) | Err(DbErr::RecordNotInserted) => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 fn canonical_principals(principals: &[String]) -> Result<Vec<String>, DbErr> {
