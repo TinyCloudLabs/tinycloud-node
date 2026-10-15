@@ -140,6 +140,19 @@ the lock through commit, so `seq` and sync cursors remain commit-ordered even
 when same-space uploads finish out of order. An unauthorized write uploads
 nothing.
 
+For protected legacy meeting paths, the durable freeze row is locked before
+upload and held until commit or abort. That barrier is distinct from the
+per-space sequence lock: a freeze drains uploads already in flight, while
+writes arriving after the freeze are rejected before upload. A stalled writer
+causes the freeze attempt to fail after 30 seconds rather than acknowledge an
+incomplete drain.
+
+Before upload, a lost pooled connection retries the candidate registration
+with the same idempotent upsert. If the hash or freeze row lock loses its
+transaction, the node restarts that transaction once and retakes both fences
+before persisting anything. It never replays an upload or committed write
+after a connection loss.
+
 A failed upload, precondition, or database write triggers an immediate
 hash-fenced reference check. Unreferenced blobs are removed and their
 physical-byte quota is refunded before the failure returns. Historical

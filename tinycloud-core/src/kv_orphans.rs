@@ -5,11 +5,12 @@ use std::{borrow::Cow, error::Error as StdError};
 use sea_orm::{
     sea_query::{Expr, LockBehavior, LockType, OnConflict},
     ColumnTrait, ConnectionTrait, DatabaseTransaction, DbBackend, DbErr, EntityTrait, QueryFilter,
-    QueryOrder, QuerySelect, TransactionTrait,
+    QueryOrder, QuerySelect, QueryTrait, TransactionTrait,
 };
 use time::{Duration, OffsetDateTime};
 use tinycloud_auth::resource::SpaceId;
 
+use crate::db_pool::RecoveringConnection;
 use crate::hash::Hash;
 use crate::models::{current_kv, kv_orphan_candidate as candidate, kv_write};
 use crate::storage::ImmutableDeleteStore;
@@ -49,6 +50,31 @@ pub async fn register_candidates<C: ConnectionTrait>(
         )
         .exec(conn)
         .await?;
+    }
+    Ok(())
+}
+
+/// Register before upload on the recovering pool. Replaying the *same*
+/// upsert after a lost connection is safe even if its first attempt committed:
+/// the key and `created_at` are fixed in the statement. Transactional fences
+/// use `register_candidates` instead and are never replayed independently.
+pub async fn register_candidates_idempotent(
+    conn: &RecoveringConnection,
+    blobs: &[(SpaceId, Hash)],
+) -> Result<(), DbErr> {
+    for (space, value) in ordered_unique(blobs).iter() {
+        let statement = candidate::Entity::insert(candidate::ActiveModel {
+            space: sea_orm::ActiveValue::Set(SpaceIdWrap(space.clone())),
+            value: sea_orm::ActiveValue::Set(*value),
+            created_at: sea_orm::ActiveValue::Set(OffsetDateTime::now_utc()),
+        })
+        .on_conflict(
+            OnConflict::columns([candidate::Column::Space, candidate::Column::Value])
+                .update_column(candidate::Column::CreatedAt)
+                .to_owned(),
+        )
+        .build(conn.get_database_backend());
+        conn.execute_idempotent_preparatory(statement).await?;
     }
     Ok(())
 }

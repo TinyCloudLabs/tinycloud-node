@@ -113,15 +113,24 @@ use tokio::{
     net::{TcpListener, TcpStream},
 };
 
-/// Round trips allowed per flow; see the module docs. Measured with
-/// `test_before_acquire(false)`, database identity resolve as one statement,
-/// the read audit as one statement and no second sequence lock (TC-951):
+/// Measured warm on PostgreSQL with #302's one-query authorization snapshot
+/// (required dependency of TC-735). Sign-in and GET each lose six trips:
+/// - sign-in 69 = peer key 0 + host `/delegate` 17 + session `/delegate` 18
+///   + account-space SQL write 34;
+/// - kv get 16, including its durable read-audit commit.
 ///
-/// - sign-in 75 = peer key 0 + host `/delegate` 17 + session `/delegate` 18
-///   + account-space SQL write 40;
-/// - kv put 37;
-/// - kv get 22, including the read-audit commit.
-const BUDGETS: [(&str, u64); 3] = [("sign-in", 75), ("kv put", 37), ("kv get", 22)];
+/// KV PUT is 42 = 35 statements + seven mandatory pool-release pings.
+/// Against the pre-#302 production 37 = 31 statements + six pings, the four
+/// net new statements are seven necessary steps minus three queries saved by
+/// #302 in the commit authorization graph: BEGIN/COMMIT pin pre-upload work
+/// for retry-safe atomicity (two), the pre-upload authorization graph and
+/// hosted-space COUNT reject before S3 (two), the candidate reservation
+/// survives a crash before upload (one), a second hash-fence reservation
+/// under the commit transaction excludes GC after upload (one), and the
+/// candidate DELETE clears the committed reference atomically (one).
+/// The extra preflight transaction also releases one pooled connection,
+/// whose ping flushes cancelled/unfinished statements and cannot be removed.
+const BUDGETS: [(&str, u64); 3] = [("sign-in", 69), ("kv put", 42), ("kv get", 16)];
 
 /// Full sign-in plus put plus get rounds run before the measured one.
 const WARM_UP_ROUNDS: u8 = 3;

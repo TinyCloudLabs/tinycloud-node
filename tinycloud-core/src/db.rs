@@ -161,6 +161,7 @@ mod meeting_snapshot_fence_tests {
 #[derive(Debug, Clone)]
 pub struct SpaceDatabase<C, B, S> {
     conn: C,
+    candidate_conn: RecoveringConnection,
     storage: B,
     secrets: S,
     encryption: Option<ColumnEncryption>,
@@ -319,6 +320,38 @@ where
     }
 }
 
+/// Reject unauthorized or unhosted mutations before any content upload.
+/// The commit transaction repeats authorization after the sequence lock.
+async fn authorize_mutation_preupload<C: ConnectionTrait, B: StorageSetup, K: Secrets>(
+    conn: &C,
+    invocation: &Invocation,
+    mode: InvokeMode,
+    now: OffsetDateTime,
+    spaces: &[SpaceId],
+) -> Result<(), TxError<B, K>> {
+    match mode {
+        InvokeMode::Admitted => {
+            invocation::authorize_admitted(conn, &invocation.0, now, None)
+                .await
+                .map_err(TxError::<B, K>::from)?;
+        }
+        InvokeMode::Public => {
+            invocation::verify_and_authorize(conn, &invocation.0, now)
+                .await
+                .map_err(TxError::<B, K>::from)?;
+        }
+        InvokeMode::Internal | InvokeMode::MeetingPublication => {}
+    }
+    let hosted = space::Entity::find()
+        .filter(space::Column::Id.is_in(spaces.iter().cloned().map(SpaceIdWrap)))
+        .count(conn)
+        .await?;
+    if hosted != spaces.len() as u64 {
+        return Err(TxError::SpaceNotFound);
+    }
+    Ok(())
+}
+
 /// Apply the schema migrations on `pool`.
 ///
 /// On PostgreSQL sea-orm-migration runs them in one transaction; it runs
@@ -350,8 +383,9 @@ where
         migrate(&pool).await?;
         let writer_lock = (pool.get_database_backend() == sea_orm::DatabaseBackend::Sqlite)
             .then(|| Arc::new(tokio::sync::Mutex::new(())));
-        let read_audit = ReadAuditPipeline::start(pool, writer_lock.clone());
+        let read_audit = ReadAuditPipeline::start(pool.clone(), writer_lock.clone());
         Ok(Self {
+            candidate_conn: pool,
             conn,
             storage,
             secrets,
@@ -490,7 +524,11 @@ impl<C, B, K> SpaceDatabase<C, B, K>
 where
     C: TransactionTrait,
 {
-    /// Change the legacy artifact barrier. Freeze commit is the drain acknowledgement.
+    /// Change the legacy artifact barrier. Freeze commit acknowledges that
+    /// in-flight protected writes have committed or rolled back in the DB and
+    /// no protected upload can still land afterward. Cleanup of an unreferenced,
+    /// hash-fenced blob from a rolled-back write may finish after the ACK; it
+    /// only deletes/refunds physical storage, never changes committed KV rows.
     pub async fn set_legacy_meeting_write_freeze(
         &self,
         space: &SpaceId,
@@ -500,16 +538,27 @@ where
     where
         C: ConnectionTrait,
     {
-        let _writer = match &self.writer_lock {
-            Some(lock) => Some(lock.lock().await),
-            None => None,
-        };
-        let tx = self.begin_graph_transaction().await?;
-        let status =
-            crate::meeting_legacy_guard::transition(&tx, space, frozen, expected_generation)
-                .await?;
-        tx.commit().await?;
-        Ok(status)
+        // Acknowledgement must never wait indefinitely for a stalled upload.
+        // On timeout the transaction is dropped (and rolled back), so the
+        // caller cannot treat a failed freeze as a drained write barrier.
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let _writer = match &self.writer_lock {
+                Some(lock) => Some(lock.lock().await),
+                None => None,
+            };
+            let tx = self.begin_graph_transaction().await?;
+            let status =
+                crate::meeting_legacy_guard::transition(&tx, space, frozen, expected_generation)
+                    .await?;
+            tx.commit().await?;
+            Ok(status)
+        })
+        .await
+        .unwrap_or_else(|_| {
+            Err(crate::meeting_legacy_guard::FreezeError::Db(DbErr::Custom(
+                "legacy meeting freeze timed out waiting for in-flight writes".into(),
+            )))
+        })
     }
 
     pub async fn legacy_meeting_freeze_status(
@@ -2086,62 +2135,138 @@ where
             }
         }
 
+        let mut legacy_spaces: Vec<_> = mutation_keys
+            .iter()
+            .filter(|(_, path)| crate::meeting_legacy_guard::protects(path.as_str()))
+            .map(|(space, _)| space)
+            .collect();
+        legacy_spaces.sort_unstable();
+        legacy_spaces.dedup();
+        // Preserve frozen-write rejection before authorization and candidate
+        // registration. This read is only a preflight; the transaction takes
+        // the durable row lock before any upload below.
+        for space in &legacy_spaces {
+            if crate::meeting_legacy_guard::status(&self.conn, space)
+                .await
+                .map_err(|error| TxStoreError::Tx(TxError::Db(error)))?
+                .frozen
+            {
+                return Err(TxStoreError::LegacyMeetingFrozen);
+            }
+        }
         // Check the entire invocation before creating an object in the block
         // store. The transaction below repeats authorization after acquiring
         // the sequence lock, preserving revocation and time ordering.
         let now = OffsetDateTime::now_utc();
-        match mode {
-            InvokeMode::Admitted => {
-                invocation::authorize_admitted(&self.conn, &invocation.0, now, None)
-                    .await
-                    .map_err(TxError::<B, K>::from)?;
-            }
-            InvokeMode::Public => {
-                invocation::verify_and_authorize(&self.conn, &invocation.0, now)
-                    .await
-                    .map_err(TxError::<B, K>::from)?;
-            }
-            InvokeMode::Internal | InvokeMode::MeetingPublication => {}
-        }
         let mut sequence_spaces = invocation.0.spaces().cloned().collect::<Vec<_>>();
         sequence_spaces.sort_unstable();
         sequence_spaces.dedup();
-        let hosted = space::Entity::find()
-            .filter(space::Column::Id.is_in(sequence_spaces.iter().cloned().map(SpaceIdWrap)))
-            .count(&self.conn)
-            .await?;
-        if hosted != sequence_spaces.len() as u64 {
-            return Err(TxError::SpaceNotFound.into());
-        }
         let mut blobs = write_hashes
             .iter()
             .map(|((space, _), hash)| (space.clone(), *hash))
             .collect::<Vec<_>>();
         blobs.sort_unstable();
         blobs.dedup();
-        if !blobs.is_empty() {
-            crate::kv_orphans::register_candidates(&self.conn, &blobs).await?;
+        if self.conn.get_database_backend() == sea_orm::DatabaseBackend::Postgres {
+            // Batch authorization, hosted-space check, and durable candidate
+            // registration on one connection. This preparatory transaction
+            // cannot commit a KV write or upload; replay it once after a lost
+            // connection even if its candidate COMMIT reached PostgreSQL.
+            let mut retried = false;
+            loop {
+                let tx = self.candidate_conn.begin_preparatory().await?;
+                let prepared: Result<(), TxError<B, K>> = async {
+                    authorize_mutation_preupload::<_, B, K>(
+                        &tx,
+                        &invocation,
+                        mode,
+                        now,
+                        &sequence_spaces,
+                    )
+                    .await?;
+                    if !blobs.is_empty() {
+                        crate::kv_orphans::register_candidates(&tx, &blobs).await?;
+                    }
+                    tx.commit().await?;
+                    Ok(())
+                }
+                .await;
+                match prepared {
+                    Ok(()) => break,
+                    Err(TxError::Db(error))
+                        if !retried && crate::db_pool::is_connection_error(&error) =>
+                    {
+                        retried = true;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        } else {
+            authorize_mutation_preupload::<_, B, K>(
+                &self.conn,
+                &invocation,
+                mode,
+                now,
+                &sequence_spaces,
+            )
+            .await?;
+            if !blobs.is_empty() {
+                crate::kv_orphans::register_candidates_idempotent(&self.candidate_conn, &blobs)
+                    .await?;
+            }
         }
         // The database transaction fences the blob hash against a collector
         // (and another writer of the same content) through commit or rollback.
         // PostgreSQL only takes the per-space advisory sequence lock *after*
         // all S3 uploads. SQLite has one writer transaction already.
-        let result = async {
+        // Keep the write-only transaction future off caller/test thread stacks:
+        // its auth graph and commit state grew beyond the default debug stack.
+        // Read-only invocations return above without this allocation.
+        let result = Box::pin(async {
             let _writer = match &self.writer_lock {
                 Some(lock) => Some(lock.lock().await),
                 None => None,
             };
-            let begin_start = Instant::now();
-            let tx_result = self.begin_graph_transaction().await;
-            crate::telemetry::observe_stage(
-                crate::telemetry::InvocationStage::DbTxBegin,
-                crate::telemetry::StageOutcome::from(tx_result.is_ok()),
-                begin_start.elapsed(),
-            );
-            let tx = tx_result?;
-            if !blobs.is_empty() {
-                crate::kv_orphans::lock_candidates(&tx, &blobs).await?;
-            }
+            // A lost connection before persist cannot have landed a blob or
+            // committed a KV row. Restart the whole transaction once rather
+            // than replaying an individual statement on an aborted tx. This
+            // retakes both the hash fence and every protected freeze row.
+            let mut retried_preupload = false;
+            let tx = loop {
+                let begin_start = Instant::now();
+                let tx_result = self.begin_graph_transaction().await;
+                crate::telemetry::observe_stage(
+                    crate::telemetry::InvocationStage::DbTxBegin,
+                    crate::telemetry::StageOutcome::from(tx_result.is_ok()),
+                    begin_start.elapsed(),
+                );
+                let tx = tx_result?;
+                let locked: Result<bool, DbErr> = async {
+                    if !blobs.is_empty() {
+                        crate::kv_orphans::lock_candidates(&tx, &blobs).await?;
+                    }
+                    // A freeze waits for this row lock through commit/abort;
+                    // a late writer is refused without uploading.
+                    for space in &legacy_spaces {
+                        if crate::meeting_legacy_guard::lock_writer(&tx, space).await? {
+                            return Ok(true);
+                        }
+                    }
+                    Ok(false)
+                }
+                .await;
+                match locked {
+                    Ok(false) => break tx,
+                    Ok(true) => return Err(TxStoreError::LegacyMeetingFrozen),
+                    Err(error)
+                        if !retried_preupload && crate::db_pool::is_connection_error(&error) =>
+                    {
+                        retried_preupload = true;
+                        drop(tx);
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            };
             for ((space, path), stage) in stages.drain() {
                 let hash = self
                     .storage
@@ -2159,18 +2284,6 @@ where
             // SQLite already holds its single-writer lock at BEGIN, preventing a
             // read-to-write upgrade race. Multi-space PG locks are acquired in
             // stable order to avoid cross-space deadlocks.
-            let mut legacy_spaces: Vec<_> = mutation_keys
-                .iter()
-                .filter(|(_, path)| crate::meeting_legacy_guard::protects(path.as_str()))
-                .map(|(space, _)| space)
-                .collect();
-            legacy_spaces.sort_by_key(|space| space.to_string());
-            legacy_spaces.dedup();
-            for space in legacy_spaces {
-                if crate::meeting_legacy_guard::lock_writer(&tx, space).await? {
-                    return Err(TxStoreError::LegacyMeetingFrozen);
-                }
-            }
             // DbTxBody spans post-begin to pre-commit. The guard defaults to an
             // `error` outcome so any `?`/early return inside the transaction is
             // recorded as a failure; it is disarmed to `ok` right before commit.
@@ -2365,7 +2478,7 @@ where
             // commit tx if all side effects worked
             tx.commit().await?;
             Ok((commit, results))
-        }
+        })
         .await;
         if result.is_err() && !blobs.is_empty() {
             // The failed transaction (including any hash locks) has ended.
@@ -4938,8 +5051,12 @@ mod test {
                     db.invoke::<MemoryStaging>(invocation, inputs).await
                 };
                 assert!(
-                    matches!(result, Err(TxStoreError::LegacyMeetingFrozen)),
-                    "{ability} admitted={admitted}"
+                    matches!(&result, Err(TxStoreError::LegacyMeetingFrozen)),
+                    "{ability} admitted={admitted}: {:?}",
+                    result
+                        .as_ref()
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
                 );
             }
         }
@@ -5089,6 +5206,11 @@ mod test {
         inner: MemoryStore,
         entered: Arc<tokio::sync::Notify>,
         release: Arc<tokio::sync::Notify>,
+        fail_after_persist: bool,
+        uploads: Arc<std::sync::atomic::AtomicUsize>,
+        pause_remove: bool,
+        removing: Arc<tokio::sync::Notify>,
+        remove_release: Arc<tokio::sync::Notify>,
     }
     #[async_trait::async_trait]
     impl StorageSetup for LegacyPausedStore {
@@ -5128,9 +5250,15 @@ mod test {
             space: &SpaceId,
             stage: HashBuffer<Vec<u8>>,
         ) -> Result<Hash, Self::Error> {
+            self.uploads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.entered.notify_one();
             self.release.notified().await;
-            self.inner.persist(space, stage).await
+            let hash = self.inner.persist(space, stage).await?;
+            if self.fail_after_persist {
+                return Err(std::io::Error::other("lost upload response"));
+            }
+            Ok(hash)
         }
     }
     #[async_trait::async_trait]
@@ -5138,6 +5266,10 @@ mod test {
         type Error = std::io::Error;
 
         async fn remove(&self, space: &SpaceId, hash: &Hash) -> Result<Option<()>, Self::Error> {
+            if self.pause_remove {
+                self.removing.notify_one();
+                self.remove_release.notified().await;
+            }
             self.inner.remove(space, hash).await
         }
     }
@@ -5242,6 +5374,420 @@ mod test {
                 .await,
             Err(TxStoreError::LegacyMeetingFrozen)
         ));
+    }
+
+    #[tokio::test]
+    async fn postgres_legacy_freeze_during_slow_upload_waits_for_commit() {
+        use crate::storage::memory::MemoryStaging;
+        use futures::io::AsyncWriteExt;
+        let Some(schema) = crate::test_support::PostgresTestSchema::new(
+            "postgres_legacy_freeze_during_slow_upload_waits_for_commit",
+        )
+        .await
+        else {
+            return;
+        };
+        let storage = LegacyPausedStore::default();
+        let first = SpaceDatabase::new(
+            schema.conn.clone(),
+            storage.clone(),
+            StaticSecret::new(vec![0; 32]).unwrap(),
+        )
+        .await
+        .unwrap();
+        let second = SpaceDatabase::new(
+            schema.conn.clone(),
+            storage.clone(),
+            StaticSecret::new(vec![0; 32]).unwrap(),
+        )
+        .await
+        .unwrap();
+        let space = test_space_id("pg-legacy-slow-upload");
+        space::ActiveModel {
+            id: Set(SpaceIdWrap(space.clone())),
+        }
+        .insert(&first.conn)
+        .await
+        .unwrap();
+        let path: Path = "xyz.tinycloud.tinychat/connectors/fireflies/transcript/slow"
+            .parse()
+            .unwrap();
+        let writer_space = space.clone();
+        let writer_path = path.clone();
+        let writer = tokio::spawn(async move {
+            let mut stage = HashBuffer::new(Vec::new());
+            stage.write_all(b"slow original").await.unwrap();
+            first
+                .invoke_internal_kv_put::<MemoryStaging>(
+                    writer_space,
+                    writer_path,
+                    Metadata(Default::default()),
+                    stage,
+                    None,
+                )
+                .await
+                .map_err(|error| error.to_string())
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            storage.entered.notified(),
+        )
+        .await
+        .unwrap();
+        let freeze_space = space.clone();
+        let reader = second.clone();
+        let mut freeze = tokio::spawn(async move {
+            second
+                .set_legacy_meeting_write_freeze(&freeze_space, true, 0)
+                .await
+        });
+        let early_ack =
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut freeze).await;
+        storage.release.notify_one();
+        let written = tokio::time::timeout(std::time::Duration::from_secs(10), writer)
+            .await
+            .unwrap()
+            .unwrap();
+        let acknowledged_while_uploading = early_ack.is_ok();
+        let frozen = match early_ack {
+            Ok(result) => result.unwrap().unwrap().frozen,
+            Err(_) => {
+                tokio::time::timeout(std::time::Duration::from_secs(10), freeze)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap()
+                    .frozen
+            }
+        };
+        assert!(
+            !acknowledged_while_uploading,
+            "freeze acknowledged before pre-persisted write committed"
+        );
+        let hash = written.unwrap();
+        assert!(frozen);
+        assert!(storage.inner.contains(&space, &hash).await.unwrap());
+        assert_eq!(reader.kv_get(&space, &path).await.unwrap().unwrap().1, hash);
+    }
+
+    #[tokio::test]
+    async fn legacy_freeze_during_failed_upload_refunds_and_rejects_later_write_before_upload() {
+        use crate::storage::{memory::MemoryStaging, StoreSize};
+        use futures::io::AsyncWriteExt;
+        let directory = tempfile::tempdir().unwrap();
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("native.sqlite").display()
+        );
+        let storage = LegacyPausedStore {
+            fail_after_persist: true,
+            ..Default::default()
+        };
+        let first = SpaceDatabase::new(
+            Database::connect(url.clone()).await.unwrap(),
+            storage.clone(),
+            StaticSecret::new(vec![0; 32]).unwrap(),
+        )
+        .await
+        .unwrap();
+        let second = SpaceDatabase::new(
+            Database::connect(url).await.unwrap(),
+            storage.clone(),
+            StaticSecret::new(vec![0; 32]).unwrap(),
+        )
+        .await
+        .unwrap();
+        let space = test_space_id("legacy-failed-upload-freeze");
+        space::ActiveModel {
+            id: Set(SpaceIdWrap(space.clone())),
+        }
+        .insert(&first.conn)
+        .await
+        .unwrap();
+        let path: Path = "xyz.tinycloud.tinychat/connectors/fireflies/transcript/failed"
+            .parse()
+            .unwrap();
+        let writer_space = space.clone();
+        let writer_path = path.clone();
+        let writer = tokio::spawn(async move {
+            let mut stage = HashBuffer::new(Vec::new());
+            stage.write_all(b"failed upload").await.unwrap();
+            first
+                .invoke_internal_kv_put::<MemoryStaging>(
+                    writer_space,
+                    writer_path,
+                    Metadata(Default::default()),
+                    stage,
+                    None,
+                )
+                .await
+                .map_err(|error| error.to_string())
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            storage.entered.notified(),
+        )
+        .await
+        .unwrap();
+        let freeze_space = space.clone();
+        let freeze_db = second.clone();
+        let mut freeze = tokio::spawn(async move {
+            freeze_db
+                .set_legacy_meeting_write_freeze(&freeze_space, true, 0)
+                .await
+        });
+        let early_ack =
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut freeze).await;
+        storage.release.notify_one();
+        let written = tokio::time::timeout(std::time::Duration::from_secs(10), writer)
+            .await
+            .unwrap()
+            .unwrap();
+        let acknowledged_while_uploading = early_ack.is_ok();
+        let frozen = match early_ack {
+            Ok(result) => result.unwrap().unwrap().frozen,
+            Err(_) => {
+                tokio::time::timeout(std::time::Duration::from_secs(10), freeze)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap()
+                    .frozen
+            }
+        };
+        assert!(
+            !acknowledged_while_uploading,
+            "freeze acknowledged while upload remained in flight"
+        );
+        let error = written.unwrap_err();
+        assert!(error.contains("lost upload response"), "{error}");
+        assert!(frozen);
+        let hash = crate::hash::hash(b"failed upload");
+        assert!(!storage.inner.contains(&space, &hash).await.unwrap());
+        assert_eq!(storage.inner.total_size(&space).await.unwrap(), Some(0));
+        assert_eq!(
+            crate::kv_orphans::collect_candidates(&second.conn, &storage, 1, time::Duration::ZERO)
+                .await
+                .unwrap(),
+            0,
+            "immediate refund consumed candidate exactly once"
+        );
+        let mut late_stage = HashBuffer::new(Vec::new());
+        late_stage.write_all(b"late").await.unwrap();
+        assert!(matches!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                second.invoke_internal_kv_put::<MemoryStaging>(
+                    space.clone(),
+                    path,
+                    Metadata(Default::default()),
+                    late_stage,
+                    None,
+                )
+            )
+            .await
+            .unwrap(),
+            Err(TxStoreError::LegacyMeetingFrozen)
+        ));
+        assert_eq!(
+            storage.uploads.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a post-freeze write must be refused before storage.persist"
+        );
+        assert_eq!(storage.inner.total_size(&space).await.unwrap(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn postgres_legacy_freeze_ack_during_orphan_cleanup_preserves_committed_references() {
+        use crate::storage::{memory::MemoryStaging, StoreSize};
+        use futures::io::AsyncWriteExt;
+        let Some(schema) = crate::test_support::PostgresTestSchema::new(
+            "postgres_legacy_freeze_ack_during_orphan_cleanup_preserves_committed_references",
+        )
+        .await
+        else {
+            return;
+        };
+        let storage = LegacyPausedStore {
+            fail_after_persist: true,
+            pause_remove: true,
+            ..Default::default()
+        };
+        let committed_db = SpaceDatabase::new(
+            schema.conn.clone(),
+            storage.inner.clone(),
+            StaticSecret::new(vec![0; 32]).unwrap(),
+        )
+        .await
+        .unwrap();
+        let writer_db = SpaceDatabase::new(
+            schema.conn.clone(),
+            storage.clone(),
+            StaticSecret::new(vec![0; 32]).unwrap(),
+        )
+        .await
+        .unwrap();
+        let freezer = SpaceDatabase::new(
+            schema.conn.clone(),
+            storage.clone(),
+            StaticSecret::new(vec![0; 32]).unwrap(),
+        )
+        .await
+        .unwrap();
+        let space = test_space_id("pg-freeze-orphan-cleanup");
+        space::ActiveModel {
+            id: Set(SpaceIdWrap(space.clone())),
+        }
+        .insert(&schema.conn)
+        .await
+        .unwrap();
+        let kept_path: Path = "xyz.tinycloud.tinychat/connectors/fireflies/transcript/kept"
+            .parse()
+            .unwrap();
+        let mut kept_stage = HashBuffer::new(Vec::new());
+        kept_stage.write_all(b"committed").await.unwrap();
+        let kept_hash = committed_db
+            .invoke_internal_kv_put::<MemoryStaging>(
+                space.clone(),
+                kept_path.clone(),
+                Metadata(Default::default()),
+                kept_stage,
+                None,
+            )
+            .await
+            .map_err(|error| error.to_string())
+            .unwrap();
+        let before = get_kv_entity(&schema.conn, &space, &kept_path)
+            .await
+            .unwrap()
+            .unwrap();
+        let writes_before = crate::models::kv_write::Entity::find()
+            .filter(crate::models::kv_write::Column::Space.eq(SpaceIdWrap(space.clone())))
+            .count(&schema.conn)
+            .await
+            .unwrap();
+        let orphan_path: Path = "xyz.tinycloud.tinychat/connectors/fireflies/transcript/orphan"
+            .parse()
+            .unwrap();
+        let orphan_probe = orphan_path.clone();
+        let orphan_hash = crate::hash::hash(b"uncommitted");
+        let writer_space = space.clone();
+        let mut writer = tokio::spawn(async move {
+            let mut stage = HashBuffer::new(Vec::new());
+            stage.write_all(b"uncommitted").await.unwrap();
+            writer_db
+                .invoke_internal_kv_put::<MemoryStaging>(
+                    writer_space,
+                    orphan_path,
+                    Metadata(Default::default()),
+                    stage,
+                    None,
+                )
+                .await
+                .map_err(|error| error.to_string())
+        });
+        if tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            storage.entered.notified(),
+        )
+        .await
+        .is_err()
+        {
+            writer.abort();
+            panic!("the protected writer did not reach the upload");
+        }
+        let freeze_space = space.clone();
+        let mut freeze = tokio::spawn(async move {
+            freezer
+                .set_legacy_meeting_write_freeze(&freeze_space, true, 0)
+                .await
+        });
+        let acknowledged_during_upload =
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut freeze)
+                .await
+                .is_ok();
+        storage.release.notify_one();
+        if tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            storage.removing.notified(),
+        )
+        .await
+        .is_err()
+        {
+            storage.remove_release.notify_one();
+            writer.abort();
+            freeze.abort();
+            panic!("the failed upload did not reach orphan cleanup");
+        }
+        let ack_before_cleanup =
+            tokio::time::timeout(std::time::Duration::from_secs(10), &mut freeze).await;
+        let orphan_still_present = storage.inner.contains(&space, &orphan_hash).await;
+        storage.remove_release.notify_one();
+        let orphan_still_present = orphan_still_present.unwrap();
+        let write_result =
+            match tokio::time::timeout(std::time::Duration::from_secs(10), &mut writer).await {
+                Ok(result) => result.unwrap(),
+                Err(_) => {
+                    writer.abort();
+                    freeze.abort();
+                    panic!("the failed write did not finish cleanup");
+                }
+            };
+        let acknowledged_before_cleanup = ack_before_cleanup.is_ok();
+        let frozen = match ack_before_cleanup {
+            Ok(result) => result.unwrap().unwrap().frozen,
+            Err(_) => {
+                tokio::time::timeout(std::time::Duration::from_secs(10), freeze)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap()
+                    .frozen
+            }
+        };
+        assert!(!acknowledged_during_upload);
+        assert!(
+            acknowledged_before_cleanup,
+            "the DB abort must release the freeze barrier"
+        );
+        assert!(
+            orphan_still_present,
+            "cleanup was still pending at freeze ACK"
+        );
+        assert!(frozen);
+        assert!(write_result.unwrap_err().contains("lost upload response"));
+        let after = get_kv_entity(&schema.conn, &space, &kept_path)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((after.seq, after.value), (before.seq, before.value));
+        assert_eq!(after.value, kept_hash);
+        assert!(get_kv_entity(&schema.conn, &space, &orphan_probe)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            crate::models::kv_write::Entity::find()
+                .filter(crate::models::kv_write::Column::Space.eq(SpaceIdWrap(space.clone())))
+                .count(&schema.conn)
+                .await
+                .unwrap(),
+            writes_before,
+            "post-ACK cleanup must not mutate committed rows"
+        );
+        assert!(storage.inner.contains(&space, &kept_hash).await.unwrap());
+        assert!(!storage.inner.contains(&space, &orphan_hash).await.unwrap());
+        assert_eq!(
+            storage.inner.total_size(&space).await.unwrap(),
+            Some(b"committed".len() as u64),
+            "only the unreferenced candidate may be refunded"
+        );
+        assert_eq!(
+            crate::kv_orphans::collect_candidates(&schema.conn, &storage, 1, time::Duration::ZERO)
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]
