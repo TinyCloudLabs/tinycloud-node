@@ -146,6 +146,22 @@ impl MigratorTrait for StandardMigrator {
     }
 }
 
+/// SeaORM's default maintenance methods bypass `up`/`down` and wrap their
+/// PostgreSQL work in one transaction. Reject them before touching schema or
+/// history rather than entering the nontransactional index migration.
+fn standard_maintenance_only<'c>(
+    db: SchemaManagerConnection<'c>,
+    operation: &str,
+) -> Result<SchemaManagerConnection<'c>, DbErr> {
+    if db.get_database_backend() == DbBackend::Postgres {
+        Err(DbErr::Custom(format!(
+            "PostgreSQL migrations support up/down only; {operation} is unsupported"
+        )))
+    } else {
+        Ok(db)
+    }
+}
+
 #[async_trait::async_trait]
 impl MigratorTrait for Migrator {
     fn migrations() -> Vec<Box<dyn MigrationTrait>> {
@@ -178,6 +194,39 @@ impl MigratorTrait for Migrator {
             Box::new(m20261015_000000_delegation_cursor_index::Migration),
             Box::new(m20261015_010000_current_kv_prefix_index::Migration),
         ]
+    }
+
+    async fn fresh<'c, C>(db: C) -> Result<(), DbErr>
+    where
+        C: IntoSchemaManagerConnection<'c>,
+    {
+        StandardMigrator::fresh(standard_maintenance_only(
+            db.into_schema_manager_connection(),
+            "fresh",
+        )?)
+        .await
+    }
+
+    async fn refresh<'c, C>(db: C) -> Result<(), DbErr>
+    where
+        C: IntoSchemaManagerConnection<'c>,
+    {
+        StandardMigrator::refresh(standard_maintenance_only(
+            db.into_schema_manager_connection(),
+            "refresh",
+        )?)
+        .await
+    }
+
+    async fn reset<'c, C>(db: C) -> Result<(), DbErr>
+    where
+        C: IntoSchemaManagerConnection<'c>,
+    {
+        StandardMigrator::reset(standard_maintenance_only(
+            db.into_schema_manager_connection(),
+            "reset",
+        )?)
+        .await
     }
 
     async fn up<'c, C>(db: C, steps: Option<u32>) -> Result<(), DbErr>
@@ -355,6 +404,58 @@ mod release_line_tests {
             ))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_maintenance_methods_reject_without_mutation() {
+        let Some(schema) = crate::test_support::PostgresTestSchema::new(
+            "postgres_maintenance_methods_reject_without_mutation",
+        )
+        .await
+        else {
+            return;
+        };
+        let db = &schema.conn;
+        db.execute_unprepared("CREATE TABLE tc737_stray (id integer)")
+            .await
+            .unwrap();
+        let before: i64 = db
+            .query_one(Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT count(*) AS count FROM seaql_migrations",
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "count")
+            .unwrap();
+        for (name, result) in [
+            ("fresh", Migrator::fresh(db).await),
+            ("refresh", Migrator::refresh(db).await),
+            ("reset", Migrator::reset(db).await),
+        ] {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains(&format!("{name} is unsupported")),
+                "{name} must reject before DDL"
+            );
+        }
+        let row = db
+            .query_one(Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT (SELECT count(*) FROM seaql_migrations) AS count, \
+                 to_regclass('tc737_stray') IS NOT NULL AS stray, \
+                 EXISTS(SELECT 1 FROM pg_index WHERE \
+                 indexrelid = to_regclass('idx_current_kv_space_key_c') AND indisvalid) AS valid",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.try_get::<i64>("", "count").unwrap(), before);
+        assert!(row.try_get::<bool>("", "stray").unwrap());
+        assert!(row.try_get::<bool>("", "valid").unwrap());
     }
 
     #[tokio::test]

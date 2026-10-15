@@ -222,6 +222,17 @@ gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref main \
   release; only the node binary rolls back. Check
   `tinycloud-core/src/migrations` between the two revisions first: a binary
   rollback across a schema migration is not DB-safe.
+- After TC-737's `m20261015_010000_current_kv_prefix_index` is recorded,
+  an older node binary cannot restart against that database: SeaORM rejects
+  unknown applied migration versions. Already-running older writers can keep
+  writing while PostgreSQL builds the additive index concurrently, but binary
+  rollback is not safe. Recover by rolling forward through the coordinated
+  release sequence, not by promoting an older image.
+- The PostgreSQL migrator supports `up` and `down` across the concurrent index.
+  `fresh`, `refresh`, and `reset` reject before changing schema or migration
+  history; SeaORM's inherited implementations require one transaction and
+  cannot execute `CREATE/DROP INDEX CONCURRENTLY`. SQLite and MySQL keep their
+  standard migrator operations.
 - The sealed-config preflight is skipped for rollbacks, and the post-deploy
   `/version` check expects `rollback_image_version`. Run the same manual
   verification as for a release.
