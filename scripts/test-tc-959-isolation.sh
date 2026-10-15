@@ -600,3 +600,15 @@ SNAPSHOT_STARTED=2026-10-14T10:00:00.999999999+01:30
 CURRENT_STARTED=2026-10-14T08:30:01Z
 assert_crash_recovered
 printf '%s\n' 'PASS: exact-container crash identity and restart proofs'
+HOST_PROBE_REPORT=""
+HOST_PROBE_TARGETS=()
+record() { HOST_PROBE_REPORT+="$*"$'\n'; }
+assert_isolated_probe() {
+  record "PASS: $1 isolation; fresh source +0 and shipped +0"
+  HOST_PROBE_TARGETS+=("$4")
+}
+probe_host_external_interfaces $'198.51.100.22\n203.0.113.17'
+assert_eq "${HOST_PROBE_TARGETS[*]}" "198.51.100.22 203.0.113.17"
+[[ "$HOST_PROBE_REPORT" == *"iface#1"* && "$HOST_PROBE_REPORT" == *"iface#2"* ]] || fail "host interface report omitted stable labels"
+[[ "$HOST_PROBE_REPORT" != *"198.51.100.22"* && "$HOST_PROBE_REPORT" != *"203.0.113.17"* ]] || fail "host interface report exposed a full IPv4 address"
+printf '%s\n' 'PASS: host interface reports use iface labels without full IPv4 addresses'

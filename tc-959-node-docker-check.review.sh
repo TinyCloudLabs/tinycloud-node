@@ -349,7 +349,7 @@ const calledHelpers = [
   'probe_target_is_name', 'name_network_names_from_json', 'name_network_container_ids_from_json',
   'name_peer_matches_target', 'hosts_file_has_name', 'name_resolver_positive_control',
   'read_target_hosts_file', 'prove_name_target_structure',
-  'compose_half_cpu_cmd', 'measure_burst', 'run_isolation_leak_self_test',
+  'compose_half_cpu_cmd', 'measure_burst', 'run_isolation_leak_self_test', 'probe_host_external_interfaces',
 ];
 const missing = calledHelpers.filter((name) => !declared.has(name));
 if (missing.length) throw new Error(`harness calls undefined shell functions: ${missing.join(', ')}`);
@@ -532,11 +532,7 @@ for target in "${probe_targets[@]}"; do
 done
 
 host_ips=$(ip -o -4 addr show scope global | awk '{split($4,a,"/"); print a[1]}')
-[[ -n "$host_ips" ]] || fail "no non-loopback IPv4 interface available for external-interface isolation probes"
-while read -r host_ip; do
-  [[ -n "$host_ip" ]] || continue
-  assert_isolated_probe "host external interface $host_ip" host host "$host_ip"
-done <<<"$host_ips"
+probe_host_external_interfaces "$host_ips"
 assert_no_console_marker "$PROBE_CANARY" || fail "forged probe canary appeared anywhere in Vector console output"
 record "PASS: raw Vector console output contains no forged-probe canary after the isolation matrix"
 

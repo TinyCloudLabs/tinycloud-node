@@ -559,3 +559,12 @@ run_isolation_leak_self_test() {
     record "PASS: negative isolation check rejected a deliberately allowed host-loopback packet"
   fi
 }
+probe_host_external_interfaces() {
+  local host_ips=$1 host_ip interface_index=0
+  [[ -n "$host_ips" ]] || fail "no non-loopback IPv4 interface available for external-interface isolation probes"
+  while read -r host_ip; do
+    [[ -n "$host_ip" ]] || continue
+    interface_index=$((interface_index + 1))
+    assert_isolated_probe "host external interface iface#$interface_index" host host "$host_ip"
+  done <<<"$host_ips"
+}
