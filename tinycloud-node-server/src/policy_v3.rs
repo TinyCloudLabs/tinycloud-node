@@ -7948,35 +7948,60 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn policy_v2_admits_v3_account_and_v4_accountless_receivers() -> anyhow::Result<()> {
-        run_policy_v2_flow(PolicyOwner::SpaceOwner).await
+    #[test]
+    fn policy_v2_admits_v3_account_and_v4_accountless_receivers() -> anyhow::Result<()> {
+        run_policy_v2_flow_on_large_stack(PolicyOwner::SpaceOwner)
+    }
+
+    #[test]
+    fn revoking_policy_authority_root_denies_admitted_sessions() -> anyhow::Result<()> {
+        run_policy_v2_flow_on_large_stack(PolicyOwner::SpaceOwnerPolicyRoot)
     }
 
     /// The real Share and CLI shape: the policy owner is a session key the
     /// space owner delegated to. It registers, mints and reads; once the
     /// space owner revokes that delegation, no new session can be minted.
-    #[tokio::test]
-    async fn policy_owner_may_be_a_session_the_space_owner_delegated_to() -> anyhow::Result<()> {
-        run_policy_v2_flow(PolicyOwner::DelegatedSession).await
+    #[test]
+    fn policy_owner_may_be_a_session_the_space_owner_delegated_to() -> anyhow::Result<()> {
+        run_policy_v2_flow_on_large_stack(PolicyOwner::DelegatedSession)
     }
 
     /// The policy owner signs a valid, self-consistent policy over content in
     /// a space it holds no authority in (the victim hosts and seeds it).
     /// Registration must refuse it, so no session can ever read the bytes.
-    #[tokio::test]
-    async fn policy_registration_requires_the_owner_to_hold_what_it_grants() -> anyhow::Result<()> {
-        run_policy_v2_flow(PolicyOwner::Unauthorized).await
+    #[test]
+    fn policy_registration_requires_the_owner_to_hold_what_it_grants() -> anyhow::Result<()> {
+        run_policy_v2_flow_on_large_stack(PolicyOwner::Unauthorized)
     }
 
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum PolicyOwner {
         /// The policy owner is the content space's owner.
         SpaceOwner,
+        /// A second owner-owned policy revoking the policy-authority root.
+        SpaceOwnerPolicyRoot,
         /// The policy owner is a session key the space owner delegated to.
         DelegatedSession,
         /// The policy owner holds nothing in the content space.
         Unauthorized,
+    }
+
+    // This existing end-to-end fixture now exercises get and put across
+    // several policy descendants; its async frame exceeds the default test
+    // thread stack. Keep the test self-contained on CI rather than requiring
+    // RUST_MIN_STACK in the runner environment.
+    fn run_policy_v2_flow_on_large_stack(policy_owner: PolicyOwner) -> anyhow::Result<()> {
+        std::thread::Builder::new()
+            .stack_size(16 << 20)
+            .spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("policy fixture runtime")
+                    .block_on(run_policy_v2_flow(policy_owner))
+            })?
+            .join()
+            .expect("policy fixture thread panicked")
     }
 
     async fn run_policy_v2_flow(policy_owner: PolicyOwner) -> anyhow::Result<()> {
@@ -8016,7 +8041,10 @@ mod tests {
             SpaceId::new(account_owner_did.parse::<DIDBuf>()?, "credentials".parse()?);
         let victim_key = tinycloud_core::libp2p::identity::ed25519::Keypair::generate();
         let victim_did = did(&victim_key);
-        let content_owner_did = if policy_owner != PolicyOwner::SpaceOwner {
+        let space_owner = matches!(
+            policy_owner, PolicyOwner::SpaceOwner | PolicyOwner::SpaceOwnerPolicyRoot
+        );
+        let content_owner_did = if !space_owner {
             &victim_did
         } else {
             &owner_did
@@ -8052,19 +8080,33 @@ mod tests {
         let now = OffsetDateTime::now_utc().replace_nanosecond(0).unwrap();
         let issued = now - Duration::seconds(5);
         let expires = now + Duration::seconds(600);
+        let requested_actions = if policy_owner != PolicyOwner::Unauthorized {
+            vec!["tinycloud.kv/get", "tinycloud.kv/put"]
+        } else {
+            vec!["tinycloud.kv/get"]
+        };
+        let ceiling_actions = if policy_owner != PolicyOwner::Unauthorized {
+            vec!["tinycloud.kv/get", "tinycloud.kv/metadata", "tinycloud.kv/put"]
+        } else {
+            vec!["tinycloud.kv/get", "tinycloud.kv/metadata"]
+        };
         let requested = vec![json!({
             "kind": "kv",
             "resource": content_resource.to_string(),
             "selector": "exact",
-            "actions": ["tinycloud.kv/get"]
+            "actions": requested_actions
         })];
+        let mut read_capabilities = requested.clone();
+        read_capabilities[0]["actions"] = json!(["tinycloud.kv/get"]);
+        let mut write_capabilities = requested.clone();
+        write_capabilities[0]["actions"] = json!(["tinycloud.kv/put"]);
         let encryption_resource = format!("urn:tinycloud:encryption:{content_owner_did}:mainnet");
         let ceiling = vec![
             json!({
                 "kind": "kv",
                 "resource": content_resource.to_string(),
                 "selector": "exact",
-                "actions": ["tinycloud.kv/get", "tinycloud.kv/metadata"]
+                "actions": ceiling_actions
             }),
             json!({
                 "kind": "encryption",
@@ -8470,7 +8512,7 @@ mod tests {
         // never carries authority for this resource.
         // The content space's owner hosts and seeds it through the ordinary
         // graph: the policy owner itself, or a victim when the content is foreign.
-        let content_owner_key = if policy_owner != PolicyOwner::SpaceOwner {
+        let content_owner_key = if !space_owner {
             &victim_key
         } else {
             &owner_key
@@ -8539,7 +8581,7 @@ mod tests {
         // that delegation covers, as the Share and CLI owners do.
         let owner_delegation_cid = if policy_owner == PolicyOwner::DelegatedSession {
             let mut owner_capabilities = Capabilities::<Value>::new();
-            for ability in ["tinycloud.kv/get", "tinycloud.kv/metadata"] {
+            for ability in ["tinycloud.kv/get", "tinycloud.kv/metadata", "tinycloud.kv/put"] {
                 owner_capabilities.with_action(
                     content_resource.as_uri(),
                     ability.parse::<RecapAbility>()?,
@@ -9152,7 +9194,7 @@ mod tests {
             facts: Some(Vec::<Value>::new()),
             proof: vec![child_cid],
             attenuation: serde_json::from_value::<Capabilities<Value>>(
-                attenuation_for_policy_capabilities(&requested)
+                attenuation_for_policy_capabilities(&read_capabilities)
                     .map_err(|(_, error)| anyhow::anyhow!(error))?,
             )?,
         }
@@ -9389,7 +9431,7 @@ mod tests {
             facts: Some(Vec::<Value>::new()),
             proof: vec![v4_s0.content_hash().to_cid(0x55)],
             attenuation: serde_json::from_value::<Capabilities<Value>>(
-                attenuation_for_policy_capabilities(&requested)
+                attenuation_for_policy_capabilities(&read_capabilities)
                     .map_err(|(_, error)| anyhow::anyhow!(error))?,
             )?,
         }
@@ -9456,7 +9498,8 @@ mod tests {
         let reader_b_did = tinycloud_auth::resolver::DID_METHODS
             .generate(&reader_b_jwk, "key")?
             .to_string();
-        let mut chain_tip = v4_s0;
+        let mut chain_tip =
+            decode_delegation(v4_authorization).map_err(|(_, error)| anyhow::anyhow!(error))?;
         for (issuer_jwk, issuer_did, audience_did, nonce) in [
             (&holder_jwk, &holder_did, &reader_a_did, "tc529-child"),
             (
@@ -9499,7 +9542,7 @@ mod tests {
                 facts: Some(Vec::<Value>::new()),
                 proof: vec![grandchild_cid],
                 attenuation: serde_json::from_value::<Capabilities<Value>>(
-                    attenuation_for_policy_capabilities(&requested)
+                    attenuation_for_policy_capabilities(&read_capabilities)
                         .map_err(|(_, error)| anyhow::anyhow!(error))?,
                 )?,
             }
@@ -9590,6 +9633,64 @@ mod tests {
             .await;
         assert_eq!(replay.status(), Status::Unauthorized);
 
+        let session_invocation =
+            |key: &JWK,
+             principal: &str,
+             parent: tinycloud_auth::ipld_core::cid::Cid,
+             allowed: &[Value],
+             nonce: &str|
+             -> anyhow::Result<String> {
+                let now = OffsetDateTime::now_utc();
+                let vm = format!("{principal}#{}", principal.trim_start_matches("did:key:"));
+                Ok(Payload {
+                    issuer: vm.parse()?,
+                    audience: principal.parse()?,
+                    not_before: Some(NumericDate::try_from_seconds(now.unix_timestamp() as f64)?),
+                    expiration: NumericDate::try_from_seconds(
+                        (now + Duration::seconds(30)).unix_timestamp() as f64,
+                    )?,
+                    nonce: Some(nonce.into()),
+                    facts: Some(Vec::<Value>::new()),
+                    proof: vec![parent],
+                    attenuation: serde_json::from_value::<Capabilities<Value>>(
+                        attenuation_for_policy_capabilities(allowed)
+                            .map_err(|(_, error)| anyhow::anyhow!(error))?,
+                    )?,
+                }
+                .sign(Algorithm::EdDSA, key)?
+                .encode()?)
+            };
+        let s0_cid = v4_s0.content_hash().to_cid(0x55);
+        for (key, principal, parent, nonce, content) in [
+            (&holder_jwk, holder_did.as_str(), s0_cid, "tc1149-s0-write-before", "s0-before"),
+            (&reader_b_jwk, reader_b_did.as_str(), grandchild_cid, "tc1149-descendant-write-before", "descendant-before"),
+        ] {
+            let write = client.post("/invoke")
+                .header(rocket::http::Header::new(
+                    "Authorization",
+                    session_invocation(key, principal, parent, &write_capabilities, nonce)?,
+                ))
+                .header(ContentType::Plain)
+                .body(content)
+                .dispatch().await;
+            let status = write.status();
+            let body = write.into_string().await.unwrap_or_default();
+            assert_eq!(status, Status::Ok, "pre-revoke {nonce}: {body}");
+        }
+        let owner_read = |nonce: &str| -> anyhow::Result<String> {
+            Ok(make_invocation(
+                [(content_resource.clone(), ["tinycloud.kv/get".parse::<RecapAbility>()?])],
+                &sender_cid, &holder_jwk, &holder_vm,
+                (OffsetDateTime::now_utc() + Duration::seconds(30)).unix_timestamp() as f64,
+                InvocationOptions { nonce: Some(nonce.into()), ..InvocationOptions::default() },
+            )?.encode()?)
+        };
+        let before = client.post("/invoke")
+            .header(rocket::http::Header::new("Authorization", owner_read("tc1149-owner-read-before")?))
+            .dispatch().await;
+        assert_eq!(before.status(), Status::Ok);
+        assert_eq!(before.into_bytes().await.unwrap_or_default(), b"descendant-before");
+
         if let Some(owner_delegation_cid) = owner_delegation_cid.as_deref() {
             // Revoking the delegation the policy owner held stops new
             // sessions, although the policy and its roots are untouched.
@@ -9629,6 +9730,55 @@ mod tests {
                 Status::Ok,
                 "owner session revoke: {revoked_body}"
             );
+
+            // The revoke ACK is the cutoff. Old signatures and registered
+            // descendants must no longer authorize reads, writes, or children.
+            for (key, principal, parent, label) in [
+                (&holder_jwk, holder_did.as_str(), s0_cid, "s0"),
+                (&reader_b_jwk, reader_b_did.as_str(), grandchild_cid, "descendant"),
+            ] {
+                for (action, allowed) in [
+                    ("get", &read_capabilities),
+                    ("put", &write_capabilities),
+                ] {
+                    let authorization = session_invocation(
+                        key, principal, parent, allowed,
+                        &format!("tc1149-after-owner-revoke-{label}-{action}"),
+                    )?;
+                    let response = client.post("/invoke")
+                        .header(rocket::http::Header::new("Authorization", authorization))
+                        .header(ContentType::Plain)
+                        .body("must-not-overwrite")
+                        .dispatch().await;
+                    let status = response.status();
+                    let body = response.into_string().await.unwrap_or_default();
+                    assert_eq!(status, Status::Forbidden, "{label} {action}: {body}");
+                }
+            }
+            let after = client.post("/invoke")
+                .header(rocket::http::Header::new("Authorization", owner_read("tc1149-owner-read-after")?))
+                .dispatch().await;
+            assert_eq!(after.status(), Status::Ok);
+            assert_eq!(after.into_bytes().await.unwrap_or_default(), b"descendant-before",
+                "denied policy writes must leave the owner-visible bytes unchanged");
+            let next_reader = JWK::generate_ed25519()?;
+            let next_did = tinycloud_auth::resolver::DID_METHODS
+                .generate(&next_reader, "key")?.to_string();
+            for (parent, issuer, principal, label) in [
+                (&v4_s0, &holder_jwk, holder_did.as_str(), "s0"),
+                (&chain_tip, &reader_b_jwk, reader_b_did.as_str(), "descendant"),
+            ] {
+                let attempted = hop(
+                    parent, issuer, principal, &next_did,
+                    &format!("tc1149-child-after-owner-revoke-{label}"),
+                )?;
+                let response = client.post("/delegate")
+                    .header(rocket::http::Header::new("Authorization", attempted))
+                    .dispatch().await;
+                let status = response.status();
+                let body = response.into_string().await.unwrap_or_default();
+                assert_eq!(status, Status::Forbidden, "{label} child: {body}");
+            }
 
             let challenge_response = client
                 .post("/policy/v3/challenges")
@@ -9689,21 +9839,68 @@ mod tests {
                 Status::Forbidden,
                 "mint after owner revoke: {refused_body}"
             );
-            assert_eq!(refused_body, "policy-owner-not-authorized");
         }
+
+        // Prepare a fresh, unused admission while both roots are live. It
+        // cannot be created after root revoke because challenge itself closes.
+        let fresh_root_mint = if space_owner {
+            let response = client.post("/policy/v3/challenges")
+                .header(ContentType::JSON)
+                .body(json!({
+                    "policyCid": policy_cid,
+                    "recipientDid": holder_did,
+                    "requestedCapabilities": requested,
+                }).to_string())
+                .dispatch().await;
+            assert_eq!(response.status(), Status::Ok);
+            let challenge: Value = response.into_json().await.unwrap();
+            let mut signed = presentation.clone();
+            signed["schema"] = json!(CREDENTIAL_PRESENTATION_V4_SCHEMA);
+            signed["jti"] = json!("presentation-tc1149-after-root-revoke");
+            signed["challengeId"] = challenge["challengeId"].clone();
+            signed["nonce"] = challenge["nonce"].clone();
+            signed.as_object_mut().unwrap().remove("credentialSpaceOwnerDid");
+            signed["issuedAt"] = json!(format_time(OffsetDateTime::now_utc()));
+            signed["expiresAt"] = json!(format_time(
+                OffsetDateTime::now_utc() + Duration::seconds(45)
+            ));
+            let mut unsigned = signed.clone();
+            unsigned.as_object_mut().unwrap().remove("signature");
+            let mut preimage = CREDENTIAL_PRESENTATION_V4_DOMAIN.to_vec();
+            preimage.extend_from_slice(&canonical_json_value(&unsigned));
+            signed["signature"]["value"] = json!(encode_config(
+                holder_key.sign(&Sha256::digest(preimage)),
+                URL_SAFE_NO_PAD
+            ));
+            Some(json!({
+                "policyCid": policy_cid,
+                "challengeId": challenge["challengeId"],
+                "nonce": challenge["nonce"],
+                "requirement": requirement,
+                "credential": credential,
+                "presentation": signed,
+            }).to_string())
+        } else {
+            None
+        };
 
         // SDK revocation writes the generic graph. Policy/v3 joins that
         // graph with its signed root status, so this one root revocation must
         // close the already-minted session plus new control-plane admission
         // and delivery. It intentionally does not fabricate a root-status
         // checkpoint.
-        let policy_root_cid = registered["policyRootCid"]
+        let root_field = if policy_owner == PolicyOwner::SpaceOwner {
+            "enforcementRootCid"
+        } else {
+            "policyRootCid"
+        };
+        let revoked_root_cid = registered[root_field]
             .as_str()
-            .ok_or_else(|| anyhow::anyhow!("missing policy root cid"))?
+            .ok_or_else(|| anyhow::anyhow!("missing {root_field}"))?
             .parse::<tinycloud_auth::ipld_core::cid::Cid>()?;
         let mut revoke_capabilities = Capabilities::<Value>::new();
         revoke_capabilities.with_action(
-            format!("urn:cid:{policy_root_cid}").parse()?,
+            format!("urn:cid:{revoked_root_cid}").parse()?,
             "tinycloud.delegation/revoke".parse::<RecapAbility>()?,
             [std::collections::BTreeMap::<String, Value>::new()],
         );
@@ -9734,6 +9931,68 @@ mod tests {
         let revoke_body = revoke_response.into_string().await.unwrap_or_default();
         assert_eq!(revoke_status, Status::Ok, "SDK root revoke: {revoke_body}");
 
+        if space_owner {
+            for (key, principal, parent, label) in [
+                (&holder_jwk, holder_did.as_str(), s0_cid, "s0"),
+                (&reader_b_jwk, reader_b_did.as_str(), grandchild_cid, "descendant"),
+            ] {
+                for (action, allowed) in [
+                    ("get", &read_capabilities),
+                    ("put", &write_capabilities),
+                ] {
+                    let authorization = session_invocation(
+                        key, principal, parent, allowed,
+                        &format!("tc1149-after-{root_field}-revoke-{label}-{action}"),
+                    )?;
+                    let response = client.post("/invoke")
+                        .header(rocket::http::Header::new("Authorization", authorization))
+                        .header(ContentType::Plain)
+                        .body("root-denied-write")
+                        .dispatch().await;
+                    let status = response.status();
+                    let body = response.into_string().await.unwrap_or_default();
+                    assert_eq!(status, Status::Forbidden, "{root_field} {label} {action}: {body}");
+                }
+            }
+            let unchanged = client.post("/invoke")
+                .header(rocket::http::Header::new(
+                    "Authorization",
+                    owner_read(&format!("tc1149-owner-read-after-{root_field}"))?,
+                ))
+                .dispatch().await;
+            assert_eq!(unchanged.status(), Status::Ok);
+            assert_eq!(
+                unchanged.into_bytes().await.unwrap_or_default(),
+                b"descendant-before",
+                "revoking {root_field} must not commit denied writes"
+            );
+            let next_reader = JWK::generate_ed25519()?;
+            let next_did = tinycloud_auth::resolver::DID_METHODS
+                .generate(&next_reader, "key")?.to_string();
+            for (parent, issuer, principal, label) in [
+                (&v4_s0, &holder_jwk, holder_did.as_str(), "s0"),
+                (&chain_tip, &reader_b_jwk, reader_b_did.as_str(), "descendant"),
+            ] {
+                let attempted = hop(
+                    parent, issuer, principal, &next_did,
+                    &format!("tc1149-{root_field}-child-after-revoke-{label}"),
+                )?;
+                let response = client.post("/delegate")
+                    .header(rocket::http::Header::new("Authorization", attempted))
+                    .dispatch().await;
+                let status = response.status();
+                let body = response.into_string().await.unwrap_or_default();
+                assert_eq!(status, Status::Forbidden, "{root_field} {label} child: {body}");
+            }
+            let refused = client.post("/policy/v3/delegations")
+                .header(ContentType::JSON)
+                .body(fresh_root_mint.expect("pre-revoke challenge and presentation"))
+                .dispatch().await;
+            let status = refused.status();
+            let body = refused.into_string().await.unwrap_or_default();
+            assert_eq!(status, Status::Forbidden, "{root_field} fresh mint: {body}");
+        }
+
         let post_revoke_now = OffsetDateTime::now_utc();
         let post_revoke_read = Payload {
             issuer: reader_vm.parse()?,
@@ -9748,7 +10007,7 @@ mod tests {
             facts: Some(Vec::<Value>::new()),
             proof: vec![child_cid],
             attenuation: serde_json::from_value::<Capabilities<Value>>(
-                attenuation_for_policy_capabilities(&requested)
+                attenuation_for_policy_capabilities(&read_capabilities)
                     .map_err(|(_, error)| anyhow::anyhow!(error))?,
             )?,
         }

@@ -6697,6 +6697,69 @@ mod test {
         drop(after);
     }
 
+    /// A second node process has a different lock registry but the same durable
+    /// authorization graph. Its revoke ACK must not overtake a read admitted
+    /// on the first connection, and a new admission after ACK must see revoke.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn independent_connections_fence_revocation_ack_and_later_admission() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("revoke-cutoff.db");
+        let make_db = |conn| async move {
+            SpaceDatabase::new(
+                conn,
+                MemoryStore::default(),
+                StaticSecret::new([0u8; 32].to_vec()).unwrap(),
+            ).await.unwrap()
+        };
+        let admitting = make_db(sqlite_write_pool(
+            &path, std::time::Duration::from_secs(5), 2
+        ).await).await;
+        let revoking = make_db(sqlite_write_pool(
+            &path, std::time::Duration::from_secs(5), 2
+        ).await).await;
+        insert_chain_guard_actors(&admitting).await;
+        let (parent, child) = insert_test_chain(&admitting, "cross-connection-cutoff").await;
+        let in_flight = admitting.guard_delegation_chains(&[child]).await.unwrap();
+        assert!(admitting.delegation_chains_unrevoked(&[child.to_cid(0x55)]).await.unwrap());
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let revoke = tokio::spawn(async move {
+            started_tx.send(()).unwrap();
+            let guards = revoking.acquire_chain_guards(&[parent]).await
+                .ok().expect("exclusive revoke chain guard");
+            insert_test_revocation(&revoking, "cross-connection-revoke", parent).await;
+            drop(guards);
+        });
+        started_rx.await.unwrap();
+        settle().await;
+        assert!(
+            !revoke.is_finished(),
+            "revoke ACK on another connection must wait for in-flight authorization"
+        );
+        assert!(
+            admitting.delegation_chains_unrevoked(&[child.to_cid(0x55)]).await.unwrap(),
+            "the admitted read must finish before revoke commits"
+        );
+        drop(in_flight);
+        tokio::time::timeout(std::time::Duration::from_secs(10), revoke)
+            .await.expect("revoke resumes after admission").unwrap();
+        let after_ack = admitting.guard_delegation_chains(&[child]).await.unwrap();
+        assert!(
+            !admitting.delegation_chains_unrevoked(&[child.to_cid(0x55)]).await.unwrap(),
+            "a new admission after ACK cannot reuse the signed child"
+        );
+        drop(after_ack);
+        // Dropping every in-memory guard/cache in a new process must not make
+        // the old child usable again.
+        let restarted = make_db(sqlite_write_pool(
+            &path, std::time::Duration::from_secs(5), 2
+        ).await).await;
+        assert!(
+            !restarted.delegation_chains_unrevoked(&[child.to_cid(0x55)]).await.unwrap(),
+            "a cold connection must honor the committed revoke"
+        );
+    }
+
     /// TC-324 requirement 3: delegation registration still mutually excludes
     /// against invocations on the same chain, in both orders.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
