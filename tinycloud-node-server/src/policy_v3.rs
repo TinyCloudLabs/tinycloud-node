@@ -3700,6 +3700,9 @@ pub async fn revoke_root(
         &runtime.node_did,
         OffsetDateTime::now_utc(),
     )?;
+    policy_witness::check_revocations(&runtime.conn, &root.policy_cid, None)
+        .await
+        .map_err(|_| (Status::Forbidden, "policy-authority-revoked".into()))?;
     let previous = root
         .status_checkpoint_bytes
         .as_deref()
@@ -8097,6 +8100,11 @@ mod tests {
         run_policy_v2_flow_on_large_stack(PolicyOwner::SpaceOwnerPolicyRoot)
     }
 
+    #[test]
+    fn signed_policy_root_revoke_closes_sessions_and_replays_idempotently() -> anyhow::Result<()> {
+        run_policy_v2_flow_with_root_route(PolicyOwner::SpaceOwnerPolicyRoot, true)
+    }
+
     /// The real Share and CLI shape: the policy owner is a session key the
     /// space owner delegated to. It registers, mints and reads; once the
     /// space owner revokes that delegation, no new session can be minted.
@@ -8144,6 +8152,13 @@ mod tests {
     // thread stack. Keep the test self-contained on CI rather than requiring
     // RUST_MIN_STACK in the runner environment.
     fn run_policy_v2_flow_on_large_stack(policy_owner: PolicyOwner) -> anyhow::Result<()> {
+        run_policy_v2_flow_with_root_route(policy_owner, false)
+    }
+
+    fn run_policy_v2_flow_with_root_route(
+        policy_owner: PolicyOwner,
+        signed_root_revoke: bool,
+    ) -> anyhow::Result<()> {
         std::thread::Builder::new()
             .stack_size(16 << 20)
             .spawn(move || {
@@ -8151,13 +8166,16 @@ mod tests {
                     .enable_all()
                     .build()
                     .expect("policy fixture runtime")
-                    .block_on(run_policy_v2_flow(policy_owner))
+                    .block_on(run_policy_v2_flow(policy_owner, signed_root_revoke))
             })?
             .join()
             .expect("policy fixture thread panicked")
     }
 
-    async fn run_policy_v2_flow(policy_owner: PolicyOwner) -> anyhow::Result<()> {
+    async fn run_policy_v2_flow(
+        policy_owner: PolicyOwner,
+        signed_root_revoke: bool,
+    ) -> anyhow::Result<()> {
         use k256::ecdsa::SigningKey;
         use sha3::Keccak256;
         use tinycloud_auth::cacaos::siwe::encode_eip55;
@@ -8641,6 +8659,7 @@ mod tests {
                     crate::routes::create_signed_kv_url,
                     crate::key_revoke::revoke_key,
                     status,
+                    revoke_root,
                     get_status,
                     crate::routes::signed_kv_get,
                     crate::routes::hooks::create_hook_ticket
@@ -9232,6 +9251,50 @@ mod tests {
                 Status::Forbidden,
                 "renewal after key tombstone"
             );
+
+            if policy_owner == PolicyOwner::RegistrarKeyCutoff {
+                let mut root_revocation = json!({
+                    "schema": ROOT_REVOCATION_V1_SCHEMA,
+                    "targetCid": policy_root_cid,
+                    "targetRole": "policy-authority",
+                    "ownerDid": owner_did,
+                    "nodeAudience": node_did,
+                    "revokedAt": format_time(OffsetDateTime::now_utc()),
+                    "reason": "owner-requested",
+                    "issuerDid": owner_did,
+                });
+                let mut preimage = b"xyz.tinycloud.policy/RootRevocation/v1\0".to_vec();
+                preimage.extend_from_slice(&canonical_json_value(&root_revocation));
+                root_revocation["signature"] = json!({
+                    "suite": "Ed25519",
+                    "signerDid": owner_did,
+                    "value": encode_config(owner_key.sign(&Sha256::digest(preimage)), URL_SAFE_NO_PAD),
+                });
+                validate_root_revocation(
+                    &root_revocation,
+                    policy_root_cid,
+                    "policy-authority",
+                    &owner_did,
+                    Some(&enforcer_did),
+                    &node_did,
+                    OffsetDateTime::now_utc(),
+                )
+                .map_err(|(_, error)| anyhow::anyhow!("valid signed root revocation: {error}"))?;
+                let fresh_revoke = client
+                    .post("/revoke")
+                    .header(ContentType::JSON)
+                    .body(json!({"revocation": root_revocation}).to_string())
+                    .dispatch()
+                    .await;
+                let revoke_status = fresh_revoke.status();
+                let revoke_body = fresh_revoke.into_string().await.unwrap_or_default();
+                assert_eq!(
+                    revoke_status,
+                    Status::Forbidden,
+                    "fresh signed root revoke after owner key cutoff: {revoke_body}"
+                );
+                assert_eq!(revoke_body, "policy-authority-revoked");
+            }
 
             if policy_owner == PolicyOwner::RegistrarKeyCutoff {
                 // New request/JTI and a still-live ordinary sender grant:
@@ -10288,11 +10351,8 @@ mod tests {
             None
         };
 
-        // SDK revocation writes the generic graph. Policy/v3 joins that
-        // graph with its signed root status, so this one root revocation must
-        // close the already-minted session plus new control-plane admission
-        // and delivery. It intentionally does not fabricate a root-status
-        // checkpoint.
+        // Exercise both distinct root-revocation routes: the generic CID
+        // tombstone and the policy root's signed status event.
         let root_field = if policy_owner == PolicyOwner::SpaceOwner {
             "enforcementRootCid"
         } else {
@@ -10302,35 +10362,78 @@ mod tests {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("missing {root_field}"))?
             .parse::<tinycloud_auth::ipld_core::cid::Cid>()?;
-        let mut revoke_capabilities = Capabilities::<Value>::new();
-        revoke_capabilities.with_action(
-            format!("urn:cid:{revoked_root_cid}").parse()?,
-            "tinycloud.delegation/revoke".parse::<RecapAbility>()?,
-            [std::collections::BTreeMap::<String, Value>::new()],
-        );
-        let generic_revoke = tinycloud_auth::authorization::TinyCloudRevocation::Ucan(Box::new(
-            Payload {
-                issuer: owner_vm.parse()?,
-                audience: owner_did.parse()?,
-                not_before: None,
-                expiration: NumericDate::try_from_seconds(
-                    (OffsetDateTime::now_utc() + Duration::seconds(60)).unix_timestamp() as f64,
-                )?,
-                nonce: Some("tc500-policy-root-generic-revoke".into()),
-                facts: Some(Vec::new()),
-                proof: Vec::new(),
-                attenuation: revoke_capabilities,
-            }
-            .sign(Algorithm::EdDSA, &owner_jwk)?,
-        ));
-        let revoke_response = client
-            .post("/revoke")
-            .header(rocket::http::Header::new(
-                "Authorization",
-                generic_revoke.encode()?,
-            ))
-            .dispatch()
-            .await;
+        let revoke_response = if signed_root_revoke {
+            assert_eq!(root_field, "policyRootCid");
+            let mut revocation = json!({
+                "schema": ROOT_REVOCATION_V1_SCHEMA,
+                "targetCid": revoked_root_cid.to_string(),
+                "targetRole": "policy-authority",
+                "ownerDid": owner_did,
+                "nodeAudience": node_did,
+                "revokedAt": format_time(OffsetDateTime::now_utc()),
+                "reason": "owner-requested",
+                "issuerDid": owner_did,
+            });
+            let mut preimage = b"xyz.tinycloud.policy/RootRevocation/v1\0".to_vec();
+            preimage.extend_from_slice(&canonical_json_value(&revocation));
+            revocation["signature"] = json!({
+                "suite": "Ed25519",
+                "signerDid": owner_did,
+                "value": encode_config(owner_key.sign(&Sha256::digest(preimage)), URL_SAFE_NO_PAD),
+            });
+            let body = json!({"revocation": revocation}).to_string();
+            let result = client
+                .post("/revoke")
+                .header(ContentType::JSON)
+                .body(body.clone())
+                .dispatch()
+                .await;
+            assert_eq!(result.status(), Status::Ok, "live signed root revoke");
+            let retry = client
+                .post("/revoke")
+                .header(ContentType::JSON)
+                .body(body)
+                .dispatch()
+                .await;
+            assert_eq!(
+                retry.status(),
+                Status::Ok,
+                "exact signed root revoke replay"
+            );
+            result
+        } else {
+            let mut revoke_capabilities = Capabilities::<Value>::new();
+            revoke_capabilities.with_action(
+                format!("urn:cid:{revoked_root_cid}").parse()?,
+                "tinycloud.delegation/revoke".parse::<RecapAbility>()?,
+                [std::collections::BTreeMap::<String, Value>::new()],
+            );
+            let generic_revoke =
+                tinycloud_auth::authorization::TinyCloudRevocation::Ucan(Box::new(
+                    Payload {
+                        issuer: owner_vm.parse()?,
+                        audience: owner_did.parse()?,
+                        not_before: None,
+                        expiration: NumericDate::try_from_seconds(
+                            (OffsetDateTime::now_utc() + Duration::seconds(60)).unix_timestamp()
+                                as f64,
+                        )?,
+                        nonce: Some("tc500-policy-root-generic-revoke".into()),
+                        facts: Some(Vec::new()),
+                        proof: Vec::new(),
+                        attenuation: revoke_capabilities,
+                    }
+                    .sign(Algorithm::EdDSA, &owner_jwk)?,
+                ));
+            client
+                .post("/revoke")
+                .header(rocket::http::Header::new(
+                    "Authorization",
+                    generic_revoke.encode()?,
+                ))
+                .dispatch()
+                .await
+        };
         let revoke_status = revoke_response.status();
         let revoke_body = revoke_response.into_string().await.unwrap_or_default();
         assert_eq!(revoke_status, Status::Ok, "SDK root revoke: {revoke_body}");

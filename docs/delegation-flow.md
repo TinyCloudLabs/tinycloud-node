@@ -516,6 +516,10 @@ enrolled global recovery delegate. A space owner or its scoped recovery
 delegate may revoke a key only in that owner's space. Generic `/revoke`
 continues to revoke a single delegation CID, not a whole key.
 
+The signed policy-v3 JSON `/revoke` records one root's status, not a
+key-wide cutoff. Fresh root events check the historical policy witness;
+repeating the exact committed event remains idempotent.
+
 `targetDid` must be a canonical DID with valid DID syntax, not a DID URL
 or a delegation CID; an empty method-specific ID is rejected.
 
