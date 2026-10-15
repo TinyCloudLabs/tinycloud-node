@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- `/attestation` quotes the SHA-256 of `key_binding` as REPORTDATA and returns it as `key_binding_sha256`; the quote no longer carries the raw binding. When the TEE can't produce a quote, the endpoint returns 503 instead of 200 `mode: "classic"`, and the dstack client reports a guest-agent error status instead of a parse error. Verifiers recompute the digest from their own nonce and expected DID; see `docs/attestation.md` (TC-963).
+
 ## [1.20.7] - 2026-10-14
 
 A security hardening release (TC-1132, #292) for webhook, quota and tunnel egress.

@@ -28,7 +28,7 @@ pub mod allow_list;
 pub mod auth_guards;
 pub mod authorization;
 pub mod config;
-#[cfg(feature = "dstack")]
+#[cfg(any(test, feature = "dstack"))]
 pub mod dstack;
 pub mod egress;
 pub mod hooks;
