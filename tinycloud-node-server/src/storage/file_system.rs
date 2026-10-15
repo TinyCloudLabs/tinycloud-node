@@ -9,9 +9,10 @@ use futures::{
 use pin_project::pin_project;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{hash_map::Entry, HashMap},
     io::{Error as IoError, ErrorKind, SeekFrom},
     path::{Path, PathBuf},
+    sync::Arc,
     time::Instant,
 };
 use tempfile::{NamedTempFile, PathPersistError};
@@ -20,6 +21,7 @@ use tinycloud_core::{hash::Hash, storage::*};
 use tokio::{
     fs::{create_dir_all, metadata, remove_file, File},
     io::{AsyncReadExt, AsyncSeekExt},
+    sync::Mutex,
 };
 use tokio_stream::wrappers::ReadDirStream;
 
@@ -29,13 +31,20 @@ use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
 pub struct FileSystemStore {
     path: PathBuf,
     sizes: SpaceSizes,
+    // A partial filesystem write can fail after creating a file. Reserve
+    // before writing and refund the full reservation when deleting it.
+    pending: Arc<Mutex<HashMap<(SpaceId, Hash), u64>>>,
 }
 
 impl FileSystemStore {
     async fn new(path: PathBuf) -> Result<Self, IoError> {
         // get the size of the directory
         let sizes = store_sizes(&path).await?.into();
-        Ok(Self { path, sizes })
+        Ok(Self {
+            path,
+            sizes,
+            pending: Arc::new(Mutex::new(HashMap::new())),
+        })
     }
 
     fn get_path(&self, space: &SpaceId, mh: &Hash) -> PathBuf {
@@ -50,6 +59,61 @@ impl FileSystemStore {
     }
     async fn decrement_size(&self, space: &SpaceId, size: u64) {
         self.sizes.decrement_size(space, size).await;
+    }
+
+    async fn reserve(&self, space: &SpaceId, hash: Hash, size: u64) {
+        let mut pending = self.pending.lock().await;
+        if let Entry::Vacant(slot) = pending.entry((space.clone(), hash)) {
+            slot.insert(size);
+            self.increment_size(space, size).await;
+        }
+    }
+
+    async fn settle(&self, space: &SpaceId, hash: Hash) {
+        self.pending.lock().await.remove(&(space.clone(), hash));
+    }
+
+    async fn refund_missing_pending(&self, space: &SpaceId, hash: Hash) {
+        if let Some(size) = self.pending.lock().await.remove(&(space.clone(), hash)) {
+            self.decrement_size(space, size).await;
+        }
+    }
+
+    async fn persist_temp(
+        &self,
+        space: &SpaceId,
+        hash: Hash,
+        file: TempFileStage,
+    ) -> Result<(), FileSystemStoreError> {
+        if self.contains(space, &hash).await? {
+            self.settle(space, hash).await;
+            return Ok(());
+        }
+        let size = file.size().await?;
+        self.reserve(space, hash, size).await;
+        let (_, path) = file.into_inner();
+        path.persist(self.get_path(space, &hash))?;
+        self.settle(space, hash).await;
+        Ok(())
+    }
+
+    async fn persist_memory(
+        &self,
+        space: &SpaceId,
+        hash: Hash,
+        bytes: Vec<u8>,
+    ) -> Result<(), FileSystemStoreError> {
+        if self.contains(space, &hash).await? {
+            self.settle(space, hash).await;
+            return Ok(());
+        }
+        self.reserve(space, hash, bytes.len() as u64).await;
+        let file = File::create(self.get_path(space, &hash)).await?;
+        let mut writer = futures::io::BufWriter::new(file.compat());
+        writer.write_all(&bytes).await?;
+        writer.flush().await?;
+        self.settle(space, hash).await;
+        Ok(())
     }
 }
 
@@ -277,12 +341,7 @@ impl ImmutableWriteStore<TempFileSystemStage> for FileSystemStore {
         let result = async move {
             let (mut h, f) = staged.into_inner();
             let hash = h.finalize();
-            if !self.contains(space, &hash).await? {
-                let size = f.size().await?;
-                let (_, path) = f.into_inner();
-                path.persist(self.get_path(space, &hash))?;
-                self.increment_size(space, size).await;
-            }
+            self.persist_temp(space, hash, f).await?;
             Ok(hash)
         }
         .await;
@@ -307,14 +366,7 @@ impl ImmutableWriteStore<memory::MemoryStaging> for FileSystemStore {
         let result = async move {
             let (mut h, v) = staged.into_inner();
             let hash = h.finalize();
-            if !self.contains(space, &hash).await? {
-                let file = File::create(self.get_path(space, &hash)).await?;
-                let size = v.len() as u64;
-                let mut writer = futures::io::BufWriter::new(file.compat());
-                writer.write_all(&v).await?;
-                writer.flush().await?;
-                self.increment_size(space, size).await;
-            }
+            self.persist_memory(space, hash, v).await?;
             Ok(hash)
         }
         .await;
@@ -342,24 +394,10 @@ impl ImmutableWriteStore<either::Either<TempFileSystemStage, memory::MemoryStagi
             let (mut h, f) = staged.into_inner();
             let hash = h.finalize();
 
-            if !self.contains(space, &hash).await? {
-                match f {
-                    AsyncEither::Left(t_file) => {
-                        let size = t_file.size().await?;
-                        let (_, path) = t_file.into_inner();
-                        path.persist(self.get_path(space, &hash))?;
-                        self.increment_size(space, size).await;
-                    }
-                    AsyncEither::Right(v) => {
-                        let file = File::create(self.get_path(space, &hash)).await?;
-                        let size = v.len() as u64;
-                        let mut writer = futures::io::BufWriter::new(file.compat());
-                        writer.write_all(&v).await?;
-                        writer.flush().await?;
-                        self.increment_size(space, size).await;
-                    }
-                }
-            };
+            match f {
+                AsyncEither::Left(file) => self.persist_temp(space, hash, file).await?,
+                AsyncEither::Right(bytes) => self.persist_memory(space, hash, bytes).await?,
+            }
             Ok(hash)
         }
         .await;
@@ -379,15 +417,27 @@ impl ImmutableDeleteStore for FileSystemStore {
         let path = self.get_path(space, id);
         let size = match metadata(&path).await {
             Ok(m) => m.len(),
-            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                self.refund_missing_pending(space, *id).await;
+                return Ok(None);
+            }
             Err(e) => return Err(e.into()),
         };
         match remove_file(path).await {
             Ok(()) => {
-                self.decrement_size(space, size).await;
+                let charged = self
+                    .pending
+                    .lock()
+                    .await
+                    .remove(&(space.clone(), *id))
+                    .unwrap_or(size);
+                self.decrement_size(space, charged).await;
                 Ok(Some(()))
             }
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                self.refund_missing_pending(space, *id).await;
+                Ok(None)
+            }
             Err(e) => Err(e.into()),
         }
     }
@@ -404,7 +454,30 @@ impl StorageConfig<TempFileSystemStage> for TempFileSystemStage {
 #[cfg(test)]
 mod test {
     use super::*;
-    use futures::io::AsyncReadExt;
+    use futures::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn failed_file_creation_refunds_reserved_quota() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileSystemConfig::new(dir.path()).open().await.unwrap();
+        let space: SpaceId = "tinycloud:key:test:failed".parse().unwrap();
+        store.create(&space).await.unwrap();
+        tokio::fs::remove_dir(store.path.join(space.suffix()).join(space.name().as_str()))
+            .await
+            .unwrap();
+        let mut stage = HashBuffer::new(Vec::new());
+        stage.write_all(b"failed-write").await.unwrap();
+        let hash = stage.hash();
+        assert!(
+            ImmutableWriteStore::<memory::MemoryStaging>::persist(&store, &space, stage)
+                .await
+                .is_err()
+        );
+        assert_eq!(store.total_size(&space).await.unwrap(), Some(12));
+        assert_eq!(store.remove(&space, &hash).await.unwrap(), None);
+        assert!(!store.contains(&space, &hash).await.unwrap());
+        assert_eq!(store.total_size(&space).await.unwrap(), Some(0));
+    }
 
     #[tokio::test]
     async fn test_file_system_store() {

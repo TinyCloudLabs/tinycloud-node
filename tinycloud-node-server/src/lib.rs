@@ -622,14 +622,12 @@ pub async fn app_with_control(
         encryption_backend,
     );
 
-    let tinycloud = TinyCloud::new(
-        database_connection,
-        tinycloud_config.storage.blocks.open().await?,
-        key_setup.setup(()).await?,
-    )
-    .await?
-    .with_encryption(Some(webhook_encryption.clone()))
-    .with_sql_sizes(sql_sizes.clone());
+    let block_store = tinycloud_config.storage.blocks.open().await?;
+    let orphan_store = block_store.clone();
+    let tinycloud = TinyCloud::new(database_connection, block_store, key_setup.setup(()).await?)
+        .await?
+        .with_encryption(Some(webhook_encryption.clone()))
+        .with_sql_sizes(sql_sizes.clone());
     let encryption_service =
         encryption_service.with_sqlite_writer_lock(tinycloud.sqlite_writer_lock());
     let database_artifact_repository: Arc<dyn DatabaseArtifactRepository> =
@@ -719,6 +717,8 @@ pub async fn app_with_control(
     )?;
     spawn_webhook_dispatcher(webhook_dispatcher);
 
+    let orphan_conn = seed_conn.clone();
+
     // TC-326: capture handles for the telemetry DB sampler before `tinycloud`
     // is moved into Rocket-managed state below.
     let telemetry_enabled = tinycloud_config.telemetry.enabled;
@@ -769,6 +769,36 @@ pub async fn app_with_control(
                 })
             },
         ))
+        .attach(AdHoc::on_liftoff("kv-orphan-cleanup", move |rocket| {
+            let conn = orphan_conn.clone();
+            let store = orphan_store.clone();
+            let shutdown = rocket.shutdown();
+            Box::pin(async move {
+                tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+                    tokio::pin!(shutdown);
+                    loop {
+                        tokio::select! {
+                            _ = interval.tick() => {
+                                loop {
+                                    match tinycloud_core::kv_orphans::collect_candidates_with_progress(
+                                        &conn, &store, 256, time::Duration::minutes(5),
+                                    ).await {
+                                        Ok((_, 256)) => continue,
+                                        Ok(_) => break,
+                                        Err(error) => {
+                                            ::tracing::warn!(%error, "KV orphan collection failed");
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            _ = &mut shutdown => break,
+                        }
+                    }
+                });
+            })
+        }))
         .manage(tinycloud)
         .manage(node_public_keys)
         .manage(sql_service);

@@ -1650,6 +1650,250 @@ pub(crate) mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn unauthorized_put_never_uploads_a_blob() {
+        use crate::storage::ImmutableReadStore;
+        let store = MemoryStore::default();
+        let db = SpaceDatabase::new(
+            Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
+                .await
+                .unwrap(),
+            store.clone(),
+            StaticSecret::new([0u8; 32].to_vec()).unwrap(),
+        )
+        .await
+        .unwrap();
+        let signer = Owner::generate();
+        let other = Owner::generate();
+        host(&db, &other).await;
+        let op = Op::Put("notes/forbidden", b"unauthorized");
+        let result = invoke_in(
+            &db,
+            &signer,
+            &[(&other.space, &op)],
+            KvInvokeOptions::default(),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "the signer cannot write another owner's space"
+        );
+        assert!(
+            !store
+                .contains(&other.space, &crate::hash::hash(b"unauthorized"))
+                .await
+                .unwrap(),
+            "authorization failure must not create a blob"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_put_refunds_quota_without_deleting_committed_hash() {
+        use crate::storage::{ImmutableReadStore, StoreSize};
+        let store = MemoryStore::default();
+        let db = SpaceDatabase::new(
+            Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
+                .await
+                .unwrap(),
+            store.clone(),
+            StaticSecret::new([0u8; 32].to_vec()).unwrap(),
+        )
+        .await
+        .unwrap();
+        let owner = Owner::generate();
+        host(&db, &owner).await;
+        let committed = run(&db, &owner, &[Op::Put("notes/a", b"kept")]).await[0];
+        let mut options = KvInvokeOptions::default();
+        options.preconditions.insert(
+            (owner.space.clone(), "notes/a".parse().unwrap()),
+            KvPrecondition::DoesNotExist,
+        );
+        let rejected = invoke(&db, &owner, &[Op::Put("notes/a", b"rejected")], options)
+            .await
+            .unwrap_err();
+        assert!(rejected.contains("precondition"), "{rejected}");
+        let orphan = crate::hash::hash(b"rejected");
+        assert!(
+            !store.contains(&owner.space, &orphan).await.unwrap(),
+            "a known precondition failure must remove its unreferenced upload"
+        );
+        assert!(store.contains(&owner.space, &committed).await.unwrap());
+        assert_eq!(store.total_size(&owner.space).await.unwrap(), Some(4));
+        let duplicate = invoke(&db, &owner, &[Op::Put("notes/a", b"kept")], {
+            let mut options = KvInvokeOptions::default();
+            options.preconditions.insert(
+                (owner.space.clone(), "notes/a".parse().unwrap()),
+                KvPrecondition::DoesNotExist,
+            );
+            options
+        })
+        .await
+        .unwrap_err();
+        assert!(duplicate.contains("precondition"), "{duplicate}");
+        assert!(store.contains(&owner.space, &committed).await.unwrap());
+        assert_eq!(store.total_size(&owner.space).await.unwrap(), Some(4));
+    }
+
+    #[tokio::test]
+    async fn failed_database_write_refunds_uploaded_blob_immediately() {
+        use crate::storage::{ImmutableReadStore, StoreSize};
+        use sea_orm::{ConnectionTrait, DbBackend, Statement};
+        let store = MemoryStore::default();
+        let db = SpaceDatabase::new(
+            Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
+                .await
+                .unwrap(),
+            store.clone(),
+            StaticSecret::new([0u8; 32].to_vec()).unwrap(),
+        )
+        .await
+        .unwrap();
+        let owner = Owner::generate();
+        host(&db, &owner).await;
+        db.connection()
+            .execute(Statement::from_string(
+                DbBackend::Sqlite,
+                "CREATE TRIGGER fail_kv_write BEFORE INSERT ON kv_write BEGIN SELECT RAISE(FAIL, 'blocked'); END",
+            ))
+            .await
+            .unwrap();
+        let error = invoke(
+            &db,
+            &owner,
+            &[Op::Put("notes/failure", b"uploaded")],
+            KvInvokeOptions::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("blocked"), "{error}");
+        assert!(!store
+            .contains(&owner.space, &crate::hash::hash(b"uploaded"))
+            .await
+            .unwrap());
+        assert_eq!(store.total_size(&owner.space).await.unwrap(), Some(0));
+    }
+
+    /// Simulate an object store that accepted the PUT but lost its success
+    /// response. The caller must still delete and refund the possible object.
+    #[derive(Clone, Default)]
+    struct AmbiguousUploadStore(MemoryStore);
+
+    #[async_trait::async_trait]
+    impl crate::storage::StorageSetup for AmbiguousUploadStore {
+        type Error = std::io::Error;
+        async fn create(&self, space: &SpaceId) -> Result<(), Self::Error> {
+            self.0.create(space).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::storage::ImmutableReadStore for AmbiguousUploadStore {
+        type Error = std::io::Error;
+        type Readable = futures::io::Cursor<Vec<u8>>;
+        async fn contains(&self, space: &SpaceId, id: &Hash) -> Result<bool, Self::Error> {
+            self.0.contains(space, id).await
+        }
+        async fn read(
+            &self,
+            space: &SpaceId,
+            id: &Hash,
+        ) -> Result<Option<crate::storage::Content<Self::Readable>>, Self::Error> {
+            self.0.read(space, id).await
+        }
+        async fn read_range(
+            &self,
+            space: &SpaceId,
+            id: &Hash,
+            range: crate::storage::ByteRangeSpec,
+        ) -> Result<Option<crate::storage::RangeRead<Self::Readable>>, Self::Error> {
+            self.0.read_range(space, id, range).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::storage::ImmutableWriteStore<MemoryStaging> for AmbiguousUploadStore {
+        type Error = std::io::Error;
+        async fn persist(
+            &self,
+            space: &SpaceId,
+            staged: HashBuffer<Vec<u8>>,
+        ) -> Result<Hash, Self::Error> {
+            self.0.persist(space, staged).await?;
+            Err(std::io::Error::other("lost PUT response"))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::storage::ImmutableDeleteStore for AmbiguousUploadStore {
+        type Error = std::io::Error;
+        async fn remove(&self, space: &SpaceId, id: &Hash) -> Result<Option<()>, Self::Error> {
+            self.0.remove(space, id).await
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_upload_refunds_physical_bytes_immediately() {
+        use crate::storage::{ImmutableReadStore, StoreSize};
+        let store = AmbiguousUploadStore::default();
+        let db = SpaceDatabase::new(
+            Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
+                .await
+                .unwrap(),
+            store.clone(),
+            StaticSecret::new([0u8; 32].to_vec()).unwrap(),
+        )
+        .await
+        .unwrap();
+        let owner = Owner::generate();
+        space::ActiveModel {
+            id: Set(SpaceIdWrap(owner.space.clone())),
+        }
+        .insert(db.connection())
+        .await
+        .unwrap();
+        let op = Op::Put("notes/failure", b"uploaded");
+        let mut stage = HashBuffer::new(Vec::new());
+        stage.write_all(b"uploaded").await.unwrap();
+        let mut inputs = std::collections::HashMap::new();
+        inputs.insert(
+            (
+                owner.space.clone(),
+                "notes/failure".parse::<Path>().unwrap(),
+            ),
+            (Metadata(Default::default()), stage),
+        );
+        let error = match db
+            .invoke::<MemoryStaging>(owner.invocation_in(&[(&owner.space, &op)]), inputs)
+            .await
+        {
+            Ok(_) => panic!("the upload response was lost"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("lost PUT response"), "{error}");
+        assert!(!store
+            .contains(&owner.space, &crate::hash::hash(b"uploaded"))
+            .await
+            .unwrap());
+        assert_eq!(store.0.total_size(&owner.space).await.unwrap(), Some(0));
+        assert_eq!(
+            crate::kv_orphans::collect_candidates(
+                db.connection(),
+                &store,
+                1,
+                time::Duration::ZERO,
+            )
+            .await
+            .unwrap(),
+            0,
+            "the immediate failure path consumed the candidate"
+        );
+        assert_eq!(
+            store.0.total_size(&owner.space).await.unwrap(),
+            Some(0),
+            "a later GC pass must not refund the same object twice"
+        );
+    }
+
     // ── PostgreSQL (run in CI's PG16 job; `TINYCLOUD_TEST_POSTGRES_URL`) ──
 
     /// Drops its schema when it goes out of scope, including while a failed
@@ -1697,6 +1941,7 @@ pub(crate) mod tests {
     /// ("sorry, too many clients already" at `CREATE SCHEMA`).
     struct PostgresFixture {
         dbs: Vec<TestDb>,
+        store: MemoryStore,
         _schema: SchemaGuard,
         // Last, so the schema is dropped before the next fixture starts.
         _serial: tokio::sync::MutexGuard<'static, ()>,
@@ -1728,6 +1973,7 @@ pub(crate) mod tests {
                 schema: schema.clone(),
             };
             let mut dbs = Vec::with_capacity(instances);
+            let store = MemoryStore::default();
             for _ in 0..instances {
                 let mut options = ConnectOptions::new(url.clone());
                 options
@@ -1739,7 +1985,7 @@ pub(crate) mod tests {
                         Database::connect(options)
                             .await
                             .expect("connect to isolated TC-732 schema"),
-                        MemoryStore::default(),
+                        store.clone(),
                         StaticSecret::new([0u8; 32].to_vec()).unwrap(),
                     )
                     .await
@@ -1748,10 +1994,51 @@ pub(crate) mod tests {
             }
             Some(Self {
                 dbs,
+                store,
                 _schema: guard,
                 _serial: serial,
             })
         }
+    }
+
+    /// PG's per-space lock may be held by another process, but independent
+    /// content-addressed uploads must still finish before acquiring it.
+    #[tokio::test]
+    async fn postgres_blob_persists_before_space_sequence_lock() {
+        use crate::storage::ImmutableReadStore;
+        let Some(fixture) =
+            PostgresFixture::new("postgres_blob_persists_before_space_sequence_lock", 2).await
+        else {
+            return;
+        };
+        let owner = std::sync::Arc::new(Owner::generate());
+        host(&fixture.dbs[0], &owner).await;
+        let holder = fixture.dbs[0].connection().begin().await.unwrap();
+        lock_space_sequences(&holder, [&owner.space]).await.unwrap();
+        let db = fixture.dbs[1].clone();
+        let writer_owner = owner.clone();
+        let writer = tokio::spawn(async move {
+            run(
+                &db,
+                &writer_owner,
+                &[Op::Put("notes/held", b"persist-before-lock")],
+            )
+            .await
+        });
+        let hash = crate::hash::hash(b"persist-before-lock");
+        let visible = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if fixture.store.contains(&owner.space, &hash).await.unwrap() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok();
+        holder.commit().await.unwrap();
+        writer.await.unwrap();
+        assert!(visible, "blob upload must not wait for the sequence lock");
     }
 
     /// `(seq, epoch bytes, epoch_seq)`: the order the feed promises.
@@ -2134,6 +2421,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn postgres_conditional_put_is_atomic_under_concurrency() {
         use crate::models::kv_write;
+        use crate::storage::StoreSize;
         const INSTANCES: usize = 4;
         const CONTENDERS: usize = 32;
         let Some(fixture) = PostgresFixture::new(
@@ -2210,6 +2498,7 @@ pub(crate) mod tests {
                 who(&created)
             );
             let mut committed = vec![created[0].1];
+            let mut committed_bytes = format!("create-{}", created[0].0).len() as u64;
             // Before the first replace no etag has been replaced yet: present
             // one that was never written.
             let mut stale = crate::hash::hash(b"never written");
@@ -2232,6 +2521,7 @@ pub(crate) mod tests {
                 );
                 stale = current;
                 committed.push(replaced[0].1);
+                committed_bytes += format!("replace{round}-{}", replaced[0].0).len() as u64;
             }
             run(&fixture.dbs[1], &owner, &[Op::Del("notes/x")]).await;
             let recreated = race("recreate".into(), create()).await;
@@ -2242,6 +2532,7 @@ pub(crate) mod tests {
                 who(&recreated)
             );
             committed.push(recreated[0].1);
+            committed_bytes += format!("recreate-{}", recreated[0].0).len() as u64;
             let over_live = race("create-over-live".into(), create()).await;
             assert!(
                 over_live.is_empty(),
@@ -2270,6 +2561,11 @@ pub(crate) mod tests {
             assert_eq!(
                 writes.iter().map(|write| write.value).collect::<Vec<_>>(),
                 committed
+            );
+            assert_eq!(
+                fixture.store.total_size(&owner.space).await.unwrap(),
+                Some(committed_bytes),
+                "failed contenders must refund their physical bytes without touching committed blobs"
             );
             assert_eq!(
                 assert_linear_history(conn, &owner.space, "conditional").await,

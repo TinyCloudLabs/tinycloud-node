@@ -12,8 +12,8 @@ use crate::read_audit::ReadAuditPipeline;
 use crate::relationships::*;
 use crate::sql_sizes::SqlSizes;
 use crate::storage::{
-    either::EitherError, ByteRangeSpec, Content, HashBuffer, ImmutableReadStore, ImmutableStaging,
-    ImmutableWriteStore, RangeRead, StorageSetup, StoreSize,
+    either::EitherError, ByteRangeSpec, Content, HashBuffer, ImmutableDeleteStore,
+    ImmutableReadStore, ImmutableStaging, ImmutableWriteStore, RangeRead, StorageSetup, StoreSize,
 };
 use crate::types::{
     AccountDelegationRecord, CapabilitiesReadParams, DelegationQuery, DelegationQueryDirection,
@@ -1481,7 +1481,7 @@ where
         precondition: Option<KvPrecondition>,
     ) -> Result<Hash, TxStoreError<B, S, K>>
     where
-        B: ImmutableWriteStore<S> + ImmutableReadStore,
+        B: ImmutableWriteStore<S> + ImmutableReadStore + ImmutableDeleteStore,
         S: ImmutableStaging,
         S::Writable: 'static + Unpin,
     {
@@ -1505,7 +1505,7 @@ where
         precondition: Option<KvPrecondition>,
     ) -> Result<Hash, TxStoreError<B, S, K>>
     where
-        B: ImmutableWriteStore<S> + ImmutableReadStore,
+        B: ImmutableWriteStore<S> + ImmutableReadStore + ImmutableDeleteStore,
         S: ImmutableStaging,
         S::Writable: 'static + Unpin,
     {
@@ -1529,7 +1529,7 @@ where
         path: Path,
     ) -> Result<(), TxStoreError<B, S, K>>
     where
-        B: ImmutableWriteStore<S> + ImmutableReadStore,
+        B: ImmutableWriteStore<S> + ImmutableReadStore + ImmutableDeleteStore,
         S: ImmutableStaging,
         S::Writable: 'static + Unpin,
     {
@@ -1563,7 +1563,7 @@ where
         mode: InvokeMode,
     ) -> Result<Option<Hash>, TxStoreError<B, S, K>>
     where
-        B: ImmutableWriteStore<S> + ImmutableReadStore,
+        B: ImmutableWriteStore<S> + ImmutableReadStore + ImmutableDeleteStore,
         S: ImmutableStaging,
         S::Writable: 'static + Unpin,
     {
@@ -1847,7 +1847,7 @@ where
         inputs: InvocationInputs<S::Writable>,
     ) -> Result<(TransactResult, Vec<InvocationOutcome<B::Readable>>), TxStoreError<B, S, K>>
     where
-        B: ImmutableWriteStore<S> + ImmutableReadStore,
+        B: ImmutableWriteStore<S> + ImmutableReadStore + ImmutableDeleteStore,
         S: ImmutableStaging,
         S::Writable: 'static + Unpin,
     {
@@ -1868,7 +1868,7 @@ where
         inputs: InvocationInputs<S::Writable>,
     ) -> Result<(TransactResult, Vec<InvocationOutcome<B::Readable>>), TxStoreError<B, S, K>>
     where
-        B: ImmutableWriteStore<S> + ImmutableReadStore,
+        B: ImmutableWriteStore<S> + ImmutableReadStore + ImmutableDeleteStore,
         S: ImmutableStaging,
         S::Writable: 'static + Unpin,
     {
@@ -1883,7 +1883,7 @@ where
         options: KvInvokeOptions,
     ) -> Result<(TransactResult, Vec<InvocationOutcome<B::Readable>>), TxStoreError<B, S, K>>
     where
-        B: ImmutableWriteStore<S> + ImmutableReadStore,
+        B: ImmutableWriteStore<S> + ImmutableReadStore + ImmutableDeleteStore,
         S: ImmutableStaging,
         S::Writable: 'static + Unpin,
     {
@@ -1903,7 +1903,7 @@ where
         options: KvInvokeOptions,
     ) -> Result<(TransactResult, Vec<InvocationOutcome<B::Readable>>), TxStoreError<B, S, K>>
     where
-        B: ImmutableWriteStore<S> + ImmutableReadStore,
+        B: ImmutableWriteStore<S> + ImmutableReadStore + ImmutableDeleteStore,
         S: ImmutableStaging,
         S::Writable: 'static + Unpin,
     {
@@ -1919,7 +1919,7 @@ where
         mode: InvokeMode,
     ) -> Result<(TransactResult, Vec<InvocationOutcome<B::Readable>>), TxStoreError<B, S, K>>
     where
-        B: ImmutableWriteStore<S> + ImmutableReadStore,
+        B: ImmutableWriteStore<S> + ImmutableReadStore + ImmutableDeleteStore,
         S: ImmutableStaging,
         S::Writable: 'static + Unpin,
     {
@@ -2086,241 +2086,301 @@ where
             }
         }
 
-        // TC-732: conditional writes no longer need SERIALIZABLE. The
-        // per-space sequence lock is taken right after BEGIN, before the
-        // precondition read, so under READ COMMITTED that read already sees
-        // every earlier same-space commit and no same-space writer can commit
-        // until this one does. A failed precondition is a 412, never a false
-        // success (see `postgres_conditional_put_is_atomic_under_concurrency`).
-        let sequence_spaces = invocation.0.spaces().cloned().collect::<Vec<_>>();
-        let _sequence_guards = self.acquire_space_sequence_guards(&sequence_spaces).await;
-        let _writer = match &self.writer_lock {
-            Some(lock) => Some(lock.lock().await),
-            None => None,
-        };
-        let begin_start = Instant::now();
-        let tx_result = self.begin_graph_transaction().await;
-        crate::telemetry::observe_stage(
-            crate::telemetry::InvocationStage::DbTxBegin,
-            crate::telemetry::StageOutcome::from(tx_result.is_ok()),
-            begin_start.elapsed(),
-        );
-        let tx = tx_result?;
-        // TC-732: order this transaction's event sequence under the
-        // per-space lock. On PostgreSQL this is an advisory lock, so the
-        // meeting legacy guard lock below is still the first row lock.
-        crate::kv_sync::lock_space_sequences(&tx, &sequence_spaces).await?;
-        // On SQLite `begin_graph_transaction` already holds the write lock,
-        // so no read-to-write upgrade race remains. Distinct spaces are
-        // locked in a stable order to prevent cross-space deadlocks on PG.
-        let mut legacy_spaces: Vec<_> = mutation_keys
+        // Check the entire invocation before creating an object in the block
+        // store. The transaction below repeats authorization after acquiring
+        // the sequence lock, preserving revocation and time ordering.
+        let now = OffsetDateTime::now_utc();
+        match mode {
+            InvokeMode::Admitted => {
+                invocation::authorize_admitted(&self.conn, &invocation.0, now, None)
+                    .await
+                    .map_err(TxError::<B, K>::from)?;
+            }
+            InvokeMode::Public => {
+                invocation::verify_and_authorize(&self.conn, &invocation.0, now)
+                    .await
+                    .map_err(TxError::<B, K>::from)?;
+            }
+            InvokeMode::Internal | InvokeMode::MeetingPublication => {}
+        }
+        let mut sequence_spaces = invocation.0.spaces().cloned().collect::<Vec<_>>();
+        sequence_spaces.sort_unstable();
+        sequence_spaces.dedup();
+        let hosted = space::Entity::find()
+            .filter(space::Column::Id.is_in(sequence_spaces.iter().cloned().map(SpaceIdWrap)))
+            .count(&self.conn)
+            .await?;
+        if hosted != sequence_spaces.len() as u64 {
+            return Err(TxError::SpaceNotFound.into());
+        }
+        let mut blobs = write_hashes
             .iter()
-            .filter(|(_, path)| crate::meeting_legacy_guard::protects(path.as_str()))
-            .map(|(space, _)| space)
-            .collect();
-        legacy_spaces.sort_by_key(|space| space.to_string());
-        legacy_spaces.dedup();
-        for space in legacy_spaces {
-            if crate::meeting_legacy_guard::lock_writer(&tx, space).await? {
-                return Err(TxStoreError::LegacyMeetingFrozen);
-            }
+            .map(|((space, _), hash)| (space.clone(), *hash))
+            .collect::<Vec<_>>();
+        blobs.sort_unstable();
+        blobs.dedup();
+        if !blobs.is_empty() {
+            crate::kv_orphans::register_candidates(&self.conn, &blobs).await?;
         }
-        // DbTxBody spans post-begin to pre-commit. The guard defaults to an
-        // `error` outcome so any `?`/early return inside the transaction is
-        // recorded as a failure; it is disarmed to `ok` right before commit.
-        let tx_body_timer =
-            crate::telemetry::StageTimer::start(crate::telemetry::InvocationStage::DbTxBody);
-        let auth_graph = match crate::auth_graph::AuthGraphSnapshot::load(&tx, &roots).await {
-            Ok(graph) => graph,
-            Err(error) => {
-                crate::telemetry::observe_stage(
-                    crate::telemetry::InvocationStage::AuthorizationGraphLoad,
-                    crate::telemetry::StageOutcome::Error,
-                    authz_start.elapsed(),
-                );
-                return Err(TxStoreError::Tx(match error {
-                    revocation::ChainTraversalError::Db(error) => TxError::Db(error),
-                    revocation::ChainTraversalError::LimitExceeded => {
-                        TxError::ChainTraversalLimitExceeded
-                    }
-                }));
+        // The database transaction fences the blob hash against a collector
+        // (and another writer of the same content) through commit or rollback.
+        // PostgreSQL only takes the per-space advisory sequence lock *after*
+        // all S3 uploads. SQLite has one writer transaction already.
+        let result = async {
+            let _writer = match &self.writer_lock {
+                Some(lock) => Some(lock.lock().await),
+                None => None,
+            };
+            let begin_start = Instant::now();
+            let tx_result = self.begin_graph_transaction().await;
+            crate::telemetry::observe_stage(
+                crate::telemetry::InvocationStage::DbTxBegin,
+                crate::telemetry::StageOutcome::from(tx_result.is_ok()),
+                begin_start.elapsed(),
+            );
+            let tx = tx_result?;
+            if !blobs.is_empty() {
+                crate::kv_orphans::lock_candidates(&tx, &blobs).await?;
             }
-        };
-        crate::telemetry::observe_stage(
-            crate::telemetry::InvocationStage::AuthorizationGraphLoad,
-            crate::telemetry::StageOutcome::Ok,
-            authz_start.elapsed(),
-        );
-        let mut deleted_hashes = HashMap::new();
-        for key @ (space, path) in &mutation_keys {
-            let current = get_kv_entity(&tx, space, path).await?;
-            if let Some(precondition) = options.preconditions.get(key) {
-                let matches = kv_precondition_matches(
-                    *precondition,
-                    current.as_ref().map(|entry| entry.value),
-                );
-                if !matches {
-                    return Err(TxStoreError::KvPreconditionFailed);
+            for ((space, path), stage) in stages.drain() {
+                let hash = self
+                    .storage
+                    .persist(&space, stage)
+                    .await
+                    .map_err(TxStoreError::StoreWrite)?;
+                debug_assert_eq!(write_hashes.get(&(space, path)), Some(&hash));
+            }
+            // Only the database section assigns sequence numbers. Its advisory
+            // lock remains held through commit so kv/sync cursors stay ordered.
+            let _sequence_guards = self.acquire_space_sequence_guards(&sequence_spaces).await;
+            crate::kv_sync::lock_space_sequences(&tx, &sequence_spaces).await?;
+            // The sequence lock precedes every precondition read under READ
+            // COMMITTED, including when an upload was prepared concurrently.
+            // SQLite already holds its single-writer lock at BEGIN, preventing a
+            // read-to-write upgrade race. Multi-space PG locks are acquired in
+            // stable order to avoid cross-space deadlocks.
+            let mut legacy_spaces: Vec<_> = mutation_keys
+                .iter()
+                .filter(|(_, path)| crate::meeting_legacy_guard::protects(path.as_str()))
+                .map(|(space, _)| space)
+                .collect();
+            legacy_spaces.sort_by_key(|space| space.to_string());
+            legacy_spaces.dedup();
+            for space in legacy_spaces {
+                if crate::meeting_legacy_guard::lock_writer(&tx, space).await? {
+                    return Err(TxStoreError::LegacyMeetingFrozen);
                 }
             }
-            if let Some(entry) = current {
-                deleted_hashes.insert(key.clone(), entry.value);
-            }
-        }
-        let caps = invocation.0.capabilities.clone();
-        let invoker = invocation.0.invoker.clone();
-        // Extract capabilities read params from UCAN facts field
-        // Facts is Vec<JsonValue>, we look for an object with capabilitiesReadParams key
-        let caps_read_params: Option<CapabilitiesReadParams> = invocation
-            .0
-            .invocation
-            .payload()
-            .facts
-            .as_ref()
-            .and_then(|facts| {
-                facts.iter().find_map(|fact| {
-                    fact.as_object()
-                        .and_then(|obj| obj.get("capabilitiesReadParams"))
-                        .and_then(|v| serde_json::from_value(v.clone()).ok())
-                })
-            });
-        //  verify and commit invocation and kv operations
-        let event = match mode {
-            InvokeMode::Internal | InvokeMode::MeetingPublication => {
-                Event::InternalInvocation(Box::new(invocation), ops)
-            }
-            InvokeMode::Admitted => Event::AdmittedInvocation(Box::new(invocation), ops),
-            InvokeMode::Public => Event::Invocation(Box::new(invocation), ops),
-        };
-        let commit = transact(
-            &tx,
-            &self.storage,
-            &self.secrets,
-            vec![event],
-            self.encryption.as_ref(),
-            Some(&auth_graph),
-            // Taken on this `tx` right after BEGIN, above.
-            &sequence_spaces,
-        )
-        .await?;
-
-        let mut results = Vec::new();
-        // perform and record side effects
-        for cap in caps.iter().filter_map(|c| {
-            c.resource.tinycloud_resource().and_then(|r| {
-                Some((
-                    r.space(),
-                    r.service().as_str(),
-                    // TC-119: resolve deprecated aliases to canonical (see the
-                    // staging loop above) — identity for canonical URNs.
-                    crate::policy_capability::resolve_alias(c.ability.as_ref().as_ref()),
-                    r.path()?,
-                ))
-            })
-        }) {
-            match cap {
-                (space, "kv", "tinycloud.kv/get", path) => {
-                    let data =
-                        get_kv(&tx, &self.storage, space, path)
-                            .await
-                            .map_err(|e| match e {
-                                EitherError::A(e) => TxStoreError::Tx(e.into()),
-                                EitherError::B(e) => TxStoreError::StoreRead(e),
-                            })?;
-                    if let (Some(limit), Some((_, _, content))) =
-                        (options.max_response_bytes, data.as_ref())
-                    {
-                        if content.len() > limit {
-                            return Err(TxStoreError::KvResponseTooLarge {
-                                size: content.len(),
-                                limit,
-                            });
+            // DbTxBody spans post-begin to pre-commit. The guard defaults to an
+            // `error` outcome so any `?`/early return inside the transaction is
+            // recorded as a failure; it is disarmed to `ok` right before commit.
+            let tx_body_timer =
+                crate::telemetry::StageTimer::start(crate::telemetry::InvocationStage::DbTxBody);
+            let auth_graph = match crate::auth_graph::AuthGraphSnapshot::load(&tx, &roots).await {
+                Ok(graph) => graph,
+                Err(error) => {
+                    crate::telemetry::observe_stage(
+                        crate::telemetry::InvocationStage::AuthorizationGraphLoad,
+                        crate::telemetry::StageOutcome::Error,
+                        authz_start.elapsed(),
+                    );
+                    return Err(TxStoreError::Tx(match error {
+                        revocation::ChainTraversalError::Db(error) => TxError::Db(error),
+                        revocation::ChainTraversalError::LimitExceeded => {
+                            TxError::ChainTraversalLimitExceeded
                         }
+                    }));
+                }
+            };
+            crate::telemetry::observe_stage(
+                crate::telemetry::InvocationStage::AuthorizationGraphLoad,
+                crate::telemetry::StageOutcome::Ok,
+                authz_start.elapsed(),
+            );
+            let mut deleted_hashes = HashMap::new();
+            for key @ (space, path) in &mutation_keys {
+                let current = get_kv_entity(&tx, space, path).await?;
+                if let Some(precondition) = options.preconditions.get(key) {
+                    let matches = kv_precondition_matches(
+                        *precondition,
+                        current.as_ref().map(|entry| entry.value),
+                    );
+                    if !matches {
+                        return Err(TxStoreError::KvPreconditionFailed);
                     }
-                    results.push(InvocationOutcome::KvRead(data));
                 }
-                (space, "kv", "tinycloud.kv/list", path) => {
-                    let (list, truncated) = list_bounded_after(
-                        &tx,
-                        space,
-                        path,
-                        options.list_limit,
-                        options.list_cursor.as_ref(),
-                    )
-                    .await?;
-                    results.push(InvocationOutcome::KvList(list, truncated, None))
+                if let Some(entry) = current {
+                    deleted_hashes.insert(key.clone(), entry.value);
                 }
-                (space, "kv", "tinycloud.kv/del", path) => {
-                    // KV deletion is logical. Blobs are content-addressed and may be
-                    // shared by live sibling keys or retained version history.
-                    results.push(InvocationOutcome::KvDelete(
-                        deleted_hashes.get(&(space.clone(), path.clone())).copied(),
+            }
+            let caps = invocation.0.capabilities.clone();
+            let invoker = invocation.0.invoker.clone();
+            // Extract capabilities read params from UCAN facts field
+            // Facts is Vec<JsonValue>, we look for an object with capabilitiesReadParams key
+            let caps_read_params: Option<CapabilitiesReadParams> = invocation
+                .0
+                .invocation
+                .payload()
+                .facts
+                .as_ref()
+                .and_then(|facts| {
+                    facts.iter().find_map(|fact| {
+                        fact.as_object()
+                            .and_then(|obj| obj.get("capabilitiesReadParams"))
+                            .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    })
+                });
+            //  verify and commit invocation and kv operations
+            let event = match mode {
+                InvokeMode::Internal | InvokeMode::MeetingPublication => {
+                    Event::InternalInvocation(Box::new(invocation), ops)
+                }
+                InvokeMode::Admitted => Event::AdmittedInvocation(Box::new(invocation), ops),
+                InvokeMode::Public => Event::Invocation(Box::new(invocation), ops),
+            };
+            let commit = transact(
+                &tx,
+                &self.storage,
+                &self.secrets,
+                vec![event],
+                self.encryption.as_ref(),
+                Some(&auth_graph),
+                // Taken on this `tx` right after BEGIN, above.
+                &sequence_spaces,
+            )
+            .await?;
+
+            let mut results = Vec::new();
+            // perform and record side effects
+            for cap in caps.iter().filter_map(|c| {
+                c.resource.tinycloud_resource().and_then(|r| {
+                    Some((
+                        r.space(),
+                        r.service().as_str(),
+                        // TC-119: resolve deprecated aliases to canonical (see the
+                        // staging loop above) — identity for canonical URNs.
+                        crate::policy_capability::resolve_alias(c.ability.as_ref().as_ref()),
+                        r.path()?,
                     ))
-                }
-                (space, "kv", "tinycloud.kv/put", path) => {
-                    if let Some(stage) = stages.remove(&(space.clone(), path.clone())) {
-                        self.storage
-                            .persist(space, stage)
-                            .await
-                            .map_err(TxStoreError::StoreWrite)?;
+                })
+            }) {
+                match cap {
+                    (space, "kv", "tinycloud.kv/get", path) => {
+                        let data =
+                            get_kv(&tx, &self.storage, space, path)
+                                .await
+                                .map_err(|e| match e {
+                                    EitherError::A(e) => TxStoreError::Tx(e.into()),
+                                    EitherError::B(e) => TxStoreError::StoreRead(e),
+                                })?;
+                        if let (Some(limit), Some((_, _, content))) =
+                            (options.max_response_bytes, data.as_ref())
+                        {
+                            if content.len() > limit {
+                                return Err(TxStoreError::KvResponseTooLarge {
+                                    size: content.len(),
+                                    limit,
+                                });
+                            }
+                        }
+                        results.push(InvocationOutcome::KvRead(data));
+                    }
+                    (space, "kv", "tinycloud.kv/list", path) => {
+                        let (list, truncated) = list_bounded_after(
+                            &tx,
+                            space,
+                            path,
+                            options.list_limit,
+                            options.list_cursor.as_ref(),
+                        )
+                        .await?;
+                        results.push(InvocationOutcome::KvList(list, truncated, None))
+                    }
+                    (space, "kv", "tinycloud.kv/del", path) => {
+                        // KV deletion is logical. Blobs are content-addressed and may be
+                        // shared by live sibling keys or retained version history.
+                        results.push(InvocationOutcome::KvDelete(
+                            deleted_hashes.get(&(space.clone(), path.clone())).copied(),
+                        ))
+                    }
+                    (space, "kv", "tinycloud.kv/put", path) => {
                         let hash = write_hashes
                             .get(&(space.clone(), path.clone()))
                             .copied()
                             .expect("staged KV writes have a content hash");
-                        results.push(InvocationOutcome::KvWrite(hash))
+                        results.push(InvocationOutcome::KvWrite(hash));
                     }
-                }
-                (space, "kv", "tinycloud.kv/metadata", path) => results.push(
-                    InvocationOutcome::KvMetadata(metadata_with_hash(&tx, space, path).await?),
-                ),
-                (space, "capabilities", "tinycloud.capabilities/read", path)
-                    if path.as_str() == "all" =>
-                {
-                    match &caps_read_params {
-                        None => {
-                            // Backward compatible: no params means return all valid delegations
-                            results.push(InvocationOutcome::OpenSessions(
-                                get_valid_delegations(&tx, space, self.encryption.as_ref()).await?,
-                            ))
-                        }
-                        Some(CapabilitiesReadParams::List { filters }) => {
-                            // List with optional filters
-                            results.push(InvocationOutcome::OpenSessions(
-                                get_filtered_delegations(
-                                    &tx,
-                                    space,
-                                    &invoker,
-                                    filters.as_ref(),
-                                    self.encryption.as_ref(),
-                                )
-                                .await?,
-                            ))
-                        }
-                        Some(CapabilitiesReadParams::Chain { delegation_cid }) => {
-                            // Get the delegation chain for a specific delegation
-                            results.push(InvocationOutcome::DelegationChain(
-                                get_delegation_chain(
-                                    &tx,
-                                    space,
-                                    delegation_cid,
-                                    self.encryption.as_ref(),
-                                )
-                                .await?,
-                            ))
+                    (space, "kv", "tinycloud.kv/metadata", path) => results.push(
+                        InvocationOutcome::KvMetadata(metadata_with_hash(&tx, space, path).await?),
+                    ),
+                    (space, "capabilities", "tinycloud.capabilities/read", path)
+                        if path.as_str() == "all" =>
+                    {
+                        match &caps_read_params {
+                            None => {
+                                // Backward compatible: no params means return all valid delegations
+                                results.push(InvocationOutcome::OpenSessions(
+                                    get_valid_delegations(&tx, space, self.encryption.as_ref())
+                                        .await?,
+                                ))
+                            }
+                            Some(CapabilitiesReadParams::List { filters }) => {
+                                // List with optional filters
+                                results.push(InvocationOutcome::OpenSessions(
+                                    get_filtered_delegations(
+                                        &tx,
+                                        space,
+                                        &invoker,
+                                        filters.as_ref(),
+                                        self.encryption.as_ref(),
+                                    )
+                                    .await?,
+                                ))
+                            }
+                            Some(CapabilitiesReadParams::Chain { delegation_cid }) => {
+                                // Get the delegation chain for a specific delegation
+                                results.push(InvocationOutcome::DelegationChain(
+                                    get_delegation_chain(
+                                        &tx,
+                                        space,
+                                        delegation_cid,
+                                        self.encryption.as_ref(),
+                                    )
+                                    .await?,
+                                ))
+                            }
                         }
                     }
-                }
-                _ => {}
-            };
-        }
+                    _ => {}
+                };
+            }
+            if !blobs.is_empty() {
+                crate::kv_orphans::finish_candidates(&tx, &blobs).await?;
+            }
 
-        // Record the transaction body as successful (post-begin to
-        // pre-commit) before the commit itself; commit latency is tracked
-        // separately (EpochPersist on the delegate/revoke path).
-        tx_body_timer.observe_ok();
-        // commit tx if all side effects worked
-        tx.commit().await?;
-        Ok((commit, results))
+            // Record the transaction body as successful (post-begin to
+            // pre-commit) before the commit itself; commit latency is tracked
+            // separately (EpochPersist on the delegate/revoke path).
+            tx_body_timer.observe_ok();
+            // commit tx if all side effects worked
+            tx.commit().await?;
+            Ok((commit, results))
+        }
+        .await;
+        if result.is_err() && !blobs.is_empty() {
+            // The failed transaction (including any hash locks) has ended.
+            // A commit error may be outcome-unknown: the candidate fence and
+            // committed-reference check distinguish that from an orphan.
+            if let Err(error) =
+                crate::kv_orphans::refund_failed(&self.conn, &self.storage, &blobs).await
+            {
+                tracing::warn!(
+                    ?error,
+                    "failed to refund orphaned KV blob; periodic collector will retry"
+                );
+            }
+        }
+        result
     }
 
     /// Execute a successful non-mutating invocation without entering the
@@ -5071,6 +5131,14 @@ mod test {
             self.entered.notify_one();
             self.release.notified().await;
             self.inner.persist(space, stage).await
+        }
+    }
+    #[async_trait::async_trait]
+    impl ImmutableDeleteStore for LegacyPausedStore {
+        type Error = std::io::Error;
+
+        async fn remove(&self, space: &SpaceId, hash: &Hash) -> Result<Option<()>, Self::Error> {
+            self.inner.remove(space, hash).await
         }
     }
     #[tokio::test]

@@ -18,6 +18,7 @@ pub mod hook_subscription;
 pub mod invocation;
 pub mod invocation_replay;
 pub mod kv_delete;
+pub mod kv_orphan_candidate;
 pub mod kv_write;
 pub mod meeting_legacy_write_guard;
 pub mod owner_share_policy;

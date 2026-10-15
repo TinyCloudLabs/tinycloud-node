@@ -129,3 +129,31 @@ cursor.
 
 Read audit records every poll. Poll on demand, or no more often than every
 60 seconds.
+
+## Write ordering and blob recovery
+
+KV puts stage and authorize content before upload. The node registers a
+durable `(space, content hash)` recovery candidate, then persists the blob
+before taking the per-space sequence lock. The database transaction rechecks
+authorization and conditional-write preconditions under that lock; it holds
+the lock through commit, so `seq` and sync cursors remain commit-ordered even
+when same-space uploads finish out of order. An unauthorized write uploads
+nothing.
+
+A failed upload, precondition, or database write triggers an immediate
+hash-fenced reference check. Unreferenced blobs are removed and their
+physical-byte quota is refunded before the failure returns. Historical
+`kv_write` references are retained as well as current values, because a
+client can still read an older value. The candidate row is removed with a
+successful KV commit; a failed cleanup leaves it for the collector. After a
+crash, the node scans candidates at 60-second intervals, collecting those
+older than five minutes in bounded batches of 256 until the eligible backlog
+is drained. S3 and filesystem stores reserve bytes before a potentially
+ambiguous write; deleting the resulting object or canceling a reservation
+for an object that never materialized refunds once, not twice.
+
+Quota is conservative physical accounting, **not commit-only accounting**:
+in-flight uploads and crash leftovers may temporarily count against it.
+`SpaceSizes` remains in-memory and per process; writes or deletions on other
+nodes do not synchronize that counter. Globally exact multi-node accounting
+requires a separate shared byte ledger (TC-1162).

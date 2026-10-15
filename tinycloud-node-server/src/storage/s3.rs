@@ -1,8 +1,5 @@
 use aws_sdk_s3::{
-    error::{
-        GetObjectAttributesError, GetObjectAttributesErrorKind, GetObjectError, GetObjectErrorKind,
-        HeadObjectError, HeadObjectErrorKind,
-    },
+    error::{GetObjectError, GetObjectErrorKind, HeadObjectError, HeadObjectErrorKind},
     types::{ByteStream, SdkError},
     Client, // Config,
     Error as S3Error,
@@ -16,11 +13,19 @@ use futures::{
 use rocket::{async_trait, http::hyper::Uri};
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DisplayFromStr};
-use std::{collections::HashMap, io::Error as IoError, ops::AddAssign, time::Instant};
+use std::{
+    collections::{hash_map::Entry, HashMap},
+    future::Future,
+    io::Error as IoError,
+    ops::AddAssign,
+    sync::Arc,
+    time::Instant,
+};
 use tinycloud_auth::resource::SpaceId;
 use tinycloud_core::{hash::Hash, storage::*};
 
 use super::{file_system, size::SpaceSizes};
+use tokio::sync::Mutex;
 
 async fn aws_config() -> SdkConfig {
     aws_config::from_env().load().await
@@ -31,6 +36,10 @@ pub struct S3BlockStore {
     pub client: Client,
     pub bucket: String,
     sizes: SpaceSizes,
+    // A PUT can succeed on S3 even if its response fails. Reserve its size
+    // before sending; this shared map refunds a missing object on known
+    // failure without subtracting another writer's committed bytes.
+    pending: Arc<Mutex<HashMap<(SpaceId, Hash), u64>>>,
 }
 
 #[serde_as]
@@ -102,6 +111,7 @@ impl S3BlockStore {
             client,
             bucket: config.bucket.clone(),
             sizes,
+            pending: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -118,6 +128,47 @@ impl S3BlockStore {
     }
     async fn decrement_size(&self, space: &SpaceId, size: u64) {
         self.sizes.decrement_size(space, size).await;
+    }
+
+    async fn put_if_absent<F, Fut>(
+        &self,
+        space: &SpaceId,
+        hash: Hash,
+        body: F,
+    ) -> Result<(), S3StoreError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<(u64, ByteStream), S3StoreError>>,
+    {
+        let key = (space.clone(), hash);
+        if self.contains(space, &hash).await? {
+            // A retry of an ambiguous PUT can find its original object.
+            self.pending.lock().await.remove(&key);
+            return Ok(());
+        }
+        let (size, body) = body().await?;
+        let mut pending = self.pending.lock().await;
+        if let Entry::Vacant(slot) = pending.entry(key.clone()) {
+            slot.insert(size);
+            self.increment_size(space, size).await;
+        }
+        drop(pending);
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(self.key(space, &hash))
+            .body(body)
+            .send()
+            .await
+            .map_err(S3Error::from)?;
+        self.pending.lock().await.remove(&key);
+        Ok(())
+    }
+
+    async fn refund_missing_pending(&self, space: &SpaceId, id: &Hash) {
+        if let Some(size) = self.pending.lock().await.remove(&(space.clone(), *id)) {
+            self.decrement_size(space, size).await;
+        }
     }
 }
 
@@ -312,18 +363,10 @@ impl ImmutableWriteStore<memory::MemoryStaging> for S3BlockStore {
             let (mut h, f) = staged.into_inner();
             let hash = h.finalize();
 
-            if !self.contains(space, &hash).await? {
-                let size = f.len() as u64;
-                self.client
-                    .put_object()
-                    .bucket(&self.bucket)
-                    .key(self.key(space, &hash))
-                    .body(ByteStream::from(f))
-                    .send()
-                    .await
-                    .map_err(S3Error::from)?;
-                self.increment_size(space, size).await;
-            }
+            self.put_if_absent(space, hash, || async move {
+                Ok((f.len() as u64, ByteStream::from(f)))
+            })
+            .await?;
             Ok(hash)
         }
         .await;
@@ -349,20 +392,12 @@ impl ImmutableWriteStore<file_system::TempFileSystemStage> for S3BlockStore {
             let (mut h, f) = staged.into_inner();
             let hash = h.finalize();
 
-            if !self.contains(space, &hash).await? {
+            self.put_if_absent(space, hash, || async move {
                 let size = f.size().await?;
                 let (_file, path) = f.into_inner();
-
-                self.client
-                    .put_object()
-                    .bucket(&self.bucket)
-                    .key(self.key(space, &hash))
-                    .body(ByteStream::from_path(&path).await?)
-                    .send()
-                    .await
-                    .map_err(S3Error::from)?;
-                self.increment_size(space, size).await;
-            }
+                Ok((size, ByteStream::from_path(&path).await?))
+            })
+            .await?;
             Ok(hash)
         }
         .await;
@@ -390,35 +425,22 @@ impl ImmutableWriteStore<either::Either<file_system::TempFileSystemStage, memory
             let (mut h, f) = staged.into_inner();
             let hash = h.finalize();
 
-            if !self.contains(space, &hash).await? {
-                match f {
-                    AsyncEither::Left(t_file) => {
+            match f {
+                AsyncEither::Left(t_file) => {
+                    self.put_if_absent(space, hash, || async move {
                         let size = t_file.size().await?;
                         let (_file, path) = t_file.into_inner();
-                        self.client
-                            .put_object()
-                            .bucket(&self.bucket)
-                            .key(self.key(space, &hash))
-                            .body(ByteStream::from_path(&path).await?)
-                            .send()
-                            .await
-                            .map_err(S3Error::from)?;
-                        self.increment_size(space, size).await;
-                    }
-                    AsyncEither::Right(b) => {
-                        let size = b.len() as u64;
-                        self.client
-                            .put_object()
-                            .bucket(&self.bucket)
-                            .key(self.key(space, &hash))
-                            .body(ByteStream::from(b))
-                            .send()
-                            .await
-                            .map_err(S3Error::from)?;
-                        self.increment_size(space, size).await;
-                    }
+                        Ok((size, ByteStream::from_path(&path).await?))
+                    })
+                    .await?;
                 }
-            };
+                AsyncEither::Right(b) => {
+                    self.put_if_absent(space, hash, || async move {
+                        Ok((b.len() as u64, ByteStream::from(b)))
+                    })
+                    .await?;
+                }
+            }
             Ok(hash)
         }
         .await;
@@ -437,23 +459,25 @@ impl ImmutableDeleteStore for S3BlockStore {
     async fn remove(&self, space: &SpaceId, id: &Hash) -> Result<Option<()>, Self::Error> {
         let size: u64 = match self
             .client
-            .get_object_attributes()
+            .head_object()
             .bucket(&self.bucket)
             .key(self.key(space, id))
             .send()
             .await
         {
-            Ok(o) if !o.delete_marker() => o.object_size().try_into()?,
-            Ok(_) => return Ok(None),
+            Ok(object) => object.content_length().try_into()?,
             Err(SdkError::ServiceError {
                 err:
-                    GetObjectAttributesError {
-                        kind: GetObjectAttributesErrorKind::NoSuchKey(_),
+                    HeadObjectError {
+                        kind: HeadObjectErrorKind::NotFound(_),
                         ..
                     },
                 ..
-            }) => return Ok(None),
-            Err(e) => return Err(S3Error::from(e).into()),
+            }) => {
+                self.refund_missing_pending(space, id).await;
+                return Ok(None);
+            }
+            Err(error) => return Err(S3Error::from(error).into()),
         };
         match self
             .client
@@ -464,7 +488,13 @@ impl ImmutableDeleteStore for S3BlockStore {
             .await
         {
             Ok(_) => {
-                self.decrement_size(space, size).await;
+                let charged = self
+                    .pending
+                    .lock()
+                    .await
+                    .remove(&(space.clone(), *id))
+                    .unwrap_or(size);
+                self.decrement_size(space, charged).await;
                 Ok(Some(()))
             }
             // TODO does this distinguish between object missing and object present?
