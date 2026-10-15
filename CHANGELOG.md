@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Account delegation session discovery keyset-pages delegation rows independently of ability fan-out, using a composite delegator/id index so large grant sets are not truncated (TC-1195).
+
 ## [1.20.7] - 2026-10-14
 
 A security hardening release (TC-1132, #292) for webhook, quota and tunnel egress.

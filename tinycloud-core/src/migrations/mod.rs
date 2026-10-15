@@ -24,6 +24,7 @@ pub mod m20261005_000000_current_kv_sync_order;
 pub mod m20261005_000000_deactivate_hook_subscriptions;
 pub mod m20261007_000000_database_alias;
 pub mod m20261007_010000_database_identity_fence;
+pub mod m20261015_000000_delegation_cursor_index;
 
 pub struct Migrator;
 
@@ -56,6 +57,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261005_000000_deactivate_hook_subscriptions::Migration),
             Box::new(m20261007_000000_database_alias::Migration),
             Box::new(m20261007_010000_database_identity_fence::Migration),
+            Box::new(m20261015_000000_delegation_cursor_index::Migration),
         ]
     }
 }
