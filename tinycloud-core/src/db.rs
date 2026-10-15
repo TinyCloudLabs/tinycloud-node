@@ -2116,18 +2116,6 @@ where
                 }
                 return Err(KeyRevokeError::Forbidden);
             }
-            // A nonce already bound to this exact target/scope remains a
-            // conflict even if its signer has since revoked itself. A changed
-            // target or scope must pass fresh authority before diagnostics.
-            if row.target_did == request.target_did {
-                let receipt: key_revocation::KeyRevokeReceipt =
-                    serde_json::from_slice(&row.receipt_bytes).map_err(|_| {
-                        db_error(DbErr::Custom("key-receipt-invalid".into()), false)
-                    })?;
-                if receipt.scope == request.scope {
-                    return Err(KeyRevokeError::Conflict);
-                }
-            }
         }
 
         let target_key = crate::key_authority::principal_lock_id(&request.target_did)
@@ -2143,6 +2131,26 @@ where
             .begin_graph_transaction()
             .await
             .map_err(|error| db_error(error, false))?;
+        // A concurrent request may have committed the identical self-revoke
+        // while this one waited for its target lock. Its receipt remains
+        // retryable even though fresh issuer authority is now gone.
+        if let Some(row) = key_revocation::nonce::Entity::find_by_id(nonce_key.clone())
+            .one(&tx)
+            .await
+            .map_err(|error| db_error(error, false))?
+        {
+            if row.authorization_hash == request.authorization_hash
+                && row.target_did == request.target_did
+            {
+                let receipt: key_revocation::KeyRevokeReceipt =
+                    serde_json::from_slice(&row.receipt_bytes).map_err(|_| {
+                        db_error(DbErr::Custom("key-receipt-invalid".into()), false)
+                    })?;
+                if receipt.scope == request.scope && receipt.target_did == request.target_did {
+                    return Ok(receipt);
+                }
+            }
+        }
         let now = OffsetDateTime::now_utc();
         let direct = if tinycloud_auth::identity::did_principal_matches(
             &request.issuer_did,
@@ -2163,6 +2171,7 @@ where
         } else {
             false
         };
+        let mut recovery_expires_at = None;
         let authorized = if direct {
             let spaces = match &request.scope {
                 KeyRevokeScope::Global => Vec::new(),
@@ -2180,26 +2189,17 @@ where
                 Err(error) => return Err(db_error(error, false)),
             }
         } else {
-            crate::recovery_authority::is_authorized(&tx, &request, now, self.encryption.as_ref())
-                .await
-                .map_err(|error| db_error(error, false))?
+            crate::recovery_authority::is_authorized(
+                &tx,
+                &request,
+                now,
+                self.encryption.as_ref(),
+                &mut recovery_expires_at,
+            )
+            .await
+            .map_err(|error| db_error(error, false))?
         };
         if !authorized {
-            return Err(KeyRevokeError::Forbidden);
-        }
-        if existing.is_some() {
-            return Err(KeyRevokeError::Conflict);
-        }
-        let issued_at = request.not_before;
-        let now_seconds = now.unix_timestamp();
-        if issued_at > now_seconds.saturating_add(30)
-            || request.expires_at <= now_seconds
-            || request.expires_at.saturating_sub(issued_at) > 60
-            || request.expires_at <= issued_at
-            || request
-                .valid_after
-                .is_some_and(|not_before| now_seconds < not_before)
-        {
             return Err(KeyRevokeError::Forbidden);
         }
         // Both the target and nonce issuer use the same sorted row-lock
@@ -2227,6 +2227,20 @@ where
                 return Err(KeyRevokeError::Forbidden);
             }
             Err(error) => return Err(db_error(error, false)),
+        }
+        let cutoff_now = OffsetDateTime::now_utc();
+        let now_seconds = cutoff_now.unix_timestamp();
+        let issued_at = request.not_before;
+        if recovery_expires_at.is_some_and(|expiry| cutoff_now >= expiry)
+            || issued_at > now_seconds.saturating_add(30)
+            || request.expires_at <= now_seconds
+            || request.expires_at.saturating_sub(issued_at) > 60
+            || request.expires_at <= issued_at
+            || request
+                .valid_after
+                .is_some_and(|not_before| now_seconds < not_before)
+        {
+            return Err(KeyRevokeError::Forbidden);
         }
         if let Some(row) = key_revocation::nonce::Entity::find_by_id(nonce_key.clone())
             .one(&tx)
@@ -7642,6 +7656,45 @@ mod test {
                 .await
                 .unwrap_err()
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn overlapping_exact_self_revokes_return_the_same_receipt() {
+        let db = get_db().await.unwrap();
+        let target = "did:key:overlapping-receipt-owner".to_owned();
+        let key = crate::key_authority::principal_lock_id(&target).unwrap();
+        let in_flight = db.acquire_shared_chain_guards_for_keys(vec![key]).await;
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let request = key_revocation::VerifiedKeyRevoke {
+            target_did: target.clone(),
+            issuer_did: target,
+            scope: key_revocation::KeyRevokeScope::Global,
+            nonce: "overlapping-exact-receipt".into(),
+            authorization_hash: [8; 32],
+            proof_cids: Vec::new(),
+            not_before: now,
+            valid_after: None,
+            expires_at: now + 40,
+        };
+        let first_db = db.clone();
+        let first_request = request.clone();
+        let first = tokio::spawn(async move { first_db.revoke_key(first_request).await });
+        let second_db = db.clone();
+        let second = tokio::spawn(async move { second_db.revoke_key(request).await });
+        settle().await;
+        assert!(!first.is_finished() && !second.is_finished());
+        drop(in_flight);
+        let first_receipt = tokio::time::timeout(std::time::Duration::from_secs(5), first)
+            .await
+            .expect("first cutoff finishes")
+            .unwrap()
+            .unwrap();
+        let second_receipt = tokio::time::timeout(std::time::Duration::from_secs(5), second)
+            .await
+            .expect("concurrent exact retry finishes")
+            .unwrap()
+            .unwrap();
+        assert_eq!(first_receipt, second_receipt);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

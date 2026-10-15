@@ -448,3 +448,40 @@ async fn legacy_candidate_overflow_is_never_silently_narrowed() {
     ));
     assert_eq!(dry_run_backfill(&db, None).await.unwrap().overflow, 1);
 }
+
+#[tokio::test]
+async fn unrelated_incoming_grants_do_not_exhaust_a_policy_witness_limit() {
+    let db = database().await;
+    let (owner, roots, direct, chained) = legacy_policy(&db).await;
+    let unrelated = format!(
+        "tinycloud:key:{}:unrelated/kv",
+        signer(3).1.trim_start_matches("did:key:")
+    );
+    for index in 0..513 {
+        grant(
+            &db,
+            3,
+            &owner,
+            &unrelated,
+            &[],
+            &format!("unrelated-{index}"),
+        )
+        .await;
+    }
+    let witnesses =
+        capture_in_transaction(&db, "legacy-policy", &owner, &roots, date(ADMISSION), None)
+            .await
+            .unwrap();
+    for witness in &witnesses {
+        assert_eq!(witness.candidates.len(), 2);
+        assert!(witness
+            .candidates
+            .iter()
+            .any(|closure| closure.tip_cid == direct));
+        assert!(witness
+            .candidates
+            .iter()
+            .any(|closure| closure.tip_cid == chained));
+    }
+    assert_eq!(dry_run_backfill(&db, None).await.unwrap().overflow, 0);
+}

@@ -525,14 +525,18 @@ or a delegation CID; an empty method-specific ID is rejected.
 
 The committed response includes the target, scope, and original cutoff.
 Repeating the exact signed request returns the same receipt even after the
-signer is revoked; another request using its nonce cannot alter that cutoff.
-New requests still need live authorization. A successful response follows the
-durable cutoff, so later policy mint, delegation admission, and invocations
-cannot use authority derived from the revoked principal. Natural proof expiry
-is not an explicit revoke.
+signer is revoked or its recovery proof expires. Changed signed bytes with
+the same nonce return `409` only for a still-authorized signer; a signer
+without current target/scope authority receives `403`. First-use request
+and recovery proof validity are checked after blocking authorization locks.
+The cutoff remains immutable; successful responses follow its durable commit.
+Later policy mints, delegation admission, and invocations cannot use authority
+derived from the revoked principal. Natural proof expiry is not an explicit
+revoke.
 
 Policy registration persists a versioned, signed-byte-bound witness for its
-authority dependencies. Preexisting registrations receive a conservative
+authority dependencies. The signed candidate limit counts relevant closures,
+not unrelated incoming grants. Preexisting registrations receive a conservative
 transactional backfill at startup; inconsistent or incomplete provenance
 prevents serving rather than silently narrowing dependencies. Before release,
 an operator runs `policy-witness-dry-run` with the node's configuration on a

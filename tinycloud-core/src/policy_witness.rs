@@ -30,6 +30,7 @@ use tinycloud_auth::{
 const VERSION: i32 = 1;
 const MAX_NODES: usize = revocation::MAX_CHAIN_TRAVERSAL_NODES;
 const MAX_CANDIDATES: usize = 64;
+const CANDIDATE_PAGE_SIZE: u64 = 128;
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
 #[sea_orm(table_name = "policy_witness")]
@@ -375,6 +376,9 @@ async fn closure<C: ConnectionTrait>(
             return Ok(None);
         }
         let has_capability = signed_caps.iter().any(|held| covers(held, capability));
+        if id == tip && !has_capability {
+            return Ok(None);
+        }
         covering.insert(id, has_capability);
         for parent in graph_parents {
             pending.push(parent);
@@ -481,35 +485,46 @@ pub async fn capture_in_transaction<C: ConnectionTrait>(
         }
         roots.push((root, signed, event));
     }
-    let candidates = delegation::Entity::find()
-        .filter(
-            sea_orm::Condition::any()
-                .add(delegation::Column::Delegatee.eq(owner_did))
-                .add(delegation::Column::Delegatee.like(format!("{owner_did}#%"))),
-        )
-        .limit((MAX_CANDIDATES * 8 + 1) as u64)
-        .all(db)
-        .await?;
-    if candidates.len() > MAX_CANDIDATES * 8 {
-        return Err(WitnessError::Overflow);
-    }
+    let delegatee_prefix = format!("{owner_did}#%");
     for (root, signed, event) in roots {
         for (index, capability) in event.0.capabilities.into_iter().enumerate() {
             if index > i32::MAX as usize {
                 return Err(WitnessError::Overflow);
             }
             let mut closures = Vec::new();
-            for candidate in &candidates {
-                if !did_principal_matches(&candidate.delegatee, &owner) {
-                    continue;
+            let mut cursor = None;
+            loop {
+                let mut query = delegation::Entity::find()
+                    .filter(
+                        sea_orm::Condition::any()
+                            .add(delegation::Column::Delegatee.eq(owner_did))
+                            .add(delegation::Column::Delegatee.like(delegatee_prefix.as_str())),
+                    )
+                    .order_by_asc(delegation::Column::Id)
+                    .limit(CANDIDATE_PAGE_SIZE);
+                if let Some(last) = cursor {
+                    query = query.filter(delegation::Column::Id.gt(last));
                 }
-                if let Some(found) =
-                    closure(db, candidate.id, &owner, &capability, at, encryption).await?
-                {
-                    closures.push(found);
-                    if closures.len() > MAX_CANDIDATES {
-                        return Err(WitnessError::Overflow);
+                let candidates = query.all(db).await?;
+                if candidates.is_empty() {
+                    break;
+                }
+                cursor = candidates.last().map(|row| row.id);
+                for candidate in &candidates {
+                    if !did_principal_matches(&candidate.delegatee, &owner) {
+                        continue;
                     }
+                    if let Some(found) =
+                        closure(db, candidate.id, &owner, &capability, at, encryption).await?
+                    {
+                        closures.push(found);
+                        if closures.len() > MAX_CANDIDATES {
+                            return Err(WitnessError::Overflow);
+                        }
+                    }
+                }
+                if candidates.len() < CANDIDATE_PAGE_SIZE as usize {
+                    break;
                 }
             }
             closures.sort_by(|a, b| a.tip_cid.cmp(&b.tip_cid));

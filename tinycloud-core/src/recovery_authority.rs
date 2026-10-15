@@ -37,6 +37,7 @@ pub async fn is_authorized(
     request: &VerifiedKeyRevoke,
     now: OffsetDateTime,
     encryption: Option<&ColumnEncryption>,
+    proof_expires_at: &mut Option<OffsetDateTime>,
 ) -> Result<bool, DbErr> {
     if request.proof_cids.is_empty()
         || request.proof_cids.len() > revocation::MAX_CHAIN_TRAVERSAL_NODES
@@ -246,6 +247,17 @@ pub async fn is_authorized(
         .cloned()
         .collect::<Vec<_>>();
     key_authority::lock_targets(db, &shared, false).await?;
+    // The graph and principal locks may have waited past a signed proof's
+    // window. Recheck every bound under those locks rather than trusting the
+    // entry timestamp passed by the caller.
+    let locked_now = OffsetDateTime::now_utc();
+    if rows.iter().any(|row| {
+        row.issued_at.is_some_and(|issued| locked_now < issued)
+            || row.not_before.is_some_and(|start| locked_now < start)
+            || row.expiry.is_some_and(|expiry| locked_now >= expiry)
+    }) {
+        return Ok(false);
+    }
     let spaces = match &request.scope {
         crate::models::key_revocation::KeyRevokeScope::Global => Vec::new(),
         crate::models::key_revocation::KeyRevokeScope::Space { space_id } => vec![space_id.clone()],
@@ -312,8 +324,11 @@ pub async fn is_authorized(
     // because generic invocations do not treat key URNs as space roots.
     let proofs = roots.iter().map(|id| id.to_cid(0x55)).collect::<Vec<_>>();
     let caps = &signed[&roots[0]].capabilities;
-    match invocation::authorize_holder(db, &request.issuer_did, caps, &proofs, now).await {
-        Ok(()) => Ok(true),
+    match invocation::authorize_holder(db, &request.issuer_did, caps, &proofs, locked_now).await {
+        Ok(()) => {
+            *proof_expires_at = rows.iter().filter_map(|row| row.expiry).min();
+            Ok(true)
+        }
         Err(invocation::Error::Db(error)) => Err(error),
         Err(_) => Ok(false),
     }
