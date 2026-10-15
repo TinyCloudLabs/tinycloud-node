@@ -43,7 +43,6 @@ import { dirname } from "node:path";
 import { TinyCloudNode } from "@tinycloud/node-sdk";
 import {
   STAGE_DEADLINE_MS,
-  decide,
   denseWatch,
   detail,
   failBody,
@@ -53,9 +52,11 @@ import {
   parseState,
   readCheck,
   report,
+  settle,
   summaryTable,
+  type Deliver,
+  type ProbeState,
   type ReadClient,
-  type Reporter,
   type StageResult,
 } from "./probe-core";
 
@@ -157,20 +158,27 @@ async function writeSummary(markdown: string): Promise<void> {
   if (path) await appendFile(path, `${markdown}\n`);
 }
 
+// The per-target failure state is shared by normal and dense runs: the Actions
+// cache carries this file from one run to the next, whichever mode it is.
+async function loadState(): Promise<ProbeState> {
+  return parseState(await readFile(STATE_FILE, "utf8").catch(() => undefined));
+}
+async function saveState(state: ProbeState): Promise<void> {
+  await mkdir(dirname(STATE_FILE), { recursive: true });
+  await writeFile(STATE_FILE, `${JSON.stringify(state)}\n`);
+}
+
 // ---- normal (scheduled) run ----------------------------------------------------
 
-async function normalRun(node: TinyCloudNode, client: ReadClient, reporter: Reporter, secrets: string[]): Promise<boolean> {
+async function normalRun(node: TinyCloudNode, client: ReadClient, deliver: Deliver, secrets: string[]): Promise<boolean> {
   const log = (line: string) => console.log(line);
   const { results, failure } = await readCheck(client, { log, secrets });
 
-  const prev = parseState(await readFile(STATE_FILE, "utf8").catch(() => undefined));
-  const decision = decide(prev, !failure, Date.now());
+  const settled = await settle(await loadState(), results, Date.now(), deliver);
   console.log(
-    `[probe] read verdict=${failure ? "fail" : "ok"} consecutive_failures=${decision.state.consecutiveFailures} heartbeat_action=${decision.action}`,
+    `[probe] read verdict=${failure ? "fail" : "ok"} failures_kv=${settled.state.failures.kv} failures_sql=${settled.state.failures.sql} heartbeat_action=${settled.action}`,
   );
-  if (decision.action !== "none") await reporter(decision.action, failure, decision.state.consecutiveFailures);
-  await mkdir(dirname(STATE_FILE), { recursive: true });
-  await writeFile(STATE_FILE, `${JSON.stringify(decision.state)}\n`);
+  await saveState(settled.state);
 
   // Write half (TC-313). Needs a signed-in session in an existing space.
   const writes: StageResult[] = [];
@@ -208,6 +216,12 @@ async function normalRun(node: TinyCloudNode, client: ReadClient, reporter: Repo
     console.error(`[probe] FAIL: ${breaches.map((b) => `${b.stage} ${b.outcome} (${b.ms}ms)`).join(", ")}`);
     return false;
   }
+  if (!settled.delivered) {
+    // Healthy reads but Better Stack didn't take the ping: fail the job so the
+    // gap shows before the heartbeat goes "missed".
+    console.error("[probe] FAIL: heartbeat report was not accepted");
+    return false;
+  }
   console.log("[probe] PASS: reads and writes within thresholds");
   return true;
 }
@@ -240,26 +254,34 @@ async function main(): Promise<number> {
 
   console.log(`[probe] mode=${MODE} host=${HOST} space_prefix=${PREFIX} stage_deadline_ms=${STAGE_DEADLINE_MS} heartbeat=${hbUrl ? "configured" : "not configured"}`);
 
-  const reporter: Reporter = async (action, failure, consecutive) => {
+  const deliver: Deliver = async (action, failure, consecutive) => {
     const body =
       action === "fail" && failure
         ? failBody({ mode, consecutive, failure, build: await nodeBuild(HOST, fetch), host: new URL(HOST).host, at: new Date() })
         : undefined;
     if (body) console.log(`[probe] fail report body: ${body}`);
-    console.log(`[probe] ${await report(action, hbUrl, body, fetch)}`);
+    const delivery = await report(action, hbUrl, body, fetch);
+    console.log(`[probe] ${delivery.line}`);
+    return delivery;
   };
 
   const node = new TinyCloudNode({ privateKey, host: HOST, prefix: PREFIX });
   const client = sdkClient(node);
 
-  if (MODE === "dense") {
-    const samples = await denseWatch(client, { log: (line) => console.log(line), secrets, report: reporter });
+  if (mode === "dense") {
+    const { samples, undelivered } = await denseWatch(client, {
+      log: (line) => console.log(line),
+      secrets,
+      deliver,
+      initialState: await loadState(),
+      onState: saveState,
+    });
     await writeSummary(summaryTable("Write Probe promote watch (dense)", samples));
     const failed = samples.filter((s) => !s.ok).length;
-    console.log(`[probe] dense watch done: ${samples.length} samples, ${failed} failed`);
-    return failed === 0 && configOk ? 0 : 1;
+    console.log(`[probe] dense watch done: ${samples.length} samples, ${failed} failed, ${undelivered} heartbeat report(s) not accepted`);
+    return failed === 0 && undelivered === 0 && configOk ? 0 : 1;
   }
-  return (await normalRun(node, client, reporter, secrets)) && configOk ? 0 : 1;
+  return (await normalRun(node, client, deliver, secrets)) && configOk ? 0 : 1;
 }
 
 // Deadlines leave SDK requests running in the background; exit explicitly so a

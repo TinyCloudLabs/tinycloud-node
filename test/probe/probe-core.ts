@@ -151,41 +151,93 @@ export async function measure(
 
 // ---- consecutive-failure rule ------------------------------------------------
 
+/**
+ * KV and SQL are tracked separately: a sample may read only one of them (dense
+ * 30 s phase), and a healthy SQL read must not hide a broken KV read.
+ */
+export const READ_TARGETS = ["kv", "sql"] as const;
+export type ReadTarget = (typeof READ_TARGETS)[number];
+
+/** Persisted between runs and shared by normal and dense mode. */
 export type ProbeState = {
-  consecutiveFailures: number;
-  /** ISO time of the last `/fail` report in the current streak. */
+  /** Failed observations in a row, per read target. */
+  failures: Record<ReadTarget, number>;
+  /** The latest failure per target, for the `/fail` body. */
+  lastFailure: Partial<Record<ReadTarget, StageResult>>;
+  /** ISO time of the last ACCEPTED `/fail` in the current streak. */
   lastFailReportAt?: string;
 };
 
-export type Decision = { action: "ping" | "fail" | "none"; state: ProbeState };
+export const INITIAL_STATE: ProbeState = { failures: { kv: 0, sql: 0 }, lastFailure: {} };
+
+export type Decision = {
+  action: "ping" | "fail" | "none";
+  /** State to keep if the action's delivery succeeds (see settle()). */
+  state: ProbeState;
+  /** The failure named in the `/fail` body: the worst target's latest failure. */
+  failure?: StageResult;
+  consecutive: number;
+};
 
 /**
- * Good read -> ping (resolves an open heartbeat incident) and reset.
- * Failed read -> count it; from the FAILURES_TO_ALERT-th in a row, report
- * `/fail`, at most once per FAIL_REPORT_MIN_INTERVAL_MS.
+ * Folds one sample into the state and decides what the heartbeat should hear.
+ * A kv/sql result updates its own target; a failed signin/space means neither
+ * could be read, so it counts against both. Targets the sample didn't observe
+ * keep their count.
+ * - every target at 0 failures -> ping (resolves an open heartbeat incident);
+ * - any target at FAILURES_TO_ALERT+ -> `/fail`, at most once per
+ *   FAIL_REPORT_MIN_INTERVAL_MS;
+ * - otherwise nothing (one failure alone never pages).
  */
-export function decide(prev: ProbeState, ok: boolean, nowMs: number): Decision {
-  if (ok) return { action: "ping", state: { consecutiveFailures: 0 } };
-  const consecutiveFailures = prev.consecutiveFailures + 1;
+export function decide(prev: ProbeState, results: readonly StageResult[], nowMs: number): Decision {
+  const failures = { ...prev.failures };
+  const lastFailure = { ...prev.lastFailure };
+  for (const r of results) {
+    const targets: readonly ReadTarget[] = r.stage === "kv" || r.stage === "sql" ? [r.stage] : r.ok ? [] : READ_TARGETS;
+    for (const t of targets) {
+      failures[t] = r.ok ? 0 : failures[t] + 1;
+      if (r.ok) delete lastFailure[t];
+      else lastFailure[t] = r;
+    }
+  }
+  const worst = READ_TARGETS.reduce((a, b) => (failures[b] > failures[a] ? b : a));
+  const consecutive = failures[worst];
+  if (consecutive === 0) return { action: "ping", state: { failures, lastFailure: {} }, consecutive };
+  const state: ProbeState = { failures, lastFailure, ...(prev.lastFailReportAt ? { lastFailReportAt: prev.lastFailReportAt } : {}) };
   const last = prev.lastFailReportAt ? Date.parse(prev.lastFailReportAt) : Number.NaN;
-  const due = consecutiveFailures >= FAILURES_TO_ALERT && !(nowMs - last < FAIL_REPORT_MIN_INTERVAL_MS);
-  if (!due) return { action: "none", state: { consecutiveFailures, lastFailReportAt: prev.lastFailReportAt } };
-  return { action: "fail", state: { consecutiveFailures, lastFailReportAt: new Date(nowMs).toISOString() } };
+  const due = consecutive >= FAILURES_TO_ALERT && !(nowMs - last < FAIL_REPORT_MIN_INTERVAL_MS);
+  return { action: due ? "fail" : "none", state, failure: lastFailure[worst], consecutive };
+}
+
+function count(value: unknown): number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : 0;
 }
 
 /** Tolerates a missing or corrupt state file: start from zero failures. */
 export function parseState(text: string | undefined): ProbeState {
-  if (!text) return { consecutiveFailures: 0 };
+  if (!text) return INITIAL_STATE;
   try {
     const raw: unknown = JSON.parse(text);
-    const n = field(raw, "consecutiveFailures");
+    const failures = field(raw, "failures");
+    const lastFailure = field(raw, "lastFailure");
     const at = field(raw, "lastFailReportAt");
+    const restored: Partial<Record<ReadTarget, StageResult>> = {};
+    for (const t of READ_TARGETS) {
+      const r = field(lastFailure, t);
+      const stage = field(r, "stage");
+      const ms = field(r, "ms");
+      const outcome = field(r, "outcome");
+      if (typeof stage === "string" && typeof ms === "number" && typeof outcome === "string") {
+        restored[t] = { stage: redact(stage, [], 20), ms, ok: false, outcome: redact(outcome, [], 60) };
+      }
+    }
     return {
-      consecutiveFailures: typeof n === "number" && Number.isInteger(n) && n >= 0 ? n : 0,
+      failures: { kv: count(field(failures, "kv")), sql: count(field(failures, "sql")) },
+      lastFailure: restored,
       ...(typeof at === "string" && !Number.isNaN(Date.parse(at)) ? { lastFailReportAt: at } : {}),
     };
   } catch {
-    return { consecutiveFailures: 0 };
+    return INITIAL_STATE;
   }
 }
 
@@ -225,14 +277,12 @@ export function heartbeatUrl(raw: string | undefined): URL | undefined {
 
 export type Fetch = (input: string, init?: RequestInit) => Promise<Response>;
 
-/** Sends the ping or `/fail`. Returns a loggable result line; never the URL. */
-export async function report(
-  action: "ping" | "fail",
-  url: URL | undefined,
-  body: string | undefined,
-  fetchFn: Fetch,
-): Promise<string> {
-  if (!url) return `heartbeat ${action} skipped: BETTERSTACK_HEARTBEAT_URL not set`;
+/** Outcome of a heartbeat call; `line` is safe to log (never the URL). */
+export type Delivery = { ok: boolean; line: string };
+
+/** Sends the ping or `/fail`. Only a 2xx counts as delivered. */
+export async function report(action: "ping" | "fail", url: URL | undefined, body: string | undefined, fetchFn: Fetch): Promise<Delivery> {
+  if (!url) return { ok: true, line: `heartbeat ${action} skipped: BETTERSTACK_HEARTBEAT_URL not set` };
   const target = action === "fail" ? `${url.toString().replace(/\/$/, "")}/fail` : url.toString();
   try {
     const res = await fetchFn(target, {
@@ -240,9 +290,11 @@ export async function report(
       ...(action === "fail" ? { body, headers: { "content-type": "text/plain" } } : {}),
       signal: AbortSignal.timeout(REPORT_TIMEOUT_MS),
     });
-    return `heartbeat ${action} sent: HTTP ${res.status}`;
+    return res.ok
+      ? { ok: true, line: `heartbeat ${action} sent: HTTP ${res.status}` }
+      : { ok: false, line: `heartbeat ${action} NOT accepted: HTTP ${res.status}` };
   } catch (error) {
-    return `heartbeat ${action} failed: ${classify(error)}`;
+    return { ok: false, line: `heartbeat ${action} NOT delivered: ${classify(error)}` };
   }
 }
 
@@ -272,8 +324,22 @@ export interface ReadClient {
 
 export type Logger = (line: string) => void;
 
-/** Sends the decided ping or `/fail`; `failure` is the stage named in the `/fail` body. */
-export type Reporter = (action: "ping" | "fail", failure: StageResult | undefined, consecutive: number) => Promise<void>;
+/** Delivers the decided ping or `/fail`; `failure` is the stage named in the `/fail` body. */
+export type Deliver = (action: "ping" | "fail", failure: StageResult | undefined, consecutive: number) => Promise<Delivery>;
+
+export type Settled = { state: ProbeState; action: Decision["action"]; delivered: boolean };
+
+/**
+ * decide() + delivery. A `/fail` only starts its rate-limit window once
+ * Better Stack accepted it, so a rejected report is retried on the next sample.
+ */
+export async function settle(prev: ProbeState, results: readonly StageResult[], nowMs: number, deliver: Deliver): Promise<Settled> {
+  const d = decide(prev, results, nowMs);
+  if (d.action === "none") return { state: d.state, action: d.action, delivered: true };
+  const { ok } = await deliver(d.action, d.failure, d.consecutive);
+  const state = d.action === "fail" && ok ? { ...d.state, lastFailReportAt: new Date(nowMs).toISOString() } : d.state;
+  return { state, action: d.action, delivered: ok };
+}
 
 export type ReadCheckResult = { results: StageResult[]; failure?: StageResult };
 
@@ -326,34 +392,37 @@ export async function readCheck(
 }
 
 export type DenseSample = { sample: number; at: string; results: StageResult[]; ok: boolean };
+export type DenseResult = { samples: DenseSample[]; state: ProbeState; undelivered: number };
 
 /**
  * Dense promote watch. One sign-in (retried on the next sample if it fails),
- * then reads on DENSE_SCHEDULE. In the 30 s phase each sample reads ONE of
- * KV/SQL alternately, so each endpoint sees at most one request per 30 s; in
- * the 5 min phase each sample reads both. A read over DENSE_SLOW_MS or any
- * failure counts; FAILURES_TO_ALERT in a row reports `/fail`, a good sample
- * pings.
+ * then reads on DENSE_SCHEDULE. Under a 60 s interval each sample reads ONE of
+ * KV/SQL alternately, so each sees at most one request per 30 s; otherwise both.
+ * A read over DENSE_SLOW_MS or failing counts. Starts from, and hands back
+ * through `onState`, the same per-target state as normal mode.
  */
 export async function denseWatch(
   client: ReadClient,
   opts: {
     log: Logger;
     secrets: readonly string[];
-    report: Reporter;
+    deliver: Deliver;
+    initialState?: ProbeState;
+    onState?: (state: ProbeState) => Promise<void>;
     schedule?: readonly Phase[];
     slowMs?: number;
     deadlineMs?: number;
     sleep?: (ms: number) => Promise<void>;
     clock?: () => number;
   },
-): Promise<DenseSample[]> {
+): Promise<DenseResult> {
   const schedule = opts.schedule ?? DENSE_SCHEDULE;
   const slowMs = opts.slowMs ?? DENSE_SLOW_MS;
   const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const clock = opts.clock ?? (() => Date.now());
   const samples: DenseSample[] = [];
-  let state: ProbeState = { consecutiveFailures: 0 };
+  let state = opts.initialState ?? INITIAL_STATE;
+  let undelivered = 0;
   let signedIn = false;
   let next = clock();
   let n = 0;
@@ -362,7 +431,6 @@ export async function denseWatch(
       const wait = next - clock();
       if (wait > 0) await sleep(wait);
       n += 1;
-      // Under a 60 s interval, alternate KV and SQL so each sees <= 1 request per 30 s.
       const reads: ReadStage[] = phase.intervalMs < 60_000 ? [n % 2 === 1 ? "kv" : "sql"] : ["kv", "sql"];
       const stages: ReadStage[] = signedIn ? reads : ["signin", "space", ...reads];
       const at = new Date(clock()).toISOString();
@@ -377,14 +445,16 @@ export async function denseWatch(
         stages,
       });
       if (!signedIn && results.some((r) => r.stage === "space" && r.ok)) signedIn = true;
-      const decision = decide(state, !failure, clock());
-      state = decision.state;
-      if (decision.action !== "none") await opts.report(decision.action, failure, state.consecutiveFailures);
+      const settled = await settle(state, results, clock(), opts.deliver);
+      state = settled.state;
+      if (!settled.delivered) undelivered += 1;
+      opts.log(`[probe] mode=dense sample=${n} failures_kv=${state.failures.kv} failures_sql=${state.failures.sql} heartbeat_action=${settled.action}`);
+      await opts.onState?.(state);
       samples.push({ sample: n, at, results, ok: !failure });
       next += phase.intervalMs;
     }
   }
-  return samples;
+  return { samples, state, undelivered };
 }
 
 /** Markdown for $GITHUB_STEP_SUMMARY: every sample's latency. */

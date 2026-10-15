@@ -35,12 +35,16 @@ deadline (`STAGE_DEADLINE_MS`):
 The fixed key and row are written once by the probe itself the first time they
 are missing; after that they are only read.
 
-- **Good read:** ping the Better Stack heartbeat **Node authorized reads (Write
-  Probe)**. A ping also resolves an open heartbeat incident.
-- **Failed read** (any stage over 20s or erroring): increment a failure count
-  kept in a small state file (`.state/probe-state.json`, carried between runs in
-  the Actions cache). From the **2nd failure in a row** the probe POSTs the
-  heartbeat's `/fail` URL with one line, which pages team@:
+- **Good read** of both KV and SQL: ping the Better Stack heartbeat **Node
+  authorized reads (Write Probe)**. A ping also resolves an open heartbeat
+  incident.
+- **Failed read** (any stage over 20s or erroring): count it in a small state
+  file (`.state/probe-state.json`, carried between runs in the Actions cache and
+  shared with dense mode). KV and SQL are counted separately; a failed `signin`
+  or `space` counts against both. The heartbeat is pinged only while **both**
+  are at zero, so a healthy SQL read never hides a broken KV read. From the
+  **2nd failure in a row** of either, the probe POSTs the heartbeat's `/fail`
+  URL with one line, which pages team@:
 
   ```
   TC-1176 node read probe FAIL (2 in a row, normal): stage=kv outcome="timeout >=20s" duration_ms=20004 build=1.20.6 host=node.tinycloud.xyz at=2026-10-15T01:05:07Z
@@ -55,8 +59,13 @@ are missing; after that they are only read.
   failing with `HTTP 5xx`, `connection refused`, `DNS` or `build=unknown(...)`
   means the **node is down** (rollback territory).
 
-  While a failure streak lasts, `/fail` is re-sent at most every 4 minutes. One
-  failure alone never pages: a ~60s node restart during a deploy is absorbed.
+  While a failure streak lasts, `/fail` is re-sent at most every 4 minutes,
+  counted from the last report Better Stack **accepted** (2xx): a rejected or
+  undelivered report is retried on the next sample. One failure alone never
+  pages: a ~60s node restart during a deploy is absorbed.
+- **Heartbeat not accepted:** if a ping or `/fail` gets a non-2xx or no
+  response, the job ends red (logged as `heartbeat ... NOT accepted`), so a
+  broken heartbeat shows before it turns into a false "missed" page.
 
 **Write half — TC-313's round-trip.** `put -> get -> delete` of a fresh key,
 each with its latency threshold (default 5s, `PROBE_THRESHOLD_{PUT,GET,DELETE}_MS`)
@@ -71,11 +80,18 @@ touch the heartbeat.
   most one request per 30s), then
 - every **5 min for 60 min** (12 samples, KV and SQL each).
 
-A read over **5s** (`DENSE_SLOW_MS`) or failing counts; **2 in a row** POST
-`/fail` with the same one-line body (`dense` instead of `normal`); a good sample
-pings. The job summary tables every sample's latency, and the job ends red if
-any sample failed. While a dense watch runs, scheduled runs skip themselves so
-only one probe owns the heartbeat.
+A read over **5s** (`DENSE_SLOW_MS`) or failing counts; **2 in a row** of KV or
+of SQL POST `/fail` with the same one-line body (`dense` instead of `normal`);
+the heartbeat is pinged once both are healthy. The job summary tables every
+sample's latency, and the job ends red if any sample failed or a heartbeat
+report wasn't accepted.
+
+**One owner of the heartbeat at a time.** A dense watch starts from the failure
+state the last normal run saved and saves its own at the end, so a streak
+carries across modes. Scheduled runs skip themselves while a dense watch is
+queued or running, and the dense job waits for any normal run already in
+progress to finish before its first sample. They use separate concurrency
+groups, so a scheduled run can never cancel a pending dense watch.
 
 `docker.yml` dispatches it automatically after every Phala deploy attempt (job
 `promote-watch`). To run it by hand (Amos, QA):
@@ -97,7 +113,7 @@ One line per stage, per sample:
 ```
 [probe] mode=dense sample=3 stage=kv ms=812 threshold_ms=5000 result=ok outcome="ok"
 [probe] mode=normal sample=1 stage=kv ms=20004 threshold_ms=20000 result=fail outcome="timeout >=20s"
-[probe] read verdict=fail consecutive_failures=2 heartbeat_action=fail
+[probe] read verdict=fail failures_kv=2 failures_sql=0 heartbeat_action=fail
 [probe] fail report body: TC-1176 node read probe FAIL (2 in a row, normal): stage=kv ...
 [probe] heartbeat fail sent: HTTP 200
 ```
