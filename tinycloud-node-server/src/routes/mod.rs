@@ -9203,7 +9203,7 @@ mod tests {
                 expiration: test_invocation_expiration(),
                 nonce: Some(fixture.next_nonce()),
                 facts: Some(vec![fact]),
-                proof: vec![grant_cid.clone()],
+                proof: vec![grant_cid],
                 attenuation: caps,
             }
             .sign(
