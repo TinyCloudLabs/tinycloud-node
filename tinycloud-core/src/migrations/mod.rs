@@ -365,10 +365,21 @@ mod release_line_tests {
             return;
         };
         let admin = Database::connect(url.clone()).await.unwrap();
-        let before_1195 = Migrator::migrations()
+        let migrations = Migrator::migrations();
+        let before_1195 = migrations
             .iter()
             .position(|migration| migration.name() == "m20261015_000000_delegation_cursor_index")
             .unwrap() as u32;
+        // Older same-timestamp migrations have historical registration order;
+        // the new release-line tail must never precede an already applied one.
+        for pair in migrations[before_1195 as usize..].windows(2) {
+            assert!(
+                pair[0].name() < pair[1].name(),
+                "new migration must follow its predecessor: {} before {}",
+                pair[0].name(),
+                pair[1].name()
+            );
+        }
         // v1.20.6 ends immediately before TC-1195 in the migration list.
         for (prior, with_737) in [
             ("fresh", false),
