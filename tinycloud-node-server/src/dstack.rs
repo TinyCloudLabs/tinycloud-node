@@ -59,9 +59,18 @@ fn parse_response_body(raw: &[u8]) -> Result<&[u8]> {
         .ok_or_else(|| anyhow!("invalid HTTP response: missing status code"))?;
     let body = &raw[header_end + 4..];
     if !(200..300).contains(&status) {
-        // The error body stays in the operator log; callers see only the status.
-        let excerpt = String::from_utf8_lossy(&body[..body.len().min(512)]);
-        tracing::warn!(status, body = %excerpt, "dstack guest agent returned an error");
+        // Production logs ship off-host, so they get the status and size only;
+        // the agent's body is logged at debug, which is off by default.
+        tracing::warn!(
+            status,
+            body_len = body.len(),
+            "dstack guest agent returned an error"
+        );
+        tracing::debug!(
+            status,
+            body = %String::from_utf8_lossy(&body[..body.len().min(512)]),
+            "dstack guest agent error body"
+        );
         anyhow::bail!("guest agent returned HTTP {status}");
     }
     Ok(body)

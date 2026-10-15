@@ -94,7 +94,10 @@ async fn dstack_attestation(
     let quote_resp = crate::dstack::get_quote(socket, &report_data)
         .await
         .map_err(|e| {
-            tracing::error!("Failed to get TDX quote: {:#}", e);
+            // `{e}` is only the outermost context, a fixed message from this
+            // code; the full chain may quote agent output, so it is debug-only.
+            tracing::error!(error_class = %e, "TDX quote unavailable");
+            tracing::debug!("TDX quote failure: {e:#}");
             (
                 Status::ServiceUnavailable,
                 "quote generation failed".to_string(),
@@ -156,6 +159,53 @@ mod tests {
                 Status::ServiceUnavailable,
                 "quote generation failed".to_string()
             )
+        );
+    }
+
+    /// Log lines written at production's default INFO level.
+    #[derive(Clone, Default)]
+    struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn quote_failure_logs_status_and_length_but_not_the_agent_body() {
+        let logs = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .finish();
+        // #[tokio::test] runs on one thread, so this covers the whole request.
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let body = r#"{"error":"agent-detail-7f3a"}"#;
+        let agent = stub::serve_once("400 Bad Request", body);
+
+        dstack_attestation(&agent.socket, &ctx(), Some("n"))
+            .await
+            .unwrap_err();
+
+        let logged = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert!(!logged.contains("agent-detail-7f3a"), "{logged}");
+        assert!(logged.contains("status=400"), "{logged}");
+        assert!(
+            logged.contains(&format!("body_len={}", body.len())),
+            "{logged}"
         );
     }
 

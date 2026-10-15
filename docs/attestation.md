@@ -45,10 +45,13 @@ or TCB status, so a 200 response proves nothing on its own.
   with 200 and `mode: "classic"`.
 - A node outside a TEE returns 200 with `mode: "classic"`. A verifier that
   expects a TEE must treat that as a failure.
+- The quote binds `enforcer_did` to the measured node. It does not prove that
+  the DID's private key was derived inside the TEE.
 
 ## Verifying
 
-1. Choose a fresh, unpredictable nonce and request
+1. Choose a fresh, unpredictable nonce, for example 32 random bytes as
+   unpadded base64url (43 characters), and request
    `/attestation?nonce=<nonce>`. Reject anything but 200 with
    `mode: "dstack"`.
 2. Build the expected preimage yourself from the DID you expect and your
@@ -60,10 +63,16 @@ or TCB status, so a 200 response proves nothing on its own.
    including its TCB status, and read REPORTDATA from the verified quote,
    not from the response JSON. REPORTDATA must be the digest followed by 32
    zero bytes.
-5. Check the quote's MRTD and RTMR0-2 against the dstack OS image you trust.
+5. Check the TD report body yourself; quote verification doesn't apply this
+   policy (Intel TDX DCAP Quoting Library API, §2.3.2 and Appendix A.3.4).
+   TDATTRIBUTES must have the debug bit (TUD) clear, since a debug TD's memory
+   is readable by the host.
+6. Check the quote's MRTD and RTMR0-2 against the dstack OS image you trust.
    Replay `event_log` against RTMR3 and take `compose-hash` and `app-id` from
-   the replayed events, not from the JSON fields; compare them with the
-   release you expect.
+   the replayed events, not from the JSON fields. `compose-hash` is SHA-256 of
+   the full app-compose JSON dstack deployed (compose file plus runner
+   settings), so compare it with a trusted hash of that exact manifest for the
+   release you expect, and check the manifest pins the expected image digests.
 
 The digest only binds what the verifier recomputes in steps 2 and 3, so
 always derive the preimage from your own nonce and expected DID rather than
