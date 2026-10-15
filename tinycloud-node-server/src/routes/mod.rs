@@ -71,6 +71,7 @@ pub mod hooks;
 pub(crate) mod kv_sync;
 mod meeting_publication;
 pub mod node_keys;
+pub use crate::key_revoke;
 pub mod public;
 #[cfg(feature = "tc-bench-v1")]
 pub mod tc_bench;
@@ -345,9 +346,8 @@ pub async fn create_signed_kv_url(
 ) -> Result<Json<SignedKvUrlResponse>, (Status, String)> {
     let invocation_info = invocation.0 .0.clone();
     verify_auth("server.signed_kv.auth", invocation.0, tinycloud).await?;
-    // Same policy gate as `/invoke`. A policy-session invocation lives at most
-    // 60 s, and the ticket never outlives it, so a revoked policy stops new
-    // signed URLs here and existing ones within a minute.
+    // Mint and every redemption check the policy's current revocation
+    // dependencies; the ticket lifetime is not a revocation grace period.
     policy_v3
         .authorize_invocation(tinycloud, &invocation_info, OffsetDateTime::now_utc())
         .await
@@ -526,8 +526,16 @@ pub async fn delegation_status(
     match tinycloud
         .delegation_status(target, &auth.invoker, &auth.parents)
         .await
-        .map_err(|_| (Status::ServiceUnavailable, "Status unavailable".to_string()))?
-    {
+        .map_err(|error| match error {
+            tinycloud_core::db::TxError::AuthorizationDenied => {
+                (Status::Forbidden, "Status authority revoked".to_string())
+            }
+            tinycloud_core::db::TxError::AuthorizationWaitTimeout => (
+                Status::Forbidden,
+                "Status authority wait timed out".to_string(),
+            ),
+            _ => (Status::ServiceUnavailable, "Status unavailable".to_string()),
+        })? {
         Some(status) => Ok(Custom(
             Status::Ok,
             Json(DelegationStatusResponse::from_status(request.cid, status)),
@@ -602,6 +610,9 @@ pub async fn delegate(
                     database_failure(error, write_may_have_applied, e.to_string())
                 }
                 TxError::SpaceNotFound => (Status::NotFound, e.to_string()),
+                TxError::AuthorizationDenied | TxError::AuthorizationWaitTimeout => {
+                    (Status::Forbidden, e.to_string())
+                }
                 _ => (Status::Unauthorized, e.to_string()),
             })
             .and_then(|result: TransactResult| {
@@ -2210,6 +2221,8 @@ async fn invoke_impl(
                         TxStoreError::Tx(TxError::SpaceNotFound) => Status::NotFound,
                         TxStoreError::KvSyncInvalidRequest(_) => Status::BadRequest,
                         TxStoreError::KvPreconditionFailed => Status::PreconditionFailed,
+                        TxStoreError::Tx(TxError::AuthorizationDenied | TxError::AuthorizationWaitTimeout) =>
+                            Status::Forbidden,
                         TxStoreError::MeetingSnapshotProtected => Status::Forbidden,
                         TxStoreError::LegacyMeetingFrozen => Status::Conflict,
                         TxStoreError::KvResponseTooLarge { .. } => Status::PayloadTooLarge,
@@ -5389,9 +5402,17 @@ mod tests {
 
     #[tokio::test]
     async fn delegation_status_and_query_enforce_control_proofs_without_oracles() -> Result<()> {
+        use k256::ecdsa::SigningKey;
         use rocket::http::{ContentType, Header, Status};
         use rocket::local::asynchronous::Client;
+        use sha3::Keccak256;
         use tinycloud_auth::authorization::Cid as AuthCid;
+        use tinycloud_auth::authorization::{HeaderEncode, TinyCloudDelegation};
+        use tinycloud_auth::cacaos::{
+            siwe::{encode_eip55, Message, Version},
+            siwe_cacao::{Header as SiweHeader, Signature as SiweSignature, SiweCacao},
+        };
+        use tinycloud_auth::siwe_recap::Capability as RecapCapability;
         use tinycloud_auth::ssi::{
             claims::jwt::NumericDate,
             dids::{DIDBuf, DIDURLBuf},
@@ -5400,10 +5421,90 @@ mod tests {
         };
         use tinycloud_auth::ucan_capabilities_object::Capabilities;
         use tinycloud_core::models::{
-            abilities, actor, delegation as deleg_model, revocation as revo_model,
+            abilities, actor, delegation as deleg_model, policy_v3_root, revocation as revo_model,
         };
         use tinycloud_core::relationships::parent_delegations;
         use tinycloud_core::sea_orm::{ActiveModelTrait, ActiveValue::Set};
+
+        fn signed_ucan_grant(
+            jwk: &JWK,
+            vm: &str,
+            audience: &str,
+            nonce: &str,
+            resource: &Resource,
+            action: &str,
+            expiry: f64,
+        ) -> Result<Vec<u8>> {
+            let mut capabilities = Capabilities::new();
+            capabilities.with_action(
+                resource.to_string().parse()?,
+                action.parse::<UcanAbility>()?,
+                [std::collections::BTreeMap::<String, serde_json::Value>::new()],
+            );
+            Ok(Payload {
+                issuer: vm.parse::<DIDURLBuf>()?,
+                audience: audience.parse::<DIDBuf>()?,
+                not_before: None,
+                expiration: NumericDate::try_from_seconds(expiry)?,
+                nonce: Some(nonce.to_string()),
+                facts: Some(Vec::<serde_json::Value>::new()),
+                proof: Vec::new(),
+                attenuation: capabilities,
+            }
+            .sign(jwk.get_algorithm().unwrap_or_default(), jwk)?
+            .encode()?
+            .into_bytes())
+        }
+
+        fn signed_wallet_session(
+            key: &SigningKey,
+            address: [u8; 20],
+            audience: &str,
+            resource: &Resource,
+            nonce: &str,
+        ) -> Result<(Vec<u8>, OffsetDateTime, OffsetDateTime)> {
+            let mut recap = RecapCapability::<serde_json::Value>::new();
+            for action in [
+                "tinycloud.delegation/list",
+                "tinycloud.delegation/status",
+                "tinycloud.delegation/revoke",
+            ] {
+                recap.with_action(
+                    resource.to_string().parse()?,
+                    action.parse::<UcanAbility>()?,
+                    [std::collections::BTreeMap::<String, serde_json::Value>::new()],
+                );
+            }
+            let issued = OffsetDateTime::now_utc() - time::Duration::minutes(1);
+            let expires = issued + time::Duration::hours(1);
+            let message = recap.build_message(Message {
+                scheme: Some("https".parse()?),
+                domain: "tc1149.test".parse()?,
+                address,
+                statement: None,
+                uri: audience.parse()?,
+                version: Version::V1,
+                chain_id: 1,
+                nonce: nonce.to_string(),
+                issued_at: issued.into(),
+                expiration_time: Some(expires.into()),
+                not_before: None,
+                request_id: None,
+                resources: vec![],
+            })?;
+            let (signature, recovery_id) = key.sign_prehash_recoverable(&message.eip191_hash()?)?;
+            let mut signature_bytes = [0u8; 65];
+            signature_bytes[..64].copy_from_slice(signature.to_bytes().as_ref());
+            signature_bytes[64] = u8::from(recovery_id) + 27;
+            let authorization = TinyCloudDelegation::Cacao(Box::new(SiweCacao::new(
+                message.into(),
+                SiweSignature::from(signature_bytes),
+                SiweHeader,
+            )))
+            .encode()?;
+            let (_, serialization) = TinyCloudDelegation::decode(&authorization)?;
+            Ok((serialization, issued, expires))
+        }
 
         fn verification_method(jwk: &JWK) -> Result<(String, String)> {
             let did = DID_METHODS.generate(jwk, "key")?.to_string();
@@ -5512,8 +5613,14 @@ mod tests {
         let mut holder_jwk = JWK::generate_ed25519()?;
         holder_jwk.algorithm = Some(Algorithm::EdDSA);
         let (holder_did, holder_vm) = verification_method(&holder_jwk)?;
-        let owner_did = "did:key:zStatusOwner".to_string();
-        let wallet_pkh = "did:pkh:eip155:1:0x1111111111111111111111111111111111111111".to_string();
+        let mut owner_jwk = JWK::generate_ed25519()?;
+        owner_jwk.algorithm = Some(Algorithm::EdDSA);
+        let (owner_did, owner_vm) = verification_method(&owner_jwk)?;
+        let wallet_key = SigningKey::from_bytes(&[0x47; 32].into())?;
+        let wallet_public = wallet_key.verifying_key().to_encoded_point(false);
+        let wallet_digest = Keccak256::digest(&wallet_public.as_bytes()[1..]);
+        let wallet_address: [u8; 20] = wallet_digest[12..].try_into()?;
+        let wallet_pkh = format!("did:pkh:eip155:1:0x{}", encode_eip55(&wallet_address));
         let unrelated_pkh =
             "did:pkh:eip155:1:0x2222222222222222222222222222222222222222".to_string();
         for did in [&owner_did, &holder_did, &wallet_pkh, &unrelated_pkh] {
@@ -5523,10 +5630,26 @@ mod tests {
             .insert(&conn)
             .await?;
         }
-        let parent_id = tinycloud_core::hash::hash(b"status-parent");
+        let owner_control_space = SpaceId::new(owner_did.parse::<DIDBuf>()?, "control".parse()?);
+        let owner_control_resource = Resource::TinyCloud(owner_control_space.to_resource(
+            "delegation".parse()?,
+            None,
+            None,
+            None,
+        ));
+        let parent_serialization = signed_ucan_grant(
+            &owner_jwk,
+            &owner_vm,
+            &holder_did,
+            "status-parent",
+            &owner_control_resource,
+            "tinycloud.delegation/status",
+            4_102_444_800.0,
+        )?;
+        let parent_id = tinycloud_core::hash::hash(&parent_serialization);
         let mut child_capabilities = Capabilities::new();
         child_capabilities.with_action(
-            format!("urn:cid:{}", parent_id.to_cid(0x55)).parse()?,
+            owner_control_resource.to_string().parse()?,
             "tinycloud.delegation/status".parse::<UcanAbility>()?,
             [std::collections::BTreeMap::<String, serde_json::Value>::new()],
         );
@@ -5544,30 +5667,39 @@ mod tests {
         .encode()?
         .into_bytes();
         let child_id = tinycloud_core::hash::hash(&child_serialization);
-        let direct_id = tinycloud_core::hash::hash(b"status-direct");
-        for (id, delegator, delegatee, bytes) in [
-            (
-                parent_id,
-                &owner_did,
-                &holder_did,
-                b"status-parent".as_slice(),
-            ),
-            (
-                direct_id,
-                &owner_did,
-                &holder_did,
-                b"status-direct".as_slice(),
-            ),
+        let direct_serialization = signed_ucan_grant(
+            &owner_jwk,
+            &owner_vm,
+            &holder_did,
+            "status-direct",
+            &owner_control_resource,
+            "tinycloud.delegation/status",
+            4_102_444_800.0,
+        )?;
+        let direct_id = tinycloud_core::hash::hash(&direct_serialization);
+        for (id, bytes) in [
+            (parent_id, parent_serialization),
+            (direct_id, direct_serialization),
         ] {
             deleg_model::ActiveModel {
                 id: Set(id),
-                delegator: Set(delegator.clone()),
-                delegatee: Set(delegatee.clone()),
-                expiry: Set(None),
+                delegator: Set(owner_did.clone()),
+                delegatee: Set(holder_did.clone()),
+                expiry: Set(Some(OffsetDateTime::from_unix_timestamp(4_102_444_800)?)),
                 issued_at: Set(None),
                 not_before: Set(None),
                 facts: Set(None),
-                serialization: Set(bytes.to_vec()),
+                serialization: Set(bytes),
+            }
+            .insert(&conn)
+            .await?;
+            abilities::ActiveModel {
+                delegation: Set(id),
+                resource: Set(owner_control_resource.clone()),
+                ability: Set(Ability::try_from(
+                    "tinycloud.delegation/status".to_string(),
+                )?),
+                caveats: Set(Default::default()),
             }
             .insert(&conn)
             .await?;
@@ -5576,7 +5708,7 @@ mod tests {
             id: Set(child_id),
             delegator: Set(holder_did.clone()),
             delegatee: Set(holder_did.clone()),
-            expiry: Set(None),
+            expiry: Set(Some(OffsetDateTime::from_unix_timestamp(4_102_444_800)?)),
             issued_at: Set(None),
             not_before: Set(None),
             facts: Set(None),
@@ -5584,7 +5716,26 @@ mod tests {
         }
         .insert(&conn)
         .await?;
-        let expired_id = tinycloud_core::hash::hash(b"status-expired");
+        abilities::ActiveModel {
+            delegation: Set(child_id),
+            resource: Set(owner_control_resource.clone()),
+            ability: Set(Ability::try_from(
+                "tinycloud.delegation/status".to_string(),
+            )?),
+            caveats: Set(Default::default()),
+        }
+        .insert(&conn)
+        .await?;
+        let expired_serialization = signed_ucan_grant(
+            &owner_jwk,
+            &owner_vm,
+            &holder_did,
+            "status-expired",
+            &owner_control_resource,
+            "tinycloud.delegation/status",
+            1.0,
+        )?;
+        let expired_id = tinycloud_core::hash::hash(&expired_serialization);
         deleg_model::ActiveModel {
             id: Set(expired_id),
             delegator: Set(owner_did.clone()),
@@ -5593,36 +5744,93 @@ mod tests {
             issued_at: Set(None),
             not_before: Set(None),
             facts: Set(None),
-            serialization: Set(b"status-expired".to_vec()),
+            serialization: Set(expired_serialization),
         }
         .insert(&conn)
         .await?;
-        let wallet_session_id = tinycloud_core::hash::hash(b"wallet-session-proof");
+        abilities::ActiveModel {
+            delegation: Set(expired_id),
+            resource: Set(owner_control_resource.clone()),
+            ability: Set(Ability::try_from(
+                "tinycloud.delegation/status".to_string(),
+            )?),
+            caveats: Set(Default::default()),
+        }
+        .insert(&conn)
+        .await?;
+        let wallet_control_space = SpaceId::new(wallet_pkh.parse::<DIDBuf>()?, "control".parse()?);
+        let control_resource = Resource::TinyCloud(wallet_control_space.clone().to_resource(
+            "delegation".parse()?,
+            None,
+            None,
+            None,
+        ));
+        let query_control_resource = control_resource.clone();
+        let (wallet_session_serialization, wallet_session_issued, wallet_session_expires) =
+            signed_wallet_session(
+                &wallet_key,
+                wallet_address,
+                &holder_did,
+                &control_resource,
+                "tc1149-wallet-session",
+            )?;
+        let wallet_session_id = tinycloud_core::hash::hash(&wallet_session_serialization);
+        deleg_model::ActiveModel {
+            id: Set(wallet_session_id),
+            delegator: Set(wallet_pkh.clone()),
+            delegatee: Set(holder_did.clone()),
+            expiry: Set(Some(wallet_session_expires)),
+            issued_at: Set(Some(wallet_session_issued)),
+            not_before: Set(None),
+            facts: Set(None),
+            serialization: Set(wallet_session_serialization),
+        }
+        .insert(&conn)
+        .await?;
         let unrelated_session_id = tinycloud_core::hash::hash(b"unrelated-session-proof");
         let wrong_target_session_id = tinycloud_core::hash::hash(b"wrong-target-session-proof");
         let foreign_scope_session_id = tinycloud_core::hash::hash(b"foreign-scope-session-proof");
         let narrow_scope_session_id = tinycloud_core::hash::hash(b"narrow-scope-session-proof");
         let query_scope_session_id = tinycloud_core::hash::hash(b"query-scope-session-proof");
         let fragment_scope_session_id = tinycloud_core::hash::hash(b"fragment-scope-session-proof");
-        let wallet_child_id = tinycloud_core::hash::hash(b"wallet-pkh-child");
+        let wallet_child_serialization = signed_ucan_grant(
+            &owner_jwk,
+            &owner_vm,
+            &wallet_pkh,
+            "wallet-pkh-child",
+            &owner_control_resource,
+            "tinycloud.delegation/status",
+            4_102_444_800.0,
+        )?;
+        let wallet_child_id = tinycloud_core::hash::hash(&wallet_child_serialization);
+        deleg_model::ActiveModel {
+            id: Set(wallet_child_id),
+            delegator: Set(owner_did.clone()),
+            delegatee: Set(wallet_pkh.clone()),
+            expiry: Set(Some(OffsetDateTime::from_unix_timestamp(4_102_444_800)?)),
+            issued_at: Set(None),
+            not_before: Set(None),
+            facts: Set(None),
+            serialization: Set(wallet_child_serialization),
+        }
+        .insert(&conn)
+        .await?;
+        abilities::ActiveModel {
+            delegation: Set(wallet_child_id),
+            resource: Set(owner_control_resource.clone()),
+            ability: Set(Ability::try_from(
+                "tinycloud.delegation/status".to_string(),
+            )?),
+            caveats: Set(Default::default()),
+        }
+        .insert(&conn)
+        .await?;
         for (id, delegator, delegatee, bytes) in [
-            (
-                wallet_session_id,
-                &wallet_pkh,
-                &holder_did,
-                b"wallet-session-proof".as_slice(),
-            ),
             (
                 unrelated_session_id,
                 &wallet_pkh,
                 &holder_did,
                 b"unrelated-session-proof".as_slice(),
-            ),
-            (
-                wallet_child_id,
-                &owner_did,
-                &wallet_pkh,
-                b"wallet-pkh-child".as_slice(),
             ),
             (
                 wrong_target_session_id,
@@ -5668,17 +5876,6 @@ mod tests {
             .insert(&conn)
             .await?;
         }
-        let wallet_control_space = SpaceId::new(
-            wallet_pkh.parse::<DIDBuf>()?,
-            "control".parse().expect("valid space name"),
-        );
-        let control_resource = Resource::TinyCloud(wallet_control_space.clone().to_resource(
-            "delegation".parse()?,
-            None,
-            None,
-            None,
-        ));
-        let query_control_resource = control_resource.clone();
         for action in [
             "tinycloud.delegation/status",
             "tinycloud.delegation/revoke",
@@ -6113,7 +6310,7 @@ mod tests {
             .await?;
         revo_model::ActiveModel {
             id: Set(tinycloud_core::hash::hash(b"status-parent-revocation")),
-            revoker: Set(owner_did),
+            revoker: Set(owner_did.clone()),
             revoked: Set(parent_id),
             serialization: Set(b"status-parent-revocation".to_vec()),
             revoked_at: Set(None),
@@ -6210,6 +6407,474 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&response.into_string().await.unwrap())?;
         assert_eq!(body["status"], "not_found");
         assert_eq!(body["exists"], false);
+
+        // A valid control session remains independently usable after the
+        // original holder's signing key is globally revoked.
+        use tinycloud_core::models::key_revocation;
+
+        let direct_live_serialization = signed_ucan_grant(
+            &owner_jwk,
+            &owner_vm,
+            &holder_did,
+            "tc1149-direct-live",
+            &owner_control_resource,
+            "tinycloud.delegation/status",
+            4_102_444_800.0,
+        )?;
+        let direct_live_id = tinycloud_core::hash::hash(&direct_live_serialization);
+        let conn = client
+            .rocket()
+            .state::<TinyCloud>()
+            .expect("tinycloud state")
+            .readable()
+            .await?;
+        deleg_model::ActiveModel {
+            id: Set(direct_live_id),
+            delegator: Set(owner_did.clone()),
+            delegatee: Set(holder_did.clone()),
+            expiry: Set(Some(OffsetDateTime::from_unix_timestamp(4_102_444_800)?)),
+            issued_at: Set(None),
+            not_before: Set(None),
+            facts: Set(None),
+            serialization: Set(direct_live_serialization),
+        }
+        .insert(&conn)
+        .await?;
+        abilities::ActiveModel {
+            delegation: Set(direct_live_id),
+            resource: Set(owner_control_resource.clone()),
+            ability: Set(Ability::try_from(
+                "tinycloud.delegation/status".to_string(),
+            )?),
+            caveats: Set(Default::default()),
+        }
+        .insert(&conn)
+        .await?;
+
+        let mut control_jwk = JWK::generate_ed25519()?;
+        control_jwk.algorithm = Some(Algorithm::EdDSA);
+        let (control_did, control_vm) = verification_method(&control_jwk)?;
+        actor::ActiveModel {
+            id: Set(control_did.clone()),
+        }
+        .insert(&conn)
+        .await?;
+        let owner_control_serialization = signed_ucan_grant(
+            &owner_jwk,
+            &owner_vm,
+            &control_did,
+            "tc1149-owner-control",
+            &owner_control_resource,
+            "tinycloud.delegation/status",
+            4_102_444_800.0,
+        )?;
+        let owner_control_id = tinycloud_core::hash::hash(&owner_control_serialization);
+        deleg_model::ActiveModel {
+            id: Set(owner_control_id),
+            delegator: Set(owner_did.clone()),
+            delegatee: Set(control_did.clone()),
+            expiry: Set(Some(OffsetDateTime::from_unix_timestamp(4_102_444_800)?)),
+            issued_at: Set(None),
+            not_before: Set(None),
+            facts: Set(None),
+            serialization: Set(owner_control_serialization),
+        }
+        .insert(&conn)
+        .await?;
+        abilities::ActiveModel {
+            delegation: Set(owner_control_id),
+            resource: Set(owner_control_resource.clone()),
+            ability: Set(Ability::try_from(
+                "tinycloud.delegation/status".to_string(),
+            )?),
+            caveats: Set(Default::default()),
+        }
+        .insert(&conn)
+        .await?;
+        let (control_serialization, control_issued, control_expires) = signed_wallet_session(
+            &wallet_key,
+            wallet_address,
+            &control_did,
+            &query_control_resource,
+            "tc1149-independent-session",
+        )?;
+        let control_session_id = tinycloud_core::hash::hash(&control_serialization);
+        deleg_model::ActiveModel {
+            id: Set(control_session_id),
+            delegator: Set(wallet_pkh.clone()),
+            delegatee: Set(control_did.clone()),
+            expiry: Set(Some(control_expires)),
+            issued_at: Set(Some(control_issued)),
+            not_before: Set(None),
+            facts: Set(None),
+            serialization: Set(control_serialization),
+        }
+        .insert(&conn)
+        .await?;
+        for action in [
+            "tinycloud.delegation/list",
+            "tinycloud.delegation/status",
+            "tinycloud.delegation/revoke",
+        ] {
+            abilities::ActiveModel {
+                delegation: Set(control_session_id),
+                resource: Set(query_control_resource.clone()),
+                ability: Set(Ability::try_from(action.to_string())?),
+                caveats: Set(Default::default()),
+            }
+            .insert(&conn)
+            .await?;
+        }
+        conn.commit().await?;
+
+        let direct_live_cid = direct_live_id.to_cid(0x55).to_string();
+        let owner_control_cid = owner_control_id.to_cid(0x55).to_string();
+        let session_cid = wallet_session_id.to_cid(0x55).to_string();
+        let control_session_cid = control_session_id.to_cid(0x55).to_string();
+        let holder_query = || -> Result<String> {
+            query_header_with_proofs(
+                &holder_jwk,
+                &holder_vm,
+                &holder_did,
+                &query_control_resource,
+                "tc1149-holder-query",
+                vec![wallet_session_id.to_cid(0x55)],
+            )
+        };
+        let control_query = || -> Result<String> {
+            query_header_with_proofs(
+                &control_jwk,
+                &control_vm,
+                &control_did,
+                &query_control_resource,
+                "tc1149-control-query",
+                vec![control_session_id.to_cid(0x55)],
+            )
+        };
+        for (label, header) in [
+            ("target", holder_query()?),
+            ("independent session", control_query()?),
+        ] {
+            let response = query_request(header).dispatch().await;
+            assert_eq!(
+                response.status(),
+                Status::Ok,
+                "{label} query before key revoke"
+            );
+            let body = response.into_string().await.unwrap_or_default();
+            assert!(body.contains(&session_cid), "{label} query: {body}");
+        }
+        let response = request(
+            &direct_live_cid,
+            status_header(
+                &holder_jwk,
+                &holder_vm,
+                &holder_did,
+                &direct_live_cid,
+                "tc1149-direct-before",
+            )?,
+        )
+        .dispatch()
+        .await;
+        assert_eq!(
+            response.status(),
+            Status::Ok,
+            "proofless direct-root status"
+        );
+        let body: serde_json::Value = serde_json::from_str(&response.into_string().await.unwrap())?;
+        assert_eq!(body["status"], "active");
+        // A status read shares the registry with another reader. It must not
+        // queue behind an exclusive worker while a live read holds this CID.
+        let existing_reader = client
+            .rocket()
+            .state::<TinyCloud>()
+            .expect("tinycloud state")
+            .guard_delegation_chains(&[direct_live_id])
+            .await?;
+        let simultaneous_status = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            request(
+                &direct_live_cid,
+                status_header(
+                    &holder_jwk,
+                    &holder_vm,
+                    &holder_did,
+                    &direct_live_cid,
+                    "tc1149-concurrent-reader",
+                )?,
+            )
+            .dispatch(),
+        )
+        .await
+        .expect("status read queued behind another shared reader");
+        drop(existing_reader);
+        assert_eq!(simultaneous_status.status(), Status::Ok);
+        for (label, jwk, vm, did, proof) in [
+            (
+                "target",
+                &holder_jwk,
+                &holder_vm,
+                &holder_did,
+                wallet_session_id,
+            ),
+            (
+                "independent session",
+                &control_jwk,
+                &control_vm,
+                &control_did,
+                control_session_id,
+            ),
+        ] {
+            let response = request(
+                &session_cid,
+                status_header_with_proofs(
+                    jwk,
+                    vm,
+                    did,
+                    &session_cid,
+                    label,
+                    vec![proof.to_cid(0x55)],
+                )?,
+            )
+            .dispatch()
+            .await;
+            assert_eq!(
+                response.status(),
+                Status::Ok,
+                "{label} delegated status before key revoke"
+            );
+            let body: serde_json::Value =
+                serde_json::from_str(&response.into_string().await.unwrap())?;
+            assert_eq!(body["status"], "active", "{label}");
+        }
+
+        // Model the durable self-global key tombstone. Neither the signed
+        // proof nor the queried delegation CID is revoked.
+        let conn = client
+            .rocket()
+            .state::<TinyCloud>()
+            .expect("tinycloud state")
+            .readable()
+            .await?;
+        key_revocation::ActiveModel {
+            target_did: Set(holder_did.clone()),
+            scope_key: Set("global".to_string()),
+            revoked_at: Set(OffsetDateTime::now_utc().unix_timestamp()),
+        }
+        .insert(&conn)
+        .await?;
+        conn.commit().await?;
+
+        let response = query_request(holder_query()?).dispatch().await;
+        assert!(
+            response.status() == Status::Unauthorized || response.status() == Status::Forbidden,
+            "revoked signer queried delegation metadata: {}",
+            response.status()
+        );
+        for (label, cid, header) in [
+            (
+                "proofless direct-root",
+                &direct_live_cid,
+                status_header(
+                    &holder_jwk,
+                    &holder_vm,
+                    &holder_did,
+                    &direct_live_cid,
+                    "tc1149-direct-after",
+                )?,
+            ),
+            (
+                "delegated proof",
+                &session_cid,
+                status_header_with_proofs(
+                    &holder_jwk,
+                    &holder_vm,
+                    &holder_did,
+                    &session_cid,
+                    "tc1149-session-after",
+                    vec![wallet_session_id.to_cid(0x55)],
+                )?,
+            ),
+        ] {
+            let response = request(cid, header).dispatch().await;
+            assert!(
+                response.status() == Status::Unauthorized || response.status() == Status::Forbidden,
+                "{label} status accepted revoked signer: {}",
+                response.status()
+            );
+        }
+        let response = query_request(control_query()?).dispatch().await;
+        assert_eq!(
+            response.status(),
+            Status::Ok,
+            "independent session query after key revoke"
+        );
+        let body = response.into_string().await.unwrap_or_default();
+        assert!(body.contains(&session_cid), "{body}");
+        let revoked_target = request(
+            &session_cid,
+            status_header_with_proofs(
+                &control_jwk,
+                &control_vm,
+                &control_did,
+                &session_cid,
+                "tc1149-control-revoked-target",
+                vec![control_session_id.to_cid(0x55)],
+            )?,
+        )
+        .dispatch()
+        .await;
+        assert_eq!(
+            revoked_target.status(),
+            Status::Forbidden,
+            "an independent signer cannot activate the revoked target"
+        );
+        let response = request(
+            &control_session_cid,
+            status_header_with_proofs(
+                &control_jwk,
+                &control_vm,
+                &control_did,
+                &control_session_cid,
+                "tc1149-control-after",
+                vec![control_session_id.to_cid(0x55)],
+            )?,
+        )
+        .dispatch()
+        .await;
+        assert_eq!(
+            response.status(),
+            Status::Ok,
+            "independent session status after key revoke"
+        );
+        let body: serde_json::Value = serde_json::from_str(&response.into_string().await.unwrap())?;
+        assert_eq!(body["status"], "active");
+        let response = request(
+            &owner_control_cid,
+            status_header(
+                &owner_jwk,
+                &owner_vm,
+                &owner_did,
+                &owner_control_cid,
+                "tc1149-owner-after",
+            )?,
+        )
+        .dispatch()
+        .await;
+        assert_eq!(
+            response.status(),
+            Status::Ok,
+            "independent owner status after key revoke"
+        );
+        let body: serde_json::Value = serde_json::from_str(&response.into_string().await.unwrap())?;
+        assert_eq!(body["status"], "active");
+        // A target CID may also have a generic revoke. Reporting that CID's
+        // status must not reauthorize the already-tombstoned requester key.
+        let conn = client
+            .rocket()
+            .state::<TinyCloud>()
+            .expect("tinycloud state")
+            .readable()
+            .await?;
+        revo_model::ActiveModel {
+            id: Set(tinycloud_core::hash::hash(
+                b"tc1149-direct-live-cid-revocation",
+            )),
+            revoker: Set(owner_did.clone()),
+            revoked: Set(direct_live_id),
+            serialization: Set(b"tc1149-direct-live-cid-revocation".to_vec()),
+            revoked_at: Set(None),
+        }
+        .insert(&conn)
+        .await?;
+        conn.commit().await?;
+        let denied_status = request(
+            &direct_live_cid,
+            status_header(
+                &holder_jwk,
+                &holder_vm,
+                &holder_did,
+                &direct_live_cid,
+                "tc1149-revoked-cid-and-caller-key",
+            )?,
+        )
+        .dispatch()
+        .await;
+        assert_eq!(denied_status.status(), Status::Forbidden);
+        let owner_status = request(
+            &direct_live_cid,
+            status_header(
+                &owner_jwk,
+                &owner_vm,
+                &owner_did,
+                &direct_live_cid,
+                "tc1149-revoked-cid-live-owner",
+            )?,
+        )
+        .dispatch()
+        .await;
+        assert_eq!(
+            owner_status.status(),
+            Status::Forbidden,
+            "a revoked target key cannot be reported through an independent signer"
+        );
+
+        // A control proof can be valid as an ordinary grant, but cannot
+        // silently stay valid when its ancestry is recorded as an admitted
+        // policy root without the corresponding signed session/witness.
+        let independent_control = client
+            .post("/revoke")
+            .header(Header::new(
+                "Authorization",
+                revocation_header(
+                    &control_jwk,
+                    &control_vm,
+                    &control_did,
+                    &unrelated_session_id.to_cid(0x55).to_string(),
+                    control_session_id.to_cid(0x55),
+                )?,
+            ))
+            .dispatch()
+            .await;
+        assert_eq!(independent_control.status(), Status::Ok);
+        let conn = client
+            .rocket()
+            .state::<TinyCloud>()
+            .expect("tinycloud state")
+            .readable()
+            .await?;
+        policy_v3_root::ActiveModel {
+            root_cid: Set(control_session_cid.clone()),
+            policy_cid: Set("tc1149-missing-control-witness".to_owned()),
+            role: Set("policy-authority".to_owned()),
+            authorization_bytes: Set(b"spoofed-policy-root".to_vec()),
+            status_checkpoint_bytes: Set(None),
+            previous_checkpoint_digest_hex: Set(None),
+            status_sequence: Set(0),
+            admission_epoch: Set(0),
+            status_checked_at: Set(None),
+            status_fresh_until: Set(None),
+            revoked_at: Set(None),
+            revocation_bytes: Set(None),
+        }
+        .insert(&conn)
+        .await?;
+        conn.commit().await?;
+        let missing_witness = client
+            .post("/revoke")
+            .header(Header::new(
+                "Authorization",
+                revocation_header(
+                    &control_jwk,
+                    &control_vm,
+                    &control_did,
+                    &session_cid,
+                    control_session_id.to_cid(0x55),
+                )?,
+            ))
+            .dispatch()
+            .await;
+        assert_eq!(missing_witness.status(), Status::Forbidden);
 
         Ok(())
     }

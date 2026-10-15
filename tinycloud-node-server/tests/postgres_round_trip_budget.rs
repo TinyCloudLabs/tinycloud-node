@@ -114,14 +114,16 @@ use tokio::{
 };
 
 /// Round trips allowed per flow; see the module docs. Measured with
-/// `test_before_acquire(false)`, database identity resolve as one statement,
-/// the read audit as one statement and no second sequence lock (TC-951):
+/// `test_before_acquire(false)`, database identity resolve as one statement
+/// and the read audit as one statement (TC-951). TC-1149 adds canonical
+/// principal/ancestor cutoff checks and transactional target row locks; the
+/// immutable proof signers and CID alias identities share one request query:
 ///
-/// - sign-in 75 = peer key 0 + host `/delegate` 17 + session `/delegate` 18
-///   + account-space SQL write 40;
-/// - kv put 37;
-/// - kv get 22, including the read-audit commit.
-const BUDGETS: [(&str, u64); 3] = [("sign-in", 75), ("kv put", 37), ("kv get", 22)];
+/// - sign-in 89 = peer key 0 + host `/delegate` 20 + session `/delegate` 21
+///   + account-space SQL write 48;
+/// - kv put 49, including cross-process principal lock rows and recheck;
+/// - kv get 30, including the live key tombstone and read-audit commit.
+const BUDGETS: [(&str, u64); 3] = [("sign-in", 89), ("kv put", 49), ("kv get", 30)];
 
 /// Full sign-in plus put plus get rounds run before the measured one.
 const WARM_UP_ROUNDS: u8 = 3;

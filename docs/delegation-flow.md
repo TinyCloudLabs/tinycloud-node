@@ -506,6 +506,36 @@ support. On the same `utf8mb4`/default-strict configuration, unmodified
 alias migration exists. That separate full-schema prerequisite must be resolved
 and exercised before claiming end-to-end support for that configuration.
 
+## Explicit Key Revocation and Policy Witness
+
+`POST /keys/revoke` accepts JSON with `targetDid`, `scope` (`{"kind":"global"}`
+or `{"kind":"space","spaceId":"..."}`), and `authorization`, a signed UCAN or
+SIWE/CACAO addressed to this node. The signed capability names the same
+target and scope. Global revocation requires the target key or its explicitly
+enrolled global recovery delegate. A space owner or its scoped recovery
+delegate may revoke a key only in that owner's space. Generic `/revoke`
+continues to revoke a single delegation CID, not a whole key.
+
+The committed response includes the target, scope, and original cutoff.
+Repeating the exact signed request returns the same receipt even after the
+signer is revoked; another request using its nonce cannot alter that cutoff.
+New requests still need live authorization. A successful response follows the
+durable cutoff, so later policy mint, delegation admission, and invocations
+cannot use authority derived from the revoked principal. Natural proof expiry
+is not an explicit revoke.
+
+Policy registration persists a versioned, signed-byte-bound witness for its
+authority dependencies. Preexisting registrations receive a conservative
+transactional backfill at startup; inconsistent or incomplete provenance
+prevents serving rather than silently narrowing dependencies. Before release,
+an operator runs `policy-witness-dry-run` with the node's configuration on a
+production snapshot or read replica. It opens read-only and reports only
+aggregate `ok`, `missing`, `ambiguous`, and `overflow` counts. Any unresolved
+rows require a release decision; the startup backfill is not a substitute for
+the dry-run gate. Owner-self classification remains `unknown/legacy` in this
+phase; natural sign-in expiry retains existing behavior. Signed self-session
+classification is tracked separately in TC-1213.
+
 ## Child Delegation (UCAN) Creation
 
 For sharing, child UCANs are created that delegate from the session key to another DID.

@@ -1,0 +1,112 @@
+use sea_orm_migration::prelude::*;
+
+use crate::models::key_revocation;
+
+#[derive(DeriveMigrationName)]
+pub struct Migration;
+
+#[async_trait::async_trait]
+impl MigrationTrait for Migration {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .create_table(
+                Table::create()
+                    .table(key_revocation::target::Entity)
+                    .if_not_exists()
+                    .col(
+                        ColumnDef::new(key_revocation::target::Column::TargetDid)
+                            .string()
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_table(
+                Table::create()
+                    .table(key_revocation::Entity)
+                    .if_not_exists()
+                    .col(
+                        ColumnDef::new(key_revocation::Column::TargetDid)
+                            .string()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(key_revocation::Column::ScopeKey)
+                            .string()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(key_revocation::Column::RevokedAt)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .primary_key(
+                        Index::create()
+                            .col(key_revocation::Column::TargetDid)
+                            .col(key_revocation::Column::ScopeKey),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_table(
+                Table::create()
+                    .table(key_revocation::nonce::Entity)
+                    .if_not_exists()
+                    .col(
+                        ColumnDef::new(key_revocation::nonce::Column::IssuerDid)
+                            .string()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(key_revocation::nonce::Column::Nonce)
+                            .string()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(key_revocation::nonce::Column::AuthorizationHash)
+                            .binary()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(key_revocation::nonce::Column::TargetDid)
+                            .string()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(key_revocation::nonce::Column::ReceiptBytes)
+                            .binary()
+                            .not_null(),
+                    )
+                    .primary_key(
+                        Index::create()
+                            .col(key_revocation::nonce::Column::IssuerDid)
+                            .col(key_revocation::nonce::Column::Nonce),
+                    )
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_table(
+                Table::drop()
+                    .table(key_revocation::nonce::Entity)
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .drop_table(Table::drop().table(key_revocation::Entity).to_owned())
+            .await?;
+        manager
+            .drop_table(
+                Table::drop()
+                    .table(key_revocation::target::Entity)
+                    .to_owned(),
+            )
+            .await
+    }
+}

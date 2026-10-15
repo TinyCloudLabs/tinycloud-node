@@ -32,6 +32,7 @@ pub mod dstack;
 pub mod egress;
 pub mod hooks;
 pub mod invocation_replay;
+pub mod key_revoke;
 pub mod link;
 pub mod node_control;
 pub mod policy_v3;
@@ -129,6 +130,7 @@ use routes::{
     },
     hooks::{create_hook_ticket, create_webhook, delete_webhook, hook_events, list_webhooks},
     info, invoke,
+    key_revoke::revoke_key,
     node_keys::{node_keys, NodePublicKeys},
     open_host_key,
     public::{public_kv_get, public_kv_head, public_kv_list, public_kv_options, RateLimiter},
@@ -452,6 +454,7 @@ fn production_routes() -> Vec<Route> {
         delegation_query,
         delegation_status,
         revoke,
+        revoke_key,
         create_signed_kv_url,
         signed_kv_get,
         create_hook_ticket,
@@ -1151,7 +1154,7 @@ async fn run_retention_sweep<C: tinycloud_core::sea_orm::ConnectionTrait>(
     }
 }
 
-pub(crate) async fn resolve_keys(keys: &Keys) -> Result<StaticSecret> {
+pub async fn resolve_keys(keys: &Keys) -> Result<StaticSecret> {
     match keys {
         Keys::Static(s) => Ok(s.clone().try_into()?),
         #[cfg(feature = "dstack")]

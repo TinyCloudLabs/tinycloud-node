@@ -18,6 +18,7 @@ pub mod hook_delivery;
 pub mod hook_subscription;
 pub mod invocation;
 pub mod invocation_replay;
+pub mod key_revocation;
 pub mod kv_delete;
 pub mod kv_write;
 pub mod meeting_legacy_write_guard;

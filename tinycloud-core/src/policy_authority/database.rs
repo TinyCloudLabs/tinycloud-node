@@ -2,7 +2,7 @@ use super::*;
 use crate::models::{policy_challenge, policy_delegation, policy_edge, policy_issuance_audit};
 use sea_orm::{
     sea_query::Expr, ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseTransaction,
-    DbBackend, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
+    DbBackend, DbErr, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 
 #[derive(Clone)]
@@ -11,6 +11,18 @@ pub struct DatabaseAuthorityStore {
     chain_locks: Arc<tokio::sync::Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>>,
     #[cfg(test)]
     race_barrier: Option<Arc<tokio::sync::Barrier>>,
+}
+
+async fn check_signed_principals<C: ConnectionTrait>(
+    db: &C,
+    principals: &[String],
+) -> Result<(), AuthorityError> {
+    crate::key_authority::check_principals_any_scope(db, principals)
+        .await
+        .map_err(|error| match error {
+            DbErr::Custom(_) => AuthorityError::DelegationAncestorRevoked,
+            _ => AuthorityError::AuthorityStateUnavailable,
+        })
 }
 
 impl DatabaseAuthorityStore {
@@ -415,11 +427,14 @@ impl DatabaseAuthorityStore {
     ) -> Result<(), AuthorityError> {
         let mut stack = vec![(cid.to_string(), false, 0usize)];
         let mut visited = HashSet::new();
+        let mut principals = Vec::new();
         while let Some((current, ancestor, depth)) = stack.pop() {
             if depth > MAX_ANCESTRY_DEPTH || !visited.insert(current.clone()) {
                 return Err(AuthorityError::AncestryTooDeep);
             }
             let artifact = self.ensure_live(&current, now, ancestor).await?;
+            principals.push(artifact.issuer_did.clone());
+            principals.push(artifact.audience_did.clone());
             let edges = self.edges(&current).await?;
             validate_persisted_edges(&artifact, &edges)?;
             stack.extend(
@@ -429,7 +444,7 @@ impl DatabaseAuthorityStore {
                     .map(|edge| (edge.parent_cid, true, depth + 1)),
             );
         }
-        Ok(())
+        check_signed_principals(&self.db, &principals).await
     }
 
     /// Revalidates the complete ancestry/revocation chain for `cid` with
@@ -446,12 +461,15 @@ impl DatabaseAuthorityStore {
     ) -> Result<(), AuthorityError> {
         let mut stack = vec![(cid.to_owned(), false, 0usize)];
         let mut ancestry = HashMap::new();
+        let mut principals = Vec::new();
         while let Some((current, ancestor, depth)) = stack.pop() {
             if depth > MAX_ANCESTRY_DEPTH || ancestry.contains_key(&current) {
                 return Err(AuthorityError::AncestryTooDeep);
             }
             let row = delegation_row(transaction, &current, true).await?;
             let verified = ensure_live_model(&row, now, ancestor)?;
+            principals.push(verified.issuer_did.clone());
+            principals.push(verified.audience_did.clone());
             let edges = edges_on(transaction, &current).await?;
             validate_persisted_edges(&verified, &edges)?;
             ancestry.insert(current.clone(), verified);
@@ -462,6 +480,7 @@ impl DatabaseAuthorityStore {
                     .map(|edge| (edge.parent_cid, true, depth + 1)),
             );
         }
+        check_signed_principals(transaction, &principals).await?;
         let mut locked_artifacts = HashMap::new();
         locked_artifacts.extend(ancestry);
         validate_locked_ancestry(transaction, cid, &locked_artifacts).await

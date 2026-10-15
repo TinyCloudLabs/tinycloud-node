@@ -2009,7 +2009,19 @@ async fn verify_registered_ancestors(
         &registered.envelope,
         &registered.row.policy_cid,
         &enforcement,
+    )?;
+    tinycloud_core::key_authority::check_principals(
+        &runtime.conn,
+        &[
+            registered.row.owner_did.clone(),
+            registered.row.share_key_did.clone(),
+            registered.row.enforcer_did.clone(),
+        ],
+        std::slice::from_ref(&registered.row.space_id),
     )
+    .await
+    .map_err(|_| ())?;
+    Ok(())
 }
 
 async fn cid_revoked<C: ConnectionTrait>(db: &C, cid: &str) -> Result<bool, ()> {
@@ -2928,6 +2940,13 @@ pub async fn invoke_v2(
     verify_registered_ancestors(runtime, &registered, None)
         .await
         .map_err(|_| share_error("invoke_denied"))?;
+    tinycloud_core::key_authority::check_principals(
+        &runtime.conn,
+        std::slice::from_ref(&challenge.holder_did),
+        std::slice::from_ref(&registered.row.space_id),
+    )
+    .await
+    .map_err(|_| share_error("invoke_denied"))?;
     let credential_digest = session
         .binding_json
         .get("credentialDigest")
@@ -3294,6 +3313,22 @@ pub async fn authorize_delivery_v2(
     verify_registered_ancestors(runtime, &registered, None)
         .await
         .map_err(|_| share_error("delivery_authorization_invalid"))?;
+    let proof_ids = invocation
+        .0
+         .0
+        .parents
+        .iter()
+        .copied()
+        .map(tinycloud_core::hash::Hash::from)
+        .collect::<Vec<_>>();
+    tinycloud_core::key_authority::check_invoker_chain(
+        &runtime.conn,
+        &proof_ids,
+        &invocation.0 .0.invoker,
+        std::slice::from_ref(&registered.row.space_id),
+    )
+    .await
+    .map_err(|_| share_error("delivery_authorization_invalid"))?;
     let expires = OffsetDateTime::parse(&request.expires_at, &Rfc3339)
         .map_err(|_| share_error("delivery_authorization_invalid"))?;
     let now = OffsetDateTime::now_utc();
@@ -3411,6 +3446,8 @@ mod tests {
 
     #[path = "alias_revocation_tests.rs"]
     mod alias_revocation_tests;
+    #[path = "share_v2_legacy_key_tests.rs"]
+    mod share_v2_legacy_key_tests;
 
     #[test]
     fn policy_domain_matches_the_sdk_wire_contract() {

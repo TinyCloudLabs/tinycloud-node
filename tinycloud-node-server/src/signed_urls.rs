@@ -413,7 +413,89 @@ pub async fn load_signed_kv_ticket(
                 "signed URL ticket not found".to_string(),
             )
         })?;
-    validate_signed_kv_ticket(&ticket)?;
+    let (space, _) = validate_signed_kv_ticket(&ticket)?;
+    let issuer = tinycloud_auth::identity::principal_did(&ticket.issuer_did).map_err(|_| {
+        (
+            Status::Forbidden,
+            "signed URL authority invalid".to_string(),
+        )
+    })?;
+    let subject = tinycloud_auth::identity::principal_did(&ticket.subject_did).map_err(|_| {
+        (
+            Status::Forbidden,
+            "signed URL authority invalid".to_string(),
+        )
+    })?;
+    if issuer != subject || space.to_string() != ticket.space_id {
+        return Err((
+            Status::Forbidden,
+            "signed URL authority invalid".to_string(),
+        ));
+    }
+    let parents = match ticket.parent_cids_json.as_deref() {
+        Some(serialized) => {
+            let cids: Vec<String> = serde_json::from_str(serialized).map_err(|_| {
+                (
+                    Status::Forbidden,
+                    "signed URL authority invalid".to_string(),
+                )
+            })?;
+            if cids.is_empty() {
+                return Err((
+                    Status::Forbidden,
+                    "signed URL authority invalid".to_string(),
+                ));
+            }
+            let mut parents = Vec::with_capacity(cids.len());
+            for value in cids {
+                let cid = value
+                    .parse::<tinycloud_auth::authorization::Cid>()
+                    .map_err(|_| {
+                        (
+                            Status::Forbidden,
+                            "signed URL authority invalid".to_string(),
+                        )
+                    })?;
+                if cid.to_string() != value || parents.contains(&cid) {
+                    return Err((
+                        Status::Forbidden,
+                        "signed URL authority invalid".to_string(),
+                    ));
+                }
+                parents.push(cid);
+            }
+            parents
+        }
+        None => {
+            if issuer
+                != tinycloud_auth::identity::principal_did(space.did().as_str()).map_err(|_| {
+                    (
+                        Status::Forbidden,
+                        "signed URL authority invalid".to_string(),
+                    )
+                })?
+            {
+                return Err((
+                    Status::Forbidden,
+                    "signed URL authority invalid".to_string(),
+                ));
+            }
+            Vec::new()
+        }
+    };
+    tinycloud
+        .ticket_authority_unrevoked(
+            &parents,
+            &ticket.subject_did,
+            std::slice::from_ref(&ticket.space_id),
+        )
+        .await
+        .map_err(|_| {
+            (
+                Status::Forbidden,
+                "signed URL authority revoked".to_string(),
+            )
+        })?;
     Ok(ticket)
 }
 
@@ -1066,8 +1148,9 @@ mod tests {
         assert!(!response.url.contains("?token="));
         assert!(!response.url.contains(&space.to_string()));
 
-        let ticket = load_signed_kv_ticket(&tinycloud, &response.ticket_id)
-            .await
+        let ticket = tinycloud
+            .find_signed_kv_ticket(&response.ticket_id)
+            .await?
             .expect("minted ticket should be persisted");
         let (ticket_space, ticket_path) =
             validate_signed_kv_ticket(&ticket).expect("persisted ticket should validate");

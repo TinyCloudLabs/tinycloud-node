@@ -15,9 +15,10 @@ use crate::relationships::parent_delegations;
 use sea_orm::{
     entity::prelude::*,
     sea_query::{Alias, CommonTableExpression, Expr, JoinType, Query, UnionType, WithClause},
-    ConnectionTrait,
+    ConnectionTrait, DbErr,
 };
 use std::collections::{HashMap, HashSet};
+use tinycloud_auth::identity::principal_did;
 
 pub(crate) use crate::models::revocation::ChainTraversalError;
 use crate::models::revocation::MAX_CHAIN_TRAVERSAL_NODES;
@@ -40,6 +41,115 @@ pub(crate) async fn load_chain_lock_ids<C: ConnectionTrait>(
     roots: &[Hash],
 ) -> Result<Vec<Hash>, ChainTraversalError> {
     load_closure(db, roots, true).await.map(|(ids, _)| ids)
+}
+
+/// The caller already loaded and bounded the signed proof closure. Resolve
+/// its immutable signer/audience principals and canonical alias lock IDs in
+/// one query; live revocation is still checked after acquiring those guards.
+pub(crate) async fn invocation_authority_for_closure<C: ConnectionTrait>(
+    db: &C,
+    mut ids: Vec<Hash>,
+) -> Result<(Vec<Hash>, Vec<String>), DbErr> {
+    if ids.is_empty() {
+        return Ok((ids, Vec::new()));
+    }
+    let query = Query::select()
+        .columns([
+            (delegation::Entity, delegation::Column::Id),
+            (delegation::Entity, delegation::Column::Delegator),
+            (delegation::Entity, delegation::Column::Delegatee),
+        ])
+        .expr_as(
+            Expr::col((
+                delegation_cid_alias::Entity,
+                delegation_cid_alias::Column::Canonical,
+            )),
+            Alias::new("canonical_lock"),
+        )
+        .from(delegation::Entity)
+        .join(
+            JoinType::LeftJoin,
+            delegation_cid_alias::Entity,
+            Expr::col((delegation::Entity, delegation::Column::Id)).equals((
+                delegation_cid_alias::Entity,
+                delegation_cid_alias::Column::Id,
+            )),
+        )
+        .and_where(
+            Expr::col((delegation::Entity, delegation::Column::Id)).is_in(ids.iter().copied()),
+        )
+        .to_owned();
+    let rows = db
+        .query_all(db.get_database_backend().build(&query))
+        .await?;
+    if rows.len() != ids.len() {
+        return Err(DbErr::Custom("authorization-chain-missing".into()));
+    }
+    let mut principals = Vec::with_capacity(rows.len() * 2);
+    let mut aliases = HashMap::with_capacity(rows.len());
+    for row in rows {
+        let id: Hash = row.try_get("", "id")?;
+        if let Some(canonical) = row.try_get::<Option<Hash>>("", "canonical_lock")? {
+            aliases.insert(id, canonical);
+        }
+        for column in ["delegator", "delegatee"] {
+            let did: String = row.try_get("", column)?;
+            principals.push(
+                principal_did(&did)
+                    .map_err(|_| DbErr::Custom("authorization-principal-invalid".into()))?,
+            );
+        }
+    }
+    for id in &mut ids {
+        if let Some(canonical) = aliases.get(id) {
+            *id = *canonical;
+        }
+    }
+    principals.sort_unstable();
+    principals.dedup();
+    Ok((ids, principals))
+}
+
+/// Every signer and audience in a bounded, persisted proof closure. Missing
+/// rows and unparseable principals are authorization failures, not an empty
+/// dependency set. CID identity and DID-principal identity remain separate.
+pub(crate) async fn load_chain_principals<C: ConnectionTrait>(
+    db: &C,
+    roots: &[Hash],
+) -> Result<Vec<String>, ChainTraversalError> {
+    let (ids, _) = load_closure_edges(db, roots).await?;
+    principals_for_ids(db, &ids).await
+}
+
+/// Resolve the signers of an already bounded proof closure without re-running
+/// its recursive query. The invocation request also needs these same IDs to
+/// discover its policy session, so it can share this request-local snapshot.
+pub(crate) async fn principals_for_ids<C: ConnectionTrait>(
+    db: &C,
+    ids: &[Hash],
+) -> Result<Vec<String>, ChainTraversalError> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = delegation::Entity::find()
+        .filter(delegation::Column::Id.is_in(ids.iter().copied()))
+        .all(db)
+        .await?;
+    if rows.len() != ids.len() {
+        return Err(DbErr::Custom("authorization-chain-missing".into()).into());
+    }
+    let mut principals = Vec::with_capacity(rows.len() * 2);
+    for row in rows {
+        for did in [&row.delegator, &row.delegatee] {
+            principals.push(
+                principal_did(did)
+                    .map_err(|_| DbErr::Custom("authorization-principal-invalid".into()))?,
+            );
+        }
+    }
+    principals.sort_unstable();
+    principals.dedup();
+    Ok(principals)
 }
 
 async fn load_closure<C: ConnectionTrait>(

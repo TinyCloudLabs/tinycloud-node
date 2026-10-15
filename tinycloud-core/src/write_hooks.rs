@@ -148,19 +148,30 @@ pub async fn hook_register_authority_holds<C: ConnectionTrait>(
             .expect("valid hooks/register ability"),
         caveats,
     };
+    let holder_principal = match tinycloud_auth::identity::principal_did(holder) {
+        Ok(principal) => principal,
+        Err(_) => return Ok(false),
+    };
+    let scope = [space.to_string()];
     match invocation::authorize_holder(db, holder, &[cap(Caveats(Default::default()))], &[], now)
         .await
     {
-        Ok(()) => return Ok(true),
+        Ok(()) => {
+            let principals = [holder_principal.clone(), space.did().to_string()];
+            return match crate::key_authority::check_principals(db, &principals, &scope).await {
+                Ok(()) => Ok(true),
+                Err(error) if crate::key_authority::is_revoked_error(&error) => Ok(false),
+                Err(error) => Err(error),
+            };
+        }
         Err(invocation::Error::Db(error)) => return Err(error),
         Err(invocation::Error::InvalidInvocation(_)) => {}
     }
-    let principal =
-        tinycloud_auth::identity::principal_did(holder).unwrap_or_else(|_| holder.to_string());
+    let principal = holder_principal.as_str();
     let candidates = delegation::Entity::find()
         .filter(
             Condition::any()
-                .add(delegation::Column::Delegatee.eq(&principal))
+                .add(delegation::Column::Delegatee.eq(principal))
                 .add(delegation::Column::Delegatee.like(format!("{principal}#%")))
                 .add(delegation::Column::Delegatee.eq(holder)),
         )
@@ -219,7 +230,31 @@ pub async fn hook_register_authority_holds<C: ConnectionTrait>(
             )
             .await
             {
-                Ok(()) => return Ok(true),
+                Ok(()) => {
+                    let mut principals =
+                        match crate::auth_graph::load_chain_principals(db, &[candidate.id]).await {
+                            Ok(principals) => principals,
+                            Err(crate::auth_graph::ChainTraversalError::LimitExceeded) => continue,
+                            Err(crate::auth_graph::ChainTraversalError::Db(DbErr::Custom(
+                                reason,
+                            ))) if matches!(
+                                reason.as_str(),
+                                "authorization-chain-missing" | "authorization-principal-invalid"
+                            ) =>
+                            {
+                                continue;
+                            }
+                            Err(crate::auth_graph::ChainTraversalError::Db(error)) => {
+                                return Err(error)
+                            }
+                        };
+                    principals.push(holder_principal.clone());
+                    match crate::key_authority::check_principals(db, &principals, &scope).await {
+                        Ok(()) => return Ok(true),
+                        Err(error) if crate::key_authority::is_revoked_error(&error) => continue,
+                        Err(error) => return Err(error),
+                    }
+                }
                 Err(invocation::Error::Db(error)) => return Err(error),
                 Err(invocation::Error::InvalidInvocation(_)) => {}
             }

@@ -393,11 +393,30 @@ mod tests {
         subscription_id: &str,
         subscriber_did: &str,
     ) -> Result<()> {
+        insert_subscription_in_space(
+            db,
+            encryption,
+            callback_url,
+            subscription_id,
+            subscriber_did,
+            SPACE_ID,
+        )
+        .await
+    }
+
+    async fn insert_subscription_in_space(
+        db: &DatabaseConnection,
+        encryption: &ColumnEncryption,
+        callback_url: &str,
+        subscription_id: &str,
+        subscriber_did: &str,
+        space_id: &str,
+    ) -> Result<()> {
         hook_subscription::Entity::insert(hook_subscription::ActiveModel::from(
             hook_subscription::Model {
                 id: subscription_id.to_string(),
                 subscriber_did: subscriber_did.to_string(),
-                space_id: SPACE_ID.to_string(),
+                space_id: space_id.to_string(),
                 target_service: "kv".to_string(),
                 path_prefix: Some("documents".to_string()),
                 abilities_json: Some(
@@ -421,11 +440,21 @@ mod tests {
         delivery_id: &str,
         attempts: i64,
     ) -> Result<()> {
+        insert_delivery_in_space(db, subscription_id, delivery_id, attempts, SPACE_ID).await
+    }
+
+    async fn insert_delivery_in_space(
+        db: &DatabaseConnection,
+        subscription_id: &str,
+        delivery_id: &str,
+        attempts: i64,
+        space_id: &str,
+    ) -> Result<()> {
         hook_delivery::Entity::insert(hook_delivery::ActiveModel::from(hook_delivery::Model {
             id: delivery_id.to_string(),
             subscription_id: subscription_id.to_string(),
             event_id: delivery_id.replace("delivery", "event"),
-            payload_json: serde_json::json!({"id": "event_01", "space": SPACE_ID}).to_string(),
+            payload_json: serde_json::json!({"id": "event_01", "space": space_id}).to_string(),
             status: tinycloud_core::db::HOOK_DELIVERY_STATUS_PENDING.to_string(),
             attempts,
             next_attempt_at: None,
@@ -650,6 +679,7 @@ mod tests {
     /// subscriber's DID, which only the authority check does.
     mod postgres_connection_loss {
         use super::*;
+        use std::collections::BTreeMap;
         use std::{
             collections::BTreeSet,
             net::SocketAddr,
@@ -658,12 +688,23 @@ mod tests {
                 Arc,
             },
         };
+        use tinycloud_auth::{
+            authorization::{HeaderEncode, TinyCloudDelegation},
+            resolver::DID_METHODS,
+            resource::SpaceId,
+            ssi::{
+                claims::jwt::NumericDate,
+                dids::{DIDBuf, DIDURLBuf},
+                jwk::JWK,
+                ucan::Payload,
+            },
+            ucan_capabilities_object::{Ability, Capabilities},
+        };
+        use tinycloud_core::events::Delegation;
         use tinycloud_core::{
             db_pool::PoolRecoveryStats,
-            hash::hash,
-            models::{abilities, actor, delegation},
+            models::key_revocation,
             sea_orm::{ConnectionTrait, DbBackend, Statement},
-            types::{Ability, Caveats, Resource},
             RecoveringConnection,
         };
         use tokio::{
@@ -777,6 +818,9 @@ mod tests {
             encryption: ColumnEncryption,
             proxy: Proxy,
             holder: String,
+            owner_key: JWK,
+            owner_did: String,
+            space_id: String,
             callback_url: String,
             callbacks: tokio::sync::mpsc::UnboundedReceiver<(String, String, String)>,
         }
@@ -798,9 +842,18 @@ mod tests {
                     .await
                     .unwrap();
 
-                // A holder of `tinycloud.hooks/register` on `kv/documents`
-                // through the space owner's delegation, as in TC-991's tests.
-                let holder = format!("did:key:z6MkTc991Dispatch{unique}");
+                // Register a real owner-signed UCAN grant on this fixture's space.
+                let owner_key = JWK::generate_ed25519().unwrap();
+                let owner_did = DID_METHODS.generate(&owner_key, "key").unwrap().to_string();
+                let space_id = SpaceId::new(
+                    owner_did.parse::<DIDBuf>().unwrap(),
+                    "files".parse().unwrap(),
+                )
+                .to_string();
+                let holder = DID_METHODS
+                    .generate(&JWK::generate_ed25519().unwrap(), "key")
+                    .unwrap()
+                    .to_string();
                 let upstream = Url::parse(url).unwrap();
                 let upstream_addr: SocketAddr = format!(
                     "{}:{}",
@@ -851,7 +904,7 @@ mod tests {
                     .sqlx_logging(false)
                     .set_schema_search_path(schema.clone());
                 let setup = Database::connect(setup_options).await.unwrap();
-                grant_hook_register(&setup, &holder).await;
+                grant_hook_register(&tinycloud, &owner_key, &owner_did, &holder, &space_id).await;
                 let (callback_url, callbacks) =
                     spawn_callback_server(StatusCode::OK).await.unwrap();
 
@@ -864,6 +917,9 @@ mod tests {
                     encryption,
                     proxy,
                     holder,
+                    owner_key,
+                    owner_did,
+                    space_id,
                     callback_url,
                     callbacks,
                 }
@@ -897,16 +953,17 @@ mod tests {
                     self.holder,
                     self.holder.strip_prefix("did:key:").unwrap()
                 );
-                insert_subscription(
+                insert_subscription_in_space(
                     &self.setup,
                     &self.encryption,
                     &self.callback_url,
                     &subscription,
                     &subscriber,
+                    &self.space_id,
                 )
                 .await
                 .unwrap();
-                insert_delivery(&self.setup, &subscription, &delivery, 0)
+                insert_delivery_in_space(&self.setup, &subscription, &delivery, 0, &self.space_id)
                     .await
                     .unwrap();
                 (subscription, delivery)
@@ -1038,50 +1095,263 @@ mod tests {
             }
         }
 
-        async fn grant_hook_register(db: &DatabaseConnection, holder: &str) {
-            let space = SPACE_ID
-                .parse::<tinycloud_auth::resource::SpaceId>()
+        async fn grant_hook_register(
+            tinycloud: &TinyCloud,
+            owner_key: &JWK,
+            owner_did: &str,
+            holder: &str,
+            space_id: &str,
+        ) {
+            let space = space_id.parse::<SpaceId>().unwrap();
+            let resource = space.to_resource(
+                "hooks".parse().unwrap(),
+                Some("kv/documents".parse().unwrap()),
+                None,
+                None,
+            );
+            let mut capabilities = Capabilities::new();
+            capabilities.with_action(
+                resource.as_uri(),
+                "tinycloud.hooks/register".parse::<Ability>().unwrap(),
+                [BTreeMap::<String, serde_json::Value>::new()],
+            );
+            let fragment = owner_did.rsplit_once(':').unwrap().1;
+            let payload = Payload {
+                issuer: format!("{owner_did}#{fragment}")
+                    .parse::<DIDURLBuf>()
+                    .unwrap(),
+                audience: holder.parse::<DIDBuf>().unwrap(),
+                not_before: None,
+                expiration: NumericDate::try_from_seconds(
+                    OffsetDateTime::now_utc().unix_timestamp() as f64 + 3600.0,
+                )
+                .unwrap(),
+                nonce: Some(format!("tc1149-{holder}-{space_id}")),
+                facts: Some(Vec::<serde_json::Value>::new()),
+                proof: vec![],
+                attenuation: capabilities,
+            };
+            let ucan = payload
+                .sign(owner_key.get_algorithm().unwrap_or_default(), owner_key)
                 .unwrap();
-            let owner = space.did().to_string();
-            let now = OffsetDateTime::now_utc();
-            for id in [&owner, &holder.to_string()] {
-                actor::ActiveModel {
-                    id: ActiveValue::Set(id.to_string()),
-                }
-                .insert(db)
+            let header = TinyCloudDelegation::Ucan(Box::new(ucan)).encode().unwrap();
+            let delegation = Delegation::from_header_ser::<TinyCloudDelegation>(&header).unwrap();
+            tinycloud
+                .delegate(delegation)
+                .await
+                .unwrap_or_else(|_| panic!("signed hook grant must persist"));
+        }
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn tc1149_revoked_holder_stops_queued_webhook_but_owner_stays_live() {
+            let Some(url) =
+                postgres_url("tc1149_revoked_holder_stops_queued_webhook_but_owner_stays_live")
+            else {
+                return;
+            };
+            let mut fixture = Fixture::new(&url).await;
+            let dispatcher = fixture.dispatcher();
+            let (subscription, before) = fixture.subscribe("holder_before").await;
+            dispatcher.dispatch_due_once().await.unwrap();
+            fixture.assert_delivered(&before).await;
+
+            let after = "delivery_holder_after";
+            insert_delivery_in_space(&fixture.setup, &subscription, after, 0, &fixture.space_id)
                 .await
                 .unwrap();
+            key_revocation::ActiveModel {
+                target_did: ActiveValue::Set(fixture.holder.clone()),
+                scope_key: ActiveValue::Set("global".to_string()),
+                revoked_at: ActiveValue::Set(OffsetDateTime::now_utc().unix_timestamp()),
             }
-            let id = hash(format!("tc991-dispatch-{holder}").as_bytes());
-            delegation::ActiveModel {
-                id: ActiveValue::Set(id),
-                delegator: ActiveValue::Set(owner),
-                delegatee: ActiveValue::Set(holder.to_string()),
-                expiry: ActiveValue::Set(Some(now + TimeDuration::hours(1))),
-                issued_at: ActiveValue::Set(Some(now)),
-                not_before: ActiveValue::Set(None),
-                facts: ActiveValue::Set(None),
-                serialization: ActiveValue::Set(vec![]),
-            }
-            .insert(db)
+            .insert(&fixture.setup)
             .await
             .unwrap();
-            abilities::ActiveModel {
-                delegation: ActiveValue::Set(id),
-                resource: ActiveValue::Set(Resource::TinyCloud(space.to_resource(
-                    "hooks".parse().unwrap(),
-                    Some("kv/documents".parse().unwrap()),
-                    None,
-                    None,
-                ))),
-                ability: ActiveValue::Set(
-                    Ability::try_from("tinycloud.hooks/register".to_string()).unwrap(),
-                ),
-                caveats: ActiveValue::Set(Caveats::default()),
-            }
-            .insert(db)
+            insert_subscription_in_space(
+                &fixture.setup,
+                &fixture.encryption,
+                &fixture.callback_url,
+                "sub_owner_control",
+                &fixture.owner_did,
+                &fixture.space_id,
+            )
             .await
             .unwrap();
+            insert_delivery_in_space(
+                &fixture.setup,
+                "sub_owner_control",
+                "delivery_owner_control",
+                0,
+                &fixture.space_id,
+            )
+            .await
+            .unwrap();
+
+            dispatcher.dispatch_due_once().await.unwrap();
+            fixture.assert_delivered("delivery_owner_control").await;
+            assert!(
+                fixture.callbacks.try_recv().is_err(),
+                "revoked holder emitted a callback"
+            );
+            let denied = fixture.delivery(after).await;
+            assert_eq!(
+                denied.status,
+                tinycloud_core::db::HOOK_DELIVERY_STATUS_DEAD_LETTER
+            );
+            assert!(!fixture.subscription_active(&subscription).await);
+            fixture.drop_schema().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn tc1149_revoked_owner_root_stops_queued_webhook() {
+            let Some(url) = postgres_url("tc1149_revoked_owner_root_stops_queued_webhook") else {
+                return;
+            };
+            let mut fixture = Fixture::new(&url).await;
+            insert_subscription_in_space(
+                &fixture.setup,
+                &fixture.encryption,
+                &fixture.callback_url,
+                "sub_root",
+                &fixture.owner_did,
+                &fixture.space_id,
+            )
+            .await
+            .unwrap();
+            insert_delivery_in_space(
+                &fixture.setup,
+                "sub_root",
+                "delivery_root_before",
+                0,
+                &fixture.space_id,
+            )
+            .await
+            .unwrap();
+            let dispatcher = fixture.dispatcher();
+            dispatcher.dispatch_due_once().await.unwrap();
+            fixture.assert_delivered("delivery_root_before").await;
+
+            insert_delivery_in_space(
+                &fixture.setup,
+                "sub_root",
+                "delivery_root_after",
+                0,
+                &fixture.space_id,
+            )
+            .await
+            .unwrap();
+            key_revocation::ActiveModel {
+                target_did: ActiveValue::Set(fixture.owner_did.clone()),
+                scope_key: ActiveValue::Set("global".to_string()),
+                revoked_at: ActiveValue::Set(OffsetDateTime::now_utc().unix_timestamp()),
+            }
+            .insert(&fixture.setup)
+            .await
+            .unwrap();
+            dispatcher.dispatch_due_once().await.unwrap();
+            assert!(
+                fixture.callbacks.try_recv().is_err(),
+                "revoked root emitted a callback"
+            );
+            let denied = fixture.delivery("delivery_root_after").await;
+            assert_eq!(
+                denied.status,
+                tinycloud_core::db::HOOK_DELIVERY_STATUS_DEAD_LETTER
+            );
+            assert!(!fixture.subscription_active("sub_root").await);
+            fixture.drop_schema().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn tc1149_space_revocation_stops_only_matching_webhook_space() {
+            let Some(url) =
+                postgres_url("tc1149_space_revocation_stops_only_matching_webhook_space")
+            else {
+                return;
+            };
+            let mut fixture = Fixture::new(&url).await;
+            let other_space = SpaceId::new(
+                fixture.owner_did.parse::<DIDBuf>().unwrap(),
+                "other".parse().unwrap(),
+            )
+            .to_string();
+            grant_hook_register(
+                &fixture.tinycloud,
+                &fixture.owner_key,
+                &fixture.owner_did,
+                &fixture.holder,
+                &other_space,
+            )
+            .await;
+            let (primary, before) = fixture.subscribe("scoped_before").await;
+            let subscriber = format!(
+                "{}#{}",
+                fixture.holder,
+                fixture.holder.strip_prefix("did:key:").unwrap()
+            );
+            insert_subscription_in_space(
+                &fixture.setup,
+                &fixture.encryption,
+                &fixture.callback_url,
+                "sub_other_space",
+                &subscriber,
+                &other_space,
+            )
+            .await
+            .unwrap();
+            let dispatcher = fixture.dispatcher();
+            dispatcher.dispatch_due_once().await.unwrap();
+            fixture.assert_delivered(&before).await;
+            insert_delivery_in_space(
+                &fixture.setup,
+                "sub_other_space",
+                "delivery_other_before",
+                0,
+                &other_space,
+            )
+            .await
+            .unwrap();
+            dispatcher.dispatch_due_once().await.unwrap();
+            fixture.assert_delivered("delivery_other_before").await;
+
+            insert_delivery_in_space(
+                &fixture.setup,
+                &primary,
+                "delivery_scoped_after",
+                0,
+                &fixture.space_id,
+            )
+            .await
+            .unwrap();
+            insert_delivery_in_space(
+                &fixture.setup,
+                "sub_other_space",
+                "delivery_other_after",
+                0,
+                &other_space,
+            )
+            .await
+            .unwrap();
+            key_revocation::ActiveModel {
+                target_did: ActiveValue::Set(fixture.holder.clone()),
+                scope_key: ActiveValue::Set(format!("space:{}", fixture.space_id)),
+                revoked_at: ActiveValue::Set(OffsetDateTime::now_utc().unix_timestamp()),
+            }
+            .insert(&fixture.setup)
+            .await
+            .unwrap();
+            dispatcher.dispatch_due_once().await.unwrap();
+            fixture.assert_delivered("delivery_other_after").await;
+            assert!(
+                fixture.callbacks.try_recv().is_err(),
+                "scoped-revoked holder emitted a callback"
+            );
+            assert_eq!(
+                fixture.delivery("delivery_scoped_after").await.status,
+                tinycloud_core::db::HOOK_DELIVERY_STATUS_DEAD_LETTER
+            );
+            assert!(!fixture.subscription_active(&primary).await);
+            assert!(fixture.subscription_active("sub_other_space").await);
+            fixture.drop_schema().await;
         }
 
         /// (a) Every idle pooled connection is terminated, then one pass

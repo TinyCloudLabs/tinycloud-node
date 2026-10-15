@@ -242,6 +242,15 @@ async fn validate<C: ConnectionTrait>(
             !is_root_authority(c, &delegation.delegator)
         })
         .collect();
+    // A recovery enrollment is a deliberately narrow target- or
+    // space-owner-signed root, not an arbitrary parentless key capability.
+    if delegation.parents.is_empty()
+        && delegation.capabilities.iter().any(is_key_revoke_capability)
+        && (delegation.capabilities.len() != 1
+            || !is_key_recovery_root(&delegation.capabilities[0], &delegation.delegator))
+    {
+        return Err(DelegationError::MissingParents.into());
+    }
 
     match (dependant_caps.is_empty(), delegation.parents.is_empty()) {
         // no dependant caps, no parents needed, must be valid
@@ -786,7 +795,64 @@ async fn ensure_parent_active<C: ConnectionTrait>(db: &C, parent_id: &Hash) -> R
     Ok(())
 }
 
+fn is_key_revoke_capability(cap: &util::Capability) -> bool {
+    cap.ability.as_ref().as_ref() == "tinycloud.key/revoke"
+}
+
+fn is_key_recovery_root(cap: &util::Capability, delegator: &str) -> bool {
+    use crate::models::key_revocation::KeyRevokeScope;
+    use tinycloud_auth::resource::SpaceId;
+
+    if !is_key_revoke_capability(cap) || cap.caveats.0.len() != 1 {
+        return false;
+    }
+    let Resource::Other(uri) = &cap.resource else {
+        return false;
+    };
+    let Some(target) = uri.as_str().strip_prefix("urn:tinycloud:key:") else {
+        return false;
+    };
+    if target.contains(['#', '?', '/'])
+        || tinycloud_auth::identity::canonicalize_did(target)
+            .ok()
+            .as_deref()
+            != Some(target)
+    {
+        return false;
+    }
+    let Some(caveat) = cap.caveats.0.get("0") else {
+        return false;
+    };
+    let Some(scope) = caveat
+        .get("scope")
+        .cloned()
+        .and_then(|scope| serde_json::from_value::<KeyRevokeScope>(scope).ok())
+    else {
+        return false;
+    };
+    if *caveat
+        != serde_json::json!({
+            "version": 1,
+            "targetDid": target,
+            "scope": scope,
+        })
+    {
+        return false;
+    }
+    match scope {
+        KeyRevokeScope::Global => did_principal_matches(target, delegator),
+        KeyRevokeScope::Space { space_id } => space_id
+            .parse::<SpaceId>()
+            .ok()
+            .filter(|space| space.to_string() == space_id)
+            .is_some_and(|space| did_principal_matches(space.did().as_str(), delegator)),
+    }
+}
+
 fn is_root_authority(cap: &util::Capability, delegator: &str) -> bool {
+    if is_key_recovery_root(cap, delegator) {
+        return true;
+    }
     if cap
         .resource
         .space()
