@@ -9,6 +9,7 @@ pub mod backend;
 pub mod canonical;
 pub mod network_id;
 pub mod protocol;
+pub mod resource;
 pub mod service;
 pub mod types;
 
@@ -22,6 +23,7 @@ pub use protocol::{
     NetworkAdminFacts, NetworkAdminInvocation, DECRYPT_ACTION, DECRYPT_REQUEST_TYPE,
     DECRYPT_RESULT_TYPE, NETWORK_ADMIN_TYPE, NETWORK_CREATE_ACTION, NETWORK_REVOKE_ACTION,
 };
+pub use resource::{DecryptResource, DecryptResourceError, ScopedDecryptLocator};
 pub use service::{
     CreateNetworkRequest, EncryptionService, EncryptionServiceError, VerifiedDecrypt,
     WellKnownRecord,

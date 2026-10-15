@@ -117,6 +117,8 @@ fn build_body(ctx: &ClientCtx, net: &NetworkId) -> (DecryptRequestBody, Value) {
         encrypted_symmetric_key_hash: canonical_hash(&Value::String(encrypted_symmetric_key)),
         receiver_public_key: receiver_public_key.clone(),
         receiver_public_key_hash: canonical_hash(&Value::String(receiver_public_key)),
+        space_id: None,
+        path: None,
     };
     let value = serde_json::to_value(&body).unwrap();
     (body, value)
@@ -168,6 +170,15 @@ fn build_session_invocation_info(
     facts: Vec<Value>,
     audience: &str,
 ) -> crate::util::InvocationInfo {
+    build_session_invocation_for_resource(&resource.to_string(), action, facts, audience)
+}
+
+fn build_session_invocation_for_resource(
+    resource: &str,
+    action: &str,
+    facts: Vec<Value>,
+    audience: &str,
+) -> crate::util::InvocationInfo {
     let mut jwk = JWK::generate_ed25519().expect("session jwk");
     jwk.algorithm = Some(Algorithm::EdDSA);
 
@@ -183,8 +194,7 @@ fn build_session_invocation_info(
     verification_method.push('#');
     verification_method.push_str(&fragment);
 
-    let resource_uri: iri_string::types::UriString =
-        resource.to_string().parse().expect("network uri");
+    let resource_uri: iri_string::types::UriString = resource.parse().expect("encryption uri");
     let capability: tinycloud_auth::ucan_capabilities_object::Ability =
         action.to_string().try_into().expect("capability");
     let delegation_cid = Cid::new_v1(0x55, Code::Blake3_256.digest(b"network-session-delegation"));
@@ -224,6 +234,23 @@ fn unwrap_with_secret(secret: &X25519StaticSecret, wrapped: &[u8]) -> Vec<u8> {
     ColumnEncryption::new(*shared.as_bytes())
         .decrypt(&wrapped[32..])
         .expect("decrypt rewrapped key")
+}
+
+#[test]
+fn scoped_decrypt_body_binds_exact_locator_and_rejects_missing_half() {
+    let net = network_id();
+    let ctx = make_client_request(&[0x42; 32]);
+    let (_, mut body) = build_body(&ctx, &net);
+    body["spaceId"] = Value::String(format!(
+        "tinycloud:key:{}:alternate",
+        net.owner_did().strip_prefix("did:key:").unwrap()
+    ));
+    body["path"] = Value::String("vault/secrets/A".into());
+    let scoped: DecryptRequestBody = serde_json::from_value(body.clone()).unwrap();
+    assert!(scoped.resource().unwrap().scope().is_some());
+    body.as_object_mut().unwrap().remove("path");
+    let partial: DecryptRequestBody = serde_json::from_value(body).unwrap();
+    assert!(partial.resource().is_err());
 }
 
 #[tokio::test]
@@ -364,6 +391,36 @@ async fn network_admin_authorized_accepts_session_invoker() {
 }
 
 #[tokio::test]
+async fn scoped_decrypt_resource_never_authorizes_network_admin() {
+    let svc = make_service(fresh_db().await);
+    let net = network_id();
+    let body = serde_json::json!({});
+    let facts = serde_json::to_value(NetworkAdminFacts {
+        ty: NETWORK_ADMIN_TYPE.into(),
+        target_node: NODE_DID.into(),
+        network_id: net.clone(),
+        body_hash: canonical_hash(&body),
+        action: NETWORK_CREATE_ACTION.into(),
+    })
+    .unwrap();
+    let space = format!(
+        "tinycloud:key:{}:alternate",
+        net.owner_did().strip_prefix("did:key:").unwrap()
+    );
+    let invocation = build_session_invocation_for_resource(
+        &scoped_resource(&net, &space, "vault/secrets/A"),
+        NETWORK_CREATE_ACTION,
+        vec![facts],
+        NODE_DID,
+    );
+    assert!(matches!(
+        svc.verify_network_admin_authorized(&net, NETWORK_CREATE_ACTION, &invocation, &body)
+            .await,
+        Err(EncryptionServiceError::NetworkMismatch)
+    ));
+}
+
+#[tokio::test]
 async fn decrypt_round_trip_returns_rewrapped_key() {
     let svc = make_service(fresh_db().await);
     let net = network_id();
@@ -423,7 +480,7 @@ async fn decrypt_authorized_accepts_session_invoker() {
     let invocation = build_session_invocation_info(&net, DECRYPT_ACTION, vec![facts], NODE_DID);
 
     let verified = svc
-        .decrypt_authorized(&net, &invocation, &body_value)
+        .decrypt_authorized(&net, &invocation, &body_value, None)
         .await
         .unwrap();
     let rewrapped = STANDARD
@@ -471,7 +528,7 @@ async fn decrypt_authorized_rejects_audience_mismatch() {
     );
 
     let err = svc
-        .decrypt_authorized(&net, &invocation, &body_value)
+        .decrypt_authorized(&net, &invocation, &body_value, None)
         .await
         .unwrap_err();
     assert!(matches!(err, EncryptionServiceError::AudienceMismatch));
@@ -821,4 +878,175 @@ async fn unique_request_hashes_per_decrypt() {
     let r2 = svc.decrypt(&net, &inv2, &body2).await.unwrap();
 
     assert_ne!(r1.request_hash, r2.request_hash);
+}
+fn scoped_resource(net: &NetworkId, space: &str, path: &str) -> String {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    format!(
+        "{net}/kv/{}/{}",
+        URL_SAFE_NO_PAD.encode(space),
+        URL_SAFE_NO_PAD.encode(path)
+    )
+}
+
+fn tagged_envelope(
+    net: &NetworkId,
+    space: &str,
+    path: &str,
+    ctx: &ClientCtx,
+    ciphertext: &str,
+) -> Value {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let message = format!(
+        "tinycloud.decrypt-scope/v1\n{net}\n{space}\n{path}\n{ALG_X25519_AES256GCM}\n1\n{ciphertext}"
+    );
+    let mut mac = Hmac::<Sha256>::new_from_slice(&ctx.symmetric).unwrap();
+    mac.update(message.as_bytes());
+    serde_json::json!({
+        "v": 1, "networkId": net, "alg": ALG_X25519_AES256GCM,
+        "keyVersion": 1, "encryptedSymmetricKey": STANDARD.encode(&ctx.wrapped_key),
+        "encryptedSymmetricKeyHash": canonical_hash(&Value::String(STANDARD.encode(&ctx.wrapped_key))),
+        "ciphertext": ciphertext, "aad": STANDARD.encode(path),
+        "scopeTag": hex::encode(mac.finalize().into_bytes()),
+        "metadata": {}
+    })
+}
+
+fn scoped_body_and_invocation(
+    net: &NetworkId,
+    space: &str,
+    path: &str,
+    ctx: &ClientCtx,
+    grant_path: &str,
+) -> (Value, crate::util::InvocationInfo) {
+    let (_, mut body) = build_body(ctx, net);
+    body["spaceId"] = Value::String(space.into());
+    body["path"] = Value::String(path.into());
+    let facts = serde_json::to_value(DecryptFacts {
+        ty: DECRYPT_REQUEST_TYPE.into(),
+        target_node: NODE_DID.into(),
+        network_id: net.clone(),
+        body_hash: canonical_hash(&body),
+        encrypted_symmetric_key_hash: body["encryptedSymmetricKeyHash"].as_str().unwrap().into(),
+        receiver_public_key_hash: body["receiverPublicKeyHash"].as_str().unwrap().into(),
+        alg: ALG_X25519_AES256GCM.into(),
+        key_version: 1,
+    })
+    .unwrap();
+    let invocation = build_session_invocation_for_resource(
+        &scoped_resource(net, space, grant_path),
+        DECRYPT_ACTION,
+        vec![facts],
+        NODE_DID,
+    );
+    (body, invocation)
+}
+
+#[tokio::test]
+async fn scoped_decrypt_releases_a_but_not_locally_held_b_or_transplanted_envelopes() {
+    let svc = make_service(fresh_db().await);
+    let net = network_id();
+    let descriptor = svc
+        .create_one_of_one_network(CreateNetworkRequest {
+            name: NETWORK_NAME.into(),
+            owner_did: owner_did(),
+            threshold: Threshold::one_of_one(),
+        })
+        .await
+        .unwrap();
+    let space = format!(
+        "tinycloud:key:{}:alternate",
+        net.owner_did().strip_prefix("did:key:").unwrap()
+    );
+    let a = "vault/secrets/A";
+    let b = "vault/secrets/B";
+    let ctx_a = make_client_request(&descriptor.public_encryption_key);
+    let mut ctx_b = make_client_request(&descriptor.public_encryption_key);
+    ctx_b.symmetric = vec![0xEE; 32];
+    ctx_b.wrapped_key =
+        wrap_to_public_key(&descriptor.public_encryption_key, &ctx_b.symmetric).unwrap();
+    // The replica already has both ciphertexts and envelopes before receiving only A's grant.
+    let stored_a = tagged_envelope(&net, &space, a, &ctx_a, &STANDARD.encode("ciphertext-A"));
+    let stored_b = tagged_envelope(&net, &space, b, &ctx_b, &STANDARD.encode("ciphertext-B"));
+    let (body_a, invocation_a) = scoped_body_and_invocation(&net, &space, a, &ctx_a, a);
+    let released = svc
+        .decrypt_authorized(&net, &invocation_a, &body_a, Some(&stored_a))
+        .await
+        .unwrap();
+    let wrapped = STANDARD.decode(&released.response.wrapped_key).unwrap();
+    assert_eq!(
+        unwrap_with_secret(&ctx_a.receiver_secret, &wrapped),
+        ctx_a.symmetric
+    );
+
+    let (body_b, invocation_b_under_a) = scoped_body_and_invocation(&net, &space, b, &ctx_b, a);
+    assert!(
+        svc.decrypt_authorized(&net, &invocation_b_under_a, &body_b, Some(&stored_b))
+            .await
+            .is_err(),
+        "B key released under only A's grant"
+    );
+
+    // Claim A in the signed body but present B's wrapped key.
+    let (forged_a, forged_invocation) = scoped_body_and_invocation(&net, &space, a, &ctx_b, a);
+    assert!(
+        svc.decrypt_authorized(&net, &forged_invocation, &forged_a, Some(&stored_a))
+            .await
+            .is_err(),
+        "B wrapped key accepted at A"
+    );
+
+    let mut transplanted = stored_b.clone();
+    transplanted["aad"] = stored_a["aad"].clone();
+    let (transplant_body, transplant_invocation) =
+        scoped_body_and_invocation(&net, &space, a, &ctx_b, a);
+    assert!(
+        svc.decrypt_authorized(
+            &net,
+            &transplant_invocation,
+            &transplant_body,
+            Some(&transplanted)
+        )
+        .await
+        .is_err(),
+        "B envelope transplanted at A with edited visible AAD"
+    );
+
+    assert!(
+        svc.decrypt_authorized(&net, &invocation_a, &body_a, None)
+            .await
+            .is_err(),
+        "deleted record released a stale key"
+    );
+    let replaced_a = tagged_envelope(&net, &space, a, &ctx_b, &STANDARD.encode("replacement"));
+    assert!(
+        svc.decrypt_authorized(&net, &invocation_a, &body_a, Some(&replaced_a))
+            .await
+            .is_err(),
+        "stale wrapped key released after replacing A"
+    );
+    let mut untagged = stored_a.clone();
+    untagged.as_object_mut().unwrap().remove("scopeTag");
+    assert!(
+        svc.decrypt_authorized(&net, &invocation_a, &body_a, Some(&untagged))
+            .await
+            .is_err(),
+        "untagged legacy envelope accepted under scoped grant"
+    );
+    let mut uppercase = stored_a.clone();
+    uppercase["scopeTag"] = Value::String(stored_a["scopeTag"].as_str().unwrap().to_uppercase());
+    assert!(
+        svc.decrypt_authorized(&net, &invocation_a, &body_a, Some(&uppercase))
+            .await
+            .is_err(),
+        "noncanonical uppercase scopeTag accepted"
+    );
+    let mut edited_ciphertext = stored_a.clone();
+    edited_ciphertext["ciphertext"] = stored_b["ciphertext"].clone();
+    assert!(
+        svc.decrypt_authorized(&net, &invocation_a, &body_a, Some(&edited_ciphertext))
+            .await
+            .is_err(),
+        "edited ciphertext accepted under A's tag"
+    );
 }

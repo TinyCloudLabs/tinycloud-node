@@ -9649,6 +9649,7 @@ dependencies = [
  "duckdb",
  "futures",
  "hex",
+ "hmac",
  "iri-string",
  "k256",
  "libp2p",
@@ -9758,6 +9759,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "uuid",
+ "x25519-dalek",
  "x509-parser 0.16.0",
 ]
 

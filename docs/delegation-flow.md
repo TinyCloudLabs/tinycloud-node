@@ -672,6 +672,35 @@ export interface CreateDelegationParams {
 4. **Path Scope**: Child path must be within parent path scope
 5. **Actions**: Child actions must be subset of parent actions
 
+## Scoped encryption decrypt grants (TC-755)
+
+`tinycloud.encryption/decrypt` may be delegated on a bare network ID
+(`urn:tinycloud:encryption:<ownerDid>:<networkName>`) or one exact secret:
+`<networkId>/kv/<base64url-no-pad(UTF8 canonical spaceId)>/<base64url-no-pad(UTF8 path)>`.
+The path must be `vault/secrets/<name>` or
+`vault/secrets/scoped/<scope>/<name>`. The space may be any space owned by
+the network owner, including an explicit alternate secrets space. Use the
+canonical space ID on the wire (including EIP-55 address spelling) in the
+resource, signed request body and stored-envelope scope tag; the node does
+not silently substitute the default secrets space.
+
+A bare network decrypt grant covers its own exact scoped children; a scoped
+grant covers only the same space and key. Scoped resources do not grant
+network administration. A scoped decrypt request signs `spaceId` and `path`
+as part of `bodyHash`. Before releasing a key, the node reads the **current**
+KV item at that exact locator with its own storage authority; the delegate
+does not need `tinycloud.kv/get`. The stored envelope must match the network,
+algorithm, key version and wrapped key in the request, and must include a
+lowercase hexadecimal `scopeTag`: HMAC-SHA256 keyed by the unwrapped 32-byte
+secret over UTF8
+`tinycloud.decrypt-scope/v1\n<networkId>\n<spaceId>\n<path>\n<alg>\n<keyVersion>\n<ciphertext>`.
+
+If the current envelope is absent, mismatched or untagged, scoped release is
+denied. Legacy untagged envelopes remain usable only with an explicit bare
+network-wide decrypt grant. Both `/invoke` and the direct decrypt route enforce
+the same guard. Deletion does not revoke keys already released or necessarily
+cancel a release in flight.
+
 ## Summary
 
 The TinyCloud delegation system provides:

@@ -7,6 +7,7 @@
 //! - `POST /encryption/networks/<network_id>/decrypt` — UCAN-style decrypt invocation
 //! - `POST /encryption/networks/<network_id>/revoke`  — admin revoke (placeholder)
 
+use futures::io::AsyncReadExt;
 use rocket::{form::FromForm, http::Status, serde::json::Json, State};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, time::Instant};
@@ -14,8 +15,8 @@ use std::{collections::HashMap, time::Instant};
 use crate::{authorization::AuthHeaderGetter, BlockStage, TinyCloud};
 use tinycloud_core::encryption_network::{
     CreateNetworkRequest, DecryptResponseBody, EncryptionService, EncryptionServiceError,
-    NetworkDescriptor, NetworkId, Threshold, WellKnownRecord, NETWORK_CREATE_ACTION,
-    NETWORK_REVOKE_ACTION,
+    NetworkDescriptor, NetworkId, ScopedDecryptLocator, Threshold, WellKnownRecord,
+    NETWORK_CREATE_ACTION, NETWORK_REVOKE_ACTION,
 };
 use tinycloud_core::{events::Invocation, util::InvocationInfo};
 
@@ -142,6 +143,43 @@ pub async fn well_known_network(
     Ok(Json(WellKnownRecord::from(&descriptor)))
 }
 
+/// Read the current exact KV item with the node's own storage authority. The
+/// caller must validate the signed invocation before using this locator; a
+/// delegate needs decrypt, not a separate KV read grant.
+pub(super) async fn current_decrypt_envelope(
+    tinycloud: &TinyCloud,
+    scope: Option<&ScopedDecryptLocator>,
+) -> Result<Option<serde_json::Value>, (Status, String)> {
+    let Some(scope) = scope else {
+        return Ok(None);
+    };
+    let path = scope
+        .path()
+        .parse()
+        .map_err(|_| (Status::Forbidden, "invalid decrypt scope".into()))?;
+    let (_, _, content) = tinycloud
+        .kv_get(scope.space_id(), &path)
+        .await
+        .map_err(|error| (Status::InternalServerError, error.to_string()))?
+        .ok_or((Status::Forbidden, "scoped secret not found".into()))?;
+    const MAX_ENVELOPE_BYTES: u64 = 10 * 1024 * 1024;
+    if content.len() > MAX_ENVELOPE_BYTES {
+        return Err((Status::Forbidden, "scoped envelope too large".into()));
+    }
+    let mut bytes = Vec::with_capacity(content.len() as usize);
+    content
+        .take(MAX_ENVELOPE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|error| (Status::InternalServerError, error.to_string()))?;
+    if bytes.len() as u64 > MAX_ENVELOPE_BYTES {
+        return Err((Status::Forbidden, "scoped envelope too large".into()));
+    }
+    let stored = serde_json::from_slice(&bytes)
+        .map_err(|_| (Status::Forbidden, "invalid stored envelope".into()))?;
+    Ok(Some(stored))
+}
+
 #[post(
     "/encryption/networks/<network_id>/decrypt",
     format = "json",
@@ -178,9 +216,14 @@ pub async fn decrypt(
                 (Status::BadRequest, e.to_string())
             })?;
     let body = body.into_inner();
+    let resource = service
+        .validate_authorized_decrypt_request(&net, &invocation_info, &body)
+        .await
+        .map_err(map_service_err)?;
+    let stored = current_decrypt_envelope(tinycloud, resource.scope()).await?;
     let decrypt_start = Instant::now();
     let decrypt_result = service
-        .decrypt_authorized(&net, &invocation_info, &body)
+        .decrypt_authorized(&net, &invocation_info, &body, stored.as_ref())
         .await;
     crate::prometheus::observe_span(
         "server.encryption.decrypt_authorized",
@@ -286,6 +329,7 @@ fn map_service_err(err: EncryptionServiceError) -> (Status, String) {
         | EncryptionServiceError::WrongInvocationType
         | EncryptionServiceError::AlgKeyVersionMismatch
         | EncryptionServiceError::HashMismatch(_) => Status::Unauthorized,
+        EncryptionServiceError::ScopeMismatch => Status::Forbidden,
         EncryptionServiceError::NetworkNotActive(_) => Status::Conflict,
         EncryptionServiceError::InvalidBody(_) | EncryptionServiceError::Base64(_) => {
             Status::BadRequest

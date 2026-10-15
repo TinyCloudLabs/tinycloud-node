@@ -29,6 +29,7 @@ use tinycloud_auth::{
     resource::{ResourceId, SpaceId},
 };
 use tinycloud_core::{
+    encryption_network::DecryptResource,
     events::{Delegation, SerializedEvent},
     hash::hash,
     keys::StaticSecret,
@@ -4374,7 +4375,10 @@ fn registration_projections(policy: &Value) -> Result<RegistrationProjections, (
         .get("encryptionNetwork")
         .and_then(Value::as_str)
         .ok_or((Status::BadRequest, "content-source-invalid".into()))?;
-    validate_policy_encryption_resource(encryption_network)?;
+    let source_encryption = parse_policy_encryption_resource(encryption_network)?;
+    if source_encryption.scope().is_some() {
+        return Err((Status::BadRequest, "content-source-invalid".into()));
+    }
 
     let capabilities = object
         .get("capabilityCeiling")
@@ -4449,7 +4453,21 @@ fn registration_projections(policy: &Value) -> Result<RegistrationProjections, (
                     .get("resource")
                     .and_then(Value::as_str)
                     .ok_or((Status::BadRequest, "capability-invalid".into()))?;
-                validate_policy_encryption_resource(resource)?;
+                let ceiling_resource = parse_policy_encryption_resource(resource)?;
+                if let Some(scope) = ceiling_resource.scope() {
+                    let source_contains_path = source_path == scope.path()
+                        || (selector == "prefix"
+                            && scope
+                                .path()
+                                .strip_prefix(source_path.as_str())
+                                .is_some_and(|suffix| suffix.starts_with('/')));
+                    if source_space != scope.space_id().to_string() || !source_contains_path {
+                        return Err((
+                            Status::Forbidden,
+                            "content-source-capability-mismatch".into(),
+                        ));
+                    }
+                }
                 if cap.get("action").and_then(Value::as_str) != Some("tinycloud.encryption/decrypt")
                 {
                     return Err((Status::BadRequest, "capability-invalid".into()));
@@ -4469,7 +4487,7 @@ fn registration_projections(policy: &Value) -> Result<RegistrationProjections, (
                     "path": resource,
                     "actions": ["tinycloud.encryption/decrypt"],
                 }));
-                saw_source_encryption |= resource == encryption_network;
+                saw_source_encryption |= source_encryption.contains(&ceiling_resource);
             }
             _ => return Err((Status::BadRequest, "capability-invalid".into())),
         }
@@ -4569,21 +4587,10 @@ fn parse_policy_kv_resource(value: &str) -> Result<(String, String), (Status, St
     Ok((space.to_owned(), path.to_owned()))
 }
 
-fn validate_policy_encryption_resource(value: &str) -> Result<(), (Status, String)> {
-    let rest = value
-        .strip_prefix("urn:tinycloud:encryption:")
-        .ok_or((Status::BadRequest, "encryption-resource-invalid".into()))?;
-    let (owner, network) = rest
-        .rsplit_once(':')
-        .ok_or((Status::BadRequest, "encryption-resource-invalid".into()))?;
-    if !owner.starts_with("did:")
-        || owner.len() <= 4
-        || network.is_empty()
-        || network.contains([':', '/', '%', '?', '#'])
-    {
-        return Err((Status::BadRequest, "encryption-resource-invalid".into()));
-    }
-    Ok(())
+fn parse_policy_encryption_resource(value: &str) -> Result<DecryptResource, (Status, String)> {
+    value
+        .parse::<DecryptResource>()
+        .map_err(|_| (Status::BadRequest, "encryption-resource-invalid".into()))
 }
 
 fn canonical_policy_actions(
@@ -4698,10 +4705,19 @@ fn validate_requested_policy_capabilities(
                     && object
                         .get("resource")
                         .and_then(Value::as_str)
-                        .is_some_and(|value| validate_policy_encryption_resource(value).is_ok())
-                    && ceiling
-                        .iter()
-                        .any(|entry| canonical_json_value(entry) == canonical_json_value(candidate))
+                        .and_then(|raw| parse_policy_encryption_resource(raw).ok())
+                        .is_some_and(|child| {
+                            ceiling.iter().any(|entry| {
+                                entry.get("kind").and_then(Value::as_str) == Some("encryption")
+                                    && entry.get("action").and_then(Value::as_str)
+                                        == Some("tinycloud.encryption/decrypt")
+                                    && entry
+                                        .get("resource")
+                                        .and_then(Value::as_str)
+                                        .and_then(|raw| parse_policy_encryption_resource(raw).ok())
+                                        .is_some_and(|parent| parent.contains(&child))
+                            })
+                        })
             }
             _ => false,
         };
@@ -4791,6 +4807,18 @@ fn attenuation_caveats_contain(
     child_resource: &str,
     child: &Value,
 ) -> bool {
+    if parent_resource.starts_with("urn:tinycloud:encryption:")
+        || child_resource.starts_with("urn:tinycloud:encryption:")
+    {
+        return canonical_json_value(parent) == canonical_json_value(child)
+            && match (
+                parse_policy_encryption_resource(parent_resource),
+                parse_policy_encryption_resource(child_resource),
+            ) {
+                (Ok(parent), Ok(child)) => parent.contains(&child),
+                _ => false,
+            };
+    }
     if parent_resource == child_resource
         && canonical_json_value(parent) == canonical_json_value(child)
     {
@@ -6791,7 +6819,7 @@ mod tests {
     #[test]
     fn exact_resource_read_only_and_decrypt_denial_matrix_is_fail_closed() {
         let resource = "tinycloud://applications/kv/shares/tc-500/document.txt";
-        let encryption = "urn:tinycloud:encryption:did:key:zPolicyOwner:mainnet";
+        let encryption = "urn:tinycloud:encryption:did:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:mainnet";
         let ceiling = vec![
             json!({
                 "kind": "kv",
@@ -6841,7 +6869,7 @@ mod tests {
             ),
             (
                 "decrypt-resource-mismatch",
-                json!({"kind":"encryption","resource":"urn:tinycloud:encryption:did:key:zPolicyOwner:testnet","action":"tinycloud.encryption/decrypt"}),
+                json!({"kind":"encryption","resource":encryption.replace(":mainnet", ":testnet"),"action":"tinycloud.encryption/decrypt"}),
             ),
         ] {
             assert!(
@@ -6861,6 +6889,77 @@ mod tests {
             .is_err(),
             "accepted decrypt escalation without an encryption ceiling"
         );
+    }
+
+    #[test]
+    fn decrypt_policy_root_ceiling_can_narrow_to_one_secret_not_widen_back() {
+        let root = "urn:tinycloud:encryption:did:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:mainnet";
+        let scoped = format!(
+            "{root}/kv/{}/{}",
+            encode_config(
+                "tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:alternate",
+                URL_SAFE_NO_PAD
+            ),
+            encode_config("vault/secrets/A", URL_SAFE_NO_PAD)
+        );
+        let cap = |resource: &str| {
+            json!({
+                "kind": "encryption", "resource": resource,
+                "action": "tinycloud.encryption/decrypt"
+            })
+        };
+        assert!(validate_requested_policy_capabilities(&[cap(&scoped)], &[cap(root)]).is_ok());
+        assert!(validate_requested_policy_capabilities(&[cap(root)], &[cap(&scoped)]).is_err());
+        let attenuation = |resource: &str| {
+            Value::Object(serde_json::Map::from_iter([(
+                resource.to_string(),
+                json!({"tinycloud.encryption/decrypt": [{}]}),
+            )]))
+        };
+        assert!(attenuation_contains(
+            &attenuation(root),
+            &attenuation(&scoped)
+        ));
+        assert!(!attenuation_contains(
+            &attenuation(&scoped),
+            &attenuation(root)
+        ));
+    }
+
+    #[test]
+    fn scoped_policy_ceiling_must_match_root_source_and_exact_kv_record() {
+        let owner = "did:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
+        let space = "tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:alternate";
+        let root = format!("urn:tinycloud:encryption:{owner}:default");
+        let scoped = format!(
+            "{root}/kv/{}/{}",
+            encode_config(space, URL_SAFE_NO_PAD),
+            encode_config("vault/secrets/A", URL_SAFE_NO_PAD)
+        );
+        let kv = format!("{space}/kv/vault/secrets/A");
+        let mut policy = json!({
+            "contentSource": {
+                "shareId": "share-scoped-A",
+                "kvResource": kv,
+                "selector": "exact",
+                "encryptionNetwork": root,
+                "keyVersion": 1,
+                "mode": "mutable"
+            },
+            "capabilityCeiling": [
+                {"kind": "kv", "resource": kv, "selector": "exact", "actions": ["tinycloud.kv/get"]},
+                {"kind": "encryption", "resource": scoped, "action": "tinycloud.encryption/decrypt"}
+            ]
+        });
+        assert!(registration_projections(&policy).is_ok());
+        let other_kv = format!("{space}/kv/vault/secrets/B");
+        policy["contentSource"]["kvResource"] = json!(other_kv);
+        policy["capabilityCeiling"][0]["resource"] = json!(other_kv);
+        assert!(registration_projections(&policy).is_err());
+        policy["contentSource"]["kvResource"] = json!(kv);
+        policy["capabilityCeiling"][0]["resource"] = json!(kv);
+        policy["contentSource"]["encryptionNetwork"] = json!(scoped);
+        assert!(registration_projections(&policy).is_err());
     }
 
     #[test]
