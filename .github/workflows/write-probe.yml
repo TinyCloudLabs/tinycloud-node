@@ -1,104 +1,264 @@
-# TC-313: Synthetic end-to-end WRITE probe for the prod TinyCloud node.
+# TC-313 + TC-1176: synthetic end-to-end probe for the prod TinyCloud node.
 #
-# WHY: During the 2026-07-27/28 write-degradation incident, /healthz returned
-# 200 in ~300ms while kv.put took 46s and /delegate blew past Cloudflare's 100s
-# ceiling. /healthz and /version never touch the DB or the write path, so
-# uptime monitoring stayed green while writes were down. This probe drives a
-# REAL signed end-to-end write (signIn -> kv.put -> kv.get -> kv.delete) and
-# FAILS the job when any stage is too slow. A failed scheduled job is the alert
-# (GitHub sends failure notifications) -- no new always-on infra.
+# WHY: /healthz and /version never touch the DB, the read path or the write
+# path. On 2026-07-27/28 (TC-313) writes degraded while /healthz stayed green;
+# on 2026-10-14 (TC-1176) signed-in KV reads and SQL hung ~62s (504) for every
+# account while /healthz, /version, 401s and writes stayed green. This probe
+# failed twice during TC-1176 and nobody was paged.
 #
-# OPERATOR SETUP -- set ONE repository secret (Settings -> Secrets and
-# variables -> Actions):
-#   PROBE_PRIVATE_KEY  A hex private key (with or without 0x) for a THROWAWAY
-#                      identity used only by the probe. It operates in its own
-#                      isolated space (prefix "tc313-write-probe"), so it never
-#                      touches user data. Do NOT reuse a real user/prod key.
-# Optional overrides (secrets or repo variables):
-#   PROBE_HOST (default https://node.tinycloud.xyz), PROBE_PREFIX,
-#   PROBE_THRESHOLD_SIGNIN_MS, PROBE_THRESHOLD_PUT_MS,
-#   PROBE_THRESHOLD_GET_MS, PROBE_THRESHOLD_DELETE_MS.
+# WHAT: every 5 minutes, sign in with a throwaway key, read a fixed KV key and a
+# fixed SQL row (hard 20s deadline per stage), then the TC-313 write round-trip.
+# A good read pings the Better Stack heartbeat "Node authorized reads (Write
+# Probe)"; from the 2nd failed read in a row the probe POSTs the heartbeat's
+# /fail URL with one line naming the stage, outcome, duration, node build and
+# UTC time, which pages team@. A missed heartbeat (GitHub not running the
+# schedule) pages after 60 min. Heartbeat as code: tinycloud-dev
+# ops/betterstack/uptime.json.
 #
-# READING A FAILURE: the job log prints one line per stage with its latency and
-# threshold; the slow stage is flagged SLOW. signIn slowness -> /delegate; put/
-# delete slowness -> DB write path. See test/probe/README.md for full details.
+# DENSE MODE (promote watch): `gh workflow run write-probe.yml -f mode=dense`
+# reads every 30s for 5 min, then every 5 min for 60 min, with a 5s threshold.
+# docker.yml dispatches it after every Phala deploy. While it runs, scheduled
+# runs skip so only one probe owns the heartbeat.
 #
-# SLACK (optional, later): if the repo adopts a Slack-notify pattern, add a
-# final step guarded by `if: failure()` posting to a SLACK_WEBHOOK_URL secret
-# (e.g. slackapi/slack-github-action). Keep it separate so a Slack outage never
-# masks the probe verdict.
+# SECRETS (Settings -> Secrets and variables -> Actions):
+#   PROBE_PRIVATE_KEY          hex private key of a THROWAWAY identity used only
+#                              by the probe, in its own space (prefix
+#                              "tc313-write-probe"). Never a real user/prod key.
+#   BETTERSTACK_HEARTBEAT_URL  the heartbeat's secret URL (set by piping
+#                              tinycloud-dev ops/betterstack/apply.ts
+#                              --heartbeat-url into `gh secret set`).
+# Optional overrides (secrets): PROBE_HOST (default https://node.tinycloud.xyz),
+#   PROBE_PREFIX, PROBE_THRESHOLD_PUT_MS, PROBE_THRESHOLD_GET_MS,
+#   PROBE_THRESHOLD_DELETE_MS (write round-trip only).
+#
+# READING A RUN: one log line per stage —
+#   [probe] mode=normal sample=1 stage=kv ms=812 threshold_ms=20000 result=ok outcome="ok"
+# and the job summary tables every sample. See test/probe/README.md.
 
 name: Write Probe
+run-name: >-
+  ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'dense' && 'Write Probe (dense promote watch)'
+  || github.event_name == 'workflow_dispatch' && inputs.force_failure && 'Write Probe (forced failure)'
+  || 'Write Probe' }}
 
 on:
   schedule:
-    # Every 15 minutes. A red run is the alert.
-    - cron: "*/15 * * * *"
-  workflow_dispatch: {}
-
-# Only one probe at a time; never queue a backlog if a run is slow.
-concurrency:
-  group: write-probe
-  cancel-in-progress: false
+    # GitHub delays and drops scheduled runs under load (measured on this
+    # workflow at */15: p50 gap 19 min, max 54 min), hence the heartbeat's
+    # 60 min period+grace. Failed reads alert through /fail regardless.
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "normal: one probe run. dense: promote watch (reads every 30 s for 5 min, then every 5 min for 60 min; 5 s threshold)"
+        type: choice
+        options: [normal, dense]
+        default: normal
+      force_failure:
+        description: "Probe an unresolvable host to exercise the alert path. Two forced runs in a row page team@."
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 jobs:
   probe:
+    if: github.event_name != 'workflow_dispatch' || inputs.mode != 'dense'
     runs-on: ubuntu-latest
-    # Hard wall below Cloudflare's 100s ceiling * a few stages, so a truly hung
-    # write path still fails the job instead of hanging the runner.
+    # Every stage has a 20s deadline, so a hung node can't hold the runner.
     timeout-minutes: 5
+    # Only one normal probe at a time; never queue a backlog. Heartbeat
+    # ownership with the dense job: this job skips while a dense watch is
+    # queued or running, and the dense job waits for running normal runs to
+    # finish before its first sample (separate groups, so a scheduled run can
+    # never cancel a pending dense watch).
+    concurrency:
+      group: write-probe
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      actions: read # to see whether a dense promote watch is queued or running
     defaults:
       run:
         working-directory: test/probe
     steps:
-      # An unconfigured probe must be visibly INACTIVE, not noisily red. Until
-      # an operator sets PROBE_PRIVATE_KEY the scheduled run would fail every 15
-      # minutes on a missing key -- alert fatigue that would bury the real
-      # write-degradation signal this probe exists to surface. Skip cleanly
-      # instead; a configured probe still fails loudly on latency, as intended.
+      # An unconfigured probe must be visibly INACTIVE, not noisily red.
       - name: Check probe is configured
         id: gate
         # Runs before checkout, so override the job's test/probe default.
         working-directory: ${{ github.workspace }}
         env:
           PROBE_PRIVATE_KEY: ${{ secrets.PROBE_PRIVATE_KEY }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           if [ -z "${PROBE_PRIVATE_KEY}" ]; then
             echo "::notice::PROBE_PRIVATE_KEY is not set; skipping. Set it to activate the write probe."
-            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # A queued or running dense watch owns the heartbeat. Fail closed: if
+          # the lookup can't be made, skip this run rather than risk two owners
+          # (a persistent outage of the lookup shows as a missed heartbeat).
+          for attempt in 1 2 3; do
+            if dense="$(gh run list -R "$GITHUB_REPOSITORY" --workflow write-probe.yml --limit 30 \
+              --json displayTitle,status --jq '[.[] | select(.displayTitle == "Write Probe (dense promote watch)" and .status != "completed")] | length')"; then
+              break
+            fi
+            dense=""
+            sleep 5
+          done
+          if [ -z "${dense}" ]; then
+            echo "::warning::Could not check for a dense promote watch; skipping this run."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          elif [ "${dense}" != "0" ]; then
+            echo "::notice::A dense promote watch is queued or running and owns the heartbeat; skipping this run."
+            echo "run=false" >> "$GITHUB_OUTPUT"
           else
-            echo "configured=true" >> "$GITHUB_OUTPUT"
+            echo "run=true" >> "$GITHUB_OUTPUT"
           fi
 
       - uses: actions/checkout@v4
-        if: steps.gate.outputs.configured == 'true'
+        if: steps.gate.outputs.run == 'true'
 
       - uses: actions/setup-node@v4
-        if: steps.gate.outputs.configured == 'true'
+        if: steps.gate.outputs.run == 'true'
         with:
           node-version: "20"
           cache: npm
           cache-dependency-path: test/probe/package-lock.json
 
       - name: Install probe dependencies
-        if: steps.gate.outputs.configured == 'true'
+        if: steps.gate.outputs.run == 'true'
         run: npm install --no-audit --no-fund
 
       - name: Type-check probe
-        if: steps.gate.outputs.configured == 'true'
+        if: steps.gate.outputs.run == 'true'
         run: npm run typecheck
 
-      - name: Run write probe
-        if: steps.gate.outputs.configured == 'true'
+      # The consecutive-failure count survives between runs as a tiny state
+      # file in the Actions cache (the newest entry wins on restore).
+      - name: Restore failure count
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: test/probe/.state
+          key: write-probe-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: write-probe-state-
+
+      - name: Run probe
+        id: probe
+        if: steps.gate.outputs.run == 'true'
         env:
+          PROBE_MODE: normal
+          PROBE_FORCE_FAILURE: ${{ github.event_name == 'workflow_dispatch' && inputs.force_failure }}
           PROBE_PRIVATE_KEY: ${{ secrets.PROBE_PRIVATE_KEY }}
+          BETTERSTACK_HEARTBEAT_URL: ${{ secrets.BETTERSTACK_HEARTBEAT_URL }}
           PROBE_HOST: ${{ secrets.PROBE_HOST }}
           PROBE_PREFIX: ${{ secrets.PROBE_PREFIX }}
-          PROBE_THRESHOLD_SIGNIN_MS: ${{ secrets.PROBE_THRESHOLD_SIGNIN_MS }}
           PROBE_THRESHOLD_PUT_MS: ${{ secrets.PROBE_THRESHOLD_PUT_MS }}
           PROBE_THRESHOLD_GET_MS: ${{ secrets.PROBE_THRESHOLD_GET_MS }}
           PROBE_THRESHOLD_DELETE_MS: ${{ secrets.PROBE_THRESHOLD_DELETE_MS }}
         run: npm run probe
+
+      - name: Save failure count
+        if: always() && steps.gate.outputs.run == 'true' && (steps.probe.outcome == 'success' || steps.probe.outcome == 'failure')
+        uses: actions/cache/save@v4
+        with:
+          path: test/probe/.state
+          key: write-probe-state-${{ github.run_id }}-${{ github.run_attempt }}
+
+  dense:
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'dense'
+    runs-on: ubuntu-latest
+    # Up to 10 min of handover wait, ~66 min of samples, plus setup.
+    timeout-minutes: 85
+    concurrency:
+      group: write-probe-dense
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      actions: read # to wait for running normal probe runs
+    defaults:
+      run:
+        working-directory: test/probe
+    steps:
+      - name: Check probe is configured
+        id: gate
+        working-directory: ${{ github.workspace }}
+        env:
+          PROBE_PRIVATE_KEY: ${{ secrets.PROBE_PRIVATE_KEY }}
+        run: |
+          if [ -z "${PROBE_PRIVATE_KEY}" ]; then
+            echo "::notice::PROBE_PRIVATE_KEY is not set; skipping."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Take over the heartbeat: new normal runs already skip (they see this
+      # run); wait for any normal run that started earlier to finish, so its
+      # final ping or /fail and its state save land before ours. Fail closed:
+      # without a confirmed handover the watch doesn't start (the red run is
+      # the signal to re-dispatch it).
+      - name: Wait for running normal probes
+        if: steps.gate.outputs.run == 'true'
+        working-directory: ${{ github.workspace }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for _ in $(seq 1 40); do
+            if busy="$(gh run list -R "$GITHUB_REPOSITORY" --workflow write-probe.yml --limit 30 \
+              --json databaseId,displayTitle,status \
+              --jq "[.[] | select(.databaseId != ${GITHUB_RUN_ID} and .status == \"in_progress\" and .displayTitle != \"Write Probe (dense promote watch)\")] | length")"; then
+              [ "${busy}" = "0" ] && exit 0
+              echo "waiting for ${busy} running normal probe run(s)"
+            else
+              echo "run lookup failed; retrying"
+            fi
+            sleep 15
+          done
+          echo "::error::No confirmed handover from normal probe runs after 10 min; not starting the watch. Re-dispatch mode=dense."
+          exit 1
+
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.run == 'true'
+
+      - uses: actions/setup-node@v4
+        if: steps.gate.outputs.run == 'true'
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: test/probe/package-lock.json
+
+      - name: Install probe dependencies
+        if: steps.gate.outputs.run == 'true'
+        run: npm install --no-audit --no-fund
+
+      # Same failure state as normal runs, so a streak carries across modes.
+      - name: Restore failure count
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: test/probe/.state
+          key: write-probe-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: write-probe-state-
+
+      - name: Promote watch
+        id: probe
+        if: steps.gate.outputs.run == 'true'
+        env:
+          PROBE_MODE: dense
+          PROBE_FORCE_FAILURE: ${{ inputs.force_failure }}
+          PROBE_PRIVATE_KEY: ${{ secrets.PROBE_PRIVATE_KEY }}
+          BETTERSTACK_HEARTBEAT_URL: ${{ secrets.BETTERSTACK_HEARTBEAT_URL }}
+          PROBE_HOST: ${{ secrets.PROBE_HOST }}
+          PROBE_PREFIX: ${{ secrets.PROBE_PREFIX }}
+        run: npm run probe
+
+      - name: Save failure count
+        if: always() && steps.gate.outputs.run == 'true' && (steps.probe.outcome == 'success' || steps.probe.outcome == 'failure')
+        uses: actions/cache/save@v4
+        with:
+          path: test/probe/.state
+          key: write-probe-state-${{ github.run_id }}-${{ github.run_attempt }}

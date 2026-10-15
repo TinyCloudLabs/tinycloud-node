@@ -6,7 +6,8 @@
   "description": "TC-313 synthetic end-to-end write probe for the TinyCloud prod node.",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "probe": "tsx write-probe.ts"
+    "probe": "tsx write-probe.ts",
+    "test": "tsx --test probe-core.test.ts"
   },
   "dependencies": {
     "@tinycloud/node-sdk": "^2.10.0"
