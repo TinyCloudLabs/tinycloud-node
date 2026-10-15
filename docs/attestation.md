@@ -1,7 +1,17 @@
 # `/attestation` response and verification
 
 `GET /attestation?nonce=<nonce>` returns a fresh TDX quote from the dstack
-guest agent when the node runs in a dstack TEE (`--features dstack`).
+guest agent when the node runs in a dstack TEE (`--features dstack`). The
+optional `nonce` must be 1-64 characters of `A-Z a-z 0-9 - _`; anything else
+gets 400. The endpoint shares the public routes' per-IP rate limit (429).
+
+**The node checks the binding is present; you must verify the quote.** Before
+answering 200, the node parses the returned TDX v4 quote and requires its
+REPORTDATA field (48-byte quote header, then TD report body offset 520; see
+Intel's TDX DCAP Quoting Library API, Appendix A, "Version 4 Quote Format")
+to equal `key_binding_sha256` followed by 32 zero bytes. This is a structural
+check only. The node does not verify the quote's signature, certificate chain
+or TCB status, so a 200 response proves nothing on its own.
 
 ## Response
 
@@ -26,27 +36,34 @@ guest agent when the node runs in a dstack TEE (`--features dstack`).
 - `key_binding_sha256` is the hex SHA-256 of the UTF-8 bytes of
   `key_binding`. The node sends these 32 bytes to dstack `GetQuote`, so the
   quote's 64-byte REPORTDATA is the digest followed by 32 zero bytes.
-- If the node can't produce a quote, or the guest agent reports quoting
-  different report data, the endpoint returns HTTP 503 with a
-  `quote generation failed: ...` message. Earlier releases had no
-  `key_binding_sha256` and answered that case with 200 and
-  `mode: "classic"`.
-- A node outside a TEE still returns 200 with `mode: "classic"`.
+- `timestamp` is the node's clock and is not covered by the quote. A quote
+  requested without a nonce proves no freshness and can be replayed.
+- If the node can't produce a quote, or the quote's REPORTDATA (or the guest
+  agent's echo of it) is not the digest, or the quote is truncated or not a
+  TDX v4 quote, the endpoint returns HTTP 503 `quote generation failed`.
+  Earlier releases had no `key_binding_sha256` and answered quote failures
+  with 200 and `mode: "classic"`.
+- A node outside a TEE returns 200 with `mode: "classic"`. A verifier that
+  expects a TEE must treat that as a failure.
 
 ## Verifying
 
 1. Choose a fresh, unpredictable nonce and request
-   `/attestation?nonce=<nonce>`.
+   `/attestation?nonce=<nonce>`. Reject anything but 200 with
+   `mode: "dstack"`.
 2. Build the expected preimage yourself from the DID you expect and your
    nonce: `xyz.tinycloud.share/tee-key/v1\0:<expected DID>:<nonce>`. Check
    that it equals `key_binding` and that `enforcer_did` is the expected DID.
 3. Compute SHA-256 of the preimage's UTF-8 bytes. It must equal
    `key_binding_sha256`.
-4. Verify the quote (for example with dstack-verifier or Intel DCAP) and
-   read its REPORTDATA from the verified quote, not from the response JSON.
-   REPORTDATA must be the digest followed by 32 zero bytes.
-5. Replay `event_log` against the quote's RTMRs and check `compose_hash` and
-   `app_id` against the measurements you trust.
+4. Verify the quote (for example with dstack-verifier or Intel DCAP),
+   including its TCB status, and read REPORTDATA from the verified quote,
+   not from the response JSON. REPORTDATA must be the digest followed by 32
+   zero bytes.
+5. Check the quote's MRTD and RTMR0-2 against the dstack OS image you trust.
+   Replay `event_log` against RTMR3 and take `compose-hash` and `app-id` from
+   the replayed events, not from the JSON fields; compare them with the
+   release you expect.
 
 The digest only binds what the verifier recomputes in steps 2 and 3, so
 always derive the preimage from your own nonce and expected DID rather than

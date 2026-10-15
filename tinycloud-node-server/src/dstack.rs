@@ -152,16 +152,61 @@ pub async fn get_quote(socket: &str, report_data: &[u8]) -> Result<GetQuoteRespo
     )
     .context("parsing GetQuote response")?;
 
-    // dstack zero-pads report_data to 64 bytes; refuse a quote over anything else.
     let mut expected = report_data.to_vec();
     expected.resize(MAX_REPORT_DATA_BYTES, 0);
-    let quoted = hex::decode(response.report_data.trim_start_matches("0x"))
+    // The agent's echo is a cheap sanity check; the binding that matters is
+    // the REPORTDATA inside the quote itself.
+    let echoed = hex::decode(response.report_data.trim_start_matches("0x"))
         .context("decoding GetQuote report_data")?;
     anyhow::ensure!(
-        quoted == expected,
+        echoed == expected,
         "GetQuote report_data does not match the requested report_data"
     );
+    let quote =
+        hex::decode(response.quote.trim_start_matches("0x")).context("decoding GetQuote quote")?;
+    anyhow::ensure!(
+        quote_report_data(&quote)? == expected.as_slice(),
+        "quote REPORTDATA does not match the requested report_data"
+    );
     Ok(response)
+}
+
+// TDX quote layout, Intel TDX DCAP Quoting Library API, Appendix A
+// ("Version 4 Quote Format"): a 48-byte Quote Header (version u16 LE at 0,
+// TEE type u32 LE at 4, 0x81 for TDX), the 584-byte TD Quote Body, then a
+// u32 LE signature-data length and that many bytes. REPORTDATA is the last
+// 64 bytes of the body (body offset 520). dstack emits version 4 quotes.
+const QUOTE_HEADER_LEN: usize = 48;
+const TD_QUOTE_BODY_LEN: usize = 584;
+const TD_REPORT_DATA_OFFSET: usize = QUOTE_HEADER_LEN + 520;
+const TEE_TYPE_TDX: u32 = 0x81;
+
+/// The REPORTDATA of a structurally complete TDX v4 quote. This checks
+/// layout only; it does not verify the quote's signature or certificates.
+fn quote_report_data(quote: &[u8]) -> Result<&[u8]> {
+    let sig_len_at = QUOTE_HEADER_LEN + TD_QUOTE_BODY_LEN;
+    anyhow::ensure!(
+        quote.len() >= sig_len_at + 4,
+        "quote is truncated ({} bytes)",
+        quote.len()
+    );
+    let version = u16::from_le_bytes([quote[0], quote[1]]);
+    let tee_type = u32::from_le_bytes([quote[4], quote[5], quote[6], quote[7]]);
+    anyhow::ensure!(
+        version == 4 && tee_type == TEE_TYPE_TDX,
+        "unsupported quote: version {version}, TEE type {tee_type:#x}"
+    );
+    let sig_len = u32::from_le_bytes([
+        quote[sig_len_at],
+        quote[sig_len_at + 1],
+        quote[sig_len_at + 2],
+        quote[sig_len_at + 3],
+    ]) as usize;
+    anyhow::ensure!(
+        quote.len() - (sig_len_at + 4) >= sig_len,
+        "quote signature data is truncated"
+    );
+    Ok(&quote[TD_REPORT_DATA_OFFSET..TD_REPORT_DATA_OFFSET + MAX_REPORT_DATA_BYTES])
 }
 
 /// Retrieve TEE instance information.
@@ -200,14 +245,35 @@ pub(crate) mod stub {
         serve(move |_| (status_line, body))
     }
 
-    /// Answer one GetQuote like dstack: a quote whose `report_data` is the
-    /// requested bytes zero-padded to 64.
+    /// A structurally valid TDX v4 quote: 48-byte header (version 4, ECDSA-256
+    /// key type 2, TEE type 0x81), 584-byte TD report body carrying
+    /// `report_data` at body offset 520, then a length-prefixed signature
+    /// section. The signature bytes are filler; nothing here verifies them.
+    pub(crate) fn tdx_quote(report_data: &[u8]) -> Vec<u8> {
+        let mut quote = vec![0u8; 48 + 584];
+        quote[0..2].copy_from_slice(&4u16.to_le_bytes());
+        quote[2..4].copy_from_slice(&2u16.to_le_bytes());
+        quote[4..8].copy_from_slice(&0x81u32.to_le_bytes());
+        quote[48 + 520..48 + 584].copy_from_slice(report_data);
+        quote.extend_from_slice(&64u32.to_le_bytes());
+        quote.extend_from_slice(&[0x5a; 64]);
+        quote
+    }
+
+    /// Answer one GetQuote like dstack: a quote over the requested bytes
+    /// zero-padded to 64, echoed back as `report_data`.
     pub(crate) fn serve_quote() -> Agent {
+        serve_quote_with(|padded| hex::encode(tdx_quote(padded)))
+    }
+
+    /// Like [`serve_quote`], echoing the right `report_data` but answering
+    /// with the hex quote `make` builds from the padded request.
+    pub(crate) fn serve_quote_with(make: impl FnOnce(&[u8]) -> String + Send + 'static) -> Agent {
         serve(|request| {
             let mut padded = requested_report_data(request);
             padded.resize(super::MAX_REPORT_DATA_BYTES, 0);
             let body = serde_json::json!({
-                "quote": "aa",
+                "quote": make(&padded),
                 "event_log": "[]",
                 "report_data": hex::encode(padded),
             });
@@ -258,7 +324,7 @@ mod tests {
         let quote = get_quote(&agent.socket, &[0x42; MAX_REPORT_DATA_BYTES])
             .await
             .unwrap();
-        assert_eq!(quote.quote, "aa");
+        assert_eq!(quote.quote, hex::encode(stub::tdx_quote(&[0x42; 64])));
         assert_eq!(quote.event_log, "[]");
         let sent = stub::requested_report_data(&agent.request.await.unwrap());
         assert_eq!(sent, vec![0x42; MAX_REPORT_DATA_BYTES]);
@@ -292,9 +358,10 @@ mod tests {
     #[tokio::test]
     async fn get_quote_rejects_a_quote_over_different_report_data() {
         let other = hex::encode([0x24u8; MAX_REPORT_DATA_BYTES]);
+        let quote = hex::encode(stub::tdx_quote(&[0x24; 64]));
         let agent = stub::serve_once(
             "200 OK",
-            &format!(r#"{{"quote":"aa","event_log":"[]","report_data":"{other}"}}"#),
+            &format!(r#"{{"quote":"{quote}","event_log":"[]","report_data":"{other}"}}"#),
         );
         let err = get_quote(&agent.socket, &[0x42; 32]).await.unwrap_err();
         assert!(format!("{err:#}").contains("report_data"), "{err:#}");
@@ -303,9 +370,56 @@ mod tests {
 
     #[tokio::test]
     async fn get_quote_rejects_a_quote_without_report_data() {
-        let agent = stub::serve_once("200 OK", r#"{"quote":"aa","event_log":"[]"}"#);
+        let quote = hex::encode(stub::tdx_quote(&[0x42; 64]));
+        let agent = stub::serve_once(
+            "200 OK",
+            &format!(r#"{{"quote":"{quote}","event_log":"[]"}}"#),
+        );
         let err = get_quote(&agent.socket, &[0x42; 32]).await.unwrap_err();
         assert!(format!("{err:#}").contains("report_data"), "{err:#}");
         agent.request.await.unwrap();
+    }
+
+    /// get_quote over 32 bytes of 0x42 against an agent that echoes the right
+    /// report_data but answers with the quote `make` builds.
+    async fn quote_failure(make: impl FnOnce(&[u8]) -> String + Send + 'static) -> String {
+        let agent = stub::serve_quote_with(make);
+        let err = get_quote(&agent.socket, &[0x42; 32]).await.unwrap_err();
+        agent.request.await.unwrap();
+        format!("{err:#}")
+    }
+
+    #[tokio::test]
+    async fn get_quote_rejects_a_quote_whose_reportdata_differs_from_a_matching_echo() {
+        let message = quote_failure(|_| hex::encode(stub::tdx_quote(&[0x24; 64]))).await;
+        assert!(message.contains("REPORTDATA"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn get_quote_rejects_truncated_and_malformed_quotes() {
+        let makers: [fn(&[u8]) -> String; 5] = [
+            // Cut inside REPORTDATA.
+            |padded: &[u8]| hex::encode(&stub::tdx_quote(padded)[..600]),
+            // Body complete, signature section missing.
+            |padded: &[u8]| hex::encode(&stub::tdx_quote(padded)[..632]),
+            // Signature length runs past the end.
+            |padded: &[u8]| {
+                let mut quote = stub::tdx_quote(padded);
+                quote.truncate(quote.len() - 1);
+                hex::encode(quote)
+            },
+            // An SGX (TEE type 0) quote.
+            |padded: &[u8]| {
+                let mut quote = stub::tdx_quote(padded);
+                quote[4] = 0;
+                hex::encode(quote)
+            },
+            // Not hex.
+            |_: &[u8]| "zz".to_owned(),
+        ];
+        for make in makers {
+            let message = quote_failure(make).await;
+            assert!(message.contains("quote"), "{message}");
+        }
     }
 }
