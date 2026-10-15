@@ -768,3 +768,22 @@ jobs:
             echo "${route}: mounted (HTTP ${STATUS})"
             rm -f "${RESPONSE_FILE}"
           done
+
+  # TC-1176: the 2026-10-14 read hang began ~40 min after a promote. After any
+  # Phala deploy attempt (including rollbacks and failed verifications, which
+  # may still have changed prod), start the Write Probe's dense promote watch:
+  # reads every 30 s for 5 min, then every 5 min for 60 min, paging on 2 slow
+  # (>5 s) or failed reads in a row. A separate job so the production-secret
+  # deploy job never holds `actions: write`.
+  promote-watch:
+    runs-on: ubuntu-latest
+    needs: [deploy-phala]
+    if: ${{ always() && needs.deploy-phala.result != 'skipped' && needs.deploy-phala.result != 'cancelled' }}
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Dispatch Write Probe promote watch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run write-probe.yml -R "${GITHUB_REPOSITORY}" --ref main -f mode=dense

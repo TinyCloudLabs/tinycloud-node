@@ -186,6 +186,14 @@ its branch policy before any workflow that names it runs.
      that profile's space. This exercises `/delegate`, `/invoke` KV and SQL.
      Run it with stderr visible (no `2>/dev/null`), so a failing request shows
      its error rather than an empty result.
+4. **Watch.** The `promote-watch` job then dispatches the Write Probe's dense
+   promote watch (TC-1176): signed-in KV and SQL reads every 30 s for 5 min,
+   then every 5 min for 60 min, paging team@ through Better Stack on 2 reads
+   in a row over 5 s or failing. The 2026-10-14 read hang began ~40 min after
+   a promote, which is why it runs for an hour. Check the run titled
+   `Write Probe (dense promote watch)`; to start one by hand:
+   `gh workflow run write-probe.yml -R TinyCloudLabs/tinycloud-node --ref main -f mode=dense`.
+   Details: `test/probe/README.md`.
 
 ## Rolling back
 

@@ -1,53 +1,71 @@
 /**
- * TC-313: Synthetic end-to-end WRITE probe for the TinyCloud prod node.
+ * TC-313 + TC-1176: synthetic end-to-end probe for the TinyCloud prod node.
  *
  * WHY THIS EXISTS
  * ---------------
- * During the 2026-07-27/28 write-degradation incident, `/healthz` kept
- * returning 200 in ~300ms while `kv.put` took 46s and `/delegate` blew past
- * Cloudflare's 100s ceiling. Monitoring was blind because `/healthz` and
- * `/version` never touch the database or the write path. This probe closes
- * that gap: it drives a REAL signed, end-to-end write against the live node
- * and fails (which is the alert) when any stage crosses a latency threshold.
+ * 2026-07-27/28 (TC-313): `/healthz` returned 200 in ~300ms while `kv.put`
+ * took 46s and `/delegate` blew past Cloudflare's 100s ceiling.
+ * 2026-10-14 (TC-1176): signed-in KV reads and SQL hung ~62s (504) for every
+ * account while `/healthz`, `/version`, 401s and writes stayed green. This
+ * probe failed twice during that window and nobody was paged.
  *
- * WHAT IT MEASURES (each stage timed independently)
- * -------------------------------------------------
- *   1. signIn    - SIWE sign-in + delegation activation (the /delegate path
- *                  that was worst-hit in the incident).
- *   2. kv.put    - write a small value.
- *   3. kv.get    - read it back and verify the bytes round-trip.
- *   4. kv.delete - clean up so the probe space never accumulates data.
+ * WHAT IT DOES (normal mode, every scheduled run)
+ * -----------------------------------------------
+ * Read half — the alerting signal. Each stage has a hard 20s client deadline:
+ *   signin  SIWE sign-in + delegation activation
+ *   space   ensure the probe's own space exists (idempotent)
+ *   kv      signed-in read of a fixed key (written once, on first run)
+ *   sql     signed-in `SELECT` of a fixed row (created once, on first run)
+ * A good read pings the Better Stack heartbeat. A failed read is counted in a
+ * state file; from the 2nd failure in a row the probe POSTs the heartbeat's
+ * `/fail` URL with one line naming the stage, outcome, duration, node build
+ * and UTC time (see probe-core.ts `failBody`).
  *
- * THRESHOLDS (see THRESHOLDS_MS below; override via env)
- * ------------------------------------------------------
- *   signIn    > 15s -> fail. The incident showed /delegate as the first thing
- *                      to blow the CF ceiling; 15s is well under the 100s wall
- *                      but far above a healthy (~1-3s) activation.
- *   kv.put    >  5s -> fail. Healthy puts are sub-second; 5s means the write
- *                      path is degrading before users hit a hard failure.
- *   kv.get    >  5s -> fail. Same rationale on the read path.
- *   kv.delete >  5s -> fail. Delete also exercises the write path.
+ * Write half — TC-313's original round-trip (put -> get -> delete), each with
+ * its latency threshold and the same 20s deadline. A breach fails the job
+ * (GitHub e-mail) but does not touch the heartbeat.
  *
- * A non-zero exit fails the GitHub Actions job; a failed scheduled job IS the
- * alert (GitHub emails the configured recipients). No always-on infra added.
+ * DENSE MODE (`PROBE_MODE=dense`, the post-promote watch)
+ * --------------------------------------------------------
+ * Reads every 30s for 5 min, then every 5 min for 60 min; a read over 5s or
+ * any failure counts, 2 in a row POST `/fail`. See probe-core.ts `denseWatch`.
  *
  * IDENTITY / SECRETS
  * ------------------
- * The private key comes from the PROBE_PRIVATE_KEY env var (a GH secret) and
- * is NEVER hardcoded. It must be a THROWAWAY key operating in its own probe
- * space (the PREFIX below) so the probe never reads or writes user data.
+ * PROBE_PRIVATE_KEY (GitHub secret) is a THROWAWAY key operating only in its
+ * own probe space (PREFIX). BETTERSTACK_HEARTBEAT_URL (GitHub secret) is the
+ * heartbeat's secret URL. Neither is ever printed: errors are reduced to a
+ * classified outcome and raw details are redacted.
  */
 
+import { mkdir, readFile, writeFile, appendFile } from "node:fs/promises";
+import { dirname } from "node:path";
 import { TinyCloudNode } from "@tinycloud/node-sdk";
+import {
+  STAGE_DEADLINE_MS,
+  denseWatch,
+  detail,
+  failBody,
+  heartbeatUrl,
+  measure,
+  nodeBuild,
+  parseState,
+  readCheck,
+  report,
+  settle,
+  summaryTable,
+  type Deliver,
+  type ProbeState,
+  type ReadClient,
+  type StageResult,
+} from "./probe-core";
 
 // ---- configuration (env-overridable) ---------------------------------------
 
 // The workflow wires optional overrides straight from secrets/vars, which
 // arrive as EMPTY STRINGS when unset — and `??` only falls back on
-// null/undefined, so `"" ?? default` keeps the empty string. Treat blank
-// (whitespace-only) env values as absent, otherwise HOST/PREFIX go empty
-// (sign-in fails: "Space name cannot be empty") and Number("") coerces every
-// threshold to 0 (instant breach).
+// null/undefined. Treat blank values as absent, otherwise HOST/PREFIX go empty
+// and Number("") coerces every threshold to 0 (instant breach).
 function envStr(name: string, fallback: string): string {
   const v = process.env[name];
   return v !== undefined && v.trim() !== "" ? v : fallback;
@@ -62,135 +80,216 @@ function envMs(name: string, fallback: number): number {
   return n;
 }
 
-const HOST = envStr("PROBE_HOST", "https://node.tinycloud.xyz");
-// Dedicated, isolated space prefix for the probe identity. Never shared with
-// any user-facing app prefix.
+const MODE = envStr("PROBE_MODE", "normal");
+// `force_failure` dispatch input: a host under the reserved .invalid TLD, so
+// the run fails at DNS and exercises the alert path end to end.
+const FORCED_FAILURE_HOST = "https://read-probe-forced-failure.invalid";
+const HOST = envStr("PROBE_FORCE_FAILURE", "") === "true" ? FORCED_FAILURE_HOST : envStr("PROBE_HOST", "https://node.tinycloud.xyz");
+// Dedicated, isolated space prefix for the probe identity.
 const PREFIX = envStr("PROBE_PREFIX", "tc313-write-probe");
+const STATE_FILE = envStr("PROBE_STATE_FILE", ".state/probe-state.json");
 
-const THRESHOLDS_MS = {
-  signIn: envMs("PROBE_THRESHOLD_SIGNIN_MS", 15_000),
+const WRITE_THRESHOLDS_MS = {
   put: envMs("PROBE_THRESHOLD_PUT_MS", 5_000),
   get: envMs("PROBE_THRESHOLD_GET_MS", 5_000),
   delete: envMs("PROBE_THRESHOLD_DELETE_MS", 5_000),
 } as const;
 
-type Stage = keyof typeof THRESHOLDS_MS;
+// The fixed read targets. Written once by the probe itself, then only read.
+const FIXED_KEY = "read-probe/fixed";
+const FIXED_VALUE = "tc1176-read-probe-v1";
+const SQL_SELECT = "SELECT v FROM read_probe WHERE id = 1";
 
-// ---- helpers ---------------------------------------------------------------
-
-interface StageResult {
-  stage: Stage;
-  ms: number;
-  threshold: number;
-  breached: boolean;
-}
-
-async function timed<T>(
-  stage: Stage,
-  fn: () => Promise<T>,
-): Promise<{ value: T; result: StageResult }> {
-  const start = performance.now();
-  const value = await fn();
-  const ms = Math.round(performance.now() - start);
-  const threshold = THRESHOLDS_MS[stage];
-  const breached = ms > threshold;
-  const flag = breached ? "SLOW" : "ok";
-  console.log(
-    `[probe] ${stage.padEnd(8)} ${String(ms).padStart(6)}ms (threshold ${threshold}ms) ${flag}`,
-  );
-  return { value, result: { stage, ms, threshold, breached } };
+class ReadBackMismatch extends Error {
+  constructor(what: string) {
+    super(`${what} read-back did not match the fixed value`);
+    this.name = "ReadBackMismatch";
+  }
 }
 
 type Result<T> = { ok: true; data: T } | { ok: false; error: unknown };
 
-/**
- * Unwrap a Result-typed SDK response. We do NOT swallow errors or add a
- * graceful fallback: a failed KV op must surface loudly and fail the probe,
- * exactly like a threshold breach would.
- */
-function unwrap<T>(label: string, result: Result<T>): T {
-  if (!result.ok) {
-    throw new Error(`[probe] ${label} failed: ${JSON.stringify(result.error)}`);
-  }
+// A failed SDK call surfaces as its ServiceError (code, meta.status, cause),
+// which classify() turns into "HTTP 504", "connection refused", "DNS", ...
+function unwrap<T>(result: Result<T>): T {
+  if (!result.ok) throw result.error;
   return result.data;
 }
 
-// ---- probe -----------------------------------------------------------------
-
-async function main(): Promise<void> {
-  const privateKey = process.env.PROBE_PRIVATE_KEY;
-  if (!privateKey) {
-    throw new Error(
-      "PROBE_PRIVATE_KEY is not set. Set it as a GitHub Actions secret " +
-        "(a throwaway key in its own probe space). See test/probe/README.md.",
-    );
-  }
-
-  console.log(`[probe] target host: ${HOST}`);
-  console.log(`[probe] space prefix: ${PREFIX}`);
-
-  const node = new TinyCloudNode({ privateKey, host: HOST, prefix: PREFIX });
-
-  const key = `probe/${Date.now()}`;
-  const value = `tc313-${Date.now()}`;
-  const results: StageResult[] = [];
-
-  // 1. Sign-in + delegation activation (worst-hit path in the incident).
-  results.push((await timed("signIn", () => node.signIn())).result);
-
-  // 1b. Ensure the probe's own space exists. A brand-new probe identity has no
-  // space yet, so the first write 404s "space not found"; hostOwnedSpace is
-  // idempotent (fast no-op once the space exists) and returns the space id.
-  // This is provisioning, not the steady-state write we alert on, so we time
-  // and log it but do NOT threshold-gate it — a genuine failure throws and
-  // still fails the probe. (Do not branch on the return value: it is the space
-  // id string on success and throws on failure, never a falsy sentinel.)
-  const ensureStart = performance.now();
-  const spaceId = await node.hostOwnedSpace(PREFIX);
-  console.log(
-    `[probe] ${"ensure".padEnd(8)} ${String(Math.round(performance.now() - ensureStart)).padStart(6)}ms -> ${spaceId}`,
-  );
-
-  // 2. Write a small value.
-  results.push(
-    (await timed("put", async () => unwrap("kv.put", await node.kv.put(key, value))))
-      .result,
-  );
-
-  // 3. Read it back and verify the round-trip.
-  const { value: readBack, result: getResult } = await timed("get", async () =>
-    unwrap<{ data: unknown }>("kv.get", await node.kv.get(key)),
-  );
-  results.push(getResult);
-  if (readBack?.data !== value) {
-    throw new Error(
-      `[probe] readback mismatch: wrote ${JSON.stringify(value)} but read ${JSON.stringify(
-        readBack?.data,
-      )}`,
-    );
-  }
-
-  // 4. Clean up.
-  results.push(
-    (await timed("delete", async () => unwrap("kv.delete", await node.kv.delete(key))))
-      .result,
-  );
-
-  // ---- verdict -------------------------------------------------------------
-  const breaches = results.filter((r) => r.breached);
-  if (breaches.length > 0) {
-    console.error(
-      `[probe] FAIL: ${breaches.length} stage(s) exceeded threshold: ` +
-        breaches.map((b) => `${b.stage}=${b.ms}ms>${b.threshold}ms`).join(", "),
-    );
-    process.exit(1);
-  }
-  console.log("[probe] PASS: all stages within thresholds");
+function errorCode(result: Result<unknown>): string | undefined {
+  if (result.ok || !result.error || typeof result.error !== "object" || !("code" in result.error)) return undefined;
+  return typeof result.error.code === "string" ? result.error.code : undefined;
 }
 
-main().catch((err) => {
-  // No graceful fallback: any error (network, auth, mismatch) fails the probe
-  // so the scheduled job goes red and GitHub sends the failure notification.
-  console.error(err instanceof Error ? (err.stack ?? err.message) : String(err));
-  process.exit(1);
-});
+function sdkClient(node: TinyCloudNode): ReadClient {
+  let kvProvisioned = false;
+  let sqlProvisioned = false;
+  return {
+    signIn: () => node.signIn(),
+    ensureSpace: async () => {
+      await node.hostOwnedSpace(PREFIX);
+    },
+    async kvRead() {
+      let got = await node.kv.get(FIXED_KEY);
+      if (errorCode(got) === "KV_NOT_FOUND" && !kvProvisioned) {
+        kvProvisioned = true;
+        unwrap(await node.kv.put(FIXED_KEY, FIXED_VALUE));
+        got = await node.kv.get(FIXED_KEY);
+      }
+      if (unwrap<{ data: unknown }>(got).data !== FIXED_VALUE) throw new ReadBackMismatch("kv");
+    },
+    async sqlRead() {
+      // Rows are arrays of cell values ({ columns, rows: unknown[][], rowCount }).
+      let rows = await node.sql.query<unknown>(SQL_SELECT);
+      const missing = ["SQL_ERROR", "SQL_DATABASE_NOT_FOUND"].includes(errorCode(rows) ?? "") || (rows.ok && rows.data.rowCount === 0);
+      if (missing && !sqlProvisioned) {
+        sqlProvisioned = true;
+        unwrap(await node.sql.execute("CREATE TABLE IF NOT EXISTS read_probe (id INTEGER PRIMARY KEY, v TEXT NOT NULL)"));
+        unwrap(await node.sql.execute("INSERT OR REPLACE INTO read_probe (id, v) VALUES (1, ?)", [FIXED_VALUE]));
+        rows = await node.sql.query<unknown>(SQL_SELECT);
+      }
+      if (unwrap(rows).rows[0]?.[0] !== FIXED_VALUE) throw new ReadBackMismatch("sql");
+    },
+  };
+}
+
+async function writeSummary(markdown: string): Promise<void> {
+  const path = process.env.GITHUB_STEP_SUMMARY;
+  if (path) await appendFile(path, `${markdown}\n`);
+}
+
+// The per-target failure state is shared by normal and dense runs: the Actions
+// cache carries this file from one run to the next, whichever mode it is.
+async function loadState(): Promise<ProbeState> {
+  return parseState(await readFile(STATE_FILE, "utf8").catch(() => undefined));
+}
+async function saveState(state: ProbeState): Promise<void> {
+  await mkdir(dirname(STATE_FILE), { recursive: true });
+  await writeFile(STATE_FILE, `${JSON.stringify(state)}\n`);
+}
+
+// ---- normal (scheduled) run ----------------------------------------------------
+
+async function normalRun(node: TinyCloudNode, client: ReadClient, deliver: Deliver, secrets: string[]): Promise<boolean> {
+  const log = (line: string) => console.log(line);
+  const { results, failure } = await readCheck(client, { log, secrets });
+
+  const settled = await settle(await loadState(), results, Date.now(), deliver);
+  console.log(
+    `[probe] read verdict=${failure ? "fail" : "ok"} failures_kv=${settled.state.failures.kv} failures_sql=${settled.state.failures.sql} heartbeat_action=${settled.action}`,
+  );
+  await saveState(settled.state);
+
+  // Write half (TC-313). Needs a signed-in session in an existing space.
+  const writes: StageResult[] = [];
+  if (!failure || (failure.stage !== "signin" && failure.stage !== "space")) {
+    const key = `probe/${Date.now()}`;
+    const value = `tc313-${Date.now()}`;
+    const stages: [keyof typeof WRITE_THRESHOLDS_MS, () => Promise<unknown>][] = [
+      ["put", async () => unwrap(await node.kv.put(key, value))],
+      [
+        "get",
+        async () => {
+          if (unwrap<{ data: unknown }>(await node.kv.get(key)).data !== value) throw new ReadBackMismatch("write round-trip");
+        },
+      ],
+      ["delete", async () => unwrap(await node.kv.delete(key))],
+    ];
+    for (const [stage, fn] of stages) {
+      const threshold = WRITE_THRESHOLDS_MS[stage];
+      const r = await measure(`write.${stage}`, fn, {
+        slowMs: threshold,
+        onError: (e) => console.log(`[probe] mode=normal sample=1 stage=write.${stage} error: ${detail(e, secrets)}`),
+      });
+      console.log(
+        `[probe] mode=normal sample=1 stage=${r.stage} ms=${r.ms} threshold_ms=${threshold} result=${r.ok ? "ok" : "fail"} outcome="${r.outcome}"`,
+      );
+      writes.push(r);
+      if (!r.ok) break;
+    }
+  }
+
+  const all = [...results, ...writes];
+  await writeSummary(summaryTable("Write Probe (normal)", [{ sample: 1, at: new Date().toISOString(), results: all, ok: all.every((r) => r.ok) }]));
+  const breaches = all.filter((r) => !r.ok);
+  if (breaches.length > 0) {
+    console.error(`[probe] FAIL: ${breaches.map((b) => `${b.stage} ${b.outcome} (${b.ms}ms)`).join(", ")}`);
+    return false;
+  }
+  if (!settled.delivered) {
+    // Healthy reads but Better Stack didn't take the ping: fail the job so the
+    // gap shows before the heartbeat goes "missed".
+    console.error("[probe] FAIL: heartbeat report was not accepted");
+    return false;
+  }
+  console.log("[probe] PASS: reads and writes within thresholds");
+  return true;
+}
+
+// ---- main ----------------------------------------------------------------------
+
+async function main(): Promise<number> {
+  const privateKey = process.env.PROBE_PRIVATE_KEY;
+  if (!privateKey) {
+    console.error("[probe] PROBE_PRIVATE_KEY is not set (a throwaway key in its own probe space). See test/probe/README.md.");
+    return 1;
+  }
+  const mode = MODE === "normal" || MODE === "dense" ? MODE : undefined;
+  if (!mode) {
+    console.error(`[probe] PROBE_MODE must be "normal" or "dense"`);
+    return 1;
+  }
+  const rawHeartbeat = process.env.BETTERSTACK_HEARTBEAT_URL;
+  const secrets = [privateKey, privateKey.replace(/^0x/, ""), rawHeartbeat ?? ""];
+  let hbUrl: URL | undefined;
+  let configOk = true;
+  try {
+    hbUrl = heartbeatUrl(rawHeartbeat);
+  } catch (error) {
+    // The message names the problem, never the value.
+    console.error(`[probe] ${error instanceof Error ? error.message : "invalid BETTERSTACK_HEARTBEAT_URL"}; heartbeat reporting disabled for this run`);
+    configOk = false;
+  }
+  if (hbUrl) secrets.push(hbUrl.pathname.split("/").filter(Boolean).pop() ?? "");
+
+  console.log(`[probe] mode=${MODE} host=${HOST} space_prefix=${PREFIX} stage_deadline_ms=${STAGE_DEADLINE_MS} heartbeat=${hbUrl ? "configured" : "not configured"}`);
+
+  const deliver: Deliver = async (action, failure, consecutive) => {
+    const body =
+      action === "fail" && failure
+        ? failBody({ mode, consecutive, failure, build: await nodeBuild(HOST, fetch), host: new URL(HOST).host, at: new Date() })
+        : undefined;
+    if (body) console.log(`[probe] fail report body: ${body}`);
+    const delivery = await report(action, hbUrl, body, fetch);
+    console.log(`[probe] ${delivery.line}`);
+    return delivery;
+  };
+
+  const node = new TinyCloudNode({ privateKey, host: HOST, prefix: PREFIX });
+  const client = sdkClient(node);
+
+  if (mode === "dense") {
+    const { samples, undelivered } = await denseWatch(client, {
+      log: (line) => console.log(line),
+      secrets,
+      deliver,
+      initialState: await loadState(),
+      onState: saveState,
+    });
+    await writeSummary(summaryTable("Write Probe promote watch (dense)", samples));
+    const failed = samples.filter((s) => !s.ok).length;
+    console.log(`[probe] dense watch done: ${samples.length} samples, ${failed} failed, ${undelivered} heartbeat report(s) not accepted`);
+    return failed === 0 && undelivered === 0 && configOk ? 0 : 1;
+  }
+  return (await normalRun(node, client, deliver, secrets)) && configOk ? 0 : 1;
+}
+
+// Deadlines leave SDK requests running in the background; exit explicitly so a
+// hung request can't keep the process (and the job) alive.
+main().then(
+  (code) => process.exit(code),
+  (err: unknown) => {
+    console.error(`[probe] crashed: ${detail(err, [process.env.PROBE_PRIVATE_KEY ?? "", process.env.BETTERSTACK_HEARTBEAT_URL ?? ""])}`);
+    process.exit(1);
+  },
+);
