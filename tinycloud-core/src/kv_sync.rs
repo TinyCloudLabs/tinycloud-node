@@ -45,7 +45,7 @@ use chacha20poly1305::{
 use rand::{rngs::OsRng, RngCore};
 use sea_orm::{
     entity::prelude::*,
-    sea_query::{Expr, Order, Query, SelectStatement},
+    sea_query::{Expr, ExprTrait, Order, Query, SelectStatement},
     Condition, ConnectionTrait, DbBackend, QueryOrder, QueryResult, QuerySelect, Statement,
 };
 use serde::{Deserialize, Serialize};
@@ -637,6 +637,19 @@ fn position_value(anchor: &KvSyncAnchor) -> Expr {
     ])
 }
 
+fn feed_condition(space: &SpaceId, floor: Option<&KvSyncAnchor>) -> Condition {
+    let mut condition =
+        Condition::all().add(col(current_kv::Column::Space).eq(SpaceIdWrap(space.clone())));
+    if let Some(floor) = floor {
+        condition = condition.add(
+            Condition::any()
+                .add(col(current_kv::Column::Deleted).eq(false))
+                .add(col(current_kv::Column::Seq).gt(floor.seq)),
+        );
+    }
+    condition
+}
+
 /// The rows of `space` inside `prefix`, minus tombstones at or below
 /// `floor.seq`, with the feed's columns.
 fn feed_select(
@@ -645,17 +658,9 @@ fn feed_select(
     prefix: &Path,
     floor: Option<&KvSyncAnchor>,
 ) -> SelectStatement {
-    let mut condition =
-        Condition::all().add(col(current_kv::Column::Space).eq(SpaceIdWrap(space.clone())));
+    let mut condition = feed_condition(space, floor);
     if let Some(prefix) = crate::db::kv_prefix_condition(backend, prefix.as_str()) {
         condition = condition.add(prefix);
-    }
-    if let Some(floor) = floor {
-        condition = condition.add(
-            Condition::any()
-                .add(col(current_kv::Column::Deleted).eq(false))
-                .add(col(current_kv::Column::Seq).gt(floor.seq)),
-        );
     }
     let mut query = Query::select();
     query
@@ -671,6 +676,238 @@ fn feed_select(
         .from(current_kv::Entity)
         .cond_where(condition);
     query
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum KvPrefixProbe {
+    Exact,
+    Descendants,
+}
+
+/// Seek keys in byte order when the sequence-index lookahead is full and
+/// contains no scoped change. Separate exact/descendant queries avoid the
+/// bare-prefix OR plan over an unbounded key range.
+pub(crate) fn kv_sync_probe_statement(
+    backend: DbBackend,
+    space: &SpaceId,
+    prefix: &Path,
+    pos: Option<&KvSyncAnchor>,
+    floor: Option<&KvSyncAnchor>,
+    branch: KvPrefixProbe,
+) -> Statement {
+    let key = col(current_kv::Column::Key);
+    let mut condition = feed_condition(space, floor);
+    condition = match branch {
+        KvPrefixProbe::Exact => {
+            condition.add(crate::db::byte_ordered(backend, key.clone()).eq(prefix.as_str()))
+        }
+        KvPrefixProbe::Descendants => {
+            let (lower, upper, _) =
+                crate::db::kv_prefix_bounds(prefix.as_str()).expect("probe needs a prefix");
+            condition
+                .add(crate::db::byte_ordered(backend, key.clone()).gte(lower))
+                .add(crate::db::byte_ordered(backend, key.clone()).lt(upper))
+        }
+    };
+    if let Some(pos) = pos {
+        condition = condition
+            .add(col(current_kv::Column::Seq).gte(pos.seq))
+            .add(position_columns().gt(position_value(pos)));
+    }
+    let mut query = Query::select();
+    query
+        .expr(Expr::cust("1"))
+        .from(current_kv::Entity)
+        .cond_where(condition)
+        .order_by_expr(crate::db::byte_ordered(backend, key), Order::Asc)
+        .limit(1);
+    backend.build(&query)
+}
+
+fn kv_sync_sequence_window(
+    backend: DbBackend,
+    space: &SpaceId,
+    pos: Option<&KvSyncAnchor>,
+    columns: &[current_kv::Column],
+    limit: u64,
+) -> Statement {
+    let mut window = Query::select();
+    window
+        .columns(columns.iter().cloned())
+        .from(current_kv::Entity)
+        .and_where(col(current_kv::Column::Space).eq(SpaceIdWrap(space.clone())));
+    if let Some(pos) = pos {
+        window
+            .and_where(col(current_kv::Column::Seq).gte(pos.seq))
+            .and_where(position_columns().gt(position_value(pos)));
+    }
+    window
+        .order_by(current_kv::Column::Seq, Order::Asc)
+        .order_by(current_kv::Column::Epoch, Order::Asc)
+        .order_by(current_kv::Column::EpochSeq, Order::Asc)
+        .order_by(current_kv::Column::Key, Order::Asc)
+        .limit(limit);
+    backend.build(&window)
+}
+
+fn kv_sync_window_filter(
+    prefix: &Path,
+    floor: Option<&KvSyncAnchor>,
+    values: &mut Vec<sea_orm::Value>,
+) -> String {
+    let eligibility = floor.map(|floor| {
+        values.push(floor.seq.into());
+        format!("(NOT deleted OR seq > ${})", values.len())
+    });
+    let (lower, upper, bare) =
+        crate::db::kv_prefix_bounds(prefix.as_str()).expect("window needs a prefix");
+    values.push(lower.into());
+    let lower = values.len();
+    values.push(upper.into());
+    let upper = values.len();
+    let descendants = format!(r#"(key COLLATE "C" >= ${lower} AND key COLLATE "C" < ${upper})"#);
+    let scope = if bare {
+        values.push(prefix.as_str().into());
+        format!(r#"(key COLLATE "C" = ${} OR {descendants})"#, values.len())
+    } else {
+        descendants
+    };
+    format!("({} AND {scope})", eligibility.as_deref().unwrap_or("true"))
+}
+
+const KV_SYNC_CANDIDATE_WINDOW: u64 = 64;
+
+/// A bounded sequence-index lookahead before seeking the C-key index. Limit
+/// raw rows *inside* the materialized CTE, then apply scope and floor outside
+/// it: a dense prefix can resume cheaply, while a quiet prefix pays at most
+/// one fixed-size window before the byte-key fallback.
+pub(crate) fn kv_sync_candidate_statement(
+    backend: DbBackend,
+    space: &SpaceId,
+    prefix: &Path,
+    pos: Option<&KvSyncAnchor>,
+    floor: Option<&KvSyncAnchor>,
+) -> Statement {
+    debug_assert_eq!(backend, DbBackend::Postgres);
+    let window = kv_sync_sequence_window(
+        backend,
+        space,
+        pos,
+        &[
+            current_kv::Column::Key,
+            current_kv::Column::Deleted,
+            current_kv::Column::Seq,
+        ],
+        KV_SYNC_CANDIDATE_WINDOW,
+    );
+    let mut values = window.values.map(|values| values.0).unwrap_or_default();
+    let filter = kv_sync_window_filter(prefix, floor, &mut values);
+    Statement::from_sql_and_values(
+        backend,
+        format!(
+            "WITH candidates AS MATERIALIZED ({}) \
+             SELECT count(*) AS seen, \
+             COALESCE(bool_or({filter}), false) AS found \
+             FROM candidates",
+            window.sql
+        ),
+        values,
+    )
+}
+
+/// A bounded feed for dense prefixes. If it yields a full page, or exhausts
+/// the raw sequence window, its rows are the same next page as the normal
+/// feed. Otherwise the caller falls back to the unbounded scoped query.
+pub(crate) fn kv_sync_bounded_feed_statement(
+    backend: DbBackend,
+    space: &SpaceId,
+    prefix: &Path,
+    limit: usize,
+    pos: Option<&KvSyncAnchor>,
+    floor: Option<&KvSyncAnchor>,
+) -> Statement {
+    debug_assert_eq!(backend, DbBackend::Postgres);
+    let window = kv_sync_sequence_window(
+        backend,
+        space,
+        pos,
+        &[
+            current_kv::Column::Key,
+            current_kv::Column::Seq,
+            current_kv::Column::Epoch,
+            current_kv::Column::EpochSeq,
+            current_kv::Column::Value,
+            current_kv::Column::Metadata,
+            current_kv::Column::Deleted,
+        ],
+        limit.saturating_add(1) as u64,
+    );
+    let mut values = window.values.map(|values| values.0).unwrap_or_default();
+    let filter = kv_sync_window_filter(prefix, floor, &mut values);
+    Statement::from_sql_and_values(
+        backend,
+        format!(
+            "WITH candidates AS MATERIALIZED ({}) \
+             SELECT key, seq, epoch, epoch_seq, value, metadata, deleted, \
+             (SELECT count(*) FROM candidates) AS seen \
+             FROM candidates WHERE {filter} \
+             ORDER BY seq, epoch, epoch_seq",
+            window.sql
+        ),
+        values,
+    )
+}
+
+/// Only called for a non-empty PostgreSQL prefix; a bounded sequence-index
+/// window handles dense continuations before the C-key seek handles quiet
+/// prefixes. Other engines and the whole-space feed remain unchanged.
+async fn prefix_has_feed_rows<C: ConnectionTrait>(
+    db: &C,
+    space: &SpaceId,
+    prefix: &Path,
+    pos: Option<&KvSyncAnchor>,
+    floor: Option<&KvSyncAnchor>,
+) -> Result<bool, DbErr> {
+    let backend = db.get_database_backend();
+    let candidate = db
+        .query_one(kv_sync_candidate_statement(
+            backend, space, prefix, pos, floor,
+        ))
+        .await?
+        .ok_or_else(|| DbErr::Custom("missing KV sync candidate aggregate".into()))?;
+    let seen = candidate.try_get::<i64>("", "seen")?;
+    let found = candidate.try_get::<bool>("", "found")?;
+    if found || seen < KV_SYNC_CANDIDATE_WINDOW as i64 {
+        return Ok(found);
+    }
+    // A full window without a match cannot prove the rest of the space quiet.
+    // Seek only this prefix; never advance the cursor past other-space writes.
+    if !prefix.as_str().ends_with('/')
+        && db
+            .query_one(kv_sync_probe_statement(
+                backend,
+                space,
+                prefix,
+                pos,
+                floor,
+                KvPrefixProbe::Exact,
+            ))
+            .await?
+            .is_some()
+    {
+        return Ok(true);
+    }
+    Ok(db
+        .query_one(kv_sync_probe_statement(
+            backend,
+            space,
+            prefix,
+            pos,
+            floor,
+            KvPrefixProbe::Descendants,
+        ))
+        .await?
+        .is_some())
 }
 
 /// The feed query: rows in `prefix` at positions strictly after `pos`, in
@@ -756,7 +993,7 @@ async fn feed_rows<C: ConnectionTrait>(
         .collect()
 }
 
-/// Read one page of the feed for `prefix` (non-empty) in `space`.
+/// Read one page of the feed for `prefix` in `space` (empty means root).
 ///
 /// `state` is `None` on the first page, which anchors a fresh floor at the
 /// space's newest event. Otherwise both the position and floor anchors must
@@ -794,11 +1031,44 @@ pub(crate) async fn kv_sync_page<C: ConnectionTrait>(
     };
     let backend = db.get_database_backend();
     let floor = state.floor.as_ref();
-    let mut rows = feed_rows(
-        db,
-        kv_sync_statement(backend, space, prefix, limit, state.pos.as_ref(), floor),
-    )
-    .await?;
+    if backend == DbBackend::Postgres
+        && !prefix.as_str().is_empty()
+        && !prefix_has_feed_rows(db, space, prefix, state.pos.as_ref(), floor).await?
+    {
+        return Ok((Vec::new(), false, state));
+    }
+    let mut rows = if backend == DbBackend::Postgres && !prefix.as_str().is_empty() {
+        let window = db
+            .query_all(kv_sync_bounded_feed_statement(
+                backend,
+                space,
+                prefix,
+                limit,
+                state.pos.as_ref(),
+                floor,
+            ))
+            .await?;
+        let exhausted = window
+            .first()
+            .map(|row| row.try_get::<i64>("", "seen"))
+            .transpose()?
+            .is_some_and(|seen| seen < limit.saturating_add(1) as i64);
+        if window.len() > limit || exhausted {
+            window.into_iter().map(feed_row).collect::<Result<_, _>>()?
+        } else {
+            feed_rows(
+                db,
+                kv_sync_statement(backend, space, prefix, limit, state.pos.as_ref(), floor),
+            )
+            .await?
+        }
+    } else {
+        feed_rows(
+            db,
+            kv_sync_statement(backend, space, prefix, limit, state.pos.as_ref(), floor),
+        )
+        .await?
+    };
     let more = if rows.len() <= limit {
         false
     } else {
@@ -813,12 +1083,16 @@ pub(crate) async fn kv_sync_page<C: ConnectionTrait>(
                 )
                 .await?,
             );
-            !feed_rows(
-                db,
-                kv_sync_statement(backend, space, prefix, 1, Some(&last), floor),
-            )
-            .await?
-            .is_empty()
+            if backend == DbBackend::Postgres && !prefix.as_str().is_empty() {
+                prefix_has_feed_rows(db, space, prefix, Some(&last), floor).await?
+            } else {
+                !feed_rows(
+                    db,
+                    kv_sync_statement(backend, space, prefix, 1, Some(&last), floor),
+                )
+                .await?
+                .is_empty()
+            }
         } else {
             rows.truncate(limit);
             true
@@ -1250,6 +1524,57 @@ pub(crate) mod tests {
             keys(drain(db.connection(), &owner.space, "notes/", 1, &mut None).await),
             vec!["notes/a", "notes/b/c"]
         );
+    }
+
+    #[tokio::test]
+    async fn kv_sync_quiet_prefix_does_not_expose_other_writes_in_cursor() {
+        let db = sqlite_db().await;
+        let owner = Owner::generate();
+        host(&db, &owner).await;
+        run(&db, &owner, &[Op::Put("quiet/only", b"first")]).await;
+        let prefix = "quiet/".parse().unwrap();
+        let mut request = KvSyncRequest {
+            limit: 10,
+            cursor: None,
+            cursor_key: [7; 32],
+            retention_grant: None,
+        };
+        let (changes, more, cursor) =
+            kv_sync_read(db.connection(), &owner.space, &prefix, &request)
+                .await
+                .unwrap();
+        assert_eq!(changes.len(), 1);
+        assert!(!more);
+        request.cursor = Some(cursor.clone());
+
+        for index in 0..20 {
+            run(
+                &db,
+                &owner,
+                &[Op::Put(&format!("busy/{index}"), b"outside")],
+            )
+            .await;
+        }
+        let (changes, more, after_busy) =
+            kv_sync_read(db.connection(), &owner.space, &prefix, &request)
+                .await
+                .unwrap();
+        assert!(changes.is_empty());
+        assert!(!more);
+        assert_eq!(
+            after_busy, cursor,
+            "outside writes must not change the token"
+        );
+
+        run(&db, &owner, &[Op::Put("quiet/new", b"inside")]).await;
+        let (changes, more, advanced) =
+            kv_sync_read(db.connection(), &owner.space, &prefix, &request)
+                .await
+                .unwrap();
+        assert_eq!(changes[0].key.as_str(), "quiet/new");
+        assert_eq!(changes.len(), 1);
+        assert!(!more);
+        assert_ne!(advanced, cursor);
     }
 
     #[tokio::test]
@@ -2677,6 +3002,223 @@ pub(crate) mod tests {
             }
         });
         (conn, locks)
+    }
+
+    /// Run explicitly against PG18.6 (production engine): this fixture is
+    /// intentionally too large for the normal test suite. The one quiet key
+    /// predates 299,999 busy keys in its space; another space has 300,000 keys.
+    #[tokio::test]
+    #[ignore = "PG18.6 performance fixture: 2 spaces x 300k current_kv rows"]
+    async fn postgres_quiet_prefix_poll_seeks_by_key() {
+        let fixture = PostgresFixture::new("postgres_quiet_prefix_poll_seeks_by_key", 1)
+            .await
+            .expect("TINYCLOUD_TEST_POSTGRES_URL is required");
+        let db = fixture.dbs[0].connection();
+        let quiet = Owner::generate();
+        let other = Owner::generate();
+        host(&fixture.dbs[0], &quiet).await;
+        host(&fixture.dbs[0], &other).await;
+        let epoch = crate::hash::hash(b"tc737 benchmark epoch");
+        for (space, with_quiet) in [(&quiet.space, true), (&other.space, false)] {
+            if with_quiet {
+                db.execute(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "INSERT INTO current_kv (space, key, invocation, seq, epoch, epoch_seq, value, metadata, deleted) \
+                     VALUES ($1, 'quiet/only', $2, 10, $2, 0, $2, '{}', false)",
+                    [SpaceIdWrap(space.clone()).into(), epoch.into()],
+                ))
+                .await
+                .unwrap();
+            }
+            db.execute(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "INSERT INTO current_kv (space, key, invocation, seq, epoch, epoch_seq, value, metadata, deleted) \
+                 SELECT $1, 'busy/' || lpad(n::text, 6, '0'), $2, n + 10, $2, 0, $2, '{}', false \
+                 FROM generate_series(1, $3::integer) AS n",
+                [
+                    SpaceIdWrap(space.clone()).into(),
+                    epoch.into(),
+                    (if with_quiet { 299_999 } else { 300_000 }).into(),
+                ],
+            ))
+            .await
+            .unwrap();
+        }
+        db.execute(Statement::from_string(
+            DbBackend::Postgres,
+            "ANALYZE current_kv",
+        ))
+        .await
+        .unwrap();
+        let statement = kv_sync_statement(
+            DbBackend::Postgres,
+            &quiet.space,
+            &"quiet/".parse().unwrap(),
+            500,
+            Some(&KvSyncAnchor {
+                seq: 10,
+                epoch,
+                epoch_seq: 0,
+            }),
+            None,
+        );
+        use sea_orm_migration::{MigrationTrait, SchemaManager};
+
+        let explain_sql = format!("EXPLAIN (ANALYZE, BUFFERS) {}", statement.sql);
+        let values = statement.values.map(|values| values.0).unwrap_or_default();
+        db.execute_unprepared("DROP INDEX CONCURRENTLY idx_current_kv_space_key_c")
+            .await
+            .unwrap();
+        let baseline = db
+            .query_all(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                explain_sql,
+                values,
+            ))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.try_get_by_index::<String>(0).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        println!("TC-737 PostgreSQL pre-index quiet-prefix poll (2 x 300k):\n{baseline}");
+        let build_db = db.clone();
+        let build = tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            crate::migrations::m20261015_010000_current_kv_prefix_index::Migration
+                .up(&SchemaManager::new(&build_db))
+                .await
+                .unwrap();
+            started.elapsed()
+        });
+        let active = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if build.is_finished() {
+                    break false;
+                }
+                let progress = db
+                    .query_one(Statement::from_string(
+                        DbBackend::Postgres,
+                        "SELECT 1 AS active FROM pg_stat_progress_create_index \
+                         WHERE relid = 'current_kv'::regclass",
+                    ))
+                    .await
+                    .unwrap();
+                if progress.is_some() {
+                    break true;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(active, "index build finished before lock sampling");
+        let locks = db
+            .query_all(Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT mode FROM pg_locks WHERE relation = 'current_kv'::regclass \
+                 AND pid IN (SELECT pid FROM pg_stat_progress_create_index \
+                             WHERE relid = 'current_kv'::regclass)",
+            ))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.try_get::<String>("", "mode").unwrap())
+            .collect::<Vec<_>>();
+        println!("TC-737 concurrent index table locks: {locks:?}");
+        assert!(
+            !locks
+                .iter()
+                .any(|mode| mode == "ShareLock" || mode == "AccessExclusiveLock"),
+            "index build took a write-blocking lock: {locks:?}"
+        );
+        let mut reads = 0;
+        let mut writes = 0;
+        let mut max_read = std::time::Duration::ZERO;
+        let mut max_write = std::time::Duration::ZERO;
+        while !build.is_finished() && writes < 10 {
+            let started = std::time::Instant::now();
+            let row = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                db.query_one(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "SELECT key FROM current_kv WHERE space = $1 AND key = 'busy/000001'",
+                    [SpaceIdWrap(quiet.space.clone()).into()],
+                )),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(row.is_some());
+            max_read = max_read.max(started.elapsed());
+            reads += 1;
+            let started = std::time::Instant::now();
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                db.execute(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "UPDATE current_kv SET metadata = '{}' WHERE space = $1 \
+                     AND key = 'busy/000001'",
+                    [SpaceIdWrap(quiet.space.clone()).into()],
+                )),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(result.rows_affected(), 1);
+            max_write = max_write.max(started.elapsed());
+            writes += 1;
+        }
+        let build_time = build.await.unwrap();
+        println!(
+            "TC-737 concurrent index build: {build_time:?}; \
+             during build: {reads} reads (max {max_read:?}), \
+             {writes} writes (max {max_write:?})"
+        );
+        assert!(
+            reads > 0 && writes > 0,
+            "no read/write overlap with index build"
+        );
+        let statement = kv_sync_probe_statement(
+            DbBackend::Postgres,
+            &quiet.space,
+            &"quiet/".parse().unwrap(),
+            Some(&KvSyncAnchor {
+                seq: 10,
+                epoch,
+                epoch_seq: 0,
+            }),
+            None,
+            KvPrefixProbe::Descendants,
+        );
+        let explain_sql = format!("EXPLAIN (ANALYZE, BUFFERS) {}", statement.sql);
+        let values = statement.values.map(|values| values.0).unwrap_or_default();
+        let plan = db
+            .query_all(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                explain_sql,
+                values,
+            ))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.try_get_by_index::<String>(0).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        println!("TC-737 PostgreSQL quiet-prefix poll (2 x 300k):\n{plan}");
+        assert!(
+            plan.contains("idx_current_kv_space_key_c") && plan.contains("Index Cond:"),
+            "quiet-prefix poll must seek by key, not scan newer space changes:\n{plan}"
+        );
+        let filtered = plan
+            .lines()
+            .filter_map(|line| line.split("Rows Removed by Filter: ").nth(1))
+            .map(|count| count.trim().parse::<usize>().unwrap())
+            .sum::<usize>();
+        assert!(
+            filtered <= 10,
+            "quiet-prefix poll filtered {filtered} rows:\n{plan}"
+        );
     }
 
     /// Keys the transaction already holds are not asked for again; the
