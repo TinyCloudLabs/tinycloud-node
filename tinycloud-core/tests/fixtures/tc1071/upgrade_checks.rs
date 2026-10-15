@@ -1,4 +1,5 @@
 use super::*;
+use sea_orm_migration::{MigrationTrait, MigratorTrait};
 use tinycloud_core::{
     db::InvocationOutcome, encryption::ColumnEncryption, events::Delegation, hash::hash,
 };
@@ -34,6 +35,58 @@ fn assert_aliases(path: &Path, fixture: &Fixture) {
                 "alias must use exactly the current ingestion decoder bytes"
             );
         }
+    }
+}
+
+struct BeforeAliasMigrator;
+
+#[async_trait::async_trait]
+impl MigratorTrait for BeforeAliasMigrator {
+    fn migrations() -> Vec<Box<dyn MigrationTrait>> {
+        tinycloud_core::migrations::Migrator::migrations()
+            .into_iter()
+            .filter(|migration| migration.name() != "m20261014_000000_delegation_cid_alias")
+            .collect()
+    }
+}
+
+#[tokio::test]
+async fn later_schema_upgrade_preserves_revoked_historical_grants() {
+    for fixture in fixtures().into_iter().filter(|fixture| {
+        matches!(
+            fixture.database.as_str(),
+            "revoked-v0.sqlite" | "revoked-v27.sqlite"
+        )
+    }) {
+        let (_directory, path) = copy_database(&fixture);
+        let before = signed_snapshot(&path);
+        let connection = connection(&path).await;
+        BeforeAliasMigrator::up(&connection, None).await.unwrap();
+        assert!(
+            connection
+                .query_one(Statement::from_string(
+                    DbBackend::Sqlite,
+                    "SELECT version FROM seaql_migrations WHERE version = 'm20261015_000000_delegation_cursor_index'".to_string(),
+                ))
+                .await
+                .unwrap()
+                .is_some(),
+            "exercise an already-applied later migration before alias backfill"
+        );
+        drop(connection);
+
+        let db = open(&path).await;
+        assert_eq!(signed_snapshot(&path), before);
+        assert_signed_rows_untouched(&db, &fixture).await;
+        assert_aliases(&path, &fixture);
+        assert_denied(&db, &fixture).await;
+        for row in &fixture.rows {
+            register(&db, &row.header).await;
+        }
+        assert_denied(&db, &fixture).await;
+        drop(db);
+        let db = open(&path).await;
+        assert_denied(&db, &fixture).await;
     }
 }
 

@@ -57,8 +57,13 @@ pub enum AttestationResponse {
         app_id: String,
         /// DID whose public key is bound to this attested instance.
         enforcer_did: String,
-        /// The report-data binding input used for the quote.
+        /// The quote's binding preimage:
+        /// `xyz.tinycloud.share/tee-key/v1\0:<enforcer_did>:<nonce or empty>`,
+        /// where `\0` is the two characters backslash and zero.
         key_binding: String,
+        /// Hex SHA-256 of `key_binding`'s UTF-8 bytes. The quote's 64-byte
+        /// REPORTDATA is these 32 bytes followed by 32 zero bytes.
+        key_binding_sha256: String,
         /// ISO 8601 timestamp
         timestamp: String,
     },
