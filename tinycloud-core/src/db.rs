@@ -7698,6 +7698,46 @@ mod test {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn first_use_expiry_while_waiting_for_target_guard_does_not_commit_a_cutoff() {
+        let db = get_db().await.unwrap();
+        let target = "did:key:waited-out-key-revoke".to_owned();
+        let key = crate::key_authority::principal_lock_id(&target).unwrap();
+        let in_flight = db.acquire_shared_chain_guards_for_keys(vec![key]).await;
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let request = key_revocation::VerifiedKeyRevoke {
+            target_did: target.clone(),
+            issuer_did: target.clone(),
+            scope: key_revocation::KeyRevokeScope::Global,
+            nonce: "waited-out-key-revoke".into(),
+            authorization_hash: [9; 32],
+            proof_cids: Vec::new(),
+            not_before: now,
+            valid_after: None,
+            expires_at: now + 1,
+        };
+        let revoking = db.clone();
+        let pending = tokio::spawn(async move { revoking.revoke_key(request).await });
+        settle().await;
+        assert!(
+            !pending.is_finished(),
+            "the target guard must block the revoke"
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        drop(in_flight);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), pending)
+            .await
+            .expect("expired revoke finishes")
+            .unwrap();
+        assert!(matches!(
+            result,
+            Err(key_revocation::KeyRevokeError::Forbidden)
+        ));
+        crate::key_authority::check_principals(&db.conn, &[target], &[])
+            .await
+            .expect("no cutoff was committed after first-use expiry");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn key_cutoff_serializes_across_connections_and_survives_restart() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("key-cutoff.db");
