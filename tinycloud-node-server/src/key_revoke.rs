@@ -7,6 +7,7 @@ use tinycloud_auth::{
     identity::{canonicalize_did, principal_did},
     resource::SpaceId,
     siwe_recap::Capability as SiweRecap,
+    ssi::dids::DID,
 };
 use tinycloud_core::{
     encryption_network::EncryptionService,
@@ -37,6 +38,7 @@ async fn verify_request(
         || target_did
             .bytes()
             .any(|byte| matches!(byte, b'#' | b'?' | b'/'))
+        || DID::new(&target_did).is_err()
         || canonicalize_did(&target_did).ok().as_deref() != Some(&target_did)
     {
         return Err(MALFORMED);

@@ -516,6 +516,9 @@ enrolled global recovery delegate. A space owner or its scoped recovery
 delegate may revoke a key only in that owner's space. Generic `/revoke`
 continues to revoke a single delegation CID, not a whole key.
 
+`targetDid` must be a canonical DID with valid DID syntax, not a DID URL
+or a delegation CID; an empty method-specific ID is rejected.
+
 The committed response includes the target, scope, and original cutoff.
 Repeating the exact signed request returns the same receipt even after the
 signer is revoked; another request using its nonce cannot alter that cutoff.
