@@ -37,10 +37,12 @@ NAME_VECTOR_NETWORKS='{"logship":{}}'
 NAME_NETWORK_CONTAINERS='{"sender-id":{"Name":"tinycloud"},"peer-id":{"Name":"other"}}'
 NAME_SENDER_METADATA='{"name":"/tinycloud-container","hostname":"tinycloud-host","service":"tinycloud","networks":{"default":{"Aliases":["tinycloud"],"DNSNames":["tinycloud-container"]}}}'
 NAME_PEER_METADATA='{"name":"/other","hostname":"other-host","service":"other","networks":{"default":{"Aliases":["other"],"DNSNames":["other"]}}}'
-NAME_HOSTS='127.0.0.1 localhost'
+NAME_TARGET_HOSTNAME=tinycloud-container
+NAME_HOSTS='127.0.0.1 localhost tinycloud-container'
 NAME_INSPECT_FAIL=0
 NAME_NETWORK_INSPECT_FAIL=0
-NAME_HOSTS_FAIL=0
+NAME_HOSTS_RUN_FAIL=0
+NAME_HOST_READ_TRACE_FILE=""
 NAME_RESOLVER_MODE=ok
 NAME_RESOLVER_NETWORK_FILE=""
 docker_cmd() {
@@ -53,6 +55,10 @@ docker_cmd() {
     case "$1" in
       inspect)
         if (( NAME_INSPECT_FAIL )); then return 1; fi
+        if [[ "${3:-}" == '{{.Config.Hostname}}' ]]; then
+          printf '%s\n' "$NAME_TARGET_HOSTNAME"
+          return 0
+        fi
         if [[ "${3:-}" == '{{json .NetworkSettings.Networks}}' ]]; then
           if [[ "${4:-}" == "$NAME_SENDER_ID" ]]; then printf '%s\n' "$NAME_SENDER_NETWORKS"
           elif [[ "${4:-}" == "$VECTOR_ID" ]]; then printf '%s\n' "$NAME_VECTOR_NETWORKS"
@@ -73,17 +79,27 @@ docker_cmd() {
         return 0
         ;;
       exec)
-        if (( NAME_HOSTS_FAIL )); then return 1; fi
-        [[ "${2:-}" == "$NAME_SENDER_ID" && "${3:-}" == cat && "${4:-}" == /etc/hosts ]] || return 1
-        printf '%s\n' "$NAME_HOSTS"
-        return 0
+        printf '%s\n' exec >>"$NAME_HOST_READ_TRACE_FILE"
+        return 1
         ;;
       timeout)
+        if [[ "${12:-}" == cat && "${13:-}" == /etc/hosts ]]; then
+          printf 'run:%s\n' "${10#container:}" >>"$NAME_HOST_READ_TRACE_FILE"
+          if [[ "$1" != timeout || "$2" != 60 || "$3" != run || "$4" != --rm ||
+                "$5" != --label || "$6" != "com.docker.compose.project=${PROJECT:-tc959-isolation-test}" ||
+                "$7" != --label || "$8" != tc959.probe=true || "$9" != --network ||
+                "${10:-}" != "container:$NAME_SENDER_ID" ||
+                "${11:-}" != node:20-alpine@sha256:fb4cd12c85ee03686f6af5362a0b0d56d50c58a04632e6c0fb8363f609372293 ]]; then
+            return 125
+          fi
+          (( NAME_HOSTS_RUN_FAIL == 0 )) || return 1
+          printf '%s\n' "$NAME_HOSTS"
+          return 0
+        fi
         if [[ -n "$NAME_RESOLVER_NETWORK_FILE" ]]; then
           for arg in "$@"; do
             if [[ "$arg" == "container:$NAME_SENDER_ID" ]]; then printf '%s\n' "$arg" >"$NAME_RESOLVER_NETWORK_FILE"; fi
           done
-
         fi
         case "$NAME_RESOLVER_MODE" in
           ok) printf '%s\n' GELF_RESOLVER_OK; return 0 ;;
@@ -153,10 +169,12 @@ prepare_name_probe() {
   NAME_NETWORK_CONTAINERS='{"sender-id":{"Name":"tinycloud"},"peer-id":{"Name":"other"}}'
   NAME_SENDER_METADATA='{"name":"/tinycloud-container","hostname":"tinycloud-host","service":"tinycloud","networks":{"default":{"Aliases":["tinycloud"],"DNSNames":["tinycloud-container"]}}}'
   NAME_PEER_METADATA='{"name":"/other","hostname":"other-host","service":"other","networks":{"default":{"Aliases":["other"],"DNSNames":["other"]}}}'
-  NAME_HOSTS='127.0.0.1 localhost'
+  NAME_TARGET_HOSTNAME=tinycloud-container
+  NAME_HOSTS='127.0.0.1 localhost tinycloud-container'
   NAME_INSPECT_FAIL=0
   NAME_NETWORK_INSPECT_FAIL=0
-  NAME_HOSTS_FAIL=0
+  NAME_HOSTS_RUN_FAIL=0
+  NAME_HOST_READ_TRACE_FILE="$CONTROL/host-read-trace"
   NAME_RESOLVER_MODE=ok
   NAME_RESOLVER_NETWORK_FILE="$CONTROL/resolver-network"
   SENDER_EXIT=1
@@ -167,6 +185,7 @@ prepare_name_probe() {
   SHIPPED_NAME_SAMPLES=('[]' '[]')
   RECORD_LINES=()
   : >"$NAME_RESOLVER_NETWORK_FILE"
+  : >"$NAME_HOST_READ_TRACE_FILE"
   reset_fixtures
 }
 
@@ -311,8 +330,9 @@ prepare_name_probe
 assert_isolated_probe 'vector name with transient DNS errors' container "container:$NAME_SENDER_ID" vector "$NAME_SENDER_ID"
 assert_eq "$SEND_COUNT" 3
 assert_eq "$(<"$NAME_RESOLVER_NETWORK_FILE")" "container:$NAME_SENDER_ID"
-[[ "${RECORD_LINES[*]}" == *"name unresolvable (EAI_AGAIN); structural: sender_networks=default vector_networks=logship shared_networks=0 alias_matches=0 hosts_entry=0 resolver_control=ok error_code=EAI_AGAIN"* ]] || fail "name proof did not report safe structural evidence: ${RECORD_LINES[*]}"
+[[ "${RECORD_LINES[*]}" == *"name unresolvable (EAI_AGAIN); structural: sender_networks=default vector_networks=logship shared_networks=0 alias_matches=0 hosts_entry=0 target_hostname=present resolver_control=ok error_code=EAI_AGAIN"* ]] || fail "name proof did not report safe structural evidence: ${RECORD_LINES[*]}"
 [[ "${RECORD_LINES[*]}" == *"fresh source +0 and shipped +0"* ]] || fail "name proof passed without zero traffic deltas"
+assert_eq "$(<"$NAME_HOST_READ_TRACE_FILE")" "run:$NAME_SENDER_ID"
 
 prepare_name_probe
 SENDER_OUTPUT='GELF_SEND_ERROR code=ENOTFOUND'
@@ -344,15 +364,19 @@ NAME_PEER_METADATA='{"name":"/peer","hostname":"peer-host","service":"peer","net
 expect_name_proof_failure 'alias_matches=1'
 
 prepare_name_probe
-NAME_HOSTS_FAIL=1
+NAME_HOSTS_RUN_FAIL=1
 expect_name_proof_failure 'hosts_entry=unreadable'
 
 prepare_name_probe
-NAME_HOSTS='127.0.0.1 localhost host.docker.internal'
+NAME_HOSTS='127.0.0.1 localhost'
+expect_name_proof_failure 'target_hostname=missing'
+
+prepare_name_probe
+NAME_HOSTS='127.0.0.1 localhost tinycloud-container host.docker.internal'
 expect_name_proof_failure 'hosts_entry=1' host.docker.internal
 
 prepare_name_probe
-NAME_HOSTS='127.0.0.1 localhost host.docker.internal'
+NAME_HOSTS='127.0.0.1 localhost tinycloud-container host.docker.internal'
 SENDER_EXIT=0
 SENDER_OUTPUT=""
 METRIC_SAMPLES=('10 61000' '10 62000' '10 63000' '10 64000')

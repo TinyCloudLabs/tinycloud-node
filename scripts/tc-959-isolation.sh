@@ -325,31 +325,49 @@ name_resolver_positive_control() {
   [[ "$result" == GELF_RESOLVER_OK ]]
 }
 
+read_target_hosts_file() {
+  local target_container=$1 project=${PROJECT:-tc959-isolation-test}
+  docker_cmd timeout 60 run --rm \
+    --label "com.docker.compose.project=$project" \
+    --label "tc959.probe=true" \
+    --network "container:$target_container" \
+    node:20-alpine@sha256:fb4cd12c85ee03686f6af5362a0b0d56d50c58a04632e6c0fb8363f609372293 \
+    cat /etc/hosts
+}
+
 prove_name_target_structure() {
   local description=$1 target_container=$2 target=$3 error_code=$4
-  local hosts_file sender_networks_json vector_networks_json sender_networks vector_networks
+  local target_hostname hosts_file sender_networks_json vector_networks_json sender_networks vector_networks
   local sender_parse_status vector_parse_status shared_networks=0 alias_matches=0
   local network containers_json peer_ids peer_id peer_metadata peer_match_status
   local sender_member_found peer_format
   local -a sender_network_names=() vector_network_names=()
   if [[ -z "$target_container" ]]; then
-    record "INFO: $description name proof failed; sender_networks=unavailable vector_networks=unavailable shared_networks=unknown alias_matches=unknown hosts_entry=unknown resolver_control=not-run error_code=$error_code reason=missing_container_id"
+    record "INFO: $description name proof failed; sender_networks=unavailable vector_networks=unavailable shared_networks=unknown alias_matches=unknown hosts_entry=unknown target_hostname=unavailable resolver_control=not-run error_code=$error_code reason=missing_container_id"
     return 2
   fi
-  if ! hosts_file=$(docker_cmd exec "$target_container" cat /etc/hosts 2>/dev/null); then
-    record "INFO: $description name proof failed; sender_networks=unavailable vector_networks=unavailable shared_networks=unknown alias_matches=unknown hosts_entry=unreadable resolver_control=not-run error_code=$error_code"
+  if ! target_hostname=$(docker_cmd inspect -f '{{.Config.Hostname}}' "$target_container" 2>/dev/null) || [[ -z "$target_hostname" ]]; then
+    record "INFO: $description name proof failed; sender_networks=unavailable vector_networks=unavailable shared_networks=unknown alias_matches=unknown hosts_entry=unknown target_hostname=unavailable resolver_control=not-run error_code=$error_code inspect_error=1"
+    return 2
+  fi
+  if ! hosts_file=$(read_target_hosts_file "$target_container"); then
+    record "INFO: $description name proof failed; sender_networks=unavailable vector_networks=unavailable shared_networks=unknown alias_matches=unknown hosts_entry=unreadable target_hostname=unverified resolver_control=not-run error_code=$error_code"
+    return 2
+  fi
+  if ! hosts_file_has_name "$hosts_file" "$target_hostname"; then
+    record "INFO: $description name proof failed; sender_networks=unavailable vector_networks=unavailable shared_networks=unknown alias_matches=unknown hosts_entry=0 target_hostname=missing resolver_control=not-run error_code=$error_code"
     return 2
   fi
   if hosts_file_has_name "$hosts_file" "$target"; then
-    record "INFO: $description name target is in hosts file; sender_networks=not-checked vector_networks=not-checked shared_networks=not-applicable alias_matches=not-applicable hosts_entry=1 resolver_control=not-needed error_code=$error_code"
+    record "INFO: $description name target is in hosts file; sender_networks=not-checked vector_networks=not-checked shared_networks=not-applicable alias_matches=not-applicable hosts_entry=1 target_hostname=present resolver_control=not-needed error_code=$error_code"
     return 2
   fi
   if ! sender_networks_json=$(docker_cmd inspect -f '{{json .NetworkSettings.Networks}}' "$target_container" 2>/dev/null); then
-    record "INFO: $description name proof failed; sender_networks=unavailable vector_networks=unavailable shared_networks=unknown alias_matches=unknown hosts_entry=0 resolver_control=not-run error_code=$error_code inspect_error=1"
+    record "INFO: $description name proof failed; sender_networks=unavailable vector_networks=unavailable shared_networks=unknown alias_matches=unknown hosts_entry=0 target_hostname=present resolver_control=not-run error_code=$error_code inspect_error=1"
     return 2
   fi
   if ! vector_networks_json=$(docker_cmd inspect -f '{{json .NetworkSettings.Networks}}' "$VECTOR_ID" 2>/dev/null); then
-    record "INFO: $description name proof failed; sender_networks=read vector_networks=unavailable shared_networks=unknown alias_matches=unknown hosts_entry=0 resolver_control=not-run error_code=$error_code inspect_error=1"
+    record "INFO: $description name proof failed; sender_networks=read vector_networks=unavailable shared_networks=unknown alias_matches=unknown hosts_entry=0 target_hostname=present resolver_control=not-run error_code=$error_code inspect_error=1"
     return 2
   fi
   if sender_networks=$(name_network_names_from_json <<<"$sender_networks_json"); then
@@ -357,7 +375,7 @@ prove_name_target_structure() {
   else
     sender_parse_status=$?
     if (( sender_parse_status == 3 )); then sender_networks=empty; else sender_networks=invalid; fi
-    record "INFO: $description name proof failed; sender_networks=$sender_networks vector_networks=read shared_networks=unknown alias_matches=unknown hosts_entry=0 resolver_control=not-run error_code=$error_code inspect_error=1"
+    record "INFO: $description name proof failed; sender_networks=$sender_networks vector_networks=read shared_networks=unknown alias_matches=unknown hosts_entry=0 target_hostname=present resolver_control=not-run error_code=$error_code inspect_error=1"
     return 2
   fi
   if vector_networks=$(name_network_names_from_json <<<"$vector_networks_json"); then
@@ -365,7 +383,7 @@ prove_name_target_structure() {
   else
     vector_parse_status=$?
     if (( vector_parse_status == 3 )); then vector_networks=empty; else vector_networks=invalid; fi
-    record "INFO: $description name proof failed; sender_networks=$sender_networks vector_networks=$vector_networks shared_networks=unknown alias_matches=unknown hosts_entry=0 resolver_control=not-run error_code=$error_code inspect_error=1"
+    record "INFO: $description name proof failed; sender_networks=$sender_networks vector_networks=$vector_networks shared_networks=unknown alias_matches=unknown hosts_entry=0 target_hostname=present resolver_control=not-run error_code=$error_code inspect_error=1"
     return 2
   fi
   IFS=, read -r -a sender_network_names <<<"$sender_networks"
@@ -378,11 +396,11 @@ prove_name_target_structure() {
   peer_format='{{printf "{\"name\":%s,\"hostname\":%s,\"service\":%s,\"networks\":%s}" (json .Name) (json .Config.Hostname) (json (index .Config.Labels "com.docker.compose.service")) (json .NetworkSettings.Networks)}}'
   for network in "${sender_network_names[@]}"; do
     if ! containers_json=$(docker_cmd network inspect -f '{{json .Containers}}' "$network" 2>/dev/null); then
-      record "INFO: $description name proof failed; sender_networks=$sender_networks vector_networks=$vector_networks shared_networks=$shared_networks alias_matches=$alias_matches hosts_entry=0 resolver_control=not-run error_code=$error_code network_inspect_error=1"
+      record "INFO: $description name proof failed; sender_networks=$sender_networks vector_networks=$vector_networks shared_networks=$shared_networks alias_matches=$alias_matches hosts_entry=0 target_hostname=present resolver_control=not-run error_code=$error_code network_inspect_error=1"
       return 2
     fi
     if ! peer_ids=$(name_network_container_ids_from_json <<<"$containers_json"); then
-      record "INFO: $description name proof failed; sender_networks=$sender_networks vector_networks=$vector_networks shared_networks=$shared_networks alias_matches=$alias_matches hosts_entry=0 resolver_control=not-run error_code=$error_code network_inspect_error=1"
+      record "INFO: $description name proof failed; sender_networks=$sender_networks vector_networks=$vector_networks shared_networks=$shared_networks alias_matches=$alias_matches hosts_entry=0 target_hostname=present resolver_control=not-run error_code=$error_code network_inspect_error=1"
       return 2
     fi
     sender_member_found=0
@@ -390,7 +408,7 @@ prove_name_target_structure() {
       [[ -n "$peer_id" ]] || continue
       [[ "$peer_id" == "$target_container" ]] && sender_member_found=1
       if ! peer_metadata=$(docker_cmd inspect -f "$peer_format" "$peer_id" 2>/dev/null); then
-        record "INFO: $description name proof failed; sender_networks=$sender_networks vector_networks=$vector_networks shared_networks=$shared_networks alias_matches=$alias_matches hosts_entry=0 resolver_control=not-run error_code=$error_code inspect_error=1"
+        record "INFO: $description name proof failed; sender_networks=$sender_networks vector_networks=$vector_networks shared_networks=$shared_networks alias_matches=$alias_matches hosts_entry=0 target_hostname=present resolver_control=not-run error_code=$error_code inspect_error=1"
         return 2
       fi
       if name_peer_matches_target "$network" "$target" "$peer_metadata"; then
@@ -398,25 +416,25 @@ prove_name_target_structure() {
       else
         peer_match_status=$?
         if (( peer_match_status != 1 )); then
-          record "INFO: $description name proof failed; sender_networks=$sender_networks vector_networks=$vector_networks shared_networks=$shared_networks alias_matches=unknown hosts_entry=0 resolver_control=not-run error_code=$error_code inspect_error=1"
+          record "INFO: $description name proof failed; sender_networks=$sender_networks vector_networks=$vector_networks shared_networks=$shared_networks alias_matches=unknown hosts_entry=0 target_hostname=present resolver_control=not-run error_code=$error_code inspect_error=1"
           return 2
         fi
       fi
     done <<<"$peer_ids"
     if (( sender_member_found == 0 )); then
-      record "INFO: $description name proof failed; sender_networks=$sender_networks vector_networks=$vector_networks shared_networks=$shared_networks alias_matches=$alias_matches hosts_entry=0 resolver_control=not-run error_code=$error_code network_sender_match=0"
+      record "INFO: $description name proof failed; sender_networks=$sender_networks vector_networks=$vector_networks shared_networks=$shared_networks alias_matches=$alias_matches hosts_entry=0 target_hostname=present resolver_control=not-run error_code=$error_code network_sender_match=0"
       return 2
     fi
   done
   if (( shared_networks != 0 || alias_matches != 0 )); then
-    record "INFO: $description name proof failed; sender_networks=$sender_networks vector_networks=$vector_networks shared_networks=$shared_networks alias_matches=$alias_matches hosts_entry=0 resolver_control=not-run error_code=$error_code"
+    record "INFO: $description name proof failed; sender_networks=$sender_networks vector_networks=$vector_networks shared_networks=$shared_networks alias_matches=$alias_matches hosts_entry=0 target_hostname=present resolver_control=not-run error_code=$error_code"
     return 2
   fi
   if ! name_resolver_positive_control "$target_container"; then
-    record "INFO: $description name proof failed; sender_networks=$sender_networks vector_networks=$vector_networks shared_networks=0 alias_matches=0 hosts_entry=0 resolver_control=failed error_code=$error_code"
+    record "INFO: $description name proof failed; sender_networks=$sender_networks vector_networks=$vector_networks shared_networks=0 alias_matches=0 hosts_entry=0 target_hostname=present resolver_control=failed error_code=$error_code"
     return 2
   fi
-  PROBE_NAME_EVIDENCE="sender_networks=$sender_networks vector_networks=$vector_networks shared_networks=0 alias_matches=0 hosts_entry=0 resolver_control=ok error_code=$error_code"
+  PROBE_NAME_EVIDENCE="sender_networks=$sender_networks vector_networks=$vector_networks shared_networks=0 alias_matches=0 hosts_entry=0 target_hostname=present resolver_control=ok error_code=$error_code"
   record "INFO: $description name unresolvable ($error_code); structural: $PROBE_NAME_EVIDENCE"
 }
 

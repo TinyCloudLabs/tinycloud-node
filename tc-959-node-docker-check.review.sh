@@ -348,7 +348,7 @@ const calledHelpers = [
   'send_positive_probe', 'run_probe_sender', 'sender_error_code', 'probe_routing_error_matches_target',
   'probe_target_is_name', 'name_network_names_from_json', 'name_network_container_ids_from_json',
   'name_peer_matches_target', 'hosts_file_has_name', 'name_resolver_positive_control',
-  'prove_name_target_structure',
+  'read_target_hosts_file', 'prove_name_target_structure',
   'compose_half_cpu_cmd', 'measure_burst', 'run_isolation_leak_self_test',
 ];
 const missing = calledHelpers.filter((name) => !declared.has(name));
