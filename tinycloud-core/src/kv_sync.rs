@@ -684,8 +684,9 @@ pub(crate) enum KvPrefixProbe {
     Descendants,
 }
 
-/// Seek keys in byte order before running the sequence-ordered feed. The
-/// disjoint exact and descendant probes avoid the bare-prefix OR plan.
+/// Seek keys in byte order when the sequence-index lookahead is full and
+/// contains no scoped change. Separate exact/descendant queries avoid the
+/// bare-prefix OR plan over an unbounded key range.
 pub(crate) fn kv_sync_probe_statement(
     backend: DbBackend,
     space: &SpaceId,
@@ -723,8 +724,143 @@ pub(crate) fn kv_sync_probe_statement(
     backend.build(&query)
 }
 
-/// Only called for a non-empty PostgreSQL prefix; other engines and the
-/// whole-space feed retain their original single sequence-ordered query.
+fn kv_sync_sequence_window(
+    backend: DbBackend,
+    space: &SpaceId,
+    pos: Option<&KvSyncAnchor>,
+    columns: &[current_kv::Column],
+    limit: u64,
+) -> Statement {
+    let mut window = Query::select();
+    window
+        .columns(columns.iter().cloned())
+        .from(current_kv::Entity)
+        .and_where(col(current_kv::Column::Space).eq(SpaceIdWrap(space.clone())));
+    if let Some(pos) = pos {
+        window
+            .and_where(col(current_kv::Column::Seq).gte(pos.seq))
+            .and_where(position_columns().gt(position_value(pos)));
+    }
+    window
+        .order_by(current_kv::Column::Seq, Order::Asc)
+        .order_by(current_kv::Column::Epoch, Order::Asc)
+        .order_by(current_kv::Column::EpochSeq, Order::Asc)
+        .order_by(current_kv::Column::Key, Order::Asc)
+        .limit(limit);
+    backend.build(&window)
+}
+
+fn kv_sync_window_filter(
+    prefix: &Path,
+    floor: Option<&KvSyncAnchor>,
+    values: &mut Vec<sea_orm::Value>,
+) -> String {
+    let eligibility = floor.map(|floor| {
+        values.push(floor.seq.into());
+        format!("(NOT deleted OR seq > ${})", values.len())
+    });
+    let (lower, upper, bare) =
+        crate::db::kv_prefix_bounds(prefix.as_str()).expect("window needs a prefix");
+    values.push(lower.into());
+    let lower = values.len();
+    values.push(upper.into());
+    let upper = values.len();
+    let descendants = format!(r#"(key COLLATE "C" >= ${lower} AND key COLLATE "C" < ${upper})"#);
+    let scope = if bare {
+        values.push(prefix.as_str().into());
+        format!(r#"(key COLLATE "C" = ${} OR {descendants})"#, values.len())
+    } else {
+        descendants
+    };
+    format!("({} AND {scope})", eligibility.as_deref().unwrap_or("true"))
+}
+
+const KV_SYNC_CANDIDATE_WINDOW: u64 = 64;
+
+/// A bounded sequence-index lookahead before seeking the C-key index. Limit
+/// raw rows *inside* the materialized CTE, then apply scope and floor outside
+/// it: a dense prefix can resume cheaply, while a quiet prefix pays at most
+/// one fixed-size window before the byte-key fallback.
+pub(crate) fn kv_sync_candidate_statement(
+    backend: DbBackend,
+    space: &SpaceId,
+    prefix: &Path,
+    pos: Option<&KvSyncAnchor>,
+    floor: Option<&KvSyncAnchor>,
+) -> Statement {
+    debug_assert_eq!(backend, DbBackend::Postgres);
+    let window = kv_sync_sequence_window(
+        backend,
+        space,
+        pos,
+        &[
+            current_kv::Column::Key,
+            current_kv::Column::Deleted,
+            current_kv::Column::Seq,
+        ],
+        KV_SYNC_CANDIDATE_WINDOW,
+    );
+    let mut values = window.values.map(|values| values.0).unwrap_or_default();
+    let filter = kv_sync_window_filter(prefix, floor, &mut values);
+    Statement::from_sql_and_values(
+        backend,
+        format!(
+            "WITH candidates AS MATERIALIZED ({}) \
+             SELECT count(*) AS seen, \
+             COALESCE(bool_or({filter}), false) AS found \
+             FROM candidates",
+            window.sql
+        ),
+        values,
+    )
+}
+
+/// A bounded feed for dense prefixes. If it yields a full page, or exhausts
+/// the raw sequence window, its rows are the same next page as the normal
+/// feed. Otherwise the caller falls back to the unbounded scoped query.
+pub(crate) fn kv_sync_bounded_feed_statement(
+    backend: DbBackend,
+    space: &SpaceId,
+    prefix: &Path,
+    limit: usize,
+    pos: Option<&KvSyncAnchor>,
+    floor: Option<&KvSyncAnchor>,
+) -> Statement {
+    debug_assert_eq!(backend, DbBackend::Postgres);
+    let window = kv_sync_sequence_window(
+        backend,
+        space,
+        pos,
+        &[
+            current_kv::Column::Key,
+            current_kv::Column::Seq,
+            current_kv::Column::Epoch,
+            current_kv::Column::EpochSeq,
+            current_kv::Column::Value,
+            current_kv::Column::Metadata,
+            current_kv::Column::Deleted,
+        ],
+        limit.saturating_add(1) as u64,
+    );
+    let mut values = window.values.map(|values| values.0).unwrap_or_default();
+    let filter = kv_sync_window_filter(prefix, floor, &mut values);
+    Statement::from_sql_and_values(
+        backend,
+        format!(
+            "WITH candidates AS MATERIALIZED ({}) \
+             SELECT key, seq, epoch, epoch_seq, value, metadata, deleted, \
+             (SELECT count(*) FROM candidates) AS seen \
+             FROM candidates WHERE {filter} \
+             ORDER BY seq, epoch, epoch_seq",
+            window.sql
+        ),
+        values,
+    )
+}
+
+/// Only called for a non-empty PostgreSQL prefix; a bounded sequence-index
+/// window handles dense continuations before the C-key seek handles quiet
+/// prefixes. Other engines and the whole-space feed remain unchanged.
 async fn prefix_has_feed_rows<C: ConnectionTrait>(
     db: &C,
     space: &SpaceId,
@@ -733,6 +869,19 @@ async fn prefix_has_feed_rows<C: ConnectionTrait>(
     floor: Option<&KvSyncAnchor>,
 ) -> Result<bool, DbErr> {
     let backend = db.get_database_backend();
+    let candidate = db
+        .query_one(kv_sync_candidate_statement(
+            backend, space, prefix, pos, floor,
+        ))
+        .await?
+        .ok_or_else(|| DbErr::Custom("missing KV sync candidate aggregate".into()))?;
+    let seen = candidate.try_get::<i64>("", "seen")?;
+    let found = candidate.try_get::<bool>("", "found")?;
+    if found || seen < KV_SYNC_CANDIDATE_WINDOW as i64 {
+        return Ok(found);
+    }
+    // A full window without a match cannot prove the rest of the space quiet.
+    // Seek only this prefix; never advance the cursor past other-space writes.
     if !prefix.as_str().ends_with('/')
         && db
             .query_one(kv_sync_probe_statement(
@@ -888,11 +1037,38 @@ pub(crate) async fn kv_sync_page<C: ConnectionTrait>(
     {
         return Ok((Vec::new(), false, state));
     }
-    let mut rows = feed_rows(
-        db,
-        kv_sync_statement(backend, space, prefix, limit, state.pos.as_ref(), floor),
-    )
-    .await?;
+    let mut rows = if backend == DbBackend::Postgres && !prefix.as_str().is_empty() {
+        let window = db
+            .query_all(kv_sync_bounded_feed_statement(
+                backend,
+                space,
+                prefix,
+                limit,
+                state.pos.as_ref(),
+                floor,
+            ))
+            .await?;
+        let exhausted = window
+            .first()
+            .map(|row| row.try_get::<i64>("", "seen"))
+            .transpose()?
+            .is_some_and(|seen| seen < limit.saturating_add(1) as i64);
+        if window.len() > limit || exhausted {
+            window.into_iter().map(feed_row).collect::<Result<_, _>>()?
+        } else {
+            feed_rows(
+                db,
+                kv_sync_statement(backend, space, prefix, limit, state.pos.as_ref(), floor),
+            )
+            .await?
+        }
+    } else {
+        feed_rows(
+            db,
+            kv_sync_statement(backend, space, prefix, limit, state.pos.as_ref(), floor),
+        )
+        .await?
+    };
     let more = if rows.len() <= limit {
         false
     } else {

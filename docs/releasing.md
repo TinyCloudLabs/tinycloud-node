@@ -234,6 +234,11 @@ gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref main \
   "restart listing"; the client must omit `x-tinycloud-cursor` and begin a
   new listing. The node rejects rather than silently skipping or repeating
   keys when a database's native collation differs from byte order.
+- PostgreSQL `tinycloud.kv/sync` prefix polls first inspect at most 64 raw
+  sequence-index candidates; dense continuations use a bounded sequence feed,
+  while a full window without a match falls back to the C-ordered key index.
+  Empty polls preserve the supplied cursor bytes. The root feed and
+  SQLite/MySQL behavior are unchanged.
 - The PostgreSQL migrator supports `up` and `down` across the concurrent index.
   `fresh`, `refresh`, and `reset` reject before changing schema or migration
   history; SeaORM's inherited implementations require one transaction and

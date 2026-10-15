@@ -5770,8 +5770,9 @@ mod test {
         }
     }
 
-    /// The auto and generic plans must seek by byte key under cross-space
-    /// skew. This is intentionally too large for the default test suite.
+    /// Dense continuations seek by sequence, while quiet prefixes seek by
+    /// byte key, in both auto and generic plans. This fixture is too large
+    /// for the default suite.
     #[tokio::test]
     #[ignore = "PG18.6 planner fixture: 2 spaces x 300k current_kv rows"]
     async fn postgres_kv_prefix_actual_builders_seek_under_skew() {
@@ -5800,6 +5801,60 @@ mod test {
             ))
             .await
             .unwrap();
+        }
+        // Keep actual event_order anchors at the middle, the next whole
+        // invocation, near the end, and at the end. Other bulk rows only
+        // shape the planner's space/prefix distribution.
+        let mut dense_anchors = Vec::new();
+        for (seq, keys) in [
+            (150_010, &["busy/150000"][..]),
+            (
+                150_011,
+                &["busy/150001", "busy/150002", "busy/150003", "busy/150004"][..],
+            ),
+            (299_910, &["busy/299900"][..]),
+            (300_010, &["busy/300000"][..]),
+        ] {
+            let epoch_id = crate::hash::hash(format!("tc737-dense-epoch-{seq}").as_bytes());
+            epoch::ActiveModel {
+                seq: Set(seq),
+                id: Set(epoch_id),
+                space: Set(SpaceIdWrap(dense.clone())),
+            }
+            .insert(db)
+            .await
+            .unwrap();
+            event_order::ActiveModel {
+                seq: Set(seq),
+                epoch: Set(epoch_id),
+                epoch_seq: Set(0),
+                event: Set(crate::hash::hash(
+                    format!("tc737-dense-event-{seq}").as_bytes(),
+                )),
+                space: Set(SpaceIdWrap(dense.clone())),
+            }
+            .insert(db)
+            .await
+            .unwrap();
+            for key in keys {
+                db.execute(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "UPDATE current_kv SET seq = $2, epoch = $3 WHERE space = $1 AND key = $4",
+                    [
+                        SpaceIdWrap(dense.clone()).into(),
+                        seq.into(),
+                        epoch_id.into(),
+                        (*key).into(),
+                    ],
+                ))
+                .await
+                .unwrap();
+            }
+            dense_anchors.push(crate::kv_sync::KvSyncAnchor {
+                seq,
+                epoch: epoch_id,
+                epoch_seq: 0,
+            });
         }
         db.execute(Statement::from_string(
             DbBackend::Postgres,
@@ -5850,6 +5905,18 @@ mod test {
             .unwrap();
             plan
         }
+        fn execution_buffers(plan: &str) -> usize {
+            plan.lines()
+                .find(|line| line.trim_start().starts_with("Buffers: shared "))
+                .expect("EXPLAIN must report execution buffers")
+                .split_whitespace()
+                .filter_map(|part| {
+                    part.strip_prefix("hit=")
+                        .or_else(|| part.strip_prefix("read="))
+                        .map(|count| count.parse::<usize>().unwrap())
+                })
+                .sum()
+        }
         // seed_kv_keys wrote a real event_order row at this floor/position.
         let pos = crate::kv_sync::KvSyncAnchor {
             seq: 0,
@@ -5880,6 +5947,101 @@ mod test {
                 .unwrap();
             assert_eq!(actual_mode, mode);
             println!("TC-737 skew planner mode: {actual_mode}");
+            for (label, space, prefix, cursor, floor, found, seen) in [
+                ("rare-bare", &rare, &bare, &pos, &floor, false, 64),
+                ("rare-slash", &rare, &slash, &pos, &floor, false, 64),
+                (
+                    "dense-mid-bare",
+                    &dense,
+                    &bare,
+                    &dense_anchors[0],
+                    &dense_anchors[3],
+                    true,
+                    64,
+                ),
+                (
+                    "dense-mid-slash",
+                    &dense,
+                    &slash,
+                    &dense_anchors[0],
+                    &dense_anchors[3],
+                    true,
+                    64,
+                ),
+                (
+                    "dense-group-more",
+                    &dense,
+                    &slash,
+                    &dense_anchors[1],
+                    &dense_anchors[3],
+                    true,
+                    64,
+                ),
+                (
+                    "dense-late",
+                    &dense,
+                    &bare,
+                    &dense_anchors[2],
+                    &dense_anchors[3],
+                    true,
+                    64,
+                ),
+                (
+                    "dense-caught-up",
+                    &dense,
+                    &slash,
+                    &dense_anchors[3],
+                    &dense_anchors[3],
+                    false,
+                    0,
+                ),
+            ] {
+                let statement = crate::kv_sync::kv_sync_candidate_statement(
+                    DbBackend::Postgres,
+                    space,
+                    prefix,
+                    Some(cursor),
+                    Some(floor),
+                );
+                let row = tx.query_one(statement.clone()).await.unwrap().unwrap();
+                assert_eq!(row.try_get::<i64>("", "seen").unwrap(), seen, "{label}");
+                assert_eq!(row.try_get::<bool>("", "found").unwrap(), found, "{label}");
+                let plan = explain(&tx, statement).await;
+                println!("{mode} {label} bounded candidate:\n{plan}");
+                assert!(
+                    plan.contains("idx_current_kv_space_order")
+                        && plan.contains("Limit")
+                        && execution_buffers(&plan) <= 96,
+                    "{mode} {label} preflight must stay bounded:\n{plan}"
+                );
+                if mode == "force_generic_plan" {
+                    assert!(
+                        plan.contains("$1"),
+                        "{mode} {label} was not generic:\n{plan}"
+                    );
+                }
+                if found && space == &dense {
+                    let feed = explain(
+                        &tx,
+                        crate::kv_sync::kv_sync_bounded_feed_statement(
+                            DbBackend::Postgres,
+                            space,
+                            prefix,
+                            500,
+                            Some(cursor),
+                            Some(floor),
+                        ),
+                    )
+                    .await;
+                    println!("{mode} {label} bounded sequence feed:\n{feed}");
+                    assert!(
+                        feed.contains("idx_current_kv_space_order")
+                            && feed.contains("Limit")
+                            && execution_buffers(&plan) + execution_buffers(&feed) <= 160,
+                        "{mode} {label} preflight+feed scanned consumed keys:\n{plan}\n{feed}"
+                    );
+                }
+            }
             for (space, label) in [(&rare, "rare"), (&dense, "dense")] {
                 for (prefix, branch) in [
                     (&bare, crate::kv_sync::KvPrefixProbe::Exact),
@@ -6005,6 +6167,114 @@ mod test {
                 echo, cursor,
                 "outside writes cannot change the cursor bytes"
             );
+        }
+        let mid = crate::kv_sync::KvSyncState {
+            pos: Some(dense_anchors[0]),
+            floor: Some(dense_anchors[3]),
+        };
+        let (group, more, next) = crate::kv_sync::kv_sync_page(db, &dense, &slash, 1, Some(&mid))
+            .await
+            .unwrap();
+        assert_eq!(
+            group
+                .iter()
+                .map(|change| change.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["busy/150001", "busy/150002", "busy/150003", "busy/150004",]
+        );
+        assert!(more);
+        assert_eq!(next.pos, Some(dense_anchors[1]));
+        let (following, more, _) = crate::kv_sync::kv_sync_page(db, &dense, &slash, 2, Some(&next))
+            .await
+            .unwrap();
+        assert_eq!(
+            following
+                .iter()
+                .map(|change| change.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["busy/150005", "busy/150006"]
+        );
+        assert!(more);
+        let late = crate::kv_sync::KvSyncState {
+            pos: Some(dense_anchors[2]),
+            floor: Some(dense_anchors[3]),
+        };
+        let (following, more, _) = crate::kv_sync::kv_sync_page(db, &dense, &bare, 2, Some(&late))
+            .await
+            .unwrap();
+        assert_eq!(
+            following
+                .iter()
+                .map(|change| change.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["busy/299901", "busy/299902"]
+        );
+        assert!(more);
+        let caught_up = crate::kv_sync::KvSyncState {
+            pos: Some(dense_anchors[3]),
+            floor: Some(dense_anchors[3]),
+        };
+        let (changes, more, next) =
+            crate::kv_sync::kv_sync_page(db, &dense, &slash, 500, Some(&caught_up))
+                .await
+                .unwrap();
+        assert!(changes.is_empty() && !more);
+        assert_eq!(next, caught_up);
+        // A qualifying key beyond a full 64-row window must still be found
+        // by the C-key fallback; the window is not a cursor advance.
+        let rare_next = crate::kv_sync::KvSyncAnchor {
+            seq: 300_011,
+            epoch: crate::hash::hash(b"tc737-skew-rare-next"),
+            epoch_seq: 0,
+        };
+        epoch::ActiveModel {
+            seq: Set(rare_next.seq),
+            id: Set(rare_next.epoch),
+            space: Set(SpaceIdWrap(rare.clone())),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        event_order::ActiveModel {
+            seq: Set(rare_next.seq),
+            epoch: Set(rare_next.epoch),
+            epoch_seq: Set(0),
+            event: Set(crate::hash::hash(b"tc737-skew-rare-next-event")),
+            space: Set(SpaceIdWrap(rare.clone())),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        db.execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "UPDATE current_kv SET seq = $2, epoch = $3 \
+             WHERE space = $1 AND key = 'busy/only'",
+            [
+                SpaceIdWrap(rare.clone()).into(),
+                rare_next.seq.into(),
+                rare_next.epoch.into(),
+            ],
+        ))
+        .await
+        .unwrap();
+        for prefix in [&bare, &slash] {
+            let state = crate::kv_sync::KvSyncState {
+                pos: Some(pos),
+                floor: Some(floor),
+            };
+            let (changes, more, next) =
+                crate::kv_sync::kv_sync_page(db, &rare, prefix, 500, Some(&state))
+                    .await
+                    .unwrap();
+            assert_eq!(
+                changes
+                    .iter()
+                    .map(|change| change.key.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["busy/only"]
+            );
+            assert!(!more);
+            assert_eq!(next.pos, Some(rare_next));
         }
         assert_eq!(
             kv_list_pages(db, &rare, "busy", 1).await,
