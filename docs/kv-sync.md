@@ -69,6 +69,13 @@ root feeds advertise `kv-sync-root` alongside `kv-sync-v1` in `/info`.
   the node's reads. It is not an error. Keep paging with the returned cursor;
   the next request makes progress.
 
+The PostgreSQL node checks a non-root prefix by seeking the exact key and
+its descendants in byte-key order before reading the sequence-ordered feed.
+If no key has a change after the cursor (or a live key at the bootstrap floor),
+it returns the same cursor without scanning unrelated writes in a busy space.
+The probe reads at most the selected prefix's keys; positive polls retain
+commit ordering, tombstone handling, and whole-invocation pages.
+
 ### Pages and `limit`
 
 All keys written or deleted by one invocation (for example a batch put) share

@@ -853,6 +853,13 @@ fn parse_positive_u64_header(
 }
 
 type KvCursorMac = Hmac<Sha256>;
+const KV_LIST_CURSOR_VERSION: u8 = 2;
+
+#[derive(Debug)]
+enum KvListCursorError {
+    Invalid,
+    RestartListing,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct KvListCursorPayload {
@@ -891,7 +898,7 @@ fn encode_kv_cursor(
     last: &Path,
 ) -> Result<String, ()> {
     let payload = KvListCursorPayload {
-        version: 1,
+        version: KV_LIST_CURSOR_VERSION,
         subject_digest: kv_subject_digest(subject),
         space: space.to_string(),
         prefix: prefix.to_string(),
@@ -914,26 +921,33 @@ fn decode_kv_cursor(
     space: &SpaceId,
     prefix: &Path,
     limit: usize,
-) -> Result<Path, ()> {
+) -> Result<Path, KvListCursorError> {
     if value.len() > 4096 {
-        return Err(());
+        return Err(KvListCursorError::Invalid);
     }
-    let bytes = decode_config(value, URL_SAFE_NO_PAD).map_err(|_| ())?;
-    let wire: KvListCursorWire = serde_json::from_slice(&bytes).map_err(|_| ())?;
-    if wire.payload.version != 1
-        || wire.payload.subject_digest != kv_subject_digest(subject)
+    let bytes = decode_config(value, URL_SAFE_NO_PAD).map_err(|_| KvListCursorError::Invalid)?;
+    let wire: KvListCursorWire =
+        serde_json::from_slice(&bytes).map_err(|_| KvListCursorError::Invalid)?;
+    let expected = kv_cursor_mac(key, &wire.payload).map_err(|_| KvListCursorError::Invalid)?;
+    if wire.payload.subject_digest != kv_subject_digest(subject)
         || wire.payload.space != space.to_string()
         || wire.payload.prefix != prefix.to_string()
         || wire.payload.action != "tinycloud.kv/list"
         || wire.payload.limit != limit
+        || !constant_time_eq(expected.as_bytes(), wire.mac.as_bytes())
     {
-        return Err(());
+        return Err(KvListCursorError::Invalid);
     }
-    let expected = kv_cursor_mac(key, &wire.payload)?;
-    if !constant_time_eq(expected.as_bytes(), wire.mac.as_bytes()) {
-        return Err(());
+    if wire.payload.version == 1 {
+        return Err(KvListCursorError::RestartListing);
     }
-    wire.payload.last.parse().map_err(|_| ())
+    if wire.payload.version != KV_LIST_CURSOR_VERSION {
+        return Err(KvListCursorError::Invalid);
+    }
+    wire.payload
+        .last
+        .parse()
+        .map_err(|_| KvListCursorError::Invalid)
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
@@ -1196,8 +1210,15 @@ fn kv_invoke_options_for_capabilities_with_cursor(
                 .ok_or_else(|| (Status::BadRequest, "Invalid KV list cursor".to_string()))?;
             let limit = list_limit
                 .ok_or_else(|| (Status::BadRequest, "Invalid KV list cursor".to_string()))?;
-            decode_kv_cursor(key, &value, subject, &space, &prefix, limit)
-                .map_err(|_| (Status::BadRequest, "Invalid KV list cursor".to_string()))
+            decode_kv_cursor(key, &value, subject, &space, &prefix, limit).map_err(|error| {
+                let message = match error {
+                    KvListCursorError::Invalid => "Invalid KV list cursor",
+                    KvListCursorError::RestartListing => {
+                        "KV list cursor predates byte ordering; restart listing without x-tinycloud-cursor"
+                    }
+                };
+                (Status::BadRequest, message.to_string())
+            })
         })
         .transpose()?;
 
@@ -8519,6 +8540,28 @@ mod tests {
         let (status, body, _) = list_page(Some(forged)).await;
         assert_eq!(status, Status::BadRequest, "{body}");
         assert!(body.contains("outside the requested prefix"), "{body}");
+        // A pre-cutover cursor was signed for the native-collation ordering.
+        // It must not silently resume a byte-ordered page in the middle.
+        let mut legacy: KvListCursorWire =
+            serde_json::from_slice(&decode_config(&cursors[0], URL_SAFE_NO_PAD)?)?;
+        legacy.payload.version = 1;
+        legacy.mac = kv_cursor_mac(&cursor_key, &legacy.payload).expect("mac");
+        let legacy = encode_config(serde_json::to_vec(&legacy)?, URL_SAFE_NO_PAD);
+        let (status, body, _) = list_page(Some(legacy.clone())).await;
+        assert_eq!(status, Status::BadRequest, "{body}");
+        assert!(body.contains("restart listing"), "{body}");
+        let (status, body, _) = list_page(None).await;
+        assert_eq!(status, Status::Ok, "{body}");
+        assert_eq!(serde_json::from_str::<Vec<String>>(&body)?, vec!["docs"]);
+
+        // Editing the version without its MAC does not get the restart hint.
+        let mut tampered: KvListCursorWire =
+            serde_json::from_slice(&decode_config(&legacy, URL_SAFE_NO_PAD)?)?;
+        tampered.payload.version = 2;
+        let tampered = encode_config(serde_json::to_vec(&tampered)?, URL_SAFE_NO_PAD);
+        let (status, body, _) = list_page(Some(tampered)).await;
+        assert_eq!(status, Status::BadRequest, "{body}");
+        assert!(body.contains("Invalid KV list cursor"), "{body}");
         Ok(())
     }
 

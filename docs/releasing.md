@@ -228,6 +228,12 @@ gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref main \
   writing while PostgreSQL builds the additive index concurrently, but binary
   rollback is not safe. Recover by rolling forward through the coordinated
   release sequence, not by promoting an older image.
+- TC-737 also orders PostgreSQL `tinycloud.kv/list` pages by key bytes,
+  matching SQLite's BINARY order. Newly issued list cursors use version 2.
+  A valid version-1 cursor from before this cutover returns HTTP 400 with
+  "restart listing"; the client must omit `x-tinycloud-cursor` and begin a
+  new listing. The node rejects rather than silently skipping or repeating
+  keys when a database's native collation differs from byte order.
 - The PostgreSQL migrator supports `up` and `down` across the concurrent index.
   `fresh`, `refresh`, and `reset` reject before changing schema or migration
   history; SeaORM's inherited implementations require one transaction and

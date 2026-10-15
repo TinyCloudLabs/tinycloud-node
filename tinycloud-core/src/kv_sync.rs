@@ -45,7 +45,7 @@ use chacha20poly1305::{
 use rand::{rngs::OsRng, RngCore};
 use sea_orm::{
     entity::prelude::*,
-    sea_query::{Expr, Order, Query, SelectStatement},
+    sea_query::{Expr, ExprTrait, Order, Query, SelectStatement},
     Condition, ConnectionTrait, DbBackend, QueryOrder, QueryResult, QuerySelect, Statement,
 };
 use serde::{Deserialize, Serialize};
@@ -637,6 +637,19 @@ fn position_value(anchor: &KvSyncAnchor) -> Expr {
     ])
 }
 
+fn feed_condition(space: &SpaceId, floor: Option<&KvSyncAnchor>) -> Condition {
+    let mut condition =
+        Condition::all().add(col(current_kv::Column::Space).eq(SpaceIdWrap(space.clone())));
+    if let Some(floor) = floor {
+        condition = condition.add(
+            Condition::any()
+                .add(col(current_kv::Column::Deleted).eq(false))
+                .add(col(current_kv::Column::Seq).gt(floor.seq)),
+        );
+    }
+    condition
+}
+
 /// The rows of `space` inside `prefix`, minus tombstones at or below
 /// `floor.seq`, with the feed's columns.
 fn feed_select(
@@ -645,17 +658,9 @@ fn feed_select(
     prefix: &Path,
     floor: Option<&KvSyncAnchor>,
 ) -> SelectStatement {
-    let mut condition =
-        Condition::all().add(col(current_kv::Column::Space).eq(SpaceIdWrap(space.clone())));
+    let mut condition = feed_condition(space, floor);
     if let Some(prefix) = crate::db::kv_prefix_condition(backend, prefix.as_str()) {
         condition = condition.add(prefix);
-    }
-    if let Some(floor) = floor {
-        condition = condition.add(
-            Condition::any()
-                .add(col(current_kv::Column::Deleted).eq(false))
-                .add(col(current_kv::Column::Seq).gt(floor.seq)),
-        );
     }
     let mut query = Query::select();
     query
@@ -671,6 +676,89 @@ fn feed_select(
         .from(current_kv::Entity)
         .cond_where(condition);
     query
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum KvPrefixProbe {
+    Exact,
+    Descendants,
+}
+
+/// Seek keys in byte order before running the sequence-ordered feed. The
+/// disjoint exact and descendant probes avoid the bare-prefix OR plan.
+pub(crate) fn kv_sync_probe_statement(
+    backend: DbBackend,
+    space: &SpaceId,
+    prefix: &Path,
+    pos: Option<&KvSyncAnchor>,
+    floor: Option<&KvSyncAnchor>,
+    branch: KvPrefixProbe,
+) -> Statement {
+    let key = col(current_kv::Column::Key);
+    let mut condition = feed_condition(space, floor);
+    condition = match branch {
+        KvPrefixProbe::Exact => {
+            condition.add(crate::db::byte_ordered(backend, key.clone()).eq(prefix.as_str()))
+        }
+        KvPrefixProbe::Descendants => {
+            let (lower, upper, _) =
+                crate::db::kv_prefix_bounds(prefix.as_str()).expect("probe needs a prefix");
+            condition
+                .add(crate::db::byte_ordered(backend, key.clone()).gte(lower))
+                .add(crate::db::byte_ordered(backend, key.clone()).lt(upper))
+        }
+    };
+    if let Some(pos) = pos {
+        condition = condition
+            .add(col(current_kv::Column::Seq).gte(pos.seq))
+            .add(position_columns().gt(position_value(pos)));
+    }
+    let mut query = Query::select();
+    query
+        .expr(Expr::cust("1"))
+        .from(current_kv::Entity)
+        .cond_where(condition)
+        .order_by_expr(crate::db::byte_ordered(backend, key), Order::Asc)
+        .limit(1);
+    backend.build(&query)
+}
+
+/// Only called for a non-empty PostgreSQL prefix; other engines and the
+/// whole-space feed retain their original single sequence-ordered query.
+async fn prefix_has_feed_rows<C: ConnectionTrait>(
+    db: &C,
+    space: &SpaceId,
+    prefix: &Path,
+    pos: Option<&KvSyncAnchor>,
+    floor: Option<&KvSyncAnchor>,
+) -> Result<bool, DbErr> {
+    let backend = db.get_database_backend();
+    if !prefix.as_str().ends_with('/')
+        && db
+            .query_one(kv_sync_probe_statement(
+                backend,
+                space,
+                prefix,
+                pos,
+                floor,
+                KvPrefixProbe::Exact,
+            ))
+            .await?
+            .is_some()
+    {
+        return Ok(true);
+    }
+    Ok(db
+        .query_one(kv_sync_probe_statement(
+            backend,
+            space,
+            prefix,
+            pos,
+            floor,
+            KvPrefixProbe::Descendants,
+        ))
+        .await?
+        .is_some())
 }
 
 /// The feed query: rows in `prefix` at positions strictly after `pos`, in
@@ -756,7 +844,7 @@ async fn feed_rows<C: ConnectionTrait>(
         .collect()
 }
 
-/// Read one page of the feed for `prefix` (non-empty) in `space`.
+/// Read one page of the feed for `prefix` in `space` (empty means root).
 ///
 /// `state` is `None` on the first page, which anchors a fresh floor at the
 /// space's newest event. Otherwise both the position and floor anchors must
@@ -794,6 +882,12 @@ pub(crate) async fn kv_sync_page<C: ConnectionTrait>(
     };
     let backend = db.get_database_backend();
     let floor = state.floor.as_ref();
+    if backend == DbBackend::Postgres
+        && !prefix.as_str().is_empty()
+        && !prefix_has_feed_rows(db, space, prefix, state.pos.as_ref(), floor).await?
+    {
+        return Ok((Vec::new(), false, state));
+    }
     let mut rows = feed_rows(
         db,
         kv_sync_statement(backend, space, prefix, limit, state.pos.as_ref(), floor),
@@ -813,12 +907,16 @@ pub(crate) async fn kv_sync_page<C: ConnectionTrait>(
                 )
                 .await?,
             );
-            !feed_rows(
-                db,
-                kv_sync_statement(backend, space, prefix, 1, Some(&last), floor),
-            )
-            .await?
-            .is_empty()
+            if backend == DbBackend::Postgres && !prefix.as_str().is_empty() {
+                prefix_has_feed_rows(db, space, prefix, Some(&last), floor).await?
+            } else {
+                !feed_rows(
+                    db,
+                    kv_sync_statement(backend, space, prefix, 1, Some(&last), floor),
+                )
+                .await?
+                .is_empty()
+            }
         } else {
             rows.truncate(limit);
             true
@@ -2798,8 +2896,8 @@ pub(crate) mod tests {
         let baseline = db
             .query_all(Statement::from_sql_and_values(
                 DbBackend::Postgres,
-                explain_sql.clone(),
-                values.clone(),
+                explain_sql,
+                values,
             ))
             .await
             .unwrap()
@@ -2905,6 +3003,20 @@ pub(crate) mod tests {
             reads > 0 && writes > 0,
             "no read/write overlap with index build"
         );
+        let statement = kv_sync_probe_statement(
+            DbBackend::Postgres,
+            &quiet.space,
+            &"quiet/".parse().unwrap(),
+            Some(&KvSyncAnchor {
+                seq: 10,
+                epoch,
+                epoch_seq: 0,
+            }),
+            None,
+            KvPrefixProbe::Descendants,
+        );
+        let explain_sql = format!("EXPLAIN (ANALYZE, BUFFERS) {}", statement.sql);
+        let values = statement.values.map(|values| values.0).unwrap_or_default();
         let plan = db
             .query_all(Statement::from_sql_and_values(
                 DbBackend::Postgres,
