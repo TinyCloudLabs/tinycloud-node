@@ -4096,12 +4096,13 @@ async fn account_query_principal<C: ConnectionTrait>(
 }
 
 const MAX_ACCOUNT_SESSION_NODES: usize = 256;
-const MAX_ACCOUNT_SESSION_EDGES_PER_LEVEL: u64 = 1025;
+const ACCOUNT_SESSION_DELEGATION_PAGE_SIZE: u64 = 512;
 const MAX_ACCOUNT_ANCESTOR_NODES: usize = 4096;
 
 /// Discover only session/control DIDs that were delegated the account's list
 /// capability. Ordinary recipients are deliberately not pulled into the
-/// account relationship graph.
+/// account relationship graph. Delegations are keyset-paged independently of
+/// their abilities, so neither fan-out nor a large grant set truncates discovery.
 async fn account_session_dids<C: ConnectionTrait>(
     db: &C,
     principal: &str,
@@ -4112,44 +4113,52 @@ async fn account_session_dids<C: ConnectionTrait>(
         if frontier.is_empty() {
             return Ok(account_dids);
         }
-        let rows = delegation::Entity::find()
-            .filter(delegation::Column::Delegator.is_in(frontier.clone()))
-            .limit(MAX_ACCOUNT_SESSION_EDGES_PER_LEVEL)
-            .find_with_related(abilities::Entity)
-            .all(db)
-            .await?;
-        if rows.len() as u64 == MAX_ACCOUNT_SESSION_EDGES_PER_LEVEL {
-            return Err(DbErr::Custom(
-                "account-session-graph-level-limit-exceeded".to_string(),
-            ));
-        }
         let mut next = Vec::new();
-        for (delegation, abilities) in rows {
-            let controls_account = abilities.iter().any(|ability| {
-                ability.ability.as_ref().as_ref() == "tinycloud.delegation/list"
-                    && ability
-                        .resource
-                        .tinycloud_resource()
-                        .is_some_and(|resource| {
-                            resource.service().as_str() == "delegation"
-                                && resource
-                                    .path()
-                                    .map(|path| path.as_str().is_empty())
-                                    .unwrap_or(true)
-                                && resource.query().is_none()
-                                && resource.fragment().is_none()
-                                && did_principal_matches(resource.space().did().as_str(), principal)
-                        })
-            });
-            if controls_account
-                && delegation.delegatee.starts_with("did:key:")
-                && account_dids.insert(delegation.delegatee.clone())
-            {
-                next.push(delegation.delegatee);
-                if account_dids.len() > MAX_ACCOUNT_SESSION_NODES {
-                    return Err(DbErr::Custom(
-                        "account-session-graph-node-limit-exceeded".to_string(),
-                    ));
+        let mut after = None;
+        loop {
+            let mut query = delegation::Entity::find()
+                .filter(delegation::Column::Delegator.is_in(frontier.clone()))
+                .order_by_asc(delegation::Column::Id)
+                .limit(ACCOUNT_SESSION_DELEGATION_PAGE_SIZE);
+            if let Some(id) = after {
+                query = query.filter(delegation::Column::Id.gt(id));
+            }
+            let delegations = query.all(db).await?;
+            let Some(last) = delegations.last() else {
+                break;
+            };
+            after = Some(last.id);
+            let ability_rows = delegations.load_many(abilities::Entity, db).await?;
+            for (delegation, abilities) in delegations.into_iter().zip(ability_rows) {
+                let controls_account = abilities.iter().any(|ability| {
+                    ability.ability.as_ref().as_ref() == "tinycloud.delegation/list"
+                        && ability
+                            .resource
+                            .tinycloud_resource()
+                            .is_some_and(|resource| {
+                                resource.service().as_str() == "delegation"
+                                    && resource
+                                        .path()
+                                        .map(|path| path.as_str().is_empty())
+                                        .unwrap_or(true)
+                                    && resource.query().is_none()
+                                    && resource.fragment().is_none()
+                                    && did_principal_matches(
+                                        resource.space().did().as_str(),
+                                        principal,
+                                    )
+                            })
+                });
+                if controls_account
+                    && delegation.delegatee.starts_with("did:key:")
+                    && account_dids.insert(delegation.delegatee.clone())
+                {
+                    next.push(delegation.delegatee);
+                    if account_dids.len() > MAX_ACCOUNT_SESSION_NODES {
+                        return Err(DbErr::Custom(
+                            "account-session-graph-node-limit-exceeded".to_string(),
+                        ));
+                    }
                 }
             }
         }
@@ -5862,6 +5871,282 @@ mod test {
             use_existing.await.unwrap(),
             "existing child use check must observe revoke"
         );
+    }
+
+    #[tokio::test]
+    async fn account_session_discovery_paginates_delegations_not_ability_rows() {
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set};
+
+        let db = get_db().await.unwrap();
+        let principal = "did:pkh:eip155:1:0x0000000000000000000000000000000000000001";
+        let principal_suffix = principal.strip_prefix("did:").unwrap();
+        test_actor(principal).insert(&db.conn).await.unwrap();
+
+        for sign_in in 0..35 {
+            let session = format!("did:key:session-{sign_in:02}");
+            test_actor(&session).insert(&db.conn).await.unwrap();
+            for delegation_index in 0..13 {
+                let id = crate::hash::hash(
+                    format!("tc1195-signin-{sign_in}-{delegation_index}").as_bytes(),
+                );
+                let delegatee = if delegation_index == 0 {
+                    session.clone()
+                } else {
+                    format!("did:key:recipient-{sign_in}-{delegation_index}")
+                };
+                if delegation_index != 0 {
+                    test_actor(&delegatee).insert(&db.conn).await.unwrap();
+                }
+                delegation::ActiveModel {
+                    id: Set(id),
+                    delegator: Set(principal.to_string()),
+                    delegatee: Set(delegatee),
+                    expiry: Set(None),
+                    issued_at: Set(None),
+                    not_before: Set(None),
+                    facts: Set(None),
+                    serialization: Set(id.as_ref().to_vec()),
+                }
+                .insert(&db.conn)
+                .await
+                .unwrap();
+                for ability_index in 0..7 {
+                    let (resource, ability) = if delegation_index == 0 && ability_index == 0 {
+                        (
+                            format!("tinycloud:{principal_suffix}:default/delegation"),
+                            "tinycloud.delegation/list",
+                        )
+                    } else {
+                        (
+                            format!("tinycloud:{principal_suffix}:default/kv/key-{ability_index}"),
+                            "tinycloud.kv/get",
+                        )
+                    };
+                    abilities::ActiveModel {
+                        resource: Set(resource.parse().unwrap()),
+                        ability: Set(ability.to_string().try_into().unwrap()),
+                        delegation: Set(id),
+                        caveats: Set(Default::default()),
+                    }
+                    .insert(&db.conn)
+                    .await
+                    .unwrap();
+                }
+            }
+        }
+
+        let discovered = account_session_dids(&db.conn, principal).await.unwrap();
+        assert_eq!(discovered.len(), 36);
+        for sign_in in 0..35 {
+            assert!(
+                discovered.contains(&format!("did:key:session-{sign_in:02}")),
+                "session {sign_in} was omitted"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn account_session_discovery_pages_past_the_edge_limit_boundary() {
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set};
+
+        for count in [1024, 1025, 1026] {
+            let db = get_db().await.unwrap();
+            let principal = "did:pkh:eip155:1:0x0000000000000000000000000000000000000001";
+            let principal_suffix = principal.strip_prefix("did:").unwrap();
+            let session = "did:key:tc1195-boundary-session";
+            test_actor(principal).insert(&db.conn).await.unwrap();
+            test_actor(session).insert(&db.conn).await.unwrap();
+
+            let control_id = crate::hash::hash(format!("tc1195-control-{count}").as_bytes());
+            delegation::ActiveModel {
+                id: Set(control_id),
+                delegator: Set(principal.to_string()),
+                delegatee: Set(session.to_string()),
+                expiry: Set(None),
+                issued_at: Set(None),
+                not_before: Set(None),
+                facts: Set(None),
+                serialization: Set(control_id.as_ref().to_vec()),
+            }
+            .insert(&db.conn)
+            .await
+            .unwrap();
+            abilities::ActiveModel {
+                resource: Set(format!("tinycloud:{principal_suffix}:default/delegation")
+                    .parse()
+                    .unwrap()),
+                ability: Set("tinycloud.delegation/list".to_string().try_into().unwrap()),
+                delegation: Set(control_id),
+                caveats: Set(Default::default()),
+            }
+            .insert(&db.conn)
+            .await
+            .unwrap();
+
+            for index in 0..count {
+                let id = crate::hash::hash(format!("tc1195-grant-{count}-{index}").as_bytes());
+                let delegatee = format!("did:key:tc1195-boundary-recipient-{index}");
+                test_actor(&delegatee).insert(&db.conn).await.unwrap();
+                delegation::ActiveModel {
+                    id: Set(id),
+                    delegator: Set(session.to_string()),
+                    delegatee: Set(delegatee),
+                    expiry: Set(None),
+                    issued_at: Set(None),
+                    not_before: Set(None),
+                    facts: Set(None),
+                    serialization: Set(id.as_ref().to_vec()),
+                }
+                .insert(&db.conn)
+                .await
+                .unwrap();
+                abilities::ActiveModel {
+                    resource: Set(
+                        format!("tinycloud:{principal_suffix}:default/kv/key-{index}")
+                            .parse()
+                            .unwrap(),
+                    ),
+                    ability: Set("tinycloud.kv/get".to_string().try_into().unwrap()),
+                    delegation: Set(id),
+                    caveats: Set(Default::default()),
+                }
+                .insert(&db.conn)
+                .await
+                .unwrap();
+            }
+
+            let discovered = account_session_dids(&db.conn, principal).await.unwrap();
+            assert!(
+                discovered.contains(session),
+                "{count} session grants must retain their session DID"
+            );
+            let matching_grants = delegation::Entity::find()
+                .filter(delegation::Column::Delegator.eq(session))
+                .find_with_related(abilities::Entity)
+                .all(&db.conn)
+                .await
+                .unwrap();
+            assert_eq!(matching_grants.len(), count);
+            assert!(
+                matching_grants
+                    .iter()
+                    .all(|(_, abilities)| abilities.len() == 1),
+                "{count} grants should each have one ability"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn account_session_keyset_query_uses_composite_delegator_index() {
+        let db = get_db().await.unwrap();
+        let mut statement = delegation::Entity::find()
+            .filter(
+                Condition::all()
+                    .add(delegation::Column::Delegator.eq("did:key:tc1195-index"))
+                    .add(delegation::Column::Id.gt(crate::hash::hash(b"tc1195-cursor"))),
+            )
+            .order_by_asc(delegation::Column::Id)
+            .limit(ACCOUNT_SESSION_DELEGATION_PAGE_SIZE)
+            .build(DbBackend::Sqlite);
+        statement.sql = format!("EXPLAIN QUERY PLAN {}", statement.sql);
+        let plan = db
+            .conn
+            .query_all(statement)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.try_get::<String>("", "detail").unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("idx_delegation_delegator") && line.contains("id>?")),
+            "session pagination must seek by delegator and id: {plan:?}"
+        );
+    }
+    #[tokio::test]
+    async fn postgres_account_session_discovery_paginates_ability_fanout() {
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set};
+
+        let Some(schema) = crate::test_support::PostgresTestSchema::new(
+            "postgres_account_session_discovery_paginates_ability_fanout",
+        )
+        .await
+        else {
+            return;
+        };
+        let conn = &schema.conn;
+        let principal = "did:pkh:eip155:1:0x0000000000000000000000000000000000000001";
+        let principal_suffix = principal.strip_prefix("did:").unwrap();
+        let mut actors = vec![test_actor(principal)];
+        let mut delegations = Vec::new();
+        let mut ability_rows = Vec::new();
+
+        for sign_in in 0..35 {
+            let session = format!("did:key:tc1195-pg-session-{sign_in:02}");
+            actors.push(test_actor(&session));
+            for delegation_index in 0..13 {
+                let id = crate::hash::hash(
+                    format!("tc1195-pg-signin-{sign_in}-{delegation_index}").as_bytes(),
+                );
+                let delegatee = if delegation_index == 0 {
+                    session.clone()
+                } else {
+                    let recipient =
+                        format!("did:key:tc1195-pg-recipient-{sign_in}-{delegation_index}");
+                    actors.push(test_actor(&recipient));
+                    recipient
+                };
+                delegations.push(delegation::ActiveModel {
+                    id: Set(id),
+                    delegator: Set(principal.to_string()),
+                    delegatee: Set(delegatee),
+                    expiry: Set(None),
+                    issued_at: Set(None),
+                    not_before: Set(None),
+                    facts: Set(None),
+                    serialization: Set(id.as_ref().to_vec()),
+                });
+                for ability_index in 0..7 {
+                    let (resource, ability) = if delegation_index == 0 && ability_index == 0 {
+                        (
+                            format!("tinycloud:{principal_suffix}:default/delegation"),
+                            "tinycloud.delegation/list",
+                        )
+                    } else {
+                        (
+                            format!(
+                                "tinycloud:{principal_suffix}:default/kv/key-{sign_in}-{delegation_index}-{ability_index}"
+                            ),
+                            "tinycloud.kv/get",
+                        )
+                    };
+                    ability_rows.push(abilities::ActiveModel {
+                        resource: Set(resource.parse().unwrap()),
+                        ability: Set(ability.to_string().try_into().unwrap()),
+                        delegation: Set(id),
+                        caveats: Set(Default::default()),
+                    });
+                }
+            }
+        }
+        actor::Entity::insert_many(actors).exec(conn).await.unwrap();
+        delegation::Entity::insert_many(delegations)
+            .exec(conn)
+            .await
+            .unwrap();
+        abilities::Entity::insert_many(ability_rows)
+            .exec(conn)
+            .await
+            .unwrap();
+
+        let discovered = account_session_dids(conn, principal).await.unwrap();
+        assert_eq!(discovered.len(), 36);
+        for sign_in in 0..35 {
+            assert!(
+                discovered.contains(&format!("did:key:tc1195-pg-session-{sign_in:02}")),
+                "PostgreSQL omitted session {sign_in}"
+            );
+        }
     }
 
     #[tokio::test]
