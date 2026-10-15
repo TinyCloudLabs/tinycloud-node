@@ -1,4 +1,3 @@
-use sea_orm::{ConnectionTrait, DbBackend, Statement};
 use sea_orm_migration::prelude::*;
 
 use crate::models::delegation;
@@ -7,15 +6,19 @@ use crate::models::delegation;
 pub struct Migration;
 
 async fn drop_index_if_exists(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
-    let backend = manager.get_database_backend();
-    let sql = match backend {
-        DbBackend::MySql => "DROP INDEX IF EXISTS idx_delegation_delegator ON delegation",
-        DbBackend::Postgres | DbBackend::Sqlite => "DROP INDEX IF EXISTS idx_delegation_delegator",
-    };
-    manager
-        .get_connection()
-        .execute(Statement::from_string(backend, sql.to_string()))
-        .await?;
+    if manager
+        .has_index("delegation", "idx_delegation_delegator")
+        .await?
+    {
+        manager
+            .drop_index(
+                Index::drop()
+                    .name("idx_delegation_delegator")
+                    .table(delegation::Entity)
+                    .to_owned(),
+            )
+            .await?;
+    }
     Ok(())
 }
 
