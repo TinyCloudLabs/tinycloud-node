@@ -78,7 +78,11 @@ fn target_condition(id: SimpleExpr) -> Condition {
     let canonical = Query::select()
         .column(AliasColumn::Canonical)
         .from(AliasEntity)
-        .and_where(Expr::col(AliasColumn::Id).eq(id.clone()))
+        .cond_where(
+            Condition::any()
+                .add(Expr::col(AliasColumn::Id).eq(id.clone()))
+                .add(Expr::col(AliasColumn::Canonical).eq(id.clone())),
+        )
         .to_owned();
     let equivalents = Query::select()
         .column(AliasColumn::Id)
@@ -304,13 +308,35 @@ pub(crate) async fn control_proof_decision<C: ConnectionTrait>(
         .filter(abilities::Column::Ability.eq(requested_action))
         .all(db)
         .await?;
-    let target_resource = format!("urn:cid:{}", target.to_cid(0x55));
-    let has_control_ability = control_abilities
-        .iter()
-        .any(|ability| match &ability.resource {
-            Resource::Other(resource) => resource.as_str() == target_resource,
+    let target_canonical = delegation_cid_alias::Entity::find_by_id(*target)
+        .one(db)
+        .await?
+        .map(|alias| alias.canonical)
+        .unwrap_or(*target);
+    let mut has_control_ability = false;
+    for ability in &control_abilities {
+        match &ability.resource {
+            Resource::Other(resource) => {
+                let Some(control_target) = resource
+                    .as_str()
+                    .strip_prefix("urn:cid:")
+                    .and_then(|cid| cid.parse::<Cid>().ok())
+                    .map(Hash::from)
+                else {
+                    continue;
+                };
+                let control_canonical = delegation_cid_alias::Entity::find_by_id(control_target)
+                    .one(db)
+                    .await?
+                    .map(|alias| alias.canonical)
+                    .unwrap_or(control_target);
+                if control_canonical == target_canonical {
+                    has_control_ability = true;
+                    break;
+                }
+            }
             Resource::TinyCloud(resource) => {
-                resource.service().as_str() == "delegation"
+                if resource.service().as_str() == "delegation"
                     && resource
                         .path()
                         .map(|path| path.as_str().is_empty())
@@ -318,12 +344,70 @@ pub(crate) async fn control_proof_decision<C: ConnectionTrait>(
                     && resource.query().is_none()
                     && resource.fragment().is_none()
                     && resource.space().did().as_str() == parent.delegator
+                {
+                    has_control_ability = true;
+                    break;
+                }
             }
-        });
+        }
+    }
     if !has_control_ability {
         return Ok(ControlProofDecision::Denied);
     }
     Ok(ControlProofDecision::PersistentPrincipal(parent.delegator))
+}
+
+/// A canonical CID can name a historical stored row without being its primary
+/// key. Keep the signed CID on the wire; use the stored row for authorization.
+async fn target_for_cid<C: ConnectionTrait>(
+    db: &C,
+    target: Hash,
+) -> Result<Option<delegation::Model>, DbErr> {
+    if let Some(row) = delegation::Entity::find_by_id(target).one(db).await? {
+        return Ok(Some(row));
+    }
+    let Some(alias) = delegation_cid_alias::Entity::find()
+        .filter(delegation_cid_alias::Column::Canonical.eq(target))
+        .one(db)
+        .await?
+    else {
+        return Ok(None);
+    };
+    delegation::Entity::find_by_id(alias.id).one(db).await
+}
+
+/// Root CID control is available only to an owner of a space in the target's
+/// persisted abilities. A delegator or delegatee alone is not an owner.
+pub(crate) async fn owner_controls_target<C: ConnectionTrait>(
+    db: &C,
+    owner: &str,
+    cap: &crate::util::Capability,
+) -> Result<bool, DbErr> {
+    if cap.ability.as_ref().as_ref() != "tinycloud.delegation/revoke" {
+        return Ok(false);
+    }
+    let Resource::Other(resource) = &cap.resource else {
+        return Ok(false);
+    };
+    let Some(target) = resource
+        .as_str()
+        .strip_prefix("urn:cid:")
+        .and_then(|cid| cid.parse::<Cid>().ok())
+    else {
+        return Ok(false);
+    };
+    let Some(target) = target_for_cid(db, Hash::from(target)).await? else {
+        return Ok(false);
+    };
+    let abilities = abilities::Entity::find()
+        .filter(abilities::Column::Delegation.eq(target.id))
+        .all(db)
+        .await?;
+    Ok(abilities.iter().any(|row| {
+        row.resource
+            .space()
+            .is_some_and(|space| did_principal_matches(space.did().as_str(), owner))
+    }))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -390,8 +474,7 @@ pub(crate) async fn process<C: ConnectionTrait>(
     };
 
     let hash: Hash = hash(&serialization);
-    let delegation = delegation::Entity::find_by_id(Hash::from(r.revoked))
-        .one(db)
+    let delegation = target_for_cid(db, Hash::from(r.revoked))
         .await?
         .ok_or(RevocationError::MissingParents)?;
 
@@ -404,7 +487,15 @@ pub(crate) async fn process<C: ConnectionTrait>(
     // Any one of these is sufficient. The Cacao revoker == delegator
     // path stays as the cheapest check; owner-authorized falls back to
     // walking the ability rows.
-    if !revoker_is_authorized(db, &delegation, &r.revoker, &r.parents).await? {
+    if !revoker_is_authorized(
+        db,
+        &delegation,
+        &r.revoker,
+        &r.parents,
+        &Hash::from(r.revoked),
+    )
+    .await?
+    {
         return Err(RevocationError::UnauthorizedRevoker(r.revoker).into());
     };
 
@@ -453,20 +544,16 @@ async fn revoker_is_authorized<C: ConnectionTrait>(
     delegation: &delegation::Model,
     revoker: &str,
     proofs: &[Cid],
+    target: &Hash,
 ) -> Result<bool, DbErr> {
-    let principal = match control_proof_decision(
-        db,
-        revoker,
-        proofs,
-        "tinycloud.delegation/revoke",
-        &delegation.id,
-    )
-    .await?
-    {
-        ControlProofDecision::DirectSigner(principal)
-        | ControlProofDecision::PersistentPrincipal(principal) => principal,
-        ControlProofDecision::Denied => return Ok(false),
-    };
+    let principal =
+        match control_proof_decision(db, revoker, proofs, "tinycloud.delegation/revoke", target)
+            .await?
+        {
+            ControlProofDecision::DirectSigner(principal)
+            | ControlProofDecision::PersistentPrincipal(principal) => principal,
+            ControlProofDecision::Denied => return Ok(false),
+        };
     if did_principal_matches(&delegation.delegator, &principal) {
         return Ok(true);
     }

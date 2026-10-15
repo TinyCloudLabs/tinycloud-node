@@ -13,7 +13,7 @@ use tinycloud_auth::{
 };
 use tinycloud_core::{
     db::SpaceDatabase,
-    events::Revocation,
+    events::{Delegation, Revocation},
     keys::StaticSecret,
     models::{delegation, revocation},
     relationships::parent_delegations,
@@ -271,6 +271,155 @@ async fn upgrade_active_legacy_children_remain_valid_until_owner_revokes_either_
         drop(db);
         let db = open(&path).await;
         assert_denied(&db, &fixture).await;
+    }
+}
+
+fn owner_cid_control(target: &str, audience: &str) -> String {
+    use tinycloud_auth::{
+        cacaos::{
+            siwe::Message,
+            siwe_cacao::{Header, Signature, SiweCacao},
+        },
+        siwe_recap::{Ability, Capability},
+    };
+    let mut recap = Capability::<serde_json::Value>::new();
+    recap.with_action(
+        format!("urn:cid:{target}").parse().unwrap(),
+        "tinycloud.delegation/revoke".parse::<Ability>().unwrap(),
+        [std::collections::BTreeMap::new()],
+    );
+    let message: Message = signed_cacao(audience, None, "tc821-cid-control")
+        .payload()
+        .clone()
+        .try_into()
+        .unwrap();
+    let message = recap.build_message(message).unwrap();
+    let (key, _, _) = owner();
+    let (signature, recovery) = key
+        .sign_prehash_recoverable(&message.eip191_hash().unwrap())
+        .unwrap();
+    let mut bytes = [0; 65];
+    bytes[..64].copy_from_slice(signature.to_bytes().as_ref());
+    bytes[64] = u8::from(recovery) + 27;
+    TinyCloudDelegation::Cacao(Box::new(SiweCacao::new(
+        message.into(),
+        Signature::from(bytes),
+        Header,
+    )))
+    .encode()
+    .unwrap()
+}
+
+fn session_cid_revocation(target: &str, control: &str, seed: u8) -> Revocation {
+    use tinycloud_auth::{
+        ssi::{claims::jwt::NumericDate, jwk::Algorithm, ucan::Payload},
+        ucan_capabilities_object::Capabilities,
+    };
+    let (key, did, vm) = session(seed);
+    let mut caps = Capabilities::new();
+    caps.with_action(
+        format!("urn:cid:{target}").parse().unwrap(),
+        "tinycloud.delegation/revoke".parse().unwrap(),
+        [std::collections::BTreeMap::<String, serde_json::Value>::new()],
+    );
+    let header = TinyCloudRevocation::Ucan(Box::new(
+        Payload {
+            issuer: vm.parse().unwrap(),
+            audience: did.parse().unwrap(),
+            not_before: None,
+            expiration: NumericDate::try_from_seconds(EXPIRATION).unwrap(),
+            nonce: Some("tc821-session-revoke".into()),
+            facts: None,
+            proof: vec![control.parse().unwrap()],
+            attenuation: caps,
+        }
+        .sign(Algorithm::EdDSA, &key)
+        .unwrap(),
+    ))
+    .encode()
+    .unwrap();
+    Revocation::from_header_ser::<TinyCloudRevocation>(&header).unwrap()
+}
+
+#[tokio::test]
+async fn owner_cid_control_revokes_historical_equivalents_without_target_artifact() {
+    for database in ["active.sqlite", "single-v0.sqlite"] {
+        let fixture = fixtures()
+            .into_iter()
+            .find(|fixture| fixture.database == database)
+            .unwrap();
+        for target in &fixture.rows {
+            let (_directory, path) = copy_database(&fixture);
+            let before = signed_snapshot(&path);
+            let db = open(&path).await;
+            let (_, audience, _) = session(fixture.session_seed);
+            let header = owner_cid_control(&target.raw_cid, &audience);
+            db.delegate(Delegation::from_header_ser::<TinyCloudDelegation>(&header).unwrap())
+                .await
+                .map_err(|error| error.to_string())
+                .unwrap();
+            let signed =
+                session_cid_revocation(&target.raw_cid, &cid(&header), fixture.session_seed);
+            db.revoke(signed)
+                .await
+                .map_err(|error| error.to_string())
+                .unwrap();
+            for equivalent in &fixture.rows {
+                assert_eq!(
+                    db.delegation_status(hash_from_cid(&equivalent.raw_cid), &fixture.issuer, &[])
+                        .await
+                        .map_err(|error| error.to_string())
+                        .unwrap(),
+                    Some(tinycloud_core::db::DelegationStatus::Revoked),
+                    "{database} {} via {}",
+                    equivalent.encoding,
+                    target.encoding,
+                );
+            }
+            let after = signed_snapshot(&path);
+            assert!(before[0].iter().all(|row| after[0].contains(row)));
+            assert!(before[1].iter().all(|row| after[1].contains(row)));
+        }
+    }
+}
+
+#[tokio::test]
+async fn owner_cid_control_resolves_unstored_canonical_target() {
+    let fixture = fixtures()
+        .into_iter()
+        .find(|fixture| fixture.database == "single-v0.sqlite")
+        .unwrap();
+    let canonical = current_cid(&fixture.canonical_header);
+    let raw = &fixture.rows[0].raw_cid;
+    assert_ne!(canonical, *raw);
+    for (control_target, signed_target) in [(&canonical, raw), (raw, &canonical)] {
+        let (_directory, path) = copy_database(&fixture);
+        let db = open(&path).await;
+        let (_, audience, _) = session(fixture.session_seed);
+        let header = owner_cid_control(control_target, &audience);
+        db.delegate(Delegation::from_header_ser::<TinyCloudDelegation>(&header).unwrap())
+            .await
+            .map_err(|error| error.to_string())
+            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            db.revoke(session_cid_revocation(
+                signed_target,
+                &cid(&header),
+                fixture.session_seed,
+            )),
+        )
+        .await
+        .expect("same-registry root/alias revoke must not deadlock")
+        .map_err(|error| error.to_string())
+        .unwrap();
+        assert_eq!(
+            db.delegation_status(hash_from_cid(raw), &fixture.issuer, &[])
+                .await
+                .map_err(|error| error.to_string())
+                .unwrap(),
+            Some(tinycloud_core::db::DelegationStatus::Revoked),
+        );
     }
 }
 

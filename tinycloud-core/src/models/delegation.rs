@@ -253,6 +253,19 @@ async fn validate<C: ConnectionTrait>(
         // ordered sibling pair.  Keeping the graph row here is what lets the
         // ordinary transaction validate an S0's proof CIDs.
         (false, true) if is_policy_root(&delegation.delegation) => Ok(()),
+        // A space owner may mint a narrowly scoped control grant for a
+        // persisted target without possessing the target's signed bytes.
+        (false, true)
+            if delegation.capabilities.len() == 1
+                && revocation::owner_controls_target(
+                    db,
+                    &delegation.delegator,
+                    dependant_caps[0],
+                )
+                .await? =>
+        {
+            Ok(())
+        }
         // dependant caps, no parents, invalid
         (false, true) => Err(DelegationError::MissingParents.into()),
         // dependant caps, parents, check parents
