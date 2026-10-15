@@ -10370,7 +10370,7 @@ mod tests {
                 "targetRole": "policy-authority",
                 "ownerDid": owner_did,
                 "nodeAudience": node_did,
-                "revokedAt": format_time(OffsetDateTime::now_utc()),
+                "revokedAt": format_time(OffsetDateTime::now_utc() + Duration::seconds(30)),
                 "reason": "owner-requested",
                 "issuerDid": owner_did,
             });
