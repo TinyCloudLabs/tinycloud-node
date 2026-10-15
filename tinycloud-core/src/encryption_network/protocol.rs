@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 
 use super::canonical::canonical_hash;
 use super::network_id::NetworkId;
+use super::resource::{DecryptResource, DecryptResourceError};
 
 pub const DECRYPT_REQUEST_TYPE: &str = "tinycloud.encryption.decrypt/v1";
 pub const DECRYPT_RESULT_TYPE: &str = "tinycloud.encryption.decrypt-result/v1";
@@ -44,6 +45,23 @@ pub struct DecryptRequestBody {
     pub receiver_public_key: String,
     #[serde(rename = "receiverPublicKeyHash")]
     pub receiver_public_key_hash: String,
+    /// Signed locator for a scoped key release. Both fields are required together.
+    #[serde(rename = "spaceId", skip_serializing_if = "Option::is_none")]
+    pub space_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+impl DecryptRequestBody {
+    pub fn resource(&self) -> Result<DecryptResource, DecryptResourceError> {
+        match (&self.space_id, &self.path) {
+            (None, None) => self.network_id.to_string().parse(),
+            (Some(space), Some(path)) => {
+                DecryptResource::scoped(self.network_id.clone(), space, path)
+            }
+            _ => Err(DecryptResourceError::Scope),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -288,6 +306,8 @@ mod tests {
             encrypted_symmetric_key_hash: "aa".repeat(32),
             receiver_public_key: "BAUG".to_string(),
             receiver_public_key_hash: "bb".repeat(32),
+            space_id: None,
+            path: None,
         };
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(json["type"], json!(DECRYPT_REQUEST_TYPE));
@@ -309,6 +329,8 @@ mod tests {
             encrypted_symmetric_key_hash: "aa".repeat(32),
             receiver_public_key: "BAUG".to_string(),
             receiver_public_key_hash: "bb".repeat(32),
+            space_id: None,
+            path: None,
         };
         let mut body_json = serde_json::to_value(body).unwrap();
         body_json["unsupported"] = json!(true);

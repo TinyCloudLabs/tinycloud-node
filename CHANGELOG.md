@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Add exact single-secret `tinycloud.encryption/decrypt` delegations under canonical owner-owned KV spaces (TC-755). Both decrypt routes read the current stored envelope before rewrapping a key and require a valid keyed `scopeTag` for scoped grants; bare network-wide grants retain legacy untagged envelope compatibility. Scoped grants cannot authorize network administration. Policy-session encryption ceilings may narrow from their source network root to a matching source KV secret. See `docs/delegation-flow.md`.
 - Account delegation session discovery keyset-pages delegation rows independently of ability fan-out, using a composite delegator/id index so large grant sets are not truncated (TC-1195).
 - `/attestation` quotes the SHA-256 of `key_binding` as REPORTDATA and returns it as `key_binding_sha256`; the quote no longer carries the raw binding. Before answering 200 the node checks that the returned TDX v4 quote's REPORTDATA field holds that digest (a structural check; it does not verify the quote). When the TEE can't produce a bound quote, the endpoint returns 503 instead of 200 `mode: "classic"`, and the dstack client reports a guest-agent error status instead of a parse error. `nonce` must be 1-64 characters of `A-Z a-z 0-9 - _` (400 otherwise), and the endpoint now shares the public routes' per-IP rate limit. Verifiers recompute the digest from their own nonce and expected DID and must still verify the quote; see `docs/attestation.md` (TC-963).
 

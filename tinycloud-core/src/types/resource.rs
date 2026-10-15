@@ -1,4 +1,4 @@
-use crate::encryption_network::NetworkId;
+use crate::encryption_network::DecryptResource;
 use sea_orm::{entity::prelude::*, sea_query::ValueTypeErr};
 use serde::{Deserialize, Serialize};
 use std::{fmt::Display, str::FromStr};
@@ -32,17 +32,17 @@ impl Resource {
             (Resource::TinyCloud(a), Resource::TinyCloud(b)) => a.extends(b).is_ok(),
             (Resource::Other(a), Resource::Other(b)) => {
                 match (
-                    a.as_str().parse::<NetworkId>(),
-                    b.as_str().parse::<NetworkId>(),
+                    a.as_str().parse::<DecryptResource>(),
+                    b.as_str().parse::<DecryptResource>(),
                 ) {
-                    (Ok(a), Ok(b)) => a == b,
-                    (Ok(_), Err(_)) | (Err(_), Ok(_)) => false,
+                    (Ok(child), Ok(parent)) => parent.contains(&child),
                     (Err(_), Err(_))
                         if a.as_str().starts_with(ENCRYPTION_NETWORK_PREFIX)
                             || b.as_str().starts_with(ENCRYPTION_NETWORK_PREFIX) =>
                     {
                         false
                     }
+                    (Ok(_), Err(_)) | (Err(_), Ok(_)) => false,
                     (Err(_), Err(_)) => a.as_str().starts_with(b.as_str()),
                 }
             }
@@ -215,6 +215,84 @@ mod tests {
         assert!(!default.extends(&default_evil));
         assert!(!malformed_network.extends(&default));
         assert!(!default.extends(&malformed_network));
+    }
+
+    #[test]
+    fn scoped_decrypt_containment_is_exact_and_network_root_is_explicit() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
+        let root = "urn:tinycloud:encryption:did:key:z6MkOwner:default";
+        let scoped = |path: &str| {
+            format!(
+                "{root}/kv/{}/{}",
+                URL_SAFE_NO_PAD.encode("tinycloud:key:z6MkOwner:alternate"),
+                URL_SAFE_NO_PAD.encode(path)
+            )
+        };
+        let a: Resource = scoped("vault/secrets/A").parse().unwrap();
+        let b: Resource = scoped("vault/secrets/B").parse().unwrap();
+        let root: Resource = root.parse().unwrap();
+        assert!(a.extends(&root));
+        assert!(a.extends(&a));
+        assert!(!a.extends(&b));
+        assert!(!b.extends(&a));
+        assert!(!root.extends(&a));
+        assert!(!a.extends(
+            &"urn:tinycloud:encryption:did:key:z6MkOwner:default-evil"
+                .parse()
+                .unwrap()
+        ));
+        let foreign = format!(
+            "urn:tinycloud:encryption:did:key:z6MkOwner:default/kv/{}/{}",
+            URL_SAFE_NO_PAD.encode("tinycloud:key:z6MkForeign:alternate"),
+            URL_SAFE_NO_PAD.encode("vault/secrets/A")
+        );
+        let foreign: Resource = foreign.parse().unwrap();
+        assert!(!foreign.extends(&root));
+        for malformed in [
+            scoped("vault/secrets/../B"),
+            scoped("vault/other/A"),
+            format!(
+                "{root}/kv/{}=/{}",
+                URL_SAFE_NO_PAD.encode("tinycloud:key:z6MkOwner:alternate"),
+                URL_SAFE_NO_PAD.encode("vault/secrets/A")
+            ),
+            format!(
+                "{root}/kv/{}/{}",
+                URL_SAFE_NO_PAD.encode("tinycloud:key:z6MkOwner:alternate"),
+                "dmF1bHQvc2VjcmV0cy9B="
+            ),
+        ] {
+            let malformed: Resource = malformed.parse().unwrap();
+            assert!(!malformed.extends(&root));
+        }
+    }
+
+    #[test]
+    fn scoped_decrypt_requires_one_checksums_canonical_space_uri() {
+        use crate::encryption_network::{DecryptResource, NetworkId};
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
+        let owner = "did:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
+        let network = NetworkId::new(owner, "default").unwrap();
+        let canonical =
+            "tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:alternate";
+        let lower = "tinycloud:pkh:eip155:1:0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266:alternate";
+        let path = "vault/secrets/scoped/agent/API_KEY";
+        let scoped = DecryptResource::scoped(network.clone(), canonical, path).unwrap();
+        assert_eq!(
+            scoped.to_string().parse::<DecryptResource>().unwrap(),
+            scoped
+        );
+        assert!(DecryptResource::scoped(network.clone(), lower, path).is_err());
+        let malformed = format!(
+            "{network}/kv/{}/{}",
+            URL_SAFE_NO_PAD.encode(lower),
+            URL_SAFE_NO_PAD.encode(path)
+        );
+        assert!(malformed.parse::<DecryptResource>().is_err());
+        let default_space = canonical.replace(":alternate", ":secrets");
+        assert!(DecryptResource::scoped(network, &default_space, "vault/secrets/A").is_ok());
     }
 
     #[test]

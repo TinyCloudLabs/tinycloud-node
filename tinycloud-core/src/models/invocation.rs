@@ -1,5 +1,5 @@
 use super::super::{
-    encryption_network::NetworkId,
+    encryption_network::{DecryptResource, DECRYPT_ACTION},
     events::{Invocation, VersionedOperation},
     models::*,
     relationships::*,
@@ -553,8 +553,12 @@ fn is_root_authority(cap: &util::Capability, invoker: &str) -> bool {
     match &cap.resource {
         Resource::Other(uri) => uri
             .as_str()
-            .parse::<NetworkId>()
-            .map(|network_id| did_principal_matches(network_id.owner_did(), invoker))
+            .parse::<DecryptResource>()
+            .map(|resource| {
+                did_principal_matches(resource.network().owner_did(), invoker)
+                    && (resource.scope().is_none()
+                        || cap.ability.as_ref().as_ref() == DECRYPT_ACTION)
+            })
             .unwrap_or(false),
         Resource::TinyCloud(_) => false,
     }

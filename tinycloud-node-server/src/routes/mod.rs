@@ -1704,11 +1704,12 @@ async fn invoke_impl(
                     "decrypt invocation contains multiple networks".to_string(),
                 ).into());
             }
-            let network = network.parse().map_err(
-                |error: tinycloud_core::encryption_network::NetworkIdError| {
+            let resource: tinycloud_core::encryption_network::DecryptResource = network
+                .parse()
+                .map_err(|error: tinycloud_core::encryption_network::DecryptResourceError| {
                     (Status::Forbidden, error.to_string())
-                },
-            )?;
+                })?;
+            let network = resource.network().clone();
             let body = read_json_body(data).await?;
             let body = serde_json::from_str(&body)
                 .map_err(|error| (Status::BadRequest, error.to_string()))?;
@@ -1716,10 +1717,11 @@ async fn invoke_impl(
                 .authorize_invocation(&admitted.invocation().0, now)
                 .await
                 .map_err(|error| (Status::Forbidden, error.to_string()))?;
-            encryption
+            let validated_resource = encryption
                 .validate_authorized_decrypt_request(&network, &admitted.invocation().0, &body)
                 .await
                 .map_err(|error| (Status::Forbidden, error.to_string()))?;
+            let stored = encryption::current_decrypt_envelope(tinycloud, validated_resource.scope()).await?;
             if policy_session_invocation {
                 invocation_replay_cache
                     .check_and_insert_invoker_nonce(admitted.invocation(), 60)
@@ -1730,7 +1732,7 @@ async fn invoke_impl(
                     .await?;
             }
             let verified = encryption
-                .decrypt_authorized(&network, &admitted.invocation().0, &body)
+                .decrypt_authorized(&network, &admitted.invocation().0, &body, stored.as_ref())
                 .await
                 .map_err(|error| (Status::Forbidden, error.to_string()))?;
             if let Some(timer) = timer {
@@ -9049,6 +9051,256 @@ mod tests {
             .await?;
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn scoped_decrypt_routes_read_current_kv_under_node_authority() -> Result<()> {
+        use base64::{encode_config, URL_SAFE_NO_PAD};
+        use hmac::{Hmac, Mac};
+        use rocket::http::{ContentType, Header, Status};
+        use sha2::Sha256;
+        use tinycloud_auth::authorization::Cid;
+        use tinycloud_auth::ssi::{
+            dids::{DIDBuf, DIDURLBuf},
+            ucan::Payload,
+        };
+        use tinycloud_auth::ucan_capabilities_object::Capabilities;
+        use tinycloud_core::encryption_network::{
+            backend::wrap_to_public_key, canonical::canonical_hash, CreateNetworkRequest,
+            DecryptResponseBody, NetworkId, Threshold, DECRYPT_ACTION, DECRYPT_REQUEST_TYPE,
+        };
+        use x25519_dalek::{PublicKey as ReceiverPublicKey, StaticSecret as ReceiverSecret};
+
+        let fixture = KvSyncFixture::new_with(|rocket| {
+            rocket.mount("/", rocket::routes![encryption::decrypt])
+        })
+        .await?;
+        let net = NetworkId::new(fixture.space.did().to_string(), "default")?;
+        let descriptor = fixture
+            .client
+            .rocket()
+            .state::<EncryptionService>()
+            .unwrap()
+            .create_one_of_one_network(CreateNetworkRequest {
+                name: "default".into(),
+                owner_did: fixture.space.did().to_string(),
+                threshold: Threshold::one_of_one(),
+            })
+            .await?;
+        let space = fixture.space.to_string();
+        let a = "vault/secrets/A";
+        let b = "vault/secrets/B";
+        let scoped = |path: &str| {
+            format!(
+                "{net}/kv/{}/{}",
+                encode_config(&space, URL_SAFE_NO_PAD),
+                encode_config(path, URL_SAFE_NO_PAD)
+            )
+        };
+        let envelope = |path: &str, key: &[u8; 32], wrapped: &[u8]| {
+            let ciphertext = base64::encode(format!("encrypted-{path}"));
+            let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("32-byte HMAC key");
+            mac.update(
+                format!(
+                    "tinycloud.decrypt-scope/v1\n{net}\n{space}\n{path}\n{}\n1\n{ciphertext}",
+                    descriptor.alg
+                )
+                .as_bytes(),
+            );
+            let encoded = base64::encode(wrapped);
+            serde_json::json!({
+                "v": 1, "networkId": net, "alg": descriptor.alg,
+                "keyVersion": 1, "encryptedSymmetricKey": encoded,
+                "encryptedSymmetricKeyHash": canonical_hash(&serde_json::json!(encoded)),
+                "ciphertext": ciphertext, "aad": base64::encode(path),
+                "scopeTag": hex::encode(mac.finalize().into_bytes()), "metadata": {}
+            })
+        };
+        let key_a = [0xA1; 32];
+        let key_b = [0xB2; 32];
+        let wrapped_a = wrap_to_public_key(&descriptor.public_encryption_key, &key_a)?;
+        let wrapped_b = wrap_to_public_key(&descriptor.public_encryption_key, &key_b)?;
+        let envelope_a = envelope(a, &key_a, &wrapped_a);
+        let envelope_b = envelope(b, &key_b, &wrapped_b);
+        for (path, stored) in [(a, &envelope_a), (b, &envelope_b)] {
+            fixture
+                .owner_write(path, Some(&serde_json::to_vec(stored)?))
+                .await?;
+        }
+        let receiver_secret = ReceiverSecret::from([0x91; 32]);
+        let receiver = base64::encode(ReceiverPublicKey::from(&receiver_secret).as_bytes());
+        let request = |path: &str, wrapped: &[u8]| {
+            let wrapped = base64::encode(wrapped);
+            let receiver = receiver.clone();
+            serde_json::json!({
+                "type": DECRYPT_REQUEST_TYPE, "targetNode": fixture.node_did,
+                "networkId": net, "alg": descriptor.alg, "keyVersion": 1,
+                "spaceId": space, "path": path,
+                "encryptedSymmetricKey": wrapped,
+                "encryptedSymmetricKeyHash": canonical_hash(&serde_json::json!(wrapped)),
+                "receiverPublicKey": receiver,
+                "receiverPublicKeyHash": canonical_hash(&serde_json::json!(receiver))
+            })
+        };
+        // Issue one real owner-signed A grant to the device. The device has
+        // no root authority, no B decrypt grant and no delegate KV/get.
+        let mut grant_caps = Capabilities::new();
+        grant_caps.with_action(
+            scoped(a).parse()?,
+            DECRYPT_ACTION.parse::<UcanAbility>()?,
+            [std::collections::BTreeMap::<String, serde_json::Value>::new()],
+        );
+        let grant = Payload {
+            issuer: fixture.owner_vm.parse::<DIDURLBuf>()?,
+            audience: fixture.device_did().parse::<DIDBuf>()?,
+            not_before: None,
+            expiration: test_invocation_expiration(),
+            nonce: Some(fixture.next_nonce()),
+            facts: Some(Vec::<serde_json::Value>::new()),
+            proof: vec![],
+            attenuation: grant_caps,
+        }
+        .sign(
+            fixture.owner.get_algorithm().unwrap_or_default(),
+            &fixture.owner,
+        )?
+        .encode()?;
+        let reply = fixture
+            .client
+            .post("/delegate")
+            .header(Header::new("Authorization", grant))
+            .dispatch()
+            .await;
+        let grant_status = reply.status();
+        let grant_body = reply.into_string().await.unwrap_or_default();
+        assert!(
+            grant_status.class().is_success(),
+            "A grant failed: {grant_status}: {grant_body}"
+        );
+        let grant_cid: Cid = serde_json::from_str::<serde_json::Value>(&grant_body)?["cid"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("grant missing CID"))?
+            .parse()?;
+
+        let signed = |body: &serde_json::Value| -> Result<String> {
+            let mut caps = Capabilities::new();
+            caps.with_action(
+                scoped(a).parse()?,
+                DECRYPT_ACTION.parse::<UcanAbility>()?,
+                [std::collections::BTreeMap::<String, serde_json::Value>::new()],
+            );
+            let fact = serde_json::json!({
+                "type": DECRYPT_REQUEST_TYPE, "targetNode": fixture.node_did,
+                "networkId": net, "bodyHash": canonical_hash(body),
+                "encryptedSymmetricKeyHash": body["encryptedSymmetricKeyHash"],
+                "receiverPublicKeyHash": body["receiverPublicKeyHash"],
+                "alg": descriptor.alg, "keyVersion": 1
+            });
+            Ok(Payload {
+                issuer: fixture.device_vm.parse::<DIDURLBuf>()?,
+                audience: fixture.node_did.parse::<DIDBuf>()?,
+                not_before: None,
+                expiration: test_invocation_expiration(),
+                nonce: Some(fixture.next_nonce()),
+                facts: Some(vec![fact]),
+                proof: vec![grant_cid],
+                attenuation: caps,
+            }
+            .sign(
+                fixture.device.get_algorithm().unwrap_or_default(),
+                &fixture.device,
+            )?
+            .encode()?)
+        };
+        for route in [
+            format!("/encryption/networks/{net}/decrypt"),
+            "/invoke".into(),
+        ] {
+            let send = |body: &serde_json::Value, header: String| {
+                fixture
+                    .client
+                    .post(route.clone())
+                    .header(Header::new("Authorization", header))
+                    .header(ContentType::JSON)
+                    .body(body.to_string())
+            };
+            let body_a = request(a, &wrapped_a);
+            let reply = send(&body_a, signed(&body_a)?).dispatch().await;
+            let status = reply.status();
+            let response = reply.into_string().await.unwrap_or_default();
+            assert_eq!(status, Status::Ok, "{route}: {response}");
+            let released: DecryptResponseBody = serde_json::from_str(&response)?;
+            let wrapped = base64::decode(&released.wrapped_key)?;
+            let peer: [u8; 32] = wrapped[..32].try_into()?;
+            let shared = receiver_secret.diffie_hellman(&ReceiverPublicKey::from(peer));
+            let recovered = ColumnEncryption::new(*shared.as_bytes())
+                .decrypt(&wrapped[32..])
+                .expect("receiver unwraps the released key");
+            assert_eq!(recovered, key_a, "{route}: wrong secret key released");
+
+            // B's ciphertext is already present locally; A's signed grant
+            // cannot release its key through either dispatch path.
+            let body_b = request(b, &wrapped_b);
+            let reply = send(&body_b, signed(&body_b)?).dispatch().await;
+            assert!(
+                !reply.status().class().is_success(),
+                "{route}: B key released"
+            );
+
+            let forged = request(a, &wrapped_b);
+            let reply = send(&forged, signed(&forged)?).dispatch().await;
+            assert!(
+                !reply.status().class().is_success(),
+                "{route}: forged A locator released B"
+            );
+            let mut missing = request(a, &wrapped_a);
+            missing.as_object_mut().unwrap().remove("path");
+            let reply = send(&missing, signed(&missing)?).dispatch().await;
+            assert!(
+                !reply.status().class().is_success(),
+                "{route}: missing signed locator accepted"
+            );
+        }
+        fixture.owner_write(a, None).await?;
+        let old_a = request(a, &wrapped_a);
+        for route in [
+            format!("/encryption/networks/{net}/decrypt"),
+            "/invoke".into(),
+        ] {
+            let reply = fixture
+                .client
+                .post(route)
+                .header(Header::new("Authorization", signed(&old_a)?))
+                .header(ContentType::JSON)
+                .body(old_a.to_string())
+                .dispatch()
+                .await;
+            assert_eq!(reply.status(), Status::Forbidden, "deleted A key released");
+        }
+        let mut transplanted = envelope_b.clone();
+        transplanted["aad"] = serde_json::json!(base64::encode(a));
+        fixture
+            .owner_write(a, Some(&serde_json::to_vec(&transplanted)?))
+            .await?;
+        let forged = request(a, &wrapped_b);
+        for (route, expected) in [
+            (
+                format!("/encryption/networks/{net}/decrypt"),
+                Status::Forbidden,
+            ),
+            ("/invoke".into(), Status::Forbidden),
+        ] {
+            let reply = fixture
+                .client
+                .post(route)
+                .header(Header::new("Authorization", signed(&forged)?))
+                .header(ContentType::JSON)
+                .body(forged.to_string())
+                .dispatch()
+                .await;
+            assert_eq!(reply.status(), expected, "transplanted B envelope released");
+        }
+        Ok(())
     }
 
     fn changes(reply: &SyncReply) -> Vec<(String, bool, Option<String>)> {

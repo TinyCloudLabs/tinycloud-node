@@ -1,5 +1,5 @@
 use crate::encryption::ColumnEncryption;
-use crate::encryption_network::NetworkId;
+use crate::encryption_network::{DecryptResource, DECRYPT_ACTION};
 use crate::hash::Hash;
 use crate::models::did_resolution::{verify_ucan_signature, UcanVerifyError};
 use crate::policy_capability::sql_caveat;
@@ -794,8 +794,12 @@ fn is_root_authority(cap: &util::Capability, delegator: &str) -> bool {
     match &cap.resource {
         Resource::Other(uri) => uri
             .as_str()
-            .parse::<NetworkId>()
-            .map(|network_id| did_principal_matches(network_id.owner_did(), delegator))
+            .parse::<DecryptResource>()
+            .map(|resource| {
+                did_principal_matches(resource.network().owner_did(), delegator)
+                    && (resource.scope().is_none()
+                        || cap.ability.as_ref().as_ref() == DECRYPT_ACTION)
+            })
             .unwrap_or(false),
         Resource::TinyCloud(_) => false,
     }

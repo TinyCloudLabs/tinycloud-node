@@ -9,9 +9,11 @@
 use std::sync::Arc;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+use hmac::{Hmac, Mac};
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, DbErr, EntityTrait, QueryFilter};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::Sha256;
 use thiserror::Error;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tinycloud_auth::identity::did_principal_matches;
@@ -33,6 +35,7 @@ use super::protocol::{
     NetworkAdminInvocation, DECRYPT_ACTION, DECRYPT_REQUEST_TYPE, DECRYPT_RESULT_TYPE,
     NETWORK_ADMIN_TYPE,
 };
+use super::resource::{DecryptResource, ScopedDecryptLocator};
 use super::types::{
     KeyBackendKind, NetworkDescriptor, NetworkMemberDescriptor, NetworkState, Threshold,
 };
@@ -44,6 +47,80 @@ fn network_id_matches(actual: &str, expected: &NetworkId) -> bool {
         .parse::<NetworkId>()
         .map(|actual| &actual == expected)
         .unwrap_or_else(|_| actual == expected.to_string())
+}
+
+fn decrypt_capability_matches(
+    actual: &str,
+    network_id: &NetworkId,
+    body: &DecryptRequestBody,
+) -> Result<DecryptResource, EncryptionServiceError> {
+    let expected = body
+        .resource()
+        .map_err(|e| EncryptionServiceError::InvalidBody(e.to_string()))?;
+    let capability = actual
+        .parse::<DecryptResource>()
+        .map_err(|_| EncryptionServiceError::Unauthorized)?;
+    if capability.network() != network_id {
+        return Err(EncryptionServiceError::NetworkMismatch);
+    }
+    if capability != expected {
+        return Err(EncryptionServiceError::Unauthorized);
+    }
+    Ok(capability)
+}
+
+fn verify_scoped_envelope(
+    scope: &ScopedDecryptLocator,
+    network_id: &NetworkId,
+    body: &DecryptRequestBody,
+    stored: Option<&Value>,
+    symmetric: &[u8],
+) -> Result<(), EncryptionServiceError> {
+    let stored = stored.ok_or(EncryptionServiceError::ScopeMismatch)?;
+    let ciphertext = stored
+        .get("ciphertext")
+        .and_then(Value::as_str)
+        .ok_or(EncryptionServiceError::ScopeMismatch)?;
+    let tag = stored
+        .get("scopeTag")
+        .and_then(Value::as_str)
+        .ok_or(EncryptionServiceError::ScopeMismatch)?;
+    let network = network_id.to_string();
+    if stored.get("v").and_then(Value::as_u64) != Some(1)
+        || stored.get("networkId").and_then(Value::as_str) != Some(network.as_str())
+        || stored.get("alg").and_then(Value::as_str) != Some(body.alg.as_str())
+        || stored.get("keyVersion").and_then(Value::as_i64) != Some(body.key_version)
+        || stored.get("encryptedSymmetricKey").and_then(Value::as_str)
+            != Some(body.encrypted_symmetric_key.as_str())
+        || stored
+            .get("encryptedSymmetricKeyHash")
+            .and_then(Value::as_str)
+            != Some(body.encrypted_symmetric_key_hash.as_str())
+        || symmetric.len() != 32
+        || tag.len() != 64
+        || !tag
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(EncryptionServiceError::ScopeMismatch);
+    }
+    let tag_bytes = hex::decode(tag).map_err(|_| EncryptionServiceError::ScopeMismatch)?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(symmetric)
+        .map_err(|_| EncryptionServiceError::ScopeMismatch)?;
+    mac.update(b"tinycloud.decrypt-scope/v1\n");
+    mac.update(network.as_bytes());
+    mac.update(b"\n");
+    mac.update(scope.space_id().to_string().as_bytes());
+    mac.update(b"\n");
+    mac.update(scope.path().as_bytes());
+    mac.update(b"\n");
+    mac.update(body.alg.as_bytes());
+    mac.update(b"\n");
+    mac.update(body.key_version.to_string().as_bytes());
+    mac.update(b"\n");
+    mac.update(ciphertext.as_bytes());
+    mac.verify_slice(&tag_bytes)
+        .map_err(|_| EncryptionServiceError::ScopeMismatch)
 }
 
 #[derive(Debug, Error)]
@@ -60,6 +137,8 @@ pub enum EncryptionServiceError {
     NetworkRevoked,
     #[error("decrypt action not permitted")]
     Unauthorized,
+    #[error("stored scoped envelope does not match the requested secret")]
+    ScopeMismatch,
     #[error("invocation audience does not match this node")]
     AudienceMismatch,
     #[error("invocation target node does not match this node")]
@@ -457,6 +536,16 @@ impl EncryptionService {
     ) -> Result<VerifiedDecrypt, EncryptionServiceError> {
         let body: DecryptRequestBody = serde_json::from_value(body_value.clone())
             .map_err(|e| EncryptionServiceError::InvalidBody(e.to_string()))?;
+        // This legacy owner-only API has no authoritative KV read. Scoped
+        // releases use the native route and its current-record check.
+        if body
+            .resource()
+            .map_err(|e| EncryptionServiceError::InvalidBody(e.to_string()))?
+            .scope()
+            .is_some()
+        {
+            return Err(EncryptionServiceError::Unauthorized);
+        }
 
         // ---- Static invariants ----
         if body.ty != DECRYPT_REQUEST_TYPE || invocation.facts.ty != DECRYPT_REQUEST_TYPE {
@@ -624,7 +713,7 @@ impl EncryptionService {
         network_id: &NetworkId,
         invocation: &InvocationInfo,
         body_value: &Value,
-    ) -> Result<(), EncryptionServiceError> {
+    ) -> Result<DecryptResource, EncryptionServiceError> {
         let body: DecryptRequestBody = serde_json::from_value(body_value.clone())
             .map_err(|e| EncryptionServiceError::InvalidBody(e.to_string()))?;
         let facts = native_decrypt_facts(invocation)?;
@@ -644,9 +733,8 @@ impl EncryptionService {
             .iter()
             .find(|capability| capability.ability.to_string() == DECRYPT_ACTION)
             .ok_or(EncryptionServiceError::Unauthorized)?;
-        if !network_id_matches(&capability.resource.to_string(), network_id) {
-            return Err(EncryptionServiceError::NetworkMismatch);
-        }
+        let resource =
+            decrypt_capability_matches(&capability.resource.to_string(), network_id, &body)?;
         let descriptor = self.get_network(network_id).await?;
         if descriptor.state != NetworkState::Active {
             return Err(EncryptionServiceError::NetworkNotActive(
@@ -676,7 +764,7 @@ impl EncryptionService {
         {
             return Err(EncryptionServiceError::HashMismatch("bodyHash"));
         }
-        Ok(())
+        Ok(resource)
     }
 
     pub async fn decrypt_authorized(
@@ -684,6 +772,7 @@ impl EncryptionService {
         network_id: &NetworkId,
         invocation: &InvocationInfo,
         body_value: &Value,
+        stored_envelope: Option<&Value>,
     ) -> Result<VerifiedDecrypt, EncryptionServiceError> {
         let body: DecryptRequestBody = serde_json::from_value(body_value.clone())
             .map_err(|e| EncryptionServiceError::InvalidBody(e.to_string()))?;
@@ -711,9 +800,7 @@ impl EncryptionService {
             .iter()
             .find(|c| c.ability.to_string() == DECRYPT_ACTION)
             .ok_or(EncryptionServiceError::Unauthorized)?;
-        if !network_id_matches(&cap.resource.to_string(), network_id) {
-            return Err(EncryptionServiceError::NetworkMismatch);
-        }
+        let resource = decrypt_capability_matches(&cap.resource.to_string(), network_id, &body)?;
 
         let descriptor = self.get_network(network_id).await?;
         match descriptor.state {
@@ -780,11 +867,6 @@ impl EncryptionService {
         let invocation_cid = native_invocation_cid(invocation)?;
         let request_hash =
             hash_hex(&[invocation_cid.as_bytes(), expected_body_hash.as_bytes()].concat());
-        // `/invoke` owns the single common invoker+nonce reservation for both
-        // KV and decrypt.  This authorized helper is only called after that
-        // reservation and must not consume the legacy encryption_nonce table a
-        // second time.  The direct encryption route still uses `decrypt`,
-        // which retains its own legacy replay boundary for compatibility.
 
         let network_row = encryption_network::Entity::find_by_id(network_id.to_string())
             .one(&self.db)
@@ -800,6 +882,9 @@ impl EncryptionService {
         let symmetric = self
             .backend
             .unwrap(sealed_private_key, &wrapped_key_bytes)?;
+        if let Some(scope) = resource.scope() {
+            verify_scoped_envelope(scope, network_id, &body, stored_envelope, &symmetric)?;
+        }
         let rewrapped = self.backend.rewrap(&symmetric, &receiver_key_bytes)?;
         drop(symmetric);
 
