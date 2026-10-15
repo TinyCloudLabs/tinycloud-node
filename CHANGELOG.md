@@ -2,7 +2,7 @@
 
 ## [Unreleased]
 
-- Account delegation session discovery keyset-pages delegation rows independently of ability fan-out, using a covering delegator/cursor index so large grant sets are not truncated (TC-1195).
+- Account delegation session discovery keyset-pages delegation rows independently of ability fan-out, using a composite delegator/id index so large grant sets are not truncated (TC-1195).
 
 ## [1.20.7] - 2026-10-14
 
