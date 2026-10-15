@@ -161,6 +161,7 @@ fn snapshot_query(roots: &[Hash]) -> WithQuery {
     let edges_name = Alias::new("authorization_edges");
     let bounded_name = Alias::new("bounded_edges");
     let nodes_name = Alias::new("graph_nodes");
+    let lookup_name = Alias::new("lookup_nodes");
     let id = Alias::new("id");
     let child = Alias::new("child");
     let parent = Alias::new("parent");
@@ -262,6 +263,20 @@ fn snapshot_query(roots: &[Hash]) -> WithQuery {
         .column(id.clone())
         .query(node_query)
         .to_owned();
+    // The authorization limit is 64 nodes. Keep one sentinel in the planner-
+    // visible metadata input; within_budget still counts every node from the
+    // edge-bounded graph_nodes result, so truncation cannot authorize a chain.
+    let lookup_cte = CommonTableExpression::new()
+        .table_name(lookup_name.clone())
+        .column(id.clone())
+        .query(
+            Query::select()
+                .column((nodes_name.clone(), id.clone()))
+                .from(nodes_name.clone())
+                .limit((MAX_CHAIN_TRAVERSAL_NODES + 1) as u64)
+                .to_owned(),
+        )
+        .to_owned();
     let null = || Expr::cust("NULL");
     let field = |table: Alias, column: Alias| Expr::col((table, column)).into();
     let node = |table: Alias| Expr::col((table, id.clone())).into();
@@ -323,7 +338,7 @@ fn snapshot_query(roots: &[Hash]) -> WithQuery {
     let mut delegations = snapshot_branch(
         1,
         [
-            node(nodes_name.clone()),
+            node(lookup_name.clone()),
             null(),
             Expr::col((delegation::Entity, delegation::Column::Delegator)).into(),
             Expr::col((delegation::Entity, delegation::Column::Delegatee)).into(),
@@ -341,16 +356,16 @@ fn snapshot_query(roots: &[Hash]) -> WithQuery {
         .from(delegation::Entity)
         .join(
             JoinType::InnerJoin,
-            nodes_name.clone(),
+            lookup_name.clone(),
             Expr::col((delegation::Entity, delegation::Column::Id))
-                .equals((nodes_name.clone(), id.clone())),
+                .equals((lookup_name.clone(), id.clone())),
         )
         .and_where(within_budget());
     query.union(UnionType::All, delegations);
     let mut abilities_query = snapshot_branch(
         2,
         [
-            node(nodes_name.clone()),
+            node(lookup_name.clone()),
             null(),
             null(),
             null(),
@@ -368,16 +383,16 @@ fn snapshot_query(roots: &[Hash]) -> WithQuery {
         .from(abilities::Entity)
         .join(
             JoinType::InnerJoin,
-            nodes_name.clone(),
+            lookup_name.clone(),
             Expr::col((abilities::Entity, abilities::Column::Delegation))
-                .equals((nodes_name.clone(), id.clone())),
+                .equals((lookup_name.clone(), id.clone())),
         )
         .and_where(within_budget());
     query.union(UnionType::All, abilities_query);
     let mut revocations = snapshot_branch(
         3,
         [
-            node(nodes_name.clone()),
+            node(lookup_name.clone()),
             null(),
             null(),
             null(),
@@ -395,9 +410,9 @@ fn snapshot_query(roots: &[Hash]) -> WithQuery {
         .from(revocation::Entity)
         .join(
             JoinType::InnerJoin,
-            nodes_name,
+            lookup_name,
             Expr::col((revocation::Entity, revocation::Column::Revoked))
-                .equals((Alias::new("graph_nodes"), id)),
+                .equals((Alias::new("lookup_nodes"), id)),
         )
         .and_where(within_budget());
     query.union(UnionType::All, revocations);
@@ -408,10 +423,24 @@ fn snapshot_query(roots: &[Hash]) -> WithQuery {
             .cte(edges_cte)
             .cte(bounded_cte)
             .cte(nodes_cte)
+            .cte(lookup_cte)
             .to_owned(),
     )
 }
 
+// The old metadata query had no ORDER BY. Authorization accepts any matching
+// ability, but the last rejected caveat supplies a diagnostic reason. Use the
+// typed `(resource, ability)` order on every backend; only that diagnostic can
+// differ from the old backend-dependent order.
+fn sort_abilities(abilities: &mut HashMap<Hash, Vec<abilities::Model>>) {
+    for rows in abilities.values_mut() {
+        rows.sort_unstable_by(|left, right| {
+            left.resource
+                .cmp(&right.resource)
+                .then_with(|| left.ability.cmp(&right.ability))
+        });
+    }
+}
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct AuthGraphSnapshot {
     parents: HashMap<Hash, Vec<Hash>>,
@@ -496,6 +525,7 @@ impl AuthGraphSnapshot {
             ancestor_ids.sort_by(|left, right| left.as_ref().cmp(right.as_ref()));
             ancestor_ids.dedup();
         }
+        sort_abilities(&mut abilities);
         let mut visited = nodes.iter().copied().collect::<HashSet<_>>();
         let mut frontier = nodes.clone();
         while let Some(current) = frontier.pop() {
@@ -673,6 +703,9 @@ mod tests {
         {
             ability_rows.entry(row.delegation).or_default().push(row);
         }
+        // Compare the old loader's rows under the new explicit order, rather
+        // than accidentally pinning one backend's unspecified row order.
+        sort_abilities(&mut ability_rows);
         let revoked = revocation::Entity::find()
             .filter(revocation::Column::Revoked.is_in(nodes.iter().copied()))
             .all(db)
@@ -738,18 +771,26 @@ mod tests {
         )));
         windowed.update(db).await.unwrap();
 
+        // Deliberately insert away from canonical `(resource, ability)` order.
+        // A one-ability fixture cannot detect changed rejection-reason order.
         for id in [ids[0], ids[2], alias] {
-            abilities::ActiveModel {
-                delegation: Set(id),
-                resource: Set("tinycloud:did:key:actor:files/kv/doc".parse().unwrap()),
-                ability: Set("tinycloud.kv/get".to_string().try_into().unwrap()),
-                caveats: Set(Caveats(
-                    [("limit".to_string(), serde_json::json!({"max": 7}))].into(),
-                )),
+            for (index, action) in ["put", "get", "list", "del"].iter().enumerate() {
+                for suffix in ["z", "b", "a"] {
+                    abilities::ActiveModel {
+                        delegation: Set(id),
+                        resource: Set(format!("tinycloud:did:key:actor:files/kv/{suffix}")
+                            .parse()
+                            .unwrap()),
+                        ability: Set(format!("tinycloud.kv/{action}").try_into().unwrap()),
+                        caveats: Set(Caveats(
+                            [("limit".to_string(), serde_json::json!({"max": index + 1}))].into(),
+                        )),
+                    }
+                    .insert(db)
+                    .await
+                    .unwrap();
+                }
             }
-            .insert(db)
-            .await
-            .unwrap();
         }
         revocation::ActiveModel {
             id: Set(hash(b"cross-backend-revocation")),
@@ -777,11 +818,129 @@ mod tests {
         );
     }
 
+    async fn assert_canonical_caveat_reason(db: &DatabaseConnection) {
+        let id = hash(b"canonical-overlapping-caveats");
+        delegation::ActiveModel {
+            id: Set(id),
+            delegator: Set("did:key:actor".to_string()),
+            delegatee: Set("did:key:alias".to_string()),
+            expiry: Set(None),
+            issued_at: Set(None),
+            not_before: Set(None),
+            facts: Set(None),
+            serialization: Set(id.as_ref().to_vec()),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        let sql_caveats = Caveats(
+            [(
+                "0".to_string(),
+                serde_json::json!({
+                    "mode": "constrained-statements",
+                    "readOnly": true,
+                    "statements": [
+                        {"name": "get", "sql": "SELECT 1", "fixedParams": []}
+                    ]
+                }),
+            )]
+            .into(),
+        );
+        for (resource, caveats) in [
+            (
+                "tinycloud:did:key:actor:files/kv",
+                Caveats([("tenant".to_string(), serde_json::json!("a"))].into()),
+            ),
+            ("tinycloud:did:key:actor:files/kv/doc", sql_caveats.clone()),
+        ] {
+            abilities::ActiveModel {
+                delegation: Set(id),
+                resource: Set(resource.parse().unwrap()),
+                ability: Set("tinycloud.kv/get".to_string().try_into().unwrap()),
+                caveats: Set(caveats),
+            }
+            .insert(db)
+            .await
+            .unwrap();
+        }
+        let snapshot = AuthGraphSnapshot::load(db, &[id]).await.unwrap();
+        let rows = snapshot.abilities(&id);
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows[0].resource < rows[1].resource,
+            "canonical resource order"
+        );
+
+        let capability = crate::util::Capability {
+            resource: "tinycloud:did:key:actor:files/kv/doc".parse().unwrap(),
+            ability: "tinycloud.kv/get".to_string().try_into().unwrap(),
+            caveats: Caveats::default(),
+        };
+        let parent = id.to_cid(0x55);
+        let err = crate::models::invocation::authorize_holder(
+            db,
+            "did:key:alias",
+            std::slice::from_ref(&capability),
+            &[parent],
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                crate::models::invocation::Error::InvalidInvocation(
+                    crate::models::invocation::InvocationError::CaveatsNotContained(reason)
+                ) if reason == "containment-caveat-required"
+            ),
+            "unexpected canonical rejection: {err:?}"
+        );
+
+        // A matching constrained caveat still authorizes; sorting changes
+        // only which diagnostic wins if *all* candidates reject.
+        crate::models::invocation::authorize_holder(
+            db,
+            "did:key:alias",
+            &[crate::util::Capability {
+                caveats: sql_caveats,
+                ..capability
+            }],
+            &[parent],
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn assert_closure_limit(db: &DatabaseConnection) {
+        for size in [MAX_CHAIN_TRAVERSAL_NODES + 1, MAX_CHAIN_TRAVERSAL_NODES + 2] {
+            let ids = insert_chain(db, &format!("too-deep-{size}"), size - 1).await;
+            assert!(matches!(
+                AuthGraphSnapshot::load(db, &[ids[0]]).await,
+                Err(ChainTraversalError::LimitExceeded)
+            ));
+        }
+
+        let ids = insert_chain(db, "boundary", MAX_CHAIN_TRAVERSAL_NODES - 1).await;
+        let snapshot = AuthGraphSnapshot::load(db, &[ids[0]]).await.unwrap();
+        assert_eq!(
+            snapshot.chain_ids_from(&ids[0]).len(),
+            MAX_CHAIN_TRAVERSAL_NODES
+        );
+        assert!(
+            snapshot.delegation(ids.last().unwrap()).is_some(),
+            "the 64th node must not be silently truncated"
+        );
+        assert_eq!(snapshot, load_sequential(db, &[ids[0]]).await.unwrap());
+    }
+
     #[tokio::test]
     async fn sqlite_snapshot_matches_sequential_for_chains_windows_caveats_revocations_aliases() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
         assert_fixture_equivalence(&db).await;
+        assert_canonical_caveat_reason(&db).await;
+        assert_closure_limit(&db).await;
     }
 
     #[tokio::test]
@@ -794,6 +953,8 @@ mod tests {
             return;
         };
         assert_fixture_equivalence(&fixture.conn).await;
+        assert_canonical_caveat_reason(&fixture.conn).await;
+        assert_closure_limit(&fixture.conn).await;
     }
 
     struct MySqlGraphFixture {
@@ -869,6 +1030,8 @@ mod tests {
                 .unwrap();
         }
         assert_fixture_equivalence(&db).await;
+        assert_canonical_caveat_reason(&db).await;
+        assert_closure_limit(&db).await;
         db.close().await.unwrap();
         admin.close().await.unwrap();
     }
@@ -932,23 +1095,6 @@ mod tests {
                 "depth {depth}"
             );
         }
-    }
-
-    #[tokio::test]
-    async fn snapshot_load_fails_closed_at_traversal_limit() {
-        let (db, _) = counted_database().await;
-        let ids = insert_chain(&db, "deep", MAX_CHAIN_TRAVERSAL_NODES).await;
-        assert!(matches!(
-            AuthGraphSnapshot::load(&db, &[ids[0]]).await,
-            Err(ChainTraversalError::LimitExceeded)
-        ));
-
-        let boundary = insert_chain(&db, "boundary", MAX_CHAIN_TRAVERSAL_NODES - 1).await;
-        let snapshot = AuthGraphSnapshot::load(&db, &[boundary[0]]).await.unwrap();
-        assert_eq!(
-            snapshot.chain_ids_from(&boundary[0]).len(),
-            MAX_CHAIN_TRAVERSAL_NODES
-        );
     }
 
     #[tokio::test]

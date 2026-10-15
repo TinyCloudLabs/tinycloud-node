@@ -2,7 +2,7 @@
 
 ## [Unreleased]
 
-- Load each invocation's complete authorization graph (proof edges, delegation windows and facts, abilities and caveats, revocations) in one SQL round trip on PostgreSQL, SQLite and MySQL rather than four, without changing Rust capability validation or schema (TC-735).
+- Load each invocation's authorization graph in one SQL round trip on PostgreSQL, SQLite and MySQL rather than four. Bound metadata lookups to 65 nodes for indexed access on large tables while the unchanged 64-node authorization limit still denies oversized chains. Sort abilities by `(resource, ability)` on every backend; authorization decisions are unchanged, but the diagnostic reason when multiple caveats all reject may normalize. No schema change (TC-735).
 - Account delegation session discovery keyset-pages delegation rows independently of ability fan-out, using a composite delegator/id index so large grant sets are not truncated (TC-1195).
 - `/attestation` quotes the SHA-256 of `key_binding` as REPORTDATA and returns it as `key_binding_sha256`; the quote no longer carries the raw binding. Before answering 200 the node checks that the returned TDX v4 quote's REPORTDATA field holds that digest (a structural check; it does not verify the quote). When the TEE can't produce a bound quote, the endpoint returns 503 instead of 200 `mode: "classic"`, and the dstack client reports a guest-agent error status instead of a parse error. `nonce` must be 1-64 characters of `A-Z a-z 0-9 - _` (400 otherwise), and the endpoint now shares the public routes' per-IP rate limit. Verifiers recompute the digest from their own nonce and expected DID and must still verify the quote; see `docs/attestation.md` (TC-963).
 
