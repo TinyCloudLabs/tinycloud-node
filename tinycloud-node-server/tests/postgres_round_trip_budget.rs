@@ -113,15 +113,16 @@ use tokio::{
     net::{TcpListener, TcpStream},
 };
 
-/// Round trips allowed per flow; see the module docs. Measured with
-/// `test_before_acquire(false)`, database identity resolve as one statement,
-/// the read audit as one statement and no second sequence lock (TC-951):
+/// Round trips allowed per flow; see the module docs. Each invocation's
+/// transaction-scoped authorization snapshot now fetches edges, delegations,
+/// abilities and revocations in one tagged query (TC-735); capability checks
+/// and connection-release pings are unchanged. Measured on PostgreSQL:
 ///
-/// - sign-in 75 = peer key 0 + host `/delegate` 17 + session `/delegate` 18
-///   + account-space SQL write 40;
-/// - kv put 37;
-/// - kv get 22, including the read-audit commit.
-const BUDGETS: [(&str, u64); 3] = [("sign-in", 75), ("kv put", 37), ("kv get", 22)];
+/// - sign-in 69 = peer key 0 + host `/delegate` 17 + session `/delegate` 18
+///   + account-space SQL write 34;
+/// - kv put 34;
+/// - kv get 16, including the read-audit commit.
+const BUDGETS: [(&str, u64); 3] = [("sign-in", 69), ("kv put", 34), ("kv get", 16)];
 
 /// Full sign-in plus put plus get rounds run before the measured one.
 const WARM_UP_ROUNDS: u8 = 3;
