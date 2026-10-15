@@ -346,6 +346,9 @@ const calledHelpers = [
   'vector_shipped_name_counts', 'report_shipped_event_delta', 'vector_event_count',
   'assert_no_console_marker', 'wait_next_line', 'send_from_container', 'send_probe',
   'send_positive_probe', 'run_probe_sender', 'sender_error_code', 'probe_routing_error_matches_target',
+  'probe_target_is_name', 'name_network_names_from_json', 'name_network_container_ids_from_json',
+  'name_peer_matches_target', 'hosts_file_has_name', 'name_resolver_positive_control',
+  'prove_name_target_structure',
   'compose_half_cpu_cmd', 'measure_burst', 'run_isolation_leak_self_test',
 ];
 const missing = calledHelpers.filter((name) => !declared.has(name));
@@ -523,9 +526,9 @@ run_isolation_leak_self_test host host 127.0.0.1
 
 probe_targets=("$vector_ip" "$app_gateway" vector host.docker.internal 127.0.0.1)
 for target in "${probe_targets[@]}"; do
-  assert_isolated_probe "node->$target" container "container:$NODE_ID" "$target"
-  assert_isolated_probe "ingress->$target" container "container:$INGRESS_ID" "$target"
-  assert_isolated_probe "postgres->$target" container "container:$PG_ID" "$target"
+  assert_isolated_probe "node->$target" container "container:$NODE_ID" "$target" "$NODE_ID"
+  assert_isolated_probe "ingress->$target" container "container:$INGRESS_ID" "$target" "$INGRESS_ID"
+  assert_isolated_probe "postgres->$target" container "container:$PG_ID" "$target" "$PG_ID"
 done
 
 host_ips=$(ip -o -4 addr show scope global | awk '{split($4,a,"/"); print a[1]}')

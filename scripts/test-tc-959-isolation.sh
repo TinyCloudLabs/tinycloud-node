@@ -4,6 +4,7 @@ set -Eeuo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 source "$ROOT/scripts/tc-959-isolation.sh"
 
+LOGS_SHOULD_FAIL=0
 METRICS_SCRAPE_INTERVAL_SECONDS=1
 ISOLATION_SETTLE_SECONDS=2
 TEST_NOW_MS=3000
@@ -29,12 +30,68 @@ vector_shipped_name_counts() {
 }
 report_shipped_event_delta() { :; }
 compose_cmd() { printf '%s\n' test-vector; }
-LOGS_SHOULD_FAIL=0
+NAME_STUBS=0
+NAME_SENDER_ID=""
+NAME_SENDER_NETWORKS='{"default":{}}'
+NAME_VECTOR_NETWORKS='{"logship":{}}'
+NAME_NETWORK_CONTAINERS='{"sender-id":{"Name":"tinycloud"},"peer-id":{"Name":"other"}}'
+NAME_SENDER_METADATA='{"name":"/tinycloud-container","hostname":"tinycloud-host","service":"tinycloud","networks":{"default":{"Aliases":["tinycloud"],"DNSNames":["tinycloud-container"]}}}'
+NAME_PEER_METADATA='{"name":"/other","hostname":"other-host","service":"other","networks":{"default":{"Aliases":["other"],"DNSNames":["other"]}}}'
+NAME_HOSTS='127.0.0.1 localhost'
+NAME_INSPECT_FAIL=0
+NAME_NETWORK_INSPECT_FAIL=0
+NAME_HOSTS_FAIL=0
+NAME_RESOLVER_MODE=ok
+NAME_RESOLVER_NETWORK_FILE=""
 docker_cmd() {
   if [[ "$1" == logs ]]; then
     if (( LOGS_SHOULD_FAIL )); then printf '%s\n' 'stub docker logs failure' >&2; return 1; fi
     printf '%s\n' "$RAW_CONSOLE_OUTPUT"
     return 0
+  fi
+  if (( NAME_STUBS )); then
+    case "$1" in
+      inspect)
+        if (( NAME_INSPECT_FAIL )); then return 1; fi
+        if [[ "${3:-}" == '{{json .NetworkSettings.Networks}}' ]]; then
+          if [[ "${4:-}" == "$NAME_SENDER_ID" ]]; then printf '%s\n' "$NAME_SENDER_NETWORKS"
+          elif [[ "${4:-}" == "$VECTOR_ID" ]]; then printf '%s\n' "$NAME_VECTOR_NETWORKS"
+          else printf '%s\n' "$NAME_PEER_METADATA"
+          fi
+          return 0
+        fi
+        if [[ "${3:-}" == *networks* ]]; then
+          if [[ "${4:-}" == "$NAME_SENDER_ID" ]]; then printf '%s\n' "$NAME_SENDER_METADATA"
+          else printf '%s\n' "$NAME_PEER_METADATA"
+          fi
+          return 0
+        fi
+        ;;
+      network)
+        if (( NAME_NETWORK_INSPECT_FAIL )); then return 1; fi
+        printf '%s\n' "$NAME_NETWORK_CONTAINERS"
+        return 0
+        ;;
+      exec)
+        if (( NAME_HOSTS_FAIL )); then return 1; fi
+        [[ "${2:-}" == "$NAME_SENDER_ID" && "${3:-}" == cat && "${4:-}" == /etc/hosts ]] || return 1
+        printf '%s\n' "$NAME_HOSTS"
+        return 0
+        ;;
+      timeout)
+        if [[ -n "$NAME_RESOLVER_NETWORK_FILE" ]]; then
+          for arg in "$@"; do
+            if [[ "$arg" == "container:$NAME_SENDER_ID" ]]; then printf '%s\n' "$arg" >"$NAME_RESOLVER_NETWORK_FILE"; fi
+          done
+
+        fi
+        case "$NAME_RESOLVER_MODE" in
+          ok) printf '%s\n' GELF_RESOLVER_OK; return 0 ;;
+          eai) printf '%s\n' 'GELF_RESOLVER_ERROR code=EAI_AGAIN'; return 1 ;;
+          *) return 1 ;;
+        esac
+        ;;
+    esac
   fi
   [[ "$1" == inspect ]] && printf '%s\n' true
 }
@@ -74,6 +131,7 @@ expect_probe_failure() {
 
 prepare_sender_error_probe() {
   TEST_NOW_MS=50000
+  SENDER_EXIT=1
   METRIC_SAMPLES=('10 51000' '10 52000')
   SHIPPED_SAMPLES=(5)
   SHIPPED_NAME_SAMPLES=('[]')
@@ -84,6 +142,51 @@ reset_fixtures() {
   exec 3< <(printf '%s\n' "${METRIC_SAMPLES[@]}")
   exec 4< <(printf '%s\n' "${SHIPPED_SAMPLES[@]}")
   exec 6< <(printf '%s\n' "${SHIPPED_NAME_SAMPLES[@]}")
+}
+
+prepare_name_probe() {
+  NAME_STUBS=1
+  NAME_SENDER_ID=sender-id
+  VECTOR_ID=vector-id
+  NAME_SENDER_NETWORKS='{"default":{}}'
+  NAME_VECTOR_NETWORKS='{"logship":{}}'
+  NAME_NETWORK_CONTAINERS='{"sender-id":{"Name":"tinycloud"},"peer-id":{"Name":"other"}}'
+  NAME_SENDER_METADATA='{"name":"/tinycloud-container","hostname":"tinycloud-host","service":"tinycloud","networks":{"default":{"Aliases":["tinycloud"],"DNSNames":["tinycloud-container"]}}}'
+  NAME_PEER_METADATA='{"name":"/other","hostname":"other-host","service":"other","networks":{"default":{"Aliases":["other"],"DNSNames":["other"]}}}'
+  NAME_HOSTS='127.0.0.1 localhost'
+  NAME_INSPECT_FAIL=0
+  NAME_NETWORK_INSPECT_FAIL=0
+  NAME_HOSTS_FAIL=0
+  NAME_RESOLVER_MODE=ok
+  NAME_RESOLVER_NETWORK_FILE="$CONTROL/resolver-network"
+  SENDER_EXIT=1
+  SENDER_OUTPUT='GELF_SEND_ERROR code=EAI_AGAIN'
+  TEST_NOW_MS=60000
+  METRIC_SAMPLES=('10 61000' '10 62000' '10 63000' '10 64000')
+  SHIPPED_SAMPLES=(5 5)
+  SHIPPED_NAME_SAMPLES=('[]' '[]')
+  RECORD_LINES=()
+  : >"$NAME_RESOLVER_NETWORK_FILE"
+  reset_fixtures
+}
+
+expect_name_proof_failure() {
+  local expected=$1 target=${2:-vector} status
+  if prove_name_target_structure 'stub-name-proof' "$NAME_SENDER_ID" "$target" EAI_AGAIN; then
+    fail "name target proof accepted $expected"
+  else
+    status=$?
+  fi
+  assert_eq "$status" 2
+  [[ "${RECORD_LINES[*]}" == *"$expected"* ]] || fail "name target proof did not report $expected: ${RECORD_LINES[*]}"
+}
+
+expect_name_isolation_failure() {
+  local expected=$1 target=$2 output
+  if output=$(assert_isolated_probe "stub-name->$target" container "container:$NAME_SENDER_ID" "$target" "$NAME_SENDER_ID" 2>&1); then
+    fail "name isolation check accepted $expected"
+  fi
+  [[ "$output" == *"$expected"* ]] || fail "name isolation check did not explain $expected: $output"
 }
 wait_vector
 wait_node
@@ -126,18 +229,6 @@ SHIPPED_NAME_SAMPLES=('[]' '[{"event":"node_warning","event_code":"invocation_re
 reset_fixtures
 run_isolation_leak_self_test host host 127.0.0.1
 assert_eq "$SEND_COUNT" 1
-# Not-routable sender errors pass only after fresh +0/+0 samples for a matching target type.
-TEST_NOW_MS=20000
-METRIC_SAMPLES=('10 21000' '10 22000' '10 23000' '10 24000')
-SHIPPED_SAMPLES=(5 5)
-SHIPPED_NAME_SAMPLES=('[]' '[]')
-SENDER_EXIT=1
-SENDER_OUTPUT='GELF_SEND_ERROR code=ENOTFOUND'
-reset_fixtures
-RECORD_LINES=()
-assert_isolated_probe 'name target' container test-network vector
-[[ "${RECORD_LINES[*]}" == *"name target not routable (ENOTFOUND)"* ]] || fail "name target ENOTFOUND was not reported as not routable"
-[[ "${RECORD_LINES[*]}" == *"source=0 shipped_probe=0"* ]] || fail "name target did not require zero deltas"
 
 # ENOTFOUND is only valid for names; reachability errors are only valid for IP literals.
 prepare_sender_error_probe
@@ -180,7 +271,7 @@ else
 fi
 assert_eq "$SEND_COUNT" 3
 assert_eq "$(wc -c <"$SEND_COUNT_FILE")" 3
-[[ "${RECORD_LINES[*]}" == *"EAI_AGAIN remained after 3 attempts"* ]] || fail "EAI_AGAIN retry exhaustion was not reported"
+[[ "${RECORD_LINES[*]}" == *"missing_container_id"* ]] || fail "EAI_AGAIN did not require structural proof"
 SEND_COUNT_FILE=""
 
 prepare_sender_error_probe
@@ -194,14 +285,13 @@ expect_probe_failure 'status=2' vector 126 'docker run failed'
 prepare_sender_error_probe
 expect_probe_failure 'status=2' vector 1 'usage: send-gelf HOST PORT JSON'
 
-# A not-routable error contradicts a received probe and therefore cannot pass.
-TEST_NOW_MS=40000
-METRIC_SAMPLES=('10 41000' '10 42000' '11 43000' '11 44000')
+prepare_name_probe
+SENDER_OUTPUT='GELF_SEND_ERROR code=ENOTFOUND'
+METRIC_SAMPLES=('10 61000' '10 62000' '11 63000' '11 64000')
 SHIPPED_SAMPLES=(5 6)
 SHIPPED_NAME_SAMPLES=('[]' '[{"event":"node_warning","event_code":"invocation_replay_insert_failed","count":1}]')
-SENDER_OUTPUT='GELF_SEND_ERROR code=ENOTFOUND'
 reset_fixtures
-expect_probe_failure 'isolation check failed' vector 1 "$SENDER_OUTPUT"
+expect_name_isolation_failure 'status=1' vector
 
 # Positive controls and the isolation leak self-test never accept sender errors.
 SENDER_OUTPUT='GELF_SEND_ERROR code=ENOTFOUND'
@@ -215,6 +305,97 @@ if output=$(run_isolation_leak_self_test host host 127.0.0.1 2>&1); then
   fail "leak self-test accepted a sender error"
 fi
 [[ "$output" == *"could not deliver its allowed packet"* ]] || fail "leak self-test sender error was not fatal: $output"
+
+# Name errors require independent structure and a successful same-network resolver control.
+prepare_name_probe
+assert_isolated_probe 'vector name with transient DNS errors' container "container:$NAME_SENDER_ID" vector "$NAME_SENDER_ID"
+assert_eq "$SEND_COUNT" 3
+assert_eq "$(<"$NAME_RESOLVER_NETWORK_FILE")" "container:$NAME_SENDER_ID"
+[[ "${RECORD_LINES[*]}" == *"name unresolvable (EAI_AGAIN); structural: sender_networks=default vector_networks=logship shared_networks=0 alias_matches=0 hosts_entry=0 resolver_control=ok error_code=EAI_AGAIN"* ]] || fail "name proof did not report safe structural evidence: ${RECORD_LINES[*]}"
+[[ "${RECORD_LINES[*]}" == *"fresh source +0 and shipped +0"* ]] || fail "name proof passed without zero traffic deltas"
+
+prepare_name_probe
+SENDER_OUTPUT='GELF_SEND_ERROR code=ENOTFOUND'
+assert_isolated_probe 'vector name with ENOTFOUND' container "container:$NAME_SENDER_ID" vector "$NAME_SENDER_ID"
+assert_eq "$SEND_COUNT" 1
+
+prepare_name_probe
+NAME_VECTOR_NETWORKS='{"default":{}}'
+expect_name_proof_failure 'shared_networks=1'
+
+prepare_name_probe
+NAME_PEER_METADATA='{"name":"/peer","hostname":"peer-host","service":"peer","networks":{"default":{"Aliases":["vector"],"DNSNames":["peer"]}}}'
+expect_name_proof_failure 'alias_matches=1'
+
+prepare_name_probe
+NAME_PEER_METADATA='{"name":"/peer","hostname":"vector","service":"peer","networks":{"default":{"Aliases":["peer"],"DNSNames":["peer"]}}}'
+expect_name_proof_failure 'alias_matches=1'
+
+prepare_name_probe
+NAME_PEER_METADATA='{"name":"/vector","hostname":"peer-host","service":"peer","networks":{"default":{"Aliases":["peer"],"DNSNames":["peer"]}}}'
+expect_name_proof_failure 'alias_matches=1'
+
+prepare_name_probe
+NAME_PEER_METADATA='{"name":"/peer","hostname":"peer-host","service":"vector","networks":{"default":{"Aliases":["peer"],"DNSNames":["peer"]}}}'
+expect_name_proof_failure 'alias_matches=1'
+
+prepare_name_probe
+NAME_PEER_METADATA='{"name":"/peer","hostname":"peer-host","service":"peer","networks":{"default":{"Aliases":["peer"],"DNSNames":["vector"]}}}'
+expect_name_proof_failure 'alias_matches=1'
+
+prepare_name_probe
+NAME_HOSTS_FAIL=1
+expect_name_proof_failure 'hosts_entry=unreadable'
+
+prepare_name_probe
+NAME_HOSTS='127.0.0.1 localhost host.docker.internal'
+expect_name_proof_failure 'hosts_entry=1' host.docker.internal
+
+prepare_name_probe
+NAME_HOSTS='127.0.0.1 localhost host.docker.internal'
+SENDER_EXIT=0
+SENDER_OUTPUT=""
+METRIC_SAMPLES=('10 61000' '10 62000' '10 63000' '10 64000')
+SHIPPED_SAMPLES=(5 5)
+SHIPPED_NAME_SAMPLES=('[]' '[]')
+reset_fixtures
+assert_isolated_probe 'hosts-mapped name is a real send' container "container:$NAME_SENDER_ID" host.docker.internal "$NAME_SENDER_ID"
+assert_eq "$SEND_COUNT" 1
+
+prepare_name_probe
+NAME_INSPECT_FAIL=1
+expect_name_proof_failure 'inspect_error=1'
+
+prepare_name_probe
+NAME_NETWORK_INSPECT_FAIL=1
+expect_name_proof_failure 'network_inspect_error=1'
+
+prepare_name_probe
+NAME_SENDER_NETWORKS='{}'
+expect_name_proof_failure 'sender_networks=empty'
+
+prepare_name_probe
+NAME_VECTOR_NETWORKS='{}'
+expect_name_proof_failure 'vector_networks=empty'
+
+prepare_name_probe
+NAME_RESOLVER_MODE=eai
+expect_name_proof_failure 'resolver_control=failed'
+
+prepare_name_probe
+NAME_RESOLVER_MODE=fail
+expect_name_proof_failure 'resolver_control=failed'
+
+prepare_name_probe
+METRIC_SAMPLES=('10 61000' '10 62000' '11 63000' '11 64000')
+reset_fixtures
+expect_name_isolation_failure 'status=1' vector
+
+prepare_name_probe
+SENDER_OUTPUT='GELF_SEND_ERROR code=EAI_AGAIN'
+expect_probe_failure 'status=2' 10.255.253.2 1 "$SENDER_OUTPUT"
+
+NAME_STUBS=0
 SENDER_EXIT=0
 SENDER_OUTPUT=""
 printf '%s\n' 'PASS: sender failures are classified by exact code, target type, and context'
@@ -236,12 +417,13 @@ unset -f vector_shipped_count vector_shipped_name_counts vector_event_count asse
 source "$ROOT/scripts/tc-959-isolation.sh"
 LOGS_SHOULD_FAIL=1
 for reader in vector_shipped_count vector_shipped_name_counts vector_event_count assert_no_console_marker; do
-  if output=$("$reader" TC959_FORGED_PROBE_CANARY_UNEXPECTED_FIELD 2>&1); then
+  if output=$( ( "$reader" TC959_FORGED_PROBE_CANARY_UNEXPECTED_FIELD ) 2>&1); then
     fail "$reader passed after docker logs failed"
   fi
   [[ "$output" == *"docker logs failed"* ]] || fail "$reader did not fail closed: $output"
 done
 LOGS_SHOULD_FAIL=0
+printf '%s\n' 'PASS: console readers fail closed on docker logs errors'
 
 # Host-port preflight reports the owning Compose service before startup.
 PORT_HOLDER_MODE=container

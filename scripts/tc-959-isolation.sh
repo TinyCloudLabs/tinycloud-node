@@ -240,10 +240,189 @@ probe_routing_error_matches_target() {
     *) return 1 ;;
   esac
 }
+probe_target_is_name() {
+  [[ "$1" == vector || "$1" == host.docker.internal ]]
+}
+
+name_network_names_from_json() {
+  node -e '
+    const fs = require("node:fs");
+    let networks;
+    try { networks = JSON.parse(fs.readFileSync(0, "utf8")); } catch { process.exit(2); }
+    if (!networks || typeof networks !== "object" || Array.isArray(networks)) process.exit(2);
+    const names = Object.keys(networks);
+    if (names.length === 0) process.exit(3);
+    if (names.some((name) => !/^[A-Za-z0-9_.-]+$/.test(name))) process.exit(2);
+    process.stdout.write(`${names.sort().join(",")}\n`);
+  '
+}
+
+name_network_container_ids_from_json() {
+  node -e '
+    const fs = require("node:fs");
+    let containers;
+    try { containers = JSON.parse(fs.readFileSync(0, "utf8")); } catch { process.exit(2); }
+    if (containers === null) containers = {};
+    if (typeof containers !== "object" || Array.isArray(containers)) process.exit(2);
+    const ids = Object.keys(containers);
+    if (ids.some((id) => !/^[A-Za-z0-9_.-]+$/.test(id))) process.exit(2);
+    if (ids.length) process.stdout.write(`${ids.join("\n")}\n`);
+  '
+}
+
+name_peer_matches_target() {
+  local network=$1 target=$2 peer_json=$3
+  printf '%s\n' "$peer_json" | node -e '
+    const fs = require("node:fs");
+    const [network, target] = process.argv.slice(1);
+    let peer;
+    try { peer = JSON.parse(fs.readFileSync(0, "utf8")); } catch { process.exit(2); }
+    if (!peer || typeof peer !== "object" || Array.isArray(peer) ||
+        typeof peer.name !== "string" || typeof peer.hostname !== "string" ||
+        (peer.service !== null && typeof peer.service !== "string") ||
+        !peer.networks || typeof peer.networks !== "object" || !Object.hasOwn(peer.networks, network)) {
+      process.exit(2);
+    }
+    const endpoint = peer.networks[network];
+    if (!endpoint || typeof endpoint !== "object" || Array.isArray(endpoint)) process.exit(2);
+    const aliases = endpoint.Aliases ?? [];
+    const dnsNames = endpoint.DNSNames ?? [];
+    if (!Array.isArray(aliases) || !Array.isArray(dnsNames) ||
+        aliases.some((name) => typeof name !== "string") ||
+        dnsNames.some((name) => typeof name !== "string")) process.exit(2);
+    const names = [peer.name.replace(/^\/+/, ""), peer.hostname, peer.service, ...aliases, ...dnsNames];
+    process.exit(names.includes(target) ? 0 : 1);
+  ' "$network" "$target"
+}
+
+hosts_file_has_name() {
+  local hosts_file=$1 target=$2
+  awk -v target="$target" '
+    /^[[:space:]]*#/ { next }
+    {
+      for (i = 2; i <= NF; i++) {
+        if ($i ~ /^#/) break;
+        if ($i == target) found = 1;
+      }
+    }
+    END { exit !found }
+  ' <<<"$hosts_file"
+}
+
+name_resolver_positive_control() {
+  local target_container=$1 result project=${PROJECT:-tc959-isolation-test}
+  result=$(docker_cmd timeout 60 run --rm \
+    --label "com.docker.compose.project=$project" \
+    --label "tc959.probe=true" \
+    --network "container:$target_container" \
+    node:20-alpine@sha256:fb4cd12c85ee03686f6af5362a0b0d56d50c58a04632e6c0fb8363f609372293 \
+    node -e 'require("node:dns").lookup("tinycloud", (error) => {
+      if (error) {
+        process.stderr.write(`GELF_RESOLVER_ERROR code=${error.code === "EAI_AGAIN" ? "EAI_AGAIN" : "other"}\n`);
+        process.exitCode = 1;
+      } else process.stdout.write("GELF_RESOLVER_OK\n");
+    })' 2>&1) || return 1
+  [[ "$result" == GELF_RESOLVER_OK ]]
+}
+
+prove_name_target_structure() {
+  local description=$1 target_container=$2 target=$3 error_code=$4
+  local hosts_file sender_networks_json vector_networks_json sender_networks vector_networks
+  local sender_parse_status vector_parse_status shared_networks=0 alias_matches=0
+  local network containers_json peer_ids peer_id peer_metadata peer_match_status
+  local sender_member_found peer_format
+  local -a sender_network_names=() vector_network_names=()
+  if [[ -z "$target_container" ]]; then
+    record "INFO: $description name proof failed; sender_networks=unavailable vector_networks=unavailable shared_networks=unknown alias_matches=unknown hosts_entry=unknown resolver_control=not-run error_code=$error_code reason=missing_container_id"
+    return 2
+  fi
+  if ! hosts_file=$(docker_cmd exec "$target_container" cat /etc/hosts 2>/dev/null); then
+    record "INFO: $description name proof failed; sender_networks=unavailable vector_networks=unavailable shared_networks=unknown alias_matches=unknown hosts_entry=unreadable resolver_control=not-run error_code=$error_code"
+    return 2
+  fi
+  if hosts_file_has_name "$hosts_file" "$target"; then
+    record "INFO: $description name target is in hosts file; sender_networks=not-checked vector_networks=not-checked shared_networks=not-applicable alias_matches=not-applicable hosts_entry=1 resolver_control=not-needed error_code=$error_code"
+    return 2
+  fi
+  if ! sender_networks_json=$(docker_cmd inspect -f '{{json .NetworkSettings.Networks}}' "$target_container" 2>/dev/null); then
+    record "INFO: $description name proof failed; sender_networks=unavailable vector_networks=unavailable shared_networks=unknown alias_matches=unknown hosts_entry=0 resolver_control=not-run error_code=$error_code inspect_error=1"
+    return 2
+  fi
+  if ! vector_networks_json=$(docker_cmd inspect -f '{{json .NetworkSettings.Networks}}' "$VECTOR_ID" 2>/dev/null); then
+    record "INFO: $description name proof failed; sender_networks=read vector_networks=unavailable shared_networks=unknown alias_matches=unknown hosts_entry=0 resolver_control=not-run error_code=$error_code inspect_error=1"
+    return 2
+  fi
+  if sender_networks=$(name_network_names_from_json <<<"$sender_networks_json"); then
+    :
+  else
+    sender_parse_status=$?
+    if (( sender_parse_status == 3 )); then sender_networks=empty; else sender_networks=invalid; fi
+    record "INFO: $description name proof failed; sender_networks=$sender_networks vector_networks=read shared_networks=unknown alias_matches=unknown hosts_entry=0 resolver_control=not-run error_code=$error_code inspect_error=1"
+    return 2
+  fi
+  if vector_networks=$(name_network_names_from_json <<<"$vector_networks_json"); then
+    :
+  else
+    vector_parse_status=$?
+    if (( vector_parse_status == 3 )); then vector_networks=empty; else vector_networks=invalid; fi
+    record "INFO: $description name proof failed; sender_networks=$sender_networks vector_networks=$vector_networks shared_networks=unknown alias_matches=unknown hosts_entry=0 resolver_control=not-run error_code=$error_code inspect_error=1"
+    return 2
+  fi
+  IFS=, read -r -a sender_network_names <<<"$sender_networks"
+  IFS=, read -r -a vector_network_names <<<"$vector_networks"
+  for network in "${sender_network_names[@]}"; do
+    for peer_id in "${vector_network_names[@]}"; do
+      if [[ "$network" == "$peer_id" ]]; then shared_networks=$((shared_networks + 1)); fi
+    done
+  done
+  peer_format='{{printf "{\"name\":%s,\"hostname\":%s,\"service\":%s,\"networks\":%s}" (json .Name) (json .Config.Hostname) (json (index .Config.Labels "com.docker.compose.service")) (json .NetworkSettings.Networks)}}'
+  for network in "${sender_network_names[@]}"; do
+    if ! containers_json=$(docker_cmd network inspect -f '{{json .Containers}}' "$network" 2>/dev/null); then
+      record "INFO: $description name proof failed; sender_networks=$sender_networks vector_networks=$vector_networks shared_networks=$shared_networks alias_matches=$alias_matches hosts_entry=0 resolver_control=not-run error_code=$error_code network_inspect_error=1"
+      return 2
+    fi
+    if ! peer_ids=$(name_network_container_ids_from_json <<<"$containers_json"); then
+      record "INFO: $description name proof failed; sender_networks=$sender_networks vector_networks=$vector_networks shared_networks=$shared_networks alias_matches=$alias_matches hosts_entry=0 resolver_control=not-run error_code=$error_code network_inspect_error=1"
+      return 2
+    fi
+    sender_member_found=0
+    while IFS= read -r peer_id; do
+      [[ -n "$peer_id" ]] || continue
+      [[ "$peer_id" == "$target_container" ]] && sender_member_found=1
+      if ! peer_metadata=$(docker_cmd inspect -f "$peer_format" "$peer_id" 2>/dev/null); then
+        record "INFO: $description name proof failed; sender_networks=$sender_networks vector_networks=$vector_networks shared_networks=$shared_networks alias_matches=$alias_matches hosts_entry=0 resolver_control=not-run error_code=$error_code inspect_error=1"
+        return 2
+      fi
+      if name_peer_matches_target "$network" "$target" "$peer_metadata"; then
+        alias_matches=1
+      else
+        peer_match_status=$?
+        if (( peer_match_status != 1 )); then
+          record "INFO: $description name proof failed; sender_networks=$sender_networks vector_networks=$vector_networks shared_networks=$shared_networks alias_matches=unknown hosts_entry=0 resolver_control=not-run error_code=$error_code inspect_error=1"
+          return 2
+        fi
+      fi
+    done <<<"$peer_ids"
+    if (( sender_member_found == 0 )); then
+      record "INFO: $description name proof failed; sender_networks=$sender_networks vector_networks=$vector_networks shared_networks=$shared_networks alias_matches=$alias_matches hosts_entry=0 resolver_control=not-run error_code=$error_code network_sender_match=0"
+      return 2
+    fi
+  done
+  if (( shared_networks != 0 || alias_matches != 0 )); then
+    record "INFO: $description name proof failed; sender_networks=$sender_networks vector_networks=$vector_networks shared_networks=$shared_networks alias_matches=$alias_matches hosts_entry=0 resolver_control=not-run error_code=$error_code"
+    return 2
+  fi
+  if ! name_resolver_positive_control "$target_container"; then
+    record "INFO: $description name proof failed; sender_networks=$sender_networks vector_networks=$vector_networks shared_networks=0 alias_matches=0 hosts_entry=0 resolver_control=failed error_code=$error_code"
+    return 2
+  fi
+  PROBE_NAME_EVIDENCE="sender_networks=$sender_networks vector_networks=$vector_networks shared_networks=0 alias_matches=0 hosts_entry=0 resolver_control=ok error_code=$error_code"
+  record "INFO: $description name unresolvable ($error_code); structural: $PROBE_NAME_EVIDENCE"
+}
 
 check_isolated_probe() {
   local description=$1 sender=$2 network=$3 target=$4
-  local sender_errors=${5:-allow-routing-errors}
+  local target_container=${5:-} sender_errors=${6:-allow-routing-errors}
   local source_before shipped_before shipped_names_before sent_at source_after shipped_after shipped_names_after
   local source_delta shipped_delta send_status=0 sender_code="" routing_code="" eai_attempts=0
   source_before=$(fresh_sample)
@@ -262,17 +441,29 @@ check_isolated_probe() {
     fi
     record "INFO: $description sender error code=$sender_code exit=$send_status"
     if [[ "$sender_code" == EAI_AGAIN ]]; then
+      probe_target_is_name "$target" && [[ "$sender_errors" == allow-routing-errors ]] || {
+        record "INFO: $description EAI_AGAIN is not acceptable for this target/context"
+        return 2
+      }
       eai_attempts=$((eai_attempts + 1))
       if (( eai_attempts >= 3 )); then
-        record "INFO: $description EAI_AGAIN remained after 3 attempts"
-        return 2
+        if ! prove_name_target_structure "$description" "$target_container" "$target" "$sender_code"; then
+          return 2
+        fi
+        routing_code=$sender_code
+        break
       fi
       record "INFO: $description retrying EAI_AGAIN attempt $((eai_attempts + 1))/3"
       continue
     fi
     if [[ "$sender_errors" == allow-routing-errors ]] && probe_routing_error_matches_target "$sender_code" "$target"; then
+      if [[ "$sender_code" == ENOTFOUND ]]; then
+        if ! prove_name_target_structure "$description" "$target_container" "$target" "$sender_code"; then
+          return 2
+        fi
+      fi
       routing_code=$sender_code
-      record "INFO: $description not routable ($routing_code)"
+      if [[ "$sender_code" != ENOTFOUND ]]; then record "INFO: $description not routable ($routing_code)"; fi
       break
     fi
     record "INFO: $description sender error code=$sender_code is not acceptable for this target/context"
@@ -287,7 +478,11 @@ check_isolated_probe() {
   record "INFO: $description fresh deltas source=$source_delta shipped_probe=$shipped_delta"
   if (( source_delta == 0 && shipped_delta == 0 )); then
     if [[ -n "$routing_code" ]]; then
-      record "PASS: $description isolated: not routable ($routing_code); fresh source +0 and shipped +0"
+      if [[ "$routing_code" == ENOTFOUND || "$routing_code" == EAI_AGAIN ]]; then
+        record "PASS: $description isolated: name unresolvable ($routing_code); fresh source +0 and shipped +0"
+      else
+        record "PASS: $description isolated: not routable ($routing_code); fresh source +0 and shipped +0"
+      fi
       return 3
     fi
     return 0
@@ -324,8 +519,9 @@ assert_no_console_marker() {
   [[ "$match_count" == 0 ]]
 }
 assert_isolated_probe() {
-  local description=$1 sender=$2 network=$3 target=$4 status
-  if check_isolated_probe "$description" "$sender" "$network" "$target"; then
+  local description=$1 sender=$2 network=$3 target=$4
+  local target_container=${5:-} status
+  if check_isolated_probe "$description" "$sender" "$network" "$target" "$target_container"; then
     record "PASS: $description isolation; fresh source +0 and shipped +0"
     return 0
   else
@@ -337,7 +533,7 @@ assert_isolated_probe() {
 
 run_isolation_leak_self_test() {
   local sender=$1 network=$2 target=$3 status
-  if check_isolated_probe "intentional host-loopback leak self-test" "$sender" "$network" "$target" must-deliver; then
+  if check_isolated_probe "intentional host-loopback leak self-test" "$sender" "$network" "$target" "" must-deliver; then
     fail "isolation leak self-test passed unexpectedly"
   else
     status=$?
