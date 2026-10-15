@@ -470,15 +470,31 @@ async fn assert_redelegation_denied(db: &TestDb, fixture: &Fixture) {
         let error = db
             .delegate(Delegation::from_header_ser::<TinyCloudDelegation>(&direct).unwrap())
             .await
-            .expect_err("revoked equivalent parent must not allow a new child")
-            .to_string();
-        assert!(error.contains("delegation-parent-revoked"), "{error}");
+            .expect_err("revoked equivalent parent must not allow a new child");
+        assert!(
+            matches!(
+                error,
+                tinycloud_core::db::TxError::AuthorizationDenied
+                    | tinycloud_core::db::TxError::InvalidDelegation(
+                        tinycloud_core::models::delegation::DelegationError::ParentRevoked(_)
+                    )
+            ),
+            "a revoked parent must deny delegation: {error}"
+        );
         let descendant = child_header(&fixture.resource, &row.child_cid, fixture.child_seed, 13);
         let error = db
             .delegate(Delegation::from_header_ser::<TinyCloudDelegation>(&descendant).unwrap())
             .await
-            .expect_err("legacy child of revoked root must not allow a descendant")
-            .to_string();
-        assert!(error.contains("delegation-ancestor-revoked"), "{error}");
+            .expect_err("legacy child of revoked root must not allow a descendant");
+        assert!(
+            matches!(
+                error,
+                tinycloud_core::db::TxError::AuthorizationDenied
+                    | tinycloud_core::db::TxError::InvalidDelegation(
+                        tinycloud_core::models::delegation::DelegationError::AncestorRevoked { .. }
+                    )
+            ),
+            "a revoked ancestor must deny delegation: {error}"
+        );
     }
 }

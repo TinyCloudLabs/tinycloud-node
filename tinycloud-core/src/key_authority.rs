@@ -9,8 +9,10 @@ use crate::models::{
     key_revocation::{self, target},
 };
 use sea_orm::{
-    sea_query::OnConflict, ActiveValue::Set, ColumnTrait, Condition, ConnectionTrait,
-    DatabaseTransaction, DbBackend, DbErr, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
+    sea_query::{Expr, OnConflict},
+    ActiveValue::Set,
+    ColumnTrait, Condition, ConnectionTrait, DatabaseTransaction, DbBackend, DbErr, EntityTrait,
+    QueryFilter, QueryOrder, QuerySelect,
 };
 use tinycloud_auth::{identity::principal_did, resource::SpaceId};
 
@@ -116,14 +118,17 @@ pub async fn lock_targets(
     if principals.is_empty() {
         return Ok(());
     }
-    // Insert and lock in canonical order across all node processes. A single
-    // batched insert plus one ordered shared/exclusive row-lock query avoids
-    // serial DB round trips for every signer in a proof closure.
+    // Retain the batched row-lock query, but pin the same byte order used by
+    // recovery's Rust-sorted per-principal locks. PostgreSQL's default text
+    // collation (and MySQL's) need not order mixed-case DIDs bytewise.
     ensure_target_rows(tx, &principals).await?;
     if tx.get_database_backend() != DbBackend::Sqlite {
         let query = target::Entity::find()
             .filter(target::Column::TargetDid.is_in(principals.iter().cloned()))
-            .order_by_asc(target::Column::TargetDid);
+            .order_by_asc(crate::db::byte_ordered(
+                tx.get_database_backend(),
+                Expr::col((target::Entity, target::Column::TargetDid)),
+            ));
         let rows = if exclusive {
             query.lock_exclusive().all(tx).await?
         } else {

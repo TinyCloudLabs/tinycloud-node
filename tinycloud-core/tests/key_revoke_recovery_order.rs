@@ -14,6 +14,7 @@ use tinycloud_auth::{
 };
 use tinycloud_core::{
     hash::{hash, Hash},
+    key_authority,
     keys::{public_key_to_did_key, Keypair, StaticSecret},
     migrations::Migrator,
     models::{
@@ -192,30 +193,33 @@ impl Drop for Schema {
     }
 }
 
-async fn wait_for_both_at_update(
+async fn wait_for_target_updates(
     admin: &DatabaseConnection,
-    names: [&str; 2],
-    holder: i32,
+    names: &[&str],
+    holder: Option<i32>,
 ) -> bool {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+    let blocker_clause = holder.map_or_else(
+        || "cardinality(pg_blocking_pids(pid)) > 0".to_owned(),
+        |pid| format!("{pid} = ANY(pg_blocking_pids(pid))"),
+    );
     loop {
-        // pg_blocking_pids pins each wait to OUR held R/S rows rather than a
-        // migration or a competing test. Only the ordered exclusive row query
-        // qualifies; an earlier proof/share wait is not a valid schedule.
+        // A first waiter is pinned to our holder. A later waiter can be
+        // queued behind that earlier waiter rather than behind the holder.
         let rows = admin
             .query_all(Statement::from_string(
                 DbBackend::Postgres,
                 format!(
                     "SELECT application_name FROM pg_stat_activity \
-             WHERE application_name IN ('{}', '{}') AND state = 'active' \
-             AND wait_event_type = 'Lock' AND {} = ANY(pg_blocking_pids(pid)) \
+             WHERE application_name IN ('{}') AND state = 'active' \
+             AND wait_event_type = 'Lock' AND {blocker_clause} \
              AND query LIKE '%key_revocation_target%' AND query LIKE '%FOR UPDATE%'",
-                    names[0], names[1], holder,
+                    names.join("','"),
                 ),
             ))
             .await
             .expect("inspect isolated PostgreSQL wait events");
-        if rows.len() == 2 {
+        if rows.len() == names.len() {
             let seen: Vec<String> = rows
                 .iter()
                 .map(|row| row.try_get("", "application_name").unwrap())
@@ -384,7 +388,8 @@ async fn postgres_crossed_recovery_revokes_do_not_deadlock() {
     let holder_pid: i32 = pid.try_get("", "pid").unwrap();
     let first_job = tokio::spawn(async move { first.revoke_key(a_request).await });
     let second_job = tokio::spawn(async move { second.revoke_key(b_request).await });
-    let reached = wait_for_both_at_update(&admin, [&first_name, &second_name], holder_pid).await;
+    let reached =
+        wait_for_target_updates(&admin, &[&first_name, &second_name], Some(holder_pid)).await;
     holder.rollback().await.expect("release issuer row locks");
     if !reached {
         first_job.abort();
@@ -410,5 +415,226 @@ async fn postgres_crossed_recovery_revokes_do_not_deadlock() {
         "at least one live recovery revoke must commit"
     );
     first_conn.close().await.unwrap();
+    admin.close().await.unwrap();
+}
+
+/// Recovery's Rust byte order must agree with the direct/admission transaction
+/// even when PostgreSQL's configured text collation orders those DIDs differently.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_mixed_direct_and_recovery_locks_share_byte_order() {
+    let url = match std::env::var("TINYCLOUD_TEST_POSTGRES_URL") {
+        Ok(url) if !url.trim().is_empty() => url,
+        _ => {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "mixed lock-order regression requires TINYCLOUD_TEST_POSTGRES_URL in CI"
+            );
+            eprintln!("skipping PostgreSQL-only mixed lock-order test: URL is unset");
+            return;
+        }
+    };
+    let schema = Schema {
+        url: url.clone(),
+        name: format!(
+            "tc1149_mixed_{}_{}",
+            std::process::id(),
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ),
+    };
+    let mut admin_options = ConnectOptions::new(url.clone());
+    admin_options.max_connections(2).sqlx_logging(false);
+    let admin = Database::connect(admin_options).await.unwrap();
+    admin
+        .execute_unprepared(&format!("CREATE SCHEMA {}", schema.name))
+        .await
+        .unwrap();
+    let connect = |label: &str| {
+        let app = format!("{}_{}", schema.name, label);
+        let mut options = ConnectOptions::new(format!(
+            "{}{}application_name={app}",
+            url,
+            if url.contains('?') { "&" } else { "?" }
+        ));
+        options
+            .max_connections(1)
+            .sqlx_logging(false)
+            .set_schema_search_path(schema.name.clone());
+        (app, options)
+    };
+    let (recovery_name, recovery_options) = connect("recovery");
+    let (direct_name, direct_options) = connect("direct");
+    let recovery_conn = Database::connect(recovery_options).await.unwrap();
+    Migrator::up(&recovery_conn, None).await.unwrap();
+    recovery_conn
+        .execute_unprepared(
+            "ALTER TABLE key_revocation_target ALTER COLUMN target_did TYPE varchar(255) COLLATE \"en-US-x-icu\"",
+        )
+        .await
+        .expect("PostgreSQL must support the test's non-bytewise ICU collation");
+    let direct_conn = Database::connect(direct_options).await.unwrap();
+    let recovery = SpaceDatabase::new(
+        recovery_conn.clone(),
+        MemoryStore::default(),
+        StaticSecret::new(vec![0; 32]).unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let mut identities: Vec<(u8, String)> = (1..=64).map(|seed| (seed, signer(seed).1)).collect();
+    identities.sort_by(|left, right| left.1.cmp(&right.1));
+    for (_, did) in &identities {
+        key_revocation::target::ActiveModel {
+            target_did: Set(did.clone()),
+        }
+        .insert(&recovery_conn)
+        .await
+        .unwrap();
+    }
+    let db_order = recovery_conn
+        .query_all(Statement::from_string(
+            DbBackend::Postgres,
+            "SELECT target_did FROM key_revocation_target ORDER BY target_did".to_owned(),
+        ))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.try_get::<String>("", "target_did").unwrap())
+        .collect::<Vec<_>>();
+    let mut chosen = None;
+    for first in 1..identities.len() {
+        for second in first + 1..identities.len() {
+            let a = &identities[first].1;
+            let b = &identities[second].1;
+            if db_order.iter().position(|did| did == b).unwrap()
+                < db_order.iter().position(|did| did == a).unwrap()
+            {
+                chosen = Some((identities[first].clone(), identities[second].clone()));
+                break;
+            }
+        }
+        if chosen.is_some() {
+            break;
+        }
+    }
+    let ((a_seed, a), (b_seed, b)) =
+        chosen.expect("fixture must assert an actual database-versus-Rust DID ordering inversion");
+    let r = identities[0].1.clone();
+    assert!(r < a && a < b);
+    assert!(
+        db_order.iter().position(|did| did == &b).unwrap()
+            < db_order.iter().position(|did| did == &a).unwrap(),
+        "PostgreSQL sorts B before A while canonical Rust bytes sort A before B"
+    );
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    let root = persist_grant(
+        &recovery_conn,
+        &signed_grant(a_seed, &b, &a, None, "mixed-root", now),
+    )
+    .await;
+    let tip = persist_grant(
+        &recovery_conn,
+        &signed_grant(b_seed, &r, &a, Some(&root), "mixed-tip", now),
+    )
+    .await;
+    let recovery_request = request(&a, &r, tip, "mixed-recovery", now);
+    let proof_tx = recovery_conn.begin().await.unwrap();
+    let mut expiry = None;
+    assert!(
+        recovery_authority::is_authorized(
+            &proof_tx,
+            &recovery_request,
+            OffsetDateTime::now_utc(),
+            None,
+            &mut expiry
+        )
+        .await
+        .unwrap(),
+        "signed recovery chain is valid before arranging either lock wait"
+    );
+    proof_tx.rollback().await.unwrap();
+
+    let holder = admin.begin().await.unwrap();
+    holder
+        .query_one(Statement::from_string(
+            DbBackend::Postgres,
+            format!(
+                "SELECT target_did FROM {}.key_revocation_target WHERE target_did = '{}' FOR UPDATE",
+                schema.name, a
+            ),
+        ))
+        .await
+        .unwrap()
+        .expect("holder locks A");
+    let holder_pid: i32 = holder
+        .query_one(Statement::from_string(
+            DbBackend::Postgres,
+            "SELECT pg_backend_pid() AS pid".to_owned(),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "pid")
+        .unwrap();
+    let recovered = tokio::spawn(async move { recovery.revoke_key(recovery_request).await });
+    assert!(
+        wait_for_target_updates(&admin, &[&recovery_name], Some(holder_pid)).await,
+        "the recovery path must be blocked at A before direct locks are requested"
+    );
+    let direct = tokio::spawn(async move {
+        let tx = direct_conn.begin().await.unwrap();
+        let result = key_authority::lock_targets(&tx, &[a, b], true).await;
+        tx.rollback().await.unwrap();
+        result
+    });
+    let reached = wait_for_target_updates(&admin, &[&recovery_name, &direct_name], None).await;
+    let diagnostic = if reached {
+        Vec::new()
+    } else {
+        admin
+            .query_all(Statement::from_string(
+                DbBackend::Postgres,
+                format!(
+                    "SELECT application_name, state, COALESCE(wait_event_type, '') AS wait, \
+                     cardinality(pg_blocking_pids(pid)) AS blockers, \
+                     query LIKE '%key_revocation_target%' AS target_sql, \
+                     query LIKE '%FOR UPDATE%' AS update_sql \
+                     FROM pg_stat_activity WHERE application_name IN ('{recovery_name}', '{direct_name}')"
+                ),
+            ))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| {
+                let app: String = row.try_get("", "application_name").unwrap();
+                (
+                    if app == recovery_name { "recovery" } else { "direct" },
+                    row.try_get::<String>("", "state").unwrap(),
+                    row.try_get::<String>("", "wait").unwrap(),
+                    row.try_get::<i32>("", "blockers").unwrap(),
+                    row.try_get::<bool>("", "target_sql").unwrap(),
+                    row.try_get::<bool>("", "update_sql").unwrap(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    holder
+        .rollback()
+        .await
+        .expect("release A after both paths are waiting");
+    assert!(
+        reached,
+        "both real lock paths must block at held A; count-only connection states: {diagnostic:?}"
+    );
+    let recovered = tokio::time::timeout(Duration::from_secs(12), recovered)
+        .await
+        .expect("recovery path must not deadlock")
+        .expect("recovery task must not panic");
+    let direct = tokio::time::timeout(Duration::from_secs(12), direct)
+        .await
+        .expect("direct path must not deadlock")
+        .expect("direct task must not panic");
+    assert!(recovered.is_ok(), "valid recovery failed: {recovered:?}");
+    assert!(direct.is_ok(), "direct/admission lock failed: {direct:?}");
+    recovery_conn.close().await.unwrap();
     admin.close().await.unwrap();
 }

@@ -350,26 +350,18 @@ pub enum RevocationError {
     MissingParents,
 }
 
-pub(crate) async fn process<C: ConnectionTrait>(
-    db: &C,
-    revocation: Revocation,
-) -> Result<Hash, Error> {
-    let (r, serialization) = (revocation.0, revocation.1);
-
+pub(crate) async fn verify(revocation: &TinyCloudRevocation) -> Result<(), Error> {
     let t = OffsetDateTime::now_utc();
-
-    // W1 (audit P0 finding 5): verify both CACAO and did:key/UCAN format
-    // revocations. The route accepts either suite so the Policy Engine
-    // active_cutoff loop can rely on a single endpoint regardless of
-    // whether the Grant Issuer signs with SIWE or did:key.
-    match &r.revocation {
+    // Verify both CACAO and did:key/UCAN revocations before inspecting the
+    // referenced graph, including when an ancestor is missing.
+    match revocation {
         TinyCloudRevocation::Cacao(c) => {
             c.verify()
                 .await
                 .map_err(|_| RevocationError::InvalidSignature)?;
             if !c.payload().valid_at(&t) {
                 return Err(RevocationError::InvalidTime.into());
-            };
+            }
         }
         TinyCloudRevocation::Ucan(u) => {
             verify_ucan_signature(u)
@@ -387,7 +379,17 @@ pub(crate) async fn process<C: ConnectionTrait>(
                 .validate_time(None)
                 .map_err(|_| RevocationError::InvalidTime)?;
         }
-    };
+    }
+    Ok(())
+}
+
+pub(crate) async fn process<C: ConnectionTrait>(
+    db: &C,
+    revocation: Revocation,
+) -> Result<Hash, Error> {
+    let (r, serialization) = (revocation.0, revocation.1);
+
+    verify(&r.revocation).await?;
 
     let hash: Hash = hash(&serialization);
     let delegation = delegation::Entity::find_by_id(Hash::from(r.revoked))

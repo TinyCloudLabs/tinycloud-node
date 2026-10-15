@@ -1735,11 +1735,27 @@ where
                             }
                         }
                     }
-                    admission_principals.extend(
-                        crate::auth_graph::load_chain_principals(&tx, &parents)
-                            .await
-                            .map_err(|error| TxError::Db(DbErr::Custom(error.to_string())))?,
-                    );
+                    let principals =
+                        match crate::auth_graph::load_chain_principals(&tx, &parents).await {
+                            Ok(principals) => principals,
+                            Err(revocation::ChainTraversalError::Db(DbErr::Custom(reason)))
+                                if reason == "authorization-chain-missing" =>
+                            {
+                                // Preserve signed issuer-policy refusal when a
+                                // claimed revocation parent was never admitted.
+                                revocation::verify(&revocation.0.revocation).await?;
+                                return Err(TxError::InvalidRevocation(
+                                    revocation::RevocationError::MissingParents,
+                                ));
+                            }
+                            Err(revocation::ChainTraversalError::Db(error)) => {
+                                return Err(TxError::Db(error));
+                            }
+                            Err(revocation::ChainTraversalError::LimitExceeded) => {
+                                return Err(TxError::ChainTraversalLimitExceeded);
+                            }
+                        };
+                    admission_principals.extend(principals);
                     admission_principals.push(revocation.0.revoker.clone());
                     // The CID action is scoped to the capabilities it revokes;
                     // a key cutoff in an unrelated space must not block it.
@@ -1965,6 +1981,25 @@ where
     }
 
     pub async fn delegate(&self, delegation: Delegation) -> Result<TransactResult, TxError<B, K>> {
+        // Fresh expired/not-yet-valid statements cannot be admitted regardless
+        // of their parents. An exact already-registered statement retains its
+        // existing idempotent behavior; the normal authority guards still run
+        // before that existing-row fast path returns.
+        let retained_hash = delegation.content_hash();
+        let invalid_time = match &delegation.0.delegation {
+            TinyCloudDelegation::Ucan(ucan) => ucan.payload().validate_time(None).is_err(),
+            TinyCloudDelegation::Cacao(cacao) => !cacao.payload().valid_now(),
+        };
+        if invalid_time
+            && delegation::Entity::find_by_id(retained_hash)
+                .one(&self.conn)
+                .await?
+                .is_none()
+        {
+            return Err(TxError::InvalidDelegation(
+                delegation::DelegationError::InvalidTime,
+            ));
+        }
         let parent_hashes: Vec<Hash> = delegation
             .0
             .parents
@@ -1972,14 +2007,29 @@ where
             .copied()
             .map(Hash::from)
             .collect();
-        let retained_hash = delegation.content_hash();
         // Capture expected row counts before consuming the delegation.
         let expected_ability_count = delegation.0.capabilities.len() as u64;
         let expected_parent_count = parent_hashes.len() as u64;
         let roots = delegation_guard_roots(retained_hash, &parent_hashes);
-        let mut principals = crate::auth_graph::load_chain_principals(&self.conn, &parent_hashes)
-            .await
-            .map_err(|error| TxError::Db(DbErr::Custom(error.to_string())))?;
+        let mut principals =
+            match crate::auth_graph::load_chain_principals(&self.conn, &parent_hashes).await {
+                Ok(principals) => principals,
+                Err(revocation::ChainTraversalError::Db(DbErr::Custom(reason)))
+                    if reason == "authorization-chain-missing" =>
+                {
+                    // The signature and DID method were historically checked
+                    // before a missing parent. Do that only on this failing
+                    // path; successful imports still verify once in process().
+                    delegation::verify(&delegation.0.delegation).await?;
+                    return Err(TxError::InvalidDelegation(
+                        delegation::DelegationError::MissingParents,
+                    ));
+                }
+                Err(revocation::ChainTraversalError::Db(error)) => return Err(TxError::Db(error)),
+                Err(revocation::ChainTraversalError::LimitExceeded) => {
+                    return Err(TxError::ChainTraversalLimitExceeded);
+                }
+            };
         principals.push(delegation.0.delegator.clone());
         principals.push(delegation.0.delegate.clone());
         let authz_start = Instant::now();
@@ -4755,7 +4805,7 @@ fn byte_ordered_resource(backend: DbBackend) -> SimpleExpr {
 }
 
 /// `column`, compared in byte order on `backend` (see `byte_ordered_resource`).
-fn byte_ordered(backend: DbBackend, column: impl Into<SimpleExpr>) -> SimpleExpr {
+pub(crate) fn byte_ordered(backend: DbBackend, column: impl Into<SimpleExpr>) -> SimpleExpr {
     // `$1` / `?` is sea-query's per-backend placeholder for the embedded
     // column expression, not for a bound value.
     match backend {

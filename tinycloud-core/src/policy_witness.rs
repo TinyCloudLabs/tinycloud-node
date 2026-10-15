@@ -606,6 +606,17 @@ pub async fn revocation_dependencies<C: ConnectionTrait>(
     db: &C,
     policy_cid: &str,
 ) -> Result<WitnessDependencies, WitnessError> {
+    load_dependencies(db, policy_cid, true).await
+}
+
+// Startup validates the entire immutable witness even when a root was later
+// revoked. Live consumers still deny that already-loaded root immediately,
+// without reading the other root or aliases on the denied request path.
+async fn load_dependencies<C: ConnectionTrait>(
+    db: &C,
+    policy_cid: &str,
+    require_live_root: bool,
+) -> Result<WitnessDependencies, WitnessError> {
     let registration = policy_v3_registration::Entity::find_by_id(policy_cid)
         .one(db)
         .await?
@@ -638,11 +649,10 @@ pub async fn revocation_dependencies<C: ConnectionTrait>(
             .one(db)
             .await?
             .ok_or(WitnessError::Missing)?;
-        // A signed policy-root status revocation is an explicit CID cutoff,
-        // even when no generic `/revoke` tombstone was written. This row is
-        // already loaded for every witness-backed consumer (including issued
-        // download tickets), so the check adds no read round trip.
-        if root.revoked_at.is_some() || root.revocation_bytes.is_some() {
+        // Signed root status is an explicit CID cutoff. Startup continues
+        // validating both historical roots and all witness dependencies;
+        // a live request fails closed here with no additional SQL.
+        if require_live_root && (root.revoked_at.is_some() || root.revocation_bytes.is_some()) {
             return Err(WitnessError::Revoked);
         }
         if root.policy_cid != policy_cid || root.role != role {
@@ -843,7 +853,7 @@ async fn plan_backfill<C: ConnectionTrait>(
                 .all(db)
                 .await?;
             if !existing.is_empty() {
-                match revocation_dependencies(db, &registration.policy_cid).await {
+                match load_dependencies(db, &registration.policy_cid, false).await {
                     Ok(_) => counts.witnesses += existing.len() as u64,
                     Err(WitnessError::Missing) => counts.missing += 1,
                     Err(

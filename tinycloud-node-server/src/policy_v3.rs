@@ -8105,6 +8105,11 @@ mod tests {
         run_policy_v2_flow_with_root_route(PolicyOwner::SpaceOwnerPolicyRoot, true)
     }
 
+    #[test]
+    fn signed_enforcement_root_revoke_preserves_witness_on_cold_open() -> anyhow::Result<()> {
+        run_policy_v2_flow_with_root_route(PolicyOwner::SpaceOwner, true)
+    }
+
     /// The real Share and CLI shape: the policy owner is a session key the
     /// space owner delegated to. It registers, mints and reads; once the
     /// space owner revokes that delegation, no new session can be minted.
@@ -10628,16 +10633,32 @@ mod tests {
                 "active"
             );
         }
+        if signed_root_revoke {
+            let storage = crate::storage::file_system::FileSystemConfig::new(&_storage_dir)
+                .open()
+                .await?;
+            crate::TinyCloud::new(
+                db.clone().into(),
+                Either::B(storage),
+                StaticSecret::new(vec![0; 32]).unwrap(),
+            )
+            .await
+            .expect("cold-open succeeds before signed root revoke");
+        }
         let revoked_root_cid = registered[root_field]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("missing {root_field}"))?
             .parse::<tinycloud_auth::ipld_core::cid::Cid>()?;
         let revoke_response = if signed_root_revoke {
-            assert_eq!(root_field, "policyRootCid");
+            let root_role = if root_field == "enforcementRootCid" {
+                "policy-enforcement"
+            } else {
+                "policy-authority"
+            };
             let mut revocation = json!({
                 "schema": ROOT_REVOCATION_V1_SCHEMA,
                 "targetCid": revoked_root_cid.to_string(),
-                "targetRole": "policy-authority",
+                "targetRole": root_role,
                 "ownerDid": owner_did,
                 "nodeAudience": node_did,
                 "revokedAt": format_time(OffsetDateTime::now_utc() + Duration::seconds(30)),
@@ -10933,6 +10954,51 @@ mod tests {
             .dispatch()
             .await;
         assert_eq!(post_revoke_delivery_response.status(), Status::Forbidden);
+        if signed_root_revoke {
+            let key = StaticSecret::new(vec![0; 32]).unwrap();
+            let encryption =
+                ColumnEncryption::new(key.derive_key(b"tinycloud/hooks/webhook-secrets"));
+            let counts =
+                tinycloud_core::policy_witness::dry_run_backfill(&db, Some(&encryption)).await?;
+            assert_eq!(
+                (
+                    counts.policies,
+                    counts.missing,
+                    counts.ambiguous,
+                    counts.overflow
+                ),
+                (1, 0, 0, 0),
+                "revoked signed roots remain structurally complete witnesses"
+            );
+            let storage = crate::storage::file_system::FileSystemConfig::new(&_storage_dir)
+                .open()
+                .await?;
+            crate::TinyCloud::new(db.clone().into(), Either::B(storage), key)
+                .await
+                .expect("cold-open succeeds after signed root revoke");
+            if root_field == "policyRootCid" {
+                // Revocation does not excuse the other historical root from
+                // full structural validation during startup. Roll back the
+                // deliberately corrupt row so the signed fixture stays valid.
+                let transaction = db.begin().await?;
+                let other_cid = registered["enforcementRootCid"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("missing enforcement root"))?;
+                let other = policy_v3_root::Entity::find_by_id(other_cid.to_owned())
+                    .one(&transaction)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("missing enforcement root row"))?;
+                let mut damaged: policy_v3_root::ActiveModel = other.into();
+                damaged.role = Set("invalid-structural-role".to_owned());
+                damaged.update(&transaction).await?;
+                let error =
+                    policy_witness::backfill_in_transaction(&transaction, Some(&encryption))
+                        .await
+                        .expect_err("a revoked root must not mask a corrupt sibling root");
+                assert!(matches!(error, policy_witness::WitnessError::Ambiguous));
+                transaction.rollback().await?;
+            }
+        }
         Ok(())
     }
 

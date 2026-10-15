@@ -197,7 +197,7 @@ pub(crate) async fn process<C: ConnectionTrait>(
 }
 
 // verify signatures and time
-async fn verify(delegation: &TinyCloudDelegation) -> Result<(), Error> {
+pub(crate) async fn verify(delegation: &TinyCloudDelegation) -> Result<(), Error> {
     match delegation {
         TinyCloudDelegation::Ucan(ref ucan) => {
             verify_ucan_signature(ucan)
