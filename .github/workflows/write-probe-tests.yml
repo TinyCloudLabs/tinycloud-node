@@ -1,0 +1,37 @@
+# TC-1176: unit tests for the Write Probe's deadlines, failure classification,
+# consecutive-failure rule, heartbeat reporting and dense watch (stub client,
+# no node, no secrets).
+
+name: Write Probe tests
+
+on:
+  pull_request:
+    paths:
+      - "test/probe/**"
+      - ".github/workflows/write-probe*.yml"
+  push:
+    branches: [main]
+    paths:
+      - "test/probe/**"
+      - ".github/workflows/write-probe*.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    defaults:
+      run:
+        working-directory: test/probe
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: test/probe/package-lock.json
+      - run: npm install --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm test
