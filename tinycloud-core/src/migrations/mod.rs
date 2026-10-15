@@ -1,4 +1,6 @@
+use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement, TransactionTrait};
 use sea_orm_migration::prelude::*;
+use sea_orm_migration::{IntoSchemaManagerConnection, SchemaManagerConnection};
 pub mod m20230510_101010_init_tables;
 pub mod m20260218_sql_database;
 pub mod m20260409_000000_hook_tables;
@@ -25,8 +27,124 @@ pub mod m20261005_000000_deactivate_hook_subscriptions;
 pub mod m20261007_000000_database_alias;
 pub mod m20261007_010000_database_identity_fence;
 pub mod m20261015_000000_delegation_cursor_index;
+pub mod m20261015_010000_current_kv_prefix_index;
 
 pub struct Migrator;
+
+/// SeaORM wraps every PostgreSQL migration batch in a transaction. The
+/// byte-ordered index cannot be built or dropped there: CONCURRENTLY must run
+/// between committed batches. Keep ordinary migrations atomic on either side.
+async fn postgres_migrate(
+    db: &DatabaseConnection,
+    steps: Option<u32>,
+    rollback: bool,
+) -> Result<(), DbErr> {
+    let initial = db.begin().await?;
+    initial
+        .execute_unprepared(crate::db_pool::EXEMPT_STATEMENT_TIMEOUT)
+        .await?;
+    Migrator::install(&initial).await?;
+    let mut selected = if rollback {
+        Migrator::get_applied_migrations(&initial).await?
+    } else {
+        Migrator::get_pending_migrations(&initial).await?
+    };
+    if rollback {
+        selected.reverse();
+    }
+    let selected = selected
+        .into_iter()
+        .take(steps.map(|steps| steps as usize).unwrap_or(usize::MAX))
+        .map(|migration| migration.name().to_owned())
+        .collect::<Vec<_>>();
+    let mut migrations = Migrator::migrations();
+    if rollback {
+        migrations.reverse();
+    }
+    let mut transaction = Some(initial);
+    for migration in migrations {
+        if !selected.iter().any(|name| name == migration.name()) {
+            continue;
+        }
+        let concurrent = migration.name() == m20261015_010000_current_kv_prefix_index::NAME;
+        if concurrent {
+            if let Some(open) = transaction.take() {
+                open.commit().await?;
+            }
+            let manager = SchemaManager::new(db);
+            if rollback {
+                migration.down(&manager).await?;
+            } else {
+                migration.up(&manager).await?;
+            }
+        } else {
+            if transaction.is_none() {
+                let open = db.begin().await?;
+                open.execute_unprepared(crate::db_pool::EXEMPT_STATEMENT_TIMEOUT)
+                    .await?;
+                transaction = Some(open);
+            }
+            let open = transaction.as_ref().expect("transaction opened above");
+            let manager = SchemaManager::new(open);
+            if rollback {
+                migration.down(&manager).await?;
+            } else {
+                migration.up(&manager).await?;
+            }
+        }
+        if transaction.is_none() {
+            let open = db.begin().await?;
+            open.execute_unprepared(crate::db_pool::EXEMPT_STATEMENT_TIMEOUT)
+                .await?;
+            transaction = Some(open);
+        }
+        let connection: &dyn ConnectionTrait =
+            transaction.as_ref().expect("transaction opened above");
+        if rollback {
+            connection
+                .execute(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "DELETE FROM seaql_migrations WHERE version = $1",
+                    [migration.name().to_owned().into()],
+                ))
+                .await?;
+        } else {
+            // Another node can finish the same concurrent build between the
+            // pending-migration read and this write.
+            let sql = if concurrent {
+                "INSERT INTO seaql_migrations (version, applied_at) VALUES ($1, $2) \
+                 ON CONFLICT (version) DO NOTHING"
+            } else {
+                "INSERT INTO seaql_migrations (version, applied_at) VALUES ($1, $2)"
+            };
+            connection
+                .execute(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    sql,
+                    [
+                        migration.name().to_owned().into(),
+                        time::OffsetDateTime::now_utc().unix_timestamp().into(),
+                    ],
+                ))
+                .await?;
+        }
+    }
+    if let Some(open) = transaction {
+        open.commit().await?;
+    }
+    Ok(())
+}
+
+/// Use SeaORM's standard runner on SQLite/MySQL; only PostgreSQL needs a
+/// nontransactional break around the concurrent index.
+struct StandardMigrator;
+
+#[async_trait::async_trait]
+impl MigratorTrait for StandardMigrator {
+    fn migrations() -> Vec<Box<dyn MigrationTrait>> {
+        Migrator::migrations()
+    }
+}
 
 #[async_trait::async_trait]
 impl MigratorTrait for Migrator {
@@ -58,7 +176,50 @@ impl MigratorTrait for Migrator {
             Box::new(m20261007_000000_database_alias::Migration),
             Box::new(m20261007_010000_database_identity_fence::Migration),
             Box::new(m20261015_000000_delegation_cursor_index::Migration),
+            Box::new(m20261015_010000_current_kv_prefix_index::Migration),
         ]
+    }
+
+    async fn up<'c, C>(db: C, steps: Option<u32>) -> Result<(), DbErr>
+    where
+        C: IntoSchemaManagerConnection<'c>,
+    {
+        match db.into_schema_manager_connection() {
+            SchemaManagerConnection::Connection(conn)
+                if conn.get_database_backend() == DbBackend::Postgres =>
+            {
+                postgres_migrate(conn, steps, false).await
+            }
+            SchemaManagerConnection::Transaction(conn)
+                if conn.get_database_backend() == DbBackend::Postgres =>
+            {
+                Err(DbErr::Custom(
+                    "PostgreSQL migrations require a connection outside a transaction".into(),
+                ))
+            }
+            other => StandardMigrator::up(other, steps).await,
+        }
+    }
+
+    async fn down<'c, C>(db: C, steps: Option<u32>) -> Result<(), DbErr>
+    where
+        C: IntoSchemaManagerConnection<'c>,
+    {
+        match db.into_schema_manager_connection() {
+            SchemaManagerConnection::Connection(conn)
+                if conn.get_database_backend() == DbBackend::Postgres =>
+            {
+                postgres_migrate(conn, steps, true).await
+            }
+            SchemaManagerConnection::Transaction(conn)
+                if conn.get_database_backend() == DbBackend::Postgres =>
+            {
+                Err(DbErr::Custom(
+                    "PostgreSQL migrations require a connection outside a transaction".into(),
+                ))
+            }
+            other => StandardMigrator::down(other, steps).await,
+        }
     }
 }
 
@@ -132,6 +293,139 @@ mod release_line_tests {
                 .collect();
             assert!(versions.contains(&"m20261007_000000_database_alias".to_string()));
             assert!(versions.contains(&"m20261007_010000_database_identity_fence".to_string()));
+            drop(db);
+            admin
+                .execute(Statement::from_string(
+                    DbBackend::Postgres,
+                    format!("DROP SCHEMA {schema} CASCADE"),
+                ))
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn postgres_ordinary_migration_rolls_back_all_ddl_on_failure() {
+        let Some(url) = crate::test_support::postgres_test_url(
+            "postgres_ordinary_migration_rolls_back_all_ddl_on_failure",
+        ) else {
+            return;
+        };
+        let admin = Database::connect(url.clone()).await.unwrap();
+        let schema = format!(
+            "tc737_atomic_{}_{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        );
+        admin
+            .execute(Statement::from_string(
+                DbBackend::Postgres,
+                format!("CREATE SCHEMA {schema}"),
+            ))
+            .await
+            .unwrap();
+        let mut options = ConnectOptions::new(url);
+        options.set_schema_search_path(schema.clone());
+        let db = Database::connect(options).await.unwrap();
+        db.execute_unprepared("CREATE TABLE actor (id text PRIMARY KEY)")
+            .await
+            .unwrap();
+        // The first ordinary migration creates `space` before `actor`.
+        // Conflict at actor must roll back space and the migration history.
+        assert!(Migrator::up(&db, Some(1)).await.is_err());
+        let rolled_back: bool = db
+            .query_one(Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT to_regclass('space') IS NULL AND \
+                 to_regclass('seaql_migrations') IS NULL AS rolled_back",
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "rolled_back")
+            .unwrap();
+        assert!(rolled_back, "ordinary migration must remain atomic");
+        db.execute_unprepared("DROP TABLE actor").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        drop(db);
+        admin
+            .execute(Statement::from_string(
+                DbBackend::Postgres,
+                format!("DROP SCHEMA {schema} CASCADE"),
+            ))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_tc1195_and_tc737_fresh_and_from_1206() {
+        let Some(url) =
+            crate::test_support::postgres_test_url("postgres_tc1195_and_tc737_fresh_and_from_1206")
+        else {
+            return;
+        };
+        let admin = Database::connect(url.clone()).await.unwrap();
+        let before_1195 = Migrator::migrations()
+            .iter()
+            .position(|migration| migration.name() == "m20261015_000000_delegation_cursor_index")
+            .unwrap() as u32;
+        // v1.20.6 ends immediately before TC-1195 in the migration list.
+        for (prior, with_737) in [
+            ("fresh", false),
+            ("fresh", true),
+            ("v1.20.6", false),
+            ("v1.20.6", true),
+        ] {
+            let schema = format!(
+                "tc737_{}_{}_{}",
+                std::process::id(),
+                if with_737 { "both" } else { "only1195" },
+                time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+            );
+            admin
+                .execute(Statement::from_string(
+                    DbBackend::Postgres,
+                    format!("CREATE SCHEMA {schema}"),
+                ))
+                .await
+                .unwrap();
+            let mut options = ConnectOptions::new(url.clone());
+            options.set_schema_search_path(schema.clone());
+            let db = Database::connect(options).await.unwrap();
+            if prior == "v1.20.6" {
+                Migrator::up(&db, Some(before_1195)).await.unwrap();
+            }
+            Migrator::up(
+                &db,
+                Some(if prior == "fresh" {
+                    before_1195 + 1 + u32::from(with_737)
+                } else {
+                    1 + u32::from(with_737)
+                }),
+            )
+            .await
+            .unwrap();
+            let ddl: String = db
+                .query_one(Statement::from_string(
+                    DbBackend::Postgres,
+                    "SELECT pg_get_indexdef(to_regclass('idx_delegation_delegator')) AS ddl",
+                ))
+                .await
+                .unwrap()
+                .unwrap()
+                .try_get("", "ddl")
+                .unwrap();
+            assert!(ddl.contains("(delegator, id)"), "{prior}: {ddl}");
+            let prefix_index: Option<bool> = db
+                .query_one(Statement::from_string(
+                    DbBackend::Postgres,
+                    "SELECT indisvalid AS valid FROM pg_index \
+                     WHERE indexrelid = to_regclass('idx_current_kv_space_key_c')",
+                ))
+                .await
+                .unwrap()
+                .map(|row| row.try_get("", "valid").unwrap());
+            assert_eq!(prefix_index, with_737.then_some(true), "{prior}");
             drop(db);
             admin
                 .execute(Statement::from_string(

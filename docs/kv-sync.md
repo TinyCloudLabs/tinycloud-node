@@ -129,3 +129,14 @@ cursor.
 
 Read audit records every poll. Poll on demand, or no more often than every
 60 seconds.
+
+On PostgreSQL, a `(space, key COLLATE "C")` index bounds a quiet-prefix poll
+to keys inside that prefix even when other keys in the space keep changing.
+The byte collation matches the prefix range predicate; the older feed-order
+index still serves broad or active feeds. SQLite uses its existing
+`(space, key)` primary key. This does not advance the cursor on an empty poll.
+
+MySQL does not get this index: its prefix predicate casts `key` to binary,
+which does not seek the normal `(space, key)` index. MySQL's `kv/sync`
+sequence lock is currently marked unsupported/untested for newly created
+spaces. This change does not claim MySQL quiet-prefix performance.

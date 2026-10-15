@@ -319,24 +319,11 @@ where
     }
 }
 
-/// Apply the schema migrations on `pool`.
-///
-/// On PostgreSQL sea-orm-migration runs them in one transaction; it runs
-/// here inside an outer one that first lifts the pool's `statement_timeout`
-/// (TC-1054), since a migration or its backfill may legitimately run for
-/// minutes. The nested `BEGIN` becomes a savepoint, so the migrations stay
-/// atomic as before.
+/// Apply schema migrations on `pool`. The migrator keeps ordinary PostgreSQL
+/// migrations transactional with an exempt statement timeout, but commits
+/// before the concurrent current_kv index build and resumes afterward.
 pub async fn migrate(pool: &RecoveringConnection) -> Result<(), DbErr> {
-    let conn = pool.sea_orm_connection();
-    if conn.get_database_backend() != sea_orm::DatabaseBackend::Postgres {
-        return Migrator::up(conn, None).await;
-    }
-    let transaction = conn.begin().await?;
-    transaction
-        .execute_unprepared(crate::db_pool::EXEMPT_STATEMENT_TIMEOUT)
-        .await?;
-    Migrator::up(&transaction, None).await?;
-    transaction.commit().await
+    Migrator::up(pool.sea_orm_connection(), None).await
 }
 
 impl<C, B, K> SpaceDatabase<C, B, K>

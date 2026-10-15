@@ -1253,6 +1253,57 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn kv_sync_quiet_prefix_does_not_expose_other_writes_in_cursor() {
+        let db = sqlite_db().await;
+        let owner = Owner::generate();
+        host(&db, &owner).await;
+        run(&db, &owner, &[Op::Put("quiet/only", b"first")]).await;
+        let prefix = "quiet/".parse().unwrap();
+        let mut request = KvSyncRequest {
+            limit: 10,
+            cursor: None,
+            cursor_key: [7; 32],
+            retention_grant: None,
+        };
+        let (changes, more, cursor) =
+            kv_sync_read(db.connection(), &owner.space, &prefix, &request)
+                .await
+                .unwrap();
+        assert_eq!(changes.len(), 1);
+        assert!(!more);
+        request.cursor = Some(cursor.clone());
+
+        for index in 0..20 {
+            run(
+                &db,
+                &owner,
+                &[Op::Put(&format!("busy/{index}"), b"outside")],
+            )
+            .await;
+        }
+        let (changes, more, after_busy) =
+            kv_sync_read(db.connection(), &owner.space, &prefix, &request)
+                .await
+                .unwrap();
+        assert!(changes.is_empty());
+        assert!(!more);
+        assert_eq!(
+            after_busy, cursor,
+            "outside writes must not change the token"
+        );
+
+        run(&db, &owner, &[Op::Put("quiet/new", b"inside")]).await;
+        let (changes, more, advanced) =
+            kv_sync_read(db.connection(), &owner.space, &prefix, &request)
+                .await
+                .unwrap();
+        assert_eq!(changes[0].key.as_str(), "quiet/new");
+        assert_eq!(changes.len(), 1);
+        assert!(!more);
+        assert_ne!(advanced, cursor);
+    }
+
+    #[tokio::test]
     async fn kv_sync_bootstrap_skips_pre_floor_tombstones() {
         let db = sqlite_db().await;
         let owner = Owner::generate();
@@ -2677,6 +2728,209 @@ pub(crate) mod tests {
             }
         });
         (conn, locks)
+    }
+
+    /// Run explicitly against PG18.6 (production engine): this fixture is
+    /// intentionally too large for the normal test suite. The one quiet key
+    /// predates 299,999 busy keys in its space; another space has 300,000 keys.
+    #[tokio::test]
+    #[ignore = "PG18.6 performance fixture: 2 spaces x 300k current_kv rows"]
+    async fn postgres_quiet_prefix_poll_seeks_by_key() {
+        let fixture = PostgresFixture::new("postgres_quiet_prefix_poll_seeks_by_key", 1)
+            .await
+            .expect("TINYCLOUD_TEST_POSTGRES_URL is required");
+        let db = fixture.dbs[0].connection();
+        let quiet = Owner::generate();
+        let other = Owner::generate();
+        host(&fixture.dbs[0], &quiet).await;
+        host(&fixture.dbs[0], &other).await;
+        let epoch = crate::hash::hash(b"tc737 benchmark epoch");
+        for (space, with_quiet) in [(&quiet.space, true), (&other.space, false)] {
+            if with_quiet {
+                db.execute(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "INSERT INTO current_kv (space, key, invocation, seq, epoch, epoch_seq, value, metadata, deleted) \
+                     VALUES ($1, 'quiet/only', $2, 10, $2, 0, $2, '{}', false)",
+                    [SpaceIdWrap(space.clone()).into(), epoch.into()],
+                ))
+                .await
+                .unwrap();
+            }
+            db.execute(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "INSERT INTO current_kv (space, key, invocation, seq, epoch, epoch_seq, value, metadata, deleted) \
+                 SELECT $1, 'busy/' || lpad(n::text, 6, '0'), $2, n + 10, $2, 0, $2, '{}', false \
+                 FROM generate_series(1, $3::integer) AS n",
+                [
+                    SpaceIdWrap(space.clone()).into(),
+                    epoch.into(),
+                    (if with_quiet { 299_999 } else { 300_000 }).into(),
+                ],
+            ))
+            .await
+            .unwrap();
+        }
+        db.execute(Statement::from_string(
+            DbBackend::Postgres,
+            "ANALYZE current_kv",
+        ))
+        .await
+        .unwrap();
+        let statement = kv_sync_statement(
+            DbBackend::Postgres,
+            &quiet.space,
+            &"quiet/".parse().unwrap(),
+            500,
+            Some(&KvSyncAnchor {
+                seq: 10,
+                epoch,
+                epoch_seq: 0,
+            }),
+            None,
+        );
+        use sea_orm_migration::{MigrationTrait, SchemaManager};
+
+        let explain_sql = format!("EXPLAIN (ANALYZE, BUFFERS) {}", statement.sql);
+        let values = statement.values.map(|values| values.0).unwrap_or_default();
+        db.execute_unprepared("DROP INDEX CONCURRENTLY idx_current_kv_space_key_c")
+            .await
+            .unwrap();
+        let baseline = db
+            .query_all(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                explain_sql.clone(),
+                values.clone(),
+            ))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.try_get_by_index::<String>(0).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        println!("TC-737 PostgreSQL pre-index quiet-prefix poll (2 x 300k):\n{baseline}");
+        let build_db = db.clone();
+        let build = tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            crate::migrations::m20261015_010000_current_kv_prefix_index::Migration
+                .up(&SchemaManager::new(&build_db))
+                .await
+                .unwrap();
+            started.elapsed()
+        });
+        let active = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if build.is_finished() {
+                    break false;
+                }
+                let progress = db
+                    .query_one(Statement::from_string(
+                        DbBackend::Postgres,
+                        "SELECT 1 AS active FROM pg_stat_progress_create_index \
+                         WHERE relid = 'current_kv'::regclass",
+                    ))
+                    .await
+                    .unwrap();
+                if progress.is_some() {
+                    break true;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(active, "index build finished before lock sampling");
+        let locks = db
+            .query_all(Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT mode FROM pg_locks WHERE relation = 'current_kv'::regclass \
+                 AND pid IN (SELECT pid FROM pg_stat_progress_create_index \
+                             WHERE relid = 'current_kv'::regclass)",
+            ))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.try_get::<String>("", "mode").unwrap())
+            .collect::<Vec<_>>();
+        println!("TC-737 concurrent index table locks: {locks:?}");
+        assert!(
+            !locks
+                .iter()
+                .any(|mode| mode == "ShareLock" || mode == "AccessExclusiveLock"),
+            "index build took a write-blocking lock: {locks:?}"
+        );
+        let mut reads = 0;
+        let mut writes = 0;
+        let mut max_read = std::time::Duration::ZERO;
+        let mut max_write = std::time::Duration::ZERO;
+        while !build.is_finished() && writes < 10 {
+            let started = std::time::Instant::now();
+            let row = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                db.query_one(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "SELECT key FROM current_kv WHERE space = $1 AND key = 'busy/000001'",
+                    [SpaceIdWrap(quiet.space.clone()).into()],
+                )),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(row.is_some());
+            max_read = max_read.max(started.elapsed());
+            reads += 1;
+            let started = std::time::Instant::now();
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                db.execute(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "UPDATE current_kv SET metadata = '{}' WHERE space = $1 \
+                     AND key = 'busy/000001'",
+                    [SpaceIdWrap(quiet.space.clone()).into()],
+                )),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(result.rows_affected(), 1);
+            max_write = max_write.max(started.elapsed());
+            writes += 1;
+        }
+        let build_time = build.await.unwrap();
+        println!(
+            "TC-737 concurrent index build: {build_time:?}; \
+             during build: {reads} reads (max {max_read:?}), \
+             {writes} writes (max {max_write:?})"
+        );
+        assert!(
+            reads > 0 && writes > 0,
+            "no read/write overlap with index build"
+        );
+        let plan = db
+            .query_all(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                explain_sql,
+                values,
+            ))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.try_get_by_index::<String>(0).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        println!("TC-737 PostgreSQL quiet-prefix poll (2 x 300k):\n{plan}");
+        assert!(
+            plan.contains("idx_current_kv_space_key_c") && plan.contains("Index Cond:"),
+            "quiet-prefix poll must seek by key, not scan newer space changes:\n{plan}"
+        );
+        let filtered = plan
+            .lines()
+            .filter_map(|line| line.split("Rows Removed by Filter: ").nth(1))
+            .map(|count| count.trim().parse::<usize>().unwrap())
+            .sum::<usize>();
+        assert!(
+            filtered <= 10,
+            "quiet-prefix poll filtered {filtered} rows:\n{plan}"
+        );
     }
 
     /// Keys the transaction already holds are not asked for again; the
