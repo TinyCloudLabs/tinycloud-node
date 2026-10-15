@@ -97,12 +97,22 @@ jobs:
             echo "run=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # A queued or running dense watch owns the heartbeat. If the lookup
-          # itself fails, probe anyway.
-          dense="$(gh run list -R "$GITHUB_REPOSITORY" --workflow write-probe.yml --limit 30 \
-            --json displayTitle,status --jq '[.[] | select(.displayTitle == "Write Probe (dense promote watch)" and .status != "completed")] | length' 2>/dev/null || echo 0)"
-          if [ "${dense:-0}" != "0" ]; then
-            echo "::notice::A dense promote watch is running and owns the heartbeat; skipping this run."
+          # A queued or running dense watch owns the heartbeat. Fail closed: if
+          # the lookup can't be made, skip this run rather than risk two owners
+          # (a persistent outage of the lookup shows as a missed heartbeat).
+          for attempt in 1 2 3; do
+            if dense="$(gh run list -R "$GITHUB_REPOSITORY" --workflow write-probe.yml --limit 30 \
+              --json displayTitle,status --jq '[.[] | select(.displayTitle == "Write Probe (dense promote watch)" and .status != "completed")] | length')"; then
+              break
+            fi
+            dense=""
+            sleep 5
+          done
+          if [ -z "${dense}" ]; then
+            echo "::warning::Could not check for a dense promote watch; skipping this run."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          elif [ "${dense}" != "0" ]; then
+            echo "::notice::A dense promote watch is queued or running and owns the heartbeat; skipping this run."
             echo "run=false" >> "$GITHUB_OUTPUT"
           else
             echo "run=true" >> "$GITHUB_OUTPUT"
@@ -161,8 +171,8 @@ jobs:
   dense:
     if: github.event_name == 'workflow_dispatch' && inputs.mode == 'dense'
     runs-on: ubuntu-latest
-    # ~66 min of samples plus setup.
-    timeout-minutes: 75
+    # Up to 10 min of handover wait, ~66 min of samples, plus setup.
+    timeout-minutes: 85
     concurrency:
       group: write-probe-dense
       cancel-in-progress: false
@@ -188,7 +198,9 @@ jobs:
 
       # Take over the heartbeat: new normal runs already skip (they see this
       # run); wait for any normal run that started earlier to finish, so its
-      # final ping or /fail and its state save land before ours.
+      # final ping or /fail and its state save land before ours. Fail closed:
+      # without a confirmed handover the watch doesn't start (the red run is
+      # the signal to re-dispatch it).
       - name: Wait for running normal probes
         if: steps.gate.outputs.run == 'true'
         working-directory: ${{ github.workspace }}
@@ -196,14 +208,18 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           for _ in $(seq 1 40); do
-            busy="$(gh run list -R "$GITHUB_REPOSITORY" --workflow write-probe.yml --limit 30 \
+            if busy="$(gh run list -R "$GITHUB_REPOSITORY" --workflow write-probe.yml --limit 30 \
               --json databaseId,displayTitle,status \
-              --jq "[.[] | select(.databaseId != ${GITHUB_RUN_ID} and .status == \"in_progress\" and .displayTitle != \"Write Probe (dense promote watch)\")] | length" 2>/dev/null || echo 0)"
-            [ "${busy:-0}" = "0" ] && exit 0
-            echo "waiting for ${busy} running normal probe run(s)"
+              --jq "[.[] | select(.databaseId != ${GITHUB_RUN_ID} and .status == \"in_progress\" and .displayTitle != \"Write Probe (dense promote watch)\")] | length")"; then
+              [ "${busy}" = "0" ] && exit 0
+              echo "waiting for ${busy} running normal probe run(s)"
+            else
+              echo "run lookup failed; retrying"
+            fi
             sleep 15
           done
-          echo "::warning::normal probe runs still running after 10 min; starting the watch anyway"
+          echo "::error::No confirmed handover from normal probe runs after 10 min; not starting the watch. Re-dispatch mode=dense."
+          exit 1
 
       - uses: actions/checkout@v4
         if: steps.gate.outputs.run == 'true'

@@ -91,7 +91,10 @@ state the last normal run saved and saves its own at the end, so a streak
 carries across modes. Scheduled runs skip themselves while a dense watch is
 queued or running, and the dense job waits for any normal run already in
 progress to finish before its first sample. They use separate concurrency
-groups, so a scheduled run can never cancel a pending dense watch.
+groups, so a scheduled run can never cancel a pending dense watch. Both checks
+fail closed: a scheduled run that can't look up runs (after 3 tries) skips
+itself, and a dense watch without a confirmed handover within 10 min ends red
+without sampling. Re-dispatch it in that case.
 
 `docker.yml` dispatches it automatically after every Phala deploy attempt (job
 `promote-watch`). To run it by hand (Amos, QA):
