@@ -187,6 +187,34 @@ jobs:
       uses: actions/setup-node@v4
       with:
         node-version: 20
+    - name: Check generated log allowlist and compose parity
+      run: |
+        npm ci --ignore-scripts --no-audit --no-fund
+        node scripts/node-vector-schema.mjs --check
+        node scripts/node-vector-schema.mjs --check-compose
+        node --test scripts/node-vector-schema.test.mjs scripts/tc-959-vector-metrics.test.mjs scripts/tc-959-compose-env.test.mjs
+        bash scripts/test-tc-959-isolation.sh
+    - name: Test Vector allowlist (0.59.0, checksum pinned)
+      run: |
+        set -eu
+        version=0.59.0
+        archive="vector-${version}-x86_64-unknown-linux-musl.tar.gz"
+        expected_sha256=a8dbc43c18ae25d0b23a712c9262f3aad904e352b1db5e7db1d9c4aecab59496
+        release_url="https://github.com/vectordotdev/vector/releases/download/v${version}"
+        curl -fsSL "${release_url}/${archive}" -o "${RUNNER_TEMP}/${archive}"
+        curl -fsSL "${release_url}/vector-${version}-SHA256SUMS" -o "${RUNNER_TEMP}/vector-${version}-SHA256SUMS"
+        printf '%s  %s\n' "${expected_sha256}" "${archive}" | (cd "${RUNNER_TEMP}" && sha256sum --check)
+        (cd "${RUNNER_TEMP}" && sha256sum --check --ignore-missing "vector-${version}-SHA256SUMS")
+        mkdir -p "${RUNNER_TEMP}/vector"
+        tar -xzf "${RUNNER_TEMP}/${archive}" -C "${RUNNER_TEMP}/vector"
+        vector="${RUNNER_TEMP}/vector/vector-x86_64-unknown-linux-musl/bin/vector"
+        sudo install -d -o "$(id -u)" -g "$(id -g)" -m 700 /var/lib/vector/secrets
+        trap 'sudo rm -rf /var/lib/vector' EXIT
+        printf '%s' 'dummy-vector-test-token' > /var/lib/vector/secrets/bs_token
+        chmod 600 /var/lib/vector/secrets/bs_token
+        "${vector}" validate --no-environment log-shipper/vector.yaml
+        "${vector}" test log-shipper/vector.yaml log-shipper/vector.tests.yaml
+        TC_VECTOR_BIN="${vector}" TC_DRY_RUN=1 bash ./tc-959-node-docker-check.review.sh
     - name: Verify generated capability artifacts match capabilities.json
       run: node scripts/gen-capabilities.mjs --check
     - name: Verify deployed Policy/v3 probe contract

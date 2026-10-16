@@ -428,6 +428,8 @@ jobs:
       # required for centralized KMS", which broke the 2026-07-28 deploy. The
       # last green deploy (run 29953848846, 2026-07-22) ran on 1.1.19. Only
       # unpin once the prod CVM is migrated or 1.1.20+ is verified against it.
+      - name: Install Phala SDK helpers
+        run: npm ci --prefix .github/scripts --ignore-scripts
       - name: Install Phala CLI
         run: npm install -g phala@1.1.19
 
@@ -598,6 +600,7 @@ jobs:
           PHALA_ENV_CLOUDFLARE_API_TOKEN: ${{ secrets.PROD_TINYCLOUD_CLOUDFLARE_API_TOKEN }}
           PHALA_ENV_DSTACK_GATEWAY_DOMAIN: ${{ secrets.PROD_TINYCLOUD_DSTACK_GATEWAY_DOMAIN }}
           PHALA_ENV_CERTBOT_EMAIL: ${{ secrets.PROD_TINYCLOUD_CERTBOT_EMAIL }}
+          PHALA_ENV_BETTERSTACK_SOURCE_TOKEN: ${{ secrets.PROD_TINYCLOUD_BETTERSTACK_SOURCE_TOKEN }}
           PHALA_ENV_SQL_IDENTITY_FENCE: ${{ inputs.sql_identity_fence }}
         # Update the existing prod CVM (name: tinycloud-node) in the
         # Tiny Cloud workspace. The PHALA_CLOUD_API_KEY secret is
@@ -642,6 +645,7 @@ jobs:
             printf 'CLOUDFLARE_API_TOKEN=%s\n' "$PHALA_ENV_CLOUDFLARE_API_TOKEN"
             printf 'DSTACK_GATEWAY_DOMAIN=%s\n' "$PHALA_ENV_DSTACK_GATEWAY_DOMAIN"
             printf 'CERTBOT_EMAIL=%s\n' "$PHALA_ENV_CERTBOT_EMAIL"
+            printf 'BETTERSTACK_SOURCE_TOKEN=%s\n' "$PHALA_ENV_BETTERSTACK_SOURCE_TOKEN"
             printf 'SQL_IDENTITY_FENCE=%s\n' "$PHALA_ENV_SQL_IDENTITY_FENCE"
             # SSH public keys authorized on the CVM (checked into the repo,
             # see dstack-authorized-keys). The Phala Cloud pre-launch script
@@ -657,6 +661,13 @@ jobs:
             -f docker-compose.dstack-postgres.yaml config --quiet
 
           phala deploy --cvm-id tinycloud-node -c docker-compose.dstack-postgres.yaml -e .phala-prod.env --no-public-logs --no-public-sysinfo --wait
+      # Run only after the compose deploy so a Phala allowed_envs sync failure cannot gate node startup.
+      - name: Sync production allowed_envs
+        env:
+          PHALA_CLOUD_API_KEY: ${{ secrets.PHALA_CLOUD_API_KEY }}
+          PHALA_CVM_ID: tinycloud-node
+          ENV_FILE: .phala-prod.env
+        run: node .github/scripts/phala-sync-allowed-envs.mjs
 
       # TC-312: prove the deploy actually converged. The image tag matching the
       # crate version is enforced at build time by version-guard, but nothing

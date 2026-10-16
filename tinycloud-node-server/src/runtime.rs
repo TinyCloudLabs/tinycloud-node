@@ -649,6 +649,30 @@ mod tests {
             })
         );
     }
+    #[::core::prelude::v1::test]
+    fn serve_config_figment_reads_json_log_format_from_canonical_env() {
+        let _lock = env_lock();
+        let temp = tempdir().unwrap();
+        let base = temp.path().join("base.toml");
+        std::fs::write(&base, "[global]\n").unwrap();
+        let _storage_datadir = EnvGuard::unset("TINYCLOUD_STORAGE_DATADIR");
+        let _storage_datadir_canonical = EnvGuard::unset("TINYCLOUD_STORAGE__DATADIR");
+        let _old_logging_key = EnvGuard::unset("TINYCLOUD_LOGGING__FORMAT");
+        let _legacy_log_key = EnvGuard::unset("TINYCLOUD_LOG_FORMAT");
+        let _canonical_log_key = EnvGuard::set("TINYCLOUD_LOG__FORMAT", "Json");
+        let _keys_env = clear_keys_env();
+        let _rocket_address = EnvGuard::unset("ROCKET_ADDRESS");
+        let _rocket_port = EnvGuard::unset("ROCKET_PORT");
+        let _rocket_config = EnvGuard::unset("ROCKET_CONFIG");
+        let _rocket_profile = EnvGuard::unset("ROCKET_PROFILE");
+
+        let cfg = serve_config_figment(&base)
+            .unwrap()
+            .extract::<config::Config>()
+            .unwrap();
+
+        assert_eq!(cfg.log.format, config::LoggingFormat::Json);
+    }
 
     #[::core::prelude::v1::test]
     fn serve_config_figment_defaults_to_spec_bind_without_config_file() {

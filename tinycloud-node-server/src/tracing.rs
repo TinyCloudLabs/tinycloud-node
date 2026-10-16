@@ -7,7 +7,7 @@ use rocket::{
     request::{FromRequest, Outcome},
     Data, Request, Response,
 };
-use serde::Serialize;
+use serde::{de::Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::{
     borrow::Cow,
@@ -41,6 +41,128 @@ const UNMATCHED_ROUTE_LABEL: &str = "<unmatched>";
 /// Target of the one log line per request (method, route template, status,
 /// latency). It replaces Rocket's own request logging, which prints the raw URI.
 const REQUEST_LOG_TARGET: &str = "tinycloud::request";
+pub const MAX_JSON_LOG_LINE_BYTES: usize = 15_000;
+const TRUNCATION_MARKER: &str = "[truncated]";
+const JSON_LOG_FALLBACK: &[u8] = b"{\"fields\":{\"message\":\"log line exceeded 15000 bytes\"}}\n";
+
+fn collect_string_fields<'a>(value: &'a mut Value, strings: &mut Vec<&'a mut String>) {
+    match value {
+        Value::String(string) => strings.push(string),
+        Value::Array(values) => {
+            for value in values {
+                collect_string_fields(value, strings);
+            }
+        }
+        Value::Object(fields) => {
+            for value in fields.values_mut() {
+                collect_string_fields(value, strings);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_valid_json(json: &[u8]) -> bool {
+    let mut deserializer = serde_json::Deserializer::from_slice(json);
+    serde::de::IgnoredAny::deserialize(&mut deserializer).is_ok() && deserializer.end().is_ok()
+}
+
+pub fn cap_json_log_line(line: &[u8]) -> Vec<u8> {
+    cap_json_log_buffer(line.to_vec())
+}
+
+fn cap_json_log_buffer(mut line: Vec<u8>) -> Vec<u8> {
+    let content_len = line.len() - usize::from(line.ends_with(b"\n"));
+    let json = &line[..content_len];
+    if json.contains(&b'\n') || !is_valid_json(json) {
+        return JSON_LOG_FALLBACK.to_vec();
+    }
+    if line.len() <= MAX_JSON_LOG_LINE_BYTES {
+        if content_len == line.len() {
+            line.push(b'\n');
+        }
+        return line;
+    }
+
+    let Ok(mut value) = serde_json::from_slice::<Value>(json) else {
+        return JSON_LOG_FALLBACK.to_vec();
+    };
+    loop {
+        let Ok(mut encoded) = serde_json::to_vec(&value) else {
+            return JSON_LOG_FALLBACK.to_vec();
+        };
+        encoded.push(b'\n');
+        if encoded.len() <= MAX_JSON_LOG_LINE_BYTES {
+            return encoded;
+        }
+
+        let mut strings = Vec::new();
+        collect_string_fields(&mut value, &mut strings);
+        let mut longest_index = None;
+        let mut longest_len = TRUNCATION_MARKER.len();
+        for (index, string) in strings.iter().enumerate() {
+            if string.len() > longest_len {
+                longest_index = Some(index);
+                longest_len = string.len();
+            }
+        }
+        let Some(longest_index) = longest_index else {
+            return JSON_LOG_FALLBACK.to_vec();
+        };
+        let longest = strings
+            .into_iter()
+            .nth(longest_index)
+            .expect("selected field exists");
+        let excess = encoded.len() - MAX_JSON_LOG_LINE_BYTES;
+        let mut keep = longest
+            .len()
+            .saturating_sub(excess + TRUNCATION_MARKER.len());
+        while !longest.is_char_boundary(keep) {
+            keep -= 1;
+        }
+        longest.truncate(keep);
+        longest.push_str(TRUNCATION_MARKER);
+    }
+}
+
+struct CappedJsonMakeWriter<M>(M);
+
+struct CappedJsonWriter<W: std::io::Write> {
+    inner: W,
+    bytes: Vec<u8>,
+}
+
+impl<W: std::io::Write> std::io::Write for CappedJsonWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<W: std::io::Write> Drop for CappedJsonWriter<W> {
+    fn drop(&mut self) {
+        let line = cap_json_log_buffer(std::mem::take(&mut self.bytes));
+        let _ = self.inner.write_all(&line);
+    }
+}
+
+impl<'a, M> tracing_subscriber::fmt::MakeWriter<'a> for CappedJsonMakeWriter<M>
+where
+    M: tracing_subscriber::fmt::MakeWriter<'a>,
+{
+    type Writer = CappedJsonWriter<M::Writer>;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        CappedJsonWriter {
+            inner: self.0.make_writer(),
+            bytes: Vec::with_capacity(512),
+        }
+    }
+}
 
 /// Rocket modules that log only at ignite, liftoff or shutdown, never request
 /// data. Rocket's other modules log per request.
@@ -391,7 +513,10 @@ pub fn tracing_try_init(
     let subscriber = tracing_subscriber::fmt::layer();
     let log = match config.format {
         config::LoggingFormat::Text => subscriber.boxed(),
-        config::LoggingFormat::Json => subscriber.json().boxed(),
+        config::LoggingFormat::Json => subscriber
+            .json()
+            .with_writer(CappedJsonMakeWriter(std::io::stderr))
+            .boxed(),
     };
     let telemetry = if config.tracing.enabled {
         let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
@@ -606,5 +731,69 @@ mod tests {
             response.headers().get_one("TinyCloud-Trace-Id").is_some(),
             "trace header should still be set (as the all-zero id) when tracing is disabled"
         );
+    }
+    #[test]
+    fn json_formatter_caps_each_complete_serialized_event() {
+        #[derive(Clone)]
+        struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for CaptureWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("capture mutex")
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let capture = output.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(CappedJsonMakeWriter(move || CaptureWriter(capture.clone())))
+            .finish();
+        let over_16k = "a".repeat(17 * 1024);
+        let several_a = "b".repeat(7 * 1024);
+        let several_b = "c".repeat(7 * 1024);
+        let several_c = "d".repeat(7 * 1024);
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(oversized = %over_16k, "one oversized field");
+            tracing::info!(
+                large_a = %several_a,
+                large_b = %several_b,
+                large_c = %several_c,
+                "several large fields"
+            );
+        });
+
+        let bytes = output.lock().expect("capture mutex");
+        let lines: Vec<&[u8]> = bytes.split_inclusive(|byte| *byte == b'\n').collect();
+        assert_eq!(lines.len(), 2, "each event must produce exactly one line");
+        for line in lines {
+            assert!(
+                line.len() <= MAX_JSON_LOG_LINE_BYTES,
+                "line size: {}",
+                line.len()
+            );
+            assert_eq!(line.last(), Some(&b'\n'), "line must be newline terminated");
+            let record: Value =
+                serde_json::from_slice(&line[..line.len() - 1]).expect("capped line must be JSON");
+            assert!(
+                record["fields"]
+                    .as_object()
+                    .expect("JSON fields")
+                    .values()
+                    .any(|value| value
+                        .as_str()
+                        .is_some_and(|text| text.ends_with(TRUNCATION_MARKER))),
+                "large string fields should carry the fixed truncation marker"
+            );
+        }
     }
 }

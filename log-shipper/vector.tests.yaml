@@ -1,0 +1,901 @@
+tests:
+  - name: "known node warning is reduced to fixed allowlisted fields"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.node"
+          log: '{"timestamp":"2026-10-14T10:00:00.000Z","level":"WARN","fields":{"message":"invocation replay insert failed","error":"private error"},"target":"private target","unknown":"private"}'
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "node_warning")
+              assert_eq!(.event_code, "invocation_replay_insert_failed")
+              assert_eq!(.level, "warn")
+              assert_eq!(length(keys(.)), 5)
+              assert!(!contains(encode_json(.), "private"))
+  - name: "forbidden value probes are removed from a known event"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.node"
+          log: '{"timestamp":"2026-10-14T10:00:00.000Z","level":"WARN","fields":{"message":"invocation replay insert failed","ticket":"signed-kv-ticket-probe","authorization":"Bearer auth-probe","token":"tc_live_probe","transcript":"transcript-probe","sql":"SELECT ''sql-probe''","meeting_url":"https://meet.invalid/probe","ip":"198.51.100.25","path":"/private/owner-42","did":"did:key:did-probe","wallet":"0xwallet-probe","space":"space-probe","email":"owner@example.invalid","nested":{"text":"nested-probe"},"array":["array-probe"]}}'
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(length(keys(.)), 5)
+              assert!(!contains(encode_json(.), "signed-kv-ticket-probe"))
+              assert!(!contains(encode_json(.), "auth-probe"))
+              assert!(!contains(encode_json(.), "tc_live_probe"))
+              assert!(!contains(encode_json(.), "transcript-probe"))
+              assert!(!contains(encode_json(.), "sql-probe"))
+              assert!(!contains(encode_json(.), "https://meet.invalid/probe"))
+              assert!(!contains(encode_json(.), "198.51.100.25"))
+              assert!(!contains(encode_json(.), "/private/owner-42"))
+              assert!(!contains(encode_json(.), "did-probe"))
+              assert!(!contains(encode_json(.), "0xwallet-probe"))
+              assert!(!contains(encode_json(.), "space-probe"))
+              assert!(!contains(encode_json(.), "owner@example.invalid"))
+              assert!(!contains(encode_json(.), "nested-probe"))
+              assert!(!contains(encode_json(.), "array-probe"))
+  - name: "random-looking unknown keys cannot extend output"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.node"
+          log: '{"timestamp":"2026-10-14T10:00:00.000Z","level":"WARN","fields":{"message":"invocation replay insert failed"},"x_71a9c2":"random-probe-a","x_4b28ef":{"nested":"random-probe-b"},"x_905de1":["random-probe-c"],"x_aa03f7":true}'
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(length(keys(.)), 5)
+              assert!(!contains(encode_json(.), "random-probe"))
+  - name: "dynamic tunnel reason is replaced by a fixed event"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.node"
+          log: '{"timestamp":"2026-10-14T10:00:00.000Z","level":"WARN","fields":{"message":"tunnel authentication rejected","close_code":4001,"reason":"did:key:private-probe"}}'
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event_code, "tunnel_auth_rejected")
+              assert!(!contains(encode_json(.), "private-probe"))
+  - name: "fatal panic emits a fixed alertable event without panic text"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.node"
+          log: '{"timestamp":"2026-10-14T10:00:00.000Z","level":"ERROR","fields":{"message":"node fatal panic"},"secret":"panic-probe"}'
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "node_fatal_panic")
+              assert_eq!(.level, "error")
+              assert_eq!(.event_code, "other")
+              assert!(!contains(encode_json(.), "panic-probe"))
+  - name: "signed-KV ticket and authorization header text is dropped"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.node"
+          log: '{"timestamp":"2026-10-14T10:00:00.000Z","level":"ERROR","fields":{"message":"GET /signed/kv/ticket-probe Authorization: Bearer bearer-probe"}}'
+    no_outputs_from: [allowlist]
+  - name: "tokens and API credentials are dropped"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.node"
+          log: '{"timestamp":"2026-10-14T10:00:00.000Z","level":"WARN","fields":{"message":"token tc_live_probe api_key=key-probe"}}'
+    no_outputs_from: [allowlist]
+  - name: "transcript text is dropped"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.node"
+          log: '{"timestamp":"2026-10-14T10:00:00.000Z","level":"ERROR","fields":{"message":"Transcript: this private sentence must never ship"}}'
+    no_outputs_from: [allowlist]
+  - name: "SQL literal values are dropped"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.node"
+          log: '{"timestamp":"2026-10-14T10:00:00.000Z","level":"ERROR","fields":{"message":"SELECT * FROM users WHERE email=\u0027owner@example.invalid\u0027"}}'
+    no_outputs_from: [allowlist]
+  - name: "meeting URL is dropped"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.node"
+          log: '{"timestamp":"2026-10-14T10:00:00.000Z","level":"WARN","fields":{"message":"meeting https://meet.google.com/abc-defg-hij"}}'
+    no_outputs_from: [allowlist]
+  - name: "raw IP address in unknown message is dropped"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.node"
+          log: '{"timestamp":"2026-10-14T10:00:00.000Z","level":"WARN","fields":{"message":"client 198.51.100.25"}}'
+    no_outputs_from: [allowlist]
+  - name: "raw path with identifiers is dropped"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.node"
+          log: '{"timestamp":"2026-10-14T10:00:00.000Z","level":"ERROR","fields":{"message":"failed at /tmp/owner-42/private.db"}}'
+    no_outputs_from: [allowlist]
+  - name: "owner DID and wallet address text is dropped"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.node"
+          log: '{"timestamp":"2026-10-14T10:00:00.000Z","level":"WARN","fields":{"message":"did:pkh:eip155:1:0x1111111111111111111111111111111111111111 0x2222222222222222222222222222222222222222"}}'
+    no_outputs_from: [allowlist]
+  - name: "space identifier is dropped"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.node"
+          log: '{"timestamp":"2026-10-14T10:00:00.000Z","level":"ERROR","fields":{"message":"tinycloud:pkh:eip155:1:0x1111111111111111111111111111111111111111:default"}}'
+    no_outputs_from: [allowlist]
+  - name: "email address is dropped"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.node"
+          log: '{"timestamp":"2026-10-14T10:00:00.000Z","level":"ERROR","fields":{"message":"owner@example.invalid"}}'
+    no_outputs_from: [allowlist]
+  - name: "nested object and array message smuggling aborts"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.node"
+          log: '{"timestamp":"2026-10-14T10:00:00.000Z","level":"WARN","fields":{"message":{"text":"secret"}},"array":[{"owner":"private"}]}'
+    no_outputs_from: [allowlist]
+  - name: "wrongly typed allowed top-level fields abort"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.node"
+          log: '{"timestamp":{"private":"path"},"level":["ERROR"],"fields":{"message":"invocation replay insert failed"}}'
+    no_outputs_from: [allowlist]
+  - name: "wrongly typed ingress allowlist values are dropped"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.ingress"
+          log: '{"time":"2026-10-14T10:00:00+00:00","method":"GET","route":17,"status":401,"bytes":0,"request_time":0.02,"upstream_status":"401"}'
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.ingress"
+          log: '{"time":"2026-10-14T10:00:00+00:00","method":["GET"],"route":"/info","status":200,"bytes":0,"request_time":0.02,"upstream_status":"200"}'
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.ingress"
+          log: '{"time":"2026-10-14T10:00:00+00:00","method":"GET","route":"/info","status":"200","bytes":0,"request_time":0.02,"upstream_status":"200"}'
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.ingress"
+          log: '{"time":"2026-10-14T10:00:00+00:00","method":"GET","route":"/info","status":200,"bytes":"0","request_time":0.02,"upstream_status":"200"}'
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.ingress"
+          log: '{"time":"2026-10-14T10:00:00+00:00","method":"GET","route":"/info","status":200,"bytes":0,"request_time":"0.02","upstream_status":"200"}'
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.ingress"
+          log: '{"time":"2026-10-14T10:00:00+00:00","method":"GET","route":"/info","status":200,"bytes":0,"request_time":0.02,"upstream_status":{"code":"200"}}'
+    no_outputs_from: [allowlist]
+  - name: "unknown nested and top-level keys do not expand output"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.node"
+          log: '{"timestamp":"2026-10-14T10:00:00.000Z","level":"WARN","fields":{"message":"invocation replay insert failed","arbitrary":{"text":"private"}},"extra":["unknown"]}'
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(length(keys(.)), 5)
+              assert!(!exists(.extra))
+              assert!(!contains(encode_json(.), "private"))
+  - name: "unknown node message is dropped"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.node"
+          log: '{"timestamp":"2026-10-14T10:00:00.000Z","level":"ERROR","fields":{"message":"unknown request /signed/kv/ticket-probe"}}'
+    no_outputs_from: [allowlist]
+  - name: "non-JSON and non-object records are dropped"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.node"
+          log: "not-json Authorization Bearer probe"
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.node"
+          log: "[]"
+    no_outputs_from: [allowlist]
+  - name: "partial records are dropped"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.node"
+          log: '{"timestamp":"2026-10-14T10:00:00.000Z","level":"WARN","fields":{"message":"invocation replay insert failed"}}'
+          partial_message: true
+    no_outputs_from: [allowlist]
+  - name: "ingress 4xx and route template ship without raw request values"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.ingress"
+          log: '{"time":"2026-10-14T10:00:00+00:00","method":"POST","route":"/signed/kv/<ticket_id>","protocol":"HTTP/1.1","status":401,"bytes":0,"request_time":0.02,"upstream_status":"401"}'
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "ingress_failure_count")
+              assert_eq!(.status, 401)
+              assert_eq!(.route, "/signed/kv/<ticket_id>")
+              assert!(!contains(encode_json(.), "ticket-probe"))
+  - name: "unknown ingress path is collapsed to bounded unmatched route"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.ingress"
+          log: '{"time":"2026-10-14T10:00:00+00:00","method":"GET","route":"/signed/kv/ticket-probe","status":404,"bytes":0,"request_time":0.02,"remote_addr":"198.51.100.8"}'
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "ingress_failure_count")
+              assert_eq!(.route, "<unmatched>")
+              assert!(!contains(encode_json(.), "ticket-probe"))
+  - name: "oversized raw ingress route is rejected before normalization"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.ingress"
+          log: '{"time":"2026-10-14T10:00:00+00:00","method":"GET","route":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx","status":404,"bytes":0,"request_time":0.02}'
+    no_outputs_from: [allowlist]
+  - name: "ingress success emits bounded counter input by route only"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.ingress"
+          log: '{"time":"2026-10-14T10:00:00+00:00","method":"GET","route":"/info","status":200,"bytes":30,"request_time":0.01,"remote_addr":"198.51.100.8"}'
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "ingress_success_count")
+              assert_eq!(.request_count, 1)
+              assert_eq!(.route, "/info")
+              assert!(!exists(.remote_addr))
+  - name: "slow 2xx requests remain counted and emit the slow event"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.ingress"
+          log: '{"time":"2026-10-14T10:00:00+00:00","method":"GET","route":"/info","status":200,"bytes":30,"request_time":1.2,"upstream_status":"200","remote_addr":"2001:db8::1"}'
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "ingress_success_count")
+              assert_eq!(.request_count, 1)
+      - extract_from: slow_success
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "ingress_request_slow")
+              assert_eq!(.request_time_seconds, 1.2)
+              assert_eq!(.route, "/info")
+  - name: "per-minute request output retains route status class and count"
+    inputs:
+      - insert_at: request_reduce
+        type: log
+        log_fields:
+          route: "/info"
+          status_class: "5xx"
+          event: "ingress_failure_count"
+          request_count: 120
+          minute: "2026-10-14T10:00"
+    outputs:
+      - extract_from: request_output
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "ingress_failure_count")
+              assert_eq!(.status_class, "5xx")
+              assert_eq!(.request_count, 120)
+              assert_eq!(.route, "/info")
+              assert_eq!(.level, "error")
+              assert_eq!(length(keys(.)), 7)
+  - name: "404 and slow 2xx floods cannot consume panic, app error, or WARN lanes"
+    inputs:
+      - &slow2xx
+        insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.ingress"
+          log: '{"time":"2026-10-14T10:00:00+00:00","method":"GET","route":"/info","status":200,"bytes":0,"request_time":2.0,"upstream_status":"200"}'
+      - *slow2xx
+      - *slow2xx
+      - *slow2xx
+      - *slow2xx
+      - *slow2xx
+      - *slow2xx
+      - *slow2xx
+      - *slow2xx
+      - *slow2xx
+      - *slow2xx
+      - *slow2xx
+      - *slow2xx
+      - *slow2xx
+      - *slow2xx
+      - *slow2xx
+      - *slow2xx
+      - *slow2xx
+      - *slow2xx
+      - *slow2xx
+      - *slow2xx
+      - *slow2xx
+      - *slow2xx
+      - *slow2xx
+      - *slow2xx
+      - *slow2xx
+      - *slow2xx
+      - *slow2xx
+      - *slow2xx
+      - *slow2xx
+      - &failure404
+        insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.ingress"
+          log: '{"time":"2026-10-14T10:00:00+00:00","method":"GET","route":"/info","status":404,"bytes":0,"request_time":0.02,"upstream_status":"-"}'
+      - *failure404
+      - *failure404
+      - *failure404
+      - *failure404
+      - *failure404
+      - *failure404
+      - *failure404
+      - *failure404
+      - *failure404
+      - *failure404
+      - *failure404
+      - *failure404
+      - *failure404
+      - *failure404
+      - *failure404
+      - *failure404
+      - *failure404
+      - *failure404
+      - *failure404
+      - *failure404
+      - *failure404
+      - *failure404
+      - *failure404
+      - *failure404
+      - *failure404
+      - *failure404
+      - *failure404
+      - *failure404
+      - *failure404
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.node"
+          log: '{"timestamp":"2026-10-14T10:00:00.000Z","level":"WARN","fields":{"message":"invocation replay insert failed"}}'
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.node"
+          log: '{"timestamp":"2026-10-14T10:00:00.000Z","level":"ERROR","fields":{"message":"addressed delegation authorization failed"}}'
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.node"
+          log: '{"timestamp":"2026-10-14T10:00:00.000Z","level":"ERROR","fields":{"message":"node fatal panic"}}'
+    outputs:
+      - extract_from: throttle_panic
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "node_fatal_panic")
+              assert_eq!(.level, "error")
+      - extract_from: throttle_app_error
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "node_error")
+              assert_eq!(.level, "error")
+      - extract_from: throttle_app_warning
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "node_warning")
+              assert_eq!(.level, "warn")
+              assert_eq!(.event_code, "invocation_replay_insert_failed")
+      - extract_from: budget_size_guard
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "node_warning")
+              assert_eq!(.level, "warn")
+  - name: "504 colon-separated upstream status is normalized to one status"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.ingress"
+          log: '{"time":"2026-10-14T10:00:00+00:00","method":"POST","route":"/invoke","status":504,"bytes":0,"request_time":0.2,"upstream_status":"504 : 200"}'
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "ingress_failure_count")
+              assert_eq!(.level, "error")
+              assert_eq!(.status_class, "5xx")
+              assert_eq!(.upstream_status, "504")
+  - name: "long-route 2xx counter input survives the final-size projection"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.ingress"
+          log: '{"time":"2026-10-14T10:00:00+00:00","method":"GET","route":"/encryption/networks/<network_id>/decrypt","status":200,"bytes":1000,"request_time":0.01,"upstream_status":"200"}'
+    outputs:
+      - extract_from: request_minute
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "ingress_success_count")
+              assert_eq!(.status_class, "2xx")
+              assert_eq!(.route, "/encryption/networks/<network_id>/decrypt")
+              assert_eq!(.request_count, 1)
+              assert_eq!(length(keys(.)), 5)
+      - extract_from: request_output
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "ingress_success_count")
+              assert_eq!(.status_class, "2xx")
+              assert_eq!(.route, "/encryption/networks/<network_id>/decrypt")
+              assert_eq!(.request_count, 1)
+              assert_eq!(length(keys(.)), 7)
+  - name: "long-route 5xx counter input survives the final-size projection"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.ingress"
+          log: '{"time":"2026-10-14T10:00:00+00:00","method":"GET","route":"/encryption/networks/<network_id>/decrypt","status":502,"bytes":1000,"request_time":0.01,"upstream_status":"502"}'
+    outputs:
+      - extract_from: request_minute
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "ingress_failure_count")
+              assert_eq!(.status_class, "5xx")
+              assert_eq!(.route, "/encryption/networks/<network_id>/decrypt")
+              assert_eq!(.request_count, 1)
+              assert_eq!(length(keys(.)), 5)
+      - extract_from: request_output
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "ingress_failure_count")
+              assert_eq!(.status_class, "5xx")
+              assert_eq!(.route, "/encryption/networks/<network_id>/decrypt")
+              assert_eq!(.request_count, 1)
+              assert_eq!(length(keys(.)), 7)
+  - name: "WARN cannot forge the fatal panic alert"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.node"
+          log: '{"timestamp":"2026-10-14T10:00:00.000Z","level":"WARN","fields":{"message":"node fatal panic"}}'
+    no_outputs_from: [allowlist]
+  - name: "node WARN uses its dedicated cap and reaches the final guard without ingress throttle"
+    inputs:
+      - insert_at: throttle_app_warning
+        type: log
+        log_fields:
+          level: "warn"
+          ts: "2026-10-14T10:00:00.000Z"
+          event: "node_warning"
+          svc: "api"
+          event_code: "quota_fallback"
+    outputs:
+      - extract_from: budget_size_guard
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "node_warning")
+              assert_eq!(.level, "warn")
+  - name: "multiple upstream statuses normalize to a bounded 5xx code"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.ingress"
+          log: '{"time":"2026-10-14T10:00:00+00:00","method":"POST","route":"/invoke","status":502,"bytes":0,"request_time":0.2,"upstream_status":"502, 502"}'
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "ingress_failure_count")
+              assert_eq!(.level, "error")
+              assert_eq!(.status_class, "5xx")
+              assert_eq!(.upstream_status, "502")
+  - name: "UCAN SIWE and delegation text is dropped"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.node"
+          log: '{"timestamp":"2026-10-14T10:00:00.000Z","level":"ERROR","fields":{"message":"UCAN ucan-probe"}}'
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.node"
+          log: '{"timestamp":"2026-10-14T10:00:00.000Z","level":"ERROR","fields":{"message":"SIWE signed-message-probe"}}'
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.node"
+          log: '{"timestamp":"2026-10-14T10:00:00.000Z","level":"ERROR","fields":{"message":"delegation private-delegation-probe"}}'
+    no_outputs_from: [allowlist]
+  - name: "ingress forwarding headers nested envelope and IPv6 are excluded"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.ingress"
+          log: '{"time":"2026-10-14T10:00:00+00:00","method":"GET","route":"/info","status":404,"bytes":0,"request_time":0.02,"remote_addr":"2001:db8::1","headers":{"X-Forwarded-For":"198.51.100.9","CF-Connecting-IP":"2001:db8::2","Authorization":"UCAN private-ucan-probe"},"envelope":{"owner":"did:key:nested-did-probe","email":"nested@example.invalid"}}'
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "ingress_failure_count")
+              assert_eq!(.route, "/info")
+              assert!(!contains(encode_json(.), "2001:db8::1"))
+              assert!(!contains(encode_json(.), "198.51.100.9"))
+              assert!(!contains(encode_json(.), "2001:db8::2"))
+              assert!(!contains(encode_json(.), "private-ucan-probe"))
+              assert!(!contains(encode_json(.), "nested-did-probe"))
+              assert!(!contains(encode_json(.), "nested@example.invalid"))
+              assert!(!exists(.headers))
+              assert!(!exists(.envelope))
+  - name: "raw request path on 2xx is replaced by unmatched template"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "tinycloud.ingress"
+          log: '{"time":"2026-10-14T10:00:00+00:00","method":"GET","route":"/signed/kv/ticket-probe","status":200,"bytes":0,"request_time":0.02}'
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "ingress_success_count")
+              assert_eq!(.route, "<unmatched>")
+              assert!(!contains(encode_json(.), "ticket-probe"))
+  - name: "labelled node GELF message passes after dockerd fields are stripped"
+    inputs:
+      - insert_at: logship_gate
+        type: log
+        log_fields:
+          '."_tc.logship"': "tinycloud-node"
+          "_container_id": "container-secret-probe"
+          "_container_name": "tinycloud-probe"
+          "_image_name": "image-secret-probe"
+          "_command": "private-command-probe"
+          "_private_probe": "custom-dockerd-probe"
+          host: "host-secret-probe"
+          version: "1"
+          level: 6
+          timestamp: 1791972000.0
+          source_type: "source-secret-probe"
+          peer_addr: "192.0.2.1"
+          port: 12345
+          message: '{"timestamp":"2026-10-14T10:00:00.000Z","level":"WARN","fields":{"message":"invocation replay insert failed"}}'
+    outputs:
+      - extract_from: logship_gate
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(get(., ["_tc.logship"]) ?? null, "tinycloud-node")
+              assert_eq!(.gate_action, "candidate")
+              assert_eq!(.gate_label, "tinycloud-node")
+      - extract_from: strip_gelf_fields
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.gate_action, "candidate")
+              assert!((get(., ["_tc.logship"]) ?? null) == null)
+              assert!(!exists(._container_id))
+              assert!(!exists(._container_name))
+              assert!(!exists(._image_name))
+              assert!(!exists(._command))
+              assert!(!exists(._private_probe))
+              assert!(!exists(.host))
+              assert!(!exists(.version))
+              assert!(!exists(.level))
+              assert!(!exists(.timestamp))
+              assert!(!exists(.source_type))
+              assert!(!exists(.peer_addr))
+              assert!(!exists(.port))
+              assert!(!contains(encode_json(.), "secret-probe"))
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "node_warning")
+              assert_eq!(.event_code, "invocation_replay_insert_failed")
+  - name: "labelled ingress GELF message passes the allowlist"
+    inputs:
+      - insert_at: logship_gate
+        type: log
+        log_fields:
+          '."_tc.logship"': "tinycloud-ingress"
+          message: '{"time":"2026-10-14T10:00:00+00:00","method":"GET","route":"/info","status":404,"bytes":0,"request_time":0.02,"upstream_status":"-"}'
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "ingress_failure_count")
+              assert_eq!(.route, "/info")
+  - name: "unlabelled GELF canaries are reduced into a bounded summary"
+    inputs:
+      - &unlabelled_canary
+        insert_at: logship_gate
+        type: log
+        log_fields:
+          message: 'signed-kv-ticket-probe auth-probe did:key:owner-probe space-probe@example.invalid'
+      - *unlabelled_canary
+    no_outputs_from: [strip_gelf_fields, parse_gelf_message, allowlist]
+    outputs:
+      - extract_from: logship_counter_output
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "logship_gate_summary_total")
+              assert_eq!(.unlabelled_count, 2)
+              assert_eq!(.malformed_envelope_count, 0)
+              assert_eq!(.unknown_message_count, 0)
+              assert_eq!(.unexpected_label_count, 0)
+              assert!(!contains(encode_json(.), "signed-kv-ticket-probe"))
+              assert!(!contains(encode_json(.), "auth-probe"))
+              assert!(!contains(encode_json(.), "did:key:owner-probe"))
+              assert!(!contains(encode_json(.), "space-probe@example.invalid"))
+  - name: "wrong and postgres labels increment only the fixed unexpected-label summary"
+    inputs:
+      - insert_at: logship_gate
+        type: log
+        log_fields:
+          '."_tc.logship"': "private-untrusted-label"
+          message: "ticket-probe auth-probe wrong-label-canary"
+      - insert_at: logship_gate
+        type: log
+        log_fields:
+          '."_tc.logship"': "postgres"
+          message: "sql-password-probe postgres-canary"
+    no_outputs_from: [strip_gelf_fields, parse_gelf_message, allowlist]
+    outputs:
+      - extract_from: logship_counter_output
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "logship_gate_summary_total")
+              assert_eq!(.unexpected_label_count, 2)
+              assert_eq!(.malformed_envelope_count, 0)
+              assert_eq!(.unknown_message_count, 0)
+              assert_eq!(.unlabelled_count, 0)
+              assert!(!contains(encode_json(.), "private-untrusted-label"))
+              assert!(!contains(encode_json(.), "postgres"))
+              assert!(!contains(encode_json(.), "ticket-probe"))
+              assert!(!contains(encode_json(.), "sql-password-probe"))
+  - name: "label text inside a GELF message cannot forge the top-level label"
+    inputs:
+      - insert_at: logship_gate
+        type: log
+        log_fields:
+          message: '{"_tc.logship":"tinycloud-node","timestamp":"2026-10-14T10:00:00.000Z","level":"ERROR","fields":{"message":"node fatal panic"}}'
+    no_outputs_from: [strip_gelf_fields, parse_gelf_message, allowlist]
+    outputs:
+      - extract_from: logship_counter_output
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "logship_gate_summary_total")
+              assert_eq!(.unlabelled_count, 1)
+              assert_eq!(.malformed_envelope_count, 0)
+              assert_eq!(.unknown_message_count, 0)
+              assert_eq!(.unexpected_label_count, 0)
+              assert!(!contains(encode_json(.), "node fatal panic"))
+  - name: "split GELF fragments with invalid JSON are counted without content"
+    inputs:
+      - insert_at: logship_gate
+        type: log
+        log_fields:
+          '."_tc.logship"': "tinycloud-node"
+          "_container_id": "container-fragment-probe"
+          message: '{"timestamp":"2026-10-14T10:00:00.000Z","level":"ERROR","fields":{"message":"token-fragment-probe'
+    no_outputs_from: [allowlist]
+    outputs:
+      - extract_from: logship_counter_output
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "logship_gate_summary_total")
+              assert_eq!(.malformed_envelope_count, 1)
+              assert_eq!(.unknown_message_count, 0)
+              assert_eq!(.unlabelled_count, 0)
+              assert_eq!(.unexpected_label_count, 0)
+              assert!(!contains(encode_json(.), "token-fragment-probe"))
+  - name: "labelled ingress non-JSON messages are dropped after the gate"
+    inputs:
+      - insert_at: logship_gate
+        type: log
+        log_fields:
+          '."_tc.logship"': "tinycloud-ingress"
+          _container_id: "container-non-json-probe"
+          message: "private-non-json-ingress-probe"
+    no_outputs_from: [allowlist]
+    outputs:
+      - extract_from: logship_counter_output
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "logship_gate_summary_total")
+              assert_eq!(.malformed_envelope_count, 1)
+              assert_eq!(.unknown_message_count, 0)
+              assert_eq!(.unlabelled_count, 0)
+              assert_eq!(.unexpected_label_count, 0)
+              assert!(!contains(encode_json(.), "private-non-json-ingress-probe"))
+              assert!(!contains(encode_json(.), "container-non-json-probe"))
+  - name: "all gate reasons use their summary lane without consuming five WARN slots"
+    inputs:
+      - insert_at: logship_gate
+        type: log
+        log_fields:
+          message: "unlabelled-probe"
+      - insert_at: logship_gate
+        type: log
+        log_fields:
+          '."_tc.logship"': "wrong-label-probe"
+          message: "wrong-label-probe"
+      - insert_at: logship_gate
+        type: log
+        log_fields:
+          '."_tc.logship"': "tinycloud-node"
+          message: "malformed-probe"
+      - insert_at: logship_gate
+        type: log
+        log_fields:
+          '."_tc.logship"': "tinycloud-node"
+          message: '{"timestamp":"2026-10-14T10:00:00.000Z","level":"WARN","fields":{"message":"unknown-message-probe"}}'
+      - &summary_warn
+        insert_at: logship_gate
+        type: log
+        log_fields:
+          '."_tc.logship"': "tinycloud-node"
+          message: '{"timestamp":"2026-10-14T10:00:00.000Z","level":"WARN","fields":{"message":"invocation replay insert failed"}}'
+      - *summary_warn
+      - *summary_warn
+      - *summary_warn
+      - *summary_warn
+    outputs:
+      - extract_from: logship_counter_output
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "logship_gate_summary_total")
+              assert_eq!(.svc, "logship")
+              assert_eq!(.level, "warn")
+              assert_eq!(.malformed_envelope_count, 1)
+              assert_eq!(.unexpected_label_count, 1)
+              assert_eq!(.unknown_message_count, 1)
+              assert_eq!(.unlabelled_count, 1)
+              assert!(!exists(.reason))
+              assert!(!exists(.message))
+      - extract_from: throttle_logship_summary
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "logship_gate_summary_total")
+              assert_eq!(.malformed_envelope_count, 1)
+              assert_eq!(.unexpected_label_count, 1)
+              assert_eq!(.unknown_message_count, 1)
+              assert_eq!(.unlabelled_count, 1)
+      - extract_from: throttle_app_warning
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "node_warning")
+              assert_eq!(.event_code, "invocation_replay_insert_failed")
+              assert_eq!(.level, "warn")
+      - extract_from: throttle_app_warning
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "node_warning")
+              assert_eq!(.event_code, "invocation_replay_insert_failed")
+              assert_eq!(.level, "warn")
+      - extract_from: throttle_app_warning
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "node_warning")
+              assert_eq!(.event_code, "invocation_replay_insert_failed")
+              assert_eq!(.level, "warn")
+      - extract_from: throttle_app_warning
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "node_warning")
+              assert_eq!(.event_code, "invocation_replay_insert_failed")
+              assert_eq!(.level, "warn")
+      - extract_from: throttle_app_warning
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "node_warning")
+              assert_eq!(.event_code, "invocation_replay_insert_failed")
+              assert_eq!(.level, "warn")

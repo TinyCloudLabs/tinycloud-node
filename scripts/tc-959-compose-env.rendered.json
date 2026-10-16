@@ -1,0 +1,28 @@
+{
+  "services": {
+    "tinycloud": {
+      "environment": {
+        "ROCKET_ADDRESS": "<redacted>",
+        "TINYCLOUD_ADMIN_SECRET": "<redacted>",
+        "TINYCLOUD_DATABASE__WRITE_FENCE": "<redacted>",
+        "TINYCLOUD_KEYS_SECRET": "<redacted>",
+        "TINYCLOUD_KEYS_TYPE": "Static",
+        "TINYCLOUD_LOG__FORMAT": "<redacted>",
+        "TINYCLOUD_QUOTA_URL": "<redacted>",
+        "TINYCLOUD_SHARE_EMAIL__ENABLED": "<redacted>",
+        "TINYCLOUD_STORAGE_BLOCKS_TYPE": "<redacted>",
+        "TINYCLOUD_STORAGE_DATABASE": "<redacted>",
+        "TINYCLOUD_TEE__MODE": "Off"
+      }
+    },
+    "dstack-ingress": {},
+    "postgres": {
+      "environment": {
+        "POSTGRES_HOST_AUTH_METHOD": "trust"
+      }
+    },
+    "vector": {
+      "init": true
+    }
+  }
+}
