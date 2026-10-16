@@ -49,6 +49,10 @@ pub struct FileSystemStore {
     #[cfg(test)]
     before_memory_write: TestPause,
     #[cfg(test)]
+    before_pending_refund: TestPause,
+    #[cfg(test)]
+    before_reserve_charge: TestPause,
+    #[cfg(test)]
     after_memory_contains: TestPause,
     #[cfg(test)]
     fail_stage_cleanup: Arc<AtomicBool>,
@@ -69,7 +73,11 @@ impl FileSystemStore {
             #[cfg(test)]
             before_memory_write: Arc::new(Mutex::new(None)),
             #[cfg(test)]
+            before_pending_refund: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
             after_memory_contains: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            before_reserve_charge: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             fail_stage_cleanup: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
@@ -96,10 +104,18 @@ impl FileSystemStore {
     }
 
     async fn reserve(&self, space: &SpaceId, hash: Hash, generation: i64, size: u64) {
+        let key = (space.clone(), hash, generation);
         let mut pending = self.pending.lock().await;
-        if let Entry::Vacant(slot) = pending.entry((space.clone(), hash, generation)) {
-            slot.insert(size);
+        if let Entry::Vacant(slot) = pending.entry(key) {
+            #[cfg(test)]
+            if let Some((entered, release)) = self.before_reserve_charge.lock().await.take() {
+                entered.notify_one();
+                release.notified().await;
+            }
+            // Charge before publishing the reservation. Cancellation while
+            // waiting on SpaceSizes leaves neither a charge nor a claim.
             self.increment_size(space, size).await;
+            slot.insert(size);
         }
     }
 
@@ -111,14 +127,20 @@ impl FileSystemStore {
     }
 
     async fn refund_pending(&self, space: &SpaceId, hash: Hash, generation: i64) {
-        let reserved = self
-            .pending
-            .lock()
-            .await
-            .remove(&(space.clone(), hash, generation))
-            .unwrap_or(0);
-        if reserved != 0 {
-            self.decrement_size(space, reserved).await;
+        let key = (space.clone(), hash, generation);
+        let mut pending = self.pending.lock().await;
+        if let Some(&reserved) = pending.get(&key) {
+            #[cfg(test)]
+            if let Some((entered, release)) = self.before_pending_refund.lock().await.take() {
+                entered.notify_one();
+                release.notified().await;
+            }
+            // Retain the refund obligation until the size change completes.
+            // No await may separate decrement from clearing this claim.
+            if reserved != 0 {
+                self.decrement_size(space, reserved).await;
+            }
+            pending.remove(&key);
         }
     }
 
@@ -1304,6 +1326,99 @@ mod test {
         );
         assert_eq!(store.total_size(&space).await.unwrap(), Some(0));
         assert_eq!(store.remove(&space, &staged_hash, 0).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn cancelled_failed_upload_retains_refund_until_quota_lock_is_available() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileSystemConfig::new(dir.path()).open().await.unwrap();
+        let space: SpaceId = "tinycloud:key:test:cancel-refund".parse().unwrap();
+        store.create(&space).await.unwrap();
+        let bytes = b"failed upload quota";
+        let hash = tinycloud_core::hash::hash(bytes);
+        let target = store.get_path(&space, &hash, 0);
+
+        let writing = Arc::new(Notify::new());
+        let resume_write = Arc::new(Notify::new());
+        *store.before_memory_write.lock().await = Some((writing.clone(), resume_write.clone()));
+        let refunding = Arc::new(Notify::new());
+        let resume_refund = Arc::new(Notify::new());
+        *store.before_pending_refund.lock().await =
+            Some((refunding.clone(), resume_refund.clone()));
+        let mut stage = HashBuffer::new(Vec::new());
+        stage.write_all(bytes).await.unwrap();
+        let uploading_store = store.clone();
+        let uploading_space = space.clone();
+        let upload = tokio::spawn(async move {
+            ImmutableWriteStore::<memory::MemoryStaging>::persist(
+                &uploading_store,
+                &uploading_space,
+                stage,
+                0,
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), writing.notified())
+            .await
+            .unwrap();
+        tokio::fs::create_dir(&target).await.unwrap();
+        let quota_lock = store.sizes.lock_updates_for_test().await;
+        resume_write.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(2), refunding.notified())
+            .await
+            .unwrap();
+        resume_refund.notify_one();
+        tokio::task::yield_now().await;
+        upload.abort();
+        assert!(upload.await.unwrap_err().is_cancelled());
+        drop(quota_lock);
+        tokio::fs::remove_dir(&target).await.unwrap();
+        assert_eq!(store.remove(&space, &hash, 0).await.unwrap(), None);
+        assert_eq!(store.total_size(&space).await.unwrap(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn cancelled_reservation_cannot_refund_bytes_never_charged() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileSystemConfig::new(dir.path()).open().await.unwrap();
+        let space: SpaceId = "tinycloud:key:test:cancel-reserve".parse().unwrap();
+        store.create(&space).await.unwrap();
+        let bytes = b"unacquired charge";
+        let hash = tinycloud_core::hash::hash(bytes);
+        let checked = Arc::new(Notify::new());
+        let resume_check = Arc::new(Notify::new());
+        *store.after_memory_contains.lock().await = Some((checked.clone(), resume_check.clone()));
+        let charging = Arc::new(Notify::new());
+        let resume_charge = Arc::new(Notify::new());
+        *store.before_reserve_charge.lock().await = Some((charging.clone(), resume_charge.clone()));
+        let mut stage = HashBuffer::new(Vec::new());
+        stage.write_all(bytes).await.unwrap();
+        let uploading_store = store.clone();
+        let uploading_space = space.clone();
+        let upload = tokio::spawn(async move {
+            ImmutableWriteStore::<memory::MemoryStaging>::persist(
+                &uploading_store,
+                &uploading_space,
+                stage,
+                0,
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), checked.notified())
+            .await
+            .unwrap();
+        let quota_lock = store.sizes.lock_updates_for_test().await;
+        resume_check.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(2), charging.notified())
+            .await
+            .unwrap();
+        resume_charge.notify_one();
+        tokio::task::yield_now().await;
+        upload.abort();
+        assert!(upload.await.unwrap_err().is_cancelled());
+        drop(quota_lock);
+        assert_eq!(store.remove(&space, &hash, 0).await.unwrap(), None);
+        assert_eq!(store.total_size(&space).await.unwrap(), Some(0));
     }
 
     #[tokio::test]

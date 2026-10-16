@@ -4,8 +4,8 @@ use std::{borrow::Cow, error::Error as StdError};
 
 use sea_orm::{
     sea_query::{Expr, LockBehavior, LockType, OnConflict},
-    ColumnTrait, Condition, ConnectionTrait, DatabaseTransaction, DbBackend, DbErr, EntityTrait,
-    QueryFilter, QueryOrder, QuerySelect, Statement, TransactionTrait,
+    ColumnTrait, ConnectionTrait, DatabaseTransaction, DbBackend, DbErr, EntityTrait, QueryFilter,
+    QueryOrder, QuerySelect, Statement, TransactionTrait,
 };
 use time::{Duration, OffsetDateTime};
 use tinycloud_auth::resource::SpaceId;
@@ -854,7 +854,7 @@ where
     let cutoff = now
         .checked_sub(min_age)
         .unwrap_or(OffsetDateTime::UNIX_EPOCH);
-    let deleting = candidate::Entity::find()
+    let mut deleting = candidate::Entity::find()
         .filter(candidate::Column::DeletingAt.is_not_null())
         .filter(candidate::Column::DeletingAt.lte(now))
         .order_by_asc(candidate::Column::DeletingAt)
@@ -863,19 +863,52 @@ where
         .limit(limit)
         .all(conn)
         .await?;
-    let attempts = attempt::Entity::find()
-        .filter(attempt::Column::CreatedAt.lte(cutoff))
-        .filter(
-            Condition::any()
-                .add(attempt::Column::RetryAfter.is_null())
-                .add(attempt::Column::RetryAfter.lte(now)),
-        )
-        .order_by_asc(attempt::Column::CreatedAt)
-        .order_by_asc(attempt::Column::Space)
-        .order_by_asc(attempt::Column::Value)
-        .limit(limit.saturating_sub(deleting.len() as u64))
-        .all(conn)
-        .await?;
+    // A full repeatedly failing DELETE page must not exclude independent
+    // expired uploads. Give each queue half a page if both have due work.
+    let available = if deleting.len() as u64 == limit {
+        limit.div_ceil(2)
+    } else {
+        limit - deleting.len() as u64
+    };
+    let attempts = if available == 0 {
+        Vec::new()
+    } else {
+        // Query the two retry states separately so each bounded page can use
+        // its age or retry index. Re-reading an oldest failing page every
+        // minute must not hide an unrelated, never-retried orphan.
+        let mut never_retried = attempt::Entity::find()
+            .filter(attempt::Column::CreatedAt.lte(cutoff))
+            .filter(attempt::Column::RetryAfter.is_null())
+            .order_by_asc(attempt::Column::CreatedAt)
+            .order_by_asc(attempt::Column::Space)
+            .order_by_asc(attempt::Column::Value)
+            .limit(available)
+            .all(conn)
+            .await?;
+        let due_retries = attempt::Entity::find()
+            .filter(attempt::Column::CreatedAt.lte(cutoff))
+            .filter(attempt::Column::RetryAfter.lte(now))
+            .order_by_asc(attempt::Column::RetryAfter)
+            .order_by_asc(attempt::Column::CreatedAt)
+            .order_by_asc(attempt::Column::Space)
+            .order_by_asc(attempt::Column::Value)
+            .limit(available)
+            .all(conn)
+            .await?;
+        never_retried.extend(due_retries);
+        never_retried.sort_unstable_by(|left, right| {
+            left.retry_after
+                .unwrap_or(left.created_at)
+                .cmp(&right.retry_after.unwrap_or(right.created_at))
+                .then_with(|| left.created_at.cmp(&right.created_at))
+                .then_with(|| left.space.cmp(&right.space))
+                .then_with(|| left.value.cmp(&right.value))
+                .then_with(|| left.attempt_id.cmp(&right.attempt_id))
+        });
+        never_retried.truncate(available as usize);
+        never_retried
+    };
+    deleting.truncate((limit as usize).saturating_sub(attempts.len()));
     let scanned = deleting.len() + attempts.len();
     let mut removed = 0;
     let mut first_error = None;
@@ -985,6 +1018,9 @@ mod tests {
         pause: Arc<AtomicBool>,
         lose_response: Arc<AtomicBool>,
         fail_read: Arc<AtomicBool>,
+        fail_hash: Arc<tokio::sync::Mutex<Option<Hash>>>,
+        fail_remove: Arc<AtomicBool>,
+        allow_remove: Arc<tokio::sync::Mutex<Option<Hash>>>,
     }
 
     impl InterruptedDelete {
@@ -996,6 +1032,9 @@ mod tests {
                 pause: Arc::new(AtomicBool::new(false)),
                 lose_response: Arc::new(AtomicBool::new(false)),
                 fail_read: Arc::new(AtomicBool::new(false)),
+                fail_hash: Arc::new(tokio::sync::Mutex::new(None)),
+                fail_remove: Arc::new(AtomicBool::new(false)),
+                allow_remove: Arc::new(tokio::sync::Mutex::new(None)),
             }
         }
     }
@@ -1020,7 +1059,13 @@ mod tests {
             id: &Hash,
             generation: i64,
         ) -> Result<Option<crate::storage::Content<Self::Readable>>, Self::Error> {
-            if self.fail_read.swap(false, Ordering::SeqCst) {
+            if self
+                .fail_hash
+                .lock()
+                .await
+                .is_some_and(|value| value == *id)
+                || self.fail_read.swap(false, Ordering::SeqCst)
+            {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::ConnectionReset,
                     "lost HEAD response",
@@ -1053,6 +1098,14 @@ mod tests {
             if self.pause.swap(false, Ordering::SeqCst) {
                 self.entered.notify_one();
                 self.resume.notified().await;
+            }
+            if self.fail_remove.load(Ordering::SeqCst)
+                && self.allow_remove.lock().await.as_ref() != Some(id)
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "persistent DELETE transport failure",
+                ));
             }
             let removed = self.inner.remove(space, id, generation).await?;
             if self.lose_response.swap(false, Ordering::SeqCst) {
@@ -1113,6 +1166,45 @@ mod tests {
             .col_expr(
                 kv_orphan_attempt::Column::CreatedAt,
                 Expr::value(time::OffsetDateTime::now_utc() - time::Duration::hours(2)),
+            )
+            .filter(kv_orphan_attempt::Column::Space.eq(SpaceIdWrap(space.clone())))
+            .filter(kv_orphan_attempt::Column::Value.eq(value))
+            .exec(db)
+            .await
+            .unwrap();
+    }
+    async fn seed_crashed_attempts(
+        db: &DatabaseConnection,
+        space: &SpaceId,
+        value: Hash,
+        count: usize,
+    ) {
+        use sea_orm::ActiveValue::Set;
+        register(db, &[(space.clone(), value)], "crashed-0").await;
+        age(db, space, value).await;
+        let old = time::OffsetDateTime::now_utc() - time::Duration::hours(2);
+        for start in (1..count).step_by(256) {
+            kv_orphan_attempt::Entity::insert_many((start..(start + 256).min(count)).map(
+                |index| kv_orphan_attempt::ActiveModel {
+                    space: Set(SpaceIdWrap(space.clone())),
+                    value: Set(value),
+                    attempt_id: Set(format!("crashed-{index}")),
+                    generation: Set(0),
+                    created_at: Set(old),
+                    retry_after: Set(None),
+                },
+            ))
+            .exec(db)
+            .await
+            .unwrap();
+        }
+    }
+
+    async fn advance_retry_tick(db: &DatabaseConnection, space: &SpaceId, value: Hash) {
+        kv_orphan_attempt::Entity::update_many()
+            .col_expr(
+                kv_orphan_attempt::Column::RetryAfter,
+                Expr::value(time::OffsetDateTime::now_utc() - Duration::seconds(1)),
             )
             .filter(kv_orphan_attempt::Column::Space.eq(SpaceIdWrap(space.clone())))
             .filter(kv_orphan_attempt::Column::Value.eq(value))
@@ -1615,6 +1707,157 @@ mod tests {
         );
         assert!(!store.contains(&space, &later, 0).await.unwrap());
         assert!(store.contains(&space, &blocked, 0).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn repeated_failed_oldest_page_cannot_starve_independent_orphan_across_ticks() {
+        let db = database().await;
+        let inner = Arc::new(MemoryStore::default());
+        let store = InterruptedDelete::new(inner.clone());
+        let space = space();
+        let blocked = upload(&inner, &space, b"persistently unreadable orphan").await;
+        seed_crashed_attempts(&db, &space, blocked, 256).await;
+        *store.fail_hash.lock().await = Some(blocked);
+
+        let healthy = upload(&inner, &space, b"healthy later orphan").await;
+        register(&db, &[(space.clone(), healthy)], "healthy").await;
+        kv_orphan_attempt::Entity::update_many()
+            .col_expr(
+                kv_orphan_attempt::Column::CreatedAt,
+                Expr::value(time::OffsetDateTime::now_utc() - Duration::hours(1)),
+            )
+            .filter(kv_orphan_attempt::Column::Value.eq(healthy))
+            .exec(&db)
+            .await
+            .unwrap();
+
+        // Logical ticks 0, 60, 120 seconds: make the retry deadline due
+        // before each subsequent production drain without sleeping a minute.
+        assert!(drain_candidates_for_interval(&db, &store, ORPHAN_GRACE)
+            .await
+            .is_err());
+        advance_retry_tick(&db, &space, blocked).await;
+        assert!(drain_candidates_for_interval(&db, &store, ORPHAN_GRACE)
+            .await
+            .is_err());
+        assert!(
+            !inner.contains(&space, &healthy, 0).await.unwrap(),
+            "a permanently failing prefix must not hide unrelated bytes"
+        );
+        advance_retry_tick(&db, &space, blocked).await;
+        assert!(drain_candidates_for_interval(&db, &store, ORPHAN_GRACE)
+            .await
+            .is_err());
+        assert!(inner.contains(&space, &blocked, 0).await.unwrap());
+        assert_eq!(
+            inner.total_size(&space).await.unwrap(),
+            Some(b"persistently unreadable orphan".len() as u64)
+        );
+    }
+
+    #[tokio::test]
+    async fn four_live_blocked_pages_cannot_starve_independent_orphan_across_ticks() {
+        let db = database().await;
+        let store = MemoryStore::default();
+        let space = space();
+        let blocked = upload(&store, &space, b"live protected orphan").await;
+        seed_crashed_attempts(&db, &space, blocked, 1024).await;
+        let live = register(&db, &[(space.clone(), blocked)], "live-writer").await;
+
+        let healthy = upload(&store, &space, b"healthy after four pages").await;
+        register(&db, &[(space.clone(), healthy)], "healthy").await;
+        kv_orphan_attempt::Entity::update_many()
+            .col_expr(
+                kv_orphan_attempt::Column::CreatedAt,
+                Expr::value(time::OffsetDateTime::now_utc() - Duration::hours(1)),
+            )
+            .filter(kv_orphan_attempt::Column::Value.eq(healthy))
+            .exec(&db)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            drain_candidates_for_interval(&db, &store, ORPHAN_GRACE)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(store.contains(&space, &healthy, 0).await.unwrap());
+        advance_retry_tick(&db, &space, blocked).await;
+        assert_eq!(
+            drain_candidates_for_interval(&db, &store, ORPHAN_GRACE)
+                .await
+                .unwrap(),
+            1,
+            "a later healthy hash must progress even across four blocked pages"
+        );
+        assert!(!store.contains(&space, &healthy, 0).await.unwrap());
+        advance_retry_tick(&db, &space, blocked).await;
+        assert_eq!(
+            drain_candidates_for_interval(&db, &store, ORPHAN_GRACE)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(store.contains(&space, &blocked, 0).await.unwrap());
+        refund_failed(&db, &store, &live, "live-writer")
+            .await
+            .unwrap();
+        assert_eq!(
+            drain_candidates_for_interval(&db, &store, ORPHAN_GRACE)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(store.total_size(&space).await.unwrap(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn retried_deletes_cannot_hide_healthy_orphans_across_ticks() {
+        use sea_orm::ActiveValue::Set;
+        let db = database().await;
+        let inner = Arc::new(MemoryStore::default());
+        let store = InterruptedDelete::new(inner.clone());
+        let space = space();
+        let old = time::OffsetDateTime::now_utc() - Duration::hours(2);
+        kv_orphan_candidate::Entity::insert_many((0..256).map(|index| {
+            kv_orphan_candidate::ActiveModel {
+                space: Set(SpaceIdWrap(space.clone())),
+                value: Set(hash(format!("failed-delete-{index}").as_bytes())),
+                generation: Set(0),
+                created_at: Set(old),
+                deleting_at: Set(Some(old)),
+                deletion_bytes: Set(Some(1)),
+            }
+        }))
+        .exec(&db)
+        .await
+        .unwrap();
+        store.fail_remove.store(true, Ordering::SeqCst);
+        let healthy = upload(&inner, &space, b"healthy behind failed deletes").await;
+        *store.allow_remove.lock().await = Some(healthy);
+        register(&db, &[(space.clone(), healthy)], "healthy").await;
+        age(&db, &space, healthy).await;
+        assert!(drain_candidates_for_interval(&db, &store, ORPHAN_GRACE)
+            .await
+            .is_err());
+        kv_orphan_candidate::Entity::update_many()
+            .col_expr(
+                kv_orphan_candidate::Column::DeletingAt,
+                Expr::value(time::OffsetDateTime::now_utc() - Duration::seconds(1)),
+            )
+            .filter(kv_orphan_candidate::Column::DeletingAt.is_not_null())
+            .exec(&db)
+            .await
+            .unwrap();
+        assert!(drain_candidates_for_interval(&db, &store, ORPHAN_GRACE)
+            .await
+            .is_err());
+        assert!(
+            !inner.contains(&space, &healthy, 0).await.unwrap(),
+            "retrying deletes must leave capacity for independent healthy attempts"
+        );
+        assert_eq!(inner.total_size(&space).await.unwrap(), Some(0));
     }
 
     #[tokio::test]
@@ -2245,44 +2488,6 @@ mod tests {
             0
         );
         assert!(store.contains(&space, &value, 0).await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn failed_old_delete_does_not_starve_next_aged_attempt() {
-        let db = database().await;
-        let inner = Arc::new(MemoryStore::default());
-        let store = InterruptedDelete::new(inner.clone());
-        let space = space();
-        let old = upload(&inner, &space, b"old failed delete").await;
-        let next = upload(&inner, &space, b"next candidate").await;
-        register(&db, &[(space.clone(), old)], "a").await;
-        register(&db, &[(space.clone(), next)], "b").await;
-        store.lose_response.store(true, Ordering::SeqCst);
-        assert!(refund_failed(&db, &store, &[(space.clone(), old, 0)], "a")
-            .await
-            .is_err());
-        kv_orphan_candidate::Entity::update_many()
-            .col_expr(
-                kv_orphan_candidate::Column::DeletingAt,
-                Expr::value(OffsetDateTime::now_utc() - Duration::hours(2)),
-            )
-            .filter(kv_orphan_candidate::Column::Space.eq(SpaceIdWrap(space.clone())))
-            .filter(kv_orphan_candidate::Column::Value.eq(old))
-            .exec(&db)
-            .await
-            .unwrap();
-        age(&db, &space, next).await;
-        store.lose_response.store(true, Ordering::SeqCst);
-        assert!(collect_candidates(&db, &store, 1, Duration::hours(1))
-            .await
-            .is_err());
-        assert_eq!(
-            collect_candidates(&db, &store, 1, Duration::hours(1))
-                .await
-                .unwrap(),
-            1
-        );
-        assert!(!inner.contains(&space, &next, 0).await.unwrap());
     }
 
     #[tokio::test]

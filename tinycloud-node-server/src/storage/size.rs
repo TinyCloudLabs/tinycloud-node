@@ -26,6 +26,12 @@ impl SpaceSizes {
             s.sub_assign(size)
         }
     }
+    #[cfg(test)]
+    pub(crate) async fn lock_updates_for_test(
+        &self,
+    ) -> tokio::sync::RwLockWriteGuard<'_, HashMap<SpaceId, u64>> {
+        self.0.write().await
+    }
     pub async fn get_size(&self, space: &SpaceId) -> Option<u64> {
         self.0.read().await.get(space).copied()
     }

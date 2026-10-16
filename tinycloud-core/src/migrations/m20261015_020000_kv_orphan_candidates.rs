@@ -60,6 +60,18 @@ impl MigrationTrait for Migration {
                     .to_owned(),
             )
             .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_kv_orphan_attempt_retry")
+                    .table(kv_orphan_attempt::Entity)
+                    .col(kv_orphan_attempt::Column::RetryAfter)
+                    .col(kv_orphan_attempt::Column::CreatedAt)
+                    .col(kv_orphan_attempt::Column::Space)
+                    .col(kv_orphan_attempt::Column::Value)
+                    .to_owned(),
+            )
+            .await?;
         Ok(())
     }
 
