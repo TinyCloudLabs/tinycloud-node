@@ -744,15 +744,15 @@ jobs:
                 requireCondition(current.status === "running" || pending.has(current.status));
                 const after = namesFrom(await getCvmComposeFile(client, ref));
                 const progress = current.progress;
-                if (progress?.correlation_id === result.correlation_id || pending.has(current.status)) observedOperation = true;
-                // progress is optional in the pinned SDK. Missing or null is
-                // settled only AFTER an update/progress transition was seen.
+                // Prefer this operation's correlation. If optional progress
+                // is absent, require a post-PATCH non-running/running cycle.
+                if (progress?.correlation_id === result.correlation_id ||
+                    (!progress?.correlation_id && pending.has(current.status))) observedOperation = true;
+                // Missing/null progress can mean a fast or still-queued
+                // restart. Stored names + running alone are not completion.
                 const settled = progress == null || (
                   progress && !progress.target && !progress.started_at && !progress.correlation_id
                 );
-                // A stored whitelist/running status can precede a queued
-                // restart. Require this operation to be observed and settled;
-                // an unobserved fast update fails closed at the deadline.
                 if (observedOperation && current.status === "running" && settled && [...keys].every((key) => after.includes(key))) {
                   completed = true;
                   break;
@@ -914,72 +914,24 @@ jobs:
           echo "::error::node.tinycloud.xyz still reports '${REPORTED}' after $((ATTEMPTS * SLEEP))s, expected '${EXPECTED}'. The deploy did not converge."
           exit 1
 
-      # TC-465: Share requires the complete Policy/v3 control plane before it
-      # can create or receive an exact-email share. A version-only check let a
-      # pre-TC-405 image look healthy while every required route returned 404.
-      # Empty JSON is deliberately rejected before any handler can mutate
-      # policy state, so this proves route mounting against the direct TEE
-      # origin without creating a binding, challenge, policy, or delegation.
-      - name: Verify deployed Policy/v3 routes
+      # Ingress TLS readiness is required health. Restore quotas before the
+      # separate Policy probes, which still fail the deployment if invalid.
+      - name: Verify deployed ingress health
+        env:
+          EXPECTED: ${{ steps.pin.outputs.version }}
         run: |
           set -euo pipefail
-
-          NODE_ORIGIN="https://tee.node.tinycloud.xyz"
-          ROUTES=(
-            /policy/v3/enforcer-bindings
-            /policy/v3/policies
-            /policy/v3/challenges
-            /policy/v3/delegations
-            /policy/v3/deliveries/authorize
-          )
-
-          # The direct TEE ingress obtains/loads its certificate after the
-          # node's public /version endpoint is already healthy. Wait for that
-          # TLS endpoint before probing routes so a successful rollout does
-          # not fail on a transient SSL_ERROR_SYSCALL during ingress startup.
           for attempt in $(seq 1 30); do
-            if curl -fsS --max-time 10 "${NODE_ORIGIN}/version" > /dev/null; then
-              echo "Direct TEE ingress is ready."
-              break
-            fi
-            if [ "${attempt}" = "30" ]; then
-              echo "::error::Direct TEE ingress did not become ready after 150s."
-              exit 1
+            REPORTED="$(curl -fsS --max-time 10 https://tee.node.tinycloud.xyz/version | jq -r '.version' || true)"
+            if [ "${REPORTED}" = "${EXPECTED}" ]; then
+              echo "Direct TEE ingress is serving ${EXPECTED}."
+              exit 0
             fi
             sleep 5
           done
+          echo "::error::Direct TEE ingress did not become healthy at version ${EXPECTED}."
+          exit 1
 
-          for route in "${ROUTES[@]}"; do
-            RESPONSE_FILE="$(mktemp)"
-            STATUS="$(curl -sS --max-time 15 -o "${RESPONSE_FILE}" -w '%{http_code}' \
-              -X POST \
-              -H 'accept: application/json' \
-              -H 'content-type: application/json' \
-              --data '{}' \
-              "${NODE_ORIGIN}${route}")"
-
-            # Delivery is authenticated before request-body validation, so its
-            # intentionally unsigned probe must be exactly 401. Other
-            # control-plane routes reject the body first (400 or 422). Neither
-            # case may silently accept a missing route or a server failure.
-            if [ "${route}" = "/policy/v3/deliveries/authorize" ]; then
-              EXPECTED="401"
-              case "${STATUS}" in 401) VALID=true ;; *) VALID=false ;; esac
-            else
-              EXPECTED="400 or 422"
-              case "${STATUS}" in 400|422) VALID=true ;; *) VALID=false ;; esac
-            fi
-
-            if [ "${VALID}" != true ]; then
-              echo "::error::${route} returned HTTP ${STATUS}; expected ${EXPECTED} for an intentionally invalid unauthenticated request."
-              head -c 1000 "${RESPONSE_FILE}" || true
-              rm -f "${RESPONSE_FILE}"
-              exit 1
-            fi
-
-            echo "${route}: mounted (HTTP ${STATUS})"
-            rm -f "${RESPONSE_FILE}"
-          done
       # Reviewed N0-only snapshot, not evergreen quota policy. Same deploy job
       # means no second environment approval or watcher-scheduling gap.
       # Future restarts require refreshed config and operator authorization.
@@ -1009,6 +961,7 @@ jobs:
 
           CONFIG_PATH = Path("ops/quota-overrides.json")
           LIMITS = {"applications": 5368709120, "secrets": 268721121}
+          SNAPSHOT_OWNER = "tinycloud:pkh:eip155:1:0xd559CCd9EB87c530A9a349262669386dE93cf412"
 
           class QuotaError(Exception):
               pass
@@ -1026,6 +979,7 @@ jobs:
                           raise ValueError
                       limit = row["limit_bytes"]
                       if (not match or type(limit) is not int or limit != LIMITS[match[1]]
+                          or space != f"{SNAPSHOT_OWNER}:{match[1]}"
                           or not isinstance(row["_comment"], str) or not row["_comment"]):
                           raise ValueError
                       names.add(match[1])
@@ -1116,6 +1070,57 @@ jobs:
           if __name__ == "__main__":
               raise SystemExit(main())
           PY
+
+      # TC-465: Share requires the complete Policy/v3 control plane before it
+      # can create or receive an exact-email share. A version-only check let a
+      # pre-TC-405 image look healthy while every required route returned 404.
+      # Empty JSON is deliberately rejected before any handler can mutate
+      # policy state, so this proves route mounting against the direct TEE
+      # origin without creating a binding, challenge, policy, or delegation.
+      - name: Verify deployed Policy/v3 routes
+        run: |
+          set -euo pipefail
+
+          NODE_ORIGIN="https://tee.node.tinycloud.xyz"
+          ROUTES=(
+            /policy/v3/enforcer-bindings
+            /policy/v3/policies
+            /policy/v3/challenges
+            /policy/v3/delegations
+            /policy/v3/deliveries/authorize
+          )
+
+          for route in "${ROUTES[@]}"; do
+            RESPONSE_FILE="$(mktemp)"
+            STATUS="$(curl -sS --max-time 15 -o "${RESPONSE_FILE}" -w '%{http_code}' \
+              -X POST \
+              -H 'accept: application/json' \
+              -H 'content-type: application/json' \
+              --data '{}' \
+              "${NODE_ORIGIN}${route}")"
+
+            # Delivery is authenticated before request-body validation, so its
+            # intentionally unsigned probe must be exactly 401. Other
+            # control-plane routes reject the body first (400 or 422). Neither
+            # case may silently accept a missing route or a server failure.
+            if [ "${route}" = "/policy/v3/deliveries/authorize" ]; then
+              EXPECTED="401"
+              case "${STATUS}" in 401) VALID=true ;; *) VALID=false ;; esac
+            else
+              EXPECTED="400 or 422"
+              case "${STATUS}" in 400|422) VALID=true ;; *) VALID=false ;; esac
+            fi
+
+            if [ "${VALID}" != true ]; then
+              echo "::error::${route} returned HTTP ${STATUS}; expected ${EXPECTED} for an intentionally invalid unauthenticated request."
+              head -c 1000 "${RESPONSE_FILE}" || true
+              rm -f "${RESPONSE_FILE}"
+              exit 1
+            fi
+
+            echo "${route}: mounted (HTTP ${STATUS})"
+            rm -f "${RESPONSE_FILE}"
+          done
 
       - name: Report unverified storage overrides
         if: >-

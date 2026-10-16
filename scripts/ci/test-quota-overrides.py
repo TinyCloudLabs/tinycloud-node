@@ -26,10 +26,30 @@ SCRIPT = BLOCK.split("          python3 - <<'PY'\n", 1)[1].split("\n          PY
 NAMESPACE = {"__name__": "quota_workflow_test"}
 exec(compile(textwrap.dedent(SCRIPT), str(WORKFLOW) + ":quota-restoration", "exec"), NAMESPACE)
 
-APPLICATIONS = "tinycloud:pkh:eip155:1:0x" + "1" * 40 + ":applications"
-SECRETS = "tinycloud:pkh:eip155:1:0x" + "1" * 40 + ":secrets"
+APPLICATIONS = "tinycloud:pkh:eip155:1:0xd559CCd9EB87c530A9a349262669386dE93cf412:applications"
+SECRETS = "tinycloud:pkh:eip155:1:0xd559CCd9EB87c530A9a349262669386dE93cf412:secrets"
 OVERRIDES = {APPLICATIONS: 5368709120, SECRETS: 268721121}
 CANARIES = []
+DIGEST = "sha256:4bdae4fc232d886bb56bfbce4ec62ed4b8fb4e1369a01f6afb73d06dd68c188f"
+N0_CONTEXT = {
+    "github.event_name": "workflow_dispatch", "github.ref": "refs/heads/main",
+    "inputs.deploy_phala": True, "inputs.deploy_image_digest": DIGEST,
+    "inputs.restore_n0_quota_snapshot": True, "job.success": True,
+    "needs.promote-watch.result": "success",
+    "steps.pin.outputs.image": "ghcr.io/tinycloudlabs/tinycloud-node@" + DIGEST,
+    "steps.pin.outputs.version": "1.20.6", "steps.pin.outputs.image_label": "1.20.6-dstack",
+    "steps.pin.outputs.revision": "e18578ff9162986ddd813259c60f73866e3e60d1",
+}
+
+
+def shell_for_step(name):
+    block = SOURCE.split("      - name: " + name + "\n", 1)[1]
+    lines = []
+    for line in block.split("        run: |\n", 1)[1].splitlines():
+        if line and not line.startswith("          "):
+            break
+        lines.append(line)
+    return textwrap.dedent("\n".join(lines))
 
 
 class SecretSafeResult(unittest.TextTestResult):
@@ -37,6 +57,8 @@ class SecretSafeResult(unittest.TextTestResult):
         output = super()._exc_info_to_string(error, test)
         for canary in CANARIES:
             output = output.replace(canary, "[sealed canary withheld]")
+        for space in OVERRIDES:
+            output = output.replace(space, "[space id withheld]")
         return output
 
 
@@ -241,9 +263,9 @@ class QuotaTests(unittest.TestCase):
                 self.assertTrue(all(request[0] == "GET" for request in self.requests),
                                 "No target may be mutated before both identities are proved")
 
-    def test_checked_in_config_has_reviewed_absolute_limits(self):
+    def test_checked_in_config_matches_verified_full_ids_and_limits(self):
         overrides = NAMESPACE["load_overrides"](WORKFLOW.parents[2] / "ops/quota-overrides.json")
-        self.assertEqual(sorted(overrides.values()), sorted(OVERRIDES.values()))
+        self.assertTrue(overrides == OVERRIDES, "Reviewed canonical target/value contract mismatch")
 
     def test_inventory_failure_never_dumps_raw_space_rows(self):
         self.usage_rows = [{"space_id": self.secret, "usage_bytes": 10}]
@@ -261,17 +283,8 @@ class QuotaTests(unittest.TestCase):
             self.assertFalse(self.secret in output.getvalue() + summary.read_text(), "Raw inventory leaked")
 
     def test_snapshot_requires_explicit_n0_authorization_and_exact_image(self):
-        digest = "sha256:4bdae4fc232d886bb56bfbce4ec62ed4b8fb4e1369a01f6afb73d06dd68c188f"
-        selected = {
-            "github.event_name": "workflow_dispatch", "github.ref": "refs/heads/main",
-            "inputs.deploy_phala": True, "inputs.deploy_image_digest": digest,
-            "inputs.restore_n0_quota_snapshot": True,
-            "job.success": True, "needs.promote-watch.result": "success",
-            "steps.pin.outputs.image": "ghcr.io/tinycloudlabs/tinycloud-node@" + digest,
-            "steps.pin.outputs.version": "1.20.6",
-            "steps.pin.outputs.image_label": "1.20.6-dstack",
-            "steps.pin.outputs.revision": "e18578ff9162986ddd813259c60f73866e3e60d1",
-        }
+        digest = DIGEST
+        selected = N0_CONTEXT
         self.assertTrue(quota_restore_enabled(selected))
         self.assertTrue(quota_restore_enabled({**selected, "needs.promote-watch.result": "failure"}),
                         "Watch scheduling must not block post-restart quota restoration")
@@ -291,6 +304,30 @@ class QuotaTests(unittest.TestCase):
                 self.assertFalse(quota_restore_enabled({**selected, **changes}),
                                  "Unrelated deploy must not replay the reviewed snapshot")
 
+    def test_policy_probe_failure_cannot_skip_verified_quota_restoration(self):
+        restored = False
+        healthy = True
+        names = ["Restore storage quota overrides", "Verify deployed Policy/v3 routes"]
+        names.sort(key=lambda name: SOURCE.index("      - name: " + name + "\n"))
+        with tempfile.TemporaryDirectory() as directory:
+            curl = Path(directory) / "curl"
+            curl.write_text("#!/bin/sh\nprintf '500'\n")
+            curl.chmod(0o700)
+            for name in names:
+                if name == "Restore storage quota overrides":
+                    if quota_restore_enabled({**N0_CONTEXT, "job.success": healthy}):
+                        self.apply()
+                        restored = True
+                else:
+                    result = subprocess.run(["bash", "-e", "-c", shell_for_step(name)],
+                                            env={"PATH": directory + ":/usr/bin:/bin"},
+                                            capture_output=True, text=True)
+                    self.assertNotEqual(result.returncode, 0, "Synthetic Policy probe must fail")
+                    healthy = False
+        self.assertFalse(healthy)
+        self.assertTrue(restored, "Policy failure after restart must not prevent quota restoration")
+        self.assertEqual(sorted(self.values.values()), sorted(OVERRIDES.values()))
+
     def test_partial_restart_failure_is_explicitly_unverified(self):
         report = SOURCE.split("      - name: Report unverified storage overrides\n", 1)[1]
         condition = report.split("        if: >-\n", 1)[1].split("\n        run:", 1)[0].strip()[3:-2]
@@ -305,20 +342,35 @@ class QuotaTests(unittest.TestCase):
                     "steps.deploy.outputs.cvm_mutation_attempted": attempted,
                     "steps.quotas.outcome": outcome,
                 }), enabled)
-        lines = []
-        for line in report.split("        run: |\n", 1)[1].splitlines():
-            if line and not line.startswith("          "):
-                break
-            lines.append(line)
+        script = shell_for_step("Report unverified storage overrides")
         with tempfile.TemporaryDirectory() as directory:
             summary = Path(directory) / "summary"
-            result = subprocess.run(["bash", "-e", "-c", textwrap.dedent("\n".join(lines))],
+            result = subprocess.run(["bash", "-e", "-c", script],
                                     env={"GITHUB_STEP_SUMMARY": str(summary), "QUOTA_ADMIN_SECRET": self.secret},
                                     capture_output=True, text=True)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("OVERRIDES UNVERIFIED", summary.read_text())
             self.assertFalse(self.secret in result.stdout + result.stderr + summary.read_text(),
                              "Partial-failure diagnostics must not expose authorization")
+
+    def test_positive_usage_wrong_owner_config_fails_before_any_request(self):
+        other = "tinycloud:pkh:eip155:1:0x" + "1" * 40
+        wrong = {other + ":applications": 5368709120, other + ":secrets": 268721121}
+        self.usage_rows = [{"space_id": space, "usage_bytes": 10} for space in wrong]
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "overrides.json"
+            summary = Path(directory) / "summary"
+            config.write_text(json.dumps(config_document(wrong)))
+            output = io.StringIO()
+            with patch.dict(NAMESPACE["os"].environ, {
+                "QUOTA_ADMIN_SECRET": self.secret, "GITHUB_STEP_SUMMARY": str(summary),
+            }), patch.dict(NAMESPACE, {"CONFIG_PATH": config}):
+                with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+                    self.assertEqual(NAMESPACE["main"](), 1)
+            self.assertFalse(bool(self.requests), "Wrong-owner config must fail before any request")
+            logs = output.getvalue() + summary.read_text()
+            self.assertFalse(any(space in logs for space in [*wrong, *OVERRIDES]))
+            self.assertFalse(self.secret in logs, "Sealed canary leaked")
 
 
 if __name__ == "__main__":
