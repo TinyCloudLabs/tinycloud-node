@@ -10,7 +10,10 @@ pub struct Model {
     pub space: SpaceIdWrap,
     #[sea_orm(primary_key, auto_increment = false)]
     pub value: Hash,
+    pub generation: i64,
     pub created_at: OffsetDateTime,
+    pub deleting_at: Option<OffsetDateTime>,
+    pub deletion_bytes: Option<i64>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

@@ -568,11 +568,16 @@ async fn postgres_s3_orphan_cleanup_reclaims_space_usage() {
     let mut stage = HashBuffer::new(Vec::new());
     stage.write_all(b"tc735-orphan-cleanup").await.unwrap();
     let hash = stage.hash();
-    tinycloud_core::kv_orphans::register_candidates(&conn, &[(owner.space.clone(), hash)])
-        .await
-        .unwrap();
+    let first = tinycloud_core::kv_orphans::register_candidates(
+        &conn,
+        &[(owner.space.clone(), hash)],
+        "crashed",
+    )
+    .await
+    .unwrap();
+    assert_eq!(first[0].2, 0, "the first upload uses the legacy bare key");
     assert_eq!(
-        ImmutableWriteStore::<MemoryStaging>::persist(&store, &owner.space, stage)
+        ImmutableWriteStore::<MemoryStaging>::persist(&store, &owner.space, stage, first[0].2)
             .await
             .unwrap(),
         hash
@@ -584,7 +589,10 @@ async fn postgres_s3_orphan_cleanup_reclaims_space_usage() {
             .unwrap(),
         1
     );
-    assert!(!store.contains(&owner.space, &hash).await.unwrap());
+    assert!(!store
+        .contains(&owner.space, &hash, first[0].2)
+        .await
+        .unwrap());
     assert_eq!(store.total_size(&owner.space).await.unwrap(), Some(0));
     // Simulate a known failure whose object removal succeeded but whose
     // candidate-row deletion did not commit. A later GC pass must not debit
@@ -593,19 +601,30 @@ async fn postgres_s3_orphan_cleanup_reclaims_space_usage() {
     failed.write_all(b"tc735-known-failure").await.unwrap();
     let failed_hash = failed.hash();
     let candidate = [(owner.space.clone(), failed_hash)];
-    tinycloud_core::kv_orphans::register_candidates(&conn, &candidate)
-        .await
-        .unwrap();
-    ImmutableWriteStore::<MemoryStaging>::persist(&store, &owner.space, failed)
-        .await
-        .unwrap();
-    tinycloud_core::kv_orphans::refund_failed(&conn, &store, &candidate)
+    let failed_attempt =
+        tinycloud_core::kv_orphans::register_candidates(&conn, &candidate, "known-failure")
+            .await
+            .unwrap();
+    ImmutableWriteStore::<MemoryStaging>::persist(
+        &store,
+        &owner.space,
+        failed,
+        failed_attempt[0].2,
+    )
+    .await
+    .unwrap();
+    tinycloud_core::kv_orphans::refund_failed(&conn, &store, &failed_attempt, "known-failure")
         .await
         .unwrap();
     assert_eq!(store.total_size(&owner.space).await.unwrap(), Some(0));
-    tinycloud_core::kv_orphans::register_candidates(&conn, &candidate)
-        .await
-        .unwrap();
+    let retry =
+        tinycloud_core::kv_orphans::register_candidates(&conn, &candidate, "retry-after-delete")
+            .await
+            .unwrap();
+    assert_eq!(
+        retry[0].2, 1,
+        "confirmed deletion advances storage generation"
+    );
     assert_eq!(
         tinycloud_core::kv_orphans::collect_candidates(&conn, &store, 1, time::Duration::ZERO,)
             .await
@@ -613,7 +632,10 @@ async fn postgres_s3_orphan_cleanup_reclaims_space_usage() {
         0,
         "the stale candidate has no physical object left to remove"
     );
-    assert!(!store.contains(&owner.space, &failed_hash).await.unwrap());
+    assert!(!store
+        .contains(&owner.space, &failed_hash, retry[0].2)
+        .await
+        .unwrap());
     assert_eq!(store.total_size(&owner.space).await.unwrap(), Some(0));
     conn.close().await.unwrap();
     admin

@@ -1,4 +1,4 @@
-use super::size::SpaceSizes;
+use super::{size::SpaceSizes, BlobGenerationKey};
 use core::pin::Pin;
 use futures::{
     future::{Either as AsyncEither, TryFutureExt},
@@ -10,6 +10,7 @@ use pin_project::pin_project;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{hash_map::Entry, HashMap},
+    fmt::Write as _,
     io::{Error as IoError, ErrorKind, SeekFrom},
     path::{Path, PathBuf},
     sync::Arc,
@@ -33,7 +34,7 @@ pub struct FileSystemStore {
     sizes: SpaceSizes,
     // A partial filesystem write can fail after creating a file. Reserve
     // before writing and refund the full reservation when deleting it.
-    pending: Arc<Mutex<HashMap<(SpaceId, Hash), u64>>>,
+    pending: Arc<Mutex<HashMap<BlobGenerationKey, u64>>>,
 }
 
 impl FileSystemStore {
@@ -47,11 +48,15 @@ impl FileSystemStore {
         })
     }
 
-    fn get_path(&self, space: &SpaceId, mh: &Hash) -> PathBuf {
+    fn get_path(&self, space: &SpaceId, mh: &Hash, generation: i64) -> PathBuf {
+        let mut name = base64::encode_config(mh.as_ref(), base64::URL_SAFE);
+        if generation != 0 {
+            write!(&mut name, "@{generation}").expect("writing to String cannot fail");
+        }
         self.path
             .join(space.suffix())
             .join(space.name().as_str())
-            .join(base64::encode_config(mh.as_ref(), base64::URL_SAFE))
+            .join(name)
     }
 
     async fn increment_size(&self, space: &SpaceId, size: u64) {
@@ -61,20 +66,28 @@ impl FileSystemStore {
         self.sizes.decrement_size(space, size).await;
     }
 
-    async fn reserve(&self, space: &SpaceId, hash: Hash, size: u64) {
+    async fn reserve(&self, space: &SpaceId, hash: Hash, generation: i64, size: u64) {
         let mut pending = self.pending.lock().await;
-        if let Entry::Vacant(slot) = pending.entry((space.clone(), hash)) {
+        if let Entry::Vacant(slot) = pending.entry((space.clone(), hash, generation)) {
             slot.insert(size);
             self.increment_size(space, size).await;
         }
     }
 
-    async fn settle(&self, space: &SpaceId, hash: Hash) {
-        self.pending.lock().await.remove(&(space.clone(), hash));
+    async fn settle(&self, space: &SpaceId, hash: Hash, generation: i64) {
+        self.pending
+            .lock()
+            .await
+            .remove(&(space.clone(), hash, generation));
     }
 
-    async fn refund_missing_pending(&self, space: &SpaceId, hash: Hash) {
-        if let Some(size) = self.pending.lock().await.remove(&(space.clone(), hash)) {
+    async fn refund_missing_pending(&self, space: &SpaceId, hash: Hash, generation: i64) {
+        if let Some(size) = self
+            .pending
+            .lock()
+            .await
+            .remove(&(space.clone(), hash, generation))
+        {
             self.decrement_size(space, size).await;
         }
     }
@@ -83,17 +96,18 @@ impl FileSystemStore {
         &self,
         space: &SpaceId,
         hash: Hash,
+        generation: i64,
         file: TempFileStage,
     ) -> Result<(), FileSystemStoreError> {
-        if self.contains(space, &hash).await? {
-            self.settle(space, hash).await;
+        if self.contains(space, &hash, generation).await? {
+            self.settle(space, hash, generation).await;
             return Ok(());
         }
         let size = file.size().await?;
-        self.reserve(space, hash, size).await;
+        self.reserve(space, hash, generation, size).await;
         let (_, path) = file.into_inner();
-        path.persist(self.get_path(space, &hash))?;
-        self.settle(space, hash).await;
+        path.persist(self.get_path(space, &hash, generation))?;
+        self.settle(space, hash, generation).await;
         Ok(())
     }
 
@@ -101,18 +115,20 @@ impl FileSystemStore {
         &self,
         space: &SpaceId,
         hash: Hash,
+        generation: i64,
         bytes: Vec<u8>,
     ) -> Result<(), FileSystemStoreError> {
-        if self.contains(space, &hash).await? {
-            self.settle(space, hash).await;
+        if self.contains(space, &hash, generation).await? {
+            self.settle(space, hash, generation).await;
             return Ok(());
         }
-        self.reserve(space, hash, bytes.len() as u64).await;
-        let file = File::create(self.get_path(space, &hash)).await?;
+        self.reserve(space, hash, generation, bytes.len() as u64)
+            .await;
+        let file = File::create(self.get_path(space, &hash, generation)).await?;
         let mut writer = futures::io::BufWriter::new(file.compat());
         writer.write_all(&bytes).await?;
         writer.flush().await?;
-        self.settle(space, hash).await;
+        self.settle(space, hash, generation).await;
         Ok(())
     }
 }
@@ -177,16 +193,22 @@ pub enum FileSystemStoreError {
 impl ImmutableReadStore for FileSystemStore {
     type Error = FileSystemStoreError;
     type Readable = Compat<tokio::io::Take<File>>;
-    async fn contains(&self, space: &SpaceId, id: &Hash) -> Result<bool, Self::Error> {
-        Ok(self.get_path(space, id).exists())
+    async fn contains(
+        &self,
+        space: &SpaceId,
+        id: &Hash,
+        generation: i64,
+    ) -> Result<bool, Self::Error> {
+        Ok(self.get_path(space, id, generation).exists())
     }
     async fn read(
         &self,
         space: &SpaceId,
         id: &Hash,
+        generation: i64,
     ) -> Result<Option<Content<Self::Readable>>, Self::Error> {
         let start = Instant::now();
-        let result = match File::open(self.get_path(space, id)).await {
+        let result = match File::open(self.get_path(space, id, generation)).await {
             Ok(file) => {
                 let size = file.metadata().await?.len();
                 Ok(Some(Content::new(size, file.take(size).compat())))
@@ -206,9 +228,10 @@ impl ImmutableReadStore for FileSystemStore {
         &self,
         space: &SpaceId,
         id: &Hash,
+        generation: i64,
         range: ByteRangeSpec,
     ) -> Result<Option<RangeRead<Self::Readable>>, Self::Error> {
-        match File::open(self.get_path(space, id)).await {
+        match File::open(self.get_path(space, id, generation)).await {
             Ok(mut file) => {
                 let total_size = file.metadata().await?.len();
                 let Some(range) = range.resolve(total_size) else {
@@ -336,12 +359,13 @@ impl ImmutableWriteStore<TempFileSystemStage> for FileSystemStore {
         &self,
         space: &SpaceId,
         staged: HashBuffer<<TempFileSystemStage as ImmutableStaging>::Writable>,
+        generation: i64,
     ) -> Result<Hash, Self::Error> {
         let start = Instant::now();
         let result = async move {
             let (mut h, f) = staged.into_inner();
             let hash = h.finalize();
-            self.persist_temp(space, hash, f).await?;
+            self.persist_temp(space, hash, generation, f).await?;
             Ok(hash)
         }
         .await;
@@ -361,12 +385,13 @@ impl ImmutableWriteStore<memory::MemoryStaging> for FileSystemStore {
         &self,
         space: &SpaceId,
         staged: HashBuffer<<memory::MemoryStaging as ImmutableStaging>::Writable>,
+        generation: i64,
     ) -> Result<Hash, Self::Error> {
         let start = Instant::now();
         let result = async move {
             let (mut h, v) = staged.into_inner();
             let hash = h.finalize();
-            self.persist_memory(space, hash, v).await?;
+            self.persist_memory(space, hash, generation, v).await?;
             Ok(hash)
         }
         .await;
@@ -388,6 +413,7 @@ impl ImmutableWriteStore<either::Either<TempFileSystemStage, memory::MemoryStagi
         &self,
         space: &SpaceId,
         staged: HashBuffer<<either::Either<TempFileSystemStage, memory::MemoryStaging> as ImmutableStaging>::Writable>,
+        generation: i64,
     ) -> Result<Hash, Self::Error> {
         let start = Instant::now();
         let result = async move {
@@ -395,8 +421,10 @@ impl ImmutableWriteStore<either::Either<TempFileSystemStage, memory::MemoryStagi
             let hash = h.finalize();
 
             match f {
-                AsyncEither::Left(file) => self.persist_temp(space, hash, file).await?,
-                AsyncEither::Right(bytes) => self.persist_memory(space, hash, bytes).await?,
+                AsyncEither::Left(file) => self.persist_temp(space, hash, generation, file).await?,
+                AsyncEither::Right(bytes) => {
+                    self.persist_memory(space, hash, generation, bytes).await?
+                }
             }
             Ok(hash)
         }
@@ -413,12 +441,17 @@ impl ImmutableWriteStore<either::Either<TempFileSystemStage, memory::MemoryStagi
 #[async_trait]
 impl ImmutableDeleteStore for FileSystemStore {
     type Error = FileSystemStoreError;
-    async fn remove(&self, space: &SpaceId, id: &Hash) -> Result<Option<()>, Self::Error> {
-        let path = self.get_path(space, id);
+    async fn remove(
+        &self,
+        space: &SpaceId,
+        id: &Hash,
+        generation: i64,
+    ) -> Result<Option<()>, Self::Error> {
+        let path = self.get_path(space, id, generation);
         let size = match metadata(&path).await {
             Ok(m) => m.len(),
             Err(e) if e.kind() == ErrorKind::NotFound => {
-                self.refund_missing_pending(space, *id).await;
+                self.refund_missing_pending(space, *id, generation).await;
                 return Ok(None);
             }
             Err(e) => return Err(e.into()),
@@ -429,13 +462,13 @@ impl ImmutableDeleteStore for FileSystemStore {
                     .pending
                     .lock()
                     .await
-                    .remove(&(space.clone(), *id))
+                    .remove(&(space.clone(), *id, generation))
                     .unwrap_or(size);
                 self.decrement_size(space, charged).await;
                 Ok(Some(()))
             }
             Err(e) if e.kind() == ErrorKind::NotFound => {
-                self.refund_missing_pending(space, *id).await;
+                self.refund_missing_pending(space, *id, generation).await;
                 Ok(None)
             }
             Err(e) => Err(e.into()),
@@ -469,13 +502,13 @@ mod test {
         stage.write_all(b"failed-write").await.unwrap();
         let hash = stage.hash();
         assert!(
-            ImmutableWriteStore::<memory::MemoryStaging>::persist(&store, &space, stage)
+            ImmutableWriteStore::<memory::MemoryStaging>::persist(&store, &space, stage, 0)
                 .await
                 .is_err()
         );
         assert_eq!(store.total_size(&space).await.unwrap(), Some(12));
-        assert_eq!(store.remove(&space, &hash).await.unwrap(), None);
-        assert!(!store.contains(&space, &hash).await.unwrap());
+        assert_eq!(store.remove(&space, &hash, 0).await.unwrap(), None);
+        assert!(!store.contains(&space, &hash, 0).await.unwrap());
         assert_eq!(store.total_size(&space).await.unwrap(), Some(0));
     }
 
@@ -493,11 +526,11 @@ mod test {
         let mut stage = tfs.stage(&space_id).await.unwrap();
         futures::io::copy(&mut &data[..], &mut stage).await.unwrap();
 
-        let hash = ImmutableWriteStore::<TempFileSystemStage>::persist(&store, &space_id, stage)
+        let hash = ImmutableWriteStore::<TempFileSystemStage>::persist(&store, &space_id, stage, 0)
             .await
             .unwrap();
 
-        assert!(store.contains(&space_id, &hash).await.unwrap());
+        assert!(store.contains(&space_id, &hash, 0).await.unwrap());
         assert_eq!(
             store.total_size(&space_id).await.unwrap(),
             Some(data.len() as u64)
@@ -505,7 +538,7 @@ mod test {
 
         let mut buf = Vec::new();
         store
-            .read(&space_id, &hash)
+            .read(&space_id, &hash, 0)
             .await
             .unwrap()
             .unwrap()
@@ -515,7 +548,11 @@ mod test {
 
         assert_eq!(buf, data);
         assert_eq!(
-            store.read_to_vec(&space_id, &hash).await.unwrap().unwrap(),
+            store
+                .read_to_vec(&space_id, &hash, 0)
+                .await
+                .unwrap()
+                .unwrap(),
             data
         );
 
@@ -523,6 +560,7 @@ mod test {
             .read_range(
                 &space_id,
                 &hash,
+                0,
                 ByteRangeSpec::Inclusive { start: 6, end: 10 },
             )
             .await
@@ -549,20 +587,98 @@ mod test {
 
         assert!(matches!(
             store
-                .read_range(&space_id, &hash, ByteRangeSpec::From { start: 99 })
+                .read_range(&space_id, &hash, 0, ByteRangeSpec::From { start: 99 })
                 .await
                 .unwrap()
                 .unwrap(),
             RangeRead::Unsatisfiable { total_size: 11 }
         ));
 
-        assert_eq!(store.remove(&space_id, &hash).await.unwrap(), Some(()));
-        assert_eq!(store.remove(&space_id, &hash).await.unwrap(), None);
-        assert!(!store.contains(&space_id, &hash).await.unwrap());
+        assert_eq!(store.remove(&space_id, &hash, 0).await.unwrap(), Some(()));
+        assert_eq!(store.remove(&space_id, &hash, 0).await.unwrap(), None);
+        assert!(!store.contains(&space_id, &hash, 0).await.unwrap());
         assert_eq!(store.total_size(&space_id).await.unwrap(), Some(0));
         assert_eq!(
-            store.read(&space_id, &hash).await.unwrap().map(|_| ()),
+            store.read(&space_id, &hash, 0).await.unwrap().map(|_| ()),
             None
         );
+    }
+    #[tokio::test]
+    async fn reads_preexisting_bare_hash_file_as_generation_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let space: SpaceId = "tinycloud:key:test:old-file".parse().unwrap();
+        let initial = FileSystemConfig::new(dir.path()).open().await.unwrap();
+        initial.create(&space).await.unwrap();
+        let mut data = HashBuffer::new(Vec::new());
+        data.write_all(b"legacy").await.unwrap();
+        let hash = data.hash();
+        let bare = initial.get_path(&space, &hash, 0);
+        tokio::fs::write(&bare, b"legacy").await.unwrap();
+        let loaded = FileSystemConfig::new(dir.path()).open().await.unwrap();
+        assert_eq!(
+            loaded.read_to_vec(&space, &hash, 0).await.unwrap(),
+            Some(b"legacy".to_vec())
+        );
+        assert_eq!(loaded.read_to_vec(&space, &hash, 1).await.unwrap(), None);
+        assert_eq!(loaded.total_size(&space).await.unwrap(), Some(6));
+    }
+
+    #[tokio::test]
+    async fn generations_keep_legacy_key_and_account_for_both_files_on_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let space: SpaceId = "tinycloud:key:test:generations".parse().unwrap();
+        let store = FileSystemConfig::new(dir.path()).open().await.unwrap();
+        store.create(&space).await.unwrap();
+        let mut old = HashBuffer::new(Vec::new());
+        old.write_all(b"same bytes").await.unwrap();
+        let hash = old.hash();
+        let legacy_path = store.get_path(&space, &hash, 0);
+        assert_eq!(
+            legacy_path.file_name().unwrap(),
+            base64::encode_config(hash.as_ref(), base64::URL_SAFE).as_str()
+        );
+        ImmutableWriteStore::<memory::MemoryStaging>::persist(&store, &space, old, 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.read_to_vec(&space, &hash, 0).await.unwrap().unwrap(),
+            b"same bytes"
+        );
+        let mut next = HashBuffer::new(Vec::new());
+        next.write_all(b"same bytes").await.unwrap();
+        ImmutableWriteStore::<memory::MemoryStaging>::persist(&store, &space, next, 1)
+            .await
+            .unwrap();
+        assert_ne!(legacy_path, store.get_path(&space, &hash, 1));
+        assert_eq!(store.total_size(&space).await.unwrap(), Some(20));
+        let restarted = FileSystemConfig::new(dir.path()).open().await.unwrap();
+        assert_eq!(restarted.total_size(&space).await.unwrap(), Some(20));
+        assert_eq!(store.remove(&space, &hash, 0).await.unwrap(), Some(()));
+        assert!(store.contains(&space, &hash, 1).await.unwrap());
+        assert_eq!(
+            store.read_to_vec(&space, &hash, 1).await.unwrap().unwrap(),
+            b"same bytes"
+        );
+        let RangeRead::Content { mut content, .. } = store
+            .read_range(
+                &space,
+                &hash,
+                1,
+                ByteRangeSpec::Inclusive { start: 5, end: 9 },
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("expected generation-one range");
+        };
+        let mut range_bytes = Vec::new();
+        content.read_to_end(&mut range_bytes).await.unwrap();
+        assert_eq!(range_bytes, b"bytes");
+        assert_eq!(store.total_size(&space).await.unwrap(), Some(10));
+        assert_eq!(store.remove(&space, &hash, 0).await.unwrap(), None);
+        assert_eq!(store.total_size(&space).await.unwrap(), Some(10));
+        assert_eq!(store.remove(&space, &hash, 1).await.unwrap(), Some(()));
+        assert_eq!(store.total_size(&space).await.unwrap(), Some(0));
     }
 }

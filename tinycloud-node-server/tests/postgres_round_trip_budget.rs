@@ -124,12 +124,15 @@ use tokio::{
 /// net new statements are seven necessary steps minus three queries saved by
 /// #302 in the commit authorization graph: BEGIN/COMMIT pin pre-upload work
 /// for retry-safe atomicity (two), the pre-upload authorization graph and
-/// hosted-space COUNT reject before S3 (two), the candidate reservation
-/// survives a crash before upload (one), a second hash-fence reservation
-/// under the commit transaction excludes GC after upload (one), and the
-/// candidate DELETE clears the committed reference atomically (one).
-/// The extra preflight transaction also releases one pooled connection,
-/// whose ping flushes cancelled/unfinished statements and cannot be removed.
+/// hosted-space COUNT reject before S3 (two), the PostgreSQL candidate-and-
+/// attempt registration CTE durably protects the blob before upload (one),
+/// the joined active-fence/own-attempt lock excludes GC after upload (one),
+/// and the successful-commit CTE retires the attempt and only an already
+/// referenced last fence (one). A failed last attempt instead persists a
+/// deleting fence until physical absence is confirmed. The extra preparatory
+/// transaction releases one pooled connection; its mandatory ping flushes
+/// cancelled/unfinished statements. SQLite/MySQL use the equivalent guarded
+/// multi-statement paths rather than the PostgreSQL-only CTEs.
 const BUDGETS: [(&str, u64); 3] = [("sign-in", 69), ("kv put", 42), ("kv get", 16)];
 
 /// Full sign-in plus put plus get rounds run before the measured one.
@@ -1188,11 +1191,13 @@ async fn postgres_write_routes_tell_retryable_failures_from_unknown_outcomes() {
         let (status, body, _) = kv_put(&node, &session, "tc1054/warm").await?;
         ensure!(status == Status::Ok, "warm-up put: {status} {body}");
 
-        // KV put: no connection survives BEGIN, so nothing was written.
+        // KV put's preparatory BEGIN retries once in the recovering pool and
+        // once around the idempotent preparation (two attempts each). Exhaust
+        // both layers before asserting the public retryable response.
         node.settle().await?;
-        cut.arm(&[b"BEGIN"], 2);
+        cut.arm(&[b"BEGIN"], 4);
         let (status, body, retry_after) = kv_put(&node, &session, "tc1054/retryable").await?;
-        ensure!(!cut.armed(), "both BEGIN attempts were cut");
+        ensure!(!cut.armed(), "all preparatory BEGIN attempts were cut");
         ensure!(
             status == Status::ServiceUnavailable && body.starts_with("unavailable_retryable:"),
             "kv put before any write: {status} {body}"

@@ -622,7 +622,16 @@ pub async fn app_with_control(
         encryption_backend,
     );
 
-    let block_store = tinycloud_config.storage.blocks.open().await?;
+    // Migrate before opening S3: its one bucket listing both reconstructs
+    // SpaceSizes and records which in-flight DELETE fences were counted.
+    // A separate HEAD after listing could race an old DELETE and leak quota.
+    // TinyCloud::new sees an already-current migration history below.
+    tinycloud_core::db::migrate(&database_connection).await?;
+    let deleting_fences = tinycloud_core::kv_orphans::deleting_fences(&database_connection).await?;
+    let block_store: BlockStores = match &tinycloud_config.storage.blocks {
+        Either::A(s3) => Either::A(s3.open_with_deleting(&deleting_fences).await?),
+        Either::B(local) => Either::B(local.open().await?),
+    };
     let orphan_store = block_store.clone();
     let tinycloud = TinyCloud::new(database_connection, block_store, key_setup.setup(()).await?)
         .await?
@@ -782,7 +791,7 @@ pub async fn app_with_control(
                             _ = interval.tick() => {
                                 loop {
                                     match tinycloud_core::kv_orphans::collect_candidates_with_progress(
-                                        &conn, &store, 256, time::Duration::minutes(5),
+                                        &conn, &store, 256, tinycloud_core::kv_orphans::ORPHAN_GRACE,
                                     ).await {
                                         Ok((_, 256)) => continue,
                                         Ok(_) => break,

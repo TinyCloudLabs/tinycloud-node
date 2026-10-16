@@ -804,38 +804,32 @@ async fn postgres_requests_survive_one_stale_pooled_connection() {
     fixture.drop_schema().await;
 }
 
-/// Candidate registration is an idempotent write before upload. A stale idle
-/// connection must be retried here, before any blob can land in storage.
+/// Ordinary KV writes begin with an idempotent preparatory transaction.
+/// A stale idle connection must not produce an orphan or prevent the write.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn postgres_preupload_candidate_registration_retries_stale_connection() {
-    let Some(url) =
-        postgres_url("postgres_preupload_candidate_registration_retries_stale_connection")
+async fn postgres_ordinary_put_recovers_stale_connection_without_orphan() {
+    let Some(url) = postgres_url("postgres_ordinary_put_recovers_stale_connection_without_orphan")
     else {
         return;
     };
-    let fixture = Fixture::new("candidate", &url, None).await;
+    let mut fixture = Fixture::new("candidate", &url, None).await;
     fixture.fill_pool().await;
     let victim = fixture.order_idle_queue(0).await;
     fixture.terminate(&BTreeSet::from([victim])).await;
     let before = fixture.stats();
-    let blob = (
-        fixture.owner.space.clone(),
-        tinycloud_core::hash::hash(b"preupload-stale-connection"),
-    );
-    tinycloud_core::kv_orphans::register_candidates_idempotent(&fixture.conn, &[blob])
+    fixture
+        .put("after/preflight/stale")
         .await
-        .expect("candidate is registered after reconnect");
+        .expect("ordinary write survives stale pooled connection");
     let recovered = delta(before, fixture.stats());
     assert_eq!(
-        (
-            recovered.losses,
-            recovered.retries,
-            recovered.idempotent_retries
-        ),
-        (1, 1, 1),
+        (recovered.losses, recovered.retries),
+        (1, 1),
         "{recovered:?}"
     );
-    assert_eq!(fixture.row_count("kv_orphan_candidate").await, 1);
+    assert_eq!(fixture.row_count("kv_orphan_candidate").await, 0);
+    assert_eq!(fixture.row_count("kv_orphan_attempt").await, 0);
+    fixture.get("after/preflight/stale").await.unwrap();
     fixture.drop_schema().await;
 }
 

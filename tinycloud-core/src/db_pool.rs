@@ -237,35 +237,6 @@ impl RecoveringConnection {
     /// the replay guard's `INSERT ... ON CONFLICT DO NOTHING` reports a
     /// conflict as a replay, so it must not be retried.
     pub async fn execute_idempotent(&self, stmt: Statement) -> Result<ExecResult, DbErr> {
-        self.execute_idempotent_with_tracking(stmt, true).await
-    }
-
-    /// A replayable candidate reservation made before any user-visible KV
-    /// effect. Losing its connection cannot make the KV outcome unknown, even
-    /// if the reservation landed. Only the pre-upload orphan registry uses it.
-    pub(crate) async fn execute_idempotent_preparatory(
-        &self,
-        stmt: Statement,
-    ) -> Result<ExecResult, DbErr> {
-        self.execute_idempotent_with_tracking(stmt, false).await
-    }
-
-    /// Pre-upload authorization and orphan registration share one connection.
-    /// This transaction can only change retryable candidate metadata; the
-    /// caller commits it before persisting a blob, so its uncertain outcome
-    /// cannot mean a user-visible KV write committed.
-    pub(crate) async fn begin_preparatory(&self) -> Result<DatabaseTransaction, DbErr> {
-        let transaction = self
-            .run("begin_preparatory", true, || self.conn.begin())
-            .await?;
-        self.scope_local_timeout(transaction).await
-    }
-
-    async fn execute_idempotent_with_tracking(
-        &self,
-        stmt: Statement,
-        track_user_write: bool,
-    ) -> Result<ExecResult, DbErr> {
         let started = Instant::now();
         let result = match self.conn.execute(stmt.clone()).await {
             Err(error) if is_connection_error(&error) && !self.within_retry_window(started) => {
@@ -281,10 +252,19 @@ impl RecoveringConnection {
             }
             result => result,
         };
-        if track_user_write {
-            note_write_outcome(&result);
-        }
+        note_write_outcome(&result);
         result
+    }
+
+    /// Pre-upload authorization and orphan registration share one connection.
+    /// This transaction can only change retryable candidate metadata; the
+    /// caller commits it before persisting a blob, so its uncertain outcome
+    /// cannot mean a user-visible KV write committed.
+    pub(crate) async fn begin_preparatory(&self) -> Result<DatabaseTransaction, DbErr> {
+        let transaction = self
+            .run("begin_preparatory", true, || self.conn.begin())
+            .await?;
+        self.scope_local_timeout(transaction).await
     }
 
     /// The outcome of the one retry. It is never retried again, but a

@@ -119,6 +119,7 @@ fn latest_writes() -> SelectStatement {
             (write.clone(), kv_write::Column::Metadata),
         ])
         .expr_as(Expr::exists(exact_tombstone), current_kv::Column::Deleted)
+        .expr_as(Expr::val(0), current_kv::Column::Generation)
         .from_as(kv_write::Entity, write)
         .cond_where(Condition::all().not().add(Expr::exists(newer_write)));
     query.to_owned()
@@ -141,6 +142,7 @@ async fn backfill_and_validate(manager: &SchemaManager<'_>) -> Result<(), DbErr>
             current_kv::Column::Value,
             current_kv::Column::Metadata,
             current_kv::Column::Deleted,
+            current_kv::Column::Generation,
         ])
         .select_from(expected_select.clone())
         .map_err(|error| DbErr::Migration(error.to_string()))?;
@@ -233,12 +235,13 @@ mod tests {
             epoch: epoch_id,
             epoch_seq: 0,
             value: hash(format!("value-{label}").as_bytes()),
+            generation: 0,
             metadata: Metadata(BTreeMap::from([("label".to_string(), label.to_string())])),
         };
-        kv_write::ActiveModel::from(write.clone())
-            .insert(db)
-            .await
-            .unwrap();
+        let mut legacy = kv_write::ActiveModel::from(write.clone());
+        // Older writers omit the field; a fresh table defaults it to zero.
+        legacy.generation = sea_orm::ActiveValue::NotSet;
+        legacy.insert(db).await.unwrap();
         write
     }
 

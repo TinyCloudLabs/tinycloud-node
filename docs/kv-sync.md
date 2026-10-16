@@ -132,41 +132,55 @@ Read audit records every poll. Poll on demand, or no more often than every
 
 ## Write ordering and blob recovery
 
-KV puts stage and authorize content before upload. The node registers a
-durable `(space, content hash)` recovery candidate, then persists the blob
-before taking the per-space sequence lock. The database transaction rechecks
-authorization and conditional-write preconditions under that lock; it holds
-the lock through commit, so `seq` and sync cursors remain commit-ordered even
-when same-space uploads finish out of order. An unauthorized write uploads
-nothing.
+KV puts stage and authorize content before upload. A short preparatory
+transaction checks authorization and hosting, then commits an active
+`(space, content hash, generation)` fence and a separate claim for each
+writer. The first generation is zero and retains the original bare-hash
+storage key; a generation above zero is allocated only after a prior
+generation's physical deletion is confirmed. Ordinary writes release every
+pooled connection and database lock before S3 or filesystem I/O. A
+four-minute upload deadline stays below the five-minute DB-clock GC grace.
+After upload, an ordinary writer takes the per-space sequence guard, starts
+a fresh commit transaction and takes
+the DB sequence lock; it verifies its own active claim, then rechecks
+authorization and conditional-write preconditions. The guards stay through
+commit, so `seq` and sync cursors remain commit-ordered even when same-space
+uploads finish out of order. An unauthorized write uploads nothing.
 
-For protected legacy meeting paths, the durable freeze row is locked before
-upload and held until commit or abort. That barrier is distinct from the
-per-space sequence lock: a freeze drains uploads already in flight, while
-writes arriving after the freeze are rejected before upload. A stalled writer
-causes the freeze attempt to fail after 30 seconds rather than acknowledge an
-incomplete drain.
+Protected legacy meeting paths are the TC-1260 exception: the durable freeze
+row and its pooled transaction remain locked across upload until commit or
+abort. A freeze acknowledgement drains earlier uploads; a later protected
+write is refused before upload. A stalled writer causes the freeze attempt
+to fail after 30 seconds rather than acknowledge an incomplete drain.
 
-Before upload, a lost pooled connection retries the candidate registration
-with the same idempotent upsert. If the hash or freeze row lock loses its
-transaction, the node restarts that transaction once and retakes both fences
-before persisting anything. It never replays an upload or committed write
-after a connection loss.
+Before upload, a lost pooled connection retries the preparatory transaction
+with the same attempt ID. The registration is idempotent; neither an upload
+nor a committed write is replayed on an uncertain outcome. A missing claim
+or a fence already deleting returns a retryable error, never a reference to
+a potentially removed object.
 
-A failed upload, precondition, or database write triggers an immediate
-hash-fenced reference check. Unreferenced blobs are removed and their
-physical-byte quota is refunded before the failure returns. Historical
-`kv_write` references are retained as well as current values, because a
-client can still read an older value. The candidate row is removed with a
-successful KV commit; a failed cleanup leaves it for the collector. After a
-crash, the node scans candidates at 60-second intervals, collecting those
-older than five minutes in bounded batches of 256 until the eligible backlog
-is drained. S3 and filesystem stores reserve bytes before a potentially
-ambiguous write; deleting the resulting object or canceling a reservation
-for an object that never materialized refunds once, not twice.
+A failed upload, precondition or database write removes only its own claim.
+If another claim or a current or historical KV reference exists, it leaves
+the shared generation's blob alone. Otherwise it commits a `deleting` fence
+and byte entitlement, releases the DB connection, then deletes that
+generation's object. A writer seeing `deleting` cannot deduplicate or
+upload over it. Only confirmed physical absence refunds the per-process
+quota exactly once; only then is the fence retired and the next generation
+made available. Each delete targets its original generation's storage key,
+so even a delayed second delete cannot remove a later committed generation.
+A lost DELETE response or a crash mid-delete leaves the fence for
+idempotent GC retry. Reads get the generation from their existing KV lookup,
+without another database query; generation zero reads the bare key. A
+rolled-back binary cannot read records with generation above zero, which
+can occur after a failed upload is collected and its content is saved again.
 
-Quota is conservative physical accounting, **not commit-only accounting**:
-in-flight uploads and crash leftovers may temporarily count against it.
-`SpaceSizes` remains in-memory and per process; writes or deletions on other
-nodes do not synchronize that counter. Globally exact multi-node accounting
-requires a separate shared byte ledger (TC-1162).
+The collector runs every 60 seconds, aging attempts after five minutes by
+DB time and draining eligible work in batches of 256. On S3 startup the
+same object-listing snapshot reconstructs both `SpaceSizes` and which
+`deleting` fences counted physical bytes; a deletion before the listing
+needs no refund, while a deletion afterward refunds once. Orphans present
+at restart count until GC. Quota is conservative physical accounting,
+**not commit-only accounting**: pending uploads and crash leftovers can
+temporarily over-count. `SpaceSizes` remains in-memory and per process; other
+nodes' writes and deletes do not synchronize it. Globally exact multi-node
+accounting requires a separate shared byte ledger (TC-1162).

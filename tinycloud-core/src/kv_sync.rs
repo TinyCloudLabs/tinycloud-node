@@ -895,7 +895,7 @@ pub(crate) mod tests {
     use crate::storage::memory::{MemoryStaging, MemoryStore};
     use crate::storage::HashBuffer;
     use crate::InvocationOutcome;
-    use futures::io::AsyncWriteExt;
+    use futures::io::{AsyncReadExt, AsyncWriteExt};
     use sea_orm::{
         ActiveModelTrait, ActiveValue::Set, ConnectOptions, Database, DatabaseConnection,
         TransactionTrait,
@@ -1680,11 +1680,102 @@ pub(crate) mod tests {
         );
         assert!(
             !store
-                .contains(&other.space, &crate::hash::hash(b"unauthorized"))
+                .contains(&other.space, &crate::hash::hash(b"unauthorized"), 0)
                 .await
                 .unwrap(),
             "authorization failure must not create a blob"
         );
+    }
+
+    #[tokio::test]
+    async fn gen_zero_legacy_read_and_reuploaded_generation_get_and_range() {
+        use crate::storage::{ByteRangeSpec, ImmutableReadStore, ImmutableWriteStore, RangeRead};
+        let store = MemoryStore::default();
+        let db = SpaceDatabase::new(
+            Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
+                .await
+                .unwrap(),
+            store.clone(),
+            StaticSecret::new([0u8; 32].to_vec()).unwrap(),
+        )
+        .await
+        .unwrap();
+        let owner = Owner::generate();
+        host(&db, &owner).await;
+
+        let original = run(&db, &owner, &[Op::Put("notes/legacy", b"bare")]).await[0];
+        let legacy_key: Path = "notes/legacy".parse().unwrap();
+        let legacy = current_kv::Entity::find_by_id((
+            SpaceIdWrap(owner.space.clone()),
+            legacy_key.clone().into(),
+        ))
+        .one(db.connection())
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(legacy.generation, 0);
+        assert_eq!(legacy.value, original);
+        assert_eq!(
+            store.read_to_vec(&owner.space, &original, 0).await.unwrap(),
+            Some(b"bare".to_vec()),
+            "the older bare-key reader can still read a first-generation row"
+        );
+
+        let bytes = b"regenerated";
+        let hash = crate::hash::hash(bytes);
+        let tx = db.connection().begin().await.unwrap();
+        let old = crate::kv_orphans::register_candidates(
+            &tx,
+            &[(owner.space.clone(), hash)],
+            "orphan-before-resave",
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(old[0].2, 0);
+        let mut staged = HashBuffer::new(Vec::new());
+        staged.write_all(bytes).await.unwrap();
+        store.persist(&owner.space, staged, 0).await.unwrap();
+        crate::kv_orphans::refund_failed(db.connection(), &store, &old, "orphan-before-resave")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            run(&db, &owner, &[Op::Put("notes/resaved", bytes)]).await[0],
+            hash
+        );
+        let new_key: Path = "notes/resaved".parse().unwrap();
+        let new_row = current_kv::Entity::find_by_id((
+            SpaceIdWrap(owner.space.clone()),
+            new_key.clone().into(),
+        ))
+        .one(db.connection())
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(new_row.generation, 1);
+        assert!(!store.contains(&owner.space, &hash, 0).await.unwrap());
+        let (_, _, content) = db.kv_get(&owner.space, &new_key).await.unwrap().unwrap();
+        let (_, mut reader) = content.into_inner();
+        let mut read = Vec::new();
+        reader.read_to_end(&mut read).await.unwrap();
+        assert_eq!(read, bytes);
+        let (_, _, range) = db
+            .kv_get_range(
+                &owner.space,
+                &new_key,
+                ByteRangeSpec::Inclusive { start: 2, end: 5 },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let RangeRead::Content { content, .. } = range else {
+            panic!("expected generated range");
+        };
+        let (_, mut reader) = content.into_inner();
+        let mut read = Vec::new();
+        reader.read_to_end(&mut read).await.unwrap();
+        assert_eq!(read, &bytes[2..=5]);
     }
 
     #[tokio::test]
@@ -1714,10 +1805,10 @@ pub(crate) mod tests {
         assert!(rejected.contains("precondition"), "{rejected}");
         let orphan = crate::hash::hash(b"rejected");
         assert!(
-            !store.contains(&owner.space, &orphan).await.unwrap(),
+            !store.contains(&owner.space, &orphan, 0).await.unwrap(),
             "a known precondition failure must remove its unreferenced upload"
         );
-        assert!(store.contains(&owner.space, &committed).await.unwrap());
+        assert!(store.contains(&owner.space, &committed, 0).await.unwrap());
         assert_eq!(store.total_size(&owner.space).await.unwrap(), Some(4));
         let duplicate = invoke(&db, &owner, &[Op::Put("notes/a", b"kept")], {
             let mut options = KvInvokeOptions::default();
@@ -1730,7 +1821,7 @@ pub(crate) mod tests {
         .await
         .unwrap_err();
         assert!(duplicate.contains("precondition"), "{duplicate}");
-        assert!(store.contains(&owner.space, &committed).await.unwrap());
+        assert!(store.contains(&owner.space, &committed, 0).await.unwrap());
         assert_eq!(store.total_size(&owner.space).await.unwrap(), Some(4));
     }
 
@@ -1767,7 +1858,7 @@ pub(crate) mod tests {
         .unwrap_err();
         assert!(error.contains("blocked"), "{error}");
         assert!(!store
-            .contains(&owner.space, &crate::hash::hash(b"uploaded"))
+            .contains(&owner.space, &crate::hash::hash(b"uploaded"), 0)
             .await
             .unwrap());
         assert_eq!(store.total_size(&owner.space).await.unwrap(), Some(0));
@@ -1790,23 +1881,30 @@ pub(crate) mod tests {
     impl crate::storage::ImmutableReadStore for AmbiguousUploadStore {
         type Error = std::io::Error;
         type Readable = futures::io::Cursor<Vec<u8>>;
-        async fn contains(&self, space: &SpaceId, id: &Hash) -> Result<bool, Self::Error> {
-            self.0.contains(space, id).await
+        async fn contains(
+            &self,
+            space: &SpaceId,
+            id: &Hash,
+            generation: i64,
+        ) -> Result<bool, Self::Error> {
+            self.0.contains(space, id, generation).await
         }
         async fn read(
             &self,
             space: &SpaceId,
             id: &Hash,
+            generation: i64,
         ) -> Result<Option<crate::storage::Content<Self::Readable>>, Self::Error> {
-            self.0.read(space, id).await
+            self.0.read(space, id, generation).await
         }
         async fn read_range(
             &self,
             space: &SpaceId,
             id: &Hash,
+            generation: i64,
             range: crate::storage::ByteRangeSpec,
         ) -> Result<Option<crate::storage::RangeRead<Self::Readable>>, Self::Error> {
-            self.0.read_range(space, id, range).await
+            self.0.read_range(space, id, generation, range).await
         }
     }
 
@@ -1817,8 +1915,9 @@ pub(crate) mod tests {
             &self,
             space: &SpaceId,
             staged: HashBuffer<Vec<u8>>,
+            generation: i64,
         ) -> Result<Hash, Self::Error> {
-            self.0.persist(space, staged).await?;
+            self.0.persist(space, staged, generation).await?;
             Err(std::io::Error::other("lost PUT response"))
         }
     }
@@ -1826,8 +1925,13 @@ pub(crate) mod tests {
     #[async_trait::async_trait]
     impl crate::storage::ImmutableDeleteStore for AmbiguousUploadStore {
         type Error = std::io::Error;
-        async fn remove(&self, space: &SpaceId, id: &Hash) -> Result<Option<()>, Self::Error> {
-            self.0.remove(space, id).await
+        async fn remove(
+            &self,
+            space: &SpaceId,
+            id: &Hash,
+            generation: i64,
+        ) -> Result<Option<()>, Self::Error> {
+            self.0.remove(space, id, generation).await
         }
     }
 
@@ -1871,7 +1975,7 @@ pub(crate) mod tests {
         };
         assert!(error.contains("lost PUT response"), "{error}");
         assert!(!store
-            .contains(&owner.space, &crate::hash::hash(b"uploaded"))
+            .contains(&owner.space, &crate::hash::hash(b"uploaded"), 0)
             .await
             .unwrap());
         assert_eq!(store.0.total_size(&owner.space).await.unwrap(), Some(0));
@@ -2028,7 +2132,12 @@ pub(crate) mod tests {
         let hash = crate::hash::hash(b"persist-before-lock");
         let visible = tokio::time::timeout(std::time::Duration::from_secs(3), async {
             loop {
-                if fixture.store.contains(&owner.space, &hash).await.unwrap() {
+                if fixture
+                    .store
+                    .contains(&owner.space, &hash, 0)
+                    .await
+                    .unwrap()
+                {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;

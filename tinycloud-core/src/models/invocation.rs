@@ -640,6 +640,7 @@ async fn save<C: ConnectionTrait>(
             VersionedOperation::KvWrite {
                 key,
                 value,
+                generation,
                 metadata,
                 space,
                 seq,
@@ -650,6 +651,7 @@ async fn save<C: ConnectionTrait>(
                     invocation: hash,
                     key: key.clone().into(),
                     value: *value,
+                    generation: *generation,
                     space: space.clone().into(),
                     metadata: metadata.clone(),
                     seq: *seq,
@@ -791,6 +793,7 @@ pub(crate) async fn upsert_current_kv<C: ConnectionTrait>(
         epoch: write.epoch,
         epoch_seq: write.epoch_seq,
         value: write.value,
+        generation: write.generation,
         metadata: write.metadata,
         deleted: false,
     };
@@ -804,6 +807,7 @@ pub(crate) async fn upsert_current_kv<C: ConnectionTrait>(
         const NEWER: &str = "VALUES(`seq`) > `seq` OR (VALUES(`seq`) = `seq` AND VALUES(`epoch`) > `epoch`) OR (VALUES(`seq`) = `seq` AND VALUES(`epoch`) = `epoch` AND VALUES(`epoch_seq`) > `epoch_seq`) OR (VALUES(`seq`) = `seq` AND VALUES(`epoch`) = `epoch` AND VALUES(`epoch_seq`) = `epoch_seq` AND `deleted`)";
         for (column, incoming) in [
             (current_kv::Column::Invocation, "invocation"),
+            (current_kv::Column::Generation, "generation"),
             (current_kv::Column::Value, "value"),
             (current_kv::Column::Metadata, "metadata"),
             (current_kv::Column::Deleted, "deleted"),
@@ -826,6 +830,7 @@ pub(crate) async fn upsert_current_kv<C: ConnectionTrait>(
                 current_kv::Column::Epoch,
                 current_kv::Column::EpochSeq,
                 current_kv::Column::Value,
+                current_kv::Column::Generation,
                 current_kv::Column::Metadata,
                 current_kv::Column::Deleted,
             ])
@@ -1081,6 +1086,7 @@ mod tests {
             epoch: crate::hash::hash(format!("epoch-{label}").as_bytes()),
             epoch_seq: 0,
             value: crate::hash::hash(format!("value-{label}").as_bytes()),
+            generation: 0,
             metadata: crate::types::Metadata(BTreeMap::from([(
                 "label".to_string(),
                 label.to_string(),
