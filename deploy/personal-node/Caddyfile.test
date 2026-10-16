@@ -1,0 +1,4 @@
+{$NODE_DOMAIN} {
+    tls internal
+    reverse_proxy node:8000
+}

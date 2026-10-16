@@ -21,6 +21,7 @@
   "include": [
     "write-probe.ts",
     "probe-core.ts",
-    "probe-core.test.ts"
+    "probe-core.test.ts",
+    "personal-node-check.ts"
   ]
 }
