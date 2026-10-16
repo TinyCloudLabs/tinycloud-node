@@ -594,13 +594,22 @@ jobs:
             exit 1
           fi
           python3 - <<'PY'
+          import hashlib
           import os
           import re
           from pathlib import Path
           path = Path('docker-compose.dstack-postgres.yaml')
-          content = path.read_text()
+          raw = path.read_bytes()
+          content = raw.decode('utf-8')
           native = 'ghcr.io/tinycloudlabs/tinycloud-node'
           reviewed = native + '@sha256:4bdae4fc232d886bb56bfbce4ec62ed4b8fb4e1369a01f6afb73d06dd68c188f'
+          n0_configuration = os.environ['RESOLVED_IMAGE'] == reviewed
+          if n0_configuration:
+              # #309 head 44eeb20a1461ef66b5af492e3be4c42be2728b67.
+              # Approved: https://github.com/TinyCloudLabs/tinycloud-node/pull/309#issuecomment-6224650050
+              expected = 'ca110b0bae6d5a06a1002fb80df3f71cffec11659c9f9dbfa5d72624735546f6'
+              if hashlib.sha256(raw).hexdigest() != expected:
+                  raise SystemExit('::error::N0 promotion requires the exact reviewed compose bytes; deployment not attempted')
           images = [
               image for image in re.finditer(r'(?m)^([ \t]+image:[ \t]+)([^\n]+)$', content)
               if image[2].strip().strip('"\'').startswith((native + ':', native + '@'))
@@ -610,7 +619,9 @@ jobs:
           image = images[0]
           if image[2].strip().strip('"\'') == reviewed and reviewed != os.environ['RESOLVED_IMAGE']:
               raise SystemExit('Reviewed compose digest does not match the selected deployment image')
-          path.write_text(content[:image.start(2)] + os.environ['RESOLVED_IMAGE'] + content[image.end(2):])
+          path.write_bytes((content[:image.start(2)] + os.environ['RESOLVED_IMAGE'] + content[image.end(2):]).encode('utf-8'))
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'n0_configuration_verified={str(n0_configuration).lower()}\n')
           PY
           {
             echo "image=${RESOLVED_IMAGE}"
@@ -943,6 +954,7 @@ jobs:
           ${{ success() && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.deploy_phala && inputs.restore_n0_quota_snapshot &&
             inputs.deploy_image_digest == 'sha256:4bdae4fc232d886bb56bfbce4ec62ed4b8fb4e1369a01f6afb73d06dd68c188f' &&
             steps.pin.outputs.image == 'ghcr.io/tinycloudlabs/tinycloud-node@sha256:4bdae4fc232d886bb56bfbce4ec62ed4b8fb4e1369a01f6afb73d06dd68c188f' &&
+            steps.pin.outputs.n0_configuration_verified == 'true' &&
             steps.pin.outputs.version == '1.20.6' && steps.pin.outputs.image_label == '1.20.6-dstack' &&
             steps.pin.outputs.revision == 'e18578ff9162986ddd813259c60f73866e3e60d1' }}
         env:

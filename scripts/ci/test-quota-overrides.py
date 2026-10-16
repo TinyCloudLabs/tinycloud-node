@@ -2,6 +2,7 @@
 """Exercise docker.yml's quota restoration against synthetic HTTP only."""
 
 import contextlib
+import hashlib
 import io
 import json
 from pathlib import Path
@@ -31,6 +32,10 @@ SECRETS = "tinycloud:pkh:eip155:1:0xd559CCd9EB87c530A9a349262669386dE93cf412:sec
 OVERRIDES = {APPLICATIONS: 5368709120, SECRETS: 268721121}
 CANARIES = []
 DIGEST = "sha256:4bdae4fc232d886bb56bfbce4ec62ed4b8fb4e1369a01f6afb73d06dd68c188f"
+# #309 exact head 44eeb20a1461ef66b5af492e3be4c42be2728b67,
+# approved at https://github.com/TinyCloudLabs/tinycloud-node/pull/309#issuecomment-6224650050.
+REVIEWED_COMPOSE = Path(__file__).with_name("fixtures") / "tc959-n0-compose.yaml"
+REVIEWED_COMPOSE_SHA256 = "ca110b0bae6d5a06a1002fb80df3f71cffec11659c9f9dbfa5d72624735546f6"
 N0_CONTEXT = {
     "github.event_name": "workflow_dispatch", "github.ref": "refs/heads/main",
     "inputs.deploy_phala": True, "inputs.deploy_image_digest": DIGEST,
@@ -39,6 +44,7 @@ N0_CONTEXT = {
     "steps.pin.outputs.image": "ghcr.io/tinycloudlabs/tinycloud-node@" + DIGEST,
     "steps.pin.outputs.version": "1.20.6", "steps.pin.outputs.image_label": "1.20.6-dstack",
     "steps.pin.outputs.revision": "e18578ff9162986ddd813259c60f73866e3e60d1",
+    "steps.pin.outputs.n0_configuration_verified": "true",
 }
 
 
@@ -290,6 +296,8 @@ class QuotaTests(unittest.TestCase):
                         "Watch scheduling must not block post-restart quota restoration")
         for changes in (
             {"inputs.restore_n0_quota_snapshot": False},
+            {"steps.pin.outputs.n0_configuration_verified": ""},
+            {"steps.pin.outputs.n0_configuration_verified": "false"},
             {"inputs.deploy_image_digest": ""},
             {"inputs.deploy_image_digest": "sha256:" + "f" * 64},
             {"github.event_name": "release"},
@@ -395,9 +403,9 @@ class QuotaTests(unittest.TestCase):
                 else:
                     self.assertEqual(result.returncode, 0)
 
-    def test_pending_reviewed_compose_binding_rejects_same_image_other_configuration(self):
-        # Intentionally RED until #309 hosted acceptance and Amos's exact-head
-        # review authorize its compose bytes. No candidate/caller hash is trusted.
+    def test_reviewed_compose_binding_rejects_same_image_other_configuration(self):
+        # Execute the actual pre-mutation path against frozen reviewed bytes
+        # and unrelated same-image configs, without any network or real CLI.
         boundary = """#!/usr/bin/env python3
 import os
 from pathlib import Path
@@ -410,9 +418,9 @@ if tool == "docker":
     elif args[:2] == ["image", "inspect"]:
         label = args[-1]
         if "org.opencontainers.image.revision" in label:
-            print(os.environ["ROLLBACK_REVISION"])
+            print(os.environ["BOUNDARY_REVISION"])
         elif "org.opencontainers.image.version" in label:
-            print("1.20.6-dstack")
+            print(os.environ["BOUNDARY_LABEL"])
         else:
             raise SystemExit("Unexpected synthetic label lookup")
     elif args[:1] == ["run"]:
@@ -440,7 +448,24 @@ else:
         steps = [shell_for_step(name) for name in (
             "Validate image version against Cargo.toml", "Validate and pin deployment image",
             "Preflight sealed runtime configuration", "Deploy to Phala Cloud")]
-        for configuration in ("alpha", "beta"):
+        reviewed = REVIEWED_COMPOSE.read_bytes()
+        self.assertEqual(hashlib.sha256(reviewed).hexdigest(), REVIEWED_COMPOSE_SHA256)
+        native = "ghcr.io/tinycloudlabs/tinycloud-node"
+        legacy = ("services:\n  tinycloud:\n    image: " + native + ":dstack\n").encode()
+        cases = [("reviewed", reviewed, True, True)]
+        cases += [
+            (name, ("services:\n  tinycloud:\n    image: " + N0_CONTEXT["steps.pin.outputs.image"]
+                    + "\n    environment:\n      SYNTHETIC_CONFIG: " + name + "\n").encode(), False, True)
+            for name in ("alpha", "beta")
+        ]
+        cases += [
+            ("profile-change", reviewed.replace(b":-errors_slow}", b":-all_requests}"), False, True),
+            ("crlf-change", reviewed.replace(b"\n", b"\r\n"), False, True),
+            ("n0-unreviewed-tag", reviewed.replace(
+                N0_CONTEXT["steps.pin.outputs.image"].encode(), (native + ":dstack").encode()), False, True),
+            ("normal-dstack", legacy, True, False),
+        ]
+        for configuration, compose, permitted, n0 in cases:
             with self.subTest(configuration=configuration), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 binaries = root / "bin"
@@ -452,9 +477,8 @@ else:
                 (root / "tinycloud-node-server").mkdir()
                 (root / "tinycloud-node-server/Cargo.toml").write_text('version = "1.20.7"\n')
                 (root / "dstack-authorized-keys").write_text("synthetic-public-key\n")
-                (root / "docker-compose.dstack-postgres.yaml").write_text(
-                    "services:\n  tinycloud:\n    image: " + N0_CONTEXT["steps.pin.outputs.image"]
-                    + "\n    environment:\n      SYNTHETIC_CONFIG: " + configuration + "\n")
+                compose_path = root / "docker-compose.dstack-postgres.yaml"
+                compose_path.write_bytes(compose)
                 trace = root / "mutation-trace"
                 summary = root / "summary"
                 output = root / "output"
@@ -472,6 +496,14 @@ else:
                     "GITHUB_OUTPUT": str(output), "GITHUB_STEP_SUMMARY": str(summary),
                     **{name: self.secret for name in required},
                 }
+                if not n0:
+                    env.update({
+                        "INPUT_IMAGE_VERSION": "1.20.7", "INPUT_DEPLOY_DIGEST": "",
+                        "BUILD_DIGEST": "sha256:" + "f" * 64, "N0_QUOTA_SNAPSHOT": "false",
+                        "ROLLBACK_VERSION": "", "ROLLBACK_REVISION": "", "DEPLOY_VERSION": "1.20.7",
+                    })
+                env["BOUNDARY_REVISION"] = N0_CONTEXT["steps.pin.outputs.revision"] if n0 else "f" * 40
+                env["BOUNDARY_LABEL"] = "1.20.6-dstack" if n0 else "1.20.7-dstack"
                 result = subprocess.run(["bash", "--noprofile", "--norc", "-e", "-c", "\n".join(steps)],
                                         cwd=root, env=env, capture_output=True, text=True)
                 logs = result.stdout + result.stderr
@@ -479,10 +511,28 @@ else:
                 logs += output.read_text() if output.exists() else ""
                 self.assertFalse(self.secret in logs, "Synthetic workflow leaked a sealed canary")
                 self.assertFalse((root / ".phala-prod.env").exists(), "Sealed temp file was not removed")
-                self.assertFalse(trace.exists(),
-                                 "PENDING reviewed #309 compose binding: unreviewed config reached CVM mutation")
-                self.assertNotEqual(result.returncode, 0,
-                                    "Same immutable image must not authorize unrelated compose bytes")
+                selected = dict(line.split("=", 1) for line in output.read_text().splitlines())
+                if permitted:
+                    self.assertEqual(result.returncode, 0, "Authorized configuration was rejected")
+                    self.assertEqual(trace.read_text().splitlines(), ["cvm-mutation"])
+                    context = {
+                        **N0_CONTEXT, "inputs.restore_n0_quota_snapshot": n0,
+                        **{"steps.pin.outputs." + key: value for key, value in selected.items()},
+                    }
+                    self.assertEqual(quota_restore_enabled(context), n0)
+                    if n0:
+                        self.assertEqual(selected.get("n0_configuration_verified"), "true",
+                                         "Reviewed bytes must authorize quota restoration")
+                        self.assertEqual(compose_path.read_bytes(), reviewed)
+                        self.assertNotIn("1.20.7", logs, "Checkout version leaked into the old-image promotion")
+                    else:
+                        self.assertNotEqual(selected.get("n0_configuration_verified"), "true")
+                        self.assertIn((native + "@sha256:" + "f" * 64).encode(), compose_path.read_bytes())
+                else:
+                    self.assertFalse(trace.exists(), "Unreviewed configuration reached CVM mutation")
+                    self.assertNotEqual(result.returncode, 0, "Unreviewed configuration was authorized")
+                    self.assertNotEqual(selected.get("n0_configuration_verified"), "true")
+                    self.assertEqual(compose_path.read_bytes(), compose, "Rejected compose was modified")
 
     def test_positive_usage_wrong_owner_config_fails_before_any_request(self):
         other = "tinycloud:pkh:eip155:1:0x" + "1" * 40
