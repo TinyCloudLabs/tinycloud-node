@@ -32,16 +32,21 @@ curl -fsS http://127.0.0.1:8000/version |
   jq -e '.version == "1.20.6" and (.features | index("tee") != null) and .inTEE == false' >/dev/null ||
   { printf '%s\n' 'Dstack profile did not run the pinned dstack build' >&2; exit 1; }
 first_did="$(curl -fsS http://127.0.0.1:8000/.well-known/tinycloud/node-keys | jq -er '.nodeDid')"
-TC1282_TEST_KEY_TYPE=Provider compose up -d --force-recreate tinycloud
-ready
-provider_did="$(curl -fsS http://127.0.0.1:8000/.well-known/tinycloud/node-keys | jq -er '.nodeDid')"
-[[ "$first_did" != "$provider_did" ]] ||
-  { printf '%s\n' 'Legacy single-underscore key-type override did not select Provider' >&2; exit 1; }
-compose up -d --force-recreate tinycloud
+compose stop tinycloud
+# With a valid Static secret still present, selecting Dstack via the legacy
+# key-type name must try KMS. The runner has no dstack daemon.
+dstack_status=0
+dstack_output="$(TC1282_TEST_KEY_TYPE=Dstack timeout 30 docker compose \
+  -f "$here/docker-compose.dstack.yaml" \
+  -f "$here/deploy/personal-node/dstack-smoke.yaml" \
+  run --rm --no-deps tinycloud 2>&1)" || dstack_status=$?
+[[ "$dstack_status" == 1 && "$dstack_output" == *"connecting to dstack socket"* ]] ||
+  { printf '%s\n' 'Legacy single-underscore key-type did not select Dstack KMS' >&2; exit 1; }
+compose up -d tinycloud
 ready
 static_did="$(curl -fsS http://127.0.0.1:8000/.well-known/tinycloud/node-keys | jq -er '.nodeDid')"
 [[ "$first_did" == "$static_did" ]] ||
-  { printf '%s\n' 'Legacy single-underscore key-type override did not restore Static' >&2; exit 1; }
+  { printf '%s\n' 'Static key did not restore the original node identity' >&2; exit 1; }
 second_key="$(openssl rand -base64 48 | tr '+/' '-_' | tr -d '=\n')"
 TC1282_TEST_KEY="$second_key" compose up -d --force-recreate tinycloud
 ready
