@@ -10,12 +10,15 @@ use rocket::{
 use serde::Serialize;
 use serde_json::{Map, Value};
 use std::{
-    borrow::Cow,
     collections::VecDeque,
     sync::{Arc, Mutex, OnceLock},
     time::Instant,
 };
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+use tinycloud_core::{
+    keys::StaticSecret,
+    request_telemetry::{self, Pseudonymizer, RequestContext},
+};
 use tracing::{
     field::{Field, Visit},
     info_span,
@@ -28,6 +31,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use tracing_subscriber::{
     filter::filter_fn, layer::Context, layer::SubscriberExt, Layer, Registry,
 };
+use uuid::{Uuid, Variant};
 
 use crate::config;
 
@@ -41,6 +45,44 @@ const UNMATCHED_ROUTE_LABEL: &str = "<unmatched>";
 /// Target of the one log line per request (method, route template, status,
 /// latency). It replaces Rocket's own request logging, which prints the raw URI.
 const REQUEST_LOG_TARGET: &str = "tinycloud::request";
+
+/// Explicit origin classification, parsed once at startup, never from a request.
+pub(crate) struct RequestIdOrigins(Vec<reqwest::Url>);
+
+impl RequestIdOrigins {
+    pub(crate) fn new(origins: &[String]) -> Result<Self, &'static str> {
+        let origins = origins
+            .iter()
+            .map(|value| {
+                let origin = reqwest::Url::parse(value)
+                    .map_err(|_| "invalid request-ID first-party origin")?;
+                if !matches!(origin.scheme(), "http" | "https")
+                    || origin.host_str().is_none()
+                    || !origin.username().is_empty()
+                    || origin.password().is_some()
+                    || origin.path() != "/"
+                    || origin.query().is_some()
+                    || origin.fragment().is_some()
+                {
+                    return Err("request-ID first-party origins must be HTTP(S) origins only");
+                }
+                Ok(origin)
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Self(origins))
+    }
+
+    pub(crate) fn allows(&self, destination: &str) -> bool {
+        let Ok(destination) = reqwest::Url::parse(destination) else {
+            return false;
+        };
+        self.0.iter().any(|origin| {
+            origin.scheme() == destination.scheme()
+                && origin.host_str() == destination.host_str()
+                && origin.port_or_known_default() == destination.port_or_known_default()
+        })
+    }
+}
 
 /// Rocket modules that log only at ignite, liftoff or shutdown, never request
 /// data. Rocket's other modules log per request.
@@ -85,7 +127,13 @@ fn may_be_logged(metadata: &Metadata<'_>) -> bool {
                 .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
         });
     }
-    if target.starts_with("sea_orm") && level == Level::TRACE {
+    // SQLx statements/notices/pool errors, SeaORM diagnostics and sqlparser's
+    // token/AST debug logs can carry SQL, values or database-generated text.
+    // Typed DB hooks supply timing independently of all diagnostic output.
+    if target.starts_with("sea_orm")
+        || target.starts_with("sqlx")
+        || target.starts_with("sqlparser")
+    {
         return false;
     }
     if (target.starts_with("aws_") || target.starts_with("reqwest")) && level > Level::INFO {
@@ -108,26 +156,89 @@ fn default_log_level(level: LogLevel) -> LevelFilter {
 #[derive(Clone)]
 pub struct TracingSpan(pub Span);
 
-#[derive(Clone)]
+/// Request-owned state; never shared with detached background work.
 struct RequestTelemetry {
     start: Instant,
     /// The method as received. Rocket rewrites an unrouted HEAD to GET before
     /// dispatching it to a GET route.
     method: Method,
+    request_id_replaced: bool,
+    context: Arc<RequestContext>,
 }
 
 pub struct TracingFairing {
     pub header_name: String,
     pub tracing_enabled: bool,
+    pseudonymizer: Arc<Pseudonymizer>,
 }
 
 impl TracingFairing {
-    pub fn new(cfg: &config::Tracing) -> Self {
+    /// Use the node's already-resolved, restart-stable key source.
+    pub fn new(cfg: &config::Tracing, secret: &StaticSecret) -> Self {
         Self {
             header_name: cfg.traceheader.clone(),
             tracing_enabled: cfg.enabled,
+            pseudonymizer: Arc::new(Pseudonymizer::new(secret)),
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(cfg: &config::Tracing) -> Self {
+        Self::new(cfg, &StaticSecret::new(vec![0x42; 32]).unwrap())
+    }
+}
+
+/// Scope the entire generated handler, including authorization/data guards and
+/// responder construction. A request fairing alone cannot scope an async handler.
+#[derive(Clone)]
+struct TelemetryHandler(Box<dyn rocket::route::Handler>);
+
+#[rocket::async_trait]
+impl rocket::route::Handler for TelemetryHandler {
+    async fn handle<'r>(
+        &self,
+        request: &'r Request<'_>,
+        data: Data<'r>,
+    ) -> rocket::route::Outcome<'r> {
+        let telemetry = request.local_cache(|| Option::<RequestTelemetry>::None);
+        match telemetry {
+            Some(telemetry) => {
+                request_telemetry::scope(
+                    Arc::clone(&telemetry.context),
+                    self.0.handle(request, data),
+                )
+                .await
+            }
+            None => self.0.handle(request, data).await,
+        }
+    }
+}
+
+pub(crate) fn instrument_route(mut route: rocket::Route) -> rocket::Route {
+    route.handler = Box::new(TelemetryHandler(route.handler));
+    route
+}
+
+fn incoming_request_id(request: &Request<'_>) -> (Uuid, bool) {
+    let mut headers = request.headers().get("x-request-id");
+    let Some(value) = headers.next() else {
+        return (Uuid::new_v4(), false);
+    };
+    let accepted = (headers.next().is_none() && value.len() == 36)
+        .then(|| Uuid::parse_str(value).ok())
+        .flatten()
+        .filter(|id| {
+            id.get_variant() == Variant::RFC4122 && (1..=8).contains(&id.get_version_num())
+        });
+    accepted
+        .map(|id| (id, false))
+        .unwrap_or_else(|| (Uuid::new_v4(), true))
+}
+
+fn hash_field<'a>(hash: Option<&[u8; 32]>, buffer: &'a mut [u8; 64]) -> Option<&'a str> {
+    let hash = hash?;
+    hex::encode_to_slice(hash, &mut *buffer).expect("32 bytes encode to 64 hex bytes");
+    Some(std::str::from_utf8(buffer).expect("hex is ASCII"))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -427,7 +538,19 @@ impl Fairing for TracingFairing {
         }
     }
     async fn on_request(&self, req: &mut Request<'_>, _data: &mut Data<'_>) {
-        let span = info_span!(parent: None, "request", trace_id = tracing::field::Empty);
+        let start = Instant::now();
+        let (request_id, request_id_replaced) = incoming_request_id(req);
+        // Replace, don't append: guards and local delegates see only the
+        // validated canonical value, never the untrusted original header.
+        req.replace_header(rocket::http::Header::new(
+            "x-request-id",
+            request_id.to_string(),
+        ));
+        let span = info_span!(
+            parent: None, "request",
+            request_id = %request_id,
+            trace_id = tracing::field::Empty
+        );
         // Resolving the OTel context (and recording it onto the span) is only
         // meaningful when tracing is enabled and an OTel layer is installed
         // (tracing_try_init only attaches one in that case); skip the work
@@ -442,8 +565,10 @@ impl Fairing for TracingFairing {
         req.local_cache(|| Some(TracingSpan(span)));
         req.local_cache(|| {
             Some(RequestTelemetry {
-                start: Instant::now(),
+                start,
                 method: req.method(),
+                request_id_replaced,
+                context: RequestContext::new(request_id, Arc::clone(&self.pseudonymizer)),
             })
         });
     }
@@ -464,7 +589,7 @@ impl Fairing for TracingFairing {
         }
         let Some(telemetry) = req
             .local_cache(|| Option::<RequestTelemetry>::None)
-            .to_owned()
+            .as_ref()
         else {
             return;
         };
@@ -475,26 +600,38 @@ impl Fairing for TracingFairing {
         // request path: it can hold bearer tickets and space IDs (TC-961), and
         // every distinct probed path would otherwise create its own permanent
         // histogram series (TC-286).
-        let route = match req.route() {
-            Some(route) => Cow::Owned(route.uri.to_string()),
-            None => Cow::Borrowed(UNMATCHED_ROUTE_LABEL),
-        };
+        let route = req
+            .route()
+            .map(|route| route.uri.as_str())
+            .unwrap_or(UNMATCHED_ROUTE_LABEL);
         let status = res.status().code;
+        res.set_raw_header("x-request-id", telemetry.context.request_id().to_string());
+        let database = telemetry.context.snapshot();
+        let hashes = telemetry.context.hashes();
+        let mut account_buffer = [0; 64];
+        let mut space_buffer = [0; 64];
+        let account_hash = hash_field(hashes.account_hash.as_ref(), &mut account_buffer);
+        let space_hash = hash_field(hashes.space_hash.as_ref(), &mut space_buffer);
         tracing::info!(
             target: REQUEST_LOG_TARGET,
+            event = "node_request",
+            svc = "api",
+            request_id = %telemetry.context.request_id(),
+            request_id_replaced = telemetry.request_id_replaced,
             method = %telemetry.method,
-            route = %route,
+            route,
             status,
             latency_us = elapsed.as_micros() as u64,
+            pool_wait_ms = database.pool_wait_ns as f64 / 1_000_000.0,
+            query_time_ms = database.query_time_ns as f64 / 1_000_000.0,
+            query_count = database.query_count,
+            account_hash,
+            space_hash,
             "request"
         );
         if crate::prometheus::enabled() {
             crate::prometheus::REQUEST_HISTOGRAM
-                .with_label_values(&[
-                    req.method().as_str(),
-                    route.as_ref(),
-                    status.to_string().as_str(),
-                ])
+                .with_label_values(&[req.method().as_str(), route, status.to_string().as_str()])
                 .observe(elapsed.as_secs_f64());
         }
     }
@@ -517,6 +654,71 @@ mod tests {
     use super::*;
     use rocket::local::asynchronous::Client;
 
+    #[test]
+    fn first_party_origins_use_exact_http_origin_not_host_suffix_or_path() {
+        let policy = RequestIdOrigins::new(&[
+            "https://FIRST.example:443".to_string(),
+            "http://localhost:80".to_string(),
+        ])
+        .unwrap();
+        assert!(policy.allows("https://first.example/api/quota"));
+        assert!(policy.allows("http://LOCALHOST/path"));
+        for destination in [
+            "http://first.example/api/quota",
+            "https://first.example:444/api/quota",
+            "https://first.example.attacker.invalid/api/quota",
+            "https://other.first.example/api/quota",
+            "http://localhost:8000/path",
+            "file:///first.example",
+        ] {
+            assert!(!policy.allows(destination));
+        }
+        for invalid in [
+            "https://first.example/private",
+            "https://user:pass@first.example",
+            "https://first.example?query=private",
+            "https://first.example#private",
+            "file:///private",
+        ] {
+            assert!(RequestIdOrigins::new(&[invalid.to_string()]).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn canonical_vectors_reject_application_visible_padding_newlines_and_duplicates() {
+        // Canonical TC-959 corpus at tinycloud-dev 76bd10752a52f179ac2a49214f488236d02f8192.
+        let vectors: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/request-id-vectors.json"))
+                .unwrap();
+        let client = Client::tracked(rocket::build().mount("/", rocket::routes![known]))
+            .await
+            .unwrap();
+        for case in vectors["cases"].as_array().unwrap() {
+            let mut request = client.get("/tc286-known");
+            if let Some(values) = case["incoming"].as_array() {
+                for value in values {
+                    request = request.header(rocket::http::Header::new(
+                        "x-request-id",
+                        value.as_str().unwrap().to_string(),
+                    ));
+                }
+            }
+            let (id, replaced) = incoming_request_id(request.inner());
+            assert_eq!(
+                Value::Bool(replaced),
+                case["request_id_replaced"],
+                "{}",
+                case["name"]
+            );
+            if let Some(normalized) = case["normalized"].as_str() {
+                assert_eq!(id.to_string(), normalized, "{}", case["name"]);
+            } else {
+                assert_eq!(id.get_version_num(), 4, "{}", case["name"]);
+                assert_eq!(id.get_variant(), Variant::RFC4122);
+            }
+        }
+    }
+
     #[rocket::get("/tc286-known")]
     fn known() -> &'static str {
         "ok"
@@ -528,10 +730,9 @@ mod tests {
     }
 
     fn disabled_fairing() -> TracingFairing {
-        TracingFairing {
-            header_name: "TinyCloud-Trace-Id".to_string(),
-            tracing_enabled: false,
-        }
+        let mut cfg = config::Tracing::default();
+        cfg.enabled = false;
+        TracingFairing::for_test(&cfg)
     }
 
     /// Regression test for TC-286: unmatched requests must collapse into a

@@ -119,6 +119,7 @@ impl SqlService {
         ability: String,
         growth: GrowthPolicy,
     ) -> Result<SqlExecutionResult, SqlError> {
+        crate::request_telemetry::observe_space(space);
         let _operation_guard = self.operation_lock(space, db_name).await.lock_owned().await;
         let key = (space.to_string(), db_name.to_string());
         let mut handle = self.handle(space, db_name).await?;
@@ -192,6 +193,7 @@ impl SqlService {
         space: &SpaceId,
         command: serde_json::Value,
     ) -> Result<SqlExecutionResult, SqlError> {
+        crate::request_telemetry::observe_space(space);
         let db_name = super::publication::DATABASE;
         let _guard = self.operation_lock(space, db_name).await.lock_owned().await;
         let key = (space.to_string(), db_name.to_string());
@@ -212,6 +214,7 @@ impl SqlService {
     /// Export a durable database without persisting changes. A cached actor
     /// created by a query or rejected write does not establish its existence.
     pub async fn export(&self, space: &SpaceId, db_name: &str) -> Result<Vec<u8>, SqlError> {
+        crate::request_telemetry::observe_space(space);
         let _operation_guard = self.operation_lock(space, db_name).await.lock_owned().await;
         let key = (space.to_string(), db_name.to_string());
 
@@ -520,7 +523,6 @@ fn validate_payload(
         service = "sql",
         role,
         bytes = payload.len(),
-        leading = %hex::encode(&payload[..payload.len().min(16)]),
         "Durable database artifact does not carry the expected file header; refusing to hydrate"
     );
     Err(SqlError::Internal(format!(

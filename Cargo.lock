@@ -8328,6 +8328,7 @@ dependencies = [
  "memchr",
  "once_cell",
  "percent-encoding",
+ "pin-project",
  "rust_decimal",
  "rustls 0.23.36",
  "serde",
@@ -8434,8 +8435,6 @@ dependencies = [
 [[package]]
 name = "sqlx-postgres"
 version = "0.8.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "db58fcd5a53cf07c184b154801ff91347e4c30d17a3562a635ff028ad5deda46"
 dependencies = [
  "atoi",
  "base64 0.22.1",
@@ -8477,8 +8476,6 @@ dependencies = [
 [[package]]
 name = "sqlx-sqlite"
 version = "0.8.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2d12fe70b2c1b4401038055f90f151b78208de1f9f89a7dbfd41587a10c3eea"
 dependencies = [
  "atoi",
  "chrono",
@@ -9649,6 +9646,7 @@ dependencies = [
  "duckdb",
  "futures",
  "hex",
+ "hmac",
  "iri-string",
  "k256",
  "libp2p",
@@ -9666,6 +9664,7 @@ dependencies = [
  "sha2 0.10.9",
  "sha3",
  "sqlparser",
+ "sqlx-core",
  "tempfile",
  "thiserror 2.0.18",
  "time",
@@ -9674,6 +9673,7 @@ dependencies = [
  "tracing",
  "ucan-capabilities-object",
  "unicode-normalization",
+ "uuid",
  "x25519-dalek",
 ]
 
@@ -9712,6 +9712,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "parking_lot",
  "pem",
  "percent-encoding",
  "pin-project",

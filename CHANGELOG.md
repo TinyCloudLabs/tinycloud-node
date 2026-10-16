@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Request events include validated/echoed UUID correlation, typed replacement flags, node-keyed target account/space pseudonyms and per-request database acquisition/execution timings and attempt counts. Driver/actor instrumentation includes failures and request-awaited audit batches; forwarding requires explicit first-party origin classification. See `docs/request-telemetry.md` for the wire contract, key derivation and coverage/exclusions (TC-959 N2).
 - Account delegation session discovery keyset-pages delegation rows independently of ability fan-out, using a composite delegator/id index so large grant sets are not truncated (TC-1195).
 - `/attestation` quotes the SHA-256 of `key_binding` as REPORTDATA and returns it as `key_binding_sha256`; the quote no longer carries the raw binding. Before answering 200 the node checks that the returned TDX v4 quote's REPORTDATA field holds that digest (a structural check; it does not verify the quote). When the TEE can't produce a bound quote, the endpoint returns 503 instead of 200 `mode: "classic"`, and the dstack client reports a guest-agent error status instead of a parse error. `nonce` must be 1-64 characters of `A-Z a-z 0-9 - _` (400 otherwise), and the endpoint now shares the public routes' per-IP rate limit. Verifiers recompute the digest from their own nonce and expected DID and must still verify the quote; see `docs/attestation.md` (TC-963).
 

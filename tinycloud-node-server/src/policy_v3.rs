@@ -882,7 +882,30 @@ async fn validate_persisted_root(
     }
     verify_signed_delegation(&event.0.delegation)
         .await
-        .map_err(|_| "policy-root-signature-invalid")
+        .map_err(|_| "policy-root-signature-invalid")?;
+    for space in event.0.spaces() {
+        tinycloud_core::request_telemetry::observe_space(space);
+    }
+    Ok(())
+}
+
+/// Observe only content-addressed root bytes already authenticated by durable
+/// node status/revocation state. Never substitute the root CID or ownerDid.
+fn observe_stored_root_target(root: &policy_v3_root::Model, root_cid: &str) {
+    let Some(context) = tinycloud_core::request_telemetry::current() else {
+        return;
+    };
+    let Ok(encoded) = std::str::from_utf8(&root.authorization_bytes) else {
+        return;
+    };
+    let Ok(event) = decode_delegation(encoded) else {
+        return;
+    };
+    if event.content_hash().to_cid(0x55).to_string() == root_cid {
+        for space in event.0.spaces() {
+            context.observe_space(space);
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1840,6 +1863,11 @@ pub async fn register_policy(
         )
         .await
         .map_err(|error| (Status::Forbidden, error.into()))?;
+    }
+    for root in [&policy_root, &enforcement_root] {
+        for space in root.0.spaces() {
+            tinycloud_core::request_telemetry::observe_space(space);
+        }
     }
     if let Some(existing) = policy_v3_registration::Entity::find_by_id(request.policy_cid.clone())
         .one(&runtime.conn)
@@ -3512,6 +3540,7 @@ pub async fn get_status(
         )
         .map_err(|error| (Status::Forbidden, error.into()))?;
     }
+    observe_stored_root_target(&root, root_cid);
     let checkpoint: Value = serde_json::from_slice(
         root.status_checkpoint_bytes
             .as_deref()
@@ -3559,6 +3588,7 @@ pub async fn revoke_root(
         .ok_or((Status::NotFound, "policy-root-missing".into()))?;
     if let Some(existing) = root.revocation_bytes.as_deref() {
         if existing == canonical_json_value(&request.revocation) {
+            observe_stored_root_target(&root, &root_cid);
             return Ok(Json(crate::routes::RevokeResponse {
                 revoked: true,
                 cid: root_cid,
@@ -8444,7 +8474,7 @@ mod tests {
                     crate::routes::hooks::create_hook_ticket
                 ],
             )
-            .attach(crate::tracing::TracingFairing::new(
+            .attach(crate::tracing::TracingFairing::for_test(
                 &crate::config::Config::default().log.tracing,
             ))
             .manage(tinycloud)
@@ -8711,7 +8741,13 @@ mod tests {
             .await;
         assert_eq!(binding_response.status(), Status::Ok);
         let live_binding: Value = binding_response.into_json().await.unwrap();
-        let register_response = client
+        let telemetry = tinycloud_core::request_telemetry::RequestContext::new(
+            uuid::Uuid::new_v4(),
+            std::sync::Arc::new(tinycloud_core::request_telemetry::Pseudonymizer::new(
+                &StaticSecret::new(vec![29; 32]).unwrap(),
+            )),
+        );
+        let register_request = client
             .post("/policy/v3/policies")
             .header(ContentType::JSON)
             .body(
@@ -8725,9 +8761,12 @@ mod tests {
                     "attestedEnforcerBinding": live_binding,
                 })
                 .to_string(),
-            )
-            .dispatch()
-            .await;
+            );
+        let register_response = tinycloud_core::request_telemetry::scope(
+            telemetry.clone(),
+            register_request.dispatch(),
+        )
+        .await;
         let register_status = register_response.status();
         let register_body = register_response.into_string().await.unwrap_or_default();
         if policy_owner == PolicyOwner::Unauthorized {
@@ -8737,6 +8776,8 @@ mod tests {
                 "register: {register_body}"
             );
             assert_eq!(register_body, "policy-owner-not-authorized");
+            assert!(telemetry.hashes().account_hash.is_none());
+            assert!(telemetry.hashes().space_hash.is_none());
             let conn = &client.rocket().state::<PolicyV3Runtime>().unwrap().conn;
             assert!(
                 policy_v3_registration::Entity::find_by_id(policy_cid.clone())
@@ -8748,6 +8789,14 @@ mod tests {
             return Ok(());
         }
         assert_eq!(register_status, Status::Ok, "register: {register_body}");
+        let expected_identity = tinycloud_core::request_telemetry::RequestContext::new(
+            uuid::Uuid::new_v4(),
+            std::sync::Arc::new(tinycloud_core::request_telemetry::Pseudonymizer::new(
+                &StaticSecret::new(vec![29; 32]).unwrap(),
+            )),
+        );
+        expected_identity.observe_space(&content_space);
+        assert_eq!(telemetry.hashes(), expected_identity.hashes());
         let registered: Value = serde_json::from_str(&register_body)?;
 
         // Exercise the exact SDK/Rust seam used before email delivery accepts

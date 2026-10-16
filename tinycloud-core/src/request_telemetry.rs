@@ -1,0 +1,224 @@
+//! Request-local database metrics and bounded, node-keyed identity pseudonyms.
+//!
+//! Raw account/space identifiers and the HMAC key never enter metrics, snapshots,
+//! or diagnostic formatting. Conflicting identities permanently omit that hash
+//! for the request instead of reporting a misleading first identity.
+
+use std::cell::RefCell;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
+
+use hmac::digest::CtOutput;
+use hmac::{Hmac, Mac};
+use pin_project::pin_project;
+use sha2::Sha256;
+use tinycloud_auth::resource::SpaceId;
+use uuid::Uuid;
+
+use crate::keys::StaticSecret;
+
+pub use sqlx_core::request_telemetry::{Metrics, PoolTimer, QueryTimer, Snapshot};
+
+type PseudonymHmac = Hmac<Sha256>;
+
+thread_local! {
+    static CURRENT: RefCell<Option<Arc<RequestContext>>> = const { RefCell::new(None) };
+}
+
+/// Cached keyed HMAC state, derived from the configured node secret.
+///
+/// Deliberately has no `Debug` implementation. Rotating the node secret rotates
+/// pseudonyms; domain separation prevents account and space hashes colliding.
+pub struct Pseudonymizer {
+    account: PseudonymHmac,
+    space: PseudonymHmac,
+}
+
+impl Pseudonymizer {
+    /// Derive the telemetry-only key without exposing or retaining the node secret.
+    pub fn new(secret: &StaticSecret) -> Self {
+        let key = secret.derive_key(b"tinycloud/telemetry/pseudonyms/v1");
+        // HMAC accepts every key length; the constructor cannot reject 32 bytes.
+        let mut account = PseudonymHmac::new_from_slice(&key).expect("HMAC accepts 32-byte keys");
+        account.update(b"account\0");
+        let mut space = PseudonymHmac::new_from_slice(&key).expect("HMAC accepts 32-byte keys");
+        space.update(b"space\0");
+        Self { account, space }
+    }
+}
+
+#[derive(Default)]
+enum HashSlot {
+    #[default]
+    Unobserved,
+    One(CtOutput<PseudonymHmac>),
+    Conflicted,
+}
+
+impl HashSlot {
+    fn observe(&mut self, hash: CtOutput<PseudonymHmac>) {
+        match self {
+            Self::Unobserved => *self = Self::One(hash),
+            // CtOutput compares cryptographic bytes in constant time.
+            Self::One(previous) if *previous != hash => *self = Self::Conflicted,
+            _ => {}
+        }
+    }
+
+    fn hash(&self) -> Option<[u8; 32]> {
+        match self {
+            Self::One(hash) => Some(hash.clone().into_bytes().into()),
+            Self::Unobserved | Self::Conflicted => None,
+        }
+    }
+}
+
+#[derive(Default)]
+struct IdentityState {
+    account: HashSlot,
+    space: HashSlot,
+}
+
+/// Optional binary hashes; encode as lowercase hex only when emitting an event.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Hashes {
+    /// HMAC of the unique target space-owner DID, or absent/ambiguous.
+    pub account_hash: Option<[u8; 32]>,
+    /// HMAC of the unique canonical target SpaceId, or absent/ambiguous.
+    pub space_hash: Option<[u8; 32]>,
+}
+
+/// One request's ID, data-free counters, and bounded pseudonym state.
+///
+/// Deliberately has no `Debug` implementation and retains no raw identities.
+pub struct RequestContext {
+    request_id: Uuid,
+    metrics: Arc<Metrics>,
+    pseudonymizer: Arc<Pseudonymizer>,
+    identities: Mutex<IdentityState>,
+}
+
+impl RequestContext {
+    /// Create independent counters for one canonical request UUID.
+    pub fn new(request_id: Uuid, pseudonymizer: Arc<Pseudonymizer>) -> Arc<Self> {
+        Arc::new(Self {
+            request_id,
+            metrics: Arc::new(Metrics::default()),
+            pseudonymizer,
+            identities: Mutex::new(IdentityState::default()),
+        })
+    }
+
+    /// Return the request ID for same-request outbound HTTP propagation.
+    pub fn request_id(&self) -> Uuid {
+        self.request_id
+    }
+
+    /// Share this request's counters with an explicitly scoped worker.
+    pub fn metrics(&self) -> Arc<Metrics> {
+        Arc::clone(&self.metrics)
+    }
+
+    /// Read this request's numeric database timing totals.
+    pub fn snapshot(&self) -> Snapshot {
+        self.metrics.snapshot()
+    }
+
+    /// Observe an authenticated/canonical space without retaining its identity.
+    ///
+    /// Hashes the exact `SpaceId` display bytes without allocating a formatted
+    /// string. Only bounded digests are kept; repeated identities must be hashed
+    /// to compare them, while an already-conflicted slot requires no more work.
+    pub fn observe_space(&self, space: &SpaceId) {
+        let mut identities = self
+            .identities
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !matches!(identities.account, HashSlot::Conflicted) {
+            let mut account = self.pseudonymizer.account.clone();
+            account.update(space.did().as_str().as_bytes());
+            identities.account.observe(account.finalize());
+        }
+        if !matches!(identities.space, HashSlot::Conflicted) {
+            let mut canonical_space = self.pseudonymizer.space.clone();
+            canonical_space.update(b"tinycloud:");
+            canonical_space.update(space.suffix().as_bytes());
+            canonical_space.update(b":");
+            canonical_space.update(space.name().as_str().as_bytes());
+            identities.space.observe(canonical_space.finalize());
+        }
+    }
+
+    /// Return only unambiguous pseudonyms; absent/conflicting identities are omitted.
+    pub fn hashes(&self) -> Hashes {
+        let identities = self
+            .identities
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Hashes {
+            account_hash: identities.account.hash(),
+            space_hash: identities.space.hash(),
+        }
+    }
+}
+
+/// Return the request installed for the current poll or synchronous worker.
+pub fn current() -> Option<Arc<RequestContext>> {
+    CURRENT.with(|current| current.borrow().clone())
+}
+
+/// Observe a space if an HTTP request context is currently installed.
+pub fn observe_space(space: &SpaceId) {
+    if let Some(context) = current() {
+        context.observe_space(space);
+    }
+}
+
+/// Restores both request identity and SQLx metrics on the entering thread.
+pub struct EnterGuard {
+    previous: Option<Arc<RequestContext>>,
+    _metrics: sqlx_core::request_telemetry::EnterGuard,
+}
+
+/// Install context for synchronous work. Never keep the guard across an await.
+pub fn enter(context: Option<Arc<RequestContext>>) -> EnterGuard {
+    let metrics = sqlx_core::request_telemetry::enter(context.as_ref().map(|ctx| ctx.metrics()));
+    let previous = CURRENT.with(|current| current.replace(context));
+    EnterGuard {
+        previous,
+        _metrics: metrics,
+    }
+}
+
+impl Drop for EnterGuard {
+    fn drop(&mut self) {
+        CURRENT.with(|current| {
+            current.replace(self.previous.take());
+        });
+    }
+}
+
+/// An allocation-free future wrapper installing context for each poll only.
+#[pin_project]
+pub struct Scope<F> {
+    context: Arc<RequestContext>,
+    #[pin]
+    future: F,
+}
+
+/// Scope a request handler without leaking its context to interleaved tasks.
+pub fn scope<F: Future>(context: Arc<RequestContext>, future: F) -> Scope<F> {
+    Scope { context, future }
+}
+
+impl<F: Future> Future for Scope<F> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        let _guard = enter(Some(Arc::clone(this.context)));
+        this.future.poll(cx)
+    }
+}

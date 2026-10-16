@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use duckdb::Connection;
 
+use crate::request_telemetry::QueryTimer;
+
 use super::types::DuckDbError;
 
 #[derive(Debug, Clone)]
@@ -52,6 +54,7 @@ fn validate_max_memory(value: &str) -> Result<(), DuckDbError> {
 pub fn apply_security_settings(conn: &Connection, max_memory: &str) -> Result<(), DuckDbError> {
     validate_max_memory(max_memory)?;
 
+    let _timer = QueryTimer::new();
     conn.execute_batch(&format!(
         "SET enable_external_access = false;\
          SET allow_unsigned_extensions = false;\
@@ -64,6 +67,7 @@ pub fn apply_security_settings(conn: &Connection, max_memory: &str) -> Result<()
 }
 
 pub fn database_size(conn: &Connection) -> Result<u64, DuckDbError> {
+    let _timer = QueryTimer::new();
     let mut stmt = conn
         .prepare("SELECT SUM(total_blocks * block_size) FROM pragma_database_size()")
         .map_err(|e| DuckDbError::Internal(e.to_string()))?;
@@ -98,6 +102,7 @@ pub fn promote_to_file(
 /// Uses Arrow record batches for fast bulk transfer.
 pub fn copy_tables(src: &Connection, dest: &Connection) -> Result<(), DuckDbError> {
     // Get all user tables
+    let timer = QueryTimer::new();
     let mut stmt = src
         .prepare(
             "SELECT table_name FROM information_schema.tables \
@@ -110,9 +115,11 @@ pub fn copy_tables(src: &Connection, dest: &Connection) -> Result<(), DuckDbErro
         .map_err(|e| DuckDbError::Internal(e.to_string()))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| DuckDbError::Internal(e.to_string()))?;
+    drop(timer);
 
     for table in &table_names {
         // Get CREATE TABLE DDL
+        let timer = QueryTimer::new();
         let create_sql: String = src
             .query_row(
                 &format!(
@@ -125,12 +132,17 @@ pub fn copy_tables(src: &Connection, dest: &Connection) -> Result<(), DuckDbErro
             .map_err(|e| {
                 DuckDbError::Internal(format!("Failed to get DDL for {}: {}", table, e))
             })?;
+        drop(timer);
 
-        dest.execute_batch(&create_sql).map_err(|e| {
-            DuckDbError::Internal(format!("Failed to create table {}: {}", table, e))
-        })?;
+        {
+            let _timer = QueryTimer::new();
+            dest.execute_batch(&create_sql).map_err(|e| {
+                DuckDbError::Internal(format!("Failed to create table {}: {}", table, e))
+            })?;
+        }
 
         // Bulk copy via Arrow record batches
+        let mut timer = QueryTimer::new();
         let mut read_stmt = src
             .prepare(&format!("SELECT * FROM \"{}\"", table.replace('"', "\"\"")))
             .map_err(|e| DuckDbError::Internal(e.to_string()))?;
@@ -138,12 +150,21 @@ pub fn copy_tables(src: &Connection, dest: &Connection) -> Result<(), DuckDbErro
         let arrow_result = read_stmt
             .query_arrow([])
             .map_err(|e| DuckDbError::Internal(e.to_string()))?;
+        timer.pause();
 
         let mut appender = dest.appender(table).map_err(|e| {
             DuckDbError::Internal(format!("Failed to create appender for {}: {}", table, e))
         })?;
 
-        for batch in arrow_result {
+        // Native appender transfer is not SQL; time only source query steps.
+        let mut arrow_result = arrow_result;
+        loop {
+            timer.resume();
+            let next = arrow_result.next();
+            timer.pause();
+            let Some(batch) = next else {
+                break;
+            };
             appender.append_record_batch(batch).map_err(|e| {
                 DuckDbError::Internal(format!("Failed to append batch for {}: {}", table, e))
             })?;
@@ -151,6 +172,7 @@ pub fn copy_tables(src: &Connection, dest: &Connection) -> Result<(), DuckDbErro
     }
 
     // Copy views
+    let timer = QueryTimer::new();
     let mut view_stmt = src
         .prepare("SELECT view_name, sql FROM duckdb_views() WHERE schema_name = 'main'")
         .map_err(|e| DuckDbError::Internal(e.to_string()))?;
@@ -162,10 +184,12 @@ pub fn copy_tables(src: &Connection, dest: &Connection) -> Result<(), DuckDbErro
         .map_err(|e| DuckDbError::Internal(e.to_string()))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| DuckDbError::Internal(e.to_string()))?;
+    drop(timer);
 
     for (_, view_sql) in &views {
-        if let Err(e) = dest.execute_batch(view_sql) {
-            tracing::warn!(error=%e, "failed to copy view during table copy");
+        let _timer = QueryTimer::new();
+        if dest.execute_batch(view_sql).is_err() {
+            tracing::warn!("failed to copy view during table copy");
         }
     }
 
