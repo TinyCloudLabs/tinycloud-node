@@ -3,6 +3,6 @@ services:
     environment:
       TINYCLOUD_KEYS_TYPE: ${TC1282_TEST_KEY_TYPE:-Static}
       TINYCLOUD_KEYS__SECRET: ${TC1282_TEST_KEY:?CI test key required}
-      TINYCLOUD_TEE_MODE: 'off'
+      TINYCLOUD_TEE__MODE: 'Off'
     labels:
       tc1282: 'true'
