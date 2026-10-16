@@ -41,7 +41,7 @@ export function resourceNames(id) {
   return Object.fromEntries(['logship', 'sink', 'vector', 'node', 'ingress', 'emitter'].map(role => [role, `${owner}-${id}-${role}`]));
 }
 
-export function assertShipperIsolation(value, network) {
+export function assertShipperIsolation(value, network, gelfPort) {
   const host = value.HostConfig;
   assert.equal(value.Config.User, '10001:10001');
   assert.equal(host.ReadonlyRootfs, true);
@@ -52,6 +52,7 @@ export function assertShipperIsolation(value, network) {
   assert.equal(host.NanoCpus, 500000000);
   assert.match(host.Tmpfs['/tmp'], /size=(8388608|8m)(,|$)/i);
   assert.deepEqual(Object.keys(value.NetworkSettings.Networks), [network]);
+  assert.deepEqual(value.NetworkSettings.Ports['12201/udp'], [{ HostIp: '127.0.0.1', HostPort: String(gelfPort) }]);
   for (const mount of value.Mounts) {
     if (mount.Type === 'tmpfs' && mount.Destination === '/tmp') continue;
     assert.equal(mount.RW, false);
@@ -198,7 +199,8 @@ export async function main(args = process.argv.slice(2)) {
     shipperConfig.sinks.acceptance_metrics_out = { type: 'prometheus_exporter', inputs: ['acceptance_metrics'], address: '127.0.0.1:9598' };
     await writeFile(join(scratch, 'vector.json'), JSON.stringify(shipperConfig));
     slot(false);
-    docker('network', 'create', '--internal', ...labels, names.logship);
+    // Match compose: an internal-only bridge suppresses the daemon's published UDP port.
+    docker('network', 'create', '--driver', 'bridge', ...labels, names.logship);
     networkCreated = true;
     const hardened = ['--network', names.logship, '--user', '10001:10001', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true', '--memory', '64m', '--memory-swap', '64m', '--cpus', '0.5', '--tmpfs', '/tmp:rw,noexec,nosuid,size=8388608,mode=1777', '--log-driver', 'none'];
     const vectorCommand = ['--entrypoint', '/bin/sh', vectorImage, '-ec', 'mkdir -p /tmp/vector-data; exec vector --config /etc/vector/vector.json'];
@@ -231,6 +233,12 @@ export async function main(args = process.argv.slice(2)) {
         capture_tcp_listener: http.status === 0,
       };
     });
+    phase = 'published_binding';
+    const shipper = inspect(names.vector);
+    assertShipperIsolation(shipper, names.logship, gelfPort);
+    const logshipNetwork = json('network', 'inspect', names.logship)[0];
+    assert.equal(logshipNetwork.Internal, false);
+    assert.equal(logshipNetwork.Driver, 'bridge');
     phase = 'real_requests';
     await awaitReadiness(async () => {
       checkTime();
@@ -258,10 +266,8 @@ export async function main(args = process.argv.slice(2)) {
       };
     });
     phase = 'isolation';
-    const shipper = inspect(names.vector);
-    assertShipperIsolation(shipper, names.logship);
     const ingressIP = inspect(names.ingress).NetworkSettings.Networks.bridge.IPAddress;
-    const gateway = json('network', 'inspect', names.logship)[0].IPAM.Config[0].Gateway;
+    const gateway = logshipNetwork.IPAM.Config[0].Gateway;
     docker('exec', names.vector, '/bin/sh', '-c', 'command -v nc');
     // A failed/unsupported probe binary must not masquerade as network isolation.
     docker('exec', names.vector, 'nc', '-z', '-w', '2', names.sink, '8080');

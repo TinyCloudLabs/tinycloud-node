@@ -32,10 +32,13 @@ test('capture rejects unsafe values even when all request positive controls are 
   }
 });
 
-test('shipper has no application network, privileged mode or unsafe mounts', () => {
-  const inspect = { Config: { User: '10001:10001' }, HostConfig: { ReadonlyRootfs: true, Privileged: false, CapDrop: ['ALL'], SecurityOpt: ['no-new-privileges:true'], Memory: 67108864, NanoCpus: 500000000, Tmpfs: { '/tmp': 'rw,noexec,nosuid,size=8388608,mode=1777' } }, Mounts: [{ Destination: '/etc/vector/vector.json', RW: false }], NetworkSettings: { Networks: { 'tc959-n0-test-logship': {} } } };
-  assert.doesNotThrow(() => assertShipperIsolation(inspect, 'tc959-n0-test-logship'));
-  assert.throws(() => assertShipperIsolation({ ...inspect, Config: { User: 'root' } }, 'tc959-n0-test-logship'));
-  assert.throws(() => assertShipperIsolation({ ...inspect, Mounts: [{ Destination: '/var/run/docker.sock', RW: false }] }, 'tc959-n0-test-logship'));
-  assert.throws(() => assertShipperIsolation({ ...inspect, NetworkSettings: { Networks: { bridge: {} } } }, 'tc959-n0-test-logship'));
+test('shipper isolation requires an actual loopback UDP binding, not just requested ports', () => {
+  const inspect = { Config: { User: '10001:10001' }, HostConfig: { ReadonlyRootfs: true, Privileged: false, CapDrop: ['ALL'], SecurityOpt: ['no-new-privileges:true'], Memory: 67108864, NanoCpus: 500000000, Tmpfs: { '/tmp': 'rw,noexec,nosuid,size=8388608,mode=1777' }, PortBindings: { '12201/udp': [{ HostIp: '127.0.0.1', HostPort: '42000' }] } }, Mounts: [{ Destination: '/etc/vector/vector.json', RW: false }], NetworkSettings: { Networks: { 'tc959-n0-test-logship': {} }, Ports: { '12201/udp': [{ HostIp: '127.0.0.1', HostPort: '42000' }] } } };
+  assert.doesNotThrow(() => assertShipperIsolation(inspect, 'tc959-n0-test-logship', 42000));
+  assert.throws(() => assertShipperIsolation({ ...inspect, Config: { User: 'root' } }, 'tc959-n0-test-logship', 42000));
+  assert.throws(() => assertShipperIsolation({ ...inspect, Mounts: [{ Destination: '/var/run/docker.sock', RW: false }] }, 'tc959-n0-test-logship', 42000));
+  assert.throws(() => assertShipperIsolation({ ...inspect, NetworkSettings: { Networks: { bridge: {} } } }, 'tc959-n0-test-logship', 42000));
+  for (const Ports of [{}, { '12201/udp': null }, { '12201/udp': [] }, { '12201/udp': [{ HostIp: '0.0.0.0', HostPort: '42000' }] }, { '12201/udp': [{ HostIp: '127.0.0.1', HostPort: '42001' }] }, { '12201/udp': [{ HostIp: '127.0.0.1', HostPort: '42000' }, { HostIp: '0.0.0.0', HostPort: '42000' }] }]) {
+    assert.throws(() => assertShipperIsolation({ ...inspect, NetworkSettings: { ...inspect.NetworkSettings, Ports } }, 'tc959-n0-test-logship', 42000));
+  }
 });
