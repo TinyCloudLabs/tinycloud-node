@@ -26,6 +26,15 @@ creates the matching tag. Everything downstream of the tag is automated except
 the production promotion, which is a deliberate manual dispatch. Only
 the version *number* is manual.
 
+On `main` pushes, the ordinary GHCR image gets `main`, `edge`, and the
+short commit SHA; the dstack image gets `dstack-main`, `dstack-edge`,
+and its prefixed short SHA. Neither floating release tag (`latest` for the
+ordinary image, `dstack` for the dstack image) moves on a main push.
+A `v*` tag push or published GitHub Release on that tag publishes the
+version tags and both floating release tags.
+Both are mutable; pin production and self-hosted compose files to a verified
+digest instead.
+
 ## Cutting a release
 
 1. Land your feature PRs on `main` as usual. `main` stays at the previously
