@@ -1,6 +1,7 @@
 name: logship
 
 on:
+  workflow_dispatch:
   pull_request:
     branches: [main]
     paths:
@@ -8,6 +9,7 @@ on:
       - 'scripts/tc959-*.mjs'
       - 'docker-compose.dstack-postgres.yaml'
       - '.github/workflows/logship.yml'
+      - 'deploy/ingress/redacted-logging.conf'
   push:
     branches: [main]
     paths:
@@ -15,6 +17,7 @@ on:
       - 'scripts/tc959-*.mjs'
       - 'docker-compose.dstack-postgres.yaml'
       - '.github/workflows/logship.yml'
+      - 'deploy/ingress/redacted-logging.conf'
 
 permissions:
   contents: read
@@ -25,11 +28,14 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: Verify request budgets and local acceptance guards
-        run: node --test log-shipper/budget.test.mjs scripts/tc959-docker.test.mjs scripts/tc959-readiness.test.mjs
+      - name: Verify request budgets and hosted acceptance guards
+        run: node --test log-shipper/budget.test.mjs log-shipper/profile.test.mjs scripts/tc959-docker.test.mjs scripts/tc959-readiness.test.mjs
       - name: Check schema provenance and compose boundary without env interpolation
         run: node scripts/tc959-check.mjs
       - name: Install checksum-pinned native Vector
@@ -39,11 +45,34 @@ jobs:
           tar -xzf /tmp/tc959-vector.tar.gz -C /tmp
       - name: Run native request and forbidden-value boundary cases
         run: |
-          node scripts/tc959-logship.mjs render-tests /tmp/tc959-tests.json
-          /tmp/vector-x86_64-unknown-linux-gnu/bin/vector test /tmp/tc959-tests.json
+          node scripts/tc959-logship.mjs render-tests /tmp/tc959-errors-slow.json errors_slow
+          /tmp/vector-x86_64-unknown-linux-gnu/bin/vector test /tmp/tc959-errors-slow.json
+          node scripts/tc959-logship.mjs render-tests /tmp/tc959-all-requests.json all_requests
+          /tmp/vector-x86_64-unknown-linux-gnu/bin/vector test /tmp/tc959-all-requests.json
       - name: Exercise native UDP-to-HTTP delivery and console leak canaries
         run: node log-shipper/native-check.mjs /tmp/vector-x86_64-unknown-linux-gnu/bin/vector
       - name: Validate the actual HTTP sink without contacting it
         run: |
           node scripts/tc959-logship.mjs render-vector /tmp/tc959-runtime.json http://127.0.0.1:9599/
           /tmp/vector-x86_64-unknown-linux-gnu/bin/vector validate --no-environment --skip-healthchecks /tmp/tc959-runtime.json
+
+  hosted-compose-proof:
+    needs: boundary
+    # Only GitHub's disposable Linux VM; never a self-hosted production Docker socket.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Prove exact-compose boundary with immutable public images and synthetic inputs
+        timeout-minutes: 8
+        run: node scripts/tc959-docker.mjs --go --ci
+      - name: Always diagnose before owner-only cleanup, including proof timeout
+        if: always()
+        timeout-minutes: 3
+        run: node scripts/tc959-docker.mjs --go --ci --cleanup-only

@@ -1,7 +1,7 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
-import { vectorTests } from '../log-shipper/cases.mjs';
+import { vectorTests, requestProfileTests } from '../log-shipper/cases.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const load = name => JSON.parse(readFileSync(resolve(root, 'log-shipper', name), 'utf8'));
@@ -17,8 +17,12 @@ const aliases = {
   '/public/<space_id>/kv?<prefix>': '/public/<space_id>/kv',
 };
 
-/** Compile the same boundary for native tests, local Docker proof, and compose. */
-export function buildConfig({ sinkUri = 'https://s2795437.us-west-2a.betterstackdata.com/', dataDir = '/var/lib/vector', sourceAddress = '0.0.0.0:12201', token } = {}) {
+/** Compile one boundary for native tests, hosted Docker proof, and compose. */
+export function buildConfig({ sinkUri = 'https://s2795437.us-west-2a.betterstackdata.com/', dataDir = '/var/lib/vector', sourceAddress = '0.0.0.0:12201', token, profile = 'errors_slow', slowThresholdUs = 1000000, runtimeProfile = false } = {}) {
+  if (!['errors_slow', 'all_requests'].includes(profile)) throw new TypeError('invalid logship profile');
+  if (!Number.isSafeInteger(slowThresholdUs) || slowThresholdUs < 0) throw new TypeError('invalid logship slow threshold');
+  if (typeof runtimeProfile !== 'boolean') throw new TypeError('invalid runtime profile choice');
+  const profileExpression = runtimeProfile ? '"${TINYCLOUD_LOGSHIP_PROFILE}"' : JSON.stringify(profile);
   const schema = load('fields.json').services['tinycloud-node'];
   const diagnostics = load('diagnostics.json');
   let sanitize = readFileSync(resolve(root, 'log-shipper/sanitize.vrl'), 'utf8')
@@ -30,7 +34,7 @@ export function buildConfig({ sinkUri = 'https://s2795437.us-west-2a.betterstack
   const config = {
     data_dir: dataDir,
     sources: { gelf_in: {
-      type: 'socket', mode: 'udp', address: sourceAddress, max_length: 262144,
+      type: 'socket', mode: 'udp', address: sourceAddress, max_length: 262144, receive_buffer_bytes: 8388608,
       framing: { method: 'chunked_gelf', chunked_gelf: { decompression: 'Auto' } }, decoding: { codec: 'bytes' },
     } },
     transforms: {
@@ -69,9 +73,9 @@ if reason != "" {
   else {
     target = string(parsed.target) ?? ""
     level = downcase(string(parsed.level) ?? "")
-    if label == "tinycloud-node" && target != "tinycloud" && !starts_with(target, "tinycloud::") && target != "tinycloud_core" && !starts_with(target, "tinycloud_core::") {
+    if label == "tinycloud-node" && !includes(["warn", "error"], level) && target != "tinycloud" && !starts_with(target, "tinycloud::") && target != "tinycloud_core" && !starts_with(target, "tinycloud_core::") {
       . = {"reason": "unknown_target"}
-    } else if label == "tinycloud-node" && ((target == "tinycloud::request" && level != "info") || (target != "tinycloud::request" && !includes(["warn", "error"], level))) {
+    } else if label == "tinycloud-node" && !includes(["warn", "error"], level) && (target != "tinycloud::request" || level != "info") {
       . = {"reason": "filtered_level"}
     } else { . = {"label": label, "parsed": parsed} }
   }
@@ -84,7 +88,8 @@ if !includes(${JSON.stringify(schema.fields.reason.values)}, reason) { reason = 
 . = {"reason": reason, "count": 1}`),
       gate_reduce: { type: 'reduce', inputs: ['gate_counts'], group_by: ['reason'], end_every_period_ms: 60000, expire_after_ms: 75000, flush_period_ms: 1000, merge_strategies: { count: 'sum' } },
       gate_output: remap(['gate_reduce'], `. = {"ts": format_timestamp!(now(), format: "%Y-%m-%dT%H:%M:%S%.3fZ"), "level": "warn", "event": "logship_gate_summary_total", "svc": "logship", "reason": .reason, "count": .count}`),
-      event_route: { type: 'route', inputs: ['allowlist'], route: { request: '.event == "node_request" || .event == "ingress_request"', diagnostic: '.event == "node_warning" || .event == "node_error"' } },
+      request_profile: { type: 'filter', inputs: ['allowlist'], condition: `${profileExpression} == "all_requests" || includes(["node_warning", "node_error"], .event) || (int(.status) ?? 0) >= 400 || (.event == "node_request" && (int(.latency_us) ?? 0) > ${slowThresholdUs}) || (.event == "ingress_request" && (to_float(.request_time_seconds) ?? 0.0) > ${(slowThresholdUs / 1000000).toFixed(6)})` },
+      event_route: { type: 'route', inputs: ['request_profile'], route: { request: '.event == "node_request" || .event == "ingress_request"', diagnostic: '.event == "node_warning" || .event == "node_error"' } },
       diagnostic_reduce: { type: 'reduce', inputs: ['event_route.diagnostic'], group_by: ['event', 'event_code', 'level', 'svc'], end_every_period_ms: 60000, expire_after_ms: 75000, flush_period_ms: 1000, merge_strategies: { event_count: 'sum', ts: 'discard' } },
       diagnostic_output: remap(['diagnostic_reduce'], `. = {"ts": format_timestamp!(now(), format: "%Y-%m-%dT%H:%M:%S%.3fZ"), "level": .level, "event": .event, "svc": "api", "event_code": .event_code, "event_count": .event_count}`),
     },
@@ -103,13 +108,15 @@ if !includes(${JSON.stringify(schema.fields.reason.values)}, reason) { reason = 
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  const [command, output, sinkUri] = process.argv.slice(2);
-  if (!['render-vector', 'render-tests'].includes(command) || !output) throw new Error('usage: tc959-logship.mjs render-vector|render-tests OUTPUT [LOCAL_SINK_URI]');
-  const config = buildConfig(sinkUri ? { sinkUri, token: 'tc959-synthetic-only' } : {});
+  const [command, output, option, profileOption] = process.argv.slice(2);
+  if (!['render-vector', 'render-tests'].includes(command) || !output) throw new Error('usage: tc959-logship.mjs render-tests OUTPUT [PROFILE] | render-vector OUTPUT [LOCAL_SINK_URI] [PROFILE]');
+  const profile = (command === 'render-tests' ? option : profileOption) ?? 'errors_slow';
+  const sinkUri = command === 'render-vector' ? option : undefined;
+  const config = buildConfig({ profile, ...(sinkUri ? { sinkUri, token: 'tc959-synthetic-only' } : {}) });
   if (command === 'render-tests') {
     delete config.secret;
     config.sinks = { discard: { type: 'blackhole', inputs: ['event_route.request', 'diagnostic_output', 'gate_output'] } };
-    config.tests = vectorTests;
+    config.tests = [...vectorTests, ...requestProfileTests(profile)];
   }
   writeFileSync(output, JSON.stringify(config, null, 2) + '\n');
 }

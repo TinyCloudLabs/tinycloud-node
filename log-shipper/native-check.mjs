@@ -40,7 +40,7 @@ export async function checkNativeVector(vector, baseline) {
     await new Promise(resolve => udp.bind(0, '127.0.0.1', resolve));
     const port = udp.address().port;
     await new Promise(resolve => udp.close(resolve));
-    const config = baseline ? structuredClone(baseline) : buildConfig();
+    const config = baseline ? structuredClone(baseline) : buildConfig({ profile: 'all_requests' });
     delete config.secret;
     config.data_dir = dir;
     config.sources.gelf_in.address = `127.0.0.1:${port}`;

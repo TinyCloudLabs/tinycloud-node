@@ -5,10 +5,10 @@ label = .label
 out = {}
 ts = ""
 if label == "tinycloud-node" {
-  target = string!(j.target)
+  target = string(j.target) ?? ""
   level = downcase(string!(j.level))
-  f = object!(j.fields)
-  msg = string!(f.message)
+  f = object(j.fields) ?? {}
+  msg = string(f.message) ?? ""
   ts = string!(j.timestamp)
   if target == "tinycloud::request" && level == "info" && msg == "request" {
     method = string!(f.method)
@@ -28,11 +28,13 @@ if label == "tinycloud-node" {
     out = {"event": "node_request", "svc": "api", "level": "info", "method": method, "route": route, "status": status, "latency_us": latency}
   } else {
     if !includes(["warn", "error"], level) { abort }
-    if target != "tinycloud" && !starts_with(target, "tinycloud::") && target != "tinycloud_core" && !starts_with(target, "tinycloud_core::") { abort }
-    codes = __DIAGNOSTICS__
-    code = get(codes, [msg]) ?? null
-    if !is_string(code) { code = "unclassified" }
-    __PREFIX_DIAGNOSTICS__
+    code = "unclassified"
+    if target == "tinycloud" || starts_with(target, "tinycloud::") || target == "tinycloud_core" || starts_with(target, "tinycloud_core::") {
+      codes = __DIAGNOSTICS__
+      known = get(codes, [msg]) ?? null
+      if is_string(known) { code = known }
+      __PREFIX_DIAGNOSTICS__
+    }
     event = if level == "warn" { "node_warning" } else { "node_error" }
     out = {"event": event, "svc": "api", "level": level, "event_code": code, "event_count": 1}
   }
