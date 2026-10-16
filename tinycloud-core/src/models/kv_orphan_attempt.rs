@@ -14,6 +14,8 @@ pub struct Model {
     pub attempt_id: String,
     pub generation: i64,
     pub created_at: OffsetDateTime,
+    /// Collector backoff only; `created_at` remains the immutable upload age.
+    pub retry_after: Option<OffsetDateTime>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

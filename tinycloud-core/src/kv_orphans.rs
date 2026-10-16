@@ -4,8 +4,8 @@ use std::{borrow::Cow, error::Error as StdError};
 
 use sea_orm::{
     sea_query::{Expr, LockBehavior, LockType, OnConflict},
-    ColumnTrait, ConnectionTrait, DatabaseTransaction, DbBackend, DbErr, EntityTrait, QueryFilter,
-    QueryOrder, QuerySelect, Statement, TransactionTrait,
+    ColumnTrait, Condition, ConnectionTrait, DatabaseTransaction, DbBackend, DbErr, EntityTrait,
+    QueryFilter, QueryOrder, QuerySelect, Statement, TransactionTrait,
 };
 use time::{Duration, OffsetDateTime};
 use tinycloud_auth::resource::SpaceId;
@@ -222,6 +222,7 @@ pub async fn register_candidates<C: ConnectionTrait>(
                 attempt_id: sea_orm::ActiveValue::Set(attempt_id.to_owned()),
                 generation: sea_orm::ActiveValue::Set(generation),
                 created_at: sea_orm::ActiveValue::Set(now),
+                retry_after: sea_orm::ActiveValue::Set(None),
             })
             .on_conflict(
                 OnConflict::columns([
@@ -358,6 +359,14 @@ pub async fn finish_candidates(
                           AND EXISTS(SELECT 1 FROM locked)
                           AND (SELECT present FROM refs)
                         RETURNING space, value
+                    ), woken AS (
+                        UPDATE kv_orphan_attempt AS other
+                           SET retry_after = NULL
+                        WHERE other.space = $1 AND other.value = $2
+                          AND other.generation = $4 AND other.attempt_id <> $3
+                          AND other.retry_after IS NOT NULL
+                          AND EXISTS(SELECT 1 FROM removed)
+                        RETURNING 1
                     ), retired AS (
                         DELETE FROM kv_orphan_candidate AS fence
                         USING removed
@@ -375,6 +384,7 @@ pub async fn finish_candidates(
                     )
                     SELECT (SELECT COUNT(*) FROM removed) AS removed,
                            (SELECT present FROM refs) AS referenced,
+                           (SELECT COUNT(*) FROM woken) AS woken,
                            (SELECT COUNT(*) FROM retired) AS retired",
                     [key.into(), (*value).into(), attempt_id.to_owned().into(), (*generation).into()],
                 ))
@@ -402,9 +412,9 @@ pub async fn finish_candidates(
                 "KV blob attempt disappeared before commit".into(),
             ));
         }
-        if !has_attempts(tx, &key, *value, *generation).await?
-            && has_references(tx, &key, *value, *generation).await?
-        {
+        if has_attempts(tx, &key, *value, *generation).await? {
+            wake_attempts(tx, &key, *value, *generation, attempt_id).await?;
+        } else if has_references(tx, &key, *value, *generation).await? {
             candidate::Entity::delete_many()
                 .filter(candidate::Column::Space.eq(key))
                 .filter(candidate::Column::Value.eq(*value))
@@ -413,6 +423,28 @@ pub async fn finish_candidates(
                 .await?;
         }
     }
+    Ok(())
+}
+
+/// A writer leaving makes older deferred stage claims eligible immediately.
+/// Both the successful commit and the failure path call this under the fence;
+/// registration age remains immutable throughout.
+async fn wake_attempts<C: ConnectionTrait>(
+    conn: &C,
+    space: &SpaceIdWrap,
+    value: Hash,
+    generation: i64,
+    departing_attempt: &str,
+) -> Result<(), DbErr> {
+    attempt::Entity::update_many()
+        .col_expr(attempt::Column::RetryAfter, Expr::cust("NULL"))
+        .filter(attempt::Column::Space.eq(space.clone()))
+        .filter(attempt::Column::Value.eq(value))
+        .filter(attempt::Column::Generation.eq(generation))
+        .filter(attempt::Column::AttemptId.ne(departing_attempt))
+        .filter(attempt::Column::RetryAfter.is_not_null())
+        .exec(conn)
+        .await?;
     Ok(())
 }
 
@@ -566,10 +598,10 @@ where
         .filter(attempt::Column::Value.eq(value))
         .filter(attempt::Column::Generation.eq(generation));
     if let Some(cutoff) = gc_cutoff {
-        // The fence excludes new registrations. If a live sibling exists,
-        // retain this expired claim as the stage-cleanup obligation, but move
-        // its next eligibility just past this pass's DB-time cutoff so a full
-        // blocked page cannot hide unrelated orphans.
+        // The fence excludes new registrations. A live sibling retains this
+        // expired claim's stage obligation, but its retry eligibility must be
+        // separate from immutable upload age: other collectors must never
+        // mistake a deferred crashed attempt for a new live writer.
         let live = attempt::Entity::find()
             .filter(attempt::Column::Space.eq(key.clone()))
             .filter(attempt::Column::Value.eq(value))
@@ -582,8 +614,8 @@ where
         if live {
             attempt::Entity::update_many()
                 .col_expr(
-                    attempt::Column::CreatedAt,
-                    Expr::value(cutoff + Duration::seconds(59)),
+                    attempt::Column::RetryAfter,
+                    Expr::value(now + Duration::seconds(59)),
                 )
                 .filter(attempt::Column::Space.eq(key))
                 .filter(attempt::Column::Value.eq(value))
@@ -607,6 +639,7 @@ where
         return Ok(false);
     }
     if gc_cutoff.is_none() && has_attempts(&tx, &key, value, generation).await? {
+        wake_attempts(&tx, &key, value, generation, attempt_id).await?;
         tx.commit().await?;
         return Ok(false);
     }
@@ -756,8 +789,8 @@ async fn defer_attempt<C: ConnectionTrait>(
 ) -> Result<(), DbErr> {
     attempt::Entity::update_many()
         .col_expr(
-            attempt::Column::CreatedAt,
-            Expr::value(database_now(conn).await?),
+            attempt::Column::RetryAfter,
+            Expr::value(database_now(conn).await? + Duration::seconds(59)),
         )
         .filter(attempt::Column::Space.eq(SpaceIdWrap(space.clone())))
         .filter(attempt::Column::Value.eq(value))
@@ -832,6 +865,11 @@ where
         .await?;
     let attempts = attempt::Entity::find()
         .filter(attempt::Column::CreatedAt.lte(cutoff))
+        .filter(
+            Condition::any()
+                .add(attempt::Column::RetryAfter.is_null())
+                .add(attempt::Column::RetryAfter.lte(now)),
+        )
         .order_by_asc(attempt::Column::CreatedAt)
         .order_by_asc(attempt::Column::Space)
         .order_by_asc(attempt::Column::Value)
@@ -1432,6 +1470,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn staggered_collectors_drain_crashed_claims_after_last_live_writer_exits() {
+        let directory = tempfile::tempdir().unwrap();
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            directory
+                .path()
+                .join("staggered-collectors.sqlite")
+                .display()
+        );
+        let first = Database::connect(ConnectOptions::new(url.clone()))
+            .await
+            .unwrap();
+        crate::migrations::Migrator::up(&first, None).await.unwrap();
+        let second = Database::connect(ConnectOptions::new(url)).await.unwrap();
+        for db in [&first, &second] {
+            db.execute(Statement::from_string(
+                DbBackend::Sqlite,
+                "PRAGMA foreign_keys = OFF",
+            ))
+            .await
+            .unwrap();
+        }
+
+        let store = MemoryStore::default();
+        let space = space();
+        let value = upload(&store, &space, b"two stale claims").await;
+        let blob = [(space.clone(), value)];
+        register(&first, &blob, "crashed-a").await;
+        register(&first, &blob, "crashed-b").await;
+        age(&first, &space, value).await;
+        let live = register(&first, &blob, "live-c").await;
+
+        // First collector defers one old claim while C is still uploading.
+        assert_eq!(
+            collect_candidates(&first, &store, 1, ORPHAN_GRACE)
+                .await
+                .unwrap(),
+            0
+        );
+        refund_failed(&first, &store, &live, "live-c")
+            .await
+            .unwrap();
+        assert!(store.contains(&space, &value, 0).await.unwrap());
+
+        // A second collector must not mistake A's retry delay for a live
+        // writer; with no real uploader left, the group and bytes drain now.
+        assert_eq!(
+            collect_candidates(&second, &store, 1, ORPHAN_GRACE)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(!store.contains(&space, &value, 0).await.unwrap());
+        assert_eq!(store.total_size(&space).await.unwrap(), Some(0));
+        assert!(kv_orphan_attempt::Entity::find()
+            .all(&second)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_gc_read_does_not_make_crashed_sibling_look_live() {
+        let db = database().await;
+        let inner = Arc::new(MemoryStore::default());
+        let store = InterruptedDelete::new(inner.clone());
+        let space = space();
+        let value = upload(&inner, &space, b"failed first collector read").await;
+        let blob = [(space.clone(), value)];
+        register(&db, &blob, "crashed-a").await;
+        register(&db, &blob, "crashed-b").await;
+        age(&db, &space, value).await;
+
+        store.fail_read.store(true, Ordering::SeqCst);
+        assert!(collect_candidates(&db, &store, 1, ORPHAN_GRACE)
+            .await
+            .is_err());
+        assert_eq!(
+            collect_candidates(&db, &store, 1, ORPHAN_GRACE)
+                .await
+                .unwrap(),
+            1,
+            "a failed read must not turn its crashed claim into a live writer"
+        );
+        assert!(!inner.contains(&space, &value, 0).await.unwrap());
+        assert_eq!(inner.total_size(&space).await.unwrap(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn last_failed_writer_wakes_deferred_crash_cleanup() {
+        let db = database().await;
+        let store = MemoryStore::default();
+        let space = space();
+        let value = upload(&store, &space, b"last failed writer").await;
+        let blob = [(space.clone(), value)];
+        register(&db, &blob, "crashed-a").await;
+        age(&db, &space, value).await;
+        let live = register(&db, &blob, "live-b").await;
+        assert_eq!(
+            collect_candidates(&db, &store, 1, ORPHAN_GRACE)
+                .await
+                .unwrap(),
+            0
+        );
+        refund_failed(&db, &store, &live, "live-b").await.unwrap();
+        assert_eq!(
+            collect_candidates(&db, &store, 1, ORPHAN_GRACE)
+                .await
+                .unwrap(),
+            1,
+            "the final writer leaving must expose the old claim immediately"
+        );
+        assert!(!store.contains(&space, &value, 0).await.unwrap());
+        assert_eq!(store.total_size(&space).await.unwrap(), Some(0));
+    }
+
+    #[tokio::test]
     async fn full_page_retained_for_live_writer_does_not_hide_later_orphans() {
         let db = database().await;
         let store = MemoryStore::default();
@@ -1993,7 +2148,8 @@ mod tests {
             "CREATE TABLE kv_orphan_attempt (
                 space VARCHAR(191) NOT NULL, value VARBINARY(34) NOT NULL,
                 attempt_id VARCHAR(32) NOT NULL, generation BIGINT NOT NULL,
-                created_at DATETIME(6) NOT NULL, PRIMARY KEY (space, value, attempt_id))",
+                created_at DATETIME(6) NOT NULL, retry_after DATETIME(6) NULL,
+                PRIMARY KEY (space, value, attempt_id))",
             "CREATE TABLE kv_write (space VARCHAR(191), value VARBINARY(34),
                 generation BIGINT NOT NULL DEFAULT 0, seq BIGINT NOT NULL, INDEX (space, value))",
             "CREATE TABLE current_kv (space VARCHAR(191), value VARBINARY(34),
