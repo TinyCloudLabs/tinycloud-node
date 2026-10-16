@@ -776,6 +776,23 @@ mod tests {
 
     #[cfg(feature = "dstack")]
     #[::core::prelude::v1::test]
+    fn shipped_config_allows_legacy_dstack_without_a_static_key() {
+        let _lock = env_lock();
+        let temp = tempdir().unwrap();
+        fs::write(
+            temp.path().join("tinycloud.toml"),
+            include_str!("../../tinycloud.toml"),
+        )
+        .unwrap();
+        let _cwd = CwdGuard::set(temp.path());
+        let _keys_env = clear_keys_env();
+        let _dstack = EnvGuard::set("TINYCLOUD_KEYS_TYPE", "Dstack");
+        let config = legacy_config_figment().extract::<config::Config>().unwrap();
+        assert_eq!(config.keys, config::Keys::Dstack);
+    }
+
+    #[cfg(feature = "dstack")]
+    #[::core::prelude::v1::test]
     fn serve_config_figment_loads_keys_type_from_env() {
         let _lock = env_lock();
         let temp = tempdir().unwrap();
