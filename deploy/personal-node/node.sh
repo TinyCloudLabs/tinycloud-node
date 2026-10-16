@@ -83,11 +83,17 @@ case "${1:-}" in
   check-missing-key)
     require_home
     blank="$(mktemp)"
-    trap 'rm -f "$blank"' EXIT
+    diagnostic="$(mktemp)"
+    trap 'rm -f "$blank" "$diagnostic"' EXIT
     printf 'TINYCLOUD_KEYS__TYPE=Static\n' > "$blank"
     status=0
-    NODE_KEY_ENV_FILE="$blank" timeout 30 "$0" compose-check >/dev/null 2>&1 || status=$?
-    [[ "$status" == 1 ]] || fail 'Missing-key check did not fail promptly with a provisioning error'
+    NODE_KEY_ENV_FILE="$blank" timeout 30 "$0" compose-check >"$diagnostic" 2>&1 || status=$?
+    missing=0
+    while IFS= read -r line; do
+      if [[ "$line" == '  Missing secret' ]]; then missing=1; fi
+    done < "$diagnostic"
+    [[ "$status" == 1 && "$missing" == 1 ]] ||
+      fail 'Missing-key check did not report the exact missing-secret error'
     printf '%s\n' 'Missing-key startup failed as required'
     ;;
   compose-check)
