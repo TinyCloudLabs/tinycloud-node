@@ -789,17 +789,14 @@ pub async fn app_with_control(
                     loop {
                         tokio::select! {
                             _ = interval.tick() => {
-                                loop {
-                                    match tinycloud_core::kv_orphans::collect_candidates_with_progress(
-                                        &conn, &store, 256, tinycloud_core::kv_orphans::ORPHAN_GRACE,
-                                    ).await {
-                                        Ok((_, 256)) => continue,
-                                        Ok(_) => break,
-                                        Err(error) => {
-                                            ::tracing::warn!(%error, "KV orphan collection failed");
-                                            break;
-                                        }
-                                    }
+                                let result = tokio::select! {
+                                    result = tinycloud_core::kv_orphans::drain_candidates_for_interval(
+                                        &conn, &store, tinycloud_core::kv_orphans::ORPHAN_GRACE,
+                                    ) => result,
+                                    _ = &mut shutdown => break,
+                                };
+                                if let Err(error) = result {
+                                    ::tracing::warn!(%error, "KV orphan collection failed");
                                 }
                             }
                             _ = &mut shutdown => break,

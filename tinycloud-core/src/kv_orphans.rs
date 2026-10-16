@@ -528,8 +528,8 @@ async fn lock_fence(
     }
 }
 
-/// Drop one durable attempt and, if it is the last unreferenced claim, commit
-/// the deleting fence and its byte entitlement before external I/O.
+/// Retire a failed attempt or an expired GC group under the hash fence. GC
+/// keeps an expired cleanup claim only while a genuinely live sibling exists.
 async fn prepare_deletion<C, S>(
     conn: &C,
     store: &S,
@@ -537,7 +537,7 @@ async fn prepare_deletion<C, S>(
     value: Hash,
     generation: i64,
     attempt_id: &str,
-    skip_locked: bool,
+    gc_cutoff: Option<OffsetDateTime>,
 ) -> Result<bool, CollectError<<S as ImmutableDeleteStore>::Error>>
 where
     C: ConnectionTrait + TransactionTrait,
@@ -553,7 +553,7 @@ where
     let now = database_now(conn).await?;
     let tx = conn.begin().await?;
     let key = SpaceIdWrap(space.clone());
-    let Some(fence) = lock_fence(&tx, &key, value, generation, skip_locked).await? else {
+    let Some(fence) = lock_fence(&tx, &key, value, generation, gc_cutoff.is_some()).await? else {
         tx.commit().await?;
         return Ok(false);
     };
@@ -561,26 +561,53 @@ where
         tx.commit().await?;
         return Ok(false);
     }
-    let removed = attempt::Entity::delete_many()
+    let mut attempts = attempt::Entity::delete_many()
         .filter(attempt::Column::Space.eq(key.clone()))
         .filter(attempt::Column::Value.eq(value))
-        .filter(attempt::Column::AttemptId.eq(attempt_id))
-        .filter(attempt::Column::Generation.eq(generation))
-        .exec(&tx)
-        .await?;
+        .filter(attempt::Column::Generation.eq(generation));
+    if let Some(cutoff) = gc_cutoff {
+        // The fence excludes new registrations. If a live sibling exists,
+        // retain this expired claim as the stage-cleanup obligation, but move
+        // its next eligibility just past this pass's DB-time cutoff so a full
+        // blocked page cannot hide unrelated orphans.
+        let live = attempt::Entity::find()
+            .filter(attempt::Column::Space.eq(key.clone()))
+            .filter(attempt::Column::Value.eq(value))
+            .filter(attempt::Column::Generation.eq(generation))
+            .filter(attempt::Column::AttemptId.ne(attempt_id))
+            .filter(attempt::Column::CreatedAt.gt(cutoff))
+            .one(&tx)
+            .await?
+            .is_some();
+        if live {
+            attempt::Entity::update_many()
+                .col_expr(
+                    attempt::Column::CreatedAt,
+                    Expr::value(cutoff + Duration::seconds(59)),
+                )
+                .filter(attempt::Column::Space.eq(key))
+                .filter(attempt::Column::Value.eq(value))
+                .filter(attempt::Column::Generation.eq(generation))
+                .filter(attempt::Column::AttemptId.eq(attempt_id))
+                .filter(attempt::Column::CreatedAt.lte(cutoff))
+                .exec(&tx)
+                .await?;
+            tx.commit().await?;
+            return Ok(false);
+        }
+        // All siblings are expired. Drain them together under this fence;
+        // deleting one at a time would make two crashed uploads immortal.
+        attempts = attempts.filter(attempt::Column::CreatedAt.lte(cutoff));
+    } else {
+        attempts = attempts.filter(attempt::Column::AttemptId.eq(attempt_id));
+    }
+    let removed = attempts.exec(&tx).await?;
     if removed.rows_affected == 0 {
         tx.commit().await?;
         return Ok(false);
     }
-    if has_attempts(&tx, &key, value, generation).await? {
-        if skip_locked {
-            // GC must retain the expired claim while another upload is
-            // in flight. Its crashed stage is still owed cleanup even if the
-            // other writer commits and would otherwise retire the fence.
-            tx.rollback().await?;
-        } else {
-            tx.commit().await?;
-        }
+    if gc_cutoff.is_none() && has_attempts(&tx, &key, value, generation).await? {
+        tx.commit().await?;
         return Ok(false);
     }
     if has_references(&tx, &key, value, generation).await? {
@@ -751,7 +778,7 @@ where
     S: ImmutableDeleteStore + ImmutableReadStore,
 {
     for (space, value, generation) in blobs {
-        if prepare_deletion(conn, store, space, *value, *generation, attempt_id, false).await? {
+        if prepare_deletion(conn, store, space, *value, *generation, attempt_id, None).await? {
             complete_deletion(conn, store, space, *value, *generation).await?;
         }
     }
@@ -831,7 +858,7 @@ where
             row.value,
             row.generation,
             &row.attempt_id,
-            true,
+            Some(cutoff),
         )
         .await
         {
@@ -863,6 +890,32 @@ where
         return Err(error);
     }
     Ok((removed, scanned))
+}
+
+/// Drain due work for one scheduled collector tick. A full page can contain
+/// only temporarily retained claims; never spin indefinitely on it or keep a
+/// database connection busy while starving later candidates.
+pub async fn drain_candidates_for_interval<C, S>(
+    conn: &C,
+    store: &S,
+    min_age: Duration,
+) -> Result<usize, CollectError<<S as ImmutableDeleteStore>::Error>>
+where
+    C: ConnectionTrait + TransactionTrait,
+    S: ImmutableDeleteStore + ImmutableReadStore,
+{
+    const PAGE_SIZE: usize = 256;
+    const MAX_PAGES_PER_INTERVAL: usize = 4;
+    let mut removed = 0;
+    for _ in 0..MAX_PAGES_PER_INTERVAL {
+        let (deleted, scanned) =
+            collect_candidates_with_progress(conn, store, PAGE_SIZE as u64, min_age).await?;
+        removed += deleted;
+        if scanned < PAGE_SIZE {
+            break;
+        }
+    }
+    Ok(removed)
 }
 
 #[cfg(test)]
@@ -1300,6 +1353,114 @@ mod tests {
                 .is_none()
         );
     }
+    #[tokio::test]
+    async fn expired_same_hash_attempts_drain_as_one_unreferenced_group() {
+        let db = database().await;
+        let store = MemoryStore::default();
+        let space = space();
+        let value = upload(&store, &space, b"two crashed uploads").await;
+        let blob = [(space.clone(), value)];
+        register(&db, &blob, "crashed-a").await;
+        register(&db, &blob, "crashed-b").await;
+        age(&db, &space, value).await;
+
+        assert_eq!(
+            collect_candidates(&db, &store, 256, ORPHAN_GRACE)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(!store.contains(&space, &value, 0).await.unwrap());
+        assert_eq!(store.total_size(&space).await.unwrap(), Some(0));
+        assert_eq!(
+            kv_orphan_attempt::Entity::find()
+                .all(&db)
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            kv_orphan_candidate::Entity::find()
+                .all(&db)
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_same_hash_attempts_drain_without_removing_committed_reference() {
+        let db = database().await;
+        let store = MemoryStore::default();
+        let space = space();
+        let value = upload(&store, &space, b"referenced retry").await;
+        let blob = [(space.clone(), value)];
+        register(&db, &blob, "crashed-a").await;
+        register(&db, &blob, "crashed-b").await;
+        age(&db, &space, value).await;
+        reference(&db, "kv_write", &space, value, 0).await;
+
+        assert_eq!(
+            collect_candidates(&db, &store, 256, ORPHAN_GRACE)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(store.contains(&space, &value, 0).await.unwrap());
+        assert_eq!(
+            store.total_size(&space).await.unwrap(),
+            Some(b"referenced retry".len() as u64)
+        );
+        assert_eq!(
+            kv_orphan_attempt::Entity::find()
+                .all(&db)
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            kv_orphan_candidate::Entity::find()
+                .all(&db)
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn full_page_retained_for_live_writer_does_not_hide_later_orphans() {
+        let db = database().await;
+        let store = MemoryStore::default();
+        let space = space();
+        let blocked = upload(&store, &space, b"blocked group").await;
+        let blocked_blob = [(space.clone(), blocked)];
+        for index in 0..256 {
+            register(&db, &blocked_blob, &format!("crashed-{index}")).await;
+        }
+        age(&db, &space, blocked).await;
+        register(&db, &blocked_blob, "active-writer").await;
+
+        let later = upload(&store, &space, b"independent later orphan").await;
+        register(&db, &[(space.clone(), later)], "later-crash").await;
+        age(&db, &space, later).await;
+        assert_eq!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                drain_candidates_for_interval(&db, &store, ORPHAN_GRACE),
+            )
+            .await
+            .expect("one collector tick must terminate on a blocked full page")
+            .unwrap(),
+            1,
+            "the retained page must not starve an independent later orphan"
+        );
+        assert!(!store.contains(&space, &later, 0).await.unwrap());
+        assert!(store.contains(&space, &blocked, 0).await.unwrap());
+    }
 
     #[tokio::test]
     async fn replayed_registration_requires_own_attempt_without_duplicating_it() {
@@ -1578,6 +1739,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn postgres_expired_same_hash_claims_drain_under_one_fence() {
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_expired_same_hash_claims_drain_under_one_fence",
+        )
+        .await
+        else {
+            return;
+        };
+        let store = MemoryStore::default();
+        let space = space();
+        let value = upload(&store, &space, b"expired-pg-group").await;
+        let blob = [(space.clone(), value)];
+        register(&fixture.conn, &blob, "crashed-a").await;
+        register(&fixture.conn, &blob, "crashed-b").await;
+        age(&fixture.conn, &space, value).await;
+        assert_eq!(
+            collect_candidates(&fixture.conn, &store, 256, ORPHAN_GRACE)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            kv_orphan_attempt::Entity::find()
+                .all(&fixture.conn)
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
+        assert!(!store.contains(&space, &value, 0).await.unwrap());
+        assert_eq!(store.total_size(&space).await.unwrap(), Some(0));
+    }
+
+    #[tokio::test]
     async fn postgres_failed_attempt_cannot_erase_another_durable_registration() {
         let Some(fixture) = crate::test_support::PostgresTestSchema::new(
             "postgres_failed_attempt_cannot_erase_another_durable_registration",
@@ -1845,6 +2040,19 @@ mod tests {
             value
         );
         refund_failed(&db, &store, &third, "c").await.unwrap();
+        assert_eq!(inner.total_size(&space).await.unwrap(), Some(0));
+        let expired = upload(&inner, &space, b"mysql-two-expired").await;
+        let expired_blob = [(space.clone(), expired)];
+        register(&db, &expired_blob, "expired-a").await;
+        register(&db, &expired_blob, "expired-b").await;
+        age(&db, &space, expired).await;
+        assert_eq!(
+            collect_candidates(&db, &store, 256, ORPHAN_GRACE)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(!inner.contains(&space, &expired, 0).await.unwrap());
         assert_eq!(inner.total_size(&space).await.unwrap(), Some(0));
         db.close().await.unwrap();
         admin
