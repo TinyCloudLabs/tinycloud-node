@@ -148,16 +148,75 @@ Keep these identities distinct:
 
 The raw after hash identifies the profile-enabled compose, not deployment approval. Record its final reviewed PR head and required CI evidence in the officer handoff. Do not infer a raw-file hash from the distinct application-reported compose hash.
 
-Rollback means restoring the preserved current pre-N0 compose, not rebuilding or retagging the node image. **Operator privacy decision:** its `json-file` logging may restore raw retention. Explicitly approve that consequence, keep private flags, and never install a stealth fallback or assume `docker logs` stays unavailable after rollback.
+### Approved workflow contract: no deployment authorization
 
-Workflow/config PR [#310](https://github.com/TinyCloudLabs/tinycloud-node/pull/310) is separate. Its current candidate `fd1b1893c9b874be518397697c0daa3b899ea574` is **held** with two reported compose-binding test failures; the earlier green head is superseded. No candidate compose hash is authorization: binding waits for hosted acceptance and Amos-owned exact-head Astra approval of N0. The workflow maps only secret names through `PROD_TINYCLOUD_BETTERSTACK_SOURCE_TOKEN` → `PHALA_ENV_BETTERSTACK_SOURCE_TOKEN` → mode-0600 `.phala-prod.env` key `BETTERSTACK_SOURCE_TOKEN`, with complete-set `allowed_envs` synchronization and mandatory sealed preflight for the old digest. This document does not claim those operator steps have run.
+The canonical release contract is [#313 `docs/releasing.md` at `63d11dd67e07378acb9213ecd8e3b895c7be5931`](https://github.com/TinyCloudLabs/tinycloud-node/blob/63d11dd67e07378acb9213ecd8e3b895c7be5931/docs/releasing.md), approved by the same Astra in [comment 6226203726](https://github.com/TinyCloudLabs/tinycloud-node/pull/313#issuecomment-6226203726). It supersedes the earlier N0-specific quota snapshot input and the separate #310 candidate packet.
 
-The conditional immutable promotion additionally requires **`restore_n0_quota_snapshot=true`**, fresh Sam authorization of the pinned quota snapshot, and Amos's reviewed evidence. The opt-in is not evergreen permission for unrelated same-image redeploys. Intended image identity is **1.20.6**, with `sql_identity_fence=false` and optional image features false; publish the full exact input packet only after the workflow's exact-head review and final N0 proof. Quota restoration must follow required version/ingress health and precede Policy probes; any attempted mutation without verified restoration is a fatal **`OVERRIDES UNVERIFIED`** gate.
+**HOLD:** #313 remains unmerged until Holden/Sam provision the runner-only `PROD_TINYCLOUD_BILLING_ADMIN_SECRET`. This document does not provision or read it. The billing credential never belongs in the CVM environment or `allowed_envs`. Workflow/security recovery must land as the approved combined lineage first; the N0 sidecar compose belongs only to a later separately approved logging window. No command below is merge, privacy-choice or dispatch authorization.
 
-### Workflow guard packet: not dispatch authorization
+| Operation | Required inputs / approval | Effect |
+| --- | --- | --- |
+| Every `deploy_phala=true` dispatch | Explicit `authorize_quota_values=true` and fresh authorization for the reviewed values and authority in `ops/quota-overrides.json` | One-dispatch authorization, not an N0-only snapshot or evergreen permission to reuse old values |
+| Current-compose promotion or same-image recovery | Recorded immutable image identity; no captured-rollback/privacy inputs | Uses current main compose and preserves its current logging policy |
+| Captured pre-N0 compose rollback | `rollback_pre_n0=true`, plus explicit `rollback_privacy_mode` matching Sam's approved repository variable `TC959_ROLLBACK_PRIVACY_MODE` | Uses the fixed-path/hash rollback source and the selected logging policy |
 
-**No runnable dispatch command or input table is published here until the workflow-only PR has passed exact-head review.** The previous proposed table was obsolete and has been removed. Amos must use the reviewed immutable-image promotion contract, not a checkout's unrelated package version or default feature flags.
+Missing quota authorization or unknown authority fails before compose, CVM or whitelist mutation. Sealed-runtime preflight remains mandatory on forward, recovery and rollback paths. Quota reconciliation follows the final environment operation and required version/ingress health, before ancillary Policy probes; attempted restart without verified reconciliation is fatal **`OVERRIDES UNVERIFIED`**. See the pinned canonical guide for the node-override/billing authority checks and operator fallback.
 
-Release-blocking workflow review must establish that sealed runtime preflight **runs even when the old 1.20.6 digest is repromoted with `rollback_image_version` set**. The deliberately unchanged local old-base workflow has `if: inputs.rollback_image_version == ''`, which would skip it; that observation is **not** the status of the workflow-only worker's final reviewed implementation. The secret-name mapping, required-variable checks, generated sealed-env key and compose **`allowed_envs`** must be synchronized for `BETTERSTACK_SOURCE_TOKEN`, without reading any secret values. Record the final workflow PR/head and reviewed exact input contract before publishing any dispatch command.
+#### Current-compose same-image promotion or recovery
 
-Before any later authorized promotion, reconcile canonical/vendor activation, required CI, Astra, healthy hosted-burst evidence, final artifact hash, the workflow-only review, approved measured volume allowance and sealed-token presence without exposing it. Record source/sink arrival with positive leak controls. No production checks, Phala API calls, secret reads, merge, dispatch or deployment are authorized by this packet.
+After the combined workflow is reviewed/landed, a named operator is approved and fresh quota-values authorization exists, the canonical command is:
+
+```sh
+gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref main \
+  -f deploy_phala=true \
+  -f authorize_quota_values=true \
+  -f image_version=1.20.6 \
+  -f deploy_image_digest=sha256:4bdae4fc232d886bb56bfbce4ec62ed4b8fb4e1369a01f6afb73d06dd68c188f \
+  -f rollback_image_version=1.20.6 \
+  -f rollback_image_revision=e18578ff9162986ddd813259c60f73866e3e60d1 \
+  -f sql_identity_fence=false
+```
+
+This is not a captured compose rollback and does not automatically install the sidecar: it uses the current main compose, whether approved pre-N0 or exact reviewed N0 bytes. Served/OCI identity remains **1.20.6-dstack / e18578ff9162986ddd813259c60f73866e3e60d1**; it is not an unrelated checkout crate version.
+
+#### Captured pre-N0 rollback: explicit privacy choice
+
+The reviewed repository source is `ops/rollback/pre-n0-compose.yaml`, byte-identical to the captured raw hash `df239749ca0a9c09893a855ae2a8abb94090b8556515ad002105c58ac91f4c91`. Fixed-path/hash validation rejects other paths, symlinks and source drift. Selecting the same node digest alone is **not** this compose rollback.
+
+**There is no automatic privacy choice.** `unselected` refuses rollback. Sam must explicitly select the policy; Amos records it in repository variable `TC959_ROLLBACK_PRIVACY_MODE`, and the dispatch's `rollback_privacy_mode` must match. Neither conditional command chooses or authorizes that policy.
+
+If Sam selects **`keep-json-file`**, retain the captured node/ingress 3×50 MB local logging policy:
+
+```sh
+gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref main \
+  -f deploy_phala=true \
+  -f authorize_quota_values=true \
+  -f rollback_pre_n0=true \
+  -f rollback_privacy_mode=keep-json-file \
+  -f image_version=1.20.6 \
+  -f deploy_image_digest=sha256:4bdae4fc232d886bb56bfbce4ec62ed4b8fb4e1369a01f6afb73d06dd68c188f \
+  -f rollback_image_version=1.20.6 \
+  -f rollback_image_revision=e18578ff9162986ddd813259c60f73866e3e60d1 \
+  -f sql_identity_fence=false
+```
+
+If Sam selects **`stop-future-local-logs`**, the reviewed derivative changes only the node and ingress logging drivers to `none`:
+
+```sh
+gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref main \
+  -f deploy_phala=true \
+  -f authorize_quota_values=true \
+  -f rollback_pre_n0=true \
+  -f rollback_privacy_mode=stop-future-local-logs \
+  -f image_version=1.20.6 \
+  -f deploy_image_digest=sha256:4bdae4fc232d886bb56bfbce4ec62ed4b8fb4e1369a01f6afb73d06dd68c188f \
+  -f rollback_image_version=1.20.6 \
+  -f rollback_image_revision=e18578ff9162986ddd813259c60f73866e3e60d1 \
+  -f sql_identity_fence=false
+```
+
+That derivative's raw SHA256 is `315ceca54bf8bfefe2b395b4097fe38ed8ec847fa0688bc873220bd65efc99ec`. **Stopping future logs does not delete existing files. There is no truncation/deletion path.** Any destructive action requires separate explicit authorization and a reviewed procedure. Keeping prior json-file logging may restore raw retention; never install a stealth fallback.
+
+Privacy inputs are rollback-only and mutually exclusive with ordinary current-compose promotion. Preserve the private logs/sysinfo settings and the previously recorded logs/sysinfo/tcbinfo flags **false/false/true**. Keep actual versions/revisions in main history; no bypass flags or retired refs. A binary rollback across a database schema migration still needs its separate DB-safety decision.
+
+Before any later authorized promotion, reconcile canonical/vendor activation, required exact-head CI/reviews, final artifact hash, the approved logging window and measured volume allowance, fresh quota authority/values and sealed-token presence without exposing it. Record source/sink arrival with positive leak controls. No production checks, Phala API calls, secret reads, merge, dispatch or deployment are authorized by this packet.
