@@ -11,7 +11,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { buildConfig, nodeImage, ingressImage, vectorImage } from './tc959-logship.mjs';
 import { canary, nodeRequest } from '../log-shipper/cases.mjs';
 import { awaitReadiness, classifyProbeError, classifyStartupOutput, hasUdpListener, componentCounters } from './tc959-readiness.mjs';
-import { owner, assertHostedRunner, cleanupOwnedResources, burstEvidence, assertHealthyBurst, progressEvidence, assertServiceParity, socketEvidence, numericMetrics, diagnosticCounts } from './tc959-compose-proof.mjs';
+import { owner, assertHostedRunner, cleanupOwnedResources, burstEvidence, assertHealthyBurst, progressEvidence, assertServiceParity, assertLogshipNetwork, socketEvidence, numericMetrics, diagnosticCounts } from './tc959-compose-proof.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const token = 'TC959_SYNTHETIC_HOSTED_SINK_BEARER';
@@ -366,10 +366,9 @@ export async function main(args = process.argv.slice(2)) {
     assert.deepEqual(Object.keys(production.tinycloud.networks), ['default']);
     assert.deepEqual(Object.keys(production['dstack-ingress'].networks), ['default']);
     assert.deepEqual(Object.keys(production.vector.networks), ['logship']);
-    assert.equal(rendered.networks.logship.driver, 'bridge');
-    assert.equal(rendered.networks.logship.internal ?? false, false);
-    assert.equal(rendered.networks.logship.external ?? false, false);
-    assert.ok(Object.keys(rendered.networks.logship).every(key => ['name', 'driver', 'internal', 'external'].includes(key)), 'unsupported_compose_network_options');
+    const networkFields = ['name', 'driver', 'internal', 'external', 'attachable', 'enable_ipv4', 'enable_ipv6', 'driver_opts', 'labels', 'ipam'];
+    report.compose_network_fields = Object.keys(rendered.networks.logship).map(key => networkFields.includes(key) ? key : 'unsupported').sort();
+    assertLogshipNetwork(rendered.networks.logship);
     phase = 'compose_compiler';
     const compiled = buildConfig({ runtimeProfile: true });
     assert.deepEqual(JSON.parse(production.vector.environment.VECTOR_CONFIG_JSON), compiled, 'rendered_compose_compiler_mismatch');

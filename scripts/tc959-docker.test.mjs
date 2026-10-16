@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { parseArgs, assertCapture, resourceNames } from './tc959-docker.mjs';
-import { assertHostedRunner, cleanupOwnedResources, burstEvidence, assertHealthyBurst, progressEvidence, assertServiceParity, socketEvidence, numericMetrics, diagnosticCounts } from './tc959-compose-proof.mjs';
+import { assertHostedRunner, cleanupOwnedResources, burstEvidence, assertHealthyBurst, progressEvidence, assertServiceParity, assertLogshipNetwork, socketEvidence, numericMetrics, diagnosticCounts } from './tc959-compose-proof.mjs';
 
 const request = { ts: '2026-10-16T12:00:00.000Z', level: 'info', event: 'node_request', svc: 'api', method: 'GET', route: '/healthz', status: 200, latency_us: 12 };
 const ingress = { ...request, event: 'ingress_request', svc: 'ingress', request_time_seconds: 0.001 };
@@ -95,6 +95,14 @@ test('timed per-hop evidence distinguishes continued drainage from an observed p
   assert.equal(progressEvidence([later, sample(2000, 500, 500, 500, 300, 300), sample(3000, 500, 500, 500, 300, 300)]).plateau, true);
   assert.equal(progressEvidence([first]).plateau, false);
   assert.equal(progressEvidence([first, { ...later, sink: null }]).deltas.sink, null);
+});
+
+test('normal bridge defaults cannot hide external, routed or host-changing network options', () => {
+  assertLogshipNetwork({ name: 'synthetic_logship', driver: 'bridge' });
+  assertLogshipNetwork({ name: 'synthetic_logship', driver: 'bridge', internal: false, external: false, attachable: false, enable_ipv4: true, enable_ipv6: false, driver_opts: {}, labels: {}, ipam: { driver: 'default', config: [], options: {} } });
+  for (const poison of [{ driver: 'host' }, { internal: true }, { external: true }, { enable_ipv4: false }, { enable_ipv6: true }, { driver_opts: { 'com.docker.network.bridge.name': 'foreign' } }, { ipam: { config: [{ subnet: '10.0.0.0/8' }] } }, { unknown_option: true }]) {
+    assert.throws(() => assertLogshipNetwork({ driver: 'bridge', ...poison }));
+  }
 });
 
 test('actual container parity catches image, GELF option, isolation and resource drift', () => {

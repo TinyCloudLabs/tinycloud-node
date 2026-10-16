@@ -97,6 +97,24 @@ export function assertServiceParity(service, value, { networks, portBindings, mo
   if (service.environment) for (const [key, expected] of Object.entries(service.environment)) assert.ok(value.Config.Env.includes(`${key}=${expected}`), 'rendered_environment_mismatch');
 }
 
+/** Validate network semantics, including explicit defaults emitted by Compose. */
+export function assertLogshipNetwork(value) {
+  assert.equal(value.driver, 'bridge');
+  assert.equal(value.internal ?? false, false);
+  assert.equal(value.external ?? false, false);
+  assert.equal(value.attachable ?? false, false);
+  assert.equal(value.enable_ipv4 ?? true, true);
+  assert.equal(value.enable_ipv6 ?? false, false);
+  assert.deepEqual(value.driver_opts ?? {}, {});
+  assert.deepEqual(value.labels ?? {}, {});
+  const ipam = value.ipam ?? {};
+  assert.equal(ipam.driver ?? 'default', 'default');
+  assert.deepEqual(ipam.config ?? [], []);
+  assert.deepEqual(ipam.options ?? {}, {});
+  assert.ok(Object.keys(ipam).every(key => ['driver', 'config', 'options'].includes(key)));
+  assert.ok(Object.keys(value).every(key => ['name', 'driver', 'internal', 'external', 'attachable', 'enable_ipv4', 'enable_ipv6', 'driver_opts', 'labels', 'ipam'].includes(key)));
+}
+
 /** ss skmem rb is the effective SO_RCVBUF, which Linux may double and kernel-cap. */
 export function socketEvidence(text, rmemMax) {
   const number = value => /^\d+$/.test(value ?? '') ? Number(value) : null;
