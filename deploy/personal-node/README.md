@@ -1,6 +1,6 @@
 # Run a personal TinyCloud node
 
-This ordinary-server profile runs a single node with local SQLite, local blocks, and Caddy HTTPS. It tracks the version TinyCloud itself runs in production: **1.20.6**, pinned by immutable image digest in [`compose.yaml`](compose.yaml). The prior published ordinary image 1.20.5 is used only to rehearse an upgrade and restore-based rollback. Do not use `latest` or 1.20.7: the latter was rolled back in production (TC-1176). New node-image changes remain unavailable to this published-image guide until a separately approved release ships.
+This ordinary-server profile runs a single node with local SQLite, local blocks, and Caddy HTTPS. It tracks the version TinyCloud itself runs in production: **1.20.6**, pinned by immutable image digest in [`compose.yaml`](compose.yaml). Caddy **2.10.2** is pinned by its multi-platform image digest there too. The prior published ordinary image 1.20.5 is used only to rehearse an upgrade and restore-based rollback. Do not use `latest` or 1.20.7: the latter was rolled back in production (TC-1176). New node-image changes remain unavailable to this published-image guide until a separately approved release ships.
 
 This is **not** a TEE: the VPS operator and its host can access the filesystem and key. No hardware attestation, dstack KMS isolation, or cross-host account migration is claimed. This guide does not configure registry discovery or hosted-to-owned-node replication (TC-1280/TC-1283). TLS authenticates your domain but does not attest the machine.
 
@@ -24,7 +24,7 @@ bash deploy/personal-node/node.sh start
 bash deploy/personal-node/node.sh check-version 1.20.6
 ```
 
-Replace `node.example.com` with the domain you own. `init` writes a unique 48-byte random Static root to a `0600` private `node.env`; it is never echoed. The profile mounts a keyless TOML over the bundled image config, so even the older 1.20.6 image **fails** if the installation root is absent. `check-missing-key` must run before `start`; it probes the unprovisioned path without printing keys. Caddy obtains and renews a public certificate; do not bypass its trust verification.
+Replace `node.example.com` with the domain you own. `init` writes a unique 48-byte random Static root to a `0600` private `node.env`; it is never echoed. The profile mounts a keyless TOML over the bundled image config, so even the older 1.20.6 image **fails** if the installation root is absent. `check-missing-key` must run before `start`; it requires the node's exact `Missing secret` diagnostic and rejects unrelated failures without printing their logs. Caddy obtains and renews a public certificate; do not bypass its trust verification.
 
 The 1.20.6 config loader accepts both the legacy single-underscore nesting (`TINYCLOUD_KEYS_TYPE`, `TINYCLOUD_STORAGE_DATADIR`) and canonical double-underscore nesting (`TINYCLOUD_KEYS__TYPE`, `TINYCLOUD_STORAGE__DATADIR`). It merges canonical values last when both are set. This profile uses the canonical form; the existing dstack Compose retains its working single-underscore key-type setting.
 
@@ -63,7 +63,7 @@ Use a fresh host/directory, not two live nodes serving the same identity and dom
 
 ## Upgrade and rollback rehearsal
 
-CI executes [`ci.sh`](ci.sh) on a clean runner: 1.20.5 → 1.20.6, with data checks before and after restart, fresh-volume restores, and rollback by restoring the **pre-upgrade** snapshot into another fresh instance on 1.20.5. An in-place downgrade of a migrated database is not supported. A normal new installation starts directly on 1.20.6; do not downgrade it merely to rehearse.
+CI executes [`ci.sh`](ci.sh) on a clean runner: a fresh 1.20.6 installation with missing-key denial, an unrelated-failure negative control, signed data and restart; then 1.20.5 → 1.20.6, with data checks before and after restart, fresh-volume restores, and rollback by restoring the **pre-upgrade** snapshot into another fresh instance on 1.20.5. An in-place downgrade of a migrated database is not supported. A normal new installation starts directly on 1.20.6; do not downgrade it merely to rehearse.
 
 ```bash
 # Run only on a disposable isolated runner with permission to create Docker
@@ -72,5 +72,7 @@ bash deploy/personal-node/ci.sh
 ```
 
 Before a future upgrade, take and verify an offline backup as above, stop the node, change the pinned image only to a reviewed released digest, start and verify identity and signed data. If verification fails, stop the candidate and restore that pre-upgrade backup to a fresh instance of the previous image; never blindly start the older binary against migrated data. The next-release upgrade step **requires the next approved production node release** and a new published-image CI run. TC-1176 prohibits promotion of that release until Sam separately clears the hold. Changes to the shipped default key in TC-1200 likewise require that next image; the mounted keyless profile is the safe 1.20.6 workaround, not proof that its bare image fails closed.
+
+For a Caddy update, choose a reviewed release and resolve its published multi-platform index digest (for example, from the [Docker Hub tag metadata](https://hub.docker.com/v2/repositories/library/caddy/tags/2.10.2)). Replace only the `caddy@sha256:…` reference in `compose.yaml`, run the published-image CI job and verify HTTPS certificate issuance and renewal on a staging domain before upgrading a live proxy. Retain the Caddy `/data` and `/config` volumes; do not switch to a mutable tag.
 
 The [personal-node workflow](../../.github/workflows/personal-node.yml) is the acceptance evidence only when its published-image job is green. Record the successful run URL and exact image versions/digests in TC-1282; no CI result here authorizes a production deployment or a stronger sovereignty claim.
