@@ -43,11 +43,22 @@ on:
         required: false
         type: boolean
         default: false
-      restore_n0_quota_snapshot:
-        description: 'One-dispatch N0 authorization to restore the reviewed Sam quota snapshot. Refresh config/authorization before reuse; never enable for unrelated same-image redeploys.'
+      authorize_quota_values:
+        description: 'Fresh authorization of the reviewed quota values/authority for this deployment; required on every deploy_phala path.'
         required: false
         type: boolean
         default: false
+      rollback_pre_n0:
+        description: 'Deploy only the captured pre-N0 1.20.6 compose; requires an explicit Sam-approved rollback privacy mode.'
+        required: false
+        type: boolean
+        default: false
+      rollback_privacy_mode:
+        description: 'Explicit rollback-only policy; stop-future-local-logs does NOT delete existing files. No production default.'
+        required: false
+        type: choice
+        options: [unselected, keep-json-file, stop-future-local-logs]
+        default: unselected
       allow_non_descendant:
         description: 'Skip the production ancestry guard for a deliberate non-descendant deployment'
         required: false
@@ -69,7 +80,7 @@ on:
         type: string
         default: ''
       rollback_image_version:
-        description: 'Recorded digest version label when promoting an older image or performing an emergency rollback; revision must be in main history'
+        description: 'Recorded immutable digest version label, for recovery, rollback or forward digest promotion; revision must be in main history'
         required: false
         type: string
         default: ''
@@ -122,8 +133,10 @@ jobs:
       - name: Check published Docker tags
         run: python3 scripts/ci/test-docker-tags.py
 
-      - name: Test quota override restoration with synthetic HTTP
-        run: python3 scripts/ci/test-quota-overrides.py
+      - name: Test quota authority with synthetic HTTP
+        run: python3 scripts/ci/test-quota-authority.py
+      - name: Test recovery deployment boundaries and documented commands
+        run: python3 scripts/ci/test-deploy-recovery.py
 
       - name: Validate image version against Cargo.toml
         id: check
@@ -132,7 +145,10 @@ jobs:
           INPUT_IMAGE_VERSION: ${{ inputs.image_version }}
           INPUT_DEPLOY_DIGEST: ${{ inputs.deploy_image_digest }}
           INPUT_DEPLOY_PHALA: ${{ inputs.deploy_phala }}
-          N0_QUOTA_SNAPSHOT: ${{ inputs.restore_n0_quota_snapshot }}
+          AUTHORIZE_QUOTA_VALUES: ${{ inputs.authorize_quota_values }}
+          ROLLBACK_PRE_N0: ${{ inputs.rollback_pre_n0 }}
+          ROLLBACK_PRIVACY_MODE: ${{ inputs.rollback_privacy_mode }}
+          APPROVED_ROLLBACK_PRIVACY_MODE: ${{ vars.TC959_ROLLBACK_PRIVACY_MODE }}
           ROLLBACK_VERSION: ${{ inputs.rollback_image_version }}
           ROLLBACK_REVISION: ${{ inputs.rollback_image_revision }}
           INCLUDE_DUCKDB: ${{ inputs.include_duckdb }}
@@ -140,6 +156,15 @@ jobs:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
+          # #310 and this recovery change must land as one lineage, before
+          # #309's later logging window. Never merge #310 alone.
+          if [ "${INPUT_DEPLOY_PHALA}" = "true" ]; then
+            if [ "${EVENT_NAME}" != "workflow_dispatch" ] || [ "${AUTHORIZE_QUOTA_VALUES:-false}" != "true" ]; then
+              echo "::error::Every deployment requires explicit authorize_quota_values=true before any mutation"
+              exit 1
+            fi
+          fi
+          python3 scripts/ci/reconcile-quota.py --validate-only
 
           # `|| true` so a missing match reaches the explicit check below
           # instead of dying under `set -e` with no explanation.
@@ -148,20 +173,26 @@ jobs:
             echo "::error::could not read the tinycloud-node version from tinycloud-node-server/Cargo.toml"
             exit 1
           fi
-          # An image digest is not a compose identity or evergreen quota
-          # policy. This dispatch explicitly authorizes the reviewed N0
-          # snapshot; an unrelated same-image redeploy must not reuse it.
-          if [ "${N0_QUOTA_SNAPSHOT:-false}" = "true" ] \
-            || [ "${INPUT_DEPLOY_DIGEST}" = "sha256:4bdae4fc232d886bb56bfbce4ec62ed4b8fb4e1369a01f6afb73d06dd68c188f" ]; then
-            if [ "${N0_QUOTA_SNAPSHOT:-false}" != "true" ] \
-              || [ "${EVENT_NAME}" != "workflow_dispatch" ] || [ "${GITHUB_REF}" != "refs/heads/main" ] \
+          if [ "${ROLLBACK_PRE_N0:-false}" = "true" ]; then
+            if [ "${EVENT_NAME}" != "workflow_dispatch" ] || [ "${GITHUB_REF}" != "refs/heads/main" ] \
               || [ "${INPUT_DEPLOY_PHALA}" != "true" ] \
               || [ "${INPUT_DEPLOY_DIGEST}" != "sha256:4bdae4fc232d886bb56bfbce4ec62ed4b8fb4e1369a01f6afb73d06dd68c188f" ] \
               || [ "${INPUT_IMAGE_VERSION}" != "1.20.6" ] || [ "${ROLLBACK_VERSION}" != "1.20.6" ] \
               || [ "${ROLLBACK_REVISION}" != "e18578ff9162986ddd813259c60f73866e3e60d1" ]; then
-              echo "::error::N0 promotion requires explicit reviewed quota snapshot authorization and exact 1.20.6/e18578 digest labels on main"
+              echo "::error::Captured pre-N0 rollback requires main-only dispatch and the exact recorded 1.20.6 digest labels"
               exit 1
             fi
+            case "${ROLLBACK_PRIVACY_MODE:-unselected}" in
+              keep-json-file|stop-future-local-logs) ;;
+              *) echo "::error::Choose an explicit Sam-approved rollback privacy mode"; exit 1 ;;
+            esac
+            if [ "${APPROVED_ROLLBACK_PRIVACY_MODE:-}" != "${ROLLBACK_PRIVACY_MODE}" ]; then
+              echo "::error::Rollback privacy mode does not match the recorded Sam card decision"
+              exit 1
+            fi
+          elif [ "${ROLLBACK_PRIVACY_MODE:-unselected}" != "unselected" ]; then
+            echo "::error::Rollback privacy selection is mutually exclusive from current-compose promotion"
+            exit 1
           fi
 
           check_matches() {
@@ -564,6 +595,17 @@ jobs:
           fi
           echo "Running production revision ${RUNNING_REVISION} is an ancestor of ${GITHUB_SHA}."
 
+      - name: Preflight quota authority
+        env:
+          QUOTA_ADMIN_SECRET: ${{ secrets.PROD_TINYCLOUD_ADMIN_SECRET }}
+          # Separate runner credential; never sealed into the CVM.
+          QUOTA_BILLING_ADMIN_SECRET: ${{ secrets.PROD_TINYCLOUD_BILLING_ADMIN_SECRET }}
+          QUOTA_BILLING_URL: ${{ secrets.PROD_TINYCLOUD_QUOTA_URL }}
+        run: |
+          set -euo pipefail
+          set +x
+          python3 scripts/ci/reconcile-quota.py --preflight
+
       - name: Validate and pin deployment image
         id: pin
         env:
@@ -574,6 +616,9 @@ jobs:
           INCLUDE_TC_BENCH_V1: ${{ inputs.include_tc_bench_v1 }}
           ROLLBACK_VERSION: ${{ inputs.rollback_image_version }}
           ROLLBACK_REVISION: ${{ inputs.rollback_image_revision }}
+          ROLLBACK_PRE_N0: ${{ inputs.rollback_pre_n0 }}
+          ROLLBACK_PRIVACY_MODE: ${{ inputs.rollback_privacy_mode }}
+          APPROVED_ROLLBACK_PRIVACY_MODE: ${{ vars.TC959_ROLLBACK_PRIVACY_MODE }}
         run: |
           set -euo pipefail
           DIGEST="${INPUT_DEPLOY_DIGEST:-${BUILD_DIGEST}}"
@@ -598,18 +643,47 @@ jobs:
           import os
           import re
           from pathlib import Path
+          def read_artifact(relative):
+              path = Path(relative)
+              if path.is_symlink() or path.resolve() != Path.cwd().resolve() / relative:
+                  raise SystemExit('::error::Deployment artifact path is not the fixed reviewed path')
+              try:
+                  return path.read_bytes()
+              except OSError:
+                  raise SystemExit('::error::Reviewed deployment artifact is unavailable') from None
+
           path = Path('docker-compose.dstack-postgres.yaml')
-          raw = path.read_bytes()
-          content = raw.decode('utf-8')
+          if path.is_symlink() or path.resolve() != Path.cwd().resolve() / path:
+              raise SystemExit('::error::Deployment destination is not the fixed reviewed path')
           native = 'ghcr.io/tinycloudlabs/tinycloud-node'
           reviewed = native + '@sha256:4bdae4fc232d886bb56bfbce4ec62ed4b8fb4e1369a01f6afb73d06dd68c188f'
-          n0_configuration = os.environ['RESOLVED_IMAGE'] == reviewed
-          if n0_configuration:
-              # #309 head 44eeb20a1461ef66b5af492e3be4c42be2728b67.
-              # Approved: https://github.com/TinyCloudLabs/tinycloud-node/pull/309#issuecomment-6224650050
-              expected = 'ca110b0bae6d5a06a1002fb80df3f71cffec11659c9f9dbfa5d72624735546f6'
-              if hashlib.sha256(raw).hexdigest() != expected:
-                  raise SystemExit('::error::N0 promotion requires the exact reviewed compose bytes; deployment not attempted')
+          n0_hash = 'ca110b0bae6d5a06a1002fb80df3f71cffec11659c9f9dbfa5d72624735546f6'
+          pre_n0_hash = 'df239749ca0a9c09893a855ae2a8abb94090b8556515ad002105c58ac91f4c91'
+          pre_n0_template_hash = '28302d6761d841b7cc5c11314aed2d377735e6bbdcaf85972a752e03bc9fdc93'
+          rollback = os.environ.get('ROLLBACK_PRE_N0') == 'true'
+          mode = os.environ.get('ROLLBACK_PRIVACY_MODE') or 'unselected'
+          if rollback:
+              raw = read_artifact('ops/rollback/pre-n0-compose.yaml')
+              if os.environ['RESOLVED_IMAGE'] != reviewed or hashlib.sha256(raw).hexdigest() != pre_n0_hash:
+                  raise SystemExit('::error::Captured pre-N0 image/compose pin mismatch; deployment not attempted')
+              if mode not in ('keep-json-file', 'stop-future-local-logs') or mode != os.environ.get('APPROVED_ROLLBACK_PRIVACY_MODE'):
+                  raise SystemExit('::error::Rollback privacy decision is missing or mismatched')
+              if mode == 'stop-future-local-logs':
+                  raw = read_artifact('ops/rollback/pre-n0-stop-local-logs.yaml')
+                  if hashlib.sha256(raw).hexdigest() != '315ceca54bf8bfefe2b395b4097fe38ed8ec847fa0688bc873220bd65efc99ec':
+                      raise SystemExit('::error::Reviewed stop-future-logs artifact pin mismatch')
+              n0_configuration = False
+          else:
+              if mode != 'unselected':
+                  raise SystemExit('::error::Rollback privacy cannot modify a forward/current-compose deployment')
+              raw = read_artifact(str(path))
+              digest = hashlib.sha256(raw).hexdigest()
+              n0_configuration = digest == n0_hash
+              if n0_configuration and os.environ['RESOLVED_IMAGE'] != reviewed:
+                  raise SystemExit('::error::Reviewed N0 compose cannot substitute a different image')
+              if os.environ['RESOLVED_IMAGE'] == reviewed and digest not in (n0_hash, pre_n0_hash, pre_n0_template_hash):
+                  raise SystemExit('::error::Same-image recovery requires the exact current pre-N0 or reviewed N0 compose')
+          content = raw.decode('utf-8')
           images = [
               image for image in re.finditer(r'(?m)^([ \t]+image:[ \t]+)([^\n]+)$', content)
               if image[2].strip().strip('"\'').startswith((native + ':', native + '@'))
@@ -622,6 +696,12 @@ jobs:
           path.write_bytes((content[:image.start(2)] + os.environ['RESOLVED_IMAGE'] + content[image.end(2):]).encode('utf-8'))
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
               output.write(f'n0_configuration_verified={str(n0_configuration).lower()}\n')
+              output.write(f'rollback_pre_n0_verified={str(rollback).lower()}\n')
+          if rollback:
+              message = f'Rollback privacy: {mode}; no deletion of existing log files is requested.'
+              print(message)
+              with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+                  summary.write(message + '\n')
           PY
           {
             echo "image=${RESOLVED_IMAGE}"
@@ -639,9 +719,6 @@ jobs:
       # without opening a database, resolving dstack, network, or socket
       # access, before the deploy step can replace the healthy CVM.
       - name: Preflight sealed runtime configuration
-        # Older emergency images may lack --validate-config. This reviewed
-        # 1.20.6 image supports it and MUST NOT inherit that emergency skip.
-        if: inputs.rollback_image_version == '' || inputs.deploy_image_digest == 'sha256:4bdae4fc232d886bb56bfbce4ec62ed4b8fb4e1369a01f6afb73d06dd68c188f'
         env:
           TINYCLOUD_STORAGE__DATABASE: ${{ secrets.PROD_TINYCLOUD_DATABASE_URL }}
           TINYCLOUD_DATABASE__WRITE_FENCE: ${{ inputs.sql_identity_fence }}
@@ -943,146 +1020,23 @@ jobs:
           echo "::error::Direct TEE ingress did not become healthy at version ${EXPECTED}."
           exit 1
 
-      # Reviewed N0-only snapshot, not evergreen quota policy. Same deploy job
-      # means no second environment approval or watcher-scheduling gap.
-      # Future restarts require refreshed config and operator authorization.
+      # General reviewed authority/values, freshly authorized for every deploy.
+      # Same job, after the final env operation and required health, before
+      # ancillary Policy probes. Billing mode is verification-only.
 
       - name: Restore storage quota overrides
         id: quotas
         timeout-minutes: 5
-        if: >-
-          ${{ success() && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.deploy_phala && inputs.restore_n0_quota_snapshot &&
-            inputs.deploy_image_digest == 'sha256:4bdae4fc232d886bb56bfbce4ec62ed4b8fb4e1369a01f6afb73d06dd68c188f' &&
-            steps.pin.outputs.image == 'ghcr.io/tinycloudlabs/tinycloud-node@sha256:4bdae4fc232d886bb56bfbce4ec62ed4b8fb4e1369a01f6afb73d06dd68c188f' &&
-            steps.pin.outputs.n0_configuration_verified == 'true' &&
-            steps.pin.outputs.version == '1.20.6' && steps.pin.outputs.image_label == '1.20.6-dstack' &&
-            steps.pin.outputs.revision == 'e18578ff9162986ddd813259c60f73866e3e60d1' }}
+        if: ${{ success() && inputs.authorize_quota_values }}
         env:
           # Repository-scoped; never read by an agent or passed in argv.
           QUOTA_ADMIN_SECRET: ${{ secrets.PROD_TINYCLOUD_ADMIN_SECRET }}
+          QUOTA_BILLING_ADMIN_SECRET: ${{ secrets.PROD_TINYCLOUD_BILLING_ADMIN_SECRET }}
+          QUOTA_BILLING_URL: ${{ secrets.PROD_TINYCLOUD_QUOTA_URL }}
         run: |
           set -euo pipefail
           set +x
-          python3 - <<'PY'
-          import http.client
-          import json
-          import os
-          from pathlib import Path
-          import re
-          import time
-          from urllib.parse import quote
-
-          CONFIG_PATH = Path("ops/quota-overrides.json")
-          LIMITS = {"applications": 5368709120, "secrets": 268721121}
-          SNAPSHOT_OWNER = "tinycloud:pkh:eip155:1:0xd559CCd9EB87c530A9a349262669386dE93cf412"
-
-          class QuotaError(Exception):
-              pass
-
-          def load_overrides(path):
-              try:
-                  document = json.loads(path.read_text())
-                  if not isinstance(document, dict) or len(document) != 2:
-                      raise ValueError
-                  names = set()
-                  overrides = {}
-                  for space, row in document.items():
-                      match = re.fullmatch(r"tinycloud:[A-Za-z0-9:._-]+:(applications|secrets)", space)
-                      if not isinstance(row, dict) or set(row) != {"limit_bytes", "_comment"}:
-                          raise ValueError
-                      limit = row["limit_bytes"]
-                      if (not match or type(limit) is not int or limit != LIMITS[match[1]]
-                          or space != f"{SNAPSHOT_OWNER}:{match[1]}"
-                          or not isinstance(row["_comment"], str) or not row["_comment"]):
-                          raise ValueError
-                      names.add(match[1])
-                      overrides[space] = limit
-                  if names != set(LIMITS):
-                      raise ValueError
-                  return overrides
-              except (OSError, ValueError, TypeError):
-                  raise QuotaError("reviewed quota configuration is invalid") from None
-
-          def request_admin(method, path, limit, secret):
-              body = None if limit is None else json.dumps({"limit_bytes": limit}).encode()
-              headers = {"Authorization": "Bearer " + secret, "Content-Type": "application/json"}
-              # Fixed HTTPS origin, no redirects/proxies; authorization exists
-              # only in process memory and the TLS request header, never argv.
-              for attempt in range(3):
-                  connection = http.client.HTTPSConnection("node.tinycloud.xyz", timeout=15)
-                  try:
-                      connection.request(method, path, body=body, headers=headers)
-                      response = connection.getresponse()
-                      payload = response.read(65537)
-                  except (OSError, http.client.HTTPException):
-                      if attempt == 2:
-                          raise QuotaError("quota transport failed after bounded attempts") from None
-                      time.sleep(attempt + 1)
-                      continue
-                  finally:
-                      connection.close()
-                  # HTTP failures (including 5xx) are NOT transport retries.
-                  # Never include a response body/status detail in diagnostics.
-                  if response.status != 200:
-                      raise QuotaError("quota API rejected the request")
-                  try:
-                      result = json.loads(payload) if len(payload) <= 65536 else None
-                      if not isinstance(result, dict):
-                          raise ValueError
-                      return result
-                  except ValueError:
-                      raise QuotaError("quota API returned an invalid response") from None
-
-          def apply_overrides(overrides, secret):
-              if not secret or "\r" in secret or "\n" in secret:
-                  raise QuotaError("admin authorization is missing or invalid")
-              # A quota GET echoes its supplied ID even for a nonexistent
-              # space. Only /admin/usage enumerates actual list_space_ids.
-              # Validate BOTH configured targets before ANY PUT.
-              inventory = request_admin("GET", "/admin/usage", None, secret)
-              spaces = inventory.get("spaces")
-              if (not isinstance(spaces, list) or type(inventory.get("count")) is not int
-                  or inventory["count"] != len(spaces)):
-                  raise QuotaError("space inventory is invalid; no overrides applied")
-              usage = {}
-              for row in spaces:
-                  if (not isinstance(row, dict) or not isinstance(row.get("space_id"), str)
-                      or row["space_id"] in usage):
-                      raise QuotaError("space inventory is ambiguous; no overrides applied")
-                  usage[row["space_id"]] = row.get("usage_bytes")
-              if any(type(usage.get(space)) is not int or usage[space] <= 0 for space in overrides):
-                  raise QuotaError("both exact quota targets require positive known usage; no overrides applied")
-              for space, limit in overrides.items():
-                  path = "/admin/quota/" + quote(space, safe="")
-                  request_admin("PUT", path, limit, secret)
-                  actual = request_admin("GET", path, None, secret)
-                  if (actual.get("space_id") != space
-                      or type(actual.get("override_bytes")) is not int
-                      or actual["override_bytes"] != limit
-                      or type(actual.get("effective_limit_bytes")) is not int
-                      or actual["effective_limit_bytes"] != limit):
-                      raise QuotaError("quota override and effective limit did not both verify")
-
-          def main():
-              try:
-                  overrides = load_overrides(CONFIG_PATH)
-                  apply_overrides(overrides, os.environ.get("QUOTA_ADMIN_SECRET", ""))
-                  message = "Quota overrides verified: applications=5368709120; secrets=268721121."
-                  code = 0
-              except QuotaError as error:
-                  message = f"Quota restoration FAILED: {error}. Authorized TC-1161 fallback required."
-                  code = 1
-              except Exception:
-                  message = "Quota restoration FAILED: unexpected error; details withheld. Authorized TC-1161 fallback required."
-                  code = 1
-              print(("::error::" if code else "") + message)
-              with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
-                  summary.write(message + "\n")
-              return code
-
-          if __name__ == "__main__":
-              raise SystemExit(main())
-          PY
+          python3 scripts/ci/reconcile-quota.py
 
       # TC-465: Share requires the complete Policy/v3 control plane before it
       # can create or receive an exact-email share. A version-only check let a
@@ -1140,7 +1094,7 @@ jobs:
           ${{ always() && steps.deploy.outputs.cvm_mutation_attempted == 'true' && steps.quotas.outcome != 'success' }}
         run: |
           set -euo pipefail
-          MESSAGE="OVERRIDES UNVERIFIED: a CVM mutation was attempted without successful reviewed quota restoration. Authorized operator must resolve via TC-1161 before another dispatch."
+          MESSAGE="OVERRIDES UNVERIFIED: a CVM mutation was attempted without successful authorized quota reconciliation. Authorized operator must resolve before another dispatch."
           echo "::error::${MESSAGE}"
           printf '%s\n' "${MESSAGE}" >> "$GITHUB_STEP_SUMMARY"
           exit 1

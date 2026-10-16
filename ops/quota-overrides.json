@@ -1,10 +1,13 @@
 {
-  "tinycloud:pkh:eip155:1:0xd559CCd9EB87c530A9a349262669386dE93cf412:applications": {
-    "limit_bytes": 5368709120,
-    "_comment": "Confirmed by Amos's read-only TC-1161 D1 quota_overrides and quota_override_audit extract, 2026-10-16: applied 2026-10-16T17:37:16Z, last_node_status 200. N0 snapshot only: Sam authorizes values; Amos supplies reviewed target/value evidence. Refresh this config and authorization before reuse. The explicit restore_n0_quota_snapshot dispatch input is not compose-hash verification. The workflow must still prove exact space existence and positive usage before any PUT."
-  },
-  "tinycloud:pkh:eip155:1:0xd559CCd9EB87c530A9a349262669386dE93cf412:secrets": {
-    "limit_bytes": 268721121,
-    "_comment": "Space ID verified read-only by Amos via Sam's tc-secrets release-keys and monitoring profiles; override value 268721121 was applied manually before the dashboard existed. No secret values were read. TC-1161 D1 record is pending Sam's board task. The authorized workflow must still prove this exact full ID with positive usage through GET /admin/usage before ANY PUT; a quota GET echo is not existence evidence."
+  "authority": "node-override",
+  "overrides": {
+    "tinycloud:pkh:eip155:1:0xd559CCd9EB87c530A9a349262669386dE93cf412:applications": {
+      "limit_bytes": 5368709120,
+      "_comment": "Confirmed by Amos's read-only TC-1161 D1 quota_overrides and quota_override_audit extract, 2026-10-16: applied 2026-10-16T17:37:16Z, last_node_status 200. Sam authorizes these values; every deployment requires fresh authorize_quota_values opt-in. Flip authority to billing only through a separate reviewed PR after TC-1162 migration. Prove both exact spaces and positive usage, and reject active billing comp before any legacy node PUT."
+    },
+    "tinycloud:pkh:eip155:1:0xd559CCd9EB87c530A9a349262669386dE93cf412:secrets": {
+      "limit_bytes": 268721121,
+      "_comment": "Space ID verified read-only by Amos via Sam's tc-secrets release-keys and monitoring profiles; value applied manually before the dashboard existed. No secret values were read. TC-1161 D1 parity remains pending Sam's card. Every authorized deployment must prove this full ID with positive usage; a quota GET echo is not existence evidence. Existing node/billing authority may never be silently overridden."
+    }
   }
 }
