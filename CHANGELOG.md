@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Prepare a compose-only GELF-to-Vector sidecar for the unchanged node 1.20.6 and ingress image digests. It emits individual safe request events plus bounded diagnostic/rejection counts, with schema drift checks, explicit transport-loss and Docker-log limitations, and unsampled volume accounting. No Rust or application image change and no deployment authorization; see `docs/runbooks/tc-959-n0-log-shipping.md` (TC-959 N0).
 - Account delegation session discovery keyset-pages delegation rows independently of ability fan-out, using a composite delegator/id index so large grant sets are not truncated (TC-1195).
 - `/attestation` quotes the SHA-256 of `key_binding` as REPORTDATA and returns it as `key_binding_sha256`; the quote no longer carries the raw binding. Before answering 200 the node checks that the returned TDX v4 quote's REPORTDATA field holds that digest (a structural check; it does not verify the quote). When the TEE can't produce a bound quote, the endpoint returns 503 instead of 200 `mode: "classic"`, and the dstack client reports a guest-agent error status instead of a parse error. `nonce` must be 1-64 characters of `A-Z a-z 0-9 - _` (400 otherwise), and the endpoint now shares the public routes' per-IP rate limit. Verifiers recompute the digest from their own nonce and expected DID and must still verify the quote; see `docs/attestation.md` (TC-963).
 

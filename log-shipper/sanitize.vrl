@@ -1,0 +1,56 @@
+# Only this fresh object can leave the process boundary. No envelope, span,
+# message, error, identity, URI or unknown key is copied into it.
+j = .parsed
+label = .label
+out = {}
+ts = ""
+if label == "tinycloud-node" {
+  target = string!(j.target)
+  level = downcase(string!(j.level))
+  f = object!(j.fields)
+  msg = string!(f.message)
+  ts = string!(j.timestamp)
+  if target == "tinycloud::request" && level == "info" && msg == "request" {
+    method = string!(f.method)
+    if includes(["TRACE", "CONNECT"], method) { method = "<other>" }
+    route = string!(f.route)
+    # Literal Rocket template aliases only; never split an arbitrary URI.
+    aliases = __ROUTE_ALIASES__
+    canonical_route = get(aliases, [route]) ?? null
+    if is_string(canonical_route) { route = canonical_route }
+    if !includes(__METHODS__, method) || !includes(__ROUTES__, route) { abort }
+    status = f.status
+    latency = f.latency_us
+    if !is_integer(status) || !is_integer(latency) { abort }
+    status = int!(status)
+    latency = int!(latency)
+    if status < 100 || status > 599 || latency < 0 || latency > 9007199254740991 { abort }
+    out = {"event": "node_request", "svc": "api", "level": "info", "method": method, "route": route, "status": status, "latency_us": latency}
+  } else {
+    if !includes(["warn", "error"], level) { abort }
+    if target != "tinycloud" && !starts_with(target, "tinycloud::") && target != "tinycloud_core" && !starts_with(target, "tinycloud_core::") { abort }
+    codes = __DIAGNOSTICS__
+    code = get(codes, [msg]) ?? null
+    if !is_string(code) { code = "unclassified" }
+    __PREFIX_DIAGNOSTICS__
+    event = if level == "warn" { "node_warning" } else { "node_error" }
+    out = {"event": event, "svc": "api", "level": level, "event_code": code, "event_count": 1}
+  }
+} else {
+  ts = string!(j.time)
+  method = string!(j.method)
+  route = string!(j.route)
+  if route == "<other>" { route = "<unmatched>" }
+  if !includes(__METHODS__, method) || !includes(__ROUTES__, route) { abort }
+  status = j.status
+  request_time = j.request_time
+  if !is_integer(status) || !(is_integer(request_time) || is_float(request_time)) { abort }
+  status = int!(status)
+  request_time = to_float!(request_time)
+  if status < 100 || status > 599 || request_time < 0 || request_time > 86400 { abort }
+  out = {"event": "ingress_request", "svc": "ingress", "level": "info", "method": method, "route": route, "status": status, "request_time_seconds": request_time}
+}
+if length(ts) > 64 { abort }
+parsed_ts = parse_timestamp!(ts, format: "%+")
+out.ts = format_timestamp!(parsed_ts, format: "%Y-%m-%dT%H:%M:%S%.3fZ")
+. = out

@@ -1,0 +1,49 @@
+name: logship
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'log-shipper/**'
+      - 'scripts/tc959-*.mjs'
+      - 'docker-compose.dstack-postgres.yaml'
+      - '.github/workflows/logship.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'log-shipper/**'
+      - 'scripts/tc959-*.mjs'
+      - 'docker-compose.dstack-postgres.yaml'
+      - '.github/workflows/logship.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  boundary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Verify request budgets and local acceptance guards
+        run: node --test log-shipper/budget.test.mjs scripts/tc959-docker.test.mjs scripts/tc959-readiness.test.mjs
+      - name: Check schema provenance and compose boundary without env interpolation
+        run: node scripts/tc959-check.mjs
+      - name: Install checksum-pinned native Vector
+        run: |
+          curl --fail --location --silent --show-error https://github.com/vectordotdev/vector/releases/download/v0.59.0/vector-0.59.0-x86_64-unknown-linux-gnu.tar.gz --output /tmp/tc959-vector.tar.gz
+          printf '%s\n' 'fb15878d1cd68445e0658792a8fa7ccf02ae8a353c6cc5d6fe867b171993e19f  /tmp/tc959-vector.tar.gz' | sha256sum --check
+          tar -xzf /tmp/tc959-vector.tar.gz -C /tmp
+      - name: Run native request and forbidden-value boundary cases
+        run: |
+          node scripts/tc959-logship.mjs render-tests /tmp/tc959-tests.json
+          /tmp/vector-x86_64-unknown-linux-gnu/bin/vector test /tmp/tc959-tests.json
+      - name: Exercise native UDP-to-HTTP delivery and console leak canaries
+        run: node log-shipper/native-check.mjs /tmp/vector-x86_64-unknown-linux-gnu/bin/vector
+      - name: Validate the actual HTTP sink without contacting it
+        run: |
+          node scripts/tc959-logship.mjs render-vector /tmp/tc959-runtime.json http://127.0.0.1:9599/
+          /tmp/vector-x86_64-unknown-linux-gnu/bin/vector validate --no-environment --skip-healthchecks /tmp/tc959-runtime.json

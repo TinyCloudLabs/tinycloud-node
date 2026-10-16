@@ -1,0 +1,27 @@
+{
+  "data_dir": "/tmp/vector-data",
+  "sources": {
+    "capture": {
+      "type": "http_server",
+      "address": "0.0.0.0:8080",
+      "framing": { "method": "newline_delimited" },
+      "decoding": { "codec": "bytes" }
+    }
+  },
+  "transforms": {
+    "wire_only": {
+      "type": "remap",
+      "inputs": ["capture"],
+      "source": ". = parse_json!(string!(.message))"
+    }
+  },
+  "sinks": {
+    "capture_file": {
+      "type": "file",
+      "inputs": ["wire_only"],
+      "path": "/tmp/capture.ndjson",
+      "encoding": { "codec": "json" },
+      "framing": { "method": "newline_delimited" }
+    }
+  }
+}
