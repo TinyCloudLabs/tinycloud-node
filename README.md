@@ -171,6 +171,15 @@ do not replace it during an upgrade: derived node identities and sealed data
 depend on it. `TINYCLOUD_KEYS__TYPE=Dstack` remains an explicit alternative
 only for a properly configured dstack TEE.
 
+For an existing node, do **not** generate a new root during upgrade. Recover
+the installation's original key from its private backup or its existing
+operator configuration, provide that same root explicitly, and compare the
+public node identity and encrypted/sealed data before accepting the upgrade.
+If the original root is unavailable, stop: a replacement is a different node
+identity and does not recover data sealed under the prior root. Changing the
+identity also invalidates trust bindings that refer to its DID or public keys.
+
+
 
 ## Configuration
 

@@ -38,15 +38,18 @@ The pinned `@tinycloud/node-sdk` signs in, hosts an owned space, writes and read
 
 ## Offline backup and fresh restore
 
-Stop writes before backup. `backup` stops the node, archives the entire `/data` tree while SQLite and SQL actors are closed, encrypts `node.env` as a separate artifact, then restarts the node. The passphrase file is not included in either artifact. Retain both the backup and passphrase in independent secure locations. Test recovery regularly.
+Stop writes before backup. `backup` stops the node, archives the entire `/data` tree while SQLite and SQL actors are closed, encrypts `node.env` as a separate artifact, then restarts the node. The data archive itself is **not encrypted**; protect it as sensitive data or encrypt it using your backup system. The passphrase file is not included in either artifact. Retain both the backup and passphrase in independent secure locations. Test recovery regularly.
 
 ```bash
-# Create a private passphrase file out of band; it must not be committed or logged.
+# Generate a strong private passphrase file outside the node and backup tree.
 export BACKUP_PASSPHRASE_FILE=/secure/path/node-backup-passphrase
+umask 077
+openssl rand -base64 48 > "$BACKUP_PASSPHRASE_FILE"
 bash deploy/personal-node/node.sh backup /secure/path/node-backup-2026-10-16 "$BACKUP_PASSPHRASE_FILE"
 
 # On the destination, copy the encrypted backup, passphrase and owner wallet
-# by independent secure channels; use a fresh NODE_HOME and the same domain.
+# by independent secure channels. Stop the old node, repoint DNS to the new
+# host, then start the restored node after Caddy can obtain its certificate.
 export NODE_HOME="$HOME/personal-tinycloud-restored"
 bash deploy/personal-node/node.sh restore /secure/path/node-backup-2026-10-16 "$BACKUP_PASSPHRASE_FILE"
 bash deploy/personal-node/node.sh start
@@ -54,7 +57,7 @@ bash deploy/personal-node/node.sh check-version 1.20.6
 bash deploy/personal-node/node.sh verify /secure/path/owner.key
 ```
 
-Use a fresh host/directory, not two live nodes serving the same identity and domain at once. Repoint DNS only after verifying the new host; Caddy obtains a new certificate. `verify` compares the public node DID saved before backup and the signed KV/SQL data; a different root fails rather than silently rotating. The backup is a full offline snapshot, **not** continuous replication. TLS ACME state is not in the backup, and a restore needs a reachable domain and valid certificate again.
+Use a fresh host/directory, not two live nodes serving the same identity and domain at once. Stop the old node before DNS cutover; wait for the new host's Caddy certificate, then verify before admitting clients. If verification fails, stop the destination and revert DNS to the old host. `verify` compares the public node DID saved before backup and the signed KV/SQL data; a different root fails rather than silently rotating. The backup is a full offline snapshot, **not** continuous replication. TLS ACME state is not in the backup, and a restore needs a reachable domain and valid certificate again.
 
 ## Upgrade and rollback rehearsal
 
