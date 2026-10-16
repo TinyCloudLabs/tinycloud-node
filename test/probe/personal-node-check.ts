@@ -18,7 +18,7 @@ function unwrap<T>(result: { ok: true; data: T } | { ok: false; error: unknown }
 }
 
 async function main(): Promise<void> {
-  unwrap(await node.signIn());
+  await node.signIn();
   stage = "hostOwnedSpace";
   if (mode === "seed") {
     await node.hostOwnedSpace("personal-node-guide");
