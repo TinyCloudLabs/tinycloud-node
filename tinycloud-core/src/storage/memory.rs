@@ -223,6 +223,15 @@ impl ImmutableDeleteStore for MemoryStore {
             .and_then(|o| o.remove(&(*id, generation)))
             .map(|_| ()))
     }
+    async fn cleanup_stages(
+        &self,
+        _space: &SpaceId,
+        _id: &Hash,
+        _generation: i64,
+    ) -> Result<(), Self::Error> {
+        // Memory staging has no filesystem artifact after the writer exits.
+        Ok(())
+    }
 }
 
 #[async_trait]

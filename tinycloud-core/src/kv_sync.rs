@@ -1933,6 +1933,14 @@ pub(crate) mod tests {
         ) -> Result<Option<()>, Self::Error> {
             self.0.remove(space, id, generation).await
         }
+        async fn cleanup_stages(
+            &self,
+            space: &SpaceId,
+            id: &Hash,
+            generation: i64,
+        ) -> Result<(), Self::Error> {
+            self.0.cleanup_stages(space, id, generation).await
+        }
     }
 
     #[tokio::test]

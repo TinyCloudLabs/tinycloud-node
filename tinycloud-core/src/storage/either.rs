@@ -236,6 +236,23 @@ where
                 .map_err(Self::Error::B),
         }
     }
+    async fn cleanup_stages(
+        &self,
+        space: &SpaceId,
+        id: &Hash,
+        generation: i64,
+    ) -> Result<(), Self::Error> {
+        match self {
+            Self::A(store) => store
+                .cleanup_stages(space, id, generation)
+                .await
+                .map_err(Self::Error::A),
+            Self::B(store) => store
+                .cleanup_stages(space, id, generation)
+                .await
+                .map_err(Self::Error::B),
+        }
+    }
 }
 
 #[async_trait]

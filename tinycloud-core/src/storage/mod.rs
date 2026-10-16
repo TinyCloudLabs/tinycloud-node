@@ -213,6 +213,16 @@ pub trait ImmutableDeleteStore: Send + Sync {
         id: &Hash,
         generation: i64,
     ) -> Result<Option<()>, Self::Error>;
+
+    /// Reclaim incomplete, unreferenced staging files without removing the
+    /// published blob. Called only after the orphan fence found no active
+    /// attempts; storage backends without persistent stages have nothing to do.
+    async fn cleanup_stages(
+        &self,
+        space: &SpaceId,
+        id: &Hash,
+        generation: i64,
+    ) -> Result<(), Self::Error>;
 }
 
 #[async_trait]
@@ -320,6 +330,14 @@ where
         generation: i64,
     ) -> Result<Option<()>, Self::Error> {
         (**self).remove(space, id, generation).await
+    }
+    async fn cleanup_stages(
+        &self,
+        space: &SpaceId,
+        id: &Hash,
+        generation: i64,
+    ) -> Result<(), Self::Error> {
+        (**self).cleanup_stages(space, id, generation).await
     }
 }
 

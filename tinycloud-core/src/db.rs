@@ -5663,6 +5663,14 @@ mod test {
             }
             self.inner.remove(space, hash, generation).await
         }
+        async fn cleanup_stages(
+            &self,
+            space: &SpaceId,
+            hash: &Hash,
+            generation: i64,
+        ) -> Result<(), Self::Error> {
+            self.inner.cleanup_stages(space, hash, generation).await
+        }
     }
     #[tokio::test]
     async fn legacy_freeze_ack_waits_for_actual_in_flight_kv_storage_and_commit() {

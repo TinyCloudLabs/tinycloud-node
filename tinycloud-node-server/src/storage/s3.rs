@@ -615,6 +615,15 @@ impl ImmutableDeleteStore for S3BlockStore {
             Err(e) => Err(S3Error::from(e).into()),
         }
     }
+    async fn cleanup_stages(
+        &self,
+        _space: &SpaceId,
+        _id: &Hash,
+        _generation: i64,
+    ) -> Result<(), Self::Error> {
+        // Staging is not in the bucket; an incomplete S3 PUT has no visible key.
+        Ok(())
+    }
 }
 
 #[async_trait]

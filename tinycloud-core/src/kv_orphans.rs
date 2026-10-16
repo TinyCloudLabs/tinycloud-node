@@ -422,6 +422,8 @@ pub enum CollectError<E: StdError + Send + Sync> {
     Database(#[from] DbErr),
     #[error("orphan blob metadata read failed: {0}")]
     Read(String),
+    #[error("orphan stage cleanup timed out")]
+    StageTimeout,
     #[error("orphan blob deletion failed: {0}")]
     Store(E),
 }
@@ -571,10 +573,28 @@ where
         return Ok(false);
     }
     if has_attempts(&tx, &key, value, generation).await? {
-        tx.commit().await?;
+        if skip_locked {
+            // GC must retain the expired claim while another upload is
+            // in flight. Its crashed stage is still owed cleanup even if the
+            // other writer commits and would otherwise retire the fence.
+            tx.rollback().await?;
+        } else {
+            tx.commit().await?;
+        }
         return Ok(false);
     }
     if has_references(&tx, &key, value, generation).await? {
+        // This is a rare local-filesystem cleanup, not a blob upload. Keep
+        // the fence locked until only incomplete stages are gone, then retire
+        // the candidate. A timeout or cancellation rolls this transaction
+        // back, preserving its attempt for the next GC pass.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            store.cleanup_stages(space, &value, generation),
+        )
+        .await
+        .map_err(|_| CollectError::StageTimeout)?
+        .map_err(CollectError::Store)?;
         candidate::Entity::delete_many()
             .filter(candidate::Column::Space.eq(key))
             .filter(candidate::Column::Value.eq(value))
@@ -951,6 +971,14 @@ mod tests {
                 ));
             }
             Ok(removed)
+        }
+        async fn cleanup_stages(
+            &self,
+            space: &SpaceId,
+            id: &Hash,
+            generation: i64,
+        ) -> Result<(), Self::Error> {
+            self.inner.cleanup_stages(space, id, generation).await
         }
     }
 

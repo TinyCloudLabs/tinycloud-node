@@ -10,6 +10,8 @@ use futures::{
 };
 use pin_project::pin_project;
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     collections::{hash_map::Entry, HashMap},
     fmt::Write as _,
@@ -45,6 +47,10 @@ pub struct FileSystemStore {
     before_memory_write: TestPause,
     #[cfg(test)]
     after_memory_contains: TestPause,
+    #[cfg(test)]
+    fail_stage_cleanup: Arc<AtomicBool>,
+    #[cfg(test)]
+    after_stage_unlink: TestPause,
 }
 
 impl FileSystemStore {
@@ -60,6 +66,10 @@ impl FileSystemStore {
             before_memory_write: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             after_memory_contains: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            fail_stage_cleanup: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            after_stage_unlink: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -136,6 +146,11 @@ impl FileSystemStore {
                     removed = removed
                         .checked_add(size)
                         .ok_or_else(|| IoError::other("staged blob byte count overflow"))?;
+                    #[cfg(test)]
+                    if let Some((entered, release)) = self.after_stage_unlink.lock().await.take() {
+                        entered.notify_one();
+                        release.notified().await;
+                    }
                     if refund_each {
                         self.decrement_size(space, size).await;
                     }
@@ -565,6 +580,36 @@ impl ImmutableDeleteStore for FileSystemStore {
         }
         Ok((removed_final.is_some() || staged != 0).then_some(()))
     }
+    async fn cleanup_stages(
+        &self,
+        space: &SpaceId,
+        id: &Hash,
+        generation: i64,
+    ) -> Result<(), Self::Error> {
+        let store = self.clone();
+        let space = space.clone();
+        let id = *id;
+        // The DB fence may time out or its caller may be cancelled. Finish
+        // each unlink and its quota refund together before releasing the
+        // physical lock; the retained DB attempt makes a retry idempotent.
+        tokio::spawn(async move {
+            let key = (space.clone(), id, generation);
+            let _operation = store.operations.lock(key.clone()).await;
+            #[cfg(test)]
+            if store.fail_stage_cleanup.load(Ordering::SeqCst) {
+                return Err(IoError::other("injected stage cleanup failure").into());
+            }
+            let pending = store.pending.lock().await.contains_key(&key);
+            // This path is for a referenced final blob. Only incomplete
+            // stages are removed; never unlink a committed row's object.
+            store
+                .remove_stages(&space, &store.get_path(&space, &id, generation), !pending)
+                .await?;
+            Ok::<(), FileSystemStoreError>(())
+        })
+        .await
+        .map_err(IoError::other)?
+    }
 }
 
 #[async_trait]
@@ -734,6 +779,218 @@ mod test {
         reopened.remove(&space, &hash, 0).await.unwrap();
         assert_eq!(reopened.total_size(&space).await.unwrap(), Some(0));
         assert!(!stage_path.exists());
+    }
+
+    #[tokio::test]
+    async fn referenced_retry_collects_crashed_stage_without_deleting_committed_blob() {
+        referenced_retry_with_crashed_stage(false, false, false).await;
+    }
+
+    #[tokio::test]
+    async fn referenced_retry_retains_stage_recovery_if_crash_attempt_expires_first() {
+        referenced_retry_with_crashed_stage(true, false, false).await;
+    }
+
+    #[tokio::test]
+    async fn referenced_retry_retains_candidate_when_stage_cleanup_fails() {
+        referenced_retry_with_crashed_stage(false, true, false).await;
+    }
+
+    #[tokio::test]
+    async fn referenced_retry_cancelled_cleanup_completes_stage_refund() {
+        referenced_retry_with_crashed_stage(false, false, true).await;
+    }
+
+    async fn referenced_retry_with_crashed_stage(
+        collect_before_commit: bool,
+        fail_cleanup: bool,
+        cancel_cleanup: bool,
+    ) {
+        use tinycloud_core::sea_orm::{
+            ConnectionTrait, Database, DbBackend, EntityTrait, PaginatorTrait, Statement,
+            TransactionTrait,
+        };
+        use tinycloud_core::sea_orm_migration::MigratorTrait;
+        use tinycloud_core::{
+            hash::hash,
+            kv_orphans,
+            migrations::Migrator,
+            models::{kv_orphan_attempt, kv_orphan_candidate},
+        };
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        db.execute_unprepared("PRAGMA foreign_keys = OFF")
+            .await
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = FileSystemConfig::new(dir.path());
+        let store = cfg.open().await.unwrap();
+        let space: SpaceId = "tinycloud:key:test:referenced-stage".parse().unwrap();
+        store.create(&space).await.unwrap();
+        let data = b"complete same-hash retry after crash";
+        let value = hash(data);
+        let blobs = [(space.clone(), value)];
+        let tx = db.begin().await.unwrap();
+        kv_orphans::register_candidates(&tx, &blobs, "crashed-A")
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let path = store.get_path(&space, &value, 0);
+        let staged = tempfile::Builder::new()
+            .prefix(&FileSystemStore::stage_prefix(&path))
+            .tempfile_in(path.parent().unwrap())
+            .unwrap();
+        let stage_path = staged.path().to_path_buf();
+        std::fs::write(&stage_path, b"partial").unwrap();
+        staged.into_temp_path().keep().unwrap();
+        drop(store);
+        let store = cfg.open().await.unwrap();
+        assert_eq!(store.total_size(&space).await.unwrap(), Some(7));
+
+        let tx = db.begin().await.unwrap();
+        let registered = kv_orphans::register_candidates(&tx, &blobs, "retry-B")
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let mut stage = HashBuffer::new(Vec::new());
+        stage.write_all(data).await.unwrap();
+        ImmutableWriteStore::<memory::MemoryStaging>::persist(
+            &store,
+            &space,
+            stage,
+            registered[0].2,
+        )
+        .await
+        .unwrap();
+        if collect_before_commit {
+            // A's DB-time claim is older than the five-minute grace; B's
+            // fresh claim still protects its in-flight upload.
+            db.execute(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "UPDATE kv_orphan_attempt SET created_at = ? WHERE attempt_id = ?",
+                [
+                    (time::OffsetDateTime::now_utc() - time::Duration::minutes(6)).into(),
+                    "crashed-A".into(),
+                ],
+            ))
+            .await
+            .unwrap();
+            kv_orphans::collect_candidates(&db, &store, 256, kv_orphans::ORPHAN_GRACE)
+                .await
+                .unwrap();
+            assert!(stage_path.exists());
+        }
+        let tx = db.begin().await.unwrap();
+        kv_orphans::lock_candidates(&tx, &registered, "retry-B")
+            .await
+            .unwrap();
+        tx.execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO kv_write (space,key,invocation,seq,epoch,epoch_seq,value,metadata,generation)
+             VALUES (?,'retry',?,1,?,1,?,'{}',?)",
+            [
+                space.to_string().into(),
+                Vec::<u8>::from(hash(b"invocation")).into(),
+                Vec::<u8>::from(hash(b"epoch")).into(),
+                Vec::<u8>::from(value).into(),
+                registered[0].2.into(),
+            ],
+        ))
+        .await
+        .unwrap();
+        kv_orphans::finish_candidates(&tx, &registered, "retry-B")
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        if fail_cleanup {
+            store.fail_stage_cleanup.store(true, Ordering::SeqCst);
+            assert!(
+                kv_orphans::collect_candidates(&db, &store, 256, time::Duration::ZERO)
+                    .await
+                    .is_err()
+            );
+            assert!(stage_path.exists());
+            assert_eq!(
+                kv_orphan_candidate::Entity::find()
+                    .count(&db)
+                    .await
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                kv_orphan_attempt::Entity::find().count(&db).await.unwrap(),
+                1
+            );
+            assert_eq!(
+                store.total_size(&space).await.unwrap(),
+                Some(7 + data.len() as u64)
+            );
+            store.fail_stage_cleanup.store(false, Ordering::SeqCst);
+            kv_orphans::refund_failed(&db, &store, &registered, "crashed-A")
+                .await
+                .unwrap();
+        } else if cancel_cleanup {
+            let entered = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            *store.after_stage_unlink.lock().await = Some((entered.clone(), release.clone()));
+            let collecting_db = db.clone();
+            let collecting_store = store.clone();
+            let collector = tokio::spawn(async move {
+                kv_orphans::collect_candidates(
+                    &collecting_db,
+                    &collecting_store,
+                    256,
+                    time::Duration::ZERO,
+                )
+                .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+                .await
+                .unwrap();
+            assert!(!stage_path.exists());
+            assert_eq!(
+                store.total_size(&space).await.unwrap(),
+                Some(7 + data.len() as u64)
+            );
+            collector.abort();
+            assert!(collector.await.unwrap_err().is_cancelled());
+            release.notify_one();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                kv_orphans::refund_failed(&db, &store, &registered, "crashed-A"),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        } else {
+            kv_orphans::collect_candidates(&db, &store, 256, time::Duration::ZERO)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            store.read_to_vec(&space, &value, 0).await.unwrap(),
+            Some(data.to_vec()),
+            "GC must preserve the committed retry"
+        );
+        assert!(!stage_path.exists(), "the crashed stage is unreferenced");
+        assert_eq!(
+            store.total_size(&space).await.unwrap(),
+            Some(data.len() as u64)
+        );
+        assert_eq!(
+            kv_orphan_candidate::Entity::find()
+                .count(&db)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            kv_orphan_attempt::Entity::find().count(&db).await.unwrap(),
+            0
+        );
     }
 
     #[tokio::test]
