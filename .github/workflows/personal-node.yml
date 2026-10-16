@@ -33,6 +33,8 @@ jobs:
           cache-dependency-path: test/probe/package-lock.json
       - name: Install pinned signing client
         run: npm ci --prefix test/probe
+      - name: Typecheck signing probe
+        run: npm run typecheck --prefix test/probe
       - name: Exercise the published personal-node guide
         run: bash deploy/personal-node/ci.sh
       - name: Check dstack-profile local-data persistence
