@@ -8,10 +8,11 @@ import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import net from 'node:net';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { isDeepStrictEqual } from 'node:util';
 import { buildConfig, nodeImage, ingressImage, vectorImage } from './tc959-logship.mjs';
 import { canary, nodeRequest } from '../log-shipper/cases.mjs';
 import { awaitReadiness, classifyProbeError, classifyStartupOutput, hasUdpListener, componentCounters } from './tc959-readiness.mjs';
-import { owner, assertHostedRunner, cleanupOwnedResources, burstEvidence, assertHealthyBurst, progressEvidence, assertServiceParity, assertLogshipNetwork, socketEvidence, numericMetrics, diagnosticCounts } from './tc959-compose-proof.mjs';
+import { owner, assertHostedRunner, cleanupOwnedResources, burstEvidence, assertHealthyBurst, progressEvidence, assertServiceParity, assertLogshipNetwork, composeRuntimeValues, socketEvidence, numericMetrics, diagnosticCounts } from './tc959-compose-proof.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const token = 'TC959_SYNTHETIC_HOSTED_SINK_BEARER';
@@ -338,7 +339,8 @@ export async function main(args = process.argv.slice(2)) {
     assert.equal(unresolved.secrets, undefined, 'deployment_secret_files_forbidden');
     assert.equal(unresolved.configs, undefined, 'deployment_config_files_forbidden');
     for (const service of Object.values(unresolved.services)) assert.equal(service.env_file, undefined, 'deployment_env_files_forbidden');
-    const rendered = JSON.parse(docker(...composeArgs, '--format', 'json'));
+    const serialized = JSON.parse(docker(...composeArgs, '--format', 'json'));
+    const rendered = composeRuntimeValues(serialized);
     const production = rendered.services;
     phase = 'compose_images';
     assert.equal(production.tinycloud.image, nodeImage);
@@ -371,6 +373,10 @@ export async function main(args = process.argv.slice(2)) {
     assertLogshipNetwork(rendered.networks.logship);
     phase = 'compose_compiler';
     const compiled = buildConfig({ runtimeProfile: true });
+    report.compose_compiler_matches = {
+      serialized: isDeepStrictEqual(JSON.parse(serialized.services.vector.environment.VECTOR_CONFIG_JSON), compiled),
+      runtime: isDeepStrictEqual(JSON.parse(production.vector.environment.VECTOR_CONFIG_JSON), compiled),
+    };
     assert.deepEqual(JSON.parse(production.vector.environment.VECTOR_CONFIG_JSON), compiled, 'rendered_compose_compiler_mismatch');
     assert.equal(compiled.sources.gelf_in.receive_buffer_bytes, 8388608);
     const [nodePort, ingressPort] = await Promise.all([freePort(), freePort()]);

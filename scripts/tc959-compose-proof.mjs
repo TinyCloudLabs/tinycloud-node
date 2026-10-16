@@ -2,6 +2,14 @@ import assert from 'node:assert/strict';
 
 export const owner = 'tc959-n0';
 
+/** Canonical `compose config` escapes dollars for reuse as Compose input. */
+export function composeRuntimeValues(value) {
+  if (typeof value === 'string') return value.replaceAll('$$', '$');
+  if (Array.isArray(value)) return value.map(composeRuntimeValues);
+  if (value !== null && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, composeRuntimeValues(item)]));
+  return value;
+}
+
 /** Refuse local/self-hosted execution before touching the Docker daemon. */
 export function assertHostedRunner(env) {
   if (env.GITHUB_ACTIONS !== 'true' || env.RUNNER_ENVIRONMENT !== 'github-hosted' || env.RUNNER_OS !== 'Linux'

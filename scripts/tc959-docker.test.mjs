@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { parseArgs, assertCapture, resourceNames } from './tc959-docker.mjs';
-import { assertHostedRunner, cleanupOwnedResources, burstEvidence, assertHealthyBurst, progressEvidence, assertServiceParity, assertLogshipNetwork, socketEvidence, numericMetrics, diagnosticCounts } from './tc959-compose-proof.mjs';
+import { assertHostedRunner, cleanupOwnedResources, burstEvidence, assertHealthyBurst, progressEvidence, assertServiceParity, assertLogshipNetwork, composeRuntimeValues, socketEvidence, numericMetrics, diagnosticCounts } from './tc959-compose-proof.mjs';
 
 const request = { ts: '2026-10-16T12:00:00.000Z', level: 'info', event: 'node_request', svc: 'api', method: 'GET', route: '/healthz', status: 200, latency_us: 12 };
 const ingress = { ...request, event: 'ingress_request', svc: 'ingress', request_time_seconds: 0.001 };
@@ -95,6 +95,18 @@ test('timed per-hop evidence distinguishes continued drainage from an observed p
   assert.equal(progressEvidence([later, sample(2000, 500, 500, 500, 300, 300), sample(3000, 500, 500, 500, 300, 300)]).plateau, true);
   assert.equal(progressEvidence([first]).plateau, false);
   assert.equal(progressEvidence([first, { ...later, sink: null }]).deltas.sink, null);
+});
+
+test('canonical Compose dollar escaping becomes runtime variables rather than shell PID expansion', () => {
+  const runtime = composeRuntimeValues({
+    environment: { TC959_VALUE: 'TC959_SYNTHETIC_$$literal' },
+    entrypoint: ['/bin/sh', '-ec', 'printf "%s" "$$TC959_VALUE"'],
+    config: JSON.stringify({ condition: '"$${TINYCLOUD_LOGSHIP_PROFILE}" == "all_requests"' }),
+  });
+  const child = spawnSync(runtime.entrypoint[0], runtime.entrypoint.slice(1), { env: runtime.environment, encoding: 'utf8' });
+  assert.equal(child.status, 0);
+  assert.equal(child.stdout, 'TC959_SYNTHETIC_$literal');
+  assert.equal(JSON.parse(runtime.config).condition, '"${TINYCLOUD_LOGSHIP_PROFILE}" == "all_requests"');
 });
 
 test('normal bridge defaults cannot hide external, routed or host-changing network options', () => {
