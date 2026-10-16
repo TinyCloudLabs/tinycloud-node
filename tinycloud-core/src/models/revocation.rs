@@ -371,20 +371,60 @@ pub(crate) async fn control_proof_decision<C: ConnectionTrait>(
         .filter(abilities::Column::Ability.eq(requested_action))
         .all(db)
         .await?;
-    let target_resource = format!("urn:cid:{}", target.to_cid(0x55));
-    control_abilities.retain(|ability| match &ability.resource {
-        Resource::Other(resource) => resource.as_str() == target_resource,
-        Resource::TinyCloud(resource) => {
-            resource.service().as_str() == "delegation"
-                && resource
-                    .path()
-                    .map(|path| path.as_str().is_empty())
-                    .unwrap_or(true)
-                && resource.query().is_none()
-                && resource.fragment().is_none()
-                && did_principal_matches(resource.space().did().as_str(), &parent.delegator)
+    let mut canonical_target = None;
+    let mut index = 0;
+    while index < control_abilities.len() {
+        let matches = match &control_abilities[index].resource {
+            Resource::Other(resource) => {
+                let control_target = resource
+                    .as_str()
+                    .strip_prefix("urn:cid:")
+                    .and_then(|cid| cid.parse::<Cid>().ok())
+                    .map(Hash::from);
+                if let Some(control_target) = control_target {
+                    if control_target == *target {
+                        true
+                    } else {
+                        let target_canonical = if let Some(canonical) = canonical_target {
+                            canonical
+                        } else {
+                            let canonical = delegation_cid_alias::Entity::find_by_id(*target)
+                                .one(db)
+                                .await?
+                                .map(|alias| alias.canonical)
+                                .unwrap_or(*target);
+                            canonical_target = Some(canonical);
+                            canonical
+                        };
+                        let control_canonical =
+                            delegation_cid_alias::Entity::find_by_id(control_target)
+                                .one(db)
+                                .await?
+                                .map(|alias| alias.canonical)
+                                .unwrap_or(control_target);
+                        control_canonical == target_canonical
+                    }
+                } else {
+                    false
+                }
+            }
+            Resource::TinyCloud(resource) => {
+                resource.service().as_str() == "delegation"
+                    && resource
+                        .path()
+                        .map(|path| path.as_str().is_empty())
+                        .unwrap_or(true)
+                    && resource.query().is_none()
+                    && resource.fragment().is_none()
+                    && did_principal_matches(resource.space().did().as_str(), &parent.delegator)
+            }
+        };
+        if matches {
+            index += 1;
+        } else {
+            control_abilities.swap_remove(index);
         }
-    });
+    }
     if control_abilities.is_empty() {
         return Ok(ControlProofDecision::Denied);
     }
@@ -397,7 +437,7 @@ pub(crate) async fn control_proof_decision<C: ConnectionTrait>(
 
 /// A canonical CID can name a historical stored row without being its primary
 /// key. Keep the signed CID on the wire; use the stored row for authorization.
-async fn target_for_cid<C: ConnectionTrait>(
+pub(crate) async fn target_for_cid<C: ConnectionTrait>(
     db: &C,
     target: Hash,
 ) -> Result<Option<delegation::Model>, DbErr> {
@@ -584,28 +624,23 @@ async fn revoker_is_authorized<C: ConnectionTrait>(
     proofs: &[Cid],
     target: &Hash,
 ) -> Result<bool, DbErr> {
-    let principal = match control_proof_decision(
-        db,
-        revoker,
-        proofs,
-        "tinycloud.delegation/revoke",
-        &delegation.id,
-    )
-    .await?
-    {
-        ControlProofDecision::DirectSigner(principal) => principal,
-        ControlProofDecision::Scoped(control) => {
-            if control.directly_authorizes_cid(&delegation.id, delegation) {
-                return Ok(true);
+    let principal =
+        match control_proof_decision(db, revoker, proofs, "tinycloud.delegation/revoke", target)
+            .await?
+        {
+            ControlProofDecision::DirectSigner(principal) => principal,
+            ControlProofDecision::Scoped(control) => {
+                if control.directly_authorizes_cid(target, delegation) {
+                    return Ok(true);
+                }
+                let target_abilities = abilities::Entity::find()
+                    .filter(abilities::Column::Delegation.eq(delegation.id))
+                    .all(db)
+                    .await?;
+                return Ok(control.authorizes_target(target, delegation, &target_abilities));
             }
-            let target_abilities = abilities::Entity::find()
-                .filter(abilities::Column::Delegation.eq(delegation.id))
-                .all(db)
-                .await?;
-            return Ok(control.authorizes_target(&delegation.id, delegation, &target_abilities));
-        }
-        ControlProofDecision::Denied => return Ok(false),
-    };
+            ControlProofDecision::Denied => return Ok(false),
+        };
     if did_principal_matches(&delegation.delegator, &principal) {
         return Ok(true);
     }

@@ -1796,18 +1796,18 @@ where
         if proofs.len() > 1 {
             return Ok(None);
         }
-        let Some(delegation) = delegation::Entity::find_by_id(target)
-            .one(&self.conn)
-            .await?
-        else {
+        let Some(delegation) = revocation::target_for_cid(&self.conn, target).await? else {
             return Ok(None);
         };
         let abilities = abilities::Entity::find()
-            .filter(abilities::Column::Delegation.eq(target))
+            .filter(abilities::Column::Delegation.eq(delegation.id))
             .all(&self.conn)
             .await?;
 
         let mut roots = vec![target];
+        if delegation.id != target {
+            roots.push(delegation.id);
+        }
         roots.extend(proofs.iter().copied().map(Hash::from));
         let _chain_guards = match self.acquire_chain_guards(&roots).await {
             Ok(guards) => guards,
@@ -1849,7 +1849,7 @@ where
         if revocation::is_revoked(&self.conn, &target).await? {
             return Ok(Some(DelegationStatus::Revoked));
         }
-        match revocation::first_revoked_ancestor(&self.conn, &target).await {
+        match revocation::first_revoked_ancestor(&self.conn, &delegation.id).await {
             Ok(Some(_)) => return Ok(Some(DelegationStatus::Revoked)),
             Ok(None) => {}
             Err(revocation::ChainTraversalError::LimitExceeded) => {

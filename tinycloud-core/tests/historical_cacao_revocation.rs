@@ -384,6 +384,25 @@ async fn owner_cid_control_revokes_historical_equivalents_without_target_artifac
 }
 
 #[tokio::test]
+async fn unstored_canonical_status_resolves_historical_grant() {
+    let fixture = fixtures()
+        .into_iter()
+        .find(|fixture| fixture.database == "single-v0.sqlite")
+        .unwrap();
+    let canonical = current_cid(&fixture.canonical_header);
+    assert_ne!(canonical, fixture.rows[0].raw_cid);
+    let (_directory, path) = copy_database(&fixture);
+    let db = open(&path).await;
+    assert_eq!(
+        db.delegation_status(hash_from_cid(&canonical), &fixture.issuer, &[])
+            .await
+            .map_err(|error| error.to_string())
+            .unwrap(),
+        Some(tinycloud_core::db::DelegationStatus::Active),
+    );
+}
+
+#[tokio::test]
 async fn owner_cid_control_resolves_unstored_canonical_target() {
     let fixture = fixtures()
         .into_iter()
@@ -415,6 +434,13 @@ async fn owner_cid_control_resolves_unstored_canonical_target() {
         .unwrap();
         assert_eq!(
             db.delegation_status(hash_from_cid(raw), &fixture.issuer, &[])
+                .await
+                .map_err(|error| error.to_string())
+                .unwrap(),
+            Some(tinycloud_core::db::DelegationStatus::Revoked),
+        );
+        assert_eq!(
+            db.delegation_status(hash_from_cid(&canonical), &fixture.issuer, &[])
                 .await
                 .map_err(|error| error.to_string())
                 .unwrap(),
