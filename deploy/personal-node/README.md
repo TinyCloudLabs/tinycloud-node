@@ -26,6 +26,8 @@ bash deploy/personal-node/node.sh check-version 1.20.6
 
 Replace `node.example.com` with the domain you own. `init` writes a unique 48-byte random Static root to a `0600` private `node.env`; it is never echoed. The profile mounts a keyless TOML over the bundled image config, so even the older 1.20.6 image **fails** if the installation root is absent. `check-missing-key` must run before `start`; it probes the unprovisioned path without printing keys. Caddy obtains and renews a public certificate; do not bypass its trust verification.
 
+The 1.20.6 config loader accepts both the legacy single-underscore nesting (`TINYCLOUD_KEYS_TYPE`, `TINYCLOUD_STORAGE_DATADIR`) and canonical double-underscore nesting (`TINYCLOUD_KEYS__TYPE`, `TINYCLOUD_STORAGE__DATADIR`). It merges canonical values last when both are set. This profile uses the canonical form; the existing dstack Compose retains its working single-underscore key-type setting.
+
 To prove owner-held EOA operations, place your own wallet's 32-byte hexadecimal private key (without `0x`) in a separate `0600` file outside `NODE_HOME`, then run:
 
 ```bash

@@ -26,6 +26,18 @@ ready
 curl -fsS http://127.0.0.1:8000/version |
   jq -e '.version == "1.20.6" and (.features | index("tee") != null) and .inTEE == false' >/dev/null ||
   { printf '%s\n' 'Dstack profile did not run the pinned dstack build' >&2; exit 1; }
+first_did="$(curl -fsS http://127.0.0.1:8000/.well-known/tinycloud/node-keys | jq -er '.nodeDid')"
+second_key="$(openssl rand -base64 48 | tr '+/' '-_' | tr -d '=\n')"
+TC1282_TEST_KEY="$second_key" compose up -d --force-recreate tinycloud
+ready
+second_did="$(curl -fsS http://127.0.0.1:8000/.well-known/tinycloud/node-keys | jq -er '.nodeDid')"
+[[ "$first_did" != "$second_did" ]] ||
+  { printf '%s\n' 'Dstack-profile Static key override did not change node identity' >&2; exit 1; }
+compose up -d --force-recreate tinycloud
+ready
+restored_did="$(curl -fsS http://127.0.0.1:8000/.well-known/tinycloud/node-keys | jq -er '.nodeDid')"
+[[ "$first_did" == "$restored_did" ]] ||
+  { printf '%s\n' 'Dstack-profile original Static key did not restore node identity' >&2; exit 1; }
 "$here/test/probe/node_modules/.bin/tsx" "$here/test/probe/personal-node-check.ts" seed http://127.0.0.1:8000 "$owner"
 compose down
 compose up -d tinycloud

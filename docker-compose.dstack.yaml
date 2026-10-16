@@ -24,7 +24,7 @@ services:
       - /var/run/dstack.sock:/var/run/dstack.sock
       - tinycloud-data:/data
     environment:
-      TINYCLOUD_KEYS__TYPE: Dstack
+      TINYCLOUD_KEYS_TYPE: Dstack
       TINYCLOUD_STORAGE__DATADIR: /data
       TINYCLOUD_LOG_LEVEL: normal
       TINYCLOUD_CORS: "true"
