@@ -361,7 +361,7 @@ pub async fn finish_candidates(
                         RETURNING space, value
                     ), woken AS (
                         UPDATE kv_orphan_attempt AS other
-                           SET retry_after = NULL
+                           SET retry_after = statement_timestamp()
                         WHERE other.space = $1 AND other.value = $2
                           AND other.generation = $4 AND other.attempt_id <> $3
                           AND other.retry_after IS NOT NULL
@@ -426,9 +426,10 @@ pub async fn finish_candidates(
     Ok(())
 }
 
-/// A writer leaving makes older deferred stage claims eligible immediately.
-/// Both the successful commit and the failure path call this under the fence;
-/// registration age remains immutable throughout.
+/// A writer leaving makes older deferred stage claims eligible immediately
+/// without restoring their old first-attempt priority. Keep them in the retry
+/// queue at the database's current time so an unrelated orphan cannot be
+/// starved by repeated departures. Registration age remains immutable.
 async fn wake_attempts<C: ConnectionTrait>(
     conn: &C,
     space: &SpaceIdWrap,
@@ -437,7 +438,7 @@ async fn wake_attempts<C: ConnectionTrait>(
     departing_attempt: &str,
 ) -> Result<(), DbErr> {
     attempt::Entity::update_many()
-        .col_expr(attempt::Column::RetryAfter, Expr::cust("NULL"))
+        .col_expr(attempt::Column::RetryAfter, Expr::cust("CURRENT_TIMESTAMP"))
         .filter(attempt::Column::Space.eq(space.clone()))
         .filter(attempt::Column::Value.eq(value))
         .filter(attempt::Column::Generation.eq(generation))
@@ -993,7 +994,10 @@ where
 mod tests {
     use super::*;
     use crate::hash::hash;
-    use crate::models::{kv_orphan_attempt, kv_orphan_candidate};
+    use crate::models::{
+        actor, epoch, invocation, kv_orphan_attempt, kv_orphan_candidate, space as space_model,
+    };
+    use crate::relationships::event_order;
     use crate::storage::{
         memory::MemoryStore, HashBuffer, ImmutableReadStore, ImmutableWriteStore, StoreSize,
     };
@@ -1813,6 +1817,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn departing_writers_cannot_restore_old_claims_ahead_of_an_unrelated_orphan() {
+        let db = database().await;
+        let store = MemoryStore::default();
+        let space = space();
+        let blocked = upload(&store, &space, b"departing writers").await;
+        seed_crashed_attempts(&db, &space, blocked, 1024).await;
+        let mut live = register(&db, &[(space.clone(), blocked)], "live-0").await;
+
+        let healthy = upload(&store, &space, b"unrelated orphan").await;
+        register(&db, &[(space.clone(), healthy)], "healthy").await;
+        kv_orphan_attempt::Entity::update_many()
+            .col_expr(
+                kv_orphan_attempt::Column::CreatedAt,
+                Expr::value(time::OffsetDateTime::now_utc() - Duration::hours(1)),
+            )
+            .filter(kv_orphan_attempt::Column::Value.eq(healthy))
+            .exec(&db)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            drain_candidates_for_interval(&db, &store, ORPHAN_GRACE)
+                .await
+                .unwrap(),
+            0
+        );
+        for index in 1..=2 {
+            let next = format!("live-{index}");
+            let successor = register(&db, &[(space.clone(), blocked)], &next).await;
+            refund_failed(&db, &store, &live, &format!("live-{}", index - 1))
+                .await
+                .unwrap();
+            live = successor;
+            // A departure wakes old claims while the successor still protects
+            // their blob. It must not make them outrank a different orphan.
+            drain_candidates_for_interval(&db, &store, ORPHAN_GRACE)
+                .await
+                .unwrap();
+        }
+        assert!(
+            !store.contains(&space, &healthy, 0).await.unwrap(),
+            "repeated live writer departures must not starve an unrelated hash"
+        );
+        assert!(store.contains(&space, &blocked, 0).await.unwrap());
+        refund_failed(&db, &store, &live, "live-2").await.unwrap();
+    }
+
+    #[tokio::test]
     async fn retried_deletes_cannot_hide_healthy_orphans_across_ticks() {
         use sea_orm::ActiveValue::Set;
         let db = database().await;
@@ -2171,6 +2223,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn postgres_committing_writer_does_not_reprioritize_deferred_orphans() {
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_committing_writer_does_not_reprioritize_deferred_orphans",
+        )
+        .await
+        else {
+            return;
+        };
+        let store = MemoryStore::default();
+        let space = space();
+        let blocked = upload(&store, &space, b"PG protected backlog").await;
+        seed_crashed_attempts(&fixture.conn, &space, blocked, 256).await;
+        register(&fixture.conn, &[(space.clone(), blocked)], "committing").await;
+        assert_eq!(
+            collect_candidates(&fixture.conn, &store, 256, ORPHAN_GRACE)
+                .await
+                .unwrap(),
+            0
+        );
+
+        let healthy = upload(&store, &space, b"PG unrelated orphan").await;
+        register(&fixture.conn, &[(space.clone(), healthy)], "healthy").await;
+        kv_orphan_attempt::Entity::update_many()
+            .col_expr(
+                kv_orphan_attempt::Column::CreatedAt,
+                Expr::value(time::OffsetDateTime::now_utc() - Duration::hours(1)),
+            )
+            .filter(kv_orphan_attempt::Column::Value.eq(healthy))
+            .exec(&fixture.conn)
+            .await
+            .unwrap();
+
+        let actor_id = "did:key:gc-fairness".to_owned();
+        actor::Entity::insert(actor::ActiveModel {
+            id: sea_orm::ActiveValue::Set(actor_id.clone()),
+        })
+        .exec(&fixture.conn)
+        .await
+        .unwrap();
+        space_model::Entity::insert(space_model::ActiveModel {
+            id: sea_orm::ActiveValue::Set(SpaceIdWrap(space.clone())),
+        })
+        .exec(&fixture.conn)
+        .await
+        .unwrap();
+        invocation::Entity::insert(invocation::ActiveModel {
+            id: sea_orm::ActiveValue::Set(hash(b"invocation")),
+            invoker: sea_orm::ActiveValue::Set(actor_id),
+            issued_at: sea_orm::ActiveValue::Set(time::OffsetDateTime::now_utc()),
+            facts: sea_orm::ActiveValue::Set(None),
+            serialization: sea_orm::ActiveValue::Set(vec![1]),
+        })
+        .exec(&fixture.conn)
+        .await
+        .unwrap();
+        epoch::Entity::insert(epoch::ActiveModel {
+            seq: sea_orm::ActiveValue::Set(1),
+            id: sea_orm::ActiveValue::Set(hash(b"epoch")),
+            space: sea_orm::ActiveValue::Set(SpaceIdWrap(space.clone())),
+        })
+        .exec(&fixture.conn)
+        .await
+        .unwrap();
+        event_order::Entity::insert(event_order::ActiveModel {
+            seq: sea_orm::ActiveValue::Set(1),
+            epoch: sea_orm::ActiveValue::Set(hash(b"epoch")),
+            epoch_seq: sea_orm::ActiveValue::Set(1),
+            event: sea_orm::ActiveValue::Set(hash(b"invocation")),
+            space: sea_orm::ActiveValue::Set(SpaceIdWrap(space.clone())),
+        })
+        .exec(&fixture.conn)
+        .await
+        .unwrap();
+
+        let tx = fixture.conn.begin().await.unwrap();
+        lock_candidates(&tx, &[(space.clone(), blocked, 0)], "committing")
+            .await
+            .unwrap();
+        tx.execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "INSERT INTO kv_write (space, key, invocation, seq, epoch, epoch_seq, value, metadata)
+             VALUES ($1, 'a', $2, 1, $3, 1, $4, '{}')",
+            [
+                space.to_string().into(),
+                Vec::<u8>::from(hash(b"invocation")).into(),
+                Vec::<u8>::from(hash(b"epoch")).into(),
+                Vec::<u8>::from(blocked).into(),
+            ],
+        ))
+        .await
+        .unwrap();
+        finish_candidates(&tx, &[(space.clone(), blocked, 0)], "committing")
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        assert_eq!(
+            collect_candidates(&fixture.conn, &store, 1, ORPHAN_GRACE)
+                .await
+                .unwrap(),
+            1,
+            "a writer's commit cannot restore old claims ahead of an unrelated orphan"
+        );
+        assert!(!store.contains(&space, &healthy, 0).await.unwrap());
+        assert!(store.contains(&space, &blocked, 0).await.unwrap());
+    }
+
+    #[tokio::test]
     async fn postgres_failed_attempt_cannot_erase_another_durable_registration() {
         let Some(fixture) = crate::test_support::PostgresTestSchema::new(
             "postgres_failed_attempt_cannot_erase_another_durable_registration",
@@ -2453,6 +2613,43 @@ mod tests {
         );
         assert!(!inner.contains(&space, &expired, 0).await.unwrap());
         assert_eq!(inner.total_size(&space).await.unwrap(), Some(0));
+
+        let blocked = upload(&inner, &space, b"mysql-departing-writers").await;
+        seed_crashed_attempts(&db, &space, blocked, 256).await;
+        let live = register(&db, &[(space.clone(), blocked)], "mysql-live").await;
+        assert_eq!(
+            collect_candidates(&db, &store, 256, ORPHAN_GRACE)
+                .await
+                .unwrap(),
+            0
+        );
+        let healthy = upload(&inner, &space, b"mysql-independent-orphan").await;
+        register(&db, &[(space.clone(), healthy)], "mysql-healthy").await;
+        kv_orphan_attempt::Entity::update_many()
+            .col_expr(
+                kv_orphan_attempt::Column::CreatedAt,
+                Expr::value(time::OffsetDateTime::now_utc() - Duration::hours(1)),
+            )
+            .filter(kv_orphan_attempt::Column::Value.eq(healthy))
+            .exec(&db)
+            .await
+            .unwrap();
+        let successor = register(&db, &[(space.clone(), blocked)], "mysql-successor").await;
+        refund_failed(&db, &store, &live, "mysql-live")
+            .await
+            .unwrap();
+        assert_eq!(
+            collect_candidates(&db, &store, 1, ORPHAN_GRACE)
+                .await
+                .unwrap(),
+            1,
+            "a departing MySQL writer cannot starve a different hash"
+        );
+        assert!(!inner.contains(&space, &healthy, 0).await.unwrap());
+        assert!(inner.contains(&space, &blocked, 0).await.unwrap());
+        refund_failed(&db, &store, &successor, "mysql-successor")
+            .await
+            .unwrap();
         db.close().await.unwrap();
         admin
             .execute(Statement::from_string(
