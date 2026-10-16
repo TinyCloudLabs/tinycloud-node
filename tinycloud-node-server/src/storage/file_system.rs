@@ -3,7 +3,7 @@ use super::TestPause;
 use super::{size::SpaceSizes, BlobGenerationKey, BlobOperationLocks};
 use core::pin::Pin;
 use futures::{
-    future::{Either as AsyncEither, TryFutureExt},
+    future::Either as AsyncEither,
     io::{AsyncWrite, AsyncWriteExt},
     stream::TryStreamExt,
     task::{Context, Poll},
@@ -42,6 +42,9 @@ pub struct FileSystemStore {
     // or failed publish leaves a conservative charge until cleanup confirms
     // that neither the stage nor the final object remains.
     pending: Arc<Mutex<HashMap<BlobGenerationKey, u64>>>,
+    // Paths and charges from the same boot listing as `sizes`. A later upload
+    // reservation for the same hash is a separate charge, not a replacement.
+    boot_stages: Arc<Mutex<HashMap<PathBuf, u64>>>,
     operations: BlobOperationLocks,
     #[cfg(test)]
     before_memory_write: TestPause,
@@ -55,12 +58,13 @@ pub struct FileSystemStore {
 
 impl FileSystemStore {
     async fn new(path: PathBuf) -> Result<Self, IoError> {
-        // get the size of the directory
-        let sizes = store_sizes(&path).await?.into();
+        // Count each stage and its enclosing space from one listing snapshot.
+        let (sizes, boot_stages) = store_sizes(&path).await?;
         Ok(Self {
             path,
-            sizes,
+            sizes: sizes.into(),
             pending: Arc::new(Mutex::new(HashMap::new())),
+            boot_stages: Arc::new(Mutex::new(boot_stages)),
             operations: BlobOperationLocks::default(),
             #[cfg(test)]
             before_memory_write: Arc::new(Mutex::new(None)),
@@ -106,6 +110,31 @@ impl FileSystemStore {
             .remove(&(space.clone(), hash, generation));
     }
 
+    async fn refund_pending(&self, space: &SpaceId, hash: Hash, generation: i64) {
+        let reserved = self
+            .pending
+            .lock()
+            .await
+            .remove(&(space.clone(), hash, generation))
+            .unwrap_or(0);
+        if reserved != 0 {
+            self.decrement_size(space, reserved).await;
+        }
+    }
+
+    async fn discard_failed_stage(
+        &self,
+        space: &SpaceId,
+        hash: Hash,
+        generation: i64,
+        path: tempfile::TempPath,
+    ) -> Result<(), IoError> {
+        // Do not refund a reservation until its unpublished bytes are gone.
+        path.close()?;
+        self.refund_pending(space, hash, generation).await;
+        Ok(())
+    }
+
     fn stage_prefix(path: &Path) -> String {
         format!(
             ".tc-stage-{}-",
@@ -123,17 +152,18 @@ impl FileSystemStore {
         space: &SpaceId,
         path: &Path,
         refund_each: bool,
-    ) -> Result<u64, IoError> {
+    ) -> Result<(u64, u64), IoError> {
         let Some(parent) = path.parent() else {
-            return Ok(0);
+            return Ok((0, 0));
         };
         let mut entries = match tokio::fs::read_dir(parent).await {
             Ok(entries) => entries,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(0),
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok((0, 0)),
             Err(error) => return Err(error),
         };
         let prefix = Self::stage_prefix(path);
         let mut removed = 0u64;
+        let mut boot_refunded = 0u64;
         while let Some(entry) = entries.next_entry().await? {
             if !entry.file_name().to_string_lossy().starts_with(&prefix)
                 || !entry.file_type().await?.is_file()
@@ -141,7 +171,8 @@ impl FileSystemStore {
                 continue;
             }
             let size = entry.metadata().await?.len();
-            match remove_file(entry.path()).await {
+            let stage_path = entry.path();
+            match remove_file(&stage_path).await {
                 Ok(()) => {
                     removed = removed
                         .checked_add(size)
@@ -151,15 +182,32 @@ impl FileSystemStore {
                         entered.notify_one();
                         release.notified().await;
                     }
-                    if refund_each {
-                        self.decrement_size(space, size).await;
+                    let counted_at_boot = self
+                        .boot_stages
+                        .lock()
+                        .await
+                        .remove(&stage_path)
+                        .unwrap_or(0);
+                    boot_refunded = boot_refunded
+                        .checked_add(counted_at_boot)
+                        .ok_or_else(|| IoError::other("boot stage byte count overflow"))?;
+                    if counted_at_boot != 0 || refund_each {
+                        self.decrement_size(
+                            space,
+                            if counted_at_boot != 0 {
+                                counted_at_boot
+                            } else {
+                                size
+                            },
+                        )
+                        .await;
                     }
                 }
                 Err(error) if error.kind() == ErrorKind::NotFound => {}
                 Err(error) => return Err(error),
             }
         }
-        Ok(removed)
+        Ok((removed, boot_refunded))
     }
 
     async fn persist_temp(
@@ -180,9 +228,17 @@ impl FileSystemStore {
         let size = file.size().await?;
         self.reserve(space, hash, generation, size).await;
         let (_, path) = file.into_inner();
-        path.persist(self.get_path(space, &hash, generation))?;
-        self.settle(space, hash, generation).await;
-        Ok(())
+        match path.persist(self.get_path(space, &hash, generation)) {
+            Ok(()) => {
+                self.settle(space, hash, generation).await;
+                Ok(())
+            }
+            Err(PathPersistError { error, path }) => {
+                self.discard_failed_stage(space, hash, generation, path)
+                    .await?;
+                Err(error.into())
+            }
+        }
     }
 
     async fn persist_memory(
@@ -212,9 +268,16 @@ impl FileSystemStore {
         let target = self.get_path(space, &hash, generation);
         // Stage on the target filesystem so the final rename is atomic and
         // never depends on a cross-device copy.
-        let staged = tempfile::Builder::new()
+        let staged = match tempfile::Builder::new()
             .prefix(&Self::stage_prefix(&target))
-            .tempfile_in(target.parent().expect("blob path has a parent"))?;
+            .tempfile_in(target.parent().expect("blob path has a parent"))
+        {
+            Ok(staged) => staged,
+            Err(error) => {
+                self.refund_pending(space, hash, generation).await;
+                return Err(error.into());
+            }
+        };
         let (file, path) = staged.into_parts();
         #[cfg(test)]
         let pause = self.before_memory_write.lock().await.take();
@@ -224,12 +287,28 @@ impl FileSystemStore {
             release.notified().await;
         }
         let mut writer = File::from_std(file).compat();
-        writer.write_all(&bytes).await?;
-        writer.flush().await?;
+        let written = async {
+            writer.write_all(&bytes).await?;
+            writer.flush().await
+        }
+        .await;
         drop(writer);
-        path.persist(target)?;
-        self.settle(space, hash, generation).await;
-        Ok(())
+        if let Err(error) = written {
+            self.discard_failed_stage(space, hash, generation, path)
+                .await?;
+            return Err(error.into());
+        }
+        match path.persist(target) {
+            Ok(()) => {
+                self.settle(space, hash, generation).await;
+                Ok(())
+            }
+            Err(PathPersistError { error, path }) => {
+                self.discard_failed_stage(space, hash, generation, path)
+                    .await?;
+                Err(error.into())
+            }
+        }
     }
 }
 
@@ -360,49 +439,72 @@ impl StoreSize for FileSystemStore {
 }
 
 // get the sum size of all files in this directory (recurse into subdirectories with space ID names)
-async fn store_sizes<P: AsRef<Path>>(path: &P) -> Result<HashMap<SpaceId, u64>, IoError> {
+async fn store_sizes<P: AsRef<Path>>(
+    path: &P,
+) -> Result<(HashMap<SpaceId, u64>, HashMap<PathBuf, u64>), IoError> {
     ReadDirStream::new(tokio::fs::read_dir(path).await?)
         // for every entry in the store dir
-        .try_fold(HashMap::new(), |mut acc, entry| async move {
-            // if its a directory and the suffix is a valid string
-            if let (true, Ok(ref suffix)) = (
-                entry.metadata().await?.is_dir(),
-                entry.file_name().into_string(),
-            ) {
-                let mut ds = ReadDirStream::new(tokio::fs::read_dir(entry.path()).await?);
-                let did: DIDBuf = ["did:", suffix.as_str()].concat().parse().map_err(|_| {
-                    IoError::new(ErrorKind::InvalidData, format!("Invalid DID: {suffix}"))
-                })?;
-                // go through each suffix directory
-                while let Some(entry) = ds.try_next().await? {
-                    // for each entry in the suffix directory
-                    // if its a directory and the name is a valid string
-                    if let (true, Ok(name)) = (
-                        entry.metadata().await?.is_dir(),
-                        entry.file_name().into_string(),
-                    ) {
-                        // get the space ID from suffix and name
-                        let space =
-                            SpaceId::new(did.clone(), name.try_into().map_err(IoError::other)?);
-                        let size = space_size(&entry.path()).await?;
-                        acc.insert(space, size);
+        .try_fold(
+            (HashMap::new(), HashMap::new()),
+            |(mut acc, mut stages), entry| async move {
+                // if its a directory and the suffix is a valid string
+                if let (true, Ok(ref suffix)) = (
+                    entry.metadata().await?.is_dir(),
+                    entry.file_name().into_string(),
+                ) {
+                    let mut ds = ReadDirStream::new(tokio::fs::read_dir(entry.path()).await?);
+                    let did: DIDBuf = ["did:", suffix.as_str()].concat().parse().map_err(|_| {
+                        IoError::new(ErrorKind::InvalidData, format!("Invalid DID: {suffix}"))
+                    })?;
+                    // go through each suffix directory
+                    while let Some(entry) = ds.try_next().await? {
+                        // for each entry in the suffix directory
+                        // if its a directory and the name is a valid string
+                        if let (true, Ok(name)) = (
+                            entry.metadata().await?.is_dir(),
+                            entry.file_name().into_string(),
+                        ) {
+                            // get the space ID from suffix and name
+                            let space =
+                                SpaceId::new(did.clone(), name.try_into().map_err(IoError::other)?);
+                            let (size, space_stages) = space_size(&entry.path()).await?;
+                            acc.insert(space, size);
+                            stages.extend(space_stages);
+                        }
                     }
-                }
-            };
-            Ok(acc)
-        })
+                };
+                Ok((acc, stages))
+            },
+        )
         .await
 }
 
-async fn space_size<P: AsRef<Path>>(path: &P) -> Result<u64, IoError> {
-    // get the sum size of all files in this directory (do not recurse into subdirectories)
+async fn space_size<P: AsRef<Path>>(path: &P) -> Result<(u64, HashMap<PathBuf, u64>), IoError> {
+    // This one directory listing establishes both the charged total and the
+    // exact incomplete stages which contributed to that total at boot.
     ReadDirStream::new(tokio::fs::read_dir(path).await?)
-        .try_fold(0, |acc, entry| async move {
-            entry
-                .metadata()
-                .map_ok(|m| if m.is_dir() { acc } else { acc + m.len() })
-                .await
-        })
+        .try_fold(
+            (0u64, HashMap::new()),
+            |(acc, mut stages), entry| async move {
+                let metadata = entry.metadata().await?;
+                if metadata.is_dir() {
+                    return Ok((acc, stages));
+                }
+                let size = metadata.len();
+                if metadata.is_file()
+                    && entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.starts_with(".tc-stage-"))
+                {
+                    stages.insert(entry.path(), size);
+                }
+                let total = acc
+                    .checked_add(size)
+                    .ok_or_else(|| IoError::other("space byte count overflow"))?;
+                Ok((total, stages))
+            },
+        )
         .await
 }
 
@@ -547,38 +649,51 @@ impl ImmutableDeleteStore for FileSystemStore {
         id: &Hash,
         generation: i64,
     ) -> Result<Option<()>, Self::Error> {
-        let key = (space.clone(), *id, generation);
-        let _operation = self.operations.lock(key.clone()).await;
-        let path = self.get_path(space, id, generation);
-        let pending = self.pending.lock().await.contains_key(&key);
-        // A crash can leave a named, incomplete memory stage. Boot counted
-        // its actual bytes; a live reservation instead counted its full size.
-        let staged = self.remove_stages(space, &path, !pending).await?;
-        let final_size = match metadata(&path).await {
-            Ok(meta) => Some(meta.len()),
-            Err(error) if error.kind() == ErrorKind::NotFound => None,
-            Err(error) => return Err(error.into()),
-        };
-        let removed_final = if let Some(size) = final_size {
-            match remove_file(&path).await {
-                Ok(()) => Some(size),
+        let store = self.clone();
+        let space = space.clone();
+        let id = *id;
+        // Finish unlink and quota settlement under the same physical lock
+        // even if the request or collector is cancelled after unlink.
+        tokio::spawn(async move {
+            let key = (space.clone(), id, generation);
+            let _operation = store.operations.lock(key.clone()).await;
+            let path = store.get_path(&space, &id, generation);
+            let pending = store.pending.lock().await.contains_key(&key);
+            // Boot stages and a new reservation are independently charged.
+            let (staged, boot_refunded) = store.remove_stages(&space, &path, !pending).await?;
+            let final_size = match metadata(&path).await {
+                Ok(meta) => Some(meta.len()),
                 Err(error) if error.kind() == ErrorKind::NotFound => None,
                 Err(error) => return Err(error.into()),
+            };
+            let removed_final = if let Some(size) = final_size {
+                match remove_file(&path).await {
+                    Ok(()) => Some(size),
+                    Err(error) if error.kind() == ErrorKind::NotFound => None,
+                    Err(error) => return Err(error.into()),
+                }
+            } else {
+                None
+            };
+            if pending {
+                let reserved = store.pending.lock().await.remove(&key).unwrap_or(0);
+                store
+                    .decrement_size(
+                        &space,
+                        reserved.max(
+                            staged
+                                .saturating_sub(boot_refunded)
+                                .saturating_add(removed_final.unwrap_or(0)),
+                        ),
+                    )
+                    .await;
+            } else if let Some(size) = removed_final {
+                store.decrement_size(&space, size).await;
             }
-        } else {
-            None
-        };
-        if pending {
-            let reserved = self.pending.lock().await.remove(&key).unwrap_or(0);
-            self.decrement_size(
-                space,
-                reserved.max(staged.saturating_add(removed_final.unwrap_or(0))),
-            )
-            .await;
-        } else if let Some(size) = removed_final {
-            self.decrement_size(space, size).await;
-        }
-        Ok((removed_final.is_some() || staged != 0).then_some(()))
+            Ok::<_, FileSystemStoreError>((removed_final.is_some() || staged != 0).then_some(()))
+        })
+        .await
+        .map_err(IoError::other)?
     }
     async fn cleanup_stages(
         &self,
@@ -605,6 +720,9 @@ impl ImmutableDeleteStore for FileSystemStore {
             store
                 .remove_stages(&space, &store.get_path(&space, &id, generation), !pending)
                 .await?;
+            if pending {
+                store.refund_pending(&space, id, generation).await;
+            }
             Ok::<(), FileSystemStoreError>(())
         })
         .await
@@ -779,6 +897,162 @@ mod test {
         reopened.remove(&space, &hash, 0).await.unwrap();
         assert_eq!(reopened.total_size(&space).await.unwrap(), Some(0));
         assert!(!stage_path.exists());
+    }
+
+    #[tokio::test]
+    async fn cancelled_delete_finishes_boot_stage_refund_before_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileSystemConfig::new(dir.path()).open().await.unwrap();
+        let space: SpaceId = "tinycloud:key:test:cancel-stage".parse().unwrap();
+        store.create(&space).await.unwrap();
+        let value = tinycloud_core::hash::hash(b"cancelled stage delete");
+        let target = store.get_path(&space, &value, 0);
+        let mut stage = tempfile::Builder::new()
+            .prefix(&FileSystemStore::stage_prefix(&target))
+            .tempfile_in(target.parent().unwrap())
+            .unwrap();
+        std::io::Write::write_all(&mut stage, b"partial").unwrap();
+        let stage_path = stage.path().to_path_buf();
+        stage.into_temp_path().keep().unwrap();
+        drop(store);
+        let store = FileSystemConfig::new(dir.path()).open().await.unwrap();
+        assert_eq!(store.total_size(&space).await.unwrap(), Some(7));
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        *store.after_stage_unlink.lock().await = Some((entered.clone(), release.clone()));
+        let deleting_store = store.clone();
+        let deleting_space = space.clone();
+        let deletion =
+            tokio::spawn(async move { deleting_store.remove(&deleting_space, &value, 0).await });
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        assert!(!stage_path.exists());
+        deletion.abort();
+        assert!(deletion.await.unwrap_err().is_cancelled());
+        release.notify_one();
+        assert_eq!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                store.remove(&space, &value, 0)
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+            None
+        );
+        assert_eq!(store.total_size(&space).await.unwrap(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn boot_counted_stage_and_failed_retry_refund_both_charges_once() {
+        use tinycloud_core::sea_orm::{
+            ConnectionTrait, Database, DbBackend, Statement, TransactionTrait,
+        };
+        use tinycloud_core::sea_orm_migration::MigratorTrait;
+        use tinycloud_core::{hash::hash, kv_orphans, migrations::Migrator};
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        db.execute_unprepared("PRAGMA foreign_keys = OFF")
+            .await
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileSystemConfig::new(dir.path()).open().await.unwrap();
+        let space: SpaceId = "tinycloud:key:test:stage-and-reservation".parse().unwrap();
+        store.create(&space).await.unwrap();
+        let bytes = b"retrying the same hash after a crash";
+        let value = hash(bytes);
+        let blob = [(space.clone(), value)];
+        let tx = db.begin().await.unwrap();
+        kv_orphans::register_candidates(&tx, &blob, "crashed-a")
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let target = store.get_path(&space, &value, 0);
+        let mut stage = tempfile::Builder::new()
+            .prefix(&FileSystemStore::stage_prefix(&target))
+            .tempfile_in(target.parent().unwrap())
+            .unwrap();
+        std::io::Write::write_all(&mut stage, b"partial").unwrap();
+        let boot_stage = stage.path().to_path_buf();
+        stage.into_temp_path().keep().unwrap();
+        drop(store);
+        let store = FileSystemConfig::new(dir.path()).open().await.unwrap();
+        assert_eq!(store.total_size(&space).await.unwrap(), Some(7));
+
+        let tx = db.begin().await.unwrap();
+        let failed = kv_orphans::register_candidates(&tx, &blob, "failed-b")
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        *store.before_memory_write.lock().await = Some((entered.clone(), release));
+        let mut retry = HashBuffer::new(Vec::new());
+        retry.write_all(bytes).await.unwrap();
+        let uploading_store = store.clone();
+        let uploading_space = space.clone();
+        let uploading = tokio::spawn(async move {
+            ImmutableWriteStore::<memory::MemoryStaging>::persist(
+                &uploading_store,
+                &uploading_space,
+                retry,
+                0,
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        assert_eq!(
+            store.total_size(&space).await.unwrap(),
+            Some(7 + bytes.len() as u64)
+        );
+        uploading.abort();
+        assert!(uploading.await.unwrap_err().is_cancelled());
+        kv_orphans::refund_failed(&db, &store, &failed, "failed-b")
+            .await
+            .unwrap();
+
+        let unrelated = b"other";
+        let mut other_stage = HashBuffer::new(Vec::new());
+        other_stage.write_all(unrelated).await.unwrap();
+        let other =
+            ImmutableWriteStore::<memory::MemoryStaging>::persist(&store, &space, other_stage, 0)
+                .await
+                .unwrap();
+        db.execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE kv_orphan_attempt SET created_at = ? WHERE attempt_id = ?",
+            [
+                (time::OffsetDateTime::now_utc() - time::Duration::minutes(6)).into(),
+                "crashed-a".into(),
+            ],
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            kv_orphans::collect_candidates(&db, &store, 256, kv_orphans::ORPHAN_GRACE)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(!boot_stage.exists());
+        assert!(!store.contains(&space, &value, 0).await.unwrap());
+        assert_eq!(
+            store.read_to_vec(&space, &other, 0).await.unwrap(),
+            Some(unrelated.to_vec())
+        );
+        assert_eq!(store.total_size(&space).await.unwrap(), Some(5));
+        assert_eq!(
+            kv_orphans::collect_candidates(&db, &store, 256, kv_orphans::ORPHAN_GRACE)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(store.total_size(&space).await.unwrap(), Some(5));
     }
 
     #[tokio::test]
@@ -1010,10 +1284,26 @@ mod test {
                 .await
                 .is_err()
         );
-        assert_eq!(store.total_size(&space).await.unwrap(), Some(12));
+        assert_eq!(store.total_size(&space).await.unwrap(), Some(0));
         assert_eq!(store.remove(&space, &hash, 0).await.unwrap(), None);
         assert!(!store.contains(&space, &hash, 0).await.unwrap());
         assert_eq!(store.total_size(&space).await.unwrap(), Some(0));
+
+        let mut staged = HashBuffer::new(
+            TempFileSystemStage
+                .get_staging_buffer(&space)
+                .await
+                .unwrap(),
+        );
+        staged.write_all(b"failed-stage").await.unwrap();
+        let staged_hash = staged.hash();
+        assert!(
+            ImmutableWriteStore::<TempFileSystemStage>::persist(&store, &space, staged, 0)
+                .await
+                .is_err()
+        );
+        assert_eq!(store.total_size(&space).await.unwrap(), Some(0));
+        assert_eq!(store.remove(&space, &staged_hash, 0).await.unwrap(), None);
     }
 
     #[tokio::test]
