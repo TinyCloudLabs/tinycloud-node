@@ -1,4 +1,8 @@
 //! Exercise tenant policy against the real native service and process streams.
+//! WITH-body writes also exercise the real service's touched-table persistence
+//! consumer, including durable rehydration after authorized Query execution.
+//! Restricted invocations fail closed on unsupported analysis shapes; these
+//! controls do not claim HTTP delegation-chain caveat verification.
 #![cfg(feature = "duckdb")]
 
 use std::{process::Command, sync::Arc};
@@ -180,6 +184,263 @@ async fn invocation_template_is_not_authority_to_execute_ddl_with_read_ability()
     assert_eq!(result.rows, vec![vec![DuckDbValue::Integer(0)]]);
 }
 
+#[tokio::test]
+async fn with_prefixed_writes_require_authority_and_persist_query_write_targets() {
+    use tinycloud_auth::resource::SpaceId;
+    use tinycloud_core::{
+        database_artifacts::{DatabaseArtifactRepository, SeaOrmDatabaseArtifactRepository},
+        duckdb::{service::DuckDbService, types::DuckDbError},
+        migrations::Migrator,
+        sea_orm::{ConnectOptions, Database},
+        sea_orm_migration::MigratorTrait,
+        write_hooks::TouchedTables,
+    };
+
+    async fn rows(service: &DuckDbService, space: &SpaceId, sql: &str) -> Vec<Vec<DuckDbValue>> {
+        let result = service
+            .execute(
+                space,
+                "nested",
+                DuckDbRequest::Query {
+                    sql: sql.into(),
+                    params: vec![],
+                },
+                None,
+                "tinycloud.duckdb/read".into(),
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(
+            result.write_targets.is_empty(),
+            "ordinary reads must not persist"
+        );
+        let DuckDbResponse::Query(result) = result.response else {
+            panic!("query response required");
+        };
+        result.rows
+    }
+
+    fn statement(insert: bool, analyze: bool, id: i64, value: i64) -> String {
+        let sql = if insert {
+            format!(
+                "WITH change AS (SELECT {id} AS id, {value} AS value) \
+                 INSERT INTO policy_rows SELECT id, value FROM change"
+            )
+        } else {
+            format!(
+                "WITH change AS (SELECT {value} AS value) \
+                 UPDATE policy_rows SET value = (SELECT value FROM change) WHERE id = 1"
+            )
+        };
+        if analyze {
+            format!("EXPLAIN ANALYZE {sql}")
+        } else {
+            sql
+        }
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let database = Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
+        .await
+        .unwrap();
+    Migrator::up(&database, None).await.unwrap();
+    let repository = Arc::new(SeaOrmDatabaseArtifactRepository::new(database));
+    let space = SpaceId::new(
+        "did:pkh:eip155:1:0x6464646464646464646464646464646464646464"
+            .parse()
+            .unwrap(),
+        "tc1304".parse().unwrap(),
+    );
+    let service = DuckDbService::new(
+        directory.path().to_string_lossy().into_owned(),
+        u64::MAX,
+        300,
+        "128MB".into(),
+        repository.clone(),
+    );
+    for sql in [
+        "CREATE TABLE policy_rows (id INTEGER, value INTEGER)",
+        "INSERT INTO policy_rows VALUES (1, 7)",
+    ] {
+        service
+            .execute(
+                &space,
+                "nested",
+                DuckDbRequest::Execute {
+                    sql: sql.into(),
+                    params: vec![],
+                    schema: None,
+                },
+                None,
+                "tinycloud.duckdb/write".into(),
+                false,
+            )
+            .await
+            .unwrap();
+    }
+    let data_sql = "SELECT id, value FROM policy_rows ORDER BY id";
+    let catalog_sql = "SELECT table_name, column_name, data_type FROM information_schema.columns \
+                       WHERE table_schema = 'main' ORDER BY table_name, ordinal_position";
+    let before_rows = rows(&service, &space, data_sql).await;
+    let before_catalog = rows(&service, &space, catalog_sql).await;
+    let before_artifact = repository
+        .load("duckdb", &space.to_string(), "nested")
+        .await
+        .unwrap()
+        .unwrap();
+    let mut violations = Vec::new();
+    for analyze in [false, true] {
+        for insert in [false, true] {
+            let sql = statement(insert, analyze, 2, 99);
+            for (ability, read_only) in [
+                ("tinycloud.duckdb/read", false),
+                ("tinycloud.duckdb/write", true),
+                ("tinycloud.duckdb/admin", true),
+            ] {
+                for mode in ["raw", "exact", "named"] {
+                    let caveats = (read_only || mode != "raw").then(|| DuckDbCaveats {
+                        read_only: read_only.then_some(true),
+                        statements: (mode != "raw").then(|| {
+                            vec![PreparedStatement {
+                                name: "tenant".into(),
+                                sql: sql.clone(),
+                            }]
+                        }),
+                        ..Default::default()
+                    });
+                    // Query is intentional: EXPLAIN ANALYZE executes while
+                    // returning a plan, so native execute() errors cannot
+                    // masquerade as an authorization rejection.
+                    let request = if mode == "named" {
+                        DuckDbRequest::ExecuteStatement {
+                            name: "tenant".into(),
+                            params: vec![],
+                        }
+                    } else {
+                        DuckDbRequest::Query {
+                            sql: sql.clone(),
+                            params: vec![],
+                        }
+                    };
+                    let result = service
+                        .execute(&space, "nested", request, caveats, ability.into(), false)
+                        .await;
+                    if !matches!(
+                        &result,
+                        Err(DuckDbError::PermissionDenied(_) | DuckDbError::ReadOnlyViolation)
+                    ) {
+                        violations.push(format!(
+                            "{ability} readOnly={read_only} {mode} {sql}: {result:?}"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(rows(&service, &space, data_sql).await, before_rows);
+    assert_eq!(rows(&service, &space, catalog_sql).await, before_catalog);
+    let denied_artifact = repository
+        .load("duckdb", &space.to_string(), "nested")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(denied_artifact.revision, before_artifact.revision);
+    assert_eq!(denied_artifact.payload, before_artifact.payload);
+    assert_eq!(denied_artifact.delta_payload, before_artifact.delta_payload);
+    assert!(violations.is_empty(), "{}", violations.join("\n"));
+
+    let mut expected = before_rows;
+    let mut next_id = 2;
+    let mut next_value = 10;
+    for ability in ["tinycloud.duckdb/write", "tinycloud.duckdb/admin"] {
+        for analyze in [false, true] {
+            for insert in [false, true] {
+                for mode in ["raw", "exact", "named"] {
+                    // Named plans use the legacy execute response path; test
+                    // executing plans through Query, not its native row error.
+                    if analyze && mode == "named" {
+                        continue;
+                    }
+                    let sql = statement(insert, analyze, next_id, next_value);
+                    let caveats = (mode != "raw").then(|| DuckDbCaveats {
+                        statements: Some(vec![PreparedStatement {
+                            name: "tenant".into(),
+                            sql: sql.clone(),
+                        }]),
+                        ..Default::default()
+                    });
+                    let request = if mode == "named" {
+                        DuckDbRequest::ExecuteStatement {
+                            name: "tenant".into(),
+                            params: vec![],
+                        }
+                    } else {
+                        DuckDbRequest::Query {
+                            sql,
+                            params: vec![],
+                        }
+                    };
+                    let prior = repository
+                        .load("duckdb", &space.to_string(), "nested")
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let result = service
+                        .execute(&space, "nested", request, caveats, ability.into(), false)
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        result.write_targets,
+                        vec![TouchedTables::supported(vec!["policy_rows".into()])],
+                        "{ability} {mode} analyze={analyze} insert={insert}"
+                    );
+                    if mode != "named" {
+                        let DuckDbResponse::Query(result) = result.response else {
+                            panic!("query response required");
+                        };
+                        assert!(!result.columns.is_empty());
+                        assert!(!result.rows.is_empty());
+                        assert_eq!(result.row_count, result.rows.len());
+                    }
+                    if insert {
+                        expected.push(vec![
+                            DuckDbValue::Integer(next_id),
+                            DuckDbValue::Integer(next_value),
+                        ]);
+                        next_id += 1;
+                    } else {
+                        expected[0][1] = DuckDbValue::Integer(next_value);
+                    }
+                    next_value += 1;
+                    assert_eq!(rows(&service, &space, data_sql).await, expected);
+                    let persisted = repository
+                        .load("duckdb", &space.to_string(), "nested")
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert!(
+                        persisted.revision > prior.revision,
+                        "Query-body writes must reach the persistence consumer"
+                    );
+                    // A fresh service/cache reads only durable state, not the
+                    // writing actor's live connection or its local database.
+                    let hydrated_directory = tempfile::tempdir().unwrap();
+                    let hydrated = DuckDbService::new(
+                        hydrated_directory.path().to_string_lossy().into_owned(),
+                        u64::MAX,
+                        300,
+                        "128MB".into(),
+                        repository.clone(),
+                    );
+                    assert_eq!(rows(&hydrated, &space, data_sql).await, expected);
+                }
+            }
+        }
+    }
+    assert_eq!(rows(&service, &space, catalog_sql).await, before_catalog);
+}
+
 fn assert_connection_policy(connection: &duckdb::Connection) {
     let settings: (bool, bool, bool, bool, Option<String>) = connection
         .query_row(
@@ -355,4 +616,299 @@ async fn executing_explain_template_still_requires_the_wrapped_write_ability() {
         panic!("query response required");
     };
     assert_eq!(result.rows, vec![vec![DuckDbValue::Integer(2)]]);
+}
+
+#[tokio::test]
+async fn restricted_invocations_fail_closed_on_unsupported_sql_shapes_without_changing_data() {
+    use tinycloud_auth::resource::SpaceId;
+    use tinycloud_core::{
+        database_artifacts::{DatabaseArtifactRepository, SeaOrmDatabaseArtifactRepository},
+        duckdb::{
+            service::DuckDbService,
+            types::{DuckDbError, DuckDbExecutionResult},
+        },
+        migrations::Migrator,
+        sea_orm::{ConnectOptions, Database},
+        sea_orm_migration::MigratorTrait,
+        write_hooks::TouchedTables,
+    };
+
+    async fn run(
+        service: &DuckDbService,
+        space: &SpaceId,
+        sql: &str,
+        caveats: Option<DuckDbCaveats>,
+        ability: &str,
+    ) -> DuckDbExecutionResult {
+        service
+            .execute(
+                space,
+                "restrictions",
+                DuckDbRequest::Query {
+                    sql: sql.into(),
+                    params: vec![],
+                },
+                caveats,
+                ability.into(),
+                false,
+            )
+            .await
+            .unwrap()
+    }
+
+    fn query_rows(result: DuckDbExecutionResult) -> Vec<Vec<DuckDbValue>> {
+        let DuckDbResponse::Query(result) = result.response else {
+            panic!("native Query response required");
+        };
+        assert_eq!(result.row_count, result.rows.len());
+        result.rows
+    }
+
+    fn restrictions(scope: &str) -> DuckDbCaveats {
+        DuckDbCaveats {
+            tables: (scope != "columns").then(|| vec!["safe_rows".into(), "sink_rows".into()]),
+            columns: (scope != "tables").then(|| vec!["id".into()]),
+            ..Default::default()
+        }
+    }
+
+    const READ: &str = "tinycloud.duckdb/read";
+    const WRITE: &str = "tinycloud.duckdb/write";
+    const ADMIN: &str = "tinycloud.duckdb/admin";
+    const SECRET: &str = "tc1304_synthetic_excluded_service_value";
+    let directory = tempfile::tempdir().unwrap();
+    let database = Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
+        .await
+        .unwrap();
+    Migrator::up(&database, None).await.unwrap();
+    let repository = Arc::new(SeaOrmDatabaseArtifactRepository::new(database));
+    let space = SpaceId::new(
+        "did:pkh:eip155:1:0x6464646464646464646464646464646464646464"
+            .parse()
+            .unwrap(),
+        "tc1304".parse().unwrap(),
+    );
+    let service = DuckDbService::new(
+        directory.path().to_string_lossy().into_owned(),
+        u64::MAX,
+        300,
+        "128MB".into(),
+        repository.clone(),
+    );
+    for sql in [
+        "CREATE TABLE safe_rows (id INTEGER, value TEXT)".to_string(),
+        "CREATE TABLE private_rows (id INTEGER, secret TEXT)".into(),
+        "CREATE TABLE sink_rows (id INTEGER, value TEXT)".into(),
+        format!("INSERT INTO safe_rows VALUES (1, '{SECRET}')"),
+        format!("INSERT INTO private_rows VALUES (1, '{SECRET}')"),
+    ] {
+        service
+            .execute(
+                &space,
+                "restrictions",
+                DuckDbRequest::Execute {
+                    sql,
+                    params: vec![],
+                    schema: None,
+                },
+                None,
+                WRITE.into(),
+                false,
+            )
+            .await
+            .unwrap();
+    }
+    for scope in ["tables", "columns", "both"] {
+        assert_eq!(
+            query_rows(
+                run(
+                    &service,
+                    &space,
+                    "SELECT id FROM safe_rows",
+                    Some(restrictions(scope)),
+                    READ,
+                )
+                .await
+            ),
+            vec![vec![DuckDbValue::Integer(1)]],
+            "simple supported restricted SELECT must remain valid"
+        );
+        for sql in [
+            "INSERT INTO sink_rows (id) VALUES (2)",
+            "UPDATE sink_rows SET id = 3 WHERE id = 2",
+            "DELETE FROM sink_rows WHERE id = 3",
+        ] {
+            run(&service, &space, sql, Some(restrictions(scope)), WRITE).await;
+        }
+        assert!(
+            query_rows(run(&service, &space, "SELECT id FROM sink_rows", None, READ).await)
+                .is_empty(),
+            "supported restricted literal DML changed semantics"
+        );
+    }
+    let snapshot_sql = "SELECT 'safe' AS source, id, value FROM safe_rows \
+                        UNION ALL SELECT 'private', id, secret FROM private_rows \
+                        UNION ALL SELECT 'sink', id, value FROM sink_rows ORDER BY source, id";
+    let catalog_sql = "SELECT table_name, column_name, data_type FROM information_schema.columns \
+                       WHERE table_schema = 'main' ORDER BY table_name, ordinal_position";
+    let before_rows = query_rows(run(&service, &space, snapshot_sql, None, READ).await);
+    let before_catalog = query_rows(run(&service, &space, catalog_sql, None, READ).await);
+    let before_artifact = repository
+        .load("duckdb", &space.to_string(), "restrictions")
+        .await
+        .unwrap()
+        .unwrap();
+    let cases = [
+        (
+            "derived SELECT",
+            "SELECT id FROM (SELECT id FROM safe_rows) AS nested",
+            false,
+            false,
+        ),
+        (
+            "scalar subquery",
+            "SELECT (SELECT secret FROM private_rows WHERE id = 1) AS id",
+            false,
+            true,
+        ),
+        (
+            "projection alias",
+            "SELECT value AS id FROM safe_rows",
+            false,
+            true,
+        ),
+        (
+            "table alias",
+            "SELECT owned.id FROM safe_rows AS owned",
+            false,
+            false,
+        ),
+        (
+            "INSERT SELECT",
+            "INSERT INTO sink_rows SELECT id, secret FROM private_rows",
+            true,
+            false,
+        ),
+        (
+            "CTE",
+            "WITH owned AS (SELECT secret AS id FROM private_rows) SELECT id FROM owned",
+            false,
+            true,
+        ),
+    ];
+    let mut violations = Vec::new();
+    for scope in ["tables", "columns", "both"] {
+        for (label, sql, writes, _) in cases {
+            let abilities: &[&str] = if writes { &[WRITE, ADMIN] } else { &[READ] };
+            for ability in abilities {
+                for mode in ["raw", "exact", "named"] {
+                    let mut caveats = restrictions(scope);
+                    if mode != "raw" {
+                        caveats.statements = Some(vec![PreparedStatement {
+                            name: "tenant".into(),
+                            sql: sql.into(),
+                        }]);
+                    }
+                    let request = if mode == "named" {
+                        DuckDbRequest::ExecuteStatement {
+                            name: "tenant".into(),
+                            params: vec![],
+                        }
+                    } else {
+                        DuckDbRequest::Query {
+                            sql: sql.into(),
+                            params: vec![],
+                        }
+                    };
+                    let result = service
+                        .execute(
+                            &space,
+                            "restrictions",
+                            request,
+                            Some(caveats),
+                            (*ability).into(),
+                            false,
+                        )
+                        .await;
+                    if !matches!(&result, Err(DuckDbError::PermissionDenied(_))) {
+                        violations.push(format!("{scope} {label} {ability} {mode}: {result:?}"));
+                    }
+                    if let Ok(result) = result {
+                        if let DuckDbResponse::Query(result) = result.response {
+                            assert!(
+                                !result
+                                    .rows
+                                    .iter()
+                                    .flatten()
+                                    .any(|value| value == &DuckDbValue::Text(SECRET.into())),
+                                "excluded synthetic data returned by {scope} {label} {mode}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(
+        query_rows(run(&service, &space, snapshot_sql, None, READ).await),
+        before_rows,
+        "denied shapes must not materialize excluded data"
+    );
+    assert_eq!(
+        query_rows(run(&service, &space, catalog_sql, None, READ).await),
+        before_catalog
+    );
+    let after_artifact = repository
+        .load("duckdb", &space.to_string(), "restrictions")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after_artifact.revision, before_artifact.revision);
+    assert_eq!(after_artifact.payload, before_artifact.payload);
+    assert_eq!(after_artifact.delta_payload, before_artifact.delta_payload);
+    assert!(violations.is_empty(), "{}", violations.join("\n"));
+
+    // These are restrictions on invocation-controlled facts, not a claim that
+    // HTTP delegation-chain caveats were independently verified (TC-1307).
+    // Without restrictions the same owned-data SQL and native results remain.
+    for (label, sql, writes, returns_secret) in cases {
+        let result = run(
+            &service,
+            &space,
+            sql,
+            None,
+            if writes { WRITE } else { READ },
+        )
+        .await;
+        if writes {
+            assert_eq!(
+                result.write_targets,
+                vec![TouchedTables::supported(vec!["sink_rows".into()])]
+            );
+            assert_eq!(
+                query_rows(
+                    run(
+                        &service,
+                        &space,
+                        "SELECT id, value FROM sink_rows",
+                        None,
+                        READ
+                    )
+                    .await
+                ),
+                vec![vec![
+                    DuckDbValue::Integer(1),
+                    DuckDbValue::Text(SECRET.into())
+                ]],
+                "unrestricted INSERT SELECT must preserve actual materialization"
+            );
+        } else {
+            let expected = if returns_secret {
+                DuckDbValue::Text(SECRET.into())
+            } else {
+                DuckDbValue::Integer(1)
+            };
+            assert_eq!(query_rows(result), vec![vec![expected]], "{label}");
+        }
+    }
 }

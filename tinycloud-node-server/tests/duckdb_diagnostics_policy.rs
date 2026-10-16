@@ -8,6 +8,8 @@
 //!
 //! This deliberately uses production INFO logging (`normal`). DEBUG/TRACE
 //! application-log redaction is independent N2 work, not this native-sink test.
+//! WITH-body write controls cover signed read/readOnly authority and executing
+//! plans. File auditing includes data/, exempting only native storage artifacts.
 #![cfg(feature = "duckdb")]
 
 use std::{
@@ -438,10 +440,16 @@ impl Node {
                 self.file_canary.display()
             ));
         }
-        // Persistent application databases legitimately contain the successful
-        // literal/bound rows. Everything else under our fresh cwd/HOME/TMPDIR,
-        // including unknown/default diagnostic filenames, is scanned in full.
-        scan_owned_files(root, &root.join("data"), &self.canaries, violations)?;
+        // Only exact native database/WAL paths and content-addressed block
+        // artifacts for this synthetic space are exempt. Recurse into data/
+        // too: a default diagnostic filename there is not application storage.
+        scan_owned_files(
+            root,
+            &root.join("data"),
+            &Account::synthetic()?.space,
+            &self.canaries,
+            violations,
+        )?;
         Ok(())
     }
 }
@@ -456,22 +464,64 @@ fn contains_bytes(bytes: &[u8], needle: &[u8]) -> bool {
     bytes.windows(needle.len()).any(|window| window == needle)
 }
 
+fn is_native_storage_artifact(path: &FsPath, data: &FsPath, space: &SpaceId) -> bool {
+    if ["caps.db", "caps.db-wal", "caps.db-shm", "caps.db-journal"]
+        .iter()
+        .any(|name| path == data.join(name))
+    {
+        return true;
+    }
+    let cache = data.join("duckdb").join(space.to_string());
+    let physical = tinycloud_core::database_identity::logical_name(Some(DATABASE));
+    if [
+        format!("{physical}.duckdb"),
+        format!("{physical}.duckdb.wal"),
+    ]
+    .iter()
+    .any(|name| path == cache.join(name))
+    {
+        return true;
+    }
+    let blocks = data
+        .join("blocks")
+        .join(space.suffix())
+        .join(space.name().as_str());
+    if path.parent() != Some(blocks.as_path()) {
+        return false;
+    }
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Ok(bytes) = base64::decode_config(name, base64::URL_SAFE) else {
+        return false;
+    };
+    base64::encode_config(&bytes, base64::URL_SAFE) == name
+        && tinycloud_core::hash::Hash::try_from(bytes).is_ok()
+}
+
 fn scan_owned_files(
     directory: &FsPath,
     data: &FsPath,
+    space: &SpaceId,
     canaries: &[String],
     violations: &mut Vec<String>,
 ) -> Result<()> {
     for entry in std::fs::read_dir(directory)? {
         let entry = entry?;
         let path = entry.path();
-        if path == data {
-            continue;
-        }
         let kind = entry.file_type()?;
         if kind.is_dir() {
-            scan_owned_files(&path, data, canaries, violations)?;
+            scan_owned_files(&path, data, space, canaries, violations)?;
         } else if kind.is_file() {
+            if is_native_storage_artifact(&path, data, space) {
+                continue;
+            }
+            if path.starts_with(data) {
+                violations.push(format!(
+                    "unexpected non-storage file under owned data directory: {}",
+                    path.display()
+                ));
+            }
             let contents = std::fs::read(&path)?;
             for canary in canaries {
                 if contains_bytes(&contents, canary.as_bytes()) {
@@ -488,6 +538,78 @@ fn scan_owned_files(
             ));
         }
     }
+    Ok(())
+}
+
+#[test]
+fn owned_file_audit_scans_data_without_reading_native_storage_artifacts() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path();
+    let data = root.join("data");
+    let space = Account::synthetic()?.space;
+    let marker = "tc1304_synthetic_file_audit_canary";
+    let canaries = vec![marker.into()];
+    let physical = tinycloud_core::database_identity::logical_name(Some(DATABASE));
+    let block_name = base64::encode_config(
+        Vec::<u8>::from(tinycloud_core::hash::hash(marker.as_bytes())),
+        base64::URL_SAFE,
+    );
+    let native = [
+        data.join("caps.db"),
+        data.join("caps.db-wal"),
+        data.join("caps.db-shm"),
+        data.join("caps.db-journal"),
+        data.join("duckdb")
+            .join(space.to_string())
+            .join(format!("{physical}.duckdb")),
+        data.join("duckdb")
+            .join(space.to_string())
+            .join(format!("{physical}.duckdb.wal")),
+        data.join("blocks")
+            .join(space.suffix())
+            .join(space.name().as_str())
+            .join(block_name),
+    ];
+    for path in &native {
+        std::fs::create_dir_all(path.parent().context("native artifact parent")?)?;
+        std::fs::write(path, marker)?;
+    }
+    let mut violations = Vec::new();
+    scan_owned_files(root, &data, &space, &canaries, &mut violations)?;
+    ensure!(
+        violations.is_empty(),
+        "native storage must not be scanned for legitimate stored rows"
+    );
+
+    // Unknown files, even with a database suffix or empty contents, must not
+    // disappear merely because they live below the application data root.
+    for (name, contents) in [
+        ("duckdb_profile.json", marker),
+        ("decoy.duckdb", marker),
+        ("empty_profile.json", ""),
+    ] {
+        std::fs::write(data.join(name), contents)?;
+    }
+    std::fs::create_dir_all(data.join("nested"))?;
+    std::fs::write(data.join("nested/diagnostics.log"), marker)?;
+    scan_owned_files(root, &data, &space, &canaries, &mut violations)?;
+    for name in [
+        "duckdb_profile.json",
+        "decoy.duckdb",
+        "empty_profile.json",
+        "diagnostics.log",
+    ] {
+        ensure!(
+            violations.iter().any(|violation| violation.contains(name)),
+            "owned data diagnostic escaped file audit: {name}"
+        );
+    }
+    ensure!(
+        violations.iter().any(|violation| {
+            violation.contains("diagnostics.log") && violation.contains(marker)
+        }),
+        "nested data files must be content-scanned too"
+    );
     Ok(())
 }
 
@@ -777,6 +899,347 @@ fn signed_tenant_tiers_cannot_activate_native_diagnostic_sinks() -> Result<()> {
         );
         let settings = node.rows(&reader, "SELECT current_setting('enable_external_access'), current_setting('lock_configuration'), CAST(current_setting('enable_logging') AS BOOLEAN)", json!([]))?;
         ensure!(settings == json!([[false, true, false]]), "native connection did not keep external access/logging off and configuration locked: {settings}");
+        Ok(())
+    })();
+    let audit = node.audit(&mut violations);
+    result?;
+    audit?;
+    ensure!(violations.is_empty(), "{}", violations.join("\n"));
+    Ok(())
+}
+
+#[test]
+fn signed_with_prefixed_writes_and_executing_plans_require_write_authority() -> Result<()> {
+    fn statement(insert: bool, analyze: bool, id: i64, value: i64) -> String {
+        let sql = if insert {
+            format!(
+                "WITH change AS (SELECT {id} AS id, {value} AS value) \
+                 INSERT INTO nested_rows SELECT id, value FROM change"
+            )
+        } else {
+            format!(
+                "WITH change AS (SELECT {value} AS value) \
+                 UPDATE nested_rows SET value = (SELECT value FROM change) WHERE id = 1"
+            )
+        };
+        if analyze {
+            format!("EXPLAIN ANALYZE {sql}")
+        } else {
+            sql
+        }
+    }
+
+    let mut node = Node::start()?;
+    let mut violations = Vec::new();
+    let result = (|| -> Result<()> {
+        let (reader, writer, admin) = signed_sessions(&node)?;
+        safe_controls(&mut node, &reader, &writer, &admin)?;
+        for sql in [
+            "CREATE TABLE nested_rows (id INTEGER, value INTEGER)",
+            "INSERT INTO nested_rows VALUES (1, 7)",
+        ] {
+            node.invoke(&writer, WRITE, &execute(sql), None)?
+                .ok("nested-write fixture")?;
+        }
+        let data_sql = "SELECT id, value FROM nested_rows ORDER BY id";
+        let catalog_sql =
+            "SELECT table_name, column_name, data_type FROM information_schema.columns \
+                           WHERE table_schema = 'main' ORDER BY table_name, ordinal_position";
+        let before_rows = node.rows(&reader, data_sql, json!([]))?;
+        let before_catalog = node.rows(&reader, catalog_sql, json!([]))?;
+        for analyze in [false, true] {
+            for insert in [false, true] {
+                let sql = statement(insert, analyze, 2, 99);
+                for (session, ability, read_only) in [
+                    (&reader, READ, false),
+                    (&writer, WRITE, true),
+                    (&admin, ADMIN, true),
+                ] {
+                    for mode in ["raw", "exact", "named"] {
+                        let facts = if read_only {
+                            let mut caveats = json!({"readOnly": true});
+                            if mode != "raw" {
+                                caveats["statements"] = json!([{"name": "tenant", "sql": sql}]);
+                            }
+                            Some(vec![json!({"duckdbCaveats": caveats})])
+                        } else if mode != "raw" {
+                            Some(template(&sql))
+                        } else {
+                            None
+                        };
+                        // Raw/exact executing plans MUST use Query. Native
+                        // execute() may reject a returned plan after a write;
+                        // that is neither policy denial nor absence of effect.
+                        let body = if mode == "named" {
+                            named(json!([]))
+                        } else {
+                            query(&sql, json!([]))
+                        };
+                        let reply = node.invoke(session, ability, &body, facts)?;
+                        require_denial(
+                            &format!("{ability} readOnly={read_only} {mode} {sql}"),
+                            reply,
+                            &mut violations,
+                        );
+                    }
+                }
+            }
+        }
+        ensure!(
+            node.rows(&reader, data_sql, json!([]))? == before_rows,
+            "rejected WITH-prefixed writes changed real row data"
+        );
+        ensure!(
+            node.rows(&reader, catalog_sql, json!([]))? == before_catalog,
+            "rejected WITH-prefixed writes changed the native catalog"
+        );
+
+        let mut expected = vec![json!([1, 7])];
+        let mut next_id = 2;
+        let mut next_value = 10;
+        for (session, ability) in [(&writer, WRITE), (&admin, ADMIN)] {
+            for analyze in [false, true] {
+                for insert in [false, true] {
+                    for mode in ["raw", "exact", "named"] {
+                        // Named templates retain the execute response path.
+                        // Positive executing-plan controls use Query instead.
+                        if analyze && mode == "named" {
+                            continue;
+                        }
+                        let sql = statement(insert, analyze, next_id, next_value);
+                        let facts = (mode != "raw").then(|| template(&sql));
+                        let body = if mode == "named" {
+                            named(json!([]))
+                        } else {
+                            query(&sql, json!([]))
+                        };
+                        let result = node.invoke(session, ability, &body, facts)?.ok(&format!(
+                            "authorized {ability} {mode} analyze={analyze} insert={insert}"
+                        ))?;
+                        if mode != "named" {
+                            ensure!(
+                                result["columns"]
+                                    .as_array()
+                                    .is_some_and(|columns| !columns.is_empty())
+                                    && result["rows"]
+                                        .as_array()
+                                        .is_some_and(|rows| !rows.is_empty()),
+                                "authorized Query must return native row/plan results: {result}"
+                            );
+                            ensure!(
+                                result["rowCount"].as_u64()
+                                    == result["rows"].as_array().map(|rows| rows.len() as u64),
+                                "authorized Query lost its real row count"
+                            );
+                        }
+                        if insert {
+                            expected.push(json!([next_id, next_value]));
+                            next_id += 1;
+                        } else {
+                            expected[0] = json!([1, next_value]);
+                        }
+                        next_value += 1;
+                        ensure!(
+                            node.rows(&reader, data_sql, json!([]))? == json!(expected),
+                            "authorized WITH-prefixed write did not change real row data"
+                        );
+                    }
+                }
+            }
+        }
+        ensure!(
+            node.rows(&reader, catalog_sql, json!([]))? == before_catalog,
+            "authorized DML changed catalog definitions"
+        );
+        Ok(())
+    })();
+    // Preserve stream, result, request-log and file canary controls even when
+    // an authorization or native-result assertion reports a failure.
+    let audit = node.audit(&mut violations);
+    result?;
+    audit?;
+    ensure!(violations.is_empty(), "{}", violations.join("\n"));
+    Ok(())
+}
+
+#[test]
+fn signed_restricted_invocations_fail_closed_on_unsupported_sql_shapes() -> Result<()> {
+    fn restrictions(scope: &str) -> Value {
+        let mut caveats = json!({});
+        if scope != "columns" {
+            caveats["tables"] = json!(["safe_rows", "sink_rows"]);
+        }
+        if scope != "tables" {
+            caveats["columns"] = json!(["id"]);
+        }
+        caveats
+    }
+
+    let mut node = Node::start()?;
+    let mut violations = Vec::new();
+    let result = (|| -> Result<()> {
+        let (reader, writer, admin) = signed_sessions(&node)?;
+        safe_controls(&mut node, &reader, &writer, &admin)?;
+        let secret = node.canaries[1].clone();
+        for sql in [
+            "CREATE TABLE private_rows (id INTEGER, secret TEXT)".to_string(),
+            "CREATE TABLE sink_rows (id INTEGER, value TEXT)".into(),
+            format!("INSERT INTO private_rows VALUES (1, '{secret}')"),
+        ] {
+            node.invoke(&writer, WRITE, &execute(&sql), None)?
+                .ok("restricted-shape fixture")?;
+        }
+        for scope in ["tables", "columns", "both"] {
+            let facts = Some(vec![json!({"duckdbCaveats": restrictions(scope)})]);
+            let selected = node
+                .invoke(
+                    &reader,
+                    READ,
+                    &query("SELECT id FROM safe_rows", json!([])),
+                    facts.clone(),
+                )?
+                .ok("simple supported restricted SELECT")?;
+            ensure!(
+                selected["rows"] == json!([[1]]),
+                "simple restricted SELECT changed its actual result"
+            );
+            for sql in [
+                "INSERT INTO sink_rows (id) VALUES (2)",
+                "UPDATE sink_rows SET id = 3 WHERE id = 2",
+                "DELETE FROM sink_rows WHERE id = 3",
+            ] {
+                node.invoke(&writer, WRITE, &query(sql, json!([])), facts.clone())?
+                    .ok("simple supported restricted literal DML")?;
+            }
+            ensure!(
+                node.rows(&reader, "SELECT id FROM sink_rows", json!([]))? == json!([]),
+                "simple restricted literal DML changed semantics"
+            );
+        }
+        let snapshot_sql = "SELECT 'safe' AS source, id, value FROM safe_rows \
+                            UNION ALL SELECT 'private', id, secret FROM private_rows \
+                            UNION ALL SELECT 'sink', id, value FROM sink_rows ORDER BY source, id";
+        let catalog_sql =
+            "SELECT table_name, column_name, data_type FROM information_schema.columns \
+                           WHERE table_schema = 'main' ORDER BY table_name, ordinal_position";
+        let before_rows = node.rows(&reader, snapshot_sql, json!([]))?;
+        let before_catalog = node.rows(&reader, catalog_sql, json!([]))?;
+        let cases = [
+            (
+                "derived SELECT",
+                "SELECT id FROM (SELECT id FROM safe_rows) AS nested",
+                false,
+                false,
+            ),
+            (
+                "scalar subquery",
+                "SELECT (SELECT secret FROM private_rows WHERE id = 1) AS id",
+                false,
+                true,
+            ),
+            (
+                "projection alias",
+                "SELECT value AS id FROM safe_rows",
+                false,
+                true,
+            ),
+            (
+                "table alias",
+                "SELECT owned.id FROM safe_rows AS owned",
+                false,
+                false,
+            ),
+            (
+                "INSERT SELECT",
+                "INSERT INTO sink_rows SELECT id, secret FROM private_rows",
+                true,
+                false,
+            ),
+            (
+                "CTE",
+                "WITH owned AS (SELECT secret AS id FROM private_rows) SELECT id FROM owned",
+                false,
+                true,
+            ),
+        ];
+        for scope in ["tables", "columns", "both"] {
+            for (label, sql, writes, _) in cases {
+                for (session, ability) in [(&reader, READ), (&writer, WRITE), (&admin, ADMIN)] {
+                    if (writes && ability == READ) || (!writes && ability != READ) {
+                        continue;
+                    }
+                    for mode in ["raw", "exact", "named"] {
+                        let mut caveats = restrictions(scope);
+                        if mode != "raw" {
+                            caveats["statements"] = json!([{"name": "tenant", "sql": sql}]);
+                        }
+                        let body = if mode == "named" {
+                            named(json!([]))
+                        } else {
+                            query(sql, json!([]))
+                        };
+                        let reply = node.invoke(
+                            session,
+                            ability,
+                            &body,
+                            Some(vec![json!({"duckdbCaveats": caveats})]),
+                        )?;
+                        ensure!(
+                            !reply.body.contains(&secret),
+                            "excluded synthetic data returned by {scope} {label} {mode}"
+                        );
+                        require_denial(
+                            &format!("restricted {scope} {label} {ability} {mode}"),
+                            reply,
+                            &mut violations,
+                        );
+                    }
+                }
+            }
+        }
+        ensure!(
+            node.rows(&reader, snapshot_sql, json!([]))? == before_rows,
+            "denied shapes materialized excluded data or changed stored rows"
+        );
+        ensure!(
+            node.rows(&reader, catalog_sql, json!([]))? == before_catalog,
+            "denied shapes changed native catalog definitions"
+        );
+
+        // Invocation-fact enforcement only: this deliberately makes no claim
+        // about HTTP delegation-chain caveat verification (tracked in TC-1307).
+        // Unrestricted signed invocations keep the same owned-data SQL/results.
+        for (label, sql, writes, returns_secret) in cases {
+            let (session, ability) = if writes {
+                (&writer, WRITE)
+            } else {
+                (&reader, READ)
+            };
+            let result = node
+                .invoke(session, ability, &query(sql, json!([])), None)?
+                .ok(&format!("unrestricted {label}"))?;
+            if writes {
+                ensure!(
+                    node.rows(&reader, "SELECT id, value FROM sink_rows", json!([]))?
+                        == json!([[1, secret]]),
+                    "unrestricted INSERT SELECT did not retain real materialization"
+                );
+            } else {
+                let expected = if returns_secret {
+                    json!([[secret]])
+                } else {
+                    json!([[1]])
+                };
+                ensure!(
+                    result["rows"] == expected,
+                    "unrestricted {label} actual result changed"
+                );
+            }
+        }
+        ensure!(
+            node.rows(&reader, catalog_sql, json!([]))? == before_catalog,
+            "ordinary unrestricted SQL changed catalog definitions"
+        );
         Ok(())
     })();
     let audit = node.audit(&mut violations);

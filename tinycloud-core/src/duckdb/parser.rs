@@ -3,6 +3,7 @@ use std::ops::ControlFlow;
 use sqlparser::ast::*;
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
+use sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
 
 use super::caveats::DuckDbCaveats;
 use super::types::DuckDbError;
@@ -137,16 +138,234 @@ fn check_diagnostic_statements(statements: &[Statement]) -> Result<(), DuckDbErr
     Ok(())
 }
 
+// TC-1308 gates broader restricted-SQL support. Until binding/lineage analysis
+// exists, admit only shapes whose referenced names are explicit and unaliased.
+struct RestrictedSqlPolicy<'a> {
+    caveats: &'a DuckDbCaveats,
+    queries_left: usize,
+}
+
+impl Visitor for RestrictedSqlPolicy<'_> {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<()> {
+        if self.queries_left == 0 || query.with.is_some() {
+            return ControlFlow::Break(());
+        }
+        self.queries_left -= 1;
+        match &*query.body {
+            SetExpr::Select(select) => {
+                for item in &select.projection {
+                    match item {
+                        SelectItem::ExprWithAlias { .. } => return ControlFlow::Break(()),
+                        SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _)
+                            if self.caveats.columns.is_some() =>
+                        {
+                            return ControlFlow::Break(());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            SetExpr::Values(_) => {}
+            _ => return ControlFlow::Break(()),
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_relation(&mut self, relation: &ObjectName) -> ControlFlow<()> {
+        if self.caveats.is_table_allowed(&relation.to_string()) {
+            ControlFlow::Continue(())
+        } else {
+            ControlFlow::Break(())
+        }
+    }
+
+    fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<()> {
+        match factor {
+            TableFactor::Table {
+                alias: None,
+                args: None,
+                ..
+            } => ControlFlow::Continue(()),
+            _ => ControlFlow::Break(()),
+        }
+    }
+
+    fn pre_visit_expr(&mut self, expression: &Expr) -> ControlFlow<()> {
+        let allowed = match expression {
+            Expr::Identifier(identifier) => self.caveats.is_column_allowed(&identifier.value),
+            Expr::CompoundIdentifier(identifiers) => identifiers
+                .last()
+                .is_some_and(|identifier| self.caveats.is_column_allowed(&identifier.value)),
+            // Without binding, a function may be a stored macro with hidden reads.
+            Expr::Function(_) => false,
+            _ => true,
+        };
+        if allowed {
+            ControlFlow::Continue(())
+        } else {
+            ControlFlow::Break(())
+        }
+    }
+
+    fn pre_visit_statement(&mut self, statement: &Statement) -> ControlFlow<()> {
+        let supported = match statement {
+            Statement::Query(_)
+            | Statement::Explain { .. }
+            | Statement::StartTransaction { .. }
+            | Statement::Commit { .. }
+            | Statement::Rollback { .. } => true,
+            Statement::Insert {
+                source,
+                columns,
+                returning,
+                on,
+                ..
+            } => {
+                returning.is_none()
+                    && on.is_none()
+                    && source
+                        .as_ref()
+                        .is_none_or(|query| matches!(&*query.body, SetExpr::Values(_)))
+                    && (self.caveats.columns.is_none() || !columns.is_empty())
+                    && columns
+                        .iter()
+                        .all(|column| self.caveats.is_column_allowed(&column.value))
+            }
+            Statement::Update { returning, .. } | Statement::Delete { returning, .. } => {
+                returning.is_none()
+            }
+            _ => false,
+        };
+        if supported {
+            ControlFlow::Continue(())
+        } else {
+            ControlFlow::Break(())
+        }
+    }
+}
+
+fn restricted_query_allowance(statement: &Statement) -> usize {
+    match statement {
+        Statement::Explain { statement, .. } => restricted_query_allowance(statement),
+        Statement::Query(_) => 1,
+        Statement::Insert {
+            source: Some(_), ..
+        } => 1,
+        _ => 0,
+    }
+}
+
+fn check_restricted_sql(
+    statements: &[Statement],
+    caveats: &Option<DuckDbCaveats>,
+) -> Result<(), DuckDbError> {
+    let Some(caveats) = caveats
+        .as_ref()
+        .filter(|caveats| caveats.tables.is_some() || caveats.columns.is_some())
+    else {
+        return Ok(());
+    };
+    for statement in statements {
+        let mut policy = RestrictedSqlPolicy {
+            caveats,
+            queries_left: restricted_query_allowance(statement),
+        };
+        if statement.visit(&mut policy).is_break() {
+            return Err(DuckDbError::PermissionDenied(
+                "Restricted SQL shape is not supported by the node policy".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Validates persisted tenant SQL without executing it or granting an ability.
 pub(crate) fn validate_diagnostic_sql(sql: &str) -> Result<(), DuckDbError> {
-    let statements = Parser::parse_sql(&GenericDialect {}, sql).map_err(|_| {
+    let invalid = || {
         DuckDbError::PermissionDenied(
             "Stored SQL does not satisfy the node statement policy".into(),
         )
-    })?;
+    };
+    let dialect = GenericDialect {};
+    let mut tokens = Tokenizer::new(&dialect, sql)
+        .tokenize()
+        .map_err(|_| invalid())?;
+    normalize_stored_array_cast_types(&mut tokens);
+    let statements = Parser::new(&dialect)
+        .with_tokens(tokens)
+        .parse_statements()
+        .map_err(|_| invalid())?;
     check_diagnostic_statements(&statements)
 }
 
+// DuckDB serializes casts to fixed arrays as CAST(expr AS INTEGER[3]).
+// sqlparser 0.44 accepts INTEGER[] instead. Erase only a numeric dimension
+// inside CAST/TRY_CAST's type, never an expression, identifier or function.
+// This AST is used only for diagnostics admission; executed SQL is unchanged.
+fn normalize_stored_array_cast_types(tokens: &mut [Token]) {
+    let mut parentheses = 0usize;
+    let mut casts: Vec<(usize, bool)> = Vec::new();
+    let mut pending_cast = false;
+    for index in 0..tokens.len() {
+        match &tokens[index] {
+            Token::Whitespace(_) => continue,
+            Token::Word(word) => {
+                if word.quote_style.is_none() && word.value.eq_ignore_ascii_case("AS") {
+                    if let Some((depth, in_type)) = casts.last_mut() {
+                        if *depth == parentheses {
+                            *in_type = true;
+                        }
+                    }
+                }
+                pending_cast = word.quote_style.is_none()
+                    && (word.value.eq_ignore_ascii_case("CAST")
+                        || word.value.eq_ignore_ascii_case("TRY_CAST"));
+            }
+            Token::LParen => {
+                parentheses += 1;
+                if pending_cast {
+                    casts.push((parentheses, false));
+                }
+                pending_cast = false;
+            }
+            Token::RParen => {
+                if casts.last().is_some_and(|(depth, _)| *depth == parentheses) {
+                    casts.pop();
+                }
+                parentheses = parentheses.saturating_sub(1);
+                pending_cast = false;
+            }
+            Token::LBracket => {
+                pending_cast = false;
+                if !casts.last().is_some_and(|(_, in_type)| *in_type) {
+                    continue;
+                }
+                let significant = |start| {
+                    (start..tokens.len())
+                        .find(|&offset| !matches!(tokens[offset], Token::Whitespace(_)))
+                };
+                let Some(number) = significant(index + 1) else {
+                    continue;
+                };
+                let Some(close) = significant(number + 1) else {
+                    continue;
+                };
+                if matches!(&tokens[number], Token::Number(value, false)
+                    if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+                    && matches!(tokens[close], Token::RBracket)
+                {
+                    tokens[number] = Token::Whitespace(Whitespace::Space);
+                }
+            }
+            _ => pending_cast = false,
+        }
+    }
+}
+
+/// Validate tenant SQL against ability, diagnostic and supported caveat policy.
+/// Named invocation templates never bypass these checks.
 pub fn validate_sql(
     sql: &str,
     caveats: &Option<DuckDbCaveats>,
@@ -169,6 +388,7 @@ pub fn validate_sql(
     // Invocation-provided templates are data, never authority. Every tier and
     // every nested statement/function follows the same diagnostic boundary.
     check_diagnostic_statements(&statements)?;
+    check_restricted_sql(&statements, caveats)?;
 
     let mut tables = Vec::new();
     let mut columns = Vec::new();
@@ -228,6 +448,7 @@ pub fn validate_sql(
     })
 }
 
+/// Collect mutation targets, returning `Unsupported` for unclassifiable SQL.
 pub fn extract_write_targets(sql: &str) -> Result<WriteTargets, DuckDbError> {
     let dialect = GenericDialect {};
     let statements =
@@ -261,11 +482,48 @@ enum CollectWriteTargets {
     Unsupported,
 }
 
+// A Query is not necessarily a read: WITH-prefixed INSERT/UPDATE are stored
+// as Statement children of SetExpr. Visit those through every nested query.
+fn visit_query_statements<B>(
+    query: &Query,
+    mut visit: impl FnMut(&Statement) -> ControlFlow<B>,
+) -> ControlFlow<B> {
+    visit_statements(query, |statement| match statement {
+        Statement::Query(_) => ControlFlow::Continue(()),
+        other => visit(other),
+    })
+}
+
+fn collect_query_write_targets(
+    query: &Query,
+    tables: &mut Vec<String>,
+) -> Option<CollectWriteTargets> {
+    let mut result = None;
+    let flow = visit_query_statements(
+        query,
+        |statement| match collect_write_targets_from_statement(statement, tables) {
+            CollectWriteTargets::Supported => {
+                result = Some(CollectWriteTargets::Supported);
+                ControlFlow::Continue(())
+            }
+            CollectWriteTargets::Unsupported => ControlFlow::Break(()),
+        },
+    );
+    if flow.is_break() {
+        Some(CollectWriteTargets::Unsupported)
+    } else {
+        result
+    }
+}
+
 fn collect_write_targets_from_statement(
     stmt: &Statement,
     tables: &mut Vec<String>,
 ) -> CollectWriteTargets {
     match stmt {
+        Statement::Query(query) => {
+            collect_query_write_targets(query, tables).unwrap_or(CollectWriteTargets::Unsupported)
+        }
         Statement::Explain {
             analyze: true,
             statement,
@@ -357,9 +615,13 @@ fn classify_statement(
                 *is_ddl |= inner_ddl;
             }
         }
-        Statement::Query(_) => {
+        Statement::Query(query) => {
             extract_tables_from_statement(stmt, tables);
             extract_columns_from_statement(stmt, columns);
+            let _ = visit_query_statements(query, |statement| {
+                classify_statement(statement, tables, columns, is_read_only, is_ddl);
+                ControlFlow::<()>::Continue(())
+            });
         }
         Statement::Insert { .. } => {
             *is_read_only = false;
@@ -430,8 +692,18 @@ fn check_statement_allowed(stmt: &Statement, has_write: bool) -> Result<(), Duck
             statement,
             ..
         } => check_statement_allowed(statement, has_write),
-        // Read operations — any ability
-        Statement::Query(_) => Ok(()),
+        Statement::Query(query) => {
+            match visit_query_statements(query, |statement| {
+                match check_statement_allowed(statement, has_write) {
+                    Ok(()) => ControlFlow::Continue(()),
+                    Err(error) => ControlFlow::Break(error),
+                }
+            }) {
+                ControlFlow::Continue(()) => Ok(()),
+                ControlFlow::Break(error) => Err(error),
+            }
+        }
+        // Non-executing plans are reads.
         Statement::ExplainTable { .. } | Statement::Explain { .. } => Ok(()),
 
         // Write operations — require write ability
@@ -671,8 +943,16 @@ fn extract_columns_from_query(query: &Query, columns: &mut Vec<String>) {
     }
 }
 
+/// Describe the tables mutated by this statement, including executing wrappers.
 pub fn extract_write_targets_from_statement(stmt: &Statement) -> Option<TouchedTables> {
     match stmt {
+        Statement::Query(query) => {
+            let mut tables = Vec::new();
+            collect_query_write_targets(query, &mut tables).map(|result| match result {
+                CollectWriteTargets::Supported => TouchedTables::supported(unique_names(tables)),
+                CollectWriteTargets::Unsupported => TouchedTables::unsupported(),
+            })
+        }
         Statement::Explain {
             analyze: true,
             statement,

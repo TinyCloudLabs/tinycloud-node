@@ -13,6 +13,21 @@ pub enum StorageMode {
 /// Open a database with the native diagnostic and external-access policy locked.
 /// A missing path selects an in-memory database.
 pub fn open_connection(path: Option<&Path>, max_memory: &str) -> Result<Connection, DuckDbError> {
+    open_guarded_connection(path, Some(max_memory))
+}
+
+/// Open an offline snapshot/cache under the node's complete native admission
+/// policy, including the stored-code audit. Offline identity tooling has no
+/// trusted memory setting, so preserve DuckDB's native default rather than
+/// inventing a node limit or reading operator configuration.
+pub fn open_offline_connection(path: &Path) -> Result<Connection, DuckDbError> {
+    open_guarded_connection(Some(path), None)
+}
+
+fn open_guarded_connection(
+    path: Option<&Path>,
+    max_memory: Option<&str>,
+) -> Result<Connection, DuckDbError> {
     // External access must already be disabled during native open/WAL recovery.
     // Profiling and logging are disabled by default; their setters require a
     // live connection in DuckDB, so explicitly reset them before any catalog SQL.
@@ -58,12 +73,14 @@ fn validate_max_memory(value: &str) -> Result<(), DuckDbError> {
     Ok(())
 }
 
-fn apply_security_settings(conn: &Connection, max_memory: &str) -> Result<(), DuckDbError> {
-    validate_max_memory(max_memory)?;
+fn apply_security_settings(conn: &Connection, max_memory: Option<&str>) -> Result<(), DuckDbError> {
+    if let Some(max_memory) = max_memory {
+        validate_max_memory(max_memory)?;
+    }
 
     // All operator configuration precedes the irreversible tenant-facing lock.
     // "no_output" alone still enables profiling, so reset it instead.
-    conn.execute_batch(&format!(
+    conn.execute_batch(
         "RESET enable_profiling;\
          SET enable_logging = false;\
          SET enable_http_logging = false;\
@@ -71,23 +88,46 @@ fn apply_security_settings(conn: &Connection, max_memory: &str) -> Result<(), Du
          RESET profiling_output;\
          SET enable_external_access = false;\
          SET allow_unsigned_extensions = false;\
-         SET checkpoint_threshold = '1TB';\
-         SET max_memory = '{}';\
-         SET lock_configuration = true;",
-        max_memory
-    ))
+         SET checkpoint_threshold = '1TB';",
+    )
     .map_err(|e| DuckDbError::Internal(format!("Failed to apply security settings: {}", e)))?;
+    if let Some(max_memory) = max_memory {
+        conn.execute_batch(&format!("SET max_memory = '{}';", max_memory))
+            .map_err(|e| {
+                DuckDbError::Internal(format!("Failed to apply security settings: {}", e))
+            })?;
+    }
+    conn.execute_batch("SET lock_configuration = true;")
+        .map_err(|e| DuckDbError::Internal(format!("Failed to apply security settings: {}", e)))?;
     Ok(())
 }
 
 fn audit_stored_code(conn: &Connection) -> Result<(), DuckDbError> {
-    // Fully qualify the native system catalog: an imported user macro named
-    // duckdb_views/duckdb_functions/duckdb_tables must not run during the audit.
-    // Inspect every user definition, not just objects directly referenced by a
-    // request, so nested and recursive view/macro calls cannot hide a primitive.
-    for catalog_sql in [
-        "SELECT sql FROM system.main.duckdb_views() WHERE NOT internal",
-        "SELECT sql FROM system.main.duckdb_tables() WHERE NOT internal",
+    // Fully qualify native catalog functions so imported macros cannot run
+    // during admission. Inspect every user definition, including indirect calls.
+    //
+    // Table DDL also contains native type syntax (for example INTEGER[3]) that
+    // is not executable SQL. Audit the native catalog's typed executable fields
+    // instead: column_default includes both defaults and generated expressions;
+    // CHECK constraints expose their executable expression separately.
+    for (catalog_sql, expression) in [
+        (
+            "SELECT sql FROM system.main.duckdb_views() WHERE NOT internal",
+            false,
+        ),
+        (
+            "SELECT column_default FROM system.main.duckdb_columns() \
+             WHERE NOT internal AND column_default IS NOT NULL",
+            true,
+        ),
+        (
+            "SELECT c.expression FROM system.main.duckdb_constraints() AS c \
+             JOIN system.main.duckdb_tables() AS t \
+             ON c.database_oid = t.database_oid AND c.schema_oid = t.schema_oid \
+             AND c.table_oid = t.table_oid \
+             WHERE NOT t.internal AND c.constraint_type = 'CHECK'",
+            true,
+        ),
     ] {
         let mut stmt = conn.prepare(catalog_sql).map_err(|_| stored_code_error())?;
         let definitions = stmt
@@ -97,7 +137,12 @@ fn audit_stored_code(conn: &Connection) -> Result<(), DuckDbError> {
             let definition = definition
                 .map_err(|_| stored_code_error())?
                 .ok_or_else(stored_code_error)?;
-            validate_diagnostic_sql(&definition).map_err(|_| stored_code_error())?;
+            if expression {
+                validate_diagnostic_sql(&format!("SELECT {}", definition))
+                    .map_err(|_| stored_code_error())?;
+            } else {
+                validate_diagnostic_sql(&definition).map_err(|_| stored_code_error())?;
+            }
         }
     }
 
@@ -146,6 +191,7 @@ pub fn database_size(conn: &Connection) -> Result<u64, DuckDbError> {
     }
 }
 
+/// Promote an in-memory database through the same guarded file-open policy.
 pub fn promote_to_file(
     conn: &Connection,
     path: &Path,
@@ -161,7 +207,10 @@ pub fn promote_to_file(
 
 /// Copy all user tables and views from one connection to another.
 /// Uses Arrow record batches for fast bulk transfer.
+/// Audits all source executable definitions before copying any schema or rows.
 pub fn copy_tables(src: &Connection, dest: &Connection) -> Result<(), DuckDbError> {
+    audit_stored_code(src)?;
+
     // Get all user tables
     let mut stmt = src
         .prepare(
@@ -191,8 +240,6 @@ pub fn copy_tables(src: &Connection, dest: &Connection) -> Result<(), DuckDbErro
             .map_err(|e| {
                 DuckDbError::Internal(format!("Failed to get DDL for {}: {}", table, e))
             })?;
-
-        validate_diagnostic_sql(&create_sql).map_err(|_| stored_code_error())?;
 
         dest.execute_batch(&create_sql).map_err(|e| {
             DuckDbError::Internal(format!("Failed to create table {}: {}", table, e))
