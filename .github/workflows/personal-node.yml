@@ -37,5 +37,18 @@ jobs:
         run: npm run typecheck --prefix test/probe
       - name: Exercise the published personal-node guide
         run: bash deploy/personal-node/ci.sh
+
+  dstack-profile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: test/probe/package-lock.json
+      - name: Install pinned signing client
+        run: npm ci --prefix test/probe
       - name: Check dstack-profile local-data persistence
         run: bash deploy/personal-node/dstack-smoke.sh
