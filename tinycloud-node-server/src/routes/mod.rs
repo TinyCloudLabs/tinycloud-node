@@ -3650,6 +3650,8 @@ async fn verify_auth_admitted(
 
 #[cfg(test)]
 mod tests {
+    mod revocation_scope;
+
     use super::*;
     use crate::{
         config::{Config, HooksConfig},
@@ -5672,6 +5674,21 @@ mod tests {
             wallet_pkh.parse::<DIDBuf>()?,
             "control".parse().expect("valid space name"),
         );
+        abilities::ActiveModel {
+            delegation: Set(wallet_child_id),
+            resource: Set(Resource::TinyCloud(
+                wallet_control_space.clone().to_resource(
+                    "kv".parse()?,
+                    Some("notes/status".parse()?),
+                    None,
+                    None,
+                ),
+            )),
+            ability: Set(Ability::try_from("tinycloud.kv/get".to_string())?),
+            caveats: Set(Default::default()),
+        }
+        .insert(&conn)
+        .await?;
         let control_resource = Resource::TinyCloud(wallet_control_space.clone().to_resource(
             "delegation".parse()?,
             None,
