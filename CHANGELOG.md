@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Tighten revocation scope checks (TC-1302).
+
 ## [1.20.6] - 2026-10-14
 
 A security fix (TC-1080, Part A). UCAN issuer resolution no longer dereferences network DID methods by default, so a request can't make the node fetch arbitrary or internal hosts through a crafted issuer DID (#284).
