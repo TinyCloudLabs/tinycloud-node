@@ -150,35 +150,35 @@ With telemetry enabled, backend time-to-first-byte is recorded under the `server
 
 ## Quickstart
 
-To run TinyCloud Protocol locally, install [Rustup](https://rustup.rs). The
-repository selects the reviewed Rust `1.97.1` toolchain automatically through
-`rust-toolchain.toml`; do not substitute a floating `stable` compiler.
+For a self-hosted HTTPS deployment with persistent data, unique identity,
+backup/restore, and a verified upgrade path, follow the
+[personal-node guide](deploy/personal-node/README.md). The source-checkout
+example below is for local development only. It deliberately requires a unique
+key: the shipped configuration no longer contains a usable key.
 
+Install [Rustup](https://rustup.rs); `rust-toolchain.toml` selects Rust 1.97.1.
+Provision a private key file once and retain it across restarts:
 
-You will need to create a directory for TinyCloud Protocol to store data in:
 ```bash
-mkdir data
+umask 077
+mkdir -p data/blocks
+openssl rand -base64 48 | tr '+/' '-_' | tr -d '=\n' > node.key
+TINYCLOUD_KEYS__SECRET="$(cat node.key)" cargo run
 ```
 
-Within this directory, create one more directories `blocks` and a database file `caps.db`:
-```bash
-mkdir data/blocks
-touch data/caps.db
-```
+Keep `node.key` out of git, back it up separately from the data directory, and
+do not replace it during an upgrade: derived node identities and sealed data
+depend on it. `TINYCLOUD_KEYS__TYPE=Dstack` remains an explicit alternative
+only for a properly configured dstack TEE.
 
-To setup local data storage you can also run `./scripts/init-tinycloud-data.sh`
+For an existing node, do **not** generate a new root during upgrade. Recover
+the installation's original key from its private backup or its existing
+operator configuration, provide that same root explicitly, and compare the
+public node identity and encrypted/sealed data before accepting the upgrade.
+If the original root is unavailable, stop: a replacement is a different node
+identity and does not recover data sealed under the prior root. Changing the
+identity also invalidates trust bindings that refer to its DID or public keys.
 
-You will then need to set the environment variables to point to those directories:
-```bash
-export TINYCLOUD_STORAGE_BLOCKS_PATH="data/blocks"
-export TINYCLOUD_STORAGE_DATABASE="data/caps.db"
-```
-
-Finally you can run TinyCloud Protocol using `cargo`:
-```bash
-cargo build
-cargo run
-```
 
 
 ## Configuration

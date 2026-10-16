@@ -57,11 +57,15 @@ impl Wallet {
     }
 
     fn session(&self) -> Result<Session> {
+        self.session_for("kv", "tinycloud.kv/list")
+    }
+
+    fn session_for(&self, service: &str, ability: &str) -> Result<Session> {
         let now = time::OffsetDateTime::now_utc();
         let prepared = prepare_session(SessionConfig {
             abilities: HashMap::from([(
-                "kv".parse()?,
-                HashMap::from([("".parse()?, vec!["tinycloud.kv/list".parse()?])]),
+                service.parse()?,
+                HashMap::from([("".parse()?, vec![ability.parse()?])]),
             )]),
             space_abilities: None,
             raw_abilities: HashMap::new(),
@@ -133,12 +137,19 @@ async fn expect_ok(label: &str, request: LocalRequest<'_>) -> Result<String> {
 }
 
 async fn client() -> Result<(Client, tempfile::TempDir)> {
+    client_with_database("sqlite::memory:", [43; 32]).await
+}
+
+async fn client_with_database(
+    database: &str,
+    secret: [u8; 32],
+) -> Result<(Client, tempfile::TempDir)> {
     let dir = tempfile::tempdir()?;
     let mut config = tinycloud::config::Config::default();
     config.storage.datadir = dir.path().into();
-    config.storage.database = Some("sqlite::memory:".into());
+    config.storage.database = Some(database.into());
     config.keys = serde_json::from_value(
-        json!({"type":"static", "secret":base64::encode_config([43; 32], base64::URL_SAFE_NO_PAD)}),
+        json!({"type":"static", "secret":base64::encode_config(secret, base64::URL_SAFE_NO_PAD)}),
     )?;
     let figment = rocket::figment::Figment::from(rocket::Config {
         address: "127.0.0.1".parse()?,
@@ -548,5 +559,217 @@ async fn issuer_canonicalization_does_not_accept_invalid_signatures_or_changed_s
     println!(
         "invalid signatures and changed signed fields rejected; distinct signed grant accepted"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn historical_alias_targets_cannot_widen_a_space_scoped_revoke_control() -> Result<()> {
+    use tinycloud_auth::{
+        resolver::DID_METHODS, resource::iri_string::types::UriString, ssi::jwk::JWK,
+    };
+    use tinycloud_core::{
+        db::DelegationStatus,
+        hash::Hash,
+        models::{delegation, revocation},
+        sea_orm::{EntityTrait, PaginatorTrait},
+    };
+
+    let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../tinycloud-core/tests/fixtures/tc1071/generated");
+    let fixtures: Vec<Value> =
+        serde_json::from_slice(&std::fs::read(fixture_dir.join("manifest.json"))?)?;
+    let fixture = fixtures
+        .iter()
+        .find(|fixture| fixture["database"] == "active.sqlite")
+        .ok_or_else(|| anyhow::anyhow!("missing genuine active historical fixture"))?;
+    let legacy = fixture["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["encoding"] == "v0")
+        .ok_or_else(|| anyhow::anyhow!("missing historical low-v row"))?;
+    let resource = fixture["resource"].as_str().unwrap();
+    let legacy_cid: Cid = legacy["raw_cid"].as_str().unwrap().parse()?;
+    let child_cid: Cid = legacy["child_cid"].as_str().unwrap().parse()?;
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("historical.sqlite");
+    std::fs::copy(fixture_dir.join("active.sqlite"), &path)?;
+    let (client, _data) =
+        client_with_database(&format!("sqlite:{}?mode=rwc", path.display()), [31; 32]).await?;
+
+    let canonical_header = fixture["canonical_header"].as_str().unwrap();
+    let imported: Value = serde_json::from_str(
+        &expect_ok(
+            "historical canonical reimport",
+            client
+                .post("/delegate")
+                .header(Header::new("Authorization", canonical_header.to_owned())),
+        )
+        .await?,
+    )?;
+    let canonical_cid: Cid = imported["cid"].as_str().unwrap().parse()?;
+    assert_ne!(
+        legacy_cid, canonical_cid,
+        "historical and canonical paths must differ"
+    );
+
+    let key = SigningKey::from_bytes(&[7; 32].into())?;
+    let public = key.verifying_key().to_encoded_point(false);
+    let address = Keccak256::digest(&public.as_bytes()[1..])[12..].try_into()?;
+    let did = format!("did:pkh:eip155:1:0x{}", encode_eip55(&address));
+    let wallet = Wallet {
+        key,
+        address,
+        space: SpaceId::new(did.parse()?, "scope-control".parse()?),
+    };
+    bootstrap(&client, &wallet).await?;
+    let control = wallet.session_for("delegation", "tinycloud.delegation/revoke")?;
+    let activated: Value = serde_json::from_str(
+        &expect_ok(
+            "space-scoped revoke control",
+            client.post("/delegate").header(Header::new(
+                "Authorization",
+                authorization(&control.delegation_header)?,
+            )),
+        )
+        .await?,
+    )?;
+    let control_cid: Cid = activated["cid"].as_str().unwrap().parse()?;
+    let session_jwk: JWK = serde_json::from_value(fixture["session_jwk"].clone())?;
+    let child_jwk: JWK = serde_json::from_value(fixture["child_jwk"].clone())?;
+    let session_did = DID_METHODS
+        .generate(&session_jwk, "key")
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?
+        .to_string();
+    let child_did = DID_METHODS
+        .generate(&child_jwk, "key")
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?
+        .to_string();
+    let session_vm = format!(
+        "{session_did}#{}",
+        session_did.trim_start_matches("did:key:")
+    );
+    let child_vm = format!("{child_did}#{}", child_did.trim_start_matches("did:key:"));
+    let kv_resource: UriString = format!("{resource}/").parse()?;
+    let list = |cid: Cid, key: &JWK, method: &str| -> Result<String> {
+        Ok(make_invocation_from_uris(
+            [(kv_resource.clone(), ["tinycloud.kv/list".parse()?])],
+            &cid,
+            key,
+            method,
+            (time::OffsetDateTime::now_utc() + time::Duration::minutes(5)).unix_timestamp() as f64,
+            InvocationOptions::default(),
+        )?
+        .encode()?)
+    };
+    let state = client
+        .rocket()
+        .state::<tinycloud::TinyCloud>()
+        .expect("managed database");
+    let original = delegation::Entity::find_by_id(Hash::from(legacy_cid))
+        .one(state.connection())
+        .await?
+        .expect("original historical row");
+    assert_eq!(
+        original.serialization,
+        base64::decode_config(legacy["header"].as_str().unwrap(), base64::URL_SAFE)?
+    );
+    let before = revocation::Entity::find().count(state.connection()).await?;
+    for target in [legacy_cid, canonical_cid] {
+        let invocation = make_invocation_from_uris(
+            [(
+                format!("urn:cid:{target}").parse()?,
+                ["tinycloud.delegation/revoke".parse()?],
+            )],
+            &control_cid,
+            &control.jwk,
+            &control.verification_method,
+            (time::OffsetDateTime::now_utc() + time::Duration::minutes(5)).unix_timestamp() as f64,
+            InvocationOptions::default(),
+        )?
+        .encode()?;
+        let (denied, body) = dispatch(
+            client
+                .post("/revoke")
+                .header(Header::new("Authorization", invocation)),
+        )
+        .await;
+        assert_eq!(denied, Status::Forbidden, "target {target}: {body}");
+        assert_eq!(
+            revocation::Entity::find().count(state.connection()).await?,
+            before
+        );
+        assert_eq!(
+            state
+                .delegation_status(Hash::from(target), &session_did, &[])
+                .await
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?,
+            Some(DelegationStatus::Active)
+        );
+        expect_ok(
+            "historical/canonical signed list after scope denial",
+            client.post("/invoke").header(Header::new(
+                "Authorization",
+                list(target, &session_jwk, &session_vm)?,
+            )),
+        )
+        .await?;
+    }
+    expect_ok(
+        "signed child list after scope denial",
+        client.post("/invoke").header(Header::new(
+            "Authorization",
+            list(child_cid, &child_jwk, &child_vm)?,
+        )),
+    )
+    .await?;
+
+    let (TinyCloudDelegation::Cacao(cacao), _) = TinyCloudDelegation::decode(canonical_header)?
+    else {
+        panic!("historical CACAO");
+    };
+    let mut message: Message = cacao.payload().clone().try_into()?;
+    message.uri = format!("ucan:{legacy_cid}").parse()?;
+    message.statement = None;
+    message.resources.clear();
+    let signature = wallet.sign(&message)?;
+    let owner_revocation = TinyCloudRevocation::Cacao(Box::new(
+        tinycloud_auth::cacaos::siwe_cacao::Payload::from(message)
+            .sign::<tinycloud_auth::cacaos::siwe_cacao::Eip191>(signature),
+    ));
+    expect_ok(
+        "owner signed historical target revocation",
+        client
+            .post("/revoke")
+            .header(Header::new("Authorization", owner_revocation.encode()?)),
+    )
+    .await?;
+    for target in [legacy_cid, canonical_cid] {
+        assert_eq!(
+            state
+                .delegation_status(Hash::from(target), &session_did, &[])
+                .await
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?,
+            Some(DelegationStatus::Revoked)
+        );
+    }
+    for (target, key, method) in [
+        (legacy_cid, &session_jwk, session_vm.as_str()),
+        (canonical_cid, &session_jwk, session_vm.as_str()),
+        (child_cid, &child_jwk, child_vm.as_str()),
+    ] {
+        let (denied, body) = dispatch(
+            client
+                .post("/invoke")
+                .header(Header::new("Authorization", list(target, key, method)?)),
+        )
+        .await;
+        assert_eq!(denied, Status::Unauthorized, "revoked {target}: {body}");
+    }
+    let preserved = delegation::Entity::find_by_id(original.id)
+        .one(state.connection())
+        .await?
+        .expect("preserved historical row");
+    assert_eq!(preserved.serialization, original.serialization);
     Ok(())
 }

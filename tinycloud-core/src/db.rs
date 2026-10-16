@@ -1817,7 +1817,7 @@ where
             Err(error) => return Err(error),
         };
 
-        let principal = match revocation::control_proof_decision(
+        let authorized = match revocation::control_proof_decision(
             &self.conn,
             invoker,
             proofs,
@@ -1826,19 +1826,22 @@ where
         )
         .await?
         {
-            revocation::ControlProofDecision::DirectSigner(principal)
-            | revocation::ControlProofDecision::PersistentPrincipal(principal) => principal,
-            revocation::ControlProofDecision::Denied => return Ok(None),
+            revocation::ControlProofDecision::DirectSigner(principal) => {
+                did_principal_matches(&delegation.delegator, &principal)
+                    || did_principal_matches(&delegation.delegatee, &principal)
+                    || abilities.iter().any(|ability| {
+                        ability
+                            .resource
+                            .space()
+                            .map(|space| did_principal_matches(space.did().as_str(), &principal))
+                            .unwrap_or(false)
+                    })
+            }
+            revocation::ControlProofDecision::Scoped(control) => {
+                control.authorizes_target(&target, &delegation, &abilities)
+            }
+            revocation::ControlProofDecision::Denied => false,
         };
-        let authorized = did_principal_matches(&delegation.delegator, &principal)
-            || did_principal_matches(&delegation.delegatee, &principal)
-            || abilities.iter().any(|ability| {
-                ability
-                    .resource
-                    .space()
-                    .map(|space| did_principal_matches(space.did().as_str(), &principal))
-                    .unwrap_or(false)
-            });
         if !authorized {
             return Ok(None);
         }

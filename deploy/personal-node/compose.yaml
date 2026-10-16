@@ -1,0 +1,36 @@
+name: personal-node
+services:
+  node:
+    image: ${NODE_IMAGE:-ghcr.io/tinycloudlabs/tinycloud-node@sha256:41667d3d133aaa12290a2f3a744afacd838988327552d159c60f04466e66f86f}
+    restart: unless-stopped
+    env_file:
+      - ${NODE_KEY_ENV_FILE:?Set the private node key file}
+    environment:
+      TINYCLOUD_STORAGE__DATADIR: /data
+      ROCKET_ADDRESS: 0.0.0.0
+    volumes:
+      - ${NODE_DATA_DIR:?Set the node data directory}:/data
+      # 1.20.6 still embeds a sample key in its default TOML. This clean
+      # config masks the image copy, even when the operator key is absent.
+      - ./tinycloud.toml:/tinycloud.toml:ro
+    security_opt:
+      - no-new-privileges:true
+
+  https:
+    image: caddy@sha256:c3d7ee5d2b11f9dc54f947f68a734c84e9c9666c92c88a7f30b9cba5da182adb
+    restart: unless-stopped
+    depends_on:
+      - node
+    ports:
+      - "${NODE_HTTP_BIND:-80:80}"
+      - "${NODE_HTTPS_BIND:-443:443}"
+    environment:
+      NODE_DOMAIN: ${NODE_DOMAIN:?Set your domain}
+    volumes:
+      - ${NODE_CADDYFILE:-./Caddyfile}:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  caddy-data:
+  caddy-config:
