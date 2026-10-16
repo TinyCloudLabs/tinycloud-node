@@ -17,14 +17,11 @@ ready() {
     if curl -fsS http://127.0.0.1:8000/healthz -o /dev/null 2>/dev/null; then return; fi
     sleep 2
   done
-  printf '%s\n' 'Dstack-profile health check failed; container state and redacted errors:' >&2
+  printf '%s\n' 'Dstack-profile health check failed; container state and redacted startup log:' >&2
   compose ps --all >&2
-  compose logs --no-color --tail=100 tinycloud 2>&1 |
+  compose logs --no-color --tail=35 tinycloud 2>&1 |
     while IFS= read -r line; do
-      case "$line" in
-        *[Ee]rror*|*failed*|*denied*|*panic*)
-          printf '%s\n' "${line//"$TC1282_TEST_KEY"/[REDACTED]}" >&2 ;;
-      esac
+      printf '%s\n' "${line//"$TC1282_TEST_KEY"/[REDACTED]}" >&2
     done
   exit 1
 }
