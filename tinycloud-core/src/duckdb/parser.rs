@@ -1,3 +1,5 @@
+use std::ops::ControlFlow;
+
 use sqlparser::ast::*;
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -22,6 +24,129 @@ pub struct ParsedQuery {
     pub is_ddl: bool,
 }
 
+fn ascii_prefix(value: &str, prefix: &str) -> bool {
+    value
+        .as_bytes()
+        .get(..prefix.len())
+        .is_some_and(|start| start.eq_ignore_ascii_case(prefix.as_bytes()))
+}
+
+fn node_controlled_setting(name: &str) -> bool {
+    [
+        "profil",
+        "logging_",
+        "log_",
+        "enable_profil",
+        "disable_profil",
+        "debug_",
+        "verify_",
+        "disable_verify_",
+    ]
+    .iter()
+    .any(|prefix| ascii_prefix(name, prefix))
+        || [
+            "enable_logging",
+            "disable_logging",
+            "enable_http_logging",
+            "http_logging_output",
+            "enable_verification",
+            "disable_verification",
+            "enable_progress_bar",
+            "disable_progress_bar",
+            "enable_print_progress_bar",
+            "disable_print_progress_bar",
+            "progress_bar_time",
+            "enable_external_access",
+            "allow_unsigned_extensions",
+            "lock_configuration",
+        ]
+        .iter()
+        .any(|reserved| name.eq_ignore_ascii_case(reserved))
+}
+
+fn diagnostic_function(name: &ObjectName) -> bool {
+    name.0.last().is_some_and(|ident| {
+        [
+            "enable_logging",
+            "disable_logging",
+            "write_log",
+            "truncate_duckdb_logs",
+            // Dynamic SQL strings cannot bypass structural statement checks.
+            "query",
+        ]
+        .iter()
+        .any(|reserved| ident.value.eq_ignore_ascii_case(reserved))
+    })
+}
+
+struct DiagnosticPolicy;
+
+impl Visitor for DiagnosticPolicy {
+    type Break = ();
+
+    fn pre_visit_statement(&mut self, statement: &Statement) -> ControlFlow<Self::Break> {
+        let prohibited = match statement {
+            Statement::SetVariable { variable: name, .. } | Statement::Pragma { name, .. } => name
+                .0
+                .last()
+                .is_some_and(|ident| node_controlled_setting(&ident.value)),
+            Statement::Call(function) => diagnostic_function(&function.name),
+            _ => false,
+        };
+        if prohibited {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    }
+
+    fn pre_visit_expr(&mut self, expression: &Expr) -> ControlFlow<Self::Break> {
+        if matches!(expression, Expr::Function(function) if diagnostic_function(&function.name)) {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    }
+
+    fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<Self::Break> {
+        let prohibited = match factor {
+            TableFactor::Table {
+                name,
+                args: Some(_),
+                ..
+            }
+            | TableFactor::Function { name, .. } => diagnostic_function(name),
+            _ => false,
+        };
+        if prohibited {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    }
+}
+
+fn check_diagnostic_statements(statements: &[Statement]) -> Result<(), DuckDbError> {
+    for statement in statements {
+        if statement.visit(&mut DiagnosticPolicy).is_break() {
+            return Err(DuckDbError::PermissionDenied(
+                "Database diagnostic controls are reserved for the node".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validates persisted tenant SQL without executing it or granting an ability.
+pub(crate) fn validate_diagnostic_sql(sql: &str) -> Result<(), DuckDbError> {
+    let statements = Parser::parse_sql(&GenericDialect {}, sql).map_err(|_| {
+        DuckDbError::PermissionDenied(
+            "Stored SQL does not satisfy the node statement policy".into(),
+        )
+    })?;
+    check_diagnostic_statements(&statements)
+}
+
 pub fn validate_sql(
     sql: &str,
     caveats: &Option<DuckDbCaveats>,
@@ -34,55 +159,6 @@ pub fn validate_sql(
     let is_admin = ability_matches(ability, "tinycloud.duckdb/admin");
     let has_write = is_admin || ability_matches(ability, "tinycloud.duckdb/write");
 
-    // Tier 3: Check if SQL is in pre-approved statements list
-    if let Some(ref c) = caveats {
-        if c.find_statement_by_sql(sql).is_some() {
-            // Pre-approved by delegation — skip allowlist check
-            // Still apply function blocklist (defense in depth)
-            check_blocked_functions(sql, is_admin)?;
-
-            // Parse to extract tables/columns for caveat checks
-            let dialect = GenericDialect {};
-            let statements = Parser::parse_sql(&dialect, sql)
-                .map_err(|e| DuckDbError::ParseError(e.to_string()))?;
-
-            let mut tables = Vec::new();
-            let mut columns = Vec::new();
-            let mut write_targets = Vec::new();
-            let mut is_read_only = true;
-            let mut is_ddl = false;
-
-            for stmt in &statements {
-                classify_statement(
-                    stmt,
-                    &mut tables,
-                    &mut columns,
-                    &mut is_read_only,
-                    &mut is_ddl,
-                );
-                if let Some(targets) = extract_write_targets_from_statement(stmt) {
-                    write_targets.push(targets);
-                }
-            }
-
-            // Still apply caveat table/column checks
-            apply_caveat_checks(c, &tables, &columns, is_read_only)?;
-
-            tables.dedup();
-            columns.dedup();
-
-            return Ok(ParsedQuery {
-                statements,
-                referenced_tables: tables,
-                referenced_columns: columns,
-                write_targets,
-                is_read_only,
-                is_ddl,
-            });
-        }
-    }
-
-    // Parse normally
     let dialect = GenericDialect {};
     let statements =
         Parser::parse_sql(&dialect, sql).map_err(|e| DuckDbError::ParseError(e.to_string()))?;
@@ -90,6 +166,9 @@ pub fn validate_sql(
     if statements.is_empty() {
         return Err(DuckDbError::ParseError("Empty SQL statement".to_string()));
     }
+    // Invocation-provided templates are data, never authority. Every tier and
+    // every nested statement/function follows the same diagnostic boundary.
+    check_diagnostic_statements(&statements)?;
 
     let mut tables = Vec::new();
     let mut columns = Vec::new();
@@ -98,10 +177,7 @@ pub fn validate_sql(
     let mut is_ddl = false;
 
     for stmt in &statements {
-        // Tier 1/2: Check statement allowlist
-        if is_admin {
-            check_admin_blocked(stmt)?;
-        } else {
+        if !is_admin {
             check_statement_allowed(stmt, has_write)?;
         }
 
@@ -190,6 +266,11 @@ fn collect_write_targets_from_statement(
     tables: &mut Vec<String>,
 ) -> CollectWriteTargets {
     match stmt {
+        Statement::Explain {
+            analyze: true,
+            statement,
+            ..
+        } => collect_write_targets_from_statement(statement, tables),
         Statement::Insert { table_name, .. } => {
             tables.push(table_name.to_string());
             CollectWriteTargets::Supported
@@ -259,6 +340,23 @@ fn classify_statement(
     is_ddl: &mut bool,
 ) {
     match stmt {
+        Statement::Explain {
+            analyze, statement, ..
+        } => {
+            let mut inner_read_only = true;
+            let mut inner_ddl = false;
+            classify_statement(
+                statement,
+                tables,
+                columns,
+                &mut inner_read_only,
+                &mut inner_ddl,
+            );
+            if *analyze {
+                *is_read_only &= inner_read_only;
+                *is_ddl |= inner_ddl;
+            }
+        }
         Statement::Query(_) => {
             extract_tables_from_statement(stmt, tables);
             extract_columns_from_statement(stmt, columns);
@@ -326,6 +424,12 @@ fn apply_caveat_checks(
 /// Tier 1 allowlist: check that the statement type is allowed for non-admin users.
 fn check_statement_allowed(stmt: &Statement, has_write: bool) -> Result<(), DuckDbError> {
     match stmt {
+        // ANALYZE executes its body; plain EXPLAIN only plans it.
+        Statement::Explain {
+            analyze: true,
+            statement,
+            ..
+        } => check_statement_allowed(statement, has_write),
         // Read operations — any ability
         Statement::Query(_) => Ok(()),
         Statement::ExplainTable { .. } | Statement::Explain { .. } => Ok(()),
@@ -374,27 +478,6 @@ fn check_statement_allowed(stmt: &Statement, has_write: bool) -> Result<(), Duck
             statement_type_name(other)
         ))),
     }
-}
-
-/// Tier 2: Admin bypass — block only security-critical SET variables.
-fn check_admin_blocked(stmt: &Statement) -> Result<(), DuckDbError> {
-    if let Statement::SetVariable { variable, .. } = stmt {
-        let var_name = variable.to_string().to_uppercase();
-        const BLOCKED: &[&str] = &[
-            "ENABLE_EXTERNAL_ACCESS",
-            "ALLOW_UNSIGNED_EXTENSIONS",
-            "ENABLE_LOGGING",
-            "LOG_QUERY_PATH",
-            "LOCK_CONFIGURATION",
-        ];
-        if BLOCKED.iter().any(|s| var_name.contains(s)) {
-            return Err(DuckDbError::PermissionDenied(format!(
-                "Cannot modify security setting: {}",
-                variable
-            )));
-        }
-    }
-    Ok(())
 }
 
 /// Defense-in-depth: block function calls that could access external resources.
@@ -590,6 +673,11 @@ fn extract_columns_from_query(query: &Query, columns: &mut Vec<String>) {
 
 pub fn extract_write_targets_from_statement(stmt: &Statement) -> Option<TouchedTables> {
     match stmt {
+        Statement::Explain {
+            analyze: true,
+            statement,
+            ..
+        } => extract_write_targets_from_statement(statement),
         Statement::Insert { table_name, .. } => {
             Some(TouchedTables::supported(vec![table_name.to_string()]))
         }
@@ -654,7 +742,7 @@ fn unique_names(names: Vec<String>) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::caveats::{DuckDbCaveats, PreparedStatement};
+    use super::super::caveats::DuckDbCaveats;
     use super::*;
     use crate::write_hooks::TouchedTables;
 
@@ -782,26 +870,6 @@ mod tests {
         let result = validate_sql(
             "EXPLAIN SELECT * FROM users",
             &None,
-            "tinycloud.duckdb/read",
-        );
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_pre_approved_statement_bypass() {
-        let caveats = DuckDbCaveats {
-            tables: None,
-            columns: None,
-            statements: Some(vec![PreparedStatement {
-                name: "special".to_string(),
-                sql: "COPY users TO 'file.csv'".to_string(),
-            }]),
-            read_only: None,
-        };
-        // This SQL would normally be blocked, but it's pre-approved
-        let result = validate_sql(
-            "COPY users TO 'file.csv'",
-            &Some(caveats),
             "tinycloud.duckdb/read",
         );
         assert!(result.is_ok());

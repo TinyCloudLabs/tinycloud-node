@@ -1,8 +1,8 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use duckdb::Connection;
+use duckdb::{Config, Connection};
 
-use super::types::DuckDbError;
+use super::{parser::validate_diagnostic_sql, types::DuckDbError};
 
 #[derive(Debug, Clone)]
 pub enum StorageMode {
@@ -10,21 +10,30 @@ pub enum StorageMode {
     File(PathBuf),
 }
 
-pub fn open_connection(mode: &StorageMode, max_memory: &str) -> Result<Connection, DuckDbError> {
-    let conn = match mode {
-        StorageMode::InMemory => {
-            Connection::open_in_memory().map_err(|e| DuckDbError::Internal(e.to_string()))?
-        }
-        StorageMode::File(path) => {
+/// Open a database with the native diagnostic and external-access policy locked.
+/// A missing path selects an in-memory database.
+pub fn open_connection(path: Option<&Path>, max_memory: &str) -> Result<Connection, DuckDbError> {
+    // External access must already be disabled during native open/WAL recovery.
+    // Profiling and logging are disabled by default; their setters require a
+    // live connection in DuckDB, so explicitly reset them before any catalog SQL.
+    let config = Config::default()
+        .enable_external_access(false)
+        .map_err(|e| DuckDbError::Internal(e.to_string()))?;
+    let conn = match path {
+        None => Connection::open_in_memory_with_flags(config)
+            .map_err(|e| DuckDbError::Internal(e.to_string()))?,
+        Some(path) => {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| DuckDbError::Internal(e.to_string()))?;
             }
-            Connection::open(path).map_err(|e| DuckDbError::Internal(e.to_string()))?
+            Connection::open_with_flags(path, config)
+                .map_err(|e| DuckDbError::Internal(e.to_string()))?
         }
     };
 
     apply_security_settings(&conn, max_memory)?;
+    audit_stored_code(&conn)?;
 
     Ok(conn)
 }
@@ -49,18 +58,79 @@ fn validate_max_memory(value: &str) -> Result<(), DuckDbError> {
     Ok(())
 }
 
-pub fn apply_security_settings(conn: &Connection, max_memory: &str) -> Result<(), DuckDbError> {
+fn apply_security_settings(conn: &Connection, max_memory: &str) -> Result<(), DuckDbError> {
     validate_max_memory(max_memory)?;
 
+    // All operator configuration precedes the irreversible tenant-facing lock.
+    // "no_output" alone still enables profiling, so reset it instead.
     conn.execute_batch(&format!(
-        "SET enable_external_access = false;\
+        "RESET enable_profiling;\
+         SET enable_logging = false;\
+         SET enable_http_logging = false;\
+         RESET log_query_path;\
+         RESET profiling_output;\
+         SET enable_external_access = false;\
          SET allow_unsigned_extensions = false;\
          SET checkpoint_threshold = '1TB';\
-         SET max_memory = '{}';",
+         SET max_memory = '{}';\
+         SET lock_configuration = true;",
         max_memory
     ))
     .map_err(|e| DuckDbError::Internal(format!("Failed to apply security settings: {}", e)))?;
     Ok(())
+}
+
+fn audit_stored_code(conn: &Connection) -> Result<(), DuckDbError> {
+    // Fully qualify the native system catalog: an imported user macro named
+    // duckdb_views/duckdb_functions/duckdb_tables must not run during the audit.
+    // Inspect every user definition, not just objects directly referenced by a
+    // request, so nested and recursive view/macro calls cannot hide a primitive.
+    for catalog_sql in [
+        "SELECT sql FROM system.main.duckdb_views() WHERE NOT internal",
+        "SELECT sql FROM system.main.duckdb_tables() WHERE NOT internal",
+    ] {
+        let mut stmt = conn.prepare(catalog_sql).map_err(|_| stored_code_error())?;
+        let definitions = stmt
+            .query_map([], |row| row.get::<_, Option<String>>(0))
+            .map_err(|_| stored_code_error())?;
+        for definition in definitions {
+            let definition = definition
+                .map_err(|_| stored_code_error())?
+                .ok_or_else(stored_code_error)?;
+            validate_diagnostic_sql(&definition).map_err(|_| stored_code_error())?;
+        }
+    }
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT function_type, macro_definition \
+             FROM system.main.duckdb_functions() \
+             WHERE NOT internal AND function_type IN ('macro', 'table_macro')",
+        )
+        .map_err(|_| stored_code_error())?;
+    let definitions = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })
+        .map_err(|_| stored_code_error())?;
+    for definition in definitions {
+        let (kind, definition) = definition.map_err(|_| stored_code_error())?;
+        let definition = definition.ok_or_else(stored_code_error)?;
+        if kind == "macro" {
+            validate_diagnostic_sql(&format!("SELECT {}", definition))
+                .map_err(|_| stored_code_error())?;
+        } else {
+            validate_diagnostic_sql(&definition).map_err(|_| stored_code_error())?;
+        }
+    }
+    Ok(())
+}
+
+fn stored_code_error() -> DuckDbError {
+    // Never include persisted SQL, object names, or native parser snippets.
+    DuckDbError::PermissionDenied(
+        "Stored database code cannot be admitted under the diagnostic policy".to_string(),
+    )
 }
 
 pub fn database_size(conn: &Connection) -> Result<u64, DuckDbError> {
@@ -78,15 +148,10 @@ pub fn database_size(conn: &Connection) -> Result<u64, DuckDbError> {
 
 pub fn promote_to_file(
     conn: &Connection,
-    path: &PathBuf,
+    path: &Path,
     max_memory: &str,
 ) -> Result<Connection, DuckDbError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| DuckDbError::Internal(e.to_string()))?;
-    }
-
-    let file_conn = Connection::open(path).map_err(|e| DuckDbError::Internal(e.to_string()))?;
-    apply_security_settings(&file_conn, max_memory)?;
+    let file_conn = open_connection(Some(path), max_memory)?;
 
     // Copy tables from in-memory conn to file-backed conn
     copy_tables(conn, &file_conn)?;
@@ -100,8 +165,8 @@ pub fn copy_tables(src: &Connection, dest: &Connection) -> Result<(), DuckDbErro
     // Get all user tables
     let mut stmt = src
         .prepare(
-            "SELECT table_name FROM information_schema.tables \
-             WHERE table_schema = 'main' AND table_type = 'BASE TABLE'",
+            "SELECT table_name FROM system.main.duckdb_tables() \
+             WHERE schema_name = 'main' AND NOT internal",
         )
         .map_err(|e| DuckDbError::Internal(e.to_string()))?;
 
@@ -116,7 +181,8 @@ pub fn copy_tables(src: &Connection, dest: &Connection) -> Result<(), DuckDbErro
         let create_sql: String = src
             .query_row(
                 &format!(
-                    "SELECT sql FROM duckdb_tables() WHERE table_name = '{}'",
+                    "SELECT sql FROM system.main.duckdb_tables() \
+                     WHERE schema_name = 'main' AND table_name = '{}'",
                     table.replace('\'', "''")
                 ),
                 [],
@@ -125,6 +191,8 @@ pub fn copy_tables(src: &Connection, dest: &Connection) -> Result<(), DuckDbErro
             .map_err(|e| {
                 DuckDbError::Internal(format!("Failed to get DDL for {}: {}", table, e))
             })?;
+
+        validate_diagnostic_sql(&create_sql).map_err(|_| stored_code_error())?;
 
         dest.execute_batch(&create_sql).map_err(|e| {
             DuckDbError::Internal(format!("Failed to create table {}: {}", table, e))
@@ -152,7 +220,10 @@ pub fn copy_tables(src: &Connection, dest: &Connection) -> Result<(), DuckDbErro
 
     // Copy views
     let mut view_stmt = src
-        .prepare("SELECT view_name, sql FROM duckdb_views() WHERE schema_name = 'main'")
+        .prepare(
+            "SELECT view_name, sql FROM system.main.duckdb_views() \
+             WHERE schema_name = 'main' AND NOT internal",
+        )
         .map_err(|e| DuckDbError::Internal(e.to_string()))?;
 
     let views: Vec<(String, String)> = view_stmt
@@ -164,6 +235,7 @@ pub fn copy_tables(src: &Connection, dest: &Connection) -> Result<(), DuckDbErro
         .map_err(|e| DuckDbError::Internal(e.to_string()))?;
 
     for (_, view_sql) in &views {
+        validate_diagnostic_sql(view_sql).map_err(|_| stored_code_error())?;
         if let Err(e) = dest.execute_batch(view_sql) {
             tracing::warn!(error=%e, "failed to copy view during table copy");
         }
