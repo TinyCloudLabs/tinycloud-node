@@ -44,8 +44,10 @@ cors = true
     # retry_window_ms = 10000
 
 [global.keys]
+    # Provision a unique, persistent root before starting this node.
+    # TINYCLOUD_KEYS__SECRET supplies it; Dstack deployments explicitly
+    # select TINYCLOUD_KEYS__TYPE=Dstack instead.
     type = "Static"
-    secret = "U29tZSBsb25nIHBpZWNlIG9mIGVudHJvcHkgd2hpY2ggaXMgYSBzZWNyZXQgYW5kIG1vcmUgdGhhbiAzMiBieXRlcw"
 
 [global.spaces]
 ## Space allow list api endpoint
