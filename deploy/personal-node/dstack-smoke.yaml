@@ -1,0 +1,8 @@
+services:
+  tinycloud:
+    environment:
+      TINYCLOUD_KEYS__TYPE: Static
+      TINYCLOUD_KEYS__SECRET: ${TC1282_TEST_KEY:?CI test key required}
+      TINYCLOUD_TEE_MODE: 'off'
+    labels:
+      tc1282: 'true'

@@ -1,0 +1,39 @@
+name: Personal node guide
+on:
+  pull_request:
+    paths:
+      - 'deploy/personal-node/**'
+      - 'test/probe/personal-node-check.ts'
+      - '.github/workflows/personal-node.yml'
+      - 'tinycloud.toml'
+      - 'docker-compose.dstack.yaml'
+      - 'tinycloud-node-server/src/runtime.rs'
+  push:
+    branches: [main]
+    paths:
+      - 'deploy/personal-node/**'
+      - 'test/probe/personal-node-check.ts'
+      - '.github/workflows/personal-node.yml'
+      - 'docker-compose.dstack.yaml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  published-images:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: test/probe/package-lock.json
+      - name: Install pinned signing client
+        run: npm ci --prefix test/probe
+      - name: Exercise the published personal-node guide
+        run: bash deploy/personal-node/ci.sh
+      - name: Check dstack-profile local-data persistence
+        run: bash deploy/personal-node/dstack-smoke.sh
