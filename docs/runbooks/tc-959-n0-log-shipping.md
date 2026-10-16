@@ -150,6 +150,10 @@ The raw after hash identifies the profile-enabled compose, not deployment approv
 
 Rollback means restoring the preserved current pre-N0 compose, not rebuilding or retagging the node image. **Operator privacy decision:** its `json-file` logging may restore raw retention. Explicitly approve that consequence, keep private flags, and never install a stealth fallback or assume `docker logs` stays unavailable after rollback.
 
+Workflow/config PR [#310](https://github.com/TinyCloudLabs/tinycloud-node/pull/310) is the separate candidate at `311103644a4591b3d6a2c7cae1ba489f2d022301`, with reported green CI; its Amos-owned exact-head Astra review remains a gate. It maps only secret names through `PROD_TINYCLOUD_BETTERSTACK_SOURCE_TOKEN` → `PHALA_ENV_BETTERSTACK_SOURCE_TOKEN` → mode-0600 `.phala-prod.env` key `BETTERSTACK_SOURCE_TOKEN`, with complete-set `allowed_envs` synchronization and mandatory sealed preflight for the old digest. This document does not claim those operator steps have run.
+
+The conditional immutable promotion additionally requires **`restore_n0_quota_snapshot=true`**, fresh Sam authorization of the pinned quota snapshot, and Amos's reviewed evidence. The opt-in is not evergreen permission for unrelated same-image redeploys. Intended image identity is **1.20.6**, with `sql_identity_fence=false` and optional image features false; publish the full exact input packet only after the workflow's exact-head review and final N0 proof. Quota restoration must follow required version/ingress health and precede Policy probes; any attempted mutation without verified restoration is a fatal **`OVERRIDES UNVERIFIED`** gate.
+
 ### Workflow guard packet: not dispatch authorization
 
 **No runnable dispatch command or input table is published here until the workflow-only PR has passed exact-head review.** The previous proposed table was obsolete and has been removed. Amos must use the reviewed immutable-image promotion contract, not a checkout's unrelated package version or default feature flags.

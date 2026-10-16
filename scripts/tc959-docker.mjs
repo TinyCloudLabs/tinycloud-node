@@ -340,12 +340,15 @@ export async function main(args = process.argv.slice(2)) {
     for (const service of Object.values(unresolved.services)) assert.equal(service.env_file, undefined, 'deployment_env_files_forbidden');
     const rendered = JSON.parse(docker(...composeArgs, '--format', 'json'));
     const production = rendered.services;
+    phase = 'compose_images';
     assert.equal(production.tinycloud.image, nodeImage);
     assert.equal(production['dstack-ingress'].image, ingressImage);
     assert.equal(production.vector.image, vectorImage);
+    phase = 'compose_fields';
     // Refuse silently ignored compose fields: this is a projection with explicit substitutions, not a mirror.
     const supported = new Set(['image', 'restart', 'labels', 'logging', 'ports', 'volumes', 'environment', 'networks', 'depends_on', 'entrypoint', 'command', 'init', 'user', 'read_only', 'cap_drop', 'security_opt', 'mem_limit', 'memswap_limit', 'cpus', 'tmpfs', 'privileged']);
     for (const service of [production.tinycloud, production['dstack-ingress'], production.vector]) for (const key of Object.keys(service)) assert.ok(supported.has(key), 'unsupported_rendered_compose_field');
+    phase = 'compose_ports';
     assert.equal(production.vector.volumes, undefined);
     assert.equal(production.tinycloud.ports.length, 1);
     assert.equal(production.tinycloud.ports[0].target, 8000);
@@ -356,8 +359,10 @@ export async function main(args = process.argv.slice(2)) {
       assert.equal(service.ports[0].protocol, 'tcp');
       assert.equal(service.ports[0].host_ip ?? '0.0.0.0', '0.0.0.0');
     }
+    phase = 'compose_mounts';
     assert.deepEqual(production.tinycloud.volumes.map(value => [value.type, value.source, value.target]), [['bind', '/var/run/dstack.sock', '/var/run/dstack.sock']]);
-    assert.deepEqual(production['dstack-ingress'].volumes.map(value => [value.type, value.source, value.target]), [['bind', '/var/run/dstack.sock', '/var/run/dstack.sock'], ['volume', 'cert-data', '/etc/letsencrypt']]);
+    assert.deepEqual(production['dstack-ingress'].volumes.map(value => [value.type, value.source, value.target]).sort((a, b) => a[2].localeCompare(b[2])), [['volume', 'cert-data', '/etc/letsencrypt'], ['bind', '/var/run/dstack.sock', '/var/run/dstack.sock']]);
+    phase = 'compose_networks';
     assert.deepEqual(Object.keys(production.tinycloud.networks), ['default']);
     assert.deepEqual(Object.keys(production['dstack-ingress'].networks), ['default']);
     assert.deepEqual(Object.keys(production.vector.networks), ['logship']);
@@ -365,6 +370,7 @@ export async function main(args = process.argv.slice(2)) {
     assert.equal(rendered.networks.logship.internal ?? false, false);
     assert.equal(rendered.networks.logship.external ?? false, false);
     assert.ok(Object.keys(rendered.networks.logship).every(key => ['name', 'driver', 'internal', 'external'].includes(key)), 'unsupported_compose_network_options');
+    phase = 'compose_compiler';
     const compiled = buildConfig({ runtimeProfile: true });
     assert.deepEqual(JSON.parse(production.vector.environment.VECTOR_CONFIG_JSON), compiled, 'rendered_compose_compiler_mismatch');
     assert.equal(compiled.sources.gelf_in.receive_buffer_bytes, 8388608);
