@@ -704,6 +704,76 @@ mod tests {
         assert_eq!(cfg.keys, config::Keys::Auto);
     }
 
+    #[::core::prelude::v1::test]
+    fn shipped_legacy_config_requires_an_installation_key() {
+        let _lock = env_lock();
+        let temp = tempdir().unwrap();
+        fs::write(
+            temp.path().join("tinycloud.toml"),
+            include_str!("../../tinycloud.toml"),
+        )
+        .unwrap();
+        let _cwd = CwdGuard::set(temp.path());
+        let _keys_env = clear_keys_env();
+        let config = legacy_config_figment().extract::<config::Config>().unwrap();
+        match config.keys {
+            config::Keys::Static(secret) => {
+                assert!(tinycloud_core::keys::StaticSecret::try_from(secret).is_err());
+            }
+            config::Keys::Auto => {}
+            other => panic!("shipped configuration must fail closed without a key: {other:?}"),
+        }
+    }
+    #[::core::prelude::v1::test]
+    fn shipped_config_uses_explicit_key_and_canonical_override_across_restarts() {
+        let _lock = env_lock();
+        let temp = tempdir().unwrap();
+        fs::write(
+            temp.path().join("tinycloud.toml"),
+            include_str!("../../tinycloud.toml"),
+        )
+        .unwrap();
+        let _cwd = CwdGuard::set(temp.path());
+        let _keys_env = clear_keys_env();
+        let legacy = base64::encode_config([41; 32], base64::URL_SAFE_NO_PAD);
+        let canonical = base64::encode_config([42; 32], base64::URL_SAFE_NO_PAD);
+        let _legacy = EnvGuard::set("TINYCLOUD_KEYS_SECRET", legacy);
+        let _canonical = EnvGuard::set("TINYCLOUD_KEYS__SECRET", canonical);
+        let expected = tinycloud_core::keys::StaticSecret::new(vec![42; 32])
+            .unwrap()
+            .node_did();
+
+        for _ in 0..2 {
+            let config = legacy_config_figment().extract::<config::Config>().unwrap();
+            let config::Keys::Static(secret) = config.keys else {
+                panic!("explicit key must select Static");
+            };
+            assert_eq!(
+                tinycloud_core::keys::StaticSecret::try_from(secret)
+                    .unwrap()
+                    .node_did(),
+                expected
+            );
+        }
+    }
+
+    #[cfg(feature = "dstack")]
+    #[::core::prelude::v1::test]
+    fn shipped_config_allows_explicit_dstack_without_a_static_key() {
+        let _lock = env_lock();
+        let temp = tempdir().unwrap();
+        fs::write(
+            temp.path().join("tinycloud.toml"),
+            include_str!("../../tinycloud.toml"),
+        )
+        .unwrap();
+        let _cwd = CwdGuard::set(temp.path());
+        let _keys_env = clear_keys_env();
+        let _dstack = EnvGuard::set("TINYCLOUD_KEYS__TYPE", "Dstack");
+        let config = legacy_config_figment().extract::<config::Config>().unwrap();
+        assert_eq!(config.keys, config::Keys::Dstack);
+    }
+
     #[cfg(feature = "dstack")]
     #[::core::prelude::v1::test]
     fn serve_config_figment_loads_keys_type_from_env() {
