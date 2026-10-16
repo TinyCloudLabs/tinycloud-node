@@ -353,6 +353,137 @@ class QuotaTests(unittest.TestCase):
             self.assertFalse(self.secret in result.stdout + result.stderr + summary.read_text(),
                              "Partial-failure diagnostics must not expose authorization")
 
+    def test_new_shell_steps_enforce_strict_runtime_baseline(self):
+        probe = """
+        require_strict_shell() {
+          for option in errexit nounset pipefail; do
+            case ":${SHELLOPTS}:" in
+              *:"${option}":*) ;;
+              *) builtin printf 'missing-%s\\n' "${option}" >> "$SHELL_PROBE"; return 89 ;;
+            esac
+          done
+          builtin printf 'strict\\n' >> "$SHELL_PROBE"
+        }
+        python3() { require_strict_shell; }
+        gh() { require_strict_shell; }
+        printf() { require_strict_shell || return; builtin printf "$@"; }
+        """
+        for name in ("Restore storage quota overrides", "Report unverified storage overrides",
+                     "Dispatch Write Probe promote watch"):
+            with self.subTest(step=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                startup = root / "bash-env"
+                trace = root / "probe"
+                summary = root / "summary"
+                startup.write_text(textwrap.dedent(probe))
+                result = subprocess.run(
+                    ["bash", "--noprofile", "--norc", "-c", shell_for_step(name)],
+                    env={"PATH": "/usr/bin:/bin", "BASH_ENV": str(startup), "SHELL_PROBE": str(trace),
+                         "GITHUB_STEP_SUMMARY": str(summary), "QUOTA_ADMIN_SECRET": self.secret,
+                         "IMAGE": N0_CONTEXT["steps.pin.outputs.image"], "IMAGE_VERSION": "1.20.6",
+                         "IMAGE_LABEL": "1.20.6-dstack",
+                         "IMAGE_REVISION": N0_CONTEXT["steps.pin.outputs.revision"],
+                         "GITHUB_REPOSITORY": "synthetic/repository"},
+                    capture_output=True, text=True)
+                logs = result.stdout + result.stderr + (summary.read_text() if summary.exists() else "")
+                self.assertFalse(self.secret in logs, "Shell diagnostics leaked a sealed canary")
+                self.assertEqual(trace.read_text().splitlines(), ["strict"],
+                                 "Each new shell block must enforce all three runtime options")
+                if name == "Report unverified storage overrides":
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("OVERRIDES UNVERIFIED", summary.read_text())
+                else:
+                    self.assertEqual(result.returncode, 0)
+
+    def test_pending_reviewed_compose_binding_rejects_same_image_other_configuration(self):
+        # Intentionally RED until #309 hosted acceptance and Amos's exact-head
+        # review authorize its compose bytes. No candidate/caller hash is trusted.
+        boundary = """#!/usr/bin/env python3
+import os
+from pathlib import Path
+import sys
+tool = Path(sys.argv[0]).name
+args = sys.argv[1:]
+if tool == "docker":
+    if args[:1] == ["pull"]:
+        assert args[1:3] == ["--platform", "linux/amd64"]
+    elif args[:2] == ["image", "inspect"]:
+        label = args[-1]
+        if "org.opencontainers.image.revision" in label:
+            print(os.environ["ROLLBACK_REVISION"])
+        elif "org.opencontainers.image.version" in label:
+            print("1.20.6-dstack")
+        else:
+            raise SystemExit("Unexpected synthetic label lookup")
+    elif args[:1] == ["run"]:
+        assert args[-1] == "--validate-config" and "none" in args and "--read-only" in args
+    elif args[:1] == ["compose"]:
+        assert args[-2:] == ["config", "--quiet"]
+    else:
+        raise SystemExit("Unexpected synthetic Docker command")
+elif tool == "git":
+    assert args == ["rev-parse", "HEAD"]
+    print("f" * 40)
+elif tool == "node":
+    assert args[0].endswith("/phala-env-sync/sync.mjs") and args[1:] in ([], ["--check"])
+elif tool == "phala":
+    assert args[:3] == ["deploy", "--cvm-id", "tinycloud-node"]
+    assert "--no-public-logs" in args and "--no-public-sysinfo" in args
+    assert Path(".phala-prod.env").stat().st_mode & 0o777 == 0o600
+    with open(os.environ["MUTATION_TRACE"], "a") as output:
+        output.write("cvm-mutation\\n")
+else:
+    raise SystemExit("Unexpected synthetic executable")
+"""
+        deploy = shell_for_step("Deploy to Phala Cloud")
+        required = deploy.split("required_vars=(\n", 1)[1].split("\n)", 1)[0].split()
+        steps = [shell_for_step(name) for name in (
+            "Validate image version against Cargo.toml", "Validate and pin deployment image",
+            "Preflight sealed runtime configuration", "Deploy to Phala Cloud")]
+        for configuration in ("alpha", "beta"):
+            with self.subTest(configuration=configuration), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                binaries = root / "bin"
+                binaries.mkdir()
+                for tool in ("docker", "git", "node", "phala"):
+                    executable = binaries / tool
+                    executable.write_text(boundary)
+                    executable.chmod(0o700)
+                (root / "tinycloud-node-server").mkdir()
+                (root / "tinycloud-node-server/Cargo.toml").write_text('version = "1.20.7"\n')
+                (root / "dstack-authorized-keys").write_text("synthetic-public-key\n")
+                (root / "docker-compose.dstack-postgres.yaml").write_text(
+                    "services:\n  tinycloud:\n    image: " + N0_CONTEXT["steps.pin.outputs.image"]
+                    + "\n    environment:\n      SYNTHETIC_CONFIG: " + configuration + "\n")
+                trace = root / "mutation-trace"
+                summary = root / "summary"
+                output = root / "output"
+                env = {
+                    "PATH": str(binaries) + ":/usr/bin:/bin", "RUNNER_TEMP": directory,
+                    "EVENT_NAME": "workflow_dispatch", "GITHUB_REF": "refs/heads/main",
+                    "GITHUB_REF_TYPE": "branch", "GITHUB_REF_NAME": "main", "RELEASE_TAG": "",
+                    "INPUT_IMAGE_VERSION": "1.20.6", "INPUT_DEPLOY_DIGEST": DIGEST,
+                    "INPUT_DEPLOY_PHALA": "true", "N0_QUOTA_SNAPSHOT": "true",
+                    "INCLUDE_DUCKDB": "false", "INCLUDE_TC_BENCH_V1": "false",
+                    "ROLLBACK_VERSION": "1.20.6",
+                    "ROLLBACK_REVISION": N0_CONTEXT["steps.pin.outputs.revision"],
+                    "DEPLOY_VERSION": "1.20.6", "BUILD_DIGEST": "", "REGISTRY": "ghcr.io",
+                    "IMAGE_NAME": "tinycloudlabs/tinycloud-node", "MUTATION_TRACE": str(trace),
+                    "GITHUB_OUTPUT": str(output), "GITHUB_STEP_SUMMARY": str(summary),
+                    **{name: self.secret for name in required},
+                }
+                result = subprocess.run(["bash", "--noprofile", "--norc", "-e", "-c", "\n".join(steps)],
+                                        cwd=root, env=env, capture_output=True, text=True)
+                logs = result.stdout + result.stderr
+                logs += summary.read_text() if summary.exists() else ""
+                logs += output.read_text() if output.exists() else ""
+                self.assertFalse(self.secret in logs, "Synthetic workflow leaked a sealed canary")
+                self.assertFalse((root / ".phala-prod.env").exists(), "Sealed temp file was not removed")
+                self.assertFalse(trace.exists(),
+                                 "PENDING reviewed #309 compose binding: unreviewed config reached CVM mutation")
+                self.assertNotEqual(result.returncode, 0,
+                                    "Same immutable image must not authorize unrelated compose bytes")
+
     def test_positive_usage_wrong_owner_config_fails_before_any_request(self):
         other = "tinycloud:pkh:eip155:1:0x" + "1" * 40
         wrong = {other + ":applications": 5368709120, other + ":secrets": 268721121}

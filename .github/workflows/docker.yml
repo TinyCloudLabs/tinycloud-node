@@ -949,6 +949,7 @@ jobs:
           # Repository-scoped; never read by an agent or passed in argv.
           QUOTA_ADMIN_SECRET: ${{ secrets.PROD_TINYCLOUD_ADMIN_SECRET }}
         run: |
+          set -euo pipefail
           set +x
           python3 - <<'PY'
           import http.client
@@ -1126,6 +1127,7 @@ jobs:
         if: >-
           ${{ always() && steps.deploy.outputs.cvm_mutation_attempted == 'true' && steps.quotas.outcome != 'success' }}
         run: |
+          set -euo pipefail
           MESSAGE="OVERRIDES UNVERIFIED: a CVM mutation was attempted without successful reviewed quota restoration. Authorized operator must resolve via TC-1161 before another dispatch."
           echo "::error::${MESSAGE}"
           printf '%s\n' "${MESSAGE}" >> "$GITHUB_STEP_SUMMARY"
@@ -1153,6 +1155,7 @@ jobs:
           IMAGE_LABEL: ${{ needs.deploy-phala.outputs.image_label }}
           IMAGE_REVISION: ${{ needs.deploy-phala.outputs.revision }}
         run: |
+          set -euo pipefail
           if [ -n "${IMAGE}" ]; then
             echo "Promote watch for ${IMAGE_LABEL} (version ${IMAGE_VERSION}) revision ${IMAGE_REVISION}: ${IMAGE}"
           else
