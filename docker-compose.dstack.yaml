@@ -13,7 +13,7 @@
 
 services:
   tinycloud:
-    image: ghcr.io/tinycloudlabs/tinycloud-node:latest
+    image: ghcr.io/tinycloudlabs/tinycloud-node@sha256:4bdae4fc232d886bb56bfbce4ec62ed4b8fb4e1369a01f6afb73d06dd68c188f
     ports:
       # Port 8001 (Prometheus /metrics) is intentionally NOT published: the
       # metrics handler is unauthenticated and serves every series to anyone,
@@ -22,12 +22,10 @@ services:
       - "8000:8000"
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock
-      - tinycloud-data:/app/data
+      - tinycloud-data:/data
     environment:
-      TINYCLOUD_KEYS_TYPE: Dstack
-      TINYCLOUD_STORAGE_DATABASE: "sqlite:./data/caps.db?mode=rwc"
-      TINYCLOUD_STORAGE_BLOCKS_TYPE: Local
-      TINYCLOUD_STORAGE_BLOCKS_PATH: ./data/blocks
+      TINYCLOUD_KEYS__TYPE: Dstack
+      TINYCLOUD_STORAGE__DATADIR: /data
       TINYCLOUD_LOG_LEVEL: normal
       TINYCLOUD_CORS: "true"
       ROCKET_ADDRESS: "0.0.0.0"
