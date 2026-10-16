@@ -1,4 +1,6 @@
-use super::{size::SpaceSizes, BlobGenerationKey};
+#[cfg(test)]
+use super::TestPause;
+use super::{size::SpaceSizes, BlobGenerationKey, BlobOperationLocks};
 use core::pin::Pin;
 use futures::{
     future::{Either as AsyncEither, TryFutureExt},
@@ -19,6 +21,8 @@ use std::{
 use tempfile::{NamedTempFile, PathPersistError};
 use tinycloud_auth::{resource::SpaceId, ssi::dids::DIDBuf};
 use tinycloud_core::{hash::Hash, storage::*};
+#[cfg(test)]
+use tokio::sync::Notify;
 use tokio::{
     fs::{create_dir_all, metadata, remove_file, File},
     io::{AsyncReadExt, AsyncSeekExt},
@@ -32,9 +36,15 @@ use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
 pub struct FileSystemStore {
     path: PathBuf,
     sizes: SpaceSizes,
-    // A partial filesystem write can fail after creating a file. Reserve
-    // before writing and refund the full reservation when deleting it.
+    // Reserve the full size before writing a temporary file. A cancellation
+    // or failed publish leaves a conservative charge until cleanup confirms
+    // that neither the stage nor the final object remains.
     pending: Arc<Mutex<HashMap<BlobGenerationKey, u64>>>,
+    operations: BlobOperationLocks,
+    #[cfg(test)]
+    before_memory_write: TestPause,
+    #[cfg(test)]
+    after_memory_contains: TestPause,
 }
 
 impl FileSystemStore {
@@ -45,6 +55,11 @@ impl FileSystemStore {
             path,
             sizes,
             pending: Arc::new(Mutex::new(HashMap::new())),
+            operations: BlobOperationLocks::default(),
+            #[cfg(test)]
+            before_memory_write: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            after_memory_contains: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -81,15 +96,55 @@ impl FileSystemStore {
             .remove(&(space.clone(), hash, generation));
     }
 
-    async fn refund_missing_pending(&self, space: &SpaceId, hash: Hash, generation: i64) {
-        if let Some(size) = self
-            .pending
-            .lock()
-            .await
-            .remove(&(space.clone(), hash, generation))
-        {
-            self.decrement_size(space, size).await;
+    fn stage_prefix(path: &Path) -> String {
+        format!(
+            ".tc-stage-{}-",
+            path.file_name()
+                .expect("blob path has a name")
+                .to_string_lossy()
+        )
+    }
+
+    /// A process crash can leave a named temporary file in a space directory.
+    /// Boot quota reconstruction counts its actual bytes; candidate GC removes
+    /// files for that hash and refunds them along with any published object.
+    async fn remove_stages(
+        &self,
+        space: &SpaceId,
+        path: &Path,
+        refund_each: bool,
+    ) -> Result<u64, IoError> {
+        let Some(parent) = path.parent() else {
+            return Ok(0);
+        };
+        let mut entries = match tokio::fs::read_dir(parent).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(error),
+        };
+        let prefix = Self::stage_prefix(path);
+        let mut removed = 0u64;
+        while let Some(entry) = entries.next_entry().await? {
+            if !entry.file_name().to_string_lossy().starts_with(&prefix)
+                || !entry.file_type().await?.is_file()
+            {
+                continue;
+            }
+            let size = entry.metadata().await?.len();
+            match remove_file(entry.path()).await {
+                Ok(()) => {
+                    removed = removed
+                        .checked_add(size)
+                        .ok_or_else(|| IoError::other("staged blob byte count overflow"))?;
+                    if refund_each {
+                        self.decrement_size(space, size).await;
+                    }
+                }
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
         }
+        Ok(removed)
     }
 
     async fn persist_temp(
@@ -99,6 +154,10 @@ impl FileSystemStore {
         generation: i64,
         file: TempFileStage,
     ) -> Result<(), FileSystemStoreError> {
+        let _operation = self
+            .operations
+            .lock((space.clone(), hash, generation))
+            .await;
         if self.contains(space, &hash, generation).await? {
             self.settle(space, hash, generation).await;
             return Ok(());
@@ -118,16 +177,42 @@ impl FileSystemStore {
         generation: i64,
         bytes: Vec<u8>,
     ) -> Result<(), FileSystemStoreError> {
+        let _operation = self
+            .operations
+            .lock((space.clone(), hash, generation))
+            .await;
         if self.contains(space, &hash, generation).await? {
             self.settle(space, hash, generation).await;
             return Ok(());
         }
+        #[cfg(test)]
+        let pause = self.after_memory_contains.lock().await.take();
+        #[cfg(test)]
+        if let Some((entered, release)) = pause {
+            entered.notify_one();
+            release.notified().await;
+        }
         self.reserve(space, hash, generation, bytes.len() as u64)
             .await;
-        let file = File::create(self.get_path(space, &hash, generation)).await?;
-        let mut writer = futures::io::BufWriter::new(file.compat());
+        let target = self.get_path(space, &hash, generation);
+        // Stage on the target filesystem so the final rename is atomic and
+        // never depends on a cross-device copy.
+        let staged = tempfile::Builder::new()
+            .prefix(&Self::stage_prefix(&target))
+            .tempfile_in(target.parent().expect("blob path has a parent"))?;
+        let (file, path) = staged.into_parts();
+        #[cfg(test)]
+        let pause = self.before_memory_write.lock().await.take();
+        #[cfg(test)]
+        if let Some((entered, release)) = pause {
+            entered.notify_one();
+            release.notified().await;
+        }
+        let mut writer = File::from_std(file).compat();
         writer.write_all(&bytes).await?;
         writer.flush().await?;
+        drop(writer);
+        path.persist(target)?;
         self.settle(space, hash, generation).await;
         Ok(())
     }
@@ -447,32 +532,38 @@ impl ImmutableDeleteStore for FileSystemStore {
         id: &Hash,
         generation: i64,
     ) -> Result<Option<()>, Self::Error> {
+        let key = (space.clone(), *id, generation);
+        let _operation = self.operations.lock(key.clone()).await;
         let path = self.get_path(space, id, generation);
-        let size = match metadata(&path).await {
-            Ok(m) => m.len(),
-            Err(e) if e.kind() == ErrorKind::NotFound => {
-                self.refund_missing_pending(space, *id, generation).await;
-                return Ok(None);
-            }
-            Err(e) => return Err(e.into()),
+        let pending = self.pending.lock().await.contains_key(&key);
+        // A crash can leave a named, incomplete memory stage. Boot counted
+        // its actual bytes; a live reservation instead counted its full size.
+        let staged = self.remove_stages(space, &path, !pending).await?;
+        let final_size = match metadata(&path).await {
+            Ok(meta) => Some(meta.len()),
+            Err(error) if error.kind() == ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
         };
-        match remove_file(path).await {
-            Ok(()) => {
-                let charged = self
-                    .pending
-                    .lock()
-                    .await
-                    .remove(&(space.clone(), *id, generation))
-                    .unwrap_or(size);
-                self.decrement_size(space, charged).await;
-                Ok(Some(()))
+        let removed_final = if let Some(size) = final_size {
+            match remove_file(&path).await {
+                Ok(()) => Some(size),
+                Err(error) if error.kind() == ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
             }
-            Err(e) if e.kind() == ErrorKind::NotFound => {
-                self.refund_missing_pending(space, *id, generation).await;
-                Ok(None)
-            }
-            Err(e) => Err(e.into()),
+        } else {
+            None
+        };
+        if pending {
+            let reserved = self.pending.lock().await.remove(&key).unwrap_or(0);
+            self.decrement_size(
+                space,
+                reserved.max(staged.saturating_add(removed_final.unwrap_or(0))),
+            )
+            .await;
+        } else if let Some(size) = removed_final {
+            self.decrement_size(space, size).await;
         }
+        Ok((removed_final.is_some() || staged != 0).then_some(()))
     }
 }
 
@@ -488,6 +579,162 @@ impl StorageConfig<TempFileSystemStage> for TempFileSystemStage {
 mod test {
     use super::*;
     use futures::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn memory_publish_is_atomic_for_concurrent_same_hash_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileSystemConfig::new(dir.path()).open().await.unwrap();
+        let space: SpaceId = "tinycloud:key:test:atomic".parse().unwrap();
+        store.create(&space).await.unwrap();
+        let data = b"same-content two distinct KV paths".to_vec();
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        *store.before_memory_write.lock().await = Some((entered.clone(), release));
+        let mut first_stage = HashBuffer::new(Vec::new());
+        first_stage.write_all(&data).await.unwrap();
+        let hash = first_stage.hash();
+        let first_store = store.clone();
+        let first_space = space.clone();
+        let first = tokio::spawn(async move {
+            ImmutableWriteStore::<memory::MemoryStaging>::persist(
+                &first_store,
+                &first_space,
+                first_stage,
+                0,
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        let prematurely_visible = store.contains(&space, &hash, 0).await.unwrap();
+        let mut second_stage = HashBuffer::new(Vec::new());
+        second_stage.write_all(&data).await.unwrap();
+        let second_store = store.clone();
+        let second_space = space.clone();
+        let mut second = tokio::spawn(async move {
+            ImmutableWriteStore::<memory::MemoryStaging>::persist(
+                &second_store,
+                &second_space,
+                second_stage,
+                0,
+            )
+            .await
+        });
+        let early_second =
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut second).await;
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        let second_hash = match early_second {
+            Ok(result) => result.unwrap().unwrap(),
+            Err(_) => tokio::time::timeout(std::time::Duration::from_secs(2), second)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+        };
+        assert_eq!(second_hash, hash);
+        let stored = store.read_to_vec(&space, &hash, 0).await.unwrap().unwrap();
+        assert!(
+            !prematurely_visible,
+            "a complete candidate must be published before same-hash dedup"
+        );
+        assert_eq!(stored, data, "a committed alias must read all staged bytes");
+        assert_eq!(
+            store.total_size(&space).await.unwrap(),
+            Some(data.len() as u64)
+        );
+    }
+
+    #[tokio::test]
+    async fn same_generation_concurrent_memory_put_charges_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileSystemConfig::new(dir.path()).open().await.unwrap();
+        let space: SpaceId = "tinycloud:key:test:one-charge".parse().unwrap();
+        store.create(&space).await.unwrap();
+        let data = b"same content for two KV records".to_vec();
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        *store.after_memory_contains.lock().await = Some((entered.clone(), release.clone()));
+        let mut first_stage = HashBuffer::new(Vec::new());
+        first_stage.write_all(&data).await.unwrap();
+        let hash = first_stage.hash();
+        let first_store = store.clone();
+        let first_space = space.clone();
+        let first = tokio::spawn(async move {
+            ImmutableWriteStore::<memory::MemoryStaging>::persist(
+                &first_store,
+                &first_space,
+                first_stage,
+                0,
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        let mut second_stage = HashBuffer::new(Vec::new());
+        second_stage.write_all(&data).await.unwrap();
+        let second_store = store.clone();
+        let second_space = space.clone();
+        let mut second = tokio::spawn(async move {
+            ImmutableWriteStore::<memory::MemoryStaging>::persist(
+                &second_store,
+                &second_space,
+                second_stage,
+                0,
+            )
+            .await
+        });
+        let early_second =
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut second).await;
+        release.notify_one();
+        assert_eq!(first.await.unwrap().unwrap(), hash);
+        let second_hash = match early_second {
+            Ok(result) => result.unwrap().unwrap(),
+            Err(_) => tokio::time::timeout(std::time::Duration::from_secs(2), second)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+        };
+        assert_eq!(second_hash, hash);
+        assert_eq!(
+            store.read_to_vec(&space, &hash, 0).await.unwrap(),
+            Some(data.clone())
+        );
+        assert_eq!(
+            store.total_size(&space).await.unwrap(),
+            Some(data.len() as u64)
+        );
+        assert_eq!(store.remove(&space, &hash, 0).await.unwrap(), Some(()));
+        assert_eq!(store.total_size(&space).await.unwrap(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn restart_counts_then_collects_crash_leftover_memory_stage() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileSystemConfig::new(dir.path()).open().await.unwrap();
+        let space: SpaceId = "tinycloud:key:test:stage-restart".parse().unwrap();
+        store.create(&space).await.unwrap();
+        let hash = tinycloud_core::hash::hash(b"unfinished memory stage");
+        let path = store.get_path(&space, &hash, 0);
+        let prefix = format!(".tc-stage-{}-", path.file_name().unwrap().to_str().unwrap());
+        let mut stage = tempfile::Builder::new()
+            .prefix(&prefix)
+            .tempfile_in(path.parent().unwrap())
+            .unwrap();
+        std::io::Write::write_all(&mut stage, b"partial").unwrap();
+        let stage_path = stage.path().to_path_buf();
+        stage.into_temp_path().keep().unwrap();
+        drop(store);
+
+        let reopened = FileSystemConfig::new(dir.path()).open().await.unwrap();
+        assert_eq!(reopened.total_size(&space).await.unwrap(), Some(7));
+        reopened.remove(&space, &hash, 0).await.unwrap();
+        assert_eq!(reopened.total_size(&space).await.unwrap(), Some(0));
+        assert!(!stage_path.exists());
+    }
 
     #[tokio::test]
     async fn failed_file_creation_refunds_reserved_quota() {

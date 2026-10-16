@@ -119,7 +119,7 @@ fn latest_writes() -> SelectStatement {
             (write.clone(), kv_write::Column::Metadata),
         ])
         .expr_as(Expr::exists(exact_tombstone), current_kv::Column::Deleted)
-        .expr_as(Expr::val(0), current_kv::Column::Generation)
+        .expr_as(Expr::val(0_i64), current_kv::Column::Generation)
         .from_as(kv_write::Entity, write)
         .cond_where(Condition::all().not().add(Expr::exists(newer_write)));
     query.to_owned()
@@ -177,7 +177,10 @@ mod tests {
     use crate::models::{actor, epoch, invocation, space};
     use crate::relationships::event_order;
     use crate::types::{Metadata, SpaceIdWrap};
-    use sea_orm::{ActiveModelTrait, ActiveValue::Set, ConnectOptions, Database, PaginatorTrait};
+    use sea_orm::{
+        ActiveModelTrait, ActiveValue::Set, ConnectOptions, ConnectionTrait, Database, DbBackend,
+        PaginatorTrait, Statement,
+    };
     use sea_orm_migration::MigratorTrait;
     use std::collections::BTreeMap;
     use time::OffsetDateTime;
@@ -342,5 +345,66 @@ mod tests {
             2,
             "backfill must preserve immutable delete history"
         );
+    }
+    #[tokio::test]
+    async fn postgres_populated_pre_current_kv_backfill_decodes_generation() {
+        let Some(url) = crate::test_support::postgres_test_url(
+            "postgres_populated_pre_current_kv_backfill_decodes_generation",
+        ) else {
+            return;
+        };
+        let admin = Database::connect(url.clone()).await.unwrap();
+        let schema = format!(
+            "tc735_old_kv_{}_{}",
+            std::process::id(),
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        );
+        admin
+            .execute(Statement::from_string(
+                DbBackend::Postgres,
+                format!("CREATE SCHEMA {schema}"),
+            ))
+            .await
+            .unwrap();
+        let mut options = ConnectOptions::new(url);
+        options.set_schema_search_path(schema.clone());
+        let db = Database::connect(options).await.unwrap();
+        Migrator::up(&db, Some(13)).await.unwrap();
+        let did: DIDBuf = DID_METHODS
+            .generate(&JWK::generate_ed25519().unwrap(), "key")
+            .unwrap();
+        let space_id = SpaceId::new(did, "migration".parse().unwrap());
+        actor::ActiveModel {
+            id: Set("did:key:migration".to_string()),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        space::ActiveModel {
+            id: Set(SpaceIdWrap(space_id.clone())),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        let write = insert_write(&db, &space_id, "older-key", "older-value", 1).await;
+        let backfill = Migration.up(&SchemaManager::new(&db)).await;
+        let current = if backfill.is_ok() {
+            current_kv::Entity::find().one(&db).await.unwrap()
+        } else {
+            None
+        };
+        db.close().await.unwrap();
+        admin
+            .execute(Statement::from_string(
+                DbBackend::Postgres,
+                format!("DROP SCHEMA {schema} CASCADE"),
+            ))
+            .await
+            .unwrap();
+        backfill.unwrap();
+        let current = current.unwrap();
+        assert_eq!(current.invocation, write.invocation);
+        assert_eq!(current.value, write.value);
+        assert_eq!(current.generation, 0);
     }
 }

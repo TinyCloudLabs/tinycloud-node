@@ -25,8 +25,12 @@ use std::{
 use tinycloud_auth::resource::SpaceId;
 use tinycloud_core::{hash::Hash, storage::*};
 
-use super::{file_system, size::SpaceSizes, BlobGenerationKey};
+#[cfg(test)]
+use super::TestPause;
+use super::{file_system, size::SpaceSizes, BlobGenerationKey, BlobOperationLocks};
 use tokio::sync::Mutex;
+#[cfg(test)]
+use tokio::sync::Notify;
 
 async fn aws_config() -> SdkConfig {
     aws_config::from_env().load().await
@@ -45,6 +49,11 @@ pub struct S3BlockStore {
     // size until absence is confirmed, so retry refunds exactly once. On
     // restart, the initial bucket listing reconstructs only physical bytes.
     deleting: Arc<Mutex<HashMap<BlobGenerationKey, u64>>>,
+    operations: BlobOperationLocks,
+    #[cfg(test)]
+    after_delete_head: TestPause,
+    #[cfg(test)]
+    after_put_head: TestPause,
 }
 
 #[serde_as]
@@ -155,6 +164,11 @@ impl S3BlockStore {
             sizes,
             pending: Arc::new(Mutex::new(HashMap::new())),
             deleting: Arc::new(Mutex::new(counted_deletes)),
+            operations: BlobOperationLocks::default(),
+            #[cfg(test)]
+            after_delete_head: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            after_put_head: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -194,10 +208,20 @@ impl S3BlockStore {
         Fut: Future<Output = Result<(u64, ByteStream, G), S3StoreError>>,
     {
         let key = (space.clone(), hash, generation);
+        // Dedup, reservation, PUT and settlement are one physical generation
+        // operation. A second KV path cannot charge the same bytes again.
+        let _operation = self.operations.lock(key.clone()).await;
         if self.contains(space, &hash, generation).await? {
             // A retry of an ambiguous PUT can find its original object.
             self.pending.lock().await.remove(&key);
             return Ok(());
+        }
+        #[cfg(test)]
+        let pause = self.after_put_head.lock().await.take();
+        #[cfg(test)]
+        if let Some((entered, release)) = pause {
+            entered.notify_one();
+            release.notified().await;
         }
         let (size, body, guard) = body().await?;
         let mut pending = self.pending.lock().await;
@@ -539,6 +563,9 @@ impl ImmutableDeleteStore for S3BlockStore {
         id: &Hash,
         generation: i64,
     ) -> Result<Option<()>, Self::Error> {
+        // A stale positive HEAD must not recreate a charge after another
+        // deleter has already confirmed absence and refunded it.
+        let _operation = self.operations.lock((space.clone(), *id, generation)).await;
         let size: u64 = match self
             .client
             .head_object()
@@ -561,6 +588,13 @@ impl ImmutableDeleteStore for S3BlockStore {
             }
             Err(error) => return Err(S3Error::from(error).into()),
         };
+        #[cfg(test)]
+        let pause = self.after_delete_head.lock().await.take();
+        #[cfg(test)]
+        if let Some((entered, release)) = pause {
+            entered.notify_one();
+            release.notified().await;
+        }
         self.deleting
             .lock()
             .await
@@ -691,6 +725,151 @@ mod tests {
         for hash in hashes {
             store.remove(&space, &hash, 0).await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn minio_same_generation_concurrent_put_charges_once() {
+        use futures::io::AsyncWriteExt;
+        let Ok(endpoint) = std::env::var("TC735_TEST_MINIO_ENDPOINT") else {
+            return;
+        };
+        let bucket = std::env::var("TC735_TEST_MINIO_BUCKET")
+            .expect("TC735_TEST_MINIO_BUCKET is required with TC735_TEST_MINIO_ENDPOINT");
+        let store = S3BlockConfig {
+            bucket,
+            endpoint: Some(endpoint.parse().unwrap()),
+        }
+        .open()
+        .await
+        .unwrap();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let space: SpaceId = format!("tinycloud:key:test:tc735-same-charge-{nonce}")
+            .parse()
+            .unwrap();
+        store.create(&space).await.unwrap();
+        let data = b"same bytes under two KV paths";
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        *store.after_put_head.lock().await = Some((entered.clone(), release.clone()));
+        let mut first_stage = memory::MemoryStaging.stage(&space).await.unwrap();
+        first_stage.write_all(data).await.unwrap();
+        let hash = first_stage.hash();
+        let first_store = store.clone();
+        let first_space = space.clone();
+        let first = tokio::spawn(async move {
+            ImmutableWriteStore::<memory::MemoryStaging>::persist(
+                &first_store,
+                &first_space,
+                first_stage,
+                0,
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(3), entered.notified())
+            .await
+            .unwrap();
+        let mut second_stage = memory::MemoryStaging.stage(&space).await.unwrap();
+        second_stage.write_all(data).await.unwrap();
+        let second_store = store.clone();
+        let second_space = space.clone();
+        let mut second = tokio::spawn(async move {
+            ImmutableWriteStore::<memory::MemoryStaging>::persist(
+                &second_store,
+                &second_space,
+                second_stage,
+                0,
+            )
+            .await
+        });
+        let early_second =
+            tokio::time::timeout(std::time::Duration::from_secs(2), &mut second).await;
+        release.notify_one();
+        assert_eq!(first.await.unwrap().unwrap(), hash);
+        let second_hash = match early_second {
+            Ok(result) => result.unwrap().unwrap(),
+            Err(_) => second.await.unwrap().unwrap(),
+        };
+        assert_eq!(second_hash, hash);
+        assert_eq!(
+            store.total_size(&space).await.unwrap(),
+            Some(data.len() as u64)
+        );
+        assert_eq!(
+            store.read_to_vec(&space, &hash, 0).await.unwrap(),
+            Some(data.to_vec())
+        );
+        assert_eq!(store.remove(&space, &hash, 0).await.unwrap(), Some(()));
+        assert_eq!(store.total_size(&space).await.unwrap(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn minio_stale_head_cannot_recreate_refunded_deletion_charge() {
+        use futures::io::AsyncWriteExt;
+        let Ok(endpoint) = std::env::var("TC735_TEST_MINIO_ENDPOINT") else {
+            return;
+        };
+        let bucket = std::env::var("TC735_TEST_MINIO_BUCKET")
+            .expect("TC735_TEST_MINIO_BUCKET is required with TC735_TEST_MINIO_ENDPOINT");
+        let store = S3BlockConfig {
+            bucket,
+            endpoint: Some(endpoint.parse().unwrap()),
+        }
+        .open()
+        .await
+        .unwrap();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let space: SpaceId = format!("tinycloud:key:test:tc735-stale-head-{nonce}")
+            .parse()
+            .unwrap();
+        store.create(&space).await.unwrap();
+        let data = b"same generation charge";
+        let mut stage = memory::MemoryStaging.stage(&space).await.unwrap();
+        stage.write_all(data).await.unwrap();
+        let hash = ImmutableWriteStore::<memory::MemoryStaging>::persist(&store, &space, stage, 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.total_size(&space).await.unwrap(),
+            Some(data.len() as u64)
+        );
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        *store.after_delete_head.lock().await = Some((entered.clone(), release.clone()));
+        let first_store = store.clone();
+        let first_space = space.clone();
+        let first = tokio::spawn(async move { first_store.remove(&first_space, &hash, 0).await });
+        tokio::time::timeout(std::time::Duration::from_secs(3), entered.notified())
+            .await
+            .unwrap();
+        let second_store = store.clone();
+        let second_space = space.clone();
+        let mut second =
+            tokio::spawn(async move { second_store.remove(&second_space, &hash, 0).await });
+        // Without per-generation serialization, second DELETE completes
+        // while the first retains a stale positive HEAD. With the fix, it
+        // waits and then observes the confirmed absence.
+        let early_second =
+            tokio::time::timeout(std::time::Duration::from_secs(2), &mut second).await;
+        release.notify_one();
+        let first_result = first.await.unwrap().unwrap();
+        let second_result = match early_second {
+            Ok(result) => result.unwrap().unwrap(),
+            Err(_) => second.await.unwrap().unwrap(),
+        };
+        assert!(first_result.is_some() || second_result.is_some());
+        assert!(!store.contains(&space, &hash, 0).await.unwrap());
+        assert_eq!(
+            store.total_size(&space).await.unwrap(),
+            Some(0),
+            "the same generation can refund physical bytes only once"
+        );
     }
 
     #[tokio::test]

@@ -4981,6 +4981,31 @@ mod test {
     }
 
     #[tokio::test]
+    async fn sqlite_preupload_registration_reserves_writer_before_authorization_reads() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("candidate.db");
+        let conn = sqlite_write_pool(&path, std::time::Duration::from_secs(5), 1).await;
+        let collector = sqlite_write_pool(&path, std::time::Duration::from_millis(100), 1).await;
+        let recovering = RecoveringConnection::new(conn);
+
+        let prep = recovering.begin_preparatory().await.unwrap();
+        epoch::Entity::find().count(&prep).await.unwrap();
+        let error = test_actor("did:key:collector")
+            .insert(&collector)
+            .await
+            .expect_err("collector cannot invalidate the preparatory read snapshot");
+        assert_eq!(sqlite_error_code(&error).as_deref(), Some("5"), "{error}");
+        prep.execute_unprepared(SQLITE_RESERVE_WRITE_LOCK)
+            .await
+            .expect("registration after authorization remains writable");
+        prep.commit().await.unwrap();
+        test_actor("did:key:collector")
+            .insert(&collector)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn postgres_write_transaction_is_a_plain_begin() {
         let Some(database_url) =
             crate::test_support::postgres_test_url("postgres_write_transaction_is_a_plain_begin")

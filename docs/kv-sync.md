@@ -147,6 +147,15 @@ authorization and conditional-write preconditions. The guards stay through
 commit, so `seq` and sync cursors remain commit-ordered even when same-space
 uploads finish out of order. An unauthorized write uploads nothing.
 
+For a single node process, each `(space, hash, generation)` serializes its
+physical existence check, upload or deletion, and quota settlement without
+holding a database connection. Filesystem memory staging writes into a
+same-directory temporary file and atomically renames only complete bytes to
+the hash key. A process crash can leave an incomplete stage; startup counts
+its physical bytes, and the hash candidate's GC pass removes and refunds it.
+SQLite preparatory writes reserve the database writer before authorization
+reads, so a separate collector connection cannot invalidate the read snapshot.
+
 Protected legacy meeting paths are the TC-1260 exception: the durable freeze
 row and its pooled transaction remain locked across upload until commit or
 abort. A freeze acknowledgement drains earlier uploads; a later protected
