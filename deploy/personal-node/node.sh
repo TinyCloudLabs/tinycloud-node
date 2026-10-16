@@ -97,6 +97,10 @@ case "${1:-}" in
     compose up -d
     health
     ;;
+  restart)
+    compose restart node
+    health
+    ;;
   stop)
     compose stop
     ;;
