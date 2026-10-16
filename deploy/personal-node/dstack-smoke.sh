@@ -23,6 +23,9 @@ ready() {
 
 compose up -d tinycloud
 ready
+curl -fsS http://127.0.0.1:8000/version |
+  jq -e '.version == "1.20.6" and (.features | index("tee") != null) and .inTEE == false' >/dev/null ||
+  { printf '%s\n' 'Dstack profile did not run the pinned dstack build' >&2; exit 1; }
 "$here/test/probe/node_modules/.bin/tsx" "$here/test/probe/personal-node-check.ts" seed http://127.0.0.1:8000 "$owner"
 compose down
 compose up -d tinycloud

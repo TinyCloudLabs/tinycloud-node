@@ -104,7 +104,7 @@ case "${1:-}" in
     [[ $# == 2 ]] || fail 'Usage: node.sh check-version 1.20.5|1.20.6'
     health
     curl -fsS "${ca_args[@]}" "$(url)/version" |
-      jq -e --arg version "$2" '.version == $version and .quotaUrl == null and .inTee == false' >/dev/null ||
+      jq -e --arg version "$2" '.version == $version and .quota_url == null and .inTEE == false' >/dev/null ||
       fail 'Unexpected node version, hosted quota, or TEE mode'
     ;;
   verify|seed)
