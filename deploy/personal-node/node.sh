@@ -127,9 +127,11 @@ case "${1:-}" in
     [[ $# == 3 && -f "$3" ]] || fail 'Usage: node.sh backup BACKUP_DIR PASSPHRASE_FILE'
     [[ ! -e "$2" ]] || fail 'Choose a fresh backup directory'
     identity
+    [[ -f "$home/identity" ]] && cmp -s "$home/identity" "$home/current-identity" ||
+      fail 'Back up only after verifying the original node identity'
     mkdir -m 700 "$2"
     compose stop node
-    tar -C "$home/data" -czf "$2/data.tar.gz" .
+    sudo tar -C "$home/data" -czf - . > "$2/data.tar.gz"
     openssl enc -aes-256-cbc -pbkdf2 -salt -in "$home/node.env" -out "$2/identity.enc" -pass "file:$3"
     cp "$home/identity" "$home/image" "$home/domain" "$home/tls-mode" "$2/"
     compose up -d node
