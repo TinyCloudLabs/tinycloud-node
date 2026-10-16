@@ -14,10 +14,18 @@ trap 'compose down -v >/dev/null 2>&1 || true' EXIT
 
 ready() {
   for _ in {1..40}; do
-    if curl -fsS http://127.0.0.1:8000/healthz -o /dev/null; then return; fi
+    if curl -fsS http://127.0.0.1:8000/healthz -o /dev/null 2>/dev/null; then return; fi
     sleep 2
   done
-  printf '%s\n' 'Dstack-profile health check failed' >&2
+  printf '%s\n' 'Dstack-profile health check failed; container state and redacted errors:' >&2
+  compose ps --all >&2
+  compose logs --no-color --tail=100 tinycloud 2>&1 |
+    while IFS= read -r line; do
+      case "$line" in
+        *[Ee]rror*|*failed*|*denied*|*panic*)
+          printf '%s\n' "${line//"$TC1282_TEST_KEY"/[REDACTED]}" >&2 ;;
+      esac
+    done
   exit 1
 }
 
