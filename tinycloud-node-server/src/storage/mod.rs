@@ -9,18 +9,14 @@ use std::sync::Arc;
 use crate::{at_rest::AtRestRuntime, BlockStores};
 use tinycloud_core::storage::either::Either;
 
-/// Links the opened block store to the node's at-rest state (TC-887).
-///
-/// The FileSystem store seals KV blocks when the mode and keys allow, so it
-/// declares a seal path. The S3 store does not seal yet and declares none,
-/// so `at_rest::setup` refuses a non-`off` mode with S3 storage rather than
-/// write plaintext.
+/// Links the opened block store to the node's at-rest state (TC-887). Both
+/// stores seal KV blocks when the mode and keys allow, so storage declares a
+/// seal path.
 pub fn attach_at_rest(stores: &mut BlockStores, runtime: Arc<AtRestRuntime>) {
+    runtime.declare_seal_path();
+    let handle = sealed::AtRestHandle::new(runtime);
     match stores {
-        Either::B(fs) => {
-            runtime.declare_seal_path();
-            fs.attach_at_rest(sealed::AtRestHandle::new(runtime));
-        }
-        Either::A(_) => {}
+        Either::A(s3) => s3.attach_at_rest(handle),
+        Either::B(fs) => fs.attach_at_rest(handle),
     }
 }
