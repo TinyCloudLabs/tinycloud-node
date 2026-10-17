@@ -9,7 +9,9 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
 /// `database_artifact.payload_encoding` / `delta_encoding` (SMALLINT).
-/// `NULL` is legacy plaintext; `1` is TCE1. Any other value is refused.
+/// `NULL` is legacy plaintext; `g` in 1..=255 is TCE generation `g`, of which
+/// this build reads only 1 (later ones are [`EnvelopeError::Unsupported`]).
+/// Zero, negative and larger values are refused as invalid.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PayloadEncoding {
     LegacyPlaintext,
@@ -21,7 +23,8 @@ impl PayloadEncoding {
         match value {
             None => Ok(Self::LegacyPlaintext),
             Some(1) => Ok(Self::Tce1),
-            Some(_) => Err(EnvelopeError::Header("unknown payload encoding")),
+            Some(v @ 2..=255) => Err(EnvelopeError::Unsupported { version: v as u8 }),
+            Some(_) => Err(EnvelopeError::Header("invalid payload encoding")),
         }
     }
 

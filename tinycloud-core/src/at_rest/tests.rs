@@ -133,6 +133,94 @@ fn segment(p: usize, i: usize) -> std::ops::Range<usize> {
 struct Vectors {
     vectors: Vec<Vector>,
     object_names: Vec<NameVector>,
+    negative: Vec<serde_json::Value>,
+    lengths: Lengths,
+    ranges: Vec<RangeVector>,
+}
+
+#[derive(serde::Deserialize)]
+struct Lengths {
+    plaintext_to_ciphertext: Vec<LengthPair>,
+    ciphertext_to_plaintext: Vec<LengthPair>,
+}
+
+#[derive(serde::Deserialize)]
+struct LengthPair {
+    plaintext_len: Option<u64>,
+    ciphertext_len: Option<u64>,
+}
+
+#[derive(serde::Deserialize)]
+struct RangeVector {
+    total: u64,
+    spec: serde_json::Value,
+    mapped: Option<MappedRange>,
+}
+
+#[derive(serde::Deserialize, Debug, PartialEq)]
+struct MappedRange {
+    plaintext_start: u64,
+    plaintext_end: u64,
+    ciphertext_start: u64,
+    ciphertext_end: u64,
+}
+
+fn vectors() -> Vectors {
+    serde_json::from_str(include_str!("testdata/vectors.json")).unwrap()
+}
+
+fn vector_plaintext(t: &Vector) -> Vec<u8> {
+    match t.plaintext.get("hex") {
+        Some(h) => hex::decode(h.as_str().unwrap()).unwrap(),
+        None => (0..t.plaintext["pattern_len"].as_u64().unwrap())
+            .map(|i| (i % 251) as u8)
+            .collect(),
+    }
+}
+
+fn with_identity<T>(i: &serde_json::Value, f: impl FnOnce(&BlobIdentity<'_>) -> T) -> T {
+    let content_hash;
+    let id = match s(i, "purpose") {
+        "kv-block" => {
+            content_hash = Hash::try_from(hex::decode(s(i, "content_hash")).unwrap()).unwrap();
+            BlobIdentity::KvBlock {
+                space: s(i, "space"),
+                content_hash: &content_hash,
+            }
+        }
+        "sql-checkpoint" => BlobIdentity::SqlCheckpoint {
+            service: s(i, "service"),
+            space: s(i, "space"),
+            name: s(i, "name"),
+            checkpoint_content_hash: s(i, "checkpoint_content_hash"),
+            checkpoint_size_bytes: i["checkpoint_size_bytes"].as_u64().unwrap(),
+        },
+        "sql-wal" => BlobIdentity::SqlWal {
+            service: s(i, "service"),
+            space: s(i, "space"),
+            name: s(i, "name"),
+            revision: i["revision"].as_i64().unwrap(),
+            checkpoint_content_hash: s(i, "checkpoint_content_hash"),
+            delta_content_hash: s(i, "delta_content_hash"),
+        },
+        p => panic!("unknown purpose {p}"),
+    };
+    f(&id)
+}
+
+fn range_spec(v: &serde_json::Value) -> ByteRangeSpec {
+    let n = |k: &str| v[k].as_u64().unwrap();
+    match s(v, "kind") {
+        "inclusive" => ByteRangeSpec::Inclusive {
+            start: n("start"),
+            end: n("end"),
+        },
+        "from" => ByteRangeSpec::From { start: n("start") },
+        "suffix" => ByteRangeSpec::Suffix {
+            length: n("length"),
+        },
+        k => panic!("unknown range kind {k}"),
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -168,69 +256,12 @@ fn s<'a>(v: &'a serde_json::Value, k: &str) -> &'a str {
 
 #[test]
 fn known_answer_vectors_match_independent_reference() {
-    use sha2::{Digest, Sha256};
-    let v: Vectors = serde_json::from_str(include_str!("testdata/vectors.json")).unwrap();
+    let v = vectors();
     assert_eq!(v.vectors.len(), 8);
     for t in &v.vectors {
         let k = DataKey::new(DekId::new(t.dek_id), arr32(&t.dek));
-        let pt = match t.plaintext.get("hex") {
-            Some(h) => hex::decode(h.as_str().unwrap()).unwrap(),
-            None => (0..t.plaintext["pattern_len"].as_u64().unwrap())
-                .map(|i| (i % 251) as u8)
-                .collect(),
-        };
-        let i = &t.identity;
-        let content_hash;
-        let id = match s(i, "purpose") {
-            "kv-block" => {
-                content_hash = Hash::try_from(hex::decode(s(i, "content_hash")).unwrap()).unwrap();
-                BlobIdentity::KvBlock {
-                    space: s(i, "space"),
-                    content_hash: &content_hash,
-                }
-            }
-            "sql-checkpoint" => BlobIdentity::SqlCheckpoint {
-                service: s(i, "service"),
-                space: s(i, "space"),
-                name: s(i, "name"),
-                checkpoint_content_hash: s(i, "checkpoint_content_hash"),
-                checkpoint_size_bytes: i["checkpoint_size_bytes"].as_u64().unwrap(),
-            },
-            "sql-wal" => BlobIdentity::SqlWal {
-                service: s(i, "service"),
-                space: s(i, "space"),
-                name: s(i, "name"),
-                revision: i["revision"].as_i64().unwrap(),
-                checkpoint_content_hash: s(i, "checkpoint_content_hash"),
-                delta_content_hash: s(i, "delta_content_hash"),
-            },
-            p => panic!("unknown purpose {p}"),
-        };
-        let header = Header::build(k.id(), pt.len() as u64, &arr32(&t.salt));
-
-        let ct = seal_with_header(&k, &id, &header, pt.clone());
-        assert_eq!(ct.len() as u64, t.ciphertext_len, "{}", t.name);
-        assert_eq!(
-            hex::encode(Sha256::digest(&ct)),
-            t.ciphertext_sha256,
-            "{}",
-            t.name
-        );
-        if let Some(full) = &t.ciphertext {
-            assert_eq!(&hex::encode(&ct), full, "{}", t.name);
-        }
-        if let Some(head) = &t.ciphertext_head {
-            assert!(hex::encode(&ct).starts_with(head), "{}", t.name);
-        }
-
-        let streamed = read_all(
-            EncryptReader::with_header(&k, &id, &header, Chunked::new(pt.clone(), vec![777])),
-            &[1000],
-        )
-        .unwrap();
-        assert_eq!(streamed, ct, "{} streaming", t.name);
-        assert_eq!(open(&k, &id, ct.clone()).unwrap(), pt, "{}", t.name);
-        assert_eq!(stream_open(&k, &id, &ct).unwrap(), pt, "{}", t.name);
+        let pt = vector_plaintext(t);
+        with_identity(&t.identity, |id| kat_one(t, &k, id, &pt));
     }
 
     for n in &v.object_names {
@@ -238,6 +269,147 @@ fn known_answer_vectors_match_independent_reference() {
         let h = Hash::try_from(hex::decode(&n.content_hash).unwrap()).unwrap();
         assert_eq!(space_tag(&nk, &n.space), n.space_tag);
         assert_eq!(sealed_object_name(&nk, &n.space, &h), n.object_name);
+    }
+}
+
+fn kat_one(t: &Vector, k: &DataKey, id: &BlobIdentity<'_>, pt: &[u8]) {
+    use sha2::{Digest, Sha256};
+    let header = Header::build(k.id(), pt.len() as u64, &arr32(&t.salt));
+
+    let ct = seal_with_header(k, id, &header, pt.to_vec());
+    assert_eq!(ct.len() as u64, t.ciphertext_len, "{}", t.name);
+    assert_eq!(
+        hex::encode(Sha256::digest(&ct)),
+        t.ciphertext_sha256,
+        "{}",
+        t.name
+    );
+    if let Some(full) = &t.ciphertext {
+        assert_eq!(&hex::encode(&ct), full, "{}", t.name);
+    }
+    if let Some(head) = &t.ciphertext_head {
+        assert!(hex::encode(&ct).starts_with(head), "{}", t.name);
+    }
+
+    let streamed = read_all(
+        EncryptReader::with_header(k, id, &header, Chunked::new(pt.to_vec(), vec![777])),
+        &[1000],
+    )
+    .unwrap();
+    assert_eq!(streamed, ct, "{} streaming", t.name);
+    assert_eq!(open(k, id, ct.clone()).unwrap(), pt, "{}", t.name);
+    assert_eq!(stream_open(k, id, &ct).unwrap(), pt, "{}", t.name);
+}
+
+fn error_kind(e: &EnvelopeError) -> &'static str {
+    match e {
+        EnvelopeError::Header(_) => "header",
+        EnvelopeError::Unsupported { .. } => "unsupported",
+        EnvelopeError::Integrity => "integrity",
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+/// Mutations the Python reference opener rejects must be rejected the same
+/// way here, whole-buffer and streaming.
+#[test]
+fn negative_vectors_are_refused_like_the_reference() {
+    let v = vectors();
+    assert!(v.negative.len() >= 15);
+    for n in &v.negative {
+        let base = v.vectors.iter().find(|t| t.name == s(n, "base")).unwrap();
+        let k = DataKey::new(DekId::new(base.dek_id), arr32(&base.dek));
+        let header = Header::build(
+            k.id(),
+            vector_plaintext(base).len() as u64,
+            &arr32(&base.salt),
+        );
+        let mut ct = with_identity(&base.identity, |id| {
+            seal_with_header(&k, id, &header, vector_plaintext(base))
+        });
+        let at = || n["at"].as_u64().unwrap() as usize;
+        match s(n, "op") {
+            "truncate" => ct.truncate(n["len"].as_u64().unwrap() as usize),
+            "append" => ct.extend(hex::decode(s(n, "hex")).unwrap()),
+            "xor" => ct[at()] ^= n["mask"].as_u64().unwrap() as u8,
+            "set" => {
+                let b = hex::decode(s(n, "hex")).unwrap();
+                ct[at()..at() + b.len()].copy_from_slice(&b);
+            }
+            "swap_segments" => {
+                let p = vector_plaintext(base).len();
+                let (a, b) = (
+                    n["a"].as_u64().unwrap() as usize,
+                    n["b"].as_u64().unwrap() as usize,
+                );
+                let (ra, rb) = (segment(p, a), segment(p, b));
+                let (sa, sb) = (ct[ra.clone()].to_vec(), ct[rb.clone()].to_vec());
+                ct[ra].copy_from_slice(&sb);
+                ct[rb].copy_from_slice(&sa);
+            }
+            op => panic!("unknown op {op}"),
+        }
+        let expect = s(n, "expect");
+        with_identity(&base.identity, |id| {
+            let e = open(&k, id, ct.clone()).unwrap_err();
+            assert_eq!(error_kind(&e), expect, "{n}: {e:?}");
+            let se = stream_open(&k, id, &ct).unwrap_err();
+            let inner = se.get_ref().and_then(|e| e.downcast_ref::<EnvelopeError>());
+            assert_eq!(inner.map(error_kind), Some(expect), "{n} streaming: {se}");
+        });
+    }
+}
+
+#[test]
+fn length_vectors_match_reference() {
+    let v = vectors();
+    for l in &v.lengths.plaintext_to_ciphertext {
+        let p = l.plaintext_len.unwrap();
+        match (ciphertext_len(p), l.ciphertext_len) {
+            (Ok(c), Some(want)) => assert_eq!(c, want, "p={p}"),
+            (Err(EnvelopeError::TooLarge), None) => {}
+            (got, want) => panic!("p={p}: {got:?} vs {want:?}"),
+        }
+    }
+    for l in &v.lengths.ciphertext_to_plaintext {
+        let c = l.ciphertext_len.unwrap();
+        assert_eq!(plaintext_len(c), l.plaintext_len, "c={c}");
+    }
+}
+
+/// Range mapping against the reference, then a real ranged decrypt of each
+/// satisfiable range.
+#[test]
+fn range_vectors_match_reference() {
+    let v = vectors();
+    assert!(v.ranges.len() > 300);
+    let k = key(1, 2);
+    let h = hash(b"range-kat");
+    let mut sealed = std::collections::HashMap::new();
+    for r in &v.ranges {
+        let pt = bytes(r.total as usize, r.total);
+        let ct = sealed
+            .entry(r.total)
+            .or_insert_with(|| seal(&k, &kv(&h), pt.clone()).unwrap())
+            .clone();
+        let header = Header::parse(&ct).unwrap();
+        let spec = range_spec(&r.spec);
+        let got = header.map_range(spec).map(|m| MappedRange {
+            plaintext_start: m.plaintext_range().start(),
+            plaintext_end: m.plaintext_range().end(),
+            ciphertext_start: m.ciphertext_start(),
+            ciphertext_end: m.ciphertext_end(),
+        });
+        assert_eq!(got, r.mapped, "total {} spec {}", r.total, r.spec);
+        if let Some(m) = header.map_range(spec) {
+            assert_eq!(m.total_size(), r.total);
+            let fetched = ct[m.ciphertext_start() as usize..=m.ciphertext_end() as usize].to_vec();
+            let dec = DecryptReader::range(&k, &kv(&h), &header, m, &fetched[..]).unwrap();
+            let out = read_all(dec, &[65536]).unwrap();
+            let pr = m.plaintext_range();
+            assert_eq!(out.len() as u64, pr.len());
+            assert_eq!(&out[..], &pt[pr.start() as usize..=pr.end() as usize]);
+        }
     }
 }
 
@@ -594,8 +766,23 @@ fn payload_encoding_column_is_explicit() {
         PayloadEncoding::from_column(Some(1)).unwrap(),
         PayloadEncoding::Tce1
     );
-    for v in [0, 2, -1, i16::MAX] {
-        assert!(PayloadEncoding::from_column(Some(v)).is_err(), "{v}");
+    for v in [2i16, 3, 255] {
+        assert!(
+            matches!(
+                PayloadEncoding::from_column(Some(v)),
+                Err(EnvelopeError::Unsupported { version }) if version as i16 == v
+            ),
+            "{v}"
+        );
+    }
+    for v in [0, -1, 256, i16::MAX, i16::MIN] {
+        assert!(
+            matches!(
+                PayloadEncoding::from_column(Some(v)),
+                Err(EnvelopeError::Header(_))
+            ),
+            "{v}"
+        );
     }
     for e in [PayloadEncoding::LegacyPlaintext, PayloadEncoding::Tce1] {
         assert_eq!(PayloadEncoding::from_column(e.to_column()).unwrap(), e);
@@ -714,4 +901,225 @@ fn sealed_names_hide_space_and_hash() {
     assert!(
         sealed_object_name(&nk, other, &h).starts_with(&format!("v1/{}/", space_tag(&nk, other)))
     );
+}
+
+// ---------- review round: boundaries, partial output, versions ----------
+
+/// Lengths and range endpoints biased to segment edges (k·SEG−1, k·SEG,
+/// k·SEG+1) and to the end of the blob (len−1, len, len+1).
+fn len_and_points() -> impl Strategy<Value = (usize, u64, u64)> {
+    let edge = |k: u64, d: i64| (k as i64 * SEG as i64 + d).max(1) as u64;
+    (1u64..4, -1i64..=1)
+        .prop_map(move |(k, d)| edge(k, d) as usize)
+        .prop_flat_map(move |len| {
+            let point = prop_oneof![
+                (0u64..4, -1i64..=1)
+                    .prop_map(move |(k, d)| (k as i64 * SEG as i64 + d).max(0) as u64),
+                (-1i64..=1).prop_map(move |d| (len as i64 + d) as u64),
+                0u64..(len as u64 + 2),
+            ];
+            (Just(len), point.clone(), point)
+        })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(96))]
+
+    #[test]
+    fn edge_biased_ranges_equal_plaintext_slice((len, a, b) in len_and_points(), kind in 0u8..3, seed: u64) {
+        let k = key(4, 5);
+        let h = hash(b"edge");
+        let pt = bytes(len, seed);
+        let ct = seal(&k, &kv(&h), pt.clone()).unwrap();
+        let header = Header::parse(&ct).unwrap();
+        let spec = match kind {
+            0 => ByteRangeSpec::Inclusive { start: a.min(b), end: a.max(b) },
+            1 => ByteRangeSpec::From { start: a },
+            _ => ByteRangeSpec::Suffix { length: a },
+        };
+        let want = spec.resolve(len as u64);
+        let got = header.map_range(spec);
+        prop_assert_eq!(want.is_some(), got.is_some());
+        if let (Some(want), Some(r)) = (want, got) {
+            prop_assert_eq!(r.plaintext_range(), want);
+            prop_assert_eq!(r.ciphertext_start() as usize % (SEG + TAG_LEN), HEADER_LEN % (SEG + TAG_LEN));
+            prop_assert_eq!(r.ciphertext_end() as usize + 1 == ct.len(), want.end() as usize / SEG == (len - 1) / SEG);
+            let fetched = ct[r.ciphertext_start() as usize..=r.ciphertext_end() as usize].to_vec();
+            let dec = DecryptReader::range(&k, &kv(&h), &header, r, Chunked::new(fetched, vec![7000])).unwrap();
+            let out = read_all(dec, &[4096]).unwrap();
+            prop_assert_eq!(out.len() as u64, want.len());
+            prop_assert_eq!(&out[..], &pt[want.start() as usize..=want.end() as usize]);
+        }
+    }
+}
+
+#[test]
+fn empty_blob_has_no_satisfiable_range() {
+    let k = key(1, 1);
+    let h = hash(b"empty");
+    let ct = seal(&k, &kv(&h), Vec::new()).unwrap();
+    let header = Header::parse(&ct).unwrap();
+    assert_eq!(header.plaintext_len(), 0);
+    for spec in [
+        ByteRangeSpec::Inclusive { start: 0, end: 0 },
+        ByteRangeSpec::Inclusive {
+            start: 0,
+            end: u64::MAX,
+        },
+        ByteRangeSpec::From { start: 0 },
+        ByteRangeSpec::Suffix { length: 0 },
+        ByteRangeSpec::Suffix { length: 1 },
+        ByteRangeSpec::Suffix { length: u64::MAX },
+    ] {
+        assert_eq!(header.map_range(spec), None, "{spec:?}");
+    }
+    assert_eq!(stream_open(&k, &kv(&h), &ct).unwrap(), Vec::<u8>::new());
+}
+
+/// Reads until the first error; returns what was yielded and the error.
+fn read_until_err<R: AsyncRead + Unpin>(r: &mut R) -> (Vec<u8>, io::Error) {
+    futures::executor::block_on(async {
+        let mut got = Vec::new();
+        let mut buf = [0u8; 3000];
+        loop {
+            match r.read(&mut buf).await {
+                Ok(0) => panic!("stream ended without an error"),
+                Ok(n) => got.extend_from_slice(&buf[..n]),
+                Err(e) => return (got, e),
+            }
+        }
+    })
+}
+
+#[test]
+fn failing_segment_releases_nothing_and_errors_stick() {
+    let k = key(1, 3);
+    let h = hash(b"partial");
+    let p = 4 * SEG;
+    let pt = bytes(p, 9);
+    let ct = seal(&k, &kv(&h), pt.clone()).unwrap();
+    let header = Header::parse(&ct).unwrap();
+    for bad in 0..4 {
+        let mut c = ct.clone();
+        c[segment(p, bad).start + 17] ^= 0x40;
+
+        let mut whole = DecryptReader::new(
+            &k,
+            &kv(&h),
+            &header,
+            Chunked::new(c[HEADER_LEN..].to_vec(), vec![5000]),
+        )
+        .unwrap();
+        let (got, err) = read_until_err(&mut whole);
+        assert_eq!(got, pt[..bad * SEG], "segment {bad}");
+        assert!(is_integrity(Err(err)));
+        let again = futures::executor::block_on(whole.read(&mut [0u8; 10]));
+        assert!(again.is_err(), "error must be sticky");
+
+        // A range starting mid-segment 0 and spanning everything.
+        let r = header
+            .map_range(ByteRangeSpec::From { start: 100 })
+            .unwrap();
+        let fetched = c[r.ciphertext_start() as usize..].to_vec();
+        let mut ranged =
+            DecryptReader::range(&k, &kv(&h), &header, r, Chunked::new(fetched, vec![5000]))
+                .unwrap();
+        let (got, err) = read_until_err(&mut ranged);
+        assert_eq!(
+            got,
+            pt[100.min(bad * SEG)..bad * SEG],
+            "range, segment {bad}"
+        );
+        assert!(is_integrity(Err(err)));
+        assert!(futures::executor::block_on(ranged.read(&mut [0u8; 10])).is_err());
+    }
+}
+
+#[test]
+fn range_with_trailing_bytes_is_refused() {
+    let k = key(1, 4);
+    let h = hash(b"trail");
+    let p = 2 * SEG + 10;
+    let pt = bytes(p, 4);
+    let ct = seal(&k, &kv(&h), pt.clone()).unwrap();
+    let header = Header::parse(&ct).unwrap();
+    for spec in [
+        ByteRangeSpec::Inclusive {
+            start: 10,
+            end: SEG as u64 + 5,
+        },
+        ByteRangeSpec::Suffix { length: 3 },
+    ] {
+        let r = header.map_range(spec).unwrap();
+        let mut fetched = ct[r.ciphertext_start() as usize..=r.ciphertext_end() as usize].to_vec();
+        fetched.push(0);
+        let dec = DecryptReader::range(&k, &kv(&h), &header, r, &fetched[..]).unwrap();
+        assert!(is_integrity(read_all(dec, &[4096])), "{spec:?}");
+    }
+}
+
+#[test]
+fn size_limits_at_two_to_the_48() {
+    let max = (1u64 << 32) * SEG as u64;
+    let c = ciphertext_len(max).unwrap();
+    assert_eq!(c, max + HEADER_LEN as u64 + (1u64 << 32) * TAG_LEN as u64);
+    assert_eq!(plaintext_len(c), Some(max));
+    assert_eq!(plaintext_len(c + 1), None);
+    for p in [max + 1, u64::MAX] {
+        assert!(
+            matches!(ciphertext_len(p), Err(EnvelopeError::TooLarge)),
+            "{p}"
+        );
+    }
+    assert_eq!(plaintext_len(u64::MAX), None);
+
+    let k = key(1, 1);
+    let ok = Header::build(k.id(), max, &[0; 32]);
+    assert_eq!(Header::parse(ok.as_bytes()).unwrap().plaintext_len(), max);
+    for p in [max + 1, u64::MAX] {
+        let mut b = *ok.as_bytes();
+        b[12..20].copy_from_slice(&p.to_be_bytes());
+        assert!(
+            matches!(Header::parse(&b), Err(EnvelopeError::Header("length"))),
+            "{p}"
+        );
+    }
+}
+
+#[test]
+fn later_generations_are_unsupported_not_corrupt() {
+    let k = key(1, 1);
+    let h = hash(b"gen");
+    let ct = seal(&k, &kv(&h), b"abc".to_vec()).unwrap();
+    assert_eq!(format_version(&ct).unwrap(), 1);
+    for g in [2u8, 9] {
+        let mut c = ct.clone();
+        c[3] = b'0' + g;
+        c[4] = g;
+        assert_eq!(format_version(&c).unwrap(), g);
+        assert!(
+            matches!(Header::parse(&c), Err(EnvelopeError::Unsupported { version }) if version == g)
+        );
+        assert!(
+            matches!(open(&k, &kv(&h), c.clone()), Err(EnvelopeError::Unsupported { version }) if version == g)
+        );
+        // Dispatch needs only the first 5 bytes, even if the rest differs in size.
+        assert!(matches!(
+            Header::parse(&c[..5]),
+            Err(EnvelopeError::Unsupported { .. })
+        ));
+    }
+    for (b3, b4) in [(b'2', 1u8), (b'1', 2), (b'0', 0), (b'A', 17)] {
+        let mut c = ct.clone();
+        c[3] = b3;
+        c[4] = b4;
+        assert!(
+            matches!(Header::parse(&c), Err(EnvelopeError::Header("version"))),
+            "{b3} {b4}"
+        );
+    }
+    assert!(matches!(
+        format_version(b"TCE"),
+        Err(EnvelopeError::Header("short header"))
+    ));
 }

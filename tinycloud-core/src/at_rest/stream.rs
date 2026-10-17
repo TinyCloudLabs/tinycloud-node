@@ -1,7 +1,8 @@
 //! Streaming TCE1 encryption/decryption over `futures::io::AsyncRead`, and
 //! plaintext→ciphertext Range mapping.
 //!
-//! Both readers hold at most one segment (64 KiB + tag) in memory. A
+//! Each reader keeps two segment-sized buffers (2 × (64 KiB + 16 B), one being
+//! filled, one being drained), allocated once. A
 //! `DecryptReader` only yields a segment after it authenticates; an error part
 //! way through means the object is corrupt or truncated, and a consumer must
 //! abort (e.g. reset the HTTP response) rather than finish normally.
@@ -349,7 +350,8 @@ impl<R: AsyncRead + Unpin> DecryptReader<R> {
                 .open_segment(self.next, body, tag)
                 .map_err(invalid)?;
             let start = self.skip;
-            let end = len.min(start + self.remaining.min(usize::MAX as u64) as usize);
+            let end = len
+                .min(start.saturating_add(usize::try_from(self.remaining).unwrap_or(usize::MAX)));
             self.seg.truncate(end);
             std::mem::swap(&mut self.seg, &mut self.out);
             self.out_pos = start;

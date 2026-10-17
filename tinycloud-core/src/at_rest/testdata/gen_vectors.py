@@ -96,13 +96,186 @@ CASES = [
     ("sql-checkpoint-multi-segment", 3, CKPT, {"pattern_len": 200000}),
     ("sql-wal-short", 0xFFFFFFFF, WAL, {"hex": b"wal frame bytes".hex()}),
 ]
+MAX_PLAIN = (1 << 32) * SEG  # 2^48: the largest plaintext TCE1 can hold
+U64_MAX = (1 << 64) - 1
+
+
+def n_segments(plen: int) -> int:
+    return max(1, -(-plen // SEG))
+
+
+def ct_len(plen: int):
+    """None if too large for TCE1."""
+    if n_segments(plen) > (1 << 32):
+        return None
+    c = 64 + plen + 16 * n_segments(plen)
+    return c if c <= U64_MAX else None
+
+
+def pt_len(clen: int):
+    """The plaintext length whose ciphertext is exactly clen, else None.
+    Searched over the two candidate segment counts, not by formula inversion."""
+    if clen < 64 + 16:
+        return None
+    body = clen - 64
+    base = body // (SEG + 16)
+    for n in (base, base + 1):
+        p = body - 16 * n
+        if n >= 1 and p >= 0 and ct_len(p) == clen:
+            return p
+    return None
+
+
+def resolve(spec, total):
+    """HTTP byte-range semantics: (start, end) inclusive, or None (416)."""
+    if total == 0:
+        return None
+    kind = spec["kind"]
+    if kind == "inclusive":
+        s, e = spec["start"], spec["end"]
+        return (s, min(e, total - 1)) if s <= e and s < total else None
+    if kind == "from":
+        s = spec["start"]
+        return (s, total - 1) if s < total else None
+    if kind == "suffix":
+        n = spec["length"]
+        return (total - min(n, total), total - 1) if n > 0 else None
+    raise ValueError(kind)
+
+
+def map_range(spec, total):
+    r = resolve(spec, total)
+    if r is None:
+        return None
+    s, e = r
+    first, last = s // SEG, e // SEG
+    last_len = min(SEG, total - last * SEG)
+    return {"plaintext_start": s, "plaintext_end": e,
+            "ciphertext_start": 64 + first * (SEG + 16),
+            "ciphertext_end": 64 + last * (SEG + 16) + last_len + 16 - 1}
+
+
+class Reject(Exception):
+    def __init__(self, kind):
+        super().__init__(kind)
+        self.kind = kind
+
+
+def open_ct(dek: bytes, ident: dict, ct: bytes) -> bytes:
+    """Reference opener: returns plaintext or raises Reject(kind) with kind in
+    header / unsupported / integrity."""
+    if len(ct) < 5 or ct[0:3] != b"TCE":
+        raise Reject("header")
+    if not (0x31 <= ct[3] <= 0x39) or ct[4] != ct[3] - 0x30:
+        raise Reject("header")
+    if ct[4] != 1:
+        raise Reject("unsupported")
+    if len(ct) < 64:
+        raise Reject("header")
+    hdr = ct[:64]
+    if hdr[5] != 1 or hdr[6] or hdr[7] or hdr[52] != 16 or any(hdr[53:]):
+        raise Reject("header")
+    dek_id, plen = struct.unpack(">IQ", hdr[8:20])
+    if ct_len(plen) is None:
+        raise Reject("header")
+    if len(ct) != ct_len(plen):
+        raise Reject("integrity")
+    ctx = context(ident)
+    k = HKDF(algorithm=hashes.SHA256(), length=32, salt=hdr[20:52],
+             info=hashlib.sha256(ctx).digest()).derive(dek)
+    aead = AESGCM(k)
+    n = n_segments(plen)
+    out = b""
+    for i in range(n):
+        off = 64 + i * (SEG + 16)
+        seg_len = min(SEG, plen - i * SEG) + 16
+        nonce = struct.pack(">I", i) + bytes([1 if i == n - 1 else 0]) + bytes(7)
+        try:
+            out += aead.decrypt(nonce, ct[off:off + seg_len], ctx + hdr)
+        except Exception:
+            raise Reject("integrity")
+    return out
+
+
+def mutate(ct: bytes, op: dict) -> bytes:
+    kind = op["op"]
+    if kind == "truncate":
+        return ct[:op["len"]]
+    if kind == "append":
+        return ct + bytes.fromhex(op["hex"])
+    if kind == "xor":
+        b = bytearray(ct)
+        b[op["at"]] ^= op["mask"]
+        return bytes(b)
+    if kind == "set":
+        b = bytearray(ct)
+        b[op["at"]:op["at"] + len(bytes.fromhex(op["hex"]))] = bytes.fromhex(op["hex"])
+        return bytes(b)
+    if kind == "swap_segments":
+        a, b_ = op["a"], op["b"]
+        sa = slice(64 + a * (SEG + 16), 64 + (a + 1) * (SEG + 16))
+        sb = slice(64 + b_ * (SEG + 16), 64 + (b_ + 1) * (SEG + 16))
+        b = bytearray(ct)
+        b[sa], b[sb] = ct[sb], ct[sa]
+        return bytes(b)
+    raise ValueError(kind)
+
+
+NEGATIVE = [
+    # (base vector, op, expected rejection)
+    ("kv-short-text", {"op": "truncate", "len": 103}, "integrity"),
+    ("kv-short-text", {"op": "truncate", "len": 64}, "integrity"),
+    ("kv-short-text", {"op": "append", "hex": "00"}, "integrity"),
+    ("kv-short-text", {"op": "xor", "at": 103, "mask": 1}, "integrity"),
+    ("kv-short-text", {"op": "xor", "at": 64, "mask": 0x80}, "integrity"),
+    ("kv-short-text", {"op": "xor", "at": 30, "mask": 1}, "integrity"),
+    ("kv-short-text", {"op": "xor", "at": 12 + 7, "mask": 1}, "integrity"),
+    ("kv-short-text", {"op": "set", "at": 3, "hex": "3202"}, "unsupported"),
+    ("kv-short-text", {"op": "set", "at": 4, "hex": "02"}, "header"),
+    ("kv-short-text", {"op": "set", "at": 0, "hex": "58"}, "header"),
+    ("kv-short-text", {"op": "set", "at": 6, "hex": "01"}, "header"),
+    ("sql-checkpoint-multi-segment", {"op": "swap_segments", "a": 0, "b": 1}, "integrity"),
+    ("sql-checkpoint-multi-segment", {"op": "truncate", "len": 64 + 3 * (SEG + 16) - 1}, "integrity"),
+    ("sql-checkpoint-multi-segment", {"op": "truncate", "len": 64 + 3 * (SEG + 16)}, "integrity"),
+    ("sql-checkpoint-multi-segment", {"op": "xor", "at": 64 + SEG + 16 + 5, "mask": 4}, "integrity"),
+]
+
+RANGE_TOTALS = [0, 1, SEG - 1, SEG, SEG + 1, 2 * SEG, 3 * SEG + 5]
+
+
+def range_specs(total):
+    pts = sorted({0, 1, SEG - 1, SEG, SEG + 1, 2 * SEG - 1, 2 * SEG, max(total - 1, 0), total, total + 1})
+    specs = [{"kind": "inclusive", "start": 5, "end": 3},
+             {"kind": "inclusive", "start": 0, "end": U64_MAX},
+             {"kind": "from", "start": U64_MAX},
+             {"kind": "suffix", "length": 0},
+             {"kind": "suffix", "length": U64_MAX}]
+    for p in pts:
+        specs.append({"kind": "from", "start": p})
+        specs.append({"kind": "suffix", "length": p})
+        for q in pts:
+            if p <= q:
+                specs.append({"kind": "inclusive", "start": p, "end": q})
+    return specs
+
+
+LENGTH_PLAINTEXTS = [0, 1, SEG - 1, SEG, SEG + 1, 2 * SEG, MAX_PLAIN - 1, MAX_PLAIN,
+                     MAX_PLAIN + 1, U64_MAX]
+LENGTH_CIPHERTEXTS = [0, 63, 64, 79, 80, 81, 64 + SEG + 16, 64 + SEG + 17, 64 + SEG + 32,
+                      64 + SEG + 33, 64 + 2 * (SEG + 16), ct_len(MAX_PLAIN), ct_len(MAX_PLAIN) + 1,
+                      U64_MAX]
+
+
 
 
 def main():
     vectors = []
+    cts = {}
     for name, dek_id, ident, ptspec in CASES:
         pt = bytes.fromhex(ptspec["hex"]) if "hex" in ptspec else pattern(ptspec["pattern_len"])
         ct = seal(DEK, dek_id, SALT, ident, pt)
+        assert open_ct(DEK, ident, ct) == pt
+        cts[name] = (ct, ident)
         v = {"name": name, "dek": DEK.hex(), "dek_id": dek_id, "salt": SALT.hex(),
              "identity": ident, "plaintext": ptspec,
              "ciphertext_len": len(ct), "ciphertext_sha256": hashlib.sha256(ct).hexdigest()}
@@ -111,6 +284,25 @@ def main():
         else:
             v["ciphertext_head"] = ct[:96].hex()
         vectors.append(v)
+
+    negative = []
+    for base, op, expected in NEGATIVE:
+        ct, ident = cts[base]
+        try:
+            open_ct(DEK, ident, mutate(ct, op))
+            raise AssertionError(f"reference accepted {base} {op}")
+        except Reject as r:
+            assert r.kind == expected, (base, op, r.kind)
+        negative.append({"base": base, **op, "expect": expected})
+
+    lengths = {
+        "plaintext_to_ciphertext": [{"plaintext_len": p, "ciphertext_len": ct_len(p)}
+                                    for p in LENGTH_PLAINTEXTS],
+        "ciphertext_to_plaintext": [{"ciphertext_len": c, "plaintext_len": pt_len(c)}
+                                    for c in LENGTH_CIPHERTEXTS],
+    }
+    ranges = [{"total": t, "spec": s, "mapped": map_range(s, t)}
+              for t in RANGE_TOTALS for s in range_specs(t)]
 
     nk = bytes(range(0x80, 0xA0))
 
@@ -132,6 +324,9 @@ def main():
         "pattern": "plaintext byte i = i mod 251",
         "vectors": vectors,
         "object_names": names,
+        "negative": negative,
+        "lengths": lengths,
+        "ranges": ranges,
     }, indent=1))
 
 

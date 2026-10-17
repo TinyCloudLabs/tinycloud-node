@@ -27,6 +27,9 @@ pub const HEADER_LEN: usize = 64;
 pub const SEGMENT_LEN: usize = 1 << 16;
 pub const TAG_LEN: usize = 16;
 
+/// Every TCE generation starts `"TCE" ‖ ASCII digit g ‖ version byte g`; this
+/// build reads and writes generation 1 only. See `INTERFACES.md` §4 (TCE2 rule).
+const FAMILY: &[u8; 3] = b"TCE";
 const MAGIC: &[u8; 4] = b"TCE1";
 const VERSION: u8 = 1;
 const ALG_AES256GCM_HKDF_SHA256: u8 = 1;
@@ -36,10 +39,15 @@ const CONTEXT_LABEL: &[u8] = b"tinycloud/at-rest/v1";
 const SEGMENT_CT_LEN: u64 = (SEGMENT_LEN + TAG_LEN) as u64;
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum EnvelopeError {
-    /// Not a TCE1 header this build understands.
+    /// Malformed or not a TCE header at all.
     #[error("invalid TCE1 header: {0}")]
     Header(&'static str),
+    /// A well-formed TCE header (or payload encoding) of a later format
+    /// generation than this build reads. Not corruption: upgrade the node.
+    #[error("unsupported at-rest format version {version}")]
+    Unsupported { version: u8 },
     /// The header names a different data key than the one supplied.
     #[error("TCE1 header names a different data key")]
     KeyMismatch,
@@ -138,9 +146,9 @@ impl BlobIdentity<'_> {
 ///
 /// Parsing checks structure only. The header is authenticated as part of every
 /// segment's AAD, so its fields (`plaintext_len`, `dek_id`) are **unverified
-/// hints until a segment has decrypted**. A size, `Content-Length` or 416
-/// total taken from a header alone may be forged by whoever stores the bytes;
-/// verify a segment (for an exact size, the last one) before relying on it.
+/// hints until a segment has decrypted**; any one authenticated segment
+/// authenticates them. A size, `Content-Length` or 416 total taken from a
+/// header alone may be forged by whoever stores the bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Header {
     bytes: [u8; HEADER_LEN],
@@ -166,19 +174,19 @@ impl Header {
     }
 
     /// Parses the first [`HEADER_LEN`] bytes of `bytes`. Every field this
-    /// version does not define must be zero.
+    /// version does not define must be zero. A later TCE generation is
+    /// [`EnvelopeError::Unsupported`], never a malformed header.
     pub fn parse(bytes: &[u8]) -> Result<Self, EnvelopeError> {
+        let version = format_version(bytes)?;
+        if version != VERSION {
+            return Err(EnvelopeError::Unsupported { version });
+        }
         let b: [u8; HEADER_LEN] = bytes
             .get(..HEADER_LEN)
             .ok_or(EnvelopeError::Header("short header"))?
             .try_into()
             .expect("64 bytes");
-        if &b[0..4] != MAGIC {
-            return Err(EnvelopeError::Header("magic"));
-        }
-        if b[4] != VERSION {
-            return Err(EnvelopeError::Header("version"));
-        }
+        debug_assert_eq!(&b[0..4], MAGIC);
         if b[5] != ALG_AES256GCM_HKDF_SHA256 {
             return Err(EnvelopeError::Header("algorithm"));
         }
@@ -225,6 +233,22 @@ impl Header {
 
     fn salt(&self) -> &[u8] {
         &self.bytes[20..52]
+    }
+}
+
+/// The TCE format generation from the first 5 bytes, before any
+/// generation-specific parsing: `"TCE" ‖ ASCII digit g ‖ byte g`, with
+/// `g` in 1..=9. Anything else is not a TCE header.
+pub fn format_version(bytes: &[u8]) -> Result<u8, EnvelopeError> {
+    let b = bytes
+        .get(..5)
+        .ok_or(EnvelopeError::Header("short header"))?;
+    if &b[0..3] != FAMILY {
+        return Err(EnvelopeError::Header("magic"));
+    }
+    match b[3] {
+        d @ b'1'..=b'9' if b[4] == d - b'0' => Ok(b[4]),
+        _ => Err(EnvelopeError::Header("version")),
     }
 }
 
@@ -332,7 +356,8 @@ pub(crate) fn new_header(key: &DataKey, plaintext_len: u64) -> Result<Header, En
     Ok(Header::build(key.id(), plaintext_len, &salt))
 }
 
-/// Seals a whole buffer, reusing its allocation.
+/// Seals a whole buffer in place. To avoid a reallocation and copy, pass a
+/// `Vec` whose capacity is already at least `ciphertext_len(len)`.
 pub fn seal(
     key: &DataKey,
     id: &BlobIdentity<'_>,
@@ -358,7 +383,9 @@ fn seal_into(key: &DataKey, id: &BlobIdentity<'_>, header: &Header, mut buf: Vec
     let p = header.plaintext_len();
     debug_assert_eq!(p, buf.len() as u64);
     let n = header.segment_count();
-    buf.resize(header.ciphertext_len() as usize, 0);
+    let ct_len = header.ciphertext_len() as usize;
+    buf.reserve_exact(ct_len - buf.len());
+    buf.resize(ct_len, 0);
     // Move segments to their final offsets, last first: every destination is
     // at or after its source, so nothing unmoved is overwritten.
     for i in (0..n).rev() {
