@@ -65,9 +65,21 @@ pub trait DataKeyProvider: Send + Sync {
     /// by deliberate crypto-shred).
     async fn key(&self, space: &str, dek_id: DekId) -> Result<DataKey, DataKeyError>;
 
+    /// Before work that may read `space`'s sealed blobs under the invoke write
+    /// lock: put back any of the space's keys the database lost (from an
+    /// authenticated mirror). Never creates a key. Locked keys are not an error
+    /// here (the read itself answers 503).
+    async fn prepare_read(&self, space: &str) -> Result<(), DataKeyError>;
+
     /// NK for sealed S3 object names. Same value for the life of the deployment.
     fn object_name_key(&self) -> Result<ObjectNameKey, DataKeyError>;
 }
+
+/// Work under the invoke write lock and transaction runs inside
+/// `write_locked(..)`; there `current_key`/`key` make no key-store writes and
+/// answer `NotPrepared` for a key that would need creating or restoring.
+pub async fn write_locked<F: Future>(f: F) -> F::Output;
+pub fn in_write_lock() -> bool;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DataKeyError {
@@ -81,6 +93,9 @@ pub enum DataKeyError {
     /// PG/S3/unwrap failure (incl. a wrapped DEK failing AEAD). Opaque, no key bytes.
     #[error("data key backend: {0}")]
     Backend(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// A key needed creating or restoring inside `write_locked`. HTTP 503.
+    #[error("the space's data key was not prepared before the write lock")]
+    NotPrepared,
 }
 ```
 
@@ -290,8 +305,29 @@ redacted.
   counts legacy + sealed. While locked, a space reports legacy bytes only (writes are 503 then).
   A sealed object with an invalid TCE1 length counts 0 bytes; the warning is rate-limited and
   carries only the length.
-- **Errors:** at-rest causes map explicitly to 503 (keys unavailable / key store) or 500
-  (integrity, unsupported, legacy refused in strict) on `/invoke` and the KV GET routes. The
-  general "store error → 401" catch-all is tracked separately (TC-1347).
+- **Errors:** at-rest causes map explicitly to 503 (keys unavailable, key store unavailable, key
+  not prepared) or 500 (integrity, unsupported, legacy refused in strict, inconsistent key store)
+  on `/invoke` and the KV GET routes. Bodies carry reason codes only; backend detail goes to the
+  server log. Integrity and unsupported failures are logged (typed, rate-limited, no names),
+  including ones that abort a response mid-stream. The general "store error → 401" catch-all is
+  tracked separately (TC-1347).
+- **Prepare before the write lock:** while keys are set up, a writing invocation is authorized and
+  its spaces' hosting checked *before* any key work, so a refused request creates no data key or
+  mirror object. Then every space it touches is prepared: a data key the database lost is restored
+  from its authenticated mirror (never created), and written spaces get their current key. Inside
+  the invoke write lock and transaction the provider only looks keys up (`at_rest::write_locked`);
+  a key that would need creating or restoring there is `NotPrepared` (503), never a key-store
+  write, which on SQLite would wait on the lock the request holds.
+- **Accepted residual (linkability during the transition):** in `encrypt`, a read of a
+  legacy-only block asks for the sealed name first, then the legacy name (`strict` probes the legacy
+  name to answer "legacy refused"). A storage provider's access logs can therefore link a
+  `space_tag` to its space id (and an object tag to its content hash) for every space read before
+  the backfill, for the life of the object-name key.
+- **Downgrade window until `strict`:** legacy objects are served without a hash check. In `off` or
+  `encrypt`, someone who can write the bucket and delete sealed objects can serve any bytes under the
+  legacy names they know. `strict` (after the backfill) closes this.
+- **`remove`:** deletes the sealed copy when keys can name it, else the legacy copy. When both
+  exist, the legacy copy survives, and while keys are locked only the legacy copy is removed. KV
+  delete is logical, so nothing calls it in production today; S5/GC must delete both names.
 - **Reserved names:** The key-continuity key mirror lives under `_tc/` in the block bucket (`datadir/at-rest` on
   FS). The block boot scan skips it.

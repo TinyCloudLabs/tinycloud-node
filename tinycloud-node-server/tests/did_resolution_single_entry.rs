@@ -144,7 +144,7 @@ impl Guard {
             | ("tinycloud-core/src/manifest.rs", "id_from_vm", "r . resolve (did)")
             | ("tinycloud-core/src/share_email/ports.rs", "resolve_exact", "self . resolve (policy , delegation)")
             | ("tinycloud-core/src/storage/memory.rs", "read_range", "range . resolve (total_size)")
-            | ("tinycloud-node-server/src/storage/file_system.rs", "read_range", "range . resolve (total_size)")
+            | ("tinycloud-node-server/src/storage/file_system.rs", "range_legacy", "range . resolve (total_size)")
             | ("tinycloud-node-server/src/storage/s3.rs", "parse_content_range", "ByteRangeSpec :: Inclusive { start , end } . resolve (total_size)")
             // TC-887: at-rest Range mapping resolves an HTTP byte range against the plaintext length.
             | ("tinycloud-core/src/at_rest/stream.rs", "map_range", "spec . resolve (self . plaintext_len ())")

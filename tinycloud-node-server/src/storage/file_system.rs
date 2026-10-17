@@ -1,4 +1,11 @@
-use super::size::SpaceSizes;
+use super::{
+    sealed::{
+        contains_name, open_sealed, plan_range, read_plan, seal_file, seal_vec, space_tag_of,
+        write_target, AtRestHandle, AtRestStoreError, AtRestView, ContainsName, LoggedDecrypt,
+        ReadPlan, SealFileError, SealedName, WriteTarget,
+    },
+    size::SpaceSizes,
+};
 use core::pin::Pin;
 use futures::{
     future::{Either as AsyncEither, TryFutureExt},
@@ -16,7 +23,11 @@ use std::{
 };
 use tempfile::{NamedTempFile, PathPersistError};
 use tinycloud_auth::{resource::SpaceId, ssi::dids::DIDBuf};
-use tinycloud_core::{at_rest::plaintext_len, hash::Hash, storage::*};
+use tinycloud_core::{
+    at_rest::{plaintext_len, DataKeyProvider, HEADER_LEN},
+    hash::Hash,
+    storage::*,
+};
 use tokio::{
     fs::{create_dir_all, metadata, remove_file, File},
     io::{AsyncReadExt, AsyncSeekExt},
@@ -29,7 +40,16 @@ use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
 pub struct FileSystemStore {
     path: PathBuf,
     sizes: SpaceSizes,
+    at_rest: Option<AtRestHandle>,
 }
+
+/// A staged block on its way into the store.
+enum Staged {
+    File(TempFileStage),
+    Bytes(Vec<u8>),
+}
+
+type PlainReader = Compat<tokio::io::Take<File>>;
 
 impl FileSystemStore {
     async fn new(path: PathBuf) -> Result<Self, IoError> {
@@ -38,7 +58,21 @@ impl FileSystemStore {
             store_sizes(&path).await?,
             sealed_sizes(&path.join(SEALED_DIR)).await?,
         );
-        Ok(Self { path, sizes })
+        Ok(Self {
+            path,
+            sizes,
+            at_rest: None,
+        })
+    }
+
+    /// Links the store to the node's at-rest state (TC-887). Without it the
+    /// store behaves as at-rest mode `off`.
+    pub fn attach_at_rest(&mut self, handle: AtRestHandle) {
+        self.at_rest = Some(handle);
+    }
+
+    fn view(&self) -> AtRestView {
+        AtRestView::of(self.at_rest.as_ref())
     }
 
     fn get_path(&self, space: &SpaceId, mh: &Hash) -> PathBuf {
@@ -48,13 +82,286 @@ impl FileSystemStore {
             .join(base64::encode_config(mh.as_ref(), base64::URL_SAFE))
     }
 
-    async fn increment_size(&self, space: &SpaceId, size: u64) {
-        self.sizes.increment_size(space, None, size).await;
+    fn sealed_path(&self, name: &SealedName) -> PathBuf {
+        self.path
+            .join(SEALED_DIR)
+            .join(&name.space_tag)
+            .join(&name.object_tag)
     }
-    async fn decrement_size(&self, space: &SpaceId, size: u64) {
-        self.sizes.decrement_size(space, None, size).await;
+
+    async fn persist_staged(
+        &self,
+        space: &SpaceId,
+        hash: &Hash,
+        staged: Staged,
+    ) -> Result<(), FileSystemStoreError> {
+        match write_target(&self.view(), space, hash).await? {
+            WriteTarget::Legacy => {
+                let path = self.get_path(space, hash);
+                if path.exists() {
+                    return Ok(());
+                }
+                let size = match staged {
+                    Staged::File(t_file) => {
+                        let size = t_file.size().await?;
+                        let (_, tmp) = t_file.into_inner();
+                        tmp.persist(path)?;
+                        size
+                    }
+                    Staged::Bytes(v) => {
+                        let file = File::create(path).await?;
+                        let size = v.len() as u64;
+                        let mut writer = futures::io::BufWriter::new(file.compat());
+                        writer.write_all(&v).await?;
+                        writer.flush().await?;
+                        size
+                    }
+                };
+                self.sizes.increment_size(space, None, size).await;
+            }
+            WriteTarget::Sealed { name, key } => {
+                // Only the sealed name dedups: a legacy copy never suppresses
+                // the sealed write.
+                let dest = self.sealed_path(&name);
+                if dest.exists() {
+                    return Ok(());
+                }
+                let dir = dest.parent().expect("sealed path has a parent");
+                create_dir_all(dir).await?;
+                let (size, sealed) = match staged {
+                    Staged::File(t_file) => {
+                        let size = t_file.size().await?;
+                        let (_, tmp) = t_file.into_inner();
+                        let sealed = seal_file(&key, space, hash, &tmp, size)
+                            .await
+                            .map_err(FileSystemStoreError::from)?;
+                        (size, sealed)
+                    }
+                    Staged::Bytes(v) => {
+                        let size = v.len() as u64;
+                        let ct = seal_vec(key, space, hash, v).await?;
+                        let out = NamedTempFile::new_in(dir)?;
+                        let mut file = File::from_std(out.reopen()?);
+                        tokio::io::AsyncWriteExt::write_all(&mut file, &ct).await?;
+                        tokio::io::AsyncWriteExt::flush(&mut file).await?;
+                        (size, out)
+                    }
+                };
+                sealed.persist(&dest).map_err(|e| e.error)?;
+                self.sizes
+                    .increment_size(space, Some(&name.space_tag), size)
+                    .await;
+            }
+        }
+        Ok(())
+    }
+
+    async fn open_legacy(
+        &self,
+        space: &SpaceId,
+        id: &Hash,
+    ) -> Result<Option<Content<PlainReader>>, FileSystemStoreError> {
+        match File::open(self.get_path(space, id)).await {
+            Ok(file) => {
+                let size = file.metadata().await?.len();
+                Ok(Some(Content::new(size, file.take(size).compat())))
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Opens the block's sealed file, or `None` if it is absent.
+    async fn open_sealed_file(
+        &self,
+        name: &SealedName,
+        provider: &dyn DataKeyProvider,
+        space: &SpaceId,
+        id: &Hash,
+    ) -> Result<Option<Content<FsReadable>>, FileSystemStoreError> {
+        let file = match File::open(self.sealed_path(name)).await {
+            Ok(file) => file,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let len = file.metadata().await?.len();
+        let logged = |e: AtRestStoreError| {
+            e.log_at(name);
+            e
+        };
+        let (size, reader) = open_sealed(provider, space, id, file.take(len).compat(), len)
+            .await
+            .map_err(logged)?
+            .into_inner();
+        Ok(Some(Content::new(
+            size,
+            AsyncEither::Right(Box::new(LoggedDecrypt::new(reader, name))),
+        )))
+    }
+
+    async fn read_block(
+        &self,
+        space: &SpaceId,
+        id: &Hash,
+    ) -> Result<Option<Content<FsReadable>>, FileSystemStoreError> {
+        let legacy = |c: Option<Content<PlainReader>>| {
+            c.map(|c| {
+                let (size, r) = c.into_inner();
+                Content::new(size, AsyncEither::Left(r))
+            })
+        };
+        match read_plan(&self.view(), space, id)? {
+            ReadPlan::Legacy => Ok(legacy(self.open_legacy(space, id).await?)),
+            ReadPlan::LegacyWhileLocked => match legacy(self.open_legacy(space, id).await?) {
+                Some(c) => Ok(Some(c)),
+                None => Err(AtRestStoreError::Unavailable("at-rest keys are locked").into()),
+            },
+            ReadPlan::SealedThenLegacy { name, provider } => {
+                match self.open_sealed_file(&name, &*provider, space, id).await? {
+                    Some(c) => Ok(Some(c)),
+                    None => Ok(legacy(self.open_legacy(space, id).await?)),
+                }
+            }
+            ReadPlan::Sealed { name, provider } => {
+                match self.open_sealed_file(&name, &*provider, space, id).await? {
+                    Some(c) => Ok(Some(c)),
+                    None if self.get_path(space, id).exists() => {
+                        Err(AtRestStoreError::LegacyRefused.into())
+                    }
+                    None => Ok(None),
+                }
+            }
+        }
+    }
+
+    async fn range_legacy(
+        &self,
+        space: &SpaceId,
+        id: &Hash,
+        range: ByteRangeSpec,
+    ) -> Result<Option<RangeRead<FsReadable>>, FileSystemStoreError> {
+        match File::open(self.get_path(space, id)).await {
+            Ok(mut file) => {
+                let total_size = file.metadata().await?.len();
+                let Some(range) = range.resolve(total_size) else {
+                    return Ok(Some(RangeRead::Unsatisfiable { total_size }));
+                };
+                file.seek(SeekFrom::Start(range.start())).await?;
+                let content = Content::new(
+                    range.len(),
+                    AsyncEither::Left(file.take(range.len()).compat()),
+                );
+                Ok(Some(RangeRead::Content {
+                    total_size,
+                    range,
+                    content,
+                }))
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// A range of the block's sealed file, or `None` if it is absent. Totals
+    /// and the 416 decision use the plaintext length.
+    async fn range_sealed(
+        &self,
+        name: &SealedName,
+        provider: &dyn DataKeyProvider,
+        space: &SpaceId,
+        id: &Hash,
+        spec: ByteRangeSpec,
+    ) -> Result<Option<RangeRead<FsReadable>>, FileSystemStoreError> {
+        let mut file = match File::open(self.sealed_path(name)).await {
+            Ok(file) => file,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let len = file.metadata().await?.len();
+        let logged = |e: AtRestStoreError| {
+            e.log_at(name);
+            e
+        };
+        let mut header = [0u8; HEADER_LEN];
+        file.read_exact(&mut header).await.map_err(|_| {
+            logged(AtRestStoreError::Integrity(
+                "object shorter than its header",
+            ))
+        })?;
+        let plan = plan_range(provider, space, &header, len, spec)
+            .await
+            .map_err(logged)?;
+        let Some(r) = plan.range else {
+            return Ok(Some(RangeRead::Unsatisfiable {
+                total_size: plan.plaintext_len(),
+            }));
+        };
+        file.seek(SeekFrom::Start(r.ciphertext_start())).await?;
+        let span = r.ciphertext_end() - r.ciphertext_start() + 1;
+        let reader = plan
+            .reader(space, id, r, file.take(span).compat())
+            .map_err(logged)?;
+        let range = r.plaintext_range();
+        Ok(Some(RangeRead::Content {
+            total_size: plan.plaintext_len(),
+            range,
+            content: Content::new(
+                range.len(),
+                AsyncEither::Right(Box::new(LoggedDecrypt::new(reader, name))),
+            ),
+        }))
+    }
+
+    async fn range_block(
+        &self,
+        space: &SpaceId,
+        id: &Hash,
+        spec: ByteRangeSpec,
+    ) -> Result<Option<RangeRead<FsReadable>>, FileSystemStoreError> {
+        match read_plan(&self.view(), space, id)? {
+            ReadPlan::Legacy => self.range_legacy(space, id, spec).await,
+            ReadPlan::LegacyWhileLocked => match self.range_legacy(space, id, spec).await? {
+                Some(r) => Ok(Some(r)),
+                None => Err(AtRestStoreError::Unavailable("at-rest keys are locked").into()),
+            },
+            ReadPlan::SealedThenLegacy { name, provider } => {
+                match self
+                    .range_sealed(&name, &*provider, space, id, spec)
+                    .await?
+                {
+                    Some(r) => Ok(Some(r)),
+                    None => self.range_legacy(space, id, spec).await,
+                }
+            }
+            ReadPlan::Sealed { name, provider } => {
+                match self
+                    .range_sealed(&name, &*provider, space, id, spec)
+                    .await?
+                {
+                    Some(r) => Ok(Some(r)),
+                    None if self.get_path(space, id).exists() => {
+                        Err(AtRestStoreError::LegacyRefused.into())
+                    }
+                    None => Ok(None),
+                }
+            }
+        }
+    }
+
+    /// Whether the block exists under the name a write would use (INTERFACES
+    /// §7): in `encrypt`/`strict` only the sealed name counts.
+    fn exists(&self, space: &SpaceId, id: &Hash) -> Result<bool, FileSystemStoreError> {
+        Ok(match contains_name(&self.view(), space, id)? {
+            ContainsName::Legacy => self.get_path(space, id).exists(),
+            ContainsName::Sealed(name) => self.sealed_path(&name).exists(),
+        })
     }
 }
+
+/// Plaintext from a legacy file, or authenticated plaintext from a sealed one.
+/// The decrypting side is boxed: it carries the AES key schedule and segment
+/// buffers, and `Content` values move by value through deep request paths.
+pub type FsReadable = AsyncEither<PlainReader, Box<LoggedDecrypt<PlainReader>>>;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
 pub struct FileSystemConfig {
@@ -114,12 +421,27 @@ pub enum FileSystemStoreError {
     AtRest(#[from] super::sealed::AtRestStoreError),
 }
 
+impl From<SealFileError> for FileSystemStoreError {
+    fn from(e: SealFileError) -> Self {
+        match e {
+            SealFileError::AtRest(e) => Self::AtRest(e),
+            SealFileError::Io(e) => Self::Io(e),
+        }
+    }
+}
+
 #[async_trait]
 impl ImmutableReadStore for FileSystemStore {
     type Error = FileSystemStoreError;
-    type Readable = Compat<tokio::io::Take<File>>;
+    type Readable = FsReadable;
     async fn contains(&self, space: &SpaceId, id: &Hash) -> Result<bool, Self::Error> {
-        Ok(self.get_path(space, id).exists())
+        self.exists(space, id)
+    }
+    fn prepares(&self) -> bool {
+        super::sealed::prepares(&self.view())
+    }
+    async fn prepare_read(&self, space: &SpaceId) -> Result<(), Self::Error> {
+        Ok(super::sealed::prepare_read(&self.view(), space).await?)
     }
     async fn read(
         &self,
@@ -127,14 +449,9 @@ impl ImmutableReadStore for FileSystemStore {
         id: &Hash,
     ) -> Result<Option<Content<Self::Readable>>, Self::Error> {
         let start = Instant::now();
-        let result = match File::open(self.get_path(space, id)).await {
-            Ok(file) => {
-                let size = file.metadata().await?.len();
-                Ok(Some(Content::new(size, file.take(size).compat())))
-            }
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e.into()),
-        };
+        // Boxed: the sealed read path's future is large, and the trait method
+        // future is built on the caller's stack before async_trait boxes it.
+        let result = Box::pin(self.read_block(space, id)).await;
         crate::prometheus::observe_stage(
             crate::prometheus::InvocationStage::BlockRead,
             crate::prometheus::StageOutcome::from(result.is_ok()),
@@ -149,23 +466,7 @@ impl ImmutableReadStore for FileSystemStore {
         id: &Hash,
         range: ByteRangeSpec,
     ) -> Result<Option<RangeRead<Self::Readable>>, Self::Error> {
-        match File::open(self.get_path(space, id)).await {
-            Ok(mut file) => {
-                let total_size = file.metadata().await?.len();
-                let Some(range) = range.resolve(total_size) else {
-                    return Ok(Some(RangeRead::Unsatisfiable { total_size }));
-                };
-                file.seek(SeekFrom::Start(range.start())).await?;
-                let content = Content::new(range.len(), file.take(range.len()).compat());
-                Ok(Some(RangeRead::Content {
-                    total_size,
-                    range,
-                    content,
-                }))
-            }
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+        Box::pin(self.range_block(space, id, range)).await
     }
 }
 
@@ -173,7 +474,11 @@ impl ImmutableReadStore for FileSystemStore {
 impl StoreSize for FileSystemStore {
     type Error = FileSystemStoreError;
     async fn total_size(&self, space: &SpaceId) -> Result<Option<u64>, Self::Error> {
-        Ok(self.sizes.get_size(space, None).await)
+        let view = self.view();
+        Ok(self
+            .sizes
+            .get_size(space, space_tag_of(&view, space).as_deref())
+            .await)
     }
 }
 
@@ -313,6 +618,9 @@ impl ImmutableStaging for TempFileSystemStage {
 #[async_trait]
 impl ImmutableWriteStore<TempFileSystemStage> for FileSystemStore {
     type Error = FileSystemStoreError;
+    async fn prepare_write(&self, space: &SpaceId) -> Result<(), Self::Error> {
+        Ok(super::sealed::prepare_write(&self.view(), space).await?)
+    }
     async fn persist(
         &self,
         space: &SpaceId,
@@ -322,12 +630,7 @@ impl ImmutableWriteStore<TempFileSystemStage> for FileSystemStore {
         let result = async move {
             let (mut h, f) = staged.into_inner();
             let hash = h.finalize();
-            if !self.contains(space, &hash).await? {
-                let size = f.size().await?;
-                let (_, path) = f.into_inner();
-                path.persist(self.get_path(space, &hash))?;
-                self.increment_size(space, size).await;
-            }
+            Box::pin(self.persist_staged(space, &hash, Staged::File(f))).await?;
             Ok(hash)
         }
         .await;
@@ -343,6 +646,9 @@ impl ImmutableWriteStore<TempFileSystemStage> for FileSystemStore {
 #[async_trait]
 impl ImmutableWriteStore<memory::MemoryStaging> for FileSystemStore {
     type Error = FileSystemStoreError;
+    async fn prepare_write(&self, space: &SpaceId) -> Result<(), Self::Error> {
+        Ok(super::sealed::prepare_write(&self.view(), space).await?)
+    }
     async fn persist(
         &self,
         space: &SpaceId,
@@ -352,14 +658,7 @@ impl ImmutableWriteStore<memory::MemoryStaging> for FileSystemStore {
         let result = async move {
             let (mut h, v) = staged.into_inner();
             let hash = h.finalize();
-            if !self.contains(space, &hash).await? {
-                let file = File::create(self.get_path(space, &hash)).await?;
-                let size = v.len() as u64;
-                let mut writer = futures::io::BufWriter::new(file.compat());
-                writer.write_all(&v).await?;
-                writer.flush().await?;
-                self.increment_size(space, size).await;
-            }
+            Box::pin(self.persist_staged(space, &hash, Staged::Bytes(v))).await?;
             Ok(hash)
         }
         .await;
@@ -377,6 +676,9 @@ impl ImmutableWriteStore<either::Either<TempFileSystemStage, memory::MemoryStagi
     for FileSystemStore
 {
     type Error = FileSystemStoreError;
+    async fn prepare_write(&self, space: &SpaceId) -> Result<(), Self::Error> {
+        Ok(super::sealed::prepare_write(&self.view(), space).await?)
+    }
     async fn persist(
         &self,
         space: &SpaceId,
@@ -386,25 +688,11 @@ impl ImmutableWriteStore<either::Either<TempFileSystemStage, memory::MemoryStagi
         let result = async move {
             let (mut h, f) = staged.into_inner();
             let hash = h.finalize();
-
-            if !self.contains(space, &hash).await? {
-                match f {
-                    AsyncEither::Left(t_file) => {
-                        let size = t_file.size().await?;
-                        let (_, path) = t_file.into_inner();
-                        path.persist(self.get_path(space, &hash))?;
-                        self.increment_size(space, size).await;
-                    }
-                    AsyncEither::Right(v) => {
-                        let file = File::create(self.get_path(space, &hash)).await?;
-                        let size = v.len() as u64;
-                        let mut writer = futures::io::BufWriter::new(file.compat());
-                        writer.write_all(&v).await?;
-                        writer.flush().await?;
-                        self.increment_size(space, size).await;
-                    }
-                }
+            let staged = match f {
+                AsyncEither::Left(t_file) => Staged::File(t_file),
+                AsyncEither::Right(v) => Staged::Bytes(v),
             };
+            Box::pin(self.persist_staged(space, &hash, staged)).await?;
             Ok(hash)
         }
         .await;
@@ -421,6 +709,26 @@ impl ImmutableWriteStore<either::Either<TempFileSystemStage, memory::MemoryStagi
 impl ImmutableDeleteStore for FileSystemStore {
     type Error = FileSystemStoreError;
     async fn remove(&self, space: &SpaceId, id: &Hash) -> Result<Option<()>, Self::Error> {
+        // A sealed copy first (if keys can name it), then the legacy file.
+        let view = self.view();
+        let sealed = view
+            .object_name_key()
+            .map(|nk| SealedName::new(&nk, space, id));
+        if let Some(name) = &sealed {
+            let path = self.sealed_path(name);
+            match metadata(&path).await {
+                Ok(m) => {
+                    remove_file(path).await?;
+                    let size = plaintext_len(m.len()).unwrap_or(0);
+                    self.sizes
+                        .decrement_size(space, Some(&name.space_tag), size)
+                        .await;
+                    return Ok(Some(()));
+                }
+                Err(e) if e.kind() == ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
         let path = self.get_path(space, id);
         let size = match metadata(&path).await {
             Ok(m) => m.len(),
@@ -429,7 +737,7 @@ impl ImmutableDeleteStore for FileSystemStore {
         };
         match remove_file(path).await {
             Ok(()) => {
-                self.decrement_size(space, size).await;
+                self.sizes.decrement_size(space, None, size).await;
                 Ok(Some(()))
             }
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
@@ -445,6 +753,9 @@ impl StorageConfig<TempFileSystemStage> for TempFileSystemStage {
         Ok(Self)
     }
 }
+
+#[cfg(test)]
+mod sealed_tests;
 
 #[cfg(test)]
 mod test {

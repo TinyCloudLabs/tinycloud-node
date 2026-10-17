@@ -5,9 +5,11 @@
 //! keyring needs its tables: [`AtRestRuntime::new`] before storage, then
 //! [`setup`] after migrations installs the keyring.
 //!
-//! In this build no storage seals anything yet: nothing calls
-//! [`AtRestRuntime::declare_seal_path`], so `setup` refuses every mode
-//! but `off` and `encrypting()` is always false.
+//! Block storage declares its seal path when it is attached
+//! ([`crate::storage::attach_at_rest`] calls
+//! [`AtRestRuntime::declare_seal_path`] for a store that seals every
+//! write); without it `setup` refuses every mode but `off` and
+//! `encrypting()` stays false.
 //!
 //! With the default config (`mode = "off"`, no recipients, no
 //! `escrow_none`) nothing is set up: no key reads, no rows, no mirror.
@@ -32,14 +34,14 @@ use crate::config::{AtRestConfig, AtRestEscrowConfig, AtRestMode, Storage};
 use crate::storage::at_rest_mirror::{FsKeyMirror, S3KeyMirror};
 use crate::tee::TeeContext;
 
-/// At-rest state shared by the routes and `/info` (and, once it seals
-/// writes, block storage). Rocket manages it as `Arc<AtRestRuntime>`.
+/// At-rest state shared by the routes, `/info` and block storage. Rocket
+/// manages it as `Arc<AtRestRuntime>`.
 ///
-/// The contract for the storage seal path (TC-887 S3), not yet wired: mode
-/// `off` behaves exactly as without at-rest. Otherwise writes are sealed
-/// only while [`encrypting`](Self::encrypting) (else 503, never plaintext);
-/// a sealed read whose key is `Locked` is a 503; legacy plaintext reads are
-/// allowed unless the mode is `strict`.
+/// The contract for the storage seal path (TC-887 S3): mode `off` behaves
+/// exactly as without at-rest. Otherwise writes are sealed only while
+/// [`encrypting`](Self::encrypting) (else 503, never plaintext); a sealed
+/// read whose key is `Locked` is a 503; legacy plaintext reads are allowed
+/// unless the mode is `strict`.
 pub struct AtRestRuntime {
     mode: AtRestMode,
     escrow_none: bool,
@@ -48,8 +50,9 @@ pub struct AtRestRuntime {
     /// writes may be encrypted. Set at boot, or after a recovery unlocks a
     /// node whose gate then passes.
     encrypting: AtomicBool,
-    /// Set by block storage when it seals writes (TC-887 S3). Until then a
-    /// mode other than `off` is refused at boot and `encrypting` stays false.
+    /// Set by block storage when it is attached with a seal path (TC-887
+    /// S3). Without it a mode other than `off` is refused at boot and
+    /// `encrypting` stays false.
     seal_path: AtomicBool,
     share_failures: ShareFailureLimiter,
 }

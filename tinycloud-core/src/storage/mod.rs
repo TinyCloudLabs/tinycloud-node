@@ -125,6 +125,22 @@ pub trait ImmutableReadStore: Send + Sync {
     type Error: StdError + Send + Sync;
     type Readable: futures::io::AsyncRead + Send + Sync;
     async fn contains(&self, space: &SpaceId, id: &Hash) -> Result<bool, Self::Error>;
+    /// Whether a writing invocation must be authorized, and the spaces it
+    /// touches prepared ([`prepare_read`](Self::prepare_read),
+    /// [`ImmutableWriteStore::prepare_write`]), before its database write
+    /// lock and transaction. Default: no.
+    fn prepares(&self) -> bool {
+        false
+    }
+    /// When [`prepares`](Self::prepares): called for each space a writing
+    /// invocation touches without writing it, once the invocation is
+    /// authorized and before the write lock. Reads inside the transaction
+    /// then need no database writes (on SQLite they would wait on the lock
+    /// the invocation holds), e.g. restoring the space's at-rest data key.
+    /// Default: nothing.
+    async fn prepare_read(&self, _space: &SpaceId) -> Result<(), Self::Error> {
+        Ok(())
+    }
     async fn read(
         &self,
         space: &SpaceId,
@@ -175,6 +191,14 @@ where
     S::Writable: 'static,
 {
     type Error: StdError + Send + Sync;
+    /// When [`ImmutableReadStore::prepares`]: called for each space an
+    /// invocation writes, once the invocation is authorized and before its
+    /// database write lock and transaction; `persist` later runs inside them.
+    /// A store that needs its own database writes for a space (e.g. creating
+    /// the space's at-rest data key) does them here. Default: nothing.
+    async fn prepare_write(&self, _space: &SpaceId) -> Result<(), Self::Error> {
+        Ok(())
+    }
     async fn persist(
         &self,
         space: &SpaceId,
@@ -215,6 +239,12 @@ where
     type Readable = S::Readable;
     async fn contains(&self, space: &SpaceId, id: &Hash) -> Result<bool, Self::Error> {
         self.contains(space, id).await
+    }
+    fn prepares(&self) -> bool {
+        S::prepares(self)
+    }
+    async fn prepare_read(&self, space: &SpaceId) -> Result<(), Self::Error> {
+        S::prepare_read(self, space).await
     }
     async fn read(
         &self,
@@ -263,6 +293,9 @@ where
     W::Writable: 'static,
 {
     type Error = S::Error;
+    async fn prepare_write(&self, space: &SpaceId) -> Result<(), Self::Error> {
+        S::prepare_write(self, space).await
+    }
     async fn persist(
         &self,
         space: &SpaceId,

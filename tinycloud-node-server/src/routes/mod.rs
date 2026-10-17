@@ -139,7 +139,7 @@ fn database_failure(
 
 /// TC-887: the status for an invocation whose block-store step failed for
 /// at-rest reasons (503 keys unavailable, 500 integrity/unsupported), if so.
-fn at_rest_invoke_status(
+pub(crate) fn at_rest_invoke_status(
     e: &TxStoreError<BlockStores, BlockStage, tinycloud_core::keys::StaticSecret>,
 ) -> Option<Status> {
     match e {

@@ -356,39 +356,76 @@ fn space_tags_need_unlocked_keys() {
     );
 }
 
+/// At-rest causes answer 503 (retry may help) or 500 (operator must act) on
+/// the KV GET routes and on `/invoke`, reads and writes alike; anything else
+/// keeps its old mapping.
 #[test]
-fn at_rest_causes_map_to_503_or_500_on_kv_reads() {
+fn at_rest_causes_map_to_503_or_500_on_kv_reads_and_invoke() {
     use crate::storage::{file_system::FileSystemStoreError, s3::S3StoreError};
-    use tinycloud_core::storage::either::EitherError;
-    let read = |e: AtRestStoreError, s3: bool| {
-        let store = if s3 {
+    use tinycloud_core::{storage::either::EitherError, TxStoreError};
+    let store_err = |e: AtRestStoreError, s3: bool| {
+        if s3 {
             EitherError::A(S3StoreError::AtRest(e))
         } else {
             EitherError::B(FileSystemStoreError::AtRest(e))
-        };
-        crate::routes::kv_read_failure(EitherError::B(store)).0
+        }
+    };
+    let cases = || {
+        [
+            (
+                AtRestStoreError::Unavailable("locked"),
+                Status::ServiceUnavailable,
+            ),
+            (
+                AtRestStoreError::KeyStore("store_unavailable"),
+                Status::ServiceUnavailable,
+            ),
+            (
+                AtRestStoreError::KeyInconsistent("inconsistent"),
+                Status::InternalServerError,
+            ),
+            (
+                AtRestStoreError::Integrity("x"),
+                Status::InternalServerError,
+            ),
+            (
+                AtRestStoreError::Unsupported(2),
+                Status::InternalServerError,
+            ),
+            (AtRestStoreError::LegacyRefused, Status::InternalServerError),
+            (
+                AtRestStoreError::Internal("sealing task failed"),
+                Status::InternalServerError,
+            ),
+        ]
     };
     for s3 in [true, false] {
-        assert_eq!(
-            read(AtRestStoreError::Unavailable("locked"), s3),
-            Status::ServiceUnavailable
-        );
-        assert_eq!(
-            read(AtRestStoreError::KeyStore("pg".into()), s3),
-            Status::ServiceUnavailable
-        );
-        assert_eq!(
-            read(AtRestStoreError::Integrity("x"), s3),
-            Status::InternalServerError
-        );
-        assert_eq!(
-            read(AtRestStoreError::Unsupported(2), s3),
-            Status::InternalServerError
-        );
-        assert_eq!(
-            read(AtRestStoreError::LegacyRefused, s3),
-            Status::InternalServerError
-        );
+        for (e, want) in cases() {
+            let what = e.to_string();
+            assert_eq!(
+                crate::routes::kv_read_failure(EitherError::B(store_err(e, s3))).0,
+                want,
+                "kv read: {what}"
+            );
+        }
+        for (e, want) in cases() {
+            let what = e.to_string();
+            let read = TxStoreError::StoreRead(store_err(e, s3));
+            assert_eq!(
+                crate::routes::at_rest_invoke_status(&read),
+                Some(want),
+                "invoke read: {what}"
+            );
+        }
+        for (e, want) in cases() {
+            let what = e.to_string();
+            let write = TxStoreError::StoreWrite(store_err(e, s3));
+            assert_eq!(
+                crate::routes::at_rest_invoke_status(&write),
+                Some(want),
+                "invoke write: {what}"
+            );
+        }
     }
     let other = EitherError::B(EitherError::B(FileSystemStoreError::Io(
         std::io::Error::other("disk"),
@@ -396,5 +433,30 @@ fn at_rest_causes_map_to_503_or_500_on_kv_reads() {
     assert_eq!(
         crate::routes::kv_read_failure(other).0,
         Status::InternalServerError
+    );
+    let io = TxStoreError::StoreRead(EitherError::B(FileSystemStoreError::Io(
+        std::io::Error::other("disk"),
+    )));
+    assert_eq!(crate::routes::at_rest_invoke_status(&io), None);
+}
+
+/// Key-store failures answer with a reason code only; backend detail stays
+/// in the server log. A stored key that does not unwrap is a 500.
+#[test]
+fn key_store_failures_carry_reason_codes_only() {
+    use tinycloud_core::sea_orm::DbErr;
+    let db = AtRestStoreError::from(DataKeyError::Backend(Box::new(DbErr::Custom(
+        "SELECT secret_table_detail".into(),
+    ))));
+    assert_eq!(db.status(), Status::ServiceUnavailable);
+    assert!(!db.to_string().contains("secret_table_detail"), "{db}");
+    let unwrap = AtRestStoreError::from(DataKeyError::Backend(Box::new(std::io::Error::other(
+        "aead tag mismatch detail",
+    ))));
+    assert_eq!(unwrap.status(), Status::InternalServerError);
+    assert!(!unwrap.to_string().contains("detail"), "{unwrap}");
+    assert_eq!(
+        AtRestStoreError::from(DataKeyError::NotPrepared).status(),
+        Status::ServiceUnavailable
     );
 }
