@@ -106,8 +106,14 @@ mod tests {
             return;
         };
         let db = &fixture.conn;
-        // Back to the state a node upgrading to this migration boots with.
-        crate::migrations::Migrator::down(db, Some(1))
+        // Back to the state a node upgrading to this migration boots with:
+        // roll back this migration and every later one, located by name.
+        let migrations = crate::migrations::Migrator::migrations();
+        let index = migrations
+            .iter()
+            .position(|m| m.name() == Migration.name())
+            .unwrap();
+        crate::migrations::Migrator::down(db, Some((migrations.len() - index) as u32))
             .await
             .unwrap();
         assert!(!recorded(db).await);
