@@ -121,7 +121,7 @@ async fn session(client: &Client) -> Result<Session> {
         "x": base64::encode_config(key.verifying_key().to_bytes(), base64::URL_SAFE_NO_PAD),
     }))?;
     let prepared = prepare_session(serde_json::from_value(json!({
-        "abilities": {"kv": {"": ["tinycloud.kv/put", "tinycloud.kv/get"]}},
+        "abilities": {"kv": {"": ["tinycloud.kv/put", "tinycloud.kv/get", "tinycloud.kv/del"]}},
         "address": format!("0x{}", encode_eip55(&address)),
         "chainId": 1, "domain": "localhost",
         "issuedAt": rfc3339(now - time::Duration::minutes(1))?,
@@ -144,13 +144,28 @@ async fn invoke(
     action: &str,
     body: &str,
 ) -> Result<(Status, String)> {
-    let resource = session.space_id.clone().to_resource(
-        "kv".parse::<Service>()?,
-        Some(path.parse::<Path>()?),
-        None,
-        None,
-    );
-    let invocation = session.invoke_any([(resource, [action.parse::<Ability>()?])], None)?;
+    invoke_in(client, session, &session.space_id, &[(path, action)], body).await
+}
+
+/// One invocation with several `(path, action)` capabilities in `space`.
+async fn invoke_in(
+    client: &Client,
+    session: &Session,
+    space: &SpaceId,
+    caps: &[(&str, &str)],
+    body: &str,
+) -> Result<(Status, String)> {
+    let mut targets = Vec::new();
+    for (path, action) in caps {
+        let resource = space.clone().to_resource(
+            "kv".parse::<Service>()?,
+            Some(path.parse::<Path>()?),
+            None,
+            None,
+        );
+        targets.push((resource, [action.parse::<Ability>()?]));
+    }
+    let invocation = session.invoke_any(targets, None)?;
     let response = client
         .post("/invoke")
         .header(Header::new("Authorization", invocation.encode()?))
@@ -162,6 +177,12 @@ async fn invoke(
         response.status(),
         response.into_string().await.unwrap_or_default(),
     ))
+}
+
+/// Rows in the node's `space_data_key` table.
+fn data_key_rows(dir: &FsPath) -> Result<i64> {
+    let db = rusqlite::Connection::open(dir.join("caps.db"))?;
+    Ok(db.query_row("SELECT COUNT(*) FROM space_data_key", [], |r| r.get(0))?)
 }
 
 fn files(root: &FsPath) -> Vec<PathBuf> {
@@ -276,6 +297,95 @@ async fn an_off_node_still_stores_plaintext_under_legacy_names() -> Result<()> {
     ensure!(
         contains(&std::fs::read(&stored[0])?, MARKER.as_bytes()),
         "off mode keeps plaintext"
+    );
+    Ok(())
+}
+
+/// TC-887 S3 review B1: an invocation the node refuses (spaces it does not
+/// host, no authority there) creates no data key and no mirror object.
+#[tokio::test]
+async fn a_refused_put_creates_no_data_key_or_mirror_object() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let client = node(dir.path(), json!({"mode": "encrypt", "escrow_none": true})).await?;
+    let session = session(&client).await?;
+    let mirror = dir.path().join("at-rest");
+    let (rows, mirrored) = (data_key_rows(dir.path())?, files(&mirror).len());
+    let (_, address, _) = wallet()?;
+    for n in 0..3 {
+        let foreign: SpaceId = format!(
+            "tinycloud:pkh:eip155:1:0x{}:never-hosted-{n}",
+            encode_eip55(&address)
+        )
+        .parse()?;
+        let (status, body) = invoke_in(
+            &client,
+            &session,
+            &foreign,
+            &[("notes/x", "tinycloud.kv/put")],
+            "value",
+        )
+        .await?;
+        ensure!(status != Status::Ok, "put to {foreign}: {status} {body}");
+    }
+    ensure!(
+        data_key_rows(dir.path())? == rows,
+        "refused puts created data keys"
+    );
+    ensure!(
+        files(&mirror).len() == mirrored,
+        "refused puts created mirror objects"
+    );
+    Ok(())
+}
+
+/// TC-887 S3 review B2: a mixed get + delete (the transaction path, under the
+/// SQLite writer lock) of sealed values after the database lost the space's
+/// data-key row (restored to before it; the mirror still holds it). The key
+/// is put back before the lock, so the request completes instead of waiting
+/// on the lock it holds.
+#[tokio::test]
+async fn a_mixed_read_and_delete_after_losing_the_data_key_row_completes() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let at_rest = json!({"mode": "encrypt", "escrow_none": true});
+    {
+        let client = node(dir.path(), at_rest.clone()).await?;
+        let session = session(&client).await?;
+        for (path, value) in values() {
+            let (status, body) =
+                invoke(&client, &session, &path, "tinycloud.kv/put", &value).await?;
+            ensure!(status == Status::Ok, "put {path}: {status} {body}");
+        }
+    }
+    rusqlite::Connection::open(dir.path().join("caps.db"))?
+        .execute("DELETE FROM space_data_key", [])?;
+
+    let client = node(dir.path(), at_rest).await?;
+    let session = session(&client).await?;
+    let (status, body) = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        invoke_in(
+            &client,
+            &session,
+            &session.space_id,
+            &[
+                ("notes/short", "tinycloud.kv/get"),
+                ("notes/big", "tinycloud.kv/del"),
+            ],
+            "",
+        ),
+    )
+    .await
+    .context("mixed get + del hung (key restore under the writer lock?)")??;
+    ensure!(
+        status != Status::ServiceUnavailable && status != Status::InternalServerError,
+        "mixed get + del: {status} {body}"
+    );
+    ensure!(data_key_rows(dir.path())? == 1, "the data key is put back");
+    let (path, value) = values().remove(0);
+    let (status, body) = invoke(&client, &session, &path, "tinycloud.kv/get", "").await?;
+    ensure!(
+        status == Status::Ok && body == value,
+        "get {path}: {status}"
     );
     Ok(())
 }

@@ -1,8 +1,8 @@
 use super::{
     sealed::{
-        open_sealed, plan_range, read_plan, seal_file, seal_vec, space_tag_of, write_target,
-        AtRestHandle, AtRestStoreError, AtRestView, ReadPlan, SealFileError, SealedName,
-        WriteTarget,
+        contains_name, open_sealed, plan_range, read_plan, seal_file, seal_vec, space_tag_of,
+        write_target, AtRestHandle, AtRestStoreError, AtRestView, ContainsName, LoggedDecrypt,
+        ReadPlan, SealFileError, SealedName, WriteTarget,
     },
     size::SpaceSizes,
 };
@@ -24,7 +24,7 @@ use std::{
 use tempfile::{NamedTempFile, PathPersistError};
 use tinycloud_auth::{resource::SpaceId, ssi::dids::DIDBuf};
 use tinycloud_core::{
-    at_rest::{plaintext_len, DataKeyProvider, DecryptReader, HEADER_LEN},
+    at_rest::{plaintext_len, DataKeyProvider, HEADER_LEN},
     hash::Hash,
     storage::*,
 };
@@ -140,8 +140,10 @@ impl FileSystemStore {
                     Staged::Bytes(v) => {
                         let size = v.len() as u64;
                         let ct = seal_vec(key, space, hash, v).await?;
-                        let mut out = NamedTempFile::new_in(dir)?;
-                        std::io::Write::write_all(&mut out, &ct)?;
+                        let out = NamedTempFile::new_in(dir)?;
+                        let mut file = File::from_std(out.reopen()?);
+                        tokio::io::AsyncWriteExt::write_all(&mut file, &ct).await?;
+                        tokio::io::AsyncWriteExt::flush(&mut file).await?;
                         (size, out)
                     }
                 };
@@ -188,7 +190,7 @@ impl FileSystemStore {
             .into_inner();
         Ok(Some(Content::new(
             size,
-            AsyncEither::Right(Box::new(reader)),
+            AsyncEither::Right(Box::new(LoggedDecrypt::new(reader))),
         )))
     }
 
@@ -288,7 +290,10 @@ impl FileSystemStore {
         Ok(Some(RangeRead::Content {
             total_size: plan.plaintext_len(),
             range,
-            content: Content::new(range.len(), AsyncEither::Right(Box::new(reader))),
+            content: Content::new(
+                range.len(),
+                AsyncEither::Right(Box::new(LoggedDecrypt::new(reader))),
+            ),
         }))
     }
 
@@ -328,14 +333,12 @@ impl FileSystemStore {
         }
     }
 
-    /// Whether the block exists under a name this node may read.
+    /// Whether the block exists under the name a write would use (INTERFACES
+    /// §7): in `encrypt`/`strict` only the sealed name counts.
     fn exists(&self, space: &SpaceId, id: &Hash) -> Result<bool, FileSystemStoreError> {
-        Ok(match read_plan(&self.view(), space, id)? {
-            ReadPlan::Legacy | ReadPlan::LegacyWhileLocked => self.get_path(space, id).exists(),
-            ReadPlan::SealedThenLegacy { name, .. } => {
-                self.sealed_path(&name).exists() || self.get_path(space, id).exists()
-            }
-            ReadPlan::Sealed { name, .. } => self.sealed_path(&name).exists(),
+        Ok(match contains_name(&self.view(), space, id)? {
+            ContainsName::Legacy => self.get_path(space, id).exists(),
+            ContainsName::Sealed(name) => self.sealed_path(&name).exists(),
         })
     }
 }
@@ -343,7 +346,7 @@ impl FileSystemStore {
 /// Plaintext from a legacy file, or authenticated plaintext from a sealed one.
 /// The decrypting side is boxed: it carries the AES key schedule and segment
 /// buffers, and `Content` values move by value through deep request paths.
-pub type FsReadable = AsyncEither<PlainReader, Box<DecryptReader<PlainReader>>>;
+pub type FsReadable = AsyncEither<PlainReader, Box<LoggedDecrypt<PlainReader>>>;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
 pub struct FileSystemConfig {
@@ -418,6 +421,12 @@ impl ImmutableReadStore for FileSystemStore {
     type Readable = FsReadable;
     async fn contains(&self, space: &SpaceId, id: &Hash) -> Result<bool, Self::Error> {
         self.exists(space, id)
+    }
+    fn prepares(&self) -> bool {
+        super::sealed::prepares(&self.view())
+    }
+    async fn prepare_read(&self, space: &SpaceId) -> Result<(), Self::Error> {
+        Ok(super::sealed::prepare_read(&self.view(), space).await?)
     }
     async fn read(
         &self,

@@ -139,12 +139,15 @@ fn database_failure(
 
 /// TC-887: the status for an invocation whose block-store step failed for
 /// at-rest reasons (503 keys unavailable, 500 integrity/unsupported), if so.
-fn at_rest_invoke_status(
+pub(crate) fn at_rest_invoke_status(
     e: &TxStoreError<BlockStores, BlockStage, tinycloud_core::keys::StaticSecret>,
 ) -> Option<Status> {
     match e {
         TxStoreError::StoreRead(err) | TxStoreError::StoreWrite(err) => {
-            crate::storage::sealed::block_store_at_rest_error(err).map(|e| e.status())
+            crate::storage::sealed::block_store_at_rest_error(err).map(|e| {
+                e.log_failure();
+                e.status()
+            })
         }
         _ => None,
     }
@@ -160,7 +163,10 @@ pub(crate) fn kv_read_failure(
     use tinycloud_core::storage::either::EitherError;
     let status = match &e {
         EitherError::B(err) => crate::storage::sealed::block_store_at_rest_error(err)
-            .map(|e| e.status())
+            .map(|e| {
+                e.log_failure();
+                e.status()
+            })
             .unwrap_or(Status::InternalServerError),
         EitherError::A(_) => Status::InternalServerError,
     };

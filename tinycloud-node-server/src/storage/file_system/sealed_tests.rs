@@ -260,6 +260,162 @@ async fn a_legacy_copy_does_not_suppress_the_sealed_write() {
     assert_eq!(read_all(&store, &h).await.unwrap().unwrap(), data);
 }
 
+/// `contains` checks the name a write would use (INTERFACES §7): in encrypt
+/// mode a legacy-only block does not count; once sealed it does.
+#[tokio::test]
+async fn contains_checks_the_name_a_write_would_use() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, switch) = open_store(dir.path(), AtRestView::off()).await;
+    let data = value(300);
+    let h = put_bytes(&store, &data).await.unwrap();
+    assert!(store.contains(&space(), &h).await.unwrap());
+    switch.set(encrypt());
+    assert!(!store.contains(&space(), &h).await.unwrap(), "legacy only");
+    put_bytes(&store, &data).await.unwrap();
+    assert!(store.contains(&space(), &h).await.unwrap(), "sealed");
+    switch.set(view(AtRestMode::Encrypt, false, Some(keys().locked())));
+    let e = store.contains(&space(), &h).await.unwrap_err();
+    assert_eq!(status(&e), Some(Status::ServiceUnavailable), "{e}");
+}
+
+/// Switching back to `off` with keys still reads sealed blocks; `off` with
+/// locked keys answers 503 for a sealed-only block (it may exist but cannot
+/// be named).
+#[tokio::test]
+async fn off_after_encrypt_reads_sealed_and_locked_off_is_unavailable() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, switch) = open_store(dir.path(), encrypt()).await;
+    let data = value(SEG + 3);
+    let h = put_bytes(&store, &data).await.unwrap();
+    switch.set(view(AtRestMode::Off, false, Some(keys())));
+    assert_eq!(read_all(&store, &h).await.unwrap().unwrap(), data);
+    switch.set(view(AtRestMode::Off, false, Some(keys().locked())));
+    let e = store.read(&space(), &h).await.map(|_| ()).unwrap_err();
+    assert_eq!(status(&e), Some(Status::ServiceUnavailable), "{e}");
+}
+
+/// `strict` with locked keys serves nothing: sealed and legacy reads are 503.
+#[tokio::test]
+async fn strict_with_locked_keys_is_unavailable_for_legacy_and_sealed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, switch) = open_store(dir.path(), AtRestView::off()).await;
+    let hl = put_bytes(&store, &value(40)).await.unwrap();
+    switch.set(encrypt());
+    let hs = put_bytes(&store, &value(41)).await.unwrap();
+    switch.set(view(AtRestMode::Strict, false, Some(keys().locked())));
+    for h in [hl, hs] {
+        let e = store.read(&space(), &h).await.map(|_| ()).unwrap_err();
+        assert_eq!(status(&e), Some(Status::ServiceUnavailable), "{e}");
+        let e = store
+            .read_range(&space(), &h, ByteRangeSpec::Suffix { length: 2 })
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(status(&e), Some(Status::ServiceUnavailable), "{e}");
+    }
+}
+
+/// `From` and `Suffix` ranges at every segment edge (k·64 KiB ± 1, up to an
+/// exact multiple) return the plaintext slice and plaintext totals, for both
+/// staging paths.
+#[tokio::test]
+async fn from_and_suffix_ranges_match_the_plaintext_at_segment_edges() {
+    for (n, via_file) in [
+        (3 * SEG, false),
+        (3 * SEG, true),
+        (2 * SEG + 1, true),
+        (2 * SEG - 1, false),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _) = open_store(dir.path(), encrypt()).await;
+        let data = value(n);
+        let h = if via_file {
+            put_file(&store, &data).await.unwrap()
+        } else {
+            put_bytes(&store, &data).await.unwrap()
+        };
+        let edges = [
+            0,
+            1,
+            SEG - 1,
+            SEG,
+            SEG + 1,
+            2 * SEG - 1,
+            2 * SEG,
+            2 * SEG + 1,
+            n - 1,
+        ];
+        for &at in edges.iter().filter(|&&at| at < n) {
+            for (spec, want) in [
+                (ByteRangeSpec::From { start: at as u64 }, &data[at..]),
+                (
+                    ByteRangeSpec::Suffix {
+                        length: (n - at) as u64,
+                    },
+                    &data[at..],
+                ),
+            ] {
+                match store.read_range(&space(), &h, spec).await.unwrap().unwrap() {
+                    RangeRead::Content {
+                        total_size,
+                        content,
+                        ..
+                    } => {
+                        assert_eq!(total_size, n as u64);
+                        let mut out = Vec::new();
+                        Box::pin(content).read_to_end(&mut out).await.unwrap();
+                        assert!(out == want, "n={n} {spec:?}");
+                    }
+                    RangeRead::Unsatisfiable { .. } => panic!("n={n} {spec:?} unsatisfiable"),
+                }
+            }
+        }
+    }
+}
+
+/// A sealed persist that fails at its final step (the space's sealed
+/// directory is read-only) leaves no temporary file behind: not the sealed
+/// temp, not the staged plaintext (file staging, in its own directory), and
+/// no legacy copy.
+#[tokio::test]
+async fn a_failed_sealed_persist_leaves_no_temporary_files() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let staging = tempfile::tempdir().unwrap();
+    let (store, _) = open_store(dir.path(), encrypt()).await;
+    put_bytes(&store, b"creates the space's sealed directory")
+        .await
+        .unwrap();
+    let first = sealed_files(dir.path());
+    let tag_dir = first[0].parent().unwrap().to_path_buf();
+    std::fs::set_permissions(&tag_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let data = value(SEG + 11);
+    let mut staged = HashBuffer::new(TempFileStage::new(
+        NamedTempFile::new_in(staging.path()).unwrap(),
+    ));
+    staged.write_all(&data).await.unwrap();
+    staged.flush().await.unwrap();
+    let via_file =
+        ImmutableWriteStore::<TempFileSystemStage>::persist(&store, &space(), staged).await;
+    let via_bytes = put_bytes(&store, &data).await;
+    std::fs::set_permissions(&tag_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert!(via_file.is_err() && via_bytes.is_err());
+    let staged_left: Vec<_> = std::fs::read_dir(staging.path())
+        .unwrap()
+        .flatten()
+        .collect();
+    assert!(staged_left.is_empty(), "{staged_left:?}");
+    assert_eq!(
+        sealed_files(dir.path()),
+        first,
+        "no temporary or partial files"
+    );
+    let h = tinycloud_core::hash::hash(&data);
+    assert!(!store.get_path(&space(), &h).exists());
+}
+
 #[tokio::test]
 async fn locked_keys_refuse_writes_and_sealed_reads_but_serve_legacy() {
     let dir = tempfile::tempdir().unwrap();

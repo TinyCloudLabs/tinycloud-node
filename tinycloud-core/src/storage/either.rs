@@ -31,6 +31,18 @@ where
             Self::B(r) => r.contains(space, id).await.map_err(Self::Error::B),
         }
     }
+    fn prepares(&self) -> bool {
+        match self {
+            Self::A(l) => l.prepares(),
+            Self::B(r) => r.prepares(),
+        }
+    }
+    async fn prepare_read(&self, space: &SpaceId) -> Result<(), Self::Error> {
+        match self {
+            Self::A(l) => l.prepare_read(space).await.map_err(Self::Error::A),
+            Self::B(r) => r.prepare_read(space).await.map_err(Self::Error::B),
+        }
+    }
     async fn read(
         &self,
         space: &SpaceId,
