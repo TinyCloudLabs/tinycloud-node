@@ -626,6 +626,54 @@ fn encrypt_reader_enforces_declared_length() {
     }
 }
 
+/// Over-long input must fail before the final segment is released, so a
+/// consumer that stops reading at `ciphertext_len` never holds a complete,
+/// valid object of a prefix.
+#[test]
+fn over_long_input_never_yields_the_final_segment() {
+    let k = key(1, 1);
+    let h = hash(b"long");
+    for declared in [0usize, 10, SEG - 1, SEG, SEG + 10, 2 * SEG] {
+        let n = declared.div_ceil(SEG).max(1);
+        let final_start = segment_offset(n as u64 - 1) as usize;
+        for sizes in [vec![1], vec![3], vec![SEG + 100]] {
+            let mut r = EncryptReader::new(
+                &k,
+                &kv(&h),
+                declared as u64,
+                Chunked::new(vec![7; declared + 1], sizes.clone()),
+            )
+            .unwrap();
+            let mut got = Vec::new();
+            let err = futures::executor::block_on(async {
+                let mut buf = [0u8; 4096];
+                loop {
+                    match r.read(&mut buf).await {
+                        Ok(0) => return None,
+                        Ok(m) => got.extend_from_slice(&buf[..m]),
+                        Err(e) => return Some(e),
+                    }
+                }
+            })
+            .unwrap_or_else(|| panic!("{declared}/{sizes:?}: no error"));
+            assert!(
+                matches!(
+                    err.get_ref()
+                        .and_then(|e| e.downcast_ref::<EnvelopeError>()),
+                    Some(EnvelopeError::LengthMismatch)
+                ),
+                "{declared}: {err}"
+            );
+            assert!(
+                got.len() <= final_start,
+                "{declared}/{sizes:?}: {} bytes released, final segment starts at {final_start}",
+                got.len()
+            );
+            assert!(open(&k, &kv(&h), got).is_err());
+        }
+    }
+}
+
 #[test]
 fn range_from_another_header_is_refused() {
     let k = key(1, 1);

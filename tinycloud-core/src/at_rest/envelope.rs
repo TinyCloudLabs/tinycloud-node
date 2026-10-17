@@ -135,6 +135,12 @@ impl BlobIdentity<'_> {
 }
 
 /// A parsed and validated TCE1 header.
+///
+/// Parsing checks structure only. The header is authenticated as part of every
+/// segment's AAD, so its fields (`plaintext_len`, `dek_id`) are **unverified
+/// hints until a segment has decrypted**. A size, `Content-Length` or 416
+/// total taken from a header alone may be forged by whoever stores the bytes;
+/// verify a segment (for an exact size, the last one) before relying on it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Header {
     bytes: [u8; HEADER_LEN],
@@ -333,15 +339,22 @@ pub fn seal(
     plaintext: Vec<u8>,
 ) -> Result<Vec<u8>, EnvelopeError> {
     let header = new_header(key, plaintext.len() as u64)?;
-    Ok(seal_with_header(key, id, &header, plaintext))
+    Ok(seal_into(key, id, &header, plaintext))
 }
 
+/// Test-only: a caller-chosen header reuses its salt, and so its per-blob key
+/// and nonces. Production always goes through [`seal`].
+#[cfg(test)]
 pub(crate) fn seal_with_header(
     key: &DataKey,
     id: &BlobIdentity<'_>,
     header: &Header,
-    mut buf: Vec<u8>,
+    buf: Vec<u8>,
 ) -> Vec<u8> {
+    seal_into(key, id, header, buf)
+}
+
+fn seal_into(key: &DataKey, id: &BlobIdentity<'_>, header: &Header, mut buf: Vec<u8>) -> Vec<u8> {
     let p = header.plaintext_len();
     debug_assert_eq!(p, buf.len() as u64);
     let n = header.segment_count();

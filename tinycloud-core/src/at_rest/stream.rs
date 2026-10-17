@@ -60,7 +60,9 @@ fn poll_fill<R: AsyncRead + Unpin>(
 }
 
 /// Turns a plaintext reader of a declared length into `header ‖ segments`.
-/// Fails if the reader yields fewer or more bytes than declared.
+/// Fails if the reader yields fewer or more bytes than declared. The final
+/// segment is sealed only after the reader reports EOF, so over-long input
+/// fails before a complete object has been yielded.
 /// `R` must be `Unpin`; wrap with `Box::pin` if needed.
 pub struct EncryptReader<R> {
     inner: R,
@@ -73,7 +75,6 @@ pub struct EncryptReader<R> {
     filling: bool,
     out: Vec<u8>,
     out_pos: usize,
-    finished: bool,
     failed: bool,
 }
 
@@ -85,15 +86,22 @@ impl<R: AsyncRead + Unpin> EncryptReader<R> {
         inner: R,
     ) -> Result<Self, EnvelopeError> {
         let header = new_header(key, plaintext_len)?;
-        Ok(Self::with_header(key, id, &header, inner))
+        Ok(Self::from_header(key, id, &header, inner))
     }
 
+    /// Test-only: a caller-chosen header reuses its salt, and so its per-blob
+    /// key and nonces. Production always goes through [`Self::new`].
+    #[cfg(test)]
     pub(crate) fn with_header(
         key: &DataKey,
         id: &BlobIdentity<'_>,
         header: &Header,
         inner: R,
     ) -> Self {
+        Self::from_header(key, id, header, inner)
+    }
+
+    fn from_header(key: &DataKey, id: &BlobIdentity<'_>, header: &Header, inner: R) -> Self {
         Self {
             inner,
             cipher: SegmentCipher::new(key, id, header),
@@ -105,7 +113,6 @@ impl<R: AsyncRead + Unpin> EncryptReader<R> {
             filling: false,
             out: header.as_bytes().to_vec(),
             out_pos: 0,
-            finished: false,
             failed: false,
         }
     }
@@ -116,12 +123,6 @@ impl<R: AsyncRead + Unpin> EncryptReader<R> {
                 return Poll::Ready(Ok(drain(&self.out, &mut self.out_pos, buf)));
             }
             if self.next == self.segments {
-                if !self.finished {
-                    if !ready!(poll_eof(&mut self.inner, cx))? {
-                        return Poll::Ready(Err(invalid(EnvelopeError::LengthMismatch)));
-                    }
-                    self.finished = true;
-                }
                 return Poll::Ready(Ok(0));
             }
             if !self.filling {
@@ -137,6 +138,10 @@ impl<R: AsyncRead + Unpin> EncryptReader<R> {
                 &mut self.seg,
                 &mut self.filled
             ))? {
+                return Poll::Ready(Err(invalid(EnvelopeError::LengthMismatch)));
+            }
+            // Check for over-long input before releasing the final segment.
+            if self.next + 1 == self.segments && !ready!(poll_eof(&mut self.inner, cx))? {
                 return Poll::Ready(Err(invalid(EnvelopeError::LengthMismatch)));
             }
             let tag = self.cipher.seal_segment(self.next, &mut self.seg);
@@ -259,6 +264,8 @@ impl<R: AsyncRead + Unpin> DecryptReader<R> {
 
     /// A plaintext range. `inner` yields exactly the bytes
     /// `range.ciphertext_start()..=range.ciphertext_end()` of the object.
+    /// Refused if `range` was mapped for a different plaintext length (the
+    /// mapping depends on nothing else in the header).
     pub fn range(
         key: &DataKey,
         id: &BlobIdentity<'_>,
@@ -268,7 +275,7 @@ impl<R: AsyncRead + Unpin> DecryptReader<R> {
     ) -> Result<Self, EnvelopeError> {
         if range.plaintext_len != header.plaintext_len() {
             return Err(EnvelopeError::Header(
-                "range was mapped from another header",
+                "range was mapped for another plaintext length",
             ));
         }
         let skip = (range.start - range.first * SEGMENT_LEN as u64) as usize;
