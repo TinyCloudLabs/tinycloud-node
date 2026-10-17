@@ -413,6 +413,11 @@ impl AtRestStore {
             .await
     }
 
+    /// Every escrow row, active or not.
+    pub async fn escrows(&self) -> Result<Vec<at_rest_escrow::Model>, DbErr> {
+        at_rest_escrow::Entity::find().all(&self.db).await
+    }
+
     /// Make `row` the generation's only active bundle. Older bundles stay.
     ///
     /// Concurrent activations serialize on the generation's `at_rest_key`

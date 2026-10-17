@@ -1466,6 +1466,104 @@ async fn a_wrong_holder_is_fixed_only_before_the_ceremony_and_with_a_fresh_root_
     ));
 }
 
+/// The database lost its escrow rows and the configured holders changed:
+/// the ARK must not get a second split for other holders.
+#[tokio::test]
+async fn an_ark_never_gets_a_second_bundle_for_other_holders() {
+    let (db, mirror, h) = (db().await, Arc::new(MemoryMirror::default()), holders());
+    let k = open(&db, &mirror, &ROOT, config(&h, None)).await.unwrap();
+    let old = k.escrow_view().await.unwrap().unwrap().bundle;
+    drop(k);
+    let escrow_rows = || async { at_rest_escrow::Entity::find().all(&db).await.unwrap() };
+    let lose_escrow_rows = || async {
+        at_rest_escrow::Entity::delete_many()
+            .exec(&db)
+            .await
+            .unwrap();
+    };
+    let fixed = holders();
+    let allow = |h: &Holders| KeyringConfig {
+        allow_resplit_before_verify: true,
+        ..config(h, None)
+    };
+
+    // Before the ceremony: the mirrored bundle object is the evidence.
+    lose_escrow_rows().await;
+    assert!(matches!(
+        open(&db, &mirror, &ROOT, config(&fixed, None)).await,
+        Err(AtRestError::EscrowHoldersChanged)
+    ));
+    assert!(escrow_rows().await.is_empty(), "nothing was split");
+    // With the flag (unverified, nothing sealed): a fresh ARK instead.
+    let k = open(&db, &mirror, &ROOT, allow(&fixed)).await.unwrap();
+    let new = k.escrow_view().await.unwrap().unwrap().bundle;
+    assert_ne!(new.ark_id, old.ark_id);
+    assert_eq!(new.holders(), fixed.recipients);
+
+    // After the ceremony: the verified record is the evidence, and the flag
+    // no longer helps.
+    verify_escrow(&k, &fixed).await;
+    drop(k);
+    lose_escrow_rows().await;
+    for config in [config(&h, None), allow(&h)] {
+        assert!(matches!(
+            open(&db, &mirror, &ROOT, config).await,
+            Err(AtRestError::EscrowHoldersChanged)
+        ));
+    }
+    assert!(escrow_rows().await.is_empty());
+    // The configured holders themselves: the verified bundle comes back.
+    let k = open(&db, &mirror, &ROOT, config(&fixed, None))
+        .await
+        .unwrap();
+    assert_eq!(
+        k.escrow_view().await.unwrap().unwrap().bundle.fingerprint(),
+        new.fingerprint()
+    );
+}
+
+/// A bundle object planted in the bucket for the live ARK can only make a
+/// boot that lost its escrow rows refuse (fail closed, like D1); removing
+/// it lets the node boot.
+#[tokio::test]
+async fn a_planted_bundle_only_refuses_and_is_never_used() {
+    let (db, mirror, h) = (db().await, Arc::new(MemoryMirror::default()), holders());
+    let k = open(&db, &mirror, &ROOT, config(&h, None)).await.unwrap();
+    let real = k.escrow_view().await.unwrap().unwrap().bundle;
+    drop(k);
+    let other = holders();
+    let planted = EscrowBundle::create(
+        &Ark::generate(),
+        real.ark_id,
+        real.generation,
+        &other.recipients,
+        RecipientPolicy::AllowSoftware,
+    )
+    .unwrap();
+    let planted_name = escrow_mirror_name(&planted.fingerprint().to_string());
+    mirror
+        .put(&planted_name, serde_json::to_vec(&planted).unwrap())
+        .await
+        .unwrap();
+    // A healthy database: the planted object changes nothing.
+    open(&db, &mirror, &ROOT, config(&h, None)).await.unwrap();
+    // Escrow rows lost: refused, never split for the planted holders.
+    at_rest_escrow::Entity::delete_many()
+        .exec(&db)
+        .await
+        .unwrap();
+    assert!(matches!(
+        open(&db, &mirror, &ROOT, config(&h, None)).await,
+        Err(AtRestError::EscrowHoldersChanged)
+    ));
+    // Runbook: verify the object isn't a genuine escrow, then remove it.
+    mirror.delete(&planted_name).await.unwrap();
+    let k = open(&db, &mirror, &ROOT, config(&h, None)).await.unwrap();
+    let bundle = k.escrow_view().await.unwrap().unwrap().bundle;
+    assert_eq!(bundle.ark_id, real.ark_id);
+    assert_eq!(bundle.holders(), h.recipients);
+}
+
 #[tokio::test]
 async fn a_forged_retirement_marker_never_drops_a_live_root_key() {
     let (db, mirror, h) = (db().await, Arc::new(MemoryMirror::default()), holders());
