@@ -97,13 +97,16 @@ All of these must hold, or the command prints `REFUSED: …` and exits 1:
 
 Not pinned: `key-provider`, `instance-id`, `os-image-hash`, XFAM, MRCONFIGID, MROWNER and MROWNERCONFIG. RTMR0-2 and the compose hash cover what the per-boot, in-memory recovery key depends on.
 
-`compose_hash` pins container images only if `app-compose.json` references every image by digest. `verify-compose` parses the compose YAML with a real parser and accepts only a small subset:
+`compose_hash` pins container images only if `app-compose.json` references every image by digest. `verify-compose` reads it with a real parser (`tinycloud_at_rest_escrow::compose`, shared with the node) and accepts only a small subset:
+- `runner` is `docker-compose`;
+- the compose text is newlines and printable ASCII only, because YAML parsers disagree on Unicode line breaks such as U+2028;
 - exactly one document;
 - no anchors, aliases, merge keys, tags or duplicate keys;
 - a `services` mapping, and no `include`;
-- every service has a string `image` of the form `<name>[:tag]@sha256:<64 lowercase hex>`, with no `build` or `extends`.
+- every service has a string `image` of the form `<name>[:tag]@sha256:<64 lowercase hex>`, with no `build` or `extends`;
+- `TINYCLOUD_AT_REST__ESCROW__RECIPIENTS` and `TINYCLOUD_AT_REST__ESCROW__VERIFIED_FP`, if set, are literal values: no `$` interpolation and no pass-through from the runtime environment.
 
-Anything else is refused. Run it when building the trust policy.
+Anything else is refused. `verify-compose` prints the escrow values the compose sets and every other app-compose setting in full (scripts included). All untrusted text is escaped, so control characters and terminal escapes show up as `\u{…}`. Run it when building the trust policy.
 
 A PCCS can't forge collateral, which is Intel-signed. A malicious PCCS can, however, serve older collateral that is still valid (TCB info is valid for about 30 days), which could hide a TCB recovery for that long. Use Intel PCS when that matters.
 

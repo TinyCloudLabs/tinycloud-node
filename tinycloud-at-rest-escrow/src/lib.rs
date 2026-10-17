@@ -18,6 +18,7 @@
 #![forbid(unsafe_code)]
 
 mod bundle;
+pub mod compose;
 mod piv;
 mod recipients;
 mod record;
@@ -83,6 +84,8 @@ pub enum EscrowError {
     Record(&'static str),
     #[error("recovery binding: {0}")]
     Binding(&'static str),
+    #[error("app-compose: {0}")]
+    Compose(String),
 }
 
 /// The at-rest root key. Zeroized on drop; `Debug` never prints it.

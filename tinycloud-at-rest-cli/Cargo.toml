@@ -31,7 +31,6 @@ zeroize = "1"
 # `self-test`: throwaway P-256 co-holders encoded as age1yubikey1.
 p256 = "0.13"
 bech32 = "0.11"
-yaml-rust2 = "=0.13.0"
 
 [dev-dependencies]
 # Tests only: drive a genuine quote and collateral through every TCB status
