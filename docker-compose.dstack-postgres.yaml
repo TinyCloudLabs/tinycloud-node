@@ -65,8 +65,8 @@ services:
       # entrypoint cannot work here) and a dstack deployment uploads only
       # this compose file (so there is no host path to bind-mount from).
       #
-      # Seal the base64 of the reviewed trust-bundle.production.json — the
-      # same bytes share-api serves — into the CVM's encrypted environment as
+      # Seal the base64 of the reviewed trust-bundle.production.json (the
+      # same bytes share-api serves) into the CVM's encrypted environment as
       # SHARE_TRUST_BUNDLE_BASE64. Same variable name and same wire form
       # share-api already uses, so one sealed value feeds both services and
       # cannot drift between them.

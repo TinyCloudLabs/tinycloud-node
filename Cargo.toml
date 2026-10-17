@@ -8,6 +8,7 @@ members = [
     "tinycloud-verifier-wasm",
     "tinycloud-sdk-rs",
     "tinycloud-core",
+    "tinycloud-at-rest-escrow",
     "dependencies/siwe",
     "dependencies/siwe-recap",
     "dependencies/cacao",
@@ -23,6 +24,9 @@ exclude = [
     "vendor/sqlx-postgres",
     "test/m1-realdata-e2e",
     "test/w5-policy-runtime-node-e2e",
+    # Own workspace and lockfile: its DCAP verifier (dcap-qvl) must not
+    # change the node's dependency graph or features (TC-887).
+    "tinycloud-at-rest-cli",
 ]
 
 [workspace.dependencies]

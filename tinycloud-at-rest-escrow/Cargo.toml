@@ -1,0 +1,34 @@
+[package]
+name = "tinycloud-at-rest-escrow"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Escrow of the TinyCloud at-rest root key: 2-of-3 Shamir shares sealed to pinned age recipients (TC-887)"
+
+[dependencies]
+# Pinned exactly: share and bundle formats depend on these crates' behaviour.
+age = { version = "=0.12.1", default-features = false, features = ["armor"] }
+vsss-rs = { version = "=5.4.0", default-features = false, features = ["std", "zeroize"] }
+# age-plugin-yubikey's `piv-p256` stanza (see src/piv.rs); same versions age uses.
+age-core = "=0.12.0"
+p256 = { version = "0.13", features = ["ecdh"] }
+base64 = { workspace = true }
+hkdf = "0.12"
+hmac = "0.12"
+sha2 = "0.10"
+subtle = "2.6"
+zeroize = { version = "1", features = ["derive"] }
+rand = "0.8"
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+# Strict app-compose reading (src/compose.rs); pinned: what it accepts is a
+# security property.
+yaml-rust2 = "=0.13.0"
+
+[dev-dependencies]
+# Software P-256 identities that open `p256tag` and `piv-p256` stanzas, so
+# tests can round-trip shares sealed to hardware-key recipients.
+hpke = { version = "0.12", default-features = false, features = ["alloc", "p256"] }
+bech32 = "0.11"
