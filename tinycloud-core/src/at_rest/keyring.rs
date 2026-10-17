@@ -48,6 +48,11 @@ pub struct KeyringConfig {
     /// The TEE identity written into verification records (informational).
     pub app_id: Option<String>,
     pub compose_hash: Option<String>,
+    /// Whether mirror writes at boot and after recovery must succeed. True
+    /// once keys may seal data (mode other than `off`); with it false, a
+    /// mirror that can't be written is logged and the database alone serves,
+    /// so mirror contents never stop a node that encrypts nothing.
+    pub require_mirror: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -500,14 +505,26 @@ async fn persist_chosen(
 }
 
 /// Mirrored ARK rows, unauthenticated. Junk objects (not JSON, a newer
-/// format, bad fields) are skipped with a warning; only mirror I/O fails.
-async fn mirrored_rows(mirror: &dyn KeyMirror) -> Result<Vec<at_rest_key::Model>, AtRestError> {
+/// format, bad fields) are always skipped with a warning. An object that
+/// can't be read at all is skipped too when `tolerate_unreadable` (the
+/// database already has rows, so the mirror is only a supplement);
+/// otherwise it fails the call, as does a failure to list.
+async fn mirrored_rows(
+    mirror: &dyn KeyMirror,
+    tolerate_unreadable: bool,
+) -> Result<Vec<at_rest_key::Model>, AtRestError> {
     let mut names = mirror.list(ARK_MIRROR_PREFIX).await.map_err(mirror_err)?;
     names.sort();
     let mut rows = Vec::new();
     for name in names {
-        let Some(bytes) = get_capped(mirror, &name).await.map_err(mirror_err)? else {
-            continue;
+        let bytes = match get_capped(mirror, &name).await {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => continue,
+            Err(error) if tolerate_unreadable => {
+                tracing::warn!(object = ?name, %error, "ignoring an at-rest mirror object that can't be read");
+                continue;
+            }
+            Err(error) => return Err(mirror_err(error)),
         };
         let parsed = serde_json::from_slice::<MirroredArk>(&bytes)
             .map_err(|e| e.to_string())
@@ -622,7 +639,7 @@ impl AtRestKeyring {
     async fn load(&self) -> Result<(), AtRestError> {
         let mut db = self.store.keys().await?;
         check_contiguous(&db)?;
-        let mirrored = mirrored_rows(&*self.mirror).await?;
+        let mirrored = mirrored_rows(&*self.mirror, !db.is_empty()).await?;
         if db.is_empty() && mirrored.is_empty() {
             if self.store.has_space_keys().await?
                 || self.store.has_escrow_rows().await?
@@ -686,7 +703,7 @@ impl AtRestKeyring {
             }
             persist_chosen(&self.store, &db, &chosen).await?;
             for row in self.store.keys().await? {
-                Self::mirror_row(&*self.mirror, &row).await?;
+                self.mirror_soft(Self::mirror_row(&*self.mirror, &row).await)?;
             }
             *self.phase.write() = Phase::Unlocked(Arc::new(keys));
             return Ok(());
@@ -732,6 +749,17 @@ impl AtRestKeyring {
             Phase::NotProvisioned => KeyringState::NotProvisioned,
             Phase::Locked { .. } => KeyringState::Locked,
             Phase::Unlocked(_) => KeyringState::Unlocked,
+        }
+    }
+
+    /// A boot-time mirror write: fatal only when `require_mirror`.
+    fn mirror_soft(&self, result: Result<(), AtRestError>) -> Result<(), AtRestError> {
+        match result {
+            Err(AtRestError::Mirror(error)) if !self.config.require_mirror => {
+                tracing::warn!(%error, "at-rest key mirror could not be written; continuing (nothing is encrypted)");
+                Ok(())
+            }
+            other => other,
         }
     }
 
@@ -786,7 +814,7 @@ impl AtRestKeyring {
             if bundle.holders() != self.config.holders {
                 return Err(AtRestError::EscrowHoldersChanged);
             }
-            self.mirror_escrow(&row).await?;
+            self.mirror_soft(self.mirror_escrow(&row).await)?;
             if row.record.is_none() {
                 self.restore_record(&gen.ark, &bundle).await?;
             }
@@ -827,7 +855,7 @@ impl AtRestKeyring {
             created_at: now_rfc3339(),
         };
         self.store.activate_escrow(row.clone()).await?;
-        self.mirror_escrow(&row).await?;
+        self.mirror_soft(self.mirror_escrow(&row).await)?;
         if created {
             tracing::warn!(
                 generation = g,
@@ -857,11 +885,13 @@ impl AtRestKeyring {
     /// MAC verifies under the ARK.
     async fn restore_record(&self, ark: &Ark, bundle: &EscrowBundle) -> Result<(), AtRestError> {
         let efp = bundle.fingerprint().to_string();
-        let Some(bytes) = get_capped(&*self.mirror, &record_mirror_name(&efp))
-            .await
-            .map_err(mirror_err)?
-        else {
-            return Ok(());
+        let bytes = match get_capped(&*self.mirror, &record_mirror_name(&efp)).await {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return Ok(()),
+            Err(error) => {
+                tracing::warn!(%efp, %error, "can't read the mirrored ceremony record; not restoring it");
+                return Ok(());
+            }
         };
         match VerificationRecord::from_json(&bytes) {
             Ok(record) if record.verify(ark, bundle).is_ok() => {
@@ -886,16 +916,14 @@ impl AtRestKeyring {
             .await
             .map_err(mirror_err)?;
         for name in names {
-            let Some(bytes) = get_capped(&*self.mirror, &name).await.map_err(mirror_err)? else {
+            let Ok(Some(bytes)) = get_capped(&*self.mirror, &name).await else {
                 continue;
             };
             let Ok(record) = VerificationRecord::from_json(&bytes) else {
                 continue;
             };
             let efp = record.efp.to_string();
-            let Some(bundle_bytes) = get_capped(&*self.mirror, &escrow_mirror_name(&efp))
-                .await
-                .map_err(mirror_err)?
+            let Ok(Some(bundle_bytes)) = get_capped(&*self.mirror, &escrow_mirror_name(&efp)).await
             else {
                 continue;
             };
@@ -1204,7 +1232,7 @@ impl AtRestKeyring {
                 "recovered ARK is not the newest generation",
             ));
         }
-        let cands = candidates(&db, mirrored_rows(&*self.mirror).await?);
+        let cands = candidates(&db, mirrored_rows(&*self.mirror, !db.is_empty()).await?);
         let top = cands
             .get(&bundle.generation)
             .and_then(|l| l.iter().find(|c| c.row.ark_id == bundle.ark_id.0))
@@ -1223,7 +1251,7 @@ impl AtRestKeyring {
         }
         persist_chosen(&self.store, &db, &chosen).await?;
         for row in self.store.keys().await? {
-            Self::mirror_row(&*self.mirror, &row).await?;
+            self.mirror_soft(Self::mirror_row(&*self.mirror, &row).await)?;
         }
         *self.phase.write() = Phase::Unlocked(Arc::new(keys));
         tracing::warn!(

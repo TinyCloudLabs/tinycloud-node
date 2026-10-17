@@ -434,6 +434,8 @@ impl AtRestStore {
 pub struct MemoryMirror {
     objects: parking_lot::Mutex<std::collections::BTreeMap<String, Vec<u8>>>,
     fail: std::sync::atomic::AtomicBool,
+    read_only: std::sync::atomic::AtomicBool,
+    unreadable: parking_lot::Mutex<std::collections::BTreeSet<String>>,
 }
 
 #[cfg(any(test, feature = "test-util"))]
@@ -441,6 +443,19 @@ impl MemoryMirror {
     /// Make every call fail, like an unreachable bucket.
     pub fn set_failing(&self, fail: bool) {
         self.fail.store(fail, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Refuse every write, like a bucket whose objects can't be replaced.
+    pub fn set_read_only(&self, read_only: bool) {
+        self.read_only
+            .store(read_only, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// List `name` but fail to read it, like an object whose name or type
+    /// the real mirror refuses.
+    pub fn plant_unreadable(&self, name: &str) {
+        self.objects.lock().insert(name.to_owned(), Vec::new());
+        self.unreadable.lock().insert(name.to_owned());
     }
 
     pub fn names(&self) -> Vec<String> {
@@ -470,12 +485,18 @@ impl MemoryMirror {
 impl KeyMirror for MemoryMirror {
     async fn put(&self, name: &str, bytes: Vec<u8>) -> Result<(), MirrorError> {
         self.check()?;
+        if self.read_only.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("mirror is read-only".into());
+        }
         self.objects.lock().insert(name.to_owned(), bytes);
         Ok(())
     }
 
     async fn get(&self, name: &str) -> Result<Option<Vec<u8>>, MirrorError> {
         self.check()?;
+        if self.unreadable.lock().contains(name) {
+            return Err(format!("cannot read {name:?}").into());
+        }
         match self.objects.lock().get(name) {
             Some(bytes) if bytes.len() > MAX_MIRROR_OBJECT => Err(Box::new(MirrorObjectTooLarge)),
             other => Ok(other.cloned()),
