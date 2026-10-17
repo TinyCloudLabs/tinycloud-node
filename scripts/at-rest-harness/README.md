@@ -163,10 +163,24 @@ Every one must pass all of these, or the check is RED:
   escrow commitments, holder names alone, joined in every order with or
   without `-`/`_` separators and shifted by up to 7 characters, the armored
   share text and its decoded payload as bytes and as text, the data of a
-  bech32 recipient, record fields) and no block (its name, its raw bytes and
-  its bytes as text) may carry, in any of the encodings above, a secret the
-  harness derived or unwrapped: the root, W, each ARK_g, KEK_g, chain, canary
-  and record-MAC key, NK, the DEK mirror tag key, or any DEK.
+  bech32 recipient, record fields) may carry, in any of the encodings above,
+  a secret the harness derived or unwrapped: the root, W, each ARK_g, KEK_g,
+  chain, canary and record-MAC key, NK, the DEK mirror tag key, or any DEK.
+  The same goes for every block, in every mode:
+  - its raw bytes, searched whole;
+  - its name (the whole name, every `/` segment) and its bytes read as text:
+    hex in any case and base64/base64url at any alignment (padded or not),
+    and decoded as hex, base64, base64url (padded or not), base32 and bech32
+    data after removing whitespace and a `0x`, `\x`, short `label:` or
+    `data:…;base64,` prefix, shifted by 0 to 7 characters. This decoding
+    is applied to the whole text and to every run of 32 or more characters
+    from those alphabets (so a key encoded inside ciphertext or other text
+    is found).
+- **No piece of a secret in a TCE1 salt.** The salt (header bytes 20..52) is
+  the only free field of a sealed block. No block's salt may hold any 16-byte
+  window of any of those secrets: a truncated key (31 bytes and one other
+  byte) and a key split across two blocks' salts (one half in each) are both
+  RED. A random salt matches with probability about 2^-120 per secret.
 - **Escrow-none.** If `up` started the node with `TC887_AT_REST_ESCROW_NONE=true`,
   any escrow bundle or record object is RED.
 - **Mirrors required, blocks tied to them (encrypt/strict mode).** An ARK
@@ -183,6 +197,8 @@ Out of scope for a regression harness, one line each:
 - Escrow share commitments and age-encrypted shares can't be opened without
   the holders' keys, so key material the harness didn't derive can hide there.
 - A key split across two commitments, or XOR'd with anything, isn't found.
+- A piece of a secret (fewer than 32 bytes) is only looked for in TCE1 salts;
+  everywhere else only whole secrets are matched.
 - Separators other than `-`/`_` inside holder names, shifts of more than 7
   characters, and splits across fields other than holder names aren't
   rejoined.
@@ -198,8 +214,9 @@ round trips, every one-bit flip and wrong binding rejected),
 bypass), `selftest_key_mirror_refuses_escrow_contents_and_derived_keys`,
 `selftest_key_mirror_bounds_absurd_generations`,
 `selftest_key_mirror_requires_mirrors_in_encrypt_mode`,
-`selftest_blocks_open_under_their_mirrored_dek` and
-`selftest_blocks_carry_no_derived_secret` run in plain `cargo test`.
+`selftest_blocks_open_under_their_mirrored_dek`,
+`selftest_blocks_carry_no_derived_secret` and
+`selftest_salts_hold_no_piece_of_a_secret` run in plain `cargo test`.
 
 ## Not covered
 

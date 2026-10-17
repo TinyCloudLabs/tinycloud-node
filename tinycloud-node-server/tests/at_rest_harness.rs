@@ -1924,9 +1924,23 @@ mod key_mirror {
         findings.into_iter().collect()
     }
 
-    /// Round 6, ruling 1: a block's name and bytes carry no harness-derived
-    /// secret, raw or as hex, base64 or base64url (padded or not, any
-    /// alignment), in its name or anywhere in its body.
+    fn is_encoding_char(c: char) -> bool {
+        c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=' | '_' | '-')
+    }
+
+    /// Maximal runs of 32 or more characters from the hex, base64,
+    /// base64url, base32 and bech32 alphabets: where an encoded key would
+    /// sit inside other text or among ciphertext bytes.
+    fn encoded_runs(text: &str) -> impl Iterator<Item = &str> {
+        text.split(|c: char| !is_encoding_char(c))
+            .filter(|run| run.len() >= 32)
+    }
+
+    /// Round 6 ruling 1 / round 7: a block's name and bytes carry no
+    /// harness-derived secret. The body is searched as raw bytes. The name
+    /// (whole and every `/` segment) and the body read as text are checked
+    /// as hex (any case) and base64/base64url at any alignment, and through
+    /// [`byte_views`] of the whole text and of every [`encoded_runs`] run.
     pub fn block_secret_findings(
         label: &str,
         block: &ObjectRef,
@@ -1934,20 +1948,28 @@ mod key_mirror {
     ) -> Vec<String> {
         let body_text = String::from_utf8_lossy(block.body);
         let body_lower = body_text.to_ascii_lowercase();
+        let body_views: Vec<Vec<u8>> = std::iter::once(&*body_text)
+            .chain(encoded_runs(&body_text))
+            .flat_map(byte_views)
+            .collect();
         let name_lower = block.key.to_ascii_lowercase();
+        let name_views: Vec<Vec<u8>> = std::iter::once(block.key)
+            .chain(block.key.split('/'))
+            .chain(encoded_runs(block.key))
+            .flat_map(byte_views)
+            .collect();
         let mut findings = Vec::new();
         for secret in secrets {
+            let needle = &secret.bytes;
+            let in_views =
+                |views: &[Vec<u8>]| views.iter().any(|v| super::find(v, needle).is_some());
             let mut places = Vec::new();
-            if in_text(block.key, &name_lower, &secret.bytes)
-                || byte_views(block.key.rsplit('/').next().unwrap_or(block.key))
-                    .iter()
-                    .any(|b| super::find(b, &secret.bytes).is_some())
-            {
+            if in_text(block.key, &name_lower, needle) || in_views(&name_views) {
                 places.push("name");
             }
-            if super::find(block.body, &secret.bytes).is_some() {
+            if super::find(block.body, needle).is_some() {
                 places.push("raw bytes");
-            } else if in_text(&body_text, &body_lower, &secret.bytes) {
+            } else if in_text(&body_text, &body_lower, needle) || in_views(&body_views) {
                 places.push("bytes as text");
             }
             if !places.is_empty() {
@@ -1955,6 +1977,43 @@ mod key_mirror {
                     "[{label}] block {:?}: its {} carry the harness-derived {} (raw key material)",
                     block.key,
                     places.join(" and "),
+                    secret.label
+                ));
+            }
+        }
+        findings
+    }
+
+    /// TCE1's only free header field: the salt, bytes 20..52 (envelope.rs
+    /// `Header::build`). Every other header byte is fixed, a length, or the
+    /// authenticated `dek_id`.
+    const SALT: std::ops::Range<usize> = 20..52;
+
+    /// The salt check looks for pieces of a secret this long. A 31-byte
+    /// prefix of a key holds one, and so does each half of a key split
+    /// across two blocks' salts; a random salt holds one of a given secret's
+    /// 17 pieces with probability about 17 · 17 · 2^-128.
+    const SECRET_PIECE: usize = 16;
+
+    /// Round 7: no TCE1 block's salt holds any 16-byte piece of a
+    /// harness-derived secret (a truncated key, or one half of a key split
+    /// across salts).
+    pub fn salt_findings(label: &str, block: &ObjectRef, secrets: &[Secret]) -> Vec<String> {
+        if tinycloud_core::at_rest::Header::parse(block.body).is_err() {
+            return Vec::new();
+        }
+        let salt = &block.body[SALT];
+        let mut findings = Vec::new();
+        for secret in secrets {
+            let found = secret
+                .bytes
+                .windows(SECRET_PIECE)
+                .position(|piece| super::find(salt, piece).is_some());
+            if let Some(at) = found {
+                findings.push(format!(
+                    "[{label}] block {:?}: its TCE1 header salt holds bytes {at}..{} of the harness-derived {} (a piece of raw key material)",
+                    block.key,
+                    at + SECRET_PIECE,
                     secret.label
                 ));
             }
@@ -2121,6 +2180,7 @@ mod key_mirror {
         }
         for block in blocks {
             findings.extend(block_secret_findings(label, block, &keys.secrets));
+            findings.extend(salt_findings(label, block, &keys.secrets));
         }
         if policy.encrypt {
             require_mirrors(label, blocks, puts, spaces, &arks, &keys, &mut findings);
@@ -4702,10 +4762,12 @@ fn selftest_blocks_open_under_their_mirrored_dek() -> Result<()> {
     Ok(())
 }
 
-/// Round 6 ruling 1, offline: a block's name or bytes carrying a harness
-/// secret (raw, hex, base64 or base64url, padded or not) is RED, in any
-/// mode: the space's DEK as the TCE1 header salt, b64url(DEK) or b64url(NK)
-/// as the object name, hex(KEK) and base64(W) inside the body.
+/// Round 6 ruling 1 / round 7, offline: a block's name or bytes carrying a
+/// harness secret (raw, hex, base64 or base64url, padded or not, base32,
+/// bech32 data) is RED, in any mode: the space's DEK as the TCE1 header
+/// salt, b64url(DEK) or b64url(NK) as the object name, base32(NK) as a middle
+/// name segment, and hex(KEK), base64(W), base32(KEK) and bech32(DEK) text
+/// after the ciphertext.
 #[test]
 fn selftest_blocks_carry_no_derived_secret() -> Result<()> {
     let fx = MirrorFixture::new();
@@ -4719,6 +4781,7 @@ fn selftest_blocks_carry_no_derived_secret() -> Result<()> {
     salt_dek[20..52].copy_from_slice(&dek);
     let with_text = |text: String| {
         let mut body = good.body.clone();
+        body.push(b'\n');
         body.extend_from_slice(text.as_bytes());
         body
     };
@@ -4769,6 +4832,34 @@ fn selftest_blocks_carry_no_derived_secret() -> Result<()> {
             },
             "bytes as text carry the harness-derived wrap key W",
         ),
+        (
+            "base32(NK) as a middle name segment",
+            StoredObject {
+                key: format!(
+                    "v1/{}/{}",
+                    base32_lower(&fx.keys.nk),
+                    good.key.rsplit('/').next().expect("object")
+                ),
+                body: good.body.clone(),
+            },
+            "name carry the harness-derived object-name key NK",
+        ),
+        (
+            "base32(KEK_1) in the body",
+            StoredObject {
+                key: good.key.clone(),
+                body: with_text(base32_lower(&kek_1).to_uppercase()),
+            },
+            "bytes as text carry the harness-derived KEK of generation 1",
+        ),
+        (
+            "bech32 data of the DEK in the body",
+            StoredObject {
+                key: good.key.clone(),
+                body: with_text(bech32_of("age", &dek)),
+            },
+            "bytes as text carry the harness-derived DEK 1",
+        ),
     ];
     let mut missed = Vec::new();
     for (what, block, expected) in cases {
@@ -4786,6 +4877,75 @@ fn selftest_blocks_carry_no_derived_secret() -> Result<()> {
         missed.is_empty(),
         "block secret scan missed:\n{}",
         missed.join("\n")
+    );
+    Ok(())
+}
+
+/// Round 7, offline: no TCE1 salt may hold any 16-byte piece of a harness
+/// secret, in any mode: (a) a salt of DEK[0..31] plus one random byte; (b)
+/// DEK[0..16] in one block's salt and DEK[16..32] in another's. Random salts
+/// (fresh seals) never match.
+#[test]
+fn selftest_salts_hold_no_piece_of_a_secret() -> Result<()> {
+    let fx = MirrorFixture::new();
+    let all = fx.with_edit("ark-", &|_, _| None);
+    let dek = fx.keys.deks[0];
+    let (a, put_a) = fx.sealed_block(0, b"first value");
+    let (b, put_b) = fx.sealed_block(0, b"second value");
+    let puts = [put_a, put_b];
+    let with_salt = |block: &StoredObject, salt: &[u8]| {
+        let mut body = block.body.clone();
+        body[20..52].copy_from_slice(salt);
+        StoredObject {
+            key: block.key.clone(),
+            body,
+        }
+    };
+    let pieces = |findings: &[String]| {
+        findings
+            .iter()
+            .filter(|f| f.contains("TCE1 header salt holds bytes"))
+            .count()
+    };
+    let truncated = [&dek[..31], &random_bytes(1)[..]].concat();
+    let half_a = [&dek[..16], &random_bytes(16)[..]].concat();
+    let half_b = [&random_bytes(16)[..], &dek[16..]].concat();
+    for policy in [ENCRYPT, key_mirror::Policy::default()] {
+        let findings = fx.check_with(&all, &[with_salt(&a, &truncated)], &puts, policy);
+        ensure!(
+            pieces(&findings) == 1
+                && any_contains(
+                    &findings,
+                    "salt holds bytes 0..16 of the harness-derived DEK 1"
+                ),
+            "a salt of DEK[0..31] plus one byte was missed ({policy:?}): {findings:#?}"
+        );
+        let findings = fx.check_with(
+            &all,
+            &[with_salt(&a, &half_a), with_salt(&b, &half_b)],
+            &puts,
+            policy,
+        );
+        ensure!(
+            pieces(&findings) == 2
+                && any_contains(
+                    &findings,
+                    "salt holds bytes 0..16 of the harness-derived DEK 1"
+                )
+                && any_contains(
+                    &findings,
+                    "salt holds bytes 16..32 of the harness-derived DEK 1"
+                ),
+            "a DEK split across two blocks' salts was missed ({policy:?}): {findings:#?}"
+        );
+    }
+    let blocks: Vec<StoredObject> = (0..64)
+        .map(|i| fx.sealed_block(i % 2, format!("value {i}").as_bytes()).0)
+        .collect();
+    let findings = fx.check_with(&all, &blocks, &[], key_mirror::Policy::default());
+    ensure!(
+        pieces(&findings) == 0,
+        "a random salt matched a piece of a secret: {findings:#?}"
     );
     Ok(())
 }
