@@ -107,7 +107,7 @@ then insert (a WAL delta).
 |---|---|---|
 | `green_kv_put_reaches_minio` | every put round-trips through the node and adds a non-empty object to the bucket | pass |
 | `green_sql_write_reaches_postgres` | the writes round-trip, and `database_artifact` has a `payload` and a non-NULL `delta_payload` | pass |
-| `red_kv_blocks_are_sealed_in_minio` | object keys contain no space id, wallet address or blake3 fingerprint of the value (b64url padded/unpadded, base64 padded/unpadded, hex; raw digest and multihash); raw bytes hold no marker; each put's objects together are at least as large as the value; the 64 KiB object doesn't compress (zlib ratio > 0.95); every object of a put in one space shares no 32-byte run with every object of the same put in the other (equal object counts required) | **fail** |
+| `red_kv_blocks_are_sealed_in_minio` | object keys contain no identity of any space the harness created (space id or wallet address: raw, lowercase, hex, base64 and base64url at any alignment, of the text and of the bytes) and no blake3 fingerprint of the value (b64url padded/unpadded, base64 padded/unpadded, hex; raw digest and multihash); raw bytes hold no marker; each put's objects together are at least as large as the value; the 64 KiB object doesn't compress (zlib ratio > 0.95); every object of a put in one space shares no 32-byte run with every object of the same put in the other (equal object counts required); every `_tc/` key-mirror object passes the checks below | **fail** |
 | `red_sql_artifacts_are_sealed_in_postgres` | `payload` doesn't start with `SQLite format 3\0` and `delta_payload` doesn't start with the WAL magic; neither holds a marker, compresses (ratio > 0.95) or is smaller than the 64 KiB value it holds; the two spaces' payloads and deltas share no 32-byte run | **fail** |
 
 The RED checks re-run the green preconditions first, so a RED result is never
@@ -122,6 +122,46 @@ across writes once a per-write salt (SQLite's WAL salts) is mixed in.
 `cargo test` and checks the predicates offline: base64, XOR and zlib are
 flagged, a salted deflate-9 blob is flagged by the size floor, and sealed-like
 random blobs pass.
+
+### At-rest key mirror (`_tc/…` objects)
+
+With at-rest keys on, the node writes control objects next to its blocks. The
+KV RED check reads them twice: from the boot snapshot `up` saves
+(`boot-snapshot/`, before any test write) and from the bucket after its puts.
+Every one must pass all of these, or the check is RED:
+
+- **Name.** Exactly one of `_tc/at-rest/ark-<generation, 10 digits>-<ark id,
+  32 lowercase hex>.json`, `escrow-<EFP, 64 hex>.json`, `record-<EFP, 64
+  hex>.json` or `dek-<tag, 32 hex>-<data key id, 10 digits>.json`, numbers ≥ 1.
+  Any other `_tc/` object is RED.
+- **Typed schema** per kind (S1's `MirroredArk`, `MirroredDek`,
+  `EscrowBundle`, `VerificationRecord`): exactly the fields, integers as
+  integers, `created_at`/`verified_at` strict RFC 3339 (≤ 35 chars), ids as
+  exact lowercase hex, `sealed`/`chain`/`wrapped` as canonical base64 of 60
+  bytes, escrow shares as armored age files and bech32 recipients, and no TEE
+  identity in a record (the harness node has none). Duplicate keys are refused.
+- **Raw-key scan** over every JSON key and every string outside those exact
+  fields: nothing that decodes (hex, base64, base64url, padded or not,
+  whitespace and prefixes like `0x`/`base64:`/data URLs removed) to 32 bytes,
+  no array of 32 byte values, no two fields of 16 bytes each.
+- **Content.** The same identity, fingerprint and marker scans as blocks,
+  over the name and the text.
+- **Authentic key material.** The check reads the node's Static root
+  (`secrets/node-static-secret`, never printed) and re-derives the hierarchy
+  from S1's spec: every sealed ARK opens under W, each older generation's
+  chain opens under the next, every wrapped DEK opens under KEK_g with its
+  AAD, its tag mapped to a space the harness signed in to (`spaces.log`). An
+  escrow bundle's canary and EFP and a record's MAC are recomputed. A raw key
+  padded to 60 bytes fails here.
+
+Not checkable without the escrow holders: the escrow share commitments and
+the age-encrypted share files themselves.
+
+`selftest_key_hierarchy_reference_vectors` (RFC 5869 vectors, seal/open
+round trips, every one-bit flip and wrong binding rejected),
+`selftest_key_mirror_accepts_s1_shaped_mirrors` and
+`selftest_key_mirror_flags_every_bypass` (one case per rule and per known
+bypass) run in plain `cargo test`.
 
 ## Not covered
 
