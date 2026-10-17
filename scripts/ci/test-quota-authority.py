@@ -17,7 +17,7 @@ NS = {"__name__": "quota_authority_test", "__file__": str(SCRIPT)}
 exec(compile(SCRIPT.read_text(), str(SCRIPT), "exec"), NS)
 
 OWNER = "tinycloud:pkh:eip155:1:0xd559CCd9EB87c530A9a349262669386dE93cf412"
-LIMITS = {OWNER + ":applications": 5368709120, OWNER + ":secrets": 268721121}
+LIMITS = {OWNER + ":applications": 5368709120, OWNER + ":secrets": 1073741824}
 CANARIES = []
 
 
@@ -332,6 +332,32 @@ class AuthorityTests(unittest.TestCase):
         authority, overrides = NS["load_configuration"](ROOT / "ops/quota-overrides.json")
         self.assertIn(authority, ("node-override", "billing"))
         self.assertTrue(overrides == LIMITS, "Canonical Sam targets/values changed")
+
+    def test_shipped_billing_config_reconciles_against_exact_floors(self):
+        shipped = ROOT / "ops/quota-overrides.json"
+        document = json.loads(shipped.read_text())
+        self.assertEqual(document["authority"], "billing")
+        self.billing_active()
+        for space, limit in LIMITS.items():
+            self.billing_body[space]["storage_limit_bytes"] = limit
+        with patch.dict(NS, {"CONFIG_PATH": shipped}):
+            code, logs = self.run_main()
+            self.assertEqual(code, 0)
+            self.assertIn("billing-authoritative", logs)
+            self.assertEqual(self.puts(), [])
+            secrets_space = OWNER + ":secrets"
+            self.billing_body[secrets_space]["storage_limit_bytes"] = 1073741823
+            code, logs = self.run_main()
+            self.assertEqual(code, 1)
+            self.assertIn("billing authority does not cover both reviewed quota floors", logs)
+            self.assertEqual(self.puts(), [])
+        self.billing_body[secrets_space]["storage_limit_bytes"] = 1073741824
+        document["authority"] = "node-override"
+        self.config.write_text(json.dumps(document))
+        code, logs = self.run_main()
+        self.assertEqual(code, 1)
+        self.assertIn("authority mismatch: flip to billing", logs)
+        self.assertEqual(self.puts(), [])
 
     def test_missing_node_secret_is_preflight_failure(self):
         self.environment.pop("QUOTA_ADMIN_SECRET")
