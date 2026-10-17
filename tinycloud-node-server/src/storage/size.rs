@@ -123,5 +123,10 @@ mod tests {
         sizes.decrement_size(&c, Some("tagC"), 40).await;
         assert_eq!(sizes.get_size(&c, Some("tagC")).await, Some(40));
         assert_eq!(sizes.get_size(&c, None).await, Some(40));
+        // A second removal of the same bytes (double remove) floors at zero
+        // under both entries; it never wraps.
+        sizes.decrement_size(&c, Some("tagC"), 40).await;
+        sizes.decrement_size(&c, None, 40).await;
+        assert_eq!(sizes.get_size(&c, Some("tagC")).await, Some(0));
     }
 }
