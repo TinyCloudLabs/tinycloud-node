@@ -383,6 +383,10 @@ async fn gate_requires_pinned_verified_escrow_for_the_configured_recipients() {
     );
     assert_eq!(k.gate(false).await, Ok(GatePass::Verified { efp }));
     assert!(k.escrow_view().await.unwrap().unwrap().verified);
+    assert_eq!(
+        k.verification_record().await.unwrap().map(|r| r.efp),
+        Some(efp)
+    );
     let record = at_rest_escrow::Entity::find_by_id(efp.to_string())
         .one(&db)
         .await

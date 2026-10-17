@@ -592,6 +592,18 @@ impl AtRestKeyring {
         }))
     }
 
+    /// The active escrow's verification record, only if its MAC verifies
+    /// under the loaded ARK. `None` when locked, unescrowed or unverified.
+    pub async fn verification_record(&self) -> Result<Option<VerificationRecord>, AtRestError> {
+        if self.state() != KeyringState::Unlocked {
+            return Ok(None);
+        }
+        match self.ensure_escrow().await? {
+            Some(bundle) => self.verified_record(&bundle).await,
+            None => Ok(None),
+        }
+    }
+
     async fn verified_record(
         &self,
         bundle: &EscrowBundle,
