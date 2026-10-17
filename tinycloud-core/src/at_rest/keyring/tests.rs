@@ -3,7 +3,8 @@ use std::sync::Arc;
 
 use base64::Engine as _;
 use sea_orm::{
-    ColumnTrait, ConnectOptions, Database, DatabaseConnection, EntityTrait, QueryFilter,
+    ColumnTrait, ConnectOptions, Database, DatabaseConnection, EntityTrait, IntoActiveModel,
+    QueryFilter,
 };
 use sea_orm_migration::MigratorTrait;
 use tinycloud_at_rest_escrow::{wrap_share, EscrowBundle, HolderRecipient, SharePayload};
@@ -1043,6 +1044,53 @@ async fn data_keys_survive_a_restore_to_before_they_were_created() {
     assert_eq!(k.current_key("space-a").await.unwrap().bytes(), a.bytes());
 }
 
+/// TC-887 S3: inside `write_locked` (the invoke write lock and transaction)
+/// the keyring never writes: a key that would need restoring or creating is
+/// `NotPrepared`, with no row inserted. `prepare_read` restores it beforehand
+/// (never creating one), after which lookups under the lock succeed.
+#[tokio::test]
+async fn under_the_write_lock_keys_are_only_looked_up() {
+    use crate::at_rest::write_locked;
+    let (db, mirror, h) = (db().await, Arc::new(MemoryMirror::default()), holders());
+    let k = open(&db, &mirror, &ROOT, config(&h, None)).await.unwrap();
+    let a = k.current_key("space-a").await.unwrap();
+    drop(k);
+    space_data_key::Entity::delete_many()
+        .exec(&db)
+        .await
+        .unwrap();
+    let rows = || async { space_data_key::Entity::find().all(&db).await.unwrap().len() };
+
+    let k = open(&db, &mirror, &ROOT, config(&h, None)).await.unwrap();
+    assert!(matches!(
+        write_locked(k.key("space-a", DekId::new(1))).await,
+        Err(DataKeyError::NotPrepared)
+    ));
+    assert!(matches!(
+        write_locked(k.current_key("space-a")).await,
+        Err(DataKeyError::NotPrepared)
+    ));
+    assert!(matches!(
+        write_locked(k.current_key("space-new")).await,
+        Err(DataKeyError::NotPrepared)
+    ));
+    assert_eq!(rows().await, 0, "nothing is written under the lock");
+
+    // Reads never create a key: a space with no key stays without one.
+    k.prepare_read("space-new").await.unwrap();
+    assert_eq!(rows().await, 0);
+    // The lost row comes back from the mirror before the lock.
+    k.prepare_read("space-a").await.unwrap();
+    assert_eq!(rows().await, 1);
+    assert_eq!(
+        write_locked(k.key("space-a", DekId::new(1)))
+            .await
+            .unwrap()
+            .bytes(),
+        a.bytes()
+    );
+}
+
 #[tokio::test]
 async fn escrow_rows_or_any_mirror_object_block_provisioning() {
     let (db, mirror, h) = (db().await, Arc::new(MemoryMirror::default()), holders());
@@ -1303,11 +1351,13 @@ async fn a_mirrored_data_key_under_an_unloaded_generation_is_never_replaced() {
 }
 
 #[tokio::test]
-async fn a_wrong_holder_can_be_fixed_only_before_the_ceremony_and_any_sealing() {
+async fn a_wrong_holder_is_fixed_only_before_the_ceremony_and_with_a_fresh_root_key() {
     let (db, mirror, h) = (db().await, Arc::new(MemoryMirror::default()), holders());
     let wrong = open(&db, &mirror, &ROOT, config(&h, None)).await.unwrap();
-    let first = wrong.escrow_view().await.unwrap().unwrap().efp;
+    let old = wrong.escrow_view().await.unwrap().unwrap().bundle;
     drop(wrong);
+    let old_keys = at_rest_key::Entity::find().all(&db).await.unwrap();
+    let old_escrow = at_rest_escrow::Entity::find().all(&db).await.unwrap();
     let fixed = holders();
     let allow = |h: &Holders| KeyringConfig {
         allow_resplit_before_verify: true,
@@ -1318,10 +1368,63 @@ async fn a_wrong_holder_can_be_fixed_only_before_the_ceremony_and_any_sealing() 
         open(&db, &mirror, &ROOT, config(&fixed, None)).await,
         Err(AtRestError::EscrowHoldersChanged)
     ));
-    // With it, unverified and nothing sealed: re-split for the new holders.
+    // With it, unverified and nothing sealed: a fresh ARK, split for the
+    // new holders.
     let k = open(&db, &mirror, &ROOT, allow(&fixed)).await.unwrap();
-    let second = k.escrow_view().await.unwrap().unwrap().efp;
-    assert_ne!(second, first);
+    let new = k.escrow_view().await.unwrap().unwrap().bundle;
+    assert_ne!(new.fingerprint(), old.fingerprint());
+    assert_ne!(new.ark_id, old.ark_id);
+    // The removed holder's old share, with any other old share, rebuilds
+    // only the retired ARK, never the one now escrowed.
+    let old_ark = old
+        .recover(&h.decrypt(&old, 1), &h.decrypt(&old, 0))
+        .unwrap();
+    let new_ark = new
+        .recover(&fixed.decrypt(&new, 0), &fixed.decrypt(&new, 2))
+        .unwrap();
+    assert_ne!(old_ark.expose(), new_ark.expose());
+    // The old ARK's copy, bundle and record objects are gone from the mirror.
+    let old_hex = hex::encode(old.ark_id.0);
+    let names = mirror.list(MIRROR_PREFIX).await.unwrap();
+    assert!(!names
+        .iter()
+        .any(|n| n.starts_with(ARK_MIRROR_PREFIX) && n.contains(&old_hex)));
+    assert!(!names.contains(&escrow_mirror_name(&old.fingerprint().to_string())));
+    drop(k);
+
+    // A database restored to before the re-split never brings the old ARK
+    // back: its rows are dropped and the fresh ARK comes from the mirror.
+    at_rest_escrow::Entity::delete_many()
+        .exec(&db)
+        .await
+        .unwrap();
+    at_rest_key::Entity::delete_many().exec(&db).await.unwrap();
+    at_rest_key::Entity::insert_many(old_keys.into_iter().map(IntoActiveModel::into_active_model))
+        .exec(&db)
+        .await
+        .unwrap();
+    at_rest_escrow::Entity::insert_many(
+        old_escrow
+            .into_iter()
+            .map(IntoActiveModel::into_active_model),
+    )
+    .exec(&db)
+    .await
+    .unwrap();
+    let k = open(&db, &mirror, &ROOT, config(&fixed, None))
+        .await
+        .unwrap();
+    assert_eq!(
+        k.escrow_view().await.unwrap().unwrap().bundle.ark_id,
+        new.ark_id
+    );
+    assert!(at_rest_key::Entity::find()
+        .all(&db)
+        .await
+        .unwrap()
+        .iter()
+        .all(|r| r.ark_id == new.ark_id.0));
+
     // Once verified, the flag no longer helps.
     verify_escrow(&k, &fixed).await;
     drop(k);
@@ -1329,8 +1432,22 @@ async fn a_wrong_holder_can_be_fixed_only_before_the_ceremony_and_any_sealing() 
         open(&db, &mirror, &ROOT, allow(&h)).await,
         Err(AtRestError::EscrowHoldersChanged)
     ));
+    // Nor when the database lost the record but the mirror still has it.
+    at_rest_escrow::Entity::update_many()
+        .col_expr(
+            at_rest_escrow::Column::Record,
+            sea_orm::sea_query::Expr::value(Option::<String>::None),
+        )
+        .exec(&db)
+        .await
+        .unwrap();
+    assert!(matches!(
+        open(&db, &mirror, &ROOT, allow(&h)).await,
+        Err(AtRestError::EscrowHoldersChanged)
+    ));
 
-    // Unverified, but a data key exists (data may be sealed): refused.
+    // Unverified, but a data key exists (data may be sealed): refused,
+    // also when only the mirror still has it.
     let (db, mirror) = (self::db().await, Arc::new(MemoryMirror::default()));
     let k = open(&db, &mirror, &ROOT, config(&h, None)).await.unwrap();
     k.current_key("space-a").await.unwrap();
@@ -1339,6 +1456,41 @@ async fn a_wrong_holder_can_be_fixed_only_before_the_ceremony_and_any_sealing() 
         open(&db, &mirror, &ROOT, allow(&fixed)).await,
         Err(AtRestError::EscrowHoldersChanged)
     ));
+    space_data_key::Entity::delete_many()
+        .exec(&db)
+        .await
+        .unwrap();
+    assert!(matches!(
+        open(&db, &mirror, &ROOT, allow(&fixed)).await,
+        Err(AtRestError::EscrowHoldersChanged)
+    ));
+}
+
+#[tokio::test]
+async fn a_forged_retirement_marker_never_drops_a_live_root_key() {
+    let (db, mirror, h) = (db().await, Arc::new(MemoryMirror::default()), holders());
+    let k = open(&db, &mirror, &ROOT, config(&h, None)).await.unwrap();
+    let bundle = k.escrow_view().await.unwrap().unwrap().bundle;
+    drop(k);
+    let id = hex::encode(bundle.ark_id.0);
+    // A marker for the live ARK under another root's W, and junk.
+    let forged = WrapKey::derive(&NEW_ROOT).retire_tag(&bundle.ark_id.0);
+    mirror
+        .put(
+            &retired_mirror_name(&id),
+            serde_json::to_vec(&MirroredRetired::new(id.clone(), &forged)).unwrap(),
+        )
+        .await
+        .unwrap();
+    mirror
+        .put(&retired_mirror_name("junk"), b"not json".to_vec())
+        .await
+        .unwrap();
+    let k = open(&db, &mirror, &ROOT, config(&h, None)).await.unwrap();
+    assert_eq!(
+        k.escrow_view().await.unwrap().unwrap().bundle.ark_id,
+        bundle.ark_id
+    );
 }
 
 #[tokio::test]

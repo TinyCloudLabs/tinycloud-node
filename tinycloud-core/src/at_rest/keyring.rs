@@ -22,10 +22,11 @@ use super::hierarchy::{
     Kek, WrapKey, W_LABEL,
 };
 use super::store::{
-    ark_mirror_name, dek_mirror_name, escrow_mirror_name, record_mirror_name, AtRestStore,
-    KeyMirror, MirrorObjectTooLarge, MirroredArk, MirroredDek, ARK_MIRROR_PREFIX, MIRROR_PREFIX,
+    ark_mirror_name, dek_mirror_name, escrow_mirror_name, record_mirror_name, retired_mirror_name,
+    AtRestStore, KeyMirror, MirrorObjectTooLarge, MirroredArk, MirroredDek, MirroredRetired,
+    ARK_MIRROR_PREFIX, MIRROR_PREFIX, RETIRED_MIRROR_PREFIX,
 };
-use super::{DataKey, DataKeyError, DataKeyProvider, DekId, ObjectNameKey};
+use super::{in_write_lock, DataKey, DataKeyError, DataKeyProvider, DekId, ObjectNameKey};
 use crate::models::{at_rest_escrow, at_rest_key, space_data_key};
 
 const DEK_CACHE: usize = 4096;
@@ -54,10 +55,13 @@ pub struct KeyringConfig {
     /// so mirror contents never stop a node that encrypts nothing.
     pub require_mirror: bool,
     /// `at_rest.escrow.allow_resplit_before_verify`: let a holder change
-    /// re-split at boot, but only while nothing is pinned, the active
-    /// escrow has no verified ceremony record, and no data key has ever
-    /// been made (so nothing was ever sealed). For fixing a wrong holder
-    /// before the ceremony; otherwise a holder change refuses the boot.
+    /// replace the root key at boot, but only while nothing is pinned, no
+    /// ceremony record exists, and no data key has ever been made (database
+    /// and mirror both checked). The node makes a fresh ARK, splits it for
+    /// the configured holders and retires the old ARK and its escrow, so
+    /// old shares rebuild only a key that never protected anything. For
+    /// fixing a wrong holder before the ceremony; otherwise a holder change
+    /// refuses the boot.
     pub allow_resplit_before_verify: bool,
 }
 
@@ -647,18 +651,45 @@ impl AtRestKeyring {
 
     /// Read the stored and mirrored rows and set the phase.
     async fn load(&self) -> Result<(), AtRestError> {
+        // A retired ARK (W-authenticated tombstone in the mirror) is never
+        // loaded, even from a database restored to before its retirement.
+        let retired = self.retired_ark_ids().await?;
         let mut db = self.store.keys().await?;
+        if db.iter().any(|r| retired.contains(&r.ark_id)) {
+            // Retirement replaces every generation at once, so a database
+            // holding both kinds was not written by this node.
+            if !db.iter().all(|r| retired.contains(&r.ark_id))
+                || self.store.has_space_keys().await?
+            {
+                return Err(AtRestError::Inconsistent(
+                    "a retired at-rest root key is stored next to live key material",
+                ));
+            }
+            tracing::warn!("dropping key and escrow rows of a retired at-rest root key");
+            self.store.drop_retired_keys(&retired).await?;
+            db = self.store.keys().await?;
+        }
+        if !retired.is_empty() {
+            self.sweep_retired(&retired).await?;
+        }
         check_contiguous(&db)?;
-        let mirrored = mirrored_rows(&*self.mirror, !db.is_empty()).await?;
+        let mut mirrored = mirrored_rows(&*self.mirror, !db.is_empty()).await?;
+        mirrored.retain(|r| !retired.contains(&r.ark_id));
         if db.is_empty() && mirrored.is_empty() {
+            let live_mirror_objects = self
+                .mirror
+                .list(MIRROR_PREFIX)
+                .await
+                .map_err(mirror_err)?
+                .into_iter()
+                .filter(|name| {
+                    !name.starts_with(RETIRED_MIRROR_PREFIX)
+                        && !retired.iter().any(|id| name.contains(&hex::encode(id)))
+                })
+                .count();
             if self.store.has_space_keys().await?
                 || self.store.has_escrow_rows().await?
-                || !self
-                    .mirror
-                    .list(MIRROR_PREFIX)
-                    .await
-                    .map_err(mirror_err)?
-                    .is_empty()
+                || live_mirror_objects > 0
             {
                 // Another process may have provisioned since we read: its
                 // ARK row is written before anything else.
@@ -833,8 +864,11 @@ impl AtRestKeyring {
             }
             tracing::warn!(
                 generation = g,
-                "re-splitting an unverified escrow for corrected holders (allow_resplit_before_verify); the ceremony starts over"
+                "replacing an unverified root key for corrected holders (allow_resplit_before_verify): the old shares are worthless and the ceremony starts over"
             );
+            self.retire_and_replace().await?;
+            // The fresh key has no escrow yet: this makes its bundle.
+            return Box::pin(self.establish_escrow()).await;
         }
         let wanted = |b: &EscrowBundle| {
             b.holders() == self.config.holders && b.ark_id == gen.ark_id && b.generation == g
@@ -898,13 +932,140 @@ impl AtRestKeyring {
     }
 
     /// A holder change may re-split only when explicitly allowed, nothing is
-    /// pinned, the active escrow was never verified, and no data key has
-    /// ever been made.
+    /// pinned, no ceremony record exists, and no data key was ever made.
+    /// The database and the mirror are both checked (a database restored to
+    /// an earlier point may have lost a data key or record the mirror still
+    /// has). Any record or data-key object in the mirror counts, readable
+    /// or not: it refuses only this pre-ceremony shortcut.
     async fn may_resplit(&self, active: &EscrowBundle) -> Result<bool, AtRestError> {
-        Ok(self.config.allow_resplit_before_verify
-            && self.config.pinned_efp.is_none()
-            && self.verified_record(active).await?.is_none()
-            && !self.store.has_space_keys().await?)
+        if !self.config.allow_resplit_before_verify || self.config.pinned_efp.is_some() {
+            return Ok(false);
+        }
+        if self.verified_record(active).await?.is_some()
+            || self.store.has_space_keys().await?
+            || self.store.has_escrow_record().await?
+        {
+            return Ok(false);
+        }
+        for prefix in ["record-", "dek-"] {
+            let names = self
+                .mirror
+                .list(&format!("{MIRROR_PREFIX}{prefix}"))
+                .await
+                .map_err(mirror_err)?;
+            if !names.is_empty() {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Replace every ARK generation with a fresh ARK (generation 1) for a
+    /// pre-ceremony re-split, so a removed holder's old share, with any
+    /// other old share, rebuilds only a key that never protected anything
+    /// and is never loaded again.
+    ///
+    /// 1. A W-authenticated tombstone per old ARK goes to the mirror first:
+    ///    from then on [`Self::load`] drops that ARK's rows (even from a
+    ///    database restored to an earlier point) and ignores its objects.
+    /// 2. The database swaps to the fresh ARK in one transaction, dropping
+    ///    every escrow row.
+    /// 3. Reloading deletes the old ARK, escrow and record objects from
+    ///    the mirror and mirrors the fresh ARK.
+    ///
+    /// A crash between 1 and 2 leaves only retired rows, which the next
+    /// boot drops before provisioning a fresh ARK.
+    async fn retire_and_replace(&self) -> Result<(), AtRestError> {
+        for row in self.store.keys().await? {
+            let id = hex::encode(&row.ark_id);
+            let tag = self.w.retire_tag(&row.ark_id);
+            let body =
+                serde_json::to_vec(&MirroredRetired::new(id.clone(), &tag)).expect("serializable");
+            self.mirror
+                .put(&retired_mirror_name(&id), body)
+                .await
+                .map_err(mirror_err)?;
+        }
+        let ark = Ark::generate();
+        let ark_id = ArkId::generate();
+        self.store
+            .replace_all_keys(at_rest_key::Model {
+                generation: 1,
+                ark_id: ark_id.0.to_vec(),
+                w_label: W_LABEL.into(),
+                sealed: seal_ark(&self.w, &ark, &ark_id, 1),
+                chain: None,
+                created_at: now_rfc3339(),
+            })
+            .await?;
+        tracing::warn!(generation = 1, %ark_id, "at-rest root key replaced; the old one is retired");
+        self.load().await
+    }
+
+    /// ARK ids with a tombstone that authenticates under this node's W.
+    /// Junk or forged tombstones are skipped; a read error fails the call
+    /// (skipping could bring a retired ARK back).
+    async fn retired_ark_ids(&self) -> Result<Vec<Vec<u8>>, AtRestError> {
+        let mut ids = Vec::new();
+        let names = self
+            .mirror
+            .list(RETIRED_MIRROR_PREFIX)
+            .await
+            .map_err(mirror_err)?;
+        for name in names {
+            let Some(bytes) = get_capped(&*self.mirror, &name).await.map_err(mirror_err)? else {
+                continue;
+            };
+            let parts = serde_json::from_slice::<MirroredRetired>(&bytes)
+                .ok()
+                .and_then(|m| m.parts());
+            match parts {
+                Some((id, tag)) if self.w.verify_retire_tag(&id, &tag) => ids.push(id),
+                _ => {
+                    tracing::warn!(object = ?name, "ignoring an at-rest retirement marker that doesn't authenticate")
+                }
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Delete the mirror objects of retired ARKs: their ARK copies, escrow
+    /// bundles and ceremony records. Idempotent; a failed delete leaves an
+    /// object [`Self::load`] already ignores.
+    async fn sweep_retired(&self, retired: &[Vec<u8>]) -> Result<(), AtRestError> {
+        let hexes: Vec<String> = retired.iter().map(hex::encode).collect();
+        let mut doomed = Vec::new();
+        for name in self
+            .mirror
+            .list(ARK_MIRROR_PREFIX)
+            .await
+            .map_err(mirror_err)?
+        {
+            if hexes.iter().any(|h| name.ends_with(&format!("-{h}.json"))) {
+                doomed.push(name);
+            }
+        }
+        for name in self
+            .mirror
+            .list(&format!("{MIRROR_PREFIX}escrow-"))
+            .await
+            .map_err(mirror_err)?
+        {
+            let Ok(Some(bytes)) = get_capped(&*self.mirror, &name).await else {
+                continue;
+            };
+            let Ok(bundle) = EscrowBundle::from_json(&bytes) else {
+                continue;
+            };
+            if retired.iter().any(|id| id.as_slice() == bundle.ark_id.0) {
+                doomed.push(record_mirror_name(&bundle.fingerprint().to_string()));
+                doomed.push(name);
+            }
+        }
+        for name in doomed {
+            self.mirror_soft(self.mirror.delete(&name).await.map_err(mirror_err))?;
+        }
+        Ok(())
     }
 
     /// A ceremony record for `bundle` from the mirror, stored only if its
@@ -1403,6 +1564,9 @@ impl AtRestKeyring {
         space: &str,
         dek_id: u32,
     ) -> Result<Option<space_data_key::Model>, DataKeyError> {
+        if in_write_lock() {
+            return Err(DataKeyError::NotPrepared);
+        }
         let name = dek_mirror_name(&keys.dek_tag.tag(space), dek_id);
         let Some(bytes) = self.dek_object(&name).await? else {
             return Ok(None);
@@ -1444,6 +1608,9 @@ impl AtRestKeyring {
         keys: &Keys,
         row: &space_data_key::Model,
     ) -> Result<(), DataKeyError> {
+        if in_write_lock() {
+            return Err(DataKeyError::NotPrepared);
+        }
         let dek_id = row.dek_id as u32;
         let name = dek_mirror_name(&keys.dek_tag.tag(&row.space), dek_id);
         if let Some(bytes) = self.dek_object(&name).await? {
@@ -1470,6 +1637,9 @@ impl AtRestKeyring {
         keys: &Keys,
         space: &str,
     ) -> Result<space_data_key::Model, DataKeyError> {
+        if in_write_lock() {
+            return Err(DataKeyError::NotPrepared);
+        }
         let (g, gen) = keys.newest();
         let (wrapped, _) = new_dek(&gen.kek, space, DekId::new(1), g, &gen.ark_id);
         self.store
@@ -1569,6 +1739,39 @@ impl DataKeyProvider for AtRestKeyring {
             Some(row) => self.load_dek(&keys, &row).await,
             None => Err(DataKeyError::UnknownKey { dek_id }),
         }
+    }
+
+    async fn prepare_read(&self, space: &str) -> Result<(), DataKeyError> {
+        let keys = match self.keys() {
+            Ok(keys) => keys,
+            // Locked: sealed reads answer 503 themselves; legacy reads go on.
+            Err(AtRestError::Locked | AtRestError::NotProvisioned) => return Ok(()),
+            Err(e) => return Err(backend(e)),
+        };
+        if self.current.lock().get(space).is_some()
+            || self
+                .store
+                .newest_dek(space)
+                .await
+                .map_err(backend)?
+                .is_some()
+        {
+            return Ok(());
+        }
+        let _create = self.dek_create.lock().await;
+        if self
+            .store
+            .newest_dek(space)
+            .await
+            .map_err(backend)?
+            .is_none()
+        {
+            // A database restored to before the space's first DEK: objects
+            // may be sealed under the mirrored one. Spaces have exactly DEK 1
+            // (see `create_dek`).
+            self.restore_dek(&keys, space, 1).await?;
+        }
+        Ok(())
     }
 
     fn object_name_key(&self) -> Result<ObjectNameKey, DataKeyError> {

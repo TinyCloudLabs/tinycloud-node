@@ -39,10 +39,47 @@ pub trait KeyMirror: Send + Sync {
     async fn get(&self, name: &str) -> Result<Option<Vec<u8>>, MirrorError>;
     /// Names under `prefix`, in any order.
     async fn list(&self, prefix: &str) -> Result<Vec<String>, MirrorError>;
+    /// Remove an object; absent is fine. Only used to retire key material
+    /// that never protected anything.
+    async fn delete(&self, name: &str) -> Result<(), MirrorError>;
 }
 
 pub const MIRROR_PREFIX: &str = "_tc/at-rest/";
 pub(crate) const ARK_MIRROR_PREFIX: &str = "_tc/at-rest/ark-";
+pub(crate) const RETIRED_MIRROR_PREFIX: &str = "_tc/at-rest/retired-";
+
+/// A W-authenticated marker that an ARK was retired (see
+/// `WrapKey::retire_tag`).
+pub(crate) fn retired_mirror_name(ark_id_hex: &str) -> String {
+    format!("{RETIRED_MIRROR_PREFIX}{ark_id_hex}.json")
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MirroredRetired {
+    pub version: u32,
+    pub ark_id: String,
+    pub tag: String,
+}
+
+impl MirroredRetired {
+    pub fn new(ark_id_hex: String, tag: &[u8]) -> Self {
+        Self {
+            version: MIRROR_VERSION,
+            ark_id: ark_id_hex,
+            tag: hex::encode(tag),
+        }
+    }
+
+    /// `(ark_id, tag)` bytes, if well formed and a version this node reads.
+    pub fn parts(&self) -> Option<(Vec<u8>, Vec<u8>)> {
+        check_version(self.version).ok()?;
+        Some((
+            hex::decode(&self.ark_id).ok()?,
+            hex::decode(&self.tag).ok()?,
+        ))
+    }
+}
 
 pub(crate) fn ark_mirror_name(generation: u32, ark_id_hex: &str) -> String {
     format!("{ARK_MIRROR_PREFIX}{generation:010}-{ark_id_hex}.json")
@@ -307,8 +344,51 @@ impl AtRestStore {
         Ok(at_rest_escrow::Entity::find().count(&self.db).await? > 0)
     }
 
+    /// Drop every key and escrow row and store `row` as generation 1, in
+    /// one transaction. Only for replacing an ARK that never protected
+    /// anything (no data key, never verified).
+    pub async fn replace_all_keys(&self, row: at_rest_key::Model) -> Result<(), DbErr> {
+        let _w = self.writer().await;
+        let tx = self.db.begin().await?;
+        at_rest_escrow::Entity::delete_many().exec(&tx).await?;
+        at_rest_key::Entity::delete_many().exec(&tx).await?;
+        at_rest_key::Entity::insert(at_rest_key::ActiveModel {
+            generation: Set(row.generation),
+            ark_id: Set(row.ark_id),
+            w_label: Set(row.w_label),
+            sealed: Set(row.sealed),
+            chain: Set(row.chain),
+            created_at: Set(row.created_at),
+        })
+        .exec(&tx)
+        .await?;
+        tx.commit().await
+    }
+
+    /// Remove key rows of retired ARKs and every escrow row, in one
+    /// transaction (escrow rows of a retired ARK must never load either).
+    pub async fn drop_retired_keys(&self, ark_ids: &[Vec<u8>]) -> Result<(), DbErr> {
+        let _w = self.writer().await;
+        let tx = self.db.begin().await?;
+        at_rest_escrow::Entity::delete_many().exec(&tx).await?;
+        at_rest_key::Entity::delete_many()
+            .filter(at_rest_key::Column::ArkId.is_in(ark_ids.iter().cloned()))
+            .exec(&tx)
+            .await?;
+        tx.commit().await
+    }
+
     pub async fn has_space_keys(&self) -> Result<bool, DbErr> {
         Ok(space_data_key::Entity::find().count(&self.db).await? > 0)
+    }
+
+    /// Any escrow row holding a ceremony record, verifiable or not.
+    pub async fn has_escrow_record(&self) -> Result<bool, DbErr> {
+        Ok(at_rest_escrow::Entity::find()
+            .filter(at_rest_escrow::Column::Record.is_not_null())
+            .count(&self.db)
+            .await?
+            > 0)
     }
 
     /// The generation's active bundle. The partial unique index and
@@ -522,5 +602,14 @@ impl KeyMirror for MemoryMirror {
             .filter(|k| k.starts_with(prefix))
             .cloned()
             .collect())
+    }
+
+    async fn delete(&self, name: &str) -> Result<(), MirrorError> {
+        self.check()?;
+        if self.read_only.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("mirror is read-only".into());
+        }
+        self.objects.lock().remove(name);
+        Ok(())
     }
 }

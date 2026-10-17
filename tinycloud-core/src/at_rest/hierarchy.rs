@@ -37,6 +37,7 @@ const CHAIN_INFO: &[u8] = b"tinycloud/at-rest/ark-chain/v1";
 const SEAL_DOMAIN: &[u8] = b"tinycloud/at-rest/ark-seal/v1";
 const CHAIN_DOMAIN: &[u8] = b"tinycloud/at-rest/ark-chain-aad/v1";
 const DEK_DOMAIN: &[u8] = b"tinycloud/at-rest/dek/v1";
+const RETIRED_INFO: &[u8] = b"tinycloud/at-rest/retired/v1";
 const NONCE_LEN: usize = 12;
 
 /// An AEAD open failed: wrong key, wrong binding, or tampered bytes.
@@ -100,6 +101,28 @@ pub struct WrapKey(Zeroizing<[u8; 32]>);
 impl WrapKey {
     pub fn derive(root: &[u8]) -> Self {
         Self(hkdf32(root, W_LABEL.as_bytes()))
+    }
+
+    fn retire_mac(&self, ark_id: &[u8]) -> hmac::Hmac<Sha256> {
+        use hmac::Mac as _;
+        let key = hkdf32(self.0.as_ref(), RETIRED_INFO);
+        let mut mac = <hmac::Hmac<Sha256> as hmac::Mac>::new_from_slice(key.as_ref())
+            .expect("HMAC takes any key length");
+        mac.update(ark_id);
+        mac
+    }
+
+    /// A tag only this root can make: "this ARK was retired". A retired
+    /// ARK is never loaded again, even from a database restored to before
+    /// its retirement.
+    pub fn retire_tag(&self, ark_id: &[u8]) -> Vec<u8> {
+        use hmac::Mac as _;
+        self.retire_mac(ark_id).finalize().into_bytes().to_vec()
+    }
+
+    pub fn verify_retire_tag(&self, ark_id: &[u8], tag: &[u8]) -> bool {
+        use hmac::Mac as _;
+        self.retire_mac(ark_id).verify_slice(tag).is_ok()
     }
 }
 

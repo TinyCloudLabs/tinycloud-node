@@ -20,7 +20,7 @@ pub use envelope::{
 };
 pub use key::{DataKey, DekId, ObjectNameKey};
 pub use names::{sealed_object_name, space_tag, PayloadEncoding, SEALED_NAME_PREFIX};
-pub use provider::{DataKeyError, DataKeyProvider};
+pub use provider::{in_write_lock, write_locked, DataKeyError, DataKeyProvider};
 pub use stream::{DecryptReader, EncryptReader, SegmentRange};
 #[cfg(any(test, feature = "test-util"))]
 pub use testing::FixedKeyProvider;
