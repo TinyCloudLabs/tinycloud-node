@@ -4,8 +4,8 @@ use std::{borrow::Cow, error::Error as StdError};
 
 use sea_orm::{
     sea_query::{Expr, LockBehavior, LockType, OnConflict},
-    ColumnTrait, ConnectionTrait, DatabaseTransaction, DbBackend, DbErr, EntityTrait, QueryFilter,
-    QueryOrder, QuerySelect, Statement, TransactionTrait,
+    ColumnTrait, ConnectionTrait, DatabaseTransaction, DbBackend, DbErr, EntityTrait,
+    FromQueryResult, QueryFilter, QueryOrder, QuerySelect, Statement, TransactionTrait,
 };
 use time::{Duration, OffsetDateTime};
 use tinycloud_auth::resource::SpaceId;
@@ -19,7 +19,17 @@ use crate::storage::{ImmutableDeleteStore, ImmutableReadStore};
 use crate::types::SpaceIdWrap;
 
 const MAX_BATCH_SIZE: u64 = 256;
-/// Expired registrations are collected only after the upload deadline.
+/// A failed upload's claim becomes eligible after five minutes of DB time.
+/// Ordinary uploads have a 240-second deadline; the server then runs GC every
+/// 60 seconds. A genuinely live same-space, same-hash attempt protects an
+/// older crash stage and its physical-byte charge until it commits or aborts.
+/// The older claim becomes due when the last attempt ends, for the next
+/// scheduled pass (within 60 seconds); each upload has at most 240 seconds.
+/// A backlog beyond the collector's bounded pages may take further passes.
+/// Repeated overlapping attempts can extend this conservative overcharge.
+/// A referenced final blob is never deleted or refunded. A single blob key
+/// costs at most its physical size; filesystem crash stages are separate
+/// physical files whose charges are settled independently.
 pub const ORPHAN_GRACE: Duration = Duration::minutes(5);
 
 const UNAVAILABLE_DELETING: &str = "KV blob is being deleted; retry registration";
@@ -877,25 +887,84 @@ where
         // Query the two retry states separately so each bounded page can use
         // its age or retry index. Re-reading an oldest failing page every
         // minute must not hide an unrelated, never-retried orphan.
-        let mut never_retried = attempt::Entity::find()
-            .filter(attempt::Column::CreatedAt.lte(cutoff))
-            .filter(attempt::Column::RetryAfter.is_null())
-            .order_by_asc(attempt::Column::CreatedAt)
-            .order_by_asc(attempt::Column::Space)
-            .order_by_asc(attempt::Column::Value)
-            .limit(available)
-            .all(conn)
-            .await?;
-        let due_retries = attempt::Entity::find()
-            .filter(attempt::Column::CreatedAt.lte(cutoff))
-            .filter(attempt::Column::RetryAfter.lte(now))
-            .order_by_asc(attempt::Column::RetryAfter)
-            .order_by_asc(attempt::Column::CreatedAt)
-            .order_by_asc(attempt::Column::Space)
-            .order_by_asc(attempt::Column::Value)
-            .limit(available)
-            .all(conn)
-            .await?;
+        // PostgreSQL must exclude held hash fences *before* LIMIT. An ordered
+        // attempt index scan with a per-row LATERAL fence lock does that while
+        // keeping the planner off a full hash join/sort of every candidate.
+        // The retry index also serves NULL retry_after: its leading key is
+        // constant in that queue. Commit selection before any storage I/O;
+        // one held hash cannot occupy a page or block an unrelated orphan.
+        let (mut never_retried, due_retries) = if conn.get_database_backend() == DbBackend::Postgres
+        {
+            let tx = conn.begin().await?;
+            let first = tx
+                .query_all(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "SELECT a.* FROM (
+                        SELECT * FROM kv_orphan_attempt
+                        WHERE created_at <= $1 AND retry_after IS NULL
+                        ORDER BY retry_after, created_at, space, value
+                     ) AS a
+                     CROSS JOIN LATERAL (
+                        SELECT 1 FROM kv_orphan_candidate AS fence
+                        WHERE fence.space = a.space AND fence.value = a.value
+                          AND fence.generation = a.generation
+                        FOR UPDATE SKIP LOCKED
+                     ) AS available
+                     LIMIT $2",
+                    [cutoff.into(), (available as i64).into()],
+                ))
+                .await?;
+            let second = tx
+                .query_all(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "SELECT a.* FROM (
+                        SELECT * FROM kv_orphan_attempt
+                        WHERE created_at <= $1 AND retry_after <= $2
+                        ORDER BY retry_after, created_at, space, value
+                     ) AS a
+                     CROSS JOIN LATERAL (
+                        SELECT 1 FROM kv_orphan_candidate AS fence
+                        WHERE fence.space = a.space AND fence.value = a.value
+                          AND fence.generation = a.generation
+                        FOR UPDATE SKIP LOCKED
+                     ) AS available
+                     LIMIT $3",
+                    [cutoff.into(), now.into(), (available as i64).into()],
+                ))
+                .await?;
+            tx.commit().await?;
+            (
+                first
+                    .iter()
+                    .map(|row| attempt::Model::from_query_result(row, ""))
+                    .collect::<Result<Vec<_>, _>>()?,
+                second
+                    .iter()
+                    .map(|row| attempt::Model::from_query_result(row, ""))
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+        } else {
+            let never_retried = attempt::Entity::find()
+                .filter(attempt::Column::CreatedAt.lte(cutoff))
+                .filter(attempt::Column::RetryAfter.is_null())
+                .order_by_asc(attempt::Column::CreatedAt)
+                .order_by_asc(attempt::Column::Space)
+                .order_by_asc(attempt::Column::Value)
+                .limit(available)
+                .all(conn)
+                .await?;
+            let due_retries = attempt::Entity::find()
+                .filter(attempt::Column::CreatedAt.lte(cutoff))
+                .filter(attempt::Column::RetryAfter.lte(now))
+                .order_by_asc(attempt::Column::RetryAfter)
+                .order_by_asc(attempt::Column::CreatedAt)
+                .order_by_asc(attempt::Column::Space)
+                .order_by_asc(attempt::Column::Value)
+                .limit(available)
+                .all(conn)
+                .await?;
+            (never_retried, due_retries)
+        };
         never_retried.extend(due_retries);
         never_retried.sort_unstable_by(|left, right| {
             left.retry_after
@@ -2186,6 +2255,99 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn postgres_held_old_fence_does_not_starve_an_independent_orphan_across_ticks() {
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_held_old_fence_does_not_starve_an_independent_orphan_across_ticks",
+        )
+        .await
+        else {
+            return;
+        };
+        let store = MemoryStore::default();
+        let space = space();
+        let blocked = upload(&store, &space, b"held oldest fence").await;
+        seed_crashed_attempts(&fixture.conn, &space, blocked, 256).await;
+        let healthy = upload(&store, &space, b"independent expired blob").await;
+        register(&fixture.conn, &[(space.clone(), healthy)], "healthy").await;
+        kv_orphan_attempt::Entity::update_many()
+            .col_expr(
+                kv_orphan_attempt::Column::CreatedAt,
+                Expr::value(time::OffsetDateTime::now_utc() - Duration::hours(1)),
+            )
+            .filter(kv_orphan_attempt::Column::Value.eq(healthy))
+            .exec(&fixture.conn)
+            .await
+            .unwrap();
+
+        let schema: String = fixture
+            .conn
+            .query_one(Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT current_schema() AS schema_name",
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "schema_name")
+            .unwrap();
+        let mut options = ConnectOptions::new(
+            crate::test_support::postgres_test_url(
+                "postgres_held_old_fence_does_not_starve_an_independent_orphan_across_ticks",
+            )
+            .unwrap(),
+        );
+        options.set_schema_search_path(schema);
+        let collector = Database::connect(options).await.unwrap();
+        let held = fixture.conn.begin().await.unwrap();
+        lock_candidates(&held, &[(space.clone(), blocked, 0)], "crashed-0")
+            .await
+            .unwrap();
+
+        // Logical ticks 0/60/120 advance the age cutoff without wall-clock
+        // sleeps. The other pool holds X throughout; H must make progress.
+        let mut ticks = Vec::with_capacity(3);
+        for tick in 0..3 {
+            let min_age = ORPHAN_GRACE - Duration::seconds(tick * 60);
+            let snapshot = match tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                drain_candidates_for_interval(&collector, &store, min_age),
+            )
+            .await
+            {
+                Ok(Ok(removed)) => (
+                    removed,
+                    store.contains(&space, &healthy, 0).await.unwrap(),
+                    store.contains(&space, &blocked, 0).await.unwrap(),
+                ),
+                _ => (usize::MAX, true, true),
+            };
+            ticks.push(snapshot);
+            if snapshot.0 == usize::MAX {
+                break;
+            }
+        }
+        // Always release the independent transaction and pool before checking
+        // the assertions; otherwise a RED test can deadlock schema teardown.
+        held.rollback().await.unwrap();
+        let after_release = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            drain_candidates_for_interval(&collector, &store, ORPHAN_GRACE),
+        )
+        .await;
+        let blocked_after_release = store.contains(&space, &blocked, 0).await.unwrap();
+        let final_size = store.total_size(&space).await.unwrap();
+        collector.close().await.unwrap();
+        assert_eq!(
+            ticks,
+            vec![(1, false, true), (0, false, true), (0, false, true)],
+            "the unrelated H must retire while X's fence is still held"
+        );
+        assert_eq!(after_release.unwrap().unwrap(), 1);
+        assert!(!blocked_after_release);
+        assert_eq!(final_size, Some(0));
     }
 
     #[tokio::test]

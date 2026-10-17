@@ -54,7 +54,9 @@ use tinycloud_auth::{
 /// cap still does; the cap is what bounds HTTP/2 over TLS, whose header list
 /// may reach 16 MiB.
 pub const KV_MAX_MUTATIONS_PER_INVOCATION: usize = 4096;
-/// All persist calls in one invocation finish before the five-minute orphan GC grace.
+/// One invocation's uploads finish within 240 seconds of preflight, before
+/// the five-minute orphan age. A live same-hash retry defers an older crash
+/// stage until that retry finishes; repeated overlaps can extend its charge.
 const KV_UPLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(240);
 const _: () =
     assert!(KV_UPLOAD_TIMEOUT.as_secs() < crate::kv_orphans::ORPHAN_GRACE.whole_seconds() as u64);

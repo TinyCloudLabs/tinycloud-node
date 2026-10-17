@@ -1290,6 +1290,160 @@ mod test {
     }
 
     #[tokio::test]
+    async fn expired_crash_stage_is_refunded_after_overlapping_retry_commits_or_aborts() {
+        use tinycloud_core::sea_orm::{
+            ConnectionTrait, Database, DbBackend, EntityTrait, PaginatorTrait, Statement,
+            TransactionTrait,
+        };
+        use tinycloud_core::sea_orm_migration::MigratorTrait;
+        use tinycloud_core::{
+            hash::hash,
+            kv_orphans,
+            migrations::Migrator,
+            models::{kv_orphan_attempt, kv_orphan_candidate, kv_write},
+        };
+
+        for commits in [true, false] {
+            let db = Database::connect("sqlite::memory:").await.unwrap();
+            Migrator::up(&db, None).await.unwrap();
+            db.execute_unprepared("PRAGMA foreign_keys = OFF")
+                .await
+                .unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = FileSystemConfig::new(dir.path());
+            let store = cfg.open().await.unwrap();
+            let space: SpaceId = "tinycloud:key:test:overlap-bound".parse().unwrap();
+            store.create(&space).await.unwrap();
+            let data = b"complete retry after crashed stage";
+            let value = hash(data);
+            let blobs = [(space.clone(), value)];
+            let tx = db.begin().await.unwrap();
+            kv_orphans::register_candidates(&tx, &blobs, "crashed-A")
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+            let target = store.get_path(&space, &value, 0);
+            let mut stage = tempfile::Builder::new()
+                .prefix(&FileSystemStore::stage_prefix(&target))
+                .tempfile_in(target.parent().unwrap())
+                .unwrap();
+            std::io::Write::write_all(&mut stage, b"partial").unwrap();
+            let stage_path = stage.path().to_path_buf();
+            stage.into_temp_path().keep().unwrap();
+            drop(store);
+            let store = cfg.open().await.unwrap();
+            assert_eq!(store.total_size(&space).await.unwrap(), Some(7));
+            db.execute(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "UPDATE kv_orphan_attempt SET created_at = ? WHERE attempt_id = ?",
+                [
+                    (time::OffsetDateTime::now_utc() - time::Duration::minutes(6)).into(),
+                    "crashed-A".into(),
+                ],
+            ))
+            .await
+            .unwrap();
+
+            let tx = db.begin().await.unwrap();
+            let retry = kv_orphans::register_candidates(&tx, &blobs, "live-B")
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+            let mut upload = HashBuffer::new(Vec::new());
+            upload.write_all(data).await.unwrap();
+            assert_eq!(
+                ImmutableWriteStore::<memory::MemoryStaging>::persist(
+                    &store, &space, upload, retry[0].2
+                )
+                .await
+                .unwrap(),
+                value
+            );
+            assert_eq!(
+                store.total_size(&space).await.unwrap(),
+                Some(7 + data.len() as u64)
+            );
+            assert_eq!(
+                kv_orphans::collect_candidates(&db, &store, 256, kv_orphans::ORPHAN_GRACE)
+                    .await
+                    .unwrap(),
+                0,
+                "A's expired stage must remain charged while B is live"
+            );
+            assert!(stage_path.exists());
+
+            if commits {
+                let tx = db.begin().await.unwrap();
+                kv_orphans::lock_candidates(&tx, &retry, "live-B")
+                    .await
+                    .unwrap();
+                tx.execute(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "INSERT INTO kv_write (space,key,invocation,seq,epoch,epoch_seq,value,metadata,generation)
+                     VALUES (?,'retry',?,1,?,1,?,'{}',?)",
+                    [
+                        space.to_string().into(),
+                        Vec::<u8>::from(hash(b"invocation")).into(),
+                        Vec::<u8>::from(hash(b"epoch")).into(),
+                        Vec::<u8>::from(value).into(),
+                        retry[0].2.into(),
+                    ],
+                ))
+                .await
+                .unwrap();
+                kv_orphans::finish_candidates(&tx, &retry, "live-B")
+                    .await
+                    .unwrap();
+                tx.commit().await.unwrap();
+            } else {
+                kv_orphans::refund_failed(&db, &store, &retry, "live-B")
+                    .await
+                    .unwrap();
+            }
+
+            assert_eq!(
+                kv_orphans::collect_candidates(&db, &store, 256, kv_orphans::ORPHAN_GRACE)
+                    .await
+                    .unwrap(),
+                usize::from(!commits),
+                "A's crash charge must settle on the next pass after B leaves"
+            );
+            assert!(!stage_path.exists());
+            assert_eq!(
+                store.read_to_vec(&space, &value, 0).await.unwrap(),
+                commits.then(|| data.to_vec()),
+                "a committed retry must remain readable; an aborted one must be absent"
+            );
+            assert_eq!(
+                kv_write::Entity::find().count(&db).await.unwrap(),
+                u64::from(commits)
+            );
+            assert_eq!(
+                store.total_size(&space).await.unwrap(),
+                Some(if commits { data.len() as u64 } else { 0 })
+            );
+            assert_eq!(
+                kv_orphans::collect_candidates(&db, &store, 256, kv_orphans::ORPHAN_GRACE)
+                    .await
+                    .unwrap(),
+                0,
+                "settled crash attempts cannot refund twice"
+            );
+            assert_eq!(
+                kv_orphan_candidate::Entity::find()
+                    .count(&db)
+                    .await
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                kv_orphan_attempt::Entity::find().count(&db).await.unwrap(),
+                0
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn failed_file_creation_refunds_reserved_quota() {
         let dir = tempfile::tempdir().unwrap();
         let store = FileSystemConfig::new(dir.path()).open().await.unwrap();
