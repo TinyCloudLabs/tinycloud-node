@@ -434,21 +434,136 @@ async fn gate_requires_pinned_verified_escrow_for_the_configured_recipients() {
     assert_eq!(k.gate(false).await, Ok(GatePass::Verified { efp }));
     drop(k);
 
-    // New recipients in config with the old pin removed re-split the same
-    // ARK: a new bundle that the old pin doesn't match.
+    // New recipients in config: the node never re-splits on its own, with
+    // or without the pin. Nothing is written.
     let changed = holders();
-    let k = open(&db, &mirror, &ROOT, config(&changed, None))
+    for pin in [None, Some(efp)] {
+        assert!(matches!(
+            open(&db, &mirror, &ROOT, config(&changed, pin)).await,
+            Err(AtRestError::EscrowHoldersChanged)
+        ));
+    }
+    let bundles = at_rest_escrow::Entity::find().all(&db).await.unwrap();
+    assert_eq!(bundles.len(), 1);
+}
+
+#[tokio::test]
+async fn two_nodes_with_different_holders_never_flip_the_escrow() {
+    let (db, mirror) = (db().await, Arc::new(MemoryMirror::default()));
+    let (ha, hb) = (holders(), holders());
+    let a = open(&db, &mirror, &ROOT, config(&ha, None)).await.unwrap();
+    let efp = a.escrow_view().await.unwrap().unwrap().efp;
+    // A second node configured with other holders refuses to boot.
+    assert!(matches!(
+        open(&db, &mirror, &ROOT, config(&hb, None)).await,
+        Err(AtRestError::EscrowHoldersChanged)
+    ));
+    // Read paths are read-only: any number of them change nothing.
+    let escrow_objects = || {
+        mirror
+            .names()
+            .iter()
+            .filter(|n| n.contains("/escrow-"))
+            .count()
+    };
+    let before = escrow_objects();
+    for _ in 0..10 {
+        assert_eq!(a.escrow_view().await.unwrap().unwrap().efp, efp);
+        assert!(a.verification_record().await.unwrap().is_none());
+        let _ = a.gate(false).await;
+    }
+    assert_eq!(
+        at_rest_escrow::Entity::find().all(&db).await.unwrap().len(),
+        1
+    );
+    assert_eq!(escrow_objects(), before);
+}
+
+/// Run the ceremony test-unlock on an unlocked keyring.
+async fn verify_escrow(k: &AtRestKeyring, h: &Holders) -> Efp {
+    for i in 0..3 {
+        submit(k, h, i).await.unwrap();
+    }
+    let view = k.escrow_view().await.unwrap().unwrap();
+    assert!(view.verified);
+    view.efp
+}
+
+#[tokio::test]
+async fn a_restore_before_the_escrow_or_record_needs_no_new_ceremony() {
+    let (db, mirror, h) = (db().await, Arc::new(MemoryMirror::default()), holders());
+    let k = open(&db, &mirror, &ROOT, config(&h, None)).await.unwrap();
+    let efp = verify_escrow(&k, &h).await;
+    drop(k);
+
+    // Before the record: it comes back from the mirror (its MAC verifies).
+    at_rest_escrow::Entity::update_many()
+        .col_expr(
+            at_rest_escrow::Column::Record,
+            sea_orm::sea_query::Expr::value(Option::<String>::None),
+        )
+        .exec(&db)
         .await
         .unwrap();
-    let new_efp = k.escrow_view().await.unwrap().unwrap().efp;
-    assert_ne!(new_efp, efp);
+    let k = open(&db, &mirror, &ROOT, config(&h, Some(efp)))
+        .await
+        .unwrap();
+    assert_eq!(k.gate(false).await, Ok(GatePass::Verified { efp }));
+    drop(k);
+
+    // Before the escrow row, pinned and unpinned: the same bundle and its
+    // record come back; no new split.
+    for pin in [Some(efp), None] {
+        at_rest_escrow::Entity::delete_many()
+            .exec(&db)
+            .await
+            .unwrap();
+        let k = open(&db, &mirror, &ROOT, config(&h, pin)).await.unwrap();
+        let view = k.escrow_view().await.unwrap().unwrap();
+        assert_eq!((view.efp, view.verified), (efp, true), "pin {pin:?}");
+        assert_eq!(
+            at_rest_escrow::Entity::find().all(&db).await.unwrap().len(),
+            1
+        );
+    }
+
+    // A forged record in the mirror proves nothing: unpinned, a new bundle.
+    at_rest_escrow::Entity::delete_many()
+        .exec(&db)
+        .await
+        .unwrap();
+    let name = format!("{MIRROR_PREFIX}record-{efp}.json");
+    let mut forged: serde_json::Value =
+        serde_json::from_slice(&mirror.get(&name).await.unwrap().unwrap()).unwrap();
+    forged["verified_at"] = serde_json::json!("2030-01-01T00:00:00Z");
+    mirror
+        .put(&name, serde_json::to_vec(&forged).unwrap())
+        .await
+        .unwrap();
+    let k = open(&db, &mirror, &ROOT, config(&h, None)).await.unwrap();
+    let view = k.escrow_view().await.unwrap().unwrap();
+    assert_ne!(view.efp, efp);
+    assert!(!view.verified);
+}
+
+#[tokio::test]
+async fn a_stale_chain_on_the_newest_generation_is_cleared_not_a_permanent_conflict() {
+    let (db, mirror, h) = (db().await, Arc::new(MemoryMirror::default()), holders());
+    let k = open(&db, &mirror, &ROOT, config(&h, None)).await.unwrap();
+    drop(k);
+    set_chain(&db, 1, Some(vec![0x33; 60])).await;
+    let k = open(&db, &mirror, &ROOT, config(&h, None)).await.unwrap();
+    let rows = AtRestStore::new(db.clone()).keys().await.unwrap();
+    assert_eq!(chain_of(&rows, 1), None);
+    assert_eq!(k.rotate_ark().await.unwrap(), 2);
+
+    // Garbage chained after boot: an explicit, retryable error, then success.
+    set_chain(&db, 2, Some(vec![0x33; 60])).await;
     assert!(matches!(
-        k.gate(false).await,
-        Err(GateRefusal::NotPinned { .. })
+        k.rotate_ark().await,
+        Err(AtRestError::Inconsistent(why)) if why.contains("retry")
     ));
-    let bundles = at_rest_escrow::Entity::find().all(&db).await.unwrap();
-    assert_eq!(bundles.len(), 2);
-    assert_eq!(bundles.iter().filter(|b| b.active).count(), 1);
+    assert_eq!(k.rotate_ark().await.unwrap(), 3);
 }
 
 #[tokio::test]
@@ -1102,12 +1217,27 @@ async fn a_pinned_escrow_is_never_re_split() {
     let changed = holders();
     assert!(matches!(
         open(&db, &mirror, &ROOT, config(&changed, Some(efp))).await,
-        Err(AtRestError::EscrowPinned)
+        Err(AtRestError::EscrowHoldersChanged)
     ));
     assert_eq!(
         at_rest_escrow::Entity::find().all(&db).await.unwrap().len(),
         1
     );
+    // Pinned to a bundle for other holders, with the database's row gone:
+    // still no split.
+    at_rest_escrow::Entity::delete_many()
+        .exec(&db)
+        .await
+        .unwrap();
+    assert!(matches!(
+        open(&db, &mirror, &ROOT, config(&changed, Some(efp))).await,
+        Err(AtRestError::EscrowPinned)
+    ));
+    assert!(at_rest_escrow::Entity::find()
+        .all(&db)
+        .await
+        .unwrap()
+        .is_empty());
     // Pinned and the database lost the bundle: the pinned one comes back
     // from the mirror, no new split.
     at_rest_escrow::Entity::delete_many()

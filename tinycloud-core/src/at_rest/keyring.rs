@@ -22,8 +22,8 @@ use super::hierarchy::{
     Kek, WrapKey, W_LABEL,
 };
 use super::store::{
-    ark_mirror_name, dek_mirror_name, escrow_mirror_name, AtRestStore, KeyMirror,
-    MirrorObjectTooLarge, MirroredArk, MirroredDek, ARK_MIRROR_PREFIX, MIRROR_PREFIX,
+    ark_mirror_name, dek_mirror_name, escrow_mirror_name, record_mirror_name, AtRestStore,
+    KeyMirror, MirrorObjectTooLarge, MirroredArk, MirroredDek, ARK_MIRROR_PREFIX, MIRROR_PREFIX,
 };
 use super::{DataKey, DataKeyError, DataKeyProvider, DekId, ObjectNameKey};
 use crate::models::{at_rest_escrow, at_rest_key, space_data_key};
@@ -60,14 +60,48 @@ pub enum AtRestError {
     Inconsistent(&'static str),
     #[error("at-rest key change lost a race: {0}")]
     Conflict(&'static str),
-    #[error("at_rest.escrow.verified_fp pins an escrow that is not for the configured recipients and the newest key; the node never re-splits while a fingerprint is pinned (remove the pin in the attested compose to change holders)")]
+    #[error("at_rest.escrow.verified_fp pins an escrow that is not for the configured recipients and the newest key; the node never re-splits while a fingerprint is pinned")]
     EscrowPinned,
+    #[error("the configured escrow recipients differ from the active escrow bundle's; the node never re-splits on its own (an explicit re-escrow is needed)")]
+    EscrowHoldersChanged,
     #[error("at-rest escrow: {0}")]
     Escrow(#[from] EscrowError),
     #[error("at-rest keys are locked")]
     Locked,
     #[error("at-rest keys are not provisioned")]
     NotProvisioned,
+}
+
+impl AtRestError {
+    /// Whether retrying may help: the store or mirror was unreachable, the
+    /// keys are locked, or a concurrent change won. Everything else needs an
+    /// operator.
+    pub fn is_transient(&self) -> bool {
+        matches!(
+            self,
+            Self::Store(_)
+                | Self::Mirror(_)
+                | Self::Conflict(_)
+                | Self::Locked
+                | Self::NotProvisioned
+        )
+    }
+
+    /// A stable reason for API answers: a code plus, where it's static and
+    /// key-free, the explanation. Backend details (SQL, S3) stay in the log.
+    pub fn reason(&self) -> String {
+        match self {
+            Self::Store(_) => "store_unavailable".into(),
+            Self::Mirror(_) => "mirror_unavailable".into(),
+            Self::Inconsistent(why) => format!("inconsistent: {why}"),
+            Self::Conflict(why) => format!("conflict: {why}"),
+            Self::EscrowPinned => "escrow_pinned".into(),
+            Self::EscrowHoldersChanged => "escrow_holders_changed".into(),
+            Self::Escrow(e) => format!("escrow: {e}"),
+            Self::Locked => "locked".into(),
+            Self::NotProvisioned => "not_provisioned".into(),
+        }
+    }
 }
 
 /// Why `encrypt` may not be enabled. Every variant is an operator action.
@@ -318,7 +352,11 @@ fn resolve(
     let top_g = u32::try_from(top.generation)
         .map_err(|_| AtRestError::Inconsistent("ARK generation out of range"))?;
     let top_id = ark_id_of(top)?;
-    let mut chosen = vec![top.clone()];
+    // The newest generation has no successor, so it never carries a chain.
+    let mut chosen = vec![at_rest_key::Model {
+        chain: None,
+        ..top.clone()
+    }];
     let mut gens = BTreeMap::new();
     gens.insert(
         top_g,
@@ -445,8 +483,9 @@ async fn persist_chosen(
                         .await?;
                 }
                 if d.chain != row.chain {
-                    if let Some(chain) = &row.chain {
-                        store.set_chain(row.generation, chain.clone()).await?;
+                    match &row.chain {
+                        Some(chain) => store.set_chain(row.generation, chain.clone()).await?,
+                        None => store.clear_chain(row.generation).await?,
                     }
                 }
             }
@@ -574,7 +613,7 @@ impl AtRestKeyring {
         };
         keyring.load().await?;
         if keyring.state() == KeyringState::Unlocked {
-            keyring.ensure_escrow().await?;
+            keyring.establish_escrow().await?;
         }
         Ok(keyring)
     }
@@ -706,54 +745,71 @@ impl AtRestKeyring {
         Ok(bundle)
     }
 
-    /// Make sure the newest generation is escrowed to exactly the configured
-    /// holders.
+    /// At boot (and after a rotation or recovery): make sure the newest
+    /// generation has an active escrow bundle for exactly the configured
+    /// holders. This is the only place a bundle is ever created or
+    /// activated; request paths only read ([`Self::active_bundle`]).
     ///
-    /// Without a pin, a different holder list re-splits the same ARK into a
-    /// new bundle (new EFP, so a new ceremony); old bundles are kept
-    /// inactive. With `verified_fp` pinned, the node **never** re-splits:
-    /// the only bundle it uses is the pinned one (re-activated if the
-    /// database lost it). Changing holders means removing the pin in the
-    /// attested compose first.
-    async fn ensure_escrow(&self) -> Result<Option<EscrowBundle>, AtRestError> {
+    /// - An active bundle for other holders: refused
+    ///   ([`AtRestError::EscrowHoldersChanged`]); the node never re-splits on
+    ///   its own.
+    /// - None active and `verified_fp` pinned: the pinned bundle, from the
+    ///   database or the mirror (the pin authenticates it), is re-activated;
+    ///   anything else is [`AtRestError::EscrowPinned`].
+    /// - None active, no pin: a mirrored bundle whose mirrored ceremony
+    ///   record verifies under the ARK is restored (a database restore
+    ///   doesn't force a new ceremony); otherwise a new bundle is made.
+    ///
+    /// A verification record the database lost is restored from the mirror
+    /// when it verifies under the ARK.
+    async fn establish_escrow(&self) -> Result<(), AtRestError> {
         if self.config.holders.is_empty() {
-            return Ok(None);
+            return Ok(());
         }
         let keys = self.keys()?;
         let (g, gen) = keys.newest();
         if let Some(row) = self.store.active_escrow(g as i32).await? {
             let bundle = Self::parse_bundle(&row)?;
-            if bundle.holders() == self.config.holders && bundle.ark_id == gen.ark_id {
-                self.mirror_escrow(&row).await?;
-                return Ok(Some(bundle));
+            if bundle.ark_id != gen.ark_id {
+                return Err(AtRestError::Inconsistent(
+                    "the active escrow bundle is for another ARK",
+                ));
             }
-        }
-        if let Some(pin) = self.config.pinned_efp {
-            let usable = self.pinned_bundle().await?.filter(|b| {
-                b.holders() == self.config.holders && b.ark_id == gen.ark_id && b.generation == g
-            });
-            let Some(bundle) = usable else {
-                return Err(AtRestError::EscrowPinned);
-            };
-            let row = at_rest_escrow::Model {
-                efp: pin.to_string(),
-                generation: g as i32,
-                bundle: serde_json::to_string(&bundle).expect("serializable"),
-                active: true,
-                record: None,
-                created_at: now_rfc3339(),
-            };
-            self.store.activate_escrow(row.clone()).await?;
+            if bundle.holders() != self.config.holders {
+                return Err(AtRestError::EscrowHoldersChanged);
+            }
             self.mirror_escrow(&row).await?;
-            return Ok(Some(bundle));
+            if row.record.is_none() {
+                self.restore_record(&gen.ark, &bundle).await?;
+            }
+            return Ok(());
         }
-        let bundle = EscrowBundle::create(
-            &gen.ark,
-            gen.ark_id,
-            g,
-            &self.config.holders,
-            self.config.recipient_policy,
-        )?;
+        let wanted = |b: &EscrowBundle| {
+            b.holders() == self.config.holders && b.ark_id == gen.ark_id && b.generation == g
+        };
+        let restored = match self.config.pinned_efp {
+            Some(_) => match self.pinned_bundle().await?.filter(wanted) {
+                Some(bundle) => Some(bundle),
+                None => return Err(AtRestError::EscrowPinned),
+            },
+            None => self
+                .verified_mirrored_bundle(&gen.ark)
+                .await?
+                .filter(wanted),
+        };
+        let (bundle, created) = match restored {
+            Some(bundle) => (bundle, false),
+            None => (
+                EscrowBundle::create(
+                    &gen.ark,
+                    gen.ark_id,
+                    g,
+                    &self.config.holders,
+                    self.config.recipient_policy,
+                )?,
+                true,
+            ),
+        };
         let row = at_rest_escrow::Model {
             efp: bundle.fingerprint().to_string(),
             generation: g as i32,
@@ -764,12 +820,100 @@ impl AtRestKeyring {
         };
         self.store.activate_escrow(row.clone()).await?;
         self.mirror_escrow(&row).await?;
-        tracing::warn!(
-            generation = g,
-            efp = %row.efp,
-            "at-rest escrow bundle created; the escrow ceremony must verify it before encryption can be enabled"
-        );
-        Ok(Some(bundle))
+        if created {
+            tracing::warn!(
+                generation = g,
+                efp = %row.efp,
+                "at-rest escrow bundle created; the escrow ceremony must verify it before encryption can be enabled"
+            );
+        } else {
+            tracing::warn!(
+                generation = g,
+                efp = %row.efp,
+                "at-rest escrow bundle was missing from the database; restored an authenticated copy from the mirror"
+            );
+            if self
+                .store
+                .escrow(&row.efp)
+                .await?
+                .and_then(|r| r.record)
+                .is_none()
+            {
+                self.restore_record(&gen.ark, &bundle).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// A ceremony record for `bundle` from the mirror, stored only if its
+    /// MAC verifies under the ARK.
+    async fn restore_record(&self, ark: &Ark, bundle: &EscrowBundle) -> Result<(), AtRestError> {
+        let efp = bundle.fingerprint().to_string();
+        let Some(bytes) = get_capped(&*self.mirror, &record_mirror_name(&efp))
+            .await
+            .map_err(mirror_err)?
+        else {
+            return Ok(());
+        };
+        match VerificationRecord::from_json(&bytes) {
+            Ok(record) if record.verify(ark, bundle).is_ok() => {
+                let json = serde_json::to_string(&record).expect("serializable");
+                self.store.save_record(&efp, json).await?;
+                tracing::warn!(%efp, "at-rest ceremony record was missing from the database; restored a verified copy from the mirror");
+            }
+            _ => tracing::warn!(%efp, "ignoring a mirrored ceremony record that does not verify"),
+        }
+        Ok(())
+    }
+
+    /// An unpinned node after a database restore: a mirrored bundle that a
+    /// mirrored ceremony record proves (MAC under the ARK) was verified.
+    async fn verified_mirrored_bundle(
+        &self,
+        ark: &Ark,
+    ) -> Result<Option<EscrowBundle>, AtRestError> {
+        let names = self
+            .mirror
+            .list(&format!("{MIRROR_PREFIX}record-"))
+            .await
+            .map_err(mirror_err)?;
+        for name in names {
+            let Some(bytes) = get_capped(&*self.mirror, &name).await.map_err(mirror_err)? else {
+                continue;
+            };
+            let Ok(record) = VerificationRecord::from_json(&bytes) else {
+                continue;
+            };
+            let efp = record.efp.to_string();
+            let Some(bundle_bytes) = get_capped(&*self.mirror, &escrow_mirror_name(&efp))
+                .await
+                .map_err(mirror_err)?
+            else {
+                continue;
+            };
+            let Ok(bundle) = EscrowBundle::from_json(&bundle_bytes) else {
+                continue;
+            };
+            if bundle.fingerprint() == record.efp && record.verify(ark, &bundle).is_ok() {
+                return Ok(Some(bundle));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The newest generation's active bundle. Read-only: request paths never
+    /// create, activate or mirror anything.
+    async fn active_bundle(&self) -> Result<Option<EscrowBundle>, AtRestError> {
+        if self.config.holders.is_empty() {
+            return Ok(None);
+        }
+        let keys = self.keys()?;
+        let (g, gen) = keys.newest();
+        let Some(row) = self.store.active_escrow(g as i32).await? else {
+            return Ok(None);
+        };
+        let bundle = Self::parse_bundle(&row)?;
+        Ok((bundle.ark_id == gen.ark_id).then_some(bundle))
     }
 
     async fn mirror_escrow(&self, row: &at_rest_escrow::Model) -> Result<(), AtRestError> {
@@ -833,9 +977,10 @@ impl AtRestKeyring {
                 }
                 Ok(bundle)
             }
-            None => self.ensure_escrow().await?.ok_or(ShareRefusal::NoBundle(
-                "no escrow recipients are configured",
-            )),
+            None => self
+                .active_bundle()
+                .await?
+                .ok_or(ShareRefusal::NoBundle("no active escrow bundle")),
         }
     }
 
@@ -876,7 +1021,7 @@ impl AtRestKeyring {
         if self.state() != KeyringState::Unlocked {
             return Ok(None);
         }
-        match self.ensure_escrow().await? {
+        match self.active_bundle().await? {
             Some(bundle) => self.verified_record(&bundle).await,
             None => Ok(None),
         }
@@ -918,9 +1063,13 @@ impl AtRestKeyring {
                 Err(GateRefusal::NoEscrow)
             };
         }
-        let bundle = match self.ensure_escrow().await {
+        let bundle = match self.active_bundle().await {
             Ok(Some(b)) => b,
-            Ok(None) => return Err(GateRefusal::NoEscrow),
+            Ok(None) => {
+                return Err(GateRefusal::Unavailable(
+                    "no active escrow bundle; restart the node to escrow the key".into(),
+                ))
+            }
             Err(e) => return Err(GateRefusal::Unavailable(e.to_string())),
         };
         if bundle.holders() != self.config.holders {
@@ -1016,10 +1165,7 @@ impl AtRestKeyring {
                     .await
                     .map_err(AtRestError::from)?;
                 self.mirror
-                    .put(
-                        &format!("{MIRROR_PREFIX}record-{efp}.json"),
-                        json.into_bytes(),
-                    )
+                    .put(&record_mirror_name(&efp.to_string()), json.into_bytes())
                     .await
                     .map_err(mirror_err)?;
                 intake.clear();
@@ -1070,6 +1216,11 @@ impl AtRestKeyring {
             generation = bundle.generation,
             "at-rest keys recovered from escrow and resealed under this node's root"
         );
+        // The keys are already unlocked; an escrow problem (for example a
+        // database that lost the bundle row) is reported, not undone.
+        if let Err(error) = self.establish_escrow().await {
+            tracing::error!(%error, "at-rest keys recovered, but the escrow could not be re-established");
+        }
         Ok(())
     }
 
@@ -1108,12 +1259,21 @@ impl AtRestKeyring {
             ));
         }
         self.current.lock().clear();
-        self.ensure_escrow().await?;
         if !won {
-            return Err(AtRestError::Conflict(
-                "another node rotated the ARK first; reloaded the stored generations",
-            ));
+            let newest = self.keys()?.newest().0;
+            return Err(if newest > g {
+                AtRestError::Conflict(
+                    "another node rotated the ARK first; reloaded the stored generations",
+                )
+            } else {
+                // The newest generation carried a chain with no successor
+                // (a restored or garbage row). Reloading cleared it.
+                AtRestError::Inconsistent(
+                    "the newest ARK generation carried a stale chain; it has been cleared, retry the rotation",
+                )
+            });
         }
+        self.establish_escrow().await?;
         tracing::warn!(generation = next, %ark_id, "at-rest ARK rotated");
         Ok(next)
     }
