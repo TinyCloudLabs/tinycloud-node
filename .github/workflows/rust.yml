@@ -235,3 +235,50 @@ jobs:
         cargo fmt --manifest-path test/m1-realdata-e2e/Cargo.toml -p m1-realdata-e2e -- --check
     - name: Run deterministic M1 contract tests
       run: cargo test --locked --manifest-path test/m1-realdata-e2e/Cargo.toml
+
+  # TC-887 S0: a real node on native PostgreSQL and native MinIO (no service
+  # containers). MinIO/mc are pinned community releases whose sha256 is pinned
+  # in harness.sh; PostgreSQL is the runner image's own native install. The
+  # green checks prove a KV put lands in MinIO and a SQL write lands in
+  # database_artifact. The RED checks assert encryption at rest and fail until
+  # TC-887 S3/S4 land; they run visibly but do not fail the job. Flip that step
+  # to blocking when S3/S4 merge.
+  at-rest-harness:
+    name: at-rest harness (native PostgreSQL + MinIO)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+    - name: Checkout TinyCloud repository
+      uses: actions/checkout@v4
+
+    - name: Install reviewed Rust toolchain
+      uses: dtolnay/rust-toolchain@1.97.1
+      with:
+        components: clippy, rustfmt
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      with:
+        shared-key: rust-1.97.1-at-rest-harness
+        workspaces: . -> target
+        save-if: ${{ github.ref == 'refs/heads/main' }}
+
+    - name: Fetch pinned MinIO and mc (sha256-verified)
+      run: bash scripts/at-rest-harness/harness.sh bins
+
+    - name: Start the harness (native PostgreSQL, MinIO, tinycloud-node)
+      run: bash scripts/at-rest-harness/harness.sh up
+
+    - name: Harness checks (writes reach MinIO and PostgreSQL)
+      run: bash scripts/at-rest-harness/harness.sh test green
+
+    - name: TC-887 RED checks (expected to fail until S3/S4)
+      continue-on-error: true
+      run: bash scripts/at-rest-harness/harness.sh test red
+
+    - name: Harness logs
+      if: failure()
+      run: bash scripts/at-rest-harness/harness.sh logs
+
+    - name: Stop the harness
+      if: always()
+      run: bash scripts/at-rest-harness/harness.sh down --purge

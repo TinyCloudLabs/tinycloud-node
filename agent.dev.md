@@ -90,6 +90,12 @@ For persistence-sensitive work, add a restart/cold-cache check:
 5. Restart against the same durable database.
 6. Query through the SDK and confirm the data is still present.
 
+For work on what reaches storage (S3 blocks, `database_artifact`, encryption at rest), use the
+native harness in `scripts/at-rest-harness/` (README there): `harness.sh up` runs the real node on
+native PostgreSQL and MinIO with no containers, `harness.sh test green|red` runs the checks in
+`tinycloud-node-server/tests/at_rest_harness.rs`, and `harness.sh down --purge` stops only the
+PIDs it started.
+
 ## Debugging
 
 Health and feature discovery:
