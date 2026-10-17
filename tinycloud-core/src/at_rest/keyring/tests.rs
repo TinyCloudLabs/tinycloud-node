@@ -1564,6 +1564,37 @@ async fn a_planted_bundle_only_refuses_and_is_never_used() {
     assert_eq!(bundle.holders(), h.recipients);
 }
 
+/// Review 761d4859: one unreadable retirement marker must not stop every
+/// node. It blocks only when it names a known ARK and keys may seal;
+/// with mode off, mirror contents never stop the node.
+#[tokio::test]
+async fn an_unreadable_retirement_marker_blocks_only_a_known_key_once_keys_may_seal() {
+    let (db, mirror, h) = (db().await, Arc::new(MemoryMirror::default()), holders());
+    let k = open(&db, &mirror, &ROOT, config(&h, None)).await.unwrap();
+    let live = k.escrow_view().await.unwrap().unwrap().bundle.ark_id;
+    drop(k);
+    let mode_off = |h: &Holders| KeyringConfig {
+        require_mirror: false,
+        ..config(h, None)
+    };
+
+    // For an ARK that exists nowhere: skipped, with or without sealing.
+    mirror.plant_unreadable(&retired_mirror_name(&hex::encode([0xab; 16])));
+    open(&db, &mirror, &ROOT, config(&h, None)).await.unwrap();
+    open(&db, &mirror, &ROOT, mode_off(&h)).await.unwrap();
+
+    // For the live ARK: mode off still boots on the same key; once keys
+    // may seal, skipping could bring a retired key back, so it fails.
+    mirror.plant_unreadable(&retired_mirror_name(&hex::encode(live.0)));
+    let k = open(&db, &mirror, &ROOT, mode_off(&h)).await.unwrap();
+    assert_eq!(k.escrow_view().await.unwrap().unwrap().bundle.ark_id, live);
+    drop(k);
+    assert!(matches!(
+        open(&db, &mirror, &ROOT, config(&h, None)).await,
+        Err(AtRestError::Mirror(_))
+    ));
+}
+
 #[tokio::test]
 async fn a_forged_retirement_marker_never_drops_a_live_root_key() {
     let (db, mirror, h) = (db().await, Arc::new(MemoryMirror::default()), holders());
