@@ -15,7 +15,10 @@
 //!
 //! All derivations use length-prefixed fields: `lp(x) = u32 BE len ‖ x`.
 
+#![forbid(unsafe_code)]
+
 mod bundle;
+mod piv;
 mod recipients;
 mod record;
 mod recovery;
@@ -30,11 +33,13 @@ use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 pub use bundle::{EscrowBundle, EscrowShare, TestUnlock};
-pub use recipients::{parse_recipient, validate_holders, HolderRecipient, RecipientKind};
+pub use recipients::{
+    parse_recipient, validate_holders, HolderRecipient, RecipientKind, RecipientPolicy,
+};
 pub use record::VerificationRecord;
 pub use recovery::{
     binding_digest, recovery_binding, validate_nonce, wrap_share, RecoveryIdentity, RecoveryInfo,
-    MAX_WRAPPED_SHARE,
+    MAX_WRAPPED_SHARE, RECOVERY_INFO_VERSION,
 };
 pub use share::SharePayload;
 
@@ -56,8 +61,16 @@ pub enum EscrowError {
     ShareFormat,
     #[error("share belongs to a different ARK or generation")]
     ShareMismatch,
-    #[error("share {index} does not match its commitment in the bundle")]
+    #[error("share {index} does not match its commitment in this bundle: the share may come from a different escrow (a re-split) of the same key; check the bundle's EFP")]
     Commitment { index: u8 },
+    #[error("{what} is not valid: {reason}")]
+    Json { what: &'static str, reason: String },
+    #[error("{what} is version {found}, but this tool reads version {supported}; use the tool built from the release that matches the node")]
+    Version {
+        what: &'static str,
+        found: u64,
+        supported: u32,
+    },
     #[error("two shares with index {index}")]
     DuplicateIndex { index: u8 },
     #[error("combined shares do not reproduce the escrowed key (canary mismatch)")]
@@ -227,6 +240,35 @@ pub(crate) fn lp(out: &mut Vec<u8>, bytes: &[u8]) {
 
 pub(crate) fn sha256(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
+}
+
+/// Parse a versioned JSON document: read `version` first, so a newer format
+/// is reported as such instead of as an unknown field; then parse strictly.
+pub(crate) fn parse_versioned<T: serde::de::DeserializeOwned>(
+    bytes: &[u8],
+    what: &'static str,
+    supported: u32,
+) -> Result<T, EscrowError> {
+    let json_err = |e: serde_json::Error| EscrowError::Json {
+        what,
+        reason: e.to_string(),
+    };
+    let value: serde_json::Value = serde_json::from_slice(bytes).map_err(json_err)?;
+    let found = value
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| EscrowError::Json {
+            what,
+            reason: "no numeric `version` field".into(),
+        })?;
+    if found != u64::from(supported) {
+        return Err(EscrowError::Version {
+            what,
+            found,
+            supported,
+        });
+    }
+    serde_json::from_value(value).map_err(json_err)
 }
 
 const CANARY_INFO: &[u8] = b"tinycloud/at-rest/escrow-canary/v1";

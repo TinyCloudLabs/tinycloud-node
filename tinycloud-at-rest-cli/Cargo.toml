@@ -5,6 +5,10 @@ edition = "2021"
 publish = false
 description = "Escrow ceremony and recovery tool for TinyCloud encryption at rest (TC-887)"
 
+# A workspace of its own, with its own Cargo.lock: the DCAP verifier and its
+# HTTP stack must not change the node's dependency graph or features.
+[workspace]
+
 [[bin]]
 name = "tinycloud-at-rest"
 path = "src/main.rs"
@@ -16,11 +20,23 @@ tinycloud-at-rest-escrow = { path = "../tinycloud-at-rest-escrow" }
 dcap-qvl = { version = "=0.7.0" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-base64 = { workspace = true }
-hex = { workspace = true }
+base64 = "0.22"
+hex = "0.4"
 rand = "0.8"
-serde = { workspace = true }
-serde_json = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 sha2 = "0.10"
-tokio = { workspace = true }
+tokio = { version = "1", features = ["macros", "rt", "time"] }
 zeroize = "1"
+# `self-test`: throwaway P-256 co-holders encoded as age1yubikey1.
+p256 = "0.13"
+bech32 = "0.11"
+
+[dev-dependencies]
+# Tests only: drive a genuine quote and collateral through every TCB status
+# class. Never enabled in the built binary.
+dcap-qvl = { version = "=0.7.0", features = ["danger-allow-tcb-override"] }
+# Holder-side decryption and the p256tag interop vector in tests/.
+age = { version = "=0.12.1", default-features = false, features = ["armor"] }
+age-core = "=0.12.0"
+hpke = { version = "0.12", default-features = false, features = ["alloc", "p256"] }

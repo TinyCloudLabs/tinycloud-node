@@ -9,6 +9,10 @@ description = "Escrow of the TinyCloud at-rest root key: 2-of-3 Shamir shares se
 # Pinned exactly: share and bundle formats depend on these crates' behaviour.
 age = { version = "=0.12.1", default-features = false, features = ["armor"] }
 vsss-rs = { version = "=5.4.0", default-features = false, features = ["std", "zeroize"] }
+# age-plugin-yubikey's `piv-p256` stanza (see src/piv.rs); same versions age uses.
+age-core = "=0.12.0"
+p256 = { version = "0.13", features = ["ecdh"] }
+base64 = { workspace = true }
 hkdf = "0.12"
 hmac = "0.12"
 sha2 = "0.10"
@@ -21,10 +25,7 @@ hex = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-# A software P-256 identity that opens `p256tag` stanzas, so tests can
-# round-trip shares sealed to hardware-key (`age1tag1…`) recipients.
-age-core = "0.12"
+# Software P-256 identities that open `p256tag` and `piv-p256` stanzas, so
+# tests can round-trip shares sealed to hardware-key recipients.
 hpke = { version = "0.12", default-features = false, features = ["alloc", "p256"] }
-p256 = "0.13"
-base64 = { workspace = true }
 bech32 = "0.11"

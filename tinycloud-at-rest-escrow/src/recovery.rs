@@ -14,6 +14,8 @@ use crate::{sha256, ArkId, Digest32, Efp, EscrowError, SharePayload};
 /// Largest wrapped share the TEE reads. A real one is about 400 bytes.
 pub const MAX_WRAPPED_SHARE: usize = 4096;
 const BINDING_PREFIX: &str = "xyz.tinycloud.at-rest/recovery-key/v1\\0";
+/// Wire version of [`RecoveryInfo`].
+pub const RECOVERY_INFO_VERSION: u32 = 1;
 
 /// What `GET /at-rest/recovery?nonce=` returns. Every field is public. Only
 /// what the holder recomputes and the verified quote prove anything; the
@@ -21,6 +23,8 @@ const BINDING_PREFIX: &str = "xyz.tinycloud.at-rest/recovery-key/v1\\0";
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecoveryInfo {
+    /// [`RECOVERY_INFO_VERSION`]; checked before any other field.
+    pub version: u32,
     /// `"dstack"` when `quote` is a TDX quote, `"classic"` outside a TEE.
     pub mode: String,
     /// `"locked"` or `"unlocked"`.
@@ -40,6 +44,13 @@ pub struct RecoveryInfo {
     pub event_log: Option<String>,
     /// Indices of valid shares the TEE holds for this boot.
     pub shares_held: Vec<u8>,
+}
+
+impl RecoveryInfo {
+    /// Parse a node's answer: version first, then strict fields.
+    pub fn from_json(bytes: &[u8]) -> Result<Self, EscrowError> {
+        crate::parse_versioned(bytes, "recovery response", RECOVERY_INFO_VERSION)
+    }
 }
 
 /// `xyz.tinycloud.at-rest/recovery-key/v1\0:<recipient>:<efp>:<nonce>`. The
@@ -135,7 +146,9 @@ mod tests {
     #[test]
     fn wrapped_share_round_trips_through_the_recovery_identity_only() {
         let (ark, ark_id, holders, ids) = escrow_fixture();
-        let bundle = EscrowBundle::create(&ark, ark_id, 1, &holders).unwrap();
+        let bundle =
+            EscrowBundle::create(&ark, ark_id, 1, &holders, RecipientPolicy::AllowSoftware)
+                .unwrap();
         let shares = open_all(&bundle, &ids);
         let tee = RecoveryIdentity::generate();
         let wrapped = wrap_share(&tee.recipient(), &shares[2]).unwrap();
@@ -171,7 +184,9 @@ mod tests {
     #[test]
     fn wrap_refuses_tag_recipients() {
         let (ark, ark_id, holders, ids) = escrow_fixture();
-        let bundle = EscrowBundle::create(&ark, ark_id, 1, &holders).unwrap();
+        let bundle =
+            EscrowBundle::create(&ark, ark_id, 1, &holders, RecipientPolicy::AllowSoftware)
+                .unwrap();
         let share = &open_all(&bundle, &ids)[0];
         assert!(wrap_share(&tag_identity().1, share).is_err());
     }

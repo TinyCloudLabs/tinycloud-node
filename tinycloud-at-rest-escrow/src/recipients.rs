@@ -4,6 +4,7 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
+use crate::piv::PivRecipient;
 use crate::{EscrowError, HOLDERS};
 
 /// One escrow holder: a label and the age recipient their share is sealed to.
@@ -12,21 +13,44 @@ use crate::{EscrowError, HOLDERS};
 pub struct HolderRecipient {
     /// 1-32 chars of `a-z 0-9 - _`, unique within the escrow.
     pub holder: String,
-    /// `age1tag1…` (P-256 hardware key, e.g. a YubiKey via age-plugin-yubikey)
-    /// or `age1…` (X25519, software; tests and self-host only).
+    /// See [`RecipientKind`].
     pub recipient: String,
 }
 
+/// The recipient format. The format says which kind of key can decrypt; it
+/// does not prove where the private key lives. That a P-256 key was made on
+/// a YubiKey is established in the escrow ceremony, not here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecipientKind {
-    /// `age1tag1…` (`p256tag` stanza). Meant for keys held in hardware; age
-    /// encrypts to it natively, decryption needs the holder's plugin.
-    HardwareTag,
-    /// `age1…` X25519. The identity is a file, not hardware.
-    SoftwareX25519,
+    /// `age1yubikey1…` (`piv-p256` stanza): what released age-plugin-yubikey
+    /// prints and decrypts.
+    PivP256,
+    /// `age1tag1…` (`p256tag` stanza): native age tagged P-256 recipient,
+    /// meant for hardware keys.
+    P256Tag,
+    /// `age1…` X25519: a software key file. Test and self-host only.
+    X25519,
+}
+
+impl RecipientKind {
+    pub fn is_software(self) -> bool {
+        self == Self::X25519
+    }
+}
+
+/// Which recipient kinds an escrow may use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum RecipientPolicy {
+    /// P-256 key formats only (`age1yubikey1`, `age1tag1`). The default.
+    #[default]
+    HardwareOnly,
+    /// Also X25519 software keys. Only for tests and self-hosted nodes that
+    /// explicitly opt in; tools warn loudly whenever it is in effect.
+    AllowSoftware,
 }
 
 pub(crate) enum ParsedRecipient {
+    Piv(PivRecipient),
     Tag(age::tag::Recipient),
     X25519(age::x25519::Recipient),
 }
@@ -34,8 +58,17 @@ pub(crate) enum ParsedRecipient {
 impl ParsedRecipient {
     pub(crate) fn as_age(&self) -> &dyn age::Recipient {
         match self {
+            Self::Piv(r) => r,
             Self::Tag(r) => r,
             Self::X25519(r) => r,
+        }
+    }
+
+    fn kind(&self) -> RecipientKind {
+        match self {
+            Self::Piv(_) => RecipientKind::PivP256,
+            Self::Tag(_) => RecipientKind::P256Tag,
+            Self::X25519(_) => RecipientKind::X25519,
         }
     }
 }
@@ -45,31 +78,31 @@ pub(crate) fn parse(holder: &str, recipient: &str) -> Result<ParsedRecipient, Es
         holder: holder.to_owned(),
         reason: reason.to_owned(),
     };
-    if recipient.starts_with("age1tag1") {
+    if recipient.starts_with("age1yubikey1") {
+        recipient
+            .parse::<PivRecipient>()
+            .map(ParsedRecipient::Piv)
+            .map_err(err)
+    } else if recipient.starts_with("age1tag1") {
         recipient
             .parse::<age::tag::Recipient>()
             .map(ParsedRecipient::Tag)
             .map_err(err)
-    } else if recipient.starts_with("age1yubikey1") {
-        Err(err(
-            "age1yubikey1 recipients need the plugin to encrypt; use the age1tag1 form of the same key",
-        ))
     } else if recipient.starts_with("age1") {
         recipient
             .parse::<age::x25519::Recipient>()
             .map(ParsedRecipient::X25519)
             .map_err(err)
     } else {
-        Err(err("not an age1tag1 or age1 X25519 recipient"))
+        Err(err(
+            "not an age1yubikey1, age1tag1 or age1 X25519 recipient",
+        ))
     }
 }
 
 /// Parse one recipient and report its kind.
 pub fn parse_recipient(holder: &str, recipient: &str) -> Result<RecipientKind, EscrowError> {
-    Ok(match parse(holder, recipient)? {
-        ParsedRecipient::Tag(_) => RecipientKind::HardwareTag,
-        ParsedRecipient::X25519(_) => RecipientKind::SoftwareX25519,
-    })
+    parse(holder, recipient).map(|r| r.kind())
 }
 
 fn valid_holder_name(name: &str) -> bool {
@@ -79,8 +112,12 @@ fn valid_holder_name(name: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
 }
 
-/// Exactly three holders, valid unique names, unique recipients that parse.
-pub fn validate_holders(holders: &[HolderRecipient]) -> Result<Vec<RecipientKind>, EscrowError> {
+/// Exactly three holders, valid unique names, unique recipients that parse,
+/// and no software recipient unless `policy` allows it.
+pub fn validate_holders(
+    holders: &[HolderRecipient],
+    policy: RecipientPolicy,
+) -> Result<Vec<RecipientKind>, EscrowError> {
     if holders.len() != usize::from(HOLDERS) {
         return Err(EscrowError::Holders(format!(
             "need exactly {HOLDERS} holders, got {}",
@@ -109,7 +146,14 @@ pub fn validate_holders(holders: &[HolderRecipient]) -> Result<Vec<RecipientKind
                 h.holder
             )));
         }
-        kinds.push(parse_recipient(&h.holder, &h.recipient)?);
+        let kind = parse_recipient(&h.holder, &h.recipient)?;
+        if kind.is_software() && policy == RecipientPolicy::HardwareOnly {
+            return Err(EscrowError::Recipient {
+                holder: h.holder.clone(),
+                reason: "X25519 recipients are software keys; use a YubiKey (age1yubikey1/age1tag1) or explicitly allow software recipients (tests and self-host only)".into(),
+            });
+        }
+        kinds.push(kind);
     }
     Ok(kinds)
 }
@@ -117,7 +161,7 @@ pub fn validate_holders(holders: &[HolderRecipient]) -> Result<Vec<RecipientKind
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{tag_identity, x25519_identity};
+    use crate::test_support::{piv_identity, tag_identity, x25519_identity};
 
     fn holder(name: &str, recipient: String) -> HolderRecipient {
         HolderRecipient {
@@ -127,40 +171,50 @@ mod tests {
     }
 
     #[test]
-    fn accepts_tag_and_x25519_and_reports_kind() {
+    fn reports_each_kind_and_refuses_software_by_default() {
         let holders = vec![
-            holder("sam", tag_identity().1),
+            holder("sam", piv_identity().1),
             holder("hunter", tag_identity().1),
             holder("safe", x25519_identity().to_public().to_string()),
         ];
         assert_eq!(
-            validate_holders(&holders).unwrap(),
+            validate_holders(&holders, RecipientPolicy::AllowSoftware).unwrap(),
             vec![
-                RecipientKind::HardwareTag,
-                RecipientKind::HardwareTag,
-                RecipientKind::SoftwareX25519
+                RecipientKind::PivP256,
+                RecipientKind::P256Tag,
+                RecipientKind::X25519
             ]
         );
+        let err = validate_holders(&holders, RecipientPolicy::HardwareOnly).unwrap_err();
+        assert!(
+            matches!(&err, EscrowError::Recipient { holder, .. } if holder == "safe"),
+            "{err}"
+        );
+        let hardware = vec![
+            holder("sam", piv_identity().1),
+            holder("hunter", tag_identity().1),
+            holder("safe", piv_identity().1),
+        ];
+        validate_holders(&hardware, RecipientPolicy::HardwareOnly).unwrap();
     }
 
     #[test]
     fn rejects_count_names_duplicates_and_bad_recipients() {
-        let r = || x25519_identity().to_public().to_string();
-        assert!(validate_holders(&[holder("a", r()), holder("b", r())]).is_err());
-        assert!(validate_holders(&[
+        let r = || piv_identity().1;
+        let v = |h: &[HolderRecipient]| validate_holders(h, RecipientPolicy::AllowSoftware);
+        assert!(v(&[holder("a", r()), holder("b", r())]).is_err());
+        assert!(v(&[
             holder("a", r()),
             holder("b", r()),
             holder("c", r()),
             holder("d", r())
         ])
         .is_err());
-        assert!(validate_holders(&[holder("a", r()), holder("a", r()), holder("c", r())]).is_err());
-        assert!(
-            validate_holders(&[holder("Sam", r()), holder("b", r()), holder("c", r())]).is_err()
-        );
-        assert!(validate_holders(&[holder("", r()), holder("b", r()), holder("c", r())]).is_err());
+        assert!(v(&[holder("a", r()), holder("a", r()), holder("c", r())]).is_err());
+        assert!(v(&[holder("Sam", r()), holder("b", r()), holder("c", r())]).is_err());
+        assert!(v(&[holder("", r()), holder("b", r()), holder("c", r())]).is_err());
         let same = r();
-        assert!(validate_holders(&[
+        assert!(v(&[
             holder("a", same.clone()),
             holder("b", same),
             holder("c", r())
@@ -172,9 +226,20 @@ mod tests {
             "age1notavalidrecipient",
             "age1tag1notvalid",
         ] {
-            let err =
-                validate_holders(&[holder("a", bad.into()), holder("b", r()), holder("c", r())]);
-            assert!(err.is_err(), "{bad}");
+            assert!(
+                v(&[holder("a", bad.into()), holder("b", r()), holder("c", r())]).is_err(),
+                "{bad}"
+            );
         }
+    }
+
+    #[test]
+    fn parses_a_real_age_plugin_yubikey_recipient() {
+        // From age-plugin-yubikey 0.5.1 tests/integration.rs.
+        let real = "age1yubikey1q2w7u3vpya839jxxuq8g0sedh3d740d4xvn639sqhr95ejj8vu3hyfumptt";
+        assert_eq!(
+            parse_recipient("sam", real).unwrap(),
+            RecipientKind::PivP256
+        );
     }
 }
