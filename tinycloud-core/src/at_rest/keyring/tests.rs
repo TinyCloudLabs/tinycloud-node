@@ -65,6 +65,7 @@ fn config(h: &Holders, pinned: Option<Efp>) -> KeyringConfig {
         pinned_efp: pinned,
         app_id: Some("app".into()),
         compose_hash: Some("compose".into()),
+        require_mirror: true,
     }
 }
 
@@ -1303,4 +1304,63 @@ async fn migration_down_refuses_to_drop_keys() {
         .await
         .unwrap();
     assert!(at_rest_key::Entity::find().all(&db).await.is_err());
+}
+
+#[tokio::test]
+async fn unreadable_mirror_objects_never_stop_a_node_with_a_healthy_database() {
+    let (db, mirror, h) = (db().await, Arc::new(MemoryMirror::default()), holders());
+    let k = open(&db, &mirror, &ROOT, config(&h, None)).await.unwrap();
+    let dek = k.current_key("space-a").await.unwrap();
+    let efp = k.escrow_view().await.unwrap().unwrap().efp;
+    drop(k);
+    // Objects the real mirror can't read: odd names, a directory, a symlink.
+    for name in [
+        "ark-0000000002-x y.json",
+        "ark-..json",
+        "ark-0000000002-x+y.json",
+        "ark-0000000002-d.json",
+        "record-x y.json",
+    ] {
+        mirror.plant_unreadable(&format!("{MIRROR_PREFIX}{name}"));
+    }
+    for pin in [None, Some(efp)] {
+        let k = open(&db, &mirror, &ROOT, config(&h, pin)).await.unwrap();
+        assert_eq!(k.state(), KeyringState::Unlocked);
+        assert_eq!(k.current_key("space-a").await.unwrap().bytes(), dek.bytes());
+    }
+    // A new root still boots locked and recovers.
+    let k = open(&db, &mirror, &NEW_ROOT, config(&h, Some(efp)))
+        .await
+        .unwrap();
+    submit(&k, &h, 0).await.unwrap();
+    assert_eq!(submit(&k, &h, 1).await.unwrap(), ShareOutcome::Unlocked);
+    drop(k);
+
+    // With an empty database the mirror is all there is: an object that
+    // can't be read stops the boot rather than guessing.
+    at_rest_key::Entity::delete_many().exec(&db).await.unwrap();
+    assert!(matches!(
+        open(&db, &mirror, &NEW_ROOT, config(&h, Some(efp))).await,
+        Err(AtRestError::Mirror(_))
+    ));
+}
+
+#[tokio::test]
+async fn a_mirror_that_cannot_be_written_only_matters_once_keys_may_seal() {
+    let (db, mirror, h) = (db().await, Arc::new(MemoryMirror::default()), holders());
+    open(&db, &mirror, &ROOT, config(&h, None)).await.unwrap();
+    // The mirror lost its copies and can't take new ones.
+    mirror.clear();
+    mirror.set_read_only(true);
+    let off = KeyringConfig {
+        require_mirror: false,
+        ..config(&h, None)
+    };
+    let k = open(&db, &mirror, &ROOT, off).await.unwrap();
+    assert_eq!(k.state(), KeyringState::Unlocked);
+    drop(k);
+    assert!(matches!(
+        open(&db, &mirror, &ROOT, config(&h, None)).await,
+        Err(AtRestError::Mirror(_))
+    ));
 }
