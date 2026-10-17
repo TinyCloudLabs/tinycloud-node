@@ -46,6 +46,7 @@ dependencies = [
  "cfg-if",
  "cipher",
  "cpufeatures 0.2.17",
+ "zeroize",
 ]
 
 [[package]]
@@ -60,6 +61,7 @@ dependencies = [
  "ctr",
  "ghash",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -8182,6 +8184,7 @@ dependencies = [
 name = "tinycloud-core"
 version = "1.3.0"
 dependencies = [
+ "aes",
  "aes-gcm",
  "arrow",
  "async-trait",
@@ -8191,6 +8194,7 @@ dependencies = [
  "duckdb",
  "futures",
  "hex",
+ "hkdf",
  "hmac",
  "k256",
  "libp2p",
@@ -8219,6 +8223,7 @@ dependencies = [
  "unicode-normalization",
  "uuid",
  "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]
