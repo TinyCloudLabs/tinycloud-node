@@ -7,15 +7,15 @@
 //! space's sequence lock, to the one epoch it just appended.
 //!
 //! The cache is trusted only when it is provably current. Every epoch is
-//! appended under the space's sequence lock with `seq = MAX(event_order.seq)
-//! + 1` (TC-732), so it outranks every existing epoch, including those
-//! appended by releases that never write `epoch_head`. Rows written under the
-//! lock are exact at that moment, and the newest epoch is always a head (its
-//! child would have a larger `seq`). So the rows are still exact if and only
-//! if their largest `seq` is the space's largest. Otherwise the space falls
-//! back to the anti-join once and the caller rewrites its rows. Correctness
-//! never depends on a backfill having run, or on every writer maintaining the
-//! table.
+//! appended under the space's sequence lock with
+//! `seq = MAX(event_order.seq) + 1` (TC-732), so it outranks every existing
+//! epoch, including those appended by releases that never write
+//! `epoch_head`. Rows written under the lock are exact at that moment, and
+//! the newest epoch is always a head (its child would have a larger `seq`).
+//! So the rows are still exact if and only if their largest `seq` is the
+//! space's largest. Otherwise the space falls back to the anti-join once and
+//! the caller rewrites its rows. Correctness never depends on a backfill
+//! having run, or on every writer maintaining the table.
 //!
 //! Heads are returned in `id` (byte) order. The anti-join had no order, and
 //! the parent order only feeds the hash of a new merge epoch; nothing

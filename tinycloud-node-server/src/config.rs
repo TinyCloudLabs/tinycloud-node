@@ -969,7 +969,12 @@ impl Default for EpochHeadBackfillConfig {
 }
 
 impl EpochHeadBackfillConfig {
+    /// The pacing fields matter only when the backfill runs, so a disabled
+    /// backfill accepts any values.
     pub fn validate(&self) -> Result<(), &'static str> {
+        if !self.enabled {
+            return Ok(());
+        }
         if self.spaces_per_second == 0 {
             return Err("epoch_head_backfill.spaces_per_second must be at least 1; set enabled = false to turn the backfill off");
         }
@@ -1508,6 +1513,32 @@ mod tests {
             let mut config = Config::default();
             config.hooks.webhook_max_attempts = attempts;
             assert!(crate::resolve_runtime_config(&config).is_err());
+        }
+    }
+
+    /// TC-1274: a running backfill needs a positive rate and progress
+    /// interval; a disabled one boots whatever its pacing says.
+    #[test]
+    fn epoch_head_backfill_pacing_is_checked_only_when_enabled() {
+        for (enabled, spaces_per_second, progress_every, ok) in [
+            (true, 1, 1, true),
+            (true, 0, 500, false),
+            (true, 2, 0, false),
+            (false, 0, 0, true),
+        ] {
+            let config = Config {
+                epoch_head_backfill: EpochHeadBackfillConfig {
+                    enabled,
+                    spaces_per_second,
+                    progress_every,
+                },
+                ..Config::default()
+            };
+            assert_eq!(
+                crate::resolve_runtime_config(&config).is_ok(),
+                ok,
+                "enabled {enabled}, {spaces_per_second}/s, every {progress_every}"
+            );
         }
     }
 
