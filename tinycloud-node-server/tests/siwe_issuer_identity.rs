@@ -773,3 +773,207 @@ async fn historical_alias_targets_cannot_widen_a_space_scoped_revoke_control() -
     assert_eq!(preserved.serialization, original.serialization);
     Ok(())
 }
+
+#[tokio::test]
+async fn status_signed_invocation_cannot_revoke_but_revoke_signed_invocation_can() -> Result<()> {
+    use tinycloud_core::{
+        db::DelegationStatus,
+        hash::{hash, Hash},
+        models::{delegation, revocation},
+        relationships::event_order,
+        sea_orm::{EntityTrait, PaginatorTrait},
+    };
+
+    let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../tinycloud-core/tests/fixtures/tc1071/generated");
+    let fixtures: Vec<Value> =
+        serde_json::from_slice(&std::fs::read(fixture_dir.join("manifest.json"))?)?;
+    let fixture = fixtures
+        .iter()
+        .find(|row| row["database"] == "single-v0.sqlite")
+        .ok_or_else(|| anyhow::anyhow!("missing genuine single-v0 fixture"))?;
+    let raw: Cid = fixture["rows"][0]["raw_cid"].as_str().unwrap().parse()?;
+    let (_, canonical_bytes) =
+        TinyCloudDelegation::decode(fixture["canonical_header"].as_str().unwrap())?;
+    let canonical = hash(&canonical_bytes).to_cid(0x55);
+    assert_ne!(raw, canonical);
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("historical.sqlite");
+    std::fs::copy(fixture_dir.join("single-v0.sqlite"), &path)?;
+    let (client, _data) =
+        client_with_database(&format!("sqlite:{}?mode=rwc", path.display()), [31; 32]).await?;
+    let state = client
+        .rocket()
+        .state::<tinycloud::TinyCloud>()
+        .expect("managed database");
+    assert!(
+        delegation::Entity::find_by_id(Hash::from(canonical))
+            .one(state.connection())
+            .await?
+            .is_none(),
+        "canonical CID must not be a stored delegation"
+    );
+
+    let key = SigningKey::from_bytes(&[7; 32].into())?;
+    let public = key.verifying_key().to_encoded_point(false);
+    let address = Keccak256::digest(&public.as_bytes()[1..])[12..].try_into()?;
+    let owner = format!("did:pkh:eip155:1:0x{}", encode_eip55(&address));
+    let wallet = Wallet {
+        key,
+        address,
+        space: SpaceId::new(owner.parse()?, "single-v0".parse()?),
+    };
+    let now = time::OffsetDateTime::now_utc();
+    let prepared = prepare_session(SessionConfig {
+        abilities: HashMap::from([(
+            "delegation".parse()?,
+            HashMap::from([(
+                "".parse()?,
+                vec![
+                    "tinycloud.delegation/status".parse()?,
+                    "tinycloud.delegation/revoke".parse()?,
+                ],
+            )]),
+        )]),
+        space_abilities: None,
+        raw_abilities: HashMap::new(),
+        address: wallet.address,
+        chain_id: 1,
+        domain: "localhost".parse()?,
+        issued_at: now.into(),
+        space_id: wallet.space.clone(),
+        additional_spaces: None,
+        not_before: None,
+        expiration_time: (now + time::Duration::hours(1)).into(),
+        parents: None,
+        jwk: None,
+        delegate_uri: None,
+        nonce: None,
+        invocation_ttl_secs: None,
+    })?;
+    let signature = wallet.sign(&prepared.siwe)?;
+    let control = complete_session_setup(SignedSession {
+        session: prepared,
+        signature,
+    })?;
+    let activated: Value = serde_json::from_str(
+        &expect_ok(
+            "dual-action owner control",
+            client.post("/delegate").header(Header::new(
+                "Authorization",
+                authorization(&control.delegation_header)?,
+            )),
+        )
+        .await?,
+    )?;
+    let control_cid: Cid = activated["cid"].as_str().unwrap().parse()?;
+    for target in [raw, canonical] {
+        let status_only = make_invocation_from_uris(
+            [(
+                format!("urn:cid:{target}").parse()?,
+                ["tinycloud.delegation/status".parse()?],
+            )],
+            &control_cid,
+            &control.jwk,
+            &control.verification_method,
+            (time::OffsetDateTime::now_utc() + time::Duration::minutes(5)).unix_timestamp() as f64,
+            InvocationOptions::default(),
+        )?
+        .encode()?;
+        let (status_response, body) = dispatch(
+            client
+                .post("/delegation/status")
+                .header(ContentType::JSON)
+                .header(Header::new("Authorization", status_only.clone()))
+                .body(json!({"cid": target.to_string()}).to_string()),
+        )
+        .await;
+        assert_eq!(
+            status_response,
+            if target == raw {
+                Status::Ok
+            } else {
+                Status::NotFound
+            },
+            "{target}: {body}"
+        );
+        let before_revocations = revocation::Entity::find().count(state.connection()).await?;
+        let before_events = event_order::Entity::find()
+            .count(state.connection())
+            .await?;
+        let (status, body) = dispatch(
+            client
+                .post("/revoke")
+                .header(Header::new("Authorization", status_only)),
+        )
+        .await;
+        assert_eq!(status, Status::Forbidden, "{target}: {body}");
+        assert_eq!(
+            revocation::Entity::find().count(state.connection()).await?,
+            before_revocations,
+            "{target}: no revocation side effect"
+        );
+        assert_eq!(
+            event_order::Entity::find()
+                .count(state.connection())
+                .await?,
+            before_events,
+            "{target}: no event side effect"
+        );
+        assert_eq!(
+            state
+                .delegation_status(Hash::from(target), &owner, &[])
+                .await
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?,
+            if target == raw {
+                Some(DelegationStatus::Active)
+            } else {
+                None
+            }
+        );
+    }
+    let revoke = make_invocation_from_uris(
+        [(
+            format!("urn:cid:{raw}").parse()?,
+            ["tinycloud.delegation/revoke".parse()?],
+        )],
+        &control_cid,
+        &control.jwk,
+        &control.verification_method,
+        (time::OffsetDateTime::now_utc() + time::Duration::minutes(5)).unix_timestamp() as f64,
+        InvocationOptions::default(),
+    )?
+    .encode()?;
+    let before_revocations = revocation::Entity::find().count(state.connection()).await?;
+    let before_events = event_order::Entity::find()
+        .count(state.connection())
+        .await?;
+    let response: Value = serde_json::from_str(
+        &expect_ok(
+            "revoke-signed invocation",
+            client
+                .post("/revoke")
+                .header(Header::new("Authorization", revoke)),
+        )
+        .await?,
+    )?;
+    assert_eq!(response["cid"], raw.to_string());
+    assert_eq!(
+        revocation::Entity::find().count(state.connection()).await?,
+        before_revocations + 1
+    );
+    assert_eq!(
+        event_order::Entity::find()
+            .count(state.connection())
+            .await?,
+        before_events + 1
+    );
+    assert_eq!(
+        state
+            .delegation_status(Hash::from(raw), &owner, &[])
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?,
+        Some(DelegationStatus::Revoked)
+    );
+    Ok(())
+}
