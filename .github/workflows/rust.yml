@@ -235,3 +235,69 @@ jobs:
         cargo fmt --manifest-path test/m1-realdata-e2e/Cargo.toml -p m1-realdata-e2e -- --check
     - name: Run deterministic M1 contract tests
       run: cargo test --locked --manifest-path test/m1-realdata-e2e/Cargo.toml
+
+  # TC-887 S0: a real node on native PostgreSQL and native MinIO (no service
+  # containers). MinIO/mc are pinned community releases whose sha256 is pinned
+  # in harness.sh; PostgreSQL is the runner image's own native install. The
+  # green checks prove KV puts land in MinIO and SQL writes land in
+  # database_artifact (checkpoint and WAL delta). The RED checks assert
+  # encryption at rest; until TC-887 S3/S4 land, the step passes only if both
+  # fail with their "TC-887 RED:" findings (`--expect red`), and fails loudly
+  # if they error or unexpectedly pass. Switch to `--expect green` (with the
+  # at-rest mode set) when S3/S4 merge.
+  at-rest-harness:
+    name: at-rest harness (native PostgreSQL + MinIO)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+    - name: Checkout TinyCloud repository
+      uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+
+    - name: Install reviewed Rust toolchain
+      uses: dtolnay/rust-toolchain@1.97.1
+      with:
+        components: clippy, rustfmt
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      with:
+        shared-key: rust-1.97.1-at-rest-harness
+        workspaces: . -> target
+        save-if: ${{ github.ref == 'refs/heads/main' }}
+
+    - name: Harness paths
+      run: |
+        {
+          echo "TC887_SCRATCH_ROOT=$RUNNER_TEMP/tc887"
+          echo "TC887_RUN_DIR=$RUNNER_TEMP/tc887/harness-run-ci"
+          echo "TC887_STATE=$RUNNER_TEMP/tc887/harness-run-ci/state.json"
+        } >> "$GITHUB_ENV"
+
+    - name: Fetch pinned MinIO and mc (sha256-verified)
+      run: bash scripts/at-rest-harness/harness.sh bins
+
+    - name: Start the harness (native PostgreSQL, MinIO, tinycloud-node)
+      run: bash scripts/at-rest-harness/harness.sh up
+
+    - name: Harness checks (writes reach MinIO and PostgreSQL)
+      run: bash scripts/at-rest-harness/harness.sh test green "$TC887_STATE"
+
+    - name: TC-887 RED checks (must be RED until S3/S4)
+      run: bash scripts/at-rest-harness/harness.sh test red --expect red "$TC887_STATE"
+
+    - name: Harness logs
+      if: failure()
+      run: |
+        if [ -f "$TC887_STATE" ]; then
+          bash scripts/at-rest-harness/harness.sh logs "$TC887_STATE"
+        fi
+
+    - name: Stop the harness
+      if: always()
+      run: |
+        if [ -f "$TC887_STATE" ]; then
+          bash scripts/at-rest-harness/harness.sh down --purge "$TC887_STATE"
+        fi
