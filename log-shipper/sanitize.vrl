@@ -26,6 +26,16 @@ if label == "tinycloud-node" {
     latency = int!(latency)
     if status < 100 || status > 599 || latency < 0 || latency > 9007199254740991 { abort }
     out = {"event": "node_request", "svc": "api", "level": "info", "method": method, "route": route, "status": status, "latency_us": latency}
+    # N2 correlation fields: copied only when they have exactly the node's emitted shape; anything else is dropped
+    # (the event still ships). The pseudonyms are keyed HMAC-SHA256 digests, never raw identifiers.
+    rid = string(f.request_id) ?? ""
+    if match(rid, r'^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$') { out.request_id = rid }
+    replaced = f.request_id_replaced
+    if is_boolean(replaced) { out.request_id_replaced = replaced }
+    account = string(f.account_hash) ?? ""
+    if match(account, r'^[0-9a-f]{64}$') { out.account_hash = account }
+    space = string(f.space_hash) ?? ""
+    if match(space, r'^[0-9a-f]{64}$') { out.space_hash = space }
   } else {
     if !includes(["warn", "error"], level) { abort }
     code = "unclassified"

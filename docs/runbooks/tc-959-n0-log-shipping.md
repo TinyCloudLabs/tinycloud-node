@@ -28,7 +28,7 @@ Parsing failures become fixed counters; no log-level suppression is used.
 
 | Event | Fields beyond `ts`, `level`, `event`, `svc` | Delivery policy |
 | --- | --- | --- |
-| `node_request`, `svc=api` | `method`, canonical `route` template, integer `status`, nonnegative integer `latency_us` | Individually when valid and eligible under the selected request profile; no sampling |
+| `node_request`, `svc=api` | `method`, canonical `route` template, integer `status`, nonnegative integer `latency_us`; plus, only when present and exactly well-formed: `request_id` (lowercase UUID, version 1-8), `request_id_replaced` (boolean), `account_hash` and `space_hash` (64 lowercase hex, keyed pseudonyms). A malformed value is dropped and the request still ships. | Individually when valid and eligible under the selected request profile; no sampling |
 | `ingress_request`, `svc=ingress` | Same method/route/status, distinct numeric `request_time_seconds` | Individually when valid and eligible under the selected request profile; no sampling |
 | `node_warning` / `node_error`, `svc=api` | Fixed `event_code`, integer `event_count` | All accepted typed application WARN/ERROR records remain eligible under either profile; grouped counts approximately every 60 seconds |
 | `logship_gate_summary_total`, `svc=logship` | Fixed `reason`, integer `count` | Count every rejection that reaches the boundary; emit approximately every 60 seconds per fixed reason |
