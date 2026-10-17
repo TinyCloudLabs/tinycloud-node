@@ -1,15 +1,17 @@
 //! Persistence for the at-rest keys: PG/SQLite rows plus a mirror of the
-//! sealed ARK rows and escrow bundles in the block store (TC-887 plan §5).
+//! sealed ARK rows, escrow bundles and wrapped DEKs in the block store
+//! (TC-887 plan §5).
 //!
-//! The mirror covers a database restored to a point before an ARK row was
-//! written: sealed blobs in object storage outlive such a restore.
+//! The mirror covers a database restored to a point before a key row was
+//! written: sealed blobs in object storage outlive such a restore, and an
+//! object sealed under a DEK must never meet a different DEK with its id.
 
 use std::sync::Arc;
 
 use base64::Engine;
 use sea_orm::{
     sea_query::OnConflict, ActiveValue::Set, ColumnTrait, DbErr, EntityTrait, PaginatorTrait,
-    QueryFilter, QueryOrder, TransactionTrait,
+    QueryFilter, QueryOrder, QuerySelect, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -40,10 +42,31 @@ pub(crate) fn escrow_mirror_name(efp: &str) -> String {
     format!("{MIRROR_PREFIX}escrow-{efp}.json")
 }
 
+/// `tag` is a keyed hash of the space (see `hierarchy::dek_mirror_tag`), so
+/// the bucket listing doesn't name spaces.
+pub(crate) fn dek_mirror_name(tag: &str, dek_id: u32) -> String {
+    format!("{MIRROR_PREFIX}dek-{tag}-{dek_id:010}.json")
+}
+
+/// Mirror object format version; a newer one is refused, never guessed at.
+const MIRROR_VERSION: u32 = 1;
+
+fn check_version(version: u32) -> Result<(), MirrorError> {
+    if version == MIRROR_VERSION {
+        Ok(())
+    } else {
+        Err(format!(
+            "mirror object version {version} is not supported (this node reads {MIRROR_VERSION})"
+        )
+        .into())
+    }
+}
+
 /// The mirrored form of an `at_rest_key` row.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct MirroredArk {
+    pub version: u32,
     pub generation: u32,
     pub ark_id: String,
     pub w_label: String,
@@ -59,6 +82,7 @@ fn b64() -> base64::engine::GeneralPurpose {
 impl MirroredArk {
     pub fn from_row(row: &at_rest_key::Model) -> Self {
         Self {
+            version: MIRROR_VERSION,
             generation: row.generation as u32,
             ark_id: hex::encode(&row.ark_id),
             w_label: row.w_label.clone(),
@@ -69,12 +93,48 @@ impl MirroredArk {
     }
 
     pub fn into_row(self) -> Result<at_rest_key::Model, MirrorError> {
+        check_version(self.version)?;
         Ok(at_rest_key::Model {
             generation: i32::try_from(self.generation)?,
             ark_id: hex::decode(&self.ark_id)?,
             w_label: self.w_label,
             sealed: b64().decode(&self.sealed)?,
             chain: self.chain.map(|c| b64().decode(c)).transpose()?,
+            created_at: self.created_at,
+        })
+    }
+}
+
+/// The mirrored form of a `space_data_key` row. The space is not stored:
+/// whoever restores the row knows it, and the wrap's AAD binds it.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MirroredDek {
+    pub version: u32,
+    pub dek_id: u32,
+    pub generation: u32,
+    pub wrapped: String,
+    pub created_at: String,
+}
+
+impl MirroredDek {
+    pub fn from_row(row: &space_data_key::Model) -> Self {
+        Self {
+            version: MIRROR_VERSION,
+            dek_id: row.dek_id as u32,
+            generation: row.generation as u32,
+            wrapped: b64().encode(&row.wrapped),
+            created_at: row.created_at.clone(),
+        }
+    }
+
+    pub fn into_row(self, space: &str) -> Result<space_data_key::Model, MirrorError> {
+        check_version(self.version)?;
+        Ok(space_data_key::Model {
+            space: space.to_owned(),
+            dek_id: i32::try_from(self.dek_id)?,
+            generation: i32::try_from(self.generation)?,
+            wrapped: b64().decode(&self.wrapped)?,
             created_at: self.created_at,
         })
     }
@@ -160,6 +220,49 @@ impl AtRestStore {
             .map(|_| ())
     }
 
+    /// Write generation `row.generation` and the chain that lets it open
+    /// generation `row.generation - 1`, in one transaction. Returns `false`,
+    /// writing nothing, if that generation already exists or the older one
+    /// is already chained: another node rotated first.
+    pub async fn rotate(&self, row: at_rest_key::Model, chain: Vec<u8>) -> Result<bool, DbErr> {
+        let older = row.generation - 1;
+        let _w = self.writer().await;
+        let tx = self.db.begin().await?;
+        let inserted = at_rest_key::Entity::insert(at_rest_key::ActiveModel {
+            generation: Set(row.generation),
+            ark_id: Set(row.ark_id),
+            w_label: Set(row.w_label),
+            sealed: Set(row.sealed),
+            chain: Set(row.chain),
+            created_at: Set(row.created_at),
+        })
+        .on_conflict(
+            OnConflict::column(at_rest_key::Column::Generation)
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec(&tx)
+        .await;
+        match inserted {
+            Ok(_) => {}
+            Err(DbErr::RecordNotInserted) => return Ok(false),
+            Err(e) => return Err(e),
+        }
+        let chained = at_rest_key::Entity::update_many()
+            .col_expr(at_rest_key::Column::Chain, chain.into())
+            .filter(at_rest_key::Column::Generation.eq(older))
+            .filter(at_rest_key::Column::Chain.is_null())
+            .exec(&tx)
+            .await?;
+        if chained.rows_affected != 1 {
+            return Ok(false);
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// Replace a generation's chain. Only for repairing a chain that is
+    /// missing or doesn't open, with the newer ARK in hand.
     pub async fn set_chain(&self, generation: i32, chain: Vec<u8>) -> Result<(), DbErr> {
         let _w = self.writer().await;
         at_rest_key::Entity::update_many()
@@ -170,10 +273,18 @@ impl AtRestStore {
             .map(|_| ())
     }
 
+    /// Any escrow row at all (sealed material that must block provisioning).
+    pub async fn has_escrow_rows(&self) -> Result<bool, DbErr> {
+        Ok(at_rest_escrow::Entity::find().count(&self.db).await? > 0)
+    }
+
     pub async fn has_space_keys(&self) -> Result<bool, DbErr> {
         Ok(space_data_key::Entity::find().count(&self.db).await? > 0)
     }
 
+    /// The generation's active bundle. The partial unique index and
+    /// `activate_escrow`'s lock keep it unique; the order makes the choice
+    /// deterministic even if a database lacks the index.
     pub async fn active_escrow(
         &self,
         generation: i32,
@@ -181,6 +292,8 @@ impl AtRestStore {
         at_rest_escrow::Entity::find()
             .filter(at_rest_escrow::Column::Generation.eq(generation))
             .filter(at_rest_escrow::Column::Active.eq(true))
+            .order_by_desc(at_rest_escrow::Column::CreatedAt)
+            .order_by_asc(at_rest_escrow::Column::Efp)
             .one(&self.db)
             .await
     }
@@ -192,9 +305,19 @@ impl AtRestStore {
     }
 
     /// Make `row` the generation's only active bundle. Older bundles stay.
+    ///
+    /// Concurrent activations serialize on the generation's `at_rest_key`
+    /// row (`FOR UPDATE` on PG/MySQL; SQLite transactions are serializable
+    /// and in-process writers share the writer lock), so the deactivate
+    /// step always sees the other's committed bundle.
     pub async fn activate_escrow(&self, row: at_rest_escrow::Model) -> Result<(), DbErr> {
         let _w = self.writer().await;
         let tx = self.db.begin().await?;
+        at_rest_key::Entity::find_by_id(row.generation)
+            .lock_exclusive()
+            .one(&tx)
+            .await?
+            .ok_or_else(|| DbErr::RecordNotFound("escrowed ARK generation".into()))?;
         at_rest_escrow::Entity::update_many()
             .col_expr(at_rest_escrow::Column::Active, false.into())
             .filter(at_rest_escrow::Column::Generation.eq(row.generation))
@@ -297,6 +420,11 @@ impl MemoryMirror {
 
     pub fn clear(&self) {
         self.objects.lock().clear();
+    }
+
+    /// Drop every object under `prefix`, like a lost or rolled-back bucket.
+    pub fn remove_prefix(&self, prefix: &str) {
+        self.objects.lock().retain(|k, _| !k.starts_with(prefix));
     }
 
     fn check(&self) -> Result<(), MirrorError> {
