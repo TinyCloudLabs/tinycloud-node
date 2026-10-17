@@ -66,6 +66,7 @@ pub struct QueryLogger<'q> {
     rows_affected: u64,
     start: Instant,
     settings: LogSettings,
+    telemetry: Option<crate::request_telemetry::QueryTimer>,
 }
 
 impl<'q> QueryLogger<'q> {
@@ -76,6 +77,7 @@ impl<'q> QueryLogger<'q> {
             rows_affected: 0,
             start: Instant::now(),
             settings,
+            telemetry: Some(crate::request_telemetry::QueryTimer::new()),
         }
     }
 
@@ -160,6 +162,8 @@ impl<'q> QueryLogger<'q> {
 
 impl<'q> Drop for QueryLogger<'q> {
     fn drop(&mut self) {
+        // Finish request timing once, before formatting any diagnostic log output.
+        drop(self.telemetry.take());
         self.finish();
     }
 }

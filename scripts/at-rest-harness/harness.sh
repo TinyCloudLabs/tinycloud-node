@@ -6,8 +6,9 @@
 #
 #   harness.sh bins                              fetch + sha256-verify the pinned MinIO/mc binaries
 #   harness.sh up [--no-build]                   start PG, MinIO, the node; prints the STATE path last
-#   harness.sh test green|red [--expect green|red] STATE
-#                                                run the checks; exit 0 only on the expected outcome
+#   harness.sh test green|red [--expect EXPECT] STATE
+#                                                run the checks; exit 0 only if each check (kv, sql)
+#                                                matches EXPECT: green|red (both) or kv=green|red,sql=green|red
 #   harness.sh status STATE                      print the state file
 #   harness.sh logs STATE                        tail the harness logs (no secrets are written to them)
 #   harness.sh down [--purge] STATE              stop the recorded processes; --purge removes the run dir
@@ -19,7 +20,7 @@ set -Eeuo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 SCRATCH_ROOT=${TC887_SCRATCH_ROOT:-$HOME/scratch/tc887}
 BIN_DIR=${TC887_BIN_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/tc887-harness/bin}
-STATE_SCHEMA=tc887-at-rest-harness/v2
+STATE_SCHEMA=tc887-at-rest-harness/v3
 
 # Pinned MinIO community releases (linux-amd64). dl.min.io no longer serves
 # community binaries (HTTP 410), so these come from the archived GitHub
@@ -32,16 +33,20 @@ MINIO_URL=https://github.com/minio/minio/releases/download/$MINIO_RELEASE/minio.
 MC_URL=https://github.com/minio/mc/releases/download/$MC_RELEASE/mc.linux-amd64.$MC_RELEASE
 
 # ---------------------------------------------------------------------------
-# TC-887 at-rest node config. These two names belong to the S1 key-continuity
-# slice and may change; this block is the only place the harness defines them
-# (README "At-rest mode" documents the same mapping).
-#   TC887_AT_REST_MODE   -> TINYCLOUD_AT_REST__MODE    (off|encrypt|strict)
-#   TC887_AT_REST_ESCROW -> TINYCLOUD_AT_REST__ESCROW  (Static self-host
-#                                                       `none` acknowledgement, plan §5)
+# TC-887 at-rest node config, as defined by the S1 key-continuity slice. This
+# block is the only place the harness names them (README "At-rest mode"
+# documents the same mapping).
+#   TC887_AT_REST_MODE        -> TINYCLOUD_AT_REST__MODE         (off|encrypt|strict)
+#   TC887_AT_REST_ESCROW_NONE -> TINYCLOUD_AT_REST__ESCROW_NONE  (true|false: the Static
+#                                self-host acknowledgement that no escrow exists, plan §5)
 # Unset: the harness sets nothing and the node runs its default (today: no
-# encryption at rest). With mode encrypt/strict, `test red` expects green.
+# encryption at rest). Simplest encrypting node: Static root (always, here) +
+# TC887_AT_REST_MODE=encrypt + TC887_AT_REST_ESCROW_NONE=true. With mode
+# encrypt/strict, `test red` defaults to expecting kv=green,sql=red: S3 seals
+# KV before S4 seals SQL. When S4 lands, flip the SQL default to green
+# (default_expect below).
 AT_REST_MODE_VAR=TINYCLOUD_AT_REST__MODE
-AT_REST_ESCROW_VAR=TINYCLOUD_AT_REST__ESCROW
+AT_REST_ESCROW_NONE_VAR=TINYCLOUD_AT_REST__ESCROW_NONE
 # ---------------------------------------------------------------------------
 
 BUCKET=tinycloud-blocks
@@ -229,7 +234,8 @@ up_abort() {
   exit "$status"
 }
 
-valid_setting() { [[ "$1" =~ ^[A-Za-z0-9_.:-]+$ ]]; }
+valid_mode() { [[ "$1" =~ ^(off|encrypt|strict)$ ]]; }
+valid_bool() { [[ "$1" =~ ^(true|false)$ ]]; }
 
 cmd_up() {
   local build=1
@@ -244,9 +250,11 @@ cmd_up() {
   trap 'exit 143' TERM
   command -v python3 >/dev/null || die "python3 is required"
   command -v curl >/dev/null || die "curl is required"
-  local at_rest_mode=${TC887_AT_REST_MODE:-} at_rest_escrow=${TC887_AT_REST_ESCROW:-}
-  [[ -z "$at_rest_mode" ]] || valid_setting "$at_rest_mode" || die "invalid TC887_AT_REST_MODE"
-  [[ -z "$at_rest_escrow" ]] || valid_setting "$at_rest_escrow" || die "invalid TC887_AT_REST_ESCROW"
+  local at_rest_mode=${TC887_AT_REST_MODE:-} at_rest_escrow_none=${TC887_AT_REST_ESCROW_NONE:-}
+  [[ -z "$at_rest_mode" ]] || valid_mode "$at_rest_mode" \
+    || die "TC887_AT_REST_MODE must be off, encrypt or strict"
+  [[ -z "$at_rest_escrow_none" ]] || valid_bool "$at_rest_escrow_none" \
+    || die "TC887_AT_REST_ESCROW_NONE must be true or false"
   cmd_bins
 
   local pg_bin
@@ -287,7 +295,7 @@ cmd_up() {
   # Recorded by every write_state call, including a failed up's.
   export STATE_PG_BIN=$pg_bin STATE_NODE_BIN=$node_bin STATE_PG_PORT=$pg_port \
     STATE_MINIO_PORT=$minio_port STATE_CONSOLE_PORT=$console_port STATE_NODE_PORT=$node_port \
-    STATE_AT_REST_MODE=$at_rest_mode STATE_AT_REST_ESCROW=$at_rest_escrow
+    STATE_AT_REST_MODE=$at_rest_mode STATE_AT_REST_ESCROW_NONE=$at_rest_escrow_none
 
   # Per-run secrets: generated here, kept in 0600 files, never on argv.
   random_hex | secret_file "$run/secrets/pg-password"
@@ -345,9 +353,9 @@ EOF
     printf '%s=%s\n' "$AT_REST_MODE_VAR" "$at_rest_mode" >>"$run/node.env"
     log "at-rest: $AT_REST_MODE_VAR=$at_rest_mode"
   fi
-  if [[ -n "$at_rest_escrow" ]]; then
-    printf '%s=%s\n' "$AT_REST_ESCROW_VAR" "$at_rest_escrow" >>"$run/node.env"
-    log "at-rest: $AT_REST_ESCROW_VAR=$at_rest_escrow"
+  if [[ -n "$at_rest_escrow_none" ]]; then
+    printf '%s=%s\n' "$AT_REST_ESCROW_NONE_VAR" "$at_rest_escrow_none" >>"$run/node.env"
+    log "at-rest: $AT_REST_ESCROW_NONE_VAR=$at_rest_escrow_none"
   fi
   printf '[global]\nlog_level = "normal"\n' >"$run/tinycloud.toml"
   write_state "$run" starting
@@ -413,7 +421,7 @@ write_state() {
     NODE_PID=$UP_NODE_PID NODE_START=$UP_NODE_START \
     BIN_DIR=$BIN_DIR MINIO_RELEASE=$MINIO_RELEASE MC_RELEASE=$MC_RELEASE \
     BUCKET=$BUCKET REGION=$REGION PG_USER=$PG_USER PG_DB=$PG_DB \
-    AT_REST_MODE_VAR=$AT_REST_MODE_VAR AT_REST_ESCROW_VAR=$AT_REST_ESCROW_VAR python3 - <<'PY'
+    AT_REST_MODE_VAR=$AT_REST_MODE_VAR AT_REST_ESCROW_NONE_VAR=$AT_REST_ESCROW_NONE_VAR python3 - <<'PY'
 import json, os, datetime
 e = os.environ
 run = e["RUN"]
@@ -433,9 +441,9 @@ state = {
     "env_file": os.path.join(run, "harness.env"),
     "at_rest": {
         "mode": text("STATE_AT_REST_MODE"),
-        "escrow": text("STATE_AT_REST_ESCROW"),
+        "escrow_none": {"true": True, "false": False}.get(e.get("STATE_AT_REST_ESCROW_NONE", "")),
         "mode_var": e["AT_REST_MODE_VAR"],
-        "escrow_var": e["AT_REST_ESCROW_VAR"],
+        "escrow_none_var": e["AT_REST_ESCROW_NONE_VAR"],
     },
     "node": {
         "pid": num("NODE_PID"),
@@ -554,74 +562,122 @@ annotate() {
   log "$*"
 }
 
+# The harness test for each check, per kind, and the finding its RED test
+# prints when the stored bytes are plaintext.
+test_name() {
+  case $1-$2 in
+    green-kv) echo green_kv_put_reaches_minio ;;
+    green-sql) echo green_sql_write_reaches_postgres ;;
+    red-kv) echo red_kv_blocks_are_sealed_in_minio ;;
+    red-sql) echo red_sql_artifacts_are_sealed_in_postgres ;;
+  esac
+}
+red_finding() {
+  case $1 in
+    kv) echo 'TC-887 RED: KV data is not sealed at rest' ;;
+    sql) echo 'TC-887 RED: SQL artifacts are not sealed at rest' ;;
+  esac
+}
+
+# Default expectation of CHECK for KIND on the harness at STATE.
+default_expect() {
+  local kind=$1 check=$2 state=$3
+  [[ "$kind" == green ]] && { echo green; return; }
+  case $(state_get "$state" at_rest.mode) in
+    # S3 seals KV before S4 seals SQL; flip sql to green when S4 lands.
+    encrypt|strict) [[ "$check" == kv ]] && echo green || echo red ;;
+    *) echo red ;;
+  esac
+}
+
+# Run one check alone; sets CHECK_OUTCOME (green|red|errored) and CHECK_DETAIL.
+run_check() {
+  local kind=$1 check=$2 state=$3 name out status=0 passed failed
+  name=$(test_name "$kind" "$check")
+  out=$(mktemp)
+  (cd "$ROOT" && TC887_HARNESS_STATE=$state nice -n 10 cargo test -p tinycloud-node \
+    -j "${TC887_CARGO_JOBS:-8}" --test at_rest_harness -- --ignored --nocapture --exact "$name") \
+    2>&1 | tee "$out" || status=$?
+  read -r passed failed < <(grep -Eo 'test result: [A-Za-z]+\. [0-9]+ passed; [0-9]+ failed' "$out" \
+    | awk '{p += $4; f += $6} END {print p + 0, f + 0}')
+  CHECK_DETAIL="cargo exit $status"
+  # libtest exits 0 when a filter matches nothing; never let that pass (TC-381).
+  if ((passed + failed != 1)); then
+    CHECK_OUTCOME=errored
+    CHECK_DETAIL="expected 1 test ($name) to run, $((passed + failed)) ran; $CHECK_DETAIL (compile or harness failure)"
+  elif ((passed == 1 && status == 0)); then
+    CHECK_OUTCOME=green
+  elif [[ "$kind" == red ]] && grep -qF "$(red_finding "$check")" "$out"; then
+    CHECK_OUTCOME=red
+  else
+    CHECK_OUTCOME=errored
+    CHECK_DETAIL="$name failed without a TC-887 RED finding (harness, precondition or node error; see output above)"
+  fi
+  rm -f "$out"
+}
+
 cmd_test() {
   local kind="" expect="" target=""
   while (($#)); do
     case $1 in
       green|red) [[ -z "$kind" ]] || die "test: one kind only"; kind=$1 ;;
-      --expect) (($# >= 2)) || die "--expect needs green or red"; shift; expect=$1 ;;
+      --expect) (($# >= 2)) || die "--expect needs a value"; shift; expect=$1 ;;
       --expect=*) expect=${1#--expect=} ;;
       -*) die "test: unknown option $1" ;;
       *) [[ -z "$target" ]] || die "test: one STATE only"; target=$1 ;;
     esac
     shift
   done
-  [[ -n "$kind" ]] || die "usage: harness.sh test green|red [--expect green|red] STATE"
+  [[ -n "$kind" ]] || die "usage: harness.sh test green|red [--expect EXPECT] STATE"
   local state
   state=$(resolve_state "$target")
   [[ "$(state_get "$state" status)" == up ]] || die "harness at $state is not up"
-  if [[ -z "$expect" ]]; then
-    expect=green
-    if [[ "$kind" == red ]]; then
-      case $(state_get "$state" at_rest.mode) in
-        encrypt|strict) expect=green ;;
-        *) expect=red ;;
-      esac
+
+  local -A want=([kv]=$(default_expect "$kind" kv "$state") [sql]=$(default_expect "$kind" sql "$state"))
+  local item key value items=()
+  case $expect in
+    "") ;;
+    green|red) want[kv]=$expect want[sql]=$expect ;;
+    *)
+      IFS=, read -ra items <<<"$expect"
+      for item in "${items[@]}"; do
+        key=${item%%=*} value=${item#*=}
+        [[ "$item" == *=* && ( "$key" == kv || "$key" == sql ) && ( "$value" == green || "$value" == red ) ]] \
+          || die "--expect must be green, red, or kv=green|red,sql=green|red (got '$item')"
+        want[$key]=$value
+      done
+      ;;
+  esac
+
+  local check rc=0 CHECK_OUTCOME CHECK_DETAIL label
+  for check in kv sql; do
+    run_check "$kind" "$check" "$state"
+    label=$(tr '[:lower:]' '[:upper:]' <<<"$check")
+    if [[ "$CHECK_OUTCOME" == errored ]]; then
+      annotate error "$label $kind check ERRORED: $CHECK_DETAIL"
+      rc=4
+    elif [[ "$CHECK_OUTCOME" == "${want[$check]}" ]]; then
+      if [[ "$CHECK_OUTCOME" == red ]]; then
+        annotate notice "$label RED as expected: $label data is plaintext at rest"
+      else
+        annotate notice "$label $kind check GREEN as expected"
+      fi
+    elif [[ "$CHECK_OUTCOME" == green ]]; then
+      annotate error "$label $kind check UNEXPECTEDLY PASSED under expect $check=red: the at-rest property holds for $label; expect $check=green and update CI"
+      ((rc == 4)) || rc=3
+    else
+      annotate error "$label $kind check still RED ($label data is plaintext at rest) but expected $check=green"
+      ((rc == 4)) || rc=3
+    fi
+  done
+  if ((rc == 0)); then
+    if [[ "$kind" == red && "${want[kv]}" == red && "${want[sql]}" == red ]]; then
+      annotate notice "RED as expected: both TC-887 RED checks report plaintext at rest (KV and SQL)"
+    else
+      annotate notice "$kind checks as expected (kv=${want[kv]}, sql=${want[sql]})"
     fi
   fi
-  [[ "$expect" == green || "$expect" == red ]] || die "--expect must be green or red"
-
-  local out status=0
-  out=$(mktemp)
-  (cd "$ROOT" && TC887_HARNESS_STATE=$state nice -n 10 cargo test -p tinycloud-node \
-    -j "${TC887_CARGO_JOBS:-8}" --test at_rest_harness -- --ignored --nocapture --test-threads=1 "${kind}_") \
-    2>&1 | tee "$out" || status=$?
-  local passed failed kv_red=0 sql_red=0
-  read -r passed failed < <(grep -Eo 'test result: [A-Za-z]+\. [0-9]+ passed; [0-9]+ failed' "$out" \
-    | awk '{p += $4; f += $6} END {print p + 0, f + 0}')
-  if [[ "$kind" == red ]]; then
-    grep -q 'TC-887 RED: KV data is not sealed at rest' "$out" && kv_red=1
-    grep -q 'TC-887 RED: SQL artifacts are not sealed at rest' "$out" && sql_red=1
-  fi
-  rm -f "$out"
-  local reds=$((kv_red + sql_red)) ran=$((passed + failed))
-
-  # libtest exits 0 when a filter matches nothing; never let that pass (TC-381).
-  if ((ran != 2)); then
-    annotate error "$kind checks ERRORED: expected 2 to run, $ran ran (cargo exit $status: compile or harness failure)"
-    return 4
-  fi
-  if ((failed != reds)); then
-    annotate error "$kind checks ERRORED: $failed failed but only $reds with a TC-887 RED finding (harness, precondition or node error; see output above)"
-    return 4
-  fi
-  if [[ "$expect" == green ]]; then
-    if ((status == 0 && failed == 0)); then
-      annotate notice "$kind checks GREEN as expected ($passed passed)"
-      return 0
-    fi
-    annotate error "$kind checks still RED ($reds of 2 report plaintext at rest) but expected green"
-    return 3
-  fi
-  if ((status == 101 && reds == 2)); then
-    annotate notice "RED as expected: both TC-887 RED checks report plaintext at rest (KV and SQL)"
-    return 0
-  fi
-  local flipped=()
-  ((kv_red)) || flipped+=(KV)
-  ((sql_red)) || flipped+=(SQL)
-  annotate error "$kind checks UNEXPECTEDLY PASSED under --expect red (no TC-887 RED finding for ${flipped[*]}): the at-rest property holds there; run with --expect green (or set TC887_AT_REST_MODE) and update CI"
-  return 3
+  return "$rc"
 }
 
 cmd_status() {
@@ -647,5 +703,5 @@ case ${1:-} in
   test) shift; cmd_test "$@" ;;
   status) shift; cmd_status "$@" ;;
   logs) shift; cmd_logs "$@" ;;
-  *) die "usage: harness.sh bins | up [--no-build] | test green|red [--expect green|red] STATE | status STATE | logs STATE | down [--purge] STATE" ;;
+  *) die "usage: harness.sh bins | up [--no-build] | test green|red [--expect EXPECT] STATE | status STATE | logs STATE | down [--purge] STATE" ;;
 esac

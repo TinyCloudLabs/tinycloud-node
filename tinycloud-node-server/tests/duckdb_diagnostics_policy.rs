@@ -187,6 +187,7 @@ fn child_command(root: &FsPath, port: u16, metrics_port: u16) -> Command {
         .env("TINYCLOUD_ADDRESS", "127.0.0.1")
         .env("TINYCLOUD_PORT", port.to_string())
         .env("TINYCLOUD_LOG_LEVEL", "normal")
+        .env("TINYCLOUD_LOG__FORMAT", "Json")
         .env("TINYCLOUD_TELEMETRY__ENABLED", "true")
         .env("TINYCLOUD_PROMETHEUS__PORT", metrics_port.to_string())
         .env("TINYCLOUD_STORAGE__DATADIR", root.join("data"))
@@ -412,26 +413,33 @@ impl Node {
             err.contains("tinycloud-node runtime configuration is valid"),
             "real-binary stderr capture control is missing"
         );
-        let request_lines = out
+        let request_events = out
             .lines()
-            .filter(|line| {
-                line.contains("tinycloud::request") && line.contains("method=POST route=/invoke ")
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|event| event["target"] == "tinycloud::request")
+            .map(|mut event| event["fields"].take())
+            .filter(|event| {
+                event["event"] == "node_request"
+                    && event["method"] == "POST"
+                    && event["route"] == "/invoke"
             })
             .collect::<Vec<_>>();
         ensure!(
-            request_lines.len() == self.invocations,
+            request_events.len() == self.invocations,
             "request logging was hidden: expected {}, got {}",
             self.invocations,
-            request_lines.len()
+            request_events.len()
         );
         ensure!(
-            request_lines.iter().any(|line| line.contains("status=200")),
+            request_events
+                .iter()
+                .any(|event| event["status"].as_u64() == Some(200)),
             "successful requests must still be logged"
         );
         ensure!(
-            request_lines
+            request_events
                 .iter()
-                .any(|line| line.contains("status=400") || line.contains("status=403")),
+                .any(|event| matches!(event["status"].as_u64(), Some(400 | 403))),
             "rejected requests must still be logged"
         );
         if self.file_canary.exists() {

@@ -766,7 +766,7 @@ fn payload_encoding_column_is_explicit() {
         PayloadEncoding::from_column(Some(1)).unwrap(),
         PayloadEncoding::Tce1
     );
-    for v in [2i16, 3, 255] {
+    for v in [2i16, 3, 9] {
         assert!(
             matches!(
                 PayloadEncoding::from_column(Some(v)),
@@ -775,7 +775,7 @@ fn payload_encoding_column_is_explicit() {
             "{v}"
         );
     }
-    for v in [0, -1, 256, i16::MAX, i16::MIN] {
+    for v in [0, -1, 10, 255, 256, i16::MAX, i16::MIN] {
         assert!(
             matches!(
                 PayloadEncoding::from_column(Some(v)),

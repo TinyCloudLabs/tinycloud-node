@@ -65,6 +65,8 @@ x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 hex.workspace = true
 base64.workspace = true
 sha2 = "0.10"
+sqlx-core = "=0.8.6"
+uuid = "1"
 sha3 = "0.10"
 k256 = "0.13"
 # TC-887: at-rest envelope key derivation and object names; zeroize key
