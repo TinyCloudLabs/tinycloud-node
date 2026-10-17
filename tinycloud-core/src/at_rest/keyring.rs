@@ -1575,7 +1575,10 @@ impl AtRestKeyring {
             let newest = keys.newest().0;
             let names_unloaded_generation =
                 serde_json::from_slice::<MirroredDek>(&bytes).is_ok_and(|m| m.generation > newest);
+            // The object name is a keyed hash, not the space: safe to log,
+            // and what an operator needs for the dek_unavailable runbook.
             tracing::error!(
+                object = %name,
                 dek_id,
                 names_unloaded_generation,
                 "a mirrored data key for this space does not authenticate; refusing to make a new one"
@@ -1618,9 +1621,16 @@ impl AtRestKeyring {
                 Some((m, _)) if m.generation == row.generation && m.wrapped == row.wrapped => {
                     Ok(())
                 }
-                _ => Err(backend(AtRestError::DekUnavailable(
-                    "the mirror holds different bytes for this data key; it is never overwritten",
-                ))),
+                _ => {
+                    tracing::error!(
+                        object = %name,
+                        dek_id,
+                        "the mirror holds different bytes for this data key; refusing to overwrite it"
+                    );
+                    Err(backend(AtRestError::DekUnavailable(
+                        "the mirror holds different bytes for this data key; it is never overwritten",
+                    )))
+                }
             };
         }
         let body = serde_json::to_vec(&MirroredDek::from_row(row)).expect("serializable");
