@@ -24,7 +24,9 @@ use tinycloud_at_rest_escrow::{
     binding_digest, recovery_binding, validate_nonce, EscrowBundle, RecoveryInfo,
     VerificationRecord, MAX_WRAPPED_SHARE, RECOVERY_INFO_VERSION,
 };
-use tinycloud_core::at_rest::keyring::{EscrowView, KeyringState, ShareOutcome, ShareRefusal};
+use tinycloud_core::at_rest::keyring::{
+    AtRestError, EscrowView, KeyringState, ShareOutcome, ShareRefusal,
+};
 
 use crate::at_rest::{AtRestRuntime, AtRestState};
 use crate::routes::public::{ClientIp, RateLimiter};
@@ -39,9 +41,17 @@ fn not_enabled() -> Refusal {
     )
 }
 
-fn internal(e: impl std::fmt::Display) -> Refusal {
+/// A keyring error as an answer: 503 when a retry may help (store or mirror
+/// unreachable, locked, a concurrent change), 500 when an operator must act.
+/// The body is a stable, non-secret reason; backend detail goes to the log.
+fn internal(e: AtRestError) -> Refusal {
     ::tracing::error!(error = %e, "at-rest keyring error");
-    (Status::ServiceUnavailable, "at-rest keyring error".into())
+    let status = if e.is_transient() {
+        Status::ServiceUnavailable
+    } else {
+        Status::InternalServerError
+    };
+    (status, format!("at-rest keyring error: {}", e.reason()))
 }
 
 async fn view(runtime: &AtRestRuntime) -> Result<EscrowView, Refusal> {
@@ -259,5 +269,35 @@ pub async fn at_rest_recovery_share(
             Err((Status::BadRequest, format!("share rejected: {e}")))
         }
         Err(ShareRefusal::Keyring(e)) => Err(internal(e)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keyring_errors_answer_with_a_status_and_a_non_secret_reason() {
+        let (status, body) = internal(AtRestError::Mirror(
+            "s3://bucket/secret-path: access denied".into(),
+        ));
+        assert_eq!(status, Status::ServiceUnavailable);
+        assert_eq!(body, "at-rest keyring error: mirror_unavailable");
+        let (status, body) = internal(AtRestError::Inconsistent(
+            "an older ARK generation's chain is missing or does not open",
+        ));
+        assert_eq!(status, Status::InternalServerError);
+        assert!(
+            body.contains("inconsistent: an older ARK generation"),
+            "{body}"
+        );
+        let (status, body) = internal(AtRestError::EscrowHoldersChanged);
+        assert_eq!(
+            (status, body.as_str()),
+            (
+                Status::InternalServerError,
+                "at-rest keyring error: escrow_holders_changed"
+            )
+        );
     }
 }

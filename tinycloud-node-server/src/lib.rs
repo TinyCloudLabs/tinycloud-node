@@ -668,6 +668,7 @@ pub async fn app_with_control(
         tee_context.as_ref(),
     )
     .await?;
+    at_rest_runtime.spawn_gate_retry(std::time::Duration::from_secs(30));
     #[cfg(feature = "tc-bench-v1")]
     let bench_state = BenchState::new(
         &tinycloud_config.tc_bench,

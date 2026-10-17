@@ -1,9 +1,13 @@
 //! Node wiring for encryption at rest (TC-887 S1): config → keyring, the
-//! boot-time encrypt gate, and the runtime state storage and routes use.
+//! boot-time escrow gate, and the runtime state the routes use.
 //!
 //! Two phases, because block storage opens before migrations and the
-//! keyring needs its tables: [`AtRestRuntime::new`] before storage (storage
-//! keeps the `Arc`), then [`setup`] after migrations installs the keyring.
+//! keyring needs its tables: [`AtRestRuntime::new`] before storage, then
+//! [`setup`] after migrations installs the keyring.
+//!
+//! In this build no storage seals anything yet: nothing calls
+//! [`AtRestRuntime::declare_seal_path`], so `setup` refuses every mode
+//! but `off` and `encrypting()` is always false.
 //!
 //! With the default config (`mode = "off"`, no recipients, no
 //! `escrow_none`) nothing is set up: no key reads, no rows, no mirror.
@@ -28,13 +32,14 @@ use crate::config::{AtRestConfig, AtRestEscrowConfig, AtRestMode, Storage};
 use crate::storage::at_rest_mirror::{FsKeyMirror, S3KeyMirror};
 use crate::tee::TeeContext;
 
-/// At-rest state shared by block storage, the routes and `/info`. Rocket
-/// manages it as `Arc<AtRestRuntime>`.
+/// At-rest state shared by the routes and `/info` (and, once it seals
+/// writes, block storage). Rocket manages it as `Arc<AtRestRuntime>`.
 ///
-/// Storage rules (S3): mode `off` behaves exactly as without at-rest.
-/// Otherwise writes are sealed only while [`encrypting`](Self::encrypting)
-/// (else 503, never plaintext); a sealed read whose key is `Locked` is a
-/// 503; legacy plaintext reads are allowed unless the mode is `strict`.
+/// The contract for the storage seal path (TC-887 S3), not yet wired: mode
+/// `off` behaves exactly as without at-rest. Otherwise writes are sealed
+/// only while [`encrypting`](Self::encrypting) (else 503, never plaintext);
+/// a sealed read whose key is `Locked` is a 503; legacy plaintext reads are
+/// allowed unless the mode is `strict`.
 pub struct AtRestRuntime {
     mode: AtRestMode,
     escrow_none: bool,
@@ -190,6 +195,40 @@ impl AtRestRuntime {
         result
     }
 
+    /// While a mode other than `off` is configured and encryption is off on
+    /// an unlocked node (for example the gate hit a transient store or
+    /// mirror error after a recovery), re-run the gate every `every`.
+    pub fn spawn_gate_retry(self: &Arc<Self>, every: std::time::Duration) {
+        if self.mode == AtRestMode::Off {
+            return;
+        }
+        let runtime = Arc::downgrade(self);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(every).await;
+                let Some(runtime) = runtime.upgrade() else {
+                    return;
+                };
+                let unlocked = runtime
+                    .keyring()
+                    .is_some_and(|k| k.state() == KeyringState::Unlocked);
+                if unlocked && !runtime.encrypting() {
+                    match runtime.reevaluate().await {
+                        Ok(_) if runtime.encrypting() => {
+                            ::tracing::info!(
+                                "at-rest escrow gate passed on retry; encryption enabled"
+                            )
+                        }
+                        Ok(_) => {}
+                        Err(reason) => {
+                            ::tracing::warn!(%reason, "at-rest escrow gate still closed")
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     pub fn mode_name(&self) -> &'static str {
         match self.mode {
             AtRestMode::Off => "off",
@@ -289,12 +328,15 @@ pub async fn setup(
         Some(KeyringState::Unlocked) => {
             let gate = runtime.reevaluate().await;
             match (config.mode, gate) {
-                (AtRestMode::Off, Ok(_)) => {
+                (AtRestMode::Off, Ok(GatePass::Verified { .. })) => {
                     ::tracing::info!("at-rest keys unlocked; escrow verified; mode off")
                 }
+                (AtRestMode::Off, Ok(GatePass::Unescrowed)) => ::tracing::info!(
+                    "at-rest keys unlocked; no escrow (escrow_none acknowledged); mode off"
+                ),
                 (AtRestMode::Off, Err(refusal)) => ::tracing::warn!(
                     reason = %refusal,
-                    "at-rest keys unlocked; encryption could not be enabled yet"
+                    "at-rest keys unlocked; the escrow gate is not satisfied yet"
                 ),
                 (mode, Ok(_)) => ::tracing::info!(?mode, "at-rest encryption enabled"),
                 (mode, Err(refusal)) => {

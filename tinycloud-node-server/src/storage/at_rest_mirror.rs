@@ -155,8 +155,13 @@ impl KeyMirror for FsKeyMirror {
         let dir = path.parent().ok_or("mirror path has no parent")?;
         tokio::fs::create_dir_all(dir).await?;
         // Write, fsync, then rename, so a crash never leaves a half-written
-        // or unsynced key file under the final name.
-        let tmp = path.with_extension("tmp");
+        // or unsynced key file under the final name. The temporary name is
+        // unique, so concurrent writers of one object never collide.
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or("mirror path has no file name")?;
+        let tmp = dir.join(format!("{file_name}.{:016x}.tmp", rand::random::<u64>()));
         let mut file = tokio::fs::File::create(&tmp).await?;
         tokio::io::AsyncWriteExt::write_all(&mut file, &bytes).await?;
         file.sync_all().await?;

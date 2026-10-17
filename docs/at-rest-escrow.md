@@ -142,11 +142,13 @@ The same settings as compose env: `TINYCLOUD_AT_REST__MODE`, `TINYCLOUD_AT_REST_
 
 - **Recipients set, `mode = "off"`:**
   - at boot the node creates the ARK (sealed under its root) and the escrow bundle;
-  - it keeps a copy of the sealed key, the bundle and each space's wrapped data key in the block store (`_tc/at-rest/` in S3, `{datadir}/at-rest/` on disk). Data-key objects are named by a keyed hash, not the space;
+  - it keeps a copy of the sealed key, the bundle, the ceremony record and each space's wrapped data key in the block store (`_tc/at-rest/` in S3, `{datadir}/at-rest/_tc/at-rest/` on disk). Data-key objects are named by a keyed hash, not the space;
   - nothing is encrypted.
 - **`encrypt` and `strict` are refused at boot in this build.** Block storage has no seal path yet, so the node won't claim to encrypt while it writes plaintext; `/info` never shows `encrypting: true`. Storage turns the capability on when the seal path lands (TC-887 S3). From then on, `encrypt` or `strict` refuses to start unless the recipients equal the bundle's, `verified_fp` equals its EFP, and the stored ceremony record verifies under the key inside the TEE. A Static-root node with no recipients may use `escrow_none = true` instead, which acknowledges that no escrow exists.
 - **In a TEE, the escrow recipients and `verified_fp` must be literal values in the measured compose.** The node reads its `app-compose.json` from the guest agent, checks it against `compose_hash`, and refuses to boot unless `TINYCLOUD_AT_REST__ESCROW__RECIPIENTS` and `TINYCLOUD_AT_REST__ESCROW__VERIFIED_FP` are set there as literals (no `${…}`, no pass-through) equal to the effective config. Values from the encrypted environment, a file or anywhere else are refused.
-- **With `verified_fp` set, the node never re-splits the key.** It uses only the pinned bundle (restoring it from the block store if the database lost it) and refuses to boot if that bundle is not for the configured recipients and the newest key. To change holders, remove the pin in the compose first; the new bundle then needs a new ceremony.
+- **The escrow bundle is made or changed only at boot, never by a request.** Every endpoint below only reads it.
+  - If the configured recipients differ from the active bundle's, the node refuses to boot: it never re-splits on its own. Changing a holder needs an explicit re-escrow (a follow-up, with the rotation tooling in TC-1345).
+  - With `verified_fp` set, the node uses only the pinned bundle, restoring it from the block store if the database lost it, and refuses to boot if that bundle is not for the configured recipients and the newest key.
 - **If the node's root can no longer unseal the key** (new app id or KMS), it boots **locked**:
   - `/info` shows `at_rest.state = "locked"` and encryption is unavailable;
   - two holders recover it through the endpoints below, which needs `verified_fp` to be pinned;
@@ -168,9 +170,19 @@ The share endpoint:
 
 Shares live in memory for the current boot only.
 
+A keyring failure answers `503` when a retry may help (`store_unavailable`, `mirror_unavailable`, `locked`, `conflict: …`) and `500` when an operator must act (`inconsistent: …`, `escrow_pinned`, `escrow_holders_changed`, `escrow: …`). The reason never contains key material or backend detail; the server log has the rest.
+
+**Recovery is per node.** Each boot has its own recovery key, so a share wrapped for one node is rejected by another. With several nodes on one database:
+- recover one node, by its own address (not through a load balancer);
+- then restart the others; a locked node doesn't pick up another node's recovery until it restarts;
+- every node on one database must use the same root. A node under another root boots locked, and recovering it re-seals the rows under its root, which locks the others out at their next restart.
+
+Production runs one node per database. Multi-node recovery is a known limitation.
+
 ### Key continuity
 
 - **Database restored to an earlier point.** At boot the node takes back a key generation or chain from the block-store copy only once it authenticates: the newest under this node's root, each older one by its chain. During recovery, the recovered key authenticates them. Anything else in the copy (forged, junk, a gap, an oversized object) is skipped with a warning and never stored, so write access to the bucket can neither lock the node nor stop it booting while the database is healthy. A space's data key missing from the database is restored from its copy only if its wrap authenticates for that space, before a new one would be made; if a *genuine* different key exists under the same id, the node refuses to use it.
 - **No key is ever made over existing material.** The node creates a new root key only when the database has no key, escrow or data-key rows and the block store has nothing under `_tc/at-rest/`. A store or mirror error stops the boot instead, and so does an empty database whose block-store copy holds nothing usable.
-- **Generations.** Each older generation is sealed under the next one's key (its chain), so escrowing the newest generation recovers all of them. At boot under the same root, a missing or broken chain is rebuilt and logged. During recovery under a new root it can't be rebuilt, and the shares are refused with the reason.
+- **Escrow and ceremony record after a restore.** A bundle or record the database lost is restored from the block store at boot, so a restore doesn't force a new ceremony: the pinned bundle (the pin authenticates it), or, unpinned, a bundle whose mirrored ceremony record verifies under the key. A record is restored only if its MAC verifies under the key.
+- **Generations.** Each older generation is sealed under the next one's key (its chain), so escrowing the newest generation recovers all of them. At boot under the same root, a missing or broken chain is rebuilt and logged. During recovery under a new root it can't be rebuilt, and the shares are refused with the reason. The newest generation never keeps a chain: a stale one is cleared at boot.
 - The key tables' migration `down` refuses while they hold rows.
