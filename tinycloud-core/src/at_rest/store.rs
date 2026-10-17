@@ -21,6 +21,16 @@ use crate::RecoveringConnection;
 
 pub type MirrorError = Box<dyn std::error::Error + Send + Sync>;
 
+/// The largest mirror object a [`KeyMirror`] reads. Key objects are a few
+/// hundred bytes; a larger one is junk and is never read into memory.
+pub const MAX_MIRROR_OBJECT: usize = 64 * 1024;
+
+/// A mirror object over [`MAX_MIRROR_OBJECT`]. The keyring skips it like
+/// any other unreadable object instead of failing.
+#[derive(Debug, thiserror::Error)]
+#[error("mirror object is larger than {MAX_MIRROR_OBJECT} bytes")]
+pub struct MirrorObjectTooLarge;
+
 /// Named control objects next to the node's blocks (`_tc/at-rest/…`). The S3
 /// and filesystem block stores implement it in the server crate.
 #[async_trait::async_trait]
@@ -447,7 +457,10 @@ impl KeyMirror for MemoryMirror {
 
     async fn get(&self, name: &str) -> Result<Option<Vec<u8>>, MirrorError> {
         self.check()?;
-        Ok(self.objects.lock().get(name).cloned())
+        match self.objects.lock().get(name) {
+            Some(bytes) if bytes.len() > MAX_MIRROR_OBJECT => Err(Box::new(MirrorObjectTooLarge)),
+            other => Ok(other.cloned()),
+        }
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<String>, MirrorError> {

@@ -23,6 +23,7 @@ use anyhow::{anyhow, bail, ensure, Context, Result};
 use dcap_qvl::TcbStatus;
 use serde::Deserialize;
 use sha2::{Digest, Sha256, Sha384};
+use tinycloud_at_rest_escrow::compose::{escape, AppCompose, RECIPIENTS_ENV, VERIFIED_FP_ENV};
 use tinycloud_at_rest_escrow::{
     binding_digest, recovery_binding, validate_nonce, EscrowBundle, RecoveryInfo,
 };
@@ -236,17 +237,20 @@ pub fn require_attested(info: &RecoveryInfo) -> Result<Vec<u8>> {
     Ok(quote)
 }
 
-/// What `verify-compose` found: each service's pinned image, plus the other
-/// app-compose settings the hash covers.
+/// What `verify-compose` found: each service's pinned image, the escrow
+/// values the compose sets literally, and the other app-compose settings
+/// the hash covers. All text is escaped for printing.
 #[derive(Debug)]
 pub struct ComposeReport {
     pub images: Vec<(String, String)>,
-    pub settings: Vec<String>,
+    pub recipients: Option<String>,
+    pub verified_fp: Option<String>,
+    pub settings: Vec<(String, String)>,
 }
 
 /// `compose-hash` pins container images only if the compose file names each
 /// image by digest. Check `app-compose.json` against the trust policy's
-/// `compose_hash`, then parse its compose YAML strictly (see `compose.rs`).
+/// `compose_hash`, then read it strictly (`tinycloud_at_rest_escrow::compose`).
 pub fn check_app_compose(app_compose: &[u8], trust: &TrustPolicy) -> Result<ComposeReport> {
     let digest = hex::encode(Sha256::digest(app_compose));
     ensure!(
@@ -254,15 +258,12 @@ pub fn check_app_compose(app_compose: &[u8], trust: &TrustPolicy) -> Result<Comp
         "app-compose.json hashes to {digest}, but the trust policy pins compose_hash {}",
         trust.compose_hash
     );
-    let doc: serde_json::Value =
-        serde_json::from_slice(app_compose).context("app-compose.json is not JSON")?;
-    let compose = doc
-        .get("docker_compose_file")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("app-compose.json has no docker_compose_file"))?;
+    let parsed = AppCompose::parse(app_compose)?;
     Ok(ComposeReport {
-        images: crate::compose::pinned_images(compose)?,
-        settings: crate::compose::other_settings(&doc),
+        images: parsed.pinned_images()?,
+        recipients: parsed.literal_env(RECIPIENTS_ENV)?.map(|v| escape(&v)),
+        verified_fp: parsed.literal_env(VERIFIED_FP_ENV)?.map(|v| escape(&v)),
+        settings: parsed.other_settings(),
     })
 }
 

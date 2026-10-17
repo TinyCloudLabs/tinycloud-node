@@ -1,6 +1,7 @@
 use std::io::Read;
 use std::sync::Arc;
 
+use base64::Engine as _;
 use sea_orm::{
     ColumnTrait, ConnectOptions, Database, DatabaseConnection, EntityTrait, QueryFilter,
 };
@@ -8,7 +9,7 @@ use sea_orm_migration::MigratorTrait;
 use tinycloud_at_rest_escrow::{wrap_share, EscrowBundle, HolderRecipient, SharePayload};
 
 use super::*;
-use crate::at_rest::store::MemoryMirror;
+use crate::at_rest::store::{MemoryMirror, MAX_MIRROR_OBJECT};
 use crate::models::{at_rest_escrow, at_rest_key, space_data_key};
 
 const ROOT: [u8; 64] = [7; 64];
@@ -433,17 +434,17 @@ async fn gate_requires_pinned_verified_escrow_for_the_configured_recipients() {
     assert_eq!(k.gate(false).await, Ok(GatePass::Verified { efp }));
     drop(k);
 
-    // New recipients in config re-split the same ARK: a new bundle, and the
-    // old pin no longer opens the gate.
+    // New recipients in config with the old pin removed re-split the same
+    // ARK: a new bundle that the old pin doesn't match.
     let changed = holders();
-    let k = open(&db, &mirror, &ROOT, config(&changed, Some(efp)))
+    let k = open(&db, &mirror, &ROOT, config(&changed, None))
         .await
         .unwrap();
     let new_efp = k.escrow_view().await.unwrap().unwrap().efp;
     assert_ne!(new_efp, efp);
     assert!(matches!(
         k.gate(false).await,
-        Err(GateRefusal::PinMismatch { .. })
+        Err(GateRefusal::NotPinned { .. })
     ));
     let bundles = at_rest_escrow::Entity::find().all(&db).await.unwrap();
     assert_eq!(bundles.len(), 2);
@@ -540,20 +541,39 @@ async fn rotation_keeps_old_generations_and_survives_recovery() {
 }
 
 #[tokio::test]
-async fn share_intake_is_rate_limited_per_boot() {
+async fn junk_never_spends_the_share_budget() {
     let (db, mirror, h) = (db().await, Arc::new(MemoryMirror::default()), holders());
     let k = open(&db, &mirror, &ROOT, config(&h, None)).await.unwrap();
-    for _ in 0..SHARE_BURST {
-        assert!(!matches!(
+    // Any amount of junk, or shares of another escrow, is refused but free.
+    let foreign = EscrowBundle::create(
+        &Ark::generate(),
+        ArkId::generate(),
+        1,
+        &h.recipients,
+        RecipientPolicy::AllowSoftware,
+    )
+    .unwrap();
+    let recipient = k.escrow_view().await.unwrap().unwrap().recovery_recipient;
+    for _ in 0..3 * SHARE_BURST {
+        assert!(matches!(
             k.submit_share(b"junk").await,
-            Err(ShareRefusal::RateLimited)
+            Err(ShareRefusal::Invalid(_))
+        ));
+        let wrapped = wrap_share(&recipient, &h.decrypt(&foreign, 0)).unwrap();
+        assert!(matches!(
+            k.submit_share(wrapped.as_bytes()).await,
+            Err(ShareRefusal::Invalid(_))
         ));
     }
+    // A genuine share still goes through after the junk...
     assert!(matches!(
-        k.submit_share(b"junk").await,
-        Err(ShareRefusal::RateLimited)
+        submit(&k, &h, 0).await,
+        Ok(ShareOutcome::Held { .. })
     ));
-    // Valid shares are throttled the same way.
+    // ...and only genuine submissions count against the per-boot budget.
+    for _ in 1..SHARE_BURST {
+        submit(&k, &h, 0).await.unwrap();
+    }
     assert!(matches!(
         submit(&k, &h, 0).await,
         Err(ShareRefusal::RateLimited)
@@ -901,27 +921,207 @@ async fn escrow_rows_or_any_mirror_object_block_provisioning() {
         .is_empty());
 }
 
-#[tokio::test]
-async fn a_newer_mirror_format_is_refused_not_guessed() {
-    let (db, mirror, h) = (db().await, Arc::new(MemoryMirror::default()), holders());
-    open(&db, &mirror, &ROOT, config(&h, None)).await.unwrap();
-    at_rest_key::Entity::delete_many().exec(&db).await.unwrap();
-    let name = mirror
-        .names()
-        .into_iter()
-        .find(|n| n.starts_with(ARK_MIRROR_PREFIX))
-        .unwrap();
-    let mut obj: serde_json::Value =
-        serde_json::from_slice(&mirror.get(&name).await.unwrap().unwrap()).unwrap();
-    obj["version"] = serde_json::json!(2);
+/// Plant an unauthenticated ARK row in the mirror, as a bucket writer could.
+async fn plant_ark(mirror: &MemoryMirror, generation: u32) {
+    let ark_id = ArkId::generate();
+    let forged = MirroredArk {
+        version: 1,
+        generation,
+        ark_id: hex::encode(ark_id.0),
+        w_label: W_LABEL.into(),
+        sealed: base64::engine::general_purpose::STANDARD.encode([0x41; 60]),
+        chain: Some(base64::engine::general_purpose::STANDARD.encode([0x42; 60])),
+        created_at: now_rfc3339(),
+    };
     mirror
-        .put(&name, serde_json::to_vec(&obj).unwrap())
+        .put(
+            &ark_mirror_name(generation, &hex::encode(ark_id.0)),
+            serde_json::to_vec(&forged).unwrap(),
+        )
         .await
         .unwrap();
+}
+
+/// Junk the parser must skip: not JSON, a newer format, and oversized.
+async fn plant_junk(mirror: &MemoryMirror) {
+    mirror
+        .put(&format!("{ARK_MIRROR_PREFIX}zzz.json"), b"<html>".to_vec())
+        .await
+        .unwrap();
+    let newer = serde_json::json!({"version": 2, "generation": 1});
+    mirror
+        .put(
+            &ark_mirror_name(1, &"f".repeat(32)),
+            serde_json::to_vec(&newer).unwrap(),
+        )
+        .await
+        .unwrap();
+    mirror
+        .put(
+            &ark_mirror_name(1, &"e".repeat(32)),
+            vec![b' '; MAX_MIRROR_OBJECT + 1],
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn forged_gapped_or_junk_mirror_rows_never_lock_or_stop_a_healthy_node() {
+    let (db, mirror, h) = (db().await, Arc::new(MemoryMirror::default()), holders());
+    let k = open(&db, &mirror, &ROOT, config(&h, None)).await.unwrap();
+    let dek = k.current_key("space-a").await.unwrap();
+    let efp = k.escrow_view().await.unwrap().unwrap().efp;
+    drop(k);
+    plant_ark(&mirror, 2).await; // forged next generation
+    plant_ark(&mirror, 4).await; // gap: no generation 3
+    plant_junk(&mirror).await;
+
+    for _ in 0..2 {
+        let k = open(&db, &mirror, &ROOT, config(&h, None)).await.unwrap();
+        assert_eq!(k.state(), KeyringState::Unlocked);
+        assert_eq!(k.current_key("space-a").await.unwrap().bytes(), dek.bytes());
+        let gens: Vec<i32> = AtRestStore::new(db.clone())
+            .keys()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.generation)
+            .collect();
+        assert_eq!(gens, vec![1], "nothing unauthenticated was stored");
+    }
+
+    // A new root still waits for the real generation and recovers with it.
+    let k = open(&db, &mirror, &NEW_ROOT, config(&h, Some(efp)))
+        .await
+        .unwrap();
+    assert_eq!(k.state(), KeyringState::Locked);
+    submit(&k, &h, 0).await.unwrap();
+    assert_eq!(submit(&k, &h, 1).await.unwrap(), ShareOutcome::Unlocked);
+    assert_eq!(
+        k.key("space-a", DekId::new(1)).await.unwrap().bytes(),
+        dek.bytes()
+    );
+}
+
+#[tokio::test]
+async fn an_empty_database_takes_back_only_authenticated_mirror_rows() {
+    let (db, mirror, h) = (db().await, Arc::new(MemoryMirror::default()), holders());
+    let k = open(&db, &mirror, &ROOT, config(&h, None)).await.unwrap();
+    let dek = k.current_key("space-a").await.unwrap();
+    k.rotate_ark().await.unwrap();
+    let efp = k.escrow_view().await.unwrap().unwrap().efp;
+    drop(k);
+    plant_ark(&mirror, 3).await;
+    plant_junk(&mirror).await;
+
+    // A restore to before any key row, same root: generations 1 and 2 come
+    // back (they authenticate); the forged generation 3 doesn't.
+    at_rest_key::Entity::delete_many().exec(&db).await.unwrap();
+    let k = open(&db, &mirror, &ROOT, config(&h, None)).await.unwrap();
+    assert_eq!(k.state(), KeyringState::Unlocked);
+    assert_eq!(
+        k.key("space-a", DekId::new(1)).await.unwrap().bytes(),
+        dek.bytes()
+    );
+    assert_eq!(at_rest_key::Entity::find().all(&db).await.unwrap().len(), 2);
+    drop(k);
+
+    // The same restore under a new root: nothing authenticates until the
+    // pinned escrow's shares do; then the rows are stored, resealed.
+    at_rest_key::Entity::delete_many().exec(&db).await.unwrap();
+    let k = open(&db, &mirror, &NEW_ROOT, config(&h, Some(efp)))
+        .await
+        .unwrap();
+    assert_eq!(k.state(), KeyringState::Locked);
+    assert!(at_rest_key::Entity::find()
+        .all(&db)
+        .await
+        .unwrap()
+        .is_empty());
+    submit(&k, &h, 2).await.unwrap();
+    assert_eq!(submit(&k, &h, 0).await.unwrap(), ShareOutcome::Unlocked);
+    assert_eq!(
+        k.key("space-a", DekId::new(1)).await.unwrap().bytes(),
+        dek.bytes()
+    );
+    assert_eq!(at_rest_key::Entity::find().all(&db).await.unwrap().len(), 2);
+    drop(k);
+    let k = open(&db, &mirror, &NEW_ROOT, config(&h, Some(efp)))
+        .await
+        .unwrap();
+    assert_eq!(k.state(), KeyringState::Unlocked);
+
+    // Only junk and no rows at all: fail closed, never provision over it.
+    let (db, mirror) = (self::db().await, Arc::new(MemoryMirror::default()));
+    plant_junk(&mirror).await;
     assert!(matches!(
         open(&db, &mirror, &ROOT, config(&h, None)).await,
-        Err(AtRestError::Mirror(e)) if e.contains("version 2")
+        Err(AtRestError::Inconsistent(_))
     ));
+    assert!(at_rest_key::Entity::find()
+        .all(&db)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn a_mirrored_data_key_for_another_space_is_never_stored() {
+    let (db, mirror, h) = (db().await, Arc::new(MemoryMirror::default()), holders());
+    let k = open(&db, &mirror, &ROOT, config(&h, None)).await.unwrap();
+    let a = k.current_key("space-a").await.unwrap();
+    // A bucket writer copies space-a's mirrored DEK to space-b's name.
+    let keys = k.keys().unwrap();
+    let a_name = dek_mirror_name(&keys.dek_tag.tag("space-a"), 1);
+    let b_name = dek_mirror_name(&keys.dek_tag.tag("space-b"), 1);
+    let copied = mirror.get(&a_name).await.unwrap().unwrap();
+    mirror.put(&b_name, copied.clone()).await.unwrap();
+
+    // It doesn't authenticate for space-b: not stored, not served, replaced.
+    assert!(matches!(
+        k.key("space-b", DekId::new(1)).await,
+        Err(DataKeyError::UnknownKey { .. })
+    ));
+    assert!(AtRestStore::new(db.clone())
+        .dek("space-b", 1)
+        .await
+        .unwrap()
+        .is_none());
+    let b = k.current_key("space-b").await.unwrap();
+    assert_ne!(b.bytes(), a.bytes());
+    assert_ne!(mirror.get(&b_name).await.unwrap().unwrap(), copied);
+}
+
+#[tokio::test]
+async fn a_pinned_escrow_is_never_re_split() {
+    let (db, mirror, h) = (db().await, Arc::new(MemoryMirror::default()), holders());
+    let k = open(&db, &mirror, &ROOT, config(&h, None)).await.unwrap();
+    let efp = k.escrow_view().await.unwrap().unwrap().efp;
+    drop(k);
+    // Different recipients with the pin still set: refused, nothing written.
+    let changed = holders();
+    assert!(matches!(
+        open(&db, &mirror, &ROOT, config(&changed, Some(efp))).await,
+        Err(AtRestError::EscrowPinned)
+    ));
+    assert_eq!(
+        at_rest_escrow::Entity::find().all(&db).await.unwrap().len(),
+        1
+    );
+    // Pinned and the database lost the bundle: the pinned one comes back
+    // from the mirror, no new split.
+    at_rest_escrow::Entity::delete_many()
+        .exec(&db)
+        .await
+        .unwrap();
+    let k = open(&db, &mirror, &ROOT, config(&h, Some(efp)))
+        .await
+        .unwrap();
+    assert_eq!(k.escrow_view().await.unwrap().unwrap().efp, efp);
+    assert_eq!(
+        at_rest_escrow::Entity::find().all(&db).await.unwrap().len(),
+        1
+    );
 }
 
 #[tokio::test]

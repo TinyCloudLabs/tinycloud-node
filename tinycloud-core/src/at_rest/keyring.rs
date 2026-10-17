@@ -22,8 +22,8 @@ use super::hierarchy::{
     Kek, WrapKey, W_LABEL,
 };
 use super::store::{
-    ark_mirror_name, dek_mirror_name, escrow_mirror_name, AtRestStore, KeyMirror, MirroredArk,
-    MirroredDek, ARK_MIRROR_PREFIX, MIRROR_PREFIX,
+    ark_mirror_name, dek_mirror_name, escrow_mirror_name, AtRestStore, KeyMirror,
+    MirrorObjectTooLarge, MirroredArk, MirroredDek, ARK_MIRROR_PREFIX, MIRROR_PREFIX,
 };
 use super::{DataKey, DataKeyError, DataKeyProvider, DekId, ObjectNameKey};
 use crate::models::{at_rest_escrow, at_rest_key, space_data_key};
@@ -60,6 +60,8 @@ pub enum AtRestError {
     Inconsistent(&'static str),
     #[error("at-rest key change lost a race: {0}")]
     Conflict(&'static str),
+    #[error("at_rest.escrow.verified_fp pins an escrow that is not for the configured recipients and the newest key; the node never re-splits while a fingerprint is pinned (remove the pin in the attested compose to change holders)")]
+    EscrowPinned,
     #[error("at-rest escrow: {0}")]
     Escrow(#[from] EscrowError),
     #[error("at-rest keys are locked")]
@@ -226,6 +228,21 @@ fn mirror_err(e: impl std::fmt::Display) -> AtRestError {
     AtRestError::Mirror(e.to_string())
 }
 
+/// A mirror read where an oversized object counts as absent (it can't be a
+/// key object) rather than an error that would stop the caller.
+async fn get_capped(
+    mirror: &dyn KeyMirror,
+    name: &str,
+) -> Result<Option<Vec<u8>>, super::store::MirrorError> {
+    match mirror.get(name).await {
+        Err(e) if e.is::<MirrorObjectTooLarge>() => {
+            tracing::warn!(object = ?name, "ignoring an oversized at-rest mirror object");
+            Ok(None)
+        }
+        other => other,
+    }
+}
+
 fn ark_id_of(row: &at_rest_key::Model) -> Result<ArkId, AtRestError> {
     row.ark_id
         .as_slice()
@@ -240,9 +257,6 @@ fn backend(e: impl std::error::Error + Send + Sync + 'static) -> DataKeyError {
 
 /// Generations must be exactly 1..=n.
 fn check_contiguous(rows: &[at_rest_key::Model]) -> Result<(), AtRestError> {
-    if rows.is_empty() {
-        return Err(AtRestError::NotProvisioned);
-    }
     for (i, row) in rows.iter().enumerate() {
         if row.generation != i as i32 + 1 {
             return Err(AtRestError::Inconsistent("ARK generations are not 1..n"));
@@ -251,93 +265,259 @@ fn check_contiguous(rows: &[at_rest_key::Model]) -> Result<(), AtRestError> {
     Ok(())
 }
 
-/// A generation whose chain had to be rewritten: (generation, new chain).
-type Rechain = (u32, Vec<u8>);
-
-/// Open every generation from the rows under this node's W. `Ok(None)`
-/// means the newest doesn't open under W (locked).
-fn unlock_rows(
-    w: &WrapKey,
-    rows: &[at_rest_key::Model],
-) -> Result<Option<(Keys, Vec<Rechain>)>, AtRestError> {
-    check_contiguous(rows)?;
-    let newest = rows.last().expect("check_contiguous: non-empty");
-    let newest_id = ark_id_of(newest)?;
-    let Ok(ark) = open_ark(
-        w,
-        &newest.sealed,
-        &newest_id,
-        newest.generation as u32,
-        &newest.w_label,
-    ) else {
-        return Ok(None);
-    };
-    keys_from_newest(rows, ark, Some(w)).map(Some)
+/// A row that may hold generation `row.generation`'s ARK. Mirror rows are
+/// unauthenticated until a chain from an authenticated ARK opens them.
+#[derive(Clone)]
+struct Candidate {
+    row: at_rest_key::Model,
+    from_db: bool,
 }
 
-/// Walk down from the newest ARK. Every older generation must open **by its
-/// chain**: that is the only path recovery has, so a broken chain is never
-/// accepted silently.
+/// Candidates per generation: the database row first, then mirrored rows
+/// that differ from it.
+type Candidates = BTreeMap<u32, Vec<Candidate>>;
+
+fn candidates(db: &[at_rest_key::Model], mirrored: Vec<at_rest_key::Model>) -> Candidates {
+    let mut out = Candidates::new();
+    for row in db {
+        out.entry(row.generation as u32)
+            .or_default()
+            .push(Candidate {
+                row: row.clone(),
+                from_db: true,
+            });
+    }
+    for row in mirrored {
+        let list = out.entry(row.generation as u32).or_default();
+        if !list.iter().any(|c| c.row == row) {
+            list.push(Candidate {
+                row,
+                from_db: false,
+            });
+        }
+    }
+    out
+}
+
+/// Walk down from an authenticated ARK at `top`. For every older generation,
+/// pick the candidate whose chain opens under the newer ARK. That is the
+/// only path recovery has, so nothing is accepted because W alone opens it.
 ///
-/// With `repair_w` (boot under the root that sealed the rows), a chain that
-/// is missing or doesn't open is rebuilt if the generation opens under W,
-/// and returned for the caller to store. Without it (recovery under a new
-/// root), a broken chain is an error.
-fn keys_from_newest(
-    rows: &[at_rest_key::Model],
-    newest_ark: Ark,
+/// With `repair_w` (boot under the root that sealed the rows), a generation
+/// with no working chain is accepted if it opens under W, and its chain is
+/// rebuilt (logged). Without it (recovery under a new root), that is an
+/// error.
+///
+/// Returns the rows for 1..=top as they must be stored, and the keys.
+fn resolve(
+    cands: &Candidates,
+    top: &at_rest_key::Model,
+    top_ark: Ark,
     repair_w: Option<&WrapKey>,
-) -> Result<(Keys, Vec<Rechain>), AtRestError> {
-    check_contiguous(rows)?;
+) -> Result<(Vec<at_rest_key::Model>, Keys), AtRestError> {
+    let top_g = u32::try_from(top.generation)
+        .map_err(|_| AtRestError::Inconsistent("ARK generation out of range"))?;
+    let top_id = ark_id_of(top)?;
+    let mut chosen = vec![top.clone()];
     let mut gens = BTreeMap::new();
-    let mut rechain = Vec::new();
-    let mut newer: Option<(Ark, ArkId)> = None;
-    for row in rows.iter().rev() {
-        let id = ark_id_of(row)?;
-        let g = row.generation as u32;
-        let this = match &newer {
-            None => newest_ark.clone(),
-            Some((n_ark, n_id)) => {
-                let by_chain = row
-                    .chain
-                    .as_deref()
-                    .and_then(|c| open_chain(n_ark, n_id, c, &id, g).ok());
-                match (by_chain, repair_w) {
-                    (Some(ark), _) => ark,
-                    (None, Some(w)) => {
-                        let ark = open_ark(w, &row.sealed, &id, g, &row.w_label).map_err(|_| {
-                            AtRestError::Inconsistent(
-                                "an older ARK generation opens neither by its chain nor under W",
-                            )
-                        })?;
-                        rechain.push((g, chain_ark(n_ark, n_id, &ark, &id, g)));
-                        ark
-                    }
-                    (None, None) => {
-                        return Err(AtRestError::Inconsistent(
-                            "an older ARK generation's chain is missing or does not open",
-                        ))
-                    }
-                }
+    gens.insert(
+        top_g,
+        Generation {
+            ark_id: top_id,
+            kek: Kek::derive(&top_ark),
+            ark: top_ark.clone(),
+        },
+    );
+    let mut newer = (top_ark, top_id);
+    for g in (1..top_g).rev() {
+        let list = cands.get(&g).map(Vec::as_slice).unwrap_or_default();
+        let by_chain = list.iter().find_map(|c| {
+            let id = ark_id_of(&c.row).ok()?;
+            let chain = c.row.chain.as_deref()?;
+            let ark = open_chain(&newer.0, &newer.1, chain, &id, g).ok()?;
+            Some((c.row.clone(), ark, id))
+        });
+        let found = match (by_chain, repair_w) {
+            (Some(found), _) => found,
+            (None, Some(w)) => list
+                .iter()
+                .find_map(|c| {
+                    let id = ark_id_of(&c.row).ok()?;
+                    let ark = open_ark(w, &c.row.sealed, &id, g, &c.row.w_label).ok()?;
+                    let mut row = c.row.clone();
+                    row.chain = Some(chain_ark(&newer.0, &newer.1, &ark, &id, g));
+                    tracing::warn!(
+                        generation = g,
+                        "at-rest ARK chain was missing or did not open; rebuilt it from the newer generation"
+                    );
+                    Some((row, ark, id))
+                })
+                .ok_or(AtRestError::Inconsistent(
+                    "an older ARK generation opens neither by its chain nor under W",
+                ))?,
+            (None, None) => {
+                return Err(AtRestError::Inconsistent(
+                    "an older ARK generation's chain is missing or does not open",
+                ))
             }
         };
-        newer = Some((this.clone(), id));
+        let (row, ark, id) = found;
         gens.insert(
             g,
             Generation {
                 ark_id: id,
-                kek: Kek::derive(&this),
-                ark: this,
+                kek: Kek::derive(&ark),
+                ark: ark.clone(),
             },
         );
+        chosen.push(row);
+        newer = (ark, id);
     }
-    let ark_1 = &gens.get(&1).expect("check_contiguous: generation 1").ark;
+    chosen.reverse();
+    let ark_1 = &gens.get(&1).expect("the walk ends at generation 1").ark;
     let keys = Keys {
         nk: object_name_key(ark_1),
         dek_tag: DekTagKey::derive(ark_1),
         gens,
     };
-    Ok((keys, rechain))
+    Ok((chosen, keys))
+}
+
+/// Unlock under this root's W: the newest generation (at least the
+/// database's newest) whose row opens under W and whose chain reaches
+/// generation 1. Mirrored generations that don't authenticate or don't
+/// connect are skipped with a warning. `Ok(None)`: nothing opens (locked).
+fn unlock_under_w(
+    w: &WrapKey,
+    db_newest: u32,
+    cands: &Candidates,
+) -> Result<Option<(Vec<at_rest_key::Model>, Keys)>, AtRestError> {
+    for (&g, list) in cands.iter().rev() {
+        if g < db_newest.max(1) {
+            break;
+        }
+        for c in list {
+            let Ok(id) = ark_id_of(&c.row) else { continue };
+            let Ok(ark) = open_ark(w, &c.row.sealed, &id, g, &c.row.w_label) else {
+                continue;
+            };
+            match resolve(cands, &c.row, ark, Some(w)) {
+                Ok(found) => return Ok(Some(found)),
+                // The database's own newest row: a broken store, fail loudly.
+                Err(e) if c.from_db => return Err(e),
+                Err(e) => tracing::warn!(
+                    generation = g,
+                    error = %e,
+                    "ignoring a mirrored ARK generation whose chain does not reach generation 1"
+                ),
+            }
+        }
+        if g > db_newest {
+            tracing::warn!(
+                generation = g,
+                "ignoring a mirrored ARK generation the database lacks: it does not authenticate under this node's root"
+            );
+        }
+    }
+    Ok(None)
+}
+
+/// Store what `resolve` chose: insert generations the database lacks, and
+/// update the seal or chain of those it has. Every row was authenticated.
+async fn persist_chosen(
+    store: &AtRestStore,
+    db: &[at_rest_key::Model],
+    chosen: &[at_rest_key::Model],
+) -> Result<(), AtRestError> {
+    for row in chosen {
+        match db.iter().find(|d| d.generation == row.generation) {
+            None => {
+                tracing::warn!(
+                    generation = row.generation,
+                    "at-rest ARK row was missing from the database; restored an authenticated copy from the mirror"
+                );
+                store.insert_key(row.clone()).await?;
+            }
+            Some(d) if d.ark_id == row.ark_id => {
+                if d.sealed != row.sealed || d.w_label != row.w_label {
+                    store
+                        .reseal_key(row.generation, &row.w_label, row.sealed.clone())
+                        .await?;
+                }
+                if d.chain != row.chain {
+                    if let Some(chain) = &row.chain {
+                        store.set_chain(row.generation, chain.clone()).await?;
+                    }
+                }
+            }
+            Some(_) => {
+                return Err(AtRestError::Inconsistent(
+                    "the database holds a different ARK for a generation the authenticated chain covers",
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Mirrored ARK rows, unauthenticated. Junk objects (not JSON, a newer
+/// format, bad fields) are skipped with a warning; only mirror I/O fails.
+async fn mirrored_rows(mirror: &dyn KeyMirror) -> Result<Vec<at_rest_key::Model>, AtRestError> {
+    let mut names = mirror.list(ARK_MIRROR_PREFIX).await.map_err(mirror_err)?;
+    names.sort();
+    let mut rows = Vec::new();
+    for name in names {
+        let Some(bytes) = get_capped(mirror, &name).await.map_err(mirror_err)? else {
+            continue;
+        };
+        let parsed = serde_json::from_slice::<MirroredArk>(&bytes)
+            .map_err(|e| e.to_string())
+            .and_then(|m| m.into_row().map_err(|e| e.to_string()));
+        match parsed {
+            Ok(row) if row.generation >= 1 && row.ark_id.len() == 16 => rows.push(row),
+            Ok(_) => {
+                tracing::warn!(object = ?name, "ignoring an at-rest mirror object with bad fields")
+            }
+            Err(error) => {
+                tracing::warn!(object = ?name, %error, "ignoring an unreadable at-rest mirror object")
+            }
+        }
+    }
+    Ok(rows)
+}
+
+/// The generation a locked node waits for. The pinned bundle names it when
+/// one is found (the pin is attested config); otherwise the database's
+/// newest; otherwise (empty database) the mirror's only contiguous run.
+fn locked_target(
+    db: &[at_rest_key::Model],
+    cands: &Candidates,
+    pinned: Option<&EscrowBundle>,
+) -> Result<(u32, ArkId), AtRestError> {
+    if let Some(b) = pinned {
+        let known = cands
+            .get(&b.generation)
+            .is_some_and(|l| l.iter().any(|c| c.row.ark_id == b.ark_id.0));
+        if known && b.generation as usize >= db.len() {
+            return Ok((b.generation, b.ark_id));
+        }
+    }
+    if let Some(newest) = db.last() {
+        return Ok((newest.generation as u32, ark_id_of(newest)?));
+    }
+    let mut target = None;
+    for g in 1.. {
+        match cands.get(&g).map(Vec::as_slice) {
+            Some([only]) => target = Some((g, ark_id_of(&only.row)?)),
+            Some([]) | None => break,
+            Some(_) => return Err(AtRestError::Inconsistent(
+                "the mirror holds conflicting ARK rows and no pinned escrow names the right one",
+            )),
+        }
+    }
+    target.ok_or(AtRestError::Inconsistent(
+        "sealed at-rest material exists but no ARK row or mirrored ARK was found",
+    ))
 }
 
 pub struct AtRestKeyring {
@@ -358,95 +538,30 @@ pub struct AtRestKeyring {
 impl AtRestKeyring {
     /// Load the keyring at boot.
     ///
-    /// - Mirrored ARK generations missing from the database (a restore to
-    ///   an earlier point) are put back first.
-    /// - Rows open under this root's W: unlocked. A chain that is missing or
+    /// - The newest generation that opens under this root's W, with a chain
+    ///   down to generation 1, unlocks the keys. Mirrored generations the
+    ///   database lacks (a restore to an earlier point) are stored only once
+    ///   they authenticate this way; anything else in the mirror (forged,
+    ///   junk, gapped) is skipped with a warning. A chain that is missing or
     ///   doesn't open is rebuilt and logged.
-    /// - Rows exist but don't open: **locked** (data intact; recover with two
-    ///   shares).
-    /// - No rows: provision generation 1 if `config.provision`, else not
-    ///   provisioned. Never when any sealed material exists without an ARK
-    ///   (data keys, escrow rows, any mirror object), and never after a
-    ///   store or mirror error.
+    /// - Rows exist but nothing opens: **locked** (data intact; recover with
+    ///   two shares of the pinned escrow).
+    /// - No rows anywhere: provision generation 1 if `config.provision`,
+    ///   else not provisioned. Never when any sealed material exists without
+    ///   an ARK (data keys, escrow rows, any mirror object), and never after
+    ///   a store or mirror error.
     pub async fn open(
         store: AtRestStore,
         mirror: Arc<dyn KeyMirror>,
         root: &[u8],
         config: KeyringConfig,
     ) -> Result<Self, AtRestError> {
-        let w = WrapKey::derive(root);
-        Self::restore_rows(&store, &*mirror).await?;
-        let mut rows = store.keys().await?;
-        if rows.is_empty() {
-            if store.has_space_keys().await?
-                || store.has_escrow_rows().await?
-                || !mirror
-                    .list(MIRROR_PREFIX)
-                    .await
-                    .map_err(mirror_err)?
-                    .is_empty()
-            {
-                // Another process may have provisioned since we read: its
-                // ARK row is written before anything else.
-                rows = store.keys().await?;
-                if rows.is_empty() {
-                    return Err(AtRestError::Inconsistent(
-                        "sealed at-rest material exists but no ARK row or mirrored ARK was found",
-                    ));
-                }
-            } else if config.provision {
-                let ark = Ark::generate();
-                let ark_id = ArkId::generate();
-                store
-                    .insert_key(at_rest_key::Model {
-                        generation: 1,
-                        ark_id: ark_id.0.to_vec(),
-                        w_label: W_LABEL.into(),
-                        sealed: seal_ark(&w, &ark, &ark_id, 1),
-                        chain: None,
-                        created_at: now_rfc3339(),
-                    })
-                    .await?;
-                // Another process may have won the insert; use what's stored.
-                rows = store.keys().await?;
-                if rows.first().map(|r| r.ark_id.as_slice()) == Some(&ark_id.0[..]) {
-                    tracing::info!(generation = 1, %ark_id, "at-rest root key provisioned");
-                }
-            }
-        }
-        let phase = if rows.is_empty() {
-            Phase::NotProvisioned
-        } else {
-            match unlock_rows(&w, &rows)? {
-                Some((keys, rechain)) => {
-                    if !rechain.is_empty() {
-                        Self::store_rechain(&store, rechain).await?;
-                        rows = store.keys().await?;
-                    }
-                    for row in &rows {
-                        Self::mirror_row(&*mirror, row).await?;
-                    }
-                    Phase::Unlocked(Arc::new(keys))
-                }
-                None => {
-                    let newest = rows.last().expect("non-empty");
-                    tracing::warn!(
-                        generation = newest.generation,
-                        "at-rest keys locked: this node's root cannot unseal the ARK"
-                    );
-                    Phase::Locked {
-                        generation: newest.generation as u32,
-                        ark_id: ark_id_of(newest)?,
-                    }
-                }
-            }
-        };
         let keyring = Self {
             store,
             mirror,
-            w,
+            w: WrapKey::derive(root),
             config,
-            phase: RwLock::new(phase),
+            phase: RwLock::new(Phase::NotProvisioned),
             deks: Mutex::new(LruCache::new(
                 NonZeroUsize::new(DEK_CACHE).expect("non-zero"),
             )),
@@ -457,73 +572,94 @@ impl AtRestKeyring {
             intake: tokio::sync::Mutex::new(ShareIntake::new()),
             dek_create: tokio::sync::Mutex::new(()),
         };
+        keyring.load().await?;
         if keyring.state() == KeyringState::Unlocked {
             keyring.ensure_escrow().await?;
         }
         Ok(keyring)
     }
 
-    async fn store_rechain(store: &AtRestStore, rechain: Vec<Rechain>) -> Result<(), AtRestError> {
-        for (g, chain) in rechain {
-            tracing::warn!(
-                generation = g,
-                "at-rest ARK chain was missing or did not open; rebuilt it from the newer generation"
-            );
-            store.set_chain(g as i32, chain).await?;
-        }
-        Ok(())
-    }
-
-    /// Put back mirrored ARK generations the database lacks, and chains the
-    /// database lost. Both are AEAD-checked when used, so a bad mirror
-    /// object can make the node fail closed but never feeds it a key.
-    async fn restore_rows(store: &AtRestStore, mirror: &dyn KeyMirror) -> Result<(), AtRestError> {
-        let mut names = mirror.list(ARK_MIRROR_PREFIX).await.map_err(mirror_err)?;
-        if names.is_empty() {
-            return Ok(());
-        }
-        names.sort();
-        let have: BTreeMap<i32, at_rest_key::Model> = store
-            .keys()
-            .await?
-            .into_iter()
-            .map(|r| (r.generation, r))
-            .collect();
-        for name in names {
-            let bytes =
-                mirror
-                    .get(&name)
+    /// Read the stored and mirrored rows and set the phase.
+    async fn load(&self) -> Result<(), AtRestError> {
+        let mut db = self.store.keys().await?;
+        check_contiguous(&db)?;
+        let mirrored = mirrored_rows(&*self.mirror).await?;
+        if db.is_empty() && mirrored.is_empty() {
+            if self.store.has_space_keys().await?
+                || self.store.has_escrow_rows().await?
+                || !self
+                    .mirror
+                    .list(MIRROR_PREFIX)
                     .await
                     .map_err(mirror_err)?
-                    .ok_or(AtRestError::Inconsistent(
-                        "mirrored ARK vanished while listing",
-                    ))?;
-            let row = serde_json::from_slice::<MirroredArk>(&bytes)
-                .map_err(mirror_err)?
-                .into_row()
-                .map_err(mirror_err)?;
-            match have.get(&row.generation) {
-                None => {
-                    tracing::warn!(
-                        generation = row.generation,
-                        "at-rest ARK row was missing from the database; restored from the mirror"
-                    );
-                    store.insert_key(row).await?;
+                    .is_empty()
+            {
+                // Another process may have provisioned since we read: its
+                // ARK row is written before anything else.
+                db = self.store.keys().await?;
+                if db.is_empty() {
+                    return Err(AtRestError::Inconsistent(
+                        "sealed at-rest material exists but no ARK row or mirrored ARK was found",
+                    ));
                 }
-                Some(db)
-                    if db.chain.is_none() && row.chain.is_some() && db.ark_id == row.ark_id =>
-                {
-                    tracing::warn!(
-                        generation = row.generation,
-                        "at-rest ARK chain was missing from the database; restored from the mirror"
-                    );
-                    store
-                        .set_chain(row.generation, row.chain.expect("checked"))
-                        .await?;
+            } else if self.config.provision {
+                let ark = Ark::generate();
+                let ark_id = ArkId::generate();
+                self.store
+                    .insert_key(at_rest_key::Model {
+                        generation: 1,
+                        ark_id: ark_id.0.to_vec(),
+                        w_label: W_LABEL.into(),
+                        sealed: seal_ark(&self.w, &ark, &ark_id, 1),
+                        chain: None,
+                        created_at: now_rfc3339(),
+                    })
+                    .await?;
+                // Another process may have won the insert; use what's stored.
+                db = self.store.keys().await?;
+                if db.first().map(|r| r.ark_id.as_slice()) == Some(&ark_id.0[..]) {
+                    tracing::info!(generation = 1, %ark_id, "at-rest root key provisioned");
                 }
-                Some(_) => {}
+            } else {
+                return Ok(());
             }
+            check_contiguous(&db)?;
         }
+        let cands = candidates(&db, mirrored);
+        if let Some((mut chosen, keys)) = unlock_under_w(&self.w, db.len() as u32, &cands)? {
+            // A generation the database lacks is stored with a fresh seal
+            // under W, never with the mirror's bytes.
+            for row in chosen.iter_mut() {
+                if !db.iter().any(|d| d.generation == row.generation) {
+                    let g = row.generation as u32;
+                    let gen = &keys.gens[&g];
+                    row.sealed = seal_ark(&self.w, &gen.ark, &gen.ark_id, g);
+                    row.w_label = W_LABEL.into();
+                }
+            }
+            persist_chosen(&self.store, &db, &chosen).await?;
+            for row in self.store.keys().await? {
+                Self::mirror_row(&*self.mirror, &row).await?;
+            }
+            *self.phase.write() = Phase::Unlocked(Arc::new(keys));
+            return Ok(());
+        }
+        // A stored or mirrored escrow bundle that can't be read must not
+        // stop the boot: the node then just has no bundle to recover with.
+        let pinned = match self.pinned_bundle().await {
+            Ok(b) => b,
+            Err(e @ (AtRestError::Store(_) | AtRestError::Mirror(_))) => return Err(e),
+            Err(error) => {
+                tracing::warn!(%error, "ignoring the pinned escrow bundle: it can't be read");
+                None
+            }
+        };
+        let (generation, ark_id) = locked_target(&db, &cands, pinned.as_ref())?;
+        tracing::warn!(
+            generation,
+            "at-rest keys locked: this node's root cannot unseal the ARK"
+        );
+        *self.phase.write() = Phase::Locked { generation, ark_id };
         Ok(())
     }
 
@@ -533,7 +669,12 @@ impl AtRestKeyring {
     ) -> Result<(), AtRestError> {
         let name = ark_mirror_name(row.generation as u32, &hex::encode(&row.ark_id));
         let body = serde_json::to_vec(&MirroredArk::from_row(row)).expect("serializable");
-        if mirror.get(&name).await.map_err(mirror_err)?.as_deref() != Some(body.as_slice()) {
+        if get_capped(mirror, &name)
+            .await
+            .map_err(mirror_err)?
+            .as_deref()
+            != Some(body.as_slice())
+        {
             mirror.put(&name, body).await.map_err(mirror_err)?;
         }
         Ok(())
@@ -566,8 +707,14 @@ impl AtRestKeyring {
     }
 
     /// Make sure the newest generation is escrowed to exactly the configured
-    /// holders. A different holder list re-splits the same ARK into a new
-    /// bundle (new EFP, so a new ceremony); old bundles are kept inactive.
+    /// holders.
+    ///
+    /// Without a pin, a different holder list re-splits the same ARK into a
+    /// new bundle (new EFP, so a new ceremony); old bundles are kept
+    /// inactive. With `verified_fp` pinned, the node **never** re-splits:
+    /// the only bundle it uses is the pinned one (re-activated if the
+    /// database lost it). Changing holders means removing the pin in the
+    /// attested compose first.
     async fn ensure_escrow(&self) -> Result<Option<EscrowBundle>, AtRestError> {
         if self.config.holders.is_empty() {
             return Ok(None);
@@ -580,6 +727,25 @@ impl AtRestKeyring {
                 self.mirror_escrow(&row).await?;
                 return Ok(Some(bundle));
             }
+        }
+        if let Some(pin) = self.config.pinned_efp {
+            let usable = self.pinned_bundle().await?.filter(|b| {
+                b.holders() == self.config.holders && b.ark_id == gen.ark_id && b.generation == g
+            });
+            let Some(bundle) = usable else {
+                return Err(AtRestError::EscrowPinned);
+            };
+            let row = at_rest_escrow::Model {
+                efp: pin.to_string(),
+                generation: g as i32,
+                bundle: serde_json::to_string(&bundle).expect("serializable"),
+                active: true,
+                record: None,
+                created_at: now_rfc3339(),
+            };
+            self.store.activate_escrow(row.clone()).await?;
+            self.mirror_escrow(&row).await?;
+            return Ok(Some(bundle));
         }
         let bundle = EscrowBundle::create(
             &gen.ark,
@@ -611,7 +777,11 @@ impl AtRestKeyring {
             return Ok(());
         }
         let name = escrow_mirror_name(&row.efp);
-        if self.mirror.get(&name).await.map_err(mirror_err)?.is_none() {
+        if get_capped(&*self.mirror, &name)
+            .await
+            .map_err(mirror_err)?
+            .is_none()
+        {
             self.mirror
                 .put(&name, row.bundle.clone().into_bytes())
                 .await
@@ -631,9 +801,7 @@ impl AtRestKeyring {
         if let Some(row) = self.store.escrow(&efp).await? {
             return Self::parse_bundle(&row).map(Some);
         }
-        let Some(bytes) = self
-            .mirror
-            .get(&escrow_mirror_name(&efp))
+        let Some(bytes) = get_capped(&*self.mirror, &escrow_mirror_name(&efp))
             .await
             .map_err(mirror_err)?
         else {
@@ -791,16 +959,18 @@ impl AtRestKeyring {
     /// Take one wrapped share (age file to this boot's recovery recipient).
     ///
     /// Each share is checked against its commitment before it occupies one of
-    /// three slots (one per index); submissions are rate limited per boot.
+    /// three slots (one per index). Only shares that pass (decrypt and match
+    /// a commitment) spend this boot's submission budget, so junk can't
+    /// starve genuine holders; the HTTP layer limits failures per client.
     /// Share bytes are never logged.
     pub async fn submit_share(&self, wrapped: &[u8]) -> Result<ShareOutcome, ShareRefusal> {
         let mut intake = self.intake.lock().await;
-        if !intake.take_token() {
-            return Err(ShareRefusal::RateLimited);
-        }
         let share = intake.identity.open(wrapped)?;
         let bundle = self.intake_bundle().await?;
         bundle.verify_share(&share)?;
+        if !intake.take_token() {
+            return Err(ShareRefusal::RateLimited);
+        }
         let efp = bundle.fingerprint();
         if intake.efp != Some(efp) {
             intake.clear();
@@ -863,28 +1033,35 @@ impl AtRestKeyring {
         Ok(outcome)
     }
 
-    /// Locked → unlocked with a recovered newest ARK: re-seal every
-    /// generation under this node's W, mirror, and serve keys.
+    /// Locked → unlocked with a recovered ARK: authenticate every older
+    /// generation by its chain (database rows first, then mirrored ones),
+    /// re-seal all of them under this node's W, store, mirror, serve keys.
     async fn unlock_with(&self, ark: Ark, bundle: &EscrowBundle) -> Result<(), AtRestError> {
-        let rows = self.store.keys().await?;
-        let newest = rows.last().ok_or(AtRestError::NotProvisioned)?;
-        if newest.generation as u32 != bundle.generation || ark_id_of(newest)? != bundle.ark_id {
+        let db = self.store.keys().await?;
+        check_contiguous(&db)?;
+        if (bundle.generation as usize) < db.len() {
             return Err(AtRestError::Inconsistent(
                 "recovered ARK is not the newest generation",
             ));
         }
+        let cands = candidates(&db, mirrored_rows(&*self.mirror).await?);
+        let top = cands
+            .get(&bundle.generation)
+            .and_then(|l| l.iter().find(|c| c.row.ark_id == bundle.ark_id.0))
+            .map(|c| c.row.clone())
+            .ok_or(AtRestError::Inconsistent(
+                "no stored or mirrored row for the recovered generation",
+            ))?;
         // Under a new root the rows still carry the old W: every older
         // generation must open by its chain, or recovery fails loudly.
-        let (keys, _) = keys_from_newest(&rows, ark, None)?;
-        for (g, gen) in &keys.gens {
-            self.store
-                .reseal_key(
-                    *g as i32,
-                    W_LABEL,
-                    seal_ark(&self.w, &gen.ark, &gen.ark_id, *g),
-                )
-                .await?;
+        let (mut chosen, keys) = resolve(&cands, &top, ark, None)?;
+        for row in chosen.iter_mut() {
+            let g = row.generation as u32;
+            let gen = &keys.gens[&g];
+            row.sealed = seal_ark(&self.w, &gen.ark, &gen.ark_id, g);
+            row.w_label = W_LABEL.into();
         }
+        persist_chosen(&self.store, &db, &chosen).await?;
         for row in self.store.keys().await? {
             Self::mirror_row(&*self.mirror, &row).await?;
         }
@@ -924,15 +1101,12 @@ impl AtRestKeyring {
                 chain_ark(&ark, &ark_id, &old.ark, &old.ark_id, g),
             )
             .await?;
-        let rows = self.store.keys().await?;
-        let (keys, rechain) = unlock_rows(&self.w, &rows)?.ok_or(AtRestError::Inconsistent(
-            "the stored newest generation does not open under this node's root",
-        ))?;
-        Self::store_rechain(&self.store, rechain).await?;
-        for row in &self.store.keys().await? {
-            Self::mirror_row(&*self.mirror, row).await?;
+        self.load().await?;
+        if self.state() != KeyringState::Unlocked {
+            return Err(AtRestError::Inconsistent(
+                "the stored newest generation does not open under this node's root",
+            ));
         }
-        *self.phase.write() = Phase::Unlocked(Arc::new(keys));
         self.current.lock().clear();
         self.ensure_escrow().await?;
         if !won {
@@ -944,7 +1118,36 @@ impl AtRestKeyring {
         Ok(next)
     }
 
-    /// A space's DEK row from the mirror, put back into the database.
+    /// A mirrored DEK row for `space`, only if its wrap authenticates under
+    /// the stated generation's KEK for exactly this space and id.
+    fn authentic_mirrored_dek(
+        keys: &Keys,
+        space: &str,
+        dek_id: u32,
+        bytes: &[u8],
+    ) -> Option<(space_data_key::Model, DataKey)> {
+        let row = serde_json::from_slice::<MirroredDek>(bytes)
+            .ok()?
+            .into_row(space)
+            .ok()?;
+        if row.dek_id as u32 != dek_id {
+            return None;
+        }
+        let gen = keys.gens.get(&(row.generation as u32))?;
+        let key = unwrap_dek(
+            &gen.kek,
+            &row.wrapped,
+            space,
+            DekId::new(dek_id),
+            row.generation as u32,
+            &gen.ark_id,
+        )
+        .ok()?;
+        Some((row, key))
+    }
+
+    /// A space's DEK row from the mirror, put back into the database once
+    /// it authenticates. Anything else in the mirror is ignored (warned).
     async fn restore_dek(
         &self,
         keys: &Keys,
@@ -952,23 +1155,19 @@ impl AtRestKeyring {
         dek_id: u32,
     ) -> Result<Option<space_data_key::Model>, DataKeyError> {
         let name = dek_mirror_name(&keys.dek_tag.tag(space), dek_id);
-        let Some(bytes) = self
-            .mirror
-            .get(&name)
+        let Some(bytes) = get_capped(&*self.mirror, &name)
             .await
             .map_err(|e| backend(mirror_err(e)))?
         else {
             return Ok(None);
         };
-        let row = serde_json::from_slice::<MirroredDek>(&bytes)
-            .map_err(|e| backend(mirror_err(e)))?
-            .into_row(space)
-            .map_err(|e| backend(mirror_err(e)))?;
-        if row.dek_id as u32 != dek_id {
-            return Err(backend(AtRestError::Inconsistent(
-                "mirrored data key has a different id than its name",
-            )));
-        }
+        let Some((row, _)) = Self::authentic_mirrored_dek(keys, space, dek_id, &bytes) else {
+            tracing::warn!(
+                dek_id,
+                "ignoring a mirrored data key that does not authenticate for its space"
+            );
+            return Ok(None);
+        };
         tracing::warn!(
             dek_id,
             "at-rest data key was missing from the database; restored from the mirror"
@@ -981,45 +1180,41 @@ impl AtRestKeyring {
     }
 
     /// Make sure the mirror holds exactly this DEK row before any object is
-    /// sealed under it. A different mirrored row with the same id means
-    /// objects may exist under another key: refuse, never overwrite.
+    /// sealed under it. A *genuine* different DEK under the same id means
+    /// objects may exist under another key: refuse, never overwrite. A
+    /// mirror object that doesn't authenticate carries no key and is
+    /// replaced.
     async fn mirror_dek(
         &self,
         keys: &Keys,
         row: &space_data_key::Model,
     ) -> Result<(), DataKeyError> {
-        let name = dek_mirror_name(&keys.dek_tag.tag(&row.space), row.dek_id as u32);
-        match self
-            .mirror
-            .get(&name)
+        let dek_id = row.dek_id as u32;
+        let name = dek_mirror_name(&keys.dek_tag.tag(&row.space), dek_id);
+        let existing = get_capped(&*self.mirror, &name)
             .await
-            .map_err(|e| backend(mirror_err(e)))?
-        {
-            None => {
-                let body = serde_json::to_vec(&MirroredDek::from_row(row)).expect("serializable");
-                self.mirror
-                    .put(&name, body)
-                    .await
-                    .map_err(|e| backend(mirror_err(e)))
-            }
-            Some(bytes) => {
-                let same = serde_json::from_slice::<MirroredDek>(&bytes)
-                    .ok()
-                    .and_then(|m| m.into_row(&row.space).ok())
-                    .is_some_and(|m| {
-                        m.dek_id == row.dek_id
-                            && m.generation == row.generation
-                            && m.wrapped == row.wrapped
-                    });
-                if same {
-                    Ok(())
-                } else {
-                    Err(backend(AtRestError::Inconsistent(
+            .map_err(|e| backend(mirror_err(e)))?;
+        if let Some(bytes) = existing {
+            match Self::authentic_mirrored_dek(keys, &row.space, dek_id, &bytes) {
+                Some((m, _)) if m.generation == row.generation && m.wrapped == row.wrapped => {
+                    return Ok(())
+                }
+                Some(_) => {
+                    return Err(backend(AtRestError::Inconsistent(
                         "the mirror holds a different data key with this id",
                     )))
                 }
+                None => tracing::warn!(
+                    dek_id,
+                    "replacing a mirrored data key that does not authenticate for its space"
+                ),
             }
         }
+        let body = serde_json::to_vec(&MirroredDek::from_row(row)).expect("serializable");
+        self.mirror
+            .put(&name, body)
+            .await
+            .map_err(|e| backend(mirror_err(e)))
     }
 
     /// Generate, store and return the space's first DEK row. If another

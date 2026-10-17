@@ -9,7 +9,6 @@
 #![forbid(unsafe_code)]
 
 mod attest;
-mod compose;
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -17,6 +16,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Result};
 use base64::Engine;
 use clap::{Args, Parser, Subcommand};
+use tinycloud_at_rest_escrow::compose::escape;
 use tinycloud_at_rest_escrow::{
     validate_holders, wrap_share, Ark, ArkId, EscrowBundle, HolderRecipient, RecipientKind,
     RecipientPolicy, RecoveryInfo, VerificationRecord,
@@ -273,7 +273,8 @@ async fn verify_node(args: &NodeArgs) -> Result<(EscrowBundle, RecoveryInfo)> {
     eprintln!("    {}", attest::collateral_dates(&collateral));
     eprintln!(
         "    MRTD, RTMR0-2, app-id and compose-hash match the trust policy; recovery key {} is bound to your nonce and escrow {}",
-        info.recovery_recipient, info.efp
+        escape(&info.recovery_recipient),
+        info.efp
     );
     eprintln!(
         "    node state: {} ({}); shares it holds this boot: {:?}",
@@ -463,9 +464,22 @@ async fn run(cli: Cli) -> Result<()> {
             for (service, image) in report.images {
                 eprintln!("    {service}: {image}");
             }
-            eprintln!("Other settings the hash covers (review them):");
-            for line in report.settings {
-                eprintln!("    {line}");
+            eprintln!("At-rest escrow values set literally in the compose (compare with the bundle and the pin):");
+            for (key, value) in [
+                (
+                    tinycloud_at_rest_escrow::compose::RECIPIENTS_ENV,
+                    report.recipients,
+                ),
+                (
+                    tinycloud_at_rest_escrow::compose::VERIFIED_FP_ENV,
+                    report.verified_fp,
+                ),
+            ] {
+                eprintln!("    {key} = {}", value.as_deref().unwrap_or("(not set)"));
+            }
+            eprintln!("Other settings the hash covers, in full (review them):");
+            for (key, value) in report.settings {
+                eprintln!("    {key} = {value}");
             }
         }
         Command::VerifyNode(args) => {
@@ -489,7 +503,10 @@ async fn run(cli: Cli) -> Result<()> {
             record.covers(&bundle)?;
             eprintln!(
                 "NOT AUTHENTICATED: this record names escrow {} and claims shares {:?} and pairs {:?} (verified_at {}),",
-                record.efp, record.verified_indices, record.pairs, record.verified_at
+                record.efp,
+                record.verified_indices,
+                record.pairs,
+                escape(&record.verified_at)
             );
             eprintln!(
                 "but its MAC can only be checked inside the TEE. Pin this value only after you saw the node answer \
@@ -509,10 +526,10 @@ fn main() {
         .expect("tokio runtime");
     if let Err(e) = runtime.block_on(run(cli)) {
         if e.downcast_ref::<InputError>().is_some() {
-            eprintln!("ERROR: {e:#}");
+            eprintln!("ERROR: {}", escape(&format!("{e:#}")));
             std::process::exit(3);
         }
-        eprintln!("REFUSED: {e:#}");
+        eprintln!("REFUSED: {}", escape(&format!("{e:#}")));
         std::process::exit(1);
     }
 }

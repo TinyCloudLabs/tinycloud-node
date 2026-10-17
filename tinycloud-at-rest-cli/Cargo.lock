@@ -3367,7 +3367,6 @@ dependencies = [
  "sha2 0.10.9",
  "tinycloud-at-rest-escrow",
  "tokio",
- "yaml-rust2",
  "zeroize",
 ]
 
@@ -3389,6 +3388,7 @@ dependencies = [
  "subtle",
  "thiserror 2.0.21",
  "vsss-rs",
+ "yaml-rust2",
  "zeroize",
 ]
 
