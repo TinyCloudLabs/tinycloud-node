@@ -7,6 +7,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod pseudonyms;
+pub use pseudonyms::{Pseudonym, Pseudonymizer};
+
 static TELEMETRY_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Explicit buckets for the internal pipeline-stage histogram. Individual

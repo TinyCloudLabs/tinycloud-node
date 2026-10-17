@@ -192,6 +192,9 @@ pub(crate) async fn process<C: ConnectionTrait>(
     encryption: Option<&ColumnEncryption>,
 ) -> Result<DelegationRegistration, Error> {
     verify(&delegation.0.delegation).await?;
+    for space in delegation.0.spaces() {
+        crate::request_telemetry::observe_space(space);
+    }
     validate(db, &delegation.0).await?;
     save(db, delegation.0.clone(), delegation.1.clone(), encryption).await
 }

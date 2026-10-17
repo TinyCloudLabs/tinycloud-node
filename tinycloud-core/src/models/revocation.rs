@@ -552,14 +552,20 @@ async fn revoker_is_authorized<C: ConnectionTrait>(
         .filter(abilities::Column::Delegation.eq(delegation.id))
         .all(db)
         .await?;
-    for row in ability_rows {
-        if let Some(space) = row.resource.space() {
-            if did_principal_matches(space.did().as_str(), &principal) {
-                return Ok(true);
+    let authorized = ability_rows.iter().any(|row| {
+        row.resource
+            .space()
+            .is_some_and(|space| did_principal_matches(space.did().as_str(), &principal))
+    });
+    if authorized {
+        // Observe every affected resource, not just the owner-match witness.
+        for row in &ability_rows {
+            if let Some(space) = row.resource.space() {
+                crate::request_telemetry::observe_space(space);
             }
         }
     }
-    Ok(false)
+    Ok(authorized)
 }
 
 #[cfg(test)]

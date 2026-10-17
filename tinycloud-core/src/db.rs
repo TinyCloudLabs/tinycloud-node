@@ -1747,7 +1747,13 @@ where
             .one(&self.conn)
             .await
         {
-            Ok(Some(_)) => return Ok(already_registered_result(retained_hash)),
+            Ok(Some(_)) => {
+                // The content-addressed row authenticates these exact signed bytes.
+                for space in delegation.0.spaces() {
+                    crate::request_telemetry::observe_space(space);
+                }
+                return Ok(already_registered_result(retained_hash));
+            }
             Ok(None) => {}
             Err(e) => return Err(TxError::Db(e)),
         }
@@ -3436,18 +3442,11 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
             .exec(db)
             .await
             .map_err(|e| {
-                if let DbErr::Exec(RuntimeErr::SqlxError(SqlxError::Database(db_err))) = &e {
-                    tracing::error!(
-                        error = %e,
-                        db_error = %db_err,
-                        db_error_code = ?db_err.code(),
-                        db_error_kind = ?db_err.kind(),
-                        "epoch insert failed with database error after space pre-check; \
-                         treating as integrity error"
-                    );
-                } else {
-                    tracing::error!(error = %e, "epoch insert failed");
-                }
+                tracing::error!(
+                    operation = "epoch_insert",
+                    error_class = "database",
+                    "epoch insert failed"
+                );
                 TxError::EpochInsert(e)
             })?;
 
@@ -3528,6 +3527,11 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                 }
                 Event::Revocation(r) => {
                     revocation::process(db, *r).await?;
+                    for (space, (_, _, _, hashes)) in &space_order {
+                        if hashes.contains_key(&hash) {
+                            crate::request_telemetry::observe_space(space);
+                        }
+                    }
                 }
             };
         }
