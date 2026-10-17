@@ -125,11 +125,16 @@ use tokio::{
 /// `test_before_acquire(false)`, database identity resolve as one statement,
 /// the read audit as one statement and no second sequence lock (TC-951):
 ///
-/// - sign-in 75 = peer key 0 + host `/delegate` 17 + session `/delegate` 18
+/// - sign-in 77 = peer key 0 + host `/delegate` 18 + session `/delegate` 19
 ///   + account-space SQL write 40;
-/// - kv put 37;
+/// - kv put 38;
 /// - kv get 22, including the read-audit commit.
-const BUDGETS: [(&str, u64); 3] = [("sign-in", 75), ("kv put", 37), ("kv get", 22)];
+///
+/// TC-1274: each epoch-writing commit (both `/delegate`s and the kv put)
+/// gained one round trip, the `epoch_head` cache write, which replaces the
+/// head anti-join over the space's whole history (measured on main: 75, 37,
+/// 22; with the cache: 77, 38, 22).
+const BUDGETS: [(&str, u64); 3] = [("sign-in", 77), ("kv put", 38), ("kv get", 22)];
 
 /// Full sign-in plus put plus get rounds run before the measured one.
 const WARM_UP_ROUNDS: u8 = 3;
@@ -960,6 +965,10 @@ database = "{}"
 [keys]
 type = "Static"
 secret = "{}"
+# Background traffic that is not a request's (TC-1274): off, so it cannot
+# land inside a measured window.
+[epoch_head_backfill]
+enabled = false
 "#,
         datadir.path().join("data").display(),
         proxied_url(url, proxy, schema)?,

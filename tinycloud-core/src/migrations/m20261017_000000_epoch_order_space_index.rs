@@ -69,6 +69,8 @@ async fn postgres_index_present(manager: &SchemaManager<'_>) -> Result<bool, DbE
                            OR (p.relid IS NULL AND EXISTS (
                                    SELECT 1 FROM pg_locks l
                                    WHERE l.pid = p.pid AND l.granted
+                                     AND l.database = (SELECT oid FROM pg_database
+                                                       WHERE datname = current_database())
                                      AND l.relation = 'epoch_order'::regclass
                                      AND l.mode = 'ShareUpdateExclusiveLock'))
                     ) AS building
@@ -591,5 +593,45 @@ mod tests {
             assert_eq!(recorded(db).await, 1);
             assert!(postgres_index(db).await.unwrap().1);
         }
+    }
+
+    /// A failed build is not mistaken for a running one just because some
+    /// session that is not building an index (autovacuum, ANALYZE, a manual
+    /// lock) holds SHARE UPDATE EXCLUSIVE on `epoch_order`: the advice stays
+    /// to drop and rebuild.
+    #[tokio::test]
+    async fn postgres_failed_index_with_a_non_building_lock_holder_says_drop() {
+        let Some(fixture) = PostgresTestSchema::migrated_through(
+            "postgres_failed_index_with_a_non_building_lock_holder_says_drop",
+            Some(steps_before_this()),
+        )
+        .await
+        else {
+            return;
+        };
+        let db = &fixture.conn;
+        db.execute_unprepared(&format!(
+            "CREATE INDEX {INDEX} ON epoch_order (space, parent, child)"
+        ))
+        .await
+        .unwrap();
+        db.execute_unprepared(&format!(
+            "UPDATE pg_index SET indisvalid = false WHERE indexrelid = '{INDEX}'::regclass"
+        ))
+        .await
+        .unwrap();
+        let holder = db.begin().await.unwrap();
+        holder
+            .execute_unprepared("LOCK TABLE epoch_order IN SHARE UPDATE EXCLUSIVE MODE")
+            .await
+            .unwrap();
+
+        let migrator = fixture.connect(1).await;
+        let error = migrate(&migrator).await.unwrap_err().to_string();
+        holder.rollback().await.unwrap();
+
+        assert!(error.contains("DROP INDEX CONCURRENTLY"), "{error}");
+        assert!(!error.contains("still being built"), "{error}");
+        assert_eq!(recorded(db).await, 0);
     }
 }
