@@ -9688,6 +9688,7 @@ dependencies = [
  "ucan-capabilities-object",
  "unicode-normalization",
  "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]
