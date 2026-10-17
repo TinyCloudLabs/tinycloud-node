@@ -141,9 +141,11 @@ Every one must pass all of these, or the check is RED:
   bytes, escrow shares as armored age files and bech32 recipients, and no TEE
   identity in a record (the harness node has none). Duplicate keys are refused.
 - **Raw-key scan** over every JSON key and every string outside those exact
-  fields: nothing that decodes (hex, base64, base64url, padded or not,
-  whitespace and prefixes like `0x`/`base64:`/data URLs removed) to 32 bytes,
-  no array of 32 byte values, no two fields of 16 bytes each.
+  fields: nothing that decodes (hex, base64, base64url, base32, padded or
+  not, whitespace and prefixes like `0x`, any short `label:`, data URLs
+  removed) to 32 bytes or more, no array of 32 byte values, no two fields of
+  16 bytes each (escrow holder names, which the schema checks exactly and
+  which can be 16-byte-looking, are left out of that split check).
 - **Content.** The same identity, fingerprint and marker scans as blocks,
   over the name and the text.
 - **Authentic key material.** The check reads the node's Static root
@@ -152,16 +154,33 @@ Every one must pass all of these, or the check is RED:
   chain opens under the next, every wrapped DEK opens under KEK_g with its
   AAD, its tag mapped to a space the harness signed in to (`spaces.log`). An
   escrow bundle's canary and EFP and a record's MAC are recomputed. A raw key
-  padded to 60 bytes fails here.
+  padded to 60 bytes fails here. ARK generations above 9 (INTERFACES: 1..=9)
+  are refused outright, and a gap is one finding: a name never sets a loop
+  bound.
+- **No derived secret anywhere.** No string of any mirror (exempt fields,
+  escrow commitments, holder names alone, in pairs or all in order, the armored
+  share text and its decoded payload, record fields) may carry, in any of the
+  encodings above, a secret the harness derived or unwrapped: the root, W,
+  each ARK_g, KEK_g, chain, canary and record-MAC key, NK, the DEK mirror tag
+  key, or any DEK.
+- **Escrow-none.** If `up` started the node with `TC887_AT_REST_ESCROW_NONE=true`,
+  any escrow bundle or record object is RED.
+- **Mirrors required (encrypt/strict mode).** An ARK mirror must exist, every
+  block must be named as sealed (`v1/<space tag>/…`), and its space tag
+  (from the re-derived NK) must belong to a harness space whose DEK mirror
+  authenticates. A sealed block or DEK with no mirror behind it is RED.
 
-Not checkable without the escrow holders: the escrow share commitments and
-the age-encrypted share files themselves.
+Not checkable without the escrow holders: whether an escrow share commitment
+or age-encrypted share hides key material that the harness didn't derive.
 
 `selftest_key_hierarchy_reference_vectors` (RFC 5869 vectors, seal/open
 round trips, every one-bit flip and wrong binding rejected),
-`selftest_key_mirror_accepts_s1_shaped_mirrors` and
+`selftest_key_mirror_accepts_s1_shaped_mirrors`,
 `selftest_key_mirror_flags_every_bypass` (one case per rule and per known
-bypass) run in plain `cargo test`.
+bypass), `selftest_key_mirror_refuses_escrow_contents_and_derived_keys`,
+`selftest_key_mirror_bounds_absurd_generations` and
+`selftest_key_mirror_requires_mirrors_in_encrypt_mode` run in plain
+`cargo test`.
 
 ## Not covered
 

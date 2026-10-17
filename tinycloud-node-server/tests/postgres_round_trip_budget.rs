@@ -11,10 +11,10 @@
 //! # What is driven
 //!
 //! The real node: `tinycloud::app_with_control` behind
-//! `rocket::local::asynchronous::Client`, so the pool is built by the
-//! production code with the production settings. Only its database URL
-//! differs: it points at an in-test TCP proxy in front of PostgreSQL, with TLS
-//! off and a throwaway schema on the search path. The flows are the node side
+//! `rocket::local::asynchronous::Client`, so the pool is built through the
+//! production configuration path. The budget fixture caps its pool as described
+//! below; its database URL points at an in-test TCP proxy in front of PostgreSQL,
+//! with TLS off and a throwaway schema on the search path. The flows are the node side
 //! of what `@tinycloud/node-sdk` sends, built with the SDK's own Rust half
 //! (`tinycloud-sdk-wasm`). The SDK's sign-in touches several spaces and
 //! repeats these requests for each; one space is enough to price them:
@@ -56,8 +56,16 @@
 //! The counts are deterministic without sleeping for them: every request is
 //! measured between two barriers that wait until every pooled connection is
 //! idle again, so the release ping of the last statement is inside the window
-//! and no request overlaps another's traffic. The flows run three times
-//! first, so the pool has grown to the connections it needs and the
+//! and no request overlaps another's traffic. The barriers cannot stop the
+//! webhook dispatcher from checking a connection out just after a mark, and a
+//! request that then finds no idle connection opens one and pays its
+//! `SET statement_timeout` round trip. So the pool is capped at `POOL_SIZE`
+//! and every connection it may hold is opened before the first flow, and a
+//! measured request that still opens a connection fails the test instead of
+//! being counted. The cap only keeps the fully opened pool small, because
+//! test binaries run concurrently against one CI PostgreSQL and the default
+//! of 100 connections each could exhaust it; a request's round trips do not
+//! depend on the pool size. The flows then run three times first, so the
 //! statements are prepared.
 //!
 //! # Budgets
@@ -137,6 +145,10 @@ const BUDGETS: [(&str, u64); 3] = [("sign-in", 69), ("kv put", 42), ("kv get", 1
 
 /// Full sign-in plus put plus get rounds run before the measured one.
 const WARM_UP_ROUNDS: u8 = 3;
+
+/// Connections in the measured node's pool, all opened before the flows run;
+/// see the module docs.
+const POOL_SIZE: u32 = 4;
 
 /// The account space and SQL database the SDK bootstraps at sign-in.
 const ACCOUNT_SPACE: &str = "account";
@@ -635,6 +647,24 @@ impl Node {
         }
     }
 
+    /// Open all `max` connections the pool may hold at once, then return them
+    /// to idle, so no later request has to connect.
+    async fn open_pool(&self, max: u32) -> Result<()> {
+        self.settle().await?;
+        let pool = self.pool();
+        let mut held = Vec::with_capacity(max as usize);
+        for _ in 0..max {
+            held.push(pool.acquire().await?);
+        }
+        ensure!(
+            pool.size() == max,
+            "the pool holds {} connections, not {max}",
+            pool.size()
+        );
+        drop(held);
+        self.settle().await
+    }
+
     /// Dispatch `request` between two settled marks.
     async fn measure(
         &self,
@@ -922,12 +952,18 @@ fn upstream(url: &str) -> Result<(String, u16)> {
     Ok((host, url.port().unwrap_or(5432)))
 }
 
-/// The real node, its pool behind the test proxy (with `cut`), on `schema`.
-async fn start_node(url: &str, schema: &str, cut: Cut) -> Result<(Node, tempfile::TempDir)> {
+/// The real node, its pool behind the test proxy (with `cut`), on `schema`;
+/// `max_connections` overrides the pool's default size.
+async fn start_node(
+    url: &str,
+    schema: &str,
+    cut: Cut,
+    max_connections: Option<u32>,
+) -> Result<(Node, tempfile::TempDir)> {
     let wire = Wire::default();
     let proxy = start_proxy(upstream(url)?, wire.clone(), cut).await?;
     let datadir = tempfile::TempDir::new()?;
-    let overlay = format!(
+    let mut overlay = format!(
         r#"
 log_level = "critical"
 [storage]
@@ -941,6 +977,9 @@ secret = "{}"
         proxied_url(url, proxy, schema)?,
         base64::encode_config([7u8; 32], base64::URL_SAFE_NO_PAD),
     );
+    if let Some(max_connections) = max_connections {
+        let _ = write!(overlay, "[database]\nmax_connections = {max_connections}\n");
+    }
     let figment = rocket::Config::figment()
         .merge(Serialized::defaults(tinycloud::config::Config::default()))
         .merge(Toml::string(&overlay));
@@ -954,9 +993,10 @@ secret = "{}"
 }
 
 async fn run(url: &str, schema: &str) -> Result<Vec<Measured>> {
-    let (node, _datadir) = start_node(url, schema, Cut::default()).await?;
+    let (node, _datadir) = start_node(url, schema, Cut::default(), Some(POOL_SIZE)).await?;
 
     let result = async {
+        node.open_pool(POOL_SIZE).await?;
         let mut warm_up = Vec::new();
         for seed in 1..=WARM_UP_ROUNDS {
             round(&node, &Account::new(seed)?, &mut warm_up)
@@ -1027,6 +1067,12 @@ async fn postgres_round_trip_budget() {
                 counts.connections
             );
             request.window.describe(&mut detail);
+            if counts.connections > 0 {
+                violations.push(format!(
+                    "{flow}: {} opened {} connection(s) inside its measured window",
+                    request.request, counts.connections
+                ));
+            }
         }
         let _ = writeln!(
             report,
@@ -1047,7 +1093,7 @@ async fn postgres_round_trip_budget() {
     println!("{report}");
     assert!(
         violations.is_empty(),
-        "PostgreSQL round-trip budget exceeded (TC-951):\n  {}\n\n{report}",
+        "PostgreSQL round-trip budget check failed (TC-951):\n  {}\n\n{report}",
         violations.join("\n  ")
     );
 }
@@ -1181,7 +1227,7 @@ async fn postgres_write_routes_tell_retryable_failures_from_unknown_outcomes() {
         .await
         .expect("create the isolated schema");
     let cut = Cut::default();
-    let (node, _datadir) = start_node(&url, &schema, cut.clone())
+    let (node, _datadir) = start_node(&url, &schema, cut.clone(), None)
         .await
         .expect("start the node");
 
@@ -1369,7 +1415,7 @@ async fn postgres_info_reports_connection_counters() {
         ))
         .await
         .expect("create the isolated schema");
-    let (node, _datadir) = start_node(&url, &schema, Cut::default())
+    let (node, _datadir) = start_node(&url, &schema, Cut::default(), None)
         .await
         .expect("start the node");
 
