@@ -1,0 +1,67 @@
+name: Personal node guide
+on:
+  pull_request:
+    paths:
+      - 'deploy/personal-node/**'
+      - 'test/probe/personal-node-check.ts'
+      - '.github/workflows/personal-node.yml'
+      - 'tinycloud.toml'
+      - 'docker-compose.dstack.yaml'
+      - 'tinycloud-node-server/src/runtime.rs'
+  push:
+    branches: [main]
+    paths:
+      - 'deploy/personal-node/**'
+      - 'test/probe/personal-node-check.ts'
+      - '.github/workflows/personal-node.yml'
+      - 'docker-compose.dstack.yaml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  published-images:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: test/probe/package-lock.json
+      - name: Install pinned signing client
+        run: npm ci --prefix test/probe
+      - name: Typecheck signing probe
+        run: npm run typecheck --prefix test/probe
+      - name: Exercise the published personal-node guide
+        run: bash deploy/personal-node/ci.sh
+
+  dstack-profile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: test/probe/package-lock.json
+      - name: Install pinned signing client
+        run: npm ci --prefix test/probe
+      - name: Check dstack-profile local-data persistence
+        run: bash deploy/personal-node/dstack-smoke.sh
+
+  dstack-config-source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          shared-key: rust-1.97.1-dstack-config
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Check shipped keyless config with both Dstack environment forms
+        run: cargo test --locked -p tinycloud-node --features dstack shipped_config_allows_ --lib

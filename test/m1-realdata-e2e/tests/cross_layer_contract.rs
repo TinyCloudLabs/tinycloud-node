@@ -1366,7 +1366,14 @@ async fn observe_grant_output_on_real_node(
     ];
     for (case_name, capabilities, ttl_seconds) in interop_cases {
         let issued_capabilities = capabilities.clone();
-        let issued_at = Utc::now();
+        // The issuer encodes nbf/exp as whole Unix seconds. Prepare the
+        // one-second grant before its window, not at an arbitrary fraction.
+        let issued_at = if ttl_seconds == 1 {
+            DateTime::from_timestamp(Utc::now().timestamp() + 1, 0)
+                .context("minimum-TTL whole-second issuance")?
+        } else {
+            Utc::now()
+        };
         let mut engine_policy = policy(&space_id, &grant_issuer_did);
         engine_policy.policy_id = format!("pol_m1_g08_{case_name}");
         engine_policy.resource.permissions_ceiling = capabilities.clone();
@@ -1383,6 +1390,9 @@ async fn observe_grant_output_on_real_node(
             evidence_provenance: Vec::new(),
             policy: engine_policy,
         })?;
+        if let Ok(until_valid) = (issued_at - Utc::now()).to_std() {
+            tokio::time::sleep(until_valid).await;
+        }
         let emitted_response = client
             .post("/delegate")
             .header(Header::new("Authorization", emitted.encoded.clone()))
@@ -2174,7 +2184,7 @@ fn signed_ucan_revocation(
     let resource = format!("urn:cid:{target}");
     capabilities.with_action(
         resource.parse()?,
-        "tinycloud/revoke".parse::<UcanAbility>()?,
+        "tinycloud.delegation/revoke".parse::<UcanAbility>()?,
         [BTreeMap::<String, Value>::new()],
     );
     let payload = Payload {

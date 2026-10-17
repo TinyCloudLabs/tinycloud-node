@@ -8,7 +8,7 @@
 //! against that consistent view.
 
 use crate::hash::Hash;
-use crate::models::{abilities, delegation, revocation};
+use crate::models::{abilities, delegation, delegation_cid_alias, revocation};
 use crate::relationships::parent_delegations;
 use sea_orm::{
     entity::prelude::*,
@@ -26,10 +26,29 @@ use crate::models::revocation::MAX_CHAIN_TRAVERSAL_NODES;
 /// Batched ancestor-closure load over `parent_delegations`. A recursive CTE
 /// fetches all reachable edges in one query rather than walking one node at a
 /// time. The in-memory pass enforces the same fail-closed node budget as the
-/// per-node traversal used by the delegate/revoke paths.
+/// per-node traversal used by the delegate/revoke paths. Production locks use
+/// `load_chain_lock_ids`; tests keep this as the sequential edge oracle.
+#[cfg(test)]
 pub(crate) async fn load_closure_edges<C: ConnectionTrait>(
     db: &C,
     roots: &[Hash],
+) -> Result<(Vec<Hash>, HashMap<Hash, Vec<Hash>>), ChainTraversalError> {
+    load_closure(db, roots, false).await
+}
+
+/// Resolve the same bounded closure to canonical lock identities. Signed graph
+/// IDs stay untouched; indexed alias joins share the closure's one round trip.
+pub(crate) async fn load_chain_lock_ids<C: ConnectionTrait>(
+    db: &C,
+    roots: &[Hash],
+) -> Result<Vec<Hash>, ChainTraversalError> {
+    load_closure(db, roots, true).await.map(|(ids, _)| ids)
+}
+
+async fn load_closure<C: ConnectionTrait>(
+    db: &C,
+    roots: &[Hash],
+    canonical_locks: bool,
 ) -> Result<(Vec<Hash>, HashMap<Hash, Vec<Hash>>), ChainTraversalError> {
     let mut nodes = roots.to_vec();
     nodes.sort_by(|left, right| left.as_ref().cmp(right.as_ref()));
@@ -75,6 +94,17 @@ pub(crate) async fn load_closure_edges<C: ConnectionTrait>(
         )
         .to_owned();
     let mut closure_query = base;
+    if canonical_locks {
+        // Parentless stored roots otherwise produce no edge row. Seed them
+        // only for locking; roots without a persisted alias retain their ID.
+        let seed = Query::select()
+            .expr_as(Expr::col(delegation_cid_alias::Column::Id), child.clone())
+            .expr_as(Expr::val(Option::<Hash>::None), parent.clone())
+            .from(delegation_cid_alias::Entity)
+            .and_where(Expr::col(delegation_cid_alias::Column::Id).is_in(nodes.iter().copied()))
+            .to_owned();
+        closure_query.union(UnionType::Distinct, seed);
+    }
     closure_query.union(UnionType::Distinct, recursive);
     let cte = CommonTableExpression::new()
         .table_name(closure.clone())
@@ -88,20 +118,65 @@ pub(crate) async fn load_closure_edges<C: ConnectionTrait>(
             (closure.clone(), child.clone()),
             (closure.clone(), parent.clone()),
         ])
-        .from(closure)
-        .limit((edge_cap + 1) as u64);
+        .from(closure.clone())
+        .limit((edge_cap + if canonical_locks { nodes.len() } else { 0 } + 1) as u64);
+    if canonical_locks {
+        for (column, alias, output) in [
+            (
+                child.clone(),
+                Alias::new("child_alias"),
+                Alias::new("child_lock"),
+            ),
+            (
+                parent.clone(),
+                Alias::new("parent_alias"),
+                Alias::new("parent_lock"),
+            ),
+        ] {
+            query
+                .expr_as(
+                    Expr::col((alias.clone(), delegation_cid_alias::Column::Canonical)),
+                    output,
+                )
+                .join_as(
+                    JoinType::LeftJoin,
+                    delegation_cid_alias::Entity,
+                    alias.clone(),
+                    Expr::col((alias, delegation_cid_alias::Column::Id))
+                        .equals((closure.clone(), column)),
+                );
+        }
+    }
     let query = query.with(WithClause::new().recursive(true).cte(cte).to_owned());
     let rows = db
         .query_all(db.get_database_backend().build(&query))
         .await?;
-    if rows.len() > edge_cap {
+    if rows.len() > edge_cap + if canonical_locks { nodes.len() } else { 0 } {
         return Err(ChainTraversalError::LimitExceeded);
     }
 
     let mut edges: HashMap<Hash, Vec<Hash>> = HashMap::new();
+    let mut lock_aliases = HashMap::new();
     for row in rows {
         let edge_child: Hash = row.try_get("", "child")?;
-        let edge_parent: Hash = row.try_get("", "parent")?;
+        let edge_parent: Option<Hash> = row.try_get("", "parent")?;
+        if canonical_locks {
+            if let Some(canonical) = row.try_get::<Option<Hash>>("", "child_lock")? {
+                if canonical != edge_child {
+                    lock_aliases.insert(edge_child, canonical);
+                }
+            }
+            if let (Some(parent), Some(canonical)) =
+                (edge_parent, row.try_get::<Option<Hash>>("", "parent_lock")?)
+            {
+                if canonical != parent {
+                    lock_aliases.insert(parent, canonical);
+                }
+            }
+        }
+        let Some(edge_parent) = edge_parent else {
+            continue;
+        };
         let parents = edges.entry(edge_child).or_default();
         if !parents.contains(&edge_parent) {
             parents.push(edge_parent);
@@ -122,6 +197,11 @@ pub(crate) async fn load_closure_edges<C: ConnectionTrait>(
                 nodes.push(*parent);
                 frontier.push(*parent);
             }
+        }
+    }
+    for id in &mut nodes {
+        if let Some(canonical) = lock_aliases.get(id) {
+            *id = *canonical;
         }
     }
 
@@ -389,33 +469,51 @@ fn snapshot_query(roots: &[Hash]) -> WithQuery {
         )
         .and_where(within_budget());
     query.union(UnionType::All, abilities_query);
-    let mut revocations = snapshot_branch(
-        3,
-        [
-            node(lookup_name.clone()),
-            null(),
-            null(),
-            null(),
-            null(),
-            null(),
-            null(),
-            null(),
-            null(),
-            null(),
-            null(),
-            null(),
-        ],
-    );
+    let revocation_fields = || {
+        let mut fields: [SimpleExpr; 12] = std::array::from_fn(|_| null());
+        fields[0] = node(lookup_name.clone());
+        fields
+    };
+    let mut revocations = snapshot_branch(3, revocation_fields());
     revocations
         .from(revocation::Entity)
         .join(
             JoinType::InnerJoin,
-            lookup_name,
+            lookup_name.clone(),
             Expr::col((revocation::Entity, revocation::Column::Revoked))
-                .equals((Alias::new("lookup_nodes"), id)),
+                .equals((lookup_name.clone(), id.clone())),
         )
         .and_where(within_budget());
     query.union(UnionType::All, revocations);
+    // TC-1071: revoking any stored encoding revokes every encoding with the
+    // same canonical identity. This mirrors `revocation::effective_rows`'
+    // alias branch inside the same statement; signed targets stay unchanged.
+    let source = Alias::new("revocation_source_alias");
+    let target = Alias::new("revocation_target_alias");
+    let mut aliased_revocations = snapshot_branch(3, revocation_fields());
+    aliased_revocations
+        .from(lookup_name.clone())
+        .join_as(
+            JoinType::InnerJoin,
+            delegation_cid_alias::Entity,
+            source.clone(),
+            Expr::col((source.clone(), delegation_cid_alias::Column::Id)).equals((lookup_name, id)),
+        )
+        .join_as(
+            JoinType::InnerJoin,
+            delegation_cid_alias::Entity,
+            target.clone(),
+            Expr::col((source, delegation_cid_alias::Column::Canonical))
+                .equals((target.clone(), delegation_cid_alias::Column::Canonical)),
+        )
+        .join(
+            JoinType::InnerJoin,
+            revocation::Entity,
+            Expr::col((target, delegation_cid_alias::Column::Id))
+                .equals((revocation::Entity, revocation::Column::Revoked)),
+        )
+        .and_where(within_budget());
+    query.union(UnionType::All, aliased_revocations);
     query.with(
         WithClause::new()
             .recursive(true)
@@ -539,6 +637,7 @@ impl AuthGraphSnapshot {
                 }
             }
         }
+
         Ok(Self {
             parents,
             delegations,
@@ -706,12 +805,12 @@ mod tests {
         // Compare the old loader's rows under the new explicit order, rather
         // than accidentally pinning one backend's unspecified row order.
         sort_abilities(&mut ability_rows);
-        let revoked = revocation::Entity::find()
-            .filter(revocation::Column::Revoked.is_in(nodes.iter().copied()))
-            .all(db)
+        // Main's sequential TC-1071 semantics: revocations under any
+        // persisted encoding of a delegation apply to every encoding.
+        let revoked = revocation::effective_rows(db, &nodes)
             .await?
             .into_iter()
-            .map(|row| row.revoked)
+            .map(|(id, _)| id)
             .collect();
         Ok(AuthGraphSnapshot {
             parents,
@@ -934,6 +1033,198 @@ mod tests {
         assert_eq!(snapshot, load_sequential(db, &[ids[0]]).await.unwrap());
     }
 
+    async fn insert_alias(db: &DatabaseConnection, id: Hash, canonical: Hash) {
+        delegation_cid_alias::ActiveModel {
+            id: Set(id),
+            canonical: Set(canonical),
+            encrypted: Set(false),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+    }
+
+    async fn insert_revocation(db: &DatabaseConnection, id: Hash, target: Hash) {
+        revocation::ActiveModel {
+            id: Set(id),
+            revoker: Set("did:key:actor".to_string()),
+            revoked: Set(target),
+            serialization: Set(id.as_ref().to_vec()),
+            revoked_at: Set(Some(OffsetDateTime::now_utc())),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+    }
+
+    /// TC-1071: a revocation names one stored encoding; every other stored
+    /// encoding with the same canonical identity is revoked too. The batched
+    /// snapshot must refuse exactly where `revocation::effective_rows` does.
+    async fn assert_alias_revocation_refused(db: &DatabaseConnection) {
+        let ids = insert_chain(db, "alias-revoked", 2).await;
+        let other = hash(b"alias-revoked-other-encoding");
+        insert_delegation(db, other).await;
+        let canonical = hash(b"alias-revoked-canonical");
+        insert_alias(db, ids[1], canonical).await;
+        insert_alias(db, other, canonical).await;
+        insert_revocation(db, hash(b"alias-revoked-revocation"), other).await;
+
+        assert!(revocation::is_revoked(db, &ids[1]).await.unwrap());
+        let snapshot = AuthGraphSnapshot::load(db, &[ids[0]]).await.unwrap();
+        assert!(
+            snapshot.is_revoked(&ids[1]),
+            "batched snapshot missed a revocation under another encoding"
+        );
+        assert_eq!(
+            snapshot.first_revoked_ancestor(&ids[0]),
+            Some(ids[1].to_cid(0x55).to_string())
+        );
+        assert_eq!(snapshot, load_sequential(db, &[ids[0]]).await.unwrap());
+        let cited = AuthGraphSnapshot::load(db, &[ids[1]]).await.unwrap();
+        assert!(cited.is_revoked(&ids[1]));
+        assert!(!cited.is_revoked(&ids[2]));
+    }
+
+    /// Seeded property check: over random DAGs with mixed alias groups,
+    /// revocations of cited and uncited encodings, and expired delegations,
+    /// the production batched decision equals the decision computed from the
+    /// sequential `effective_rows` snapshot and the per-node DB lookups.
+    async fn assert_batched_matches_sequential_decisions(
+        db: &DatabaseConnection,
+        backend: &str,
+        cases: u64,
+    ) {
+        use rand::{rngs::StdRng, Rng, SeedableRng};
+        let now = OffsetDateTime::now_utc().replace_nanosecond(0).unwrap();
+        let capability = crate::util::Capability {
+            resource: "tinycloud:did:key:actor:files/kv/doc".parse().unwrap(),
+            ability: "tinycloud.kv/get".to_string().try_into().unwrap(),
+            caveats: Caveats::default(),
+        };
+        let (mut alias_refusals, mut accepted, mut refused) = (0, 0, 0);
+        for case in 0..cases {
+            let seed = 0x7c73_5000 + case;
+            let mut rng = StdRng::seed_from_u64(seed);
+            let tag = format!("prop-{backend}-{seed}");
+            let node = |kind: &str, index: usize| hash(format!("{tag}-{kind}-{index}").as_bytes());
+            let count = rng.gen_range(1..=6);
+            let ids: Vec<Hash> = (0..count).map(|index| node("delegation", index)).collect();
+            // Other stored encodings of a canonical delegation; never cited.
+            let encodings: Vec<Hash> = (0..rng.gen_range(0..=3))
+                .map(|index| node("encoding", index))
+                .collect();
+            let canonicals = [node("canonical", 0), node("canonical", 1)];
+            for id in ids.iter().chain(&encodings) {
+                let expiry = match rng.gen_range(0..4) {
+                    0 => Some(now - time::Duration::minutes(5)),
+                    1 => Some(now + time::Duration::hours(1)),
+                    _ => None,
+                };
+                delegation::ActiveModel {
+                    id: Set(*id),
+                    delegator: Set("did:key:actor".to_string()),
+                    delegatee: Set("did:key:alias".to_string()),
+                    expiry: Set(expiry),
+                    issued_at: Set(None),
+                    not_before: Set(None),
+                    facts: Set(None),
+                    serialization: Set(id.as_ref().to_vec()),
+                }
+                .insert(db)
+                .await
+                .unwrap();
+                abilities::ActiveModel {
+                    delegation: Set(*id),
+                    resource: Set("tinycloud:did:key:actor:files/kv".parse().unwrap()),
+                    ability: Set("tinycloud.kv/get".to_string().try_into().unwrap()),
+                    caveats: Set(Caveats::default()),
+                }
+                .insert(db)
+                .await
+                .unwrap();
+                if rng.gen_bool(0.6) {
+                    insert_alias(db, *id, canonicals[rng.gen_range(0..2)]).await;
+                }
+            }
+            for child in 1..count {
+                let mut parents = HashSet::new();
+                for _ in 0..rng.gen_range(0..=2) {
+                    parents.insert(rng.gen_range(0..child));
+                }
+                for parent in parents {
+                    insert_edge(db, ids[child], ids[parent]).await;
+                }
+            }
+            let mut targets = HashSet::new();
+            for id in ids.iter().chain(&encodings) {
+                if rng.gen_bool(0.2) {
+                    targets.insert(*id);
+                }
+            }
+            for (index, target) in targets.iter().enumerate() {
+                insert_revocation(db, node("revocation", index), *target).await;
+            }
+
+            let mut root_sets: Vec<Vec<Hash>> = ids.iter().map(|id| vec![*id]).collect();
+            root_sets.push(ids.clone());
+            for roots in root_sets {
+                let context = format!("{backend} seed {seed} roots {roots:?}");
+                let batched = AuthGraphSnapshot::load(db, &roots).await.unwrap();
+                let sequential = load_sequential(db, &roots).await.unwrap();
+                assert_eq!(batched, sequential, "{context}");
+                for root in &roots {
+                    let revoked = revocation::is_revoked(db, root).await.unwrap();
+                    assert_eq!(batched.is_revoked(root), revoked, "{context}");
+                    assert_eq!(
+                        batched.first_revoked_ancestor(root).is_some(),
+                        revocation::first_revoked_ancestor(db, root)
+                            .await
+                            .unwrap()
+                            .is_some(),
+                        "{context}"
+                    );
+                    if revoked && !targets.contains(root) {
+                        alias_refusals += 1;
+                    }
+                }
+                let parents: Vec<_> = roots.iter().map(|id| id.to_cid(0x55)).collect();
+                let production = crate::models::invocation::authorize_holder(
+                    db,
+                    "did:key:alias",
+                    std::slice::from_ref(&capability),
+                    &parents,
+                    now,
+                )
+                .await;
+                let reference = crate::models::invocation::authorize_holder_with_graph(
+                    db,
+                    "did:key:alias",
+                    std::slice::from_ref(&capability),
+                    &parents,
+                    now,
+                    &sequential,
+                )
+                .await;
+                assert_eq!(
+                    format!("{production:?}"),
+                    format!("{reference:?}"),
+                    "{context}"
+                );
+                if production.is_ok() {
+                    accepted += 1;
+                } else {
+                    refused += 1;
+                }
+            }
+        }
+        // The generator must exercise every decision class it claims to.
+        assert!(alias_refusals > 0, "{backend}: no alias-only revocation");
+        assert!(
+            accepted > 0 && refused > 0,
+            "{backend}: one-sided decisions"
+        );
+    }
+
     #[tokio::test]
     async fn sqlite_snapshot_matches_sequential_for_chains_windows_caveats_revocations_aliases() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
@@ -941,6 +1232,8 @@ mod tests {
         assert_fixture_equivalence(&db).await;
         assert_canonical_caveat_reason(&db).await;
         assert_closure_limit(&db).await;
+        assert_alias_revocation_refused(&db).await;
+        assert_batched_matches_sequential_decisions(&db, "sqlite", 200).await;
     }
 
     #[tokio::test]
@@ -955,6 +1248,8 @@ mod tests {
         assert_fixture_equivalence(&fixture.conn).await;
         assert_canonical_caveat_reason(&fixture.conn).await;
         assert_closure_limit(&fixture.conn).await;
+        assert_alias_revocation_refused(&fixture.conn).await;
+        assert_batched_matches_sequential_decisions(&fixture.conn, "postgres", 60).await;
     }
 
     struct MySqlGraphFixture {
@@ -1016,7 +1311,7 @@ mod tests {
         };
         let db = Database::connect(format!("{prefix}/{name}")).await.unwrap();
         // The full repository migrator predates MySQL's indexed-column length
-        // limits. Keep this fixture scoped to the four auth-graph model tables
+        // limits. Keep this fixture scoped to the auth-graph model tables
         // rather than changing unrelated migrations for a query equivalence test.
         for ddl in [
             "CREATE TABLE actor (id VARCHAR(191) PRIMARY KEY)",
@@ -1024,6 +1319,7 @@ mod tests {
             "CREATE TABLE parent_delegation (child VARBINARY(34) NOT NULL, parent VARBINARY(34) NOT NULL, PRIMARY KEY (parent, child))",
             "CREATE TABLE ability (resource VARCHAR(255) NOT NULL, ability VARCHAR(255) NOT NULL, delegation VARBINARY(34) NOT NULL, caveats JSON NOT NULL, PRIMARY KEY (resource, ability, delegation))",
             "CREATE TABLE revocation (id VARBINARY(34) PRIMARY KEY, revoker VARCHAR(191) NOT NULL, revoked VARBINARY(34) NOT NULL, serialization BLOB NOT NULL, revoked_at DATETIME NULL)",
+            "CREATE TABLE delegation_cid_alias (id VARBINARY(64) PRIMARY KEY, canonical VARBINARY(64) NOT NULL, encrypted BOOLEAN NOT NULL, INDEX idx_delegation_cid_alias_canonical (canonical, id))",
         ] {
             db.execute(Statement::from_string(DbBackend::MySql, ddl.to_string()))
                 .await
@@ -1032,6 +1328,8 @@ mod tests {
         assert_fixture_equivalence(&db).await;
         assert_canonical_caveat_reason(&db).await;
         assert_closure_limit(&db).await;
+        assert_alias_revocation_refused(&db).await;
+        assert_batched_matches_sequential_decisions(&db, "mysql", 60).await;
         db.close().await.unwrap();
         admin.close().await.unwrap();
     }
@@ -1211,7 +1509,7 @@ mod tests {
             // New production path: one recursive edge query to establish the
             // lock set, then one transaction-scoped snapshot query.
             let before = counter.load(Ordering::SeqCst);
-            let (lock_keys, _) = load_closure_edges(&db, &[leaf]).await.unwrap();
+            let lock_keys = load_chain_lock_ids(&db, &[leaf]).await.unwrap();
             let snapshot = AuthGraphSnapshot::load(&db, &[leaf]).await.unwrap();
             let optimized_queries = counter.load(Ordering::SeqCst) - before;
 

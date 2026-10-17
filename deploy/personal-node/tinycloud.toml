@@ -1,0 +1,13 @@
+[global]
+log_level = "normal"
+port = 8000
+
+[global.storage]
+datadir = "/data"
+
+[global.storage.blocks]
+type = "Local"
+
+[global.keys]
+type = "Static"
+# The secret is provided only through the installation's private node.env.

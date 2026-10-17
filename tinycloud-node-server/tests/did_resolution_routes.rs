@@ -39,9 +39,22 @@ async fn assert_route_refuses(path: &str, status: Status) {
         "did:web:127.0.0.1%3A{}",
         listener.local_addr().unwrap().port()
     );
-    let token = signed_ucan(&issuer, &JWK::generate_ed25519().unwrap(), Algorithm::EdDSA)
-        .encode()
-        .unwrap();
+    let jwk = JWK::generate_ed25519().unwrap();
+    let ucan = signed_ucan(&issuer, &jwk, Algorithm::EdDSA);
+    let token = if path == "/revoke" {
+        let mut payload = ucan.payload().clone();
+        payload.attenuation.with_actions(
+            format!("urn:cid:{}", payload.proof[0]).parse().unwrap(),
+            [("tinycloud.delegation/revoke".parse().unwrap(), [])],
+        );
+        payload
+            .sign(Algorithm::EdDSA, &jwk)
+            .unwrap()
+            .encode()
+            .unwrap()
+    } else {
+        ucan.encode().unwrap()
+    };
     let response = client
         .post(path)
         .header(Header::new("Authorization", token))
@@ -64,6 +77,26 @@ async fn delegate_keeps_401_with_method_disabled_body() {
 #[tokio::test]
 async fn revoke_keeps_403_with_method_disabled_body() {
     assert_route_refuses("/revoke", Status::Forbidden).await;
+}
+
+#[tokio::test]
+async fn actionless_revoke_is_forbidden_without_resolution() {
+    let (client, _dir) = client().await;
+    let listener = bound_listener();
+    let issuer = format!(
+        "did:web:127.0.0.1%3A{}",
+        listener.local_addr().unwrap().port()
+    );
+    let token = signed_ucan(&issuer, &JWK::generate_ed25519().unwrap(), Algorithm::EdDSA)
+        .encode()
+        .unwrap();
+    let response = client
+        .post("/revoke")
+        .header(Header::new("Authorization", token))
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Forbidden);
+    assert_no_connections(&[&listener]).await;
 }
 
 #[tokio::test]

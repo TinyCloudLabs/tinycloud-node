@@ -4,7 +4,7 @@
 
 services:
   tinycloud:
-    image: ghcr.io/tinycloudlabs/tinycloud-node:latest
+    image: ghcr.io/tinycloudlabs/tinycloud-node@sha256:4bdae4fc232d886bb56bfbce4ec62ed4b8fb4e1369a01f6afb73d06dd68c188f # 1.20.6-dstack
     ports:
       # Port 8001 (Prometheus /metrics) is intentionally NOT published: the
       # metrics handler is unauthenticated and serves every series to anyone,

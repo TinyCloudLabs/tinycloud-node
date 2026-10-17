@@ -118,6 +118,9 @@ pub(crate) async fn process<C: ConnectionTrait>(
 ) -> Result<Hash, Error> {
     let (i, serialized) = (invocation.0, invocation.1);
     verify_invocation(&i.invocation).await?;
+    for space in i.spaces() {
+        crate::request_telemetry::observe_space(space);
+    }
 
     let now = OffsetDateTime::now_utc();
     validate(db, &i, Some(now), auth_graph).await?;
@@ -136,6 +139,9 @@ pub(crate) async fn process_internal<C: ConnectionTrait>(
     encryption: Option<&ColumnEncryption>,
 ) -> Result<Hash, Error> {
     let (i, serialized) = (invocation.0, invocation.1);
+    for space in i.spaces() {
+        crate::request_telemetry::observe_space(space);
+    }
     save(
         db,
         i,
@@ -169,6 +175,9 @@ pub(crate) async fn process_admitted<C: ConnectionTrait>(
         .payload()
         .validate_time(None)
         .map_err(|_| InvocationError::InvalidTime)?;
+    for space in i.spaces() {
+        crate::request_telemetry::observe_space(space);
+    }
 
     let now = OffsetDateTime::now_utc();
     validate(db, &i, Some(now), auth_graph).await?;
@@ -192,6 +201,9 @@ pub(crate) async fn authorize_admitted<C: ConnectionTrait>(
         .payload()
         .validate_time(None)
         .map_err(|_| InvocationError::InvalidTime)?;
+    for space in invocation.spaces() {
+        crate::request_telemetry::observe_space(space);
+    }
     validate(db, invocation, Some(now), auth_graph).await
 }
 
@@ -247,6 +259,9 @@ pub(crate) async fn verify_and_authorize_with_graph<C: ConnectionTrait>(
     auth_graph: Option<&crate::auth_graph::AuthGraphSnapshot>,
 ) -> Result<(), Error> {
     verify_invocation(&invocation.invocation).await?;
+    for space in invocation.spaces() {
+        crate::request_telemetry::observe_space(space);
+    }
     validate(db, invocation, Some(now), auth_graph).await
 }
 
@@ -282,6 +297,19 @@ pub async fn authorize_holder<C: ConnectionTrait>(
     now: OffsetDateTime,
 ) -> Result<(), Error> {
     validate_capabilities(db, capabilities, holder, parents, Some(now), None).await
+}
+
+/// Test oracle: `authorize_holder`'s checks against a caller-built snapshot.
+#[cfg(test)]
+pub(crate) async fn authorize_holder_with_graph<C: ConnectionTrait>(
+    db: &C,
+    holder: &str,
+    capabilities: &[util::Capability],
+    parents: &[tinycloud_auth::ipld_core::cid::Cid],
+    now: OffsetDateTime,
+    graph: &crate::auth_graph::AuthGraphSnapshot,
+) -> Result<(), Error> {
+    validate_capabilities(db, capabilities, holder, parents, Some(now), Some(graph)).await
 }
 
 async fn validate_capabilities<C: ConnectionTrait>(

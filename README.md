@@ -150,35 +150,35 @@ With telemetry enabled, backend time-to-first-byte is recorded under the `server
 
 ## Quickstart
 
-To run TinyCloud Protocol locally, install [Rustup](https://rustup.rs). The
-repository selects the reviewed Rust `1.97.1` toolchain automatically through
-`rust-toolchain.toml`; do not substitute a floating `stable` compiler.
+For a self-hosted HTTPS deployment with persistent data, unique identity,
+backup/restore, and a verified upgrade path, follow the
+[personal-node guide](deploy/personal-node/README.md). The source-checkout
+example below is for local development only. It deliberately requires a unique
+key: the shipped configuration no longer contains a usable key.
 
+Install [Rustup](https://rustup.rs); `rust-toolchain.toml` selects Rust 1.97.1.
+Provision a private key file once and retain it across restarts:
 
-You will need to create a directory for TinyCloud Protocol to store data in:
 ```bash
-mkdir data
+umask 077
+mkdir -p data/blocks
+openssl rand -base64 48 | tr '+/' '-_' | tr -d '=\n' > node.key
+TINYCLOUD_KEYS__SECRET="$(cat node.key)" cargo run
 ```
 
-Within this directory, create one more directories `blocks` and a database file `caps.db`:
-```bash
-mkdir data/blocks
-touch data/caps.db
-```
+Keep `node.key` out of git, back it up separately from the data directory, and
+do not replace it during an upgrade: derived node identities and sealed data
+depend on it. `TINYCLOUD_KEYS__TYPE=Dstack` remains an explicit alternative
+only for a properly configured dstack TEE.
 
-To setup local data storage you can also run `./scripts/init-tinycloud-data.sh`
+For an existing node, do **not** generate a new root during upgrade. Recover
+the installation's original key from its private backup or its existing
+operator configuration, provide that same root explicitly, and compare the
+public node identity and encrypted/sealed data before accepting the upgrade.
+If the original root is unavailable, stop: a replacement is a different node
+identity and does not recover data sealed under the prior root. Changing the
+identity also invalidates trust bindings that refer to its DID or public keys.
 
-You will then need to set the environment variables to point to those directories:
-```bash
-export TINYCLOUD_STORAGE_BLOCKS_PATH="data/blocks"
-export TINYCLOUD_STORAGE_DATABASE="data/caps.db"
-```
-
-Finally you can run TinyCloud Protocol using `cargo`:
-```bash
-cargo build
-cargo run
-```
 
 
 ## Configuration
@@ -233,7 +233,7 @@ These bound how long one PostgreSQL round trip can block a request (TC-1054). Ea
 | database.bulk_statement_timeout_ms | `120000` | `statement_timeout` for statements on a whole SQL or DuckDB artifact larger than 8 MiB (or of unknown size): hydration loads and checkpoint saves, whose server-side work on a ~100 MiB value can outlast the base limit. PostgreSQL does not cancel a statement while it writes a row to the client, so the download itself is not limited by either value. |
 | database.retry_window_ms | `10000` | A read (or `BEGIN`) whose connection is lost is retried once only if that attempt failed within this window. A connection found dead at once is retried; one whose loss took a keepalive expiry to detect is not, so a lost connection costs a read at most one detection plus this window (about 40 s) instead of two detections (about 60 s). This bounds the retry, not the request or the per-database lock hold: acquisition waits, legitimate transfers and queueing behind the lock add to it, and a general deadline is later TC-1054 work. |
 
-Schema migrations always run with no statement timeout. Customer SQL (`tinycloud.sql/*`) runs in the node's local SQLite engine, never on PostgreSQL, so `statement_timeout` does not limit it.
+Schema migrations always run with no statement timeout. On PostgreSQL they wait at most 30 s for any lock (`lock_timeout`), so a session holding a conflicting table lock makes the node fail to start with an error naming the lock wait instead of hanging; the migrations roll back together and the next start applies them (TC-1176). Customer SQL (`tinycloud.sql/*`) runs in the node's local SQLite engine, never on PostgreSQL, so `statement_timeout` does not limit it.
 
 A database failure gets one of two responses, which clients must tell apart by the body's leading code:
 

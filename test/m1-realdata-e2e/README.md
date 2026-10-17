@@ -19,6 +19,11 @@ named-statement caveats, and the minimum/maximum TTL bounds. Producer and audit
 cases remain explicitly assigned to m1-g-07 in `vendor/grant-output/
 SKIP_MANIFEST.json`.
 
+The one-second live grant is signed for the next whole Unix second and
+submitted once its validity window opens, matching the emitter's integer
+`nbf`/`exp` timestamps. Successful real-node use and denial after expiry are
+both required; frozen vectors and production clocks are unchanged.
+
 The pinned node has no production route for initial space creation. Following
 the W5 recipe, this test directly provisions one space row and its storage
 directory solely as a node-storage precondition, then proves delegation and
@@ -34,7 +39,7 @@ correspondence with every frozen case.
 Run it explicitly with the pinned private git dependency:
 
 ```sh
-CARGO_NET_GIT_FETCH_WITH_CLI=true cargo test --manifest-path test/m1-realdata-e2e/Cargo.toml
+CARGO_NET_GIT_FETCH_WITH_CLI=true cargo test --locked --manifest-path test/m1-realdata-e2e/Cargo.toml
 ```
 
 ## Live M1 gate runner and independent verifier

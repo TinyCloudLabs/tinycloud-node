@@ -53,8 +53,12 @@ impl WebhookDispatcher {
         // so a revocation or expiry applies by the next pass.
         let mut authority = HashMap::<String, bool>::new();
         for delivery in deliveries {
-            if let Err(error) = self.dispatch_delivery(delivery, &mut authority).await {
-                tracing::warn!(error = %error, "webhook delivery attempt failed");
+            if self
+                .dispatch_delivery(delivery, &mut authority)
+                .await
+                .is_err()
+            {
+                tracing::warn!("webhook delivery attempt failed");
             }
         }
 
@@ -249,8 +253,8 @@ impl WebhookDispatcher {
 pub fn spawn_webhook_dispatcher(dispatcher: WebhookDispatcher) {
     rocket::tokio::spawn(async move {
         loop {
-            if let Err(error) = dispatcher.dispatch_due_once().await {
-                tracing::warn!(error = %error, "webhook dispatcher loop failed");
+            if dispatcher.dispatch_due_once().await.is_err() {
+                tracing::warn!("webhook dispatcher loop failed");
             }
 
             rocket::tokio::time::sleep(POLL_INTERVAL).await;
@@ -314,13 +318,13 @@ mod tests {
         let storage = NodeFileSystemConfig::new(tempdir.path()).open().await?;
         let _persisted = tempdir.keep();
         let encryption = ColumnEncryption::new([9u8; 32]);
-        let tinycloud = TinyCloud::new(
+        let tinycloud = TinyCloud::new_with_encryption(
             db.clone().into(),
             Either::B(storage),
             StaticSecret::new(vec![0u8; 32]).unwrap(),
+            Some(encryption.clone()),
         )
-        .await?
-        .with_encryption(Some(encryption.clone()));
+        .await?;
         Ok((tinycloud, db, encryption))
     }
 
@@ -609,13 +613,13 @@ mod tests {
         let tempdir = TempDir::new()?;
         let storage = NodeFileSystemConfig::new(tempdir.path()).open().await?;
         let _persisted = tempdir.keep();
-        let tinycloud = TinyCloud::new(
+        let tinycloud = TinyCloud::new_with_encryption(
             db.clone().into(),
             Either::B(storage),
             StaticSecret::new(vec![0u8; 32]).unwrap(),
+            Some(encryption.clone()),
         )
-        .await?
-        .with_encryption(Some(encryption.clone()));
+        .await?;
         let dispatcher = WebhookDispatcher::new(
             tinycloud,
             HooksConfig::default(),
@@ -836,14 +840,14 @@ mod tests {
                     .unwrap();
                 let _persisted = tempdir.keep();
                 let encryption = ColumnEncryption::new([9u8; 32]);
-                let tinycloud = TinyCloud::new(
+                let tinycloud = TinyCloud::new_with_encryption(
                     conn,
                     Either::B(storage),
                     StaticSecret::new(vec![0u8; 32]).unwrap(),
+                    Some(encryption.clone()),
                 )
                 .await
-                .unwrap()
-                .with_encryption(Some(encryption.clone()));
+                .unwrap();
 
                 let mut setup_options = ConnectOptions::new(url.to_owned());
                 setup_options

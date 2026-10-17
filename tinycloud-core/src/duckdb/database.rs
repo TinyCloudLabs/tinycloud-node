@@ -1,3 +1,8 @@
+//! Each actor message carries its request context independently. Explicit
+//! prepare/query lifecycles and execute/execute_batch calls count once,
+//! including failed prepares, controls and maintenance SQL. Actor queueing,
+//! result formatting, native connection open/close and filesystem work do not.
+
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -6,6 +11,8 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use sqlparser::ast::Statement;
 use tokio::sync::{mpsc, oneshot};
+
+use crate::request_telemetry::{self, QueryTimer, RequestContext};
 
 use super::{
     caveats::DuckDbCaveats,
@@ -39,7 +46,7 @@ enum DbMessage {
 #[derive(Clone)]
 pub struct DatabaseHandle {
     id: u64,
-    tx: mpsc::Sender<DbMessage>,
+    tx: mpsc::Sender<(Option<Arc<RequestContext>>, DbMessage)>,
 }
 
 /// Distinguishes one actor from its replacement for the same (space, db); see
@@ -57,14 +64,17 @@ impl DatabaseHandle {
     ) -> Result<DuckDbExecutionResult, DuckDbError> {
         let (response_tx, response_rx) = oneshot::channel();
         self.tx
-            .send(DbMessage::Execute {
-                request: Box::new(request),
-                caveats,
-                ability,
-                arrow_format,
-                without_growth,
-                response_tx,
-            })
+            .send((
+                request_telemetry::current(),
+                DbMessage::Execute {
+                    request: Box::new(request),
+                    caveats,
+                    ability,
+                    arrow_format,
+                    without_growth,
+                    response_tx,
+                },
+            ))
             .await
             .map_err(|_| DuckDbError::Internal("Database actor not available".to_string()))?;
         response_rx
@@ -75,7 +85,10 @@ impl DatabaseHandle {
     pub async fn export(&self) -> Result<Vec<u8>, DuckDbError> {
         let (response_tx, response_rx) = oneshot::channel();
         self.tx
-            .send(DbMessage::Export { response_tx })
+            .send((
+                request_telemetry::current(),
+                DbMessage::Export { response_tx },
+            ))
             .await
             .map_err(|_| DuckDbError::Internal("Database actor not available".to_string()))?;
         response_rx
@@ -86,7 +99,7 @@ impl DatabaseHandle {
     pub async fn wal(&self) -> Result<Option<Vec<u8>>, DuckDbError> {
         let (response_tx, response_rx) = oneshot::channel();
         self.tx
-            .send(DbMessage::Wal { response_tx })
+            .send((request_telemetry::current(), DbMessage::Wal { response_tx }))
             .await
             .map_err(|_| DuckDbError::Internal("Database actor not available".to_string()))?;
         response_rx
@@ -98,7 +111,10 @@ impl DatabaseHandle {
     pub(crate) async fn shutdown(&self) -> Result<(), DuckDbError> {
         let (response_tx, response_rx) = oneshot::channel();
         self.tx
-            .send(DbMessage::Shutdown { response_tx })
+            .send((
+                request_telemetry::current(),
+                DbMessage::Shutdown { response_tx },
+            ))
             .await
             .map_err(|_| DuckDbError::Internal("Database actor not available".to_string()))?;
         response_rx.await.map_err(|_| {
@@ -116,9 +132,10 @@ pub fn spawn_actor(
     max_memory_per_connection: String,
     databases: Arc<DashMap<(String, String), DatabaseHandle>>,
 ) -> DatabaseHandle {
-    let (tx, mut rx) = mpsc::channel::<DbMessage>(32);
+    let (tx, mut rx) = mpsc::channel::<(Option<Arc<RequestContext>>, DbMessage)>(32);
     let id = NEXT_ACTOR_ID.fetch_add(1, Ordering::Relaxed);
     let idle_timeout = std::time::Duration::from_secs(idle_timeout_secs);
+    let initial_context = request_telemetry::current();
 
     tokio::task::spawn_blocking(move || {
         let rt = tokio::runtime::Handle::current();
@@ -132,44 +149,59 @@ pub fn spawn_actor(
         } else {
             StorageMode::InMemory
         };
-        let mut conn = match storage::open_connection(&mode, &max_memory_per_connection) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!(error=%e, "Failed to open database");
-                // Drain pending messages with error
-                while let Ok(msg) = rx.try_recv() {
-                    match msg {
-                        DbMessage::Execute { response_tx, .. } => {
-                            let _ = response_tx
-                                .send(Err(DuckDbError::Internal(format!("Failed to open: {}", e))));
-                        }
-                        DbMessage::Export { response_tx } => {
-                            let _ = response_tx
-                                .send(Err(DuckDbError::Internal(format!("Failed to open: {}", e))));
-                        }
-                        DbMessage::Wal { response_tx } => {
-                            let _ = response_tx
-                                .send(Err(DuckDbError::Internal(format!("Failed to open: {}", e))));
-                        }
-                        DbMessage::Shutdown { response_tx } => {
-                            let _ = response_tx.send(());
+        let opening_path = match &mode {
+            StorageMode::InMemory => None,
+            StorageMode::File(path) => Some(path.as_path()),
+        };
+        let mut conn = {
+            let _context = request_telemetry::enter(initial_context);
+            match storage::open_connection(opening_path, &max_memory_per_connection) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!("Failed to open database");
+                    // Drain pending messages with error
+                    while let Ok((context, msg)) = rx.try_recv() {
+                        let _context = request_telemetry::enter(context);
+                        match msg {
+                            DbMessage::Execute { response_tx, .. } => {
+                                let _ = response_tx.send(Err(DuckDbError::Internal(format!(
+                                    "Failed to open: {}",
+                                    e
+                                ))));
+                            }
+                            DbMessage::Export { response_tx } => {
+                                let _ = response_tx.send(Err(DuckDbError::Internal(format!(
+                                    "Failed to open: {}",
+                                    e
+                                ))));
+                            }
+                            DbMessage::Wal { response_tx } => {
+                                let _ = response_tx.send(Err(DuckDbError::Internal(format!(
+                                    "Failed to open: {}",
+                                    e
+                                ))));
+                            }
+                            DbMessage::Shutdown { response_tx } => {
+                                let _ = response_tx.send(());
+                            }
                         }
                     }
+                    databases.remove_if(&(space_id, db_name), |_, handle| handle.id == id);
+                    return;
                 }
-                databases.remove_if(&(space_id, db_name), |_, handle| handle.id == id);
-                return;
             }
         };
 
         let mut shutdown = None;
         loop {
             // Block on receiving with timeout
-            let msg =
+            let (context, msg) =
                 match rt.block_on(async { tokio::time::timeout(idle_timeout, rx.recv()).await }) {
                     Ok(Some(msg)) => msg,
                     Ok(None) => break, // Channel closed
                     Err(_) => break,   // Idle timeout
                 };
+            let _context = request_telemetry::enter(context);
 
             match msg {
                 DbMessage::Execute {
@@ -206,8 +238,8 @@ pub fn spawn_actor(
                                         mode = StorageMode::File(file_path.clone());
                                         tracing::info!("Promoted database to file storage");
                                     }
-                                    Err(e) => {
-                                        tracing::error!(error=%e, "Failed to promote database to file");
+                                    Err(_) => {
+                                        tracing::error!("Failed to promote database to file");
                                     }
                                 }
                             }
@@ -217,7 +249,8 @@ pub fn spawn_actor(
                     let _ = response_tx.send(result);
                 }
                 DbMessage::Export { response_tx } => {
-                    let result = handle_export(&conn, &mode, &file_path);
+                    let result =
+                        handle_export(&conn, &mode, &file_path, &max_memory_per_connection);
                     let _ = response_tx.send(result);
                 }
                 DbMessage::Wal { response_tx } => {
@@ -267,11 +300,15 @@ fn handle_export(
     conn: &duckdb::Connection,
     mode: &StorageMode,
     file_path: &PathBuf,
+    max_memory: &str,
 ) -> Result<Vec<u8>, DuckDbError> {
     match mode {
         StorageMode::File(_) => {
-            conn.execute_batch("CHECKPOINT;")
-                .map_err(|e| DuckDbError::Internal(e.to_string()))?;
+            {
+                let _timer = QueryTimer::new();
+                conn.execute_batch("CHECKPOINT;")
+                    .map_err(|e| DuckDbError::Internal(e.to_string()))?;
+            }
             std::fs::read(file_path).map_err(|e| DuckDbError::Internal(e.to_string()))
         }
         StorageMode::InMemory => {
@@ -281,8 +318,7 @@ fn handle_export(
             let temp_dir = tempfile::tempdir().map_err(|e| DuckDbError::Internal(e.to_string()))?;
             let temp_db_path = temp_dir.path().join("export.duckdb");
 
-            let dest = duckdb::Connection::open(&temp_db_path)
-                .map_err(|e| DuckDbError::Internal(e.to_string()))?;
+            let dest = storage::open_connection(Some(&temp_db_path), max_memory)?;
 
             storage::copy_tables(conn, &dest)?;
 
@@ -329,8 +365,11 @@ fn handle_message(
                     let parsed =
                         validate_sql(conn, stmt_sql, caveats, ability, &mut storage_guard)?;
                     write_targets.extend(parsed.write_targets);
-                    conn.execute_batch(stmt_sql)
-                        .map_err(|e| DuckDbError::SchemaError(e.to_string()))?;
+                    {
+                        let _timer = QueryTimer::new();
+                        conn.execute_batch(stmt_sql)
+                            .map_err(|e| DuckDbError::SchemaError(e.to_string()))?;
+                    }
                 }
             }
 
@@ -481,6 +520,7 @@ impl StorageGuard {
 fn catalog_objects(conn: &duckdb::Connection) -> Result<BTreeSet<(i32, i64, i64)>, DuckDbError> {
     // Fully qualify built-ins so user macros/search_path cannot shadow them.
     // OIDs, rather than object counts, detect DROP + recreate under one name.
+    let _timer = QueryTimer::new();
     let mut statement = conn
         .prepare(
             "SELECT 0, database_oid, table_oid FROM system.main.duckdb_tables()
@@ -523,9 +563,11 @@ fn handle_message_without_growth(
     // The actor owns the connection throughout validation, catalog inspection,
     // and execution. Even non-transactional batches need this boundary so a
     // later growth refusal cannot retain earlier DELETE/DROP/schema effects.
-    let transaction = conn
-        .unchecked_transaction()
-        .map_err(|e| DuckDbError::DuckDb(e.to_string()))?;
+    let transaction = {
+        let _timer = QueryTimer::new();
+        conn.unchecked_transaction()
+            .map_err(|e| DuckDbError::DuckDb(e.to_string()))?
+    };
     let mut guard = StorageGuard::default();
     let result = handle_message(
         &transaction,
@@ -537,15 +579,21 @@ fn handle_message_without_growth(
     );
     match result.and_then(|result| guard.finish(&transaction).map(|()| result)) {
         Ok(result) => {
-            transaction
-                .commit()
-                .map_err(|e| DuckDbError::DuckDb(e.to_string()))?;
+            {
+                let _timer = QueryTimer::new();
+                transaction
+                    .commit()
+                    .map_err(|e| DuckDbError::DuckDb(e.to_string()))?;
+            }
             Ok(result)
         }
         Err(error) => {
-            transaction
-                .rollback()
-                .map_err(|e| DuckDbError::DuckDb(e.to_string()))?;
+            {
+                let _timer = QueryTimer::new();
+                transaction
+                    .rollback()
+                    .map_err(|e| DuckDbError::DuckDb(e.to_string()))?;
+            }
             Err(error)
         }
     }
@@ -590,9 +638,11 @@ fn execute_query(
     sql: &str,
     params: &[DuckDbValue],
 ) -> Result<QueryResponse, DuckDbError> {
+    let mut timer = QueryTimer::new();
     let mut stmt = conn
         .prepare(sql)
         .map_err(|e| DuckDbError::DuckDb(e.to_string()))?;
+    timer.pause();
 
     let duckdb_params: Vec<duckdb::types::Value> =
         params.iter().map(duckdb_value_to_param).collect();
@@ -601,9 +651,11 @@ fn execute_query(
         .map(|p| p as &dyn duckdb::types::ToSql)
         .collect();
 
+    timer.resume();
     let mut query_rows = stmt
         .query(param_refs.as_slice())
         .map_err(|e| DuckDbError::DuckDb(e.to_string()))?;
+    timer.pause();
 
     // column_names() must be called after query() — the duckdb crate
     // only populates the schema once the statement has been executed.
@@ -616,10 +668,13 @@ fn execute_query(
     let mut rows = Vec::new();
     let mut size_estimate: usize = 0;
 
-    while let Some(row) = query_rows
-        .next()
-        .map_err(|e| DuckDbError::DuckDb(e.to_string()))?
-    {
+    loop {
+        timer.resume();
+        let next = query_rows.next();
+        timer.pause();
+        let Some(row) = next.map_err(|e| DuckDbError::DuckDb(e.to_string()))? else {
+            break;
+        };
         let mut values = Vec::new();
         for i in 0..columns.len() {
             let val = row_to_duckdb_value(row, i)?;
@@ -646,9 +701,11 @@ fn execute_query_arrow(
     sql: &str,
     params: &[DuckDbValue],
 ) -> Result<Vec<u8>, DuckDbError> {
+    let mut timer = QueryTimer::new();
     let mut stmt = conn
         .prepare(sql)
         .map_err(|e| DuckDbError::DuckDb(e.to_string()))?;
+    timer.pause();
 
     let duckdb_params: Vec<duckdb::types::Value> =
         params.iter().map(duckdb_value_to_param).collect();
@@ -657,9 +714,11 @@ fn execute_query_arrow(
         .map(|p| p as &dyn duckdb::types::ToSql)
         .collect();
 
+    timer.resume();
     let arrow_result = stmt
         .query_arrow(param_refs.as_slice())
         .map_err(|e| DuckDbError::DuckDb(e.to_string()))?;
+    timer.pause();
 
     let schema = arrow_result.get_schema();
     let mut buf = Vec::new();
@@ -668,7 +727,14 @@ fn execute_query_arrow(
         let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut buf, &schema)
             .map_err(|e| DuckDbError::Internal(format!("Arrow writer error: {}", e)))?;
 
-        for batch in arrow_result {
+        let mut arrow_result = arrow_result;
+        loop {
+            timer.resume();
+            let next = arrow_result.next();
+            timer.pause();
+            let Some(batch) = next else {
+                break;
+            };
             writer
                 .write(&batch)
                 .map_err(|e| DuckDbError::Internal(format!("Arrow write error: {}", e)))?;
@@ -697,9 +763,11 @@ fn execute_statement(
         .map(|p| p as &dyn duckdb::types::ToSql)
         .collect();
 
-    let changes = conn
-        .execute(sql, param_refs.as_slice())
-        .map_err(|e| DuckDbError::DuckDb(e.to_string()))?;
+    let changes = {
+        let _timer = QueryTimer::new();
+        conn.execute(sql, param_refs.as_slice())
+            .map_err(|e| DuckDbError::DuckDb(e.to_string()))?
+    };
 
     Ok(ExecuteResponse {
         changes: changes as u64,
@@ -722,22 +790,29 @@ fn execute_batch_transactional(
     conn: &duckdb::Connection,
     statements: &[DuckDbStatement],
 ) -> Result<BatchResponse, DuckDbError> {
-    conn.execute_batch("BEGIN TRANSACTION;")
-        .map_err(|e| DuckDbError::DuckDb(e.to_string()))?;
+    {
+        let _timer = QueryTimer::new();
+        conn.execute_batch("BEGIN TRANSACTION;")
+            .map_err(|e| DuckDbError::DuckDb(e.to_string()))?;
+    }
 
     let mut results = Vec::new();
     for stmt in statements {
         match execute_statement(conn, &stmt.sql, &stmt.params) {
             Ok(result) => results.push(result),
             Err(e) => {
+                let _timer = QueryTimer::new();
                 let _ = conn.execute_batch("ROLLBACK;");
                 return Err(e);
             }
         }
     }
 
-    conn.execute_batch("COMMIT;")
-        .map_err(|e| DuckDbError::DuckDb(e.to_string()))?;
+    {
+        let _timer = QueryTimer::new();
+        conn.execute_batch("COMMIT;")
+            .map_err(|e| DuckDbError::DuckDb(e.to_string()))?;
+    }
 
     Ok(BatchResponse { results })
 }
@@ -771,7 +846,7 @@ mod tests {
 
     #[test]
     fn full_database_allows_existing_schema_delete_and_drop() {
-        let conn = storage::open_connection(&StorageMode::InMemory, "128MB").unwrap();
+        let conn = storage::open_connection(None, "128MB").unwrap();
         conn.execute_batch(
             "CREATE TABLE \"Event.Log\" (id INTEGER);
              CREATE INDEX event_id ON \"Event.Log\" (id);
@@ -810,7 +885,7 @@ mod tests {
 
     #[test]
     fn full_database_refuses_rows_and_new_if_not_exists_objects() {
-        let conn = storage::open_connection(&StorageMode::InMemory, "128MB").unwrap();
+        let conn = storage::open_connection(None, "128MB").unwrap();
         conn.execute_batch("CREATE TABLE events (id INTEGER); INSERT INTO events VALUES (1)")
             .unwrap();
         let before = catalog_objects(&conn).unwrap();
@@ -844,7 +919,7 @@ mod tests {
     #[test]
     fn full_database_rolls_back_drop_and_recreate_in_either_batch_mode() {
         for transactional in [false, true] {
-            let conn = storage::open_connection(&StorageMode::InMemory, "128MB").unwrap();
+            let conn = storage::open_connection(None, "128MB").unwrap();
             conn.execute_batch("CREATE TABLE events (id INTEGER); INSERT INTO events VALUES (1)")
                 .unwrap();
             let before = catalog_objects(&conn).unwrap();
@@ -877,7 +952,7 @@ mod tests {
 
     #[test]
     fn full_database_rolls_back_schema_mutations_and_rejects_transaction_escape() {
-        let conn = storage::open_connection(&StorageMode::InMemory, "128MB").unwrap();
+        let conn = storage::open_connection(None, "128MB").unwrap();
         conn.execute_batch("CREATE TABLE events (id INTEGER); INSERT INTO events VALUES (1)")
             .unwrap();
         let before = catalog_objects(&conn).unwrap();
@@ -909,7 +984,7 @@ mod tests {
 
     #[test]
     fn full_database_preserves_schema_caveats_and_prepared_statement_parameters() {
-        let conn = storage::open_connection(&StorageMode::InMemory, "128MB").unwrap();
+        let conn = storage::open_connection(None, "128MB").unwrap();
         conn.execute_batch(
             "CREATE TABLE events (id INTEGER);
              CREATE TABLE private (id INTEGER);

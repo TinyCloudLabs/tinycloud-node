@@ -77,6 +77,7 @@ pub mod query_builder;
 pub mod query_scalar;
 
 pub mod raw_sql;
+pub mod request_telemetry;
 pub mod row;
 pub mod rt;
 pub mod sync;

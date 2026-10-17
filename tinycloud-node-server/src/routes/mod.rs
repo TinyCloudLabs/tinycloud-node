@@ -321,13 +321,11 @@ pub async fn open_host_key(
     s: &State<TinyCloud>,
     space: &str,
 ) -> Result<String, (Status, &'static str)> {
-    s.stage_key(
-        &space
-            .parse()
-            .map_err(|_| (Status::BadRequest, "Invalid space ID"))?,
-    )
-    .await
-    .map_err(|_| {
+    let space = space
+        .parse()
+        .map_err(|_| (Status::BadRequest, "Invalid space ID"))?;
+    tinycloud_core::request_telemetry::observe_space(&space);
+    s.stage_key(&space).await.map_err(|_| {
         (
             Status::InternalServerError,
             "Failed to stage keypair for space",
@@ -1667,6 +1665,9 @@ async fn invoke_impl(
                 };
                 (Status::Unauthorized, message)
             })?;
+        for space in admitted.invocation().0.spaces() {
+            tinycloud_core::request_telemetry::observe_space(space);
+        }
 
         // TC-732: `kv/sync` must be the invocation's only capability and
         // target a KV resource. The KV root is the whole-space feed. Check
@@ -2273,8 +2274,12 @@ async fn emit_kv_hook_events(
 
     let tx = match tinycloud.readable().await {
         Ok(tx) => tx,
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to read committed hook events");
+        Err(_) => {
+            tracing::warn!(
+                operation = "hook_read",
+                error_class = "database",
+                "failed to read committed hook events"
+            );
             return;
         }
     };
@@ -2288,8 +2293,12 @@ async fn emit_kv_hook_events(
         .await
     {
         Ok(rows) => rows,
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to load kv write hook rows");
+        Err(_) => {
+            tracing::warn!(
+                operation = "hook_write_rows",
+                error_class = "database",
+                "failed to load kv write hook rows"
+            );
             return;
         }
     };
@@ -2300,8 +2309,12 @@ async fn emit_kv_hook_events(
         .await
     {
         Ok(rows) => rows,
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to load kv delete hook rows");
+        Err(_) => {
+            tracing::warn!(
+                operation = "hook_delete_rows",
+                error_class = "database",
+                "failed to load kv delete hook rows"
+            );
             return;
         }
     };
@@ -3362,8 +3375,12 @@ fn spawn_database_hook_delivery(
             enqueue_start.elapsed(),
         );
 
-        if let Err(error) = enqueue_result {
-            tracing::warn!(error = %error, "database write committed but webhook enqueue failed");
+        if enqueue_result.is_err() {
+            tracing::warn!(
+                operation = "hook_enqueue",
+                error_class = "database",
+                "database write committed but webhook enqueue failed"
+            );
             return;
         }
 
@@ -3660,6 +3677,8 @@ async fn verify_auth_admitted(
 
 #[cfg(test)]
 mod tests {
+    mod revocation_scope;
+
     use super::*;
     use crate::{
         config::{Config, HooksConfig},
@@ -4946,7 +4965,7 @@ mod tests {
 
         let rocket = rocket::build()
             .mount("/", rocket::routes![invoke])
-            .attach(crate::tracing::TracingFairing::new(
+            .attach(crate::tracing::TracingFairing::for_test(
                 &Config::default().log.tracing,
             ))
             .manage(tinycloud)
@@ -5200,7 +5219,7 @@ mod tests {
 
         let rocket = rocket::build()
             .mount("/", rocket::routes![invoke])
-            .attach(crate::tracing::TracingFairing::new(
+            .attach(crate::tracing::TracingFairing::for_test(
                 &Config::default().log.tracing,
             ))
             .manage(tinycloud)
@@ -5682,6 +5701,21 @@ mod tests {
             wallet_pkh.parse::<DIDBuf>()?,
             "control".parse().expect("valid space name"),
         );
+        abilities::ActiveModel {
+            delegation: Set(wallet_child_id),
+            resource: Set(Resource::TinyCloud(
+                wallet_control_space.clone().to_resource(
+                    "kv".parse()?,
+                    Some("notes/status".parse()?),
+                    None,
+                    None,
+                ),
+            )),
+            ability: Set(Ability::try_from("tinycloud.kv/get".to_string())?),
+            caveats: Set(Default::default()),
+        }
+        .insert(&conn)
+        .await?;
         let control_resource = Resource::TinyCloud(wallet_control_space.clone().to_resource(
             "delegation".parse()?,
             None,
@@ -5859,7 +5893,7 @@ mod tests {
                 "/",
                 rocket::routes![delegation_status, delegation_query, revoke],
             )
-            .attach(crate::tracing::TracingFairing::new(
+            .attach(crate::tracing::TracingFairing::for_test(
                 &Config::default().log.tracing,
             ))
             .manage(tinycloud);
@@ -6633,7 +6667,7 @@ mod tests {
         let conn = setup.replay_db.clone();
         let rocket = rocket::build()
             .mount("/", rocket::routes![invoke])
-            .attach(crate::tracing::TracingFairing::new(
+            .attach(crate::tracing::TracingFairing::for_test(
                 &Config::default().log.tracing,
             ))
             .manage(setup.tinycloud)
@@ -7471,7 +7505,7 @@ mod tests {
 
         let rocket = rocket::build()
             .mount("/", rocket::routes![delegate])
-            .attach(crate::tracing::TracingFairing::new(
+            .attach(crate::tracing::TracingFairing::for_test(
                 &Config::default().log.tracing,
             ))
             .manage(tinycloud)
@@ -7686,7 +7720,7 @@ mod tests {
         let build_client = |tc: TinyCloud, db: tinycloud_core::sea_orm::DatabaseConnection| async move {
             let r = rocket::build()
                 .mount("/", rocket::routes![delegate])
-                .attach(crate::tracing::TracingFairing::new(
+                .attach(crate::tracing::TracingFairing::for_test(
                     &Config::default().log.tracing,
                 ))
                 .manage(tc)
@@ -7969,7 +8003,7 @@ mod tests {
         let hook_runtime = HookRuntime::new(HooksConfig::default(), [9u8; 32]);
         let rocket = rocket::build()
             .mount("/", rocket::routes![invoke])
-            .attach(crate::tracing::TracingFairing::new(
+            .attach(crate::tracing::TracingFairing::for_test(
                 &Config::default().log.tracing,
             ))
             .manage(tinycloud)
@@ -8277,7 +8311,7 @@ mod tests {
         };
         let rocket = rocket::build()
             .mount("/", rocket::routes![invoke, info, delegate])
-            .attach(crate::tracing::TracingFairing::new(
+            .attach(crate::tracing::TracingFairing::for_test(
                 &Config::default().log.tracing,
             ))
             .manage(tinycloud)
@@ -8533,6 +8567,63 @@ mod tests {
     }
 
     // ── TC-732: `tinycloud.kv/sync` through the real `/invoke` route ──
+
+    #[tokio::test]
+    async fn public_and_host_key_telemetry_uses_target_not_caller() -> Result<()> {
+        use tinycloud_core::request_telemetry::{scope, RequestContext};
+        use tinycloud_core::telemetry::Pseudonymizer;
+        let f = KvSyncFixture::new().await?;
+        let tinycloud = State::from(f.client.rocket().state::<TinyCloud>().unwrap());
+        let secret = tinycloud_core::keys::StaticSecret::new(vec![63; 32]).unwrap();
+        let pseudonyms = std::sync::Arc::new(Pseudonymizer::new(&secret));
+        let public_context = RequestContext::new(uuid::Uuid::new_v4(), pseudonyms.clone());
+        let limiter = public::RateLimiter::new(&crate::config::PublicSpacesConfig::default());
+        let ip = || public::ClientIp("127.0.0.1".parse().unwrap());
+        // A parseable private target is not enough for public resource attribution.
+        let denied = scope(
+            public_context.clone(),
+            public::public_kv_list(
+                &f.space.to_string(),
+                None,
+                ip(),
+                State::from(&limiter),
+                tinycloud,
+            ),
+        )
+        .await;
+        assert!(matches!(denied, Err((status, _)) if status == Status::Forbidden));
+        assert!(public_context.hashes().space_hash.is_none());
+        let target = SpaceId::new(f.space.did().to_owned(), "public".parse()?);
+        let _ = scope(
+            public_context.clone(),
+            public::public_kv_list(
+                &target.to_string(),
+                None,
+                ip(),
+                State::from(&limiter),
+                tinycloud,
+            ),
+        )
+        .await;
+        let expected = RequestContext::new(uuid::Uuid::new_v4(), pseudonyms.clone());
+        expected.observe_space(&target);
+        assert_eq!(public_context.hashes(), expected.hashes());
+        let host_context = RequestContext::new(uuid::Uuid::new_v4(), pseudonyms);
+        assert!(
+            scope(host_context.clone(), open_host_key(tinycloud, "invalid"))
+                .await
+                .is_err()
+        );
+        assert!(host_context.hashes().space_hash.is_none());
+        scope(
+            host_context.clone(),
+            open_host_key(tinycloud, &target.to_string()),
+        )
+        .await
+        .map_err(|(_, error)| anyhow::anyhow!(error))?;
+        assert_eq!(host_context.hashes(), expected.hashes());
+        Ok(())
+    }
 
     /// An owner-hosted space on a real `/invoke` rocket, plus a device key the
     /// owner delegates to through directly inserted graph rows (the same

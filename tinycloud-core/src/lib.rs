@@ -1,4 +1,5 @@
 pub mod admission;
+pub mod at_rest;
 pub(crate) mod auth_graph;
 pub mod database_artifacts;
 pub mod database_identity;
@@ -23,6 +24,7 @@ pub mod policy_authority;
 pub mod policy_capability;
 mod read_audit;
 pub mod relationships;
+pub mod request_telemetry;
 pub mod share_email;
 pub mod sql;
 pub mod sql_sizes;

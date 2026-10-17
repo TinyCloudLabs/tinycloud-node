@@ -24,6 +24,7 @@ pub mod m20261005_000000_current_kv_sync_order;
 pub mod m20261005_000000_deactivate_hook_subscriptions;
 pub mod m20261007_000000_database_alias;
 pub mod m20261007_010000_database_identity_fence;
+pub mod m20261014_000000_delegation_cid_alias;
 pub mod m20261015_000000_delegation_cursor_index;
 pub mod m20261015_020000_kv_orphan_candidates;
 
@@ -58,6 +59,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261005_000000_deactivate_hook_subscriptions::Migration),
             Box::new(m20261007_000000_database_alias::Migration),
             Box::new(m20261007_010000_database_identity_fence::Migration),
+            Box::new(m20261014_000000_delegation_cid_alias::Migration),
             Box::new(m20261015_000000_delegation_cursor_index::Migration),
             Box::new(m20261015_020000_kv_orphan_candidates::Migration),
         ]
@@ -77,7 +79,7 @@ mod release_line_tests {
             return;
         };
         let admin = Database::connect(url.clone()).await.unwrap();
-        let base_count = (Migrator::migrations().len() - 2) as u32;
+        let base_count = (Migrator::migrations().len() - 3) as u32;
         for path in ["fresh", "release"] {
             let schema = format!(
                 "tc780_{path}_{}_{}",
@@ -134,6 +136,7 @@ mod release_line_tests {
                 .collect();
             assert!(versions.contains(&"m20261007_000000_database_alias".to_string()));
             assert!(versions.contains(&"m20261007_010000_database_identity_fence".to_string()));
+            assert!(versions.contains(&"m20261014_000000_delegation_cid_alias".to_string()));
             drop(db);
             admin
                 .execute(Statement::from_string(
