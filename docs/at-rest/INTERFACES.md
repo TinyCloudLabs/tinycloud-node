@@ -299,7 +299,9 @@ redacted.
 - **Accepted residual (header trust):** `Content-Length`/`Content-Range`/416 totals come from the
   unverified header. A forged header can only produce a wrong total or a body that aborts with
   no unauthenticated bytes (test `storage::sealed::tests::forged_header_length_aborts_without_extra_bytes`),
-  never wrong bytes.
+  never wrong bytes. On S3 a range read's segment GET is pinned to the header GET's ETag
+  (`If-Match`): if the object is replaced or removed in between, the read starts over once, then
+  answers 503. It never falls back to the legacy name once a sealed header was read.
 - **Quota:** plaintext bytes. Sealed objects are scanned by `space_tag` and joined to a space when
   the object-name key is unlocked (lazily, per lookup), so the first quota check after an unlock
   counts legacy + sealed. While locked, a space reports legacy bytes only (writes are 503 then).

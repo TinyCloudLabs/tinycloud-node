@@ -355,6 +355,11 @@ jobs:
         (set -a; . "$TC887_RUN_DIR/harness.env"; set +a
          cargo test --locked -p tinycloud-node --test s3_block_store -- --ignored)
 
+    - name: S3 block store with encryption at rest (against the harness MinIO)
+      run: |
+        (set -a; . "$TC887_RUN_DIR/harness.env"; set +a
+         cargo test --locked -p tinycloud-node --test at_rest_s3_store -- --ignored)
+
     - name: Harness logs
       if: failure()
       run: |
