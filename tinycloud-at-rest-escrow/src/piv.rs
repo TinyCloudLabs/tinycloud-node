@@ -94,3 +94,70 @@ impl age::Recipient for PivRecipient {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::io::Read;
+
+    use age::Identity as _;
+
+    use super::*;
+    use crate::test_support::*;
+
+    #[test]
+    fn the_released_plugins_output_opens_with_the_test_identity() {
+        let decryptor =
+            age::Decryptor::new_buffered(age::armor::ArmoredReader::new(PLUGIN_VECTOR.as_bytes()))
+                .unwrap();
+        let identity = plugin_vector_identity();
+        let mut plain = Vec::new();
+        decryptor
+            .decrypt(std::iter::once(&identity as &dyn age::Identity))
+            .unwrap()
+            .read_to_end(&mut plain)
+            .unwrap();
+        assert_eq!(plain, PLUGIN_VECTOR_MESSAGE);
+        // Our recipient parser reads the plugin's recipient string.
+        assert!(PLUGIN_VECTOR_RECIPIENT.parse::<PivRecipient>().is_ok());
+    }
+
+    #[test]
+    fn our_stanza_has_the_plugins_shape_and_bad_shapes_are_refused() {
+        let identity = plugin_vector_identity();
+        let recipient: PivRecipient = PLUGIN_VECTOR_RECIPIENT.parse().unwrap();
+        let file_key = FileKey::new(Box::new([7u8; 16]));
+        let (stanzas, _) = age::Recipient::wrap_file_key(&recipient, &file_key).unwrap();
+        let stanza = &stanzas[0];
+        assert_eq!(stanza.tag, "piv-p256");
+        assert_eq!((stanza.args[0].len(), stanza.args[1].len()), (6, 44));
+        assert_eq!(stanza.body.len(), 32);
+        let opened = identity.unwrap_stanza(stanza).unwrap().unwrap();
+        assert_eq!(opened.expose_secret(), &[7u8; 16]);
+
+        // What the plugin rejects as structurally invalid, the identity does too.
+        let epk = BASE64_STANDARD_NO_PAD.decode(&stanza.args[1]).unwrap();
+        let point = PublicKey::from_sec1_bytes(&epk).unwrap();
+        let uncompressed = BASE64_STANDARD_NO_PAD.encode(point.to_encoded_point(false).as_bytes());
+        type Mutation = Box<dyn Fn(&mut Stanza)>;
+        let mutations: Vec<Mutation> = vec![
+            Box::new(move |s| s.args[1] = uncompressed.clone()),
+            Box::new(|s| s.args[0].push('A')),
+            Box::new(|s| {
+                s.args.pop();
+            }),
+            Box::new(|s| s.body.push(0)),
+        ];
+        for mutate in mutations {
+            let mut bad = Stanza {
+                tag: stanza.tag.clone(),
+                args: stanza.args.clone(),
+                body: stanza.body.clone(),
+            };
+            mutate(&mut bad);
+            assert!(matches!(identity.unwrap_stanza(&bad), Some(Err(_))));
+        }
+        // Another key's stanza is not ours.
+        let (other, _) = piv_identity();
+        assert!(other.unwrap_stanza(stanza).is_none());
+    }
+}

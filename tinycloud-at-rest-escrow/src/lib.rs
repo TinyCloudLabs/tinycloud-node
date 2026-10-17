@@ -255,20 +255,25 @@ pub(crate) fn sha256(bytes: &[u8]) -> [u8; 32] {
 }
 
 /// Parse a versioned JSON document: read `version` first, so a newer format
-/// is reported as such instead of as an unknown field; then parse strictly.
+/// is reported as such instead of as an unknown field; then parse the typed
+/// struct strictly from the original bytes (duplicate keys and unknown
+/// fields are refused).
 pub(crate) fn parse_versioned<T: serde::de::DeserializeOwned>(
     bytes: &[u8],
     what: &'static str,
     supported: u32,
 ) -> Result<T, EscrowError> {
+    #[derive(serde::Deserialize)]
+    struct Peek {
+        version: Option<u64>,
+    }
     let json_err = |e: serde_json::Error| EscrowError::Json {
         what,
         reason: e.to_string(),
     };
-    let value: serde_json::Value = serde_json::from_slice(bytes).map_err(json_err)?;
-    let found = value
-        .get("version")
-        .and_then(serde_json::Value::as_u64)
+    let found = serde_json::from_slice::<Peek>(bytes)
+        .map_err(json_err)?
+        .version
         .ok_or_else(|| EscrowError::Json {
             what,
             reason: "no numeric `version` field".into(),
@@ -280,7 +285,7 @@ pub(crate) fn parse_versioned<T: serde::de::DeserializeOwned>(
             supported,
         });
     }
-    serde_json::from_value(value).map_err(json_err)
+    serde_json::from_slice(bytes).map_err(json_err)
 }
 
 const CANARY_INFO: &[u8] = b"tinycloud/at-rest/escrow-canary/v1";

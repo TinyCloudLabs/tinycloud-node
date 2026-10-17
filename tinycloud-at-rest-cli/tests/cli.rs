@@ -259,6 +259,29 @@ fn input_problems_are_errors_not_refusals() {
     v2["kdf"] = "x".into();
     let v2 = f.write("v2.json", &serde_json::to_vec(&v2).unwrap());
     expect(&run(&["inspect", "--bundle", p(&v2)], None), 1, "version 2");
+    // A bad download (HTML, truncated JSON) is an input error, not a refusal.
+    let html = f.write("html.json", b"<html>502 Bad Gateway</html>");
+    expect(&run(&["inspect", "--bundle", p(&html)], None), 3, "ERROR");
+    // A recovery response in an unknown state is malformed input too.
+    let mut info = serde_json::to_value(f.info("dstack", Some("00"))).unwrap();
+    info["state"] = "rebooting".into();
+    let r = f.write("weird.json", &serde_json::to_vec(&info).unwrap());
+    let out = run(
+        &[
+            "verify-node",
+            "--bundle",
+            p(&b),
+            "--allow-software",
+            "--recovery",
+            p(&r),
+            "--nonce",
+            NONCE,
+            "--trust",
+            p(&b),
+        ],
+        None,
+    );
+    expect(&out, 3, "state must be");
 }
 
 #[test]
@@ -419,12 +442,13 @@ fn self_test_round_trips_and_refuses_software_by_default() {
             &recipient,
             "--allow-software",
             "--out",
-            p(&f.dir),
+            // A directory that doesn't exist yet: self-test creates it.
+            p(&f.dir.join("st/new")),
         ],
         None,
     );
     expect(&out, 0, "THROWAWAY");
-    let armored = std::fs::read_to_string(f.path("selftest-share.age")).unwrap();
+    let armored = std::fs::read_to_string(f.dir.join("st/new/selftest-share.age")).unwrap();
     let decryptor =
         age::Decryptor::new_buffered(age::armor::ArmoredReader::new(armored.as_bytes())).unwrap();
     let mut plain = Vec::new();
@@ -433,7 +457,7 @@ fn self_test_round_trips_and_refuses_software_by_default() {
         .unwrap()
         .read_to_end(&mut plain)
         .unwrap();
-    let bundle = f.path("selftest-bundle.json");
+    let bundle = f.dir.join("st/new/selftest-bundle.json");
     expect(
         &run(
             &["check-share", "--bundle", p(&bundle), "--allow-software"],

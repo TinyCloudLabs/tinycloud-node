@@ -29,7 +29,7 @@ cargo build --release --locked --manifest-path tinycloud-at-rest-cli/Cargo.toml
   - The sealed plaintext is `"TCS1" ‖ ark_id(16) ‖ generation u32 BE ‖ i ‖ share(33)`, 58 bytes.
 - **Recipients.** Each share is age-encrypted (`age` 0.12.1, ASCII armor) to one holder. The recipient type can be:
   - `age1yubikey1…` (`piv-p256` stanza). This is what released age-plugin-yubikey (0.5.x) prints and decrypts. The stanza is produced exactly as the plugin's own `wrap_file_key`, so the TEE needs no plugin.
-  - `age1tag1…` (`p256tag` stanza). This is native age 1.3 tagged P-256. Decrypting it needs a plugin build that supports it.
+  - `age1tag1…` (`p256tag` stanza). This is native age 1.3 tagged P-256. The released age-plugin-yubikey 0.5.1 **cannot** decrypt it, so every command warns when a holder uses one.
   - `age1…` X25519. These are software keys, refused unless software recipients are explicitly allowed (`--allow-software` on the CLI; tests and self-hosted nodes only). Every command prints a warning while that is in effect.
   - A recipient format proves which kind of key decrypts, **not** where the private key lives. That a P-256 key was generated on a YubiKey is established in the escrow ceremony.
 - **Commitment.** `SHA-256(lp("tinycloud/at-rest/escrow-share-commit/v1") ‖ ark_id ‖ generation ‖ i ‖ lp(share))`.
@@ -67,7 +67,7 @@ Exit codes:
 | `inspect --bundle B` | bundle | EFP, ark_id, generation, canary_fp, each holder's recipient kind |
 | `extract-share --bundle B --holder H` | bundle | holder H's armored age file |
 | `check-share --bundle B` | decrypted share on **stdin** | which share it is; refuses on a commitment mismatch (e.g. a share from an earlier split) |
-| `verify-compose --app-compose A --trust T` | the deployment's `app-compose.json` | OK if it hashes to `compose_hash` and every `image:` is `…@sha256:<digest>` |
+| `verify-compose --app-compose A --trust T` | the deployment's `app-compose.json` | OK if it hashes to `compose_hash` and its compose YAML passes the strict check below; also lists the other app-compose settings to review |
 | `verify-node --bundle B --recovery R --nonce N --trust T [--collateral C \| --pccs-url U]` | node's recovery response | OK (with node state and shares held) or REFUSED |
 | `share-wrap` (same flags) | decrypted share on **stdin** | after `verify-node` passes: the share sealed to the node's recovery key |
 | `record-efp --bundle B --record V` | record | `TINYCLOUD_AT_REST__ESCROW__VERIFIED_FP=<efp>`, marked NOT AUTHENTICATED: the record's MAC is checked only in the TEE |
@@ -97,7 +97,13 @@ All of these must hold, or the command prints `REFUSED: …` and exits 1:
 
 Not pinned: `key-provider`, `instance-id`, `os-image-hash`, XFAM, MRCONFIGID, MROWNER and MROWNERCONFIG. RTMR0-2 and the compose hash cover what the per-boot, in-memory recovery key depends on.
 
-`compose_hash` pins container images only if `app-compose.json` references every image by `@sha256:` digest. Check that with `verify-compose` when building the trust policy.
+`compose_hash` pins container images only if `app-compose.json` references every image by digest. `verify-compose` parses the compose YAML with a real parser and accepts only a small subset:
+- exactly one document;
+- no anchors, aliases, merge keys, tags or duplicate keys;
+- a `services` mapping, and no `include`;
+- every service has a string `image` of the form `<name>[:tag]@sha256:<64 lowercase hex>`, with no `build` or `extends`.
+
+Anything else is refused. Run it when building the trust policy.
 
 A PCCS can't forge collateral, which is Intel-signed. A malicious PCCS can, however, serve older collateral that is still valid (TCB info is valid for about 30 days), which could hide a TCB recovery for that long. Use Intel PCS when that matters.
 
