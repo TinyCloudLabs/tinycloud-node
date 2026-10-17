@@ -46,6 +46,8 @@ pub enum EnvelopeError {
     Header(&'static str),
     /// A well-formed TCE header (or payload encoding) of a later format
     /// generation than this build reads. Not corruption: upgrade the node.
+    /// Unauthenticated (anyone who can write the bytes can produce it), so
+    /// callers must fail closed: never treat it as legacy, re-seal or skip.
     #[error("unsupported at-rest format version {version}")]
     Unsupported { version: u8 },
     /// The header names a different data key than the one supplied.

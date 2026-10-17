@@ -54,8 +54,10 @@ tokio.workspace = true
 duckdb = { version = "1.1", features = ["bundled", "appender-arrow"], optional = true }
 arrow = { version = "56", features = ["ipc"], optional = true }
 tempfile = "3"
-# TC-887: `zeroize` wipes the AES key schedule and GHASH key on drop; `aes` is
-# listed only to enable its `zeroize` feature (feature unification).
+# TC-887: `zeroize` wipes the AES key schedule on drop; `aes` is listed only to
+# enable its `zeroize` feature (feature unification). Not wiped (accepted
+# residual): the GHASH key H (polyval 0.6.2's autodetect backend keeps it in a
+# ManuallyDrop union with no Drop), the hkdf PRK and the hmac state.
 aes-gcm = { version = "0.10.3", features = ["zeroize"] }
 aes = { version = "0.8", features = ["zeroize"] }
 rand = "0.8"
