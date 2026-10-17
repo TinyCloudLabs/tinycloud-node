@@ -1,5 +1,7 @@
 pub mod abilities;
 pub mod actor;
+pub mod at_rest_escrow;
+pub mod at_rest_key;
 pub mod current_kv;
 pub mod database_alias;
 pub mod database_artifact;
@@ -40,3 +42,4 @@ pub mod share_policy_presentation_jti;
 pub mod share_session_handle;
 pub mod signed_kv_ticket;
 pub mod space;
+pub mod space_data_key;
