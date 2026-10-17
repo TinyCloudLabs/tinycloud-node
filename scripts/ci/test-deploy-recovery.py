@@ -86,7 +86,6 @@ elif name=='git':
 elif name=='node':
     names=[line.split('=',1)[0] for line in Path('.phala-prod.env').read_text().splitlines()]
     assert 'BETTERSTACK_SOURCE_TOKEN' in names and 'QUOTA_BILLING_ADMIN_SECRET' not in names
-    assert os.environ['QUOTA_BILLING_ADMIN_SECRET'] not in Path('.phala-prod.env').read_text()
     if args[-1]=='--check': event('whitelist-check')
     else:
         event('whitelist-sync')
@@ -171,8 +170,7 @@ class RecoveryTests(unittest.TestCase):
         if missing_authorization:
             inputs.pop("authorize_quota_values", None)
         canary = secrets.token_urlsafe(32)
-        billing_canary = secrets.token_urlsafe(32)
-        CANARIES.extend([canary, billing_canary])
+        CANARIES.append(canary)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory); binaries = root / "bin"; binaries.mkdir()
             for name in ("docker", "git", "node", "phala", "curl", "sleep"):
@@ -217,7 +215,8 @@ class RecoveryTests(unittest.TestCase):
                         "APPROVED_ROLLBACK_PRIVACY_MODE": approved_privacy, "INCLUDE_DUCKDB": "false", "INCLUDE_TC_BENCH_V1": "false",
                         "DEPLOY_VERSION": inputs["image_version"], "OCI_LABEL": oci_label or inputs["image_version"] + "-dstack",
                         "OCI_REVISION": oci_revision or inputs.get("rollback_image_revision") or "f" * 40,
-                        "QUOTA_ADMIN_SECRET": canary, "QUOTA_BILLING_ADMIN_SECRET": billing_canary,
+                        # Production maps both from PROD_TINYCLOUD_ADMIN_SECRET: one shared value.
+                        "QUOTA_ADMIN_SECRET": canary, "QUOTA_BILLING_ADMIN_SECRET": canary,
                         "QUOTA_BILLING_URL": "https://billing.example.invalid/api/quota"})
             if missing_billing: env.pop("QUOTA_BILLING_ADMIN_SECRET")
             context = {"github.event_name": event, "github.ref": ref, "job.success": True,
@@ -242,7 +241,7 @@ class RecoveryTests(unittest.TestCase):
                 if name == "Restore storage quota overrides": context["steps.quotas.outcome"] = "success" if result.returncode == 0 else "failure"
                 if result.returncode != 0: context["job.success"] = False
             report = summary.read_text() if summary.exists() else ""
-            self.assertTrue(all(value not in logs + report for value in (canary, billing_canary)), "Sealed canary leaked")
+            self.assertNotIn(canary, logs + report, "Sealed canary leaked")
             self.assertFalse((root / ".phala-prod.env").exists(), "Sealed env was not cleaned")
             return {"success": context["job.success"], "events": json.loads(state.read_text())["events"],
                     "compose": compose_path.read_bytes(), "summary": report, "logs": logs}

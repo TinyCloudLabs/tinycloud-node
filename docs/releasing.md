@@ -102,8 +102,7 @@ Environment settings (Settings → Environments → `production`):
   `PROD_TINYCLOUD_SHARE_TRUST_BUNDLE_BASE64`,
   `PROD_TINYCLOUD_CLOUDFLARE_API_TOKEN`, `PROD_TINYCLOUD_DSTACK_GATEWAY_DOMAIN`,
   `PROD_TINYCLOUD_CERTBOT_EMAIL`, `PROD_TINYCLOUD_KEYS_SECRET`,
-  `PROD_TINYCLOUD_BETTERSTACK_SOURCE_TOKEN`,
-  **`PROD_TINYCLOUD_BILLING_ADMIN_SECRET`**.
+  `PROD_TINYCLOUD_BETTERSTACK_SOURCE_TOKEN`.
 - Except for the explicit node admin exception, none may also exist as a repository secret; this repository
   must not be selected for the organization secret `PHALA_CLOUD_API_KEY`. A
   same-named repository or organization secret is still readable by a job
@@ -128,12 +127,18 @@ closes that gap.
 `TC780_CUTOVER_READY` stays a repository variable: the build jobs, which have
 no environment, read it too. `GITHUB_TOKEN` is the automatic token.
 
-The new billing admin secret is **not provisioned yet**; Sam must provide it
-through Amos's one window card. It is a separate runner-only credential,
-never copied from a Worker secret by an agent, never passed in argv/logs,
-and never added to the CVM env or `allowed_envs`. Missing node/billing
-credentials or an incompatible billing URL fails before compose/CVM
-mutation. Billing URLs derive strictly from the same HTTPS origin and
+The quota steps send `PROD_TINYCLOUD_ADMIN_SECRET` to billing's
+`/api/admin/storage-comp/:space_id` as well as to the node's admin API.
+Billing's storage-comp guard checks the Worker secret
+`TINYCLOUD_ADMIN_SECRET`, which is the node/billing shared admin value:
+billing uses it for its own calls to the node's `/admin/*` routes, and a
+rotation sets the GitHub secret and the `tinycloud-billing` Worker secret
+to one new value. No separate billing runner secret exists; rotating the
+shared value must update both holders together, or the quota steps fail
+closed with `quota API rejected the request`. The value is never passed in
+argv/logs and never added to the CVM env or `allowed_envs` under a billing
+name. A missing credential or an incompatible billing URL fails before
+compose/CVM mutation. Billing URLs derive strictly from the same HTTPS origin and
 `/api/quota` path of `PROD_TINYCLOUD_QUOTA_URL`; no URL is printed.
 
 Every `deploy_phala=true` command must explicitly include

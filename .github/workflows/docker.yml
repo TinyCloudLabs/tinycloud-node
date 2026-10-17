@@ -598,8 +598,9 @@ jobs:
       - name: Preflight quota authority
         env:
           QUOTA_ADMIN_SECRET: ${{ secrets.PROD_TINYCLOUD_ADMIN_SECRET }}
-          # Separate runner credential; never sealed into the CVM.
-          QUOTA_BILLING_ADMIN_SECRET: ${{ secrets.PROD_TINYCLOUD_BILLING_ADMIN_SECRET }}
+          # Billing's storage-comp guard checks the same shared node/billing
+          # admin value (billing TINYCLOUD_ADMIN_SECRET); see docs/releasing.md.
+          QUOTA_BILLING_ADMIN_SECRET: ${{ secrets.PROD_TINYCLOUD_ADMIN_SECRET }}
           QUOTA_BILLING_URL: ${{ secrets.PROD_TINYCLOUD_QUOTA_URL }}
         run: |
           set -euo pipefail
@@ -1031,7 +1032,7 @@ jobs:
         env:
           # Repository-scoped; never read by an agent or passed in argv.
           QUOTA_ADMIN_SECRET: ${{ secrets.PROD_TINYCLOUD_ADMIN_SECRET }}
-          QUOTA_BILLING_ADMIN_SECRET: ${{ secrets.PROD_TINYCLOUD_BILLING_ADMIN_SECRET }}
+          QUOTA_BILLING_ADMIN_SECRET: ${{ secrets.PROD_TINYCLOUD_ADMIN_SECRET }}
           QUOTA_BILLING_URL: ${{ secrets.PROD_TINYCLOUD_QUOTA_URL }}
         run: |
           set -euo pipefail
