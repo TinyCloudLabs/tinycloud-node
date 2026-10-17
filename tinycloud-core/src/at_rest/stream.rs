@@ -180,8 +180,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for EncryptReader<R> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SegmentRange {
     plaintext_len: u64,
-    start: u64,
-    end: u64,
+    range: ResolvedByteRange,
     first: u64,
     last: u64,
 }
@@ -201,12 +200,7 @@ impl SegmentRange {
 
     /// The plaintext range that will be yielded, for `Content-Range`.
     pub fn plaintext_range(&self) -> ResolvedByteRange {
-        ByteRangeSpec::Inclusive {
-            start: self.start,
-            end: self.end,
-        }
-        .resolve(self.plaintext_len)
-        .expect("constructed from a satisfiable range")
+        self.range
     }
 
     /// Total plaintext size of the blob, for `Content-Range` and 416.
@@ -224,8 +218,7 @@ impl Header {
         let seg = SEGMENT_LEN as u64;
         Some(SegmentRange {
             plaintext_len: self.plaintext_len(),
-            start: r.start(),
-            end: r.end(),
+            range: r,
             first: r.start() / seg,
             last: r.end() / seg,
         })
@@ -279,8 +272,8 @@ impl<R: AsyncRead + Unpin> DecryptReader<R> {
                 "range was mapped for another plaintext length",
             ));
         }
-        let skip = (range.start - range.first * SEGMENT_LEN as u64) as usize;
-        let len = range.end - range.start + 1;
+        let skip = (range.range.start() - range.first * SEGMENT_LEN as u64) as usize;
+        let len = range.range.len();
         Self::build(key, id, header, inner, range.first, range.last, skip, len)
     }
 
