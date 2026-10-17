@@ -246,8 +246,8 @@ jobs:
   # database_artifact (checkpoint and WAL delta). The RED checks assert
   # encryption at rest; until TC-887 S3/S4 land, the step passes only if both
   # fail with their "TC-887 RED:" findings (`--expect red`), and fails loudly
-  # if they error or unexpectedly pass. Switch to `--expect green` (with the
-  # at-rest mode set) when S3/S4 merge.
+  # if they error or unexpectedly pass. When S3 lands, start the harness with
+  # the at-rest mode set and expect `kv=green,sql=red`; when S4 lands, `green`.
   at-rest-harness:
     name: at-rest harness (native PostgreSQL + MinIO)
     runs-on: ubuntu-latest
