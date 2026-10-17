@@ -319,13 +319,26 @@ where
     }
 }
 
+/// How long a boot migration on PostgreSQL waits for any one lock before it
+/// fails (TC-1176). Schema changes need strong table locks, which queue
+/// behind any open transaction on the table and, while queued, block every
+/// later query on it. Deploys run with the writer stopped, so a legitimate
+/// holder is a short transaction that 30s outlasts; a stuck session fails
+/// the boot with a clear error instead of hanging it. This bounds each lock
+/// wait, not how long a migration runs.
+const MIGRATION_LOCK_TIMEOUT: &str = "30s";
+
 /// Apply the schema migrations on `pool`.
 ///
 /// On PostgreSQL sea-orm-migration runs them in one transaction; it runs
 /// here inside an outer one that first lifts the pool's `statement_timeout`
 /// (TC-1054), since a migration or its backfill may legitimately run for
-/// minutes. The nested `BEGIN` becomes a savepoint, so the migrations stay
-/// atomic as before.
+/// minutes, and bounds every lock wait with `lock_timeout`
+/// ([`MIGRATION_LOCK_TIMEOUT`]). Both are `SET LOCAL`, so they end with the
+/// transaction and never reach the pooled session. The nested `BEGIN`
+/// becomes a savepoint, so the migrations stay atomic as before: a lock-wait
+/// failure rolls them all back, records none, and is reported as a
+/// [`DbErr::Migration`].
 pub async fn migrate(pool: &RecoveringConnection) -> Result<(), DbErr> {
     let conn = pool.sea_orm_connection();
     if conn.get_database_backend() != sea_orm::DatabaseBackend::Postgres {
@@ -335,8 +348,36 @@ pub async fn migrate(pool: &RecoveringConnection) -> Result<(), DbErr> {
     transaction
         .execute_unprepared(crate::db_pool::EXEMPT_STATEMENT_TIMEOUT)
         .await?;
-    Migrator::up(&transaction, None).await?;
+    transaction
+        .execute_unprepared(&format!(
+            "SET LOCAL lock_timeout = '{MIGRATION_LOCK_TIMEOUT}'"
+        ))
+        .await?;
+    Migrator::up(&transaction, None)
+        .await
+        .map_err(migration_lock_wait_error)?;
     transaction.commit().await
+}
+
+/// Name a migration's lock-wait failure (SQLSTATE 55P03, which
+/// `lock_timeout` raises) so the boot error says what to fix. sea-orm-migration
+/// returns the failing statement's error without the migration's name; its
+/// `Applying migration` log line names it. Other errors pass through unchanged.
+fn migration_lock_wait_error(error: DbErr) -> DbErr {
+    let (DbErr::Conn(RuntimeErr::SqlxError(SqlxError::Database(database)))
+    | DbErr::Exec(RuntimeErr::SqlxError(SqlxError::Database(database)))
+    | DbErr::Query(RuntimeErr::SqlxError(SqlxError::Database(database)))) = &error
+    else {
+        return error;
+    };
+    if database.code().as_deref() != Some("55P03") {
+        return error;
+    }
+    DbErr::Migration(format!(
+        "a migration gave up after waiting {MIGRATION_LOCK_TIMEOUT} (lock_timeout) for a table \
+         lock; another session holds a conflicting lock (SQLSTATE 55P03: {database}). Nothing \
+         was applied; end that session and restart."
+    ))
 }
 
 impl<C, B, K> SpaceDatabase<C, B, K>
@@ -1706,7 +1747,13 @@ where
             .one(&self.conn)
             .await
         {
-            Ok(Some(_)) => return Ok(already_registered_result(retained_hash)),
+            Ok(Some(_)) => {
+                // The content-addressed row authenticates these exact signed bytes.
+                for space in delegation.0.spaces() {
+                    crate::request_telemetry::observe_space(space);
+                }
+                return Ok(already_registered_result(retained_hash));
+            }
             Ok(None) => {}
             Err(e) => return Err(TxError::Db(e)),
         }
@@ -3395,18 +3442,11 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
             .exec(db)
             .await
             .map_err(|e| {
-                if let DbErr::Exec(RuntimeErr::SqlxError(SqlxError::Database(db_err))) = &e {
-                    tracing::error!(
-                        error = %e,
-                        db_error = %db_err,
-                        db_error_code = ?db_err.code(),
-                        db_error_kind = ?db_err.kind(),
-                        "epoch insert failed with database error after space pre-check; \
-                         treating as integrity error"
-                    );
-                } else {
-                    tracing::error!(error = %e, "epoch insert failed");
-                }
+                tracing::error!(
+                    operation = "epoch_insert",
+                    error_class = "database",
+                    "epoch insert failed"
+                );
                 TxError::EpochInsert(e)
             })?;
 
@@ -3487,6 +3527,11 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                 }
                 Event::Revocation(r) => {
                     revocation::process(db, *r).await?;
+                    for (space, (_, _, _, hashes)) in &space_order {
+                        if hashes.contains_key(&hash) {
+                            crate::request_telemetry::observe_space(space);
+                        }
+                    }
                 }
             };
         }

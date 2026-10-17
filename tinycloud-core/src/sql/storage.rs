@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use rusqlite::Connection;
 
+use crate::request_telemetry::QueryTimer;
+
 use super::types::SqlError;
 
 #[derive(Debug, Clone)]
@@ -25,26 +27,39 @@ pub fn open_connection(mode: &StorageMode) -> Result<Connection, SqlError> {
 
     // Enable WAL mode for file-backed databases
     if matches!(mode, StorageMode::File(_)) {
-        conn.pragma_update(None, "journal_mode", "wal")
-            .map_err(|e| SqlError::Internal(e.to_string()))?;
-        conn.pragma_update(None, "wal_autocheckpoint", 0)
-            .map_err(|e| SqlError::Internal(e.to_string()))?;
+        {
+            let _timer = QueryTimer::new();
+            conn.pragma_update(None, "journal_mode", "wal")
+                .map_err(|e| SqlError::Internal(e.to_string()))?;
+        }
+        {
+            let _timer = QueryTimer::new();
+            conn.pragma_update(None, "wal_autocheckpoint", 0)
+                .map_err(|e| SqlError::Internal(e.to_string()))?;
+        }
     }
 
     // Enable foreign keys
-    conn.pragma_update(None, "foreign_keys", "ON")
-        .map_err(|e| SqlError::Internal(e.to_string()))?;
+    {
+        let _timer = QueryTimer::new();
+        conn.pragma_update(None, "foreign_keys", "ON")
+            .map_err(|e| SqlError::Internal(e.to_string()))?;
+    }
 
     Ok(conn)
 }
 
 pub fn database_size(conn: &Connection) -> Result<u64, SqlError> {
-    let page_count: u64 = conn
-        .pragma_query_value(None, "page_count", |row| row.get(0))
-        .map_err(|e| SqlError::Internal(e.to_string()))?;
-    let page_size: u64 = conn
-        .pragma_query_value(None, "page_size", |row| row.get(0))
-        .map_err(|e| SqlError::Internal(e.to_string()))?;
+    let page_count: u64 = {
+        let _timer = QueryTimer::new();
+        conn.pragma_query_value(None, "page_count", |row| row.get(0))
+            .map_err(|e| SqlError::Internal(e.to_string()))?
+    };
+    let page_size: u64 = {
+        let _timer = QueryTimer::new();
+        conn.pragma_query_value(None, "page_size", |row| row.get(0))
+            .map_err(|e| SqlError::Internal(e.to_string()))?
+    };
     Ok(page_count * page_size)
 }
 
@@ -63,6 +78,7 @@ pub fn promote_to_file(conn: &Connection, path: &PathBuf) -> Result<Connection, 
     })?;
 
     // Use SQLite backup API
+    // Native backup and filesystem I/O are not SQL query attempts.
     {
         let backup = rusqlite::backup::Backup::new(conn, &mut file_conn)
             .map_err(|e: rusqlite::Error| SqlError::Internal(e.to_string()))?;
@@ -76,15 +92,24 @@ pub fn promote_to_file(conn: &Connection, path: &PathBuf) -> Result<Connection, 
     }
 
     // Enable WAL on the new file
-    file_conn
-        .pragma_update(None, "journal_mode", "wal")
-        .map_err(|e| SqlError::Internal(e.to_string()))?;
-    file_conn
-        .pragma_update(None, "wal_autocheckpoint", 0)
-        .map_err(|e| SqlError::Internal(e.to_string()))?;
-    file_conn
-        .pragma_update(None, "foreign_keys", "ON")
-        .map_err(|e| SqlError::Internal(e.to_string()))?;
+    {
+        let _timer = QueryTimer::new();
+        file_conn
+            .pragma_update(None, "journal_mode", "wal")
+            .map_err(|e| SqlError::Internal(e.to_string()))?;
+    }
+    {
+        let _timer = QueryTimer::new();
+        file_conn
+            .pragma_update(None, "wal_autocheckpoint", 0)
+            .map_err(|e| SqlError::Internal(e.to_string()))?;
+    }
+    {
+        let _timer = QueryTimer::new();
+        file_conn
+            .pragma_update(None, "foreign_keys", "ON")
+            .map_err(|e| SqlError::Internal(e.to_string()))?;
+    }
 
     Ok(file_conn)
 }

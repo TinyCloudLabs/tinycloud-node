@@ -132,7 +132,11 @@ impl InvocationReplayCache {
         .exec_without_returning(&self.conn)
         .await
         .map_err(|error| {
-            tracing::warn!(?error, "invocation replay insert failed");
+            tracing::warn!(
+                error_class =
+                    tinycloud_core::db_pool::transient_error_class(&error).unwrap_or("database"),
+                "invocation replay insert failed"
+            );
             InvocationReplayError::Database
         })?;
 
@@ -173,7 +177,11 @@ impl InvocationReplayCache {
             .await
             .map(|result| result.rows_affected)
             .map_err(|error| {
-                tracing::warn!(?error, "invocation replay cleanup failed");
+                tracing::warn!(
+                    error_class = tinycloud_core::db_pool::transient_error_class(&error)
+                        .unwrap_or("database"),
+                    "invocation replay cleanup failed"
+                );
                 InvocationReplayError::Database
             })
     }

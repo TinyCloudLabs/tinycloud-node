@@ -88,6 +88,7 @@ pub async fn set_quota(
     let sid: tinycloud_auth::resource::SpaceId = space_id
         .parse()
         .map_err(|_| (Status::BadRequest, "Invalid space ID".into()))?;
+    tinycloud_core::request_telemetry::observe_space(&sid);
     quota_cache.set_limit(&sid, body.limit_bytes).await;
     Ok(Json(QuotaResponse {
         space_id: space_id.to_string(),
@@ -111,6 +112,7 @@ pub async fn delete_quota(
     let sid: tinycloud_auth::resource::SpaceId = space_id
         .parse()
         .map_err(|_| (Status::BadRequest, "Invalid space ID".into()))?;
+    tinycloud_core::request_telemetry::observe_space(&sid);
     quota_cache.remove_limit(&sid).await;
     let effective = quota_cache.default_limit().map(|l| l.as_u64());
     Ok(Json(QuotaResponse {
@@ -131,6 +133,7 @@ pub async fn get_quota(
     let sid: tinycloud_auth::resource::SpaceId = space_id
         .parse()
         .map_err(|_| (Status::BadRequest, "Invalid space ID".into()))?;
+    tinycloud_core::request_telemetry::observe_space(&sid);
     let override_bytes = quota_cache.get_override(&sid).await;
     // Never resolve via get_limit() here: it pulls from the remote quota
     // service, and that service calls this endpoint per owned space to compute
@@ -162,6 +165,11 @@ pub async fn list_quotas(
     quota_cache: &State<QuotaCache>,
 ) -> Json<QuotaListResponse> {
     let overrides = quota_cache.list_overrides().await;
+    for target in overrides.keys() {
+        if let Ok(space) = target.parse() {
+            tinycloud_core::request_telemetry::observe_space(&space);
+        }
+    }
     Json(QuotaListResponse {
         overrides,
         default_limit_bytes: quota_cache.default_limit().map(|l| l.as_u64()),
@@ -181,6 +189,9 @@ pub async fn get_usage(
         .list_space_ids()
         .await
         .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+    for sid in &space_ids {
+        tinycloud_core::request_telemetry::observe_space(sid);
+    }
 
     let mut spaces = Vec::with_capacity(space_ids.len());
     for sid in space_ids {
