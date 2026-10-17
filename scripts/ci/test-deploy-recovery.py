@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Run actual workflow Bash against offline CLI/HTTP boundaries only."""
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -19,6 +20,9 @@ N0 = (ROOT / "scripts/ci/fixtures/tc959-n0-compose.yaml").read_bytes()
 PRE_N0 = (ROOT / "ops/rollback/pre-n0-compose.yaml").read_bytes()
 STOP_LOGS = (ROOT / "ops/rollback/pre-n0-stop-local-logs.yaml").read_bytes()
 CURRENT = (ROOT / "docker-compose.dstack-postgres.yaml").read_bytes()
+# Frozen ordinary (pre-N0) template from main before #309; the workflow accepts it by raw hash.
+PRE_N0_TEMPLATE = (ROOT / "scripts/ci/fixtures/pre-n0-template-compose.yaml").read_bytes()
+assert hashlib.sha256(PRE_N0_TEMPLATE).hexdigest() == "28302d6761d841b7cc5c11314aed2d377735e6bbdcaf85972a752e03bc9fdc93"
 CANARIES = []
 
 
@@ -247,7 +251,7 @@ class RecoveryTests(unittest.TestCase):
                     "compose": compose_path.read_bytes(), "summary": report, "logs": logs}
 
     def test_recovery_current_pre_n0_and_reviewed_n0(self):
-        for compose in (CURRENT, N0):
+        for compose in (PRE_N0_TEMPLATE, N0):
             with self.subTest(n0=compose == N0):
                 result = self.run_deploy(compose)
                 self.assertTrue(result["success"], "Authorized same-image recovery must work")
@@ -257,7 +261,7 @@ class RecoveryTests(unittest.TestCase):
                 self.assertNotIn("1.20.7", result["logs"] + result["summary"])
 
     def test_future_digest_gets_preflight_and_general_quota_restore(self):
-        result = self.run_deploy(changes={"deploy_image_digest": "sha256:" + "a" * 64,
+        result = self.run_deploy(PRE_N0_TEMPLATE, {"deploy_image_digest": "sha256:" + "a" * 64,
              "image_version": "1.20.8", "rollback_image_version": "1.20.8", "rollback_image_revision": "a" * 40})
         self.assertTrue(result["success"])
         self.assertIn("sealed-preflight", result["events"])
@@ -274,9 +278,9 @@ class RecoveryTests(unittest.TestCase):
                 self.assertIn(mode, result["summary"])
 
     def test_missing_authorization_never_reaches_any_mutation(self):
-        for compose, changes, mode in ((CURRENT, {}, ""), (N0, {}, ""),
+        for compose, changes, mode in ((PRE_N0_TEMPLATE, {}, ""), (N0, {}, ""),
              (N0, {"rollback_pre_n0": "true", "rollback_privacy_mode": "keep-json-file"}, "keep-json-file"),
-             (CURRENT, {"deploy_image_digest": "sha256:" + "a" * 64, "image_version": "1.20.8",
+             (PRE_N0_TEMPLATE, {"deploy_image_digest": "sha256:" + "a" * 64, "image_version": "1.20.8",
                         "rollback_image_version": "1.20.8", "rollback_image_revision": "a" * 40}, "")):
             result = self.run_deploy(compose, {**changes, "authorize_quota_values": "false"}, approved_privacy=mode)
             self.assertFalse(result["success"])
@@ -327,7 +331,7 @@ class RecoveryTests(unittest.TestCase):
             self.assertEqual(result["compose"], N0)
 
     def test_normal_build_deployment_keeps_preflight_and_general_quota(self):
-        result = self.run_deploy(changes={"deploy_image_digest": "", "image_version": "1.20.7",
+        result = self.run_deploy(PRE_N0_TEMPLATE, {"deploy_image_digest": "", "image_version": "1.20.7",
                                         "rollback_image_version": "", "rollback_image_revision": ""},
                                  build_digest="sha256:" + "f" * 64)
         self.assertTrue(result["success"])
@@ -343,6 +347,12 @@ class RecoveryTests(unittest.TestCase):
             self.assertFalse(result["success"])
             self.assertNotIn("cvm-deploy", result["events"])
             self.assertEqual(result["compose"], N0)
+        result = self.run_deploy(N0, {"deploy_image_digest": "", "image_version": "1.20.7",
+                                      "rollback_image_version": "", "rollback_image_revision": ""},
+                                 build_digest="sha256:" + "f" * 64)
+        self.assertFalse(result["success"])
+        self.assertNotIn("cvm-deploy", result["events"])
+        self.assertEqual(result["compose"], N0)
 
     def test_last_restart_precedes_health_inventory_and_quota(self):
         result = self.run_deploy(N0, {"rollback_pre_n0": "true", "rollback_privacy_mode": "keep-json-file"}, approved_privacy="keep-json-file")
