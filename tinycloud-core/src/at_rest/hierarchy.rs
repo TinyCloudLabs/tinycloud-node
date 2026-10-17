@@ -7,6 +7,8 @@
 //! KEK_g = HKDF-SHA256(ARK_g, info "tinycloud/at-rest/kek/v1")
 //! NK    = HKDF-SHA256(ARK_1, info "tinycloud/at-rest/object-names/v1")
 //! DEK   = 32 random bytes per (space, dek_id): nonce ‖ AES-256-GCM(KEK_g, DEK, AAD dek)
+//! TAG   = HKDF-SHA256(ARK_1, info "tinycloud/at-rest/dek-mirror-tag/v1")
+//!         names a space's mirrored DEKs: hex(HKDF(TAG, info space)[..16])
 //! ```
 //!
 //! Every AAD starts with a length-prefixed domain string; variable fields are
@@ -30,6 +32,7 @@ use super::{DataKey, DekId, ObjectNameKey};
 pub const W_LABEL: &str = "tinycloud/at-rest/wrap/v1";
 const KEK_INFO: &[u8] = b"tinycloud/at-rest/kek/v1";
 const NK_INFO: &[u8] = b"tinycloud/at-rest/object-names/v1";
+const DEK_TAG_INFO: &[u8] = b"tinycloud/at-rest/dek-mirror-tag/v1";
 const CHAIN_INFO: &[u8] = b"tinycloud/at-rest/ark-chain/v1";
 const SEAL_DOMAIN: &[u8] = b"tinycloud/at-rest/ark-seal/v1";
 const CHAIN_DOMAIN: &[u8] = b"tinycloud/at-rest/ark-chain-aad/v1";
@@ -179,8 +182,21 @@ impl Kek {
 
 /// NK from ARK generation 1; constant for the deployment.
 pub fn object_name_key(ark_1: &Ark) -> ObjectNameKey {
-    let nk = hkdf32(ark_1.expose(), NK_INFO);
-    ObjectNameKey::new(*nk)
+    ObjectNameKey::from_zeroizing(hkdf32(ark_1.expose(), NK_INFO))
+}
+
+/// Names a space's mirrored DEK rows without naming the space. From ARK
+/// generation 1, so the names survive rotation.
+pub struct DekTagKey(Zeroizing<[u8; 32]>);
+
+impl DekTagKey {
+    pub fn derive(ark_1: &Ark) -> Self {
+        Self(hkdf32(ark_1.expose(), DEK_TAG_INFO))
+    }
+
+    pub fn tag(&self, space: &str) -> String {
+        hex::encode(&hkdf32(self.0.as_ref(), space.as_bytes())[..16])
+    }
 }
 
 fn dek_aad(space: &str, dek_id: DekId, generation: u32, ark_id: &ArkId) -> Vec<u8> {
@@ -208,7 +224,7 @@ pub fn new_dek(
         &dek_aad(space, dek_id, generation, ark_id),
         bytes.as_ref(),
     );
-    (wrapped, DataKey::new(dek_id, *bytes))
+    (wrapped, DataKey::from_zeroizing(dek_id, bytes))
 }
 
 pub fn unwrap_dek(
@@ -220,7 +236,7 @@ pub fn unwrap_dek(
     ark_id: &ArkId,
 ) -> Result<DataKey, Unauthentic> {
     let bytes = open32(&kek.0, &dek_aad(space, dek_id, generation, ark_id), wrapped)?;
-    Ok(DataKey::new(dek_id, *bytes))
+    Ok(DataKey::from_zeroizing(dek_id, bytes))
 }
 
 #[cfg(test)]

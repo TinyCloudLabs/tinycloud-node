@@ -18,12 +18,12 @@ use tinycloud_at_rest_escrow::{
 };
 
 use super::hierarchy::{
-    chain_ark, new_dek, object_name_key, open_ark, open_chain, seal_ark, unwrap_dek, Kek, WrapKey,
-    W_LABEL,
+    chain_ark, new_dek, object_name_key, open_ark, open_chain, seal_ark, unwrap_dek, DekTagKey,
+    Kek, WrapKey, W_LABEL,
 };
 use super::store::{
-    ark_mirror_name, escrow_mirror_name, AtRestStore, KeyMirror, MirroredArk, ARK_MIRROR_PREFIX,
-    MIRROR_PREFIX,
+    ark_mirror_name, dek_mirror_name, escrow_mirror_name, AtRestStore, KeyMirror, MirroredArk,
+    MirroredDek, ARK_MIRROR_PREFIX, MIRROR_PREFIX,
 };
 use super::{DataKey, DataKeyError, DataKeyProvider, DekId, ObjectNameKey};
 use crate::models::{at_rest_escrow, at_rest_key, space_data_key};
@@ -58,6 +58,8 @@ pub enum AtRestError {
     Mirror(String),
     #[error("at-rest key state is inconsistent: {0}")]
     Inconsistent(&'static str),
+    #[error("at-rest key change lost a race: {0}")]
+    Conflict(&'static str),
     #[error("at-rest escrow: {0}")]
     Escrow(#[from] EscrowError),
     #[error("at-rest keys are locked")]
@@ -85,6 +87,10 @@ pub enum GateRefusal {
     PinMismatch { pinned: String, efp: String },
     #[error("escrow {efp} has no valid verification record; run the ceremony test-unlock")]
     NotVerified { efp: String },
+    /// Not a configuration problem: the store, mirror or stored escrow could
+    /// not be read. Fix that (or retry); don't re-run the ceremony.
+    #[error("could not evaluate the escrow: {0}")]
+    Unavailable(String),
 }
 
 /// How a passing gate was satisfied.
@@ -150,11 +156,15 @@ struct Generation {
 struct Keys {
     gens: BTreeMap<u32, Generation>,
     nk: ObjectNameKey,
+    dek_tag: DekTagKey,
 }
 
 impl Keys {
     fn newest(&self) -> (u32, &Generation) {
-        let (g, gen) = self.gens.last_key_value().expect("at least generation 1");
+        let (g, gen) = self
+            .gens
+            .last_key_value()
+            .expect("keys_from_newest loads ≥ 1 generation");
         (*g, gen)
     }
 }
@@ -228,15 +238,30 @@ fn backend(e: impl std::error::Error + Send + Sync + 'static) -> DataKeyError {
     DataKeyError::Backend(Box::new(e))
 }
 
-/// Open every generation from the rows: the newest under W, older ones via
-/// their chain (or W). `Ok(None)` means the newest doesn't open under W.
-fn unlock_rows(w: &WrapKey, rows: &[at_rest_key::Model]) -> Result<Option<Keys>, AtRestError> {
+/// Generations must be exactly 1..=n.
+fn check_contiguous(rows: &[at_rest_key::Model]) -> Result<(), AtRestError> {
+    if rows.is_empty() {
+        return Err(AtRestError::NotProvisioned);
+    }
     for (i, row) in rows.iter().enumerate() {
         if row.generation != i as i32 + 1 {
             return Err(AtRestError::Inconsistent("ARK generations are not 1..n"));
         }
     }
-    let newest = rows.last().expect("caller checked non-empty");
+    Ok(())
+}
+
+/// A generation whose chain had to be rewritten: (generation, new chain).
+type Rechain = (u32, Vec<u8>);
+
+/// Open every generation from the rows under this node's W. `Ok(None)`
+/// means the newest doesn't open under W (locked).
+fn unlock_rows(
+    w: &WrapKey,
+    rows: &[at_rest_key::Model],
+) -> Result<Option<(Keys, Vec<Rechain>)>, AtRestError> {
+    check_contiguous(rows)?;
+    let newest = rows.last().expect("check_contiguous: non-empty");
     let newest_id = ark_id_of(newest)?;
     let Ok(ark) = open_ark(
         w,
@@ -247,31 +272,53 @@ fn unlock_rows(w: &WrapKey, rows: &[at_rest_key::Model]) -> Result<Option<Keys>,
     ) else {
         return Ok(None);
     };
-    keys_from_newest(w, rows, ark).map(Some)
+    keys_from_newest(rows, ark, Some(w)).map(Some)
 }
 
+/// Walk down from the newest ARK. Every older generation must open **by its
+/// chain**: that is the only path recovery has, so a broken chain is never
+/// accepted silently.
+///
+/// With `repair_w` (boot under the root that sealed the rows), a chain that
+/// is missing or doesn't open is rebuilt if the generation opens under W,
+/// and returned for the caller to store. Without it (recovery under a new
+/// root), a broken chain is an error.
 fn keys_from_newest(
-    w: &WrapKey,
     rows: &[at_rest_key::Model],
     newest_ark: Ark,
-) -> Result<Keys, AtRestError> {
+    repair_w: Option<&WrapKey>,
+) -> Result<(Keys, Vec<Rechain>), AtRestError> {
+    check_contiguous(rows)?;
     let mut gens = BTreeMap::new();
+    let mut rechain = Vec::new();
     let mut newer: Option<(Ark, ArkId)> = None;
-    let mut ark = Some(newest_ark);
     for row in rows.iter().rev() {
         let id = ark_id_of(row)?;
         let g = row.generation as u32;
-        let this = match ark.take() {
-            Some(a) => a,
-            None => {
-                let (n_ark, n_id) = newer.as_ref().expect("set after the newest");
-                row.chain
+        let this = match &newer {
+            None => newest_ark.clone(),
+            Some((n_ark, n_id)) => {
+                let by_chain = row
+                    .chain
                     .as_deref()
-                    .and_then(|c| open_chain(n_ark, n_id, c, &id, g).ok())
-                    .or_else(|| open_ark(w, &row.sealed, &id, g, &row.w_label).ok())
-                    .ok_or(AtRestError::Inconsistent(
-                        "an older ARK generation opens neither by chain nor by W",
-                    ))?
+                    .and_then(|c| open_chain(n_ark, n_id, c, &id, g).ok());
+                match (by_chain, repair_w) {
+                    (Some(ark), _) => ark,
+                    (None, Some(w)) => {
+                        let ark = open_ark(w, &row.sealed, &id, g, &row.w_label).map_err(|_| {
+                            AtRestError::Inconsistent(
+                                "an older ARK generation opens neither by its chain nor under W",
+                            )
+                        })?;
+                        rechain.push((g, chain_ark(n_ark, n_id, &ark, &id, g)));
+                        ark
+                    }
+                    (None, None) => {
+                        return Err(AtRestError::Inconsistent(
+                            "an older ARK generation's chain is missing or does not open",
+                        ))
+                    }
+                }
             }
         };
         newer = Some((this.clone(), id));
@@ -284,8 +331,13 @@ fn keys_from_newest(
             },
         );
     }
-    let nk = object_name_key(&gens.get(&1).expect("generation 1 exists").ark);
-    Ok(Keys { gens, nk })
+    let ark_1 = &gens.get(&1).expect("check_contiguous: generation 1").ark;
+    let keys = Keys {
+        nk: object_name_key(ark_1),
+        dek_tag: DekTagKey::derive(ark_1),
+        gens,
+    };
+    Ok((keys, rechain))
 }
 
 pub struct AtRestKeyring {
@@ -296,6 +348,9 @@ pub struct AtRestKeyring {
     phase: RwLock<Phase>,
     deks: Mutex<LruCache<(String, u32), DataKey>>,
     current: Mutex<LruCache<String, DekId>>,
+    /// The EFP last confirmed present in the mirror, so `/info` and the gate
+    /// don't GET it every call.
+    escrow_mirrored: Mutex<Option<String>>,
     intake: tokio::sync::Mutex<ShareIntake>,
     dek_create: tokio::sync::Mutex<()>,
 }
@@ -303,13 +358,16 @@ pub struct AtRestKeyring {
 impl AtRestKeyring {
     /// Load the keyring at boot.
     ///
-    /// - Rows open under this root's W: unlocked.
+    /// - Mirrored ARK generations missing from the database (a restore to
+    ///   an earlier point) are put back first.
+    /// - Rows open under this root's W: unlocked. A chain that is missing or
+    ///   doesn't open is rebuilt and logged.
     /// - Rows exist but don't open: **locked** (data intact; recover with two
     ///   shares).
-    /// - No rows: restore them from the mirror if it has any; otherwise
-    ///   provision generation 1 if `config.provision`, else not provisioned.
-    ///   A store or mirror error fails the call; it never provisions over
-    ///   uncertainty, and never when data keys exist without an ARK.
+    /// - No rows: provision generation 1 if `config.provision`, else not
+    ///   provisioned. Never when any sealed material exists without an ARK
+    ///   (data keys, escrow rows, any mirror object), and never after a
+    ///   store or mirror error.
     pub async fn open(
         store: AtRestStore,
         mirror: Arc<dyn KeyMirror>,
@@ -317,17 +375,26 @@ impl AtRestKeyring {
         config: KeyringConfig,
     ) -> Result<Self, AtRestError> {
         let w = WrapKey::derive(root);
+        Self::restore_rows(&store, &*mirror).await?;
         let mut rows = store.keys().await?;
         if rows.is_empty() {
-            rows = Self::restore_rows(&store, &*mirror).await?;
-        }
-        if rows.is_empty() {
-            if store.has_space_keys().await? {
-                return Err(AtRestError::Inconsistent(
-                    "data keys exist but no ARK row or mirrored ARK was found",
-                ));
-            }
-            if config.provision {
+            if store.has_space_keys().await?
+                || store.has_escrow_rows().await?
+                || !mirror
+                    .list(MIRROR_PREFIX)
+                    .await
+                    .map_err(mirror_err)?
+                    .is_empty()
+            {
+                // Another process may have provisioned since we read: its
+                // ARK row is written before anything else.
+                rows = store.keys().await?;
+                if rows.is_empty() {
+                    return Err(AtRestError::Inconsistent(
+                        "sealed at-rest material exists but no ARK row or mirrored ARK was found",
+                    ));
+                }
+            } else if config.provision {
                 let ark = Ark::generate();
                 let ark_id = ArkId::generate();
                 store
@@ -342,14 +409,20 @@ impl AtRestKeyring {
                     .await?;
                 // Another process may have won the insert; use what's stored.
                 rows = store.keys().await?;
-                tracing::info!(generation = 1, %ark_id, "at-rest root key provisioned");
+                if rows.first().map(|r| r.ark_id.as_slice()) == Some(&ark_id.0[..]) {
+                    tracing::info!(generation = 1, %ark_id, "at-rest root key provisioned");
+                }
             }
         }
         let phase = if rows.is_empty() {
             Phase::NotProvisioned
         } else {
             match unlock_rows(&w, &rows)? {
-                Some(keys) => {
+                Some((keys, rechain)) => {
+                    if !rechain.is_empty() {
+                        Self::store_rechain(&store, rechain).await?;
+                        rows = store.keys().await?;
+                    }
                     for row in &rows {
                         Self::mirror_row(&*mirror, row).await?;
                     }
@@ -380,6 +453,7 @@ impl AtRestKeyring {
             current: Mutex::new(LruCache::new(
                 NonZeroUsize::new(DEK_CACHE).expect("non-zero"),
             )),
+            escrow_mirrored: Mutex::new(None),
             intake: tokio::sync::Mutex::new(ShareIntake::new()),
             dek_create: tokio::sync::Mutex::new(()),
         };
@@ -389,15 +463,32 @@ impl AtRestKeyring {
         Ok(keyring)
     }
 
-    async fn restore_rows(
-        store: &AtRestStore,
-        mirror: &dyn KeyMirror,
-    ) -> Result<Vec<at_rest_key::Model>, AtRestError> {
+    async fn store_rechain(store: &AtRestStore, rechain: Vec<Rechain>) -> Result<(), AtRestError> {
+        for (g, chain) in rechain {
+            tracing::warn!(
+                generation = g,
+                "at-rest ARK chain was missing or did not open; rebuilt it from the newer generation"
+            );
+            store.set_chain(g as i32, chain).await?;
+        }
+        Ok(())
+    }
+
+    /// Put back mirrored ARK generations the database lacks, and chains the
+    /// database lost. Both are AEAD-checked when used, so a bad mirror
+    /// object can make the node fail closed but never feeds it a key.
+    async fn restore_rows(store: &AtRestStore, mirror: &dyn KeyMirror) -> Result<(), AtRestError> {
         let mut names = mirror.list(ARK_MIRROR_PREFIX).await.map_err(mirror_err)?;
         if names.is_empty() {
-            return Ok(Vec::new());
+            return Ok(());
         }
         names.sort();
+        let have: BTreeMap<i32, at_rest_key::Model> = store
+            .keys()
+            .await?
+            .into_iter()
+            .map(|r| (r.generation, r))
+            .collect();
         for name in names {
             let bytes =
                 mirror
@@ -411,10 +502,29 @@ impl AtRestKeyring {
                 .map_err(mirror_err)?
                 .into_row()
                 .map_err(mirror_err)?;
-            store.insert_key(row).await?;
+            match have.get(&row.generation) {
+                None => {
+                    tracing::warn!(
+                        generation = row.generation,
+                        "at-rest ARK row was missing from the database; restored from the mirror"
+                    );
+                    store.insert_key(row).await?;
+                }
+                Some(db)
+                    if db.chain.is_none() && row.chain.is_some() && db.ark_id == row.ark_id =>
+                {
+                    tracing::warn!(
+                        generation = row.generation,
+                        "at-rest ARK chain was missing from the database; restored from the mirror"
+                    );
+                    store
+                        .set_chain(row.generation, row.chain.expect("checked"))
+                        .await?;
+                }
+                Some(_) => {}
+            }
         }
-        tracing::warn!("at-rest ARK rows were missing from the database; restored from the mirror");
-        Ok(store.keys().await?)
+        Ok(())
     }
 
     async fn mirror_row(
@@ -446,9 +556,7 @@ impl AtRestKeyring {
     }
 
     fn parse_bundle(row: &at_rest_escrow::Model) -> Result<EscrowBundle, AtRestError> {
-        let bundle: EscrowBundle = serde_json::from_str(&row.bundle)
-            .map_err(|_| AtRestError::Inconsistent("stored escrow bundle is not valid JSON"))?;
-        bundle.validate()?;
+        let bundle = EscrowBundle::from_json(row.bundle.as_bytes())?;
         if bundle.fingerprint().to_string() != row.efp {
             return Err(AtRestError::Inconsistent(
                 "stored escrow bundle does not match its fingerprint",
@@ -499,6 +607,9 @@ impl AtRestKeyring {
     }
 
     async fn mirror_escrow(&self, row: &at_rest_escrow::Model) -> Result<(), AtRestError> {
+        if self.escrow_mirrored.lock().as_deref() == Some(row.efp.as_str()) {
+            return Ok(());
+        }
         let name = escrow_mirror_name(&row.efp);
         if self.mirror.get(&name).await.map_err(mirror_err)?.is_none() {
             self.mirror
@@ -506,6 +617,7 @@ impl AtRestKeyring {
                 .await
                 .map_err(mirror_err)?;
         }
+        *self.escrow_mirrored.lock() = Some(row.efp.clone());
         Ok(())
     }
 
@@ -527,9 +639,7 @@ impl AtRestKeyring {
         else {
             return Ok(None);
         };
-        let bundle: EscrowBundle = serde_json::from_slice(&bytes)
-            .map_err(|_| AtRestError::Inconsistent("mirrored escrow bundle is not valid JSON"))?;
-        bundle.validate()?;
+        let bundle = EscrowBundle::from_json(&bytes)?;
         Ok((bundle.fingerprint() == pinned).then_some(bundle))
     }
 
@@ -618,9 +728,9 @@ impl AtRestKeyring {
         let Some(json) = row.record else {
             return Ok(None);
         };
-        let Ok(record) = serde_json::from_str::<VerificationRecord>(&json) else {
-            return Ok(None);
-        };
+        // A record this node can't read (newer version, corrupt) is an
+        // error to surface, not "unverified".
+        let record = VerificationRecord::from_json(json.as_bytes())?;
         Ok(record.verify(&gen.ark, bundle).is_ok().then_some(record))
     }
 
@@ -642,7 +752,8 @@ impl AtRestKeyring {
         }
         let bundle = match self.ensure_escrow().await {
             Ok(Some(b)) => b,
-            _ => return Err(GateRefusal::NoEscrow),
+            Ok(None) => return Err(GateRefusal::NoEscrow),
+            Err(e) => return Err(GateRefusal::Unavailable(e.to_string())),
         };
         if bundle.holders() != self.config.holders {
             return Err(GateRefusal::RecipientsMismatch);
@@ -670,9 +781,10 @@ impl AtRestKeyring {
         }
         match self.verified_record(&bundle).await {
             Ok(Some(_)) => Ok(GatePass::Verified { efp }),
-            _ => Err(GateRefusal::NotVerified {
+            Ok(None) => Err(GateRefusal::NotVerified {
                 efp: efp.to_string(),
             }),
+            Err(e) => Err(GateRefusal::Unavailable(e.to_string())),
         }
     }
 
@@ -761,7 +873,9 @@ impl AtRestKeyring {
                 "recovered ARK is not the newest generation",
             ));
         }
-        let keys = keys_from_newest(&self.w, &rows, ark)?;
+        // Under a new root the rows still carry the old W: every older
+        // generation must open by its chain, or recovery fails loudly.
+        let (keys, _) = keys_from_newest(&rows, ark, None)?;
         for (g, gen) in &keys.gens {
             self.store
                 .reseal_key(
@@ -785,36 +899,153 @@ impl AtRestKeyring {
     /// Start ARK generation n+1. Older generations stay readable through the
     /// chain; new DEKs wrap under the new KEK. The new generation has no
     /// verified escrow until a ceremony runs, so the gate closes.
+    ///
+    /// The new row and the older generation's chain are written in one
+    /// transaction. If another node rotated first, nothing is written, this
+    /// keyring reloads what is stored, and the call returns
+    /// [`AtRestError::Conflict`].
     pub async fn rotate_ark(&self) -> Result<u32, AtRestError> {
         let keys = self.keys()?;
         let (g, old) = keys.newest();
         let next = g + 1;
         let ark = Ark::generate();
         let ark_id = ArkId::generate();
-        self.store
-            .insert_key(at_rest_key::Model {
-                generation: next as i32,
-                ark_id: ark_id.0.to_vec(),
-                w_label: W_LABEL.into(),
-                sealed: seal_ark(&self.w, &ark, &ark_id, next),
-                chain: None,
-                created_at: now_rfc3339(),
-            })
-            .await?;
-        self.store
-            .set_chain(g as i32, chain_ark(&ark, &ark_id, &old.ark, &old.ark_id, g))
+        let won = self
+            .store
+            .rotate(
+                at_rest_key::Model {
+                    generation: next as i32,
+                    ark_id: ark_id.0.to_vec(),
+                    w_label: W_LABEL.into(),
+                    sealed: seal_ark(&self.w, &ark, &ark_id, next),
+                    chain: None,
+                    created_at: now_rfc3339(),
+                },
+                chain_ark(&ark, &ark_id, &old.ark, &old.ark_id, g),
+            )
             .await?;
         let rows = self.store.keys().await?;
-        let keys = unlock_rows(&self.w, &rows)?.ok_or(AtRestError::Inconsistent(
-            "a just-written generation does not open",
+        let (keys, rechain) = unlock_rows(&self.w, &rows)?.ok_or(AtRestError::Inconsistent(
+            "the stored newest generation does not open under this node's root",
         ))?;
-        for row in &rows {
+        Self::store_rechain(&self.store, rechain).await?;
+        for row in &self.store.keys().await? {
             Self::mirror_row(&*self.mirror, row).await?;
         }
         *self.phase.write() = Phase::Unlocked(Arc::new(keys));
         self.current.lock().clear();
         self.ensure_escrow().await?;
+        if !won {
+            return Err(AtRestError::Conflict(
+                "another node rotated the ARK first; reloaded the stored generations",
+            ));
+        }
+        tracing::warn!(generation = next, %ark_id, "at-rest ARK rotated");
         Ok(next)
+    }
+
+    /// A space's DEK row from the mirror, put back into the database.
+    async fn restore_dek(
+        &self,
+        keys: &Keys,
+        space: &str,
+        dek_id: u32,
+    ) -> Result<Option<space_data_key::Model>, DataKeyError> {
+        let name = dek_mirror_name(&keys.dek_tag.tag(space), dek_id);
+        let Some(bytes) = self
+            .mirror
+            .get(&name)
+            .await
+            .map_err(|e| backend(mirror_err(e)))?
+        else {
+            return Ok(None);
+        };
+        let row = serde_json::from_slice::<MirroredDek>(&bytes)
+            .map_err(|e| backend(mirror_err(e)))?
+            .into_row(space)
+            .map_err(|e| backend(mirror_err(e)))?;
+        if row.dek_id as u32 != dek_id {
+            return Err(backend(AtRestError::Inconsistent(
+                "mirrored data key has a different id than its name",
+            )));
+        }
+        tracing::warn!(
+            dek_id,
+            "at-rest data key was missing from the database; restored from the mirror"
+        );
+        self.store.insert_dek(row).await.map_err(backend)?;
+        let id = i32::try_from(dek_id).map_err(|_| DataKeyError::UnknownKey {
+            dek_id: DekId::new(dek_id),
+        })?;
+        self.store.dek(space, id).await.map_err(backend)
+    }
+
+    /// Make sure the mirror holds exactly this DEK row before any object is
+    /// sealed under it. A different mirrored row with the same id means
+    /// objects may exist under another key: refuse, never overwrite.
+    async fn mirror_dek(
+        &self,
+        keys: &Keys,
+        row: &space_data_key::Model,
+    ) -> Result<(), DataKeyError> {
+        let name = dek_mirror_name(&keys.dek_tag.tag(&row.space), row.dek_id as u32);
+        match self
+            .mirror
+            .get(&name)
+            .await
+            .map_err(|e| backend(mirror_err(e)))?
+        {
+            None => {
+                let body = serde_json::to_vec(&MirroredDek::from_row(row)).expect("serializable");
+                self.mirror
+                    .put(&name, body)
+                    .await
+                    .map_err(|e| backend(mirror_err(e)))
+            }
+            Some(bytes) => {
+                let same = serde_json::from_slice::<MirroredDek>(&bytes)
+                    .ok()
+                    .and_then(|m| m.into_row(&row.space).ok())
+                    .is_some_and(|m| {
+                        m.dek_id == row.dek_id
+                            && m.generation == row.generation
+                            && m.wrapped == row.wrapped
+                    });
+                if same {
+                    Ok(())
+                } else {
+                    Err(backend(AtRestError::Inconsistent(
+                        "the mirror holds a different data key with this id",
+                    )))
+                }
+            }
+        }
+    }
+
+    /// Generate, store and return the space's first DEK row. If another
+    /// process won the insert, its row is returned.
+    async fn create_dek(
+        &self,
+        keys: &Keys,
+        space: &str,
+    ) -> Result<space_data_key::Model, DataKeyError> {
+        let (g, gen) = keys.newest();
+        let (wrapped, _) = new_dek(&gen.kek, space, DekId::new(1), g, &gen.ark_id);
+        self.store
+            .insert_dek(space_data_key::Model {
+                space: space.to_owned(),
+                dek_id: 1,
+                generation: g as i32,
+                wrapped,
+                created_at: now_rfc3339(),
+            })
+            .await
+            .map_err(backend)?;
+        self.store
+            .dek(space, 1)
+            .await
+            .map_err(backend)?
+            .ok_or_else(|| backend(AtRestError::Inconsistent("inserted data key is missing")))
     }
 
     async fn load_dek(
@@ -865,32 +1096,17 @@ impl DataKeyProvider for AtRestKeyring {
                 let _create = self.dek_create.lock().await;
                 match self.store.newest_dek(space).await.map_err(backend)? {
                     Some(row) => row,
-                    None => {
-                        let (g, gen) = keys.newest();
-                        let id = DekId::new(1);
-                        let (wrapped, _) = new_dek(&gen.kek, space, id, g, &gen.ark_id);
-                        self.store
-                            .insert_dek(space_data_key::Model {
-                                space: space.to_owned(),
-                                dek_id: 1,
-                                generation: g as i32,
-                                wrapped,
-                                created_at: now_rfc3339(),
-                            })
-                            .await
-                            .map_err(backend)?;
-                        // Another process may have won; serve whatever is stored.
-                        self.store
-                            .dek(space, 1)
-                            .await
-                            .map_err(backend)?
-                            .ok_or_else(|| {
-                                backend(AtRestError::Inconsistent("inserted data key is missing"))
-                            })?
-                    }
+                    // A database restored to before this space's first DEK:
+                    // objects may still be sealed under the mirrored one.
+                    None => match self.restore_dek(&keys, space, 1).await? {
+                        Some(row) => row,
+                        None => self.create_dek(&keys, space).await?,
+                    },
                 }
             }
         };
+        // First use of this space's current key in this process.
+        self.mirror_dek(&keys, &row).await?;
         let key = self.load_dek(&keys, &row).await?;
         self.current.lock().put(space.to_owned(), key.id());
         Ok(key)
@@ -904,7 +1120,11 @@ impl DataKeyProvider for AtRestKeyring {
         let Ok(id) = i32::try_from(dek_id.get()) else {
             return Err(DataKeyError::UnknownKey { dek_id });
         };
-        match self.store.dek(space, id).await.map_err(backend)? {
+        let row = match self.store.dek(space, id).await.map_err(backend)? {
+            Some(row) => Some(row),
+            None => self.restore_dek(&keys, space, dek_id.get()).await?,
+        };
+        match row {
             Some(row) => self.load_dek(&keys, &row).await,
             None => Err(DataKeyError::UnknownKey { dek_id }),
         }

@@ -1,7 +1,9 @@
 use std::io::Read;
 use std::sync::Arc;
 
-use sea_orm::{ConnectOptions, Database, DatabaseConnection, EntityTrait};
+use sea_orm::{
+    ColumnTrait, ConnectOptions, Database, DatabaseConnection, EntityTrait, QueryFilter,
+};
 use sea_orm_migration::MigratorTrait;
 use tinycloud_at_rest_escrow::{wrap_share, EscrowBundle, HolderRecipient, SharePayload};
 
@@ -412,6 +414,18 @@ async fn gate_requires_pinned_verified_escrow_for_the_configured_recipients() {
         k.gate(false).await,
         Err(GateRefusal::NotVerified { .. })
     ));
+    // A record this node can't read (a newer format) is not "unverified":
+    // the operator must fix the node, not re-run the ceremony.
+    let mut newer: serde_json::Value = serde_json::from_str(&record).unwrap();
+    newer["version"] = serde_json::json!(2);
+    AtRestStore::new(db.clone())
+        .save_record(&efp.to_string(), newer.to_string())
+        .await
+        .unwrap();
+    assert!(matches!(
+        k.gate(false).await,
+        Err(GateRefusal::Unavailable(e)) if e.contains("version 2")
+    ));
     AtRestStore::new(db.clone())
         .save_record(&efp.to_string(), record)
         .await
@@ -546,10 +560,10 @@ async fn share_intake_is_rate_limited_per_boot() {
     ));
 }
 
-#[tokio::test]
-async fn postgres_two_nodes_converge_on_one_ark_and_one_dek_per_space() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_concurrent_writers_converge_on_one_row_each() {
     let Some(pg) = crate::test_support::PostgresTestSchema::new(
-        "postgres_two_nodes_converge_on_one_ark_and_one_dek_per_space",
+        "postgres_concurrent_writers_converge_on_one_row_each",
     )
     .await
     else {
@@ -598,4 +612,333 @@ async fn postgres_two_nodes_converge_on_one_ark_and_one_dek_per_space() {
             .len(),
         4
     );
+
+    // Store conflicts keep the first row, deterministically, on PG too.
+    store_conflicts_keep_the_first_row(&pg.conn).await;
+
+    // Concurrent re-splits of one generation leave exactly one active bundle.
+    let store = AtRestStore::new(pg.conn.clone());
+    for round in 0..50 {
+        let row = |n: u8| at_rest_escrow::Model {
+            efp: format!("{round:04}-{n}"),
+            generation: 1,
+            bundle: "{}".into(),
+            active: true,
+            record: None,
+            created_at: now_rfc3339(),
+        };
+        let (x, y) = tokio::join!(store.activate_escrow(row(1)), store.activate_escrow(row(2)));
+        x.unwrap();
+        y.unwrap();
+        let active = at_rest_escrow::Entity::find()
+            .all(&pg.conn)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|b| b.generation == 1 && b.active)
+            .count();
+        assert_eq!(active, 1, "round {round}");
+    }
+}
+
+/// Both conflict branches return `Ok` and keep the first row; a rotation
+/// onto an existing generation writes nothing.
+async fn store_conflicts_keep_the_first_row(db: &DatabaseConnection) {
+    let store = AtRestStore::new(db.clone());
+    let key = |ark_id: u8, generation: i32| at_rest_key::Model {
+        generation,
+        ark_id: vec![ark_id; 16],
+        w_label: W_LABEL.into(),
+        sealed: vec![ark_id; 60],
+        chain: None,
+        created_at: now_rfc3339(),
+    };
+    let gen1 = store.keys().await.unwrap()[0].clone();
+    store.insert_key(key(0xee, 1)).await.unwrap();
+    assert_eq!(store.keys().await.unwrap()[0], gen1);
+
+    let dek = |wrapped: u8| space_data_key::Model {
+        space: "conflict".into(),
+        dek_id: 1,
+        generation: 1,
+        wrapped: vec![wrapped; 60],
+        created_at: now_rfc3339(),
+    };
+    store.insert_dek(dek(1)).await.unwrap();
+    store.insert_dek(dek(2)).await.unwrap();
+    assert_eq!(
+        store.dek("conflict", 1).await.unwrap().unwrap().wrapped,
+        vec![1; 60]
+    );
+
+    // Generation 1 exists: rotating "to" it writes neither row nor chain.
+    let before = store.keys().await.unwrap();
+    assert!(!store.rotate(key(0xdd, 1), vec![1; 60]).await.unwrap());
+    assert_eq!(store.keys().await.unwrap(), before);
+}
+
+#[tokio::test]
+async fn sqlite_store_conflicts_keep_the_first_row() {
+    let (db, mirror, h) = (db().await, Arc::new(MemoryMirror::default()), holders());
+    open(&db, &mirror, &ROOT, config(&h, None)).await.unwrap();
+    store_conflicts_keep_the_first_row(&db).await;
+}
+
+async fn set_chain(db: &DatabaseConnection, generation: i32, chain: Option<Vec<u8>>) {
+    at_rest_key::Entity::update_many()
+        .col_expr(at_rest_key::Column::Chain, chain.into())
+        .filter(at_rest_key::Column::Generation.eq(generation))
+        .exec(db)
+        .await
+        .unwrap();
+}
+
+fn chain_of(rows: &[at_rest_key::Model], generation: i32) -> Option<Vec<u8>> {
+    rows.iter()
+        .find(|r| r.generation == generation)
+        .unwrap()
+        .chain
+        .clone()
+}
+
+#[tokio::test]
+async fn a_missing_or_foreign_chain_is_rebuilt_under_the_same_root() {
+    for broken in [None, Some(vec![0x5a; 60])] {
+        let (db, mirror, h) = (db().await, Arc::new(MemoryMirror::default()), holders());
+        let k = open(&db, &mirror, &ROOT, config(&h, None)).await.unwrap();
+        let old = k.current_key("space-a").await.unwrap();
+        k.rotate_ark().await.unwrap();
+        let efp = k.escrow_view().await.unwrap().unwrap().efp;
+        drop(k);
+        // A crash or a stale writer left generation 1 without a usable
+        // chain, and the mirror has no better copy.
+        set_chain(&db, 1, broken.clone()).await;
+        mirror.remove_prefix(ARK_MIRROR_PREFIX);
+
+        let k = open(&db, &mirror, &ROOT, config(&h, None)).await.unwrap();
+        assert_eq!(k.state(), KeyringState::Unlocked);
+        let rows = AtRestStore::new(db.clone()).keys().await.unwrap();
+        let rebuilt = chain_of(&rows, 1).expect("chain rebuilt");
+        assert_ne!(Some(rebuilt), broken);
+        drop(k);
+
+        // The rebuilt chain is what recovery under a new root relies on.
+        let k = open(&db, &mirror, &NEW_ROOT, config(&h, Some(efp)))
+            .await
+            .unwrap();
+        submit(&k, &h, 0).await.unwrap();
+        assert_eq!(submit(&k, &h, 2).await.unwrap(), ShareOutcome::Unlocked);
+        assert_eq!(
+            k.key("space-a", DekId::new(1)).await.unwrap().bytes(),
+            old.bytes()
+        );
+    }
+}
+
+#[tokio::test]
+async fn recovery_fails_loudly_on_a_broken_chain_or_missing_generation() {
+    let (db, mirror, h) = (db().await, Arc::new(MemoryMirror::default()), holders());
+    let k = open(&db, &mirror, &ROOT, config(&h, None)).await.unwrap();
+    k.current_key("space-a").await.unwrap();
+    k.rotate_ark().await.unwrap();
+    let efp = k.escrow_view().await.unwrap().unwrap().efp;
+    drop(k);
+    set_chain(&db, 1, None).await;
+    mirror.remove_prefix(ARK_MIRROR_PREFIX);
+
+    // Under a new root nothing can rebuild the chain: two valid shares are
+    // refused with the reason, and the node stays locked.
+    let k = open(&db, &mirror, &NEW_ROOT, config(&h, Some(efp)))
+        .await
+        .unwrap();
+    submit(&k, &h, 0).await.unwrap();
+    assert!(matches!(
+        submit(&k, &h, 1).await,
+        Err(ShareRefusal::Keyring(AtRestError::Inconsistent(_)))
+    ));
+    assert_eq!(k.state(), KeyringState::Locked);
+
+    // Generation 1 deleted after boot: an error, not a panic. The two
+    // valid shares stay held, so any submission retries the unlock.
+    at_rest_key::Entity::delete_by_id(1)
+        .exec(&db)
+        .await
+        .unwrap();
+    assert!(matches!(
+        submit(&k, &h, 0).await,
+        Err(ShareRefusal::Keyring(AtRestError::Inconsistent(_)))
+    ));
+    assert_eq!(k.state(), KeyringState::Locked);
+}
+
+#[tokio::test]
+async fn a_stale_node_cannot_rotate_over_another_nodes_rotation() {
+    let (db, mirror, h) = (db().await, Arc::new(MemoryMirror::default()), holders());
+    let a = open(&db, &mirror, &ROOT, config(&h, None)).await.unwrap();
+    let b = open(&db, &mirror, &ROOT, config(&h, None)).await.unwrap();
+    let old = a.current_key("space-a").await.unwrap();
+    assert_eq!(a.rotate_ark().await.unwrap(), 2);
+    let chain = chain_of(&AtRestStore::new(db.clone()).keys().await.unwrap(), 1);
+
+    // B still believes generation 1 is newest.
+    assert!(matches!(
+        b.rotate_ark().await,
+        Err(AtRestError::Conflict(_))
+    ));
+    let rows = AtRestStore::new(db.clone()).keys().await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(chain_of(&rows, 1), chain, "A's chain is untouched");
+    // B reloaded A's generation: new spaces wrap under generation 2.
+    b.current_key("space-b").await.unwrap();
+    assert_eq!(
+        AtRestStore::new(db.clone())
+            .dek("space-b", 1)
+            .await
+            .unwrap()
+            .unwrap()
+            .generation,
+        2
+    );
+    assert_eq!(b.rotate_ark().await.unwrap(), 3);
+    let efp = b.escrow_view().await.unwrap().unwrap().efp;
+    drop((a, b));
+
+    // Generation 3's escrow alone recovers every generation.
+    let k = open(&db, &mirror, &NEW_ROOT, config(&h, Some(efp)))
+        .await
+        .unwrap();
+    submit(&k, &h, 1).await.unwrap();
+    assert_eq!(submit(&k, &h, 2).await.unwrap(), ShareOutcome::Unlocked);
+    assert_eq!(
+        k.key("space-a", DekId::new(1)).await.unwrap().bytes(),
+        old.bytes()
+    );
+}
+
+#[tokio::test]
+async fn data_keys_survive_a_restore_to_before_they_were_created() {
+    let (db, mirror, h) = (db().await, Arc::new(MemoryMirror::default()), holders());
+    let k = open(&db, &mirror, &ROOT, config(&h, None)).await.unwrap();
+    let a = k.current_key("space-a").await.unwrap();
+    // Mirror names don't reveal the space.
+    assert!(mirror.names().iter().all(|n| !n.contains("space-a")));
+    drop(k);
+    space_data_key::Entity::delete_many()
+        .exec(&db)
+        .await
+        .unwrap();
+
+    // The restored database lacks the row; objects sealed under it remain.
+    let k = open(&db, &mirror, &ROOT, config(&h, None)).await.unwrap();
+    assert_eq!(
+        k.key("space-a", DekId::new(1)).await.unwrap().bytes(),
+        a.bytes()
+    );
+    space_data_key::Entity::delete_many()
+        .exec(&db)
+        .await
+        .unwrap();
+    let k = open(&db, &mirror, &ROOT, config(&h, None)).await.unwrap();
+    assert_eq!(k.current_key("space-a").await.unwrap().bytes(), a.bytes());
+    drop(k);
+
+    // A different DEK under the same id would strand every object sealed
+    // under the mirrored one: refused, and the mirror is not overwritten.
+    space_data_key::Entity::delete_many()
+        .exec(&db)
+        .await
+        .unwrap();
+    let keys = open(&db, &mirror, &ROOT, config(&h, None)).await.unwrap();
+    let gen = &keys.keys().unwrap();
+    let (g, newest) = gen.newest();
+    let (wrapped, _) = new_dek(&newest.kek, "space-a", DekId::new(1), g, &newest.ark_id);
+    AtRestStore::new(db.clone())
+        .insert_dek(space_data_key::Model {
+            space: "space-a".into(),
+            dek_id: 1,
+            generation: g as i32,
+            wrapped,
+            created_at: now_rfc3339(),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        keys.current_key("space-a").await,
+        Err(DataKeyError::Backend(_))
+    ));
+    space_data_key::Entity::delete_many()
+        .exec(&db)
+        .await
+        .unwrap();
+    let k = open(&db, &mirror, &ROOT, config(&h, None)).await.unwrap();
+    assert_eq!(k.current_key("space-a").await.unwrap().bytes(), a.bytes());
+}
+
+#[tokio::test]
+async fn escrow_rows_or_any_mirror_object_block_provisioning() {
+    let (db, mirror, h) = (db().await, Arc::new(MemoryMirror::default()), holders());
+    open(&db, &mirror, &ROOT, config(&h, None)).await.unwrap();
+    at_rest_key::Entity::delete_many().exec(&db).await.unwrap();
+    mirror.remove_prefix(ARK_MIRROR_PREFIX);
+    // Only escrow rows and escrow mirror objects are left.
+    assert!(matches!(
+        open(&db, &mirror, &ROOT, config(&h, None)).await,
+        Err(AtRestError::Inconsistent(_))
+    ));
+    at_rest_escrow::Entity::delete_many()
+        .exec(&db)
+        .await
+        .unwrap();
+    // Only a mirror object is left.
+    assert!(matches!(
+        open(&db, &mirror, &ROOT, config(&h, None)).await,
+        Err(AtRestError::Inconsistent(_))
+    ));
+    assert!(at_rest_key::Entity::find()
+        .all(&db)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn a_newer_mirror_format_is_refused_not_guessed() {
+    let (db, mirror, h) = (db().await, Arc::new(MemoryMirror::default()), holders());
+    open(&db, &mirror, &ROOT, config(&h, None)).await.unwrap();
+    at_rest_key::Entity::delete_many().exec(&db).await.unwrap();
+    let name = mirror
+        .names()
+        .into_iter()
+        .find(|n| n.starts_with(ARK_MIRROR_PREFIX))
+        .unwrap();
+    let mut obj: serde_json::Value =
+        serde_json::from_slice(&mirror.get(&name).await.unwrap().unwrap()).unwrap();
+    obj["version"] = serde_json::json!(2);
+    mirror
+        .put(&name, serde_json::to_vec(&obj).unwrap())
+        .await
+        .unwrap();
+    assert!(matches!(
+        open(&db, &mirror, &ROOT, config(&h, None)).await,
+        Err(AtRestError::Mirror(e)) if e.contains("version 2")
+    ));
+}
+
+#[tokio::test]
+async fn migration_down_refuses_to_drop_keys() {
+    let (db, mirror, h) = (db().await, Arc::new(MemoryMirror::default()), holders());
+    open(&db, &mirror, &ROOT, config(&h, None)).await.unwrap();
+    assert!(crate::migrations::Migrator::down(&db, Some(1))
+        .await
+        .is_err());
+    assert_eq!(at_rest_key::Entity::find().all(&db).await.unwrap().len(), 1);
+    at_rest_escrow::Entity::delete_many()
+        .exec(&db)
+        .await
+        .unwrap();
+    at_rest_key::Entity::delete_many().exec(&db).await.unwrap();
+    crate::migrations::Migrator::down(&db, Some(1))
+        .await
+        .unwrap();
+    assert!(at_rest_key::Entity::find().all(&db).await.is_err());
 }

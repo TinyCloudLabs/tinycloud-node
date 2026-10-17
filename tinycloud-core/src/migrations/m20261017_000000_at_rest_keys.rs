@@ -2,6 +2,7 @@
 //! until a node is configured to provision at-rest keys.
 
 use sea_orm_migration::prelude::*;
+use sea_orm_migration::sea_orm::{DatabaseBackend, EntityTrait, PaginatorTrait};
 
 use crate::models::{at_rest_escrow, at_rest_key, space_data_key};
 
@@ -77,6 +78,24 @@ impl MigrationTrait for Migration {
                     .to_owned(),
             )
             .await?;
+        // At most one active bundle per generation. MySQL has no partial
+        // indexes (sea-query would emit a plain unique index, which would
+        // forbid keeping old bundles); there, the row lock taken by
+        // `AtRestStore::activate_escrow` alone serializes activations.
+        if manager.get_database_backend() != DatabaseBackend::MySql {
+            manager
+                .create_index(
+                    Index::create()
+                        .name("at_rest_escrow_one_active")
+                        .table(at_rest_escrow::Entity)
+                        .col(at_rest_escrow::Column::Generation)
+                        .unique()
+                        .if_not_exists()
+                        .and_where(Expr::col(at_rest_escrow::Column::Active).eq(true))
+                        .to_owned(),
+                )
+                .await?;
+        }
         manager
             .create_table(
                 Table::create()
@@ -117,7 +136,19 @@ impl MigrationTrait for Migration {
             .await
     }
 
+    /// Refuses while any key row exists: dropping them would leave sealed
+    /// data depending on the mirror alone, or on nothing.
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let db = manager.get_connection();
+        let rows = at_rest_key::Entity::find().count(db).await?
+            + at_rest_escrow::Entity::find().count(db).await?
+            + space_data_key::Entity::find().count(db).await?;
+        if rows > 0 {
+            return Err(DbErr::Migration(
+                "refusing to drop the at-rest key tables: they hold keys that exist nowhere else"
+                    .into(),
+            ));
+        }
         manager
             .drop_table(Table::drop().table(space_data_key::Entity).to_owned())
             .await?;
