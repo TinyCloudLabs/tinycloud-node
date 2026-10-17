@@ -59,7 +59,7 @@ impl StorageSetup for S3BlockStore {
     }
 }
 
-async fn new_client(config: &S3BlockConfig) -> Client {
+pub(crate) async fn new_client(config: &S3BlockConfig) -> Client {
     let general_config = aws_config().await;
     let sdk_config = aws_sdk_s3::config::Builder::from(&general_config);
     let sdk_config = match &config.endpoint {

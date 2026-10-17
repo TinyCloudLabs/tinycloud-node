@@ -10282,6 +10282,7 @@ name = "tinycloud-node"
 version = "1.20.7"
 dependencies = [
  "aes-gcm",
+ "age",
  "anyhow",
  "async-trait",
  "aws-config",
@@ -10345,6 +10346,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tikv-jemallocator",
  "time",
+ "tinycloud-at-rest-escrow",
  "tinycloud-auth",
  "tinycloud-core",
  "tinycloud-sdk-wasm",
