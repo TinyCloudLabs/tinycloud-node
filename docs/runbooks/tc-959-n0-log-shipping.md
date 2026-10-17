@@ -28,10 +28,12 @@ Parsing failures become fixed counters; no log-level suppression is used.
 
 | Event | Fields beyond `ts`, `level`, `event`, `svc` | Delivery policy |
 | --- | --- | --- |
-| `node_request`, `svc=api` | `method`, canonical `route` template, integer `status`, nonnegative integer `latency_us` | Individually when valid and eligible under the selected request profile; no sampling |
+| `node_request`, `svc=api` | `method`, canonical `route` template, integer `status`, nonnegative integer `latency_us`; plus, only when present and exactly well-formed: `request_id` (lowercase UUID, version 1-8), `request_id_replaced` (boolean), `account_hash` and `space_hash` (64 lowercase hex, keyed pseudonyms). A malformed value is dropped and the request still ships. | Individually when valid and eligible under the selected request profile; no sampling |
 | `ingress_request`, `svc=ingress` | Same method/route/status, distinct numeric `request_time_seconds` | Individually when valid and eligible under the selected request profile; no sampling |
 | `node_warning` / `node_error`, `svc=api` | Fixed `event_code`, integer `event_count` | All accepted typed application WARN/ERROR records remain eligible under either profile; grouped counts approximately every 60 seconds |
 | `logship_gate_summary_total`, `svc=logship` | Fixed `reason`, integer `count` | Count every rejection that reaches the boundary; emit approximately every 60 seconds per fixed reason |
+
+**`request_id` provenance:** `request_id` is the caller's `X-Request-ID` when that header is a single valid UUID (version 1-8, RFC 4122 variant), and a node-generated UUID otherwise (`request_id_replaced=true`). The value therefore carries caller-chosen bits, and a version-1 UUID can embed the client's MAC address and a timestamp, per the #140 contract. The sidecar validates only the shape; it cannot tell a caller-chosen id from a random one. `account_hash` and `space_hash` are the node's keyed pseudonyms, never raw identifiers.
 
 ### Request profiles
 
@@ -144,7 +146,7 @@ Keep these identities distinct:
 | --- | --- |
 | Before: verifier `docker_compose_file` / hash | Raw preserved pre-N0 compose: `df239749ca0a9c09893a855ae2a8abb94090b8556515ad002105c58ac91f4c91` |
 | Before: application `compose_hash` | `bfe9028a58b23238188aa7d70b82282a7cd6414cd83dcc47a3b295c6f64fe2f8`; a distinct reported identity, not the raw-file hash |
-| After: current profile-enabled raw compose | `ca110b0bae6d5a06a1002fb80df3f71cffec11659c9f9dbfa5d72624735546f6`; bind this artifact to the final reviewed PR head before any promotion |
+| After: current profile-enabled raw compose | `6563d51bffe4b537d49b0c087a50e86753aaaf5ba533f1e52c7c2214f7f5f04e`; bind this artifact to the final reviewed PR head before any promotion |
 
 The raw after hash identifies the profile-enabled compose, not deployment approval. Record its final reviewed PR head and required CI evidence in the officer handoff. Do not infer a raw-file hash from the distinct application-reported compose hash.
 
