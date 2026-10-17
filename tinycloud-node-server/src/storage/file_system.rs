@@ -16,7 +16,7 @@ use std::{
 };
 use tempfile::{NamedTempFile, PathPersistError};
 use tinycloud_auth::{resource::SpaceId, ssi::dids::DIDBuf};
-use tinycloud_core::{hash::Hash, storage::*};
+use tinycloud_core::{at_rest::plaintext_len, hash::Hash, storage::*};
 use tokio::{
     fs::{create_dir_all, metadata, remove_file, File},
     io::{AsyncReadExt, AsyncSeekExt},
@@ -34,7 +34,10 @@ pub struct FileSystemStore {
 impl FileSystemStore {
     async fn new(path: PathBuf) -> Result<Self, IoError> {
         // get the size of the directory
-        let sizes = store_sizes(&path).await?.into();
+        let sizes = SpaceSizes::from_scan(
+            store_sizes(&path).await?,
+            sealed_sizes(&path.join(SEALED_DIR)).await?,
+        );
         Ok(Self { path, sizes })
     }
 
@@ -46,10 +49,10 @@ impl FileSystemStore {
     }
 
     async fn increment_size(&self, space: &SpaceId, size: u64) {
-        self.sizes.increment_size(space, size).await;
+        self.sizes.increment_size(space, None, size).await;
     }
     async fn decrement_size(&self, space: &SpaceId, size: u64) {
-        self.sizes.decrement_size(space, size).await;
+        self.sizes.decrement_size(space, None, size).await;
     }
 }
 
@@ -107,6 +110,8 @@ pub enum FileSystemStoreError {
     Io(#[from] IoError),
     #[error(transparent)]
     Persist(#[from] PathPersistError),
+    #[error(transparent)]
+    AtRest(#[from] super::sealed::AtRestStoreError),
 }
 
 #[async_trait]
@@ -168,7 +173,7 @@ impl ImmutableReadStore for FileSystemStore {
 impl StoreSize for FileSystemStore {
     type Error = FileSystemStoreError;
     async fn total_size(&self, space: &SpaceId) -> Result<Option<u64>, Self::Error> {
-        Ok(self.sizes.get_size(space).await)
+        Ok(self.sizes.get_size(space, None).await)
     }
 }
 
@@ -177,11 +182,15 @@ async fn store_sizes<P: AsRef<Path>>(path: &P) -> Result<HashMap<SpaceId, u64>, 
     ReadDirStream::new(tokio::fs::read_dir(path).await?)
         // for every entry in the store dir
         .try_fold(HashMap::new(), |mut acc, entry| async move {
-            // if its a directory and the suffix is a valid string
+            // if its a directory and the suffix is a valid string (the sealed
+            // `v1` directory is scanned by `sealed_sizes`)
             if let (true, Ok(ref suffix)) = (
                 entry.metadata().await?.is_dir(),
                 entry.file_name().into_string(),
             ) {
+                if suffix == SEALED_DIR {
+                    return Ok(acc);
+                }
                 let mut ds = ReadDirStream::new(tokio::fs::read_dir(entry.path()).await?);
                 let did: DIDBuf = ["did:", suffix.as_str()].concat().parse().map_err(|_| {
                     IoError::new(ErrorKind::InvalidData, format!("Invalid DID: {suffix}"))
@@ -205,6 +214,42 @@ async fn store_sizes<P: AsRef<Path>>(path: &P) -> Result<HashMap<SpaceId, u64>, 
             Ok(acc)
         })
         .await
+}
+
+/// The sealed-object directory under the store root: `v1/{space_tag}/{object_tag}`.
+const SEALED_DIR: &str = "v1";
+
+/// Plaintext bytes per space tag under `v1/` (TC-887). Missing directory: none.
+async fn sealed_sizes(path: &Path) -> Result<HashMap<String, u64>, IoError> {
+    let mut sizes = HashMap::new();
+    let mut invalid = super::sealed::InvalidLengthLog::default();
+    let mut tags = match tokio::fs::read_dir(path).await {
+        Ok(dir) => ReadDirStream::new(dir),
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(sizes),
+        Err(e) => return Err(e),
+    };
+    while let Some(tag) = tags.try_next().await? {
+        let (true, Ok(name)) = (
+            tag.metadata().await?.is_dir(),
+            tag.file_name().into_string(),
+        ) else {
+            continue;
+        };
+        let mut total = 0u64;
+        let mut objects = ReadDirStream::new(tokio::fs::read_dir(tag.path()).await?);
+        while let Some(object) = objects.try_next().await? {
+            let meta = object.metadata().await?;
+            if meta.is_file() {
+                total += plaintext_len(meta.len()).unwrap_or_else(|| {
+                    invalid.record(meta.len());
+                    0
+                });
+            }
+        }
+        sizes.insert(name, total);
+    }
+    invalid.finish();
+    Ok(sizes)
 }
 
 async fn space_size<P: AsRef<Path>>(path: &P) -> Result<u64, IoError> {
@@ -490,6 +535,36 @@ mod test {
         assert_eq!(
             store.read(&space_id, &hash).await.unwrap().map(|_| ()),
             None
+        );
+    }
+
+    /// A store holding sealed objects under `v1/` still opens, and counts
+    /// their plaintext bytes per space tag, not under a space.
+    #[tokio::test]
+    async fn boot_scan_counts_sealed_objects_by_tag() {
+        use tinycloud_core::at_rest::ciphertext_len;
+        let dir = tempfile::tempdir().unwrap();
+        let space_id: SpaceId = "tinycloud:key:test:default".parse().unwrap();
+        let legacy = dir
+            .path()
+            .join(space_id.suffix())
+            .join(space_id.name().as_str());
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("obj"), [1u8; 11]).unwrap();
+        let tag = dir.path().join(SEALED_DIR).join("tagA");
+        std::fs::create_dir_all(&tag).unwrap();
+        for (name, plain) in [("o1", 100u64), ("o2", 70_000)] {
+            let len = ciphertext_len(plain).unwrap() as usize;
+            std::fs::write(tag.join(name), vec![0u8; len]).unwrap();
+        }
+        // Not a valid TCE1 length: counted as 0.
+        std::fs::write(tag.join("bad"), [0u8; 70]).unwrap();
+
+        let store = FileSystemConfig::new(dir.path()).open().await.unwrap();
+        assert_eq!(store.total_size(&space_id).await.unwrap(), Some(11));
+        assert_eq!(
+            store.sizes.get_size(&space_id, Some("tagA")).await,
+            Some(11 + 100 + 70_000)
         );
     }
 }
