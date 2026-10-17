@@ -295,7 +295,7 @@ gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref main \
 
 The served/OCI identity remains **1.20.6-dstack / e18578ff9162986ddd813259c60f73866e3e60d1**.
 The N0 raw lock is unchanged:
-`ca110b0bae6d5a06a1002fb80df3f71cffec11659c9f9dbfa5d72624735546f6`,
+`6563d51bffe4b537d49b0c087a50e86753aaaf5ba533f1e52c7c2214f7f5f04e`,
 from #309 reviewed head `44eeb20a1461ef66b5af492e3be4c42be2728b67`,
 [approval](https://github.com/TinyCloudLabs/tinycloud-node/pull/309#issuecomment-6224650050).
 Current pre-N0 tag/pinned equivalents are separately hash-checked; arbitrary
