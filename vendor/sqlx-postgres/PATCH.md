@@ -2,9 +2,9 @@
 
 Source: crates.io `sqlx-postgres` 0.8.6, SHA-256
 `db58fcd5a53cf07c184b154801ff91347e4c30d17a3562a635ff028ad5deda46`.
-The extracted package is otherwise unchanged; the registry-only `.cargo-ok`
-marker is omitted. Root and excluded harness `[patch.crates-io]` entries select
-this directory alongside the matching sqlx-core/sqlx-sqlite patches.
+The registry-only `.cargo-ok` marker is omitted. Local differences are documented
+below. Root and excluded harness `[patch.crates-io]` entries select this directory
+alongside the matching sqlx-core/sqlx-sqlite patches.
 
 ## Boundary
 
@@ -24,6 +24,17 @@ No SQL, values, identities or error strings are copied into telemetry. A scope
 without request metrics adds no query count or timer clock read. Connection
 initialization/acquisition housekeeping is unscoped by sqlx-core's acquisition
 hook, while its full elapsed time remains pool acquisition time.
+
+## Build hygiene under denied warnings
+
+The original registry archive checksum above identifies the unpatched source.
+`src/connection/sasl.rs` borrows the SCRAM digest bytes directly instead of using
+the deprecated `GenericArray::as_slice`; this does not allocate or copy.
+The unused private `Flush` encoder, internal re-export and frontend discriminator
+are removed after checking all crate references. The only references were its
+definition/implementation and that re-export; `message` is private and does not
+export it from the crate. Remaining protocol discriminators are explicit bytes
+and are unchanged. No lint allowance is added.
 
 ## Evidence and removal
 

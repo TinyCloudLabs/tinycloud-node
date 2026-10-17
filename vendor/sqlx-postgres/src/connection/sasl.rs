@@ -197,7 +197,7 @@ fn hi<'a>(s: &'a str, salt: &'a [u8], iter_count: u32) -> Result<[u8; 32], Error
     let mut hi = u;
 
     for _ in 1..iter_count {
-        mac.update(u.as_slice());
+        mac.update(&u);
         u = mac.finalize_reset().into_bytes();
         hi = hi.iter().zip(u.iter()).map(|(&a, &b)| a ^ b).collect();
     }

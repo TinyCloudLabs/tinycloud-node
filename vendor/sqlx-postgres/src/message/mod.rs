@@ -13,7 +13,6 @@ mod copy;
 mod data_row;
 mod describe;
 mod execute;
-mod flush;
 mod notification;
 mod parameter_description;
 mod parameter_status;
@@ -39,8 +38,6 @@ pub use copy::{CopyData, CopyDone, CopyFail, CopyInResponse, CopyOutResponse, Co
 pub use data_row::DataRow;
 pub use describe::Describe;
 pub use execute::Execute;
-#[allow(unused_imports)]
-pub use flush::Flush;
 pub use notification::Notification;
 pub use parameter_description::ParameterDescription;
 pub use parameter_status::ParameterStatus;
@@ -73,7 +70,6 @@ pub enum FrontendMessageFormat {
     CopyFail = b'f',
     Describe = b'D',
     Execute = b'E',
-    Flush = b'H',
     Parse = b'P',
     /// This message format is polymorphic. It's used for:
     ///
