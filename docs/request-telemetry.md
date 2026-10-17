@@ -81,10 +81,12 @@ SQLx query timing follows the execution/logger lifetime, including network I/O a
 | Request-awaited read audit | Separate measured batch context, fanned out before durable receipts; details below |
 | User SQL rusqlite actor | Context on every work message; actual statement/schema/batch/growth-control SQL, prepare/constraint errors, cold-open PRAGMAs, size/promotion/checkpoint SQL |
 | SQL publication | The current withdrawn publication handler executes no SQL; it is not an uninstrumented database path |
-| Optional DuckDB actor | Context on every message; JSON/Arrow queries, schema/batch/transaction/growth/catalog SQL, security settings and promotion/copy/describe SQL |
-| DuckDB import/cold export blocking workers | Explicit worker context for validation/security/checkpoint/copy SQL; artifact repository work is measured separately by SQLx |
+| Optional DuckDB actor | Context on every message and the initiating cold-open worker; JSON/Arrow queries, schema/batch/transaction/growth/catalog SQL, locked security settings and promotion/copy/describe SQL |
+| DuckDB import/cold export blocking workers | Explicit worker context for guarded admission/validation/checkpoint/copy SQL; artifact repository work is measured separately by SQLx |
 | `/healthz` | Real BEGIN is counted. Its drop-triggered rollback is detached cleanup, excluded below |
 | `/version`, `/info`, public node-key descriptions and CORS | No database work: known numeric zeros, no borrowed maintenance counters |
+
+DuckDB's guarded opener counts each settings batch, optional memory-setting call and configuration-lock call at the native execution boundary. Its stored-definition audit measures catalog prepare/query/step work for views, column defaults/generated expressions, CHECK constraints and macros. The same audit runs before copying tables. Timers pause between rows for SQL admission parsing, expression wrapping and other Rust-side work; rejected stored definitions retain the SQL attempts already performed. Native connection opening itself is not invented SQL, and native actors do not masquerade their operation locks/queues as SQLx pool acquisitions.
 
 ### Shared read-audit batches
 
@@ -95,7 +97,7 @@ Each participant receives the full physical batch's execution/wait/count contrib
 ### Inspected exclusions and limits
 
 - Detached drop/cancellation-cleanup rollback and connection-release health/close work: may complete after the response. Awaited BEGIN/SAVEPOINT/COMMIT/ROLLBACK is counted; queueing detached rollback is not mislabeled execution.
-- Database startup/migrations/SQL-size seeding and the separate offline SQL-identity CLI: no HTTP request context.
+- Database startup/migrations/SQL-size seeding and the separate offline SQL-identity CLI: no HTTP request context. Offline fingerprint/checkpoint uses the same guarded DuckDB opener but emits no request event; its direct inspection/checkpoint SQL is outside the HTTP timing contract.
 - Periodic pool sampler, replay cleanup, retention sweeper, webhook dispatcher and egress refresh: detached maintenance, not whichever HTTP request runs concurrently.
 - Detached post-commit SQL/DuckDB webhook enqueue: does not mutate a response's finalized counters. Synchronous KV post-commit hook reads remain counted.
 - SQL/DuckDB operation locks, actor queues, parser/admission work, native connection open/implicit close, filesystem/WAL/blob I/O and result formatting: not SQL execution time.
@@ -115,6 +117,8 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 TINYCLOUD_TEST_POSTGRES_URL=<isolated-local-postgres> cargo test --workspace
 TINYCLOUD_TEST_POSTGRES_URL=<isolated-local-postgres> cargo test -p tinycloud-core --features duckdb
+cargo test -p tinycloud-node --test request_telemetry --test request_telemetry_authenticated --test request_log_redaction
+cargo test -p tinycloud-node --features duckdb --test request_telemetry_authenticated --test duckdb_diagnostics_policy --test duckdb_offline_policy
 ```
 
 The existing full workspace suite requires PostgreSQL 16+ with ICU collation support; PostgreSQL 14 cannot run its existing ICU `rules` regression. The existing privileged black-hole tests additionally require their explicit opt-in and host/network authorization; they are not implied by a telemetry smoke or a shared build slot. Never point tests at production databases. No local Docker proof, production ingestion, deployment or merge is implied by these commands.
