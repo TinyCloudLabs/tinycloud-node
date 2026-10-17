@@ -88,11 +88,7 @@ pub(crate) fn seal_armored(
 fn combine(a: &SharePayload, b: &SharePayload) -> Result<Ark, EscrowError> {
     let shares = Zeroizing::new(vec![a.share.to_vec(), b.share.to_vec()]);
     let secret = Zeroizing::new(Gf256::combine_array(&*shares).map_err(|_| EscrowError::Shamir)?);
-    let bytes: [u8; 32] = secret
-        .as_slice()
-        .try_into()
-        .map_err(|_| EscrowError::Shamir)?;
-    Ok(Ark::from_bytes(bytes))
+    Ark::from_slice(&secret).ok_or(EscrowError::Shamir)
 }
 
 impl EscrowBundle {
