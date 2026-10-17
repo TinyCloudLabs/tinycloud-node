@@ -135,8 +135,8 @@ jobs:
     - name: Run DuckDB-enabled core tests
       run: cargo test -p tinycloud-core --features duckdb
 
-    - name: Run DuckDB policy through node binaries
-      run: cargo test -p tinycloud-node --features duckdb --test duckdb_diagnostics_policy --test duckdb_offline_policy
+    - name: Run DuckDB policy and request telemetry through node binaries
+      run: cargo test -p tinycloud-node --features duckdb --test request_telemetry_authenticated --test duckdb_diagnostics_policy --test duckdb_offline_policy
 
   clippy:
     name: clippy (workspace)
@@ -243,8 +243,10 @@ jobs:
   # repository by git, which this workflow's token cannot clone, so it runs
   # locally before a release (`cargo test --locked --manifest-path
   # test/w5-policy-runtime-node-e2e/Cargo.toml`); a CI job needs a read token
-  # for that repository first. test/load/signer is covered by no job at all.
-  # Recorded here rather than left implicit.
+  # for that repository first, and its lockfile is not checked in CI yet.
+  # test/load/signer is built by no job. The `lockfiles` job below resolves
+  # main, m1-realdata-e2e and test/load/signer with --locked. Recorded here
+  # rather than left implicit.
   m1-realdata:
     runs-on: ubuntu-latest
     env:
@@ -274,6 +276,28 @@ jobs:
     - name: Run deterministic M1 contract tests
       run: cargo test --locked --manifest-path test/m1-realdata-e2e/Cargo.toml
 
+  # TC-887: every separate workspace's Cargo.lock must stay current for the
+  # in-repo crates it uses by path, or `cargo ... --locked` breaks there. The
+  # jobs above build only the main workspace and m1-realdata-e2e. This job
+  # resolves each workspace CI can fetch with --locked (w5's private git
+  # dependency is not fetchable here; see above).
+  lockfiles:
+    name: separate workspace lockfiles
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+    steps:
+    - name: Checkout TinyCloud repository
+      uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@1.97.1
+    - name: Resolve each fetchable workspace with --locked
+      run: |
+        for manifest in Cargo.toml test/m1-realdata-e2e/Cargo.toml test/load/signer/Cargo.toml; do
+          echo "cargo metadata --locked --manifest-path $manifest"
+          cargo metadata --locked --format-version 1 --manifest-path "$manifest" > /dev/null
+        done
+
   # TC-887 S0: a real node on native PostgreSQL and native MinIO (no service
   # containers). MinIO/mc are pinned community releases whose sha256 is pinned
   # in harness.sh; PostgreSQL is the runner image's own native install. The
@@ -281,8 +305,8 @@ jobs:
   # database_artifact (checkpoint and WAL delta). The RED checks assert
   # encryption at rest; until TC-887 S3/S4 land, the step passes only if both
   # fail with their "TC-887 RED:" findings (`--expect red`), and fails loudly
-  # if they error or unexpectedly pass. Switch to `--expect green` (with the
-  # at-rest mode set) when S3/S4 merge.
+  # if they error or unexpectedly pass. When S3 lands, start the harness with
+  # the at-rest mode set and expect `kv=green,sql=red`; when S4 lands, `green`.
   at-rest-harness:
     name: at-rest harness (native PostgreSQL + MinIO)
     runs-on: ubuntu-latest
@@ -339,3 +363,64 @@ jobs:
         if [ -f "$TC887_STATE" ]; then
           bash scripts/at-rest-harness/harness.sh down --purge "$TC887_STATE"
         fi
+
+  # TC-887: test/w5-policy-runtime-node-e2e depends on the private
+  # TinyCloudLabs/policy-engine repository by git, so the workflow token cannot
+  # resolve it. With a read-only deploy key for that one repository in the
+  # POLICY_ENGINE_DEPLOY_KEY secret, this job resolves w5 with --locked like
+  # the other workspaces. The key is loaded into an ssh-agent for the cargo
+  # step only and removed from the environment before cargo runs; checkout
+  # keeps no credentials.
+  # Without the secret the job skips with a notice. That is intended for fork
+  # PRs, which never receive secrets, and for the period before the deploy key
+  # exists. Once the key is added, pushes and same-repository PRs are meant to
+  # fail when the secret is missing; only fork PRs keep the notice skip.
+  w5-lockfile:
+    name: w5 workspace lockfile (private dependency)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      HAS_DEPLOY_KEY: ${{ secrets.POLICY_ENGINE_DEPLOY_KEY != '' }}
+    steps:
+    - name: Skip without the policy-engine deploy key
+      if: env.HAS_DEPLOY_KEY != 'true'
+      run: echo "::notice title=w5 lockfile not checked::POLICY_ENGINE_DEPLOY_KEY is not available (fork PR, or the key is not added yet); the w5 --locked resolve was skipped."
+    - name: Checkout TinyCloud repository
+      if: env.HAS_DEPLOY_KEY == 'true'
+      uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    # No toolchain action: rustup on the runner installs the toolchain pinned
+    # in rust-toolchain.toml when cargo first runs.
+    - name: Resolve w5 with --locked
+      if: env.HAS_DEPLOY_KEY == 'true'
+      env:
+        POLICY_ENGINE_DEPLOY_KEY: ${{ secrets.POLICY_ENGINE_DEPLOY_KEY }}
+        CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      run: |
+        set -euo pipefail
+        lock=test/w5-policy-runtime-node-e2e/Cargo.lock
+        repo=https://github.com/TinyCloudLabs/policy-engine
+        # The rewrite below is a git prefix match. Anchor it: every lockfile
+        # source under that prefix must be exactly this repository (followed
+        # by its ?query or #revision), so no other URL can be rewritten.
+        if grep -E "^source = \"git\+${repo}[^?#\"]" "$lock"; then
+          echo "::error::$lock has a git source that shares the ${repo} prefix but is a different URL"
+          exit 1
+        fi
+        eval "$(ssh-agent -s)" > /dev/null
+        trap 'ssh-agent -k > /dev/null' EXIT
+        ssh-add - <<< "$POLICY_ENGINE_DEPLOY_KEY"
+        unset POLICY_ENGINE_DEPLOY_KEY
+        # GitHub's published ED25519 host key:
+        # https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints
+        mkdir -p ~/.ssh
+        echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" >> ~/.ssh/known_hosts
+        # Rewrite only this repository to SSH, for the cargo process only; the
+        # lockfile keeps the https source.
+        GIT_CONFIG_COUNT=1 \
+          GIT_CONFIG_KEY_0="url.ssh://git@github.com/TinyCloudLabs/policy-engine.insteadOf" \
+          GIT_CONFIG_VALUE_0="$repo" \
+          cargo metadata --locked --format-version 1 --manifest-path test/w5-policy-runtime-node-e2e/Cargo.toml > /dev/null

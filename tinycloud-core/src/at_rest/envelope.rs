@@ -1,5 +1,5 @@
 //! TCE1: a segmented AES-256-GCM envelope (TC-887 plan §1.2–1.3; normative
-//! format in `INTERFACES.md` §4).
+//! format in `docs/at-rest/INTERFACES.md` §4).
 //!
 //! ```text
 //! header(64) ‖ seg_0 ‖ … ‖ seg_{n-1}       seg_i = AES-GCM(ct_i) ‖ tag16
@@ -28,7 +28,8 @@ pub const SEGMENT_LEN: usize = 1 << 16;
 pub const TAG_LEN: usize = 16;
 
 /// Every TCE generation starts `"TCE" ‖ ASCII digit g ‖ version byte g`; this
-/// build reads and writes generation 1 only. See `INTERFACES.md` §4 (TCE2 rule).
+/// build reads and writes generation 1 only. See `docs/at-rest/INTERFACES.md`
+/// §4 (TCE2 rule).
 const FAMILY: &[u8; 3] = b"TCE";
 const MAGIC: &[u8; 4] = b"TCE1";
 const VERSION: u8 = 1;

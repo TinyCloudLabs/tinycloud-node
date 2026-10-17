@@ -53,8 +53,12 @@ impl WebhookDispatcher {
         // so a revocation or expiry applies by the next pass.
         let mut authority = HashMap::<String, bool>::new();
         for delivery in deliveries {
-            if let Err(error) = self.dispatch_delivery(delivery, &mut authority).await {
-                tracing::warn!(error = %error, "webhook delivery attempt failed");
+            if self
+                .dispatch_delivery(delivery, &mut authority)
+                .await
+                .is_err()
+            {
+                tracing::warn!("webhook delivery attempt failed");
             }
         }
 
@@ -249,8 +253,8 @@ impl WebhookDispatcher {
 pub fn spawn_webhook_dispatcher(dispatcher: WebhookDispatcher) {
     rocket::tokio::spawn(async move {
         loop {
-            if let Err(error) = dispatcher.dispatch_due_once().await {
-                tracing::warn!(error = %error, "webhook dispatcher loop failed");
+            if dispatcher.dispatch_due_once().await.is_err() {
+                tracing::warn!("webhook dispatcher loop failed");
             }
 
             rocket::tokio::time::sleep(POLL_INTERVAL).await;

@@ -1035,6 +1035,10 @@ impl TryFrom<Static> for StaticSecret {
 pub struct Logging {
     pub format: LoggingFormat,
     pub tracing: Tracing,
+    /// Exact HTTP(S) origins permitted to receive request correlation IDs.
+    /// Service URLs are not implicitly first-party; empty means no forwarding.
+    #[serde(default)]
+    pub request_id_first_party_origins: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone, Hash, PartialEq, Eq)]

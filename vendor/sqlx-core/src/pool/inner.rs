@@ -176,6 +176,7 @@ impl<DB: Database> PoolInner<DB> {
 
     #[inline]
     pub(super) fn try_acquire(self: &Arc<Self>) -> Option<Floating<DB, Idle<DB>>> {
+        let _request_wait = crate::request_telemetry::PoolTimer::new();
         if self.is_closed() {
             return None;
         }
@@ -240,6 +241,7 @@ impl<DB: Database> PoolInner<DB> {
     }
 
     pub(super) async fn acquire(self: &Arc<Self>) -> Result<Floating<DB, Live<DB>>, Error> {
+        let _request_wait = crate::request_telemetry::PoolTimer::new();
         if self.is_closed() {
             return Err(Error::PoolClosed);
         }
@@ -259,7 +261,9 @@ impl<DB: Database> PoolInner<DB> {
                     let guard = match self.pop_idle(permit) {
 
                         // Then, check that we can use it...
-                        Ok(conn) => match check_idle_conn(conn, &self.options).await {
+                        Ok(conn) => match crate::request_telemetry::unscoped(
+                            check_idle_conn(conn, &self.options),
+                        ).await {
 
                             // All good!
                             Ok(live) => return Ok(live),
@@ -285,7 +289,7 @@ impl<DB: Database> PoolInner<DB> {
                     };
 
                     // Attempt to connect...
-                    return self.connect(deadline, guard).await;
+                    return crate::request_telemetry::unscoped(self.connect(deadline, guard)).await;
                 }
             }
         )
