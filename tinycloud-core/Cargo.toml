@@ -16,6 +16,10 @@ duckdb = ["dep:arrow", "dep:duckdb"]
 # build. Downstream crates enable it only on their `tinycloud-core`
 # dev-dependency so their own tests can assert exactly-once verification.
 verification-count-test-hook = []
+# TC-887: `at_rest::FixedKeyProvider`, a deterministic test key provider.
+# Never part of a production build; downstream crates enable it only on their
+# `tinycloud-core` dev-dependency.
+test-util = []
 
 tokio = [
     "sea-orm/runtime-tokio-rustls",
@@ -58,6 +62,8 @@ base64.workspace = true
 sha2 = "0.10"
 sha3 = "0.10"
 k256 = "0.13"
+# TC-887: zeroize at-rest key material on drop.
+zeroize = "1"
 prometheus = { version = "0.13.0", features = ["process"] }
 ryu-js = "0.2.2"
 # W1 (audit P1): full Unicode NFC normalization for policy capability path

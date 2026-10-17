@@ -157,7 +157,10 @@ authority for both of Sam's spaces, and the reviewed limits are floors,
 applications `5368709120` and secrets `1073741824` (internal D1
 `quota_overrides`). Billing mode is read-only after the last restart and
 required health: both exact spaces must exist once with positive usage in
-authenticated `/admin/usage`; it never PUTs/DELETEs a node override. Each
+authenticated `/admin/usage`, which lists every space on the node
+unpaginated (~107 bytes a space); the script reads up to 16 MiB of it and
+fails closed above that, while other quota bodies stay capped at 64 KiB.
+It never PUTs/DELETEs a node override. Each
 active absolute per-space `storage_limit_bytes` must cover its floor, and
 node GET must show `override_bytes=null`. Missing, inactive or insufficient
 comps fail `billing authority does not cover both reviewed quota floors`; a
@@ -168,7 +171,12 @@ space limits.
 
 Ordering rule: the flip to `billing` is merged only after both spaces are
 billing comps with their node overrides cleared, and before any further
-`deploy_phala` dispatch. Reverting to `authority=node-override` requires a
+`deploy_phala` dispatch. Merged before that migration, the next dispatch
+restarts the node (wiping its in-memory overrides) and billing-mode
+reconcile then fails without restoring them (no comp covers the floors).
+Left unmerged after the migration, the next dispatch refuses in
+node-override mode with `authority mismatch: flip to billing`.
+Reverting to `authority=node-override` requires a
 reviewed PR. In that legacy mode, before ANY PUT both billing storage-comp
 reads must prove no active comp (404 logs only `billing storage-comp
 unavailable`; valid `active:false` also permits the restore); an active comp
