@@ -1,8 +1,5 @@
 use aws_sdk_s3::{
-    error::{
-        GetObjectAttributesError, GetObjectAttributesErrorKind, GetObjectError, GetObjectErrorKind,
-        HeadObjectError, HeadObjectErrorKind,
-    },
+    error::{GetObjectError, GetObjectErrorKind, HeadObjectError, HeadObjectErrorKind},
     types::{ByteStream, SdkError},
     Client, // Config,
     Error as S3Error,
@@ -118,6 +115,42 @@ impl S3BlockStore {
     }
     async fn decrement_size(&self, space: &SpaceId, size: u64) {
         self.sizes.decrement_size(space, size).await;
+    }
+
+    /// The stored size of an object, or `None` if absent. HeadObject, not
+    /// GetObjectAttributes: that call needs an explicit attribute list, and
+    /// S3 (and MinIO) reject it without one.
+    async fn object_size(&self, key: &str) -> Result<Option<u64>, S3StoreError> {
+        match self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(o) => Ok(Some(o.content_length().try_into()?)),
+            Err(SdkError::ServiceError {
+                err:
+                    HeadObjectError {
+                        kind: HeadObjectErrorKind::NotFound(_),
+                        ..
+                    },
+                ..
+            }) => Ok(None),
+            Err(e) => Err(S3Error::from(e).into()),
+        }
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), S3StoreError> {
+        self.client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(S3Error::from)?;
+        Ok(())
     }
 }
 
@@ -435,41 +468,13 @@ impl ImmutableWriteStore<either::Either<file_system::TempFileSystemStage, memory
 impl ImmutableDeleteStore for S3BlockStore {
     type Error = S3StoreError;
     async fn remove(&self, space: &SpaceId, id: &Hash) -> Result<Option<()>, Self::Error> {
-        let size: u64 = match self
-            .client
-            .get_object_attributes()
-            .bucket(&self.bucket)
-            .key(self.key(space, id))
-            .send()
-            .await
-        {
-            Ok(o) if !o.delete_marker() => o.object_size().try_into()?,
-            Ok(_) => return Ok(None),
-            Err(SdkError::ServiceError {
-                err:
-                    GetObjectAttributesError {
-                        kind: GetObjectAttributesErrorKind::NoSuchKey(_),
-                        ..
-                    },
-                ..
-            }) => return Ok(None),
-            Err(e) => return Err(S3Error::from(e).into()),
+        let key = self.key(space, id);
+        let Some(size) = self.object_size(&key).await? else {
+            return Ok(None);
         };
-        match self
-            .client
-            .delete_object()
-            .bucket(&self.bucket)
-            .key(self.key(space, id))
-            .send()
-            .await
-        {
-            Ok(_) => {
-                self.decrement_size(space, size).await;
-                Ok(Some(()))
-            }
-            // TODO does this distinguish between object missing and object present?
-            Err(e) => Err(S3Error::from(e).into()),
-        }
+        self.delete(&key).await?;
+        self.decrement_size(space, size).await;
+        Ok(Some(()))
     }
 }
 
