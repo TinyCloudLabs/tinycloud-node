@@ -245,7 +245,7 @@ class AuthorityTests(unittest.TestCase):
                 self.assertEqual(self.run_main(["--validate-only"])[0], 1)
                 self.assertEqual(self.calls, [])
 
-    def test_missing_distinct_billing_secret_fails_preflight_without_requests(self):
+    def test_missing_billing_secret_fails_preflight_without_requests(self):
         self.environment.pop("QUOTA_BILLING_ADMIN_SECRET")
         self.assertEqual(self.run_main(["--preflight"])[0], 1)
         self.assertEqual(self.calls, [])
