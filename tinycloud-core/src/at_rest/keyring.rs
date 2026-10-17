@@ -653,8 +653,14 @@ impl AtRestKeyring {
     async fn load(&self) -> Result<(), AtRestError> {
         // A retired ARK (W-authenticated tombstone in the mirror) is never
         // loaded, even from a database restored to before its retirement.
-        let retired = self.retired_ark_ids().await?;
         let mut db = self.store.keys().await?;
+        let mut mirrored = mirrored_rows(&*self.mirror, !db.is_empty()).await?;
+        let known: Vec<&[u8]> = db
+            .iter()
+            .chain(&mirrored)
+            .map(|r| r.ark_id.as_slice())
+            .collect();
+        let retired = self.retired_ark_ids(&known).await?;
         if db.iter().any(|r| retired.contains(&r.ark_id)) {
             // Retirement replaces every generation at once, so a database
             // holding both kinds was not written by this node.
@@ -668,12 +674,12 @@ impl AtRestKeyring {
             tracing::warn!("dropping key and escrow rows of a retired at-rest root key");
             self.store.drop_retired_keys(&retired).await?;
             db = self.store.keys().await?;
+            mirrored = mirrored_rows(&*self.mirror, !db.is_empty()).await?;
         }
         if !retired.is_empty() {
             self.sweep_retired(&retired).await?;
         }
         check_contiguous(&db)?;
-        let mut mirrored = mirrored_rows(&*self.mirror, !db.is_empty()).await?;
         mirrored.retain(|r| !retired.contains(&r.ark_id));
         if db.is_empty() && mirrored.is_empty() {
             let live_mirror_objects = self
@@ -1097,9 +1103,12 @@ impl AtRestKeyring {
     }
 
     /// ARK ids with a tombstone that authenticates under this node's W.
-    /// Junk or forged tombstones are skipped; a read error fails the call
-    /// (skipping could bring a retired ARK back).
-    async fn retired_ark_ids(&self) -> Result<Vec<Vec<u8>>, AtRestError> {
+    /// Junk or forged tombstones are skipped with a warning. A tombstone
+    /// that can't be read is skipped too, unless its name is for an ARK
+    /// in `known` (stored or mirrored) and keys may seal (`require_mirror`):
+    /// then skipping could bring a retired ARK back, so the boot fails.
+    /// With mode off, mirror contents never stop the node.
+    async fn retired_ark_ids(&self, known: &[&[u8]]) -> Result<Vec<Vec<u8>>, AtRestError> {
         let mut ids = Vec::new();
         let names = self
             .mirror
@@ -1107,8 +1116,21 @@ impl AtRestKeyring {
             .await
             .map_err(mirror_err)?;
         for name in names {
-            let Some(bytes) = get_capped(&*self.mirror, &name).await.map_err(mirror_err)? else {
-                continue;
+            let bytes = match get_capped(&*self.mirror, &name).await {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => continue,
+                Err(error) => {
+                    let names_known = name
+                        .strip_prefix(RETIRED_MIRROR_PREFIX)
+                        .and_then(|rest| rest.strip_suffix(".json"))
+                        .and_then(|id| hex::decode(id).ok())
+                        .is_some_and(|id| known.contains(&id.as_slice()));
+                    if names_known && self.config.require_mirror {
+                        return Err(mirror_err(error));
+                    }
+                    tracing::warn!(object = ?name, %error, names_known, "ignoring an at-rest retirement marker that can't be read");
+                    continue;
+                }
             };
             let parts = serde_json::from_slice::<MirroredRetired>(&bytes)
                 .ok()
