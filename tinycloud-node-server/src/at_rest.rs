@@ -11,8 +11,10 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use anyhow::{bail, Context, Result};
-use tinycloud_at_rest_escrow::{Efp, RecipientPolicy};
+use anyhow::{bail, ensure, Context, Result};
+use sha2::Digest as _;
+use tinycloud_at_rest_escrow::compose::{AppCompose, RECIPIENTS_ENV, VERIFIED_FP_ENV};
+use tinycloud_at_rest_escrow::{Efp, HolderRecipient, RecipientPolicy};
 use tinycloud_core::{
     at_rest::{
         keyring::{GatePass, GateRefusal},
@@ -22,7 +24,7 @@ use tinycloud_core::{
     RecoveringConnection,
 };
 
-use crate::config::{AtRestConfig, AtRestMode, Storage};
+use crate::config::{AtRestConfig, AtRestEscrowConfig, AtRestMode, Storage};
 use crate::storage::at_rest_mirror::{FsKeyMirror, S3KeyMirror};
 use crate::tee::TeeContext;
 
@@ -41,6 +43,66 @@ pub struct AtRestRuntime {
     /// writes may be encrypted. Set at boot, or after a recovery unlocks a
     /// node whose gate then passes.
     encrypting: AtomicBool,
+    /// Set by block storage when it seals writes (TC-887 S3). Until then a
+    /// mode other than `off` is refused at boot and `encrypting` stays false.
+    seal_path: AtomicBool,
+    share_failures: ShareFailureLimiter,
+}
+
+/// Failed share submissions per client: a share that doesn't decrypt to
+/// this boot's recovery key or match a commitment. A client that keeps
+/// failing is refused for a while. Failures never spend the keyring's
+/// per-boot share budget, which only authenticated shares count against.
+pub struct ShareFailureLimiter {
+    clients:
+        parking_lot::Mutex<std::collections::HashMap<std::net::IpAddr, (f64, std::time::Instant)>>,
+}
+
+impl ShareFailureLimiter {
+    /// Failures a client may make at once, then one more per minute.
+    pub const BURST: f64 = 5.0;
+    const REFILL_PER_SEC: f64 = 1.0 / 60.0;
+    const MAX_CLIENTS: usize = 10_000;
+
+    fn new() -> Self {
+        Self {
+            clients: parking_lot::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    fn refilled(entry: &mut (f64, std::time::Instant)) {
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(entry.1).as_secs_f64();
+        entry.0 = (entry.0 + elapsed * Self::REFILL_PER_SEC).min(Self::BURST);
+        entry.1 = now;
+    }
+
+    /// Whether `ip` may submit now.
+    pub fn allows(&self, ip: std::net::IpAddr) -> bool {
+        let mut clients = self.clients.lock();
+        match clients.get_mut(&ip) {
+            None => true,
+            Some(entry) => {
+                Self::refilled(entry);
+                entry.0 >= 1.0
+            }
+        }
+    }
+
+    pub fn record_failure(&self, ip: std::net::IpAddr) {
+        let mut clients = self.clients.lock();
+        if clients.len() >= Self::MAX_CLIENTS {
+            clients.retain(|_, entry| {
+                Self::refilled(entry);
+                entry.0 < Self::BURST
+            });
+        }
+        let entry = clients
+            .entry(ip)
+            .or_insert((Self::BURST, std::time::Instant::now()));
+        Self::refilled(entry);
+        entry.0 = (entry.0 - 1.0).max(0.0);
+    }
 }
 
 /// The node's [`AtRestRuntime`], if it manages one. Unlike a `State` guard it
@@ -72,6 +134,8 @@ impl AtRestRuntime {
             escrow_none: config.escrow_none,
             keyring: OnceLock::new(),
             encrypting: AtomicBool::new(false),
+            seal_path: AtomicBool::new(false),
+            share_failures: ShareFailureLimiter::new(),
         })
     }
 
@@ -79,10 +143,26 @@ impl AtRestRuntime {
         self.mode
     }
 
-    /// Whether new writes may be sealed now: the gate passed (non-`off`
-    /// mode) and the keys are unlocked.
+    /// Whether new writes may be sealed now: storage has a seal path, the
+    /// gate passed (non-`off` mode) and the keys are unlocked.
     pub fn encrypting(&self) -> bool {
         self.encrypting.load(Ordering::SeqCst)
+    }
+
+    /// Storage calls this when it opens with a seal path for every write
+    /// (the capability S3 turns on). Without it `setup` refuses any mode
+    /// other than `off`, so the node never claims to encrypt while storage
+    /// writes plaintext.
+    pub fn declare_seal_path(&self) {
+        self.seal_path.store(true, Ordering::SeqCst);
+    }
+
+    pub fn has_seal_path(&self) -> bool {
+        self.seal_path.load(Ordering::SeqCst)
+    }
+
+    pub fn share_failures(&self) -> &ShareFailureLimiter {
+        &self.share_failures
     }
 
     /// The data-key provider, once [`setup`] installed a keyring. `None`
@@ -105,7 +185,7 @@ impl AtRestRuntime {
             return Err(GateRefusal::NotProvisioned);
         };
         let result = keyring.gate(self.escrow_none).await;
-        let on = self.mode != AtRestMode::Off && result.is_ok();
+        let on = self.mode != AtRestMode::Off && self.has_seal_path() && result.is_ok();
         self.encrypting.store(on, Ordering::SeqCst);
         result
     }
@@ -130,10 +210,16 @@ impl AtRestRuntime {
 
 /// Phase two, after migrations ran: open the keyring and run the gate.
 ///
-/// Refuses (an error, so the node does not start) when `mode` is `encrypt`
-/// or `strict` and the keys are unlocked but the escrow gate fails. A node
-/// that boots **locked** starts anyway, with encryption unavailable, so two
-/// holders can recover it.
+/// Refuses (an error, so the node does not start):
+/// - `mode` other than `off` while storage has no seal path
+///   ([`AtRestRuntime::declare_seal_path`]);
+/// - in a TEE, escrow recipients or a pin that are not literal values in
+///   the measured compose ([`check_measured_escrow`]);
+/// - `encrypt` or `strict` when the keys are unlocked but the escrow gate
+///   fails.
+///
+/// A node that boots **locked** starts anyway, with encryption
+/// unavailable, so two holders can recover it.
 pub async fn setup(
     runtime: &AtRestRuntime,
     config: &AtRestConfig,
@@ -149,6 +235,12 @@ pub async fn setup(
     if !enabled {
         return Ok(());
     }
+    if config.mode != AtRestMode::Off && !runtime.has_seal_path() {
+        bail!(
+            "at_rest.mode = \"{}\" is refused: this build's storage has no at-rest seal path, so nothing would be encrypted; use mode = \"off\"",
+            runtime.mode_name()
+        );
+    }
     if config.escrow_none && !escrow.recipients.is_empty() {
         bail!("set at_rest.escrow.recipients or at_rest.escrow_none, not both");
     }
@@ -158,12 +250,15 @@ pub async fn setup(
     if tee.is_some() && escrow.allow_software {
         bail!("at_rest.escrow.allow_software is refused inside a TEE: escrow holders must use hardware keys");
     }
-    let pinned_efp = escrow
-        .verified_fp
-        .as_deref()
-        .map(|s| s.trim().to_ascii_lowercase().parse::<Efp>())
-        .transpose()
-        .map_err(|_| anyhow::anyhow!("at_rest.escrow.verified_fp must be 64 hex characters"))?;
+    if let Some(tee) = tee {
+        if !escrow.recipients.is_empty() || escrow.verified_fp.is_some() {
+            let app_compose = crate::dstack::get_app_compose()
+                .await
+                .context("reading the measured app-compose to check the at-rest escrow config")?;
+            check_measured_escrow(&app_compose, &tee.compose_hash, escrow)?;
+        }
+    }
+    let pinned_efp = escrow.verified_fp.as_deref().map(parse_efp).transpose()?;
     let mirror: Arc<dyn KeyMirror> = match &storage.blocks {
         Either::A(s3) => Arc::new(S3KeyMirror::new(s3).await),
         Either::B(_) => Arc::new(FsKeyMirror::new(storage.datadir.join("at-rest"))),
@@ -214,4 +309,166 @@ pub async fn setup(
         _ => bail!("at-rest keys were not provisioned"),
     }
     Ok(())
+}
+
+fn parse_efp(s: &str) -> Result<Efp> {
+    s.trim()
+        .to_ascii_lowercase()
+        .parse::<Efp>()
+        .map_err(|_| anyhow::anyhow!("at_rest.escrow.verified_fp must be 64 hex characters"))
+}
+
+/// In a TEE, the escrow recipients and the pinned fingerprint decide who can
+/// rebuild the root key, so they must come from the attested compose: each
+/// must equal a literal value in the measured `app-compose.json` (covered by
+/// `compose_hash`), never the encrypted environment, a file or any other
+/// runtime source. Either one configured without a matching literal, or a
+/// literal the effective config doesn't match, is refused.
+pub fn check_measured_escrow(
+    app_compose: &str,
+    compose_hash: &str,
+    escrow: &AtRestEscrowConfig,
+) -> Result<()> {
+    let digest = hex::encode(sha2::Sha256::digest(app_compose.as_bytes()));
+    ensure!(
+        digest.eq_ignore_ascii_case(compose_hash.trim()),
+        "the app-compose the guest agent reports hashes to {digest}, not the measured compose_hash {compose_hash}"
+    );
+    let compose =
+        AppCompose::parse(app_compose.as_bytes()).context("reading the measured app-compose")?;
+    let literal_recipients = compose.literal_env(RECIPIENTS_ENV)?;
+    match literal_recipients {
+        None => ensure!(
+            escrow.recipients.is_empty(),
+            "at_rest.escrow.recipients must be set as a literal {RECIPIENTS_ENV} in the measured compose, not from the environment or a file"
+        ),
+        Some(literal) => {
+            let value: rocket::figment::value::Value =
+                literal.parse().unwrap_or_else(|never| match never {});
+            let measured: Vec<HolderRecipient> = value
+                .deserialize()
+                .with_context(|| format!("the measured {RECIPIENTS_ENV} does not parse"))?;
+            ensure!(
+                measured == escrow.recipients,
+                "at_rest.escrow.recipients differ from the literal {RECIPIENTS_ENV} in the measured compose"
+            );
+        }
+    }
+    let literal_fp = compose.literal_env(VERIFIED_FP_ENV)?;
+    let configured = escrow.verified_fp.as_deref().map(parse_efp).transpose()?;
+    match (literal_fp, configured) {
+        (None, None) => {}
+        (None, Some(_)) => bail!(
+            "at_rest.escrow.verified_fp must be set as a literal {VERIFIED_FP_ENV} in the measured compose, not from the environment or a file"
+        ),
+        (Some(_), None) => bail!(
+            "the measured compose pins {VERIFIED_FP_ENV}, but the effective config has no at_rest.escrow.verified_fp"
+        ),
+        (Some(literal), Some(configured)) => ensure!(
+            parse_efp(&literal)? == configured,
+            "at_rest.escrow.verified_fp differs from the literal {VERIFIED_FP_ENV} in the measured compose"
+        ),
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const R: &str = "[{holder=\"sam\",recipient=\"age1yubikey1qg3fps8csqk30gjdt552hf7jyjnmt753z9yhk4p8f0x5vvr5m53mju3vr5u\"},{holder=\"hunter\",recipient=\"age1yubikey1qg3fps8csqk30gjdt552hf7jyjnmt753z9yhk4p8f0x5vvr5m53mju3vr5u\"},{holder=\"safe\",recipient=\"age1yubikey1qg3fps8csqk30gjdt552hf7jyjnmt753z9yhk4p8f0x5vvr5m53mju3vr5u\"}]";
+
+    fn app_compose(env: &str) -> String {
+        let digest = "a".repeat(64);
+        serde_json::to_string(&serde_json::json!({
+            "manifest_version": 2,
+            "runner": "docker-compose",
+            "docker_compose_file": format!(
+                "services:\n  tinycloud:\n    image: n@sha256:{digest}\n    environment:\n{env}"
+            ),
+        }))
+        .unwrap()
+    }
+
+    fn hash(s: &str) -> String {
+        hex::encode(sha2::Sha256::digest(s.as_bytes()))
+    }
+
+    fn escrow(recipients: &str, fp: Option<&str>) -> AtRestEscrowConfig {
+        let value: rocket::figment::value::Value = recipients.parse().unwrap();
+        AtRestEscrowConfig {
+            recipients: value.deserialize().unwrap(),
+            verified_fp: fp.map(str::to_owned),
+            allow_software: false,
+        }
+    }
+
+    #[test]
+    fn literal_compose_values_pass() {
+        let fp = "b".repeat(64);
+        let doc = app_compose(&format!(
+            "      {RECIPIENTS_ENV}: '{R}'\n      {VERIFIED_FP_ENV}: {fp}\n"
+        ));
+        check_measured_escrow(&doc, &hash(&doc), &escrow(R, Some(&fp.to_uppercase()))).unwrap();
+        // No pin yet (before the ceremony): only the recipients.
+        let doc = app_compose(&format!("      - {RECIPIENTS_ENV}={R}\n"));
+        check_measured_escrow(&doc, &hash(&doc), &escrow(R, None)).unwrap();
+    }
+
+    #[test]
+    fn escrow_values_from_anywhere_but_the_measured_compose_are_refused() {
+        let fp = "b".repeat(64);
+        let cases = [
+            // Recipients from the encrypted env (interpolated or passed through).
+            (
+                format!("      {RECIPIENTS_ENV}: ${{RECIPIENTS}}\n"),
+                escrow(R, None),
+                "literal",
+            ),
+            (
+                format!("      - {RECIPIENTS_ENV}\n"),
+                escrow(R, None),
+                "literal",
+            ),
+            // Configured, but not in the compose at all (env file, config file).
+            ("      A: '1'\n".to_string(), escrow(R, None), "literal"),
+            // The compose names other holders than the node uses.
+            (
+                format!("      {RECIPIENTS_ENV}: '{}'\n", R.replace("sam", "eve")),
+                escrow(R, None),
+                "differ",
+            ),
+            // A pin from the environment, or a different one.
+            (
+                format!("      {RECIPIENTS_ENV}: '{R}'\n"),
+                escrow(R, Some(&fp)),
+                "verified_fp must be set",
+            ),
+            (
+                format!(
+                    "      {RECIPIENTS_ENV}: '{R}'\n      {VERIFIED_FP_ENV}: {}\n",
+                    "c".repeat(64)
+                ),
+                escrow(R, Some(&fp)),
+                "differs",
+            ),
+            (
+                format!("      {RECIPIENTS_ENV}: '{R}'\n      {VERIFIED_FP_ENV}: {fp}\n"),
+                escrow(R, None),
+                "no at_rest.escrow.verified_fp",
+            ),
+        ];
+        for (env, config, needle) in cases {
+            let doc = app_compose(&env);
+            let err = format!(
+                "{:#}",
+                check_measured_escrow(&doc, &hash(&doc), &config).unwrap_err()
+            );
+            assert!(err.contains(needle), "{env:?}: {err}");
+        }
+        // An app-compose that isn't the measured one.
+        let doc = app_compose(&format!("      {RECIPIENTS_ENV}: '{R}'\n"));
+        let err = check_measured_escrow(&doc, &"0".repeat(64), &escrow(R, None)).unwrap_err();
+        assert!(err.to_string().contains("measured compose_hash"), "{err}");
+    }
 }

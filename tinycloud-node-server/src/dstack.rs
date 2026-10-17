@@ -228,6 +228,30 @@ pub async fn get_info() -> Result<InfoResponse> {
     .context("parsing Info response")
 }
 
+/// The `app-compose.json` this CVM was launched with: `tcb_info.app_compose`
+/// from the guest agent's `/Info` (`tcb_info` is a JSON string or object).
+/// The caller checks it against `compose_hash`.
+pub async fn get_app_compose() -> Result<String> {
+    let info = get_json(&socket_path(), "/Info")
+        .await
+        .context("dstack Info request")?;
+    app_compose_from_info(&info)
+}
+
+fn app_compose_from_info(info: &serde_json::Value) -> Result<String> {
+    let tcb = match info.get("tcb_info") {
+        Some(serde_json::Value::String(s)) => {
+            serde_json::from_str(s).context("dstack Info tcb_info is not JSON")?
+        }
+        Some(other) => other.clone(),
+        None => return Err(anyhow!("dstack Info has no tcb_info")),
+    };
+    tcb.get("app_compose")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow!("dstack Info tcb_info has no app_compose"))
+}
+
 /// Check whether the dstack socket is reachable.
 pub fn is_available() -> bool {
     std::path::Path::new(&socket_path()).exists()
@@ -326,6 +350,22 @@ pub(crate) mod stub {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_compose_comes_from_tcb_info_as_a_string_or_an_object() {
+        let tcb =
+            serde_json::json!({"mrtd": "00", "app_compose": "{\"runner\":\"docker-compose\"}"});
+        let as_string = serde_json::json!({"app_id": "a", "tcb_info": tcb.to_string()});
+        let as_object = serde_json::json!({"app_id": "a", "tcb_info": tcb});
+        for info in [as_string, as_object] {
+            assert_eq!(
+                app_compose_from_info(&info).unwrap(),
+                "{\"runner\":\"docker-compose\"}"
+            );
+        }
+        assert!(app_compose_from_info(&serde_json::json!({"app_id": "a"})).is_err());
+        assert!(app_compose_from_info(&serde_json::json!({"tcb_info": "{}"})).is_err());
+    }
 
     #[tokio::test]
     async fn get_quote_sends_exactly_64_bytes_of_report_data() {

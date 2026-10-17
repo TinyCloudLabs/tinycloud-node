@@ -8469,6 +8469,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "parking_lot",
  "percent-encoding",
  "pin-project",
  "prometheus",

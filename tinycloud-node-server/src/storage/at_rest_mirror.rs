@@ -16,7 +16,7 @@ use aws_sdk_s3::{
 };
 use futures::TryStreamExt;
 use tinycloud_core::at_rest::{
-    store::{MirrorError, MIRROR_PREFIX},
+    store::{MirrorError, MirrorObjectTooLarge, MAX_MIRROR_OBJECT, MIRROR_PREFIX},
     KeyMirror,
 };
 
@@ -75,7 +75,22 @@ impl KeyMirror for S3KeyMirror {
             .send()
             .await
         {
-            Ok(o) => Ok(Some(o.body.collect().await?.into_bytes().to_vec())),
+            Ok(o) => {
+                // A key object is a few hundred bytes; anything far larger
+                // is junk planted in the bucket, never read into memory.
+                if o.content_length() > MAX_MIRROR_OBJECT as i64 {
+                    return Err(Box::new(MirrorObjectTooLarge));
+                }
+                let mut body = o.body;
+                let mut out = Vec::new();
+                while let Some(chunk) = body.try_next().await? {
+                    if out.len() + chunk.len() > MAX_MIRROR_OBJECT {
+                        return Err(Box::new(MirrorObjectTooLarge));
+                    }
+                    out.extend_from_slice(&chunk);
+                }
+                Ok(Some(out))
+            }
             Err(SdkError::ServiceError {
                 err:
                     GetObjectError {
@@ -139,15 +154,29 @@ impl KeyMirror for FsKeyMirror {
         let path = self.path(name)?;
         let dir = path.parent().ok_or("mirror path has no parent")?;
         tokio::fs::create_dir_all(dir).await?;
-        // Write then rename, so a crash never leaves a half-written key file.
+        // Write, fsync, then rename, so a crash never leaves a half-written
+        // or unsynced key file under the final name.
         let tmp = path.with_extension("tmp");
-        tokio::fs::write(&tmp, bytes).await?;
+        let mut file = tokio::fs::File::create(&tmp).await?;
+        tokio::io::AsyncWriteExt::write_all(&mut file, &bytes).await?;
+        file.sync_all().await?;
+        drop(file);
         tokio::fs::rename(&tmp, &path).await?;
+        tokio::fs::File::open(dir).await?.sync_all().await?;
         Ok(())
     }
 
     async fn get(&self, name: &str) -> Result<Option<Vec<u8>>, MirrorError> {
-        match tokio::fs::read(self.path(name)?).await {
+        let path = self.path(name)?;
+        match tokio::fs::metadata(&path).await {
+            Ok(meta) if meta.len() > MAX_MIRROR_OBJECT as u64 => {
+                return Err(Box::new(MirrorObjectTooLarge))
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        }
+        match tokio::fs::read(&path).await {
             Ok(bytes) => Ok(Some(bytes)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e.into()),

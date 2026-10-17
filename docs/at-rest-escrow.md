@@ -144,7 +144,9 @@ The same settings as compose env: `TINYCLOUD_AT_REST__MODE`, `TINYCLOUD_AT_REST_
   - at boot the node creates the ARK (sealed under its root) and the escrow bundle;
   - it keeps a copy of the sealed key, the bundle and each space's wrapped data key in the block store (`_tc/at-rest/` in S3, `{datadir}/at-rest/` on disk). Data-key objects are named by a keyed hash, not the space;
   - nothing is encrypted.
-- **`encrypt` or `strict` refuses to start** unless the recipients equal the bundle's, `verified_fp` equals its EFP, and the stored ceremony record verifies under the key inside the TEE. A Static-root node with no recipients may use `escrow_none = true` instead, which acknowledges that no escrow exists.
+- **`encrypt` and `strict` are refused at boot in this build.** Block storage has no seal path yet, so the node won't claim to encrypt while it writes plaintext; `/info` never shows `encrypting: true`. Storage turns the capability on when the seal path lands (TC-887 S3). From then on, `encrypt` or `strict` refuses to start unless the recipients equal the bundle's, `verified_fp` equals its EFP, and the stored ceremony record verifies under the key inside the TEE. A Static-root node with no recipients may use `escrow_none = true` instead, which acknowledges that no escrow exists.
+- **In a TEE, the escrow recipients and `verified_fp` must be literal values in the measured compose.** The node reads its `app-compose.json` from the guest agent, checks it against `compose_hash`, and refuses to boot unless `TINYCLOUD_AT_REST__ESCROW__RECIPIENTS` and `TINYCLOUD_AT_REST__ESCROW__VERIFIED_FP` are set there as literals (no `${…}`, no pass-through) equal to the effective config. Values from the encrypted environment, a file or anywhere else are refused.
+- **With `verified_fp` set, the node never re-splits the key.** It uses only the pinned bundle (restoring it from the block store if the database lost it) and refuses to boot if that bundle is not for the configured recipients and the newest key. To change holders, remove the pin in the compose first; the new bundle then needs a new ceremony.
 - **If the node's root can no longer unseal the key** (new app id or KMS), it boots **locked**:
   - `/info` shows `at_rest.state = "locked"` and encryption is unavailable;
   - two holders recover it through the endpoints below, which needs `verified_fp` to be pinned;
@@ -159,15 +161,16 @@ The same settings as compose env: `TINYCLOUD_AT_REST__MODE`, `TINYCLOUD_AT_REST_
 | `POST /at-rest/recovery/shares` | body: one share age-sealed to the recovery recipient (≤ 4 KiB). Answers `held` (with `shares_held`), `verified` (all three shares rebuilt the key), or `unlocked` (locked node recovered), with the gate result |
 
 The share endpoint:
-- is rate limited per IP and per boot;
+- is rate limited per IP;
 - checks every share against the bundle's commitments before it takes one of three slots;
+- counts only shares that authenticate (decrypt and match a commitment) against the node's per-boot share budget, so junk can't starve genuine holders. Rejected shares are limited per client (5, then one a minute);
 - never logs share bytes or ciphertexts.
 
 Shares live in memory for the current boot only.
 
 ### Key continuity
 
-- **Database restored to an earlier point.** At boot the node puts back any key generation or chain the database lacks from the block-store copy. A space's data key missing from the database is restored from its copy before a new one would be made; if the database holds a *different* key under the same id, the node refuses to use it.
-- **No key is ever made over existing material.** The node creates a new root key only when the database has no key, escrow or data-key rows and the block store has nothing under `_tc/at-rest/`. A store or mirror error stops the boot instead.
+- **Database restored to an earlier point.** At boot the node takes back a key generation or chain from the block-store copy only once it authenticates: the newest under this node's root, each older one by its chain. During recovery, the recovered key authenticates them. Anything else in the copy (forged, junk, a gap, an oversized object) is skipped with a warning and never stored, so write access to the bucket can neither lock the node nor stop it booting while the database is healthy. A space's data key missing from the database is restored from its copy only if its wrap authenticates for that space, before a new one would be made; if a *genuine* different key exists under the same id, the node refuses to use it.
+- **No key is ever made over existing material.** The node creates a new root key only when the database has no key, escrow or data-key rows and the block store has nothing under `_tc/at-rest/`. A store or mirror error stops the boot instead, and so does an empty database whose block-store copy holds nothing usable.
 - **Generations.** Each older generation is sealed under the next one's key (its chain), so escrowing the newest generation recovers all of them. At boot under the same root, a missing or broken chain is rebuilt and logged. During recovery under a new root it can't be rebuilt, and the shares are refused with the reason.
 - The key tables' migration `down` refuses while they hold rows.

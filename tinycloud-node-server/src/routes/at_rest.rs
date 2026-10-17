@@ -9,9 +9,11 @@
 //!   with the holder's nonce and the EFP into a TDX quote.
 //! - `POST /at-rest/recovery/shares`: one share sealed to that recipient.
 //!
-//! Share bodies are capped at 4 KiB, rate limited per IP and per boot, and
-//! checked against the bundle's commitments before they occupy a slot.
-//! Neither share bytes nor ciphertexts are logged.
+//! Share bodies are capped at 4 KiB and rate limited per IP. Shares that
+//! don't authenticate (don't decrypt, or match no commitment) are limited
+//! per client and never spend the node's per-boot share budget, which only
+//! genuine shares count against. Neither share bytes nor ciphertexts are
+//! logged.
 
 use rocket::data::{Data, ToByteUnit};
 use rocket::http::Status;
@@ -191,12 +193,23 @@ pub async fn at_rest_recovery_share(
         .map_err(|s| (s, "Rate limit exceeded".to_string()))?;
     let runtime = at_rest.0.ok_or_else(not_enabled)?;
     let keyring = runtime.keyring().ok_or_else(not_enabled)?;
+    let failures = runtime.share_failures();
+    if !failures.allows(client_ip.0) {
+        return Err((
+            Status::TooManyRequests,
+            "too many rejected shares from this client; retry later".into(),
+        ));
+    }
     let wrapped = body
         .open(MAX_WRAPPED_SHARE.bytes())
         .into_bytes()
         .await
-        .map_err(|_| (Status::BadRequest, "could not read the share".to_string()))?;
+        .map_err(|_| {
+            failures.record_failure(client_ip.0);
+            (Status::BadRequest, "could not read the share".to_string())
+        })?;
     if !wrapped.is_complete() {
+        failures.record_failure(client_ip.0);
         return Err((
             Status::PayloadTooLarge,
             format!("a wrapped share is at most {MAX_WRAPPED_SHARE} bytes"),
@@ -241,7 +254,10 @@ pub async fn at_rest_recovery_share(
             "too many share submissions this boot; retry later".into(),
         )),
         Err(ShareRefusal::NoBundle(why)) => Err((Status::Conflict, why.into())),
-        Err(ShareRefusal::Invalid(e)) => Err((Status::BadRequest, format!("share rejected: {e}"))),
+        Err(ShareRefusal::Invalid(e)) => {
+            failures.record_failure(client_ip.0);
+            Err((Status::BadRequest, format!("share rejected: {e}")))
+        }
         Err(ShareRefusal::Keyring(e)) => Err(internal(e)),
     }
 }

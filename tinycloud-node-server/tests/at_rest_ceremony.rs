@@ -191,49 +191,38 @@ async fn ceremony_gate_and_recovery_through_the_app() {
     );
     drop(client);
 
-    // encrypt without the pinned fingerprint: the node refuses to start.
-    let err = refused(
-        dir.path(),
-        1,
-        json!({"mode": "encrypt", "escrow": escrow(None)}),
-    )
-    .await;
-    assert!(err.contains("verified_fp is unset"), "{err}");
-    let err = refused(
-        dir.path(),
-        1,
-        json!({"mode": "encrypt", "escrow": escrow(Some(&"0".repeat(64)))}),
-    )
-    .await;
-    assert!(err.contains("is not the active escrow"), "{err}");
+    // No seal path in this build: encrypt and strict are refused at boot,
+    // even with the escrow pinned and verified, so nothing ever claims to
+    // encrypt while storage writes plaintext.
+    for mode in ["encrypt", "strict"] {
+        let err = refused(
+            dir.path(),
+            1,
+            json!({"mode": mode, "escrow": escrow(Some(&efp))}),
+        )
+        .await;
+        assert!(err.contains("no at-rest seal path"), "{err}");
+    }
 
-    // Pinned and verified: encryption is enabled.
-    let client = app(
-        dir.path(),
-        1,
-        json!({"mode": "encrypt", "escrow": escrow(Some(&efp))}),
-    )
-    .await
-    .unwrap();
+    // Pinned and verified, mode off: the gate passes, nothing is encrypted.
+    let client = app(dir.path(), 1, json!({"escrow": escrow(Some(&efp))}))
+        .await
+        .unwrap();
     let (_, info) = get_json(&client, "/info").await;
     assert_eq!(
         info["at_rest"],
-        json!({"mode":"encrypt","state":"unlocked","encrypting":true})
+        json!({"mode":"off","state":"unlocked","encrypting":false})
     );
     drop(client);
 
     // New root (new app id / KMS): boots LOCKED, not refused.
-    let client = app(
-        dir.path(),
-        2,
-        json!({"mode": "encrypt", "escrow": escrow(Some(&efp))}),
-    )
-    .await
-    .unwrap();
+    let client = app(dir.path(), 2, json!({"escrow": escrow(Some(&efp))}))
+        .await
+        .unwrap();
     let (_, info) = get_json(&client, "/info").await;
     assert_eq!(
         info["at_rest"],
-        json!({"mode":"encrypt","state":"locked","encrypting":false})
+        json!({"mode":"off","state":"locked","encrypting":false})
     );
     let (status, _) = get_json(&client, "/at-rest/escrow/record").await;
     assert_eq!(status, Status::NotFound);
@@ -248,7 +237,7 @@ async fn ceremony_gate_and_recovery_through_the_app() {
     assert_eq!(post_share(&client, one).await.1["shares_held"], json!([2]));
     let (_, st) = get_json(&client, "/at-rest/status").await;
     assert_eq!(st["state"], "locked");
-    // A second holder unlocks it and the gate reopens.
+    // A second holder unlocks it and the escrow gate passes again.
     let (_, a) = post_share(&client, h.wrapped(&bundle, &info, 2)).await;
     assert_eq!(
         (a["outcome"].clone(), a["gate"].clone()),
@@ -257,20 +246,68 @@ async fn ceremony_gate_and_recovery_through_the_app() {
     let (_, info) = get_json(&client, "/info").await;
     assert_eq!(
         info["at_rest"],
-        json!({"mode":"encrypt","state":"unlocked","encrypting":true})
+        json!({"mode":"off","state":"unlocked","encrypting":false})
     );
     drop(client);
 
-    // Resealed under the new root: it now boots unlocked with encryption on.
-    let client = app(
-        dir.path(),
-        2,
-        json!({"mode": "encrypt", "escrow": escrow(Some(&efp))}),
-    )
-    .await
-    .unwrap();
+    // Resealed under the new root: it now boots unlocked.
+    let client = app(dir.path(), 2, json!({"escrow": escrow(Some(&efp))}))
+        .await
+        .unwrap();
     let (_, info) = get_json(&client, "/info").await;
-    assert_eq!(info["at_rest"]["encrypting"], json!(true));
+    assert_eq!(info["at_rest"]["state"], json!("unlocked"));
+}
+
+async fn post_share_from(client: &Client, ip: &str, body: impl Into<Vec<u8>>) -> (Status, Value) {
+    let res = client
+        .post("/at-rest/recovery/shares")
+        .remote(format!("{ip}:4000").parse().unwrap())
+        .header(ContentType::Plain)
+        .body(body.into())
+        .dispatch()
+        .await;
+    let status = res.status();
+    let body = res.into_string().await.unwrap_or_default();
+    (
+        status,
+        serde_json::from_str(&body).unwrap_or(Value::String(body)),
+    )
+}
+
+/// The review's starvation probe, inverted: junk from one client, at about
+/// ten requests a minute, never keeps a genuine holder from recovering a
+/// locked node.
+#[tokio::test]
+async fn junk_from_one_client_does_not_block_a_genuine_share() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Holders::new();
+    let escrow = |fp: Option<&str>| json!({"recipients": h.recipients(), "allow_software": true, "verified_fp": fp});
+    let client = app(dir.path(), 1, json!({"escrow": escrow(None)}))
+        .await
+        .unwrap();
+    let (_, bundle) = get_json(&client, "/at-rest/escrow").await;
+    let bundle: EscrowBundle = serde_json::from_value(bundle).unwrap();
+    let efp = bundle.fingerprint().to_string();
+    drop(client);
+
+    let client = app(dir.path(), 2, json!({"escrow": escrow(Some(&efp))}))
+        .await
+        .unwrap();
+    let info = recovery(&client).await;
+    assert_eq!(info.state, "locked");
+    // Ten junk bodies from one address: rejected, then that client is
+    // throttled; the node's share budget is untouched.
+    let mut statuses = Vec::new();
+    for _ in 0..10 {
+        statuses.push(post_share_from(&client, "203.0.113.7", "junk").await.0);
+    }
+    assert!(statuses.contains(&Status::BadRequest), "{statuses:?}");
+    assert_eq!(statuses.last(), Some(&Status::TooManyRequests));
+    // Two genuine holders from other addresses recover the node.
+    let (s, a) = post_share_from(&client, "198.51.100.1", h.wrapped(&bundle, &info, 0)).await;
+    assert_eq!((s, &a["shares_held"]), (Status::Ok, &json!([1])), "{a}");
+    let (s, a) = post_share_from(&client, "198.51.100.2", h.wrapped(&bundle, &info, 2)).await;
+    assert_eq!((s, &a["outcome"]), (Status::Ok, &json!("unlocked")), "{a}");
 }
 
 #[tokio::test]
@@ -293,23 +330,15 @@ async fn misconfigurations_are_refused_at_boot() {
     )
     .await;
     assert!(err.contains("not both"), "{err}");
-    // encrypt with no escrow at all on a Static root needs the acknowledgement.
-    let err = refused(dir.path(), 1, json!({"mode": "encrypt"})).await;
-    assert!(err.contains("escrow_none"), "{err}");
-    let client = app(
+    // No seal path: encrypt is refused even on a self-hosted Static root
+    // that acknowledges having no escrow.
+    let err = refused(
         dir.path(),
         1,
         json!({"mode": "encrypt", "escrow_none": true}),
     )
-    .await
-    .unwrap();
-    let (_, info) = get_json(&client, "/info").await;
-    assert_eq!(info["at_rest"]["encrypting"], json!(true));
-    // Unknown keys in the section are refused, not ignored.
-    refused(
-        dir.path(),
-        1,
-        json!({"mode": "encrypt", "escrow_nonee": true}),
-    )
     .await;
+    assert!(err.contains("no at-rest seal path"), "{err}");
+    // Unknown keys in the section are refused, not ignored.
+    refused(dir.path(), 1, json!({"escrow_nonee": true})).await;
 }
