@@ -5,6 +5,9 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
+  # TC-887: run the full Rust CI on a stacked branch (a PR whose base is not
+  # main gets no pull_request run). Manual only; same jobs as a PR to main.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
