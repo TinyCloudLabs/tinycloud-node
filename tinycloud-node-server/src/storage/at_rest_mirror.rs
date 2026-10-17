@@ -129,6 +129,19 @@ impl KeyMirror for S3KeyMirror {
             .await?;
         Ok(names)
     }
+
+    async fn delete(&self, name: &str) -> Result<(), MirrorError> {
+        check_name(name)?;
+        // S3 answers success for a key that doesn't exist.
+        self.client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(name)
+            .send()
+            .await
+            .map_err(|e| aws_sdk_s3::Error::from(e).into())
+            .map(|_| ())
+    }
 }
 
 /// Control files under a local directory.
@@ -235,6 +248,15 @@ impl KeyMirror for FsKeyMirror {
         }
         Ok(names)
     }
+
+    async fn delete(&self, name: &str) -> Result<(), MirrorError> {
+        let path = self.path(name)?;
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -261,6 +283,14 @@ mod tests {
             m.list("_tc/at-rest/ark-").await.unwrap(),
             vec!["_tc/at-rest/ark-0000000001-ab.json".to_string()]
         );
+        m.delete("_tc/at-rest/ark-0000000001-ab.json")
+            .await
+            .unwrap();
+        m.delete("_tc/at-rest/ark-0000000001-ab.json")
+            .await
+            .unwrap();
+        assert!(m.list("_tc/at-rest/ark-").await.unwrap().is_empty());
+        assert!(m.delete("../x").await.is_err());
         for bad in [
             "../x",
             "_tc/at-rest/../../etc",
