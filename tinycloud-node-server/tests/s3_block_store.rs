@@ -72,7 +72,10 @@ async fn remove_deletes_the_block_and_releases_its_size() -> Result<()> {
         !store.contains(&space, &removed, 0).await?,
         "object still exists"
     );
-    ensure!(store.contains(&space, &kept, 0).await?, "other block removed");
+    ensure!(
+        store.contains(&space, &kept, 0).await?,
+        "other block removed"
+    );
     ensure!(
         store.total_size(&space).await? == Some(17),
         "size drops by the removed block's length"
