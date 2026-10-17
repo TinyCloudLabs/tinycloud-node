@@ -117,7 +117,7 @@ elif name=='sleep': pass
 else: raise SystemExit('Unexpected CLI boundary')
 '''
 
-HTTP = r'''import http.client, json, os, socket
+HTTP = r'''import http.client, io, json, os, random, socket
 from pathlib import Path
 from urllib.parse import unquote
 socket.create_connection=lambda *a,**k: (_ for _ in ()).throw(AssertionError('Real network forbidden'))
@@ -147,12 +147,17 @@ class Connection:
                 payload={'active':True,'comp_bytes':1,'account_limit_bytes':floor+100,'storage_limit_bytes':floor+100}
             else: status,payload=404,os.environ['QUOTA_BILLING_ADMIN_SECRET']
         elif os.environ['FAIL_AT']=='quota': status,payload=503,os.environ['QUOTA_ADMIN_SECRET']
-        elif self.path=='/admin/usage': payload={'count':len(targets),'spaces':[{'space_id':space,'usage_bytes':10} for space in targets]}
+        elif self.path=='/admin/usage':
+            # The node's real, unpaginated inventory: every space, ~107 bytes a row (prod: ~1,034 spaces).
+            rng=random.Random(959); spaces=[{'space_id':space,'usage_bytes':10} for space in targets]
+            spaces+=[{'space_id':'tinycloud:pkh:eip155:1:0x%040x:default'%rng.getrandbits(160),'usage_bytes':rng.choice([None,rng.randint(1,700000000)])} for _ in range(3000)]
+            payload={'spaces':spaces,'count':len(spaces)}
         else:
             value=data['values'].get(self.path)
             payload={'space_id':unquote(self.path.removeprefix('/admin/quota/')),'override_bytes':value,'effective_limit_bytes':value if value is not None else 123}
+        stream=io.BytesIO(json.dumps(payload).encode())
         class Response:
-            def read(self,count): return json.dumps(payload).encode()[:count]
+            def read(self,count): return stream.read(count)
         response=Response(); response.status=status; return response
     def close(self): pass
 http.client.HTTPSConnection=Connection
