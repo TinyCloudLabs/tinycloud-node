@@ -476,6 +476,63 @@ fn check_size_floor(what: &str, stored: usize, plaintext: usize, findings: &mut 
     }
 }
 
+/// Findings for one at-rest key-mirror object (`_tc/…`). It may hold only
+/// wrapped or sealed key material: a data-key mirror
+/// (`_tc/at-rest/dek-<tag>-<id>.json`) must have exactly the expected fields
+/// and a `wrapped` value of nonce ‖ 32-byte DEK ciphertext ‖ tag (60 bytes);
+/// no mirror may carry a 32-byte base64 value (the size of a raw key), and no
+/// mirror name may carry the space id or wallet address.
+fn mirror_findings(key: &str, body: &[u8], space_id: &str, address: &str) -> Vec<String> {
+    const WRAPPED_DEK_LEN: usize = 12 + 32 + 16;
+    const DEK_FIELDS: [&str; 5] = ["created_at", "dek_id", "generation", "version", "wrapped"];
+    let mut findings = Vec::new();
+    if key.contains(space_id) || key.to_ascii_lowercase().contains(address) {
+        findings.push(format!(
+            "key-mirror name {key:?} contains the space id or wallet address"
+        ));
+    }
+    let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) else {
+        findings.push(format!("key-mirror object {key:?} is not JSON"));
+        return findings;
+    };
+    let decoded = |value: &serde_json::Value| {
+        value
+            .as_str()
+            .and_then(|s| base64::decode(s).ok())
+            .map(|bytes| bytes.len())
+    };
+    let name = key.rsplit('/').next().unwrap_or(key);
+    if name.starts_with("dek-") {
+        let fields: BTreeSet<&str> = json
+            .as_object()
+            .map(|o| o.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        if fields != BTreeSet::from(DEK_FIELDS) {
+            findings.push(format!(
+                "data-key mirror {key:?} has fields {fields:?}, expected {DEK_FIELDS:?}"
+            ));
+        }
+        if decoded(&json["wrapped"]) != Some(WRAPPED_DEK_LEN) {
+            findings.push(format!(
+                "data-key mirror {key:?} does not hold a wrapped key ({WRAPPED_DEK_LEN} bytes): {:?} bytes",
+                decoded(&json["wrapped"])
+            ));
+        }
+    }
+    let mut stack = vec![("", &json)];
+    while let Some((field, value)) = stack.pop() {
+        match value {
+            serde_json::Value::Object(o) => stack.extend(o.iter().map(|(k, v)| (k.as_str(), v))),
+            serde_json::Value::Array(a) => stack.extend(a.iter().map(|v| (field, v))),
+            v if decoded(v) == Some(32) => findings.push(format!(
+                "key-mirror object {key:?} field {field:?} holds 32 base64 bytes (a raw key's size)"
+            )),
+            _ => {}
+        }
+    }
+    findings
+}
+
 /// A text encoding of the plaintext's blake3 fingerprint.
 struct Fingerprint {
     label: String,
@@ -522,9 +579,16 @@ struct StoredObject {
 /// KV probes written into one space, with the objects each put created.
 struct KvSpace {
     account: Account,
-    /// Per probe (same order as [`KvRun::probes`]).
+    /// Per probe (same order as [`KvRun::probes`]): the block objects it created.
     objects: Vec<Vec<StoredObject>>,
+    /// At-rest key-mirror objects (`_tc/…`) the puts created, e.g. the
+    /// space's wrapped data key on its first sealed write. Not KV data, so not
+    /// paired or size-checked; checked by [`mirror_findings`] instead.
+    mirrors: Vec<StoredObject>,
 }
+
+/// The at-rest key mirror's prefix in the block bucket.
+const KEY_MIRROR_PREFIX: &str = "_tc/";
 
 /// The same KV probes written into two fresh spaces.
 struct KvRun {
@@ -541,7 +605,7 @@ async fn kv_put(
     account: &Account,
     path: &str,
     value: &str,
-) -> Result<Vec<StoredObject>> {
+) -> Result<(Vec<StoredObject>, Vec<StoredObject>)> {
     let before = harness.keys().await?;
     let (status, body) = harness
         .invoke(
@@ -567,23 +631,28 @@ async fn kv_put(
         body.len(),
         value.len()
     );
-    let mut objects = Vec::new();
+    let (mut objects, mut mirrors) = (Vec::new(), Vec::new());
     for key in harness.keys().await?.difference(&before) {
         let body = harness.object(key).await?;
         ensure!(!body.is_empty(), "new object {key} is empty");
-        objects.push(StoredObject {
+        let object = StoredObject {
             key: key.clone(),
             body,
-        });
+        };
+        if key.starts_with(KEY_MIRROR_PREFIX) {
+            mirrors.push(object);
+        } else {
+            objects.push(object);
+        }
     }
     if objects.is_empty() {
         bail!(
-            "harness no-op: the {}-byte KV put to {}/{path} created no object in the MinIO bucket",
+            "harness no-op: the {}-byte KV put to {}/{path} created no block object in the MinIO bucket",
             value.len(),
             account.space
         );
     }
-    Ok(objects)
+    Ok((objects, mirrors))
 }
 
 async fn kv_run(harness: &Harness) -> Result<KvRun> {
@@ -595,20 +664,24 @@ async fn kv_run(harness: &Harness) -> Result<KvRun> {
     let mut spaces = Vec::new();
     for _ in 0..2 {
         let (account, session) = harness.sign_in().await?;
-        let mut objects = Vec::new();
+        let (mut objects, mut mirrors) = (Vec::new(), Vec::new());
         for (label, value) in &probes {
-            objects.push(
-                kv_put(
-                    harness,
-                    &session,
-                    &account,
-                    &format!("tc887/{label}"),
-                    value,
-                )
-                .await?,
-            );
+            let (blocks, mirrored) = kv_put(
+                harness,
+                &session,
+                &account,
+                &format!("tc887/{label}"),
+                value,
+            )
+            .await?;
+            objects.push(blocks);
+            mirrors.extend(mirrored);
         }
-        spaces.push(KvSpace { account, objects });
+        spaces.push(KvSpace {
+            account,
+            objects,
+            mirrors,
+        });
     }
     Ok(KvRun {
         marker,
@@ -830,6 +903,15 @@ async fn red_kv_blocks_are_sealed_in_minio() -> Result<()> {
             }
         }
     }
+    // Key-mirror objects are not KV data: check them for leaked key material
+    // and identity instead of pairing or size-checking them.
+    for space in &run.spaces {
+        let space_id = space.account.space.to_string();
+        let address = space.account.address_hex();
+        for StoredObject { key, body } in &space.mirrors {
+            findings.extend(mirror_findings(key, body, &space_id, &address));
+        }
+    }
     // Compare every object of a put in space A with every object of the same
     // put in space B: sealed names sort randomly, so no pairing by order.
     for (index, (label, _)) in run.probes.iter().enumerate() {
@@ -1044,6 +1126,63 @@ fn selftest_predicates_flag_deterministic_transforms_not_ciphertext() -> Result<
         ensure!(
             find(&a, marker.as_bytes()).is_none() && findings.is_empty(),
             "sealed-like blobs of {len} bytes were flagged: {findings:?}"
+        );
+    }
+    Ok(())
+}
+
+/// Offline: the key-mirror check accepts a wrapped data-key mirror and flags
+/// raw key material, unexpected fields, identity in the name and non-JSON.
+/// Its name avoids the `green_`/`red_` filters, so plain `cargo test` runs it.
+#[test]
+fn selftest_key_mirror_objects_hold_only_wrapped_keys() -> Result<()> {
+    let space = "tinycloud:pkh:eip155:1:0xAbCd000000000000000000000000000000000001:default";
+    let address = "abcd000000000000000000000000000000000001";
+    let dek = |wrapped: Vec<u8>, extra: Option<(&str, Value)>| {
+        let mut v = json!({
+            "version": 1, "dek_id": 1, "generation": 1,
+            "wrapped": base64::encode(wrapped), "created_at": "2026-10-17T10:00:00Z",
+        });
+        if let Some((k, x)) = extra {
+            v[k] = x;
+        }
+        serde_json::to_vec(&v).unwrap()
+    };
+    let name = "_tc/at-rest/dek-q7Zx4m0aT1sQ9vL2hN8cKw-1.json";
+    ensure!(
+        mirror_findings(name, &dek(random_bytes(60), None), space, address).is_empty(),
+        "a wrapped data-key mirror was flagged"
+    );
+    let cases: Vec<(&str, String, Vec<u8>)> = vec![
+        (
+            "raw 32-byte key as `wrapped`",
+            name.into(),
+            dek(random_bytes(32), None),
+        ),
+        (
+            "an extra raw-key field",
+            name.into(),
+            dek(
+                random_bytes(60),
+                Some(("dek", base64::encode(random_bytes(32)).into())),
+            ),
+        ),
+        ("not JSON", name.into(), random_bytes(60)),
+        (
+            "space id in the name",
+            format!("_tc/at-rest/dek-{space}-1.json"),
+            dek(random_bytes(60), None),
+        ),
+        (
+            "address in the name",
+            format!("_tc/at-rest/dek-0x{}-1.json", address.to_uppercase()),
+            dek(random_bytes(60), None),
+        ),
+    ];
+    for (what, key, body) in cases {
+        ensure!(
+            !mirror_findings(&key, &body, space, address).is_empty(),
+            "key-mirror check missed: {what}"
         );
     }
     Ok(())

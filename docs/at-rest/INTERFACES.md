@@ -1,5 +1,9 @@
 # Encryption at rest: interfaces (TC-887)
 
+> **Status (TC-887):** on `main` today: the envelope, key types, `DataKeyProvider` and the
+> harness. Not on `main` yet: key continuity (`docs/at-rest-escrow.md`, `at_rest::keyring`,
+> node wiring) and sealed KV storage (§7). They land with PRs #325–#327 and #329/#333.
+
 Normative interface and format for `tinycloud_core::at_rest` and the node's sealed KV block
 storage. Plan: TC-887 (encryption at rest inside the TEE). Key continuity and escrow:
 `docs/at-rest-escrow.md`.
