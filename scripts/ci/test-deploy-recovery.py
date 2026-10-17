@@ -20,8 +20,9 @@ N0 = (ROOT / "scripts/ci/fixtures/tc959-n0-compose.yaml").read_bytes()
 PRE_N0 = (ROOT / "ops/rollback/pre-n0-compose.yaml").read_bytes()
 STOP_LOGS = (ROOT / "ops/rollback/pre-n0-stop-local-logs.yaml").read_bytes()
 CURRENT = (ROOT / "docker-compose.dstack-postgres.yaml").read_bytes()
-# Frozen ordinary (pre-N0) template from main before #309; the workflow accepts it by raw hash.
-PRE_N0_TEMPLATE = (ROOT / "scripts/ci/fixtures/pre-n0-template-compose.yaml").read_bytes()
+# Ordinary (pre-N0) template from main before #309: the captured rollback compose with its digest pin
+# reverted to the :dstack tag. The workflow accepts these bytes by raw hash.
+PRE_N0_TEMPLATE = PRE_N0.replace(b"@" + DIGEST.encode(), b":dstack")
 assert hashlib.sha256(PRE_N0_TEMPLATE).hexdigest() == "28302d6761d841b7cc5c11314aed2d377735e6bbdcaf85972a752e03bc9fdc93"
 CANARIES = []
 
