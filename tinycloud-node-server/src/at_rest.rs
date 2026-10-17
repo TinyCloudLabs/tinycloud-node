@@ -269,9 +269,7 @@ pub async fn setup(
     tee: Option<&TeeContext>,
 ) -> Result<()> {
     let escrow = &config.escrow;
-    let enabled =
-        config.mode != AtRestMode::Off || !escrow.recipients.is_empty() || config.escrow_none;
-    if !enabled {
+    if !enabled(config) {
         return Ok(());
     }
     if config.mode != AtRestMode::Off && !runtime.has_seal_path() {
@@ -346,6 +344,24 @@ pub async fn setup(
             "at-rest keys are LOCKED: encrypted data is unavailable until two escrow holders recover the key (POST /at-rest/recovery/shares)"
         ),
         _ => bail!("at-rest keys were not provisioned"),
+    }
+    Ok(())
+}
+
+/// Whether any at-rest setting is configured (otherwise nothing is set up).
+pub fn enabled(config: &AtRestConfig) -> bool {
+    config.mode != AtRestMode::Off || !config.escrow.recipients.is_empty() || config.escrow_none
+}
+
+/// The dstack socket exists but its Info couldn't be read, so the node
+/// can't tell whether it runs in a TEE. Booting as non-TEE would skip the
+/// TEE-only checks (measured compose, no `escrow_none`, no software
+/// holders), so with any at-rest setting the node refuses to start.
+pub fn refuse_unknown_tee(config: &AtRestConfig, info_error: &anyhow::Error) -> Result<()> {
+    if enabled(config) {
+        bail!(
+            "refusing to start: the dstack socket is present but its Info could not be read ({info_error:#}), so the at-rest TEE checks can't run"
+        );
     }
     Ok(())
 }
@@ -552,5 +568,32 @@ mod tests {
         }
         // Readable and matching: the boot may continue.
         check_tee_escrow(Ok(doc), &tee, &escrow(R, None)).unwrap();
+    }
+
+    #[test]
+    fn an_unreadable_dstack_info_refuses_at_rest_instead_of_booting_as_non_tee() {
+        let info_error = anyhow::anyhow!("dstack Info request: connection reset");
+        let configured = [
+            AtRestConfig {
+                mode: AtRestMode::Encrypt,
+                ..Default::default()
+            },
+            AtRestConfig {
+                escrow: escrow(R, None),
+                ..Default::default()
+            },
+            AtRestConfig {
+                escrow_none: true,
+                ..Default::default()
+            },
+        ];
+        for config in configured {
+            let err = refuse_unknown_tee(&config, &info_error)
+                .unwrap_err()
+                .to_string();
+            assert!(err.starts_with("refusing to start"), "{err}");
+        }
+        // Nothing at rest configured: the node keeps its old behaviour.
+        refuse_unknown_tee(&AtRestConfig::default(), &info_error).unwrap();
     }
 }

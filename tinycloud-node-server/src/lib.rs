@@ -597,6 +597,9 @@ pub async fn app_with_control(
                         })
                     }
                     Err(e) => {
+                        // TC-887: at-rest must not boot as non-TEE when it
+                        // can't tell; that would skip its TEE checks.
+                        at_rest::refuse_unknown_tee(&tinycloud_config.at_rest, &e)?;
                         ::tracing::warn!("dstack socket available but get_info failed: {}", e);
                         None
                     }
