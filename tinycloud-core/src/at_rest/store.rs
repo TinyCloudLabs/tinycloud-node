@@ -52,6 +52,10 @@ pub(crate) fn escrow_mirror_name(efp: &str) -> String {
     format!("{MIRROR_PREFIX}escrow-{efp}.json")
 }
 
+pub(crate) fn record_mirror_name(efp: &str) -> String {
+    format!("{MIRROR_PREFIX}record-{efp}.json")
+}
+
 /// `tag` is a keyed hash of the space (see `hierarchy::dek_mirror_tag`), so
 /// the bucket listing doesn't name spaces.
 pub(crate) fn dek_mirror_name(tag: &str, dek_id: u32) -> String {
@@ -277,6 +281,21 @@ impl AtRestStore {
         let _w = self.writer().await;
         at_rest_key::Entity::update_many()
             .col_expr(at_rest_key::Column::Chain, chain.into())
+            .filter(at_rest_key::Column::Generation.eq(generation))
+            .exec(&self.db)
+            .await
+            .map(|_| ())
+    }
+
+    /// Drop a generation's chain: the newest generation has no successor,
+    /// so a chain there is stale (a restored or garbage row).
+    pub async fn clear_chain(&self, generation: i32) -> Result<(), DbErr> {
+        let _w = self.writer().await;
+        at_rest_key::Entity::update_many()
+            .col_expr(
+                at_rest_key::Column::Chain,
+                sea_orm::sea_query::Expr::value(Option::<Vec<u8>>::None),
+            )
             .filter(at_rest_key::Column::Generation.eq(generation))
             .exec(&self.db)
             .await
