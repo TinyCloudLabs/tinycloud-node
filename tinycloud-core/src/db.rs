@@ -2217,6 +2217,9 @@ where
             Some(lock) => Some(lock.lock().await),
             None => None,
         };
+        // TC-1274: the write transaction begins here, so the request deadline
+        // may no longer cut this request; it completes and reports its outcome.
+        crate::request_cancel::latch();
         let begin_start = Instant::now();
         let tx_result = self.begin_graph_transaction().await;
         crate::telemetry::observe_stage(

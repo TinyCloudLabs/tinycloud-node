@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
+    future::Future,
     time::Instant,
 };
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -52,6 +53,7 @@ use tinycloud_core::{
     models::{
         hook_delivery, hook_subscription, invocation as invocation_model, kv_delete, kv_write,
     },
+    request_cancel,
     sea_orm::{ColumnTrait, DbErr, EntityTrait, QueryFilter, QueryOrder},
     sql::{SqlCaveats, SqlError, SqlRequest, SqlService},
     storage::{HashBuffer, ImmutableReadStore, ImmutableStaging},
@@ -98,8 +100,21 @@ pub const UNAVAILABLE_RETRYABLE: &str = "unavailable_retryable";
 /// Body prefix of a database failure after a write may have been applied;
 /// the response is a `500` with no `Retry-After` (TC-1054).
 pub const OUTCOME_UNKNOWN: &str = "outcome_unknown";
-/// `Retry-After` on an [`UNAVAILABLE_RETRYABLE`] response, in seconds.
+/// `Retry-After` on an [`UNAVAILABLE_RETRYABLE`] or [`REQUEST_TIMEOUT`]
+/// response, in seconds.
 pub const RETRY_AFTER_SECS: u32 = 1;
+/// Body prefix of a `503` whose SQL database stayed busy past a wait bound
+/// before the request's write began: `sql_busy: <stage>: ...` (TC-1274).
+pub const SQL_BUSY: &str = "sql_busy";
+/// `Retry-After` on a [`SQL_BUSY`] response, in seconds. Longer than the
+/// retryable one: the request already waited its bound on a database that is
+/// still busy, and an immediate retry only lengthens the queue.
+pub const SQL_BUSY_RETRY_AFTER_SECS: u32 = 5;
+/// Body prefix of a `503` whose `/invoke` deadline was reached before any
+/// write began (TC-1274).
+pub const REQUEST_TIMEOUT: &str = "request_timeout";
+/// The whole body of a [`REQUEST_TIMEOUT`] response.
+pub const REQUEST_TIMEOUT_BODY: &str = "request_timeout: no change was applied; retry the request";
 
 /// The response to a database failure of an operation (TC-1054):
 ///
@@ -708,21 +723,24 @@ pub async fn invoke(
     duckdb_service: &State<DuckDbService>,
     hook_runtime: &State<HookRuntime>,
 ) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, InvokeError> {
-    invoke_impl(
-        i,
-        req_span,
-        headers,
-        data,
-        staging,
-        tinycloud,
+    with_invoke_deadline(
         config,
-        quota_cache,
-        invocation_replay_cache,
-        policy_v3,
-        encryption,
-        sql_service,
-        duckdb_service,
-        hook_runtime,
+        Box::pin(invoke_impl(
+            i,
+            req_span,
+            headers,
+            data,
+            staging,
+            tinycloud,
+            config,
+            quota_cache,
+            invocation_replay_cache,
+            policy_v3,
+            encryption,
+            sql_service,
+            duckdb_service,
+            hook_runtime,
+        )),
     )
     .await
 }
@@ -745,23 +763,46 @@ pub async fn invoke(
     sql_service: &State<SqlService>,
     hook_runtime: &State<HookRuntime>,
 ) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, InvokeError> {
-    invoke_impl(
-        i,
-        req_span,
-        headers,
-        data,
-        staging,
-        tinycloud,
+    with_invoke_deadline(
         config,
-        quota_cache,
-        invocation_replay_cache,
-        policy_v3,
-        encryption,
-        sql_service,
-        (),
-        hook_runtime,
+        Box::pin(invoke_impl(
+            i,
+            req_span,
+            headers,
+            data,
+            staging,
+            tinycloud,
+            config,
+            quota_cache,
+            invocation_replay_cache,
+            policy_v3,
+            encryption,
+            sql_service,
+            (),
+            hook_runtime,
+        )),
     )
     .await
+}
+
+/// Run an `/invoke` handler under the request deadline (TC-1274). Before its
+/// first write the deadline drops the handler and answers [`REQUEST_TIMEOUT`];
+/// after it, the handler finishes and its own result is returned.
+///
+/// The handler arrives boxed: it is large, and holding it inline in the route
+/// future overflows the test threads' stacks in debug builds.
+async fn with_invoke_deadline<T>(
+    config: &Config,
+    handler: std::pin::Pin<Box<impl Future<Output = Result<T, InvokeError>>>>,
+) -> Result<T, InvokeError> {
+    request_cancel::run_with_deadline(config.invocation.deadline(), handler)
+        .await
+        .unwrap_or_else(|request_cancel::DeadlineExceeded| {
+            Err(InvokeError::Text(
+                Status::ServiceUnavailable,
+                REQUEST_TIMEOUT_BODY.to_string(),
+            ))
+        })
 }
 
 #[cfg(feature = "duckdb")]
@@ -1730,6 +1771,9 @@ async fn invoke_impl(
                     .check_and_insert(&admitted, config.invocation.max_lifetime_secs)
                     .await?;
             }
+            // TC-1274: the decrypt records its audit and rewraps the key;
+            // from here the deadline no longer cuts the request.
+            request_cancel::latch();
             let verified = encryption
                 .decrypt_authorized(&network, &admitted.invocation().0, &body)
                 .await
@@ -2615,6 +2659,10 @@ async fn handle_sql_invoke(
         None
     };
     let execute_start = Instant::now();
+    if publication_command.is_some() {
+        // TC-1274: publication writes its freeze before the service runs.
+        request_cancel::latch();
+    }
     let execute_result = if let Some(command) = publication_command {
         meeting_publication::execute(tinycloud, sql_service, space, command).await
     } else if full_space.is_some() {
@@ -3032,6 +3080,7 @@ fn sql_error_to_status(err: &SqlError) -> Status {
         SqlError::Internal(_) => Status::InternalServerError,
         SqlError::Unavailable => Status::ServiceUnavailable,
         SqlError::OutcomeUnknown => Status::InternalServerError,
+        SqlError::Busy(_) | SqlError::RequestTimeout => Status::ServiceUnavailable,
     }
 }
 
@@ -3149,6 +3198,8 @@ async fn handle_duckdb_invoke(
             }
         };
 
+        // TC-1274: the import writes the live cache and the artifact.
+        request_cancel::latch();
         let import_start = Instant::now();
         let import_result = duckdb_service.import_db(space, &db_name, &body_bytes).await;
         crate::prometheus::observe_span(
@@ -3201,6 +3252,9 @@ async fn handle_duckdb_invoke(
         None
     };
 
+    // TC-1274: DuckDB's service has no write latch of its own; its
+    // hydration and statement must not be cut once started.
+    request_cancel::latch();
     let execute_start = Instant::now();
     let execute_result = if full_space.is_some() {
         duckdb_service
@@ -3978,6 +4032,59 @@ mod tests {
             sql_error_to_status(&SqlError::Internal("x".into())),
             Status::InternalServerError
         );
+        for error in [
+            SqlError::Busy(tinycloud_core::sql::SqlBusyStage::Hydration),
+            SqlError::RequestTimeout,
+        ] {
+            assert_eq!(sql_error_to_status(&error), Status::ServiceUnavailable);
+        }
+        assert!(SqlError::Busy(tinycloud_core::sql::SqlBusyStage::Hydration)
+            .to_string()
+            .starts_with(&format!("{SQL_BUSY}: hydration:")));
+        // The SQL service's own timeout answer is the route's, word for word.
+        assert_eq!(SqlError::RequestTimeout.to_string(), REQUEST_TIMEOUT_BODY);
+    }
+
+    /// TC-1274: an `/invoke` that has not begun a write is answered
+    /// `request_timeout` at its deadline; one that has reports its outcome.
+    #[tokio::test]
+    async fn invoke_deadline_cuts_only_before_the_first_write() {
+        let mut config = Config::default();
+        config.invocation.deadline_ms = 50;
+        let cut = with_invoke_deadline(
+            &config,
+            Box::pin(std::future::pending::<Result<(), InvokeError>>()),
+        )
+        .await;
+        match cut {
+            Err(InvokeError::Text(status, body)) => {
+                assert_eq!(status, Status::ServiceUnavailable);
+                assert_eq!(body, REQUEST_TIMEOUT_BODY);
+            }
+            other => panic!("expected request_timeout, got {other:?}"),
+        }
+
+        let latched = with_invoke_deadline(
+            &config,
+            Box::pin(async {
+                request_cancel::latch();
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                Ok::<_, InvokeError>("applied")
+            }),
+        )
+        .await;
+        assert!(matches!(latched, Ok("applied")), "{latched:?}");
+
+        config.invocation.deadline_ms = 0;
+        let unbounded = with_invoke_deadline(
+            &config,
+            Box::pin(async {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                Ok::<_, InvokeError>("served")
+            }),
+        )
+        .await;
+        assert!(matches!(unbounded, Ok("served")), "{unbounded:?}");
     }
 
     fn test_space_id(name: &str) -> SpaceId {

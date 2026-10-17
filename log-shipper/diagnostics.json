@@ -47,7 +47,12 @@
     "tunnel: failed to record runtime state": "tunnel_state_record_failed",
     "tunnel: failed to clear runtime state after disable": "tunnel_state_clear_failed",
     "tunnel authentication rejected": "tunnel_auth_rejected",
-    "network DID resolution enabled: did:web/did:tz fetches use the unhardened ssi client (TC-1080)": "network_did_resolution_enabled"
+    "network DID resolution enabled: did:web/did:tz fetches use the unhardened ssi client (TC-1080)": "network_did_resolution_enabled",
+    "SQL busy: lock wait": "sql_busy_lock_wait",
+    "SQL busy: hydration": "sql_busy_hydration",
+    "SQL busy: artifact transfer": "sql_busy_artifact_transfer",
+    "Request deadline exceeded": "request_timeout",
+    "Request completed after its deadline": "deadline_overrun"
   },
   "prefix": {
     "dstack socket available but get_info failed: ": "dstack_get_info_failed",
