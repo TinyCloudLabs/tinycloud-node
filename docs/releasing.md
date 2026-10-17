@@ -154,7 +154,10 @@ CVM or whitelist mutation.
 
 `authority=node-override` currently applies the reviewed limits after the
 last restart and required health. Both exact spaces must exist once with
-positive usage in authenticated `/admin/usage`. Before ANY PUT, both billing
+positive usage in authenticated `/admin/usage`, which lists every space on
+the node unpaginated (~107 bytes a space); the script reads up to 16 MiB of
+it and fails closed above that, while other quota bodies stay capped at
+64 KiB. Before ANY PUT, both billing
 storage-comp reads must prove no active comp: 404 logs only
 `billing storage-comp unavailable`; valid `active:false` also permits the
 legacy restore. Active comp fails `authority mismatch: flip to billing`.
