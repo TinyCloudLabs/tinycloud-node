@@ -107,7 +107,12 @@ mod tests {
         };
         let db = &fixture.conn;
         // Back to the state a node upgrading to this migration boots with.
-        crate::migrations::Migrator::down(db, Some(1))
+        let migrations = crate::migrations::Migrator::migrations();
+        let this = migrations
+            .iter()
+            .position(|migration| migration.name() == Migration.name())
+            .unwrap();
+        crate::migrations::Migrator::down(db, Some((migrations.len() - this) as u32))
             .await
             .unwrap();
         assert!(!recorded(db).await);
