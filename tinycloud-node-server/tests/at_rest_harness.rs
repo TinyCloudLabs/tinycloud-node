@@ -23,6 +23,12 @@
 //!   stored bytes must share no [`MAX_SHARED_RUN`]-byte run, stored bytes
 //!   must not compress below [`MIN_INCOMPRESSIBLE_RATIO`], and a blob must be
 //!   at least as large as the plaintext it holds (TCE1 never shrinks data).
+//!
+//! The KV RED check also covers the at-rest key mirror: every `_tc/` object,
+//! in the bucket at boot and after the puts, must have an allowed name and an
+//! exact typed schema, carry no raw key, identity, fingerprint or marker, and
+//! hold key material that authenticates under the harness's Static root (see
+//! [`key_mirror`]).
 
 use std::collections::{BTreeSet, HashMap};
 use std::io::Write;
@@ -87,6 +93,13 @@ struct Harness {
     s3: aws_sdk_s3::Client,
     bucket: String,
     pg: DatabaseConnection,
+    /// The node's Static root (`TINYCLOUD_KEYS__SECRET`, base64url): the
+    /// test re-derives the at-rest key hierarchy from it. Never printed.
+    root: Vec<u8>,
+    /// Every space any check signed in to on this harness, one per line.
+    spaces_log: std::path::PathBuf,
+    /// The bucket as the node left it at boot, before any test write.
+    boot_snapshot: std::path::PathBuf,
 }
 
 impl Harness {
@@ -135,6 +148,16 @@ impl Harness {
         let pg = Database::connect(var("TC887_PG_URL")?)
             .await
             .context("connect to the harness PostgreSQL")?;
+        let root_file = var("TC887_NODE_ROOT_FILE")?;
+        let root = std::fs::read_to_string(&root_file)
+            .with_context(|| format!("read the node root file {root_file}"))?;
+        // The decode error could quote secret bytes; don't pass it on.
+        let root = base64::decode_config(root.trim(), base64::URL_SAFE_NO_PAD)
+            .map_err(|_| anyhow!("{root_file} does not hold unpadded base64url"))?;
+        ensure!(
+            root.len() >= 32,
+            "{root_file}: the node root is shorter than 32 bytes"
+        );
         Ok(Self {
             node: var("TC887_NODE_URL")?,
             http: Client::builder()
@@ -144,6 +167,9 @@ impl Harness {
             s3,
             bucket: var("TC887_S3_BUCKET")?,
             pg,
+            root,
+            spaces_log: var("TC887_SPACES_LOG")?.into(),
+            boot_snapshot: var("TC887_BOOT_SNAPSHOT")?.into(),
         })
     }
 
@@ -187,6 +213,54 @@ impl Harness {
             .to_vec())
     }
 
+    /// Every `_tc/` (control) object now in the bucket.
+    async fn control_objects(&self) -> Result<Vec<StoredObject>> {
+        let mut objects = Vec::new();
+        for key in self.keys().await? {
+            if key.starts_with(key_mirror::CONTROL_PREFIX) {
+                let body = self.object(&key).await?;
+                objects.push(StoredObject { key, body });
+            }
+        }
+        Ok(objects)
+    }
+
+    /// The bucket right after the node booted (`harness.sh up` saved it).
+    fn boot_objects(&self) -> Result<Vec<StoredObject>> {
+        let dir = &self.boot_snapshot;
+        let index: Vec<Value> = serde_json::from_slice(
+            &std::fs::read(dir.join("index.json"))
+                .with_context(|| format!("harness gap: no boot snapshot in {}", dir.display()))?,
+        )?;
+        index
+            .iter()
+            .map(|entry| {
+                let key = entry["key"]
+                    .as_str()
+                    .context("boot snapshot entry without key")?;
+                let file = entry["file"]
+                    .as_str()
+                    .context("boot snapshot entry without file")?;
+                Ok(StoredObject {
+                    key: key.to_owned(),
+                    body: std::fs::read(dir.join(file))
+                        .with_context(|| format!("boot snapshot of {key:?}"))?,
+                })
+            })
+            .collect()
+    }
+
+    /// Every space signed in to on this harness, from any check.
+    fn known_spaces(&self) -> Result<Vec<String>> {
+        let log = std::fs::read_to_string(&self.spaces_log).unwrap_or_default();
+        Ok(log
+            .lines()
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect())
+    }
+
     async fn delegate(&self, authorization: String) -> Result<()> {
         let response = self
             .http
@@ -205,6 +279,17 @@ impl Harness {
     /// delegation to an ephemeral Ed25519 key.
     async fn sign_in(&self) -> Result<(Account, Session)> {
         let account = Account::random()?;
+        // Logged before use, so the RED checks can map every DEK mirror tag
+        // back to a space this harness created (ruling 5).
+        writeln!(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.spaces_log)
+                .with_context(|| format!("open {}", self.spaces_log.display()))?,
+            "{}",
+            account.space
+        )?;
         let response = self
             .http
             .get(format!("{}/peer/generate/{}", self.node, account.space))
@@ -377,11 +462,6 @@ impl Account {
         bytes[64] = u8::from(recovery) + 27;
         Ok(Signature::from(bytes))
     }
-
-    /// Lower-case hex wallet address, as it can appear in any casing.
-    fn address_hex(&self) -> String {
-        hex::encode(self.address)
-    }
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -476,6 +556,1408 @@ fn check_size_floor(what: &str, stored: usize, plaintext: usize, findings: &mut 
     }
 }
 
+/// One text form of a space's identity (its space id or its wallet address)
+/// that must never appear in an object name or a key-mirror body.
+struct IdentityForm {
+    label: String,
+    text: String,
+    case_insensitive: bool,
+}
+
+/// The parts of base64(`bytes`) that are the same wherever `bytes` sits in a
+/// longer encoded string: for each of the three byte alignments, the
+/// characters that carry only bits of `bytes`.
+fn base64_cores(bytes: &[u8], config: base64::Config) -> Vec<String> {
+    (0..3)
+        .filter_map(|offset| {
+            let mut aligned = vec![0u8; offset];
+            aligned.extend_from_slice(bytes);
+            let encoded = base64::encode_config(&aligned, config);
+            let (start, end) = ((8 * offset).div_ceil(6), 8 * aligned.len() / 6);
+            (end > start).then(|| encoded[start..end].to_owned())
+        })
+        .collect()
+}
+
+/// The wallet address in a `tinycloud:pkh:eip155:<chain>:0x<40 hex>:<name>`
+/// space id: its text (as written) and its 20 bytes.
+fn space_address(space: &str) -> Option<(String, [u8; 20])> {
+    space.split(':').find_map(|part| {
+        let hex_part = part.strip_prefix("0x")?;
+        let bytes: [u8; 20] = hex::decode(hex_part).ok()?.try_into().ok()?;
+        Some((part.to_owned(), bytes))
+    })
+}
+
+/// Ruling 4: the space id and its wallet address, raw, lowercase, as hex and
+/// as base64 and base64url (any alignment), of both the text and the bytes.
+fn identity_forms(space: &str) -> Vec<IdentityForm> {
+    let mut forms = Vec::new();
+    let mut texts = vec![("space id".to_owned(), space.as_bytes().to_vec())];
+    if let Some((text, bytes)) = space_address(space) {
+        forms.push(IdentityForm {
+            label: "wallet address".into(),
+            text: hex::encode(bytes),
+            case_insensitive: true,
+        });
+        for (encoding, config) in [
+            ("base64", base64::STANDARD_NO_PAD),
+            ("base64url", base64::URL_SAFE_NO_PAD),
+        ] {
+            for core in base64_cores(&bytes, config) {
+                forms.push(IdentityForm {
+                    label: format!("wallet address bytes as {encoding}"),
+                    text: core,
+                    case_insensitive: false,
+                });
+            }
+        }
+        texts.push(("wallet address text".into(), text.as_bytes().to_vec()));
+        texts.push((
+            "lowercase wallet address text".into(),
+            text.to_ascii_lowercase().into_bytes(),
+        ));
+    }
+    for (label, bytes) in texts {
+        forms.push(IdentityForm {
+            label: label.clone(),
+            text: String::from_utf8_lossy(&bytes).into_owned(),
+            case_insensitive: true,
+        });
+        forms.push(IdentityForm {
+            label: format!("{label} as hex"),
+            text: hex::encode(&bytes),
+            case_insensitive: true,
+        });
+        for (encoding, config) in [
+            ("base64", base64::STANDARD_NO_PAD),
+            ("base64url", base64::URL_SAFE_NO_PAD),
+        ] {
+            for core in base64_cores(&bytes, config) {
+                forms.push(IdentityForm {
+                    label: format!("{label} as {encoding}"),
+                    text: core,
+                    case_insensitive: false,
+                });
+            }
+        }
+    }
+    forms
+}
+
+fn contains_form(haystack: &str, text: &str, case_insensitive: bool) -> bool {
+    if case_insensitive {
+        haystack
+            .to_ascii_lowercase()
+            .contains(&text.to_ascii_lowercase())
+    } else {
+        haystack.contains(text)
+    }
+}
+
+/// Rulings 1 and 4 for one stored object, block or key mirror: no identity
+/// form or plaintext fingerprint in its name, no plaintext marker in its
+/// bytes, and for a key mirror (`scan_body`) no identity form or fingerprint
+/// in its text either.
+fn content_findings(
+    object: &StoredObject,
+    scan_body: bool,
+    marker: &str,
+    fingerprints: &[(&str, Fingerprint)],
+    identities: &[IdentityForm],
+) -> Vec<String> {
+    let key = &object.key;
+    let body_text = String::from_utf8_lossy(&object.body);
+    let mut findings = Vec::new();
+    let mut places = vec![("name", key.as_str())];
+    if scan_body {
+        places.push(("body", &*body_text));
+    }
+    for (place, text) in places {
+        let identity = identities
+            .iter()
+            .filter(|form| contains_form(text, &form.text, form.case_insensitive))
+            .map(|form| form.label.as_str())
+            .collect::<BTreeSet<_>>();
+        if !identity.is_empty() {
+            findings.push(format!(
+                "object {key:?}: its {place} contains a space identity: {}",
+                identity.into_iter().collect::<Vec<_>>().join(", ")
+            ));
+        }
+        for (label, fp) in fingerprints {
+            if contains_form(text, &fp.text, fp.case_insensitive) {
+                findings.push(format!(
+                    "object {key:?}: its {place} contains the plaintext fingerprint of the {label} value ({} {})",
+                    fp.label, fp.text
+                ));
+            }
+        }
+    }
+    if let Some(offset) = find(&object.body, marker.as_bytes()) {
+        findings.push(format!(
+            "raw object {key:?} ({} bytes) contains the plaintext marker {marker:?} at byte {offset}",
+            object.body.len()
+        ));
+    }
+    findings
+}
+
+/// The at-rest key mirror (`_tc/…` objects next to the blocks): exact names,
+/// exact typed schemas, a raw-key scan, and an independent re-derivation of
+/// the key hierarchy from the harness's Static root, so every sealed ARK and
+/// wrapped DEK must authenticate (rulings 1-3, 5).
+///
+/// Written from the S1 spec, not linked against it (main doesn't carry it):
+/// `tinycloud-core/src/at_rest/{hierarchy,store,keyring}.rs`,
+/// `tinycloud-at-rest-escrow/src/{lib,bundle,record}.rs` and
+/// `tinycloud-node-server/src/at_rest.rs` (the root is the Static secret's
+/// bytes: `key_setup.as_bytes()`).
+mod key_mirror {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use aes_gcm::{
+        aead::{Aead, KeyInit, Payload},
+        Aes256Gcm, Nonce,
+    };
+    use hmac::{Hmac, Mac};
+    use serde::Deserialize;
+    use serde_json::{json, Map, Value};
+    use sha2::{Digest, Sha256};
+
+    /// Every object under this prefix is a control object: it must be one of
+    /// the mirror kinds below, by exact name.
+    pub const CONTROL_PREFIX: &str = "_tc/";
+    pub const PREFIX: &str = "_tc/at-rest/";
+    pub const W_LABEL: &str = "tinycloud/at-rest/wrap/v1";
+    const KEK_INFO: &[u8] = b"tinycloud/at-rest/kek/v1";
+    const DEK_TAG_INFO: &[u8] = b"tinycloud/at-rest/dek-mirror-tag/v1";
+    const CHAIN_INFO: &[u8] = b"tinycloud/at-rest/ark-chain/v1";
+    const SEAL_DOMAIN: &[u8] = b"tinycloud/at-rest/ark-seal/v1";
+    const CHAIN_DOMAIN: &[u8] = b"tinycloud/at-rest/ark-chain-aad/v1";
+    const DEK_DOMAIN: &[u8] = b"tinycloud/at-rest/dek/v1";
+    const EFP_DOMAIN: &[u8] = b"tinycloud/at-rest/escrow-bundle/v1";
+    const CANARY_INFO: &[u8] = b"tinycloud/at-rest/escrow-canary/v1";
+    const CANARY_FP_DOMAIN: &[u8] = b"tinycloud/at-rest/escrow-canary-fp/v1";
+    const MAC_INFO: &[u8] = b"tinycloud/at-rest/escrow-record/v1";
+    const ARMOR_BEGIN: &str = "-----BEGIN AGE ENCRYPTED FILE-----\n";
+    const ARMOR_END: &str = "-----END AGE ENCRYPTED FILE-----";
+    const AGE_MAGIC: &[u8] = b"age-encryption.org/v1\n";
+    const MAX_CIPHERTEXT: usize = 4096;
+    const BECH32: &str = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+    const NONCE_LEN: usize = 12;
+    /// nonce ‖ AES-256-GCM(32-byte key) ‖ tag.
+    pub const SEALED_LEN: usize = NONCE_LEN + 32 + 16;
+    /// `2026-10-17T10:00:00.123456789+00:00`.
+    const MAX_TIMESTAMP_LEN: usize = 35;
+    const MIRROR_VERSION: u64 = 1;
+    const THRESHOLD: u64 = 2;
+    const HOLDERS: usize = 3;
+
+    pub type Key = [u8; 32];
+
+    // ---- the key hierarchy (hierarchy.rs, escrow lib.rs/record.rs) -------
+
+    fn lp(out: &mut Vec<u8>, bytes: &[u8]) {
+        out.extend_from_slice(&u32::try_from(bytes.len()).expect("short").to_be_bytes());
+        out.extend_from_slice(bytes);
+    }
+
+    fn hmac_sha256(key: &[u8], parts: &[&[u8]]) -> Key {
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("any key length");
+        for part in parts {
+            mac.update(part);
+        }
+        mac.finalize().into_bytes().into()
+    }
+
+    /// HKDF-SHA256 (RFC 5869), 32 bytes: one expand block. No salt means
+    /// HashLen zero bytes, as in the `hkdf` crate.
+    pub fn hkdf32(salt: Option<&[u8]>, ikm: &[u8], info: &[u8]) -> Key {
+        let prk = hmac_sha256(salt.unwrap_or(&[0u8; 32]), &[ikm]);
+        hmac_sha256(&prk, &[info, &[1u8]])
+    }
+
+    fn sha256(bytes: &[u8]) -> Key {
+        Sha256::digest(bytes).into()
+    }
+
+    pub fn open32(key: &Key, aad: &[u8], sealed: &[u8]) -> Option<Key> {
+        if sealed.len() != SEALED_LEN {
+            return None;
+        }
+        let cipher = <Aes256Gcm as KeyInit>::new_from_slice(key).ok()?;
+        let (nonce, ct) = sealed.split_at(NONCE_LEN);
+        let nonce: [u8; NONCE_LEN] = nonce.try_into().ok()?;
+        let plain = cipher
+            .decrypt(&Nonce::from(nonce), Payload { msg: ct, aad })
+            .ok()?;
+        plain.try_into().ok()
+    }
+
+    /// Test-side sealing, for reference vectors only.
+    pub fn seal32(key: &Key, aad: &[u8], plaintext: &Key, nonce: [u8; NONCE_LEN]) -> Vec<u8> {
+        let cipher = <Aes256Gcm as KeyInit>::new_from_slice(key).expect("32-byte key");
+        let ct = cipher
+            .encrypt(
+                &Nonce::from(nonce),
+                Payload {
+                    msg: plaintext,
+                    aad,
+                },
+            )
+            .expect("AES-GCM of 32 bytes");
+        [nonce.as_slice(), ct.as_slice()].concat()
+    }
+
+    /// W = HKDF(R, "tinycloud/at-rest/wrap/v1").
+    pub fn wrap_key(root: &[u8]) -> Key {
+        hkdf32(None, root, W_LABEL.as_bytes())
+    }
+
+    pub fn seal_aad(ark_id: &[u8; 16], generation: u32, w_label: &str) -> Vec<u8> {
+        let mut aad = Vec::new();
+        lp(&mut aad, SEAL_DOMAIN);
+        lp(&mut aad, ark_id);
+        aad.extend_from_slice(&generation.to_be_bytes());
+        lp(&mut aad, w_label.as_bytes());
+        aad
+    }
+
+    pub fn chain_aad(older_id: &[u8; 16], older_generation: u32, newer_id: &[u8; 16]) -> Vec<u8> {
+        let mut aad = Vec::new();
+        lp(&mut aad, CHAIN_DOMAIN);
+        lp(&mut aad, older_id);
+        aad.extend_from_slice(&older_generation.to_be_bytes());
+        lp(&mut aad, newer_id);
+        aad
+    }
+
+    pub fn dek_aad(space: &str, dek_id: u32, generation: u32, ark_id: &[u8; 16]) -> Vec<u8> {
+        let mut aad = Vec::new();
+        lp(&mut aad, DEK_DOMAIN);
+        lp(&mut aad, space.as_bytes());
+        aad.extend_from_slice(&dek_id.to_be_bytes());
+        aad.extend_from_slice(&generation.to_be_bytes());
+        lp(&mut aad, ark_id);
+        aad
+    }
+
+    pub fn chain_key(newer_ark: &Key) -> Key {
+        hkdf32(None, newer_ark, CHAIN_INFO)
+    }
+
+    /// KEK_g = HKDF(ARK_g, "tinycloud/at-rest/kek/v1").
+    pub fn kek(ark: &Key) -> Key {
+        hkdf32(None, ark, KEK_INFO)
+    }
+
+    /// A space's DEK mirror tag: hex(HKDF(HKDF(ARK_1, tag info), space)[..16]).
+    pub fn dek_tag(ark_1: &Key, space: &str) -> String {
+        hex::encode(&hkdf32(None, &hkdf32(None, ark_1, DEK_TAG_INFO), space.as_bytes())[..16])
+    }
+
+    /// Escrow-side keys: HKDF with salt = ark_id.
+    fn escrow_key(ark: &Key, ark_id: &[u8; 16], info: &[u8]) -> Key {
+        hkdf32(Some(ark_id), ark, info)
+    }
+
+    pub fn canary_fp(ark: &Key, ark_id: &[u8; 16], generation: u32) -> Key {
+        let mut info = Vec::new();
+        lp(&mut info, CANARY_INFO);
+        info.extend_from_slice(&generation.to_be_bytes());
+        let canary = escrow_key(ark, ark_id, &info);
+        let mut pre = Vec::new();
+        lp(&mut pre, CANARY_FP_DOMAIN);
+        pre.extend_from_slice(ark_id);
+        pre.extend_from_slice(&generation.to_be_bytes());
+        lp(&mut pre, &canary);
+        sha256(&pre)
+    }
+
+    // ---- names (store.rs) -------------------------------------------------
+
+    #[derive(Debug, PartialEq)]
+    pub enum Kind {
+        Ark { generation: u32, ark_id: [u8; 16] },
+        Escrow { efp: Key },
+        Record { efp: Key },
+        Dek { tag: String, dek_id: u32 },
+    }
+
+    fn digits10(s: &str) -> Option<u32> {
+        (s.len() == 10 && s.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| s.parse::<u32>().ok())
+            .flatten()
+            .filter(|n| *n >= 1)
+    }
+
+    /// Exactly `2 * N` lowercase hex characters.
+    pub fn lower_hex<const N: usize>(s: &str) -> Option<[u8; N]> {
+        if s.len() != 2 * N || !s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+            return None;
+        }
+        hex::decode(s).ok()?.try_into().ok()
+    }
+
+    /// The allowlist: `ark-{generation:010}-{ark_id:32 hex}.json`,
+    /// `escrow-{efp:64 hex}.json`, `record-{efp:64 hex}.json` and
+    /// `dek-{tag:32 hex}-{dek_id:010}.json` under `_tc/at-rest/`; numbers ≥ 1.
+    pub fn parse_name(name: &str) -> Option<Kind> {
+        let rest = name.strip_prefix(PREFIX)?.strip_suffix(".json")?;
+        if let Some(rest) = rest.strip_prefix("ark-") {
+            let (generation, ark_id) = rest.split_once('-')?;
+            return Some(Kind::Ark {
+                generation: digits10(generation)?,
+                ark_id: lower_hex::<16>(ark_id)?,
+            });
+        }
+        if let Some(efp) = rest.strip_prefix("escrow-") {
+            return Some(Kind::Escrow {
+                efp: lower_hex::<32>(efp)?,
+            });
+        }
+        if let Some(efp) = rest.strip_prefix("record-") {
+            return Some(Kind::Record {
+                efp: lower_hex::<32>(efp)?,
+            });
+        }
+        let (tag, dek_id) = rest.strip_prefix("dek-")?.split_once('-')?;
+        lower_hex::<16>(tag)?;
+        Some(Kind::Dek {
+            tag: tag.to_owned(),
+            dek_id: digits10(dek_id)?,
+        })
+    }
+
+    // ---- strict documents (MirroredArk/MirroredDek, EscrowBundle, ----------
+    // ---- VerificationRecord: all deny_unknown_fields) --------------------
+    // Parsed only to refuse duplicate keys and unknown fields the way the
+    // node's serde types do; the typed checks below work on the JSON value.
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    #[allow(dead_code)]
+    struct StrictArk {
+        version: u32,
+        generation: u32,
+        ark_id: String,
+        w_label: String,
+        sealed: String,
+        chain: Option<String>,
+        created_at: String,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    #[allow(dead_code)]
+    struct StrictDek {
+        version: u32,
+        dek_id: u32,
+        generation: u32,
+        wrapped: String,
+        created_at: String,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    #[allow(dead_code)]
+    struct StrictShare {
+        index: u8,
+        holder: String,
+        recipient: String,
+        commitment: String,
+        ciphertext: String,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    #[allow(dead_code)]
+    struct StrictBundle {
+        version: u32,
+        ark_id: String,
+        generation: u32,
+        threshold: u8,
+        canary_fp: String,
+        shares: Vec<StrictShare>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    #[allow(dead_code)]
+    struct StrictRecord {
+        version: u32,
+        efp: String,
+        ark_id: String,
+        generation: u32,
+        verified_indices: Vec<u8>,
+        pairs: Vec<[u8; 2]>,
+        canary_fp: String,
+        app_id: Option<String>,
+        compose_hash: Option<String>,
+        verified_at: String,
+        mac: String,
+    }
+
+    fn strict<T: for<'de> Deserialize<'de>>(
+        what: &str,
+        schema: &str,
+        body: &[u8],
+        findings: &mut Vec<String>,
+    ) {
+        // The serde error can quote the offending value; report its place only.
+        if let Err(e) = serde_json::from_slice::<T>(body) {
+            findings.push(format!(
+                "{what}: not a strict {schema} ({:?} error at line {} column {})",
+                e.classify(),
+                e.line(),
+                e.column()
+            ));
+        }
+    }
+
+    pub fn json_type(value: &Value) -> &'static str {
+        match value {
+            Value::Null => "null",
+            Value::Bool(_) => "a boolean",
+            Value::Number(n) if n.is_u64() => "an unsigned integer",
+            Value::Number(n) if n.is_i64() => "a negative integer",
+            Value::Number(_) => "a float",
+            Value::String(_) => "a string",
+            Value::Array(_) => "an array",
+            Value::Object(_) => "an object",
+        }
+    }
+
+    /// Strict RFC 3339 (`T`, `Z` uppercase, 1-9 fraction digits), bounded.
+    pub fn strict_timestamp(s: &str) -> bool {
+        let b = s.as_bytes();
+        if !(20..=MAX_TIMESTAMP_LEN).contains(&b.len()) {
+            return false;
+        }
+        let digits = |r: std::ops::Range<usize>| b[r].iter().all(u8::is_ascii_digit);
+        if !(digits(0..4)
+            && b[4] == b'-'
+            && digits(5..7)
+            && b[7] == b'-'
+            && digits(8..10)
+            && b[10] == b'T'
+            && digits(11..13)
+            && b[13] == b':'
+            && digits(14..16)
+            && b[16] == b':'
+            && digits(17..19))
+        {
+            return false;
+        }
+        let mut i = 19;
+        if b[i] == b'.' {
+            let start = i + 1;
+            i = start;
+            while i < b.len() && b[i].is_ascii_digit() {
+                i += 1;
+            }
+            if !(1..=9).contains(&(i - start)) {
+                return false;
+            }
+        }
+        let zone = &b[i..];
+        let zone_ok = zone == b"Z"
+            || (zone.len() == 6
+                && matches!(zone[0], b'+' | b'-')
+                && zone[1..3].iter().all(u8::is_ascii_digit)
+                && zone[3] == b':'
+                && zone[4..6].iter().all(u8::is_ascii_digit));
+        zone_ok
+            && time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
+                .is_ok()
+    }
+
+    /// Canonical padded standard base64 of exactly `len` bytes.
+    pub fn canonical_b64(s: &str, len: usize) -> Option<Vec<u8>> {
+        let bytes = base64::decode_config(s, base64::STANDARD).ok()?;
+        (bytes.len() == len && base64::encode_config(&bytes, base64::STANDARD) == s)
+            .then_some(bytes)
+    }
+
+    fn age_recipient(s: &str) -> bool {
+        let data = s
+            .strip_prefix("age1yubikey1")
+            .or_else(|| s.strip_prefix("age1tag1"))
+            .or_else(|| s.strip_prefix("age1"));
+        data.is_some_and(|d| (40..=90).contains(&d.len()) && d.chars().all(|c| BECH32.contains(c)))
+    }
+
+    fn holder_name(s: &str) -> bool {
+        (1..=32).contains(&s.len())
+            && s.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+    }
+
+    /// An ASCII-armored age file (64-column standard base64) whose payload
+    /// starts with the age v1 header.
+    pub fn age_armor(s: &str) -> bool {
+        if s.len() > MAX_CIPHERTEXT {
+            return false;
+        }
+        let Some(body) = s
+            .strip_prefix(ARMOR_BEGIN)
+            .map(|b| b.strip_suffix('\n').unwrap_or(b))
+            .and_then(|b| b.strip_suffix(ARMOR_END))
+        else {
+            return false;
+        };
+        let Some(body) = body.strip_suffix('\n') else {
+            return false;
+        };
+        let lines: Vec<&str> = body.split('\n').collect();
+        let shaped = lines.iter().enumerate().all(|(i, line)| {
+            let full = i + 1 < lines.len();
+            (if full {
+                line.len() == 64
+            } else {
+                (1..=64).contains(&line.len())
+            }) && line
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
+        });
+        shaped
+            && base64::decode_config(lines.concat(), base64::STANDARD)
+                .is_ok_and(|bin| bin.starts_with(AGE_MAGIC))
+    }
+
+    /// Typed field checks; findings name the field and the JSON type found,
+    /// never the value (it could be key material).
+    struct Fields<'a> {
+        what: &'a str,
+        map: &'a Map<String, Value>,
+        findings: &'a mut Vec<String>,
+    }
+
+    impl Fields<'_> {
+        fn bad(&mut self, field: &str, expected: &str) {
+            let map = self.map;
+            let found = map.get(field).map_or("nothing", json_type);
+            self.findings.push(format!(
+                "{}: field `{field}` must be {expected}, found {found}",
+                self.what
+            ));
+        }
+
+        fn exact(&mut self, names: &[&str]) {
+            let map = self.map;
+            let want: BTreeSet<&str> = names.iter().copied().collect();
+            let extra = map.keys().filter(|k| !want.contains(k.as_str())).count();
+            let missing: Vec<&str> = names
+                .iter()
+                .copied()
+                .filter(|n| !map.contains_key(*n))
+                .collect();
+            if extra > 0 || !missing.is_empty() {
+                self.findings.push(format!(
+                    "{}: fields must be exactly {names:?}; {extra} unknown field(s), missing {missing:?}",
+                    self.what
+                ));
+            }
+        }
+
+        fn int(&mut self, field: &str, want: u64) {
+            let map = self.map;
+            if map.get(field).and_then(Value::as_u64) != Some(want) {
+                self.bad(field, &format!("the integer {want}"));
+            }
+        }
+
+        fn u32_min(&mut self, field: &str, min: u32) -> Option<u32> {
+            let map = self.map;
+            let value = map
+                .get(field)
+                .and_then(Value::as_u64)
+                .and_then(|n| u32::try_from(n).ok())
+                .filter(|n| *n >= min);
+            if value.is_none() {
+                self.bad(field, &format!("an integer in {min}..={}", u32::MAX));
+            }
+            value
+        }
+
+        fn hex<const N: usize>(&mut self, field: &str) -> Option<[u8; N]> {
+            let map = self.map;
+            let value = map
+                .get(field)
+                .and_then(Value::as_str)
+                .and_then(lower_hex::<N>);
+            if value.is_none() {
+                self.bad(field, &format!("{} lowercase hex characters", 2 * N));
+            }
+            value
+        }
+
+        fn base64(&mut self, field: &str, len: usize) -> Option<Vec<u8>> {
+            let map = self.map;
+            let value = map
+                .get(field)
+                .and_then(Value::as_str)
+                .and_then(|s| canonical_b64(s, len));
+            if value.is_none() {
+                self.bad(field, &format!("canonical padded base64 of {len} bytes"));
+            }
+            value
+        }
+
+        fn nullable_base64(&mut self, field: &str, len: usize) -> Option<Option<Vec<u8>>> {
+            let map = self.map;
+            let value = match map.get(field) {
+                Some(Value::Null) => Some(None),
+                Some(Value::String(s)) => canonical_b64(s, len).map(Some),
+                _ => None,
+            };
+            if value.is_none() {
+                self.bad(
+                    field,
+                    &format!("null or canonical padded base64 of {len} bytes"),
+                );
+            }
+            value
+        }
+
+        fn string(
+            &mut self,
+            field: &str,
+            check: fn(&str) -> bool,
+            expected: &str,
+        ) -> Option<String> {
+            let map = self.map;
+            let value = map
+                .get(field)
+                .and_then(Value::as_str)
+                .filter(|s| check(s))
+                .map(str::to_owned);
+            if value.is_none() {
+                self.bad(field, expected);
+            }
+            value
+        }
+
+        fn timestamp(&mut self, field: &str) -> Option<String> {
+            self.string(field, strict_timestamp, "a strict RFC 3339 timestamp")
+        }
+
+        fn equals(&mut self, field: &str, want: &Value, expected: &str) {
+            let map = self.map;
+            if map.get(field) != Some(want) {
+                self.bad(field, expected);
+            }
+        }
+
+        fn finding(&mut self, text: String) {
+            self.findings.push(format!("{}: {text}", self.what));
+        }
+    }
+
+    pub struct ArkDoc {
+        pub key: String,
+        pub generation: u32,
+        pub ark_id: [u8; 16],
+        pub sealed: Vec<u8>,
+        pub chain: Option<Vec<u8>>,
+    }
+
+    pub struct DekDoc {
+        pub key: String,
+        pub tag: String,
+        pub dek_id: u32,
+        pub generation: u32,
+        pub wrapped: Vec<u8>,
+    }
+
+    pub struct ShareDoc {
+        pub index: u8,
+        pub holder: String,
+        pub recipient: String,
+        pub commitment: Key,
+        pub ciphertext: String,
+    }
+
+    pub struct BundleDoc {
+        pub key: String,
+        pub name_efp: Key,
+        pub ark_id: [u8; 16],
+        pub generation: u32,
+        pub canary_fp: Key,
+        pub shares: Vec<ShareDoc>,
+    }
+
+    pub struct RecordDoc {
+        pub key: String,
+        pub efp: Key,
+        pub ark_id: [u8; 16],
+        pub generation: u32,
+        pub canary_fp: Key,
+        pub verified_at: String,
+        pub mac: Key,
+    }
+
+    fn ark_doc(
+        what: &str,
+        key: &str,
+        map: &Map<String, Value>,
+        name: (u32, [u8; 16]),
+        findings: &mut Vec<String>,
+    ) -> Option<ArkDoc> {
+        let mut f = Fields {
+            what,
+            map,
+            findings,
+        };
+        f.exact(&[
+            "version",
+            "generation",
+            "ark_id",
+            "w_label",
+            "sealed",
+            "chain",
+            "created_at",
+        ]);
+        f.int("version", MIRROR_VERSION);
+        let generation = f.u32_min("generation", 1);
+        let ark_id = f.hex::<16>("ark_id");
+        f.equals(
+            "w_label",
+            &json!(W_LABEL),
+            &format!("the string {W_LABEL:?}"),
+        );
+        let sealed = f.base64("sealed", SEALED_LEN);
+        let chain = f.nullable_base64("chain", SEALED_LEN);
+        f.timestamp("created_at");
+        if generation.is_some_and(|g| g != name.0) || ark_id.is_some_and(|id| id != name.1) {
+            f.finding("generation/ark_id differ from the object name".into());
+        }
+        Some(ArkDoc {
+            key: key.to_owned(),
+            generation: generation?,
+            ark_id: ark_id?,
+            sealed: sealed?,
+            chain: chain?,
+        })
+    }
+
+    fn dek_doc(
+        what: &str,
+        key: &str,
+        map: &Map<String, Value>,
+        name: (String, u32),
+        findings: &mut Vec<String>,
+    ) -> Option<DekDoc> {
+        let mut f = Fields {
+            what,
+            map,
+            findings,
+        };
+        f.exact(&["version", "dek_id", "generation", "wrapped", "created_at"]);
+        f.int("version", MIRROR_VERSION);
+        let dek_id = f.u32_min("dek_id", 1);
+        let generation = f.u32_min("generation", 1);
+        let wrapped = f.base64("wrapped", SEALED_LEN);
+        f.timestamp("created_at");
+        if dek_id.is_some_and(|id| id != name.1) {
+            f.finding("dek_id differs from the object name".into());
+        }
+        Some(DekDoc {
+            key: key.to_owned(),
+            tag: name.0,
+            dek_id: dek_id?,
+            generation: generation?,
+            wrapped: wrapped?,
+        })
+    }
+
+    fn bundle_doc(
+        what: &str,
+        key: &str,
+        map: &Map<String, Value>,
+        name_efp: Key,
+        findings: &mut Vec<String>,
+    ) -> Option<BundleDoc> {
+        let mut f = Fields {
+            what,
+            map,
+            findings,
+        };
+        f.exact(&[
+            "version",
+            "ark_id",
+            "generation",
+            "threshold",
+            "canary_fp",
+            "shares",
+        ]);
+        f.int("version", MIRROR_VERSION);
+        let ark_id = f.hex::<16>("ark_id");
+        let generation = f.u32_min("generation", 1);
+        f.int("threshold", THRESHOLD);
+        let canary_fp = f.hex::<32>("canary_fp");
+        let mut shares = Vec::new();
+        match map.get("shares") {
+            Some(Value::Array(items)) if items.len() == HOLDERS => {
+                for (i, item) in items.iter().enumerate() {
+                    let share_what = format!("{what} share {}", i + 1);
+                    let Value::Object(share) = item else {
+                        f.finding(format!(
+                            "share {} must be an object, found {}",
+                            i + 1,
+                            json_type(item)
+                        ));
+                        continue;
+                    };
+                    let mut s = Fields {
+                        what: &share_what,
+                        map: share,
+                        findings: &mut *f.findings,
+                    };
+                    s.exact(&["index", "holder", "recipient", "commitment", "ciphertext"]);
+                    s.int("index", i as u64 + 1);
+                    let holder = s.string("holder", holder_name, "1-32 characters of a-z 0-9 - _");
+                    let recipient = s.string(
+                        "recipient",
+                        age_recipient,
+                        "an age1/age1yubikey1/age1tag1 bech32 recipient",
+                    );
+                    let commitment = s.hex::<32>("commitment");
+                    let ciphertext = s.string("ciphertext", age_armor, "an ASCII-armored age file");
+                    if let (Some(holder), Some(recipient), Some(commitment), Some(ciphertext)) =
+                        (holder, recipient, commitment, ciphertext)
+                    {
+                        shares.push(ShareDoc {
+                            index: i as u8 + 1,
+                            holder,
+                            recipient,
+                            commitment,
+                            ciphertext,
+                        });
+                    }
+                }
+            }
+            _ => f.bad("shares", &format!("an array of {HOLDERS} share objects")),
+        }
+        let holders: BTreeSet<&str> = shares.iter().map(|s| s.holder.as_str()).collect();
+        let recipients: BTreeSet<&str> = shares.iter().map(|s| s.recipient.as_str()).collect();
+        if shares.len() == HOLDERS && (holders.len() != HOLDERS || recipients.len() != HOLDERS) {
+            f.finding("holders and recipients must be unique".into());
+        }
+        (shares.len() == HOLDERS).then_some(())?;
+        Some(BundleDoc {
+            key: key.to_owned(),
+            name_efp,
+            ark_id: ark_id?,
+            generation: generation?,
+            canary_fp: canary_fp?,
+            shares,
+        })
+    }
+
+    fn record_doc(
+        what: &str,
+        key: &str,
+        map: &Map<String, Value>,
+        name_efp: Key,
+        findings: &mut Vec<String>,
+    ) -> Option<RecordDoc> {
+        let mut f = Fields {
+            what,
+            map,
+            findings,
+        };
+        f.exact(&[
+            "version",
+            "efp",
+            "ark_id",
+            "generation",
+            "verified_indices",
+            "pairs",
+            "canary_fp",
+            "app_id",
+            "compose_hash",
+            "verified_at",
+            "mac",
+        ]);
+        f.int("version", MIRROR_VERSION);
+        let efp = f.hex::<32>("efp");
+        let ark_id = f.hex::<16>("ark_id");
+        let generation = f.u32_min("generation", 1);
+        f.equals(
+            "verified_indices",
+            &json!([1, 2, 3]),
+            "the integers [1, 2, 3]",
+        );
+        f.equals(
+            "pairs",
+            &json!([[1, 2], [1, 3], [2, 3]]),
+            "the pairs [[1, 2], [1, 3], [2, 3]]",
+        );
+        let canary_fp = f.hex::<32>("canary_fp");
+        // The harness runs a Static-root node outside a TEE: no TEE identity.
+        f.equals("app_id", &Value::Null, "null (no TEE)");
+        f.equals("compose_hash", &Value::Null, "null (no TEE)");
+        let verified_at = f.timestamp("verified_at");
+        let mac = f.hex::<32>("mac");
+        if efp.is_some_and(|e| e != name_efp) {
+            f.finding("efp differs from the object name".into());
+        }
+        Some(RecordDoc {
+            key: key.to_owned(),
+            efp: efp?,
+            ark_id: ark_id?,
+            generation: generation?,
+            canary_fp: canary_fp?,
+            verified_at: verified_at?,
+            mac: mac?,
+        })
+    }
+
+    /// The escrow fingerprint (bundle.rs `EscrowBundle::fingerprint`).
+    pub fn bundle_efp(b: &BundleDoc) -> Key {
+        let mut pre = Vec::new();
+        lp(&mut pre, EFP_DOMAIN);
+        pre.extend_from_slice(&(MIRROR_VERSION as u32).to_be_bytes());
+        pre.extend_from_slice(&b.ark_id);
+        pre.extend_from_slice(&b.generation.to_be_bytes());
+        pre.push(THRESHOLD as u8);
+        pre.extend_from_slice(&b.canary_fp);
+        pre.push(u8::try_from(b.shares.len()).unwrap_or(u8::MAX));
+        for s in &b.shares {
+            pre.push(s.index);
+            lp(&mut pre, s.holder.as_bytes());
+            lp(&mut pre, s.recipient.as_bytes());
+            pre.extend_from_slice(&s.commitment);
+            pre.extend_from_slice(&sha256(s.ciphertext.as_bytes()));
+        }
+        sha256(&pre)
+    }
+
+    /// The verification record's MAC (record.rs `compute_mac`), with no TEE
+    /// identity (`app_id`, `compose_hash` null).
+    pub fn record_mac(ark: &Key, r: &RecordDoc) -> Key {
+        let mut info = Vec::new();
+        lp(&mut info, MAC_INFO);
+        let key = escrow_key(ark, &r.ark_id, &info);
+        let mut body = Vec::new();
+        body.extend_from_slice(&(MIRROR_VERSION as u32).to_be_bytes());
+        body.extend_from_slice(&r.efp);
+        body.extend_from_slice(&r.ark_id);
+        body.extend_from_slice(&r.generation.to_be_bytes());
+        lp(&mut body, &[1, 2, 3]);
+        lp(&mut body, &[1, 2, 1, 3, 2, 3]);
+        body.extend_from_slice(&r.canary_fp);
+        body.extend_from_slice(&[0, 0]);
+        lp(&mut body, r.verified_at.as_bytes());
+        hmac_sha256(&key, &[&body])
+    }
+
+    // ---- raw-key scan (ruling 3 backstop) ---------------------------------
+
+    const KEY_PREFIXES: [&str; 9] = [
+        "0x",
+        "\\x",
+        "hex:",
+        "base64:",
+        "base64url:",
+        "b64:",
+        "b64url:",
+        "key:",
+        "raw:",
+    ];
+
+    /// Every byte string `s` decodes to as hex, base64 or base64url (padded
+    /// or not), after removing whitespace and optionally a common prefix
+    /// (`0x`, `base64:`, a `data:…;base64,` URL head, …).
+    pub fn decodings(s: &str) -> Vec<Vec<u8>> {
+        let compact: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+        let lower = compact.to_ascii_lowercase();
+        let mut candidates = vec![compact.as_str()];
+        for prefix in KEY_PREFIXES {
+            if lower.starts_with(prefix) {
+                candidates.push(&compact[prefix.len()..]);
+            }
+        }
+        if let Some(at) = lower.find(";base64,") {
+            candidates.push(&compact[at + ";base64,".len()..]);
+        }
+        let mut out = Vec::new();
+        for candidate in candidates.into_iter().filter(|c| !c.is_empty()) {
+            if let Ok(bytes) = hex::decode(candidate) {
+                out.push(bytes);
+            }
+            for config in [
+                base64::STANDARD,
+                base64::STANDARD_NO_PAD,
+                base64::URL_SAFE,
+                base64::URL_SAFE_NO_PAD,
+            ] {
+                if let Ok(bytes) = base64::decode_config(candidate, config) {
+                    out.push(bytes);
+                }
+            }
+        }
+        out
+    }
+
+    /// A path component that never echoes a long or unusual JSON key.
+    fn component(key: &str, i: usize) -> String {
+        if key.len() <= 24 && key.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') {
+            key.to_owned()
+        } else {
+            format!("<key #{i}>")
+        }
+    }
+
+    fn byte_array(items: &[Value]) -> bool {
+        items.iter().all(|v| v.as_u64().is_some_and(|n| n <= 255))
+    }
+
+    fn scan_string(
+        s: &str,
+        at: String,
+        is_key: bool,
+        exempt: &[&str],
+        halves: &mut Vec<String>,
+        found: &mut Vec<String>,
+    ) {
+        if !is_key && exempt.contains(&at.as_str()) {
+            return;
+        }
+        let lens: BTreeSet<usize> = decodings(s).iter().map(Vec::len).collect();
+        let place = if is_key {
+            format!("a JSON key in `{at}`")
+        } else {
+            format!("`{at}`")
+        };
+        if lens.contains(&32) {
+            found.push(format!("{place} decodes to 32 bytes (a raw key's size)"));
+        } else if lens.contains(&16) {
+            halves.push(place);
+        }
+    }
+
+    fn walk(
+        value: &Value,
+        path: &str,
+        exempt: &[&str],
+        halves: &mut Vec<String>,
+        found: &mut Vec<String>,
+    ) {
+        match value {
+            Value::Object(map) => {
+                let here = if path.is_empty() {
+                    "/".to_owned()
+                } else {
+                    path.to_owned()
+                };
+                for (i, (key, child)) in map.iter().enumerate() {
+                    scan_string(key, here.clone(), true, exempt, halves, found);
+                    let name = component(key, i);
+                    let at = if path.is_empty() {
+                        name
+                    } else {
+                        format!("{path}.{name}")
+                    };
+                    walk(child, &at, exempt, halves, found);
+                }
+            }
+            Value::Array(items) if items.len() == 32 && byte_array(items) => {
+                found.push(format!(
+                    "`{path}` is an array of 32 byte values (a raw key)"
+                ));
+            }
+            Value::Array(items) if items.len() == 16 && byte_array(items) => {
+                halves.push(format!("`{path}` (16 byte values)"));
+            }
+            Value::Array(items) => {
+                for item in items {
+                    walk(item, &format!("{path}[]"), exempt, halves, found);
+                }
+            }
+            Value::String(s) => scan_string(s, path.to_owned(), false, exempt, halves, found),
+            _ => {}
+        }
+    }
+
+    /// Every JSON key and every string outside `exempt` (fields whose exact
+    /// encoding the schema checked) must not decode to 32 bytes; no array may
+    /// be 32 byte values; no two fields may hold 16 bytes each (a split key).
+    pub fn raw_key_findings(what: &str, doc: &Value, exempt: &[&str]) -> Vec<String> {
+        let (mut halves, mut found) = (Vec::new(), Vec::new());
+        walk(doc, "", exempt, &mut halves, &mut found);
+        let mut findings: Vec<String> = found.into_iter().map(|f| format!("{what}: {f}")).collect();
+        if halves.len() >= 2 {
+            findings.push(format!(
+                "{what}: {} hold 16 bytes each (a 32-byte key split across fields)",
+                halves.join(", ")
+            ));
+        }
+        findings
+    }
+
+    // ---- one snapshot -------------------------------------------------------
+
+    pub struct ObjectRef<'a> {
+        pub key: &'a str,
+        pub body: &'a [u8],
+    }
+
+    /// Every `_tc/` object of one bucket snapshot: an allowed name, an exact
+    /// typed schema, no raw key, and authentic key material under the
+    /// harness's Static `root`, with DEK tags mapped to `spaces`.
+    pub fn check_snapshot(
+        label: &str,
+        objects: &[ObjectRef],
+        root: &[u8],
+        spaces: &[String],
+    ) -> Vec<String> {
+        let mut findings = Vec::new();
+        let mut arks: Vec<ArkDoc> = Vec::new();
+        let mut deks: Vec<DekDoc> = Vec::new();
+        let mut bundles: Vec<BundleDoc> = Vec::new();
+        let mut records: Vec<RecordDoc> = Vec::new();
+        for object in objects {
+            let what = format!("[{label}] at-rest control object {:?}", object.key);
+            let Some(kind) = parse_name(object.key) else {
+                findings.push(format!(
+                    "{what}: not an allowed mirror name ({PREFIX}ark-<10 digits>-<32 hex>.json, \
+                     escrow-<64 hex>.json, record-<64 hex>.json or dek-<32 hex>-<10 digits>.json)"
+                ));
+                continue;
+            };
+            let doc: Value = match serde_json::from_slice(object.body) {
+                Ok(doc) => doc,
+                Err(e) => {
+                    findings.push(format!(
+                        "{what}: not JSON ({:?} error at line {} column {})",
+                        e.classify(),
+                        e.line(),
+                        e.column()
+                    ));
+                    continue;
+                }
+            };
+            let Value::Object(map) = &doc else {
+                findings.push(format!(
+                    "{what}: JSON {} where an object is required",
+                    json_type(&doc)
+                ));
+                continue;
+            };
+            let exempt: &[&str] = match kind {
+                Kind::Ark { generation, ark_id } => {
+                    strict::<StrictArk>(&what, "MirroredArk", object.body, &mut findings);
+                    arks.extend(ark_doc(
+                        &what,
+                        object.key,
+                        map,
+                        (generation, ark_id),
+                        &mut findings,
+                    ));
+                    &["ark_id", "sealed", "chain"]
+                }
+                Kind::Dek { tag, dek_id } => {
+                    strict::<StrictDek>(&what, "MirroredDek", object.body, &mut findings);
+                    deks.extend(dek_doc(
+                        &what,
+                        object.key,
+                        map,
+                        (tag, dek_id),
+                        &mut findings,
+                    ));
+                    &["wrapped"]
+                }
+                Kind::Escrow { efp } => {
+                    strict::<StrictBundle>(&what, "EscrowBundle", object.body, &mut findings);
+                    bundles.extend(bundle_doc(&what, object.key, map, efp, &mut findings));
+                    &[
+                        "ark_id",
+                        "canary_fp",
+                        "shares[].recipient",
+                        "shares[].commitment",
+                        "shares[].ciphertext",
+                    ]
+                }
+                Kind::Record { efp } => {
+                    strict::<StrictRecord>(&what, "VerificationRecord", object.body, &mut findings);
+                    records.extend(record_doc(&what, object.key, map, efp, &mut findings));
+                    &["efp", "ark_id", "canary_fp", "mac"]
+                }
+            };
+            findings.extend(raw_key_findings(&what, &doc, exempt));
+        }
+        authenticate(
+            label,
+            root,
+            spaces,
+            &arks,
+            &deks,
+            &bundles,
+            &records,
+            &mut findings,
+        );
+        findings
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn authenticate(
+        label: &str,
+        root: &[u8],
+        spaces: &[String],
+        arks: &[ArkDoc],
+        deks: &[DekDoc],
+        bundles: &[BundleDoc],
+        records: &[RecordDoc],
+        findings: &mut Vec<String>,
+    ) {
+        let w = wrap_key(root);
+        let mut opened: BTreeMap<u32, ([u8; 16], Key)> = BTreeMap::new();
+        for d in arks {
+            match open_ark_doc(&w, d) {
+                Some(ark) => match opened.get(&d.generation) {
+                    Some((id, other)) if *id != d.ark_id || *other != ark => findings.push(format!(
+                        "[{label}] two different ARKs are mirrored for generation {}",
+                        d.generation
+                    )),
+                    Some(_) => {}
+                    None => {
+                        opened.insert(d.generation, (d.ark_id, ark));
+                    }
+                },
+                None => findings.push(format!(
+                    "[{label}] sealed ARK {:?} (generation {}) does not authenticate under W from the harness's Static root",
+                    d.key, d.generation
+                )),
+            }
+        }
+        let newest = arks.iter().map(|d| d.generation).max();
+        if let Some(newest) = newest {
+            for g in 1..=newest {
+                if !arks.iter().any(|d| d.generation == g) {
+                    findings.push(format!(
+                        "[{label}] no ARK mirror for generation {g} of 1..={newest}"
+                    ));
+                }
+            }
+        }
+        for d in arks {
+            let what = format!("[{label}] ARK {:?}", d.key);
+            match (&d.chain, Some(d.generation) == newest) {
+                (None, true) => {}
+                (Some(_), true) => {
+                    findings.push(format!("{what}: the newest generation has a chain"))
+                }
+                (None, false) => findings.push(format!(
+                    "{what}: an older generation has no chain to the next"
+                )),
+                (Some(chain), false) => {
+                    let opens = match (opened.get(&(d.generation + 1)), opened.get(&d.generation)) {
+                        (Some((newer_id, newer)), Some((_, older))) => {
+                            open32(
+                                &chain_key(newer),
+                                &chain_aad(&d.ark_id, d.generation, newer_id),
+                                chain,
+                            )
+                            .as_ref()
+                                == Some(older)
+                        }
+                        _ => false,
+                    };
+                    if !opens {
+                        findings.push(format!("{what}: its chain does not open to this generation's ARK under the next one"));
+                    }
+                }
+            }
+        }
+        let Some((_, ark_1)) = opened.get(&1) else {
+            if !(deks.is_empty() && bundles.is_empty() && records.is_empty()) {
+                findings.push(format!(
+                    "[{label}] {} DEK, {} escrow and {} record mirror(s) but no authentic generation-1 ARK to check them against",
+                    deks.len(),
+                    bundles.len(),
+                    records.len()
+                ));
+            }
+            return;
+        };
+        let tags: BTreeMap<String, &String> =
+            spaces.iter().map(|s| (dek_tag(ark_1, s), s)).collect();
+        for d in deks {
+            let what = format!("[{label}] DEK {:?}", d.key);
+            let Some(space) = tags.get(&d.tag) else {
+                findings.push(format!(
+                    "{what}: its tag belongs to none of the {} spaces this harness created",
+                    spaces.len()
+                ));
+                continue;
+            };
+            let Some((ark_id, ark)) = opened.get(&d.generation) else {
+                findings.push(format!(
+                    "{what}: wrapped under generation {}, which has no authentic ARK",
+                    d.generation
+                ));
+                continue;
+            };
+            if open32(
+                &kek(ark),
+                &dek_aad(space, d.dek_id, d.generation, ark_id),
+                &d.wrapped,
+            )
+            .is_none()
+            {
+                findings.push(format!(
+                    "{what}: the wrapped DEK does not authenticate under KEK_{} with its AAD (space, dek_id, generation, ark_id)",
+                    d.generation
+                ));
+            }
+        }
+        for b in bundles {
+            let what = format!("[{label}] escrow bundle {:?}", b.key);
+            match opened.get(&b.generation) {
+                Some((id, ark)) if *id == b.ark_id => {
+                    if canary_fp(ark, id, b.generation) != b.canary_fp {
+                        findings.push(format!("{what}: canary_fp is not this generation's canary"));
+                    }
+                }
+                _ => findings.push(format!("{what}: names no authentic ARK generation and id")),
+            }
+            if bundle_efp(b) != b.name_efp {
+                findings.push(format!(
+                    "{what}: the name's EFP is not the bundle's fingerprint"
+                ));
+            }
+        }
+        for r in records {
+            let what = format!("[{label}] verification record {:?}", r.key);
+            let Some(b) = bundles
+                .iter()
+                .find(|b| b.name_efp == r.efp && bundle_efp(b) == r.efp)
+            else {
+                findings.push(format!("{what}: no mirrored escrow bundle has its EFP"));
+                continue;
+            };
+            if (r.ark_id, r.generation, r.canary_fp) != (b.ark_id, b.generation, b.canary_fp) {
+                findings.push(format!(
+                    "{what}: ark_id, generation or canary_fp differ from its bundle"
+                ));
+            }
+            match opened.get(&r.generation) {
+                Some((id, ark)) if *id == r.ark_id && record_mac(ark, r) == r.mac => {}
+                _ => findings.push(format!(
+                    "{what}: its MAC does not verify under the generation's ARK"
+                )),
+            }
+        }
+    }
+
+    fn open_ark_doc(w: &Key, d: &ArkDoc) -> Option<Key> {
+        open32(w, &seal_aad(&d.ark_id, d.generation, W_LABEL), &d.sealed)
+    }
+}
+
 /// A text encoding of the plaintext's blake3 fingerprint.
 struct Fingerprint {
     label: String,
@@ -522,7 +2004,11 @@ struct StoredObject {
 /// KV probes written into one space, with the objects each put created.
 struct KvSpace {
     account: Account,
-    /// Per probe (same order as [`KvRun::probes`]).
+    /// Per probe (same order as [`KvRun::probes`]): the block objects it
+    /// created. Control objects (`_tc/…`, e.g. the space's wrapped data key
+    /// on its first sealed write) are not KV data, so they are not paired or
+    /// size-checked here; the RED check reads every one of them from the
+    /// boot and after-put snapshots instead.
     objects: Vec<Vec<StoredObject>>,
 }
 
@@ -569,6 +2055,9 @@ async fn kv_put(
     );
     let mut objects = Vec::new();
     for key in harness.keys().await?.difference(&before) {
+        if key.starts_with(key_mirror::CONTROL_PREFIX) {
+            continue;
+        }
         let body = harness.object(key).await?;
         ensure!(!body.is_empty(), "new object {key} is empty");
         objects.push(StoredObject {
@@ -578,7 +2067,7 @@ async fn kv_put(
     }
     if objects.is_empty() {
         bail!(
-            "harness no-op: the {}-byte KV put to {}/{path} created no object in the MinIO bucket",
+            "harness no-op: the {}-byte KV put to {}/{path} created no block object in the MinIO bucket",
             value.len(),
             account.space
         );
@@ -773,9 +2262,19 @@ async fn red_kv_blocks_are_sealed_in_minio() -> Result<()> {
     let harness = Harness::connect().await?;
     let run = kv_run(&harness).await?;
     let mut findings = Vec::new();
+    let spaces = harness.known_spaces()?;
+    let identities: Vec<IdentityForm> = spaces.iter().flat_map(|s| identity_forms(s)).collect();
+    let fingerprints: Vec<(&str, Fingerprint)> = run
+        .probes
+        .iter()
+        .flat_map(|(label, value)| {
+            fingerprints(value.as_bytes())
+                .into_iter()
+                .map(move |fp| (*label, fp))
+        })
+        .collect();
     for space in &run.spaces {
         let space_id = space.account.space.to_string();
-        let address = space.account.address_hex();
         for ((label, value), objects) in run.probes.iter().zip(&space.objects) {
             check_size_floor(
                 &format!("KV {label} put for {space_id}: its new object(s) in total"),
@@ -783,52 +2282,60 @@ async fn red_kv_blocks_are_sealed_in_minio() -> Result<()> {
                 value.len(),
                 &mut findings,
             );
-            let fingerprints = fingerprints(value.as_bytes());
-            for StoredObject { key, body } in objects {
-                if key.contains(&space_id) {
-                    findings.push(format!(
-                        "object key {key:?} contains the space id {space_id}"
-                    ));
-                }
-                let lower = key.to_ascii_lowercase();
-                if lower.contains(&address) {
-                    findings.push(format!(
-                        "object key {key:?} contains the wallet address 0x{address} (case-insensitive)"
-                    ));
-                }
-                let leaked = fingerprints
-                    .iter()
-                    .filter(|fp| {
-                        if fp.case_insensitive {
-                            lower.contains(&fp.text)
-                        } else {
-                            key.contains(&fp.text)
-                        }
-                    })
-                    .map(|fp| format!("{} {}", fp.label, fp.text))
-                    .collect::<Vec<_>>();
-                if !leaked.is_empty() {
-                    findings.push(format!(
-                        "object key {key:?} contains the plaintext fingerprint of the {label} value: {}",
-                        leaked.join(", ")
-                    ));
-                }
-                if let Some(offset) = find(body, run.marker.as_bytes()) {
-                    findings.push(format!(
-                        "raw object {key:?} ({} bytes, {label} value) contains the plaintext marker {:?} at byte {offset}",
-                        body.len(),
-                        run.marker
-                    ));
-                }
+            for object in objects {
+                findings.extend(content_findings(
+                    object,
+                    false,
+                    &run.marker,
+                    &fingerprints,
+                    &identities,
+                ));
                 if *label == "compressible" {
                     check_incompressible(
-                        &format!("raw object {key:?} [{label} value]"),
-                        body,
+                        &format!("raw object {:?} [{label} value]", object.key),
+                        &object.body,
                         &mut findings,
                     )?;
                 }
             }
         }
+    }
+    // Control objects (`_tc/…`) as the node left them at boot and after the
+    // puts: the same name and content scans (also over their text), then an
+    // exact name, an exact typed schema, no raw key, and authentic key
+    // material under the harness's Static root (rulings 1-5).
+    for (snapshot, objects) in [
+        ("boot", harness.boot_objects()?),
+        ("after the puts", harness.control_objects().await?),
+    ] {
+        for object in &objects {
+            findings.extend(content_findings(
+                object,
+                true,
+                &run.marker,
+                &fingerprints,
+                &identities,
+            ));
+        }
+        let control: Vec<key_mirror::ObjectRef> = objects
+            .iter()
+            .filter(|o| o.key.starts_with(key_mirror::CONTROL_PREFIX))
+            .map(|o| key_mirror::ObjectRef {
+                key: &o.key,
+                body: &o.body,
+            })
+            .collect();
+        println!(
+            "[{snapshot}] {} object(s), {} control object(s) checked",
+            objects.len(),
+            control.len()
+        );
+        findings.extend(key_mirror::check_snapshot(
+            snapshot,
+            &control,
+            &harness.root,
+            &spaces,
+        ));
     }
     // Compare every object of a put in space A with every object of the same
     // put in space B: sealed names sort randomly, so no pairing by order.
@@ -1044,6 +2551,945 @@ fn selftest_predicates_flag_deterministic_transforms_not_ciphertext() -> Result<
         ensure!(
             find(&a, marker.as_bytes()).is_none() && findings.is_empty(),
             "sealed-like blobs of {len} bytes were flagged: {findings:?}"
+        );
+    }
+    Ok(())
+}
+
+fn random_key() -> key_mirror::Key {
+    random_bytes(32).try_into().expect("32 bytes")
+}
+
+fn random_nonce() -> [u8; 12] {
+    random_bytes(12).try_into().expect("12 bytes")
+}
+
+fn standard_b64(bytes: &[u8]) -> String {
+    base64::encode_config(bytes, base64::STANDARD)
+}
+
+/// A Static root and the mirror objects an S1 node writes for it, built with
+/// this file's reference sealing (random nonces), not the node's code: ARK
+/// generations 1 and 2 (1 chained under 2), a DEK in each of two spaces (one
+/// per generation), and generation 2's escrow bundle with its record.
+struct MirrorFixture {
+    root: Vec<u8>,
+    spaces: Vec<String>,
+    ark_1: key_mirror::Key,
+    objects: Vec<(String, Value)>,
+}
+
+impl MirrorFixture {
+    fn new() -> Self {
+        use key_mirror::*;
+        let root = random_bytes(32);
+        let w = wrap_key(&root);
+        let ts = "2026-10-17T10:00:00.123456789Z";
+        let (ark_1, id_1, ark_2, id_2) = (random_key(), [1u8; 16], random_key(), [2u8; 16]);
+        let ark = |generation: u32, id: &[u8; 16], key: &Key, chain: Value| {
+            let sealed = seal32(&w, &seal_aad(id, generation, W_LABEL), key, random_nonce());
+            json!({
+                "version": 1, "generation": generation, "ark_id": hex::encode(id),
+                "w_label": W_LABEL, "sealed": standard_b64(&sealed), "chain": chain,
+                "created_at": ts,
+            })
+        };
+        let chain = seal32(
+            &chain_key(&ark_2),
+            &chain_aad(&id_1, 1, &id_2),
+            &ark_1,
+            random_nonce(),
+        );
+        let mut objects = vec![
+            (
+                format!("{PREFIX}ark-{:010}-{}.json", 1, hex::encode(id_1)),
+                ark(1, &id_1, &ark_1, json!(standard_b64(&chain))),
+            ),
+            (
+                format!("{PREFIX}ark-{:010}-{}.json", 2, hex::encode(id_2)),
+                ark(2, &id_2, &ark_2, Value::Null),
+            ),
+        ];
+        let spaces = vec![
+            "tinycloud:pkh:eip155:1:0x5005aE13512FEfD4745e2750329B6d09572Ee176:tc887fixturea"
+                .to_owned(),
+            "tinycloud:pkh:eip155:1:0x9BADDA8920399B6471BB3B89e5244964EB14Ef30:tc887fixtureb"
+                .to_owned(),
+        ];
+        for (space, (generation, id, key)) in
+            spaces.iter().zip([(1, id_1, ark_1), (2, id_2, ark_2)])
+        {
+            let wrapped = seal32(
+                &kek(&key),
+                &dek_aad(space, 1, generation, &id),
+                &random_key(),
+                random_nonce(),
+            );
+            objects.push((
+                format!("{PREFIX}dek-{}-{:010}.json", dek_tag(&ark_1, space), 1),
+                json!({
+                    "version": 1, "dek_id": 1, "generation": generation,
+                    "wrapped": standard_b64(&wrapped), "created_at": ts,
+                }),
+            ));
+        }
+        let canary = canary_fp(&ark_2, &id_2, 2);
+        let shares: Vec<ShareDoc> = (1..=3u8)
+            .map(|index| {
+                let mut payload = b"age-encryption.org/v1\n-> X25519 ".to_vec();
+                payload.extend(random_bytes(150));
+                let encoded = standard_b64(&payload);
+                let lines: Vec<&str> = encoded
+                    .as_bytes()
+                    .chunks(64)
+                    .map(|c| std::str::from_utf8(c).expect("base64 is ASCII"))
+                    .collect();
+                ShareDoc {
+                    index,
+                    holder: format!("holder-{index}"),
+                    recipient: format!("age1{}", ["q", "p", "z"][usize::from(index) - 1].repeat(58)),
+                    commitment: random_key(),
+                    ciphertext: format!(
+                        "-----BEGIN AGE ENCRYPTED FILE-----\n{}\n-----END AGE ENCRYPTED FILE-----\n",
+                        lines.join("\n")
+                    ),
+                }
+            })
+            .collect();
+        let share_json: Vec<Value> = shares
+            .iter()
+            .map(|s| {
+                json!({
+                    "index": s.index, "holder": s.holder, "recipient": s.recipient,
+                    "commitment": hex::encode(s.commitment), "ciphertext": s.ciphertext,
+                })
+            })
+            .collect();
+        let bundle = BundleDoc {
+            key: String::new(),
+            name_efp: [0; 32],
+            ark_id: id_2,
+            generation: 2,
+            canary_fp: canary,
+            shares,
+        };
+        let efp = bundle_efp(&bundle);
+        objects.push((
+            format!("{PREFIX}escrow-{}.json", hex::encode(efp)),
+            json!({
+                "version": 1, "ark_id": hex::encode(id_2), "generation": 2, "threshold": 2,
+                "canary_fp": hex::encode(canary), "shares": share_json,
+            }),
+        ));
+        let mut record = RecordDoc {
+            key: String::new(),
+            efp,
+            ark_id: id_2,
+            generation: 2,
+            canary_fp: canary,
+            verified_at: ts.to_owned(),
+            mac: [0; 32],
+        };
+        record.mac = record_mac(&ark_2, &record);
+        objects.push((
+            format!("{PREFIX}record-{}.json", hex::encode(efp)),
+            json!({
+                "version": 1, "efp": hex::encode(efp), "ark_id": hex::encode(id_2), "generation": 2,
+                "verified_indices": [1, 2, 3], "pairs": [[1, 2], [1, 3], [2, 3]],
+                "canary_fp": hex::encode(canary), "app_id": null, "compose_hash": null,
+                "verified_at": ts, "mac": hex::encode(record.mac),
+            }),
+        ));
+        Self {
+            root,
+            spaces,
+            ark_1,
+            objects,
+        }
+    }
+
+    /// The fixture's objects, the first one named with `target` edited:
+    /// `edit` changes its name and JSON, or returns raw bytes for its body.
+    fn with_edit(
+        &self,
+        target: &str,
+        edit: &dyn Fn(&mut String, &mut Value) -> Option<Vec<u8>>,
+    ) -> Vec<StoredObject> {
+        let mut edited = false;
+        let mut out = Vec::new();
+        for (key, value) in &self.objects {
+            let (mut key, mut value) = (key.clone(), value.clone());
+            let mut raw = None;
+            if !edited && key.contains(target) {
+                edited = true;
+                raw = edit(&mut key, &mut value);
+            }
+            let body = raw.unwrap_or_else(|| serde_json::to_vec(&value).expect("JSON"));
+            out.push(StoredObject { key, body });
+        }
+        assert!(edited, "no fixture object named with {target:?}");
+        out
+    }
+
+    fn check(&self, objects: &[StoredObject]) -> Vec<String> {
+        let refs: Vec<key_mirror::ObjectRef> = objects
+            .iter()
+            .map(|o| key_mirror::ObjectRef {
+                key: &o.key,
+                body: &o.body,
+            })
+            .collect();
+        key_mirror::check_snapshot("selftest", &refs, &self.root, &self.spaces)
+    }
+}
+
+/// Every bit of `sealed`, flipped one at a time, must fail to open.
+fn every_bit_flip_fails(sealed: &[u8], open: impl Fn(&[u8]) -> bool) -> bool {
+    (0..sealed.len() * 8).all(|bit| {
+        let mut flipped = sealed.to_vec();
+        flipped[bit / 8] ^= 1 << (bit % 8);
+        !open(&flipped)
+    })
+}
+
+/// Offline cross-check of the re-derived key hierarchy (ruling 5): HKDF
+/// matches RFC 5869; a sealed ARK and a wrapped DEK made with this file's
+/// reference sealing open under the right root and binding, and fail under
+/// any one-bit flip, another root, ARK id, generation, W label, space, data
+/// key id or KEK.
+#[test]
+fn selftest_key_hierarchy_reference_vectors() -> Result<()> {
+    use key_mirror::*;
+    // RFC 5869 A.3 (no salt) and A.1 (salt), first 32 bytes of the OKM.
+    ensure!(
+        hex::encode(hkdf32(None, &[0x0b; 22], b""))
+            == "8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d",
+        "HKDF-SHA256 without salt does not match RFC 5869 A.3"
+    );
+    let salt: Vec<u8> = (0x00..=0x0c).collect();
+    let info: Vec<u8> = (0xf0..=0xf9).collect();
+    ensure!(
+        hex::encode(hkdf32(Some(&salt), &[0x0b; 22], &info))
+            == "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf",
+        "HKDF-SHA256 with salt does not match RFC 5869 A.1"
+    );
+
+    let root = random_bytes(32);
+    let w = wrap_key(&root);
+    let (ark, id) = (random_key(), [7u8; 16]);
+    let sealed = seal32(&w, &seal_aad(&id, 1, W_LABEL), &ark, random_nonce());
+    ensure!(
+        sealed.len() == SEALED_LEN,
+        "a sealed ARK is nonce ‖ ct ‖ tag"
+    );
+    let opens = |w: &Key, sealed: &[u8], id: &[u8; 16], g: u32, label: &str| {
+        open32(w, &seal_aad(id, g, label), sealed) == Some(ark)
+    };
+    ensure!(
+        opens(&w, &sealed, &id, 1, W_LABEL),
+        "the sealed ARK does not open"
+    );
+    ensure!(
+        every_bit_flip_fails(&sealed, |s| opens(&w, s, &id, 1, W_LABEL)),
+        "a one-bit flip of the sealed ARK still opens"
+    );
+    ensure!(
+        !opens(&wrap_key(&random_bytes(32)), &sealed, &id, 1, W_LABEL)
+            && !opens(&w, &sealed, &[8; 16], 1, W_LABEL)
+            && !opens(&w, &sealed, &id, 2, W_LABEL)
+            && !opens(&w, &sealed, &id, 1, "tinycloud/at-rest/wrap/v2")
+            && !opens(&w, &sealed[..SEALED_LEN - 1], &id, 1, W_LABEL),
+        "the sealed ARK opens under another root, id, generation, label or length"
+    );
+
+    let space = "tinycloud:pkh:eip155:1:0x5005aE13512FEfD4745e2750329B6d09572Ee176:tc887vector";
+    let dek = random_key();
+    let k = kek(&ark);
+    let wrapped = seal32(&k, &dek_aad(space, 1, 1, &id), &dek, random_nonce());
+    let unwraps = |k: &Key, wrapped: &[u8], space: &str, dek_id: u32, g: u32, id: &[u8; 16]| {
+        open32(k, &dek_aad(space, dek_id, g, id), wrapped) == Some(dek)
+    };
+    ensure!(
+        unwraps(&k, &wrapped, space, 1, 1, &id),
+        "the wrapped DEK does not open"
+    );
+    ensure!(
+        every_bit_flip_fails(&wrapped, |s| unwraps(&k, s, space, 1, 1, &id)),
+        "a one-bit flip of the wrapped DEK still opens"
+    );
+    ensure!(
+        !unwraps(&k, &wrapped, &format!("{space}x"), 1, 1, &id)
+            && !unwraps(&k, &wrapped, space, 2, 1, &id)
+            && !unwraps(&k, &wrapped, space, 1, 2, &id)
+            && !unwraps(&k, &wrapped, space, 1, 1, &[8; 16])
+            && !unwraps(&kek(&random_key()), &wrapped, space, 1, 1, &id),
+        "the wrapped DEK opens under another space, id, generation, ARK id or KEK"
+    );
+
+    let tag = dek_tag(&ark, space);
+    ensure!(
+        tag.len() == 32
+            && lower_hex::<16>(&tag).is_some()
+            && tag == dek_tag(&ark, space)
+            && tag != dek_tag(&ark, &format!("{space}x"))
+            && tag != dek_tag(&random_key(), space),
+        "DEK mirror tags must be 32 lowercase hex, deterministic, per space and per ARK"
+    );
+    Ok(())
+}
+
+/// Offline: mirrors shaped exactly like S1's (ARK, chain, DEK, escrow bundle,
+/// verification record) pass every key-mirror rule and the content scans.
+#[test]
+fn selftest_key_mirror_accepts_s1_shaped_mirrors() -> Result<()> {
+    let fx = MirrorFixture::new();
+    let objects = fx.with_edit("ark-", &|_, _| None);
+    let findings = fx.check(&objects);
+    ensure!(
+        findings.is_empty(),
+        "S1-shaped mirrors were flagged: {findings:#?}"
+    );
+    let identities: Vec<IdentityForm> = fx.spaces.iter().flat_map(|s| identity_forms(s)).collect();
+    let fingerprints: Vec<(&str, Fingerprint)> = fingerprints(b"some value")
+        .into_iter()
+        .map(|fp| ("probe", fp))
+        .collect();
+    for object in &objects {
+        let found = content_findings(
+            object,
+            true,
+            &marker("SELFTEST"),
+            &fingerprints,
+            &identities,
+        );
+        ensure!(
+            found.is_empty(),
+            "content scan flagged {:?}: {found:?}",
+            object.key
+        );
+    }
+    // Sealed-shaped block names carry no identity.
+    for _ in 0..64 {
+        let object = StoredObject {
+            key: format!(
+                "v1/{}/{}",
+                base64::encode_config(random_bytes(16), base64::URL_SAFE_NO_PAD),
+                base64::encode_config(random_bytes(32), base64::URL_SAFE_NO_PAD)
+            ),
+            body: random_bytes(64),
+        };
+        let found = content_findings(&object, false, "TC887-X", &fingerprints, &identities);
+        ensure!(
+            found.is_empty(),
+            "a sealed-shaped name was flagged: {found:?}"
+        );
+    }
+    Ok(())
+}
+
+type MirrorEdit = Box<dyn Fn(&mut String, &mut Value) -> Option<Vec<u8>>>;
+
+fn name_edit(f: impl Fn(&str) -> String + 'static) -> MirrorEdit {
+    Box::new(move |key, _| {
+        *key = f(key);
+        None
+    })
+}
+
+fn body_edit(f: impl Fn(&mut Value) + 'static) -> MirrorEdit {
+    Box::new(move |_, value| {
+        f(value);
+        None
+    })
+}
+
+fn set(field: &'static str, to: Value) -> MirrorEdit {
+    body_edit(move |value| value[field] = to.clone())
+}
+
+fn raw_body(f: impl Fn() -> Vec<u8> + 'static) -> MirrorEdit {
+    Box::new(move |_, _| Some(f()))
+}
+
+/// The 32 hex characters after `dek-` in a DEK mirror name.
+fn dek_tag_in(name: &str) -> String {
+    name.split("/dek-").nth(1).unwrap_or_default()[..32].to_owned()
+}
+
+/// Offline negative cases (ruling 6): every bypass the review listed and
+/// every rule, each on an otherwise S1-shaped mirror set, must be flagged
+/// with the expected finding.
+#[test]
+fn selftest_key_mirror_flags_every_bypass() -> Result<()> {
+    let fx = MirrorFixture::new();
+    let raw = random_key();
+    let hex_key = hex::encode(raw);
+    let b64 = |config| base64::encode_config(raw, config);
+    let spaced: String = hex_key
+        .as_bytes()
+        .chunks(8)
+        .map(|c| std::str::from_utf8(c).expect("hex"))
+        .collect::<Vec<_>>()
+        .join(" \n");
+    let other_space = "tinycloud:pkh:eip155:1:0x0000000000000000000000000000000000000001:other";
+    let other_tag = key_mirror::dek_tag(&fx.ark_1, other_space);
+    let second_tag = key_mirror::dek_tag(&fx.ark_1, &fx.spaces[1]);
+    let flip_b64 = |field: &'static str| {
+        body_edit(move |value| {
+            let mut bytes = base64::decode(value[field].as_str().expect("string")).expect("b64");
+            bytes[20] ^= 1;
+            value[field] = json!(standard_b64(&bytes));
+        })
+    };
+    let raw_plus_junk = |field: &'static str| {
+        let mut bytes = raw.to_vec();
+        bytes.extend(random_bytes(28));
+        set(field, json!(standard_b64(&bytes)))
+    };
+    let cases: Vec<(&str, &str, MirrorEdit, &str)> = vec![
+        // Ruling 1/2: names.
+        (
+            "unknown _tc/ object",
+            "dek-",
+            name_edit(|_| "_tc/other/blob".into()),
+            "not an allowed mirror name",
+        ),
+        (
+            "unknown at-rest kind",
+            "dek-",
+            name_edit(|_| "_tc/at-rest/zzz.json".into()),
+            "not an allowed mirror name",
+        ),
+        (
+            "uppercase kind",
+            "dek-",
+            name_edit(|k| k.replace("/dek-", "/DEK-")),
+            "not an allowed mirror name",
+        ),
+        (
+            "uppercase tag",
+            "dek-",
+            name_edit(|k| k.replace(&dek_tag_in(k), &dek_tag_in(k).to_uppercase())),
+            "not an allowed mirror name",
+        ),
+        (
+            "31-hex tag",
+            "dek-",
+            name_edit(|k| k.replace(&dek_tag_in(k), &dek_tag_in(k)[1..])),
+            "not an allowed mirror name",
+        ),
+        (
+            "9-digit dek id",
+            "dek-",
+            name_edit(|k| k.replace("-0000000001.json", "-000000001.json")),
+            "not an allowed mirror name",
+        ),
+        (
+            "11-digit dek id",
+            "dek-",
+            name_edit(|k| k.replace("-0000000001.json", "-00000000001.json")),
+            "not an allowed mirror name",
+        ),
+        (
+            "dek id 0",
+            "dek-",
+            name_edit(|k| k.replace("-0000000001.json", "-0000000000.json")),
+            "not an allowed mirror name",
+        ),
+        (
+            "suffix .JSON",
+            "dek-",
+            name_edit(|k| k.replace(".json", ".JSON")),
+            "not an allowed mirror name",
+        ),
+        (
+            "suffix .json.bak",
+            "dek-",
+            name_edit(|k| format!("{k}.bak")),
+            "not an allowed mirror name",
+        ),
+        (
+            "extra name part",
+            "dek-",
+            name_edit(|k| k.replace(".json", "-x.json")),
+            "not an allowed mirror name",
+        ),
+        (
+            "double slash",
+            "dek-",
+            name_edit(|k| k.replace("at-rest/", "at-rest//")),
+            "not an allowed mirror name",
+        ),
+        (
+            "9-digit generation",
+            "ark-0000000002",
+            name_edit(|k| k.replace("ark-0000000002", "ark-000000002")),
+            "not an allowed mirror name",
+        ),
+        (
+            "uppercase ark id",
+            "ark-0000000002",
+            name_edit(|k| k.replace("02020202", "0202020A")),
+            "not an allowed mirror name",
+        ),
+        (
+            "63-hex efp",
+            "escrow-",
+            name_edit(|k| format!("{}.json", &k[..k.len() - 6])),
+            "not an allowed mirror name",
+        ),
+        (
+            "uppercase record efp",
+            "record-",
+            name_edit(|k| {
+                let (head, efp) = k.split_at(k.len() - 69);
+                format!(
+                    "{head}{}.json",
+                    efp.trim_end_matches(".json").to_uppercase()
+                )
+            }),
+            "not an allowed mirror name",
+        ),
+        // Ruling 3: exact typed schemas.
+        (
+            "not JSON",
+            "dek-",
+            raw_body(|| random_bytes(80)),
+            "not JSON",
+        ),
+        (
+            "JSON array",
+            "dek-",
+            body_edit(|v| *v = json!([1, 2, 3])),
+            "where an object is required",
+        ),
+        (
+            "extra field",
+            "dek-",
+            set("note", json!("x")),
+            "fields must be exactly",
+        ),
+        (
+            "missing field",
+            "dek-",
+            body_edit(|v| {
+                v.as_object_mut().expect("object").remove("created_at");
+            }),
+            "fields must be exactly",
+        ),
+        (
+            "version as string",
+            "dek-",
+            set("version", json!("1")),
+            "`version` must be the integer 1",
+        ),
+        (
+            "version as float",
+            "dek-",
+            set("version", json!(1.0)),
+            "`version` must be the integer 1",
+        ),
+        (
+            "version 2",
+            "dek-",
+            set("version", json!(2)),
+            "`version` must be the integer 1",
+        ),
+        (
+            "dek_id as string",
+            "dek-",
+            set("dek_id", json!("1")),
+            "`dek_id` must be an integer",
+        ),
+        (
+            "negative generation",
+            "dek-",
+            set("generation", json!(-1)),
+            "`generation` must be an integer",
+        ),
+        (
+            "generation over u32",
+            "dek-",
+            set("generation", json!(4_294_967_296u64)),
+            "`generation` must be an integer",
+        ),
+        (
+            "created_at as integer",
+            "dek-",
+            set("created_at", json!(123)),
+            "strict RFC 3339",
+        ),
+        (
+            "created_at free text",
+            "dek-",
+            set("created_at", json!("yesterday")),
+            "strict RFC 3339",
+        ),
+        (
+            "created_at with a space",
+            "dek-",
+            set("created_at", json!("2026-10-17 10:00:00Z")),
+            "strict RFC 3339",
+        ),
+        (
+            "created_at lowercase",
+            "dek-",
+            set("created_at", json!("2026-10-17t10:00:00z")),
+            "strict RFC 3339",
+        ),
+        (
+            "created_at 10 fraction digits",
+            "dek-",
+            set("created_at", json!("2026-10-17T10:00:00.1234567890Z")),
+            "strict RFC 3339",
+        ),
+        (
+            "created_at month 13",
+            "dek-",
+            set("created_at", json!("2026-13-17T10:00:00Z")),
+            "strict RFC 3339",
+        ),
+        (
+            "created_at as object",
+            "dek-",
+            set("created_at", json!({})),
+            "strict RFC 3339",
+        ),
+        (
+            "version as array",
+            "dek-",
+            set("version", json!([1])),
+            "`version` must be the integer 1",
+        ),
+        (
+            "wrapped as int array",
+            "dek-",
+            set("wrapped", json!(vec![7u8; 60])),
+            "canonical padded base64",
+        ),
+        (
+            "wrapped base64url",
+            "dek-",
+            set(
+                "wrapped",
+                json!(base64::encode_config([0xffu8; 60], base64::URL_SAFE)),
+            ),
+            "canonical padded base64",
+        ),
+        (
+            "wrapped with a newline",
+            "dek-",
+            body_edit(|v| {
+                let s = v["wrapped"].as_str().expect("string").to_owned();
+                v["wrapped"] = json!(format!("{}\n{}", &s[..40], &s[40..]));
+            }),
+            "canonical padded base64",
+        ),
+        (
+            "wrapped 59 bytes",
+            "dek-",
+            set("wrapped", json!(standard_b64(&random_bytes(59)))),
+            "canonical padded base64",
+        ),
+        (
+            "wrapped 61 bytes",
+            "dek-",
+            set("wrapped", json!(standard_b64(&random_bytes(61)))),
+            "canonical padded base64",
+        ),
+        (
+            "ARK w_label v2",
+            "ark-0000000002",
+            set("w_label", json!("tinycloud/at-rest/wrap/v2")),
+            "`w_label` must be the string",
+        ),
+        (
+            "ARK generation differs from its name",
+            "ark-0000000002",
+            set("generation", json!(3)),
+            "differ from the object name",
+        ),
+        (
+            "escrow extra share field",
+            "escrow-",
+            body_edit(|v| v["shares"][0]["note"] = json!("x")),
+            "fields must be exactly",
+        ),
+        (
+            "escrow holder charset",
+            "escrow-",
+            body_edit(|v| v["shares"][1]["holder"] = json!("Sam!")),
+            "1-32 characters",
+        ),
+        (
+            "escrow ciphertext not armor",
+            "escrow-",
+            body_edit(|v| v["shares"][2]["ciphertext"] = json!("hello")),
+            "ASCII-armored age file",
+        ),
+        (
+            "escrow two shares",
+            "escrow-",
+            body_edit(|v| {
+                v["shares"].as_array_mut().expect("array").pop();
+            }),
+            "array of 3 share objects",
+        ),
+        (
+            "record app_id",
+            "record-",
+            set("app_id", json!("app")),
+            "null (no TEE)",
+        ),
+        (
+            "record pairs",
+            "record-",
+            set("pairs", json!([[1, 2]])),
+            "`pairs` must be",
+        ),
+        // Ruling 3: raw-key scan, as an extra field and as a JSON key.
+        (
+            "raw key, lowercase hex",
+            "dek-",
+            set("k", json!(hex_key)),
+            "decodes to 32 bytes",
+        ),
+        (
+            "raw key, uppercase hex",
+            "dek-",
+            set("k", json!(hex_key.to_uppercase())),
+            "decodes to 32 bytes",
+        ),
+        (
+            "raw key, 0x hex",
+            "dek-",
+            set("k", json!(format!("0x{hex_key}"))),
+            "decodes to 32 bytes",
+        ),
+        (
+            "raw key, whitespace-split hex",
+            "dek-",
+            set("k", json!(spaced)),
+            "decodes to 32 bytes",
+        ),
+        (
+            "raw key, base64",
+            "dek-",
+            set("k", json!(b64(base64::STANDARD))),
+            "decodes to 32 bytes",
+        ),
+        (
+            "raw key, base64 unpadded",
+            "dek-",
+            set("k", json!(b64(base64::STANDARD_NO_PAD))),
+            "decodes to 32 bytes",
+        ),
+        (
+            "raw key, base64url",
+            "dek-",
+            set("k", json!(b64(base64::URL_SAFE))),
+            "decodes to 32 bytes",
+        ),
+        (
+            "raw key, base64url unpadded",
+            "dek-",
+            set("k", json!(b64(base64::URL_SAFE_NO_PAD))),
+            "decodes to 32 bytes",
+        ),
+        (
+            "raw key, base64: prefix",
+            "dek-",
+            set("k", json!(format!("base64:{}", b64(base64::STANDARD)))),
+            "decodes to 32 bytes",
+        ),
+        (
+            "raw key, data URL",
+            "dek-",
+            set(
+                "k",
+                json!(format!(
+                    "data:application/octet-stream;base64,{}",
+                    b64(base64::STANDARD)
+                )),
+            ),
+            "decodes to 32 bytes",
+        ),
+        (
+            "raw key as a JSON key",
+            "dek-",
+            body_edit(move |v| v[hex::encode(raw)] = json!(1)),
+            "a JSON key in `/` decodes to 32 bytes",
+        ),
+        (
+            "raw key as 32 ints",
+            "dek-",
+            set("k", json!(raw.to_vec())),
+            "array of 32 byte values",
+        ),
+        (
+            "raw key split 16+16",
+            "dek-",
+            body_edit(move |v| {
+                v["a"] = json!(hex::encode(&raw[..16]));
+                v["b"] = json!(base64::encode(&raw[16..]));
+            }),
+            "16 bytes each",
+        ),
+        // Ruling 5: authenticity under the harness root.
+        (
+            "wrapped = raw key + 28 junk bytes",
+            "dek-",
+            raw_plus_junk("wrapped"),
+            "does not authenticate",
+        ),
+        (
+            "wrapped, one bit flipped",
+            "dek-",
+            flip_b64("wrapped"),
+            "does not authenticate",
+        ),
+        (
+            "sealed ARK = raw key + 28 junk bytes",
+            "ark-0000000002",
+            raw_plus_junk("sealed"),
+            "does not authenticate",
+        ),
+        (
+            "sealed ARK, one bit flipped",
+            "ark-0000000001",
+            flip_b64("sealed"),
+            "does not authenticate",
+        ),
+        (
+            "ARK chain, one bit flipped",
+            "ark-0000000001",
+            flip_b64("chain"),
+            "chain does not open",
+        ),
+        (
+            "older ARK without chain",
+            "ark-0000000001",
+            set("chain", Value::Null),
+            "has no chain",
+        ),
+        (
+            "newest ARK with a chain",
+            "ark-0000000002",
+            body_edit(|v| v["chain"] = json!(standard_b64(&random_bytes(60)))),
+            "newest generation has a chain",
+        ),
+        (
+            "DEK moved to another space's tag",
+            "dek-",
+            name_edit(move |k| k.replace(&dek_tag_in(k), &second_tag)),
+            "does not authenticate",
+        ),
+        (
+            "DEK tagged for an unknown space",
+            "dek-",
+            name_edit(move |k| k.replace(&dek_tag_in(k), &other_tag)),
+            "belongs to none of",
+        ),
+        (
+            "DEK under a generation without ARK",
+            "dek-",
+            set("generation", json!(3)),
+            "no authentic ARK",
+        ),
+        (
+            "escrow canary_fp",
+            "escrow-",
+            set("canary_fp", json!(hex::encode(random_key()))),
+            "canary_fp is not",
+        ),
+        (
+            "escrow name EFP",
+            "escrow-",
+            name_edit(|_| {
+                format!(
+                    "{}escrow-{}.json",
+                    key_mirror::PREFIX,
+                    hex::encode(random_key())
+                )
+            }),
+            "name's EFP is not the bundle's fingerprint",
+        ),
+        (
+            "record MAC",
+            "record-",
+            body_edit(|v| v["mac"] = json!(hex::encode(random_key()))),
+            "MAC does not verify",
+        ),
+        (
+            "record without its bundle",
+            "record-",
+            body_edit(|v| v["efp"] = json!(hex::encode(random_key()))),
+            "no mirrored escrow bundle",
+        ),
+    ];
+    let mut missed = Vec::new();
+    for (what, target, edit, expected) in &cases {
+        let findings = fx.check(&fx.with_edit(target, edit.as_ref()));
+        if !findings.iter().any(|f| f.contains(expected)) {
+            missed.push(format!("{what}: expected {expected:?}, got {findings:?}"));
+        }
+    }
+    ensure!(
+        missed.is_empty(),
+        "key-mirror check missed:\n{}",
+        missed.join("\n")
+    );
+
+    // Ruling 4: each identity form of each space, in an object name and (for
+    // a mirror) in its body.
+    let fingerprints: Vec<(&str, Fingerprint)> = fingerprints(b"the probe value")
+        .into_iter()
+        .map(|fp| ("probe", fp))
+        .collect();
+    let identities: Vec<IdentityForm> = fx.spaces.iter().flat_map(|s| identity_forms(s)).collect();
+    for form in &identities {
+        for (key, body, scan_body) in [
+            (format!("v1/x{}y/z", form.text), Vec::new(), false),
+            (
+                "_tc/at-rest/zzz.json".to_owned(),
+                json!({"note": format!("x{}y", form.text)})
+                    .to_string()
+                    .into_bytes(),
+                true,
+            ),
+        ] {
+            let object = StoredObject { key, body };
+            let found = content_findings(&object, scan_body, "TC887-X", &fingerprints, &identities);
+            ensure!(
+                found
+                    .iter()
+                    .any(|f| f.contains("space identity") && f.contains(&form.label)),
+                "identity form {:?} was missed: {found:?}",
+                form.label
+            );
+        }
+    }
+    // Ruling 1: a marker or a fingerprint inside a mirror.
+    let marker = marker("SELFTEST");
+    for (what, note) in [
+        ("marker", format!("value {marker}")),
+        ("fingerprint", fingerprints[0].1.text.clone()),
+        ("hex fingerprint", fingerprints[4].1.text.to_uppercase()),
+    ] {
+        let objects = fx.with_edit("dek-", &|_, v| {
+            v["note"] = json!(note);
+            None
+        });
+        let object = objects
+            .iter()
+            .find(|o| o.key.contains("dek-"))
+            .expect("dek");
+        let found = content_findings(object, true, &marker, &fingerprints, &identities);
+        ensure!(
+            found
+                .iter()
+                .any(|f| f.contains("plaintext marker") || f.contains("plaintext fingerprint")),
+            "a {what} inside a mirror was missed: {found:?}"
         );
     }
     Ok(())
