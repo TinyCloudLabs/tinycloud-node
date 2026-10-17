@@ -64,6 +64,11 @@ sha3 = "0.10"
 k256 = "0.13"
 # TC-887: zeroize at-rest key material on drop.
 zeroize = "1"
+# TC-887 S1: at-rest key hierarchy and escrow.
+hkdf = "0.12"
+lru = "0.12"
+parking_lot = "0.12"
+tinycloud-at-rest-escrow = { path = "../tinycloud-at-rest-escrow" }
 prometheus = { version = "0.13.0", features = ["process"] }
 ryu-js = "0.2.2"
 # W1 (audit P1): full Unicode NFC normalization for policy capability path
@@ -75,4 +80,6 @@ unicode-normalization = "0.1"
 sea-orm = { version = "1.1", features = ["runtime-tokio-rustls", "sqlx-sqlite"] }
 async-std = { version = "1", features = ["attributes"] }
 tokio.workspace = true
+# Holder-side decryption of escrow shares in the at-rest keyring tests.
+age = { version = "=0.12.1", default-features = false, features = ["armor"] }
 iri-string.workspace = true
