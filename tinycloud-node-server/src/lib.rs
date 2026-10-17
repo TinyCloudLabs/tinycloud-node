@@ -650,7 +650,7 @@ pub async fn app_with_control(
     // it; the keyring is installed after migrations (`at_rest::setup`).
     let at_rest_runtime = at_rest::AtRestRuntime::new(&tinycloud_config.at_rest);
     let mut blocks = tinycloud_config.storage.blocks.open().await?;
-    storage::attach_at_rest(&mut blocks, at_rest_runtime.clone())?;
+    storage::attach_at_rest(&mut blocks, at_rest_runtime.clone());
 
     let tinycloud = TinyCloud::new_with_encryption(
         database_connection,

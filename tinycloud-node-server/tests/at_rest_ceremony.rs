@@ -191,17 +191,19 @@ async fn ceremony_gate_and_recovery_through_the_app() {
     );
     drop(client);
 
-    // No seal path in this build: encrypt and strict are refused at boot,
-    // even with the escrow pinned and verified, so nothing ever claims to
-    // encrypt while storage writes plaintext.
+    // The FileSystem store seals every write: with the escrow pinned and
+    // verified, encrypt and strict boot and encrypt.
     for mode in ["encrypt", "strict"] {
-        let err = refused(
+        let client = app(
             dir.path(),
             1,
             json!({"mode": mode, "escrow": escrow(Some(&efp))}),
         )
-        .await;
-        assert!(err.contains("no at-rest seal path"), "{err}");
+        .await
+        .unwrap();
+        let (_, st) = get_json(&client, "/at-rest/status").await;
+        assert_eq!(st["encrypting"], json!(true), "{mode}");
+        drop(client);
     }
 
     // Pinned and verified, mode off: the gate passes, nothing is encrypted.
@@ -358,15 +360,6 @@ async fn misconfigurations_are_refused_at_boot() {
     )
     .await;
     assert!(err.contains("not both"), "{err}");
-    // No seal path: encrypt is refused even on a self-hosted Static root
-    // that acknowledges having no escrow.
-    let err = refused(
-        dir.path(),
-        1,
-        json!({"mode": "encrypt", "escrow_none": true}),
-    )
-    .await;
-    assert!(err.contains("no at-rest seal path"), "{err}");
     // Unknown keys in the section are refused, not ignored.
     refused(dir.path(), 1, json!({"escrow_nonee": true})).await;
 }
