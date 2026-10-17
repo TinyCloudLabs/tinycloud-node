@@ -730,9 +730,10 @@ mod tests {
     }
 
     fn disabled_fairing() -> TracingFairing {
-        let mut cfg = config::Tracing::default();
-        cfg.enabled = false;
-        TracingFairing::for_test(&cfg)
+        TracingFairing::for_test(&config::Tracing {
+            enabled: false,
+            ..Default::default()
+        })
     }
 
     /// Regression test for TC-286: unmatched requests must collapse into a

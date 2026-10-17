@@ -544,6 +544,17 @@ fn sign_in(node: &Node, account: &Account) -> Result<Session> {
                     ],
                 )]),
             ),
+            #[cfg(feature = "duckdb")]
+            (
+                "duckdb".parse()?,
+                HashMap::from([(
+                    DATABASE.parse()?,
+                    vec![
+                        "tinycloud.duckdb/read".parse()?,
+                        "tinycloud.duckdb/admin".parse()?,
+                    ],
+                )]),
+            ),
         ]),
         space_abilities: None,
         raw_abilities: HashMap::new(),
@@ -932,5 +943,64 @@ fn concurrent_authenticated_requests_keep_metrics_and_pseudonyms_scoped() -> Res
         });
     }
     node.finish(&[&accounts[0], &accounts[1]]);
+    Ok(())
+}
+
+#[cfg(feature = "duckdb")]
+#[test]
+fn native_duckdb_requests_keep_scoped_fields_and_independent_db_timings() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    std::fs::write(root.path().join("isolated.toml"), "# Native DuckDB fixture\n")?;
+    let quota = QuotaStub::start();
+    let mut node = Node::start(root.path(), 0, "trace", &quota.url);
+    let account = Account::new(61)?;
+    let session = sign_in(&node, &account)?;
+
+    let version = node.request("GET", "/version", None, None, None);
+    assert_eq!(version.status, 200);
+    assert_eq!(version.event["query_count"], 0);
+    assert_eq!(version.event["query_time_ms"], 0.0);
+    assert_eq!(version.event["pool_wait_ms"], 0.0);
+
+    // Diagnostic policy is covered by the separate TC-1304 suite. This request
+    // proves node telemetry uses independent call-boundary instrumentation.
+    let body = json!({
+        "action":"query",
+        "sql":format!("SELECT '{LITERAL}' AS literal, ? AS parameter"),
+        "params":[PARAM],
+    })
+    .to_string();
+    let incoming = Uuid::new_v4().to_string().to_ascii_uppercase();
+    let selected = node.invoke(
+        &session,
+        "duckdb",
+        DATABASE,
+        "tinycloud.duckdb/read",
+        Some(&body),
+        Some(&incoming),
+    );
+    assert_eq!(selected.status, 200, "native query: {}", selected.body);
+    assert_eq!(selected.id, incoming.to_ascii_lowercase());
+    assert_eq!(selected.event["request_id_replaced"], false);
+    let result: Value = serde_json::from_str(&selected.body)?;
+    assert_eq!(result["rows"][0], json!([LITERAL, PARAM]));
+    check_authenticated(&selected, &account);
+
+    let body = json!({
+        "action":"query",
+        "sql":format!("SELECT '{LITERAL}' FROM {TABLE}"),
+        "params":[],
+    }).to_string();
+    let failed = node.invoke(
+        &session,
+        "duckdb",
+        DATABASE,
+        "tinycloud.duckdb/read",
+        Some(&body),
+        None,
+    );
+    assert!(failed.status >= 400);
+    check_authenticated(&failed, &account);
+    node.finish(&[&account]);
     Ok(())
 }

@@ -36,17 +36,18 @@ fn scope_restores_nested_and_pending_context() {
         let outer = Arc::new(Metrics::default());
         let inner = Arc::new(Metrics::default());
         let _outer = enter(Some(Arc::clone(&outer)));
-        let mut pending = std::pin::pin!(scope(Arc::clone(&inner), async {
-            assert!(Arc::ptr_eq(&current().unwrap(), &inner));
-            std::future::pending::<()>().await;
-        }));
-        poll_fn(|cx| {
-            assert!(pending.as_mut().poll(cx).is_pending());
-            assert!(Arc::ptr_eq(&current().unwrap(), &outer));
-            Poll::Ready(())
-        })
-        .await;
-        drop(pending);
+        {
+            let mut pending = std::pin::pin!(scope(Arc::clone(&inner), async {
+                assert!(Arc::ptr_eq(&current().unwrap(), &inner));
+                std::future::pending::<()>().await;
+            }));
+            poll_fn(|cx| {
+                assert!(pending.as_mut().poll(cx).is_pending());
+                assert!(Arc::ptr_eq(&current().unwrap(), &outer));
+                Poll::Ready(())
+            })
+            .await;
+        }
         assert!(Arc::ptr_eq(&current().unwrap(), &outer));
         {
             let _clear = enter(None);
