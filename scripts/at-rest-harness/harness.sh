@@ -620,11 +620,15 @@ cmd_test() {
   local flipped=()
   ((kv_red)) || flipped+=(KV)
   ((sql_red)) || flipped+=(SQL)
-  annotate error "RED checks UNEXPECTEDLY PASSED for ${flipped[*]}: the at-rest property now holds there; run with --expect green (or set TC887_AT_REST_MODE) and update CI"
+  annotate error "$kind checks UNEXPECTEDLY PASSED under --expect red (no TC-887 RED finding for ${flipped[*]}): the at-rest property holds there; run with --expect green (or set TC887_AT_REST_MODE) and update CI"
   return 3
 }
 
-cmd_status() { cat "$(resolve_state "${1:-}")"; }
+cmd_status() {
+  local state
+  state=$(resolve_state "${1:-}")
+  cat "$state"
+}
 
 cmd_logs() {
   local state run f
