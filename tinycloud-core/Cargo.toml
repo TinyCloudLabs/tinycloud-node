@@ -58,6 +58,8 @@ base64.workspace = true
 sha2 = "0.10"
 sha3 = "0.10"
 k256 = "0.13"
+# TC-887: zeroize at-rest key material on drop.
+zeroize = "1"
 prometheus = { version = "0.13.0", features = ["process"] }
 ryu-js = "0.2.2"
 # W1 (audit P1): full Unicode NFC normalization for policy capability path
