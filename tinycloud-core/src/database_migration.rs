@@ -140,8 +140,8 @@ fn fingerprint_sqlite(path: &Path) -> Result<ArtifactFingerprint, MigrationError
 
 #[cfg(feature = "duckdb")]
 fn fingerprint_duckdb(path: &Path) -> Result<ArtifactFingerprint, MigrationError> {
-    let db =
-        duckdb::Connection::open(path).map_err(|e| MigrationError::Checkpoint(e.to_string()))?;
+    let db = crate::duckdb::storage::open_offline_connection(path)
+        .map_err(|e| MigrationError::Checkpoint(e.to_string()))?;
     let mut statement = db.prepare("SELECT table_schema, table_name FROM information_schema.tables WHERE table_type='BASE TABLE' AND table_schema NOT IN ('information_schema', 'pg_catalog') ORDER BY table_schema, table_name")
         .map_err(|e| MigrationError::Checkpoint(e.to_string()))?;
     let names: Vec<(String, String)> = statement
@@ -339,6 +339,8 @@ async fn offline_fingerprint<C: ConnectionTrait>(
 
 /// Full schema and row-count inspection is limited to an operator-designated
 /// local snapshot. The caller must enforce that boundary before invoking it.
+/// DuckDB snapshots undergo the same locked native policy and stored-code audit
+/// as node connections, while retaining the offline tool's native memory default.
 pub async fn offline_inventory(
     conn: &DatabaseConnection,
     datadir: &Path,
@@ -1242,6 +1244,8 @@ pub async fn quarantined(
 /// Checkpoint every local cache with the node stopped. Artifact rows and
 /// their durable checkpoint/delta columns are untouched. Built without the
 /// `duckdb` feature, this refuses a directory containing DuckDB files.
+/// DuckDB caches must pass the node's native policy and stored-code audit before
+/// checkpointing; the tool preserves DuckDB's native default memory limit.
 pub fn checkpoint_cache(datadir: &Path) -> Result<(usize, usize), MigrationError> {
     let mut sqlite_count = 0;
     #[cfg(feature = "duckdb")]
@@ -1277,7 +1281,7 @@ pub fn checkpoint_cache(datadir: &Path) -> Result<(usize, usize), MigrationError
                 } else {
                     #[cfg(feature = "duckdb")]
                     {
-                        let db = duckdb::Connection::open(entry.path())
+                        let db = crate::duckdb::storage::open_offline_connection(&entry.path())
                             .map_err(|e| MigrationError::Checkpoint(e.to_string()))?;
                         db.execute_batch("CHECKPOINT;")
                             .map_err(|e| MigrationError::Checkpoint(e.to_string()))?;

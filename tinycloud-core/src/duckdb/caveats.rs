@@ -6,10 +6,12 @@ use std::collections::BTreeMap;
 pub struct DuckDbCaveats {
     pub tables: Option<Vec<String>>,
     pub columns: Option<Vec<String>>,
+    /// Named SQL templates; each execution still requires the appropriate ability.
     pub statements: Option<Vec<PreparedStatement>>,
     pub read_only: Option<bool>,
 }
 
+/// A named SQL template, not an additional capability grant.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreparedStatement {
     pub name: String,
@@ -48,10 +50,6 @@ impl DuckDbCaveats {
 
     pub fn find_statement(&self, name: &str) -> Option<&PreparedStatement> {
         self.statements.as_ref()?.iter().find(|s| s.name == name)
-    }
-
-    pub fn find_statement_by_sql(&self, sql: &str) -> Option<&PreparedStatement> {
-        self.statements.as_ref()?.iter().find(|s| s.sql == sql)
     }
 }
 
@@ -140,22 +138,5 @@ mod tests {
         };
         assert!(c.find_statement("get_users").is_some());
         assert!(c.find_statement("nonexistent").is_none());
-    }
-
-    #[test]
-    fn test_find_statement_by_sql() {
-        let c = DuckDbCaveats {
-            tables: None,
-            columns: None,
-            statements: Some(vec![PreparedStatement {
-                name: "special".to_string(),
-                sql: "COPY users TO 'file.csv'".to_string(),
-            }]),
-            read_only: None,
-        };
-        assert!(c
-            .find_statement_by_sql("COPY users TO 'file.csv'")
-            .is_some());
-        assert!(c.find_statement_by_sql("DROP TABLE users").is_none());
     }
 }
