@@ -458,6 +458,16 @@ impl MemoryMirror {
         self.unreadable.lock().insert(name.to_owned());
     }
 
+    /// Make reads of an existing object fail (a transient error on a
+    /// genuine object), or work again with `false`.
+    pub fn set_unreadable(&self, name: &str, unreadable: bool) {
+        if unreadable {
+            self.unreadable.lock().insert(name.to_owned());
+        } else {
+            self.unreadable.lock().remove(name);
+        }
+    }
+
     pub fn names(&self) -> Vec<String> {
         self.objects.lock().keys().cloned().collect()
     }

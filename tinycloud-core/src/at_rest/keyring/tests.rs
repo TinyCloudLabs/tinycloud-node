@@ -66,6 +66,7 @@ fn config(h: &Holders, pinned: Option<Efp>) -> KeyringConfig {
         app_id: Some("app".into()),
         compose_hash: Some("compose".into()),
         require_mirror: true,
+        allow_resplit_before_verify: false,
     }
 }
 
@@ -1225,19 +1226,119 @@ async fn a_mirrored_data_key_for_another_space_is_never_stored() {
     let copied = mirror.get(&a_name).await.unwrap().unwrap();
     mirror.put(&b_name, copied.clone()).await.unwrap();
 
-    // It doesn't authenticate for space-b: not stored, not served, replaced.
-    assert!(matches!(
-        k.key("space-b", DekId::new(1)).await,
-        Err(DataKeyError::UnknownKey { .. })
-    ));
+    // It doesn't authenticate for space-b: never stored, never replaced,
+    // and space-b fails closed rather than getting a new key over it.
+    let unavailable = |r: Result<DataKey, DataKeyError>| {
+        matches!(r, Err(DataKeyError::Backend(e))
+            if matches!(e.downcast_ref::<AtRestError>(), Some(AtRestError::DekUnavailable(_))))
+    };
+    assert!(unavailable(k.key("space-b", DekId::new(1)).await));
+    assert!(unavailable(k.current_key("space-b").await));
     assert!(AtRestStore::new(db.clone())
         .dek("space-b", 1)
         .await
         .unwrap()
         .is_none());
-    let b = k.current_key("space-b").await.unwrap();
-    assert_ne!(b.bytes(), a.bytes());
-    assert_ne!(mirror.get(&b_name).await.unwrap().unwrap(), copied);
+    assert_eq!(mirror.get(&b_name).await.unwrap().unwrap(), copied);
+    assert_eq!(k.current_key("space-a").await.unwrap().bytes(), a.bytes());
+}
+
+/// The round-3 correctness probe D1: a restore before generation 2, plus
+/// one failed read of the genuine generation-2 object at boot, used to
+/// replace space-x's data key and overwrite its only copy.
+#[tokio::test]
+async fn a_mirrored_data_key_under_an_unloaded_generation_is_never_replaced() {
+    let (db, mirror, h) = (db().await, Arc::new(MemoryMirror::default()), holders());
+    let k = open(&db, &mirror, &ROOT, config(&h, None)).await.unwrap();
+    k.rotate_ark().await.unwrap();
+    let original = k.current_key("space-x").await.unwrap();
+    let keys = k.keys().unwrap();
+    let dek_name = dek_mirror_name(&keys.dek_tag.tag("space-x"), 1);
+    let gen2 = AtRestStore::new(db.clone()).keys().await.unwrap()[1].clone();
+    let gen2_name = ark_mirror_name(2, &hex::encode(&gen2.ark_id));
+    drop((k, keys));
+    let mirrored = mirror.get(&dek_name).await.unwrap().unwrap();
+
+    // The restore: generation 2, its escrow and space-x's DEK row are gone.
+    at_rest_key::Entity::delete_by_id(2)
+        .exec(&db)
+        .await
+        .unwrap();
+    at_rest_escrow::Entity::delete_many()
+        .filter(at_rest_escrow::Column::Generation.eq(2))
+        .exec(&db)
+        .await
+        .unwrap();
+    space_data_key::Entity::delete_many()
+        .exec(&db)
+        .await
+        .unwrap();
+    // One boot where the genuine generation-2 object can't be read.
+    mirror.set_unreadable(&gen2_name, true);
+    let k = open(&db, &mirror, &ROOT, config(&h, None)).await.unwrap();
+    assert_eq!(k.keys().unwrap().newest().0, 1);
+    for _ in 0..2 {
+        assert!(matches!(
+            k.current_key("space-x").await,
+            Err(DataKeyError::Backend(e))
+                if matches!(e.downcast_ref::<AtRestError>(), Some(AtRestError::DekUnavailable(why)) if why.contains("hasn't loaded"))
+        ));
+    }
+    assert_eq!(mirror.get(&dek_name).await.unwrap().unwrap(), mirrored);
+    assert!(space_data_key::Entity::find()
+        .all(&db)
+        .await
+        .unwrap()
+        .is_empty());
+    drop(k);
+
+    // The object is readable again: generation 2 and the original key are back.
+    mirror.set_unreadable(&gen2_name, false);
+    let k = open(&db, &mirror, &ROOT, config(&h, None)).await.unwrap();
+    assert_eq!(k.keys().unwrap().newest().0, 2);
+    assert_eq!(
+        k.current_key("space-x").await.unwrap().bytes(),
+        original.bytes()
+    );
+}
+
+#[tokio::test]
+async fn a_wrong_holder_can_be_fixed_only_before_the_ceremony_and_any_sealing() {
+    let (db, mirror, h) = (db().await, Arc::new(MemoryMirror::default()), holders());
+    let wrong = open(&db, &mirror, &ROOT, config(&h, None)).await.unwrap();
+    let first = wrong.escrow_view().await.unwrap().unwrap().efp;
+    drop(wrong);
+    let fixed = holders();
+    let allow = |h: &Holders| KeyringConfig {
+        allow_resplit_before_verify: true,
+        ..config(h, None)
+    };
+    // Without the flag a holder change is refused, as before.
+    assert!(matches!(
+        open(&db, &mirror, &ROOT, config(&fixed, None)).await,
+        Err(AtRestError::EscrowHoldersChanged)
+    ));
+    // With it, unverified and nothing sealed: re-split for the new holders.
+    let k = open(&db, &mirror, &ROOT, allow(&fixed)).await.unwrap();
+    let second = k.escrow_view().await.unwrap().unwrap().efp;
+    assert_ne!(second, first);
+    // Once verified, the flag no longer helps.
+    verify_escrow(&k, &fixed).await;
+    drop(k);
+    assert!(matches!(
+        open(&db, &mirror, &ROOT, allow(&h)).await,
+        Err(AtRestError::EscrowHoldersChanged)
+    ));
+
+    // Unverified, but a data key exists (data may be sealed): refused.
+    let (db, mirror) = (self::db().await, Arc::new(MemoryMirror::default()));
+    let k = open(&db, &mirror, &ROOT, config(&h, None)).await.unwrap();
+    k.current_key("space-a").await.unwrap();
+    drop(k);
+    assert!(matches!(
+        open(&db, &mirror, &ROOT, allow(&fixed)).await,
+        Err(AtRestError::EscrowHoldersChanged)
+    ));
 }
 
 #[tokio::test]
