@@ -208,8 +208,9 @@ jobs:
   # repository by git, which this workflow's token cannot clone, so it runs
   # locally before a release (`cargo test --locked --manifest-path
   # test/w5-policy-runtime-node-e2e/Cargo.toml`); a CI job needs a read token
-  # for that repository first. test/load/signer is covered by no job at all.
-  # Recorded here rather than left implicit.
+  # for that repository first. test/load/signer is built by no job. The
+  # `lockfiles` job below keeps all three lockfiles current. Recorded here
+  # rather than left implicit.
   m1-realdata:
     runs-on: ubuntu-latest
     env:
@@ -238,6 +239,31 @@ jobs:
         cargo fmt --manifest-path test/m1-realdata-e2e/Cargo.toml -p m1-realdata-e2e -- --check
     - name: Run deterministic M1 contract tests
       run: cargo test --locked --manifest-path test/m1-realdata-e2e/Cargo.toml
+
+  # TC-887: every separate workspace's Cargo.lock must stay current for the
+  # in-repo crates it uses by path, or `cargo ... --locked` breaks there. The
+  # jobs above build only the main workspace and m1-realdata-e2e. This job
+  # resolves each workspace CI can fetch with --locked, and checks the w5
+  # lockfile (whose private git dependency CI cannot fetch) without network:
+  # in-repo crates' direct dependencies and requested dependency features.
+  lockfiles:
+    name: separate workspace lockfiles
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+    steps:
+    - name: Checkout TinyCloud repository
+      uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@1.97.1
+    - name: Resolve each fetchable workspace with --locked
+      run: |
+        for manifest in Cargo.toml test/m1-realdata-e2e/Cargo.toml test/load/signer/Cargo.toml; do
+          echo "cargo metadata --locked --manifest-path $manifest"
+          cargo metadata --locked --format-version 1 --manifest-path "$manifest" > /dev/null
+        done
+    - name: Check separate lockfiles against in-repo crates
+      run: python3 scripts/ci/check-separate-lockfiles.py
 
   # TC-887 S0: a real node on native PostgreSQL and native MinIO (no service
   # containers). MinIO/mc are pinned community releases whose sha256 is pinned
