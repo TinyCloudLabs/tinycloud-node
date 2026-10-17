@@ -1,6 +1,6 @@
 # At-rest key escrow (TC-887)
 
-Nothing in the node binary uses these two crates yet.
+The node provisions and escrows at-rest keys only when `at_rest` is configured (below). The default config does nothing: no key reads, no rows.
 
 - `tinycloud-at-rest-escrow` (a node workspace member) holds the escrow format:
   - the 2-of-3 split of the at-rest root key (ARK);
@@ -124,3 +124,72 @@ Trust policy (`--trust`), from a source independent of the node being checked:
   "allowed_advisories": []
 }
 ```
+
+## Node configuration and endpoints
+
+```toml
+[at_rest]
+mode = "off"            # off | encrypt | strict
+escrow_none = false     # self-hosted Static-root nodes only (refused in a TEE)
+
+[at_rest.escrow]
+recipients = [ { holder = "sam", recipient = "age1yubikey1…" }, … ]   # exactly 3
+verified_fp = "<efp>"   # after the ceremony (record-efp)
+allow_software = false  # X25519 holders; tests and self-host only, refused in a TEE
+allow_resplit_before_verify = false  # before the ceremony only: corrected holders get a fresh root key
+```
+
+The same settings as compose env: `TINYCLOUD_AT_REST__MODE`, `TINYCLOUD_AT_REST__ESCROW_NONE`, `TINYCLOUD_AT_REST__ESCROW__RECIPIENTS=[{holder="…",recipient="…"},…]`, `TINYCLOUD_AT_REST__ESCROW__VERIFIED_FP`, `TINYCLOUD_AT_REST__ESCROW__ALLOW_SOFTWARE`, `TINYCLOUD_AT_REST__ESCROW__ALLOW_RESPLIT_BEFORE_VERIFY`.
+
+- **Recipients set, `mode = "off"`:**
+  - at boot the node creates the ARK (sealed under its root) and the escrow bundle;
+  - it keeps a copy of the sealed key, the bundle, the ceremony record and each space's wrapped data key in the block store (`_tc/at-rest/` in S3, `{datadir}/at-rest/_tc/at-rest/` on disk). Data-key objects are named by a keyed hash, not the space;
+  - in this mode a copy that can't be written is logged and the boot goes on (nothing depends on it yet). With `encrypt` or `strict`, every boot-time copy must be written: a block store that refuses the write stops the boot;
+  - nothing is encrypted.
+- **`encrypt` and `strict` are refused at boot in this build.** Block storage has no seal path yet, so the node won't claim to encrypt while it writes plaintext; `/info` never shows `encrypting: true`. Storage turns the capability on when the seal path lands (TC-887 S3). From then on, `encrypt` or `strict` refuses to start unless the recipients equal the bundle's, `verified_fp` equals its EFP, and the stored ceremony record verifies under the key inside the TEE. A Static-root node with no recipients may use `escrow_none = true` instead, which acknowledges that no escrow exists.
+- **In a TEE, the escrow recipients and `verified_fp` must be literal values in the measured compose.** With any at-rest config, the node reads its `app-compose.json` from the guest agent (`/Info`, `tcb_info.app_compose`), checks it against `compose_hash`, and refuses to boot unless `TINYCLOUD_AT_REST__ESCROW__RECIPIENTS` and `TINYCLOUD_AT_REST__ESCROW__VERIFIED_FP` are set there as literals (no `${…}`, no pass-through) equal to the effective config. Values from the encrypted environment, a file or anywhere else are refused. If the app-compose can't be read or parsed, the node refuses to boot. The `/Info` shape must be confirmed on a live CVM before the escrow ceremony.
+- **The escrow bundle is made or changed only at boot, never by a request.** Every endpoint below only reads it.
+  - **An ARK never gets a second bundle for other holders.** The node refuses to boot (`escrow_holders_changed`) if the configured recipients differ from any existing bundle for its ARK: the active bundle, any stored escrow row, a ceremony record in the block store whose MAC verifies under the ARK, or a bundle object in the block store naming the ARK. This holds after a restore too, when the database lost its escrow rows. The block-store bundle object is unauthenticated, so it can only refuse, never be used. Changing a holder after the ceremony needs an ARK rotation (TC-1345).
+  - **Fixing a wrong holder before the ceremony:** set `allow_resplit_before_verify = true` together with the corrected recipients. The node then **replaces the root key**: it makes a fresh ARK, splits it for the corrected holders, and retires the old ARK and its bundle. Shares of the old bundle become worthless: any two of them rebuild only the retired key, which never protected anything and is never loaded again (a W-authenticated retirement marker in the block store drops it even from a database restored to before the fix). The node does this only if no fingerprint is pinned, no ceremony record exists, and no data key was ever made, checking both the database and the block store. If any of those fails, it still refuses to boot. Remove the flag after the fix.
+  - With `verified_fp` set, the node uses only the pinned bundle, restoring it from the block store if the database lost it, and refuses to boot if that bundle is not for the configured recipients and the newest key.
+- **If the node's root can no longer unseal the key** (new app id or KMS), it boots **locked**:
+  - `/info` shows `at_rest.state = "locked"` and encryption is unavailable;
+  - two holders recover it through the endpoints below, which needs `verified_fp` to be pinned;
+  - the node then re-seals the key under its new root, with no restart and no data rewrite.
+
+| Endpoint | Answer |
+|---|---|
+| `GET /at-rest/status` | `mode`, `state`, `encrypting`, `efp`, `generation`, `verified` |
+| `GET /at-rest/escrow` | the active escrow bundle (or, on a locked node, the pinned one) |
+| `GET /at-rest/escrow/record` | the ceremony record, only if its MAC verifies under the live key |
+| `GET /at-rest/recovery?nonce=N` | `RecoveryInfo`: this boot's recovery recipient, bound with `N` and the EFP into a TDX quote (`mode = "classic"` with no quote outside a TEE) |
+| `POST /at-rest/recovery/shares` | body: one share age-sealed to the recovery recipient (≤ 4 KiB). Answers `held` (with `shares_held`), `verified` (all three shares rebuilt the key), or `unlocked` (locked node recovered), with the gate result |
+
+The share endpoint:
+- is rate limited per IP. Until TC-1357, the client IP comes from a proxy header trusted from any peer, so per-client limits are best effort; the per-boot budget below doesn't depend on them;
+- checks every share against the bundle's commitments before it takes one of three slots;
+- counts only shares that authenticate (decrypt and match a commitment) against the node's per-boot share budget, so junk can't starve genuine holders. Rejected shares are limited per client (5, then one a minute);
+- never logs share bytes or ciphertexts.
+
+Shares live in memory for the current boot only.
+
+A keyring failure answers `503` when a retry may help (`store_unavailable`, `mirror_unavailable`, `locked`, `conflict: …`, `dek_unavailable: …`) and `500` when an operator must act (`inconsistent: …`, `escrow_pinned`, `escrow_holders_changed`, `escrow: …`). The reason never contains key material or backend detail; the server log has the rest.
+
+**Recovery is per node.** Each boot has its own recovery key, so a share wrapped for one node is rejected by another. With several nodes on one database:
+- recover one node, by its own address (not through a load balancer);
+- then restart the others; a locked node doesn't pick up another node's recovery until it restarts;
+- every node on one database must use the same root. A node under another root boots locked, and recovering it re-seals the rows under its root, which locks the others out at their next restart.
+
+Production runs one node per database. Multi-node recovery is a known limitation.
+
+### Key continuity
+
+- **Database restored to an earlier point.** At boot the node takes back a key generation or chain from the block-store copy only once it authenticates: the newest under this node's root, each older one by its chain. During recovery, the recovered key authenticates them. Anything else in the copy (forged, junk, a gap, an oversized object) is skipped with a warning and never stored, so objects planted in the bucket can neither lock the node nor stop it booting while the database is healthy. A block store that refuses the node's own writes is different: with `encrypt` or `strict` it stops the boot (see above).
+  - Retirement markers (`_tc/at-rest/retired-<ark_id>.json`, written when a holder fix replaces the root key) follow the same rule. A forged or junk marker is skipped. One that can't be read is skipped too, unless it names a key the node has stored or mirrored and the mode is `encrypt` or `strict`: skipping it then could bring a retired key back, so the boot stops until the object reads. With `mode = "off"` a marker never stops the boot.
+- **Data keys after a restore.** A space's data key missing from the database is restored from its copy only if its wrap authenticates for that space. A copy that exists but doesn't authenticate is never ignored and never overwritten: it may be the genuine key under a generation the node hasn't loaded (for example after a failed read at boot). That space answers `503 dek_unavailable` until the generation loads or an operator removes the object; no new key is made over it.
+  - **Runbook, `dek_unavailable` that doesn't clear:** first restart once the block store reads cleanly; a genuine key under an unloaded generation then authenticates and comes back. If the error stays, the server log names the space's data-key object as not authenticating under any loaded generation. Check no newer key generation exists anywhere (database backups, other nodes); only then delete that object under `_tc/at-rest/` and the space gets a new key on its next write. Deleting a genuine key makes everything sealed under it unreadable.
+- **No key is ever made over existing material.** The node creates a new root key only when the database has no key, escrow or data-key rows and the block store has nothing under `_tc/at-rest/`. A store or mirror error stops the boot instead, and so does an empty database whose block-store copy holds nothing usable.
+- **Escrow and ceremony record after a restore.** A bundle or record the database lost is restored from the block store at boot, so a restore doesn't force a new ceremony: the pinned bundle (the pin authenticates it), or, unpinned, a bundle whose mirrored ceremony record verifies under the key. A record is restored only if its MAC verifies under the key.
+  - **Runbook, `escrow_holders_changed` you didn't expect:** the server log names the evidence. If it is a block-store object (`_tc/at-rest/escrow-…`) and the configured recipients are right, check it isn't a genuine escrow: compare it with the bundle the holders hold (`tinycloud-at-rest inspect`) and the pinned `efp`. Only then remove that object and restart. A planted object can only stop a boot whose database lost its escrow rows; it never changes who can rebuild the key.
+- **Generations.** Each older generation is sealed under the next one's key (its chain), so escrowing the newest generation recovers all of them. At boot under the same root, a missing or broken chain is rebuilt and logged. During recovery under a new root it can't be rebuilt, and the shares are refused with the reason. The newest generation never keeps a chain: a stale one is cleared at boot.
+- The key tables' migration `down` refuses while they hold rows.
