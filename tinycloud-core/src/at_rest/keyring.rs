@@ -77,7 +77,7 @@ pub enum AtRestError {
     Conflict(&'static str),
     #[error("at_rest.escrow.verified_fp pins an escrow that is not for the configured recipients and the newest key; the node never re-splits while a fingerprint is pinned")]
     EscrowPinned,
-    #[error("the configured escrow recipients differ from the active escrow bundle's; the node never re-splits on its own (before the ceremony, at_rest.escrow.allow_resplit_before_verify allows it; afterwards an explicit re-escrow is needed)")]
+    #[error("the configured escrow recipients differ from an existing escrow for this ARK, and an ARK never gets a second split for other holders. Before the ceremony with nothing sealed: set at_rest.escrow.allow_resplit_before_verify (the node makes a fresh ARK). After it: an ARK rotation (TC-1345). If the log names an unexpected block-store object, verify it is not a genuine escrow, then remove it")]
     EscrowHoldersChanged,
     #[error("a space's data key is unavailable: {0}")]
     DekUnavailable(&'static str),
@@ -827,15 +827,23 @@ impl AtRestKeyring {
     /// holders. This is the only place a bundle is ever created or
     /// activated; request paths only read ([`Self::active_bundle`]).
     ///
-    /// - An active bundle for other holders: refused
-    ///   ([`AtRestError::EscrowHoldersChanged`]); the node never re-splits on
-    ///   its own.
+    /// An existing ARK never gets a second bundle for other holders:
+    ///
+    /// - An active bundle for other holders refuses the boot
+    ///   ([`AtRestError::EscrowHoldersChanged`]).
     /// - None active and `verified_fp` pinned: the pinned bundle, from the
     ///   database or the mirror (the pin authenticates it), is re-activated;
     ///   anything else is [`AtRestError::EscrowPinned`].
     /// - None active, no pin: a mirrored bundle whose mirrored ceremony
     ///   record verifies under the ARK is restored (a database restore
-    ///   doesn't force a new ceremony); otherwise a new bundle is made.
+    ///   doesn't force a new ceremony). Otherwise a new bundle is made,
+    ///   unless any evidence of an earlier bundle for this ARK with other
+    ///   holders exists ([`Self::other_holders_evidence`]): that refuses
+    ///   the boot too.
+    ///
+    /// A refused holder change can be fixed only before the ceremony, with
+    /// `allow_resplit_before_verify` ([`Self::may_resplit`]), which
+    /// replaces the ARK; afterwards it needs a rotation (TC-1345).
     ///
     /// A verification record the database lost is restored from the mirror
     /// when it verifies under the ARK.
@@ -859,16 +867,9 @@ impl AtRestKeyring {
                 }
                 return Ok(());
             }
-            if !self.may_resplit(&bundle).await? {
-                return Err(AtRestError::EscrowHoldersChanged);
-            }
-            tracing::warn!(
-                generation = g,
-                "replacing an unverified root key for corrected holders (allow_resplit_before_verify): the old shares are worthless and the ceremony starts over"
-            );
-            self.retire_and_replace().await?;
-            // The fresh key has no escrow yet: this makes its bundle.
-            return Box::pin(self.establish_escrow()).await;
+            return self
+                .holders_changed(g, "the active escrow bundle".into())
+                .await;
         }
         let wanted = |b: &EscrowBundle| {
             b.holders() == self.config.holders && b.ark_id == gen.ark_id && b.generation == g
@@ -885,16 +886,21 @@ impl AtRestKeyring {
         };
         let (bundle, created) = match restored {
             Some(bundle) => (bundle, false),
-            None => (
-                EscrowBundle::create(
-                    &gen.ark,
-                    gen.ark_id,
-                    g,
-                    &self.config.holders,
-                    self.config.recipient_policy,
-                )?,
-                true,
-            ),
+            None => {
+                if let Some(evidence) = self.other_holders_evidence(&gen.ark, gen.ark_id).await? {
+                    return self.holders_changed(g, evidence).await;
+                }
+                (
+                    EscrowBundle::create(
+                        &gen.ark,
+                        gen.ark_id,
+                        g,
+                        &self.config.holders,
+                        self.config.recipient_policy,
+                    )?,
+                    true,
+                )
+            }
         };
         let row = at_rest_escrow::Model {
             efp: bundle.fingerprint().to_string(),
@@ -931,20 +937,108 @@ impl AtRestKeyring {
         Ok(())
     }
 
-    /// A holder change may re-split only when explicitly allowed, nothing is
-    /// pinned, no ceremony record exists, and no data key was ever made.
-    /// The database and the mirror are both checked (a database restored to
-    /// an earlier point may have lost a data key or record the mirror still
-    /// has). Any record or data-key object in the mirror counts, readable
-    /// or not: it refuses only this pre-ceremony shortcut.
-    async fn may_resplit(&self, active: &EscrowBundle) -> Result<bool, AtRestError> {
+    /// The configured holders differ from an existing bundle for the ARK.
+    /// Refused, unless [`Self::may_resplit`] allows replacing the ARK.
+    async fn holders_changed(&self, g: u32, evidence: String) -> Result<(), AtRestError> {
+        if !self.may_resplit().await? {
+            tracing::error!(
+                generation = g,
+                %evidence,
+                "the configured escrow holders differ from an existing escrow for this ARK; refusing to split it again. Before the ceremony: allow_resplit_before_verify (a fresh ARK). After it: an ARK rotation (TC-1345). An unexpected mirror object: verify it, then remove it"
+            );
+            return Err(AtRestError::EscrowHoldersChanged);
+        }
+        tracing::warn!(
+            generation = g,
+            %evidence,
+            "replacing an unverified root key for corrected holders (allow_resplit_before_verify): the old shares are worthless and the ceremony starts over"
+        );
+        self.retire_and_replace().await?;
+        // The fresh key has no escrow yet: this makes its bundle.
+        Box::pin(self.establish_escrow()).await
+    }
+
+    /// Evidence that `ark_id` already has a bundle for holders other than
+    /// the configured ones, strongest first:
+    ///
+    /// 1. a database escrow row for this ARK;
+    /// 2. a mirrored ceremony record whose MAC verifies under the ARK
+    ///    against its mirrored bundle, for other holders (authenticated);
+    ///    a record that doesn't verify proves nothing and is skipped;
+    /// 3. a mirrored bundle object naming this ARK. Unauthenticated: it can
+    ///    only refuse, never be used.
+    ///
+    /// Evidence for the configured holders themselves is not a change.
+    async fn other_holders_evidence(
+        &self,
+        ark: &Ark,
+        ark_id: ArkId,
+    ) -> Result<Option<String>, AtRestError> {
+        for row in self.store.escrows().await? {
+            let bundle = Self::parse_bundle(&row)?;
+            if bundle.ark_id == ark_id && bundle.holders() != self.config.holders {
+                return Ok(Some(format!("stored escrow bundle {}", row.efp)));
+            }
+        }
+        let records = self
+            .mirror
+            .list(&format!("{MIRROR_PREFIX}record-"))
+            .await
+            .map_err(mirror_err)?;
+        for name in records {
+            let Some(bytes) = get_capped(&*self.mirror, &name).await.map_err(mirror_err)? else {
+                continue;
+            };
+            let Ok(record) = VerificationRecord::from_json(&bytes) else {
+                continue;
+            };
+            if record.ark_id != ark_id {
+                continue;
+            }
+            let bundle = get_capped(&*self.mirror, &escrow_mirror_name(&record.efp.to_string()))
+                .await
+                .map_err(mirror_err)?
+                .and_then(|b| EscrowBundle::from_json(&b).ok());
+            if let Some(b) = bundle {
+                if record.verify(ark, &b).is_ok() && b.holders() != self.config.holders {
+                    return Ok(Some(format!(
+                        "verified ceremony record {name}, for other holders"
+                    )));
+                }
+            }
+        }
+        let bundles = self
+            .mirror
+            .list(&format!("{MIRROR_PREFIX}escrow-"))
+            .await
+            .map_err(mirror_err)?;
+        for name in bundles {
+            let Some(bytes) = get_capped(&*self.mirror, &name).await.map_err(mirror_err)? else {
+                continue;
+            };
+            let Ok(bundle) = EscrowBundle::from_json(&bytes) else {
+                continue;
+            };
+            if bundle.ark_id == ark_id && bundle.holders() != self.config.holders {
+                return Ok(Some(format!(
+                    "unauthenticated block-store object {name}, a bundle for this ARK with other holders"
+                )));
+            }
+        }
+        Ok(None)
+    }
+
+    /// A holder change may replace the ARK only when explicitly allowed,
+    /// nothing is pinned, no ceremony record exists, and no data key was
+    /// ever made. The database and the mirror are both checked (a database
+    /// restored to an earlier point may have lost a data key or record the
+    /// mirror still has). Any record or data-key object in the mirror
+    /// counts, readable or not: it refuses only this pre-ceremony shortcut.
+    async fn may_resplit(&self) -> Result<bool, AtRestError> {
         if !self.config.allow_resplit_before_verify || self.config.pinned_efp.is_some() {
             return Ok(false);
         }
-        if self.verified_record(active).await?.is_some()
-            || self.store.has_space_keys().await?
-            || self.store.has_escrow_record().await?
-        {
+        if self.store.has_space_keys().await? || self.store.has_escrow_record().await? {
             return Ok(false);
         }
         for prefix in ["record-", "dek-"] {
