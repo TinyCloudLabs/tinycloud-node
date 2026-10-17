@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Run actual workflow Bash against offline CLI/HTTP boundaries only."""
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -15,10 +16,16 @@ ROOT = Path(__file__).resolve().parents[2]
 SOURCE = (ROOT / ".github/workflows/docker.yml").read_text()
 DIGEST = "sha256:4bdae4fc232d886bb56bfbce4ec62ed4b8fb4e1369a01f6afb73d06dd68c188f"
 REVISION = "e18578ff9162986ddd813259c60f73866e3e60d1"
+# The real PROD_TINYCLOUD_QUOTA_URL shape: billing's bare HTTPS origin, not a /api/quota path.
+BILLING_URL = "https://billing.example.invalid"
 N0 = (ROOT / "scripts/ci/fixtures/tc959-n0-compose.yaml").read_bytes()
 PRE_N0 = (ROOT / "ops/rollback/pre-n0-compose.yaml").read_bytes()
 STOP_LOGS = (ROOT / "ops/rollback/pre-n0-stop-local-logs.yaml").read_bytes()
 CURRENT = (ROOT / "docker-compose.dstack-postgres.yaml").read_bytes()
+# Ordinary (pre-N0) template from main before #309: the captured rollback compose with its digest pin
+# reverted to the :dstack tag. The workflow accepts these bytes by raw hash.
+PRE_N0_TEMPLATE = PRE_N0.replace(b"@" + DIGEST.encode(), b":dstack")
+assert hashlib.sha256(PRE_N0_TEMPLATE).hexdigest() == "28302d6761d841b7cc5c11314aed2d377735e6bbdcaf85972a752e03bc9fdc93"
 CANARIES = []
 
 
@@ -110,7 +117,7 @@ elif name=='sleep': pass
 else: raise SystemExit('Unexpected CLI boundary')
 '''
 
-HTTP = r'''import http.client, json, os, socket
+HTTP = r'''import http.client, io, json, os, random, socket
 from pathlib import Path
 from urllib.parse import unquote
 socket.create_connection=lambda *a,**k: (_ for _ in ()).throw(AssertionError('Real network forbidden'))
@@ -120,6 +127,7 @@ class Connection:
     def request(self,method,path,body=None,headers=None):
         expected=os.environ['QUOTA_BILLING_ADMIN_SECRET'] if self.host=='billing.example.invalid' else os.environ['QUOTA_ADMIN_SECRET']
         assert headers['Authorization']=='Bearer '+expected
+        assert self.host!='billing.example.invalid' or path.startswith('/api/admin/storage-comp/')
         self.method,self.path=method,path
         state=Path(os.environ['TEST_STATE']); data=json.loads(state.read_text())
         if self.host=='billing.example.invalid': data['events'].append('billing-comp')
@@ -139,12 +147,17 @@ class Connection:
                 payload={'active':True,'comp_bytes':1,'account_limit_bytes':floor+100,'storage_limit_bytes':floor+100}
             else: status,payload=404,os.environ['QUOTA_BILLING_ADMIN_SECRET']
         elif os.environ['FAIL_AT']=='quota': status,payload=503,os.environ['QUOTA_ADMIN_SECRET']
-        elif self.path=='/admin/usage': payload={'count':len(targets),'spaces':[{'space_id':space,'usage_bytes':10} for space in targets]}
+        elif self.path=='/admin/usage':
+            # The node's real, unpaginated inventory: every space, ~107 bytes a row (prod: ~1,034 spaces).
+            rng=random.Random(959); spaces=[{'space_id':space,'usage_bytes':10} for space in targets]
+            spaces+=[{'space_id':'tinycloud:pkh:eip155:1:0x%040x:default'%rng.getrandbits(160),'usage_bytes':rng.choice([None,rng.randint(1,700000000)])} for _ in range(3000)]
+            payload={'spaces':spaces,'count':len(spaces)}
         else:
             value=data['values'].get(self.path)
             payload={'space_id':unquote(self.path.removeprefix('/admin/quota/')),'override_bytes':value,'effective_limit_bytes':value if value is not None else 123}
+        stream=io.BytesIO(json.dumps(payload).encode())
         class Response:
-            def read(self,count): return json.dumps(payload).encode()[:count]
+            def read(self,count): return stream.read(count)
         response=Response(); response.status=status; return response
     def close(self): pass
 http.client.HTTPSConnection=Connection
@@ -217,7 +230,8 @@ class RecoveryTests(unittest.TestCase):
                         "OCI_REVISION": oci_revision or inputs.get("rollback_image_revision") or "f" * 40,
                         # Production maps both from PROD_TINYCLOUD_ADMIN_SECRET: one shared value.
                         "QUOTA_ADMIN_SECRET": canary, "QUOTA_BILLING_ADMIN_SECRET": canary,
-                        "QUOTA_BILLING_URL": "https://billing.example.invalid/api/quota"})
+                        # Production maps both from PROD_TINYCLOUD_QUOTA_URL: billing's base URL.
+                        "QUOTA_BILLING_URL": BILLING_URL, "PHALA_ENV_TINYCLOUD_QUOTA_URL": BILLING_URL})
             if missing_billing: env.pop("QUOTA_BILLING_ADMIN_SECRET")
             context = {"github.event_name": event, "github.ref": ref, "job.success": True,
                        **{"inputs." + key: (value == "true" if value in ("true", "false") else value) for key, value in inputs.items()}}
@@ -247,7 +261,7 @@ class RecoveryTests(unittest.TestCase):
                     "compose": compose_path.read_bytes(), "summary": report, "logs": logs}
 
     def test_recovery_current_pre_n0_and_reviewed_n0(self):
-        for compose in (CURRENT, N0):
+        for compose in (PRE_N0_TEMPLATE, N0):
             with self.subTest(n0=compose == N0):
                 result = self.run_deploy(compose)
                 self.assertTrue(result["success"], "Authorized same-image recovery must work")
@@ -257,7 +271,7 @@ class RecoveryTests(unittest.TestCase):
                 self.assertNotIn("1.20.7", result["logs"] + result["summary"])
 
     def test_future_digest_gets_preflight_and_general_quota_restore(self):
-        result = self.run_deploy(changes={"deploy_image_digest": "sha256:" + "a" * 64,
+        result = self.run_deploy(PRE_N0_TEMPLATE, {"deploy_image_digest": "sha256:" + "a" * 64,
              "image_version": "1.20.8", "rollback_image_version": "1.20.8", "rollback_image_revision": "a" * 40})
         self.assertTrue(result["success"])
         self.assertIn("sealed-preflight", result["events"])
@@ -274,9 +288,9 @@ class RecoveryTests(unittest.TestCase):
                 self.assertIn(mode, result["summary"])
 
     def test_missing_authorization_never_reaches_any_mutation(self):
-        for compose, changes, mode in ((CURRENT, {}, ""), (N0, {}, ""),
+        for compose, changes, mode in ((PRE_N0_TEMPLATE, {}, ""), (N0, {}, ""),
              (N0, {"rollback_pre_n0": "true", "rollback_privacy_mode": "keep-json-file"}, "keep-json-file"),
-             (CURRENT, {"deploy_image_digest": "sha256:" + "a" * 64, "image_version": "1.20.8",
+             (PRE_N0_TEMPLATE, {"deploy_image_digest": "sha256:" + "a" * 64, "image_version": "1.20.8",
                         "rollback_image_version": "1.20.8", "rollback_image_revision": "a" * 40}, "")):
             result = self.run_deploy(compose, {**changes, "authorize_quota_values": "false"}, approved_privacy=mode)
             self.assertFalse(result["success"])
@@ -327,7 +341,7 @@ class RecoveryTests(unittest.TestCase):
             self.assertEqual(result["compose"], N0)
 
     def test_normal_build_deployment_keeps_preflight_and_general_quota(self):
-        result = self.run_deploy(changes={"deploy_image_digest": "", "image_version": "1.20.7",
+        result = self.run_deploy(PRE_N0_TEMPLATE, {"deploy_image_digest": "", "image_version": "1.20.7",
                                         "rollback_image_version": "", "rollback_image_revision": ""},
                                  build_digest="sha256:" + "f" * 64)
         self.assertTrue(result["success"])
@@ -343,6 +357,12 @@ class RecoveryTests(unittest.TestCase):
             self.assertFalse(result["success"])
             self.assertNotIn("cvm-deploy", result["events"])
             self.assertEqual(result["compose"], N0)
+        result = self.run_deploy(N0, {"deploy_image_digest": "", "image_version": "1.20.7",
+                                      "rollback_image_version": "", "rollback_image_revision": ""},
+                                 build_digest="sha256:" + "f" * 64)
+        self.assertFalse(result["success"])
+        self.assertNotIn("cvm-deploy", result["events"])
+        self.assertEqual(result["compose"], N0)
 
     def test_last_restart_precedes_health_inventory_and_quota(self):
         result = self.run_deploy(N0, {"rollback_pre_n0": "true", "rollback_privacy_mode": "keep-json-file"}, approved_privacy="keep-json-file")

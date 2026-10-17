@@ -126,6 +126,9 @@ tokio = { version = "1", features = ["test-util"] }
 axum = { version = "0.7", features = ["ws"] }
 bs58 = "0.5"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+# zlib compressibility of raw stored bytes in tests/at_rest_harness.rs (TC-887).
+# Already in the lock through ssi-status; adds no new crate.
+flate2 = "1"
 k256 = { version = "0.13.4", features = ["ecdsa"] }
 sha3 = "0.10"
 # The Rust half of the JS SDK: builds the same host and session SIWE

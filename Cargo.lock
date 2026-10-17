@@ -46,6 +46,7 @@ dependencies = [
  "cfg-if",
  "cipher",
  "cpufeatures",
+ "zeroize",
 ]
 
 [[package]]
@@ -60,6 +61,7 @@ dependencies = [
  "ctr",
  "ghash",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -9628,6 +9630,7 @@ dependencies = [
 name = "tinycloud-core"
 version = "1.3.0"
 dependencies = [
+ "aes",
  "aes-gcm",
  "arrow",
  "async-std",
@@ -9638,6 +9641,7 @@ dependencies = [
  "duckdb",
  "futures",
  "hex",
+ "hkdf",
  "hmac",
  "iri-string",
  "k256",
@@ -9645,6 +9649,7 @@ dependencies = [
  "multihash-derive 0.9.1",
  "pin-project",
  "prometheus",
+ "proptest",
  "rand 0.8.5",
  "rusqlite",
  "ryu-js",
@@ -9667,6 +9672,7 @@ dependencies = [
  "unicode-normalization",
  "uuid",
  "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]
@@ -9690,6 +9696,7 @@ dependencies = [
  "core-foundation",
  "core-foundation-sys",
  "ed25519-dalek",
+ "flate2",
  "futures",
  "hex",
  "hmac",

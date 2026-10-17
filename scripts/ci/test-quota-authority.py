@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Synthetic HTTP contracts for reviewed node/billing quota authority."""
 import contextlib
+import gzip
 import http.client
 import io
 import json
 from pathlib import Path
+import random
 import secrets
 import tempfile
 import unittest
@@ -19,6 +21,24 @@ exec(compile(SCRIPT.read_text(), str(SCRIPT), "exec"), NS)
 OWNER = "tinycloud:pkh:eip155:1:0xd559CCd9EB87c530A9a349262669386dE93cf412"
 LIMITS = {OWNER + ":applications": 5368709120, OWNER + ":secrets": 268721121}
 CANARIES = []
+USAGE_CAP = 16 * 1024 * 1024
+
+
+def realistic_inventory(total):
+    """The node's real GET /admin/usage body (routes/admin.rs `UsageResponse`):
+    every space on the node, unpaginated, as compact serde JSON with `spaces`
+    before `count`, sorted by usage descending with unknown (null) last.
+    Production held about 1,034 spaces on 2026-10-12 (~107 bytes a row)."""
+    rng = random.Random(959)
+    rows = [{"space_id": space, "usage_bytes": usage}
+            for space, usage in zip(LIMITS, (640743590, 1048576))]
+    while len(rows) < total:
+        owner = "tinycloud:pkh:eip155:1:0x" + "".join(rng.choice("0123456789abcdef") for _ in range(40))
+        name = rng.choice(("default", "applications", "secrets", "kv", "public", "notes"))
+        rows.append({"space_id": owner + ":" + name,
+                     "usage_bytes": None if rng.random() < 0.4 else rng.randint(1, 700_000_000)})
+    rows.sort(key=lambda row: (row["usage_bytes"] is None, -(row["usage_bytes"] or 0)))
+    return json.dumps({"spaces": rows, "count": len(rows)}, separators=(",", ":")).encode()
 
 
 class SafeResult(unittest.TextTestResult):
@@ -34,6 +54,7 @@ class AuthorityTests(unittest.TestCase):
         self.node_secret = secrets.token_urlsafe(32)
         self.billing_secret = secrets.token_urlsafe(32)
         CANARIES.extend([self.node_secret, self.billing_secret])
+        self.ports = []
         self.calls = []
         self.values = {}
         self.billing_status = {space: 404 for space in LIMITS}
@@ -45,6 +66,8 @@ class AuthorityTests(unittest.TestCase):
         self.node_status = 200
         self.bad_effective = False
         self.usage = [{"space_id": space, "usage_bytes": 10} for space in LIMITS]
+        self.usage_body = None
+        self.stream = None
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.config = Path(self.directory.name) / "quota.json"
@@ -53,7 +76,8 @@ class AuthorityTests(unittest.TestCase):
         self.environment = {
             "QUOTA_ADMIN_SECRET": self.node_secret,
             "QUOTA_BILLING_ADMIN_SECRET": self.billing_secret,
-            "QUOTA_BILLING_URL": "https://billing.example.invalid/api/quota",
+            # The real secret is billing's base URL (the node's TINYCLOUD_QUOTA_URL).
+            "QUOTA_BILLING_URL": "https://billing.example.invalid",
             "GITHUB_STEP_SUMMARY": str(self.summary),
         }
         for patcher in (
@@ -78,6 +102,7 @@ class AuthorityTests(unittest.TestCase):
         test = self
         self.assertIn(host, ["node.tinycloud.xyz", "billing.example.invalid"])
         self.assertGreater(timeout, 0)
+        test.ports.append((host, kwargs.get("port")))
 
         class Connection:
             def request(self, method, path, body=None, headers=None):
@@ -89,6 +114,9 @@ class AuthorityTests(unittest.TestCase):
                 if host == "billing.example.invalid" and test.transport_failures:
                     test.transport_failures -= 1
                     raise OSError(test.billing_secret)
+                if host == "billing.example.invalid":
+                    test.assertTrue(path.startswith("/api/admin/storage-comp/"),
+                                    "Billing paths are fixed, never derived from the operator URL")
                 self.method, self.path = method, path
                 if method == "PUT" and test.apply_put:
                     test.values[unquote(path.rsplit("/", 1)[1])] = json.loads(body)["limit_bytes"]
@@ -100,6 +128,8 @@ class AuthorityTests(unittest.TestCase):
                     body = test.billing_body[space] if status == 200 else test.billing_secret
                 elif test.node_status != 200:
                     status, body = test.node_status, test.node_secret
+                elif self.path == "/admin/usage" and test.usage_body is not None:
+                    status, body = 200, test.usage_body
                 elif self.path == "/admin/usage":
                     status, body = 200, {"count": len(test.usage), "spaces": test.usage}
                 else:
@@ -109,10 +139,11 @@ class AuthorityTests(unittest.TestCase):
                                          "effective_limit_bytes": (value + int(test.bad_effective)) if value is not None else 123,
                                          "current_usage_bytes": 10}
 
-                class Response:
-                    def read(self, count):
-                        return json.dumps(body).encode()[:count]
-                response = Response()
+                # Stream semantics of http.client.HTTPResponse.read(amt): at most
+                # amt bytes per call, b"" once the body is exhausted.
+                stream = io.BytesIO(body if isinstance(body, bytes) else json.dumps(body).encode())
+                test.stream = stream
+                response = type("Response", (), {"read": lambda _, count: stream.read(count)})()
                 response.status = status
                 return response
 
@@ -254,11 +285,43 @@ class AuthorityTests(unittest.TestCase):
         self.assertEqual(self.run_main(["--preflight"])[0], 0)
         self.assertEqual(self.calls, [])
 
+    def test_billing_base_url_and_compat_path_drive_the_full_restore(self):
+        for url, port in (("https://billing.example.invalid", None), ("https://billing.example.invalid/", None),
+                          ("https://billing.example.invalid:8443", 8443), ("https://billing.example.invalid/api/quota", None),
+                          ("https://billing.example.invalid/api/quota/", None)):
+            with self.subTest(url=url):
+                self.calls.clear(); self.values.clear(); self.ports.clear()
+                self.environment["QUOTA_BILLING_URL"] = url
+                self.assertEqual(self.run_main(["--preflight"])[0], 0)
+                self.assertEqual(self.calls, [])
+                code, logs = self.run_main()
+                self.assertEqual(code, 0)
+                self.assertIn("Quota overrides verified", logs)
+                self.assertEqual(sorted(self.values.values()), sorted(LIMITS.values()))
+                self.assertEqual([call[1] for call in self.calls], ["GET"] * 3 + ["PUT", "GET", "PUT", "GET"])
+                self.assertEqual([call[2].rsplit("/", 1)[0] for call in self.calls if call[0] == "billing.example.invalid"],
+                                 ["/api/admin/storage-comp"] * 2)
+                self.assertEqual({entry for entry in self.ports if entry[0] == "billing.example.invalid"},
+                                 {("billing.example.invalid", port)})
+
     def test_incompatible_or_credential_bearing_billing_url_fails_without_requests(self):
-        for url in ("http://billing.example.invalid/api/quota", "https://billing.example.invalid/unreviewed",
-                    "https://user:password@billing.example.invalid/api/quota", "https://billing.example.invalid/api/quota?key=bad"):
-            self.environment["QUOTA_BILLING_URL"] = url
-            self.assertEqual(self.run_main(["--preflight"])[0], 1)
+        for url in ("", "billing.example.invalid", "http://billing.example.invalid", "http://billing.example.invalid/api/quota",
+                    "https://billing.example.invalid/api", "https://billing.example.invalid/api/quota/x",
+                    "https://billing.example.invalid/quota", "https://billing.example.invalid/unreviewed",
+                    "https://billing.example.invalid//", "https://billing.example.invalid/api/quota//",
+                    "https://user:password@billing.example.invalid", "https://user@billing.example.invalid/api/quota",
+                    "https://@billing.example.invalid", "https://billing.example.invalid?key=bad",
+                    "https://billing.example.invalid/api/quota?key=bad", "https://billing.example.invalid?",
+                    "https://billing.example.invalid#fragment", "https://billing.example.invalid/api/quota#",
+                    "https://", "https:///api/quota", "https://:8443", "https://billing.example.invalid:port",
+                    "https://billing.example.invalid\n", "https://billing.example.invalid/api/quota\r\n",
+                    "https://billing.exa\rmple.invalid", "https://billing.example.invalid/api/\tquota"):
+            for args in (["--preflight"], []):
+                with self.subTest(url=url.encode(), args=args):
+                    self.environment["QUOTA_BILLING_URL"] = url
+                    code, logs = self.run_main(args)
+                    self.assertEqual(code, 1)
+                    self.assertIn("billing quota URL has an incompatible shape", logs)
         self.assertEqual(self.calls, [])
 
     def test_effective_limit_and_override_must_both_match(self):
@@ -279,6 +342,82 @@ class AuthorityTests(unittest.TestCase):
                 self.usage = rows
                 self.assertEqual(self.run_main()[0], 1)
                 self.assertEqual(self.puts(), [])
+
+    def test_prod_sized_inventory_drives_the_full_restore(self):
+        self.usage_body = realistic_inventory(3000)
+        self.assertGreater(len(self.usage_body), 4 * 65536)
+        for authority in ("node-override", "billing"):
+            with self.subTest(authority=authority):
+                self.calls.clear(); self.values.clear()
+                self.configure(authority)
+                if authority == "billing":
+                    self.billing_active()
+                code, logs = self.run_main()
+                self.assertEqual(code, 0)
+                if authority == "billing":
+                    self.assertIn("billing-authoritative", logs)
+                    self.assertEqual(self.puts(), [])
+                else:
+                    self.assertIn("Quota overrides verified", logs)
+                    self.assertEqual(sorted(self.values.values()), sorted(LIMITS.values()))
+                    self.assertEqual([call[1] for call in self.calls], ["GET"] * 3 + ["PUT", "GET", "PUT", "GET"])
+
+    def test_prod_sized_inventory_keeps_exact_target_invariants(self):
+        document = json.loads(realistic_inventory(3000))
+        first = next(iter(LIMITS))
+        target = next(row for row in document["spaces"] if row["space_id"] == first)
+        variants = {
+            "missing": [row for row in document["spaces"] if row is not target],
+            "duplicate": document["spaces"] + [dict(target)],
+            "unknown-usage": [dict(row, usage_bytes=None) if row is target else row for row in document["spaces"]],
+        }
+        for name, rows in variants.items():
+            with self.subTest(case=name):
+                self.calls.clear()
+                self.usage_body = json.dumps({"spaces": rows, "count": len(rows)}).encode()
+                code, logs = self.run_main()
+                self.assertEqual(code, 1)
+                self.assertIn("no overrides applied", logs)
+                self.assertEqual(self.puts(), [])
+
+    def test_usage_body_is_bounded_at_the_documented_cap(self):
+        inventory = realistic_inventory(3000)
+        at_cap = inventory + b" " * (USAGE_CAP - len(inventory))
+        self.usage_body = at_cap
+        code, logs = self.run_main()
+        self.assertEqual(code, 0, "A valid inventory of exactly the cap is accepted")
+        self.calls.clear(); self.values.clear()
+        self.usage_body = at_cap + b" "
+        code, logs = self.run_main()
+        self.assertEqual(code, 1)
+        self.assertIn("quota API returned an invalid response", logs)
+        self.assertEqual(self.calls, [("node.tinycloud.xyz", "GET", "/admin/usage")])
+        self.assertLessEqual(self.stream.tell(), USAGE_CAP + 1, "The read stops at cap+1 bytes")
+
+    def test_invalid_usage_body_fails_closed(self):
+        inventory = realistic_inventory(3000)
+        text = inventory.decode()
+        # json.loads(bytes) auto-detects UTF-8-sig/16/32; the node only ever sends
+        # plain UTF-8, so every other encoding (and gzip, which the script never
+        # requests or decodes) must fail closed.
+        for name, body in (("array", json.dumps(json.loads(inventory)["spaces"]).encode()),
+                           ("truncated", inventory[:-1]), ("empty", b""), ("string", b'"spaces"'),
+                           ("html", b"<html><body>502 Bad Gateway</body></html>"),
+                           ("invalid-utf8", b"\xff" * 70000),
+                           ("utf8-bom", b"\xef\xbb\xbf" + inventory),
+                           ("utf16", text.encode("utf-16")), ("utf16-le", text.encode("utf-16-le")),
+                           ("utf32-le", text.encode("utf-32-le")),
+                           ("gzip", gzip.compress(inventory))):
+            with self.subTest(case=name):
+                self.calls.clear()
+                self.usage_body = body
+                code, logs = self.run_main()
+                self.assertEqual(code, 1)
+                self.assertIn("quota API returned an invalid response", logs)
+                self.assertEqual(self.calls, [("node.tinycloud.xyz", "GET", "/admin/usage")])
+        self.calls.clear()
+        self.usage_body = inventory
+        self.assertEqual(self.run_main()[0], 0, "Plain UTF-8 JSON is still accepted")
 
     def test_wrong_owner_config_fails_before_any_request(self):
         document = json.loads(self.config.read_text())

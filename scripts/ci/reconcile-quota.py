@@ -13,6 +13,11 @@ CONFIG_PATH = Path("ops/quota-overrides.json")
 OWNER = "tinycloud:pkh:eip155:1:0xd559CCd9EB87c530A9a349262669386dE93cf412"
 LIMITS = {"applications": 5368709120, "secrets": 268721121}
 NODE_HOST = "node.tinycloud.xyz"
+# Per-space and billing bodies are a few hundred bytes. GET /admin/usage lists
+# every space on the node, unpaginated, at ~107 bytes a row (~1,034 spaces,
+# ~110 KiB, in October 2026): bounded at 16 MiB (~150,000 spaces).
+RESPONSE_CAP = 64 * 1024
+USAGE_RESPONSE_CAP = 16 * 1024 * 1024
 
 
 class QuotaError(Exception):
@@ -49,9 +54,17 @@ def credentials():
     if not node or not billing or any("\r" in value or "\n" in value for value in (node, billing)):
         raise QuotaError("required runner quota credentials are missing or invalid")
     try:
-        url = urlsplit(os.environ.get("QUOTA_BILLING_URL", ""))
-        if (url.scheme != "https" or not url.hostname or url.username or url.password
-            or url.path.rstrip("/") != "/api/quota" or url.query or url.fragment):
+        # PROD_TINYCLOUD_QUOTA_URL is also the node's TINYCLOUD_QUOTA_URL: billing's
+        # base URL, to which the node appends /api/quota/<space>. Accept that bare
+        # origin or the explicit /api/quota form; only (hostname, port) is used and
+        # every billing request path is fixed below. urlsplit silently drops
+        # CR/LF/tab, so the raw value is checked first.
+        raw = os.environ.get("QUOTA_BILLING_URL", "")
+        url = urlsplit(raw)
+        if (any(character in raw for character in "\r\n\t") or url.scheme != "https"
+            or not url.hostname or url.username is not None or url.password is not None
+            or url.path not in ("", "/", "/api/quota", "/api/quota/")
+            or url.query or url.fragment or "?" in raw or "#" in raw):
             raise ValueError
         port = url.port
     except ValueError:
@@ -59,7 +72,19 @@ def credentials():
     return node, billing, (url.hostname, port)
 
 
-def request_json(host, method, path, secret, limit=None, port=None, allow_404=False):
+def read_bounded(response, cap):
+    """Stream at most cap+1 bytes; the caller rejects a body longer than cap."""
+    chunks, size = [], 0
+    while size <= cap:
+        chunk = response.read(min(64 * 1024, cap + 1 - size))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        size += len(chunk)
+    return b"".join(chunks)
+
+
+def request_json(host, method, path, secret, limit=None, port=None, allow_404=False, cap=RESPONSE_CAP):
     """Fixed TLS requests, no redirects; retry transport only, never HTTP errors."""
     headers = {"Authorization": "Bearer " + secret, "Content-Type": "application/json"}
     body = None if limit is None else json.dumps({"limit_bytes": limit}).encode()
@@ -72,7 +97,7 @@ def request_json(host, method, path, secret, limit=None, port=None, allow_404=Fa
             connection = http.client.HTTPSConnection(host, **kwargs)
             connection.request(method, path, body=body, headers=headers)
             response = connection.getresponse()
-            payload = response.read(65537)
+            payload = read_bounded(response, cap)
         except (OSError, http.client.HTTPException):
             if attempt == 2:
                 raise QuotaError("quota transport failed after bounded attempts") from None
@@ -86,7 +111,8 @@ def request_json(host, method, path, secret, limit=None, port=None, allow_404=Fa
         if response.status != 200:
             raise QuotaError("quota API rejected the request")
         try:
-            result = json.loads(payload) if len(payload) <= 65536 else None
+            # Strict UTF-8: json.loads(bytes) would auto-accept a BOM, UTF-16 or UTF-32.
+            result = json.loads(payload.decode("utf-8")) if len(payload) <= cap else None
             if not isinstance(result, dict):
                 raise ValueError
             return result
@@ -96,7 +122,7 @@ def request_json(host, method, path, secret, limit=None, port=None, allow_404=Fa
 
 def prove_inventory(overrides, node_secret):
     """A quota GET echoes arbitrary IDs; only usage enumerates existing spaces."""
-    inventory = request_json(NODE_HOST, "GET", "/admin/usage", node_secret)
+    inventory = request_json(NODE_HOST, "GET", "/admin/usage", node_secret, cap=USAGE_RESPONSE_CAP)
     rows = inventory.get("spaces")
     if (not isinstance(rows, list) or type(inventory.get("count")) is not int
         or inventory["count"] != len(rows)):

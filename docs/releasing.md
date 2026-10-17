@@ -138,8 +138,12 @@ shared value must update both holders together, or the quota steps fail
 closed with `quota API rejected the request`. The value is never passed in
 argv/logs and never added to the CVM env or `allowed_envs` under a billing
 name. A missing credential or an incompatible billing URL fails before
-compose/CVM mutation. Billing URLs derive strictly from the same HTTPS origin and
-`/api/quota` path of `PROD_TINYCLOUD_QUOTA_URL`; no URL is printed.
+compose/CVM mutation. `PROD_TINYCLOUD_QUOTA_URL` is billing's base URL (the
+node's `TINYCLOUD_QUOTA_URL`, to which the node appends `/api/quota/<space>`):
+a bare HTTPS origin. The preflight also accepts that origin with the
+`/api/quota` path; any other path, `http`, credentials, a query or fragment,
+or CR/LF fails it. The quota steps take only its host and port and
+call billing's fixed `/api/admin/storage-comp/` path; no URL is printed.
 
 Every `deploy_phala=true` command must explicitly include
 **`-f authorize_quota_values=true`**. This authorizes the reviewed values
@@ -150,7 +154,10 @@ CVM or whitelist mutation.
 
 `authority=node-override` currently applies the reviewed limits after the
 last restart and required health. Both exact spaces must exist once with
-positive usage in authenticated `/admin/usage`. Before ANY PUT, both billing
+positive usage in authenticated `/admin/usage`, which lists every space on
+the node unpaginated (~107 bytes a space); the script reads up to 16 MiB of
+it and fails closed above that, while other quota bodies stay capped at
+64 KiB. Before ANY PUT, both billing
 storage-comp reads must prove no active comp: 404 logs only
 `billing storage-comp unavailable`; valid `active:false` also permits the
 legacy restore. Active comp fails `authority mismatch: flip to billing`.
