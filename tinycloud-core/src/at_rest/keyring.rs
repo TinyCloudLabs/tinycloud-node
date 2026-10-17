@@ -343,7 +343,7 @@ fn candidates(db: &[at_rest_key::Model], mirrored: Vec<at_rest_key::Model>) -> C
 /// error.
 ///
 /// Returns the rows for 1..=top as they must be stored, and the keys.
-fn resolve(
+fn resolve_chain(
     cands: &Candidates,
     top: &at_rest_key::Model,
     top_ark: Ark,
@@ -439,7 +439,7 @@ fn unlock_under_w(
             let Ok(ark) = open_ark(w, &c.row.sealed, &id, g, &c.row.w_label) else {
                 continue;
             };
-            match resolve(cands, &c.row, ark, Some(w)) {
+            match resolve_chain(cands, &c.row, ark, Some(w)) {
                 Ok(found) => return Ok(Some(found)),
                 // The database's own newest row: a broken store, fail loudly.
                 Err(e) if c.from_db => return Err(e),
@@ -460,7 +460,7 @@ fn unlock_under_w(
     Ok(None)
 }
 
-/// Store what `resolve` chose: insert generations the database lacks, and
+/// Store what `resolve_chain` chose: insert generations the database lacks, and
 /// update the seal or chain of those it has. Every row was authenticated.
 async fn persist_chosen(
     store: &AtRestStore,
@@ -1200,7 +1200,7 @@ impl AtRestKeyring {
             ))?;
         // Under a new root the rows still carry the old W: every older
         // generation must open by its chain, or recovery fails loudly.
-        let (mut chosen, keys) = resolve(&cands, &top, ark, None)?;
+        let (mut chosen, keys) = resolve_chain(&cands, &top, ark, None)?;
         for row in chosen.iter_mut() {
             let g = row.generation as u32;
             let gen = &keys.gens[&g];
