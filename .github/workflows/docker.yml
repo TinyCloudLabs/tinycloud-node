@@ -114,6 +114,8 @@ jobs:
       cargo_version: ${{ steps.check.outputs.cargo_version }}
     steps:
       - uses: actions/checkout@v4
+      - name: Check published Docker tags
+        run: python3 scripts/ci/test-docker-tags.py
 
       - name: Validate image version against Cargo.toml
         id: check
@@ -238,13 +240,16 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          flavor: latest=false
           tags: |
             type=semver,pattern={{version}},suffix=${{ steps.build_features.outputs.image_suffix }}
             type=semver,pattern={{major}}.{{minor}},suffix=${{ steps.build_features.outputs.image_suffix }}
             type=semver,pattern={{major}},suffix=${{ steps.build_features.outputs.image_suffix }}
             type=raw,value=${{ steps.build_features.outputs.manual_version }}${{ steps.build_features.outputs.image_suffix }},enable=${{ github.event_name == 'workflow_dispatch' && steps.build_features.outputs.manual_version != '' }}
             type=sha,prefix=
-            type=raw,value=latest${{ steps.build_features.outputs.image_suffix }},enable={{is_default_branch}}
+            type=raw,value=main,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+            type=raw,value=edge,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+            type=raw,value=latest,enable=${{ github.event_name != 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v') }}
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
@@ -307,13 +312,16 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          flavor: latest=false
           tags: |
             type=semver,pattern={{version}},suffix=-dstack${{ steps.build_features.outputs.image_suffix }}
             type=semver,pattern={{major}}.{{minor}},suffix=-dstack${{ steps.build_features.outputs.image_suffix }}
             type=semver,pattern={{major}},suffix=-dstack${{ steps.build_features.outputs.image_suffix }}
             type=raw,value=${{ steps.build_features.outputs.manual_version }}-dstack${{ steps.build_features.outputs.image_suffix }},enable=${{ github.event_name == 'workflow_dispatch' && steps.build_features.outputs.manual_version != '' }}
             type=sha,prefix=${{ steps.build_features.outputs.sha_prefix }}
-            type=raw,value=dstack${{ steps.build_features.outputs.image_suffix }},enable={{is_default_branch}}
+            type=raw,value=dstack-main,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+            type=raw,value=dstack-edge,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+            type=raw,value=dstack,enable=${{ github.event_name != 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v') }}
 
       - name: Build and push dstack Docker image
         id: build

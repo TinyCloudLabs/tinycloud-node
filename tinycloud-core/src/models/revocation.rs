@@ -251,14 +251,77 @@ pub(crate) async fn ancestor_chain_ids_for_roots<C: ConnectionTrait>(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ControlProofDecision {
     DirectSigner(String),
-    PersistentPrincipal(String),
+    Scoped(ScopedControl),
     Denied,
 }
 
-/// Resolve the principal authorized for a control action. Proofless requests
-/// stay direct-signer-only. A proof-bearing request must cite exactly one
-/// current, unrevoked session/control delegation whose persisted abilities
-/// explicitly include the requested action; invalid proofs never fall back.
+/// A current control grant bound to one requested target. Keep its complete
+/// resources: owning a space does not make a space-scoped grant account-wide.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScopedControl {
+    target: Hash,
+    grantor: String,
+    abilities: Vec<abilities::Model>,
+}
+
+impl ScopedControl {
+    fn has_cid_scope(&self) -> bool {
+        self.abilities
+            .iter()
+            .any(|ability| matches!(ability.resource, Resource::Other(_)))
+    }
+
+    /// Check direct grantor/recipient authority within an exact-CID grant.
+    pub(crate) fn directly_authorizes_cid(
+        &self,
+        target: &Hash,
+        delegation: &delegation::Model,
+    ) -> bool {
+        self.target == *target
+            && self.has_cid_scope()
+            && (did_principal_matches(&delegation.delegator, &self.grantor)
+                || did_principal_matches(&delegation.delegatee, &self.grantor))
+    }
+
+    /// Require exact-CID authority or coverage of every target capability's
+    /// complete SpaceId. Space grants cannot cover missing/non-space resources.
+    pub(crate) fn authorizes_target(
+        &self,
+        target: &Hash,
+        delegation: &delegation::Model,
+        target_abilities: &[abilities::Model],
+    ) -> bool {
+        if self.target != *target {
+            return false;
+        }
+        if self.has_cid_scope() {
+            // Exact-CID scope is checked before this value is constructed.
+            // Its issuer must still have direct authority over that target.
+            return self.directly_authorizes_cid(target, delegation)
+                || target_abilities.iter().any(|ability| {
+                    ability.resource.space().is_some_and(|space| {
+                        did_principal_matches(space.did().as_str(), &self.grantor)
+                    })
+                });
+        }
+        !target_abilities.is_empty()
+            && target_abilities.iter().all(|target_ability| {
+                let Some(target_space) = target_ability.resource.space() else {
+                    return false;
+                };
+                self.abilities.iter().any(|control| {
+                    matches!(
+                        &control.resource,
+                        Resource::TinyCloud(resource) if resource.space() == target_space
+                    )
+                })
+            })
+    }
+}
+
+/// Resolve a direct signer or the complete, target-bound control grant.
+/// Proof-bearing authority keeps its resource scopes through authorization;
+/// invalid proofs never fall back to the signer's or grantor's other rights.
 pub(crate) async fn control_proof_decision<C: ConnectionTrait>(
     db: &C,
     signer: &str,
@@ -299,31 +362,33 @@ pub(crate) async fn control_proof_decision<C: ConnectionTrait>(
         }
     }
 
-    let control_abilities = abilities::Entity::find()
+    let mut control_abilities = abilities::Entity::find()
         .filter(abilities::Column::Delegation.eq(proof_id))
         .filter(abilities::Column::Ability.eq(requested_action))
         .all(db)
         .await?;
     let target_resource = format!("urn:cid:{}", target.to_cid(0x55));
-    let has_control_ability = control_abilities
-        .iter()
-        .any(|ability| match &ability.resource {
-            Resource::Other(resource) => resource.as_str() == target_resource,
-            Resource::TinyCloud(resource) => {
-                resource.service().as_str() == "delegation"
-                    && resource
-                        .path()
-                        .map(|path| path.as_str().is_empty())
-                        .unwrap_or(true)
-                    && resource.query().is_none()
-                    && resource.fragment().is_none()
-                    && resource.space().did().as_str() == parent.delegator
-            }
-        });
-    if !has_control_ability {
+    control_abilities.retain(|ability| match &ability.resource {
+        Resource::Other(resource) => resource.as_str() == target_resource,
+        Resource::TinyCloud(resource) => {
+            resource.service().as_str() == "delegation"
+                && resource
+                    .path()
+                    .map(|path| path.as_str().is_empty())
+                    .unwrap_or(true)
+                && resource.query().is_none()
+                && resource.fragment().is_none()
+                && did_principal_matches(resource.space().did().as_str(), &parent.delegator)
+        }
+    });
+    if control_abilities.is_empty() {
         return Ok(ControlProofDecision::Denied);
     }
-    Ok(ControlProofDecision::PersistentPrincipal(parent.delegator))
+    Ok(ControlProofDecision::Scoped(ScopedControl {
+        target: *target,
+        grantor: parent.delegator,
+        abilities: control_abilities,
+    }))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -465,8 +530,17 @@ async fn revoker_is_authorized<C: ConnectionTrait>(
     )
     .await?
     {
-        ControlProofDecision::DirectSigner(principal)
-        | ControlProofDecision::PersistentPrincipal(principal) => principal,
+        ControlProofDecision::DirectSigner(principal) => principal,
+        ControlProofDecision::Scoped(control) => {
+            if control.directly_authorizes_cid(&delegation.id, delegation) {
+                return Ok(true);
+            }
+            let target_abilities = abilities::Entity::find()
+                .filter(abilities::Column::Delegation.eq(delegation.id))
+                .all(db)
+                .await?;
+            return Ok(control.authorizes_target(&delegation.id, delegation, &target_abilities));
+        }
         ControlProofDecision::Denied => return Ok(false),
     };
     if did_principal_matches(&delegation.delegator, &principal) {
