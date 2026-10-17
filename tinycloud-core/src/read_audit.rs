@@ -461,7 +461,7 @@ mod tests {
     fn telemetry_context() -> Arc<crate::request_telemetry::RequestContext> {
         crate::request_telemetry::RequestContext::new(
             "12345678-1234-4234-8234-123456789abc".parse().unwrap(),
-            Arc::new(crate::request_telemetry::Pseudonymizer::new(
+            Arc::new(crate::telemetry::Pseudonymizer::new(
                 &crate::keys::StaticSecret::new(vec![17; 32]).unwrap(),
             )),
         )

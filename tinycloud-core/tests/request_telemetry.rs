@@ -4,7 +4,8 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use tinycloud_auth::resource::SpaceId;
 use tinycloud_core::keys::StaticSecret;
-use tinycloud_core::request_telemetry::{current, scope, Pseudonymizer, RequestContext};
+use tinycloud_core::request_telemetry::{current, scope, RequestContext};
+use tinycloud_core::telemetry::Pseudonymizer;
 
 fn pseudonymizer(secret: u8) -> Arc<Pseudonymizer> {
     Arc::new(Pseudonymizer::new(
@@ -51,6 +52,62 @@ fn hashes_match_exact_canonical_domain_separated_hmac() {
     );
     context.observe_space(&space);
     assert_eq!(context.hashes(), hashes);
+}
+
+#[test]
+fn shared_pseudonyms_match_literal_interoperability_vectors() {
+    let fixtures: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/telemetry-pseudonyms.json")).unwrap();
+    let secret =
+        StaticSecret::new(hex::decode(fixtures["synthetic_secret_hex"].as_str().unwrap()).unwrap())
+            .unwrap();
+    let pseudonymizer = Pseudonymizer::new(&secret);
+    for case in fixtures["identities"].as_array().unwrap() {
+        let space: SpaceId = case["space"].as_str().unwrap().parse().unwrap();
+        assert_eq!(
+            hex::encode(pseudonymizer.account_hash(&space).into_bytes()),
+            case["account_hash"].as_str().unwrap(),
+            "{}",
+            case["id"],
+        );
+        assert_eq!(
+            hex::encode(pseudonymizer.space_hash(&space).into_bytes()),
+            case["space_hash"].as_str().unwrap(),
+            "{}",
+            case["id"],
+        );
+    }
+    let cases = fixtures["databases"].as_array().unwrap();
+    let pair = fixtures["old_separator_collision_pair"].as_array().unwrap();
+    let mut collision_hashes = [None, None];
+    for case in cases {
+        let space: SpaceId = case["space"].as_str().unwrap().parse().unwrap();
+        let hash = pseudonymizer
+            .db_hash(
+                case["service"].as_str().unwrap(),
+                &space,
+                case["physical_name"].as_str().unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            hex::encode(hash.clone().into_bytes()),
+            case["db_hash"].as_str().unwrap(),
+            "{}",
+            case["id"],
+        );
+        if let Some(index) = pair.iter().position(|id| *id == case["id"]) {
+            collision_hashes[index] = Some(hash);
+        }
+    }
+    let old_payload = |id: &serde_json::Value| {
+        let case = cases.iter().find(|case| case["id"] == *id).unwrap();
+        ["service", "space", "physical_name"]
+            .map(|field| case[field].as_str().unwrap())
+            .join("\0")
+    };
+    // This is a real ambiguity in the old encoding, not merely two different inputs.
+    assert_eq!(old_payload(&pair[0]), old_payload(&pair[1]));
+    assert_ne!(collision_hashes[0], collision_hashes[1]);
 }
 
 #[test]

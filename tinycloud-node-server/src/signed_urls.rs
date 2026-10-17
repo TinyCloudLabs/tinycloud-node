@@ -734,7 +734,8 @@ mod tests {
     #[test]
     fn telemetry_observes_only_validated_ticket_targets() {
         use std::sync::Arc;
-        use tinycloud_core::request_telemetry::{enter, Pseudonymizer, RequestContext};
+        use tinycloud_core::request_telemetry::{enter, RequestContext};
+        use tinycloud_core::telemetry::Pseudonymizer;
         let (_, space) = test_invocation("docs").unwrap();
         let secret = tinycloud_core::keys::StaticSecret::new(vec![7; 32]).unwrap();
         let context =

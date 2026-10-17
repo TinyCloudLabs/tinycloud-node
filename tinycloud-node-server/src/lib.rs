@@ -549,7 +549,12 @@ pub async fn app_with_control(
     ]);
 
     let key_setup: StaticSecret = resolve_keys(&tinycloud_config.keys).await?;
-    let tracing_fairing = tracing::TracingFairing::new(&tinycloud_config.log.tracing, &key_setup);
+    let pseudonymizer =
+        std::sync::Arc::new(tinycloud_core::telemetry::Pseudonymizer::new(&key_setup));
+    let tracing_fairing = tracing::TracingFairing::new(
+        &tinycloud_config.log.tracing,
+        std::sync::Arc::clone(&pseudonymizer),
+    );
     // TC-359: publish the derived public halves so an operator can read the
     // invitation key a dstack-keyed node actually signs with.
     let node_public_keys = NodePublicKeys::derive(&key_setup);

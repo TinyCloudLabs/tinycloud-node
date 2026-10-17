@@ -16,8 +16,8 @@ use std::{
 };
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tinycloud_core::{
-    keys::StaticSecret,
-    request_telemetry::{self, Pseudonymizer, RequestContext},
+    request_telemetry::{self, RequestContext},
+    telemetry::Pseudonymizer,
 };
 use tracing::{
     field::{Field, Visit},
@@ -173,18 +173,19 @@ pub struct TracingFairing {
 }
 
 impl TracingFairing {
-    /// Use the node's already-resolved, restart-stable key source.
-    pub fn new(cfg: &config::Tracing, secret: &StaticSecret) -> Self {
+    /// Share the node's single startup-derived pseudonymizer with request logs.
+    pub fn new(cfg: &config::Tracing, pseudonymizer: Arc<Pseudonymizer>) -> Self {
         Self {
             header_name: cfg.traceheader.clone(),
             tracing_enabled: cfg.enabled,
-            pseudonymizer: Arc::new(Pseudonymizer::new(secret)),
+            pseudonymizer,
         }
     }
 
     #[cfg(test)]
     pub(crate) fn for_test(cfg: &config::Tracing) -> Self {
-        Self::new(cfg, &StaticSecret::new(vec![0x42; 32]).unwrap())
+        let secret = tinycloud_core::keys::StaticSecret::new(vec![0x42; 32]).unwrap();
+        Self::new(cfg, Arc::new(Pseudonymizer::new(&secret)))
     }
 }
 

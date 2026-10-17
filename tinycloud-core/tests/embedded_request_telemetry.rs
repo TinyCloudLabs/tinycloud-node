@@ -2,9 +2,10 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 use tinycloud_core::keys::StaticSecret;
-use tinycloud_core::request_telemetry::{scope, Pseudonymizer, RequestContext};
+use tinycloud_core::request_telemetry::{scope, RequestContext};
 use tinycloud_core::sql::database::{spawn_actor, DatabaseHandle, GrowthPolicy};
 use tinycloud_core::sql::types::{SqlError, SqlRequest};
+use tinycloud_core::telemetry::Pseudonymizer;
 
 fn request(id: &str) -> Arc<RequestContext> {
     RequestContext::new(

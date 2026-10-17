@@ -10,55 +10,28 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-use hmac::digest::CtOutput;
-use hmac::{Hmac, Mac};
 use pin_project::pin_project;
-use sha2::Sha256;
 use tinycloud_auth::resource::SpaceId;
 use uuid::Uuid;
 
-use crate::keys::StaticSecret;
+use crate::telemetry::{Pseudonym, Pseudonymizer};
 
 pub use sqlx_core::request_telemetry::{Metrics, PoolTimer, QueryTimer, Snapshot};
 
-type PseudonymHmac = Hmac<Sha256>;
-
 thread_local! {
     static CURRENT: RefCell<Option<Arc<RequestContext>>> = const { RefCell::new(None) };
-}
-
-/// Cached keyed HMAC state, derived from the configured node secret.
-///
-/// Deliberately has no `Debug` implementation. Rotating the node secret rotates
-/// pseudonyms; domain separation prevents account and space hashes colliding.
-pub struct Pseudonymizer {
-    account: PseudonymHmac,
-    space: PseudonymHmac,
-}
-
-impl Pseudonymizer {
-    /// Derive the telemetry-only key without exposing or retaining the node secret.
-    pub fn new(secret: &StaticSecret) -> Self {
-        let key = secret.derive_key(b"tinycloud/telemetry/pseudonyms/v1");
-        // HMAC accepts every key length; the constructor cannot reject 32 bytes.
-        let mut account = PseudonymHmac::new_from_slice(&key).expect("HMAC accepts 32-byte keys");
-        account.update(b"account\0");
-        let mut space = PseudonymHmac::new_from_slice(&key).expect("HMAC accepts 32-byte keys");
-        space.update(b"space\0");
-        Self { account, space }
-    }
 }
 
 #[derive(Default)]
 enum HashSlot {
     #[default]
     Unobserved,
-    One(CtOutput<PseudonymHmac>),
+    One(Pseudonym),
     Conflicted,
 }
 
 impl HashSlot {
-    fn observe(&mut self, hash: CtOutput<PseudonymHmac>) {
+    fn observe(&mut self, hash: Pseudonym) {
         match self {
             Self::Unobserved => *self = Self::One(hash),
             // CtOutput compares cryptographic bytes in constant time.
@@ -137,17 +110,14 @@ impl RequestContext {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !matches!(identities.account, HashSlot::Conflicted) {
-            let mut account = self.pseudonymizer.account.clone();
-            account.update(space.did().as_str().as_bytes());
-            identities.account.observe(account.finalize());
+            identities
+                .account
+                .observe(self.pseudonymizer.account_hash(space));
         }
         if !matches!(identities.space, HashSlot::Conflicted) {
-            let mut canonical_space = self.pseudonymizer.space.clone();
-            canonical_space.update(b"tinycloud:");
-            canonical_space.update(space.suffix().as_bytes());
-            canonical_space.update(b":");
-            canonical_space.update(space.name().as_str().as_bytes());
-            identities.space.observe(canonical_space.finalize());
+            identities
+                .space
+                .observe(self.pseudonymizer.space_hash(space));
         }
     }
 

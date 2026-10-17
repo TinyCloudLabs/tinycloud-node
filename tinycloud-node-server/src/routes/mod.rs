@@ -8560,7 +8560,8 @@ mod tests {
 
     #[tokio::test]
     async fn public_and_host_key_telemetry_uses_target_not_caller() -> Result<()> {
-        use tinycloud_core::request_telemetry::{scope, Pseudonymizer, RequestContext};
+        use tinycloud_core::request_telemetry::{scope, RequestContext};
+        use tinycloud_core::telemetry::Pseudonymizer;
         let f = KvSyncFixture::new().await?;
         let tinycloud = State::from(f.client.rocket().state::<TinyCloud>().unwrap());
         let secret = tinycloud_core::keys::StaticSecret::new(vec![63; 32]).unwrap();

@@ -8742,7 +8742,7 @@ mod tests {
         let live_binding: Value = binding_response.into_json().await.unwrap();
         let telemetry = tinycloud_core::request_telemetry::RequestContext::new(
             uuid::Uuid::new_v4(),
-            std::sync::Arc::new(tinycloud_core::request_telemetry::Pseudonymizer::new(
+            std::sync::Arc::new(tinycloud_core::telemetry::Pseudonymizer::new(
                 &StaticSecret::new(vec![29; 32]).unwrap(),
             )),
         );
@@ -8790,7 +8790,7 @@ mod tests {
         assert_eq!(register_status, Status::Ok, "register: {register_body}");
         let expected_identity = tinycloud_core::request_telemetry::RequestContext::new(
             uuid::Uuid::new_v4(),
-            std::sync::Arc::new(tinycloud_core::request_telemetry::Pseudonymizer::new(
+            std::sync::Arc::new(tinycloud_core::telemetry::Pseudonymizer::new(
                 &StaticSecret::new(vec![29; 32]).unwrap(),
             )),
         );
