@@ -1,6 +1,38 @@
+use sea_orm::{
+    error::{RuntimeErr, SqlxError},
+    ConnectionTrait, DbBackend,
+};
 use sea_orm_migration::prelude::*;
 
 use crate::models::delegation;
+
+/// How long `up` waits on PostgreSQL for a lock on `delegation` before it
+/// fails (TC-1176). Dropping the index needs an ACCESS EXCLUSIVE lock, which
+/// queues behind any open transaction that has read the table and, while
+/// queued, blocks every later reader. The deploy runs with the writer
+/// stopped, so a legitimate holder is a short read; 30s outlasts one, while a
+/// stuck session fails the boot with a clear error instead of hanging it. The
+/// limit bounds each lock wait, not the index build.
+const LOCK_TIMEOUT: &str = "30s";
+
+/// Name a lock-wait failure (SQLSTATE 55P03, raised by `lock_timeout`) so the
+/// boot error says what to fix. Other errors pass through unchanged.
+fn lock_wait_error(error: DbErr) -> DbErr {
+    let (DbErr::Exec(RuntimeErr::SqlxError(SqlxError::Database(database)))
+    | DbErr::Query(RuntimeErr::SqlxError(SqlxError::Database(database)))) = &error
+    else {
+        return error;
+    };
+    if database.code().as_deref() != Some("55P03") {
+        return error;
+    }
+    DbErr::Migration(format!(
+        "{}: gave up after waiting {LOCK_TIMEOUT} (lock_timeout) for a lock on table \
+         delegation; another session holds a conflicting lock (SQLSTATE 55P03: {database}). \
+         The migration was rolled back and nothing was applied; end that session and restart.",
+        Migration.name()
+    ))
+}
 
 #[derive(DeriveMigrationName)]
 pub struct Migration;
@@ -25,18 +57,40 @@ async fn drop_index_if_exists(manager: &SchemaManager<'_>) -> Result<(), DbErr> 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        drop_index_if_exists(manager).await?;
-        manager
-            .create_index(
-                Index::create()
-                    .name("idx_delegation_delegator")
-                    .table(delegation::Entity)
-                    .col(delegation::Column::Delegator)
-                    .col(delegation::Column::Id)
-                    .if_not_exists()
-                    .to_owned(),
-            )
-            .await
+        // sea-orm-migration runs PostgreSQL migrations in one transaction, so
+        // a lock-wait failure rolls back the index change and leaves this
+        // migration unrecorded. `SET LOCAL` lasts until that transaction
+        // ends; it is reset below so later migrations keep the default.
+        let postgres = manager.get_database_backend() == DbBackend::Postgres;
+        if postgres {
+            manager
+                .get_connection()
+                .execute_unprepared(&format!("SET LOCAL lock_timeout = '{LOCK_TIMEOUT}'"))
+                .await?;
+        }
+        let rebuilt: Result<(), DbErr> = async {
+            drop_index_if_exists(manager).await?;
+            manager
+                .create_index(
+                    Index::create()
+                        .name("idx_delegation_delegator")
+                        .table(delegation::Entity)
+                        .col(delegation::Column::Delegator)
+                        .col(delegation::Column::Id)
+                        .if_not_exists()
+                        .to_owned(),
+                )
+                .await
+        }
+        .await;
+        rebuilt.map_err(lock_wait_error)?;
+        if postgres {
+            manager
+                .get_connection()
+                .execute_unprepared("SET LOCAL lock_timeout TO DEFAULT")
+                .await?;
+        }
+        Ok(())
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
@@ -51,5 +105,103 @@ impl MigrationTrait for Migration {
                     .to_owned(),
             )
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{db::migrate, db_pool::RecoveringConnection, test_support::PostgresTestSchema};
+    use sea_orm::{DatabaseConnection, Statement, TransactionTrait};
+    use std::time::{Duration, Instant};
+
+    /// `(name, definition, valid)` for every index on `delegation`.
+    async fn delegation_indexes(db: &DatabaseConnection) -> Vec<(String, String, bool)> {
+        db.query_all(Statement::from_string(
+            DbBackend::Postgres,
+            "SELECT c.relname, pg_get_indexdef(i.indexrelid) AS def, i.indisvalid \
+             FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid \
+             WHERE i.indrelid = 'delegation'::regclass ORDER BY c.relname"
+                .to_string(),
+        ))
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| {
+            (
+                row.try_get("", "relname").unwrap(),
+                row.try_get("", "def").unwrap(),
+                row.try_get("", "indisvalid").unwrap(),
+            )
+        })
+        .collect()
+    }
+
+    async fn recorded(db: &DatabaseConnection) -> bool {
+        db.query_one(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT 1 FROM seaql_migrations WHERE version = $1",
+            [Migration.name().into()],
+        ))
+        .await
+        .unwrap()
+        .is_some()
+    }
+
+    /// A session holding any lock on `delegation` must make the boot
+    /// migration fail within its lock timeout, not hang, and leave the
+    /// database exactly as before so a later boot can apply it.
+    #[tokio::test]
+    async fn postgres_cursor_index_fails_fast_while_delegation_is_locked() {
+        let Some(fixture) =
+            PostgresTestSchema::new("postgres_cursor_index_fails_fast_while_delegation_is_locked")
+                .await
+        else {
+            return;
+        };
+        let db = &fixture.conn;
+        // Back to the state a node upgrading to this migration boots with.
+        crate::migrations::Migrator::down(db, Some(1))
+            .await
+            .unwrap();
+        assert!(!recorded(db).await);
+        let before = delegation_indexes(db).await;
+
+        let reader = db.begin().await.unwrap();
+        reader
+            .execute_unprepared("LOCK TABLE delegation IN ACCESS SHARE MODE")
+            .await
+            .unwrap();
+        let pool = RecoveringConnection::new(db.clone());
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(Duration::from_secs(45), migrate(&pool)).await;
+        let waited = started.elapsed();
+        reader.rollback().await.unwrap();
+
+        let error = outcome
+            .expect("boot migration still waiting for the delegation lock after 45s")
+            .expect_err("boot migration must fail while delegation is locked");
+        let message = error.to_string();
+        assert!(
+            matches!(error, DbErr::Migration(_))
+                && message.contains("lock on table delegation")
+                && message.contains("55P03"),
+            "error must name the lock wait: {message}"
+        );
+        eprintln!("boot migration failed after {waited:?}: {message}");
+        assert_eq!(delegation_indexes(db).await, before);
+        assert!(!recorded(db).await);
+
+        migrate(&pool).await.unwrap();
+        assert!(recorded(db).await);
+        let after = delegation_indexes(db).await;
+        let cursor = after
+            .iter()
+            .find(|(name, _, _)| name == "idx_delegation_delegator")
+            .unwrap();
+        assert!(
+            cursor.1.ends_with("(delegator, id)") && cursor.2,
+            "{cursor:?}"
+        );
     }
 }
