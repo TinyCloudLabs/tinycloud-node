@@ -416,6 +416,8 @@ impl Node {
         let request_events = out
             .lines()
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|event| event["target"] == "tinycloud::request")
+            .map(|mut event| event["fields"].take())
             .filter(|event| {
                 event["event"] == "node_request"
                     && event["method"] == "POST"
