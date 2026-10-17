@@ -1812,7 +1812,7 @@ pub(crate) mod tests {
             .map(|epoch| (epoch.id, epoch.seq))
             .collect::<std::collections::HashMap<_, _>>();
         for event in event_order::Entity::find()
-            .filter(event_order::Column::Space.eq(space))
+            .filter(event_order::Column::Space.eq(space.clone()))
             .all(conn)
             .await
             .unwrap()
@@ -1823,6 +1823,20 @@ pub(crate) mod tests {
                 "{label}: an event must carry its epoch's seq"
             );
         }
+        // TC-1274: the cached heads are exactly the chain's last epoch.
+        let cached = crate::models::epoch_head::Entity::find()
+            .filter(crate::models::epoch_head::Column::Space.eq(space))
+            .all(conn)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|head| (head.id, head.seq))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            cached,
+            Vec::from_iter(epochs.last().map(|epoch| (epoch.id, epoch.seq))),
+            "{label}: the cached head must be the newest epoch"
+        );
         epochs.len()
     }
 

@@ -7,7 +7,7 @@ import { assertCapture } from '../scripts/tc959-docker.mjs';
 const fields = JSON.parse(await readFile(new URL('./fields.json', import.meta.url), 'utf8'));
 const nodeSchema = fields.services['tinycloud-node'];
 
-test('request representatives use the schema longest route and method, with no N2 identifiers', () => {
+test('request representatives use the schema longest route and method; only node requests carry correlation fields', () => {
   const routes = nodeSchema.fields.route.values;
   const methods = nodeSchema.fields.method.values;
   for (const row of [representativeEvents.node, representativeEvents.ingress]) {
@@ -16,7 +16,11 @@ test('request representatives use the schema longest route and method, with no N
     assert.ok(routes.includes(row.route));
     assert.ok(methods.includes(row.method));
     assert.equal(row.ts.length, 24);
-    for (const key of ['request_id', 'account_hash', 'space_hash']) assert.equal(Object.hasOwn(row, key), false);
+    for (const key of ['request_id', 'request_id_replaced', 'account_hash', 'space_hash']) {
+      assert.equal(Object.hasOwn(row, key), row === representativeEvents.node);
+    }
+    if (row === representativeEvents.node) for (const key of ['request_id', 'account_hash', 'space_hash']) assert.match(row[key], new RegExp(nodeSchema.fields[key].regex));
+    assert.equal(Object.hasOwn(row, 'db_hash'), false);
   }
   assert.equal(representativeEvents.node.event, 'node_request');
   assert.equal(representativeEvents.node.latency_us, Number.MAX_SAFE_INTEGER);

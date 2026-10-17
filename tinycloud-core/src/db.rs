@@ -541,6 +541,44 @@ where
     pub async fn begin_graph_transaction(&self) -> Result<DatabaseTransaction, DbErr> {
         begin_write_transaction(&self.conn, chain_isolation_level(&self.conn)).await
     }
+
+    /// TC-1274 backfill: up to `limit` space IDs after `after`, in ID order.
+    pub async fn epoch_head_backfill_page(
+        &self,
+        after: Option<&SpaceId>,
+        limit: u64,
+    ) -> Result<Vec<SpaceId>, DbErr> {
+        let mut query = space::Entity::find().order_by_asc(space::Column::Id);
+        if let Some(after) = after {
+            query = query.filter(space::Column::Id.gt(SpaceIdWrap(after.clone())));
+        }
+        Ok(query
+            .limit(limit)
+            .all(&self.conn)
+            .await?
+            .into_iter()
+            .map(|space| space.id.0)
+            .collect())
+    }
+
+    /// TC-1274 backfill of one space: rewrite its cached head epochs from
+    /// history unless they are provably current. Takes the space's sequence
+    /// locks as a write does, so it serializes with that space's writers and
+    /// holds no other space. Returns whether it rewrote the cache.
+    pub async fn repair_epoch_heads(&self, space: &SpaceId) -> Result<bool, DbErr> {
+        let _sequence = self
+            .acquire_space_sequence_guards(std::slice::from_ref(space))
+            .await;
+        let _writer = match &self.writer_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+        let tx = self.begin_graph_transaction().await?;
+        crate::kv_sync::lock_space_sequences(&tx, [space]).await?;
+        let repaired = crate::epoch_head::repair(&tx, &SpaceIdWrap(space.clone())).await?;
+        tx.commit().await?;
+        Ok(repaired)
+    }
 }
 
 impl<C, B, K> SpaceDatabase<C, B, K>
@@ -3344,34 +3382,18 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
             }
         }
 
-        // get 'most recent' epochs for each of the spaces
-        let mut most_recent = epoch::Entity::find()
-            .select_only()
-            .left_join(epoch_order::Entity)
-            .filter(
-                Condition::all()
-                    .add(epoch::Column::Space.is_in(event_spaces.keys().cloned().map(SpaceIdWrap)))
-                    .add(epoch_order::Column::Child.is_null()),
-            )
-            .column(epoch::Column::Space)
-            .column(epoch::Column::Id)
-            .into_tuple::<(SpaceIdWrap, Hash)>()
-            .all(db)
-            .await?
-            .into_iter()
-            .fold(
-                HashMap::new(),
-                |mut m: HashMap<SpaceIdWrap, Vec<Hash>>, (space, epoch)| {
-                    m.entry(space).or_default().push(epoch);
-                    m
-                },
-            );
+        // The current heads of each space (TC-1274): O(#heads) from the
+        // `epoch_head` cache, falling back to history only for a space whose
+        // cache is not provably current. The sequence locks taken above are
+        // held to commit.
+        let head_spaces: Vec<SpaceIdWrap> = event_spaces.keys().cloned().map(SpaceIdWrap).collect();
+        let mut heads = crate::epoch_head::current(db, &head_spaces, &max_seqs).await?;
 
         // get all the orderings and associated data
         let (epoch_order, space_order, event_order, epochs) = event_spaces
             .into_iter()
             .map(|(space, events)| {
-                let parents = most_recent.remove(&space).unwrap_or_default();
+                let parents = heads.parents.remove(&space).unwrap_or_default();
                 let epoch = epoch_hash(&space, &events, &parents)?;
                 let seq = max_seqs.remove(&space).unwrap_or(0);
                 Ok((space, (epoch, events, seq, parents)))
@@ -3449,6 +3471,18 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                 );
                 TxError::EpochInsert(e)
             })?;
+
+        // Each space's only head is now the epoch just appended: its parents
+        // were all of the previous heads.
+        crate::epoch_head::advance(
+            db,
+            &heads,
+            space_order
+                .iter()
+                .map(|(space, (seq, epoch, _, _))| (SpaceIdWrap(space.clone()), *epoch, *seq))
+                .collect(),
+        )
+        .await?;
 
         // save epoch orderings
         if !epoch_order.is_empty() {

@@ -24,6 +24,11 @@ export const MINUTES_30_DAYS = 30 * 24 * 60;
 export const REQUEST_ALLOCATION_BYTES = 480_000_000;
 
 const common = { level: 'info', ts: '9999-12-31T23:59:59.999Z' };
+// Worst-valid N2 correlation fields on a node request: longest request id, both full-width pseudonyms.
+const correlation = {
+  request_id: 'ffffffff-ffff-8fff-bfff-ffffffffffff', request_id_replaced: true,
+  account_hash: 'f'.repeat(64), space_hash: 'f'.repeat(64),
+};
 const request = {
   method: longest(schema.fields.method.values), route: longest(schema.fields.route.values),
   status: schema.fields.status.max,
@@ -32,12 +37,13 @@ const request = {
 /**
  * Representative worst-valid N0 wire records: longest schema strings, maximum
  * integer widths, and a long round-trippable fractional ingress duration.
- * N2 UUIDs/hashes are reserved by the canonical schema but are NOT emitted in N0.
+ * Only node_request carries N2 correlation fields (request_id, request_id_replaced, account_hash,
+ * space_hash); the ingress log carries none. db_hash is emitted by the F6 typed events only.
  * Bytes below are exact for these records, not a proven Vector float-serializer
  * upper bound or a fixed event-size guard. Actual ingestion/billing can differ.
  */
 export const representativeEvents = Object.freeze({
-  node: Object.freeze({ ...common, event: 'node_request', svc: 'api', ...request, latency_us: schema.fields.latency_us.max }),
+  node: Object.freeze({ ...common, event: 'node_request', svc: 'api', ...request, latency_us: schema.fields.latency_us.max, ...correlation }),
   ingress: Object.freeze({ ...common, event: 'ingress_request', svc: 'ingress', ...request, request_time_seconds: 0.0000010000000000000002 }),
   diagnostic: Object.freeze({ level: 'warn', ts: common.ts, event: 'node_warning', svc: 'api', event_code: longest(schema.fields.event_code.values), event_count: schema.fields.event_count.max }),
   gate: Object.freeze({ level: 'warn', ts: common.ts, event: 'logship_gate_summary_total', svc: 'logship', reason: longest(schema.fields.reason.values), count: schema.fields.count.max }),

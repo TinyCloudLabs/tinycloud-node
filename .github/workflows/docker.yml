@@ -658,7 +658,7 @@ jobs:
               raise SystemExit('::error::Deployment destination is not the fixed reviewed path')
           native = 'ghcr.io/tinycloudlabs/tinycloud-node'
           reviewed = native + '@sha256:4bdae4fc232d886bb56bfbce4ec62ed4b8fb4e1369a01f6afb73d06dd68c188f'
-          n0_hash = 'ca110b0bae6d5a06a1002fb80df3f71cffec11659c9f9dbfa5d72624735546f6'
+          n0_hash = '1e62ceb326679c8862c8ae822288b48c54997983a4b011b84d516e943e4f1859'
           pre_n0_hash = 'df239749ca0a9c09893a855ae2a8abb94090b8556515ad002105c58ac91f4c91'
           pre_n0_template_hash = '28302d6761d841b7cc5c11314aed2d377735e6bbdcaf85972a752e03bc9fdc93'
           rollback = os.environ.get('ROLLBACK_PRE_N0') == 'true'
