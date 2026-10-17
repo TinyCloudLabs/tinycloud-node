@@ -18,9 +18,13 @@ use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DisplayFromStr};
 use std::{collections::HashMap, io::Error as IoError, ops::AddAssign, time::Instant};
 use tinycloud_auth::resource::SpaceId;
-use tinycloud_core::{hash::Hash, storage::*};
+use tinycloud_core::{at_rest::plaintext_len, hash::Hash, storage::*};
 
-use super::{file_system, size::SpaceSizes};
+use super::{
+    file_system,
+    sealed::{self, scanned_object, ScannedObject},
+    size::SpaceSizes,
+};
 
 async fn aws_config() -> SdkConfig {
     aws_config::from_env().load().await
@@ -73,31 +77,48 @@ pub(crate) async fn new_client(config: &S3BlockConfig) -> Client {
 impl S3BlockStore {
     async fn new_(config: &S3BlockConfig) -> Result<Self, S3Error> {
         let client = new_client(config).await;
-        let sizes = client
+        let (spaces, sealed, invalid) = client
             .list_objects_v2()
             .bucket(&config.bucket)
             .into_paginator()
             .send()
-            // get the sum of all objects in each page
-            .try_fold(HashMap::new(), |mut acc, page| async move {
-                // get the sum of all objects per space in this particular page
-                for (space, obj_size) in page.contents.into_iter().flatten().filter_map(|content| {
-                    content.key().and_then(|key| {
-                        let (o, _) = key.rsplit_once('/')?;
-                        let space: SpaceId = o.parse().ok()?;
-                        if content.size() > 0 {
-                            Some((space, content.size() as u64))
-                        } else {
-                            None
+            // sum stored plaintext bytes per space (legacy names) and per
+            // space tag (sealed names) in each page
+            .try_fold(
+                (
+                    HashMap::new(),
+                    HashMap::new(),
+                    sealed::InvalidLengthLog::default(),
+                ),
+                |(mut spaces, mut sealed, mut invalid), page| async move {
+                    for content in page.contents.into_iter().flatten() {
+                        let (Some(key), size) = (content.key(), content.size().max(0) as u64)
+                        else {
+                            continue;
+                        };
+                        match scanned_object(key) {
+                            ScannedObject::Legacy(space) if size > 0 => {
+                                spaces.entry(space).or_insert(0).add_assign(size);
+                            }
+                            ScannedObject::Sealed(tag) => {
+                                let plaintext = plaintext_len(size).unwrap_or_else(|| {
+                                    invalid.record(size);
+                                    0
+                                });
+                                sealed
+                                    .entry(tag.to_owned())
+                                    .or_insert(0)
+                                    .add_assign(plaintext);
+                            }
+                            _ => {}
                         }
-                    })
-                }) {
-                    acc.entry(space).or_insert(0).add_assign(obj_size);
-                }
-                Ok(acc)
-            })
-            .await?
-            .into();
+                    }
+                    Ok((spaces, sealed, invalid))
+                },
+            )
+            .await?;
+        invalid.finish();
+        let sizes = SpaceSizes::from_scan(spaces, sealed);
         Ok(S3BlockStore {
             client,
             bucket: config.bucket.clone(),
@@ -114,10 +135,10 @@ impl S3BlockStore {
     }
 
     async fn increment_size(&self, space: &SpaceId, size: u64) {
-        self.sizes.increment_size(space, size).await;
+        self.sizes.increment_size(space, None, size).await;
     }
     async fn decrement_size(&self, space: &SpaceId, size: u64) {
-        self.sizes.decrement_size(space, size).await;
+        self.sizes.decrement_size(space, None, size).await;
     }
 }
 
@@ -137,6 +158,8 @@ pub enum S3StoreError {
     Length(#[from] std::num::TryFromIntError),
     #[error("invalid S3 Content-Range response: {0}")]
     InvalidContentRange(String),
+    #[error(transparent)]
+    AtRest(#[from] sealed::AtRestStoreError),
 }
 
 #[async_trait]
@@ -477,7 +500,7 @@ impl ImmutableDeleteStore for S3BlockStore {
 impl StoreSize for S3BlockStore {
     type Error = S3StoreError;
     async fn total_size(&self, space: &SpaceId) -> Result<Option<u64>, Self::Error> {
-        Ok(self.sizes.get_size(space).await)
+        Ok(self.sizes.get_size(space, None).await)
     }
 }
 

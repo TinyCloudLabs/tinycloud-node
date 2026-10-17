@@ -237,7 +237,7 @@ pub async fn public_kv_get(
     let result = tinycloud
         .public_kv_get(&space_id, &key)
         .await
-        .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+        .map_err(super::kv_read_failure)?;
 
     match result {
         Some((md, hash, content)) => {
@@ -284,7 +284,7 @@ pub async fn public_kv_head(
     let result = tinycloud
         .public_kv_get(&space_id, &key)
         .await
-        .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+        .map_err(super::kv_read_failure)?;
 
     match result {
         Some((md, hash, _content)) => {

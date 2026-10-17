@@ -114,7 +114,8 @@ path = "../tinycloud-at-rest-escrow/"
 [dev-dependencies.tinycloud-core]
 path = "../tinycloud-core/"
 default-features = false
-features = ["sqlite", "postgres", "mysql", "tokio", "verification-count-test-hook"]
+# TC-887: `test-util` provides at_rest::FixedKeyProvider for sealed-store tests.
+features = ["sqlite", "postgres", "mysql", "tokio", "verification-count-test-hook", "test-util"]
 
 [dev-dependencies]
 # TC-887: escrow holders decrypting their shares in tests/at_rest_ceremony.rs.
