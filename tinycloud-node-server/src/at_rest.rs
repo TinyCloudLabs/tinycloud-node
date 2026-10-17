@@ -289,13 +289,10 @@ pub async fn setup(
     if tee.is_some() && escrow.allow_software {
         bail!("at_rest.escrow.allow_software is refused inside a TEE: escrow holders must use hardware keys");
     }
+    // In a TEE every at-rest configuration is checked against the measured
+    // compose; see `check_tee_escrow`.
     if let Some(tee) = tee {
-        if !escrow.recipients.is_empty() || escrow.verified_fp.is_some() {
-            let app_compose = crate::dstack::get_app_compose()
-                .await
-                .context("reading the measured app-compose to check the at-rest escrow config")?;
-            check_measured_escrow(&app_compose, &tee.compose_hash, escrow)?;
-        }
+        check_tee_escrow(crate::dstack::get_app_compose().await, tee, escrow)?;
     }
     let pinned_efp = escrow.verified_fp.as_deref().map(parse_efp).transpose()?;
     let mirror: Arc<dyn KeyMirror> = match &storage.blocks {
@@ -351,6 +348,24 @@ pub async fn setup(
         _ => bail!("at-rest keys were not provisioned"),
     }
     Ok(())
+}
+
+/// The TEE boot check: `app_compose` is what the guest agent returned for
+/// `tcb_info.app_compose`. If it couldn't be read, or doesn't parse, or the
+/// escrow config doesn't match its literals, the node refuses to start: it
+/// never runs at-rest in a TEE without the check. (The guest agent's Info
+/// shape is to be confirmed on a live CVM before the escrow ceremony.)
+pub fn check_tee_escrow(
+    app_compose: Result<String>,
+    tee: &TeeContext,
+    escrow: &AtRestEscrowConfig,
+) -> Result<()> {
+    let app_compose = app_compose.context(
+        "refusing to start: at-rest needs the measured app-compose (dstack Info tcb_info.app_compose) to check the escrow config, and it could not be read",
+    )?;
+    check_measured_escrow(&app_compose, &tee.compose_hash, escrow).context(
+        "refusing to start: the at-rest escrow config does not match the measured app-compose",
+    )
 }
 
 fn parse_efp(s: &str) -> Result<Efp> {
@@ -512,5 +527,30 @@ mod tests {
         let doc = app_compose(&format!("      {RECIPIENTS_ENV}: '{R}'\n"));
         let err = check_measured_escrow(&doc, &"0".repeat(64), &escrow(R, None)).unwrap_err();
         assert!(err.to_string().contains("measured compose_hash"), "{err}");
+    }
+
+    #[test]
+    fn a_tee_node_refuses_to_start_without_a_readable_measured_compose() {
+        let doc = app_compose(&format!("      {RECIPIENTS_ENV}: '{R}'\n"));
+        let tee = TeeContext {
+            app_id: "a".into(),
+            compose_hash: hash(&doc),
+            instance_id: "i".into(),
+            enforcer_did: "did:key:z".into(),
+        };
+        // The guest agent's Info had no tcb_info.app_compose, or it isn't
+        // an app-compose at all: never start without the check.
+        for app_compose in [
+            Err(anyhow::anyhow!("dstack Info has no tcb_info")),
+            Ok("not json".to_string()),
+        ] {
+            let err = format!(
+                "{:#}",
+                check_tee_escrow(app_compose, &tee, &escrow(R, None)).unwrap_err()
+            );
+            assert!(err.starts_with("refusing to start"), "{err}");
+        }
+        // Readable and matching: the boot may continue.
+        check_tee_escrow(Ok(doc), &tee, &escrow(R, None)).unwrap();
     }
 }

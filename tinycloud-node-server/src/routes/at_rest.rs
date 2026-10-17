@@ -194,6 +194,8 @@ pub struct ShareAnswer {
 #[post("/at-rest/recovery/shares", data = "<body>")]
 pub async fn at_rest_recovery_share(
     at_rest: AtRestState<'_>,
+    // TC-1357: ClientIp trusts the proxy IP header from any peer; per-client
+    // limits are best effort until it is trusted only from the ingress.
     client_ip: ClientIp,
     rate_limiter: &State<RateLimiter>,
     body: Data<'_>,
