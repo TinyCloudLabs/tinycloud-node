@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.20.7](https://github.com/TinyCloudLabs/tinycloud-node/compare/v0.0.1...v1.20.7) - 2026-10-17
+
+### Added
+
+- *(TC-1274)* maintain epoch_head so writes stop scanning epoch history ([#343](https://github.com/TinyCloudLabs/tinycloud-node/pull/343))
+- *(TC-887)* TCE1 segmented AES-256-GCM envelope ([#322](https://github.com/TinyCloudLabs/tinycloud-node/pull/322))
+
+### Fixed
+
+- *(TC-1277)* saturate SpaceSizes decrement instead of wrapping ([#345](https://github.com/TinyCloudLabs/tinycloud-node/pull/345))
+- *(TC-1354)* size S3 block deletes with HeadObject ([#337](https://github.com/TinyCloudLabs/tinycloud-node/pull/337))
+- Require revoke action for revocation requests ([#314](https://github.com/TinyCloudLabs/tinycloud-node/pull/314))
+- tighten revocation scope checks ([#311](https://github.com/TinyCloudLabs/tinycloud-node/pull/311))
+
+### Other
+
+- *(TC-887)* base32 runs end at their own alphabet; name 3+ salt pieces as out of scope ([#344](https://github.com/TinyCloudLabs/tinycloud-node/pull/344))
+- *(TC-887)* harness follow-ups 3: secrets in blocks, blocks tied to their DEK, ARK sanity cap ([#340](https://github.com/TinyCloudLabs/tinycloud-node/pull/340))
+- *(TC-887)* harness follow-ups: derived keys in mirrors, escrow-none, bounded generations, required mirrors ([#338](https://github.com/TinyCloudLabs/tinycloud-node/pull/338))
+- prewarm PostgreSQL round-trip budget fixture ([#339](https://github.com/TinyCloudLabs/tinycloud-node/pull/339))
+- *(TC-887)* keep the at-rest key mirror out of KV pairing; check it for raw keys ([#335](https://github.com/TinyCloudLabs/tinycloud-node/pull/335))
+- *(TC-887)* at-rest interfaces in the repo, one generation ceiling, harness follow-ups ([#331](https://github.com/TinyCloudLabs/tinycloud-node/pull/331))
+- Add request correlation and per-request database telemetry ([#305](https://github.com/TinyCloudLabs/tinycloud-node/pull/305))
+- *(TC-887)* native at-rest harness with RED plaintext-at-rest checks ([#324](https://github.com/TinyCloudLabs/tinycloud-node/pull/324))
+- Normalize delegation identifiers ([#291](https://github.com/TinyCloudLabs/tinycloud-node/pull/291))
+- Harden DuckDB statement and settings policy ([#312](https://github.com/TinyCloudLabs/tinycloud-node/pull/312))
+- Test a personal-node installation guide ([#308](https://github.com/TinyCloudLabs/tinycloud-node/pull/308))
+- hash report data before GetQuote ([#295](https://github.com/TinyCloudLabs/tinycloud-node/pull/295))
+
 - Recheck hook ticket delegation revocation when event streams open and use
   literal segment-prefix matching for hook subscriptions.
 
