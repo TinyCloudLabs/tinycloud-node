@@ -66,12 +66,12 @@ main's history (`scripts/ci/check-deploy-ref.sh`, before builds and again
 inside `deploy-phala`). Other refs fail `Deploy refused (main-only)`.
 
 **Release order:** approved #310 must never merge alone. Land #310 and its
-stacked recovery change atomically as one lineage, preserving emergency
-re-promotion and security rollback first. #309's sidecar compose belongs
-only to the later approved logging window, not this workflow/security
-release. The security card remains rollback-not-ready until the combined
-path is reviewed and landed. These docs grant no merge or dispatch authority.
-Merging either workflow change is a push, not a deployment dispatch.
+stacked recovery changes atomically as one lineage, preserving emergency
+re-promotion and security rollback first. #309's sidecar compose may then
+ship in the same window as a main release, promoted by one dispatch (see
+[Main release with N0 log shipping](#main-release-with-n0-log-shipping-one-dispatch)).
+These docs grant no merge or dispatch authority. Merging either workflow
+change is a push, not a deployment dispatch.
 
 ### The `production` environment (TC-971)
 
@@ -204,10 +204,13 @@ its branch policy before any workflow that names it runs.
    - `image_version` and recorded labels describe the immutable image,
      never an unrelated current crate version. The revision must be in
      main history. A future non-N0 digest uses this same contract.
-   - The reviewed N0 compose remains raw-hash locked to its exact image;
-     it cannot substitute a future security image. Before the later
-     logging window, the ordinary main `:dstack` compose supports forward
-     image promotions without installing the sidecar.
+   - The reviewed N0 compose is locked as a template: its raw bytes with
+     the single node digest normalized. Only a recorded *released* main
+     image may fill that pin; see
+     [Main release with N0 log shipping](#main-release-with-n0-log-shipping-one-dispatch).
+     Before #309 lands,
+     the ordinary main `:dstack` compose supports forward image
+     promotions without installing the sidecar.
    - `sql_identity_fence=false` is required. The input defaults to `true`,
      which re-fences SQL/DuckDB in production (503s).
    - The production ancestry guard still applies: the revision prod is running
@@ -265,6 +268,54 @@ its branch policy before any workflow that names it runs.
    `gh workflow run write-probe.yml -R TinyCloudLabs/tinycloud-node --ref main -f mode=dense`.
    Details: `test/probe/README.md`.
 
+### Main release with N0 log shipping (one dispatch)
+
+Ships a main release and #309's log sidecar together. Before dispatching,
+`main` must contain the combined workflow lineage and #309, plus the merged
+`chore(release): 1.21.0` commit tagged `v1.21.0`. Take the digest and
+labels of the tag build's `1.21.0-dstack` image as in step 1 above:
+
+```sh
+gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref main \
+  -f deploy_phala=true \
+  -f authorize_quota_values=true \
+  -f image_version=1.21.0 \
+  -f deploy_image_digest=sha256:<release-dstack-digest> \
+  -f rollback_image_version=1.21.0 \
+  -f rollback_image_revision=<release-commit-sha> \
+  -f sql_identity_fence=false
+```
+
+Before any CVM mutation the workflow requires:
+
+- the main compose, with its one node digest replaced by 64 zeros, to hash
+  to the reviewed N0 template
+  **`92be17ff125e5d4cada9b81d7a8e655442fa66a454e19f76e3f8880a93123d3d`**
+  (#309's raw `ca110b0bae6d5a06a1002fb80df3f71cffec11659c9f9dbfa5d72624735546f6`
+  normalized). Ingress, socat, Vector and the log profile stay byte-exact;
+- the deployed compose to differ from that template only by
+  `deploy_image_digest`;
+- OCI labels `1.21.0-dstack` / `<release-commit-sha>`, the `v1.21.0` tag on
+  that commit, its `Cargo.toml` at `1.21.0`, and the commit in main history.
+  An untagged, mislabelled, feature-variant or freshly built image is
+  refused.
+
+Sealed preflight, `BETTERSTACK_SOURCE_TOKEN` sealing with the
+`allowed_envs` sync, and the general quota reconciliation run as on every
+deploy. The template's comment naming 1.20.6 is reviewed text, not image
+identity; `/version` and the labels report the release. Reproduce the
+template hash from any ref:
+
+```sh
+git show main:docker-compose.dstack-postgres.yaml \
+  | sed -E '/^    image: ghcr\.io\/tinycloudlabs\/tinycloud-node@sha256:/s/[0-9a-f]{64}$/0000000000000000000000000000000000000000000000000000000000000000/' \
+  | sha256sum
+```
+
+Rolling this release back means a database snapshot restore (a separate
+decision) plus the [captured pre-N0 rollback](#tc-1302-captured-pre-n0-rollback)
+to 1.20.6 with Sam's explicit privacy mode.
+
 ## Rolling back
 
 Keep the digest, actual OCI version and actual revision of every promoted
@@ -294,14 +345,14 @@ gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref main \
 ```
 
 The served/OCI identity remains **1.20.6-dstack / e18578ff9162986ddd813259c60f73866e3e60d1**.
-The N0 raw lock **changed again in TC-1274**, which sets `TINYCLOUD_EPOCH_HEAD_BACKFILL__ENABLED: "false"` in the production compose (whichever of this and #347 lands second re-pins). It previously changed in #346 (TC-959), which passes the validated N2 correlation fields through the log sidecar; the hash below is the TC-1274 lock:
-`c33c23021589163b62a71ef245b7194717711922027629f155bdd5cff806b8c7`,
-from #346 final reviewed head.
-It supersedes the #309 lock `ca110b0bae6d5a06a1002fb80df3f71cffec11659c9f9dbfa5d72624735546f6`,
-from #309 reviewed head `44eeb20a1461ef66b5af492e3be4c42be2728b67`,
-[approval](https://github.com/TinyCloudLabs/tinycloud-node/pull/309#issuecomment-6224650050).
-Current pre-N0 tag/pinned equivalents are separately hash-checked; arbitrary
-same-image config substitutions fail before mutation.
+With #309 on main this redeploys exactly #309's reviewed raw compose
+`ca110b0bae6d5a06a1002fb80df3f71cffec11659c9f9dbfa5d72624735546f6`
+(from reviewed head `44eeb20a1461ef66b5af492e3be4c42be2728b67`,
+[approval](https://github.com/TinyCloudLabs/tinycloud-node/pull/309#issuecomment-6224650050)),
+whatever digest main's template currently pins. It is not a rollback of a
+later release across a schema migration. Current pre-N0 tag/pinned
+equivalents are separately hash-checked; arbitrary same-image config
+substitutions fail before mutation.
 
 ### TC-1302 captured pre-N0 rollback
 

@@ -26,6 +26,12 @@ CURRENT = (ROOT / "docker-compose.dstack-postgres.yaml").read_bytes()
 # reverted to the :dstack tag. The workflow accepts these bytes by raw hash.
 PRE_N0_TEMPLATE = PRE_N0.replace(b"@" + DIGEST.encode(), b":dstack")
 assert hashlib.sha256(PRE_N0_TEMPLATE).hexdigest() == "28302d6761d841b7cc5c11314aed2d377735e6bbdcaf85972a752e03bc9fdc93"
+RELEASE_DIGEST = "sha256:" + "b" * 64
+RELEASE_REVISION = "c" * 40
+RELEASE = {"deploy_image_digest": RELEASE_DIGEST, "image_version": "1.21.0",
+           "rollback_image_version": "1.21.0", "rollback_image_revision": RELEASE_REVISION}
+RELEASED = {"1.21.0": (RELEASE_REVISION, "1.21.0")}
+RELEASE_N0 = N0.replace(DIGEST.encode(), RELEASE_DIGEST.encode())
 CANARIES = []
 
 
@@ -89,7 +95,19 @@ if name=='docker':
         assert args[-2:]==['config','--quiet']; assert Path('.phala-prod.env').stat().st_mode & 0o777==0o600
     else: raise SystemExit('Unexpected Docker boundary')
 elif name=='git':
-    assert args==['rev-parse','HEAD']; print('f'*40)
+    releases=json.loads(os.environ['TEST_RELEASES'])
+    if args==['rev-parse','HEAD']: print('f'*40)
+    elif args[:3]==['rev-parse','--verify','--quiet'] and len(args)==4:
+        tag=args[3]; assert tag.startswith('refs/tags/v') and tag.endswith('^{commit}')
+        release=releases.get(tag[len('refs/tags/v'):-len('^{commit}')])
+        if release is None: sys.exit(1)
+        print(release[0])
+    elif args[0]=='show' and len(args)==2:
+        revision,path=args[1].split(':',1); assert path=='tinycloud-node-server/Cargo.toml'
+        crates=[crate for tagged,crate in releases.values() if tagged==revision]
+        if not crates: sys.exit(128)
+        print('[package]\nname = "tinycloud-node"\nversion = "'+crates[0]+'"')
+    else: raise SystemExit('Unexpected git boundary')
 elif name=='node':
     names=[line.split('=',1)[0] for line in Path('.phala-prod.env').read_text().splitlines()]
     assert 'BETTERSTACK_SOURCE_TOKEN' in names and 'QUOTA_BILLING_ADMIN_SECRET' not in names
@@ -175,7 +193,7 @@ class SafeResult(unittest.TextTestResult):
 class RecoveryTests(unittest.TestCase):
     def run_deploy(self, compose=CURRENT, changes=None, *, fail_at="", artifact_error="", authority="node-override",
                    missing_billing=False, missing_authorization=False, approved_privacy="", event="workflow_dispatch",
-                   ref="refs/heads/main", oci_label=None, oci_revision=None, build_digest=""):
+                   ref="refs/heads/main", oci_label=None, oci_revision=None, build_digest="", releases=RELEASED):
         inputs = {"deploy_phala": "true", "authorize_quota_values": "true", "image_version": "1.20.6",
                   "deploy_image_digest": DIGEST, "rollback_image_version": "1.20.6", "rollback_image_revision": REVISION,
                   "rollback_pre_n0": "false", "rollback_privacy_mode": "unselected", "sql_identity_fence": "false"}
@@ -231,7 +249,7 @@ class RecoveryTests(unittest.TestCase):
                         # Production maps both from PROD_TINYCLOUD_ADMIN_SECRET: one shared value.
                         "QUOTA_ADMIN_SECRET": canary, "QUOTA_BILLING_ADMIN_SECRET": canary,
                         # Production maps both from PROD_TINYCLOUD_QUOTA_URL: billing's base URL.
-                        "QUOTA_BILLING_URL": BILLING_URL, "PHALA_ENV_TINYCLOUD_QUOTA_URL": BILLING_URL})
+                        "QUOTA_BILLING_URL": BILLING_URL, "PHALA_ENV_TINYCLOUD_QUOTA_URL": BILLING_URL, "TEST_RELEASES": json.dumps(releases)})
             if missing_billing: env.pop("QUOTA_BILLING_ADMIN_SECRET")
             context = {"github.event_name": event, "github.ref": ref, "job.success": True,
                        **{"inputs." + key: (value == "true" if value in ("true", "false") else value) for key, value in inputs.items()}}
@@ -261,8 +279,8 @@ class RecoveryTests(unittest.TestCase):
                     "compose": compose_path.read_bytes(), "summary": report, "logs": logs}
 
     def test_recovery_current_pre_n0_and_reviewed_n0(self):
-        for compose in (PRE_N0_TEMPLATE, N0):
-            with self.subTest(n0=compose == N0):
+        for compose in (PRE_N0_TEMPLATE, PRE_N0, N0):
+            with self.subTest(n0=compose == N0, template=compose == PRE_N0_TEMPLATE):
                 result = self.run_deploy(compose)
                 self.assertTrue(result["success"], "Authorized same-image recovery must work")
                 self.assertIn("sealed-preflight", result["events"])
@@ -277,6 +295,51 @@ class RecoveryTests(unittest.TestCase):
         self.assertIn("sealed-preflight", result["events"])
         self.assertEqual(result["events"].count("quota-put"), 2)
         self.assertIn(b"@sha256:" + b"a" * 64, result["compose"])
+
+    def test_release_digest_substitutes_only_the_reviewed_n0_node_digest(self):
+        # The reviewed template is N0 with its node digest normalized; the
+        # source pin is irrelevant, the deployed pin is exactly the release.
+        for source in (N0, RELEASE_N0):
+            with self.subTest(source_pinned_release=source == RELEASE_N0):
+                result = self.run_deploy(source, RELEASE)
+                self.assertTrue(result["success"], "Released digest must deploy the reviewed N0 template")
+                self.assertEqual(result["compose"], RELEASE_N0)
+                self.assertIn("sealed-preflight", result["events"])
+                self.assertEqual(result["events"].count("quota-put"), 2)
+                self.assertIn("1.21.0-dstack", result["summary"])
+                self.assertIn(RELEASE_REVISION, result["summary"])
+
+    def test_n0_release_requires_truthful_release_labels(self):
+        for name, releases in (("untagged", {}), ("tag elsewhere", {"1.21.0": ("d" * 40, "1.21.0")}),
+                               ("crate disagrees", {"1.21.0": (RELEASE_REVISION, "1.20.7")})):
+            with self.subTest(name):
+                result = self.run_deploy(N0, RELEASE, releases=releases)
+                self.assertFalse(result["success"])
+                self.assertNotIn("sealed-preflight", result["events"])
+                self.assertNotIn("cvm-deploy", result["events"])
+                self.assertEqual(result["compose"], N0)
+        with self.subTest("build path, not a recorded digest"):
+            result = self.run_deploy(N0, {"deploy_image_digest": "", "image_version": "1.20.7", "rollback_image_version": "",
+                                          "rollback_image_revision": ""}, build_digest=RELEASE_DIGEST,
+                                     releases={"1.20.7": ("f" * 40, "1.20.7")})
+            self.assertFalse(result["success"])
+            self.assertNotIn("cvm-deploy", result["events"])
+            self.assertEqual(result["compose"], N0)
+
+    def test_n0_template_drift_refuses_release_digest(self):
+        node_line = b"    image: ghcr.io/tinycloudlabs/tinycloud-node@" + DIGEST.encode() + b"\n"
+        for name, compose in (("profile", N0.replace(b":-errors_slow}", b":-all_requests}")),
+                              ("ingress", N0.replace(b"63c1c44e2ded5b73a5f174807b91ca677826974df0f9ab3045f6ec87865a5744", b"e" * 64)),
+                              ("crlf", N0.replace(b"\n", b"\r\n")),
+                              ("duplicate node", N0.replace(node_line, node_line * 2)),
+                              ("quoted node", N0.replace(b"@" + DIGEST.encode(), b"@" + DIGEST.encode() + b"'").replace(
+                                  b"image: ghcr.io/tinycloudlabs/tinycloud-node@", b"image: 'ghcr.io/tinycloudlabs/tinycloud-node@"))):
+            with self.subTest(name):
+                self.assertNotEqual(compose, N0)
+                result = self.run_deploy(compose, RELEASE)
+                self.assertFalse(result["success"])
+                self.assertNotIn("cvm-deploy", result["events"])
+                self.assertEqual(result["compose"], compose)
 
     def test_explicit_rollback_privacy_variants(self):
         for mode, expected in (("keep-json-file", PRE_N0), ("stop-future-local-logs", STOP_LOGS)):
@@ -348,11 +411,11 @@ class RecoveryTests(unittest.TestCase):
         self.assertIn("sealed-preflight", result["events"])
         self.assertEqual(result["events"].count("quota-put"), 2)
 
-    def test_forward_n0_lock_and_captured_rollback_are_not_substitutable(self):
+    def test_unreleased_digest_and_captured_rollback_are_not_substitutable(self):
         future = {"deploy_image_digest": "sha256:" + "a" * 64, "image_version": "1.20.8",
                   "rollback_image_version": "1.20.8", "rollback_image_revision": "a" * 40}
-        for changes, mode in ((future, ""), ({**future, "rollback_pre_n0": "true",
-                                             "rollback_privacy_mode": "keep-json-file"}, "keep-json-file")):
+        rollback = {"rollback_pre_n0": "true", "rollback_privacy_mode": "keep-json-file"}
+        for changes, mode in ((future, ""), ({**future, **rollback}, "keep-json-file"), ({**RELEASE, **rollback}, "keep-json-file")):
             result = self.run_deploy(N0, changes, approved_privacy=mode)
             self.assertFalse(result["success"])
             self.assertNotIn("cvm-deploy", result["events"])
@@ -419,23 +482,26 @@ class RecoveryTests(unittest.TestCase):
                     capture_output=True, text=True)
                 self.assertEqual(trace.read_text().splitlines(), ["strict"])
 
-    def test_documented_recovery_and_both_rollback_commands(self):
+    def test_documented_recovery_rollback_and_release_commands(self):
         text = (ROOT / "docs/releasing.md").read_text()
-        for heading in ("### Emergency same-image recovery (12c)", "### TC-1302 captured pre-N0 rollback"):
+        for heading, count, compose in (("### Emergency same-image recovery (12c)", 1, CURRENT),
+                                        ("### TC-1302 captured pre-N0 rollback", 2, CURRENT),
+                                        ("### Main release with N0 log shipping (one dispatch)", 1, N0)):
             self.assertTrue(heading in text, "Copy-paste recovery contract is missing")
             section = text.split(heading, 1)[1].split("\n### ", 1)[0].split("\n## ", 1)[0]
             commands = re.findall(r"```sh\n(gh workflow run docker.yml.*?)\n```", section, re.S)
-            self.assertEqual(len(commands), 1 if "12c" in heading else 2)
+            self.assertEqual(len(commands), count)
             for command in commands:
+                command = command.replace("<release-dstack-digest>", "b" * 64).replace("<release-commit-sha>", RELEASE_REVISION)
                 tokens = shlex.split(command.replace("\\\n", " "))
                 self.assertEqual(tokens[:6], ["gh", "workflow", "run", "docker.yml", "-R", "TinyCloudLabs/tinycloud-node"])
                 self.assertEqual(tokens[tokens.index("--ref") + 1], "main")
                 inputs = dict(tokens[index + 1].split("=", 1) for index, value in enumerate(tokens) if value == "-f")
                 mode = inputs.get("rollback_privacy_mode", "")
-                result = self.run_deploy(changes=inputs, approved_privacy=mode)
+                result = self.run_deploy(compose, inputs, approved_privacy=mode)
                 self.assertTrue(result["success"], "Documented command failed actual input validation")
                 inputs.pop("authorize_quota_values")
-                denied = self.run_deploy(changes=inputs, missing_authorization=True, approved_privacy=mode)
+                denied = self.run_deploy(compose, inputs, missing_authorization=True, approved_privacy=mode)
                 self.assertFalse(denied["success"])
                 self.assertEqual(denied["events"], [])
 
