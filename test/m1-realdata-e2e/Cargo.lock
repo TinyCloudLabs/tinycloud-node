@@ -1020,6 +1020,7 @@ dependencies = [
  "http 1.4.0",
  "ipld-core",
  "iri-string",
+ "k256",
  "serde",
  "serde_bytes",
  "serde_ipld_dagcbor 0.6.4",
@@ -6451,6 +6452,18 @@ checksum = "aaf9c7ff146298ffda83a200f8d5084f08dcee1edfc135fcc1d646a45d50ffd6"
 dependencies = [
  "log",
  "serde",
+ "sqlparser_derive",
+]
+
+[[package]]
+name = "sqlparser_derive"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "01b2e185515564f15375f593fb966b5718bc624ba77fe49fa4616ad619690554"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.114",
 ]
 
 [[package]]

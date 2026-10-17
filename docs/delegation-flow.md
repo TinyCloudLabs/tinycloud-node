@@ -431,6 +431,81 @@ export class Authenticator {
 }
 ```
 
+## Historical CACAO CIDs and Revocation
+
+New CACAO imports hash the canonical bytes returned by
+`TinyCloudDelegation::decode`: accepted recovery IDs, issuer address/chain
+representations, and DAG-CBOR encodings share the same ingestion identity.
+UCAN/JWS bytes remain exact.
+
+At startup, `m20261014_000000_delegation_cid_alias` creates the persisted alias
+index. The database then backfills missing entries in a transaction from each
+stored delegation's exact plaintext serialization, using that same decoder.
+Encrypted databases must open with `SpaceDatabase::new_with_encryption`; the
+column key must be available before backfill. Missing/wrong keys, decoding
+failures, and plaintext hash mismatches fail startup rather than silently
+leaving an active alias. Completed backfills do not re-decode indexed history;
+one indexed encrypted record is checked on each boot to validate the key.
+
+Concurrent PostgreSQL and MySQL boot transactions lock this migration's history
+row before their first history read. This also prevents a waiting MySQL boot
+from establishing a stale repeatable-read snapshot. SQLite keeps its existing
+`BEGIN IMMEDIATE` writer serialization. Failures roll back the boot transaction;
+alias conflicts are not ignored. MySQL stores complete, unpadded multihashes in
+indexed `VARBINARY(255)` columns, and the one-row encrypted-key check uses a join
+with an outer limit rather than MySQL's unsupported limited `IN` subquery.
+
+Stop old-version writers before upgrading the shared database. Older binaries
+do not maintain the alias index; mixed-version writes are not a supported
+security cutover. Do not accept requests until the new constructors complete.
+
+Revocation status, invocation authorization, and ancestor checks union owner
+revocations across equivalent stored CIDs through indexed lookups. Historical
+delegation IDs, signed bytes, revocation targets, and child proof edges are
+never rewritten. A child signed against an old CID remains valid until the
+owner revokes that identity; revocation also denies descendants and new
+redelegations citing any equivalent root.
+
+Canonical chain guards use indexed alias joins in the existing bounded closure
+query, so equivalent revocations serialize against in-flight ancestor
+authorization without an extra request round trip. New delegations and their
+alias commit together; PostgreSQL uses a dependent insert CTE to preserve the
+existing registration round-trip budget.
+
+Policy v3 account-owner credential admission, its locked transactional recheck,
+and legacy Share v2 ancestry/root checks use the same effective revocation
+predicate, not an exact stored-ID comparison. Account-owner authentication takes
+shared canonical ancestor guards with `TinyCloud::guard_delegation_chains`
+before per-space guards or the SQL transaction and retains them in the proof
+through commit or rollback. These guards coordinate the database instance and
+its clones through their shared graph-lock registry; they are not distributed
+locks. The transaction still rechecks effective revocation, including a sibling
+revocation committed by a separately constructed database instance.
+
+Legacy capability list/chain responses advertise the stored CID and return
+the exact stored raw header, not a re-encoding of the decoded CACAO. Their
+parent CID fields retain the signed child references. Existing legacy list
+ancestor-visibility behavior is unchanged; authorization always checks the
+complete chain.
+
+Rust callers must supply column encryption at construction through
+`SpaceDatabase::new_with_encryption`, not a post-open setter.
+`InvocationOutcome::OpenSessions` and `DelegationChain` retain serialized
+delegation wrappers so callers can preserve the original headers rather than
+re-encode them. SDK session setup validates and normalizes wallet signatures
+before deriving its delegation CID, including direct Rust `SignedSession`
+values that bypass JSON deserialization. Recovery IDs 0/1 and 27/28 therefore
+produce the node's same proof CID; invalid encodings and high-s signatures are
+rejected. Rust exhaustive matches must account for
+`session::Error::InvalidSIWESignature`.
+
+MySQL coverage remains bounded: native MySQL 8.0.46 alias-migration, backfill,
+concurrent-boot, and key-validation checks do not establish full-constructor
+support. On the same `utf8mb4`/default-strict configuration, unmodified
+`f9d700bf` fails the older initial schema with error 1074 on `id`, before the
+alias migration exists. That separate full-schema prerequisite must be resolved
+and exercised before claiming end-to-end support for that configuration.
+
 ## Child Delegation (UCAN) Creation
 
 For sharing, child UCANs are created that delegate from the session key to another DID.

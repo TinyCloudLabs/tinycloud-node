@@ -25,6 +25,9 @@ pub struct Payload {
     pub scheme: Option<Scheme>,
     #[serde_as(as = "DisplayFromStr")]
     pub domain: Authority,
+    /// Serialized as the verifier's parsed chain ID and EIP-55 address.
+    /// This changes only the DID representation, never the signed SIWE text.
+    #[serde(serialize_with = "serialize_issuer")]
     pub iss: UriAbsoluteString,
     pub statement: Option<String>,
     pub aud: UriString,
@@ -119,15 +122,40 @@ pub enum SIWEPayloadConversionError {
     InvalidDID,
 }
 
+fn parse_issuer(issuer: &str) -> Result<(u64, [u8; 20]), SIWEPayloadConversionError> {
+    let mut parts = issuer.split(':');
+    match [
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ] {
+        [Some("did"), Some("pkh"), Some("eip155"), Some(chain), Some(address), None]
+            if address.starts_with("0x") =>
+        {
+            Ok((chain.parse()?, FromHex::from_hex(&address[2..])?))
+        }
+        _ => Err(SIWEPayloadConversionError::InvalidDID),
+    }
+}
+
+fn serialize_issuer<S>(issuer: &UriAbsoluteString, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    let (chain, address) = parse_issuer(issuer.as_str()).map_err(serde::ser::Error::custom)?;
+    serializer.collect_str(&format_args!(
+        "did:pkh:eip155:{chain}:0x{}",
+        encode_eip55(&address)
+    ))
+}
+
 impl TryInto<Message> for Payload {
     type Error = SIWEPayloadConversionError;
     fn try_into(self) -> Result<Message, Self::Error> {
-        let (chain_id, address) = match &self.iss.as_str().split(':').collect::<Vec<&str>>()[..] {
-            &["did", "pkh", "eip155", c, h] if h.get(..2) == Some("0x") => {
-                (c.parse()?, FromHex::from_hex(&h[2..])?)
-            }
-            _ => return Err(Self::Error::InvalidDID),
-        };
+        let (chain_id, address) = parse_issuer(self.iss.as_str())?;
         Ok(Message {
             scheme: self.scheme,
             domain: self.domain,
@@ -193,10 +221,30 @@ impl AsRef<[u8]> for Signature {
     }
 }
 
+impl Signature {
+    /// Validate a fixed-size EIP-191 signature and canonicalize its recovery ID.
+    ///
+    /// Low-s signatures accept `0/1` and `27/28`; invalid scalars, high-s values
+    /// and other recovery IDs are rejected without allocating a byte buffer.
+    pub fn decode(mut bytes: [u8; 65]) -> Result<Self, SIWESignatureDecodeError> {
+        let signature = k256::ecdsa::Signature::from_slice(&bytes[..64])
+            .map_err(|_| SIWESignatureDecodeError::InvalidSignature)?;
+        if signature.normalize_s().is_some() {
+            return Err(SIWESignatureDecodeError::NonCanonicalS);
+        }
+        bytes[64] = match bytes[64] {
+            0 | 1 => bytes[64] + 27,
+            27 | 28 => bytes[64],
+            _ => return Err(SIWESignatureDecodeError::InvalidRecoveryId(bytes[64])),
+        };
+        Ok(Self(bytes))
+    }
+}
+
 impl TryFrom<Vec<u8>> for Signature {
     type Error = SIWESignatureDecodeError;
     fn try_from(s: Vec<u8>) -> Result<Self, Self::Error> {
-        Ok(Self(s.try_into().map_err(SIWESignatureDecodeError::from)?))
+        Self::decode(s.try_into().map_err(SIWESignatureDecodeError::from)?)
     }
 }
 
@@ -206,6 +254,12 @@ pub enum SIWESignatureDecodeError {
     InvalidLength(usize),
     #[error("Invalid Type, expected 'eip191', got {0}")]
     InvalidType(String),
+    #[error("Invalid ECDSA signature")]
+    InvalidSignature,
+    #[error("Non-canonical high-s ECDSA signature")]
+    NonCanonicalS,
+    #[error("Invalid recovery ID: {0}")]
+    InvalidRecoveryId(u8),
 }
 
 impl From<Vec<u8>> for SIWESignatureDecodeError {
@@ -286,11 +340,12 @@ impl<'de> Deserialize<'de> for Signature {
                 SIWESignatureDecodeError::InvalidLength(l),
             ));
         }
-        Ok(Signature(
+        Signature::decode(
             ds.s.try_into()
                 .map_err(|_| SIWESignatureDecodeError::InvalidLength(l))
                 .map_err(serde::de::Error::custom)?,
-        ))
+        )
+        .map_err(serde::de::Error::custom)
     }
 }
 

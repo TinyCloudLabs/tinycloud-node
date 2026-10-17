@@ -240,8 +240,7 @@ impl DuckDbService {
                 .map_err(|e| DuckDbError::Internal(e.to_string()))?;
             std::fs::write(duckdb_wal_path(&path), delta)
                 .map_err(|e| DuckDbError::Internal(e.to_string()))?;
-            let conn =
-                storage::open_connection(&storage::StorageMode::File(path.clone()), &max_memory)?;
+            let conn = storage::open_connection(Some(&path), &max_memory)?;
             {
                 let _timer = QueryTimer::new();
                 conn.execute_batch("CHECKPOINT")
@@ -282,15 +281,20 @@ impl DuckDbService {
             .await
             .map_err(|e| DuckDbError::ImportError(e.to_string()))?;
 
-        // Validate the temp file by opening it with DuckDB and applying security settings
+        // Validate with the same locked native policy as live and export connections.
         let temp_path_clone = temp_path.clone();
         let max_memory = self.max_memory_per_connection.clone();
         let context = request_telemetry::current();
         let valid = tokio::task::spawn_blocking(move || -> Result<(), DuckDbError> {
             let _context = request_telemetry::enter(context);
-            let conn = duckdb::Connection::open(&temp_path_clone)
-                .map_err(|e| DuckDbError::ImportError(format!("Invalid DuckDB file: {}", e)))?;
-            storage::apply_security_settings(&conn, &max_memory)?;
+            let conn = storage::open_connection(Some(&temp_path_clone), &max_memory).map_err(
+                |e| match e {
+                    DuckDbError::Internal(message) => {
+                        DuckDbError::ImportError(format!("Invalid DuckDB file: {}", message))
+                    }
+                    other => other,
+                },
+            )?;
             {
                 let _timer = QueryTimer::new();
                 conn.execute_batch("SELECT 1").map_err(|e| {
@@ -1195,7 +1199,7 @@ mod tests {
             let snapshot_dir = TempDir::new().unwrap();
             let snapshot_path = snapshot_dir.path().join("snapshot.duckdb");
             std::fs::write(&snapshot_path, bytes).unwrap();
-            let snapshot = duckdb::Connection::open(snapshot_path).unwrap();
+            let snapshot = storage::open_connection(Some(&snapshot_path), "128MB").unwrap();
             let names: String = snapshot
                 .query_row("SELECT name FROM events WHERE id = 1", [], |row| row.get(0))
                 .unwrap();

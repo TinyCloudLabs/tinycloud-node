@@ -950,7 +950,10 @@ fn concurrent_authenticated_requests_keep_metrics_and_pseudonyms_scoped() -> Res
 #[test]
 fn native_duckdb_requests_keep_scoped_fields_and_independent_db_timings() -> Result<()> {
     let root = tempfile::tempdir()?;
-    std::fs::write(root.path().join("isolated.toml"), "# Native DuckDB fixture\n")?;
+    std::fs::write(
+        root.path().join("isolated.toml"),
+        "# Native DuckDB fixture\n",
+    )?;
     let quota = QuotaStub::start();
     let mut node = Node::start(root.path(), 0, "trace", &quota.url);
     let account = Account::new(61)?;
@@ -990,7 +993,8 @@ fn native_duckdb_requests_keep_scoped_fields_and_independent_db_timings() -> Res
         "action":"query",
         "sql":format!("SELECT '{LITERAL}' FROM {TABLE}"),
         "params":[],
-    }).to_string();
+    })
+    .to_string();
     let failed = node.invoke(
         &session,
         "duckdb",

@@ -149,9 +149,13 @@ pub fn spawn_actor(
         } else {
             StorageMode::InMemory
         };
+        let opening_path = match &mode {
+            StorageMode::InMemory => None,
+            StorageMode::File(path) => Some(path.as_path()),
+        };
         let mut conn = {
             let _context = request_telemetry::enter(initial_context);
-            match storage::open_connection(&mode, &max_memory_per_connection) {
+            match storage::open_connection(opening_path, &max_memory_per_connection) {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::error!("Failed to open database");
@@ -245,7 +249,8 @@ pub fn spawn_actor(
                     let _ = response_tx.send(result);
                 }
                 DbMessage::Export { response_tx } => {
-                    let result = handle_export(&conn, &mode, &file_path);
+                    let result =
+                        handle_export(&conn, &mode, &file_path, &max_memory_per_connection);
                     let _ = response_tx.send(result);
                 }
                 DbMessage::Wal { response_tx } => {
@@ -295,6 +300,7 @@ fn handle_export(
     conn: &duckdb::Connection,
     mode: &StorageMode,
     file_path: &PathBuf,
+    max_memory: &str,
 ) -> Result<Vec<u8>, DuckDbError> {
     match mode {
         StorageMode::File(_) => {
@@ -312,8 +318,7 @@ fn handle_export(
             let temp_dir = tempfile::tempdir().map_err(|e| DuckDbError::Internal(e.to_string()))?;
             let temp_db_path = temp_dir.path().join("export.duckdb");
 
-            let dest = duckdb::Connection::open(&temp_db_path)
-                .map_err(|e| DuckDbError::Internal(e.to_string()))?;
+            let dest = storage::open_connection(Some(&temp_db_path), max_memory)?;
 
             storage::copy_tables(conn, &dest)?;
 
@@ -841,7 +846,7 @@ mod tests {
 
     #[test]
     fn full_database_allows_existing_schema_delete_and_drop() {
-        let conn = storage::open_connection(&StorageMode::InMemory, "128MB").unwrap();
+        let conn = storage::open_connection(None, "128MB").unwrap();
         conn.execute_batch(
             "CREATE TABLE \"Event.Log\" (id INTEGER);
              CREATE INDEX event_id ON \"Event.Log\" (id);
@@ -880,7 +885,7 @@ mod tests {
 
     #[test]
     fn full_database_refuses_rows_and_new_if_not_exists_objects() {
-        let conn = storage::open_connection(&StorageMode::InMemory, "128MB").unwrap();
+        let conn = storage::open_connection(None, "128MB").unwrap();
         conn.execute_batch("CREATE TABLE events (id INTEGER); INSERT INTO events VALUES (1)")
             .unwrap();
         let before = catalog_objects(&conn).unwrap();
@@ -914,7 +919,7 @@ mod tests {
     #[test]
     fn full_database_rolls_back_drop_and_recreate_in_either_batch_mode() {
         for transactional in [false, true] {
-            let conn = storage::open_connection(&StorageMode::InMemory, "128MB").unwrap();
+            let conn = storage::open_connection(None, "128MB").unwrap();
             conn.execute_batch("CREATE TABLE events (id INTEGER); INSERT INTO events VALUES (1)")
                 .unwrap();
             let before = catalog_objects(&conn).unwrap();
@@ -947,7 +952,7 @@ mod tests {
 
     #[test]
     fn full_database_rolls_back_schema_mutations_and_rejects_transaction_escape() {
-        let conn = storage::open_connection(&StorageMode::InMemory, "128MB").unwrap();
+        let conn = storage::open_connection(None, "128MB").unwrap();
         conn.execute_batch("CREATE TABLE events (id INTEGER); INSERT INTO events VALUES (1)")
             .unwrap();
         let before = catalog_objects(&conn).unwrap();
@@ -979,7 +984,7 @@ mod tests {
 
     #[test]
     fn full_database_preserves_schema_caveats_and_prepared_statement_parameters() {
-        let conn = storage::open_connection(&StorageMode::InMemory, "128MB").unwrap();
+        let conn = storage::open_connection(None, "128MB").unwrap();
         conn.execute_batch(
             "CREATE TABLE events (id INTEGER);
              CREATE TABLE private (id INTEGER);
