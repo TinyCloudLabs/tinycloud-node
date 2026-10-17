@@ -1,38 +1,6 @@
-use sea_orm::{
-    error::{RuntimeErr, SqlxError},
-    ConnectionTrait, DbBackend,
-};
 use sea_orm_migration::prelude::*;
 
 use crate::models::delegation;
-
-/// How long `up` waits on PostgreSQL for a lock on `delegation` before it
-/// fails (TC-1176). Dropping the index needs an ACCESS EXCLUSIVE lock, which
-/// queues behind any open transaction that has read the table and, while
-/// queued, blocks every later reader. The deploy runs with the writer
-/// stopped, so a legitimate holder is a short read; 30s outlasts one, while a
-/// stuck session fails the boot with a clear error instead of hanging it. The
-/// limit bounds each lock wait, not the index build.
-const LOCK_TIMEOUT: &str = "30s";
-
-/// Name a lock-wait failure (SQLSTATE 55P03, raised by `lock_timeout`) so the
-/// boot error says what to fix. Other errors pass through unchanged.
-fn lock_wait_error(error: DbErr) -> DbErr {
-    let (DbErr::Exec(RuntimeErr::SqlxError(SqlxError::Database(database)))
-    | DbErr::Query(RuntimeErr::SqlxError(SqlxError::Database(database)))) = &error
-    else {
-        return error;
-    };
-    if database.code().as_deref() != Some("55P03") {
-        return error;
-    }
-    DbErr::Migration(format!(
-        "{}: gave up after waiting {LOCK_TIMEOUT} (lock_timeout) for a lock on table \
-         delegation; another session holds a conflicting lock (SQLSTATE 55P03: {database}). \
-         The migration was rolled back and nothing was applied; end that session and restart.",
-        Migration.name()
-    ))
-}
 
 #[derive(DeriveMigrationName)]
 pub struct Migration;
@@ -57,40 +25,18 @@ async fn drop_index_if_exists(manager: &SchemaManager<'_>) -> Result<(), DbErr> 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        // sea-orm-migration runs PostgreSQL migrations in one transaction, so
-        // a lock-wait failure rolls back the index change and leaves this
-        // migration unrecorded. `SET LOCAL` lasts until that transaction
-        // ends; it is reset below so later migrations keep the default.
-        let postgres = manager.get_database_backend() == DbBackend::Postgres;
-        if postgres {
-            manager
-                .get_connection()
-                .execute_unprepared(&format!("SET LOCAL lock_timeout = '{LOCK_TIMEOUT}'"))
-                .await?;
-        }
-        let rebuilt: Result<(), DbErr> = async {
-            drop_index_if_exists(manager).await?;
-            manager
-                .create_index(
-                    Index::create()
-                        .name("idx_delegation_delegator")
-                        .table(delegation::Entity)
-                        .col(delegation::Column::Delegator)
-                        .col(delegation::Column::Id)
-                        .if_not_exists()
-                        .to_owned(),
-                )
-                .await
-        }
-        .await;
-        rebuilt.map_err(lock_wait_error)?;
-        if postgres {
-            manager
-                .get_connection()
-                .execute_unprepared("SET LOCAL lock_timeout TO DEFAULT")
-                .await?;
-        }
-        Ok(())
+        drop_index_if_exists(manager).await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_delegation_delegator")
+                    .table(delegation::Entity)
+                    .col(delegation::Column::Delegator)
+                    .col(delegation::Column::Id)
+                    .if_not_exists()
+                    .to_owned(),
+            )
+            .await
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
@@ -112,7 +58,7 @@ impl MigrationTrait for Migration {
 mod tests {
     use super::*;
     use crate::{db::migrate, db_pool::RecoveringConnection, test_support::PostgresTestSchema};
-    use sea_orm::{DatabaseConnection, Statement, TransactionTrait};
+    use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement, TransactionTrait};
     use std::time::{Duration, Instant};
 
     /// `(name, definition, valid)` for every index on `delegation`.
@@ -184,7 +130,7 @@ mod tests {
         let message = error.to_string();
         assert!(
             matches!(error, DbErr::Migration(_))
-                && message.contains("lock on table delegation")
+                && message.contains("30s")
                 && message.contains("55P03"),
             "error must name the lock wait: {message}"
         );

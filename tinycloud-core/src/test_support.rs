@@ -46,7 +46,14 @@ pub(crate) struct PostgresTestSchema {
 impl PostgresTestSchema {
     /// `None` (skip) only where `postgres_test_url` allows it: never in CI.
     pub(crate) async fn new(test: &str) -> Option<Self> {
-        use sea_orm::{ConnectOptions, ConnectionTrait, Database, DbBackend, Statement};
+        Self::migrated_through(test, None).await
+    }
+
+    /// Like [`Self::new`], but applies only the first `steps` migrations
+    /// (all of them when `None`), so a test can start from an older release's
+    /// schema.
+    pub(crate) async fn migrated_through(test: &str, steps: Option<u32>) -> Option<Self> {
+        use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
         use sea_orm_migration::MigratorTrait;
 
         let url = postgres_test_url(test)?;
@@ -55,7 +62,7 @@ impl PostgresTestSchema {
             std::process::id(),
             time::OffsetDateTime::now_utc().unix_timestamp_nanos()
         );
-        let admin = Database::connect(ConnectOptions::new(url.clone()))
+        let admin = Database::connect(sea_orm::ConnectOptions::new(url.clone()))
             .await
             .expect("connect to PostgreSQL test database");
         admin
@@ -66,19 +73,28 @@ impl PostgresTestSchema {
             .await
             .expect("create isolated test schema");
         admin.close().await.expect("close admin connection");
-        let mut options = ConnectOptions::new(url.clone());
-        options
-            .max_connections(4)
-            .sqlx_logging(false)
-            .set_schema_search_path(schema.clone());
-        let conn = Database::connect(options)
-            .await
-            .expect("connect to isolated test schema");
-        let fixture = Self { conn, url, schema };
-        crate::migrations::Migrator::up(&fixture.conn, None)
+        let mut fixture = Self {
+            conn: Default::default(),
+            url,
+            schema,
+        };
+        fixture.conn = fixture.connect(4).await;
+        crate::migrations::Migrator::up(&fixture.conn, steps)
             .await
             .expect("migrate isolated test schema");
         Some(fixture)
+    }
+
+    /// Another pool of `max_connections` on the same isolated schema.
+    pub(crate) async fn connect(&self, max_connections: u32) -> sea_orm::DatabaseConnection {
+        let mut options = sea_orm::ConnectOptions::new(self.url.clone());
+        options
+            .max_connections(max_connections)
+            .sqlx_logging(false)
+            .set_schema_search_path(self.schema.clone());
+        sea_orm::Database::connect(options)
+            .await
+            .expect("connect to isolated test schema")
     }
 }
 
