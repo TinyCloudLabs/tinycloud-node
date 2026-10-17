@@ -90,8 +90,20 @@ pub enum EscrowError {
 pub struct Ark(Zeroizing<[u8; 32]>);
 
 impl Ark {
-    pub fn from_bytes(bytes: [u8; 32]) -> Self {
-        Self(Zeroizing::new(bytes))
+    /// Take ownership of key bytes already in a zeroizing container.
+    pub fn from_zeroizing(bytes: Zeroizing<[u8; 32]>) -> Self {
+        Self(bytes)
+    }
+
+    /// Copy 32 key bytes straight into a zeroizing buffer; `None` for any
+    /// other length. No plain array copy is made.
+    pub fn from_slice(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != 32 {
+            return None;
+        }
+        let mut key = Zeroizing::new([0u8; 32]);
+        key.copy_from_slice(bytes);
+        Some(Self(key))
     }
 
     /// A fresh key from the OS CSPRNG.
