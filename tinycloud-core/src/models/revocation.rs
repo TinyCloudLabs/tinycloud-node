@@ -573,7 +573,15 @@ mod tests {
             "did:web:127.0.0.1%3A{}",
             listener.local_addr().unwrap().port()
         );
-        let ucan = signed_ucan(&issuer, &JWK::generate_ed25519().unwrap(), Algorithm::EdDSA);
+        let jwk = JWK::generate_ed25519().unwrap();
+        let mut payload = signed_ucan(&issuer, &jwk, Algorithm::EdDSA)
+            .payload()
+            .clone();
+        payload.attenuation.with_actions(
+            format!("urn:cid:{}", payload.proof[0]).parse().unwrap(),
+            [("tinycloud.delegation/revoke".parse().unwrap(), [])],
+        );
+        let ucan = payload.sign(Algorithm::EdDSA, &jwk).unwrap();
         let db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
         let token = ucan.encode().unwrap();
         let event = crate::events::Revocation::from_header_ser::<
