@@ -50,6 +50,48 @@ pub struct Config {
     pub share_email: ShareEmailConfig,
     #[serde(default)]
     pub retention: RetentionConfig,
+    #[serde(default)]
+    pub at_rest: AtRestConfig,
+}
+
+/// Encryption at rest (TC-887). Off by default; see `docs/at-rest-escrow.md`.
+#[derive(Serialize, Deserialize, Debug, Default, Clone, Hash, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AtRestConfig {
+    /// `off` writes plaintext; `encrypt` and `strict` are refused at boot
+    /// unless the escrow gate passes.
+    #[serde(default)]
+    pub mode: AtRestMode,
+    #[serde(default)]
+    pub escrow: AtRestEscrowConfig,
+    /// Self-hosted Static-root nodes only: acknowledge that no escrow exists,
+    /// so losing the root loses encrypted data. Refused inside a TEE.
+    #[serde(default)]
+    pub escrow_none: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Default, Clone, Copy, Hash, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AtRestMode {
+    #[default]
+    Off,
+    Encrypt,
+    Strict,
+}
+
+#[derive(Serialize, Deserialize, Debug, Default, Clone, Hash, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AtRestEscrowConfig {
+    /// Exactly three holders. Setting them provisions the at-rest root key
+    /// and its escrow bundle at boot, even with `mode = "off"`.
+    #[serde(default)]
+    pub recipients: Vec<tinycloud_at_rest_escrow::HolderRecipient>,
+    /// The escrow fingerprint a ceremony verified (`tinycloud-at-rest record-efp`).
+    #[serde(default)]
+    pub verified_fp: Option<String>,
+    /// Accept X25519 software-key holders (tests and self-host only).
+    #[serde(default)]
+    pub allow_software: bool,
 }
 
 /// Production exact-email composition.  The capability remains unavailable

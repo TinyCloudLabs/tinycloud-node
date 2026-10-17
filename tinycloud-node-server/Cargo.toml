@@ -102,6 +102,10 @@ features = ["sqlite", "postgres", "mysql", "tokio"]
 [dependencies.tinycloud-auth]
 path = "../tinycloud-auth/"
 
+# TC-887: escrow bundle and recovery wire types for the at-rest routes.
+[dependencies.tinycloud-at-rest-escrow]
+path = "../tinycloud-at-rest-escrow/"
+
 # TC-409: only for test builds, enable tinycloud-core's opt-in
 # verification-count test hook so node route tests can assert exactly-once
 # signature verification. Cargo only activates dev-dependency features when
@@ -113,6 +117,8 @@ default-features = false
 features = ["sqlite", "postgres", "mysql", "tokio", "verification-count-test-hook"]
 
 [dev-dependencies]
+# TC-887: escrow holders decrypting their shares in tests/at_rest_ceremony.rs.
+age = { version = "=0.12.1", default-features = false, features = ["armor"] }
 # Parse production Rust items in the DID resolver source guard (tests only).
 syn = { version = "2", features = ["full", "visit"] }
 quote = "1"

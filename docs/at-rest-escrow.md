@@ -1,6 +1,6 @@
 # At-rest key escrow (TC-887)
 
-Nothing in the node binary uses these two crates yet.
+The node provisions and escrows at-rest keys only when `at_rest` is configured (below). The default config does nothing: no key reads, no rows.
 
 - `tinycloud-at-rest-escrow` (a node workspace member) holds the escrow format:
   - the 2-of-3 split of the at-rest root key (ARK);
@@ -121,3 +121,50 @@ Trust policy (`--trust`), from a source independent of the node being checked:
   "allowed_advisories": []
 }
 ```
+
+## Node configuration and endpoints
+
+```toml
+[at_rest]
+mode = "off"            # off | encrypt | strict
+escrow_none = false     # self-hosted Static-root nodes only (refused in a TEE)
+
+[at_rest.escrow]
+recipients = [ { holder = "sam", recipient = "age1yubikey1…" }, … ]   # exactly 3
+verified_fp = "<efp>"   # after the ceremony (record-efp)
+allow_software = false  # X25519 holders; tests and self-host only, refused in a TEE
+```
+
+The same settings as compose env: `TINYCLOUD_AT_REST__MODE`, `TINYCLOUD_AT_REST__ESCROW_NONE`, `TINYCLOUD_AT_REST__ESCROW__RECIPIENTS=[{holder="…",recipient="…"},…]`, `TINYCLOUD_AT_REST__ESCROW__VERIFIED_FP`, `TINYCLOUD_AT_REST__ESCROW__ALLOW_SOFTWARE`.
+
+- **Recipients set, `mode = "off"`:**
+  - at boot the node creates the ARK (sealed under its root) and the escrow bundle;
+  - it keeps a copy of the sealed key, the bundle and each space's wrapped data key in the block store (`_tc/at-rest/` in S3, `{datadir}/at-rest/` on disk). Data-key objects are named by a keyed hash, not the space;
+  - nothing is encrypted.
+- **`encrypt` or `strict` refuses to start** unless the recipients equal the bundle's, `verified_fp` equals its EFP, and the stored ceremony record verifies under the key inside the TEE. A Static-root node with no recipients may use `escrow_none = true` instead, which acknowledges that no escrow exists.
+- **If the node's root can no longer unseal the key** (new app id or KMS), it boots **locked**:
+  - `/info` shows `at_rest.state = "locked"` and encryption is unavailable;
+  - two holders recover it through the endpoints below, which needs `verified_fp` to be pinned;
+  - the node then re-seals the key under its new root, with no restart and no data rewrite.
+
+| Endpoint | Answer |
+|---|---|
+| `GET /at-rest/status` | `mode`, `state`, `encrypting`, `efp`, `generation`, `verified` |
+| `GET /at-rest/escrow` | the active escrow bundle (or, on a locked node, the pinned one) |
+| `GET /at-rest/escrow/record` | the ceremony record, only if its MAC verifies under the live key |
+| `GET /at-rest/recovery?nonce=N` | `RecoveryInfo`: this boot's recovery recipient, bound with `N` and the EFP into a TDX quote (`mode = "classic"` with no quote outside a TEE) |
+| `POST /at-rest/recovery/shares` | body: one share age-sealed to the recovery recipient (≤ 4 KiB). Answers `held` (with `shares_held`), `verified` (all three shares rebuilt the key), or `unlocked` (locked node recovered), with the gate result |
+
+The share endpoint:
+- is rate limited per IP and per boot;
+- checks every share against the bundle's commitments before it takes one of three slots;
+- never logs share bytes or ciphertexts.
+
+Shares live in memory for the current boot only.
+
+### Key continuity
+
+- **Database restored to an earlier point.** At boot the node puts back any key generation or chain the database lacks from the block-store copy. A space's data key missing from the database is restored from its copy before a new one would be made; if the database holds a *different* key under the same id, the node refuses to use it.
+- **No key is ever made over existing material.** The node creates a new root key only when the database has no key, escrow or data-key rows and the block store has nothing under `_tc/at-rest/`. A store or mirror error stops the boot instead.
+- **Generations.** Each older generation is sealed under the next one's key (its chain), so escrowing the newest generation recovers all of them. At boot under the same root, a missing or broken chain is rebuilt and logged. During recovery under a new root it can't be rebuilt, and the shares are refused with the reason.
+- The key tables' migration `down` refuses while they hold rows.
