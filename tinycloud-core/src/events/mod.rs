@@ -56,6 +56,7 @@ pub(crate) enum Operation {
         space: SpaceId,
         key: Path,
         value: Hash,
+        generation: i64,
         metadata: Metadata,
     },
     KvDelete {
@@ -72,11 +73,13 @@ impl Operation {
                 space,
                 key,
                 value,
+                generation,
                 metadata,
             } => VersionedOperation::KvWrite {
                 space,
                 key,
                 value,
+                generation,
                 metadata,
                 seq,
                 epoch,
@@ -111,6 +114,7 @@ pub(crate) enum VersionedOperation {
         space: SpaceId,
         key: Path,
         value: Hash,
+        generation: i64,
         metadata: Metadata,
         seq: i64,
         epoch: Hash,
@@ -224,6 +228,7 @@ fn hash_inv(inv_hash: &Hash, sp: &SpaceId, ops: &[Operation]) -> Result<OneOrMan
                 key,
                 value,
                 metadata,
+                ..
             } if space == sp => Some(Op::KvWrite {
                 key,
                 value: value.to_cid(CBOR_CODEC),

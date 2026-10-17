@@ -256,6 +256,22 @@ impl RecoveringConnection {
         result
     }
 
+    /// Pre-upload authorization and orphan registration share one connection.
+    /// Reserve SQLite's database writer before authorization reads, just like
+    /// the other write paths: a separate collector connection must not commit
+    /// after our snapshot and turn registration into SQLITE_BUSY_SNAPSHOT.
+    /// This transaction changes only retryable candidate metadata and commits
+    /// before blob persistence, so its uncertain outcome cannot mean a
+    /// user-visible KV write committed.
+    pub(crate) async fn begin_preparatory(&self) -> Result<DatabaseTransaction, DbErr> {
+        let transaction = self
+            .run("begin_preparatory", true, || {
+                crate::db::begin_write_transaction(&self.conn, None)
+            })
+            .await?;
+        self.scope_local_timeout(transaction).await
+    }
+
     /// The outcome of the one retry. It is never retried again, but a
     /// connection lost again is still recorded.
     fn retried<T>(&self, operation: &'static str, result: Result<T, DbErr>) -> Result<T, DbErr> {

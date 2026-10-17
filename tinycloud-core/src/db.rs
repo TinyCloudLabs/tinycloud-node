@@ -12,8 +12,8 @@ use crate::read_audit::ReadAuditPipeline;
 use crate::relationships::*;
 use crate::sql_sizes::SqlSizes;
 use crate::storage::{
-    either::EitherError, ByteRangeSpec, Content, HashBuffer, ImmutableReadStore, ImmutableStaging,
-    ImmutableWriteStore, RangeRead, StorageSetup, StoreSize,
+    either::EitherError, ByteRangeSpec, Content, HashBuffer, ImmutableDeleteStore,
+    ImmutableReadStore, ImmutableStaging, ImmutableWriteStore, RangeRead, StorageSetup, StoreSize,
 };
 use crate::types::{
     AccountDelegationRecord, CapabilitiesReadParams, DelegationQuery, DelegationQueryDirection,
@@ -21,6 +21,7 @@ use crate::types::{
     Resource, SpaceIdWrap,
 };
 use crate::util::DelegationInfo;
+use rand::{rngs::OsRng, RngCore};
 use sea_orm::{
     entity::prelude::*,
     error::{DbErr, RuntimeErr, SqlxError},
@@ -53,6 +54,12 @@ use tinycloud_auth::{
 /// cap still does; the cap is what bounds HTTP/2 over TLS, whose header list
 /// may reach 16 MiB.
 pub const KV_MAX_MUTATIONS_PER_INVOCATION: usize = 4096;
+/// One invocation's uploads finish within 240 seconds of preflight, before
+/// the five-minute orphan age. A live same-hash retry defers an older crash
+/// stage until that retry finishes; repeated overlaps can extend its charge.
+const KV_UPLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(240);
+const _: () =
+    assert!(KV_UPLOAD_TIMEOUT.as_secs() < crate::kv_orphans::ORPHAN_GRACE.whole_seconds() as u64);
 
 pub const HOOK_DELIVERY_STATUS_PENDING: &str = "pending";
 pub const HOOK_DELIVERY_STATUS_RETRYING: &str = "retrying";
@@ -161,6 +168,7 @@ mod meeting_snapshot_fence_tests {
 #[derive(Debug, Clone)]
 pub struct SpaceDatabase<C, B, S> {
     conn: C,
+    candidate_conn: RecoveringConnection,
     storage: B,
     secrets: S,
     encryption: Option<ColumnEncryption>,
@@ -168,6 +176,9 @@ pub struct SpaceDatabase<C, B, S> {
     revocation_chain_locks: ChainLockRegistry,
     kv_object_locks: KvObjectLockRegistry,
     space_sequence_locks: SpaceSequenceLockRegistry,
+    // SQLite lock order everywhere: per-space sequence guard, then writer
+    // mutex, then BEGIN. Freeze takes only the writer mutex. PostgreSQL has no
+    // writer mutex and takes its sequence guard after uploading.
     writer_lock: Option<Arc<tokio::sync::Mutex<()>>>,
     read_audit: ReadAuditPipeline,
     database_fence_cache: Arc<crate::database_migration::EffectiveFenceCache>,
@@ -283,6 +294,8 @@ where
     MeetingSnapshotProtected,
     #[error("legacy meeting artifacts are frozen")]
     LegacyMeetingFrozen,
+    #[error("KV blob candidate is unavailable; retry the invocation")]
+    KvCandidateUnavailable,
     #[error("KV precondition failed")]
     KvPreconditionFailed,
     #[error("KV response is {size} bytes, exceeding the requested limit of {limit} bytes")]
@@ -317,6 +330,38 @@ where
     fn from(e: DbErr) -> Self {
         TxStoreError::Tx(e.into())
     }
+}
+
+/// Reject unauthorized or unhosted mutations before any content upload.
+/// The commit transaction repeats authorization after the sequence lock.
+async fn authorize_mutation_preupload<C: ConnectionTrait, B: StorageSetup, K: Secrets>(
+    conn: &C,
+    invocation: &Invocation,
+    mode: InvokeMode,
+    now: OffsetDateTime,
+    spaces: &[SpaceId],
+) -> Result<(), TxError<B, K>> {
+    match mode {
+        InvokeMode::Admitted => {
+            invocation::authorize_admitted(conn, &invocation.0, now, None)
+                .await
+                .map_err(TxError::<B, K>::from)?;
+        }
+        InvokeMode::Public => {
+            invocation::verify_and_authorize(conn, &invocation.0, now)
+                .await
+                .map_err(TxError::<B, K>::from)?;
+        }
+        InvokeMode::Internal | InvokeMode::MeetingPublication => {}
+    }
+    let hosted = space::Entity::find()
+        .filter(space::Column::Id.is_in(spaces.iter().cloned().map(SpaceIdWrap)))
+        .count(conn)
+        .await?;
+    if hosted != spaces.len() as u64 {
+        return Err(TxError::SpaceNotFound);
+    }
+    Ok(())
 }
 
 /// How long a boot migration on PostgreSQL waits for any one lock before it
@@ -412,8 +457,9 @@ where
         tx.commit().await?;
         let writer_lock = (pool.get_database_backend() == sea_orm::DatabaseBackend::Sqlite)
             .then(|| Arc::new(tokio::sync::Mutex::new(())));
-        let read_audit = ReadAuditPipeline::start(pool, writer_lock.clone());
+        let read_audit = ReadAuditPipeline::start(pool.clone(), writer_lock.clone());
         Ok(Self {
+            candidate_conn: pool,
             conn,
             storage,
             secrets,
@@ -547,7 +593,11 @@ impl<C, B, K> SpaceDatabase<C, B, K>
 where
     C: TransactionTrait,
 {
-    /// Change the legacy artifact barrier. Freeze commit is the drain acknowledgement.
+    /// Change the legacy artifact barrier. Freeze commit acknowledges that
+    /// in-flight protected writes have committed or rolled back in the DB and
+    /// no protected upload can still land afterward. Cleanup of an unreferenced,
+    /// hash-fenced blob from a rolled-back write may finish after the ACK; it
+    /// only deletes/refunds physical storage, never changes committed KV rows.
     pub async fn set_legacy_meeting_write_freeze(
         &self,
         space: &SpaceId,
@@ -557,16 +607,27 @@ where
     where
         C: ConnectionTrait,
     {
-        let _writer = match &self.writer_lock {
-            Some(lock) => Some(lock.lock().await),
-            None => None,
-        };
-        let tx = self.begin_graph_transaction().await?;
-        let status =
-            crate::meeting_legacy_guard::transition(&tx, space, frozen, expected_generation)
-                .await?;
-        tx.commit().await?;
-        Ok(status)
+        // Acknowledgement must never wait indefinitely for a stalled upload.
+        // On timeout the transaction is dropped (and rolled back), so the
+        // caller cannot treat a failed freeze as a drained write barrier.
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let _writer = match &self.writer_lock {
+                Some(lock) => Some(lock.lock().await),
+                None => None,
+            };
+            let tx = self.begin_graph_transaction().await?;
+            let status =
+                crate::meeting_legacy_guard::transition(&tx, space, frozen, expected_generation)
+                    .await?;
+            tx.commit().await?;
+            Ok(status)
+        })
+        .await
+        .unwrap_or_else(|_| {
+            Err(crate::meeting_legacy_guard::FreezeError::Db(DbErr::Custom(
+                "legacy meeting freeze timed out waiting for in-flight writes".into(),
+            )))
+        })
     }
 
     pub async fn legacy_meeting_freeze_status(
@@ -1262,15 +1323,21 @@ where
         range: ByteRangeSpec,
     ) -> Result<Option<(Metadata, Hash, RangeRead<B::Readable>)>, EitherError<DbErr, B::Error>>
     {
-        let Some((metadata, hash)) = metadata_with_hash(&self.conn, space_id, key)
+        let Some(entry) = get_kv_entity(&self.conn, space_id, key)
             .await
             .map_err(EitherError::A)?
         else {
             return Ok(None);
         };
+        let current_kv::Model {
+            metadata,
+            value: hash,
+            generation,
+            ..
+        } = entry;
         let Some(content) = self
             .storage
-            .read_range(space_id, &hash, range)
+            .read_range(space_id, &hash, generation, range)
             .await
             .map_err(EitherError::B)?
         else {
@@ -1554,7 +1621,7 @@ where
         precondition: Option<KvPrecondition>,
     ) -> Result<Hash, TxStoreError<B, S, K>>
     where
-        B: ImmutableWriteStore<S> + ImmutableReadStore,
+        B: ImmutableWriteStore<S> + ImmutableReadStore + ImmutableDeleteStore,
         S: ImmutableStaging,
         S::Writable: 'static + Unpin,
     {
@@ -1578,7 +1645,7 @@ where
         precondition: Option<KvPrecondition>,
     ) -> Result<Hash, TxStoreError<B, S, K>>
     where
-        B: ImmutableWriteStore<S> + ImmutableReadStore,
+        B: ImmutableWriteStore<S> + ImmutableReadStore + ImmutableDeleteStore,
         S: ImmutableStaging,
         S::Writable: 'static + Unpin,
     {
@@ -1602,7 +1669,7 @@ where
         path: Path,
     ) -> Result<(), TxStoreError<B, S, K>>
     where
-        B: ImmutableWriteStore<S> + ImmutableReadStore,
+        B: ImmutableWriteStore<S> + ImmutableReadStore + ImmutableDeleteStore,
         S: ImmutableStaging,
         S::Writable: 'static + Unpin,
     {
@@ -1636,7 +1703,7 @@ where
         mode: InvokeMode,
     ) -> Result<Option<Hash>, TxStoreError<B, S, K>>
     where
-        B: ImmutableWriteStore<S> + ImmutableReadStore,
+        B: ImmutableWriteStore<S> + ImmutableReadStore + ImmutableDeleteStore,
         S: ImmutableStaging,
         S::Writable: 'static + Unpin,
     {
@@ -1929,7 +1996,7 @@ where
         inputs: InvocationInputs<S::Writable>,
     ) -> Result<(TransactResult, Vec<InvocationOutcome<B::Readable>>), TxStoreError<B, S, K>>
     where
-        B: ImmutableWriteStore<S> + ImmutableReadStore,
+        B: ImmutableWriteStore<S> + ImmutableReadStore + ImmutableDeleteStore,
         S: ImmutableStaging,
         S::Writable: 'static + Unpin,
     {
@@ -1950,7 +2017,7 @@ where
         inputs: InvocationInputs<S::Writable>,
     ) -> Result<(TransactResult, Vec<InvocationOutcome<B::Readable>>), TxStoreError<B, S, K>>
     where
-        B: ImmutableWriteStore<S> + ImmutableReadStore,
+        B: ImmutableWriteStore<S> + ImmutableReadStore + ImmutableDeleteStore,
         S: ImmutableStaging,
         S::Writable: 'static + Unpin,
     {
@@ -1965,7 +2032,7 @@ where
         options: KvInvokeOptions,
     ) -> Result<(TransactResult, Vec<InvocationOutcome<B::Readable>>), TxStoreError<B, S, K>>
     where
-        B: ImmutableWriteStore<S> + ImmutableReadStore,
+        B: ImmutableWriteStore<S> + ImmutableReadStore + ImmutableDeleteStore,
         S: ImmutableStaging,
         S::Writable: 'static + Unpin,
     {
@@ -1985,7 +2052,7 @@ where
         options: KvInvokeOptions,
     ) -> Result<(TransactResult, Vec<InvocationOutcome<B::Readable>>), TxStoreError<B, S, K>>
     where
-        B: ImmutableWriteStore<S> + ImmutableReadStore,
+        B: ImmutableWriteStore<S> + ImmutableReadStore + ImmutableDeleteStore,
         S: ImmutableStaging,
         S::Writable: 'static + Unpin,
     {
@@ -2001,7 +2068,7 @@ where
         mode: InvokeMode,
     ) -> Result<(TransactResult, Vec<InvocationOutcome<B::Readable>>), TxStoreError<B, S, K>>
     where
-        B: ImmutableWriteStore<S> + ImmutableReadStore,
+        B: ImmutableWriteStore<S> + ImmutableReadStore + ImmutableDeleteStore,
         S: ImmutableStaging,
         S::Writable: 'static + Unpin,
     {
@@ -2153,6 +2220,7 @@ where
                         key: path.clone(),
                         metadata,
                         value,
+                        generation: 0,
                     });
                 }
                 // add delete for tx
@@ -2167,126 +2235,419 @@ where
             }
         }
 
-        // TC-732: conditional writes no longer need SERIALIZABLE. The
-        // per-space sequence lock is taken right after BEGIN, before the
-        // precondition read, so under READ COMMITTED that read already sees
-        // every earlier same-space commit and no same-space writer can commit
-        // until this one does. A failed precondition is a 412, never a false
-        // success (see `postgres_conditional_put_is_atomic_under_concurrency`).
-        let sequence_spaces = invocation.0.spaces().cloned().collect::<Vec<_>>();
-        let _sequence_guards = self.acquire_space_sequence_guards(&sequence_spaces).await;
-        let _writer = match &self.writer_lock {
-            Some(lock) => Some(lock.lock().await),
-            None => None,
-        };
-        let begin_start = Instant::now();
-        let tx_result = self.begin_graph_transaction().await;
-        crate::telemetry::observe_stage(
-            crate::telemetry::InvocationStage::DbTxBegin,
-            crate::telemetry::StageOutcome::from(tx_result.is_ok()),
-            begin_start.elapsed(),
-        );
-        let tx = tx_result?;
-        // TC-732: order this transaction's event sequence under the
-        // per-space lock. On PostgreSQL this is an advisory lock, so the
-        // meeting legacy guard lock below is still the first row lock.
-        crate::kv_sync::lock_space_sequences(&tx, &sequence_spaces).await?;
-        // On SQLite `begin_graph_transaction` already holds the write lock,
-        // so no read-to-write upgrade race remains. Distinct spaces are
-        // locked in a stable order to prevent cross-space deadlocks on PG.
         let mut legacy_spaces: Vec<_> = mutation_keys
             .iter()
             .filter(|(_, path)| crate::meeting_legacy_guard::protects(path.as_str()))
             .map(|(space, _)| space)
             .collect();
-        legacy_spaces.sort_by_key(|space| space.to_string());
+        legacy_spaces.sort_unstable();
         legacy_spaces.dedup();
-        for space in legacy_spaces {
-            if crate::meeting_legacy_guard::lock_writer(&tx, space).await? {
+        // Preserve frozen-write rejection before authorization and candidate
+        // registration. This read is only a preflight; the transaction takes
+        // the durable row lock before any upload below.
+        for space in &legacy_spaces {
+            if crate::meeting_legacy_guard::status(&self.conn, space)
+                .await
+                .map_err(|error| TxStoreError::Tx(TxError::Db(error)))?
+                .frozen
+            {
                 return Err(TxStoreError::LegacyMeetingFrozen);
             }
         }
-        // DbTxBody spans post-begin to pre-commit. The guard defaults to an
-        // `error` outcome so any `?`/early return inside the transaction is
-        // recorded as a failure; it is disarmed to `ok` right before commit.
-        let tx_body_timer =
-            crate::telemetry::StageTimer::start(crate::telemetry::InvocationStage::DbTxBody);
-        let auth_graph = match crate::auth_graph::AuthGraphSnapshot::load(&tx, &roots).await {
-            Ok(graph) => graph,
-            Err(error) => {
-                crate::telemetry::observe_stage(
-                    crate::telemetry::InvocationStage::AuthorizationGraphLoad,
-                    crate::telemetry::StageOutcome::Error,
-                    authz_start.elapsed(),
-                );
-                return Err(TxStoreError::Tx(match error {
-                    revocation::ChainTraversalError::Db(error) => TxError::Db(error),
-                    revocation::ChainTraversalError::LimitExceeded => {
-                        TxError::ChainTraversalLimitExceeded
-                    }
-                }));
+        // Check the entire invocation before creating an object in the block
+        // store. The transaction below repeats authorization after acquiring
+        // the sequence lock, preserving revocation and time ordering.
+        let now = OffsetDateTime::now_utc();
+        let mut sequence_spaces = invocation.0.spaces().cloned().collect::<Vec<_>>();
+        sequence_spaces.sort_unstable();
+        sequence_spaces.dedup();
+        let mut blobs = write_hashes
+            .iter()
+            .map(|((space, _), hash)| (space.clone(), *hash))
+            .collect::<Vec<_>>();
+        blobs.sort_unstable();
+        blobs.dedup();
+        // GC ages attempts from registration, not from storage.persist.
+        // This deadline also covers preparatory retries and queueing behind
+        // legacy freeze locks, so no PUT may begin after its five-minute fence
+        // grace could expire.
+        let upload_deadline = tokio::time::Instant::now() + KV_UPLOAD_TIMEOUT;
+        let mut attempt_bytes = [0u8; 16];
+        OsRng.fill_bytes(&mut attempt_bytes);
+        let attempt_id = hex::encode(attempt_bytes);
+        // Registration and authorization commit before any blob can be
+        // persisted. Retrying an uncertain preparatory COMMIT uses exactly the
+        // same attempt ID, so it cannot duplicate or steal another writer.
+        // SQLite's preparatory write follows sequence→writer→BEGIN and
+        // releases every guard before an ordinary upload.
+        let mut retried = false;
+        let blobs = loop {
+            let _sequence = if self.writer_lock.is_some() {
+                self.acquire_space_sequence_guards(&sequence_spaces).await
+            } else {
+                Vec::new()
+            };
+            let _writer = match &self.writer_lock {
+                Some(lock) => Some(lock.lock().await),
+                None => None,
+            };
+            let prepared = async {
+                let tx = self.candidate_conn.begin_preparatory().await?;
+                authorize_mutation_preupload::<_, B, K>(
+                    &tx,
+                    &invocation,
+                    mode,
+                    now,
+                    &sequence_spaces,
+                )
+                .await?;
+                let generations = if blobs.is_empty() {
+                    Vec::new()
+                } else {
+                    crate::kv_orphans::register_candidates(&tx, &blobs, &attempt_id).await?
+                };
+                tx.commit().await?;
+                Ok::<_, TxError<B, K>>(generations)
+            }
+            .await;
+            match prepared {
+                Ok(generations) => break generations,
+                Err(TxError::Db(error))
+                    if !retried && crate::db_pool::is_connection_error(&error) =>
+                {
+                    retried = true;
+                }
+                Err(TxError::Db(error)) if crate::kv_orphans::is_candidate_unavailable(&error) => {
+                    return Err(TxStoreError::KvCandidateUnavailable);
+                }
+                Err(error) => return Err(error.into()),
             }
         };
-        crate::telemetry::observe_stage(
-            crate::telemetry::InvocationStage::AuthorizationGraphLoad,
-            crate::telemetry::StageOutcome::Ok,
-            authz_start.elapsed(),
-        );
-        let mut deleted_hashes = HashMap::new();
-        for key @ (space, path) in &mutation_keys {
-            let current = get_kv_entity(&tx, space, path).await?;
-            if let Some(precondition) = options.preconditions.get(key) {
-                let matches = kv_precondition_matches(
-                    *precondition,
-                    current.as_ref().map(|entry| entry.value),
-                );
-                if !matches {
-                    return Err(TxStoreError::KvPreconditionFailed);
-                }
-            }
-            if let Some(entry) = current {
-                deleted_hashes.insert(key.clone(), entry.value);
+        for op in &mut ops {
+            if let Operation::KvWrite {
+                space,
+                value,
+                generation,
+                ..
+            } = op
+            {
+                let index = blobs
+                    .binary_search_by(|(s, v, _)| (s, v).cmp(&(&*space, &*value)))
+                    .expect("registered generation for every staged write");
+                *generation = blobs[index].2;
             }
         }
-        let caps = invocation.0.capabilities.clone();
-        let invoker = invocation.0.invoker.clone();
-        // Extract capabilities read params from UCAN facts field
-        // Facts is Vec<JsonValue>, we look for an object with capabilitiesReadParams key
-        let caps_read_params: Option<CapabilitiesReadParams> = invocation
-            .0
-            .invocation
-            .payload()
-            .facts
-            .as_ref()
-            .and_then(|facts| {
-                facts.iter().find_map(|fact| {
-                    fact.as_object()
-                        .and_then(|obj| obj.get("capabilitiesReadParams"))
-                        .and_then(|v| serde_json::from_value(v.clone()).ok())
-                })
-            });
-        //  verify and commit invocation and kv operations
-        let event = match mode {
-            InvokeMode::Internal | InvokeMode::MeetingPublication => {
-                Event::InternalInvocation(Box::new(invocation), ops)
+        // Keep the write-only transaction future off caller/test thread stacks:
+        // its auth graph and commit state grew beyond the default debug stack.
+        // Read-only invocations return above without this allocation.
+        let result = Box::pin(async {
+            let begin_mutation = || {
+                let legacy_spaces = &legacy_spaces;
+                async move {
+                    // Retrying a lost BEGIN or freeze lock is safe before
+                    // any KV transaction body or COMMIT has run.
+                    let mut retried = false;
+                    loop {
+                        let begin_start = Instant::now();
+                        let tx_result = self.begin_graph_transaction().await;
+                        crate::telemetry::observe_stage(
+                            crate::telemetry::InvocationStage::DbTxBegin,
+                            crate::telemetry::StageOutcome::from(tx_result.is_ok()),
+                            begin_start.elapsed(),
+                        );
+                        let tx = match tx_result {
+                            Ok(tx) => tx,
+                            Err(error)
+                                if !retried && crate::db_pool::is_connection_error(&error) =>
+                            {
+                                retried = true;
+                                continue;
+                            }
+                            Err(error) => return Err(TxStoreError::Tx(TxError::Db(error))),
+                        };
+                        let locked: Result<bool, DbErr> = async {
+                            // Protected legacy writes take the durable freeze
+                            // row before uploading and hold it through commit.
+                            for space in legacy_spaces {
+                                if crate::meeting_legacy_guard::lock_writer(&tx, space).await? {
+                                    return Ok(true);
+                                }
+                            }
+                            Ok(false)
+                        }
+                        .await;
+                        match locked {
+                            Ok(false) => break Ok(tx),
+                            Ok(true) => break Err(TxStoreError::LegacyMeetingFrozen),
+                            Err(error)
+                                if !retried && crate::db_pool::is_connection_error(&error) =>
+                            {
+                                retried = true;
+                                drop(tx);
+                            }
+                            Err(error) => break Err(error.into()),
+                        }
+                    }
+                }
+            };
+            // TC-1260: protected legacy paths deliberately retain the old
+            // lock_writer transaction across upload. Freeze ACK must wait
+            // until such an in-flight write commits or aborts. Ordinary paths
+            // never hold a transaction, pool connection, sequence or writer
+            // lock during upload.
+            let protected = !legacy_spaces.is_empty();
+            let _legacy_sqlite_sequence = if protected && self.writer_lock.is_some() {
+                self.acquire_space_sequence_guards(&sequence_spaces).await
+            } else {
+                Vec::new()
+            };
+            let _legacy_writer = if protected {
+                match &self.writer_lock {
+                    Some(lock) => Some(lock.lock().await),
+                    None => None,
+                }
+            } else {
+                None
+            };
+            let legacy_tx = if protected {
+                Some(begin_mutation().await?)
+            } else {
+                None
+            };
+            if !blobs.is_empty() {
+                self.persist_registered_blobs::<S>(
+                    std::mem::take(&mut stages),
+                    &write_hashes,
+                    &blobs,
+                    upload_deadline,
+                )
+                .await?;
             }
-            InvokeMode::Admitted => Event::AdmittedInvocation(Box::new(invocation), ops),
-            InvokeMode::Public => Event::Invocation(Box::new(invocation), ops),
-        };
-        let commit = transact(
-            &tx,
-            &self.storage,
-            &self.secrets,
-            vec![event],
-            self.encryption.as_ref(),
-            Some(&auth_graph),
-            // Taken on this `tx` right after BEGIN, above.
-            &sequence_spaces,
-        )
-        .await?;
+            // PG sequence guards are taken after upload. SQLite takes them
+            // before its writer mutex and BEGIN. The protected SQLite writer
+            // already holds both guards above.
+            let _sequence_guards = if protected && self.writer_lock.is_some() {
+                Vec::new()
+            } else {
+                self.acquire_space_sequence_guards(&sequence_spaces).await
+            };
+            let _ordinary_writer = if protected {
+                None
+            } else {
+                match &self.writer_lock {
+                    Some(lock) => Some(lock.lock().await),
+                    None => None,
+                }
+            };
+            let tx = match legacy_tx {
+                Some(tx) => tx,
+                None => begin_mutation().await?,
+            };
+            crate::kv_sync::lock_space_sequences(&tx, &sequence_spaces).await?;
+            // Legacy freeze alone holds its transaction across upload. Take
+            // the hash fence only now, after all external storage I/O, for
+            // both legacy and ordinary writes.
+            if !blobs.is_empty() {
+                crate::kv_orphans::lock_candidates(&tx, &blobs, &attempt_id)
+                    .await
+                    .map_err(|error| {
+                        if crate::kv_orphans::is_candidate_unavailable(&error) {
+                            TxStoreError::KvCandidateUnavailable
+                        } else {
+                            error.into()
+                        }
+                    })?;
+            }
+            // The sequence lock precedes every precondition read under READ
+            // COMMITTED, including when an upload was prepared concurrently.
+            // SQLite already holds its single-writer lock at BEGIN, preventing a
+            // read-to-write upgrade race. Multi-space PG locks are acquired in
+            // stable order to avoid cross-space deadlocks.
+            // DbTxBody spans post-begin to pre-commit. The guard defaults to an
+            // `error` outcome so any `?`/early return inside the transaction is
+            // recorded as a failure; it is disarmed to `ok` right before commit.
+            let tx_body_timer =
+                crate::telemetry::StageTimer::start(crate::telemetry::InvocationStage::DbTxBody);
+            let auth_graph = match crate::auth_graph::AuthGraphSnapshot::load(&tx, &roots).await {
+                Ok(graph) => graph,
+                Err(error) => {
+                    crate::telemetry::observe_stage(
+                        crate::telemetry::InvocationStage::AuthorizationGraphLoad,
+                        crate::telemetry::StageOutcome::Error,
+                        authz_start.elapsed(),
+                    );
+                    return Err(TxStoreError::Tx(match error {
+                        revocation::ChainTraversalError::Db(error) => TxError::Db(error),
+                        revocation::ChainTraversalError::LimitExceeded => {
+                            TxError::ChainTraversalLimitExceeded
+                        }
+                    }));
+                }
+            };
+            crate::telemetry::observe_stage(
+                crate::telemetry::InvocationStage::AuthorizationGraphLoad,
+                crate::telemetry::StageOutcome::Ok,
+                authz_start.elapsed(),
+            );
+            let mut deleted_hashes = HashMap::new();
+            for key @ (space, path) in &mutation_keys {
+                let current = get_kv_entity(&tx, space, path).await?;
+                if let Some(precondition) = options.preconditions.get(key) {
+                    let matches = kv_precondition_matches(
+                        *precondition,
+                        current.as_ref().map(|entry| entry.value),
+                    );
+                    if !matches {
+                        return Err(TxStoreError::KvPreconditionFailed);
+                    }
+                }
+                if let Some(entry) = current {
+                    deleted_hashes.insert(key.clone(), entry.value);
+                }
+            }
+            let caps = invocation.0.capabilities.clone();
+            let invoker = invocation.0.invoker.clone();
+            // Extract capabilities read params from UCAN facts field
+            // Facts is Vec<JsonValue>, we look for an object with capabilitiesReadParams key
+            let caps_read_params: Option<CapabilitiesReadParams> = invocation
+                .0
+                .invocation
+                .payload()
+                .facts
+                .as_ref()
+                .and_then(|facts| {
+                    facts.iter().find_map(|fact| {
+                        fact.as_object()
+                            .and_then(|obj| obj.get("capabilitiesReadParams"))
+                            .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    })
+                });
+            //  verify and commit invocation and kv operations
+            let event = match mode {
+                InvokeMode::Internal | InvokeMode::MeetingPublication => {
+                    Event::InternalInvocation(Box::new(invocation), ops)
+                }
+                InvokeMode::Admitted => Event::AdmittedInvocation(Box::new(invocation), ops),
+                InvokeMode::Public => Event::Invocation(Box::new(invocation), ops),
+            };
+            let commit = transact(
+                &tx,
+                &self.storage,
+                &self.secrets,
+                vec![event],
+                self.encryption.as_ref(),
+                Some(&auth_graph),
+                // Taken on this `tx` right after BEGIN, above.
+                &sequence_spaces,
+            )
+            .await?;
 
+            let results = self
+                .invocation_side_effects::<S>(
+                    &tx,
+                    &caps,
+                    &invoker,
+                    &options,
+                    &write_hashes,
+                    &deleted_hashes,
+                    caps_read_params.as_ref(),
+                )
+                .await?;
+            if !blobs.is_empty() {
+                crate::kv_orphans::finish_candidates(&tx, &blobs, &attempt_id).await?;
+            }
+
+            // Record the transaction body as successful (post-begin to
+            // pre-commit) before the commit itself; commit latency is tracked
+            // separately (EpochPersist on the delegate/revoke path).
+            tx_body_timer.observe_ok();
+            // commit tx if all side effects worked
+            tx.commit().await?;
+            Ok((commit, results))
+        })
+        .await;
+        if result.is_err() && !blobs.is_empty() {
+            // The failed transaction (including any hash locks) has ended.
+            // A commit error may be outcome-unknown: the candidate fence and
+            // committed-reference check distinguish that from an orphan.
+            if let Err(error) =
+                crate::kv_orphans::refund_failed(&self.conn, &self.storage, &blobs, &attempt_id)
+                    .await
+            {
+                tracing::warn!(
+                    ?error,
+                    "failed to refund orphaned KV blob; periodic collector will retry"
+                );
+            }
+        }
+        result
+    }
+
+    /// Upload staged KV blobs under their registered generations before any
+    /// sequence lock or KV transaction.
+    ///
+    /// A separate function, not inline in the commit future: debug builds give
+    /// every awaited temporary its own stack slot, and the commit future runs
+    /// the deepest request path (TC-735 #301 overflowed CI's 2 MiB stack).
+    async fn persist_registered_blobs<S>(
+        &self,
+        stages: HashMap<(SpaceId, Path), HashBuffer<S::Writable>>,
+        write_hashes: &HashMap<(SpaceId, Path), Hash>,
+        blobs: &[(SpaceId, Hash, i64)],
+        upload_deadline: tokio::time::Instant,
+    ) -> Result<(), TxStoreError<B, S, K>>
+    where
+        B: ImmutableWriteStore<S> + ImmutableReadStore + ImmutableDeleteStore,
+        S: ImmutableStaging,
+        S::Writable: 'static + Unpin,
+    {
+        if tokio::time::Instant::now() >= upload_deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "KV upload deadline elapsed before persist",
+            )
+            .into());
+        }
+        tokio::time::timeout_at(upload_deadline, async {
+            for (key, stage) in stages {
+                let expected = write_hashes[&key];
+                let (space, _) = key;
+                let index = blobs
+                    .binary_search_by(|(s, v, _)| (s, v).cmp(&(&space, &expected)))
+                    .expect("registered generation for every staged write");
+                let hash = self
+                    .storage
+                    .persist(&space, stage, blobs[index].2)
+                    .await
+                    .map_err(TxStoreError::StoreWrite)?;
+                debug_assert_eq!(hash, expected);
+            }
+            Ok::<(), TxStoreError<B, S, K>>(())
+        })
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "KV upload timed out"))?
+    }
+
+    /// Perform and record the invocation's side effects inside the KV
+    /// transaction, after `transact`. Separate from the commit future for the
+    /// same stack reason as [`Self::persist_registered_blobs`].
+    #[allow(clippy::too_many_arguments)]
+    async fn invocation_side_effects<S>(
+        &self,
+        tx: &DatabaseTransaction,
+        caps: &[crate::util::Capability],
+        invoker: &str,
+        options: &KvInvokeOptions,
+        write_hashes: &HashMap<(SpaceId, Path), Hash>,
+        deleted_hashes: &HashMap<(SpaceId, Path), Hash>,
+        caps_read_params: Option<&CapabilitiesReadParams>,
+    ) -> Result<Vec<InvocationOutcome<B::Readable>>, TxStoreError<B, S, K>>
+    where
+        B: ImmutableWriteStore<S> + ImmutableReadStore + ImmutableDeleteStore,
+        S: ImmutableStaging,
+        S::Writable: 'static + Unpin,
+    {
         let mut results = Vec::new();
-        // perform and record side effects
         for cap in caps.iter().filter_map(|c| {
             c.resource.tinycloud_resource().and_then(|r| {
                 Some((
@@ -2302,7 +2663,7 @@ where
             match cap {
                 (space, "kv", "tinycloud.kv/get", path) => {
                     let data =
-                        get_kv(&tx, &self.storage, space, path)
+                        get_kv(tx, &self.storage, space, path)
                             .await
                             .map_err(|e| match e {
                                 EitherError::A(e) => TxStoreError::Tx(e.into()),
@@ -2322,7 +2683,7 @@ where
                 }
                 (space, "kv", "tinycloud.kv/list", path) => {
                     let (list, truncated) = list_bounded_after(
-                        &tx,
+                        tx,
                         space,
                         path,
                         options.list_limit,
@@ -2339,38 +2700,32 @@ where
                     ))
                 }
                 (space, "kv", "tinycloud.kv/put", path) => {
-                    if let Some(stage) = stages.remove(&(space.clone(), path.clone())) {
-                        self.storage
-                            .persist(space, stage)
-                            .await
-                            .map_err(TxStoreError::StoreWrite)?;
-                        let hash = write_hashes
-                            .get(&(space.clone(), path.clone()))
-                            .copied()
-                            .expect("staged KV writes have a content hash");
-                        results.push(InvocationOutcome::KvWrite(hash))
-                    }
+                    let hash = write_hashes
+                        .get(&(space.clone(), path.clone()))
+                        .copied()
+                        .expect("staged KV writes have a content hash");
+                    results.push(InvocationOutcome::KvWrite(hash));
                 }
                 (space, "kv", "tinycloud.kv/metadata", path) => results.push(
-                    InvocationOutcome::KvMetadata(metadata_with_hash(&tx, space, path).await?),
+                    InvocationOutcome::KvMetadata(metadata_with_hash(tx, space, path).await?),
                 ),
                 (space, "capabilities", "tinycloud.capabilities/read", path)
                     if path.as_str() == "all" =>
                 {
-                    match &caps_read_params {
+                    match caps_read_params {
                         None => {
                             // Backward compatible: no params means return all valid delegations
                             results.push(InvocationOutcome::OpenSessions(
-                                get_valid_delegations(&tx, space, self.encryption.as_ref()).await?,
+                                get_valid_delegations(tx, space, self.encryption.as_ref()).await?,
                             ))
                         }
                         Some(CapabilitiesReadParams::List { filters }) => {
                             // List with optional filters
                             results.push(InvocationOutcome::OpenSessions(
                                 get_filtered_delegations(
-                                    &tx,
+                                    tx,
                                     space,
-                                    &invoker,
+                                    invoker,
                                     filters.as_ref(),
                                     self.encryption.as_ref(),
                                 )
@@ -2381,7 +2736,7 @@ where
                             // Get the delegation chain for a specific delegation
                             results.push(InvocationOutcome::DelegationChain(
                                 get_delegation_chain(
-                                    &tx,
+                                    tx,
                                     space,
                                     delegation_cid,
                                     self.encryption.as_ref(),
@@ -2394,14 +2749,7 @@ where
                 _ => {}
             };
         }
-
-        // Record the transaction body as successful (post-begin to
-        // pre-commit) before the commit itself; commit latency is tracked
-        // separately (EpochPersist on the delegate/revoke path).
-        tx_body_timer.observe_ok();
-        // commit tx if all side effects worked
-        tx.commit().await?;
-        Ok((commit, results))
+        Ok(results)
     }
 
     /// Execute a successful non-mutating invocation without entering the
@@ -3851,7 +4199,7 @@ async fn get_kv<C: ConnectionTrait, B: ImmutableReadStore>(
     };
     let content_hash = e.value;
     let c = match store
-        .read(space_id, &content_hash)
+        .read(space_id, &content_hash, e.generation)
         .await
         .map_err(EitherError::B)?
     {
@@ -4694,6 +5042,31 @@ mod test {
     }
 
     #[tokio::test]
+    async fn sqlite_preupload_registration_reserves_writer_before_authorization_reads() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("candidate.db");
+        let conn = sqlite_write_pool(&path, std::time::Duration::from_secs(5), 1).await;
+        let collector = sqlite_write_pool(&path, std::time::Duration::from_millis(100), 1).await;
+        let recovering = RecoveringConnection::new(conn);
+
+        let prep = recovering.begin_preparatory().await.unwrap();
+        epoch::Entity::find().count(&prep).await.unwrap();
+        let error = test_actor("did:key:collector")
+            .insert(&collector)
+            .await
+            .expect_err("collector cannot invalidate the preparatory read snapshot");
+        assert_eq!(sqlite_error_code(&error).as_deref(), Some("5"), "{error}");
+        prep.execute_unprepared(SQLITE_RESERVE_WRITE_LOCK)
+            .await
+            .expect("registration after authorization remains writable");
+        prep.commit().await.unwrap();
+        test_actor("did:key:collector")
+            .insert(&collector)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn postgres_write_transaction_is_a_plain_begin() {
         let Some(database_url) =
             crate::test_support::postgres_test_url("postgres_write_transaction_is_a_plain_begin")
@@ -4848,6 +5221,242 @@ mod test {
     }
 
     #[tokio::test]
+    async fn sqlite_prepersist_upload_does_not_invert_delegate_lock_order() {
+        use crate::storage::memory::MemoryStaging;
+        use futures::io::AsyncWriteExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("lock-order.db").display()
+        );
+        let storage = LegacyPausedStore::default();
+        let db = SpaceDatabase::new(
+            Database::connect(url).await.unwrap(),
+            storage.clone(),
+            StaticSecret::new(vec![0; 32]).unwrap(),
+        )
+        .await
+        .unwrap();
+        let space = test_space_id("sqlite-lock-order");
+        space::ActiveModel {
+            id: Set(SpaceIdWrap(space.clone())),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+        let writer_db = db.clone();
+        let writer_space = space.clone();
+        let writer = tokio::spawn(async move {
+            let mut stage = HashBuffer::new(Vec::new());
+            stage.write_all(b"paused upload").await.unwrap();
+            writer_db
+                .invoke_internal_kv_put::<MemoryStaging>(
+                    writer_space,
+                    "lock/key".parse().unwrap(),
+                    Metadata(Default::default()),
+                    stage,
+                    None,
+                )
+                .await
+                .map_err(|error| error.to_string())
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            storage.entered.notified(),
+        )
+        .await
+        .unwrap();
+        let invocation =
+            legacy_test_invocation(&space, &"lock/other".parse().unwrap(), "tinycloud.kv/del");
+        // Keep the generic transaction live after it takes the sequence
+        // guard. A one-shot poll would leave it suspended indefinitely and
+        // incorrectly report a deadlock even when both paths have one order.
+        let writer_gate = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            db.writer_lock.as_ref().unwrap().lock(),
+        )
+        .await
+        .expect("ordinary upload must not hold the SQLite writer mutex");
+        let delegate_db = db.clone();
+        let delegate = tokio::spawn(async move {
+            delegate_db
+                .transact(vec![Event::InternalInvocation(
+                    Box::new(invocation),
+                    vec![],
+                )])
+                .await
+                .map_err(|error| error.to_string())
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let acquired = db
+                    .space_sequence_locks
+                    .lock()
+                    .await
+                    .get(&space)
+                    .and_then(Weak::upgrade)
+                    .is_some_and(|lock| lock.try_lock().is_err());
+                if acquired {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("generic transaction must acquire the sequence before writer");
+        drop(writer_gate);
+        storage.release.notify_one();
+        let (write, delegated) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(writer, delegate)
+        })
+        .await
+        .expect("KV upload and generic transaction must not deadlock");
+        assert!(write.unwrap().is_ok());
+        assert!(delegated.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn sqlite_ordinary_upload_does_not_hold_writer_or_sequence() {
+        use crate::storage::memory::MemoryStaging;
+        use futures::io::AsyncWriteExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("ordinary.db").display()
+        );
+        let storage = LegacyPausedStore::default();
+        let db = SpaceDatabase::new(
+            Database::connect(url).await.unwrap(),
+            storage.clone(),
+            StaticSecret::new(vec![0; 32]).unwrap(),
+        )
+        .await
+        .unwrap();
+        let space = test_space_id("sqlite-ordinary-pool-release");
+        space::ActiveModel {
+            id: Set(SpaceIdWrap(space.clone())),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+        let writer_db = db.clone();
+        let writer_space = space.clone();
+        let writer = tokio::spawn(async move {
+            let mut stage = HashBuffer::new(Vec::new());
+            stage.write_all(b"ordinary upload").await.unwrap();
+            writer_db
+                .invoke_internal_kv_put::<MemoryStaging>(
+                    writer_space,
+                    "notes/paused".parse().unwrap(),
+                    Metadata(Default::default()),
+                    stage,
+                    None,
+                )
+                .await
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            storage.entered.notified(),
+        )
+        .await
+        .unwrap();
+        // GC can run while an ordinary S3/FS upload is in flight. The
+        // attempt is newer than its five-minute grace, so it stays durable
+        // until commit even though the blob has not landed yet.
+        let attempts_before = crate::models::kv_orphan_attempt::Entity::find()
+            .all(&db.conn)
+            .await
+            .unwrap();
+        assert_eq!(attempts_before.len(), 1);
+        assert_eq!(
+            crate::kv_orphans::collect_candidates_with_progress(
+                &db.conn,
+                &storage,
+                256,
+                crate::kv_orphans::ORPHAN_GRACE,
+            )
+            .await
+            .unwrap(),
+            (0, 0)
+        );
+        assert_eq!(
+            crate::models::kv_orphan_attempt::Entity::find()
+                .all(&db.conn)
+                .await
+                .unwrap(),
+            attempts_before
+        );
+        let invocation = legacy_test_invocation(
+            &space,
+            &"notes/deleted".parse().unwrap(),
+            "tinycloud.kv/del",
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            db.transact(vec![Event::InternalInvocation(
+                Box::new(invocation),
+                vec![],
+            )]),
+        )
+        .await
+        .expect("SQLite writer and sequence must be free during ordinary upload")
+        .map_err(|error| error.to_string())
+        .unwrap();
+        storage.release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(10), writer)
+            .await
+            .unwrap()
+            .unwrap()
+            .map_err(|error| error.to_string())
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn unauthorized_ordinary_put_never_reaches_storage() {
+        use crate::storage::memory::MemoryStaging;
+        use futures::io::AsyncWriteExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("unauthorized.db").display()
+        );
+        let storage = LegacyPausedStore::default();
+        let db = SpaceDatabase::new(
+            Database::connect(url).await.unwrap(),
+            storage.clone(),
+            StaticSecret::new(vec![0; 32]).unwrap(),
+        )
+        .await
+        .unwrap();
+        let space = test_space_id("unauthorized-ordinary");
+        space::ActiveModel {
+            id: Set(SpaceIdWrap(space.clone())),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+        let path: Path = "notes/unauthorized".parse().unwrap();
+        // The signed invocation presents an unregistered delegation.
+        let invocation = legacy_test_invocation(&space, &path, "tinycloud.kv/put");
+        let mut stage = HashBuffer::new(Vec::new());
+        stage.write_all(b"unauthorized").await.unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            db.invoke::<MemoryStaging>(
+                invocation,
+                HashMap::from([((space, path), (Metadata(Default::default()), stage))]),
+            ),
+        )
+        .await
+        .expect("authorization should fail before persist");
+        assert!(result.is_err());
+        assert_eq!(storage.uploads.load(std::sync::atomic::Ordering::SeqCst), 0,);
+    }
+
+    #[tokio::test]
     async fn legacy_freeze_covers_public_admitted_put_delete_and_deprecated_delete() {
         use crate::storage::memory::MemoryStaging;
         use futures::io::AsyncWriteExt;
@@ -4881,8 +5490,12 @@ mod test {
                     db.invoke::<MemoryStaging>(invocation, inputs).await
                 };
                 assert!(
-                    matches!(result, Err(TxStoreError::LegacyMeetingFrozen)),
-                    "{ability} admitted={admitted}"
+                    matches!(&result, Err(TxStoreError::LegacyMeetingFrozen)),
+                    "{ability} admitted={admitted}: {:?}",
+                    result
+                        .as_ref()
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
                 );
             }
         }
@@ -5032,6 +5645,11 @@ mod test {
         inner: MemoryStore,
         entered: Arc<tokio::sync::Notify>,
         release: Arc<tokio::sync::Notify>,
+        fail_after_persist: bool,
+        uploads: Arc<std::sync::atomic::AtomicUsize>,
+        pause_remove: bool,
+        removing: Arc<tokio::sync::Notify>,
+        remove_release: Arc<tokio::sync::Notify>,
     }
     #[async_trait::async_trait]
     impl StorageSetup for LegacyPausedStore {
@@ -5044,23 +5662,30 @@ mod test {
     impl ImmutableReadStore for LegacyPausedStore {
         type Error = std::io::Error;
         type Readable = futures::io::Cursor<Vec<u8>>;
-        async fn contains(&self, space: &SpaceId, hash: &Hash) -> Result<bool, Self::Error> {
-            self.inner.contains(space, hash).await
+        async fn contains(
+            &self,
+            space: &SpaceId,
+            hash: &Hash,
+            generation: i64,
+        ) -> Result<bool, Self::Error> {
+            self.inner.contains(space, hash, generation).await
         }
         async fn read(
             &self,
             space: &SpaceId,
             hash: &Hash,
+            generation: i64,
         ) -> Result<Option<Content<Self::Readable>>, Self::Error> {
-            self.inner.read(space, hash).await
+            self.inner.read(space, hash, generation).await
         }
         async fn read_range(
             &self,
             space: &SpaceId,
             hash: &Hash,
+            generation: i64,
             range: crate::storage::ByteRangeSpec,
         ) -> Result<Option<crate::storage::RangeRead<Self::Readable>>, Self::Error> {
-            self.inner.read_range(space, hash, range).await
+            self.inner.read_range(space, hash, generation, range).await
         }
     }
     #[async_trait::async_trait]
@@ -5070,10 +5695,42 @@ mod test {
             &self,
             space: &SpaceId,
             stage: HashBuffer<Vec<u8>>,
+            generation: i64,
         ) -> Result<Hash, Self::Error> {
+            self.uploads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.entered.notify_one();
             self.release.notified().await;
-            self.inner.persist(space, stage).await
+            let hash = self.inner.persist(space, stage, generation).await?;
+            if self.fail_after_persist {
+                return Err(std::io::Error::other("lost upload response"));
+            }
+            Ok(hash)
+        }
+    }
+    #[async_trait::async_trait]
+    impl ImmutableDeleteStore for LegacyPausedStore {
+        type Error = std::io::Error;
+
+        async fn remove(
+            &self,
+            space: &SpaceId,
+            hash: &Hash,
+            generation: i64,
+        ) -> Result<Option<()>, Self::Error> {
+            if self.pause_remove {
+                self.removing.notify_one();
+                self.remove_release.notified().await;
+            }
+            self.inner.remove(space, hash, generation).await
+        }
+        async fn cleanup_stages(
+            &self,
+            space: &SpaceId,
+            hash: &Hash,
+            generation: i64,
+        ) -> Result<(), Self::Error> {
+            self.inner.cleanup_stages(space, hash, generation).await
         }
     }
     #[tokio::test]
@@ -5177,6 +5834,516 @@ mod test {
                 .await,
             Err(TxStoreError::LegacyMeetingFrozen)
         ));
+    }
+
+    #[tokio::test]
+    async fn postgres_ordinary_upload_releases_pool_and_sequence_before_persist() {
+        use crate::storage::memory::MemoryStaging;
+        use futures::io::AsyncWriteExt;
+
+        let Some(schema) = crate::test_support::PostgresTestSchema::new(
+            "postgres_ordinary_upload_releases_pool_and_sequence_before_persist",
+        )
+        .await
+        else {
+            return;
+        };
+        let storage = LegacyPausedStore::default();
+        let db = SpaceDatabase::new(
+            schema.conn.clone(),
+            storage.clone(),
+            StaticSecret::new(vec![0; 32]).unwrap(),
+        )
+        .await
+        .unwrap();
+        let space = test_space_id("pg-ordinary-pool-release");
+        space::ActiveModel {
+            id: Set(SpaceIdWrap(space.clone())),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+        let pool = schema.conn.get_postgres_connection_pool();
+        // The fixture's max_connections is four: reserve three and leave
+        // precisely one for both preparatory and final transactions.
+        let mut held = Vec::new();
+        for _ in 0..3 {
+            held.push(pool.acquire().await.unwrap());
+        }
+        let baseline = pool.size() as usize - pool.num_idle();
+        let writer_db = db.clone();
+        let writer_space = space.clone();
+        let writer = tokio::spawn(async move {
+            let mut stage = HashBuffer::new(Vec::new());
+            stage.write_all(b"ordinary upload").await.unwrap();
+            writer_db
+                .invoke_internal_kv_put::<MemoryStaging>(
+                    writer_space,
+                    "notes/paused".parse().unwrap(),
+                    Metadata(Default::default()),
+                    stage,
+                    None,
+                )
+                .await
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            storage.entered.notified(),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if pool.size() as usize - pool.num_idle() == baseline {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("ordinary upload must release its pooled connection while paused");
+        // A different same-space transaction must commit while upload is paused.
+        let invocation = legacy_test_invocation(
+            &space,
+            &"notes/deleted".parse().unwrap(),
+            "tinycloud.kv/del",
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            db.transact(vec![Event::InternalInvocation(
+                Box::new(invocation),
+                vec![],
+            )]),
+        )
+        .await
+        .expect("another same-space write should not wait for an ordinary upload")
+        .map_err(|error| error.to_string())
+        .unwrap();
+        storage.release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(10), writer)
+            .await
+            .unwrap()
+            .unwrap()
+            .map_err(|error| error.to_string())
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_legacy_freeze_during_slow_upload_waits_for_commit() {
+        use crate::storage::memory::MemoryStaging;
+        use futures::io::AsyncWriteExt;
+        let Some(schema) = crate::test_support::PostgresTestSchema::new(
+            "postgres_legacy_freeze_during_slow_upload_waits_for_commit",
+        )
+        .await
+        else {
+            return;
+        };
+        let storage = LegacyPausedStore::default();
+        let first = SpaceDatabase::new(
+            schema.conn.clone(),
+            storage.clone(),
+            StaticSecret::new(vec![0; 32]).unwrap(),
+        )
+        .await
+        .unwrap();
+        let second = SpaceDatabase::new(
+            schema.conn.clone(),
+            storage.clone(),
+            StaticSecret::new(vec![0; 32]).unwrap(),
+        )
+        .await
+        .unwrap();
+        let space = test_space_id("pg-legacy-slow-upload");
+        space::ActiveModel {
+            id: Set(SpaceIdWrap(space.clone())),
+        }
+        .insert(&first.conn)
+        .await
+        .unwrap();
+        let path: Path = "xyz.tinycloud.tinychat/connectors/fireflies/transcript/slow"
+            .parse()
+            .unwrap();
+        let writer_space = space.clone();
+        let writer_path = path.clone();
+        let writer = tokio::spawn(async move {
+            let mut stage = HashBuffer::new(Vec::new());
+            stage.write_all(b"slow original").await.unwrap();
+            first
+                .invoke_internal_kv_put::<MemoryStaging>(
+                    writer_space,
+                    writer_path,
+                    Metadata(Default::default()),
+                    stage,
+                    None,
+                )
+                .await
+                .map_err(|error| error.to_string())
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            storage.entered.notified(),
+        )
+        .await
+        .unwrap();
+        let freeze_space = space.clone();
+        let reader = second.clone();
+        let mut freeze = tokio::spawn(async move {
+            second
+                .set_legacy_meeting_write_freeze(&freeze_space, true, 0)
+                .await
+        });
+        let early_ack =
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut freeze).await;
+        storage.release.notify_one();
+        let written = tokio::time::timeout(std::time::Duration::from_secs(10), writer)
+            .await
+            .unwrap()
+            .unwrap();
+        let acknowledged_while_uploading = early_ack.is_ok();
+        let frozen = match early_ack {
+            Ok(result) => result.unwrap().unwrap().frozen,
+            Err(_) => {
+                tokio::time::timeout(std::time::Duration::from_secs(10), freeze)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap()
+                    .frozen
+            }
+        };
+        assert!(
+            !acknowledged_while_uploading,
+            "freeze acknowledged before pre-persisted write committed"
+        );
+        let hash = written.unwrap();
+        assert!(frozen);
+        assert!(storage.inner.contains(&space, &hash, 0).await.unwrap());
+        assert_eq!(reader.kv_get(&space, &path).await.unwrap().unwrap().1, hash);
+    }
+
+    #[tokio::test]
+    async fn legacy_freeze_during_failed_upload_refunds_and_rejects_later_write_before_upload() {
+        use crate::storage::{memory::MemoryStaging, StoreSize};
+        use futures::io::AsyncWriteExt;
+        let directory = tempfile::tempdir().unwrap();
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("native.sqlite").display()
+        );
+        let storage = LegacyPausedStore {
+            fail_after_persist: true,
+            ..Default::default()
+        };
+        let first = SpaceDatabase::new(
+            Database::connect(url.clone()).await.unwrap(),
+            storage.clone(),
+            StaticSecret::new(vec![0; 32]).unwrap(),
+        )
+        .await
+        .unwrap();
+        let second = SpaceDatabase::new(
+            Database::connect(url).await.unwrap(),
+            storage.clone(),
+            StaticSecret::new(vec![0; 32]).unwrap(),
+        )
+        .await
+        .unwrap();
+        let space = test_space_id("legacy-failed-upload-freeze");
+        space::ActiveModel {
+            id: Set(SpaceIdWrap(space.clone())),
+        }
+        .insert(&first.conn)
+        .await
+        .unwrap();
+        let path: Path = "xyz.tinycloud.tinychat/connectors/fireflies/transcript/failed"
+            .parse()
+            .unwrap();
+        let writer_space = space.clone();
+        let writer_path = path.clone();
+        let writer = tokio::spawn(async move {
+            let mut stage = HashBuffer::new(Vec::new());
+            stage.write_all(b"failed upload").await.unwrap();
+            first
+                .invoke_internal_kv_put::<MemoryStaging>(
+                    writer_space,
+                    writer_path,
+                    Metadata(Default::default()),
+                    stage,
+                    None,
+                )
+                .await
+                .map_err(|error| error.to_string())
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            storage.entered.notified(),
+        )
+        .await
+        .unwrap();
+        let freeze_space = space.clone();
+        let freeze_db = second.clone();
+        let mut freeze = tokio::spawn(async move {
+            freeze_db
+                .set_legacy_meeting_write_freeze(&freeze_space, true, 0)
+                .await
+        });
+        let early_ack =
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut freeze).await;
+        storage.release.notify_one();
+        let written = tokio::time::timeout(std::time::Duration::from_secs(10), writer)
+            .await
+            .unwrap()
+            .unwrap();
+        let acknowledged_while_uploading = early_ack.is_ok();
+        let frozen = match early_ack {
+            Ok(result) => result.unwrap().unwrap().frozen,
+            Err(_) => {
+                tokio::time::timeout(std::time::Duration::from_secs(10), freeze)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap()
+                    .frozen
+            }
+        };
+        assert!(
+            !acknowledged_while_uploading,
+            "freeze acknowledged while upload remained in flight"
+        );
+        let error = written.unwrap_err();
+        assert!(error.contains("lost upload response"), "{error}");
+        assert!(frozen);
+        let hash = crate::hash::hash(b"failed upload");
+        assert!(!storage.inner.contains(&space, &hash, 0).await.unwrap());
+        assert_eq!(storage.inner.total_size(&space).await.unwrap(), Some(0));
+        assert_eq!(
+            crate::kv_orphans::collect_candidates(&second.conn, &storage, 1, time::Duration::ZERO)
+                .await
+                .unwrap(),
+            0,
+            "immediate refund consumed candidate exactly once"
+        );
+        let mut late_stage = HashBuffer::new(Vec::new());
+        late_stage.write_all(b"late").await.unwrap();
+        assert!(matches!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                second.invoke_internal_kv_put::<MemoryStaging>(
+                    space.clone(),
+                    path,
+                    Metadata(Default::default()),
+                    late_stage,
+                    None,
+                )
+            )
+            .await
+            .unwrap(),
+            Err(TxStoreError::LegacyMeetingFrozen)
+        ));
+        assert_eq!(
+            storage.uploads.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a post-freeze write must be refused before storage.persist"
+        );
+        assert_eq!(storage.inner.total_size(&space).await.unwrap(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn postgres_legacy_freeze_ack_during_orphan_cleanup_preserves_committed_references() {
+        use crate::storage::{memory::MemoryStaging, StoreSize};
+        use futures::io::AsyncWriteExt;
+        let Some(schema) = crate::test_support::PostgresTestSchema::new(
+            "postgres_legacy_freeze_ack_during_orphan_cleanup_preserves_committed_references",
+        )
+        .await
+        else {
+            return;
+        };
+        let storage = LegacyPausedStore {
+            fail_after_persist: true,
+            pause_remove: true,
+            ..Default::default()
+        };
+        let committed_db = SpaceDatabase::new(
+            schema.conn.clone(),
+            storage.inner.clone(),
+            StaticSecret::new(vec![0; 32]).unwrap(),
+        )
+        .await
+        .unwrap();
+        let writer_db = SpaceDatabase::new(
+            schema.conn.clone(),
+            storage.clone(),
+            StaticSecret::new(vec![0; 32]).unwrap(),
+        )
+        .await
+        .unwrap();
+        let freezer = SpaceDatabase::new(
+            schema.conn.clone(),
+            storage.clone(),
+            StaticSecret::new(vec![0; 32]).unwrap(),
+        )
+        .await
+        .unwrap();
+        let space = test_space_id("pg-freeze-orphan-cleanup");
+        space::ActiveModel {
+            id: Set(SpaceIdWrap(space.clone())),
+        }
+        .insert(&schema.conn)
+        .await
+        .unwrap();
+        let kept_path: Path = "xyz.tinycloud.tinychat/connectors/fireflies/transcript/kept"
+            .parse()
+            .unwrap();
+        let mut kept_stage = HashBuffer::new(Vec::new());
+        kept_stage.write_all(b"committed").await.unwrap();
+        let kept_hash = committed_db
+            .invoke_internal_kv_put::<MemoryStaging>(
+                space.clone(),
+                kept_path.clone(),
+                Metadata(Default::default()),
+                kept_stage,
+                None,
+            )
+            .await
+            .map_err(|error| error.to_string())
+            .unwrap();
+        let before = get_kv_entity(&schema.conn, &space, &kept_path)
+            .await
+            .unwrap()
+            .unwrap();
+        let writes_before = crate::models::kv_write::Entity::find()
+            .filter(crate::models::kv_write::Column::Space.eq(SpaceIdWrap(space.clone())))
+            .count(&schema.conn)
+            .await
+            .unwrap();
+        let orphan_path: Path = "xyz.tinycloud.tinychat/connectors/fireflies/transcript/orphan"
+            .parse()
+            .unwrap();
+        let orphan_probe = orphan_path.clone();
+        let orphan_hash = crate::hash::hash(b"uncommitted");
+        let writer_space = space.clone();
+        let mut writer = tokio::spawn(async move {
+            let mut stage = HashBuffer::new(Vec::new());
+            stage.write_all(b"uncommitted").await.unwrap();
+            writer_db
+                .invoke_internal_kv_put::<MemoryStaging>(
+                    writer_space,
+                    orphan_path,
+                    Metadata(Default::default()),
+                    stage,
+                    None,
+                )
+                .await
+                .map_err(|error| error.to_string())
+        });
+        if tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            storage.entered.notified(),
+        )
+        .await
+        .is_err()
+        {
+            writer.abort();
+            panic!("the protected writer did not reach the upload");
+        }
+        let freeze_space = space.clone();
+        let mut freeze = tokio::spawn(async move {
+            freezer
+                .set_legacy_meeting_write_freeze(&freeze_space, true, 0)
+                .await
+        });
+        let acknowledged_during_upload =
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut freeze)
+                .await
+                .is_ok();
+        storage.release.notify_one();
+        if tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            storage.removing.notified(),
+        )
+        .await
+        .is_err()
+        {
+            storage.remove_release.notify_one();
+            writer.abort();
+            freeze.abort();
+            panic!("the failed upload did not reach orphan cleanup");
+        }
+        let ack_before_cleanup =
+            tokio::time::timeout(std::time::Duration::from_secs(10), &mut freeze).await;
+        let orphan_still_present = storage.inner.contains(&space, &orphan_hash, 0).await;
+        storage.remove_release.notify_one();
+        let orphan_still_present = orphan_still_present.unwrap();
+        let write_result =
+            match tokio::time::timeout(std::time::Duration::from_secs(10), &mut writer).await {
+                Ok(result) => result.unwrap(),
+                Err(_) => {
+                    writer.abort();
+                    freeze.abort();
+                    panic!("the failed write did not finish cleanup");
+                }
+            };
+        let acknowledged_before_cleanup = ack_before_cleanup.is_ok();
+        let frozen = match ack_before_cleanup {
+            Ok(result) => result.unwrap().unwrap().frozen,
+            Err(_) => {
+                tokio::time::timeout(std::time::Duration::from_secs(10), freeze)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap()
+                    .frozen
+            }
+        };
+        assert!(!acknowledged_during_upload);
+        assert!(
+            acknowledged_before_cleanup,
+            "the DB abort must release the freeze barrier"
+        );
+        assert!(
+            orphan_still_present,
+            "cleanup was still pending at freeze ACK"
+        );
+        assert!(frozen);
+        assert!(write_result.unwrap_err().contains("lost upload response"));
+        let after = get_kv_entity(&schema.conn, &space, &kept_path)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((after.seq, after.value), (before.seq, before.value));
+        assert_eq!(after.value, kept_hash);
+        assert!(get_kv_entity(&schema.conn, &space, &orphan_probe)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            crate::models::kv_write::Entity::find()
+                .filter(crate::models::kv_write::Column::Space.eq(SpaceIdWrap(space.clone())))
+                .count(&schema.conn)
+                .await
+                .unwrap(),
+            writes_before,
+            "post-ACK cleanup must not mutate committed rows"
+        );
+        assert!(storage.inner.contains(&space, &kept_hash, 0).await.unwrap());
+        assert!(!storage
+            .inner
+            .contains(&space, &orphan_hash, 0)
+            .await
+            .unwrap());
+        assert_eq!(
+            storage.inner.total_size(&space).await.unwrap(),
+            Some(b"committed".len() as u64),
+            "only the unreferenced candidate may be refunded"
+        );
+        assert_eq!(
+            crate::kv_orphans::collect_candidates(&schema.conn, &storage, 1, time::Duration::ZERO)
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]
@@ -5321,6 +6488,7 @@ mod test {
                 epoch: epoch_id,
                 epoch_seq: 0,
                 value: crate::hash::hash(b"shared-value"),
+                generation: 0,
                 metadata: Metadata(std::collections::BTreeMap::new()),
             };
             kv_write::ActiveModel::from(write.clone())
@@ -5692,6 +6860,7 @@ mod test {
                 epoch: Set(crate::hash::hash(b"query-plan-epoch")),
                 epoch_seq: Set(0),
                 value: Set(crate::hash::hash(format!("value-{seq}").as_bytes())),
+                generation: Set(0),
                 metadata: Set(Metadata(std::collections::BTreeMap::new())),
             });
         }

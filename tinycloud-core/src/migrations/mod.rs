@@ -27,6 +27,7 @@ pub mod m20261007_010000_database_identity_fence;
 pub mod m20261014_000000_delegation_cid_alias;
 pub mod m20261015_000000_delegation_cursor_index;
 pub mod m20261017_000000_epoch_order_space_index;
+pub mod m20261017_020000_kv_orphan_candidates;
 
 pub struct Migrator;
 
@@ -62,6 +63,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261014_000000_delegation_cid_alias::Migration),
             Box::new(m20261015_000000_delegation_cursor_index::Migration),
             Box::new(m20261017_000000_epoch_order_space_index::Migration),
+            Box::new(m20261017_020000_kv_orphan_candidates::Migration),
         ]
     }
 }

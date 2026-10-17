@@ -633,9 +633,22 @@ pub async fn app_with_control(
         encryption_backend,
     );
 
+    // Migrate before opening S3: its one bucket listing both reconstructs
+    // SpaceSizes and records which in-flight DELETE fences were counted.
+    // A separate HEAD after listing could race an old DELETE and leak quota.
+    // This is main's lock_timeout-bounded boot migration; the second pass in
+    // `new_with_encryption` finds the history current, then runs the CID-alias
+    // backfill with the column key before any request is served.
+    tinycloud_core::db::migrate(&database_connection).await?;
+    let deleting_fences = tinycloud_core::kv_orphans::deleting_fences(&database_connection).await?;
+    let block_store: BlockStores = match &tinycloud_config.storage.blocks {
+        Either::A(s3) => Either::A(s3.open_with_deleting(&deleting_fences).await?),
+        Either::B(local) => Either::B(local.open().await?),
+    };
+    let orphan_store = block_store.clone();
     let tinycloud = TinyCloud::new_with_encryption(
         database_connection,
-        tinycloud_config.storage.blocks.open().await?,
+        block_store,
         key_setup.setup(()).await?,
         Some(webhook_encryption.clone()),
     )
@@ -731,6 +744,8 @@ pub async fn app_with_control(
     )?;
     spawn_webhook_dispatcher(webhook_dispatcher);
 
+    let orphan_conn = seed_conn.clone();
+
     // TC-326: capture handles for the telemetry DB sampler before `tinycloud`
     // is moved into Rocket-managed state below.
     let telemetry_enabled = tinycloud_config.telemetry.enabled;
@@ -787,6 +802,33 @@ pub async fn app_with_control(
                 })
             },
         ))
+        .attach(AdHoc::on_liftoff("kv-orphan-cleanup", move |rocket| {
+            let conn = orphan_conn.clone();
+            let store = orphan_store.clone();
+            let shutdown = rocket.shutdown();
+            Box::pin(async move {
+                tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+                    tokio::pin!(shutdown);
+                    loop {
+                        tokio::select! {
+                            _ = interval.tick() => {
+                                let result = tokio::select! {
+                                    result = tinycloud_core::kv_orphans::drain_candidates_for_interval(
+                                        &conn, &store, tinycloud_core::kv_orphans::ORPHAN_GRACE,
+                                    ) => result,
+                                    _ = &mut shutdown => break,
+                                };
+                                if let Err(error) = result {
+                                    ::tracing::warn!(%error, "KV orphan collection failed");
+                                }
+                            }
+                            _ = &mut shutdown => break,
+                        }
+                    }
+                });
+            })
+        }))
         .manage(tinycloud)
         .manage(node_public_keys)
         .manage(sql_service);

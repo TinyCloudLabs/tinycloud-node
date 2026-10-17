@@ -124,28 +124,36 @@ pub enum KeyedWriteError<E> {
 pub trait ImmutableReadStore: Send + Sync {
     type Error: StdError + Send + Sync;
     type Readable: futures::io::AsyncRead + Send + Sync;
-    async fn contains(&self, space: &SpaceId, id: &Hash) -> Result<bool, Self::Error>;
+    async fn contains(
+        &self,
+        space: &SpaceId,
+        id: &Hash,
+        generation: i64,
+    ) -> Result<bool, Self::Error>;
     async fn read(
         &self,
         space: &SpaceId,
         id: &Hash,
+        generation: i64,
     ) -> Result<Option<Content<Self::Readable>>, Self::Error>;
     async fn read_range(
         &self,
         space: &SpaceId,
         id: &Hash,
+        generation: i64,
         range: ByteRangeSpec,
     ) -> Result<Option<RangeRead<Self::Readable>>, Self::Error>;
     async fn read_to_vec(
         &self,
         space: &SpaceId,
         id: &Hash,
+        generation: i64,
     ) -> Result<Option<Vec<u8>>, VecReadError<Self::Error>>
     where
         Self::Readable: Send,
     {
         use futures::io::AsyncReadExt;
-        let (l, r) = match self.read(space, id).await? {
+        let (l, r) = match self.read(space, id, generation).await? {
             None => return Ok(None),
             Some(r) => r.into_inner(),
         };
@@ -179,17 +187,19 @@ where
         &self,
         space: &SpaceId,
         staged: HashBuffer<S::Writable>,
+        generation: i64,
     ) -> Result<Hash, Self::Error>;
     async fn persist_keyed(
         &self,
         space: &SpaceId,
         mut staged: HashBuffer<S::Writable>,
         hash: &Hash,
+        generation: i64,
     ) -> Result<(), KeyedWriteError<Self::Error>> {
         if hash != &staged.hash() {
             return Err(KeyedWriteError::IncorrectHash);
         };
-        self.persist(space, staged).await?;
+        self.persist(space, staged, generation).await?;
         Ok(())
     }
 }
@@ -197,7 +207,22 @@ where
 #[async_trait]
 pub trait ImmutableDeleteStore: Send + Sync {
     type Error: StdError + Send + Sync;
-    async fn remove(&self, space: &SpaceId, id: &Hash) -> Result<Option<()>, Self::Error>;
+    async fn remove(
+        &self,
+        space: &SpaceId,
+        id: &Hash,
+        generation: i64,
+    ) -> Result<Option<()>, Self::Error>;
+
+    /// Reclaim incomplete, unreferenced staging files without removing the
+    /// published blob. Called only after the orphan fence found no active
+    /// attempts; storage backends without persistent stages have nothing to do.
+    async fn cleanup_stages(
+        &self,
+        space: &SpaceId,
+        id: &Hash,
+        generation: i64,
+    ) -> Result<(), Self::Error>;
 }
 
 #[async_trait]
@@ -213,33 +238,41 @@ where
 {
     type Error = S::Error;
     type Readable = S::Readable;
-    async fn contains(&self, space: &SpaceId, id: &Hash) -> Result<bool, Self::Error> {
-        self.contains(space, id).await
+    async fn contains(
+        &self,
+        space: &SpaceId,
+        id: &Hash,
+        generation: i64,
+    ) -> Result<bool, Self::Error> {
+        (**self).contains(space, id, generation).await
     }
     async fn read(
         &self,
         space: &SpaceId,
         id: &Hash,
+        generation: i64,
     ) -> Result<Option<Content<Self::Readable>>, Self::Error> {
-        self.read(space, id).await
+        (**self).read(space, id, generation).await
     }
     async fn read_range(
         &self,
         space: &SpaceId,
         id: &Hash,
+        generation: i64,
         range: ByteRangeSpec,
     ) -> Result<Option<RangeRead<Self::Readable>>, Self::Error> {
-        self.read_range(space, id, range).await
+        (**self).read_range(space, id, generation, range).await
     }
     async fn read_to_vec(
         &self,
         space: &SpaceId,
         id: &Hash,
+        generation: i64,
     ) -> Result<Option<Vec<u8>>, VecReadError<Self::Error>>
     where
         Self::Readable: Send,
     {
-        self.read_to_vec(space, id).await
+        (**self).read_to_vec(space, id, generation).await
     }
 }
 
@@ -267,16 +300,20 @@ where
         &self,
         space: &SpaceId,
         staged: HashBuffer<W::Writable>,
+        generation: i64,
     ) -> Result<Hash, Self::Error> {
-        self.persist(space, staged).await
+        (**self).persist(space, staged, generation).await
     }
     async fn persist_keyed(
         &self,
         space: &SpaceId,
         staged: HashBuffer<W::Writable>,
         hash: &Hash,
+        generation: i64,
     ) -> Result<(), KeyedWriteError<Self::Error>> {
-        self.persist_keyed(space, staged, hash).await
+        (**self)
+            .persist_keyed(space, staged, hash, generation)
+            .await
     }
 }
 
@@ -286,8 +323,21 @@ where
     S: ImmutableDeleteStore,
 {
     type Error = S::Error;
-    async fn remove(&self, space: &SpaceId, id: &Hash) -> Result<Option<()>, Self::Error> {
-        self.remove(space, id).await
+    async fn remove(
+        &self,
+        space: &SpaceId,
+        id: &Hash,
+        generation: i64,
+    ) -> Result<Option<()>, Self::Error> {
+        (**self).remove(space, id, generation).await
+    }
+    async fn cleanup_stages(
+        &self,
+        space: &SpaceId,
+        id: &Hash,
+        generation: i64,
+    ) -> Result<(), Self::Error> {
+        (**self).cleanup_stages(space, id, generation).await
     }
 }
 
