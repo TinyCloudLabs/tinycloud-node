@@ -84,21 +84,24 @@ impl AtRestStoreError {
         }
     }
 
-    /// Logs integrity and unsupported-format failures (typed, rate-limited,
-    /// no object names or space ids). Called where a request fails with it.
-    pub fn log_failure(&self) {
-        match self {
-            Self::Integrity(why) => log_integrity_failure("integrity", why),
-            Self::Unsupported(_) => log_integrity_failure("unsupported", "later format version"),
-            Self::KeyInconsistent(why) => log_integrity_failure("key_store", why),
-            _ => {}
-        }
+    /// Logs an integrity, unsupported-format or inconsistent-key failure of
+    /// the sealed object `name` (typed, rate-limited). The locator is the
+    /// sealed name `v1/{space tag}/{object tag}`: keyed hashes an operator can
+    /// find in the store, never a space id or content hash.
+    pub fn log_at(&self, name: &SealedName) {
+        let (kind, why) = match self {
+            Self::Integrity(why) => ("integrity", *why),
+            Self::Unsupported(_) => ("unsupported", "later format version"),
+            Self::KeyInconsistent(why) => ("key_store", *why),
+            _ => return,
+        };
+        log_integrity_failure(kind, why, &name.key());
     }
 }
 
 /// At most one log line per second for sealed-object integrity failures; the
 /// number suppressed in between is reported with the next line.
-fn log_integrity_failure(kind: &'static str, why: &'static str) {
+fn log_integrity_failure(kind: &'static str, why: &'static str, object: &str) {
     static LAST_SECOND: AtomicU64 = AtomicU64::new(0);
     static SUPPRESSED: AtomicU64 = AtomicU64::new(0);
     let now = std::time::SystemTime::now()
@@ -112,18 +115,25 @@ fn log_integrity_failure(kind: &'static str, why: &'static str) {
     tracing::error!(
         kind,
         why,
+        object,
         suppressed,
         "at-rest sealed block failed its checks"
     );
 }
 
-/// A decrypting reader that logs (as [`AtRestStoreError::log_failure`] does)
+/// A decrypting reader that logs (as [`AtRestStoreError::log_at`] does)
 /// when a sealed object fails authentication part way through a response.
-pub struct LoggedDecrypt<R>(DecryptReader<R>);
+pub struct LoggedDecrypt<R> {
+    inner: DecryptReader<R>,
+    object: String,
+}
 
 impl<R> LoggedDecrypt<R> {
-    pub fn new(inner: DecryptReader<R>) -> Self {
-        Self(inner)
+    pub fn new(inner: DecryptReader<R>, name: &SealedName) -> Self {
+        Self {
+            inner,
+            object: name.key(),
+        }
     }
 }
 
@@ -133,10 +143,15 @@ impl<R: AsyncRead + Unpin> AsyncRead for LoggedDecrypt<R> {
         cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<std::io::Result<usize>> {
-        let polled = Pin::new(&mut self.0).poll_read(cx, buf);
+        let this = &mut *self;
+        let polled = Pin::new(&mut this.inner).poll_read(cx, buf);
         if let Poll::Ready(Err(e)) = &polled {
             if e.kind() == std::io::ErrorKind::InvalidData {
-                log_integrity_failure("integrity", "authentication failed mid-stream");
+                log_integrity_failure(
+                    "integrity",
+                    "authentication failed mid-stream",
+                    &this.object,
+                );
             }
         }
         polled
@@ -177,6 +192,7 @@ impl From<DataKeyError> for AtRestStoreError {
                         AtRestError::Locked | AtRestError::NotProvisioned => {
                             Self::Unavailable("at-rest keys are locked")
                         }
+                        AtRestError::DekUnavailable(why) => Self::KeyStore(why),
                         e if e.is_transient() => Self::KeyStore("key store busy"),
                         _ => Self::KeyInconsistent("inconsistent"),
                     }

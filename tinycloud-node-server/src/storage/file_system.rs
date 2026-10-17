@@ -185,12 +185,17 @@ impl FileSystemStore {
             Err(e) => return Err(e.into()),
         };
         let len = file.metadata().await?.len();
+        let logged = |e: AtRestStoreError| {
+            e.log_at(name);
+            e
+        };
         let (size, reader) = open_sealed(provider, space, id, file.take(len).compat(), len)
-            .await?
+            .await
+            .map_err(logged)?
             .into_inner();
         Ok(Some(Content::new(
             size,
-            AsyncEither::Right(Box::new(LoggedDecrypt::new(reader))),
+            AsyncEither::Right(Box::new(LoggedDecrypt::new(reader, name))),
         )))
     }
 
@@ -273,11 +278,19 @@ impl FileSystemStore {
             Err(e) => return Err(e.into()),
         };
         let len = file.metadata().await?.len();
+        let logged = |e: AtRestStoreError| {
+            e.log_at(name);
+            e
+        };
         let mut header = [0u8; HEADER_LEN];
-        file.read_exact(&mut header)
+        file.read_exact(&mut header).await.map_err(|_| {
+            logged(AtRestStoreError::Integrity(
+                "object shorter than its header",
+            ))
+        })?;
+        let plan = plan_range(provider, space, &header, len, spec)
             .await
-            .map_err(|_| AtRestStoreError::Integrity("object shorter than its header"))?;
-        let plan = plan_range(provider, space, &header, len, spec).await?;
+            .map_err(logged)?;
         let Some(r) = plan.range else {
             return Ok(Some(RangeRead::Unsatisfiable {
                 total_size: plan.plaintext_len(),
@@ -285,14 +298,16 @@ impl FileSystemStore {
         };
         file.seek(SeekFrom::Start(r.ciphertext_start())).await?;
         let span = r.ciphertext_end() - r.ciphertext_start() + 1;
-        let reader = plan.reader(space, id, r, file.take(span).compat())?;
+        let reader = plan
+            .reader(space, id, r, file.take(span).compat())
+            .map_err(logged)?;
         let range = r.plaintext_range();
         Ok(Some(RangeRead::Content {
             total_size: plan.plaintext_len(),
             range,
             content: Content::new(
                 range.len(),
-                AsyncEither::Right(Box::new(LoggedDecrypt::new(reader))),
+                AsyncEither::Right(Box::new(LoggedDecrypt::new(reader, name))),
             ),
         }))
     }

@@ -92,8 +92,19 @@ async fn delegate(client: &Client, headers: &impl serde::Serialize) -> Result<()
     Ok(())
 }
 
-/// Host delegation for the space, then a KV session.
+/// Host delegation for the space, then a KV session with all KV abilities.
 async fn session(client: &Client) -> Result<Session> {
+    session_with(
+        client,
+        &["tinycloud.kv/put", "tinycloud.kv/get", "tinycloud.kv/del"],
+        114,
+    )
+    .await
+}
+
+/// Host delegation for the space, then a KV session with exactly `abilities`
+/// under the session key seeded by `key_seed`.
+async fn session_with(client: &Client, abilities: &[&str], key_seed: u8) -> Result<Session> {
     let (wallet, address, space) = wallet()?;
     let now = time::OffsetDateTime::now_utc();
     let peer = client
@@ -114,19 +125,19 @@ async fn session(client: &Client) -> Result<Session> {
     }))?;
     delegate(client, &siwe_to_delegation_headers(host)).await?;
 
-    let key = ed25519_dalek::SigningKey::from_bytes(&[114; 32]);
+    let key = ed25519_dalek::SigningKey::from_bytes(&[key_seed; 32]);
     let jwk: JWK = serde_json::from_value(json!({
         "kty": "OKP", "crv": "Ed25519",
         "d": base64::encode_config(key.to_bytes(), base64::URL_SAFE_NO_PAD),
         "x": base64::encode_config(key.verifying_key().to_bytes(), base64::URL_SAFE_NO_PAD),
     }))?;
     let prepared = prepare_session(serde_json::from_value(json!({
-        "abilities": {"kv": {"": ["tinycloud.kv/put", "tinycloud.kv/get", "tinycloud.kv/del"]}},
+        "abilities": {"kv": {"": abilities}},
         "address": format!("0x{}", encode_eip55(&address)),
         "chainId": 1, "domain": "localhost",
         "issuedAt": rfc3339(now - time::Duration::minutes(1))?,
         "expirationTime": rfc3339(now + time::Duration::hours(1))?,
-        "spaceId": space, "jwk": jwk, "nonce": "tc887s3bnode",
+        "spaceId": space, "jwk": jwk, "nonce": format!("tc887s3bnode{key_seed}"),
     }))?)?;
     let signature = sign(&wallet, &prepared.siwe)?;
     let session = complete_session_setup(SignedSession {
@@ -334,6 +345,34 @@ async fn a_refused_put_creates_no_data_key_or_mirror_object() -> Result<()> {
     ensure!(
         files(&mirror).len() == mirrored,
         "refused puts created mirror objects"
+    );
+    Ok(())
+}
+
+/// TC-887 S3 review B1/R1: a put to a space the node hosts, by a session that
+/// holds no `kv/put` there, is refused by authorization before any key work:
+/// no data key and no mirror object for the space.
+#[tokio::test]
+async fn an_unauthorized_put_to_a_hosted_space_creates_no_data_key() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let client = node(dir.path(), json!({"mode": "encrypt", "escrow_none": true})).await?;
+    let reader = session_with(&client, &["tinycloud.kv/get"], 115).await?;
+    let mirror = dir.path().join("at-rest");
+    let (rows, mirrored) = (data_key_rows(dir.path())?, files(&mirror).len());
+    for path in ["notes/a", "notes/b", "notes/c"] {
+        let (status, body) = invoke(&client, &reader, path, "tinycloud.kv/put", "value").await?;
+        ensure!(
+            status == Status::Unauthorized || status == Status::Forbidden,
+            "unauthorized put {path}: {status} {body}"
+        );
+    }
+    ensure!(
+        data_key_rows(dir.path())? == rows,
+        "an unauthorized put created a data key"
+    );
+    ensure!(
+        files(&mirror).len() == mirrored,
+        "an unauthorized put created a mirror object"
     );
     Ok(())
 }
