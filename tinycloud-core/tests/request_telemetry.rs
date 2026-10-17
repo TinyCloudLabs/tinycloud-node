@@ -107,7 +107,9 @@ fn shared_pseudonyms_match_literal_interoperability_vectors() {
     };
     // This is a real ambiguity in the old encoding, not merely two different inputs.
     assert_eq!(old_payload(&pair[0]), old_payload(&pair[1]));
-    assert_ne!(collision_hashes[0], collision_hashes[1]);
+    let [first, second] =
+        collision_hashes.map(|hash| hash.expect("collision pair id present").into_bytes());
+    assert_ne!(first, second);
 }
 
 #[test]
