@@ -23,6 +23,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 hex = { workspace = true }
 thiserror = { workspace = true }
+# Strict app-compose reading (src/compose.rs); pinned: what it accepts is a
+# security property.
+yaml-rust2 = "=0.13.0"
 
 [dev-dependencies]
 # Software P-256 identities that open `p256tag` and `piv-p256` stanzas, so
