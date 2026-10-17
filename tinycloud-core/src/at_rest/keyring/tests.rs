@@ -547,6 +547,38 @@ async fn a_restore_before_the_escrow_or_record_needs_no_new_ceremony() {
 }
 
 #[tokio::test]
+async fn a_mirrored_row_picked_for_its_chain_never_brings_its_seal() {
+    let (db, mirror, h) = (db().await, Arc::new(MemoryMirror::default()), holders());
+    let k = open(&db, &mirror, &ROOT, config(&h, None)).await.unwrap();
+    k.rotate_ark().await.unwrap();
+    drop(k);
+    let gen1 = AtRestStore::new(db.clone()).keys().await.unwrap()[0].clone();
+    // The database lost generation 1's chain; the mirror has it, next to
+    // junk seal bytes.
+    set_chain(&db, 1, None).await;
+    let name = ark_mirror_name(1, &hex::encode(&gen1.ark_id));
+    let mut obj: serde_json::Value =
+        serde_json::from_slice(&mirror.get(&name).await.unwrap().unwrap()).unwrap();
+    obj["sealed"] = serde_json::json!(base64::engine::general_purpose::STANDARD.encode([7; 60]));
+    mirror
+        .put(&name, serde_json::to_vec(&obj).unwrap())
+        .await
+        .unwrap();
+
+    let k = open(&db, &mirror, &ROOT, config(&h, None)).await.unwrap();
+    assert_eq!(k.state(), KeyringState::Unlocked);
+    let rows = AtRestStore::new(db.clone()).keys().await.unwrap();
+    assert_eq!(
+        rows[0].sealed, gen1.sealed,
+        "the database keeps its own seal"
+    );
+    assert_eq!(
+        rows[0].chain, gen1.chain,
+        "the authenticated chain is restored"
+    );
+}
+
+#[tokio::test]
 async fn a_stale_chain_on_the_newest_generation_is_cleared_not_a_permanent_conflict() {
     let (db, mirror, h) = (db().await, Arc::new(MemoryMirror::default()), holders());
     let k = open(&db, &mirror, &ROOT, config(&h, None)).await.unwrap();

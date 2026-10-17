@@ -666,14 +666,22 @@ impl AtRestKeyring {
         }
         let cands = candidates(&db, mirrored);
         if let Some((mut chosen, keys)) = unlock_under_w(&self.w, db.len() as u32, &cands)? {
-            // A generation the database lacks is stored with a fresh seal
-            // under W, never with the mirror's bytes.
+            // Only chains and ARK ids come from the chosen rows. Seal bytes
+            // are never taken from the mirror: a generation the database has
+            // keeps its own seal, and one it lacks gets a fresh seal under W.
             for row in chosen.iter_mut() {
-                if !db.iter().any(|d| d.generation == row.generation) {
-                    let g = row.generation as u32;
-                    let gen = &keys.gens[&g];
-                    row.sealed = seal_ark(&self.w, &gen.ark, &gen.ark_id, g);
-                    row.w_label = W_LABEL.into();
+                match db.iter().find(|d| d.generation == row.generation) {
+                    Some(d) if d.ark_id == row.ark_id => {
+                        row.sealed = d.sealed.clone();
+                        row.w_label = d.w_label.clone();
+                    }
+                    Some(_) => {} // persist_chosen refuses this
+                    None => {
+                        let g = row.generation as u32;
+                        let gen = &keys.gens[&g];
+                        row.sealed = seal_ark(&self.w, &gen.ark, &gen.ark_id, g);
+                        row.w_label = W_LABEL.into();
+                    }
                 }
             }
             persist_chosen(&self.store, &db, &chosen).await?;
@@ -1070,7 +1078,10 @@ impl AtRestKeyring {
                     "no active escrow bundle; restart the node to escrow the key".into(),
                 ))
             }
-            Err(e) => return Err(GateRefusal::Unavailable(e.to_string())),
+            Err(e) => {
+                tracing::warn!(error = %e, "at-rest escrow gate could not read the escrow");
+                return Err(GateRefusal::Unavailable(e.reason()));
+            }
         };
         if bundle.holders() != self.config.holders {
             return Err(GateRefusal::RecipientsMismatch);
@@ -1101,7 +1112,10 @@ impl AtRestKeyring {
             Ok(None) => Err(GateRefusal::NotVerified {
                 efp: efp.to_string(),
             }),
-            Err(e) => Err(GateRefusal::Unavailable(e.to_string())),
+            Err(e) => {
+                tracing::warn!(error = %e, "at-rest escrow gate could not read the ceremony record");
+                Err(GateRefusal::Unavailable(e.reason()))
+            }
         }
     }
 
