@@ -484,7 +484,8 @@ fn postgres_pool_exhaustion_failure_records_wait_without_queries() {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(1)
             .min_connections(1)
-            .acquire_timeout(Duration::from_millis(50))
+            // This budget also covers cold TCP/SCRAM setup before request scope.
+            .acquire_timeout(Duration::from_secs(5))
             .connect(&url)
             .await
             .unwrap();
@@ -494,7 +495,7 @@ fn postgres_pool_exhaustion_failure_records_wait_without_queries() {
             assert!(matches!(pool.begin().await, Err(sqlx::Error::PoolTimedOut)));
         })
         .await;
-        assert!(metrics.snapshot().pool_wait_ns >= 40_000_000);
+        assert!(metrics.snapshot().pool_wait_ns >= 4_000_000_000);
         assert_eq!(metrics.snapshot().query_count, 0);
         assert_eq!(metrics.snapshot().query_time_ns, 0);
         drop(held);
