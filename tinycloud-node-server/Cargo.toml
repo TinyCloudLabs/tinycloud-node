@@ -74,6 +74,7 @@ tracing = "0.1"
 tracing-log = "0.2"
 tracing-opentelemetry = "0.30"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "json"] }
+uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(all(target_os = "linux", target_arch = "aarch64"))'.dependencies]
 # Release builds cross-compile aarch64 Linux from x86_64 Linux. Vendoring
@@ -117,6 +118,7 @@ features = ["sqlite", "postgres", "mysql", "tokio", "verification-count-test-hoo
 syn = { version = "2", features = ["full", "visit"] }
 quote = "1"
 proc-macro2 = "1"
+parking_lot = "0.12"
 # Reads socket options back in tests/postgres_pool_timeouts.rs.
 socket2 = { version = "0.5", features = ["all"] }
 rusqlite.workspace = true
@@ -124,6 +126,9 @@ tokio = { version = "1", features = ["test-util"] }
 axum = { version = "0.7", features = ["ws"] }
 bs58 = "0.5"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+# zlib compressibility of raw stored bytes in tests/at_rest_harness.rs (TC-887).
+# Already in the lock through ssi-status; adds no new crate.
+flate2 = "1"
 k256 = { version = "0.13.4", features = ["ecdsa"] }
 sha3 = "0.10"
 # The Rust half of the JS SDK: builds the same host and session SIWE
@@ -133,7 +138,6 @@ ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 hyper = { version = "0.14", features = ["http1", "server", "tcp"] }
 libp2p-identity = { version = "0.2", features = ["ed25519"] }
 pem = "3"
-uuid = { version = "1", features = ["v4"] }
 x509-parser = "0.16"
 
 [features]

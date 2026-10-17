@@ -14,6 +14,8 @@ use crate::database_artifacts::{
     ArtifactExpectation, DatabaseArtifactError, DatabaseArtifactRepository,
 };
 
+use crate::request_telemetry::{self, QueryTimer};
+
 use super::{
     caveats::DuckDbCaveats,
     database::{spawn_actor, DatabaseHandle},
@@ -148,6 +150,7 @@ impl DuckDbService {
         ability: String,
         options: ExecuteOptions,
     ) -> Result<DuckDbExecutionResult, DuckDbError> {
+        request_telemetry::observe_space(space);
         let ExecuteOptions {
             arrow_format,
             without_growth,
@@ -197,6 +200,7 @@ impl DuckDbService {
 
     /// Export only durable data, without changing its artifact or live WAL base.
     pub async fn export(&self, space: &SpaceId, db_name: &str) -> Result<Vec<u8>, DuckDbError> {
+        request_telemetry::observe_space(space);
         validate_db_name(db_name)?;
 
         let key = (space.to_string(), db_name.to_string());
@@ -227,17 +231,21 @@ impl DuckDbService {
         // the actor here would reset its WAL base without persisting that base,
         // making a later incremental save incompatible with the durable file.
         let max_memory = self.max_memory_per_connection.clone();
+        let context = request_telemetry::current();
         tokio::task::spawn_blocking(move || {
+            let _context = request_telemetry::enter(context);
             let temp = tempfile::tempdir().map_err(|e| DuckDbError::Internal(e.to_string()))?;
             let path = temp.path().join("export.duckdb");
             std::fs::write(&path, artifact.payload)
                 .map_err(|e| DuckDbError::Internal(e.to_string()))?;
             std::fs::write(duckdb_wal_path(&path), delta)
                 .map_err(|e| DuckDbError::Internal(e.to_string()))?;
-            let conn =
-                storage::open_connection(&storage::StorageMode::File(path.clone()), &max_memory)?;
-            conn.execute_batch("CHECKPOINT")
-                .map_err(|e| DuckDbError::Internal(e.to_string()))?;
+            let conn = storage::open_connection(Some(&path), &max_memory)?;
+            {
+                let _timer = QueryTimer::new();
+                conn.execute_batch("CHECKPOINT")
+                    .map_err(|e| DuckDbError::Internal(e.to_string()))?;
+            }
             drop(conn);
             std::fs::read(path).map_err(|e| DuckDbError::Internal(e.to_string()))
         })
@@ -251,6 +259,7 @@ impl DuckDbService {
         db_name: &str,
         data: &[u8],
     ) -> Result<(), DuckDbError> {
+        request_telemetry::observe_space(space);
         validate_db_name(db_name)?;
         let operation_lock = Self::database_lock(
             &self.operation_locks,
@@ -272,16 +281,26 @@ impl DuckDbService {
             .await
             .map_err(|e| DuckDbError::ImportError(e.to_string()))?;
 
-        // Validate the temp file by opening it with DuckDB and applying security settings
+        // Validate with the same locked native policy as live and export connections.
         let temp_path_clone = temp_path.clone();
         let max_memory = self.max_memory_per_connection.clone();
+        let context = request_telemetry::current();
         let valid = tokio::task::spawn_blocking(move || -> Result<(), DuckDbError> {
-            let conn = duckdb::Connection::open(&temp_path_clone)
-                .map_err(|e| DuckDbError::ImportError(format!("Invalid DuckDB file: {}", e)))?;
-            storage::apply_security_settings(&conn, &max_memory)?;
-            conn.execute_batch("SELECT 1").map_err(|e| {
-                DuckDbError::ImportError(format!("Database validation failed: {}", e))
-            })?;
+            let _context = request_telemetry::enter(context);
+            let conn = storage::open_connection(Some(&temp_path_clone), &max_memory).map_err(
+                |e| match e {
+                    DuckDbError::Internal(message) => {
+                        DuckDbError::ImportError(format!("Invalid DuckDB file: {}", message))
+                    }
+                    other => other,
+                },
+            )?;
+            {
+                let _timer = QueryTimer::new();
+                conn.execute_batch("SELECT 1").map_err(|e| {
+                    DuckDbError::ImportError(format!("Database validation failed: {}", e))
+                })?;
+            }
             Ok(())
         })
         .await
@@ -607,7 +626,6 @@ fn validate_payload(
         service = "duckdb",
         role,
         bytes = payload.len(),
-        leading = %hex::encode(&payload[..payload.len().min(16)]),
         "Durable database artifact does not carry the expected file header; refusing to hydrate"
     );
     Err(DuckDbError::Internal(format!(
@@ -1181,7 +1199,7 @@ mod tests {
             let snapshot_dir = TempDir::new().unwrap();
             let snapshot_path = snapshot_dir.path().join("snapshot.duckdb");
             std::fs::write(&snapshot_path, bytes).unwrap();
-            let snapshot = duckdb::Connection::open(snapshot_path).unwrap();
+            let snapshot = storage::open_connection(Some(&snapshot_path), "128MB").unwrap();
             let names: String = snapshot
                 .query_row("SELECT name FROM events WHERE id = 1", [], |row| row.get(0))
                 .unwrap();

@@ -23,3 +23,5 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 # TC-1054: the node's patched sqlx-core (see vendor/sqlx-core/PATCH.md).
 [patch.crates-io]
 sqlx-core = { path = "../../vendor/sqlx-core" }
+sqlx-sqlite = { path = "../../vendor/sqlx-sqlite" }
+sqlx-postgres = { path = "../../vendor/sqlx-postgres" }

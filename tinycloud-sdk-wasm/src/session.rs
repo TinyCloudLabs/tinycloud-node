@@ -118,6 +118,8 @@ pub struct PreparedSession {
 pub struct SignedSession {
     #[serde(flatten)]
     pub session: PreparedSession,
+    /// EIP-191 wallet signature. Hex import validates its encoding and
+    /// canonicalizes recovery IDs `0/1` to `27/28`.
     #[serde(with = "tinycloud_sdk_rs::serde_siwe::signature")]
     pub signature: Signature,
 }
@@ -696,12 +698,18 @@ pub fn prepare_session(config: SessionConfig) -> Result<PreparedSession, Error> 
     })
 }
 
+/// Finish session setup using a validated, canonical wallet signature encoding.
+///
+/// Low-s signatures with recovery IDs `0/1` and `27/28` produce the same
+/// delegation header and CID registered by the node. Invalid signature scalars,
+/// high-s values, and unsupported recovery IDs fail before CID calculation,
+/// including when Rust callers construct [`SignedSession`] directly.
+///
+/// The node still verifies the signature against the SIWE message and checks
+/// the delegation's authority; setup only validates the signature encoding.
 pub fn complete_session_setup(signed_session: SignedSession) -> Result<Session, Error> {
-    let delegation = SiweCacao::new(
-        signed_session.session.siwe.into(),
-        signed_session.signature,
-        SiweHeader,
-    );
+    let signature = Signature::decode(*signed_session.signature)?;
+    let delegation = SiweCacao::new(signed_session.session.siwe.into(), signature, SiweHeader);
     let serialised = serde_ipld_dagcbor::to_vec(&delegation)?;
     let hash = Code::Blake3_256.digest(&serialised);
     // Use raw codec 0x55 to match server behavior
@@ -729,6 +737,9 @@ pub enum Error {
     UnableToGenerateDID(#[from] tinycloud_auth::ssi::dids::GenerateError),
     #[error("unable to generate the SIWE message to start the session: {0}")]
     UnableToGenerateSIWEMessage(String),
+    /// The wallet signature encoding is not accepted by the node's CACAO decoder.
+    #[error("invalid SIWE signature: {0}")]
+    InvalidSIWESignature(#[from] tinycloud_auth::cacaos::siwe_cacao::SIWESignatureDecodeError),
     #[error("unable to generate the CID: {0}")]
     UnableToGenerateCid(#[from] EncodeError<std::collections::TryReserveError>),
 }

@@ -282,8 +282,8 @@ pub enum RevocationError {
 impl TryFrom<TinyCloudRevocation> for RevocationInfo {
     type Error = RevocationError;
     fn try_from(r: TinyCloudRevocation) -> Result<Self, Self::Error> {
-        match r {
-            TinyCloudRevocation::Cacao(ref c) => match c.payload().aud.as_str().split_once(':') {
+        match &r {
+            TinyCloudRevocation::Cacao(c) => match c.payload().aud.as_str().split_once(':') {
                 Some(("ucan", ps)) => Ok(Self {
                     parents: Vec::new(),
                     revoked: ps.parse().map_err(|_| RevocationError::InvalidTarget)?,
@@ -292,27 +292,27 @@ impl TryFrom<TinyCloudRevocation> for RevocationInfo {
                 }),
                 _ => Err(RevocationError::InvalidTarget),
             },
-            // W1 (audit P0 finding 5): UCAN-format revocation. We resolve
-            // the revoked target by walking the payload's attenuation map
-            // for an explicit `urn:cid:<cid>` resource, falling back to
-            // the first proof CID. Any did:key principal that signs the
-            // UCAN is the candidate revoker; the authorization check in
-            // `models/revocation::process` rejects non-owner / non-
-            // delegator signers.
-            TinyCloudRevocation::Ucan(ref u) => {
+            // The signed UCAN must request revocation of exactly one CID.
+            // Proofs authorize that action; they do not select its target.
+            TinyCloudRevocation::Ucan(u) => {
                 let payload = u.payload();
-                let mut explicit: Option<Cid> = None;
-                for resource in payload.attenuation.abilities().keys() {
-                    let s = resource.to_string();
-                    if let Some(cid_str) = s.strip_prefix("urn:cid:") {
-                        if let Ok(cid) = cid_str.parse::<Cid>() {
-                            explicit = Some(cid);
-                            break;
-                        }
-                    }
+                let capabilities = payload.attenuation.abilities();
+                let (resource, abilities) = capabilities
+                    .iter()
+                    .next()
+                    .ok_or(RevocationError::InvalidTarget)?;
+                if capabilities.len() != 1
+                    || abilities.len() != 1
+                    || !abilities
+                        .keys()
+                        .any(|ability| ability.as_ref() == "tinycloud.delegation/revoke")
+                {
+                    return Err(RevocationError::InvalidTarget);
                 }
-                let revoked = explicit
-                    .or_else(|| payload.proof.first().copied())
+                let revoked = resource
+                    .as_str()
+                    .strip_prefix("urn:cid:")
+                    .and_then(|cid| cid.parse().ok())
                     .ok_or(RevocationError::InvalidTarget)?;
                 let revoker = strip_fragment(&payload.issuer.to_string());
                 Ok(Self {

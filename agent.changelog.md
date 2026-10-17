@@ -3,6 +3,11 @@
 Track changes to agent-facing development guidance for TinyCloud Node. Add a concise entry when
 `agent.dev.md` or related agent workflow expectations change.
 
+## 2026-10-17
+
+- Added the TC-887 native at-rest harness (`scripts/at-rest-harness/`): a real node on native
+  PostgreSQL + MinIO, green storage-reach checks, and RED checks for plaintext at rest.
+
 ## 2026-05-17
 
 - Added initial agent development notes covering project context, related repositories, build and

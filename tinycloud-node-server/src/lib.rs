@@ -424,6 +424,8 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
 pub fn resolve_runtime_config(tinycloud_config: &Config) -> Result<Config> {
     let mut resolved = tinycloud_config.clone();
     resolved.hooks.validate().map_err(anyhow::Error::msg)?;
+    tracing::RequestIdOrigins::new(&resolved.log.request_id_first_party_origins)
+        .map_err(anyhow::Error::msg)?;
     resolved.storage.resolve();
     resolved.share_email = resolved
         .share_email
@@ -491,6 +493,9 @@ pub async fn app_with_control(
     control: Option<ControlPlaneHandle>,
 ) -> Result<Rocket<Build>> {
     let tinycloud_config = resolve_runtime_config(tinycloud_config)?;
+    let request_id_origins =
+        tracing::RequestIdOrigins::new(&tinycloud_config.log.request_id_first_party_origins)
+            .map_err(anyhow::Error::msg)?;
     let quota_url = std::env::var("TINYCLOUD_QUOTA_URL").ok();
     let egress_policy = Arc::new(egress::EgressPolicy::from_config(
         &tinycloud_config,
@@ -544,6 +549,12 @@ pub async fn app_with_control(
     ]);
 
     let key_setup: StaticSecret = resolve_keys(&tinycloud_config.keys).await?;
+    let pseudonymizer =
+        std::sync::Arc::new(tinycloud_core::telemetry::Pseudonymizer::new(&key_setup));
+    let tracing_fairing = tracing::TracingFairing::new(
+        &tinycloud_config.log.tracing,
+        std::sync::Arc::clone(&pseudonymizer),
+    );
     // TC-359: publish the derived public halves so an operator can read the
     // invitation key a dstack-keyed node actually signs with.
     let node_public_keys = NodePublicKeys::derive(&key_setup);
@@ -622,13 +633,13 @@ pub async fn app_with_control(
         encryption_backend,
     );
 
-    let tinycloud = TinyCloud::new(
+    let tinycloud = TinyCloud::new_with_encryption(
         database_connection,
         tinycloud_config.storage.blocks.open().await?,
         key_setup.setup(()).await?,
+        Some(webhook_encryption.clone()),
     )
     .await?
-    .with_encryption(Some(webhook_encryption.clone()))
     .with_sql_sizes(sql_sizes.clone());
     let encryption_service =
         encryption_service.with_sqlite_writer_lock(tinycloud.sqlite_writer_lock());
@@ -704,6 +715,7 @@ pub async fn app_with_control(
     // Billing shares TINYCLOUD_ADMIN_SECRET with the node (it calls the
     // node's admin API with it) and accepts it on quota fetches (TC-627).
     let quota_cache = QuotaCache::new(tinycloud_config.storage.limit, quota_url)
+        .with_request_id_origins(&request_id_origins)
         .with_service_secret(std::env::var("TINYCLOUD_ADMIN_SECRET").ok());
     let invocation_replay_cache = node_replay_cache(&tinycloud);
     let replay_cleanup = invocation_replay_cache.clone();
@@ -735,9 +747,15 @@ pub async fn app_with_control(
                 })
             }
         }))
-        .mount("/", routes)
+        .mount(
+            "/",
+            routes
+                .into_iter()
+                .map(tracing::instrument_route)
+                .collect::<Vec<_>>(),
+        )
         .attach(AdHoc::config::<Config>())
-        .attach(tracing::TracingFairing::new(&tinycloud_config.log.tracing))
+        .attach(tracing_fairing)
         .attach(AdHoc::on_liftoff(
             "invocation-replay-cleanup",
             move |rocket| {
@@ -947,12 +965,12 @@ fn cors_fairing() -> AdHoc {
             resp.set_header(Header::new(
                 // expose response headers to browser-run scripts
                 "Access-Control-Expose-Headers",
-                "*, Authorization",
+                "*, Authorization, X-Request-Id",
             ));
             resp.set_header(Header::new(
                 // allow custom headers + Authorization in requests
                 "Access-Control-Allow-Headers",
-                "*, Authorization",
+                "*, Authorization, X-Request-Id",
             ));
             resp.set_header(Header::new("Access-Control-Allow-Credentials", "true"));
             if request.method() == Method::Options {
@@ -982,8 +1000,9 @@ fn share_security_fairing(share_allowed_origin: String) -> AdHoc {
                 response.set_header(Header::new("Access-Control-Allow-Methods", "GET, POST"));
                 response.set_header(Header::new(
                     "Access-Control-Allow-Headers",
-                    "Content-Type, Authorization",
+                    "Content-Type, Authorization, X-Request-Id",
                 ));
+                response.set_header(Header::new("Access-Control-Expose-Headers", "X-Request-Id"));
             }
         })
     })
@@ -1114,7 +1133,11 @@ async fn run_retention_sweep<C: tinycloud_core::sea_orm::ConnectionTrait>(
         }
         Ok(_) => {}
         Err(error) => {
-            ::tracing::warn!(?error, "retention: delivered hook delivery prune failed")
+            ::tracing::warn!(
+                error_class =
+                    tinycloud_core::db_pool::transient_error_class(&error).unwrap_or("database"),
+                "retention: delivered hook delivery prune failed"
+            )
         }
     }
 
@@ -1131,7 +1154,11 @@ async fn run_retention_sweep<C: tinycloud_core::sea_orm::ConnectionTrait>(
         }
         Ok(_) => {}
         Err(error) => {
-            ::tracing::warn!(?error, "retention: dead-letter hook delivery prune failed")
+            ::tracing::warn!(
+                error_class =
+                    tinycloud_core::db_pool::transient_error_class(&error).unwrap_or("database"),
+                "retention: dead-letter hook delivery prune failed"
+            )
         }
     }
 
@@ -1147,7 +1174,11 @@ async fn run_retention_sweep<C: tinycloud_core::sea_orm::ConnectionTrait>(
             ::tracing::info!(deleted, "retention: pruned expired signed KV tickets")
         }
         Ok(_) => {}
-        Err(error) => ::tracing::warn!(?error, "retention: signed KV ticket prune failed"),
+        Err(error) => ::tracing::warn!(
+            error_class =
+                tinycloud_core::db_pool::transient_error_class(&error).unwrap_or("database"),
+            "retention: signed KV ticket prune failed"
+        ),
     }
 }
 
@@ -1428,7 +1459,7 @@ mod share_security_fairing_tests {
                 .header(Header::new("Access-Control-Request-Method", "POST"))
                 .header(Header::new(
                     "Access-Control-Request-Headers",
-                    "authorization,content-type",
+                    "authorization,content-type,x-request-id",
                 ))
                 .dispatch()
                 .await;
@@ -1439,16 +1470,33 @@ mod share_security_fairing_tests {
                 Some("https://share.tinycloud.xyz"),
                 "{path}"
             );
+            let methods: std::collections::BTreeSet<_> = response
+                .headers()
+                .get_one("Access-Control-Allow-Methods")
+                .unwrap()
+                .split(',')
+                .map(str::trim)
+                .collect();
+            assert_eq!(methods, std::collections::BTreeSet::from(["GET", "POST"]));
+            let allowed = response
+                .headers()
+                .get_one("Access-Control-Allow-Headers")
+                .unwrap()
+                .to_ascii_lowercase();
+            let allowed: std::collections::BTreeSet<_> =
+                allowed.split(',').map(str::trim).collect();
             assert_eq!(
-                response.headers().get_one("Access-Control-Allow-Methods"),
-                Some("GET, POST"),
-                "{path}"
+                allowed,
+                std::collections::BTreeSet::from(
+                    ["authorization", "content-type", "x-request-id",]
+                )
             );
-            assert_eq!(
-                response.headers().get_one("Access-Control-Allow-Headers"),
-                Some("Content-Type, Authorization"),
-                "{path}"
-            );
+            assert!(response
+                .headers()
+                .get_one("Access-Control-Expose-Headers")
+                .unwrap()
+                .split(',')
+                .any(|name| name.trim().eq_ignore_ascii_case("x-request-id")));
         }
     }
 
@@ -1514,7 +1562,7 @@ mod cors_fairing_tests {
             .header(Header::new("Access-Control-Request-Method", "POST"))
             .header(Header::new(
                 "Access-Control-Request-Headers",
-                "authorization,content-type",
+                "authorization,content-type,x-request-id",
             ))
             .dispatch()
             .await;
@@ -1523,14 +1571,30 @@ mod cors_fairing_tests {
         let headers = response.headers();
         assert_eq!(headers.get_one("Access-Control-Max-Age"), Some("7200"));
         assert_eq!(headers.get_one("Access-Control-Allow-Origin"), Some("*"));
+        let methods: std::collections::BTreeSet<_> = headers
+            .get_one("Access-Control-Allow-Methods")
+            .unwrap()
+            .split(',')
+            .map(str::trim)
+            .collect();
         assert_eq!(
-            headers.get_one("Access-Control-Allow-Methods"),
-            Some("POST, PUT, GET, OPTIONS, DELETE")
+            methods,
+            std::collections::BTreeSet::from(["DELETE", "GET", "OPTIONS", "POST", "PUT",])
         );
+        let allowed = headers
+            .get_one("Access-Control-Allow-Headers")
+            .unwrap()
+            .to_ascii_lowercase();
+        let allowed: std::collections::BTreeSet<_> = allowed.split(',').map(str::trim).collect();
         assert_eq!(
-            headers.get_one("Access-Control-Allow-Headers"),
-            Some("*, Authorization")
+            allowed,
+            std::collections::BTreeSet::from(["*", "authorization", "x-request-id"])
         );
+        assert!(headers
+            .get_one("Access-Control-Expose-Headers")
+            .unwrap()
+            .split(',')
+            .any(|name| name.trim().eq_ignore_ascii_case("x-request-id")));
         assert_eq!(
             headers.get_one("Access-Control-Allow-Credentials"),
             Some("true")

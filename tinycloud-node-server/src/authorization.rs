@@ -15,7 +15,7 @@ use tinycloud_core::{
 pub struct AuthHeaderGetter<T>(pub SerializedEvent<T>);
 
 macro_rules! impl_fromreq {
-    ($type:ident, $inter:ident, $name:tt) => {
+    ($type:ident, $inter:ident, $name:tt, $try_from_status:expr) => {
         #[rocket::async_trait]
         impl<'r> FromRequest<'r> for AuthHeaderGetter<$type> {
             type Error = FromReqErr<<$type as TryFrom<$inter>>::Error>;
@@ -27,7 +27,14 @@ macro_rules! impl_fromreq {
                     .map(SerializedEvent::<$type>::from_header_ser::<$inter>)
                 {
                     Some(Ok(e)) => Outcome::Success(AuthHeaderGetter(e)),
-                    Some(Err(e)) => Outcome::Error((Status::Unauthorized, e)), // Revert back to Failure variant
+                    Some(Err(e)) => Outcome::Error((
+                        if matches!(e, FromReqErr::TryFrom(_)) {
+                            $try_from_status
+                        } else {
+                            Status::Unauthorized
+                        },
+                        e,
+                    )),
                     None => Outcome::Forward(Status::Unauthorized),
                 };
                 // TC-326: this guard decodes the base64url auth header into a
@@ -47,9 +54,24 @@ macro_rules! impl_fromreq {
     };
 }
 
-impl_fromreq!(DelegationInfo, TinyCloudDelegation, "Authorization");
-impl_fromreq!(InvocationInfo, TinyCloudInvocation, "Authorization");
-impl_fromreq!(RevocationInfo, TinyCloudRevocation, "Authorization");
+impl_fromreq!(
+    DelegationInfo,
+    TinyCloudDelegation,
+    "Authorization",
+    Status::Unauthorized
+);
+impl_fromreq!(
+    InvocationInfo,
+    TinyCloudInvocation,
+    "Authorization",
+    Status::Unauthorized
+);
+impl_fromreq!(
+    RevocationInfo,
+    TinyCloudRevocation,
+    "Authorization",
+    Status::Forbidden
+);
 
 #[cfg(test)]
 mod test {
