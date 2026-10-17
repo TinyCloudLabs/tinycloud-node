@@ -144,6 +144,9 @@ jobs:
     - name: Run DuckDB-enabled core tests
       run: cargo test -p tinycloud-core --features duckdb
 
+    - name: Run DuckDB policy through node binaries
+      run: cargo test -p tinycloud-node --features duckdb --test duckdb_diagnostics_policy --test duckdb_offline_policy
+
   clippy:
     name: clippy (workspace)
     runs-on: ubuntu-latest

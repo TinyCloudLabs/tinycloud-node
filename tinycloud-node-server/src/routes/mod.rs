@@ -5781,7 +5781,6 @@ mod tests {
             None,
             None,
         ));
-        let query_control_resource = control_resource.clone();
         let (wallet_session_serialization, wallet_session_issued, wallet_session_expires) =
             signed_wallet_session(
                 &wallet_key,
@@ -5918,6 +5917,45 @@ mod tests {
             None,
         ));
         let query_control_resource = control_resource.clone();
+        // The wallet-space session cannot control a target that also carries
+        // the owner's separate control space. An exact-CID grant from the
+        // target's delegatee keeps the positive status/revoke path scoped.
+        let exact_control_resource =
+            Resource::Other(format!("urn:cid:{}", wallet_child_id.to_cid(0x55)).parse()?);
+        let (exact_serialization, exact_issued, exact_expires) = signed_wallet_session(
+            &wallet_key,
+            wallet_address,
+            &holder_did,
+            &exact_control_resource,
+            "tc1149-wallet-exact-session",
+        )?;
+        let wallet_exact_session_id = tinycloud_core::hash::hash(&exact_serialization);
+        deleg_model::ActiveModel {
+            id: Set(wallet_exact_session_id),
+            delegator: Set(wallet_pkh.clone()),
+            delegatee: Set(holder_did.clone()),
+            expiry: Set(Some(exact_expires)),
+            issued_at: Set(Some(exact_issued)),
+            not_before: Set(None),
+            facts: Set(None),
+            serialization: Set(exact_serialization),
+        }
+        .insert(&conn)
+        .await?;
+        for action in [
+            "tinycloud.delegation/list",
+            "tinycloud.delegation/status",
+            "tinycloud.delegation/revoke",
+        ] {
+            abilities::ActiveModel {
+                delegation: Set(wallet_exact_session_id),
+                resource: Set(exact_control_resource.clone()),
+                ability: Set(Ability::try_from(action.to_string())?),
+                caveats: Set(Default::default()),
+            }
+            .insert(&conn)
+            .await?;
+        }
         for action in [
             "tinycloud.delegation/status",
             "tinycloud.delegation/revoke",
@@ -6210,8 +6248,22 @@ mod tests {
                 &holder_vm,
                 &holder_did,
                 &wallet_child_cid,
-                "wallet-session-status",
+                "wallet-space-not-full-target",
                 vec![wallet_session_id.to_cid(0x55)],
+            )?,
+        )
+        .dispatch()
+        .await;
+        assert_eq!(response.status(), Status::NotFound);
+        let response = request(
+            &wallet_child_cid,
+            status_header_with_proofs(
+                &holder_jwk,
+                &holder_vm,
+                &holder_did,
+                &wallet_child_cid,
+                "wallet-exact-session-status",
+                vec![wallet_exact_session_id.to_cid(0x55)],
             )?,
         )
         .dispatch()
@@ -6287,6 +6339,7 @@ mod tests {
         }
 
         for (label, proof_id) in [
+            ("wallet-space-not-full-target-revoke", wallet_session_id),
             ("unrelated-capability-revoke", unrelated_session_id),
             ("wrong-target-resource-revoke", wrong_target_session_id),
             ("foreign-root-scope-revoke", foreign_scope_session_id),
@@ -6320,7 +6373,7 @@ mod tests {
                     &holder_vm,
                     &holder_did,
                     &wallet_child_cid,
-                    wallet_session_id.to_cid(0x55),
+                    wallet_exact_session_id.to_cid(0x55),
                 )?,
             ))
             .dispatch()
@@ -6334,8 +6387,8 @@ mod tests {
                 &holder_vm,
                 &holder_did,
                 &wallet_child_cid,
-                "wallet-session-post-revoke",
-                vec![wallet_session_id.to_cid(0x55)],
+                "wallet-exact-session-post-revoke",
+                vec![wallet_exact_session_id.to_cid(0x55)],
             )?,
         )
         .dispatch()
