@@ -49,9 +49,17 @@ def credentials():
     if not node or not billing or any("\r" in value or "\n" in value for value in (node, billing)):
         raise QuotaError("required runner quota credentials are missing or invalid")
     try:
-        url = urlsplit(os.environ.get("QUOTA_BILLING_URL", ""))
-        if (url.scheme != "https" or not url.hostname or url.username or url.password
-            or url.path.rstrip("/") != "/api/quota" or url.query or url.fragment):
+        # PROD_TINYCLOUD_QUOTA_URL is also the node's TINYCLOUD_QUOTA_URL: billing's
+        # base URL, to which the node appends /api/quota/<space>. Accept that bare
+        # origin or the explicit /api/quota form; only (hostname, port) is used and
+        # every billing request path is fixed below. urlsplit silently drops
+        # CR/LF/tab, so the raw value is checked first.
+        raw = os.environ.get("QUOTA_BILLING_URL", "")
+        url = urlsplit(raw)
+        if (any(character in raw for character in "\r\n\t") or url.scheme != "https"
+            or not url.hostname or url.username is not None or url.password is not None
+            or url.path not in ("", "/", "/api/quota", "/api/quota/")
+            or url.query or url.fragment or "?" in raw or "#" in raw):
             raise ValueError
         port = url.port
     except ValueError:

@@ -16,6 +16,8 @@ ROOT = Path(__file__).resolve().parents[2]
 SOURCE = (ROOT / ".github/workflows/docker.yml").read_text()
 DIGEST = "sha256:4bdae4fc232d886bb56bfbce4ec62ed4b8fb4e1369a01f6afb73d06dd68c188f"
 REVISION = "e18578ff9162986ddd813259c60f73866e3e60d1"
+# The real PROD_TINYCLOUD_QUOTA_URL shape: billing's bare HTTPS origin, not a /api/quota path.
+BILLING_URL = "https://billing.example.invalid"
 N0 = (ROOT / "scripts/ci/fixtures/tc959-n0-compose.yaml").read_bytes()
 PRE_N0 = (ROOT / "ops/rollback/pre-n0-compose.yaml").read_bytes()
 STOP_LOGS = (ROOT / "ops/rollback/pre-n0-stop-local-logs.yaml").read_bytes()
@@ -125,6 +127,7 @@ class Connection:
     def request(self,method,path,body=None,headers=None):
         expected=os.environ['QUOTA_BILLING_ADMIN_SECRET'] if self.host=='billing.example.invalid' else os.environ['QUOTA_ADMIN_SECRET']
         assert headers['Authorization']=='Bearer '+expected
+        assert self.host!='billing.example.invalid' or path.startswith('/api/admin/storage-comp/')
         self.method,self.path=method,path
         state=Path(os.environ['TEST_STATE']); data=json.loads(state.read_text())
         if self.host=='billing.example.invalid': data['events'].append('billing-comp')
@@ -222,7 +225,8 @@ class RecoveryTests(unittest.TestCase):
                         "OCI_REVISION": oci_revision or inputs.get("rollback_image_revision") or "f" * 40,
                         # Production maps both from PROD_TINYCLOUD_ADMIN_SECRET: one shared value.
                         "QUOTA_ADMIN_SECRET": canary, "QUOTA_BILLING_ADMIN_SECRET": canary,
-                        "QUOTA_BILLING_URL": "https://billing.example.invalid/api/quota"})
+                        # Production maps both from PROD_TINYCLOUD_QUOTA_URL: billing's base URL.
+                        "QUOTA_BILLING_URL": BILLING_URL, "PHALA_ENV_TINYCLOUD_QUOTA_URL": BILLING_URL})
             if missing_billing: env.pop("QUOTA_BILLING_ADMIN_SECRET")
             context = {"github.event_name": event, "github.ref": ref, "job.success": True,
                        **{"inputs." + key: (value == "true" if value in ("true", "false") else value) for key, value in inputs.items()}}

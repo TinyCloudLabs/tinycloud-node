@@ -34,6 +34,7 @@ class AuthorityTests(unittest.TestCase):
         self.node_secret = secrets.token_urlsafe(32)
         self.billing_secret = secrets.token_urlsafe(32)
         CANARIES.extend([self.node_secret, self.billing_secret])
+        self.ports = []
         self.calls = []
         self.values = {}
         self.billing_status = {space: 404 for space in LIMITS}
@@ -53,7 +54,8 @@ class AuthorityTests(unittest.TestCase):
         self.environment = {
             "QUOTA_ADMIN_SECRET": self.node_secret,
             "QUOTA_BILLING_ADMIN_SECRET": self.billing_secret,
-            "QUOTA_BILLING_URL": "https://billing.example.invalid/api/quota",
+            # The real secret is billing's base URL (the node's TINYCLOUD_QUOTA_URL).
+            "QUOTA_BILLING_URL": "https://billing.example.invalid",
             "GITHUB_STEP_SUMMARY": str(self.summary),
         }
         for patcher in (
@@ -78,6 +80,7 @@ class AuthorityTests(unittest.TestCase):
         test = self
         self.assertIn(host, ["node.tinycloud.xyz", "billing.example.invalid"])
         self.assertGreater(timeout, 0)
+        test.ports.append((host, kwargs.get("port")))
 
         class Connection:
             def request(self, method, path, body=None, headers=None):
@@ -89,6 +92,9 @@ class AuthorityTests(unittest.TestCase):
                 if host == "billing.example.invalid" and test.transport_failures:
                     test.transport_failures -= 1
                     raise OSError(test.billing_secret)
+                if host == "billing.example.invalid":
+                    test.assertTrue(path.startswith("/api/admin/storage-comp/"),
+                                    "Billing paths are fixed, never derived from the operator URL")
                 self.method, self.path = method, path
                 if method == "PUT" and test.apply_put:
                     test.values[unquote(path.rsplit("/", 1)[1])] = json.loads(body)["limit_bytes"]
@@ -254,11 +260,43 @@ class AuthorityTests(unittest.TestCase):
         self.assertEqual(self.run_main(["--preflight"])[0], 0)
         self.assertEqual(self.calls, [])
 
+    def test_billing_base_url_and_compat_path_drive_the_full_restore(self):
+        for url, port in (("https://billing.example.invalid", None), ("https://billing.example.invalid/", None),
+                          ("https://billing.example.invalid:8443", 8443), ("https://billing.example.invalid/api/quota", None),
+                          ("https://billing.example.invalid/api/quota/", None)):
+            with self.subTest(url=url):
+                self.calls.clear(); self.values.clear(); self.ports.clear()
+                self.environment["QUOTA_BILLING_URL"] = url
+                self.assertEqual(self.run_main(["--preflight"])[0], 0)
+                self.assertEqual(self.calls, [])
+                code, logs = self.run_main()
+                self.assertEqual(code, 0)
+                self.assertIn("Quota overrides verified", logs)
+                self.assertEqual(sorted(self.values.values()), sorted(LIMITS.values()))
+                self.assertEqual([call[1] for call in self.calls], ["GET"] * 3 + ["PUT", "GET", "PUT", "GET"])
+                self.assertEqual([call[2].rsplit("/", 1)[0] for call in self.calls if call[0] == "billing.example.invalid"],
+                                 ["/api/admin/storage-comp"] * 2)
+                self.assertEqual({entry for entry in self.ports if entry[0] == "billing.example.invalid"},
+                                 {("billing.example.invalid", port)})
+
     def test_incompatible_or_credential_bearing_billing_url_fails_without_requests(self):
-        for url in ("http://billing.example.invalid/api/quota", "https://billing.example.invalid/unreviewed",
-                    "https://user:password@billing.example.invalid/api/quota", "https://billing.example.invalid/api/quota?key=bad"):
-            self.environment["QUOTA_BILLING_URL"] = url
-            self.assertEqual(self.run_main(["--preflight"])[0], 1)
+        for url in ("", "billing.example.invalid", "http://billing.example.invalid", "http://billing.example.invalid/api/quota",
+                    "https://billing.example.invalid/api", "https://billing.example.invalid/api/quota/x",
+                    "https://billing.example.invalid/quota", "https://billing.example.invalid/unreviewed",
+                    "https://billing.example.invalid//", "https://billing.example.invalid/api/quota//",
+                    "https://user:password@billing.example.invalid", "https://user@billing.example.invalid/api/quota",
+                    "https://@billing.example.invalid", "https://billing.example.invalid?key=bad",
+                    "https://billing.example.invalid/api/quota?key=bad", "https://billing.example.invalid?",
+                    "https://billing.example.invalid#fragment", "https://billing.example.invalid/api/quota#",
+                    "https://", "https:///api/quota", "https://:8443", "https://billing.example.invalid:port",
+                    "https://billing.example.invalid\n", "https://billing.example.invalid/api/quota\r\n",
+                    "https://billing.exa\rmple.invalid", "https://billing.example.invalid/api/\tquota"):
+            for args in (["--preflight"], []):
+                with self.subTest(url=url.encode(), args=args):
+                    self.environment["QUOTA_BILLING_URL"] = url
+                    code, logs = self.run_main(args)
+                    self.assertEqual(code, 1)
+                    self.assertIn("billing quota URL has an incompatible shape", logs)
         self.assertEqual(self.calls, [])
 
     def test_effective_limit_and_override_must_both_match(self):

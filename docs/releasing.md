@@ -138,8 +138,12 @@ shared value must update both holders together, or the quota steps fail
 closed with `quota API rejected the request`. The value is never passed in
 argv/logs and never added to the CVM env or `allowed_envs` under a billing
 name. A missing credential or an incompatible billing URL fails before
-compose/CVM mutation. Billing URLs derive strictly from the same HTTPS origin and
-`/api/quota` path of `PROD_TINYCLOUD_QUOTA_URL`; no URL is printed.
+compose/CVM mutation. `PROD_TINYCLOUD_QUOTA_URL` is billing's base URL (the
+node's `TINYCLOUD_QUOTA_URL`, to which the node appends `/api/quota/<space>`):
+a bare HTTPS origin. The preflight also accepts that origin with the
+`/api/quota` path; any other path, `http`, credentials, a query or fragment,
+or CR/LF fails it. The quota steps take only its host and port and
+call billing's fixed `/api/admin/storage-comp/` path; no URL is printed.
 
 Every `deploy_phala=true` command must explicitly include
 **`-f authorize_quota_values=true`**. This authorizes the reviewed values
