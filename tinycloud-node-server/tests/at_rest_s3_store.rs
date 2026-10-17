@@ -440,13 +440,16 @@ async fn a_replaced_object_never_yields_a_false_integrity_error() -> Result<()> 
         };
         match store.read_range(&space, &h, spec).await {
             Ok(Some(RangeRead::Content { content, .. })) => {
+                // The segment GET is pinned to one version: its body is that
+                // version's bytes even if the object is replaced meanwhile,
+                // so a body never aborts and never yields wrong bytes.
                 let mut out = Vec::new();
-                // A body may still abort if the object changes mid-stream
-                // after the pinned GET started; it never yields wrong bytes.
-                if Box::pin(content).read_to_end(&mut out).await.is_ok() {
-                    ensure!(out == data[SEG - 3..=2 * SEG + 3], "wrong bytes served");
-                    served += 1;
-                }
+                Box::pin(content)
+                    .read_to_end(&mut out)
+                    .await
+                    .context("a served range aborted mid-stream")?;
+                ensure!(out == data[SEG - 3..=2 * SEG + 3], "wrong bytes served");
+                served += 1;
             }
             Ok(other) => anyhow::bail!("unexpected {:?}", other.is_some()),
             Err(e) => {

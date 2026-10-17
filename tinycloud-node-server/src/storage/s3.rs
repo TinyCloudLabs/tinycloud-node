@@ -353,10 +353,13 @@ impl S3BlockStore {
         let Some((len, b)) = self.get_full(&name.key()).await? else {
             return Ok(None);
         };
-        let (size, reader) = open_sealed(provider, space, id, b, len).await?.into_inner();
+        let (size, reader) = open_sealed(provider, space, id, b, len)
+            .await
+            .inspect_err(|e| e.log_at(name))?
+            .into_inner();
         Ok(Some(Content::new(
             size,
-            AsyncEither::Right(Box::new(LoggedDecrypt::new(reader))),
+            AsyncEither::Right(Box::new(LoggedDecrypt::new(reader, name))),
         )))
     }
 
@@ -446,6 +449,10 @@ impl S3BlockStore {
         spec: ByteRangeSpec,
     ) -> Result<Option<RangeRead<S3Readable>>, S3StoreError> {
         let object = name.key();
+        let logged = |e: AtRestStoreError| {
+            e.log_at(name);
+            e
+        };
         let header_span = ByteRangeSpec::Inclusive {
             start: 0,
             end: HEADER_LEN as u64 - 1,
@@ -457,9 +464,10 @@ impl S3BlockStore {
                     RangeGet::Missing | RangeGet::Changed if seen_header => break,
                     RangeGet::Missing | RangeGet::Changed => return Ok(None),
                     RangeGet::InvalidRange => {
-                        return Err(
-                            AtRestStoreError::Integrity("object shorter than its header").into(),
-                        )
+                        return Err(logged(AtRestStoreError::Integrity(
+                            "object shorter than its header",
+                        ))
+                        .into())
                     }
                     RangeGet::Got {
                         total, etag, body, ..
@@ -467,11 +475,14 @@ impl S3BlockStore {
                 };
             seen_header = true;
             let mut header = [0u8; HEADER_LEN];
-            head_body
-                .read_exact(&mut header)
+            head_body.read_exact(&mut header).await.map_err(|_| {
+                logged(AtRestStoreError::Integrity(
+                    "object shorter than its header",
+                ))
+            })?;
+            let plan = plan_range(provider, space, &header, total, spec)
                 .await
-                .map_err(|_| AtRestStoreError::Integrity("object shorter than its header"))?;
-            let plan = plan_range(provider, space, &header, total, spec).await?;
+                .map_err(logged)?;
             let Some(r) = plan.range else {
                 return Ok(Some(RangeRead::Unsatisfiable {
                     total_size: plan.plaintext_len(),
@@ -489,21 +500,22 @@ impl S3BlockStore {
                     body
                 }
                 RangeGet::Got { .. } => {
-                    return Err(
-                        AtRestStoreError::Integrity("ranged GET returned another span").into(),
-                    )
+                    return Err(logged(AtRestStoreError::Integrity(
+                        "ranged GET returned another span",
+                    ))
+                    .into())
                 }
                 // Replaced, removed or shrunk since the header was read.
                 RangeGet::Changed | RangeGet::Missing | RangeGet::InvalidRange => continue,
             };
-            let reader = plan.reader(space, id, r, body)?;
+            let reader = plan.reader(space, id, r, body).map_err(logged)?;
             let range = r.plaintext_range();
             return Ok(Some(RangeRead::Content {
                 total_size: plan.plaintext_len(),
                 range,
                 content: Content::new(
                     range.len(),
-                    AsyncEither::Right(Box::new(LoggedDecrypt::new(reader))),
+                    AsyncEither::Right(Box::new(LoggedDecrypt::new(reader, name))),
                 ),
             }));
         }
