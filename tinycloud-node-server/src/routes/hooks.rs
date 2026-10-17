@@ -127,6 +127,9 @@ async fn authorize_admitted(
     let admitted = AdmittedInvocation::admit(invocation, config.invocation.max_lifetime_secs)
         .await
         .map_err(|error| (Status::Unauthorized, error.to_string()))?;
+    for space in admitted.invocation().0.spaces() {
+        tinycloud_core::request_telemetry::observe_space(space);
+    }
     tinycloud
         .authorize_admitted(&admitted, now)
         .await
@@ -322,6 +325,11 @@ pub async fn hook_events<'r>(
     let claims = hooks
         .verify_ticket(ticket)
         .map_err(|e| (Status::Unauthorized, e))?;
+    for scope in &claims.scopes {
+        if let Ok(space) = scope.space.parse() {
+            tinycloud_core::request_telemetry::observe_space(&space);
+        }
+    }
     let stream_deadline = hook_stream_deadline(
         &claims,
         hooks.config().max_ticket_ttl_seconds,

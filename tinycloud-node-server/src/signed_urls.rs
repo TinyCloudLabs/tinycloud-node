@@ -297,6 +297,7 @@ pub async fn mint_signed_kv_url(
             "signed URL scope is not authorized".to_string(),
         ));
     }
+    tinycloud_core::request_telemetry::observe_space(&space);
 
     let requested_hash = request
         .content_hash
@@ -417,6 +418,8 @@ pub async fn load_signed_kv_ticket(
     Ok(ticket)
 }
 
+/// Validate the stored bearer scope before observing its canonical resource owner.
+/// Issuer/subject DIDs and ticket IDs are never request account identities.
 pub fn validate_signed_kv_ticket(
     ticket: &signed_kv_ticket::Model,
 ) -> Result<(SpaceId, Path), (Status, String)> {
@@ -449,6 +452,7 @@ pub fn validate_signed_kv_ticket(
             "signed URL ticket is invalid".to_string(),
         )
     })?;
+    tinycloud_core::request_telemetry::observe_space(&space);
     Ok((space, path))
 }
 
@@ -725,6 +729,44 @@ mod tests {
             etag: None,
             parent_cids_json: None,
         }
+    }
+
+    #[test]
+    fn telemetry_observes_only_validated_ticket_targets() {
+        use std::sync::Arc;
+        use tinycloud_core::request_telemetry::{enter, RequestContext};
+        use tinycloud_core::telemetry::Pseudonymizer;
+        let (_, space) = test_invocation("docs").unwrap();
+        let secret = tinycloud_core::keys::StaticSecret::new(vec![7; 32]).unwrap();
+        let context =
+            RequestContext::new(uuid::Uuid::new_v4(), Arc::new(Pseudonymizer::new(&secret)));
+        let _guard = enter(Some(context.clone()));
+        let mut ticket = ticket_model(
+            &space,
+            "docs",
+            OffsetDateTime::now_utc() - time::Duration::seconds(1),
+        );
+        assert!(validate_signed_kv_ticket(&ticket).is_err());
+        assert!(context.hashes().account_hash.is_none());
+        assert!(context.hashes().space_hash.is_none());
+        ticket.expires_at =
+            format_timestamp(OffsetDateTime::now_utc() + time::Duration::hours(1)).unwrap();
+        validate_signed_kv_ticket(&ticket).unwrap();
+        assert!(context.hashes().account_hash.is_some());
+        assert!(context.hashes().space_hash.is_some());
+        let other = SpaceId::new(space.did().to_owned(), "other".parse().unwrap());
+        ticket.space_id = other.to_string();
+        validate_signed_kv_ticket(&ticket).unwrap();
+        assert!(context.hashes().account_hash.is_some());
+        assert!(context.hashes().space_hash.is_none());
+        ticket.space_id = space.to_string();
+        validate_signed_kv_ticket(&ticket).unwrap();
+        assert!(context.hashes().space_hash.is_none());
+        let (_, unrelated) = test_invocation("docs").unwrap();
+        ticket.space_id = unrelated.to_string();
+        validate_signed_kv_ticket(&ticket).unwrap();
+        assert!(context.hashes().account_hash.is_none());
+        assert!(context.hashes().space_hash.is_none());
     }
 
     #[get("/partial")]
