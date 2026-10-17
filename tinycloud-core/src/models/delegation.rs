@@ -6,7 +6,12 @@ use crate::policy_capability::sql_caveat;
 use crate::types::{Ability, Caveats, Facts, Resource};
 use crate::util::DelegationMode;
 use crate::{events::Delegation, models::*, relationships::*, util};
-use sea_orm::{entity::prelude::*, sea_query::OnConflict, ConnectionTrait};
+use sea_orm::ActiveValue::Set;
+use sea_orm::{
+    entity::prelude::*,
+    sea_query::{Alias, CommonTableExpression, Expr, OnConflict, Query, WithClause},
+    ConnectionTrait, DbBackend, QueryTrait,
+};
 use std::collections::BTreeMap;
 use time::OffsetDateTime;
 use tinycloud_auth::{authorization::TinyCloudDelegation, identity::did_principal_matches};
@@ -248,6 +253,19 @@ async fn validate<C: ConnectionTrait>(
         // ordered sibling pair.  Keeping the graph row here is what lets the
         // ordinary transaction validate an S0's proof CIDs.
         (false, true) if is_policy_root(&delegation.delegation) => Ok(()),
+        // A space owner may mint a narrowly scoped control grant for a
+        // persisted target without possessing the target's signed bytes.
+        (false, true)
+            if delegation.capabilities.len() == 1
+                && revocation::owner_controls_target(
+                    db,
+                    &delegation.delegator,
+                    dependant_caps[0],
+                )
+                .await? =>
+        {
+            Ok(())
+        }
         // dependant caps, no parents, invalid
         (false, true) => Err(DelegationError::MissingParents.into()),
         // dependant caps, parents, check parents
@@ -835,10 +853,11 @@ async fn save<C: ConnectionTrait>(
     // idempotency gate below.
     save_actors(&[&delegation.delegator, &delegation.delegate], db).await?;
 
-    // Idempotency gate: the delegation INSERT ON CONFLICT is the claim. If
-    // the row already exists (RecordNotInserted) we return Existing immediately
-    // — no abilities or parent rows are written.
-    match Entity::insert(ActiveModel::from(Model {
+    // The signed row remains the idempotency gate. Persist its alias in the
+    // same transaction; PostgreSQL uses a dependent INSERT CTE to keep the
+    // existing registration round-trip budget.
+    let canonical = delegation_cid_alias::canonical_hash(&serialization)?;
+    let insert = Entity::insert(ActiveModel::from(Model {
         id: hash,
         delegator: delegation.delegator,
         delegatee: delegation.delegate,
@@ -848,15 +867,65 @@ async fn save<C: ConnectionTrait>(
         facts,
         serialization: stored_serialization,
     }))
-    .on_conflict(OnConflict::column(Column::Id).do_nothing().to_owned())
-    .exec(db)
-    .await
-    {
-        Err(DbErr::RecordNotInserted) => return Ok(DelegationRegistration::Existing(hash)),
-        r => {
-            r?;
+    .on_conflict(OnConflict::column(Column::Id).do_nothing().to_owned());
+    if db.get_database_backend() == DbBackend::Postgres {
+        let claimed = Alias::new("registered_delegation");
+        let mut delegation_insert = insert.into_query();
+        delegation_insert.returning(Query::returning().column(Column::Id).to_owned());
+        let mut alias_insert = Query::insert();
+        alias_insert
+            .into_table(delegation_cid_alias::Entity)
+            .columns([
+                delegation_cid_alias::Column::Id,
+                delegation_cid_alias::Column::Canonical,
+                delegation_cid_alias::Column::Encrypted,
+            ])
+            .select_from(
+                Query::select()
+                    .column(Column::Id)
+                    .expr(Expr::val(canonical))
+                    .expr(Expr::val(encryption.is_some()))
+                    .from(claimed.clone())
+                    .to_owned(),
+            )
+            .map_err(|error| DbErr::Custom(error.to_string()))?
+            .returning(
+                Query::returning()
+                    .column(delegation_cid_alias::Column::Id)
+                    .to_owned(),
+            )
+            .with_cte(
+                WithClause::new()
+                    .cte(
+                        CommonTableExpression::new()
+                            .table_name(claimed)
+                            .query(delegation_insert)
+                            .to_owned(),
+                    )
+                    .to_owned(),
+            );
+        if db
+            .query_one(db.get_database_backend().build(&alias_insert))
+            .await?
+            .is_none()
+        {
+            return Ok(DelegationRegistration::Existing(hash));
         }
-    };
+    } else {
+        match insert.exec(db).await {
+            Err(DbErr::RecordNotInserted) => return Ok(DelegationRegistration::Existing(hash)),
+            result => {
+                result?;
+            }
+        };
+        delegation_cid_alias::Entity::insert(delegation_cid_alias::ActiveModel {
+            id: Set(hash),
+            canonical: Set(canonical),
+            encrypted: Set(encryption.is_some()),
+        })
+        .exec(db)
+        .await?;
+    }
 
     // save abilities — persist UCAN caveats with the delegation row. W1
     // contract: caveats MUST NOT be reconstructed from invocation facts;

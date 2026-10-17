@@ -1249,6 +1249,7 @@ dependencies = [
  "http 1.4.0",
  "ipld-core",
  "iri-string",
+ "k256",
  "serde",
  "serde_bytes",
  "serde_ipld_dagcbor 0.6.4",

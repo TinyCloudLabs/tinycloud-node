@@ -2,8 +2,11 @@ use super::super::{events::Revocation, models::*, relationships::*};
 use crate::hash::{hash, Hash};
 use crate::models::did_resolution::{verify_ucan_signature, UcanVerifyError};
 use crate::types::Resource;
+use sea_orm::Condition;
 use sea_orm::{
-    entity::prelude::*, sea_query::OnConflict, ConnectionTrait, QueryOrder, QuerySelect,
+    entity::prelude::*,
+    sea_query::{Alias, Expr, JoinType, OnConflict, Query, SimpleExpr, UnionType},
+    ConnectionTrait, FromQueryResult, QueryOrder, QuerySelect,
 };
 use std::collections::HashSet;
 use time::OffsetDateTime;
@@ -68,15 +71,113 @@ pub enum ChainTraversalError {
     LimitExceeded,
 }
 
-pub(crate) async fn is_revoked<C: ConnectionTrait>(
+/// Resolve revocation targets through the persisted canonical identity. The
+/// exact-target branch also handles graph rows created directly by unit tests.
+fn target_condition(id: SimpleExpr) -> Condition {
+    use delegation_cid_alias::{Column as AliasColumn, Entity as AliasEntity};
+    let canonical = Query::select()
+        .column(AliasColumn::Canonical)
+        .from(AliasEntity)
+        .cond_where(
+            Condition::any()
+                .add(Expr::col(AliasColumn::Id).eq(id.clone()))
+                .add(Expr::col(AliasColumn::Canonical).eq(id.clone())),
+        )
+        .to_owned();
+    let equivalents = Query::select()
+        .column(AliasColumn::Id)
+        .from(AliasEntity)
+        .and_where(Expr::col(AliasColumn::Canonical).in_subquery(canonical))
+        .to_owned();
+    Condition::any()
+        .add(Expr::col((Entity, Column::Revoked)).eq(id))
+        .add(Expr::col((Entity, Column::Revoked)).in_subquery(equivalents))
+}
+
+/// Correlated, indexed revocation exclusion for legacy delegation listings.
+pub(crate) fn unrevoked_condition() -> SimpleExpr {
+    Expr::exists(
+        Query::select()
+            .expr(Expr::value(1))
+            .from(Entity)
+            .cond_where(target_condition(
+                Expr::col((delegation::Entity, delegation::Column::Id)).into(),
+            ))
+            .to_owned(),
+    )
+    .not()
+}
+
+/// Load effective revocations in one indexed batch while keeping the original
+/// signed revocation target and bytes intact. The returned key is the queried
+/// delegation, not necessarily the CID the owner named in the revocation.
+pub(crate) async fn effective_rows<C: ConnectionTrait>(
     db: &C,
-    delegation_id: &Hash,
-) -> Result<bool, DbErr> {
-    Ok(Entity::find()
-        .filter(Column::Revoked.eq(*delegation_id))
-        .count(db)
+    ids: &[Hash],
+) -> Result<Vec<(Hash, Model)>, DbErr> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    use delegation_cid_alias::{Column as AliasColumn, Entity as AliasEntity};
+    let source = Alias::new("revocation_source_alias");
+    let target = Alias::new("revocation_target_alias");
+    let effective_id = Alias::new("effective_id");
+    let columns = [
+        Column::Id,
+        Column::Revoker,
+        Column::Revoked,
+        Column::Serialization,
+        Column::RevokedAt,
+    ];
+    let mut direct = Query::select();
+    direct
+        .columns(columns.map(|column| (Entity, column)))
+        .expr_as(Expr::col((Entity, Column::Revoked)), effective_id.clone())
+        .from(Entity)
+        .and_where(Expr::col((Entity, Column::Revoked)).is_in(ids.iter().copied()));
+    let mut aliased = Query::select();
+    aliased
+        .columns(columns.map(|column| (Entity, column)))
+        .expr_as(Expr::col((source.clone(), AliasColumn::Id)), effective_id)
+        .from_as(AliasEntity, source.clone())
+        .join_as(
+            JoinType::InnerJoin,
+            AliasEntity,
+            target.clone(),
+            Expr::col((source.clone(), AliasColumn::Canonical))
+                .equals((target.clone(), AliasColumn::Canonical)),
+        )
+        .join(
+            JoinType::InnerJoin,
+            Entity,
+            Expr::col((target, AliasColumn::Id)).equals((Entity, Column::Revoked)),
+        )
+        .and_where(Expr::col((source, AliasColumn::Id)).is_in(ids.iter().copied()));
+    // A self-alias appears in both branches. UNION removes that duplicate
+    // without manufacturing a second revocation or rewriting its target.
+    direct.union(UnionType::Distinct, aliased);
+    db.query_all(db.get_database_backend().build(&direct))
         .await?
-        > 0)
+        .into_iter()
+        .map(|row| {
+            Ok((
+                row.try_get("", "effective_id")?,
+                Model::from_query_result(&row, "")?,
+            ))
+        })
+        .collect()
+}
+
+/// Whether this delegation or any persisted equivalent CID has been revoked.
+///
+/// Use the caller's transaction for an admission-time recheck; signed targets
+/// and stored delegation IDs are never rewritten.
+pub async fn is_revoked<C: ConnectionTrait>(db: &C, delegation_id: &Hash) -> Result<bool, DbErr> {
+    Ok(Entity::find()
+        .filter(target_condition(Expr::value(*delegation_id)))
+        .one(db)
+        .await?
+        .is_some())
 }
 
 pub(crate) async fn first_revoked_ancestor<C: ConnectionTrait>(
@@ -270,20 +371,60 @@ pub(crate) async fn control_proof_decision<C: ConnectionTrait>(
         .filter(abilities::Column::Ability.eq(requested_action))
         .all(db)
         .await?;
-    let target_resource = format!("urn:cid:{}", target.to_cid(0x55));
-    control_abilities.retain(|ability| match &ability.resource {
-        Resource::Other(resource) => resource.as_str() == target_resource,
-        Resource::TinyCloud(resource) => {
-            resource.service().as_str() == "delegation"
-                && resource
-                    .path()
-                    .map(|path| path.as_str().is_empty())
-                    .unwrap_or(true)
-                && resource.query().is_none()
-                && resource.fragment().is_none()
-                && did_principal_matches(resource.space().did().as_str(), &parent.delegator)
+    let mut canonical_target = None;
+    let mut index = 0;
+    while index < control_abilities.len() {
+        let matches = match &control_abilities[index].resource {
+            Resource::Other(resource) => {
+                let control_target = resource
+                    .as_str()
+                    .strip_prefix("urn:cid:")
+                    .and_then(|cid| cid.parse::<Cid>().ok())
+                    .map(Hash::from);
+                if let Some(control_target) = control_target {
+                    if control_target == *target {
+                        true
+                    } else {
+                        let target_canonical = if let Some(canonical) = canonical_target {
+                            canonical
+                        } else {
+                            let canonical = delegation_cid_alias::Entity::find_by_id(*target)
+                                .one(db)
+                                .await?
+                                .map(|alias| alias.canonical)
+                                .unwrap_or(*target);
+                            canonical_target = Some(canonical);
+                            canonical
+                        };
+                        let control_canonical =
+                            delegation_cid_alias::Entity::find_by_id(control_target)
+                                .one(db)
+                                .await?
+                                .map(|alias| alias.canonical)
+                                .unwrap_or(control_target);
+                        control_canonical == target_canonical
+                    }
+                } else {
+                    false
+                }
+            }
+            Resource::TinyCloud(resource) => {
+                resource.service().as_str() == "delegation"
+                    && resource
+                        .path()
+                        .map(|path| path.as_str().is_empty())
+                        .unwrap_or(true)
+                    && resource.query().is_none()
+                    && resource.fragment().is_none()
+                    && did_principal_matches(resource.space().did().as_str(), &parent.delegator)
+            }
+        };
+        if matches {
+            index += 1;
+        } else {
+            control_abilities.swap_remove(index);
         }
-    });
+    }
     if control_abilities.is_empty() {
         return Ok(ControlProofDecision::Denied);
     }
@@ -291,6 +432,59 @@ pub(crate) async fn control_proof_decision<C: ConnectionTrait>(
         target: *target,
         grantor: parent.delegator,
         abilities: control_abilities,
+    }))
+}
+
+/// A canonical CID can name a historical stored row without being its primary
+/// key. Keep the signed CID on the wire; use the stored row for authorization.
+pub(crate) async fn target_for_cid<C: ConnectionTrait>(
+    db: &C,
+    target: Hash,
+) -> Result<Option<delegation::Model>, DbErr> {
+    if let Some(row) = delegation::Entity::find_by_id(target).one(db).await? {
+        return Ok(Some(row));
+    }
+    let Some(alias) = delegation_cid_alias::Entity::find()
+        .filter(delegation_cid_alias::Column::Canonical.eq(target))
+        .one(db)
+        .await?
+    else {
+        return Ok(None);
+    };
+    delegation::Entity::find_by_id(alias.id).one(db).await
+}
+
+/// Root CID control is available only to an owner of a space in the target's
+/// persisted abilities. A delegator or delegatee alone is not an owner.
+pub(crate) async fn owner_controls_target<C: ConnectionTrait>(
+    db: &C,
+    owner: &str,
+    cap: &crate::util::Capability,
+) -> Result<bool, DbErr> {
+    if cap.ability.as_ref().as_ref() != "tinycloud.delegation/revoke" {
+        return Ok(false);
+    }
+    let Resource::Other(resource) = &cap.resource else {
+        return Ok(false);
+    };
+    let Some(target) = resource
+        .as_str()
+        .strip_prefix("urn:cid:")
+        .and_then(|cid| cid.parse::<Cid>().ok())
+    else {
+        return Ok(false);
+    };
+    let Some(target) = target_for_cid(db, Hash::from(target)).await? else {
+        return Ok(false);
+    };
+    let abilities = abilities::Entity::find()
+        .filter(abilities::Column::Delegation.eq(target.id))
+        .all(db)
+        .await?;
+    Ok(abilities.iter().any(|row| {
+        row.resource
+            .space()
+            .is_some_and(|space| did_principal_matches(space.did().as_str(), owner))
     }))
 }
 
@@ -358,8 +552,7 @@ pub(crate) async fn process<C: ConnectionTrait>(
     };
 
     let hash: Hash = hash(&serialization);
-    let delegation = delegation::Entity::find_by_id(Hash::from(r.revoked))
-        .one(db)
+    let delegation = target_for_cid(db, Hash::from(r.revoked))
         .await?
         .ok_or(RevocationError::MissingParents)?;
 
@@ -372,7 +565,15 @@ pub(crate) async fn process<C: ConnectionTrait>(
     // Any one of these is sufficient. The Cacao revoker == delegator
     // path stays as the cheapest check; owner-authorized falls back to
     // walking the ability rows.
-    if !revoker_is_authorized(db, &delegation, &r.revoker, &r.parents).await? {
+    if !revoker_is_authorized(
+        db,
+        &delegation,
+        &r.revoker,
+        &r.parents,
+        &Hash::from(r.revoked),
+    )
+    .await?
+    {
         return Err(RevocationError::UnauthorizedRevoker(r.revoker).into());
     };
 
@@ -421,29 +622,25 @@ async fn revoker_is_authorized<C: ConnectionTrait>(
     delegation: &delegation::Model,
     revoker: &str,
     proofs: &[Cid],
+    target: &Hash,
 ) -> Result<bool, DbErr> {
-    let principal = match control_proof_decision(
-        db,
-        revoker,
-        proofs,
-        "tinycloud.delegation/revoke",
-        &delegation.id,
-    )
-    .await?
-    {
-        ControlProofDecision::DirectSigner(principal) => principal,
-        ControlProofDecision::Scoped(control) => {
-            if control.directly_authorizes_cid(&delegation.id, delegation) {
-                return Ok(true);
+    let principal =
+        match control_proof_decision(db, revoker, proofs, "tinycloud.delegation/revoke", target)
+            .await?
+        {
+            ControlProofDecision::DirectSigner(principal) => principal,
+            ControlProofDecision::Scoped(control) => {
+                if control.directly_authorizes_cid(target, delegation) {
+                    return Ok(true);
+                }
+                let target_abilities = abilities::Entity::find()
+                    .filter(abilities::Column::Delegation.eq(delegation.id))
+                    .all(db)
+                    .await?;
+                return Ok(control.authorizes_target(target, delegation, &target_abilities));
             }
-            let target_abilities = abilities::Entity::find()
-                .filter(abilities::Column::Delegation.eq(delegation.id))
-                .all(db)
-                .await?;
-            return Ok(control.authorizes_target(&delegation.id, delegation, &target_abilities));
-        }
-        ControlProofDecision::Denied => return Ok(false),
-    };
+            ControlProofDecision::Denied => return Ok(false),
+        };
     if did_principal_matches(&delegation.delegator, &principal) {
         return Ok(true);
     }

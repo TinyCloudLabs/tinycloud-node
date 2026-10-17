@@ -23,7 +23,7 @@ async fn stored_revoked(
 }
 
 async fn scoped_fixture() -> Result<KvSyncFixture> {
-    KvSyncFixture::new_with(|rocket| rocket.mount("/", routes![revoke])).await
+    KvSyncFixture::new().await
 }
 
 #[tokio::test]
@@ -371,6 +371,89 @@ async fn space_control_cannot_revoke_a_grant_with_an_uncovered_space() -> Result
     fixture
         .assert_scope_denied(target, fixture.scoped_revoke_header(target, Some(control))?)
         .await
+}
+
+#[tokio::test]
+async fn space_control_covering_both_owner_spaces_revokes_a_mixed_space_grant() -> Result<()> {
+    use tinycloud_core::models::space as space_model;
+    use tinycloud_core::types::SpaceIdWrap;
+
+    let fixture = scoped_fixture().await?;
+    let other = SpaceId::new(fixture.space.did().to_string().parse()?, "other".parse()?);
+    space_model::ActiveModel {
+        id: Set(SpaceIdWrap(other.clone())),
+    }
+    .insert(&fixture.conn)
+    .await?;
+    let target = fixture
+        .grant_in(
+            "covered-mixed-space-target",
+            &fixture.space.did().to_string(),
+            &fixture.device_did(),
+            &[
+                (&fixture.space, "notes/", "tinycloud.kv/get"),
+                (&other, "notes/", "tinycloud.kv/get"),
+            ],
+            None,
+            None,
+            &[],
+        )
+        .await?;
+
+    let mut capabilities = Capabilities::new();
+    for space in [&fixture.space, &other] {
+        capabilities.with_action(
+            fixture.resource_in(space, "delegation", "")?.as_uri(),
+            "tinycloud.delegation/revoke".parse::<UcanAbility>()?,
+            [std::collections::BTreeMap::<String, serde_json::Value>::new()],
+        );
+    }
+    let header = Payload {
+        issuer: fixture.owner_vm.parse::<DIDURLBuf>()?,
+        audience: fixture.device_did().parse()?,
+        not_before: None,
+        expiration: NumericDate::try_from_seconds(
+            whole_seconds_from_now(3600).unix_timestamp() as f64
+        )?,
+        nonce: Some(fixture.next_nonce()),
+        facts: Some(Vec::<serde_json::Value>::new()),
+        proof: vec![],
+        attenuation: capabilities,
+    }
+    .sign(
+        fixture.owner.get_algorithm().unwrap_or_default(),
+        &fixture.owner,
+    )?
+    .encode()?;
+    let response = fixture
+        .client
+        .post("/delegate")
+        .header(Header::new("Authorization", header))
+        .dispatch()
+        .await;
+    let status = response.status();
+    let body = response.into_string().await.unwrap_or_default();
+    assert_eq!(status, Status::Ok, "control activation: {body}");
+    let control = Hash::from(
+        serde_json::from_str::<serde_json::Value>(&body)?["cid"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("missing control CID"))?
+            .parse::<Cid>()?,
+    );
+    let response = fixture
+        .client
+        .post("/revoke")
+        .header(Header::new(
+            "Authorization",
+            fixture.scoped_revoke_header(target, Some(control))?,
+        ))
+        .dispatch()
+        .await;
+    let status = response.status();
+    let body = response.into_string().await.unwrap_or_default();
+    assert_eq!(status, Status::Ok, "covered mixed-space revoke: {body}");
+    assert!(stored_revoked(&fixture.conn, &target).await?);
+    Ok(())
 }
 
 #[tokio::test]

@@ -8283,7 +8283,7 @@ mod tests {
             DuckDbService::new(path, u64::MAX, 300, "256MB".into(), repo)
         };
         let rocket = rocket::build()
-            .mount("/", rocket::routes![invoke, info, delegate])
+            .mount("/", rocket::routes![invoke, info, delegate, revoke])
             .attach(crate::tracing::TracingFairing::new(
                 &Config::default().log.tracing,
             ))
@@ -9736,6 +9736,169 @@ mod tests {
             get.status,
             Status::NotFound,
             "the mixed put must not have run"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn owner_can_activate_cid_root_revoke_without_target_artifact() -> Result<()> {
+        use rocket::http::{Header, Status};
+        use tinycloud_auth::ssi::{
+            dids::{DIDBuf, DIDURLBuf},
+            ucan::Payload,
+        };
+        use tinycloud_auth::ucan_capabilities_object::Capabilities;
+
+        let fixture = KvSyncFixture::new().await?;
+        let target = fixture
+            .signed_root_grant(
+                "owner-cid-target",
+                "tinycloud.kv/sync",
+                whole_seconds_from_now(3600),
+                false,
+            )
+            .await?;
+        let target_cid = target.to_cid(0x55);
+        assert_eq!(
+            fixture.sync("notes/", target, &[]).await?.status,
+            Status::Ok
+        );
+
+        let mut capabilities = Capabilities::new();
+        capabilities.with_action(
+            format!("urn:cid:{target_cid}").parse()?,
+            "tinycloud.delegation/revoke".parse::<UcanAbility>()?,
+            [std::collections::BTreeMap::<String, serde_json::Value>::new()],
+        );
+        let root = Payload {
+            issuer: fixture.owner_vm.parse::<DIDURLBuf>()?,
+            audience: fixture.device_did().parse::<DIDBuf>()?,
+            not_before: None,
+            expiration: test_invocation_expiration(),
+            nonce: Some(fixture.next_nonce()),
+            facts: Some(Vec::<serde_json::Value>::new()),
+            proof: vec![],
+            attenuation: capabilities.clone(),
+        }
+        .sign(
+            fixture.owner.get_algorithm().unwrap_or_default(),
+            &fixture.owner,
+        )?
+        .encode()?;
+        let activated = fixture
+            .client
+            .post("/delegate")
+            .header(Header::new("Authorization", root))
+            .dispatch()
+            .await;
+        let status = activated.status();
+        let body = activated.into_string().await.unwrap_or_default();
+        assert_eq!(status, Status::Ok, "{body}");
+        let control_cid = serde_json::from_str::<serde_json::Value>(&body)?["cid"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("missing control CID"))?
+            .parse::<tinycloud_auth::ipld_core::cid::Cid>()?;
+
+        let revoke = Payload {
+            issuer: fixture.device_vm.parse::<DIDURLBuf>()?,
+            audience: fixture.device_did().parse::<DIDBuf>()?,
+            not_before: None,
+            expiration: test_invocation_expiration(),
+            nonce: Some(fixture.next_nonce()),
+            facts: Some(Vec::<serde_json::Value>::new()),
+            proof: vec![control_cid],
+            attenuation: capabilities,
+        }
+        .sign(
+            fixture.device.get_algorithm().unwrap_or_default(),
+            &fixture.device,
+        )?
+        .encode()?;
+        let revoked = fixture
+            .client
+            .post("/revoke")
+            .header(Header::new("Authorization", revoke))
+            .dispatch()
+            .await;
+        let status = revoked.status();
+        let body = revoked.into_string().await.unwrap_or_default();
+        assert_eq!(status, Status::Ok, "{body}");
+        assert_eq!(
+            fixture.sync("notes/", target, &[]).await?.status,
+            Status::Unauthorized
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cid_root_revoke_rejects_foreign_signer_and_unknown_target() -> Result<()> {
+        use rocket::http::{Header, Status};
+        use tinycloud_auth::ssi::{
+            dids::{DIDBuf, DIDURLBuf},
+            ucan::Payload,
+        };
+        use tinycloud_auth::ucan_capabilities_object::Capabilities;
+
+        let fixture = KvSyncFixture::new().await?;
+        let target = fixture
+            .signed_root_grant(
+                "owner-only-revoke",
+                "tinycloud.kv/sync",
+                whole_seconds_from_now(3600),
+                false,
+            )
+            .await?;
+        let unknown = tinycloud_core::hash::hash(b"unknown-revoke-target");
+        let foreign = JWK::generate_ed25519()?;
+        let foreign_vm = tc341_verification_method(&foreign)?;
+        let owner_did = fixture.space.did().to_string();
+        let device_did = fixture.device_did();
+        let empty = fixture
+            .grant(
+                "owner-revoke-no-abilities",
+                &owner_did,
+                &device_did,
+                &[],
+                None,
+                Some(whole_seconds_from_now(3600)),
+                &[],
+            )
+            .await?;
+        for (key, issuer, cid) in [
+            (&foreign, foreign_vm.as_str(), target),
+            (&fixture.device, fixture.device_vm.as_str(), target),
+            (&fixture.owner, fixture.owner_vm.as_str(), unknown),
+            (&fixture.owner, fixture.owner_vm.as_str(), empty),
+        ] {
+            let mut capabilities = Capabilities::new();
+            capabilities.with_action(
+                format!("urn:cid:{}", cid.to_cid(0x55)).parse()?,
+                "tinycloud.delegation/revoke".parse::<UcanAbility>()?,
+                [std::collections::BTreeMap::<String, serde_json::Value>::new()],
+            );
+            let header = Payload {
+                issuer: issuer.parse::<DIDURLBuf>()?,
+                audience: fixture.device_did().parse::<DIDBuf>()?,
+                not_before: None,
+                expiration: test_invocation_expiration(),
+                nonce: Some(fixture.next_nonce()),
+                facts: Some(Vec::<serde_json::Value>::new()),
+                proof: vec![],
+                attenuation: capabilities,
+            }
+            .sign(key.get_algorithm().unwrap_or_default(), key)?
+            .encode()?;
+            let response = fixture
+                .client
+                .post("/delegate")
+                .header(Header::new("Authorization", header))
+                .dispatch()
+                .await;
+            assert_eq!(response.status(), Status::Unauthorized, "target {cid:?}");
+        }
+        assert_eq!(
+            fixture.sync("notes/", target, &[]).await?.status,
+            Status::Ok
         );
         Ok(())
     }
