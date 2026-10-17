@@ -64,5 +64,6 @@
     "db_pool_acquire_timeout": { "target": "tinycloud_core::db_pool", "level": "warn", "fields": ["elapsed_ms", "pool_size", "pool_idle", "pool_max", "suppressed_count"] },
     "db_connect_failed": { "target": "tinycloud_core::db_pool", "level": "warn", "fields": ["class", "suppressed_count"] }
   },
+  "typed_limit": { "records": 10, "window_secs": 60 },
   "fallback": "unclassified"
 }

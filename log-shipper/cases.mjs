@@ -1,6 +1,9 @@
+import { readFileSync } from 'node:fs';
 // Synthetic inputs only. Native Vector evaluates every assertion after the full boundary.
 export const canary = 'TC959_SYNTHETIC_Bearer_eyJhbGciOiJub25lIn0.email@example.test.did:pkh:0xdeadbeef';
 export const timestamp = '2026-10-16T12:00:00.000Z';
+// The shipper cap per typed code per window (Sam, tc-959-f6-log-cap); fixtures derive from it.
+const typedCap = JSON.parse(readFileSync(new URL('./diagnostics.json', import.meta.url), 'utf8')).typed_limit.records;
 export const nodeRequest = (fields = {}) => ({ timestamp, level: 'INFO', target: 'tinycloud::request', fields: { message: 'request', method: 'POST', route: '/invoke', status: 200, latency_us: 1234, ...fields } });
 export const ingressRequest = (fields = {}) => ({ time: timestamp, method: 'GET', route: '/healthz', status: 200, request_time: 0.012, bytes: 2, upstream_status: '200', ...fields });
 export const envelope = (value, label = 'tinycloud-node') => ({ message: typeof value === 'string' ? value : JSON.stringify(value), '_tc.logship': label, host: canary, full_message: canary, container_id: canary });
@@ -40,6 +43,12 @@ const f6Check = (name, input, assertion, extract = 'allowlist') => ({ name, inpu
 const f6Reject = (name, input) => ({ name, inputs: [{ insert_at: 'logship_gate', type: 'log', log_fields: logFields(envelope(input)) }], no_outputs_from: ['allowlist'], outputs: [{ extract_from: 'gate_counts', conditions: [{ type: 'vrl', source: 'assert!(.count == 1 && .reason == "invalid_fields")\nassert!(!contains(encode_json(.), "TC959_SYNTHETIC"))' }] }] });
 const hostileExtras = { db: 'v2n', operation: 'begin', error: canary, err: canary, sql: `SELECT '${canary}'`, nested: { space: canary }, space: canary, did: canary };
 const integerFields = { waited_ms: 86_400_000, held_ms: 86_400_000, hydrate_ms: 86_400_000, execute_ms: 86_400_000, persist_ms: 86_400_000, elapsed_ms: 86_400_000, ahead_approx: 1_000_000, suppressed_count: 9_007_199_254_740_991, pool_size: 100_000, pool_idle: 100_000, pool_max: 100_000 };
+/** An admitted F6 wire record, as the allowlist emits it. */
+const f6Wire = name => {
+  const { level, fields } = f6Events[name];
+  const lower = level.toLowerCase();
+  return { ts: timestamp, level: lower, event: lower === 'warn' ? 'node_warning' : 'node_error', svc: 'api', event_code: name, event_count: 1, ...fields };
+};
 const f6Tests = [
   ...Object.keys(f6Events).map(name => f6Check(`F6 ${name} keeps exactly its typed fields`, f6Line(name), f6Expected(name))),
   ...Object.keys(f6Events).map(name => f6Check(`F6 ${name} drops raw db, pool operation, error text and nested extras`, f6Line(name, hostileExtras), f6Expected(name))),
@@ -80,6 +89,28 @@ const f6Tests = [
     inputs: [61000, 62000].map(waited_ms => ({ insert_at: 'logship_gate', type: 'log', log_fields: logFields(envelope(f6Line('sql_operation_lock_wait', { waited_ms }))) })),
     no_outputs_from: ['diagnostic_output'],
     outputs: [{ extract_from: 'event_route.typed_diagnostic', conditions: [{ type: 'vrl', source: `assert!(.event_count == 1 && (.waited_ms == 61000 || .waited_ms == 62000))\nassert!(${f6Safe})` }] }],
+  },
+  // Shipper-side cap (defence in depth over the node limiter): at most `typedCap` records per code per window.
+  {
+    name: 'typed cap passes up to its limit for each code unchanged and counts nothing',
+    inputs: [...Array(typedCap).fill('sql_operation_lock_wait'), ...Array(typedCap).fill('db_connect_failed')].map(name => ({ insert_at: 'logship_gate', type: 'log', log_fields: logFields(envelope(f6Line(name))) })),
+    no_outputs_from: ['typed_limit_route.throttled'],
+    outputs: [{ extract_from: 'typed_limit_route.record', conditions: [{ type: 'vrl', source: `assert!(.event_count == 1 && ((.event_code == "sql_operation_lock_wait" && is_integer(.waited_ms) && .waited_ms == 61000 && length(keys(.)) == 12) || (.event_code == "db_connect_failed" && .class == "refused" && length(keys(.)) == 8)))\nassert!(${f6Safe})` }] }],
+  },
+  {
+    name: 'typed cap drops the record past its limit and counts it without content',
+    inputs: Array(typedCap + 1).fill('sql_operation_lock_wait').map(name => ({ insert_at: 'typed_limit', type: 'log', log_fields: f6Wire(name) })),
+    outputs: [{ extract_from: 'typed_limit_route.throttled', conditions: [{ type: 'vrl', source: 'assert!(.reason == "typed_throttled" && .count == 1 && length(keys(.)) == 2)' }] }],
+  },
+  {
+    name: 'typed cap drops surface in the gate summary as an exact count',
+    inputs: Array(typedCap + 65).fill('sql_actor_message_slow').map(name => ({ insert_at: 'typed_limit', type: 'log', log_fields: f6Wire(name) })),
+    outputs: [{ extract_from: 'gate_output', conditions: [{ type: 'vrl', source: 'assert!(.reason == "typed_throttled" && .count == 65 && .event == "logship_gate_summary_total" && length(keys(.)) == 6)' }] }],
+  },
+  {
+    name: 'typed cap applies to raw node lines end to end',
+    inputs: Array(typedCap + 1).fill('db_pool_acquire_timeout').map(name => ({ insert_at: 'logship_gate', type: 'log', log_fields: logFields(envelope(f6Line(name, { error: canary }))) })),
+    outputs: [{ extract_from: 'gate_output', conditions: [{ type: 'vrl', source: 'assert!(.reason == "typed_throttled" && .count == 1)\nassert!(!contains(encode_json(.), "TC959_SYNTHETIC"))' }] }],
   },
 ];
 export const vectorTests = [
