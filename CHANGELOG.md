@@ -14,6 +14,7 @@
 - Tighten revocation scope checks (TC-1302).
 - Account delegation session discovery keyset-pages delegation rows independently of ability fan-out, using a composite delegator/id index so large grant sets are not truncated (TC-1195).
 - `/attestation` quotes the SHA-256 of `key_binding` as REPORTDATA and returns it as `key_binding_sha256`; the quote no longer carries the raw binding. Before answering 200 the node checks that the returned TDX v4 quote's REPORTDATA field holds that digest (a structural check; it does not verify the quote). When the TEE can't produce a bound quote, the endpoint returns 503 instead of 200 `mode: "classic"`, and the dstack client reports a guest-agent error status instead of a parse error. `nonce` must be 1-64 characters of `A-Z a-z 0-9 - _` (400 otherwise), and the endpoint now shares the public routes' per-IP rate limit. Verifiers recompute the digest from their own nonce and expected DID and must still verify the quote; see `docs/attestation.md` (TC-963).
+- `/invoke` upload bodies are capped at 95 MiB (99,614,720 bytes), and a longer body gets 413 (TC-1012). This applies to a KV put, a multipart KV batch put (the whole multipart body) and a DuckDB import, whether the body is declared or chunked. Before, a KV put kept only the first 1 GB of a longer body without an error, a batch put over 1 GB got 400, and a DuckDB import was cut off at 100 MB. The ingress test now expects `CLIENT_MAX_BODY_SIZE=95m`. The release compose line changes with the TC-959 N0 compose (#309).
 
 ## [1.20.7] - 2026-10-14
 
