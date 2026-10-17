@@ -28,15 +28,23 @@ if label == "tinycloud-node" {
     out = {"event": "node_request", "svc": "api", "level": "info", "method": method, "route": route, "status": status, "latency_us": latency}
   } else {
     if !includes(["warn", "error"], level) { abort }
-    code = "unclassified"
-    if target == "tinycloud" || starts_with(target, "tinycloud::") || target == "tinycloud_core" || starts_with(target, "tinycloud_core::") {
-      codes = __DIAGNOSTICS__
-      known = get(codes, [msg]) ?? null
-      if is_string(known) { code = known }
-      __PREFIX_DIAGNOSTICS__
-    }
     event = if level == "warn" { "node_warning" } else { "node_error" }
-    out = {"event": event, "svc": "api", "level": level, "event_code": code, "event_count": 1}
+    # Typed diagnostics: an exact (target, message) match ships one record per
+    # occurrence with only its declared fields. A wrong level, a missing field
+    # or any value outside its type, range, enum or hash pattern aborts the
+    # whole record; undeclared fields are never copied.
+    typed = false
+    __TYPED_DIAGNOSTICS__
+    if !typed {
+      code = "unclassified"
+      if target == "tinycloud" || starts_with(target, "tinycloud::") || target == "tinycloud_core" || starts_with(target, "tinycloud_core::") {
+        codes = __DIAGNOSTICS__
+        known = get(codes, [msg]) ?? null
+        if is_string(known) { code = known }
+        __PREFIX_DIAGNOSTICS__
+      }
+      out = {"event": event, "svc": "api", "level": level, "event_code": code, "event_count": 1}
+    }
   }
 } else {
   ts = string!(j.time)

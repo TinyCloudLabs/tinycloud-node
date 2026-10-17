@@ -11,7 +11,7 @@ import { gunzipSync } from 'node:zlib';
 import { buildConfig } from '../scripts/tc959-logship.mjs';
 import { assertCapture } from '../scripts/tc959-docker.mjs';
 import { hasUdpListener } from '../scripts/tc959-readiness.mjs';
-import { canary, nodeRequest, ingressRequest } from './cases.mjs';
+import { canary, nodeRequest, ingressRequest, f6Line, f6Events } from './cases.mjs';
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -75,9 +75,13 @@ export async function checkNativeVector(vector, baseline) {
       // Native GELF JSON decoding used to quote this value in its own console.
       await send(frame(nodeRequest({ route: '/healthz' }), 'tinycloud-node', { level: canary, full_message: canary }));
       await send(`{"version":"1.1","short_message":"${canary}`);
+      // F6: one valid occurrence with hostile extras is shipped typed; the stale 16-hex shape is not.
+      await send(frame(f6Line('sql_operation_lock_wait', { db: canary, operation: 'begin', error: canary })));
+      await send(frame(f6Line('sql_operation_lock_wait', { space_hash: '0123456789abcdef', db: 'v2n', db_hash: undefined })));
     } finally { sender.close(); }
+    const typed = () => events.filter(event => event.event_code === 'sql_operation_lock_wait');
     for (let attempt = 0; attempt < 100; attempt++) {
-      if (events.filter(event => event.event === 'node_request' || event.event === 'ingress_request').length >= 5) break;
+      if (events.filter(event => event.event === 'node_request' || event.event === 'ingress_request').length >= 5 && typed().length >= 1) break;
       await sleep(30);
     }
     child.kill('SIGTERM');
@@ -87,8 +91,11 @@ export async function checkNativeVector(vector, baseline) {
     const schema = JSON.parse(await readFile(new URL('./fields.json', import.meta.url), 'utf8'));
     try { assertCapture(events, schema.services['tinycloud-node'].fields); } catch { wireSafe = false; }
     const requests = events.filter(event => event.event === 'node_request' || event.event === 'ingress_request').length;
+    const f6 = typed();
+    const expected = { level: 'warn', event: 'node_warning', svc: 'api', event_code: 'sql_operation_lock_wait', event_count: 1, ...f6Events.sql_operation_lock_wait.fields };
+    const f6Exact = f6.length === 1 && Object.entries(expected).every(([key, value]) => f6[0][key] === value) && Object.keys(f6[0]).length === Object.keys(expected).length + 1;
     const consoleHits = consoleText.split(canary).length - 1;
-    return { status: wireSafe && !malformedHttp && !overflow && requests === 5 && consoleHits === 0 ? 'passed' : 'failed', request_events: requests, console_canary_hits: consoleHits, wire_safe: wireSafe, positive_controls: 5, console_overflow: overflow };
+    return { status: wireSafe && !malformedHttp && !overflow && requests === 5 && f6Exact && consoleHits === 0 ? 'passed' : 'failed', request_events: requests, f6_typed_events: f6.length, f6_exact: f6Exact, console_canary_hits: consoleHits, wire_safe: wireSafe, positive_controls: 6, console_overflow: overflow };
   } finally {
     if (child) { child.kill('SIGTERM'); await closed; }
     server.closeAllConnections();

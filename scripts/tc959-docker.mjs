@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import dgram from 'node:dgram';
-import { writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import net from 'node:net';
 import { dirname, join, resolve } from 'node:path';
@@ -43,6 +43,16 @@ export function resourceNames(id) {
   return Object.fromEntries(['logship', 'sink', 'vector', 'node', 'ingress', 'emitter'].map(role => [role, `${owner}-${id}-${role}`]));
 }
 
+const typedDiagnostics = JSON.parse(readFileSync(new URL('../log-shipper/diagnostics.json', import.meta.url), 'utf8')).typed;
+/** One typed diagnostic field against its closed schema type. */
+function assertTypedField(value, spec) {
+  assert.ok(spec);
+  if (spec.type === 'integer') assert.ok(Number.isSafeInteger(value) && value >= spec.min && value <= spec.max);
+  else if (spec.type === 'enum') assert.ok(spec.values.includes(value));
+  else if (spec.type === 'string') assert.ok(typeof value === 'string' && value.length <= spec.max_len && new RegExp(spec.regex).test(value));
+  else assert.fail('typed diagnostic field has no closed type');
+}
+
 /** Strict validation applies to every captured record, including a failing proof's partial capture. */
 export function assertCapture(events, fields) {
   assert.ok(events.length > 0);
@@ -66,8 +76,17 @@ export function assertCapture(events, fields) {
       assert.equal(event.svc, 'api');
       assert.equal(event.level, event.event === 'node_warning' ? 'warn' : 'error');
       assert.ok(fields?.event_code?.values.includes(event.event_code));
-      assert.ok(Number.isSafeInteger(event.event_count) && event.event_count > 0);
       allowed = [...base, 'event_code', 'event_count'];
+      const typed = Object.hasOwn(typedDiagnostics, event.event_code) ? typedDiagnostics[event.event_code] : undefined;
+      if (typed) {
+        // Typed diagnostics are never reduced: one record per occurrence.
+        assert.equal(event.event_count, 1);
+        assert.equal(event.level, typed.level);
+        for (const name of typed.fields) assertTypedField(event[name], fields[name]);
+        allowed.push(...typed.fields);
+      } else {
+        assert.ok(Number.isSafeInteger(event.event_count) && event.event_count > 0);
+      }
     } else {
       assert.equal(event.event, 'logship_gate_summary_total');
       assert.equal(event.svc, 'logship');

@@ -17,6 +17,44 @@ const aliases = {
   '/public/<space_id>/kv?<prefix>': '/public/<space_id>/kv',
 };
 
+/**
+ * Compile each typed diagnostic into straight-line VRL: an exact (target,
+ * message) match, its fixed level, then one check per declared field taken
+ * from the schema. Any failure aborts the record; nothing undeclared is copied.
+ */
+function typedDiagnostics(diagnostics, fields) {
+  const codes = fields.event_code.values;
+  const untyped = new Set([...Object.keys(diagnostics.exact), ...Object.values(diagnostics.exact), ...Object.values(diagnostics.prefix)]);
+  return Object.entries(diagnostics.typed).map(([message, { target, level, fields: names }]) => {
+    if (!/^[a-z_]+$/.test(message) || !codes.includes(message) || untyped.has(message)) throw new TypeError(`typed diagnostic ${message} must be a distinct schema event code`);
+    if (!/^tinycloud(_core)?(::[a-z_]+)*$/.test(target) || !['warn', 'error'].includes(level)) throw new TypeError(`typed diagnostic ${message} has an invalid target or level`);
+    if (new Set(names).size !== names.length) throw new TypeError(`typed diagnostic ${message} repeats a field`);
+    const checks = names.map(name => {
+      const spec = fields[name];
+      if (!/^[a-z_]+$/.test(name) || !spec) throw new TypeError(`typed diagnostic field ${name} is not in the schema`);
+      const read = `v = get(f, [${JSON.stringify(name)}]) ?? null`;
+      if (spec.type === 'integer' && Number.isSafeInteger(spec.min) && Number.isSafeInteger(spec.max)) {
+        return `${read}\nif !is_integer(v) { abort }\nn = int!(v)\nif n < ${spec.min} || n > ${spec.max} { abort }\nout.${name} = n`;
+      }
+      if (spec.type === 'enum' && spec.values.every(value => /^[a-z_]+$/.test(value))) {
+        return `${read}\nif !is_string(v) || !includes(${JSON.stringify(spec.values)}, v) { abort }\nout.${name} = string!(v)`;
+      }
+      if (spec.type === 'string' && /^\^[^'\\]*\$$/.test(spec.regex) && Number.isSafeInteger(spec.max_len)) {
+        return `${read}\nif !is_string(v) { abort }\ns = string!(v)\nif length(s) > ${spec.max_len} || !match(s, r'${spec.regex}') { abort }\nout.${name} = s`;
+      }
+      throw new TypeError(`typed diagnostic field ${name} has no closed type`);
+    });
+    return [
+      `if target == ${JSON.stringify(target)} && msg == ${JSON.stringify(message)} {`,
+      '  typed = true',
+      `  if level != ${JSON.stringify(level)} { abort }`,
+      `  out = {"event": event, "svc": "api", "level": level, "event_code": ${JSON.stringify(message)}, "event_count": 1}`,
+      ...checks.join('\n').split('\n').map(line => `  ${line}`),
+      '}',
+    ].join('\n');
+  }).join('\n');
+}
+
 /** Compile one boundary for native tests, hosted Docker proof, and compose. */
 export function buildConfig({ sinkUri = 'https://s2795437.us-west-2a.betterstackdata.com/', dataDir = '/var/lib/vector', sourceAddress = '0.0.0.0:12201', token, profile = 'errors_slow', slowThresholdUs = 1000000, runtimeProfile = false } = {}) {
   if (!['errors_slow', 'all_requests'].includes(profile)) throw new TypeError('invalid logship profile');
@@ -25,10 +63,45 @@ export function buildConfig({ sinkUri = 'https://s2795437.us-west-2a.betterstack
   const profileExpression = runtimeProfile ? '"${TINYCLOUD_LOGSHIP_PROFILE}"' : JSON.stringify(profile);
   const schema = load('fields.json').services['tinycloud-node'];
   const diagnostics = load('diagnostics.json');
+  const typedCodes = JSON.stringify(Object.keys(diagnostics.typed));
+  const typedSource = typedDiagnostics(diagnostics, schema.fields);
+  const { records: typedLimit, window_secs: typedWindow } = diagnostics.typed_limit;
+  if (!Number.isSafeInteger(typedLimit) || typedLimit < 1 || !Number.isSafeInteger(typedWindow) || typedWindow < 1) throw new TypeError('invalid typed diagnostic limit');
+  const typedLimitSource = `local limit = ${typedLimit}
+local window = ${typedWindow}
+local started = 0
+local seen = {}
+local dropped = 0
+function init(emit)
+  started = os.time()
+end
+function process(event, emit)
+  local now = os.time()
+  if now - started >= window then
+    seen = {}
+    started = now
+  end
+  local code = event.log.event_code
+  local n = (seen[code] or 0) + 1
+  seen[code] = n
+  if n <= limit then
+    emit(event)
+  else
+    dropped = dropped + 1
+  end
+end
+function flush(emit)
+  if dropped > 0 then
+    emit({ log = { reason = "typed_throttled", count = dropped } })
+    dropped = 0
+  end
+end`;
+  // Function replacements: VRL regex literals contain `$'`, a replacement pattern.
   let sanitize = readFileSync(resolve(root, 'log-shipper/sanitize.vrl'), 'utf8')
     .replaceAll('__METHODS__', JSON.stringify(schema.fields.method.values))
     .replaceAll('__ROUTES__', JSON.stringify(schema.fields.route.values))
     .replace('__ROUTE_ALIASES__', JSON.stringify(aliases))
+    .replace('__TYPED_DIAGNOSTICS__', () => typedSource)
     .replace('__DIAGNOSTICS__', JSON.stringify(diagnostics.exact))
     .replace('__PREFIX_DIAGNOSTICS__', Object.entries(diagnostics.prefix).sort(([a], [b]) => a.length - b.length).map(([prefix, code]) => `if starts_with(msg, ${JSON.stringify(prefix)}) { code = ${JSON.stringify(code)} }`).join('\n'));
   const config = {
@@ -83,18 +156,24 @@ if reason != "" {
 }`),
       gate_route: { type: 'route', inputs: ['logship_gate'], route: { candidate: 'exists(.parsed)', rejected: 'exists(.reason)' } },
       allowlist: remap(['gate_route.candidate'], sanitize, { reroute_dropped: true }),
-      gate_counts: remap(['gate_route.rejected', 'gate_route._unmatched', 'allowlist.dropped', 'event_route._unmatched'], `reason = .reason
+      gate_counts: remap(['gate_route.rejected', 'gate_route._unmatched', 'allowlist.dropped', 'event_route._unmatched', 'typed_limit_route._unmatched'], `reason = .reason
 if !includes(${JSON.stringify(schema.fields.reason.values)}, reason) { reason = "invalid_fields" }
 . = {"reason": reason, "count": 1}`),
-      gate_reduce: { type: 'reduce', inputs: ['gate_counts'], group_by: ['reason'], end_every_period_ms: 60000, expire_after_ms: 75000, flush_period_ms: 1000, merge_strategies: { count: 'sum' } },
+      gate_reduce: { type: 'reduce', inputs: ['gate_counts', 'typed_limit_route.throttled'], group_by: ['reason'], end_every_period_ms: 60000, expire_after_ms: 75000, flush_period_ms: 1000, merge_strategies: { count: 'sum' } },
       gate_output: remap(['gate_reduce'], `. = {"ts": format_timestamp!(now(), format: "%Y-%m-%dT%H:%M:%S%.3fZ"), "level": "warn", "event": "logship_gate_summary_total", "svc": "logship", "reason": .reason, "count": .count}`),
       request_profile: { type: 'filter', inputs: ['allowlist'], condition: `${profileExpression} == "all_requests" || includes(["node_warning", "node_error"], .event) || (int(.status) ?? 0) >= 400 || (.event == "node_request" && (int(.latency_us) ?? 0) > ${slowThresholdUs}) || (.event == "ingress_request" && (to_float(.request_time_seconds) ?? 0.0) > ${(slowThresholdUs / 1000000).toFixed(6)})` },
-      event_route: { type: 'route', inputs: ['request_profile'], route: { request: '.event == "node_request" || .event == "ingress_request"', diagnostic: '.event == "node_warning" || .event == "node_error"' } },
+      // Typed diagnostics keep their per-occurrence fields; only untyped codes are counted by reduction.
+      event_route: { type: 'route', inputs: ['request_profile'], route: { request: '.event == "node_request" || .event == "ingress_request"', diagnostic: `(.event == "node_warning" || .event == "node_error") && !includes(${typedCodes}, .event_code)`, typed_diagnostic: `(.event == "node_warning" || .event == "node_error") && includes(${typedCodes}, .event_code)` } },
       diagnostic_reduce: { type: 'reduce', inputs: ['event_route.diagnostic'], group_by: ['event', 'event_code', 'level', 'svc'], end_every_period_ms: 60000, expire_after_ms: 75000, flush_period_ms: 1000, merge_strategies: { event_count: 'sum', ts: 'discard' } },
       diagnostic_output: remap(['diagnostic_reduce'], `. = {"ts": format_timestamp!(now(), format: "%Y-%m-%dT%H:%M:%S%.3fZ"), "level": .level, "event": .event, "svc": "api", "event_code": .event_code, "event_count": .event_count}`),
+      // Shipper-side cap, defence in depth over the node's own limiter: per event_code, at most
+      // `records` per fixed `window_secs` window. Excess records are dropped and only their count
+      // leaves, as the `typed_throttled` gate reason. Keys are the closed typed code set.
+      typed_limit: { type: 'lua', version: '2', inputs: ['event_route.typed_diagnostic'], source: typedLimitSource, hooks: { init: 'init', process: 'process', shutdown: 'flush' }, timers: [{ interval_seconds: 1, handler: 'flush' }] },
+      typed_limit_route: { type: 'route', inputs: ['typed_limit'], route: { record: '!exists(.reason)', throttled: 'exists(.reason)' } },
     },
     sinks: { betterstack: {
-      type: 'http', inputs: ['event_route.request', 'diagnostic_output', 'gate_output'], method: 'post', uri: sinkUri,
+      type: 'http', inputs: ['event_route.request', 'typed_limit_route.record', 'diagnostic_output', 'gate_output'], method: 'post', uri: sinkUri,
       encoding: { codec: 'json' }, framing: { method: 'newline_delimited' }, compression: 'gzip',
       auth: { strategy: 'bearer', token: token ?? 'SECRET[bs.bs_token]' },
       batch: { max_bytes: 262144, timeout_secs: 1 },
@@ -115,7 +194,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   const config = buildConfig({ profile, ...(sinkUri ? { sinkUri, token: 'tc959-synthetic-only' } : {}) });
   if (command === 'render-tests') {
     delete config.secret;
-    config.sinks = { discard: { type: 'blackhole', inputs: ['event_route.request', 'diagnostic_output', 'gate_output'] } };
+    config.sinks = { discard: { type: 'blackhole', inputs: config.sinks.betterstack.inputs } };
     config.tests = [...vectorTests, ...requestProfileTests(profile)];
   }
   writeFileSync(output, JSON.stringify(config, null, 2) + '\n');
