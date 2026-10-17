@@ -145,8 +145,6 @@ impl EscrowBundle {
         Ok(bundle)
     }
 
-    /// Structural checks. Every other method calls this first. Any recipient
-    /// kind passes here; apply a policy with [`check_recipients`](Self::check_recipients).
     /// Parse a bundle: version first, then strict fields, then [`validate`](Self::validate).
     pub fn from_json(bytes: &[u8]) -> Result<Self, EscrowError> {
         let bundle: Self = crate::parse_versioned(bytes, "escrow bundle", BUNDLE_VERSION)?;
@@ -154,6 +152,8 @@ impl EscrowBundle {
         Ok(bundle)
     }
 
+    /// Structural checks. Every other method calls this first. Any recipient
+    /// kind passes here; apply a policy with [`check_recipients`](Self::check_recipients).
     pub fn validate(&self) -> Result<(), EscrowError> {
         if self.version != BUNDLE_VERSION {
             return Err(EscrowError::Bundle("unsupported version"));
@@ -550,6 +550,16 @@ mod tests {
             ),
             "{err}"
         );
+        // Duplicate keys are refused (the typed parse sees them all).
+        let dup = String::from_utf8(json.clone()).unwrap().replacen(
+            "\"generation\":1",
+            "\"generation\":7,\"generation\":1",
+            1,
+        );
+        assert!(matches!(
+            EscrowBundle::from_json(dup.as_bytes()),
+            Err(EscrowError::Json { .. })
+        ));
         // Same version with an unknown field is still refused.
         let mut extra: serde_json::Value = serde_json::from_slice(&json).unwrap();
         extra["kdf"] = "new".into();

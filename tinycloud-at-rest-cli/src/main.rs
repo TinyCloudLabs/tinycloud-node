@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 mod attest;
+mod compose;
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -181,22 +182,41 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path, what: &str) -> Result<
         .map_err(|e| input_err(format!("parsing {what} {}: {e}", path.display())))
 }
 
+/// Loud warnings for holder kinds that need care: software keys, and
+/// `age1tag1` keys that the released plugin can't decrypt.
 fn warn_software(holders: &[HolderRecipient], kinds: &[RecipientKind]) {
     for (h, kind) in holders.iter().zip(kinds) {
-        if kind.is_software() {
-            eprintln!(
+        match kind {
+            RecipientKind::X25519 => eprintln!(
                 "!!! WARNING: holder {:?} uses an X25519 SOFTWARE key, not a hardware key. \
                  Accepted only because --allow-software was given (tests and self-host only). !!!",
                 h.holder
-            );
+            ),
+            RecipientKind::P256Tag => eprintln!(
+                "!!! WARNING: holder {:?} uses an age1tag1 (p256tag) recipient. The released \
+                 age-plugin-yubikey 0.5.1 CANNOT decrypt it; use the age1yubikey1 recipient \
+                 that `age-plugin-yubikey --list` prints. !!!",
+                h.holder
+            ),
+            RecipientKind::PivP256 => {}
         }
+    }
+}
+
+/// A file that isn't the expected JSON at all (a bad download, an HTML
+/// error page) is an input error (exit 3); a well-formed but unacceptable
+/// one is a refusal (exit 1).
+fn parse_err(e: tinycloud_at_rest_escrow::EscrowError) -> anyhow::Error {
+    match e {
+        tinycloud_at_rest_escrow::EscrowError::Json { .. } => input_err(e.to_string()),
+        other => other.into(),
     }
 }
 
 /// Read and validate a bundle, apply the recipient policy and `--expect-efp`.
 fn read_bundle(args: &BundleArgs) -> Result<(EscrowBundle, Vec<RecipientKind>)> {
     let bytes = read_file(&args.bundle, "bundle")?;
-    let bundle = EscrowBundle::from_json(&bytes)?;
+    let bundle = EscrowBundle::from_json(&bytes).map_err(parse_err)?;
     let kinds = bundle.check_recipients(args.software.policy())?;
     warn_software(&bundle.holders(), &kinds);
     if let Some(expected) = &args.expect_efp {
@@ -231,7 +251,8 @@ fn read_share_stdin(bundle: &EscrowBundle) -> Result<tinycloud_at_rest_escrow::S
 
 async fn verify_node(args: &NodeArgs) -> Result<(EscrowBundle, RecoveryInfo)> {
     let (bundle, _) = read_bundle(&args.bundle)?;
-    let info = RecoveryInfo::from_json(&read_file(&args.recovery, "recovery response")?)?;
+    let info = RecoveryInfo::from_json(&read_file(&args.recovery, "recovery response")?)
+        .map_err(parse_err)?;
     let trust: TrustPolicy = read_json(&args.trust, "trust policy")?;
     trust.validate()?;
     // Everything that needs no network first, so its cause is what's reported.
@@ -360,6 +381,8 @@ async fn run(cli: Cli) -> Result<()> {
                 &holders,
                 software.policy(),
             )?;
+            std::fs::create_dir_all(&out)
+                .map_err(|e| input_err(format!("creating {}: {e}", out.display())))?;
             let bundle_path = out.join("selftest-bundle.json");
             let share_path = out.join("selftest-share.age");
             std::fs::write(&bundle_path, serde_json::to_vec_pretty(&bundle)?)
@@ -432,13 +455,17 @@ async fn run(cli: Cli) -> Result<()> {
             let trust: TrustPolicy = read_json(&trust, "trust policy")?;
             trust.validate()?;
             let bytes = read_file(&app_compose, "app-compose.json")?;
-            let images = attest::check_app_compose(&bytes, &trust)?;
+            let report = attest::check_app_compose(&bytes, &trust)?;
             eprintln!(
-                "OK: app-compose.json matches compose_hash {}; every image is pinned by digest:",
+                "OK: app-compose.json matches compose_hash {}; every service's image is pinned by digest:",
                 trust.compose_hash
             );
-            for image in images {
-                eprintln!("    {image}");
+            for (service, image) in report.images {
+                eprintln!("    {service}: {image}");
+            }
+            eprintln!("Other settings the hash covers (review them):");
+            for line in report.settings {
+                eprintln!("    {line}");
             }
         }
         Command::VerifyNode(args) => {
@@ -457,7 +484,8 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::RecordEfp { bundle, record } => {
             let (bundle, _) = read_bundle(&bundle)?;
-            let record = VerificationRecord::from_json(&read_file(&record, "record")?)?;
+            let record =
+                VerificationRecord::from_json(&read_file(&record, "record")?).map_err(parse_err)?;
             record.covers(&bundle)?;
             eprintln!(
                 "NOT AUTHENTICATED: this record names escrow {} and claims shares {:?} and pairs {:?} (verified_at {}),",

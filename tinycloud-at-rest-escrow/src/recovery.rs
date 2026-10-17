@@ -49,7 +49,18 @@ pub struct RecoveryInfo {
 impl RecoveryInfo {
     /// Parse a node's answer: version first, then strict fields.
     pub fn from_json(bytes: &[u8]) -> Result<Self, EscrowError> {
-        crate::parse_versioned(bytes, "recovery response", RECOVERY_INFO_VERSION)
+        let info: Self = crate::parse_versioned(bytes, "recovery response", RECOVERY_INFO_VERSION)?;
+        let invalid = |reason: &str| EscrowError::Json {
+            what: "recovery response",
+            reason: reason.into(),
+        };
+        if !matches!(info.mode.as_str(), "dstack" | "classic") {
+            return Err(invalid("mode must be \"dstack\" or \"classic\""));
+        }
+        if !matches!(info.state.as_str(), "locked" | "unlocked") {
+            return Err(invalid("state must be \"locked\" or \"unlocked\""));
+        }
+        Ok(info)
     }
 }
 

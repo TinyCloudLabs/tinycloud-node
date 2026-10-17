@@ -172,6 +172,13 @@ pub fn check_tcb(td: &AttestedTd, trust: &TrustPolicy) -> Result<String> {
         td.advisory_ids,
         trust.allowed_tcb_status
     );
+    // A non-UpToDate class always comes with the advisories that caused it;
+    // one without any is anomalous.
+    ensure!(
+        accepted == AcceptedTcb::UpToDate || !td.advisory_ids.is_empty(),
+        "TDX TCB status {} carries no advisory IDs, which is anomalous; refused",
+        td.tcb_status
+    );
     let unpinned: Vec<&String> = td
         .advisory_ids
         .iter()
@@ -229,10 +236,18 @@ pub fn require_attested(info: &RecoveryInfo) -> Result<Vec<u8>> {
     Ok(quote)
 }
 
+/// What `verify-compose` found: each service's pinned image, plus the other
+/// app-compose settings the hash covers.
+#[derive(Debug)]
+pub struct ComposeReport {
+    pub images: Vec<(String, String)>,
+    pub settings: Vec<String>,
+}
+
 /// `compose-hash` pins container images only if the compose file names each
 /// image by digest. Check `app-compose.json` against the trust policy's
-/// `compose_hash`, and that every `image:` line carries `@sha256:`.
-pub fn check_app_compose(app_compose: &[u8], trust: &TrustPolicy) -> Result<Vec<String>> {
+/// `compose_hash`, then parse its compose YAML strictly (see `compose.rs`).
+pub fn check_app_compose(app_compose: &[u8], trust: &TrustPolicy) -> Result<ComposeReport> {
     let digest = hex::encode(Sha256::digest(app_compose));
     ensure!(
         digest == trust.compose_hash,
@@ -245,27 +260,10 @@ pub fn check_app_compose(app_compose: &[u8], trust: &TrustPolicy) -> Result<Vec<
         .get("docker_compose_file")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("app-compose.json has no docker_compose_file"))?;
-    let mut images = Vec::new();
-    for line in compose.lines() {
-        let trimmed = line.trim_start().trim_start_matches("- ");
-        let Some(rest) = trimmed.strip_prefix("image:") else {
-            continue;
-        };
-        let image = rest
-            .trim()
-            .trim_matches(|c| c == '"' || c == '\'')
-            .to_owned();
-        let pinned = image
-            .rsplit_once("@sha256:")
-            .is_some_and(|(_, d)| d.len() == 64 && d.bytes().all(|b| b.is_ascii_hexdigit()));
-        ensure!(
-            pinned,
-            "image {image:?} is not referenced by @sha256: digest"
-        );
-        images.push(image);
-    }
-    ensure!(!images.is_empty(), "the compose file names no images");
-    Ok(images)
+    Ok(ComposeReport {
+        images: crate::compose::pinned_images(compose)?,
+        settings: crate::compose::other_settings(&doc),
+    })
 }
 
 const RUNTIME_EVENT_TYPE: u32 = 0x0800_0001;
@@ -946,6 +944,11 @@ mod tests {
             assert!(ok.contains(SA), "{ok}");
         }
 
+        // A hardening class with no advisories at all is anomalous: refused.
+        let bare = real_quote_with_status(TcbStatus::SWHardeningNeeded, &[]).unwrap();
+        let err = check_tcb(&bare, &pinned).unwrap_err().to_string();
+        assert!(err.contains("anomalous"), "{err}");
+
         // Never accepted, whatever the policy says.
         for status in [
             TcbStatus::OutOfDate,
@@ -1061,7 +1064,7 @@ mod tests {
         ));
         let mut trust = scenario().trust;
         trust.compose_hash = hex::encode(Sha256::digest(&good));
-        assert_eq!(check_app_compose(&good, &trust).unwrap().len(), 2);
+        assert_eq!(check_app_compose(&good, &trust).unwrap().images.len(), 2);
 
         let tagged = app_compose(&format!(
             "services:\n  node:\n    image: ghcr.io/tinycloudlabs/tinycloud-node@sha256:{digest}\n  shipper:\n    image: vector:0.40\n"
