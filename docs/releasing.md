@@ -67,8 +67,10 @@ inside `deploy-phala`). Other refs fail `Deploy refused (main-only)`.
 
 **Release order:** approved #310 must never merge alone. Land #310 and its
 stacked recovery changes atomically as one lineage, preserving emergency
-re-promotion and security rollback first. #309's sidecar compose may then
-ship in the same window as a main release, promoted by one dispatch (see
+re-promotion and security rollback first. #309's sidecar compose then ships
+on the unchanged 1.20.6 image under that lineage's exact raw-hash lock. The
+later main release lands this template lock and the 95m ingress body cap,
+and is promoted by one dispatch (see
 [Main release with N0 log shipping](#main-release-with-n0-log-shipping-one-dispatch)).
 These docs grant no merge or dispatch authority. Merging either workflow
 change is a push, not a deployment dispatch.
@@ -263,9 +265,10 @@ its branch policy before any workflow that names it runs.
 
 ### Main release with N0 log shipping (one dispatch)
 
-Ships a main release and #309's log sidecar together. Before dispatching,
-`main` must contain the combined workflow lineage and #309, plus the merged
-`chore(release): 1.21.0` commit tagged `v1.21.0`. Take the digest and
+Ships a main release on #309's log sidecar compose. Before dispatching,
+`main` must contain the combined workflow lineage, #309, the template-lock
+change that also raises the ingress `CLIENT_MAX_BODY_SIZE` to `95m`, and the
+merged `chore(release): 1.21.0` commit tagged `v1.21.0`. Take the digest and
 labels of the tag build's `1.21.0-dstack` image as in step 1 above:
 
 ```sh
@@ -283,9 +286,12 @@ Before any CVM mutation the workflow requires:
 
 - the main compose, with its one node digest replaced by 64 zeros, to hash
   to the reviewed N0 template
-  **`92be17ff125e5d4cada9b81d7a8e655442fa66a454e19f76e3f8880a93123d3d`**
-  (#309's raw `ca110b0bae6d5a06a1002fb80df3f71cffec11659c9f9dbfa5d72624735546f6`
-  normalized). Ingress, socat, Vector and the log profile stay byte-exact;
+  **`92641ed5bd5dbd30055c86ba4a23f7ff87dfb48be2aef36e584822b9db64b230`**
+  (raw `b0cd8248aafa0b461d6430f836793a7530e0b73f713677c2bcee38540d805e4e`
+  normalized: #309's approved
+  `ca110b0bae6d5a06a1002fb80df3f71cffec11659c9f9dbfa5d72624735546f6` with
+  only `CLIENT_MAX_BODY_SIZE=32m` → `95m`). Ingress, socat, Vector and the
+  log profile stay byte-exact;
 - the deployed compose to differ from that template only by
   `deploy_image_digest`;
 - OCI labels `1.21.0-dstack` / `<release-commit-sha>`, the `v1.21.0` tag on
@@ -338,11 +344,10 @@ gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref main \
 ```
 
 The served/OCI identity remains **1.20.6-dstack / e18578ff9162986ddd813259c60f73866e3e60d1**.
-With #309 on main this redeploys exactly #309's reviewed raw compose
-`ca110b0bae6d5a06a1002fb80df3f71cffec11659c9f9dbfa5d72624735546f6`
-(from reviewed head `44eeb20a1461ef66b5af492e3be4c42be2728b67`,
-[approval](https://github.com/TinyCloudLabs/tinycloud-node/pull/309#issuecomment-6224650050)),
-whatever digest main's template currently pins. It is not a rollback of a
+With the template lock on main this redeploys exactly main's raw compose
+`b0cd8248aafa0b461d6430f836793a7530e0b73f713677c2bcee38540d805e4e`
+(#309's approved bytes plus the 95m ingress body cap), whatever digest
+main's template currently pins. It is not a rollback of a
 later release across a schema migration. Current pre-N0 tag/pinned
 equivalents are separately hash-checked; arbitrary same-image config
 substitutions fail before mutation.

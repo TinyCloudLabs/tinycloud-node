@@ -318,6 +318,7 @@ class RecoveryTests(unittest.TestCase):
         node_line = b"    image: ghcr.io/tinycloudlabs/tinycloud-node@" + DIGEST.encode() + b"\n"
         for name, compose in (("profile", N0.replace(b":-errors_slow}", b":-all_requests}")),
                               ("ingress", N0.replace(b"63c1c44e2ded5b73a5f174807b91ca677826974df0f9ab3045f6ec87865a5744", b"e" * 64)),
+                              ("approved pre-cap bytes", N0.replace(b"CLIENT_MAX_BODY_SIZE=95m", b"CLIENT_MAX_BODY_SIZE=32m")),
                               ("crlf", N0.replace(b"\n", b"\r\n")),
                               ("duplicate node", N0.replace(node_line, node_line * 2)),
                               ("quoted node", N0.replace(b"@" + DIGEST.encode(), b"@" + DIGEST.encode() + b"'").replace(

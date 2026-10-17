@@ -663,9 +663,10 @@ jobs:
               raise SystemExit('::error::Deployment destination is not the fixed reviewed path')
           native = 'ghcr.io/tinycloudlabs/tinycloud-node'
           reviewed = native + '@sha256:4bdae4fc232d886bb56bfbce4ec62ed4b8fb4e1369a01f6afb73d06dd68c188f'
-          # TC-959: #309's reviewed N0 compose (raw ca110b0b… with the 1.20.6
-          # pin) with its single node digest normalized to 64 zeros.
-          n0_template_hash = '92be17ff125e5d4cada9b81d7a8e655442fa66a454e19f76e3f8880a93123d3d'
+          # TC-959: #309's approved N0 compose (raw ca110b0b…) plus the 95m
+          # ingress body cap (raw b0cd8248… with the 1.20.6 pin), with its
+          # single node digest normalized to 64 zeros.
+          n0_template_hash = '92641ed5bd5dbd30055c86ba4a23f7ff87dfb48be2aef36e584822b9db64b230'
           node_pin = re.compile(rb'(?m)^    image: ghcr\.io/tinycloudlabs/tinycloud-node@sha256:([0-9a-f]{64})$')
           def n0_template(raw):
               pins = list(node_pin.finditer(raw))
