@@ -72,6 +72,16 @@ release = false
 publish = false
 
 [[package]]
+name = "tinycloud-at-rest-escrow"
+release = false
+publish = false
+
+[[package]]
+name = "tinycloud-at-rest-cli"
+release = false
+publish = false
+
+[[package]]
 name = "tinycloud-sdk-wasm"
 release = false
 publish = false

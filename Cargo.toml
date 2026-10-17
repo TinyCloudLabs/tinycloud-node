@@ -8,6 +8,8 @@ members = [
     "tinycloud-verifier-wasm",
     "tinycloud-sdk-rs",
     "tinycloud-core",
+    "tinycloud-at-rest-escrow",
+    "tinycloud-at-rest-cli",
     "dependencies/siwe",
     "dependencies/siwe-recap",
     "dependencies/cacao",
