@@ -20,7 +20,7 @@ set -Eeuo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 SCRATCH_ROOT=${TC887_SCRATCH_ROOT:-$HOME/scratch/tc887}
 BIN_DIR=${TC887_BIN_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/tc887-harness/bin}
-STATE_SCHEMA=tc887-at-rest-harness/v3
+STATE_SCHEMA=tc887-at-rest-harness/v4
 
 # Pinned MinIO community releases (linux-amd64). dl.min.io no longer serves
 # community binaries (HTTP 410), so these come from the archived GitHub
@@ -322,6 +322,9 @@ TC887_S3_BUCKET=$BUCKET
 TC887_S3_REGION=$REGION
 TC887_S3_ACCESS_KEY_ID=$minio_user
 TC887_S3_SECRET_ACCESS_KEY=$minio_password
+TC887_NODE_ROOT_FILE=$run/secrets/node-static-secret
+TC887_SPACES_LOG=$run/spaces.log
+TC887_BOOT_SNAPSHOT=$run/boot-snapshot
 EOF
   # The node's whole environment; sourced inside the child, never on argv.
   # memory_threshold=0 keeps SQL databases file-backed, so writes after the
@@ -408,10 +411,52 @@ EOF
   write_state "$run" starting
   wait_http "$node_url/healthz" "$UP_NODE_PID" tinycloud-node "${TC887_NODE_READY_SECS:-180}"
 
+  # ---- boot snapshot: every object as the node left it at boot, before any
+  # test write (the at-rest key mirror writes ARK/escrow objects here).
+  MC_HOST_tc887="http://$minio_user:$minio_password@127.0.0.1:$minio_port" \
+    snapshot_bucket "$run"
+
   write_state "$run" up
   trap - EXIT INT TERM
   log "up: state file $run/state.json"
   printf '%s\n' "$run/state.json"
+}
+
+# Copy every object of the harness bucket into $1/boot-snapshot as N.bin, with
+# index.json mapping each object key to its file. Keys never become paths.
+# Needs MC_HOST_tc887 (credentials) in the environment.
+snapshot_bucket() {
+  local run=$1 dir=$1/boot-snapshot i=0 key count
+  mkdir -p "$dir"
+  MC_CONFIG_DIR=$run/mc "$BIN_DIR/mc" --quiet ls --recursive --json "tc887/$BUCKET" \
+    >"$dir/listing.jsonl" 2>>"$run/logs/mc.log"
+  while IFS= read -r -d '' key; do
+    MC_CONFIG_DIR=$run/mc "$BIN_DIR/mc" --quiet cat "tc887/$BUCKET/$key" \
+      >"$dir/$i.bin" 2>>"$run/logs/mc.log"
+    i=$((i + 1))
+  done < <(python3 - "$dir" <<'PY'
+import json, os, sys
+out = sys.argv[1]
+keys = []
+with open(os.path.join(out, "listing.jsonl")) as f:
+    for line in f:
+        if not line.strip():
+            continue
+        entry = json.loads(line)
+        if entry.get("status") != "success":
+            sys.exit("mc ls reported an error")
+        if entry.get("type") == "file":
+            keys.append(entry["key"])
+index = [{"key": k, "file": f"{i}.bin"} for i, k in enumerate(keys)]
+with open(os.path.join(out, "index.json"), "w") as f:
+    json.dump(index, f, indent=1)
+for k in keys:
+    sys.stdout.write(k + "\0")
+PY
+)
+  count=$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))))' "$dir/index.json")
+  [[ "$count" == "$i" ]] || die "boot snapshot: listed $count objects, copied $i"
+  log "boot snapshot: $i object(s) in $dir"
 }
 
 # write_state RUN STATUS; PIDs come from UP_*, the rest from STATE_* env.

@@ -53,6 +53,12 @@ pub struct KeyringConfig {
     /// mirror that can't be written is logged and the database alone serves,
     /// so mirror contents never stop a node that encrypts nothing.
     pub require_mirror: bool,
+    /// `at_rest.escrow.allow_resplit_before_verify`: let a holder change
+    /// re-split at boot, but only while nothing is pinned, the active
+    /// escrow has no verified ceremony record, and no data key has ever
+    /// been made (so nothing was ever sealed). For fixing a wrong holder
+    /// before the ceremony; otherwise a holder change refuses the boot.
+    pub allow_resplit_before_verify: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -67,8 +73,10 @@ pub enum AtRestError {
     Conflict(&'static str),
     #[error("at_rest.escrow.verified_fp pins an escrow that is not for the configured recipients and the newest key; the node never re-splits while a fingerprint is pinned")]
     EscrowPinned,
-    #[error("the configured escrow recipients differ from the active escrow bundle's; the node never re-splits on its own (an explicit re-escrow is needed)")]
+    #[error("the configured escrow recipients differ from the active escrow bundle's; the node never re-splits on its own (before the ceremony, at_rest.escrow.allow_resplit_before_verify allows it; afterwards an explicit re-escrow is needed)")]
     EscrowHoldersChanged,
+    #[error("a space's data key is unavailable: {0}")]
+    DekUnavailable(&'static str),
     #[error("at-rest escrow: {0}")]
     Escrow(#[from] EscrowError),
     #[error("at-rest keys are locked")]
@@ -89,6 +97,7 @@ impl AtRestError {
                 | Self::Conflict(_)
                 | Self::Locked
                 | Self::NotProvisioned
+                | Self::DekUnavailable(_)
         )
     }
 
@@ -102,6 +111,7 @@ impl AtRestError {
             Self::Conflict(why) => format!("conflict: {why}"),
             Self::EscrowPinned => "escrow_pinned".into(),
             Self::EscrowHoldersChanged => "escrow_holders_changed".into(),
+            Self::DekUnavailable(why) => format!("dek_unavailable: {why}"),
             Self::Escrow(e) => format!("escrow: {e}"),
             Self::Locked => "locked".into(),
             Self::NotProvisioned => "not_provisioned".into(),
@@ -811,14 +821,20 @@ impl AtRestKeyring {
                     "the active escrow bundle is for another ARK",
                 ));
             }
-            if bundle.holders() != self.config.holders {
+            if bundle.holders() == self.config.holders {
+                self.mirror_soft(self.mirror_escrow(&row).await)?;
+                if row.record.is_none() {
+                    self.restore_record(&gen.ark, &bundle).await?;
+                }
+                return Ok(());
+            }
+            if !self.may_resplit(&bundle).await? {
                 return Err(AtRestError::EscrowHoldersChanged);
             }
-            self.mirror_soft(self.mirror_escrow(&row).await)?;
-            if row.record.is_none() {
-                self.restore_record(&gen.ark, &bundle).await?;
-            }
-            return Ok(());
+            tracing::warn!(
+                generation = g,
+                "re-splitting an unverified escrow for corrected holders (allow_resplit_before_verify); the ceremony starts over"
+            );
         }
         let wanted = |b: &EscrowBundle| {
             b.holders() == self.config.holders && b.ark_id == gen.ark_id && b.generation == g
@@ -879,6 +895,16 @@ impl AtRestKeyring {
             }
         }
         Ok(())
+    }
+
+    /// A holder change may re-split only when explicitly allowed, nothing is
+    /// pinned, the active escrow was never verified, and no data key has
+    /// ever been made.
+    async fn may_resplit(&self, active: &EscrowBundle) -> Result<bool, AtRestError> {
+        Ok(self.config.allow_resplit_before_verify
+            && self.config.pinned_efp.is_none()
+            && self.verified_record(active).await?.is_none()
+            && !self.store.has_space_keys().await?)
     }
 
     /// A ceremony record for `bundle` from the mirror, stored only if its
@@ -1348,8 +1374,29 @@ impl AtRestKeyring {
         Some((row, key))
     }
 
+    /// The mirror object holding a space's DEK, as bytes. An object that is
+    /// present but too large to be one fails closed for the space: it must
+    /// never read as "absent", or a new DEK would be made and mirrored over
+    /// it.
+    async fn dek_object(&self, name: &str) -> Result<Option<Vec<u8>>, DataKeyError> {
+        match self.mirror.get(name).await {
+            Ok(bytes) => Ok(bytes),
+            Err(e) if e.is::<MirrorObjectTooLarge>() => Err(backend(AtRestError::DekUnavailable(
+                "the mirrored object for this data key is oversized",
+            ))),
+            Err(e) => Err(backend(mirror_err(e))),
+        }
+    }
+
     /// A space's DEK row from the mirror, put back into the database once
-    /// it authenticates. Anything else in the mirror is ignored (warned).
+    /// it authenticates.
+    ///
+    /// A mirrored object that doesn't authenticate is **never ignored**: it
+    /// may be the genuine key under an ARK generation this node hasn't
+    /// loaded (a restore plus a failed boot read), and making a new DEK
+    /// would strand everything sealed under it. The space fails closed
+    /// ([`AtRestError::DekUnavailable`], a 503) until the generation loads
+    /// or an operator removes the object.
     async fn restore_dek(
         &self,
         keys: &Keys,
@@ -1357,18 +1404,25 @@ impl AtRestKeyring {
         dek_id: u32,
     ) -> Result<Option<space_data_key::Model>, DataKeyError> {
         let name = dek_mirror_name(&keys.dek_tag.tag(space), dek_id);
-        let Some(bytes) = get_capped(&*self.mirror, &name)
-            .await
-            .map_err(|e| backend(mirror_err(e)))?
-        else {
+        let Some(bytes) = self.dek_object(&name).await? else {
             return Ok(None);
         };
         let Some((row, _)) = Self::authentic_mirrored_dek(keys, space, dek_id, &bytes) else {
-            tracing::warn!(
+            let newest = keys.newest().0;
+            let names_unloaded_generation =
+                serde_json::from_slice::<MirroredDek>(&bytes).is_ok_and(|m| m.generation > newest);
+            tracing::error!(
                 dek_id,
-                "ignoring a mirrored data key that does not authenticate for its space"
+                names_unloaded_generation,
+                "a mirrored data key for this space does not authenticate; refusing to make a new one"
             );
-            return Ok(None);
+            return Err(backend(AtRestError::DekUnavailable(
+                if names_unloaded_generation {
+                    "the mirrored data key names an ARK generation this node hasn't loaded; restart once the key mirror is readable"
+                } else {
+                    "the mirror holds a data key object for this space that does not authenticate"
+                },
+            )));
         };
         tracing::warn!(
             dek_id,
@@ -1382,10 +1436,9 @@ impl AtRestKeyring {
     }
 
     /// Make sure the mirror holds exactly this DEK row before any object is
-    /// sealed under it. A *genuine* different DEK under the same id means
-    /// objects may exist under another key: refuse, never overwrite. A
-    /// mirror object that doesn't authenticate carries no key and is
-    /// replaced.
+    /// sealed under it. An existing object is never overwritten: if it
+    /// isn't this exact row (a genuine different key, junk, or a key under
+    /// a generation not loaded), the space fails closed.
     async fn mirror_dek(
         &self,
         keys: &Keys,
@@ -1393,24 +1446,15 @@ impl AtRestKeyring {
     ) -> Result<(), DataKeyError> {
         let dek_id = row.dek_id as u32;
         let name = dek_mirror_name(&keys.dek_tag.tag(&row.space), dek_id);
-        let existing = get_capped(&*self.mirror, &name)
-            .await
-            .map_err(|e| backend(mirror_err(e)))?;
-        if let Some(bytes) = existing {
-            match Self::authentic_mirrored_dek(keys, &row.space, dek_id, &bytes) {
+        if let Some(bytes) = self.dek_object(&name).await? {
+            return match Self::authentic_mirrored_dek(keys, &row.space, dek_id, &bytes) {
                 Some((m, _)) if m.generation == row.generation && m.wrapped == row.wrapped => {
-                    return Ok(())
+                    Ok(())
                 }
-                Some(_) => {
-                    return Err(backend(AtRestError::Inconsistent(
-                        "the mirror holds a different data key with this id",
-                    )))
-                }
-                None => tracing::warn!(
-                    dek_id,
-                    "replacing a mirrored data key that does not authenticate for its space"
-                ),
-            }
+                _ => Err(backend(AtRestError::DekUnavailable(
+                    "the mirror holds different bytes for this data key; it is never overwritten",
+                ))),
+            };
         }
         let body = serde_json::to_vec(&MirroredDek::from_row(row)).expect("serializable");
         self.mirror
