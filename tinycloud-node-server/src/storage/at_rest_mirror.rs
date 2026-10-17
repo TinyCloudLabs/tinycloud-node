@@ -174,15 +174,17 @@ impl KeyMirror for FsKeyMirror {
         Ok(())
     }
 
-    /// A regular file only: a symlink is never followed (`O_NOFOLLOW`) and a
-    /// directory or other non-file counts as absent. The read is bounded
-    /// by [`MAX_MIRROR_OBJECT`] whatever the file claims its size is.
+    /// A regular file only: a symlink is never followed (`O_NOFOLLOW`), the
+    /// open never blocks (`O_NONBLOCK`, so a FIFO can't hang it), and a
+    /// directory, FIFO or other non-file counts as absent (checked with
+    /// `fstat` on the open handle). The read is bounded by
+    /// [`MAX_MIRROR_OBJECT`] whatever the file claims its size is.
     async fn get(&self, name: &str) -> Result<Option<Vec<u8>>, MirrorError> {
         use tokio::io::AsyncReadExt as _;
         let path = self.path(name)?;
         let file = tokio::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(&path)
             .await;
         let file = match file {
@@ -291,6 +293,12 @@ mod tests {
         let secret = dir.path().join("secret");
         std::fs::write(&secret, b"not a mirror object").unwrap();
         std::os::unix::fs::symlink(&secret, at_rest.join("ark-0000000002-s.json")).unwrap();
+        // A FIFO under a name the node reads directly (escrow and record
+        // names are public): opening it used to block forever.
+        let fifo =
+            std::ffi::CString::new(at_rest.join("escrow-ff.json").to_str().unwrap().as_bytes())
+                .unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
 
         assert_eq!(
             m.list("_tc/at-rest/ark-").await.unwrap(),
@@ -300,8 +308,12 @@ mod tests {
             "_tc/at-rest/ark-0000000002-d.json",
             "_tc/at-rest/ark-0000000002-z.json",
             "_tc/at-rest/ark-0000000002-s.json",
+            "_tc/at-rest/escrow-ff.json",
         ] {
-            assert_eq!(m.get(planted).await.unwrap(), None, "{planted}");
+            let got = tokio::time::timeout(std::time::Duration::from_secs(5), m.get(planted))
+                .await
+                .unwrap_or_else(|_| panic!("{planted}: get hung"));
+            assert_eq!(got.unwrap(), None, "{planted}");
         }
         // A regular file over the cap is refused without reading it all.
         std::fs::write(

@@ -92,6 +92,12 @@ pub struct AtRestEscrowConfig {
     /// Accept X25519 software-key holders (tests and self-host only).
     #[serde(default)]
     pub allow_software: bool,
+    /// Before the escrow ceremony only: let a corrected holder list re-split
+    /// the escrow at boot. The node allows it only while no fingerprint is
+    /// pinned, the escrow was never verified, and no data key was ever made;
+    /// otherwise a holder change still refuses the boot.
+    #[serde(default)]
+    pub allow_resplit_before_verify: bool,
 }
 
 /// Production exact-email composition.  The capability remains unavailable

@@ -136,9 +136,10 @@ escrow_none = false     # self-hosted Static-root nodes only (refused in a TEE)
 recipients = [ { holder = "sam", recipient = "age1yubikey1…" }, … ]   # exactly 3
 verified_fp = "<efp>"   # after the ceremony (record-efp)
 allow_software = false  # X25519 holders; tests and self-host only, refused in a TEE
+allow_resplit_before_verify = false  # before the ceremony only: let corrected holders re-split
 ```
 
-The same settings as compose env: `TINYCLOUD_AT_REST__MODE`, `TINYCLOUD_AT_REST__ESCROW_NONE`, `TINYCLOUD_AT_REST__ESCROW__RECIPIENTS=[{holder="…",recipient="…"},…]`, `TINYCLOUD_AT_REST__ESCROW__VERIFIED_FP`, `TINYCLOUD_AT_REST__ESCROW__ALLOW_SOFTWARE`.
+The same settings as compose env: `TINYCLOUD_AT_REST__MODE`, `TINYCLOUD_AT_REST__ESCROW_NONE`, `TINYCLOUD_AT_REST__ESCROW__RECIPIENTS=[{holder="…",recipient="…"},…]`, `TINYCLOUD_AT_REST__ESCROW__VERIFIED_FP`, `TINYCLOUD_AT_REST__ESCROW__ALLOW_SOFTWARE`, `TINYCLOUD_AT_REST__ESCROW__ALLOW_RESPLIT_BEFORE_VERIFY`.
 
 - **Recipients set, `mode = "off"`:**
   - at boot the node creates the ARK (sealed under its root) and the escrow bundle;
@@ -147,7 +148,8 @@ The same settings as compose env: `TINYCLOUD_AT_REST__MODE`, `TINYCLOUD_AT_REST_
 - **`encrypt` and `strict` are refused at boot in this build.** Block storage has no seal path yet, so the node won't claim to encrypt while it writes plaintext; `/info` never shows `encrypting: true`. Storage turns the capability on when the seal path lands (TC-887 S3). From then on, `encrypt` or `strict` refuses to start unless the recipients equal the bundle's, `verified_fp` equals its EFP, and the stored ceremony record verifies under the key inside the TEE. A Static-root node with no recipients may use `escrow_none = true` instead, which acknowledges that no escrow exists.
 - **In a TEE, the escrow recipients and `verified_fp` must be literal values in the measured compose.** With any at-rest config, the node reads its `app-compose.json` from the guest agent (`/Info`, `tcb_info.app_compose`), checks it against `compose_hash`, and refuses to boot unless `TINYCLOUD_AT_REST__ESCROW__RECIPIENTS` and `TINYCLOUD_AT_REST__ESCROW__VERIFIED_FP` are set there as literals (no `${…}`, no pass-through) equal to the effective config. Values from the encrypted environment, a file or anywhere else are refused. If the app-compose can't be read or parsed, the node refuses to boot. The `/Info` shape must be confirmed on a live CVM before the escrow ceremony.
 - **The escrow bundle is made or changed only at boot, never by a request.** Every endpoint below only reads it.
-  - If the configured recipients differ from the active bundle's, the node refuses to boot: it never re-splits on its own. Changing a holder needs an explicit re-escrow (a follow-up, with the rotation tooling in TC-1345).
+  - If the configured recipients differ from the active bundle's, the node refuses to boot: it never re-splits on its own. Changing a holder after the ceremony needs an explicit re-escrow (a follow-up, with the rotation tooling in TC-1345).
+  - **Fixing a wrong holder before the ceremony:** set `allow_resplit_before_verify = true` together with the corrected recipients. The node re-splits at boot only if no fingerprint is pinned, the active escrow has no verified ceremony record, and no data key was ever made (so nothing was ever sealed). If any of those fails, it still refuses to boot. Remove the flag after the re-split.
   - With `verified_fp` set, the node uses only the pinned bundle, restoring it from the block store if the database lost it, and refuses to boot if that bundle is not for the configured recipients and the newest key.
 - **If the node's root can no longer unseal the key** (new app id or KMS), it boots **locked**:
   - `/info` shows `at_rest.state = "locked"` and encryption is unavailable;
@@ -170,7 +172,7 @@ The share endpoint:
 
 Shares live in memory for the current boot only.
 
-A keyring failure answers `503` when a retry may help (`store_unavailable`, `mirror_unavailable`, `locked`, `conflict: …`) and `500` when an operator must act (`inconsistent: …`, `escrow_pinned`, `escrow_holders_changed`, `escrow: …`). The reason never contains key material or backend detail; the server log has the rest.
+A keyring failure answers `503` when a retry may help (`store_unavailable`, `mirror_unavailable`, `locked`, `conflict: …`, `dek_unavailable: …`) and `500` when an operator must act (`inconsistent: …`, `escrow_pinned`, `escrow_holders_changed`, `escrow: …`). The reason never contains key material or backend detail; the server log has the rest.
 
 **Recovery is per node.** Each boot has its own recovery key, so a share wrapped for one node is rejected by another. With several nodes on one database:
 - recover one node, by its own address (not through a load balancer);
@@ -181,7 +183,8 @@ Production runs one node per database. Multi-node recovery is a known limitation
 
 ### Key continuity
 
-- **Database restored to an earlier point.** At boot the node takes back a key generation or chain from the block-store copy only once it authenticates: the newest under this node's root, each older one by its chain. During recovery, the recovered key authenticates them. Anything else in the copy (forged, junk, a gap, an oversized object) is skipped with a warning and never stored, so write access to the bucket can neither lock the node nor stop it booting while the database is healthy. A space's data key missing from the database is restored from its copy only if its wrap authenticates for that space, before a new one would be made; if a *genuine* different key exists under the same id, the node refuses to use it.
+- **Database restored to an earlier point.** At boot the node takes back a key generation or chain from the block-store copy only once it authenticates: the newest under this node's root, each older one by its chain. During recovery, the recovered key authenticates them. Anything else in the copy (forged, junk, a gap, an oversized object) is skipped with a warning and never stored, so write access to the bucket can neither lock the node nor stop it booting while the database is healthy.
+- **Data keys after a restore.** A space's data key missing from the database is restored from its copy only if its wrap authenticates for that space. A copy that exists but doesn't authenticate is never ignored and never overwritten: it may be the genuine key under a generation the node hasn't loaded (for example after a failed read at boot). That space answers `503 dek_unavailable` until the generation loads or an operator removes the object; no new key is made over it.
 - **No key is ever made over existing material.** The node creates a new root key only when the database has no key, escrow or data-key rows and the block store has nothing under `_tc/at-rest/`. A store or mirror error stops the boot instead, and so does an empty database whose block-store copy holds nothing usable.
 - **Escrow and ceremony record after a restore.** A bundle or record the database lost is restored from the block store at boot, so a restore doesn't force a new ceremony: the pinned bundle (the pin authenticates it), or, unpinned, a bundle whose mirrored ceremony record verifies under the key. A record is restored only if its MAC verifies under the key.
 - **Generations.** Each older generation is sealed under the next one's key (its chain), so escrowing the newest generation recovers all of them. At boot under the same root, a missing or broken chain is rebuilt and logged. During recovery under a new root it can't be rebuilt, and the shares are refused with the reason. The newest generation never keeps a chain: a stale one is cleared at boot.

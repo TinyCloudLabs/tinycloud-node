@@ -313,6 +313,7 @@ pub async fn setup(
             // Once keys may seal data, the mirror must hold a copy of every
             // key; with mode off, mirror contents never stop the node.
             require_mirror: config.mode != AtRestMode::Off,
+            allow_resplit_before_verify: escrow.allow_resplit_before_verify,
         },
     )
     .await
@@ -474,6 +475,7 @@ mod tests {
             recipients: value.deserialize().unwrap(),
             verified_fp: fp.map(str::to_owned),
             allow_software: false,
+            allow_resplit_before_verify: false,
         }
     }
 
