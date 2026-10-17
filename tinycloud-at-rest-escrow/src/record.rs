@@ -36,6 +36,11 @@ pub struct VerificationRecord {
 }
 
 impl VerificationRecord {
+    /// Parse a record: version first, then strict fields.
+    pub fn from_json(bytes: &[u8]) -> Result<Self, EscrowError> {
+        crate::parse_versioned(bytes, "verification record", RECORD_VERSION)
+    }
+
     /// TEE only. Seal a record for a test-unlock of `bundle`.
     pub fn seal(
         ark: &Ark,
@@ -136,7 +141,9 @@ mod tests {
 
     fn sealed() -> (Ark, EscrowBundle, VerificationRecord) {
         let (ark, ark_id, holders, ids) = escrow_fixture();
-        let bundle = EscrowBundle::create(&ark, ark_id, 1, &holders).unwrap();
+        let bundle =
+            EscrowBundle::create(&ark, ark_id, 1, &holders, RecipientPolicy::AllowSoftware)
+                .unwrap();
         let unlock = bundle.test_unlock(&ark, &open_all(&bundle, &ids)).unwrap();
         let record = VerificationRecord::seal(
             &ark,
@@ -181,7 +188,14 @@ mod tests {
     fn record_does_not_cover_a_different_or_partial_escrow() {
         let (ark, bundle, record) = sealed();
         // Same ARK, re-split to the same holders: new ciphertexts, new EFP.
-        let resplit = EscrowBundle::create(&ark, bundle.ark_id, 1, &bundle.holders()).unwrap();
+        let resplit = EscrowBundle::create(
+            &ark,
+            bundle.ark_id,
+            1,
+            &bundle.holders(),
+            RecipientPolicy::AllowSoftware,
+        )
+        .unwrap();
         assert!(record.verify(&ark, &resplit).is_err());
 
         let mut partial = record.clone();

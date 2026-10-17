@@ -6,7 +6,9 @@ use serde::{Deserialize, Serialize};
 use vsss_rs::Gf256;
 use zeroize::Zeroizing;
 
-use crate::recipients::{parse, validate_holders, HolderRecipient, ParsedRecipient};
+use crate::recipients::{
+    parse, validate_holders, HolderRecipient, ParsedRecipient, RecipientKind, RecipientPolicy,
+};
 use crate::share::{SharePayload, PAYLOAD_LEN};
 use crate::{
     canary_fingerprint, lp, sha256, Ark, ArkId, Digest32, Efp, EscrowError, HOLDERS, THRESHOLD,
@@ -95,6 +97,7 @@ fn combine(a: &SharePayload, b: &SharePayload) -> Result<Ark, EscrowError> {
 
 impl EscrowBundle {
     /// TEE only. Split `ark` 2-of-3 and seal share i to `holders[i]`.
+    /// Software (X25519) holders are refused unless `policy` allows them.
     ///
     /// Before returning, every pair of fresh shares is combined and compared
     /// with `ark`, so a split that can't be recovered never leaves this call.
@@ -103,8 +106,9 @@ impl EscrowBundle {
         ark_id: ArkId,
         generation: u32,
         holders: &[HolderRecipient],
+        policy: RecipientPolicy,
     ) -> Result<Self, EscrowError> {
-        validate_holders(holders)?;
+        validate_holders(holders, policy)?;
         let split = Zeroizing::new(
             Gf256::split_array(
                 usize::from(THRESHOLD),
@@ -145,7 +149,15 @@ impl EscrowBundle {
         Ok(bundle)
     }
 
-    /// Structural checks. Every other method calls this first.
+    /// Structural checks. Every other method calls this first. Any recipient
+    /// kind passes here; apply a policy with [`check_recipients`](Self::check_recipients).
+    /// Parse a bundle: version first, then strict fields, then [`validate`](Self::validate).
+    pub fn from_json(bytes: &[u8]) -> Result<Self, EscrowError> {
+        let bundle: Self = crate::parse_versioned(bytes, "escrow bundle", BUNDLE_VERSION)?;
+        bundle.validate()?;
+        Ok(bundle)
+    }
+
     pub fn validate(&self) -> Result<(), EscrowError> {
         if self.version != BUNDLE_VERSION {
             return Err(EscrowError::Bundle("unsupported version"));
@@ -169,8 +181,18 @@ impl EscrowBundle {
                 ));
             }
         }
-        validate_holders(&self.holders())?;
+        validate_holders(&self.holders(), RecipientPolicy::AllowSoftware)?;
         Ok(())
+    }
+
+    /// The holders' recipient kinds, refusing software holders unless
+    /// `policy` allows them.
+    pub fn check_recipients(
+        &self,
+        policy: RecipientPolicy,
+    ) -> Result<Vec<RecipientKind>, EscrowError> {
+        self.validate()?;
+        validate_holders(&self.holders(), policy)
     }
 
     /// The holders and recipients, in index order.
@@ -299,7 +321,9 @@ mod tests {
     #[test]
     fn create_then_two_holders_recover_and_one_cannot() {
         let (ark, ark_id, holders, ids) = escrow_fixture();
-        let bundle = EscrowBundle::create(&ark, ark_id, 1, &holders).unwrap();
+        let bundle =
+            EscrowBundle::create(&ark, ark_id, 1, &holders, RecipientPolicy::AllowSoftware)
+                .unwrap();
         let shares = open_all(&bundle, &ids);
 
         for (a, b) in [(0, 1), (0, 2), (1, 2), (2, 0)] {
@@ -319,11 +343,13 @@ mod tests {
         // splits of the same ARK give unrelated share bytes.
         let (ark, ark_id, holders, ids) = escrow_fixture();
         let a = open_all(
-            &EscrowBundle::create(&ark, ark_id, 1, &holders).unwrap(),
+            &EscrowBundle::create(&ark, ark_id, 1, &holders, RecipientPolicy::AllowSoftware)
+                .unwrap(),
             &ids,
         );
         let b = open_all(
-            &EscrowBundle::create(&ark, ark_id, 1, &holders).unwrap(),
+            &EscrowBundle::create(&ark, ark_id, 1, &holders, RecipientPolicy::AllowSoftware)
+                .unwrap(),
             &ids,
         );
         assert_ne!(a[0].share.as_slice(), b[0].share.as_slice());
@@ -333,7 +359,9 @@ mod tests {
     #[test]
     fn tampered_share_or_wrong_ark_fails_before_combining() {
         let (ark, ark_id, holders, ids) = escrow_fixture();
-        let bundle = EscrowBundle::create(&ark, ark_id, 1, &holders).unwrap();
+        let bundle =
+            EscrowBundle::create(&ark, ark_id, 1, &holders, RecipientPolicy::AllowSoftware)
+                .unwrap();
         let shares = open_all(&bundle, &ids);
 
         let mut flipped = shares[1].clone();
@@ -343,7 +371,14 @@ mod tests {
             Err(EscrowError::Commitment { index: 2 })
         ));
 
-        let other = EscrowBundle::create(&Ark::generate(), ArkId::generate(), 1, &holders).unwrap();
+        let other = EscrowBundle::create(
+            &Ark::generate(),
+            ArkId::generate(),
+            1,
+            &holders,
+            RecipientPolicy::AllowSoftware,
+        )
+        .unwrap();
         let foreign = open_all(&other, &ids);
         assert!(matches!(
             bundle.recover(&shares[0], &foreign[1]),
@@ -356,7 +391,9 @@ mod tests {
         // An attacker who controls the stored bundle can rewrite a commitment
         // to match a junk share. The canary still rejects the combination.
         let (ark, ark_id, holders, ids) = escrow_fixture();
-        let mut bundle = EscrowBundle::create(&ark, ark_id, 1, &holders).unwrap();
+        let mut bundle =
+            EscrowBundle::create(&ark, ark_id, 1, &holders, RecipientPolicy::AllowSoftware)
+                .unwrap();
         let shares = open_all(&bundle, &ids);
         let mut junk = shares[1].clone();
         junk.share[7] ^= 1;
@@ -370,7 +407,9 @@ mod tests {
     #[test]
     fn test_unlock_needs_all_three_and_the_same_ark() {
         let (ark, ark_id, holders, ids) = escrow_fixture();
-        let bundle = EscrowBundle::create(&ark, ark_id, 1, &holders).unwrap();
+        let bundle =
+            EscrowBundle::create(&ark, ark_id, 1, &holders, RecipientPolicy::AllowSoftware)
+                .unwrap();
         let shares = open_all(&bundle, &ids);
 
         let ok = bundle.test_unlock(&ark, &shares).unwrap();
@@ -392,7 +431,9 @@ mod tests {
     #[test]
     fn fingerprint_covers_recipients_commitments_ciphertexts_and_canary() {
         let (ark, ark_id, holders, _) = escrow_fixture();
-        let bundle = EscrowBundle::create(&ark, ark_id, 1, &holders).unwrap();
+        let bundle =
+            EscrowBundle::create(&ark, ark_id, 1, &holders, RecipientPolicy::AllowSoftware)
+                .unwrap();
         let efp = bundle.fingerprint();
         let mutations: Vec<Mutation> = vec![
             Box::new(|b| b.shares[0].recipient = x25519_identity().to_public().to_string()),
@@ -417,7 +458,9 @@ mod tests {
     #[test]
     fn validate_rejects_malformed_bundles() {
         let (ark, ark_id, holders, _) = escrow_fixture();
-        let bundle = EscrowBundle::create(&ark, ark_id, 1, &holders).unwrap();
+        let bundle =
+            EscrowBundle::create(&ark, ark_id, 1, &holders, RecipientPolicy::AllowSoftware)
+                .unwrap();
         let mutations: Vec<Mutation> = vec![
             Box::new(|b| b.version = 2),
             Box::new(|b| b.threshold = 1),
@@ -440,15 +483,98 @@ mod tests {
     }
 
     #[test]
-    fn hardware_tag_share_opens_with_the_p256_key_only() {
+    fn hardware_shares_open_with_their_own_p256_key_only() {
         let (ark, ark_id, holders, ids) = escrow_fixture();
-        let bundle = EscrowBundle::create(&ark, ark_id, 1, &holders).unwrap();
-        // Holder 1 is a p256tag recipient; holder 2's identity can't open it.
-        assert!(bundle.shares[0].recipient.starts_with("age1tag1"));
-        assert!(ids[1].open(&bundle.shares[0].ciphertext).is_err());
-        let share = bundle
-            .open_share(&ids[0].open(&bundle.shares[0].ciphertext).unwrap())
-            .unwrap();
-        assert_eq!(share.index, 1);
+        let bundle =
+            EscrowBundle::create(&ark, ark_id, 1, &holders, RecipientPolicy::AllowSoftware)
+                .unwrap();
+        // Share 1 is piv-p256 (age1yubikey1), share 2 is p256tag (age1tag1).
+        assert!(bundle.shares[0].recipient.starts_with("age1yubikey1"));
+        assert!(bundle.shares[1].recipient.starts_with("age1tag1"));
+        for (i, j) in [(0, 1), (1, 0), (0, 2), (1, 2)] {
+            assert!(
+                ids[j].open(&bundle.shares[i].ciphertext).is_err(),
+                "{j} opened {i}"
+            );
+        }
+        for (i, (id, entry)) in ids.iter().zip(&bundle.shares).take(2).enumerate() {
+            let share = bundle
+                .open_share(&id.open(&entry.ciphertext).unwrap())
+                .unwrap();
+            assert_eq!(usize::from(share.index), i + 1);
+        }
+    }
+
+    #[test]
+    fn software_holders_need_the_explicit_policy() {
+        let (ark, ark_id, holders, _) = escrow_fixture();
+        assert!(matches!(
+            EscrowBundle::create(&ark, ark_id, 1, &holders, RecipientPolicy::HardwareOnly),
+            Err(EscrowError::Recipient { holder, .. }) if holder == "safe"
+        ));
+        let bundle =
+            EscrowBundle::create(&ark, ark_id, 1, &holders, RecipientPolicy::AllowSoftware)
+                .unwrap();
+        assert!(bundle
+            .check_recipients(RecipientPolicy::HardwareOnly)
+            .is_err());
+        assert_eq!(
+            bundle
+                .check_recipients(RecipientPolicy::AllowSoftware)
+                .unwrap(),
+            vec![
+                RecipientKind::PivP256,
+                RecipientKind::P256Tag,
+                RecipientKind::X25519
+            ]
+        );
+    }
+
+    #[test]
+    fn newer_versions_are_reported_as_versions_not_unknown_fields() {
+        let (ark, ark_id, holders, _) = escrow_fixture();
+        let bundle =
+            EscrowBundle::create(&ark, ark_id, 1, &holders, RecipientPolicy::AllowSoftware)
+                .unwrap();
+        let json = serde_json::to_vec(&bundle).unwrap();
+        assert_eq!(EscrowBundle::from_json(&json).unwrap(), bundle);
+
+        let mut v2: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        v2["version"] = 2.into();
+        v2["kdf"] = "new".into();
+        let err = EscrowBundle::from_json(&serde_json::to_vec(&v2).unwrap()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                EscrowError::Version {
+                    found: 2,
+                    supported: 1,
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        // Same version with an unknown field is still refused.
+        let mut extra: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        extra["kdf"] = "new".into();
+        assert!(matches!(
+            EscrowBundle::from_json(&serde_json::to_vec(&extra).unwrap()),
+            Err(EscrowError::Json { .. })
+        ));
+        assert!(matches!(
+            EscrowBundle::from_json(b"{}"),
+            Err(EscrowError::Json { .. })
+        ));
+
+        let info = serde_json::json!({"version": 9, "mode": "dstack", "future": true});
+        assert!(matches!(
+            crate::RecoveryInfo::from_json(info.to_string().as_bytes()),
+            Err(EscrowError::Version { found: 9, .. })
+        ));
+        let record = serde_json::json!({"version": 3, "efp": "x"});
+        assert!(matches!(
+            crate::VerificationRecord::from_json(record.to_string().as_bytes()),
+            Err(EscrowError::Version { found: 3, .. })
+        ));
     }
 }

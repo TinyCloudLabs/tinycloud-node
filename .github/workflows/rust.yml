@@ -180,6 +180,41 @@ jobs:
     - name: Fmt
       run: cargo fmt --all -- --check
 
+  # TC-887: the at-rest ceremony CLI is its own Cargo workspace (with its own
+  # lockfile) so its DCAP verifier never changes the node's dependency graph.
+  at-rest-cli:
+    name: at-rest ceremony CLI (own workspace)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+    - name: Checkout TinyCloud repository
+      uses: actions/checkout@v4
+
+    - name: Install reviewed Rust toolchain
+      uses: dtolnay/rust-toolchain@1.97.1
+      with:
+        components: clippy, rustfmt
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      with:
+        shared-key: rust-1.97.1-at-rest-cli
+        workspaces: tinycloud-at-rest-cli -> target
+        save-if: ${{ github.ref == 'refs/heads/main' }}
+
+    - name: Fmt
+      run: cargo fmt --manifest-path tinycloud-at-rest-cli/Cargo.toml -- --check
+    - name: Clippy
+      run: RUSTFLAGS="-Dwarnings" cargo clippy --locked --manifest-path tinycloud-at-rest-cli/Cargo.toml --all-targets
+    # Interop with the stock age CLI (tests/age_interop.rs), pinned by digest.
+    - name: Install age v1.3.2
+      run: |
+        curl -fsSL -o "$RUNNER_TEMP/age.tgz" https://github.com/FiloSottile/age/releases/download/v1.3.2/age-v1.3.2-linux-amd64.tar.gz
+        echo "cbe24006683f8eb669266162894b9a522a1af52f2665fbc63a4bb032ed26ac10  $RUNNER_TEMP/age.tgz" | sha256sum -c -
+        tar -xzf "$RUNNER_TEMP/age.tgz" -C "$RUNNER_TEMP"
+        echo "AGE_BIN_DIR=$RUNNER_TEMP/age" >> "$GITHUB_ENV"
+    - name: Test
+      run: cargo test --locked --manifest-path tinycloud-at-rest-cli/Cargo.toml
+
   capabilities:
     runs-on: ubuntu-latest
     steps:
