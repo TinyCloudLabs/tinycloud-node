@@ -218,9 +218,81 @@ pub struct AppCompose {
     top: Vec<(String, Node)>,
 }
 
+/// Walks any JSON value and fails on an object key that appears twice at
+/// any depth. serde_json keeps the last duplicate; dstack's own struct
+/// parse would refuse it, so every reader of the hashed bytes must too.
+struct NoDuplicateKeys;
+
+impl<'de> serde::Deserialize<'de> for NoDuplicateKeys {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        d.deserialize_any(NoDuplicateKeysVisitor)
+    }
+}
+
+struct NoDuplicateKeysVisitor;
+
+impl<'de> serde::de::Visitor<'de> for NoDuplicateKeysVisitor {
+    type Value = NoDuplicateKeys;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a JSON value")
+    }
+
+    fn visit_bool<E>(self, _: bool) -> std::result::Result<Self::Value, E> {
+        Ok(NoDuplicateKeys)
+    }
+
+    fn visit_i64<E>(self, _: i64) -> std::result::Result<Self::Value, E> {
+        Ok(NoDuplicateKeys)
+    }
+
+    fn visit_u64<E>(self, _: u64) -> std::result::Result<Self::Value, E> {
+        Ok(NoDuplicateKeys)
+    }
+
+    fn visit_f64<E>(self, _: f64) -> std::result::Result<Self::Value, E> {
+        Ok(NoDuplicateKeys)
+    }
+
+    fn visit_str<E>(self, _: &str) -> std::result::Result<Self::Value, E> {
+        Ok(NoDuplicateKeys)
+    }
+
+    fn visit_unit<E>(self) -> std::result::Result<Self::Value, E> {
+        Ok(NoDuplicateKeys)
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(
+        self,
+        mut seq: A,
+    ) -> std::result::Result<Self::Value, A::Error> {
+        while seq.next_element::<NoDuplicateKeys>()?.is_some() {}
+        Ok(NoDuplicateKeys)
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(
+        self,
+        mut map: A,
+    ) -> std::result::Result<Self::Value, A::Error> {
+        let mut seen = HashSet::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if !seen.insert(key.clone()) {
+                return Err(serde::de::Error::custom(format!(
+                    "duplicate key {:?}",
+                    escape(&key)
+                )));
+            }
+            map.next_value::<NoDuplicateKeys>()?;
+        }
+        Ok(NoDuplicateKeys)
+    }
+}
+
 impl AppCompose {
     /// Parse `app-compose.json` and its `docker_compose_file` strictly.
     pub fn parse(app_compose: &[u8]) -> Result<Self> {
+        serde_json::from_slice::<NoDuplicateKeys>(app_compose)
+            .map_err(|e| EscrowError::Compose(format!("app-compose.json is not JSON: {e}")))?;
         let doc: serde_json::Value = serde_json::from_slice(app_compose)
             .map_err(|e| EscrowError::Compose(format!("app-compose.json is not JSON: {e}")))?;
         let serde_json::Value::Object(doc) = doc else {
@@ -336,8 +408,10 @@ impl AppCompose {
                 }
             };
             let Some(value) = value else { continue };
+            // Empty or a YAML 1.2 null (any spelling docker compose reads as
+            // null) passes the variable through from the runtime.
             ensure!(
-                !value.is_empty() && value != "~" && value != "null",
+                !matches!(value.as_str(), "" | "~" | "null" | "Null" | "NULL"),
                 "service {service:?} passes {key} through from the runtime environment; it must be a literal value"
             );
             ensure!(
@@ -461,6 +535,26 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_json_keys_are_refused_at_any_depth() {
+        let yaml = format!("services:\\n  w:\\n    image: a@sha256:{}\\n", digest());
+        for doc in [
+            format!(
+                r#"{{"runner":"docker-compose","runner":"bash","docker_compose_file":"{yaml}"}}"#
+            ),
+            format!(
+                r#"{{"runner":"docker-compose","docker_compose_file":"{yaml}","x":{{"a":1,"a":2}}}}"#
+            ),
+        ] {
+            let err = AppCompose::parse(doc.as_bytes()).err().unwrap().to_string();
+            assert!(err.contains("duplicate key"), "{doc}: {err}");
+        }
+        let ok = format!(
+            r#"{{"runner":"docker-compose","docker_compose_file":"{yaml}","x":[{{"a":1}},{{"a":2}}]}}"#
+        );
+        AppCompose::parse(ok.as_bytes()).unwrap();
+    }
+
+    #[test]
     fn only_the_docker_compose_runner_is_accepted() {
         let d = digest();
         let yaml = format!("services:\n  web:\n    image: a@sha256:{d}\n");
@@ -523,6 +617,10 @@ mod tests {
             format!("      {VERIFIED_FP_ENV}: ${{FP}}\n"),
             format!("      {VERIFIED_FP_ENV}: $FP\n"),
             format!("      {VERIFIED_FP_ENV}:\n"),
+            format!("      {VERIFIED_FP_ENV}: Null\n"),
+            format!("      {VERIFIED_FP_ENV}: NULL\n"),
+            format!("      {VERIFIED_FP_ENV}: null\n"),
+            format!("      {VERIFIED_FP_ENV}: ~\n"),
             format!("      - {VERIFIED_FP_ENV}\n"),
             format!("      - {VERIFIED_FP_ENV}=${{FP:-{d}}}\n"),
         ] {
