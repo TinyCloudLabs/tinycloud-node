@@ -37,7 +37,6 @@ impl DataKey {
         self.id
     }
 
-    #[allow(dead_code)] // read by the envelope module
     pub(crate) fn bytes(&self) -> &[u8; 32] {
         &self.bytes
     }
@@ -61,7 +60,6 @@ impl ObjectNameKey {
         Self(Zeroizing::new(bytes))
     }
 
-    #[allow(dead_code)] // read by the object-name module
     pub(crate) fn bytes(&self) -> &[u8; 32] {
         &self.0
     }

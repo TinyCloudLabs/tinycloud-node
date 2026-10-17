@@ -62,7 +62,10 @@ base64.workspace = true
 sha2 = "0.10"
 sha3 = "0.10"
 k256 = "0.13"
-# TC-887: zeroize at-rest key material on drop.
+# TC-887: at-rest envelope key derivation and object names; zeroize key
+# material on drop.
+hkdf = "0.12"
+hmac = "0.12"
 zeroize = "1"
 prometheus = { version = "0.13.0", features = ["process"] }
 ryu-js = "0.2.2"
@@ -76,3 +79,4 @@ sea-orm = { version = "1.1", features = ["runtime-tokio-rustls", "sqlx-sqlite"] 
 async-std = { version = "1", features = ["attributes"] }
 tokio.workspace = true
 iri-string.workspace = true
+proptest = "1"

@@ -1,0 +1,158 @@
+{
+ "format": "TCE1 v1 (TC-887)",
+ "pattern": "plaintext byte i = i mod 251",
+ "vectors": [
+  {
+   "name": "kv-empty",
+   "dek": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+   "dek_id": 1,
+   "salt": "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+   "identity": {
+    "purpose": "kv-block",
+    "space": "tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:default",
+    "content_hash": "1e20abababababababababababababababababababababababababababababababab"
+   },
+   "plaintext": {
+    "hex": ""
+   },
+   "ciphertext_len": 80,
+   "ciphertext_sha256": "7df316a09f4cf53027960d6901501f0bb6113b074fa1c837606de81e8a8680d5",
+   "ciphertext": "5443453101010000000000010000000000000000404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f100000000000000000000000254167d64f27d9d21f4b08707a147b73"
+  },
+  {
+   "name": "kv-one-byte",
+   "dek": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+   "dek_id": 1,
+   "salt": "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+   "identity": {
+    "purpose": "kv-block",
+    "space": "tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:default",
+    "content_hash": "1e20abababababababababababababababababababababababababababababababab"
+   },
+   "plaintext": {
+    "hex": "2a"
+   },
+   "ciphertext_len": 81,
+   "ciphertext_sha256": "b1e2a8cf5f2fb34c9d89bf03e158c669f6889213461a31960007efd8424d8054",
+   "ciphertext": "5443453101010000000000010000000000000001404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f1000000000000000000000005390d958a935974da502da687c4baa0a09"
+  },
+  {
+   "name": "kv-short-text",
+   "dek": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+   "dek_id": 7,
+   "salt": "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+   "identity": {
+    "purpose": "kv-block",
+    "space": "tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:default",
+    "content_hash": "1e20abababababababababababababababababababababababababababababababab"
+   },
+   "plaintext": {
+    "hex": "68656c6c6f2c2074696e79636c6f75642061742072657374"
+   },
+   "ciphertext_len": 104,
+   "ciphertext_sha256": "f3c0257678efd386ff69888b56403db2ac737bd72311d58d8c7e7d9ccf8ec229",
+   "ciphertext": "5443453101010000000000070000000000000018404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f100000000000000000000000115b653920750195026e22a574ba9c17c9f049c7bb1f46cd235a7c07cd7c138604b0136774217b67"
+  },
+  {
+   "name": "kv-one-short-of-segment",
+   "dek": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+   "dek_id": 1,
+   "salt": "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+   "identity": {
+    "purpose": "kv-block",
+    "space": "tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:default",
+    "content_hash": "1e20abababababababababababababababababababababababababababababababab"
+   },
+   "plaintext": {
+    "pattern_len": 65535
+   },
+   "ciphertext_len": 65615,
+   "ciphertext_sha256": "c1622e4396923eb9d8bf453bc72760cd1a3eb0722a938869c84bb219be4e1771",
+   "ciphertext_head": "544345310101000000000001000000000000ffff404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f100000000000000000000000793f0b564b5c27e6630951cd14d8e77cf9802ff4dd6f23ae390b7af2d2755ef1"
+  },
+  {
+   "name": "kv-exact-segment",
+   "dek": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+   "dek_id": 1,
+   "salt": "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+   "identity": {
+    "purpose": "kv-block",
+    "space": "tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:default",
+    "content_hash": "1e20abababababababababababababababababababababababababababababababab"
+   },
+   "plaintext": {
+    "pattern_len": 65536
+   },
+   "ciphertext_len": 65616,
+   "ciphertext_sha256": "a6d3c304b7bbb80cf4436696d647a9fa59e7be6e8ce9fa2f995f6df5524cb1e4",
+   "ciphertext_head": "5443453101010000000000010000000000010000404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f100000000000000000000000793f0b564b5c27e6630951cd14d8e77cf9802ff4dd6f23ae390b7af2d2755ef1"
+  },
+  {
+   "name": "kv-segment-plus-one",
+   "dek": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+   "dek_id": 1,
+   "salt": "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+   "identity": {
+    "purpose": "kv-block",
+    "space": "tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:default",
+    "content_hash": "1e20abababababababababababababababababababababababababababababababab"
+   },
+   "plaintext": {
+    "pattern_len": 65537
+   },
+   "ciphertext_len": 65633,
+   "ciphertext_sha256": "f3a1b7944b17fad176b6f720430985b7cc277d8fa5b794f8fb874fd206d3a73b",
+   "ciphertext_head": "5443453101010000000000010000000000010001404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f10000000000000000000000043d710a7e75233345056e6215c3eca03d7afb3a73fdf0305e00f6b454e92d876"
+  },
+  {
+   "name": "sql-checkpoint-multi-segment",
+   "dek": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+   "dek_id": 3,
+   "salt": "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+   "identity": {
+    "purpose": "sql-checkpoint",
+    "service": "sqlite",
+    "space": "tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:default",
+    "name": "notes",
+    "checkpoint_content_hash": "bafkreiexamplecheckpoint",
+    "checkpoint_size_bytes": 200000
+   },
+   "plaintext": {
+    "pattern_len": 200000
+   },
+   "ciphertext_len": 200128,
+   "ciphertext_sha256": "48a6dbc161e0ccc388eebb77b25984c21114a247e8fdd5a8827418a424bbf4f5",
+   "ciphertext_head": "5443453101010000000000030000000000030d40404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f1000000000000000000000006d948e8835fc6ab0eb886e2d3f63d335b360332c2034c820c3dc74a54a5a5467"
+  },
+  {
+   "name": "sql-wal-short",
+   "dek": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+   "dek_id": 4294967295,
+   "salt": "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+   "identity": {
+    "purpose": "sql-wal",
+    "service": "sqlite",
+    "space": "tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:default",
+    "name": "notes",
+    "revision": 42,
+    "checkpoint_content_hash": "bafkreiexamplecheckpoint",
+    "delta_content_hash": "bafkreiexampledelta"
+   },
+   "plaintext": {
+    "hex": "77616c206672616d65206279746573"
+   },
+   "ciphertext_len": 95,
+   "ciphertext_sha256": "af0a95ae37ccd587377d67752de78e73c6828a33e16eb007ae5786d5005bc572",
+   "ciphertext": "5443453101010000ffffffff000000000000000f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f100000000000000000000000db56826432a30e8d1a00143f51d2ae1665783c299e727a22eeb3d49167eb78"
+  }
+ ],
+ "object_names": [
+  {
+   "nk": "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f",
+   "space": "tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:default",
+   "content_hash": "1e20abababababababababababababababababababababababababababababababab",
+   "space_tag": "YXP0Kg8hqZ76EELP_UoPvg",
+   "object_name": "v1/YXP0Kg8hqZ76EELP_UoPvg/slhZoR_St8omnDU5b5SvW_YQQ-n4_UppbG4EjyVgppU"
+  }
+ ]
+}
