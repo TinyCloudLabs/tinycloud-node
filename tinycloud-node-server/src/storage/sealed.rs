@@ -119,20 +119,47 @@ impl AtRestView {
         }
     }
 
-    pub fn of(runtime: Option<&AtRestRuntime>) -> Self {
-        match runtime {
-            None => Self::off(),
-            Some(rt) => Self {
-                mode: rt.mode(),
-                encrypting: rt.encrypting(),
-                provider: rt.provider(),
-            },
-        }
+    /// The state a store sees: `off` without a handle, else the handle's.
+    pub fn of(handle: Option<&AtRestHandle>) -> Self {
+        handle.map_or_else(Self::off, |h| h.0.view())
     }
 
     /// The object-name key, if keys are set up and unlocked.
     pub fn object_name_key(&self) -> Option<ObjectNameKey> {
         self.provider.as_ref()?.object_name_key().ok()
+    }
+}
+
+/// Where a block store reads its at-rest state from, per operation: the
+/// node's [`AtRestRuntime`], whose keys arrive after migrations and may unlock
+/// later, or a test double.
+pub trait AtRestSource: Send + Sync {
+    fn view(&self) -> AtRestView;
+}
+
+impl AtRestSource for AtRestRuntime {
+    fn view(&self) -> AtRestView {
+        AtRestView {
+            mode: self.mode(),
+            encrypting: self.encrypting(),
+            provider: self.provider(),
+        }
+    }
+}
+
+/// A block store's link to the at-rest state.
+#[derive(Clone)]
+pub struct AtRestHandle(Arc<dyn AtRestSource>);
+
+impl AtRestHandle {
+    pub fn new(source: Arc<dyn AtRestSource>) -> Self {
+        Self(source)
+    }
+}
+
+impl std::fmt::Debug for AtRestHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AtRestHandle").finish_non_exhaustive()
     }
 }
 
@@ -169,6 +196,25 @@ impl SealedName {
 pub fn space_tag_of(view: &AtRestView, space: &SpaceId) -> Option<String> {
     view.object_name_key()
         .map(|nk| space_tag(&nk, &space.to_string()))
+}
+
+/// Gets a space ready for sealed writes before the invocation's database
+/// write lock and transaction: creates (or loads) the space's current data
+/// key, so `persist` inside the transaction never writes key rows. Errors
+/// fail the request before the transaction (503 while keys are locked).
+pub async fn prepare_write(view: &AtRestView, space: &SpaceId) -> Result<(), AtRestStoreError> {
+    if view.mode == AtRestMode::Off {
+        return Ok(());
+    }
+    if !view.encrypting {
+        return Err(AtRestStoreError::Unavailable("encryption is not enabled"));
+    }
+    let provider = view
+        .provider
+        .as_ref()
+        .ok_or(AtRestStoreError::Unavailable("at-rest keys are not set up"))?;
+    provider.current_key(&space.to_string()).await?;
+    Ok(())
 }
 
 /// Where a new block is written.
