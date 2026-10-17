@@ -20,8 +20,9 @@
 //!   (SQL). Besides the marker, the space id/address and SQLite magic, they
 //!   reject the plaintext fingerprint in object names and any deterministic,
 //!   non-encrypting transform (encoding, XOR, compression): the two spaces'
-//!   stored bytes must share no [`MAX_SHARED_RUN`]-byte run, and stored bytes
-//!   must not compress below [`MIN_INCOMPRESSIBLE_RATIO`].
+//!   stored bytes must share no [`MAX_SHARED_RUN`]-byte run, stored bytes
+//!   must not compress below [`MIN_INCOMPRESSIBLE_RATIO`], and a blob must be
+//!   at least as large as the plaintext it holds (TCE1 never shrinks data).
 
 use std::collections::{BTreeSet, HashMap};
 use std::io::Write;
@@ -461,6 +462,20 @@ fn check_incompressible(what: &str, bytes: &[u8], findings: &mut Vec<String>) ->
     Ok(())
 }
 
+/// Finding if `stored` bytes are fewer than the `plaintext` bytes they must
+/// hold. TCE1 adds a header and per-segment tags and never shrinks data, so a
+/// smaller blob is compressed (or truncated), not sealed. This catches strong
+/// compressors (xz, bz2) whose output neither compresses further nor repeats
+/// across writes once a per-write salt (e.g. SQLite's WAL salts) is mixed in.
+fn check_size_floor(what: &str, stored: usize, plaintext: usize, findings: &mut Vec<String>) {
+    if stored < plaintext {
+        findings.push(format!(
+            "{what} is {stored} bytes, smaller than the {plaintext}-byte plaintext it must hold \
+             (sealing never shrinks data: compressed, not sealed)"
+        ));
+    }
+}
+
 /// A text encoding of the plaintext's blake3 fingerprint.
 struct Fingerprint {
     label: String,
@@ -611,6 +626,8 @@ struct SqlSpace {
 /// The same SQL statements run in two fresh spaces.
 struct SqlRun {
     markers: [String; 2],
+    /// Bytes of the smaller 64 KiB value; every payload and delta holds one.
+    big_len: usize,
     spaces: Vec<SqlSpace>,
 }
 
@@ -620,6 +637,7 @@ async fn sql_run(harness: &Harness) -> Result<SqlRun> {
         repeated(&markers[0], BIG_VALUE_LEN),
         repeated(&markers[1], BIG_VALUE_LEN),
     ];
+    let big_len = big[0].len().min(big[1].len());
     let insert = "INSERT INTO probe (secret) VALUES (?)";
     let writes = [
         // No checkpoint exists yet: the node saves a full checkpoint into
@@ -665,7 +683,11 @@ async fn sql_run(harness: &Harness) -> Result<SqlRun> {
         sql_reached_postgres(&space)?;
         spaces.push(space);
     }
-    Ok(SqlRun { markers, spaces })
+    Ok(SqlRun {
+        markers,
+        big_len,
+        spaces,
+    })
 }
 
 /// The writes reached PostgreSQL as a checkpoint and a WAL delta.
@@ -755,6 +777,12 @@ async fn red_kv_blocks_are_sealed_in_minio() -> Result<()> {
         let space_id = space.account.space.to_string();
         let address = space.account.address_hex();
         for ((label, value), objects) in run.probes.iter().zip(&space.objects) {
+            check_size_floor(
+                &format!("KV {label} put for {space_id}: its new object(s) in total"),
+                objects.iter().map(|object| object.body.len()).sum(),
+                value.len(),
+                &mut findings,
+            );
             let fingerprints = fingerprints(value.as_bytes());
             for StoredObject { key, body } in objects {
                 if key.contains(&space_id) {
@@ -802,16 +830,28 @@ async fn red_kv_blocks_are_sealed_in_minio() -> Result<()> {
             }
         }
     }
+    // Compare every object of a put in space A with every object of the same
+    // put in space B: sealed names sort randomly, so no pairing by order.
     for (index, (label, _)) in run.probes.iter().enumerate() {
         let a = &run.spaces[0].objects[index];
         let b = &run.spaces[1].objects[index];
-        for (a, b) in a.iter().zip(b) {
-            compare_writes(
-                &format!("KV {label} value ({:?} vs {:?})", a.key, b.key),
-                &a.body,
-                &b.body,
-                &mut findings,
-            );
+        ensure!(
+            a.len() == b.len(),
+            "harness: the same KV {label} put created {} object(s) in {} but {} in {}",
+            a.len(),
+            run.spaces[0].account.space,
+            b.len(),
+            run.spaces[1].account.space
+        );
+        for a in a {
+            for b in b {
+                compare_writes(
+                    &format!("KV {label} value ({:?} vs {:?})", a.key, b.key),
+                    &a.body,
+                    &b.body,
+                    &mut findings,
+                );
+            }
         }
     }
     ensure!(
@@ -863,6 +903,12 @@ async fn red_sql_artifacts_are_sealed_in_postgres() -> Result<()> {
                 }
             }
             check_incompressible(&format!("{id}.{column}"), bytes, &mut findings)?;
+            check_size_floor(
+                &format!("{id}.{column}"),
+                bytes.len(),
+                run.big_len,
+                &mut findings,
+            );
         }
     }
     for a in &run.spaces[0].rows {
@@ -930,8 +976,9 @@ fn sealed_like(len: usize) -> Vec<u8> {
 /// Offline check of the RED predicates themselves (runs in plain `cargo
 /// test`, no harness; its name stays clear of the `green_`/`red_` filters
 /// `harness.sh test` uses): deterministic transforms of identical plaintext
-/// are flagged even with the marker and magic gone, and two sealed-like
-/// blobs of the same plaintext are not.
+/// are flagged even with the marker and magic gone, a compressed-only blob is
+/// flagged by the size floor, and two sealed-like blobs of the same plaintext
+/// pass every predicate.
 #[test]
 fn selftest_predicates_flag_deterministic_transforms_not_ciphertext() -> Result<()> {
     let marker = marker("SELFTEST");
@@ -969,10 +1016,28 @@ fn selftest_predicates_flag_deterministic_transforms_not_ciphertext() -> Result<
             "{name} behind a random prefix: shared-run check missed it"
         );
     }
+    // Compressed only, with a per-write salt mixed in (like a WAL delta):
+    // the size floor still catches it.
+    let deflate_best = |bytes: &[u8]| -> Result<Vec<u8>> {
+        let mut encoder =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::best());
+        encoder.write_all(bytes)?;
+        Ok(encoder.finish()?)
+    };
+    let salted = deflate_best(&[random_bytes(32), plaintext.clone()].concat())?;
+    let mut findings = Vec::new();
+    check_size_floor("deflate-9", salted.len(), plaintext.len(), &mut findings);
+    ensure!(
+        findings.len() == 1,
+        "a {}-byte compressed-only blob of {} bytes passed the size floor",
+        salted.len(),
+        plaintext.len()
+    );
     for len in [62, BIG_VALUE_LEN] {
         let (a, b) = (sealed_like(len), sealed_like(len));
         let mut findings = Vec::new();
         compare_writes("sealed", &a, &b, &mut findings);
+        check_size_floor("sealed", a.len(), len, &mut findings);
         if len == BIG_VALUE_LEN {
             check_incompressible("sealed", &a, &mut findings)?;
         }
