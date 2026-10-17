@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+# Its own workspace (with its own Cargo.lock). A root `workspace.exclude`
+# entry cannot reach it: it sits under the `tinycloud-node-server` member.
+[workspace]
+
 [dependencies]
 base64 = "0.22.1"
 ed25519-dalek = "2.2.0"
