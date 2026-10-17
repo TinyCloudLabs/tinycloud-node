@@ -15,6 +15,7 @@ use parking_lot::RwLock;
 use tinycloud::{
     config::AtRestMode,
     storage::{
+        file_system::TempFileSystemStage,
         s3::{S3BlockConfig, S3BlockStore, S3StoreError},
         sealed::{AtRestHandle, AtRestSource, AtRestStoreError, AtRestView},
     },
@@ -25,7 +26,7 @@ use tinycloud_core::{
     hash::Hash,
     storage::{
         memory::MemoryStaging, ByteRangeSpec, HashBuffer, ImmutableDeleteStore, ImmutableReadStore,
-        ImmutableWriteStore, RangeRead, StorageConfig, StorageSetup, StoreSize,
+        ImmutableStaging, ImmutableWriteStore, RangeRead, StorageConfig, StorageSetup, StoreSize,
     },
 };
 
@@ -269,5 +270,196 @@ async fn legacy_locked_strict_and_tamper_over_s3() -> Result<()> {
     // Removing the sealed block drops it.
     ensure!(store.remove(&space, &hs).await? == Some(()), "remove");
     ensure!(store.read(&space, &hs).await?.is_none(), "removed");
+    Ok(())
+}
+
+async fn put_file(store: &S3BlockStore, space: &SpaceId, data: &[u8]) -> Result<Hash> {
+    ImmutableWriteStore::<TempFileSystemStage>::prepare_write(store, space).await?;
+    let mut staged = TempFileSystemStage.stage(space).await?;
+    staged.write_all(data).await?;
+    staged.flush().await?;
+    Ok(ImmutableWriteStore::<TempFileSystemStage>::persist(store, space, staged).await?)
+}
+
+async fn range(
+    store: &S3BlockStore,
+    space: &SpaceId,
+    h: &Hash,
+    spec: ByteRangeSpec,
+) -> Result<(u64, Vec<u8>)> {
+    match store.read_range(space, h, spec).await?.context("range")? {
+        RangeRead::Content {
+            total_size,
+            content,
+            ..
+        } => {
+            let mut out = Vec::new();
+            Box::pin(content).read_to_end(&mut out).await?;
+            Ok((total_size, out))
+        }
+        RangeRead::Unsatisfiable { .. } => anyhow::bail!("{spec:?} unsatisfiable"),
+    }
+}
+
+fn status(e: &S3StoreError) -> Option<rocket::http::Status> {
+    match e {
+        S3StoreError::AtRest(e) => Some(e.status()),
+        _ => None,
+    }
+}
+
+/// Temp-file staging seals on S3 too; ranges across the tail and From /
+/// Suffix ranges at segment edges match the plaintext.
+#[tokio::test]
+#[ignore = "needs the at-rest harness MinIO (TC887_S3_* env)"]
+async fn temp_file_staging_seals_and_ranges_over_s3() -> Result<()> {
+    let (store, _, space) = store(view(AtRestMode::Encrypt, true, Some(keys()))).await?;
+    for n in [3 * SEG, 2 * SEG + 1, 2 * SEG - 1] {
+        let data = value(n);
+        let h = put_file(&store, &space, &data).await?;
+        let nk = keys().object_name_key()?;
+        let sealed = tinycloud_core::at_rest::sealed_object_name(&nk, &space.to_string(), &h);
+        ensure!(
+            raw(&store, &sealed).await?.starts_with(b"TCE1"),
+            "{n}: not sealed"
+        );
+        ensure!(get(&store, &space, &h).await? == data, "{n}: read back");
+        for at in [0, 1, SEG - 1, SEG, SEG + 1, 2 * SEG - 1, 2 * SEG, n - 1] {
+            if at >= n {
+                continue;
+            }
+            for spec in [
+                ByteRangeSpec::From { start: at as u64 },
+                ByteRangeSpec::Suffix {
+                    length: (n - at) as u64,
+                },
+            ] {
+                let (total, out) = range(&store, &space, &h, spec).await?;
+                ensure!(total == n as u64 && out == data[at..], "{n}: {spec:?}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Back to `off` with keys: sealed blocks still read; `off` with locked keys
+/// answers 503 for a sealed-only block. `strict` with locked keys answers 503
+/// for legacy and sealed blocks alike.
+#[tokio::test]
+#[ignore = "needs the at-rest harness MinIO (TC887_S3_* env)"]
+async fn off_after_encrypt_and_strict_while_locked_over_s3() -> Result<()> {
+    let (store, switch, space) = store(AtRestView::off()).await?;
+    let hl = put(&store, &space, &value(70)).await?;
+    *switch.0.write() = view(AtRestMode::Encrypt, true, Some(keys()));
+    let sealed = value(SEG + 2);
+    let hs = put(&store, &space, &sealed).await?;
+
+    *switch.0.write() = view(AtRestMode::Off, false, Some(keys()));
+    ensure!(
+        get(&store, &space, &hs).await? == sealed,
+        "off reads sealed"
+    );
+    *switch.0.write() = view(AtRestMode::Off, false, Some(keys().locked()));
+    let e = store.read(&space, &hs).await.map(|_| ()).unwrap_err();
+    ensure!(
+        status(&e) == Some(rocket::http::Status::ServiceUnavailable),
+        "off + locked: {e}"
+    );
+
+    *switch.0.write() = view(AtRestMode::Strict, false, Some(keys().locked()));
+    for h in [hl, hs] {
+        let e = store.read(&space, &h).await.map(|_| ()).unwrap_err();
+        ensure!(
+            status(&e) == Some(rocket::http::Status::ServiceUnavailable),
+            "strict + locked: {e}"
+        );
+    }
+    Ok(())
+}
+
+/// `contains` checks the name a write would use (INTERFACES §7).
+#[tokio::test]
+#[ignore = "needs the at-rest harness MinIO (TC887_S3_* env)"]
+async fn contains_checks_the_name_a_write_would_use_over_s3() -> Result<()> {
+    let (store, switch, space) = store(AtRestView::off()).await?;
+    let data = value(90);
+    let h = put(&store, &space, &data).await?;
+    ensure!(store.contains(&space, &h).await?, "legacy in off");
+    *switch.0.write() = view(AtRestMode::Encrypt, true, Some(keys()));
+    ensure!(!store.contains(&space, &h).await?, "legacy only in encrypt");
+    put(&store, &space, &data).await?;
+    ensure!(store.contains(&space, &h).await?, "sealed in encrypt");
+    Ok(())
+}
+
+/// A sealed object replaced (same block, another salt) between a range
+/// read's header GET and its segment GET: the segment GET is pinned to the
+/// header's ETag, so the read starts over or answers 503, and never returns
+/// wrong bytes or a false integrity 500.
+#[tokio::test]
+#[ignore = "needs the at-rest harness MinIO (TC887_S3_* env)"]
+async fn a_replaced_object_never_yields_a_false_integrity_error() -> Result<()> {
+    let (store, _, space) = store(view(AtRestMode::Encrypt, true, Some(keys()))).await?;
+    let data = value(3 * SEG + 5);
+    let h = put(&store, &space, &data).await?;
+    let nk = keys().object_name_key()?;
+    let key = tinycloud_core::at_rest::sealed_object_name(&nk, &space.to_string(), &h);
+    let space_str = space.to_string();
+    let identity = tinycloud_core::at_rest::BlobIdentity::KvBlock {
+        space: &space_str,
+        content_hash: &h,
+    };
+    let dek = keys().current_key(&space_str).await?;
+    let versions = [
+        raw(&store, &key).await?,
+        tinycloud_core::at_rest::seal(&dek, &identity, data.clone())?,
+    ];
+    ensure!(versions[0] != versions[1], "two encryptions differ by salt");
+
+    let writer = {
+        let (client, bucket, key) = (store.client.clone(), store.bucket.clone(), key.clone());
+        let versions = versions.clone();
+        tokio::spawn(async move {
+            for i in 0..200usize {
+                client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .body(versions[i % 2].clone().into())
+                    .send()
+                    .await
+                    .expect("put");
+            }
+        })
+    };
+    let (mut served, mut retried_out) = (0, 0);
+    while !writer.is_finished() {
+        let spec = ByteRangeSpec::Inclusive {
+            start: (SEG - 3) as u64,
+            end: (2 * SEG + 3) as u64,
+        };
+        match store.read_range(&space, &h, spec).await {
+            Ok(Some(RangeRead::Content { content, .. })) => {
+                let mut out = Vec::new();
+                // A body may still abort if the object changes mid-stream
+                // after the pinned GET started; it never yields wrong bytes.
+                if Box::pin(content).read_to_end(&mut out).await.is_ok() {
+                    ensure!(out == data[SEG - 3..=2 * SEG + 3], "wrong bytes served");
+                    served += 1;
+                }
+            }
+            Ok(other) => anyhow::bail!("unexpected {:?}", other.is_some()),
+            Err(e) => {
+                ensure!(
+                    status(&e) == Some(rocket::http::Status::ServiceUnavailable),
+                    "a replaced object must not be an integrity error: {e}"
+                );
+                retried_out += 1;
+            }
+        }
+    }
+    writer.await?;
+    println!("served {served}, gave up after a retry {retried_out}");
+    ensure!(served > 0, "no range read completed");
     Ok(())
 }

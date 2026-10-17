@@ -19,7 +19,7 @@ use std::{
 };
 use tinycloud_auth::resource::SpaceId;
 use tinycloud_core::{
-    at_rest::{plaintext_len, DataKeyProvider, DecryptReader, HEADER_LEN},
+    at_rest::{plaintext_len, DataKeyProvider, HEADER_LEN},
     hash::Hash,
     storage::*,
 };
@@ -27,9 +27,10 @@ use tinycloud_core::{
 use super::{
     file_system,
     sealed::{
-        self, open_sealed, plan_range, read_plan, scanned_object, seal_file, seal_vec,
-        space_tag_of, write_target, AtRestHandle, AtRestStoreError, AtRestView, ReadPlan,
-        ScannedObject, SealFileError, SealedName, WriteTarget,
+        self, contains_name, open_sealed, plan_range, read_plan, scanned_object, seal_file,
+        seal_vec, space_tag_of, write_target, AtRestHandle, AtRestStoreError, AtRestView,
+        ContainsName, LoggedDecrypt, ReadPlan, ScannedObject, SealFileError, SealedName,
+        WriteTarget,
     },
     size::SpaceSizes,
 };
@@ -52,7 +53,7 @@ type Body = IntoAsyncRead<MapErr<ByteStream, fn(ByteStreamError) -> IoError>>;
 /// Plaintext from a legacy object, or authenticated plaintext from a sealed one.
 /// The decrypting side is boxed: it carries the AES key schedule and segment
 /// buffers, and `Content` values move by value through deep request paths.
-pub type S3Readable = AsyncEither<Body, Box<DecryptReader<Body>>>;
+pub type S3Readable = AsyncEither<Body, Box<LoggedDecrypt<Body>>>;
 
 fn body(stream: ByteStream) -> Body {
     stream
@@ -70,9 +71,12 @@ enum Staged {
 enum RangeGet {
     Missing,
     InvalidRange,
+    /// `If-Match` failed: the object was replaced since the ETag was read.
+    Changed,
     Got {
         range: ResolvedByteRange,
         total: u64,
+        etag: Option<String>,
         body: Body,
     },
 }
@@ -212,13 +216,19 @@ impl S3BlockStore {
         }
     }
 
-    async fn get_range(&self, key: &str, range: ByteRangeSpec) -> Result<RangeGet, S3StoreError> {
+    async fn get_range(
+        &self,
+        key: &str,
+        range: ByteRangeSpec,
+        if_match: Option<&str>,
+    ) -> Result<RangeGet, S3StoreError> {
         match self
             .client
             .get_object()
             .bucket(&self.bucket)
             .key(key)
             .range(range.to_http_value())
+            .set_if_match(if_match.map(str::to_owned))
             .send()
             .await
         {
@@ -230,6 +240,7 @@ impl S3BlockStore {
                 Ok(RangeGet::Got {
                     range,
                     total,
+                    etag: output.e_tag().map(str::to_owned),
                     body: body(output.body),
                 })
             }
@@ -243,6 +254,9 @@ impl S3BlockStore {
             }) => Ok(RangeGet::Missing),
             Err(SdkError::ServiceError { err, .. }) if err.code() == Some("InvalidRange") => {
                 Ok(RangeGet::InvalidRange)
+            }
+            Err(SdkError::ServiceError { err, .. }) if err.code() == Some("PreconditionFailed") => {
+                Ok(RangeGet::Changed)
             }
             Err(error) => Err(S3Error::from(error).into()),
         }
@@ -342,7 +356,7 @@ impl S3BlockStore {
         let (size, reader) = open_sealed(provider, space, id, b, len).await?.into_inner();
         Ok(Some(Content::new(
             size,
-            AsyncEither::Right(Box::new(reader)),
+            AsyncEither::Right(Box::new(LoggedDecrypt::new(reader))),
         )))
     }
 
@@ -382,13 +396,15 @@ impl S3BlockStore {
         spec: ByteRangeSpec,
     ) -> Result<Option<RangeRead<S3Readable>>, S3StoreError> {
         let key = self.key(space, id);
-        match self.get_range(&key, spec).await? {
-            RangeGet::Got { range, total, body } => Ok(Some(RangeRead::Content {
+        match self.get_range(&key, spec, None).await? {
+            RangeGet::Got {
+                range, total, body, ..
+            } => Ok(Some(RangeRead::Content {
                 total_size: total,
                 range,
                 content: Content::new(range.len(), AsyncEither::Left(body)),
             })),
-            RangeGet::Missing => Ok(None),
+            RangeGet::Missing | RangeGet::Changed => Ok(None),
             RangeGet::InvalidRange => {
                 let head = self
                     .client
@@ -416,8 +432,11 @@ impl S3BlockStore {
     }
 
     /// A range of the block's sealed object, or `None` if it is absent: one
-    /// GET for the header, one for the segments. Totals and the 416 decision
-    /// use the plaintext length.
+    /// GET for the header, one (pinned to the first one's ETag) for the
+    /// segments. Totals and the 416 decision use the plaintext length. If the
+    /// object is replaced or removed between the two, the read starts over
+    /// once, then fails (503); once a header was read it never falls back to
+    /// the legacy name.
     async fn range_sealed(
         &self,
         name: &SealedName,
@@ -431,44 +450,64 @@ impl S3BlockStore {
             start: 0,
             end: HEADER_LEN as u64 - 1,
         };
-        let (total, mut head_body) = match self.get_range(&object, header_span).await? {
-            RangeGet::Missing => return Ok(None),
-            RangeGet::InvalidRange => {
-                return Err(AtRestStoreError::Integrity("object shorter than its header").into())
-            }
-            RangeGet::Got { total, body, .. } => (total, body),
-        };
-        let mut header = [0u8; HEADER_LEN];
-        head_body
-            .read_exact(&mut header)
-            .await
-            .map_err(|_| AtRestStoreError::Integrity("object shorter than its header"))?;
-        let plan = plan_range(provider, space, &header, total, spec).await?;
-        let Some(r) = plan.range else {
-            return Ok(Some(RangeRead::Unsatisfiable {
+        let mut seen_header = false;
+        for _ in 0..2 {
+            let (total, etag, mut head_body) =
+                match self.get_range(&object, header_span, None).await? {
+                    RangeGet::Missing | RangeGet::Changed if seen_header => break,
+                    RangeGet::Missing | RangeGet::Changed => return Ok(None),
+                    RangeGet::InvalidRange => {
+                        return Err(
+                            AtRestStoreError::Integrity("object shorter than its header").into(),
+                        )
+                    }
+                    RangeGet::Got {
+                        total, etag, body, ..
+                    } => (total, etag, body),
+                };
+            seen_header = true;
+            let mut header = [0u8; HEADER_LEN];
+            head_body
+                .read_exact(&mut header)
+                .await
+                .map_err(|_| AtRestStoreError::Integrity("object shorter than its header"))?;
+            let plan = plan_range(provider, space, &header, total, spec).await?;
+            let Some(r) = plan.range else {
+                return Ok(Some(RangeRead::Unsatisfiable {
+                    total_size: plan.plaintext_len(),
+                }));
+            };
+            let span = ByteRangeSpec::Inclusive {
+                start: r.ciphertext_start(),
+                end: r.ciphertext_end(),
+            };
+            let body = match self.get_range(&object, span, etag.as_deref()).await? {
+                RangeGet::Got { range, body, .. }
+                    if range.start() == r.ciphertext_start()
+                        && range.end() == r.ciphertext_end() =>
+                {
+                    body
+                }
+                RangeGet::Got { .. } => {
+                    return Err(
+                        AtRestStoreError::Integrity("ranged GET returned another span").into(),
+                    )
+                }
+                // Replaced, removed or shrunk since the header was read.
+                RangeGet::Changed | RangeGet::Missing | RangeGet::InvalidRange => continue,
+            };
+            let reader = plan.reader(space, id, r, body)?;
+            let range = r.plaintext_range();
+            return Ok(Some(RangeRead::Content {
                 total_size: plan.plaintext_len(),
+                range,
+                content: Content::new(
+                    range.len(),
+                    AsyncEither::Right(Box::new(LoggedDecrypt::new(reader))),
+                ),
             }));
-        };
-        let span = ByteRangeSpec::Inclusive {
-            start: r.ciphertext_start(),
-            end: r.ciphertext_end(),
-        };
-        let body = match self.get_range(&object, span).await? {
-            RangeGet::Got { range, body, .. }
-                if range.start() == r.ciphertext_start() && range.end() == r.ciphertext_end() =>
-            {
-                body
-            }
-            RangeGet::Missing => return Ok(None),
-            _ => return Err(AtRestStoreError::Integrity("object changed during a read").into()),
-        };
-        let reader = plan.reader(space, id, r, body)?;
-        let range = r.plaintext_range();
-        Ok(Some(RangeRead::Content {
-            total_size: plan.plaintext_len(),
-            range,
-            content: Content::new(range.len(), AsyncEither::Right(Box::new(reader))),
-        }))
+        }
+        Err(AtRestStoreError::Unavailable("the object changed during the read").into())
     }
 
     async fn range_block(
@@ -578,14 +617,17 @@ impl ImmutableReadStore for S3BlockStore {
     type Error = S3StoreError;
     type Readable = S3Readable;
     async fn contains(&self, space: &SpaceId, id: &Hash) -> Result<bool, Self::Error> {
-        match read_plan(&self.view(), space, id)? {
-            ReadPlan::Legacy | ReadPlan::LegacyWhileLocked => {
-                self.head_exists(&self.key(space, id)).await
-            }
-            ReadPlan::SealedThenLegacy { name, .. } => Ok(self.head_exists(&name.key()).await?
-                || self.head_exists(&self.key(space, id)).await?),
-            ReadPlan::Sealed { name, .. } => self.head_exists(&name.key()).await,
+        // The name a write would use (INTERFACES §7).
+        match contains_name(&self.view(), space, id)? {
+            ContainsName::Legacy => self.head_exists(&self.key(space, id)).await,
+            ContainsName::Sealed(name) => self.head_exists(&name.key()).await,
         }
+    }
+    fn prepares(&self) -> bool {
+        super::sealed::prepares(&self.view())
+    }
+    async fn prepare_read(&self, space: &SpaceId) -> Result<(), Self::Error> {
+        Ok(super::sealed::prepare_read(&self.view(), space).await?)
     }
 
     async fn read(
