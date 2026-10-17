@@ -1193,6 +1193,22 @@ impl DatabaseAuthorityBridge117 {
         let statement = authorized_statement(scope, &policy, &delegation).inspect_err(|&failure| {
             tracing::error!(failure = ?failure, stage = "authorized_statement", "share scope validation failed");
         })?;
+        let source_owner = match &scope.content_source {
+            super::types::ContentSource::Kv { space, .. }
+            | super::types::ContentSource::Sql { space, .. } => space.as_str(),
+        };
+        let principals = vec![
+            policy.issuer_did.clone(),
+            policy.audience_did.clone(),
+            delegation.issuer_did.clone(),
+            delegation.audience_did.clone(),
+            source_owner.to_owned(),
+            enforcer.as_str().to_owned(),
+            scope.node_audience.as_str().to_owned(),
+        ];
+        crate::key_authority::check_principals_any_scope(tx, &principals)
+            .await
+            .map_err(|_| PortError::Denied)?;
         Ok((expiry, matcher, statement, bundle.internal_delegation_cid))
     }
 }
@@ -1935,5 +1951,241 @@ mod tests {
             )
             .await;
         assert!(matches!(result, Err(PortError::Unavailable)));
+    }
+    // The checked-in vector's ceiling hash uses the generator's single-capability
+    // preimage, whereas the #117 kernel hashes the canonical capability ARRAY.
+    // Re-sign the corrected parents and their dependent evidence with the
+    // deterministic test-only keys declared by the vector's build.mjs.
+    fn sign_fixture_parent(mut parent: PolicyDelegation) -> PolicyDelegation {
+        use k256::ecdsa::SigningKey;
+        use sha3::Keccak256;
+
+        let mut unsigned = serde_json::to_value(&parent).unwrap();
+        let object = unsigned.as_object_mut().unwrap();
+        object.remove("delegationCid");
+        object.remove("signature");
+        let unsigned = jcs::canonicalize(&unsigned);
+        let digest = Sha256::digest(
+            [
+                b"xyz.tinycloud.policy/enforcement-delegation/v1\0".as_slice(),
+                &unsigned,
+            ]
+            .concat(),
+        );
+        let mut preimage = b"\x19Ethereum Signed Message:\n32".to_vec();
+        preimage.extend_from_slice(&digest);
+        let signing = SigningKey::from_bytes((&[0x55; 32]).into()).unwrap();
+        let (signature, recovery) = signing
+            .sign_prehash_recoverable(&Keccak256::digest(preimage))
+            .unwrap();
+        let mut signature_bytes = signature.to_bytes().to_vec();
+        signature_bytes.push(recovery.to_byte() + 27);
+        parent.signature.value = URL_SAFE_NO_PAD.encode(signature_bytes);
+
+        let mut cid_value = serde_json::to_value(&parent).unwrap();
+        cid_value.as_object_mut().unwrap().remove("delegationCid");
+        parent.delegation_cid = Cid::new_v1(
+            0x55,
+            Code::Blake3_256.digest(&jcs::canonicalize(&cid_value)),
+        )
+        .to_string();
+        AuthorityArtifactVerifier
+            .verify(&jcs::canonicalize(&serde_json::to_value(&parent).unwrap()))
+            .expect("re-signed owner parent verifies");
+        parent
+    }
+
+    fn sign_fixture_status(
+        status: &mut Value,
+        parent_cid: &str,
+        node: &libp2p::identity::ed25519::Keypair,
+    ) {
+        status["parentCid"] = json!(parent_cid);
+        let mut unsigned = status.clone();
+        unsigned.as_object_mut().unwrap().remove("signature");
+        let mut signed = b"xyz.tinycloud.share/authority-status/v1\0".to_vec();
+        signed.extend_from_slice(&jcs::canonicalize(&unsigned));
+        status["signature"]["value"] = json!(URL_SAFE_NO_PAD.encode(node.sign(&signed)));
+    }
+
+    fn sign_fixture_wrapper(
+        wrapper: &mut Value,
+        material: Value,
+        sender: &libp2p::identity::ed25519::Keypair,
+    ) {
+        let domain = b"xyz.tinycloud.share/authority-material-bundle/v1\0";
+        assert_eq!(wrapper["domain"].as_str().unwrap().as_bytes(), domain);
+        let canonical = jcs::canonicalize(&material);
+        let mut signed = domain.to_vec();
+        signed.extend_from_slice(&canonical);
+        let signature = sender.sign(&signed);
+        wrapper["message"] = material;
+        wrapper["jcs"] = json!(std::str::from_utf8(&canonical).unwrap());
+        wrapper["messageDigest"] = json!(URL_SAFE_NO_PAD.encode(Sha256::digest(&canonical)));
+        wrapper["signedBytesDigest"] = json!(URL_SAFE_NO_PAD.encode(Sha256::digest(&signed)));
+        wrapper["signatureDigest"] = json!(URL_SAFE_NO_PAD.encode(Sha256::digest(&signature)));
+        wrapper["signature"]["value"] = json!(URL_SAFE_NO_PAD.encode(signature));
+    }
+
+    #[tokio::test]
+    async fn signed_share_authority_denies_owner_and_enforcer_after_key_revoke() {
+        use super::super::authority::AuthenticatedAuthorityMaterialProvider;
+        use crate::models::key_revocation;
+
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../tinycloud-node-server/tests/fixtures/email-claim-v1/positive.json"
+        ))
+        .unwrap();
+        let scenario = &fixture["scenarios"][0];
+        let artifact = |name| {
+            scenario["artifacts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|artifact| artifact["name"] == name)
+                .unwrap()
+                .clone()
+        };
+        let mut material = scenario["authorityMaterial"].clone();
+        let mut parent_bytes = Vec::new();
+        for key in ["policyAuthorityBytes", "policyEnforcementBytes"] {
+            let bytes = URL_SAFE_NO_PAD
+                .decode(material[key].as_str().unwrap())
+                .unwrap();
+            parent_bytes.push(serde_json::from_slice::<PolicyDelegation>(&bytes).unwrap());
+        }
+        let ceiling = crate::policy_capability::requested_capabilities_hash_hex(
+            &parent_bytes[0]
+                .capabilities
+                .iter()
+                .map(parse_capability)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+        );
+        let node = libp2p::identity::ed25519::Keypair::from(
+            libp2p::identity::ed25519::SecretKey::try_from_bytes([0x42; 32]).unwrap(),
+        );
+        let sender = libp2p::identity::ed25519::Keypair::from(
+            libp2p::identity::ed25519::SecretKey::try_from_bytes([0x44; 32]).unwrap(),
+        );
+        assert_eq!(
+            crate::keys::public_key_to_did_key(sender.public().into()),
+            material["senderDid"].as_str().unwrap()
+        );
+        for (index, (bytes_key, cid_key)) in [
+            ("policyAuthorityBytes", "policyAuthorityCid"),
+            ("policyEnforcementBytes", "policyEnforcementCid"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut parent = parent_bytes[index].clone();
+            parent.facts.insert(
+                "xyz.tinycloud.policy/capabilityCeilingHashHex".to_owned(),
+                ceiling.clone(),
+            );
+            let parent = sign_fixture_parent(parent);
+            let cid = parent.delegation_cid.clone();
+            material[bytes_key] =
+                json!(URL_SAFE_NO_PAD
+                    .encode(jcs::canonicalize(&serde_json::to_value(&parent).unwrap())));
+            material[cid_key] = json!(cid.as_str());
+            material["mapping"][cid_key] = json!(cid.as_str());
+            sign_fixture_status(&mut material["statusObservations"][index], &cid, &node);
+        }
+        let material_digest =
+            Sha256Digest::from_bytes(Sha256::digest(jcs::canonicalize(&material)).into());
+        let mut wrapper = artifact("authorityMaterial");
+        sign_fixture_wrapper(&mut wrapper, material, &sender);
+        let provider = AuthenticatedAuthorityMaterialProvider::from_json(
+            &serde_json::to_vec(&json!({
+                "authorityMaterial": wrapper,
+                "policy": artifact("policy"),
+            }))
+            .unwrap(),
+        )
+        .expect("authenticated re-signed authority, status, and attestation");
+        let now =
+            OffsetDateTime::parse(scenario["evaluationTime"].as_str().unwrap(), &Rfc3339).unwrap();
+        let mut requested = scope(scenario["policyCid"].as_str().unwrap());
+        requested.share_cid = ShareCid::parse(scenario["shareCid"].as_str().unwrap()).unwrap();
+        requested.share_id = ShareId::parse(scenario["shareId"].as_str().unwrap()).unwrap();
+        requested.delegation_cid =
+            Some(ShareDelegationCid::parse(scenario["delegationCid"].as_str().unwrap()).unwrap());
+        requested.authority_material_handle =
+            AuthorityMaterialHandle::parse(scenario["authorityMaterialHandle"].as_str().unwrap())
+                .unwrap();
+        requested.authority_material_digest = material_digest;
+        requested.content_source_digest =
+            Sha256Digest::parse(scenario["sourceDigest"].as_str().unwrap()).unwrap();
+        requested.content_source = serde_json::from_value(scenario["source"].clone()).unwrap();
+        requested.action = serde_json::from_value(scenario["policy"]["action"].clone()).unwrap();
+        requested.allowed_actions = vec![requested.action];
+        requested.resource = ExactResource::Kv {
+            path: Path::parse(scenario["policy"]["resource"].as_str().unwrap()).unwrap(),
+        };
+        let bundle = provider
+            .resolve_exact(
+                &requested.policy_cid,
+                requested.delegation_cid.as_ref().unwrap(),
+                &requested.authority_material_handle,
+                &requested.authority_material_digest,
+            )
+            .await
+            .expect("exact signed authority material resolves");
+        validate_share_policy_state(&bundle.policy_state, &requested)
+            .expect("signed policy grants the requested share scope");
+
+        for target in [
+            scenario["authorityMaterial"]["policyOwnerDid"]
+                .as_str()
+                .unwrap(),
+            scenario["authorityMaterial"]["attestation"]["enforcerDid"]
+                .as_str()
+                .unwrap(),
+        ] {
+            let db = Database::connect("sqlite::memory:").await.unwrap();
+            crate::migrations::Migrator::up(&db, None).await.unwrap();
+            let authority = DatabaseAuthorityStore::new(db.clone());
+            let bridge = DatabaseAuthorityBridge117::new(db.clone(), authority)
+                .with_authority_providers(
+                    Arc::new(provider.clone()),
+                    Arc::new(provider.status_provider()),
+                    Arc::new(provider.attestation_provider()),
+                );
+
+            bridge
+                .validate_scope(&requested, now)
+                .await
+                .expect("signed authority is live before key revoke");
+            key_revocation::ActiveModel {
+                target_did: Set(
+                    "did:pkh:eip155:1:0x2222222222222222222222222222222222222222".to_owned(),
+                ),
+                scope_key: Set("global".to_owned()),
+                revoked_at: Set(now.unix_timestamp()),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+            bridge
+                .validate_scope(&requested, now)
+                .await
+                .expect("unrelated principal tombstone does not revoke this authority");
+
+            key_revocation::ActiveModel {
+                target_did: Set(tinycloud_auth::identity::principal_did(target).unwrap()),
+                scope_key: Set("global".to_owned()),
+                revoked_at: Set(now.unix_timestamp()),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+            assert_eq!(
+                bridge.validate_scope(&requested, now).await,
+                Err(PortError::Denied),
+                "signed authority must be denied after {target} is revoked"
+            );
+        }
     }
 }

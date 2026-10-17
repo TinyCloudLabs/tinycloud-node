@@ -16,6 +16,9 @@ duckdb = ["dep:arrow", "dep:duckdb"]
 # build. Downstream crates enable it only on their `tinycloud-core`
 # dev-dependency so their own tests can assert exactly-once verification.
 verification-count-test-hook = []
+# Reconstructed pre-sunset signed Share-v2 fixtures only. Off by default so
+# shipped authorization never accepts a caller-selected signature time.
+historical-invocation-test-clock = []
 
 tokio = [
     "sea-orm/runtime-tokio-rustls",

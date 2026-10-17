@@ -83,10 +83,9 @@ fn legacy_v2_creation_open() -> bool {
             .expect("valid v2 creation cutoff")
 }
 
-fn legacy_v2_reads_open() -> bool {
-    OffsetDateTime::now_utc()
-        <= OffsetDateTime::parse(crate::policy_v3::LAST_V2_READ_AT, &Rfc3339)
-            .expect("valid v2 read cutoff")
+fn legacy_v2_reads_open(now: OffsetDateTime) -> bool {
+    now <= OffsetDateTime::parse(crate::policy_v3::LAST_V2_READ_AT, &Rfc3339)
+        .expect("valid v2 read cutoff")
 }
 
 fn legacy_expiry_allowed(expiry: OffsetDateTime) -> bool {
@@ -173,6 +172,8 @@ pub struct ShareV2Runtime {
     migration_ready: bool,
     graph_ready: bool,
     verifier: Option<ExactEmailVerifier>,
+    #[cfg(test)]
+    evaluation_time: Option<OffsetDateTime>,
 }
 
 /// Probes that the `owner_share_policy` table is queryable.
@@ -234,6 +235,24 @@ fn report_probe(check: &str, result: Result<(), DbErr>) -> bool {
 }
 
 impl ShareV2Runtime {
+    fn evaluation_time(&self) -> OffsetDateTime {
+        #[cfg(test)]
+        if let Some(now) = self.evaluation_time {
+            return now;
+        }
+        OffsetDateTime::now_utc()
+    }
+    #[cfg(test)]
+    fn ucan_validation_time(&self) -> Option<f64> {
+        self.evaluation_time
+            .map(|now| now.unix_timestamp_nanos() as f64 / 1_000_000_000.0)
+    }
+
+    #[cfg(not(test))]
+    fn ucan_validation_time(&self) -> Option<f64> {
+        None
+    }
+
     fn static_ready(&self) -> bool {
         self.config.enabled
             && TargetOrigin::parse(self.config.target_origin.clone()).is_ok()
@@ -481,6 +500,8 @@ pub async fn compose(
         migration_ready,
         graph_ready,
         verifier,
+        #[cfg(test)]
+        evaluation_time: None,
     };
     let probe = runtime.clone();
     tokio::spawn(async move {
@@ -830,8 +851,14 @@ pub async fn register_policy(
         )
         .map_err(|_| error(Status::BadRequest, "policy_registration_invalid"))?,
     };
-    validate_policy(&policy, &request, &runtime.config, &runtime.enforcer_did)
-        .map_err(|_| error(Status::Forbidden, "policy_registration_invalid"))?;
+    validate_policy(
+        &policy,
+        &request,
+        &runtime.config,
+        &runtime.enforcer_did,
+        runtime.evaluation_time(),
+    )
+    .map_err(|_| error(Status::Forbidden, "policy_registration_invalid"))?;
     if request.policy.cid == request.owner_delegation.cid
         || request.policy.cid == request.enforcement_delegation.cid
         || request.owner_delegation.cid == request.enforcement_delegation.cid
@@ -1115,6 +1142,7 @@ fn validate_policy(
     request: &RegisterRequest,
     config: &ShareEmailConfig,
     enforcer_did: &str,
+    now: OffsetDateTime,
 ) -> Result<(), ()> {
     if envelope.domain != POLICY_DOMAIN {
         return Err(());
@@ -1138,7 +1166,7 @@ fn validate_policy(
     }
     let policy_expiry = OffsetDateTime::parse(&policy.expires_at, &Rfc3339).map_err(|_| ())?;
     if timestamp(policy_expiry) != policy.expires_at
-        || policy_expiry <= OffsetDateTime::now_utc()
+        || policy_expiry <= now
         || !legacy_expiry_allowed(policy_expiry)
     {
         return Err(());
@@ -1216,10 +1244,7 @@ fn validate_policy(
         return Err(());
     }
     let expiry = OffsetDateTime::parse(&policy.expires_at, &Rfc3339).map_err(|_| ())?;
-    if timestamp(expiry) != policy.expires_at
-        || expiry <= OffsetDateTime::now_utc()
-        || !legacy_expiry_allowed(expiry)
-    {
+    if timestamp(expiry) != policy.expires_at || expiry <= now || !legacy_expiry_allowed(expiry) {
         return Err(());
     }
     Ok(())
@@ -1275,17 +1300,17 @@ async fn verify_owner_delegation(
         return Err(());
     }
     let delegation = TinyCloudDelegation::from_bytes(&bytes).map_err(|_| ())?;
-    verify_delegation_signature(&delegation).await?;
+    verify_delegation_signature(&delegation, runtime.ucan_validation_time()).await?;
     let info = DelegationInfo::try_from(delegation).map_err(|_| ())?;
     if info.delegation_mode == DelegationMode::Terminal
         || !did_principal_matches(&info.delegator, &policy.owner_did)
         || !did_principal_matches(&info.delegate, &policy.share_key_did)
         || row
             .expiry
-            .is_none_or(|expiry| expiry <= OffsetDateTime::now_utc())
+            .is_none_or(|expiry| expiry <= runtime.evaluation_time())
         || row
             .not_before
-            .is_some_and(|not_before| not_before > OffsetDateTime::now_utc())
+            .is_some_and(|not_before| not_before > runtime.evaluation_time())
     {
         return Err(());
     }
@@ -1367,13 +1392,18 @@ fn owner_delegation_abilities_match(
     true
 }
 
-async fn verify_delegation_signature(delegation: &TinyCloudDelegation) -> Result<(), ()> {
+async fn verify_delegation_signature(
+    delegation: &TinyCloudDelegation,
+    evaluation_time: Option<f64>,
+) -> Result<(), ()> {
     match delegation {
         TinyCloudDelegation::Ucan(ucan) => {
             tinycloud_core::did_resolution::verify_ucan_signature(ucan)
                 .await
                 .map_err(|_| ())?;
-            ucan.payload().validate_time(None).map_err(|_| ())?;
+            ucan.payload()
+                .validate_time(evaluation_time)
+                .map_err(|_| ())?;
         }
         TinyCloudDelegation::Cacao(cacao) => {
             cacao.verify().await.map_err(|_| ())?;
@@ -1933,10 +1963,11 @@ async fn registered_policy(
         },
         &runtime.config,
         &runtime.enforcer_did,
+        runtime.evaluation_time(),
     )
     .map_err(|_| ())?;
     let expiry = OffsetDateTime::parse(&row.expires_at, &Rfc3339).map_err(|_| ())?;
-    if expiry <= OffsetDateTime::now_utc() {
+    if expiry <= runtime.evaluation_time() {
         return Err(());
     }
     let matcher = match policy.policy.recipient_matcher.kind.as_str() {
@@ -2009,7 +2040,19 @@ async fn verify_registered_ancestors(
         &registered.envelope,
         &registered.row.policy_cid,
         &enforcement,
+    )?;
+    tinycloud_core::key_authority::check_principals(
+        &runtime.conn,
+        &[
+            registered.row.owner_did.clone(),
+            registered.row.share_key_did.clone(),
+            registered.row.enforcer_did.clone(),
+        ],
+        std::slice::from_ref(&registered.row.space_id),
     )
+    .await
+    .map_err(|_| ())?;
+    Ok(())
 }
 
 async fn cid_revoked<C: ConnectionTrait>(db: &C, cid: &str) -> Result<bool, ()> {
@@ -2308,7 +2351,7 @@ fn verify_runtime_delegation(
     )
     .map_err(|_| ())?;
     let session_expiry = OffsetDateTime::parse(session_expires_at, &Rfc3339).map_err(|_| ())?;
-    if expiry <= OffsetDateTime::now_utc() || expiry > session_expiry {
+    if expiry <= runtime.evaluation_time() || expiry > session_expiry {
         return Err(());
     }
     Ok(())
@@ -2871,7 +2914,7 @@ pub async fn invoke_v2(
     if !runtime.live().await {
         return Err(error(Status::ServiceUnavailable, "capability_unavailable"));
     }
-    if !legacy_v2_reads_open() {
+    if !legacy_v2_reads_open(runtime.evaluation_time()) {
         return Err(error(Status::Gone, "legacy_v2_reads_closed"));
     }
     let raw = read_body(data).await?;
@@ -2882,7 +2925,7 @@ pub async fn invoke_v2(
         .await
         .map_err(|_| error(Status::ServiceUnavailable, "capability_unavailable"))?
         .ok_or_else(|| share_error("invoke_denied"))?;
-    let now = OffsetDateTime::now_utc();
+    let now = runtime.evaluation_time();
     if session.revoked_at.is_some()
         || OffsetDateTime::parse(&session.expires_at, &Rfc3339)
             .map_err(|_| share_error("invoke_denied"))?
@@ -2928,6 +2971,13 @@ pub async fn invoke_v2(
     verify_registered_ancestors(runtime, &registered, None)
         .await
         .map_err(|_| share_error("invoke_denied"))?;
+    tinycloud_core::key_authority::check_principals(
+        &runtime.conn,
+        std::slice::from_ref(&challenge.holder_did),
+        std::slice::from_ref(&registered.row.space_id),
+    )
+    .await
+    .map_err(|_| share_error("invoke_denied"))?;
     let credential_digest = session
         .binding_json
         .get("credentialDigest")
@@ -3267,13 +3317,24 @@ pub async fn authorize_delivery_v2(
     if !runtime.live().await {
         return Err(error(Status::ServiceUnavailable, "capability_unavailable"));
     }
-    invocation_model::verify_and_authorize(
-        &runtime.conn,
-        &invocation.0 .0,
-        OffsetDateTime::now_utc(),
-    )
-    .await
-    .map_err(|_| error(Status::Unauthorized, "delivery_authorization_invalid"))?;
+    let now = runtime.evaluation_time();
+    #[cfg(test)]
+    let authorization = match runtime.ucan_validation_time() {
+        Some(signed_time) => {
+            invocation_model::verify_and_authorize_with_signed_time(
+                &runtime.conn,
+                &invocation.0 .0,
+                now,
+                signed_time,
+            )
+            .await
+        }
+        None => invocation_model::verify_and_authorize(&runtime.conn, &invocation.0 .0, now).await,
+    };
+    #[cfg(not(test))]
+    let authorization =
+        invocation_model::verify_and_authorize(&runtime.conn, &invocation.0 .0, now).await;
+    authorization.map_err(|_| error(Status::Unauthorized, "delivery_authorization_invalid"))?;
     let raw = read_body(data).await?;
     let request: V2DeliveryRequest = serde_json::from_slice(&raw)
         .map_err(|_| error(Status::BadRequest, "delivery_authorization_invalid"))?;
@@ -3294,9 +3355,25 @@ pub async fn authorize_delivery_v2(
     verify_registered_ancestors(runtime, &registered, None)
         .await
         .map_err(|_| share_error("delivery_authorization_invalid"))?;
+    let proof_ids = invocation
+        .0
+         .0
+        .parents
+        .iter()
+        .copied()
+        .map(tinycloud_core::hash::Hash::from)
+        .collect::<Vec<_>>();
+    tinycloud_core::key_authority::check_invoker_chain(
+        &runtime.conn,
+        &proof_ids,
+        &invocation.0 .0.invoker,
+        std::slice::from_ref(&registered.row.space_id),
+    )
+    .await
+    .map_err(|_| share_error("delivery_authorization_invalid"))?;
     let expires = OffsetDateTime::parse(&request.expires_at, &Rfc3339)
         .map_err(|_| share_error("delivery_authorization_invalid"))?;
-    let now = OffsetDateTime::now_utc();
+    let now = runtime.evaluation_time();
     if expires <= now
         || expires > now + time::Duration::minutes(5)
         || decode_canonical_b64(&request.jti, 16).map_or(true, |value| value.len() != 16)
@@ -3398,11 +3475,12 @@ mod tests {
             listener.local_addr().unwrap().port()
         );
         let ucan = signed_ucan(&issuer, &JWK::generate_ed25519().unwrap(), Algorithm::EdDSA);
-        assert!(
-            super::verify_delegation_signature(&TinyCloudDelegation::Ucan(Box::new(ucan)))
-                .await
-                .is_err()
-        );
+        assert!(super::verify_delegation_signature(
+            &TinyCloudDelegation::Ucan(Box::new(ucan)),
+            None
+        )
+        .await
+        .is_err());
         assert_no_connections(&[&listener]).await;
     }
     use super::*;
@@ -3411,6 +3489,8 @@ mod tests {
 
     #[path = "alias_revocation_tests.rs"]
     mod alias_revocation_tests;
+    #[path = "share_v2_legacy_key_tests.rs"]
+    mod share_v2_legacy_key_tests;
 
     #[test]
     fn policy_domain_matches_the_sdk_wire_contract() {
@@ -3508,18 +3588,39 @@ mod tests {
     fn policy_validation_accepts_arbitrary_exact_email_matchers() {
         let (mut envelope, request, config) = sample_policy();
         envelope.policy.recipient_matcher.value = "person+tag@any.example".to_owned();
-        assert!(validate_policy(&envelope, &request, &config, "did:key:z6MkEnforcer").is_ok());
+        assert!(validate_policy(
+            &envelope,
+            &request,
+            &config,
+            "did:key:z6MkEnforcer",
+            OffsetDateTime::now_utc()
+        )
+        .is_ok());
     }
 
     #[test]
     fn policy_validation_rejects_path_and_action_widening() {
         let (mut envelope, request, config) = sample_policy();
         envelope.policy.resource.path = "shares/share-1/../other.md".to_owned();
-        assert!(validate_policy(&envelope, &request, &config, "did:key:z6MkEnforcer").is_err());
+        assert!(validate_policy(
+            &envelope,
+            &request,
+            &config,
+            "did:key:z6MkEnforcer",
+            OffsetDateTime::now_utc()
+        )
+        .is_err());
 
         let (mut envelope, request, config) = sample_policy();
         envelope.policy.actions.push("tinycloud.kv/list".to_owned());
-        assert!(validate_policy(&envelope, &request, &config, "did:key:z6MkEnforcer").is_err());
+        assert!(validate_policy(
+            &envelope,
+            &request,
+            &config,
+            "did:key:z6MkEnforcer",
+            OffsetDateTime::now_utc()
+        )
+        .is_err());
     }
 
     #[test]
@@ -3527,12 +3628,26 @@ mod tests {
         let (mut envelope, request, config) = sample_policy();
         envelope.policy.resource.path = "shares/other/document.md".to_owned();
         envelope.policy.content_source.path = "shares/other/document.md".to_owned();
-        assert!(validate_policy(&envelope, &request, &config, "did:key:z6MkEnforcer").is_err());
+        assert!(validate_policy(
+            &envelope,
+            &request,
+            &config,
+            "did:key:z6MkEnforcer",
+            OffsetDateTime::now_utc()
+        )
+        .is_err());
 
         let (mut envelope, request, config) = sample_policy();
         envelope.policy.content_source_digest =
             "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned();
-        assert!(validate_policy(&envelope, &request, &config, "did:key:z6MkEnforcer").is_err());
+        assert!(validate_policy(
+            &envelope,
+            &request,
+            &config,
+            "did:key:z6MkEnforcer",
+            OffsetDateTime::now_utc()
+        )
+        .is_err());
     }
 
     #[test]

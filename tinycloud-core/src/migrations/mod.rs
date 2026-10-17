@@ -26,6 +26,8 @@ pub mod m20261007_000000_database_alias;
 pub mod m20261007_010000_database_identity_fence;
 pub mod m20261014_000000_delegation_cid_alias;
 pub mod m20261015_000000_delegation_cursor_index;
+pub mod m20261016_000000_policy_witness;
+pub mod m20261016_000001_key_revocation;
 
 pub struct Migrator;
 
@@ -60,6 +62,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20261007_010000_database_identity_fence::Migration),
             Box::new(m20261014_000000_delegation_cid_alias::Migration),
             Box::new(m20261015_000000_delegation_cursor_index::Migration),
+            Box::new(m20261016_000000_policy_witness::Migration),
+            Box::new(m20261016_000001_key_revocation::Migration),
         ]
     }
 }

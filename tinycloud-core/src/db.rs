@@ -258,6 +258,29 @@ pub enum TxError<S: StorageSetup, K: Secrets> {
     Encryption(#[from] crate::encryption::EncryptionError),
     #[error("delegation-chain-traversal-limit-exceeded")]
     ChainTraversalLimitExceeded,
+    #[error("authorization-dependency-denied")]
+    AuthorizationDenied,
+    #[error("authorization-revoke-wait-timeout")]
+    AuthorizationWaitTimeout,
+}
+
+fn authority_error<S: StorageSetup, K: Secrets>(error: DbErr) -> TxError<S, K> {
+    if matches!(&error, DbErr::Custom(message) if message == "authorization-revoke-wait-timeout") {
+        TxError::AuthorizationWaitTimeout
+    } else if crate::key_authority::is_revoked_error(&error) {
+        TxError::AuthorizationDenied
+    } else {
+        TxError::Db(error)
+    }
+}
+
+fn witness_error<S: StorageSetup, K: Secrets>(
+    error: crate::policy_witness::WitnessError,
+) -> TxError<S, K> {
+    match error {
+        crate::policy_witness::WitnessError::Database(error) => authority_error(error),
+        _ => TxError::AuthorizationDenied,
+    }
 }
 
 #[non_exhaustive]
@@ -368,6 +391,13 @@ where
                 .await?;
         }
         delegation_cid_alias::backfill(&tx, encryption.as_ref()).await?;
+        // Release gate: Amos must run the read-only count inventory on a
+        // production snapshot before deploying this migration. Once enabled,
+        // legacy admissions are reconstructed atomically or startup refuses
+        // to serve them; neither CID indexing nor witness rows partially land.
+        crate::policy_witness::backfill_in_transaction(&tx, encryption.as_ref())
+            .await
+            .map_err(|_| DbErr::Custom("policy-witness-backfill-unavailable".into()))?;
         tx.commit().await?;
         let writer_lock = (pool.get_database_backend() == sea_orm::DatabaseBackend::Sqlite)
             .then(|| Arc::new(tokio::sync::Mutex::new(())));
@@ -445,6 +475,11 @@ impl<C, B, K> SpaceDatabase<C, B, K> {
     /// committed alongside ordinary delegation/revocation writes.
     pub fn connection(&self) -> &C {
         &self.conn
+    }
+
+    /// Encryption key for verifying signed authority from persisted rows.
+    pub fn column_encryption(&self) -> Option<&ColumnEncryption> {
+        self.encryption.as_ref()
     }
 
     /// Share the SQL/DuckDB cutover fence cache with all node data paths.
@@ -559,7 +594,19 @@ where
         invocation: &crate::util::InvocationInfo,
         now: OffsetDateTime,
     ) -> Result<(), crate::models::invocation::Error> {
-        invocation::verify_and_authorize(&self.conn, invocation, now).await
+        invocation::verify_and_authorize(&self.conn, invocation, now).await?;
+        let spaces = invocation
+            .spaces()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        self.ticket_authority_unrevoked(&invocation.parents, &invocation.invoker, &spaces)
+            .await
+            .map_err(|_| {
+                crate::models::invocation::InvocationError::UnauthorizedInvoker(
+                    "authorization-dependency-denied".into(),
+                )
+            })?;
+        Ok(())
     }
 
     /// [`Self::authorize_invocation`] for an invocation whose signature and
@@ -571,7 +618,20 @@ where
         invocation: &crate::AdmittedInvocation,
         now: OffsetDateTime,
     ) -> Result<(), crate::models::invocation::Error> {
-        invocation::authorize_admitted(&self.conn, &invocation.invocation().0, now, None).await
+        let admitted = &invocation.invocation().0;
+        invocation::authorize_admitted(&self.conn, admitted, now, None).await?;
+        let spaces = admitted
+            .spaces()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        self.ticket_authority_unrevoked(&admitted.parents, &admitted.invoker, &spaces)
+            .await
+            .map_err(|_| {
+                crate::models::invocation::InvocationError::UnauthorizedInvoker(
+                    "authorization-dependency-denied".into(),
+                )
+            })?;
+        Ok(())
     }
 
     /// Check the persisted revocation state for cited delegations and every
@@ -584,12 +644,51 @@ where
         let chain_ids = revocation::ancestor_chain_ids_for_roots(&self.conn, &roots)
             .await
             .map_err(|error| DbErr::Custom(error.to_string()))?;
-        for id in chain_ids {
-            if revocation::is_revoked(&self.conn, &id).await? {
+        for chunk in chain_ids.chunks(200) {
+            if !revocation::effective_rows(&self.conn, chunk)
+                .await?
+                .is_empty()
+            {
                 return Ok(false);
             }
         }
         Ok(true)
+    }
+
+    /// Recheck a minted capability ticket against its signed subject, proof
+    /// closure and registration witness. A proofless root still depends on its
+    /// subject; a policy session also depends on its historical registration.
+    pub async fn ticket_authority_unrevoked(
+        &self,
+        roots: &[Cid],
+        subject: &str,
+        spaces: &[String],
+    ) -> Result<(), DbErr> {
+        let ids = roots.iter().copied().map(Hash::from).collect::<Vec<_>>();
+        let mut principals = crate::auth_graph::load_chain_principals(&self.conn, &ids)
+            .await
+            .map_err(|error| DbErr::Custom(error.to_string()))?;
+        principals.push(subject.to_owned());
+        let policy_cid = policy_cid_in_chain(&self.conn, &ids).await?;
+        if let Some(policy_cid) = policy_cid.as_deref() {
+            let witness = crate::policy_witness::revocation_dependencies(&self.conn, policy_cid)
+                .await
+                .map_err(|error| DbErr::Custom(error.to_string()))?;
+            principals.extend(witness.principals.iter().cloned());
+            let checked_spaces = if spaces.is_empty() {
+                &witness.spaces
+            } else {
+                spaces
+            };
+            crate::policy_witness::check_dependencies(&self.conn, &witness, checked_spaces)
+                .await
+                .map_err(|error| DbErr::Custom(error.to_string()))?;
+        }
+        crate::key_authority::check_principals(&self.conn, &principals, spaces).await?;
+        if !self.delegation_chains_unrevoked(roots).await? {
+            return Err(DbErr::Custom("hook ticket authority revoked".into()));
+        }
+        Ok(())
     }
 
     /// Load and reparse a delegation from its exact signed Authorization
@@ -638,6 +737,13 @@ where
     ) -> Result<DelegationQueryPage, AccountDelegationQueryError> {
         let now = OffsetDateTime::now_utc();
         invocation::verify_and_authorize(&self.conn, invocation, now)
+            .await
+            .map_err(|_| AccountDelegationQueryError::Unauthorized)?;
+        let spaces = invocation
+            .spaces()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        self.ticket_authority_unrevoked(&invocation.parents, &invocation.invoker, &spaces)
             .await
             .map_err(|_| AccountDelegationQueryError::Unauthorized)?;
         let principal = account_query_principal(&self.conn, invocation)
@@ -1316,6 +1422,28 @@ where
         Ok(self.acquire_exclusive_chain_guards_for_keys(keys).await)
     }
 
+    /// One sorted registry acquisition for CID aliases and DID principals.
+    /// Separate acquisitions can deadlock when a root CID overlaps another
+    /// request's target principal guard.
+    async fn acquire_authority_chain_guards(
+        &self,
+        roots: &[Hash],
+        principals: &[String],
+    ) -> Result<Vec<ExclusiveChainGuard>, TxError<B, K>> {
+        let mut keys = crate::auth_graph::load_chain_lock_ids(&self.conn, roots)
+            .await
+            .map_err(|error| match error {
+                revocation::ChainTraversalError::Db(error) => TxError::Db(error),
+                revocation::ChainTraversalError::LimitExceeded => {
+                    TxError::ChainTraversalLimitExceeded
+                }
+            })?;
+        for principal in principals {
+            keys.push(crate::key_authority::principal_lock_id(principal).map_err(TxError::Db)?);
+        }
+        Ok(self.acquire_exclusive_chain_guards_for_keys(keys).await)
+    }
+
     /// Hold shared guards for the canonical ancestor identities of `roots`.
     ///
     /// These coordinate admission with delegation/revocation writers using
@@ -1332,7 +1460,7 @@ where
                 revocation::ChainTraversalError::Db(error) => error,
                 error => DbErr::Custom(error.to_string()),
             })?;
-        Ok(self.acquire_shared_chain_guards_for_keys(keys).await)
+        self.acquire_shared_chain_guards_bounded(keys).await
     }
 
     /// Resolve `keys` to their per-delegation locks in a stable global order.
@@ -1430,6 +1558,20 @@ where
         guards
     }
 
+    /// Never park a read indefinitely behind a pending revoke. Dropping the
+    /// timed-out future also releases any earlier guards in its sorted set.
+    async fn acquire_shared_chain_guards_bounded(
+        &self,
+        keys: Vec<Hash>,
+    ) -> Result<Vec<SharedChainGuard>, DbErr> {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            self.acquire_shared_chain_guards_for_keys(keys),
+        )
+        .await
+        .map_err(|_| DbErr::Custom("authorization-revoke-wait-timeout".into()))
+    }
+
     async fn acquire_kv_object_guards(
         &self,
         keys: &[(SpaceId, Path)],
@@ -1474,7 +1616,168 @@ where
             None => None,
         };
         let tx = self.begin_graph_transaction().await?;
-        // `transact` takes the database-side sequence lock itself, first.
+        crate::kv_sync::lock_space_sequences(&tx, &spaces).await?;
+        let mut admission_principals = Vec::new();
+        let mut admission_scopes = Vec::new();
+        let mut admission_cids = Vec::new();
+        for event in &events {
+            match event {
+                Event::Delegation(delegation) => {
+                    let event_scopes = delegation
+                        .0
+                        .capabilities
+                        .iter()
+                        .filter_map(|capability| {
+                            capability.resource.space().map(ToString::to_string)
+                        })
+                        .collect::<Vec<_>>();
+                    let parents = delegation
+                        .0
+                        .parents
+                        .iter()
+                        .copied()
+                        .map(Hash::from)
+                        .collect::<Vec<_>>();
+                    if !parents.is_empty() {
+                        let (ids, _) = crate::auth_graph::load_closure_edges(&tx, &parents)
+                            .await
+                            .map_err(|error| match error {
+                            revocation::ChainTraversalError::Db(error) => TxError::Db(error),
+                            revocation::ChainTraversalError::LimitExceeded => {
+                                TxError::ChainTraversalLimitExceeded
+                            }
+                        })?;
+                        if let Some(policy_cid) =
+                            policy_cid_from_ids(&tx, &ids)
+                                .await
+                                .map_err(|error| match &error {
+                                    DbErr::Custom(message)
+                                        if message.starts_with("policy-session-proof-") =>
+                                    {
+                                        TxError::AuthorizationDenied
+                                    }
+                                    _ => TxError::Db(error),
+                                })?
+                        {
+                            let dependencies =
+                                crate::policy_witness::revocation_dependencies(&tx, &policy_cid)
+                                    .await
+                                    .map_err(|error| match error {
+                                        crate::policy_witness::WitnessError::Database(source) => {
+                                            TxError::Db(source)
+                                        }
+                                        _ => TxError::AuthorizationDenied,
+                                    })?;
+                            admission_cids.extend(dependencies.signed_cids);
+                            admission_principals.extend(dependencies.principals);
+                            if event_scopes.is_empty()
+                                || delegation
+                                    .0
+                                    .capabilities
+                                    .iter()
+                                    .any(|cap| cap.resource.space().is_none())
+                            {
+                                admission_scopes.extend(dependencies.spaces);
+                            }
+                        }
+                        admission_cids.extend(ids);
+                    }
+                    admission_principals.extend(
+                        crate::auth_graph::load_chain_principals(&tx, &parents)
+                            .await
+                            .map_err(|error| TxError::Db(DbErr::Custom(error.to_string())))?,
+                    );
+                    admission_principals.push(delegation.0.delegator.clone());
+                    admission_principals.push(delegation.0.delegate.clone());
+                    admission_scopes.extend(event_scopes);
+                }
+                Event::Revocation(revocation) => {
+                    lock_revocation_alias_rows(&tx, Hash::from(revocation.0.revoked)).await?;
+                    let parents = revocation
+                        .0
+                        .parents
+                        .iter()
+                        .copied()
+                        .map(Hash::from)
+                        .collect::<Vec<_>>();
+                    let target_scopes = abilities::Entity::find()
+                        .filter(abilities::Column::Delegation.eq(Hash::from(revocation.0.revoked)))
+                        .all(&tx)
+                        .await?
+                        .into_iter()
+                        .filter_map(|row| row.resource.space().map(ToString::to_string))
+                        .collect::<Vec<_>>();
+                    if !parents.is_empty() {
+                        let policy_cid = policy_cid_in_chain(&tx, &parents).await.map_err(
+                            |error| match &error {
+                                DbErr::Custom(message)
+                                    if message.starts_with("policy-session-proof-") =>
+                                {
+                                    TxError::AuthorizationDenied
+                                }
+                                _ => TxError::Db(error),
+                            },
+                        )?;
+                        if let Some(policy_cid) = policy_cid {
+                            let dependencies =
+                                crate::policy_witness::revocation_dependencies(&tx, &policy_cid)
+                                    .await
+                                    .map_err(|error| match error {
+                                        crate::policy_witness::WitnessError::Database(source) => {
+                                            TxError::Db(source)
+                                        }
+                                        _ => TxError::AuthorizationDenied,
+                                    })?;
+                            admission_cids.extend(dependencies.signed_cids);
+                            admission_principals.extend(dependencies.principals);
+                            if target_scopes.is_empty() {
+                                admission_scopes.extend(dependencies.spaces);
+                            }
+                        }
+                    }
+                    let principals =
+                        match crate::auth_graph::load_chain_principals(&tx, &parents).await {
+                            Ok(principals) => principals,
+                            Err(revocation::ChainTraversalError::Db(DbErr::Custom(reason)))
+                                if reason == "authorization-chain-missing" =>
+                            {
+                                // Preserve signed issuer-policy refusal when a
+                                // claimed revocation parent was never admitted.
+                                revocation::verify(&revocation.0.revocation).await?;
+                                return Err(TxError::InvalidRevocation(
+                                    revocation::RevocationError::MissingParents,
+                                ));
+                            }
+                            Err(revocation::ChainTraversalError::Db(error)) => {
+                                return Err(TxError::Db(error));
+                            }
+                            Err(revocation::ChainTraversalError::LimitExceeded) => {
+                                return Err(TxError::ChainTraversalLimitExceeded);
+                            }
+                        };
+                    admission_principals.extend(principals);
+                    admission_principals.push(revocation.0.revoker.clone());
+                    // The CID action is scoped to the capabilities it revokes;
+                    // a key cutoff in an unrelated space must not block it.
+                    admission_scopes.extend(target_scopes);
+                }
+                _ => {}
+            }
+        }
+        crate::key_authority::lock_signed_dependencies(&tx, &admission_cids).await?;
+        if !admission_cids.is_empty()
+            && !revocation::effective_rows(&tx, &admission_cids)
+                .await?
+                .is_empty()
+        {
+            return Err(TxError::AuthorizationDenied);
+        }
+        if !admission_principals.is_empty() {
+            crate::key_authority::lock_targets(&tx, &admission_principals, false).await?;
+            crate::key_authority::check_principals(&tx, &admission_principals, &admission_scopes)
+                .await
+                .map_err(authority_error::<B, K>)?;
+        }
 
         let result = transact(
             &tx,
@@ -1483,7 +1786,7 @@ where
             events,
             self.encryption.as_ref(),
             None,
-            &[],
+            &spaces,
         )
         .await?;
 
@@ -1678,6 +1981,25 @@ where
     }
 
     pub async fn delegate(&self, delegation: Delegation) -> Result<TransactResult, TxError<B, K>> {
+        // Fresh expired/not-yet-valid statements cannot be admitted regardless
+        // of their parents. An exact already-registered statement retains its
+        // existing idempotent behavior; the normal authority guards still run
+        // before that existing-row fast path returns.
+        let retained_hash = delegation.content_hash();
+        let invalid_time = match &delegation.0.delegation {
+            TinyCloudDelegation::Ucan(ucan) => ucan.payload().validate_time(None).is_err(),
+            TinyCloudDelegation::Cacao(cacao) => !cacao.payload().valid_now(),
+        };
+        if invalid_time
+            && delegation::Entity::find_by_id(retained_hash)
+                .one(&self.conn)
+                .await?
+                .is_none()
+        {
+            return Err(TxError::InvalidDelegation(
+                delegation::DelegationError::InvalidTime,
+            ));
+        }
         let parent_hashes: Vec<Hash> = delegation
             .0
             .parents
@@ -1685,13 +2007,35 @@ where
             .copied()
             .map(Hash::from)
             .collect();
-        let retained_hash = delegation.content_hash();
         // Capture expected row counts before consuming the delegation.
         let expected_ability_count = delegation.0.capabilities.len() as u64;
         let expected_parent_count = parent_hashes.len() as u64;
         let roots = delegation_guard_roots(retained_hash, &parent_hashes);
+        let mut principals =
+            match crate::auth_graph::load_chain_principals(&self.conn, &parent_hashes).await {
+                Ok(principals) => principals,
+                Err(revocation::ChainTraversalError::Db(DbErr::Custom(reason)))
+                    if reason == "authorization-chain-missing" =>
+                {
+                    // The signature and DID method were historically checked
+                    // before a missing parent. Do that only on this failing
+                    // path; successful imports still verify once in process().
+                    delegation::verify(&delegation.0.delegation).await?;
+                    return Err(TxError::InvalidDelegation(
+                        delegation::DelegationError::MissingParents,
+                    ));
+                }
+                Err(revocation::ChainTraversalError::Db(error)) => return Err(TxError::Db(error)),
+                Err(revocation::ChainTraversalError::LimitExceeded) => {
+                    return Err(TxError::ChainTraversalLimitExceeded);
+                }
+            };
+        principals.push(delegation.0.delegator.clone());
+        principals.push(delegation.0.delegate.clone());
         let authz_start = Instant::now();
-        let chain_guards = self.acquire_chain_guards(&roots).await;
+        let chain_guards = self
+            .acquire_authority_chain_guards(&roots, &principals)
+            .await;
         crate::telemetry::observe_stage(
             crate::telemetry::InvocationStage::AuthorizationGraphLoad,
             crate::telemetry::StageOutcome::from(chain_guards.is_ok()),
@@ -1776,6 +2120,9 @@ where
         let mut roots = vec![Hash::from(revocation.0.revoked)];
         roots.extend(revocation.0.parents.iter().copied().map(Hash::from));
         let revocation_start = Instant::now();
+        // A CID revoke writes CID state, not a principal tombstone. Acquiring
+        // an exclusive principal lock here would queue unrelated grants from
+        // the same signer behind an account proof held on the target CID.
         let chain_guards = self.acquire_chain_guards(&roots).await;
         crate::telemetry::observe_stage(
             crate::telemetry::InvocationStage::RevocationWork,
@@ -1785,6 +2132,236 @@ where
         let _chain_guards = chain_guards?;
         self.transact(vec![Event::Revocation(Box::new(revocation))])
             .await
+    }
+
+    /// Atomically publish a permanent DID-principal cutoff and its retryable
+    /// receipt. The signed request is verified by the Node route; authority
+    /// and nonce precedence are checked again on the transaction snapshot.
+    pub async fn revoke_key(
+        &self,
+        request: key_revocation::VerifiedKeyRevoke,
+    ) -> Result<key_revocation::KeyRevokeReceipt, key_revocation::KeyRevokeError> {
+        use key_revocation::{KeyRevokeError, KeyRevokeScope};
+        let db_error = |source, write_may_have_applied| KeyRevokeError::Db {
+            source,
+            write_may_have_applied,
+        };
+        let nonce_key = (request.issuer_did.clone(), request.nonce.clone());
+        let exact_receipt = |row: &key_revocation::nonce::Model| {
+            if row.authorization_hash != request.authorization_hash
+                || row.target_did != request.target_did
+            {
+                return Ok(None);
+            }
+            let receipt: key_revocation::KeyRevokeReceipt =
+                serde_json::from_slice(&row.receipt_bytes)
+                    .map_err(|_| db_error(DbErr::Custom("key-receipt-invalid".into()), false))?;
+            if receipt.scope != request.scope || receipt.target_did != request.target_did {
+                return Err(KeyRevokeError::Forbidden);
+            }
+            Ok(Some(receipt))
+        };
+        // This read never discloses a target. The original signed request
+        // proves possession of the same issuer key even after its revocation.
+        let existing = key_revocation::nonce::Entity::find_by_id(nonce_key.clone())
+            .one(&self.conn)
+            .await
+            .map_err(|error| db_error(error, false))?;
+        if let Some(row) = &existing {
+            if let Some(receipt) = exact_receipt(row)? {
+                return Ok(receipt);
+            }
+        }
+
+        let target_key = crate::key_authority::principal_lock_id(&request.target_did)
+            .map_err(|error| db_error(error, false))?;
+        let _target_guard = self
+            .acquire_exclusive_chain_guards_for_keys(vec![target_key])
+            .await;
+        let _writer = match &self.writer_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+        let tx = self
+            .begin_graph_transaction()
+            .await
+            .map_err(|error| db_error(error, false))?;
+        // A concurrent request may have committed the identical self-revoke
+        // while this one waited for its target lock. Its receipt remains
+        if let Some(row) = key_revocation::nonce::Entity::find_by_id(nonce_key.clone())
+            .one(&tx)
+            .await
+            .map_err(|error| db_error(error, false))?
+        {
+            if let Some(receipt) = exact_receipt(&row)? {
+                return Ok(receipt);
+            }
+        }
+        let now = OffsetDateTime::now_utc();
+        let direct = if tinycloud_auth::identity::did_principal_matches(
+            &request.issuer_did,
+            &request.target_did,
+        ) {
+            true
+        } else if let KeyRevokeScope::Space { space_id } = &request.scope {
+            space_id
+                .parse::<SpaceId>()
+                .ok()
+                .filter(|space| space.to_string() == *space_id)
+                .is_some_and(|space| {
+                    tinycloud_auth::identity::did_principal_matches(
+                        space.did().as_str(),
+                        &request.issuer_did,
+                    )
+                })
+        } else {
+            false
+        };
+        let mut recovery_expires_at = None;
+        let authorized = if direct {
+            let spaces = match &request.scope {
+                KeyRevokeScope::Global => Vec::new(),
+                KeyRevokeScope::Space { space_id } => vec![space_id.clone()],
+            };
+            match crate::key_authority::check_principals(
+                &tx,
+                std::slice::from_ref(&request.issuer_did),
+                &spaces,
+            )
+            .await
+            {
+                Ok(()) => true,
+                Err(error) if crate::key_authority::is_revoked_error(&error) => false,
+                Err(error) => return Err(db_error(error, false)),
+            }
+        } else {
+            crate::recovery_authority::is_authorized(
+                &tx,
+                &request,
+                now,
+                self.encryption.as_ref(),
+                &mut recovery_expires_at,
+            )
+            .await
+            .map_err(|error| db_error(error, false))?
+        };
+        if !authorized {
+            // A second process may have committed the same signed request
+            // before this authority read. Its receipt is still retryable even
+            // when that commit has revoked the issuer itself.
+            if let Some(row) = key_revocation::nonce::Entity::find_by_id(nonce_key.clone())
+                .one(&tx)
+                .await
+                .map_err(|error| db_error(error, false))?
+            {
+                if let Some(receipt) = exact_receipt(&row)? {
+                    return Ok(receipt);
+                }
+            }
+            return Err(KeyRevokeError::Forbidden);
+        }
+        // Recovery already holds the target and issuer UPDATE locks along
+        // with shared proof principals in one canonical order. Direct
+        // self/space-owner revokes have no proof principal locks to upgrade.
+        if direct {
+            crate::key_authority::lock_targets(
+                &tx,
+                &[request.target_did.clone(), request.issuer_did.clone()],
+                true,
+            )
+            .await
+            .map_err(|error| db_error(error, false))?;
+        }
+        // The issuer/target database row locks are the cross-process
+        // serialization point. Re-read the durable nonce before fresh
+        // liveness or time checks: a simultaneous self-revoke cannot turn an
+        // identical committed request into a 403.
+        let post_lock_nonce = key_revocation::nonce::Entity::find_by_id(nonce_key.clone())
+            .one(&tx)
+            .await
+            .map_err(|error| db_error(error, false))?;
+        if let Some(row) = &post_lock_nonce {
+            if let Some(receipt) = exact_receipt(row)? {
+                return Ok(receipt);
+            }
+        }
+        let spaces = match &request.scope {
+            KeyRevokeScope::Global => Vec::new(),
+            KeyRevokeScope::Space { space_id } => vec![space_id.clone()],
+        };
+        match crate::key_authority::check_principals(
+            &tx,
+            std::slice::from_ref(&request.issuer_did),
+            &spaces,
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(error) if crate::key_authority::is_revoked_error(&error) => {
+                return Err(KeyRevokeError::Forbidden);
+            }
+            Err(error) => return Err(db_error(error, false)),
+        }
+        let cutoff_now = OffsetDateTime::now_utc();
+        let now_seconds = cutoff_now.unix_timestamp();
+        let issued_at = request.not_before;
+        if recovery_expires_at.is_some_and(|expiry| cutoff_now >= expiry)
+            || issued_at > now_seconds.saturating_add(30)
+            || request.expires_at <= now_seconds
+            || request.expires_at.saturating_sub(issued_at) > 60
+            || request.expires_at <= issued_at
+            || request
+                .valid_after
+                .is_some_and(|not_before| now_seconds < not_before)
+        {
+            return Err(KeyRevokeError::Forbidden);
+        }
+        // A changed nonce is disclosed only after the fresh signer and
+        // signed-time checks, never to a revoked or unrelated signer.
+        if post_lock_nonce.is_some() {
+            return Err(KeyRevokeError::Conflict);
+        }
+        let scope_key = request.scope.storage_key();
+        let existing_cutoff =
+            key_revocation::Entity::find_by_id((request.target_did.clone(), scope_key.clone()))
+                .one(&tx)
+                .await
+                .map_err(|error| db_error(error, false))?;
+        let revoked_at = match existing_cutoff {
+            Some(row) => row.revoked_at,
+            None => {
+                let cutoff = now_seconds;
+                key_revocation::ActiveModel {
+                    target_did: Set(request.target_did.clone()),
+                    scope_key: Set(scope_key),
+                    revoked_at: Set(cutoff),
+                }
+                .insert(&tx)
+                .await
+                .map_err(|error| db_error(error, false))?;
+                cutoff
+            }
+        };
+        let receipt = key_revocation::KeyRevokeReceipt {
+            revoked: true,
+            target_did: request.target_did.clone(),
+            scope: request.scope,
+            revoked_at,
+        };
+        let receipt_bytes = serde_json::to_vec(&receipt)
+            .map_err(|_| db_error(DbErr::Custom("key-receipt-encode-invalid".into()), false))?;
+        key_revocation::nonce::ActiveModel {
+            issuer_did: Set(nonce_key.0),
+            nonce: Set(nonce_key.1),
+            authorization_hash: Set(request.authorization_hash.to_vec()),
+            target_did: Set(request.target_did),
+            receipt_bytes: Set(receipt_bytes),
+        }
+        .insert(&tx)
+        .await
+        .map_err(|error| db_error(error, false))?;
+        tx.commit().await.map_err(|error| db_error(error, true))?;
+        Ok(receipt)
     }
 
     pub async fn delegation_status(
@@ -1809,12 +2386,14 @@ where
 
         let mut roots = vec![target];
         roots.extend(proofs.iter().copied().map(Hash::from));
-        let _chain_guards = match self.acquire_chain_guards(&roots).await {
+        let _chain_guards = match self.guard_delegation_chains(&roots).await {
             Ok(guards) => guards,
-            Err(TxError::ChainTraversalLimitExceeded) => {
+            Err(DbErr::Custom(message))
+                if message == "delegation-chain-traversal-limit-exceeded" =>
+            {
                 return Ok(Some(DelegationStatus::Unavailable));
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(authority_error(error)),
         };
 
         let authorized = match revocation::control_proof_decision(
@@ -1846,6 +2425,34 @@ where
             return Ok(None);
         }
 
+        // Check every key dependency before reporting even a generically
+        // revoked target. A revoked requester or historical policy signer
+        // cannot recover delegation metadata through the status route.
+        let mut principals = crate::auth_graph::load_chain_principals(&self.conn, &roots)
+            .await
+            .map_err(|_| TxError::<B, K>::AuthorizationDenied)?;
+        principals.push(invoker.to_owned());
+        let witness = match policy_cid_in_chain(&self.conn, &roots)
+            .await
+            .map_err(|_| TxError::<B, K>::AuthorizationDenied)?
+        {
+            Some(policy_cid) => {
+                let dependencies =
+                    crate::policy_witness::revocation_dependencies(&self.conn, &policy_cid)
+                        .await
+                        .map_err(|_| TxError::<B, K>::AuthorizationDenied)?;
+                principals.extend(dependencies.principals.iter().cloned());
+                Some(dependencies)
+            }
+            None => None,
+        };
+        let spaces = abilities
+            .iter()
+            .filter_map(|ability| ability.resource.space().map(ToString::to_string))
+            .collect::<Vec<_>>();
+        crate::key_authority::check_principals(&self.conn, &principals, &spaces)
+            .await
+            .map_err(|_| TxError::<B, K>::AuthorizationDenied)?;
         if revocation::is_revoked(&self.conn, &target).await? {
             return Ok(Some(DelegationStatus::Revoked));
         }
@@ -1856,6 +2463,11 @@ where
                 return Ok(Some(DelegationStatus::Unavailable));
             }
             Err(revocation::ChainTraversalError::Db(error)) => return Err(error.into()),
+        }
+        if let Some(dependencies) = witness.as_ref() {
+            crate::policy_witness::check_signed_cids(&self.conn, dependencies)
+                .await
+                .map_err(|_| TxError::<B, K>::AuthorizationDenied)?;
         }
 
         let now = OffsetDateTime::now_utc();
@@ -2013,23 +2625,57 @@ where
                 .as_ref()
                 .and_then(|sync| sync.retention_grant),
         );
+        let (guard_chain_ids, _) = crate::auth_graph::load_closure_edges(&self.conn, &guard_roots)
+            .await
+            .map_err(|error| {
+                TxStoreError::Tx(match error {
+                    revocation::ChainTraversalError::Db(error) => TxError::Db(error),
+                    revocation::ChainTraversalError::LimitExceeded => {
+                        TxError::ChainTraversalLimitExceeded
+                    }
+                })
+            })?;
+        let policy_cid = if guard_roots == roots {
+            policy_cid_from_ids(&self.conn, &guard_chain_ids).await
+        } else {
+            policy_cid_in_chain(&self.conn, &roots).await
+        }
+        .map_err(|error| {
+            TxStoreError::Tx(match &error {
+                DbErr::Custom(message) if message.starts_with("policy-session-proof-") => {
+                    TxError::AuthorizationDenied
+                }
+                _ => TxError::Db(error),
+            })
+        })?;
+        let witness_dependencies = match policy_cid.as_deref() {
+            Some(policy_cid) => Some(
+                crate::policy_witness::revocation_dependencies(&self.conn, policy_cid)
+                    .await
+                    .map_err(|error| {
+                        TxStoreError::Tx(match error {
+                            crate::policy_witness::WitnessError::Database(source) => {
+                                TxError::Db(source)
+                            }
+                            _ => TxError::AuthorizationDenied,
+                        })
+                    })?,
+            ),
+            None => None,
+        };
         let authz_start = Instant::now();
         let closure_start = Instant::now();
-        let lock_keys = crate::auth_graph::load_chain_lock_ids(&self.conn, &guard_roots)
-            .await
-            .map_err(|error| match error {
-                revocation::ChainTraversalError::Db(error) => TxError::Db(error),
-                revocation::ChainTraversalError::LimitExceeded => {
-                    TxError::ChainTraversalLimitExceeded
-                }
-            });
+        let authority =
+            crate::auth_graph::invocation_authority_for_closure(&self.conn, guard_chain_ids)
+                .await
+                .map_err(TxError::Db);
         crate::telemetry::observe_stage(
             crate::telemetry::InvocationStage::ChainClosureQuery,
-            crate::telemetry::StageOutcome::from(lock_keys.is_ok()),
+            crate::telemetry::StageOutcome::from(authority.is_ok()),
             closure_start.elapsed(),
         );
-        let lock_keys = match lock_keys {
-            Ok(keys) => keys,
+        let (mut lock_keys, mut principals) = match authority {
+            Ok(authority) => authority,
             Err(error) => {
                 crate::telemetry::observe_stage(
                     crate::telemetry::InvocationStage::AuthorizationGraphLoad,
@@ -2039,13 +2685,48 @@ where
                 return Err(TxStoreError::Tx(error));
             }
         };
-        // TC-324: invocations take the chain guards SHARED. The full ancestor
-        // closure is still guarded and the guards are still held through
-        // commit, so a revocation (which takes them exclusive) remains
-        // serialized against this authorization decision. What is dropped is
-        // invocation-vs-invocation exclusion, which the revocation-ordering
-        // invariant never depended on.
-        let _chain_guards = self.acquire_shared_chain_guards_for_keys(lock_keys).await;
+        principals.push(invocation.0.invoker.clone());
+        if let Some(dependencies) = &witness_dependencies {
+            principals.extend(dependencies.principals.iter().cloned());
+        }
+        principals.sort_unstable();
+        principals.dedup();
+        let mut affected_spaces = invocation
+            .0
+            .spaces()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        if affected_spaces.is_empty()
+            || invocation
+                .0
+                .capabilities
+                .iter()
+                .any(|cap| cap.resource.space().is_none())
+        {
+            if let Some(dependencies) = &witness_dependencies {
+                affected_spaces.extend(dependencies.spaces.iter().cloned());
+            }
+        }
+        affected_spaces.sort_unstable();
+        affected_spaces.dedup();
+        if let Some(dependencies) = &witness_dependencies {
+            lock_keys.extend(
+                crate::auth_graph::load_chain_lock_ids(&self.conn, &dependencies.signed_cids)
+                    .await
+                    .map_err(|error| match error {
+                        revocation::ChainTraversalError::Db(error) => TxError::Db(error),
+                        revocation::ChainTraversalError::LimitExceeded => {
+                            TxError::ChainTraversalLimitExceeded
+                        }
+                    })?,
+            );
+        }
+        for principal in &principals {
+            lock_keys.push(
+                crate::key_authority::principal_lock_id(principal)
+                    .map_err(|error| TxStoreError::Tx(TxError::Db(error)))?,
+            );
+        }
         let mutation_keys = invocation
             .0
             .capabilities
@@ -2067,9 +2748,35 @@ where
                 count: mutation_keys.len(),
             });
         }
+        // DID resolution may perform network I/O. Verify a public read's
+        // envelope before acquiring its shared revocation guards; the guarded
+        // authorization below rechecks the signed time and live dependencies.
+        if mutation_keys.is_empty() && mode != InvokeMode::Admitted {
+            invocation::verify_invocation(&invocation.0.invocation)
+                .await
+                .map_err(TxError::<B, K>::from)?;
+        }
+        // TC-324: invocations take the chain guards SHARED. The full ancestor
+        // closure is still guarded and the guards are still held through
+        // commit, so a revocation (which takes them exclusive) remains
+        // serialized against this authorization decision. What is dropped is
+        // invocation-vs-invocation exclusion, which the revocation-ordering
+        // invariant never depended on.
+        let chain_guards = self
+            .acquire_shared_chain_guards_bounded(lock_keys)
+            .await
+            .map_err(|error| TxStoreError::Tx(authority_error::<B, K>(error)))?;
         if mutation_keys.is_empty() {
             return self
-                .invoke_read_only::<S>(invocation, options, mode, sync_target)
+                .invoke_read_only::<S>(
+                    invocation,
+                    options,
+                    sync_target,
+                    chain_guards,
+                    principals,
+                    affected_spaces,
+                    witness_dependencies,
+                )
                 .await;
         }
         let _kv_object_guards = self.acquire_kv_object_guards(&mutation_keys).await;
@@ -2140,10 +2847,37 @@ where
             begin_start.elapsed(),
         );
         let tx = tx_result?;
-        // TC-732: order this transaction's event sequence under the
-        // per-space lock. On PostgreSQL this is an advisory lock, so the
-        // meeting legacy guard lock below is still the first row lock.
+        // TC-732: sequence first, then sorted signed proof and principal
+        // rows, then any meeting legacy row. Mutations use this order.
         crate::kv_sync::lock_space_sequences(&tx, &sequence_spaces).await?;
+        let (mut signed_ids, _) = crate::auth_graph::load_closure_edges(&tx, &guard_roots)
+            .await
+            .map_err(|error| match error {
+                revocation::ChainTraversalError::Db(error) => TxStoreError::Tx(TxError::Db(error)),
+                revocation::ChainTraversalError::LimitExceeded => {
+                    TxStoreError::Tx(TxError::ChainTraversalLimitExceeded)
+                }
+            })?;
+        if let Some(dependencies) = &witness_dependencies {
+            signed_ids.extend(dependencies.signed_cids.iter().copied());
+        }
+        crate::key_authority::lock_signed_dependencies(&tx, &signed_ids).await?;
+        if !signed_ids.is_empty()
+            && !revocation::effective_rows(&tx, &signed_ids)
+                .await?
+                .is_empty()
+        {
+            return Err(TxStoreError::Tx(TxError::AuthorizationDenied));
+        }
+        crate::key_authority::lock_targets(&tx, &principals, false).await?;
+        crate::key_authority::check_principals(&tx, &principals, &affected_spaces)
+            .await
+            .map_err(|error| TxStoreError::Tx(authority_error::<B, K>(error)))?;
+        if let Some(dependencies) = &witness_dependencies {
+            crate::policy_witness::check_signed_cids(&tx, dependencies)
+                .await
+                .map_err(|error| TxStoreError::Tx(witness_error::<B, K>(error)))?;
+        }
         // On SQLite `begin_graph_transaction` already holds the write lock,
         // so no read-to-write upgrade race remains. Distinct spaces are
         // locked in a stable order to prevent cross-space deadlocks on PG.
@@ -2358,16 +3092,18 @@ where
     }
 
     /// Execute a successful non-mutating invocation without entering the
-    /// single-writer transaction. Authorization and data access remain under
-    /// the caller's shared chain guards, which are held across this call and
-    /// released only after it returns; the response waits for the grouped
-    /// audit commit.
+    /// single-writer transaction. Shared guards cover authorization only;
+    /// data access and the read-audit acknowledgment never retain a guard.
+    #[allow(clippy::too_many_arguments)]
     async fn invoke_read_only<S>(
         &self,
         invocation: Invocation,
         options: KvInvokeOptions,
-        mode: InvokeMode,
         sync_target: Option<KvSyncTarget>,
+        chain_guards: Vec<SharedChainGuard>,
+        principals: Vec<String>,
+        affected_spaces: Vec<String>,
+        witness_dependencies: Option<crate::policy_witness::WitnessDependencies>,
     ) -> Result<(TransactResult, Vec<InvocationOutcome<B::Readable>>), TxStoreError<B, S, K>>
     where
         B: ImmutableWriteStore<S> + ImmutableReadStore,
@@ -2408,27 +3144,20 @@ where
             }
             None => None,
         };
-        // TC-409: an admitted invocation already had its signature verified
-        // once at the admission boundary; only re-check authorization and
-        // signed-time validity here rather than verifying the signature a
-        // second time.
-        match mode {
-            InvokeMode::Admitted => {
-                invocation::authorize_admitted(&self.conn, &invocation.0, now, sync_graph.as_ref())
-                    .await
-                    .map_err(TxError::<B, K>::from)?
-            }
-            InvokeMode::Public | InvokeMode::Internal | InvokeMode::MeetingPublication => {
-                invocation::verify_and_authorize_with_graph(
-                    &self.conn,
-                    &invocation.0,
-                    now,
-                    sync_graph.as_ref(),
-                )
+        // Admitted envelopes were verified at their admission boundary;
+        // public read envelopes were verified before acquiring these guards.
+        // Recheck authorization and signed time at the guarded ordering point.
+        invocation::authorize_admitted(&self.conn, &invocation.0, now, sync_graph.as_ref())
+            .await
+            .map_err(TxError::<B, K>::from)?;
+        crate::key_authority::check_principals(&self.conn, &principals, &affected_spaces)
+            .await
+            .map_err(|error| TxStoreError::Tx(authority_error::<B, K>(error)))?;
+        if let Some(dependencies) = &witness_dependencies {
+            crate::policy_witness::check_signed_cids(&self.conn, dependencies)
                 .await
-                .map_err(TxError::<B, K>::from)?
-            }
-        };
+                .map_err(|error| TxStoreError::Tx(witness_error::<B, K>(error)))?;
+        }
 
         let requested_spaces = invocation.0.spaces().cloned().collect::<HashSet<_>>();
         if !requested_spaces.is_empty() {
@@ -2440,6 +3169,9 @@ where
                 return Err(TxError::SpaceNotFound.into());
             }
         }
+        // The authorization decision is the read's ordering point. A revoke
+        // committed later may proceed while storage or the audit ACK waits.
+        drop(chain_guards);
 
         let sync_outcome = match (sync_target, sync_graph.as_ref()) {
             (Some((space, prefix, resource)), Some(graph)) => {
@@ -2621,6 +3353,170 @@ where
             results,
         ))
     }
+}
+
+/// Locate the admitted S0 inside an invocation's bounded signed proof
+/// closure. Ordinary delegations have no policy session index. Two different
+/// policies in one closure are ambiguous rather than interchangeable grants.
+async fn policy_cid_in_chain<C: ConnectionTrait>(
+    db: &C,
+    roots: &[Hash],
+) -> Result<Option<String>, DbErr> {
+    let (ids, _) = crate::auth_graph::load_closure_edges(db, roots)
+        .await
+        .map_err(|error| DbErr::Custom(error.to_string()))?;
+    policy_cid_from_ids(db, &ids).await
+}
+
+async fn policy_cid_from_ids<C: ConnectionTrait>(
+    db: &C,
+    ids: &[Hash],
+) -> Result<Option<String>, DbErr> {
+    if ids.is_empty() {
+        return Ok(None);
+    }
+    let session_ids = ids
+        .iter()
+        .map(|id| id.to_cid(0x55).to_string())
+        .collect::<Vec<_>>();
+    let sessions = policy_v3_session::Entity::find()
+        .filter(policy_v3_session::Column::SessionCid.is_in(session_ids.iter().map(String::as_str)))
+        .all(db)
+        .await?;
+    match sessions.as_slice() {
+        [] => {
+            // A signed policy root in the closure without its admitted S0
+            // index is missing provenance, not an ordinary delegation.
+            let has_policy_root = policy_v3_root::Entity::find()
+                .filter(policy_v3_root::Column::RootCid.is_in(session_ids))
+                .one(db)
+                .await?
+                .is_some();
+            if has_policy_root {
+                Err(DbErr::Custom("policy-session-proof-missing".into()))
+            } else {
+                Ok(None)
+            }
+        }
+        [session] if session.state == "admitted" => {
+            if policy_session_matches_signed_binding(db, session).await? {
+                Ok(Some(session.policy_cid.clone()))
+            } else {
+                Err(DbErr::Custom("policy-session-proof-ambiguous".into()))
+            }
+        }
+        _ => Err(DbErr::Custom("policy-session-proof-ambiguous".into())),
+    }
+}
+
+/// The mutable S0 index cannot reassign a signed session to another policy,
+/// recipient, or proof pair. The registration witness checks those roots
+/// separately; this binds the exact S0 that selected that witness.
+async fn policy_session_matches_signed_binding<C: ConnectionTrait>(
+    db: &C,
+    session: &policy_v3_session::Model,
+) -> Result<bool, DbErr> {
+    let Ok(cid) = Cid::try_from(session.session_cid.as_str()) else {
+        return Ok(false);
+    };
+    let id = Hash::from(cid);
+    if id.to_cid(0x55).to_string() != session.session_cid
+        || crate::hash::hash(&session.authorization_bytes) != id
+    {
+        return Ok(false);
+    }
+    let Ok(TinyCloudDelegation::Ucan(ucan)) =
+        TinyCloudDelegation::from_bytes(&session.authorization_bytes)
+    else {
+        return Ok(false);
+    };
+    let payload = ucan.payload();
+    let Some(facts) = payload.facts.as_ref().filter(|facts| facts.len() == 1) else {
+        return Ok(false);
+    };
+    let Some(fact) = facts[0].as_object() else {
+        return Ok(false);
+    };
+    let Some(registration) = policy_v3_registration::Entity::find_by_id(session.policy_cid.clone())
+        .one(db)
+        .await?
+    else {
+        return Ok(false);
+    };
+    if fact.get("profile").and_then(serde_json::Value::as_str) != Some("policy-session-ucan/v1")
+        || fact.get("policyCid").and_then(serde_json::Value::as_str)
+            != Some(session.policy_cid.as_str())
+        || fact.get("recipientDid").and_then(serde_json::Value::as_str)
+            != Some(session.recipient_did.as_str())
+        || fact
+            .get("policyDelegationCid")
+            .and_then(serde_json::Value::as_str)
+            != Some(registration.policy_root_cid.as_str())
+        || fact
+            .get("enforcementDelegationCid")
+            .and_then(serde_json::Value::as_str)
+            != Some(registration.enforcement_root_cid.as_str())
+        || fact.get("nodeAudience").and_then(serde_json::Value::as_str)
+            != Some(payload.issuer.as_str())
+        || payload.audience.as_str() != session.recipient_did
+        || payload.proof.len() != 2
+        || payload.proof[0].to_string() != registration.policy_root_cid
+        || payload.proof[1].to_string() != registration.enforcement_root_cid
+    {
+        return Ok(false);
+    }
+    let Some(graph) = delegation::Entity::find_by_id(id).one(db).await? else {
+        return Ok(false);
+    };
+    if graph.delegator.as_str() != payload.issuer.as_str()
+        || graph.delegatee != session.recipient_did
+        || graph
+            .facts
+            .as_ref()
+            .and_then(|facts| facts.0.get("xyz.tinycloud.policy/session-fact"))
+            != Some(&facts[0])
+    {
+        return Ok(false);
+    }
+    let persisted = parent_delegations::Entity::find()
+        .filter(parent_delegations::Column::Child.eq(id))
+        .all(db)
+        .await?;
+    let signed = [Hash::from(payload.proof[0]), Hash::from(payload.proof[1])];
+    Ok(signed[0] != signed[1]
+        && persisted.len() == 2
+        && persisted.iter().any(|edge| edge.parent == signed[0])
+        && persisted.iter().any(|edge| edge.parent == signed[1]))
+}
+
+/// A generic CID revoke must conflict with recovery proofs that read any
+/// equivalent signed statement in another process. Lock all stored aliases
+/// before validating/persisting the revocation, not only the submitted CID.
+async fn lock_revocation_alias_rows(tx: &DatabaseTransaction, target: Hash) -> Result<(), DbErr> {
+    if tx.get_database_backend() == DbBackend::Sqlite {
+        return Ok(());
+    }
+    let canonical = delegation_cid_alias::Entity::find_by_id(target)
+        .one(tx)
+        .await?
+        .map_or(target, |alias| alias.canonical);
+    let mut ids = delegation_cid_alias::Entity::find()
+        .filter(delegation_cid_alias::Column::Canonical.eq(canonical))
+        .all(tx)
+        .await?
+        .into_iter()
+        .map(|alias| alias.id)
+        .collect::<Vec<_>>();
+    ids.push(target);
+    ids.sort_unstable();
+    ids.dedup();
+    for id in ids {
+        delegation::Entity::find_by_id(id)
+            .lock_exclusive()
+            .one(tx)
+            .await?;
+    }
+    Ok(())
 }
 
 /// The `(space, prefix, resource)` a `tinycloud.kv/sync` invocation reads.
@@ -3912,7 +4808,7 @@ fn byte_ordered_resource(backend: DbBackend) -> SimpleExpr {
 }
 
 /// `column`, compared in byte order on `backend` (see `byte_ordered_resource`).
-fn byte_ordered(backend: DbBackend, column: impl Into<SimpleExpr>) -> SimpleExpr {
+pub(crate) fn byte_ordered(backend: DbBackend, column: impl Into<SimpleExpr>) -> SimpleExpr {
     // `$1` / `?` is sea-query's per-backend placeholder for the embedded
     // column expression, not for a bound value.
     match backend {
@@ -5789,6 +6685,13 @@ mod test {
         .await
         .unwrap();
 
+        assert!(
+            !crate::models::revocation::is_revoked(&db.conn, &parent_id)
+                .await
+                .unwrap(),
+            "the issue and existing-use checks must see a live parent before revoke"
+        );
+
         let revoke_guard = db
             .acquire_chain_guards(&[parent_id])
             .await
@@ -6514,9 +7417,13 @@ mod test {
     /// Resolve the ancestor closure exactly as `invoke_with_options_mode`
     /// does, then take the guards shared — the production invocation path.
     async fn invocation_chain_keys(db: &TestDb, roots: &[Hash]) -> Vec<Hash> {
-        crate::auth_graph::load_chain_lock_ids(&db.conn, roots)
+        let (signed, _) = crate::auth_graph::load_closure_edges(&db.conn, roots)
             .await
-            .expect("chain closure query")
+            .expect("signed chain closure");
+        crate::auth_graph::invocation_authority_for_closure(&db.conn, signed)
+            .await
+            .expect("canonical alias locks")
+            .0
     }
 
     async fn acquire_invocation_guards(db: &TestDb, roots: &[Hash]) -> Vec<SharedChainGuard> {
@@ -6698,6 +7605,279 @@ mod test {
             "an invocation starting after the revocation commits must observe it"
         );
         drop(after);
+    }
+
+    /// The in-process guard registry is not shared between database handles.
+    /// A committed CID revoke must still be visible to another connection and
+    /// after a cold restart; simultaneous cross-process reads are TC-1216.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn independent_connections_observe_committed_cid_revoke_after_ack() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("revoke-cutoff.db");
+        let make_db = |conn| async move {
+            SpaceDatabase::new(
+                conn,
+                MemoryStore::default(),
+                StaticSecret::new([0u8; 32].to_vec()).unwrap(),
+            )
+            .await
+            .unwrap()
+        };
+        let admitting =
+            make_db(sqlite_write_pool(&path, std::time::Duration::from_secs(5), 2).await).await;
+        let revoking =
+            make_db(sqlite_write_pool(&path, std::time::Duration::from_secs(5), 2).await).await;
+        insert_chain_guard_actors(&admitting).await;
+        let (parent, child) = insert_test_chain(&admitting, "cross-connection-cutoff").await;
+        let before = admitting.guard_delegation_chains(&[child]).await.unwrap();
+        assert!(admitting
+            .delegation_chains_unrevoked(&[child.to_cid(0x55)])
+            .await
+            .unwrap());
+        drop(before);
+
+        let guards = revoking
+            .acquire_chain_guards(&[parent])
+            .await
+            .ok()
+            .expect("exclusive revoke chain guard");
+        insert_test_revocation(&revoking, "cross-connection-revoke", parent).await;
+        drop(guards);
+        let after_ack = admitting.guard_delegation_chains(&[child]).await.unwrap();
+        assert!(
+            !admitting
+                .delegation_chains_unrevoked(&[child.to_cid(0x55)])
+                .await
+                .unwrap(),
+            "a new admission after ACK cannot reuse the signed child"
+        );
+        drop(after_ack);
+        // A fresh database connection has no in-memory guard/cache from the
+        // admission and must still see the persisted ancestor cutoff.
+        let reopened = sqlite_write_pool(&path, std::time::Duration::from_secs(5), 2).await;
+        assert_eq!(
+            revocation::first_revoked_ancestor(&reopened, &child)
+                .await
+                .unwrap(),
+            Some(parent.to_cid(0x55).to_string()),
+            "a cold connection must honor the committed revoke"
+        );
+    }
+
+    /// The alias's canonical CID is also the key-principal registry key.
+    /// No request may retain its shared guard while waiting to revoke that
+    /// key, and later reads must fail within the bounded guard deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn key_revoke_alias_overlap_bounds_waiting_reads_and_commits_cutoff() {
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set};
+        let db = get_db().await.unwrap();
+        insert_chain_guard_actors(&db).await;
+        let target = "did:key:chain-guard-owner".to_owned();
+        let key = crate::key_authority::principal_lock_id(&target).unwrap();
+        let alias = insert_test_delegation(&db, "key-revoke-alias-overlap").await;
+        delegation_cid_alias::ActiveModel {
+            id: Set(alias),
+            canonical: Set(key),
+            encrypted: Set(false),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+        let keys = invocation_chain_keys(&db, &[alias]).await;
+        assert!(keys.contains(&key));
+        let in_flight = db.acquire_shared_chain_guards_for_keys(keys).await;
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let revoking = db.clone();
+        let request = key_revocation::VerifiedKeyRevoke {
+            target_did: target.clone(),
+            issuer_did: target.clone(),
+            scope: key_revocation::KeyRevokeScope::Global,
+            nonce: "key-revoke-alias-overlap".into(),
+            authorization_hash: [7; 32],
+            proof_cids: Vec::new(),
+            not_before: now,
+            valid_after: None,
+            expires_at: now + 40,
+        };
+        let revoke = tokio::spawn(async move { revoking.revoke_key(request).await });
+        settle().await;
+        assert!(
+            !revoke.is_finished(),
+            "revoke must wait for the in-flight read decision"
+        );
+        let timed_out = db
+            .acquire_shared_chain_guards_bounded(vec![key])
+            .await
+            .unwrap_err();
+        assert!(matches!(&timed_out, DbErr::Custom(message)
+            if message == "authorization-revoke-wait-timeout"));
+        assert!(matches!(
+            authority_error::<MemoryStore, StaticSecret>(timed_out),
+            TxError::AuthorizationWaitTimeout
+        ));
+        drop(in_flight);
+        let receipt = tokio::time::timeout(std::time::Duration::from_secs(5), revoke)
+            .await
+            .expect("same-registry alias overlap cannot deadlock")
+            .unwrap()
+            .unwrap();
+        assert!(receipt.revoked);
+        assert!(crate::key_authority::is_revoked_error(
+            &crate::key_authority::check_principals(&db.conn, &[target], &[])
+                .await
+                .unwrap_err()
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn overlapping_exact_self_revokes_return_the_same_receipt() {
+        let db = get_db().await.unwrap();
+        let target = "did:key:overlapping-receipt-owner".to_owned();
+        let key = crate::key_authority::principal_lock_id(&target).unwrap();
+        let in_flight = db.acquire_shared_chain_guards_for_keys(vec![key]).await;
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let request = key_revocation::VerifiedKeyRevoke {
+            target_did: target.clone(),
+            issuer_did: target,
+            scope: key_revocation::KeyRevokeScope::Global,
+            nonce: "overlapping-exact-receipt".into(),
+            authorization_hash: [8; 32],
+            proof_cids: Vec::new(),
+            not_before: now,
+            valid_after: None,
+            expires_at: now + 40,
+        };
+        let first_db = db.clone();
+        let first_request = request.clone();
+        let first = tokio::spawn(async move { first_db.revoke_key(first_request).await });
+        let second_db = db.clone();
+        let second = tokio::spawn(async move { second_db.revoke_key(request).await });
+        settle().await;
+        assert!(!first.is_finished() && !second.is_finished());
+        drop(in_flight);
+        let first_receipt = tokio::time::timeout(std::time::Duration::from_secs(5), first)
+            .await
+            .expect("first cutoff finishes")
+            .unwrap()
+            .unwrap();
+        let second_receipt = tokio::time::timeout(std::time::Duration::from_secs(5), second)
+            .await
+            .expect("concurrent exact retry finishes")
+            .unwrap()
+            .unwrap();
+        assert_eq!(first_receipt, second_receipt);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn first_use_expiry_while_waiting_for_target_guard_does_not_commit_a_cutoff() {
+        let db = get_db().await.unwrap();
+        let target = "did:key:waited-out-key-revoke".to_owned();
+        let key = crate::key_authority::principal_lock_id(&target).unwrap();
+        let in_flight = db.acquire_shared_chain_guards_for_keys(vec![key]).await;
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let request = key_revocation::VerifiedKeyRevoke {
+            target_did: target.clone(),
+            issuer_did: target.clone(),
+            scope: key_revocation::KeyRevokeScope::Global,
+            nonce: "waited-out-key-revoke".into(),
+            authorization_hash: [9; 32],
+            proof_cids: Vec::new(),
+            not_before: now,
+            valid_after: None,
+            expires_at: now + 1,
+        };
+        let revoking = db.clone();
+        let pending = tokio::spawn(async move { revoking.revoke_key(request).await });
+        settle().await;
+        assert!(
+            !pending.is_finished(),
+            "the target guard must block the revoke"
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        drop(in_flight);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), pending)
+            .await
+            .expect("expired revoke finishes")
+            .unwrap();
+        assert!(matches!(
+            result,
+            Err(key_revocation::KeyRevokeError::Forbidden)
+        ));
+        crate::key_authority::check_principals(&db.conn, &[target], &[])
+            .await
+            .expect("no cutoff was committed after first-use expiry");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn key_cutoff_serializes_across_connections_and_survives_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("key-cutoff.db");
+        let make_db = |conn| async move {
+            SpaceDatabase::new(
+                conn,
+                MemoryStore::default(),
+                StaticSecret::new([0u8; 32].to_vec()).unwrap(),
+            )
+            .await
+            .unwrap()
+        };
+        let admitting =
+            make_db(sqlite_write_pool(&path, std::time::Duration::from_secs(5), 2).await).await;
+        let revoking =
+            make_db(sqlite_write_pool(&path, std::time::Duration::from_secs(5), 2).await).await;
+        let target = "did:key:cross-connection-key-cutoff".to_owned();
+        let tx = admitting.begin_graph_transaction().await.unwrap();
+        crate::key_authority::lock_targets(&tx, std::slice::from_ref(&target), false)
+            .await
+            .unwrap();
+        crate::key_authority::check_principals(&tx, std::slice::from_ref(&target), &[])
+            .await
+            .unwrap();
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let revoked_target = target.clone();
+        let revoke = tokio::spawn(async move {
+            started_tx.send(()).unwrap();
+            revoking
+                .revoke_key(key_revocation::VerifiedKeyRevoke {
+                    target_did: revoked_target.clone(),
+                    issuer_did: revoked_target,
+                    scope: key_revocation::KeyRevokeScope::Global,
+                    nonce: "cross-connection-key-cutoff".into(),
+                    authorization_hash: [9; 32],
+                    proof_cids: Vec::new(),
+                    not_before: now,
+                    valid_after: None,
+                    expires_at: now + 40,
+                })
+                .await
+        });
+        started_rx.await.unwrap();
+        settle().await;
+        assert!(
+            !revoke.is_finished(),
+            "the cutoff cannot ACK before admission completes"
+        );
+        tx.commit().await.unwrap();
+        let receipt = tokio::time::timeout(std::time::Duration::from_secs(5), revoke)
+            .await
+            .expect("cross-connection cutoff completes")
+            .unwrap()
+            .unwrap();
+        assert!(receipt.revoked);
+        for db in [
+            admitting,
+            make_db(sqlite_write_pool(&path, std::time::Duration::from_secs(5), 2).await).await,
+        ] {
+            let error = crate::key_authority::check_principals(
+                &db.conn,
+                std::slice::from_ref(&target),
+                &[],
+            )
+            .await
+            .unwrap_err();
+            assert!(crate::key_authority::is_revoked_error(&error));
+        }
     }
 
     /// TC-324 requirement 3: delegation registration still mutually excludes

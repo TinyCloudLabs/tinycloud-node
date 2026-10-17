@@ -506,6 +506,58 @@ support. On the same `utf8mb4`/default-strict configuration, unmodified
 alias migration exists. That separate full-schema prerequisite must be resolved
 and exercised before claiming end-to-end support for that configuration.
 
+## Explicit Key Revocation and Policy Witness
+
+`POST /keys/revoke` accepts JSON with `targetDid`, `scope` (`{"kind":"global"}`
+or `{"kind":"space","spaceId":"..."}`), and `authorization`, a signed UCAN or
+SIWE/CACAO addressed to this node. The signed capability names the same
+target and scope. Global revocation requires the target key or its explicitly
+enrolled global recovery delegate. A space owner or its scoped recovery
+delegate may revoke a key only in that owner's space. Generic `/revoke`
+continues to revoke a single delegation CID, not a whole key.
+
+The signed policy-v3 JSON `/revoke` records one root's status, not a
+key-wide cutoff. Fresh root events check the historical policy witness;
+repeating the exact committed event remains idempotent.
+Every witness-backed use checks the loaded roots' signed revocation status,
+including an already-issued signed KV download ticket. This cutoff uses the
+same root rows as provenance verification, without another query or lock.
+
+`targetDid` must be a canonical DID with valid DID syntax, not a DID URL
+or a delegation CID; an empty method-specific ID is rejected.
+
+The committed response includes the target, scope, and original cutoff.
+Repeating the exact signed request returns the same receipt even after the
+signer is revoked or its recovery proof expires. Changed signed bytes with
+the same nonce return `409` only for a still-authorized signer; a signer
+without current target/scope authority receives `403`. First-use request
+and recovery proof validity are checked after blocking authorization locks.
+
+On a fresh recovery request, the node verifies the signed chain before
+locking its persisted proof rows. It then locks every dependency principal
+in canonical DID order, taking the target and request signer exclusively
+and other chain principals shared on their first visit. No principal lock
+is upgraded within the transaction; the locks cover the tombstone and
+receipt commit.
+
+The cutoff remains immutable; successful responses follow its durable commit.
+Later policy mints, delegation admission, and invocations cannot use authority
+derived from the revoked principal. Natural proof expiry is not an explicit
+revoke.
+
+Policy registration persists a versioned, signed-byte-bound witness for its
+authority dependencies. The signed candidate limit counts relevant closures,
+not unrelated incoming grants. Preexisting registrations receive a conservative
+transactional backfill at startup; inconsistent or incomplete provenance
+prevents serving rather than silently narrowing dependencies. Before release,
+an operator runs `policy-witness-dry-run` with the node's configuration on a
+production snapshot or read replica. It opens read-only and reports only
+aggregate `ok`, `missing`, `ambiguous`, and `overflow` counts. Any unresolved
+rows require a release decision; the startup backfill is not a substitute for
+the dry-run gate. Owner-self classification remains `unknown/legacy` in this
+phase; natural sign-in expiry retains existing behavior. Signed self-session
+classification is tracked separately in TC-1213.
+
 ## Child Delegation (UCAN) Creation
 
 For sharing, child UCANs are created that delegate from the session key to another DID.

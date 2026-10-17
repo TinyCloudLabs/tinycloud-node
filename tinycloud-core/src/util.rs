@@ -74,18 +74,40 @@ fn extract_ucan_caps<T: serde::Serialize>(caps: &UcanCapabilities<T>) -> Vec<Cap
     capabilities
 }
 
-fn extract_siwe_cap(c: SiweCap<()>) -> (Vec<Capability>, Vec<Cid>) {
+fn extract_siwe_cap(c: SiweCap<serde_json::Value>) -> (Vec<Capability>, Vec<Cid>) {
     let (c, p) = c.into_inner();
     (
         c.into_inner()
             .into_iter()
-            .flat_map(|(r, acs)| {
-                // r is UriString, acs is BTreeMap<Ability, Caveats<()>>
-                acs.into_keys() // Iterate over Ability keys
-                    .map(|ability| Capability {
-                        resource: Resource::from(r.clone()),
-                        ability: ability.into(),
-                        caveats: Caveats::default(),
+            .flat_map(|(resource, actions)| {
+                actions
+                    .into_iter()
+                    .map(|(ability, caveats)| {
+                        // Existing SIWE capabilities retain their historical
+                        // caveat behavior. Key-recovery authority is the only
+                        // new action that requires its typed signed scope.
+                        let caveats = if ability.to_string() == "tinycloud.key/revoke" {
+                            Caveats(
+                                caveats
+                                    .into_inner()
+                                    .into_iter()
+                                    .enumerate()
+                                    .map(|(index, value)| {
+                                        (
+                                            index.to_string(),
+                                            serde_json::Value::Object(value.into_iter().collect()),
+                                        )
+                                    })
+                                    .collect(),
+                            )
+                        } else {
+                            Caveats::default()
+                        };
+                        Capability {
+                            resource: Resource::from(resource.clone()),
+                            ability: ability.into(),
+                            caveats,
+                        }
                     })
                     .collect::<Vec<_>>()
             })
@@ -197,8 +219,9 @@ impl TryFrom<TinyCloudDelegation> for DelegationInfo {
             },
             TinyCloudDelegation::Cacao(ref c) => {
                 let m: Message = c.payload().clone().try_into()?;
-                // Use the public extract_and_verify, which returns Result<Option<SiweCap<()>>, VerificationError>
-                let maybe_siwe_cap = SiweCap::extract_and_verify(&m)?;
+                // Keep the signed typed caveat for key recovery while
+                // retaining legacy caveat semantics for other SIWE actions.
+                let maybe_siwe_cap = SiweCap::<serde_json::Value>::extract_and_verify(&m)?;
 
                 let (capabilities, parents) = match maybe_siwe_cap {
                     Some(siwe_cap) => {

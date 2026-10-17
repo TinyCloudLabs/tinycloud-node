@@ -53,12 +53,13 @@
 //!   cache has expired, so whether a given SQL call pays it depends on wall
 //!   time.
 //!
-//! The counts are deterministic without sleeping for them: every request is
-//! measured between two barriers that wait until every pooled connection is
-//! idle again, so the release ping of the last statement is inside the window
-//! and no request overlaps another's traffic. The flows run three times
-//! first, so the pool has grown to the connections it needs and the
-//! statements are prepared.
+//! The counts are deterministic: every request is measured between two
+//! barriers that wait until every pooled connection is idle again, so the
+//! release ping of the last statement is inside the window and no request
+//! overlaps another's traffic. The flows run three times first, so the pool
+//! has grown to the connections they need and the statements are prepared.
+//! A dispatcher poll executed after warm-up is settled before measurement;
+//! its connection setup is attributed separately from request traffic.
 //!
 //! # Budgets
 //!
@@ -114,14 +115,16 @@ use tokio::{
 };
 
 /// Round trips allowed per flow; see the module docs. Measured with
-/// `test_before_acquire(false)`, database identity resolve as one statement,
-/// the read audit as one statement and no second sequence lock (TC-951):
+/// `test_before_acquire(false)`, database identity resolve as one statement
+/// and the read audit as one statement (TC-951). TC-1149 adds canonical
+/// principal/ancestor cutoff checks and transactional target row locks; the
+/// immutable proof signers and CID alias identities share one request query:
 ///
-/// - sign-in 75 = peer key 0 + host `/delegate` 17 + session `/delegate` 18
-///   + account-space SQL write 40;
-/// - kv put 37;
-/// - kv get 22, including the read-audit commit.
-const BUDGETS: [(&str, u64); 3] = [("sign-in", 75), ("kv put", 37), ("kv get", 22)];
+/// - sign-in 89 = peer key 0 + host `/delegate` 20 + session `/delegate` 21
+///   + account-space SQL write 48;
+/// - kv put 49, including cross-process principal lock rows and recheck;
+/// - kv get 30, including the live key tombstone and read-audit commit.
+const BUDGETS: [(&str, u64); 3] = [("sign-in", 89), ("kv put", 49), ("kv get", 30)];
 
 /// Full sign-in plus put plus get rounds run before the measured one.
 const WARM_UP_ROUNDS: u8 = 3;
@@ -194,7 +197,7 @@ struct RoundTrip {
 
 #[derive(Default)]
 struct Log {
-    connections: u64,
+    started_connections: Vec<u64>,
     round_trips: Vec<RoundTrip>,
 }
 
@@ -203,7 +206,7 @@ struct Wire(Arc<Mutex<Log>>);
 
 #[derive(Clone, Copy)]
 struct Mark {
-    connections: u64,
+    connections: usize,
     round_trips: usize,
 }
 
@@ -215,17 +218,80 @@ impl Wire {
     fn mark(&self) -> Mark {
         let log = self.log();
         Mark {
-            connections: log.connections,
+            connections: log.started_connections.len(),
             round_trips: log.round_trips.len(),
         }
     }
 
     fn since(&self, mark: Mark) -> Window {
         let log = self.log();
-        Window {
-            connections: log.connections - mark.connections,
+        let new_connections = &log.started_connections[mark.connections..];
+        let mut window = Window {
+            connections: new_connections.len() as u64,
             round_trips: log.round_trips[mark.round_trips..].to_vec(),
+        };
+        // A new connection belongs to the dispatcher only if its first
+        // executed non-setup SQL is an actual dispatcher SELECT. At most one
+        // exact startup timeout SET and bare pings can precede it. A second
+        // SET, a SQL batch, another statement, or a Parse without execution
+        // never hides request work or a request-path connection.
+        for &connection in new_connections {
+            let mut saw_setup_set = false;
+            let mut saw_poll_parse = false;
+            let mut poll_execution = None;
+            for (index, round_trip) in window
+                .round_trips
+                .iter()
+                .enumerate()
+                .filter(|(_, round_trip)| round_trip.connection == connection)
+            {
+                if !saw_poll_parse
+                    && round_trip.kind == Kind::Counted
+                    && round_trip.executed.is_empty()
+                    && round_trip.parsed.is_empty()
+                {
+                    continue;
+                }
+                if !saw_poll_parse
+                    && !saw_setup_set
+                    && round_trip.kind == Kind::Counted
+                    && round_trip.parsed.is_empty()
+                    && round_trip.executed.as_slice() == ["SET statement_timeout = 30000"]
+                {
+                    saw_setup_set = true;
+                    continue;
+                }
+                if round_trip.kind == Kind::Excluded("webhook dispatcher poll")
+                    && round_trip
+                        .parsed
+                        .iter()
+                        .all(|sql| background(sql) == Some("webhook dispatcher poll"))
+                {
+                    if round_trip.executed.is_empty() && !round_trip.parsed.is_empty() {
+                        saw_poll_parse = true;
+                        continue;
+                    }
+                    if !round_trip.executed.is_empty()
+                        && round_trip
+                            .executed
+                            .iter()
+                            .all(|sql| background(sql) == Some("webhook dispatcher poll"))
+                    {
+                        poll_execution = Some(index);
+                    }
+                }
+                break;
+            }
+            if let Some(poll_execution) = poll_execution {
+                window.connections -= 1;
+                for round_trip in &mut window.round_trips[..poll_execution] {
+                    if round_trip.connection == connection && round_trip.kind == Kind::Counted {
+                        round_trip.kind = Kind::Excluded("webhook dispatcher setup");
+                    }
+                }
+            }
         }
+        window
     }
 }
 
@@ -308,7 +374,7 @@ impl FrontendParser {
                 }
                 if be_i32(&self.buf[4..8]) == PROTOCOL_V3 {
                     self.started = true;
-                    self.wire.log().connections += 1;
+                    self.wire.log().started_connections.push(self.connection);
                 }
                 self.buf.drain(..len);
             } else {
@@ -577,6 +643,127 @@ impl Window {
             let text: String = text.chars().take(110).collect();
             let _ = writeln!(out, "      c{:<3} {kind}{text}", round_trip.connection);
         }
+    }
+}
+
+const DISPATCH_POLL_SQL: &str = r#"SELECT "hook_delivery"."id" AS "A_id""#;
+
+#[test]
+fn dispatcher_connection_setup_is_excluded_without_hiding_request_connections() {
+    let wire = Wire::default();
+    let mark = wire.mark();
+    let trip = |connection, kind, sql: &str| RoundTrip {
+        connection,
+        kind,
+        executed: vec![sql.to_owned()],
+        parsed: Vec::new(),
+    };
+    {
+        let mut log = wire.log();
+        log.started_connections.extend([11, 12]);
+        log.round_trips.extend([
+            trip(11, Kind::Counted, "SET statement_timeout = 30000"),
+            trip(12, Kind::Counted, "SET statement_timeout = 30000"),
+            RoundTrip {
+                connection: 11,
+                kind: Kind::Counted,
+                executed: Vec::new(),
+                parsed: Vec::new(),
+            },
+            trip(
+                11,
+                Kind::Excluded("webhook dispatcher poll"),
+                DISPATCH_POLL_SQL,
+            ),
+            trip(11, Kind::Counted, "SELECT current_kv"),
+            trip(12, Kind::Counted, "SELECT current_kv"),
+            trip(
+                12,
+                Kind::Excluded("webhook dispatcher poll"),
+                DISPATCH_POLL_SQL,
+            ),
+        ]);
+    }
+    let window = wire.since(mark);
+    let counts = window.counts();
+    assert_eq!(counts.connections, 1, "request connection setup is counted");
+    assert_eq!(
+        counts.round_trips, 3,
+        "request and reused-connection SQL is counted"
+    );
+    assert_eq!(
+        counts.excluded, 4,
+        "only dispatcher setup, ping and polls are excluded"
+    );
+    assert_eq!(
+        window.round_trips[0].kind,
+        Kind::Excluded("webhook dispatcher setup")
+    );
+    assert_eq!(window.round_trips[1].kind, Kind::Counted);
+    assert_eq!(
+        window.round_trips[2].kind,
+        Kind::Excluded("webhook dispatcher setup")
+    );
+    assert_eq!(window.round_trips[4].kind, Kind::Counted);
+}
+
+#[test]
+fn dispatcher_attribution_never_hides_duplicate_setup_parse_or_prior_request_sql() {
+    let wire = Wire::default();
+    let mark = wire.mark();
+    let trip = |connection, kind, sql: &str| RoundTrip {
+        connection,
+        kind,
+        executed: vec![sql.to_owned()],
+        parsed: Vec::new(),
+    };
+    {
+        let mut log = wire.log();
+        log.started_connections.extend([13, 14, 15, 16]);
+        log.round_trips.extend([
+            trip(13, Kind::Counted, "SET statement_timeout = 30000"),
+            trip(13, Kind::Counted, "SET statement_timeout = 30000"),
+            trip(
+                13,
+                Kind::Excluded("webhook dispatcher poll"),
+                DISPATCH_POLL_SQL,
+            ),
+            trip(14, Kind::Counted, "SET statement_timeout = 30000"),
+            RoundTrip {
+                connection: 14,
+                kind: Kind::Excluded("webhook dispatcher poll"),
+                executed: Vec::new(),
+                parsed: vec![DISPATCH_POLL_SQL.to_owned()],
+            },
+            trip(15, Kind::Counted, "SET statement_timeout = 30000"),
+            trip(15, Kind::Counted, "SELECT current_kv"),
+            trip(
+                15,
+                Kind::Excluded("webhook dispatcher poll"),
+                DISPATCH_POLL_SQL,
+            ),
+            trip(
+                16,
+                Kind::Counted,
+                "SET statement_timeout = 30000; SELECT current_kv",
+            ),
+            trip(
+                16,
+                Kind::Excluded("webhook dispatcher poll"),
+                DISPATCH_POLL_SQL,
+            ),
+        ]);
+    }
+    let window = wire.since(mark);
+    let counts = window.counts();
+    assert_eq!(counts.connections, 4, "all four are request-side setups");
+    assert_eq!(counts.round_trips, 6, "no SET or request SQL is hidden");
+    assert_eq!(
+        counts.excluded, 4,
+        "only dispatcher parse/SELECTs are excluded"
+    );
+    for index in [0, 1, 3, 5, 6, 8] {
+        assert_eq!(window.round_trips[index].kind, Kind::Counted);
     }
 }
 
@@ -951,6 +1138,36 @@ async fn run(url: &str, schema: &str) -> Result<Vec<Measured>> {
                 .await
                 .with_context(|| format!("warm-up round {seed}"))?;
         }
+        // The dispatcher may open a connection after request warm-up; a
+        // background SET precedes its poll SQL. Wait for an actual execution
+        // after this mark (not an older poll or a statement-cache Parse), then
+        // settle the pool before starting the measured requests.
+        let after_warm_up = node.wire.mark();
+        let poll_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let polled = {
+                let log = node.wire.log();
+                log.round_trips[after_warm_up.round_trips..]
+                    .iter()
+                    .any(|round_trip| {
+                        round_trip.kind == Kind::Excluded("webhook dispatcher poll")
+                            && round_trip
+                                .executed
+                                .iter()
+                                .any(|sql| background(sql) == Some("webhook dispatcher poll"))
+                    })
+            };
+            if polled {
+                break;
+            }
+            ensure!(
+                Instant::now() < poll_deadline,
+                "no dispatcher poll executed after warm-up within five seconds"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        node.settle().await?;
+        println!("post-warm-up dispatcher execution settled before measured requests");
         let mut measured = Vec::new();
         round(&node, &Account::new(WARM_UP_ROUNDS + 1)?, &mut measured)
             .await
@@ -1003,6 +1220,11 @@ async fn postgres_round_trip_budget() {
         let mut detail = String::new();
         for request in measured.iter().filter(|m| m.flow == flow) {
             let counts = request.window.counts();
+            assert_eq!(
+                counts.connections, 0,
+                "{flow} {}: a request opened an unwarmed PostgreSQL connection",
+                request.request
+            );
             total += counts;
             let _ = writeln!(
                 detail,

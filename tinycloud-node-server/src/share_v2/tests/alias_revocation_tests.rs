@@ -126,7 +126,7 @@ async fn signed_alias_consumers(reverse: bool) {
     assert_ne!(hash(&historical), hash(&canonical));
     for bytes in [&historical, &canonical, &unrelated] {
         let parsed = TinyCloudDelegation::from_bytes(bytes).unwrap();
-        verify_delegation_signature(&parsed).await.unwrap();
+        verify_delegation_signature(&parsed, None).await.unwrap();
         let event =
             Delegation::from_header_ser::<HistoricalWire>(&encode_config(bytes, base64::URL_SAFE))
                 .unwrap();
