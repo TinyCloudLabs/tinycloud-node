@@ -60,12 +60,18 @@ built from a `1.9.0` tree); the `version-guard` job now blocks the second one.
 ## Promoting to production (main-only)
 
 Production is built and promoted **only from `main`** (TC-940, 2026-10-13).
-There is no release branch. The `deploy-phala` job refuses to run unless the
-dispatched ref is `refs/heads/main` or a `refs/tags/vX.Y.Z` tag whose commit is
-an ancestor of `origin/main` (`scripts/ci/check-deploy-ref.sh`, run both in
-`version-guard` before any build and again at the start of `deploy-phala`). A
-dispatch from any other branch or tag fails with
-`Deploy refused (main-only)`.
+There is no release branch. Immutable digest promotions require
+`refs/heads/main`; normal build dispatches may also use a `vX.Y.Z` tag in
+main's history (`scripts/ci/check-deploy-ref.sh`, before builds and again
+inside `deploy-phala`). Other refs fail `Deploy refused (main-only)`.
+
+**Release order:** approved #310 must never merge alone. Land #310 and its
+stacked recovery change atomically as one lineage, preserving emergency
+re-promotion and security rollback first. #309's sidecar compose belongs
+only to the later approved logging window, not this workflow/security
+release. The security card remains rollback-not-ready until the combined
+path is reviewed and landed. These docs grant no merge or dispatch authority.
+Merging either workflow change is a push, not a deployment dispatch.
 
 ### The `production` environment (TC-971)
 
@@ -73,8 +79,9 @@ The ref check above runs inside the workflow file of the dispatched ref, so it
 only protects refs whose `docker.yml` already has it. `workflow_dispatch` runs
 the workflow file at the selected ref, and repository or organization secrets
 are readable by every ref. To close that, every job that reads production
-secrets runs in the GitHub `production` environment, and those secrets exist
-only there:
+secrets runs in GitHub's `production` environment. Most deploy secrets
+exist only there; `PROD_TINYCLOUD_ADMIN_SECRET` is the approved repository-
+scoped exception and is consumed only inside the deploy job.
 
 | Workflow | Job | Production secrets |
 | --- | --- | --- |
@@ -92,10 +99,11 @@ Environment settings (Settings → Environments → `production`):
   `PROD_TINYCLOUD_S3_BUCKET`, `PROD_TINYCLOUD_S3_ENDPOINT`,
   `PROD_TINYCLOUD_AWS_ACCESS_KEY_ID`, `PROD_TINYCLOUD_AWS_SECRET_ACCESS_KEY`,
   `PROD_TINYCLOUD_AWS_REGION`, `PROD_TINYCLOUD_QUOTA_URL`,
-  `PROD_TINYCLOUD_ADMIN_SECRET`, `PROD_TINYCLOUD_SHARE_TRUST_BUNDLE_BASE64`,
+  `PROD_TINYCLOUD_SHARE_TRUST_BUNDLE_BASE64`,
   `PROD_TINYCLOUD_CLOUDFLARE_API_TOKEN`, `PROD_TINYCLOUD_DSTACK_GATEWAY_DOMAIN`,
-  `PROD_TINYCLOUD_CERTBOT_EMAIL`, `PROD_TINYCLOUD_KEYS_SECRET`.
-- None of these may also exist as a repository secret, and this repository
+  `PROD_TINYCLOUD_CERTBOT_EMAIL`, `PROD_TINYCLOUD_KEYS_SECRET`,
+  `PROD_TINYCLOUD_BETTERSTACK_SOURCE_TOKEN`.
+- Except for the explicit node admin exception, none may also exist as a repository secret; this repository
   must not be selected for the organization secret `PHALA_CLOUD_API_KEY`. A
   same-named repository or organization secret is still readable by a job
   without `environment: production`.
@@ -119,6 +127,47 @@ closes that gap.
 `TC780_CUTOVER_READY` stays a repository variable: the build jobs, which have
 no environment, read it too. `GITHUB_TOKEN` is the automatic token.
 
+The quota steps send `PROD_TINYCLOUD_ADMIN_SECRET` to billing's
+`/api/admin/storage-comp/:space_id` as well as to the node's admin API.
+Billing's storage-comp guard checks the Worker secret
+`TINYCLOUD_ADMIN_SECRET`, which is the node/billing shared admin value:
+billing uses it for its own calls to the node's `/admin/*` routes, and a
+rotation sets the GitHub secret and the `tinycloud-billing` Worker secret
+to one new value. No separate billing runner secret exists; rotating the
+shared value must update both holders together, or the quota steps fail
+closed with `quota API rejected the request`. The value is never passed in
+argv/logs and never added to the CVM env or `allowed_envs` under a billing
+name. A missing credential or an incompatible billing URL fails before
+compose/CVM mutation. Billing URLs derive strictly from the same HTTPS origin and
+`/api/quota` path of `PROD_TINYCLOUD_QUOTA_URL`; no URL is printed.
+
+Every `deploy_phala=true` command must explicitly include
+**`-f authorize_quota_values=true`**. This authorizes the reviewed values
+and authority in `ops/quota-overrides.json` for that one dispatch; it is
+not N0-specific or permission to silently reuse old values. Missing
+authorization or missing/unknown authority fails before any compose,
+CVM or whitelist mutation.
+
+`authority=node-override` currently applies the reviewed limits after the
+last restart and required health. Both exact spaces must exist once with
+positive usage in authenticated `/admin/usage`. Before ANY PUT, both billing
+storage-comp reads must prove no active comp: 404 logs only
+`billing storage-comp unavailable`; valid `active:false` also permits the
+legacy restore. Active comp fails `authority mismatch: flip to billing`.
+Auth/5xx/transport/malformed responses fail closed, never count as absence.
+Each PUT requires GET readback of both override and effective values.
+
+The later reviewed authority flip to `billing` is separate from this PR and
+follows TC-1162 migration. Billing mode never PUTs/DELETEs a node override:
+active absolute per-space `storage_limit_bytes` must cover each reviewed
+floor, and node GET must show `override_bytes=null`. A non-null override
+fails `stale legacy override`. A cold node cache is not a failure: billing
+is authoritative and the node fetches on the next write (≤60 s TTL).
+Do not compare incremental account `comp_bytes` with absolute space limits.
+No raw response, identity list, credential or error body is logged.
+Any attempted restart without verified reconciliation is fatal
+**OVERRIDES UNVERIFIED**, requiring authorized operator/TC-1161 fallback.
+
 If a job that names the environment ever runs before the environment exists,
 GitHub creates `production` with no branch policy. Create the environment and
 its branch policy before any workflow that names it runs.
@@ -133,20 +182,25 @@ its branch policy before any workflow that names it runs.
      --format '{{ json .Image.Config.Labels }}'   # revision == tag commit, version == X.Y.Z-dstack
    ```
 
-2. **Promote from the tag:**
+2. **Promote the recorded immutable digest from main:**
 
    ```sh
-   gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref vX.Y.Z \
-     -f deploy_phala=true -f image_version=X.Y.Z \
-     -f deploy_image_digest=sha256:<digest> \
+   gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref main \
+     -f deploy_phala=true -f authorize_quota_values=true \
+     -f image_version=X.Y.Z \
+     -f deploy_image_digest=sha256:<recorded digest> \
+     -f rollback_image_version=X.Y.Z \
+     -f rollback_image_revision=<recorded 40-character OCI revision> \
      -f sql_identity_fence=false
    ```
 
-   - Dispatch on the **tag**, not `main`. The deploy requires the image's
-     `org.opencontainers.image.revision` label to equal `HEAD` of the dispatched
-     ref; the tag always points at the build commit, while `main` only does
-     until the next merge. (`--ref main` works only while `main`'s tip is the
-     tag commit.)
+   - `image_version` and recorded labels describe the immutable image,
+     never an unrelated current crate version. The revision must be in
+     main history. A future non-N0 digest uses this same contract.
+   - The reviewed N0 compose remains raw-hash locked to its exact image;
+     it cannot substitute a future security image. Before the later
+     logging window, the ordinary main `:dstack` compose supports forward
+     image promotions without installing the sidecar.
    - `sql_identity_fence=false` is required. The input defaults to `true`,
      which re-fences SQL/DuckDB in production (503s).
    - The production ancestry guard still applies: the revision prod is running
@@ -206,41 +260,103 @@ its branch policy before any workflow that names it runs.
 
 ## Rolling back
 
-Roll back by promoting an older **recorded** digest, dispatched on `main`.
-Keep a record (digest, version, revision) of every digest you promote.
+Keep the digest, actual OCI version and actual revision of every promoted
+image. Sealed-runtime preflight is mandatory on recovery, rollback and
+forward paths; an image that cannot validate config fails before restart.
+The same general quota authority/reconciliation gate runs after the final
+env operation plus version/ingress health, before ancillary Policy probes.
+The downstream watcher cannot skip quota restoration.
+
+### Emergency same-image recovery (12c)
+
+After the combined workflow is reviewed/landed and a named operator has fresh
+values authorization, this is the single copy-paste recovery command. It uses
+the **current main compose**, whether the exact pre-N0 template or the exact
+reviewed N0 bytes. It does not opt into an N0-only snapshot or change the
+current logging policy. No command has been dispatched by this work.
 
 ```sh
 gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref main \
   -f deploy_phala=true \
-  -f image_version=<version in main's Cargo.toml> \
-  -f deploy_image_digest=sha256:<old digest> \
-  -f rollback_image_version=<old version, e.g. 1.20.1> \
-  -f rollback_image_revision=<old image's 40-char revision label> \
+  -f authorize_quota_values=true \
+  -f image_version=1.20.6 \
+  -f deploy_image_digest=sha256:4bdae4fc232d886bb56bfbce4ec62ed4b8fb4e1369a01f6afb73d06dd68c188f \
+  -f rollback_image_version=1.20.6 \
+  -f rollback_image_revision=e18578ff9162986ddd813259c60f73866e3e60d1 \
   -f sql_identity_fence=false
 ```
 
-- The `rollback_image_*` inputs replace the "revision label equals HEAD"
-  check with "labels equal these recorded values". The rollback revision must
-  be an ancestor of `main`, which every production revision since TC-940 is.
-- `allow_non_descendant` is **not** needed. The ancestry guard compares the
-  revision prod is currently running with `main`, and that revision is on
-  `main`. Keep `allow_non_descendant` as break-glass for when Phala or GHCR
-  cannot be queried for the running revision; the main-only check still
-  applies with it set.
-- The compose file and the ingress image come from `main`, not from the old
-  release; only the node binary rolls back. Check
-  `tinycloud-core/src/migrations` between the two revisions first: a binary
-  rollback across a schema migration is not DB-safe.
-- The sealed-config preflight is skipped for rollbacks, and the post-deploy
-  `/version` check expects `rollback_image_version`. Run the same manual
-  verification as for a release.
-- Rollback runs in the `production` environment like any other deploy, and
-  `main` is admitted by its branch policy. No environment change is needed.
-- Do not roll back by dispatching on an old tag or a retired branch. Old refs
-  carry an older `docker.yml` without the main-only guard or the `production`
-  environment, so they get no deploy secrets and fail. The retired deploy
-  branches (`feat/tc-780-release-line`,
-  `Codex/roman/rollback-meeting-node-20260915`) are also locked.
+The served/OCI identity remains **1.20.6-dstack / e18578ff9162986ddd813259c60f73866e3e60d1**.
+The N0 raw lock is unchanged:
+`ca110b0bae6d5a06a1002fb80df3f71cffec11659c9f9dbfa5d72624735546f6`,
+from #309 reviewed head `44eeb20a1461ef66b5af492e3be4c42be2728b67`,
+[approval](https://github.com/TinyCloudLabs/tinycloud-node/pull/309#issuecomment-6224650050).
+Current pre-N0 tag/pinned equivalents are separately hash-checked; arbitrary
+same-image config substitutions fail before mutation.
+
+### TC-1302 captured pre-N0 rollback
+
+This is a compose rollback, not merely a node digest selection. The source
+`ops/rollback/pre-n0-compose.yaml` is byte-identical to Amos's capture:
+raw SHA256 **`df239749ca0a9c09893a855ae2a8abb94090b8556515ad002105c58ac91f4c91`**.
+Its provenance was reconstructed from the frozen public template with only
+the immutable node pin; the private saved file's contents were not read.
+The node/ingress images, app env, storage and ingress topology stay fixed.
+Other paths, symlinks, source drift and edited variants fail before mutation.
+
+**Privacy choice remains pending Sam's explicit card answer.** The default
+is `unselected`, which refuses rollback. Amos records the approved choice in
+repository variable `TC959_ROLLBACK_PRIVACY_MODE`; the chosen input must match.
+Neither command below is authorization to choose that policy. Use exactly
+the command matching Sam's answer; do not add an override/bypass flag.
+
+If Sam explicitly selects **keep prior json-file logging**, retain the
+captured 3×50 MB local logging policy:
+
+```sh
+gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref main \
+  -f deploy_phala=true \
+  -f authorize_quota_values=true \
+  -f rollback_pre_n0=true \
+  -f rollback_privacy_mode=keep-json-file \
+  -f image_version=1.20.6 \
+  -f deploy_image_digest=sha256:4bdae4fc232d886bb56bfbce4ec62ed4b8fb4e1369a01f6afb73d06dd68c188f \
+  -f rollback_image_version=1.20.6 \
+  -f rollback_image_revision=e18578ff9162986ddd813259c60f73866e3e60d1 \
+  -f sql_identity_fence=false
+```
+
+If Sam explicitly selects **stop FUTURE local logs**, the reviewed derivative
+sets only the node and ingress logging drivers to `none`:
+
+```sh
+gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref main \
+  -f deploy_phala=true \
+  -f authorize_quota_values=true \
+  -f rollback_pre_n0=true \
+  -f rollback_privacy_mode=stop-future-local-logs \
+  -f image_version=1.20.6 \
+  -f deploy_image_digest=sha256:4bdae4fc232d886bb56bfbce4ec62ed4b8fb4e1369a01f6afb73d06dd68c188f \
+  -f rollback_image_version=1.20.6 \
+  -f rollback_image_revision=e18578ff9162986ddd813259c60f73866e3e60d1 \
+  -f sql_identity_fence=false
+```
+
+That derivative's raw SHA256 is
+`315ceca54bf8bfefe2b395b4097fe38ed8ec847fa0688bc873220bd65efc99ec`.
+Both the original capture and the selected derivative are fixed-path/hash
+validated. **Stopping future logs does not delete existing files. There is
+NO truncation/deletion path in this PR.** Any destructive action needs a
+separate explicit authorization and reviewed procedure.
+
+Never silently restore raw retention on forward/current-compose promotion:
+the privacy input is rollback-only and mutually exclusive. Existing private
+logs/private sysinfo flags remain; operator readback must preserve
+logs/sysinfo/tcbinfo = false/false/true. Do not use retired branches or tags
+for these digest commands. `allow_non_descendant` is not normally needed;
+all recorded revisions must remain in main history. Binary rollback across
+a database schema migration still needs a separate DB-safety decision.
+
 
 ## Why the version bump is manual
 
