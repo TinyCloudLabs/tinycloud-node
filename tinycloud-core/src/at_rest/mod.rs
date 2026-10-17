@@ -3,6 +3,10 @@
 
 mod key;
 mod provider;
+#[cfg(any(test, feature = "test-util"))]
+mod testing;
 
 pub use key::{DataKey, DekId, ObjectNameKey};
-pub use provider::{DataKeyError, DataKeyProvider, FixedKeyProvider};
+pub use provider::{DataKeyError, DataKeyProvider};
+#[cfg(any(test, feature = "test-util"))]
+pub use testing::FixedKeyProvider;

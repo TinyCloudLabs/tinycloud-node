@@ -16,6 +16,10 @@ duckdb = ["dep:arrow", "dep:duckdb"]
 # build. Downstream crates enable it only on their `tinycloud-core`
 # dev-dependency so their own tests can assert exactly-once verification.
 verification-count-test-hook = []
+# TC-887: `at_rest::FixedKeyProvider`, a deterministic test key provider.
+# Never part of a production build; downstream crates enable it only on their
+# `tinycloud-core` dev-dependency.
+test-util = []
 
 tokio = [
     "sea-orm/runtime-tokio-rustls",
