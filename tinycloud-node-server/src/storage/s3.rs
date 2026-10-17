@@ -1,8 +1,5 @@
 use aws_sdk_s3::{
-    error::{
-        GetObjectAttributesError, GetObjectAttributesErrorKind, GetObjectError, GetObjectErrorKind,
-        HeadObjectError, HeadObjectErrorKind,
-    },
+    error::{GetObjectError, GetObjectErrorKind, HeadObjectError, HeadObjectErrorKind},
     types::{ByteStream, SdkError},
     Client, // Config,
     Error as S3Error,
@@ -11,18 +8,29 @@ use aws_smithy_http::{byte_stream::Error as ByteStreamError, endpoint::Endpoint}
 use aws_types::sdk_config::SdkConfig;
 use futures::{
     future::Either as AsyncEither,
+    io::AsyncReadExt,
     stream::{IntoAsyncRead, MapErr, TryStreamExt},
 };
 use rocket::{async_trait, http::hyper::Uri};
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DisplayFromStr};
-use std::{collections::HashMap, io::Error as IoError, ops::AddAssign, time::Instant};
+use std::{
+    collections::HashMap, future::Future, io::Error as IoError, ops::AddAssign, time::Instant,
+};
 use tinycloud_auth::resource::SpaceId;
-use tinycloud_core::{at_rest::plaintext_len, hash::Hash, storage::*};
+use tinycloud_core::{
+    at_rest::{plaintext_len, DataKeyProvider, DecryptReader, HEADER_LEN},
+    hash::Hash,
+    storage::*,
+};
 
 use super::{
     file_system,
-    sealed::{self, scanned_object, ScannedObject},
+    sealed::{
+        self, open_sealed, plan_range, read_plan, scanned_object, seal_file, seal_vec,
+        space_tag_of, write_target, AtRestHandle, AtRestStoreError, AtRestView, ReadPlan,
+        ScannedObject, SealFileError, SealedName, WriteTarget,
+    },
     size::SpaceSizes,
 };
 
@@ -35,6 +43,38 @@ pub struct S3BlockStore {
     pub client: Client,
     pub bucket: String,
     sizes: SpaceSizes,
+    at_rest: Option<AtRestHandle>,
+}
+
+/// An S3 object body as an `AsyncRead`.
+type Body = IntoAsyncRead<MapErr<ByteStream, fn(ByteStreamError) -> IoError>>;
+
+/// Plaintext from a legacy object, or authenticated plaintext from a sealed one.
+/// The decrypting side is boxed: it carries the AES key schedule and segment
+/// buffers, and `Content` values move by value through deep request paths.
+pub type S3Readable = AsyncEither<Body, Box<DecryptReader<Body>>>;
+
+fn body(stream: ByteStream) -> Body {
+    stream
+        .map_err(convert as fn(ByteStreamError) -> IoError)
+        .into_async_read()
+}
+
+/// A staged block on its way into the store.
+enum Staged {
+    File(file_system::TempFileStage),
+    Bytes(Vec<u8>),
+}
+
+/// The outcome of a ranged GET.
+enum RangeGet {
+    Missing,
+    InvalidRange,
+    Got {
+        range: ResolvedByteRange,
+        total: u64,
+        body: Body,
+    },
 }
 
 #[serde_as]
@@ -123,6 +163,7 @@ impl S3BlockStore {
             client,
             bucket: config.bucket.clone(),
             sizes,
+            at_rest: None,
         })
     }
 
@@ -134,11 +175,372 @@ impl S3BlockStore {
         )
     }
 
-    async fn increment_size(&self, space: &SpaceId, size: u64) {
-        self.sizes.increment_size(space, None, size).await;
+    /// Links the store to the node's at-rest state (TC-887). Without it the
+    /// store behaves as at-rest mode `off`.
+    pub fn attach_at_rest(&mut self, handle: AtRestHandle) {
+        self.at_rest = Some(handle);
     }
-    async fn decrement_size(&self, space: &SpaceId, size: u64) {
-        self.sizes.decrement_size(space, None, size).await;
+
+    fn view(&self) -> AtRestView {
+        AtRestView::of(self.at_rest.as_ref())
+    }
+
+    async fn head_exists(&self, key: &str) -> Result<bool, S3StoreError> {
+        Ok(self.object_size(key).await?.is_some())
+    }
+
+    /// The whole object: (stored length, body), or `None` if absent.
+    async fn get_full(&self, key: &str) -> Result<Option<(u64, Body)>, S3StoreError> {
+        match self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(o) => Ok(Some((o.content_length().try_into()?, body(o.body)))),
+            Err(SdkError::ServiceError {
+                err:
+                    GetObjectError {
+                        kind: GetObjectErrorKind::NoSuchKey(_),
+                        ..
+                    },
+                ..
+            }) => Ok(None),
+            Err(e) => Err(S3Error::from(e).into()),
+        }
+    }
+
+    async fn get_range(&self, key: &str, range: ByteRangeSpec) -> Result<RangeGet, S3StoreError> {
+        match self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .range(range.to_http_value())
+            .send()
+            .await
+        {
+            Ok(output) => {
+                let content_range = output.content_range().ok_or_else(|| {
+                    S3StoreError::InvalidContentRange("missing header".to_string())
+                })?;
+                let (range, total) = parse_content_range(content_range)?;
+                Ok(RangeGet::Got {
+                    range,
+                    total,
+                    body: body(output.body),
+                })
+            }
+            Err(SdkError::ServiceError {
+                err:
+                    GetObjectError {
+                        kind: GetObjectErrorKind::NoSuchKey(_),
+                        ..
+                    },
+                ..
+            }) => Ok(RangeGet::Missing),
+            Err(SdkError::ServiceError { err, .. }) if err.code() == Some("InvalidRange") => {
+                Ok(RangeGet::InvalidRange)
+            }
+            Err(error) => Err(S3Error::from(error).into()),
+        }
+    }
+
+    async fn put(&self, key: &str, body: ByteStream) -> Result<(), S3StoreError> {
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .body(body)
+            .send()
+            .await
+            .map_err(S3Error::from)?;
+        Ok(())
+    }
+
+    async fn persist_staged(
+        &self,
+        space: &SpaceId,
+        hash: &Hash,
+        staged: Staged,
+    ) -> Result<(), S3StoreError> {
+        match write_target(&self.view(), space, hash).await? {
+            WriteTarget::Legacy => {
+                let key = self.key(space, hash);
+                if self.head_exists(&key).await? {
+                    return Ok(());
+                }
+                let size = match staged {
+                    Staged::File(t_file) => {
+                        let size = t_file.size().await?;
+                        let (_file, path) = t_file.into_inner();
+                        self.put(&key, ByteStream::from_path(&path).await?).await?;
+                        size
+                    }
+                    Staged::Bytes(b) => {
+                        let size = b.len() as u64;
+                        self.put(&key, ByteStream::from(b)).await?;
+                        size
+                    }
+                };
+                self.sizes.increment_size(space, None, size).await;
+            }
+            WriteTarget::Sealed { name, key } => {
+                // Only the sealed name dedups: a legacy copy never suppresses
+                // the sealed write.
+                let object = name.key();
+                if self.head_exists(&object).await? {
+                    return Ok(());
+                }
+                let size = match staged {
+                    Staged::File(t_file) => {
+                        let size = t_file.size().await?;
+                        let (_file, path) = t_file.into_inner();
+                        let sealed = seal_file(&key, space, hash, &path, size).await?;
+                        self.put(&object, ByteStream::from_path(sealed.path()).await?)
+                            .await?;
+                        size
+                    }
+                    Staged::Bytes(b) => {
+                        let size = b.len() as u64;
+                        let ct = seal_vec(key, space, hash, b).await?;
+                        self.put(&object, ByteStream::from(ct)).await?;
+                        size
+                    }
+                };
+                self.sizes
+                    .increment_size(space, Some(&name.space_tag), size)
+                    .await;
+            }
+        }
+        Ok(())
+    }
+
+    async fn read_legacy(
+        &self,
+        space: &SpaceId,
+        id: &Hash,
+    ) -> Result<Option<Content<S3Readable>>, S3StoreError> {
+        Ok(self
+            .get_full(&self.key(space, id))
+            .await?
+            .map(|(len, b)| Content::new(len, AsyncEither::Left(b))))
+    }
+
+    async fn read_sealed(
+        &self,
+        name: &SealedName,
+        provider: &dyn DataKeyProvider,
+        space: &SpaceId,
+        id: &Hash,
+    ) -> Result<Option<Content<S3Readable>>, S3StoreError> {
+        let Some((len, b)) = self.get_full(&name.key()).await? else {
+            return Ok(None);
+        };
+        let (size, reader) = open_sealed(provider, space, id, b, len).await?.into_inner();
+        Ok(Some(Content::new(
+            size,
+            AsyncEither::Right(Box::new(reader)),
+        )))
+    }
+
+    async fn read_block(
+        &self,
+        space: &SpaceId,
+        id: &Hash,
+    ) -> Result<Option<Content<S3Readable>>, S3StoreError> {
+        match read_plan(&self.view(), space, id)? {
+            ReadPlan::Legacy => self.read_legacy(space, id).await,
+            ReadPlan::LegacyWhileLocked => match self.read_legacy(space, id).await? {
+                Some(c) => Ok(Some(c)),
+                None => Err(AtRestStoreError::Unavailable("at-rest keys are locked").into()),
+            },
+            ReadPlan::SealedThenLegacy { name, provider } => {
+                match self.read_sealed(&name, &*provider, space, id).await? {
+                    Some(c) => Ok(Some(c)),
+                    None => self.read_legacy(space, id).await,
+                }
+            }
+            ReadPlan::Sealed { name, provider } => {
+                match self.read_sealed(&name, &*provider, space, id).await? {
+                    Some(c) => Ok(Some(c)),
+                    None if self.head_exists(&self.key(space, id)).await? => {
+                        Err(AtRestStoreError::LegacyRefused.into())
+                    }
+                    None => Ok(None),
+                }
+            }
+        }
+    }
+
+    async fn range_legacy(
+        &self,
+        space: &SpaceId,
+        id: &Hash,
+        spec: ByteRangeSpec,
+    ) -> Result<Option<RangeRead<S3Readable>>, S3StoreError> {
+        let key = self.key(space, id);
+        match self.get_range(&key, spec).await? {
+            RangeGet::Got { range, total, body } => Ok(Some(RangeRead::Content {
+                total_size: total,
+                range,
+                content: Content::new(range.len(), AsyncEither::Left(body)),
+            })),
+            RangeGet::Missing => Ok(None),
+            RangeGet::InvalidRange => {
+                let head = self
+                    .client
+                    .head_object()
+                    .bucket(&self.bucket)
+                    .key(&key)
+                    .send()
+                    .await;
+                match head {
+                    Ok(output) => Ok(Some(RangeRead::Unsatisfiable {
+                        total_size: output.content_length().try_into()?,
+                    })),
+                    Err(SdkError::ServiceError {
+                        err:
+                            HeadObjectError {
+                                kind: HeadObjectErrorKind::NotFound(_),
+                                ..
+                            },
+                        ..
+                    }) => Ok(None),
+                    Err(error) => Err(S3Error::from(error).into()),
+                }
+            }
+        }
+    }
+
+    /// A range of the block's sealed object, or `None` if it is absent: one
+    /// GET for the header, one for the segments. Totals and the 416 decision
+    /// use the plaintext length.
+    async fn range_sealed(
+        &self,
+        name: &SealedName,
+        provider: &dyn DataKeyProvider,
+        space: &SpaceId,
+        id: &Hash,
+        spec: ByteRangeSpec,
+    ) -> Result<Option<RangeRead<S3Readable>>, S3StoreError> {
+        let object = name.key();
+        let header_span = ByteRangeSpec::Inclusive {
+            start: 0,
+            end: HEADER_LEN as u64 - 1,
+        };
+        let (total, mut head_body) = match self.get_range(&object, header_span).await? {
+            RangeGet::Missing => return Ok(None),
+            RangeGet::InvalidRange => {
+                return Err(AtRestStoreError::Integrity("object shorter than its header").into())
+            }
+            RangeGet::Got { total, body, .. } => (total, body),
+        };
+        let mut header = [0u8; HEADER_LEN];
+        head_body
+            .read_exact(&mut header)
+            .await
+            .map_err(|_| AtRestStoreError::Integrity("object shorter than its header"))?;
+        let plan = plan_range(provider, space, &header, total, spec).await?;
+        let Some(r) = plan.range else {
+            return Ok(Some(RangeRead::Unsatisfiable {
+                total_size: plan.plaintext_len(),
+            }));
+        };
+        let span = ByteRangeSpec::Inclusive {
+            start: r.ciphertext_start(),
+            end: r.ciphertext_end(),
+        };
+        let body = match self.get_range(&object, span).await? {
+            RangeGet::Got { range, body, .. }
+                if range.start() == r.ciphertext_start() && range.end() == r.ciphertext_end() =>
+            {
+                body
+            }
+            RangeGet::Missing => return Ok(None),
+            _ => return Err(AtRestStoreError::Integrity("object changed during a read").into()),
+        };
+        let reader = plan.reader(space, id, r, body)?;
+        let range = r.plaintext_range();
+        Ok(Some(RangeRead::Content {
+            total_size: plan.plaintext_len(),
+            range,
+            content: Content::new(range.len(), AsyncEither::Right(Box::new(reader))),
+        }))
+    }
+
+    async fn range_block(
+        &self,
+        space: &SpaceId,
+        id: &Hash,
+        spec: ByteRangeSpec,
+    ) -> Result<Option<RangeRead<S3Readable>>, S3StoreError> {
+        match read_plan(&self.view(), space, id)? {
+            ReadPlan::Legacy => self.range_legacy(space, id, spec).await,
+            ReadPlan::LegacyWhileLocked => match self.range_legacy(space, id, spec).await? {
+                Some(r) => Ok(Some(r)),
+                None => Err(AtRestStoreError::Unavailable("at-rest keys are locked").into()),
+            },
+            ReadPlan::SealedThenLegacy { name, provider } => {
+                match self
+                    .range_sealed(&name, &*provider, space, id, spec)
+                    .await?
+                {
+                    Some(r) => Ok(Some(r)),
+                    None => self.range_legacy(space, id, spec).await,
+                }
+            }
+            ReadPlan::Sealed { name, provider } => {
+                match self
+                    .range_sealed(&name, &*provider, space, id, spec)
+                    .await?
+                {
+                    Some(r) => Ok(Some(r)),
+                    None if self.head_exists(&self.key(space, id)).await? => {
+                        Err(AtRestStoreError::LegacyRefused.into())
+                    }
+                    None => Ok(None),
+                }
+            }
+        }
+    }
+
+    /// The stored size of an object, or `None` if absent. HeadObject, not
+    /// GetObjectAttributes: that call needs an explicit attribute list, and
+    /// S3 (and MinIO) reject it without one.
+    async fn object_size(&self, key: &str) -> Result<Option<u64>, S3StoreError> {
+        match self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(o) => Ok(Some(o.content_length().try_into()?)),
+            Err(SdkError::ServiceError {
+                err:
+                    HeadObjectError {
+                        kind: HeadObjectErrorKind::NotFound(_),
+                        ..
+                    },
+                ..
+            }) => Ok(None),
+            Err(e) => Err(S3Error::from(e).into()),
+        }
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), S3StoreError> {
+        self.client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(S3Error::from)?;
+        Ok(())
     }
 }
 
@@ -162,29 +564,27 @@ pub enum S3StoreError {
     AtRest(#[from] sealed::AtRestStoreError),
 }
 
+impl From<SealFileError> for S3StoreError {
+    fn from(e: SealFileError) -> Self {
+        match e {
+            SealFileError::AtRest(e) => Self::AtRest(e),
+            SealFileError::Io(e) => Self::Io(e),
+        }
+    }
+}
+
 #[async_trait]
 impl ImmutableReadStore for S3BlockStore {
     type Error = S3StoreError;
-    type Readable = IntoAsyncRead<MapErr<ByteStream, fn(ByteStreamError) -> IoError>>;
+    type Readable = S3Readable;
     async fn contains(&self, space: &SpaceId, id: &Hash) -> Result<bool, Self::Error> {
-        match self
-            .client
-            .head_object()
-            .bucket(&self.bucket)
-            .key(self.key(space, id))
-            .send()
-            .await
-        {
-            Ok(_) => Ok(true),
-            Err(SdkError::ServiceError {
-                err:
-                    HeadObjectError {
-                        kind: HeadObjectErrorKind::NotFound(_),
-                        ..
-                    },
-                ..
-            }) => Ok(false),
-            Err(e) => Err(S3Error::from(e).into()),
+        match read_plan(&self.view(), space, id)? {
+            ReadPlan::Legacy | ReadPlan::LegacyWhileLocked => {
+                self.head_exists(&self.key(space, id)).await
+            }
+            ReadPlan::SealedThenLegacy { name, .. } => Ok(self.head_exists(&name.key()).await?
+                || self.head_exists(&self.key(space, id)).await?),
+            ReadPlan::Sealed { name, .. } => self.head_exists(&name.key()).await,
         }
     }
 
@@ -194,30 +594,9 @@ impl ImmutableReadStore for S3BlockStore {
         id: &Hash,
     ) -> Result<Option<Content<Self::Readable>>, Self::Error> {
         let start = Instant::now();
-        let res = self
-            .client
-            .get_object()
-            .bucket(&self.bucket)
-            .key(self.key(space, id))
-            .send()
-            .await;
-        let result = match res {
-            Ok(o) => Ok(Some(Content::new(
-                o.content_length().try_into()?,
-                o.body
-                    .map_err(convert as fn(ByteStreamError) -> IoError)
-                    .into_async_read(),
-            ))),
-            Err(SdkError::ServiceError {
-                err:
-                    GetObjectError {
-                        kind: GetObjectErrorKind::NoSuchKey(_),
-                        ..
-                    },
-                ..
-            }) => Ok(None),
-            Err(e) => Err(S3Error::from(e).into()),
-        };
+        // Boxed: the sealed read path's future is large, and the trait method
+        // future is built on the caller's stack before async_trait boxes it.
+        let result = Box::pin(self.read_block(space, id)).await;
         crate::prometheus::observe_stage(
             crate::prometheus::InvocationStage::BlockRead,
             crate::prometheus::StageOutcome::from(result.is_ok()),
@@ -232,67 +611,7 @@ impl ImmutableReadStore for S3BlockStore {
         id: &Hash,
         range: ByteRangeSpec,
     ) -> Result<Option<RangeRead<Self::Readable>>, Self::Error> {
-        let key = self.key(space, id);
-        let output = self
-            .client
-            .get_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .range(range.to_http_value())
-            .send()
-            .await;
-        match output {
-            Ok(output) => {
-                let content_range = output.content_range().ok_or_else(|| {
-                    S3StoreError::InvalidContentRange("missing header".to_string())
-                })?;
-                let (range, total_size) = parse_content_range(content_range)?;
-                let content = Content::new(
-                    range.len(),
-                    output
-                        .body
-                        .map_err(convert as fn(ByteStreamError) -> IoError)
-                        .into_async_read(),
-                );
-                Ok(Some(RangeRead::Content {
-                    total_size,
-                    range,
-                    content,
-                }))
-            }
-            Err(SdkError::ServiceError {
-                err:
-                    GetObjectError {
-                        kind: GetObjectErrorKind::NoSuchKey(_),
-                        ..
-                    },
-                ..
-            }) => return Ok(None),
-            Err(SdkError::ServiceError { err, .. }) if err.code() == Some("InvalidRange") => {
-                let head = self
-                    .client
-                    .head_object()
-                    .bucket(&self.bucket)
-                    .key(self.key(space, id))
-                    .send()
-                    .await;
-                match head {
-                    Ok(output) => Ok(Some(RangeRead::Unsatisfiable {
-                        total_size: output.content_length().try_into()?,
-                    })),
-                    Err(SdkError::ServiceError {
-                        err:
-                            HeadObjectError {
-                                kind: HeadObjectErrorKind::NotFound(_),
-                                ..
-                            },
-                        ..
-                    }) => Ok(None),
-                    Err(error) => Err(S3Error::from(error).into()),
-                }
-            }
-            Err(error) => Err(S3Error::from(error).into()),
-        }
+        Box::pin(self.range_block(space, id, range)).await
     }
 }
 
@@ -322,79 +641,60 @@ fn parse_content_range(value: &str) -> Result<(ResolvedByteRange, u64), S3StoreE
     Ok((range, total_size))
 }
 
+/// Times a block write, as before.
+async fn observed_write<F>(write: F) -> Result<Hash, S3StoreError>
+where
+    F: Future<Output = Result<Hash, S3StoreError>>,
+{
+    let start = Instant::now();
+    let result = write.await;
+    crate::prometheus::observe_stage(
+        crate::prometheus::InvocationStage::BlockWrite,
+        crate::prometheus::StageOutcome::from(result.is_ok()),
+        start.elapsed(),
+    );
+    result
+}
+
 #[async_trait]
 impl ImmutableWriteStore<memory::MemoryStaging> for S3BlockStore {
     type Error = S3StoreError;
+    async fn prepare_write(&self, space: &SpaceId) -> Result<(), Self::Error> {
+        Ok(sealed::prepare_write(&self.view(), space).await?)
+    }
     async fn persist(
         &self,
         space: &SpaceId,
         staged: HashBuffer<<memory::MemoryStaging as ImmutableStaging>::Writable>,
     ) -> Result<Hash, Self::Error> {
-        let start = Instant::now();
-        let result = async move {
+        observed_write(async move {
             let (mut h, f) = staged.into_inner();
             let hash = h.finalize();
-
-            if !self.contains(space, &hash).await? {
-                let size = f.len() as u64;
-                self.client
-                    .put_object()
-                    .bucket(&self.bucket)
-                    .key(self.key(space, &hash))
-                    .body(ByteStream::from(f))
-                    .send()
-                    .await
-                    .map_err(S3Error::from)?;
-                self.increment_size(space, size).await;
-            }
+            Box::pin(self.persist_staged(space, &hash, Staged::Bytes(f))).await?;
             Ok(hash)
-        }
-        .await;
-        crate::prometheus::observe_stage(
-            crate::prometheus::InvocationStage::BlockWrite,
-            crate::prometheus::StageOutcome::from(result.is_ok()),
-            start.elapsed(),
-        );
-        result
+        })
+        .await
     }
 }
 
 #[async_trait]
 impl ImmutableWriteStore<file_system::TempFileSystemStage> for S3BlockStore {
     type Error = S3StoreError;
+    async fn prepare_write(&self, space: &SpaceId) -> Result<(), Self::Error> {
+        Ok(sealed::prepare_write(&self.view(), space).await?)
+    }
     async fn persist(
         &self,
         space: &SpaceId,
         staged: HashBuffer<<file_system::TempFileSystemStage as ImmutableStaging>::Writable>,
     ) -> Result<Hash, Self::Error> {
-        let start = Instant::now();
-        let result = async move {
+        observed_write(async move {
             let (mut h, f) = staged.into_inner();
             let hash = h.finalize();
-
-            if !self.contains(space, &hash).await? {
-                let size = f.size().await?;
-                let (_file, path) = f.into_inner();
-
-                self.client
-                    .put_object()
-                    .bucket(&self.bucket)
-                    .key(self.key(space, &hash))
-                    .body(ByteStream::from_path(&path).await?)
-                    .send()
-                    .await
-                    .map_err(S3Error::from)?;
-                self.increment_size(space, size).await;
-            }
+            Box::pin(self.persist_staged(space, &hash, Staged::File(f))).await?;
             Ok(hash)
-        }
-        .await;
-        crate::prometheus::observe_stage(
-            crate::prometheus::InvocationStage::BlockWrite,
-            crate::prometheus::StageOutcome::from(result.is_ok()),
-            start.elapsed(),
-        );
-        result
+        })
+        .await
     }
 }
 
@@ -403,54 +703,25 @@ impl ImmutableWriteStore<either::Either<file_system::TempFileSystemStage, memory
     for S3BlockStore
 {
     type Error = S3StoreError;
+    async fn prepare_write(&self, space: &SpaceId) -> Result<(), Self::Error> {
+        Ok(sealed::prepare_write(&self.view(), space).await?)
+    }
     async fn persist(
         &self,
         space: &SpaceId,
         staged: HashBuffer<<either::Either<file_system::TempFileSystemStage, memory::MemoryStaging> as ImmutableStaging>::Writable>,
     ) -> Result<Hash, Self::Error> {
-        let start = Instant::now();
-        let result = async move {
+        observed_write(async move {
             let (mut h, f) = staged.into_inner();
             let hash = h.finalize();
-
-            if !self.contains(space, &hash).await? {
-                match f {
-                    AsyncEither::Left(t_file) => {
-                        let size = t_file.size().await?;
-                        let (_file, path) = t_file.into_inner();
-                        self.client
-                            .put_object()
-                            .bucket(&self.bucket)
-                            .key(self.key(space, &hash))
-                            .body(ByteStream::from_path(&path).await?)
-                            .send()
-                            .await
-                            .map_err(S3Error::from)?;
-                        self.increment_size(space, size).await;
-                    }
-                    AsyncEither::Right(b) => {
-                        let size = b.len() as u64;
-                        self.client
-                            .put_object()
-                            .bucket(&self.bucket)
-                            .key(self.key(space, &hash))
-                            .body(ByteStream::from(b))
-                            .send()
-                            .await
-                            .map_err(S3Error::from)?;
-                        self.increment_size(space, size).await;
-                    }
-                }
+            let staged = match f {
+                AsyncEither::Left(t_file) => Staged::File(t_file),
+                AsyncEither::Right(b) => Staged::Bytes(b),
             };
+            Box::pin(self.persist_staged(space, &hash, staged)).await?;
             Ok(hash)
-        }
-        .await;
-        crate::prometheus::observe_stage(
-            crate::prometheus::InvocationStage::BlockWrite,
-            crate::prometheus::StageOutcome::from(result.is_ok()),
-            start.elapsed(),
-        );
-        result
+        })
+        .await
     }
 }
 
@@ -458,41 +729,28 @@ impl ImmutableWriteStore<either::Either<file_system::TempFileSystemStage, memory
 impl ImmutableDeleteStore for S3BlockStore {
     type Error = S3StoreError;
     async fn remove(&self, space: &SpaceId, id: &Hash) -> Result<Option<()>, Self::Error> {
-        let size: u64 = match self
-            .client
-            .get_object_attributes()
-            .bucket(&self.bucket)
-            .key(self.key(space, id))
-            .send()
-            .await
-        {
-            Ok(o) if !o.delete_marker() => o.object_size().try_into()?,
-            Ok(_) => return Ok(None),
-            Err(SdkError::ServiceError {
-                err:
-                    GetObjectAttributesError {
-                        kind: GetObjectAttributesErrorKind::NoSuchKey(_),
-                        ..
-                    },
-                ..
-            }) => return Ok(None),
-            Err(e) => return Err(S3Error::from(e).into()),
-        };
-        match self
-            .client
-            .delete_object()
-            .bucket(&self.bucket)
-            .key(self.key(space, id))
-            .send()
-            .await
-        {
-            Ok(_) => {
-                self.decrement_size(space, size).await;
-                Ok(Some(()))
+        // A sealed copy first (if keys can name it), then the legacy object.
+        if let Some(nk) = self.view().object_name_key() {
+            let name = SealedName::new(&nk, space, id);
+            if let Some(size) = self.object_size(&name.key()).await? {
+                self.delete(&name.key()).await?;
+                self.sizes
+                    .decrement_size(
+                        space,
+                        Some(&name.space_tag),
+                        plaintext_len(size).unwrap_or(0),
+                    )
+                    .await;
+                return Ok(Some(()));
             }
-            // TODO does this distinguish between object missing and object present?
-            Err(e) => Err(S3Error::from(e).into()),
         }
+        let key = self.key(space, id);
+        let Some(size) = self.object_size(&key).await? else {
+            return Ok(None);
+        };
+        self.delete(&key).await?;
+        self.sizes.decrement_size(space, None, size).await;
+        Ok(Some(()))
     }
 }
 
@@ -500,7 +758,11 @@ impl ImmutableDeleteStore for S3BlockStore {
 impl StoreSize for S3BlockStore {
     type Error = S3StoreError;
     async fn total_size(&self, space: &SpaceId) -> Result<Option<u64>, Self::Error> {
-        Ok(self.sizes.get_size(space, None).await)
+        let view = self.view();
+        Ok(self
+            .sizes
+            .get_size(space, space_tag_of(&view, space).as_deref())
+            .await)
     }
 }
 
