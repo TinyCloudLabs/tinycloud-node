@@ -105,7 +105,7 @@ services:
       - CERTBOT_EMAIL=${CERTBOT_EMAIL}
       - SET_CAA=true
       - DNS_PROVIDER=cloudflare
-      - CLIENT_MAX_BODY_SIZE=95m
+      - CLIENT_MAX_BODY_SIZE=32m
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock
       - cert-data:/etc/letsencrypt
