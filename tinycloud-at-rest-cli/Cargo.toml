@@ -1,0 +1,26 @@
+[package]
+name = "tinycloud-at-rest-cli"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Escrow ceremony and recovery tool for TinyCloud encryption at rest (TC-887)"
+
+[[bin]]
+name = "tinycloud-at-rest"
+path = "src/main.rs"
+
+[dependencies]
+tinycloud-at-rest-escrow = { path = "../tinycloud-at-rest-escrow" }
+# Intel DCAP quote verification (Phala), pinned: it decides whether a holder
+# releases a share.
+dcap-qvl = { version = "=0.7.0" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+base64 = { workspace = true }
+hex = { workspace = true }
+rand = "0.8"
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+tokio = { workspace = true }
+zeroize = "1"
