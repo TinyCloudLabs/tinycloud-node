@@ -92,9 +92,10 @@ For persistence-sensitive work, add a restart/cold-cache check:
 
 For work on what reaches storage (S3 blocks, `database_artifact`, encryption at rest), use the
 native harness in `scripts/at-rest-harness/` (README there): `harness.sh up` runs the real node on
-native PostgreSQL and MinIO with no containers, `harness.sh test green|red` runs the checks in
-`tinycloud-node-server/tests/at_rest_harness.rs`, and `harness.sh down --purge` stops only the
-PIDs it started.
+native PostgreSQL and MinIO with no containers and prints its state path, `harness.sh test
+green|red STATE` runs the checks in `tinycloud-node-server/tests/at_rest_harness.rs`, and
+`harness.sh down --purge STATE` stops only the process groups that run started. Commands never
+default to another run's state.
 
 ## Debugging
 

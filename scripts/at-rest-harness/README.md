@@ -2,27 +2,30 @@
 
 A real `tinycloud` node on native PostgreSQL and native MinIO, plus the checks
 that show what reaches storage. No Docker or containers. Everything binds
-`127.0.0.1` on free ports. Each run lives in its own directory
-(`~/scratch/tc887/harness-run-*`, mode 0700). `down` stops only the PIDs that
-`up` recorded, and only if `/proc/<pid>/exe` is still the binary it started.
+loopback on free ports. Each run lives in its own directory
+(`$TC887_SCRATCH_ROOT/harness-run-*`, default `~/scratch/tc887`, mode 0700).
+Every process the harness starts leads its own process group (`setsid`; the
+postmaster calls `setsid` itself). The state file records each PID with its
+kernel start time, and `down` signals only those groups.
 
 | Piece | What runs |
 |---|---|
 | PostgreSQL | native `initdb`/`pg_ctl` (newest `/usr/lib/postgresql/*/bin`, or `PG_BIN`), scram password auth, TCP only. Holds the node's capability DB, including `database_artifact` |
 | MinIO | `minio` `RELEASE.2025-09-07T16-13-09Z`; bucket `tinycloud-blocks` is created with `mc` `RELEASE.2025-08-13T08-35-41Z` |
-| Node | `target/debug/tinycloud` with `TINYCLOUD_STORAGE__DATABASE` = PG and `TINYCLOUD_STORAGE__BLOCKS__TYPE=S3` (bucket, endpoint, `AWS_*` creds, region `us-east-1`), `TINYCLOUD_KEYS__TYPE=Static` with a per-run secret |
+| Node | a copy of `target/debug/tinycloud` with `TINYCLOUD_STORAGE__DATABASE` = PG, `TINYCLOUD_STORAGE__BLOCKS__TYPE=S3` (bucket, endpoint, `AWS_*` creds, region `us-east-1`), `TINYCLOUD_STORAGE__SQL__MEMORY_THRESHOLD=0` (file-backed SQL, so writes after the first checkpoint are saved as WAL deltas), and `TINYCLOUD_KEYS__TYPE=Static` with a per-run secret |
 
 Secrets (PG password, MinIO root credentials, node Static root) are generated
 per run into `secrets/` and the 0600 files `harness.env` (read by the checks)
 and `node.env` (the node's entire environment). They are never put on argv or
-in logs. `state.json` (ports, PIDs, binaries, log paths, `env_file`) holds no
-secrets.
+in logs. `state.json` (ports, PIDs and start times, binaries, log paths,
+`env_file`, at-rest settings) holds no secrets.
 
 ## Prerequisites
 
-- Linux x86_64, `bash`, `curl`, `python3`, Rust toolchain from `rust-toolchain.toml`.
+- Linux x86_64 (the pinned MinIO/mc are linux-amd64; other hosts are refused), `bash`, `curl`, `python3`, and the Rust toolchain from `rust-toolchain.toml`.
 - Native PostgreSQL server binaries (`initdb`, `pg_ctl`, `postgres`, `psql`).
-  Ubuntu: `postgresql-14` or newer. Set `PG_BIN` to pick a version.
+  Ubuntu: `postgresql-14` or newer. The version is not pinned: the harness uses
+  the newest one installed, or `PG_BIN`.
 - MinIO and mc: `harness.sh bins` downloads the pinned community releases from
   their (archived) GitHub releases into `~/.cache/tc887-harness/bin` and checks
   the sha256 pinned in the script. dl.min.io no longer serves community builds
@@ -31,38 +34,85 @@ secrets.
 ## Use
 
 ```sh
-scripts/at-rest-harness/harness.sh up            # builds the node (nice -n 10, -j 8), prints state.json path
-scripts/at-rest-harness/harness.sh test green    # the harness works: writes reach MinIO and PG (passes)
-scripts/at-rest-harness/harness.sh test red      # the TC-887 at-rest property (FAILS until S3/S4)
-scripts/at-rest-harness/harness.sh down --purge  # stop recorded PIDs, remove the run dir
+STATE=$(scripts/at-rest-harness/harness.sh up)    # builds the node (nice -n 10, -j 8); prints the state path last
+scripts/at-rest-harness/harness.sh test green "$STATE"            # writes reach MinIO and PG (passes)
+scripts/at-rest-harness/harness.sh test red --expect red "$STATE" # exit 0 only if both RED checks fail as RED
+scripts/at-rest-harness/harness.sh down --purge "$STATE"          # stop this run's processes, remove its dir
 ```
 
-`up --no-build` reuses an already-built binary (or set `TC887_NODE_BIN`).
-`status` prints the state file and `logs` tails the harness logs. Commands act
-on `~/scratch/tc887/harness-latest` unless `TC887_HARNESS_STATE` or an explicit
-state path / run dir is given. Overrides: `TC887_SCRATCH_ROOT`, `TC887_RUN_DIR`,
-`TC887_{PG,MINIO,MINIO_CONSOLE,NODE}_PORT`, `TC887_BIN_DIR`, `TC887_CARGO_JOBS`.
+Every command after `up` needs the explicit `STATE` (the state.json path or its
+run dir). Nothing defaults to a "latest" run, so concurrent runs on a shared
+host can't act on each other.
+
+- `up --no-build` reuses an already-built binary (or set `TC887_NODE_BIN`).
+- If `up` fails, times out or is interrupted, it stops every process it
+  started. It keeps the run dir with its logs; remove it with `down --purge`.
+- `status STATE` prints the state file and `logs STATE` tails the logs.
+- Overrides: `TC887_SCRATCH_ROOT`, `TC887_RUN_DIR` (must be named
+  `harness-run-*`), `TC887_{PG,MINIO,MINIO_CONSOLE,NODE}_PORT`, `TC887_BIN_DIR`,
+  `TC887_CARGO_JOBS`, `TC887_NODE_READY_SECS`.
+- Ports are picked by binding port 0 and releasing it, so another process can
+  take one before the harness does. A collision makes `up` fail cleanly; it
+  can't produce a false green, because the checks talk to MinIO and PG directly.
+
+`test` exits 0 only on the expected outcome:
+
+| Exit | Meaning |
+|---|---|
+| 0 | as expected (`GREEN as expected` / `RED as expected`) |
+| 3 | unexpected result: RED checks passed (`UNEXPECTEDLY PASSED for KV/SQL`), or `--expect green` while still RED |
+| 4 | errored: compile failure, harness failure, a precondition (`harness no-op`/`harness gap`) or a node error, i.e. not a RED finding |
+
+`--expect` defaults to `green` for `test green`. For `test red` it defaults to
+`red`, or to `green` if the run was started with `TC887_AT_REST_MODE=encrypt`
+or `strict`.
+
+## At-rest mode
+
+The config names belong to the S1 key-continuity slice and may change. They
+are defined in one marked block at the top of `harness.sh`:
+
+| Harness env (at `up`) | Node env written to `node.env` |
+|---|---|
+| `TC887_AT_REST_MODE` (`off`/`encrypt`/`strict`) | `TINYCLOUD_AT_REST__MODE` |
+| `TC887_AT_REST_ESCROW` (e.g. `none`, the Static self-host acknowledgement, plan §5) | `TINYCLOUD_AT_REST__ESCROW` |
+
+If either is unset, the harness sets nothing and the node runs its default
+(today: no encryption at rest).
 
 ## Checks
 
-`tinycloud-node-server/tests/at_rest_harness.rs`, all `#[ignore]`d so that
-`cargo test --workspace` stays green. `harness.sh test` runs them with
-`--ignored` and fails if the filter matched the wrong number of tests. Each
-check signs in like the SDK (host SIWE delegation, then a session delegation)
-on a fresh random wallet and space, and writes a unique marker through `/invoke`.
+`tinycloud-node-server/tests/at_rest_harness.rs`. The harness checks are
+`#[ignore]`d, so `cargo test --workspace` stays green. `harness.sh test` runs
+them with `--ignored` and checks the count and the outcome. Each check signs in
+like the SDK (host SIWE delegation, then a session delegation) on two fresh
+random wallets and spaces, and writes the same plaintext into both through
+`/invoke`:
+- a short value carrying a unique marker;
+- a 64 KiB value of the marker repeated, which compresses well.
+
+SQL runs the same two batches in both spaces: create + insert (a checkpoint),
+then insert (a WAL delta).
 
 | Test | Asserts | Today |
 |---|---|---|
-| `green_kv_put_reaches_minio` | the KV put round-trips through the node and adds a non-empty object to the bucket | pass |
-| `green_sql_write_reaches_postgres` | create + insert + insert round-trips, and a `database_artifact` row with a payload exists | pass |
-| `red_kv_blocks_are_sealed_in_minio` | no raw object contains the marker; no object key contains the space id or wallet address | **fail**: key is `{space}/{b64url(blake3)}`, body is plaintext |
-| `red_sql_artifacts_are_sealed_in_postgres` | `payload` doesn't start with `SQLite format 3\0`; neither `payload` nor `delta_payload` contains a marker | **fail**: plaintext SQLite checkpoint/WAL |
+| `green_kv_put_reaches_minio` | every put round-trips through the node and adds a non-empty object to the bucket | pass |
+| `green_sql_write_reaches_postgres` | the writes round-trip, and `database_artifact` has a `payload` and a non-NULL `delta_payload` | pass |
+| `red_kv_blocks_are_sealed_in_minio` | object keys contain no space id, wallet address or blake3 fingerprint of the value (b64url padded/unpadded, base64 padded/unpadded, hex; raw digest and multihash); raw bytes hold no marker; the 64 KiB object doesn't compress (zlib ratio > 0.95); the two spaces' objects for the same value share no 32-byte run | **fail** |
+| `red_sql_artifacts_are_sealed_in_postgres` | `payload` doesn't start with `SQLite format 3\0` and `delta_payload` doesn't start with the WAL magic; neither holds a marker or compresses (ratio > 0.95); the two spaces' payloads and deltas share no 32-byte run | **fail** |
 
-The RED checks also run the green precondition first, so a RED result is never
-a harness no-op.
+The RED checks re-run the green preconditions first, so a RED result is never
+a harness no-op. The 32-byte limit: two sealed blobs of the same plaintext
+share only fixed TCE1 header fields (≤ 20 contiguous bytes), while any
+deterministic transform (encoding, XOR, compression, an unsalted cipher) keeps
+runs as long as the data. The reasoning is in the test's `MAX_SHARED_RUN` doc.
+`selftest_predicates_flag_deterministic_transforms_not_ciphertext` runs in plain
+`cargo test` and checks the predicates offline: base64, XOR and zlib are
+flagged, and sealed-like random blobs are not.
 
 ## Not covered
 
-The dstack simulator (`DSTACK_SIMULATOR_ENDPOINT`). No native simulator is
-installed here, so the node runs with a per-run Static root; S1 adds a
-Dstack-root variant.
+- The dstack simulator (`DSTACK_SIMULATOR_ENDPOINT`). No native simulator is
+  installed here, so the node runs with a per-run Static root; S1 adds a
+  Dstack-root variant.
+- DuckDB artifacts (`service=duckdb`, an opt-in feature): S4 follow-up.

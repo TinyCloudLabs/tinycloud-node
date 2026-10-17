@@ -2,32 +2,47 @@
 # TC-887 S0: native at-rest harness. A real tinycloud-node binary on native
 # PostgreSQL (capability DB + SQL artifacts) and native MinIO (S3 block store).
 # No containers. Everything binds 127.0.0.1 on free ports; all state lives in
-# one per-run directory; `down` stops only the PIDs this harness recorded.
+# one per-run directory; `down` stops only the process groups this run started.
 #
-#   harness.sh bins                 fetch + sha256-verify the pinned MinIO/mc binaries
-#   harness.sh up [--no-build]      start PG, MinIO, the node; print the state file path
-#   harness.sh test green|red       run the harness checks against the running harness
-#   harness.sh status               print the state file
-#   harness.sh logs                 tail the harness logs (no secrets are written to them)
-#   harness.sh down [--purge]       stop recorded PIDs; --purge also removes the run dir
+#   harness.sh bins                              fetch + sha256-verify the pinned MinIO/mc binaries
+#   harness.sh up [--no-build]                   start PG, MinIO, the node; prints the STATE path last
+#   harness.sh test green|red [--expect green|red] STATE
+#                                                run the checks; exit 0 only on the expected outcome
+#   harness.sh status STATE                      print the state file
+#   harness.sh logs STATE                        tail the harness logs (no secrets are written to them)
+#   harness.sh down [--purge] STATE              stop the recorded processes; --purge removes the run dir
 #
-# See README.md next to this script.
+# STATE is the state.json path `up` printed (or its run directory). Commands
+# never guess it. See README.md next to this script.
 set -Eeuo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 SCRATCH_ROOT=${TC887_SCRATCH_ROOT:-$HOME/scratch/tc887}
-LATEST_LINK=$SCRATCH_ROOT/harness-latest
 BIN_DIR=${TC887_BIN_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/tc887-harness/bin}
+STATE_SCHEMA=tc887-at-rest-harness/v2
 
-# Pinned MinIO community releases. dl.min.io no longer serves community
-# binaries (HTTP 410), so these come from the archived GitHub releases. The
-# sha256 values are pinned here, not trusted from the download.
+# Pinned MinIO community releases (linux-amd64). dl.min.io no longer serves
+# community binaries (HTTP 410), so these come from the archived GitHub
+# releases. The sha256 values are pinned here, not trusted from the download.
 MINIO_RELEASE=RELEASE.2025-09-07T16-13-09Z
 MINIO_SHA256=7c5bd8512c6e966455b1d198209358b2d191c77a83ab377c4073281065fb855f
 MC_RELEASE=RELEASE.2025-08-13T08-35-41Z
 MC_SHA256=01f866e9c5f9b87c2b09116fa5d7c06695b106242d829a8bb32990c00312e891
 MINIO_URL=https://github.com/minio/minio/releases/download/$MINIO_RELEASE/minio.linux-amd64.$MINIO_RELEASE
 MC_URL=https://github.com/minio/mc/releases/download/$MC_RELEASE/mc.linux-amd64.$MC_RELEASE
+
+# ---------------------------------------------------------------------------
+# TC-887 at-rest node config. These two names belong to the S1 key-continuity
+# slice and may change; this block is the only place the harness defines them
+# (README "At-rest mode" documents the same mapping).
+#   TC887_AT_REST_MODE   -> TINYCLOUD_AT_REST__MODE    (off|encrypt|strict)
+#   TC887_AT_REST_ESCROW -> TINYCLOUD_AT_REST__ESCROW  (Static self-host
+#                                                       `none` acknowledgement, plan §5)
+# Unset: the harness sets nothing and the node runs its default (today: no
+# encryption at rest). With mode encrypt/strict, `test red` expects green.
+AT_REST_MODE_VAR=TINYCLOUD_AT_REST__MODE
+AT_REST_ESCROW_VAR=TINYCLOUD_AT_REST__ESCROW
+# ---------------------------------------------------------------------------
 
 BUCKET=tinycloud-blocks
 REGION=us-east-1
@@ -39,6 +54,7 @@ log() { printf 'at-rest-harness: %s\n' "$*" >&2; }
 
 sha256_of() { sha256sum "$1" | awk '{print $1}'; }
 
+# Bind-and-release; another process can take the port before we use it.
 free_port() {
   python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()'
 }
@@ -48,6 +64,17 @@ random_hex() { python3 -c 'import secrets; print(secrets.token_hex(24))'; }
 # Write stdin to a new 0600 file.
 secret_file() { (umask 077 && cat >"$1"); }
 
+# Kernel start time (clock ticks since boot) of PID: with the PID, it names
+# one process for its whole life, across exec and binary rebuilds.
+proc_start() {
+  local stat
+  stat=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+  stat=${stat##*) }
+  # shellcheck disable=SC2086
+  set -- $stat
+  printf '%s\n' "${20}"
+}
+
 # ---------------------------------------------------------------- binaries --
 
 fetch_one() {
@@ -56,11 +83,13 @@ fetch_one() {
     return 0
   fi
   mkdir -p "$BIN_DIR"
-  local tmp
+  local tmp got
   tmp=$(mktemp "$BIN_DIR/.$name.XXXXXX")
   log "downloading $name from $url"
-  curl -fsSL --retry 3 --max-time 600 -o "$tmp" "$url"
-  local got
+  if ! curl -fsSL --retry 3 --max-time 600 -o "$tmp" "$url"; then
+    rm -f "$tmp"
+    die "downloading $name failed"
+  fi
   got=$(sha256_of "$tmp")
   if [[ "$got" != "$want" ]]; then
     rm -f "$tmp"
@@ -71,6 +100,10 @@ fetch_one() {
 }
 
 cmd_bins() {
+  local os arch
+  os=$(uname -s) arch=$(uname -m)
+  [[ "$os" == Linux && "$arch" == x86_64 ]] \
+    || die "the pinned MinIO/mc binaries are linux-amd64 only; this host is $os $arch"
   fetch_one minio "$MINIO_URL" "$MINIO_SHA256"
   fetch_one mc "$MC_URL" "$MC_SHA256"
   log "minio: $("$BIN_DIR/minio" --version | head -1)"
@@ -101,7 +134,66 @@ node_target_dir() {
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])'
 }
 
+# ------------------------------------------------------------ processes ---
+
+# Is the process group led by PID (or PID itself) still alive?
+group_alive() { kill -0 -- "-$1" 2>/dev/null || kill -0 "$1" 2>/dev/null; }
+
+signal_group() { kill "-$1" -- "-$2" 2>/dev/null || kill "-$1" "$2" 2>/dev/null || true; }
+
+# Stop the process group led by a recorded PID. Each harness process is a
+# session/group leader (setsid; pg_ctl's postmaster calls setsid), so the
+# group holds it and the children it forks. (PostgreSQL moves its backends
+# into their own groups; the postmaster stops them on SIGTERM, and they exit
+# by themselves if it dies.) The leader is signalled only if its kernel start
+# time still matches the recorded one. A group whose leader is gone still
+# holds our leftovers: Linux never reuses a PID while it names a live process
+# group. Returns 1 if a live PID was left alone.
+stop_recorded() {
+  local what=$1 pid=$2 start=$3
+  [[ -n "$pid" ]] || return 0
+  if kill -0 "$pid" 2>/dev/null; then
+    local actual
+    actual=$(proc_start "$pid" || true)
+    if [[ -z "$start" || "$actual" != "$start" ]]; then
+      log "pid $pid is not the recorded $what (start time ${actual:-?} != ${start:-unrecorded}); leaving it alone"
+      return 1
+    fi
+  elif ! group_alive "$pid"; then
+    log "$what (pid $pid) is not running"
+    return 0
+  fi
+  signal_group TERM "$pid"
+  local i
+  for ((i = 0; i < 100; i++)); do
+    group_alive "$pid" || { log "$what (process group $pid) stopped"; return 0; }
+    sleep 0.1
+  done
+  signal_group KILL "$pid"
+  for ((i = 0; i < 50; i++)); do
+    group_alive "$pid" || { log "$what (process group $pid) killed"; return 0; }
+    sleep 0.1
+  done
+  log "$what (process group $pid) survived SIGKILL"
+  return 1
+}
+
+# pg_ctl stop (a clean shutdown of our data dir), then the group fallback.
+stop_postgres() {
+  local run=$1 pid=$2 start=$3 pg_bin=$4
+  if [[ -n "$pid" && -n "$pg_bin" && -f "$run/pgdata/postmaster.pid" ]] \
+    && kill -0 "$pid" 2>/dev/null && [[ "$(proc_start "$pid" || true)" == "$start" ]]; then
+    if "$pg_bin/pg_ctl" -D "$run/pgdata" -m fast -w -t 30 stop >/dev/null 2>&1 && ! group_alive "$pid"; then
+      log "postgres (process group $pid) stopped by pg_ctl"
+      return 0
+    fi
+  fi
+  stop_recorded postgres "$pid" "$start"
+}
+
 # --------------------------------------------------------------------- up ---
+
+UP_RUN="" UP_PG_PID="" UP_PG_START="" UP_MINIO_PID="" UP_MINIO_START="" UP_NODE_PID="" UP_NODE_START=""
 
 wait_http() {
   local url=$1 pid=$2 what=$3 seconds=$4 i
@@ -115,6 +207,30 @@ wait_http() {
   die "$what did not become ready at $url within ${seconds}s"
 }
 
+# EXIT trap of `up`: a failed, interrupted or timed-out `up` stops every
+# process group it started and keeps the run dir (logs) for inspection.
+up_abort() {
+  local status=$?
+  trap '' INT TERM
+  trap - EXIT
+  set +e
+  if [[ -n "$UP_RUN" && -d "$UP_RUN" ]]; then
+    log "up failed (exit $status); stopping every process this run started"
+    if [[ -z "$UP_PG_PID" && -f "$UP_RUN/pgdata/postmaster.pid" ]]; then
+      UP_PG_PID=$(head -1 "$UP_RUN/pgdata/postmaster.pid")
+      UP_PG_START=$(proc_start "$UP_PG_PID")
+    fi
+    write_state "$UP_RUN" failed
+    stop_recorded tinycloud-node "$UP_NODE_PID" "$UP_NODE_START"
+    stop_recorded minio "$UP_MINIO_PID" "$UP_MINIO_START"
+    stop_postgres "$UP_RUN" "$UP_PG_PID" "$UP_PG_START" "${STATE_PG_BIN:-}"
+    log "logs kept in $UP_RUN/logs; remove the run with: $0 down --purge $UP_RUN/state.json"
+  fi
+  exit "$status"
+}
+
+valid_setting() { [[ "$1" =~ ^[A-Za-z0-9_.:-]+$ ]]; }
+
 cmd_up() {
   local build=1
   for arg in "$@"; do
@@ -123,8 +239,14 @@ cmd_up() {
       *) die "up: unknown argument $arg" ;;
     esac
   done
+  trap up_abort EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   command -v python3 >/dev/null || die "python3 is required"
   command -v curl >/dev/null || die "curl is required"
+  local at_rest_mode=${TC887_AT_REST_MODE:-} at_rest_escrow=${TC887_AT_REST_ESCROW:-}
+  [[ -z "$at_rest_mode" ]] || valid_setting "$at_rest_mode" || die "invalid TC887_AT_REST_MODE"
+  [[ -z "$at_rest_escrow" ]] || valid_setting "$at_rest_escrow" || die "invalid TC887_AT_REST_ESCROW"
   cmd_bins
 
   local pg_bin
@@ -144,14 +266,16 @@ cmd_up() {
   mkdir -p "$SCRATCH_ROOT"
   local run
   run=${TC887_RUN_DIR:-$SCRATCH_ROOT/harness-run-$(date -u +%Y%m%dT%H%M%SZ)-$$}
+  [[ "$(basename "$run")" == harness-run-* ]] || die "run dir must be named harness-run-*: $run"
   [[ ! -e "$run/state.json" ]] || die "$run already holds a harness"
   mkdir -p "$run"
   chmod 0700 "$run"
   run=$(cd "$run" && pwd)
+  UP_RUN=$run
   mkdir -p "$run"/{bin,secrets,logs,home,tmp,node-data,minio-data,mc}
   chmod 0700 "$run/secrets"
-  # Run a private copy, so a rebuild of target/ neither swaps the binary under
-  # the node nor breaks `down`'s /proc/<pid>/exe check.
+  # Run a private copy, so a rebuild of target/ can't swap the binary under
+  # the node.
   log "node binary: $node_bin"
   install -m 0755 "$node_bin" "$run/bin/tinycloud"
   node_bin=$run/bin/tinycloud
@@ -160,10 +284,10 @@ cmd_up() {
   local minio_port=${TC887_MINIO_PORT:-$(free_port)}
   local console_port=${TC887_MINIO_CONSOLE_PORT:-$(free_port)}
   local node_port=${TC887_NODE_PORT:-$(free_port)}
-  # Every write_state call (including the partial ones `down` may need after a
-  # failed `up`) records the binaries `down` verifies PIDs against.
+  # Recorded by every write_state call, including a failed up's.
   export STATE_PG_BIN=$pg_bin STATE_NODE_BIN=$node_bin STATE_PG_PORT=$pg_port \
-    STATE_MINIO_PORT=$minio_port STATE_CONSOLE_PORT=$console_port STATE_NODE_PORT=$node_port
+    STATE_MINIO_PORT=$minio_port STATE_CONSOLE_PORT=$console_port STATE_NODE_PORT=$node_port \
+    STATE_AT_REST_MODE=$at_rest_mode STATE_AT_REST_ESCROW=$at_rest_escrow
 
   # Per-run secrets: generated here, kept in 0600 files, never on argv.
   random_hex | secret_file "$run/secrets/pg-password"
@@ -192,6 +316,8 @@ TC887_S3_ACCESS_KEY_ID=$minio_user
 TC887_S3_SECRET_ACCESS_KEY=$minio_password
 EOF
   # The node's whole environment; sourced inside the child, never on argv.
+  # memory_threshold=0 keeps SQL databases file-backed, so writes after the
+  # first checkpoint are saved as WAL deltas (database_artifact.delta_payload).
   secret_file "$run/node.env" <<EOF
 HOME=$run/home
 TMPDIR=$run/tmp
@@ -203,6 +329,7 @@ TINYCLOUD_LOG_LEVEL=normal
 TINYCLOUD_STORAGE__DATADIR=$run/node-data
 TINYCLOUD_STORAGE__STAGING=FileSystem
 TINYCLOUD_STORAGE__DATABASE=$pg_url
+TINYCLOUD_STORAGE__SQL__MEMORY_THRESHOLD=0
 TINYCLOUD_STORAGE__BLOCKS__TYPE=S3
 TINYCLOUD_STORAGE__BLOCKS__BUCKET=$BUCKET
 TINYCLOUD_STORAGE__BLOCKS__ENDPOINT=$s3_endpoint
@@ -214,12 +341,16 @@ AWS_REGION=$REGION
 AWS_DEFAULT_REGION=$REGION
 AWS_EC2_METADATA_DISABLED=true
 EOF
+  if [[ -n "$at_rest_mode" ]]; then
+    printf '%s=%s\n' "$AT_REST_MODE_VAR" "$at_rest_mode" >>"$run/node.env"
+    log "at-rest: $AT_REST_MODE_VAR=$at_rest_mode"
+  fi
+  if [[ -n "$at_rest_escrow" ]]; then
+    printf '%s=%s\n' "$AT_REST_ESCROW_VAR" "$at_rest_escrow" >>"$run/node.env"
+    log "at-rest: $AT_REST_ESCROW_VAR=$at_rest_escrow"
+  fi
   printf '[global]\nlog_level = "normal"\n' >"$run/tinycloud.toml"
-
-  # Partial state first, so `down` can clean up a failed `up`.
-  write_state "$run" "starting" "" "" ""
-  ln -sfn "$run" "$LATEST_LINK"
-  trap 'log "up failed; run: $0 down --purge $run"' ERR
+  write_state "$run" starting
 
   # ---- PostgreSQL
   log "PostgreSQL: $("$pg_bin/postgres" --version) on 127.0.0.1:$pg_port"
@@ -232,9 +363,9 @@ port = $pg_port
 unix_socket_directories = ''
 EOF
   "$pg_bin/pg_ctl" -D "$run/pgdata" -l "$run/logs/postgres.log" -w -t 60 start >/dev/null
-  local pg_pid
-  pg_pid=$(head -1 "$run/pgdata/postmaster.pid")
-  write_state "$run" "starting" "$pg_pid" "" ""
+  UP_PG_PID=$(head -1 "$run/pgdata/postmaster.pid")
+  UP_PG_START=$(proc_start "$UP_PG_PID")
+  write_state "$run" starting
   PGPASSFILE=$run/secrets/pgpass "$pg_bin/psql" -X -q -h 127.0.0.1 -p "$pg_port" -U "$PG_USER" \
     -d postgres -v ON_ERROR_STOP=1 -c "CREATE DATABASE $PG_DB"
 
@@ -248,9 +379,10 @@ EOF
       --address "127.0.0.1:$minio_port" --console-address "127.0.0.1:$console_port" \
       </dev/null >"$run/logs/minio.log" 2>&1
   ) &
-  local minio_pid=$!
-  write_state "$run" "starting" "$pg_pid" "$minio_pid" ""
-  wait_http "$s3_endpoint/minio/health/live" "$minio_pid" MinIO 60
+  UP_MINIO_PID=$!
+  UP_MINIO_START=$(proc_start "$UP_MINIO_PID" || true)
+  write_state "$run" starting
+  wait_http "$s3_endpoint/minio/health/live" "$UP_MINIO_PID" MinIO 60
   # mc reads the alias (with credentials) from the environment, not argv.
   MC_CONFIG_DIR=$run/mc MC_HOST_tc887="http://$minio_user:$minio_password@127.0.0.1:$minio_port" \
     "$BIN_DIR/mc" --quiet mb "tc887/$BUCKET" >"$run/logs/mc.log" 2>&1
@@ -263,63 +395,75 @@ EOF
       'set -a; . "$NODE_ENV_FILE"; set +a; unset NODE_ENV_FILE; exec "$0"' "$node_bin" \
       </dev/null >"$run/logs/node.log" 2>&1
   ) &
-  local node_pid=$!
-  write_state "$run" "starting" "$pg_pid" "$minio_pid" "$node_pid"
-  wait_http "$node_url/healthz" "$node_pid" tinycloud-node 180
+  UP_NODE_PID=$!
+  UP_NODE_START=$(proc_start "$UP_NODE_PID" || true)
+  write_state "$run" starting
+  wait_http "$node_url/healthz" "$UP_NODE_PID" tinycloud-node "${TC887_NODE_READY_SECS:-180}"
 
-  # ---- state file
-  write_state "$run" "up" "$pg_pid" "$minio_pid" "$node_pid"
-  trap - ERR
+  write_state "$run" up
+  trap - EXIT INT TERM
   log "up: state file $run/state.json"
   printf '%s\n' "$run/state.json"
 }
 
-# write_state RUN STATUS PG_PID MINIO_PID NODE_PID; extra fields via STATE_* env.
+# write_state RUN STATUS; PIDs come from UP_*, the rest from STATE_* env.
 write_state() {
-  local run=$1
-  RUN=$run STATUS=$2 PG_PID=$3 MINIO_PID=$4 NODE_PID=$5 \
+  RUN=$1 STATUS=$2 SCHEMA=$STATE_SCHEMA \
+    PG_PID=$UP_PG_PID PG_START=$UP_PG_START MINIO_PID=$UP_MINIO_PID MINIO_START=$UP_MINIO_START \
+    NODE_PID=$UP_NODE_PID NODE_START=$UP_NODE_START \
     BIN_DIR=$BIN_DIR MINIO_RELEASE=$MINIO_RELEASE MC_RELEASE=$MC_RELEASE \
-    BUCKET=$BUCKET REGION=$REGION PG_USER=$PG_USER PG_DB=$PG_DB python3 - <<'PY'
+    BUCKET=$BUCKET REGION=$REGION PG_USER=$PG_USER PG_DB=$PG_DB \
+    AT_REST_MODE_VAR=$AT_REST_MODE_VAR AT_REST_ESCROW_VAR=$AT_REST_ESCROW_VAR python3 - <<'PY'
 import json, os, datetime
 e = os.environ
 run = e["RUN"]
-def pid(name):
+def num(name):
     v = e.get(name, "")
     return int(v) if v else None
-def port(name):
-    v = e.get(name, "")
-    return int(v) if v else None
-pg_bin = e.get("STATE_PG_BIN")
+def text(name):
+    return e.get(name) or None
+pg_bin = text("STATE_PG_BIN")
+node_port = num("STATE_NODE_PORT")
+minio_port = num("STATE_MINIO_PORT")
 state = {
-    "schema": "tc887-at-rest-harness/v1",
+    "schema": e["SCHEMA"],
     "status": e["STATUS"],
     "run_dir": run,
     "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
     "env_file": os.path.join(run, "harness.env"),
+    "at_rest": {
+        "mode": text("STATE_AT_REST_MODE"),
+        "escrow": text("STATE_AT_REST_ESCROW"),
+        "mode_var": e["AT_REST_MODE_VAR"],
+        "escrow_var": e["AT_REST_ESCROW_VAR"],
+    },
     "node": {
-        "pid": pid("NODE_PID"),
-        "port": port("STATE_NODE_PORT"),
-        "url": f"http://127.0.0.1:{e['STATE_NODE_PORT']}" if e.get("STATE_NODE_PORT") else None,
-        "bin": e.get("STATE_NODE_BIN"),
+        "pid": num("NODE_PID"),
+        "pid_start": num("NODE_START"),
+        "port": node_port,
+        "url": f"http://127.0.0.1:{node_port}" if node_port else None,
+        "bin": text("STATE_NODE_BIN"),
         "data_dir": os.path.join(run, "node-data"),
         "log": os.path.join(run, "logs", "node.log"),
         "keys": "Static (per-run, secrets/node-static-secret)",
+        "sql_memory_threshold": 0,
     },
     "postgres": {
-        "pid": pid("PG_PID"),
-        "port": port("STATE_PG_PORT"),
+        "pid": num("PG_PID"),
+        "pid_start": num("PG_START"),
+        "port": num("STATE_PG_PORT"),
         "bin_dir": pg_bin,
-        "exe": os.path.join(pg_bin, "postgres") if pg_bin else None,
         "data_dir": os.path.join(run, "pgdata"),
         "user": e["PG_USER"],
         "database": e["PG_DB"],
         "log": os.path.join(run, "logs", "postgres.log"),
     },
     "minio": {
-        "pid": pid("MINIO_PID"),
-        "port": port("STATE_MINIO_PORT"),
-        "console_port": port("STATE_CONSOLE_PORT"),
-        "endpoint": f"http://127.0.0.1:{e['STATE_MINIO_PORT']}" if e.get("STATE_MINIO_PORT") else None,
+        "pid": num("MINIO_PID"),
+        "pid_start": num("MINIO_START"),
+        "port": minio_port,
+        "console_port": num("STATE_CONSOLE_PORT"),
+        "endpoint": f"http://127.0.0.1:{minio_port}" if minio_port else None,
         "bin": os.path.join(e["BIN_DIR"], "minio"),
         "release": e["MINIO_RELEASE"],
         "mc_release": e["MC_RELEASE"],
@@ -337,13 +481,18 @@ os.replace(path + ".tmp", path)
 PY
 }
 
-# ------------------------------------------------------------------- down ---
+# ------------------------------------------------------------ state file ---
 
+# The explicit STATE argument (state.json or its run dir), checked.
 resolve_state() {
-  local target=${1:-${TC887_HARNESS_STATE:-$LATEST_LINK}}
+  local target=${1:-}
+  [[ -n "$target" ]] || die "STATE is required: pass the state.json path \`up\` printed (no default; refusing to guess)"
   [[ -d "$target" ]] && target=$target/state.json
   [[ -f "$target" ]] || die "no harness state at $target"
-  readlink -f "$target"
+  target=$(readlink -f "$target")
+  [[ "$(state_get "$target" schema)" == "$STATE_SCHEMA" ]] || die "$target is not a $STATE_SCHEMA state file"
+  [[ "$(state_get "$target" run_dir)" == "$(dirname "$target")" ]] || die "$target does not live in its recorded run dir"
+  printf '%s\n' "$target"
 }
 
 state_get() {
@@ -356,94 +505,123 @@ print("" if value is None else value)
 PY
 }
 
-# Signal PID only if it is still the process we started (exe matches).
-# Returns 1 if a live PID was left alone.
-stop_recorded() {
-  local what=$1 pid=$2 exe=$3
-  [[ -n "$pid" ]] || return 0
-  if ! kill -0 "$pid" 2>/dev/null; then
-    log "$what (pid $pid) is not running"
-    return 0
-  fi
-  local actual
-  actual=$(readlink "/proc/$pid/exe" 2>/dev/null || true)
-  actual=${actual% (deleted)}
-  if [[ -z "$exe" || "$actual" != "$(readlink -f "$exe")" ]]; then
-    log "pid $pid is '$actual', not the recorded $what ($exe); leaving it alone"
-    return 1
-  fi
-  kill -TERM "$pid" 2>/dev/null || true
-  local i
-  for ((i = 0; i < 100; i++)); do
-    kill -0 "$pid" 2>/dev/null || { log "$what (pid $pid) stopped"; return 0; }
-    sleep 0.1
-  done
-  kill -KILL "$pid" 2>/dev/null || true
-  log "$what (pid $pid) killed"
-}
+# ------------------------------------------------------------------- down ---
 
 cmd_down() {
   local purge=0 target=""
   for arg in "$@"; do
     case $arg in
       --purge) purge=1 ;;
-      *) target=$arg ;;
+      -*) die "down: unknown option $arg" ;;
+      *) [[ -z "$target" ]] || die "down: one STATE only"; target=$arg ;;
     esac
   done
-  local state run
+  local state run survivors=0
   state=$(resolve_state "$target")
   run=$(state_get "$state" run_dir)
-  local survivors=0
-  stop_recorded tinycloud-node "$(state_get "$state" node.pid)" "$(state_get "$state" node.bin)" || survivors=1
-  stop_recorded minio "$(state_get "$state" minio.pid)" "$(state_get "$state" minio.bin)" || survivors=1
-  local pg_pid pg_bin pg_exe
-  pg_pid=$(state_get "$state" postgres.pid)
-  pg_bin=$(state_get "$state" postgres.bin_dir)
-  pg_exe=$(state_get "$state" postgres.exe)
-  if [[ -n "$pg_pid" && -n "$pg_exe" ]] && kill -0 "$pg_pid" 2>/dev/null \
-    && [[ "$(readlink "/proc/$pg_pid/exe" 2>/dev/null)" == "$(readlink -f "$pg_exe")" ]] \
-    && "$pg_bin/pg_ctl" -D "$run/pgdata" -m fast -w -t 60 stop >/dev/null; then
-    log "postgres (pid $pg_pid) stopped"
-  else
-    stop_recorded postgres "$pg_pid" "$pg_exe" || survivors=1
-  fi
+  stop_recorded tinycloud-node "$(state_get "$state" node.pid)" "$(state_get "$state" node.pid_start)" || survivors=1
+  stop_recorded minio "$(state_get "$state" minio.pid)" "$(state_get "$state" minio.pid_start)" || survivors=1
+  stop_postgres "$run" "$(state_get "$state" postgres.pid)" "$(state_get "$state" postgres.pid_start)" \
+    "$(state_get "$state" postgres.bin_dir)" || survivors=1
   if ((purge)); then
-    ((survivors == 0)) || die "not purging $run: a recorded PID is still running"
-    case $run in
-      "$SCRATCH_ROOT"/harness-run-*|"${TC887_RUN_DIR:-/nonexistent}") rm -rf -- "$run"; log "removed $run" ;;
-      *) log "not purging $run: outside $SCRATCH_ROOT/harness-run-*" ;;
-    esac
-    [[ "$(readlink -f "$LATEST_LINK" 2>/dev/null)" != "$run" ]] || rm -f "$LATEST_LINK"
+    ((survivors == 0)) || die "not purging $run: a recorded process is still running"
+    [[ "$(basename "$run")" == harness-run-* ]] || die "not purging $run: not a harness-run-* dir"
+    rm -rf -- "$run"
+    log "removed $run"
+  elif ((survivors == 0)); then
+    python3 - "$state" <<'PY'
+import json, os, sys
+path = sys.argv[1]
+state = json.load(open(path))
+state["status"] = "down"
+with open(path + ".tmp", "w") as f:
+    json.dump(state, f, indent=2)
+    f.write("\n")
+os.replace(path + ".tmp", path)
+PY
   fi
   return "$survivors"
 }
 
 # ------------------------------------------------------------------- test ---
 
+annotate() {
+  local level=$1
+  shift
+  if [[ "${GITHUB_ACTIONS:-}" == true ]]; then
+    printf '::%s::%s\n' "$level" "$*"
+  fi
+  log "$*"
+}
+
 cmd_test() {
-  local kind=${1:-} expected
-  case $kind in
-    green) expected=2 ;;
-    red) expected=2 ;;
-    *) die "usage: harness.sh test green|red" ;;
-  esac
+  local kind="" expect="" target=""
+  while (($#)); do
+    case $1 in
+      green|red) [[ -z "$kind" ]] || die "test: one kind only"; kind=$1 ;;
+      --expect) (($# >= 2)) || die "--expect needs green or red"; shift; expect=$1 ;;
+      --expect=*) expect=${1#--expect=} ;;
+      -*) die "test: unknown option $1" ;;
+      *) [[ -z "$target" ]] || die "test: one STATE only"; target=$1 ;;
+    esac
+    shift
+  done
+  [[ -n "$kind" ]] || die "usage: harness.sh test green|red [--expect green|red] STATE"
   local state
-  state=$(resolve_state "${2:-}")
+  state=$(resolve_state "$target")
   [[ "$(state_get "$state" status)" == up ]] || die "harness at $state is not up"
+  if [[ -z "$expect" ]]; then
+    expect=green
+    if [[ "$kind" == red ]]; then
+      case $(state_get "$state" at_rest.mode) in
+        encrypt|strict) expect=green ;;
+        *) expect=red ;;
+      esac
+    fi
+  fi
+  [[ "$expect" == green || "$expect" == red ]] || die "--expect must be green or red"
+
   local out status=0
   out=$(mktemp)
   (cd "$ROOT" && TC887_HARNESS_STATE=$state nice -n 10 cargo test -p tinycloud-node \
     -j "${TC887_CARGO_JOBS:-8}" --test at_rest_harness -- --ignored --nocapture --test-threads=1 "${kind}_") \
     2>&1 | tee "$out" || status=$?
-  # libtest exits 0 when a filter matches nothing; never let that pass (TC-381).
-  local ran
-  ran=$(grep -Eo 'test result: [A-Za-z]+\. [0-9]+ passed; [0-9]+ failed' "$out" \
-    | awk '{s += $4 + $6} END {print s + 0}')
-  rm -f "$out"
-  if [[ "$ran" -ne "$expected" ]]; then
-    die "$kind: expected $expected harness checks to run, $ran ran"
+  local passed failed kv_red=0 sql_red=0
+  read -r passed failed < <(grep -Eo 'test result: [A-Za-z]+\. [0-9]+ passed; [0-9]+ failed' "$out" \
+    | awk '{p += $4; f += $6} END {print p + 0, f + 0}')
+  if [[ "$kind" == red ]]; then
+    grep -q 'TC-887 RED: KV data is not sealed at rest' "$out" && kv_red=1
+    grep -q 'TC-887 RED: SQL artifacts are not sealed at rest' "$out" && sql_red=1
   fi
-  return "$status"
+  rm -f "$out"
+  local reds=$((kv_red + sql_red)) ran=$((passed + failed))
+
+  # libtest exits 0 when a filter matches nothing; never let that pass (TC-381).
+  if ((ran != 2)); then
+    annotate error "$kind checks ERRORED: expected 2 to run, $ran ran (cargo exit $status: compile or harness failure)"
+    return 4
+  fi
+  if ((failed != reds)); then
+    annotate error "$kind checks ERRORED: $failed failed but only $reds with a TC-887 RED finding (harness, precondition or node error; see output above)"
+    return 4
+  fi
+  if [[ "$expect" == green ]]; then
+    if ((status == 0 && failed == 0)); then
+      annotate notice "$kind checks GREEN as expected ($passed passed)"
+      return 0
+    fi
+    annotate error "$kind checks still RED ($reds of 2 report plaintext at rest) but expected green"
+    return 3
+  fi
+  if ((status == 101 && reds == 2)); then
+    annotate notice "RED as expected: both TC-887 RED checks report plaintext at rest (KV and SQL)"
+    return 0
+  fi
+  local flipped=()
+  ((kv_red)) || flipped+=(KV)
+  ((sql_red)) || flipped+=(SQL)
+  annotate error "RED checks UNEXPECTEDLY PASSED for ${flipped[*]}: the at-rest property now holds there; run with --expect green (or set TC887_AT_REST_MODE) and update CI"
+  return 3
 }
 
 cmd_status() { cat "$(resolve_state "${1:-}")"; }
@@ -465,5 +643,5 @@ case ${1:-} in
   test) shift; cmd_test "$@" ;;
   status) shift; cmd_status "$@" ;;
   logs) shift; cmd_logs "$@" ;;
-  *) die "usage: harness.sh bins|up [--no-build]|test green|red|status|logs|down [--purge] [STATE]" ;;
+  *) die "usage: harness.sh bins | up [--no-build] | test green|red [--expect green|red] STATE | status STATE | logs STATE | down [--purge] STATE" ;;
 esac
