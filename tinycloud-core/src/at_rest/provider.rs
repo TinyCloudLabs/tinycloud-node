@@ -21,6 +21,7 @@ pub trait DataKeyProvider: Send + Sync {
 }
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum DataKeyError {
     /// The node booted locked: its root cannot unseal the at-rest root key.
     #[error("at-rest keys are locked")]

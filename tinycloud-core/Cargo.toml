@@ -54,7 +54,12 @@ tokio.workspace = true
 duckdb = { version = "1.1", features = ["bundled", "appender-arrow"], optional = true }
 arrow = { version = "56", features = ["ipc"], optional = true }
 tempfile = "3"
-aes-gcm = "0.10"
+# TC-887: `zeroize` wipes the AES key schedule on drop; `aes` is listed only to
+# enable its `zeroize` feature (feature unification). Not wiped (accepted
+# residual): the GHASH key H (polyval 0.6.2's autodetect backend keeps it in a
+# ManuallyDrop union with no Drop), the hkdf PRK and the hmac state.
+aes-gcm = { version = "0.10.3", features = ["zeroize"] }
+aes = { version = "0.8", features = ["zeroize"] }
 rand = "0.8"
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 hex.workspace = true
@@ -62,10 +67,12 @@ base64.workspace = true
 sha2 = "0.10"
 sha3 = "0.10"
 k256 = "0.13"
-# TC-887: zeroize at-rest key material on drop.
+# TC-887: at-rest envelope key derivation and object names; zeroize key
+# material on drop.
+hkdf = "0.12"
+hmac = "0.12"
 zeroize = "1"
 # TC-887 S1: at-rest key hierarchy and escrow.
-hkdf = "0.12"
 lru = "0.12"
 parking_lot = "0.12"
 tinycloud-at-rest-escrow = { path = "../tinycloud-at-rest-escrow" }
@@ -83,3 +90,4 @@ tokio.workspace = true
 # Holder-side decryption of escrow shares in the at-rest keyring tests.
 age = { version = "=0.12.1", default-features = false, features = ["armor"] }
 iri-string.workspace = true
+proptest = "1"
