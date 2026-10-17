@@ -137,6 +137,36 @@ fn database_failure(
     }
 }
 
+/// TC-887: the status for an invocation whose block-store step failed for
+/// at-rest reasons (503 keys unavailable, 500 integrity/unsupported), if so.
+fn at_rest_invoke_status(
+    e: &TxStoreError<BlockStores, BlockStage, tinycloud_core::keys::StaticSecret>,
+) -> Option<Status> {
+    match e {
+        TxStoreError::StoreRead(err) | TxStoreError::StoreWrite(err) => {
+            crate::storage::sealed::block_store_at_rest_error(err).map(|e| e.status())
+        }
+        _ => None,
+    }
+}
+
+/// A KV read failure: 503/500 for at-rest causes (TC-887), 500 otherwise.
+pub(crate) fn kv_read_failure(
+    e: tinycloud_core::storage::either::EitherError<
+        DbErr,
+        <BlockStores as ImmutableReadStore>::Error,
+    >,
+) -> (Status, String) {
+    use tinycloud_core::storage::either::EitherError;
+    let status = match &e {
+        EitherError::B(err) => crate::storage::sealed::block_store_at_rest_error(err)
+            .map(|e| e.status())
+            .unwrap_or(Status::InternalServerError),
+        EitherError::A(_) => Status::InternalServerError,
+    };
+    (status, e.to_string())
+}
+
 /// `/invoke` failure: plain text for everything except storage rejections,
 /// which carry the structured TC-619 JSON body.
 #[derive(Debug)]
@@ -426,7 +456,7 @@ pub async fn signed_kv_get(
             if kv_result.is_ok() { "ok" } else { "error" },
             kv_start.elapsed(),
         );
-        return match kv_result.map_err(|e| (Status::InternalServerError, e.to_string()))? {
+        return match kv_result.map_err(kv_read_failure)? {
             Some((metadata, hash, content)) => {
                 validate_signed_kv_hash_binding(&ticket, &hash)?;
                 Ok(SignedKvReadResponse::from_range(metadata, hash, content))
@@ -441,7 +471,7 @@ pub async fn signed_kv_get(
         if kv_result.is_ok() { "ok" } else { "error" },
         kv_start.elapsed(),
     );
-    match kv_result.map_err(|e| (Status::InternalServerError, e.to_string()))? {
+    match kv_result.map_err(kv_read_failure)? {
         Some((md, hash, content)) => {
             validate_signed_kv_hash_binding(&ticket, &hash)?;
             Ok(SignedKvReadResponse::Full {
@@ -2228,6 +2258,9 @@ async fn invoke_impl(
                     return Err(
                         database_failure(error, write_may_have_applied, e.to_string()).into()
                     );
+                }
+                if let Some(status) = at_rest_invoke_status(&e) {
+                    return Err((status, e.to_string()).into());
                 }
                 Err((
                     match &e {
