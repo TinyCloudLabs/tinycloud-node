@@ -622,13 +622,13 @@ pub async fn app_with_control(
         encryption_backend,
     );
 
-    let tinycloud = TinyCloud::new(
+    let tinycloud = TinyCloud::new_with_encryption(
         database_connection,
         tinycloud_config.storage.blocks.open().await?,
         key_setup.setup(()).await?,
+        Some(webhook_encryption.clone()),
     )
     .await?
-    .with_encryption(Some(webhook_encryption.clone()))
     .with_sql_sizes(sql_sizes.clone());
     let encryption_service =
         encryption_service.with_sqlite_writer_lock(tinycloud.sqlite_writer_lock());

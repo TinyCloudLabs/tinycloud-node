@@ -108,7 +108,8 @@ impl sea_orm::TryGetable for Hash {
         res: &QueryResult,
         idx: I,
     ) -> Result<Self, sea_orm::TryGetError> {
-        let vec: Vec<u8> = res.try_get_by(idx).map_err(sea_orm::TryGetError::DbErr)?;
+        // Preserve TryGetError::Null so nullable closure/alias joins decode as None.
+        let vec = <Vec<u8> as sea_orm::TryGetable>::try_get_by(res, idx)?;
         Hash::try_from(vec).map_err(|e| {
             sea_orm::TryGetError::DbErr(DbErr::TryIntoErr {
                 from: "Vec<u8>",

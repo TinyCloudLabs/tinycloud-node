@@ -251,3 +251,94 @@ fn hash_inv(inv_hash: &Hash, sp: &SpaceId, ops: &[Operation]) -> Result<OneOrMan
         OneOrMany::Many(v)
     })
 }
+
+#[cfg(test)]
+mod signature_encoding_tests {
+    use super::*;
+    use base64::{engine::general_purpose::URL_SAFE, Engine as _};
+    use k256::ecdsa::SigningKey;
+    use sha3::{Digest, Keccak256};
+    use std::str::FromStr;
+    use tinycloud_auth::cacaos::siwe::{encode_eip55, Message};
+    use tinycloud_auth::cacaos::siwe_cacao::{Payload, Signature};
+
+    const ORDER: [u8; 32] = [
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xfe, 0xba, 0xae, 0xdc, 0xe6, 0xaf, 0x48, 0xa0, 0x3b, 0xbf, 0xd2, 0x5e, 0x8c, 0xd0, 0x36,
+        0x41, 0x41,
+    ];
+
+    #[tokio::test]
+    async fn siwe_signature_encodings_have_one_delegation_cid() {
+        let key = SigningKey::from_bytes(&[7u8; 32].into()).unwrap();
+        let public = key.verifying_key().to_encoded_point(false);
+        let address: [u8; 20] = Keccak256::digest(&public.as_bytes()[1..])[12..]
+            .try_into()
+            .unwrap();
+        let message = Message::from_str(&format!(
+            "127.0.0.1 wants you to sign in with your Ethereum account:\n0x{}\n\n\nURI: http://127.0.0.1\nVersion: 1\nChain ID: 1\nNonce: testnonce123\nIssued At: 2026-10-14T00:00:00Z",
+            encode_eip55(&address)
+        ))
+        .unwrap();
+        let (signed, recovery) = key
+            .sign_prehash_recoverable(&message.eip191_hash().unwrap())
+            .unwrap();
+        let mut low = [0u8; 65];
+        low[..64].copy_from_slice(signed.to_bytes().as_ref());
+        low[64] = u8::from(recovery) + 27;
+
+        let mut high = low;
+        let mut borrow = 0i16;
+        for index in (0..32).rev() {
+            let digit = ORDER[index] as i16 - low[32 + index] as i16 - borrow;
+            high[32 + index] = digit as u8;
+            borrow = i16::from(digit < 0);
+        }
+        assert_eq!(borrow, 0);
+        high[64] = if low[64] == 27 { 28 } else { 27 };
+
+        let mut canonical_cid = None;
+        for (label, signature) in [
+            ("low-v27/28", low),
+            ("low-v0/1", {
+                let mut s = low;
+                s[64] -= 27;
+                s
+            }),
+            ("high-v27/28", high),
+            ("high-v0/1", {
+                let mut s = high;
+                s[64] -= 27;
+                s
+            }),
+        ] {
+            let cacao = Payload::from(message.clone())
+                .sign::<tinycloud_auth::cacaos::siwe_cacao::Eip191>(Signature::from(signature));
+            let header = URL_SAFE.encode(serde_ipld_dagcbor::to_vec(&cacao).unwrap());
+            let event = Delegation::from_header_ser::<TinyCloudDelegation>(&header);
+            if label.starts_with("high") {
+                assert!(
+                    event.is_err(),
+                    "{label} must be rejected before CID assignment"
+                );
+                continue;
+            }
+            let event = event.unwrap();
+            let TinyCloudDelegation::Cacao(decoded) = &event.0.delegation else {
+                panic!("expected CACAO");
+            };
+            assert!(decoded.verify().await.is_ok(), "{label}");
+            assert_eq!(
+                decoded.signature().as_ref(),
+                &low,
+                "{label} decoded signature"
+            );
+            let cid = event.content_hash().to_cid(0x55);
+            if let Some(canonical_cid) = canonical_cid {
+                assert_eq!(cid, canonical_cid, "{label} must use the canonical CID");
+            } else {
+                canonical_cid = Some(cid);
+            }
+        }
+    }
+}

@@ -80,6 +80,7 @@ async fn new_user(wallet: LocalWallet, jwk: JWK) -> User {
         jwk: Some(jwk),
         delegate_uri: None,
         nonce: None,
+        invocation_ttl_secs: None,
         issued_at: TimeStamp::from_str("1985-04-12T23:20:50.52Z").unwrap(),
         expiration_time: TimeStamp::from_str("2985-04-12T23:20:50.52Z").unwrap(),
     };

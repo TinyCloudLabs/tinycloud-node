@@ -48,11 +48,15 @@ impl HeaderEncode for TinyCloudDelegation {
                 s.as_bytes().to_vec(),
             )
         } else {
-            // Use the imported engine and trait method
+            // Signature decoding canonicalizes v; payload serialization uses the
+            // verifier's parsed issuer. Hash, persistence and revocation lookup
+            // must all use these same canonical DAG-CBOR bytes.
             let v = URL_SAFE.decode(s)?;
+            let cacao: SiweCacao = serde_ipld_dagcbor::from_slice(&v)?;
+            let canonical = serde_ipld_dagcbor::to_vec(&cacao)?;
             (
-                Self::Cacao(Box::new(serde_ipld_dagcbor::from_slice(&v)?)),
-                v,
+                Self::Cacao(Box::new(cacao)),
+                if canonical == v { v } else { canonical },
             )
         })
     }

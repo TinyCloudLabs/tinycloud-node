@@ -2,8 +2,11 @@ use super::super::{events::Revocation, models::*, relationships::*};
 use crate::hash::{hash, Hash};
 use crate::models::did_resolution::{verify_ucan_signature, UcanVerifyError};
 use crate::types::Resource;
+use sea_orm::Condition;
 use sea_orm::{
-    entity::prelude::*, sea_query::OnConflict, ConnectionTrait, QueryOrder, QuerySelect,
+    entity::prelude::*,
+    sea_query::{Alias, Expr, JoinType, OnConflict, Query, SimpleExpr, UnionType},
+    ConnectionTrait, FromQueryResult, QueryOrder, QuerySelect,
 };
 use std::collections::HashSet;
 use time::OffsetDateTime;
@@ -68,15 +71,109 @@ pub enum ChainTraversalError {
     LimitExceeded,
 }
 
-pub(crate) async fn is_revoked<C: ConnectionTrait>(
+/// Resolve revocation targets through the persisted canonical identity. The
+/// exact-target branch also handles graph rows created directly by unit tests.
+fn target_condition(id: SimpleExpr) -> Condition {
+    use delegation_cid_alias::{Column as AliasColumn, Entity as AliasEntity};
+    let canonical = Query::select()
+        .column(AliasColumn::Canonical)
+        .from(AliasEntity)
+        .and_where(Expr::col(AliasColumn::Id).eq(id.clone()))
+        .to_owned();
+    let equivalents = Query::select()
+        .column(AliasColumn::Id)
+        .from(AliasEntity)
+        .and_where(Expr::col(AliasColumn::Canonical).in_subquery(canonical))
+        .to_owned();
+    Condition::any()
+        .add(Expr::col((Entity, Column::Revoked)).eq(id))
+        .add(Expr::col((Entity, Column::Revoked)).in_subquery(equivalents))
+}
+
+/// Correlated, indexed revocation exclusion for legacy delegation listings.
+pub(crate) fn unrevoked_condition() -> SimpleExpr {
+    Expr::exists(
+        Query::select()
+            .expr(Expr::value(1))
+            .from(Entity)
+            .cond_where(target_condition(
+                Expr::col((delegation::Entity, delegation::Column::Id)).into(),
+            ))
+            .to_owned(),
+    )
+    .not()
+}
+
+/// Load effective revocations in one indexed batch while keeping the original
+/// signed revocation target and bytes intact. The returned key is the queried
+/// delegation, not necessarily the CID the owner named in the revocation.
+pub(crate) async fn effective_rows<C: ConnectionTrait>(
     db: &C,
-    delegation_id: &Hash,
-) -> Result<bool, DbErr> {
-    Ok(Entity::find()
-        .filter(Column::Revoked.eq(*delegation_id))
-        .count(db)
+    ids: &[Hash],
+) -> Result<Vec<(Hash, Model)>, DbErr> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    use delegation_cid_alias::{Column as AliasColumn, Entity as AliasEntity};
+    let source = Alias::new("revocation_source_alias");
+    let target = Alias::new("revocation_target_alias");
+    let effective_id = Alias::new("effective_id");
+    let columns = [
+        Column::Id,
+        Column::Revoker,
+        Column::Revoked,
+        Column::Serialization,
+        Column::RevokedAt,
+    ];
+    let mut direct = Query::select();
+    direct
+        .columns(columns.map(|column| (Entity, column)))
+        .expr_as(Expr::col((Entity, Column::Revoked)), effective_id.clone())
+        .from(Entity)
+        .and_where(Expr::col((Entity, Column::Revoked)).is_in(ids.iter().copied()));
+    let mut aliased = Query::select();
+    aliased
+        .columns(columns.map(|column| (Entity, column)))
+        .expr_as(Expr::col((source.clone(), AliasColumn::Id)), effective_id)
+        .from_as(AliasEntity, source.clone())
+        .join_as(
+            JoinType::InnerJoin,
+            AliasEntity,
+            target.clone(),
+            Expr::col((source.clone(), AliasColumn::Canonical))
+                .equals((target.clone(), AliasColumn::Canonical)),
+        )
+        .join(
+            JoinType::InnerJoin,
+            Entity,
+            Expr::col((target, AliasColumn::Id)).equals((Entity, Column::Revoked)),
+        )
+        .and_where(Expr::col((source, AliasColumn::Id)).is_in(ids.iter().copied()));
+    // A self-alias appears in both branches. UNION removes that duplicate
+    // without manufacturing a second revocation or rewriting its target.
+    direct.union(UnionType::Distinct, aliased);
+    db.query_all(db.get_database_backend().build(&direct))
         .await?
-        > 0)
+        .into_iter()
+        .map(|row| {
+            Ok((
+                row.try_get("", "effective_id")?,
+                Model::from_query_result(&row, "")?,
+            ))
+        })
+        .collect()
+}
+
+/// Whether this delegation or any persisted equivalent CID has been revoked.
+///
+/// Use the caller's transaction for an admission-time recheck; signed targets
+/// and stored delegation IDs are never rewritten.
+pub async fn is_revoked<C: ConnectionTrait>(db: &C, delegation_id: &Hash) -> Result<bool, DbErr> {
+    Ok(Entity::find()
+        .filter(target_condition(Expr::value(*delegation_id)))
+        .one(db)
+        .await?
+        .is_some())
 }
 
 pub(crate) async fn first_revoked_ancestor<C: ConnectionTrait>(

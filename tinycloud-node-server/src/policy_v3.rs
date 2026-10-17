@@ -2912,11 +2912,8 @@ async fn is_root_generically_revoked<C: ConnectionTrait>(
 ) -> Result<bool, &'static str> {
     let cid = tinycloud_auth::ipld_core::cid::Cid::try_from(root_cid)
         .map_err(|_| "policy-root-invalid")?;
-    revocation::Entity::find()
-        .filter(revocation::Column::Revoked.eq(tinycloud_core::hash::Hash::from(cid)))
-        .one(db)
+    revocation::is_revoked(db, &tinycloud_core::hash::Hash::from(cid))
         .await
-        .map(|record| record.is_some())
         .map_err(|_| "root-revocation-unavailable")
 }
 
@@ -5345,6 +5342,9 @@ struct AccountOwnerProof {
     owner_did: String,
     space: SpaceId,
     expires_at: Option<OffsetDateTime>,
+    // Canonical identities, not the chosen legacy row, remain guarded until
+    // admission commits or rolls back. Revoke uses these same guards exclusive.
+    _chain_guards: Vec<tokio::sync::OwnedRwLockReadGuard<()>>,
 }
 
 /// Authenticate the policy/v2 credential owner from an already-admitted
@@ -5457,12 +5457,13 @@ async fn authenticate_account_owner(
             "account-authorization-capability-mismatch".into(),
         ));
     }
-    if revocation::Entity::find()
-        .filter(revocation::Column::Revoked.eq(row.id))
-        .one(&runtime.conn)
+    let chain_guards = tinycloud
+        .guard_delegation_chains(&[row.id])
+        .await
+        .map_err(db_error)?;
+    if revocation::is_revoked(&runtime.conn, &row.id)
         .await
         .map_err(db_error)?
-        .is_some()
         || space::Entity::find_by_id(SpaceIdWrap(credentials_space.clone()))
             .one(&runtime.conn)
             .await
@@ -5477,6 +5478,7 @@ async fn authenticate_account_owner(
         owner_did,
         space: credentials_space,
         expires_at: event.0.expiry,
+        _chain_guards: chain_guards,
     })
 }
 
@@ -5495,12 +5497,9 @@ async fn validate_locked_account_owner(
         || proof
             .expires_at
             .is_some_and(|expires_at| expires_at <= OffsetDateTime::now_utc())
-        || revocation::Entity::find()
-            .filter(revocation::Column::Revoked.eq(locked.id))
-            .one(transaction)
+        || revocation::is_revoked(transaction, &locked.id)
             .await
             .map_err(db_error)?
-            .is_some()
         || space::Entity::find_by_id(SpaceIdWrap(proof.space.clone()))
             .one(transaction)
             .await
@@ -10181,3 +10180,7 @@ mod tests {
         .is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "policy_v3/account_alias_tests.rs"]
+mod account_alias_tests;

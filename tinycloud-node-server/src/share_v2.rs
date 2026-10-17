@@ -1402,13 +1402,7 @@ async fn revocation_in_ancestry<C: ConnectionTrait>(
         if visited.len() > MAX_GRAPH_NODES {
             return Err(());
         }
-        if revocation::Entity::find()
-            .filter(revocation::Column::Revoked.eq(current))
-            .count(db)
-            .await
-            .map_err(|_| ())?
-            > 0
-        {
+        if revocation::is_revoked(db, &current).await.map_err(|_| ())? {
             return Ok(true);
         }
         let parents = parent_delegations::Entity::find()
@@ -2023,12 +2017,7 @@ async fn cid_revoked<C: ConnectionTrait>(db: &C, cid: &str) -> Result<bool, ()> 
         .parse::<tinycloud_auth::ipld_core::cid::Cid>()
         .map_err(|_| ())?
         .into();
-    Ok(revocation::Entity::find()
-        .filter(revocation::Column::Revoked.eq(id))
-        .count(db)
-        .await
-        .map_err(|_| ())?
-        > 0)
+    revocation::is_revoked(db, &id).await.map_err(|_| ())
 }
 
 fn typed_scope(
@@ -3420,6 +3409,9 @@ mod tests {
     use rocket::local::asynchronous::Client;
     use time::Duration;
 
+    #[path = "alias_revocation_tests.rs"]
+    mod alias_revocation_tests;
+
     #[test]
     fn policy_domain_matches_the_sdk_wire_contract() {
         assert_eq!(POLICY_DOMAIN, "xyz.tinycloud.share/policy/v2\0");
@@ -4532,26 +4524,30 @@ mod tests {
         let runtime = compose_test_runtime(&key_setup, Some(tee_context.clone()), true).await;
         let conn = runtime.conn.clone();
 
-        actor::ActiveModel {
-            id: Set("did:key:tc349-restart".to_owned()),
-        }
-        .insert(&conn)
-        .await
-        .expect("actor row");
-        let delegation_id = hash(b"tc349-restart-delegation");
-        delegation::ActiveModel {
-            id: Set(delegation_id),
-            delegator: Set("did:key:tc349-restart".to_owned()),
-            delegatee: Set("did:key:tc349-restart".to_owned()),
-            expiry: Set(None),
-            issued_at: Set(None),
-            not_before: Set(None),
-            facts: Set(None),
-            serialization: Set(delegation_id.as_ref().to_vec()),
-        }
-        .insert(&conn)
-        .await
-        .expect("delegation row");
+        use tinycloud_auth::{
+            resolver::DID_METHODS,
+            ssi::jwk::{Algorithm, JWK},
+        };
+        let jwk = JWK::generate_ed25519().expect("local test signer");
+        let did = DID_METHODS.generate(&jwk, "key").unwrap().to_string();
+        let issuer = format!("{did}#{}", did.trim_start_matches("did:key:"));
+        let signed = crate::did_resolution_test_support::signed_ucan_with_proof(
+            &issuer,
+            &jwk,
+            Algorithm::EdDSA,
+            false,
+        );
+        let delegation =
+            tinycloud_core::events::Delegation::from_header_ser::<TinyCloudDelegation>(
+                &signed.encode().unwrap(),
+            )
+            .unwrap();
+        runtime
+            .tinycloud
+            .delegate(delegation)
+            .await
+            .map_err(|error| error.to_string())
+            .expect("valid signed delegation persisted before restart");
 
         // Re-compose over the same, now-populated connection: the restart shape.
         let directory = tempfile::tempdir().expect("tempdir for local block store");

@@ -10,7 +10,7 @@
 //! the same consistent view.
 
 use crate::hash::Hash;
-use crate::models::{abilities, delegation, revocation};
+use crate::models::{abilities, delegation, delegation_cid_alias, revocation};
 use crate::relationships::parent_delegations;
 use sea_orm::{
     entity::prelude::*,
@@ -29,6 +29,23 @@ use crate::models::revocation::MAX_CHAIN_TRAVERSAL_NODES;
 pub(crate) async fn load_closure_edges<C: ConnectionTrait>(
     db: &C,
     roots: &[Hash],
+) -> Result<(Vec<Hash>, HashMap<Hash, Vec<Hash>>), ChainTraversalError> {
+    load_closure(db, roots, false).await
+}
+
+/// Resolve the same bounded closure to canonical lock identities. Signed graph
+/// IDs stay untouched; indexed alias joins share the closure's one round trip.
+pub(crate) async fn load_chain_lock_ids<C: ConnectionTrait>(
+    db: &C,
+    roots: &[Hash],
+) -> Result<Vec<Hash>, ChainTraversalError> {
+    load_closure(db, roots, true).await.map(|(ids, _)| ids)
+}
+
+async fn load_closure<C: ConnectionTrait>(
+    db: &C,
+    roots: &[Hash],
+    canonical_locks: bool,
 ) -> Result<(Vec<Hash>, HashMap<Hash, Vec<Hash>>), ChainTraversalError> {
     let mut nodes = roots.to_vec();
     nodes.sort_by(|left, right| left.as_ref().cmp(right.as_ref()));
@@ -74,6 +91,17 @@ pub(crate) async fn load_closure_edges<C: ConnectionTrait>(
         )
         .to_owned();
     let mut closure_query = base;
+    if canonical_locks {
+        // Parentless stored roots otherwise produce no edge row. Seed them
+        // only for locking; roots without a persisted alias retain their ID.
+        let seed = Query::select()
+            .expr_as(Expr::col(delegation_cid_alias::Column::Id), child.clone())
+            .expr_as(Expr::val(Option::<Hash>::None), parent.clone())
+            .from(delegation_cid_alias::Entity)
+            .and_where(Expr::col(delegation_cid_alias::Column::Id).is_in(nodes.iter().copied()))
+            .to_owned();
+        closure_query.union(UnionType::Distinct, seed);
+    }
     closure_query.union(UnionType::Distinct, recursive);
     let cte = CommonTableExpression::new()
         .table_name(closure.clone())
@@ -87,20 +115,65 @@ pub(crate) async fn load_closure_edges<C: ConnectionTrait>(
             (closure.clone(), child.clone()),
             (closure.clone(), parent.clone()),
         ])
-        .from(closure)
-        .limit((edge_cap + 1) as u64);
+        .from(closure.clone())
+        .limit((edge_cap + if canonical_locks { nodes.len() } else { 0 } + 1) as u64);
+    if canonical_locks {
+        for (column, alias, output) in [
+            (
+                child.clone(),
+                Alias::new("child_alias"),
+                Alias::new("child_lock"),
+            ),
+            (
+                parent.clone(),
+                Alias::new("parent_alias"),
+                Alias::new("parent_lock"),
+            ),
+        ] {
+            query
+                .expr_as(
+                    Expr::col((alias.clone(), delegation_cid_alias::Column::Canonical)),
+                    output,
+                )
+                .join_as(
+                    JoinType::LeftJoin,
+                    delegation_cid_alias::Entity,
+                    alias.clone(),
+                    Expr::col((alias, delegation_cid_alias::Column::Id))
+                        .equals((closure.clone(), column)),
+                );
+        }
+    }
     let query = query.with(WithClause::new().recursive(true).cte(cte).to_owned());
     let rows = db
         .query_all(db.get_database_backend().build(&query))
         .await?;
-    if rows.len() > edge_cap {
+    if rows.len() > edge_cap + if canonical_locks { nodes.len() } else { 0 } {
         return Err(ChainTraversalError::LimitExceeded);
     }
 
     let mut edges: HashMap<Hash, Vec<Hash>> = HashMap::new();
+    let mut lock_aliases = HashMap::new();
     for row in rows {
         let edge_child: Hash = row.try_get("", "child")?;
-        let edge_parent: Hash = row.try_get("", "parent")?;
+        let edge_parent: Option<Hash> = row.try_get("", "parent")?;
+        if canonical_locks {
+            if let Some(canonical) = row.try_get::<Option<Hash>>("", "child_lock")? {
+                if canonical != edge_child {
+                    lock_aliases.insert(edge_child, canonical);
+                }
+            }
+            if let (Some(parent), Some(canonical)) =
+                (edge_parent, row.try_get::<Option<Hash>>("", "parent_lock")?)
+            {
+                if canonical != parent {
+                    lock_aliases.insert(parent, canonical);
+                }
+            }
+        }
+        let Some(edge_parent) = edge_parent else {
+            continue;
+        };
         let parents = edges.entry(edge_child).or_default();
         if !parents.contains(&edge_parent) {
             parents.push(edge_parent);
@@ -121,6 +194,11 @@ pub(crate) async fn load_closure_edges<C: ConnectionTrait>(
                 nodes.push(*parent);
                 frontier.push(*parent);
             }
+        }
+    }
+    for id in &mut nodes {
+        if let Some(canonical) = lock_aliases.get(id) {
+            *id = *canonical;
         }
     }
 
@@ -168,12 +246,10 @@ impl AuthGraphSnapshot {
             ability_rows.entry(row.delegation).or_default().push(row);
         }
 
-        let revoked = revocation::Entity::find()
-            .filter(revocation::Column::Revoked.is_in(nodes.iter().copied()))
-            .all(db)
+        let revoked = revocation::effective_rows(db, &nodes)
             .await?
             .into_iter()
-            .map(|row| row.revoked)
+            .map(|(id, _)| id)
             .collect();
 
         Ok(Self {
