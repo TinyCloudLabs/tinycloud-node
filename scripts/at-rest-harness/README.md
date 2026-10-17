@@ -172,10 +172,13 @@ Every one must pass all of these, or the check is RED:
     hex in any case and base64/base64url at any alignment (padded or not),
     and decoded as hex, base64, base64url (padded or not), base32 and bech32
     data after removing whitespace and a `0x`, `\x`, short `label:` or
-    `data:…;base64,` prefix, shifted by 0 to 7 characters. This decoding
-    is applied to the whole text and to every run of 32 or more characters
-    from those alphabets (so a key encoded inside ciphertext or other text
-    is found).
+    `data:…;base64,` prefix, shifted by 0 to 7 characters.
+
+  This decoding is applied to the whole text and to every run of 32 or more
+  characters, in mirror strings as well as in blocks. Runs are taken from all
+  those alphabets together and from base32, hex and base64url each on their
+  own, so a run ends where its own alphabet ends: a base32 key followed by `9`
+  or `1` is still found inside ciphertext or other text.
 - **No piece of a secret in a TCE1 salt.** The salt (header bytes 20..52) is
   the only free field of a sealed block. No block's salt may hold any 16-byte
   window of any of those secrets: a truncated key (31 bytes and one other
@@ -199,6 +202,8 @@ Out of scope for a regression harness, one line each:
 - A key split across two commitments, or XOR'd with anything, isn't found.
 - A piece of a secret (fewer than 32 bytes) is only looked for in TCE1 salts;
   everywhere else only whole secrets are matched.
+- A secret split into 3 or more pieces across salts (each under 16 bytes)
+  isn't found.
 - Separators other than `-`/`_` inside holder names, shifts of more than 7
   characters, and splits across fields other than holder names aren't
   rejoined.
@@ -215,8 +220,9 @@ bypass), `selftest_key_mirror_refuses_escrow_contents_and_derived_keys`,
 `selftest_key_mirror_bounds_absurd_generations`,
 `selftest_key_mirror_requires_mirrors_in_encrypt_mode`,
 `selftest_blocks_open_under_their_mirrored_dek`,
-`selftest_blocks_carry_no_derived_secret` and
-`selftest_salts_hold_no_piece_of_a_secret` run in plain `cargo test`.
+`selftest_blocks_carry_no_derived_secret`,
+`selftest_salts_hold_no_piece_of_a_secret` and
+`selftest_base32_secret_before_other_characters` run in plain `cargo test`.
 
 ## Not covered
 

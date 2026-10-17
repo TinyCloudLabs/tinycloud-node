@@ -1898,11 +1898,15 @@ mod key_mirror {
 
     /// Findings for any string of `doc` that carries one of `secrets`: in its
     /// text as hex, base64 or base64url (any alignment), or in any byte view
-    /// of it ([`byte_views`]), including as text inside a decoded payload.
+    /// ([`byte_views`]) of it or of one of its [`encoded_runs`], including
+    /// as text inside a decoded payload.
     pub fn secret_findings(what: &str, doc: &Value, secrets: &[Secret]) -> Vec<String> {
         let mut findings = BTreeSet::new();
         for (place, text) in strings(doc) {
-            let views = byte_views(&text);
+            let views: Vec<Vec<u8>> = std::iter::once(text.as_str())
+                .chain(encoded_runs(&text))
+                .flat_map(byte_views)
+                .collect();
             let texts: Vec<String> = std::iter::once(text.clone())
                 .chain(armor_payload(&text).map(|p| String::from_utf8_lossy(&p).into_owned()))
                 .collect();
@@ -1928,12 +1932,35 @@ mod key_mirror {
         c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=' | '_' | '-')
     }
 
-    /// Maximal runs of 32 or more characters from the hex, base64,
-    /// base64url, base32 and bech32 alphabets: where an encoded key would
-    /// sit inside other text or among ciphertext bytes.
+    fn is_base32_char(c: char) -> bool {
+        c.is_ascii_alphabetic() || ('2'..='7').contains(&c)
+    }
+
+    fn is_hex_char(c: char) -> bool {
+        c.is_ascii_hexdigit()
+    }
+
+    fn is_base64url_char(c: char) -> bool {
+        c.is_ascii_alphanumeric() || c == '-' || c == '_'
+    }
+
+    /// Maximal runs of 32 or more characters where an encoded key would sit
+    /// inside other text or among ciphertext bytes: runs of all the decoders'
+    /// characters together, and runs of base32, hex and base64url characters
+    /// each on their own, so a run ends where its own alphabet ends (a base32
+    /// key followed by `9` or `1` is still a whole base32 run). Every run then
+    /// goes through [`byte_views`], at every alignment it tries.
     fn encoded_runs(text: &str) -> impl Iterator<Item = &str> {
-        text.split(|c: char| !is_encoding_char(c))
-            .filter(|run| run.len() >= 32)
+        let alphabets: [fn(char) -> bool; 4] = [
+            is_encoding_char,
+            is_base32_char,
+            is_hex_char,
+            is_base64url_char,
+        ];
+        alphabets.into_iter().flat_map(move |in_alphabet| {
+            text.split(move |c: char| !in_alphabet(c))
+                .filter(|run| run.len() >= 32)
+        })
     }
 
     /// Round 6 ruling 1 / round 7: a block's name and bytes carry no
@@ -4946,6 +4973,50 @@ fn selftest_salts_hold_no_piece_of_a_secret() -> Result<()> {
     ensure!(
         pieces(&findings) == 0,
         "a random salt matched a piece of a secret: {findings:#?}"
+    );
+    Ok(())
+}
+
+/// Round 8, offline: a base32-encoded derived secret is found when the next
+/// character is outside base32 but inside another encoding's alphabet (`9`,
+/// `1`), in a block body and in a mirror string.
+#[test]
+fn selftest_base32_secret_before_other_characters() -> Result<()> {
+    let fx = MirrorFixture::new();
+    let all = fx.with_edit("ark-", &|_, _| None);
+    let (good, put) = fx.sealed_block(0, b"the probe value");
+    let puts = [put];
+    let kek_1 = key_mirror::kek(&fx.keys.ark_1);
+    let mut missed = Vec::new();
+    for suffix in ["9", "1"] {
+        let mut body = good.body.clone();
+        body.push(b'\n');
+        body.extend_from_slice(base32_lower(&kek_1).to_uppercase().as_bytes());
+        body.extend_from_slice(suffix.as_bytes());
+        let block = StoredObject {
+            key: good.key.clone(),
+            body,
+        };
+        let findings = fx.check_with(&all, &[block], &puts, key_mirror::Policy::default());
+        let expected = "bytes as text carry the harness-derived KEK of generation 1";
+        if !any_contains(&findings, expected) {
+            missed.push(format!("block body, base32 then {suffix:?}: {findings:?}"));
+        }
+        let note = format!("{}{suffix}", base32_lower(&fx.keys.ark_1));
+        let findings = fx.check(&fx.with_edit("dek-", &|_, v| {
+            v["note"] = json!(note);
+            None
+        }));
+        if !any_contains(&findings, "carries the harness-derived ARK of generation 1") {
+            missed.push(format!(
+                "mirror string, base32 then {suffix:?}: {findings:?}"
+            ));
+        }
+    }
+    ensure!(
+        missed.is_empty(),
+        "a base32 secret before another character was missed:\n{}",
+        missed.join("\n")
     );
     Ok(())
 }
