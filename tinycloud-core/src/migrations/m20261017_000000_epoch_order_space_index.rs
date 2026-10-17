@@ -38,10 +38,17 @@ fn create_index() -> IndexCreateStatement {
         .to_owned()
 }
 
-/// On PostgreSQL: `Ok(true)` when a valid plain btree index named `INDEX` on
-/// `epoch_order (space, parent, child)` exists in the current schema,
-/// `Ok(false)` when no relation has that name, and an error naming the fix
-/// otherwise.
+/// On PostgreSQL: `Ok(true)` when a valid, ready and live plain btree index
+/// named `INDEX` on `epoch_order (space, parent, child)` exists in the current
+/// schema, `Ok(false)` when no relation has that name, and an error naming
+/// the fix otherwise.
+///
+/// An index whose `CREATE INDEX CONCURRENTLY` is still running is not yet
+/// valid either. It is recognised by its build's progress row: by
+/// `index_relid` when this role may see it, and otherwise (PostgreSQL hides a
+/// progress row's columns from roles without the builder's privileges) by a
+/// hidden progress row whose backend holds the build's SHARE UPDATE EXCLUSIVE
+/// lock on `epoch_order`.
 async fn postgres_index_present(manager: &SchemaManager<'_>) -> Result<bool, DbErr> {
     let row = manager
         .get_connection()
@@ -49,13 +56,22 @@ async fn postgres_index_present(manager: &SchemaManager<'_>) -> Result<bool, DbE
             DbBackend::Postgres,
             "SELECT c.relkind::text AS kind,
                     COALESCE(i.indrelid = 'epoch_order'::regclass, false) AS on_table,
-                    COALESCE(i.indisvalid, false) AS valid,
+                    COALESCE(i.indisvalid AND i.indisready AND i.indislive, false) AS usable,
                     am.amname::text AS method,
                     i.indpred IS NULL AND i.indexprs IS NULL AS plain,
                     array_to_string(ARRAY(
                         SELECT a.attname FROM unnest(i.indkey::int2[]) WITH ORDINALITY AS k(attnum, ord)
                         JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
-                        ORDER BY k.ord), ',') AS columns
+                        ORDER BY k.ord), ',') AS columns,
+                    EXISTS (
+                        SELECT 1 FROM pg_stat_progress_create_index p
+                        WHERE p.index_relid = c.oid
+                           OR (p.relid IS NULL AND EXISTS (
+                                   SELECT 1 FROM pg_locks l
+                                   WHERE l.pid = p.pid AND l.granted
+                                     AND l.relation = 'epoch_order'::regclass
+                                     AND l.mode = 'ShareUpdateExclusiveLock'))
+                    ) AS building
              FROM pg_class c
              LEFT JOIN pg_index i ON i.indexrelid = c.oid
              LEFT JOIN pg_am am ON am.oid = c.relam
@@ -70,21 +86,30 @@ async fn postgres_index_present(manager: &SchemaManager<'_>) -> Result<bool, DbE
     };
     let kind: String = row.try_get("", "kind")?;
     let on_table: bool = row.try_get("", "on_table")?;
-    let valid: bool = row.try_get("", "valid")?;
+    let usable: bool = row.try_get("", "usable")?;
     let method: Option<String> = row.try_get("", "method")?;
     let plain: Option<bool> = row.try_get("", "plain")?;
     let columns: Option<String> = row.try_get("", "columns")?;
-    if kind == "i"
+    let building: bool = row.try_get("", "building")?;
+    let shaped = kind == "i"
         && on_table
-        && valid
         && method.as_deref() == Some("btree")
         && plain == Some(true)
-        && columns.as_deref() == Some("space,parent,child")
-    {
+        && columns.as_deref() == Some("space,parent,child");
+    if shaped && usable {
         return Ok(true);
     }
-    let problem = if kind == "i" && on_table && !valid {
-        "is INVALID (a failed or interrupted CREATE INDEX CONCURRENTLY)".to_string()
+    if shaped && building {
+        return Err(DbErr::Migration(format!(
+            "{INDEX} is still being built (a CREATE INDEX CONCURRENTLY is in progress). Nothing \
+             was applied. Wait for the build to finish, check that pg_index.indisvalid is true, \
+             and restart."
+        )));
+    }
+    let problem = if shaped {
+        "is not usable (indisvalid, indisready and indislive are not all true: a failed or \
+         interrupted CREATE INDEX CONCURRENTLY)"
+            .to_string()
     } else {
         format!(
             "is not a plain btree index on epoch_order (space, parent, child) \
@@ -416,14 +441,34 @@ mod tests {
         assert_eq!(columns, "space,parent,child");
     }
 
-    /// `IF NOT EXISTS` matches by name only. An INVALID index (a failed
-    /// `CREATE INDEX CONCURRENTLY`) or one on other columns must fail the
-    /// migration rather than be recorded as done.
+    async fn recorded(db: &DbConn) -> i64 {
+        db.query_one(Statement::from_string(
+            DbBackend::Postgres,
+            format!(
+                "SELECT COUNT(*) AS n FROM seaql_migrations WHERE version = '{}'",
+                Migration.name()
+            ),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<i64>("", "n")
+        .unwrap()
+    }
+
+    /// `IF NOT EXISTS` matches by name only. An index that is not valid,
+    /// ready and live (a failed `CREATE INDEX CONCURRENTLY`), or one on
+    /// other columns, must fail the migration rather than be recorded as
+    /// done.
     #[tokio::test]
     async fn postgres_unusable_operator_index_fails_the_migration() {
-        for (definition, invalidate) in
-            [("(space, parent, child)", true), ("(space, parent)", false)]
-        {
+        for (definition, unset) in [
+            ("(space, parent, child)", Some("indisvalid")),
+            ("(space, parent, child)", Some("indisready")),
+            ("(space, parent, child)", Some("indislive")),
+            ("(space, parent)", None),
+        ] {
+            let label = format!("{definition} {unset:?}");
             let Some(fixture) = PostgresTestSchema::migrated_through(
                 "postgres_unusable_operator_index_fails_the_migration",
                 Some(steps_before_this()),
@@ -436,11 +481,11 @@ mod tests {
             db.execute_unprepared(&format!("CREATE INDEX {INDEX} ON epoch_order {definition}"))
                 .await
                 .unwrap();
-            if invalidate {
+            if let Some(flag) = unset {
                 // What a failed CONCURRENTLY build leaves behind. Needs a
                 // superuser, as the CI and local test roles are.
                 db.execute_unprepared(&format!(
-                    "UPDATE pg_index SET indisvalid = false WHERE indexrelid = '{INDEX}'::regclass"
+                    "UPDATE pg_index SET {flag} = false WHERE indexrelid = '{INDEX}'::regclass"
                 ))
                 .await
                 .unwrap();
@@ -448,25 +493,103 @@ mod tests {
 
             let error = migrate(db).await.unwrap_err().to_string();
 
-            assert!(error.contains(INDEX), "{definition}: {error}");
+            assert!(error.contains(INDEX), "{label}: {error}");
             assert!(
                 error.contains("DROP INDEX CONCURRENTLY"),
-                "{definition}: {error}"
+                "{label}: {error}"
             );
-            let applied = db
+            assert_eq!(recorded(db).await, 0, "{label}");
+        }
+    }
+
+    /// A node that boots while the operator's `CREATE INDEX CONCURRENTLY` is
+    /// still running sees the index as not yet valid. It must fail, say to
+    /// wait for the build (not to drop it), and boot once the build is done.
+    /// The build is held in its "waiting for writers" phase by an open
+    /// `epoch_order` write. Checked as the building superuser, who sees the
+    /// build's `index_relid`, and as another role, from whom PostgreSQL hides
+    /// the progress row's columns.
+    #[tokio::test]
+    async fn postgres_index_build_in_progress_says_wait() {
+        let test = "postgres_index_build_in_progress_says_wait";
+        for restricted in [false, true] {
+            let Some(fixture) =
+                PostgresTestSchema::migrated_through(test, Some(steps_before_this())).await
+            else {
+                return;
+            };
+            let db = &fixture.conn;
+            let schema: String = db
                 .query_one(Statement::from_string(
                     DbBackend::Postgres,
-                    format!(
-                        "SELECT COUNT(*) AS n FROM seaql_migrations WHERE version = '{}'",
-                        Migration.name()
-                    ),
+                    "SELECT current_schema() AS s".to_string(),
                 ))
                 .await
                 .unwrap()
                 .unwrap()
-                .try_get::<i64>("", "n")
+                .try_get("", "s")
                 .unwrap();
-            assert_eq!(applied, 0, "{definition}");
+            let role = format!("{schema}_node");
+
+            let writer = db.begin().await.unwrap();
+            writer
+                .execute_unprepared("LOCK TABLE epoch_order IN ROW EXCLUSIVE MODE")
+                .await
+                .unwrap();
+            let builder = fixture.connect(1).await;
+            let build = tokio::spawn(async move {
+                builder
+                    .execute_unprepared(&format!(
+                        "CREATE INDEX CONCURRENTLY {INDEX} ON epoch_order (space, parent, child)"
+                    ))
+                    .await
+            });
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            while postgres_index(db).await.is_none() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "build never started"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            assert!(
+                !postgres_index(db).await.unwrap().1,
+                "mid-build index is not valid"
+            );
+
+            let migrator = fixture.connect(1).await;
+            if restricted {
+                for statement in [
+                    format!("CREATE ROLE {role} NOLOGIN"),
+                    format!("GRANT USAGE, CREATE ON SCHEMA {schema} TO {role}"),
+                    format!("GRANT SELECT ON seaql_migrations TO {role}"),
+                    format!("SET ROLE {role}"),
+                ] {
+                    migrator.execute_unprepared(&statement).await.unwrap();
+                }
+            }
+            let error = migrate(&migrator).await.unwrap_err().to_string();
+            writer.rollback().await.unwrap();
+            build.await.unwrap().unwrap();
+            if restricted {
+                drop(migrator);
+                for statement in [format!("DROP OWNED BY {role}"), format!("DROP ROLE {role}")] {
+                    db.execute_unprepared(&statement).await.unwrap();
+                }
+            }
+
+            assert!(
+                error.contains("still being built"),
+                "restricted {restricted}: {error}"
+            );
+            assert!(
+                !error.contains("DROP INDEX"),
+                "restricted {restricted}: {error}"
+            );
+            assert_eq!(recorded(db).await, 0);
+            migrate(db).await.unwrap();
+            assert_eq!(recorded(db).await, 1);
+            assert!(postgres_index(db).await.unwrap().1);
         }
     }
 }

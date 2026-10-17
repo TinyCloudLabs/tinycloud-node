@@ -99,22 +99,20 @@ mod tests {
     /// database exactly as before so a later boot can apply it.
     #[tokio::test]
     async fn postgres_cursor_index_fails_fast_while_delegation_is_locked() {
-        let Some(fixture) =
-            PostgresTestSchema::new("postgres_cursor_index_fails_fast_while_delegation_is_locked")
-                .await
+        // The state a node upgrading to this migration boots with.
+        let this = crate::migrations::Migrator::migrations()
+            .iter()
+            .position(|migration| migration.name() == Migration.name())
+            .unwrap() as u32;
+        let Some(fixture) = PostgresTestSchema::migrated_through(
+            "postgres_cursor_index_fails_fast_while_delegation_is_locked",
+            Some(this),
+        )
+        .await
         else {
             return;
         };
         let db = &fixture.conn;
-        // Back to the state a node upgrading to this migration boots with.
-        let migrations = crate::migrations::Migrator::migrations();
-        let this = migrations
-            .iter()
-            .position(|migration| migration.name() == Migration.name())
-            .unwrap();
-        crate::migrations::Migrator::down(db, Some((migrations.len() - this) as u32))
-            .await
-            .unwrap();
         assert!(!recorded(db).await);
         let before = delegation_indexes(db).await;
 
