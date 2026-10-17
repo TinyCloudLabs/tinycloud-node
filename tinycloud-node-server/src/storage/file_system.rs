@@ -186,7 +186,10 @@ impl FileSystemStore {
         let (size, reader) = open_sealed(provider, space, id, file.take(len).compat(), len)
             .await?
             .into_inner();
-        Ok(Some(Content::new(size, AsyncEither::Right(reader))))
+        Ok(Some(Content::new(
+            size,
+            AsyncEither::Right(Box::new(reader)),
+        )))
     }
 
     async fn read_block(
@@ -285,7 +288,7 @@ impl FileSystemStore {
         Ok(Some(RangeRead::Content {
             total_size: plan.plaintext_len(),
             range,
-            content: Content::new(range.len(), AsyncEither::Right(reader)),
+            content: Content::new(range.len(), AsyncEither::Right(Box::new(reader))),
         }))
     }
 
@@ -338,7 +341,9 @@ impl FileSystemStore {
 }
 
 /// Plaintext from a legacy file, or authenticated plaintext from a sealed one.
-pub type FsReadable = AsyncEither<PlainReader, DecryptReader<PlainReader>>;
+/// The decrypting side is boxed: it carries the AES key schedule and segment
+/// buffers, and `Content` values move by value through deep request paths.
+pub type FsReadable = AsyncEither<PlainReader, Box<DecryptReader<PlainReader>>>;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
 pub struct FileSystemConfig {
@@ -420,7 +425,9 @@ impl ImmutableReadStore for FileSystemStore {
         id: &Hash,
     ) -> Result<Option<Content<Self::Readable>>, Self::Error> {
         let start = Instant::now();
-        let result = self.read_block(space, id).await;
+        // Boxed: the sealed read path's future is large, and the trait method
+        // future is built on the caller's stack before async_trait boxes it.
+        let result = Box::pin(self.read_block(space, id)).await;
         crate::prometheus::observe_stage(
             crate::prometheus::InvocationStage::BlockRead,
             crate::prometheus::StageOutcome::from(result.is_ok()),
@@ -435,7 +442,7 @@ impl ImmutableReadStore for FileSystemStore {
         id: &Hash,
         range: ByteRangeSpec,
     ) -> Result<Option<RangeRead<Self::Readable>>, Self::Error> {
-        self.range_block(space, id, range).await
+        Box::pin(self.range_block(space, id, range)).await
     }
 }
 
@@ -599,7 +606,7 @@ impl ImmutableWriteStore<TempFileSystemStage> for FileSystemStore {
         let result = async move {
             let (mut h, f) = staged.into_inner();
             let hash = h.finalize();
-            self.persist_staged(space, &hash, Staged::File(f)).await?;
+            Box::pin(self.persist_staged(space, &hash, Staged::File(f))).await?;
             Ok(hash)
         }
         .await;
@@ -627,7 +634,7 @@ impl ImmutableWriteStore<memory::MemoryStaging> for FileSystemStore {
         let result = async move {
             let (mut h, v) = staged.into_inner();
             let hash = h.finalize();
-            self.persist_staged(space, &hash, Staged::Bytes(v)).await?;
+            Box::pin(self.persist_staged(space, &hash, Staged::Bytes(v))).await?;
             Ok(hash)
         }
         .await;
@@ -661,7 +668,7 @@ impl ImmutableWriteStore<either::Either<TempFileSystemStage, memory::MemoryStagi
                 AsyncEither::Left(t_file) => Staged::File(t_file),
                 AsyncEither::Right(v) => Staged::Bytes(v),
             };
-            self.persist_staged(space, &hash, staged).await?;
+            Box::pin(self.persist_staged(space, &hash, staged)).await?;
             Ok(hash)
         }
         .await;
