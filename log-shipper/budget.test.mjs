@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import { calculateBudget, representativeEvents, serializedEventBytes, MINUTES_30_DAYS, REQUEST_ALLOCATION_BYTES } from './budget.mjs';
+import { assertCapture } from '../scripts/tc959-docker.mjs';
 
 const fields = JSON.parse(await readFile(new URL('./fields.json', import.meta.url), 'utf8'));
 const nodeSchema = fields.services['tinycloud-node'];
@@ -38,8 +39,8 @@ test('exact serialized bytes account for newlines or singleton JSON array overhe
 });
 
 test('every request costs both full events; increasing traffic is linear without a sampler', () => {
-  const one = calculateBudget({ requestsPerMinute: 1, diagnosticEventsPerMinute: 0, gateEventsPerMinute: 0 });
-  const many = calculateBudget({ requestsPerMinute: 10000, diagnosticEventsPerMinute: 0, gateEventsPerMinute: 0 });
+  const one = calculateBudget({ requestsPerMinute: 1, diagnosticEventsPerMinute: 0, gateEventsPerMinute: 0, typedEventsPerMinute: 0 });
+  const many = calculateBudget({ requestsPerMinute: 10000, diagnosticEventsPerMinute: 0, gateEventsPerMinute: 0, typedEventsPerMinute: 0 });
   const pair = serializedEventBytes(representativeEvents.node, 'ndjson') + serializedEventBytes(representativeEvents.ingress, 'ndjson');
   assert.equal(one.requestPairBytes, pair);
   assert.equal(one.requestBytes30Days, pair * 43200);
@@ -63,7 +64,7 @@ test('allocation boundary is sustainable requests per minute, not a throttle', (
 });
 
 test('fixed diagnostic reserve is separate from the request allocation', () => {
-  const budget = calculateBudget({ requestsPerMinute: 1, diagnosticEventsPerMinute: 53, gateEventsPerMinute: 9 });
+  const budget = calculateBudget({ requestsPerMinute: 1, diagnosticEventsPerMinute: 53, gateEventsPerMinute: 9, typedEventsPerMinute: 0 });
   assert.equal(budget.diagnosticReserveBytes30Days,
     43200 * (53 * serializedEventBytes(representativeEvents.diagnostic, 'ndjson') + 9 * serializedEventBytes(representativeEvents.gate, 'ndjson')));
   assert.equal(budget.totalBytes30Days, budget.requestBytes30Days + budget.diagnosticReserveBytes30Days);
@@ -71,7 +72,32 @@ test('fixed diagnostic reserve is separate from the request allocation', () => {
   const noTraffic = calculateBudget({ requestsPerMinute: 0 });
   assert.equal(noTraffic.requestBytes30Days, 0);
   assert.ok(noTraffic.diagnosticReserveBytes30Days > 0);
-  assert.equal(noTraffic.totalBytes30Days, noTraffic.diagnosticReserveBytes30Days);
+  assert.equal(noTraffic.totalBytes30Days, noTraffic.diagnosticReserveBytes30Days + noTraffic.typedReserveBytes30Days);
+});
+
+test('typed per-occurrence diagnostics are reserved at the shipper cap with each code\'s widest valid record', async () => {
+  const diagnostics = JSON.parse(await readFile(new URL('./diagnostics.json', import.meta.url), 'utf8'));
+  const codes = Object.keys(diagnostics.typed);
+  const { records, window_secs } = diagnostics.typed_limit;
+  // Sam's decision (tc-959-f6-log-cap): 10 records per typed code per minute, each code counted separately.
+  assert.deepEqual(diagnostics.typed_limit, { records: 10, window_secs: 60 });
+  // Every code's widest record is valid on the wire and no wider than the budgeted representative.
+  for (const code of codes) {
+    const { level, fields } = diagnostics.typed[code];
+    const widest = { ts: '9999-12-31T23:59:59.999Z', level, event: level === 'warn' ? 'node_warning' : 'node_error', svc: 'api', event_code: code, event_count: 1 };
+    for (const name of fields) {
+      const spec = nodeSchema.fields[name];
+      widest[name] = spec.type === 'integer' ? spec.max : spec.type === 'enum' ? spec.values.reduce((a, b) => (b.length > a.length ? b : a)) : 'f'.repeat(spec.max_len);
+    }
+    assert.doesNotThrow(() => assertCapture([widest], nodeSchema.fields));
+    assert.ok(serializedEventBytes(widest) <= serializedEventBytes(representativeEvents.typed), code);
+  }
+  const budget = calculateBudget({ requestsPerMinute: 0, diagnosticEventsPerMinute: 0, gateEventsPerMinute: 0 });
+  assert.equal(budget.typedEventsPerMinute, codes.length * records * 60 / window_secs);
+  assert.equal(budget.typedEventsPerMinute, 70);
+  assert.equal(budget.typedReserveBytes30Days, budget.typedEventsPerMinute * serializedEventBytes(representativeEvents.typed) * MINUTES_30_DAYS);
+  assert.equal(budget.totalBytes30Days, budget.typedReserveBytes30Days);
+  assert.equal(calculateBudget({ requestsPerMinute: 0, typedEventsPerMinute: 0 }).typedReserveBytes30Days, 0);
 });
 
 test('diagnostic storm reserve covers every code at both severity levels', () => {
@@ -82,7 +108,7 @@ test('diagnostic storm reserve covers every code at both severity levels', () =>
 });
 
 test('invalid numeric budgets fail rather than hiding impossible volume', () => {
-  for (const field of ['requestsPerMinute', 'diagnosticEventsPerMinute', 'gateEventsPerMinute', 'allocationBytes']) {
+  for (const field of ['requestsPerMinute', 'diagnosticEventsPerMinute', 'gateEventsPerMinute', 'typedEventsPerMinute', 'allocationBytes']) {
     for (const value of [-1, NaN, Infinity, '1']) assert.throws(() => calculateBudget({ [field]: value }), /finite non-negative/);
   }
   assert.throws(() => calculateBudget({ framing: 'raw' }), /framing/);

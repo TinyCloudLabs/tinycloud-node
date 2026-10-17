@@ -3,6 +3,20 @@ import { pathToFileURL } from 'node:url';
 
 const schema = JSON.parse(readFileSync(new URL('./fields.json', import.meta.url), 'utf8')).services['tinycloud-node'];
 const longest = values => values.reduce((chosen, value) => Buffer.byteLength(value) > Buffer.byteLength(chosen) ? value : chosen, '');
+const diagnostics = JSON.parse(readFileSync(new URL('./diagnostics.json', import.meta.url), 'utf8'));
+/** The widest valid wire record of one typed diagnostic: maximum integers, longest enum values, full-length hashes. */
+const widestTyped = code => {
+  const { level, fields } = diagnostics.typed[code];
+  const record = { level, ts: '9999-12-31T23:59:59.999Z', event: level === 'warn' ? 'node_warning' : 'node_error', svc: 'api', event_code: code, event_count: 1 };
+  for (const name of fields) {
+    const spec = schema.fields[name];
+    record[name] = spec.type === 'integer' ? spec.max : spec.type === 'enum' ? longest(spec.values) : 'f'.repeat(spec.max_len);
+  }
+  return record;
+};
+const typedWidest = Object.keys(diagnostics.typed).map(widestTyped).reduce((chosen, record) => Buffer.byteLength(JSON.stringify(record)) > Buffer.byteLength(JSON.stringify(chosen)) ? record : chosen);
+/** The shipper cap: per typed code, at most `records` per `window_secs`, so this many records per minute in total. */
+const typedCapPerMinute = Object.keys(diagnostics.typed).length * diagnostics.typed_limit.records * 60 / diagnostics.typed_limit.window_secs;
 
 /** Thirty days, not a calendar-month or billing-period guarantee. */
 export const MINUTES_30_DAYS = 30 * 24 * 60;
@@ -33,6 +47,7 @@ export const representativeEvents = Object.freeze({
   ingress: Object.freeze({ ...common, event: 'ingress_request', svc: 'ingress', ...request, request_time_seconds: 0.0000010000000000000002 }),
   diagnostic: Object.freeze({ level: 'warn', ts: common.ts, event: 'node_warning', svc: 'api', event_code: longest(schema.fields.event_code.values), event_count: schema.fields.event_count.max }),
   gate: Object.freeze({ level: 'warn', ts: common.ts, event: 'logship_gate_summary_total', svc: 'logship', reason: longest(schema.fields.reason.values), count: schema.fields.count.max }),
+  typed: Object.freeze(typedWidest),
 });
 
 /**
@@ -60,22 +75,25 @@ export function calculateBudget({
   requestsPerMinute = 1,
   diagnosticEventsPerMinute = schema.fields.event_code.values.length * 2,
   gateEventsPerMinute = schema.fields.reason.values.length,
+  typedEventsPerMinute = typedCapPerMinute,
   allocationBytes = REQUEST_ALLOCATION_BYTES,
   framing = 'ndjson',
 } = {}) {
-  for (const [name, value] of Object.entries({ requestsPerMinute, diagnosticEventsPerMinute, gateEventsPerMinute, allocationBytes })) {
+  for (const [name, value] of Object.entries({ requestsPerMinute, diagnosticEventsPerMinute, gateEventsPerMinute, typedEventsPerMinute, allocationBytes })) {
     if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) throw new RangeError(`${name} must be finite non-negative`);
   }
   const eventBytes = Object.fromEntries(Object.entries(representativeEvents).map(([name, event]) => [name, serializedEventBytes(event, framing)]));
   const requestPairBytes = eventBytes.node + eventBytes.ingress;
   const requestBytes30Days = requestsPerMinute * requestPairBytes * MINUTES_30_DAYS;
   const diagnosticReserveBytes30Days = (diagnosticEventsPerMinute * eventBytes.diagnostic + gateEventsPerMinute * eventBytes.gate) * MINUTES_30_DAYS;
+  // Per-occurrence typed records, by default at the shipper cap sustained for 30 days.
+  const typedReserveBytes30Days = typedEventsPerMinute * eventBytes.typed * MINUTES_30_DAYS;
   const sustainableRequestsPerMinute = allocationBytes / (requestPairBytes * MINUTES_30_DAYS);
   return {
     sizeBasis: 'exact JSON bytes of representative worst-valid N0 events; not a hard serialized-size ceiling',
     framing, eventBytes, requestPairBytes, requestsPerMinute, allocationBytes,
-    requestBytes30Days, diagnosticReserveBytes30Days,
-    totalBytes30Days: requestBytes30Days + diagnosticReserveBytes30Days,
+    requestBytes30Days, diagnosticReserveBytes30Days, typedEventsPerMinute, typedReserveBytes30Days,
+    totalBytes30Days: requestBytes30Days + diagnosticReserveBytes30Days + typedReserveBytes30Days,
     sustainableRequestsPerMinute,
     sustainableWholeRequestsPerMinute: Math.floor(sustainableRequestsPerMinute),
     withinRequestAllocation: requestBytes30Days <= allocationBytes,

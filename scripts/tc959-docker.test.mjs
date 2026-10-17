@@ -1,9 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { parseArgs, assertCapture, resourceNames } from './tc959-docker.mjs';
 import { assertHostedRunner, cleanupOwnedResources, burstEvidence, assertHealthyBurst, progressEvidence, assertServiceParity, assertLogshipNetwork, composeRuntimeValues, socketEvidence, numericMetrics, diagnosticCounts } from './tc959-compose-proof.mjs';
+import { f6Events, spaceHash } from '../log-shipper/cases.mjs';
 
 const request = { ts: '2026-10-16T12:00:00.000Z', level: 'info', event: 'node_request', svc: 'api', method: 'GET', route: '/healthz', status: 200, latency_us: 12 };
 const ingress = { ...request, event: 'ingress_request', svc: 'ingress', request_time_seconds: 0.001 };
@@ -37,6 +39,18 @@ test('capture rejects unsafe values even when all request positive controls are 
   for (const poison of [{ authorization: 'synthetic-bearer' }, { route: '/raw-secret' }, { latency_us: -1 }, { status: 999 }, { extra: 'TC959_SYNTHETIC' }]) {
     assert.throws(() => assertCapture([{ ...request, ...poison }, ...baseline.slice(1)]));
   }
+});
+
+test('capture admits an F6 diagnostic only with its exact typed fields and 64-hex keyed hashes', () => {
+  const fields = JSON.parse(readFileSync(new URL('../log-shipper/fields.json', import.meta.url), 'utf8')).services['tinycloud-node'].fields;
+  const wire = { ts: '2026-10-16T12:00:00.000Z', level: 'warn', event: 'node_warning', svc: 'api', event_code: 'sql_operation_lock_wait', event_count: 1, ...f6Events.sql_operation_lock_wait.fields };
+  assert.doesNotThrow(() => assertCapture([wire], fields));
+  const connect = { ts: wire.ts, level: 'warn', event: 'node_warning', svc: 'api', event_code: 'db_connect_failed', event_count: 1, ...f6Events.db_connect_failed.fields };
+  assert.doesNotThrow(() => assertCapture([connect], fields));
+  for (const poison of [{ db: 'v2n' }, { operation: 'begin' }, { space_hash: '0123456789abcdef' }, { db_hash: 'A'.repeat(64) }, { op: 'lock' }, { waited_ms: -1 }, { waited_ms: 1.5 }, { waited_ms: undefined }, { phase: 'persist' }, { event_count: 2 }, { level: 'error', event: 'node_error' }]) {
+    assert.throws(() => assertCapture([JSON.parse(JSON.stringify({ ...wire, ...poison }))], fields));
+  }
+  assert.throws(() => assertCapture([{ ts: wire.ts, level: 'warn', event: 'node_warning', svc: 'api', event_code: 'unclassified', event_count: 1, space_hash: spaceHash }], fields));
 });
 
 const goodId = 'a8098c1a-f86e-4b1f-92a7-4b50b53ec932';
