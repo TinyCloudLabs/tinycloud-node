@@ -111,7 +111,8 @@ def request_json(host, method, path, secret, limit=None, port=None, allow_404=Fa
         if response.status != 200:
             raise QuotaError("quota API rejected the request")
         try:
-            result = json.loads(payload) if len(payload) <= cap else None
+            # Strict UTF-8: json.loads(bytes) would auto-accept a BOM, UTF-16 or UTF-32.
+            result = json.loads(payload.decode("utf-8")) if len(payload) <= cap else None
             if not isinstance(result, dict):
                 raise ValueError
             return result

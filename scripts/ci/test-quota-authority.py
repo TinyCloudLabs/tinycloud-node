@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Synthetic HTTP contracts for reviewed node/billing quota authority."""
 import contextlib
+import gzip
 import http.client
 import io
 import json
@@ -395,10 +396,18 @@ class AuthorityTests(unittest.TestCase):
 
     def test_invalid_usage_body_fails_closed(self):
         inventory = realistic_inventory(3000)
+        text = inventory.decode()
+        # json.loads(bytes) auto-detects UTF-8-sig/16/32; the node only ever sends
+        # plain UTF-8, so every other encoding (and gzip, which the script never
+        # requests or decodes) must fail closed.
         for name, body in (("array", json.dumps(json.loads(inventory)["spaces"]).encode()),
                            ("truncated", inventory[:-1]), ("empty", b""), ("string", b'"spaces"'),
                            ("html", b"<html><body>502 Bad Gateway</body></html>"),
-                           ("not-utf8", b"\xff" * 70000)):
+                           ("invalid-utf8", b"\xff" * 70000),
+                           ("utf8-bom", b"\xef\xbb\xbf" + inventory),
+                           ("utf16", text.encode("utf-16")), ("utf16-le", text.encode("utf-16-le")),
+                           ("utf32-le", text.encode("utf-32-le")),
+                           ("gzip", gzip.compress(inventory))):
             with self.subTest(case=name):
                 self.calls.clear()
                 self.usage_body = body
@@ -406,6 +415,9 @@ class AuthorityTests(unittest.TestCase):
                 self.assertEqual(code, 1)
                 self.assertIn("quota API returned an invalid response", logs)
                 self.assertEqual(self.calls, [("node.tinycloud.xyz", "GET", "/admin/usage")])
+        self.calls.clear()
+        self.usage_body = inventory
+        self.assertEqual(self.run_main()[0], 0, "Plain UTF-8 JSON is still accepted")
 
     def test_wrong_owner_config_fails_before_any_request(self):
         document = json.loads(self.config.read_text())
