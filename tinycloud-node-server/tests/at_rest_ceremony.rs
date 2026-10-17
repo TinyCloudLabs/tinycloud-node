@@ -310,6 +310,34 @@ async fn junk_from_one_client_does_not_block_a_genuine_share() {
     assert_eq!((s, &a["outcome"]), (Status::Ok, &json!("unlocked")), "{a}");
 }
 
+/// The round-3 security probe, inverted: one planted file whose name or
+/// type the mirror refuses used to stop the node booting.
+#[tokio::test]
+async fn planted_mirror_files_never_stop_a_node_from_booting() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Holders::new();
+    let escrow = json!({"escrow": {"recipients": h.recipients(), "allow_software": true}});
+    drop(app(dir.path(), 1, escrow.clone()).await.unwrap());
+    let mirror = dir.path().join("at-rest/_tc/at-rest");
+    for name in [
+        "ark-0000000002-x y.json",
+        "ark-..json",
+        "ark-0000000002-x+y.json",
+        "record-x y.json",
+    ] {
+        std::fs::write(mirror.join(name), b"junk").unwrap();
+    }
+    std::fs::create_dir(mirror.join("ark-0000000002-d.json")).unwrap();
+    std::os::unix::fs::symlink("/dev/zero", mirror.join("ark-0000000002-z.json")).unwrap();
+
+    let client = app(dir.path(), 1, escrow).await.unwrap();
+    let (_, info) = get_json(&client, "/info").await;
+    assert_eq!(
+        info["at_rest"],
+        json!({"mode":"off","state":"unlocked","encrypting":false})
+    );
+}
+
 #[tokio::test]
 async fn misconfigurations_are_refused_at_boot() {
     let dir = tempfile::tempdir().unwrap();

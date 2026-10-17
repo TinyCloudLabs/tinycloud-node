@@ -119,7 +119,10 @@ impl KeyMirror for S3KeyMirror {
                     page.contents
                         .into_iter()
                         .flatten()
-                        .filter_map(|o| o.key().map(str::to_owned)),
+                        .filter_map(|o| o.key().map(str::to_owned))
+                        // A name `get` would refuse can't be a key object;
+                        // listing it would let a bucket writer fail reads.
+                        .filter(|k| check_name(k).is_ok()),
                 );
                 Ok(acc)
             })
@@ -171,21 +174,34 @@ impl KeyMirror for FsKeyMirror {
         Ok(())
     }
 
+    /// A regular file only: a symlink is never followed (`O_NOFOLLOW`) and a
+    /// directory or other non-file counts as absent. The read is bounded
+    /// by [`MAX_MIRROR_OBJECT`] whatever the file claims its size is.
     async fn get(&self, name: &str) -> Result<Option<Vec<u8>>, MirrorError> {
+        use tokio::io::AsyncReadExt as _;
         let path = self.path(name)?;
-        match tokio::fs::metadata(&path).await {
-            Ok(meta) if meta.len() > MAX_MIRROR_OBJECT as u64 => {
-                return Err(Box::new(MirrorObjectTooLarge))
-            }
-            Ok(_) => {}
+        let file = tokio::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+            .await;
+        let file = match file {
+            Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Ok(None),
             Err(e) => return Err(e.into()),
+        };
+        if !file.metadata().await?.is_file() {
+            return Ok(None);
         }
-        match tokio::fs::read(&path).await {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e.into()),
+        let mut bytes = Vec::new();
+        file.take(MAX_MIRROR_OBJECT as u64 + 1)
+            .read_to_end(&mut bytes)
+            .await?;
+        if bytes.len() > MAX_MIRROR_OBJECT {
+            return Err(Box::new(MirrorObjectTooLarge));
         }
+        Ok(Some(bytes))
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<String>, MirrorError> {
@@ -200,9 +216,18 @@ impl KeyMirror for FsKeyMirror {
         };
         let mut names = Vec::new();
         while let Some(entry) = entries.next_entry().await? {
+            // Regular files only (`file_type` doesn't follow symlinks), and
+            // only names `get` accepts.
+            if !entry.file_type().await?.is_file() {
+                continue;
+            }
             if let Ok(file) = entry.file_name().into_string() {
-                if file.starts_with(file_prefix) && !file.ends_with(".tmp") {
-                    names.push(format!("{dir_name}/{file}"));
+                let name = format!("{dir_name}/{file}");
+                if file.starts_with(file_prefix)
+                    && !file.ends_with(".tmp")
+                    && check_name(&name).is_ok()
+                {
+                    names.push(name);
                 }
             }
         }
@@ -242,5 +267,52 @@ mod tests {
         ] {
             assert!(m.put(bad, vec![]).await.is_err(), "{bad}");
         }
+    }
+
+    #[tokio::test]
+    async fn fs_mirror_lists_only_readable_regular_files_and_never_follows_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = FsKeyMirror::new(dir.path().to_path_buf());
+        m.put("_tc/at-rest/ark-0000000001-ab.json", b"one".to_vec())
+            .await
+            .unwrap();
+        let at_rest = dir.path().join("_tc/at-rest");
+        // Planted by a datadir writer: names `get` refuses, a directory, a
+        // symlink to a huge stream and one to a secret file.
+        for name in [
+            "ark-0000000002-x y.json",
+            "ark-..json",
+            "ark-0000000002-x+y.json",
+        ] {
+            std::fs::write(at_rest.join(name), b"junk").unwrap();
+        }
+        std::fs::create_dir(at_rest.join("ark-0000000002-d.json")).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", at_rest.join("ark-0000000002-z.json")).unwrap();
+        let secret = dir.path().join("secret");
+        std::fs::write(&secret, b"not a mirror object").unwrap();
+        std::os::unix::fs::symlink(&secret, at_rest.join("ark-0000000002-s.json")).unwrap();
+
+        assert_eq!(
+            m.list("_tc/at-rest/ark-").await.unwrap(),
+            vec!["_tc/at-rest/ark-0000000001-ab.json".to_string()]
+        );
+        for planted in [
+            "_tc/at-rest/ark-0000000002-d.json",
+            "_tc/at-rest/ark-0000000002-z.json",
+            "_tc/at-rest/ark-0000000002-s.json",
+        ] {
+            assert_eq!(m.get(planted).await.unwrap(), None, "{planted}");
+        }
+        // A regular file over the cap is refused without reading it all.
+        std::fs::write(
+            at_rest.join("ark-0000000003-big.json"),
+            vec![b' '; MAX_MIRROR_OBJECT + 1],
+        )
+        .unwrap();
+        let err = m
+            .get("_tc/at-rest/ark-0000000003-big.json")
+            .await
+            .unwrap_err();
+        assert!(err.is::<MirrorObjectTooLarge>(), "{err}");
     }
 }

@@ -58,20 +58,26 @@ pub struct AtRestRuntime {
 /// this boot's recovery key or match a commitment. A client that keeps
 /// failing is refused for a while. Failures never spend the keyring's
 /// per-boot share budget, which only authenticated shares count against.
+///
+/// Bounded: an LRU of [`Self::MAX_CLIENTS`] entries, O(1) per call. When
+/// full, the least recently seen client is forgotten (so its budget
+/// resets), which only weakens a best-effort limit (TC-1357), never the
+/// per-boot budget.
 pub struct ShareFailureLimiter {
-    clients:
-        parking_lot::Mutex<std::collections::HashMap<std::net::IpAddr, (f64, std::time::Instant)>>,
+    clients: parking_lot::Mutex<lru::LruCache<std::net::IpAddr, (f64, std::time::Instant)>>,
 }
 
 impl ShareFailureLimiter {
     /// Failures a client may make at once, then one more per minute.
     pub const BURST: f64 = 5.0;
     const REFILL_PER_SEC: f64 = 1.0 / 60.0;
-    const MAX_CLIENTS: usize = 10_000;
+    pub const MAX_CLIENTS: usize = 4096;
 
     fn new() -> Self {
         Self {
-            clients: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            clients: parking_lot::Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(Self::MAX_CLIENTS).expect("non-zero"),
+            )),
         }
     }
 
@@ -96,15 +102,7 @@ impl ShareFailureLimiter {
 
     pub fn record_failure(&self, ip: std::net::IpAddr) {
         let mut clients = self.clients.lock();
-        if clients.len() >= Self::MAX_CLIENTS {
-            clients.retain(|_, entry| {
-                Self::refilled(entry);
-                entry.0 < Self::BURST
-            });
-        }
-        let entry = clients
-            .entry(ip)
-            .or_insert((Self::BURST, std::time::Instant::now()));
+        let entry = clients.get_or_insert_mut(ip, || (Self::BURST, std::time::Instant::now()));
         Self::refilled(entry);
         entry.0 = (entry.0 - 1.0).max(0.0);
     }
@@ -312,6 +310,9 @@ pub async fn setup(
             pinned_efp,
             app_id: tee.map(|t| t.app_id.clone()),
             compose_hash: tee.map(|t| t.compose_hash.clone()),
+            // Once keys may seal data, the mirror must hold a copy of every
+            // key; with mode off, mirror contents never stop the node.
+            require_mirror: config.mode != AtRestMode::Off,
         },
     )
     .await
@@ -595,5 +596,27 @@ mod tests {
         }
         // Nothing at rest configured: the node keeps its old behaviour.
         refuse_unknown_tee(&AtRestConfig::default(), &info_error).unwrap();
+    }
+
+    #[test]
+    fn the_share_failure_limiter_stays_bounded_and_fast() {
+        let limiter = ShareFailureLimiter::new();
+        let one: std::net::IpAddr = "203.0.113.7".parse().unwrap();
+        for _ in 0..ShareFailureLimiter::BURST as usize {
+            assert!(limiter.allows(one));
+            limiter.record_failure(one);
+        }
+        assert!(!limiter.allows(one));
+        // 100k distinct clients: O(1) each, and the map never grows past
+        // its cap (the review measured 10 s per 10k with the old map).
+        let started = std::time::Instant::now();
+        for i in 0..100_000u32 {
+            limiter.record_failure(std::net::IpAddr::from(i.to_be_bytes()));
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(
+            limiter.clients.lock().len(),
+            ShareFailureLimiter::MAX_CLIENTS
+        );
     }
 }
