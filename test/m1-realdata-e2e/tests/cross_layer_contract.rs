@@ -2184,7 +2184,7 @@ fn signed_ucan_revocation(
     let resource = format!("urn:cid:{target}");
     capabilities.with_action(
         resource.parse()?,
-        "tinycloud/revoke".parse::<UcanAbility>()?,
+        "tinycloud.delegation/revoke".parse::<UcanAbility>()?,
         [BTreeMap::<String, Value>::new()],
     );
     let payload = Payload {
