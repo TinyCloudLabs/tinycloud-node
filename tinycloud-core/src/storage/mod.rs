@@ -175,6 +175,13 @@ where
     S::Writable: 'static,
 {
     type Error: StdError + Send + Sync;
+    /// Called for each space an invocation writes, before its database write
+    /// lock and transaction are taken; `persist` later runs inside them. A
+    /// store that needs its own database writes for a space (e.g. creating
+    /// the space's at-rest data key) does them here. Default: nothing.
+    async fn prepare_write(&self, _space: &SpaceId) -> Result<(), Self::Error> {
+        Ok(())
+    }
     async fn persist(
         &self,
         space: &SpaceId,
@@ -263,6 +270,9 @@ where
     W::Writable: 'static,
 {
     type Error = S::Error;
+    async fn prepare_write(&self, space: &SpaceId) -> Result<(), Self::Error> {
+        S::prepare_write(self, space).await
+    }
     async fn persist(
         &self,
         space: &SpaceId,
