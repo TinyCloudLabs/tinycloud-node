@@ -50,6 +50,8 @@ pub struct Config {
     pub share_email: ShareEmailConfig,
     #[serde(default)]
     pub retention: RetentionConfig,
+    #[serde(default)]
+    pub epoch_head_backfill: EpochHeadBackfillConfig,
 }
 
 /// Production exact-email composition.  The capability remains unavailable
@@ -922,6 +924,67 @@ impl Default for RetentionConfig {
     }
 }
 
+/// The online `epoch_head` backfill (TC-1274): one pass over every space
+/// after the node starts serving, rewriting a space's cached head epochs
+/// only when they are not provably current. Writes stay correct without it;
+/// it moves each space's one-time history scan off its first write.
+///
+/// On by default and deliberately slow. Section `[epoch_head_backfill]`;
+/// env `TINYCLOUD_EPOCH_HEAD_BACKFILL__ENABLED`,
+/// `TINYCLOUD_EPOCH_HEAD_BACKFILL__SPACES_PER_SECOND`,
+/// `TINYCLOUD_EPOCH_HEAD_BACKFILL__PROGRESS_EVERY`.
+#[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
+pub struct EpochHeadBackfillConfig {
+    #[serde(default = "default_epoch_head_backfill_enabled")]
+    pub enabled: bool,
+    /// Upper bound on spaces checked per second. After each space the task
+    /// also pauses at least as long as that space took.
+    #[serde(default = "default_epoch_head_backfill_spaces_per_second")]
+    pub spaces_per_second: u32,
+    /// Log a progress line every this many spaces.
+    #[serde(default = "default_epoch_head_backfill_progress_every")]
+    pub progress_every: u32,
+}
+
+fn default_epoch_head_backfill_enabled() -> bool {
+    true
+}
+
+fn default_epoch_head_backfill_spaces_per_second() -> u32 {
+    2
+}
+
+fn default_epoch_head_backfill_progress_every() -> u32 {
+    500
+}
+
+impl Default for EpochHeadBackfillConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_epoch_head_backfill_enabled(),
+            spaces_per_second: default_epoch_head_backfill_spaces_per_second(),
+            progress_every: default_epoch_head_backfill_progress_every(),
+        }
+    }
+}
+
+impl EpochHeadBackfillConfig {
+    /// The pacing fields matter only when the backfill runs, so a disabled
+    /// backfill accepts any values.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.spaces_per_second == 0 {
+            return Err("epoch_head_backfill.spaces_per_second must be at least 1; set enabled = false to turn the backfill off");
+        }
+        if self.progress_every == 0 {
+            return Err("epoch_head_backfill.progress_every must be at least 1");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq, Default)]
 #[serde(tag = "type")]
 pub enum Keys {
@@ -1450,6 +1513,32 @@ mod tests {
             let mut config = Config::default();
             config.hooks.webhook_max_attempts = attempts;
             assert!(crate::resolve_runtime_config(&config).is_err());
+        }
+    }
+
+    /// TC-1274: a running backfill needs a positive rate and progress
+    /// interval; a disabled one boots whatever its pacing says.
+    #[test]
+    fn epoch_head_backfill_pacing_is_checked_only_when_enabled() {
+        for (enabled, spaces_per_second, progress_every, ok) in [
+            (true, 1, 1, true),
+            (true, 0, 500, false),
+            (true, 2, 0, false),
+            (false, 0, 0, true),
+        ] {
+            let config = Config {
+                epoch_head_backfill: EpochHeadBackfillConfig {
+                    enabled,
+                    spaces_per_second,
+                    progress_every,
+                },
+                ..Config::default()
+            };
+            assert_eq!(
+                crate::resolve_runtime_config(&config).is_ok(),
+                ok,
+                "enabled {enabled}, {spaces_per_second}/s, every {progress_every}"
+            );
         }
     }
 

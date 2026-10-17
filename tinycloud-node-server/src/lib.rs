@@ -30,6 +30,7 @@ pub mod authorization;
 pub mod config;
 pub mod dstack;
 pub mod egress;
+pub mod epoch_head_backfill;
 pub mod hooks;
 pub mod invocation_replay;
 pub mod link;
@@ -424,6 +425,10 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
 pub fn resolve_runtime_config(tinycloud_config: &Config) -> Result<Config> {
     let mut resolved = tinycloud_config.clone();
     resolved.hooks.validate().map_err(anyhow::Error::msg)?;
+    resolved
+        .epoch_head_backfill
+        .validate()
+        .map_err(anyhow::Error::msg)?;
     tracing::RequestIdOrigins::new(&resolved.log.request_id_first_party_origins)
         .map_err(anyhow::Error::msg)?;
     resolved.storage.resolve();
@@ -735,6 +740,7 @@ pub async fn app_with_control(
     // is moved into Rocket-managed state below.
     let telemetry_enabled = tinycloud_config.telemetry.enabled;
     let telemetry_tinycloud = tinycloud.clone();
+    let backfill_tinycloud = tinycloud.clone();
 
     let rocket = rocket::custom(config)
         .attach(AdHoc::on_liftoff("webhook-egress-refresh", {
@@ -833,6 +839,24 @@ pub async fn app_with_control(
                             _ = &mut shutdown => break,
                         }
                     }
+                });
+            })
+        }))
+    } else {
+        rocket
+    };
+
+    // TC-1274: one gentle pass that fills the `epoch_head` cache of spaces
+    // written before it existed. Writes stay correct without it.
+    let rocket = if tinycloud_config.epoch_head_backfill.enabled {
+        let backfill_config = tinycloud_config.epoch_head_backfill.clone();
+        rocket.attach(AdHoc::on_liftoff("epoch-head-backfill", move |rocket| {
+            let tinycloud = backfill_tinycloud.clone();
+            let backfill_config = backfill_config.clone();
+            let shutdown = rocket.shutdown();
+            Box::pin(async move {
+                tokio::spawn(async move {
+                    epoch_head_backfill::run(&tinycloud, &backfill_config, shutdown).await;
                 });
             })
         }))

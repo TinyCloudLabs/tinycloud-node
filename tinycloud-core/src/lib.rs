@@ -11,6 +11,7 @@ pub mod did_resolution;
 pub mod duckdb;
 pub mod encryption;
 pub mod encryption_network;
+pub(crate) mod epoch_head;
 pub mod events;
 pub mod hash;
 pub mod keys;
