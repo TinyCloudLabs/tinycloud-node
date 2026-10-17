@@ -2,9 +2,12 @@
 //! is switched off until the key-continuity gate exists.
 
 mod envelope;
+mod hierarchy;
 mod key;
+pub mod keyring;
 mod names;
 mod provider;
+pub mod store;
 mod stream;
 #[cfg(any(test, feature = "test-util"))]
 mod testing;
@@ -21,3 +24,6 @@ pub use provider::{DataKeyError, DataKeyProvider};
 pub use stream::{DecryptReader, EncryptReader, SegmentRange};
 #[cfg(any(test, feature = "test-util"))]
 pub use testing::FixedKeyProvider;
+
+pub use keyring::{AtRestKeyring, KeyringConfig, KeyringState};
+pub use store::{AtRestStore, KeyMirror};
