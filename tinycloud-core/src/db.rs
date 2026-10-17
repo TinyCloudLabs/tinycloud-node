@@ -2415,33 +2415,13 @@ where
                 None
             };
             if !blobs.is_empty() {
-                if tokio::time::Instant::now() >= upload_deadline {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "KV upload deadline elapsed before persist",
-                    )
-                    .into());
-                }
-                tokio::time::timeout_at(upload_deadline, async {
-                    for (key, stage) in stages.drain() {
-                        let expected = write_hashes[&key];
-                        let (space, _) = key;
-                        let index = blobs
-                            .binary_search_by(|(s, v, _)| (s, v).cmp(&(&space, &expected)))
-                            .expect("registered generation for every staged write");
-                        let hash = self
-                            .storage
-                            .persist(&space, stage, blobs[index].2)
-                            .await
-                            .map_err(TxStoreError::StoreWrite)?;
-                        debug_assert_eq!(hash, expected);
-                    }
-                    Ok::<(), TxStoreError<B, S, K>>(())
-                })
-                .await
-                .map_err(|_| {
-                    std::io::Error::new(std::io::ErrorKind::TimedOut, "KV upload timed out")
-                })??;
+                self.persist_registered_blobs::<S>(
+                    std::mem::take(&mut stages),
+                    &write_hashes,
+                    &blobs,
+                    upload_deadline,
+                )
+                .await?;
             }
             // PG sequence guards are taken after upload. SQLite takes them
             // before its writer mutex and BEGIN. The protected SQLite writer
@@ -2562,110 +2542,17 @@ where
             )
             .await?;
 
-            let mut results = Vec::new();
-            // perform and record side effects
-            for cap in caps.iter().filter_map(|c| {
-                c.resource.tinycloud_resource().and_then(|r| {
-                    Some((
-                        r.space(),
-                        r.service().as_str(),
-                        // TC-119: resolve deprecated aliases to canonical (see the
-                        // staging loop above) — identity for canonical URNs.
-                        crate::policy_capability::resolve_alias(c.ability.as_ref().as_ref()),
-                        r.path()?,
-                    ))
-                })
-            }) {
-                match cap {
-                    (space, "kv", "tinycloud.kv/get", path) => {
-                        let data =
-                            get_kv(&tx, &self.storage, space, path)
-                                .await
-                                .map_err(|e| match e {
-                                    EitherError::A(e) => TxStoreError::Tx(e.into()),
-                                    EitherError::B(e) => TxStoreError::StoreRead(e),
-                                })?;
-                        if let (Some(limit), Some((_, _, content))) =
-                            (options.max_response_bytes, data.as_ref())
-                        {
-                            if content.len() > limit {
-                                return Err(TxStoreError::KvResponseTooLarge {
-                                    size: content.len(),
-                                    limit,
-                                });
-                            }
-                        }
-                        results.push(InvocationOutcome::KvRead(data));
-                    }
-                    (space, "kv", "tinycloud.kv/list", path) => {
-                        let (list, truncated) = list_bounded_after(
-                            &tx,
-                            space,
-                            path,
-                            options.list_limit,
-                            options.list_cursor.as_ref(),
-                        )
-                        .await?;
-                        results.push(InvocationOutcome::KvList(list, truncated, None))
-                    }
-                    (space, "kv", "tinycloud.kv/del", path) => {
-                        // KV deletion is logical. Blobs are content-addressed and may be
-                        // shared by live sibling keys or retained version history.
-                        results.push(InvocationOutcome::KvDelete(
-                            deleted_hashes.get(&(space.clone(), path.clone())).copied(),
-                        ))
-                    }
-                    (space, "kv", "tinycloud.kv/put", path) => {
-                        let hash = write_hashes
-                            .get(&(space.clone(), path.clone()))
-                            .copied()
-                            .expect("staged KV writes have a content hash");
-                        results.push(InvocationOutcome::KvWrite(hash));
-                    }
-                    (space, "kv", "tinycloud.kv/metadata", path) => results.push(
-                        InvocationOutcome::KvMetadata(metadata_with_hash(&tx, space, path).await?),
-                    ),
-                    (space, "capabilities", "tinycloud.capabilities/read", path)
-                        if path.as_str() == "all" =>
-                    {
-                        match &caps_read_params {
-                            None => {
-                                // Backward compatible: no params means return all valid delegations
-                                results.push(InvocationOutcome::OpenSessions(
-                                    get_valid_delegations(&tx, space, self.encryption.as_ref())
-                                        .await?,
-                                ))
-                            }
-                            Some(CapabilitiesReadParams::List { filters }) => {
-                                // List with optional filters
-                                results.push(InvocationOutcome::OpenSessions(
-                                    get_filtered_delegations(
-                                        &tx,
-                                        space,
-                                        &invoker,
-                                        filters.as_ref(),
-                                        self.encryption.as_ref(),
-                                    )
-                                    .await?,
-                                ))
-                            }
-                            Some(CapabilitiesReadParams::Chain { delegation_cid }) => {
-                                // Get the delegation chain for a specific delegation
-                                results.push(InvocationOutcome::DelegationChain(
-                                    get_delegation_chain(
-                                        &tx,
-                                        space,
-                                        delegation_cid,
-                                        self.encryption.as_ref(),
-                                    )
-                                    .await?,
-                                ))
-                            }
-                        }
-                    }
-                    _ => {}
-                };
-            }
+            let results = self
+                .invocation_side_effects::<S>(
+                    &tx,
+                    &caps,
+                    &invoker,
+                    &options,
+                    &write_hashes,
+                    &deleted_hashes,
+                    caps_read_params.as_ref(),
+                )
+                .await?;
             if !blobs.is_empty() {
                 crate::kv_orphans::finish_candidates(&tx, &blobs, &attempt_id).await?;
             }
@@ -2694,6 +2581,175 @@ where
             }
         }
         result
+    }
+
+    /// Upload staged KV blobs under their registered generations before any
+    /// sequence lock or KV transaction.
+    ///
+    /// A separate function, not inline in the commit future: debug builds give
+    /// every awaited temporary its own stack slot, and the commit future runs
+    /// the deepest request path (TC-735 #301 overflowed CI's 2 MiB stack).
+    async fn persist_registered_blobs<S>(
+        &self,
+        stages: HashMap<(SpaceId, Path), HashBuffer<S::Writable>>,
+        write_hashes: &HashMap<(SpaceId, Path), Hash>,
+        blobs: &[(SpaceId, Hash, i64)],
+        upload_deadline: tokio::time::Instant,
+    ) -> Result<(), TxStoreError<B, S, K>>
+    where
+        B: ImmutableWriteStore<S> + ImmutableReadStore + ImmutableDeleteStore,
+        S: ImmutableStaging,
+        S::Writable: 'static + Unpin,
+    {
+        if tokio::time::Instant::now() >= upload_deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "KV upload deadline elapsed before persist",
+            )
+            .into());
+        }
+        tokio::time::timeout_at(upload_deadline, async {
+            for (key, stage) in stages {
+                let expected = write_hashes[&key];
+                let (space, _) = key;
+                let index = blobs
+                    .binary_search_by(|(s, v, _)| (s, v).cmp(&(&space, &expected)))
+                    .expect("registered generation for every staged write");
+                let hash = self
+                    .storage
+                    .persist(&space, stage, blobs[index].2)
+                    .await
+                    .map_err(TxStoreError::StoreWrite)?;
+                debug_assert_eq!(hash, expected);
+            }
+            Ok::<(), TxStoreError<B, S, K>>(())
+        })
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "KV upload timed out"))?
+    }
+
+    /// Perform and record the invocation's side effects inside the KV
+    /// transaction, after `transact`. Separate from the commit future for the
+    /// same stack reason as [`Self::persist_registered_blobs`].
+    #[allow(clippy::too_many_arguments)]
+    async fn invocation_side_effects<S>(
+        &self,
+        tx: &DatabaseTransaction,
+        caps: &[crate::util::Capability],
+        invoker: &str,
+        options: &KvInvokeOptions,
+        write_hashes: &HashMap<(SpaceId, Path), Hash>,
+        deleted_hashes: &HashMap<(SpaceId, Path), Hash>,
+        caps_read_params: Option<&CapabilitiesReadParams>,
+    ) -> Result<Vec<InvocationOutcome<B::Readable>>, TxStoreError<B, S, K>>
+    where
+        B: ImmutableWriteStore<S> + ImmutableReadStore + ImmutableDeleteStore,
+        S: ImmutableStaging,
+        S::Writable: 'static + Unpin,
+    {
+        let mut results = Vec::new();
+        for cap in caps.iter().filter_map(|c| {
+            c.resource.tinycloud_resource().and_then(|r| {
+                Some((
+                    r.space(),
+                    r.service().as_str(),
+                    // TC-119: resolve deprecated aliases to canonical (see the
+                    // staging loop above) — identity for canonical URNs.
+                    crate::policy_capability::resolve_alias(c.ability.as_ref().as_ref()),
+                    r.path()?,
+                ))
+            })
+        }) {
+            match cap {
+                (space, "kv", "tinycloud.kv/get", path) => {
+                    let data =
+                        get_kv(tx, &self.storage, space, path)
+                            .await
+                            .map_err(|e| match e {
+                                EitherError::A(e) => TxStoreError::Tx(e.into()),
+                                EitherError::B(e) => TxStoreError::StoreRead(e),
+                            })?;
+                    if let (Some(limit), Some((_, _, content))) =
+                        (options.max_response_bytes, data.as_ref())
+                    {
+                        if content.len() > limit {
+                            return Err(TxStoreError::KvResponseTooLarge {
+                                size: content.len(),
+                                limit,
+                            });
+                        }
+                    }
+                    results.push(InvocationOutcome::KvRead(data));
+                }
+                (space, "kv", "tinycloud.kv/list", path) => {
+                    let (list, truncated) = list_bounded_after(
+                        tx,
+                        space,
+                        path,
+                        options.list_limit,
+                        options.list_cursor.as_ref(),
+                    )
+                    .await?;
+                    results.push(InvocationOutcome::KvList(list, truncated, None))
+                }
+                (space, "kv", "tinycloud.kv/del", path) => {
+                    // KV deletion is logical. Blobs are content-addressed and may be
+                    // shared by live sibling keys or retained version history.
+                    results.push(InvocationOutcome::KvDelete(
+                        deleted_hashes.get(&(space.clone(), path.clone())).copied(),
+                    ))
+                }
+                (space, "kv", "tinycloud.kv/put", path) => {
+                    let hash = write_hashes
+                        .get(&(space.clone(), path.clone()))
+                        .copied()
+                        .expect("staged KV writes have a content hash");
+                    results.push(InvocationOutcome::KvWrite(hash));
+                }
+                (space, "kv", "tinycloud.kv/metadata", path) => results.push(
+                    InvocationOutcome::KvMetadata(metadata_with_hash(tx, space, path).await?),
+                ),
+                (space, "capabilities", "tinycloud.capabilities/read", path)
+                    if path.as_str() == "all" =>
+                {
+                    match caps_read_params {
+                        None => {
+                            // Backward compatible: no params means return all valid delegations
+                            results.push(InvocationOutcome::OpenSessions(
+                                get_valid_delegations(tx, space, self.encryption.as_ref()).await?,
+                            ))
+                        }
+                        Some(CapabilitiesReadParams::List { filters }) => {
+                            // List with optional filters
+                            results.push(InvocationOutcome::OpenSessions(
+                                get_filtered_delegations(
+                                    tx,
+                                    space,
+                                    invoker,
+                                    filters.as_ref(),
+                                    self.encryption.as_ref(),
+                                )
+                                .await?,
+                            ))
+                        }
+                        Some(CapabilitiesReadParams::Chain { delegation_cid }) => {
+                            // Get the delegation chain for a specific delegation
+                            results.push(InvocationOutcome::DelegationChain(
+                                get_delegation_chain(
+                                    tx,
+                                    space,
+                                    delegation_cid,
+                                    self.encryption.as_ref(),
+                                )
+                                .await?,
+                            ))
+                        }
+                    }
+                }
+                _ => {}
+            };
+        }
+        Ok(results)
     }
 
     /// Execute a successful non-mutating invocation without entering the
