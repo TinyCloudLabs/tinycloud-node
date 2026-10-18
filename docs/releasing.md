@@ -66,12 +66,14 @@ main's history (`scripts/ci/check-deploy-ref.sh`, before builds and again
 inside `deploy-phala`). Other refs fail `Deploy refused (main-only)`.
 
 **Release order:** approved #310 must never merge alone. Land #310 and its
-stacked recovery change atomically as one lineage, preserving emergency
-re-promotion and security rollback first. #309's sidecar compose belongs
-only to the later approved logging window, not this workflow/security
-release. The security card remains rollback-not-ready until the combined
-path is reviewed and landed. These docs grant no merge or dispatch authority.
-Merging either workflow change is a push, not a deployment dispatch.
+stacked recovery changes atomically as one lineage, preserving emergency
+re-promotion and security rollback first. #309's sidecar compose then ships
+on the unchanged 1.20.6 image under that lineage's exact raw-hash lock. The
+later main release lands this template lock and the 95m ingress body cap,
+and is promoted by one dispatch (see
+[Main release with N0 log shipping](#main-release-with-n0-log-shipping-one-dispatch)).
+These docs grant no merge or dispatch authority. Merging either workflow
+change is a push, not a deployment dispatch.
 
 ### The `production` environment (TC-971)
 
@@ -152,25 +154,37 @@ not N0-specific or permission to silently reuse old values. Missing
 authorization or missing/unknown authority fails before any compose,
 CVM or whitelist mutation.
 
-`authority=node-override` currently applies the reviewed limits after the
-last restart and required health. Both exact spaces must exist once with
-positive usage in authenticated `/admin/usage`, which lists every space on
-the node unpaginated (~107 bytes a space); the script reads up to 16 MiB of
-it and fails closed above that, while other quota bodies stay capped at
-64 KiB. Before ANY PUT, both billing
-storage-comp reads must prove no active comp: 404 logs only
-`billing storage-comp unavailable`; valid `active:false` also permits the
-legacy restore. Active comp fails `authority mismatch: flip to billing`.
-Auth/5xx/transport/malformed responses fail closed, never count as absence.
-Each PUT requires GET readback of both override and effective values.
+`authority=billing` is current (TC-1162/TC-1164): billing is the quota
+authority for both of Sam's spaces, and the reviewed limits are floors,
+applications `5368709120` and secrets `1073741824` (internal D1
+`quota_overrides`). Billing mode is read-only after the last restart and
+required health: both exact spaces must exist once with positive usage in
+authenticated `/admin/usage`, which lists every space on the node
+unpaginated (~107 bytes a space); the script reads up to 16 MiB of it and
+fails closed above that, while other quota bodies stay capped at 64 KiB.
+It never PUTs/DELETEs a node override. Each
+active absolute per-space `storage_limit_bytes` must cover its floor, and
+node GET must show `override_bytes=null`. Missing, inactive or insufficient
+comps fail `billing authority does not cover both reviewed quota floors`; a
+non-null override fails `stale legacy override`. A cold node cache is not a
+failure: billing is authoritative and the node fetches on the next write
+(≤60 s TTL). Do not compare incremental account `comp_bytes` with absolute
+space limits.
 
-The later reviewed authority flip to `billing` is separate from this PR and
-follows TC-1162 migration. Billing mode never PUTs/DELETEs a node override:
-active absolute per-space `storage_limit_bytes` must cover each reviewed
-floor, and node GET must show `override_bytes=null`. A non-null override
-fails `stale legacy override`. A cold node cache is not a failure: billing
-is authoritative and the node fetches on the next write (≤60 s TTL).
-Do not compare incremental account `comp_bytes` with absolute space limits.
+Ordering rule: the flip to `billing` is merged only after both spaces are
+billing comps with their node overrides cleared, and before any further
+`deploy_phala` dispatch. Merged before that migration, the next dispatch
+restarts the node (wiping its in-memory overrides) and billing-mode
+reconcile then fails without restoring them (no comp covers the floors).
+Left unmerged after the migration, the next dispatch refuses in
+node-override mode with `authority mismatch: flip to billing`.
+Reverting to `authority=node-override` requires a
+reviewed PR. In that legacy mode, before ANY PUT both billing storage-comp
+reads must prove no active comp (404 logs only `billing storage-comp
+unavailable`; valid `active:false` also permits the restore); an active comp
+fails `authority mismatch: flip to billing`. Each PUT requires GET readback
+of both override and effective values. In both modes, auth/5xx/transport/
+malformed responses fail closed and never count as absence.
 No raw response, identity list, credential or error body is logged.
 Any attempted restart without verified reconciliation is fatal
 **OVERRIDES UNVERIFIED**, requiring authorized operator/TC-1161 fallback.
@@ -204,10 +218,13 @@ its branch policy before any workflow that names it runs.
    - `image_version` and recorded labels describe the immutable image,
      never an unrelated current crate version. The revision must be in
      main history. A future non-N0 digest uses this same contract.
-   - The reviewed N0 compose remains raw-hash locked to its exact image;
-     it cannot substitute a future security image. Before the later
-     logging window, the ordinary main `:dstack` compose supports forward
-     image promotions without installing the sidecar.
+   - The reviewed N0 compose is locked as a template: its raw bytes with
+     the single node digest normalized. Only a recorded *released* main
+     image may fill that pin; see
+     [Main release with N0 log shipping](#main-release-with-n0-log-shipping-one-dispatch).
+     Before #309 lands,
+     the ordinary main `:dstack` compose supports forward image
+     promotions without installing the sidecar.
    - `sql_identity_fence=false` is required. The input defaults to `true`,
      which re-fences SQL/DuckDB in production (503s).
    - The production ancestry guard still applies: the revision prod is running
@@ -265,6 +282,72 @@ its branch policy before any workflow that names it runs.
    `gh workflow run write-probe.yml -R TinyCloudLabs/tinycloud-node --ref main -f mode=dense`.
    Details: `test/probe/README.md`.
 
+### Main release with N0 log shipping (one dispatch)
+
+Ships a main release on #309's log sidecar compose. Before dispatching,
+`main` must contain the combined workflow lineage, #309, the template-lock
+change that also raises the ingress `CLIENT_MAX_BODY_SIZE` to `95m`, and the
+merged `chore(release): 1.21.0` commit tagged `v1.21.0`. Take the digest and
+labels of the tag build's `1.21.0-dstack` image as in step 1 above:
+
+```sh
+gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref main \
+  -f deploy_phala=true \
+  -f authorize_quota_values=true \
+  -f image_version=1.21.0 \
+  -f deploy_image_digest=sha256:<release-dstack-digest> \
+  -f rollback_image_version=1.21.0 \
+  -f rollback_image_revision=<release-commit-sha> \
+  -f sql_identity_fence=false
+```
+
+`rollback_image_version` and `rollback_image_revision` name the image being
+**deployed** (here the release), not an image to roll back to. Despite the
+input names, they are the recorded labels of `deploy_image_digest`.
+
+Before any CVM mutation the workflow requires:
+
+- the main compose, with its one node digest replaced by 64 zeros, to hash
+  to the reviewed N0 template
+  **`009382266172b76ae1858aa79060da5f58ece66a758dd8fd876b96367d96e1db`**
+  (raw `b25b8414c784ee7d66d6e3a507d3dba29818aca5cbf339e85bcb667e2316e20d` normalized: the 1.21.0 compose
+  `d95bfb707871c1d626c4a8f2b8d32d354103edbb5077847c6a21fe5f7f6cfa50`, template
+  `51f8e9e9…`, with only the embedded Vector config regenerated for TC-1274's
+  warning codes. That compose is the #349 compose
+  `c33c23021589163b62a71ef245b7194717711922027629f155bdd5cff806b8c7`, which
+  keeps `TINYCLOUD_EPOCH_HEAD_BACKFILL__ENABLED: "false"`, with only
+  `CLIENT_MAX_BODY_SIZE=32m` → `95m`). Ingress, socat, Vector and the log
+  profile stay byte-exact;
+- the deployed compose to differ from that template only by
+  `deploy_image_digest`;
+- OCI labels `1.21.0-dstack` / `<release-commit-sha>`, the `v1.21.0` tag on
+  that commit, its `Cargo.toml` at `1.21.0`, and the commit in main history.
+  An untagged, mislabelled, feature-variant or freshly built image is
+  refused;
+- the release revision to be a **strict descendant** of the revision running
+  in production (read from the CVM's pinned image by the ancestry guard).
+  A downgrade (for example 1.20.5 or 1.0.0), the same revision as running,
+  or an unknown running revision is refused. The same ancestry rule makes
+  the 12c same-image command refuse an image older than the running
+  revision once 1.21.0 is live, so it cannot downgrade across migrations.
+  The captured pre-N0 rollback is the only intentional downgrade route.
+
+Sealed preflight, `BETTERSTACK_SOURCE_TOKEN` sealing with the
+`allowed_envs` sync, and the general quota reconciliation run as on every
+deploy. The template's comment naming 1.20.6 is reviewed text, not image
+identity; `/version` and the labels report the release. Reproduce the
+template hash from any ref:
+
+```sh
+git show main:docker-compose.dstack-postgres.yaml \
+  | sed -E '/^    image: ghcr\.io\/tinycloudlabs\/tinycloud-node@sha256:/s/[0-9a-f]{64}$/0000000000000000000000000000000000000000000000000000000000000000/' \
+  | sha256sum
+```
+
+Rolling this release back means a database snapshot restore (a separate
+decision) plus the [captured pre-N0 rollback](#tc-1302-captured-pre-n0-rollback)
+to 1.20.6 with Sam's explicit privacy mode.
+
 ## Rolling back
 
 Keep the digest, actual OCI version and actual revision of every promoted
@@ -294,15 +377,13 @@ gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref main \
 ```
 
 The served/OCI identity remains **1.20.6-dstack / e18578ff9162986ddd813259c60f73866e3e60d1**.
-The N0 raw lock **changed in #347 (TC-1274)**, which maps the SQL busy, hydration timeout and request deadline warnings in the log sidecar:
-`6e3b96c886774150f8dc159c9fb063d70a74ab15514bf52667e0068ae94fa391`,
-from #347 final reviewed head.
-It supersedes the #346 (TC-959) lock `6563d51bffe4b537d49b0c087a50e86753aaaf5ba533f1e52c7c2214f7f5f04e`,
-which superseded the #309 lock `ca110b0bae6d5a06a1002fb80df3f71cffec11659c9f9dbfa5d72624735546f6`,
-from #309 reviewed head `44eeb20a1461ef66b5af492e3be4c42be2728b67`,
-[approval](https://github.com/TinyCloudLabs/tinycloud-node/pull/309#issuecomment-6224650050).
-Current pre-N0 tag/pinned equivalents are separately hash-checked; arbitrary
-same-image config substitutions fail before mutation.
+With the template lock on main this redeploys exactly main's raw compose
+`b25b8414c784ee7d66d6e3a507d3dba29818aca5cbf339e85bcb667e2316e20d`
+(the 1.21.0 compose `d95bfb70…` with TC-1274's Vector config), whatever digest
+main's template currently pins. It is not a rollback of a
+later release across a schema migration. Current pre-N0 tag/pinned
+equivalents are separately hash-checked; arbitrary same-image config
+substitutions fail before mutation.
 
 ### TC-1302 captured pre-N0 rollback
 
