@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changes
+
+- Every response that carries an `ETag` now also carries `Cache-Control: no-transform` (TC-1432): KV get/head/metadata (200 and 304), KV put, the public KV read routes (200, 304 and metadata), signed-URL reads (200, 206, 304, 416) and the share-email responses that set an `ETag`. A CDN that re-compresses a response must weaken its strong `ETag` to `W/"…"`, and `If-Match` compare-and-swap only accepts the strong `"blake3-<hex>"` value. Existing `Cache-Control` directives (`private, no-cache`, `private, no-store`, `public, max-age=60`, `no-store`) are kept and `no-transform` is appended; responses without an `ETag` (KV list, SQL, error responses including 412) are unchanged. Bodies, `ETag` values and status codes are unchanged.
+
 ## [1.21.0] - 2026-10-18
 
 ### Release notes
