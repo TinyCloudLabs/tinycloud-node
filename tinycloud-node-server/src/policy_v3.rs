@@ -10233,3 +10233,7 @@ mod tests {
 #[cfg(test)]
 #[path = "policy_v3/account_alias_tests.rs"]
 mod account_alias_tests;
+
+#[cfg(test)]
+#[path = "policy_v3/owner_authority_tests.rs"]
+mod owner_authority_tests;
