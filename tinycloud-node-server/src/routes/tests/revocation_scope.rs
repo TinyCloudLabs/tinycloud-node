@@ -1444,9 +1444,10 @@ async fn cid_and_network_control_keeps_each_scope_exact() -> Result<()> {
 }
 
 #[tokio::test]
-async fn network_scope_matches_the_signed_urn_exactly() -> Result<()> {
+async fn network_scope_matches_the_parsed_network_id() -> Result<()> {
     use tinycloud_core::models::actor;
     const CHECKSUM: &str = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
+    const OTHER_ADDRESS: &str = "0x70997970c51812dc3a010c7d01b50e0d17dc79c8";
     let fixture = scoped_fixture().await?;
     let device = fixture.device_did();
     let owner = format!("did:pkh:eip155:1:{CHECKSUM}");
@@ -1455,58 +1456,149 @@ async fn network_scope_matches_the_signed_urn_exactly() -> Result<()> {
     }
     .insert(&fixture.conn)
     .await?;
+    let lower_owner = format!("did:pkh:eip155:1:{}", CHECKSUM.to_lowercase());
     let checksum = network_urn(&owner, "share");
-    let lower = network_urn(
-        &format!("did:pkh:eip155:1:{}", CHECKSUM.to_lowercase()),
-        "share",
-    );
+    let lower = network_urn(&lower_owner, "share");
     let (_, _, key) = registered_key(&fixture).await?;
-    let control_lower = fixture
-        .raw_grant("n4-pkh-control-lower", &owner, &device, &[(&lower, REVOKE)])
-        .await?;
-    let control_checksum = fixture
-        .raw_grant(
-            "n4-pkh-control-checksum",
-            &owner,
-            &device,
-            &[(&checksum, REVOKE)],
+    // Both spellings of the owner's address name the same network.
+    for (label, control_urn, target_urn) in [
+        ("lower-lower", &lower, &lower),
+        ("lower-checksum", &lower, &checksum),
+        ("checksum-lower", &checksum, &lower),
+        ("checksum-checksum", &checksum, &checksum),
+    ] {
+        let control = fixture
+            .raw_grant(
+                &format!("n4-pkh-control-{label}"),
+                &owner,
+                &device,
+                &[(control_urn, REVOKE)],
+            )
+            .await?;
+        let target = fixture
+            .raw_grant(
+                &format!("n4-pkh-root-{label}"),
+                &owner,
+                &key,
+                &[(target_urn, DECRYPT)],
+            )
+            .await?;
+        assert_revoked_ok(
+            &fixture,
+            target,
+            fixture.scoped_revoke_header(target, Some(control))?,
         )
         .await?;
-    let root_lower = fixture
-        .raw_grant("n4-pkh-root-lower", &owner, &key, &[(&lower, DECRYPT)])
+    }
+    // A different network name, owner address or chain id is another network.
+    let control = fixture
+        .raw_grant("n4-pkh-control-share", &owner, &device, &[(&lower, REVOKE)])
         .await?;
-    let root_checksum = fixture
+    for (label, network) in [
+        ("name", network_urn(&lower_owner, "default")),
+        (
+            "address",
+            network_urn(&format!("did:pkh:eip155:1:{OTHER_ADDRESS}"), "share"),
+        ),
+        (
+            "chain",
+            network_urn(
+                &format!("did:pkh:eip155:137:{}", CHECKSUM.to_lowercase()),
+                "share",
+            ),
+        ),
+    ] {
+        let target = fixture
+            .raw_grant(
+                &format!("n4-pkh-other-{label}"),
+                &owner,
+                &key,
+                &[(&network, DECRYPT)],
+            )
+            .await?;
+        fixture
+            .assert_scope_denied(target, fixture.scoped_revoke_header(target, Some(control))?)
+            .await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn network_control_never_covers_an_unrecognized_target_row() -> Result<()> {
+    let fixture = scoped_fixture().await?;
+    let owner = fixture.owner_did();
+    let share = fixture.share_network();
+    let control = fixture.kill_all_control(REVOKE).await?;
+    let (_, _, key) = registered_key(&fixture).await?;
+    let unknown = "urn:example:unknown";
+    // An address that is not 20 bytes: not a network id.
+    let malformed = "urn:tinycloud:encryption:did:pkh:eip155:1:0xabc:share";
+    let with_unknown = fixture
+        .share_root("n4-unknown-row-root", &owner, &key, &share)
+        .await?;
+    add_raw_abilities(&fixture, with_unknown, &[(unknown, DECRYPT)]).await?;
+    let with_malformed = fixture
         .raw_grant(
-            "n4-pkh-root-checksum",
+            "n4-malformed-network-row",
             &owner,
             &key,
-            &[(&checksum, DECRYPT)],
+            &[(&share, DECRYPT), (malformed, DECRYPT)],
         )
         .await?;
-    fixture
-        .assert_scope_denied(
-            root_checksum,
-            fixture.scoped_revoke_header(root_checksum, Some(control_lower))?,
-        )
+    let only_unknown = fixture
+        .raw_grant("n4-only-unknown-row", &owner, &key, &[(unknown, DECRYPT)])
         .await?;
-    fixture
-        .assert_scope_denied(
-            root_lower,
-            fixture.scoped_revoke_header(root_lower, Some(control_checksum))?,
-        )
+    for target in [with_unknown, with_malformed, only_unknown] {
+        fixture
+            .assert_scope_denied(target, fixture.scoped_revoke_header(target, Some(control))?)
+            .await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn control_of_only_unrecognized_rows_is_denied() -> Result<()> {
+    let fixture = scoped_fixture().await?;
+    let owner = fixture.owner_did();
+    let device = fixture.device_did();
+    let share = fixture.share_network();
+    let (_, _, key) = registered_key(&fixture).await?;
+    let (_, _, stranger) = registered_key(&fixture).await?;
+    let elsewhere = fixture
+        .device_grant("n4-junk-elsewhere", &["tinycloud.kv/get"])
         .await?;
-    assert_revoked_ok(
-        &fixture,
-        root_lower,
-        fixture.scoped_revoke_header(root_lower, Some(control_lower))?,
-    )
-    .await?;
-    assert_revoked_ok(
-        &fixture,
-        root_checksum,
-        fixture.scoped_revoke_header(root_checksum, Some(control_checksum))?,
-    )
-    .await
+    let elsewhere_cid = format!("urn:cid:{}", elsewhere.to_cid(0x55));
+    let stranger_share = network_urn(&stranger, "share");
+    let foreign_chain_share = network_urn(
+        "did:pkh:eip155:137:0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+        "share",
+    );
+    let junk = [
+        ("urn:example:junk", REVOKE),
+        (
+            "urn:tinycloud:encryption:did:pkh:eip155:1:0xabc:share",
+            REVOKE,
+        ),
+        (elsewhere_cid.as_str(), REVOKE),
+        (stranger_share.as_str(), REVOKE),
+        (foreign_chain_share.as_str(), REVOKE),
+        (share.as_str(), STATUS),
+    ];
+    let control = fixture
+        .raw_grant("n4-junk-control", &owner, &device, &junk)
+        .await?;
+    let share_grant = fixture
+        .raw_grant("n4-junk-share-target", &owner, &key, &[(&share, DECRYPT)])
+        .await?;
+    let kv_grant = fixture
+        .device_grant("n4-junk-kv-target", &["tinycloud.kv/get"])
+        .await?;
+    for target in [share_grant, kv_grant] {
+        fixture
+            .assert_scope_denied(target, fixture.scoped_revoke_header(target, Some(control))?)
+            .await?;
+    }
+    Ok(())
 }
 
 #[tokio::test]

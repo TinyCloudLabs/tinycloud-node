@@ -292,9 +292,10 @@ enum ControlScope {
     Cid(Hash),
     /// A `<space>/delegation` root of a space the grantor owns.
     Space(SpaceId),
-    /// An encryption network the grantor owns, kept byte-for-byte as signed:
-    /// it covers only target rows that name the network with the same bytes.
-    Network(String),
+    /// An encryption network the grantor owns. Compared as a parsed
+    /// `NetworkId` (canonical owner DID, including chain id, plus name), so
+    /// lowercase and EIP-55 spellings of one network are the same network.
+    Network(NetworkId),
 }
 
 impl ControlScope {
@@ -310,8 +311,9 @@ impl ControlScope {
             Resource::Other(uri) => uri
                 .as_str()
                 .parse::<NetworkId>()
-                .is_ok_and(|network| did_principal_matches(network.owner_did(), grantor))
-                .then(|| Self::Network(uri.as_str().to_string())),
+                .ok()
+                .filter(|network| did_principal_matches(network.owner_did(), grantor))
+                .map(Self::Network),
             Resource::TinyCloud(resource) => (resource.service().as_str() == "delegation"
                 && resource
                     .path()
@@ -327,7 +329,11 @@ impl ControlScope {
     fn covers(&self, resource: &Resource) -> bool {
         match (self, resource) {
             (Self::Space(space), Resource::TinyCloud(resource)) => resource.space() == space,
-            (Self::Network(network), Resource::Other(uri)) => uri.as_str() == network,
+            // A target row that does not parse as a network is never covered.
+            (Self::Network(network), Resource::Other(uri)) => uri
+                .as_str()
+                .parse::<NetworkId>()
+                .is_ok_and(|target| &target == network),
             _ => false,
         }
     }
