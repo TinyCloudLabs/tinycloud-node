@@ -6,6 +6,10 @@
 //!   without a key section (`type = "Auto"`, the default), must boot with the
 //!   provider identity, keep it across restarts, and report it to the
 //!   control plane.
+//! - A node that creates a new identity says so once in its log; a restart
+//!   that loads it does not.
+//! - Auto never creates a local identity where the environment indicates a
+//!   dstack TEE.
 //! - The production key sources must keep resolving the DID they resolve
 //!   today. The DIDs below are pinned from fixed fixture keys; none of them is
 //!   a real node key.
@@ -13,7 +17,7 @@
 use std::{
     fs::{self, File},
     net::TcpListener,
-    path::Path,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
@@ -27,6 +31,10 @@ const SHIPPED_CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../tinycloud.
 const STATIC_SECRET: &str = "VEMtMTQ0MiBzdGF0aWMtZW52IGZpeHR1cmUga2V5ISE";
 /// What the node published for `STATIC_SECRET` before TC-1442's provider fix.
 const STATIC_DID: &str = "did:key:z6Mkocaf9dnjBPLMQpu5jo4mLRMnqTEugbMCMS1zvb6ahrvH";
+
+/// What a node logs when it creates a new identity.
+#[cfg(target_os = "linux")]
+const CREATED: &str = "created a new node identity at ";
 
 struct KillOnDrop(Child);
 
@@ -57,19 +65,38 @@ fn tinycloud(cwd: &Path) -> Command {
     command
 }
 
-/// Start the node and wait until it serves. Returns the running node and the
-/// DID it publishes.
-fn start_node(mut command: Command, logs: &Path) -> (KillOnDrop, String) {
-    let port = free_port();
-    let stderr_path = logs.join(format!("stderr-{port}.log"));
+/// Spawn `command` with stdout and stderr in one new log file under `logs`.
+fn spawn_logged(command: &mut Command, logs: &Path) -> (KillOnDrop, PathBuf) {
+    let log = logs.join(format!("tinycloud-{}.log", uuid::Uuid::new_v4().simple()));
+    let file = File::create(&log).unwrap();
     let child = command
-        .env("TINYCLOUD_ADDRESS", "127.0.0.1")
-        .env("TINYCLOUD_PORT", port.to_string())
-        .stdout(File::create(logs.join(format!("stdout-{port}.log"))).unwrap())
-        .stderr(File::create(&stderr_path).unwrap())
+        .stdout(file.try_clone().unwrap())
+        .stderr(file)
         .spawn()
         .unwrap();
-    let mut server = KillOnDrop(child);
+    (KillOnDrop(child), log)
+}
+
+struct Node {
+    _server: KillOnDrop,
+    did: String,
+    log: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl Node {
+    fn log(&self) -> String {
+        fs::read_to_string(&self.log).unwrap()
+    }
+}
+
+/// Start the node and wait until it serves the DID it publishes.
+fn start_node(mut command: Command, logs: &Path) -> Node {
+    let port = free_port();
+    command
+        .env("TINYCLOUD_ADDRESS", "127.0.0.1")
+        .env("TINYCLOUD_PORT", port.to_string());
+    let (mut server, log) = spawn_logged(&mut command, logs);
 
     let url = format!("http://127.0.0.1:{port}/.well-known/tinycloud/node-keys");
     let client = reqwest::blocking::Client::new();
@@ -78,14 +105,18 @@ fn start_node(mut command: Command, logs: &Path) -> (KillOnDrop, String) {
         if let Some(status) = server.0.try_wait().unwrap() {
             panic!(
                 "tinycloud exited before serving ({status}):\n{}",
-                fs::read_to_string(&stderr_path).unwrap_or_default()
+                fs::read_to_string(&log).unwrap_or_default()
             );
         }
         if let Ok(response) = client.get(&url).send() {
             if response.status().is_success() {
                 let body: serde_json::Value = response.json().unwrap();
                 let did = body["nodeDid"].as_str().unwrap().to_owned();
-                return (server, did);
+                return Node {
+                    _server: server,
+                    did,
+                    log,
+                };
             }
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -109,13 +140,13 @@ fn shipped_config_with_a_static_secret_keeps_its_did() {
     // The container entrypoint: `/tinycloud` with no arguments.
     let mut legacy = tinycloud(dir.path());
     legacy.env("TINYCLOUD_KEYS__SECRET", STATIC_SECRET);
-    assert_eq!(start_node(legacy, dir.path()).1, STATIC_DID);
+    assert_eq!(start_node(legacy, dir.path()).did, STATIC_DID);
 
     let mut serve = tinycloud(dir.path());
     serve
         .args(["serve", "--config", "tinycloud.toml"])
         .env("TINYCLOUD_KEYS__SECRET", STATIC_SECRET);
-    assert_eq!(start_node(serve, dir.path()).1, STATIC_DID);
+    assert_eq!(start_node(serve, dir.path()).did, STATIC_DID);
 }
 
 #[cfg(feature = "dstack")]
@@ -195,7 +226,7 @@ mod dstack {
         legacy
             .env("TINYCLOUD_KEYS_TYPE", "Dstack")
             .env("DSTACK_SIMULATOR_ENDPOINT", &socket);
-        assert_eq!(start_node(legacy, dir.path()).1, DSTACK_DID);
+        assert_eq!(start_node(legacy, dir.path()).did, DSTACK_DID);
 
         let requested = requested.lock();
         assert!(
@@ -209,6 +240,119 @@ mod dstack {
     }
 }
 
+/// Run `command` until it exits. A node still running after 30 s started
+/// serving, which fails the test.
+#[cfg(target_os = "linux")]
+fn run_to_exit(mut command: Command, logs: &Path) -> (Option<i32>, String) {
+    command
+        .env("TINYCLOUD_ADDRESS", "127.0.0.1")
+        .env("TINYCLOUD_PORT", free_port().to_string());
+    let (mut server, log) = spawn_logged(&mut command, logs);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(status) = server.0.try_wait().unwrap() {
+            return (status.code(), fs::read_to_string(&log).unwrap());
+        }
+        assert!(
+            Instant::now() < deadline,
+            "tinycloud kept running instead of refusing:\n{}",
+            fs::read_to_string(&log).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The log says exactly once that the identity at `location` was created.
+#[cfg(target_os = "linux")]
+fn assert_created_once(log: &str, location: &str, did: &str) {
+    let created: Vec<&str> = log.lines().filter(|line| line.contains(CREATED)).collect();
+    assert_eq!(created.len(), 1, "{log}");
+    assert!(
+        created[0].contains(&format!("{location} ({did})")),
+        "{}",
+        created[0]
+    );
+}
+
+/// The container entrypoint with no key configuration and no TEE indicated:
+/// the node creates a local identity, says so once, and loads it on restart.
+/// Linux only: macOS stores the provider key in the keychain.
+#[cfg(target_os = "linux")]
+#[test]
+fn bare_start_without_a_tee_creates_one_identity_and_reloads_it() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let first = start_node(tinycloud(dir.path()), dir.path());
+    assert!(dir.path().join("data/keys/identity.key.enc").exists());
+    assert_created_once(&first.log(), "data/keys/identity.key.enc", &first.did);
+    let did = first.did.clone();
+    drop(first);
+
+    let restart = start_node(tinycloud(dir.path()), dir.path());
+    assert_eq!(restart.did, did);
+    assert!(!restart.log().contains(CREATED), "{}", restart.log());
+}
+
+/// Auto inside an environment that indicates a dstack TEE, with no dstack
+/// socket: the node exits non-zero and creates no identity. Linux only, so a
+/// regression cannot write to a macOS keychain.
+#[cfg(target_os = "linux")]
+#[test]
+fn auto_refuses_to_create_an_identity_where_a_tee_is_indicated() {
+    type Environment = &'static [(&'static str, &'static str)];
+    const MISSING_SOCKET: &str = "/nonexistent/tc-1442/dstack.sock";
+    // (environment, the indication the refusal names). `None`: an existing
+    // path refuses first. Production's own signal, `TINYCLOUD_KEYS_TYPE=Dstack`,
+    // selects dstack keys (or is rejected by a build without dstack), and a
+    // dstack build asks the socket named by `TINYCLOUD_TEE_MODE=dstack`.
+    let cases: [(Environment, Option<&str>); 5] = [
+        (
+            &[("TINYCLOUD_TEE__MODE", "Dstack")],
+            Some("tee.mode = \"Dstack\""),
+        ),
+        (
+            &[
+                ("TINYCLOUD_TEE_MODE", "dstack"),
+                ("TINYCLOUD_TEE__MODE", "Dstack"),
+            ],
+            (!cfg!(feature = "dstack")).then_some("TINYCLOUD_TEE_MODE=dstack"),
+        ),
+        (
+            &[
+                ("TINYCLOUD_KEYS_TYPE", "Dstack"),
+                ("TINYCLOUD_KEYS__TYPE", "auto"),
+            ],
+            Some("TINYCLOUD_KEYS_TYPE=Dstack"),
+        ),
+        (
+            &[("DSTACK_SIMULATOR_ENDPOINT", MISSING_SOCKET)],
+            Some("DSTACK_SIMULATOR_ENDPOINT"),
+        ),
+        (&[("TINYCLOUD_KEYS_TYPE", "Dstack")], None),
+    ];
+    for (env, indication) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let mut bare = tinycloud(dir.path());
+        bare.envs(env.iter().copied());
+        let (code, log) = run_to_exit(bare, dir.path());
+
+        assert!(
+            matches!(code, Some(code) if code != 0),
+            "{env:?}: {code:?}\n{log}"
+        );
+        assert!(!dir.path().join("data/keys").exists(), "{env:?}\n{log}");
+        assert!(!log.contains(CREATED), "{env:?}\n{log}");
+        assert!(log.to_lowercase().contains("dstack"), "{env:?}\n{log}");
+        if let Some(indication) = indication {
+            assert!(
+                log.contains(&format!(
+                    "refusing to create a new node identity: {indication} indicates a dstack TEE"
+                )),
+                "{env:?}\n{log}"
+            );
+        }
+    }
+}
 #[cfg(target_os = "linux")]
 #[test]
 fn installed_provider_config_serves_a_stable_identity() {
@@ -273,9 +417,13 @@ fn installed_node_serves_a_stable_identity(edit: fn(String) -> String) {
         command
     };
 
-    // First boot generates the identity; the control plane must report it.
-    let (server, did) = start_node(serve(), dir.path());
+    // First boot generates the identity, says so once, and the control plane
+    // reports it.
+    let identity = home.join("xdg-data/tinycloud-node/keys/identity.key.enc");
+    let first = start_node(serve(), dir.path());
+    let did = first.did.clone();
     assert!(did.starts_with("did:key:"), "{did}");
+    assert_created_once(&first.log(), &identity.display().to_string(), &did);
     let status = user_command()
         .args(["node", "status", "--json"])
         .output()
@@ -288,8 +436,10 @@ fn installed_node_serves_a_stable_identity(edit: fn(String) -> String) {
     let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
     assert_eq!(status["identityReady"], true, "{status}");
     assert_eq!(status["nodeDid"].as_str(), Some(did.as_str()), "{status}");
-    drop(server);
+    drop(first);
 
     // A restart loads the stored identity instead of making a new one.
-    assert_eq!(start_node(serve(), dir.path()).1, did);
+    let restart = start_node(serve(), dir.path());
+    assert_eq!(restart.did, did);
+    assert!(!restart.log().contains(CREATED), "{}", restart.log());
 }

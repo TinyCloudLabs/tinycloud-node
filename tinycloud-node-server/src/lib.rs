@@ -555,27 +555,28 @@ pub async fn app_with_control(
         tc_bench_health,
     ]);
 
-    let key_setup: StaticSecret = match resolve_keys(&tinycloud_config.keys).await? {
-        Some(key_setup) => key_setup,
-        None => {
-            // The node's stored identity, generated on its first start. The
-            // control plane only probed it at spawn, so publish what serve
-            // resolved.
-            let identity = key_provider::resolve_identity_state(
-                Some(&tinycloud_config.keys),
-                &tinycloud_config.storage.datadir,
-                IdentityPurpose::Serve,
-            )?;
-            if let Some(control) = control.as_ref() {
-                control
-                    .set_identity_snapshot(key_provider::identity_snapshot(&identity))
-                    .await;
+    let key_setup: StaticSecret =
+        match resolve_keys(&tinycloud_config.keys, &tinycloud_config.tee).await? {
+            Some(key_setup) => key_setup,
+            None => {
+                // The node's stored identity, generated on its first start. The
+                // control plane only probed it at spawn, so publish what serve
+                // resolved.
+                let identity = key_provider::resolve_identity_state(
+                    Some(&tinycloud_config.keys),
+                    &tinycloud_config.storage.datadir,
+                    IdentityPurpose::Serve,
+                )?;
+                if let Some(control) = control.as_ref() {
+                    control
+                        .set_identity_snapshot(key_provider::identity_snapshot(&identity))
+                        .await;
+                }
+                identity
+                    .secret
+                    .ok_or_else(|| anyhow::anyhow!("node identity is not ready"))?
             }
-            identity
-                .secret
-                .ok_or_else(|| anyhow::anyhow!("node identity is not ready"))?
-        }
-    };
+        };
     let pseudonymizer =
         std::sync::Arc::new(tinycloud_core::telemetry::Pseudonymizer::new(&key_setup));
     let tracing_fairing = tracing::TracingFairing::new(
@@ -1229,8 +1230,14 @@ async fn run_retention_sweep<C: tinycloud_core::sea_orm::ConnectionTrait>(
 }
 
 /// The node key from a Static or dstack key source. `None` means the key is
-/// the node's stored identity: provider keys, and Auto outside a TEE.
-pub(crate) async fn resolve_keys(keys: &Keys) -> Result<Option<StaticSecret>> {
+/// the node's stored identity: provider keys, and Auto outside a TEE. Auto
+/// refuses when the environment indicates a dstack TEE but no dstack key is
+/// available, so a TEE node never silently gets a new local DID.
+/// `TINYCLOUD_TEE_MODE=off` is checked first and opts out of TEE detection.
+pub(crate) async fn resolve_keys(
+    keys: &Keys,
+    tee: &config::TeeConfig,
+) -> Result<Option<StaticSecret>> {
     match keys {
         Keys::Static(s) => Ok(Some(s.clone().try_into()?)),
         #[cfg(feature = "dstack")]
@@ -1261,11 +1268,45 @@ pub(crate) async fn resolve_keys(keys: &Keys) -> Result<Option<StaticSecret>> {
                             anyhow::anyhow!("dstack key too short: {} bytes", v.len())
                         });
                     }
+                    if let Some(hint) = dstack_indication(tee) {
+                        anyhow::bail!(
+                            "refusing to create a new node identity: {hint} indicates a dstack TEE, \
+                             but no dstack key is available (socket {}{}). Start the node with its \
+                             dstack socket, or remove {hint} if this host is not a TEE.",
+                            dstack::socket_path(),
+                            if cfg!(feature = "dstack") {
+                                ""
+                            } else {
+                                "; this build has no dstack support"
+                            },
+                        );
+                    }
                     Ok(None)
                 }
             }
         }
         Keys::Provider => Ok(None),
+    }
+}
+
+/// Why the environment looks like a dstack deployment, if it does: the TEE
+/// mode the node reads, the key type dstack deployments set, an explicit
+/// dstack socket, or a dstack socket this build cannot use.
+fn dstack_indication(tee: &config::TeeConfig) -> Option<&'static str> {
+    let env_is_dstack =
+        |name: &str| std::env::var(name).is_ok_and(|value| value.eq_ignore_ascii_case("dstack"));
+    if env_is_dstack("TINYCLOUD_TEE_MODE") {
+        Some("TINYCLOUD_TEE_MODE=dstack")
+    } else if tee.mode == config::TeeMode::Dstack {
+        Some("tee.mode = \"Dstack\"")
+    } else if env_is_dstack("TINYCLOUD_KEYS_TYPE") || env_is_dstack("TINYCLOUD_KEYS__TYPE") {
+        Some("TINYCLOUD_KEYS_TYPE=Dstack")
+    } else if std::env::var_os("DSTACK_SIMULATOR_ENDPOINT").is_some() {
+        Some("DSTACK_SIMULATOR_ENDPOINT")
+    } else if dstack::is_available() {
+        Some("the dstack socket")
+    } else {
+        None
     }
 }
 
