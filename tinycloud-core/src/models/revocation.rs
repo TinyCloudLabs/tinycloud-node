@@ -1,4 +1,5 @@
 use super::super::{events::Revocation, models::*, relationships::*};
+use crate::encryption_network::NetworkId;
 use crate::hash::{hash, Hash};
 use crate::models::did_resolution::{verify_ucan_signature, UcanVerifyError};
 use crate::types::Resource;
@@ -13,6 +14,7 @@ use time::OffsetDateTime;
 use tinycloud_auth::{
     authorization::{Cid, TinyCloudRevocation},
     identity::did_principal_matches,
+    resource::SpaceId,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
@@ -281,21 +283,70 @@ pub(crate) enum ControlProofDecision {
     Denied,
 }
 
+/// One resource of a control grant, typed when the grant is loaded. Rows
+/// that are none of these are dropped, so no other resource can ever widen
+/// a control.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ControlScope {
+    /// Exactly `urn:cid:<target>`.
+    Cid(Hash),
+    /// A `<space>/delegation` root of a space the grantor owns.
+    Space(SpaceId),
+    /// An encryption network the grantor owns, kept byte-for-byte as signed:
+    /// it covers only target rows that name the network with the same bytes.
+    Network(String),
+}
+
+impl ControlScope {
+    /// `target_resource` is `urn:cid:<target>`.
+    fn parse(
+        resource: &Resource,
+        target: &Hash,
+        target_resource: &str,
+        grantor: &str,
+    ) -> Option<Self> {
+        match resource {
+            Resource::Other(uri) if uri.as_str() == target_resource => Some(Self::Cid(*target)),
+            Resource::Other(uri) => uri
+                .as_str()
+                .parse::<NetworkId>()
+                .is_ok_and(|network| did_principal_matches(network.owner_did(), grantor))
+                .then(|| Self::Network(uri.as_str().to_string())),
+            Resource::TinyCloud(resource) => (resource.service().as_str() == "delegation"
+                && resource
+                    .path()
+                    .map(|path| path.as_str().is_empty())
+                    .unwrap_or(true)
+                && resource.query().is_none()
+                && resource.fragment().is_none()
+                && did_principal_matches(resource.space().did().as_str(), grantor))
+            .then(|| Self::Space(resource.space().clone())),
+        }
+    }
+
+    fn covers(&self, resource: &Resource) -> bool {
+        match (self, resource) {
+            (Self::Space(space), Resource::TinyCloud(resource)) => resource.space() == space,
+            (Self::Network(network), Resource::Other(uri)) => uri.as_str() == network,
+            _ => false,
+        }
+    }
+}
+
 /// A current control grant bound to one requested target. Keep its complete
-/// resources: owning a space does not make a space-scoped grant account-wide.
+/// typed scopes: owning a space or network does not make a grant that names
+/// it account-wide.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ScopedControl {
     action: ControlAction,
     target: Hash,
     grantor: String,
-    abilities: Vec<abilities::Model>,
+    scopes: Vec<ControlScope>,
 }
 
 impl ScopedControl {
     fn has_cid_scope(&self) -> bool {
-        self.abilities
-            .iter()
-            .any(|ability| matches!(ability.resource, Resource::Other(_)))
+        self.scopes.contains(&ControlScope::Cid(self.target))
     }
 
     /// Check the grantor's direct party authority within an exact-CID grant.
@@ -309,8 +360,9 @@ impl ScopedControl {
             && self.action.party_may_act(delegation, &self.grantor)
     }
 
-    /// Require exact-CID authority or coverage of every target capability's
-    /// complete SpaceId. Space grants cannot cover missing/non-space resources.
+    /// Require exact-CID authority, or coverage of every target row: a space
+    /// row by its complete SpaceId, a network row by the identical network.
+    /// No other resource is ever covered.
     pub(crate) fn authorizes_target(
         &self,
         target: &Hash,
@@ -320,27 +372,22 @@ impl ScopedControl {
         if self.target != *target {
             return false;
         }
-        if self.has_cid_scope() {
-            // Exact-CID scope is checked before this value is constructed.
-            // Its issuer must still have direct authority over that target.
-            return self.directly_authorizes_cid(target, delegation)
+        // Its issuer must still have direct authority over an exact-CID target.
+        if self.has_cid_scope()
+            && (self.directly_authorizes_cid(target, delegation)
                 || target_abilities.iter().any(|ability| {
                     ability.resource.space().is_some_and(|space| {
                         did_principal_matches(space.did().as_str(), &self.grantor)
                     })
-                });
+                }))
+        {
+            return true;
         }
         !target_abilities.is_empty()
             && target_abilities.iter().all(|target_ability| {
-                let Some(target_space) = target_ability.resource.space() else {
-                    return false;
-                };
-                self.abilities.iter().any(|control| {
-                    matches!(
-                        &control.resource,
-                        Resource::TinyCloud(resource) if resource.space() == target_space
-                    )
-                })
+                self.scopes
+                    .iter()
+                    .any(|scope| scope.covers(&target_ability.resource))
             })
     }
 }
@@ -388,33 +435,30 @@ pub(crate) async fn control_proof_decision<C: ConnectionTrait>(
         }
     }
 
-    let mut control_abilities = abilities::Entity::find()
+    let target_resource = format!("urn:cid:{}", target.to_cid(0x55));
+    let scopes: Vec<ControlScope> = abilities::Entity::find()
         .filter(abilities::Column::Delegation.eq(proof_id))
         .filter(abilities::Column::Ability.eq(action.ability()))
         .all(db)
-        .await?;
-    let target_resource = format!("urn:cid:{}", target.to_cid(0x55));
-    control_abilities.retain(|ability| match &ability.resource {
-        Resource::Other(resource) => resource.as_str() == target_resource,
-        Resource::TinyCloud(resource) => {
-            resource.service().as_str() == "delegation"
-                && resource
-                    .path()
-                    .map(|path| path.as_str().is_empty())
-                    .unwrap_or(true)
-                && resource.query().is_none()
-                && resource.fragment().is_none()
-                && did_principal_matches(resource.space().did().as_str(), &parent.delegator)
-        }
-    });
-    if control_abilities.is_empty() {
+        .await?
+        .iter()
+        .filter_map(|ability| {
+            ControlScope::parse(
+                &ability.resource,
+                target,
+                &target_resource,
+                &parent.delegator,
+            )
+        })
+        .collect();
+    if scopes.is_empty() {
         return Ok(ControlProofDecision::Denied);
     }
     Ok(ControlProofDecision::Scoped(ScopedControl {
         action,
         target: *target,
         grantor: parent.delegator,
-        abilities: control_abilities,
+        scopes,
     }))
 }
 

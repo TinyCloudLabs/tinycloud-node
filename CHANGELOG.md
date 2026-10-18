@@ -5,6 +5,7 @@
 ### Changes
 
 - `POST /revoke` authorizes the delegation's issuer, the owner of a space its abilities target, or the holder of a revoke control grant issued by one of them. The delegatee alone is no longer an authorized revoker, directly or through a control grant it issued; an intermediate delegator still revokes the delegations it issued. Delegation status visibility is unchanged (TC-1436).
+- Revoke and status control grants may name an encryption network (`urn:tinycloud:encryption:<owner>:<name>`) owned by the control's grantor. Each resource of a control is typed as an exact `urn:cid:<target>`, a `<space>/delegation` root, or a network; any other resource is ignored. A control covers a target only when every one of the target's resources is covered: a space resource by a named space, a network resource by the same network URN, byte for byte as signed (an EIP-55 checksummed and a lowercase address are different URNs here). A control that names a network never counts as an exact-CID control, and a network named by a control issued by someone other than its owner is ignored. A control such as `<applications>/delegation` + `<default>/delegation` + `<owner>:share` therefore revokes or reads the status of share roots that carry `:share` decrypt, but not grants on `:default` or any other network (TC-1423).
 
 ## [1.21.0] - 2026-10-18
 
