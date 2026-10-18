@@ -57,7 +57,8 @@ off the request: the selection runs as of its registration time (delegations
 issued after it are not considered; UCANs carry no issue time and stay
 eligible), then one transaction inserts the binding row first and its closure
 after it. A concurrent writer that stored a row first wins. One task runs per
-policy at a time. If the write fails (lock timeout, SQLite busy) or the result
+policy, and at most three in the whole process; a use that finds no free slot
+starts none (a later use does). If the write fails (lock timeout, SQLite busy) or the result
 is `starved`, the row stays pending and the request path doesn't start another
 attempt for 60 seconds. Policies whose stored classification is final are
 remembered in process (bounded), so steady-state reads add no query. An
