@@ -4643,9 +4643,10 @@ impl SourceNetworkRefusal {
     }
 }
 
-/// TC-1423 N1b: every encryption network a new policy names (the content
-/// source's and every `encryption` ceiling entry) must belong to the owner of
-/// the content source's space and be active on this node.
+/// TC-1423 N1b: the encryption networks a policy names (the content source's
+/// and every `encryption` ceiling entry), when every one parses and belongs to
+/// the owner of the content source's space; otherwise why not. Pure, so it
+/// applies to stored registrations as well as new ones.
 ///
 /// A DID is root authority over every network URN that names it, created or
 /// not. Without this check, a registrant holding only kv on the content could
@@ -4655,24 +4656,19 @@ impl SourceNetworkRefusal {
 ///
 /// The owner is the space's DID (`ResourceId::space().did()`), compared with
 /// `did_principal_matches`: EIP-55 letter case is ignored, the chain id is
-/// not. Existence and state use the row key and the `active` rule that
-/// decrypt uses. `tinycloud://` sources name no space owner, and no client
-/// emits them, so new registrations refuse them.
-async fn source_network_refusal<C: ConnectionTrait>(
-    conn: &C,
-    policy: &Value,
-) -> Result<Option<SourceNetworkRefusal>, (Status, String)> {
+/// not. `tinycloud://` sources name no space owner, and no client emits them.
+fn content_owner_networks(policy: &Value) -> Result<Vec<NetworkId>, SourceNetworkRefusal> {
     let source = policy.get("contentSource");
     let kv_resource = source
         .and_then(|source| source.get("kvResource"))
         .and_then(Value::as_str)
-        .ok_or((Status::BadRequest, "content-source-invalid".into()))?;
+        .unwrap_or_default();
     if kv_resource.starts_with("tinycloud://") {
-        return Ok(Some(SourceNetworkRefusal::LegacyResource));
+        return Err(SourceNetworkRefusal::LegacyResource);
     }
     let resource = kv_resource
         .parse::<ResourceId>()
-        .map_err(|_| (Status::BadRequest, "kv-resource-invalid".into()))?;
+        .map_err(|_| SourceNetworkRefusal::Unparsable)?;
     let content_owner = resource.space().did();
     let ceiling_networks = policy
         .get("capabilityCeiling")
@@ -4681,17 +4677,36 @@ async fn source_network_refusal<C: ConnectionTrait>(
         .flatten()
         .filter(|capability| capability.get("kind").and_then(Value::as_str) == Some("encryption"))
         .map(|capability| capability.get("resource"));
-    let networks = std::iter::once(source.and_then(|source| source.get("encryptionNetwork")))
+    std::iter::once(source.and_then(|source| source.get("encryptionNetwork")))
         .chain(ceiling_networks)
         .map(|network| network.and_then(Value::as_str))
-        .collect::<std::collections::BTreeSet<_>>();
-    for network in networks {
-        let Some(network_id) = network.and_then(|network| network.parse::<NetworkId>().ok()) else {
-            return Ok(Some(SourceNetworkRefusal::Unparsable));
-        };
-        if !did_principal_matches(network_id.owner_did(), content_owner.as_str()) {
-            return Ok(Some(SourceNetworkRefusal::ForeignOwner));
-        }
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .map(|network| {
+            let network_id = network
+                .and_then(|network| network.parse::<NetworkId>().ok())
+                .ok_or(SourceNetworkRefusal::Unparsable)?;
+            if did_principal_matches(network_id.owner_did(), content_owner.as_str()) {
+                Ok(network_id)
+            } else {
+                Err(SourceNetworkRefusal::ForeignOwner)
+            }
+        })
+        .collect()
+}
+
+/// [`content_owner_networks`], and each network exists on this node in state
+/// `active`: the row key and the rule decrypt uses. A policy on any other
+/// network could never be opened here.
+async fn source_network_refusal<C: ConnectionTrait>(
+    conn: &C,
+    policy: &Value,
+) -> Result<Option<SourceNetworkRefusal>, (Status, String)> {
+    let networks = match content_owner_networks(policy) {
+        Ok(networks) => networks,
+        Err(refusal) => return Ok(Some(refusal)),
+    };
+    for network_id in networks {
         let Some(row) = encryption_network_model::Entity::find_by_id(network_id.to_string())
             .one(conn)
             .await
