@@ -400,7 +400,7 @@ lazy_static! {
 }
 
 /// Authority lifetime at registration: `le_1h` (released Share, signed by a
-/// login session), `le_30d` (CLI device sessions), `gt_30d`, or `none`.
+/// login session), `le_30d` (CLI device sessions) or `gt_30d`.
 pub fn observe_policy_owner_authority_expiry_exceeded(bucket: &'static str) {
     POLICY_OWNER_AUTHORITY_EXPIRY_EXCEEDED
         .with_label_values(&[bucket])

@@ -86,11 +86,11 @@ The fallback when the metrics aren't scraped. `registered_at`, `expires_at`
 and `authority_expires_at` are RFC 3339 UTC text.
 
 Q1, the `enforce` flip signal, by authority lifetime (`le_1h`: released Share
-signing with a login session; `le_30d`: CLI device sessions):
+signing with a login session; `le_30d`: CLI device sessions). A
+`bound-uncapped` row always has an authority expiry:
 
 ```sql
-SELECT CASE WHEN b.authority_expires_at IS NULL THEN 'none'
-            WHEN b.authority_expires_at::timestamptz - r.registered_at::timestamptz <= interval '1 hour' THEN 'le_1h'
+SELECT CASE WHEN b.authority_expires_at::timestamptz - r.registered_at::timestamptz <= interval '1 hour' THEN 'le_1h'
             WHEN b.authority_expires_at::timestamptz - r.registered_at::timestamptz <= interval '30 days' THEN 'le_30d'
             ELSE 'gt_30d' END AS authority_ttl_bucket,
        count(*), count(DISTINCT r.owner_did)
