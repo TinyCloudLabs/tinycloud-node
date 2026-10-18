@@ -178,6 +178,42 @@ mod tests {
     }
 
     #[test]
+    fn epoch_head_backfill_enabled_reads_only_the_double_underscore_key() {
+        let _lock = lock_env();
+        let single = "TINYCLOUD_EPOCH_HEAD_BACKFILL_ENABLED";
+        let double = "TINYCLOUD_EPOCH_HEAD_BACKFILL__ENABLED";
+        let rate = "TINYCLOUD_EPOCH_HEAD_BACKFILL__SPACES_PER_SECOND";
+        let extract = || {
+            build_config_figment()
+                .extract::<config::Config>()
+                .expect("config should parse")
+                .epoch_head_backfill
+        };
+
+        let _s = EnvVarGuard::unset(single);
+        let _d = EnvVarGuard::unset(double);
+        let _r = EnvVarGuard::unset(rate);
+        assert!(extract().enabled, "backfill is on by default");
+
+        // The production compose sets this key (TC-1274).
+        let _d = EnvVarGuard::set(double, "false");
+        assert!(!extract().enabled);
+        drop(_d);
+
+        // The trap: a single underscore is a silent no-op.
+        let _s = EnvVarGuard::set(single, "false");
+        assert!(
+            extract().enabled,
+            "single-underscore form must not disable it"
+        );
+        drop(_s);
+
+        // The key the later ramp tunes.
+        let _r = EnvVarGuard::set(rate, "7");
+        assert_eq!(extract().spaces_per_second, 7);
+    }
+
+    #[test]
     fn canonical_double_underscore_loads_storage_database() {
         let _lock = lock_env();
         let _legacy = EnvVarGuard::unset("TINYCLOUD_STORAGE_DATABASE");
