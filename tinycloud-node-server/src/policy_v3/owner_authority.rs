@@ -619,8 +619,6 @@ pub(super) struct OwnerAuthorityState {
     configured_cutover: Option<OffsetDateTime>,
     expiry: OwnerAuthorityExpiry,
     migration_cutover: tokio::sync::OnceCell<OffsetDateTime>,
-    #[cfg(test)]
-    pub(super) fail_lazy_writes: std::sync::atomic::AtomicBool,
 }
 
 enum LazyWrite {
@@ -805,14 +803,6 @@ impl PolicyV3Runtime {
         mode: RegisteredMode,
         stale: bool,
     ) -> LazyWrite {
-        #[cfg(test)]
-        if self
-            .owner_authority
-            .fail_lazy_writes
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            return LazyWrite::Failed;
-        }
         let _writer = match &self.sqlite_writer_lock {
             Some(lock) => match tokio::time::timeout(LAZY_WRITE_LOCK_WAIT, lock.lock()).await {
                 Ok(guard) => Some(guard),
