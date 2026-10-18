@@ -431,6 +431,8 @@ pub(super) struct Harness {
 pub(super) struct Boot {
     /// The `[policy_v3]` section, passed through figment.
     pub policy_v3: Option<Value>,
+    /// The `[hooks]` section, passed through figment.
+    pub hooks: Option<Value>,
 }
 
 impl Harness {
@@ -533,6 +535,9 @@ impl Harness {
         .merge(Serialized::defaults(&config));
         if let Some(policy_v3) = &boot.policy_v3 {
             figment = figment.merge(Serialized::default("policy_v3", policy_v3));
+        }
+        if let Some(hooks) = &boot.hooks {
+            figment = figment.merge(Serialized::default("hooks", hooks));
         }
         let config: crate::config::Config = figment.extract()?;
         Ok(Client::tracked(crate::app_with_control(&figment, &config, None).await?).await?)
@@ -660,12 +665,24 @@ impl Harness {
     }
 
     fn requested(&self) -> Vec<Value> {
-        vec![json!({
+        vec![self.requested_kv(), self.requested_decrypt()]
+    }
+
+    fn requested_kv(&self) -> Value {
+        json!({
             "kind": "kv",
             "resource": self.content_resource.to_string(),
             "selector": "exact",
             "actions": [KV_GET],
-        })]
+        })
+    }
+
+    fn requested_decrypt(&self) -> Value {
+        json!({
+            "kind": "encryption",
+            "resource": self.network,
+            "action": DECRYPT,
+        })
     }
 
     /// Register a policy over the content whose roots span `root`, signed
@@ -999,7 +1016,7 @@ impl Harness {
         let s0 = decode_delegation(session).map_err(|(_, error)| anyhow::anyhow!(error))?;
         let invocation = self.holder.invoke(
             serde_json::from_value(
-                attenuation_for_policy_capabilities(&self.requested())
+                attenuation_for_policy_capabilities(&[self.requested_kv()])
                     .map_err(|(_, error)| anyhow::anyhow!(error))?,
             )?,
             s0.content_hash().to_cid(0x55),
@@ -1186,6 +1203,7 @@ fn legacy_boot() -> Boot {
         policy_v3: Some(json!({
             "legacy_cutover": format_time(now() + Duration::days(1)),
         })),
+        ..Boot::default()
     }
 }
 
@@ -1953,6 +1971,7 @@ async fn rollback_and_reupgrade_respect_the_configured_cutover(
     );
     h.reboot(Boot {
         policy_v3: Some(json!({"legacy_cutover": format_time(cutover)})),
+        ..Boot::default()
     })
     .await?;
     assert_eq!(
@@ -2109,6 +2128,7 @@ async fn insert_synthetic(
 fn boot(policy_v3: Value) -> Boot {
     Boot {
         policy_v3: Some(policy_v3),
+        ..Boot::default()
     }
 }
 
@@ -2431,3 +2451,837 @@ async fn post_cutover_rows_outliving_their_authority_are_unknown_under_enforce(
     Ok(())
 }
 on_both_backends!(post_cutover_rows_outliving_their_authority_are_unknown_under_enforce);
+
+// ---------------------------------------------------------------------------
+// N3: the recorded owner authority is checked whenever a policy is used.
+// ---------------------------------------------------------------------------
+
+const REVOKED: &str = "policy-owner-authority-revoked";
+
+/// A recipient body must not name any CID or DID.
+fn assert_opaque(label: &str, body: &str) {
+    assert!(
+        !body.contains("bafy") && !body.contains("bafk") && !body.contains("did:"),
+        "{label} leaks an identifier: {body}"
+    );
+}
+
+fn session_cid(session: &str) -> anyhow::Result<Cid> {
+    Ok(decode_delegation(session)
+        .map_err(|(_, error)| anyhow::anyhow!(error))?
+        .content_hash()
+        .to_cid(0x55))
+}
+
+fn text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+impl Harness {
+    /// The holder decrypts through the network route under a session.
+    pub async fn decrypt(&self, session: &str) -> anyhow::Result<(Status, String)> {
+        let invocation = self.holder.invoke(
+            serde_json::from_value(
+                attenuation_for_policy_capabilities(&[self.requested_decrypt()])
+                    .map_err(|(_, error)| anyhow::anyhow!(error))?,
+            )?,
+            session_cid(session)?,
+        )?;
+        let response = self
+            .client
+            .post(format!("/encryption/networks/{}/decrypt", self.network))
+            .header(ContentType::JSON)
+            .header(Header::new("Authorization", invocation))
+            .body("{}")
+            .dispatch()
+            .await;
+        let status = response.status();
+        Ok((status, response.into_string().await.unwrap_or_default()))
+    }
+
+    /// The holder re-shares a session to a fresh reader; returns the reader
+    /// and the child CID.
+    pub async fn reshare(
+        &self,
+        session: &str,
+    ) -> anyhow::Result<(Status, String, Signer, Option<Cid>)> {
+        let s0 = decode_delegation(session).map_err(|(_, error)| anyhow::anyhow!(error))?;
+        let reader = Signer::key();
+        let mut facts = match &s0.0.delegation {
+            TinyCloudDelegation::Ucan(ucan) => ucan.payload().facts.clone().unwrap(),
+            TinyCloudDelegation::Cacao(_) => unreachable!(),
+        };
+        facts[0]["remainingRedelegationDepth"] = json!(7);
+        let Signer::Key { jwk, vm, .. } = &self.holder else {
+            unreachable!()
+        };
+        let child = Payload {
+            issuer: vm.parse()?,
+            audience: reader.did().parse()?,
+            not_before: Some(NumericDate::try_from_seconds(
+                (s0.0.not_before.unwrap() + Duration::milliseconds(1)).unix_timestamp_nanos()
+                    as f64
+                    / 1_000_000_000.0,
+            )?),
+            expiration: NumericDate::try_from_seconds(
+                (s0.0.expiry.unwrap() - Duration::seconds(1)).unix_timestamp_nanos() as f64
+                    / 1_000_000_000.0,
+            )?,
+            nonce: Some(unique("tc1423child")),
+            facts: Some(facts),
+            proof: vec![s0.content_hash().to_cid(0x55)],
+            attenuation: serde_json::from_value(
+                attenuation_for_policy_capabilities(&[self.requested_kv()])
+                    .map_err(|(_, error)| anyhow::anyhow!(error))?,
+            )?,
+        }
+        .sign(Algorithm::EdDSA, jwk)?;
+        let (status, body) = self
+            .delegate(TinyCloudDelegation::Ucan(Box::new(child)).encode()?)
+            .await;
+        let cid = (status == Status::Ok)
+            .then(|| serde_json::from_str::<Value>(&body).ok())
+            .flatten()
+            .and_then(|value| value["cid"].as_str().and_then(|cid| cid.parse().ok()));
+        Ok((status, body, reader, cid))
+    }
+
+    /// `reader` reads under the re-shared child `child`.
+    pub async fn read_as(&self, reader: &Signer, child: Cid) -> anyhow::Result<(Status, String)> {
+        let invocation = reader.invoke(
+            serde_json::from_value(
+                attenuation_for_policy_capabilities(&[self.requested_kv()])
+                    .map_err(|(_, error)| anyhow::anyhow!(error))?,
+            )?,
+            child,
+        )?;
+        let response = self
+            .client
+            .post("/invoke")
+            .header(Header::new("Authorization", invocation))
+            .dispatch()
+            .await;
+        let status = response.status();
+        Ok((
+            status,
+            text(&response.into_bytes().await.unwrap_or_default()),
+        ))
+    }
+
+    /// The holder asks for a signed KV URL under a session.
+    pub async fn signed_kv(&self, session: &str) -> anyhow::Result<(Status, String)> {
+        let invocation = self.holder.invoke(
+            serde_json::from_value(
+                attenuation_for_policy_capabilities(&[self.requested_kv()])
+                    .map_err(|(_, error)| anyhow::anyhow!(error))?,
+            )?,
+            session_cid(session)?,
+        )?;
+        let path = self
+            .content_resource
+            .path()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        let response = self
+            .client
+            .post("/signed/kv")
+            .header(ContentType::JSON)
+            .header(Header::new("Authorization", invocation))
+            .body(json!({"space": self.content_space.to_string(), "path": path}).to_string())
+            .dispatch()
+            .await;
+        let status = response.status();
+        Ok((status, response.into_string().await.unwrap_or_default()))
+    }
+
+    /// `/delegation/status` on `cid`, invoked by `signer`.
+    pub async fn delegation_status(&self, signer: &Signer, cid: &str) -> anyhow::Result<Value> {
+        let Signer::Key { jwk, vm, did, .. } = signer else {
+            anyhow::bail!("status is invoked by keys");
+        };
+        let at = now();
+        let invocation = Payload {
+            issuer: vm.parse()?,
+            audience: did.parse()?,
+            not_before: Some(seconds(at)?),
+            expiration: seconds(at + Duration::seconds(30))?,
+            nonce: Some(unique("tc1423status")),
+            facts: Some(Vec::<Value>::new()),
+            proof: Vec::new(),
+            attenuation: capabilities(&[(
+                format!("urn:cid:{cid}"),
+                "tinycloud.delegation/status",
+            )])?,
+        }
+        .sign(Algorithm::EdDSA, jwk)?
+        .encode()?;
+        let response = self
+            .client
+            .post("/delegation/status")
+            .header(ContentType::JSON)
+            .header(Header::new("Authorization", invocation))
+            .body(json!({"cid": cid}).to_string())
+            .dispatch()
+            .await;
+        Ok(response.into_json().await.unwrap_or(Value::Null))
+    }
+
+    pub async fn root_status(&self, root_cid: &str) -> Value {
+        self.client
+            .get(format!("/policy/v3/status/{root_cid}"))
+            .dispatch()
+            .await
+            .into_json()
+            .await
+            .unwrap_or(Value::Null)
+    }
+}
+
+/// [1][4][8][11] Revoking the owner's grant ends already-admitted sessions:
+/// read, decrypt, a re-shared child, challenge, mint, signed-KV mint and new
+/// re-share admission, with a fixed, opaque code.
+async fn revoking_the_owner_grant_ends_admitted_sessions(backend: Backend) -> anyhow::Result<()> {
+    let Some(h) = Harness::new(
+        backend,
+        Shape::KeySession,
+        "revoking_the_owner_grant_ends_admitted_sessions",
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let authority = h
+        .grant_owner(Window::until(now() + Duration::days(2)))
+        .await?;
+    let policy = h.register_ok(policy_window()).await?;
+    let session = h.mint_ok(&policy).await?;
+    let (status, body) = h.read(&session).await?;
+    assert_eq!((status, body.as_slice()), (Status::Ok, CONTENT));
+    let (_, decrypt_before) = h.decrypt(&session).await?;
+    assert_ne!(decrypt_before, REVOKED);
+    let (status, body, reader, child) = h.reshare(&session).await?;
+    assert_eq!(status, Status::Ok, "{body}");
+    let child = child.unwrap();
+    assert_eq!(h.read_as(&reader, child).await?.0, Status::Ok);
+    assert_eq!(h.signed_kv(&session).await?.0, Status::Ok);
+
+    h.revoke(&h.space_owner, &authority).await?;
+
+    let (status, body) = h.read(&session).await?;
+    assert_eq!((status, text(&body).as_str()), (Status::Forbidden, REVOKED));
+    let checks = [
+        ("decrypt", h.decrypt(&session).await?),
+        ("re-shared child read", h.read_as(&reader, child).await?),
+        ("challenge", h.challenge(&policy).await),
+        ("signed KV mint", h.signed_kv(&session).await?),
+    ];
+    for (label, (status, body)) in checks {
+        assert_eq!(status, Status::Forbidden, "{label}: {body}");
+        assert_eq!(body, REVOKED, "{label}");
+        assert_opaque(label, &body);
+    }
+    let (status, body) = h.mint(&policy).await?.unwrap_err();
+    assert_eq!((status, body.as_str()), (Status::Forbidden, REVOKED));
+    let (status, body, _, _) = h.reshare(&session).await?;
+    assert_eq!(status, Status::Forbidden, "re-share admission: {body}");
+    assert_opaque("re-share admission", &body);
+    // The listing by the revoked grant reports it.
+    let (status, page) = h.list(&h.space_owner, &authority, None, None).await?;
+    assert_eq!(status, Status::Ok);
+    assert_eq!(page["policies"][0]["ownerAuthorityState"], json!("revoked"));
+    Ok(())
+}
+on_both_backends!(revoking_the_owner_grant_ends_admitted_sessions);
+
+/// [B-1] The CLI agent flow: wallet W signs a session for key A, A signs the
+/// policy roots. W revokes the A session over the generic route; admitted
+/// recipients stop, the root itself stays active.
+async fn revoking_the_agent_session_ends_its_policies(backend: Backend) -> anyhow::Result<()> {
+    let Some(h) = Harness::new(
+        backend,
+        Shape::PkhSession,
+        "revoking_the_agent_session_ends_its_policies",
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let agent_session = h
+        .grant_owner(Window::until(now() + Duration::days(2)))
+        .await?;
+    let policy = h.register_ok(policy_window()).await?;
+    let session = h.mint_ok(&policy).await?;
+    assert_eq!(h.read(&session).await?.0, Status::Ok);
+
+    h.revoke(&h.space_owner, &agent_session).await?;
+
+    let (status, body) = h.read(&session).await?;
+    assert_eq!((status, text(&body).as_str()), (Status::Forbidden, REVOKED));
+    assert_eq!(
+        h.decrypt(&session).await?,
+        (Status::Forbidden, REVOKED.to_owned())
+    );
+    assert_eq!(h.signed_kv(&session).await?.0, Status::Forbidden);
+    // The root itself was never revoked.
+    assert_eq!(
+        h.root_status(&policy.policy_root_cid).await["state"],
+        json!("active")
+    );
+    assert_eq!(
+        h.delegation_status(&h.owner, &agent_session).await?["status"],
+        json!("revoked")
+    );
+    let (status, page) = h.list(&h.owner, &agent_session, None, None).await?;
+    assert_eq!(status, Status::Ok, "{page}");
+    assert_eq!(page["policies"][0]["ownerAuthorityState"], json!("revoked"));
+    Ok(())
+}
+on_both_backends!(revoking_the_agent_session_ends_its_policies);
+
+/// [2] Revoking an ancestor of the recorded grant ends sessions too.
+async fn revoking_an_ancestor_ends_admitted_sessions(backend: Backend) -> anyhow::Result<()> {
+    let Some(h) = Harness::new(
+        backend,
+        Shape::KeySession,
+        "revoking_an_ancestor_ends_admitted_sessions",
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let intermediary = Signer::key();
+    let window = Window::until(now() + Duration::days(2));
+    let upstream = h
+        .import(
+            h.space_owner
+                .delegate(intermediary.did(), &h.owner_grants(), window, &[])?,
+        )
+        .await?;
+    h.import(intermediary.delegate(
+        h.owner.did(),
+        &h.owner_grants(),
+        window,
+        &[upstream.parse()?],
+    )?)
+    .await?;
+    let policy = h.register_ok(policy_window()).await?;
+    let session = h.mint_ok(&policy).await?;
+    assert_eq!(h.read(&session).await?.0, Status::Ok);
+    h.revoke(&h.space_owner, &upstream).await?;
+    let (status, body) = h.read(&session).await?;
+    assert_eq!((status, text(&body).as_str()), (Status::Forbidden, REVOKED));
+    Ok(())
+}
+on_both_backends!(revoking_an_ancestor_ends_admitted_sessions);
+
+/// [2] A revocation stored under an alias CID of a closure node counts.
+async fn a_revocation_under_an_alias_cid_ends_sessions(backend: Backend) -> anyhow::Result<()> {
+    let Some(h) = Harness::new(
+        backend,
+        Shape::KeySession,
+        "a_revocation_under_an_alias_cid_ends_sessions",
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let authority = h
+        .grant_owner(Window::until(now() + Duration::days(2)))
+        .await?;
+    let policy = h.register_ok(policy_window()).await?;
+    let session = h.mint_ok(&policy).await?;
+    assert_eq!(h.read(&session).await?.0, Status::Ok);
+    // A second stored encoding of the same grant, and a revocation that names
+    // only that encoding.
+    let canonical = authority.parse::<Cid>()?.hash().to_bytes();
+    let alias = hash(b"tc-1423-alias-encoding")
+        .to_cid(0x55)
+        .hash()
+        .to_bytes();
+    let space_owner = h.space_owner.did().to_owned();
+    let owner = h.owner.did().to_owned();
+    let statements = [
+        Query::insert()
+            .into_table(Alias::new("delegation"))
+            .columns([
+                Alias::new("id"),
+                Alias::new("delegator"),
+                Alias::new("delegatee"),
+                Alias::new("serialization"),
+            ])
+            .values_panic([
+                alias.clone().into(),
+                space_owner.clone().into(),
+                owner.into(),
+                b"alias".to_vec().into(),
+            ])
+            .to_owned(),
+        Query::insert()
+            .into_table(Alias::new("delegation_cid_alias"))
+            .columns([Alias::new("id"), Alias::new("canonical")])
+            .values_panic([canonical.clone().into(), canonical.clone().into()])
+            .values_panic([alias.clone().into(), canonical.into()])
+            .to_owned(),
+        Query::insert()
+            .into_table(Alias::new("revocation"))
+            .columns([
+                Alias::new("id"),
+                Alias::new("revoker"),
+                Alias::new("revoked"),
+                Alias::new("serialization"),
+            ])
+            .values_panic([
+                hash(b"tc-1423-alias-revocation")
+                    .to_cid(0x55)
+                    .hash()
+                    .to_bytes()
+                    .into(),
+                space_owner.into(),
+                alias.into(),
+                b"alias-revocation".to_vec().into(),
+            ])
+            .to_owned(),
+    ];
+    for statement in statements {
+        h.conn().execute(h.backend().build(&statement)).await?;
+    }
+    let (status, body) = h.read(&session).await?;
+    assert_eq!((status, text(&body).as_str()), (Status::Forbidden, REVOKED));
+    Ok(())
+}
+on_both_backends!(a_revocation_under_an_alias_cid_ends_sessions);
+
+/// [7] All-of: kv granted by one delegation and decrypt by another; revoking
+/// either ends the policy.
+async fn each_recorded_grant_is_required(backend: Backend) -> anyhow::Result<()> {
+    for revoke_kv in [true, false] {
+        let Some(h) = Harness::new(
+            backend,
+            Shape::KeySession,
+            "each_recorded_grant_is_required",
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+        let window = Window::until(now() + Duration::days(2));
+        let grants = h.owner_grants();
+        let kv = h.grant_owner_with(&grants[..2], window).await?;
+        let decrypt = h.grant_owner_with(&grants[2..], window).await?;
+        let policy = h.register_ok(policy_window()).await?;
+        let mut expected = vec![kv.clone(), decrypt.clone()];
+        expected.sort();
+        assert_eq!(h.closure(&policy.policy_cid).await?, expected);
+        let session = h.mint_ok(&policy).await?;
+        assert_eq!(h.read(&session).await?.0, Status::Ok);
+        h.revoke(&h.space_owner, if revoke_kv { &kv } else { &decrypt })
+            .await?;
+        let (status, body) = h.read(&session).await?;
+        assert_eq!(
+            (status, text(&body).as_str()),
+            (Status::Forbidden, REVOKED),
+            "revoke kv: {revoke_kv}"
+        );
+    }
+    Ok(())
+}
+on_both_backends!(each_recorded_grant_is_required);
+
+/// [3] A root bound to its authority's expiry: once both pass, reads see the
+/// session expired and mints see the root expired.
+async fn expiry_codes_are_typed(backend: Backend) -> anyhow::Result<()> {
+    let Some(h) = Harness::new(backend, Shape::KeySession, "expiry_codes_are_typed").await? else {
+        return Ok(());
+    };
+    let expiry = now() + Duration::seconds(12);
+    h.grant_owner(Window::until(expiry)).await?;
+    let policy = h.register_ok(Window::until(expiry)).await?;
+    assert_eq!(h.binding(&policy.policy_cid).await?.unwrap().state, "bound");
+    let session = h.mint_ok(&policy).await?;
+    assert_eq!(h.read(&session).await?.0, Status::Ok);
+    tokio::time::sleep(
+        (expiry - OffsetDateTime::now_utc()).unsigned_abs() + std::time::Duration::from_secs(1),
+    )
+    .await;
+    let (status, body) = h.read(&session).await?;
+    assert_eq!(status, Status::Forbidden);
+    assert_eq!(text(&body), "policy-session-expired");
+    let (status, body) = h.challenge(&policy).await;
+    assert_eq!((status, body.as_str()), (Status::Forbidden, "root-expired"));
+    Ok(())
+}
+on_both_backends!(expiry_codes_are_typed);
+
+/// [O2][9] A legacy registration with no authority is denied; the operator
+/// escape restores root-only checks and is counted.
+async fn legacy_registrations_without_authority_are_denied_unless_escaped(
+    backend: Backend,
+) -> anyhow::Result<()> {
+    for allow in [false, true] {
+        let mut policy_v3 = json!({"legacy_cutover": format_time(now() + Duration::days(1))});
+        if allow {
+            policy_v3["legacy_unknown_allow"] = json!(true);
+        }
+        let Some(h) = Harness::with_boot(
+            backend,
+            Shape::KeySession,
+            "legacy_registrations_without_authority_are_denied_unless_escaped",
+            boot(policy_v3),
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+        let authority = h
+            .grant_owner(Window::until(now() + Duration::days(2)))
+            .await?;
+        let policy = h.register_ok(policy_window()).await?;
+        let session = h.mint_ok(&policy).await?;
+        h.revoke(&h.space_owner, &authority).await?;
+        h.forget_binding(&policy.policy_cid).await?;
+        let allowed = counter(
+            "tinycloud_policy_owner_authority_unknown_allowed_total",
+            &[("reason", "revoked")],
+        );
+        let (status, body) = h.read(&session).await?;
+        if allow {
+            assert_eq!((status, body.as_slice()), (Status::Ok, CONTENT));
+            assert!(
+                counter(
+                    "tinycloud_policy_owner_authority_unknown_allowed_total",
+                    &[("reason", "revoked")],
+                ) >= allowed + 1.0
+            );
+        } else {
+            assert_eq!(
+                (status, text(&body).as_str()),
+                (Status::Forbidden, "policy-owner-authority-unknown")
+            );
+        }
+        let binding = h
+            .wait_for_binding(&policy.policy_cid, std::time::Duration::from_secs(20))
+            .await?
+            .expect("classified");
+        assert_eq!(binding.state, "unknown");
+        assert_eq!(binding.unknown_reason.as_deref(), Some("revoked"));
+    }
+    Ok(())
+}
+on_both_backends!(legacy_registrations_without_authority_are_denied_unless_escaped);
+
+/// [9][F2] Legacy rows get liveness but no expiry cap: a legacy session
+/// whose authority expired since registration still reads, and so does a
+/// legacy root longer than 31 days.
+async fn legacy_registrations_are_never_expiry_capped(backend: Backend) -> anyhow::Result<()> {
+    let Some(h) = Harness::with_boot(
+        backend,
+        Shape::KeySession,
+        "legacy_registrations_are_never_expiry_capped",
+        legacy_boot(),
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let short_expiry = now() + Duration::seconds(8);
+    h.grant_owner(Window::until(short_expiry)).await?;
+    let short = h.register_ok(policy_window()).await?;
+    let short_session = h.mint_ok(&short).await?;
+    h.forget_binding(&short.policy_cid).await?;
+
+    let registered_at = now() - Duration::days(40);
+    h.grant_owner(Window {
+        not_before: registered_at - Duration::days(1),
+        expiry: now() + Duration::days(2),
+        issued_at: None,
+    })
+    .await?;
+    let long = h.register_ok(policy_window()).await?;
+    let long_session = h.mint_ok(&long).await?;
+    h.forget_binding(&long.policy_cid).await?;
+    backdate(&h, &long.policy_cid, registered_at).await?;
+
+    tokio::time::sleep(
+        (short_expiry - OffsetDateTime::now_utc()).unsigned_abs()
+            + std::time::Duration::from_secs(1),
+    )
+    .await;
+    for (label, session) in [
+        ("expired authority", &short_session),
+        ("41-day root", &long_session),
+    ] {
+        let (status, body) = h.read(session).await?;
+        assert_eq!(status, Status::Ok, "{label}: {}", text(&body));
+        assert_eq!(body, CONTENT);
+    }
+    Ok(())
+}
+on_both_backends!(legacy_registrations_are_never_expiry_capped);
+
+impl Harness {
+    /// The space owner grants the holder hooks subscription on the content
+    /// prefix; returns the grant CIDs.
+    async fn grant_hooks(&self, count: usize) -> anyhow::Result<Vec<String>> {
+        let resource = self.content_space.clone().to_resource(
+            "hooks".parse()?,
+            Some("kv/shares".parse()?),
+            None,
+            None,
+        );
+        let mut grants = Vec::new();
+        for _ in 0..count {
+            grants.push(
+                self.import(self.space_owner.delegate(
+                    self.holder.did(),
+                    &[(resource.to_string(), "tinycloud.hooks/subscribe")],
+                    Window::until(now() + Duration::hours(2)),
+                    &[],
+                )?)
+                .await?,
+            );
+        }
+        Ok(grants)
+    }
+
+    /// The holder mints a hook ticket on the content prefix citing `proofs`.
+    async fn hook_ticket(&self, proofs: &[String]) -> anyhow::Result<(Status, String)> {
+        let resource = self.content_space.clone().to_resource(
+            "hooks".parse()?,
+            Some("kv/shares".parse()?),
+            None,
+            None,
+        );
+        let Signer::Key { jwk, vm, did, .. } = &self.holder else {
+            unreachable!()
+        };
+        let at = now();
+        let invocation = Payload {
+            issuer: vm.parse()?,
+            audience: did.parse()?,
+            not_before: Some(seconds(at)?),
+            expiration: seconds(at + Duration::seconds(60))?,
+            nonce: Some(unique("tc1423hooks")),
+            facts: Some(Vec::<Value>::new()),
+            proof: proofs
+                .iter()
+                .map(|cid| cid.parse())
+                .collect::<Result<_, _>>()?,
+            attenuation: capabilities(&[(resource.to_string(), "tinycloud.hooks/subscribe")])?,
+        }
+        .sign(Algorithm::EdDSA, jwk)?
+        .encode()?;
+        let response = self
+            .client
+            .post("/hooks/tickets")
+            .header(ContentType::JSON)
+            .header(Header::new("Authorization", invocation))
+            .body(
+                json!({
+                    "subscriptions": [{
+                        "space": self.content_space.to_string(),
+                        "service": "kv",
+                        "pathPrefix": "shares",
+                    }],
+                    "ttlSeconds": 120,
+                })
+                .to_string(),
+            )
+            .dispatch()
+            .await;
+        let status = response.status();
+        let body = response.into_string().await.unwrap_or_default();
+        Ok((status, body))
+    }
+
+    /// The holder writes the content again, emitting a hook event.
+    async fn write_content(&self, body: &'static [u8]) -> anyhow::Result<()> {
+        let grant = self
+            .import(self.space_owner.delegate(
+                self.holder.did(),
+                &[(self.content_resource.to_string(), "tinycloud.kv/put")],
+                Window::until(now() + Duration::hours(1)),
+                &[],
+            )?)
+            .await?;
+        let Signer::Key { jwk, vm, .. } = &self.holder else {
+            unreachable!()
+        };
+        let write = make_invocation(
+            [(
+                self.content_resource.clone(),
+                ["tinycloud.kv/put".parse::<RecapAbility>()?],
+            )],
+            &grant.parse()?,
+            jwk,
+            vm,
+            (now() + Duration::seconds(45)).unix_timestamp() as f64,
+            InvocationOptions {
+                nonce: Some(unique("tc1423write")),
+                ..InvocationOptions::default()
+            },
+        )?;
+        let response = self
+            .client
+            .post("/invoke")
+            .header(Header::new("Authorization", write.encode()?))
+            .header(ContentType::Plain)
+            .body(body)
+            .dispatch()
+            .await;
+        anyhow::ensure!(
+            response.status() == Status::Ok,
+            "write: {}",
+            response.status()
+        );
+        Ok(())
+    }
+}
+
+fn fast_hooks() -> Boot {
+    Boot {
+        hooks: Some(json!({
+            "authority_recheck_seconds": 1,
+            "idle_authority_recheck_seconds": 2,
+        })),
+        ..Boot::default()
+    }
+}
+
+/// Connect a hook stream (its authority is checked here).
+async fn open_stream<'c>(
+    h: &'c Harness,
+    ticket: &str,
+) -> rocket::local::asynchronous::LocalResponse<'c> {
+    let response = h
+        .client
+        .get(format!("/hooks/events?ticket={ticket}"))
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Ok);
+    response
+}
+
+/// Read a connected hook stream to its end, or give up after `limit`.
+async fn drain_stream(
+    response: rocket::local::asynchronous::LocalResponse<'_>,
+    limit: std::time::Duration,
+) -> Option<String> {
+    tokio::time::timeout(limit, response.into_string())
+        .await
+        .ok()
+        .map(Option::unwrap_or_default)
+}
+
+/// [8][C3] An open hook stream stops delivering after its grant is revoked:
+/// no event after the re-check interval, and the stream closes; an idle
+/// stream closes on the idle re-check.
+async fn hook_streams_close_after_their_grant_is_revoked(backend: Backend) -> anyhow::Result<()> {
+    let Some(h) = Harness::with_boot(
+        backend,
+        Shape::KeySession,
+        "hook_streams_close_after_their_grant_is_revoked",
+        fast_hooks(),
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let grant = h.grant_hooks(1).await?;
+    let (status, body) = h.hook_ticket(&grant).await?;
+    assert_eq!(status, Status::Ok, "{body}");
+    let ticket = serde_json::from_str::<Value>(&body)?["ticket"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let stream = drain_stream(
+        open_stream(&h, &ticket).await,
+        std::time::Duration::from_secs(10),
+    );
+    let actions = async {
+        h.revoke(&h.space_owner, &grant[0]).await?;
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        h.write_content(b"after-revoke").await?;
+        anyhow::Ok(())
+    };
+    let (body, actions) = tokio::join!(stream, actions);
+    actions?;
+    let body = body.expect("the stream closes after the revocation");
+    assert!(!body.contains("event: write"), "{body}");
+
+    // Idle: nothing is written; the idle re-check closes it.
+    let grant = h.grant_hooks(1).await?;
+    let (_, body) = h.hook_ticket(&grant).await?;
+    let ticket = serde_json::from_str::<Value>(&body)?["ticket"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let stream = drain_stream(
+        open_stream(&h, &ticket).await,
+        std::time::Duration::from_secs(10),
+    );
+    let revoke = h.revoke(&h.space_owner, &grant[0]);
+    let (body, revoked) = tokio::join!(stream, revoke);
+    revoked?;
+    assert!(
+        body.is_some(),
+        "the idle stream closes after the revocation"
+    );
+    Ok(())
+}
+on_both_backends!(hook_streams_close_after_their_grant_is_revoked);
+
+/// [C3] Re-check errors close a stream only after three in a row.
+async fn hook_streams_close_after_repeated_check_errors(backend: Backend) -> anyhow::Result<()> {
+    let Some(h) = Harness::with_boot(
+        backend,
+        Shape::KeySession,
+        "hook_streams_close_after_repeated_check_errors",
+        fast_hooks(),
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let grant = h.grant_hooks(1).await?;
+    let (_, body) = h.hook_ticket(&grant).await?;
+    let ticket = serde_json::from_str::<Value>(&body)?["ticket"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let started = tokio::time::Instant::now();
+    let stream = drain_stream(
+        open_stream(&h, &ticket).await,
+        std::time::Duration::from_secs(15),
+    );
+    let break_checks = async {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        h.execute("DROP TABLE revocation").await
+    };
+    let (body, dropped) = tokio::join!(stream, break_checks);
+    dropped?;
+    assert!(body.is_some(), "three failed checks close the stream");
+    // Idle checks every 2 s: three errors take at least ~4 s.
+    assert!(started.elapsed() >= std::time::Duration::from_secs(4));
+    Ok(())
+}
+on_both_backends!(hook_streams_close_after_repeated_check_errors);
+
+/// [C3] A ticket would carry more than 16 authority IDs: refused.
+async fn hook_tickets_carry_at_most_16_authorities(backend: Backend) -> anyhow::Result<()> {
+    let Some(h) = Harness::new(
+        backend,
+        Shape::KeySession,
+        "hook_tickets_carry_at_most_16_authorities",
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let grants = h.grant_hooks(17).await?;
+    assert_eq!(h.hook_ticket(&grants[..16]).await?.0, Status::Ok);
+    let (status, body) = h.hook_ticket(&grants).await?;
+    assert_eq!(status, Status::Forbidden, "{body}");
+    assert_eq!(body, "hook-ticket-authority-too-large");
+    Ok(())
+}
+on_both_backends!(hook_tickets_carry_at_most_16_authorities);

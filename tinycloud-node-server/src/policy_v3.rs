@@ -9698,8 +9698,9 @@ mod tests {
         assert_eq!(replay.status(), Status::Unauthorized);
 
         if let Some(owner_delegation_cid) = owner_delegation_cid.as_deref() {
-            // Revoking the delegation the policy owner held stops new
-            // sessions, although the policy and its roots are untouched.
+            // Revoking the delegation the policy owner held ends the policy:
+            // the already-admitted session, new challenges and new sessions,
+            // although the policy and its roots are untouched.
             let mut capabilities = Capabilities::<Value>::new();
             capabilities.with_action(
                 format!("urn:cid:{owner_delegation_cid}").parse()?,
@@ -9737,6 +9738,37 @@ mod tests {
                 "owner session revoke: {revoked_body}"
             );
 
+            let post_owner_revoke_read = Payload {
+                issuer: reader_vm.parse()?,
+                audience: reader_did.parse()?,
+                not_before: Some(NumericDate::try_from_seconds(
+                    OffsetDateTime::now_utc().unix_timestamp() as f64,
+                )?),
+                expiration: NumericDate::try_from_seconds(
+                    (OffsetDateTime::now_utc() + Duration::seconds(30)).unix_timestamp() as f64,
+                )?,
+                nonce: Some("tc1423-read-after-owner-revoke".into()),
+                facts: Some(Vec::<Value>::new()),
+                proof: vec![child_cid],
+                attenuation: serde_json::from_value::<Capabilities<Value>>(
+                    attenuation_for_policy_capabilities(&requested)
+                        .map_err(|(_, error)| anyhow::anyhow!(error))?,
+                )?,
+            }
+            .sign(Algorithm::EdDSA, &reader_jwk)?;
+            let refused_read = client
+                .post("/invoke")
+                .header(rocket::http::Header::new(
+                    "Authorization",
+                    post_owner_revoke_read.encode()?,
+                ))
+                .dispatch()
+                .await;
+            assert_eq!(refused_read.status(), Status::Forbidden);
+            assert_eq!(
+                refused_read.into_string().await.unwrap_or_default(),
+                "policy-owner-authority-revoked"
+            );
             let challenge_response = client
                 .post("/policy/v3/challenges")
                 .header(ContentType::JSON)
@@ -9750,53 +9782,11 @@ mod tests {
                 )
                 .dispatch()
                 .await;
-            assert_eq!(challenge_response.status(), Status::Ok);
-            let fresh_challenge: Value = challenge_response.into_json().await.unwrap();
-            let mut fresh = presentation.clone();
-            fresh["schema"] = json!(CREDENTIAL_PRESENTATION_V4_SCHEMA);
-            fresh["jti"] = json!("presentation-tc-597-after-owner-revoke");
-            fresh["challengeId"] = fresh_challenge["challengeId"].clone();
-            fresh["nonce"] = fresh_challenge["nonce"].clone();
-            fresh
-                .as_object_mut()
-                .unwrap()
-                .remove("credentialSpaceOwnerDid");
-            fresh["issuedAt"] = json!(format_time(OffsetDateTime::now_utc()));
-            fresh["expiresAt"] = json!(format_time(
-                OffsetDateTime::now_utc() + Duration::seconds(45)
-            ));
-            let mut unsigned_fresh = fresh.clone();
-            unsigned_fresh.as_object_mut().unwrap().remove("signature");
-            let mut fresh_preimage = CREDENTIAL_PRESENTATION_V4_DOMAIN.to_vec();
-            fresh_preimage.extend_from_slice(&canonical_json_value(&unsigned_fresh));
-            fresh["signature"]["value"] = json!(encode_config(
-                holder_key.sign(&Sha256::digest(fresh_preimage)),
-                URL_SAFE_NO_PAD
-            ));
-            let refused = client
-                .post("/policy/v3/delegations")
-                .header(ContentType::JSON)
-                .body(
-                    json!({
-                        "policyCid": policy_cid,
-                        "challengeId": fresh_challenge["challengeId"],
-                        "nonce": fresh_challenge["nonce"],
-                        "requirement": requirement,
-                        "credential": credential,
-                        "presentation": fresh,
-                    })
-                    .to_string(),
-                )
-                .dispatch()
-                .await;
-            let refused_status = refused.status();
-            let refused_body = refused.into_string().await.unwrap_or_default();
+            assert_eq!(challenge_response.status(), Status::Forbidden);
             assert_eq!(
-                refused_status,
-                Status::Forbidden,
-                "mint after owner revoke: {refused_body}"
+                challenge_response.into_string().await.unwrap_or_default(),
+                "policy-owner-authority-revoked"
             );
-            assert_eq!(refused_body, "policy-owner-not-authorized");
         }
 
         // SDK revocation writes the generic graph. Policy/v3 joins that
