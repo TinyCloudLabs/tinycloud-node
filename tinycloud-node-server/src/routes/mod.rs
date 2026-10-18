@@ -9708,34 +9708,82 @@ mod tests {
         .await??;
         busy(reply.status, &reply.body, "sql");
 
-        // A real denial is still a denial: a stranger reading the space.
+        // A real denial is still a denial on every reclassified route: a
+        // stranger reading the space.
         let stranger = JWK::generate_ed25519()?;
         let stranger_vm = tc341_verification_method(&stranger)?;
-        let mut capabilities = Capabilities::new();
-        let (uri, action) = kv_get()?;
-        capabilities.with_action(
-            uri.parse()?,
-            action.parse::<UcanAbility>()?,
-            [std::collections::BTreeMap::<String, serde_json::Value>::new()],
+        let stranger_invocation = |audience: &str| -> Result<String> {
+            let mut capabilities = Capabilities::new();
+            let (uri, action) = kv_get()?;
+            capabilities.with_action(
+                uri.parse()?,
+                action.parse::<UcanAbility>()?,
+                [std::collections::BTreeMap::<String, serde_json::Value>::new()],
+            );
+            Ok(Payload {
+                issuer: stranger_vm.parse::<DIDURLBuf>()?,
+                audience: audience.parse::<DIDBuf>()?,
+                not_before: None,
+                expiration: test_invocation_expiration(),
+                nonce: Some(fixture.next_nonce()),
+                facts: Some(Vec::<serde_json::Value>::new()),
+                proof: vec![],
+                attenuation: capabilities,
+            }
+            .sign(stranger.get_algorithm().unwrap_or_default(), &stranger)?
+            .encode()?)
+        };
+        let denial = |status: Status, body: &str, route: &str| {
+            assert!(
+                [Status::Unauthorized, Status::Forbidden].contains(&status),
+                "{route}: a denial must not turn into busy: {status} {body}"
+            );
+        };
+        let space_did = fixture.space.did().to_string();
+        let reply = within(fixture.dispatch(stranger_invocation(&space_did)?, &[])).await?;
+        denial(reply.status, &reply.body, "/invoke");
+
+        let response = within(
+            fixture
+                .client
+                .post("/signed/kv")
+                .header(Header::new(
+                    "Authorization",
+                    stranger_invocation(&space_did)?,
+                ))
+                .header(ContentType::JSON)
+                .body(
+                    serde_json::json!({ "space": fixture.space.to_string(), "path": "notes/a" })
+                        .to_string(),
+                )
+                .dispatch(),
+        )
+        .await?;
+        let status = response.status();
+        denial(
+            status,
+            &response.into_string().await.unwrap_or_default(),
+            "/signed/kv",
         );
-        let denied = Payload {
-            issuer: stranger_vm.parse::<DIDURLBuf>()?,
-            audience: fixture.space.did().to_string().parse::<DIDBuf>()?,
-            not_before: None,
-            expiration: test_invocation_expiration(),
-            nonce: Some(fixture.next_nonce()),
-            facts: Some(Vec::<serde_json::Value>::new()),
-            proof: vec![],
-            attenuation: capabilities,
-        }
-        .sign(stranger.get_algorithm().unwrap_or_default(), &stranger)?
-        .encode()?;
-        let reply = within(fixture.dispatch(denied, &[])).await?;
-        assert!(
-            [Status::Unauthorized, Status::Forbidden].contains(&reply.status),
-            "a denial must not turn into busy: {} {}",
-            reply.status,
-            reply.body
+
+        let response = within(
+            fixture
+                .client
+                .post("/encryption/networks")
+                .header(Header::new(
+                    "Authorization",
+                    stranger_invocation(&fixture.node_did)?,
+                ))
+                .header(ContentType::JSON)
+                .body("{}")
+                .dispatch(),
+        )
+        .await?;
+        let status = response.status();
+        denial(
+            status,
+            &response.into_string().await.unwrap_or_default(),
+            "/encryption/networks",
         );
         drop(held);
 
@@ -9756,14 +9804,62 @@ mod tests {
     }
 
     /// TC-1317 review R2: a deadline shorter than the read-audit wait cuts a
-    /// read waiting on its audit with `503 request_timeout`, no data.
+    /// read waiting on its audit with `503 request_timeout` and
+    /// `Retry-After: 1`, no data, and logs that the time went to the audit.
     #[tokio::test]
     async fn a_deadline_before_the_audit_wait_answers_request_timeout() -> Result<()> {
-        use rocket::http::Status;
+        use rocket::http::{Header, Status};
+
+        /// Records the `stage` of each `Request deadline exceeded` warning.
+        /// Spans are ignored: a span opened on this thread may close on a
+        /// database worker thread, which a span registry would reject.
+        #[derive(Clone, Default)]
+        struct DeadlineStages(Arc<std::sync::Mutex<Vec<String>>>);
+        #[derive(Default)]
+        struct Fields {
+            message: String,
+            stage: String,
+        }
+        impl tracing::field::Visit for Fields {
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                if field.name() == "stage" {
+                    self.stage = value.to_string();
+                }
+            }
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.message = format!("{value:?}");
+                }
+            }
+        }
+        impl tracing::Subscriber for DeadlineStages {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                let mut fields = Fields::default();
+                event.record(&mut fields);
+                if fields.message == "Request deadline exceeded" {
+                    self.0.lock().unwrap().push(fields.stage);
+                }
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+        let stages = DeadlineStages::default();
+        let _logging = tracing::subscriber::set_default(stages.clone());
 
         let mut config = Config::default();
         config.invocation.deadline_ms = 300;
-        let fixture = KvSyncFixture::new_configured(config, |rocket| rocket).await?;
+        let fixture = KvSyncFixture::new_configured(config, |rocket| {
+            rocket.attach(crate::retry_after_fairing())
+        })
+        .await?;
         fixture.owner_write("notes/a", Some(b"secret")).await?;
         let tinycloud = fixture
             .client
@@ -9778,14 +9874,24 @@ mod tests {
             .sqlite_writer_lock()
             .expect("the fixture runs on SQLite");
         let held = writer.lock().await;
-        let reply = tokio::time::timeout(
+        let response = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            fixture.dispatch(get, &[]),
+            fixture
+                .client
+                .post("/invoke")
+                .header(Header::new("Authorization", get))
+                .dispatch(),
         )
         .await?;
         drop(held);
-        assert_eq!(reply.status, Status::ServiceUnavailable, "{}", reply.body);
-        assert_eq!(reply.body, REQUEST_TIMEOUT_BODY);
+        assert_eq!(response.status(), Status::ServiceUnavailable);
+        assert_eq!(response.headers().get_one("Retry-After"), Some("1"));
+        assert_eq!(
+            response.into_string().await.as_deref(),
+            Some(REQUEST_TIMEOUT_BODY)
+        );
+
+        assert_eq!(*stages.0.lock().unwrap(), ["read_audit"]);
         Ok(())
     }
 
