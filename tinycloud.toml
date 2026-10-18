@@ -48,6 +48,9 @@ cors = true
     # statement_timeout_ms = 30000
     # bulk_statement_timeout_ms = 120000
     # retry_window_ms = 10000
+    ## How long an authorized read waits for its audit record before 503
+    ## read_audit_busy (TC-1317). Its data is never returned without the record.
+    # read_audit_wait_ms = 20000
 
 [global.invocation]
     ## /invoke deadline (TC-1274): before any write, the request is stopped and

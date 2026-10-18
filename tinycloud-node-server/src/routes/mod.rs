@@ -115,6 +115,22 @@ pub const SQL_BUSY_RETRY_AFTER_SECS: u32 = 5;
 pub const REQUEST_TIMEOUT: &str = "request_timeout";
 /// The whole body of a [`REQUEST_TIMEOUT`] response.
 pub const REQUEST_TIMEOUT_BODY: &str = "request_timeout: no change was applied; retry the request";
+/// Body prefix of a `503` whose read's audit record was not committed within
+/// the read-audit wait bound (TC-1317); `Retry-After` is
+/// [`SQL_BUSY_RETRY_AFTER_SECS`], since the audit queue is backlogged.
+pub const READ_AUDIT_BUSY: &str = "read_audit_busy";
+
+/// The response to a read whose audit record was not confirmed (TC-1317).
+/// Its data was not returned, so retrying with a fresh request is safe
+/// whenever the failure was transient.
+fn read_audit_failure(error: &tinycloud_core::ReadAuditError) -> (Status, String) {
+    use tinycloud_core::ReadAuditError;
+    let status = match error {
+        ReadAuditError::Busy | ReadAuditError::Unavailable => Status::ServiceUnavailable,
+        ReadAuditError::Failed(_) | ReadAuditError::Stopped => Status::InternalServerError,
+    };
+    (status, error.to_string())
+}
 
 /// The response to a database failure of an operation (TC-1054):
 ///
@@ -2250,6 +2266,9 @@ async fn invoke_impl(
                 if let TxStoreError::KvTooManyMutations { .. } = &e {
                     return Err(too_many_mutations().into());
                 }
+                if let TxStoreError::Tx(TxError::ReadAudit(error)) = &e {
+                    return Err(read_audit_failure(error).into());
+                }
                 if let TxStoreError::Tx(TxError::Db(error) | TxError::EpochInsert(error)) = &e {
                     return Err(
                         database_failure(error, write_may_have_applied, e.to_string()).into()
@@ -3698,6 +3717,7 @@ async fn verify_auth(
             TxStoreError::Tx(TxError::Db(error) | TxError::EpochInsert(error)) => {
                 database_failure(error, false, e.to_string())
             }
+            TxStoreError::Tx(TxError::ReadAudit(error)) => read_audit_failure(error),
             TxStoreError::Tx(TxError::SpaceNotFound) => (Status::NotFound, e.to_string()),
             _ => (Status::Unauthorized, e.to_string()),
         })
@@ -3729,6 +3749,7 @@ async fn verify_auth_admitted(
             TxStoreError::Tx(TxError::Db(error) | TxError::EpochInsert(error)) => {
                 database_failure(error, false, e.to_string())
             }
+            TxStoreError::Tx(TxError::ReadAudit(error)) => read_audit_failure(error),
             TxStoreError::Tx(TxError::SpaceNotFound) => (Status::NotFound, e.to_string()),
             _ => (Status::Unauthorized, e.to_string()),
         })
@@ -9388,6 +9409,50 @@ mod tests {
             .await;
         assert_eq!(get.status, Status::Ok);
         assert_eq!(get.body, "a2");
+        Ok(())
+    }
+
+    /// TC-1317: an `/invoke` KV read whose audit record cannot commit is
+    /// answered `503 read_audit_busy` at the read-audit bound, without its
+    /// data; once the drain frees up the same read is served.
+    #[tokio::test]
+    async fn a_kv_read_with_a_stalled_read_audit_is_answered_busy() -> Result<()> {
+        use rocket::http::Status;
+
+        let fixture = KvSyncFixture::new().await?;
+        fixture.owner_write("notes/a", Some(b"secret")).await?;
+        let tinycloud = fixture
+            .client
+            .rocket()
+            .state::<TinyCloud>()
+            .expect("TinyCloud is managed");
+        tinycloud.set_read_audit_wait(std::time::Duration::from_millis(200));
+        let get = || {
+            fixture.owner_invocation(&[(
+                fixture.kv_resource("notes/a").unwrap().as_uri().to_string(),
+                "tinycloud.kv/get",
+            )])
+        };
+
+        // The SQLite writer lock is what every audit batch takes to commit.
+        let writer = tinycloud
+            .sqlite_writer_lock()
+            .expect("the fixture runs on SQLite");
+        let held = writer.lock().await;
+        let reply = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            fixture.dispatch(get()?, &[]),
+        )
+        .await
+        .expect("the read must be answered at its bound");
+        drop(held);
+        assert_eq!(reply.status, Status::ServiceUnavailable);
+        assert!(reply.body.starts_with(READ_AUDIT_BUSY), "{}", reply.body);
+        assert!(!reply.body.contains("secret"), "no data without its audit");
+
+        let reply = fixture.dispatch(get()?, &[]).await;
+        assert_eq!(reply.status, Status::Ok);
+        assert_eq!(reply.body, "secret");
         Ok(())
     }
 

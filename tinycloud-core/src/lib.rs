@@ -45,6 +45,7 @@ pub use db::{
 pub use db_pool::RecoveringConnection;
 pub use encryption::ColumnEncryption;
 pub use libp2p;
+pub use read_audit::{ReadAuditError, ReadAuditHealth, DEFAULT_READ_AUDIT_WAIT};
 pub use sea_orm;
 pub use sea_orm_migration;
 pub use sql_sizes::{SizeTrackingArtifactRepository, SqlSizes};

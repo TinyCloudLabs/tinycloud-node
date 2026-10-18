@@ -646,6 +646,9 @@ pub async fn app_with_control(
     )
     .await?
     .with_sql_sizes(sql_sizes.clone());
+    tinycloud.set_read_audit_wait(Duration::from_millis(
+        tinycloud_config.database.read_audit_wait_ms,
+    ));
     let encryption_service =
         encryption_service.with_sqlite_writer_lock(tinycloud.sqlite_writer_lock());
     let database_artifact_repository: Arc<dyn DatabaseArtifactRepository> =
@@ -877,7 +880,7 @@ pub async fn app_with_control(
             let shutdown = rocket.shutdown();
             Box::pin(async move {
                 tokio::spawn(async move {
-                    let mut last_read_audit = (0u64, 0u64);
+                    let mut last_read_audit = tinycloud_core::ReadAuditHealth::default();
                     let period = std::time::Duration::from_secs(5);
                     let mut interval =
                         tokio::time::interval_at(tokio::time::Instant::now() + period, period);
@@ -965,7 +968,9 @@ fn retry_after_fairing() -> AdHoc {
             let Ok(body) = resp.body_mut().to_string().await else {
                 return;
             };
-            let retry_after = if body.starts_with(routes::SQL_BUSY) {
+            let retry_after = if body.starts_with(routes::SQL_BUSY)
+                || body.starts_with(routes::READ_AUDIT_BUSY)
+            {
                 Some(routes::SQL_BUSY_RETRY_AFTER_SECS)
             } else if body.starts_with(routes::UNAVAILABLE_RETRYABLE)
                 || body.starts_with(routes::REQUEST_TIMEOUT)
@@ -1092,9 +1097,9 @@ mod production_route_tests {
 }
 
 /// One telemetry sample tick: update the DB pool gauges, probe pool-acquire
-/// latency (the `DbPoolAcquire` span), and advance the cumulative read-audit
-/// counters. `last_read_audit` carries the previous cumulative
-/// `(records, batches)` so the monotonic counters advance by deltas.
+/// latency (the `DbPoolAcquire` span), and update the read-audit metrics.
+/// `last_read_audit` carries the previous cumulative counts so the monotonic
+/// counters advance by deltas.
 ///
 /// sea-orm couples pool acquisition with `BEGIN` on the generic connection, so
 /// the request-path `DbTxBegin` span cannot separate the two. This sampler is
@@ -1103,7 +1108,7 @@ mod production_route_tests {
 async fn sample_db_telemetry(
     conn: &RecoveringConnection,
     tinycloud: &TinyCloud,
-    last_read_audit: &mut (u64, u64),
+    last_read_audit: &mut tinycloud_core::ReadAuditHealth,
 ) {
     use tinycloud_core::sea_orm::{ConnectionTrait, DatabaseBackend};
 
@@ -1128,12 +1133,9 @@ async fn sample_db_telemetry(
         DatabaseBackend::MySql => sample_pool!(pool.get_mysql_connection_pool()),
     }
 
-    let (records, batches) = tinycloud.read_audit_commit_stats();
-    crate::prometheus::add_read_audit_stats(
-        records.saturating_sub(last_read_audit.0),
-        batches.saturating_sub(last_read_audit.1),
-    );
-    *last_read_audit = (records, batches);
+    let read_audit = tinycloud.read_audit_health();
+    crate::prometheus::observe_read_audit(last_read_audit, &read_audit);
+    *last_read_audit = read_audit;
 }
 
 /// Run one retention sweep: prune terminal hook deliveries and expired signed
@@ -1722,6 +1724,14 @@ mod retry_after_fairing_tests {
         )
     }
 
+    #[get("/read-audit-busy")]
+    fn read_audit_busy() -> (Status, String) {
+        (
+            Status::ServiceUnavailable,
+            tinycloud_core::ReadAuditError::Busy.to_string(),
+        )
+    }
+
     /// TC-1054: clients tell a retryable database failure (503,
     /// `unavailable_retryable`, `Retry-After`) from one whose write may have
     /// applied (500, `outcome_unknown`, no `Retry-After`); CORS still applies.
@@ -1729,7 +1739,10 @@ mod retry_after_fairing_tests {
     async fn only_retryable_database_failures_carry_retry_after() {
         let client = Client::tracked(
             rocket::build()
-                .mount("/", routes![retryable, unknown, fenced, busy, timeout])
+                .mount(
+                    "/",
+                    routes![retryable, unknown, fenced, busy, timeout, read_audit_busy],
+                )
                 .attach(retry_after_fairing())
                 .attach(cors_fairing()),
         )
@@ -1746,9 +1759,9 @@ mod retry_after_fairing_tests {
         let body = response.into_string().await.unwrap();
         assert_eq!(body, "unavailable_retryable: pool exhausted", "body kept");
 
-        // TC-1274: a busy database asks for a longer pause than a request
-        // that timed out before writing.
-        for (path, retry_after) in [("/busy", "5"), ("/timeout", "1")] {
+        // TC-1274, TC-1317: a busy database or a backlogged read audit asks
+        // for a longer pause than a request that timed out before writing.
+        for (path, retry_after) in [("/busy", "5"), ("/read-audit-busy", "5"), ("/timeout", "1")] {
             let response = client.get(path).dispatch().await;
             assert_eq!(response.status(), Status::ServiceUnavailable, "{path}");
             assert_eq!(

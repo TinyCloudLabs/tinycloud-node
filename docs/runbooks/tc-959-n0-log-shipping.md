@@ -146,7 +146,7 @@ Keep these identities distinct:
 | --- | --- |
 | Before: verifier `docker_compose_file` / hash | Raw preserved pre-N0 compose: `df239749ca0a9c09893a855ae2a8abb94090b8556515ad002105c58ac91f4c91` |
 | Before: application `compose_hash` | `bfe9028a58b23238188aa7d70b82282a7cd6414cd83dcc47a3b295c6f64fe2f8`; a distinct reported identity, not the raw-file hash |
-| After: current profile-enabled raw compose | `6e3b96c886774150f8dc159c9fb063d70a74ab15514bf52667e0068ae94fa391` (TC-1274 #347; supersedes #346's `6563d51b…`); bind this artifact to the final reviewed PR head before any promotion |
+| After: current profile-enabled raw compose | `966199dc65c8dd39295827b30bf80bb432e217fc0e5509cc32f23d06b1148ec0` (TC-1317; supersedes #347's `6e3b96c8…` and #346's `6563d51b…`); bind this artifact to the final reviewed PR head before any promotion |
 
 The raw after hash identifies the profile-enabled compose, not deployment approval. Record its final reviewed PR head and required CI evidence in the officer handoff. Do not infer a raw-file hash from the distinct application-reported compose hash.
 

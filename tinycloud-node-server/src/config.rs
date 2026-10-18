@@ -1380,6 +1380,12 @@ pub struct DatabaseConfig {
     /// `storage.sql` wait bounds, TC-1274).
     #[serde(default = "default_database_retry_window_ms")]
     pub retry_window_ms: u64,
+    /// How long an authorized read waits for its audit record to commit
+    /// before it is answered `503 read_audit_busy` (TC-1317). Its data is
+    /// never returned without the record. Kept below `storage.sql`'s lock wait
+    /// and the `/invoke` deadline, so the typed answer comes first.
+    #[serde(default = "default_database_read_audit_wait_ms")]
+    pub read_audit_wait_ms: u64,
 }
 
 fn default_database_max_connections() -> u32 {
@@ -1426,6 +1432,10 @@ fn default_database_retry_window_ms() -> u64 {
     10_000
 }
 
+fn default_database_read_audit_wait_ms() -> u64 {
+    tinycloud_core::DEFAULT_READ_AUDIT_WAIT.as_millis() as u64
+}
+
 impl Default for DatabaseConfig {
     fn default() -> Self {
         Self {
@@ -1442,6 +1452,7 @@ impl Default for DatabaseConfig {
             tcp_keepalive_retries: default_database_tcp_keepalive_retries(),
             tcp_user_timeout_ms: default_database_tcp_user_timeout_ms(),
             retry_window_ms: default_database_retry_window_ms(),
+            read_audit_wait_ms: default_database_read_audit_wait_ms(),
         }
     }
 }
