@@ -8118,6 +8118,17 @@ mod tests {
         Box::pin(run_policy_v2_flow(PolicyOwner::KvOnlySelfNamedNetwork)).await
     }
 
+    /// TC-1423 (N1b, review B1): the same kv-only policy owner moves the
+    /// content source to its own space, on a network it created, and adds a
+    /// second kv ceiling entry on the space owner's content. Every kv entry
+    /// must name a space of the content source's owner, so registration
+    /// refuses it; otherwise recipients would read the space owner's content
+    /// through a policy that outlives the owner's revocation.
+    #[tokio::test]
+    async fn policy_kv_entries_must_belong_to_the_content_owner() -> anyhow::Result<()> {
+        Box::pin(run_policy_v2_flow(PolicyOwner::KvOnlyOwnSpaceSource)).await
+    }
+
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum PolicyOwner {
         /// The policy owner is the content space's owner.
@@ -8130,6 +8141,10 @@ mod tests {
         /// delegation from the space owner (no decrypt), and the policy's
         /// source network is one named after the policy owner itself.
         KvOnlySelfNamedNetwork,
+        /// As `KvOnlySelfNamedNetwork`, but the content source is the policy
+        /// owner's own space on its own (created) network, and a second kv
+        /// ceiling entry names the space owner's content.
+        KvOnlyOwnSpaceSource,
     }
 
     async fn run_policy_v2_flow(policy_owner: PolicyOwner) -> anyhow::Result<()> {
@@ -8184,6 +8199,14 @@ mod tests {
             None,
             None,
         );
+        // `KvOnlyOwnSpaceSource`: the same path in the policy owner's space.
+        let own_source_resource =
+            SpaceId::new(owner_did.parse::<DIDBuf>()?, "applications".parse()?).to_resource(
+                "kv".parse()?,
+                Some("shares/tc-470/document.txt".parse()?),
+                None,
+                None,
+            );
         let node_secret = StaticSecret::new(vec![29; 32]).unwrap();
         let node_did = node_secret.node_did();
         let issuer_did = projection["issuerDid"].as_str().unwrap();
@@ -8211,12 +8234,15 @@ mod tests {
             "selector": "exact",
             "actions": ["tinycloud.kv/get"]
         })];
-        let encryption_resource = if policy_owner == PolicyOwner::KvOnlySelfNamedNetwork {
+        let encryption_resource = if matches!(
+            policy_owner,
+            PolicyOwner::KvOnlySelfNamedNetwork | PolicyOwner::KvOnlyOwnSpaceSource
+        ) {
             format!("urn:tinycloud:encryption:{owner_did}:share")
         } else {
             format!("urn:tinycloud:encryption:{content_owner_did}:mainnet")
         };
-        let ceiling = vec![
+        let mut ceiling = vec![
             json!({
                 "kind": "kv",
                 "resource": content_resource.to_string(),
@@ -8229,9 +8255,20 @@ mod tests {
                 "action": "tinycloud.encryption/decrypt"
             }),
         ];
+        let source_kv = if policy_owner == PolicyOwner::KvOnlyOwnSpaceSource {
+            ceiling.push(json!({
+                "kind": "kv",
+                "resource": own_source_resource.to_string(),
+                "selector": "exact",
+                "actions": ["tinycloud.kv/get", "tinycloud.kv/metadata"]
+            }));
+            own_source_resource.to_string()
+        } else {
+            content_resource.to_string()
+        };
         let content_source = json!({
             "shareId": "share-tc-470",
-            "kvResource": content_resource.to_string(),
+            "kvResource": source_kv,
             "selector": "exact",
             "encryptionNetwork": encryption_resource,
             "encryptedSymmetricKeyDigestHex": "aa".repeat(32),
@@ -8593,6 +8630,18 @@ mod tests {
                 threshold: tinycloud_core::encryption_network::Threshold::one_of_one(),
             })
             .await?;
+        if policy_owner == PolicyOwner::KvOnlyOwnSpaceSource {
+            // The policy owner's own network, which any DID may create.
+            encryption
+                .create_one_of_one_network(
+                    tinycloud_core::encryption_network::CreateNetworkRequest {
+                        name: "share".into(),
+                        owner_did: owner_did.clone(),
+                        threshold: tinycloud_core::encryption_network::Threshold::one_of_one(),
+                    },
+                )
+                .await?;
+        }
         let rocket = rocket::build()
             .mount(
                 "/",
@@ -8706,7 +8755,9 @@ mod tests {
         // that delegation covers, as the Share and CLI owners do.
         let owner_delegation_cid = if matches!(
             policy_owner,
-            PolicyOwner::DelegatedSession | PolicyOwner::KvOnlySelfNamedNetwork
+            PolicyOwner::DelegatedSession
+                | PolicyOwner::KvOnlySelfNamedNetwork
+                | PolicyOwner::KvOnlyOwnSpaceSource
         ) {
             let mut owner_capabilities = Capabilities::<Value>::new();
             for ability in ["tinycloud.kv/get", "tinycloud.kv/metadata"] {
@@ -8929,7 +8980,10 @@ mod tests {
             assert!(policy_v3_root::Entity::find().one(conn).await?.is_none());
             return Ok(());
         }
-        if policy_owner == PolicyOwner::KvOnlySelfNamedNetwork {
+        if matches!(
+            policy_owner,
+            PolicyOwner::KvOnlySelfNamedNetwork | PolicyOwner::KvOnlyOwnSpaceSource
+        ) {
             assert_eq!(
                 register_status,
                 Status::Forbidden,

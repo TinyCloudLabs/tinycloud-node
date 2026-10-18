@@ -116,6 +116,11 @@ fn kv_resource(owner_did: &str) -> anyhow::Result<ResourceId> {
     )
 }
 
+/// The create-network body for a network `<owner_did>:share`.
+fn own_network_body(owner_did: &str) -> Value {
+    json!({"name": "share", "ownerDid": owner_did, "threshold": {"n": 1, "t": 1}})
+}
+
 /// The registrant's grants on the content: kv get + metadata on the content
 /// resource, and decrypt on each listed network.
 fn content_grants(kv: &ResourceId, decrypt: &[&str]) -> Vec<(String, &'static str)> {
@@ -349,11 +354,12 @@ impl Harness {
     }
 
     /// `POST /encryption/networks` as the SDK sends it: the session key
-    /// invokes `network.create` on `invocation_network` under its CACAO.
+    /// invokes `network.create` on `invocation_network` under its CACAO, or
+    /// with no proof when it names its own network (root authority by name).
     async fn create_network_via_route(
         &self,
         invoker: &KeyPrincipal,
-        proof: &str,
+        proof: Option<&str>,
         invocation_network: &str,
         body: Value,
     ) -> anyhow::Result<Status> {
@@ -379,7 +385,10 @@ impl Harness {
                 "bodyHash": canonical_hash(&body),
                 "action": NETWORK_CREATE_ACTION,
             })]),
-            proof: vec![proof.parse()?],
+            proof: proof
+                .map(str::parse)
+                .into_iter()
+                .collect::<Result<_, _>>()?,
             attenuation,
         }
         .sign(Algorithm::EdDSA, &invoker.jwk)?;
@@ -430,6 +439,19 @@ impl Harness {
         source_network: &str,
         extra: &[&str],
     ) -> anyhow::Result<(Status, String)> {
+        self.register_full(owner, kv_resource, source_network, extra, &[])
+            .await
+    }
+
+    /// [`Self::register`], with `extra_kv` as more kv ceiling entries.
+    async fn register_full(
+        &self,
+        owner: &KeyPrincipal,
+        kv_resource: &str,
+        source_network: &str,
+        extra: &[&str],
+        extra_kv: &[&str],
+    ) -> anyhow::Result<(Status, String)> {
         let now = OffsetDateTime::now_utc().replace_nanosecond(0)?;
         let issued = now - Duration::seconds(5);
         let expires = now + Duration::seconds(600);
@@ -439,6 +461,14 @@ impl Harness {
             "selector": "exact",
             "actions": ["tinycloud.kv/get", "tinycloud.kv/metadata"]
         })];
+        for kv in extra_kv {
+            ceiling.push(json!({
+                "kind": "kv",
+                "resource": kv,
+                "selector": "exact",
+                "actions": ["tinycloud.kv/get", "tinycloud.kv/metadata"]
+            }));
+        }
         for network in std::iter::once(&source_network).chain(extra) {
             ceiling.push(json!({"kind": "encryption", "resource": network, "action": DECRYPT}));
         }
@@ -774,7 +804,7 @@ async fn pkh_owner_registers(harness: Harness, name: &str) -> anyhow::Result<()>
     harness
         .create_network_via_route(
             &session,
-            &cacao,
+            Some(&cacao),
             &network(&account.did(1), name),
             json!({"name": name, "ownerDid": account.did(1), "threshold": {"n": 1, "t": 1}}),
         )
@@ -824,6 +854,115 @@ async fn chain_id_mismatch_is_refused() -> anyhow::Result<()> {
         "foreign_owner",
     )
     .await
+}
+
+/// The B1 shape (review of #363): K holds only kv on V's content. K creates a
+/// network named after itself (any DID may, with no proof) and registers a
+/// policy whose source is K's own space on that network, with a second kv
+/// ceiling entry on V's content. Every kv entry must name a space of the
+/// source's owner, so it is refused.
+#[tokio::test]
+async fn kv_entry_outside_the_content_owner_is_refused() -> anyhow::Result<()> {
+    let case = KeyOwnerCase::new(&[]).await?;
+    let k = &case.session;
+    let own_network = network(&k.did, "share");
+    case.harness
+        .create_network_via_route(k, None, &own_network, own_network_body(&k.did))
+        .await?;
+    let own_source = kv_resource(&k.did)?.to_string();
+    assert_refused(
+        case.harness
+            .register_full(k, &own_source, &own_network, &[], &[&case.kv.to_string()]),
+        "foreign_space",
+    )
+    .await
+}
+
+/// K sharing its own space on its own network is unaffected.
+#[tokio::test]
+async fn own_space_on_own_network_registers() -> anyhow::Result<()> {
+    let case = KeyOwnerCase::new(&[]).await?;
+    let k = &case.session;
+    let own_network = network(&k.did, "share");
+    case.harness
+        .create_network_via_route(k, None, &own_network, own_network_body(&k.did))
+        .await?;
+    assert_registered(
+        case.harness
+            .register(k, &kv_resource(&k.did)?.to_string(), &own_network, &[])
+            .await?,
+    );
+    Ok(())
+}
+
+/// Several kv entries pass when every one names a space of the content
+/// owner, here a second space of V's.
+#[tokio::test]
+async fn kv_entries_all_owned_by_the_content_owner_register() -> anyhow::Result<()> {
+    let case = KeyOwnerCase::new(&["default"]).await?;
+    case.harness
+        .create_network(&case.owner.did, "default")
+        .await?;
+    let notes = SpaceId::new(case.owner.did.parse::<DIDBuf>()?, "notes".parse()?).to_resource(
+        "kv".parse()?,
+        Some(KV_PATH.parse()?),
+        None,
+        None,
+    );
+    case.harness
+        .delegate_ucan(&case.owner, &case.session.did, &content_grants(&notes, &[]))
+        .await?;
+    assert_registered(
+        case.harness
+            .register_full(
+                &case.session,
+                &case.kv.to_string(),
+                &case.network("default"),
+                &[],
+                &[&notes.to_string()],
+            )
+            .await?,
+    );
+    Ok(())
+}
+
+/// A legacy `tinycloud://` kv entry names no space owner: refused like a
+/// legacy source. A kv entry that doesn't parse never gets this far
+/// (`400 kv-resource-invalid`).
+#[tokio::test]
+async fn legacy_or_unparsable_kv_entry_is_refused() -> anyhow::Result<()> {
+    let case = KeyOwnerCase::new(&["default"]).await?;
+    case.harness
+        .create_network(&case.owner.did, "default")
+        .await?;
+    let source = case.network("default");
+    let legacy = format!("tinycloud://applications/kv/{KV_PATH}");
+    assert_refused(
+        case.harness.register_full(
+            &case.session,
+            &case.kv.to_string(),
+            &source,
+            &[],
+            &[&legacy],
+        ),
+        "legacy_resource",
+    )
+    .await?;
+    let (status, body) = case
+        .harness
+        .register_full(
+            &case.session,
+            &case.kv.to_string(),
+            &source,
+            &[],
+            &["not-a-resource"],
+        )
+        .await?;
+    assert_eq!(
+        (status, body.as_str()),
+        (Status::BadRequest, "kv-resource-invalid")
+    );
+    Ok(())
 }
 
 fn postgres_url(test: &str) -> Option<String> {
