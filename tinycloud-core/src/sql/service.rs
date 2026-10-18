@@ -2402,12 +2402,16 @@ mod tests {
                 u64::MAX,
                 repo.clone(),
             );
+            // The bound is above every bounded wait on this path (lock 30 s,
+            // hydration 30 s, transfer 45 s), so a slow-but-bounded stall
+            // surfaces as a typed `Busy(stage)` naming the stage; only an
+            // unbounded wait trips this timeout (TC-1317 review).
             let run = |db: &'static str, request: SqlRequest, ability: &'static str| {
                 let service = &service;
                 let space = &space;
                 async move {
                     tokio::time::timeout(
-                        std::time::Duration::from_secs(10),
+                        std::time::Duration::from_secs(60),
                         service.execute(space, db, request, None, ability.to_string()),
                     )
                     .await
@@ -2448,7 +2452,7 @@ mod tests {
                 .expect_err("a read whose hydration failed must fail");
             assert!(matches!(err, SqlError::Unavailable), "{err:?}");
             let served = tokio::time::timeout(
-                std::time::Duration::from_secs(10),
+                std::time::Duration::from_secs(60),
                 cold.execute(&space, "a", count(), None, "tinycloud.sql/read".into()),
             )
             .await
