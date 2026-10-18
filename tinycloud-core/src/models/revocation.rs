@@ -451,7 +451,9 @@ async fn canonical_identity<C: ConnectionTrait>(db: &C, id: Hash) -> Result<Hash
 
 /// The stored delegation a CID names: the row with that ID, or the stored
 /// historical encoding whose canonical identity it is. Signed CIDs stay as
-/// signed; authorization uses the stored row.
+/// signed; authorization uses the stored row. When several stored encodings
+/// share the canonical identity, the lowest stored ID is chosen so the result
+/// is the same on every call and every database.
 pub(crate) async fn target_for_cid<C: ConnectionTrait>(
     db: &C,
     target: Hash,
@@ -461,6 +463,7 @@ pub(crate) async fn target_for_cid<C: ConnectionTrait>(
     }
     let Some(alias) = delegation_cid_alias::Entity::find()
         .filter(delegation_cid_alias::Column::Canonical.eq(target))
+        .order_by_asc(delegation_cid_alias::Column::Id)
         .one(db)
         .await?
     else {
