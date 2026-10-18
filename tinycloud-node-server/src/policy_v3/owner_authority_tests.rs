@@ -1988,8 +1988,16 @@ async fn root_lifetime_is_capped_in_both_modes(backend: Backend) -> anyhow::Resu
             let refused = counter("tinycloud_policy_root_lifetime_refused_total", &[]);
             let (status, body, registered) = h.register(root).await?;
             assert_eq!(status, Status::Forbidden, "{mode} {label}: {body}");
-            assert_eq!(body, "policy-root-lifetime-exceeded", "{mode} {label}");
-            assert!(counter("tinycloud_policy_root_lifetime_refused_total", &[]) >= refused + 1.0);
+            if root.not_before > now() {
+                // A root that is not yet valid already fails the signed
+                // time check that runs before the cap.
+                assert_eq!(body, "policy-root-signature-invalid", "{mode} {label}");
+            } else {
+                assert_eq!(body, "policy-root-lifetime-exceeded", "{mode} {label}");
+                assert!(
+                    counter("tinycloud_policy_root_lifetime_refused_total", &[]) >= refused + 1.0
+                );
+            }
             assert_eq!(h.binding(&registered.policy_cid).await?, None);
         }
         // A released SDK signs `nbf` at signing time with `exp - nbf <= 31 d`.

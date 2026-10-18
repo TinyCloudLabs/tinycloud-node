@@ -246,6 +246,7 @@ fn build_info(
     quota_cache: &State<QuotaCache>,
     encryption: &State<EncryptionService>,
     database: Option<&tinycloud_core::RecoveringConnection>,
+    owner_authority: Option<crate::config::OwnerAuthorityExpiry>,
 ) -> NodeInfo {
     #[allow(unused_mut)]
     let mut features = vec!["kv", "delegation", "sharing", "sql"];
@@ -260,6 +261,16 @@ fn build_info(
     ]);
     #[cfg(feature = "dstack")]
     features.push("tee");
+    // TC-1423: Policy/v3 registrations are bound to the owner authority
+    // (`-v1`), plus exactly one active expiry mode. Clients treat the node as
+    // enforcing only when `-enforce` is listed.
+    if let Some(mode) = owner_authority {
+        features.push("policy-owner-authority-v1");
+        features.push(match mode {
+            crate::config::OwnerAuthorityExpiry::Record => "policy-owner-authority-record",
+            crate::config::OwnerAuthorityExpiry::Enforce => "policy-owner-authority-enforce",
+        });
+    }
     NodeInfo {
         protocol: tinycloud_auth::protocol::PROTOCOL_VERSION,
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -281,6 +292,26 @@ fn build_info(
                 sockets_configured: sqlx_core::net::tcp_keepalive::sockets_configured(),
                 connections_opened: crate::postgres_connections_opened(),
             }),
+    }
+}
+
+/// The Policy/v3 owner-authority mode, if the node serves Policy/v3. Never
+/// fails, so a fixture without the policy runtime still launches.
+pub struct OwnerAuthorityMode(Option<crate::config::OwnerAuthorityExpiry>);
+
+#[rocket::async_trait]
+impl<'r> rocket::request::FromRequest<'r> for OwnerAuthorityMode {
+    type Error = std::convert::Infallible;
+
+    async fn from_request(
+        request: &'r rocket::Request<'_>,
+    ) -> rocket::request::Outcome<Self, Self::Error> {
+        rocket::request::Outcome::Success(OwnerAuthorityMode(
+            request
+                .rocket()
+                .state::<crate::policy_v3::PolicyV3Runtime>()
+                .map(crate::policy_v3::PolicyV3Runtime::owner_authority_expiry),
+        ))
     }
 }
 
@@ -309,8 +340,15 @@ pub fn info(
     quota_cache: &State<QuotaCache>,
     encryption: &State<EncryptionService>,
     pool: NodePool<'_>,
+    owner_authority: OwnerAuthorityMode,
 ) -> Json<NodeInfo> {
-    Json(build_info(tee, quota_cache, encryption, pool.0))
+    Json(build_info(
+        tee,
+        quota_cache,
+        encryption,
+        pool.0,
+        owner_authority.0,
+    ))
 }
 
 #[get("/version")]
@@ -319,8 +357,15 @@ pub fn version(
     quota_cache: &State<QuotaCache>,
     encryption: &State<EncryptionService>,
     pool: NodePool<'_>,
+    owner_authority: OwnerAuthorityMode,
 ) -> Json<NodeInfo> {
-    Json(build_info(tee, quota_cache, encryption, pool.0))
+    Json(build_info(
+        tee,
+        quota_cache,
+        encryption,
+        pool.0,
+        owner_authority.0,
+    ))
 }
 
 #[allow(clippy::let_unit_value)]

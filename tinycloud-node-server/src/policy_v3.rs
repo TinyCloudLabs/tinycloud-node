@@ -1860,19 +1860,29 @@ pub async fn register_policy(
         .get("ownerDid")
         .and_then(Value::as_str)
         .ok_or((Status::BadRequest, "policy-owner-missing".into()))?;
-    // Both roots carry the same capabilities (`validate_root_pair`), so one
-    // selection covers both. The chosen authority is recorded with the
-    // registration below.
+    // Both roots carry the same validity window and capabilities
+    // (`validate_root_pair`), so one check covers both.
+    let checked_at = OffsetDateTime::now_utc();
+    let policy_root_expiry = policy_root
+        .0
+        .expiry
+        .ok_or((Status::Forbidden, "sibling-root-mismatch".into()))?;
+    let root_not_before = policy_root
+        .0
+        .not_before
+        .ok_or((Status::Forbidden, "sibling-root-mismatch".into()))?;
+    if !owner_authority::root_lifetime_allowed(checked_at, root_not_before, policy_root_expiry) {
+        crate::prometheus::observe_policy_root_lifetime_refused();
+        return Err((Status::Forbidden, "policy-root-lifetime-exceeded".into()));
+    }
+    // The chosen authority is recorded with the registration below.
     let authority = owner_authority::classify(
         &runtime.conn,
         owner_did,
         &policy_root.0.capabilities,
-        OffsetDateTime::now_utc(),
+        checked_at,
         None,
-        policy_root
-            .0
-            .expiry
-            .ok_or((Status::Forbidden, "sibling-root-mismatch".into()))?,
+        policy_root_expiry,
     )
     .await
     .map_err(|_| {
@@ -1883,6 +1893,15 @@ pub async fn register_policy(
     })?;
     if authority.state == owner_authority::BindingState::Unknown {
         return Err((Status::Forbidden, "policy-owner-not-authorized".into()));
+    }
+    let registered_mode =
+        owner_authority::RegisteredMode::current(runtime.owner_authority_expiry());
+    let expiry_exceeded = authority.state == owner_authority::BindingState::BoundUncapped;
+    if expiry_exceeded && registered_mode == owner_authority::RegisteredMode::Enforce {
+        return Err((
+            Status::Forbidden,
+            "policy-root-outlives-owner-authority".into(),
+        ));
     }
     for root in [&policy_root, &enforcement_root] {
         for space in root.0.spaces() {
@@ -1980,7 +1999,7 @@ pub async fn register_policy(
         &txn,
         &request.policy_cid,
         &authority,
-        owner_authority::RegisteredMode::Record,
+        registered_mode,
         now,
     )
     .await
@@ -2022,6 +2041,12 @@ pub async fn register_policy(
         .map_err(|e| (Status::Conflict, e.to_string()))?;
     }
     txn.commit().await.map_err(db_error)?;
+    if expiry_exceeded {
+        // The `enforce` flip signal: counted once per stored registration.
+        crate::prometheus::observe_policy_owner_authority_expiry_exceeded(
+            owner_authority::authority_ttl_bucket(checked_at, authority.authority_expires_at),
+        );
+    }
     Ok(Json(RegisterResponse {
         policy_cid: request.policy_cid,
         policy_root_cid,

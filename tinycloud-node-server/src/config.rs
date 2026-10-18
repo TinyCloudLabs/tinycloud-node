@@ -997,8 +997,23 @@ pub struct PolicyV3Config {
     /// `TINYCLOUD_POLICY_V3__LEGACY_CUTOVER`.
     #[serde(default)]
     pub legacy_cutover: Option<String>,
+    /// Whether a policy root may outlive the owner authority it was
+    /// registered under. `record` (the default) accepts and counts such
+    /// roots; `enforce` refuses them. Env
+    /// `TINYCLOUD_POLICY_V3__OWNER_AUTHORITY_EXPIRY`.
+    #[serde(default)]
+    pub owner_authority_expiry: OwnerAuthorityExpiry,
     #[serde(default)]
     pub owner_binding_backfill: OwnerBindingBackfillConfig,
+}
+
+/// See [`PolicyV3Config::owner_authority_expiry`].
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Hash, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum OwnerAuthorityExpiry {
+    #[default]
+    Record,
+    Enforce,
 }
 
 impl PolicyV3Config {

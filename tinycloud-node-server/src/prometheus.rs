@@ -370,3 +370,55 @@ mod tests {
         assert_eq!(TimeRejection::NotYetValid.as_str(), "not_yet_valid");
     }
 }
+
+// TC-1423: Policy/v3 owner-authority counters. Always counted (they are
+// rare, cheap, and the `enforce` flip is decided on them), like the DID
+// resolution refusals above.
+lazy_static! {
+    static ref POLICY_OWNER_AUTHORITY_EXPIRY_EXCEEDED: IntCounterVec = register_int_counter_vec!(
+        "tinycloud_policy_owner_authority_expiry_exceeded_total",
+        "Policy/v3 registrations accepted in record mode whose root outlives the owner authority, by authority lifetime at registration.",
+        &["authority_ttl_bucket"]
+    )
+    .unwrap();
+    static ref POLICY_ROOT_LIFETIME_REFUSED: IntCounter = register_int_counter!(
+        "tinycloud_policy_root_lifetime_refused_total",
+        "Policy/v3 registrations refused because a root outlives registration + 31 days or starts after it expires."
+    )
+    .unwrap();
+    static ref POLICY_LEGACY_ROOT_LIFETIME_EXCEEDED: IntCounter = register_int_counter!(
+        "tinycloud_policy_legacy_root_lifetime_exceeded_total",
+        "Policy/v3 registrations from before the legacy cutover whose root outlives registration + 31 days, counted when classified."
+    )
+    .unwrap();
+    static ref POLICY_OWNER_BINDING_BACKFILL: IntCounterVec = register_int_counter_vec!(
+        "tinycloud_policy_owner_binding_backfill_total",
+        "Policy/v3 registrations classified after registration, by outcome.",
+        &["outcome"]
+    )
+    .unwrap();
+}
+
+/// Authority lifetime at registration: `le_1h` (released Share, signed by a
+/// login session), `le_30d` (CLI device sessions), `gt_30d`, or `none`.
+pub fn observe_policy_owner_authority_expiry_exceeded(bucket: &'static str) {
+    POLICY_OWNER_AUTHORITY_EXPIRY_EXCEEDED
+        .with_label_values(&[bucket])
+        .inc();
+}
+
+pub fn observe_policy_root_lifetime_refused() {
+    POLICY_ROOT_LIFETIME_REFUSED.inc();
+}
+
+pub fn observe_policy_legacy_root_lifetime_exceeded() {
+    POLICY_LEGACY_ROOT_LIFETIME_EXCEEDED.inc();
+}
+
+/// `bound`, `bound_uncapped`, `root_authority`, `unknown` or
+/// `write_failed_served`.
+pub fn observe_policy_owner_binding_backfill(outcome: &'static str) {
+    POLICY_OWNER_BINDING_BACKFILL
+        .with_label_values(&[outcome])
+        .inc();
+}
