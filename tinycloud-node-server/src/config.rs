@@ -1468,6 +1468,15 @@ pub struct DidResolutionConfig {
 }
 
 impl DatabaseConfig {
+    /// Reject settings that would make the node unusable (TC-1317): a zero
+    /// read-audit wait would answer every authorized read `read_audit_busy`.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.read_audit_wait_ms == 0 {
+            return Err("database.read_audit_wait_ms must be greater than zero");
+        }
+        Ok(())
+    }
+
     /// The pool's PostgreSQL `statement_timeout` policy.
     pub fn statement_timeouts(&self) -> StatementTimeouts {
         StatementTimeouts {
@@ -1591,6 +1600,21 @@ mod tests {
             let mut config = Config::default();
             config.hooks.webhook_max_attempts = attempts;
             assert!(crate::resolve_runtime_config(&config).is_err());
+        }
+    }
+
+    /// TC-1317: a zero read-audit wait would answer every read busy, so the
+    /// node refuses to start with it.
+    #[test]
+    fn tc1317_startup_rejects_a_zero_read_audit_wait() {
+        for (wait_ms, ok) in [(0, false), (1, true), (20_000, true)] {
+            let mut config = Config::default();
+            config.database.read_audit_wait_ms = wait_ms;
+            assert_eq!(
+                crate::resolve_runtime_config(&config).is_ok(),
+                ok,
+                "{wait_ms}"
+            );
         }
     }
 
