@@ -1016,6 +1016,15 @@ pub enum OwnerAuthorityExpiry {
     Enforce,
 }
 
+impl OwnerAuthorityExpiry {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Record => "record",
+            Self::Enforce => "enforce",
+        }
+    }
+}
+
 impl PolicyV3Config {
     pub fn validate(&self) -> Result<(), &'static str> {
         if let Some(cutover) = &self.legacy_cutover {

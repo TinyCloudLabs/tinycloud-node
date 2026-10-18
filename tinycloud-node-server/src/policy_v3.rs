@@ -2041,10 +2041,10 @@ pub async fn register_policy(
         .map_err(|e| (Status::Conflict, e.to_string()))?;
     }
     txn.commit().await.map_err(db_error)?;
-    if expiry_exceeded {
-        // The `enforce` flip signal: counted once per stored registration.
+    // The `enforce` flip signal: counted once per stored registration.
+    if let (true, Some(authority_expires_at)) = (expiry_exceeded, authority.authority_expires_at) {
         crate::prometheus::observe_policy_owner_authority_expiry_exceeded(
-            owner_authority::authority_ttl_bucket(checked_at, authority.authority_expires_at),
+            owner_authority::authority_ttl_bucket(checked_at, authority_expires_at),
         );
     }
     Ok(Json(RegisterResponse {

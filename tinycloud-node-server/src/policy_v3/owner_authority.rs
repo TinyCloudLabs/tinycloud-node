@@ -266,16 +266,22 @@ pub(super) fn root_lifetime_allowed(
     not_before <= expiry && expiry <= registered_at + MAX_ROOT_LIFETIME + ROOT_LIFETIME_SKEW
 }
 
-/// The `authority_ttl_bucket` of a root that outlives its authority.
+/// The `authority_ttl_bucket` of a root that outlives its authority, by
+/// how long the authority had left at registration: `le_1h` (released
+/// Share, signed by a login session), `le_30d` (CLI device sessions) or
+/// `gt_30d`. Only `bound-uncapped` roots are bucketed, and their authority
+/// always expires.
 pub(super) fn authority_ttl_bucket(
     registered_at: OffsetDateTime,
-    authority_expires_at: Option<OffsetDateTime>,
+    authority_expires_at: OffsetDateTime,
 ) -> &'static str {
-    match authority_expires_at {
-        None => "none",
-        Some(expiry) if expiry - registered_at <= Duration::hours(1) => "le_1h",
-        Some(expiry) if expiry - registered_at <= Duration::days(30) => "le_30d",
-        Some(_) => "gt_30d",
+    let remaining = authority_expires_at - registered_at;
+    if remaining <= Duration::hours(1) {
+        "le_1h"
+    } else if remaining <= Duration::days(30) {
+        "le_30d"
+    } else {
+        "gt_30d"
     }
 }
 
@@ -857,6 +863,7 @@ impl PolicyV3Runtime {
                     event = "policy_owner_authority",
                     legacy_cutover = %format_time(cutover),
                     source = CutoverSource::Migration.as_str(),
+                    owner_authority_expiry = self.owner_authority_expiry().as_str(),
                     "policy owner-authority legacy cutover is the binding migration's applied-at time, less than a day ago; after a rollback and re-upgrade, set policy_v3.legacy_cutover to the first deploy time"
                 )
             }
@@ -864,10 +871,12 @@ impl PolicyV3Runtime {
                 event = "policy_owner_authority",
                 legacy_cutover = %format_time(cutover),
                 source = source.as_str(),
+                owner_authority_expiry = self.owner_authority_expiry().as_str(),
                 "policy owner-authority legacy cutover"
             ),
             Err(_) => ::tracing::warn!(
                 event = "policy_owner_authority",
+                owner_authority_expiry = self.owner_authority_expiry().as_str(),
                 "policy owner-authority legacy cutover is unavailable; legacy policies are classified when it can be read"
             ),
         }
@@ -1517,5 +1526,46 @@ mod tests {
         }
         tokio::task::yield_now().await;
         assert_eq!(queries.load(Ordering::SeqCst), before);
+    }
+
+    /// The cap is exact: registration + 31 days + 5 minutes is accepted, one
+    /// second more is refused; `nbf` may equal `exp` but not pass it.
+    #[test]
+    fn root_lifetime_cap_boundaries_are_exact() {
+        let registered_at = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let cap = registered_at + Duration::days(31) + Duration::minutes(5);
+        assert!(root_lifetime_allowed(registered_at, registered_at, cap));
+        assert!(!root_lifetime_allowed(
+            registered_at,
+            registered_at,
+            cap + Duration::seconds(1)
+        ));
+        assert!(root_lifetime_allowed(registered_at, cap, cap));
+        assert!(!root_lifetime_allowed(
+            registered_at,
+            cap,
+            cap - Duration::seconds(1)
+        ));
+    }
+
+    /// The flip signal's buckets: exactly one hour left is `le_1h`, one
+    /// second more `le_30d`; exactly 30 days `le_30d`, one second more
+    /// `gt_30d`.
+    #[test]
+    fn authority_ttl_bucket_edges_are_exact() {
+        let at = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        for (remaining, bucket) in [
+            (Duration::seconds(90), "le_1h"),
+            (Duration::hours(1), "le_1h"),
+            (Duration::hours(1) + Duration::seconds(1), "le_30d"),
+            (Duration::days(30), "le_30d"),
+            (Duration::days(30) + Duration::seconds(1), "gt_30d"),
+        ] {
+            assert_eq!(
+                authority_ttl_bucket(at, at + remaining),
+                bucket,
+                "{remaining}"
+            );
+        }
     }
 }
