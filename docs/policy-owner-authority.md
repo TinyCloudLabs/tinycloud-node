@@ -29,10 +29,17 @@ classified later.
 
 ## Root lifetime and mode
 
-At registration, in both modes, a root is refused with `403
-policy-root-lifetime-exceeded` unless `exp <= registered_at + 31 days + 5
-minutes` and `nbf <= exp`. Released SDKs sign `nbf` at signing time with
-`exp - nbf <= 31 days`, so their roots pass.
+At registration, in both modes, a root that expires later than
+`registered_at + 31 days + 5 minutes` is refused with `403
+policy-root-lifetime-exceeded`. (A root that isn't valid yet is already refused
+by the signed time check, `policy-root-signature-invalid`; the node also
+requires `nbf <= exp` when it classifies an unclassified registration later.)
+Released SDKs sign `nbf` at signing time with `exp - nbf <= 31 days`, so their
+roots pass.
+
+The cap and the `enforce` check run before the idempotent re-registration
+shortcut, so re-posting an existing registration that breaks the current rules
+gets the same `403`.
 
 ```toml
 [policy_v3]
@@ -62,11 +69,13 @@ if `policy-owner-authority-enforce` is listed. The response carries no
 
 ### Metrics
 
-Always counted, independent of `telemetry.enabled`:
+Always counted, independent of the request-telemetry sampling. They are
+exported on the node's Prometheus port, which runs only when
+`telemetry.enabled` is set; without it, use the counting queries below.
 
 | metric | labels | counts |
 |---|---|---|
-| `tinycloud_policy_owner_authority_expiry_exceeded_total` | `authority_ttl_bucket` = `le_1h`, `le_30d`, `gt_30d`, `none` | `record` registrations whose root outlives the authority (authority lifetime from registration) |
+| `tinycloud_policy_owner_authority_expiry_exceeded_total` | `authority_ttl_bucket` = `le_1h`, `le_30d`, `gt_30d` (authority time left at registration; `le_1h` includes exactly one hour) | `record` registrations whose root outlives the authority |
 | `tinycloud_policy_root_lifetime_refused_total` | | lifetime-cap refusals |
 | `tinycloud_policy_legacy_root_lifetime_exceeded_total` | | legacy roots longer than 31 days, when classified |
 | `tinycloud_policy_owner_binding_backfill_total` | `outcome` = `bound`, `bound_uncapped`, `root_authority`, `unknown`, `write_failed_served` | classifications after registration |
@@ -147,16 +156,16 @@ classified again on a later use.
 
 ## Policies registered earlier
 
-A policy with no binding row is classified in the background on first use,
-off the request: the selection runs as of its registration time (delegations
-issued after it are not considered; UCANs carry no issue time and stay
-eligible), then one transaction inserts the binding row first and its closure
-after it. A concurrent writer that stored a row first wins. One task runs per
-policy at a time. If the write fails (lock timeout, SQLite busy) or the result
-is `starved`, the row stays pending and the request path doesn't start another
-attempt for 60 seconds. Policies whose stored classification is final are
-remembered in process (bounded), so steady-state reads add no query. An
-`unknown` row written by an older `classifier_version` is classified again.
+A policy with no final binding row is classified on first use, because the
+use is checked against the result: the selection runs as of its registration
+time (delegations issued after it are not considered; UCANs carry no issue
+time and stay eligible), the request is served from that result, and the
+write runs in the background: one transaction inserts the binding row first
+and its closure after it, and a concurrent writer that stored a row first
+wins. One write runs per policy, and at most three in the whole process. A
+result that isn't final (its write failed or found no free slot, or it is
+`starved`) is reused for 60 seconds before it is computed again. An `unknown`
+row written by an older `classifier_version` is classified again.
 
 The opt-in sweep classifies pending policies off the request path:
 

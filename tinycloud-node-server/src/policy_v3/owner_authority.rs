@@ -57,6 +57,8 @@ const LAZY_WRITE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_mill
 const RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
 /// Bound on the process-local sets below; a full set is cleared.
 const MAX_TRACKED_POLICIES: usize = 65_536;
+/// Background classification writes running at once, process-wide.
+const MAX_BACKGROUND_CLASSIFICATIONS: usize = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BindingState {
@@ -303,16 +305,22 @@ pub(super) fn root_lifetime_allowed(
     not_before <= expiry && expiry <= registered_at + MAX_ROOT_LIFETIME + ROOT_LIFETIME_SKEW
 }
 
-/// The `authority_ttl_bucket` of a root that outlives its authority.
+/// The `authority_ttl_bucket` of a root that outlives its authority, by
+/// how long the authority had left at registration: `le_1h` (released
+/// Share, signed by a login session), `le_30d` (CLI device sessions) or
+/// `gt_30d`. Only `bound-uncapped` roots are bucketed, and their authority
+/// always expires.
 pub(super) fn authority_ttl_bucket(
     registered_at: OffsetDateTime,
-    authority_expires_at: Option<OffsetDateTime>,
+    authority_expires_at: OffsetDateTime,
 ) -> &'static str {
-    match authority_expires_at {
-        None => "none",
-        Some(expiry) if expiry - registered_at <= Duration::hours(1) => "le_1h",
-        Some(expiry) if expiry - registered_at <= Duration::days(30) => "le_30d",
-        Some(_) => "gt_30d",
+    let remaining = authority_expires_at - registered_at;
+    if remaining <= Duration::hours(1) {
+        "le_1h"
+    } else if remaining <= Duration::days(30) {
+        "le_30d"
+    } else {
+        "gt_30d"
     }
 }
 
@@ -720,6 +728,8 @@ pub(super) struct OwnerAuthorityState {
     transient: std::sync::Mutex<HashMap<String, (Binding, tokio::time::Instant)>>,
     /// Policies with a background write running.
     in_flight: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Slots for background writes.
+    background: BackgroundSlots,
     /// When each escaped policy was last logged.
     escape_logged: std::sync::Mutex<HashMap<String, tokio::time::Instant>>,
 }
@@ -801,6 +811,51 @@ async fn recorded_closure<C: ConnectionTrait>(
         .all(conn)
         .await
         .map(|rows| rows.into_iter().map(|row| row.delegation_id).collect())
+}
+
+/// The process-wide limit on background classifications.
+pub(super) struct BackgroundSlots(Arc<tokio::sync::Semaphore>);
+
+impl Default for BackgroundSlots {
+    fn default() -> Self {
+        Self(Arc::new(tokio::sync::Semaphore::new(
+            MAX_BACKGROUND_CLASSIFICATIONS,
+        )))
+    }
+}
+
+/// A running background classification: holds a slot and the policy's
+/// in-flight mark, and releases both when dropped, including when the task
+/// panics.
+struct InFlight {
+    state: Arc<OwnerAuthorityState>,
+    policy_cid: String,
+    _slot: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl InFlight {
+    /// Claim a slot and the policy's mark; `None` when the policy is
+    /// already in flight, or no slot is free.
+    fn claim(state: &Arc<OwnerAuthorityState>, policy_cid: &str) -> Option<Self> {
+        let slot = Arc::clone(&state.background.0).try_acquire_owned().ok()?;
+        let mut in_flight = state.in_flight.lock().expect("owner-authority in-flight");
+        if in_flight.len() >= MAX_TRACKED_POLICIES || !in_flight.insert(policy_cid.to_owned()) {
+            return None;
+        }
+        Some(Self {
+            state: Arc::clone(state),
+            policy_cid: policy_cid.to_owned(),
+            _slot: slot,
+        })
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        if let Ok(mut in_flight) = self.state.in_flight.lock() {
+            in_flight.remove(&self.policy_cid);
+        }
+    }
 }
 
 /// SQL form of `!row_is_final`.
@@ -889,6 +944,7 @@ impl PolicyV3Runtime {
                     event = "policy_owner_authority",
                     legacy_cutover = %format_time(cutover),
                     source = CutoverSource::Migration.as_str(),
+                    owner_authority_expiry = self.owner_authority_expiry().as_str(),
                     "policy owner-authority legacy cutover is the binding migration's applied-at time, less than a day ago; after a rollback and re-upgrade, set policy_v3.legacy_cutover to the first deploy time"
                 )
             }
@@ -896,10 +952,12 @@ impl PolicyV3Runtime {
                 event = "policy_owner_authority",
                 legacy_cutover = %format_time(cutover),
                 source = source.as_str(),
+                owner_authority_expiry = self.owner_authority_expiry().as_str(),
                 "policy owner-authority legacy cutover"
             ),
             Err(_) => ::tracing::warn!(
                 event = "policy_owner_authority",
+                owner_authority_expiry = self.owner_authority_expiry().as_str(),
                 "policy owner-authority legacy cutover is unavailable; legacy policies are classified when it can be read"
             ),
         }
@@ -1023,25 +1081,18 @@ impl PolicyV3Runtime {
         let (classification, mode) = self.classify_registration(registration).await?;
         let binding = Binding::from_classification(&classification, mode);
         state.remember_transient(policy_cid, binding.clone());
-        let claimed = state
-            .in_flight
-            .lock()
-            .expect("owner-authority in-flight")
-            .insert(policy_cid.clone());
-        if claimed {
+        // The write runs in the background (one per policy, a few at once).
+        // Without a free slot this request still uses its result; the write
+        // is retried once the in-memory result expires.
+        if let Some(claim) = InFlight::claim(state, policy_cid) {
             let runtime = self.clone();
             let policy_cid = policy_cid.clone();
             let stale = existing.is_some();
             tokio::spawn(async move {
+                let _claim = claim;
                 runtime
                     .store_classification(&policy_cid, classification, mode, stale)
                     .await;
-                runtime
-                    .owner_authority
-                    .in_flight
-                    .lock()
-                    .expect("owner-authority in-flight")
-                    .remove(&policy_cid);
             });
         }
         Ok(binding)
@@ -1622,6 +1673,25 @@ mod tests {
         .unwrap();
     }
 
+    /// A background write that panics releases its policy and
+    /// its slot.
+    #[tokio::test]
+    async fn a_panicking_classification_releases_its_claim() {
+        let (runtime, _) = counted_runtime().await;
+        let claim = InFlight::claim(&runtime.owner_authority, "policy-panics").unwrap();
+        let result = tokio::spawn(async move {
+            let _claim = claim;
+            panic!("classification failed");
+        })
+        .await;
+        assert!(result.unwrap_err().is_panic());
+        assert!(runtime.owner_authority.in_flight.lock().unwrap().is_empty());
+        assert_eq!(
+            runtime.owner_authority.background.0.available_permits(),
+            MAX_BACKGROUND_CLASSIFICATIONS
+        );
+    }
+
     /// Once a final classification is loaded, a use costs one revocation
     /// query for a recorded closure and nothing for root authority.
     #[tokio::test]
@@ -1740,6 +1810,47 @@ mod tests {
                 .await
                 .map(|_| ());
             assert_eq!(result, expected, "{mode:?}");
+        }
+    }
+
+    /// The cap is exact: registration + 31 days + 5 minutes is accepted, one
+    /// second more is refused; `nbf` may equal `exp` but not pass it.
+    #[test]
+    fn root_lifetime_cap_boundaries_are_exact() {
+        let registered_at = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let cap = registered_at + Duration::days(31) + Duration::minutes(5);
+        assert!(root_lifetime_allowed(registered_at, registered_at, cap));
+        assert!(!root_lifetime_allowed(
+            registered_at,
+            registered_at,
+            cap + Duration::seconds(1)
+        ));
+        assert!(root_lifetime_allowed(registered_at, cap, cap));
+        assert!(!root_lifetime_allowed(
+            registered_at,
+            cap,
+            cap - Duration::seconds(1)
+        ));
+    }
+
+    /// The flip signal's buckets: exactly one hour left is `le_1h`, one
+    /// second more `le_30d`; exactly 30 days `le_30d`, one second more
+    /// `gt_30d`.
+    #[test]
+    fn authority_ttl_bucket_edges_are_exact() {
+        let at = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        for (remaining, bucket) in [
+            (Duration::seconds(90), "le_1h"),
+            (Duration::hours(1), "le_1h"),
+            (Duration::hours(1) + Duration::seconds(1), "le_30d"),
+            (Duration::days(30), "le_30d"),
+            (Duration::days(30) + Duration::seconds(1), "gt_30d"),
+        ] {
+            assert_eq!(
+                authority_ttl_bucket(at, at + remaining),
+                bucket,
+                "{remaining}"
+            );
         }
     }
 }
