@@ -51,8 +51,9 @@ const OWNER_FIRST_ROWS: u64 = 64;
 const LISTING_PAGE: u64 = 100;
 /// How long a background classification waits for the SQLite writer.
 const LAZY_WRITE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
-/// After a classification that could not be stored, or that ended
-/// `starved`, the request path doesn't start another one for this long.
+/// A classification computed for a request that isn't final (its write
+/// failed, or it ended `starved`) is reused for this long before it is
+/// recomputed.
 const RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
 /// Bound on the process-local sets below; a full set is cleared.
 const MAX_TRACKED_POLICIES: usize = 65_536;
@@ -159,6 +160,46 @@ impl RegisteredMode {
             Self::Backfill => "backfill",
         }
     }
+
+    fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "record" => Self::Record,
+            "enforce" => Self::Enforce,
+            "backfill" => Self::Backfill,
+            _ => return None,
+        })
+    }
+}
+
+/// A classification as a policy use checks it.
+#[derive(Clone, Debug)]
+pub(super) struct Binding {
+    state: BindingState,
+    reason: Option<UnknownReason>,
+    mode: RegisteredMode,
+    authority_expires_at: Option<OffsetDateTime>,
+    /// The recorded closure (empty unless `bound*`).
+    closure: Arc<[Hash]>,
+}
+
+impl Binding {
+    fn from_classification(classification: &Classification, mode: RegisteredMode) -> Self {
+        Self {
+            state: classification.state,
+            reason: classification.reason,
+            mode,
+            authority_expires_at: classification.authority_expires_at,
+            closure: classification.closure.iter().map(|(id, _)| *id).collect(),
+        }
+    }
+}
+
+/// The owner authority a policy use passed: the closure to watch for
+/// revocation, and whether it was served under the legacy escape.
+#[derive(Clone, Debug, Default)]
+pub struct OwnerAuthority {
+    pub closure: Arc<[Hash]>,
+    pub escaped: bool,
 }
 
 /// How a registration's owner held what its roots grant.
@@ -668,57 +709,98 @@ impl CutoverSource {
 pub(super) struct OwnerAuthorityState {
     configured_cutover: Option<OffsetDateTime>,
     expiry: OwnerAuthorityExpiry,
+    legacy_unknown_allow: bool,
     migration_cutover: tokio::sync::OnceCell<OffsetDateTime>,
-    /// Policies whose stored classification is final.
-    final_policies: std::sync::Mutex<HashMap<String, BindingState>>,
-    /// Policies with a background classification running.
+    /// Policies whose stored classification is final, with their closure.
+    /// Liveness is never cached, only what to check.
+    final_policies: std::sync::Mutex<HashMap<String, Binding>>,
+    /// Classifications computed for a request but not (yet) final, served
+    /// until the instant given, so a failed write or `starved` is not
+    /// recomputed on every request.
+    transient: std::sync::Mutex<HashMap<String, (Binding, tokio::time::Instant)>>,
+    /// Policies with a background write running.
     in_flight: std::sync::Mutex<std::collections::HashSet<String>>,
-    /// Policies whose last classification was not final, until when.
-    retry_after: std::sync::Mutex<HashMap<String, tokio::time::Instant>>,
+    /// When each escaped policy was last logged.
+    escape_logged: std::sync::Mutex<HashMap<String, tokio::time::Instant>>,
+}
+
+/// Insert into a bounded map, clearing it when full.
+fn bounded_insert<V>(map: &mut HashMap<String, V>, key: &str, value: V) {
+    if map.len() >= MAX_TRACKED_POLICIES && !map.contains_key(key) {
+        map.clear();
+    }
+    map.insert(key.to_owned(), value);
 }
 
 impl OwnerAuthorityState {
-    fn is_final(&self, policy_cid: &str) -> bool {
-        self.final_policies
+    fn cached(&self, policy_cid: &str) -> Option<Binding> {
+        if let Some(binding) = self
+            .final_policies
             .lock()
             .expect("owner-authority cache")
-            .contains_key(policy_cid)
-    }
-
-    fn remember_final(&self, policy_cid: &str, state: BindingState) {
-        let mut cache = self.final_policies.lock().expect("owner-authority cache");
-        if cache.len() >= MAX_TRACKED_POLICIES {
-            cache.clear();
+            .get(policy_cid)
+        {
+            return Some(binding.clone());
         }
-        cache.insert(policy_cid.to_owned(), state);
-    }
-
-    fn backing_off(&self, policy_cid: &str) -> bool {
-        let mut retry = self.retry_after.lock().expect("owner-authority backoff");
-        match retry.get(policy_cid) {
-            Some(until) if *until > tokio::time::Instant::now() => true,
+        let mut transient = self.transient.lock().expect("owner-authority cache");
+        match transient.get(policy_cid) {
+            Some((binding, until)) if *until > tokio::time::Instant::now() => Some(binding.clone()),
             Some(_) => {
-                retry.remove(policy_cid);
-                false
+                transient.remove(policy_cid);
+                None
             }
-            None => false,
+            None => None,
         }
     }
 
-    fn back_off(&self, policy_cid: &str) {
-        let mut retry = self.retry_after.lock().expect("owner-authority backoff");
-        if retry.len() >= MAX_TRACKED_POLICIES {
-            let now = tokio::time::Instant::now();
-            retry.retain(|_, until| *until > now);
-            if retry.len() >= MAX_TRACKED_POLICIES {
-                retry.clear();
-            }
-        }
-        retry.insert(
-            policy_cid.to_owned(),
-            tokio::time::Instant::now() + RETRY_BACKOFF,
+    fn remember_final(&self, policy_cid: &str, binding: Binding) {
+        self.transient
+            .lock()
+            .expect("owner-authority cache")
+            .remove(policy_cid);
+        bounded_insert(
+            &mut self.final_policies.lock().expect("owner-authority cache"),
+            policy_cid,
+            binding,
         );
     }
+
+    fn remember_transient(&self, policy_cid: &str, binding: Binding) {
+        bounded_insert(
+            &mut self.transient.lock().expect("owner-authority cache"),
+            policy_cid,
+            (binding, tokio::time::Instant::now() + RETRY_BACKOFF),
+        );
+    }
+
+    /// Whether this escaped use should be logged (once per policy per hour).
+    fn log_escape(&self, policy_cid: &str) -> bool {
+        let mut logged = self
+            .escape_logged
+            .lock()
+            .expect("owner-authority escape log");
+        let now = tokio::time::Instant::now();
+        if logged
+            .get(policy_cid)
+            .is_some_and(|at| now.duration_since(*at) < std::time::Duration::from_secs(3600))
+        {
+            return false;
+        }
+        bounded_insert(&mut logged, policy_cid, now);
+        true
+    }
+}
+
+/// The recorded closure of a policy.
+async fn recorded_closure<C: ConnectionTrait>(
+    conn: &C,
+    policy_cid: &str,
+) -> Result<Vec<Hash>, DbErr> {
+    policy_v3_owner_authority::Entity::find()
+        .filter(policy_v3_owner_authority::Column::PolicyCid.eq(policy_cid))
+        .all(conn)
+        .await
+        .map(|rows| rows.into_iter().map(|row| row.delegation_id).collect())
 }
 
 /// SQL form of `!row_is_final`.
@@ -756,6 +838,7 @@ impl PolicyV3Runtime {
         self.owner_authority = Arc::new(OwnerAuthorityState {
             configured_cutover: config.legacy_cutover(),
             expiry: config.owner_authority_expiry,
+            legacy_unknown_allow: config.legacy_unknown_allow,
             ..OwnerAuthorityState::default()
         });
         self
@@ -820,11 +903,17 @@ impl PolicyV3Runtime {
                 "policy owner-authority legacy cutover is unavailable; legacy policies are classified when it can be read"
             ),
         }
+        if self.owner_authority.legacy_unknown_allow {
+            ::tracing::warn!(
+                event = "policy_owner_authority",
+                legacy_unknown_allow = true,
+                "policy_v3.legacy_unknown_allow is on: legacy policies without owner authority are served with root-only checks"
+            );
+        }
     }
 
-    /// The stored classification of `registration`, classifying it first if
-    /// none is stored (or a stored `unknown` came from an older classifier).
-    /// A classification that cannot be stored is still returned, unstored.
+    /// The stored classification of `registration`, classifying (and
+    /// storing) it first if none is final. Used by the sweep.
     pub(super) async fn owner_binding(
         &self,
         registration: &policy_v3_registration::Model,
@@ -834,18 +923,27 @@ impl PolicyV3Runtime {
             .await
             .map_err(|_| "policy-owner-authority-unavailable")?;
         let stale = match &existing {
-            Some(row) if row_is_final(row) => {
-                let classification = Classification::from_row(row)?;
-                self.owner_authority
-                    .remember_final(&registration.policy_cid, classification.state);
-                return Ok(classification);
-            }
+            Some(row) if row_is_final(row) => return Classification::from_row(row),
             Some(_) => true,
             None => false,
         };
         let (classification, mode) = self.classify_registration(registration).await?;
+        Ok(self
+            .store_classification(&registration.policy_cid, classification, mode, stale)
+            .await)
+    }
+
+    /// Store a computed classification claim-first, count it, and remember
+    /// it when final. Returns what is now in force.
+    async fn store_classification(
+        &self,
+        policy_cid: &str,
+        classification: Classification,
+        mode: RegisteredMode,
+        stale: bool,
+    ) -> Classification {
         match self
-            .store_lazy_classification(&registration.policy_cid, &classification, mode, stale)
+            .store_lazy_classification(policy_cid, &classification, mode, stale)
             .await
         {
             LazyWrite::Written => {
@@ -862,58 +960,154 @@ impl PolicyV3Runtime {
                     ..classification
                 };
                 if classification.is_final() {
-                    self.owner_authority
-                        .remember_final(&registration.policy_cid, classification.state);
+                    self.owner_authority.remember_final(
+                        policy_cid,
+                        Binding::from_classification(&classification, mode),
+                    );
                 }
-                Ok(classification)
+                classification
             }
+            // The winner's closure is read on the next use.
             LazyWrite::Lost(winner) => {
-                let classification = Classification::from_row(&winner)?;
-                self.owner_authority
-                    .remember_final(&registration.policy_cid, classification.state);
-                Ok(classification)
+                Classification::from_row(&winner).unwrap_or(Classification {
+                    persisted: true,
+                    ..classification
+                })
             }
             LazyWrite::Failed => {
                 crate::prometheus::observe_policy_owner_binding_backfill("write_failed_served");
-                Ok(classification)
+                classification
             }
         }
     }
 
-    /// Request path: make sure `registration` gets classified, without
-    /// waiting for it. A policy whose stored classification is final costs
-    /// nothing; otherwise one background task per policy classifies it, and
-    /// a result that is not final (a failed write, `starved`) holds off the
-    /// next attempt for [`RETRY_BACKOFF`].
-    pub(super) fn note_owner_binding(
+    /// What a use of `registration` checks. A final stored classification is
+    /// loaded once (row and closure) and remembered. A policy without one is
+    /// classified in the request, served from that result, and stored in the
+    /// background; a result that isn't final is reused for
+    /// [`RETRY_BACKOFF`] instead of recomputed.
+    async fn binding_for_use(
         &self,
         registration: &policy_v3_registration::Model,
-    ) -> Option<tokio::task::JoinHandle<()>> {
+    ) -> Result<Binding, &'static str> {
         let state = &self.owner_authority;
         let policy_cid = &registration.policy_cid;
-        if state.is_final(policy_cid) || state.backing_off(policy_cid) {
-            return None;
+        if let Some(binding) = state.cached(policy_cid) {
+            return Ok(binding);
         }
-        {
-            let mut in_flight = state.in_flight.lock().expect("owner-authority in-flight");
-            if in_flight.len() >= MAX_TRACKED_POLICIES || !in_flight.insert(policy_cid.clone()) {
-                return None;
+        let existing = policy_v3_owner_binding::Entity::find_by_id(policy_cid.clone())
+            .one(&self.conn)
+            .await
+            .map_err(|_| "policy-owner-authority-unavailable")?;
+        if let Some(row) = existing.as_ref().filter(|row| row_is_final(row)) {
+            let classification = Classification::from_row(row)?;
+            let closure = match classification.state {
+                BindingState::Bound | BindingState::BoundUncapped => {
+                    recorded_closure(&self.conn, policy_cid)
+                        .await
+                        .map_err(|_| "policy-owner-authority-unavailable")?
+                }
+                BindingState::RootAuthority | BindingState::Unknown => Vec::new(),
+            };
+            let binding = Binding {
+                state: classification.state,
+                reason: classification.reason,
+                mode: RegisteredMode::parse(&row.registered_mode)
+                    .ok_or("policy-owner-binding-invalid")?,
+                authority_expires_at: classification.authority_expires_at,
+                closure: closure.into(),
+            };
+            state.remember_final(policy_cid, binding.clone());
+            return Ok(binding);
+        }
+        let (classification, mode) = self.classify_registration(registration).await?;
+        let binding = Binding::from_classification(&classification, mode);
+        state.remember_transient(policy_cid, binding.clone());
+        let claimed = state
+            .in_flight
+            .lock()
+            .expect("owner-authority in-flight")
+            .insert(policy_cid.clone());
+        if claimed {
+            let runtime = self.clone();
+            let policy_cid = policy_cid.clone();
+            let stale = existing.is_some();
+            tokio::spawn(async move {
+                runtime
+                    .store_classification(&policy_cid, classification, mode, stale)
+                    .await;
+                runtime
+                    .owner_authority
+                    .in_flight
+                    .lock()
+                    .expect("owner-authority in-flight")
+                    .remove(&policy_cid);
+            });
+        }
+        Ok(binding)
+    }
+
+    /// Check a policy use against its recorded owner authority: every
+    /// recorded delegation and ancestor must be unrevoked (as of `conn`, the
+    /// caller's transaction where it has one), and a `bound` authority
+    /// unexpired. Legacy registrations are never expiry-checked. A policy
+    /// without authority is denied, or served with root-only checks under
+    /// `policy_v3.legacy_unknown_allow` when it is legacy.
+    pub(super) async fn validate_owner_authority<C: ConnectionTrait>(
+        &self,
+        conn: &C,
+        registration: &policy_v3_registration::Model,
+        now: OffsetDateTime,
+    ) -> Result<OwnerAuthority, &'static str> {
+        let binding = self.binding_for_use(registration).await?;
+        match binding.state {
+            BindingState::RootAuthority => Ok(OwnerAuthority::default()),
+            BindingState::Unknown => {
+                let reason = binding.reason.map_or("missing", UnknownReason::as_str);
+                if binding.mode == RegisteredMode::Backfill
+                    && self.owner_authority.legacy_unknown_allow
+                {
+                    crate::prometheus::observe_policy_owner_authority_unknown_allowed(reason);
+                    if self.owner_authority.log_escape(&registration.policy_cid) {
+                        ::tracing::warn!(
+                            event = "policy_owner_authority",
+                            outcome = "unknown_allowed",
+                            policy_cid = %registration.policy_cid,
+                            reason,
+                            "legacy policy without owner authority served under policy_v3.legacy_unknown_allow"
+                        );
+                    }
+                    return Ok(OwnerAuthority {
+                        closure: Arc::from([]),
+                        escaped: true,
+                    });
+                }
+                crate::prometheus::observe_policy_owner_authority_denied("unknown");
+                Err("policy-owner-authority-unknown")
+            }
+            BindingState::Bound | BindingState::BoundUncapped => {
+                let revoked = authority_graph::revoked_ids(conn, &binding.closure)
+                    .await
+                    .map_err(|_| "policy-owner-authority-unavailable")?;
+                if !revoked.is_empty() {
+                    crate::prometheus::observe_policy_owner_authority_denied("revoked");
+                    return Err("policy-owner-authority-revoked");
+                }
+                if binding.state == BindingState::Bound
+                    && binding.mode != RegisteredMode::Backfill
+                    && binding
+                        .authority_expires_at
+                        .is_some_and(|expiry| now >= expiry)
+                {
+                    crate::prometheus::observe_policy_owner_authority_denied("expired");
+                    return Err("policy-owner-authority-expired");
+                }
+                Ok(OwnerAuthority {
+                    closure: binding.closure,
+                    escaped: false,
+                })
             }
         }
-        let runtime = self.clone();
-        let registration = registration.clone();
-        Some(tokio::spawn(async move {
-            let result = runtime.owner_binding(&registration).await;
-            let state = &runtime.owner_authority;
-            if !result.is_ok_and(|classification| classification.is_final()) {
-                state.back_off(&registration.policy_cid);
-            }
-            state
-                .in_flight
-                .lock()
-                .expect("owner-authority in-flight")
-                .remove(&registration.policy_cid);
-        }))
     }
 
     async fn classify_registration(
@@ -1284,6 +1478,24 @@ pub async fn authorized_policies(
     let generically_revoked = authority_graph::revoked_ids(conn, &root_hashes)
         .await
         .map_err(listing_unavailable)?;
+    // Live owner-authority state: a recorded closure with a revoked member
+    // is `revoked`; a non-legacy `bound` authority past its expiry `expired`.
+    let mut closures: HashMap<String, Vec<Hash>> = HashMap::new();
+    for row in policy_v3_owner_authority::Entity::find()
+        .filter(policy_v3_owner_authority::Column::PolicyCid.is_in(policy_cids.clone()))
+        .all(conn)
+        .await
+        .map_err(listing_unavailable)?
+    {
+        closures
+            .entry(row.policy_cid)
+            .or_default()
+            .push(row.delegation_id);
+    }
+    let closure_ids = closures.values().flatten().copied().collect::<Vec<_>>();
+    let revoked_authority = authority_graph::revoked_ids(conn, &closure_ids)
+        .await
+        .map_err(listing_unavailable)?;
     let now = OffsetDateTime::now_utc();
     let mut policies = Vec::with_capacity(policy_cids.len());
     for policy_cid in &policy_cids {
@@ -1310,7 +1522,24 @@ pub async fn authorized_policies(
             "rootState": if revoked { "revoked" } else if expired { "expired" } else { "active" },
             "ownerAuthorityState": bindings
                 .get(policy_cid)
-                .map(|binding| binding.state.as_str())
+                .map(|binding| {
+                    if closures.get(policy_cid).is_some_and(|closure| {
+                        closure.iter().any(|id| revoked_authority.contains(id))
+                    }) {
+                        "revoked"
+                    } else if binding.state == BindingState::Bound.as_str()
+                        && binding.registered_mode != RegisteredMode::Backfill.as_str()
+                        && binding
+                            .authority_expires_at
+                            .as_deref()
+                            .and_then(|value| parse_time(value).ok())
+                            .is_some_and(|expiry| expiry <= now)
+                    {
+                        "expired"
+                    } else {
+                        binding.state.as_str()
+                    }
+                })
                 .unwrap_or("pending"),
         }));
     }
@@ -1381,58 +1610,136 @@ mod tests {
         .unwrap()
     }
 
-    /// A policy with a final stored classification adds no query to the
-    /// request path once seen; the first sighting only spawns.
-    #[tokio::test]
-    async fn final_classifications_cost_the_request_path_nothing() {
-        let (runtime, queries) = counted_runtime().await;
-        let registration = registration(&runtime, "policy-final").await;
-        let classification =
-            Classification::from_selection(Ok(Vec::new()), OffsetDateTime::now_utc());
+    async fn store(runtime: &PolicyV3Runtime, policy_cid: &str, classification: &Classification) {
         insert_classification(
             &runtime.conn,
-            &registration.policy_cid,
-            &classification,
+            policy_cid,
+            classification,
             RegisteredMode::Record,
             OffsetDateTime::now_utc(),
         )
         .await
         .unwrap();
-
-        let before = queries.load(Ordering::SeqCst);
-        let first = runtime.note_owner_binding(&registration).expect("spawned");
-        assert_eq!(queries.load(Ordering::SeqCst), before, "spawn only");
-        assert!(
-            runtime.note_owner_binding(&registration).is_none(),
-            "deduplicated"
-        );
-        first.await.unwrap();
-
-        let before = queries.load(Ordering::SeqCst);
-        for _ in 0..10 {
-            assert!(runtime.note_owner_binding(&registration).is_none());
-        }
-        tokio::task::yield_now().await;
-        assert_eq!(queries.load(Ordering::SeqCst), before);
     }
 
-    /// A classification that is not final (here it cannot even be computed)
-    /// is not retried on every request.
+    /// Once a final classification is loaded, a use costs one revocation
+    /// query for a recorded closure and nothing for root authority.
     #[tokio::test]
-    async fn non_final_classifications_back_off() {
+    async fn steady_state_checks_cost_one_query_or_none() {
         let (runtime, queries) = counted_runtime().await;
-        // No root row: classification fails.
-        let registration = registration(&runtime, "policy-unclassifiable").await;
-        runtime
-            .note_owner_binding(&registration)
-            .expect("spawned")
+        let now = OffsetDateTime::now_utc();
+        let root_authority = registration(&runtime, "policy-root-authority").await;
+        store(
+            &runtime,
+            &root_authority.policy_cid,
+            &Classification::from_selection(Ok(Vec::new()), now),
+        )
+        .await;
+        let bound = registration(&runtime, "policy-bound").await;
+        let closure = vec![ClosureNode {
+            id: tinycloud_core::hash::hash(b"grant"),
+            depth: 0,
+            delegator: "did:key:z6MkGrantor".into(),
+            expiry: None,
+            not_before: None,
+        }];
+        store(
+            &runtime,
+            &bound.policy_cid,
+            &Classification::from_selection(Ok(closure), now),
+        )
+        .await;
+        for (registration, steady_queries) in [(&root_authority, 0), (&bound, 1)] {
+            runtime
+                .validate_owner_authority(&runtime.conn, registration, now)
+                .await
+                .unwrap();
+            for _ in 0..5 {
+                let before = queries.load(Ordering::SeqCst);
+                runtime
+                    .validate_owner_authority(&runtime.conn, registration, now)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    queries.load(Ordering::SeqCst) - before,
+                    steady_queries,
+                    "{}",
+                    registration.policy_cid
+                );
+            }
+        }
+    }
+
+    /// An `unknown` legacy classification is denied with a fixed code, or
+    /// served (escaped) when the operator allows it.
+    #[tokio::test]
+    async fn unknown_legacy_classifications_are_denied_unless_allowed() {
+        for allow in [false, true] {
+            let (runtime, _) = counted_runtime().await;
+            let runtime = runtime.with_policy_config(&crate::config::PolicyV3Config {
+                legacy_unknown_allow: allow,
+                ..Default::default()
+            });
+            let registration = registration(&runtime, "policy-unknown").await;
+            insert_classification(
+                &runtime.conn,
+                &registration.policy_cid,
+                &Classification::unknown(UnknownReason::Missing),
+                RegisteredMode::Backfill,
+                OffsetDateTime::now_utc(),
+            )
             .await
             .unwrap();
-        let before = queries.load(Ordering::SeqCst);
-        for _ in 0..10 {
-            assert!(runtime.note_owner_binding(&registration).is_none());
+            let result = runtime
+                .validate_owner_authority(&runtime.conn, &registration, OffsetDateTime::now_utc())
+                .await;
+            if allow {
+                assert!(result.unwrap().escaped);
+            } else {
+                assert_eq!(result.unwrap_err(), "policy-owner-authority-unknown");
+            }
         }
-        tokio::task::yield_now().await;
-        assert_eq!(queries.load(Ordering::SeqCst), before);
+    }
+
+    /// A `bound` (non-legacy) authority that has expired is denied with the
+    /// expiry code; a legacy one is not expiry-checked.
+    #[tokio::test]
+    async fn expired_bound_authority_is_denied_except_legacy() {
+        for (mode, expected) in [
+            (
+                RegisteredMode::Record,
+                Err("policy-owner-authority-expired"),
+            ),
+            (RegisteredMode::Backfill, Ok(())),
+        ] {
+            let (runtime, _) = counted_runtime().await;
+            let registration = registration(&runtime, "policy-expiring").await;
+            let expiry = OffsetDateTime::now_utc() + Duration::seconds(5);
+            let closure = vec![ClosureNode {
+                id: tinycloud_core::hash::hash(b"short-grant"),
+                depth: 0,
+                delegator: "did:key:z6MkGrantor".into(),
+                expiry: Some(expiry),
+                not_before: None,
+            }];
+            insert_classification(
+                &runtime.conn,
+                &registration.policy_cid,
+                &Classification::from_selection(Ok(closure), expiry),
+                mode,
+                OffsetDateTime::now_utc(),
+            )
+            .await
+            .unwrap();
+            let result = runtime
+                .validate_owner_authority(
+                    &runtime.conn,
+                    &registration,
+                    expiry + Duration::seconds(1),
+                )
+                .await
+                .map(|_| ());
+            assert_eq!(result, expected, "{mode:?}");
+        }
     }
 }

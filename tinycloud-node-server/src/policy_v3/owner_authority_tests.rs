@@ -364,13 +364,23 @@ impl Signer {
 
     /// An encoded invocation of `attenuation` citing `proof`.
     pub fn invoke(&self, attenuation: Capabilities<Value>, proof: Cid) -> anyhow::Result<String> {
-        let Self::Key { jwk, vm, did, .. } = self else {
+        self.invoke_for(self.did(), attenuation, proof)
+    }
+
+    /// An encoded invocation addressed to `audience`.
+    pub fn invoke_for(
+        &self,
+        audience: &str,
+        attenuation: Capabilities<Value>,
+        proof: Cid,
+    ) -> anyhow::Result<String> {
+        let Self::Key { jwk, vm, .. } = self else {
             anyhow::bail!("invocations are signed by keys");
         };
         let at = now();
         Ok(Payload {
             issuer: vm.parse()?,
-            audience: did.parse()?,
+            audience: audience.parse()?,
             not_before: Some(seconds(at)?),
             expiration: seconds(at + Duration::seconds(30))?,
             nonce: Some(unique("tc1423invoke")),
@@ -709,7 +719,9 @@ impl Harness {
             "policyId": "pending",
             "ownerDid": owner_did,
             "createdAt": format_time(created),
-            "expiresAt": format_time(root.expiry),
+            // The policy may outlive its roots; the roots' expiry is what
+            // the tests exercise.
+            "expiresAt": format_time(root.expiry + Duration::hours(1)),
             "contentSource": {
                 "shareId": unique("share-tc-1423-"),
                 "kvResource": self.content_resource.to_string(),
@@ -1166,8 +1178,8 @@ impl Harness {
     /// Use the policy (a challenge) and wait for its background
     /// classification.
     pub async fn classify_on_use(&self, policy: &Registered) -> anyhow::Result<BindingRow> {
-        let (status, body) = self.challenge(policy).await;
-        anyhow::ensure!(status == Status::Ok, "challenge: {status} {body}");
+        // The use may be refused once the classification gates it.
+        self.challenge(policy).await;
         self.wait_for_binding(&policy.policy_cid, std::time::Duration::from_secs(20))
             .await?
             .ok_or_else(|| anyhow::anyhow!("not classified"))
@@ -2480,7 +2492,8 @@ fn text(bytes: &[u8]) -> String {
 impl Harness {
     /// The holder decrypts through the network route under a session.
     pub async fn decrypt(&self, session: &str) -> anyhow::Result<(Status, String)> {
-        let invocation = self.holder.invoke(
+        let invocation = self.holder.invoke_for(
+            &self.node_did(),
             serde_json::from_value(
                 attenuation_for_policy_capabilities(&[self.requested_decrypt()])
                     .map_err(|(_, error)| anyhow::anyhow!(error))?,
@@ -2518,14 +2531,13 @@ impl Harness {
         let child = Payload {
             issuer: vm.parse()?,
             audience: reader.did().parse()?,
+            // Whole seconds: sub-microsecond times don't survive PostgreSQL
+            // timestamps.
             not_before: Some(NumericDate::try_from_seconds(
-                (s0.0.not_before.unwrap() + Duration::milliseconds(1)).unix_timestamp_nanos()
-                    as f64
-                    / 1_000_000_000.0,
+                (s0.0.not_before.unwrap().unix_timestamp() + 1) as f64,
             )?),
             expiration: NumericDate::try_from_seconds(
-                (s0.0.expiry.unwrap() - Duration::seconds(1)).unix_timestamp_nanos() as f64
-                    / 1_000_000_000.0,
+                (s0.0.expiry.unwrap().unix_timestamp() - 1) as f64,
             )?,
             nonce: Some(unique("tc1423child")),
             facts: Some(facts),
@@ -2577,11 +2589,7 @@ impl Harness {
             )?,
             session_cid(session)?,
         )?;
-        let path = self
-            .content_resource
-            .path()
-            .map(ToString::to_string)
-            .unwrap_or_default();
+        let path = "shares/tc-1423/document.txt";
         let response = self
             .client
             .post("/signed/kv")
@@ -2662,8 +2670,10 @@ async fn revoking_the_owner_grant_ends_admitted_sessions(backend: Backend) -> an
     let (status, body, reader, child) = h.reshare(&session).await?;
     assert_eq!(status, Status::Ok, "{body}");
     let child = child.unwrap();
-    assert_eq!(h.read_as(&reader, child).await?.0, Status::Ok);
-    assert_eq!(h.signed_kv(&session).await?.0, Status::Ok);
+    let (status, body) = h.read_as(&reader, child).await?;
+    assert_eq!(status, Status::Ok, "re-shared child read: {body}");
+    let (status, body) = h.signed_kv(&session).await?;
+    assert_eq!(status, Status::Ok, "signed KV: {body}");
 
     h.revoke(&h.space_owner, &authority).await?;
 
@@ -2712,6 +2722,12 @@ async fn revoking_the_agent_session_ends_its_policies(backend: Backend) -> anyho
     let policy = h.register_ok(policy_window()).await?;
     let session = h.mint_ok(&policy).await?;
     assert_eq!(h.read(&session).await?.0, Status::Ok);
+    // Policies grant only kv and decrypt, so a policy session never holds a
+    // hook ticket (no stream to close).
+    let (status, body) = h
+        .hook_ticket(&[session_cid(&session)?.to_string()])
+        .await?;
+    assert_ne!(status, Status::Ok, "{body}");
 
     h.revoke(&h.space_owner, &agent_session).await?;
 
@@ -2818,9 +2834,12 @@ async fn a_revocation_under_an_alias_cid_ends_sessions(backend: Backend) -> anyh
             .to_owned(),
         Query::insert()
             .into_table(Alias::new("delegation_cid_alias"))
-            .columns([Alias::new("id"), Alias::new("canonical")])
-            .values_panic([canonical.clone().into(), canonical.clone().into()])
-            .values_panic([alias.clone().into(), canonical.into()])
+            .columns([
+                Alias::new("id"),
+                Alias::new("canonical"),
+                Alias::new("encrypted"),
+            ])
+            .values_panic([alias.clone().into(), canonical.into(), false.into()])
             .to_owned(),
         Query::insert()
             .into_table(Alias::new("revocation"))
@@ -2926,7 +2945,7 @@ async fn legacy_registrations_without_authority_are_denied_unless_escaped(
             backend,
             Shape::KeySession,
             "legacy_registrations_without_authority_are_denied_unless_escaped",
-            boot(policy_v3),
+            boot(policy_v3.clone()),
         )
         .await?
         else {
@@ -2939,6 +2958,9 @@ async fn legacy_registrations_without_authority_are_denied_unless_escaped(
         let session = h.mint_ok(&policy).await?;
         h.revoke(&h.space_owner, &authority).await?;
         h.forget_binding(&policy.policy_cid).await?;
+        // A fresh process: this one remembers the earlier classification.
+        let mut h = h;
+        h.reboot(boot(policy_v3)).await?;
         let allowed = counter(
             "tinycloud_policy_owner_authority_unknown_allowed_total",
             &[("reason", "revoked")],
@@ -3285,3 +3307,69 @@ async fn hook_tickets_carry_at_most_16_authorities(backend: Backend) -> anyhow::
     Ok(())
 }
 on_both_backends!(hook_tickets_carry_at_most_16_authorities);
+
+/// [F13] PostgreSQL latency gate for a policy read (the owner-authority
+/// check adds one indexed revocation query per read). Ignored by default;
+/// run the same test on the baseline and candidate trees:
+///
+/// ```sh
+/// TINYCLOUD_TEST_POSTGRES_URL=... cargo test -p tinycloud-node --lib \
+///   postgres_policy_read_latency_gate -- --ignored --nocapture
+/// ```
+///
+/// With `TC1423_BENCH_BASELINE_P50_US` and `TC1423_BENCH_BASELINE_P99_US`
+/// set from the baseline run, it fails when p50 grows by more than 15% (+2
+/// ms) or p99 by more than 25% (+5 ms).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "benchmark; run explicitly against PostgreSQL"]
+async fn postgres_policy_read_latency_gate() -> anyhow::Result<()> {
+    let Some(h) = Harness::new(
+        Backend::Postgres,
+        Shape::KeySession,
+        "postgres_policy_read_latency_gate",
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    h.grant_owner(Window::until(now() + Duration::days(2)))
+        .await?;
+    let policy = h.register_ok(policy_window()).await?;
+    let session = h.mint_ok(&policy).await?;
+    for _ in 0..30 {
+        assert_eq!(h.read(&session).await?.0, Status::Ok);
+    }
+    let mut samples = Vec::with_capacity(400);
+    for _ in 0..400 {
+        let started = std::time::Instant::now();
+        let (status, _) = h.read(&session).await?;
+        samples.push(started.elapsed().as_micros() as u64);
+        assert_eq!(status, Status::Ok);
+    }
+    samples.sort_unstable();
+    let p50 = samples[samples.len() / 2];
+    let p99 = samples[samples.len() * 99 / 100];
+    println!(
+        "TC1423_BENCH reads={} p50_us={p50} p99_us={p99}",
+        samples.len()
+    );
+    let baseline = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+    };
+    if let (Some(base50), Some(base99)) = (
+        baseline("TC1423_BENCH_BASELINE_P50_US"),
+        baseline("TC1423_BENCH_BASELINE_P99_US"),
+    ) {
+        assert!(
+            p50 <= base50 * 115 / 100 + 2_000,
+            "p50 {p50} µs vs baseline {base50} µs"
+        );
+        assert!(
+            p99 <= base99 * 125 / 100 + 5_000,
+            "p99 {p99} µs vs baseline {base99} µs"
+        );
+    }
+    Ok(())
+}

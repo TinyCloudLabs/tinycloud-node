@@ -1748,7 +1748,8 @@ async fn invoke_impl(
         let policy_session_invocation = policy_v3
             .authorize_invocation(tinycloud, &admitted.invocation().0, now)
             .await
-            .map_err(|error| (Status::Forbidden, error.to_string()))?;
+            .map_err(|error| (Status::Forbidden, error.to_string()))?
+            .is_some();
 
         let decrypt_network = admitted
             .invocation()

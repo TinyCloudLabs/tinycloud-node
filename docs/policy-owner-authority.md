@@ -222,3 +222,60 @@ Pages hold at most 100 policies in policy-CID order; `nextCursor` is set when a
 page is full and passed back as `cursor`. There is no total count. Policies
 not yet classified (legacy policies not used since the upgrade, with the sweep
 off) are not listed. Database errors return `503 policy-listing-unavailable`.
+
+## Checking at use
+
+Every use of a policy checks its recorded owner authority, after the root
+checks: reads and decrypts by admitted sessions (and their re-shared
+children), re-share admission, signed-KV and hook-ticket mints, challenge,
+mint (again on the mint's locked transaction), S0 admission, and delivery
+authorization.
+
+| state | at use |
+|---|---|
+| `bound`, `bound-uncapped` | denied if any recorded delegation or ancestor is revoked, directly or under an alias CID (`403 policy-owner-authority-revoked`); a `bound` authority past its expiry is denied (`403 policy-owner-authority-expired`), except for legacy (`backfill`) rows, which are never expiry-checked |
+| `root-authority` | nothing more |
+| `unknown` | denied (`403 policy-owner-authority-unknown`) |
+
+The mint no longer rescans the owner's delegations as of registration for
+policies with a recorded authority.
+
+What to check is cached in process once a classification is final (bounded);
+liveness is not cached. A steady-state use costs one indexed revocation query
+for a recorded closure and none for root authority. A policy without a final
+classification is classified in the request, served from that result, and
+stored in the background; a result that isn't final is reused for 60 seconds.
+
+A revocation takes effect on commit; a request already past the check may
+finish. Signed-KV tickets minted before a revocation last at most 60 seconds.
+
+Other codes: an expired root now gives `root-expired` (other non-live status
+remains `root-not-live`); S0 admission returns the owner-authority code itself;
+delivery keeps `delivery-authorization-invalid`. No code carries a CID or DID.
+
+### Legacy escape
+
+```toml
+[policy_v3]
+legacy_unknown_allow = false  # TINYCLOUD_POLICY_V3__LEGACY_UNKNOWN_ALLOW
+```
+
+When true, legacy (`backfill`) policies classified `unknown` are served with
+the root-only checks (and the mint's registration-time rescan) instead of
+being denied. The node logs a warning at boot, and per policy at most once an
+hour when it serves one; uses are counted in
+`tinycloud_policy_owner_authority_unknown_allowed_total{reason}`. Denials are
+counted in `tinycloud_policy_owner_authority_denied_total{reason=revoked|expired|unknown}`.
+
+### Hook streams
+
+A hook ticket carries the delegations that authorized it, plus, for a policy
+session, the recorded owner-authority closure; a ticket with more than 16 is
+refused (`403 hook-ticket-authority-too-large`). An open `/hooks/events`
+stream re-checks them (one closure query plus one revocation query) before
+delivering an event, at most every `hooks.authority_recheck_seconds` (5), and
+every `hooks.idle_authority_recheck_seconds` (30) while idle. It closes on a
+revocation, or after three consecutive failed checks; a failed check withholds
+that event but keeps the stream. Streams don't see a JSON-route
+`RootRevocation` (it writes no core revocation) or an authority expiry; those
+end at the ticket deadline (at most 300 seconds), as before.

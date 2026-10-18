@@ -822,6 +822,22 @@ pub struct HooksConfig {
     pub webhook_timeout_seconds: u64,
     #[serde(default = "default_hooks_webhook_max_attempts")]
     pub webhook_max_attempts: usize,
+    /// An open event stream re-checks its ticket's authority before
+    /// delivering an event, at most this often.
+    #[serde(default = "default_hooks_authority_recheck_seconds")]
+    pub authority_recheck_seconds: u64,
+    /// An open event stream re-checks its ticket's authority this often
+    /// even when no event arrives.
+    #[serde(default = "default_hooks_idle_authority_recheck_seconds")]
+    pub idle_authority_recheck_seconds: u64,
+}
+
+fn default_hooks_authority_recheck_seconds() -> u64 {
+    5
+}
+
+fn default_hooks_idle_authority_recheck_seconds() -> u64 {
+    30
 }
 
 fn default_hooks_max_ticket_ttl_seconds() -> u64 {
@@ -863,6 +879,8 @@ impl Default for HooksConfig {
             ),
             webhook_timeout_seconds: default_hooks_webhook_timeout_seconds(),
             webhook_max_attempts: default_hooks_webhook_max_attempts(),
+            authority_recheck_seconds: default_hooks_authority_recheck_seconds(),
+            idle_authority_recheck_seconds: default_hooks_idle_authority_recheck_seconds(),
         }
     }
 }
@@ -872,6 +890,9 @@ impl HooksConfig {
     pub fn validate(&self) -> Result<(), &'static str> {
         if self.webhook_max_attempts > 10 {
             return Err("hooks.webhook_max_attempts must not exceed 10");
+        }
+        if self.authority_recheck_seconds == 0 || self.idle_authority_recheck_seconds == 0 {
+            return Err("hooks authority re-check intervals must be at least 1 second");
         }
         Ok(())
     }
@@ -1003,6 +1024,12 @@ pub struct PolicyV3Config {
     /// `TINYCLOUD_POLICY_V3__OWNER_AUTHORITY_EXPIRY`.
     #[serde(default)]
     pub owner_authority_expiry: OwnerAuthorityExpiry,
+    /// Operator escape: serve policies registered before the legacy cutover
+    /// for which no owner authority was found with the root-only checks
+    /// instead of denying them. Off by default; logged at boot and per
+    /// policy when used. Env `TINYCLOUD_POLICY_V3__LEGACY_UNKNOWN_ALLOW`.
+    #[serde(default)]
+    pub legacy_unknown_allow: bool,
     #[serde(default)]
     pub owner_binding_backfill: OwnerBindingBackfillConfig,
 }

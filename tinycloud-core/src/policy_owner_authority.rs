@@ -123,3 +123,92 @@ pub async fn migration_applied_at<C: ConnectionTrait>(
         .await?
         .map(|row| row.applied_at))
 }
+
+/// Whether nothing in the ancestor closure of `roots` is revoked (directly
+/// or under an alias CID): one recursive closure query plus one revocation
+/// query, whatever the depth. Fails closed past the traversal budget.
+pub async fn chains_unrevoked<C: ConnectionTrait>(
+    db: &C,
+    roots: &[Hash],
+) -> Result<bool, ChainTraversalError> {
+    if roots.is_empty() {
+        return Ok(true);
+    }
+    let (ids, _) = crate::auth_graph::load_closure_edges(db, roots).await?;
+    Ok(revoked_ids(db, &ids).await?.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hash::hash;
+    use crate::migrations::Migrator;
+    use crate::models::actor;
+    use crate::relationships::parent_delegations;
+    use sea_orm::{ActiveModelTrait, ActiveValue::Set, ConnectOptions, Database};
+    use sea_orm_migration::MigratorTrait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn chain_check_costs_two_queries_at_any_depth() {
+        let mut db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
+            .await
+            .unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        actor::ActiveModel {
+            id: Set("did:key:actor".to_string()),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        let ids: Vec<Hash> = (0..6)
+            .map(|i| hash(format!("chain-{i}").as_bytes()))
+            .collect();
+        for id in &ids {
+            delegation::ActiveModel {
+                id: Set(*id),
+                delegator: Set("did:key:actor".to_string()),
+                delegatee: Set("did:key:actor".to_string()),
+                expiry: Set(None),
+                issued_at: Set(None),
+                not_before: Set(None),
+                facts: Set(None),
+                serialization: Set(id.as_ref().to_vec()),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+        }
+        for pair in ids.windows(2) {
+            parent_delegations::ActiveModel {
+                child: Set(pair[0]),
+                parent: Set(pair[1]),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+        }
+        let queries = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&queries);
+        db.set_metric_callback(move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+        assert!(chains_unrevoked(&db, &ids[..1]).await.unwrap());
+        assert_eq!(queries.load(Ordering::SeqCst), 2);
+
+        revocation::ActiveModel {
+            id: Set(hash(b"revoke-chain-top")),
+            revoker: Set("did:key:actor".to_string()),
+            revoked: Set(ids[5]),
+            serialization: Set(b"revocation".to_vec()),
+            revoked_at: Set(None),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        queries.store(0, Ordering::SeqCst);
+        assert!(!chains_unrevoked(&db, &ids[..1]).await.unwrap());
+        assert_eq!(queries.load(Ordering::SeqCst), 2);
+    }
+}
