@@ -152,25 +152,37 @@ not N0-specific or permission to silently reuse old values. Missing
 authorization or missing/unknown authority fails before any compose,
 CVM or whitelist mutation.
 
-`authority=node-override` currently applies the reviewed limits after the
-last restart and required health. Both exact spaces must exist once with
-positive usage in authenticated `/admin/usage`, which lists every space on
-the node unpaginated (~107 bytes a space); the script reads up to 16 MiB of
-it and fails closed above that, while other quota bodies stay capped at
-64 KiB. Before ANY PUT, both billing
-storage-comp reads must prove no active comp: 404 logs only
-`billing storage-comp unavailable`; valid `active:false` also permits the
-legacy restore. Active comp fails `authority mismatch: flip to billing`.
-Auth/5xx/transport/malformed responses fail closed, never count as absence.
-Each PUT requires GET readback of both override and effective values.
+`authority=billing` is current (TC-1162/TC-1164): billing is the quota
+authority for both of Sam's spaces, and the reviewed limits are floors,
+applications `5368709120` and secrets `1073741824` (internal D1
+`quota_overrides`). Billing mode is read-only after the last restart and
+required health: both exact spaces must exist once with positive usage in
+authenticated `/admin/usage`, which lists every space on the node
+unpaginated (~107 bytes a space); the script reads up to 16 MiB of it and
+fails closed above that, while other quota bodies stay capped at 64 KiB.
+It never PUTs/DELETEs a node override. Each
+active absolute per-space `storage_limit_bytes` must cover its floor, and
+node GET must show `override_bytes=null`. Missing, inactive or insufficient
+comps fail `billing authority does not cover both reviewed quota floors`; a
+non-null override fails `stale legacy override`. A cold node cache is not a
+failure: billing is authoritative and the node fetches on the next write
+(≤60 s TTL). Do not compare incremental account `comp_bytes` with absolute
+space limits.
 
-The later reviewed authority flip to `billing` is separate from this PR and
-follows TC-1162 migration. Billing mode never PUTs/DELETEs a node override:
-active absolute per-space `storage_limit_bytes` must cover each reviewed
-floor, and node GET must show `override_bytes=null`. A non-null override
-fails `stale legacy override`. A cold node cache is not a failure: billing
-is authoritative and the node fetches on the next write (≤60 s TTL).
-Do not compare incremental account `comp_bytes` with absolute space limits.
+Ordering rule: the flip to `billing` is merged only after both spaces are
+billing comps with their node overrides cleared, and before any further
+`deploy_phala` dispatch. Merged before that migration, the next dispatch
+restarts the node (wiping its in-memory overrides) and billing-mode
+reconcile then fails without restoring them (no comp covers the floors).
+Left unmerged after the migration, the next dispatch refuses in
+node-override mode with `authority mismatch: flip to billing`.
+Reverting to `authority=node-override` requires a
+reviewed PR. In that legacy mode, before ANY PUT both billing storage-comp
+reads must prove no active comp (404 logs only `billing storage-comp
+unavailable`; valid `active:false` also permits the restore); an active comp
+fails `authority mismatch: flip to billing`. Each PUT requires GET readback
+of both override and effective values. In both modes, auth/5xx/transport/
+malformed responses fail closed and never count as absence.
 No raw response, identity list, credential or error body is logged.
 Any attempted restart without verified reconciliation is fatal
 **OVERRIDES UNVERIFIED**, requiring authorized operator/TC-1161 fallback.

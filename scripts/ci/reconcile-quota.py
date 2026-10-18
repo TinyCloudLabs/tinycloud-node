@@ -11,7 +11,7 @@ from urllib.parse import quote, urlsplit
 
 CONFIG_PATH = Path("ops/quota-overrides.json")
 OWNER = "tinycloud:pkh:eip155:1:0xd559CCd9EB87c530A9a349262669386dE93cf412"
-LIMITS = {"applications": 5368709120, "secrets": 268721121}
+LIMITS = {"applications": 5368709120, "secrets": 1073741824}
 NODE_HOST = "node.tinycloud.xyz"
 # Per-space and billing bodies are a few hundred bytes. GET /admin/usage lists
 # every space on the node, unpaginated, at ~107 bytes a row (~1,034 spaces,
@@ -170,7 +170,7 @@ def reconcile(authority, overrides, node_secret, billing_secret, billing_origin)
                 or actual["override_bytes"] != limit or type(actual.get("effective_limit_bytes")) is not int
                 or actual["effective_limit_bytes"] != limit):
                 raise QuotaError("quota override and effective limit did not both verify")
-        return "Quota overrides verified: applications=5368709120; secrets=268721121."
+        return "Quota overrides verified: " + "; ".join(f"{name}={limit}" for name, limit in LIMITS.items()) + "."
     for space, floor in overrides.items():
         comp = comps[space]
         if (comp is None or not comp["active"] or type(comp["storage_limit_bytes"]) is not int
