@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changes
+
+- `POST /revoke` authorizes the delegation's issuer, the owner of a space its abilities target, or the holder of a revoke control grant issued by one of them. The delegatee alone is no longer an authorized revoker, directly or through a control grant it issued; an intermediate delegator still revokes the delegations it issued. Delegation status visibility is unchanged (TC-1436).
+
 ## [1.21.0] - 2026-10-18
 
 ### Release notes
