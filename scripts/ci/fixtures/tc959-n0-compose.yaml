@@ -53,6 +53,12 @@ services:
       # headroom for admin/psql access, and raise it only alongside the
       # instance's own max_connections.
       TINYCLOUD_DATABASE__MAX_CONNECTIONS: "15"
+      # TC-1274: production boots with the epoch_head backfill off while the
+      # database is CPU-bound. Writes stay correct without it. Re-enable later
+      # by setting "true" (or removing this line); the pace keys are
+      # TINYCLOUD_EPOCH_HEAD_BACKFILL__SPACES_PER_SECOND / __PROGRESS_EVERY.
+      # Keep the double underscore: a single underscore is silently ignored.
+      TINYCLOUD_EPOCH_HEAD_BACKFILL__ENABLED: "false"
       # Required for every manual TC-780 deploy. Keep true through offline
       # verification; only the final, explicitly reviewed redeploy sets false.
       TINYCLOUD_DATABASE__WRITE_FENCE: "${SQL_IDENTITY_FENCE:?set true during cutover, false after verification}"
@@ -105,7 +111,7 @@ services:
       - CERTBOT_EMAIL=${CERTBOT_EMAIL}
       - SET_CAA=true
       - DNS_PROVIDER=cloudflare
-      - CLIENT_MAX_BODY_SIZE=32m
+      - CLIENT_MAX_BODY_SIZE=95m
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock
       - cert-data:/etc/letsencrypt

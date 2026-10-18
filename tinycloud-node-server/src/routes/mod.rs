@@ -81,6 +81,30 @@ use util::LimitedReader;
 
 const MAX_KV_BATCH_READ_ITEMS: usize = 100;
 const UPLOAD_COPY_BUFFER_SIZE: usize = 1024 * 1024;
+/// Largest `/invoke` upload body, in bytes: 95 MiB (TC-1012). It matches the
+/// ingress `client_max_body_size` and the tinycloud-tee-proxy Worker cap; a
+/// longer body is refused with 413.
+const MAX_UPLOAD_BODY_BYTES: u64 = 95 * 1024 * 1024;
+
+fn upload_body_too_large() -> (Status, String) {
+    (
+        Status::PayloadTooLarge,
+        format!("Request body exceeds the {MAX_UPLOAD_BODY_BYTES}-byte upload limit"),
+    )
+}
+
+/// Opens an upload body one byte past [`MAX_UPLOAD_BODY_BYTES`], so its
+/// reader can tell a body of exactly the limit from a longer one.
+fn open_upload_body(data: rocket::Data<'_>) -> rocket::data::DataStream<'_> {
+    data.open((MAX_UPLOAD_BODY_BYTES + 1).bytes())
+}
+
+fn multipart_error(error: multer::Error) -> (Status, String) {
+    match error {
+        multer::Error::StreamSizeExceeded { .. } => upload_body_too_large(),
+        error => (Status::BadRequest, error.to_string()),
+    }
+}
 
 async fn copy_upload<R, W>(reader: R, writer: &mut W) -> std::io::Result<u64>
 where
@@ -1515,11 +1539,7 @@ async fn copy_multipart_field_to_stage(
     space: &SpaceId,
     remaining: &mut Option<(u64, StorageCheck)>,
 ) -> Result<(), InvokeError> {
-    while let Some(chunk) = field
-        .chunk()
-        .await
-        .map_err(|e| (Status::BadRequest, e.to_string()))?
-    {
+    while let Some(chunk) = field.chunk().await.map_err(multipart_error)? {
         if let Some((remaining_bytes, check)) = remaining.as_mut() {
             let chunk_len = u64::try_from(chunk.len())
                 .map_err(|e| (Status::InternalServerError, e.to_string()))?;
@@ -1561,7 +1581,13 @@ async fn build_batch_kv_inputs(
     })?;
     let boundary =
         multer::parse_boundary(content_type).map_err(|e| (Status::BadRequest, e.to_string()))?;
-    let mut multipart = multer::Multipart::with_reader(data.open(1u8.gigabytes()), boundary);
+    let constraints = multer::Constraints::new()
+        .size_limit(multer::SizeLimit::new().whole_stream(MAX_UPLOAD_BODY_BYTES));
+    let mut multipart = multer::Multipart::with_reader_with_constraints(
+        open_upload_body(data),
+        boundary,
+        constraints,
+    );
     let mut inputs = HashMap::new();
     let (space, _) = expected
         .values()
@@ -1570,11 +1596,7 @@ async fn build_batch_kv_inputs(
     let mut remaining = staged_batch_remaining(space, tinycloud, config, quota_cache).await?;
     let decode_start = Instant::now();
     let result: Result<KvInputMap, InvokeError> = async {
-        while let Some(field) = multipart
-            .next_field()
-            .await
-            .map_err(|e| (Status::BadRequest, e.to_string()))?
-        {
+        while let Some(field) = multipart.next_field().await.map_err(multipart_error)? {
             let encoded_path = field
                 .name()
                 .ok_or_else(|| {
@@ -1999,7 +2021,7 @@ async fn invoke_impl(
                         .stage(space)
                         .await
                         .map_err(|e| (Status::InternalServerError, e.to_string()))?;
-                    let open_data = d.open(1u8.gigabytes()).compat();
+                    let open_data = open_upload_body(d).compat();
 
                     // Public spaces use their storage cap, others the per-space quota.
                     let budget = staged_batch_remaining(space, tinycloud, config, quota_cache).await?;
@@ -2033,7 +2055,9 @@ async fn invoke_impl(
                         );
                         result
                     };
-                    copy_result?;
+                    if copy_result? > MAX_UPLOAD_BODY_BYTES {
+                        return Err(upload_body_too_large().into());
+                    }
 
                     let mut inputs = HashMap::new();
                     inputs.insert(
@@ -3214,17 +3238,20 @@ async fn handle_duckdb_invoke(
 
     if ability == "tinycloud.duckdb/import" {
         // Import always grows the database artifact — gate before reading
-        // the (up to 100 MB) body. Same 402 semantics as the KV/SQL paths.
+        // the (up to 95 MiB) body. Same 402 semantics as the KV/SQL paths.
         staged_batch_remaining(space, tinycloud, config, quota_cache).await?;
 
         let body_bytes = match data {
             DataIn::One(d) => {
                 let mut buf = Vec::new();
-                let mut reader = d.open(100u8.megabytes());
+                let mut reader = open_upload_body(d);
                 reader
                     .read_to_end(&mut buf)
                     .await
                     .map_err(|e| (Status::BadRequest, e.to_string()))?;
+                if buf.len() as u64 > MAX_UPLOAD_BODY_BYTES {
+                    return Err(upload_body_too_large().into());
+                }
                 buf
             }
             _ => {
@@ -8529,6 +8556,103 @@ mod tests {
         );
 
         tinycloud_core::admission::test_hook::disarm(identity);
+        Ok(())
+    }
+
+    /// Dispatch one signed `kv/put` of `doc` with `body` and `content_type`
+    /// through the real `/invoke` route; returns the status and body text.
+    async fn tc1012_kv_put(
+        nonce: &str,
+        content_type: rocket::http::ContentType,
+        body: Vec<u8>,
+    ) -> Result<(rocket::http::Status, String)> {
+        use rocket::http::Header;
+        use rocket::local::asynchronous::Client;
+
+        let signer = JWK::generate_ed25519()?;
+        let issuer_vm = tc341_verification_method(&signer)?;
+        let (header, space) = tc409_root_invocation(
+            &signer,
+            &issuer_vm,
+            "kv",
+            "tinycloud.kv/put",
+            Some("doc"),
+            nonce,
+        )?;
+        let (rocket, _conn) = tc409_invoke_rocket(&space).await?;
+        let client = Client::tracked(rocket).await?;
+        let response = client
+            .post("/invoke")
+            .header(Header::new("Authorization", header))
+            .header(content_type)
+            .body(body)
+            .dispatch()
+            .await;
+        let status = response.status();
+        Ok((status, response.into_string().await.unwrap_or_default()))
+    }
+
+    #[tokio::test]
+    async fn tc1012_kv_put_accepts_exactly_95_mib_and_refuses_one_more_byte_with_413() -> Result<()>
+    {
+        assert_eq!(MAX_UPLOAD_BODY_BYTES, 99_614_720);
+        let cap = MAX_UPLOAD_BODY_BYTES as usize;
+
+        let (status, body) = tc1012_kv_put(
+            "urn:uuid:tc1012-kv-put-at-cap",
+            rocket::http::ContentType::Binary,
+            vec![0x5a; cap],
+        )
+        .await?;
+        assert!(status.class().is_success(), "{status}: {body}");
+
+        let (status, body) = tc1012_kv_put(
+            "urn:uuid:tc1012-kv-put-over-cap",
+            rocket::http::ContentType::Binary,
+            vec![0x5a; cap + 1],
+        )
+        .await?;
+        assert_eq!(status, rocket::http::Status::PayloadTooLarge, "{body}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tc1012_multipart_kv_put_accepts_95_mib_body_and_refuses_one_more_byte_with_413(
+    ) -> Result<()> {
+        let boundary = "tc1012-boundary";
+        let multipart_body = |total: usize| {
+            let head = format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"doc\"\r\n\
+                 Content-Type: application/octet-stream\r\n\r\n"
+            );
+            let tail = format!("\r\n--{boundary}--\r\n");
+            let mut body = head.into_bytes();
+            body.resize(total - tail.len(), 0x5a);
+            body.extend_from_slice(tail.as_bytes());
+            assert_eq!(body.len(), total);
+            body
+        };
+        let content_type = || {
+            rocket::http::ContentType::new("multipart", "form-data")
+                .with_params(("boundary", boundary))
+        };
+        let cap = MAX_UPLOAD_BODY_BYTES as usize;
+
+        let (status, body) = tc1012_kv_put(
+            "urn:uuid:tc1012-multipart-at-cap",
+            content_type(),
+            multipart_body(cap),
+        )
+        .await?;
+        assert!(status.class().is_success(), "{status}: {body}");
+
+        let (status, body) = tc1012_kv_put(
+            "urn:uuid:tc1012-multipart-over-cap",
+            content_type(),
+            multipart_body(cap + 1),
+        )
+        .await?;
+        assert_eq!(status, rocket::http::Status::PayloadTooLarge, "{body}");
         Ok(())
     }
 
