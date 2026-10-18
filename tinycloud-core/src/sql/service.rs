@@ -528,7 +528,7 @@ impl SqlService {
             if let Some(handle) = self.databases.get(&key).map(|h| h.clone()) {
                 return Ok(handle);
             }
-            let flight = {
+            let (flight, start) = {
                 let mut flights = self
                     .hydrations
                     .lock()
@@ -538,11 +538,21 @@ impl SqlService {
                 if let Some(handle) = self.databases.get(&key).map(|h| h.clone()) {
                     return Ok(handle);
                 }
-                flights
-                    .entry(key.clone())
-                    .or_insert_with(|| self.start_hydration(space, db_name))
-                    .clone()
+                match flights.get(&key) {
+                    Some(flight) => (flight.clone(), None),
+                    None => {
+                        let (flight, start) = self.prepare_hydration(space, db_name);
+                        flights.insert(key.clone(), flight.clone());
+                        (flight, Some(start))
+                    }
+                }
             };
+            // Spawned only after the registry lock is released: if the
+            // runtime is shutting down, the task is dropped at once and its
+            // guard takes that lock to retire the entry.
+            if let Some(start) = start {
+                start();
+            }
             match self.join_hydration(flight).await? {
                 HydrationOutcome::Ready => continue,
                 HydrationOutcome::Unavailable => return Err(SqlError::Unavailable),
@@ -586,8 +596,13 @@ impl SqlService {
         })
     }
 
-    /// Spawn the hydration of (space, db). Called under the registry lock.
-    fn start_hydration(&self, space: &SpaceId, db_name: &str) -> HydrationFlight {
+    /// Prepare the hydration of (space, db) and the call that spawns it.
+    /// Prepared under the registry lock; spawn it after releasing the lock.
+    fn prepare_hydration(
+        &self,
+        space: &SpaceId,
+        db_name: &str,
+    ) -> (HydrationFlight, impl FnOnce()) {
         let (sender, outcome) = tokio::sync::watch::channel(None);
         let phase = Arc::new(AtomicU8::new(PHASE_LOADING));
         let retire = RetireFlight {
@@ -603,11 +618,12 @@ impl SqlService {
             retire.finish(ended);
         }
         .instrument(tracing::Span::current());
-        match request_telemetry::current() {
+        let telemetry = request_telemetry::current();
+        let start = move || match telemetry {
             Some(context) => drop(tokio::spawn(request_telemetry::scope(context, task))),
             None => drop(tokio::spawn(task)),
-        }
-        HydrationFlight { phase, outcome }
+        };
+        (HydrationFlight { phase, outcome }, start)
     }
 
     /// Load the durable artifact, seed the cache from it and spawn the actor.
