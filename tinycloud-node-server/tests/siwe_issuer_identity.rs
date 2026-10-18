@@ -888,15 +888,8 @@ async fn status_signed_invocation_cannot_revoke_but_revoke_signed_invocation_can
                 .body(json!({"cid": target.to_string()}).to_string()),
         )
         .await;
-        assert_eq!(
-            status_response,
-            if target == raw {
-                Status::Ok
-            } else {
-                Status::NotFound
-            },
-            "{target}: {body}"
-        );
+        // A canonical CID resolves to its stored historical encoding (TC-821).
+        assert_eq!(status_response, Status::Ok, "{target}: {body}");
         let before_revocations = revocation::Entity::find().count(state.connection()).await?;
         let before_events = event_order::Entity::find()
             .count(state.connection())
@@ -925,11 +918,7 @@ async fn status_signed_invocation_cannot_revoke_but_revoke_signed_invocation_can
                 .delegation_status(Hash::from(target), &owner, &[])
                 .await
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?,
-            if target == raw {
-                Some(DelegationStatus::Active)
-            } else {
-                None
-            }
+            Some(DelegationStatus::Active)
         );
     }
     let revoke = make_invocation_from_uris(

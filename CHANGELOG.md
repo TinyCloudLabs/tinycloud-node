@@ -5,6 +5,8 @@
 ### Changes
 
 - `POST /revoke` authorizes the delegation's issuer, the owner of a space its abilities target, or the holder of a revoke control grant issued by one of them. The delegatee alone is no longer an authorized revoker, directly or through a control grant it issued; an intermediate delegator still revokes the delegations it issued. Delegation status visibility is unchanged (TC-1436).
+- An owner can activate a parentless `tinycloud.delegation/revoke` grant on exactly `urn:cid:<target>` (for example the CLI's raw-CID revoke permission) when the stored target's abilities name a space the owner owns. Every non-root capability of such a grant must be one of these. Unknown targets, targets without abilities, and signers who are only the target's delegator or delegatee are refused with `Cannot find parent delegation` (TC-821).
+- Revocation and delegation status accept a canonical CID that names a stored historical encoding. An exact-CID revoke or status grant covers every stored encoding of its target. The signed CID is kept as signed, and authorization uses the stored row (TC-821).
 
 ## [1.21.0] - 2026-10-18
 
