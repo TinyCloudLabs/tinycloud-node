@@ -818,3 +818,206 @@ async fn owner_signed_target_revocation_preserves_cross_space_account_control() 
     assert!(stored_revoked(&fixture.conn, &target).await?);
     Ok(())
 }
+
+/// A key that can sign UCANs and appear in persisted delegation rows.
+async fn registered_key(fixture: &KvSyncFixture) -> Result<(JWK, String, String)> {
+    use tinycloud_core::models::actor;
+    let jwk = JWK::generate_ed25519()?;
+    let vm = tc341_verification_method(&jwk)?;
+    let did = KvSyncFixture::did_of(&vm);
+    actor::ActiveModel {
+        id: Set(did.clone()),
+    }
+    .insert(&fixture.conn)
+    .await?;
+    Ok((jwk, vm, did))
+}
+
+/// Persist an exact-CID `tinycloud.delegation/revoke` control grant.
+async fn exact_cid_revoke_control(
+    fixture: &KvSyncFixture,
+    label: &str,
+    grantor: &str,
+    holder: &str,
+    target: Hash,
+) -> Result<Hash> {
+    let control = fixture
+        .grant(label, grantor, holder, &[], None, None, &[])
+        .await?;
+    ability_model::ActiveModel {
+        delegation: Set(control),
+        resource: Set(Resource::Other(
+            format!("urn:cid:{}", target.to_cid(0x55)).parse()?,
+        )),
+        ability: Set(Ability::try_from(
+            "tinycloud.delegation/revoke".to_string(),
+        )?),
+        caveats: Set(tinycloud_core::types::Caveats(Default::default())),
+    }
+    .insert(&fixture.conn)
+    .await?;
+    Ok(control)
+}
+
+async fn assert_revoked_ok(fixture: &KvSyncFixture, target: Hash, header: String) -> Result<()> {
+    let response = fixture
+        .client
+        .post("/revoke")
+        .header(Header::new("Authorization", header))
+        .dispatch()
+        .await;
+    let status = response.status();
+    let body = response.into_string().await.unwrap_or_default();
+    assert_eq!(status, Status::Ok, "authorized revocation: {body}");
+    let receipt: serde_json::Value = serde_json::from_str(&body)?;
+    assert_eq!(receipt["revoked"], true);
+    assert_eq!(receipt["cid"], target.to_cid(0x55).to_string());
+    assert!(stored_revoked(&fixture.conn, &target).await?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn recipient_cannot_revoke_a_grant_it_only_received() -> Result<()> {
+    use tinycloud_core::db::DelegationStatus;
+    let fixture = scoped_fixture().await?;
+    let target = fixture
+        .device_grant("received-only-target", &["tinycloud.kv/get"])
+        .await?;
+    // The recipient keeps read access to the grant's status.
+    let state = fixture
+        .client
+        .rocket()
+        .state::<TinyCloud>()
+        .expect("managed TinyCloud");
+    assert_eq!(
+        state
+            .delegation_status(target, &fixture.device_did(), &[])
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?,
+        Some(DelegationStatus::Active)
+    );
+    // A proof-less revocation signed by the recipient alone is refused.
+    fixture
+        .assert_scope_denied(target, fixture.scoped_revoke_header(target, None)?)
+        .await?;
+    // The grantor (here the space owner) still revokes it.
+    let owner = fixture.signed_scope_token(
+        &fixture.owner,
+        &fixture.owner_vm,
+        &fixture.space.did().to_string(),
+        &format!("urn:cid:{}", target.to_cid(0x55)),
+        "tinycloud.delegation/revoke",
+        whole_seconds_from_now(3600),
+        &[],
+    )?;
+    assert_revoked_ok(&fixture, target, owner).await
+}
+
+#[tokio::test]
+async fn recipient_cannot_grant_revocation_of_a_grant_it_only_received() -> Result<()> {
+    let fixture = scoped_fixture().await?;
+    let target = fixture
+        .device_grant("received-only-control-target", &["tinycloud.kv/get"])
+        .await?;
+    let (helper, helper_vm, helper_did) = registered_key(&fixture).await?;
+    // The recipient issues an exact-CID revoke control for its own grant.
+    let control = exact_cid_revoke_control(
+        &fixture,
+        "recipient-issued-control",
+        &fixture.device_did(),
+        &helper_did,
+        target,
+    )
+    .await?;
+    let header = fixture.signed_scope_token(
+        &helper,
+        &helper_vm,
+        &helper_did,
+        &format!("urn:cid:{}", target.to_cid(0x55)),
+        "tinycloud.delegation/revoke",
+        whole_seconds_from_now(3600),
+        &[control.to_cid(0x55)],
+    )?;
+    fixture.assert_scope_denied(target, header).await
+}
+
+#[tokio::test]
+async fn issuing_delegator_and_owner_revoke_a_descendant_its_recipient_cannot() -> Result<()> {
+    let fixture = scoped_fixture().await?;
+    let device_did = fixture.device_did();
+    let parent = fixture
+        .device_grant("reshare-parent", &["tinycloud.kv/get"])
+        .await?;
+    let (holder, holder_vm, holder_did) = registered_key(&fixture).await?;
+    let mut children = Vec::new();
+    for label in ["reshare-child-1", "reshare-child-2", "reshare-child-3"] {
+        children.push(
+            fixture
+                .grant(
+                    label,
+                    &device_did,
+                    &holder_did,
+                    &[("notes/", "tinycloud.kv/get")],
+                    None,
+                    Some(whole_seconds_from_now(1800)),
+                    &[parent],
+                )
+                .await?,
+        );
+    }
+    let holder_revokes = |target: Hash| {
+        fixture.signed_scope_token(
+            &holder,
+            &holder_vm,
+            &holder_did,
+            &format!("urn:cid:{}", target.to_cid(0x55)),
+            "tinycloud.delegation/revoke",
+            whole_seconds_from_now(3600),
+            &[],
+        )
+    };
+    // The re-share's recipient cannot revoke it.
+    fixture
+        .assert_scope_denied(children[0], holder_revokes(children[0])?)
+        .await?;
+    // The intermediate delegator that issued it can.
+    assert_revoked_ok(
+        &fixture,
+        children[0],
+        fixture.scoped_revoke_header(children[0], None)?,
+    )
+    .await?;
+    // So can a key the issuing delegator handed an exact-CID revoke control.
+    let (helper, helper_vm, helper_did) = registered_key(&fixture).await?;
+    let control = exact_cid_revoke_control(
+        &fixture,
+        "delegator-issued-control",
+        &device_did,
+        &helper_did,
+        children[1],
+    )
+    .await?;
+    let helper_header = fixture.signed_scope_token(
+        &helper,
+        &helper_vm,
+        &helper_did,
+        &format!("urn:cid:{}", children[1].to_cid(0x55)),
+        "tinycloud.delegation/revoke",
+        whole_seconds_from_now(3600),
+        &[control.to_cid(0x55)],
+    )?;
+    assert_revoked_ok(&fixture, children[1], helper_header).await?;
+    // The space owner revokes a descendant it did not issue directly.
+    let owner = fixture.signed_scope_token(
+        &fixture.owner,
+        &fixture.owner_vm,
+        &fixture.space.did().to_string(),
+        &format!("urn:cid:{}", children[2].to_cid(0x55)),
+        "tinycloud.delegation/revoke",
+        whole_seconds_from_now(3600),
+        &[],
+    )?;
+    assert_revoked_ok(&fixture, children[2], owner).await?;
+    assert!(!stored_revoked(&fixture.conn, &parent).await?);
+    Ok(())
+}
