@@ -2608,6 +2608,7 @@ impl Harness {
     ) -> anyhow::Result<(Status, String, Signer, Option<Cid>)> {
         let s0 = decode_delegation(session).map_err(|(_, error)| anyhow::anyhow!(error))?;
         let reader = Signer::key();
+        let child_not_before = s0.0.not_before.unwrap().unix_timestamp() + 1;
         let mut facts = match &s0.0.delegation {
             TinyCloudDelegation::Ucan(ucan) => ucan.payload().facts.clone().unwrap(),
             TinyCloudDelegation::Cacao(_) => unreachable!(),
@@ -2619,11 +2620,9 @@ impl Harness {
         let child = Payload {
             issuer: vm.parse()?,
             audience: reader.did().parse()?,
-            // Whole seconds: sub-microsecond times don't survive PostgreSQL
-            // timestamps.
-            not_before: Some(NumericDate::try_from_seconds(
-                (s0.0.not_before.unwrap().unix_timestamp() + 1) as f64,
-            )?),
+            // Whole seconds (sub-microsecond times don't survive PostgreSQL
+            // timestamps), after the parent's start; we wait for it below.
+            not_before: Some(NumericDate::try_from_seconds(child_not_before as f64)?),
             expiration: NumericDate::try_from_seconds(
                 (s0.0.expiry.unwrap().unix_timestamp() - 1) as f64,
             )?,
@@ -2636,6 +2635,11 @@ impl Harness {
             )?,
         }
         .sign(Algorithm::EdDSA, jwk)?;
+        // The child must be valid when it is imported.
+        let wait = child_not_before - OffsetDateTime::now_utc().unix_timestamp();
+        if wait >= 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(wait as u64 * 1000 + 50)).await;
+        }
         let (status, body) = self
             .delegate(TinyCloudDelegation::Ucan(Box::new(child)).encode()?)
             .await;
