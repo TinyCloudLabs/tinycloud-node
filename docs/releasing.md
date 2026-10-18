@@ -294,10 +294,11 @@ gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref main \
 ```
 
 The served/OCI identity remains **1.20.6-dstack / e18578ff9162986ddd813259c60f73866e3e60d1**.
-The N0 raw lock **changed in #346 (TC-959)**, which passes the validated N2 correlation fields through the log sidecar:
-`6563d51bffe4b537d49b0c087a50e86753aaaf5ba533f1e52c7c2214f7f5f04e`,
-from #346 final reviewed head.
-It supersedes the #309 lock `ca110b0bae6d5a06a1002fb80df3f71cffec11659c9f9dbfa5d72624735546f6`,
+The N0 raw lock **changed in #347 (TC-1274)**, which maps the SQL busy, hydration timeout and request deadline warnings in the log sidecar:
+`6e3b96c886774150f8dc159c9fb063d70a74ab15514bf52667e0068ae94fa391`,
+from #347 final reviewed head.
+It supersedes the #346 (TC-959) lock `6563d51bffe4b537d49b0c087a50e86753aaaf5ba533f1e52c7c2214f7f5f04e`,
+which superseded the #309 lock `ca110b0bae6d5a06a1002fb80df3f71cffec11659c9f9dbfa5d72624735546f6`,
 from #309 reviewed head `44eeb20a1461ef66b5af492e3be4c42be2728b67`,
 [approval](https://github.com/TinyCloudLabs/tinycloud-node/pull/309#issuecomment-6224650050).
 Current pre-N0 tag/pinned equivalents are separately hash-checked; arbitrary
