@@ -2254,6 +2254,39 @@ mod tests {
         assert_eq!(state.reported.stopped, 2);
     }
 
+    /// A request's deadline context says the time is going to the read
+    /// audit while a read waits for its record, and stops saying so once the
+    /// wait ends: a deadline that cuts the wait logs `stage = read_audit`.
+    #[tokio::test]
+    async fn tc1317_a_read_waiting_on_its_audit_is_in_the_read_audit_stage() {
+        use crate::request_cancel::{within, RequestCancel, Stage};
+
+        let (_directory, _conn, pipeline) = file_pipeline().await;
+        pipeline.set_wait(COMMIT_TEST_WAIT);
+        let context = RequestCancel::new(COMMIT_TEST_WAIT);
+        let held = pipeline.hold_drain().await;
+        let read = tokio::spawn({
+            let (pipeline, context) = (pipeline.clone(), context.clone());
+            async move { within(Some(context), pipeline.enqueue(record(0))).await }
+        });
+        tokio::time::timeout(PATIENCE, async {
+            while context.stage() != Stage::ReadAudit {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the waiting read must be in the read-audit stage");
+        assert!(!read.is_finished(), "still waiting on the held drain");
+
+        drop(held);
+        let outcome = tokio::time::timeout(PATIENCE, read)
+            .await
+            .expect("released drain commits")
+            .unwrap();
+        assert_eq!(outcome, Ok(()));
+        assert_eq!(context.stage(), Stage::Other);
+    }
+
     #[tokio::test]
     async fn tc1317_a_held_drain_answers_busy_within_the_bound() {
         let (_directory, _conn, pipeline) = file_pipeline().await;

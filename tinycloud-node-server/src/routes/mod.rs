@@ -9805,54 +9805,12 @@ mod tests {
 
     /// TC-1317 review R2: a deadline shorter than the read-audit wait cuts a
     /// read waiting on its audit with `503 request_timeout` and
-    /// `Retry-After: 1`, no data, and logs that the time went to the audit.
+    /// `Retry-After: 1`, no data. That the wait is reported as
+    /// `stage = read_audit` is tested in core
+    /// (`tc1317_a_read_waiting_on_its_audit_is_in_the_read_audit_stage`).
     #[tokio::test]
     async fn a_deadline_before_the_audit_wait_answers_request_timeout() -> Result<()> {
         use rocket::http::{Header, Status};
-
-        /// Records the `stage` of each `Request deadline exceeded` warning.
-        /// Spans are ignored: a span opened on this thread may close on a
-        /// database worker thread, which a span registry would reject.
-        #[derive(Clone, Default)]
-        struct DeadlineStages(Arc<std::sync::Mutex<Vec<String>>>);
-        #[derive(Default)]
-        struct Fields {
-            message: String,
-            stage: String,
-        }
-        impl tracing::field::Visit for Fields {
-            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-                if field.name() == "stage" {
-                    self.stage = value.to_string();
-                }
-            }
-            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-                if field.name() == "message" {
-                    self.message = format!("{value:?}");
-                }
-            }
-        }
-        impl tracing::Subscriber for DeadlineStages {
-            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
-                true
-            }
-            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-                tracing::span::Id::from_u64(1)
-            }
-            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
-            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-            fn event(&self, event: &tracing::Event<'_>) {
-                let mut fields = Fields::default();
-                event.record(&mut fields);
-                if fields.message == "Request deadline exceeded" {
-                    self.0.lock().unwrap().push(fields.stage);
-                }
-            }
-            fn enter(&self, _: &tracing::span::Id) {}
-            fn exit(&self, _: &tracing::span::Id) {}
-        }
-        let stages = DeadlineStages::default();
-        let _logging = tracing::subscriber::set_default(stages.clone());
 
         let mut config = Config::default();
         config.invocation.deadline_ms = 300;
@@ -9890,8 +9848,6 @@ mod tests {
             response.into_string().await.as_deref(),
             Some(REQUEST_TIMEOUT_BODY)
         );
-
-        assert_eq!(*stages.0.lock().unwrap(), ["read_audit"]);
         Ok(())
     }
 
