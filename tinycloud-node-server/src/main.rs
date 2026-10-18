@@ -202,7 +202,10 @@ mod tests {
 
         // The trap: a single underscore is a silent no-op.
         let _s = EnvVarGuard::set(single, "false");
-        assert!(extract().enabled, "single-underscore form must not disable it");
+        assert!(
+            extract().enabled,
+            "single-underscore form must not disable it"
+        );
         drop(_s);
 
         // The key the later ramp tunes.
