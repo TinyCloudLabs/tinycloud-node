@@ -2809,14 +2809,9 @@ impl PolicyV3Runtime {
         )
         .map_err(|_| "enforcer-binding-invalid")?;
         // TC-1423: classify a registration made before owner-authority
-        // bindings existed on its first use. Recorded only; the result does
-        // not gate this request.
-        if self.owner_binding(registration).await.is_err() {
-            ::tracing::debug!(
-                event = "policy_owner_authority",
-                "policy owner-authority classification unavailable"
-            );
-        }
+        // bindings existed, in the background. Recorded only; it does not
+        // gate this request or add work to it.
+        self.note_owner_binding(registration);
         Ok(())
     }
 }

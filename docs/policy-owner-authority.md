@@ -37,23 +37,30 @@ each capability:
    capability's space or encryption network (newest first, 64 rows). Only that
    principal can create them, so delegations from other principals cannot
    push them out of the window.
-3. Otherwise the general window: the 256 newest delegations to the owner, of
-   which at most 32 are tried.
+3. Otherwise the general window: the 256 newest delegations to the owner that
+   carry an ability on the capability's space or network (only holders of
+   authority derived from that space or network can create those), of which
+   at most 32 are tried.
 
 A candidate whose ancestor closure (the candidate included) contains a
-delegation issued by the policy owner is skipped. Among candidates that grant
-the capability, the first, newest first, whose closure outlives the policy root
-is chosen, else the newest. `starved` is recorded only when both steps found
-nothing and more delegations exist than were examined.
+delegation issued by the policy owner is skipped, without using up a try.
+Among candidates that grant the capability, the first, newest first, whose
+closure outlives the policy root is chosen, else the newest. `starved` is
+recorded only when both steps found nothing and more candidates exist than
+were examined; unlike the other `unknown` reasons it is not final and is
+classified again on a later use.
 
 ## Policies registered earlier
 
-A policy with no binding row is classified on first use: the selection runs in
-memory as of its registration time (delegations issued after it are not
-considered; UCANs carry no issue time and stay eligible), then one transaction
-inserts the binding row first and its closure after it. A concurrent writer
-that stored a row first wins. If the write fails (lock timeout, SQLite busy),
-the in-memory result is used for that request and the row stays pending. An
+A policy with no binding row is classified in the background on first use,
+off the request: the selection runs as of its registration time (delegations
+issued after it are not considered; UCANs carry no issue time and stay
+eligible), then one transaction inserts the binding row first and its closure
+after it. A concurrent writer that stored a row first wins. One task runs per
+policy at a time. If the write fails (lock timeout, SQLite busy) or the result
+is `starved`, the row stays pending and the request path doesn't start another
+attempt for 60 seconds. Policies whose stored classification is final are
+remembered in process (bounded), so steady-state reads add no query. An
 `unknown` row written by an older `classifier_version` is classified again.
 
 The opt-in sweep classifies pending policies off the request path:
@@ -78,7 +85,9 @@ legacy_cutover = "2026-10-20T00:00:00Z"  # TINYCLOUD_POLICY_V3__LEGACY_CUTOVER
 ```
 
 The node logs the effective cutover and its source (`config` or `migration`)
-at boot.
+at boot: at `warn` when the source is the migration and it was applied less
+than a day earlier (a fresh migration, or a re-upgrade that still needs the
+override), otherwise at `info`.
 
 ## Rollback
 
@@ -116,4 +125,5 @@ or the holder of a status control. Anyone else gets `403`.
 
 Pages hold at most 100 policies in policy-CID order; `nextCursor` is set when a
 page is full and passed back as `cursor`. There is no total count. Policies
-not yet classified are not listed.
+not yet classified (legacy policies not used since the upgrade, with the sweep
+off) are not listed. Database errors return `503 policy-listing-unavailable`.

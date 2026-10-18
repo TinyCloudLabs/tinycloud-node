@@ -1146,6 +1146,16 @@ impl Harness {
         Ok(())
     }
 
+    /// Use the policy (a challenge) and wait for its background
+    /// classification.
+    pub async fn classify_on_use(&self, policy: &Registered) -> anyhow::Result<BindingRow> {
+        let (status, body) = self.challenge(policy).await;
+        anyhow::ensure!(status == Status::Ok, "challenge: {status} {body}");
+        self.wait_for_binding(&policy.policy_cid, std::time::Duration::from_secs(20))
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("not classified"))
+    }
+
     /// Wait until `policy_cid` has a classification, or time out.
     pub async fn wait_for_binding(
         &self,
@@ -1368,6 +1378,34 @@ fn graph_id(encoded: &str) -> anyhow::Result<Vec<u8>> {
         .to_vec())
 }
 
+/// Sign fresh delegations until one's graph id sorts in the top quarter, so
+/// that later ids can be chosen to sort before it.
+fn high_id(mut sign: impl FnMut() -> anyhow::Result<String>) -> anyhow::Result<String> {
+    for _ in 0..512 {
+        let encoded = sign()?;
+        // Byte 2 is the first digest byte after the multihash prefix.
+        if graph_id(&encoded)?.get(2).is_some_and(|byte| *byte >= 0xC0) {
+            return Ok(encoded);
+        }
+    }
+    anyhow::bail!("no delegation sorted high")
+}
+
+/// Set a registration's `registered_at`, as for one registered earlier.
+async fn backdate(
+    h: &Harness,
+    policy_cid: &str,
+    registered_at: OffsetDateTime,
+) -> anyhow::Result<()> {
+    let update = Query::update()
+        .table(Alias::new("policy_v3_registration"))
+        .value(Alias::new("registered_at"), format_time(registered_at))
+        .and_where(Expr::col(Alias::new("policy_cid")).eq(policy_cid))
+        .to_owned();
+    h.conn().execute(h.backend().build(&update)).await?;
+    Ok(())
+}
+
 /// Sign fresh delegations until one's graph id sorts before `target`.
 fn sorting_before(
     target: &[u8],
@@ -1414,8 +1452,7 @@ async fn stranger_delegations_cannot_starve_the_owner_grant(
         vec![authority.clone()]
     );
     // First use of the legacy registration classifies it.
-    assert_eq!(h.challenge(&legacy).await.0, Status::Ok);
-    let binding = h.binding(&legacy.policy_cid).await?.expect("backfilled");
+    let binding = h.classify_on_use(&legacy).await?;
     assert_eq!(binding.registered_mode, "backfill");
     assert_eq!(binding.state, "bound");
     assert_eq!(h.closure(&legacy.policy_cid).await?, vec![authority]);
@@ -1440,14 +1477,14 @@ async fn flood(h: &Harness, count: usize, issued_offset: Duration) -> anyhow::Re
     Ok(())
 }
 
-/// `starved` is recorded only after the owner-first step and the general
-/// window both found nothing: here the owner's authority is re-delegated, so
-/// only the (flooded) general window could find it.
-async fn starved_is_recorded_only_after_both_steps(backend: Backend) -> anyhow::Result<()> {
+/// The general window only holds delegations touching the capability's space
+/// or network, so strangers cannot crowd out a re-delegated authority that
+/// the owner-first step does not see.
+async fn strangers_cannot_crowd_the_general_window(backend: Backend) -> anyhow::Result<()> {
     let Some(h) = Harness::with_boot(
         backend,
         Shape::KeySession,
-        "starved_is_recorded_only_after_both_steps",
+        "strangers_cannot_crowd_the_general_window",
         legacy_boot(),
     )
     .await?
@@ -1462,25 +1499,183 @@ async fn starved_is_recorded_only_after_both_steps(backend: Backend) -> anyhow::
                 .delegate(intermediary.did(), &h.owner_grants(), window, &[])?,
         )
         .await?;
-    h.import(intermediary.delegate(
-        h.owner.did(),
-        &h.owner_grants(),
-        window,
-        &[upstream.parse()?],
-    )?)
-    .await?;
+    let authority = h
+        .import(intermediary.delegate(
+            h.owner.did(),
+            &h.owner_grants(),
+            window,
+            &[upstream.parse()?],
+        )?)
+        .await?;
     let legacy = h.register_ok(policy_window()).await?;
     h.forget_binding(&legacy.policy_cid).await?;
-    // Backdated, so they lead the backfill's window (issued before the
-    // registration).
     flood(&h, 300, -Duration::days(300)).await?;
-    h.challenge(&legacy).await;
-    let binding = h.binding(&legacy.policy_cid).await?.expect("classified");
+    let binding = h.classify_on_use(&legacy).await?;
+    assert_eq!(binding.state, "bound");
+    let mut expected = vec![authority, upstream];
+    expected.sort();
+    assert_eq!(h.closure(&legacy.policy_cid).await?, expected);
+    Ok(())
+}
+on_both_backends!(strangers_cannot_crowd_the_general_window);
+
+/// `starved` needs both steps to miss with candidates left unexamined: here
+/// the general window is full of loop-back delegations (skipped without using
+/// a try) ahead of the re-delegated authority. `starved` is not final.
+async fn a_general_window_full_of_skipped_rows_is_starved(backend: Backend) -> anyhow::Result<()> {
+    let Some(h) = Harness::with_boot(
+        backend,
+        Shape::KeySession,
+        "a_general_window_full_of_skipped_rows_is_starved",
+        legacy_boot(),
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let grants = h.owner_grants();
+    let window = Window::until(now() + Duration::days(2));
+    let intermediary = Signer::key();
+    let upstream = h
+        .import(
+            h.space_owner
+                .delegate(intermediary.did(), &grants, window, &[])?,
+        )
+        .await?;
+    let authority_encoded =
+        high_id(|| intermediary.delegate(h.owner.did(), &grants, window, &[upstream.parse()?]))?;
+    let authority_id = graph_id(&authority_encoded)?;
+    let authority = h.import(authority_encoded).await?;
+    let legacy = h.register_ok(policy_window()).await?;
+    h.forget_binding(&legacy.policy_cid).await?;
+    let link_holder = Signer::key();
+    let link = h
+        .import(
+            h.owner
+                .delegate(link_holder.did(), &grants, window, &[authority.parse()?])?,
+        )
+        .await?;
+    for _ in 0..260 {
+        let back = sorting_before(&authority_id, || {
+            link_holder.delegate(h.owner.did(), &grants, window, &[link.parse()?])
+        })?;
+        h.import(back).await?;
+    }
+    let binding = h.classify_on_use(&legacy).await?;
     assert_eq!(binding.state, "unknown");
     assert_eq!(binding.unknown_reason.as_deref(), Some("starved"));
     Ok(())
 }
-on_both_backends!(starved_is_recorded_only_after_both_steps);
+on_both_backends!(a_general_window_full_of_skipped_rows_is_starved);
+
+/// Delegations to the owner from holders of the space owner's authority
+/// (they pass the general window's scope) sort ahead of the space owner's
+/// own grant; the owner-first step still records that grant.
+async fn owner_derived_delegations_cannot_displace_the_owner_grant(
+    backend: Backend,
+) -> anyhow::Result<()> {
+    let Some(h) = Harness::new(
+        backend,
+        Shape::KeySession,
+        "owner_derived_delegations_cannot_displace_the_owner_grant",
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let grants = h.owner_grants();
+    let window = Window::until(now() + Duration::days(2));
+    let authority_encoded =
+        high_id(|| h.space_owner.delegate(h.owner.did(), &grants, window, &[]))?;
+    let authority_id = graph_id(&authority_encoded)?;
+    let authority = h.import(authority_encoded).await?;
+    let holder = Signer::key();
+    let upstream = h
+        .import(h.space_owner.delegate(holder.did(), &grants, window, &[])?)
+        .await?;
+    for _ in 0..260 {
+        let derived = sorting_before(&authority_id, || {
+            holder.delegate(h.owner.did(), &grants, window, &[upstream.parse()?])
+        })?;
+        h.import(derived).await?;
+    }
+    let policy = h.register_ok(policy_window()).await?;
+    assert_eq!(h.closure(&policy.policy_cid).await?, vec![authority]);
+    Ok(())
+}
+on_both_backends!(owner_derived_delegations_cannot_displace_the_owner_grant);
+
+/// The legacy classifier only considers grants issued no later than the
+/// registration.
+async fn the_legacy_classifier_ignores_grants_issued_after_registration(
+    backend: Backend,
+) -> anyhow::Result<()> {
+    let Some(h) = Harness::with_boot(
+        backend,
+        Shape::PkhSession,
+        "the_legacy_classifier_ignores_grants_issued_after_registration",
+        legacy_boot(),
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    // Valid since two hours ago, but issued now.
+    h.grant_owner(Window {
+        not_before: now() - Duration::hours(2),
+        expiry: now() + Duration::days(2),
+        issued_at: Some(now()),
+    })
+    .await?;
+    let legacy = h.register_ok(policy_window()).await?;
+    h.forget_binding(&legacy.policy_cid).await?;
+    backdate(&h, &legacy.policy_cid, now() - Duration::hours(1)).await?;
+    let binding = h.classify_on_use(&legacy).await?;
+    assert_eq!(binding.state, "unknown");
+    assert_eq!(binding.unknown_reason.as_deref(), Some("missing"));
+    Ok(())
+}
+on_both_backends!(the_legacy_classifier_ignores_grants_issued_after_registration);
+
+/// [C1] With a SIWE owner grant: strangers' delegations issued after it
+/// (future at registration, or between it and a legacy registration) don't
+/// displace it.
+async fn stranger_delegations_cannot_starve_a_siwe_owner_grant(
+    backend: Backend,
+) -> anyhow::Result<()> {
+    let Some(h) = Harness::with_boot(
+        backend,
+        Shape::PkhSession,
+        "stranger_delegations_cannot_starve_a_siwe_owner_grant",
+        legacy_boot(),
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let authority = h
+        .grant_owner(Window {
+            not_before: now() - Duration::hours(3),
+            expiry: now() + Duration::days(2),
+            issued_at: Some(now() - Duration::hours(2)),
+        })
+        .await?;
+    let legacy = h.register_ok(policy_window()).await?;
+    h.forget_binding(&legacy.policy_cid).await?;
+    backdate(&h, &legacy.policy_cid, now() - Duration::minutes(30)).await?;
+    flood(&h, 260, -Duration::hours(1)).await?;
+    flood(&h, 260, Duration::days(300)).await?;
+    let policy = h.register_ok(policy_window()).await?;
+    assert_eq!(
+        h.closure(&policy.policy_cid).await?,
+        vec![authority.clone()]
+    );
+    let binding = h.classify_on_use(&legacy).await?;
+    assert_eq!(binding.state, "bound");
+    assert_eq!(h.closure(&legacy.policy_cid).await?, vec![authority]);
+    Ok(())
+}
+on_both_backends!(stranger_delegations_cannot_starve_a_siwe_owner_grant);
 
 /// [F9] An older grant that outlives the root is recorded over a newer one
 /// that does not.
@@ -1535,6 +1730,9 @@ async fn concurrent_first_uses_store_one_classification(backend: Backend) -> any
     for (status, body) in results {
         assert_eq!(status, Status::Ok, "{body}");
     }
+    h.wait_for_binding(&policy.policy_cid, std::time::Duration::from_secs(20))
+        .await?
+        .expect("classified");
     let count = Query::select()
         .expr(Expr::col(Alias::new("policy_cid")).count())
         .from(Alias::new("policy_v3_owner_binding"))
@@ -1567,13 +1765,18 @@ async fn a_failed_classification_write_still_serves(backend: Backend) -> anyhow:
     h.grant_owner(Window::until(now() + Duration::days(2)))
         .await?;
     let policy = h.register_ok(policy_window()).await?;
-    let session = h.mint_ok(&policy).await?;
     h.forget_binding(&policy.policy_cid).await?;
     h.execute("DROP TABLE policy_v3_owner_authority").await?;
+    // The challenge starts a background classification whose write fails.
+    let session = h.mint_ok(&policy).await?;
     let (status, body) = h.read(&session).await?;
     assert_eq!(status, Status::Ok, "{body:?}");
     assert_eq!(body, CONTENT);
-    assert_eq!(h.binding(&policy.policy_cid).await?, None);
+    assert_eq!(
+        h.wait_for_binding(&policy.policy_cid, std::time::Duration::from_secs(2))
+            .await?,
+        None
+    );
     Ok(())
 }
 on_both_backends!(a_failed_classification_write_still_serves);
@@ -1583,7 +1786,7 @@ on_both_backends!(a_failed_classification_write_still_serves);
 async fn legacy_classification_falls_through_to_a_live_alternate(
     backend: Backend,
 ) -> anyhow::Result<()> {
-    let Some(h) = Harness::with_boot(
+    let Some(mut h) = Harness::with_boot(
         backend,
         Shape::KeySession,
         "legacy_classification_falls_through_to_a_live_alternate",
@@ -1609,7 +1812,7 @@ async fn legacy_classification_falls_through_to_a_live_alternate(
     };
     h.revoke(&h.space_owner, &recorded[0]).await?;
     h.forget_binding(&policy.policy_cid).await?;
-    h.challenge(&policy).await;
+    h.classify_on_use(&policy).await?;
     assert_eq!(
         h.closure(&policy.policy_cid).await?,
         vec![alternate.clone()]
@@ -1617,8 +1820,10 @@ async fn legacy_classification_falls_through_to_a_live_alternate(
 
     h.revoke(&h.space_owner, alternate).await?;
     h.forget_binding(&policy.policy_cid).await?;
-    h.challenge(&policy).await;
-    let binding = h.binding(&policy.policy_cid).await?.expect("classified");
+    // A fresh process: this one remembers the earlier classification as
+    // final.
+    h.reboot(legacy_boot()).await?;
+    let binding = h.classify_on_use(&policy).await?;
     assert_eq!(binding.state, "unknown");
     assert_eq!(binding.unknown_reason.as_deref(), Some("revoked"));
     assert!(h.closure(&policy.policy_cid).await?.is_empty());
@@ -1666,9 +1871,16 @@ async fn older_unknown_classifications_are_reevaluated(backend: Backend) -> anyh
         .to_owned();
     h.conn().execute(h.backend().build(&insert)).await?;
     h.challenge(&policy).await;
-    let binding = h.binding(&policy.policy_cid).await?.expect("classified");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    let binding = loop {
+        let binding = h.binding(&policy.policy_cid).await?.expect("row");
+        if binding.classifier_version > 0 || tokio::time::Instant::now() >= deadline {
+            break binding;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
     assert_eq!(binding.state, "bound");
-    assert!(binding.classifier_version >= 1);
+    assert!(binding.classifier_version >= 2);
     assert_eq!(h.closure(&policy.policy_cid).await?, vec![authority]);
     Ok(())
 }
@@ -1743,22 +1955,11 @@ async fn rollback_and_reupgrade_respect_the_configured_cutover(
         policy_v3: Some(json!({"legacy_cutover": format_time(cutover)})),
     })
     .await?;
-    h.challenge(&before).await;
-    h.challenge(&during).await;
     assert_eq!(
-        h.binding(&before.policy_cid)
-            .await?
-            .unwrap()
-            .registered_mode,
+        h.classify_on_use(&before).await?.registered_mode,
         "backfill"
     );
-    assert_eq!(
-        h.binding(&during.policy_cid)
-            .await?
-            .unwrap()
-            .registered_mode,
-        "record"
-    );
+    assert_eq!(h.classify_on_use(&during).await?.registered_mode, "record");
     Ok(())
 }
 on_both_backends!(rollback_and_reupgrade_respect_the_configured_cutover);
