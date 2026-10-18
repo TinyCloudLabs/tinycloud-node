@@ -732,6 +732,22 @@ pub(super) struct OwnerAuthorityState {
     background: BackgroundSlots,
     /// When each escaped policy was last logged.
     escape_logged: std::sync::Mutex<HashMap<String, tokio::time::Instant>>,
+    /// Request-path classifications running, one per policy; concurrent uses
+    /// of the policy wait for it and share its result.
+    classifying: std::sync::Mutex<HashMap<String, Arc<tokio::sync::OnceCell<ClassifyResult>>>>,
+    /// Classifications computed (tests count them).
+    #[cfg(test)]
+    pub(super) classifications: std::sync::atomic::AtomicUsize,
+}
+
+type ClassifyResult = Result<(Classification, RegisteredMode), &'static str>;
+
+/// Where a use's classification came from.
+enum Classified {
+    /// Remembered from a classification that finished meanwhile.
+    InMemory(Binding),
+    /// Computed (or awaited) by this use.
+    Computed(Classification, RegisteredMode),
 }
 
 /// Insert into a bounded map, clearing it when full.
@@ -1078,9 +1094,11 @@ impl PolicyV3Runtime {
             state.remember_final(policy_cid, binding.clone());
             return Ok(binding);
         }
-        let (classification, mode) = self.classify_registration(registration).await?;
+        let (classification, mode) = match self.classify_once(registration).await? {
+            Classified::InMemory(binding) => return Ok(binding),
+            Classified::Computed(classification, mode) => (classification, mode),
+        };
         let binding = Binding::from_classification(&classification, mode);
-        state.remember_transient(policy_cid, binding.clone());
         // The write runs in the background (one per policy, a few at once).
         // Without a free slot this request still uses its result; the write
         // is retried once the in-memory result expires.
@@ -1096,6 +1114,60 @@ impl PolicyV3Runtime {
             });
         }
         Ok(binding)
+    }
+
+    /// Classify a policy for a use, one computation at a time per policy:
+    /// concurrent uses wait for it and share its result. A result is
+    /// remembered in memory before the computation's entry is dropped, and a
+    /// use that finds no entry checks memory under the same lock, so a use
+    /// arriving just after a computation reuses it rather than starting
+    /// another. No lock is held across an await; if the computing request is
+    /// cancelled, a waiting one takes over.
+    async fn classify_once(
+        &self,
+        registration: &policy_v3_registration::Model,
+    ) -> Result<Classified, &'static str> {
+        let state = &self.owner_authority;
+        let policy_cid = &registration.policy_cid;
+        let cell = {
+            let mut classifying = state
+                .classifying
+                .lock()
+                .expect("owner-authority classifications");
+            match classifying.get(policy_cid) {
+                Some(cell) => cell.clone(),
+                None => {
+                    if let Some(binding) = state.cached(policy_cid) {
+                        return Ok(Classified::InMemory(binding));
+                    }
+                    classifying.entry(policy_cid.clone()).or_default().clone()
+                }
+            }
+        };
+        let result = cell
+            .get_or_init(|| async {
+                let result = self.classify_registration(registration).await;
+                if let Ok((classification, mode)) = &result {
+                    state.remember_transient(
+                        policy_cid,
+                        Binding::from_classification(classification, *mode),
+                    );
+                }
+                result
+            })
+            .await
+            .clone();
+        let mut classifying = state
+            .classifying
+            .lock()
+            .expect("owner-authority classifications");
+        if classifying
+            .get(policy_cid)
+            .is_some_and(|current| Arc::ptr_eq(current, &cell))
+        {
+            classifying.remove(policy_cid);
+        }
+        result.map(|(classification, mode)| Classified::Computed(classification, mode))
     }
 
     /// Check a policy use against its recorded owner authority: every
@@ -1164,7 +1236,11 @@ impl PolicyV3Runtime {
     async fn classify_registration(
         &self,
         registration: &policy_v3_registration::Model,
-    ) -> Result<(Classification, RegisteredMode), &'static str> {
+    ) -> ClassifyResult {
+        #[cfg(test)]
+        self.owner_authority
+            .classifications
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let registered_at =
             parse_time(&registration.registered_at).map_err(|_| "policy-registration-invalid")?;
         let (cutover, _) = self

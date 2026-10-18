@@ -254,6 +254,7 @@ liveness is not cached. A steady-state use costs one indexed revocation query
 for a recorded closure and none for root authority. A policy without a final
 classification is classified in the request, served from that result, and
 stored in the background; a result that isn't final is reused for 60 seconds.
+Concurrent first uses of one policy share a single classification.
 
 A revocation takes effect on commit; a request already past the check may
 finish. Signed-KV tickets minted before a revocation last at most 60 seconds.
@@ -261,6 +262,10 @@ finish. Signed-KV tickets minted before a revocation last at most 60 seconds.
 Other codes: an expired root now gives `root-expired` (other non-live status
 remains `root-not-live`); S0 admission returns the owner-authority code itself;
 delivery keeps `delivery-authorization-invalid`. No code carries a CID or DID.
+`policy-owner-authority-expired` is not reached by stored rows: a `bound`
+root expires no later than its authority, and the root and session expiry
+checks run first (`policy-session-expired` on reads, `root-expired` on
+challenge and mint). It stays as a defence in depth.
 
 ### Legacy escape
 
@@ -284,7 +289,9 @@ refused (`403 hook-ticket-authority-too-large`). An open `/hooks/events`
 stream re-checks them (one closure query plus one revocation query) before
 delivering an event, at most every `hooks.authority_recheck_seconds` (5), and
 every `hooks.idle_authority_recheck_seconds` (30) while idle. It closes on a
-revocation, or after three consecutive failed checks; a failed check withholds
-that event but keeps the stream. Streams don't see a JSON-route
+revocation, or after three consecutive failed checks, each at least an
+interval after the last; until a check succeeds, events are withheld (dropped)
+without querying, so a burst of events during a brief database error doesn't
+close the stream. Streams don't see a JSON-route
 `RootRevocation` (it writes no core revocation) or an authority expiry; those
 end at the ticket deadline (at most 300 seconds), as before.

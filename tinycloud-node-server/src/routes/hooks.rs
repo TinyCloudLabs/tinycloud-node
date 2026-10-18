@@ -293,8 +293,10 @@ enum Recheck {
 
 /// An open stream's authority re-check: before delivering an event at most
 /// once per interval, and on an idle timer. It closes the stream on a
-/// definite "revoked", or after three consecutive check errors, so a busy
-/// database doesn't close streams.
+/// definite "revoked", or after three consecutive check errors, each at
+/// least an interval apart, so a busy database or a burst of events during a
+/// brief error doesn't close streams. While the last check failed, events
+/// are withheld without querying.
 struct AuthorityRecheck {
     interval: Duration,
     last: rocket::tokio::time::Instant,
@@ -311,7 +313,11 @@ impl AuthorityRecheck {
     }
 
     fn due(&self) -> bool {
-        self.last.elapsed() >= self.interval || self.consecutive_errors > 0
+        self.last.elapsed() >= self.interval
+    }
+
+    fn failing(&self) -> bool {
+        self.consecutive_errors > 0
     }
 
     fn record<E>(&mut self, result: Result<bool, E>) -> Recheck {
@@ -467,11 +473,15 @@ pub async fn hook_events<'r>(
                                         .await;
                                     match recheck.record(result) {
                                         Recheck::Close => break,
-                                        // A failed check withholds this event
-                                        // and retries on the next one.
+                                        // A failed check withholds this event;
+                                        // the next check waits an interval.
                                         Recheck::Retry => continue,
                                         Recheck::Live => {}
                                     }
+                                } else if recheck.failing() {
+                                    // Until the next check succeeds, events
+                                    // are withheld without querying.
+                                    continue;
                                 }
                                 yield Event::json(&event)
                                     .id(event.id.clone())
@@ -1052,7 +1062,10 @@ mod tests {
         assert!(!recheck.due());
         assert_eq!(recheck.record::<()>(Ok(true)), Recheck::Live);
         assert_eq!(recheck.record(Err(())), Recheck::Retry);
-        assert!(recheck.due(), "a failed check is retried on the next event");
+        assert!(
+            !recheck.due() && recheck.failing(),
+            "after a failed check, events are withheld until the interval passes"
+        );
         assert_eq!(recheck.record(Err(())), Recheck::Retry);
         assert_eq!(
             recheck.record::<()>(Ok(true)),

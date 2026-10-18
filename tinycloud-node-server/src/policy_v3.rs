@@ -2636,6 +2636,8 @@ pub async fn mint(
             .await
             .map_err(|error| (Status::Forbidden, error.into()))?;
         // The recorded owner authority, rechecked on the locked transaction.
+        // Only a revoke landing between the earlier check and this
+        // transaction reaches it, so no test pins it (it is race-only).
         if !tinycloud_core::policy_owner_authority::revoked_ids(&txn, &owner_authority.closure)
             .await
             .map_err(db_error)?
@@ -8103,7 +8105,8 @@ mod tests {
 
     #[tokio::test]
     async fn policy_v2_admits_v3_account_and_v4_accountless_receivers() -> anyhow::Result<()> {
-        run_policy_v2_flow(PolicyOwner::SpaceOwner).await
+        // Boxed: the flow's future is too large for a test thread's stack.
+        Box::pin(run_policy_v2_flow(PolicyOwner::SpaceOwner)).await
     }
 
     /// The real Share and CLI shape: the policy owner is a session key the
@@ -8111,7 +8114,8 @@ mod tests {
     /// space owner revokes that delegation, no new session can be minted.
     #[tokio::test]
     async fn policy_owner_may_be_a_session_the_space_owner_delegated_to() -> anyhow::Result<()> {
-        run_policy_v2_flow(PolicyOwner::DelegatedSession).await
+        // Boxed: the flow's future is too large for a test thread's stack.
+        Box::pin(run_policy_v2_flow(PolicyOwner::DelegatedSession)).await
     }
 
     /// The policy owner signs a valid, self-consistent policy over content in
@@ -8119,7 +8123,8 @@ mod tests {
     /// Registration must refuse it, so no session can ever read the bytes.
     #[tokio::test]
     async fn policy_registration_requires_the_owner_to_hold_what_it_grants() -> anyhow::Result<()> {
-        run_policy_v2_flow(PolicyOwner::Unauthorized).await
+        // Boxed: the flow's future is too large for a test thread's stack.
+        Box::pin(run_policy_v2_flow(PolicyOwner::Unauthorized)).await
     }
 
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -9851,6 +9856,37 @@ mod tests {
             assert_eq!(
                 challenge_response.into_string().await.unwrap_or_default(),
                 "policy-owner-authority-revoked"
+            );
+            // Delivery checks the same authority: the retry that returned the
+            // stored receipt above is now refused.
+            let owner_revoked_delivery = make_invocation(
+                [(
+                    content_resource.clone(),
+                    ["tinycloud.kv/get".parse::<RecapAbility>()?],
+                )],
+                &sender_cid,
+                &delivery_jwk,
+                &format!("{holder_did}#{}", holder_did.trim_start_matches("did:key:")),
+                (OffsetDateTime::now_utc() + Duration::seconds(45)).unix_timestamp() as f64,
+                InvocationOptions {
+                    nonce: Some("tc1423-delivery-after-owner-revoke".into()),
+                    ..InvocationOptions::default()
+                },
+            )?;
+            let refused_delivery = client
+                .post("/policy/v3/deliveries/authorize")
+                .header(ContentType::JSON)
+                .header(rocket::http::Header::new(
+                    "Authorization",
+                    owner_revoked_delivery.encode()?,
+                ))
+                .body(serde_json::to_string(&delivery_request)?)
+                .dispatch()
+                .await;
+            assert_eq!(refused_delivery.status(), Status::Forbidden);
+            assert_eq!(
+                refused_delivery.into_string().await.unwrap_or_default(),
+                "delivery-authorization-invalid"
             );
         }
 

@@ -3130,6 +3130,170 @@ async fn legacy_registrations_are_never_expiry_capped(backend: Backend) -> anyho
 }
 on_both_backends!(legacy_registrations_are_never_expiry_capped);
 
+/// [O2] The escape covers legacy rows only: a post-cutover row without
+/// authority is denied with the flag on.
+async fn the_escape_never_serves_post_cutover_rows(backend: Backend) -> anyhow::Result<()> {
+    let Some(mut h) = Harness::new(
+        backend,
+        Shape::KeySession,
+        "the_escape_never_serves_post_cutover_rows",
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let registered_at = now() - Duration::days(40);
+    h.grant_owner(Window {
+        not_before: registered_at - Duration::days(1),
+        expiry: now() + Duration::days(2),
+        issued_at: None,
+    })
+    .await?;
+    let policy = h.register_ok(policy_window()).await?;
+    let session = h.mint_ok(&policy).await?;
+    h.forget_binding(&policy.policy_cid).await?;
+    backdate(&h, &policy.policy_cid, registered_at).await?;
+    h.reboot(boot(json!({
+        "legacy_cutover": format_time(now() - Duration::days(60)),
+        "legacy_unknown_allow": true,
+    })))
+    .await?;
+    let (status, body) = h.read(&session).await?;
+    assert_eq!(
+        (status, text(&body).as_str()),
+        (Status::Forbidden, "policy-owner-authority-unknown")
+    );
+    let binding = h.binding(&policy.policy_cid).await?;
+    let binding = match binding {
+        Some(binding) => binding,
+        None => h
+            .wait_for_binding(&policy.policy_cid, std::time::Duration::from_secs(20))
+            .await?
+            .expect("classified"),
+    };
+    assert_eq!(
+        (
+            binding.registered_mode.as_str(),
+            binding.unknown_reason.as_deref()
+        ),
+        ("record", Some("lifetime-exceeded"))
+    );
+    Ok(())
+}
+on_both_backends!(the_escape_never_serves_post_cutover_rows);
+
+/// [O2] An escaped legacy policy serves its admitted sessions, but a mint
+/// still needs the owner to have held what the policy grants when it
+/// registered.
+async fn escaped_mints_still_check_the_owner_held_the_capability(
+    backend: Backend,
+) -> anyhow::Result<()> {
+    let escape = || {
+        boot(json!({
+            "legacy_cutover": format_time(now() + Duration::days(1)),
+            "legacy_unknown_allow": true,
+        }))
+    };
+    let Some(mut h) = Harness::with_boot(
+        backend,
+        Shape::KeySession,
+        "escaped_mints_still_check_the_owner_held_the_capability",
+        escape(),
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    h.grant_owner(Window {
+        not_before: now() - Duration::seconds(30),
+        expiry: now() + Duration::days(2),
+        issued_at: None,
+    })
+    .await?;
+    let policy = h.register_ok(policy_window()).await?;
+    let session = h.mint_ok(&policy).await?;
+    h.forget_binding(&policy.policy_cid).await?;
+    // Registered before the owner held the grant: nothing to record.
+    backdate(&h, &policy.policy_cid, now() - Duration::hours(1)).await?;
+    h.reboot(escape()).await?;
+    let (status, body) = h.read(&session).await?;
+    assert_eq!((status, body.as_slice()), (Status::Ok, CONTENT), "escaped");
+    let (status, body) = h.mint(&policy).await?.expect_err("mint refused");
+    assert_eq!(
+        (status, body.as_str()),
+        (Status::Forbidden, "policy-owner-not-authorized")
+    );
+    Ok(())
+}
+on_both_backends!(escaped_mints_still_check_the_owner_held_the_capability);
+
+/// [8] An admitted session can't be imported again once its owner authority
+/// is revoked.
+async fn admitted_sessions_are_not_reimported_after_a_revoke(
+    backend: Backend,
+) -> anyhow::Result<()> {
+    let Some(h) = Harness::new(
+        backend,
+        Shape::KeySession,
+        "admitted_sessions_are_not_reimported_after_a_revoke",
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let authority = h
+        .grant_owner(Window::until(now() + Duration::days(2)))
+        .await?;
+    let policy = h.register_ok(policy_window()).await?;
+    let session = h.mint_ok(&policy).await?;
+    let (status, body) = h.delegate(session.clone()).await;
+    assert_eq!(status, Status::Ok, "before the revoke: {body}");
+    h.revoke(&h.space_owner, &authority).await?;
+    let (status, body) = h.delegate(session).await;
+    assert_eq!((status, body.as_str()), (Status::Forbidden, REVOKED));
+    Ok(())
+}
+on_both_backends!(admitted_sessions_are_not_reimported_after_a_revoke);
+
+/// [F3] Concurrent first uses of an unclassified policy share one
+/// classification.
+async fn concurrent_first_uses_share_one_classification(backend: Backend) -> anyhow::Result<()> {
+    let Some(mut h) = Harness::with_boot(
+        backend,
+        Shape::KeySession,
+        "concurrent_first_uses_share_one_classification",
+        legacy_boot(),
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    h.grant_owner(Window::until(now() + Duration::days(2)))
+        .await?;
+    let policy = h.register_ok(policy_window()).await?;
+    let session = h.mint_ok(&policy).await?;
+    h.forget_binding(&policy.policy_cid).await?;
+    h.reboot(legacy_boot()).await?;
+    let classifications = || {
+        h.client
+            .rocket()
+            .state::<PolicyV3Runtime>()
+            .expect("policy runtime")
+            .owner_authority
+            .classifications
+            .load(std::sync::atomic::Ordering::Relaxed)
+    };
+    let before = classifications();
+    let reads = futures::future::join_all((0..8).map(|_| h.read(&session))).await;
+    for read in reads {
+        let (status, body) = read?;
+        assert_eq!((status, body.as_slice()), (Status::Ok, CONTENT));
+    }
+    assert_eq!(classifications() - before, 1);
+    Ok(())
+}
+on_both_backends!(concurrent_first_uses_share_one_classification);
+
 impl Harness {
     /// The space owner grants the holder hooks subscription on the content
     /// prefix; returns the grant CIDs.
@@ -3259,6 +3423,20 @@ fn fast_hooks() -> Boot {
     }
 }
 
+/// Re-checks before events only: the idle re-check never runs in a test.
+fn event_rechecks_only() -> Boot {
+    Boot {
+        hooks: Some(json!({
+            "authority_recheck_seconds": 1,
+            "idle_authority_recheck_seconds": 600,
+        })),
+        ..Boot::default()
+    }
+}
+
+/// The SSE field rocket writes for each delivered hook event.
+const WRITE_EVENT: &str = "event:write";
+
 /// Connect a hook stream (its authority is checked here).
 async fn open_stream<'c>(
     h: &'c Harness,
@@ -3285,14 +3463,15 @@ async fn drain_stream(
 }
 
 /// [8][C3] An open hook stream stops delivering after its grant is revoked:
-/// no event after the re-check interval, and the stream closes; an idle
-/// stream closes on the idle re-check.
+/// the next event after the re-check interval is withheld and the stream
+/// closes (with no idle re-check to close it otherwise); an idle stream
+/// closes on the idle re-check.
 async fn hook_streams_close_after_their_grant_is_revoked(backend: Backend) -> anyhow::Result<()> {
-    let Some(h) = Harness::with_boot(
+    let Some(mut h) = Harness::with_boot(
         backend,
         Shape::KeySession,
         "hook_streams_close_after_their_grant_is_revoked",
-        fast_hooks(),
+        event_rechecks_only(),
     )
     .await?
     else {
@@ -3307,9 +3486,11 @@ async fn hook_streams_close_after_their_grant_is_revoked(backend: Backend) -> an
         .to_owned();
     let stream = drain_stream(
         open_stream(&h, &ticket).await,
-        std::time::Duration::from_secs(10),
+        std::time::Duration::from_secs(15),
     );
     let actions = async {
+        // Delivered: the stream is live and within its interval.
+        h.write_content(b"before-revoke").await?;
         h.revoke(&h.space_owner, &grant[0]).await?;
         tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
         h.write_content(b"after-revoke").await?;
@@ -3317,10 +3498,11 @@ async fn hook_streams_close_after_their_grant_is_revoked(backend: Backend) -> an
     };
     let (body, actions) = tokio::join!(stream, actions);
     actions?;
-    let body = body.expect("the stream closes after the revocation");
-    assert!(!body.contains("event: write"), "{body}");
+    let body = body.expect("the pre-event re-check closes the stream after the revocation");
+    assert_eq!(body.matches(WRITE_EVENT).count(), 1, "{body}");
 
     // Idle: nothing is written; the idle re-check closes it.
+    h.reboot(fast_hooks()).await?;
     let grant = h.grant_hooks(1).await?;
     let (_, body) = h.hook_ticket(&grant).await?;
     let ticket = serde_json::from_str::<Value>(&body)?["ticket"]
