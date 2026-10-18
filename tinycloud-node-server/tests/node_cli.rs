@@ -5,10 +5,10 @@
 //! else is the clap CLI, which must never boot a server. These tests run the
 //! built binary with default features.
 //!
-//! Every run uses a scrubbed environment and an empty HOME, so a binary that
-//! falls through to the server start fails fast on the missing key source
-//! rather than binding a socket. The timeout turns an accidental server start
-//! into a test failure instead of a hang.
+//! Every run uses a scrubbed environment and an empty HOME. A server start
+//! with no key configuration generates a node identity and serves, so the
+//! timeout turns an accidental server start into a test failure instead of a
+//! hang.
 
 use std::{
     io::Read,
@@ -220,9 +220,10 @@ fn validate_config_still_checks_the_configuration_without_the_cli() {
 
 #[test]
 fn no_arguments_keep_the_server_start_path() {
-    // No key source is configured, so the server start path reports that and
-    // exits before binding anything. The CLI would answer with a usage error.
-    let run = run_tinycloud(&[], &[]);
+    // Share email enabled without a trust bundle, so the server start path
+    // refuses the configuration and exits before opening a key or binding
+    // anything. The CLI would answer with a usage error.
+    let run = run_tinycloud(&[], &[("TINYCLOUD_SHARE_EMAIL__ENABLED", "true")]);
     assert_eq!(run.code, Some(1), "stderr: {}", run.stderr);
     assert!(
         run.stderr.contains("Failed to start tinycloud-node"),

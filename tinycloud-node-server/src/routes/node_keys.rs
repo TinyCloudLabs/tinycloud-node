@@ -191,7 +191,8 @@ mod tests {
 
         let resolved = crate::resolve_keys(&crate::config::Keys::Dstack)
             .await
-            .expect("dstack key resolution");
+            .expect("dstack key resolution")
+            .expect("dstack yields a key");
         responder.await.expect("dstack responder");
 
         let rocket = rocket::build()

@@ -107,6 +107,7 @@ use config::{BlockStorage, Config, Keys, StagingStorage};
 use hooks::HookRuntime;
 use invocation_replay::InvocationReplayCache;
 use node_control::control::ControlPlaneHandle;
+use node_control::key_provider::{self, IdentityPurpose};
 use policy_v3::{
     authorize_delivery as authorize_policy_v3_delivery, challenge as policy_v3_challenge,
     get_status as get_policy_v3_status, issue_enforcer_binding as policy_v3_enforcer_binding,
@@ -554,7 +555,27 @@ pub async fn app_with_control(
         tc_bench_health,
     ]);
 
-    let key_setup: StaticSecret = resolve_keys(&tinycloud_config.keys).await?;
+    let key_setup: StaticSecret = match resolve_keys(&tinycloud_config.keys).await? {
+        Some(key_setup) => key_setup,
+        None => {
+            // The node's stored identity, generated on its first start. The
+            // control plane only probed it at spawn, so publish what serve
+            // resolved.
+            let identity = key_provider::resolve_identity_state(
+                Some(&tinycloud_config.keys),
+                &tinycloud_config.storage.datadir,
+                IdentityPurpose::Serve,
+            )?;
+            if let Some(control) = control.as_ref() {
+                control
+                    .set_identity_snapshot(key_provider::identity_snapshot(&identity))
+                    .await;
+            }
+            identity
+                .secret
+                .ok_or_else(|| anyhow::anyhow!("node identity is not ready"))?
+        }
+    };
     let pseudonymizer =
         std::sync::Arc::new(tinycloud_core::telemetry::Pseudonymizer::new(&key_setup));
     let tracing_fairing = tracing::TracingFairing::new(
@@ -1207,13 +1228,16 @@ async fn run_retention_sweep<C: tinycloud_core::sea_orm::ConnectionTrait>(
     }
 }
 
-pub(crate) async fn resolve_keys(keys: &Keys) -> Result<StaticSecret> {
+/// The node key from a Static or dstack key source. `None` means the key is
+/// the node's stored identity: provider keys, and Auto outside a TEE.
+pub(crate) async fn resolve_keys(keys: &Keys) -> Result<Option<StaticSecret>> {
     match keys {
-        Keys::Static(s) => Ok(s.clone().try_into()?),
+        Keys::Static(s) => Ok(Some(s.clone().try_into()?)),
         #[cfg(feature = "dstack")]
         Keys::Dstack => {
             let key_bytes = dstack::get_key("tinycloud/keys/primary").await?;
             StaticSecret::new(key_bytes)
+                .map(Some)
                 .map_err(|v| anyhow::anyhow!("dstack key too short: {} bytes", v.len()))
         }
         Keys::Auto => {
@@ -1223,36 +1247,25 @@ pub(crate) async fn resolve_keys(keys: &Keys) -> Result<StaticSecret> {
                 Some("dstack") => {
                     let key_bytes = dstack::get_key("tinycloud/keys/primary").await?;
                     StaticSecret::new(key_bytes)
+                        .map(Some)
                         .map_err(|v| anyhow::anyhow!("dstack key too short: {} bytes", v.len()))
                 }
-                Some("off") => {
-                    anyhow::bail!(
-                        "TEE mode disabled but no static key configured. \
-                         Set TINYCLOUD_KEYS_SECRET or configure [keys] in config."
-                    )
-                }
+                Some("off") => Ok(None),
                 _ => {
                     // Auto-detect: check for dstack socket
                     #[cfg(feature = "dstack")]
                     if dstack::is_available() {
                         ::tracing::info!("dstack socket detected, using TEE key derivation");
                         let key_bytes = dstack::get_key("tinycloud/keys/primary").await?;
-                        return StaticSecret::new(key_bytes).map_err(|v| {
+                        return StaticSecret::new(key_bytes).map(Some).map_err(|v| {
                             anyhow::anyhow!("dstack key too short: {} bytes", v.len())
                         });
                     }
-                    anyhow::bail!(
-                        "No key source configured. Either:\n  \
-                         - Set TINYCLOUD_KEYS_SECRET environment variable\n  \
-                         - Configure [keys] section in tinycloud.toml\n  \
-                         - Run inside a dstack TEE (with 'dstack' feature enabled)"
-                    )
+                    Ok(None)
                 }
             }
         }
-        Keys::Provider => anyhow::bail!(
-            "provider key mode must be resolved through the node control key-provider path"
-        ),
+        Keys::Provider => Ok(None),
     }
 }
 
