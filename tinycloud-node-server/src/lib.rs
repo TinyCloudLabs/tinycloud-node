@@ -1230,10 +1230,11 @@ async fn run_retention_sweep<C: tinycloud_core::sea_orm::ConnectionTrait>(
 }
 
 /// The node key from a Static or dstack key source. `None` means the key is
-/// the node's stored identity: provider keys, and Auto outside a TEE. Auto
-/// refuses when the environment indicates a dstack TEE but no dstack key is
-/// available, so a TEE node never silently gets a new local DID.
-/// `TINYCLOUD_TEE_MODE=off` is checked first and opts out of TEE detection.
+/// the node's stored identity: provider keys, and Auto outside a TEE. Where
+/// the environment indicates a dstack TEE, provider keys always refuse and
+/// Auto refuses when no dstack key is available, so a TEE node never runs
+/// under a local DID. For Auto, `TINYCLOUD_TEE_MODE=off` is checked first and
+/// opts out of TEE detection.
 pub(crate) async fn resolve_keys(
     keys: &Keys,
     tee: &config::TeeConfig,
@@ -1285,16 +1286,33 @@ pub(crate) async fn resolve_keys(
                 }
             }
         }
-        Keys::Provider => Ok(None),
+        Keys::Provider => {
+            if let Some(hint) = dstack_indication(tee) {
+                anyhow::bail!(
+                    "refusing keys.type = provider: {hint} indicates a dstack TEE, where the node \
+                     key must come from dstack. Use keys.type = Dstack, or remove {hint} if this \
+                     host is not a TEE."
+                );
+            }
+            Ok(None)
+        }
     }
 }
 
 /// Why the environment looks like a dstack deployment, if it does: the TEE
 /// mode the node reads, the key type dstack deployments set, an explicit
-/// dstack socket, or a dstack socket this build cannot use.
+/// dstack socket, or a dstack socket this build cannot use. Variable names
+/// match case-insensitively, as figment's `TINYCLOUD_` prefix does.
 fn dstack_indication(tee: &config::TeeConfig) -> Option<&'static str> {
-    let env_is_dstack =
-        |name: &str| std::env::var(name).is_ok_and(|value| value.eq_ignore_ascii_case("dstack"));
+    let env_is_dstack = |name: &str| {
+        std::env::vars_os().any(|(key, value)| {
+            key.to_str()
+                .is_some_and(|key| key.eq_ignore_ascii_case(name))
+                && value
+                    .to_str()
+                    .is_some_and(|value| value.eq_ignore_ascii_case("dstack"))
+        })
+    };
     if env_is_dstack("TINYCLOUD_TEE_MODE") {
         Some("TINYCLOUD_TEE_MODE=dstack")
     } else if tee.mode == config::TeeMode::Dstack {

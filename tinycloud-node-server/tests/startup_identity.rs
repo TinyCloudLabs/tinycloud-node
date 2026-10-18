@@ -293,6 +293,30 @@ fn bare_start_without_a_tee_creates_one_identity_and_reloads_it() {
     assert!(!restart.log().contains(CREATED), "{}", restart.log());
 }
 
+#[cfg(target_os = "linux")]
+const MISSING_SOCKET: &str = "/nonexistent/tc-1442/dstack.sock";
+
+/// Bare `tinycloud` under `env`, with no dstack socket, exits non-zero,
+/// creates no identity, and (when given) prints `refusal`.
+#[cfg(target_os = "linux")]
+fn assert_refused(env: &[(&str, &str)], refusal: Option<String>) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut bare = tinycloud(dir.path());
+    bare.envs(env.iter().copied());
+    let (code, log) = run_to_exit(bare, dir.path());
+
+    assert!(
+        matches!(code, Some(code) if code != 0),
+        "{env:?}: {code:?}\n{log}"
+    );
+    assert!(!dir.path().join("data/keys").exists(), "{env:?}\n{log}");
+    assert!(!log.contains(CREATED), "{env:?}\n{log}");
+    assert!(log.to_lowercase().contains("dstack"), "{env:?}\n{log}");
+    if let Some(refusal) = refusal {
+        assert!(log.contains(&refusal), "{env:?}\n{log}");
+    }
+}
+
 /// Auto inside an environment that indicates a dstack TEE, with no dstack
 /// socket: the node exits non-zero and creates no identity. Linux only, so a
 /// regression cannot write to a macOS keychain.
@@ -300,12 +324,11 @@ fn bare_start_without_a_tee_creates_one_identity_and_reloads_it() {
 #[test]
 fn auto_refuses_to_create_an_identity_where_a_tee_is_indicated() {
     type Environment = &'static [(&'static str, &'static str)];
-    const MISSING_SOCKET: &str = "/nonexistent/tc-1442/dstack.sock";
     // (environment, the indication the refusal names). `None`: an existing
     // path refuses first. Production's own signal, `TINYCLOUD_KEYS_TYPE=Dstack`,
     // selects dstack keys (or is rejected by a build without dstack), and a
     // dstack build asks the socket named by `TINYCLOUD_TEE_MODE=dstack`.
-    let cases: [(Environment, Option<&str>); 5] = [
+    let cases: [(Environment, Option<&str>); 6] = [
         (
             &[("TINYCLOUD_TEE__MODE", "Dstack")],
             Some("tee.mode = \"Dstack\""),
@@ -324,6 +347,14 @@ fn auto_refuses_to_create_an_identity_where_a_tee_is_indicated() {
             ],
             Some("TINYCLOUD_KEYS_TYPE=Dstack"),
         ),
+        // Figment matches the `TINYCLOUD_` prefix case-insensitively.
+        (
+            &[
+                ("tinycloud_keys_type", "Dstack"),
+                ("TINYCLOUD_KEYS__TYPE", "auto"),
+            ],
+            Some("TINYCLOUD_KEYS_TYPE=Dstack"),
+        ),
         (
             &[("DSTACK_SIMULATOR_ENDPOINT", MISSING_SOCKET)],
             Some("DSTACK_SIMULATOR_ENDPOINT"),
@@ -331,28 +362,47 @@ fn auto_refuses_to_create_an_identity_where_a_tee_is_indicated() {
         (&[("TINYCLOUD_KEYS_TYPE", "Dstack")], None),
     ];
     for (env, indication) in cases {
-        let dir = tempfile::tempdir().unwrap();
-        let mut bare = tinycloud(dir.path());
-        bare.envs(env.iter().copied());
-        let (code, log) = run_to_exit(bare, dir.path());
-
-        assert!(
-            matches!(code, Some(code) if code != 0),
-            "{env:?}: {code:?}\n{log}"
-        );
-        assert!(!dir.path().join("data/keys").exists(), "{env:?}\n{log}");
-        assert!(!log.contains(CREATED), "{env:?}\n{log}");
-        assert!(log.to_lowercase().contains("dstack"), "{env:?}\n{log}");
-        if let Some(indication) = indication {
-            assert!(
-                log.contains(&format!(
+        assert_refused(
+            env,
+            indication.map(|indication| {
+                format!(
                     "refusing to create a new node identity: {indication} indicates a dstack TEE"
-                )),
-                "{env:?}\n{log}"
-            );
-        }
+                )
+            }),
+        );
     }
 }
+
+/// Provider keys inside an environment that indicates a dstack TEE: the node
+/// exits non-zero and creates no identity, even when production's
+/// `TINYCLOUD_KEYS_TYPE=Dstack` is overridden to provider.
+#[cfg(target_os = "linux")]
+#[test]
+fn provider_refuses_where_a_tee_is_indicated() {
+    for (marker, indication) in [
+        (
+            ("TINYCLOUD_KEYS_TYPE", "Dstack"),
+            "TINYCLOUD_KEYS_TYPE=Dstack",
+        ),
+        (
+            ("TINYCLOUD_TEE_MODE", "Dstack"),
+            "TINYCLOUD_TEE_MODE=dstack",
+        ),
+        (("TINYCLOUD_TEE__MODE", "Dstack"), "tee.mode = \"Dstack\""),
+        (
+            ("DSTACK_SIMULATOR_ENDPOINT", MISSING_SOCKET),
+            "DSTACK_SIMULATOR_ENDPOINT",
+        ),
+    ] {
+        assert_refused(
+            &[marker, ("TINYCLOUD_KEYS__TYPE", "provider")],
+            Some(format!(
+                "refusing keys.type = provider: {indication} indicates a dstack TEE"
+            )),
+        );
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn installed_provider_config_serves_a_stable_identity() {
