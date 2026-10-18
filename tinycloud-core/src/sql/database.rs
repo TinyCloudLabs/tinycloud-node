@@ -1,3 +1,10 @@
+//! Request context travels with each actor message, not with the actor's idle
+//! loop. Query metrics measure explicit native SQL calls (one attempt per
+//! prepare/query lifecycle or execute/execute_batch call), including failures
+//! and request-originated maintenance. Queueing, response serialization,
+//! filesystem I/O, native backup and implicit connection-close work are not
+//! SQL query time.
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -5,6 +12,8 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use rusqlite::hooks::{AuthContext, Authorization};
 use tokio::sync::{mpsc, oneshot};
+
+use crate::request_telemetry::{self, QueryTimer, RequestContext};
 
 use super::{
     caveats::SqlCaveats,
@@ -61,7 +70,7 @@ static NEXT_ACTOR_ID: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone)]
 pub struct DatabaseHandle {
     id: u64,
-    tx: mpsc::Sender<DbMessage>,
+    tx: mpsc::Sender<(Option<Arc<RequestContext>>, DbMessage)>,
 }
 
 impl DatabaseHandle {
@@ -69,7 +78,10 @@ impl DatabaseHandle {
     pub(crate) async fn shutdown(&self) -> Result<(), SqlError> {
         let (response_tx, response_rx) = oneshot::channel();
         self.tx
-            .send(DbMessage::Shutdown { response_tx })
+            .send((
+                request_telemetry::current(),
+                DbMessage::Shutdown { response_tx },
+            ))
             .await
             .map_err(|_| SqlError::Internal("Database actor not available".into()))?;
         response_rx
@@ -83,10 +95,13 @@ impl DatabaseHandle {
     ) -> Result<SqlExecutionResult, SqlError> {
         let (response_tx, response_rx) = oneshot::channel();
         self.tx
-            .send(DbMessage::Publication {
-                command,
-                response_tx,
-            })
+            .send((
+                request_telemetry::current(),
+                DbMessage::Publication {
+                    command,
+                    response_tx,
+                },
+            ))
             .await
             .map_err(|_| SqlError::Internal("Database actor not available".into()))?;
         response_rx
@@ -102,13 +117,16 @@ impl DatabaseHandle {
     ) -> Result<SqlExecutionResult, SqlError> {
         let (response_tx, response_rx) = oneshot::channel();
         self.tx
-            .send(DbMessage::Execute {
-                request,
-                caveats,
-                ability,
-                growth,
-                response_tx,
-            })
+            .send((
+                request_telemetry::current(),
+                DbMessage::Execute {
+                    request,
+                    caveats,
+                    ability,
+                    growth,
+                    response_tx,
+                },
+            ))
             .await
             .map_err(|_| SqlError::Internal("Database actor not available".to_string()))?;
         response_rx
@@ -119,7 +137,10 @@ impl DatabaseHandle {
     pub async fn export(&self) -> Result<Vec<u8>, SqlError> {
         let (response_tx, response_rx) = oneshot::channel();
         self.tx
-            .send(DbMessage::Export { response_tx })
+            .send((
+                request_telemetry::current(),
+                DbMessage::Export { response_tx },
+            ))
             .await
             .map_err(|_| SqlError::Internal("Database actor not available".to_string()))?;
         response_rx
@@ -130,7 +151,10 @@ impl DatabaseHandle {
     pub async fn checkpoint(&self) -> Result<Vec<u8>, SqlError> {
         let (response_tx, response_rx) = oneshot::channel();
         self.tx
-            .send(DbMessage::Checkpoint { response_tx })
+            .send((
+                request_telemetry::current(),
+                DbMessage::Checkpoint { response_tx },
+            ))
             .await
             .map_err(|_| SqlError::Internal("Database actor not available".to_string()))?;
         response_rx
@@ -141,7 +165,7 @@ impl DatabaseHandle {
     pub async fn wal(&self) -> Result<Option<Vec<u8>>, SqlError> {
         let (response_tx, response_rx) = oneshot::channel();
         self.tx
-            .send(DbMessage::Wal { response_tx })
+            .send((request_telemetry::current(), DbMessage::Wal { response_tx }))
             .await
             .map_err(|_| SqlError::Internal("Database actor not available".to_string()))?;
         response_rx
@@ -157,8 +181,9 @@ pub fn spawn_actor(
     memory_threshold: u64,
     databases: Arc<DashMap<(String, String), DatabaseHandle>>,
 ) -> DatabaseHandle {
-    let (tx, mut rx) = mpsc::channel::<DbMessage>(32);
+    let (tx, mut rx) = mpsc::channel::<(Option<Arc<RequestContext>>, DbMessage)>(32);
     let id = NEXT_ACTOR_ID.fetch_add(1, Ordering::Relaxed);
+    let initial_context = request_telemetry::current();
 
     tokio::task::spawn_blocking(move || {
         let rt = tokio::runtime::Handle::current();
@@ -172,16 +197,25 @@ pub fn spawn_actor(
         } else {
             StorageMode::InMemory
         };
-        let mut conn = storage::open_connection(&mode).expect("Failed to open database");
+        let mut conn = {
+            let _context = request_telemetry::enter(initial_context);
+            let Ok(connection) = storage::open_connection(&mode) else {
+                tracing::error!("Failed to open database");
+                databases.remove_if(&(space_id, db_name), |_, handle| handle.id == id);
+                return;
+            };
+            connection
+        };
 
         let shutdown_response = loop {
             // Block on receiving with timeout
-            let msg =
+            let (context, msg) =
                 match rt.block_on(async { tokio::time::timeout(IDLE_TIMEOUT, rx.recv()).await }) {
                     Ok(Some(msg)) => msg,
                     Ok(None) => break None, // Channel closed
                     Err(_) => break None,   // Idle timeout
                 };
+            let _context = request_telemetry::enter(context);
 
             match msg {
                 DbMessage::Shutdown { response_tx } => break Some(response_tx),
@@ -228,8 +262,8 @@ pub fn spawn_actor(
                                         mode = StorageMode::File(file_path.clone());
                                         tracing::info!("Promoted database to file storage");
                                     }
-                                    Err(e) => {
-                                        tracing::error!(error=%e, "Failed to promote database to file");
+                                    Err(_) => {
+                                        tracing::error!("Failed to promote database to file");
                                     }
                                 }
                             }
@@ -325,9 +359,11 @@ fn handle_checkpoint(
 ) -> Result<Vec<u8>, SqlError> {
     match mode {
         StorageMode::File(_) => {
-            let busy: i64 = conn
-                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
-                .map_err(|e| SqlError::Internal(e.to_string()))?;
+            let busy: i64 = {
+                let _timer = QueryTimer::new();
+                conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
+                    .map_err(|e| SqlError::Internal(e.to_string()))?
+            };
             if busy != 0 {
                 return Err(SqlError::Internal("Database checkpoint is busy".into()));
             }
@@ -352,8 +388,11 @@ fn handle_message_without_growth(
     ability: &str,
 ) -> Result<SqlExecutionResult, SqlError> {
     let before = page_count(conn)?;
-    conn.execute_batch(GUARD_BEGIN)
-        .map_err(|e| SqlError::Internal(e.to_string()))?;
+    {
+        let _timer = QueryTimer::new();
+        conn.execute_batch(GUARD_BEGIN)
+            .map_err(|e| SqlError::Internal(e.to_string()))?;
+    }
     let result = handle_message(conn, request, caveats, ability);
     // An early error return can leave the request's authorizer installed.
     conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
@@ -367,11 +406,16 @@ fn handle_message_without_growth(
         // Undo earlier statements on any error, even without page growth.
         _ => GUARD_UNDO,
     };
-    if let Err(error) = conn.execute_batch(end) {
+    let end_result = {
+        let _timer = QueryTimer::new();
+        conn.execute_batch(end)
+    };
+    if let Err(error) = end_result {
         // RELEASE is also the commit for the outermost savepoint. Deferred
         // constraints can fail here and leave both the mutation and savepoint
         // active; undo them before the next request or checkpoint runs.
         if !conn.is_autocommit() {
+            let _timer = QueryTimer::new();
             conn.execute_batch(GUARD_UNDO)
                 .map_err(|e| SqlError::Internal(e.to_string()))?;
         }
@@ -384,6 +428,7 @@ fn handle_message_without_growth(
 }
 
 fn page_count(conn: &rusqlite::Connection) -> Result<i64, SqlError> {
+    let _timer = QueryTimer::new();
     conn.query_row("PRAGMA page_count", [], |row| row.get(0))
         .map_err(|e| SqlError::Internal(e.to_string()))
 }
@@ -440,8 +485,11 @@ fn handle_message(
                         is_admin,
                     );
                     conn.authorizer(Some(auth));
-                    conn.execute_batch(stmt_sql)
-                        .map_err(|e| SqlError::SchemaError(e.to_string()))?;
+                    {
+                        let _timer = QueryTimer::new();
+                        conn.execute_batch(stmt_sql)
+                            .map_err(|e| SqlError::SchemaError(e.to_string()))?;
+                    }
                     conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
                 }
             }
@@ -564,9 +612,11 @@ fn execute_query(
     max_bytes: Option<usize>,
 ) -> Result<QueryResponse, SqlError> {
     validate_query_limits(max_rows, max_bytes)?;
+    let mut timer = QueryTimer::new();
     let mut stmt = conn
         .prepare(sql)
         .map_err(|e| SqlError::Sqlite(e.to_string()))?;
+    timer.pause();
 
     let columns: Vec<String> = stmt.column_names().into_iter().map(String::from).collect();
 
@@ -590,14 +640,19 @@ fn execute_query(
         return Err(SqlError::ResponseTooLarge(serialized_size as u64));
     }
 
+    timer.resume();
     let mut query_rows = stmt
         .query(param_refs.as_slice())
         .map_err(|e| SqlError::Sqlite(e.to_string()))?;
+    timer.pause();
 
-    while let Some(row) = query_rows
-        .next()
-        .map_err(|e| SqlError::Sqlite(e.to_string()))?
-    {
+    loop {
+        timer.resume();
+        let next = query_rows.next();
+        timer.pause();
+        let Some(row) = next.map_err(|e| SqlError::Sqlite(e.to_string()))? else {
+            break;
+        };
         if max_rows.is_some_and(|limit| rows.len() >= limit) {
             return Err(SqlError::ResponseTooLarge(serialized_size as u64));
         }
@@ -666,8 +721,11 @@ fn execute_statement(
         .map(|p| p as &dyn rusqlite::types::ToSql)
         .collect();
 
-    conn.execute(sql, param_refs.as_slice())
-        .map_err(|e| SqlError::Sqlite(e.to_string()))?;
+    {
+        let _timer = QueryTimer::new();
+        conn.execute(sql, param_refs.as_slice())
+            .map_err(|e| SqlError::Sqlite(e.to_string()))?;
+    }
 
     Ok(ExecuteResponse {
         changes: conn.changes(),

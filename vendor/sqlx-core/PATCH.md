@@ -43,3 +43,39 @@ The async-std path of `connect_tcp` is not patched; the node uses tokio.
 Drop this directory and the `[patch]` entries when upstream sqlx supports
 TCP keepalive or user timeout, or when sea-orm moves to an sqlx that does
 (TC-1061).
+
+## Request-local database timing (TC-959)
+
+`src/request_telemetry.rs` contains data-free, per-request atomic counters and
+poll-scoped context propagation. No SQL, bind values, identity strings, or errors
+are stored in these counters. `QueryLogger` captures one timer when constructed
+and records it once on drop, independent of diagnostic `finish()` calls.
+
+`PoolInner::acquire` measures the actual acquisition future, including closed
+pools, timeout, and cancellation. Its connection establishment, health checks,
+and acquisition hooks are polled without request query attribution; their time
+still belongs to acquisition. SQL executed through acquired connections and
+transactions retains the request context.
+
+PostgreSQL raw BEGIN/SAVEPOINT needs the paired `sqlx-postgres` driver hook:
+SeaORM calls its transaction manager directly, bypassing the generic SQLx
+transaction wrapper. Invalid nested custom-BEGIN validation does not count SQL.
+MySQL awaited controls already use the logger. SQLite worker propagation and
+raw awaited controls use the accompanying `sqlx-sqlite` patch.
+
+Detached drop-triggered rollback, connection release/health checks, startup
+initialization, and explicit prepare/describe metadata operations are excluded.
+Query timing follows the driver execution/logger lifetime, including streaming
+execution; it is not server-side CPU time. The PostgreSQL driver hook covers
+both direct SQLx and direct SeaORM transaction-manager callers.
+
+Boundary regressions live in `tinycloud-core/tests/sqlx_request_telemetry.rs` so
+they run in the root workspace against the paired patched crates and lockfile.
+Remove these request-telemetry patches once an upstream equivalent supplies
+request-scoped acquisition and driver-execution hooks.
+
+The PostgreSQL boundary regressions use `TINYCLOUD_TEST_POSTGRES_URL` only at
+test runtime, require it in CI, and otherwise print an explicit local skip.
+They use SELECT-only statements and test raw BEGIN/SAVEPOINT through SQLx and
+SeaORM, validation, success/failure, awaited commit/rollback, and acquisition
+timeout/closed-pool failure. MySQL has no integration-test server in this suite.

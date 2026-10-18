@@ -43,6 +43,22 @@ on:
         required: false
         type: boolean
         default: false
+      authorize_quota_values:
+        description: 'Fresh authorization of the reviewed quota values/authority for this deployment; required on every deploy_phala path.'
+        required: false
+        type: boolean
+        default: false
+      rollback_pre_n0:
+        description: 'Deploy only the captured pre-N0 1.20.6 compose; requires an explicit Sam-approved rollback privacy mode.'
+        required: false
+        type: boolean
+        default: false
+      rollback_privacy_mode:
+        description: 'Explicit rollback-only policy; stop-future-local-logs does NOT delete existing files. No production default.'
+        required: false
+        type: choice
+        options: [unselected, keep-json-file, stop-future-local-logs]
+        default: unselected
       allow_non_descendant:
         description: 'Skip the production ancestry guard for a deliberate non-descendant deployment'
         required: false
@@ -54,22 +70,22 @@ on:
         type: boolean
         default: true
       image_version:
-        description: 'Manual image version to tag/deploy, without leading v. Must equal the tinycloud-node version in tinycloud-node-server/Cargo.toml at the selected ref. Defaults to the selected ref name.'
+        description: 'Image version without leading v. Builds must match the selected crate; digest promotions must match the recorded image version (rollback_image_version when supplied).'
         required: false
         type: string
         default: ''
       deploy_image_digest:
-        description: 'Promote an existing sha256 digest without rebuilding. Requires deploy_phala, matching image_version, and default dstack features.'
+        description: 'Promote an existing sha256 digest without rebuilding, dispatched on main only. Requires truthful image_version, deploy_phala and default dstack features.'
         required: false
         type: string
         default: ''
       rollback_image_version:
-        description: 'Emergency rollback only: version label of a recorded digest whose revision is in main history'
+        description: 'Recorded immutable digest version label, for recovery, rollback or forward digest promotion; revision must be in main history'
         required: false
         type: string
         default: ''
       rollback_image_revision:
-        description: 'Emergency rollback only: 40-character revision label of the recorded digest (must be an ancestor of main)'
+        description: 'Recorded digest 40-character revision label (must be an ancestor of main)'
         required: false
         type: string
         default: ''
@@ -111,11 +127,16 @@ jobs:
     name: Version guard
     runs-on: ubuntu-latest
     outputs:
-      cargo_version: ${{ steps.check.outputs.cargo_version }}
+      image_version: ${{ steps.check.outputs.image_version }}
     steps:
       - uses: actions/checkout@v4
       - name: Check published Docker tags
         run: python3 scripts/ci/test-docker-tags.py
+
+      - name: Test quota authority with synthetic HTTP
+        run: python3 scripts/ci/test-quota-authority.py
+      - name: Test recovery deployment boundaries and documented commands
+        run: python3 scripts/ci/test-deploy-recovery.py
 
       - name: Validate image version against Cargo.toml
         id: check
@@ -124,6 +145,10 @@ jobs:
           INPUT_IMAGE_VERSION: ${{ inputs.image_version }}
           INPUT_DEPLOY_DIGEST: ${{ inputs.deploy_image_digest }}
           INPUT_DEPLOY_PHALA: ${{ inputs.deploy_phala }}
+          AUTHORIZE_QUOTA_VALUES: ${{ inputs.authorize_quota_values }}
+          ROLLBACK_PRE_N0: ${{ inputs.rollback_pre_n0 }}
+          ROLLBACK_PRIVACY_MODE: ${{ inputs.rollback_privacy_mode }}
+          APPROVED_ROLLBACK_PRIVACY_MODE: ${{ vars.TC959_ROLLBACK_PRIVACY_MODE }}
           ROLLBACK_VERSION: ${{ inputs.rollback_image_version }}
           ROLLBACK_REVISION: ${{ inputs.rollback_image_revision }}
           INCLUDE_DUCKDB: ${{ inputs.include_duckdb }}
@@ -131,6 +156,15 @@ jobs:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
+          # #310 and this recovery change must land as one lineage, before
+          # #309's later logging window. Never merge #310 alone.
+          if [ "${INPUT_DEPLOY_PHALA}" = "true" ]; then
+            if [ "${EVENT_NAME}" != "workflow_dispatch" ] || [ "${AUTHORIZE_QUOTA_VALUES:-false}" != "true" ]; then
+              echo "::error::Every deployment requires explicit authorize_quota_values=true before any mutation"
+              exit 1
+            fi
+          fi
+          python3 scripts/ci/reconcile-quota.py --validate-only
 
           # `|| true` so a missing match reaches the explicit check below
           # instead of dying under `set -e` with no explanation.
@@ -139,8 +173,27 @@ jobs:
             echo "::error::could not read the tinycloud-node version from tinycloud-node-server/Cargo.toml"
             exit 1
           fi
-          echo "cargo_version=${CARGO_VERSION}" >> "$GITHUB_OUTPUT"
-          echo "tinycloud-node-server/Cargo.toml version: ${CARGO_VERSION}"
+          if [ "${ROLLBACK_PRE_N0:-false}" = "true" ]; then
+            if [ "${EVENT_NAME}" != "workflow_dispatch" ] || [ "${GITHUB_REF}" != "refs/heads/main" ] \
+              || [ "${INPUT_DEPLOY_PHALA}" != "true" ] \
+              || [ "${INPUT_DEPLOY_DIGEST}" != "sha256:4bdae4fc232d886bb56bfbce4ec62ed4b8fb4e1369a01f6afb73d06dd68c188f" ] \
+              || [ "${INPUT_IMAGE_VERSION}" != "1.20.6" ] || [ "${ROLLBACK_VERSION}" != "1.20.6" ] \
+              || [ "${ROLLBACK_REVISION}" != "e18578ff9162986ddd813259c60f73866e3e60d1" ]; then
+              echo "::error::Captured pre-N0 rollback requires main-only dispatch and the exact recorded 1.20.6 digest labels"
+              exit 1
+            fi
+            case "${ROLLBACK_PRIVACY_MODE:-unselected}" in
+              keep-json-file|stop-future-local-logs) ;;
+              *) echo "::error::Choose an explicit Sam-approved rollback privacy mode"; exit 1 ;;
+            esac
+            if [ "${APPROVED_ROLLBACK_PRIVACY_MODE:-}" != "${ROLLBACK_PRIVACY_MODE}" ]; then
+              echo "::error::Rollback privacy mode does not match the recorded Sam card decision"
+              exit 1
+            fi
+          elif [ "${ROLLBACK_PRIVACY_MODE:-unselected}" != "unselected" ]; then
+            echo "::error::Rollback privacy selection is mutually exclusive from current-compose promotion"
+            exit 1
+          fi
 
           check_matches() {
             label="$1"
@@ -158,9 +211,6 @@ jobs:
             check_matches "git tag" "${GITHUB_REF_NAME}"
           fi
 
-          if [ -n "${INPUT_IMAGE_VERSION}" ]; then
-            check_matches "image_version input" "${INPUT_IMAGE_VERSION}"
-          fi
           # TC-940: every production revision is in main's history, so a
           # rollback dispatched on main passes the ancestry guard without
           # allow_non_descendant. The rollback revision itself must be an
@@ -172,16 +222,32 @@ jobs:
               echo "::error::Rollback label override requires a digest and valid version/revision labels"
               exit 1
             fi
-            echo "::warning::Emergency rollback to recorded ${ROLLBACK_VERSION} revision ${ROLLBACK_REVISION}"
+            echo "::notice::Using recorded image labels: ${ROLLBACK_VERSION} revision ${ROLLBACK_REVISION}"
+          fi
+          if [ -n "${INPUT_IMAGE_VERSION}" ]; then
+            if [ -n "${INPUT_DEPLOY_DIGEST}" ] && [ -n "${ROLLBACK_VERSION}" ]; then
+              if [ "${INPUT_IMAGE_VERSION}" != "${ROLLBACK_VERSION}" ]; then
+                echo "::error::Digest promotion image_version must equal the recorded image version"
+                exit 1
+              fi
+            else
+              check_matches "image_version input" "${INPUT_IMAGE_VERSION}"
+            fi
           fi
           if [ -n "${INPUT_DEPLOY_DIGEST}" ]; then
-            if [ "${EVENT_NAME}" != "workflow_dispatch" ] || [ "${INPUT_DEPLOY_PHALA}" != "true" ] || [ -z "${INPUT_IMAGE_VERSION}" ] \
+            if [ "${EVENT_NAME}" != "workflow_dispatch" ] || [ "${GITHUB_REF}" != "refs/heads/main" ] \
+              || [ "${INPUT_DEPLOY_PHALA}" != "true" ] || [ -z "${INPUT_IMAGE_VERSION}" ] \
               || [ "${INCLUDE_DUCKDB}" = "true" ] || [ "${INCLUDE_TC_BENCH_V1}" = "true" ] \
               || ! [[ "${INPUT_DEPLOY_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-              echo "::error::Digest promotion requires deploy_phala=true, matching image_version, default dstack features and a sha256 digest."
+              echo "::error::Digest promotion requires workflow_dispatch on main, deploy_phala=true, truthful image_version, default dstack features and a sha256 digest."
               exit 1
             fi
           fi
+          # Only the version of the selected binary enters deployment
+          # outputs/logs; the workflow checkout is not the promoted image.
+          SELECTED_VERSION="${ROLLBACK_VERSION:-${CARGO_VERSION}}"
+          echo "image_version=${SELECTED_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Selected image version: ${SELECTED_VERSION}"
 
       # TC-940: refuse a production deploy from anything but main or a vX.Y.Z
       # tag on main's history before spending time on image builds. The
@@ -391,16 +457,20 @@ jobs:
   deploy-phala:
     runs-on: ubuntu-latest
     needs: [version-guard, build, build-dstack]
-    # TC-971: the deploy secrets live only in the production environment, whose
-    # deployment policy admits main and v* tags. A dispatch from any other ref
-    # is rejected before the job starts, and an old ref whose docker.yml lacks
-    # this line gets no deploy secrets at all. See docs/releasing.md.
+    # TC-971: production-environment policy admits main and v* tags. Most deploy
+    # secrets live there; PROD_TINYCLOUD_ADMIN_SECRET is repository-scoped.
+    # Digest promotion additionally requires main, not a release tag.
     environment: production
     if: >-
       ${{ vars.TC780_CUTOVER_READY == 'true' && !cancelled() && !inputs.rollback_audit_only && needs.version-guard.result == 'success' &&
         github.event_name == 'workflow_dispatch' && inputs.deploy_phala &&
-        ((inputs.deploy_image_digest != '' && needs.build.result == 'skipped' && needs.build-dstack.result == 'skipped') ||
+        ((inputs.deploy_image_digest != '' && github.ref == 'refs/heads/main' && needs.build.result == 'skipped' && needs.build-dstack.result == 'skipped') ||
           (inputs.deploy_image_digest == '' && needs.build.result == 'success' && needs.build-dstack.result == 'success')) }}
+    outputs:
+      image: ${{ steps.pin.outputs.image }}
+      version: ${{ steps.pin.outputs.version }}
+      revision: ${{ steps.pin.outputs.revision }}
+      image_label: ${{ steps.pin.outputs.image_label }}
     permissions:
       contents: read
       packages: read
@@ -438,6 +508,11 @@ jobs:
       # unpin once the prod CVM is migrated or 1.1.20+ is verified against it.
       - name: Install Phala CLI
         run: npm install -g phala@1.1.19
+
+      - name: Install Phala env synchronization SDK
+        # Same SDK generation as phala 1.1.19, isolated from the checkout.
+        # Install before any sealed values enter the step environment.
+        run: npm install --prefix "$RUNNER_TEMP/phala-env-sync" --no-save --ignore-scripts @phala/cloud@0.2.9
 
       - name: Guard production ancestry
         env:
@@ -520,15 +595,31 @@ jobs:
           fi
           echo "Running production revision ${RUNNING_REVISION} is an ancestor of ${GITHUB_SHA}."
 
+      - name: Preflight quota authority
+        env:
+          QUOTA_ADMIN_SECRET: ${{ secrets.PROD_TINYCLOUD_ADMIN_SECRET }}
+          # Billing's storage-comp guard checks the same shared node/billing
+          # admin value (billing TINYCLOUD_ADMIN_SECRET); see docs/releasing.md.
+          QUOTA_BILLING_ADMIN_SECRET: ${{ secrets.PROD_TINYCLOUD_ADMIN_SECRET }}
+          QUOTA_BILLING_URL: ${{ secrets.PROD_TINYCLOUD_QUOTA_URL }}
+        run: |
+          set -euo pipefail
+          set +x
+          python3 scripts/ci/reconcile-quota.py --preflight
+
       - name: Validate and pin deployment image
+        id: pin
         env:
           INPUT_DEPLOY_DIGEST: ${{ inputs.deploy_image_digest }}
           BUILD_DIGEST: ${{ needs.build-dstack.outputs.digest }}
-          CARGO_VERSION: ${{ needs.version-guard.outputs.cargo_version }}
+          DEPLOY_VERSION: ${{ needs.version-guard.outputs.image_version }}
           INCLUDE_DUCKDB: ${{ inputs.include_duckdb }}
           INCLUDE_TC_BENCH_V1: ${{ inputs.include_tc_bench_v1 }}
           ROLLBACK_VERSION: ${{ inputs.rollback_image_version }}
           ROLLBACK_REVISION: ${{ inputs.rollback_image_revision }}
+          ROLLBACK_PRE_N0: ${{ inputs.rollback_pre_n0 }}
+          ROLLBACK_PRIVACY_MODE: ${{ inputs.rollback_privacy_mode }}
+          APPROVED_ROLLBACK_PRIVACY_MODE: ${{ vars.TC959_ROLLBACK_PRIVACY_MODE }}
         run: |
           set -euo pipefail
           DIGEST="${INPUT_DEPLOY_DIGEST:-${BUILD_DIGEST}}"
@@ -537,12 +628,11 @@ jobs:
           docker pull --platform linux/amd64 "${RESOLVED_IMAGE}"
           REVISION="$(docker image inspect "${RESOLVED_IMAGE}" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')"
           VERSION="$(docker image inspect "${RESOLVED_IMAGE}" --format '{{ index .Config.Labels "org.opencontainers.image.version" }}')"
-          EXPECTED="${CARGO_VERSION}-dstack"
+          EXPECTED="${DEPLOY_VERSION}-dstack"
           if [ "${INCLUDE_DUCKDB}" = "true" ]; then EXPECTED="${EXPECTED}-duckdb"; fi
           if [ "${INCLUDE_TC_BENCH_V1}" = "true" ]; then EXPECTED="${EXPECTED}-tc-bench-v1"; fi
           EXPECTED_REVISION="$(git rev-parse HEAD)"
           if [ -n "${ROLLBACK_VERSION}" ]; then
-            EXPECTED="${ROLLBACK_VERSION}-dstack"
             EXPECTED_REVISION="${ROLLBACK_REVISION}"
           fi
           if [ "${REVISION}" != "${EXPECTED_REVISION}" ] || [ "${VERSION}" != "${EXPECTED}" ]; then
@@ -550,16 +640,79 @@ jobs:
             exit 1
           fi
           python3 - <<'PY'
+          import hashlib
           import os
+          import re
           from pathlib import Path
+          def read_artifact(relative):
+              path = Path(relative)
+              if path.is_symlink() or path.resolve() != Path.cwd().resolve() / relative:
+                  raise SystemExit('::error::Deployment artifact path is not the fixed reviewed path')
+              try:
+                  return path.read_bytes()
+              except OSError:
+                  raise SystemExit('::error::Reviewed deployment artifact is unavailable') from None
+
           path = Path('docker-compose.dstack-postgres.yaml')
-          content = path.read_text()
-          original = 'ghcr.io/tinycloudlabs/tinycloud-node:dstack'
-          assert content.count(original) == 1, 'Expected exactly one native image reference'
-          path.write_text(content.replace(original, os.environ['RESOLVED_IMAGE']))
+          if path.is_symlink() or path.resolve() != Path.cwd().resolve() / path:
+              raise SystemExit('::error::Deployment destination is not the fixed reviewed path')
+          native = 'ghcr.io/tinycloudlabs/tinycloud-node'
+          reviewed = native + '@sha256:4bdae4fc232d886bb56bfbce4ec62ed4b8fb4e1369a01f6afb73d06dd68c188f'
+          n0_hash = 'c33c23021589163b62a71ef245b7194717711922027629f155bdd5cff806b8c7'
+          pre_n0_hash = 'df239749ca0a9c09893a855ae2a8abb94090b8556515ad002105c58ac91f4c91'
+          pre_n0_template_hash = '28302d6761d841b7cc5c11314aed2d377735e6bbdcaf85972a752e03bc9fdc93'
+          rollback = os.environ.get('ROLLBACK_PRE_N0') == 'true'
+          mode = os.environ.get('ROLLBACK_PRIVACY_MODE') or 'unselected'
+          if rollback:
+              raw = read_artifact('ops/rollback/pre-n0-compose.yaml')
+              if os.environ['RESOLVED_IMAGE'] != reviewed or hashlib.sha256(raw).hexdigest() != pre_n0_hash:
+                  raise SystemExit('::error::Captured pre-N0 image/compose pin mismatch; deployment not attempted')
+              if mode not in ('keep-json-file', 'stop-future-local-logs') or mode != os.environ.get('APPROVED_ROLLBACK_PRIVACY_MODE'):
+                  raise SystemExit('::error::Rollback privacy decision is missing or mismatched')
+              if mode == 'stop-future-local-logs':
+                  raw = read_artifact('ops/rollback/pre-n0-stop-local-logs.yaml')
+                  if hashlib.sha256(raw).hexdigest() != '315ceca54bf8bfefe2b395b4097fe38ed8ec847fa0688bc873220bd65efc99ec':
+                      raise SystemExit('::error::Reviewed stop-future-logs artifact pin mismatch')
+              n0_configuration = False
+          else:
+              if mode != 'unselected':
+                  raise SystemExit('::error::Rollback privacy cannot modify a forward/current-compose deployment')
+              raw = read_artifact(str(path))
+              digest = hashlib.sha256(raw).hexdigest()
+              n0_configuration = digest == n0_hash
+              if n0_configuration and os.environ['RESOLVED_IMAGE'] != reviewed:
+                  raise SystemExit('::error::Reviewed N0 compose cannot substitute a different image')
+              if os.environ['RESOLVED_IMAGE'] == reviewed and digest not in (n0_hash, pre_n0_hash, pre_n0_template_hash):
+                  raise SystemExit('::error::Same-image recovery requires the exact current pre-N0 or reviewed N0 compose')
+          content = raw.decode('utf-8')
+          images = [
+              image for image in re.finditer(r'(?m)^([ \t]+image:[ \t]+)([^\n]+)$', content)
+              if image[2].strip().strip('"\'').startswith((native + ':', native + '@'))
+          ]
+          if len(images) != 1 or images[0][2].strip().strip('"\'') not in (native + ':dstack', reviewed):
+              raise SystemExit('Expected exactly one :dstack or reviewed digest-pinned native image')
+          image = images[0]
+          if image[2].strip().strip('"\'') == reviewed and reviewed != os.environ['RESOLVED_IMAGE']:
+              raise SystemExit('Reviewed compose digest does not match the selected deployment image')
+          path.write_bytes((content[:image.start(2)] + os.environ['RESOLVED_IMAGE'] + content[image.end(2):]).encode('utf-8'))
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'n0_configuration_verified={str(n0_configuration).lower()}\n')
+              output.write(f'rollback_pre_n0_verified={str(rollback).lower()}\n')
+          if rollback:
+              message = f'Rollback privacy: {mode}; no deletion of existing log files is requested.'
+              print(message)
+              with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+                  summary.write(message + '\n')
           PY
+          {
+            echo "image=${RESOLVED_IMAGE}"
+            echo "version=${VERSION%%-dstack*}"
+            echo "revision=${REVISION}"
+            echo "image_label=${VERSION}"
+          } >> "$GITHUB_OUTPUT"
           echo "Resolved image: ${RESOLVED_IMAGE} (revision ${REVISION}, version ${VERSION})"
-          cat docker-compose.dstack-postgres.yaml
+          printf 'Deployment image: `%s` — version `%s`, revision `%s`.\n' \
+            "${RESOLVED_IMAGE}" "${VERSION}" "${REVISION}" >> "$GITHUB_STEP_SUMMARY"
 
       # TC-500: Phala considers a CVM ready before compose services have
       # started. Validate the production-sealed bundle using the exact image
@@ -567,7 +720,6 @@ jobs:
       # without opening a database, resolving dstack, network, or socket
       # access, before the deploy step can replace the healthy CVM.
       - name: Preflight sealed runtime configuration
-        if: inputs.rollback_image_version == ''
         env:
           TINYCLOUD_STORAGE__DATABASE: ${{ secrets.PROD_TINYCLOUD_DATABASE_URL }}
           TINYCLOUD_DATABASE__WRITE_FENCE: ${{ inputs.sql_identity_fence }}
@@ -591,7 +743,123 @@ jobs:
             -e TINYCLOUD_KEYS__TYPE \
             "${IMAGE}" --validate-config
 
+      # TC-959: only env_keys/encrypted_env may change here. Never copy the
+      # precedent's raw-response logs or its unguarded compose_hash retry.
+      # https://docs.phala.com/phala-cloud/references/cloud-js-sdk/update-cvm-envs
+      - name: Prepare allowed_envs synchronization
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/phala-env-sync/sync.mjs" <<'JS'
+          import { readFileSync } from "node:fs";
+          import { setTimeout as sleep } from "node:timers/promises";
+
+          // SDK DEBUG can print request bodies and server-supplied errors.
+          delete process.env.DEBUG;
+          let phase = "sealed env validation";
+          const requireCondition = (condition) => {
+            if (!condition) throw new Error("guard failed");
+          };
+          const validName = (name) => typeof name === "string" && /^[A-Za-z_][A-Za-z0-9_]*$/.test(name);
+          const namesFrom = (compose) => {
+            const names = compose?.allowed_envs;
+            requireCondition(Array.isArray(names) && names.every(validName));
+            requireCondition(new Set(names).size === names.length);
+            return names;
+          };
+
+          try {
+            const {
+              createClient, getCvmComposeFile, getCvmInfo, updateCvmEnvs,
+              encryptEnvVars, parseEnvVars,
+            } = await import("@phala/cloud");
+            requireCondition(Boolean(process.env.PHALA_CLOUD_API_KEY));
+            const source = readFileSync(".phala-prod.env", "utf8");
+            const envs = [];
+            const keys = new Set();
+            for (const line of source.split("\n")) {
+              if (line === "") continue;
+              const separator = line.indexOf("=");
+              const key = line.slice(0, separator);
+              const value = line.slice(separator + 1);
+              requireCondition(separator > 0 && validName(key) && !keys.has(key));
+              requireCondition(value.length > 0 && !/[\r\n]/.test(value));
+              keys.add(key);
+              envs.push({ key, value });
+            }
+            requireCondition(keys.has("BETTERSTACK_SOURCE_TOKEN"));
+            // Match the CLI's dotenv interpretation exactly; no truncated,
+            // quoted or comment-stripped value may replace the intended one.
+            requireCondition(JSON.stringify(parseEnvVars(source)) === JSON.stringify(envs));
+            const client = createClient({
+              apiKey: process.env.PHALA_CLOUD_API_KEY,
+              baseURL: "https://cloud-api.phala.com/api/v1",
+              version: "2026-01-21",
+              timeout: 15000,
+              retry: 0,
+            });
+            const ref = { id: "tinycloud-node" };
+            phase = "complete whitelist validation";
+            const allowed = namesFrom(await getCvmComposeFile(client, ref));
+            // Retaining a name cannot recover a value absent from this file.
+            // Check before deploy AND again immediately before any env PATCH.
+            requireCondition(allowed.every((key) => keys.has(key)));
+            const missing = [...keys].filter((key) => !allowed.includes(key));
+            if (process.argv.includes("--check")) {
+              console.log(`Validated complete sealed set: ${keys.size} env names.`);
+            } else if (missing.length === 0) {
+              console.log(`allowed_envs verified: ${keys.size} env names; no PATCH needed.`);
+            } else {
+              phase = "public encryption key validation";
+              const info = await getCvmInfo(client, ref);
+              const pubkey = info.kms_info?.encrypted_env_pubkey ?? info.encrypted_env_pubkey;
+              requireCondition(typeof pubkey === "string" && /^(0x)?[0-9a-fA-F]{64}$/.test(pubkey));
+              const encrypted = await encryptEnvVars(envs, pubkey);
+              phase = "env whitelist update";
+              const result = await updateCvmEnvs(client, {
+                ...ref, encrypted_env: encrypted, env_keys: [...allowed, ...missing],
+              });
+              // An on-chain precondition needs a separately reviewed
+              // addComposeHash transaction. Never assume hash-only approval.
+              requireCondition(result.status === "in_progress" && typeof result.correlation_id === "string" && result.correlation_id.length > 0);
+              console.log(`allowed_envs update accepted: ${missing.length} added names.`);
+              phase = "env whitelist convergence";
+              const deadline = Date.now() + 600000;
+              let completed = false;
+              let observedOperation = false;
+              const pending = new Set(["starting", "stopping", "stopped", "restarting", "upgrading", "updating", "creating"]);
+              while (Date.now() < deadline) {
+                await sleep(5000);
+                const current = await getCvmInfo(client, ref);
+                requireCondition(current.status === "running" || pending.has(current.status));
+                const after = namesFrom(await getCvmComposeFile(client, ref));
+                const progress = current.progress;
+                // Prefer this operation's correlation. If optional progress
+                // is absent, require a post-PATCH non-running/running cycle.
+                if (progress?.correlation_id === result.correlation_id ||
+                    (!progress?.correlation_id && pending.has(current.status))) observedOperation = true;
+                // Missing/null progress can mean a fast or still-queued
+                // restart. Stored names + running alone are not completion.
+                const settled = progress == null || (
+                  progress && !progress.target && !progress.started_at && !progress.correlation_id
+                );
+                if (observedOperation && current.status === "running" && settled && [...keys].every((key) => after.includes(key))) {
+                  completed = true;
+                  break;
+                }
+              }
+              requireCondition(completed);
+              console.log(`allowed_envs verified after update: ${keys.size} env names.`);
+            }
+          } catch {
+            // Neither response message/JSON, ciphertext, nor exception detail
+            // is safe for public Actions logs.
+            console.error(`::error::allowed_envs synchronization failed during ${phase}; response details withheld.`);
+            process.exitCode = 1;
+          }
+          JS
+
       - name: Deploy to Phala Cloud
+        id: deploy
         env:
           PHALA_CLOUD_API_KEY: ${{ secrets.PHALA_CLOUD_API_KEY }}
           PHALA_ENV_DATABASE_URL: ${{ secrets.PROD_TINYCLOUD_DATABASE_URL }}
@@ -606,12 +874,16 @@ jobs:
           PHALA_ENV_CLOUDFLARE_API_TOKEN: ${{ secrets.PROD_TINYCLOUD_CLOUDFLARE_API_TOKEN }}
           PHALA_ENV_DSTACK_GATEWAY_DOMAIN: ${{ secrets.PROD_TINYCLOUD_DSTACK_GATEWAY_DOMAIN }}
           PHALA_ENV_CERTBOT_EMAIL: ${{ secrets.PROD_TINYCLOUD_CERTBOT_EMAIL }}
+          PHALA_ENV_BETTERSTACK_SOURCE_TOKEN: ${{ secrets.PROD_TINYCLOUD_BETTERSTACK_SOURCE_TOKEN }}
           PHALA_ENV_SQL_IDENTITY_FENCE: ${{ inputs.sql_identity_fence }}
         # Update the existing prod CVM (name: tinycloud-node) in the
         # Tiny Cloud workspace. The PHALA_CLOUD_API_KEY secret is
         # workspace-scoped and must be issued from that workspace.
         run: |
           set -euo pipefail
+          set +x
+          umask 077
+          trap 'rm -f .phala-prod.env' EXIT
 
           required_vars=(
             PHALA_CLOUD_API_KEY
@@ -627,6 +899,7 @@ jobs:
             PHALA_ENV_CLOUDFLARE_API_TOKEN
             PHALA_ENV_DSTACK_GATEWAY_DOMAIN
             PHALA_ENV_CERTBOT_EMAIL
+            PHALA_ENV_BETTERSTACK_SOURCE_TOKEN
             PHALA_ENV_SQL_IDENTITY_FENCE
           )
 
@@ -635,8 +908,16 @@ jobs:
               echo "::error::Missing required GitHub secret for Phala deploy: ${var#PHALA_ENV_}"
               exit 1
             fi
+            if [[ "${!var}" == *$'\n'* || "${!var}" == *$'\r'* ]]; then
+              echo "::error::Phala deploy inputs must be single-line values"
+              exit 1
+            fi
           done
 
+          # Also restrict a file left by an earlier failed runner step before
+          # writing any value; umask alone does not tighten an existing file.
+          : > .phala-prod.env
+          chmod 0600 .phala-prod.env
           {
             printf 'DATABASE_URL=%s\n' "$PHALA_ENV_DATABASE_URL"
             printf 'S3_BUCKET=%s\n' "$PHALA_ENV_S3_BUCKET"
@@ -650,6 +931,7 @@ jobs:
             printf 'CLOUDFLARE_API_TOKEN=%s\n' "$PHALA_ENV_CLOUDFLARE_API_TOKEN"
             printf 'DSTACK_GATEWAY_DOMAIN=%s\n' "$PHALA_ENV_DSTACK_GATEWAY_DOMAIN"
             printf 'CERTBOT_EMAIL=%s\n' "$PHALA_ENV_CERTBOT_EMAIL"
+            printf 'BETTERSTACK_SOURCE_TOKEN=%s\n' "$PHALA_ENV_BETTERSTACK_SOURCE_TOKEN"
             printf 'SQL_IDENTITY_FENCE=%s\n' "$PHALA_ENV_SQL_IDENTITY_FENCE"
             # SSH public keys authorized on the CVM (checked into the repo,
             # see dstack-authorized-keys). The Phala Cloud pre-launch script
@@ -658,13 +940,33 @@ jobs:
             printf 'DSTACK_AUTHORIZED_KEYS=%s\n' "$(cat dstack-authorized-keys)"
           } > .phala-prod.env
 
+          # Validate complete env names/whitelist before any CVM mutation.
+          node "$RUNNER_TEMP/phala-env-sync/sync.mjs" --check
+
           # Fail before replacing the running CVM if a required compose input
           # is absent. Phala's control-plane ready state does not prove that
           # docker compose interpolation or container startup succeeded.
-          docker compose --env-file .phala-prod.env \
-            -f docker-compose.dstack-postgres.yaml config --quiet
+          if ! docker compose --env-file .phala-prod.env \
+            -f docker-compose.dstack-postgres.yaml config --quiet >/dev/null 2>&1; then
+            echo "::error::Sealed compose validation failed; deployment not attempted"
+            exit 1
+          fi
 
-          phala deploy --cvm-id tinycloud-node -c docker-compose.dstack-postgres.yaml -e .phala-prod.env --no-public-logs --no-public-sysinfo --wait
+          # The CLI/SDK can include request details in errors. Never forward
+          # those responses into Actions logs, even when deployment fails.
+          # A failing CLI/update can still have restarted the CVM.
+          echo "cvm_mutation_attempted=true" >> "$GITHUB_OUTPUT"
+          if ! phala deploy --cvm-id tinycloud-node -c docker-compose.dstack-postgres.yaml -e .phala-prod.env --no-public-logs --no-public-sysinfo --wait >/dev/null 2>&1; then
+            echo "::error::Phala deployment failed; inspect the private control plane"
+            exit 1
+          fi
+
+          # Do not assume -e registered the whitelist; verify/sync it explicitly.
+          node "$RUNNER_TEMP/phala-env-sync/sync.mjs"
+
+      - name: Remove sealed deployment environment
+        if: always()
+        run: rm -f .phala-prod.env
 
       # TC-312: prove the deploy actually converged. The image tag matching the
       # crate version is enforced at build time by version-guard, but nothing
@@ -674,23 +976,14 @@ jobs:
       # just deployed.
       - name: Verify deployed version
         env:
-          EVENT_NAME: ${{ github.event_name }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
-          INPUT_IMAGE_VERSION: ${{ inputs.image_version }}
-          ROLLBACK_VERSION: ${{ inputs.rollback_image_version }}
+          EXPECTED: ${{ steps.pin.outputs.version }}
+          IMAGE_REVISION: ${{ steps.pin.outputs.revision }}
         run: |
           set -euo pipefail
 
-          # Resolve the version we just deployed, mirroring the compose step.
-          if [ "${EVENT_NAME}" = "release" ]; then
-            TAG="${RELEASE_TAG}"
-          elif [ -n "${INPUT_IMAGE_VERSION}" ]; then
-            TAG="${INPUT_IMAGE_VERSION}"
-          else
-            TAG="${GITHUB_REF_NAME}"
-          fi
-          EXPECTED="${ROLLBACK_VERSION:-${TAG#v}}"
-          echo "Expecting node.tinycloud.xyz to report version ${EXPECTED}"
+          # Only validated image labels describe the binary, not Cargo.toml
+          # at the workflow checkout when an existing digest is promoted.
+          echo "Expecting node.tinycloud.xyz to report version ${EXPECTED} (revision ${IMAGE_REVISION})"
 
           # The CVM needs a short while to pull the new image and restart, so
           # retry with a fixed backoff (~5 min total) before giving up.
@@ -710,6 +1003,42 @@ jobs:
           echo "::error::node.tinycloud.xyz still reports '${REPORTED}' after $((ATTEMPTS * SLEEP))s, expected '${EXPECTED}'. The deploy did not converge."
           exit 1
 
+      # Ingress TLS readiness is required health. Restore quotas before the
+      # separate Policy probes, which still fail the deployment if invalid.
+      - name: Verify deployed ingress health
+        env:
+          EXPECTED: ${{ steps.pin.outputs.version }}
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 30); do
+            REPORTED="$(curl -fsS --max-time 10 https://tee.node.tinycloud.xyz/version | jq -r '.version' || true)"
+            if [ "${REPORTED}" = "${EXPECTED}" ]; then
+              echo "Direct TEE ingress is serving ${EXPECTED}."
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::Direct TEE ingress did not become healthy at version ${EXPECTED}."
+          exit 1
+
+      # General reviewed authority/values, freshly authorized for every deploy.
+      # Same job, after the final env operation and required health, before
+      # ancillary Policy probes. Billing mode is verification-only.
+
+      - name: Restore storage quota overrides
+        id: quotas
+        timeout-minutes: 5
+        if: ${{ success() && inputs.authorize_quota_values }}
+        env:
+          # Repository-scoped; never read by an agent or passed in argv.
+          QUOTA_ADMIN_SECRET: ${{ secrets.PROD_TINYCLOUD_ADMIN_SECRET }}
+          QUOTA_BILLING_ADMIN_SECRET: ${{ secrets.PROD_TINYCLOUD_ADMIN_SECRET }}
+          QUOTA_BILLING_URL: ${{ secrets.PROD_TINYCLOUD_QUOTA_URL }}
+        run: |
+          set -euo pipefail
+          set +x
+          python3 scripts/ci/reconcile-quota.py
+
       # TC-465: Share requires the complete Policy/v3 control plane before it
       # can create or receive an exact-email share. A version-only check let a
       # pre-TC-405 image look healthy while every required route returned 404.
@@ -728,22 +1057,6 @@ jobs:
             /policy/v3/delegations
             /policy/v3/deliveries/authorize
           )
-
-          # The direct TEE ingress obtains/loads its certificate after the
-          # node's public /version endpoint is already healthy. Wait for that
-          # TLS endpoint before probing routes so a successful rollout does
-          # not fail on a transient SSL_ERROR_SYSCALL during ingress startup.
-          for attempt in $(seq 1 30); do
-            if curl -fsS --max-time 10 "${NODE_ORIGIN}/version" > /dev/null; then
-              echo "Direct TEE ingress is ready."
-              break
-            fi
-            if [ "${attempt}" = "30" ]; then
-              echo "::error::Direct TEE ingress did not become ready after 150s."
-              exit 1
-            fi
-            sleep 5
-          done
 
           for route in "${ROUTES[@]}"; do
             RESPONSE_FILE="$(mktemp)"
@@ -777,6 +1090,16 @@ jobs:
             rm -f "${RESPONSE_FILE}"
           done
 
+      - name: Report unverified storage overrides
+        if: >-
+          ${{ always() && steps.deploy.outputs.cvm_mutation_attempted == 'true' && steps.quotas.outcome != 'success' }}
+        run: |
+          set -euo pipefail
+          MESSAGE="OVERRIDES UNVERIFIED: a CVM mutation was attempted without successful authorized quota reconciliation. Authorized operator must resolve before another dispatch."
+          echo "::error::${MESSAGE}"
+          printf '%s\n' "${MESSAGE}" >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+
   # TC-1176: the 2026-10-14 read hang began ~40 min after a promote. After any
   # Phala deploy attempt (including rollbacks and failed verifications, which
   # may still have changed prod), start the Write Probe's dense promote watch:
@@ -794,4 +1117,16 @@ jobs:
       - name: Dispatch Write Probe promote watch
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh workflow run write-probe.yml -R "${GITHUB_REPOSITORY}" --ref main -f mode=dense
+          IMAGE: ${{ needs.deploy-phala.outputs.image }}
+          IMAGE_VERSION: ${{ needs.deploy-phala.outputs.version }}
+          IMAGE_LABEL: ${{ needs.deploy-phala.outputs.image_label }}
+          IMAGE_REVISION: ${{ needs.deploy-phala.outputs.revision }}
+        run: |
+          set -euo pipefail
+          if [ -n "${IMAGE}" ]; then
+            echo "Promote watch for ${IMAGE_LABEL} (version ${IMAGE_VERSION}) revision ${IMAGE_REVISION}: ${IMAGE}"
+          else
+            echo "Promote watch after deployment attempt; image validation did not complete."
+          fi
+          gh workflow run write-probe.yml -R "${GITHUB_REPOSITORY}" --ref main -f mode=dense
+

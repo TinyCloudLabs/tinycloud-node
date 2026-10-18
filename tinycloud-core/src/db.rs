@@ -319,13 +319,26 @@ where
     }
 }
 
+/// How long a boot migration on PostgreSQL waits for any one lock before it
+/// fails (TC-1176). Schema changes need strong table locks, which queue
+/// behind any open transaction on the table and, while queued, block every
+/// later query on it. Deploys run with the writer stopped, so a legitimate
+/// holder is a short transaction that 30s outlasts; a stuck session fails
+/// the boot with a clear error instead of hanging it. This bounds each lock
+/// wait, not how long a migration runs.
+const MIGRATION_LOCK_TIMEOUT: &str = "30s";
+
 /// Apply the schema migrations on `pool`.
 ///
 /// On PostgreSQL sea-orm-migration runs them in one transaction; it runs
 /// here inside an outer one that first lifts the pool's `statement_timeout`
 /// (TC-1054), since a migration or its backfill may legitimately run for
-/// minutes. The nested `BEGIN` becomes a savepoint, so the migrations stay
-/// atomic as before.
+/// minutes, and bounds every lock wait with `lock_timeout`
+/// ([`MIGRATION_LOCK_TIMEOUT`]). Both are `SET LOCAL`, so they end with the
+/// transaction and never reach the pooled session. The nested `BEGIN`
+/// becomes a savepoint, so the migrations stay atomic as before: a lock-wait
+/// failure rolls them all back, records none, and is reported as a
+/// [`DbErr::Migration`].
 pub async fn migrate(pool: &RecoveringConnection) -> Result<(), DbErr> {
     let conn = pool.sea_orm_connection();
     if conn.get_database_backend() != sea_orm::DatabaseBackend::Postgres {
@@ -335,8 +348,36 @@ pub async fn migrate(pool: &RecoveringConnection) -> Result<(), DbErr> {
     transaction
         .execute_unprepared(crate::db_pool::EXEMPT_STATEMENT_TIMEOUT)
         .await?;
-    Migrator::up(&transaction, None).await?;
+    transaction
+        .execute_unprepared(&format!(
+            "SET LOCAL lock_timeout = '{MIGRATION_LOCK_TIMEOUT}'"
+        ))
+        .await?;
+    Migrator::up(&transaction, None)
+        .await
+        .map_err(migration_lock_wait_error)?;
     transaction.commit().await
+}
+
+/// Name a migration's lock-wait failure (SQLSTATE 55P03, which
+/// `lock_timeout` raises) so the boot error says what to fix. sea-orm-migration
+/// returns the failing statement's error without the migration's name; its
+/// `Applying migration` log line names it. Other errors pass through unchanged.
+fn migration_lock_wait_error(error: DbErr) -> DbErr {
+    let (DbErr::Conn(RuntimeErr::SqlxError(SqlxError::Database(database)))
+    | DbErr::Exec(RuntimeErr::SqlxError(SqlxError::Database(database)))
+    | DbErr::Query(RuntimeErr::SqlxError(SqlxError::Database(database)))) = &error
+    else {
+        return error;
+    };
+    if database.code().as_deref() != Some("55P03") {
+        return error;
+    }
+    DbErr::Migration(format!(
+        "a migration gave up after waiting {MIGRATION_LOCK_TIMEOUT} (lock_timeout) for a table \
+         lock; another session holds a conflicting lock (SQLSTATE 55P03: {database}). Nothing \
+         was applied; end that session and restart."
+    ))
 }
 
 impl<C, B, K> SpaceDatabase<C, B, K>
@@ -499,6 +540,44 @@ where
     /// Callers take the SQLite writer gate first.
     pub async fn begin_graph_transaction(&self) -> Result<DatabaseTransaction, DbErr> {
         begin_write_transaction(&self.conn, chain_isolation_level(&self.conn)).await
+    }
+
+    /// TC-1274 backfill: up to `limit` space IDs after `after`, in ID order.
+    pub async fn epoch_head_backfill_page(
+        &self,
+        after: Option<&SpaceId>,
+        limit: u64,
+    ) -> Result<Vec<SpaceId>, DbErr> {
+        let mut query = space::Entity::find().order_by_asc(space::Column::Id);
+        if let Some(after) = after {
+            query = query.filter(space::Column::Id.gt(SpaceIdWrap(after.clone())));
+        }
+        Ok(query
+            .limit(limit)
+            .all(&self.conn)
+            .await?
+            .into_iter()
+            .map(|space| space.id.0)
+            .collect())
+    }
+
+    /// TC-1274 backfill of one space: rewrite its cached head epochs from
+    /// history unless they are provably current. Takes the space's sequence
+    /// locks as a write does, so it serializes with that space's writers and
+    /// holds no other space. Returns whether it rewrote the cache.
+    pub async fn repair_epoch_heads(&self, space: &SpaceId) -> Result<bool, DbErr> {
+        let _sequence = self
+            .acquire_space_sequence_guards(std::slice::from_ref(space))
+            .await;
+        let _writer = match &self.writer_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+        let tx = self.begin_graph_transaction().await?;
+        crate::kv_sync::lock_space_sequences(&tx, [space]).await?;
+        let repaired = crate::epoch_head::repair(&tx, &SpaceIdWrap(space.clone())).await?;
+        tx.commit().await?;
+        Ok(repaired)
     }
 }
 
@@ -1706,7 +1785,13 @@ where
             .one(&self.conn)
             .await
         {
-            Ok(Some(_)) => return Ok(already_registered_result(retained_hash)),
+            Ok(Some(_)) => {
+                // The content-addressed row authenticates these exact signed bytes.
+                for space in delegation.0.spaces() {
+                    crate::request_telemetry::observe_space(space);
+                }
+                return Ok(already_registered_result(retained_hash));
+            }
             Ok(None) => {}
             Err(e) => return Err(TxError::Db(e)),
         }
@@ -3297,34 +3382,18 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
             }
         }
 
-        // get 'most recent' epochs for each of the spaces
-        let mut most_recent = epoch::Entity::find()
-            .select_only()
-            .left_join(epoch_order::Entity)
-            .filter(
-                Condition::all()
-                    .add(epoch::Column::Space.is_in(event_spaces.keys().cloned().map(SpaceIdWrap)))
-                    .add(epoch_order::Column::Child.is_null()),
-            )
-            .column(epoch::Column::Space)
-            .column(epoch::Column::Id)
-            .into_tuple::<(SpaceIdWrap, Hash)>()
-            .all(db)
-            .await?
-            .into_iter()
-            .fold(
-                HashMap::new(),
-                |mut m: HashMap<SpaceIdWrap, Vec<Hash>>, (space, epoch)| {
-                    m.entry(space).or_default().push(epoch);
-                    m
-                },
-            );
+        // The current heads of each space (TC-1274): O(#heads) from the
+        // `epoch_head` cache, falling back to history only for a space whose
+        // cache is not provably current. The sequence locks taken above are
+        // held to commit.
+        let head_spaces: Vec<SpaceIdWrap> = event_spaces.keys().cloned().map(SpaceIdWrap).collect();
+        let mut heads = crate::epoch_head::current(db, &head_spaces, &max_seqs).await?;
 
         // get all the orderings and associated data
         let (epoch_order, space_order, event_order, epochs) = event_spaces
             .into_iter()
             .map(|(space, events)| {
-                let parents = most_recent.remove(&space).unwrap_or_default();
+                let parents = heads.parents.remove(&space).unwrap_or_default();
                 let epoch = epoch_hash(&space, &events, &parents)?;
                 let seq = max_seqs.remove(&space).unwrap_or(0);
                 Ok((space, (epoch, events, seq, parents)))
@@ -3395,20 +3464,25 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
             .exec(db)
             .await
             .map_err(|e| {
-                if let DbErr::Exec(RuntimeErr::SqlxError(SqlxError::Database(db_err))) = &e {
-                    tracing::error!(
-                        error = %e,
-                        db_error = %db_err,
-                        db_error_code = ?db_err.code(),
-                        db_error_kind = ?db_err.kind(),
-                        "epoch insert failed with database error after space pre-check; \
-                         treating as integrity error"
-                    );
-                } else {
-                    tracing::error!(error = %e, "epoch insert failed");
-                }
+                tracing::error!(
+                    operation = "epoch_insert",
+                    error_class = "database",
+                    "epoch insert failed"
+                );
                 TxError::EpochInsert(e)
             })?;
+
+        // Each space's only head is now the epoch just appended: its parents
+        // were all of the previous heads.
+        crate::epoch_head::advance(
+            db,
+            &heads,
+            space_order
+                .iter()
+                .map(|(space, (seq, epoch, _, _))| (SpaceIdWrap(space.clone()), *epoch, *seq))
+                .collect(),
+        )
+        .await?;
 
         // save epoch orderings
         if !epoch_order.is_empty() {
@@ -3487,6 +3561,11 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                 }
                 Event::Revocation(r) => {
                     revocation::process(db, *r).await?;
+                    for (space, (_, _, _, hashes)) in &space_order {
+                        if hashes.contains_key(&hash) {
+                            crate::request_telemetry::observe_space(space);
+                        }
+                    }
                 }
             };
         }
