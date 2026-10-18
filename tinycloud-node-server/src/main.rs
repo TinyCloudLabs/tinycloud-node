@@ -49,9 +49,38 @@ fn install_panic_hook() {
     }));
 }
 
-#[rocket::main]
-async fn main() {
+/// Whether argv selects the clap CLI (`serve`, `node ...`, `--help`,
+/// `--version`). Everything else keeps the original server start: the
+/// container entrypoint is `tinycloud` with no arguments, and the deploy
+/// preflight runs `tinycloud --validate-config`, which clap would reject.
+fn is_cli_invocation(args: impl IntoIterator<Item = std::ffi::OsString>) -> bool {
+    matches!(
+        args.into_iter()
+            .nth(1)
+            .as_deref()
+            .and_then(|arg| arg.to_str()),
+        Some("serve" | "node" | "--help" | "-h" | "--version" | "-V")
+    )
+}
+
+fn main() {
     install_panic_hook();
+    if is_cli_invocation(std::env::args_os()) {
+        if let Err(e) = tinycloud::cli::run() {
+            eprintln!("\n✗ tinycloud-node failed:\n");
+            for cause in e.chain() {
+                eprintln!("  {cause}");
+            }
+            std::process::exit(1);
+        }
+        return;
+    }
+    // The runtime `#[rocket::main]` used to set up: worker and blocking
+    // thread counts come from ROCKET_WORKERS / ROCKET_MAX_BLOCKING.
+    rocket::execute(start_server());
+}
+
+async fn start_server() {
     let config = build_config_figment(); // That's just for easy access to ROCKET_LOG_LEVEL
     let tinycloud_config = config.extract::<config::Config>().unwrap();
 
@@ -297,5 +326,33 @@ mod tests {
             .expect("config should parse");
 
         assert_eq!(cfg.share_email.readiness_max_age_seconds, 42);
+    }
+
+    #[test]
+    fn only_cli_tokens_leave_the_server_start_path() {
+        let argv = |args: &[&str]| {
+            std::iter::once("tinycloud")
+                .chain(args.iter().copied())
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>()
+        };
+        for args in [
+            &["node", "status", "--json"][..],
+            &["serve"],
+            &["--help"],
+            &["-h"],
+            &["--version"],
+            &["-V"],
+        ] {
+            assert!(is_cli_invocation(argv(args)), "{args:?} must reach the CLI");
+        }
+        // Container entrypoint and the deploy preflight must keep starting
+        // (or validating) the server through the original path.
+        for args in [&[][..], &["--validate-config"], &["--unknown"]] {
+            assert!(
+                !is_cli_invocation(argv(args)),
+                "{args:?} must keep the server start path"
+            );
+        }
     }
 }

@@ -27,6 +27,7 @@ use std::{
 pub mod allow_list;
 pub mod auth_guards;
 pub mod authorization;
+pub mod cli;
 pub mod config;
 pub mod dstack;
 pub mod egress;
