@@ -14,6 +14,7 @@ pub mod encryption_network;
 pub mod encryption_network_member;
 pub mod encryption_nonce;
 pub mod epoch;
+pub mod epoch_head;
 pub mod hook_delivery;
 pub mod hook_subscription;
 pub mod invocation;

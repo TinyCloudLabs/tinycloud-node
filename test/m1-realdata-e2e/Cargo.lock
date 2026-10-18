@@ -46,6 +46,7 @@ dependencies = [
  "cfg-if",
  "cipher",
  "cpufeatures",
+ "zeroize",
 ]
 
 [[package]]
@@ -60,6 +61,7 @@ dependencies = [
  "ctr",
  "ghash",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -6500,6 +6502,7 @@ dependencies = [
  "memchr",
  "once_cell",
  "percent-encoding",
+ "pin-project",
  "rustls 0.23.36",
  "serde",
  "serde_json",
@@ -6599,8 +6602,6 @@ dependencies = [
 [[package]]
 name = "sqlx-postgres"
 version = "0.8.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "db58fcd5a53cf07c184b154801ff91347e4c30d17a3562a635ff028ad5deda46"
 dependencies = [
  "atoi",
  "base64 0.22.1",
@@ -6637,8 +6638,6 @@ dependencies = [
 [[package]]
 name = "sqlx-sqlite"
 version = "0.8.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2d12fe70b2c1b4401038055f90f151b78208de1f9f89a7dbfd41587a10c3eea"
 dependencies = [
  "atoi",
  "flume",
@@ -7730,6 +7729,7 @@ dependencies = [
 name = "tinycloud-core"
 version = "1.3.0"
 dependencies = [
+ "aes",
  "aes-gcm",
  "async-trait",
  "base64 0.22.1",
@@ -7737,6 +7737,8 @@ dependencies = [
  "dashmap",
  "futures",
  "hex",
+ "hkdf",
+ "hmac",
  "k256",
  "libp2p",
  "multihash-derive 0.9.1",
@@ -7753,6 +7755,7 @@ dependencies = [
  "sha2 0.10.9",
  "sha3",
  "sqlparser",
+ "sqlx-core",
  "tempfile",
  "thiserror 2.0.18",
  "time",
@@ -7761,6 +7764,7 @@ dependencies = [
  "tracing",
  "ucan-capabilities-object",
  "unicode-normalization",
+ "uuid",
  "x25519-dalek",
  "zeroize",
 ]
@@ -7832,6 +7836,7 @@ dependencies = [
  "tracing-log",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

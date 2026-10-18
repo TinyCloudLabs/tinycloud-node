@@ -62,6 +62,18 @@ export function assertCapture(events, fields) {
       if (timing === 'latency_us') assert.ok(Number.isSafeInteger(event[timing]) && event[timing] >= 0);
       else assert.ok(Number.isFinite(event[timing]) && event[timing] >= 0 && event[timing] <= 86400);
       allowed = [...base, 'method', 'route', 'status', timing];
+      if (event.event === 'node_request') {
+        // N2 correlation fields: optional, node_request only, each held to its fields.json pattern.
+        const patterns = {
+          request_id: fields?.request_id?.regex ?? '^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$',
+          account_hash: fields?.account_hash?.regex ?? '^[0-9a-f]{64}$',
+          space_hash: fields?.space_hash?.regex ?? '^[0-9a-f]{64}$',
+        };
+        for (const [key, pattern] of Object.entries(patterns)) {
+          if (key in event) { assert.equal(typeof event[key], 'string'); assert.match(event[key], new RegExp(pattern)); allowed.push(key); }
+        }
+        if ('request_id_replaced' in event) { assert.equal(typeof event.request_id_replaced, 'boolean'); allowed.push('request_id_replaced'); }
+      }
     } else if (event.event === 'node_warning' || event.event === 'node_error') {
       assert.equal(event.svc, 'api');
       assert.equal(event.level, event.event === 'node_warning' ? 'warn' : 'error');

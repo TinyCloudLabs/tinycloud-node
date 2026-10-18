@@ -54,15 +54,25 @@ tokio.workspace = true
 duckdb = { version = "1.1", features = ["bundled", "appender-arrow"], optional = true }
 arrow = { version = "56", features = ["ipc"], optional = true }
 tempfile = "3"
-aes-gcm = "0.10"
+# TC-887: `zeroize` wipes the AES key schedule on drop; `aes` is listed only to
+# enable its `zeroize` feature (feature unification). Not wiped (accepted
+# residual): the GHASH key H (polyval 0.6.2's autodetect backend keeps it in a
+# ManuallyDrop union with no Drop), the hkdf PRK and the hmac state.
+aes-gcm = { version = "0.10.3", features = ["zeroize"] }
+aes = { version = "0.8", features = ["zeroize"] }
 rand = "0.8"
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 hex.workspace = true
 base64.workspace = true
 sha2 = "0.10"
+sqlx-core = "=0.8.6"
+uuid = "1"
 sha3 = "0.10"
 k256 = "0.13"
-# TC-887: zeroize at-rest key material on drop.
+# TC-887: at-rest envelope key derivation and object names; zeroize key
+# material on drop.
+hkdf = "0.12"
+hmac = "0.12"
 zeroize = "1"
 prometheus = { version = "0.13.0", features = ["process"] }
 ryu-js = "0.2.2"
@@ -76,3 +86,4 @@ sea-orm = { version = "1.1", features = ["runtime-tokio-rustls", "sqlx-sqlite"] 
 async-std = { version = "1", features = ["attributes"] }
 tokio.workspace = true
 iri-string.workspace = true
+proptest = "1"

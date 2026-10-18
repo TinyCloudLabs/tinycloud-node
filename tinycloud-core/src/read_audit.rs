@@ -13,6 +13,7 @@ use crate::{
     hash::Hash,
     models::{actor, invocation},
     relationships::{invoked_abilities, parent_delegations},
+    request_telemetry::{self, Metrics, RequestContext, Snapshot},
     types::{Ability, Resource},
 };
 use sea_orm::{
@@ -69,6 +70,7 @@ impl ReadAuditRecord {
 struct Command {
     record: ReadAuditRecord,
     committed: oneshot::Sender<Result<(), String>>,
+    context: Option<Arc<RequestContext>>,
 }
 
 #[derive(Debug, Default)]
@@ -107,7 +109,11 @@ impl ReadAuditPipeline {
     async fn enqueue(&self, record: ReadAuditRecord) -> Result<(), DbErr> {
         let (committed, receipt) = oneshot::channel();
         self.sender
-            .send(Command { record, committed })
+            .send(Command {
+                record,
+                committed,
+                context: request_telemetry::current(),
+            })
             .await
             .map_err(|_| DbErr::Custom("read audit pipeline stopped".to_string()))?;
         receipt
@@ -144,19 +150,46 @@ async fn run_pipeline(
             Some(lock) => Some(lock.lock().await),
             None => None,
         };
-        let result = persist_batch(&conn, &batch)
-            .await
-            .map_err(|error| error.to_string());
-        if result.is_ok() {
-            stats
-                .records
-                .fetch_add(batch.len() as u64, Ordering::Relaxed);
-            stats.batches.fetch_add(1, Ordering::Relaxed);
-        }
-        for command in batch {
-            let _ = command.committed.send(result.clone());
+        commit_batch(&conn, batch, &stats).await;
+    }
+}
+/// Charge each waiting request the full physical batch, not a share of a
+/// process-wide delta. These totals are non-additive across requests.
+/// Queue/writer-lock waits and detached driver rollback cleanup are excluded.
+async fn commit_batch(
+    conn: &RecoveringConnection,
+    batch: Vec<Command>,
+    stats: &PipelineStats,
+) -> Snapshot {
+    let metrics = Arc::new(Metrics::default());
+    let result = sqlx_core::request_telemetry::scope(metrics.clone(), persist_batch(conn, &batch))
+        .await
+        .map_err(|error| error.to_string());
+    let snapshot = metrics.snapshot();
+    // At most 64 commands: scanning prior entries avoids a recipient allocation
+    // and deduplicates by context identity, never by account or request UUID.
+    for (index, command) in batch.iter().enumerate() {
+        if let Some(context) = &command.context {
+            if !batch[..index].iter().any(|previous| {
+                previous
+                    .context
+                    .as_ref()
+                    .is_some_and(|previous| Arc::ptr_eq(previous, context))
+            }) {
+                context.metrics().accumulate(snapshot);
+            }
         }
     }
+    if result.is_ok() {
+        stats
+            .records
+            .fetch_add(batch.len() as u64, Ordering::Relaxed);
+        stats.batches.fetch_add(1, Ordering::Relaxed);
+    }
+    for command in batch {
+        let _ = command.committed.send(result.clone());
+    }
+    snapshot
 }
 
 async fn persist_batch(conn: &RecoveringConnection, batch: &[Command]) -> Result<(), DbErr> {
@@ -425,6 +458,79 @@ mod tests {
         conn
     }
 
+    fn telemetry_context() -> Arc<crate::request_telemetry::RequestContext> {
+        crate::request_telemetry::RequestContext::new(
+            "12345678-1234-4234-8234-123456789abc".parse().unwrap(),
+            Arc::new(crate::telemetry::Pseudonymizer::new(
+                &crate::keys::StaticSecret::new(vec![17; 32]).unwrap(),
+            )),
+        )
+    }
+
+    async fn assert_batch_telemetry(fail: bool) {
+        let conn = database("sqlite::memory:".to_string(), 1).await;
+        if fail {
+            conn.execute(Statement::from_string(
+                DbBackend::Sqlite,
+                "DROP TABLE invocation".to_string(),
+            ))
+            .await
+            .unwrap();
+        }
+        let first = telemetry_context();
+        let second = telemetry_context();
+        let unrelated = telemetry_context();
+        let mut batch = Vec::new();
+        let mut receipts = Vec::new();
+        for (index, context) in [first.clone(), second.clone(), first.clone()]
+            .into_iter()
+            .enumerate()
+        {
+            let (committed, receipt) = oneshot::channel();
+            batch.push(Command {
+                record: record(index),
+                committed,
+                context: Some(context),
+            });
+            receipts.push(receipt);
+        }
+        let stats = PipelineStats::default();
+        // An unrelated ambient request must neither receive SQL nor become a
+        // recipient of this explicitly captured batch.
+        let physical = crate::request_telemetry::scope(
+            unrelated.clone(),
+            commit_batch(&RecoveringConnection::new(conn), batch, &stats),
+        )
+        .await;
+        // BEGIN, actor INSERT, invocation INSERT, then COMMIT on success.
+        // Failure's detached rollback is deliberately not a request query.
+        assert_eq!(physical.query_count, if fail { 3 } else { 4 });
+        assert!(physical.query_time_ns > 0);
+        assert_eq!(first.snapshot(), physical);
+        assert_eq!(second.snapshot(), physical);
+        assert_eq!(unrelated.snapshot(), Default::default());
+        for mut receipt in receipts {
+            // Publication is complete before even a ready receipt is consumed.
+            assert_eq!(receipt.try_recv().unwrap().is_err(), fail);
+            assert_eq!(first.snapshot(), physical);
+            assert_eq!(second.snapshot(), physical);
+        }
+        assert_eq!(
+            stats.records.load(Ordering::Relaxed),
+            if fail { 0 } else { 3 }
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_batch_charges_physical_work_once_per_request() {
+        assert_batch_telemetry(false).await;
+    }
+
+    #[tokio::test]
+    async fn failed_batch_charges_physical_work_before_failure_receipt() {
+        assert_batch_telemetry(true).await;
+    }
+
     #[tokio::test]
     async fn concurrent_records_group_commit_and_are_durable() {
         let directory = tempfile::tempdir().unwrap();
@@ -524,7 +630,11 @@ mod tests {
 
     fn command(record: ReadAuditRecord) -> Command {
         let (committed, _receipt) = oneshot::channel();
-        Command { record, committed }
+        Command {
+            record,
+            committed,
+            context: None,
+        }
     }
 
     /// A `parent_delegation.parent` value must reference a real `delegation`

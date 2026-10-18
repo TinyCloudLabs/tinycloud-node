@@ -1,5 +1,5 @@
 //! The boundary between key continuity (who holds DEKs) and the envelope
-//! (what a DEK encrypts). See `INTERFACES.md` §2 on TC-887.
+//! (what a DEK encrypts). See `docs/at-rest/INTERFACES.md` §2.
 
 use super::key::{DataKey, DekId, ObjectNameKey};
 use async_trait::async_trait;
@@ -21,6 +21,7 @@ pub trait DataKeyProvider: Send + Sync {
 }
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum DataKeyError {
     /// The node booted locked: its root cannot unseal the at-rest root key.
     #[error("at-rest keys are locked")]
