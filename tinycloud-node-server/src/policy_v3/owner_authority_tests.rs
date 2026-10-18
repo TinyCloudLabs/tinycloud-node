@@ -1156,6 +1156,26 @@ impl Harness {
             .ok_or_else(|| anyhow::anyhow!("not classified"))
     }
 
+    /// Wait until `policy_cid` is classified as `state`, or time out;
+    /// returns the last row seen.
+    pub async fn wait_for_state(
+        &self,
+        policy_cid: &str,
+        state: &str,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<BindingRow> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let row = self.binding(policy_cid).await?;
+            if row.as_ref().is_some_and(|row| row.state == state)
+                || tokio::time::Instant::now() >= deadline
+            {
+                return row.ok_or_else(|| anyhow::anyhow!("not classified"));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
     /// Wait until `policy_cid` has a classification, or time out.
     pub async fn wait_for_binding(
         &self,
@@ -1272,13 +1292,13 @@ async fn delegations_back_to_the_owner_are_never_recorded(backend: Backend) -> a
     else {
         return Ok(());
     };
-    let authority = h
-        .grant_owner(Window::until(now() + Duration::days(2)))
-        .await?;
+    // One window for the grant and everything derived from it: a child may
+    // not outlive its parent, and two `now()`s can straddle a second.
+    let window = Window::until(now() + Duration::days(2));
+    let authority = h.grant_owner(window).await?;
     let authority_cid: Cid = authority.parse()?;
     let link_holder = Signer::key();
     let grants = h.owner_grants();
-    let window = Window::until(now() + Duration::days(2));
     let link = h
         .import(
             h.owner
@@ -1378,17 +1398,19 @@ fn graph_id(encoded: &str) -> anyhow::Result<Vec<u8>> {
         .to_vec())
 }
 
-/// Sign fresh delegations until one's graph id sorts in the top quarter, so
-/// that later ids can be chosen to sort before it.
+/// The highest-sorting of 64 freshly signed delegations, so that later ids
+/// can be chosen to sort before it (each fresh one does with probability
+/// about 63/64, whatever the id layout).
 fn high_id(mut sign: impl FnMut() -> anyhow::Result<String>) -> anyhow::Result<String> {
-    for _ in 0..512 {
+    let mut best: Option<(Vec<u8>, String)> = None;
+    for _ in 0..64 {
         let encoded = sign()?;
-        // Byte 2 is the first digest byte after the multihash prefix.
-        if graph_id(&encoded)?.get(2).is_some_and(|byte| *byte >= 0xC0) {
-            return Ok(encoded);
+        let id = graph_id(&encoded)?;
+        if best.as_ref().is_none_or(|(best_id, _)| id > *best_id) {
+            best = Some((id, encoded));
         }
     }
-    anyhow::bail!("no delegation sorted high")
+    Ok(best.expect("64 candidates").1)
 }
 
 /// Set a registration's `registered_at`, as for one registered earlier.
@@ -1523,7 +1545,7 @@ on_both_backends!(strangers_cannot_crowd_the_general_window);
 /// the general window is full of loop-back delegations (skipped without using
 /// a try) ahead of the re-delegated authority. `starved` is not final.
 async fn a_general_window_full_of_skipped_rows_is_starved(backend: Backend) -> anyhow::Result<()> {
-    let Some(h) = Harness::with_boot(
+    let Some(mut h) = Harness::with_boot(
         backend,
         Shape::KeySession,
         "a_general_window_full_of_skipped_rows_is_starved",
@@ -1564,9 +1586,75 @@ async fn a_general_window_full_of_skipped_rows_is_starved(backend: Backend) -> a
     let binding = h.classify_on_use(&legacy).await?;
     assert_eq!(binding.state, "unknown");
     assert_eq!(binding.unknown_reason.as_deref(), Some("starved"));
+    // `starved` is not final: once the owner holds a grant the owner-first
+    // step finds, a later use (here in a fresh process, past the back-off)
+    // classifies it again.
+    h.grant_owner(Window {
+        not_before: now() - Duration::hours(1),
+        expiry: now() + Duration::days(2),
+        issued_at: None,
+    })
+    .await?;
+    h.reboot(legacy_boot()).await?;
+    h.challenge(&legacy).await;
+    let binding = h
+        .wait_for_state(
+            &legacy.policy_cid,
+            "bound",
+            std::time::Duration::from_secs(20),
+        )
+        .await?;
+    assert_eq!(binding.state, "bound", "starved was treated as final");
     Ok(())
 }
 on_both_backends!(a_general_window_full_of_skipped_rows_is_starved);
+
+/// Loop-back candidates ahead of the authority in the general window don't
+/// use up its tries: 40 of them (more than the 32 tries) still leave the
+/// authority reachable.
+async fn loop_back_rows_do_not_use_up_tries(backend: Backend) -> anyhow::Result<()> {
+    let Some(h) = Harness::new(
+        backend,
+        Shape::KeySession,
+        "loop_back_rows_do_not_use_up_tries",
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let grants = h.owner_grants();
+    let window = Window::until(now() + Duration::days(2));
+    let intermediary = Signer::key();
+    let upstream = h
+        .import(
+            h.space_owner
+                .delegate(intermediary.did(), &grants, window, &[])?,
+        )
+        .await?;
+    let authority_encoded =
+        high_id(|| intermediary.delegate(h.owner.did(), &grants, window, &[upstream.parse()?]))?;
+    let authority_id = graph_id(&authority_encoded)?;
+    let authority = h.import(authority_encoded).await?;
+    let link_holder = Signer::key();
+    let link = h
+        .import(
+            h.owner
+                .delegate(link_holder.did(), &grants, window, &[authority.parse()?])?,
+        )
+        .await?;
+    for _ in 0..40 {
+        let back = sorting_before(&authority_id, || {
+            link_holder.delegate(h.owner.did(), &grants, window, &[link.parse()?])
+        })?;
+        h.import(back).await?;
+    }
+    let policy = h.register_ok(policy_window()).await?;
+    let mut expected = vec![authority, upstream];
+    expected.sort();
+    assert_eq!(h.closure(&policy.policy_cid).await?, expected);
+    Ok(())
+}
+on_both_backends!(loop_back_rows_do_not_use_up_tries);
 
 /// Delegations to the owner from holders of the space owner's authority
 /// (they pass the general window's scope) sort ahead of the space owner's

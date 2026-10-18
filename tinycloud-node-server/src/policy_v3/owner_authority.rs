@@ -56,6 +56,10 @@ const LAZY_WRITE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_mill
 const RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
 /// Bound on the process-local sets below; a full set is cleared.
 const MAX_TRACKED_POLICIES: usize = 65_536;
+/// Background classifications running at once, process-wide. A first use
+/// that finds no free slot starts none (and doesn't back off); a later use
+/// retries.
+const MAX_BACKGROUND_CLASSIFICATIONS: usize = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BindingState {
@@ -673,6 +677,8 @@ pub(super) struct OwnerAuthorityState {
     final_policies: std::sync::Mutex<HashMap<String, BindingState>>,
     /// Policies with a background classification running.
     in_flight: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Slots for background classifications.
+    background: BackgroundSlots,
     /// Policies whose last classification was not final, until when.
     retry_after: std::sync::Mutex<HashMap<String, tokio::time::Instant>>,
 }
@@ -718,6 +724,51 @@ impl OwnerAuthorityState {
             policy_cid.to_owned(),
             tokio::time::Instant::now() + RETRY_BACKOFF,
         );
+    }
+}
+
+/// The process-wide limit on background classifications.
+pub(super) struct BackgroundSlots(Arc<tokio::sync::Semaphore>);
+
+impl Default for BackgroundSlots {
+    fn default() -> Self {
+        Self(Arc::new(tokio::sync::Semaphore::new(
+            MAX_BACKGROUND_CLASSIFICATIONS,
+        )))
+    }
+}
+
+/// A running background classification: holds a slot and the policy's
+/// in-flight mark, and releases both when dropped, including when the task
+/// panics.
+struct InFlight {
+    state: Arc<OwnerAuthorityState>,
+    policy_cid: String,
+    _slot: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl InFlight {
+    /// Claim a slot and the policy's mark; `None` when the policy is
+    /// already in flight, or no slot is free.
+    fn claim(state: &Arc<OwnerAuthorityState>, policy_cid: &str) -> Option<Self> {
+        let slot = Arc::clone(&state.background.0).try_acquire_owned().ok()?;
+        let mut in_flight = state.in_flight.lock().expect("owner-authority in-flight");
+        if in_flight.len() >= MAX_TRACKED_POLICIES || !in_flight.insert(policy_cid.to_owned()) {
+            return None;
+        }
+        Some(Self {
+            state: Arc::clone(state),
+            policy_cid: policy_cid.to_owned(),
+            _slot: slot,
+        })
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        if let Ok(mut in_flight) = self.state.in_flight.lock() {
+            in_flight.remove(&self.policy_cid);
+        }
     }
 }
 
@@ -882,9 +933,10 @@ impl PolicyV3Runtime {
 
     /// Request path: make sure `registration` gets classified, without
     /// waiting for it. A policy whose stored classification is final costs
-    /// nothing; otherwise one background task per policy classifies it, and
-    /// a result that is not final (a failed write, `starved`) holds off the
-    /// next attempt for [`RETRY_BACKOFF`].
+    /// nothing; otherwise one background task per policy (and at most
+    /// [`MAX_BACKGROUND_CLASSIFICATIONS`] in all) classifies it, and a result
+    /// that is not final (a failed write, `starved`) holds off the next
+    /// attempt for [`RETRY_BACKOFF`].
     pub(super) fn note_owner_binding(
         &self,
         registration: &policy_v3_registration::Model,
@@ -894,25 +946,15 @@ impl PolicyV3Runtime {
         if state.is_final(policy_cid) || state.backing_off(policy_cid) {
             return None;
         }
-        {
-            let mut in_flight = state.in_flight.lock().expect("owner-authority in-flight");
-            if in_flight.len() >= MAX_TRACKED_POLICIES || !in_flight.insert(policy_cid.clone()) {
-                return None;
-            }
-        }
+        let claim = InFlight::claim(state, policy_cid)?;
         let runtime = self.clone();
         let registration = registration.clone();
         Some(tokio::spawn(async move {
+            let _claim = claim;
             let result = runtime.owner_binding(&registration).await;
-            let state = &runtime.owner_authority;
             if !result.is_ok_and(|classification| classification.is_final()) {
-                state.back_off(&registration.policy_cid);
+                runtime.owner_authority.back_off(&registration.policy_cid);
             }
-            state
-                .in_flight
-                .lock()
-                .expect("owner-authority in-flight")
-                .remove(&registration.policy_cid);
         }))
     }
 
@@ -1414,6 +1456,47 @@ mod tests {
         }
         tokio::task::yield_now().await;
         assert_eq!(queries.load(Ordering::SeqCst), before);
+    }
+
+    /// At most a few classifications run in the background at once; a use
+    /// that finds no free slot starts none and doesn't back off.
+    #[tokio::test]
+    async fn background_classifications_are_limited_without_backing_off() {
+        let (runtime, _) = counted_runtime().await;
+        let registration = registration(&runtime, "policy-busy").await;
+        let held = (0..MAX_BACKGROUND_CLASSIFICATIONS)
+            .map(|_| {
+                Arc::clone(&runtime.owner_authority.background.0)
+                    .try_acquire_owned()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(runtime.note_owner_binding(&registration).is_none());
+        assert!(runtime.owner_authority.in_flight.lock().unwrap().is_empty());
+        drop(held);
+        assert!(
+            runtime.note_owner_binding(&registration).is_some(),
+            "no back-off after a busy skip"
+        );
+    }
+
+    /// A background classification that panics releases its policy and
+    /// its slot.
+    #[tokio::test]
+    async fn a_panicking_classification_releases_its_claim() {
+        let (runtime, _) = counted_runtime().await;
+        let claim = InFlight::claim(&runtime.owner_authority, "policy-panics").unwrap();
+        let result = tokio::spawn(async move {
+            let _claim = claim;
+            panic!("classification failed");
+        })
+        .await;
+        assert!(result.unwrap_err().is_panic());
+        assert!(runtime.owner_authority.in_flight.lock().unwrap().is_empty());
+        assert_eq!(
+            runtime.owner_authority.background.0.available_permits(),
+            MAX_BACKGROUND_CLASSIFICATIONS
+        );
     }
 
     /// A classification that is not final (here it cannot even be computed)
