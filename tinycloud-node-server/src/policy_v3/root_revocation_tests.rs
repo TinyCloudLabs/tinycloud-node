@@ -16,6 +16,9 @@ const POLICY_ENFORCEMENT: &str = "policy-enforcement";
 
 /// A registered policy with an admitted session that reads, and a re-shared
 /// child that reads.
+/// The generic route's refusal of a principal that may not revoke.
+const UNAUTHORIZED_REVOKER: &str = "Unauthorized Revoker";
+
 struct Admitted {
     policy: Registered,
     session: String,
@@ -107,15 +110,28 @@ async fn the_space_owner_wallet_revokes_an_agent_signed_root(
         return Ok(());
     };
     let admitted = admitted(&h).await?;
-    // Policy sessions hold only kv and decrypt: no hook ticket, so no stream
-    // to close.
+    assert_no_hook_ticket(&h, &admitted, "Unauthorized Action").await?;
+    h.revoke(&h.space_owner, &admitted.policy.policy_root_cid)
+        .await?;
+    assert_root_revoked_cascade(&h, &admitted).await?;
+    // Now the chain check refuses it first.
+    assert_no_hook_ticket(&h, &admitted, "delegation-ancestor-revoked").await
+}
+
+/// Policy sessions hold only kv and decrypt, so a hook ticket over one is
+/// refused (401, with the cause `refusal` names): there is no hook stream
+/// to close after a root revocation.
+async fn assert_no_hook_ticket(
+    h: &Harness,
+    admitted: &Admitted,
+    refusal: &str,
+) -> anyhow::Result<()> {
     let (status, body) = h
         .hook_ticket(&[session_cid(&admitted.session)?.to_string()])
         .await?;
-    assert_ne!(status, Status::Ok, "{body}");
-    h.revoke(&h.space_owner, &admitted.policy.policy_root_cid)
-        .await?;
-    assert_root_revoked_cascade(&h, &admitted).await
+    assert_eq!(status, Status::Unauthorized, "{body}");
+    assert!(body.starts_with(refusal), "{body}");
+    Ok(())
 }
 on_both_backends!(the_space_owner_wallet_revokes_an_agent_signed_root);
 
@@ -181,9 +197,10 @@ async fn others_cannot_revoke_a_policy_root(backend: Backend) -> anyhow::Result<
         ("recipient", &h.holder),
     ] {
         let (status, body) = h.post_revoke(signer.revoke(&root)?).await;
-        assert!(
-            [Status::Unauthorized, Status::Forbidden].contains(&status),
-            "{label} generic: {status} {body}"
+        assert_eq!(
+            (status, body.as_str()),
+            (Status::Forbidden, UNAUTHORIZED_REVOKER),
+            "{label} generic"
         );
         let (status, body) = h.revoke_root_json(signer, &root, POLICY_AUTHORITY).await?;
         assert_eq!(status, Status::Forbidden, "{label} JSON: {body}");
@@ -241,9 +258,10 @@ async fn a_revoke_control_naming_the_network_revokes_a_policy_root(
             assert_eq!(status, Status::Ok, "{body}");
             assert_root_revoked_cascade(&h, &admitted).await?;
         } else {
-            assert!(
-                [Status::Unauthorized, Status::Forbidden].contains(&status),
-                "space-only control: {status} {body}"
+            assert_eq!(
+                (status, body.as_str()),
+                (Status::Forbidden, UNAUTHORIZED_REVOKER),
+                "space-only control"
             );
             assert_root_live(&h, &admitted).await?;
         }
@@ -268,6 +286,19 @@ async fn the_json_route_keeps_its_signer_and_enforcer_rules(
         return Ok(());
     };
     let first = admitted(&h).await?;
+    // The enforcer is the delegatee of the enforcement root. The generic
+    // route refuses a delegatee on either root.
+    for root in [
+        &first.policy.policy_root_cid,
+        &first.policy.enforcement_root_cid,
+    ] {
+        let (status, body) = h.post_revoke(h.enforcer.revoke(root)?).await;
+        assert_eq!(
+            (status, body.as_str()),
+            (Status::Forbidden, UNAUTHORIZED_REVOKER)
+        );
+    }
+    assert_root_live(&h, &first).await?;
     let (status, body) = h
         .revoke_root_json(&h.enforcer, &first.policy.policy_root_cid, POLICY_AUTHORITY)
         .await?;

@@ -28,6 +28,11 @@ principals get 403. The revocation applies on every later use:
   a decrypt gets the core `401 delegation-ancestor-revoked`;
 - challenge and mint are refused.
 
+A policy session grants only kv and decrypt, so it can't mint a hook ticket
+(`401 Unauthorized Action`). There is then no hook stream to close, and the
+300-second bound for open streams after a JSON-route revocation doesn't apply
+to policy roots.
+
 ## JSON route (`RootRevocation/v1`)
 
 Only the root's own signer may use it, or the enforcer for the enforcement
@@ -53,3 +58,8 @@ error, so this route is not a confirmation. Renewal (`POST
 /policy/v3/status`) returns `409 root-revoked`.
 
 After a JSON-route revocation, both `state` values are `revoked`.
+
+The released SDK parser also rejects a checkpoint whose `freshUntil` is more
+than 300 seconds after `checkedAt`. The node sets `freshUntil` to the root's
+expiry, so the parser may reject a root that lives longer than 5 minutes even
+while it is active (TC-1450).

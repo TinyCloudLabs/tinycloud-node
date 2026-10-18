@@ -5,9 +5,6 @@
 //! PostgreSQL runs need `TINYCLOUD_TEST_POSTGRES_URL` (each test uses its own
 //! schema); they are skipped when it is unset outside CI.
 
-// Shared by several test modules; each uses a subset.
-#![allow(dead_code)]
-
 use super::*;
 use rocket::{
     figment::{providers::Serialized, Figment},
@@ -29,7 +26,7 @@ use tinycloud_auth::{
     ssi::{claims::jwt::NumericDate, ucan::Payload},
     ucan_capabilities_object::Capabilities,
 };
-use tinycloud_core::sea_orm::{ConnectOptions, Database, DbBackend, Statement};
+use tinycloud_core::sea_orm::{ConnectOptions, Database};
 
 type Cid = tinycloud_auth::ipld_core::cid::Cid;
 
@@ -86,9 +83,8 @@ pub(super) fn unique(label: &str) -> String {
     )
 }
 
-/// A database the production app can be booted on, more than once.
+/// A database the production app is booted on.
 pub(super) struct TestDatabase {
-    pub backend: Backend,
     url: String,
     _dir: tempfile::TempDir,
 }
@@ -114,11 +110,7 @@ impl TestDatabase {
                 parsed.to_string()
             }
         };
-        Ok(Some(Self {
-            backend,
-            url,
-            _dir: dir,
-        }))
+        Ok(Some(Self { url, _dir: dir }))
     }
 
     pub fn url(&self) -> &str {
@@ -150,8 +142,6 @@ pub(super) enum Signer {
 pub(super) struct Window {
     pub not_before: OffsetDateTime,
     pub expiry: OffsetDateTime,
-    /// The CACAO issue time; UCANs carry none.
-    pub issued_at: Option<OffsetDateTime>,
 }
 
 impl Window {
@@ -159,13 +149,7 @@ impl Window {
         Self {
             not_before: now() - Duration::seconds(30),
             expiry,
-            issued_at: None,
         }
-    }
-
-    pub fn issued(mut self, issued_at: OffsetDateTime) -> Self {
-        self.issued_at = Some(issued_at);
-        self
     }
 }
 
@@ -311,7 +295,7 @@ impl Signer {
                 let message = recap.build_message(self.siwe_message(
                     audience,
                     &nonce,
-                    window.issued_at.unwrap_or(window.not_before),
+                    window.not_before,
                     Some(window.not_before),
                     window.expiry,
                 )?)?;
@@ -415,13 +399,12 @@ pub(super) enum Shape {
     /// A did:pkh space owner signs SIWE to the policy owner's key, as Share
     /// and the CLI do.
     PkhSession,
-    /// The policy owner owns the content space.
-    SpaceOwner,
 }
 
 pub(super) struct Harness {
     pub client: Client,
-    pub db: TestDatabase,
+    /// Kept for the app's lifetime (the SQLite directory).
+    _db: TestDatabase,
     pub space_owner: Signer,
     /// The policy owner (a key: it signs the policy and its roots).
     pub owner: Signer,
@@ -434,26 +417,8 @@ pub(super) struct Harness {
     vector: Value,
 }
 
-/// Settings for one boot of the production app.
-#[derive(Clone, Default)]
-pub(super) struct Boot {
-    /// The `[policy_v3]` section, passed through figment.
-    pub policy_v3: Option<Value>,
-    /// The `[hooks]` section, passed through figment.
-    pub hooks: Option<Value>,
-}
-
 impl Harness {
     pub async fn new(backend: Backend, shape: Shape, test: &str) -> anyhow::Result<Option<Self>> {
-        Self::with_boot(backend, shape, test, Boot::default()).await
-    }
-
-    pub async fn with_boot(
-        backend: Backend,
-        shape: Shape,
-        test: &str,
-        boot: Boot,
-    ) -> anyhow::Result<Option<Self>> {
         let Some(db) = TestDatabase::new(backend, test).await? else {
             return Ok(None);
         };
@@ -465,21 +430,6 @@ impl Harness {
         let space_owner = match shape {
             Shape::KeySession => Signer::key(),
             Shape::PkhSession => Signer::pkh(),
-            // The same key: a separate value keeps the struct simple.
-            Shape::SpaceOwner => match &owner {
-                Signer::Key {
-                    keypair,
-                    jwk,
-                    did,
-                    vm,
-                } => Signer::Key {
-                    keypair: keypair.clone(),
-                    jwk: jwk.clone(),
-                    did: did.clone(),
-                    vm: vm.clone(),
-                },
-                Signer::Pkh { .. } => unreachable!(),
-            },
         };
         let content_space = SpaceId::new(
             space_owner.did().parse::<DIDBuf>()?,
@@ -492,10 +442,10 @@ impl Harness {
             None,
         );
         let network = format!("urn:tinycloud:encryption:{}:mainnet", space_owner.did());
-        let client = Self::boot_app(&db, &vector, &issuer, &boot).await?;
+        let client = Self::boot_app(&db, &vector, &issuer).await?;
         let harness = Self {
             client,
-            db,
+            _db: db,
             space_owner,
             owner,
             holder: Signer::key(),
@@ -514,7 +464,6 @@ impl Harness {
         db: &TestDatabase,
         vector: &Value,
         issuer: &tinycloud_core::libp2p::identity::ed25519::Keypair,
-        boot: &Boot,
     ) -> anyhow::Result<Client> {
         let mut config = crate::config::Config::default();
         config.storage.datadir = db.datadir().into();
@@ -535,34 +484,14 @@ impl Harness {
             .to_owned();
         config.share_email.issuer_public_key =
             Some(encode_config(issuer.public().to_bytes(), URL_SAFE_NO_PAD));
-        let mut figment = Figment::from(rocket::Config {
+        let figment = Figment::from(rocket::Config {
             address: "127.0.0.1".parse()?,
             log_level: rocket::config::LogLevel::Off,
             ..rocket::Config::default()
         })
         .merge(Serialized::defaults(&config));
-        if let Some(policy_v3) = &boot.policy_v3 {
-            figment = figment.merge(Serialized::default("policy_v3", policy_v3));
-        }
-        if let Some(hooks) = &boot.hooks {
-            figment = figment.merge(Serialized::default("hooks", hooks));
-        }
         let config: crate::config::Config = figment.extract()?;
         Ok(Client::tracked(crate::app_with_control(&figment, &config, None).await?).await?)
-    }
-
-    /// Boot the production app again on the same database.
-    pub async fn reboot(&mut self, boot: Boot) -> anyhow::Result<()> {
-        let client = Self::boot_app(&self.db, &self.vector, &self.issuer, &boot).await?;
-        self.client = client;
-        Ok(())
-    }
-
-    pub fn conn(&self) -> &tinycloud_core::RecoveringConnection {
-        self.client
-            .rocket()
-            .state::<tinycloud_core::RecoveringConnection>()
-            .expect("node pool")
     }
 
     pub fn node_did(&self) -> String {
@@ -1058,13 +987,6 @@ impl Harness {
         Ok(())
     }
 
-    fn backend(&self) -> DbBackend {
-        match self.db.backend {
-            Backend::Sqlite => DbBackend::Sqlite,
-            Backend::Postgres => DbBackend::Postgres,
-        }
-    }
-
     /// `POST /revoke` with an encoded revocation.
     pub async fn post_revoke(&self, authorization: String) -> (Status, String) {
         let response = self
@@ -1124,24 +1046,10 @@ impl Harness {
         let status = response.status();
         (status, response.into_string().await.unwrap_or_default())
     }
-
-    pub async fn execute(&self, sql: &str) -> anyhow::Result<()> {
-        self.conn()
-            .execute(Statement::from_string(self.backend(), sql.to_owned()))
-            .await?;
-        Ok(())
-    }
 }
 
 pub(super) fn policy_window() -> Window {
     Window::until(now() + Duration::days(1))
-}
-
-pub(super) fn assert_opaque(label: &str, body: &str) {
-    assert!(
-        !body.contains("bafy") && !body.contains("bafk") && !body.contains("did:"),
-        "{label} leaks an identifier: {body}"
-    );
 }
 
 pub(super) fn session_cid(session: &str) -> anyhow::Result<Cid> {
@@ -1250,28 +1158,6 @@ impl Harness {
         ))
     }
 
-    /// The holder asks for a signed KV URL under a session.
-    pub async fn signed_kv(&self, session: &str) -> anyhow::Result<(Status, String)> {
-        let invocation = self.holder.invoke(
-            serde_json::from_value(
-                attenuation_for_policy_capabilities(&[self.requested_kv()])
-                    .map_err(|(_, error)| anyhow::anyhow!(error))?,
-            )?,
-            session_cid(session)?,
-        )?;
-        let path = "shares/tc-1423/document.txt";
-        let response = self
-            .client
-            .post("/signed/kv")
-            .header(ContentType::JSON)
-            .header(Header::new("Authorization", invocation))
-            .body(json!({"space": self.content_space.to_string(), "path": path}).to_string())
-            .dispatch()
-            .await;
-        let status = response.status();
-        Ok((status, response.into_string().await.unwrap_or_default()))
-    }
-
     /// `/delegation/status` on `cid`, invoked by `signer`.
     pub async fn delegation_status(&self, signer: &Signer, cid: &str) -> anyhow::Result<Value> {
         let Signer::Key { jwk, vm, did, .. } = signer else {
@@ -1316,30 +1202,6 @@ impl Harness {
 }
 
 impl Harness {
-    /// The space owner grants the holder hooks subscription on the content
-    /// prefix; returns the grant CIDs.
-    pub async fn grant_hooks(&self, count: usize) -> anyhow::Result<Vec<String>> {
-        let resource = self.content_space.clone().to_resource(
-            "hooks".parse()?,
-            Some("kv/shares".parse()?),
-            None,
-            None,
-        );
-        let mut grants = Vec::new();
-        for _ in 0..count {
-            grants.push(
-                self.import(self.space_owner.delegate(
-                    self.holder.did(),
-                    &[(resource.to_string(), "tinycloud.hooks/subscribe")],
-                    Window::until(now() + Duration::hours(2)),
-                    &[],
-                )?)
-                .await?,
-            );
-        }
-        Ok(grants)
-    }
-
     /// The holder mints a hook ticket on the content prefix citing `proofs`.
     pub async fn hook_ticket(&self, proofs: &[String]) -> anyhow::Result<(Status, String)> {
         let resource = self.content_space.clone().to_resource(
@@ -1388,48 +1250,5 @@ impl Harness {
         let status = response.status();
         let body = response.into_string().await.unwrap_or_default();
         Ok((status, body))
-    }
-
-    /// The holder writes the content again, emitting a hook event.
-    pub async fn write_content(&self, body: &'static [u8]) -> anyhow::Result<()> {
-        let grant = self
-            .import(self.space_owner.delegate(
-                self.holder.did(),
-                &[(self.content_resource.to_string(), "tinycloud.kv/put")],
-                Window::until(now() + Duration::hours(1)),
-                &[],
-            )?)
-            .await?;
-        let Signer::Key { jwk, vm, .. } = &self.holder else {
-            unreachable!()
-        };
-        let write = make_invocation(
-            [(
-                self.content_resource.clone(),
-                ["tinycloud.kv/put".parse::<RecapAbility>()?],
-            )],
-            &grant.parse()?,
-            jwk,
-            vm,
-            (now() + Duration::seconds(45)).unix_timestamp() as f64,
-            InvocationOptions {
-                nonce: Some(unique("tc1423write")),
-                ..InvocationOptions::default()
-            },
-        )?;
-        let response = self
-            .client
-            .post("/invoke")
-            .header(Header::new("Authorization", write.encode()?))
-            .header(ContentType::Plain)
-            .body(body)
-            .dispatch()
-            .await;
-        anyhow::ensure!(
-            response.status() == Status::Ok,
-            "write: {}",
-            response.status()
-        );
-        Ok(())
     }
 }
