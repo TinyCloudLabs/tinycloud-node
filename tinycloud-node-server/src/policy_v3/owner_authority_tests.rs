@@ -1900,3 +1900,343 @@ async fn insert_synthetic(
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// N2: the root-lifetime cap, the record/enforce mode and the advertised mode.
+// ---------------------------------------------------------------------------
+
+fn boot(policy_v3: Value) -> Boot {
+    Boot {
+        policy_v3: Some(policy_v3),
+    }
+}
+
+fn enforce_boot() -> Boot {
+    boot(json!({"owner_authority_expiry": "enforce"}))
+}
+
+/// The process-wide value of a Prometheus counter series (0 when absent).
+fn counter(name: &str, labels: &[(&str, &str)]) -> f64 {
+    prometheus::gather()
+        .iter()
+        .filter(|family| family.get_name() == name)
+        .flat_map(|family| family.get_metric())
+        .filter(|metric| {
+            labels.iter().all(|(key, value)| {
+                metric
+                    .get_label()
+                    .iter()
+                    .any(|label| label.get_name() == *key && label.get_value() == *value)
+            })
+        })
+        .map(|metric| metric.get_counter().get_value())
+        .sum()
+}
+
+/// Set a registration's `registered_at`, as for one registered earlier.
+async fn backdate(
+    h: &Harness,
+    policy_cid: &str,
+    registered_at: OffsetDateTime,
+) -> anyhow::Result<()> {
+    let update = Query::update()
+        .table(Alias::new("policy_v3_registration"))
+        .value(Alias::new("registered_at"), format_time(registered_at))
+        .and_where(Expr::col(Alias::new("policy_cid")).eq(policy_cid))
+        .to_owned();
+    h.conn().execute(h.backend().build(&update)).await?;
+    Ok(())
+}
+
+/// [F2][C2] Roots are capped at registration time + 31 days (+5 minutes of
+/// skew) with `nbf <= exp`, in both modes; a root shaped like a released
+/// SDK's is accepted.
+async fn root_lifetime_is_capped_in_both_modes(backend: Backend) -> anyhow::Result<()> {
+    for mode in ["record", "enforce"] {
+        let Some(h) = Harness::with_boot(
+            backend,
+            Shape::KeySession,
+            "root_lifetime_is_capped_in_both_modes",
+            boot(json!({"owner_authority_expiry": mode})),
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+        h.grant_owner(Window::until(now() + Duration::days(800)))
+            .await?;
+        let base = now();
+        for (label, root) in [
+            ("32 days", Window::until(base + Duration::days(32))),
+            (
+                "not before in a year, 30-day window",
+                Window {
+                    not_before: base + Duration::days(365),
+                    expiry: base + Duration::days(395),
+                    issued_at: None,
+                },
+            ),
+            (
+                "not before after expiry",
+                Window {
+                    not_before: base + Duration::days(2),
+                    expiry: base + Duration::days(1),
+                    issued_at: None,
+                },
+            ),
+        ] {
+            let refused = counter("tinycloud_policy_root_lifetime_refused_total", &[]);
+            let (status, body, registered) = h.register(root).await?;
+            assert_eq!(status, Status::Forbidden, "{mode} {label}: {body}");
+            assert_eq!(body, "policy-root-lifetime-exceeded", "{mode} {label}");
+            assert!(counter("tinycloud_policy_root_lifetime_refused_total", &[]) >= refused + 1.0);
+            assert_eq!(h.binding(&registered.policy_cid).await?, None);
+        }
+        // A released SDK signs `nbf` at signing time with `exp - nbf <= 31 d`.
+        let signed_at = now() - Duration::seconds(10);
+        let released = h
+            .register_ok(Window {
+                not_before: signed_at,
+                expiry: signed_at + Duration::days(31),
+                issued_at: None,
+            })
+            .await?;
+        let binding = h.binding(&released.policy_cid).await?.expect("binding");
+        assert_eq!(binding.registered_mode, mode);
+    }
+    Ok(())
+}
+on_both_backends!(root_lifetime_is_capped_in_both_modes);
+
+/// A root that outlives its authority: `enforce` refuses it; `record`
+/// stores it uncapped and counts it in the flip signal.
+async fn enforce_refuses_roots_outliving_their_authority(backend: Backend) -> anyhow::Result<()> {
+    let Some(h) = Harness::with_boot(
+        backend,
+        Shape::KeySession,
+        "enforce_refuses_roots_outliving_their_authority",
+        enforce_boot(),
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    h.grant_owner(Window::until(now() + Duration::seconds(90)))
+        .await?;
+    let (status, body, registered) = h.register(policy_window()).await?;
+    assert_eq!(status, Status::Forbidden, "{body}");
+    assert_eq!(body, "policy-root-outlives-owner-authority");
+    assert_eq!(h.binding(&registered.policy_cid).await?, None);
+
+    let Some(h) = Harness::new(
+        backend,
+        Shape::KeySession,
+        "enforce_refuses_roots_outliving_their_authority",
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    h.grant_owner(Window::until(now() + Duration::seconds(90)))
+        .await?;
+    let series = [("authority_ttl_bucket", "le_1h")];
+    let exceeded = counter(
+        "tinycloud_policy_owner_authority_expiry_exceeded_total",
+        &series,
+    );
+    let policy = h.register_ok(policy_window()).await?;
+    let binding = h.binding(&policy.policy_cid).await?.expect("binding");
+    assert_eq!(binding.state, "bound-uncapped");
+    assert_eq!(binding.registered_mode, "record");
+    assert!(
+        counter(
+            "tinycloud_policy_owner_authority_expiry_exceeded_total",
+            &series
+        ) >= exceeded + 1.0
+    );
+    Ok(())
+}
+on_both_backends!(enforce_refuses_roots_outliving_their_authority);
+
+/// [F9] Under `enforce`, an older grant that outlives the root is chosen
+/// over a newer one that does not, so the registration is accepted.
+async fn enforce_chooses_the_grant_that_outlives_the_root(backend: Backend) -> anyhow::Result<()> {
+    let Some(h) = Harness::with_boot(
+        backend,
+        Shape::PkhSession,
+        "enforce_chooses_the_grant_that_outlives_the_root",
+        enforce_boot(),
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let long = h
+        .grant_owner(Window::until(now() + Duration::days(2)).issued(now() - Duration::minutes(10)))
+        .await?;
+    h.grant_owner(Window::until(now() + Duration::hours(1)).issued(now() - Duration::minutes(1)))
+        .await?;
+    let policy = h.register_ok(policy_window()).await?;
+    let binding = h.binding(&policy.policy_cid).await?.expect("binding");
+    assert_eq!(binding.state, "bound");
+    assert_eq!(binding.registered_mode, "enforce");
+    assert_eq!(h.closure(&policy.policy_cid).await?, vec![long]);
+    Ok(())
+}
+on_both_backends!(enforce_chooses_the_grant_that_outlives_the_root);
+
+/// `GET /info` advertises the capability marker and exactly one mode.
+async fn info_advertises_the_owner_authority_mode(backend: Backend) -> anyhow::Result<()> {
+    for (boot, expected, absent) in [
+        (
+            Boot::default(),
+            "policy-owner-authority-record",
+            "policy-owner-authority-enforce",
+        ),
+        (
+            enforce_boot(),
+            "policy-owner-authority-enforce",
+            "policy-owner-authority-record",
+        ),
+    ] {
+        let Some(h) = Harness::with_boot(
+            backend,
+            Shape::KeySession,
+            "info_advertises_the_owner_authority_mode",
+            boot,
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+        let response = h.client.get("/info").dispatch().await;
+        assert_eq!(response.status(), Status::Ok);
+        assert!(response.headers().get_one("Cache-Control").is_none());
+        let info: Value = response.into_json().await.unwrap();
+        let features = info["features"].as_array().unwrap();
+        let has = |feature: &str| features.iter().any(|value| value == feature);
+        assert!(has("policy-owner-authority-v1"), "{info}");
+        assert!(has(expected), "{info}");
+        assert!(!has(absent), "{info}");
+    }
+    Ok(())
+}
+on_both_backends!(info_advertises_the_owner_authority_mode);
+
+/// [F2] A legacy registration whose root outlives 31 days is classified as
+/// before and counted, not refused.
+async fn legacy_long_roots_are_counted_not_refused(backend: Backend) -> anyhow::Result<()> {
+    let Some(h) = Harness::new(
+        backend,
+        Shape::KeySession,
+        "legacy_long_roots_are_counted_not_refused",
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let registered_at = now() - Duration::days(40);
+    h.grant_owner(Window {
+        not_before: registered_at - Duration::days(1),
+        expiry: now() + Duration::days(2),
+        issued_at: None,
+    })
+    .await?;
+    let policy = h.register_ok(policy_window()).await?;
+    h.forget_binding(&policy.policy_cid).await?;
+    backdate(&h, &policy.policy_cid, registered_at).await?;
+    let counted = counter("tinycloud_policy_legacy_root_lifetime_exceeded_total", &[]);
+    let backfilled = counter(
+        "tinycloud_policy_owner_binding_backfill_total",
+        &[("outcome", "bound")],
+    );
+    assert_eq!(h.challenge(&policy).await.0, Status::Ok);
+    let binding = h.binding(&policy.policy_cid).await?.expect("classified");
+    assert_eq!(binding.registered_mode, "backfill");
+    assert_eq!(binding.state, "bound");
+    assert!(counter("tinycloud_policy_legacy_root_lifetime_exceeded_total", &[]) >= counted + 1.0);
+    assert!(
+        counter(
+            "tinycloud_policy_owner_binding_backfill_total",
+            &[("outcome", "bound")],
+        ) >= backfilled + 1.0
+    );
+    Ok(())
+}
+on_both_backends!(legacy_long_roots_are_counted_not_refused);
+
+/// [F6] A registration after the cutover with no classification (written by
+/// an older binary) gets the lifetime cap, unlike a legacy one.
+async fn post_cutover_unclassified_rows_get_the_lifetime_cap(
+    backend: Backend,
+) -> anyhow::Result<()> {
+    let Some(mut h) = Harness::new(
+        backend,
+        Shape::KeySession,
+        "post_cutover_unclassified_rows_get_the_lifetime_cap",
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let registered_at = now() - Duration::days(40);
+    h.grant_owner(Window {
+        not_before: registered_at - Duration::days(1),
+        expiry: now() + Duration::days(2),
+        issued_at: None,
+    })
+    .await?;
+    let policy = h.register_ok(policy_window()).await?;
+    h.forget_binding(&policy.policy_cid).await?;
+    backdate(&h, &policy.policy_cid, registered_at).await?;
+    h.reboot(boot(json!({
+        "legacy_cutover": format_time(now() - Duration::days(60)),
+    })))
+    .await?;
+    h.challenge(&policy).await;
+    let binding = h.binding(&policy.policy_cid).await?.expect("classified");
+    assert_eq!(binding.registered_mode, "record");
+    assert_eq!(binding.state, "unknown");
+    assert_eq!(binding.unknown_reason.as_deref(), Some("lifetime-exceeded"));
+    Ok(())
+}
+on_both_backends!(post_cutover_unclassified_rows_get_the_lifetime_cap);
+
+/// [F6] Under `enforce`, a post-cutover unclassified row whose root outlives
+/// its only authority is recorded `unknown`.
+async fn post_cutover_rows_outliving_their_authority_are_unknown_under_enforce(
+    backend: Backend,
+) -> anyhow::Result<()> {
+    let Some(mut h) = Harness::new(
+        backend,
+        Shape::KeySession,
+        "post_cutover_rows_outliving_their_authority_are_unknown_under_enforce",
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    h.grant_owner(Window::until(now() + Duration::seconds(90)))
+        .await?;
+    let policy = h.register_ok(policy_window()).await?;
+    assert_eq!(
+        h.binding(&policy.policy_cid).await?.unwrap().state,
+        "bound-uncapped"
+    );
+    h.forget_binding(&policy.policy_cid).await?;
+    h.reboot(boot(json!({
+        "owner_authority_expiry": "enforce",
+        "legacy_cutover": format_time(now() - Duration::days(1)),
+    })))
+    .await?;
+    h.challenge(&policy).await;
+    let binding = h.binding(&policy.policy_cid).await?.expect("classified");
+    assert_eq!(binding.registered_mode, "enforce");
+    assert_eq!(binding.state, "unknown");
+    assert_eq!(
+        binding.unknown_reason.as_deref(),
+        Some("outlives-authority")
+    );
+    Ok(())
+}
+on_both_backends!(post_cutover_rows_outliving_their_authority_are_unknown_under_enforce);
