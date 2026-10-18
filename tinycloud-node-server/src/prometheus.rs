@@ -32,12 +32,28 @@ pub fn observe_did_resolution_refused(method: &str, reason: &str) {
         .inc();
 }
 
+/// A Policy/v3 registration refused because one of its encryption networks
+/// is not the content owner's active network on this node. `reason` is a
+/// fixed label: `unparsable`, `legacy_resource`, `foreign_owner`, `missing`
+/// or `inactive`.
+pub fn observe_policy_source_network_refused(reason: &'static str) {
+    POLICY_SOURCE_NETWORK_REFUSED
+        .with_label_values(&[reason])
+        .inc();
+}
+
 lazy_static! {
     pub static ref DID_RESOLUTION_REFUSED: IntCounterVec = register_int_counter_vec!(
         "tinycloud_did_resolution_refused_total",
         "UCAN issuer resolution refusals by method and reason.",
         &["method", "reason"]
     ).unwrap();
+    pub static ref POLICY_SOURCE_NETWORK_REFUSED: IntCounterVec = register_int_counter_vec!(
+        "tinycloud_policy_source_network_refused_total",
+        "Policy/v3 registrations refused because an encryption network is not the content owner's active network on this node, by reason.",
+        &["reason"]
+    )
+    .unwrap();
     pub static ref REQUEST_HISTOGRAM: HistogramVec = register_histogram_vec!(
         "tinycloud_http_request_duration_seconds",
         "HTTP request latencies in seconds.",

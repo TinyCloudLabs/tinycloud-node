@@ -10423,3 +10423,7 @@ mod tests {
 #[cfg(test)]
 #[path = "policy_v3/account_alias_tests.rs"]
 mod account_alias_tests;
+
+#[cfg(test)]
+#[path = "policy_v3/source_network_tests.rs"]
+mod source_network_tests;
