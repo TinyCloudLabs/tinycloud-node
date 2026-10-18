@@ -52,7 +52,8 @@
     "SQL busy: hydration": "sql_busy_hydration",
     "SQL busy: artifact transfer": "sql_busy_artifact_transfer",
     "Request deadline exceeded": "request_timeout",
-    "Request completed after its deadline": "deadline_overrun"
+    "Request completed after its deadline": "deadline_overrun",
+    "Database hydration gave up loading its artifact": "sql_hydration_timeout"
   },
   "prefix": {
     "dstack socket available but get_info failed: ": "dstack_get_info_failed",

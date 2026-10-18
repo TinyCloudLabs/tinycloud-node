@@ -1777,4 +1777,133 @@ mod retry_after_fairing_tests {
             assert!(!response.into_string().await.unwrap().is_empty(), "{path}");
         }
     }
+
+    /// An artifact store that never answers, so a cold SQL database never
+    /// finishes hydrating.
+    struct StalledArtifacts;
+
+    #[async_trait::async_trait]
+    impl tinycloud_core::database_artifacts::DatabaseArtifactRepository for StalledArtifacts {
+        async fn load(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<
+            Option<tinycloud_core::database_artifacts::DatabaseArtifact>,
+            tinycloud_core::database_artifacts::DatabaseArtifactError,
+        > {
+            std::future::pending().await
+        }
+
+        async fn save(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: Vec<u8>,
+            _: tinycloud_core::database_artifacts::ArtifactExpectation,
+        ) -> Result<
+            tinycloud_core::database_artifacts::DatabaseArtifact,
+            tinycloud_core::database_artifacts::DatabaseArtifactError,
+        > {
+            std::future::pending().await
+        }
+
+        async fn save_delta(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: Vec<u8>,
+            _: tinycloud_core::database_artifacts::ArtifactExpectation,
+        ) -> Result<
+            tinycloud_core::database_artifacts::DeltaSave,
+            tinycloud_core::database_artifacts::DatabaseArtifactError,
+        > {
+            std::future::pending().await
+        }
+    }
+
+    /// A SQL read through the `/invoke` deadline wrapper and the real SQL
+    /// service, as the route runs it.
+    #[rocket::post("/stalled-sql")]
+    async fn stalled_sql(
+        config: &rocket::State<crate::config::Config>,
+        sql: &rocket::State<tinycloud_core::sql::SqlService>,
+        space: &rocket::State<tinycloud_auth::resource::SpaceId>,
+    ) -> Result<String, routes::InvokeError> {
+        routes::with_invoke_deadline(
+            config,
+            Box::pin(async move {
+                sql.execute(
+                    space,
+                    "a",
+                    tinycloud_core::sql::SqlRequest::Query {
+                        sql: "SELECT 1".into(),
+                        params: Vec::new(),
+                        max_rows: None,
+                        max_bytes: None,
+                    },
+                    None,
+                    "tinycloud.sql/read".into(),
+                )
+                .await
+                .map(|_| "served".to_string())
+                .map_err(|error| (routes::sql_error_to_status(&error), error.to_string()).into())
+            }),
+        )
+        .await
+    }
+
+    /// TC-1274: over HTTP, a SQL request stalled in hydration is answered at
+    /// the deadline with `503 request_timeout`, `Retry-After: 1` and CORS.
+    #[tokio::test]
+    async fn a_stalled_sql_request_is_answered_at_its_deadline() {
+        use tinycloud_auth::{
+            resolver::DID_METHODS,
+            ssi::{dids::DIDBuf, jwk::JWK},
+        };
+        let jwk = JWK::generate_ed25519().unwrap();
+        let did: DIDBuf = DID_METHODS.generate(&jwk, "key").unwrap();
+        let space = tinycloud_auth::resource::SpaceId::new(did, "default".parse().unwrap());
+        let cache = tempfile::TempDir::new().unwrap();
+        let sql = tinycloud_core::sql::SqlService::new(
+            cache.path().to_string_lossy().into_owned(),
+            u64::MAX,
+            std::sync::Arc::new(StalledArtifacts),
+        );
+        let mut config = crate::config::Config::default();
+        config.invocation.deadline_ms = 300;
+        let client = Client::tracked(
+            rocket::build()
+                .mount("/", rocket::routes![stalled_sql])
+                .manage(config)
+                .manage(sql)
+                .manage(space)
+                .attach(retry_after_fairing())
+                .attach(cors_fairing()),
+        )
+        .await
+        .expect("valid Rocket instance");
+
+        let started = std::time::Instant::now();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.post("/stalled-sql").dispatch(),
+        )
+        .await
+        .expect("the deadline must answer the request");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(response.status(), Status::ServiceUnavailable);
+        assert_eq!(response.headers().get_one("Retry-After"), Some("1"));
+        assert_eq!(
+            response.headers().get_one("Access-Control-Allow-Origin"),
+            Some("*")
+        );
+        assert_eq!(
+            response.into_string().await.unwrap(),
+            routes::REQUEST_TIMEOUT_BODY
+        );
+    }
 }

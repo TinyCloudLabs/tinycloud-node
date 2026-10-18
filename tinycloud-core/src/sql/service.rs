@@ -60,6 +60,57 @@ struct HydrationFlight {
 
 type HydrationRegistry = Arc<std::sync::Mutex<HashMap<(String, String), HydrationFlight>>>;
 
+/// Hydrations one [`SqlService::handle`] call may run before it gives up.
+const MAX_HYDRATIONS: usize = 2;
+
+/// Retires a hydration's registry entry and publishes how it ended (TC-1274).
+///
+/// Dropped without [`Self::finish`] (the hydration task panicked or its
+/// runtime shut down), it still retires the entry and reports a failure, so
+/// joiners get an error and the next request starts a fresh hydration instead
+/// of joining a dead one.
+struct RetireFlight {
+    service: SqlService,
+    key: (String, String),
+    phase: Arc<AtomicU8>,
+    sender: Option<tokio::sync::watch::Sender<Option<HydrationOutcome>>>,
+}
+
+impl RetireFlight {
+    fn finish(mut self, outcome: HydrationOutcome) {
+        self.retire(outcome);
+    }
+
+    fn retire(&mut self, outcome: HydrationOutcome) {
+        let Some(sender) = self.sender.take() else {
+            return;
+        };
+        let mut flights = self
+            .service
+            .hydrations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Only this flight's entry: the key is never re-registered while it
+        // is present, but compare anyway rather than assume.
+        if flights
+            .get(&self.key)
+            .is_some_and(|flight| Arc::ptr_eq(&flight.phase, &self.phase))
+        {
+            flights.remove(&self.key);
+        }
+        drop(flights);
+        sender.send_replace(Some(outcome));
+    }
+}
+
+impl Drop for RetireFlight {
+    fn drop(&mut self) {
+        self.retire(HydrationOutcome::Failed(
+            "database hydration ended abnormally".into(),
+        ));
+    }
+}
+
 /// How long a SQL request waits at each stage before it answers
 /// [`SqlError::Busy`] (TC-1274). Every wait is also cut short by the request
 /// deadline while the request has not started writing.
@@ -352,9 +403,9 @@ impl SqlService {
             (Ok(output), _) => Ok(output),
             (Err(_), Some(context)) if deadline.is_some() => {
                 context.set_stage(stage().into());
-                if context.cut() {
-                    context.log_timeout();
-                }
+                // Logged once, by whichever of this wait and the route's
+                // deadline claims the cut first.
+                context.cut();
                 Err(SqlError::RequestTimeout)
             }
             (Err(_), _) => {
@@ -468,7 +519,12 @@ impl SqlService {
     /// database warm.
     async fn handle(&self, space: &SpaceId, db_name: &str) -> Result<DatabaseHandle, SqlError> {
         let key = (space.to_string(), db_name.to_string());
-        loop {
+        let started = Instant::now();
+        // A hydration that ends `Ready` has published its actor, but an actor
+        // that cannot open its files deregisters itself at once. Hydrate at
+        // most twice, as before TC-1274, rather than reload the artifact in a
+        // loop while holding the operation lock.
+        for _ in 0..MAX_HYDRATIONS {
             if let Some(handle) = self.databases.get(&key).map(|h| h.clone()) {
                 return Ok(handle);
             }
@@ -488,15 +544,25 @@ impl SqlService {
                     .clone()
             };
             match self.join_hydration(flight).await? {
-                // The actor may have exited (idle) since; hydrate again.
                 HydrationOutcome::Ready => continue,
                 HydrationOutcome::Unavailable => return Err(SqlError::Unavailable),
                 HydrationOutcome::Failed(message) => return Err(SqlError::Internal(message)),
                 HydrationOutcome::TimedOut => {
-                    return Err(SqlError::Busy(SqlBusyStage::ArtifactTransfer))
+                    log_busy(
+                        SqlBusyStage::ArtifactTransfer,
+                        self.bounds.hydration_max,
+                        started.elapsed(),
+                    );
+                    return Err(SqlError::Busy(SqlBusyStage::ArtifactTransfer));
                 }
             }
         }
+        if let Some(handle) = self.databases.get(&key).map(|h| h.clone()) {
+            return Ok(handle);
+        }
+        Err(SqlError::Internal(
+            "database actor did not start after hydration".into(),
+        ))
     }
 
     /// Wait for a hydration to end, at most the hydration bound.
@@ -524,17 +590,17 @@ impl SqlService {
     fn start_hydration(&self, space: &SpaceId, db_name: &str) -> HydrationFlight {
         let (sender, outcome) = tokio::sync::watch::channel(None);
         let phase = Arc::new(AtomicU8::new(PHASE_LOADING));
+        let retire = RetireFlight {
+            service: self.clone(),
+            key: (space.to_string(), db_name.to_string()),
+            phase: Arc::clone(&phase),
+            sender: Some(sender),
+        };
         let service = self.clone();
-        let task_phase = Arc::clone(&phase);
         let (space, db_name) = (space.clone(), db_name.to_string());
         let task = async move {
-            let ended = service.hydrate(&space, &db_name, &task_phase).await;
-            service
-                .hydrations
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&(space.to_string(), db_name));
-            sender.send_replace(Some(ended));
+            let ended = service.hydrate(&space, &db_name, &retire.phase).await;
+            retire.finish(ended);
         }
         .instrument(tracing::Span::current());
         match request_telemetry::current() {
@@ -905,7 +971,6 @@ fn begin_write() -> Result<(), SqlError> {
         return Ok(());
     };
     if context.is_open() && Instant::now() >= context.deadline() && context.cut() {
-        context.log_timeout();
         return Err(SqlError::RequestTimeout);
     }
     if context.latch() {
@@ -2537,6 +2602,8 @@ mod tests {
         inner: Arc<SeaOrmDatabaseArtifactRepository>,
         loads: std::sync::atomic::AtomicUsize,
         saves_waiting: std::sync::atomic::AtomicUsize,
+        /// Once through the gate, `load` fails as storage being unavailable.
+        fail_loads: std::sync::atomic::AtomicBool,
         load_open: tokio::sync::watch::Sender<bool>,
         save_open: tokio::sync::watch::Sender<bool>,
     }
@@ -2547,6 +2614,7 @@ mod tests {
                 inner,
                 loads: Default::default(),
                 saves_waiting: Default::default(),
+                fail_loads: Default::default(),
                 load_open: tokio::sync::watch::channel(true).0,
                 save_open: tokio::sync::watch::channel(true).0,
             })
@@ -2572,6 +2640,11 @@ mod tests {
         ) -> Result<Option<DatabaseArtifact>, DatabaseArtifactError> {
             self.loads.fetch_add(1, Ordering::SeqCst);
             Self::pass(&self.load_open).await;
+            if self.fail_loads.load(Ordering::SeqCst) {
+                return Err(DatabaseArtifactError::Db(DbErr::ConnectionAcquire(
+                    sea_orm::error::ConnAcquireErr::Timeout,
+                )));
+            }
             self.inner.load(service, space, name).await
         }
 
@@ -2762,6 +2835,7 @@ mod tests {
 
         repo.load_open.send_replace(true);
         assert_eq!(rows(read(&service, &space).await.unwrap()), 1);
+        assert_no_temp_files(cache.path());
     }
 
     #[tokio::test]
@@ -2793,7 +2867,16 @@ mod tests {
                     .await
             },
         ));
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // The write is latched before it reaches its save; once it waits
+        // there, run past the deadline before letting it finish.
+        tokio::time::timeout(PATIENCE, async {
+            while repo.saves_waiting.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the write must reach its save");
+        tokio::time::sleep(Duration::from_millis(300)).await;
         repo.save_open.send_replace(true);
         let outcome = tokio::time::timeout(PATIENCE, request)
             .await
@@ -2864,5 +2947,301 @@ mod tests {
         .await
         .expect("the dropped caller's write must still be persisted");
         assert_eq!(rows(read(&service, &space).await.unwrap()), 2);
+    }
+
+    /// TC-1274 B1: a save whose write statement is already on the wire when
+    /// its bound expires can still commit (PostgreSQL does not cancel it), so
+    /// the request must answer `outcome_unknown`, never a `sql_busy` that
+    /// invites a retry applying the write twice.
+    #[tokio::test]
+    async fn postgres_a_save_expiring_after_its_write_was_sent_is_an_unknown_outcome() {
+        use crate::sea_orm::{ConnectionTrait, TransactionTrait};
+        const TEST: &str =
+            "postgres_a_save_expiring_after_its_write_was_sent_is_an_unknown_outcome";
+        let Some(schema) = crate::test_support::PostgresTestSchema::new(TEST).await else {
+            return;
+        };
+        // One connection, so the delta UPDATE below is already prepared on it
+        // and the timed-out save's statement is executing, not still parsing.
+        let repo = Arc::new(SeaOrmDatabaseArtifactRepository::new(
+            schema.connect(1).await,
+        ));
+        let space = test_space_id("sql-save-in-flight");
+        let cache = TempDir::new().unwrap();
+        let service = SqlService::new(
+            cache.path().to_string_lossy().into_owned(),
+            u64::MAX,
+            repo.clone(),
+        )
+        .with_wait_bounds(SqlWaitBounds {
+            artifact_transfer: Duration::from_millis(500),
+            ..SqlWaitBounds::default()
+        });
+        for value in ["seed", "warm"] {
+            service
+                .execute(
+                    &space,
+                    "a",
+                    insert(value),
+                    None,
+                    "tinycloud.sql/write".into(),
+                )
+                .await
+                .unwrap();
+        }
+
+        // Readers pass; the save's UPDATE waits on the lock, already sent.
+        let locker = schema.connect(1).await;
+        let lock = locker.begin().await.unwrap();
+        lock.execute_unprepared("LOCK TABLE database_artifact IN EXCLUSIVE MODE")
+            .await
+            .unwrap();
+        let outcome = tokio::time::timeout(
+            PATIENCE,
+            service.execute(
+                &space,
+                "a",
+                insert("once"),
+                None,
+                "tinycloud.sql/write".into(),
+            ),
+        )
+        .await;
+        // Release before asserting: a failed assertion must not leave the
+        // lock held while the schema is dropped.
+        lock.commit().await.unwrap();
+        let err = outcome
+            .expect("the save's bound must expire")
+            .expect_err("a save that expired must fail");
+        assert!(matches!(err, SqlError::OutcomeUnknown), "{err:?}");
+
+        // Released, the write that was in flight commits on its own.
+        let cold_cache = TempDir::new().unwrap();
+        let cold = SqlService::new(
+            cold_cache.path().to_string_lossy().into_owned(),
+            u64::MAX,
+            repo,
+        );
+        tokio::time::timeout(PATIENCE, async {
+            loop {
+                let durable = rows(read(&cold, &space).await.unwrap());
+                if durable == 3 {
+                    break;
+                }
+                assert_eq!(durable, 2, "the write commits once or not yet");
+                cold.discard_local_state(&(space.to_string(), "a".to_string()))
+                    .await
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the in-flight write committed, which is why it is not retryable");
+    }
+
+    /// Hydration temp files (`<file>.tmp.<pid>.<n>`) left anywhere under
+    /// `dir` would mean a cache write was abandoned midway.
+    fn assert_no_temp_files(dir: &Path) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                assert_no_temp_files(&path);
+            } else {
+                let name = path.file_name().unwrap().to_string_lossy();
+                assert!(!name.contains(".tmp."), "leftover temp file {path:?}");
+            }
+        }
+    }
+
+    /// A hydration whose own load outlives `hydration_max` ends `TimedOut`:
+    /// its callers answer busy, its registry entry is retired, and the next
+    /// request starts a fresh hydration.
+    #[tokio::test]
+    async fn tc1274_a_hydration_past_its_own_bound_is_retired() {
+        let (inner, space) = seeded("sql-hydration-max").await;
+        let repo = GatedArtifactRepository::new(inner);
+        repo.load_open.send_replace(false);
+        let cache = TempDir::new().unwrap();
+        let service = SqlService::new(
+            cache.path().to_string_lossy().into_owned(),
+            u64::MAX,
+            repo.clone(),
+        )
+        .with_wait_bounds(SqlWaitBounds {
+            hydration_max: Duration::from_millis(200),
+            ..SqlWaitBounds::default()
+        });
+
+        let err = tokio::time::timeout(PATIENCE, read(&service, &space))
+            .await
+            .expect("the hydration's own bound must end the wait")
+            .expect_err("a hydration that timed out must fail");
+        assert!(
+            matches!(err, SqlError::Busy(SqlBusyStage::ArtifactTransfer)),
+            "{err:?}"
+        );
+        assert!(service.hydrations.lock().unwrap().is_empty());
+
+        repo.load_open.send_replace(true);
+        assert_eq!(rows(read(&service, &space).await.unwrap()), 1);
+        assert_eq!(repo.loads(), 2, "the next request hydrated afresh");
+        assert_no_temp_files(cache.path());
+    }
+
+    /// Every caller that joined a hydration sees how it failed.
+    #[tokio::test]
+    async fn tc1274_every_joiner_sees_a_failed_hydration() {
+        let (inner, space) = seeded("sql-joiners-fail").await;
+        let repo = GatedArtifactRepository::new(inner);
+        repo.load_open.send_replace(false);
+        repo.fail_loads.store(true, Ordering::SeqCst);
+        let cache = TempDir::new().unwrap();
+        let service = SqlService::new(
+            cache.path().to_string_lossy().into_owned(),
+            u64::MAX,
+            repo.clone(),
+        );
+
+        let first = tokio::spawn({
+            let (service, space) = (service.clone(), space.clone());
+            async move { read(&service, &space).await }
+        });
+        // The second caller queues behind the first on the operation lock
+        // and then joins the same failed hydration, or finds it retired and
+        // starts its own; either way it must fail like the first.
+        tokio::time::timeout(PATIENCE, async {
+            while repo.loads() == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the hydration must start");
+        let joiner = tokio::spawn({
+            let (service, space) = (service.clone(), space.clone());
+            async move {
+                let flight = service
+                    .hydrations
+                    .lock()
+                    .unwrap()
+                    .get(&(space.to_string(), "a".to_string()))
+                    .cloned()
+                    .expect("the hydration is in flight");
+                service.join_hydration(flight).await
+            }
+        });
+        repo.load_open.send_replace(true);
+        let first = tokio::time::timeout(PATIENCE, first)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(first, Err(SqlError::Unavailable)), "{first:?}");
+        let joined = tokio::time::timeout(PATIENCE, joiner)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(joined, Ok(HydrationOutcome::Unavailable)),
+            "{joined:?}"
+        );
+        assert_eq!(repo.loads(), 1, "one hydration served both");
+    }
+
+    /// Loads its artifact by panicking once, then normally.
+    struct PanickingArtifactRepository {
+        inner: Arc<SeaOrmDatabaseArtifactRepository>,
+        panicked: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl DatabaseArtifactRepository for PanickingArtifactRepository {
+        async fn load(
+            &self,
+            service: &str,
+            space: &str,
+            name: &str,
+        ) -> Result<Option<DatabaseArtifact>, DatabaseArtifactError> {
+            if !self.panicked.swap(true, Ordering::SeqCst) {
+                panic!("injected hydration panic");
+            }
+            self.inner.load(service, space, name).await
+        }
+
+        async fn save(
+            &self,
+            service: &str,
+            space: &str,
+            name: &str,
+            payload: Vec<u8>,
+            expected: ArtifactExpectation,
+        ) -> Result<DatabaseArtifact, DatabaseArtifactError> {
+            self.inner
+                .save(service, space, name, payload, expected)
+                .await
+        }
+
+        async fn save_delta(
+            &self,
+            service: &str,
+            space: &str,
+            name: &str,
+            payload: Vec<u8>,
+            expected: ArtifactExpectation,
+        ) -> Result<DeltaSave, DatabaseArtifactError> {
+            self.inner
+                .save_delta(service, space, name, payload, expected)
+                .await
+        }
+    }
+
+    /// TC-1274 M3: a hydration task that panics retires its registry entry,
+    /// so the database is not wedged until the node restarts.
+    #[tokio::test]
+    async fn tc1274_a_panicking_hydration_does_not_wedge_the_database() {
+        let (inner, space) = seeded("sql-hydration-panic").await;
+        let repo = Arc::new(PanickingArtifactRepository {
+            inner,
+            panicked: Default::default(),
+        });
+        let cache = TempDir::new().unwrap();
+        let service = SqlService::new(cache.path().to_string_lossy().into_owned(), u64::MAX, repo);
+
+        let err = tokio::time::timeout(PATIENCE, read(&service, &space))
+            .await
+            .expect("a panicked hydration must not hang its caller")
+            .expect_err("a panicked hydration must fail");
+        assert!(matches!(err, SqlError::Internal(_)), "{err:?}");
+        assert!(service.hydrations.lock().unwrap().is_empty());
+        let served = tokio::time::timeout(PATIENCE, read(&service, &space))
+            .await
+            .expect("the next request must not join the dead hydration")
+            .unwrap();
+        assert_eq!(rows(served), 1);
+    }
+
+    /// A write whose deadline passed while it waited is refused at its point
+    /// of no return, and nothing is applied.
+    #[tokio::test]
+    async fn tc1274_a_write_past_its_deadline_is_refused_before_it_starts() {
+        let (repo, space) = seeded("sql-begin-write-cut").await;
+        let cache = TempDir::new().unwrap();
+        let service = SqlService::new(cache.path().to_string_lossy().into_owned(), u64::MAX, repo);
+        read(&service, &space).await.unwrap();
+
+        let context = crate::request_cancel::RequestCancel::new(Duration::ZERO);
+        let err = crate::request_cancel::within(
+            Some(Arc::clone(&context)),
+            service.execute(
+                &space,
+                "a",
+                insert("late"),
+                None,
+                "tinycloud.sql/write".into(),
+            ),
+        )
+        .await
+        .expect_err("a write past its deadline must not start");
+        assert!(matches!(err, SqlError::RequestTimeout), "{err:?}");
+        assert!(!context.latch(), "the request was cut, not latched");
+        assert_eq!(rows(read(&service, &space).await.unwrap()), 1);
     }
 }

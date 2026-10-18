@@ -791,7 +791,7 @@ pub async fn invoke(
 ///
 /// The handler arrives boxed: it is large, and holding it inline in the route
 /// future overflows the test threads' stacks in debug builds.
-async fn with_invoke_deadline<T>(
+pub(crate) async fn with_invoke_deadline<T>(
     config: &Config,
     handler: std::pin::Pin<Box<impl Future<Output = Result<T, InvokeError>>>>,
 ) -> Result<T, InvokeError> {
@@ -1773,7 +1773,8 @@ async fn invoke_impl(
             }
             // TC-1274: the decrypt records its audit and rewraps the key;
             // from here the deadline no longer cuts the request.
-            request_cancel::latch();
+            let latched = request_cancel::latch();
+            debug_assert!(latched, "a cut handler is not polled again");
             let verified = encryption
                 .decrypt_authorized(&network, &admitted.invocation().0, &body)
                 .await
@@ -1833,6 +1834,7 @@ async fn invoke_impl(
             // Reject quarantined paths and an active cutover fence before
             // verify_auth_admitted persists invoked_abilities. A rejected
             // request must never become migration attribution evidence.
+            request_cancel::set_stage(request_cancel::Stage::IdentityResolution);
             if tinycloud.effective_database_fence(config.database.write_fence)
                 .await.map_err(identity_resolution_error)? {
                 return Err((Status::ServiceUnavailable, "SQL identity cutover fence is active".into()).into());
@@ -1840,6 +1842,7 @@ async fn invoke_impl(
             let (space, path, _) = select_database_scope(&sql_caps, "sql")?;
             database_migration::resolve(tinycloud.connection(), "sql", &space.to_string(), path)
                 .await.map_err(identity_resolution_error)?;
+            request_cancel::set_stage(request_cancel::Stage::Other);
             if policy_session_invocation {
                 invocation_replay_cache
                     .check_and_insert_invoker_nonce(admitted.invocation(), 60)
@@ -1891,6 +1894,7 @@ async fn invoke_impl(
                     .collect();
 
             if !duckdb_caps.is_empty() {
+                request_cancel::set_stage(request_cancel::Stage::IdentityResolution);
                 if tinycloud.effective_database_fence(config.database.write_fence)
                     .await.map_err(identity_resolution_error)? {
                     return Err((Status::ServiceUnavailable, "DuckDB identity cutover fence is active".into()).into());
@@ -1898,6 +1902,7 @@ async fn invoke_impl(
                 let (space, path, _) = select_database_scope(&duckdb_caps, "duckdb")?;
                 database_migration::resolve(tinycloud.connection(), "duckdb", &space.to_string(), path)
                     .await.map_err(identity_resolution_error)?;
+                request_cancel::set_stage(request_cancel::Stage::Other);
                 if policy_session_invocation {
                     invocation_replay_cache
                         .check_and_insert_invoker_nonce(admitted.invocation(), 60)
@@ -2536,6 +2541,7 @@ async fn handle_sql_invoke(
     config: &State<Config>,
     sql_caps: &[(tinycloud_auth::resource::SpaceId, Option<String>, String)],
 ) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, InvokeError> {
+    request_cancel::set_stage(request_cancel::Stage::IdentityResolution);
     if tinycloud
         .effective_database_fence(config.database.write_fence)
         .await
@@ -2547,6 +2553,7 @@ async fn handle_sql_invoke(
         )
             .into());
     }
+    request_cancel::set_stage(request_cancel::Stage::Other);
     // W1 (D): derive the SQL caveat from the VALIDATED delegation chain,
     // NOT from the invoker's own invocation facts. The invocation-facts
     // path is a holdover (and is still consulted as a fallback so the
@@ -2590,9 +2597,11 @@ async fn handle_sql_invoke(
     // N3 will resolve this logical identity through an explicit alias table.
     // Do not fall back to the legacy final-segment selector here.
     let space_id = space.to_string();
+    request_cancel::set_stage(request_cancel::Stage::IdentityResolution);
     let db_name = database_migration::resolve(tinycloud.connection(), "sql", &space_id, path)
         .await
         .map_err(identity_resolution_error)?;
+    request_cancel::set_stage(request_cancel::Stage::Other);
 
     let sql_request: SqlRequest =
         serde_json::from_str(&body_str).map_err(|e| (Status::BadRequest, e.to_string()))?;
@@ -2659,9 +2668,15 @@ async fn handle_sql_invoke(
         None
     };
     let execute_start = Instant::now();
-    if publication_command.is_some() {
-        // TC-1274: publication writes its freeze before the service runs.
-        request_cancel::latch();
+    if publication_command
+        .as_ref()
+        .is_some_and(|command| command["operation"] == "unfreeze_legacy")
+    {
+        // TC-1274: releasing the legacy freeze is publication's only write,
+        // and it never reaches the SQL service; the read-only commands stay
+        // cuttable.
+        let latched = request_cancel::latch();
+        debug_assert!(latched, "a cut handler is not polled again");
     }
     let execute_result = if let Some(command) = publication_command {
         meeting_publication::execute(tinycloud, sql_service, space, command).await
@@ -3065,7 +3080,7 @@ fn json_to_sql_value(v: &serde_json::Value) -> Result<tinycloud_core::sql::SqlVa
     }
 }
 
-fn sql_error_to_status(err: &SqlError) -> Status {
+pub(crate) fn sql_error_to_status(err: &SqlError) -> Status {
     match err {
         SqlError::Sqlite(_) => Status::BadRequest,
         SqlError::PermissionDenied(_) => Status::Forbidden,
@@ -3134,6 +3149,7 @@ async fn handle_duckdb_invoke(
     duckdb_caps: &[(tinycloud_auth::resource::SpaceId, Option<String>, String)],
     arrow_format: bool,
 ) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, InvokeError> {
+    request_cancel::set_stage(request_cancel::Stage::IdentityResolution);
     if tinycloud
         .effective_database_fence(config.database.write_fence)
         .await
@@ -3145,6 +3161,7 @@ async fn handle_duckdb_invoke(
         )
             .into());
     }
+    request_cancel::set_stage(request_cancel::Stage::Other);
     let caveats: Option<DuckDbCaveats> = admitted
         .invocation()
         .0
@@ -3170,9 +3187,11 @@ async fn handle_duckdb_invoke(
     let (space, path, ability) = select_database_scope(duckdb_caps, "duckdb")?;
     // Keep the logical path separate from any legacy physical artifact name.
     let space_id = space.to_string();
+    request_cancel::set_stage(request_cancel::Stage::IdentityResolution);
     let db_name = database_migration::resolve(tinycloud.connection(), "duckdb", &space_id, path)
         .await
         .map_err(identity_resolution_error)?;
+    request_cancel::set_stage(request_cancel::Stage::Other);
 
     if ability == "tinycloud.duckdb/import" {
         // Import always grows the database artifact — gate before reading
@@ -3199,7 +3218,8 @@ async fn handle_duckdb_invoke(
         };
 
         // TC-1274: the import writes the live cache and the artifact.
-        request_cancel::latch();
+        let latched = request_cancel::latch();
+        debug_assert!(latched, "a cut handler is not polled again");
         let import_start = Instant::now();
         let import_result = duckdb_service.import_db(space, &db_name, &body_bytes).await;
         crate::prometheus::observe_span(
@@ -3253,8 +3273,10 @@ async fn handle_duckdb_invoke(
     };
 
     // TC-1274: DuckDB's service has no write latch of its own; its
-    // hydration and statement must not be cut once started.
-    request_cancel::latch();
+    // hydration and statement must not be cut once started. Its waits are
+    // not bounded either (TC-1274 follow-up).
+    let latched = request_cancel::latch();
+    debug_assert!(latched, "a cut handler is not polled again");
     let execute_start = Instant::now();
     let execute_result = if full_space.is_some() {
         duckdb_service

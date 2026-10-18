@@ -44,6 +44,8 @@ pub enum Stage {
     LockWait = 1,
     Hydration = 2,
     ArtifactTransfer = 3,
+    /// Resolving a SQL or DuckDB database's durable identity.
+    IdentityResolution = 4,
 }
 
 impl Stage {
@@ -53,6 +55,7 @@ impl Stage {
             Stage::LockWait => "lock_wait",
             Stage::Hydration => "hydration",
             Stage::ArtifactTransfer => "artifact_transfer",
+            Stage::IdentityResolution => "identity_resolution",
         }
     }
 
@@ -61,6 +64,7 @@ impl Stage {
             1 => Stage::LockWait,
             2 => Stage::Hydration,
             3 => Stage::ArtifactTransfer,
+            4 => Stage::IdentityResolution,
             _ => Stage::Other,
         }
     }
@@ -111,12 +115,21 @@ impl RequestCancel {
     }
 
     /// Claim the timeout. False if a write has already latched the request.
+    /// Whoever moves the request from open to cut logs it, exactly once.
     pub fn cut(&self) -> bool {
         match self
             .state
             .compare_exchange(OPEN, CUT, Ordering::AcqRel, Ordering::Acquire)
         {
-            Ok(_) => true,
+            Ok(_) => {
+                tracing::warn!(
+                    error_class = "request_timeout",
+                    stage = self.stage().as_str(),
+                    deadline_ms = self.budget.as_millis() as u64,
+                    "Request deadline exceeded"
+                );
+                true
+            }
             Err(state) => state == CUT,
         }
     }
@@ -128,15 +141,12 @@ impl RequestCancel {
     pub fn stage(&self) -> Stage {
         Stage::from_u8(self.stage.load(Ordering::Relaxed))
     }
+}
 
-    /// Log the timeout answer. Called once by whoever claimed the cut.
-    pub fn log_timeout(&self) {
-        tracing::warn!(
-            error_class = "request_timeout",
-            stage = self.stage().as_str(),
-            deadline_ms = self.budget.as_millis() as u64,
-            "Request deadline exceeded"
-        );
+/// Record what the current request is waiting on, if it has a deadline.
+pub fn set_stage(stage: Stage) {
+    if let Some(context) = current() {
+        context.set_stage(stage);
     }
 }
 
@@ -185,7 +195,6 @@ pub async fn run_with_deadline<F: Future>(
         _ = tokio::time::sleep_until(context.deadline()) => {}
     }
     if context.cut() {
-        context.log_timeout();
         return Err(DeadlineExceeded);
     }
     let output = future.await;

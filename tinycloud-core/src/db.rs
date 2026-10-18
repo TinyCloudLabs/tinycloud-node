@@ -2219,7 +2219,10 @@ where
         };
         // TC-1274: the write transaction begins here, so the request deadline
         // may no longer cut this request; it completes and reports its outcome.
-        crate::request_cancel::latch();
+        // The handler task is never polled after a cut, so this is not
+        // refused here.
+        let latched = crate::request_cancel::latch();
+        debug_assert!(latched, "a cut handler is not polled again");
         let begin_start = Instant::now();
         let tx_result = self.begin_graph_transaction().await;
         crate::telemetry::observe_stage(
