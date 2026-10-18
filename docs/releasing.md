@@ -294,8 +294,8 @@ gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref main \
 ```
 
 The served/OCI identity remains **1.20.6-dstack / e18578ff9162986ddd813259c60f73866e3e60d1**.
-The N0 raw lock **changed in #346 (TC-959)**, which passes the validated N2 correlation fields through the log sidecar:
-`6563d51bffe4b537d49b0c087a50e86753aaaf5ba533f1e52c7c2214f7f5f04e`,
+The N0 raw lock **changed again in TC-1274**, which sets `TINYCLOUD_EPOCH_HEAD_BACKFILL__ENABLED: "false"` in the production compose (whichever of this and #347 lands second re-pins). It previously changed in #346 (TC-959), which passes the validated N2 correlation fields through the log sidecar; the hash below is the TC-1274 lock:
+`c33c23021589163b62a71ef245b7194717711922027629f155bdd5cff806b8c7`,
 from #346 final reviewed head.
 It supersedes the #309 lock `ca110b0bae6d5a06a1002fb80df3f71cffec11659c9f9dbfa5d72624735546f6`,
 from #309 reviewed head `44eeb20a1461ef66b5af492e3be4c42be2728b67`,
