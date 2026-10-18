@@ -4621,12 +4621,13 @@ fn validate_policy_encryption_resource(value: &str) -> Result<(), (Status, Strin
     Ok(())
 }
 
-/// Why a new policy's encryption networks were refused; the metric label.
+/// Why a new policy's resources were refused; the metric label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SourceNetworkRefusal {
     Unparsable,
     LegacyResource,
     ForeignOwner,
+    ForeignSpace,
     Missing,
     Inactive,
 }
@@ -4637,6 +4638,7 @@ impl SourceNetworkRefusal {
             Self::Unparsable => "unparsable",
             Self::LegacyResource => "legacy_resource",
             Self::ForeignOwner => "foreign_owner",
+            Self::ForeignSpace => "foreign_space",
             Self::Missing => "missing",
             Self::Inactive => "inactive",
         }
@@ -4645,42 +4647,64 @@ impl SourceNetworkRefusal {
 
 /// TC-1423 N1b: the encryption networks a policy names (the content source's
 /// and every `encryption` ceiling entry), when every one parses and belongs to
-/// the owner of the content source's space; otherwise why not. Pure, so it
-/// applies to stored registrations as well as new ones.
+/// the owner of the content source's space, and every `kv` ceiling entry
+/// names a space of that owner; otherwise why not. Pure, so it applies to
+/// stored registrations as well as new ones.
 ///
 /// A DID is root authority over every network URN that names it, created or
-/// not. Without this check, a registrant holding only kv on the content could
-/// name a network of its own and hold its decrypt by name. With it, a
-/// registrant other than the space owner holds decrypt on these networks only
+/// not, and any DID may create such a network. Without this check, a
+/// registrant holding only kv on someone's content could hand that content
+/// out under a network of its own: named in the source, or with the source
+/// moved to its own space and the content added as a second kv entry. With
+/// it, every resource the policy grants belongs to one owner, and a
+/// registrant other than that owner holds decrypt on its networks only
 /// through a delegation rooted at that owner.
 ///
 /// The owner is the space's DID (`ResourceId::space().did()`), compared with
 /// `did_principal_matches`: EIP-55 letter case is ignored, the chain id is
-/// not. `tinycloud://` sources name no space owner, and no client emits them.
+/// not. `tinycloud://` resources name no space owner, and no client emits
+/// them. A ceiling carries only `kv` and `encryption` entries
+/// (`registration_projections`); any other kind is refused as unparsable.
 fn content_owner_networks(policy: &Value) -> Result<Vec<NetworkId>, SourceNetworkRefusal> {
+    let kv_owner = |resource: Option<&str>| {
+        let resource = resource.unwrap_or_default();
+        if resource.starts_with("tinycloud://") {
+            return Err(SourceNetworkRefusal::LegacyResource);
+        }
+        resource
+            .parse::<ResourceId>()
+            .map(|resource| resource.space().did().to_owned())
+            .map_err(|_| SourceNetworkRefusal::Unparsable)
+    };
     let source = policy.get("contentSource");
-    let kv_resource = source
-        .and_then(|source| source.get("kvResource"))
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    if kv_resource.starts_with("tinycloud://") {
-        return Err(SourceNetworkRefusal::LegacyResource);
-    }
-    let resource = kv_resource
-        .parse::<ResourceId>()
-        .map_err(|_| SourceNetworkRefusal::Unparsable)?;
-    let content_owner = resource.space().did();
-    let ceiling_networks = policy
+    let content_owner = kv_owner(
+        source
+            .and_then(|source| source.get("kvResource"))
+            .and_then(Value::as_str),
+    )?;
+    let mut networks = std::collections::BTreeSet::from([source
+        .and_then(|source| source.get("encryptionNetwork"))
+        .and_then(Value::as_str)]);
+    for capability in policy
         .get("capabilityCeiling")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter(|capability| capability.get("kind").and_then(Value::as_str) == Some("encryption"))
-        .map(|capability| capability.get("resource"));
-    std::iter::once(source.and_then(|source| source.get("encryptionNetwork")))
-        .chain(ceiling_networks)
-        .map(|network| network.and_then(Value::as_str))
-        .collect::<std::collections::BTreeSet<_>>()
+    {
+        let resource = capability.get("resource").and_then(Value::as_str);
+        match capability.get("kind").and_then(Value::as_str) {
+            Some("kv") => {
+                if !did_principal_matches(kv_owner(resource)?.as_str(), content_owner.as_str()) {
+                    return Err(SourceNetworkRefusal::ForeignSpace);
+                }
+            }
+            Some("encryption") => {
+                networks.insert(resource);
+            }
+            _ => return Err(SourceNetworkRefusal::Unparsable),
+        }
+    }
+    networks
         .into_iter()
         .map(|network| {
             let network_id = network

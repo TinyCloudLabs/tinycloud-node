@@ -927,42 +927,59 @@ async fn kv_entries_all_owned_by_the_content_owner_register() -> anyhow::Result<
 }
 
 /// A legacy `tinycloud://` kv entry names no space owner: refused like a
-/// legacy source. A kv entry that doesn't parse never gets this far
-/// (`400 kv-resource-invalid`).
+/// legacy source.
 #[tokio::test]
-async fn legacy_or_unparsable_kv_entry_is_refused() -> anyhow::Result<()> {
+async fn legacy_kv_entry_is_refused() -> anyhow::Result<()> {
     let case = KeyOwnerCase::new(&["default"]).await?;
     case.harness
         .create_network(&case.owner.did, "default")
         .await?;
-    let source = case.network("default");
     let legacy = format!("tinycloud://applications/kv/{KV_PATH}");
     assert_refused(
         case.harness.register_full(
             &case.session,
             &case.kv.to_string(),
-            &source,
+            &case.network("default"),
             &[],
             &[&legacy],
         ),
         "legacy_resource",
     )
-    .await?;
-    let (status, body) = case
-        .harness
-        .register_full(
-            &case.session,
-            &case.kv.to_string(),
-            &source,
-            &[],
-            &["not-a-resource"],
-        )
-        .await?;
-    assert_eq!(
-        (status, body.as_str()),
-        (Status::BadRequest, "kv-resource-invalid")
+    .await
+}
+
+/// Registration refuses a kv entry that doesn't parse, or a ceiling entry of
+/// another kind, earlier (`400` from `registration_projections`). The pure
+/// predicate, which also classifies stored rows, refuses both on its own.
+#[test]
+fn unparsable_or_unknown_ceiling_entry_fails_the_predicate() {
+    let owner = KeyPrincipal::generate();
+    let kv = kv_resource(&owner.did).unwrap().to_string();
+    let source = network(&owner.did, "default");
+    let policy = |extra: Value| {
+        json!({
+            "contentSource": {"kvResource": kv, "encryptionNetwork": source},
+            "capabilityCeiling": [
+                {"kind": "kv", "resource": kv},
+                {"kind": "encryption", "resource": source},
+                extra,
+            ],
+        })
+    };
+    assert!(
+        content_owner_networks(&policy(json!({"kind": "encryption", "resource": source}))).is_ok()
     );
-    Ok(())
+    for extra in [
+        json!({"kind": "kv", "resource": "not-a-resource"}),
+        json!({"kind": "kv"}),
+        json!({"kind": "sql", "resource": kv}),
+    ] {
+        assert_eq!(
+            content_owner_networks(&policy(extra.clone())).err(),
+            Some(SourceNetworkRefusal::Unparsable),
+            "{extra}"
+        );
+    }
 }
 
 fn postgres_url(test: &str) -> Option<String> {

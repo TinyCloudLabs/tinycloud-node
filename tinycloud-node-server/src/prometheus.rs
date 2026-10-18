@@ -33,9 +33,10 @@ pub fn observe_did_resolution_refused(method: &str, reason: &str) {
 }
 
 /// A Policy/v3 registration refused because one of its encryption networks
-/// is not the content owner's active network on this node. `reason` is a
-/// fixed label: `unparsable`, `legacy_resource`, `foreign_owner`, `missing`
-/// or `inactive`.
+/// is not the content owner's active network on this node, or one of its kv
+/// entries names a space of another owner. `reason` is a fixed label:
+/// `unparsable`, `legacy_resource`, `foreign_owner`, `foreign_space`,
+/// `missing` or `inactive`.
 pub fn observe_policy_source_network_refused(reason: &'static str) {
     POLICY_SOURCE_NETWORK_REFUSED
         .with_label_values(&[reason])
@@ -50,7 +51,7 @@ lazy_static! {
     ).unwrap();
     pub static ref POLICY_SOURCE_NETWORK_REFUSED: IntCounterVec = register_int_counter_vec!(
         "tinycloud_policy_source_network_refused_total",
-        "Policy/v3 registrations refused because an encryption network is not the content owner's active network on this node, by reason.",
+        "Policy/v3 registrations refused because an encryption network is not the content owner's active network on this node, or a kv entry names another owner's space, by reason.",
         &["reason"]
     )
     .unwrap();
