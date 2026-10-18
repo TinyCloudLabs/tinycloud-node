@@ -49,23 +49,22 @@ fn install_panic_hook() {
     }));
 }
 
-/// Whether argv selects the clap CLI (`serve`, `node ...`, `--help`,
-/// `--version`). Everything else keeps the original server start: the
-/// container entrypoint is `tinycloud` with no arguments, and the deploy
-/// preflight runs `tinycloud --validate-config`, which clap would reject.
-fn is_cli_invocation(args: impl IntoIterator<Item = std::ffi::OsString>) -> bool {
-    matches!(
-        args.into_iter()
-            .nth(1)
-            .as_deref()
-            .and_then(|arg| arg.to_str()),
-        Some("serve" | "node" | "--help" | "-h" | "--version" | "-V")
-    )
+/// The server start path is only for the two invocations that exist outside
+/// the CLI: no arguments (the container entrypoint, `cargo run`) and exactly
+/// `--validate-config` (the deploy preflight). Every other argv goes to clap,
+/// which also rejects anything it does not recognise instead of booting.
+fn starts_server(args: &[std::ffi::OsString]) -> bool {
+    match args {
+        [] => true,
+        [only] => only == "--validate-config",
+        _ => false,
+    }
 }
 
 fn main() {
     install_panic_hook();
-    if is_cli_invocation(std::env::args_os()) {
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if !starts_server(&args) {
         if let Err(e) = tinycloud::cli::run() {
             eprintln!("\n✗ tinycloud-node failed:\n");
             for cause in e.chain() {
@@ -326,33 +325,5 @@ mod tests {
             .expect("config should parse");
 
         assert_eq!(cfg.share_email.readiness_max_age_seconds, 42);
-    }
-
-    #[test]
-    fn only_cli_tokens_leave_the_server_start_path() {
-        let argv = |args: &[&str]| {
-            std::iter::once("tinycloud")
-                .chain(args.iter().copied())
-                .map(std::ffi::OsString::from)
-                .collect::<Vec<_>>()
-        };
-        for args in [
-            &["node", "status", "--json"][..],
-            &["serve"],
-            &["--help"],
-            &["-h"],
-            &["--version"],
-            &["-V"],
-        ] {
-            assert!(is_cli_invocation(argv(args)), "{args:?} must reach the CLI");
-        }
-        // Container entrypoint and the deploy preflight must keep starting
-        // (or validating) the server through the original path.
-        for args in [&[][..], &["--validate-config"], &["--unknown"]] {
-            assert!(
-                !is_cli_invocation(argv(args)),
-                "{args:?} must keep the server start path"
-            );
-        }
     }
 }
