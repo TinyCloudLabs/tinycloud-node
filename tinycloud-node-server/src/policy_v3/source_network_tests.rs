@@ -71,18 +71,20 @@ struct PkhPrincipal {
 }
 
 impl PkhPrincipal {
-    fn new(seed: u8) -> anyhow::Result<Self> {
-        let key = SigningKey::from_bytes(&[seed; 32].into())?;
-        let public = key.verifying_key().to_encoded_point(false);
-        let digest = Keccak256::digest(&public.as_bytes()[1..]);
-        let principal = Self {
-            key,
-            address: digest[12..].try_into()?,
-        };
-        // The case-insensitivity cases mean something only if the checksum
-        // has upper-case letters.
-        assert_ne!(principal.did(1), principal.lowercase_did(1));
-        Ok(principal)
+    /// A random account whose EIP-55 spelling has upper-case letters, so the
+    /// case-insensitivity cases mean something.
+    fn generate() -> Self {
+        loop {
+            let key = SigningKey::random(&mut rand::rngs::OsRng);
+            let public = key.verifying_key().to_encoded_point(false);
+            let digest = Keccak256::digest(&public.as_bytes()[1..]);
+            let mut address = [0_u8; 20];
+            address.copy_from_slice(&digest[12..]);
+            let principal = Self { key, address };
+            if principal.did(1) != principal.lowercase_did(1) {
+                return principal;
+            }
+        }
     }
 
     /// The EIP-55 spelling space ids and session DIDs carry.
@@ -104,12 +106,14 @@ fn network(owner_did: &str, name: &str) -> String {
 }
 
 fn kv_resource(owner_did: &str) -> anyhow::Result<ResourceId> {
-    Ok(SpaceId::new(owner_did.parse::<DIDBuf>()?, "applications".parse()?).to_resource(
-        "kv".parse()?,
-        Some(KV_PATH.parse()?),
-        None,
-        None,
-    ))
+    Ok(
+        SpaceId::new(owner_did.parse::<DIDBuf>()?, "applications".parse()?).to_resource(
+            "kv".parse()?,
+            Some(KV_PATH.parse()?),
+            None,
+            None,
+        ),
+    )
 }
 
 /// The registrant's grants on the content: kv get + metadata on the content
@@ -138,6 +142,23 @@ struct Harness {
 
 impl Harness {
     async fn new() -> anyhow::Result<Self> {
+        Self::on(Database::connect("sqlite::memory:").await?).await
+    }
+
+    /// A fresh schema on the PostgreSQL server at `url`.
+    async fn postgres(url: &str) -> anyhow::Result<Self> {
+        let schema = format!("tc1423_n1b_{}", uuid::Uuid::new_v4().simple());
+        Database::connect(url)
+            .await?
+            .execute_unprepared(&format!("CREATE SCHEMA {schema}"))
+            .await?;
+        let mut url = reqwest::Url::parse(url)?;
+        url.query_pairs_mut()
+            .append_pair("options", &format!("-c search_path={schema}"));
+        Self::on(Database::connect(url.as_str()).await?).await
+    }
+
+    async fn on(db: tinycloud_core::sea_orm::DatabaseConnection) -> anyhow::Result<Self> {
         use tinycloud_core::{
             database_artifacts::SeaOrmDatabaseArtifactRepository,
             encryption::ColumnEncryption,
@@ -148,7 +169,6 @@ impl Harness {
         let vector: Value = serde_json::from_str(include_str!(
             "../../test-fixtures/tc-470-policy-credential-requirement.json"
         ))?;
-        let db = Database::connect("sqlite::memory:").await?;
         let node_secret =
             StaticSecret::new(vec![29; 32]).map_err(|_| anyhow::anyhow!("invalid secret"))?;
         let node_did = node_secret.node_did();
@@ -219,7 +239,12 @@ impl Harness {
     }
 
     fn conn(&self) -> &RecoveringConnection {
-        &self.client.rocket().state::<PolicyV3Runtime>().unwrap().conn
+        &self
+            .client
+            .rocket()
+            .state::<PolicyV3Runtime>()
+            .unwrap()
+            .conn
     }
 
     async fn post_delegation(&self, authorization: String) -> anyhow::Result<String> {
@@ -424,7 +449,9 @@ impl Harness {
             "createdAt": format_time(issued),
             "expiresAt": format_time(expires),
             "contentSource": {
-                "shareId": "share-tc-1423-n1b",
+                // Unique per call, so a refused policy never shares a CID
+                // with one registered earlier in the same test.
+                "shareId": format!("share-tc-1423-n1b-{}", uuid::Uuid::new_v4()),
                 "kvResource": kv_resource,
                 "selector": "exact",
                 "encryptionNetwork": source_network,
@@ -443,10 +470,7 @@ impl Harness {
         let mut preimage = POLICY_V2_SCHEMA.as_bytes().to_vec();
         preimage.push(0);
         preimage.extend_from_slice(&canonical_json_value(&unsigned));
-        policy["policyId"] = json!(format!(
-            "pol_{}",
-            base32_lower(&Sha256::digest(&preimage))
-        ));
+        policy["policyId"] = json!(format!("pol_{}", base32_lower(&Sha256::digest(&preimage))));
         policy["signature"]["value"] = json!(encode_config(
             owner.key.sign(&Sha256::digest(preimage)),
             URL_SAFE_NO_PAD
@@ -576,7 +600,10 @@ struct KeyOwnerCase {
 
 impl KeyOwnerCase {
     async fn new(decrypt: &[&str]) -> anyhow::Result<Self> {
-        let harness = Harness::new().await?;
+        Self::on(Harness::new().await?, decrypt).await
+    }
+
+    async fn on(harness: Harness, decrypt: &[&str]) -> anyhow::Result<Self> {
         let owner = KeyPrincipal::generate();
         let session = KeyPrincipal::generate();
         let kv = kv_resource(&owner.did)?;
@@ -639,7 +666,9 @@ async fn source_network_must_exist() -> anyhow::Result<()> {
 async fn source_network_must_be_active() -> anyhow::Result<()> {
     let case = KeyOwnerCase::new(&["default"]).await?;
     let source = case.network("default");
-    case.harness.create_network(&case.owner.did, "default").await?;
+    case.harness
+        .create_network(&case.owner.did, "default")
+        .await?;
     for state in ["pending", "rotating"] {
         case.harness.set_network_state(&source, state).await?;
         assert_refused(case.register(&source, &[]), "inactive").await?;
@@ -661,11 +690,15 @@ async fn every_policy_network_is_checked() -> anyhow::Result<()> {
     let case = KeyOwnerCase::new(&["default", "backup"]).await?;
     let source = case.network("default");
     let backup = case.network("backup");
-    case.harness.create_network(&case.owner.did, "default").await?;
+    case.harness
+        .create_network(&case.owner.did, "default")
+        .await?;
     let self_named = network(&case.session.did, "share");
     assert_refused(case.register(&source, &[&self_named]), "foreign_owner").await?;
     assert_refused(case.register(&source, &[&backup]), "missing").await?;
-    case.harness.create_network(&case.owner.did, "backup").await?;
+    case.harness
+        .create_network(&case.owner.did, "backup")
+        .await?;
     assert_registered(case.register(&source, &[&backup]).await?);
     Ok(())
 }
@@ -690,7 +723,9 @@ async fn existing_foreign_network_is_refused() -> anyhow::Result<()> {
 async fn legacy_source_resource_is_refused() -> anyhow::Result<()> {
     let case = KeyOwnerCase::new(&["default"]).await?;
     let source = case.network("default");
-    case.harness.create_network(&case.owner.did, "default").await?;
+    case.harness
+        .create_network(&case.owner.did, "default")
+        .await?;
     assert_refused(
         case.harness.register(
             &case.session,
@@ -708,7 +743,9 @@ async fn legacy_source_resource_is_refused() -> anyhow::Result<()> {
 async fn unparsable_network_is_refused() -> anyhow::Result<()> {
     let case = KeyOwnerCase::new(&["default"]).await?;
     let source = case.network("default");
-    case.harness.create_network(&case.owner.did, "default").await?;
+    case.harness
+        .create_network(&case.owner.did, "default")
+        .await?;
     assert_refused(
         case.register(
             &source,
@@ -723,9 +760,8 @@ async fn unparsable_network_is_refused() -> anyhow::Result<()> {
 /// kv get + metadata, decrypt and network.create, with the network named in
 /// Share's lower-case spelling. The session creates the network through the
 /// real route, as the SDK does at sign-in (checksummed invocation resource).
-async fn pkh_owner_registers(name: &str) -> anyhow::Result<()> {
-    let harness = Harness::new().await?;
-    let account = PkhPrincipal::new(0x5a)?;
+async fn pkh_owner_registers(harness: Harness, name: &str) -> anyhow::Result<()> {
+    let account = PkhPrincipal::generate();
     let session = KeyPrincipal::generate();
     let kv = kv_resource(&account.did(1))?;
     assert_eq!(kv.space().did().as_str(), account.did(1));
@@ -754,20 +790,20 @@ async fn pkh_owner_registers(name: &str) -> anyhow::Result<()> {
 /// Released Share: `<did:pkh lowercased>:default` against a checksummed space.
 #[tokio::test]
 async fn share_shape_registers() -> anyhow::Result<()> {
-    pkh_owner_registers("default").await
+    pkh_owner_registers(Harness::new().await?, "default").await
 }
 
 /// D3: the owner's dedicated `:share` network.
 #[tokio::test]
 async fn share_network_of_pkh_owner_registers() -> anyhow::Result<()> {
-    pkh_owner_registers("share").await
+    pkh_owner_registers(Harness::new().await?, "share").await
 }
 
 /// Same account, other chain: a different principal, so a different owner.
 #[tokio::test]
 async fn chain_id_mismatch_is_refused() -> anyhow::Result<()> {
     let harness = Harness::new().await?;
-    let account = PkhPrincipal::new(0x5a)?;
+    let account = PkhPrincipal::generate();
     let session = KeyPrincipal::generate();
     let kv = kv_resource(&account.did(1))?;
     let other_chain = network(&account.lowercase_did(137), "default");
@@ -788,4 +824,41 @@ async fn chain_id_mismatch_is_refused() -> anyhow::Result<()> {
         "foreign_owner",
     )
     .await
+}
+
+fn postgres_url(test: &str) -> Option<String> {
+    match std::env::var("TINYCLOUD_TEST_POSTGRES_URL") {
+        Ok(url) if !url.trim().is_empty() => Some(url),
+        _ => {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "{test} requires TINYCLOUD_TEST_POSTGRES_URL, which is unset in CI (TC-381)"
+            );
+            eprintln!("skipping {test}: TINYCLOUD_TEST_POSTGRES_URL is unset");
+            None
+        }
+    }
+}
+
+/// The same lookups against PostgreSQL: the Share shape registers; a missing,
+/// inactive or self-named source network is refused.
+#[tokio::test]
+async fn postgres_source_network_check() -> anyhow::Result<()> {
+    let Some(url) = postgres_url("postgres_source_network_check") else {
+        return Ok(());
+    };
+    pkh_owner_registers(Harness::postgres(&url).await?, "default").await?;
+    let case = KeyOwnerCase::on(Harness::postgres(&url).await?, &["default"]).await?;
+    let source = case.network("default");
+    assert_refused(case.register(&source, &[]), "missing").await?;
+    case.harness
+        .create_network(&case.owner.did, "default")
+        .await?;
+    case.harness.set_network_state(&source, "rotating").await?;
+    assert_refused(case.register(&source, &[]), "inactive").await?;
+    case.harness.set_network_state(&source, "active").await?;
+    let self_named = network(&case.session.did, "share");
+    assert_refused(case.register(&self_named, &[]), "foreign_owner").await?;
+    assert_registered(case.register(&source, &[]).await?);
+    Ok(())
 }

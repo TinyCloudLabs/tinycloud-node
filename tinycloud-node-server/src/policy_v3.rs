@@ -29,13 +29,14 @@ use tinycloud_auth::{
     resource::{ResourceId, SpaceId},
 };
 use tinycloud_core::{
+    encryption_network::{NetworkId, NetworkState},
     events::{Delegation, SerializedEvent},
     hash::hash,
     keys::StaticSecret,
     models::{
-        abilities, delegation as delegation_model, invocation as invocation_model,
-        policy_v3_challenge, policy_v3_registration, policy_v3_root, policy_v3_session, revocation,
-        share_invitation_authorization_jti, space,
+        abilities, delegation as delegation_model, encryption_network as encryption_network_model,
+        invocation as invocation_model, policy_v3_challenge, policy_v3_registration,
+        policy_v3_root, policy_v3_session, revocation, share_invitation_authorization_jti, space,
     },
     relationships::parent_delegations,
     sea_orm::{
@@ -1848,6 +1849,13 @@ pub async fn register_policy(
             != request.policy.get("ownerDid").and_then(Value::as_str)
     {
         return Err((Status::Forbidden, "policy-digest-mismatch".into()));
+    }
+    // Only signed, self-consistent requests reach the network lookups; the
+    // check runs before the owner-authority check, which would otherwise
+    // accept decrypt on a network that names the registrant.
+    if let Some(refusal) = source_network_refusal(&runtime.conn, &request.policy).await? {
+        crate::prometheus::observe_policy_source_network_refused(refusal.as_str());
+        return Err((Status::Forbidden, "content-source-network-invalid".into()));
     }
     let owner_did = request
         .policy
@@ -4611,6 +4619,91 @@ fn validate_policy_encryption_resource(value: &str) -> Result<(), (Status, Strin
         return Err((Status::BadRequest, "encryption-resource-invalid".into()));
     }
     Ok(())
+}
+
+/// Why a new policy's encryption networks were refused; the metric label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceNetworkRefusal {
+    Unparsable,
+    LegacyResource,
+    ForeignOwner,
+    Missing,
+    Inactive,
+}
+
+impl SourceNetworkRefusal {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unparsable => "unparsable",
+            Self::LegacyResource => "legacy_resource",
+            Self::ForeignOwner => "foreign_owner",
+            Self::Missing => "missing",
+            Self::Inactive => "inactive",
+        }
+    }
+}
+
+/// TC-1423 N1b: every encryption network a new policy names (the content
+/// source's and every `encryption` ceiling entry) must belong to the owner of
+/// the content source's space and be active on this node.
+///
+/// A DID is root authority over every network URN that names it, created or
+/// not. Without this check, a registrant holding only kv on the content could
+/// name a network of its own and hold its decrypt by name. With it, a
+/// registrant other than the space owner holds decrypt on these networks only
+/// through a delegation rooted at that owner.
+///
+/// The owner is the space's DID (`ResourceId::space().did()`), compared with
+/// `did_principal_matches`: EIP-55 letter case is ignored, the chain id is
+/// not. Existence and state use the row key and the `active` rule that
+/// decrypt uses. `tinycloud://` sources name no space owner, and no client
+/// emits them, so new registrations refuse them.
+async fn source_network_refusal<C: ConnectionTrait>(
+    conn: &C,
+    policy: &Value,
+) -> Result<Option<SourceNetworkRefusal>, (Status, String)> {
+    let source = policy.get("contentSource");
+    let kv_resource = source
+        .and_then(|source| source.get("kvResource"))
+        .and_then(Value::as_str)
+        .ok_or((Status::BadRequest, "content-source-invalid".into()))?;
+    if kv_resource.starts_with("tinycloud://") {
+        return Ok(Some(SourceNetworkRefusal::LegacyResource));
+    }
+    let resource = kv_resource
+        .parse::<ResourceId>()
+        .map_err(|_| (Status::BadRequest, "kv-resource-invalid".into()))?;
+    let content_owner = resource.space().did();
+    let ceiling_networks = policy
+        .get("capabilityCeiling")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|capability| capability.get("kind").and_then(Value::as_str) == Some("encryption"))
+        .map(|capability| capability.get("resource"));
+    let networks = std::iter::once(source.and_then(|source| source.get("encryptionNetwork")))
+        .chain(ceiling_networks)
+        .map(|network| network.and_then(Value::as_str))
+        .collect::<std::collections::BTreeSet<_>>();
+    for network in networks {
+        let Some(network_id) = network.and_then(|network| network.parse::<NetworkId>().ok()) else {
+            return Ok(Some(SourceNetworkRefusal::Unparsable));
+        };
+        if !did_principal_matches(network_id.owner_did(), content_owner.as_str()) {
+            return Ok(Some(SourceNetworkRefusal::ForeignOwner));
+        }
+        let Some(row) = encryption_network_model::Entity::find_by_id(network_id.to_string())
+            .one(conn)
+            .await
+            .map_err(db_error)?
+        else {
+            return Ok(Some(SourceNetworkRefusal::Missing));
+        };
+        if NetworkState::parse(&row.state) != Some(NetworkState::Active) {
+            return Ok(Some(SourceNetworkRefusal::Inactive));
+        }
+    }
+    Ok(None)
 }
 
 fn canonical_policy_actions(
@@ -7980,7 +8073,7 @@ mod tests {
 
     #[tokio::test]
     async fn policy_v2_admits_v3_account_and_v4_accountless_receivers() -> anyhow::Result<()> {
-        run_policy_v2_flow(PolicyOwner::SpaceOwner).await
+        Box::pin(run_policy_v2_flow(PolicyOwner::SpaceOwner)).await
     }
 
     /// The real Share and CLI shape: the policy owner is a session key the
@@ -7988,7 +8081,7 @@ mod tests {
     /// space owner revokes that delegation, no new session can be minted.
     #[tokio::test]
     async fn policy_owner_may_be_a_session_the_space_owner_delegated_to() -> anyhow::Result<()> {
-        run_policy_v2_flow(PolicyOwner::DelegatedSession).await
+        Box::pin(run_policy_v2_flow(PolicyOwner::DelegatedSession)).await
     }
 
     /// The policy owner signs a valid, self-consistent policy over content in
@@ -7996,21 +8089,18 @@ mod tests {
     /// Registration must refuse it, so no session can ever read the bytes.
     #[tokio::test]
     async fn policy_registration_requires_the_owner_to_hold_what_it_grants() -> anyhow::Result<()> {
-        run_policy_v2_flow(PolicyOwner::Unauthorized).await
+        Box::pin(run_policy_v2_flow(PolicyOwner::Unauthorized)).await
     }
 
     /// TC-1423 (B2, N1b): a policy owner that holds only `kv/get` and
     /// `kv/metadata` on the content (no decrypt on the content owner's
     /// network) registers a policy whose content source names a network
     /// called after the policy owner itself, which needs no grant: a DID is
-    /// root authority over networks that name it. Registration must refuse
-    /// it: the source network must exist and belong to the content space's
-    /// owner, and the owner's decrypt on it must come through its authority
-    /// chain. Until then this test records what the node does instead and
-    /// fails.
+    /// root authority over networks that name it. Registration refuses it:
+    /// the source network must exist and belong to the content space's owner.
     #[tokio::test]
     async fn policy_source_network_must_belong_to_the_content_owner() -> anyhow::Result<()> {
-        run_policy_v2_flow(PolicyOwner::KvOnlySelfNamedNetwork).await
+        Box::pin(run_policy_v2_flow(PolicyOwner::KvOnlySelfNamedNetwork)).await
     }
 
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -8025,131 +8115,6 @@ mod tests {
         /// delegation from the space owner (no decrypt), and the policy's
         /// source network is one named after the policy owner itself.
         KvOnlySelfNamedNetwork,
-    }
-
-    /// Observations for `policy_source_network_must_belong_to_the_content_owner`
-    /// once registration was accepted: the recorded owner binding (N1, if
-    /// present), whether its closure holds the owner's delegation, and what an
-    /// admitted session gets after the space owner revokes that delegation.
-    #[allow(clippy::too_many_arguments)]
-    async fn kv_only_self_network_report(
-        client: &rocket::local::asynchronous::Client,
-        policy_cid: &String,
-        owner_delegation_cid: Option<String>,
-        content_owner_vm: &String,
-        content_owner_did: &String,
-        content_owner_jwk: &JWK,
-        reader_vm: &String,
-        reader_did: &String,
-        reader_jwk: &JWK,
-        child_cid: tinycloud_auth::ipld_core::cid::Cid,
-        requested: &Vec<Value>,
-    ) -> anyhow::Result<(String, String, String)> {
-        use tinycloud_auth::{
-            siwe_recap::Ability as RecapAbility, ucan_capabilities_object::Capabilities,
-        };
-        use tinycloud_core::sea_orm::{ConnectionTrait as _, Statement};
-        let owner_delegation_cid = owner_delegation_cid
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("missing owner delegation"))?;
-        let conn = &client.rocket().state::<PolicyV3Runtime>().unwrap().conn;
-        // What authority the node recorded, if it records any (N1, #358).
-        let backend = conn.get_database_backend();
-        let binding = conn
-            .query_one(Statement::from_sql_and_values(
-                backend,
-                "SELECT state FROM policy_v3_owner_binding WHERE policy_cid = ?",
-                [policy_cid.clone().into()],
-            ))
-            .await;
-        let binding_state = match binding {
-            Ok(Some(row)) => row.try_get::<String>("", "state").unwrap_or_default(),
-            Ok(None) => "no binding row".to_owned(),
-            Err(_) => "no binding table (pre-N1)".to_owned(),
-        };
-        let owner_hash = tinycloud_core::hash::Hash::from(
-            owner_delegation_cid.parse::<tinycloud_auth::ipld_core::cid::Cid>()?,
-        );
-        let closure = conn
-            .query_one(Statement::from_sql_and_values(
-                backend,
-                "SELECT COUNT(*) AS n FROM policy_v3_owner_authority \
-                     WHERE policy_cid = ? AND delegation_id = ?",
-                [policy_cid.clone().into(), owner_hash.into()],
-            ))
-            .await;
-        let closure_has_share_root = match closure {
-            Ok(Some(row)) => format!("{}", row.try_get::<i64>("", "n").unwrap_or(-1) > 0),
-            Ok(None) => "no row".to_owned(),
-            Err(_) => "no closure table (pre-N1)".to_owned(),
-        };
-
-        // The space owner revokes the owner's (kv-only) delegation: the
-        // share root of the D3 design.
-        let mut capabilities = Capabilities::<Value>::new();
-        capabilities.with_action(
-            format!("urn:cid:{owner_delegation_cid}").parse()?,
-            "tinycloud.delegation/revoke".parse::<RecapAbility>()?,
-            [std::collections::BTreeMap::<String, Value>::new()],
-        );
-        let revocation = tinycloud_auth::authorization::TinyCloudRevocation::Ucan(Box::new(
-            Payload {
-                issuer: content_owner_vm.parse()?,
-                audience: content_owner_did.parse()?,
-                not_before: None,
-                expiration: NumericDate::try_from_seconds(
-                    (OffsetDateTime::now_utc() + Duration::seconds(60)).unix_timestamp() as f64,
-                )?,
-                nonce: Some("tc1423-kv-only-owner-revoke".into()),
-                facts: Some(Vec::new()),
-                proof: Vec::new(),
-                attenuation: capabilities,
-            }
-            .sign(Algorithm::EdDSA, &content_owner_jwk)?,
-        ));
-        let revoke_status = client
-            .post("/revoke")
-            .header(rocket::http::Header::new(
-                "Authorization",
-                revocation.encode()?,
-            ))
-            .dispatch()
-            .await
-            .status();
-        assert_eq!(revoke_status, Status::Ok, "owner revoke of the share root");
-
-        let reread_now = OffsetDateTime::now_utc();
-        let reread = Payload {
-            issuer: reader_vm.parse()?,
-            audience: reader_did.parse()?,
-            not_before: Some(NumericDate::try_from_seconds(
-                reread_now.unix_timestamp() as f64
-            )?),
-            expiration: NumericDate::try_from_seconds(
-                (reread_now + Duration::seconds(30)).unix_timestamp() as f64,
-            )?,
-            nonce: Some("tc1423-kv-only-reread".into()),
-            facts: Some(Vec::<Value>::new()),
-            proof: vec![child_cid],
-            attenuation: serde_json::from_value::<Capabilities<Value>>(
-                attenuation_for_policy_capabilities(&requested)
-                    .map_err(|(_, error)| anyhow::anyhow!(error))?,
-            )?,
-        }
-        .sign(Algorithm::EdDSA, &reader_jwk)?;
-        let reread_response = client
-            .post("/invoke")
-            .header(rocket::http::Header::new("Authorization", reread.encode()?))
-            .dispatch()
-            .await;
-        let reread_status = reread_response.status();
-        let reread_body = reread_response.into_string().await.unwrap_or_default();
-        let reread_outcome = if reread_status == Status::Ok {
-            format!("200, {} bytes (survives)", reread_body.len())
-        } else {
-            format!("{} {reread_body}", reread_status.code)
-        };
-        Ok((binding_state, closure_has_share_root, reread_outcome))
     }
 
     async fn run_policy_v2_flow(policy_owner: PolicyOwner) -> anyhow::Result<()> {
@@ -8603,6 +8568,16 @@ mod tests {
             runtime.signer.node_keypair(),
             encryption_backend,
         );
+        // Registration requires the source network to exist on this node and
+        // to be the content owner's (TC-1423 N1b). The self-named network of
+        // `KvOnlySelfNamedNetwork` is deliberately never created.
+        encryption
+            .create_one_of_one_network(tinycloud_core::encryption_network::CreateNetworkRequest {
+                name: "mainnet".into(),
+                owner_did: content_owner_did.clone(),
+                threshold: tinycloud_core::encryption_network::Threshold::one_of_one(),
+            })
+            .await?;
         let rocket = rocket::build()
             .mount(
                 "/",
@@ -8939,13 +8914,21 @@ mod tests {
             assert!(policy_v3_root::Entity::find().one(conn).await?.is_none());
             return Ok(());
         }
-        if policy_owner == PolicyOwner::KvOnlySelfNamedNetwork && register_status != Status::Ok {
+        if policy_owner == PolicyOwner::KvOnlySelfNamedNetwork {
             assert_eq!(
                 register_status,
                 Status::Forbidden,
                 "register: {register_body}"
             );
             assert_eq!(register_body, "content-source-network-invalid");
+            let conn = &client.rocket().state::<PolicyV3Runtime>().unwrap().conn;
+            assert!(
+                policy_v3_registration::Entity::find_by_id(policy_cid.clone())
+                    .one(conn)
+                    .await?
+                    .is_none()
+            );
+            assert!(policy_v3_root::Entity::find().one(conn).await?.is_none());
             return Ok(());
         }
         assert_eq!(register_status, Status::Ok, "register: {register_body}");
@@ -9376,35 +9359,6 @@ mod tests {
         let read_body = read_response.into_bytes().await.unwrap_or_default();
         assert_eq!(read_status, Status::Ok, "read response: {read_body:?}");
         assert_eq!(read_body, b"tc-470-real-content");
-
-        if policy_owner == PolicyOwner::KvOnlySelfNamedNetwork {
-            // Boxed: the shared flow's future is already close to the
-            // default test-thread stack.
-            let (binding_state, closure_has_share_root, reread_outcome) =
-                Box::pin(kv_only_self_network_report(
-                    &client,
-                    &policy_cid,
-                    owner_delegation_cid.clone(),
-                    &content_owner_vm,
-                    content_owner_did,
-                    &content_owner_jwk,
-                    &reader_vm,
-                    &reader_did,
-                    &reader_jwk,
-                    child_cid,
-                    &requested,
-                ))
-                .await?;
-            panic!(
-                "TC-1423 N1b RED: registration over a self-named network was ACCEPTED \
-                 (200; source network {encryption_resource} is named by the kv-only \
-                 policy owner and was never created); the admitted recipient read the \
-                 content (200, {} bytes); owner binding state: {binding_state}; closure \
-                 contains the share root: {closure_has_share_root}; read after the space \
-                 owner revoked the share root: {reread_outcome}",
-                read_body.len()
-            );
-        }
 
         // TC-541: hooks requests pass the same Policy/v3 gate as `/invoke`.
         // Policies can only grant `kv` and `encryption` capabilities, so no
