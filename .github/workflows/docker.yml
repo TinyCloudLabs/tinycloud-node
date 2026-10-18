@@ -594,6 +594,8 @@ jobs:
             exit 1
           fi
           echo "Running production revision ${RUNNING_REVISION} is an ancestor of ${GITHUB_SHA}."
+          # Later steps refuse a deployment older than what is running.
+          echo "RUNNING_REVISION=${RUNNING_REVISION}" >> "$GITHUB_ENV"
 
       - name: Preflight quota authority
         env:
@@ -689,6 +691,22 @@ jobs:
               crate = re.search(r'(?m)^version = "([^"]*)"$', git('show', f'{revision}:tinycloud-node-server/Cargo.toml'))
               if not crate or crate[1] != label[1]:
                   raise SystemExit(refuse)
+              require_release_descends(revision)
+
+          def is_ancestor(older, newer):
+              return subprocess.run(['git', 'merge-base', '--is-ancestor', older, newer], capture_output=True).returncode == 0
+
+          running = os.environ.get('RUNNING_REVISION', '')
+
+          def require_not_older_than_running(revision):
+              # No cross-migration downgrade: the running production revision
+              # must be the deployed image's revision or its ancestor.
+              if running and not is_ancestor(running, revision):
+                  raise SystemExit('::error::Refusing to deploy an image older than the running production revision; use the captured pre-N0 rollback for an intentional rollback')
+
+          def require_release_descends(revision):
+              if not re.fullmatch(r'[0-9a-f]{40}', running) or running == revision or not is_ancestor(running, revision):
+                  raise SystemExit('::error::Released image must be a strict descendant of the running production revision; deployment not attempted')
 
           pre_n0_hash = 'df239749ca0a9c09893a855ae2a8abb94090b8556515ad002105c58ac91f4c91'
           pre_n0_template_hash = '28302d6761d841b7cc5c11314aed2d377735e6bbdcaf85972a752e03bc9fdc93'
@@ -714,6 +732,7 @@ jobs:
               if os.environ['RESOLVED_IMAGE'] == reviewed:
                   if not n0_configuration and digest not in (pre_n0_hash, pre_n0_template_hash):
                       raise SystemExit('::error::Same-image recovery requires the exact current pre-N0 or reviewed N0 compose')
+                  require_not_older_than_running(os.environ['LABEL_REVISION'])
               elif n0_configuration:
                   require_release()
           content = raw.decode('utf-8')

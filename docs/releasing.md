@@ -289,6 +289,10 @@ gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref main \
   -f sql_identity_fence=false
 ```
 
+`rollback_image_version` and `rollback_image_revision` name the image being
+**deployed** (here the release), not an image to roll back to. Despite the
+input names, they are the recorded labels of `deploy_image_digest`.
+
 Before any CVM mutation the workflow requires:
 
 - the main compose, with its one node digest replaced by 64 zeros, to hash
@@ -304,7 +308,14 @@ Before any CVM mutation the workflow requires:
 - OCI labels `1.21.0-dstack` / `<release-commit-sha>`, the `v1.21.0` tag on
   that commit, its `Cargo.toml` at `1.21.0`, and the commit in main history.
   An untagged, mislabelled, feature-variant or freshly built image is
-  refused.
+  refused;
+- the release revision to be a **strict descendant** of the revision running
+  in production (read from the CVM's pinned image by the ancestry guard).
+  A downgrade (for example 1.20.5 or 1.0.0), the same revision as running,
+  or an unknown running revision is refused. The same ancestry rule makes
+  the 12c same-image command refuse an image older than the running
+  revision once 1.21.0 is live, so it cannot downgrade across migrations.
+  The captured pre-N0 rollback is the only intentional downgrade route.
 
 Sealed preflight, `BETTERSTACK_SOURCE_TOKEN` sealing with the
 `allowed_envs` sync, and the general quota reconciliation run as on every

@@ -32,6 +32,9 @@ RELEASE = {"deploy_image_digest": RELEASE_DIGEST, "image_version": "1.21.0",
            "rollback_image_version": "1.21.0", "rollback_image_revision": RELEASE_REVISION}
 RELEASED = {"1.21.0": (RELEASE_REVISION, "1.21.0")}
 RELEASE_N0 = N0.replace(DIGEST.encode(), RELEASE_DIGEST.encode())
+OLD_REVISION = "a" * 40
+ANCIENT_REVISION = "9" * 40
+ORDER = [ANCIENT_REVISION, OLD_REVISION, REVISION, RELEASE_REVISION]
 CANARIES = []
 
 
@@ -97,6 +100,10 @@ if name=='docker':
 elif name=='git':
     releases=json.loads(os.environ['TEST_RELEASES'])
     if args==['rev-parse','HEAD']: print('f'*40)
+    elif args[:2]==['merge-base','--is-ancestor'] and len(args)==4:
+        order=json.loads(os.environ['TEST_ORDER'])
+        ok=args[2] in order and args[3] in order and order.index(args[2])<=order.index(args[3])
+        sys.exit(0 if ok else 1)
     elif args[:3]==['rev-parse','--verify','--quiet'] and len(args)==4:
         tag=args[3]; assert tag.startswith('refs/tags/v') and tag.endswith('^{commit}')
         release=releases.get(tag[len('refs/tags/v'):-len('^{commit}')])
@@ -193,7 +200,7 @@ class SafeResult(unittest.TextTestResult):
 class RecoveryTests(unittest.TestCase):
     def run_deploy(self, compose=CURRENT, changes=None, *, fail_at="", artifact_error="", authority="node-override",
                    missing_billing=False, missing_authorization=False, approved_privacy="", event="workflow_dispatch",
-                   ref="refs/heads/main", oci_label=None, oci_revision=None, build_digest="", releases=RELEASED):
+                   ref="refs/heads/main", oci_label=None, oci_revision=None, build_digest="", releases=RELEASED, running=REVISION, order=None):
         inputs = {"deploy_phala": "true", "authorize_quota_values": "true", "image_version": "1.20.6",
                   "deploy_image_digest": DIGEST, "rollback_image_version": "1.20.6", "rollback_image_revision": REVISION,
                   "rollback_pre_n0": "false", "rollback_privacy_mode": "unselected", "sql_identity_fence": "false"}
@@ -249,7 +256,9 @@ class RecoveryTests(unittest.TestCase):
                         # Production maps both from PROD_TINYCLOUD_ADMIN_SECRET: one shared value.
                         "QUOTA_ADMIN_SECRET": canary, "QUOTA_BILLING_ADMIN_SECRET": canary,
                         # Production maps both from PROD_TINYCLOUD_QUOTA_URL: billing's base URL.
-                        "QUOTA_BILLING_URL": BILLING_URL, "PHALA_ENV_TINYCLOUD_QUOTA_URL": BILLING_URL, "TEST_RELEASES": json.dumps(releases)})
+                        "QUOTA_BILLING_URL": BILLING_URL, "PHALA_ENV_TINYCLOUD_QUOTA_URL": BILLING_URL, "TEST_RELEASES": json.dumps(releases),
+                        "TEST_ORDER": json.dumps(order or ORDER)})
+            if running: env["RUNNING_REVISION"] = running
             if missing_billing: env.pop("QUOTA_BILLING_ADMIN_SECRET")
             context = {"github.event_name": event, "github.ref": ref, "job.success": True,
                        **{"inputs." + key: (value == "true" if value in ("true", "false") else value) for key, value in inputs.items()}}
@@ -325,6 +334,37 @@ class RecoveryTests(unittest.TestCase):
             self.assertFalse(result["success"])
             self.assertNotIn("cvm-deploy", result["events"])
             self.assertEqual(result["compose"], N0)
+
+    def test_release_must_descend_from_the_running_revision(self):
+        digest = lambda ch: "sha256:" + ch * 64
+        def release(version, revision, ch):
+            return ({"deploy_image_digest": digest(ch), "image_version": version, "rollback_image_version": version,
+                     "rollback_image_revision": revision}, {version: (revision, version)})
+        for name, version, revision, ch, running, ok in (
+                ("1.21.0 over running 1.20.6", "1.21.0", RELEASE_REVISION, "b", REVISION, True),
+                ("1.20.5 downgrade", "1.20.5", OLD_REVISION, "d", REVISION, False),
+                ("1.0.0 downgrade", "1.0.0", ANCIENT_REVISION, "e", REVISION, False),
+                ("same revision as running", "1.21.0", RELEASE_REVISION, "b", RELEASE_REVISION, False),
+                ("running revision unknown", "1.21.0", RELEASE_REVISION, "b", "", False)):
+            with self.subTest(name):
+                changes, releases = release(version, revision, ch)
+                result = self.run_deploy(N0, changes, releases=releases, running=running)
+                self.assertEqual(result["success"], ok)
+                if not ok:
+                    self.assertNotIn("cvm-deploy", result["events"])
+                    self.assertEqual(result["compose"], N0)
+
+    def test_same_image_recovery_refuses_an_older_image_than_running(self):
+        for compose in (PRE_N0_TEMPLATE, N0):
+            with self.subTest(n0=compose == N0):
+                result = self.run_deploy(compose, running=RELEASE_REVISION)
+                self.assertFalse(result["success"])
+                self.assertNotIn("cvm-deploy", result["events"])
+                self.assertEqual(result["compose"], compose)
+        with self.subTest("explicit rollback is exempt"):
+            result = self.run_deploy(N0, {"rollback_pre_n0": "true", "rollback_privacy_mode": "keep-json-file"},
+                                     approved_privacy="keep-json-file", running=RELEASE_REVISION)
+            self.assertTrue(result["success"])
 
     def test_n0_template_drift_refuses_release_digest(self):
         node_line = b"    image: ghcr.io/tinycloudlabs/tinycloud-node@" + DIGEST.encode() + b"\n"
