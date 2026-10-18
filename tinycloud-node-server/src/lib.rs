@@ -107,7 +107,8 @@ use hooks::HookRuntime;
 use invocation_replay::InvocationReplayCache;
 use node_control::control::ControlPlaneHandle;
 use policy_v3::{
-    authorize_delivery as authorize_policy_v3_delivery, challenge as policy_v3_challenge,
+    authorize_delivery as authorize_policy_v3_delivery,
+    authorized_policies as authorized_policies_v3, challenge as policy_v3_challenge,
     get_status as get_policy_v3_status, issue_enforcer_binding as policy_v3_enforcer_binding,
     mint as policy_v3_mint, register_policy as register_policy_v3,
     revoke_root as revoke_policy_v3_root, status as policy_v3_status, PolicyV3Runtime,
@@ -429,6 +430,7 @@ pub fn resolve_runtime_config(tinycloud_config: &Config) -> Result<Config> {
         .epoch_head_backfill
         .validate()
         .map_err(anyhow::Error::msg)?;
+    resolved.policy_v3.validate().map_err(anyhow::Error::msg)?;
     tracing::RequestIdOrigins::new(&resolved.log.request_id_first_party_origins)
         .map_err(anyhow::Error::msg)?;
     resolved.storage.resolve();
@@ -489,6 +491,7 @@ fn production_routes() -> Vec<Route> {
         policy_v3_mint,
         policy_v3_status,
         revoke_policy_v3_root,
+        authorized_policies_v3,
     ]
 }
 
@@ -678,7 +681,9 @@ pub async fn app_with_control(
 
     let mut policy_v3_runtime =
         PolicyV3Runtime::new(seed_conn.clone(), key_setup.node_did(), key_setup.clone())
-            .with_sqlite_writer_lock(tinycloud.sqlite_writer_lock());
+            .with_sqlite_writer_lock(tinycloud.sqlite_writer_lock())
+            .with_policy_config(&tinycloud_config.policy_v3);
+    policy_v3_runtime.log_owner_authority_cutover().await;
     if tinycloud_config.share_email.enabled {
         policy_v3_runtime = policy_v3_runtime.with_delivery(&tinycloud_config.share_email)?;
     }
@@ -741,6 +746,7 @@ pub async fn app_with_control(
     let telemetry_enabled = tinycloud_config.telemetry.enabled;
     let telemetry_tinycloud = tinycloud.clone();
     let backfill_tinycloud = tinycloud.clone();
+    let owner_binding_runtime = policy_v3_runtime.clone();
 
     let rocket = rocket::custom(config)
         .attach(AdHoc::on_liftoff("webhook-egress-refresh", {
@@ -860,6 +866,29 @@ pub async fn app_with_control(
                 });
             })
         }))
+    } else {
+        rocket
+    };
+
+    // TC-1423: opt-in sweep that classifies Policy/v3 registrations made
+    // before owner-authority bindings existed. They are classified on first
+    // use without it.
+    let rocket = if tinycloud_config.policy_v3.owner_binding_backfill.enabled {
+        let sweep_config = tinycloud_config.policy_v3.owner_binding_backfill.clone();
+        rocket.attach(AdHoc::on_liftoff(
+            "policy-owner-binding-backfill",
+            move |rocket| {
+                let runtime = owner_binding_runtime.clone();
+                let sweep_config = sweep_config.clone();
+                let shutdown = rocket.shutdown();
+                Box::pin(async move {
+                    tokio::spawn(async move {
+                        policy_v3::run_owner_binding_backfill(&runtime, &sweep_config, shutdown)
+                            .await;
+                    });
+                })
+            },
+        ))
     } else {
         rocket
     };

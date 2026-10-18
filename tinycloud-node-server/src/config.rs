@@ -52,6 +52,8 @@ pub struct Config {
     pub retention: RetentionConfig,
     #[serde(default)]
     pub epoch_head_backfill: EpochHeadBackfillConfig,
+    #[serde(default)]
+    pub policy_v3: PolicyV3Config,
 }
 
 /// Production exact-email composition.  The capability remains unavailable
@@ -980,6 +982,77 @@ impl EpochHeadBackfillConfig {
         }
         if self.progress_every == 0 {
             return Err("epoch_head_backfill.progress_every must be at least 1");
+        }
+        Ok(())
+    }
+}
+
+/// Policy/v3 owner-authority bindings (TC-1423). Section `[policy_v3]`.
+#[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq, Default)]
+pub struct PolicyV3Config {
+    /// Registrations before this instant (RFC 3339) are classified as legacy.
+    /// Unset: the applied-at time of the migration that created the binding
+    /// tables. Set it to the first deploy time after a rollback and
+    /// re-upgrade (the rollback drops that migration record). Env
+    /// `TINYCLOUD_POLICY_V3__LEGACY_CUTOVER`.
+    #[serde(default)]
+    pub legacy_cutover: Option<String>,
+    #[serde(default)]
+    pub owner_binding_backfill: OwnerBindingBackfillConfig,
+}
+
+impl PolicyV3Config {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if let Some(cutover) = &self.legacy_cutover {
+            time::OffsetDateTime::parse(cutover, &time::format_description::well_known::Rfc3339)
+                .map_err(|_| "policy_v3.legacy_cutover must be an RFC 3339 timestamp")?;
+        }
+        self.owner_binding_backfill.validate()
+    }
+
+    /// The configured legacy cutover, if any. Call [`Self::validate`] first.
+    pub fn legacy_cutover(&self) -> Option<time::OffsetDateTime> {
+        self.legacy_cutover.as_deref().and_then(|value| {
+            time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339).ok()
+        })
+    }
+}
+
+/// The online sweep that classifies Policy/v3 registrations made before the
+/// binding tables existed. Policies are classified lazily on first use
+/// without it; the sweep only moves that work off the request path.
+///
+/// Off by default: production PostgreSQL is CPU-bound. Section
+/// `[policy_v3.owner_binding_backfill]`; env
+/// `TINYCLOUD_POLICY_V3__OWNER_BINDING_BACKFILL__ENABLED`,
+/// `TINYCLOUD_POLICY_V3__OWNER_BINDING_BACKFILL__POLICIES_PER_SECOND`.
+#[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
+pub struct OwnerBindingBackfillConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Upper bound on policies classified per second. After each policy the
+    /// sweep also pauses at least as long as that policy took.
+    #[serde(default = "default_owner_binding_backfill_policies_per_second")]
+    pub policies_per_second: u32,
+}
+
+fn default_owner_binding_backfill_policies_per_second() -> u32 {
+    1
+}
+
+impl Default for OwnerBindingBackfillConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            policies_per_second: default_owner_binding_backfill_policies_per_second(),
+        }
+    }
+}
+
+impl OwnerBindingBackfillConfig {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.enabled && self.policies_per_second == 0 {
+            return Err("policy_v3.owner_binding_backfill.policies_per_second must be at least 1; set enabled = false to turn the sweep off");
         }
         Ok(())
     }

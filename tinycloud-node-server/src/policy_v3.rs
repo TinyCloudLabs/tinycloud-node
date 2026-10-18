@@ -93,6 +93,10 @@ const EMAIL_DOMAIN_PROOF_PROFILE: &str = "tinycloud.email-domain-proof/v1";
 const MAX_OWNER_AUTHORITY_CANDIDATES: usize = 32;
 const MAX_OWNER_AUTHORITY_ROWS: u64 = 256;
 
+#[path = "policy_v3/owner_authority.rs"]
+mod owner_authority;
+pub use owner_authority::{authorized_policies, run_owner_binding_backfill};
+
 #[derive(Clone)]
 struct DeliveryRuntime {
     target_origin: String,
@@ -108,6 +112,7 @@ pub struct PolicyV3Runtime {
     credential_issuer: Option<IssuerKey>,
     delivery: Option<DeliveryRuntime>,
     sqlite_writer_lock: Option<Arc<tokio::sync::Mutex<()>>>,
+    owner_authority: Arc<owner_authority::OwnerAuthorityState>,
 }
 
 impl PolicyV3Runtime {
@@ -123,6 +128,7 @@ impl PolicyV3Runtime {
             credential_issuer: None,
             delivery: None,
             sqlite_writer_lock: None,
+            owner_authority: Arc::default(),
         }
     }
 
@@ -1854,15 +1860,29 @@ pub async fn register_policy(
         .get("ownerDid")
         .and_then(Value::as_str)
         .ok_or((Status::BadRequest, "policy-owner-missing".into()))?;
-    for root in [&policy_root, &enforcement_root] {
-        owner_holds_capabilities(
-            &runtime.conn,
-            owner_did,
-            &root.0.capabilities,
-            OffsetDateTime::now_utc(),
+    // Both roots carry the same capabilities (`validate_root_pair`), so one
+    // selection covers both. The chosen authority is recorded with the
+    // registration below.
+    let authority = owner_authority::classify(
+        &runtime.conn,
+        owner_did,
+        &policy_root.0.capabilities,
+        OffsetDateTime::now_utc(),
+        None,
+        policy_root
+            .0
+            .expiry
+            .ok_or((Status::Forbidden, "sibling-root-mismatch".into()))?,
+    )
+    .await
+    .map_err(|_| {
+        (
+            Status::Forbidden,
+            "policy-owner-authority-unavailable".into(),
         )
-        .await
-        .map_err(|error| (Status::Forbidden, error.into()))?;
+    })?;
+    if authority.state == owner_authority::BindingState::Unknown {
+        return Err((Status::Forbidden, "policy-owner-not-authorized".into()));
     }
     for root in [&policy_root, &enforcement_root] {
         for space in root.0.spaces() {
@@ -1956,6 +1976,15 @@ pub async fn register_policy(
         .insert(&txn)
         .await
         .map_err(|e| (Status::Conflict, e.to_string()))?;
+    owner_authority::insert_classification(
+        &txn,
+        &request.policy_cid,
+        &authority,
+        owner_authority::RegisteredMode::Record,
+        now,
+    )
+    .await
+    .map_err(db_error)?;
     for (cid, role, bytes, status) in [
         (
             policy_root_cid.clone(),
@@ -2779,6 +2808,15 @@ impl PolicyV3Runtime {
             now,
         )
         .map_err(|_| "enforcer-binding-invalid")?;
+        // TC-1423: classify a registration made before owner-authority
+        // bindings existed on its first use. Recorded only; the result does
+        // not gate this request.
+        if self.owner_binding(registration).await.is_err() {
+            ::tracing::debug!(
+                event = "policy_owner_authority",
+                "policy owner-authority classification unavailable"
+            );
+        }
         Ok(())
     }
 }

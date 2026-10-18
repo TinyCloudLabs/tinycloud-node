@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changes
+
+- Policy/v3 registration records which of the owner's delegations granted what the policy roots carry, with their ancestor closure, in two new tables (migration `m20261019_000000_policy_v3_owner_authority`; its `down` drops both). Delegations from the owner of the capability's space or encryption network are tried before the general window of recent delegations to the owner; a delegation whose ancestry includes one issued by the policy owner is never recorded; a grant that outlives the root is preferred. Policies registered before the migration are classified on first use, or by an opt-in sweep (`policy_v3.owner_binding_backfill.enabled`, off by default). The legacy cutover defaults to the migration's applied-at time, is logged at boot, and `policy_v3.legacy_cutover` overrides it after a rollback and re-upgrade. New `POST /policy/v3/authorized` lists the policies whose recorded authority includes a delegation, authorized like `/delegation/status`. The record does not change admission yet. See `docs/policy-owner-authority.md` (TC-1423).
+
 ## [1.21.0] - 2026-10-18
 
 ### Release notes
