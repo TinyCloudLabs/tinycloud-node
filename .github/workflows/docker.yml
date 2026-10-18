@@ -416,7 +416,7 @@ jobs:
       - uses: actions/checkout@v4
 
       # TC-970: no ticket, identifier or client address in the ingress logs;
-      # TC-910 header buffers and the 32 MB body limit still hold. Runs before
+      # TC-910 header buffers and the 95 MiB body limit still hold. Runs before
       # the push so a failing wrapper is never published.
       - name: Test redacted ingress logging
         run: deploy/ingress/test-redacted-logging.sh
