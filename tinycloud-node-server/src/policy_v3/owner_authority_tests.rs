@@ -1353,7 +1353,7 @@ async fn loop_back_delegations_are_skipped_in_the_general_window(
         )
         .await?;
     let authority_encoded =
-        intermediary.delegate(h.owner.did(), &grants, window, &[upstream.parse()?])?;
+        high_id(|| intermediary.delegate(h.owner.did(), &grants, window, &[upstream.parse()?]))?;
     let authority_id = graph_id(&authority_encoded)?;
     let authority = h.import(authority_encoded).await?;
     let link_holder = Signer::key();
