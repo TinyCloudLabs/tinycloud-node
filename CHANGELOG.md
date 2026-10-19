@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+### Changes
+
 - Authorized reads no longer wait without limit for their audit record (TC-1317). Every read (KV get/list/metadata/sync, capabilities read, and the authorization step of SQL, DuckDB, space info, `/signed/kv` and `/encryption/networks`) waits for its invocation record to commit before its data is returned. That wait used to have no bound, and one serial queue served every account.
   - **Bounded wait.** A read waits at most `database.read_audit_wait_ms` (20 s) and is then answered `503 read_audit_busy: the read audit is backlogged; retry the request` with `Retry-After: 5`, without its data. The node refuses to start with `read_audit_wait_ms = 0`, which would answer every read busy. A batch that fails with a transient database error is now `503 unavailable_retryable` instead of 500; other batch failures stay 500, and none of them is reported as 401 any more.
   - **The invariant is unchanged and tested:** no read's data is returned unless its audit record has committed.
@@ -18,6 +20,7 @@
   - **Logging.** Typed warnings `SQL busy: lock wait|hydration|artifact transfer` (fields `error_class`, `stage`, `bound_ms`, `waited_ms`), `Database hydration gave up loading its artifact` and `Request deadline exceeded` (`stage`, `deadline_ms`) are new. The log shipper maps them to `sql_busy_*`, `sql_hydration_timeout`, `request_timeout` and `deadline_overrun`. The embedded Vector configuration is regenerated, so the reviewed N0 compose template changes to `00938226…` (raw `b25b8414…`; `docs/releasing.md`).
   - **Not covered.** DuckDB's lock and hydration waits are still unbounded, and a DuckDB request is not cut by the deadline once it reaches the DuckDB service; this is unchanged from before (TC-1412). Disconnect detection is TC-1400, bounding SQLite statement execution is TC-1401, and bounding identity resolution's artifact read is TC-1403 (until then only the deadline bounds it).
   - **Any write statement cut short counts as possibly applied.** A write statement (autocommit or `execute_idempotent`) whose future is dropped before its result arrives is now recorded as possibly applied, so the failure is reported as an unknown outcome instead of a safe retry.
+- Every response that carries an `ETag` now also carries `Cache-Control: no-transform` (TC-1432): KV get/head/metadata (200 and 304), KV put, the public KV read routes (200, 304 and metadata), signed-URL reads (200, 206, 304, 416) and the share-email responses that set an `ETag`. A CDN that re-compresses a response must weaken its strong `ETag` to `W/"…"`, and `If-Match` compare-and-swap only accepts the strong `"blake3-<hex>"` value. Existing `Cache-Control` directives (`private, no-cache`, `private, no-store`, `public, max-age=60`, `no-store`) are kept and `no-transform` is appended; responses without an `ETag` (KV list, SQL, error responses including 412) are unchanged. Bodies, `ETag` values and status codes are unchanged.
 
 ## [1.21.0] - 2026-10-18
 

@@ -932,15 +932,68 @@ pub async fn app_with_control(
         .first()
         .cloned()
         .unwrap_or_else(|| tinycloud_config.share_email.return_origin.clone());
-    let rocket = rocket
-        .attach(share_security_fairing(share_allowed_origin))
-        .attach(retry_after_fairing());
+    let rocket = attach_response_fairings(rocket, share_allowed_origin);
 
     if tinycloud_config.cors {
         Ok(rocket.attach(cors_fairing()))
     } else {
         Ok(rocket)
     }
+}
+
+/// The response fairings every node mounts, in the order they must run.
+///
+/// [`no_transform_fairing`] runs after [`share_security_fairing`] because that
+/// fairing replaces `Cache-Control` on the share paths.
+fn attach_response_fairings(rocket: Rocket<Build>, share_allowed_origin: String) -> Rocket<Build> {
+    rocket
+        .attach(share_security_fairing(share_allowed_origin))
+        .attach(retry_after_fairing())
+        .attach(no_transform_fairing())
+}
+
+/// `Cache-Control: no-transform` on every response that carries an `ETag`
+/// (TC-1432).
+///
+/// A CDN that re-encodes a response (gzip/brotli) must turn a strong `ETag`
+/// into a weak one (RFC 9110 8.8.3), and a weak `ETag` is refused by `If-Match`
+/// (RFC 9110 13.1.1). TinyCloud's KV compare-and-swap needs the strong
+/// `"blake3-<hex>"` value to survive the edge, so the node forbids the
+/// re-encoding. Existing `Cache-Control` directives are kept. Responses
+/// without an `ETag` are untouched.
+fn no_transform_fairing() -> AdHoc {
+    AdHoc::on_response("etag-no-transform", |_, response| {
+        Box::pin(async move { add_no_transform_to_etag_response(response) })
+    })
+}
+
+fn add_no_transform_to_etag_response(response: &mut rocket::Response<'_>) {
+    if !response.headers().contains("ETag") {
+        return;
+    }
+    let existing: Vec<String> = response
+        .headers()
+        .get("Cache-Control")
+        .map(str::to_owned)
+        .collect();
+    let has_no_transform = existing.iter().any(|value| {
+        value.split(',').any(|directive| {
+            directive
+                .split('=')
+                .next()
+                .is_some_and(|name| name.trim().eq_ignore_ascii_case("no-transform"))
+        })
+    });
+    if has_no_transform {
+        return;
+    }
+    let mut directives: Vec<&str> = existing
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .collect();
+    directives.push("no-transform");
+    response.set_header(Header::new("Cache-Control", directives.join(", ")));
 }
 
 /// How long, in seconds, a browser may reuse a CORS preflight result for the
@@ -1919,5 +1972,299 @@ mod retry_after_fairing_tests {
             response.into_string().await.unwrap(),
             routes::REQUEST_TIMEOUT_BODY
         );
+    }
+}
+
+/// TC-1432: every `ETag`-bearing response forbids CDN re-encoding, which would
+/// weaken the strong `ETag` that `If-Match` compare-and-swap needs.
+#[cfg(test)]
+mod no_transform_fairing_tests {
+    use super::attach_response_fairings;
+    use crate::{auth_guards::KVResponse, signed_urls::SignedKvReadResponse};
+    use futures::io::Cursor;
+    use rocket::{
+        get,
+        http::{Header, Status},
+        local::asynchronous::Client,
+        response::Response,
+        routes,
+    };
+    use std::collections::BTreeMap;
+    use tinycloud_core::{hash::hash, storage::Content, types::Metadata};
+
+    const ETAG: &str =
+        "\"blake3-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"";
+
+    struct Stub(Response<'static>);
+
+    impl<'r> rocket::response::Responder<'r, 'static> for Stub {
+        fn respond_to(self, _: &'r rocket::Request<'_>) -> rocket::response::Result<'static> {
+            Ok(self.0)
+        }
+    }
+
+    fn stub(
+        etag: bool,
+        cache_control: &'static [&'static str],
+        status: Status,
+    ) -> Response<'static> {
+        let mut response = Response::build();
+        response.status(status);
+        if etag {
+            response.header(Header::new("ETag", ETAG));
+        }
+        for value in cache_control {
+            response.header_adjoin(Header::new("Cache-Control", *value));
+        }
+        response
+            .sized_body(2, std::io::Cursor::new("ok"))
+            .finalize()
+    }
+
+    #[get("/etag")]
+    fn etag_only() -> Stub {
+        Stub(stub(true, &[], Status::Ok))
+    }
+
+    #[get("/etag-private")]
+    fn etag_private() -> Stub {
+        Stub(stub(true, &["private, no-cache"], Status::Ok))
+    }
+
+    #[get("/etag-no-store")]
+    fn etag_no_store() -> Stub {
+        Stub(stub(true, &["no-store"], Status::Ok))
+    }
+
+    #[get("/etag-two-headers")]
+    fn etag_two_headers() -> Stub {
+        Stub(stub(true, &["private", "max-age=0"], Status::Ok))
+    }
+
+    #[get("/etag-already")]
+    fn etag_already() -> Stub {
+        Stub(stub(true, &["No-Transform, private"], Status::Ok))
+    }
+
+    #[get("/etag-empty-cache-control")]
+    fn etag_empty_cache_control() -> Stub {
+        Stub(stub(true, &[""], Status::Ok))
+    }
+
+    #[get("/etag-304")]
+    fn etag_not_modified() -> Stub {
+        Stub(stub(true, &["private, no-cache"], Status::NotModified))
+    }
+
+    #[get("/etag-412")]
+    fn etag_precondition_failed() -> Stub {
+        Stub(stub(true, &["private"], Status::PreconditionFailed))
+    }
+
+    #[get("/plain")]
+    fn plain() -> Stub {
+        Stub(stub(false, &[], Status::Ok))
+    }
+
+    #[get("/plain-cache")]
+    fn plain_cache() -> Stub {
+        Stub(stub(false, &["public, max-age=60"], Status::Ok))
+    }
+
+    #[get("/policy/v3/etag")]
+    fn share_path_etag() -> Stub {
+        Stub(stub(true, &["public, max-age=60"], Status::Ok))
+    }
+
+    #[get("/policy/v3/plain")]
+    fn share_path_plain() -> Stub {
+        Stub(stub(false, &[], Status::Ok))
+    }
+
+    #[get("/kv")]
+    fn kv() -> KVResponse<Cursor<Vec<u8>>> {
+        let content = b"hello".to_vec();
+        KVResponse::new(
+            Metadata(BTreeMap::new()),
+            hash(&content),
+            Content::new(content.len() as u64, Cursor::new(content)),
+        )
+    }
+
+    #[get("/signed/<variant>")]
+    fn signed(variant: &str) -> SignedKvReadResponse<Cursor<Vec<u8>>> {
+        let hash = hash(b"hello world");
+        let metadata = Metadata(BTreeMap::new());
+        match variant {
+            "full" => SignedKvReadResponse::Full {
+                metadata,
+                hash,
+                content: Content::new(11, Cursor::new(b"hello world".to_vec())),
+            },
+            _ => SignedKvReadResponse::Unsatisfiable {
+                hash,
+                total_size: 11,
+            },
+        }
+    }
+
+    async fn client() -> Client {
+        Client::tracked(attach_response_fairings(
+            rocket::build().mount(
+                "/",
+                routes![
+                    etag_only,
+                    etag_private,
+                    etag_no_store,
+                    etag_two_headers,
+                    etag_already,
+                    etag_empty_cache_control,
+                    etag_not_modified,
+                    etag_precondition_failed,
+                    plain,
+                    plain_cache,
+                    share_path_etag,
+                    share_path_plain,
+                    kv,
+                    signed,
+                ],
+            ),
+            "https://share.tinycloud.xyz".into(),
+        ))
+        .await
+        .expect("valid Rocket instance")
+    }
+
+    async fn cache_control(client: &Client, path: &str) -> (Status, Vec<String>, bool) {
+        let response = client.get(path).dispatch().await;
+        let status = response.status();
+        let values = response
+            .headers()
+            .get("Cache-Control")
+            .map(str::to_owned)
+            .collect();
+        let etag = response.headers().get_one("ETag").is_some();
+        (status, values, etag)
+    }
+
+    #[tokio::test]
+    async fn etag_response_without_cache_control_gets_no_transform() {
+        let client = client().await;
+        let response = client.get("/etag").dispatch().await;
+        assert_eq!(response.status(), Status::Ok);
+        assert_eq!(response.headers().get_one("ETag"), Some(ETAG));
+        assert_eq!(
+            response.headers().get_one("Cache-Control"),
+            Some("no-transform")
+        );
+        assert_eq!(response.into_string().await.as_deref(), Some("ok"));
+    }
+
+    #[tokio::test]
+    async fn existing_cache_control_directives_are_preserved() {
+        let client = client().await;
+        for (path, expected) in [
+            ("/etag-private", "private, no-cache, no-transform"),
+            ("/etag-no-store", "no-store, no-transform"),
+            ("/etag-two-headers", "private, max-age=0, no-transform"),
+            ("/etag-empty-cache-control", "no-transform"),
+        ] {
+            let (status, values, etag) = cache_control(&client, path).await;
+            assert_eq!(status, Status::Ok, "{path}");
+            assert!(etag, "{path}");
+            assert_eq!(values, vec![expected.to_string()], "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_existing_no_transform_is_not_duplicated() {
+        let client = client().await;
+        let (_, values, _) = cache_control(&client, "/etag-already").await;
+        assert_eq!(values, vec!["No-Transform, private".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn not_modified_and_precondition_failed_etag_responses_get_no_transform() {
+        let client = client().await;
+        for (path, status) in [
+            ("/etag-304", Status::NotModified),
+            ("/etag-412", Status::PreconditionFailed),
+        ] {
+            let (got, values, etag) = cache_control(&client, path).await;
+            assert_eq!(got, status, "{path}");
+            assert!(etag, "{path}");
+            assert_eq!(values.len(), 1, "{path}");
+            assert!(values[0].ends_with(", no-transform"), "{path}: {values:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_without_an_etag_are_unchanged() {
+        let client = client().await;
+        let (_, values, etag) = cache_control(&client, "/plain").await;
+        assert!(values.is_empty() && !etag);
+        let (_, values, etag) = cache_control(&client, "/plain-cache").await;
+        assert_eq!(values, vec!["public, max-age=60".to_string()]);
+        assert!(!etag);
+        // An absent route (404 catcher) carries no ETag either.
+        let (status, values, _) = cache_control(&client, "/missing").await;
+        assert_eq!(status, Status::NotFound);
+        assert!(values.is_empty());
+    }
+
+    /// The share fairing replaces `Cache-Control` with `no-store`; the
+    /// `no-transform` merge must run after it.
+    #[tokio::test]
+    async fn share_paths_keep_no_store_and_add_no_transform_only_with_an_etag() {
+        let client = client().await;
+        let (_, values, _) = cache_control(&client, "/policy/v3/etag").await;
+        assert_eq!(values, vec!["no-store, no-transform".to_string()]);
+        let (_, values, _) = cache_control(&client, "/policy/v3/plain").await;
+        assert_eq!(values, vec!["no-store".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn kv_get_responder_keeps_status_etag_and_body() {
+        let client = client().await;
+        let response = client.get("/kv").dispatch().await;
+        assert_eq!(response.status(), Status::Ok);
+        assert_eq!(
+            response.headers().get_one("Cache-Control"),
+            Some("private, no-cache, no-transform")
+        );
+        let etag = response.headers().get_one("ETag").unwrap().to_string();
+        assert!(etag.starts_with("\"blake3-") && !etag.starts_with("W/"));
+        assert_eq!(response.into_string().await.as_deref(), Some("hello"));
+
+        let not_modified = client
+            .get("/kv")
+            .header(Header::new("If-None-Match", etag.clone()))
+            .dispatch()
+            .await;
+        assert_eq!(not_modified.status(), Status::NotModified);
+        assert_eq!(not_modified.headers().get_one("ETag"), Some(etag.as_str()));
+        assert_eq!(
+            not_modified.headers().get_one("Cache-Control"),
+            Some("private, no-cache, no-transform")
+        );
+        assert!(not_modified.into_string().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn signed_url_responses_keep_no_store_and_add_no_transform() {
+        let client = client().await;
+        for (path, status) in [
+            ("/signed/full", Status::Ok),
+            ("/signed/unsatisfiable", Status::RangeNotSatisfiable),
+        ] {
+            let response = client.get(path).dispatch().await;
+            assert_eq!(response.status(), status, "{path}");
+            assert!(response.headers().get_one("ETag").is_some(), "{path}");
+            assert_eq!(
+                response.headers().get_one("Cache-Control"),
+                Some("private, no-store, no-transform"),
+                "{path}"
+            );
+        }
     }
 }
