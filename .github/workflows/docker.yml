@@ -978,6 +978,25 @@ jobs:
             exit 1
           fi
 
+          # TC-1482: the node keeps GET /admin/stats disabled (404) when the token
+          # equals TINYCLOUD_ADMIN_SECRET or is shorter than 32 bytes (surrounding
+          # whitespace ignored), which would surface only as an OpenKey 503. Refuse
+          # both here, before anything is written, with constant messages; no value
+          # is printed. `wc -c` counts bytes.
+          if [ -n "${PHALA_ENV_NODE_STATS_READ_TOKEN:-}" ]; then
+            if [ "$PHALA_ENV_NODE_STATS_READ_TOKEN" = "$PHALA_ENV_TINYCLOUD_ADMIN_SECRET" ]; then
+              echo "::error::NODE_STATS_READ_TOKEN must differ from TINYCLOUD_ADMIN_SECRET"
+              exit 1
+            fi
+            stats_token_trimmed="${PHALA_ENV_NODE_STATS_READ_TOKEN#"${PHALA_ENV_NODE_STATS_READ_TOKEN%%[![:space:]]*}"}"
+            stats_token_trimmed="${stats_token_trimmed%"${stats_token_trimmed##*[![:space:]]}"}"
+            if [ "$(printf '%s' "$stats_token_trimmed" | wc -c)" -lt 32 ]; then
+              echo "::error::NODE_STATS_READ_TOKEN must be at least 32 bytes"
+              exit 1
+            fi
+            unset stats_token_trimmed
+          fi
+
           # Also restrict a file left by an earlier failed runner step before
           # writing any value; umask alone does not tighten an existing file.
           : > .phala-prod.env

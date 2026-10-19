@@ -166,18 +166,47 @@ compose. Release notes for that release must say so.
   or empty, the line is not written, the node starts normally and the route
   is disabled (`404`, as for an unknown route). `--validate-config` and the
   compose validation do not read it. A multi-line value fails before any CVM
-  mutation. Once a deploy has added the name to the CVM's `allowed_envs`,
-  later deploys must keep supplying it (the whitelist check requires every
-  allowed name to be present in the sealed file).
-- The value must differ from `PROD_TINYCLOUD_ADMIN_SECRET`; if equal the
-  node keeps the route disabled.
-- Operator steps: Bobbie generates the token; Amos stores it as the
-  `PROD_TINYCLOUD_NODE_STATS_READ_TOKEN` environment secret before the
-  release deploy (via stdin, never printed, so the deploy seals it into the
-  Phala env); the same value is set as OpenKey's `NODE_STATS_READ_TOKEN`.
+  mutation.
+- When set, the deploy step **refuses**, before it writes the sealed file and
+  with a constant message that names no value, a token that equals
+  `PROD_TINYCLOUD_ADMIN_SECRET` (`NODE_STATS_READ_TOKEN must differ from
+  TINYCLOUD_ADMIN_SECRET`) and a token shorter than 32 bytes
+  (`NODE_STATS_READ_TOKEN must be at least 32 bytes`; surrounding whitespace
+  is not counted). The node itself keeps the route at `404` for either value,
+  so without this check the mistake would surface only as OpenKey's `503`.
 - `ops/rollback/pre-n0-compose.yaml` and `pre-n0-stop-local-logs.yaml` are not
   changed: they are pinned by raw hash, restore the 1.20.6 image, which does
   not read this variable, and the rollback leaves the route absent.
+
+Items for the release notes of the release that ships this:
+
+- **(a) Registration.** No registration is needed if production uses Phala's
+  centralized KMS. Amos confirms that before the deploy with
+  `phala cvms get tinycloud-node` (output stays private). If it is an on-chain
+  KMS, a reviewed `addComposeHash` is needed first. dstack's `compose_hash`
+  changes at the deploy, and again when the first deploy adds the token name
+  to `allowed_envs`.
+- **(b) Node DID.** The node DID is unchanged across the compose-hash change:
+  the key path is `tinycloud/keys/primary`, derived from the app id and that
+  path. The post-deploy DID and key-fingerprint gate stays.
+- **(c) Rule: never delete or blank `PROD_TINYCLOUD_NODE_STATS_READ_TOKEN`
+  while the name is in the CVM's `allowed_envs`.** A later deploy without it
+  fails closed before any CVM mutation with exactly
+  `::error::allowed_envs synchronization failed during complete whitelist validation; response details withheld.`
+  (the whitelist check requires every allowed name to be present in the sealed
+  file), and it also blocks rollback and same-image recovery, which use the same
+  deploy step. Removing the name later is a manual, reviewed Phala
+  control-plane operation: set `allowed_envs` without the name and a
+  re-encrypted env set without it (this changes `compose_hash` again), then
+  delete the secret.
+- **(d) First deploy.** The first deploy with the token set restarts the CVM
+  twice: dstack skips the not-yet-allowed key, so the route is `404` on that
+  boot, and the post-deploy sync adds the name. [inference from the sync code;
+  not observed live]
+- **(e) Token.** Bobbie generates a 32-byte hex token (`openssl rand -hex 32`,
+  64 characters). Amos puts it into the Phala env through the deploy, by
+  setting the `production` environment secret from stdin, never printed. The
+  same value is set as OpenKey's `NODE_STATS_READ_TOKEN`.
 
 Every `deploy_phala=true` command must explicitly include
 **`-f authorize_quota_values=true`**. This authorizes the reviewed values
