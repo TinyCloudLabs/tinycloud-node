@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Changes
+
+- New migration `m20261020_000000_current_kv_key_c_index` adds `idx_current_kv_space_deleted_key_c ON current_kv (space, deleted, (key COLLATE "C"))` (TC-1274). The KV list range select compares `key COLLATE "C"`, which the existing index, built in the column's own collation, cannot seek on under a non-`C` database collation such as production's `en_US.UTF-8`; it read and filtered every live key of the space. No query changed: the planner matches the new index. **Operator step before deploy** (PostgreSQL): build the index with `CREATE INDEX CONCURRENTLY IF NOT EXISTS` outside any transaction and check `pg_index.indisvalid`; the exact statements are in `docs/releasing.md`. The migration then does nothing when a valid index of that shape exists, fails with the `DROP INDEX CONCURRENTLY` / `CREATE INDEX CONCURRENTLY` instructions when the index is INVALID or a different shape, and otherwise builds it inside the boot transaction, which blocks `current_kv` writes for the build (instant on a fresh database; do not rely on it in production). SQLite and MySQL: no change. Rollback: `DROP INDEX CONCURRENTLY IF EXISTS idx_current_kv_space_deleted_key_c`, and, for a binary rollback, delete the migration's `seaql_migrations` row first (an older node refuses to start with a migration it does not ship).
+- The SQL/DuckDB legacy-artifact fence scan is reused for 60 s instead of 1 s while the durable fence is off (TC-1274). It was an anti-join over every artifact row, re-run by the first SQL/DuckDB request each second. The durable and configured fences are still read on every request, so `fence on` is immediate; a stale answer can only delay a 503 (or lift one) by at most 60 s, and only around an artifact written by an older release or a restore. The argument is on `LEGACY_SCAN_TTL` in `database_migration.rs`.
+
 ## [1.21.2] - 2026-10-19
 
 ### Release notes

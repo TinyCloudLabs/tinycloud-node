@@ -57,6 +57,69 @@ a version into the `docker.yml` `image_version` input that `Cargo.toml` does not
 already claim. Both have happened (`0b48da2`, and the image tagged `1.10.0`
 built from a `1.9.0` tree); the `version-guard` job now blocks the second one.
 
+## Operator steps before a node deploy
+
+A migration that indexes a large PostgreSQL table cannot be built by the boot:
+the boot runs every pending migration in one transaction, so a plain
+`CREATE INDEX` holds a SHARE lock on the table, blocking its writes, for the
+whole build. For these, the operator builds the index online first, and the
+migration then finds it and does nothing. **Order: operator step, then the
+node deploy.**
+
+### `idx_current_kv_space_deleted_key_c` (TC-1274, `m20261020_000000_current_kv_key_c_index`)
+
+Ships in the release after 1.21.2. It lets the KV list range select seek on
+its byte-order key bounds instead of reading and filtering every live key of
+the space.
+
+1. On the PlanetScale primary, **outside any transaction** (the console, or
+   `psql` without `BEGIN`; never through the node or a migration runner):
+
+   ```sql
+   CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_current_kv_space_deleted_key_c ON current_kv (space, deleted, (key COLLATE "C"));
+   ```
+
+   Writes to `current_kv` continue during the build. It waits for transactions
+   that were open when it started, so it can sit in "waiting for old
+   transactions" while one is open; it does not block them. Build time grows
+   with the row count of `current_kv`. Measured locally on an unthrottled
+   PostgreSQL 16: 3.9 s for 1,000,000 rows (112 MB heap, 109 MB index). A
+   CPU-limited primary is slower; the index is about the size of the existing
+   `idx_current_kv_space_deleted_key`.
+
+2. Check the result. All three columns must be `t`:
+
+   ```sql
+   SELECT i.indisvalid, i.indisready, i.indislive FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid WHERE c.relname = 'idx_current_kv_space_deleted_key_c';
+   ```
+
+3. If the build was cancelled or failed, the index is left INVALID, and
+   `IF NOT EXISTS` would skip it. Drop it and redo step 1:
+
+   ```sql
+   DROP INDEX CONCURRENTLY idx_current_kv_space_deleted_key_c;
+   ```
+
+4. Deploy the node. At boot the migration reads `pg_index`:
+   - a valid, ready, live btree of that name on `current_kv` with the shape
+     above: **no DDL, no lock**, and the index keeps its OID;
+   - an INVALID index, or one of another shape (for example the existing
+     `(space, deleted, key)` shape, or `COLLATE "POSIX"`): the boot **fails**
+     with the `DROP INDEX CONCURRENTLY` / `CREATE INDEX CONCURRENTLY`
+     instructions, and nothing is applied;
+   - a build still running: the boot fails and says to wait for it;
+   - no such index: the migration builds it inside the boot transaction. That
+     is instant on an empty database and **must not happen on production**:
+     it blocks every `current_kv` write for the build.
+
+Rollback: `DROP INDEX CONCURRENTLY IF EXISTS idx_current_kv_space_deleted_key_c;`
+is safe at any time; the list range select goes back to filtering the space,
+and nothing else uses the index. A node image from before this migration
+refuses to start while `seaql_migrations` lists a migration it does not ship, so
+a binary rollback also needs
+`DELETE FROM seaql_migrations WHERE version = 'm20261020_000000_current_kv_key_c_index';`
+first. The migration's `down` keeps the index.
+
 ## Promoting to production (main-only)
 
 Production is built and promoted **only from `main`** (TC-940, 2026-10-13).
