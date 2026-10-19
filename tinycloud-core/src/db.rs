@@ -1928,14 +1928,13 @@ where
             &self.conn,
             invoker,
             proofs,
-            "tinycloud.delegation/status",
+            revocation::ControlAction::Status,
             &target,
         )
         .await?
         {
             revocation::ControlProofDecision::DirectSigner(principal) => {
-                did_principal_matches(&delegation.delegator, &principal)
-                    || did_principal_matches(&delegation.delegatee, &principal)
+                revocation::ControlAction::Status.party_may_act(&delegation, &principal)
                     || abilities.iter().any(|ability| {
                         ability
                             .resource

@@ -5,6 +5,22 @@
 ### Changes
 
 - Add `GET /admin/stats` (TC-1482), a read-only list of the lowercase wallet addresses that hold data on the node, for the scoreboard's protocol-user count. It is disabled (`404`, like an unknown route) unless the new `NODE_STATS_READ_TOKEN` is set to a value of at least 32 bytes (`openssl rand -hex 32`); a shorter value, or one equal to `TINYCLOUD_ADMIN_SECRET`, also disables it. The token is separate from `TINYCLOUD_ADMIN_SECRET` (neither opens the other's routes). An owner counts when a space holds data that sign-in does not create by itself: the `account` space never counts, the `secrets` space counts only by its KV (its SQL table is created at sign-in), and every other space counts by a live `current_kv` row or any SQL/DuckDB `database_artifact` row, so an owner who only signed in is not listed. One SQL statement however many spaces exist. A result past 200,000 owners (or 400,000 distinct counted spaces) is a bare `507`, never a partial `200`. Neither the token nor any address is logged. The deployment workflow and compose files do not pass the variable yet.
+- `POST /revoke` authorizes the delegation's issuer, the owner of a space its abilities target, or the holder of a revoke control grant issued by one of them. The delegatee alone is no longer an authorized revoker, directly or through a control grant it issued; an intermediate delegator still revokes the delegations it issued. Delegation status visibility is unchanged (TC-1436).
+- Revoke and status control grants may name an encryption network (`urn:tinycloud:encryption:<owner>:<name>`) owned by the control's grantor. Only the network's owner can issue such a control without a parent, because the owner is already the network's root authority (`/delegate` accepted this before); naming the network in a control grants no decrypt or other network ability, so this is not an escalation. Each resource of a control is typed as an exact `urn:cid:<target>`, a `<space>/delegation` root, or a network; any other resource is ignored. A control covers a target only when every one of the target's resources is covered: a space resource by a named space, a network resource by the same parsed network id (owner DID including chain id, and name), so lowercase and EIP-55 checksummed spellings of an address name the same network, and a resource that does not parse as a network is never covered. A control that names a network never counts as an exact-CID control, and a network named by a control issued by someone other than its owner is ignored. A control such as `<applications>/delegation` + `<default>/delegation` + `<owner>:share` therefore revokes or reads the status of share roots that carry `:share` decrypt, but not grants on `:default` or any other network (TC-1423).
+
+## [1.21.1] - 2026-10-19
+
+### Release notes
+
+- SQL waits are bounded, and `/invoke` has a request deadline (TC-1274, #347).
+- The read-audit wait is bounded, and abandoned records are skipped (TC-1317, #350, #361).
+- Responses that carry an `ETag` also carry `Cache-Control: no-transform` (TC-1432, #354).
+- Added dstack `GetQuote` client tests (TC-963, #348).
+- No database migrations.
+- Rollback is the 1.21.0 image.
+
+### Changes
+
 - Authorized reads no longer wait without limit for their audit record (TC-1317). Every read (KV get/list/metadata/sync, capabilities read, and the authorization step of SQL, DuckDB, space info, `/signed/kv` and `/encryption/networks`) waits for its invocation record to commit before its data is returned. That wait used to have no bound, and one serial queue served every account.
   - **Bounded wait.** A read waits at most `database.read_audit_wait_ms` (20 s) and is then answered `503 read_audit_busy: the read audit is backlogged; retry the request` with `Retry-After: 5`, without its data. The node refuses to start with `read_audit_wait_ms = 0`, which would answer every read busy. A batch that fails with a transient database error is now `503 unavailable_retryable` instead of 500; other batch failures stay 500, and none of them is reported as 401 any more.
   - **The invariant is unchanged and tested:** no read's data is returned unless its audit record has committed.
