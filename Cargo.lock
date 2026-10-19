@@ -9668,6 +9668,7 @@ dependencies = [
  "tinycloud-auth",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "ucan-capabilities-object",
  "unicode-normalization",
  "uuid",
