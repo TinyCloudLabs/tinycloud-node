@@ -38,7 +38,7 @@ The SDK checks this endpoint during sign-in and requires an exact protocol versi
 | `POST` | `/delegate` | Yes | Create capability delegations |
 | `GET` | `/peer/generate/<space>` | No | Generate space host key pair |
 | `GET` | `/healthz` | No | Health check |
-| `GET` | `/admin/stats` | `NODE_STATS_READ_TOKEN` bearer | Distinct owner addresses that hold data (read-only; disabled unless the token is set) |
+| `GET` | `/admin/stats` | `NODE_STATS_READ_TOKEN` bearer | Distinct owner addresses that hold data beyond what sign-in creates (read-only; disabled unless the token is set, at least 32 bytes) |
 
 ### Storage usage and full-space writes
 
@@ -116,37 +116,52 @@ and 2-second connect deadlines.
 Read-only list of the wallet addresses that hold data on this node, for the
 scoreboard's protocol-user count (TC-1482). It is **disabled** (answers `404`,
 exactly like an unknown route) unless `NODE_STATS_READ_TOKEN` is set to a
-non-blank value that differs from `TINYCLOUD_ADMIN_SECRET`. Send it as
+value of at least 32 bytes that differs from `TINYCLOUD_ADMIN_SECRET`. Send it as
 `Authorization: Bearer <NODE_STATS_READ_TOKEN>`; a missing or wrong credential
 is a bare `401`. The token is separate from the admin secret: the admin secret
 does not open this route and this token opens no other `/admin/*` route. Use a
-random value of at least 32 bytes, kept in the secret store; the node never
+random value of at least 32 bytes (a shorter value disables the route; use
+`openssl rand -hex 32`, 64 hex characters), kept in the secret store; the node never
 logs it or any address.
 
 ```json
 { "owners": ["0x…", "0x…"], "count": 2, "generatedAt": "2026-10-19T12:00:00Z" }
 ```
 
-- **What is counted.** An owner is listed when a space they own, other than the
-  automatic `account` registry space, holds data: at least one live
-  (`deleted = false`) `current_kv` row, **or** at least one SQL/DuckDB
-  `database_artifact` row. Artifact rows are never deleted, so a database that
-  was created and later emptied or dropped still counts. The `account` space
-  never counts, whatever it holds, so an owner whose only space is `account`
-  is excluded. This is stricter than "spaces with `usage_bytes > 0`"
-  (`/admin/usage`), which counts the `account` space's bytes.
+- **What is counted.** An owner is listed when a space they own holds data that
+  signing in does not create by itself. OpenKey's sign-in bootstrap writes KV
+  in the `account` space and SQL tables in the `account` and `secrets` spaces
+  for every account, so those do not count:
+  - `account`: never counts, neither its KV nor its databases;
+  - `secrets`: its **databases** never count (the sign-in table), but its
+    **KV** does (a stored secret is real data);
+  - every other space counts by a live (`deleted = false`) `current_kv` row
+    **or** a SQL/DuckDB `database_artifact` row. Artifact rows are never
+    deleted, so a database that was created and later emptied or dropped still
+    counts.
+
+  The match is on the exact space name (the last `:`-separated segment of the
+  space id), so `secrets2`, `my-account` or `Secrets` are ordinary data. An
+  owner who only signed in is therefore not listed. This is stricter than
+  "spaces with `usage_bytes > 0`" (`/admin/usage`), which counts the `account`
+  space's bytes. Other spaces the sign-in flow can create (`default`,
+  `applications`, `public`) hold no data until the user stores some.
 - **Owner.** Parsed from `tinycloud:pkh:eip155:<chain>:0x<address>:<name>`,
   lowercased and de-duplicated across spaces and chains. Spaces whose owner is
   not an `eip155` address (a `did:key` owner) are skipped. `owners` is sorted.
 - **Cost.** One SQL statement (one round trip) however many spaces exist; no
   per-space `store_size` call. For each space it makes one primary-key probe of
-  `current_kv`, plus one pass over `database_artifact`'s space column.
+  `current_kv`, plus one pass over `database_artifact`'s space column. The cost
+  grows with the number of `space` rows (about six per bootstrapped account),
+  not only with listed owners: 4.35 s warm on a local PostgreSQL 14 with
+  300,000 spaces and 1.5 million keys. Re-measure before the node holds
+  several times that many spaces; the consumer gives up after 15 s.
 - **Bound, never a partial list.** The consumer makes no partial use of a
   response, so the route never answers a shorter list with `200`. More than
-  200,000 owners (or more than 400,000 data-holding spaces to read, which
-  bounds memory) is a bare `507`. Every entry is exactly `0x` followed by 40
-  lowercase hex digits; a space whose owner is not such an `eip155` address is
-  left out.
+  200,000 owners (or more than 400,000 distinct counted spaces, which bounds
+  memory; the excluded `account` and `secrets` entries are not counted) is a
+  bare `507`. Every entry is exactly `0x` followed by 40 lowercase hex digits;
+  a space whose owner is not such an `eip155` address is left out.
 - **Nothing else** about spaces, keys, sizes or timing is returned, and the
   response is `Cache-Control: no-store`.
 
@@ -241,7 +256,7 @@ The following common options are available:
 | spaces.allowlist    | TINYCLOUD_SPACES_ALLOWLIST    | Set the URL of an allowlist service for gating the creation of Space Peers |
 | telemetry.enabled   | TINYCLOUD_TELEMETRY__ENABLED  | Enable Prometheus latency metrics on the configured Prometheus port        |
 | (n/a)               | ROCKET_MAX_BLOCKING           | Set Rocket's blocking-thread-pool cap (default 512). Note the `ROCKET_` prefix, not `TINYCLOUD_` — Rocket builds its tokio runtime from its own Figment before TinyCloud's config is loaded, so `TINYCLOUD_MAX_BLOCKING` is silently ignored for this setting |
-| (n/a)               | NODE_STATS_READ_TOKEN         | Bearer token for the read-only `GET /admin/stats` (TC-1482). Unset, blank, or equal to `TINYCLOUD_ADMIN_SECRET` disables the route (`404`). Separate from `TINYCLOUD_ADMIN_SECRET`, which it does not replace and which does not open it. Secret: set it in the deployment secret store, never in `tinycloud.toml` or a committed env file. See [Admin stats](#admin-stats-get-adminstats) |
+| (n/a)               | NODE_STATS_READ_TOKEN         | Bearer token for the read-only `GET /admin/stats` (TC-1482). Unset, blank, shorter than 32 bytes, or equal to `TINYCLOUD_ADMIN_SECRET` disables the route (`404`). Generate it with `openssl rand -hex 32` (64 hex characters). Separate from `TINYCLOUD_ADMIN_SECRET`, which it does not replace and which does not open it. Secret: set it in the deployment secret store, never in `tinycloud.toml` or a committed env file. See [Admin stats](#admin-stats-get-adminstats) |
 
 ### Database Config
 

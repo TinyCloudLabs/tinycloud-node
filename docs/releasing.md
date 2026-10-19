@@ -114,7 +114,8 @@ Environment settings (Settings → Environments → `production`):
   so the route is disabled (`404`) in a deployment until a reviewed change adds
   it: a `PROD_TINYCLOUD_NODE_STATS_READ_TOKEN` environment secret, the
   `PHALA_ENV_` pass-through and a compose `environment` line (which changes the
-  reviewed compose hash). Its value must differ from
+  reviewed compose hash). Its value must be at least 32 bytes (generate it with
+  `openssl rand -hex 32`; a shorter value disables the route) and must differ from
   `PROD_TINYCLOUD_ADMIN_SECRET`; the node disables the route if they are equal.
 
 What this blocks: a dispatch on an unlocked branch fails the environment's

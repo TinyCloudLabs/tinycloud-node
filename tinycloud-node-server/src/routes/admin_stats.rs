@@ -12,8 +12,9 @@
 //! - if both are set to the same value, this route is disabled, so one value
 //!   can never open both surfaces.
 //!
-//! When the token is unset, empty or whitespace-only the route is disabled and
-//! answers exactly as an unknown route does (a 404 from the default catcher),
+//! When the token is unset, empty, whitespace-only or shorter than 32 bytes the
+//! route is disabled and answers exactly as an unknown route does (a 404 from
+//! the default catcher),
 //! whatever the request carries. A missing, malformed or wrong credential is a
 //! bare 401 with no detail. The comparison hashes both sides to fixed-length
 //! SHA-256 digests and compares those in constant time, so neither the content
@@ -60,11 +61,16 @@ fn secrets_match(a: &str, b: &str) -> bool {
         .into()
 }
 
+/// The shortest token the route accepts, in bytes. `openssl rand -hex 32`
+/// (64 characters) is the recommended generator.
+pub const MIN_TOKEN_BYTES: usize = 32;
+
 /// The configured stats token, or `None` when the route is disabled: unset,
-/// empty or whitespace-only, not valid UTF-8, or equal to the admin secret.
+/// empty or whitespace-only, shorter than [`MIN_TOKEN_BYTES`] bytes (after
+/// trimming), not valid UTF-8, or equal to the admin secret.
 fn configured_token() -> Option<String> {
     let token = std::env::var(STATS_TOKEN_ENV).ok()?;
-    if token.trim().is_empty() {
+    if token.trim().len() < MIN_TOKEN_BYTES {
         return None;
     }
     if let Ok(admin) = std::env::var("TINYCLOUD_ADMIN_SECRET") {
@@ -120,8 +126,9 @@ impl<'r, 'o: 'r, R: Responder<'r, 'o>> Responder<'r, 'o> for NoStore<R> {
     }
 }
 
-/// The distinct owner addresses that hold data beyond the automatic `account`
-/// space. One aggregate statement; see `tinycloud_core::data_owners`.
+/// The distinct owner addresses that hold data beyond what sign-in creates by
+/// itself (`account`, and the `secrets` space's database artifacts). One
+/// aggregate statement; see `tinycloud_core::data_owners`.
 #[get("/admin/stats")]
 pub async fn get_stats(
     _auth: StatsAuth,

@@ -3,8 +3,17 @@
 //!
 //! # What counts
 //!
-//! An owner counts when at least one of their spaces other than the automatic
-//! `account` registry space holds data:
+//! An owner counts when at least one of their spaces holds data that sign-in
+//! does not create by itself. Sign-in creates, automatically, in every
+//! bootstrapped account: KV in `account` and SQL tables in `account` and
+//! `secrets` (OpenKey's `tinycloud-bootstrap`). So:
+//!
+//! - **`account`**: never counts, neither its KV nor its database artifacts.
+//! - **`secrets`**: its **KV** counts (a stored secret is real data); its
+//!   **database artifacts do not** (the sign-in bootstrap's table).
+//! - **every other space**: KV and database artifacts both count.
+//!
+//! The name is the exact last segment of the space id; see [`not_named`].
 //!
 //! - **KV**: at least one `current_kv` row with `deleted = false`; or
 //! - **SQL/DuckDB**: at least one `database_artifact` row. Artifact rows are
@@ -36,17 +45,22 @@ use std::collections::BTreeSet;
 use std::str::FromStr;
 use tinycloud_auth::resource::SpaceId;
 
-/// The name of the registry space OpenKey writes at sign-in. It never counts
-/// on its own.
+/// The registry space OpenKey writes at sign-in. It never counts on its own:
+/// neither its KV nor its database artifacts.
 pub const ACCOUNT_SPACE: &str = "account";
+
+/// The secrets space. OpenKey's sign-in bootstrap creates a SQL table in it,
+/// so its database artifacts never count. Its KV rows (stored secrets) do.
+pub const SECRETS_SPACE: &str = "secrets";
 
 /// Most owners one call returns: the consumer's own limit (OpenKey refuses a
 /// longer list). More is an error, never a partial list.
 pub const MAX_OWNERS: usize = 200_000;
 
-/// Most space ids one call reads, which bounds memory (about 110 bytes each).
-/// More is an error, never a partial list. Every owner has an `account` space,
-/// so this is deliberately above [`MAX_OWNERS`].
+/// Most distinct spaces one call reads, which bounds memory (about 110 bytes
+/// each). Spaces that do not count (the automatic `account` space, and the
+/// `secrets` space's database artifacts) are excluded in SQL and are not part
+/// of this number. More is an error, never a partial list.
 pub const MAX_SPACES_SCANNED: usize = 400_000;
 
 /// Why no list was produced.
@@ -64,18 +78,44 @@ impl From<DbErr> for DataOwnersError {
     }
 }
 
-/// Space ids with live data: live KV in a `space` row, or any artifact. The
-/// outer `LIMIT` is the memory bound plus one, so a result past it is
-/// detected instead of silently cut. `UNION` removes the spaces both halves
-/// return. Written for SQLite, PostgreSQL and MySQL; the only parameter is
-/// the numeric bound, which is a constant of this crate.
+/// The `WHERE` condition that is true when the space id in `column` does NOT
+/// end in `:<name>`. A space id is `tinycloud:pkh:eip155:<chain>:0x<address>:<name>`
+/// and the id parser splits at the LAST `:`, so a name never contains one and
+/// "ends in `:<name>`" is "the name is exactly `<name>`": `xsecrets` and an
+/// owner part that happens to contain the word cannot match. `SUBSTR` of the
+/// last `n` characters with `=` is used rather than `LIKE`, which is
+/// ASCII-case-insensitive on SQLite (so it would drop an `Account` space that
+/// the node treats as ordinary data).
+fn not_named(column: &str, name: &str) -> String {
+    let suffix = format!(":{name}");
+    format!(
+        "SUBSTR({column}, LENGTH({column}) - {}) <> '{suffix}'",
+        suffix.len() - 1
+    )
+}
+
+/// Space ids with counted data, each at most once (`UNION`):
+///
+/// - KV half: a `space` row, not named `account`, with a live `current_kv` row;
+/// - artifact half: a `database_artifact` space not named `account` or `secrets`.
+///
+/// The exclusions are in SQL, before the outer `LIMIT`, so the bound counts
+/// DISTINCT SPACES THAT COUNT, not sign-in bookkeeping rows. The outer `LIMIT`
+/// is the memory bound plus one, so a result past it is detected instead of
+/// silently cut. Written for SQLite, PostgreSQL and MySQL; the only parameter
+/// is the numeric bound, and the names are constants of this crate.
 fn query(limit: usize) -> String {
+    let kv_not_account = not_named("s.id", ACCOUNT_SPACE);
+    let artifact_not_account = not_named("a.space", ACCOUNT_SPACE);
+    let artifact_not_secrets = not_named("a.space", SECRETS_SPACE);
     format!(
         "SELECT u.id FROM (\
            SELECT s.id AS id FROM space s \
-           WHERE EXISTS (SELECT 1 FROM current_kv k WHERE k.space = s.id AND NOT k.deleted) \
+           WHERE {kv_not_account} \
+             AND EXISTS (SELECT 1 FROM current_kv k WHERE k.space = s.id AND NOT k.deleted) \
            UNION \
-           SELECT a.space AS id FROM database_artifact a\
+           SELECT a.space AS id FROM database_artifact a \
+           WHERE {artifact_not_account} AND {artifact_not_secrets}\
          ) u LIMIT {limit}"
     )
 }
@@ -113,13 +153,11 @@ async fn collect_bounded<C: ConnectionTrait>(
     Ok(owners.into_iter().collect())
 }
 
-/// The lowercase owner address of a space id, or `None` for the `account`
-/// space, an unparsable id, and an owner that is not an `eip155` address.
+/// The lowercase owner address of a space id, or `None` for an unparsable id
+/// and an owner that is not an `eip155` address. The automatic `account` and
+/// `secrets` spaces are excluded by [`query`], before the row bound.
 fn data_owner(space_id: &str) -> Option<String> {
     let space = SpaceId::from_str(space_id).ok()?;
-    if space.name().as_str() == ACCOUNT_SPACE {
-        return None;
-    }
     // `did:pkh:eip155:<chain>:<address>`
     let mut parts = space.did().as_str().split(':');
     let (Some("did"), Some("pkh"), Some("eip155"), Some(chain), Some(address), None) = (
@@ -339,6 +377,152 @@ mod tests {
         assert_eq!(result, sorted);
     }
 
+    /// `account` and `secrets` are matched by their exact name segment, so a
+    /// name that merely contains or ends with those words still counts, and
+    /// the exclusions drop exactly what the contract says.
+    async fn assert_exclusions_are_exact(conn: &DatabaseConnection) {
+        let owner = |n: u64| format!("0x{n:040x}");
+
+        // Owner 1: only KV in `secrets` (a stored secret): counted.
+        let secret_kv = id(1, &owner(1), "secrets");
+        add_space(conn, &secret_kv).await;
+        add_kv(conn, &secret_kv, "vault/api-key", false).await;
+        // Owner 2: tombstoned KV in `secrets` only: not counted.
+        let secret_gone = id(1, &owner(2), "secrets");
+        add_space(conn, &secret_gone).await;
+        add_kv(conn, &secret_gone, "vault/old", true).await;
+        // Owner 3: only an artifact in `secrets` (the sign-in table): not counted.
+        add_artifact(conn, &id(1, &owner(3), "secrets"), "sql").await;
+        // Owner 4: artifacts in `account` (SQL and DuckDB) and KV in `account`: not counted.
+        let account = id(1, &owner(4), "account");
+        add_space(conn, &account).await;
+        add_kv(conn, &account, "bootstrap/complete", false).await;
+        add_artifact(conn, &account, "sql").await;
+        add_artifact(conn, &account, "duckdb").await;
+        // Owner 5: the whole sign-in footprint at once: not counted.
+        add_artifact(conn, &id(1, &owner(5), "secrets"), "sql").await;
+        add_artifact(conn, &id(1, &owner(5), "account"), "sql").await;
+        let account5 = id(1, &owner(5), "account");
+        add_space(conn, &account5).await;
+        add_kv(conn, &account5, "bootstrap/complete", false).await;
+        assert_eq!(owners(conn).await, vec![owner(1)]);
+
+        // Any other space counts, by KV or by artifact, whatever it is
+        // named next to the excluded words.
+        let mut expected = vec![owner(1)];
+        for (n, name) in [
+            "xsecrets",
+            "secrets2",
+            "my-secrets",
+            "secrets-old",
+            "Secrets",
+            "SECRETS",
+            "xaccount",
+            "account2",
+            "my-account",
+            "Account",
+            "ACCOUNT",
+            "default",
+            "applications",
+            "public",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let who = owner(100 + n as u64);
+            add_artifact(conn, &id(1, &who, name), "sql").await;
+            expected.push(who);
+            let who_kv = owner(200 + n as u64);
+            let space = id(1, &who_kv, name);
+            add_space(conn, &space).await;
+            add_kv(conn, &space, "k", false).await;
+            expected.push(who_kv);
+            assert_eq!(
+                owners(conn).await.len(),
+                expected.len(),
+                "a space named {name:?} must count"
+            );
+        }
+        expected.sort();
+        assert_eq!(owners(conn).await, expected);
+
+        // An artifact in `secrets` beside a live KV secret: counted by the KV.
+        // An owner with `secrets` artifact and a real artifact elsewhere: counted.
+        let both = id(1, &owner(6), "secrets");
+        add_artifact(conn, &both, "sql").await;
+        add_space(conn, &both).await;
+        add_kv(conn, &both, "vault/token", false).await;
+        add_artifact(conn, &id(1, &owner(7), "secrets"), "sql").await;
+        add_artifact(conn, &id(1, &owner(7), "notes"), "sql").await;
+        let result = owners(conn).await;
+        assert!(result.contains(&owner(6)) && result.contains(&owner(7)));
+        assert_eq!(result.len(), expected.len() + 2);
+    }
+
+    #[tokio::test]
+    async fn sqlite_exclusions_are_exact() {
+        assert_exclusions_are_exact(&sqlite().await).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_exclusions_are_exact() {
+        let Some(schema) =
+            crate::test_support::PostgresTestSchema::new("postgres_exclusions_are_exact").await
+        else {
+            return;
+        };
+        assert_exclusions_are_exact(&schema.conn).await;
+    }
+
+    /// The space bound counts distinct spaces that count, not sign-in rows:
+    /// any number of sign-in-only accounts leaves it untouched.
+    async fn assert_bound_counts_distinct_counted_spaces(conn: &DatabaseConnection) {
+        for n in 0..20u64 {
+            let who = format!("0x{n:040x}");
+            let account = id(1, &who, "account");
+            add_space(conn, &account).await;
+            add_kv(conn, &account, "bootstrap/complete", false).await;
+            add_artifact(conn, &account, "sql").await;
+            add_artifact(conn, &id(1, &who, "secrets"), "sql").await;
+        }
+        // 20 signed-in accounts, no counted space: fits even a bound of 1.
+        assert!(collect_bounded(conn, 1, 1).await.unwrap().is_empty());
+
+        // One owner whose KV and artifact are in the SAME space is one space.
+        let real = id(1, &format!("0x{:040x}", 99), "default");
+        add_space(conn, &real).await;
+        add_kv(conn, &real, "k", false).await;
+        add_artifact(conn, &real, "sql").await;
+        assert_eq!(collect_bounded(conn, 1, 1).await.unwrap().len(), 1);
+
+        // A second counted space of the same owner is a second space: over a
+        // bound of 1 it is an error, never a shorter list.
+        let second = id(1, &format!("0x{:040x}", 99), "photos");
+        add_artifact(conn, &second, "sql").await;
+        assert!(matches!(
+            collect_bounded(conn, 1, 5).await,
+            Err(DataOwnersError::TooLarge)
+        ));
+        assert_eq!(collect_bounded(conn, 2, 1).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sqlite_bound_counts_distinct_counted_spaces() {
+        assert_bound_counts_distinct_counted_spaces(&sqlite().await).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_bound_counts_distinct_counted_spaces() {
+        let Some(schema) = crate::test_support::PostgresTestSchema::new(
+            "postgres_bound_counts_distinct_counted_spaces",
+        )
+        .await
+        else {
+            return;
+        };
+        assert_bound_counts_distinct_counted_spaces(&schema.conn).await;
+    }
+
     #[tokio::test]
     async fn sqlite_owner_rules() {
         assert_owner_rules(&sqlite().await).await;
@@ -393,6 +577,302 @@ mod tests {
         assert_bounds_fail_instead_of_truncating(&schema.conn).await;
     }
 
+    // ---- Sign-in replay -------------------------------------------------
+    //
+    // What a fresh account gets from OpenKey's sign-in bootstrap
+    // (openkey `apps/api/src/services/tinycloud-bootstrap.ts`, run against
+    // openkey 82edce3 / js-sdk ba66248; the SQL text is js-sdk
+    // `packages/bootstrap/src/index.ts` `ACCOUNT_INDEX_SCHEMA` and
+    // `SECRET_RECORDS_SCHEMA`), and from the SDK's default private-key / CLI
+    // sign-in (`TinyCloudNode.runAccountBootstrap`, which adds the
+    // `system/bootstrap/complete` marker). SQL goes through the real
+    // `SqlService` and `SeaOrmDatabaseArtifactRepository`, so the
+    // `database_artifact` rows are the ones the node writes, not hand-made.
+    // KV rows are inserted directly: the KV write path needs signed
+    // delegations, and `data_owners` reads only `space` and `current_kv`.
+    //
+    // If the bootstrap gains a space or table, update this replay; a
+    // sign-in-only account listed as an owner is the symptom this test pins.
+
+    const ACCOUNT_INDEX_SCHEMA: [&str; 10] = [
+        "CREATE TABLE IF NOT EXISTS applications (app_id TEXT PRIMARY KEY, name TEXT, \
+         description TEXT, updated_at TEXT, manifest_json TEXT NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS application_state (app_id TEXT PRIMARY KEY, \
+         manifest_hash TEXT NOT NULL, indexed_at TEXT NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS spaces (space_id TEXT PRIMARY KEY, name TEXT NOT NULL, \
+         owner_did TEXT NOT NULL, type TEXT NOT NULL, permissions_json TEXT NOT NULL, \
+         status TEXT NOT NULL, registered_at TEXT, updated_at TEXT NOT NULL, expires_at TEXT)",
+        "CREATE TABLE IF NOT EXISTS delegations (cid TEXT PRIMARY KEY, direction TEXT NOT NULL, \
+         space_id TEXT NOT NULL, space_name TEXT, counterparty_did TEXT NOT NULL, \
+         delegate_did TEXT NOT NULL, delegator_did TEXT, path TEXT NOT NULL, \
+         actions_json TEXT NOT NULL, expiry TEXT NOT NULL, status TEXT NOT NULL, \
+         created_at TEXT, updated_at TEXT NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS sync_state (source TEXT PRIMARY KEY, \
+         synced_at TEXT NOT NULL, count INTEGER NOT NULL)",
+        "CREATE INDEX IF NOT EXISTS idx_delegations_direction ON delegations(direction)",
+        "CREATE INDEX IF NOT EXISTS idx_delegations_space ON delegations(space_id)",
+        "CREATE INDEX IF NOT EXISTS idx_delegations_counterparty ON delegations(counterparty_did)",
+        "CREATE INDEX IF NOT EXISTS idx_spaces_owner ON spaces(owner_did)",
+        "CREATE INDEX IF NOT EXISTS idx_spaces_type ON spaces(type)",
+    ];
+    const SECRET_RECORDS_SCHEMA: &str =
+        "CREATE TABLE IF NOT EXISTS secret_records (scope TEXT NOT NULL, name TEXT NOT NULL, \
+         provider_id TEXT, custom_note TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, \
+         last_tested TEXT, test_status TEXT, test_message TEXT, PRIMARY KEY(scope, name))";
+    const BOOTSTRAP_SPACES: [&str; 5] = ["default", "applications", "account", "secrets", "public"];
+
+    fn space_id(owner: &str, name: &str) -> SpaceId {
+        id(1, owner, name).parse().unwrap()
+    }
+
+    async fn sql_execute(
+        service: &crate::sql::SqlService,
+        owner: &str,
+        space: &str,
+        database: &str,
+        ability: &str,
+        request: crate::sql::SqlRequest,
+    ) {
+        service
+            .execute(
+                &space_id(owner, space),
+                database,
+                request,
+                None,
+                ability.to_string(),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{space}/{database}: {error:?}"));
+    }
+
+    /// The writes of one sign-in, in the bootstrap's order.
+    async fn replay_sign_in(
+        conn: &DatabaseConnection,
+        service: &crate::sql::SqlService,
+        owner: &str,
+    ) {
+        use crate::sql::{types::SqlStatement, SqlRequest, SqlValue};
+
+        // 1-2. Host the five spaces and activate their sessions: `space` rows,
+        // no KV and no SQL.
+        for name in BOOTSTRAP_SPACES {
+            add_space(conn, &id(1, owner, name)).await;
+        }
+        // 3. The registry tables, in the `account` database of `account`
+        // (`tinycloud.sql/schema`; the carrier statement is the last one).
+        sql_execute(
+            service,
+            owner,
+            "account",
+            "account",
+            "tinycloud.sql/schema",
+            SqlRequest::Execute {
+                sql: ACCOUNT_INDEX_SCHEMA[9].to_string(),
+                params: vec![],
+                schema: Some(ACCOUNT_INDEX_SCHEMA.iter().map(|s| s.to_string()).collect()),
+            },
+        )
+        .await;
+        // 4a. KV in `account`: one `spaces/<id>` entry per space, the secrets
+        // application manifest, and the SDK's `system/bootstrap/complete` marker.
+        for name in BOOTSTRAP_SPACES {
+            let key = format!("spaces/{}", id(1, owner, name));
+            add_kv(conn, &id(1, owner, "account"), &key, false).await;
+        }
+        add_kv(
+            conn,
+            &id(1, owner, "account"),
+            "applications/xyz.tinycloud.secrets",
+            false,
+        )
+        .await;
+        add_kv(
+            conn,
+            &id(1, owner, "account"),
+            "system/bootstrap/complete",
+            false,
+        )
+        .await;
+        // 4b. The same five spaces as rows of the `spaces` table.
+        sql_execute(
+            service,
+            owner,
+            "account",
+            "account",
+            "tinycloud.sql/write",
+            SqlRequest::Batch {
+                statements: BOOTSTRAP_SPACES
+                    .iter()
+                    .map(|name| SqlStatement {
+                        sql: "INSERT OR REPLACE INTO spaces (space_id, name, owner_did, type, \
+                              permissions_json, status, registered_at, updated_at, expires_at) \
+                              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                            .to_string(),
+                        params: vec![
+                            SqlValue::Text(id(1, owner, name)),
+                            SqlValue::Text(name.to_string()),
+                            SqlValue::Text(format!("did:pkh:eip155:1:{owner}")),
+                            SqlValue::Text("owned".into()),
+                            SqlValue::Text("[\"*\"]".into()),
+                            SqlValue::Text("active".into()),
+                            SqlValue::Text("now".into()),
+                            SqlValue::Text("now".into()),
+                            SqlValue::Null,
+                        ],
+                    })
+                    .collect(),
+            },
+        )
+        .await;
+        // 5. The secrets-records table, in database `default` of `secrets`.
+        sql_execute(
+            service,
+            owner,
+            "secrets",
+            "default",
+            "tinycloud.sql/schema",
+            SqlRequest::Execute {
+                sql: SECRET_RECORDS_SCHEMA.to_string(),
+                params: vec![],
+                schema: Some(vec![SECRET_RECORDS_SCHEMA.to_string()]),
+            },
+        )
+        .await;
+    }
+
+    async fn count(conn: &DatabaseConnection, table: &str, space: &str) -> i64 {
+        let sql = format!(
+            "SELECT COUNT(*) AS n FROM {table} WHERE space = {}",
+            placeholders(conn, 1)
+        );
+        conn.query_one(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            &sql,
+            vec![space.into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<i64>("", "n")
+        .unwrap()
+    }
+
+    /// Owners that only signed in are not listed; owners that also stored
+    /// anything outside what sign-in writes are.
+    async fn assert_sign_in_only_owners_are_not_listed(conn: &DatabaseConnection) {
+        use crate::{database_artifacts::SeaOrmDatabaseArtifactRepository, sql::SqlService};
+
+        let cache = tempfile::TempDir::new().unwrap();
+        let service = SqlService::new(
+            cache.path().to_string_lossy().into_owned(),
+            0,
+            std::sync::Arc::new(SeaOrmDatabaseArtifactRepository::new(conn.clone())),
+        );
+        let signed_in = |n: u64| format!("0x{:040x}", 0xa000 + n);
+        let (only, only_sdk, secret_kv, other_kv, other_sql, vault_public) = (
+            signed_in(1),
+            signed_in(2),
+            signed_in(3),
+            signed_in(4),
+            signed_in(5),
+            signed_in(6),
+        );
+        for owner in [
+            &only,
+            &only_sdk,
+            &secret_kv,
+            &other_kv,
+            &other_sql,
+            &vault_public,
+        ] {
+            replay_sign_in(conn, &service, owner).await;
+        }
+
+        // The replay really wrote what a sign-in writes: the account and the
+        // secrets database (artifact rows) and the account's KV. Without the
+        // exclusions every one of these owners would be listed.
+        for owner in [&only, &secret_kv] {
+            assert_eq!(
+                count(conn, "database_artifact", &id(1, owner, "account")).await,
+                1
+            );
+            assert_eq!(
+                count(conn, "database_artifact", &id(1, owner, "secrets")).await,
+                1
+            );
+            assert_eq!(count(conn, "current_kv", &id(1, owner, "account")).await, 7);
+        }
+        let raw: BTreeSet<String> = conn
+            .query_all(Statement::from_string(
+                conn.get_database_backend(),
+                "SELECT space FROM database_artifact UNION SELECT space FROM current_kv"
+                    .to_string(),
+            ))
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.try_get_by_index::<String>(0).unwrap())
+            .collect();
+        assert!(raw.contains(&id(1, &only, "secrets")) && raw.contains(&id(1, &only, "account")));
+        assert!(
+            owners(conn).await.is_empty(),
+            "an owner who only signed in must not be listed: {:?}",
+            owners(conn).await
+        );
+
+        // A stored secret: KV in `secrets`.
+        let secrets = id(1, &secret_kv, "secrets");
+        add_kv(conn, &secrets, "vault/openai", false).await;
+        assert_eq!(owners(conn).await, vec![secret_kv.clone()]);
+
+        // Data in another space: KV in `default`, a SQL table in `default`,
+        // and the vault's public-space KV (written when the user unlocks the
+        // vault; counted, like any other space).
+        add_kv(conn, &id(1, &other_kv, "default"), "notes/a", false).await;
+        sql_execute(
+            &service,
+            &other_sql,
+            "default",
+            "main",
+            "tinycloud.sql/write",
+            crate::sql::SqlRequest::Execute {
+                sql: "CREATE TABLE notes (id INTEGER)".to_string(),
+                params: vec![],
+                schema: None,
+            },
+        )
+        .await;
+        add_kv(
+            conn,
+            &id(1, &vault_public, "public"),
+            ".well-known/vault-pubkey",
+            false,
+        )
+        .await;
+        let mut expected = vec![secret_kv, other_kv, other_sql, vault_public];
+        expected.sort();
+        assert_eq!(owners(conn).await, expected);
+        assert!(!owners(conn).await.contains(&only));
+        assert!(!owners(conn).await.contains(&only_sdk));
+    }
+
+    #[tokio::test]
+    async fn sqlite_sign_in_only_owners_are_not_listed() {
+        assert_sign_in_only_owners_are_not_listed(&sqlite().await).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_sign_in_only_owners_are_not_listed() {
+        let Some(schema) = crate::test_support::PostgresTestSchema::new(
+            "postgres_sign_in_only_owners_are_not_listed",
+        )
+        .await
+        else {
+            return;
+        };
+        assert_sign_in_only_owners_are_not_listed(&schema.conn).await;
+    }
+
     #[test]
     fn owner_parsing() {
         let lower = "0x0abcdefabcdefabcdefabcdefabcdefabcdefabc";
@@ -404,14 +884,9 @@ mod tests {
             data_owner("tinycloud:pkh:eip155:10:0x0ABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABC:x"),
             Some(lower.to_string())
         );
-        // The registry space, exactly named, is the only exclusion; a longer or
-        // differently cased name is data.
-        assert_eq!(
-            data_owner(&format!("tinycloud:pkh:eip155:1:{lower}:account")),
-            None
-        );
-        assert!(data_owner(&format!("tinycloud:pkh:eip155:1:{lower}:account2")).is_some());
-        assert!(data_owner(&format!("tinycloud:pkh:eip155:1:{lower}:Account")).is_some());
+        // The `account` / `secrets` exclusions are in the SQL, not here (see
+        // `assert_exclusions_are_exact`).
+        assert!(data_owner(&format!("tinycloud:pkh:eip155:1:{lower}:account")).is_some());
         // Not a 40-digit eip155 address owner.
         assert_eq!(
             data_owner("tinycloud:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK:default"),

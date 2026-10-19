@@ -20,6 +20,7 @@ use tinycloud_core::sea_orm::{
 };
 
 const STATS_TOKEN: &str = "tc1482-stats-token-3f9a1c7e5b2d4a60";
+const MIN_TOKEN_BYTES: usize = 32;
 const ADMIN_SECRET: &str = "tc1482-admin-secret-9d8c7b6a5f4e3d2c";
 const TOKEN_ENV: &str = "NODE_STATS_READ_TOKEN";
 const ADMIN_ENV: &str = "TINYCLOUD_ADMIN_SECRET";
@@ -29,6 +30,8 @@ const ALICE_MIXED: &str = "0x0ABCDEFabcdefABCDEFabcdefABCDEFabcdefABC";
 const BOB: &str = "0x1111111111111111111111111111111111111111";
 const CAROL: &str = "0x2222222222222222222222222222222222222222";
 const DAVE: &str = "0x3333333333333333333333333333333333333333";
+const EVE: &str = "0x4444444444444444444444444444444444444444";
+const FRANK: &str = "0x5555555555555555555555555555555555555555";
 
 /// The two secrets live in the process environment, which the guards read on
 /// every request, so tests that set them run one at a time.
@@ -361,6 +364,8 @@ async fn assert_stats_scenario(backend: Backend, test: &str) {
     node.add_kv(&alice_account, "bootstrap/complete", false)
         .await;
     node.add_artifact(&alice_account).await;
+    // Frank: a SQL table in `secrets` only (what sign-in creates there).
+    node.add_artifact(&space(1, FRANK, "secrets")).await;
     // Bob: a data space whose only rows are deleted.
     let bob = space(1, BOB, "default");
     node.add_space(&bob).await;
@@ -383,14 +388,20 @@ async fn assert_stats_scenario(backend: Backend, test: &str) {
     node.add_space(&dave).await;
     node.add_kv(&dave, "old", true).await;
     node.add_kv(&dave, "new", false).await;
+    // Eve stored a secret (KV in `secrets`) and also has the sign-in table
+    // there.
+    let eve = space(1, EVE, "secrets");
+    node.add_space(&eve).await;
+    node.add_kv(&eve, "vault/api-key", false).await;
+    node.add_artifact(&eve).await;
 
     let reply = node.stats(Some(&auth)).await;
     assert_eq!(reply.status, Status::Ok);
     assert_eq!(reply.content_type.as_deref(), Some("application/json"));
     assert_eq!(reply.cache_control.as_deref(), Some("no-store"));
     let body = reply.json();
-    assert_eq!(body["owners"], json!([ALICE, CAROL, DAVE]));
-    assert_eq!(body["count"], 3);
+    assert_eq!(body["owners"], json!([ALICE, CAROL, DAVE, EVE]));
+    assert_eq!(body["count"], 4);
     let mut keys: Vec<&String> = body.as_object().unwrap().keys().collect();
     keys.sort();
     assert_eq!(keys, ["count", "generatedAt", "owners"]);
@@ -546,15 +557,26 @@ async fn disabled_route_is_an_unknown_route() {
         )
     };
 
-    // Unset, empty, whitespace-only and equal-to-the-admin-secret all disable
-    // the route, whatever credential the request carries.
-    let disabled: [Option<&str>; 4] = [None, Some(""), Some(" \t\n"), Some(ADMIN_SECRET)];
+    // Unset, empty, whitespace-only, shorter than 32 bytes (31 is too short) and
+    // equal-to-the-admin-secret all disable the route, whatever credential the
+    // request carries.
+    let short = "a".repeat(MIN_TOKEN_BYTES - 1);
+    let padded_short = format!("{short}  \n");
+    let disabled: [Option<&str>; 6] = [
+        None,
+        Some(""),
+        Some(" \t\n"),
+        Some(&short),
+        Some(&padded_short),
+        Some(ADMIN_SECRET),
+    ];
     for value in disabled {
         env.stats(value);
         for authorization in [
             None,
             Some(bearer(STATS_TOKEN)),
             Some(bearer(ADMIN_SECRET)),
+            Some(bearer(&short)),
             Some(bearer("")),
         ] {
             let reply = node.stats(authorization.as_deref()).await;
@@ -565,6 +587,15 @@ async fn disabled_route_is_an_unknown_route() {
             );
         }
     }
+
+    // Exactly 32 bytes is enough.
+    let minimum = "b".repeat(MIN_TOKEN_BYTES);
+    env.stats(Some(&minimum));
+    assert_eq!(node.stats(Some(&bearer(&minimum))).await.status, Status::Ok);
+    assert_eq!(
+        node.stats(Some(&bearer(&short))).await.status,
+        Status::Unauthorized
+    );
 
     // Enabling it takes effect for the next request; the admin secret is
     // still refused and the token accepted.
