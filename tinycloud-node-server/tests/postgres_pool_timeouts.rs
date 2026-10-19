@@ -998,19 +998,21 @@ async fn blackhole_mid_hydration_waits_for_one_detection_only() {
     assert!(elapsed < Duration::from_secs(6), "{elapsed:?}");
 }
 
-/// The case CI found: the hydration's `BEGIN` draws an idle connection that
-/// died silently, and the load on the next connection is cut mid-transfer.
-/// The attempt is retried as a whole, its `BEGIN` never on its own, so the
-/// request waits for at most two detections, not three.
+/// The case CI found: a hydration statement draws an idle connection that
+/// died silently, and a later slice on the next connection is cut
+/// mid-transfer. Hydration is a series of independently retried statements
+/// (TC-822), so the request waits for at most three detections: the dead idle
+/// connection (the metadata statement, retried once), then the cut slice and
+/// its one retry. Never more: each statement retries once, within the window.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn blackhole_dead_idle_connection_then_cut_hydration_waits_two_detections_at_most() {
+async fn blackhole_dead_idle_connection_then_cut_hydration_waits_three_detections_at_most() {
     let Some(url) = blackhole_url(
-        "blackhole_dead_idle_connection_then_cut_hydration_waits_two_detections_at_most",
+        "blackhole_dead_idle_connection_then_cut_hydration_waits_three_detections_at_most",
     ) else {
         return;
     };
     let (elapsed, _) = mid_hydration_blackhole_with(&url, "bhidlecut", |_| {}, true).await;
-    assert!(elapsed < Duration::from_secs(9), "{elapsed:?}");
+    assert!(elapsed < Duration::from_secs(14), "{elapsed:?}");
 }
 
 /// Black-hole every connection streaming db `a`'s hydration on a cold node,
