@@ -147,6 +147,38 @@ a bare HTTPS origin. The preflight also accepts that origin with the
 or CR/LF fails it. The quota steps take only its host and port and
 call billing's fixed `/api/admin/storage-comp/` path; no URL is printed.
 
+### `NODE_STATS_READ_TOKEN` (TC-1482): compose hash change
+
+`docker-compose.dstack-postgres.yaml` passes the optional bearer for the
+read-only `GET /admin/stats` to the node as `NODE_STATS_READ_TOKEN:
+"${NODE_STATS_READ_TOKEN:-}"`. This ships in the same release as the route
+(the release after 1.21.2) and **changes the compose hash**: the N0 template
+lock in `docker.yml` moves to the hash above and
+`scripts/ci/fixtures/tc959-n0-compose.yaml` stays byte-identical to the
+compose. Release notes for that release must say so.
+
+- The secret is the `production` environment secret
+  `PROD_TINYCLOUD_NODE_STATS_READ_TOKEN`. The deploy step maps it to
+  `PHALA_ENV_NODE_STATS_READ_TOKEN` and writes it to the sealed
+  `.phala-prod.env` (mode 0600, removed afterwards) like the other secrets;
+  the value is never in a file in the repository, in argv or in logs.
+- It is **optional**. It is not in the deploy step's `required_vars`. Unset
+  or empty, the line is not written, the node starts normally and the route
+  is disabled (`404`, as for an unknown route). `--validate-config` and the
+  compose validation do not read it. A multi-line value fails before any CVM
+  mutation. Once a deploy has added the name to the CVM's `allowed_envs`,
+  later deploys must keep supplying it (the whitelist check requires every
+  allowed name to be present in the sealed file).
+- The value must differ from `PROD_TINYCLOUD_ADMIN_SECRET`; if equal the
+  node keeps the route disabled.
+- Operator steps: Bobbie generates the token; Amos stores it as the
+  `PROD_TINYCLOUD_NODE_STATS_READ_TOKEN` environment secret before the
+  release deploy (via stdin, never printed, so the deploy seals it into the
+  Phala env); the same value is set as OpenKey's `NODE_STATS_READ_TOKEN`.
+- `ops/rollback/pre-n0-compose.yaml` and `pre-n0-stop-local-logs.yaml` are not
+  changed: they are pinned by raw hash, restore the 1.20.6 image, which does
+  not read this variable, and the rollback leaves the route absent.
+
 Every `deploy_phala=true` command must explicitly include
 **`-f authorize_quota_values=true`**. This authorizes the reviewed values
 and authority in `ops/quota-overrides.json` for that one dispatch; it is
@@ -309,8 +341,8 @@ Before any CVM mutation the workflow requires:
 
 - the main compose, with its one node digest replaced by 64 zeros, to hash
   to the reviewed N0 template
-  **`57ab0cb6b990b1ebb8898f9dd72768a047daab940cecd2ee5b5edbdf6060b4b7`**
-  (raw `e38da34f57abef713fc3261b86c01bdcb158087c892ea33f0c58e1251cfdffb3` normalized: the 1.21.0 compose
+  **`87b5d12a86f07f33ae68832c802894c061a6b4e194aea078cb5eb95a068719aa`**
+  (raw `d1fcd66534e3131c691935b7b1dc774d93f8b1e75dab52b178cafba59b2cbdbf` normalized; before the optional TC-1482 `NODE_STATS_READ_TOKEN` env line and the TC-1482 route in the Vector config the template was `7fabba70…`, raw `1228d81927fc0a3fbba85745103e77b3112606f5d314d15974d400b222409350`: the 1.21.0 compose
   `d95bfb707871c1d626c4a8f2b8d32d354103edbb5077847c6a21fe5f7f6cfa50`, template
   `51f8e9e9…`, with only the embedded Vector config regenerated for TC-1274's,
   TC-1317's and TC-1482's route and warning codes (TC-1274 and TC-1317 were template `7fabba70…`, raw `1228d819…`); TC-1274 alone was template `00938226…`, raw
@@ -379,8 +411,8 @@ gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref main \
 
 The served/OCI identity remains **1.20.6-dstack / e18578ff9162986ddd813259c60f73866e3e60d1**.
 With the template lock on main this redeploys exactly main's raw compose
-`e38da34f57abef713fc3261b86c01bdcb158087c892ea33f0c58e1251cfdffb3`
-(the 1.21.0 compose `d95bfb70…` with the TC-1274, TC-1317 and TC-1482 Vector config), whatever digest
+`d1fcd66534e3131c691935b7b1dc774d93f8b1e75dab52b178cafba59b2cbdbf`
+(the 1.21.0 compose `d95bfb70…` with the TC-1274, TC-1317 and TC-1482 Vector config and the optional TC-1482 `NODE_STATS_READ_TOKEN` env line), whatever digest
 main's template currently pins. It is not a rollback of a
 later release across a schema migration. Current pre-N0 tag/pinned
 equivalents are separately hash-checked; arbitrary same-image config
