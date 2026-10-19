@@ -126,9 +126,10 @@ impl<'r, 'o: 'r, R: Responder<'r, 'o>> Responder<'r, 'o> for NoStore<R> {
     }
 }
 
-/// The distinct owner addresses that hold data beyond what sign-in creates by
-/// itself (`account`, and the `secrets` space's database artifacts). One
-/// aggregate statement; see `tinycloud_core::data_owners`.
+/// The distinct owner addresses that hold data beyond what sign-in and vault
+/// unlock create by themselves (`account`, the `secrets` space's database
+/// artifacts, and the vault metadata in `public`). One aggregate statement;
+/// the full rule is in `tinycloud_core::data_owners`.
 #[get("/admin/stats")]
 pub async fn get_stats(
     _auth: StatsAuth,

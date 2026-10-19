@@ -38,7 +38,7 @@ The SDK checks this endpoint during sign-in and requires an exact protocol versi
 | `POST` | `/delegate` | Yes | Create capability delegations |
 | `GET` | `/peer/generate/<space>` | No | Generate space host key pair |
 | `GET` | `/healthz` | No | Health check |
-| `GET` | `/admin/stats` | `NODE_STATS_READ_TOKEN` bearer | Distinct owner addresses that hold data beyond what sign-in creates (read-only; disabled unless the token is set, at least 32 bytes) |
+| `GET` | `/admin/stats` | `NODE_STATS_READ_TOKEN` bearer | Distinct owner addresses that hold data beyond automatic sign-in records and vault metadata (read-only; disabled unless the token is set, at least 32 bytes) |
 
 ### Storage usage and full-space writes
 
@@ -128,24 +128,36 @@ logs it or any address.
 { "owners": ["0x…", "0x…"], "count": 2, "generatedAt": "2026-10-19T12:00:00Z" }
 ```
 
-- **What is counted.** An owner is listed when a space they own holds data that
-  signing in does not create by itself. OpenKey's sign-in bootstrap writes KV
-  in the `account` space and SQL tables in the `account` and `secrets` spaces
-  for every account, so those do not count:
-  - `account`: never counts, neither its KV nor its databases;
-  - `secrets`: its **databases** never count (the sign-in table), but its
-    **KV** does (a stored secret is real data);
-  - every other space counts by a live (`deleted = false`) `current_kv` row
-    **or** a SQL/DuckDB `database_artifact` row. Artifact rows are never
-    deleted, so a database that was created and later emptied or dropped still
-    counts.
+- **What is counted** (the complete rule).
+  - **Counts:** an owner holding live (`deleted = false`) KV in any space
+    except `account`, or a SQL/DuckDB database artifact in any space except
+    `account` and `secrets`, **except** KV in the `public` space whose key
+    starts with `.well-known/vault-` (vault metadata).
+  - **Excluded** (automatic sign-in records, not use of the node): the
+    `account` space entirely (its KV and its databases); the `secrets` table
+    that OpenKey's bootstrap creates (database artifacts in `secrets`; KV
+    stored in `secrets` still counts); and the vault metadata that
+    `vault.unlock()` writes (`.well-known/vault-pubkey`,
+    `.well-known/vault-version`, `.well-known/vault-space` in `public`). An
+    app may unlock the vault automatically, so counting those rows would
+    inflate "users with data" the same way the `secrets` table did.
+  - **App first-use data counts.** A database an app creates on first use
+    (for example listen's `conversations` database or feed-learn's tables) is
+    a person actually using an app that stores on TinyCloud. Artifact rows are
+    never deleted, so a database that was created and later emptied or dropped
+    still counts.
 
-  The match is on the exact space name (the last `:`-separated segment of the
-  space id), so `secrets2`, `my-account` or `Secrets` are ordinary data. An
-  owner who only signed in is therefore not listed. This is stricter than
-  "spaces with `usage_bytes > 0`" (`/admin/usage`), which counts the `account`
-  space's bytes. Other spaces the sign-in flow can create (`default`,
-  `applications`, `public`) hold no data until the user stores some.
+  The space match is on the exact space name (the last `:`-separated segment
+  of the space id), so `secrets2`, `my-account`, `Secrets` or `Account` are
+  ordinary spaces. The vault exclusion is exactly the `public` space and keys
+  that start with `.well-known/vault-` (case-sensitive, starts-with): other
+  `.well-known/*` keys (including `.well-known/vault`), any other KV in
+  `public`, and the same prefix in any other space all count, and a `public`
+  space with at least one live KV row that is not vault metadata makes its
+  owner count. An owner who only signed in, or only signed in and unlocked the
+  vault, is therefore not listed. This is stricter than "spaces with
+  `usage_bytes > 0`" (`/admin/usage`), which counts the `account` space's
+  bytes.
 - **Owner.** Parsed from `tinycloud:pkh:eip155:<chain>:0x<address>:<name>`,
   lowercased and de-duplicated across spaces and chains. Spaces whose owner is
   not an `eip155` address (a `did:key` owner) are skipped. `owners` is sorted.
@@ -154,12 +166,15 @@ logs it or any address.
   `current_kv`, plus one pass over `database_artifact`'s space column. The cost
   grows with the number of `space` rows (about six per bootstrapped account),
   not only with listed owners: 4.35 s warm on a local PostgreSQL 14 with
-  300,000 spaces and 1.5 million keys. Re-measure before the node holds
-  several times that many spaces; the consumer gives up after 15 s.
+  300,000 spaces and 1.5 million keys (measured before the vault-metadata
+  condition, which adds one prefix comparison per `current_kv` row a probe
+  reads; in a `public` space that is at most the vault rows before the first
+  other live row). Re-measure before the node holds several times that many
+  spaces; the consumer gives up after 15 s.
 - **Bound, never a partial list.** The consumer makes no partial use of a
   response, so the route never answers a shorter list with `200`. More than
   200,000 owners (or more than 400,000 distinct counted spaces, which bounds
-  memory; the excluded `account` and `secrets` entries are not counted) is a
+  memory; spaces that do not count are not included) is a
   bare `507`. Every entry is exactly `0x` followed by 40 lowercase hex digits;
   a space whose owner is not such an `eip155` address is left out.
 - **Nothing else** about spaces, keys, sizes or timing is returned, and the

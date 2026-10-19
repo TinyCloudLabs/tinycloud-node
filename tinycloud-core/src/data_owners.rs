@@ -4,16 +4,24 @@
 //! # What counts
 //!
 //! An owner counts when at least one of their spaces holds data that sign-in
-//! does not create by itself. Sign-in creates, automatically, in every
-//! bootstrapped account: KV in `account` and SQL tables in `account` and
-//! `secrets` (OpenKey's `tinycloud-bootstrap`). So:
+//! and vault unlock do not create by themselves. Sign-in creates,
+//! automatically, in every bootstrapped account: KV in `account` and SQL
+//! tables in `account` and `secrets` (OpenKey's `tinycloud-bootstrap`).
+//! `vault.unlock()` writes three KV rows in `public` whose keys start with
+//! `.well-known/vault-` (`vault-pubkey`, `vault-version`, `vault-space`), and
+//! an app may unlock automatically. So:
 //!
 //! - **`account`**: never counts, neither its KV nor its database artifacts.
 //! - **`secrets`**: its **KV** counts (a stored secret is real data); its
 //!   **database artifacts do not** (the sign-in bootstrap's table).
+//! - **`public`**: its KV counts, except rows whose key starts with the exact,
+//!   case-sensitive prefix `.well-known/vault-` (vault metadata). Any other
+//!   `public` row, and the same prefix in any other space, still counts.
 //! - **every other space**: KV and database artifacts both count.
 //!
-//! The name is the exact last segment of the space id; see [`not_named`].
+//! The name is the exact last segment of the space id; see [`name_test`].
+//! App first-use data (a database an app creates, such as a `conversations`
+//! table) counts: it means a person used an app that stores on TinyCloud.
 //!
 //! - **KV**: at least one `current_kv` row with `deleted = false`; or
 //! - **SQL/DuckDB**: at least one `database_artifact` row. Artifact rows are
@@ -53,14 +61,24 @@ pub const ACCOUNT_SPACE: &str = "account";
 /// so its database artifacts never count. Its KV rows (stored secrets) do.
 pub const SECRETS_SPACE: &str = "secrets";
 
+/// The `public` space, where `vault.unlock()` writes its metadata.
+pub const PUBLIC_SPACE: &str = "public";
+
+/// Keys in the `public` space that start with this exact prefix are vault
+/// metadata (`.well-known/vault-pubkey`, `.well-known/vault-version`,
+/// `.well-known/vault-space`), not data. ASCII only, so its byte length is its
+/// character length in SQL `SUBSTR`.
+pub const VAULT_METADATA_PREFIX: &str = ".well-known/vault-";
+
 /// Most owners one call returns: the consumer's own limit (OpenKey refuses a
 /// longer list). More is an error, never a partial list.
 pub const MAX_OWNERS: usize = 200_000;
 
 /// Most distinct spaces one call reads, which bounds memory (about 110 bytes
-/// each). Spaces that do not count (the automatic `account` space, and the
-/// `secrets` space's database artifacts) are excluded in SQL and are not part
-/// of this number. More is an error, never a partial list.
+/// each). Spaces that do not count (the automatic `account` space, the
+/// `secrets` space's database artifacts, and a `public` space holding only
+/// vault metadata) are excluded in SQL and are not part of this number. More
+/// is an error, never a partial list.
 pub const MAX_SPACES_SCANNED: usize = 400_000;
 
 /// Why no list was produced.
@@ -78,41 +96,60 @@ impl From<DbErr> for DataOwnersError {
     }
 }
 
-/// The `WHERE` condition that is true when the space id in `column` does NOT
-/// end in `:<name>`. A space id is `tinycloud:pkh:eip155:<chain>:0x<address>:<name>`
-/// and the id parser splits at the LAST `:`, so a name never contains one and
-/// "ends in `:<name>`" is "the name is exactly `<name>`": `xsecrets` and an
-/// owner part that happens to contain the word cannot match. `SUBSTR` of the
-/// last `n` characters with `=` is used rather than `LIKE`, which is
-/// ASCII-case-insensitive on SQLite (so it would drop an `Account` space that
-/// the node treats as ordinary data).
-fn not_named(column: &str, name: &str) -> String {
+/// `SUBSTR` of the last `name.len() + 1` characters of the space id in
+/// `column`, compared with `op` (`=` or `<>`) to `':<name>'`. A space id is
+/// `tinycloud:pkh:eip155:<chain>:0x<address>:<name>` and the id parser splits
+/// at the LAST `:`, so a name never contains one and "ends in `:<name>`" is
+/// "the name is exactly `<name>`": `xsecrets` and an owner part that happens to
+/// contain the word cannot match. `SUBSTR` with `=` is used rather than
+/// `LIKE`, which is ASCII-case-insensitive on SQLite (so it would drop an
+/// `Account` space that the node treats as ordinary data). `:public` is 7
+/// characters, so its substring starts at `LENGTH - 6`.
+fn name_test(column: &str, name: &str, op: &str) -> String {
     let suffix = format!(":{name}");
     format!(
-        "SUBSTR({column}, LENGTH({column}) - {}) <> '{suffix}'",
+        "SUBSTR({column}, LENGTH({column}) - {}) {op} '{suffix}'",
         suffix.len() - 1
     )
 }
 
+/// The `WHERE` condition that is true when the space id in `column` does NOT
+/// end in `:<name>`.
+fn not_named(column: &str, name: &str) -> String {
+    name_test(column, name, "<>")
+}
+
+/// The condition that is true when the space id in `column` ends in `:<name>`.
+fn named(column: &str, name: &str) -> String {
+    name_test(column, name, "=")
+}
+
 /// Space ids with counted data, each at most once (`UNION`):
 ///
-/// - KV half: a `space` row, not named `account`, with a live `current_kv` row;
+/// - KV half: a `space` row, not named `account`, with a live `current_kv` row
+///   that is not vault metadata (in a space named `public`, a key starting
+///   with [`VAULT_METADATA_PREFIX`]);
 /// - artifact half: a `database_artifact` space not named `account` or `secrets`.
 ///
 /// The exclusions are in SQL, before the outer `LIMIT`, so the bound counts
 /// DISTINCT SPACES THAT COUNT, not sign-in bookkeeping rows. The outer `LIMIT`
 /// is the memory bound plus one, so a result past it is detected instead of
 /// silently cut. Written for SQLite, PostgreSQL and MySQL; the only parameter
-/// is the numeric bound, and the names are constants of this crate.
+/// is the numeric bound, and the names and prefix are constants of this crate
+/// (no `_`, `%` or quote in them, so inlining them is exact).
 fn query(limit: usize) -> String {
     let kv_not_account = not_named("s.id", ACCOUNT_SPACE);
+    let kv_in_public = named("s.id", PUBLIC_SPACE);
+    let prefix = VAULT_METADATA_PREFIX;
+    let prefix_len = prefix.len();
     let artifact_not_account = not_named("a.space", ACCOUNT_SPACE);
     let artifact_not_secrets = not_named("a.space", SECRETS_SPACE);
     format!(
         "SELECT u.id FROM (\
            SELECT s.id AS id FROM space s \
            WHERE {kv_not_account} \
-             AND EXISTS (SELECT 1 FROM current_kv k WHERE k.space = s.id AND NOT k.deleted) \
+             AND EXISTS (SELECT 1 FROM current_kv k WHERE k.space = s.id AND NOT k.deleted \
+               AND NOT ({kv_in_public} AND SUBSTR(k.key, 1, {prefix_len}) = '{prefix}')) \
            UNION \
            SELECT a.space AS id FROM database_artifact a \
            WHERE {artifact_not_account} AND {artifact_not_secrets}\
@@ -769,22 +806,32 @@ mod tests {
             std::sync::Arc::new(SeaOrmDatabaseArtifactRepository::new(conn.clone())),
         );
         let signed_in = |n: u64| format!("0x{:040x}", 0xa000 + n);
-        let (only, only_sdk, secret_kv, other_kv, other_sql, vault_public) = (
+        let (only, only_sdk, secret_kv, other_kv, other_sql) = (
             signed_in(1),
             signed_in(2),
             signed_in(3),
             signed_in(4),
             signed_in(5),
-            signed_in(6),
         );
-        for owner in [
-            &only,
-            &only_sdk,
-            &secret_kv,
-            &other_kv,
-            &other_sql,
-            &vault_public,
-        ] {
+        // Owners that also unlock the vault (`vault.unlock()` writes three KV
+        // rows in `public`), then differ in what else they hold.
+        let (unlock_only, unlock_notes, unlock_deleted, unlock_other_space) =
+            (signed_in(6), signed_in(7), signed_in(8), signed_in(9));
+        let (unlock_wk_other, unlock_wk_nodash, unlock_case) =
+            (signed_in(10), signed_in(11), signed_in(12));
+        let unlockers = [
+            &unlock_only,
+            &unlock_notes,
+            &unlock_deleted,
+            &unlock_other_space,
+            &unlock_wk_other,
+            &unlock_wk_nodash,
+            &unlock_case,
+        ];
+        for owner in [&only, &only_sdk, &secret_kv, &other_kv, &other_sql]
+            .into_iter()
+            .chain(unlockers)
+        {
             replay_sign_in(conn, &service, owner).await;
         }
 
@@ -820,14 +867,31 @@ mod tests {
             owners(conn).await
         );
 
+        // Sign-in + vault unlock only: the three `.well-known/vault-*` rows
+        // in `public` are present (live) but are not data.
+        for owner in unlockers {
+            let public = id(1, owner, "public");
+            for key in [
+                ".well-known/vault-pubkey",
+                ".well-known/vault-version",
+                ".well-known/vault-space",
+            ] {
+                add_kv(conn, &public, key, false).await;
+            }
+            assert_eq!(count(conn, "current_kv", &public).await, 3);
+        }
+        assert!(
+            owners(conn).await.is_empty(),
+            "sign-in plus vault unlock must not be listed: {:?}",
+            owners(conn).await
+        );
+
         // A stored secret: KV in `secrets`.
         let secrets = id(1, &secret_kv, "secrets");
         add_kv(conn, &secrets, "vault/openai", false).await;
         assert_eq!(owners(conn).await, vec![secret_kv.clone()]);
 
-        // Data in another space: KV in `default`, a SQL table in `default`,
-        // and the vault's public-space KV (written when the user unlocks the
-        // vault; counted, like any other space).
+        // Data in another space: KV in `default`, a SQL table in `default`.
         add_kv(conn, &id(1, &other_kv, "default"), "notes/a", false).await;
         sql_execute(
             &service,
@@ -842,18 +906,53 @@ mod tests {
             },
         )
         .await;
-        add_kv(
-            conn,
-            &id(1, &vault_public, "public"),
-            ".well-known/vault-pubkey",
-            false,
-        )
-        .await;
-        let mut expected = vec![secret_kv, other_kv, other_sql, vault_public];
+        let mut expected = vec![secret_kv, other_kv, other_sql];
         expected.sort();
         assert_eq!(owners(conn).await, expected);
+
+        // Each of these makes an unlocked owner count. Checked one at a time,
+        // so a wider filter fails on the first row it wrongly hides.
+        let public = |owner: &String| id(1, owner, "public");
+        let cases: [(&String, String, &str); 5] = [
+            // any other `public` KV
+            (&unlock_notes, public(&unlock_notes), "notes/x"),
+            // the prefix, but in another space
+            (
+                &unlock_other_space,
+                id(1, &unlock_other_space, "default"),
+                ".well-known/vault-pubkey",
+            ),
+            // another `.well-known/` key
+            (
+                &unlock_wk_other,
+                public(&unlock_wk_other),
+                ".well-known/other",
+            ),
+            // `vault` without the dash
+            (
+                &unlock_wk_nodash,
+                public(&unlock_wk_nodash),
+                ".well-known/vault",
+            ),
+            // the prefix is case-sensitive
+            (&unlock_case, public(&unlock_case), ".Well-Known/vault-x"),
+        ];
+        for (owner, space, key) in cases {
+            let before = owners(conn).await;
+            assert!(!before.contains(owner), "{key} not yet written");
+            add_kv(conn, &space, key, false).await;
+            let after = owners(conn).await;
+            assert!(after.contains(owner), "{key} in {space} must count");
+            assert_eq!(after.len(), before.len() + 1);
+        }
+
+        // A deleted `public` row that is not metadata does not count.
+        add_kv(conn, &public(&unlock_deleted), "notes/gone", true).await;
+        assert!(!owners(conn).await.contains(&unlock_deleted));
+
         assert!(!owners(conn).await.contains(&only));
         assert!(!owners(conn).await.contains(&only_sdk));
+        assert!(!owners(conn).await.contains(&unlock_only));
     }
 
     #[tokio::test]
