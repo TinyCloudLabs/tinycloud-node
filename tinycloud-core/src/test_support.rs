@@ -32,6 +32,21 @@ pub(crate) fn postgres_test_url(test: &str) -> Option<String> {
     }
 }
 
+/// A name no other fixture of this run has: the clock alone is not enough,
+/// two tests starting together can read the same instant (a duplicate
+/// `CREATE DATABASE` / `CREATE SCHEMA` fails the test), so a process-wide
+/// counter breaks the tie.
+fn unique_name(prefix: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "{prefix}_{}_{}_{}",
+        std::process::id(),
+        time::OffsetDateTime::now_utc().unix_timestamp_nanos(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 /// A migrated connection to a throwaway schema on the
 /// `TINYCLOUD_TEST_POSTGRES_URL` database (`search_path` is that schema). The
 /// schema is dropped when this goes out of scope, including while a failed
@@ -57,11 +72,7 @@ impl PostgresTestSchema {
         use sea_orm_migration::MigratorTrait;
 
         let url = postgres_test_url(test)?;
-        let schema = format!(
-            "tc_test_{}_{}",
-            std::process::id(),
-            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
-        );
+        let schema = unique_name("tc_test");
         let admin = Database::connect(sea_orm::ConnectOptions::new(url.clone()))
             .await
             .expect("connect to PostgreSQL test database");
@@ -151,11 +162,7 @@ impl PostgresTestDatabase {
         use sea_orm_migration::MigratorTrait;
 
         let admin_url = postgres_test_url(test)?;
-        let name = format!(
-            "tc_test_db_{}_{}",
-            std::process::id(),
-            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
-        );
+        let name = unique_name("tc_test_db");
         let admin = Database::connect(sea_orm::ConnectOptions::new(admin_url.clone()))
             .await
             .expect("connect to PostgreSQL test server");

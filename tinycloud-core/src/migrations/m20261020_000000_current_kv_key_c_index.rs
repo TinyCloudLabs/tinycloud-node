@@ -96,7 +96,9 @@ enum IndexState {
 /// expression but as the column `key` with the `C` collation of `pg_catalog`
 /// recorded in `indcollation`, so that is the shape checked: columns
 /// `space, deleted, key`, the third in collation `pg_catalog.C`, default
-/// operator classes, ascending, no expressions, predicate or included
+/// operator classes, ascending, the first two columns in their own columns'
+/// collations (a query compares `space` in the column's collation, so an
+/// index in another one cannot serve `space = $1`), no expressions, predicate or included
 /// columns. An index on `key` in the database collation (the existing
 /// `idx_current_kv_space_deleted_key`), on `COLLATE "POSIX"`, on another
 /// expression, with a predicate, or with extra columns is not this index, and
@@ -125,7 +127,13 @@ async fn postgres_index_state(manager: &SchemaManager<'_>) -> Result<IndexState,
                     COALESCE((SELECT bool_and(oc.opcdefault)
                               FROM unnest(i.indclass::oid[]) AS k(opclass)
                               JOIN pg_opclass oc ON oc.oid = k.opclass), false) AS default_opclasses,
-                    array_to_string(i.indoption::int2[], ',') AS options
+                    array_to_string(i.indoption::int2[], ',') AS options,
+                    COALESCE((SELECT bool_and(k.coll = a.attcollation)
+                              FROM unnest(i.indcollation::oid[]) WITH ORDINALITY AS k(coll, ord)
+                              JOIN unnest(i.indkey::int2[]) WITH ORDINALITY AS kk(attnum, ord)
+                                ON kk.ord = k.ord
+                              JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = kk.attnum
+                              WHERE k.ord IN (1, 2)), false) AS lead_collations_match_the_columns
              FROM pg_class c
              LEFT JOIN pg_index i ON i.indexrelid = c.oid
              LEFT JOIN pg_am am ON am.oid = c.relam
@@ -147,6 +155,8 @@ async fn postgres_index_state(manager: &SchemaManager<'_>) -> Result<IndexState,
     let key_collation: Option<String> = row.try_get("", "key_collation")?;
     let default_opclasses: bool = row.try_get("", "default_opclasses")?;
     let options: Option<String> = row.try_get("", "options")?;
+    let lead_collations_match_the_columns: bool =
+        row.try_get("", "lead_collations_match_the_columns")?;
     let shaped = kind == "i"
         && on_table
         && method.as_deref() == Some("btree")
@@ -154,7 +164,8 @@ async fn postgres_index_state(manager: &SchemaManager<'_>) -> Result<IndexState,
         && columns.as_deref() == Some("space,deleted,key")
         && key_collation.as_deref() == Some("pg_catalog.C")
         && default_opclasses
-        && options.as_deref() == Some("0,0,0");
+        && options.as_deref() == Some("0,0,0")
+        && lead_collations_match_the_columns;
     Ok(match (shaped, usable) {
         (true, true) => IndexState::Valid,
         (true, false) => IndexState::Invalid,
@@ -337,6 +348,17 @@ mod tests {
         crate::db::migrate(&db.clone().into()).await
     }
 
+    /// `boot`, giving up after `limit`. The timer starts when the future is
+    /// first polled: pass this to `events_of`, which polls it only once it
+    /// holds the capture lock, so waiting for another test's capture does not
+    /// count against `limit`.
+    async fn boot_within(
+        db: &DbConn,
+        limit: Duration,
+    ) -> Result<Result<(), DbErr>, tokio::time::error::Elapsed> {
+        tokio::time::timeout(limit, boot(db)).await
+    }
+
     /// `up` alone, in a transaction under the boot's 30 s `lock_timeout`.
     /// Returns the `lock_timeout` in force when `up` returned.
     async fn run_up(db: &DbConn) -> String {
@@ -502,11 +524,7 @@ mod tests {
         assert_missing(&events, REASON_BUILD_FAILED, "up");
 
         // The real boot: continues, records the migration.
-        let (booted, events) = events_of(tokio::time::timeout(
-            Duration::from_secs(20),
-            boot(&migrator),
-        ))
-        .await;
+        let (booted, events) = events_of(boot_within(&migrator, Duration::from_secs(20))).await;
         writer.rollback().await.unwrap();
         booted.expect("boot hung on the build").unwrap();
         assert_eq!(postgres_index(db).await, None);
@@ -532,11 +550,7 @@ mod tests {
         let writer = open_writer(db).await;
         let migrator = fixture.connect(1).await;
 
-        let (booted, events) = events_of(tokio::time::timeout(
-            Duration::from_secs(5),
-            boot(&migrator),
-        ))
-        .await;
+        let (booted, events) = events_of(boot_within(&migrator, Duration::from_secs(5))).await;
         writer.rollback().await.unwrap();
 
         booted
@@ -581,11 +595,7 @@ mod tests {
         let writer = open_writer(db).await;
         let migrator = fixture.connect(1).await;
 
-        let (booted, events) = events_of(tokio::time::timeout(
-            Duration::from_secs(5),
-            boot(&migrator),
-        ))
-        .await;
+        let (booted, events) = events_of(boot_within(&migrator, Duration::from_secs(5))).await;
         writer.rollback().await.unwrap();
 
         booted
@@ -699,11 +709,7 @@ mod tests {
         assert!(!postgres_index(db).await.unwrap().1, "mid-build is invalid");
         let migrator = fixture.connect(1).await;
 
-        let (booted, events) = events_of(tokio::time::timeout(
-            Duration::from_secs(5),
-            boot(&migrator),
-        ))
-        .await;
+        let (booted, events) = events_of(boot_within(&migrator, Duration::from_secs(5))).await;
         writer.rollback().await.unwrap();
         build.await.unwrap().unwrap();
 
@@ -739,6 +745,21 @@ mod tests {
             (
                 format!(
                     r#"CREATE INDEX {INDEX} ON current_kv (space, deleted, (key COLLATE "POSIX"))"#
+                ),
+                false,
+            ),
+            // A collation on a leading column other than the column's own: a
+            // query compares `space` in the column's collation, so the
+            // planner cannot match this index for `space = $1`.
+            (
+                format!(
+                    r#"CREATE INDEX {INDEX} ON current_kv ((space COLLATE "C"), deleted, (key COLLATE "C"))"#
+                ),
+                false,
+            ),
+            (
+                format!(
+                    r#"CREATE INDEX {INDEX} ON current_kv ((space COLLATE "POSIX"), deleted, (key COLLATE "C"))"#
                 ),
                 false,
             ),
