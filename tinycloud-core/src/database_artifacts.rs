@@ -474,7 +474,9 @@ pub trait DatabaseArtifactRepository: Send + Sync {
     ) -> Result<Option<ArtifactMeta>, DatabaseArtifactError>;
 
     /// Stream the stored checkpoint, then the WAL delta when `meta` has one,
-    /// into `sink` in slices of at most [`ARTIFACT_CHUNK_BYTES`].
+    /// into `sink` in slices of at most [`ARTIFACT_CHUNK_BYTES`]; an artifact
+    /// of at most [`BASE_TIMEOUT_PAYLOAD_BYTES`] stored bytes is one slice per
+    /// part.
     ///
     /// Peak memory is one slice, whatever the artifact's size. Every slice is
     /// its own statement (`substr(column, offset, length)`, which runs on
@@ -623,11 +625,18 @@ impl SeaOrmDatabaseArtifactRepository {
             ArtifactPart::Wal => database_artifact::Column::DeltaPayload,
         };
         let expected_len = u64::try_from(size_bytes).unwrap_or(0);
+        // An artifact that fits the base-timeout budget is one slice per part:
+        // no extra round trips for the common small database.
+        let slice_bytes = if meta.size_bytes <= BASE_TIMEOUT_PAYLOAD_BYTES as i64 {
+            expected_len.max(1)
+        } else {
+            ARTIFACT_CHUNK_BYTES as u64
+        };
         let mut hasher = Blake3Hasher::new();
         sink.begin_part(part).await?;
         let mut offset = 0_u64;
         while offset < expected_len {
-            let len = (expected_len - offset).min(ARTIFACT_CHUNK_BYTES as u64);
+            let len = (expected_len - offset).min(slice_bytes);
             // `substr` is 1-based and takes int4 on PostgreSQL.
             let start = i32::try_from(offset + 1)
                 .map_err(|_| DatabaseArtifactError::PayloadTooLarge(expected_len))?;
@@ -1479,8 +1488,17 @@ mod tests {
                 for sql in statements.lock().unwrap().iter() {
                     assert!(crate::db_pool::is_read_only_statement(sql), "{sql}");
                 }
-                // One metadata statement, then one per slice of each part.
-                let expected = 1 + ceil_div(len) + delta.map_or(0, ceil_div);
+                // One metadata statement, then one per slice of each part; an
+                // artifact within the base-timeout budget is one slice a part.
+                let total = len + delta.unwrap_or(0);
+                let parts = |part: usize| {
+                    if total <= BASE_TIMEOUT_PAYLOAD_BYTES {
+                        usize::from(part > 0)
+                    } else {
+                        ceil_div(part)
+                    }
+                };
+                let expected = 1 + parts(len) + delta.map_or(0, parts);
                 assert_eq!(
                     statements.lock().unwrap().len(),
                     expected,
@@ -1640,7 +1658,7 @@ mod tests {
             "sql",
             "space",
             "main",
-            bytes(CHUNK + 1, 1),
+            bytes(2 * CHUNK + 1, 1),
             ArtifactExpectation::Any,
         )
         .await
@@ -1693,7 +1711,7 @@ mod tests {
         assert_eq!(meta.revision, 3);
         assert_eq!(sink.0.attempts, 2);
         assert_eq!(sink.0.inner.wal, Some(vec![7; 6]));
-        assert_eq!(sink.0.inner.checkpoint, bytes(CHUNK + 1, 1));
+        assert_eq!(sink.0.inner.checkpoint, bytes(2 * CHUNK + 1, 1));
     }
 
     #[tokio::test]
@@ -1703,12 +1721,12 @@ mod tests {
             "sql",
             "space",
             "main",
-            bytes(2 * CHUNK, 1),
+            bytes(2 * CHUNK + 1, 1),
             ArtifactExpectation::Any,
         )
         .await
         .unwrap();
-        let mut sink = race_sink(&repo, 10, |left| (bytes(2 * CHUNK, left as u8), None));
+        let mut sink = race_sink(&repo, 10, |left| (bytes(2 * CHUNK + 1, left as u8), None));
         let error = read_artifact(&repo, "sql", "space", "main", &mut sink)
             .await
             .expect_err("every attempt is overtaken");

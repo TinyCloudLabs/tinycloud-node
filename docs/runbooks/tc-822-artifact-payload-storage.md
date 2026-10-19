@@ -1,12 +1,12 @@
 # TC-822: bounded artifact reads and the Postgres `payload` storage setting
 
-Tracking: [TC-822](https://linear.app/tinycloud-labs/issue/TC-822), under TC-1491. This is an **operator step on Postgres**, not a migration: it is not run at boot and rewrites no data.
+Tracking: [TC-822](https://linear.app/tinycloud-labs/issue/TC-822), under TC-1491. This is an **operator step on Postgres**, not a migration: it is not run at boot and rewrites no data. The PR that introduces the bounded reads contains no migration or schema change (schema freeze).
 
 ## What the node does now
 
 The node never reads a whole `database_artifact` row. `load_meta` selects the metadata columns only. Hydration (`read_chunks`) reads `payload`, then `delta_payload`, in 4 MiB `substr(column, offset, length)` slices, each its own statement under the pool's base statement timeout and guarded by `WHERE revision = <meta.revision> AND checkpoint_content_hash = <meta.checkpoint_content_hash>`. The slices are hashed as they stream and compared with `checkpoint_content_hash` / `delta_content_hash` / `content_hash`. A slice that finds no row (the artifact was saved or deleted meanwhile) restarts the hydration from fresh metadata, at most twice; any hash or size mismatch fails the hydration and seeds nothing.
 
-Round trips per artifact hydration: `1 + ceil(checkpoint_bytes / 4 MiB) + ceil(delta_bytes / 4 MiB)`.
+Round trips per artifact hydration: an artifact of at most 8 MiB stored bytes (`BASE_TIMEOUT_PAYLOAD_BYTES`) is `1 + 1` (+1 with a WAL delta); a larger one is `1 + ceil(checkpoint_bytes / 4 MiB) + ceil(delta_bytes / 4 MiB)`.
 
 ## Why Postgres needs `STORAGE EXTERNAL` on `payload`
 
