@@ -1,5 +1,7 @@
 use aws_config::{BehaviorVersion, SdkConfig};
-use aws_sdk_s3::config::SharedHttpClient;
+use aws_sdk_s3::config::{
+    RequestChecksumCalculation, ResponseChecksumValidation, SharedHttpClient,
+};
 use aws_sdk_s3::{
     error::{ProvideErrorMetadata, SdkError},
     operation::{get_object::GetObjectError, head_object::HeadObjectError},
@@ -21,6 +23,11 @@ use tokio_util::bytes::Bytes;
 
 use super::{file_system, size::SpaceSizes};
 
+/// Pinned so an SDK bump cannot change client defaults unnoticed.
+pub fn behavior_version() -> BehaviorVersion {
+    BehaviorVersion::v2026_01_12()
+}
+
 /// HTTPS client for the SDK, with rustls on the `ring` provider.
 pub fn http_client() -> SharedHttpClient {
     aws_smithy_http_client::Builder::new()
@@ -31,7 +38,7 @@ pub fn http_client() -> SharedHttpClient {
 }
 
 async fn aws_config() -> SdkConfig {
-    aws_config::defaults(BehaviorVersion::latest())
+    aws_config::defaults(behavior_version())
         .http_client(http_client())
         .load()
         .await
@@ -72,7 +79,13 @@ impl StorageSetup for S3BlockStore {
 
 async fn new_client(config: &S3BlockConfig) -> Client {
     let general_config = aws_config().await;
-    let sdk_config = aws_sdk_s3::config::Builder::from(&general_config);
+    // Checksums only when an operation requires them: the SDK 1.x defaults
+    // (CRC32 trailers, aws-chunked uploads, checksum-mode GETs) are rejected
+    // by some S3-compatible providers and older MinIO, and the pre-1.0 SDK
+    // sent none.
+    let sdk_config = aws_sdk_s3::config::Builder::from(&general_config)
+        .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
+        .response_checksum_validation(ResponseChecksumValidation::WhenRequired);
     let sdk_config = match &config.endpoint {
         // A custom endpoint (MinIO etc.) addresses buckets by path, as the
         // pre-1.0 SDK's immutable endpoint did.

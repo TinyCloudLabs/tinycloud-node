@@ -24,8 +24,8 @@ async-trait.workspace = true
 # which next to the `ring` provider rustls already uses here leaves rustls
 # without an unambiguous default CryptoProvider. The client is built on ring
 # in `storage::s3::http_client`.
-aws-config = { version = "1", default-features = false, features = ["rt-tokio", "credentials-process", "sso", "behavior-version-latest"] }
-aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "http-1x", "behavior-version-latest"] }
+aws-config = { version = "1", default-features = false, features = ["rt-tokio", "credentials-process", "sso"] }
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "http-1x"] }
 aws-smithy-http-client = { version = "1", features = ["rustls-ring"] }
 axum = "0.7"
 base64 = "0.13"

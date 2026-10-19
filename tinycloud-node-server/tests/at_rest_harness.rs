@@ -139,7 +139,7 @@ impl Harness {
                 .with_context(|| format!("{key} missing from harness env file"))
         };
 
-        let sdk = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        let sdk = aws_config::defaults(tinycloud::storage::s3::behavior_version())
             .http_client(tinycloud::storage::s3::http_client())
             .region(aws_sdk_s3::config::Region::new(var("TC887_S3_REGION")?))
             .credentials_provider(aws_sdk_s3::config::Credentials::new(
@@ -154,6 +154,12 @@ impl Harness {
         let endpoint = var("TC887_S3_ENDPOINT")?;
         let s3 = aws_sdk_s3::Client::from_conf(
             aws_sdk_s3::config::Builder::from(&sdk)
+                .request_checksum_calculation(
+                    aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
+                )
+                .response_checksum_validation(
+                    aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired,
+                )
                 .endpoint_url(endpoint)
                 .force_path_style(true)
                 .build(),
