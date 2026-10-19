@@ -3,7 +3,7 @@ use std::{
     future::Future,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, AtomicU8, Ordering},
+        atomic::{AtomicU8, Ordering},
         Arc, Weak,
     },
     time::Duration,
@@ -15,7 +15,8 @@ use tokio::{sync::OwnedMutexGuard, time::Instant};
 use tracing::Instrument;
 
 use crate::database_artifacts::{
-    ArtifactExpectation, DatabaseArtifact, DatabaseArtifactError, DatabaseArtifactRepository,
+    read_artifact, ArtifactExpectation, ArtifactMeta, CacheFileSink, DatabaseArtifactError,
+    DatabaseArtifactRepository,
 };
 use crate::db_pool::{is_transient_error, track_writes, transient_error_class};
 use crate::{request_cancel, request_telemetry};
@@ -467,7 +468,7 @@ impl SqlService {
                 || SqlBusyStage::ArtifactTransfer,
                 self.bounds.artifact_transfer,
                 self.artifact_repository
-                    .load("sql", &space.to_string(), db_name),
+                    .load_meta("sql", &space.to_string(), db_name),
             )
             .await?
             .map_err(artifact_error_to_sql)?
@@ -626,18 +627,33 @@ impl SqlService {
         (HydrationFlight { phase, outcome }, start)
     }
 
-    /// Load the durable artifact, seed the cache from it and spawn the actor.
-    /// Only the load is bounded (`hydration_max`): the cache writes after it
-    /// are local and must finish once begun.
+    /// Stream the durable artifact into the cache, seed it and spawn the actor.
+    /// Only the streaming read is bounded (`hydration_max`): it stages temp
+    /// files that a timeout simply drops, while the commit after it is local
+    /// and must finish once begun.
     async fn hydrate(&self, space: &SpaceId, db_name: &str, phase: &AtomicU8) -> HydrationOutcome {
+        let cache_path = self.cache_path(space, db_name);
+        let mut sink = CacheFileSink::new(
+            "sql",
+            format!("{space}/{db_name}"),
+            cache_path.clone(),
+            sql_wal_path(&cache_path),
+            is_sqlite_database,
+            is_sqlite_wal,
+        );
         let loaded = tokio::time::timeout(
             self.bounds.hydration_max,
-            self.artifact_repository
-                .load("sql", &space.to_string(), db_name),
+            read_artifact(
+                self.artifact_repository.as_ref(),
+                "sql",
+                &space.to_string(),
+                db_name,
+                &mut sink,
+            ),
         )
         .await;
-        let artifact = match loaded {
-            Ok(Ok(artifact)) => artifact,
+        let meta = match loaded {
+            Ok(Ok(meta)) => meta,
             Ok(Err(error)) => return hydration_failure(artifact_error_to_sql(error)),
             Err(_) => {
                 tracing::warn!(
@@ -650,7 +666,7 @@ impl SqlService {
             }
         };
         phase.store(PHASE_WRITING, Ordering::Release);
-        if let Err(error) = self.seed_cache(space, db_name, artifact).await {
+        if let Err(error) = self.seed_cache(space, db_name, meta, sink).await {
             return hydration_failure(error);
         }
         self.databases
@@ -667,53 +683,39 @@ impl SqlService {
         HydrationOutcome::Ready
     }
 
+    /// Replace the cache files with the verified artifact staged in `sink`
+    /// (or with nothing, when there is no artifact).
     async fn seed_cache(
         &self,
         space: &SpaceId,
         db_name: &str,
-        artifact: Option<DatabaseArtifact>,
+        meta: Option<ArtifactMeta>,
+        mut sink: CacheFileSink,
     ) -> Result<(), SqlError> {
         let cache_path = self.cache_path(space, db_name);
         let key = (space.to_string(), db_name.to_string());
-        match artifact {
-            Some(artifact) => {
+        match meta {
+            Some(meta) => {
                 tracing::info!(
                     service = "sql",
-                    revision = artifact.revision,
-                    storage_mode = %artifact.storage_mode,
-                    bytes = artifact.payload.len(),
-                    delta_bytes = artifact.delta_size_bytes,
-                    logical_bytes = artifact.size_bytes,
-                    content_hash = %artifact.content_hash,
-                    checkpoint_content_hash = %artifact.checkpoint_content_hash,
+                    revision = meta.revision,
+                    storage_mode = %meta.storage_mode,
+                    bytes = meta.checkpoint_size_bytes,
+                    delta_bytes = meta.delta_size_bytes,
+                    logical_bytes = meta.size_bytes,
+                    content_hash = %meta.content_hash,
+                    checkpoint_content_hash = %meta.checkpoint_content_hash,
                     "Loaded database artifact"
                 );
-                // Refuse to seed the cache with bytes SQLite would misread. A
-                // checkpoint that is not a database opens as a fresh empty one,
-                // and a WAL that is not a WAL is ignored outright — both revert
-                // the database silently, and the next write makes the reverted
-                // state durable.
-                validate_payload(
-                    space,
-                    db_name,
-                    "checkpoint",
-                    &artifact.payload,
-                    is_sqlite_database,
-                )?;
-                if let Some(delta) = artifact.delta_payload.as_deref() {
-                    validate_payload(space, db_name, "wal", delta, is_sqlite_wal)?;
-                }
-
                 remove_sql_cache_files(&cache_path).await?;
-                write_cache_file(&cache_path, &artifact.payload).await?;
-                if let Some(delta) = artifact.delta_payload {
-                    write_cache_file(&sql_wal_path(&cache_path), &delta).await?;
-                }
+                sink.commit()
+                    .await
+                    .map_err(|e| SqlError::Internal(e.to_string()))?;
                 self.lineage.insert(
                     key,
                     ArtifactExpectation::Derived {
-                        revision: artifact.revision,
-                        checkpoint_content_hash: artifact.checkpoint_content_hash,
+                        revision: meta.revision,
+                        checkpoint_content_hash: meta.checkpoint_content_hash,
                     },
                 );
                 Ok(())
@@ -831,7 +833,7 @@ impl SqlService {
                 .bounded(
                     || SqlBusyStage::ArtifactTransfer,
                     self.bounds.artifact_transfer,
-                    self.artifact_repository.load("sql", &key.0, db_name),
+                    self.artifact_repository.load_meta("sql", &key.0, db_name),
                 )
                 .await?
                 .map_err(artifact_error_to_sql)?
@@ -883,66 +885,6 @@ fn is_sqlite_wal(payload: &[u8]) -> bool {
     SQLITE_WAL_MAGIC
         .iter()
         .any(|magic| payload.starts_with(magic))
-}
-
-/// Reject a hydration payload whose leading bytes are not the format the file
-/// it is about to become is read as.
-fn validate_payload(
-    space: &SpaceId,
-    db_name: &str,
-    role: &'static str,
-    payload: &[u8],
-    is_valid: impl Fn(&[u8]) -> bool,
-) -> Result<(), SqlError> {
-    if is_valid(payload) {
-        return Ok(());
-    }
-    tracing::error!(
-        service = "sql",
-        role,
-        bytes = payload.len(),
-        "Durable database artifact does not carry the expected file header; refusing to hydrate"
-    );
-    Err(SqlError::Internal(format!(
-        "database artifact {role} for {space}/{db_name} does not carry the expected file header"
-    )))
-}
-
-/// A temp sibling of `path`, unique per call.
-///
-/// The suffix is APPENDED to the whole path. `Path::with_extension` replaces
-/// everything after the last `.`, so `main.db` and `main.db-wal` both mapped to
-/// `main.db.tmp`: the checkpoint and WAL writes of one hydration raced on a
-/// single file and cross-consumed each other's bytes, leaving either a WAL that
-/// SQLite ignores (silent revert to the checkpoint) or a "database" with no
-/// SQLite header (silent revert to empty).
-fn temp_write_path(path: &Path) -> PathBuf {
-    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
-    PathBuf::from(format!(
-        "{}.tmp.{}.{}",
-        path.display(),
-        std::process::id(),
-        NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
-    ))
-}
-
-async fn write_cache_file(path: &Path, payload: &[u8]) -> Result<(), SqlError> {
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|e| SqlError::Internal(e.to_string()))?;
-    }
-
-    let temp_path = temp_write_path(path);
-    if let Err(e) = tokio::fs::write(&temp_path, payload).await {
-        let _ = tokio::fs::remove_file(&temp_path).await;
-        return Err(SqlError::Internal(e.to_string()));
-    }
-    if let Err(e) = tokio::fs::rename(&temp_path, path).await {
-        let _ = tokio::fs::remove_file(&temp_path).await;
-        return Err(SqlError::Internal(e.to_string()));
-    }
-    Ok(())
 }
 
 async fn remove_sql_cache_files(path: &Path) -> Result<(), SqlError> {
@@ -1051,14 +993,19 @@ fn log_busy(stage: SqlBusyStage, bound: Duration, waited: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::database_artifacts::staging_path as temp_write_path;
     use crate::{
-        database_artifacts::{DatabaseArtifact, DeltaSave, SeaOrmDatabaseArtifactRepository},
+        database_artifacts::{
+            test_support::ReadAll, ArtifactMeta, ArtifactSink, DatabaseArtifact, DeltaSave,
+            SeaOrmDatabaseArtifactRepository,
+        },
         migrations::Migrator,
         sea_orm::{ConnectOptions, Database, DbErr},
         sea_orm_migration::MigratorTrait,
         sql_sizes::{SizeTrackingArtifactRepository, SqlSizes},
     };
     use async_trait::async_trait;
+    use std::sync::atomic::AtomicU64;
     use tempfile::TempDir;
     use tinycloud_auth::{
         resolver::DID_METHODS,
@@ -1143,7 +1090,7 @@ mod tests {
                 ));
                 assert_eq!(sizes.space_total(&space).await, 0);
                 assert!(repo
-                    .load("sql", &space.to_string(), name)
+                    .read_all("sql", &space.to_string(), name)
                     .await
                     .unwrap()
                     .is_none());
@@ -1191,7 +1138,7 @@ mod tests {
             ));
             assert_eq!(sizes.space_total(&space).await, 0);
             assert!(repo
-                .load("sql", &space.to_string(), "main")
+                .read_all("sql", &space.to_string(), "main")
                 .await
                 .unwrap()
                 .is_none());
@@ -1230,7 +1177,7 @@ mod tests {
                     .expect("dropping an absent table is a successful no-op");
                 assert_eq!(sizes.space_total(&space).await, 0);
                 assert!(repo
-                    .load("sql", &space.to_string(), name)
+                    .read_all("sql", &space.to_string(), name)
                     .await
                     .unwrap()
                     .is_none());
@@ -1272,7 +1219,7 @@ mod tests {
                 .await
                 .unwrap();
             let before = repo
-                .load("sql", &space.to_string(), "main")
+                .read_all("sql", &space.to_string(), "main")
                 .await
                 .unwrap()
                 .unwrap();
@@ -1313,7 +1260,7 @@ mod tests {
                 "{rejected:?}"
             );
             let after = repo
-                .load("sql", &space.to_string(), "main")
+                .read_all("sql", &space.to_string(), "main")
                 .await
                 .unwrap()
                 .unwrap();
@@ -1441,7 +1388,7 @@ mod tests {
                     .unwrap();
             }
             let mut charged_bytes = repo
-                .load("sql", &space.to_string(), "main")
+                .read_all("sql", &space.to_string(), "main")
                 .await
                 .unwrap()
                 .unwrap()
@@ -1457,7 +1404,7 @@ mod tests {
                     .await
                     .unwrap_or_else(|e| panic!("{name}: non-growing write must pass: {e}"));
                 let artifact = repo
-                    .load("sql", &space.to_string(), "main")
+                    .read_all("sql", &space.to_string(), "main")
                     .await
                     .unwrap()
                     .unwrap();
@@ -1542,7 +1489,7 @@ mod tests {
                 .await
                 .unwrap_or_else(|e| panic!("{name}: DROP must pass: {e}"));
             let artifact = repo
-                .load("sql", &space.to_string(), "main")
+                .read_all("sql", &space.to_string(), "main")
                 .await
                 .unwrap()
                 .unwrap();
@@ -1606,7 +1553,7 @@ mod tests {
                 .await
                 .unwrap();
             let charged_bytes = repo
-                .load("sql", &space.to_string(), "main")
+                .read_all("sql", &space.to_string(), "main")
                 .await
                 .unwrap()
                 .unwrap()
@@ -1657,7 +1604,7 @@ mod tests {
                 .await
                 .unwrap();
             let artifact = repo
-                .load("sql", &space.to_string(), "main")
+                .read_all("sql", &space.to_string(), "main")
                 .await
                 .unwrap()
                 .unwrap();
@@ -1882,7 +1829,7 @@ mod tests {
             .unwrap();
 
         let artifact = repo
-            .load("sql", &space.to_string(), "main")
+            .read_all("sql", &space.to_string(), "main")
             .await
             .unwrap()
             .unwrap();
@@ -1902,7 +1849,7 @@ mod tests {
         // still has to contain both acknowledged writes.
         service.export(&space, "main").await.unwrap();
         let after_export = repo
-            .load("sql", &space.to_string(), "main")
+            .read_all("sql", &space.to_string(), "main")
             .await
             .unwrap()
             .unwrap();
@@ -2064,14 +2011,27 @@ mod tests {
 
     #[async_trait]
     impl DatabaseArtifactRepository for CountingArtifactRepository {
-        async fn load(
+        async fn load_meta(
             &self,
             service: &str,
             space: &str,
             name: &str,
-        ) -> Result<Option<DatabaseArtifact>, DatabaseArtifactError> {
+        ) -> Result<Option<ArtifactMeta>, DatabaseArtifactError> {
             self.loads.fetch_add(1, Ordering::Relaxed);
-            self.inner.load(service, space, name).await
+            self.inner.load_meta(service, space, name).await
+        }
+
+        async fn read_chunks(
+            &self,
+            service: &str,
+            space: &str,
+            name: &str,
+            meta: &ArtifactMeta,
+            sink: &mut dyn ArtifactSink,
+        ) -> Result<(), DatabaseArtifactError> {
+            self.inner
+                .read_chunks(service, space, name, meta, sink)
+                .await
         }
 
         async fn save(
@@ -2214,13 +2174,26 @@ mod tests {
 
     #[async_trait]
     impl DatabaseArtifactRepository for LostReplyArtifactRepository {
-        async fn load(
+        async fn load_meta(
             &self,
             service: &str,
             space: &str,
             name: &str,
-        ) -> Result<Option<DatabaseArtifact>, DatabaseArtifactError> {
-            self.inner.load(service, space, name).await
+        ) -> Result<Option<ArtifactMeta>, DatabaseArtifactError> {
+            self.inner.load_meta(service, space, name).await
+        }
+
+        async fn read_chunks(
+            &self,
+            service: &str,
+            space: &str,
+            name: &str,
+            meta: &ArtifactMeta,
+            sink: &mut dyn ArtifactSink,
+        ) -> Result<(), DatabaseArtifactError> {
+            self.inner
+                .read_chunks(service, space, name, meta, sink)
+                .await
         }
 
         async fn save(
@@ -2316,14 +2289,27 @@ mod tests {
 
     #[async_trait]
     impl DatabaseArtifactRepository for FlakyArtifactRepository {
-        async fn load(
+        async fn load_meta(
             &self,
             service: &str,
             space: &str,
             name: &str,
-        ) -> Result<Option<DatabaseArtifact>, DatabaseArtifactError> {
+        ) -> Result<Option<ArtifactMeta>, DatabaseArtifactError> {
             self.fail()?;
-            self.inner.load(service, space, name).await
+            self.inner.load_meta(service, space, name).await
+        }
+
+        async fn read_chunks(
+            &self,
+            service: &str,
+            space: &str,
+            name: &str,
+            meta: &ArtifactMeta,
+            sink: &mut dyn ArtifactSink,
+        ) -> Result<(), DatabaseArtifactError> {
+            self.inner
+                .read_chunks(service, space, name, meta, sink)
+                .await
         }
 
         async fn save(
@@ -2471,13 +2457,24 @@ mod tests {
 
     #[async_trait]
     impl DatabaseArtifactRepository for FailingArtifactRepository {
-        async fn load(
+        async fn load_meta(
             &self,
             _service: &str,
             _space: &str,
             _name: &str,
-        ) -> Result<Option<DatabaseArtifact>, DatabaseArtifactError> {
+        ) -> Result<Option<ArtifactMeta>, DatabaseArtifactError> {
             Ok(None)
+        }
+
+        async fn read_chunks(
+            &self,
+            _service: &str,
+            _space: &str,
+            _name: &str,
+            _meta: &ArtifactMeta,
+            _sink: &mut dyn ArtifactSink,
+        ) -> Result<(), DatabaseArtifactError> {
+            Ok(())
         }
 
         async fn save(
@@ -2652,12 +2649,12 @@ mod tests {
 
     #[async_trait]
     impl DatabaseArtifactRepository for GatedArtifactRepository {
-        async fn load(
+        async fn load_meta(
             &self,
             service: &str,
             space: &str,
             name: &str,
-        ) -> Result<Option<DatabaseArtifact>, DatabaseArtifactError> {
+        ) -> Result<Option<ArtifactMeta>, DatabaseArtifactError> {
             self.loads.fetch_add(1, Ordering::SeqCst);
             Self::pass(&self.load_open).await;
             if self.fail_loads.load(Ordering::SeqCst) {
@@ -2665,7 +2662,20 @@ mod tests {
                     sea_orm::error::ConnAcquireErr::Timeout,
                 )));
             }
-            self.inner.load(service, space, name).await
+            self.inner.load_meta(service, space, name).await
+        }
+
+        async fn read_chunks(
+            &self,
+            service: &str,
+            space: &str,
+            name: &str,
+            meta: &ArtifactMeta,
+            sink: &mut dyn ArtifactSink,
+        ) -> Result<(), DatabaseArtifactError> {
+            self.inner
+                .read_chunks(service, space, name, meta, sink)
+                .await
         }
 
         async fn save(
@@ -3174,16 +3184,29 @@ mod tests {
 
     #[async_trait]
     impl DatabaseArtifactRepository for PanickingArtifactRepository {
-        async fn load(
+        async fn load_meta(
             &self,
             service: &str,
             space: &str,
             name: &str,
-        ) -> Result<Option<DatabaseArtifact>, DatabaseArtifactError> {
+        ) -> Result<Option<ArtifactMeta>, DatabaseArtifactError> {
             if !self.panicked.swap(true, Ordering::SeqCst) {
                 panic!("injected hydration panic");
             }
-            self.inner.load(service, space, name).await
+            self.inner.load_meta(service, space, name).await
+        }
+
+        async fn read_chunks(
+            &self,
+            service: &str,
+            space: &str,
+            name: &str,
+            meta: &ArtifactMeta,
+            sink: &mut dyn ArtifactSink,
+        ) -> Result<(), DatabaseArtifactError> {
+            self.inner
+                .read_chunks(service, space, name, meta, sink)
+                .await
         }
 
         async fn save(
@@ -3263,5 +3286,285 @@ mod tests {
         assert!(matches!(err, SqlError::RequestTimeout), "{err:?}");
         assert!(!context.latch(), "the request was cut, not latched");
         assert_eq!(rows(read(&service, &space).await.unwrap()), 1);
+    }
+
+    /// Counts metadata reads and the payload bytes delivered to sinks.
+    struct ByteSpyRepository {
+        inner: Arc<SeaOrmDatabaseArtifactRepository>,
+        metas: AtomicU64,
+        chunk_reads: AtomicU64,
+        payload_bytes: Arc<AtomicU64>,
+    }
+
+    struct CountingSink<'a>(&'a mut dyn ArtifactSink, Arc<AtomicU64>);
+
+    #[async_trait]
+    impl ArtifactSink for CountingSink<'_> {
+        async fn reset(&mut self) -> Result<(), DatabaseArtifactError> {
+            self.0.reset().await
+        }
+        async fn begin_part(
+            &mut self,
+            part: crate::database_artifacts::ArtifactPart,
+        ) -> Result<(), DatabaseArtifactError> {
+            self.0.begin_part(part).await
+        }
+        async fn write(&mut self, bytes: &[u8]) -> Result<(), DatabaseArtifactError> {
+            self.1.fetch_add(bytes.len() as u64, Ordering::SeqCst);
+            self.0.write(bytes).await
+        }
+        async fn finish_part(&mut self) -> Result<(), DatabaseArtifactError> {
+            self.0.finish_part().await
+        }
+    }
+
+    #[async_trait]
+    impl DatabaseArtifactRepository for ByteSpyRepository {
+        async fn load_meta(
+            &self,
+            service: &str,
+            space: &str,
+            name: &str,
+        ) -> Result<Option<ArtifactMeta>, DatabaseArtifactError> {
+            self.metas.fetch_add(1, Ordering::SeqCst);
+            self.inner.load_meta(service, space, name).await
+        }
+
+        async fn read_chunks(
+            &self,
+            service: &str,
+            space: &str,
+            name: &str,
+            meta: &ArtifactMeta,
+            sink: &mut dyn ArtifactSink,
+        ) -> Result<(), DatabaseArtifactError> {
+            self.chunk_reads.fetch_add(1, Ordering::SeqCst);
+            let mut counting = CountingSink(sink, Arc::clone(&self.payload_bytes));
+            self.inner
+                .read_chunks(service, space, name, meta, &mut counting)
+                .await
+        }
+
+        async fn save(
+            &self,
+            service: &str,
+            space: &str,
+            name: &str,
+            payload: Vec<u8>,
+            expected: ArtifactExpectation,
+        ) -> Result<DatabaseArtifact, DatabaseArtifactError> {
+            self.inner
+                .save(service, space, name, payload, expected)
+                .await
+        }
+
+        async fn save_delta(
+            &self,
+            service: &str,
+            space: &str,
+            name: &str,
+            payload: Vec<u8>,
+            expected: ArtifactExpectation,
+        ) -> Result<DeltaSave, DatabaseArtifactError> {
+            self.inner
+                .save_delta(service, space, name, payload, expected)
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn forbid_growth_checks_and_export_existence_read_no_payload_bytes() {
+        let spy = Arc::new(ByteSpyRepository {
+            inner: artifact_repository().await,
+            metas: AtomicU64::new(0),
+            chunk_reads: AtomicU64::new(0),
+            payload_bytes: Arc::new(AtomicU64::new(0)),
+        });
+        let cache = TempDir::new().unwrap();
+        let space = test_space_id("sql-zero-payload");
+        let service = SqlService::new(
+            cache.path().to_string_lossy().into_owned(),
+            u64::MAX,
+            spy.clone(),
+        );
+        let write = |sql: &str| SqlRequest::Execute {
+            schema: Some(vec![
+                "CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, body TEXT)".into(),
+            ]),
+            sql: sql.into(),
+            params: vec![],
+        };
+        service
+            .execute(
+                &space,
+                "main",
+                write("INSERT INTO notes VALUES (1, 'kept')"),
+                None,
+                "tinycloud.sql/write".into(),
+            )
+            .await
+            .unwrap();
+        let reset = || {
+            spy.metas.store(0, Ordering::SeqCst);
+            spy.chunk_reads.store(0, Ordering::SeqCst);
+            spy.payload_bytes.store(0, Ordering::SeqCst);
+        };
+
+        // Export of a live, present database: existence from metadata alone.
+        reset();
+        assert!(!service.export(&space, "main").await.unwrap().is_empty());
+        assert_eq!(spy.metas.load(Ordering::SeqCst), 1);
+        assert_eq!(spy.chunk_reads.load(Ordering::SeqCst), 0);
+        assert_eq!(spy.payload_bytes.load(Ordering::SeqCst), 0);
+
+        // Export of a missing database.
+        reset();
+        assert!(matches!(
+            service.export(&space, "absent").await,
+            Err(SqlError::DatabaseNotFound)
+        ));
+        assert_eq!(spy.payload_bytes.load(Ordering::SeqCst), 0);
+        assert_eq!(spy.chunk_reads.load(Ordering::SeqCst), 0);
+
+        // A write that would grow a full space: the durable size comes from
+        // metadata, not from reading the checkpoint back.
+        reset();
+        let rejected = service
+            .execute_without_growth(
+                &space,
+                "main",
+                SqlRequest::Execute {
+                    schema: None,
+                    sql: "INSERT INTO notes VALUES (2, ?)".into(),
+                    params: vec![SqlValue::Text("x".repeat(256 * 1024))],
+                },
+                None,
+                "tinycloud.sql/write".into(),
+            )
+            .await;
+        assert!(matches!(rejected, Err(SqlError::StorageWouldGrow)));
+        assert_eq!(spy.chunk_reads.load(Ordering::SeqCst), 0);
+        assert_eq!(spy.payload_bytes.load(Ordering::SeqCst), 0);
+
+        // A write that fits: it reaches the Forbid size comparison, which is
+        // answered from metadata. (Warm the actor first; hydration does read.)
+        service
+            .execute(
+                &space,
+                "main",
+                SqlRequest::Query {
+                    sql: "SELECT COUNT(*) FROM notes".into(),
+                    params: vec![],
+                    max_rows: None,
+                    max_bytes: None,
+                },
+                None,
+                "tinycloud.sql/read".into(),
+            )
+            .await
+            .unwrap();
+        reset();
+        service
+            .execute_without_growth(
+                &space,
+                "main",
+                SqlRequest::Execute {
+                    schema: None,
+                    sql: "UPDATE notes SET body = 'kept'".into(),
+                    params: vec![],
+                },
+                None,
+                "tinycloud.sql/write".into(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            spy.metas.load(Ordering::SeqCst) >= 1,
+            "the Forbid path consulted the durable size"
+        );
+        assert_eq!(spy.chunk_reads.load(Ordering::SeqCst), 0);
+        assert_eq!(spy.payload_bytes.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn hydration_rejects_a_corrupt_artifact_and_seeds_nothing() {
+        use sea_orm::ConnectionTrait;
+        let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
+            .await
+            .unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        let repo = Arc::new(SeaOrmDatabaseArtifactRepository::new(db.clone()));
+        let space = test_space_id("sql-corrupt-hydration");
+        let seed_cache = TempDir::new().unwrap();
+        let seed = SqlService::new(
+            seed_cache.path().to_string_lossy().into_owned(),
+            u64::MAX,
+            repo.clone(),
+        );
+        seed.execute(
+            &space,
+            "main",
+            SqlRequest::Execute {
+                schema: Some(vec!["CREATE TABLE t (id INTEGER)".into()]),
+                sql: "INSERT INTO t VALUES (1)".into(),
+                params: vec![],
+            },
+            None,
+            "tinycloud.sql/write".into(),
+        )
+        .await
+        .unwrap();
+        // Keep the SQLite header so only the content hash can catch it.
+        let stored = repo
+            .read_all("sql", &space.to_string(), "main")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut flipped = stored.payload.clone();
+        *flipped.last_mut().unwrap() ^= 0xff;
+        db.execute(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DbBackend::Sqlite,
+            "UPDATE database_artifact SET payload = ?",
+            [flipped.into()],
+        ))
+        .await
+        .unwrap();
+
+        let cold_cache = TempDir::new().unwrap();
+        let cold = SqlService::new(
+            cold_cache.path().to_string_lossy().into_owned(),
+            u64::MAX,
+            repo,
+        );
+        let result = cold
+            .execute(
+                &space,
+                "main",
+                SqlRequest::Query {
+                    sql: "SELECT COUNT(*) FROM t".into(),
+                    params: vec![],
+                    max_rows: None,
+                    max_bytes: None,
+                },
+                None,
+                "tinycloud.sql/read".into(),
+            )
+            .await;
+        assert!(result.is_err(), "a corrupt artifact must not hydrate");
+        let leftovers: Vec<_> = walkdir_files(cold_cache.path());
+        assert!(leftovers.is_empty(), "nothing seeded: {leftovers:?}");
+    }
+
+    fn walkdir_files(dir: &Path) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                found.extend(walkdir_files(&path));
+            } else {
+                found.push(path);
+            }
+        }
+        found
     }
 }
