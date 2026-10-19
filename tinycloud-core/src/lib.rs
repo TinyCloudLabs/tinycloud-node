@@ -24,6 +24,7 @@ pub mod policy_authority;
 pub mod policy_capability;
 mod read_audit;
 pub mod relationships;
+pub mod request_cancel;
 pub mod request_telemetry;
 pub mod share_email;
 pub mod sql;

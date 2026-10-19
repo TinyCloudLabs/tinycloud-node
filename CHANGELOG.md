@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+- SQL requests no longer wait without limit, and `/invoke` has a deadline (TC-1274). The cause of the original stall is still unknown; this change bounds the waits and reports them.
+  - **Bounded waits.** A SQL request waits at most `storage.sql.lock_wait_timeout_ms` (30 s) for its database's operation lock, `hydration_wait_timeout_ms` (30 s) for the database to be loaded into the node's cache, and `artifact_transfer_timeout_ms` (45 s) for a durable artifact load or save. It then answers `503 sql_busy: <lock_wait|hydration|artifact_transfer>: …` with `Retry-After: 5`. A save that times out after its write statement was sent is `500 outcome_unknown`: PostgreSQL may still commit that statement.
+  - **Hydration keeps going.** Concurrent requests share one hydration, and it continues after its callers give up (up to `hydration_max_ms`, 10 min), so the next request finds the database warm.
+  - **Request deadline.** `/invoke` has a deadline, `invocation.deadline_ms` (55 s, below the ingress's 60 s; `0` turns it off). A request that hasn't started a data write by then is stopped and answered `503 request_timeout: no change was applied; retry the request` with `Retry-After: 1`. A request that has started one (a KV write transaction, a SQL statement, a DuckDB statement or import, a meeting publication, a decrypt) completes and reports its real result, and the node logs `Request completed after its deadline`. The invocation's replay row is kept, so a retry must be a fresh invocation, which the SDK already sends for every call.
+  - **Write safety.** A SQL write and its durable save always finish together, even if the request is stopped while waiting.
+  - **Logging.** Typed warnings `SQL busy: lock wait|hydration|artifact transfer` (fields `error_class`, `stage`, `bound_ms`, `waited_ms`), `Database hydration gave up loading its artifact` and `Request deadline exceeded` (`stage`, `deadline_ms`) are new. The log shipper maps them to `sql_busy_*`, `sql_hydration_timeout`, `request_timeout` and `deadline_overrun`. The embedded Vector configuration is regenerated, so the reviewed N0 compose template changes to `00938226…` (raw `b25b8414…`; `docs/releasing.md`).
+  - **Not covered.** DuckDB's lock and hydration waits are still unbounded, and a DuckDB request is not cut by the deadline once it reaches the DuckDB service; this is unchanged from before (TC-1412). Disconnect detection is TC-1400, bounding SQLite statement execution is TC-1401, and bounding identity resolution's artifact read is TC-1403 (until then only the deadline bounds it).
+  - **Any write statement cut short counts as possibly applied.** A write statement (autocommit or `execute_idempotent`) whose future is dropped before its result arrives is now recorded as possibly applied, so the failure is reported as an unknown outcome instead of a safe retry.
+
 ## [1.21.0] - 2026-10-18
 
 ### Release notes

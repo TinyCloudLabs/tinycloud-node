@@ -674,7 +674,8 @@ pub async fn app_with_control(
         tinycloud_config.storage.sql.path.clone().expect("resolved"),
         tinycloud_config.storage.sql.memory_threshold.as_u64(),
         database_artifact_repository.clone(),
-    );
+    )
+    .with_wait_bounds(tinycloud_config.storage.sql.wait_bounds());
 
     let mut policy_v3_runtime =
         PolicyV3Runtime::new(seed_conn.clone(), key_setup.node_did(), key_setup.clone())
@@ -948,12 +949,13 @@ pub async fn app_with_control(
 /// preflight after the policy in [`cors_fairing`] is tightened.
 const CORS_PREFLIGHT_MAX_AGE_SECS: u32 = 7200;
 
-/// `Retry-After` on a database failure that is safe to retry (TC-1054).
+/// `Retry-After` on a failure that is safe to retry (TC-1054, TC-1274).
 ///
-/// Routes report database failures as plain-text `(Status, String)`; a
-/// retryable one is a `503` whose body starts with
-/// [`routes::UNAVAILABLE_RETRYABLE`]. Other `503`s (cutover fence, missing
-/// configuration) and the `500` [`routes::OUTCOME_UNKNOWN`] get no header.
+/// Routes report these as plain-text `(Status, String)` `503`s whose body
+/// starts with [`routes::UNAVAILABLE_RETRYABLE`] or
+/// [`routes::REQUEST_TIMEOUT`] (`Retry-After: 1`), or [`routes::SQL_BUSY`]
+/// (`Retry-After: 5`). Other `503`s (cutover fence, missing configuration)
+/// and the `500` [`routes::OUTCOME_UNKNOWN`] get no header.
 fn retry_after_fairing() -> AdHoc {
     AdHoc::on_response("Retry-After", |_, resp| {
         Box::pin(async move {
@@ -963,11 +965,17 @@ fn retry_after_fairing() -> AdHoc {
             let Ok(body) = resp.body_mut().to_string().await else {
                 return;
             };
-            if body.starts_with(routes::UNAVAILABLE_RETRYABLE) {
-                resp.set_header(Header::new(
-                    "Retry-After",
-                    routes::RETRY_AFTER_SECS.to_string(),
-                ));
+            let retry_after = if body.starts_with(routes::SQL_BUSY) {
+                Some(routes::SQL_BUSY_RETRY_AFTER_SECS)
+            } else if body.starts_with(routes::UNAVAILABLE_RETRYABLE)
+                || body.starts_with(routes::REQUEST_TIMEOUT)
+            {
+                Some(routes::RETRY_AFTER_SECS)
+            } else {
+                None
+            };
+            if let Some(secs) = retry_after {
+                resp.set_header(Header::new("Retry-After", secs.to_string()));
             }
             resp.set_sized_body(body.len(), std::io::Cursor::new(body));
         })
@@ -1699,6 +1707,21 @@ mod retry_after_fairing_tests {
         )
     }
 
+    #[get("/busy")]
+    fn busy() -> (Status, String) {
+        let error =
+            tinycloud_core::sql::SqlError::Busy(tinycloud_core::sql::SqlBusyStage::LockWait);
+        (Status::ServiceUnavailable, error.to_string())
+    }
+
+    #[get("/timeout")]
+    fn timeout() -> (Status, String) {
+        (
+            Status::ServiceUnavailable,
+            routes::REQUEST_TIMEOUT_BODY.to_string(),
+        )
+    }
+
     /// TC-1054: clients tell a retryable database failure (503,
     /// `unavailable_retryable`, `Retry-After`) from one whose write may have
     /// applied (500, `outcome_unknown`, no `Retry-After`); CORS still applies.
@@ -1706,7 +1729,7 @@ mod retry_after_fairing_tests {
     async fn only_retryable_database_failures_carry_retry_after() {
         let client = Client::tracked(
             rocket::build()
-                .mount("/", routes![retryable, unknown, fenced])
+                .mount("/", routes![retryable, unknown, fenced, busy, timeout])
                 .attach(retry_after_fairing())
                 .attach(cors_fairing()),
         )
@@ -1723,6 +1746,23 @@ mod retry_after_fairing_tests {
         let body = response.into_string().await.unwrap();
         assert_eq!(body, "unavailable_retryable: pool exhausted", "body kept");
 
+        // TC-1274: a busy database asks for a longer pause than a request
+        // that timed out before writing.
+        for (path, retry_after) in [("/busy", "5"), ("/timeout", "1")] {
+            let response = client.get(path).dispatch().await;
+            assert_eq!(response.status(), Status::ServiceUnavailable, "{path}");
+            assert_eq!(
+                response.headers().get_one("Retry-After"),
+                Some(retry_after),
+                "{path}"
+            );
+            assert_eq!(
+                response.headers().get_one("Access-Control-Allow-Origin"),
+                Some("*"),
+                "{path}"
+            );
+        }
+
         for path in ["/unknown", "/fenced"] {
             let response = client.get(path).dispatch().await;
             assert!(
@@ -1736,5 +1776,134 @@ mod retry_after_fairing_tests {
             );
             assert!(!response.into_string().await.unwrap().is_empty(), "{path}");
         }
+    }
+
+    /// An artifact store that never answers, so a cold SQL database never
+    /// finishes hydrating.
+    struct StalledArtifacts;
+
+    #[async_trait::async_trait]
+    impl tinycloud_core::database_artifacts::DatabaseArtifactRepository for StalledArtifacts {
+        async fn load(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<
+            Option<tinycloud_core::database_artifacts::DatabaseArtifact>,
+            tinycloud_core::database_artifacts::DatabaseArtifactError,
+        > {
+            std::future::pending().await
+        }
+
+        async fn save(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: Vec<u8>,
+            _: tinycloud_core::database_artifacts::ArtifactExpectation,
+        ) -> Result<
+            tinycloud_core::database_artifacts::DatabaseArtifact,
+            tinycloud_core::database_artifacts::DatabaseArtifactError,
+        > {
+            std::future::pending().await
+        }
+
+        async fn save_delta(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: Vec<u8>,
+            _: tinycloud_core::database_artifacts::ArtifactExpectation,
+        ) -> Result<
+            tinycloud_core::database_artifacts::DeltaSave,
+            tinycloud_core::database_artifacts::DatabaseArtifactError,
+        > {
+            std::future::pending().await
+        }
+    }
+
+    /// A SQL read through the `/invoke` deadline wrapper and the real SQL
+    /// service, as the route runs it.
+    #[rocket::post("/stalled-sql")]
+    async fn stalled_sql(
+        config: &rocket::State<crate::config::Config>,
+        sql: &rocket::State<tinycloud_core::sql::SqlService>,
+        space: &rocket::State<tinycloud_auth::resource::SpaceId>,
+    ) -> Result<String, routes::InvokeError> {
+        routes::with_invoke_deadline(
+            config,
+            Box::pin(async move {
+                sql.execute(
+                    space,
+                    "a",
+                    tinycloud_core::sql::SqlRequest::Query {
+                        sql: "SELECT 1".into(),
+                        params: Vec::new(),
+                        max_rows: None,
+                        max_bytes: None,
+                    },
+                    None,
+                    "tinycloud.sql/read".into(),
+                )
+                .await
+                .map(|_| "served".to_string())
+                .map_err(|error| (routes::sql_error_to_status(&error), error.to_string()).into())
+            }),
+        )
+        .await
+    }
+
+    /// TC-1274: over HTTP, a SQL request stalled in hydration is answered at
+    /// the deadline with `503 request_timeout`, `Retry-After: 1` and CORS.
+    #[tokio::test]
+    async fn a_stalled_sql_request_is_answered_at_its_deadline() {
+        use tinycloud_auth::{
+            resolver::DID_METHODS,
+            ssi::{dids::DIDBuf, jwk::JWK},
+        };
+        let jwk = JWK::generate_ed25519().unwrap();
+        let did: DIDBuf = DID_METHODS.generate(&jwk, "key").unwrap();
+        let space = tinycloud_auth::resource::SpaceId::new(did, "default".parse().unwrap());
+        let cache = tempfile::TempDir::new().unwrap();
+        let sql = tinycloud_core::sql::SqlService::new(
+            cache.path().to_string_lossy().into_owned(),
+            u64::MAX,
+            std::sync::Arc::new(StalledArtifacts),
+        );
+        let mut config = crate::config::Config::default();
+        config.invocation.deadline_ms = 300;
+        let client = Client::tracked(
+            rocket::build()
+                .mount("/", rocket::routes![stalled_sql])
+                .manage(config)
+                .manage(sql)
+                .manage(space)
+                .attach(retry_after_fairing())
+                .attach(cors_fairing()),
+        )
+        .await
+        .expect("valid Rocket instance");
+
+        let started = std::time::Instant::now();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.post("/stalled-sql").dispatch(),
+        )
+        .await
+        .expect("the deadline must answer the request");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(response.status(), Status::ServiceUnavailable);
+        assert_eq!(response.headers().get_one("Retry-After"), Some("1"));
+        assert_eq!(
+            response.headers().get_one("Access-Control-Allow-Origin"),
+            Some("*")
+        );
+        assert_eq!(
+            response.into_string().await.unwrap(),
+            routes::REQUEST_TIMEOUT_BODY
+        );
     }
 }
