@@ -9668,6 +9668,7 @@ dependencies = [
  "tinycloud-auth",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "ucan-capabilities-object",
  "unicode-normalization",
  "uuid",
@@ -9677,7 +9678,7 @@ dependencies = [
 
 [[package]]
 name = "tinycloud-node"
-version = "1.21.0"
+version = "1.21.2"
 dependencies = [
  "aes-gcm",
  "anyhow",

@@ -414,4 +414,74 @@ mod tests {
         assert!(response.headers().get_one("Transfer-Encoding").is_none());
         Ok(())
     }
+
+    const PUBLIC_ETAG: &str = "\"blake3-public\"";
+
+    #[get("/etag-full")]
+    fn public_etag_full() -> PublicKVResponse<Cursor<Vec<u8>>> {
+        PublicKVResponse(
+            Content::new(2, Cursor::new(b"ok".to_vec())),
+            Metadata(Default::default()),
+            PUBLIC_ETAG.to_string(),
+        )
+    }
+
+    #[get("/etag-304")]
+    fn public_etag_not_modified() -> NotModifiedResponse {
+        NotModifiedResponse(PUBLIC_ETAG.to_string())
+    }
+
+    #[get("/etag-metadata")]
+    fn public_etag_metadata() -> PublicMetadataResponse {
+        PublicMetadataResponse(Metadata(Default::default()), PUBLIC_ETAG.to_string())
+    }
+
+    #[get("/list")]
+    fn public_list() -> PublicListResponse {
+        PublicListResponse(Json(Vec::new()))
+    }
+
+    /// TC-1432: public KV reads (200, 304, metadata) keep `public, max-age=60`
+    /// and gain `no-transform`; the list has no ETag and is unchanged.
+    #[tokio::test]
+    async fn public_etag_responses_add_no_transform_and_keep_cache_policy() -> anyhow::Result<()> {
+        let client = Client::tracked(crate::attach_response_fairings(
+            rocket::build().mount(
+                "/",
+                rocket::routes![
+                    public_etag_full,
+                    public_etag_not_modified,
+                    public_etag_metadata,
+                    public_list
+                ],
+            ),
+            "https://share.tinycloud.xyz".into(),
+        ))
+        .await?;
+        for (path, status) in [
+            ("/etag-full", Status::Ok),
+            ("/etag-304", Status::NotModified),
+            ("/etag-metadata", Status::Ok),
+        ] {
+            let response = client.get(path).dispatch().await;
+            assert_eq!(response.status(), status, "{path}");
+            assert_eq!(
+                response.headers().get_one("ETag"),
+                Some(PUBLIC_ETAG),
+                "{path}"
+            );
+            assert_eq!(
+                response.headers().get_one("Cache-Control"),
+                Some("public, max-age=60, no-transform"),
+                "{path}"
+            );
+        }
+        let list = client.get("/list").dispatch().await;
+        assert!(list.headers().get_one("ETag").is_none());
+        assert_eq!(
+            list.headers().get_one("Cache-Control"),
+            Some("public, max-age=60")
+        );
+        Ok(())
+    }
 }

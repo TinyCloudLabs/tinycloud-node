@@ -431,4 +431,50 @@ mod tests {
             assert!(message.contains("quote"), "{message}");
         }
     }
+
+    /// The 0.5.7 guest agent's 200 body for 64 zero bytes, as captured on a
+    /// dstack-dev-0.5.7 CVM (TC-963): keys quote, event_log, report_data and
+    /// vm_config, all strings. `event_log` and `vm_config` are JSON documents
+    /// encoded as strings, and `quote` is hex without a `0x` prefix. Values
+    /// are synthetic; only the shape is real.
+    #[tokio::test]
+    async fn get_quote_accepts_the_captured_guest_agent_response_shape() {
+        let events: Vec<_> = (0..30)
+            .map(|i| {
+                serde_json::json!({
+                    "imr": i % 4,
+                    "event_type": 134_217_729u32,
+                    "digest": "ab".repeat(48),
+                    "event": format!("event-{i}"),
+                    "event_payload": "00ff",
+                })
+            })
+            .collect();
+        let event_log = serde_json::to_string(&events).unwrap();
+        let body = serde_json::json!({
+            "quote": hex::encode(stub::tdx_quote(&[0; 64])),
+            "event_log": event_log,
+            "report_data": "00".repeat(64),
+            "vm_config": r#"{"os_image_hash":"00","cpu_count":2}"#,
+        });
+        let agent = stub::serve_once("200 OK", &body.to_string());
+        let quote = get_quote(&agent.socket, &[0; 64]).await.unwrap();
+        assert_eq!(quote.event_log, event_log);
+        agent.request.await.unwrap();
+    }
+
+    /// dstack's `ra-rpc` encodes a handler error as pretty-printed JSON with
+    /// HTTP 400; this is what an over-long report_data drew from the agent.
+    #[tokio::test]
+    async fn get_quote_reports_the_pretty_printed_report_data_too_long_error() {
+        let agent = stub::serve_once(
+            "400 Bad Request",
+            "{\n  \"error\": \"Report data is too long\"\n}",
+        );
+        let err = get_quote(&agent.socket, &[0x42; 32]).await.unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("HTTP 400"), "{message}");
+        assert!(!message.contains("parsing"), "{message}");
+        agent.request.await.unwrap();
+    }
 }
