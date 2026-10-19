@@ -258,6 +258,10 @@ pub enum TxError<S: StorageSetup, K: Secrets> {
     Encryption(#[from] crate::encryption::EncryptionError),
     #[error("delegation-chain-traversal-limit-exceeded")]
     ChainTraversalLimitExceeded,
+    /// The read's audit record was not confirmed; its data was not returned
+    /// (TC-1317).
+    #[error(transparent)]
+    ReadAudit(#[from] crate::read_audit::ReadAuditError),
 }
 
 #[non_exhaustive]
@@ -456,9 +460,20 @@ impl<C, B, K> SpaceDatabase<C, B, K>
 where
     K: Secrets,
 {
-    /// Number of durable read-audit records and group commits completed.
-    pub fn read_audit_commit_stats(&self) -> (u64, u64) {
-        self.read_audit.stats()
+    /// Counts and ages of the read-audit pipeline, for metrics and logs.
+    pub fn read_audit_health(&self) -> crate::read_audit::ReadAuditHealth {
+        self.read_audit.health()
+    }
+
+    /// Bound how long a read waits for its audit record (TC-1317). Takes
+    /// effect for waits that start afterwards.
+    pub fn set_read_audit_wait(&self, wait: std::time::Duration) {
+        self.read_audit.set_wait(wait);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_audit_pipeline(&self) -> &crate::read_audit::ReadAuditPipeline {
+        &self.read_audit
     }
 
     pub async fn stage_key(&self, space_id: &SpaceId) -> Result<String, K::Error> {
@@ -2216,6 +2231,12 @@ where
             Some(lock) => Some(lock.lock().await),
             None => None,
         };
+        // TC-1274: the write transaction begins here, so the request deadline
+        // may no longer cut this request; it completes and reports its outcome.
+        // The handler task is never polled after a cut, so this is not
+        // refused here.
+        let latched = crate::request_cancel::latch();
+        debug_assert!(latched, "a cut handler is not polled again");
         let begin_start = Instant::now();
         let tx_result = self.begin_graph_transaction().await;
         crate::telemetry::observe_stage(
@@ -2695,7 +2716,7 @@ where
             crate::telemetry::StageOutcome::from(record_result.is_ok()),
             read_audit_start.elapsed(),
         );
-        record_result?;
+        record_result.map_err(TxError::<B, K>::from)?;
         Ok((
             TransactResult {
                 commits: HashMap::new(),
