@@ -961,7 +961,7 @@ const WRITE_KEYWORDS: [&str; 5] = ["INSERT", "UPDATE", "DELETE", "MERGE", "INTO"
 /// of anything else (`nextval`, `setval`, `pg_advisory_lock`,
 /// `pg_terminate_backend`, `set_config`, `lo_*`, a user-defined function)
 /// may have side effects, so it makes the statement non-retryable.
-const CALL_ALLOWLIST: [&str; 36] = [
+const CALL_ALLOWLIST: [&str; 37] = [
     // keywords
     "SELECT",
     "FROM",
@@ -1000,6 +1000,7 @@ const CALL_ALLOWLIST: [&str; 36] = [
     "COALESCE",
     "LOWER",
     "UPPER",
+    "SUBSTR",
 ];
 
 #[derive(Debug, PartialEq, Eq)]

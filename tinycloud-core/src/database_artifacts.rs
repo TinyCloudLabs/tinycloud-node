@@ -1474,6 +1474,11 @@ mod tests {
                 assert_eq!(sink.wal, wal, "{name}: wal");
                 assert_eq!(meta.has_delta(), wal.is_some(), "{name}");
 
+                // Every statement is a retryable read: a lost connection costs
+                // one slice's retry, not the hydration.
+                for sql in statements.lock().unwrap().iter() {
+                    assert!(crate::db_pool::is_read_only_statement(sql), "{sql}");
+                }
                 // One metadata statement, then one per slice of each part.
                 let expected = 1 + ceil_div(len) + delta.map_or(0, ceil_div);
                 assert_eq!(
