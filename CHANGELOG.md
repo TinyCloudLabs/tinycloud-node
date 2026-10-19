@@ -9,6 +9,24 @@
   - **`current_kv` C-index warning codes.** The log sidecar maps the three constant warnings of the TC-1274 `current_kv` C-index migration to `current_kv_c_index_missing`, `current_kv_c_index_invalid` and `current_kv_c_index_wrong_shape` (TC-1274); until then they would ship as `unclassified`. This is part of the same regenerated Vector configuration.
   - **Ingress.** The `/admin/stats` label takes effect once the ingress image is rebuilt from `deploy/ingress` and its digest is pinned in the compose; until then the deployed ingress logs it as `<other>`.
 
+## [1.21.2] - 2026-10-19
+
+### Release notes
+
+- Revocation authorization tightened (TC-1436, #353); revoke controls carry a typed scope (TC-1423, #356); owner exact-CID revoke grants and canonical CID targets (TC-821, #357).
+- Node CLI dispatch re-wired; unknown arguments now exit 2 (TC-1442, #355).
+- `serve` resolves provider and Auto node identities again; Auto and provider refuse to create an identity where a TEE is indicated (TC-1442, #359).
+- Docs: CLAUDE.md logging carve-out for the node's own DID (TC-961, #365).
+- No database migrations.
+- Rollback is the 1.21.1 image.
+
+### Changes
+
+- `POST /revoke` authorizes the delegation's issuer, the owner of a space its abilities target, or the holder of a revoke control grant issued by one of them. The delegatee alone is no longer an authorized revoker, directly or through a control grant it issued; an intermediate delegator still revokes the delegations it issued. Delegation status visibility is unchanged (TC-1436).
+- Revoke and status control grants may name an encryption network (`urn:tinycloud:encryption:<owner>:<name>`) owned by the control's grantor. Only the network's owner can issue such a control without a parent, because the owner is already the network's root authority (`/delegate` accepted this before); naming the network in a control grants no decrypt or other network ability, so this is not an escalation. Each resource of a control is typed as an exact `urn:cid:<target>`, a `<space>/delegation` root, or a network; any other resource is ignored. A control covers a target only when every one of the target's resources is covered: a space resource by a named space, a network resource by the same parsed network id (owner DID including chain id, and name), so lowercase and EIP-55 checksummed spellings of an address name the same network, and a resource that does not parse as a network is never covered. A control that names a network never counts as an exact-CID control, and a network named by a control issued by someone other than its owner is ignored. A control such as `<applications>/delegation` + `<default>/delegation` + `<owner>:share` therefore revokes or reads the status of share roots that carry `:share` decrypt, but not grants on `:default` or any other network (TC-1423).
+- An owner can activate a parentless `tinycloud.delegation/revoke` grant on exactly `urn:cid:<target>` (for example the CLI's raw-CID revoke permission) when the stored target's abilities name a space the owner owns. Every non-root capability of such a grant must be one of these. Unknown targets, targets without abilities, and signers who are only the target's delegator or delegatee are refused with `Cannot find parent delegation` (TC-821).
+- Revocation and delegation status accept a canonical CID that names a stored historical encoding. An exact-CID revoke or status grant covers every stored encoding of its target. The signed CID is kept as signed, and authorization uses the stored row (TC-821).
+
 ## [1.21.1] - 2026-10-19
 
 ### Release notes

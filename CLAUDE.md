@@ -316,8 +316,13 @@ docker run -d \
 Log verbosity comes from `TINYCLOUD_LOG_LEVEL` (`normal` = info), or from
 `RUST_LOG` (a `tracing` `EnvFilter`) when that is set. Production logs are
 public: never log request URIs, credentials, space IDs, DIDs or keys
-(TC-961). Rocket's own per-request logging is filtered out at every level,
-and `tinycloud::request` logs each request by route template.
+(TC-961). One exception: the node's own DID is public (it is served
+unauthenticated at `/.well-known/tinycloud/node-keys`), and the node logs it
+once, with the identity's storage location, when it first creates a new
+identity (`created a new node identity at <location> (did:key:z6Mk…)`). No
+other DID, and never any key material, may be logged. Rocket's own
+per-request logging is filtered out at every level, and `tinycloud::request`
+logs each request by route template.
 Set it for verbose output:
 ```bash
 RUST_LOG=debug cargo run

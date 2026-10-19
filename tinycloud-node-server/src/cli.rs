@@ -19,7 +19,7 @@ use crate::{
 #[command(name = "tinycloud", version, disable_help_subcommand = true)]
 pub struct Cli {
     #[command(subcommand)]
-    command: Option<Commands>,
+    command: Commands,
 }
 
 #[derive(Debug, Subcommand)]
@@ -184,9 +184,8 @@ struct BackupArgs {
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        None => block_on(run_legacy_server()),
-        Some(Commands::Serve(args)) => block_on(run_serve(args)),
-        Some(Commands::Node(args)) => run_node(args),
+        Commands::Serve(args) => block_on(run_serve(args)),
+        Commands::Node(args) => run_node(args),
     }
 }
 
@@ -196,11 +195,6 @@ fn block_on<T>(future: impl Future<Output = Result<T>>) -> Result<T> {
         .build()
         .expect("tokio runtime should build")
         .block_on(future)
-}
-
-async fn run_legacy_server() -> Result<()> {
-    let config_path = std::env::current_dir()?.join("tinycloud.toml");
-    runtime::launch_with_figment(runtime::legacy_config_figment(), config_path).await
 }
 
 async fn run_serve(args: ServeArgs) -> Result<()> {

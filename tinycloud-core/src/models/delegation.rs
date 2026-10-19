@@ -256,8 +256,18 @@ async fn validate<C: ConnectionTrait>(
         // ordered sibling pair.  Keeping the graph row here is what lets the
         // ordinary transaction validate an S0's proof CIDs.
         (false, true) if is_policy_root(&delegation.delegation) => Ok(()),
-        // dependant caps, no parents, invalid
-        (false, true) => Err(DelegationError::MissingParents.into()),
+        // An owner may grant revocation of one exact stored delegation that
+        // targets their space, without holding the target's signed bytes:
+        // every non-root capability must be such an exact-CID revoke grant.
+        // The target's delegatee or delegator alone cannot issue one.
+        (false, true) => {
+            for cap in &dependant_caps {
+                if !revocation::owner_controls_target(db, &delegation.delegator, cap).await? {
+                    return Err(DelegationError::MissingParents.into());
+                }
+            }
+            Ok(())
+        }
         // dependant caps, parents, check parents
         (false, false) => {
             // Policy-session UCANs intentionally carry two sibling roots.  The
