@@ -98,8 +98,12 @@ struct Harness {
     root: Vec<u8>,
     /// Every space any check signed in to on this harness, one per line.
     spaces_log: std::path::PathBuf,
+    /// Every KV put any check made: `space<TAB>content multihash hex`.
+    puts_log: std::path::PathBuf,
     /// The bucket as the node left it at boot, before any test write.
     boot_snapshot: std::path::PathBuf,
+    /// The at-rest mode and escrow choice `up` started the node with.
+    policy: key_mirror::Policy,
 }
 
 impl Harness {
@@ -113,6 +117,13 @@ impl Harness {
             &std::fs::read(&path).with_context(|| format!("read harness state {path}"))?,
         )?;
         ensure!(state["status"] == "up", "harness at {path} is not up");
+        let policy = key_mirror::Policy {
+            encrypt: matches!(
+                state["at_rest"]["mode"].as_str(),
+                Some("encrypt" | "strict")
+            ),
+            escrow_none: state["at_rest"]["escrow_none"] == true,
+        };
         let env_file = state["env_file"]
             .as_str()
             .context("state file has no env_file")?;
@@ -169,7 +180,9 @@ impl Harness {
             pg,
             root,
             spaces_log: var("TC887_SPACES_LOG")?.into(),
+            puts_log: var("TC887_PUTS_LOG")?.into(),
             boot_snapshot: var("TC887_BOOT_SNAPSHOT")?.into(),
+            policy,
         })
     }
 
@@ -259,6 +272,22 @@ impl Harness {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect())
+    }
+
+    /// Every KV put made on this harness, from any check.
+    fn known_puts(&self) -> Result<Vec<key_mirror::Put>> {
+        let log = std::fs::read_to_string(&self.puts_log).unwrap_or_default();
+        log.lines()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|line| {
+                let (space, hash) = line.split_once('\t').context("malformed puts log")?;
+                Ok(key_mirror::Put {
+                    space: space.to_owned(),
+                    multihash: hex::decode(hash).context("malformed puts log")?,
+                })
+            })
+            .collect()
     }
 
     async fn delegate(&self, authorization: String) -> Result<()> {
@@ -732,6 +761,7 @@ mod key_mirror {
     pub const W_LABEL: &str = "tinycloud/at-rest/wrap/v1";
     const KEK_INFO: &[u8] = b"tinycloud/at-rest/kek/v1";
     const DEK_TAG_INFO: &[u8] = b"tinycloud/at-rest/dek-mirror-tag/v1";
+    const NK_INFO: &[u8] = b"tinycloud/at-rest/object-names/v1";
     const CHAIN_INFO: &[u8] = b"tinycloud/at-rest/ark-chain/v1";
     const SEAL_DOMAIN: &[u8] = b"tinycloud/at-rest/ark-seal/v1";
     const CHAIN_DOMAIN: &[u8] = b"tinycloud/at-rest/ark-chain-aad/v1";
@@ -1556,21 +1586,32 @@ mod key_mirror {
 
     // ---- raw-key scan (ruling 3 backstop) ---------------------------------
 
-    const KEY_PREFIXES: [&str; 9] = [
-        "0x",
-        "\\x",
-        "hex:",
-        "base64:",
-        "base64url:",
-        "b64:",
-        "b64url:",
-        "key:",
-        "raw:",
-    ];
+    const KEY_PREFIXES: [&str; 2] = ["0x", "\\x"];
 
-    /// Every byte string `s` decodes to as hex, base64 or base64url (padded
-    /// or not), after removing whitespace and optionally a common prefix
-    /// (`0x`, `base64:`, a `data:…;base64,` URL head, …).
+    /// RFC 4648 base32 (either case, padding optional).
+    pub fn base32_decode(s: &str) -> Option<Vec<u8>> {
+        let (mut bits, mut acc, mut out) = (0u32, 0u64, Vec::new());
+        for c in s.trim_end_matches('=').bytes() {
+            let value = match c.to_ascii_uppercase() {
+                upper @ b'A'..=b'Z' => upper - b'A',
+                digit @ b'2'..=b'7' => digit - b'2' + 26,
+                _ => return None,
+            };
+            acc = (acc << 5) | u64::from(value);
+            bits += 5;
+            if bits >= 8 {
+                bits -= 8;
+                out.push((acc >> bits) as u8);
+                acc &= (1 << bits) - 1;
+            }
+        }
+        Some(out)
+    }
+
+    /// Every byte string `s` decodes to as hex, base64, base64url (padded or
+    /// not) or base32, after removing whitespace and optionally a prefix:
+    /// `0x`, `\x`, any short `label:` (`base64:`, `k:`, …) or a
+    /// `data:…;base64,` URL head.
     pub fn decodings(s: &str) -> Vec<Vec<u8>> {
         let compact: String = s.chars().filter(|c| !c.is_whitespace()).collect();
         let lower = compact.to_ascii_lowercase();
@@ -1578,6 +1619,15 @@ mod key_mirror {
         for prefix in KEY_PREFIXES {
             if lower.starts_with(prefix) {
                 candidates.push(&compact[prefix.len()..]);
+            }
+        }
+        if let Some((label, rest)) = compact.split_once(':') {
+            if (1..=16).contains(&label.len())
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            {
+                candidates.push(rest);
             }
         }
         if let Some(at) = lower.find(";base64,") {
@@ -1598,6 +1648,7 @@ mod key_mirror {
                     out.push(bytes);
                 }
             }
+            out.extend(base32_decode(candidate));
         }
         out
     }
@@ -1615,37 +1666,45 @@ mod key_mirror {
         items.iter().all(|v| v.as_u64().is_some_and(|n| n <= 255))
     }
 
-    fn scan_string(
-        s: &str,
-        at: String,
-        is_key: bool,
-        exempt: &[&str],
-        halves: &mut Vec<String>,
-        found: &mut Vec<String>,
-    ) {
-        if !is_key && exempt.contains(&at.as_str()) {
+    /// Which fields the raw-key scan leaves alone.
+    #[derive(Clone, Copy)]
+    struct Exempt<'a> {
+        /// Exact encodings the schema checked: no 32-byte or 16-byte check.
+        encoded: &'a [&'a str],
+        /// Checked exactly by the schema, but short enough to be 16 bytes by
+        /// chance (escrow holder names): no 16+16 split check.
+        halves: &'a [&'a str],
+    }
+
+    struct Scan {
+        halves: Vec<String>,
+        found: Vec<String>,
+    }
+
+    fn scan_string(s: &str, at: String, is_key: bool, exempt: Exempt, scan: &mut Scan) {
+        if !is_key && exempt.encoded.contains(&at.as_str()) {
             return;
         }
         let lens: BTreeSet<usize> = decodings(s).iter().map(Vec::len).collect();
+        let longest = lens.last().copied().unwrap_or(0);
         let place = if is_key {
             format!("a JSON key in `{at}`")
         } else {
             format!("`{at}`")
         };
         if lens.contains(&32) {
-            found.push(format!("{place} decodes to 32 bytes (a raw key's size)"));
-        } else if lens.contains(&16) {
-            halves.push(place);
+            scan.found
+                .push(format!("{place} decodes to 32 bytes (a raw key's size)"));
+        } else if longest > 32 {
+            scan.found.push(format!(
+                "{place} decodes to {longest} bytes (more than a raw key)"
+            ));
+        } else if lens.contains(&16) && (is_key || !exempt.halves.contains(&at.as_str())) {
+            scan.halves.push(place);
         }
     }
 
-    fn walk(
-        value: &Value,
-        path: &str,
-        exempt: &[&str],
-        halves: &mut Vec<String>,
-        found: &mut Vec<String>,
-    ) {
+    fn walk(value: &Value, path: &str, exempt: Exempt, scan: &mut Scan) {
         match value {
             Value::Object(map) => {
                 let here = if path.is_empty() {
@@ -1654,46 +1713,337 @@ mod key_mirror {
                     path.to_owned()
                 };
                 for (i, (key, child)) in map.iter().enumerate() {
-                    scan_string(key, here.clone(), true, exempt, halves, found);
+                    scan_string(key, here.clone(), true, exempt, scan);
                     let name = component(key, i);
                     let at = if path.is_empty() {
                         name
                     } else {
                         format!("{path}.{name}")
                     };
-                    walk(child, &at, exempt, halves, found);
+                    walk(child, &at, exempt, scan);
                 }
             }
             Value::Array(items) if items.len() == 32 && byte_array(items) => {
-                found.push(format!(
+                scan.found.push(format!(
                     "`{path}` is an array of 32 byte values (a raw key)"
                 ));
             }
             Value::Array(items) if items.len() == 16 && byte_array(items) => {
-                halves.push(format!("`{path}` (16 byte values)"));
+                scan.halves.push(format!("`{path}` (16 byte values)"));
             }
             Value::Array(items) => {
                 for item in items {
-                    walk(item, &format!("{path}[]"), exempt, halves, found);
+                    walk(item, &format!("{path}[]"), exempt, scan);
                 }
             }
-            Value::String(s) => scan_string(s, path.to_owned(), false, exempt, halves, found),
+            Value::String(s) => scan_string(s, path.to_owned(), false, exempt, scan),
             _ => {}
         }
     }
 
-    /// Every JSON key and every string outside `exempt` (fields whose exact
-    /// encoding the schema checked) must not decode to 32 bytes; no array may
-    /// be 32 byte values; no two fields may hold 16 bytes each (a split key).
-    pub fn raw_key_findings(what: &str, doc: &Value, exempt: &[&str]) -> Vec<String> {
-        let (mut halves, mut found) = (Vec::new(), Vec::new());
-        walk(doc, "", exempt, &mut halves, &mut found);
-        let mut findings: Vec<String> = found.into_iter().map(|f| format!("{what}: {f}")).collect();
-        if halves.len() >= 2 {
+    /// Every JSON key and every string outside the exact-encoding fields
+    /// must not decode to 32 bytes or more; no array may be 32 byte values;
+    /// no two fields (outside `halves`) may hold 16 bytes each (a split key).
+    pub fn raw_key_findings(
+        what: &str,
+        doc: &Value,
+        encoded: &[&str],
+        halves: &[&str],
+    ) -> Vec<String> {
+        let mut scan = Scan {
+            halves: Vec::new(),
+            found: Vec::new(),
+        };
+        walk(doc, "", Exempt { encoded, halves }, &mut scan);
+        let mut findings: Vec<String> = scan
+            .found
+            .into_iter()
+            .map(|f| format!("{what}: {f}"))
+            .collect();
+        if scan.halves.len() >= 2 {
             findings.push(format!(
                 "{what}: {} hold 16 bytes each (a 32-byte key split across fields)",
-                halves.join(", ")
+                scan.halves.join(", ")
             ));
+        }
+        findings
+    }
+
+    // ---- derived secrets in mirror contents (round 5, ruling 1) ------------
+
+    /// A secret the harness re-derived (or unwrapped) from its Static root.
+    pub struct Secret {
+        pub label: String,
+        pub bytes: Vec<u8>,
+    }
+
+    /// Every string of a mirror document (values and JSON keys) with its
+    /// path, plus the escrow holder names joined in every order (pairs and
+    /// all three), with and without their `-`/`_` separators (a key split
+    /// across holders).
+    fn strings(doc: &Value) -> Vec<(String, String)> {
+        fn collect(value: &Value, path: &str, out: &mut Vec<(String, String)>) {
+            match value {
+                Value::Object(map) => {
+                    for (i, (key, child)) in map.iter().enumerate() {
+                        let name = component(key, i);
+                        let at = if path.is_empty() {
+                            name
+                        } else {
+                            format!("{path}.{name}")
+                        };
+                        out.push((format!("a JSON key in `{at}`"), key.clone()));
+                        collect(child, &at, out);
+                    }
+                }
+                Value::Array(items) => {
+                    for item in items {
+                        collect(item, &format!("{path}[]"), out);
+                    }
+                }
+                Value::String(s) => out.push((format!("`{path}`"), s.clone())),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        collect(doc, "", &mut out);
+        let holders: Vec<&str> = doc["shares"]
+            .as_array()
+            .map(|shares| shares.iter().filter_map(|s| s["holder"].as_str()).collect())
+            .unwrap_or_default();
+        let n = holders.len().min(3);
+        let mut orders: Vec<Vec<usize>> = Vec::new();
+        for i in 0..n {
+            for j in (0..n).filter(|j| *j != i) {
+                orders.push(vec![i, j]);
+                for k in (0..n).filter(|k| *k != i && *k != j) {
+                    orders.push(vec![i, j, k]);
+                }
+            }
+        }
+        for order in orders {
+            let joined: String = order.iter().map(|&i| holders[i]).collect();
+            let label = format!(
+                "holders {} joined",
+                order
+                    .iter()
+                    .map(|i| (i + 1).to_string())
+                    .collect::<Vec<_>>()
+                    .join("+")
+            );
+            let bare: String = joined.chars().filter(|c| *c != '-' && *c != '_').collect();
+            if bare != joined {
+                out.push((format!("{label} without separators"), bare));
+            }
+            out.push((label, joined));
+        }
+        out
+    }
+
+    /// The bytes an armored age file carries (its base64 body), if `s` is one.
+    fn armor_payload(s: &str) -> Option<Vec<u8>> {
+        let body: String = s
+            .lines()
+            .filter(|line| !line.starts_with("-----"))
+            .collect();
+        s.starts_with("-----BEGIN")
+            .then(|| base64::decode_config(body, base64::STANDARD).ok())
+            .flatten()
+    }
+
+    /// The data bytes of a bech32 string (`hrp 1 data checksum`, as in age
+    /// recipients), checksum not verified.
+    pub fn bech32_data(s: &str) -> Option<Vec<u8>> {
+        let lower = s.to_ascii_lowercase();
+        let (_, data) = lower.rsplit_once('1')?;
+        let data = data.get(..data.len().checked_sub(6)?)?;
+        let (mut acc, mut bits, mut out) = (0u32, 0u32, Vec::new());
+        for c in data.chars() {
+            acc = (acc << 5) | BECH32.find(c)? as u32;
+            bits += 5;
+            if bits >= 8 {
+                bits -= 8;
+                out.push((acc >> bits) as u8);
+                acc &= (1 << bits) - 1;
+            }
+        }
+        Some(out)
+    }
+
+    /// Every byte string `text` may encode: its own bytes, its decodings
+    /// (hex, base64, base64url, base32, bech32 data, an armored age
+    /// payload), and the decodings of it with 1..=7 leading characters
+    /// dropped (a value shifted inside a longer string).
+    fn byte_views(text: &str) -> Vec<Vec<u8>> {
+        let mut views = vec![text.as_bytes().to_vec()];
+        views.extend(armor_payload(text));
+        views.extend(bech32_data(text));
+        for shift in 0..8.min(text.len()) {
+            if text.is_char_boundary(shift) {
+                views.extend(decodings(&text[shift..]));
+            }
+        }
+        views
+    }
+
+    /// Whether `secret` appears in `text` as hex (any case) or as base64 or
+    /// base64url characters at any alignment.
+    fn in_text(text: &str, lower: &str, secret: &[u8]) -> bool {
+        lower.contains(&hex::encode(secret))
+            || [base64::STANDARD_NO_PAD, base64::URL_SAFE_NO_PAD]
+                .into_iter()
+                .flat_map(|config| super::base64_cores(secret, config))
+                .any(|core| text.contains(&core))
+    }
+
+    /// Findings for any string of `doc` that carries one of `secrets`: in its
+    /// text as hex, base64 or base64url (any alignment), or in any byte view
+    /// ([`byte_views`]) of it or of one of its [`encoded_runs`], including
+    /// as text inside a decoded payload.
+    pub fn secret_findings(what: &str, doc: &Value, secrets: &[Secret]) -> Vec<String> {
+        let mut findings = BTreeSet::new();
+        for (place, text) in strings(doc) {
+            let views: Vec<Vec<u8>> = std::iter::once(text.as_str())
+                .chain(encoded_runs(&text))
+                .flat_map(byte_views)
+                .collect();
+            let texts: Vec<String> = std::iter::once(text.clone())
+                .chain(armor_payload(&text).map(|p| String::from_utf8_lossy(&p).into_owned()))
+                .collect();
+            for secret in secrets {
+                let carried = texts
+                    .iter()
+                    .any(|t| in_text(t, &t.to_ascii_lowercase(), &secret.bytes))
+                    || views
+                        .iter()
+                        .any(|bytes| super::find(bytes, &secret.bytes).is_some());
+                if carried {
+                    findings.insert(format!(
+                        "{what}: {place} carries the harness-derived {} (raw key material)",
+                        secret.label
+                    ));
+                }
+            }
+        }
+        findings.into_iter().collect()
+    }
+
+    fn is_encoding_char(c: char) -> bool {
+        c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=' | '_' | '-')
+    }
+
+    fn is_base32_char(c: char) -> bool {
+        c.is_ascii_alphabetic() || ('2'..='7').contains(&c)
+    }
+
+    fn is_hex_char(c: char) -> bool {
+        c.is_ascii_hexdigit()
+    }
+
+    fn is_base64url_char(c: char) -> bool {
+        c.is_ascii_alphanumeric() || c == '-' || c == '_'
+    }
+
+    /// Maximal runs of 32 or more characters where an encoded key would sit
+    /// inside other text or among ciphertext bytes: runs of all the decoders'
+    /// characters together, and runs of base32, hex and base64url characters
+    /// each on their own, so a run ends where its own alphabet ends (a base32
+    /// key followed by `9` or `1` is still a whole base32 run). Every run then
+    /// goes through [`byte_views`], at every alignment it tries.
+    fn encoded_runs(text: &str) -> impl Iterator<Item = &str> {
+        let alphabets: [fn(char) -> bool; 4] = [
+            is_encoding_char,
+            is_base32_char,
+            is_hex_char,
+            is_base64url_char,
+        ];
+        alphabets.into_iter().flat_map(move |in_alphabet| {
+            text.split(move |c: char| !in_alphabet(c))
+                .filter(|run| run.len() >= 32)
+        })
+    }
+
+    /// Round 6 ruling 1 / round 7: a block's name and bytes carry no
+    /// harness-derived secret. The body is searched as raw bytes. The name
+    /// (whole and every `/` segment) and the body read as text are checked
+    /// as hex (any case) and base64/base64url at any alignment, and through
+    /// [`byte_views`] of the whole text and of every [`encoded_runs`] run.
+    pub fn block_secret_findings(
+        label: &str,
+        block: &ObjectRef,
+        secrets: &[Secret],
+    ) -> Vec<String> {
+        let body_text = String::from_utf8_lossy(block.body);
+        let body_lower = body_text.to_ascii_lowercase();
+        let body_views: Vec<Vec<u8>> = std::iter::once(&*body_text)
+            .chain(encoded_runs(&body_text))
+            .flat_map(byte_views)
+            .collect();
+        let name_lower = block.key.to_ascii_lowercase();
+        let name_views: Vec<Vec<u8>> = std::iter::once(block.key)
+            .chain(block.key.split('/'))
+            .chain(encoded_runs(block.key))
+            .flat_map(byte_views)
+            .collect();
+        let mut findings = Vec::new();
+        for secret in secrets {
+            let needle = &secret.bytes;
+            let in_views =
+                |views: &[Vec<u8>]| views.iter().any(|v| super::find(v, needle).is_some());
+            let mut places = Vec::new();
+            if in_text(block.key, &name_lower, needle) || in_views(&name_views) {
+                places.push("name");
+            }
+            if super::find(block.body, needle).is_some() {
+                places.push("raw bytes");
+            } else if in_text(&body_text, &body_lower, needle) || in_views(&body_views) {
+                places.push("bytes as text");
+            }
+            if !places.is_empty() {
+                findings.push(format!(
+                    "[{label}] block {:?}: its {} carry the harness-derived {} (raw key material)",
+                    block.key,
+                    places.join(" and "),
+                    secret.label
+                ));
+            }
+        }
+        findings
+    }
+
+    /// TCE1's only free header field: the salt, bytes 20..52 (envelope.rs
+    /// `Header::build`). Every other header byte is fixed, a length, or the
+    /// authenticated `dek_id`.
+    const SALT: std::ops::Range<usize> = 20..52;
+
+    /// The salt check looks for pieces of a secret this long. A 31-byte
+    /// prefix of a key holds one, and so does each half of a key split
+    /// across two blocks' salts; a random salt holds one of a given secret's
+    /// 17 pieces with probability about 17 · 17 · 2^-128.
+    const SECRET_PIECE: usize = 16;
+
+    /// Round 7: no TCE1 block's salt holds any 16-byte piece of a
+    /// harness-derived secret (a truncated key, or one half of a key split
+    /// across salts).
+    pub fn salt_findings(label: &str, block: &ObjectRef, secrets: &[Secret]) -> Vec<String> {
+        if tinycloud_core::at_rest::Header::parse(block.body).is_err() {
+            return Vec::new();
+        }
+        let salt = &block.body[SALT];
+        let mut findings = Vec::new();
+        for secret in secrets {
+            let found = secret
+                .bytes
+                .windows(SECRET_PIECE)
+                .position(|piece| super::find(salt, piece).is_some());
+            if let Some(at) = found {
+                findings.push(format!(
+                    "[{label}] block {:?}: its TCE1 header salt holds bytes {at}..{} of the harness-derived {} (a piece of raw key material)",
+                    block.key,
+                    at + SECRET_PIECE,
+                    secret.label
+                ));
+            }
         }
         findings
     }
@@ -1705,20 +2055,64 @@ mod key_mirror {
         pub body: &'a [u8],
     }
 
+    /// How the harness started the node (state.json `at_rest`).
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct Policy {
+        /// Mode `encrypt` or `strict`: blocks must be sealed and backed by
+        /// mirrors (round 5, ruling 4).
+        pub encrypt: bool,
+        /// `escrow_none = true`: no escrow bundle or record may exist.
+        pub escrow_none: bool,
+    }
+
+    /// A harness-only sanity cap on ARK generations, so an absurd name (say
+    /// `ark-4294967295-…`) fails RED at once instead of driving any work.
+    /// ARK generations themselves are unbounded (`rotate_ark` makes g+1);
+    /// this is not the TCE *format* generation (1..=9, the envelope header
+    /// field). A fresh harness node never rotates, so 1,000 leaves room.
+    pub const ARK_GENERATION_SANITY_CAP: u32 = 1000;
+
+    /// `NK = HKDF(ARK_1, "tinycloud/at-rest/object-names/v1")`.
+    pub fn object_name_key(ark_1: &Key) -> Key {
+        hkdf32(None, ark_1, NK_INFO)
+    }
+
+    /// A space's sealed-block name prefix (names.rs `space_tag`):
+    /// `b64url(HMAC(NK, lp("space") ‖ lp(space))[..16])`.
+    pub fn space_tag(nk: &Key, space: &str) -> String {
+        let mut msg = Vec::new();
+        lp(&mut msg, b"space");
+        lp(&mut msg, space.as_bytes());
+        base64::encode_config(&hmac_sha256(nk, &[&msg])[..16], base64::URL_SAFE_NO_PAD)
+    }
+
+    /// One KV put the harness made: its space and the content multihash.
+    pub struct Put {
+        pub space: String,
+        pub multihash: Vec<u8>,
+    }
+
     /// Every `_tc/` object of one bucket snapshot: an allowed name, an exact
-    /// typed schema, no raw key, and authentic key material under the
-    /// harness's Static `root`, with DEK tags mapped to `spaces`.
+    /// typed schema, no raw or harness-derived key, and authentic key
+    /// material under the harness's Static `root`, with DEK tags mapped to
+    /// `spaces`. No block carries a derived secret. In encrypt mode, every
+    /// block is sealed for a harness space, names a DEK whose mirror
+    /// authenticates, and opens under it to the content of one of `puts`.
     pub fn check_snapshot(
         label: &str,
         objects: &[ObjectRef],
+        blocks: &[ObjectRef],
+        puts: &[Put],
         root: &[u8],
         spaces: &[String],
+        policy: Policy,
     ) -> Vec<String> {
         let mut findings = Vec::new();
         let mut arks: Vec<ArkDoc> = Vec::new();
         let mut deks: Vec<DekDoc> = Vec::new();
         let mut bundles: Vec<BundleDoc> = Vec::new();
         let mut records: Vec<RecordDoc> = Vec::new();
+        let mut docs: Vec<(String, Value)> = Vec::new();
         for object in objects {
             let what = format!("[{label}] at-rest control object {:?}", object.key);
             let Some(kind) = parse_name(object.key) else {
@@ -1728,6 +2122,11 @@ mod key_mirror {
                 ));
                 continue;
             };
+            if policy.escrow_none && matches!(kind, Kind::Escrow { .. } | Kind::Record { .. }) {
+                findings.push(format!(
+                    "{what}: the node runs with escrow_none, so no escrow bundle or record may exist"
+                ));
+            }
             let doc: Value = match serde_json::from_slice(object.body) {
                 Ok(doc) => doc,
                 Err(e) => {
@@ -1747,7 +2146,7 @@ mod key_mirror {
                 ));
                 continue;
             };
-            let exempt: &[&str] = match kind {
+            let (encoded, halves): (&[&str], &[&str]) = match kind {
                 Kind::Ark { generation, ark_id } => {
                     strict::<StrictArk>(&what, "MirroredArk", object.body, &mut findings);
                     arks.extend(ark_doc(
@@ -1757,7 +2156,7 @@ mod key_mirror {
                         (generation, ark_id),
                         &mut findings,
                     ));
-                    &["ark_id", "sealed", "chain"]
+                    (&["ark_id", "sealed", "chain"], &[])
                 }
                 Kind::Dek { tag, dek_id } => {
                     strict::<StrictDek>(&what, "MirroredDek", object.body, &mut findings);
@@ -1768,28 +2167,32 @@ mod key_mirror {
                         (tag, dek_id),
                         &mut findings,
                     ));
-                    &["wrapped"]
+                    (&["wrapped"], &[])
                 }
                 Kind::Escrow { efp } => {
                     strict::<StrictBundle>(&what, "EscrowBundle", object.body, &mut findings);
                     bundles.extend(bundle_doc(&what, object.key, map, efp, &mut findings));
-                    &[
-                        "ark_id",
-                        "canary_fp",
-                        "shares[].recipient",
-                        "shares[].commitment",
-                        "shares[].ciphertext",
-                    ]
+                    (
+                        &[
+                            "ark_id",
+                            "canary_fp",
+                            "shares[].recipient",
+                            "shares[].commitment",
+                            "shares[].ciphertext",
+                        ],
+                        &["shares[].holder"],
+                    )
                 }
                 Kind::Record { efp } => {
                     strict::<StrictRecord>(&what, "VerificationRecord", object.body, &mut findings);
                     records.extend(record_doc(&what, object.key, map, efp, &mut findings));
-                    &["efp", "ark_id", "canary_fp", "mac"]
+                    (&["efp", "ark_id", "canary_fp", "mac"], &[])
                 }
             };
-            findings.extend(raw_key_findings(&what, &doc, exempt));
+            findings.extend(raw_key_findings(&what, &doc, encoded, halves));
+            docs.push((what, doc));
         }
-        authenticate(
+        let keys = authenticate(
             label,
             root,
             spaces,
@@ -1799,7 +2202,158 @@ mod key_mirror {
             &records,
             &mut findings,
         );
+        for (what, doc) in &docs {
+            findings.extend(secret_findings(what, doc, &keys.secrets));
+        }
+        for block in blocks {
+            findings.extend(block_secret_findings(label, block, &keys.secrets));
+            findings.extend(salt_findings(label, block, &keys.secrets));
+        }
+        if policy.encrypt {
+            require_mirrors(label, blocks, puts, spaces, &arks, &keys, &mut findings);
+        }
         findings
+    }
+
+    /// An authenticated DEK of one space.
+    pub struct SpaceDek {
+        pub dek_id: u32,
+        pub generation: u32,
+        pub key: Key,
+    }
+
+    /// What authentication recovered: every secret it derived or unwrapped,
+    /// ARK_1 (if authentic) and, per space, the DEKs whose mirror
+    /// authenticated.
+    pub struct Recovered {
+        pub secrets: Vec<Secret>,
+        pub ark_1: Option<Key>,
+        pub deks: BTreeMap<String, Vec<SpaceDek>>,
+    }
+
+    /// Exactly `len` unpadded base64url characters.
+    fn b64url_of_len(s: &str, len: usize) -> bool {
+        s.len() == len
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    }
+
+    /// Round 5 ruling 4 and round 6 ruling 3 (encrypt mode): an ARK mirror
+    /// exists, and every block
+    /// - is named `v1/<space tag: 22 b64url>/<object: 43 b64url>`;
+    /// - has a tag (from NK) that names a harness space with an
+    ///   authenticated DEK mirror;
+    /// - parses as TCE1 and its header's `dek_id` is one of those DEKs;
+    /// - is the exact sealed name of a put the harness made in that space,
+    ///   and opens under that DEK (AAD: space, content hash) to bytes whose
+    ///   blake3 is that put's content hash.
+    fn require_mirrors(
+        label: &str,
+        blocks: &[ObjectRef],
+        puts: &[Put],
+        spaces: &[String],
+        arks: &[ArkDoc],
+        keys: &Recovered,
+        findings: &mut Vec<String>,
+    ) {
+        use tinycloud_core::at_rest::{
+            open, sealed_object_name, BlobIdentity, DataKey, DekId, Header, ObjectNameKey,
+        };
+        if arks.is_empty() {
+            findings.push(format!(
+                "[{label}] encrypt mode, but no ARK mirror is in the bucket"
+            ));
+        }
+        if blocks.is_empty() {
+            return;
+        }
+        let Some(ark_1) = keys.ark_1 else {
+            findings.push(format!(
+                "[{label}] {} block(s) but no authentic generation-1 ARK to derive the object-name key from",
+                blocks.len()
+            ));
+            return;
+        };
+        let nk = object_name_key(&ark_1);
+        let core_nk = ObjectNameKey::new(nk);
+        let tags: BTreeMap<String, &String> =
+            spaces.iter().map(|s| (space_tag(&nk, s), s)).collect();
+        for block in blocks {
+            let what = format!("[{label}] block {:?}", block.key);
+            let Some((tag, _object)) = block
+                .key
+                .strip_prefix("v1/")
+                .and_then(|rest| rest.split_once('/'))
+                .filter(|(tag, object)| b64url_of_len(tag, 22) && b64url_of_len(object, 43))
+            else {
+                findings.push(format!(
+                    "{what}: encrypt mode, but the block is not named as sealed \
+                     (v1/<22 b64url space tag>/<43 b64url object>)"
+                ));
+                continue;
+            };
+            let Some(space) = tags.get(tag) else {
+                findings.push(format!(
+                    "{what}: its space tag belongs to none of the {} spaces this harness created",
+                    spaces.len()
+                ));
+                continue;
+            };
+            let Some(space_deks) = keys.deks.get(*space).filter(|d| !d.is_empty()) else {
+                findings.push(format!(
+                    "{what}: its space has no DEK mirror that authenticates"
+                ));
+                continue;
+            };
+            let header = match Header::parse(block.body) {
+                Ok(header) => header,
+                Err(e) => {
+                    findings.push(format!("{what}: not a TCE1 block ({e})"));
+                    continue;
+                }
+            };
+            let dek_id = header.dek_id().get();
+            let Some(dek) = space_deks.iter().find(|d| d.dek_id == dek_id) else {
+                findings.push(format!(
+                    "{what}: its header names data key {dek_id}, but its space's authenticated DEK mirror(s) are {:?}",
+                    space_deks.iter().map(|d| d.dek_id).collect::<Vec<_>>()
+                ));
+                continue;
+            };
+            let put = puts.iter().filter(|p| p.space == **space).find_map(|p| {
+                let hash = tinycloud_core::hash::Hash::try_from(p.multihash.clone()).ok()?;
+                (sealed_object_name(&core_nk, space, &hash) == block.key).then_some((p, hash))
+            });
+            let Some((put, hash)) = put else {
+                findings.push(format!(
+                    "{what}: its name is not the sealed name of any put the harness made in its space"
+                ));
+                continue;
+            };
+            let identity = BlobIdentity::KvBlock {
+                space,
+                content_hash: &hash,
+            };
+            match open(
+                &DataKey::new(DekId::new(dek.dek_id), dek.key),
+                &identity,
+                block.body.to_vec(),
+            ) {
+                Ok(plaintext) => {
+                    let got: Vec<u8> = tinycloud_core::hash::hash(&plaintext).into();
+                    if got != put.multihash {
+                        findings.push(format!(
+                            "{what}: opens under DEK {dek_id} (generation {}), but not to the content the harness wrote",
+                            dek.generation
+                        ));
+                    }
+                }
+                Err(e) => findings.push(format!(
+                    "{what}: does not open under its space's DEK {dek_id} (generation {}) with AAD (space, content hash): {e}",
+                    dek.generation
+                )),
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1812,10 +2366,44 @@ mod key_mirror {
         bundles: &[BundleDoc],
         records: &[RecordDoc],
         findings: &mut Vec<String>,
-    ) {
+    ) -> Recovered {
         let w = wrap_key(root);
+        let mut recovered = Recovered {
+            secrets: vec![
+                Secret {
+                    label: "Static root".into(),
+                    bytes: root.to_vec(),
+                },
+                Secret {
+                    label: "wrap key W".into(),
+                    bytes: w.to_vec(),
+                },
+            ],
+            ark_1: None,
+            deks: BTreeMap::new(),
+        };
+        // Bounded by the sanity cap and by the mirrors found, never by a
+        // number read from a name.
+        let generations: BTreeSet<u32> = arks.iter().map(|d| d.generation).collect();
+        let newest = generations.last().copied();
+        if let Some(newest) = newest {
+            if newest > ARK_GENERATION_SANITY_CAP {
+                findings.push(format!(
+                    "[{label}] ARK generation {newest} is above the harness's sanity cap {ARK_GENERATION_SANITY_CAP}"
+                ));
+            }
+            if generations.len() as u64 != u64::from(newest) {
+                findings.push(format!(
+                    "[{label}] ARK mirrors cover {} generation(s) up to {newest}, not every generation 1..={newest}",
+                    generations.len()
+                ));
+            }
+        }
         let mut opened: BTreeMap<u32, ([u8; 16], Key)> = BTreeMap::new();
-        for d in arks {
+        for d in arks
+            .iter()
+            .filter(|d| d.generation <= ARK_GENERATION_SANITY_CAP)
+        {
             match open_ark_doc(&w, d) {
                 Some(ark) => match opened.get(&d.generation) {
                     Some((id, other)) if *id != d.ark_id || *other != ark => findings.push(format!(
@@ -1833,14 +2421,23 @@ mod key_mirror {
                 )),
             }
         }
-        let newest = arks.iter().map(|d| d.generation).max();
-        if let Some(newest) = newest {
-            for g in 1..=newest {
-                if !arks.iter().any(|d| d.generation == g) {
-                    findings.push(format!(
-                        "[{label}] no ARK mirror for generation {g} of 1..={newest}"
-                    ));
-                }
+        for (g, (id, ark)) in &opened {
+            let mut canary_info = Vec::new();
+            lp(&mut canary_info, CANARY_INFO);
+            canary_info.extend_from_slice(&g.to_be_bytes());
+            let mut mac_info = Vec::new();
+            lp(&mut mac_info, MAC_INFO);
+            for (name, bytes) in [
+                ("ARK", *ark),
+                ("KEK", kek(ark)),
+                ("chain key", chain_key(ark)),
+                ("escrow canary key", escrow_key(ark, id, &canary_info)),
+                ("escrow record MAC key", escrow_key(ark, id, &mac_info)),
+            ] {
+                recovered.secrets.push(Secret {
+                    label: format!("{name} of generation {g}"),
+                    bytes: bytes.to_vec(),
+                });
             }
         }
         for d in arks {
@@ -1854,7 +2451,8 @@ mod key_mirror {
                     "{what}: an older generation has no chain to the next"
                 )),
                 (Some(chain), false) => {
-                    let opens = match (opened.get(&(d.generation + 1)), opened.get(&d.generation)) {
+                    let next = d.generation.saturating_add(1);
+                    let opens = match (opened.get(&next), opened.get(&d.generation)) {
                         (Some((newer_id, newer)), Some((_, older))) => {
                             open32(
                                 &chain_key(newer),
@@ -1881,8 +2479,19 @@ mod key_mirror {
                     records.len()
                 ));
             }
-            return;
+            return recovered;
         };
+        recovered.ark_1 = Some(*ark_1);
+        let tag_key = hkdf32(None, ark_1, DEK_TAG_INFO);
+        for (name, bytes) in [
+            ("object-name key NK", object_name_key(ark_1)),
+            ("DEK mirror tag key", tag_key),
+        ] {
+            recovered.secrets.push(Secret {
+                label: name.into(),
+                bytes: bytes.to_vec(),
+            });
+        }
         let tags: BTreeMap<String, &String> =
             spaces.iter().map(|s| (dek_tag(ark_1, s), s)).collect();
         for d in deks {
@@ -1901,17 +2510,30 @@ mod key_mirror {
                 ));
                 continue;
             };
-            if open32(
+            match open32(
                 &kek(ark),
                 &dek_aad(space, d.dek_id, d.generation, ark_id),
                 &d.wrapped,
-            )
-            .is_none()
-            {
-                findings.push(format!(
+            ) {
+                Some(dek) => {
+                    recovered
+                        .deks
+                        .entry((*space).clone())
+                        .or_default()
+                        .push(SpaceDek {
+                            dek_id: d.dek_id,
+                            generation: d.generation,
+                            key: dek,
+                        });
+                    recovered.secrets.push(Secret {
+                        label: format!("DEK {} of a harness space", d.dek_id),
+                        bytes: dek.to_vec(),
+                    });
+                }
+                None => findings.push(format!(
                     "{what}: the wrapped DEK does not authenticate under KEK_{} with its AAD (space, dek_id, generation, ark_id)",
                     d.generation
-                ));
+                )),
             }
         }
         for b in bundles {
@@ -1951,6 +2573,7 @@ mod key_mirror {
                 )),
             }
         }
+        recovered
     }
 
     fn open_ark_doc(w: &Key, d: &ArkDoc) -> Option<Key> {
@@ -2028,6 +2651,19 @@ async fn kv_put(
     path: &str,
     value: &str,
 ) -> Result<Vec<StoredObject>> {
+    // Logged before the put, so the RED check can open the sealed block
+    // (round 6, ruling 3): its name and AAD bind the content hash.
+    let multihash: Vec<u8> = tinycloud_core::hash::hash(value.as_bytes()).into();
+    writeln!(
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&harness.puts_log)
+            .with_context(|| format!("open {}", harness.puts_log.display()))?,
+        "{}\t{}",
+        account.space,
+        hex::encode(multihash)
+    )?;
     let before = harness.keys().await?;
     let (status, body) = harness
         .invoke(
@@ -2073,6 +2709,15 @@ async fn kv_put(
         );
     }
     Ok(objects)
+}
+
+fn object_refs(list: &[StoredObject]) -> Vec<key_mirror::ObjectRef<'_>> {
+    list.iter()
+        .map(|o| key_mirror::ObjectRef {
+            key: &o.key,
+            body: &o.body,
+        })
+        .collect()
 }
 
 async fn kv_run(harness: &Harness) -> Result<KvRun> {
@@ -2302,11 +2947,28 @@ async fn red_kv_blocks_are_sealed_in_minio() -> Result<()> {
     }
     // Control objects (`_tc/…`) as the node left them at boot and after the
     // puts: the same name and content scans (also over their text), then an
-    // exact name, an exact typed schema, no raw key, and authentic key
-    // material under the harness's Static root (rulings 1-5).
-    for (snapshot, objects) in [
-        ("boot", harness.boot_objects()?),
-        ("after the puts", harness.control_objects().await?),
+    // exact name, an exact typed schema, no raw or harness-derived key,
+    // authentic key material under the harness's Static root and, in
+    // encrypt mode, a mirror behind every sealed block.
+    let mut after_blocks = Vec::new();
+    for key in harness.keys().await? {
+        if !key.starts_with(key_mirror::CONTROL_PREFIX) {
+            let body = harness.object(&key).await?;
+            after_blocks.push(StoredObject { key, body });
+        }
+    }
+    let (boot_blocks, boot): (Vec<StoredObject>, Vec<StoredObject>) = harness
+        .boot_objects()?
+        .into_iter()
+        .partition(|o| !o.key.starts_with(key_mirror::CONTROL_PREFIX));
+    let puts = harness.known_puts()?;
+    for (snapshot, objects, blocks) in [
+        ("boot", boot, boot_blocks),
+        (
+            "after the puts",
+            harness.control_objects().await?,
+            after_blocks,
+        ),
     ] {
         for object in &objects {
             findings.extend(content_findings(
@@ -2317,24 +2979,22 @@ async fn red_kv_blocks_are_sealed_in_minio() -> Result<()> {
                 &identities,
             ));
         }
-        let control: Vec<key_mirror::ObjectRef> = objects
-            .iter()
-            .filter(|o| o.key.starts_with(key_mirror::CONTROL_PREFIX))
-            .map(|o| key_mirror::ObjectRef {
-                key: &o.key,
-                body: &o.body,
-            })
-            .collect();
+        let (control, blocks) = (object_refs(&objects), object_refs(&blocks));
         println!(
-            "[{snapshot}] {} object(s), {} control object(s) checked",
-            objects.len(),
-            control.len()
+            "[{snapshot}] {} control object(s), {} block(s), {} logged put(s) checked ({:?})",
+            control.len(),
+            blocks.len(),
+            puts.len(),
+            harness.policy
         );
         findings.extend(key_mirror::check_snapshot(
             snapshot,
             &control,
+            &blocks,
+            &puts,
             &harness.root,
             &spaces,
+            harness.policy,
         ));
     }
     // Compare every object of a put in space A with every object of the same
@@ -2575,17 +3235,43 @@ fn standard_b64(bytes: &[u8]) -> String {
 struct MirrorFixture {
     root: Vec<u8>,
     spaces: Vec<String>,
-    ark_1: key_mirror::Key,
+    keys: FixtureKeys,
     objects: Vec<(String, Value)>,
 }
 
+/// The fixture's secrets, for building negative cases.
+struct FixtureKeys {
+    w: key_mirror::Key,
+    ark_1: key_mirror::Key,
+    ark_2: key_mirror::Key,
+    nk: key_mirror::Key,
+    /// The unwrapped DEK of each space, in `spaces` order.
+    deks: Vec<key_mirror::Key>,
+}
+
+type ShareTweak = dyn Fn(&FixtureKeys, &mut [key_mirror::ShareDoc]);
+
 impl MirrorFixture {
     fn new() -> Self {
+        Self::build(&|_, _| {})
+    }
+
+    /// `tweak` edits the escrow shares before the bundle's EFP, its name and
+    /// the record (EFP and MAC) are computed, so only the rule under test can
+    /// flag the result.
+    fn build(tweak: &ShareTweak) -> Self {
         use key_mirror::*;
         let root = random_bytes(32);
         let w = wrap_key(&root);
         let ts = "2026-10-17T10:00:00.123456789Z";
         let (ark_1, id_1, ark_2, id_2) = (random_key(), [1u8; 16], random_key(), [2u8; 16]);
+        let mut keys = FixtureKeys {
+            w,
+            ark_1,
+            ark_2,
+            nk: object_name_key(&ark_1),
+            deks: Vec::new(),
+        };
         let ark = |generation: u32, id: &[u8; 16], key: &Key, chain: Value| {
             let sealed = seal32(&w, &seal_aad(id, generation, W_LABEL), key, random_nonce());
             json!({
@@ -2619,10 +3305,12 @@ impl MirrorFixture {
         for (space, (generation, id, key)) in
             spaces.iter().zip([(1, id_1, ark_1), (2, id_2, ark_2)])
         {
+            let dek = random_key();
+            keys.deks.push(dek);
             let wrapped = seal32(
                 &kek(&key),
                 &dek_aad(space, 1, generation, &id),
-                &random_key(),
+                &dek,
                 random_nonce(),
             );
             objects.push((
@@ -2634,28 +3322,16 @@ impl MirrorFixture {
             ));
         }
         let canary = canary_fp(&ark_2, &id_2, 2);
-        let shares: Vec<ShareDoc> = (1..=3u8)
-            .map(|index| {
-                let mut payload = b"age-encryption.org/v1\n-> X25519 ".to_vec();
-                payload.extend(random_bytes(150));
-                let encoded = standard_b64(&payload);
-                let lines: Vec<&str> = encoded
-                    .as_bytes()
-                    .chunks(64)
-                    .map(|c| std::str::from_utf8(c).expect("base64 is ASCII"))
-                    .collect();
-                ShareDoc {
-                    index,
-                    holder: format!("holder-{index}"),
-                    recipient: format!("age1{}", ["q", "p", "z"][usize::from(index) - 1].repeat(58)),
-                    commitment: random_key(),
-                    ciphertext: format!(
-                        "-----BEGIN AGE ENCRYPTED FILE-----\n{}\n-----END AGE ENCRYPTED FILE-----\n",
-                        lines.join("\n")
-                    ),
-                }
+        let mut shares: Vec<ShareDoc> = (1..=3u8)
+            .map(|index| ShareDoc {
+                index,
+                holder: format!("holder-{index}"),
+                recipient: format!("age1{}", ["q", "p", "z"][usize::from(index) - 1].repeat(58)),
+                commitment: random_key(),
+                ciphertext: age_armor_of(&random_bytes(150)),
             })
             .collect();
+        tweak(&keys, &mut shares);
         let share_json: Vec<Value> = shares
             .iter()
             .map(|s| {
@@ -2703,7 +3379,7 @@ impl MirrorFixture {
         Self {
             root,
             spaces,
-            ark_1,
+            keys,
             objects,
         }
     }
@@ -2732,15 +3408,102 @@ impl MirrorFixture {
     }
 
     fn check(&self, objects: &[StoredObject]) -> Vec<String> {
-        let refs: Vec<key_mirror::ObjectRef> = objects
-            .iter()
-            .map(|o| key_mirror::ObjectRef {
-                key: &o.key,
-                body: &o.body,
-            })
-            .collect();
-        key_mirror::check_snapshot("selftest", &refs, &self.root, &self.spaces)
+        self.check_with(objects, &[], &[], key_mirror::Policy::default())
     }
+
+    fn check_with(
+        &self,
+        objects: &[StoredObject],
+        blocks: &[StoredObject],
+        puts: &[key_mirror::Put],
+        policy: key_mirror::Policy,
+    ) -> Vec<String> {
+        key_mirror::check_snapshot(
+            "selftest",
+            &object_refs(objects),
+            &object_refs(blocks),
+            puts,
+            &self.root,
+            &self.spaces,
+            policy,
+        )
+    }
+
+    /// `value` sealed the way the S3 store seals a KV block of `space`
+    /// (main's `tinycloud_core::at_rest::seal`, the space's DEK id 1,
+    /// identity (space, content hash), name from NK), with its put.
+    fn sealed_block(&self, space: usize, value: &[u8]) -> (StoredObject, key_mirror::Put) {
+        use tinycloud_core::at_rest::{
+            seal, sealed_object_name, BlobIdentity, DataKey, DekId, ObjectNameKey,
+        };
+        let space_id = &self.spaces[space];
+        let hash = tinycloud_core::hash::hash(value);
+        let body = seal(
+            &DataKey::new(DekId::new(1), self.keys.deks[space]),
+            &BlobIdentity::KvBlock {
+                space: space_id,
+                content_hash: &hash,
+            },
+            value.to_vec(),
+        )
+        .expect("seal");
+        let key = sealed_object_name(&ObjectNameKey::new(self.keys.nk), space_id, &hash);
+        (
+            StoredObject { key, body },
+            key_mirror::Put {
+                space: space_id.clone(),
+                multihash: hash.into(),
+            },
+        )
+    }
+}
+
+/// ARK mirrors for generations 1..=n under `root`, each older one chained
+/// under the next, as `rotate_ark` leaves them.
+fn ark_chain(root: &[u8], n: u32) -> Vec<StoredObject> {
+    use key_mirror::*;
+    let w = wrap_key(root);
+    let arks: Vec<(Key, [u8; 16])> = (1..=n).map(|g| (random_key(), [g as u8; 16])).collect();
+    (1..=n)
+        .map(|g| {
+            let (ark, id) = arks[g as usize - 1];
+            let chain = arks.get(g as usize).map(|(newer, newer_id)| {
+                standard_b64(&seal32(
+                    &chain_key(newer),
+                    &chain_aad(&id, g, newer_id),
+                    &ark,
+                    random_nonce(),
+                ))
+            });
+            let sealed = seal32(&w, &seal_aad(&id, g, W_LABEL), &ark, random_nonce());
+            StoredObject {
+                key: format!("{PREFIX}ark-{g:010}-{}.json", hex::encode(id)),
+                body: json!({
+                    "version": 1, "generation": g, "ark_id": hex::encode(id),
+                    "w_label": W_LABEL, "sealed": standard_b64(&sealed), "chain": chain,
+                    "created_at": "2026-10-17T10:00:00Z",
+                })
+                .to_string()
+                .into_bytes(),
+            }
+        })
+        .collect()
+}
+
+/// An armored age file whose payload is the age v1 header, then `body`.
+fn age_armor_of(body: &[u8]) -> String {
+    let mut payload = b"age-encryption.org/v1\n-> X25519 ".to_vec();
+    payload.extend_from_slice(body);
+    let encoded = standard_b64(&payload);
+    let lines: Vec<&str> = encoded
+        .as_bytes()
+        .chunks(64)
+        .map(|c| std::str::from_utf8(c).expect("base64 is ASCII"))
+        .collect();
+    format!(
+        "-----BEGIN AGE ENCRYPTED FILE-----\n{}\n-----END AGE ENCRYPTED FILE-----\n",
+        lines.join("\n")
+    )
 }
 
 /// Every bit of `sealed`, flipped one at a time, must fail to open.
@@ -2932,8 +3695,8 @@ fn selftest_key_mirror_flags_every_bypass() -> Result<()> {
         .collect::<Vec<_>>()
         .join(" \n");
     let other_space = "tinycloud:pkh:eip155:1:0x0000000000000000000000000000000000000001:other";
-    let other_tag = key_mirror::dek_tag(&fx.ark_1, other_space);
-    let second_tag = key_mirror::dek_tag(&fx.ark_1, &fx.spaces[1]);
+    let other_tag = key_mirror::dek_tag(&fx.keys.ark_1, other_space);
+    let second_tag = key_mirror::dek_tag(&fx.keys.ark_1, &fx.spaces[1]);
     let flip_b64 = |field: &'static str| {
         body_edit(move |value| {
             let mut bytes = base64::decode(value[field].as_str().expect("string")).expect("b64");
@@ -3327,6 +4090,24 @@ fn selftest_key_mirror_flags_every_bypass() -> Result<()> {
             "array of 32 byte values",
         ),
         (
+            "raw key, k: prefix",
+            "dek-",
+            set("k", json!(format!("k:{}", b64(base64::STANDARD)))),
+            "decodes to 32 bytes",
+        ),
+        (
+            "raw key, base32",
+            "dek-",
+            set("k", json!(base32_lower(&raw).to_uppercase())),
+            "decodes to 32 bytes",
+        ),
+        (
+            "33 bytes, hex",
+            "dek-",
+            set("k", json!(hex::encode(random_bytes(33)))),
+            "more than a raw key",
+        ),
+        (
             "raw key split 16+16",
             "dek-",
             body_edit(move |v| {
@@ -3492,5 +4273,750 @@ fn selftest_key_mirror_flags_every_bypass() -> Result<()> {
             "a {what} inside a mirror was missed: {found:?}"
         );
     }
+    Ok(())
+}
+
+fn any_contains(findings: &[String], needle: &str) -> bool {
+    findings.iter().any(|f| f.contains(needle))
+}
+
+/// Round 5, rulings 1 and 2, offline: an escrow-none run refuses any escrow
+/// bundle or record; otherwise a harness-derived secret anywhere in escrow or
+/// record contents is RED (a commitment, holder names split in two, the
+/// armored share payload, a record field), even with the bundle's EFP, name
+/// and record MAC recomputed; and valid 16-byte-looking holder names are not
+/// a split key.
+#[test]
+fn selftest_key_mirror_refuses_escrow_contents_and_derived_keys() -> Result<()> {
+    let fx = MirrorFixture::new();
+    let escrow_none = key_mirror::Policy {
+        encrypt: false,
+        escrow_none: true,
+    };
+    let findings = fx.check_with(&fx.with_edit("ark-", &|_, _| None), &[], &[], escrow_none);
+    ensure!(
+        findings
+            .iter()
+            .filter(|f| f.contains("runs with escrow_none"))
+            .count()
+            == 2,
+        "escrow-none must refuse the escrow bundle and the record: {findings:#?}"
+    );
+
+    type Case = (&'static str, Box<ShareTweak>, &'static str);
+    fn tweak(f: impl Fn(&FixtureKeys, &mut [key_mirror::ShareDoc]) + 'static) -> Box<ShareTweak> {
+        Box::new(f)
+    }
+    let cases: Vec<Case> = vec![
+        (
+            "a commitment that is ARK_2",
+            tweak(|k, s| s[0].commitment = k.ark_2),
+            "ARK of generation 2",
+        ),
+        (
+            "a commitment that is the KEK of generation 1",
+            tweak(|k, s| s[1].commitment = key_mirror::kek(&k.ark_1)),
+            "KEK of generation 1",
+        ),
+        (
+            "W in base32, split across two holder names",
+            tweak(|k, s| {
+                let b32 = base32_lower(&k.w);
+                s[0].holder = b32[..26].to_owned();
+                s[1].holder = b32[26..].to_owned();
+            }),
+            "wrap key W",
+        ),
+        (
+            "NK inside the armored share payload",
+            tweak(|k, s| {
+                let mut body = random_bytes(37);
+                body.extend_from_slice(&k.nk);
+                body.extend(random_bytes(41));
+                s[2].ciphertext = age_armor_of(&body);
+            }),
+            "object-name key NK",
+        ),
+        (
+            "a space's DEK inside the armored share payload",
+            tweak(|k, s| {
+                let mut body = random_bytes(5);
+                body.extend_from_slice(&k.deks[0]);
+                s[0].ciphertext = age_armor_of(&body);
+            }),
+            "DEK 1 of a harness space",
+        ),
+        // Round 6, ruling 4: the cheap free-field bypasses.
+        (
+            "ARK_1 as the data of a bech32 age recipient",
+            tweak(|k, s| s[1].recipient = bech32_of("age", &k.ark_1)),
+            "ARK of generation 1",
+        ),
+        (
+            "hex(KEK_2) as text inside the armored share payload",
+            tweak(|k, s| {
+                let mut body = b"-> X25519 ".to_vec();
+                body.extend_from_slice(hex::encode(key_mirror::kek(&k.ark_2)).as_bytes());
+                s[2].ciphertext = age_armor_of(&body);
+            }),
+            "KEK of generation 2",
+        ),
+        (
+            "base32(W) split across holders with a `-` separator",
+            tweak(|k, s| {
+                let b32 = base32_lower(&k.w);
+                s[0].holder = format!("{}-", &b32[..26]);
+                s[1].holder = b32[26..].to_owned();
+            }),
+            "wrap key W",
+        ),
+        (
+            "base32(NK) split across holders, shifted one character",
+            tweak(|k, s| {
+                let b32 = base32_lower(&k.nk);
+                s[0].holder = format!("x{}", &b32[..25]);
+                s[1].holder = b32[25..].to_owned();
+            }),
+            "object-name key NK",
+        ),
+        (
+            "base32(ARK_2) split three ways, out of order",
+            tweak(|k, s| {
+                let b32 = base32_lower(&k.ark_2);
+                let (a, rest) = b32.split_at(18);
+                let (b, c) = rest.split_at(17);
+                s[0].holder = c.to_owned();
+                s[1].holder = a.to_owned();
+                s[2].holder = b.to_owned();
+            }),
+            "ARK of generation 2",
+        ),
+    ];
+    let mut missed = Vec::new();
+    for (what, tweak, expected) in &cases {
+        let fx = MirrorFixture::build(tweak.as_ref());
+        let findings = fx.check(&fx.with_edit("ark-", &|_, _| None));
+        if !any_contains(&findings, expected) || !any_contains(&findings, "raw key material") {
+            missed.push(format!("{what}: expected {expected:?}, got {findings:?}"));
+        }
+    }
+    // A record field holding a derived key (the MAC no longer verifies too).
+    let tag_key = key_mirror::hkdf32(None, &fx.keys.ark_1, b"tinycloud/at-rest/dek-mirror-tag/v1");
+    let findings = fx.check(&fx.with_edit("record-", &|_, v| {
+        v["mac"] = json!(hex::encode(tag_key));
+        None
+    }));
+    if !any_contains(&findings, "DEK mirror tag key") {
+        missed.push(format!(
+            "record mac = the DEK mirror tag key: got {findings:?}"
+        ));
+    }
+    ensure!(
+        missed.is_empty(),
+        "derived-secret scan missed:\n{}",
+        missed.join("\n")
+    );
+
+    // Ruling 2: valid holder names that decode to 16 bytes are no split key.
+    for names in [
+        [
+            "holder-one-london-hong",
+            "holder-two-london-hong",
+            "holder-six-london-hong",
+        ]
+        .map(str::to_owned),
+        [0, 1, 2].map(|_| hex::encode(random_bytes(16))),
+    ] {
+        let fx = MirrorFixture::build(&move |_, s| {
+            for (share, name) in s.iter_mut().zip(names.clone()) {
+                share.holder = name;
+            }
+        });
+        let findings = fx.check(&fx.with_edit("ark-", &|_, _| None));
+        ensure!(
+            findings.is_empty(),
+            "valid holder names were flagged: {findings:#?}"
+        );
+    }
+    Ok(())
+}
+
+/// `hrp 1 data checksum` in bech32's alphabet (checksum not computed: the
+/// harness never verifies it), like an age recipient.
+fn bech32_of(hrp: &str, bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 32] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+    let (mut bits, mut acc, mut out) = (0u32, 0u32, format!("{hrp}1"));
+    for &byte in bytes {
+        acc = (acc << 8) | u32::from(byte);
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            out.push(ALPHABET[((acc >> bits) & 31) as usize] as char);
+        }
+        acc &= (1 << bits) - 1;
+    }
+    if bits > 0 {
+        out.push(ALPHABET[((acc << (5 - bits)) & 31) as usize] as char);
+    }
+    out.push_str("qqqqqq");
+    out
+}
+
+/// Lowercase unpadded RFC 4648 base32 (a valid holder-name alphabet).
+fn base32_lower(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+    let (mut bits, mut acc, mut out) = (0u32, 0u32, String::new());
+    for &byte in bytes {
+        acc = (acc << 8) | u32::from(byte);
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            out.push(ALPHABET[((acc >> bits) & 31) as usize] as char);
+        }
+        acc &= (1 << bits) - 1;
+    }
+    if bits > 0 {
+        out.push(ALPHABET[((acc << (5 - bits)) & 31) as usize] as char);
+    }
+    out
+}
+
+/// Round 5 ruling 3 / round 6 ruling 2, offline: ARK generations are not
+/// capped at the TCE format's 9: a contiguous chain of 10 (and 9) passes.
+/// An absurd generation fails RED at once against the harness's sanity cap
+/// (no loop to the number), and a gap is one finding.
+#[test]
+fn selftest_key_mirror_bounds_absurd_generations() -> Result<()> {
+    let root = random_bytes(32);
+    let check = |objects: &[StoredObject]| {
+        key_mirror::check_snapshot(
+            "selftest",
+            &object_refs(objects),
+            &[],
+            &[],
+            &root,
+            &[],
+            key_mirror::Policy::default(),
+        )
+    };
+    for n in [9, 10] {
+        let findings = check(&ark_chain(&root, n));
+        ensure!(
+            findings.is_empty(),
+            "a valid chain of {n} ARK generations was flagged: {findings:#?}"
+        );
+    }
+    let absurd = |generation: u32| StoredObject {
+        key: format!(
+            "{}ark-{generation:010}-{}.json",
+            key_mirror::PREFIX,
+            hex::encode([0xeeu8; 16])
+        ),
+        body: json!({
+            "version": 1, "generation": generation, "ark_id": hex::encode([0xeeu8; 16]),
+            "w_label": key_mirror::W_LABEL, "sealed": standard_b64(&random_bytes(60)),
+            "chain": null, "created_at": "2026-10-17T10:00:00Z",
+        })
+        .to_string()
+        .into_bytes(),
+    };
+    let mut objects = ark_chain(&root, 2);
+    objects.push(absurd(u32::MAX));
+    let started = std::time::Instant::now();
+    let findings = check(&objects);
+    ensure!(
+        started.elapsed() < Duration::from_secs(2),
+        "the generation checks took {:?}",
+        started.elapsed()
+    );
+    ensure!(
+        any_contains(&findings, "above the harness's sanity cap 1000")
+            && any_contains(&findings, "not every generation 1..=4294967295"),
+        "an absurd generation was not refused: {findings:#?}"
+    );
+    let mut over_cap = ark_chain(&root, 2);
+    over_cap.push(absurd(1001));
+    ensure!(
+        any_contains(&check(&over_cap), "above the harness's sanity cap 1000"),
+        "generation 1001 passed the sanity cap"
+    );
+    let mut with_gap = ark_chain(&root, 2);
+    with_gap.push(absurd(5));
+    let gap = check(&with_gap);
+    ensure!(
+        gap.iter()
+            .filter(|f| f.contains("not every generation"))
+            .count()
+            == 1
+            && !any_contains(&gap, "sanity cap"),
+        "a gap must be one finding: {gap:#?}"
+    );
+    Ok(())
+}
+
+fn copies(objects: &[StoredObject]) -> Vec<StoredObject> {
+    objects
+        .iter()
+        .map(|o| StoredObject {
+            key: o.key.clone(),
+            body: o.body.clone(),
+        })
+        .collect()
+}
+
+const ENCRYPT: key_mirror::Policy = key_mirror::Policy {
+    encrypt: true,
+    escrow_none: false,
+};
+
+/// Round 5 ruling 4, offline: in encrypt mode an ARK mirror must exist and
+/// every block must be sealed-named for a harness space whose DEK mirror
+/// authenticates; outside encrypt mode no mirror is required.
+#[test]
+fn selftest_key_mirror_requires_mirrors_in_encrypt_mode() -> Result<()> {
+    let fx = MirrorFixture::new();
+    let all = fx.with_edit("ark-", &|_, _| None);
+    let (b0, p0) = fx.sealed_block(0, b"value in space a");
+    let (b1, p1) = fx.sealed_block(1, b"value in space b");
+    let puts = [p0, p1];
+    let findings = fx.check_with(&all, &copies(&[b0, b1]), &puts, ENCRYPT);
+    ensure!(
+        findings.is_empty(),
+        "mirrored sealed blocks were flagged: {findings:#?}"
+    );
+
+    let without = |needle: &str| -> Vec<StoredObject> {
+        copies(&all)
+            .into_iter()
+            .filter(|o| !o.key.contains(needle))
+            .collect()
+    };
+    let dek_0 = format!("dek-{}", key_mirror::dek_tag(&fx.keys.ark_1, &fx.spaces[0]));
+    let block = |space: usize| fx.sealed_block(space, b"a block").0;
+    let unknown = StoredObject {
+        key: format!(
+            "v1/{}/{}",
+            key_mirror::space_tag(
+                &fx.keys.nk,
+                "tinycloud:pkh:eip155:1:0x0000000000000000000000000000000000000001:other"
+            ),
+            base64::encode_config(random_bytes(32), base64::URL_SAFE_NO_PAD)
+        ),
+        body: random_bytes(100),
+    };
+    let plaintext = StoredObject {
+        key: format!("{}/abc=", fx.spaces[0]),
+        body: b"plain".to_vec(),
+    };
+    let cases: Vec<(&str, Vec<StoredObject>, StoredObject, &str)> = vec![
+        (
+            "a space's DEK mirror deleted",
+            without(&dek_0),
+            block(0),
+            "its space has no DEK mirror that authenticates",
+        ),
+        (
+            "the generation-2 ARK deleted (its DEK can't authenticate)",
+            without("ark-0000000002"),
+            block(1),
+            "its space has no DEK mirror that authenticates",
+        ),
+        (
+            "a block of no harness space",
+            copies(&all),
+            unknown,
+            "belongs to none of the 2 spaces",
+        ),
+        (
+            "a plaintext-named block",
+            without("record-"),
+            plaintext,
+            "not named as sealed",
+        ),
+        (
+            "no ARK mirror at all",
+            without("ark-"),
+            block(0),
+            "no ARK mirror is in the bucket",
+        ),
+    ];
+    let mut missed = Vec::new();
+    for (what, objects, block, expected) in cases {
+        let findings = fx.check_with(&objects, &[block], &[], ENCRYPT);
+        if !any_contains(&findings, expected) {
+            missed.push(format!("{what}: expected {expected:?}, got {findings:?}"));
+        }
+    }
+    ensure!(
+        missed.is_empty(),
+        "mirror requirement missed:\n{}",
+        missed.join("\n")
+    );
+
+    let off = fx.check_with(
+        &[],
+        &[StoredObject {
+            key: format!("{}/abc=", fx.spaces[0]),
+            body: b"plain".to_vec(),
+        }],
+        &[],
+        key_mirror::Policy::default(),
+    );
+    ensure!(
+        off.is_empty(),
+        "mode off must not require mirrors: {off:#?}"
+    );
+    Ok(())
+}
+
+/// Round 6 ruling 3, offline: each sealed block must parse as TCE1, name a
+/// DEK whose mirror authenticated for its space, be the sealed name of a
+/// logged put, and open under that DEK to that put's content. The harness's
+/// NK space tag matches main's `space_tag`.
+#[test]
+fn selftest_blocks_open_under_their_mirrored_dek() -> Result<()> {
+    use tinycloud_core::at_rest::{seal, BlobIdentity, DataKey, DekId, ObjectNameKey};
+    let fx = MirrorFixture::new();
+    for space in &fx.spaces {
+        ensure!(
+            key_mirror::space_tag(&fx.keys.nk, space)
+                == tinycloud_core::at_rest::space_tag(&ObjectNameKey::new(fx.keys.nk), space),
+            "the harness's space tag differs from main's names.rs"
+        );
+    }
+    let all = fx.with_edit("ark-", &|_, _| None);
+    let (good, put) = fx.sealed_block(0, b"the probe value");
+    let (other, other_put) = fx.sealed_block(1, b"another value");
+    let puts = [put, other_put];
+    ensure!(
+        fx.check_with(
+            &all,
+            &[
+                StoredObject {
+                    key: good.key.clone(),
+                    body: good.body.clone(),
+                },
+                other,
+            ],
+            &puts,
+            ENCRYPT
+        )
+        .is_empty(),
+        "sealed blocks that open were flagged"
+    );
+
+    let hash = tinycloud_core::hash::hash(b"the probe value");
+    let reseal = |dek_id: u32, key: [u8; 32], space: &str| {
+        seal(
+            &DataKey::new(DekId::new(dek_id), key),
+            &BlobIdentity::KvBlock {
+                space,
+                content_hash: &hash,
+            },
+            b"the probe value".to_vec(),
+        )
+        .expect("seal")
+    };
+    let with_body = |body: Vec<u8>| StoredObject {
+        key: good.key.clone(),
+        body,
+    };
+    let mut dek_id_2 = good.body.clone();
+    dek_id_2[8..12].copy_from_slice(&2u32.to_be_bytes());
+    let mut flipped = good.body.clone();
+    let last = flipped.len() - 1;
+    flipped[last] ^= 1;
+    let cases: Vec<(&str, StoredObject, &str)> = vec![
+        (
+            "header dek_id changed to 2",
+            with_body(dek_id_2),
+            "header names data key 2",
+        ),
+        (
+            "sealed under DEK id 2 with a key of its own",
+            with_body(reseal(2, random_key(), &fx.spaces[0])),
+            "header names data key 2",
+        ),
+        (
+            "sealed under a constant key that is not the space's DEK",
+            with_body(reseal(1, [7; 32], &fx.spaces[0])),
+            "does not open under its space's DEK 1",
+        ),
+        (
+            "space B's DEK and identity under space A's name",
+            with_body(reseal(1, fx.keys.deks[1], &fx.spaces[1])),
+            "does not open under its space's DEK 1",
+        ),
+        (
+            "one ciphertext bit flipped",
+            with_body(flipped),
+            "does not open under its space's DEK 1",
+        ),
+        ("not TCE1", with_body(random_bytes(200)), "not a TCE1 block"),
+        (
+            "a name that is no logged put",
+            StoredObject {
+                key: format!(
+                    "{}/{}",
+                    good.key.rsplit_once('/').expect("v1/tag/obj").0,
+                    base64::encode_config(random_bytes(32), base64::URL_SAFE_NO_PAD)
+                ),
+                body: good.body.clone(),
+            },
+            "not the sealed name of any put",
+        ),
+        (
+            "an empty object name",
+            StoredObject {
+                key: format!("{}/", good.key.rsplit_once('/').expect("v1/tag/obj").0),
+                body: good.body.clone(),
+            },
+            "not named as sealed",
+        ),
+    ];
+    let mut missed = Vec::new();
+    for (what, block, expected) in cases {
+        let findings = fx.check_with(&all, &[block], &puts, ENCRYPT);
+        if !any_contains(&findings, expected) {
+            missed.push(format!("{what}: expected {expected:?}, got {findings:?}"));
+        }
+    }
+    ensure!(
+        missed.is_empty(),
+        "block-to-DEK check missed:\n{}",
+        missed.join("\n")
+    );
+    Ok(())
+}
+
+/// Round 6 ruling 1 / round 7, offline: a block's name or bytes carrying a
+/// harness secret (raw, hex, base64 or base64url, padded or not, base32,
+/// bech32 data) is RED, in any mode: the space's DEK as the TCE1 header
+/// salt, b64url(DEK) or b64url(NK) as the object name, base32(NK) as a middle
+/// name segment, and hex(KEK), base64(W), base32(KEK) and bech32(DEK) text
+/// after the ciphertext.
+#[test]
+fn selftest_blocks_carry_no_derived_secret() -> Result<()> {
+    let fx = MirrorFixture::new();
+    let all = fx.with_edit("ark-", &|_, _| None);
+    let (good, put) = fx.sealed_block(0, b"the probe value");
+    let puts = [put];
+    let prefix = good.key.rsplit_once('/').expect("v1/tag/obj").0.to_owned();
+    let dek = fx.keys.deks[0];
+    let kek_1 = key_mirror::kek(&fx.keys.ark_1);
+    let mut salt_dek = good.body.clone();
+    salt_dek[20..52].copy_from_slice(&dek);
+    let with_text = |text: String| {
+        let mut body = good.body.clone();
+        body.push(b'\n');
+        body.extend_from_slice(text.as_bytes());
+        body
+    };
+    let cases: Vec<(&str, StoredObject, &str)> = vec![
+        (
+            "the space's DEK as the header salt",
+            StoredObject {
+                key: good.key.clone(),
+                body: salt_dek,
+            },
+            "raw bytes carry the harness-derived DEK 1",
+        ),
+        (
+            "b64url(DEK) as the object name",
+            StoredObject {
+                key: format!(
+                    "{prefix}/{}",
+                    base64::encode_config(dek, base64::URL_SAFE_NO_PAD)
+                ),
+                body: good.body.clone(),
+            },
+            "name carry the harness-derived DEK 1",
+        ),
+        (
+            "b64url(NK) as the object name",
+            StoredObject {
+                key: format!(
+                    "{prefix}/{}",
+                    base64::encode_config(fx.keys.nk, base64::URL_SAFE_NO_PAD)
+                ),
+                body: good.body.clone(),
+            },
+            "name carry the harness-derived object-name key NK",
+        ),
+        (
+            "hex(KEK_1) in the body",
+            StoredObject {
+                key: good.key.clone(),
+                body: with_text(hex::encode_upper(kek_1)),
+            },
+            "bytes as text carry the harness-derived KEK of generation 1",
+        ),
+        (
+            "padded base64(W) in the body",
+            StoredObject {
+                key: good.key.clone(),
+                body: with_text(base64::encode(fx.keys.w)),
+            },
+            "bytes as text carry the harness-derived wrap key W",
+        ),
+        (
+            "base32(NK) as a middle name segment",
+            StoredObject {
+                key: format!(
+                    "v1/{}/{}",
+                    base32_lower(&fx.keys.nk),
+                    good.key.rsplit('/').next().expect("object")
+                ),
+                body: good.body.clone(),
+            },
+            "name carry the harness-derived object-name key NK",
+        ),
+        (
+            "base32(KEK_1) in the body",
+            StoredObject {
+                key: good.key.clone(),
+                body: with_text(base32_lower(&kek_1).to_uppercase()),
+            },
+            "bytes as text carry the harness-derived KEK of generation 1",
+        ),
+        (
+            "bech32 data of the DEK in the body",
+            StoredObject {
+                key: good.key.clone(),
+                body: with_text(bech32_of("age", &dek)),
+            },
+            "bytes as text carry the harness-derived DEK 1",
+        ),
+    ];
+    let mut missed = Vec::new();
+    for (what, block, expected) in cases {
+        for policy in [ENCRYPT, key_mirror::Policy::default()] {
+            let findings =
+                fx.check_with(&all, &copies(std::slice::from_ref(&block)), &puts, policy);
+            if !any_contains(&findings, expected) {
+                missed.push(format!(
+                    "{what} ({policy:?}): expected {expected:?}, got {findings:?}"
+                ));
+            }
+        }
+    }
+    ensure!(
+        missed.is_empty(),
+        "block secret scan missed:\n{}",
+        missed.join("\n")
+    );
+    Ok(())
+}
+
+/// Round 7, offline: no TCE1 salt may hold any 16-byte piece of a harness
+/// secret, in any mode: (a) a salt of DEK[0..31] plus one random byte; (b)
+/// DEK[0..16] in one block's salt and DEK[16..32] in another's. Random salts
+/// (fresh seals) never match.
+#[test]
+fn selftest_salts_hold_no_piece_of_a_secret() -> Result<()> {
+    let fx = MirrorFixture::new();
+    let all = fx.with_edit("ark-", &|_, _| None);
+    let dek = fx.keys.deks[0];
+    let (a, put_a) = fx.sealed_block(0, b"first value");
+    let (b, put_b) = fx.sealed_block(0, b"second value");
+    let puts = [put_a, put_b];
+    let with_salt = |block: &StoredObject, salt: &[u8]| {
+        let mut body = block.body.clone();
+        body[20..52].copy_from_slice(salt);
+        StoredObject {
+            key: block.key.clone(),
+            body,
+        }
+    };
+    let pieces = |findings: &[String]| {
+        findings
+            .iter()
+            .filter(|f| f.contains("TCE1 header salt holds bytes"))
+            .count()
+    };
+    let truncated = [&dek[..31], &random_bytes(1)[..]].concat();
+    let half_a = [&dek[..16], &random_bytes(16)[..]].concat();
+    let half_b = [&random_bytes(16)[..], &dek[16..]].concat();
+    for policy in [ENCRYPT, key_mirror::Policy::default()] {
+        let findings = fx.check_with(&all, &[with_salt(&a, &truncated)], &puts, policy);
+        ensure!(
+            pieces(&findings) == 1
+                && any_contains(
+                    &findings,
+                    "salt holds bytes 0..16 of the harness-derived DEK 1"
+                ),
+            "a salt of DEK[0..31] plus one byte was missed ({policy:?}): {findings:#?}"
+        );
+        let findings = fx.check_with(
+            &all,
+            &[with_salt(&a, &half_a), with_salt(&b, &half_b)],
+            &puts,
+            policy,
+        );
+        ensure!(
+            pieces(&findings) == 2
+                && any_contains(
+                    &findings,
+                    "salt holds bytes 0..16 of the harness-derived DEK 1"
+                )
+                && any_contains(
+                    &findings,
+                    "salt holds bytes 16..32 of the harness-derived DEK 1"
+                ),
+            "a DEK split across two blocks' salts was missed ({policy:?}): {findings:#?}"
+        );
+    }
+    let blocks: Vec<StoredObject> = (0..64)
+        .map(|i| fx.sealed_block(i % 2, format!("value {i}").as_bytes()).0)
+        .collect();
+    let findings = fx.check_with(&all, &blocks, &[], key_mirror::Policy::default());
+    ensure!(
+        pieces(&findings) == 0,
+        "a random salt matched a piece of a secret: {findings:#?}"
+    );
+    Ok(())
+}
+
+/// Round 8, offline: a base32-encoded derived secret is found when the next
+/// character is outside base32 but inside another encoding's alphabet (`9`,
+/// `1`), in a block body and in a mirror string.
+#[test]
+fn selftest_base32_secret_before_other_characters() -> Result<()> {
+    let fx = MirrorFixture::new();
+    let all = fx.with_edit("ark-", &|_, _| None);
+    let (good, put) = fx.sealed_block(0, b"the probe value");
+    let puts = [put];
+    let kek_1 = key_mirror::kek(&fx.keys.ark_1);
+    let mut missed = Vec::new();
+    for suffix in ["9", "1"] {
+        let mut body = good.body.clone();
+        body.push(b'\n');
+        body.extend_from_slice(base32_lower(&kek_1).to_uppercase().as_bytes());
+        body.extend_from_slice(suffix.as_bytes());
+        let block = StoredObject {
+            key: good.key.clone(),
+            body,
+        };
+        let findings = fx.check_with(&all, &[block], &puts, key_mirror::Policy::default());
+        let expected = "bytes as text carry the harness-derived KEK of generation 1";
+        if !any_contains(&findings, expected) {
+            missed.push(format!("block body, base32 then {suffix:?}: {findings:?}"));
+        }
+        let note = format!("{}{suffix}", base32_lower(&fx.keys.ark_1));
+        let findings = fx.check(&fx.with_edit("dek-", &|_, v| {
+            v["note"] = json!(note);
+            None
+        }));
+        if !any_contains(&findings, "carries the harness-derived ARK of generation 1") {
+            missed.push(format!(
+                "mirror string, base32 then {suffix:?}: {findings:?}"
+            ));
+        }
+    }
+    ensure!(
+        missed.is_empty(),
+        "a base32 secret before another character was missed:\n{}",
+        missed.join("\n")
+    );
     Ok(())
 }

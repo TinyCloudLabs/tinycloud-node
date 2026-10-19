@@ -57,6 +57,97 @@ a version into the `docker.yml` `image_version` input that `Cargo.toml` does not
 already claim. Both have happened (`0b48da2`, and the image tagged `1.10.0`
 built from a `1.9.0` tree); the `version-guard` job now blocks the second one.
 
+## Operator steps before a node deploy
+
+A migration that indexes a large PostgreSQL table cannot be built by the boot:
+the boot runs every pending migration in one transaction, so a plain
+`CREATE INDEX` holds a SHARE lock on the table, blocking its writes, for the
+whole build. For these, the operator builds the index online first. **Order:
+operator step, then the node deploy.**
+
+An index that only speeds up reads is **performance-only**: the node boots and
+serves without it, so its migration never builds it on a non-empty table and
+never fails the boot over it. It logs a typed warning and keeps serving; an
+index built later is picked up by the planner with no restart.
+
+### `idx_current_kv_space_deleted_key_c` (TC-1274, `m20261020_000000_current_kv_key_c_index`)
+
+Ships in the release after 1.21.2. It lets the KV list range select seek on
+its byte-order key bounds instead of reading and filtering every live key of
+the space. **Performance-only:** the node boots and serves without the index,
+and KV lists are slower until it exists. When it is missing on a non-empty
+`current_kv`, the node logs `current_kv_c_index_missing` (WARN) and keeps
+serving.
+
+1. On the PlanetScale primary, **outside any transaction** (the console, or
+   `psql` without `BEGIN`; never through the node or a migration runner):
+
+   ```sql
+   CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_current_kv_space_deleted_key_c ON current_kv (space, deleted, (key COLLATE "C"));
+   ```
+
+   Writes to `current_kv` continue during the build. It waits for transactions
+   that were open when it started, so it can sit in "waiting for old
+   transactions" while one is open; it does not block them. Build time grows
+   with the row count of `current_kv`. Measured locally on an unthrottled
+   PostgreSQL 16: 3.9 s for 1,000,000 rows (112 MB heap, 109 MB index). A
+   CPU-limited primary is slower; the index is about the size of the existing
+   `idx_current_kv_space_deleted_key`.
+
+2. Check the result. All three columns must be `t`:
+
+   ```sql
+   SELECT i.indisvalid, i.indisready, i.indislive FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid WHERE c.relname = 'idx_current_kv_space_deleted_key_c';
+   ```
+
+3. If the build was cancelled or failed, the index is left INVALID, and
+   `IF NOT EXISTS` would skip it. Drop it and redo step 1:
+
+   ```sql
+   DROP INDEX CONCURRENTLY idx_current_kv_space_deleted_key_c;
+   ```
+
+4. Deploy the node. At boot the migration reads `pg_index` for that exact name
+   and **never takes a lock on `current_kv` for a build and never fails the
+   boot over the index**:
+   - a valid, ready, live btree of that name on `current_kv` with the shape
+     above (columns `space, deleted, key`, the third in collation
+     `pg_catalog.C`, the first two in their own columns' collations, default
+     operator classes, ascending, no predicate,
+     expression or INCLUDE): **no DDL, no lock, no warning**, and the index
+     keeps its OID;
+   - no such index and `current_kv` **empty** (a fresh or test database): the
+     migration builds it, which is instant;
+   - no such index and `current_kv` **not empty**: nothing is built. The node
+     logs one `current_kv_c_index_missing` warning, boots and serves with slower
+     KV lists, and the migration is recorded as applied. Run step 1 whenever
+     convenient; the planner uses the index as soon as it is valid. A restart
+     is not needed;
+   - the right shape but INVALID, not ready or not live (a failed or still
+     running `CREATE INDEX CONCURRENTLY`): one `current_kv_c_index_invalid`
+     warning. The index is left alone. If no build is running, follow step 3
+     and redo step 1;
+   - the name with another shape (for example the existing
+     `(space, deleted, key)` shape, `COLLATE "POSIX"`, DESC, another operator
+     class, INCLUDE, a predicate, another table, or a non-index relation): one
+     `current_kv_c_index_wrong_shape` error-level log. The object is left
+     alone, the node serves, and lists are slower. Run
+     `DROP INDEX CONCURRENTLY idx_current_kv_space_deleted_key_c;` and then
+     step 1.
+
+   The log text is constant (no key, space or value; production logs are
+   public, TC-961). The log shipper maps the `warn`/`error` record to
+   `node_warning` / `node_error` with an unclassified code, so look for the
+   event name in the node's own container log.
+
+Rollback: `DROP INDEX CONCURRENTLY IF EXISTS idx_current_kv_space_deleted_key_c;`
+is safe at any time; the list range select goes back to filtering the space,
+and nothing else uses the index. A node image from before this migration
+refuses to start while `seaql_migrations` lists a migration it does not ship, so
+a binary rollback also needs
+`DELETE FROM seaql_migrations WHERE version = 'm20261020_000000_current_kv_key_c_index';`
+first. The migration's `down` keeps the index.
+
 ## Promoting to production (main-only)
 
 Production is built and promoted **only from `main`** (TC-940, 2026-10-13).
@@ -66,12 +157,14 @@ main's history (`scripts/ci/check-deploy-ref.sh`, before builds and again
 inside `deploy-phala`). Other refs fail `Deploy refused (main-only)`.
 
 **Release order:** approved #310 must never merge alone. Land #310 and its
-stacked recovery change atomically as one lineage, preserving emergency
-re-promotion and security rollback first. #309's sidecar compose belongs
-only to the later approved logging window, not this workflow/security
-release. The security card remains rollback-not-ready until the combined
-path is reviewed and landed. These docs grant no merge or dispatch authority.
-Merging either workflow change is a push, not a deployment dispatch.
+stacked recovery changes atomically as one lineage, preserving emergency
+re-promotion and security rollback first. #309's sidecar compose then ships
+on the unchanged 1.20.6 image under that lineage's exact raw-hash lock. The
+later main release lands this template lock and the 95m ingress body cap,
+and is promoted by one dispatch (see
+[Main release with N0 log shipping](#main-release-with-n0-log-shipping-one-dispatch)).
+These docs grant no merge or dispatch authority. Merging either workflow
+change is a push, not a deployment dispatch.
 
 ### The `production` environment (TC-971)
 
@@ -107,6 +200,14 @@ Environment settings (Settings → Environments → `production`):
   must not be selected for the organization secret `PHALA_CLOUD_API_KEY`. A
   same-named repository or organization secret is still readable by a job
   without `environment: production`.
+- `NODE_STATS_READ_TOKEN` (TC-1482, read-only `GET /admin/stats`) is not in
+  that list and is not passed to the CVM by `docker.yml` or the compose files,
+  so the route is disabled (`404`) in a deployment until a reviewed change adds
+  it: a `PROD_TINYCLOUD_NODE_STATS_READ_TOKEN` environment secret, the
+  `PHALA_ENV_` pass-through and a compose `environment` line (which changes the
+  reviewed compose hash). Its value must be at least 32 bytes (generate it with
+  `openssl rand -hex 32`; a shorter value disables the route) and must differ from
+  `PROD_TINYCLOUD_ADMIN_SECRET`; the node disables the route if they are equal.
 
 What this blocks: a dispatch on an unlocked branch fails the environment's
 branch policy, even if that branch edits `docker.yml` to name the environment.
@@ -145,6 +246,67 @@ a bare HTTPS origin. The preflight also accepts that origin with the
 or CR/LF fails it. The quota steps take only its host and port and
 call billing's fixed `/api/admin/storage-comp/` path; no URL is printed.
 
+### `NODE_STATS_READ_TOKEN` (TC-1482): compose hash change
+
+`docker-compose.dstack-postgres.yaml` passes the optional bearer for the
+read-only `GET /admin/stats` to the node as `NODE_STATS_READ_TOKEN:
+"${NODE_STATS_READ_TOKEN:-}"`. This ships in the same release as the route
+(the release after 1.21.2) and **changes the compose hash**: the N0 template
+lock in `docker.yml` moves to the hash above and
+`scripts/ci/fixtures/tc959-n0-compose.yaml` stays byte-identical to the
+compose. Release notes for that release must say so.
+
+- The secret is the `production` environment secret
+  `PROD_TINYCLOUD_NODE_STATS_READ_TOKEN`. The deploy step maps it to
+  `PHALA_ENV_NODE_STATS_READ_TOKEN` and writes it to the sealed
+  `.phala-prod.env` (mode 0600, removed afterwards) like the other secrets;
+  the value is never in a file in the repository, in argv or in logs.
+- It is **optional**. It is not in the deploy step's `required_vars`. Unset
+  or empty, the line is not written, the node starts normally and the route
+  is disabled (`404`, as for an unknown route). `--validate-config` and the
+  compose validation do not read it. A multi-line value fails before any CVM
+  mutation.
+- When set, the deploy step **refuses**, before it writes the sealed file and
+  with a constant message that names no value, a token that equals
+  `PROD_TINYCLOUD_ADMIN_SECRET` (`NODE_STATS_READ_TOKEN must differ from
+  TINYCLOUD_ADMIN_SECRET`) and a token shorter than 32 bytes
+  (`NODE_STATS_READ_TOKEN must be at least 32 bytes`; surrounding whitespace
+  is not counted). The node itself keeps the route at `404` for either value,
+  so without this check the mistake would surface only as OpenKey's `503`.
+- `ops/rollback/pre-n0-compose.yaml` and `pre-n0-stop-local-logs.yaml` are not
+  changed: they are pinned by raw hash, restore the 1.20.6 image, which does
+  not read this variable, and the rollback leaves the route absent.
+
+Items for the release notes of the release that ships this:
+
+- **(a) Registration.** No registration is needed if production uses Phala's
+  centralized KMS. Amos confirms that before the deploy with
+  `phala cvms get tinycloud-node` (output stays private). If it is an on-chain
+  KMS, a reviewed `addComposeHash` is needed first. dstack's `compose_hash`
+  changes at the deploy, and again when the first deploy adds the token name
+  to `allowed_envs`.
+- **(b) Node DID.** The node DID is unchanged across the compose-hash change:
+  the key path is `tinycloud/keys/primary`, derived from the app id and that
+  path. The post-deploy DID and key-fingerprint gate stays.
+- **(c) Rule: never delete or blank `PROD_TINYCLOUD_NODE_STATS_READ_TOKEN`
+  while the name is in the CVM's `allowed_envs`.** A later deploy without it
+  fails closed before any CVM mutation with exactly
+  `::error::allowed_envs synchronization failed during complete whitelist validation; response details withheld.`
+  (the whitelist check requires every allowed name to be present in the sealed
+  file), and it also blocks rollback and same-image recovery, which use the same
+  deploy step. Removing the name later is a manual, reviewed Phala
+  control-plane operation: set `allowed_envs` without the name and a
+  re-encrypted env set without it (this changes `compose_hash` again), then
+  delete the secret.
+- **(d) First deploy.** The first deploy with the token set restarts the CVM
+  twice: dstack skips the not-yet-allowed key, so the route is `404` on that
+  boot, and the post-deploy sync adds the name. [inference from the sync code;
+  not observed live]
+- **(e) Token.** Bobbie generates a 32-byte hex token (`openssl rand -hex 32`,
+  64 characters). Amos puts it into the Phala env through the deploy, by
+  setting the `production` environment secret from stdin, never printed. The
+  same value is set as OpenKey's `NODE_STATS_READ_TOKEN`.
+
 Every `deploy_phala=true` command must explicitly include
 **`-f authorize_quota_values=true`**. This authorizes the reviewed values
 and authority in `ops/quota-overrides.json` for that one dispatch; it is
@@ -152,25 +314,37 @@ not N0-specific or permission to silently reuse old values. Missing
 authorization or missing/unknown authority fails before any compose,
 CVM or whitelist mutation.
 
-`authority=node-override` currently applies the reviewed limits after the
-last restart and required health. Both exact spaces must exist once with
-positive usage in authenticated `/admin/usage`, which lists every space on
-the node unpaginated (~107 bytes a space); the script reads up to 16 MiB of
-it and fails closed above that, while other quota bodies stay capped at
-64 KiB. Before ANY PUT, both billing
-storage-comp reads must prove no active comp: 404 logs only
-`billing storage-comp unavailable`; valid `active:false` also permits the
-legacy restore. Active comp fails `authority mismatch: flip to billing`.
-Auth/5xx/transport/malformed responses fail closed, never count as absence.
-Each PUT requires GET readback of both override and effective values.
+`authority=billing` is current (TC-1162/TC-1164): billing is the quota
+authority for both of Sam's spaces, and the reviewed limits are floors,
+applications `5368709120` and secrets `1073741824` (internal D1
+`quota_overrides`). Billing mode is read-only after the last restart and
+required health: both exact spaces must exist once with positive usage in
+authenticated `/admin/usage`, which lists every space on the node
+unpaginated (~107 bytes a space); the script reads up to 16 MiB of it and
+fails closed above that, while other quota bodies stay capped at 64 KiB.
+It never PUTs/DELETEs a node override. Each
+active absolute per-space `storage_limit_bytes` must cover its floor, and
+node GET must show `override_bytes=null`. Missing, inactive or insufficient
+comps fail `billing authority does not cover both reviewed quota floors`; a
+non-null override fails `stale legacy override`. A cold node cache is not a
+failure: billing is authoritative and the node fetches on the next write
+(≤60 s TTL). Do not compare incremental account `comp_bytes` with absolute
+space limits.
 
-The later reviewed authority flip to `billing` is separate from this PR and
-follows TC-1162 migration. Billing mode never PUTs/DELETEs a node override:
-active absolute per-space `storage_limit_bytes` must cover each reviewed
-floor, and node GET must show `override_bytes=null`. A non-null override
-fails `stale legacy override`. A cold node cache is not a failure: billing
-is authoritative and the node fetches on the next write (≤60 s TTL).
-Do not compare incremental account `comp_bytes` with absolute space limits.
+Ordering rule: the flip to `billing` is merged only after both spaces are
+billing comps with their node overrides cleared, and before any further
+`deploy_phala` dispatch. Merged before that migration, the next dispatch
+restarts the node (wiping its in-memory overrides) and billing-mode
+reconcile then fails without restoring them (no comp covers the floors).
+Left unmerged after the migration, the next dispatch refuses in
+node-override mode with `authority mismatch: flip to billing`.
+Reverting to `authority=node-override` requires a
+reviewed PR. In that legacy mode, before ANY PUT both billing storage-comp
+reads must prove no active comp (404 logs only `billing storage-comp
+unavailable`; valid `active:false` also permits the restore); an active comp
+fails `authority mismatch: flip to billing`. Each PUT requires GET readback
+of both override and effective values. In both modes, auth/5xx/transport/
+malformed responses fail closed and never count as absence.
 No raw response, identity list, credential or error body is logged.
 Any attempted restart without verified reconciliation is fatal
 **OVERRIDES UNVERIFIED**, requiring authorized operator/TC-1161 fallback.
@@ -204,10 +378,13 @@ its branch policy before any workflow that names it runs.
    - `image_version` and recorded labels describe the immutable image,
      never an unrelated current crate version. The revision must be in
      main history. A future non-N0 digest uses this same contract.
-   - The reviewed N0 compose remains raw-hash locked to its exact image;
-     it cannot substitute a future security image. Before the later
-     logging window, the ordinary main `:dstack` compose supports forward
-     image promotions without installing the sidecar.
+   - The reviewed N0 compose is locked as a template: its raw bytes with
+     the single node digest normalized. Only a recorded *released* main
+     image may fill that pin; see
+     [Main release with N0 log shipping](#main-release-with-n0-log-shipping-one-dispatch).
+     Before #309 lands,
+     the ordinary main `:dstack` compose supports forward image
+     promotions without installing the sidecar.
    - `sql_identity_fence=false` is required. The input defaults to `true`,
      which re-fences SQL/DuckDB in production (503s).
    - The production ancestry guard still applies: the revision prod is running
@@ -265,6 +442,73 @@ its branch policy before any workflow that names it runs.
    `gh workflow run write-probe.yml -R TinyCloudLabs/tinycloud-node --ref main -f mode=dense`.
    Details: `test/probe/README.md`.
 
+### Main release with N0 log shipping (one dispatch)
+
+Ships a main release on #309's log sidecar compose. Before dispatching,
+`main` must contain the combined workflow lineage, #309, the template-lock
+change that also raises the ingress `CLIENT_MAX_BODY_SIZE` to `95m`, and the
+merged `chore(release): 1.21.0` commit tagged `v1.21.0`. Take the digest and
+labels of the tag build's `1.21.0-dstack` image as in step 1 above:
+
+```sh
+gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref main \
+  -f deploy_phala=true \
+  -f authorize_quota_values=true \
+  -f image_version=1.21.0 \
+  -f deploy_image_digest=sha256:<release-dstack-digest> \
+  -f rollback_image_version=1.21.0 \
+  -f rollback_image_revision=<release-commit-sha> \
+  -f sql_identity_fence=false
+```
+
+`rollback_image_version` and `rollback_image_revision` name the image being
+**deployed** (here the release), not an image to roll back to. Despite the
+input names, they are the recorded labels of `deploy_image_digest`.
+
+Before any CVM mutation the workflow requires:
+
+- the main compose, with its one node digest replaced by 64 zeros, to hash
+  to the reviewed N0 template
+  **`79469f97a8dcecc7856caa11b26e3004b36d4b8ae9e16a51f963d0687992b9fb`**
+  (raw `32a002ef5751817619423c9e60776e03f2c3517315f5aa3a9c8654e3394777f1` normalized; before the three `current_kv_c_index_*` warning codes in the Vector config (TC-1274 `current_kv` C-index migration) the template was `87b5d12a…`, raw `d1fcd665…`; before the optional TC-1482 `NODE_STATS_READ_TOKEN` env line and the TC-1482 route in the Vector config the template was `7fabba70…`, raw `1228d81927fc0a3fbba85745103e77b3112606f5d314d15974d400b222409350`: the 1.21.0 compose
+  `d95bfb707871c1d626c4a8f2b8d32d354103edbb5077847c6a21fe5f7f6cfa50`, template
+  `51f8e9e9…`, with only the embedded Vector config regenerated for TC-1274's,
+  TC-1317's and TC-1482's route and warning codes (TC-1274 and TC-1317 were template `7fabba70…`, raw `1228d819…`); TC-1274 alone was template `00938226…`, raw
+  `b25b8414…`. That compose is the #349 compose
+  `c33c23021589163b62a71ef245b7194717711922027629f155bdd5cff806b8c7`, which
+  keeps `TINYCLOUD_EPOCH_HEAD_BACKFILL__ENABLED: "false"`, with only
+  `CLIENT_MAX_BODY_SIZE=32m` → `95m`). Ingress, socat, Vector and the log
+  profile stay byte-exact;
+- the deployed compose to differ from that template only by
+  `deploy_image_digest`;
+- OCI labels `1.21.0-dstack` / `<release-commit-sha>`, the `v1.21.0` tag on
+  that commit, its `Cargo.toml` at `1.21.0`, and the commit in main history.
+  An untagged, mislabelled, feature-variant or freshly built image is
+  refused;
+- the release revision to be a **strict descendant** of the revision running
+  in production (read from the CVM's pinned image by the ancestry guard).
+  A downgrade (for example 1.20.5 or 1.0.0), the same revision as running,
+  or an unknown running revision is refused. The same ancestry rule makes
+  the 12c same-image command refuse an image older than the running
+  revision once 1.21.0 is live, so it cannot downgrade across migrations.
+  The captured pre-N0 rollback is the only intentional downgrade route.
+
+Sealed preflight, `BETTERSTACK_SOURCE_TOKEN` sealing with the
+`allowed_envs` sync, and the general quota reconciliation run as on every
+deploy. The template's comment naming 1.20.6 is reviewed text, not image
+identity; `/version` and the labels report the release. Reproduce the
+template hash from any ref:
+
+```sh
+git show main:docker-compose.dstack-postgres.yaml \
+  | sed -E '/^    image: ghcr\.io\/tinycloudlabs\/tinycloud-node@sha256:/s/[0-9a-f]{64}$/0000000000000000000000000000000000000000000000000000000000000000/' \
+  | sha256sum
+```
+
+Rolling this release back means a database snapshot restore (a separate
+decision) plus the [captured pre-N0 rollback](#tc-1302-captured-pre-n0-rollback)
+to 1.20.6 with Sam's explicit privacy mode.
+
 ## Rolling back
 
 Keep the digest, actual OCI version and actual revision of every promoted
@@ -294,12 +538,13 @@ gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref main \
 ```
 
 The served/OCI identity remains **1.20.6-dstack / e18578ff9162986ddd813259c60f73866e3e60d1**.
-The N0 raw lock is unchanged:
-`ca110b0bae6d5a06a1002fb80df3f71cffec11659c9f9dbfa5d72624735546f6`,
-from #309 reviewed head `44eeb20a1461ef66b5af492e3be4c42be2728b67`,
-[approval](https://github.com/TinyCloudLabs/tinycloud-node/pull/309#issuecomment-6224650050).
-Current pre-N0 tag/pinned equivalents are separately hash-checked; arbitrary
-same-image config substitutions fail before mutation.
+With the template lock on main this redeploys exactly main's raw compose
+`32a002ef5751817619423c9e60776e03f2c3517315f5aa3a9c8654e3394777f1`
+(the 1.21.0 compose `d95bfb70…` with the TC-1274, TC-1317, TC-1482 and `current_kv_c_index_*` Vector config and the optional TC-1482 `NODE_STATS_READ_TOKEN` env line), whatever digest
+main's template currently pins. It is not a rollback of a
+later release across a schema migration. Current pre-N0 tag/pinned
+equivalents are separately hash-checked; arbitrary same-image config
+substitutions fail before mutation.
 
 ### TC-1302 captured pre-N0 rollback
 

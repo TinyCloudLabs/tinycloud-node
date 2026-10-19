@@ -50,6 +50,8 @@ pub struct Config {
     pub share_email: ShareEmailConfig,
     #[serde(default)]
     pub retention: RetentionConfig,
+    #[serde(default)]
+    pub epoch_head_backfill: EpochHeadBackfillConfig,
 }
 
 /// Production exact-email composition.  The capability remains unavailable
@@ -922,6 +924,67 @@ impl Default for RetentionConfig {
     }
 }
 
+/// The online `epoch_head` backfill (TC-1274): one pass over every space
+/// after the node starts serving, rewriting a space's cached head epochs
+/// only when they are not provably current. Writes stay correct without it;
+/// it moves each space's one-time history scan off its first write.
+///
+/// On by default and deliberately slow. Section `[epoch_head_backfill]`;
+/// env `TINYCLOUD_EPOCH_HEAD_BACKFILL__ENABLED`,
+/// `TINYCLOUD_EPOCH_HEAD_BACKFILL__SPACES_PER_SECOND`,
+/// `TINYCLOUD_EPOCH_HEAD_BACKFILL__PROGRESS_EVERY`.
+#[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
+pub struct EpochHeadBackfillConfig {
+    #[serde(default = "default_epoch_head_backfill_enabled")]
+    pub enabled: bool,
+    /// Upper bound on spaces checked per second. After each space the task
+    /// also pauses at least as long as that space took.
+    #[serde(default = "default_epoch_head_backfill_spaces_per_second")]
+    pub spaces_per_second: u32,
+    /// Log a progress line every this many spaces.
+    #[serde(default = "default_epoch_head_backfill_progress_every")]
+    pub progress_every: u32,
+}
+
+fn default_epoch_head_backfill_enabled() -> bool {
+    true
+}
+
+fn default_epoch_head_backfill_spaces_per_second() -> u32 {
+    2
+}
+
+fn default_epoch_head_backfill_progress_every() -> u32 {
+    500
+}
+
+impl Default for EpochHeadBackfillConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_epoch_head_backfill_enabled(),
+            spaces_per_second: default_epoch_head_backfill_spaces_per_second(),
+            progress_every: default_epoch_head_backfill_progress_every(),
+        }
+    }
+}
+
+impl EpochHeadBackfillConfig {
+    /// The pacing fields matter only when the backfill runs, so a disabled
+    /// backfill accepts any values.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.spaces_per_second == 0 {
+            return Err("epoch_head_backfill.spaces_per_second must be at least 1; set enabled = false to turn the backfill off");
+        }
+        if self.progress_every == 0 {
+            return Err("epoch_head_backfill.progress_every must be at least 1");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq, Default)]
 #[serde(tag = "type")]
 pub enum Keys {
@@ -1024,10 +1087,55 @@ pub struct SqlStorageConfig {
     pub path: Option<String>,
     #[serde(default = "default_sql_memory_threshold")]
     pub memory_threshold: ByteUnit,
+    /// How long a SQL request waits for its database's operation lock
+    /// before answering `503 sql_busy: lock_wait` (TC-1274).
+    #[serde(default = "default_sql_lock_wait_timeout_ms")]
+    pub lock_wait_timeout_ms: u64,
+    /// How long a SQL request waits for its database to be hydrated before
+    /// answering `503 sql_busy: hydration` or `artifact_transfer`. The
+    /// hydration itself keeps going (see `hydration_max_ms`).
+    #[serde(default = "default_sql_hydration_wait_timeout_ms")]
+    pub hydration_wait_timeout_ms: u64,
+    /// How long a durable artifact load or save that a request awaits may
+    /// take before the request answers `sql_busy: artifact_transfer` (or
+    /// `outcome_unknown` if the save may have been applied).
+    #[serde(default = "default_sql_artifact_transfer_timeout_ms")]
+    pub artifact_transfer_timeout_ms: u64,
+    /// How long a hydration's own artifact load may take. It outlives the
+    /// callers that gave up on it, so the database still warms.
+    #[serde(default = "default_sql_hydration_max_ms")]
+    pub hydration_max_ms: u64,
 }
 
 fn default_sql_memory_threshold() -> ByteUnit {
     ByteUnit::Mebibyte(10)
+}
+
+fn default_sql_lock_wait_timeout_ms() -> u64 {
+    30_000
+}
+
+fn default_sql_hydration_wait_timeout_ms() -> u64 {
+    30_000
+}
+
+fn default_sql_artifact_transfer_timeout_ms() -> u64 {
+    45_000
+}
+
+fn default_sql_hydration_max_ms() -> u64 {
+    600_000
+}
+
+impl SqlStorageConfig {
+    pub fn wait_bounds(&self) -> tinycloud_core::sql::SqlWaitBounds {
+        tinycloud_core::sql::SqlWaitBounds {
+            lock_wait: Duration::from_millis(self.lock_wait_timeout_ms),
+            hydration_wait: Duration::from_millis(self.hydration_wait_timeout_ms),
+            artifact_transfer: Duration::from_millis(self.artifact_transfer_timeout_ms),
+            hydration_max: Duration::from_millis(self.hydration_max_ms),
+        }
+    }
 }
 
 impl Default for SqlStorageConfig {
@@ -1035,6 +1143,10 @@ impl Default for SqlStorageConfig {
         Self {
             path: None,
             memory_threshold: default_sql_memory_threshold(),
+            lock_wait_timeout_ms: default_sql_lock_wait_timeout_ms(),
+            hydration_wait_timeout_ms: default_sql_hydration_wait_timeout_ms(),
+            artifact_transfer_timeout_ms: default_sql_artifact_transfer_timeout_ms(),
+            hydration_max_ms: default_sql_hydration_max_ms(),
         }
     }
 }
@@ -1264,9 +1376,16 @@ pub struct DatabaseConfig {
     /// this window (~40 s) of connection-loss detection rather than two
     /// detections (~60 s). It is not a request or per-db lock deadline:
     /// acquisition waits, legitimate transfers and queueing behind the lock
-    /// add to it (the general deadline is later TC-1054 work).
+    /// add to it (those are bounded by `invocation.deadline_ms` and the
+    /// `storage.sql` wait bounds, TC-1274).
     #[serde(default = "default_database_retry_window_ms")]
     pub retry_window_ms: u64,
+    /// How long an authorized read waits for its audit record to commit
+    /// before it is answered `503 read_audit_busy` (TC-1317). Its data is
+    /// never returned without the record. Kept below `storage.sql`'s lock wait
+    /// and the `/invoke` deadline, so the typed answer comes first.
+    #[serde(default = "default_database_read_audit_wait_ms")]
+    pub read_audit_wait_ms: u64,
 }
 
 fn default_database_max_connections() -> u32 {
@@ -1313,6 +1432,10 @@ fn default_database_retry_window_ms() -> u64 {
     10_000
 }
 
+fn default_database_read_audit_wait_ms() -> u64 {
+    tinycloud_core::DEFAULT_READ_AUDIT_WAIT.as_millis() as u64
+}
+
 impl Default for DatabaseConfig {
     fn default() -> Self {
         Self {
@@ -1329,6 +1452,7 @@ impl Default for DatabaseConfig {
             tcp_keepalive_retries: default_database_tcp_keepalive_retries(),
             tcp_user_timeout_ms: default_database_tcp_user_timeout_ms(),
             retry_window_ms: default_database_retry_window_ms(),
+            read_audit_wait_ms: default_database_read_audit_wait_ms(),
         }
     }
 }
@@ -1344,6 +1468,15 @@ pub struct DidResolutionConfig {
 }
 
 impl DatabaseConfig {
+    /// Reject settings that would make the node unusable (TC-1317): a zero
+    /// read-audit wait would answer every authorized read `read_audit_busy`.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.read_audit_wait_ms == 0 {
+            return Err("database.read_audit_wait_ms must be greater than zero");
+        }
+        Ok(())
+    }
+
     /// The pool's PostgreSQL `statement_timeout` policy.
     pub fn statement_timeouts(&self) -> StatementTimeouts {
         StatementTimeouts {
@@ -1384,16 +1517,33 @@ pub struct InvocationConfig {
     /// rows arbitrarily far into the future.
     #[serde(default = "default_invocation_max_lifetime_secs")]
     pub max_lifetime_secs: u64,
+    /// `/invoke` deadline in milliseconds (TC-1274); zero turns it off. A
+    /// request that has not begun a write by then is stopped and answered
+    /// `503 request_timeout`; one that has completes and reports its outcome.
+    /// The default sits below the ingress's 60 s, so the node answers first.
+    #[serde(default = "default_invocation_deadline_ms")]
+    pub deadline_ms: u64,
 }
 
 fn default_invocation_max_lifetime_secs() -> u64 {
     300
 }
 
+fn default_invocation_deadline_ms() -> u64 {
+    55_000
+}
+
+impl InvocationConfig {
+    pub fn deadline(&self) -> Option<Duration> {
+        (self.deadline_ms > 0).then(|| Duration::from_millis(self.deadline_ms))
+    }
+}
+
 impl Default for InvocationConfig {
     fn default() -> Self {
         Self {
             max_lifetime_secs: default_invocation_max_lifetime_secs(),
+            deadline_ms: default_invocation_deadline_ms(),
         }
     }
 }
@@ -1450,6 +1600,47 @@ mod tests {
             let mut config = Config::default();
             config.hooks.webhook_max_attempts = attempts;
             assert!(crate::resolve_runtime_config(&config).is_err());
+        }
+    }
+
+    /// TC-1317: a zero read-audit wait would answer every read busy, so the
+    /// node refuses to start with it.
+    #[test]
+    fn tc1317_startup_rejects_a_zero_read_audit_wait() {
+        for (wait_ms, ok) in [(0, false), (1, true), (20_000, true)] {
+            let mut config = Config::default();
+            config.database.read_audit_wait_ms = wait_ms;
+            assert_eq!(
+                crate::resolve_runtime_config(&config).is_ok(),
+                ok,
+                "{wait_ms}"
+            );
+        }
+    }
+
+    /// TC-1274: a running backfill needs a positive rate and progress
+    /// interval; a disabled one boots whatever its pacing says.
+    #[test]
+    fn epoch_head_backfill_pacing_is_checked_only_when_enabled() {
+        for (enabled, spaces_per_second, progress_every, ok) in [
+            (true, 1, 1, true),
+            (true, 0, 500, false),
+            (true, 2, 0, false),
+            (false, 0, 0, true),
+        ] {
+            let config = Config {
+                epoch_head_backfill: EpochHeadBackfillConfig {
+                    enabled,
+                    spaces_per_second,
+                    progress_every,
+                },
+                ..Config::default()
+            };
+            assert_eq!(
+                crate::resolve_runtime_config(&config).is_ok(),
+                ok,
+                "enabled {enabled}, {spaces_per_second}/s, every {progress_every}"
+            );
         }
     }
 

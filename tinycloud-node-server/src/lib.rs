@@ -27,9 +27,11 @@ use std::{
 pub mod allow_list;
 pub mod auth_guards;
 pub mod authorization;
+pub mod cli;
 pub mod config;
 pub mod dstack;
 pub mod egress;
+pub mod epoch_head_backfill;
 pub mod hooks;
 pub mod invocation_replay;
 pub mod link;
@@ -105,6 +107,7 @@ use config::{BlockStorage, Config, Keys, StagingStorage};
 use hooks::HookRuntime;
 use invocation_replay::InvocationReplayCache;
 use node_control::control::ControlPlaneHandle;
+use node_control::key_provider::{self, IdentityPurpose};
 use policy_v3::{
     authorize_delivery as authorize_policy_v3_delivery, challenge as policy_v3_challenge,
     get_status as get_policy_v3_status, issue_enforcer_binding as policy_v3_enforcer_binding,
@@ -120,6 +123,7 @@ use routes::tc_bench::{
 };
 use routes::{
     admin::{delete_quota, get_quota, get_usage, list_quotas, set_quota},
+    admin_stats::get_stats,
     attestation::attestation,
     create_signed_kv_url, delegate, delegation_query, delegation_status,
     encryption::{
@@ -424,6 +428,11 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
 pub fn resolve_runtime_config(tinycloud_config: &Config) -> Result<Config> {
     let mut resolved = tinycloud_config.clone();
     resolved.hooks.validate().map_err(anyhow::Error::msg)?;
+    resolved.database.validate().map_err(anyhow::Error::msg)?;
+    resolved
+        .epoch_head_backfill
+        .validate()
+        .map_err(anyhow::Error::msg)?;
     tracing::RequestIdOrigins::new(&resolved.log.request_id_first_party_origins)
         .map_err(anyhow::Error::msg)?;
     resolved.storage.resolve();
@@ -471,6 +480,7 @@ fn production_routes() -> Vec<Route> {
         get_quota,
         list_quotas,
         get_usage,
+        get_stats,
         create_encryption_network,
         get_encryption_network,
         encryption_well_known,
@@ -548,7 +558,28 @@ pub async fn app_with_control(
         tc_bench_health,
     ]);
 
-    let key_setup: StaticSecret = resolve_keys(&tinycloud_config.keys).await?;
+    let key_setup: StaticSecret =
+        match resolve_keys(&tinycloud_config.keys, &tinycloud_config.tee).await? {
+            Some(key_setup) => key_setup,
+            None => {
+                // The node's stored identity, generated on its first start. The
+                // control plane only probed it at spawn, so publish what serve
+                // resolved.
+                let identity = key_provider::resolve_identity_state(
+                    Some(&tinycloud_config.keys),
+                    &tinycloud_config.storage.datadir,
+                    IdentityPurpose::Serve,
+                )?;
+                if let Some(control) = control.as_ref() {
+                    control
+                        .set_identity_snapshot(key_provider::identity_snapshot(&identity))
+                        .await;
+                }
+                identity
+                    .secret
+                    .ok_or_else(|| anyhow::anyhow!("node identity is not ready"))?
+            }
+        };
     let pseudonymizer =
         std::sync::Arc::new(tinycloud_core::telemetry::Pseudonymizer::new(&key_setup));
     let tracing_fairing = tracing::TracingFairing::new(
@@ -641,6 +672,9 @@ pub async fn app_with_control(
     )
     .await?
     .with_sql_sizes(sql_sizes.clone());
+    tinycloud.set_read_audit_wait(Duration::from_millis(
+        tinycloud_config.database.read_audit_wait_ms,
+    ));
     let encryption_service =
         encryption_service.with_sqlite_writer_lock(tinycloud.sqlite_writer_lock());
     let database_artifact_repository: Arc<dyn DatabaseArtifactRepository> =
@@ -669,7 +703,8 @@ pub async fn app_with_control(
         tinycloud_config.storage.sql.path.clone().expect("resolved"),
         tinycloud_config.storage.sql.memory_threshold.as_u64(),
         database_artifact_repository.clone(),
-    );
+    )
+    .with_wait_bounds(tinycloud_config.storage.sql.wait_bounds());
 
     let mut policy_v3_runtime =
         PolicyV3Runtime::new(seed_conn.clone(), key_setup.node_did(), key_setup.clone())
@@ -735,6 +770,7 @@ pub async fn app_with_control(
     // is moved into Rocket-managed state below.
     let telemetry_enabled = tinycloud_config.telemetry.enabled;
     let telemetry_tinycloud = tinycloud.clone();
+    let backfill_tinycloud = tinycloud.clone();
 
     let rocket = rocket::custom(config)
         .attach(AdHoc::on_liftoff("webhook-egress-refresh", {
@@ -840,6 +876,24 @@ pub async fn app_with_control(
         rocket
     };
 
+    // TC-1274: one gentle pass that fills the `epoch_head` cache of spaces
+    // written before it existed. Writes stay correct without it.
+    let rocket = if tinycloud_config.epoch_head_backfill.enabled {
+        let backfill_config = tinycloud_config.epoch_head_backfill.clone();
+        rocket.attach(AdHoc::on_liftoff("epoch-head-backfill", move |rocket| {
+            let tinycloud = backfill_tinycloud.clone();
+            let backfill_config = backfill_config.clone();
+            let shutdown = rocket.shutdown();
+            Box::pin(async move {
+                tokio::spawn(async move {
+                    epoch_head_backfill::run(&tinycloud, &backfill_config, shutdown).await;
+                });
+            })
+        }))
+    } else {
+        rocket
+    };
+
     // TC-326: pool + read-audit telemetry sampler. Gated on telemetry.enabled;
     // an on-liftoff task that samples the DB pool gauges, probes pool-acquire
     // latency, and advances the read-audit commit counters every 5 seconds,
@@ -852,7 +906,7 @@ pub async fn app_with_control(
             let shutdown = rocket.shutdown();
             Box::pin(async move {
                 tokio::spawn(async move {
-                    let mut last_read_audit = (0u64, 0u64);
+                    let mut last_read_audit = tinycloud_core::ReadAuditHealth::default();
                     let period = std::time::Duration::from_secs(5);
                     let mut interval =
                         tokio::time::interval_at(tokio::time::Instant::now() + period, period);
@@ -903,15 +957,68 @@ pub async fn app_with_control(
         .first()
         .cloned()
         .unwrap_or_else(|| tinycloud_config.share_email.return_origin.clone());
-    let rocket = rocket
-        .attach(share_security_fairing(share_allowed_origin))
-        .attach(retry_after_fairing());
+    let rocket = attach_response_fairings(rocket, share_allowed_origin);
 
     if tinycloud_config.cors {
         Ok(rocket.attach(cors_fairing()))
     } else {
         Ok(rocket)
     }
+}
+
+/// The response fairings every node mounts, in the order they must run.
+///
+/// [`no_transform_fairing`] runs after [`share_security_fairing`] because that
+/// fairing replaces `Cache-Control` on the share paths.
+fn attach_response_fairings(rocket: Rocket<Build>, share_allowed_origin: String) -> Rocket<Build> {
+    rocket
+        .attach(share_security_fairing(share_allowed_origin))
+        .attach(retry_after_fairing())
+        .attach(no_transform_fairing())
+}
+
+/// `Cache-Control: no-transform` on every response that carries an `ETag`
+/// (TC-1432).
+///
+/// A CDN that re-encodes a response (gzip/brotli) must turn a strong `ETag`
+/// into a weak one (RFC 9110 8.8.3), and a weak `ETag` is refused by `If-Match`
+/// (RFC 9110 13.1.1). TinyCloud's KV compare-and-swap needs the strong
+/// `"blake3-<hex>"` value to survive the edge, so the node forbids the
+/// re-encoding. Existing `Cache-Control` directives are kept. Responses
+/// without an `ETag` are untouched.
+fn no_transform_fairing() -> AdHoc {
+    AdHoc::on_response("etag-no-transform", |_, response| {
+        Box::pin(async move { add_no_transform_to_etag_response(response) })
+    })
+}
+
+fn add_no_transform_to_etag_response(response: &mut rocket::Response<'_>) {
+    if !response.headers().contains("ETag") {
+        return;
+    }
+    let existing: Vec<String> = response
+        .headers()
+        .get("Cache-Control")
+        .map(str::to_owned)
+        .collect();
+    let has_no_transform = existing.iter().any(|value| {
+        value.split(',').any(|directive| {
+            directive
+                .split('=')
+                .next()
+                .is_some_and(|name| name.trim().eq_ignore_ascii_case("no-transform"))
+        })
+    });
+    if has_no_transform {
+        return;
+    }
+    let mut directives: Vec<&str> = existing
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .collect();
+    directives.push("no-transform");
+    response.set_header(Header::new("Cache-Control", directives.join(", ")));
 }
 
 /// How long, in seconds, a browser may reuse a CORS preflight result for the
@@ -924,12 +1031,13 @@ pub async fn app_with_control(
 /// preflight after the policy in [`cors_fairing`] is tightened.
 const CORS_PREFLIGHT_MAX_AGE_SECS: u32 = 7200;
 
-/// `Retry-After` on a database failure that is safe to retry (TC-1054).
+/// `Retry-After` on a failure that is safe to retry (TC-1054, TC-1274).
 ///
-/// Routes report database failures as plain-text `(Status, String)`; a
-/// retryable one is a `503` whose body starts with
-/// [`routes::UNAVAILABLE_RETRYABLE`]. Other `503`s (cutover fence, missing
-/// configuration) and the `500` [`routes::OUTCOME_UNKNOWN`] get no header.
+/// Routes report these as plain-text `(Status, String)` `503`s whose body
+/// starts with [`routes::UNAVAILABLE_RETRYABLE`] or
+/// [`routes::REQUEST_TIMEOUT`] (`Retry-After: 1`), or [`routes::SQL_BUSY`]
+/// (`Retry-After: 5`). Other `503`s (cutover fence, missing configuration)
+/// and the `500` [`routes::OUTCOME_UNKNOWN`] get no header.
 fn retry_after_fairing() -> AdHoc {
     AdHoc::on_response("Retry-After", |_, resp| {
         Box::pin(async move {
@@ -939,11 +1047,19 @@ fn retry_after_fairing() -> AdHoc {
             let Ok(body) = resp.body_mut().to_string().await else {
                 return;
             };
-            if body.starts_with(routes::UNAVAILABLE_RETRYABLE) {
-                resp.set_header(Header::new(
-                    "Retry-After",
-                    routes::RETRY_AFTER_SECS.to_string(),
-                ));
+            let retry_after = if body.starts_with(routes::SQL_BUSY)
+                || body.starts_with(routes::READ_AUDIT_BUSY)
+            {
+                Some(routes::SQL_BUSY_RETRY_AFTER_SECS)
+            } else if body.starts_with(routes::UNAVAILABLE_RETRYABLE)
+                || body.starts_with(routes::REQUEST_TIMEOUT)
+            {
+                Some(routes::RETRY_AFTER_SECS)
+            } else {
+                None
+            };
+            if let Some(secs) = retry_after {
+                resp.set_header(Header::new("Retry-After", secs.to_string()));
             }
             resp.set_sized_body(body.len(), std::io::Cursor::new(body));
         })
@@ -1060,9 +1176,9 @@ mod production_route_tests {
 }
 
 /// One telemetry sample tick: update the DB pool gauges, probe pool-acquire
-/// latency (the `DbPoolAcquire` span), and advance the cumulative read-audit
-/// counters. `last_read_audit` carries the previous cumulative
-/// `(records, batches)` so the monotonic counters advance by deltas.
+/// latency (the `DbPoolAcquire` span), and update the read-audit metrics.
+/// `last_read_audit` carries the previous cumulative counts so the monotonic
+/// counters advance by deltas.
 ///
 /// sea-orm couples pool acquisition with `BEGIN` on the generic connection, so
 /// the request-path `DbTxBegin` span cannot separate the two. This sampler is
@@ -1071,7 +1187,7 @@ mod production_route_tests {
 async fn sample_db_telemetry(
     conn: &RecoveringConnection,
     tinycloud: &TinyCloud,
-    last_read_audit: &mut (u64, u64),
+    last_read_audit: &mut tinycloud_core::ReadAuditHealth,
 ) {
     use tinycloud_core::sea_orm::{ConnectionTrait, DatabaseBackend};
 
@@ -1096,12 +1212,9 @@ async fn sample_db_telemetry(
         DatabaseBackend::MySql => sample_pool!(pool.get_mysql_connection_pool()),
     }
 
-    let (records, batches) = tinycloud.read_audit_commit_stats();
-    crate::prometheus::add_read_audit_stats(
-        records.saturating_sub(last_read_audit.0),
-        batches.saturating_sub(last_read_audit.1),
-    );
-    *last_read_audit = (records, batches);
+    let read_audit = tinycloud.read_audit_health();
+    crate::prometheus::observe_read_audit(last_read_audit, &read_audit);
+    *last_read_audit = read_audit;
 }
 
 /// Run one retention sweep: prune terminal hook deliveries and expired signed
@@ -1182,13 +1295,23 @@ async fn run_retention_sweep<C: tinycloud_core::sea_orm::ConnectionTrait>(
     }
 }
 
-pub(crate) async fn resolve_keys(keys: &Keys) -> Result<StaticSecret> {
+/// The node key from a Static or dstack key source. `None` means the key is
+/// the node's stored identity: provider keys, and Auto outside a TEE. Where
+/// the environment indicates a dstack TEE, provider keys always refuse and
+/// Auto refuses when no dstack key is available, so a TEE node never runs
+/// under a local DID. For Auto, `TINYCLOUD_TEE_MODE=off` is checked first and
+/// opts out of TEE detection.
+pub(crate) async fn resolve_keys(
+    keys: &Keys,
+    tee: &config::TeeConfig,
+) -> Result<Option<StaticSecret>> {
     match keys {
-        Keys::Static(s) => Ok(s.clone().try_into()?),
+        Keys::Static(s) => Ok(Some(s.clone().try_into()?)),
         #[cfg(feature = "dstack")]
         Keys::Dstack => {
             let key_bytes = dstack::get_key("tinycloud/keys/primary").await?;
             StaticSecret::new(key_bytes)
+                .map(Some)
                 .map_err(|v| anyhow::anyhow!("dstack key too short: {} bytes", v.len()))
         }
         Keys::Auto => {
@@ -1198,36 +1321,76 @@ pub(crate) async fn resolve_keys(keys: &Keys) -> Result<StaticSecret> {
                 Some("dstack") => {
                     let key_bytes = dstack::get_key("tinycloud/keys/primary").await?;
                     StaticSecret::new(key_bytes)
+                        .map(Some)
                         .map_err(|v| anyhow::anyhow!("dstack key too short: {} bytes", v.len()))
                 }
-                Some("off") => {
-                    anyhow::bail!(
-                        "TEE mode disabled but no static key configured. \
-                         Set TINYCLOUD_KEYS_SECRET or configure [keys] in config."
-                    )
-                }
+                Some("off") => Ok(None),
                 _ => {
                     // Auto-detect: check for dstack socket
                     #[cfg(feature = "dstack")]
                     if dstack::is_available() {
                         ::tracing::info!("dstack socket detected, using TEE key derivation");
                         let key_bytes = dstack::get_key("tinycloud/keys/primary").await?;
-                        return StaticSecret::new(key_bytes).map_err(|v| {
+                        return StaticSecret::new(key_bytes).map(Some).map_err(|v| {
                             anyhow::anyhow!("dstack key too short: {} bytes", v.len())
                         });
                     }
-                    anyhow::bail!(
-                        "No key source configured. Either:\n  \
-                         - Set TINYCLOUD_KEYS_SECRET environment variable\n  \
-                         - Configure [keys] section in tinycloud.toml\n  \
-                         - Run inside a dstack TEE (with 'dstack' feature enabled)"
-                    )
+                    if let Some(hint) = dstack_indication(tee) {
+                        anyhow::bail!(
+                            "refusing to create a new node identity: {hint} indicates a dstack TEE, \
+                             but no dstack key is available (socket {}{}). Start the node with its \
+                             dstack socket, or remove {hint} if this host is not a TEE.",
+                            dstack::socket_path(),
+                            if cfg!(feature = "dstack") {
+                                ""
+                            } else {
+                                "; this build has no dstack support"
+                            },
+                        );
+                    }
+                    Ok(None)
                 }
             }
         }
-        Keys::Provider => anyhow::bail!(
-            "provider key mode must be resolved through the node control key-provider path"
-        ),
+        Keys::Provider => {
+            if let Some(hint) = dstack_indication(tee) {
+                anyhow::bail!(
+                    "refusing keys.type = provider: {hint} indicates a dstack TEE, where the node \
+                     key must come from dstack. Use keys.type = Dstack, or remove {hint} if this \
+                     host is not a TEE."
+                );
+            }
+            Ok(None)
+        }
+    }
+}
+
+/// Why the environment looks like a dstack deployment, if it does: the TEE
+/// mode the node reads, the key type dstack deployments set, an explicit
+/// dstack socket, or a dstack socket this build cannot use. Variable names
+/// match case-insensitively, as figment's `TINYCLOUD_` prefix does.
+fn dstack_indication(tee: &config::TeeConfig) -> Option<&'static str> {
+    let env_is_dstack = |name: &str| {
+        std::env::vars_os().any(|(key, value)| {
+            key.to_str()
+                .is_some_and(|key| key.eq_ignore_ascii_case(name))
+                && value
+                    .to_str()
+                    .is_some_and(|value| value.eq_ignore_ascii_case("dstack"))
+        })
+    };
+    if env_is_dstack("TINYCLOUD_TEE_MODE") {
+        Some("TINYCLOUD_TEE_MODE=dstack")
+    } else if tee.mode == config::TeeMode::Dstack {
+        Some("tee.mode = \"Dstack\"")
+    } else if env_is_dstack("TINYCLOUD_KEYS_TYPE") || env_is_dstack("TINYCLOUD_KEYS__TYPE") {
+        Some("TINYCLOUD_KEYS_TYPE=Dstack")
+    } else if std::env::var_os("DSTACK_SIMULATOR_ENDPOINT").is_some() {
+        Some("DSTACK_SIMULATOR_ENDPOINT")
+    } else if dstack::is_available() {
+        Some("the dstack socket")
+    } else {
+        None
     }
 }
 
@@ -1675,6 +1838,29 @@ mod retry_after_fairing_tests {
         )
     }
 
+    #[get("/busy")]
+    fn busy() -> (Status, String) {
+        let error =
+            tinycloud_core::sql::SqlError::Busy(tinycloud_core::sql::SqlBusyStage::LockWait);
+        (Status::ServiceUnavailable, error.to_string())
+    }
+
+    #[get("/timeout")]
+    fn timeout() -> (Status, String) {
+        (
+            Status::ServiceUnavailable,
+            routes::REQUEST_TIMEOUT_BODY.to_string(),
+        )
+    }
+
+    #[get("/read-audit-busy")]
+    fn read_audit_busy() -> (Status, String) {
+        (
+            Status::ServiceUnavailable,
+            tinycloud_core::ReadAuditError::Busy.to_string(),
+        )
+    }
+
     /// TC-1054: clients tell a retryable database failure (503,
     /// `unavailable_retryable`, `Retry-After`) from one whose write may have
     /// applied (500, `outcome_unknown`, no `Retry-After`); CORS still applies.
@@ -1682,7 +1868,10 @@ mod retry_after_fairing_tests {
     async fn only_retryable_database_failures_carry_retry_after() {
         let client = Client::tracked(
             rocket::build()
-                .mount("/", routes![retryable, unknown, fenced])
+                .mount(
+                    "/",
+                    routes![retryable, unknown, fenced, busy, timeout, read_audit_busy],
+                )
                 .attach(retry_after_fairing())
                 .attach(cors_fairing()),
         )
@@ -1699,6 +1888,23 @@ mod retry_after_fairing_tests {
         let body = response.into_string().await.unwrap();
         assert_eq!(body, "unavailable_retryable: pool exhausted", "body kept");
 
+        // TC-1274, TC-1317: a busy database or a backlogged read audit asks
+        // for a longer pause than a request that timed out before writing.
+        for (path, retry_after) in [("/busy", "5"), ("/read-audit-busy", "5"), ("/timeout", "1")] {
+            let response = client.get(path).dispatch().await;
+            assert_eq!(response.status(), Status::ServiceUnavailable, "{path}");
+            assert_eq!(
+                response.headers().get_one("Retry-After"),
+                Some(retry_after),
+                "{path}"
+            );
+            assert_eq!(
+                response.headers().get_one("Access-Control-Allow-Origin"),
+                Some("*"),
+                "{path}"
+            );
+        }
+
         for path in ["/unknown", "/fenced"] {
             let response = client.get(path).dispatch().await;
             assert!(
@@ -1711,6 +1917,429 @@ mod retry_after_fairing_tests {
                 "{path}"
             );
             assert!(!response.into_string().await.unwrap().is_empty(), "{path}");
+        }
+    }
+
+    /// An artifact store that never answers, so a cold SQL database never
+    /// finishes hydrating.
+    struct StalledArtifacts;
+
+    #[async_trait::async_trait]
+    impl tinycloud_core::database_artifacts::DatabaseArtifactRepository for StalledArtifacts {
+        async fn load(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<
+            Option<tinycloud_core::database_artifacts::DatabaseArtifact>,
+            tinycloud_core::database_artifacts::DatabaseArtifactError,
+        > {
+            std::future::pending().await
+        }
+
+        async fn save(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: Vec<u8>,
+            _: tinycloud_core::database_artifacts::ArtifactExpectation,
+        ) -> Result<
+            tinycloud_core::database_artifacts::DatabaseArtifact,
+            tinycloud_core::database_artifacts::DatabaseArtifactError,
+        > {
+            std::future::pending().await
+        }
+
+        async fn save_delta(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: Vec<u8>,
+            _: tinycloud_core::database_artifacts::ArtifactExpectation,
+        ) -> Result<
+            tinycloud_core::database_artifacts::DeltaSave,
+            tinycloud_core::database_artifacts::DatabaseArtifactError,
+        > {
+            std::future::pending().await
+        }
+    }
+
+    /// A SQL read through the `/invoke` deadline wrapper and the real SQL
+    /// service, as the route runs it.
+    #[rocket::post("/stalled-sql")]
+    async fn stalled_sql(
+        config: &rocket::State<crate::config::Config>,
+        sql: &rocket::State<tinycloud_core::sql::SqlService>,
+        space: &rocket::State<tinycloud_auth::resource::SpaceId>,
+    ) -> Result<String, routes::InvokeError> {
+        routes::with_invoke_deadline(
+            config,
+            Box::pin(async move {
+                sql.execute(
+                    space,
+                    "a",
+                    tinycloud_core::sql::SqlRequest::Query {
+                        sql: "SELECT 1".into(),
+                        params: Vec::new(),
+                        max_rows: None,
+                        max_bytes: None,
+                    },
+                    None,
+                    "tinycloud.sql/read".into(),
+                )
+                .await
+                .map(|_| "served".to_string())
+                .map_err(|error| (routes::sql_error_to_status(&error), error.to_string()).into())
+            }),
+        )
+        .await
+    }
+
+    /// TC-1274: over HTTP, a SQL request stalled in hydration is answered at
+    /// the deadline with `503 request_timeout`, `Retry-After: 1` and CORS.
+    #[tokio::test]
+    async fn a_stalled_sql_request_is_answered_at_its_deadline() {
+        use tinycloud_auth::{
+            resolver::DID_METHODS,
+            ssi::{dids::DIDBuf, jwk::JWK},
+        };
+        let jwk = JWK::generate_ed25519().unwrap();
+        let did: DIDBuf = DID_METHODS.generate(&jwk, "key").unwrap();
+        let space = tinycloud_auth::resource::SpaceId::new(did, "default".parse().unwrap());
+        let cache = tempfile::TempDir::new().unwrap();
+        let sql = tinycloud_core::sql::SqlService::new(
+            cache.path().to_string_lossy().into_owned(),
+            u64::MAX,
+            std::sync::Arc::new(StalledArtifacts),
+        );
+        let mut config = crate::config::Config::default();
+        config.invocation.deadline_ms = 300;
+        let client = Client::tracked(
+            rocket::build()
+                .mount("/", rocket::routes![stalled_sql])
+                .manage(config)
+                .manage(sql)
+                .manage(space)
+                .attach(retry_after_fairing())
+                .attach(cors_fairing()),
+        )
+        .await
+        .expect("valid Rocket instance");
+
+        let started = std::time::Instant::now();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.post("/stalled-sql").dispatch(),
+        )
+        .await
+        .expect("the deadline must answer the request");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(response.status(), Status::ServiceUnavailable);
+        assert_eq!(response.headers().get_one("Retry-After"), Some("1"));
+        assert_eq!(
+            response.headers().get_one("Access-Control-Allow-Origin"),
+            Some("*")
+        );
+        assert_eq!(
+            response.into_string().await.unwrap(),
+            routes::REQUEST_TIMEOUT_BODY
+        );
+    }
+}
+
+/// TC-1432: every `ETag`-bearing response forbids CDN re-encoding, which would
+/// weaken the strong `ETag` that `If-Match` compare-and-swap needs.
+#[cfg(test)]
+mod no_transform_fairing_tests {
+    use super::attach_response_fairings;
+    use crate::{auth_guards::KVResponse, signed_urls::SignedKvReadResponse};
+    use futures::io::Cursor;
+    use rocket::{
+        get,
+        http::{Header, Status},
+        local::asynchronous::Client,
+        response::Response,
+        routes,
+    };
+    use std::collections::BTreeMap;
+    use tinycloud_core::{hash::hash, storage::Content, types::Metadata};
+
+    const ETAG: &str =
+        "\"blake3-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"";
+
+    struct Stub(Response<'static>);
+
+    impl<'r> rocket::response::Responder<'r, 'static> for Stub {
+        fn respond_to(self, _: &'r rocket::Request<'_>) -> rocket::response::Result<'static> {
+            Ok(self.0)
+        }
+    }
+
+    fn stub(
+        etag: bool,
+        cache_control: &'static [&'static str],
+        status: Status,
+    ) -> Response<'static> {
+        let mut response = Response::build();
+        response.status(status);
+        if etag {
+            response.header(Header::new("ETag", ETAG));
+        }
+        for value in cache_control {
+            response.header_adjoin(Header::new("Cache-Control", *value));
+        }
+        response
+            .sized_body(2, std::io::Cursor::new("ok"))
+            .finalize()
+    }
+
+    #[get("/etag")]
+    fn etag_only() -> Stub {
+        Stub(stub(true, &[], Status::Ok))
+    }
+
+    #[get("/etag-private")]
+    fn etag_private() -> Stub {
+        Stub(stub(true, &["private, no-cache"], Status::Ok))
+    }
+
+    #[get("/etag-no-store")]
+    fn etag_no_store() -> Stub {
+        Stub(stub(true, &["no-store"], Status::Ok))
+    }
+
+    #[get("/etag-two-headers")]
+    fn etag_two_headers() -> Stub {
+        Stub(stub(true, &["private", "max-age=0"], Status::Ok))
+    }
+
+    #[get("/etag-already")]
+    fn etag_already() -> Stub {
+        Stub(stub(true, &["No-Transform, private"], Status::Ok))
+    }
+
+    #[get("/etag-empty-cache-control")]
+    fn etag_empty_cache_control() -> Stub {
+        Stub(stub(true, &[""], Status::Ok))
+    }
+
+    #[get("/etag-304")]
+    fn etag_not_modified() -> Stub {
+        Stub(stub(true, &["private, no-cache"], Status::NotModified))
+    }
+
+    #[get("/etag-412")]
+    fn etag_precondition_failed() -> Stub {
+        Stub(stub(true, &["private"], Status::PreconditionFailed))
+    }
+
+    #[get("/plain")]
+    fn plain() -> Stub {
+        Stub(stub(false, &[], Status::Ok))
+    }
+
+    #[get("/plain-cache")]
+    fn plain_cache() -> Stub {
+        Stub(stub(false, &["public, max-age=60"], Status::Ok))
+    }
+
+    #[get("/policy/v3/etag")]
+    fn share_path_etag() -> Stub {
+        Stub(stub(true, &["public, max-age=60"], Status::Ok))
+    }
+
+    #[get("/policy/v3/plain")]
+    fn share_path_plain() -> Stub {
+        Stub(stub(false, &[], Status::Ok))
+    }
+
+    #[get("/kv")]
+    fn kv() -> KVResponse<Cursor<Vec<u8>>> {
+        let content = b"hello".to_vec();
+        KVResponse::new(
+            Metadata(BTreeMap::new()),
+            hash(&content),
+            Content::new(content.len() as u64, Cursor::new(content)),
+        )
+    }
+
+    #[get("/signed/<variant>")]
+    fn signed(variant: &str) -> SignedKvReadResponse<Cursor<Vec<u8>>> {
+        let hash = hash(b"hello world");
+        let metadata = Metadata(BTreeMap::new());
+        match variant {
+            "full" => SignedKvReadResponse::Full {
+                metadata,
+                hash,
+                content: Content::new(11, Cursor::new(b"hello world".to_vec())),
+            },
+            _ => SignedKvReadResponse::Unsatisfiable {
+                hash,
+                total_size: 11,
+            },
+        }
+    }
+
+    async fn client() -> Client {
+        Client::tracked(attach_response_fairings(
+            rocket::build().mount(
+                "/",
+                routes![
+                    etag_only,
+                    etag_private,
+                    etag_no_store,
+                    etag_two_headers,
+                    etag_already,
+                    etag_empty_cache_control,
+                    etag_not_modified,
+                    etag_precondition_failed,
+                    plain,
+                    plain_cache,
+                    share_path_etag,
+                    share_path_plain,
+                    kv,
+                    signed,
+                ],
+            ),
+            "https://share.tinycloud.xyz".into(),
+        ))
+        .await
+        .expect("valid Rocket instance")
+    }
+
+    async fn cache_control(client: &Client, path: &str) -> (Status, Vec<String>, bool) {
+        let response = client.get(path).dispatch().await;
+        let status = response.status();
+        let values = response
+            .headers()
+            .get("Cache-Control")
+            .map(str::to_owned)
+            .collect();
+        let etag = response.headers().get_one("ETag").is_some();
+        (status, values, etag)
+    }
+
+    #[tokio::test]
+    async fn etag_response_without_cache_control_gets_no_transform() {
+        let client = client().await;
+        let response = client.get("/etag").dispatch().await;
+        assert_eq!(response.status(), Status::Ok);
+        assert_eq!(response.headers().get_one("ETag"), Some(ETAG));
+        assert_eq!(
+            response.headers().get_one("Cache-Control"),
+            Some("no-transform")
+        );
+        assert_eq!(response.into_string().await.as_deref(), Some("ok"));
+    }
+
+    #[tokio::test]
+    async fn existing_cache_control_directives_are_preserved() {
+        let client = client().await;
+        for (path, expected) in [
+            ("/etag-private", "private, no-cache, no-transform"),
+            ("/etag-no-store", "no-store, no-transform"),
+            ("/etag-two-headers", "private, max-age=0, no-transform"),
+            ("/etag-empty-cache-control", "no-transform"),
+        ] {
+            let (status, values, etag) = cache_control(&client, path).await;
+            assert_eq!(status, Status::Ok, "{path}");
+            assert!(etag, "{path}");
+            assert_eq!(values, vec![expected.to_string()], "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_existing_no_transform_is_not_duplicated() {
+        let client = client().await;
+        let (_, values, _) = cache_control(&client, "/etag-already").await;
+        assert_eq!(values, vec!["No-Transform, private".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn not_modified_and_precondition_failed_etag_responses_get_no_transform() {
+        let client = client().await;
+        for (path, status) in [
+            ("/etag-304", Status::NotModified),
+            ("/etag-412", Status::PreconditionFailed),
+        ] {
+            let (got, values, etag) = cache_control(&client, path).await;
+            assert_eq!(got, status, "{path}");
+            assert!(etag, "{path}");
+            assert_eq!(values.len(), 1, "{path}");
+            assert!(values[0].ends_with(", no-transform"), "{path}: {values:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_without_an_etag_are_unchanged() {
+        let client = client().await;
+        let (_, values, etag) = cache_control(&client, "/plain").await;
+        assert!(values.is_empty() && !etag);
+        let (_, values, etag) = cache_control(&client, "/plain-cache").await;
+        assert_eq!(values, vec!["public, max-age=60".to_string()]);
+        assert!(!etag);
+        // An absent route (404 catcher) carries no ETag either.
+        let (status, values, _) = cache_control(&client, "/missing").await;
+        assert_eq!(status, Status::NotFound);
+        assert!(values.is_empty());
+    }
+
+    /// The share fairing replaces `Cache-Control` with `no-store`; the
+    /// `no-transform` merge must run after it.
+    #[tokio::test]
+    async fn share_paths_keep_no_store_and_add_no_transform_only_with_an_etag() {
+        let client = client().await;
+        let (_, values, _) = cache_control(&client, "/policy/v3/etag").await;
+        assert_eq!(values, vec!["no-store, no-transform".to_string()]);
+        let (_, values, _) = cache_control(&client, "/policy/v3/plain").await;
+        assert_eq!(values, vec!["no-store".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn kv_get_responder_keeps_status_etag_and_body() {
+        let client = client().await;
+        let response = client.get("/kv").dispatch().await;
+        assert_eq!(response.status(), Status::Ok);
+        assert_eq!(
+            response.headers().get_one("Cache-Control"),
+            Some("private, no-cache, no-transform")
+        );
+        let etag = response.headers().get_one("ETag").unwrap().to_string();
+        assert!(etag.starts_with("\"blake3-") && !etag.starts_with("W/"));
+        assert_eq!(response.into_string().await.as_deref(), Some("hello"));
+
+        let not_modified = client
+            .get("/kv")
+            .header(Header::new("If-None-Match", etag.clone()))
+            .dispatch()
+            .await;
+        assert_eq!(not_modified.status(), Status::NotModified);
+        assert_eq!(not_modified.headers().get_one("ETag"), Some(etag.as_str()));
+        assert_eq!(
+            not_modified.headers().get_one("Cache-Control"),
+            Some("private, no-cache, no-transform")
+        );
+        assert!(not_modified.into_string().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn signed_url_responses_keep_no_store_and_add_no_transform() {
+        let client = client().await;
+        for (path, status) in [
+            ("/signed/full", Status::Ok),
+            ("/signed/unsatisfiable", Status::RangeNotSatisfiable),
+        ] {
+            let response = client.get(path).dispatch().await;
+            assert_eq!(response.status(), status, "{path}");
+            assert!(response.headers().get_one("ETag").is_some(), "{path}");
+            assert_eq!(
+                response.headers().get_one("Cache-Control"),
+                Some("private, no-store, no-transform"),
+                "{path}"
+            );
         }
     }
 }

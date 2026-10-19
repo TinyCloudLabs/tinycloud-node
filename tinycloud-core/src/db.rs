@@ -258,6 +258,10 @@ pub enum TxError<S: StorageSetup, K: Secrets> {
     Encryption(#[from] crate::encryption::EncryptionError),
     #[error("delegation-chain-traversal-limit-exceeded")]
     ChainTraversalLimitExceeded,
+    /// The read's audit record was not confirmed; its data was not returned
+    /// (TC-1317).
+    #[error(transparent)]
+    ReadAudit(#[from] crate::read_audit::ReadAuditError),
 }
 
 #[non_exhaustive]
@@ -456,9 +460,20 @@ impl<C, B, K> SpaceDatabase<C, B, K>
 where
     K: Secrets,
 {
-    /// Number of durable read-audit records and group commits completed.
-    pub fn read_audit_commit_stats(&self) -> (u64, u64) {
-        self.read_audit.stats()
+    /// Counts and ages of the read-audit pipeline, for metrics and logs.
+    pub fn read_audit_health(&self) -> crate::read_audit::ReadAuditHealth {
+        self.read_audit.health()
+    }
+
+    /// Bound how long a read waits for its audit record (TC-1317). Takes
+    /// effect for waits that start afterwards.
+    pub fn set_read_audit_wait(&self, wait: std::time::Duration) {
+        self.read_audit.set_wait(wait);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_audit_pipeline(&self) -> &crate::read_audit::ReadAuditPipeline {
+        &self.read_audit
     }
 
     pub async fn stage_key(&self, space_id: &SpaceId) -> Result<String, K::Error> {
@@ -540,6 +555,44 @@ where
     /// Callers take the SQLite writer gate first.
     pub async fn begin_graph_transaction(&self) -> Result<DatabaseTransaction, DbErr> {
         begin_write_transaction(&self.conn, chain_isolation_level(&self.conn)).await
+    }
+
+    /// TC-1274 backfill: up to `limit` space IDs after `after`, in ID order.
+    pub async fn epoch_head_backfill_page(
+        &self,
+        after: Option<&SpaceId>,
+        limit: u64,
+    ) -> Result<Vec<SpaceId>, DbErr> {
+        let mut query = space::Entity::find().order_by_asc(space::Column::Id);
+        if let Some(after) = after {
+            query = query.filter(space::Column::Id.gt(SpaceIdWrap(after.clone())));
+        }
+        Ok(query
+            .limit(limit)
+            .all(&self.conn)
+            .await?
+            .into_iter()
+            .map(|space| space.id.0)
+            .collect())
+    }
+
+    /// TC-1274 backfill of one space: rewrite its cached head epochs from
+    /// history unless they are provably current. Takes the space's sequence
+    /// locks as a write does, so it serializes with that space's writers and
+    /// holds no other space. Returns whether it rewrote the cache.
+    pub async fn repair_epoch_heads(&self, space: &SpaceId) -> Result<bool, DbErr> {
+        let _sequence = self
+            .acquire_space_sequence_guards(std::slice::from_ref(space))
+            .await;
+        let _writer = match &self.writer_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+        let tx = self.begin_graph_transaction().await?;
+        crate::kv_sync::lock_space_sequences(&tx, [space]).await?;
+        let repaired = crate::epoch_head::repair(&tx, &SpaceIdWrap(space.clone())).await?;
+        tx.commit().await?;
+        Ok(repaired)
     }
 }
 
@@ -666,6 +719,13 @@ where
             .into_iter()
             .map(|s| s.id.0)
             .collect())
+    }
+
+    /// The distinct owner addresses that hold data beyond the automatic
+    /// `account` space (TC-1482), from a single aggregate statement. See
+    /// [`crate::data_owners`] for exactly what is counted.
+    pub async fn data_owners(&self) -> Result<Vec<String>, crate::data_owners::DataOwnersError> {
+        crate::data_owners::collect(&self.conn).await
     }
 
     /// Return lifecycle-complete delegations related to the authenticated account.
@@ -1843,18 +1903,20 @@ where
         if proofs.len() > 1 {
             return Ok(None);
         }
-        let Some(delegation) = delegation::Entity::find_by_id(target)
-            .one(&self.conn)
-            .await?
-        else {
+        // A canonical CID may name a historical stored row; the requested CID
+        // keeps its own authority scope, the stored row supplies the grant.
+        let Some(delegation) = revocation::target_for_cid(&self.conn, target).await? else {
             return Ok(None);
         };
         let abilities = abilities::Entity::find()
-            .filter(abilities::Column::Delegation.eq(target))
+            .filter(abilities::Column::Delegation.eq(delegation.id))
             .all(&self.conn)
             .await?;
 
         let mut roots = vec![target];
+        if delegation.id != target {
+            roots.push(delegation.id);
+        }
         roots.extend(proofs.iter().copied().map(Hash::from));
         let _chain_guards = match self.acquire_chain_guards(&roots).await {
             Ok(guards) => guards,
@@ -1868,14 +1930,13 @@ where
             &self.conn,
             invoker,
             proofs,
-            "tinycloud.delegation/status",
+            revocation::ControlAction::Status,
             &target,
         )
         .await?
         {
             revocation::ControlProofDecision::DirectSigner(principal) => {
-                did_principal_matches(&delegation.delegator, &principal)
-                    || did_principal_matches(&delegation.delegatee, &principal)
+                revocation::ControlAction::Status.party_may_act(&delegation, &principal)
                     || abilities.iter().any(|ability| {
                         ability
                             .resource
@@ -1896,7 +1957,7 @@ where
         if revocation::is_revoked(&self.conn, &target).await? {
             return Ok(Some(DelegationStatus::Revoked));
         }
-        match revocation::first_revoked_ancestor(&self.conn, &target).await {
+        match revocation::first_revoked_ancestor(&self.conn, &delegation.id).await {
             Ok(Some(_)) => return Ok(Some(DelegationStatus::Revoked)),
             Ok(None) => {}
             Err(revocation::ChainTraversalError::LimitExceeded) => {
@@ -2179,6 +2240,12 @@ where
             Some(lock) => Some(lock.lock().await),
             None => None,
         };
+        // TC-1274: the write transaction begins here, so the request deadline
+        // may no longer cut this request; it completes and reports its outcome.
+        // The handler task is never polled after a cut, so this is not
+        // refused here.
+        let latched = crate::request_cancel::latch();
+        debug_assert!(latched, "a cut handler is not polled again");
         let begin_start = Instant::now();
         let tx_result = self.begin_graph_transaction().await;
         crate::telemetry::observe_stage(
@@ -2658,7 +2725,7 @@ where
             crate::telemetry::StageOutcome::from(record_result.is_ok()),
             read_audit_start.elapsed(),
         );
-        record_result?;
+        record_result.map_err(TxError::<B, K>::from)?;
         Ok((
             TransactResult {
                 commits: HashMap::new(),
@@ -3034,8 +3101,12 @@ async fn sequence_spaces<C: ConnectionTrait>(
         }
     }
     if !revoked.is_empty() {
+        let mut stored = Vec::with_capacity(revoked.len());
+        for target in revoked {
+            stored.push(stored_revocation_target(db, target).await?);
+        }
         for row in event_order::Entity::find()
-            .filter(event_order::Column::Event.is_in(revoked))
+            .filter(event_order::Column::Event.is_in(stored))
             .all(db)
             .await?
         {
@@ -3045,19 +3116,29 @@ async fn sequence_spaces<C: ConnectionTrait>(
     Ok(spaces.into_iter().collect())
 }
 
+/// The stored delegation a revocation's signed target names: the target itself,
+/// or the stored historical encoding a canonical CID resolves to. `event_order`
+/// records the stored row, so the revocation is sequenced in its spaces.
+async fn stored_revocation_target<C: ConnectionTrait>(db: &C, target: Hash) -> Result<Hash, DbErr> {
+    Ok(revocation::target_for_cid(db, target)
+        .await?
+        .map(|delegation| delegation.id)
+        .unwrap_or(target))
+}
+
 async fn event_spaces<'a, C: ConnectionTrait>(
     db: &C,
     ev: &'a [(Hash, Event)],
 ) -> Result<HashMap<SpaceId, Vec<&'a (Hash, Event)>>, DbErr> {
     // get orderings of events listed as revoked by events in the ev list
     let mut spaces = HashMap::<SpaceId, Vec<&'a (Hash, Event)>>::new();
-    let revoked = ev
-        .iter()
-        .filter_map(|(_, e)| match e {
-            Event::Revocation(r) => Some(Hash::from(r.0.revoked)),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
+    let mut revoked = Vec::new();
+    for (_, e) in ev {
+        if let Event::Revocation(r) = e {
+            let signed = Hash::from(r.0.revoked);
+            revoked.push((signed, stored_revocation_target(db, signed).await?));
+        }
+    }
     // TC-732: `transact` now calls this before any write. Issue no read when
     // there is nothing to look up: on SQLite a read that opens the
     // transaction's snapshot ahead of its first write turns a concurrent
@@ -3066,7 +3147,7 @@ async fn event_spaces<'a, C: ConnectionTrait>(
         Vec::new()
     } else {
         event_order::Entity::find()
-            .filter(event_order::Column::Event.is_in(revoked))
+            .filter(event_order::Column::Event.is_in(revoked.iter().map(|(_, stored)| *stored)))
             .all(db)
             .await?
     };
@@ -3105,9 +3186,13 @@ async fn event_spaces<'a, C: ConnectionTrait>(
                 }
             }
             Event::Revocation(r) => {
-                let r_hash = Hash::from(r.0.revoked);
+                let signed = Hash::from(r.0.revoked);
+                let Some(&(_, stored)) = revoked.iter().find(|(target, _)| *target == signed)
+                else {
+                    continue;
+                };
                 for revoked in &revoked_events {
-                    if r_hash == revoked.event {
+                    if stored == revoked.event {
                         let entry = spaces.entry(revoked.space.0.clone()).or_default();
                         if !entry.iter().any(|(h, _)| h == &e.0) {
                             entry.push(e);
@@ -3344,34 +3429,18 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
             }
         }
 
-        // get 'most recent' epochs for each of the spaces
-        let mut most_recent = epoch::Entity::find()
-            .select_only()
-            .left_join(epoch_order::Entity)
-            .filter(
-                Condition::all()
-                    .add(epoch::Column::Space.is_in(event_spaces.keys().cloned().map(SpaceIdWrap)))
-                    .add(epoch_order::Column::Child.is_null()),
-            )
-            .column(epoch::Column::Space)
-            .column(epoch::Column::Id)
-            .into_tuple::<(SpaceIdWrap, Hash)>()
-            .all(db)
-            .await?
-            .into_iter()
-            .fold(
-                HashMap::new(),
-                |mut m: HashMap<SpaceIdWrap, Vec<Hash>>, (space, epoch)| {
-                    m.entry(space).or_default().push(epoch);
-                    m
-                },
-            );
+        // The current heads of each space (TC-1274): O(#heads) from the
+        // `epoch_head` cache, falling back to history only for a space whose
+        // cache is not provably current. The sequence locks taken above are
+        // held to commit.
+        let head_spaces: Vec<SpaceIdWrap> = event_spaces.keys().cloned().map(SpaceIdWrap).collect();
+        let mut heads = crate::epoch_head::current(db, &head_spaces, &max_seqs).await?;
 
         // get all the orderings and associated data
         let (epoch_order, space_order, event_order, epochs) = event_spaces
             .into_iter()
             .map(|(space, events)| {
-                let parents = most_recent.remove(&space).unwrap_or_default();
+                let parents = heads.parents.remove(&space).unwrap_or_default();
                 let epoch = epoch_hash(&space, &events, &parents)?;
                 let seq = max_seqs.remove(&space).unwrap_or(0);
                 Ok((space, (epoch, events, seq, parents)))
@@ -3449,6 +3518,18 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                 );
                 TxError::EpochInsert(e)
             })?;
+
+        // Each space's only head is now the epoch just appended: its parents
+        // were all of the previous heads.
+        crate::epoch_head::advance(
+            db,
+            &heads,
+            space_order
+                .iter()
+                .map(|(space, (seq, epoch, _, _))| (SpaceIdWrap(space.clone()), *epoch, *seq))
+                .collect(),
+        )
+        .await?;
 
         // save epoch orderings
         if !epoch_order.is_empty() {
@@ -9230,6 +9311,163 @@ mod test {
             .await
             .expect("drop isolated TC-731 collation schema");
         exercise.expect("TC-731 PostgreSQL collation resilience");
+    }
+
+    /// `EXPLAIN ANALYZE` of the `list_bounded_after` range select for
+    /// `prefix`, one line per plan row.
+    async fn explain_kv_list<C: ConnectionTrait>(
+        conn: &C,
+        space: &SpaceId,
+        prefix: &str,
+    ) -> String {
+        let prefix: Path = prefix.parse().unwrap();
+        let list = kv_list_statement(conn.get_database_backend(), space, &prefix, None, None);
+        let explain = Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            match conn.get_database_backend() {
+                DbBackend::Postgres => {
+                    format!(
+                        "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) {}",
+                        list.sql
+                    )
+                }
+                _ => format!("EXPLAIN QUERY PLAN {}", list.sql),
+            },
+            list.values.expect("list statement is parameterised").0,
+        );
+        conn.query_all(explain)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| {
+                row.try_get_by_index::<String>(0)
+                    .or_else(|_| row.try_get::<String>("", "detail"))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// TC-1274: the range select seeks on its byte-order key bounds.
+    ///
+    /// `kv_prefix_condition` compares `key COLLATE "C"`, and
+    /// `idx_current_kv_space_deleted_key` is built in the column's own
+    /// collation. Under a linguistic collation (production's `en_US.UTF-8`;
+    /// here ICU `en`, which CI's C-collated PG16 would otherwise hide) the old
+    /// index can only seek on `(space, deleted)` and filter the rest of the
+    /// space's live keys. `idx_current_kv_space_deleted_key_c` makes the
+    /// bounds index conditions, with no query change.
+    #[tokio::test]
+    async fn postgres_kv_list_range_seeks_on_the_c_collation_index() {
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_kv_list_range_seeks_on_the_c_collation_index",
+        )
+        .await
+        else {
+            return;
+        };
+        let conn = &fixture.conn;
+        conn.execute(Statement::from_string(
+            DbBackend::Postgres,
+            "CREATE COLLATION tc1274_linguistic (provider = icu, locale = 'en')".to_string(),
+        ))
+        .await
+        .unwrap();
+        conn.execute(Statement::from_string(
+            DbBackend::Postgres,
+            "ALTER TABLE current_kv ALTER COLUMN key TYPE character varying \
+             COLLATE tc1274_linguistic"
+                .to_string(),
+        ))
+        .await
+        .unwrap();
+
+        let wanted: Vec<String> = (0..20).map(|i| format!("docs/{i:03}")).collect();
+        let others: Vec<String> = (0..300).map(|i| format!("other/{i:03}")).collect();
+        let keys: Vec<&str> = wanted.iter().chain(&others).map(String::as_str).collect();
+        let space = seed_kv_keys(conn, "pg-range-index", &keys).await;
+        conn.execute(Statement::from_string(
+            DbBackend::Postgres,
+            "ANALYZE current_kv".to_string(),
+        ))
+        .await
+        .unwrap();
+
+        // Planner inputs the test controls: a table this small would be
+        // seq-scanned, and the test is about which index serves the range.
+        // Both runs are rolled back.
+        let plan = |index_present: bool, prefix: &'static str| {
+            let conn = conn.clone();
+            let space = space.clone();
+            async move {
+                let tx = conn.begin().await.unwrap();
+                tx.execute_unprepared("SET LOCAL enable_seqscan = off")
+                    .await
+                    .unwrap();
+                if !index_present {
+                    tx.execute_unprepared("DROP INDEX idx_current_kv_space_deleted_key_c")
+                        .await
+                        .unwrap();
+                }
+                let plan = explain_kv_list(&tx, &space, prefix).await;
+                tx.rollback().await.unwrap();
+                plan
+            }
+        };
+        for prefix in ["docs/", "docs"] {
+            let before = plan(false, prefix).await;
+            println!("TC-1274 plan without the C index, prefix {prefix:?}:\n{before}");
+            assert!(
+                before.contains("Rows Removed by Filter: 300"),
+                "without the C index the whole space is filtered: {before}"
+            );
+
+            let after = plan(true, prefix).await;
+            println!("TC-1274 plan with the C index, prefix {prefix:?}:\n{after}");
+            assert!(
+                after.contains("idx_current_kv_space_deleted_key_c"),
+                "{prefix:?}: {after}"
+            );
+            assert!(
+                after
+                    .lines()
+                    .any(|line| line.contains("Index Cond") && line.contains("< 'docs0'")),
+                "{prefix:?}: the key bounds are Index Cond: {after}"
+            );
+            assert!(
+                !after.contains("Rows Removed by Filter"),
+                "{prefix:?}: nothing is read and discarded: {after}"
+            );
+            assert!(!after.contains("Seq Scan"), "{prefix:?}: {after}");
+        }
+
+        // Same answers either way.
+        let listed = kv_list_pages(conn, &space, "docs", 100).await;
+        assert_eq!(listed, vec![wanted]);
+    }
+
+    /// TC-1274: SQLite needs no `COLLATE` index. Its `BINARY` bounds already
+    /// seek on `idx_current_kv_space_deleted_key` for a prefix ending in `/`,
+    /// so the migration is a no-op there. (A bare prefix is an `OR` with the
+    /// exact key, which SQLite does not seek; that is unchanged here.)
+    #[tokio::test]
+    async fn sqlite_kv_list_range_seeks_on_the_existing_index() {
+        let db = get_db().await.unwrap();
+        let space = seed_kv_keys(
+            &db.conn,
+            "sqlite-range-index",
+            &["docs/a", "docs/b", "other/a"],
+        )
+        .await;
+
+        let plan = explain_kv_list(&db.conn, &space, "docs/").await;
+        println!("TC-1274 SQLite plan:\n{plan}");
+        assert!(
+            plan.contains(
+                "idx_current_kv_space_deleted_key (space=? AND deleted=? AND key>? AND key<?)"
+            ),
+            "{plan}"
+        );
     }
 
     async fn assert_hook_prefix_filter(

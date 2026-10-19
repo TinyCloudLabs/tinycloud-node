@@ -11,10 +11,10 @@
 //! # What is driven
 //!
 //! The real node: `tinycloud::app_with_control` behind
-//! `rocket::local::asynchronous::Client`, so the pool is built by the
-//! production code with the production settings. Only its database URL
-//! differs: it points at an in-test TCP proxy in front of PostgreSQL, with TLS
-//! off and a throwaway schema on the search path. The flows are the node side
+//! `rocket::local::asynchronous::Client`, so the pool is built through the
+//! production configuration path. The budget fixture caps its pool as described
+//! below; its database URL points at an in-test TCP proxy in front of PostgreSQL,
+//! with TLS off and a throwaway schema on the search path. The flows are the node side
 //! of what `@tinycloud/node-sdk` sends, built with the SDK's own Rust half
 //! (`tinycloud-sdk-wasm`). The SDK's sign-in touches several spaces and
 //! repeats these requests for each; one space is enough to price them:
@@ -56,8 +56,16 @@
 //! The counts are deterministic without sleeping for them: every request is
 //! measured between two barriers that wait until every pooled connection is
 //! idle again, so the release ping of the last statement is inside the window
-//! and no request overlaps another's traffic. The flows run three times
-//! first, so the pool has grown to the connections it needs and the
+//! and no request overlaps another's traffic. The barriers cannot stop the
+//! webhook dispatcher from checking a connection out just after a mark, and a
+//! request that then finds no idle connection opens one and pays its
+//! `SET statement_timeout` round trip. So the pool is capped at `POOL_SIZE`
+//! and every connection it may hold is opened before the first flow, and a
+//! measured request that still opens a connection fails the test instead of
+//! being counted. The cap only keeps the fully opened pool small, because
+//! test binaries run concurrently against one CI PostgreSQL and the default
+//! of 100 connections each could exhaust it; a request's round trips do not
+//! depend on the pool size. The flows then run three times first, so the
 //! statements are prepared.
 //!
 //! # Budgets
@@ -118,14 +126,24 @@ use tokio::{
 /// abilities and revocations in one tagged query (TC-735); capability checks
 /// and connection-release pings are unchanged. Measured on PostgreSQL:
 ///
-/// - sign-in 69 = peer key 0 + host `/delegate` 17 + session `/delegate` 18
+/// - sign-in 71 = peer key 0 + host `/delegate` 18 + session `/delegate` 19
 ///   + account-space SQL write 34;
-/// - kv put 34;
+/// - kv put 35;
 /// - kv get 16, including the read-audit commit.
-const BUDGETS: [(&str, u64); 3] = [("sign-in", 69), ("kv put", 34), ("kv get", 16)];
+///
+/// TC-1274: each epoch-writing commit (both `/delegate`s and the kv put)
+/// gained one round trip, the `epoch_head` cache write, which replaces the
+/// head anti-join over the space's whole history. TC-735's one-statement
+/// authorization snapshot (#302) removes six trips from sign-in and from get
+/// (main alone: 77, 38, 22) and three from put.
+const BUDGETS: [(&str, u64); 3] = [("sign-in", 71), ("kv put", 35), ("kv get", 16)];
 
 /// Full sign-in plus put plus get rounds run before the measured one.
 const WARM_UP_ROUNDS: u8 = 3;
+
+/// Connections in the measured node's pool, all opened before the flows run;
+/// see the module docs.
+const POOL_SIZE: u32 = 4;
 
 /// The account space and SQL database the SDK bootstraps at sign-in.
 const ACCOUNT_SPACE: &str = "account";
@@ -624,6 +642,24 @@ impl Node {
         }
     }
 
+    /// Open all `max` connections the pool may hold at once, then return them
+    /// to idle, so no later request has to connect.
+    async fn open_pool(&self, max: u32) -> Result<()> {
+        self.settle().await?;
+        let pool = self.pool();
+        let mut held = Vec::with_capacity(max as usize);
+        for _ in 0..max {
+            held.push(pool.acquire().await?);
+        }
+        ensure!(
+            pool.size() == max,
+            "the pool holds {} connections, not {max}",
+            pool.size()
+        );
+        drop(held);
+        self.settle().await
+    }
+
     /// Dispatch `request` between two settled marks.
     async fn measure(
         &self,
@@ -911,12 +947,18 @@ fn upstream(url: &str) -> Result<(String, u16)> {
     Ok((host, url.port().unwrap_or(5432)))
 }
 
-/// The real node, its pool behind the test proxy (with `cut`), on `schema`.
-async fn start_node(url: &str, schema: &str, cut: Cut) -> Result<(Node, tempfile::TempDir)> {
+/// The real node, its pool behind the test proxy (with `cut`), on `schema`;
+/// `max_connections` overrides the pool's default size.
+async fn start_node(
+    url: &str,
+    schema: &str,
+    cut: Cut,
+    max_connections: Option<u32>,
+) -> Result<(Node, tempfile::TempDir)> {
     let wire = Wire::default();
     let proxy = start_proxy(upstream(url)?, wire.clone(), cut).await?;
     let datadir = tempfile::TempDir::new()?;
-    let overlay = format!(
+    let mut overlay = format!(
         r#"
 log_level = "critical"
 [storage]
@@ -925,11 +967,18 @@ database = "{}"
 [keys]
 type = "Static"
 secret = "{}"
+# Background traffic that is not a request's (TC-1274): off, so it cannot
+# land inside a measured window.
+[epoch_head_backfill]
+enabled = false
 "#,
         datadir.path().join("data").display(),
         proxied_url(url, proxy, schema)?,
         base64::encode_config([7u8; 32], base64::URL_SAFE_NO_PAD),
     );
+    if let Some(max_connections) = max_connections {
+        let _ = write!(overlay, "[database]\nmax_connections = {max_connections}\n");
+    }
     let figment = rocket::Config::figment()
         .merge(Serialized::defaults(tinycloud::config::Config::default()))
         .merge(Toml::string(&overlay));
@@ -943,9 +992,10 @@ secret = "{}"
 }
 
 async fn run(url: &str, schema: &str) -> Result<Vec<Measured>> {
-    let (node, _datadir) = start_node(url, schema, Cut::default()).await?;
+    let (node, _datadir) = start_node(url, schema, Cut::default(), Some(POOL_SIZE)).await?;
 
     let result = async {
+        node.open_pool(POOL_SIZE).await?;
         let mut warm_up = Vec::new();
         for seed in 1..=WARM_UP_ROUNDS {
             round(&node, &Account::new(seed)?, &mut warm_up)
@@ -1016,6 +1066,12 @@ async fn postgres_round_trip_budget() {
                 counts.connections
             );
             request.window.describe(&mut detail);
+            if counts.connections > 0 {
+                violations.push(format!(
+                    "{flow}: {} opened {} connection(s) inside its measured window",
+                    request.request, counts.connections
+                ));
+            }
         }
         let _ = writeln!(
             report,
@@ -1036,9 +1092,139 @@ async fn postgres_round_trip_budget() {
     println!("{report}");
     assert!(
         violations.is_empty(),
-        "PostgreSQL round-trip budget exceeded (TC-951):\n  {}\n\n{report}",
+        "PostgreSQL round-trip budget check failed (TC-951):\n  {}\n\n{report}",
         violations.join("\n  ")
     );
+}
+
+/// TC-1482: `GET /admin/stats` answers from one statement however many spaces
+/// the node holds. Its round trips are counted with 3 spaces and again with
+/// 303 and must be equal, and the window must hold exactly one statement:
+/// the `/admin/usage` shape (one `store_size` call per space) would grow with
+/// the space count and fail both checks.
+///
+/// Measured on PostgreSQL: 2 round trips per request, the statement itself
+/// and sqlx's release ping, with exactly 1 statement.
+const ADMIN_STATS_BUDGET: u64 = 2;
+const ADMIN_STATS_TOKEN: &str = "tc1482-round-trip-token-6e1f0b3a9c5d8274";
+
+/// `count` spaces named from `first`, each owned by its own address and
+/// holding one live key, inserted by two statements outside the proxy.
+async fn seed_stats_spaces(seed: &impl ConnectionTrait, first: u64, count: u64) -> Result<()> {
+    let last = first + count - 1;
+    let id = "'tinycloud:pkh:eip155:1:0x' || lpad(to_hex(g), 40, '0') || ':default'";
+    for sql in [
+        format!("INSERT INTO space (id) SELECT {id} FROM generate_series({first}, {last}) g"),
+        format!(
+            "INSERT INTO current_kv (space, key, invocation, seq, epoch, epoch_seq, value, \
+             metadata, deleted) SELECT {id}, 'k', '\\x01'::bytea, 1, '\\x02'::bytea, 1, \
+             '\\x03'::bytea, '{{}}'::json, false FROM generate_series({first}, {last}) g"
+        ),
+    ] {
+        seed.execute(Statement::from_string(DbBackend::Postgres, sql))
+            .await?;
+    }
+    Ok(())
+}
+
+async fn measure_stats(node: &Node, expected_owners: u64) -> Result<Window> {
+    let mut out = Vec::new();
+    let request = node.client.get("/admin/stats").header(Header::new(
+        "Authorization",
+        format!("Bearer {ADMIN_STATS_TOKEN}"),
+    ));
+    let (status, body) = node
+        .measure("admin stats", "GET /admin/stats", request, &mut out)
+        .await?;
+    ensure!(status == Status::Ok, "GET /admin/stats answered {status}");
+    let body: serde_json::Value = serde_json::from_str(&body)?;
+    ensure!(
+        body["count"] == expected_owners,
+        "expected {expected_owners} owners, the route returned {}",
+        body["count"]
+    );
+    Ok(out.pop().context("no measured window")?.window)
+}
+
+async fn admin_stats_windows(url: &str, schema: &str) -> Result<(Window, Window)> {
+    let (node, _datadir) = start_node(url, schema, Cut::default(), Some(POOL_SIZE)).await?;
+    let result = async {
+        node.open_pool(POOL_SIZE).await?;
+        let mut scoped = reqwest::Url::parse(url)?;
+        scoped
+            .query_pairs_mut()
+            .append_pair("options", &format!("-c search_path={schema}"));
+        let seed = Database::connect(scoped.as_str()).await?;
+
+        seed_stats_spaces(&seed, 1, 3).await?;
+        // Prepare the statement on every pooled connection first.
+        for _ in 0..(2 * POOL_SIZE) {
+            measure_stats(&node, 3).await?;
+        }
+        let few = measure_stats(&node, 3).await?;
+
+        seed_stats_spaces(&seed, 1_000, 300).await?;
+        let many = measure_stats(&node, 303).await?;
+        seed.close().await?;
+        Ok((few, many))
+    }
+    .await;
+    node.pool().close().await;
+    result
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_admin_stats_is_one_round_trip_for_any_space_count() {
+    let Some(url) = postgres_test_url("postgres_admin_stats_is_one_round_trip") else {
+        return;
+    };
+    let admin = Database::connect(url.as_str())
+        .await
+        .expect("connect to PostgreSQL");
+    let schema = format!(
+        "tc1482_rt_{}_{}",
+        std::process::id(),
+        time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+    );
+    admin
+        .execute(Statement::from_string(
+            DbBackend::Postgres,
+            format!("CREATE SCHEMA {schema}"),
+        ))
+        .await
+        .expect("create the isolated schema");
+    std::env::set_var("NODE_STATS_READ_TOKEN", ADMIN_STATS_TOKEN);
+    let result = admin_stats_windows(&url, &schema).await;
+    std::env::remove_var("NODE_STATS_READ_TOKEN");
+    admin
+        .execute(Statement::from_string(
+            DbBackend::Postgres,
+            format!("DROP SCHEMA {schema} CASCADE"),
+        ))
+        .await
+        .expect("drop the isolated schema");
+    let (few, many) = result.expect("measure GET /admin/stats");
+
+    let (few_counts, many_counts) = (few.counts(), many.counts());
+    let mut report = String::from("TC-1482 GET /admin/stats\n  3 spaces:\n");
+    few.describe(&mut report);
+    let _ = writeln!(report, "  303 spaces:");
+    many.describe(&mut report);
+    println!("{report}");
+    assert_eq!(
+        (few_counts.round_trips, few_counts.statements),
+        (many_counts.round_trips, many_counts.statements),
+        "the round trips must not depend on the number of spaces:\n{report}"
+    );
+    assert_eq!(
+        many_counts.statements, 1,
+        "GET /admin/stats must run exactly one statement:\n{report}"
+    );
+    assert_eq!(
+        many_counts.round_trips, ADMIN_STATS_BUDGET,
+        "round trips changed from the budget:\n{report}"
+    );
+    assert_eq!(many_counts.connections, 0, "opened a connection:\n{report}");
 }
 
 /// A signed session for `account`, with the same abilities the SDK asks for.
@@ -1170,7 +1356,7 @@ async fn postgres_write_routes_tell_retryable_failures_from_unknown_outcomes() {
         .await
         .expect("create the isolated schema");
     let cut = Cut::default();
-    let (node, _datadir) = start_node(&url, &schema, cut.clone())
+    let (node, _datadir) = start_node(&url, &schema, cut.clone(), None)
         .await
         .expect("start the node");
 
@@ -1356,7 +1542,7 @@ async fn postgres_info_reports_connection_counters() {
         ))
         .await
         .expect("create the isolated schema");
-    let (node, _datadir) = start_node(&url, &schema, Cut::default())
+    let (node, _datadir) = start_node(&url, &schema, Cut::default(), None)
         .await
         .expect("start the node");
 

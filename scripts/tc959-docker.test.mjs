@@ -34,8 +34,29 @@ test('capture rejects unsafe values even when all request positive controls are 
   const baseline = [request, { ...request, route: '/version' }, { ...request, method: 'POST', route: '/invoke', status: 401 }, ingress];
   assert.doesNotThrow(() => assertCapture(baseline));
   assert.doesNotThrow(() => assertCapture([request])); // errors_slow intentionally excludes fast healthy controls.
-  for (const poison of [{ authorization: 'synthetic-bearer' }, { route: '/raw-secret' }, { request_id: 'anything' }, { request_id_replaced: true }, { latency_us: -1 }, { status: 999 }, { extra: 'TC959_SYNTHETIC' }]) {
+  for (const poison of [{ authorization: 'synthetic-bearer' }, { route: '/raw-secret' }, { latency_us: -1 }, { status: 999 }, { extra: 'TC959_SYNTHETIC' }]) {
     assert.throws(() => assertCapture([{ ...request, ...poison }, ...baseline.slice(1)]));
+  }
+});
+
+const goodId = 'a8098c1a-f86e-4b1f-92a7-4b50b53ec932';
+test('capture accepts well-formed N2 correlation fields on node_request only', () => {
+  const correlated = { ...request, request_id: goodId, request_id_replaced: false, account_hash: 'a'.repeat(64), space_hash: '0123456789abcdef'.repeat(4) };
+  assert.doesNotThrow(() => assertCapture([correlated]));
+  assert.doesNotThrow(() => assertCapture([{ ...request, request_id: goodId }])); // each key is optional
+  for (const bad of [
+    { request_id: 'anything' }, { request_id: goodId.toUpperCase() }, { request_id: `${goodId}0` }, { request_id: `x${goodId}` },
+    { request_id_replaced: 'true' }, { account_hash: 'A'.repeat(64) }, { space_hash: 'a'.repeat(63) }, { space_hash: `${'a'.repeat(64)}f` },
+    { account_hash: 'did:pkh:eip155:1:0xabc' }, { request_id: 7 },
+  ]) {
+    assert.throws(() => assertCapture([{ ...request, ...bad }]), JSON.stringify(bad));
+  }
+  // Never anywhere else: ingress rows, diagnostics and gate counters.
+  const warning = { ts: request.ts, level: 'warn', event: 'node_warning', svc: 'api', event_code: 'unclassified', event_count: 1 };
+  for (const key of ['request_id', 'request_id_replaced', 'account_hash', 'space_hash']) {
+    const value = key === 'request_id' ? goodId : key === 'request_id_replaced' ? true : 'a'.repeat(64);
+    assert.throws(() => assertCapture([{ ...ingress, [key]: value }]), `ingress ${key}`);
+    assert.throws(() => assertCapture([{ ...warning, [key]: value }], { event_code: { values: ['unclassified'] } }), `warning ${key}`);
   }
 });
 

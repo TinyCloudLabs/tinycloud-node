@@ -315,6 +315,11 @@ jobs:
     - name: TC-887 RED checks (must be RED until S3/S4)
       run: bash scripts/at-rest-harness/harness.sh test red --expect red "$TC887_STATE"
 
+    - name: S3 block store (against the harness MinIO)
+      run: |
+        (set -a; . "$TC887_RUN_DIR/harness.env"; set +a
+         cargo test --locked -p tinycloud-node --test s3_block_store -- --ignored)
+
     - name: Harness logs
       if: failure()
       run: |

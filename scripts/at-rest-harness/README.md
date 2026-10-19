@@ -141,9 +141,11 @@ Every one must pass all of these, or the check is RED:
   bytes, escrow shares as armored age files and bech32 recipients, and no TEE
   identity in a record (the harness node has none). Duplicate keys are refused.
 - **Raw-key scan** over every JSON key and every string outside those exact
-  fields: nothing that decodes (hex, base64, base64url, padded or not,
-  whitespace and prefixes like `0x`/`base64:`/data URLs removed) to 32 bytes,
-  no array of 32 byte values, no two fields of 16 bytes each.
+  fields: nothing that decodes (hex, base64, base64url, base32, padded or
+  not, whitespace and prefixes like `0x`, any short `label:`, data URLs
+  removed) to 32 bytes or more, no array of 32 byte values, no two fields of
+  16 bytes each (escrow holder names, which the schema checks exactly and
+  which can be 16-byte-looking, are left out of that split check).
 - **Content.** The same identity, fingerprint and marker scans as blocks,
   over the name and the text.
 - **Authentic key material.** The check reads the node's Static root
@@ -152,16 +154,75 @@ Every one must pass all of these, or the check is RED:
   chain opens under the next, every wrapped DEK opens under KEK_g with its
   AAD, its tag mapped to a space the harness signed in to (`spaces.log`). An
   escrow bundle's canary and EFP and a record's MAC are recomputed. A raw key
-  padded to 60 bytes fails here.
+  padded to 60 bytes fails here. ARK generations are unbounded in the node
+  (`rotate_ark` makes g+1; the 1..=9 in INTERFACES is the TCE *format*
+  generation, not this). The harness applies its own sanity cap of 1,000 so
+  an absurd name like `ark-4294967295-…` fails RED at once, and a gap is one
+  finding: a name never sets a loop bound.
+- **No derived secret anywhere.** No string of any mirror (exempt fields,
+  escrow commitments, holder names alone, joined in every order with or
+  without `-`/`_` separators and shifted by up to 7 characters, the armored
+  share text and its decoded payload as bytes and as text, the data of a
+  bech32 recipient, record fields) may carry, in any of the encodings above,
+  a secret the harness derived or unwrapped: the root, W, each ARK_g, KEK_g,
+  chain, canary and record-MAC key, NK, the DEK mirror tag key, or any DEK.
+  The same goes for every block, in every mode:
+  - its raw bytes, searched whole;
+  - its name (the whole name, every `/` segment) and its bytes read as text:
+    hex in any case and base64/base64url at any alignment (padded or not),
+    and decoded as hex, base64, base64url (padded or not), base32 and bech32
+    data after removing whitespace and a `0x`, `\x`, short `label:` or
+    `data:…;base64,` prefix, shifted by 0 to 7 characters.
 
-Not checkable without the escrow holders: the escrow share commitments and
-the age-encrypted share files themselves.
+  This decoding is applied to the whole text and to every run of 32 or more
+  characters, in mirror strings as well as in blocks. Runs are taken from all
+  those alphabets together and from base32, hex and base64url each on their
+  own, so a run ends where its own alphabet ends: a base32 key followed by `9`
+  or `1` is still found inside ciphertext or other text.
+- **No piece of a secret in a TCE1 salt.** The salt (header bytes 20..52) is
+  the only free field of a sealed block. No block's salt may hold any 16-byte
+  window of any of those secrets: a truncated key (31 bytes and one other
+  byte) and a key split across two blocks' salts (one half in each) are both
+  RED. A random salt matches with probability about 2^-120 per secret.
+- **Escrow-none.** If `up` started the node with `TC887_AT_REST_ESCROW_NONE=true`,
+  any escrow bundle or record object is RED.
+- **Mirrors required, blocks tied to them (encrypt/strict mode).** An ARK
+  mirror must exist. Every block must be named
+  `v1/<22-char space tag>/<43-char object>`; its space tag (from the
+  re-derived NK) must belong to a harness space with an authenticated DEK
+  mirror; it must parse as TCE1 with a header `dek_id` that is one of those
+  DEKs; its name must be the sealed name of a put the harness logged
+  (`puts.log`: space and content hash); and it must open under that DEK, with
+  AAD (space, content hash), to bytes whose blake3 is that content hash.
+  (The TCE1 header carries no ARK generation; the DEK mirror does.)
+
+Out of scope for a regression harness, one line each:
+- Escrow share commitments and age-encrypted shares can't be opened without
+  the holders' keys, so key material the harness didn't derive can hide there.
+- A key split across two commitments, or XOR'd with anything, isn't found.
+- A piece of a secret (fewer than 32 bytes) is only looked for in TCE1 salts;
+  everywhere else only whole secrets are matched.
+- A secret split into 3 or more pieces across salts (each under 16 bytes)
+  isn't found.
+- Separators other than `-`/`_` inside holder names, shifts of more than 7
+  characters, and splits across fields other than holder names aren't
+  rejoined.
+- Secrets in encodings other than hex, base64, base64url, base32 and bech32
+  data (e.g. base58, decimal, a custom alphabet) aren't decoded.
+- A secret encrypted or hashed under something the harness doesn't know is
+  indistinguishable from random bytes.
 
 `selftest_key_hierarchy_reference_vectors` (RFC 5869 vectors, seal/open
 round trips, every one-bit flip and wrong binding rejected),
-`selftest_key_mirror_accepts_s1_shaped_mirrors` and
+`selftest_key_mirror_accepts_s1_shaped_mirrors`,
 `selftest_key_mirror_flags_every_bypass` (one case per rule and per known
-bypass) run in plain `cargo test`.
+bypass), `selftest_key_mirror_refuses_escrow_contents_and_derived_keys`,
+`selftest_key_mirror_bounds_absurd_generations`,
+`selftest_key_mirror_requires_mirrors_in_encrypt_mode`,
+`selftest_blocks_open_under_their_mirrored_dek`,
+`selftest_blocks_carry_no_derived_secret`,
+`selftest_salts_hold_no_piece_of_a_secret` and
+`selftest_base32_secret_before_other_characters` run in plain `cargo test`.
 
 ## Not covered
 

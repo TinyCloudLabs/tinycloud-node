@@ -141,6 +141,8 @@ pub struct BackupResult {
 
 pub trait KeyProvider: Send + Sync {
     fn backend(&self) -> KeyBackend;
+    /// Where the identity is stored, for operators. Never key material.
+    fn location(&self) -> String;
     fn load_secret(&self) -> Result<Option<Vec<u8>>>;
     fn store_secret(&self, secret: &[u8]) -> Result<()>;
     fn delete_secret(&self) -> Result<()>;
@@ -417,10 +419,10 @@ fn resolve_provider_state(data_root: &Path, purpose: IdentityPurpose) -> Result<
                 let secret = StaticSecret::new(secret.to_vec())
                     .expect("generated identity secret is always 32 bytes");
                 let node_did = secret.node_did();
-                tracing::info!(
-                    backend = ?backend,
-                    data_path = %data_root.display(),
-                    "generated node identity secret on first run"
+                // Once per identity: a restart loads it and logs nothing here.
+                tracing::warn!(
+                    "created a new node identity at {} ({node_did})",
+                    provider.location()
                 );
                 Ok(identity_state(
                     IdentitySourceKind::Provider,
@@ -702,6 +704,10 @@ impl KeyProvider for EncryptedFileProvider {
         KeyBackend::EncryptedFile
     }
 
+    fn location(&self) -> String {
+        self.identity_path.display().to_string()
+    }
+
     fn load_secret(&self) -> Result<Option<Vec<u8>>> {
         if !self.identity_path.exists() {
             return Ok(None);
@@ -838,6 +844,10 @@ impl MacosKeychainProvider {
 impl KeyProvider for MacosKeychainProvider {
     fn backend(&self) -> KeyBackend {
         KeyBackend::MacosKeychain
+    }
+
+    fn location(&self) -> String {
+        format!("macOS keychain item {} / {}", self.service, self.account)
     }
 
     fn load_secret(&self) -> Result<Option<Vec<u8>>> {

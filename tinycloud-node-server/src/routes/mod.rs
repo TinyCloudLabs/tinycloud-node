@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
+    future::Future,
     time::Instant,
 };
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -52,6 +53,7 @@ use tinycloud_core::{
     models::{
         hook_delivery, hook_subscription, invocation as invocation_model, kv_delete, kv_write,
     },
+    request_cancel,
     sea_orm::{ColumnTrait, DbErr, EntityTrait, QueryFilter, QueryOrder},
     sql::{SqlCaveats, SqlError, SqlRequest, SqlService},
     storage::{HashBuffer, ImmutableReadStore, ImmutableStaging},
@@ -65,6 +67,7 @@ use tinycloud_core::{
 };
 
 pub mod admin;
+pub mod admin_stats;
 pub mod attestation;
 pub mod encryption;
 pub mod hooks;
@@ -79,6 +82,30 @@ use util::LimitedReader;
 
 const MAX_KV_BATCH_READ_ITEMS: usize = 100;
 const UPLOAD_COPY_BUFFER_SIZE: usize = 1024 * 1024;
+/// Largest `/invoke` upload body, in bytes: 95 MiB (TC-1012). It matches the
+/// ingress `client_max_body_size` and the tinycloud-tee-proxy Worker cap; a
+/// longer body is refused with 413.
+const MAX_UPLOAD_BODY_BYTES: u64 = 95 * 1024 * 1024;
+
+fn upload_body_too_large() -> (Status, String) {
+    (
+        Status::PayloadTooLarge,
+        format!("Request body exceeds the {MAX_UPLOAD_BODY_BYTES}-byte upload limit"),
+    )
+}
+
+/// Opens an upload body one byte past [`MAX_UPLOAD_BODY_BYTES`], so its
+/// reader can tell a body of exactly the limit from a longer one.
+fn open_upload_body(data: rocket::Data<'_>) -> rocket::data::DataStream<'_> {
+    data.open((MAX_UPLOAD_BODY_BYTES + 1).bytes())
+}
+
+fn multipart_error(error: multer::Error) -> (Status, String) {
+    match error {
+        multer::Error::StreamSizeExceeded { .. } => upload_body_too_large(),
+        error => (Status::BadRequest, error.to_string()),
+    }
+}
 
 async fn copy_upload<R, W>(reader: R, writer: &mut W) -> std::io::Result<u64>
 where
@@ -98,8 +125,37 @@ pub const UNAVAILABLE_RETRYABLE: &str = "unavailable_retryable";
 /// Body prefix of a database failure after a write may have been applied;
 /// the response is a `500` with no `Retry-After` (TC-1054).
 pub const OUTCOME_UNKNOWN: &str = "outcome_unknown";
-/// `Retry-After` on an [`UNAVAILABLE_RETRYABLE`] response, in seconds.
+/// `Retry-After` on an [`UNAVAILABLE_RETRYABLE`] or [`REQUEST_TIMEOUT`]
+/// response, in seconds.
 pub const RETRY_AFTER_SECS: u32 = 1;
+/// Body prefix of a `503` whose SQL database stayed busy past a wait bound
+/// before the request's write began: `sql_busy: <stage>: ...` (TC-1274).
+pub const SQL_BUSY: &str = "sql_busy";
+/// `Retry-After` on a [`SQL_BUSY`] response, in seconds. Longer than the
+/// retryable one: the request already waited its bound on a database that is
+/// still busy, and an immediate retry only lengthens the queue.
+pub const SQL_BUSY_RETRY_AFTER_SECS: u32 = 5;
+/// Body prefix of a `503` whose `/invoke` deadline was reached before any
+/// write began (TC-1274).
+pub const REQUEST_TIMEOUT: &str = "request_timeout";
+/// The whole body of a [`REQUEST_TIMEOUT`] response.
+pub const REQUEST_TIMEOUT_BODY: &str = "request_timeout: no change was applied; retry the request";
+/// Body prefix of a `503` whose read's audit record was not committed within
+/// the read-audit wait bound (TC-1317); `Retry-After` is
+/// [`SQL_BUSY_RETRY_AFTER_SECS`], since the audit queue is backlogged.
+pub const READ_AUDIT_BUSY: &str = "read_audit_busy";
+
+/// The response to a read whose audit record was not confirmed (TC-1317).
+/// Its data was not returned, so retrying with a fresh request is safe
+/// whenever the failure was transient.
+fn read_audit_failure(error: &tinycloud_core::ReadAuditError) -> (Status, String) {
+    use tinycloud_core::ReadAuditError;
+    let status = match error {
+        ReadAuditError::Busy | ReadAuditError::Unavailable => Status::ServiceUnavailable,
+        ReadAuditError::Failed(_) | ReadAuditError::Stopped => Status::InternalServerError,
+    };
+    (status, error.to_string())
+}
 
 /// The response to a database failure of an operation (TC-1054):
 ///
@@ -708,21 +764,24 @@ pub async fn invoke(
     duckdb_service: &State<DuckDbService>,
     hook_runtime: &State<HookRuntime>,
 ) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, InvokeError> {
-    invoke_impl(
-        i,
-        req_span,
-        headers,
-        data,
-        staging,
-        tinycloud,
+    with_invoke_deadline(
         config,
-        quota_cache,
-        invocation_replay_cache,
-        policy_v3,
-        encryption,
-        sql_service,
-        duckdb_service,
-        hook_runtime,
+        Box::pin(invoke_impl(
+            i,
+            req_span,
+            headers,
+            data,
+            staging,
+            tinycloud,
+            config,
+            quota_cache,
+            invocation_replay_cache,
+            policy_v3,
+            encryption,
+            sql_service,
+            duckdb_service,
+            hook_runtime,
+        )),
     )
     .await
 }
@@ -745,23 +804,46 @@ pub async fn invoke(
     sql_service: &State<SqlService>,
     hook_runtime: &State<HookRuntime>,
 ) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, InvokeError> {
-    invoke_impl(
-        i,
-        req_span,
-        headers,
-        data,
-        staging,
-        tinycloud,
+    with_invoke_deadline(
         config,
-        quota_cache,
-        invocation_replay_cache,
-        policy_v3,
-        encryption,
-        sql_service,
-        (),
-        hook_runtime,
+        Box::pin(invoke_impl(
+            i,
+            req_span,
+            headers,
+            data,
+            staging,
+            tinycloud,
+            config,
+            quota_cache,
+            invocation_replay_cache,
+            policy_v3,
+            encryption,
+            sql_service,
+            (),
+            hook_runtime,
+        )),
     )
     .await
+}
+
+/// Run an `/invoke` handler under the request deadline (TC-1274). Before its
+/// first write the deadline drops the handler and answers [`REQUEST_TIMEOUT`];
+/// after it, the handler finishes and its own result is returned.
+///
+/// The handler arrives boxed: it is large, and holding it inline in the route
+/// future overflows the test threads' stacks in debug builds.
+pub(crate) async fn with_invoke_deadline<T>(
+    config: &Config,
+    handler: std::pin::Pin<Box<impl Future<Output = Result<T, InvokeError>>>>,
+) -> Result<T, InvokeError> {
+    request_cancel::run_with_deadline(config.invocation.deadline(), handler)
+        .await
+        .unwrap_or_else(|request_cancel::DeadlineExceeded| {
+            Err(InvokeError::Text(
+                Status::ServiceUnavailable,
+                REQUEST_TIMEOUT_BODY.to_string(),
+            ))
+        })
 }
 
 #[cfg(feature = "duckdb")]
@@ -1458,11 +1540,7 @@ async fn copy_multipart_field_to_stage(
     space: &SpaceId,
     remaining: &mut Option<(u64, StorageCheck)>,
 ) -> Result<(), InvokeError> {
-    while let Some(chunk) = field
-        .chunk()
-        .await
-        .map_err(|e| (Status::BadRequest, e.to_string()))?
-    {
+    while let Some(chunk) = field.chunk().await.map_err(multipart_error)? {
         if let Some((remaining_bytes, check)) = remaining.as_mut() {
             let chunk_len = u64::try_from(chunk.len())
                 .map_err(|e| (Status::InternalServerError, e.to_string()))?;
@@ -1504,7 +1582,13 @@ async fn build_batch_kv_inputs(
     })?;
     let boundary =
         multer::parse_boundary(content_type).map_err(|e| (Status::BadRequest, e.to_string()))?;
-    let mut multipart = multer::Multipart::with_reader(data.open(1u8.gigabytes()), boundary);
+    let constraints = multer::Constraints::new()
+        .size_limit(multer::SizeLimit::new().whole_stream(MAX_UPLOAD_BODY_BYTES));
+    let mut multipart = multer::Multipart::with_reader_with_constraints(
+        open_upload_body(data),
+        boundary,
+        constraints,
+    );
     let mut inputs = HashMap::new();
     let (space, _) = expected
         .values()
@@ -1513,11 +1597,7 @@ async fn build_batch_kv_inputs(
     let mut remaining = staged_batch_remaining(space, tinycloud, config, quota_cache).await?;
     let decode_start = Instant::now();
     let result: Result<KvInputMap, InvokeError> = async {
-        while let Some(field) = multipart
-            .next_field()
-            .await
-            .map_err(|e| (Status::BadRequest, e.to_string()))?
-        {
+        while let Some(field) = multipart.next_field().await.map_err(multipart_error)? {
             let encoded_path = field
                 .name()
                 .ok_or_else(|| {
@@ -1730,6 +1810,10 @@ async fn invoke_impl(
                     .check_and_insert(&admitted, config.invocation.max_lifetime_secs)
                     .await?;
             }
+            // TC-1274: the decrypt records its audit and rewraps the key;
+            // from here the deadline no longer cuts the request.
+            let latched = request_cancel::latch();
+            debug_assert!(latched, "a cut handler is not polled again");
             let verified = encryption
                 .decrypt_authorized(&network, &admitted.invocation().0, &body)
                 .await
@@ -1789,6 +1873,7 @@ async fn invoke_impl(
             // Reject quarantined paths and an active cutover fence before
             // verify_auth_admitted persists invoked_abilities. A rejected
             // request must never become migration attribution evidence.
+            request_cancel::set_stage(request_cancel::Stage::IdentityResolution);
             if tinycloud.effective_database_fence(config.database.write_fence)
                 .await.map_err(identity_resolution_error)? {
                 return Err((Status::ServiceUnavailable, "SQL identity cutover fence is active".into()).into());
@@ -1796,6 +1881,7 @@ async fn invoke_impl(
             let (space, path, _) = select_database_scope(&sql_caps, "sql")?;
             database_migration::resolve(tinycloud.connection(), "sql", &space.to_string(), path)
                 .await.map_err(identity_resolution_error)?;
+            request_cancel::set_stage(request_cancel::Stage::Other);
             if policy_session_invocation {
                 invocation_replay_cache
                     .check_and_insert_invoker_nonce(admitted.invocation(), 60)
@@ -1847,6 +1933,7 @@ async fn invoke_impl(
                     .collect();
 
             if !duckdb_caps.is_empty() {
+                request_cancel::set_stage(request_cancel::Stage::IdentityResolution);
                 if tinycloud.effective_database_fence(config.database.write_fence)
                     .await.map_err(identity_resolution_error)? {
                     return Err((Status::ServiceUnavailable, "DuckDB identity cutover fence is active".into()).into());
@@ -1854,6 +1941,7 @@ async fn invoke_impl(
                 let (space, path, _) = select_database_scope(&duckdb_caps, "duckdb")?;
                 database_migration::resolve(tinycloud.connection(), "duckdb", &space.to_string(), path)
                     .await.map_err(identity_resolution_error)?;
+                request_cancel::set_stage(request_cancel::Stage::Other);
                 if policy_session_invocation {
                     invocation_replay_cache
                         .check_and_insert_invoker_nonce(admitted.invocation(), 60)
@@ -1934,7 +2022,7 @@ async fn invoke_impl(
                         .stage(space)
                         .await
                         .map_err(|e| (Status::InternalServerError, e.to_string()))?;
-                    let open_data = d.open(1u8.gigabytes()).compat();
+                    let open_data = open_upload_body(d).compat();
 
                     // Public spaces use their storage cap, others the per-space quota.
                     let budget = staged_batch_remaining(space, tinycloud, config, quota_cache).await?;
@@ -1968,7 +2056,9 @@ async fn invoke_impl(
                         );
                         result
                     };
-                    copy_result?;
+                    if copy_result? > MAX_UPLOAD_BODY_BYTES {
+                        return Err(upload_body_too_large().into());
+                    }
 
                     let mut inputs = HashMap::new();
                     inputs.insert(
@@ -2200,6 +2290,9 @@ async fn invoke_impl(
                 }
                 if let TxStoreError::KvTooManyMutations { .. } = &e {
                     return Err(too_many_mutations().into());
+                }
+                if let TxStoreError::Tx(TxError::ReadAudit(error)) = &e {
+                    return Err(read_audit_failure(error).into());
                 }
                 if let TxStoreError::Tx(TxError::Db(error) | TxError::EpochInsert(error)) = &e {
                     return Err(
@@ -2492,6 +2585,7 @@ async fn handle_sql_invoke(
     config: &State<Config>,
     sql_caps: &[(tinycloud_auth::resource::SpaceId, Option<String>, String)],
 ) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, InvokeError> {
+    request_cancel::set_stage(request_cancel::Stage::IdentityResolution);
     if tinycloud
         .effective_database_fence(config.database.write_fence)
         .await
@@ -2503,6 +2597,7 @@ async fn handle_sql_invoke(
         )
             .into());
     }
+    request_cancel::set_stage(request_cancel::Stage::Other);
     // W1 (D): derive the SQL caveat from the VALIDATED delegation chain,
     // NOT from the invoker's own invocation facts. The invocation-facts
     // path is a holdover (and is still consulted as a fallback so the
@@ -2546,9 +2641,11 @@ async fn handle_sql_invoke(
     // N3 will resolve this logical identity through an explicit alias table.
     // Do not fall back to the legacy final-segment selector here.
     let space_id = space.to_string();
+    request_cancel::set_stage(request_cancel::Stage::IdentityResolution);
     let db_name = database_migration::resolve(tinycloud.connection(), "sql", &space_id, path)
         .await
         .map_err(identity_resolution_error)?;
+    request_cancel::set_stage(request_cancel::Stage::Other);
 
     let sql_request: SqlRequest =
         serde_json::from_str(&body_str).map_err(|e| (Status::BadRequest, e.to_string()))?;
@@ -2615,6 +2712,16 @@ async fn handle_sql_invoke(
         None
     };
     let execute_start = Instant::now();
+    if publication_command
+        .as_ref()
+        .is_some_and(|command| command["operation"] == "unfreeze_legacy")
+    {
+        // TC-1274: releasing the legacy freeze is publication's only write,
+        // and it never reaches the SQL service; the read-only commands stay
+        // cuttable.
+        let latched = request_cancel::latch();
+        debug_assert!(latched, "a cut handler is not polled again");
+    }
     let execute_result = if let Some(command) = publication_command {
         meeting_publication::execute(tinycloud, sql_service, space, command).await
     } else if full_space.is_some() {
@@ -3017,7 +3124,7 @@ fn json_to_sql_value(v: &serde_json::Value) -> Result<tinycloud_core::sql::SqlVa
     }
 }
 
-fn sql_error_to_status(err: &SqlError) -> Status {
+pub(crate) fn sql_error_to_status(err: &SqlError) -> Status {
     match err {
         SqlError::Sqlite(_) => Status::BadRequest,
         SqlError::PermissionDenied(_) => Status::Forbidden,
@@ -3032,6 +3139,7 @@ fn sql_error_to_status(err: &SqlError) -> Status {
         SqlError::Internal(_) => Status::InternalServerError,
         SqlError::Unavailable => Status::ServiceUnavailable,
         SqlError::OutcomeUnknown => Status::InternalServerError,
+        SqlError::Busy(_) | SqlError::RequestTimeout => Status::ServiceUnavailable,
     }
 }
 
@@ -3085,6 +3193,7 @@ async fn handle_duckdb_invoke(
     duckdb_caps: &[(tinycloud_auth::resource::SpaceId, Option<String>, String)],
     arrow_format: bool,
 ) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, InvokeError> {
+    request_cancel::set_stage(request_cancel::Stage::IdentityResolution);
     if tinycloud
         .effective_database_fence(config.database.write_fence)
         .await
@@ -3096,6 +3205,7 @@ async fn handle_duckdb_invoke(
         )
             .into());
     }
+    request_cancel::set_stage(request_cancel::Stage::Other);
     let caveats: Option<DuckDbCaveats> = admitted
         .invocation()
         .0
@@ -3121,23 +3231,28 @@ async fn handle_duckdb_invoke(
     let (space, path, ability) = select_database_scope(duckdb_caps, "duckdb")?;
     // Keep the logical path separate from any legacy physical artifact name.
     let space_id = space.to_string();
+    request_cancel::set_stage(request_cancel::Stage::IdentityResolution);
     let db_name = database_migration::resolve(tinycloud.connection(), "duckdb", &space_id, path)
         .await
         .map_err(identity_resolution_error)?;
+    request_cancel::set_stage(request_cancel::Stage::Other);
 
     if ability == "tinycloud.duckdb/import" {
         // Import always grows the database artifact — gate before reading
-        // the (up to 100 MB) body. Same 402 semantics as the KV/SQL paths.
+        // the (up to 95 MiB) body. Same 402 semantics as the KV/SQL paths.
         staged_batch_remaining(space, tinycloud, config, quota_cache).await?;
 
         let body_bytes = match data {
             DataIn::One(d) => {
                 let mut buf = Vec::new();
-                let mut reader = d.open(100u8.megabytes());
+                let mut reader = open_upload_body(d);
                 reader
                     .read_to_end(&mut buf)
                     .await
                     .map_err(|e| (Status::BadRequest, e.to_string()))?;
+                if buf.len() as u64 > MAX_UPLOAD_BODY_BYTES {
+                    return Err(upload_body_too_large().into());
+                }
                 buf
             }
             _ => {
@@ -3149,6 +3264,9 @@ async fn handle_duckdb_invoke(
             }
         };
 
+        // TC-1274: the import writes the live cache and the artifact.
+        let latched = request_cancel::latch();
+        debug_assert!(latched, "a cut handler is not polled again");
         let import_start = Instant::now();
         let import_result = duckdb_service.import_db(space, &db_name, &body_bytes).await;
         crate::prometheus::observe_span(
@@ -3201,6 +3319,11 @@ async fn handle_duckdb_invoke(
         None
     };
 
+    // TC-1274: DuckDB's service has no write latch of its own; its
+    // hydration and statement must not be cut once started. Its waits are
+    // not bounded either (TC-1274 follow-up).
+    let latched = request_cancel::latch();
+    debug_assert!(latched, "a cut handler is not polled again");
     let execute_start = Instant::now();
     let execute_result = if full_space.is_some() {
         duckdb_service
@@ -3622,6 +3745,7 @@ async fn verify_auth(
             TxStoreError::Tx(TxError::Db(error) | TxError::EpochInsert(error)) => {
                 database_failure(error, false, e.to_string())
             }
+            TxStoreError::Tx(TxError::ReadAudit(error)) => read_audit_failure(error),
             TxStoreError::Tx(TxError::SpaceNotFound) => (Status::NotFound, e.to_string()),
             _ => (Status::Unauthorized, e.to_string()),
         })
@@ -3653,6 +3777,7 @@ async fn verify_auth_admitted(
             TxStoreError::Tx(TxError::Db(error) | TxError::EpochInsert(error)) => {
                 database_failure(error, false, e.to_string())
             }
+            TxStoreError::Tx(TxError::ReadAudit(error)) => read_audit_failure(error),
             TxStoreError::Tx(TxError::SpaceNotFound) => (Status::NotFound, e.to_string()),
             _ => (Status::Unauthorized, e.to_string()),
         })
@@ -3978,6 +4103,59 @@ mod tests {
             sql_error_to_status(&SqlError::Internal("x".into())),
             Status::InternalServerError
         );
+        for error in [
+            SqlError::Busy(tinycloud_core::sql::SqlBusyStage::Hydration),
+            SqlError::RequestTimeout,
+        ] {
+            assert_eq!(sql_error_to_status(&error), Status::ServiceUnavailable);
+        }
+        assert!(SqlError::Busy(tinycloud_core::sql::SqlBusyStage::Hydration)
+            .to_string()
+            .starts_with(&format!("{SQL_BUSY}: hydration:")));
+        // The SQL service's own timeout answer is the route's, word for word.
+        assert_eq!(SqlError::RequestTimeout.to_string(), REQUEST_TIMEOUT_BODY);
+    }
+
+    /// TC-1274: an `/invoke` that has not begun a write is answered
+    /// `request_timeout` at its deadline; one that has reports its outcome.
+    #[tokio::test]
+    async fn invoke_deadline_cuts_only_before_the_first_write() {
+        let mut config = Config::default();
+        config.invocation.deadline_ms = 50;
+        let cut = with_invoke_deadline(
+            &config,
+            Box::pin(std::future::pending::<Result<(), InvokeError>>()),
+        )
+        .await;
+        match cut {
+            Err(InvokeError::Text(status, body)) => {
+                assert_eq!(status, Status::ServiceUnavailable);
+                assert_eq!(body, REQUEST_TIMEOUT_BODY);
+            }
+            other => panic!("expected request_timeout, got {other:?}"),
+        }
+
+        let latched = with_invoke_deadline(
+            &config,
+            Box::pin(async {
+                request_cancel::latch();
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                Ok::<_, InvokeError>("applied")
+            }),
+        )
+        .await;
+        assert!(matches!(latched, Ok("applied")), "{latched:?}");
+
+        config.invocation.deadline_ms = 0;
+        let unbounded = with_invoke_deadline(
+            &config,
+            Box::pin(async {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                Ok::<_, InvokeError>("served")
+            }),
+        )
+        .await;
+        assert!(matches!(unbounded, Ok("served")), "{unbounded:?}");
     }
 
     fn test_space_id(name: &str) -> SpaceId {
@@ -8250,6 +8428,17 @@ mod tests {
         rocket::Rocket<rocket::Build>,
         tinycloud_core::sea_orm::DatabaseConnection,
     )> {
+        tc409_invoke_rocket_with(space, Config::default()).await
+    }
+
+    /// [`tc409_invoke_rocket`] with `config` managed instead of the default.
+    async fn tc409_invoke_rocket_with(
+        space: &SpaceId,
+        config: Config,
+    ) -> Result<(
+        rocket::Rocket<rocket::Build>,
+        tinycloud_core::sea_orm::DatabaseConnection,
+    )> {
         use tinycloud_core::models::space as space_model;
         use tinycloud_core::sea_orm::ActiveModelTrait;
         use tinycloud_core::sea_orm::ActiveValue::Set;
@@ -8307,7 +8496,7 @@ mod tests {
             .manage(tinycloud)
             .manage(sql_service)
             .manage(None::<crate::tee::TeeContext>)
-            .manage(Config::default())
+            .manage(config)
             .manage(QuotaCache::new(None, None))
             .manage(InvocationReplayCache::new(replay_db))
             .manage(hook_runtime)
@@ -8368,6 +8557,103 @@ mod tests {
         );
 
         tinycloud_core::admission::test_hook::disarm(identity);
+        Ok(())
+    }
+
+    /// Dispatch one signed `kv/put` of `doc` with `body` and `content_type`
+    /// through the real `/invoke` route; returns the status and body text.
+    async fn tc1012_kv_put(
+        nonce: &str,
+        content_type: rocket::http::ContentType,
+        body: Vec<u8>,
+    ) -> Result<(rocket::http::Status, String)> {
+        use rocket::http::Header;
+        use rocket::local::asynchronous::Client;
+
+        let signer = JWK::generate_ed25519()?;
+        let issuer_vm = tc341_verification_method(&signer)?;
+        let (header, space) = tc409_root_invocation(
+            &signer,
+            &issuer_vm,
+            "kv",
+            "tinycloud.kv/put",
+            Some("doc"),
+            nonce,
+        )?;
+        let (rocket, _conn) = tc409_invoke_rocket(&space).await?;
+        let client = Client::tracked(rocket).await?;
+        let response = client
+            .post("/invoke")
+            .header(Header::new("Authorization", header))
+            .header(content_type)
+            .body(body)
+            .dispatch()
+            .await;
+        let status = response.status();
+        Ok((status, response.into_string().await.unwrap_or_default()))
+    }
+
+    #[tokio::test]
+    async fn tc1012_kv_put_accepts_exactly_95_mib_and_refuses_one_more_byte_with_413() -> Result<()>
+    {
+        assert_eq!(MAX_UPLOAD_BODY_BYTES, 99_614_720);
+        let cap = MAX_UPLOAD_BODY_BYTES as usize;
+
+        let (status, body) = tc1012_kv_put(
+            "urn:uuid:tc1012-kv-put-at-cap",
+            rocket::http::ContentType::Binary,
+            vec![0x5a; cap],
+        )
+        .await?;
+        assert!(status.class().is_success(), "{status}: {body}");
+
+        let (status, body) = tc1012_kv_put(
+            "urn:uuid:tc1012-kv-put-over-cap",
+            rocket::http::ContentType::Binary,
+            vec![0x5a; cap + 1],
+        )
+        .await?;
+        assert_eq!(status, rocket::http::Status::PayloadTooLarge, "{body}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tc1012_multipart_kv_put_accepts_95_mib_body_and_refuses_one_more_byte_with_413(
+    ) -> Result<()> {
+        let boundary = "tc1012-boundary";
+        let multipart_body = |total: usize| {
+            let head = format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"doc\"\r\n\
+                 Content-Type: application/octet-stream\r\n\r\n"
+            );
+            let tail = format!("\r\n--{boundary}--\r\n");
+            let mut body = head.into_bytes();
+            body.resize(total - tail.len(), 0x5a);
+            body.extend_from_slice(tail.as_bytes());
+            assert_eq!(body.len(), total);
+            body
+        };
+        let content_type = || {
+            rocket::http::ContentType::new("multipart", "form-data")
+                .with_params(("boundary", boundary))
+        };
+        let cap = MAX_UPLOAD_BODY_BYTES as usize;
+
+        let (status, body) = tc1012_kv_put(
+            "urn:uuid:tc1012-multipart-at-cap",
+            content_type(),
+            multipart_body(cap),
+        )
+        .await?;
+        assert!(status.class().is_success(), "{status}: {body}");
+
+        let (status, body) = tc1012_kv_put(
+            "urn:uuid:tc1012-multipart-over-cap",
+            content_type(),
+            multipart_body(cap + 1),
+        )
+        .await?;
+        assert_eq!(status, rocket::http::Status::PayloadTooLarge, "{body}");
         Ok(())
     }
 
@@ -8663,6 +8949,14 @@ mod tests {
         async fn new_with(
             extend: impl FnOnce(rocket::Rocket<rocket::Build>) -> rocket::Rocket<rocket::Build>,
         ) -> Result<Self> {
+            Self::new_configured(Config::default(), extend).await
+        }
+
+        /// [`Self::new_with`] with `config` instead of the default.
+        async fn new_configured(
+            config: Config,
+            extend: impl FnOnce(rocket::Rocket<rocket::Build>) -> rocket::Rocket<rocket::Build>,
+        ) -> Result<Self> {
             use tinycloud_core::models::actor;
             use tinycloud_core::sea_orm::ActiveModelTrait;
             use tinycloud_core::sea_orm::ActiveValue::Set;
@@ -8677,7 +8971,7 @@ mod tests {
                 Some("probe"),
                 "urn:uuid:tc732-probe",
             )?;
-            let (rocket, conn) = tc409_invoke_rocket(&space).await?;
+            let (rocket, conn) = tc409_invoke_rocket_with(&space, config).await?;
             let rocket = extend(rocket);
             let sync_cursor_key = rocket
                 .state::<TinyCloud>()
@@ -8962,6 +9256,11 @@ mod tests {
 
         /// An owner-root invocation of `caps` (resource URI, action).
         fn owner_invocation(&self, caps: &[(String, &str)]) -> Result<String> {
+            self.owner_invocation_to(&self.space.did().to_string(), caps)
+        }
+
+        /// [`Self::owner_invocation`] addressed to `audience`.
+        fn owner_invocation_to(&self, audience: &str, caps: &[(String, &str)]) -> Result<String> {
             use tinycloud_auth::ssi::{dids::DIDURLBuf, ucan::Payload};
             use tinycloud_auth::ucan_capabilities_object::Capabilities;
             let mut capabilities = Capabilities::new();
@@ -8974,7 +9273,7 @@ mod tests {
             }
             Ok(Payload {
                 issuer: self.owner_vm.parse::<DIDURLBuf>()?,
-                audience: self.space.did().to_string().parse::<DIDBuf>()?,
+                audience: audience.parse::<DIDBuf>()?,
                 not_before: None,
                 expiration: test_invocation_expiration(),
                 nonce: Some(self.next_nonce()),
@@ -9259,6 +9558,297 @@ mod tests {
             .await;
         assert_eq!(get.status, Status::Ok);
         assert_eq!(get.body, "a2");
+        Ok(())
+    }
+
+    /// TC-1317: an `/invoke` KV read whose audit record cannot commit is
+    /// answered `503 read_audit_busy` at the read-audit bound, without its
+    /// data; once the drain frees up the same read is served.
+    #[tokio::test]
+    async fn a_kv_read_with_a_stalled_read_audit_is_answered_busy() -> Result<()> {
+        use rocket::http::Status;
+
+        let fixture = KvSyncFixture::new().await?;
+        fixture.owner_write("notes/a", Some(b"secret")).await?;
+        let tinycloud = fixture
+            .client
+            .rocket()
+            .state::<TinyCloud>()
+            .expect("TinyCloud is managed");
+        tinycloud.set_read_audit_wait(std::time::Duration::from_millis(200));
+        let get = || {
+            fixture.owner_invocation(&[(
+                fixture.kv_resource("notes/a").unwrap().as_uri().to_string(),
+                "tinycloud.kv/get",
+            )])
+        };
+
+        // The SQLite writer lock is what every audit batch takes to commit.
+        let writer = tinycloud
+            .sqlite_writer_lock()
+            .expect("the fixture runs on SQLite");
+        let held = writer.lock().await;
+        let reply = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            fixture.dispatch(get()?, &[]),
+        )
+        .await
+        .expect("the read must be answered at its bound");
+        drop(held);
+        assert_eq!(reply.status, Status::ServiceUnavailable);
+        assert!(reply.body.starts_with(READ_AUDIT_BUSY), "{}", reply.body);
+        assert!(!reply.body.contains("secret"), "no data without its audit");
+
+        let reply = fixture.dispatch(get()?, &[]).await;
+        assert_eq!(reply.status, Status::Ok);
+        assert_eq!(reply.body, "secret");
+        Ok(())
+    }
+
+    /// TC-1317 review R2: with the read audit stalled, every reclassified
+    /// auth route answers `503 read_audit_busy` instead of 401, a SQL request
+    /// never executes, and a real authorization denial is still 401/403.
+    #[tokio::test]
+    async fn reclassified_auth_routes_answer_busy_and_denials_stay_denials() -> Result<()> {
+        use rocket::http::{ContentType, Header, Status};
+        use tinycloud_auth::ssi::{dids::DIDURLBuf, ucan::Payload};
+        use tinycloud_auth::ucan_capabilities_object::Capabilities;
+
+        let fixture = KvSyncFixture::new_with(|rocket| {
+            rocket
+                .mount(
+                    "/",
+                    rocket::routes![
+                        create_signed_kv_url,
+                        crate::routes::encryption::create_network
+                    ],
+                )
+                .manage(crate::signed_urls::SignedUrlRuntime::new([33; 32]))
+        })
+        .await?;
+        fixture.owner_write("notes/a", Some(b"secret")).await?;
+        let tinycloud = fixture
+            .client
+            .rocket()
+            .state::<TinyCloud>()
+            .expect("TinyCloud is managed");
+        tinycloud.set_read_audit_wait(std::time::Duration::from_millis(200));
+        let kv_get = || -> Result<(String, &str)> {
+            Ok((
+                fixture.kv_resource("notes/a")?.as_uri().to_string(),
+                "tinycloud.kv/get",
+            ))
+        };
+        let busy = |status: Status, body: &str, route: &str| {
+            assert_eq!(status, Status::ServiceUnavailable, "{route}: {body}");
+            assert!(body.starts_with(READ_AUDIT_BUSY), "{route}: {body}");
+        };
+
+        let writer = tinycloud
+            .sqlite_writer_lock()
+            .expect("the fixture runs on SQLite");
+        let held = writer.lock().await;
+        async fn within<F: Future>(future: F) -> Result<F::Output, tokio::time::error::Elapsed> {
+            tokio::time::timeout(std::time::Duration::from_secs(10), future).await
+        }
+
+        // `/signed/kv` (`verify_auth`).
+        let response = within(
+            fixture
+                .client
+                .post("/signed/kv")
+                .header(Header::new(
+                    "Authorization",
+                    fixture.owner_invocation(&[kv_get()?])?,
+                ))
+                .header(ContentType::JSON)
+                .body(
+                    serde_json::json!({ "space": fixture.space.to_string(), "path": "notes/a" })
+                        .to_string(),
+                )
+                .dispatch(),
+        )
+        .await?;
+        let status = response.status();
+        busy(
+            status,
+            &response.into_string().await.unwrap_or_default(),
+            "/signed/kv",
+        );
+
+        // `/encryption/networks` (its own `verify_auth`): no longer a 401.
+        let response = within(
+            fixture
+                .client
+                .post("/encryption/networks")
+                .header(Header::new(
+                    "Authorization",
+                    fixture.owner_invocation_to(&fixture.node_did, &[kv_get()?])?,
+                ))
+                .header(ContentType::JSON)
+                .body("{}")
+                .dispatch(),
+        )
+        .await?;
+        let status = response.status();
+        busy(
+            status,
+            &response.into_string().await.unwrap_or_default(),
+            "/encryption/networks",
+        );
+
+        // SQL (`verify_auth_admitted`): busy, and the statement never runs.
+        let reply = within(fixture.owner_sql(
+            "db",
+            SqlRequest::Execute {
+                sql: "CREATE TABLE never_created (id INTEGER)".into(),
+                params: Vec::new(),
+                schema: None,
+            },
+        ))
+        .await??;
+        busy(reply.status, &reply.body, "sql");
+
+        // A real denial is still a denial on every reclassified route: a
+        // stranger reading the space.
+        let stranger = JWK::generate_ed25519()?;
+        let stranger_vm = tc341_verification_method(&stranger)?;
+        let stranger_invocation = |audience: &str| -> Result<String> {
+            let mut capabilities = Capabilities::new();
+            let (uri, action) = kv_get()?;
+            capabilities.with_action(
+                uri.parse()?,
+                action.parse::<UcanAbility>()?,
+                [std::collections::BTreeMap::<String, serde_json::Value>::new()],
+            );
+            Ok(Payload {
+                issuer: stranger_vm.parse::<DIDURLBuf>()?,
+                audience: audience.parse::<DIDBuf>()?,
+                not_before: None,
+                expiration: test_invocation_expiration(),
+                nonce: Some(fixture.next_nonce()),
+                facts: Some(Vec::<serde_json::Value>::new()),
+                proof: vec![],
+                attenuation: capabilities,
+            }
+            .sign(stranger.get_algorithm().unwrap_or_default(), &stranger)?
+            .encode()?)
+        };
+        let denial = |status: Status, body: &str, route: &str| {
+            assert!(
+                [Status::Unauthorized, Status::Forbidden].contains(&status),
+                "{route}: a denial must not turn into busy: {status} {body}"
+            );
+        };
+        let space_did = fixture.space.did().to_string();
+        let reply = within(fixture.dispatch(stranger_invocation(&space_did)?, &[])).await?;
+        denial(reply.status, &reply.body, "/invoke");
+
+        let response = within(
+            fixture
+                .client
+                .post("/signed/kv")
+                .header(Header::new(
+                    "Authorization",
+                    stranger_invocation(&space_did)?,
+                ))
+                .header(ContentType::JSON)
+                .body(
+                    serde_json::json!({ "space": fixture.space.to_string(), "path": "notes/a" })
+                        .to_string(),
+                )
+                .dispatch(),
+        )
+        .await?;
+        let status = response.status();
+        denial(
+            status,
+            &response.into_string().await.unwrap_or_default(),
+            "/signed/kv",
+        );
+
+        let response = within(
+            fixture
+                .client
+                .post("/encryption/networks")
+                .header(Header::new(
+                    "Authorization",
+                    stranger_invocation(&fixture.node_did)?,
+                ))
+                .header(ContentType::JSON)
+                .body("{}")
+                .dispatch(),
+        )
+        .await?;
+        let status = response.status();
+        denial(
+            status,
+            &response.into_string().await.unwrap_or_default(),
+            "/encryption/networks",
+        );
+        drop(held);
+
+        let reply = fixture
+            .owner_sql(
+                "db",
+                SqlRequest::Query {
+                    sql: "SELECT name FROM sqlite_master WHERE name = 'never_created'".into(),
+                    params: Vec::new(),
+                    max_rows: None,
+                    max_bytes: None,
+                },
+            )
+            .await?;
+        assert_eq!(reply.status, Status::Ok, "{}", reply.body);
+        assert_eq!(reply.json["rows"], serde_json::json!([]), "{}", reply.body);
+        Ok(())
+    }
+
+    /// TC-1317 review R2: a deadline shorter than the read-audit wait cuts a
+    /// read waiting on its audit with `503 request_timeout` and
+    /// `Retry-After: 1`, no data. That the wait is reported as
+    /// `stage = read_audit` is tested in core
+    /// (`tc1317_a_read_waiting_on_its_audit_is_in_the_read_audit_stage`).
+    #[tokio::test]
+    async fn a_deadline_before_the_audit_wait_answers_request_timeout() -> Result<()> {
+        use rocket::http::{Header, Status};
+
+        let mut config = Config::default();
+        config.invocation.deadline_ms = 300;
+        let fixture = KvSyncFixture::new_configured(config, |rocket| {
+            rocket.attach(crate::retry_after_fairing())
+        })
+        .await?;
+        fixture.owner_write("notes/a", Some(b"secret")).await?;
+        let tinycloud = fixture
+            .client
+            .rocket()
+            .state::<TinyCloud>()
+            .expect("TinyCloud is managed");
+        let get = fixture.owner_invocation(&[(
+            fixture.kv_resource("notes/a")?.as_uri().to_string(),
+            "tinycloud.kv/get",
+        )])?;
+        let writer = tinycloud
+            .sqlite_writer_lock()
+            .expect("the fixture runs on SQLite");
+        let held = writer.lock().await;
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            fixture
+                .client
+                .post("/invoke")
+                .header(Header::new("Authorization", get))
+                .dispatch(),
+        )
+        .await?;
+        drop(held);
+        assert_eq!(response.status(), Status::ServiceUnavailable);
+        assert_eq!(response.headers().get_one("Retry-After"), Some("1"));
+        assert_eq!(
+            response.into_string().await.as_deref(),
+            Some(REQUEST_TIMEOUT_BODY)
+        );
         Ok(())
     }
 
