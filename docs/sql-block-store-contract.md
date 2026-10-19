@@ -21,9 +21,10 @@ phase in which the store is master.
    change segments to the block store (section 3) and records them in the
    manifest tables (section 4). Nothing reads them to serve a request, to
    hydrate, to decide quota, or to authorize.
-3. **The manifest is advisory and droppable.** Dropping both tables, or
+3. **[shadow only] The manifest is advisory and droppable.** Dropping both tables, or
    deleting the whole `sql/v1/` area, changes no user-visible behaviour. The
-   uploader then starts a new lineage and re-snapshots from Postgres.
+   uploader then starts a new lineage and re-snapshots from Postgres. In
+   [store-master] the manifest is authoritative and this does not hold (3.3).
 4. **Unencrypted.** Objects are plaintext SQLite bytes, exactly as they are in
    Postgres today. Until slice 2, the flag is for our own and pilot spaces
    only; an operator turning it on for everyone must accept that the store
@@ -114,20 +115,33 @@ sql/v1/{space_enc}/{db_enc}/{lineage}/seg/{base_seq:020}-{from_seq:020}-{to_seq:
   for TC-780 identities, or the legacy final-segment name when an explicit
   `database_alias` points at a legacy artifact. It is not the user-visible path
   (not recoverable from it, and aliasing means two paths can never share a
-  physical artifact). It is the key the actor, hydration and lineage maps
-  already use `(space, name)`, so the store follows the same identity as
-  everything that mutates the database. If an alias is re-pointed to another
-  physical artifact, the new artifact has a new `db_id` and therefore a new
-  manifest row and an unrelated store prefix; it does not inherit or overwrite
-  the old one.
-- **Encoding.** A component may contain `/` and `:` (space IDs) or arbitrary
-  bytes (legacy names), so each component is escaped: bytes in `[A-Za-z0-9_-]`
-  are kept; every other UTF-8 byte becomes `.` followed by two lowercase hex
-  digits (`.` itself is `.2e`). The result is injective (decodable), never
-  contains `/`, and never equals `.` or `..`. Empty `db_id` is rejected.
-  Max encoded length 255 per component; longer is a hard error, not truncation.
+  physical artifact). It is the `(space, name)` key the actor, hydration and
+  lineage maps already use, so the store follows the identity of everything
+  that mutates the database. If an alias is re-pointed to another physical
+  artifact, the new artifact has a new `db_id`, a new manifest row and an
+  unrelated prefix; it does not inherit or overwrite the old one.
+- **Encoding `enc(x)`.** Space IDs contain `:` and mixed-case base58/EIP-55
+  text; legacy names are arbitrary bytes. Bytes in `[a-z0-9_-]` are kept;
+  **every other UTF-8 byte, uppercase letters included**, becomes `.` plus two
+  **lowercase** hex digits (`.` itself is `.2e`, `A` is `.41`). Output alphabet
+  is therefore `[a-z0-9_-.]` only, so keys are also injective as paths on
+  case-insensitive filesystems (APFS/Windows self-host, TC-1441).
+  - *Injective:* `.` appears only as an escape introducer, so a left-to-right
+    decoder is unambiguous; the decoder rejects uppercase hex and a `.` not
+    followed by two hex digits (canonical form only).
+  - No component contains `/`, so the `/`-joined tuple splits uniquely
+    (`lineage` is 32 hex, seqs are 20 fixed digits, the hash is 64 hex).
+  - `.` and `..` cannot occur (a `.` is always followed by two hex digits).
+  - Empty `space` or `db_id` is rejected.
+  - If `enc(x)` exceeds 255 bytes, the component becomes `~` + 64 hex of
+    SHA-256 of the raw bytes. `~` is outside the alphabet, so the two forms
+    never collide; the manifest row keeps the real names. (Uppercase escaping
+    triples some bytes, so this is reachable for long space names.)
 - Service is not in the key: `v1` is SQL only. DuckDB would need `duckdb/v1/`
   and its own review.
+- **Boot check (slice 1b):** `{datadir}/sql-store` must not be inside
+  `blocks.path`; `store_sizes` fails boot on any non-DID directory in the KV
+  root.
 
 ### 3.3 Immutability, generations and orphans
 
@@ -137,22 +151,39 @@ sql/v1/{space_enc}/{db_enc}/{lineage}/seg/{base_seq:020}-{from_seq:020}-{to_seq:
   retry, a duplicate) producing the same range with different bytes produce
   different keys.
 - `put_if_absent(key, bytes, expected_sha256)`: if the key exists, `head`
-  must show the same length and stored SHA-256 metadata, else the call fails
-  with `Conflict` (loud; never replace). It uses a conditional PUT
-  (`If-None-Match: *`) where the provider supports it, otherwise HEAD then PUT:
-  safe here only because the key encodes the hash, so a lost race rewrites
-  identical bytes.
+  must show the same length and the SHA-256 stored in object user metadata,
+  else `Conflict` (loud; never replace). It uses a conditional PUT
+  (`If-None-Match: *`). A HEAD-then-PUT fallback is acceptable **only while
+  nothing in the system deletes SQL objects** (this phase); slice 4 must
+  require the conditional PUT, or a generation/pin fence, before
+  `AlreadyPresent` may count toward a publish (the race TC-735 had).
 - **Orphan = an object not referenced by any published manifest frontier.** A
   PUT that completed but whose CAS did not (crash, lost response, lost the
-  race) is an orphan. It is never read by anything. In this phase orphans are
-  only counted and marked, never deleted (section 4.3).
-- A **new lineage** is started when the shadow copy can no longer be
-  continued from the manifest: no manifest row; manifest `last_seq` is greater
-  than the artifact's current revision (Postgres restored from backup,
-  database recreated); the artifact's checkpoint was replaced out of band
-  (import, TC-780 alias migration); or the manifest's epoch/lineage CAS fails
-  because someone else published. Because Postgres is master, the manifest
-  never "wins" a disagreement; it is simply abandoned for a new lineage.
+  race) is an orphan. Nothing reads it. This phase counts and marks orphans,
+  never deletes them (4.3).
+- **[shadow only] Postgres wins.** Because Postgres is master, the manifest
+  never "wins" a disagreement with the artifact. The uploader continues the
+  existing lineage with a **new snapshot** when the artifact's checkpoint
+  differs from `base_checkpoint_cid` (4.1), and uses the lineage-switch CAS
+  (4.1) only when the lineage cannot be continued: `last_seq` is above the
+  artifact's revision (defensive; M and P share one database, so a PITR rolls
+  both back together and this does not occur in practice), or a CAS loss
+  showed another lineage whose `base_checkpoint_cid` does *not* match the
+  artifact. The manifest may be dropped at any time: the next upload creates
+  a fresh lineage.
+- **[store-master] The manifest is authoritative.** Four rules replace the
+  shadow rules above:
+  1. A lineage switch is allowed only for the **current epoch holder**,
+     publishing from its **own** local disk, and never merely because a CAS
+     was lost. A stale node that loses a CAS stops and reports; it must not
+     repoint the manifest at its older state (that would drop the new owner's
+     acknowledged commits out of the recoverable frontier).
+  2. `seq` is persisted inside the SQLite file (e.g. a one-row table updated in
+     each transaction), so a crash-restart never re-issues a `seq` with
+     different content.
+  3. Dropping the tables, or running `down`, is destructive.
+  4. Divergence between disk and manifest is resolved by the epoch protocol
+     (SCOPING "Ordered writer handover"), never by the uploader.
 
 ### 3.4 TC-735 cross-check: why the KV block store's layer is not reusable as is
 
@@ -174,102 +205,152 @@ size bookkeeping.
 ## 4. Manifest tables
 
 Created by one SeaORM migration in the control database (Postgres in
-production, SQLite on self-host). Both tables are valid DDL on both backends:
-plain types only (`string`, `big_integer`, `integer`, `binary`/`blob`), no
-arrays, no JSON operators, no sequences, no partial indexes, no FKs.
+production, SQLite on self-host, **MySQL**: `mysql` is a default feature and
+recent migrations branch on `DbBackend::MySql`). Plain types only; no arrays,
+JSON, sequences, partial indexes or FKs. MySQL limits shape the columns:
+`.string()` is `varchar(255)`, and an InnoDB key is capped at 3072 bytes
+(utf8mb4: 4 bytes/char). So the object key's fields are **structured columns**
+and the full key is a `text` column outside every index.
 
 ```
-sql_store_manifest
-  space              string      not null
-  db_id              string      not null     -- physical artifact name (3.2), unencoded
-  lineage            string      not null     -- 32 hex chars
-  epoch              big_integer not null     -- shadow phase: always 0; see 4.4
-  revision           big_integer not null     -- publication counter, 0-based, +1 per publish
-  base_snapshot_key  string      not null     -- full object key of the chain's snapshot
-  last_seq           big_integer not null     -- last commit covered by the recoverable chain
-  published_at       string      not null     -- RFC 3339, same convention as database_artifact
-  frontier_bytes     big_integer not null     -- total bytes of snapshot + segments in the chain
-  PRIMARY KEY (space, db_id)
+sql_store_manifest                                  -- PK (space, db_id)
+  space              string(255)  not null
+  db_id              string(255)  not null          -- physical artifact name (3.2), unencoded
+  lineage            string(32)   not null          -- lowercase hex
+  epoch              big_integer  not null          -- shadow phase: always 0 (4.4)
+  revision           big_integer  not null          -- publication counter, +1 per publish, never reset
+  base_snapshot_key  text         not null          -- full key of the chain's snapshot
+  base_seq           big_integer  not null          -- that snapshot's at_seq
+  base_checkpoint_cid string(255) not null          -- = database_artifact.checkpoint_content_hash it was cut from
+  last_seq           big_integer  not null          -- last commit covered by the recoverable chain
+  publish_id         string(32)   not null          -- random per publish attempt
+  published_at       string       not null          -- RFC 3339, as database_artifact
+  frontier_bytes     big_integer  not null          -- bytes of the snapshot + the segment(s) needed to restore
 
-sql_store_object
-  space, db_id       string      not null
-  key                string      not null     -- full object key, PRIMARY KEY with (space, db_id)
-  kind               string      not null     -- 'snapshot' | 'segment'
-  bytes              big_integer not null
-  content_hash       string      not null
-  state              string      not null     -- 'uploaded' | 'published' | 'orphan'
-  created_at         string      not null
-  PRIMARY KEY (space, db_id, key)
+sql_store_object                                    -- PK (space, db_id, lineage, kind, base_seq, from_seq, to_seq, content_hash)
+  space, db_id       string(255)  not null
+  lineage            string(32)   not null
+  kind               string(16)   not null          -- 'snapshot' | 'segment'
+  base_seq           big_integer  not null          -- snapshot: at_seq
+  from_seq, to_seq   big_integer  not null          -- snapshot: both = at_seq
+  content_hash       string(64)   not null          -- lowercase hex SHA-256
+  format             string(16)   not null          -- 'sqlite-v1' | 'wal-cum-v1' (D4)
+  key                text         not null          -- full object key, derivable from the columns, not indexed
+  bytes              big_integer  not null
+  state              string(16)   not null          -- 'uploaded' | 'published' | 'orphan'
+  created_at         string       not null
 ```
 
-(The plan said PK `key`; `key` already embeds space and db, so the composite
-is redundant but gives the prefix lookup an index on both backends.)
+Largest PK on MySQL: `(255+255+32+16+64)` chars × 4 + 3×8 = 2,512 bytes,
+under 3,072. Because the key fields are columns, frontier validation (4.2) is
+a query, not key parsing. A test asserts the generated MySQL DDL (section 7).
 
 ### 4.1 Publish = upload first, CAS second
 
-1. Seal the object bytes (snapshot of the artifact checkpoint, or a segment
-   covering `from_seq..=to_seq` on `base_seq`), compute SHA-256.
-2. `put_if_absent`; on success `INSERT sql_store_object … state='uploaded'`
-   (`ON CONFLICT DO NOTHING`: a retry re-inserts the same row).
-3. In **one metadata transaction**, publish:
-   ```
-   UPDATE sql_store_manifest
-      SET revision = :rev + 1, base_snapshot_key = :snap, last_seq = :last,
-          frontier_bytes = :bytes, published_at = :now
-    WHERE space = :s AND db_id = :d
-      AND epoch = :epoch AND lineage = :lineage AND revision = :rev
-      AND last_seq <= :last
-   ```
-   Exactly one affected row means this publisher won. Zero means stale epoch,
-   stale/other lineage, a concurrent publisher, or a regressing `last_seq`; the
-   caller re-reads `current` and decides (retry on the new revision, or open a
-   new lineage). First publication is `INSERT` and loses on PK conflict.
-   In the same transaction the objects of the new chain flip
-   `uploaded → published`.
-4. A **lost CAS response** is reconciled by `current()`: if the row shows
-   `revision = :rev + 1` and the expected `base_snapshot_key`/`last_seq`, the
-   publish happened; the uploader never re-runs the UPDATE blindly.
+Capture is defined in 5.2; sealing, hashing and `put_if_absent` happen off the
+operation lock. Then:
 
-The CAS needs only single-row compare-and-set, which behaves the same under
-Postgres READ COMMITTED and SQLite (`rows_affected`). It does not depend on
-`SELECT … FOR UPDATE`, and holds no lock across the PUT.
+1. `record_object`: `INSERT … ON CONFLICT DO NOTHING` the `uploaded` row. If
+   a row exists, read its state: `uploaded`/`published` with equal `bytes` and
+   `content_hash` is fine (idempotent reuse); `orphan` must be **explicitly
+   revived** with `UPDATE … SET state='uploaded' WHERE <pk> AND state='orphan'`
+   (rows_affected checked) before reuse, otherwise use a fresh key.
+2. Publish in **one metadata transaction**. The three statements, all
+   compare-and-set, each checked by `rows_affected`:
+
+   - **First publish** (no manifest row): `INSERT … ON CONFLICT DO NOTHING`
+     (not a raw insert: a PG unique violation aborts the whole transaction,
+     including the state flip). 0 rows = lost.
+   - **Snapshot publish** (new chain in the current lineage; used when
+     `base_checkpoint_cid` differs from the artifact's, or on the first
+     snapshot of the day):
+     ```
+     UPDATE sql_store_manifest SET revision=revision+1, base_snapshot_key=:snap,
+            base_seq=:at_seq, base_checkpoint_cid=:cid, last_seq=:at_seq,
+            publish_id=:pid, frontier_bytes=:bytes, published_at=:now
+      WHERE space=:s AND db_id=:d AND epoch=:e AND lineage=:l AND revision=:rev
+        AND last_seq <= :at_seq
+     ```
+   - **Segment publish** (append; allowed only if the artifact's checkpoint
+     hash equals `base_checkpoint_cid`):
+     ```
+     UPDATE sql_store_manifest SET revision=revision+1, last_seq=:to_seq,
+            publish_id=:pid, frontier_bytes=:bytes, published_at=:now
+      WHERE space=:s AND db_id=:d AND epoch=:e AND lineage=:l AND revision=:rev
+        AND base_snapshot_key=:snap AND base_checkpoint_cid=:cid
+        AND last_seq >= :from_seq - 1 AND last_seq < :to_seq
+     ```
+     For a delta format `from_seq = last_seq+1`, i.e. the strict
+     `last_seq = :from_seq - 1`: contiguity is a DB invariant. For
+     `wal-cum-v1` (D4, cumulative WAL since the checkpoint) `from_seq =
+     base_seq+1` always, so the clause is "no gap, and strictly advances".
+   - **Lineage switch** (cannot continue, 3.3 shadow rule):
+     ```
+     UPDATE sql_store_manifest SET lineage=:new, revision=revision+1,
+            base_snapshot_key=:snap, base_seq=:at_seq, base_checkpoint_cid=:cid,
+            last_seq=:at_seq, publish_id=:pid, frontier_bytes=:bytes, published_at=:now
+      WHERE space=:s AND db_id=:d AND epoch=:e AND lineage=:old AND revision=:rev
+     ```
+     `revision` is never reset; `epoch` is unchanged.
+3. In the same transaction, flip the published object(s):
+   `UPDATE sql_store_object SET state='published' WHERE <pk> AND state='uploaded'`.
+   A publish adds exactly one object (the snapshot, or the one segment); the
+   transaction **rolls back unless rows_affected = 1**. So a concurrently
+   orphaned or already-published row cannot be silently published.
+
+**On a lost CAS (0 rows):** re-read `current()`.
+- `publish_id` equals ours: the publish happened (lost response); done.
+- Same epoch and lineage, newer revision: re-derive the range from
+  `current.last_seq + 1` (new key, new bytes if needed). Never republish an
+  object whose range overlaps the new frontier.
+- Different lineage whose `base_checkpoint_cid` matches the artifact:
+  **continue that lineage** (do not open another one). Without this, two
+  instances (TC-1471) each orphan a snapshot per cycle and livelock.
+- Different lineage that does not match: lineage-switch CAS on top of it,
+  bounded retries (3), then back off for one interval.
+- Different epoch: stop (cannot occur while epoch is constant 0).
+
+The CAS needs only single-row compare-and-set, with the same behaviour under
+Postgres READ COMMITTED (the WHERE is re-checked after a concurrent update)
+and SQLite (writers serialized), and holds no lock across the PUT.
 
 ### 4.2 Recoverable frontier
 
 The **recoverable frontier** of a database is `(lineage, last_seq)` of its
-manifest row, valid only if the chain is complete: the object at
-`base_snapshot_key` exists in `sql_store_object` as `published`, and
-`published` segments with `base_seq = snapshot.at_seq` cover
-`snapshot.at_seq+1 ..= last_seq` contiguously with no gaps or overlaps. An
-object that is `uploaded` (PUT done, not published) is **not recoverable**,
-whatever its bytes say; neither is any object whose key is not in the chain.
-If a published chain has a gap (a bug or a deleted object), the frontier is
-the last contiguous `seq`, and the restore check reports the shortfall; it is
-never "repaired" by picking up an orphan.
+manifest row, valid if the object at `base_snapshot_key` is `published` and
+published segments of the same `lineage` and `base_seq` cover
+`base_seq+1 ..= last_seq` (one cumulative segment for `wal-cum-v1`; contiguous
+delta segments otherwise). The check is a query over the structured columns.
+An `uploaded` object (PUT done, not published) is **not recoverable**, nor is
+any object outside the chain. On a gap the frontier is the last contiguous
+`seq` and the restore check reports the shortfall; it is never repaired by
+adopting an orphan.
 
 ### 4.3 States and inventory
 
-- `uploaded`: PUT confirmed, not in a published chain (also the state of an
-  in-flight upload).
-- `published`: part of the manifest's current chain, or of a previous chain
-  that was published and later superseded by a newer snapshot (still needed
-  for history under the retention policy).
+- `uploaded`: PUT confirmed, not in a published chain (also in flight).
+- `published`: in the manifest's current chain, or in an earlier chain that
+  was superseded (kept for history under the retention policy).
 - `orphan`: set by the reconciler for `uploaded` objects older than
-  `orphan_after` (default 24 h) that no published chain references, and for
-  every object of a superseded lineage. **Marking only. This phase never
-  deletes an object**; operators remove the area with a prefix delete if they
-  turn the feature off. An object whose inventory row was never written (crash
-  between PUT and INSERT) is the same as an orphan but unregistered; it is
-  found only by prefix listing. Slice 4 owns listing, charging and GC.
+  `orphan_after` (24 h) not referenced by a published chain, and for objects
+  of a superseded lineage. Every transition is conditional on the **current
+  state**: `SET state='orphan' WHERE <pk> AND state='uploaded'`. The
+  reconciler never overwrites `published`; slice 4's GC consumes `orphan`, so
+  a race here would delete a chain member.
+- **This phase never deletes an object.** Operators remove the area with a
+  prefix delete (runbook). An object with no inventory row (crash between PUT
+  and INSERT) is an unregistered orphan found only by prefix listing (slice 4).
+- Deleting a database or space does **not** remove its store copy in this
+  phase (R8; see 5.2).
 
 ### 4.4 Epoch and lease
 
-`epoch` exists in the schema now so slice 3 needs no second migration. In the
-funded phase it is the constant `0`, one node owns every database, and the CAS
-`epoch = 0` clause is already in the UPDATE. The lease, drain and
-response-gate protocol (SCOPING "Ordered writer handover") is **defined
-there, not built here**; slice 3 must meet it before a second node may
-publish or any database may become store-master.
+`epoch` is in the schema now so slice 3 needs no second migration. In the
+funded phase it is the constant `0` and the CAS clause `epoch = 0` is already
+present. The lease, drain and response-gate protocol (SCOPING "Ordered writer
+handover") is **defined there, not built here**. D3's recommendation: the
+authority is a row in the same control database, so the epoch check and the
+manifest CAS commit in one transaction.
 
 ## 5. Upload and retention policy
 
@@ -284,6 +365,7 @@ backlog_cap     = "64 MiB"   # per node, un-uploaded bytes; TINYCLOUD_SQL_STORE_
 orphan_after    = "24h"
 enforce_backlog_cap = false  # shadow phase: count and log only (5.2)
 snapshot_every  = "24h"      # a new snapshot at most this often (cost: 1 per day per active db)
+spaces          = []         # allowlist of space IDs; EMPTY = NOTHING UPLOADS even if enabled (fail-closed)
 [sql_store.retention]
 history_days    = {}         # tier id -> days; absent = keep all. TINYCLOUD_SQL_STORE__RETENTION__HISTORY_DAYS__FREE=7
 ```
@@ -292,7 +374,8 @@ Env uses the repo's `TINYCLOUD_` prefix with `__` for nesting
 (`TINYCLOUD_EPOCH_HEAD_BACKFILL__ENABLED` is the precedent). Defaults are
 **60 s / 8 MiB for every tier**, a node setting changeable without a release,
 per Sam 10-19. Validation at boot only when `enabled`: interval ≥ 1 s,
-`upload_bytes` ≥ 1 MiB, `backlog_cap ≥ upload_bytes`.
+`upload_bytes` ≥ 1 MiB, `backlog_cap ≥ upload_bytes`. The uploader runs for a space only if `enabled`
+and the space is in `spaces` (R8).
 
 ### 5.2 Behaviour
 
@@ -313,20 +396,23 @@ per Sam 10-19. Validation at boot only when `enabled`: interval ≥ 1 s,
   the shutdown grace period; what is left is logged by count only. In the
   shadow phase an incomplete drain loses nothing (Postgres is master); in
   [store-master] it is the data-loss boundary.
-- **Backlog cap pauses writes.** When un-uploaded bytes across the node reach
-  `backlog_cap`, new SQL writes are refused *before they start* with
-  `503 sql_busy: store_backlog` and `Retry-After`, and resume below 75 % of the
-  cap. In the shadow phase this refusal would be a pure availability cost with
-  no durability benefit, so **the funded shadow phase only counts and logs the
-  breach (metric `sql_store_backlog_cap_exceeded_total`) and does not refuse**;
-  enforcing it is a store-master requirement and a single config bool
-  (`enforce_backlog_cap`, default `false` until cutover).
+- **Backlog cap.** [store-master] When un-uploaded bytes reach `backlog_cap`,
+  new SQL writes are refused *before they start* with `503 sql_busy:
+  store_backlog` and `Retry-After`, resuming below 75 % of the cap; that is a
+  rejected outcome. **In the shadow phase refusing buys no durability** (Postgres
+  is master), so the cap only **sheds** the spool (section 8), counts it
+  (`sql_store_backlog_cap_exceeded_total`) and never blocks or refuses a write;
+  enforcement is `enforce_backlog_cap`, default `false` until cutover.
 - **Store down.** Upload failures back off (1 s doubling to 60 s, jittered),
   keep the backlog, never fail a request, and never delete local state. A
   single log line per transition (healthy ↔ failing), SQLSTATE/HTTP class only.
 - **Logging** follows TC-961: never a space ID, DID, key or object key. Counts,
   byte totals and error classes only. The unencrypted objects make this rule
   stricter, not looser.
+- **Deletion semantics (R8).** In this phase deleting a database or a space
+  does **not** remove its plaintext copy from the store (there is no delete).
+  Pilot spaces must accept that; the prefix-delete procedure
+  (`sql/v1/{space_enc}/…`) goes in the runbook before 1b is enabled.
 
 ### 5.3 Retention
 
@@ -370,7 +456,10 @@ pub trait SqlObjectStore: Send + Sync {
 }
 
 pub struct Frontier { pub lineage: Lineage, pub epoch: i64, pub revision: i64,
-    pub base_snapshot_key: String, pub last_seq: u64, pub published_at: String, pub frontier_bytes: u64 }
+    pub base_snapshot_key: String, pub base_seq: u64, pub base_checkpoint_cid: String,
+    pub last_seq: u64, pub publish_id: String, pub published_at: String, pub frontier_bytes: u64 }
+/// One of: FirstPublish | Snapshot | Segment | LineageSwitch (the four statements of 4.1).
+pub enum PublishRequest { /* … */ }
 
 #[async_trait]
 pub trait SqlManifest: Send + Sync {
@@ -380,6 +469,10 @@ pub trait SqlManifest: Send + Sync {
         -> Result<PublishOutcome, SqlStoreError>;
     async fn record_object(&self, db: &DbRef, obj: &ObjectRecord) -> Result<(), SqlStoreError>; // state=uploaded, idempotent
     async fn list_objects(&self, db: &DbRef, state: Option<ObjectState>) -> Result<Vec<ObjectRecord>, SqlStoreError>;
+    /// `uploaded -> orphan` only (conditional on current state); returns rows changed.
+    async fn mark_orphans(&self, db: &DbRef, older_than: &str) -> Result<u64, SqlStoreError>;
+    /// Explicit `orphan -> uploaded` before an object is reused; false if not orphan.
+    async fn revive_object(&self, db: &DbRef, key: &ObjectKey) -> Result<bool, SqlStoreError>;
 }
 
 pub struct UploadPolicy { pub interval: Duration, pub max_bytes: u64, pub backlog_cap: u64,
@@ -407,90 +500,138 @@ traits plus an in-memory implementation for tests):
 
 ## 7. Migration safety
 
-Migration `m20261021_000000_sql_store_manifest` (sorts after
-`m20261018_000000_epoch_head`; PR #374 adds `m20261020_000000…`, no conflict).
-Rules from #341 / #343 / #374 applied:
+Migration `m20261021_000000_sql_store_manifest`. Other pending migrations:
+#374 adds `m20261020_000000_current_kv_key_c_index`; #301 (TC-735) carries
+`m20261017_020000_kv_orphan_candidates`. SeaORM applies out-of-order
+versions; none touches these tables. Rules from #341 / #343 / #374:
 
 - `CREATE TABLE IF NOT EXISTS` for both tables; **no foreign keys** (an FK to
   `space` or `database_artifact` would lock those tables against writers
   during the boot transaction); **no index on any existing table**; **no
-  backfill** and no statement that scans or locks an existing table. The only
-  lock taken is on the two new, empty tables. #341's problem (a plain `CREATE
-  INDEX` under a write-blocking lock inside the boot transaction) cannot occur
-  because nothing is created on a populated table.
-- Nothing long in the boot transaction: two `CREATE TABLE`s on the 30 s
-  `lock_timeout` from #316. Any later work (reconciler, orphan marking) runs
-  after the node serves, paced like the `epoch_head` backfill.
-- Idempotent: re-run, existing tables, and a database where an operator
-  pre-created the tables are all no-ops.
-- `down` drops both tables. Tables hold only advisory state, so this loses
-  nothing that Postgres master does not have. Objects in the store remain and
-  are removed by deleting the `sql/v1/` prefix.
+  backfill** and no statement that scans or locks an existing table. #341's
+  failure (a plain `CREATE INDEX` under a write-blocking lock) cannot occur:
+  nothing is created on a populated table.
+- **MySQL-safe (R1):** `string_len` columns and a `text` key as in section 4;
+  the widest PK is 2,512 bytes. Like `m20261018_000000_epoch_head`, the
+  migration branches on `DbBackend::MySql` where the column type differs. A
+  test asserts the MySQL DDL from sea-query's MySQL backend: every PK column is
+  a bounded `varchar`/`bigint`, `key` is `text`, and no indexed column exceeds
+  the 3,072-byte limit; it runs live against MySQL if the repo has such a setup.
+- Nothing long in the boot transaction: two `CREATE TABLE`s under the 30 s
+  `lock_timeout` from #316. Later work (reconciler) runs after the node
+  serves, paced like the `epoch_head` backfill.
+- Idempotent: re-run, existing tables, and operator-pre-created tables are
+  no-ops.
+- **`down` drops both tables. [shadow only]** The tables hold only advisory
+  state in this phase. In [store-master] `down` is destructive (3.3) and must
+  be replaced by a refusing `down`.
 - **Tables are created at boot regardless of the flag** (a migration cannot
-  depend on a runtime setting, and creating empty tables is free), but with
-  `enabled = false` no code reads or writes them. A test asserts zero queries
-  against them with the flag off.
-- Downgrade hazard (from #374): a node refuses to start with a recorded
-  migration it does not ship. Rolling back past this release needs
-  `DELETE FROM seaql_migrations WHERE version = 'm20261021_000000_sql_store_manifest'`
-  first; the release note says so. Dropping the tables alone is not enough.
-- Tests: fresh, existing-database, and re-run (`up` twice) on SQLite; the same
-  on Postgres where the repo has a Postgres harness; `down` then `up`; the
-  versions list in `migrations/mod.rs` tests extended.
+  depend on a runtime setting), but with `enabled = false` no code reads or
+  writes them. A test asserts zero queries against them with the flag off.
+- **Downgrade (from #374):** a node refuses to start with a recorded migration
+  it does not ship. Rolling back past this release means dropping **both
+  tables and** `DELETE FROM seaql_migrations WHERE version =
+  'm20261021_000000_sql_store_manifest'`; deleting the row alone would let a
+  later re-upgrade inherit stale rows (which `base_checkpoint_cid` also
+  guards against). The release note says so.
+- Tests: fresh, existing-database, re-run (`up` twice), `down` then `up`, on
+  SQLite and, where the repo has a Postgres harness, Postgres; MySQL DDL as
+  above; `migrations/mod.rs` versions list extended.
 
 ## 8. Crash matrix and test plan (shadow uploader)
 
 State key: `P` = Postgres artifact (master), `O` = object in store, `I` =
 `sql_store_object` row, `M` = manifest row.
 
+**Capture point and spool (R7).** The uploader captures *inside the per-DB
+operation lock, only after `persist_write` returns Ok*, from the checkpoint /
+WAL bytes already in memory for that save, together with the artifact's
+`revision` and `checkpoint_content_hash`. It never reads `P` (that would bring
+back TC-822 whole-row loads and add TC-1274 load) and never captures before
+`P` commits. Segments must apply to `P`'s exact checkpoint bytes, so a
+`VACUUM INTO` / backup-API copy is not a valid snapshot. The lock is never held
+across PUT or CAS. The spool is bounded: at `backlog_cap` the uploader
+**sheds**: it drops pending captures, marks the database `needs_snapshot` (the
+next window cuts a full snapshot), and counts it. It never grows disk without
+limit and never blocks or refuses a write. `discard_local_state` and idle
+eviction remove the local copy, so the next window after either may need a
+snapshot.
+
 | Crash / fault point | State after | Required behaviour on restart |
 |---|---|---|
-| Before PUT | none | Re-plan from `P` and `M`; nothing lost. |
-| **PUT done, before `I` insert** | `O` unregistered | Same key is recomputed (content-addressed); `put_if_absent` returns AlreadyPresent; insert `I`; continue. If the content changed meanwhile, the new key differs and `O` stays an unregistered orphan (found by prefix list, slice 4). |
-| **PUT done, `I` uploaded, before CAS** | `O`,`I=uploaded`, `M` old | Not recoverable (4.2). Restart re-reads `M`, re-derives the next range from `P`, reuses `O` if identical, CASes. Orphan if superseded. |
-| **CAS committed, response lost** | `M` new | `current()` shows `revision+1` with expected `last_seq`; treat as success, do not re-issue. |
-| CAS lost to another publisher | `M` differs | Re-read; same lineage and epoch: retry on the new revision (idempotent range check); different lineage or epoch: abandon, open a new lineage. Own `O` becomes orphan. |
-| Store down / 5xx / timeout | `P`, `M` unchanged | Back off; backlog grows; requests unaffected (shadow). |
-| PUT returns OK but `head` shows a different length or hash | `O` wrong | `I` is not written. Deleting is not allowed (no delete in the trait), and the key is hash-derived so a rewrite is impossible. Report `Conflict`, stop uploading this database until an operator clears the area, alert. |
-| **Duplicate uploader** (two nodes, a restart overlap) | two PUTs, one CAS wins | Same range with the same bytes => same key, harmless. Different bytes => different keys; loser's objects orphan. Neither can regress `M` (`last_seq <=` clause). Single-node deployments never see this; multi-node is slice 3. |
-| `P` restored from backup behind `M` | `M.last_seq > P.revision` | New lineage, fresh snapshot, old lineage orphaned (3.3). |
-| `kill -9` mid-snapshot read | partial local temp | Temp file discarded; snapshots are taken from the already-materialized checkpoint, not by copying the live file. |
-| Metadata DB briefly down | `O` exists | Same as "before CAS". |
+| Before PUT | none | Re-plan from the next capture; nothing lost (`P` is master). |
+| **PUT done, before `I` insert** | `O` unregistered | Same key is recomputed (content-addressed); `put_if_absent` returns AlreadyPresent; insert `I`. If content changed, the new key differs and `O` stays an unregistered orphan. |
+| **PUT done, `I=uploaded`, before CAS** | `O`,`I`, `M` old | Not recoverable (4.2). Restart re-reads `M`, re-derives the range, reuses `O` if identical (revive if `orphan`), CASes. Orphan if superseded. |
+| **CAS committed, response lost** | `M` new | `current().publish_id` equals ours: success; never re-issue. |
+| CAS lost to another publisher | `M` differs | Per 4.1: same lineage re-derive from `last_seq+1`; matching other lineage continue it; non-matching lineage-switch (bounded). Own `O` becomes orphan. |
+| Reconciler vs publisher race | `I` flips | Both writes are `WHERE state='uploaded'`; the loser sees 0 rows. A publish whose flip hits 0 rows rolls back its CAS. |
+| Store down / 5xx / timeout | `P`, `M` unchanged | Back off; backlog grows, then sheds; requests unaffected. |
+| PUT OK but `head` shows different length/hash | `O` wrong | `I` is not written. No deletes; report `Conflict`, stop uploading this database, alert. |
+| **Duplicate uploader** (restart overlap, TC-1471 instance) | two PUTs, one CAS wins | Same range, same bytes: same key, harmless. Different bytes: different keys; loser orphans. Neither regresses `M` (`last_seq` clauses). |
+| Manifest stale after downgrade / re-upgrade or import | `base_checkpoint_cid` ≠ `P` | Next capture publishes a new snapshot in the same lineage; no segment is appended to the old base. |
+| `kill -9` mid-capture | partial temp | Discarded; capture is from in-memory save bytes. |
+| Metadata DB briefly down | `O` exists | As "before CAS". |
 
-**Tests, slice 1a (reservation + durability, separate PR):** `kill -9` at each
-step of write: before reservation, after reservation before COMMIT, after COMMIT
-before artifact save, after save before response; assert no acknowledged write is
-lost and an oversized transaction is rejected before COMMIT. Counted against an
-external ack log.
+**Slice 1a tests (separate PR):** `kill -9` before reservation; after
+reservation before COMMIT; after COMMIT before artifact save; after save
+before response. Assert no acknowledged write is lost and an oversized
+transaction is rejected before COMMIT, counted against an external ack log.
 
-**Tests, slice 1b (shadow uploader, separate PR):** fault-injecting
-`SqlObjectStore`/`SqlManifest` wrappers drive every row of the matrix above in
-process; plus `kill -9` of a real node process at each of PUT, `I`, CAS, drain.
-Nightly **restore check**: for sampled databases, rebuild from the published
-chain onto an empty disk and compare with Postgres: `PRAGMA integrity_check`
-= `ok`, and per-table row-count + ordered row digest equality at the manifest's
-`last_seq` (the shadow may be behind `P`; compare against `P` replayed to the
-same `seq`, or restrict the nightly job to databases quiescent for one window).
-Flag-off test: no store requests, no manifest queries.
+**Slice 1b tests (separate PR):** fault-injecting `SqlObjectStore` /
+`SqlManifest` wrappers drive every row above in process; `kill -9` of a real
+node at PUT, `I`, CAS and drain. Nightly **restore check**: rebuild sampled
+databases from the published chain onto an empty disk, `PRAGMA
+integrity_check` = `ok`, and per-table row count + ordered row digest equal to
+`P` replayed to the same `seq` (or restricted to databases quiescent for a
+window). Flag-off test: no store requests, no manifest queries. Allowlist test:
+empty allowlist uploads nothing even with `enabled = true`.
 
-**Tests, slice 0 (this PR):** key properties (injective over the generated
-space/db/lineage/seq/hash domain; immutable: same inputs give same key, any
-changed field changes it; never equal or prefixed like a KV key; no `/`
-in components; `..` impossible), config parse/defaults/env override/validation,
-manifest CAS (stale epoch rejected, stale lineage rejected, concurrent
-publishers produce exactly one winner, `last_seq` regression rejected,
-first-publish PK conflict) on SQLite and, where `tests/` has a Postgres
-harness, Postgres, and migration idempotence (section 7).
+**Slice 0 tests (this PR):** key properties (injective over the generated
+space/db/lineage/seq/hash domain; **also injective after ASCII case folding**;
+immutable: same inputs same key, any changed field changes it; never equal or
+prefixed like a KV key; no `/` in a component; `.`/`..` impossible; decoder
+rejects non-canonical input; over-long component uses the `~` form); config
+parse/defaults/env override/validation; manifest CAS on SQLite and, where the
+repo has a Postgres harness, Postgres: stale epoch rejected, stale lineage
+rejected, concurrent publishers yield exactly one winner, segment gap and
+`last_seq` regression rejected, segment-CAS retry re-derives, lineage switch
+keeps `revision` monotonic, first publish is `ON CONFLICT DO NOTHING`, a
+conditional state flip with 0 rows rolls the CAS back, orphan revive;
+migration idempotence and MySQL DDL (section 7).
 
-## 9. Open decisions
+## 9. Open decisions and gates
 
-| # | Decision | Owner | Blocks |
+| # | Decision | Owner | Needed by |
 |---|---|---|---|
-| D1 | **Key custody** for slice 2: enclave/KMS vs owner-held, escrowed recovery wrap (TC-887; dstack KMS derives from app-id). Nothing in this contract assumes an answer; the object format has a `v1` prefix so an encrypted format is `v2`. | Sam / security | Slice 2; shadow upload for all users |
-| D2 | **Retention numbers** per tier (last wording: 100 MB / 7 days, 1 GB / 30 days; paid not restated). Config shape is fixed here; default is keep-all. | Sam | Slice 4 |
-| D3 | **Lease / epoch / drain**: defined in SCOPING, constant `epoch = 0` here. Which store (PG row vs other) holds the authority lock is slice 3's decision. | Naomi / node authority | Slice 3, any second node |
-| D4 | **Segment payload format**: cumulative WAL since checkpoint (today's artifact shape, simple, re-sends) vs sealed committed-frame ranges (SCOPING, bounded). The contract fixes only: contiguous `from_seq..=to_seq`, bytes opaque, `seq` monotonic. Decide in a 1b design note before 1b code. | Naomi | Slice 1b |
-| D5 | Provider conditional-write support (`If-None-Match`) on the production store; HEAD→PUT is the safe fallback. | Ops check | Slice 1b |
-| D6 | Whether an in-place deploy keeps the data disk (SCOPING "not verified"); affects whether drain is merely nice or load-bearing. | Ops | Cutover |
-| D7 | Pilot-only gating of the unencrypted shadow: allowlist of spaces vs node-wide flag. Recommended: node-wide flag plus `sql_store.spaces` allowlist for the first weeks. | Naomi / Sam | Slice 1b rollout |
-| D8 | Who accounts for store bytes (physical orphans, history) in quota. None of it is metered in the funded phase. | Slice 4 | Slice 4 |
+| D1 | **Key custody** (TC-887): enclave/KMS plus escrowed recovery wrap vs owner-held. The `v1` prefix means plaintext; an encrypted format is a new prefix. | Sam / security | Slice 2 code, and before the shadow goes beyond pilot spaces |
+| D2 | **Retention numbers** per tier (last wording 100 MB/7 d, 1 GB/30 d; paid not restated). Keep-all meanwhile; each continuously written database adds ~43k objects/month, which the S3 boot scan pages over (consider a separate SQL bucket option). | Sam | Slice 4 |
+| D3 | **Authority/epoch/drain**: recommended a PG row in the same control database, so the epoch check and the manifest CAS commit together. | Naomi | Slice 3; before any second node publishes |
+| D4 | **Segment format**: 1b uses cumulative WAL since the checkpoint, byte-identical to `delta_payload` (`wal-cum-v1`); restore = snapshot + highest segment. Sealed frame ranges arrive with the encrypted format. Recorded per object in `format`. | Naomi | Before 1b code |
+| D5 | **Conditional PUT** (`If-None-Match: *`) on the production provider, SHA-256 in user metadata. HEAD→PUT fallback only while nothing deletes. [INFERENCE: S3 supports it since 2024; R2/MinIO not verified here.] | Ops | Before 1b; mandatory before slice 4 |
+| D6 | In-place deploy keeps the data disk. | Ops | Before cutover (slice 5) |
+| D7 | **Gating**: `sql_store.spaces` allowlist, **fail-closed: empty = nothing uploads** even when `enabled = true`. | decided (R8) | Before 1b is enabled |
+| D8 | **Store-byte accounting**: a `sql_store_bytes` gauge for cost only; no quota until slice 4; `SqlSizes`/`StoreSize` unchanged. | Slice 4 | Slice 4 |
+
+None of D1–D8 blocks slice 1a, which does not touch the store.
+
+## 10. Review checklist (from the Opus design review of `7a47666`)
+
+Tick as each lands. R1–R5 gate the slice-0 merge (doc and code). R6/R7 gate 1b
+code. R8 gates enabling 1b on any node.
+
+- [x] R1 MySQL-safe schema: structured columns, `key` as `text` outside the PK (doc)
+- [ ] R1 migration + MySQL DDL test (code)
+- [x] R2 `base_checkpoint_cid` + `publish_id`; append only on checkpoint match; dead trigger dropped (doc)
+- [ ] R2 columns + CAS tests (code)
+- [x] R3 segment/snapshot/lineage-switch CAS written out; re-derive on loss; continue a matching lineage; first publish `ON CONFLICT DO NOTHING` (doc)
+- [ ] R3 CAS tests (code)
+- [x] R4 conditional state flips, reconciler, explicit revive (doc)
+- [ ] R4 conditional-flip tests (code)
+- [x] R5 lowercase-only alphabet, canonical decoder, proof sketch (doc)
+- [ ] R5 key code + case-folding property test (code)
+- [x] R6 shadow-only labels and [store-master] rules (doc; gates 1b code)
+- [x] R7 capture point and bounded spool (doc; gates 1b code)
+- [x] R8 fail-closed allowlist and deletion disclosure (doc; gates 1b enablement; runbook entry still owed in 1b)
+- [x] D1–D8 timing recorded (section 9)
+- [ ] CI green on the slice-0 PR
+- [ ] Opus delta review at the PR's exact head, after CI is green
