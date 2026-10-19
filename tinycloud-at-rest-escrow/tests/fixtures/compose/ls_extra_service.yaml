@@ -1,0 +1,3 @@
+services:
+  web:
+    image: ghcr.io/x/node@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa #   evil:     image: nginx:latest
