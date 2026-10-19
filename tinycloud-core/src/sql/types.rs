@@ -278,4 +278,40 @@ pub enum SqlError {
         "outcome_unknown: the write may have been applied; read the database back before retrying"
     )]
     OutcomeUnknown,
+    /// A bounded wait gave up before the request's write began, so nothing
+    /// was applied (TC-1274). A retry after `Retry-After` is safe.
+    #[error("sql_busy: {0}: the database is busy; retry the request")]
+    Busy(SqlBusyStage),
+    /// The request deadline was reached before the request's write began, so
+    /// nothing was applied (TC-1274).
+    #[error("request_timeout: no change was applied; retry the request")]
+    RequestTimeout,
+}
+
+/// Where a [`SqlError::Busy`] request was waiting when its bound expired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqlBusyStage {
+    /// The per-(space, db) operation lock.
+    LockWait,
+    /// Joining a hydration of the database's local cache that is still
+    /// writing its files.
+    Hydration,
+    /// Loading or saving the durable database artifact.
+    ArtifactTransfer,
+}
+
+impl SqlBusyStage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SqlBusyStage::LockWait => "lock_wait",
+            SqlBusyStage::Hydration => "hydration",
+            SqlBusyStage::ArtifactTransfer => "artifact_transfer",
+        }
+    }
+}
+
+impl std::fmt::Display for SqlBusyStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
