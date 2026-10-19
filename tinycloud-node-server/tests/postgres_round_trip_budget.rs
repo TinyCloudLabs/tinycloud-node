@@ -25,7 +25,9 @@
 //!   `CREATE TABLE IF NOT EXISTS`, through the TC-780 fence and resolve);
 //! - **kv put**: an `/invoke` `tinycloud.kv/put` of a new key;
 //! - **kv get**: an `/invoke` `tinycloud.kv/get` of that key, which waits for
-//!   the durable read-audit commit before it answers.
+//!   the durable read-audit commit before it answers;
+//! - **kv batch get / kv batch head**: one `/invoke` of `tinycloud.kv/get` or
+//!   `tinycloud.kv/metadata` over 100 keys (TC-1274).
 //!
 //! # What is counted
 //!
@@ -133,10 +135,26 @@ use tokio::{
 ///
 /// TC-1274: each epoch-writing commit (both `/delegate`s and the kv put)
 /// gained one round trip, the `epoch_head` cache write, which replaces the
-/// head anti-join over the space's whole history. TC-735's one-statement
-/// authorization snapshot (#302) removes six trips from sign-in and from get
-/// (main alone: 77, 38, 22) and three from put.
-const BUDGETS: [(&str, u64); 3] = [("sign-in", 71), ("kv put", 35), ("kv get", 16)];
+/// head anti-join over the space's whole history (measured on main: 75, 37,
+/// 22; with the cache: 77, 38, 22).
+///
+/// TC-1274: a batch of 100 `kv/get` or `kv/metadata` capabilities is one
+/// `current_kv` lookup per space, so it costs what a single kv get costs
+/// (measured before the batching: 216 round trips and 98 `current_kv`
+/// statements for the 98 distinct keys the fixture asks for). The flows also
+/// check the responses against the fixture, and the test fails if a batch
+/// reads `current_kv` in more than one statement.
+///
+/// TC-735: the one-statement authorization snapshot (#302) removes six trips
+/// from sign-in and from every read invocation (kv get and both batches:
+/// main alone is 77 and 22) and three from kv put (main alone: 38).
+const BUDGETS: [(&str, u64); 5] = [
+    ("sign-in", 71),
+    ("kv put", 35),
+    ("kv get", 16),
+    ("kv batch get", 16),
+    ("kv batch head", 16),
+];
 
 /// Full sign-in plus put plus get rounds run before the measured one.
 const WARM_UP_ROUNDS: u8 = 3;
@@ -578,6 +596,16 @@ impl Window {
         counts
     }
 
+    /// Counted statements that read `current_kv`: the KV index lookups.
+    fn current_kv_statements(&self) -> u64 {
+        self.round_trips
+            .iter()
+            .filter(|round_trip| round_trip.kind == Kind::Counted)
+            .flat_map(|round_trip| &round_trip.executed)
+            .filter(|sql| sql.contains(r#"FROM "current_kv""#))
+            .count() as u64
+    }
+
     fn describe(&self, out: &mut String) {
         for round_trip in &self.round_trips {
             let kind = match round_trip.kind {
@@ -920,6 +948,262 @@ async fn round(node: &Node, account: &Account, out: &mut Vec<Measured>) -> Resul
         read.as_bytes() == KV_VALUE,
         "kv get returned {read:?}, not the value just put"
     );
+    batch_reads(node, &session, out).await?;
+    Ok(())
+}
+
+/// Keys the batch flows read: `batch/000`..`batch/099` holding `v<n>`, of
+/// which `DELETED_KEY` is then deleted, plus two oversized values.
+const BATCH_ITEMS: usize = 100;
+const DELETED_KEY: usize = 7;
+const BIG_KEY: &str = "batch/big";
+const HUGE_KEY: &str = "batch/huge";
+const BIG_VALUE: [u8; 64] = [b'b'; 64];
+const HUGE_VALUE: [u8; 128] = [b'h'; 128];
+
+fn batch_key(index: usize) -> String {
+    format!("batch/{index:03}")
+}
+
+/// The value `key` holds after the fixture is written, or `None` when a read
+/// of it finds nothing (never written, or deleted).
+fn batch_value(key: &str) -> Option<Vec<u8>> {
+    match key {
+        BIG_KEY => Some(BIG_VALUE.to_vec()),
+        HUGE_KEY => Some(HUGE_VALUE.to_vec()),
+        _ => {
+            let index: usize = key.strip_prefix("batch/")?.parse().ok()?;
+            (index < BATCH_ITEMS && index != DELETED_KEY).then(|| format!("v{index}").into_bytes())
+        }
+    }
+}
+
+/// One invocation of `ability` over every key in `keys`, in that order.
+fn batch_invocation(session: &Session, ability: &str, keys: &[String]) -> Result<String> {
+    let ability: Ability = ability.parse()?;
+    let capabilities = keys
+        .iter()
+        .map(|key| {
+            Ok((
+                "kv".parse::<Service>()?,
+                key.parse::<Path>()?,
+                None,
+                None,
+                [ability.clone()],
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(session.invoke(capabilities, None)?.encode()?)
+}
+
+/// The keys a 100-key batch asks for, in request order: a permutation of the
+/// fixture (so present, deleted and capability order all vary), with a
+/// duplicate pair and two keys that were never written.
+fn batch_request() -> Vec<String> {
+    let mut keys: Vec<String> = (0..BATCH_ITEMS)
+        .map(|n| batch_key(n * 37 % BATCH_ITEMS))
+        .collect();
+    keys[10] = keys[3].clone();
+    keys[90] = keys[3].clone();
+    keys[50] = "batch/missing-a".to_owned();
+    keys[51] = "batch/missing-b".to_owned();
+    keys
+}
+
+/// An invocation's capabilities are a map: a repeated key is one capability,
+/// and the order they are answered in is the map's, by resource.
+fn capability_order(keys: &[String]) -> Vec<String> {
+    let mut order = keys.to_vec();
+    order.sort();
+    order.dedup();
+    order
+}
+
+/// The error for the first key, in `order`, whose value is over `limit`.
+fn batch_too_large(order: &[String], limit: usize) -> Option<String> {
+    order.iter().find_map(|key| {
+        let size = batch_value(key)?.len();
+        (size > limit).then(|| {
+            format!("KV response is {size} bytes, exceeding the requested limit of {limit} bytes")
+        })
+    })
+}
+
+async fn batch_put(node: &Node, session: &Session, key: &str, value: &[u8]) -> Result<()> {
+    let (status, body, _) = dispatch(
+        node.client
+            .post("/invoke")
+            .header(Header::new(
+                "Authorization",
+                invocation(session, "kv", key, "tinycloud.kv/put")?,
+            ))
+            .header(ContentType::JSON)
+            .body(value),
+    )
+    .await;
+    expect_ok("batch fixture put", (status, body))?;
+    Ok(())
+}
+
+fn parse_batch(body: &str) -> Result<Vec<serde_json::Value>> {
+    let parsed: serde_json::Value = serde_json::from_str(body)?;
+    Ok(parsed["results"]
+        .as_array()
+        .context("batch response has results")?
+        .clone())
+}
+
+/// Batch `kv/get` and `kv/metadata` reads of 100 keys (TC-1274): measured as
+/// two flows, with the response of each checked against the fixture, so the
+/// same assertions hold before and after the reads are batched in the node.
+async fn batch_reads(node: &Node, session: &Session, out: &mut Vec<Measured>) -> Result<()> {
+    for index in 0..BATCH_ITEMS {
+        let key = batch_key(index);
+        batch_put(
+            node,
+            session,
+            &key,
+            &batch_value(&key).unwrap_or_else(|| b"gone".to_vec()),
+        )
+        .await?;
+    }
+    batch_put(node, session, BIG_KEY, &BIG_VALUE).await?;
+    batch_put(node, session, HUGE_KEY, &HUGE_VALUE).await?;
+    let (status, body, _) = dispatch(node.client.post("/invoke").header(Header::new(
+        "Authorization",
+        invocation(session, "kv", &batch_key(DELETED_KEY), "tinycloud.kv/del")?,
+    )))
+    .await;
+    expect_ok("batch fixture delete", (status, body))?;
+
+    let keys = batch_request();
+    let order = capability_order(&keys);
+    let auth = |ability: &str, keys: &[String]| -> Result<Header<'static>> {
+        Ok(Header::new(
+            "Authorization",
+            batch_invocation(session, ability, keys)?,
+        ))
+    };
+
+    let body = expect_ok(
+        "batch get",
+        node.measure(
+            "kv batch get",
+            "POST /invoke kv/get x100",
+            node.client
+                .post("/invoke")
+                .header(auth("tinycloud.kv/get", &keys)?),
+            out,
+        )
+        .await?,
+    )?;
+    let results = parse_batch(&body)?;
+    ensure!(
+        results.len() == order.len(),
+        "batch get returned {} results",
+        results.len()
+    );
+    let mut etags = HashMap::new();
+    for (key, result) in order.iter().zip(&results) {
+        ensure!(
+            result["key"] == key.as_str(),
+            "result order: {key} is {}",
+            result["key"]
+        );
+        match batch_value(key) {
+            Some(value) => {
+                ensure!(result["ok"] == true, "{key} must be found: {result}");
+                let data = base64::decode(result["dataBase64"].as_str().context("data")?)?;
+                ensure!(data == value, "{key} returned {data:?}");
+                etags.insert(key.clone(), result["headers"]["etag"].clone());
+            }
+            None => ensure!(
+                result["ok"] == false && result["error"]["code"] == "KV_NOT_FOUND",
+                "{key} must be missing: {result}"
+            ),
+        }
+    }
+    let get_digest = hex::encode(Keccak256::digest(body.as_bytes()));
+
+    let body = expect_ok(
+        "batch head",
+        node.measure(
+            "kv batch head",
+            "POST /invoke kv/metadata x100",
+            node.client
+                .post("/invoke")
+                .header(auth("tinycloud.kv/metadata", &keys)?),
+            out,
+        )
+        .await?,
+    )?;
+    let heads = parse_batch(&body)?;
+    ensure!(
+        heads.len() == order.len(),
+        "batch head returned {} results",
+        heads.len()
+    );
+    for (key, head) in order.iter().zip(&heads) {
+        ensure!(
+            head["key"] == key.as_str(),
+            "head order: {key} is {}",
+            head["key"]
+        );
+        match etags.get(key) {
+            Some(etag) => ensure!(
+                head["ok"] == true
+                    && head.get("dataBase64").is_none()
+                    && head["headers"]["etag"] == *etag,
+                "{key} head: {head}"
+            ),
+            None => ensure!(head["ok"] == false, "{key} head: {head}"),
+        }
+    }
+    let head_digest = hex::encode(Keccak256::digest(body.as_bytes()));
+    println!("TC-1274 batch body digests: get {get_digest}, head {head_digest}");
+
+    // The per-key response limit: the first oversized capability, in
+    // capability order, is the one reported (not the largest), and a value of
+    // exactly the limit is not oversized.
+    fn sized<'a>(
+        node: &'a Node,
+        session: &Session,
+        keys: &[String],
+        limit: u64,
+    ) -> Result<LocalRequest<'a>> {
+        Ok(node
+            .client
+            .post("/invoke")
+            .header(Header::new(
+                "Authorization",
+                batch_invocation(session, "tinycloud.kv/get", keys)?,
+            ))
+            .header(Header::new(
+                "x-tinycloud-max-response-bytes",
+                limit.to_string(),
+            )))
+    }
+    for limit in [32, 64] {
+        let keys = [
+            batch_key(1),
+            HUGE_KEY.to_owned(),
+            batch_key(2),
+            BIG_KEY.to_owned(),
+        ];
+        let expected = batch_too_large(&capability_order(&keys), limit as usize)
+            .context("an oversized key")?;
+        let (status, body, _) = dispatch(sized(node, session, &keys, limit)?).await;
+        ensure!(
+            status == Status::PayloadTooLarge && body == expected,
+            "limit {limit}: {status} {body} (expected {expected})"
+        );
+    }
+    let keys = [batch_key(1), BIG_KEY.to_owned(), batch_key(2)];
+    let (status, body, _) = dispatch(sized(node, session, &keys, 64)?).await;
+    ensure!(
+        status == Status::Ok,
+        "a value of exactly the limit: {status} {body}"
+    );
     Ok(())
 }
 
@@ -1057,10 +1341,11 @@ async fn postgres_round_trip_budget() {
             total += counts;
             let _ = writeln!(
                 detail,
-                "    {:<34} {:>3} rt  {:>3} stmt  {} cache  {} excl  {} conn",
+                "    {:<34} {:>3} rt  {:>3} stmt ({} current_kv)  {} cache  {} excl  {} conn",
                 request.request,
                 counts.round_trips,
                 counts.statements,
+                request.window.current_kv_statements(),
                 counts.statement_cache,
                 counts.excluded,
                 counts.connections
@@ -1070,6 +1355,14 @@ async fn postgres_round_trip_budget() {
                 violations.push(format!(
                     "{flow}: {} opened {} connection(s) inside its measured window",
                     request.request, counts.connections
+                ));
+            }
+            // TC-1274: a 100-key batch does O(1) KV lookups, not one per key.
+            if flow.starts_with("kv batch") && request.window.current_kv_statements() > 1 {
+                violations.push(format!(
+                    "{flow}: {} read current_kv in {} statements, not one",
+                    request.request,
+                    request.window.current_kv_statements()
                 ));
             }
         }
