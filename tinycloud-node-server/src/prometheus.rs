@@ -123,6 +123,18 @@ lazy_static! {
         "Reads answered read_audit_busy because their audit record was not committed in time."
     )
     .unwrap();
+    /// Reads answered as stopped because the read-audit drain was gone.
+    pub static ref READ_AUDIT_STOPPED: IntCounter = register_int_counter!(
+        "tinycloud_read_audit_stopped_total",
+        "Reads that failed because the read-audit drain was gone."
+    )
+    .unwrap();
+    /// 1 once the read-audit drain is gone and nothing can commit again.
+    pub static ref READ_AUDIT_DRAIN_STOPPED: IntGauge = register_int_gauge!(
+        "tinycloud_read_audit_drain_stopped",
+        "1 if the read-audit drain is gone and no read can be confirmed, else 0."
+    )
+    .unwrap();
     /// Read-audit records waiting in the queue (TC-1317).
     pub static ref READ_AUDIT_QUEUE_DEPTH: IntGauge = register_int_gauge!(
         "tinycloud_read_audit_queue_depth",
@@ -227,8 +239,10 @@ pub fn observe_read_audit(
             .inc_by(now.failed_batches.saturating_sub(previous.failed_batches));
         READ_AUDIT_ABANDONED.inc_by(now.abandoned.saturating_sub(previous.abandoned));
         READ_AUDIT_BUSY.inc_by(now.busy.saturating_sub(previous.busy));
+        READ_AUDIT_STOPPED.inc_by(now.stopped.saturating_sub(previous.stopped));
         READ_AUDIT_QUEUE_DEPTH.set(now.queue_depth as i64);
         READ_AUDIT_IN_FLIGHT_MS.set(now.in_flight_batch_age_ms as i64);
+        READ_AUDIT_DRAIN_STOPPED.set(i64::from(now.drain_stopped));
     }
 }
 

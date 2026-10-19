@@ -103,7 +103,8 @@ struct PipelineStats {
     failed_batches: AtomicU64,
     abandoned: AtomicU64,
     busy: AtomicU64,
-    /// Batches whose commit took longer than [`SLOW_BATCH`], and the longest.
+    /// Batches in flight longer than [`SLOW_BATCH`], and the longest. On
+    /// SQLite this includes the wait for the writer lock, not only the commit.
     slow_batches: AtomicU64,
     max_commit_ms: AtomicU64,
     /// When the batch now being committed started, in ms since `epoch` plus
@@ -186,7 +187,8 @@ pub struct ReadAuditHealth {
     pub drain_stopped: bool,
 }
 
-/// A batch commit slower than this is reported (TC-1317).
+/// A batch in flight longer than this (the commit, plus the SQLite writer-lock
+/// wait) is reported (TC-1317).
 const SLOW_BATCH: Duration = Duration::from_secs(5);
 /// A batch in flight longer than this, or a queue that waited longer than
 /// [`STALLED_QUEUE_WAIT`] with no batch completing, is a stalled drain.
@@ -2211,6 +2213,78 @@ mod tests {
         };
         watch(&stats, &mut state, hung, later + Duration::from_secs(1));
         assert_eq!(stalled(&state), Some(later + Duration::from_secs(1)));
+    }
+
+    /// A drain that is gone answers every read `Stopped`, counts it, and is
+    /// reported as a stalled drain until it comes back, which it never does.
+    #[tokio::test]
+    async fn tc1317_a_dead_drain_is_counted_and_reported() {
+        let (sender, receiver) = mpsc::channel(CHANNEL_CAPACITY);
+        drop(receiver);
+        let pipeline = ReadAuditPipeline {
+            sender,
+            stats: Arc::default(),
+            wait_ms: Arc::new(AtomicU64::new(PATIENCE.as_millis() as u64)),
+            gate: Arc::default(),
+        };
+        let stalled = |state: &WatchdogState| state.last[3];
+        let mut state = WatchdogState::default();
+        let start = Instant::now();
+
+        // Dead before any read: reported on the first look.
+        let idle = pipeline.health();
+        assert!(idle.drain_stopped);
+        assert_eq!(idle.stopped, 0);
+        watch(&pipeline.stats, &mut state, idle, start);
+        assert_eq!(stalled(&state), Some(start));
+
+        for index in 0..2 {
+            assert_eq!(
+                bounded(&pipeline, index).await,
+                Err(ReadAuditError::Stopped)
+            );
+        }
+        let failing = pipeline.health();
+        assert_eq!((failing.stopped, failing.busy), (2, 0));
+        watch(&pipeline.stats, &mut state, failing, start + WATCHDOG_TICK);
+        assert_eq!(stalled(&state), Some(start), "rate-limited");
+        let later = start + WARNING_INTERVAL;
+        watch(&pipeline.stats, &mut state, failing, later);
+        assert_eq!(stalled(&state), Some(later), "still dead, reported again");
+        assert_eq!(state.reported.stopped, 2);
+    }
+
+    /// A request's deadline context says the time is going to the read
+    /// audit while a read waits for its record, and stops saying so once the
+    /// wait ends: a deadline that cuts the wait logs `stage = read_audit`.
+    #[tokio::test]
+    async fn tc1317_a_read_waiting_on_its_audit_is_in_the_read_audit_stage() {
+        use crate::request_cancel::{within, RequestCancel, Stage};
+
+        let (_directory, _conn, pipeline) = file_pipeline().await;
+        pipeline.set_wait(COMMIT_TEST_WAIT);
+        let context = RequestCancel::new(COMMIT_TEST_WAIT);
+        let held = pipeline.hold_drain().await;
+        let read = tokio::spawn({
+            let (pipeline, context) = (pipeline.clone(), context.clone());
+            async move { within(Some(context), pipeline.enqueue(record(0))).await }
+        });
+        tokio::time::timeout(PATIENCE, async {
+            while context.stage() != Stage::ReadAudit {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the waiting read must be in the read-audit stage");
+        assert!(!read.is_finished(), "still waiting on the held drain");
+
+        drop(held);
+        let outcome = tokio::time::timeout(PATIENCE, read)
+            .await
+            .expect("released drain commits")
+            .unwrap();
+        assert_eq!(outcome, Ok(()));
+        assert_eq!(context.stage(), Stage::Other);
     }
 
     #[tokio::test]
