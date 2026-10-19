@@ -67,6 +67,7 @@ use tinycloud_core::{
 };
 
 pub mod admin;
+pub mod admin_stats;
 pub mod attestation;
 pub mod encryption;
 pub mod hooks;

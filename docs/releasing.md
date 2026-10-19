@@ -109,6 +109,13 @@ Environment settings (Settings → Environments → `production`):
   must not be selected for the organization secret `PHALA_CLOUD_API_KEY`. A
   same-named repository or organization secret is still readable by a job
   without `environment: production`.
+- `NODE_STATS_READ_TOKEN` (TC-1482, read-only `GET /admin/stats`) is not in
+  that list and is not passed to the CVM by `docker.yml` or the compose files,
+  so the route is disabled (`404`) in a deployment until a reviewed change adds
+  it: a `PROD_TINYCLOUD_NODE_STATS_READ_TOKEN` environment secret, the
+  `PHALA_ENV_` pass-through and a compose `environment` line (which changes the
+  reviewed compose hash). Its value must differ from
+  `PROD_TINYCLOUD_ADMIN_SECRET`; the node disables the route if they are equal.
 
 What this blocks: a dispatch on an unlocked branch fails the environment's
 branch policy, even if that branch edits `docker.yml` to name the environment.
