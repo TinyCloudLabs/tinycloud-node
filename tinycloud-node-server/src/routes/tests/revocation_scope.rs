@@ -1065,6 +1065,140 @@ async fn issuing_delegator_and_owner_revoke_a_descendant_its_recipient_cannot() 
     Ok(())
 }
 
+/// POST `/delegate` and return the status, body and receipt CID.
+async fn activate(fixture: &KvSyncFixture, header: String) -> (Status, String, Option<Hash>) {
+    let response = fixture
+        .client
+        .post("/delegate")
+        .header(Header::new("Authorization", header))
+        .dispatch()
+        .await;
+    let status = response.status();
+    let body = response.into_string().await.unwrap_or_default();
+    let cid = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|receipt| {
+            receipt["cid"]
+                .as_str()
+                .and_then(|cid| cid.parse::<Cid>().ok())
+        })
+        .map(Hash::from);
+    (status, body, cid)
+}
+
+#[tokio::test]
+async fn owner_activates_a_parentless_exact_cid_revoke_grant() -> Result<()> {
+    let fixture = scoped_fixture().await?;
+    let target = fixture
+        .device_grant("owner-cid-control-target", &["tinycloud.kv/get"])
+        .await?;
+    let (helper, helper_vm, helper_did) = registered_key(&fixture).await?;
+    let resource = format!("urn:cid:{}", target.to_cid(0x55));
+    let control = fixture.signed_scope_token(
+        &fixture.owner,
+        &fixture.owner_vm,
+        &helper_did,
+        &resource,
+        "tinycloud.delegation/revoke",
+        whole_seconds_from_now(3600),
+        &[],
+    )?;
+    let (status, body, control) = activate(&fixture, control).await;
+    assert_eq!(status, Status::Ok, "owner exact-CID control: {body}");
+    let control = control.expect("control receipt CID");
+    let header = fixture.signed_scope_token(
+        &helper,
+        &helper_vm,
+        &helper_did,
+        &resource,
+        "tinycloud.delegation/revoke",
+        whole_seconds_from_now(3600),
+        &[control.to_cid(0x55)],
+    )?;
+    assert_revoked_ok(&fixture, target, header).await
+}
+
+#[tokio::test]
+async fn only_an_owner_of_the_target_space_activates_a_parentless_exact_cid_revoke_grant(
+) -> Result<()> {
+    let fixture = scoped_fixture().await?;
+    let owner_did = fixture.space.did().to_string();
+    let device_did = fixture.device_did();
+    let target = fixture
+        .device_grant("owner-only-cid-target", &["tinycloud.kv/get"])
+        .await?;
+    let (helper, helper_vm, helper_did) = registered_key(&fixture).await?;
+    let reshare = fixture
+        .grant(
+            "owner-only-cid-reshare",
+            &device_did,
+            &helper_did,
+            &[("notes/", "tinycloud.kv/get")],
+            None,
+            Some(whole_seconds_from_now(1800)),
+            &[target],
+        )
+        .await?;
+    let empty = fixture
+        .grant(
+            "owner-only-cid-no-abilities",
+            &owner_did,
+            &device_did,
+            &[],
+            None,
+            Some(whole_seconds_from_now(3600)),
+            &[],
+        )
+        .await?;
+    let unknown = tinycloud_core::hash::hash(b"owner-only-cid-unknown");
+    let foreign = JWK::generate_ed25519()?;
+    let foreign_vm = tc341_verification_method(&foreign)?;
+    for (label, key, vm, cid) in [
+        ("unrelated signer", &foreign, foreign_vm.as_str(), target),
+        (
+            "target delegatee",
+            &fixture.device,
+            fixture.device_vm.as_str(),
+            target,
+        ),
+        ("re-share delegatee", &helper, helper_vm.as_str(), reshare),
+        (
+            "intermediate delegator, not an owner",
+            &fixture.device,
+            fixture.device_vm.as_str(),
+            reshare,
+        ),
+        (
+            "owner, unknown target",
+            &fixture.owner,
+            fixture.owner_vm.as_str(),
+            unknown,
+        ),
+        (
+            "owner, target without abilities",
+            &fixture.owner,
+            fixture.owner_vm.as_str(),
+            empty,
+        ),
+    ] {
+        let header = fixture.signed_scope_token(
+            key,
+            vm,
+            &helper_did,
+            &format!("urn:cid:{}", cid.to_cid(0x55)),
+            "tinycloud.delegation/revoke",
+            whole_seconds_from_now(3600),
+            &[],
+        )?;
+        let (status, body, _) = activate(&fixture, header).await;
+        assert_eq!(status, Status::Unauthorized, "{label}: {body}");
+    }
+    for cid in [target, reshare, empty] {
+        assert!(!stored_revoked(&fixture.conn, &cid).await?);
+    }
+    Ok(())
+}
+
 // N4': revoke and status controls that name an encryption network (TC-1423).
 
 const REVOKE: &str = "tinycloud.delegation/revoke";

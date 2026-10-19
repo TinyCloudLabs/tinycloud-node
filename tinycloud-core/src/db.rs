@@ -1903,18 +1903,20 @@ where
         if proofs.len() > 1 {
             return Ok(None);
         }
-        let Some(delegation) = delegation::Entity::find_by_id(target)
-            .one(&self.conn)
-            .await?
-        else {
+        // A canonical CID may name a historical stored row; the requested CID
+        // keeps its own authority scope, the stored row supplies the grant.
+        let Some(delegation) = revocation::target_for_cid(&self.conn, target).await? else {
             return Ok(None);
         };
         let abilities = abilities::Entity::find()
-            .filter(abilities::Column::Delegation.eq(target))
+            .filter(abilities::Column::Delegation.eq(delegation.id))
             .all(&self.conn)
             .await?;
 
         let mut roots = vec![target];
+        if delegation.id != target {
+            roots.push(delegation.id);
+        }
         roots.extend(proofs.iter().copied().map(Hash::from));
         let _chain_guards = match self.acquire_chain_guards(&roots).await {
             Ok(guards) => guards,
@@ -1955,7 +1957,7 @@ where
         if revocation::is_revoked(&self.conn, &target).await? {
             return Ok(Some(DelegationStatus::Revoked));
         }
-        match revocation::first_revoked_ancestor(&self.conn, &target).await {
+        match revocation::first_revoked_ancestor(&self.conn, &delegation.id).await {
             Ok(Some(_)) => return Ok(Some(DelegationStatus::Revoked)),
             Ok(None) => {}
             Err(revocation::ChainTraversalError::LimitExceeded) => {
@@ -3099,8 +3101,12 @@ async fn sequence_spaces<C: ConnectionTrait>(
         }
     }
     if !revoked.is_empty() {
+        let mut stored = Vec::with_capacity(revoked.len());
+        for target in revoked {
+            stored.push(stored_revocation_target(db, target).await?);
+        }
         for row in event_order::Entity::find()
-            .filter(event_order::Column::Event.is_in(revoked))
+            .filter(event_order::Column::Event.is_in(stored))
             .all(db)
             .await?
         {
@@ -3110,19 +3116,29 @@ async fn sequence_spaces<C: ConnectionTrait>(
     Ok(spaces.into_iter().collect())
 }
 
+/// The stored delegation a revocation's signed target names: the target itself,
+/// or the stored historical encoding a canonical CID resolves to. `event_order`
+/// records the stored row, so the revocation is sequenced in its spaces.
+async fn stored_revocation_target<C: ConnectionTrait>(db: &C, target: Hash) -> Result<Hash, DbErr> {
+    Ok(revocation::target_for_cid(db, target)
+        .await?
+        .map(|delegation| delegation.id)
+        .unwrap_or(target))
+}
+
 async fn event_spaces<'a, C: ConnectionTrait>(
     db: &C,
     ev: &'a [(Hash, Event)],
 ) -> Result<HashMap<SpaceId, Vec<&'a (Hash, Event)>>, DbErr> {
     // get orderings of events listed as revoked by events in the ev list
     let mut spaces = HashMap::<SpaceId, Vec<&'a (Hash, Event)>>::new();
-    let revoked = ev
-        .iter()
-        .filter_map(|(_, e)| match e {
-            Event::Revocation(r) => Some(Hash::from(r.0.revoked)),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
+    let mut revoked = Vec::new();
+    for (_, e) in ev {
+        if let Event::Revocation(r) = e {
+            let signed = Hash::from(r.0.revoked);
+            revoked.push((signed, stored_revocation_target(db, signed).await?));
+        }
+    }
     // TC-732: `transact` now calls this before any write. Issue no read when
     // there is nothing to look up: on SQLite a read that opens the
     // transaction's snapshot ahead of its first write turns a concurrent
@@ -3131,7 +3147,7 @@ async fn event_spaces<'a, C: ConnectionTrait>(
         Vec::new()
     } else {
         event_order::Entity::find()
-            .filter(event_order::Column::Event.is_in(revoked))
+            .filter(event_order::Column::Event.is_in(revoked.iter().map(|(_, stored)| *stored)))
             .all(db)
             .await?
     };
@@ -3170,9 +3186,13 @@ async fn event_spaces<'a, C: ConnectionTrait>(
                 }
             }
             Event::Revocation(r) => {
-                let r_hash = Hash::from(r.0.revoked);
+                let signed = Hash::from(r.0.revoked);
+                let Some(&(_, stored)) = revoked.iter().find(|(target, _)| *target == signed)
+                else {
+                    continue;
+                };
                 for revoked in &revoked_events {
-                    if r_hash == revoked.event {
+                    if stored == revoked.event {
                         let entry = spaces.entry(revoked.space.0.clone()).or_default();
                         if !entry.iter().any(|(h, _)| h == &e.0) {
                             entry.push(e);
