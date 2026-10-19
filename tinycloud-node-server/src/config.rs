@@ -88,6 +88,13 @@ pub struct ShareEmailConfig {
     pub issuer_key_version: u64,
     #[serde(default)]
     pub issuer_public_key: Option<String>,
+    /// The pinned per-policy issuer set (TC-1452): the explicit entries, each
+    /// `{issuerDid, kid, alg, publicKey, vcts, profiles, notBefore, retiredAt?,
+    /// notAfter?}`. The legacy single issuer above, when its public key is
+    /// set, joins as one more entry. A violation of a set-load rule stops the
+    /// node from starting. Nothing here is fetched or resolved.
+    #[serde(default)]
+    pub credential_issuers: Vec<crate::issuer_set::CredentialIssuerConfig>,
     /// Operator-delivered owner-signed authority material. A missing or
     /// unreadable source keeps the capability unavailable.
     #[serde(default)]
@@ -225,6 +232,7 @@ impl Default for ShareEmailConfig {
             issuer_kid: default_share_issuer_kid(),
             issuer_key_version: default_share_issuer_key_version(),
             issuer_public_key: None,
+            credential_issuers: Vec::new(),
             authority_material_path: None,
             trust_bundle_path: None,
             trust_bundle_base64: None,
@@ -242,6 +250,55 @@ impl Default for ShareEmailConfig {
 }
 
 impl ShareEmailConfig {
+    /// The issuer pin checks for the legacy single issuer. They run whenever
+    /// `issuer_public_key` is set, whether or not `enabled` is on: the key is
+    /// used by policy/v3 credential admission either way.
+    pub fn validate_issuer_pin(&self) -> Result<(), &'static str> {
+        let Some(public_key) = self.issuer_public_key.as_deref() else {
+            return Ok(());
+        };
+        if self.issuer_did != tinycloud_auth::share_email_evidence::OPEN_CREDENTIALS_ISSUER_DID
+            || self.issuer_vct != tinycloud_auth::share_email_evidence::EMAIL_VCT
+            || !canonical_kid_matches(&self.issuer_kid, &self.issuer_did)
+            || self.issuer_key_version == 0
+            || !canonical_key(public_key)
+            || (!allows_hermetic_fixture() && is_fixture_public_key(public_key))
+        {
+            return Err("share email issuer pin is invalid");
+        }
+        Ok(())
+    }
+
+    /// Builds the pinned issuer set: the explicit `credential_issuers` plus the
+    /// legacy single issuer as one entry. Applies every set-load rule; the
+    /// caller refuses to start on an error.
+    pub fn credential_issuer_set(&self) -> anyhow::Result<crate::issuer_set::IssuerSet> {
+        use anyhow::Context as _;
+        self.validate_issuer_pin()
+            .map_err(|error| anyhow::anyhow!(error))?;
+        let legacy = self
+            .issuer_public_key
+            .as_deref()
+            .map(|encoded| -> anyhow::Result<_> {
+                let public_key: [u8; 32] = decode_config(encoded, URL_SAFE_NO_PAD)
+                    .context("policy credential issuer public key must be canonical base64url")?
+                    .try_into()
+                    .map_err(|_| {
+                        anyhow::anyhow!("policy credential issuer public key must be 32 bytes")
+                    })?;
+                Ok(tinycloud_auth::share_email_evidence::IssuerKey::new(
+                    self.issuer_did.clone(),
+                    self.issuer_vct.clone(),
+                    self.issuer_key_version,
+                    self.issuer_kid.clone(),
+                    public_key,
+                ))
+            })
+            .transpose()?;
+        crate::issuer_set::IssuerSet::load_with_legacy(&self.credential_issuers, legacy.as_ref())
+            .context("credential issuer set is invalid")
+    }
+
     pub fn resolve_trust_bundle(&self) -> Result<Self, &'static str> {
         if !self.enabled {
             return Ok(self.clone());
@@ -632,12 +689,12 @@ fn contains_placeholder(value: &str) -> bool {
 }
 
 #[cfg(feature = "mounted-fixture")]
-fn allows_hermetic_fixture() -> bool {
+pub(crate) fn allows_hermetic_fixture() -> bool {
     true
 }
 
 #[cfg(not(feature = "mounted-fixture"))]
-fn allows_hermetic_fixture() -> bool {
+pub(crate) fn allows_hermetic_fixture() -> bool {
     false
 }
 
@@ -680,7 +737,7 @@ fn is_repeated_test_key(value: Option<&str>) -> bool {
     bytes.len() == 32 && bytes.windows(2).all(|pair| pair[0] == pair[1])
 }
 
-fn is_fixture_public_key(value: &str) -> bool {
+pub(crate) fn is_fixture_public_key(value: &str) -> bool {
     const FROZEN_NODE_PUBLIC_KEY: &str = "IVL40Zt5HSRFMkLhXy6rbLfP-ntqXtMAl5YOBpiB2xI";
     const FROZEN_ISSUER_PUBLIC_KEY: &str = "Ivwpd5Lwtv_Av8_bftsMCqFOAlo2XsDjQuhuOCnLdLY";
     value == FROZEN_NODE_PUBLIC_KEY
@@ -1695,6 +1752,129 @@ mod tests {
             authority_material_path: Some("/run/tinycloud/authority-material.json".into()),
             ..ShareEmailConfig::default()
         }
+    }
+
+    fn explicit_issuer(fragment: &str, key: &str) -> crate::issuer_set::CredentialIssuerConfig {
+        crate::issuer_set::CredentialIssuerConfig {
+            issuer_did: "did:web:acme.credentials.org".into(),
+            kid: format!("did:web:acme.credentials.org#{fragment}"),
+            alg: "EdDSA".into(),
+            public_key: key.into(),
+            vcts: vec!["opencredentials.email/v1".into()],
+            profiles: vec!["tinycloud.email-held/v1".into()],
+            not_before: "2026-10-01T00:00:00Z".into(),
+            retired_at: None,
+            not_after: None,
+        }
+    }
+
+    #[test]
+    fn issuer_pin_checks_run_whenever_the_issuer_key_is_set() {
+        // enabled is off, so the trust-bundle path never validated this.
+        let mut config = ShareEmailConfig {
+            issuer_did: "did:web:issuer.credentials.org".into(),
+            issuer_kid: "did:web:issuer.credentials.org#email-signing-key-1".into(),
+            issuer_public_key: Some("AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA".into()),
+            ..ShareEmailConfig::default()
+        };
+        assert_eq!(config.credential_issuer_set().unwrap().len(), 1);
+        // No key set: nothing to pin, no legacy entry.
+        let mut unset = config.clone();
+        unset.issuer_public_key = None;
+        unset.issuer_did.clear();
+        assert!(unset.credential_issuer_set().unwrap().is_empty());
+        for edit in [
+            (|c: &mut ShareEmailConfig| c.issuer_did = "did:web:other.example".into())
+                as fn(&mut ShareEmailConfig),
+            |c| c.issuer_did.clear(),
+            |c| c.issuer_vct = "opencredentials.email/v2".into(),
+            |c| c.issuer_kid = "did:web:other.example#k".into(),
+            |c| c.issuer_kid = "did:web:issuer.credentials.org".into(),
+            |c| c.issuer_key_version = 0,
+            |c| c.issuer_public_key = Some("AQID".into()),
+            |c| c.issuer_public_key = Some("Ivwpd5Lwtv_Av8_bftsMCqFOAlo2XsDjQuhuOCnLdLY".into()),
+        ] {
+            let mut bad = config.clone();
+            edit(&mut bad);
+            assert!(bad.credential_issuer_set().is_err());
+        }
+        config.enabled = false;
+        assert!(config.validate_issuer_pin().is_ok());
+    }
+
+    #[test]
+    fn credential_issuer_set_joins_the_legacy_issuer_and_refuses_bad_sets() {
+        let key = &base64::encode_config(
+            ed25519_dalek::SigningKey::from_bytes(&[9; 32])
+                .verifying_key()
+                .to_bytes(),
+            URL_SAFE_NO_PAD,
+        );
+        let mut config = enabled_config();
+        config.credential_issuers = vec![explicit_issuer("issuing-1", key)];
+        let set = config.credential_issuer_set().unwrap();
+        assert_eq!(set.len(), 2);
+        assert!(set
+            .resolve_pinned_issuer(
+                "did:web:acme.credentials.org",
+                "did:web:acme.credentials.org#issuing-1"
+            )
+            .is_some());
+        assert!(set
+            .resolve_pinned_issuer(
+                "did:web:issuer.credentials.org",
+                "did:web:issuer.credentials.org#email-signing-key-1"
+            )
+            .is_some());
+        // Each set-load violation stops startup, with share-email off as well.
+        for edit in [
+            (|e: &mut crate::issuer_set::CredentialIssuerConfig| e.alg = "ES256K".into())
+                as fn(&mut crate::issuer_set::CredentialIssuerConfig),
+            |e| e.kid = "did:web:acme.credentials.org".into(),
+            |e| e.not_before = "2026-10-01T00:00:00+00:00".into(),
+            |e| e.public_key = "AQID".into(),
+            |e| {
+                e.retired_at = Some("2027-02-01T00:00:00Z".into());
+                e.not_after = Some("2027-01-01T00:00:00Z".into());
+            },
+        ] {
+            for enabled in [true, false] {
+                let mut bad = enabled_config();
+                bad.enabled = enabled;
+                let mut entry = explicit_issuer("issuing-1", key);
+                edit(&mut entry);
+                bad.credential_issuers = vec![entry];
+                assert!(bad.credential_issuer_set().is_err());
+            }
+        }
+        // A duplicate kid refuses the set.
+        let mut duplicate = enabled_config();
+        duplicate.credential_issuers = vec![
+            explicit_issuer("issuing-1", key),
+            explicit_issuer("issuing-1", key),
+        ];
+        assert!(duplicate.credential_issuer_set().is_err());
+        // The preflight that runs before the node starts catches it too.
+        let preflight = Config {
+            share_email: ShareEmailConfig {
+                credential_issuers: vec![explicit_issuer("issuing-1", "AQID")],
+                ..ShareEmailConfig::default()
+            },
+            ..Config::default()
+        };
+        assert!(crate::resolve_runtime_config(&preflight).is_err());
+    }
+
+    #[test]
+    fn credential_issuers_parse_from_the_documented_json_shape() {
+        let parsed: Vec<crate::issuer_set::CredentialIssuerConfig> = serde_json::from_str(
+            r#"[{"issuerDid":"did:web:acme.credentials.org","kid":"did:web:acme.credentials.org#issuing-1",
+            "alg":"EdDSA","publicKey":"AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA",
+            "vcts":["opencredentials.email/v1"],"profiles":["tinycloud.email-held/v1"],
+            "notBefore":"2026-10-01T00:00:00Z","retiredAt":null,"notAfter":null}]"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.len(), 1);
     }
 
     /// The exact `emailOrigin` (generic invitation audience) the committed
