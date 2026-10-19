@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+## [1.21.1] - 2026-10-19
+
+### Release notes
+
+- SQL waits are bounded, and `/invoke` has a request deadline (TC-1274, #347).
+- The read-audit wait is bounded, and abandoned records are skipped (TC-1317, #350, #361).
+- Responses that carry an `ETag` also carry `Cache-Control: no-transform` (TC-1432, #354).
+- Added dstack `GetQuote` client tests (TC-963, #348).
+- No database migrations.
+- Rollback is the 1.21.0 image.
+
 ### Changes
 
 - Authorized reads no longer wait without limit for their audit record (TC-1317). Every read (KV get/list/metadata/sync, capabilities read, and the authorization step of SQL, DuckDB, space info, `/signed/kv` and `/encryption/networks`) waits for its invocation record to commit before its data is returned. That wait used to have no bound, and one serial queue served every account.
