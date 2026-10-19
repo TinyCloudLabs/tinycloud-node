@@ -36,6 +36,10 @@ OLD_REVISION = "a" * 40
 ANCIENT_REVISION = "9" * 40
 ORDER = [ANCIENT_REVISION, OLD_REVISION, REVISION, RELEASE_REVISION]
 CANARIES = []
+# Stands for "the same value as TINYCLOUD_ADMIN_SECRET" in run_deploy's stats_token.
+ADMIN_VALUE = object()
+# What sync.mjs prints when the CVM's allowed_envs names a variable the sealed file lacks.
+GUARD_MESSAGE = "::error::allowed_envs synchronization failed during complete whitelist validation; response details withheld."
 
 
 def shell_for_step(name):
@@ -118,7 +122,12 @@ elif name=='git':
 elif name=='node':
     names=[line.split('=',1)[0] for line in Path('.phala-prod.env').read_text().splitlines()]
     assert 'BETTERSTACK_SOURCE_TOKEN' in names and 'QUOTA_BILLING_ADMIN_SECRET' not in names
-    if args[-1]=='--check': event('whitelist-check')
+    data=json.loads(state.read_text()); data['values']['env_names']=names; state.write_text(json.dumps(data))
+    if args[-1]=='--check':
+        event('whitelist-check')
+        # What sync.mjs does when the CVM's allowed_envs names a variable the sealed file lacks.
+        if any(name not in names for name in os.environ.get('TEST_ALLOWED_ENVS','').split()):
+            print(os.environ['TEST_GUARD_MESSAGE'],file=sys.stderr); raise SystemExit(1)
     else:
         event('whitelist-sync')
         if os.environ['FAIL_AT']=='sync': raise SystemExit('Fixed synchronization failure')
@@ -199,7 +208,8 @@ class SafeResult(unittest.TextTestResult):
 
 class RecoveryTests(unittest.TestCase):
     def run_deploy(self, compose=CURRENT, changes=None, *, fail_at="", artifact_error="", authority="node-override",
-                   missing_billing=False, missing_authorization=False, approved_privacy="", event="workflow_dispatch",
+                   missing_billing=False, missing_authorization=False, approved_privacy="", event="workflow_dispatch", stats_token=None,
+                   allowed_stats=False,
                    ref="refs/heads/main", oci_label=None, oci_revision=None, build_digest="", releases=RELEASED, running=REVISION, order=None):
         inputs = {"deploy_phala": "true", "authorize_quota_values": "true", "image_version": "1.20.6",
                   "deploy_image_digest": DIGEST, "rollback_image_version": "1.20.6", "rollback_image_revision": REVISION,
@@ -257,8 +267,14 @@ class RecoveryTests(unittest.TestCase):
                         "QUOTA_ADMIN_SECRET": canary, "QUOTA_BILLING_ADMIN_SECRET": canary,
                         # Production maps both from PROD_TINYCLOUD_QUOTA_URL: billing's base URL.
                         "QUOTA_BILLING_URL": BILLING_URL, "PHALA_ENV_TINYCLOUD_QUOTA_URL": BILLING_URL, "TEST_RELEASES": json.dumps(releases),
+                        "TEST_GUARD_MESSAGE": GUARD_MESSAGE,
                         "TEST_ORDER": json.dumps(order or ORDER)})
             if running: env["RUNNING_REVISION"] = running
+            if allowed_stats: env["TEST_ALLOWED_ENVS"] = "NODE_STATS_READ_TOKEN"
+            if stats_token == ADMIN_VALUE: stats_token = canary
+            if stats_token is not None:
+                env["PHALA_ENV_NODE_STATS_READ_TOKEN"] = stats_token
+                if stats_token and stats_token != canary: CANARIES.append(stats_token)
             if missing_billing: env.pop("QUOTA_BILLING_ADMIN_SECRET")
             context = {"github.event_name": event, "github.ref": ref, "job.success": True,
                        **{"inputs." + key: (value == "true" if value in ("true", "false") else value) for key, value in inputs.items()}}
@@ -285,7 +301,8 @@ class RecoveryTests(unittest.TestCase):
             self.assertNotIn(canary, logs + report, "Sealed canary leaked")
             self.assertFalse((root / ".phala-prod.env").exists(), "Sealed env was not cleaned")
             return {"success": context["job.success"], "events": json.loads(state.read_text())["events"],
-                    "compose": compose_path.read_bytes(), "summary": report, "logs": logs}
+                    "compose": compose_path.read_bytes(), "summary": report, "logs": logs,
+                    "env_names": json.loads(state.read_text())["values"].get("env_names", [])}
 
     def test_recovery_current_pre_n0_and_reviewed_n0(self):
         for compose in (PRE_N0_TEMPLATE, PRE_N0, N0):
@@ -296,6 +313,77 @@ class RecoveryTests(unittest.TestCase):
                 self.assertEqual(result["events"].count("quota-put"), 2)
                 self.assertEqual(result["compose"], N0 if compose == N0 else PRE_N0)
                 self.assertNotIn("1.20.7", result["logs"] + result["summary"])
+
+    def test_stats_token_is_optional_and_sealed_only_when_set(self):
+        # TC-1482: an unset token must not block the deploy or reach the sealed file.
+        unset = self.run_deploy()
+        self.assertTrue(unset["success"], "An unset NODE_STATS_READ_TOKEN must not block the deploy")
+        self.assertNotIn("NODE_STATS_READ_TOKEN", unset["env_names"])
+        self.assertNotIn("NODE_STATS_READ_TOKEN", self.run_deploy(stats_token="")["env_names"])
+        token = secrets.token_urlsafe(32)
+        sealed = self.run_deploy(stats_token=token)
+        self.assertTrue(sealed["success"])
+        self.assertEqual(sealed["env_names"].count("NODE_STATS_READ_TOKEN"), 1)
+        self.assertNotIn(token, sealed["logs"] + sealed["summary"], "Stats token leaked")
+        broken = self.run_deploy(stats_token="first\nsecond")
+        self.assertFalse(broken["success"])
+        self.assertEqual(broken["events"].count("cvm-deploy"), 0, "A malformed token must fail before the CVM mutation")
+
+    def test_stats_token_equal_to_the_admin_secret_or_too_short_is_refused_before_the_file(self):
+        # TC-1482: the node keeps the route at 404 for these two values, which would
+        # surface only as OpenKey's 503. The deploy refuses them with a constant message.
+        cases = (("equal to the admin secret", ADMIN_VALUE, "::error::NODE_STATS_READ_TOKEN must differ from TINYCLOUD_ADMIN_SECRET"),
+                 ("31 bytes", "a" * 31, "::error::NODE_STATS_READ_TOKEN must be at least 32 bytes"),
+                 ("31 bytes padded to 40", "  " + "a" * 31 + "      ", "::error::NODE_STATS_READ_TOKEN must be at least 32 bytes"),
+                 ("whitespace only", " " * 40, "::error::NODE_STATS_READ_TOKEN must be at least 32 bytes"),
+                 ("15 two-byte characters (30 bytes)", "é" * 15, "::error::NODE_STATS_READ_TOKEN must be at least 32 bytes"))
+        for label, value, message in cases:
+            with self.subTest(label):
+                refused = self.run_deploy(stats_token=value)
+                self.assertFalse(refused["success"])
+                self.assertIn(message, refused["logs"])
+                self.assertEqual(refused["events"].count("cvm-deploy"), 0, "A refused token must fail before the CVM mutation")
+                self.assertNotIn("whitelist-check", refused["events"], "The sealed file must not be written first")
+                self.assertEqual(refused["env_names"], [])
+                if value is not ADMIN_VALUE and value.strip():
+                    self.assertNotIn(value.strip(), refused["logs"] + refused["summary"], "Stats token leaked")
+        # Exactly 32 bytes (64 hex characters recommended) and two-byte characters counted as bytes pass.
+        for value in ("b" * 32, secrets.token_hex(32), "é" * 16):
+            with self.subTest(len(value.encode())):
+                accepted = self.run_deploy(stats_token=value)
+                self.assertTrue(accepted["success"], "A token of at least 32 bytes must be accepted")
+                self.assertEqual(accepted["env_names"].count("NODE_STATS_READ_TOKEN"), 1)
+
+    def test_deleted_stats_token_secret_fails_closed_once_the_name_is_allowed(self):
+        # TC-1482: after the first deploy with the token, `allowed_envs` on the CVM contains
+        # NODE_STATS_READ_TOKEN. A later deploy (also rollback and same-image recovery,
+        # which use the same step) without the secret must fail in `sync.mjs --check`,
+        # before `phala deploy`, with the guard's constant message.
+        self.assertIn('phase = "complete whitelist validation";', SOURCE)
+        self.assertIn("::error::allowed_envs synchronization failed during ${phase}; response details withheld.", SOURCE)
+        self.assertEqual(GUARD_MESSAGE, "::error::allowed_envs synchronization failed during complete whitelist validation; "
+                         "response details withheld.")
+        for stats_token in (None, ""):
+            with self.subTest(stats_token=stats_token):
+                result = self.run_deploy(stats_token=stats_token, allowed_stats=True)
+                self.assertFalse(result["success"])
+                self.assertEqual(result["events"].count("cvm-deploy"), 0, "No CVM mutation may follow the failed check")
+                self.assertIn("whitelist-check", result["events"])
+                self.assertNotIn("whitelist-sync", result["events"])
+                self.assertIn(GUARD_MESSAGE, result["logs"])
+        # With the secret present the same CVM state deploys.
+        kept = self.run_deploy(stats_token=secrets.token_hex(32), allowed_stats=True)
+        self.assertTrue(kept["success"])
+        self.assertEqual(kept["events"].count("cvm-deploy"), 1)
+        # The pre-N0 rollback uses the same deploy step, so it is blocked the same way
+        # (it succeeds when the secret is present).
+        for stats_token, expected in ((None, 0), (secrets.token_hex(32), 1)):
+            with self.subTest(rollback_with_token=stats_token is not None):
+                rollback = self.run_deploy(N0, {"rollback_pre_n0": "true", "rollback_privacy_mode": "keep-json-file"},
+                                           approved_privacy="keep-json-file", stats_token=stats_token, allowed_stats=True)
+                self.assertEqual(rollback["success"], bool(expected))
+                self.assertEqual(rollback["events"].count("cvm-deploy"), expected)
+                self.assertIn("whitelist-check", rollback["events"])
 
     def test_future_digest_gets_preflight_and_general_quota_restore(self):
         result = self.run_deploy(PRE_N0_TEMPLATE, {"deploy_image_digest": "sha256:" + "a" * 64,

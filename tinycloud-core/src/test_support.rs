@@ -72,7 +72,15 @@ impl PostgresTestSchema {
         use sea_orm_migration::MigratorTrait;
 
         let url = postgres_test_url(test)?;
-        let schema = unique_name("tc_test");
+        // Two tests of one process can read the same clock tick, so the name also
+        // carries a process-wide counter.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let schema = format!(
+            "tc_test_{}_{}_{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
         let admin = Database::connect(sea_orm::ConnectOptions::new(url.clone()))
             .await
             .expect("connect to PostgreSQL test database");

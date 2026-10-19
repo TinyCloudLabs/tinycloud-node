@@ -200,6 +200,14 @@ Environment settings (Settings → Environments → `production`):
   must not be selected for the organization secret `PHALA_CLOUD_API_KEY`. A
   same-named repository or organization secret is still readable by a job
   without `environment: production`.
+- `NODE_STATS_READ_TOKEN` (TC-1482, read-only `GET /admin/stats`) is not in
+  that list and is not passed to the CVM by `docker.yml` or the compose files,
+  so the route is disabled (`404`) in a deployment until a reviewed change adds
+  it: a `PROD_TINYCLOUD_NODE_STATS_READ_TOKEN` environment secret, the
+  `PHALA_ENV_` pass-through and a compose `environment` line (which changes the
+  reviewed compose hash). Its value must be at least 32 bytes (generate it with
+  `openssl rand -hex 32`; a shorter value disables the route) and must differ from
+  `PROD_TINYCLOUD_ADMIN_SECRET`; the node disables the route if they are equal.
 
 What this blocks: a dispatch on an unlocked branch fails the environment's
 branch policy, even if that branch edits `docker.yml` to name the environment.
@@ -237,6 +245,67 @@ a bare HTTPS origin. The preflight also accepts that origin with the
 `/api/quota` path; any other path, `http`, credentials, a query or fragment,
 or CR/LF fails it. The quota steps take only its host and port and
 call billing's fixed `/api/admin/storage-comp/` path; no URL is printed.
+
+### `NODE_STATS_READ_TOKEN` (TC-1482): compose hash change
+
+`docker-compose.dstack-postgres.yaml` passes the optional bearer for the
+read-only `GET /admin/stats` to the node as `NODE_STATS_READ_TOKEN:
+"${NODE_STATS_READ_TOKEN:-}"`. This ships in the same release as the route
+(the release after 1.21.2) and **changes the compose hash**: the N0 template
+lock in `docker.yml` moves to the hash above and
+`scripts/ci/fixtures/tc959-n0-compose.yaml` stays byte-identical to the
+compose. Release notes for that release must say so.
+
+- The secret is the `production` environment secret
+  `PROD_TINYCLOUD_NODE_STATS_READ_TOKEN`. The deploy step maps it to
+  `PHALA_ENV_NODE_STATS_READ_TOKEN` and writes it to the sealed
+  `.phala-prod.env` (mode 0600, removed afterwards) like the other secrets;
+  the value is never in a file in the repository, in argv or in logs.
+- It is **optional**. It is not in the deploy step's `required_vars`. Unset
+  or empty, the line is not written, the node starts normally and the route
+  is disabled (`404`, as for an unknown route). `--validate-config` and the
+  compose validation do not read it. A multi-line value fails before any CVM
+  mutation.
+- When set, the deploy step **refuses**, before it writes the sealed file and
+  with a constant message that names no value, a token that equals
+  `PROD_TINYCLOUD_ADMIN_SECRET` (`NODE_STATS_READ_TOKEN must differ from
+  TINYCLOUD_ADMIN_SECRET`) and a token shorter than 32 bytes
+  (`NODE_STATS_READ_TOKEN must be at least 32 bytes`; surrounding whitespace
+  is not counted). The node itself keeps the route at `404` for either value,
+  so without this check the mistake would surface only as OpenKey's `503`.
+- `ops/rollback/pre-n0-compose.yaml` and `pre-n0-stop-local-logs.yaml` are not
+  changed: they are pinned by raw hash, restore the 1.20.6 image, which does
+  not read this variable, and the rollback leaves the route absent.
+
+Items for the release notes of the release that ships this:
+
+- **(a) Registration.** No registration is needed if production uses Phala's
+  centralized KMS. Amos confirms that before the deploy with
+  `phala cvms get tinycloud-node` (output stays private). If it is an on-chain
+  KMS, a reviewed `addComposeHash` is needed first. dstack's `compose_hash`
+  changes at the deploy, and again when the first deploy adds the token name
+  to `allowed_envs`.
+- **(b) Node DID.** The node DID is unchanged across the compose-hash change:
+  the key path is `tinycloud/keys/primary`, derived from the app id and that
+  path. The post-deploy DID and key-fingerprint gate stays.
+- **(c) Rule: never delete or blank `PROD_TINYCLOUD_NODE_STATS_READ_TOKEN`
+  while the name is in the CVM's `allowed_envs`.** A later deploy without it
+  fails closed before any CVM mutation with exactly
+  `::error::allowed_envs synchronization failed during complete whitelist validation; response details withheld.`
+  (the whitelist check requires every allowed name to be present in the sealed
+  file), and it also blocks rollback and same-image recovery, which use the same
+  deploy step. Removing the name later is a manual, reviewed Phala
+  control-plane operation: set `allowed_envs` without the name and a
+  re-encrypted env set without it (this changes `compose_hash` again), then
+  delete the secret.
+- **(d) First deploy.** The first deploy with the token set restarts the CVM
+  twice: dstack skips the not-yet-allowed key, so the route is `404` on that
+  boot, and the post-deploy sync adds the name. [inference from the sync code;
+  not observed live]
+- **(e) Token.** Bobbie generates a 32-byte hex token (`openssl rand -hex 32`,
+  64 characters). Amos puts it into the Phala env through the deploy, by
+  setting the `production` environment secret from stdin, never printed. The
+  same value is set as OpenKey's `NODE_STATS_READ_TOKEN`.
 
 Every `deploy_phala=true` command must explicitly include
 **`-f authorize_quota_values=true`**. This authorizes the reviewed values
@@ -400,11 +469,11 @@ Before any CVM mutation the workflow requires:
 
 - the main compose, with its one node digest replaced by 64 zeros, to hash
   to the reviewed N0 template
-  **`7fabba70e71423faa2c8b61981d4a7c95ac7c2552074af81c0877af774d6b383`**
-  (raw `1228d81927fc0a3fbba85745103e77b3112606f5d314d15974d400b222409350` normalized: the 1.21.0 compose
+  **`79469f97a8dcecc7856caa11b26e3004b36d4b8ae9e16a51f963d0687992b9fb`**
+  (raw `32a002ef5751817619423c9e60776e03f2c3517315f5aa3a9c8654e3394777f1` normalized; before the three `current_kv_c_index_*` warning codes in the Vector config (TC-1274 `current_kv` C-index migration) the template was `87b5d12a…`, raw `d1fcd665…`; before the optional TC-1482 `NODE_STATS_READ_TOKEN` env line and the TC-1482 route in the Vector config the template was `7fabba70…`, raw `1228d81927fc0a3fbba85745103e77b3112606f5d314d15974d400b222409350`: the 1.21.0 compose
   `d95bfb707871c1d626c4a8f2b8d32d354103edbb5077847c6a21fe5f7f6cfa50`, template
-  `51f8e9e9…`, with only the embedded Vector config regenerated for TC-1274's
-  and TC-1317's warning codes; TC-1274 alone was template `00938226…`, raw
+  `51f8e9e9…`, with only the embedded Vector config regenerated for TC-1274's,
+  TC-1317's and TC-1482's route and warning codes (TC-1274 and TC-1317 were template `7fabba70…`, raw `1228d819…`); TC-1274 alone was template `00938226…`, raw
   `b25b8414…`. That compose is the #349 compose
   `c33c23021589163b62a71ef245b7194717711922027629f155bdd5cff806b8c7`, which
   keeps `TINYCLOUD_EPOCH_HEAD_BACKFILL__ENABLED: "false"`, with only
@@ -470,8 +539,8 @@ gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref main \
 
 The served/OCI identity remains **1.20.6-dstack / e18578ff9162986ddd813259c60f73866e3e60d1**.
 With the template lock on main this redeploys exactly main's raw compose
-`1228d81927fc0a3fbba85745103e77b3112606f5d314d15974d400b222409350`
-(the 1.21.0 compose `d95bfb70…` with the TC-1274 and TC-1317 Vector config), whatever digest
+`32a002ef5751817619423c9e60776e03f2c3517315f5aa3a9c8654e3394777f1`
+(the 1.21.0 compose `d95bfb70…` with the TC-1274, TC-1317, TC-1482 and `current_kv_c_index_*` Vector config and the optional TC-1482 `NODE_STATS_READ_TOKEN` env line), whatever digest
 main's template currently pins. It is not a rollback of a
 later release across a schema migration. Current pre-N0 tag/pinned
 equivalents are separately hash-checked; arbitrary same-image config
