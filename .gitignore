@@ -5,3 +5,4 @@
 .env
 bun.lockb
 bun.lock
+__pycache__/

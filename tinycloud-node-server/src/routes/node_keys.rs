@@ -189,9 +189,13 @@ mod tests {
             socket.display().to_string(),
         );
 
-        let resolved = crate::resolve_keys(&crate::config::Keys::Dstack)
-            .await
-            .expect("dstack key resolution");
+        let resolved = crate::resolve_keys(
+            &crate::config::Keys::Dstack,
+            &crate::config::TeeConfig::default(),
+        )
+        .await
+        .expect("dstack key resolution")
+        .expect("dstack yields a key");
         responder.await.expect("dstack responder");
 
         let rocket = rocket::build()

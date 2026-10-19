@@ -412,6 +412,55 @@ mod tests {
         assert!(second.into_string().await.is_none());
     }
 
+    #[get("/put?<written>")]
+    fn mutation_response(written: bool) -> KvMutationResponse {
+        KvMutationResponse(written.then(|| hash(b"hello")))
+    }
+
+    #[get("/metadata")]
+    fn metadata_response() -> KvMetadataResponse {
+        KvMetadataResponse(
+            Metadata(BTreeMap::from([(
+                "Content-Type".to_string(),
+                "text/plain".to_string(),
+            )])),
+            hash(b"hello"),
+        )
+    }
+
+    /// TC-1432: the KV put and metadata/HEAD responses carry a strong ETag, so
+    /// the node forbids CDN re-encoding on them. A put that wrote nothing has
+    /// no ETag and no `Cache-Control`.
+    #[tokio::test]
+    async fn kv_put_and_metadata_etags_carry_no_transform() {
+        let client = Client::tracked(crate::attach_response_fairings(
+            rocket::build().mount("/", routes![mutation_response, metadata_response]),
+            "https://share.tinycloud.xyz".into(),
+        ))
+        .await
+        .unwrap();
+
+        for path in ["/put?written=true", "/metadata"] {
+            let response = client.get(path).dispatch().await;
+            assert_eq!(response.status(), Status::Ok, "{path}");
+            assert_eq!(
+                response.headers().get_one("ETag"),
+                Some(kv_etag(hash(b"hello")).as_str()),
+                "{path}"
+            );
+            assert_eq!(
+                response.headers().get_one("Cache-Control"),
+                Some("no-transform"),
+                "{path}"
+            );
+        }
+
+        let unwritten = client.get("/put?written=false").dispatch().await;
+        assert_eq!(unwritten.status(), Status::Ok);
+        assert!(unwritten.headers().get_one("ETag").is_none());
+        assert!(unwritten.headers().get_one("Cache-Control").is_none());
+    }
+
     #[test]
     fn if_none_match_uses_weak_comparison_for_lists_and_wildcard() {
         let etag = "\"blake3-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"";
