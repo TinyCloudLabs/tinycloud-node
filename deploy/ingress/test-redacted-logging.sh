@@ -43,6 +43,7 @@ echo "testing $IMAGE"
 hex() { od -An -N"$1" -tx1 /dev/urandom | tr -d ' \n'; }
 TICKET="tc970ticket$(hex 12)"
 HOOK_TICKET="tc970hookticket$(hex 12)"
+STATS_TOKEN="tc1482statstoken$(hex 12)"
 WALLET="$(hex 20)"
 SPACE="tinycloud:pkh:eip155:1:0x${WALLET}:default"
 KEY="tc970key$(hex 12)"
@@ -128,6 +129,8 @@ expect_status() {
 
 expect_status 401 "https://$DOMAIN/signed/kv/$TICKET"
 expect_status 200 "https://$DOMAIN/hooks/events?ticket=$HOOK_TICKET"
+# TC-1482: /admin/stats is its own route; its query string never reaches the log.
+expect_status 200 "https://$DOMAIN/admin/stats?token=$STATS_TOKEN"
 expect_status 502 "https://$DOMAIN/public/$SPACE/kv/$KEY"
 expect_status 401 "https://$DOMAIN/signed/kv/$TICKET/unmatched"
 # HTTP/1.1, a client-chosen method, and a 400 raised before routing (a header
@@ -156,6 +159,7 @@ FILES=$($DOCKER exec "$INGRESS" sh -c 'find /var/log/nginx -type f -exec cat {} 
 for pair in \
     "signed-KV ticket=$TICKET" \
     "hook ticket=$HOOK_TICKET" \
+    "admin stats query token=$STATS_TOKEN" \
     "space id=$SPACE" \
     "wallet address=$WALLET" \
     "KV key=$KEY" \
@@ -200,6 +204,7 @@ expect_line() {
 }
 expect_line GET "/signed/kv/<ticket_id>" 401
 expect_line GET "/hooks/events" 200
+expect_line GET "/admin/stats" 200
 expect_line GET "/public/<space_id>/kv/<key..>" 502
 expect_line GET "<other>" 401
 expect_line "<other>" "/signed/kv/<ticket_id>" 401
