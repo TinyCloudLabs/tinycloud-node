@@ -1,6 +1,7 @@
 pub mod admission;
 pub mod at_rest;
 pub(crate) mod auth_graph;
+pub mod data_owners;
 pub mod database_artifacts;
 pub mod database_identity;
 pub mod database_migration;
@@ -25,6 +26,7 @@ pub mod policy_capability;
 pub mod policy_owner_authority;
 mod read_audit;
 pub mod relationships;
+pub mod request_cancel;
 pub mod request_telemetry;
 pub mod share_email;
 pub mod sql;
@@ -45,6 +47,7 @@ pub use db::{
 pub use db_pool::RecoveringConnection;
 pub use encryption::ColumnEncryption;
 pub use libp2p;
+pub use read_audit::{ReadAuditError, ReadAuditHealth, DEFAULT_READ_AUDIT_WAIT};
 pub use sea_orm;
 pub use sea_orm_migration;
 pub use sql_sizes::{SizeTrackingArtifactRepository, SqlSizes};

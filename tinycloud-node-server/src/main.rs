@@ -49,9 +49,37 @@ fn install_panic_hook() {
     }));
 }
 
-#[rocket::main]
-async fn main() {
+/// The server start path is only for the two invocations that exist outside
+/// the CLI: no arguments (the container entrypoint, `cargo run`) and exactly
+/// `--validate-config` (the deploy preflight). Every other argv goes to clap,
+/// which also rejects anything it does not recognise instead of booting.
+fn starts_server(args: &[std::ffi::OsString]) -> bool {
+    match args {
+        [] => true,
+        [only] => only == "--validate-config",
+        _ => false,
+    }
+}
+
+fn main() {
     install_panic_hook();
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if !starts_server(&args) {
+        if let Err(e) = tinycloud::cli::run() {
+            eprintln!("\n✗ tinycloud-node failed:\n");
+            for cause in e.chain() {
+                eprintln!("  {cause}");
+            }
+            std::process::exit(1);
+        }
+        return;
+    }
+    // The runtime `#[rocket::main]` used to set up: worker and blocking
+    // thread counts come from ROCKET_WORKERS / ROCKET_MAX_BLOCKING.
+    rocket::execute(start_server());
+}
+
+async fn start_server() {
     let config = build_config_figment(); // That's just for easy access to ROCKET_LOG_LEVEL
     let tinycloud_config = config.extract::<config::Config>().unwrap();
 
