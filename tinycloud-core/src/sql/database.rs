@@ -433,7 +433,92 @@ fn page_count(conn: &rusqlite::Connection) -> Result<i64, SqlError> {
         .map_err(|e| SqlError::Internal(e.to_string()))
 }
 
+const REQUEST_BEGIN: &str = "SAVEPOINT tinycloud_request";
+const REQUEST_KEEP: &str = "RELEASE tinycloud_request";
+
+/// Whether `request` runs more than one statement and so needs a transaction
+/// of its own to be all-or-nothing (TC-1491). A single statement is already
+/// atomic. A request with a `PRAGMA` keeps running statement by statement:
+/// several pragmas (`foreign_keys`, `journal_mode`) are no-ops or errors
+/// inside a transaction, and they are admin-only.
+fn is_atomic_request(request: &SqlRequest) -> bool {
+    match request {
+        SqlRequest::Execute { sql, schema, .. } => {
+            schema.as_ref().is_some_and(|stmts| !stmts.is_empty())
+                && !parser::is_pragma_sql(sql)
+                && !schema
+                    .iter()
+                    .flatten()
+                    .any(|stmt| parser::is_pragma_sql(stmt))
+        }
+        SqlRequest::Batch { statements } => {
+            statements.len() > 1
+                && !statements
+                    .iter()
+                    .any(|statement| parser::is_pragma_sql(&statement.sql))
+        }
+        _ => false,
+    }
+}
+
+/// Run `request` as one transaction: every statement is kept or none is.
+///
+/// Before TC-1491 each statement of a batch committed on its own, so a later
+/// failure left a committed prefix in the local file while the durable copy
+/// (written only after a fully successful request) did not have it; the two
+/// stayed apart until the next write persisted both. The transaction is a
+/// `SAVEPOINT`, which opens one when none is active; users cannot issue
+/// transaction control themselves, the authorizer denies it.
+///
+/// When a transaction is already open, [`handle_message_without_growth`]'s
+/// guard has it and already undoes the whole request on any error (reporting
+/// growth ahead of the SQL error), so this adds nothing there.
 fn handle_message(
+    conn: &rusqlite::Connection,
+    request: &SqlRequest,
+    caveats: &Option<SqlCaveats>,
+    ability: &str,
+) -> Result<SqlExecutionResult, SqlError> {
+    if !is_atomic_request(request) || !conn.is_autocommit() {
+        return handle_request(conn, request, caveats, ability);
+    }
+    {
+        let _timer = QueryTimer::new();
+        conn.execute_batch(REQUEST_BEGIN)
+            .map_err(|e| SqlError::Internal(e.to_string()))?;
+    }
+    let result = handle_request(conn, request, caveats, ability);
+    // An early error return can leave the request's authorizer installed.
+    conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+    // SQLite can already have undone the transaction (ROLLBACK conflict
+    // handling); there is then nothing left to undo.
+    if result.is_err() && conn.is_autocommit() {
+        return result;
+    }
+    // A failure rolls the whole transaction back. `ROLLBACK TO` + `RELEASE`
+    // would instead commit an empty write transaction and rewrite the header.
+    let end = if result.is_ok() {
+        REQUEST_KEEP
+    } else {
+        "ROLLBACK"
+    };
+    let end_result = {
+        let _timer = QueryTimer::new();
+        conn.execute_batch(end)
+    };
+    if let Err(error) = end_result {
+        // RELEASE of the outermost savepoint is the COMMIT. A deferred
+        // constraint can fail it and leave the writes and the savepoint open.
+        if !conn.is_autocommit() {
+            let _timer = QueryTimer::new();
+            let _ = conn.execute_batch("ROLLBACK");
+        }
+        return result.and(Err(SqlError::Sqlite(error.to_string())));
+    }
+    result
+}
+
+fn handle_request(
     conn: &rusqlite::Connection,
     request: &SqlRequest,
     caveats: &Option<SqlCaveats>,
@@ -1214,5 +1299,263 @@ mod publication_rollback_tests {
                 .unwrap(),
             "Original"
         );
+    }
+
+    // TC-1491: a request with several statements is all-or-nothing.
+
+    fn exec(sql: &str) -> SqlRequest {
+        SqlRequest::Execute {
+            schema: None,
+            sql: sql.into(),
+            params: vec![],
+        }
+    }
+
+    fn batch(statements: &[&str]) -> SqlRequest {
+        SqlRequest::Batch {
+            statements: statements
+                .iter()
+                .map(|sql| SqlStatement {
+                    sql: (*sql).into(),
+                    params: vec![],
+                })
+                .collect(),
+        }
+    }
+
+    async fn run(
+        actor: &DatabaseHandle,
+        request: SqlRequest,
+        growth: GrowthPolicy,
+    ) -> Result<SqlExecutionResult, SqlError> {
+        actor
+            .execute(request, None, "tinycloud.sql/admin".into(), growth)
+            .await
+    }
+
+    async fn scalar(actor: &DatabaseHandle, sql: &str) -> String {
+        let result = run(
+            actor,
+            SqlRequest::Query {
+                sql: sql.into(),
+                params: vec![],
+                max_rows: None,
+                max_bytes: None,
+            },
+            GrowthPolicy::Allow,
+        )
+        .await
+        .unwrap();
+        match result.response {
+            SqlResponse::Query(query) => match &query.rows[0][0] {
+                SqlValue::Integer(value) => value.to_string(),
+                SqlValue::Text(value) => value.clone(),
+                other => format!("{other:?}"),
+            },
+            other => panic!("expected a query response, got {other:?}"),
+        }
+    }
+
+    fn spawn_test_actor(dir: &tempfile::TempDir, memory_threshold: u64) -> DatabaseHandle {
+        spawn_actor(
+            "space".into(),
+            "atomic".into(),
+            dir.path().to_str().unwrap().into(),
+            memory_threshold,
+            Arc::new(DashMap::new()),
+        )
+    }
+
+    #[tokio::test]
+    async fn tc1491_failed_batch_leaves_the_local_file_unchanged() {
+        for memory_threshold in [u64::MAX, 0] {
+            for growth in [GrowthPolicy::Allow, GrowthPolicy::Forbid] {
+                let dir = tempfile::tempdir().unwrap();
+                let actor = spawn_test_actor(&dir, memory_threshold);
+                run(
+                    &actor,
+                    exec("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)"),
+                    GrowthPolicy::Allow,
+                )
+                .await
+                .unwrap();
+                run(
+                    &actor,
+                    exec("INSERT INTO t (v) VALUES ('keep')"),
+                    GrowthPolicy::Allow,
+                )
+                .await
+                .unwrap();
+                let before = actor.checkpoint().await.unwrap();
+
+                // Two statements apply, the third violates NOT NULL.
+                let failed = run(
+                    &actor,
+                    batch(&[
+                        "UPDATE t SET v = 'changed'",
+                        "INSERT INTO t (v) VALUES ('prefix')",
+                        "INSERT INTO t (v) VALUES (NULL)",
+                    ]),
+                    growth,
+                )
+                .await;
+                assert!(matches!(failed, Err(SqlError::Sqlite(_))), "{failed:?}");
+
+                assert_eq!(scalar(&actor, "SELECT count(*) FROM t").await, "1");
+                assert_eq!(scalar(&actor, "SELECT v FROM t").await, "keep");
+                // The `Forbid` guard predates this change and ends a rejected
+                // request with ROLLBACK TO + RELEASE, which commits an empty
+                // transaction and bumps the header's change counter; its
+                // content is checked above, its bytes only for `Allow`.
+                if growth == GrowthPolicy::Allow {
+                    assert!(
+                        actor.checkpoint().await.unwrap() == before,
+                        "a rejected batch must not change a single byte of the checkpoint"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tc1491_failed_schema_request_leaves_no_schema_behind() {
+        for memory_threshold in [u64::MAX, 0] {
+            let dir = tempfile::tempdir().unwrap();
+            let actor = spawn_test_actor(&dir, memory_threshold);
+            run(
+                &actor,
+                exec("CREATE TABLE base (id INTEGER)"),
+                GrowthPolicy::Allow,
+            )
+            .await
+            .unwrap();
+            let failed = run(
+                &actor,
+                SqlRequest::Execute {
+                    schema: Some(vec![
+                        "CREATE TABLE extra (id INTEGER)".into(),
+                        "CREATE INDEX extra_id ON extra (id)".into(),
+                    ]),
+                    sql: "INSERT INTO missing_table VALUES (1)".into(),
+                    params: vec![],
+                },
+                GrowthPolicy::Allow,
+            )
+            .await;
+            assert!(failed.is_err());
+            assert_eq!(
+                scalar(
+                    &actor,
+                    "SELECT count(*) FROM sqlite_master WHERE name IN ('extra', 'extra_id')"
+                )
+                .await,
+                "0"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tc1491_successful_batch_and_ddl_batch_apply_in_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let actor = spawn_test_actor(&dir, 0);
+        let result = run(
+            &actor,
+            batch(&[
+                "CREATE TABLE a (id INTEGER PRIMARY KEY, v TEXT)",
+                "CREATE INDEX a_v ON a (v)",
+                "INSERT INTO a (v) VALUES ('x')",
+                "INSERT INTO a (v) VALUES ('y')",
+            ]),
+            GrowthPolicy::Allow,
+        )
+        .await
+        .unwrap();
+        let SqlResponse::Batch(response) = result.response else {
+            panic!("expected a batch response");
+        };
+        assert_eq!(response.results.len(), 4);
+        assert_eq!(response.results[3].last_insert_row_id, Some(2));
+        assert_eq!(scalar(&actor, "SELECT count(*) FROM a").await, "2");
+
+        // A failing DDL batch undoes its DDL too.
+        let failed = run(
+            &actor,
+            batch(&["CREATE TABLE b (id INTEGER)", "CREATE TABLE a (id INTEGER)"]),
+            GrowthPolicy::Allow,
+        )
+        .await;
+        assert!(failed.is_err());
+        assert_eq!(
+            scalar(
+                &actor,
+                "SELECT count(*) FROM sqlite_master WHERE name = 'b'"
+            )
+            .await,
+            "0"
+        );
+    }
+
+    #[tokio::test]
+    async fn tc1491_user_transaction_control_is_still_denied() {
+        let dir = tempfile::tempdir().unwrap();
+        let actor = spawn_test_actor(&dir, 0);
+        run(&actor, exec("CREATE TABLE t (v TEXT)"), GrowthPolicy::Allow)
+            .await
+            .unwrap();
+        for control in [
+            "BEGIN",
+            "COMMIT",
+            "ROLLBACK",
+            "END",
+            "SAVEPOINT mine",
+            "RELEASE tinycloud_request",
+            "ROLLBACK TO tinycloud_request",
+        ] {
+            for request in [
+                batch(&["INSERT INTO t VALUES ('a')", control]),
+                batch(&[control, "INSERT INTO t VALUES ('a')"]),
+                SqlRequest::Execute {
+                    schema: Some(vec![control.into()]),
+                    sql: "INSERT INTO t VALUES ('a')".into(),
+                    params: vec![],
+                },
+            ] {
+                let result = run(&actor, request, GrowthPolicy::Allow).await;
+                assert!(result.is_err(), "{control} must be refused: {result:?}");
+                assert_eq!(
+                    scalar(&actor, "SELECT count(*) FROM t").await,
+                    "0",
+                    "{control} must not let a prefix commit"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tc1491_pragma_requests_keep_running_statement_by_statement() {
+        let dir = tempfile::tempdir().unwrap();
+        let actor = spawn_test_actor(&dir, u64::MAX);
+        run(
+            &actor,
+            exec("CREATE TABLE t (v TEXT NOT NULL)"),
+            GrowthPolicy::Allow,
+        )
+        .await
+        .unwrap();
+        // `foreign_keys` is a no-op inside a transaction, so a request that
+        // carries a PRAGMA is not wrapped: the prefix still commits.
+        let failed = run(
+            &actor,
+            batch(&[
+                "PRAGMA foreign_keys = OFF",
+                "INSERT INTO t VALUES ('prefix')",
+                "INSERT INTO t VALUES (NULL)",
+            ]),
+            GrowthPolicy::Allow,
+        )
+        .await;
+        assert!(failed.is_err());
+        assert_eq!(scalar(&actor, "SELECT count(*) FROM t").await, "1");
+        assert_eq!(scalar(&actor, "PRAGMA foreign_keys").await, "0");
     }
 }

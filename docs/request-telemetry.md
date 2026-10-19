@@ -90,7 +90,7 @@ SQLx query timing follows the execution/logger lifetime, including network I/O a
 | Quota/admin | In-memory overrides and size mirrors do not invent queries; usage/hosted-space enumeration and any actual pool work are counted |
 | SQL/DuckDB identity/fence/alias resolution and durable artifact load/save/CAS/delta | Shared pool, including PostgreSQL bulk scopes; cache hits perform only their actual work |
 | Request-awaited read audit | Separate measured batch context, fanned out before durable receipts; details below |
-| User SQL rusqlite actor | Context on every work message; actual statement/schema/batch/growth-control SQL, prepare/constraint errors, cold-open PRAGMAs, size/promotion/checkpoint SQL |
+| User SQL rusqlite actor | Context on every work message; actual statement/schema/batch/growth-control SQL (a multi-statement request also counts the `SAVEPOINT` and `RELEASE`/`ROLLBACK` of its request transaction, TC-1491), prepare/constraint errors, cold-open PRAGMAs, size/promotion/checkpoint SQL |
 | SQL publication | The current withdrawn publication handler executes no SQL; it is not an uninstrumented database path |
 | Optional DuckDB actor | Context on every message and the initiating cold-open worker; JSON/Arrow queries, schema/batch/transaction/growth/catalog SQL, locked security settings and promotion/copy/describe SQL |
 | DuckDB import/cold export blocking workers | Explicit worker context for guarded admission/validation/checkpoint/copy SQL; artifact repository work is measured separately by SQLx |

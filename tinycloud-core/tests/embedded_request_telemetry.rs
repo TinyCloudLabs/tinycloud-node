@@ -181,7 +181,9 @@ async fn sqlite_counts_schema_execution_errors_and_guard_controls() {
             .unwrap();
     })
     .await;
-    assert_eq!(context.snapshot().query_count, 4);
+    // Schema statement, statement, and the request transaction's SAVEPOINT and
+    // RELEASE (TC-1491), plus the two size PRAGMAs.
+    assert_eq!(context.snapshot().query_count, 6);
     let failed = request("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
     scope(Arc::clone(&failed), async {
         actor
