@@ -8,22 +8,27 @@
 //! expression, so the planner seeks on the bounds. The old index stays for
 //! point lookups. No query changes: the planner matches the expression.
 //!
-//! Operators build this exact index online first, outside any transaction:
-//! `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_current_kv_space_deleted_key_c
-//! ON current_kv (space, deleted, (key COLLATE "C"))`. This migration must then
-//! do nothing. On PostgreSQL a bare `CREATE INDEX IF NOT EXISTS` would still
-//! take the SHARE lock on `current_kv` before it checks the name, and the
-//! boot's migration transaction would hold it, blocking every KV write, until
-//! every migration had run. So `up` reads `pg_index` first and issues no DDL
-//! when a valid index of that name and shape exists. `IF NOT EXISTS` also
-//! matches by name only, so an INVALID (failed `CONCURRENTLY`) or differently
-//! shaped index of that name fails the migration instead of being recorded as
-//! done.
+//! **The index is performance-only.** The node boots and serves without it
+//! (KV lists are slower), so this migration never locks `current_kv` for a
+//! build and never fails boot because the index is missing or broken. On
+//! PostgreSQL, `up` reads `pg_index` for the index's exact name and:
 //!
-//! Without the operator-built index, `up` builds it inside the migration
-//! transaction: instant on a fresh database, but on a large `current_kv` it
-//! blocks writes for the build. **Do not reach that path on production: the
-//! operator step comes first** (`docs/releasing.md`).
+//! 1. valid, ready and live, with the right shape: does nothing;
+//! 2. missing and `current_kv` empty (a fresh or test database): creates it,
+//!    which is instant on an empty table;
+//! 3. missing and `current_kv` not empty: does **not** create it (a plain
+//!    `CREATE INDEX` takes a SHARE lock that blocks every KV write until the
+//!    boot transaction ends) and logs `current_kv_c_index_missing`;
+//! 4. right shape but invalid, not ready or not live (a failed or running
+//!    `CREATE INDEX CONCURRENTLY`): logs `current_kv_c_index_invalid`;
+//! 5. this name with another shape (or not an index on `current_kv`): logs
+//!    `current_kv_c_index_wrong_shape` at error level.
+//!
+//! In every case the migration is recorded as applied, so an index an operator
+//! builds later is simply used by the planner. Operators build it online
+//! before deploy, outside any transaction, with the statement and recovery
+//! steps in `docs/releasing.md`. The warnings are constant text: production
+//! logs are public (TC-961), so no key, space or value is ever logged.
 //!
 //! SQLite and MySQL: nothing to do. SQLite's `BINARY` collation is byte order,
 //! so `idx_current_kv_space_deleted_key` already seeks on the bounds. MySQL has
@@ -38,7 +43,30 @@ pub struct Migration;
 const INDEX: &str = "idx_current_kv_space_deleted_key_c";
 const DEFINITION: &str = r#"(space, deleted, (key COLLATE "C"))"#;
 
-/// The DDL the migration runs when the index is absent (PostgreSQL only).
+/// Longest the build on an empty table waits for a lock. The migration
+/// transaction's own `lock_timeout` is 30 s; a `CREATE INDEX` that waits queues
+/// every later KV writer behind it, so this is kept short and a timeout skips
+/// the index instead of failing boot.
+const CREATE_LOCK_TIMEOUT: &str = "2s";
+
+const EVENT_MISSING: &str = "current_kv_c_index_missing";
+const EVENT_INVALID: &str = "current_kv_c_index_invalid";
+const EVENT_WRONG_SHAPE: &str = "current_kv_c_index_wrong_shape";
+
+const MISSING_MESSAGE: &str = "idx_current_kv_space_deleted_key_c is missing; the node keeps \
+serving and KV list requests are slower until an operator builds it with CREATE INDEX CONCURRENTLY \
+(docs/releasing.md, section idx_current_kv_space_deleted_key_c)";
+const INVALID_MESSAGE: &str = "idx_current_kv_space_deleted_key_c is invalid or still being \
+built; the node keeps serving and KV list requests are slower. If no CREATE INDEX CONCURRENTLY is \
+running, run DROP INDEX CONCURRENTLY idx_current_kv_space_deleted_key_c; and then the CREATE INDEX \
+CONCURRENTLY in docs/releasing.md, section idx_current_kv_space_deleted_key_c";
+const WRONG_SHAPE_MESSAGE: &str = "idx_current_kv_space_deleted_key_c exists with the wrong \
+definition and is not used for KV lists; the node keeps serving and KV list requests are slower. \
+Run DROP INDEX CONCURRENTLY idx_current_kv_space_deleted_key_c; and then the CREATE INDEX \
+CONCURRENTLY in docs/releasing.md, section idx_current_kv_space_deleted_key_c";
+
+/// The DDL `up` runs when the index is absent and `current_kv` is empty
+/// (PostgreSQL only).
 fn create_index_sql() -> String {
     format!("CREATE INDEX IF NOT EXISTS {INDEX} ON current_kv {DEFINITION}")
 }
@@ -49,10 +77,20 @@ fn operator_create_index_sql() -> String {
     format!("CREATE INDEX CONCURRENTLY IF NOT EXISTS {INDEX} ON current_kv {DEFINITION}")
 }
 
-/// On PostgreSQL: `Ok(true)` when a valid, ready and live plain btree index
-/// named `INDEX` on `current_kv (space, deleted, (key COLLATE "C"))` exists in
-/// the current schema, `Ok(false)` when no relation has that name, and an
-/// error naming the fix otherwise.
+/// What the current schema holds under [`INDEX`]'s name.
+#[derive(Debug, PartialEq, Eq)]
+enum IndexState {
+    /// No relation has that name.
+    Missing,
+    /// A valid, ready and live plain btree index of the right shape.
+    Valid,
+    /// The right shape, but not valid, ready and live.
+    Invalid,
+    /// Anything else with that name.
+    WrongShape,
+}
+
+/// Classify [`INDEX`] on PostgreSQL.
 ///
 /// PostgreSQL stores `(key COLLATE "C")` on a bare column not as an index
 /// expression but as the column `key` with the `C` collation of `pg_catalog`
@@ -63,14 +101,7 @@ fn operator_create_index_sql() -> String {
 /// `idx_current_kv_space_deleted_key`), on `COLLATE "POSIX"`, on another
 /// expression, with a predicate, or with extra columns is not this index, and
 /// the planner cannot use it for the byte-order bounds.
-///
-/// An index whose `CREATE INDEX CONCURRENTLY` is still running is not yet
-/// valid either. It is recognised by its build's progress row: by
-/// `index_relid` when this role may see it, and otherwise (PostgreSQL hides a
-/// progress row's columns from roles without the builder's privileges) by a
-/// hidden progress row whose backend holds the build's SHARE UPDATE EXCLUSIVE
-/// lock on `current_kv`.
-async fn postgres_index_present(manager: &SchemaManager<'_>) -> Result<bool, DbErr> {
+async fn postgres_index_state(manager: &SchemaManager<'_>) -> Result<IndexState, DbErr> {
     let row = manager
         .get_connection()
         .query_one(Statement::from_sql_and_values(
@@ -94,18 +125,7 @@ async fn postgres_index_present(manager: &SchemaManager<'_>) -> Result<bool, DbE
                     COALESCE((SELECT bool_and(oc.opcdefault)
                               FROM unnest(i.indclass::oid[]) AS k(opclass)
                               JOIN pg_opclass oc ON oc.oid = k.opclass), false) AS default_opclasses,
-                    array_to_string(i.indoption::int2[], ',') AS options,
-                    EXISTS (
-                        SELECT 1 FROM pg_stat_progress_create_index p
-                        WHERE p.index_relid = c.oid
-                           OR (p.relid IS NULL AND EXISTS (
-                                   SELECT 1 FROM pg_locks l
-                                   WHERE l.pid = p.pid AND l.granted
-                                     AND l.database = (SELECT oid FROM pg_database
-                                                       WHERE datname = current_database())
-                                     AND l.relation = 'current_kv'::regclass
-                                     AND l.mode = 'ShareUpdateExclusiveLock'))
-                    ) AS building
+                    array_to_string(i.indoption::int2[], ',') AS options
              FROM pg_class c
              LEFT JOIN pg_index i ON i.indexrelid = c.oid
              LEFT JOIN pg_am am ON am.oid = c.relam
@@ -116,7 +136,7 @@ async fn postgres_index_present(manager: &SchemaManager<'_>) -> Result<bool, DbE
         ))
         .await?;
     let Some(row) = row else {
-        return Ok(false);
+        return Ok(IndexState::Missing);
     };
     let kind: String = row.try_get("", "kind")?;
     let on_table: bool = row.try_get("", "on_table")?;
@@ -127,7 +147,6 @@ async fn postgres_index_present(manager: &SchemaManager<'_>) -> Result<bool, DbE
     let key_collation: Option<String> = row.try_get("", "key_collation")?;
     let default_opclasses: bool = row.try_get("", "default_opclasses")?;
     let options: Option<String> = row.try_get("", "options")?;
-    let building: bool = row.try_get("", "building")?;
     let shaped = kind == "i"
         && on_table
         && method.as_deref() == Some("btree")
@@ -136,34 +155,80 @@ async fn postgres_index_present(manager: &SchemaManager<'_>) -> Result<bool, DbE
         && key_collation.as_deref() == Some("pg_catalog.C")
         && default_opclasses
         && options.as_deref() == Some("0,0,0");
-    if shaped && usable {
-        return Ok(true);
+    Ok(match (shaped, usable) {
+        (true, true) => IndexState::Valid,
+        (true, false) => IndexState::Invalid,
+        (false, _) => IndexState::WrongShape,
+    })
+}
+
+/// Whether `current_kv` has any row. An `EXISTS` probe stops at the first
+/// row and takes only an ACCESS SHARE lock, which no writer conflicts with.
+async fn current_kv_is_empty(manager: &SchemaManager<'_>) -> Result<bool, DbErr> {
+    let row = manager
+        .get_connection()
+        .query_one(Statement::from_string(
+            DbBackend::Postgres,
+            "SELECT EXISTS (SELECT 1 FROM current_kv) AS present".to_string(),
+        ))
+        .await?
+        .ok_or_else(|| DbErr::Migration("current_kv probe returned no row".to_string()))?;
+    Ok(!row.try_get::<bool>("", "present")?)
+}
+
+/// Build the index on the empty `current_kv`. The build runs in a savepoint
+/// with a short `lock_timeout`, so a writer that appears between the probe and
+/// the build, or a role that may not create indexes on the table, leaves the
+/// transaction usable: `Ok(false)` means "skipped", never a failed boot.
+async fn try_create_on_empty_table(manager: &SchemaManager<'_>) -> Result<bool, DbErr> {
+    const SAVEPOINT: &str = "current_kv_c_index";
+    let conn = manager.get_connection();
+    let outer_timeout: String = conn
+        .query_one(Statement::from_string(
+            DbBackend::Postgres,
+            "SELECT current_setting('lock_timeout') AS value".to_string(),
+        ))
+        .await?
+        .ok_or_else(|| DbErr::Migration("lock_timeout probe returned no row".to_string()))?
+        .try_get("", "value")?;
+    conn.execute_unprepared(&format!("SAVEPOINT {SAVEPOINT}"))
+        .await?;
+    let built = async {
+        conn.execute_unprepared(&format!("SET LOCAL lock_timeout = '{CREATE_LOCK_TIMEOUT}'"))
+            .await?;
+        conn.execute_unprepared(&create_index_sql()).await
     }
-    if shaped && building {
-        return Err(DbErr::Migration(format!(
-            "{INDEX} is still being built (a CREATE INDEX CONCURRENTLY is in progress). Nothing \
-             was applied. Wait for the build to finish, check that pg_index.indisvalid is true, \
-             and restart."
-        )));
+    .await;
+    if built.is_err() {
+        conn.execute_unprepared(&format!("ROLLBACK TO SAVEPOINT {SAVEPOINT}"))
+            .await?;
     }
-    let problem = if shaped {
-        "is not usable (indisvalid, indisready and indislive are not all true: a failed or \
-         interrupted CREATE INDEX CONCURRENTLY)"
-            .to_string()
-    } else {
-        format!(
-            "is not a plain btree index on current_kv {DEFINITION} \
-             (relkind {kind}, on current_kv: {on_table}, method {method:?}, \
-             columns {columns:?}, key collation {key_collation:?}, no predicate, expressions \
-             or included columns: {plain:?}, default operator classes: {default_opclasses}, \
-             options {options:?})"
-        )
-    };
-    Err(DbErr::Migration(format!(
-        "{INDEX} {problem}. Nothing was applied. Run `DROP INDEX CONCURRENTLY {INDEX};` then \
-         `CREATE INDEX CONCURRENTLY {INDEX} ON current_kv {DEFINITION};`, check \
-         pg_index.indisvalid, and restart."
-    )))
+    conn.execute_unprepared(&format!("RELEASE SAVEPOINT {SAVEPOINT}"))
+        .await?;
+    if built.is_ok() {
+        // `SET LOCAL` outlives the released savepoint: give the migration
+        // transaction its own timeout back.
+        conn.execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT set_config('lock_timeout', $1, true)",
+            [outer_timeout.into()],
+        ))
+        .await?;
+    }
+    Ok(built.is_ok())
+}
+
+/// Why the index was not built: constant values only.
+const REASON_TABLE_NOT_EMPTY: &str = "table_not_empty";
+const REASON_BUILD_FAILED: &str = "build_failed";
+
+fn warn_missing(reason: &'static str) {
+    tracing::warn!(
+        event = EVENT_MISSING,
+        index = INDEX,
+        reason,
+        "{MISSING_MESSAGE}"
+    );
 }
 
 #[async_trait::async_trait]
@@ -172,13 +237,26 @@ impl MigrationTrait for Migration {
         if manager.get_database_backend() != DbBackend::Postgres {
             return Ok(());
         }
-        if postgres_index_present(manager).await? {
-            return Ok(());
+        match postgres_index_state(manager).await? {
+            IndexState::Valid => {}
+            IndexState::Invalid => {
+                tracing::warn!(event = EVENT_INVALID, index = INDEX, "{INVALID_MESSAGE}");
+            }
+            IndexState::WrongShape => {
+                tracing::error!(
+                    event = EVENT_WRONG_SHAPE,
+                    index = INDEX,
+                    "{WRONG_SHAPE_MESSAGE}"
+                );
+            }
+            IndexState::Missing => {
+                if !current_kv_is_empty(manager).await? {
+                    warn_missing(REASON_TABLE_NOT_EMPTY);
+                } else if !try_create_on_empty_table(manager).await? {
+                    warn_missing(REASON_BUILD_FAILED);
+                }
+            }
         }
-        manager
-            .get_connection()
-            .execute_unprepared(&create_index_sql())
-            .await?;
         Ok(())
     }
 
@@ -194,20 +272,27 @@ impl MigrationTrait for Migration {
 mod tests {
     use super::*;
     use crate::migrations::Migrator;
-    use crate::test_support::PostgresTestSchema;
+    use crate::test_support::events::{capture_events, CapturedEvent};
+    use crate::test_support::PostgresTestDatabase;
     use sea_orm::{ConnectionTrait, Database, DbBackend, DbConn, Statement, TransactionTrait};
     use sea_orm_migration::MigratorTrait;
+    use std::time::Duration;
 
-    fn position_of(name: &str) -> u32 {
+    /// A key the logs must never show.
+    const KEY_CANARY: &str = "secret-key-canary";
+
+    fn steps_before_this() -> u32 {
         Migrator::migrations()
             .iter()
-            .position(|migration| migration.name() == name)
+            .position(|migration| migration.name() == Migration.name())
             .unwrap() as u32
     }
 
-    /// Number of migrations before this one.
-    fn steps_before_this() -> u32 {
-        position_of(Migration.name())
+    /// A database as of the previous release, in a database of its own: some
+    /// tests here run `CREATE INDEX CONCURRENTLY`, which waits for every open
+    /// transaction of its database (`PostgresTestDatabase`).
+    async fn before_this(test: &str) -> Option<PostgresTestDatabase> {
+        PostgresTestDatabase::migrated_through(test, Some(steps_before_this())).await
     }
 
     #[tokio::test]
@@ -228,23 +313,13 @@ mod tests {
         assert!(!names.iter().any(|name| name == INDEX), "{names:?}");
     }
 
-    /// `(oid, indisvalid, key columns with the third's collation)` of `INDEX`
-    /// on `current_kv` in the schema on `search_path`, or `None` if absent.
-    async fn postgres_index(db: &DbConn) -> Option<(u32, bool, String)> {
+    /// `(oid, indisvalid)` of `INDEX` on `current_kv`, or `None` if absent.
+    async fn postgres_index(db: &DbConn) -> Option<(u32, bool)> {
         let row = db
             .query_one(Statement::from_string(
                 DbBackend::Postgres,
                 format!(
-                    "SELECT c.oid::int8 AS oid, i.indisvalid AS valid,
-                            array_to_string(ARRAY(
-                                SELECT COALESCE(a.attname::text, '<expr>')
-                                    || CASE WHEN k.ord = 3 THEN ' ' || co.collname::text ELSE '' END
-                                FROM unnest(i.indkey::int2[]) WITH ORDINALITY AS k(attnum, ord)
-                                LEFT JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
-                                JOIN unnest(i.indcollation::oid[]) WITH ORDINALITY AS cl(coll, ord)
-                                  ON cl.ord = k.ord
-                                LEFT JOIN pg_collation co ON co.oid = cl.coll
-                                ORDER BY k.ord), ',') AS columns
+                    "SELECT c.oid::int8 AS oid, i.indisvalid AS valid
                      FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
                      WHERE i.indrelid = 'current_kv'::regclass AND c.relname = '{INDEX}'"
                 ),
@@ -254,13 +329,42 @@ mod tests {
         Some((
             row.try_get::<i64>("", "oid").unwrap() as u32,
             row.try_get("", "valid").unwrap(),
-            row.try_get("", "columns").unwrap(),
         ))
     }
 
     /// The production entry point: one outer transaction (TC-1054).
-    async fn migrate(db: &DbConn) -> Result<(), DbErr> {
+    async fn boot(db: &DbConn) -> Result<(), DbErr> {
         crate::db::migrate(&db.clone().into()).await
+    }
+
+    /// `up` alone, in a transaction under the boot's 30 s `lock_timeout`.
+    /// Returns the `lock_timeout` in force when `up` returned.
+    async fn run_up(db: &DbConn) -> String {
+        let transaction = db.begin().await.unwrap();
+        transaction
+            .execute_unprepared("SET LOCAL lock_timeout = '30s'")
+            .await
+            .unwrap();
+        Migration
+            .up(&SchemaManager::new(&transaction))
+            .await
+            .unwrap();
+        let timeout = transaction
+            .query_one(Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT current_setting('lock_timeout') AS value".to_string(),
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "value")
+            .unwrap();
+        transaction.commit().await.unwrap();
+        timeout
+    }
+
+    async fn events_of<F: std::future::Future>(run: F) -> (F::Output, Vec<CapturedEvent>) {
+        capture_events("current_kv_c_index_", run).await
     }
 
     async fn recorded(db: &DbConn) -> i64 {
@@ -278,287 +382,496 @@ mod tests {
         .unwrap()
     }
 
-    fn expected_columns() -> String {
-        "space,deleted,key C".to_string()
+    /// One live key, so `current_kv` is not empty. Foreign keys are off for
+    /// the table: the rows they point at are not what is tested.
+    async fn insert_a_key(db: &DbConn) {
+        db.execute_unprepared("ALTER TABLE current_kv DISABLE TRIGGER ALL")
+            .await
+            .unwrap();
+        db.execute_unprepared(&format!(
+            "INSERT INTO current_kv (space, key, invocation, seq, epoch, epoch_seq, value, \
+             metadata, deleted) VALUES ('tinycloud:key:z:default', '{KEY_CANARY}', '\\x1e20', 1, \
+             '\\x1e20', 0, '\\x1e20', '{{}}', false)"
+        ))
+        .await
+        .unwrap();
     }
 
-    /// A schema as of the previous release: this migration not yet applied.
-    async fn before_this(test: &str) -> Option<PostgresTestSchema> {
-        PostgresTestSchema::migrated_through(test, Some(steps_before_this())).await
+    /// A transaction mid-write on `current_kv`, as `transact` is when it
+    /// upserts. `ROW EXCLUSIVE` conflicts with the `SHARE` lock a `CREATE
+    /// INDEX` takes, so anything that tried to build would queue behind it.
+    async fn open_writer(db: &DbConn) -> sea_orm::DatabaseTransaction {
+        let writer = db.begin().await.unwrap();
+        writer
+            .execute_unprepared("LOCK TABLE current_kv IN ROW EXCLUSIVE MODE")
+            .await
+            .unwrap();
+        writer
     }
 
+    /// The one `missing` warning, with the constant reason it was not built.
+    fn assert_missing(events: &[CapturedEvent], reason: &str, label: &str) {
+        assert_only(
+            events,
+            EVENT_MISSING,
+            tracing::Level::WARN,
+            MISSING_MESSAGE,
+            label,
+        );
+        assert!(
+            events[0].fields.contains(&format!("reason=\"{reason}\"")),
+            "{label}: {:?}",
+            events[0]
+        );
+    }
+
+    fn assert_only(
+        events: &[CapturedEvent],
+        name: &str,
+        level: tracing::Level,
+        message: &str,
+        label: &str,
+    ) {
+        assert_eq!(events.len(), 1, "{label}: {events:?}");
+        let event = &events[0];
+        assert_eq!(event.event, name, "{label}");
+        assert_eq!(event.level, level, "{label}");
+        assert_eq!(event.message, message, "{label}");
+        assert!(
+            !event.message.contains(KEY_CANARY) && !event.fields.contains(KEY_CANARY),
+            "{label}: {event:?}"
+        );
+    }
+
+    /// Branch 2 (fresh database): the index is built, instantly, silently.
     #[tokio::test]
-    async fn postgres_fresh_database_gets_a_valid_index() {
+    async fn postgres_fresh_database_gets_the_index() {
         let Some(fixture) =
-            PostgresTestSchema::new("postgres_fresh_database_gets_a_valid_index").await
+            PostgresTestDatabase::migrated_through("postgres_fresh_database_gets_the_index", None)
+                .await
         else {
             return;
         };
-        let (_, valid, columns) = postgres_index(&fixture.conn).await.unwrap();
-        assert!(valid);
-        assert_eq!(columns, expected_columns());
+        assert!(postgres_index(&fixture.conn).await.unwrap().1);
     }
 
-    /// An existing database without the index (the operator step skipped)
-    /// gets it built by the migration, with its rows indexed.
+    /// Branch 2: missing and `current_kv` empty. Created; no warning; the
+    /// boot transaction's own `lock_timeout` is back afterwards.
     #[tokio::test]
-    async fn postgres_missing_index_is_created_by_the_migration() {
-        let Some(fixture) = before_this("postgres_missing_index_is_created_by_the_migration").await
+    async fn postgres_missing_index_on_an_empty_table_is_created() {
+        let Some(fixture) =
+            before_this("postgres_missing_index_on_an_empty_table_is_created").await
         else {
             return;
         };
         let db = &fixture.conn;
         assert_eq!(postgres_index(db).await, None);
 
-        migrate(db).await.unwrap();
+        let (timeout, events) = events_of(run_up(db)).await;
 
-        let (_, valid, columns) = postgres_index(db).await.unwrap();
-        assert!(valid);
-        assert_eq!(columns, expected_columns());
-        assert_eq!(recorded(db).await, 1);
+        assert!(postgres_index(db).await.unwrap().1);
+        assert!(events.is_empty(), "{events:?}");
+        assert_eq!(timeout, "30s");
     }
 
-    /// The operator built the index online with the documented statement.
-    /// Booting must keep that index (same OID) and must not lock `current_kv`
-    /// against writers: PostgreSQL takes `CREATE INDEX`'s SHARE lock before
-    /// it evaluates `IF NOT EXISTS`, and the migration transaction would hold
-    /// it until every migration has run.
+    /// Branch 2, but a writer holds `current_kv` between the probe and the
+    /// build (or the role may not build): the build gives up after
+    /// `CREATE_LOCK_TIMEOUT`, the transaction stays usable, the node boots
+    /// with one `missing` warning and the migration is recorded.
     #[tokio::test]
-    async fn postgres_operator_built_index_is_kept_without_blocking_writers() {
+    async fn postgres_failed_build_on_an_empty_table_warns_and_boots() {
         let Some(fixture) =
-            before_this("postgres_operator_built_index_is_kept_without_blocking_writers").await
+            before_this("postgres_failed_build_on_an_empty_table_warns_and_boots").await
         else {
             return;
         };
         let db = &fixture.conn;
+        let writer = open_writer(db).await;
+        let migrator = fixture.connect(1).await;
+
+        // `up` alone: the transaction is usable after the failed build and
+        // has the boot's `lock_timeout` back.
+        let ((timeout, up_waited), events) = events_of(async {
+            let started = std::time::Instant::now();
+            (run_up(&migrator).await, started.elapsed())
+        })
+        .await;
+        assert_eq!(timeout, "30s");
+        assert!(up_waited < Duration::from_secs(10), "{up_waited:?}");
+        assert_eq!(postgres_index(db).await, None);
+        assert_missing(&events, REASON_BUILD_FAILED, "up");
+
+        // The real boot: continues, records the migration.
+        let (booted, events) = events_of(tokio::time::timeout(
+            Duration::from_secs(20),
+            boot(&migrator),
+        ))
+        .await;
+        writer.rollback().await.unwrap();
+        booted.expect("boot hung on the build").unwrap();
+        assert_eq!(postgres_index(db).await, None);
+        assert_eq!(recorded(db).await, 1);
+        assert_missing(&events, REASON_BUILD_FAILED, "boot");
+    }
+
+    /// Branch 3: missing and `current_kv` not empty. No `CREATE INDEX`, so no
+    /// lock on `current_kv` (a writer mid-transaction does not hold the boot
+    /// up), no index, one `missing` warning with constant text, the node
+    /// boots and the migration is recorded. The operator's build afterwards
+    /// is a valid index of the right shape, and a restart is quiet.
+    #[tokio::test]
+    async fn postgres_missing_index_on_a_non_empty_table_is_skipped_with_a_warning() {
+        let Some(fixture) =
+            before_this("postgres_missing_index_on_a_non_empty_table_is_skipped_with_a_warning")
+                .await
+        else {
+            return;
+        };
+        let db = &fixture.conn;
+        insert_a_key(db).await;
+        let writer = open_writer(db).await;
+        let migrator = fixture.connect(1).await;
+
+        let (booted, events) = events_of(tokio::time::timeout(
+            Duration::from_secs(5),
+            boot(&migrator),
+        ))
+        .await;
+        writer.rollback().await.unwrap();
+
+        booted
+            .expect("boot waited behind an open current_kv write: it took a lock")
+            .unwrap();
+        assert_eq!(postgres_index(db).await, None, "the index was built");
+        assert_eq!(recorded(db).await, 1);
+        assert_missing(&events, REASON_TABLE_NOT_EMPTY, "non-empty");
+
+        // Later, the operator builds it with the documented statement.
         db.execute_unprepared(&operator_create_index_sql())
             .await
             .unwrap();
-        let (oid, valid, columns) = postgres_index(db).await.unwrap();
+        let (oid, valid) = postgres_index(db).await.unwrap();
         assert!(valid);
-        assert_eq!(columns, expected_columns());
+        let (_, events) = events_of(async {
+            boot(db).await.unwrap();
+            run_up(db).await;
+        })
+        .await;
+        assert!(events.is_empty(), "{events:?}");
+        assert_eq!(postgres_index(db).await, Some((oid, true)));
+    }
 
-        // A writer mid-transaction, as `transact` is when it upserts.
-        let writer = db.begin().await.unwrap();
-        writer
-            .execute_unprepared("LOCK TABLE current_kv IN ROW EXCLUSIVE MODE")
+    /// Branch 1: the operator built the index online with the documented
+    /// statement. Booting keeps that index (same OID), says nothing, and does
+    /// not lock `current_kv` against writers.
+    #[tokio::test]
+    async fn postgres_valid_index_is_kept_without_a_warning_or_a_lock() {
+        let Some(fixture) =
+            before_this("postgres_valid_index_is_kept_without_a_warning_or_a_lock").await
+        else {
+            return;
+        };
+        let db = &fixture.conn;
+        insert_a_key(db).await;
+        db.execute_unprepared(&operator_create_index_sql())
             .await
             .unwrap();
+        let (oid, valid) = postgres_index(db).await.unwrap();
+        assert!(valid);
+        let writer = open_writer(db).await;
         let migrator = fixture.connect(1).await;
-        let migrated =
-            tokio::time::timeout(std::time::Duration::from_secs(5), migrate(&migrator)).await;
+
+        let (booted, events) = events_of(tokio::time::timeout(
+            Duration::from_secs(5),
+            boot(&migrator),
+        ))
+        .await;
         writer.rollback().await.unwrap();
-        migrated
-            .expect("migration waited behind an open current_kv write")
-            .unwrap();
 
-        let (after, valid, _) = postgres_index(db).await.unwrap();
-        assert_eq!(after, oid, "operator index was rebuilt");
-        assert!(valid);
+        booted
+            .expect("boot waited behind an open current_kv write")
+            .unwrap();
+        assert_eq!(postgres_index(db).await, Some((oid, true)));
         assert_eq!(recorded(db).await, 1);
+        assert!(events.is_empty(), "{events:?}");
     }
 
-    /// `IF NOT EXISTS` matches by name only. An index that is not valid,
-    /// ready and live (a failed `CREATE INDEX CONCURRENTLY`), or one of another
-    /// shape, must fail the migration rather than be recorded as done.
+    /// Branch 4: the right shape but not valid, ready and live (what a failed
+    /// `CREATE INDEX CONCURRENTLY` leaves). One `invalid` warning; the index
+    /// is neither dropped nor rebuilt, boot continues, the migration is
+    /// recorded. Empty or not, the table is not built on.
     #[tokio::test]
-    async fn postgres_unusable_operator_index_fails_the_migration() {
-        for (definition, unset) in [
-            (DEFINITION, Some("indisvalid")),
-            (DEFINITION, Some("indisready")),
-            (DEFINITION, Some("indislive")),
-            // The existing index's shape: the database collation, not "C".
-            ("(space, deleted, key)", None),
-            (r#"(space, deleted, (key COLLATE "POSIX"))"#, None),
-            (r#"(space, deleted, (lower(key) COLLATE "C"))"#, None),
-            (r#"(space, (key COLLATE "C"))"#, None),
-            (r#"(space, (key COLLATE "C"), deleted)"#, None),
-            (r#"(space, deleted, (key COLLATE "C") DESC)"#, None),
-            (
-                r#"(space, deleted, (key COLLATE "C") varchar_pattern_ops)"#,
-                None,
-            ),
-            (r#"(space, deleted, (key COLLATE "C")) INCLUDE (seq)"#, None),
-            (
-                r#"(space, deleted, (key COLLATE "C")) WHERE deleted = false"#,
-                None,
-            ),
+    async fn postgres_invalid_index_warns_and_boots() {
+        let Some(fixture) = before_this("postgres_invalid_index_warns_and_boots").await else {
+            return;
+        };
+        let db = &fixture.conn;
+        for (flag, populated) in [
+            ("indisvalid", false),
+            ("indisready", false),
+            ("indislive", false),
+            ("indisvalid", true),
         ] {
-            let label = format!("{definition} {unset:?}");
-            let Some(fixture) =
-                before_this("postgres_unusable_operator_index_fails_the_migration").await
-            else {
-                return;
-            };
-            let db = &fixture.conn;
-            db.execute_unprepared(&format!("CREATE INDEX {INDEX} ON current_kv {definition}"))
-                .await
-                .unwrap();
-            if let Some(flag) = unset {
-                // What a failed CONCURRENTLY build leaves behind. Needs a
-                // superuser, as the CI and local test roles are.
-                db.execute_unprepared(&format!(
-                    "UPDATE pg_index SET {flag} = false WHERE indexrelid = '{INDEX}'::regclass"
-                ))
-                .await
-                .unwrap();
+            let label = format!("{flag} populated {populated}");
+            if populated {
+                insert_a_key(db).await;
             }
-
-            let error = migrate(db).await.unwrap_err().to_string();
-
-            assert!(error.contains(INDEX), "{label}: {error}");
-            assert!(
-                error.contains("DROP INDEX CONCURRENTLY"),
-                "{label}: {error}"
-            );
-            assert!(
-                error.contains("CREATE INDEX CONCURRENTLY"),
-                "{label}: {error}"
-            );
-            assert_eq!(recorded(db).await, 0, "{label}");
-        }
-    }
-
-    /// A table of that name that is not an index at all is not this index.
-    #[tokio::test]
-    async fn postgres_other_relation_with_the_index_name_fails_the_migration() {
-        let Some(fixture) =
-            before_this("postgres_other_relation_with_the_index_name_fails_the_migration").await
-        else {
-            return;
-        };
-        let db = &fixture.conn;
-        db.execute_unprepared(&format!("CREATE TABLE {INDEX} (id int)"))
+            db.execute_unprepared(&format!("DROP INDEX IF EXISTS {INDEX}"))
+                .await
+                .unwrap();
+            db.execute_unprepared(&format!("CREATE INDEX {INDEX} ON current_kv {DEFINITION}"))
+                .await
+                .unwrap();
+            // What a failed CONCURRENTLY build leaves behind. Needs a
+            // superuser, as the CI and local test roles are.
+            db.execute_unprepared(&format!(
+                "UPDATE pg_index SET {flag} = false WHERE indexrelid = '{INDEX}'::regclass"
+            ))
             .await
             .unwrap();
+            let oid = postgres_index(db).await.unwrap().0;
 
-        let error = migrate(db).await.unwrap_err().to_string();
+            let (_, events) = events_of(run_up(db)).await;
 
-        assert!(error.contains("DROP INDEX CONCURRENTLY"), "{error}");
-        assert_eq!(recorded(db).await, 0);
-    }
-
-    /// A node that boots while the operator's `CREATE INDEX CONCURRENTLY` is
-    /// still running sees the index as not yet valid. It must fail, say to
-    /// wait for the build (not to drop it), and boot once the build is done.
-    /// The build is held in its "waiting for writers" phase by an open
-    /// `current_kv` write. Checked as the building superuser, who sees the
-    /// build's `index_relid`, and as another role, from whom PostgreSQL hides
-    /// the progress row's columns.
-    #[tokio::test]
-    async fn postgres_index_build_in_progress_says_wait() {
-        let test = "postgres_index_build_in_progress_says_wait";
-        for restricted in [false, true] {
-            let Some(fixture) = before_this(test).await else {
-                return;
-            };
-            let db = &fixture.conn;
-            let schema: String = db
-                .query_one(Statement::from_string(
-                    DbBackend::Postgres,
-                    "SELECT current_schema() AS s".to_string(),
-                ))
-                .await
-                .unwrap()
-                .unwrap()
-                .try_get("", "s")
-                .unwrap();
-            let role = format!("{schema}_node");
-
-            let writer = db.begin().await.unwrap();
-            writer
-                .execute_unprepared("LOCK TABLE current_kv IN ROW EXCLUSIVE MODE")
-                .await
-                .unwrap();
-            let builder = fixture.connect(1).await;
-            let build = tokio::spawn(async move {
-                builder
-                    .execute_unprepared(&format!(
-                        "CREATE INDEX CONCURRENTLY {INDEX} ON current_kv {DEFINITION}"
-                    ))
-                    .await
-            });
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-            while postgres_index(db).await.is_none() {
-                assert!(
-                    tokio::time::Instant::now() < deadline,
-                    "build never started"
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-            assert!(
-                !postgres_index(db).await.unwrap().1,
-                "mid-build index is not valid"
+            assert_only(
+                &events,
+                EVENT_INVALID,
+                tracing::Level::WARN,
+                INVALID_MESSAGE,
+                &label,
             );
-
-            let migrator = fixture.connect(1).await;
-            if restricted {
-                for statement in [
-                    format!("CREATE ROLE {role} NOLOGIN"),
-                    format!("GRANT USAGE, CREATE ON SCHEMA {schema} TO {role}"),
-                    format!("GRANT SELECT ON seaql_migrations TO {role}"),
-                    format!("SET ROLE {role}"),
-                ] {
-                    migrator.execute_unprepared(&statement).await.unwrap();
-                }
-            }
-            let error = migrate(&migrator).await.unwrap_err().to_string();
-            writer.rollback().await.unwrap();
-            build.await.unwrap().unwrap();
-            if restricted {
-                drop(migrator);
-                for statement in [format!("DROP OWNED BY {role}"), format!("DROP ROLE {role}")] {
-                    db.execute_unprepared(&statement).await.unwrap();
-                }
-            }
-
-            assert!(
-                error.contains("still being built"),
-                "restricted {restricted}: {error}"
-            );
-            assert!(
-                !error.contains("DROP INDEX"),
-                "restricted {restricted}: {error}"
-            );
-            assert_eq!(recorded(db).await, 0);
-            migrate(db).await.unwrap();
-            assert_eq!(recorded(db).await, 1);
-            assert!(postgres_index(db).await.unwrap().1);
+            assert_eq!(postgres_index(db).await.unwrap().0, oid, "{label}: rebuilt");
         }
+
+        // Through the real boot, recorded as applied.
+        let (booted, events) = events_of(boot(db)).await;
+        booted.unwrap();
+        assert_eq!(recorded(db).await, 1);
+        assert_eq!(events.len(), 1, "{events:?}");
     }
 
-    /// A failed build is not mistaken for a running one just because some
-    /// session that is not building an index (autovacuum, ANALYZE, a manual
-    /// lock) holds SHARE UPDATE EXCLUSIVE on `current_kv`: the advice stays
-    /// to drop and rebuild.
-    #[tokio::test]
-    async fn postgres_failed_index_with_a_non_building_lock_holder_says_drop() {
-        let Some(fixture) =
-            before_this("postgres_failed_index_with_a_non_building_lock_holder_says_drop").await
-        else {
-            return;
-        };
-        let db = &fixture.conn;
-        db.execute_unprepared(&format!("CREATE INDEX {INDEX} ON current_kv {DEFINITION}"))
-            .await
-            .unwrap();
+    /// Remove whatever holds `INDEX`'s name (an index or a table) and `other_kv`.
+    async fn clear_index_name(db: &DbConn) {
         db.execute_unprepared(&format!(
-            "UPDATE pg_index SET indisvalid = false WHERE indexrelid = '{INDEX}'::regclass"
+            "DO $$
+             DECLARE kind \"char\";
+             BEGIN
+                 SELECT relkind INTO kind FROM pg_class
+                 WHERE relname = '{INDEX}'
+                   AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = current_schema());
+                 IF kind = 'i' THEN DROP INDEX {INDEX}; ELSIF kind = 'r' THEN DROP TABLE {INDEX}; END IF;
+                 DROP TABLE IF EXISTS other_kv;
+             END $$"
         ))
         .await
         .unwrap();
-        let holder = db.begin().await.unwrap();
-        holder
-            .execute_unprepared("LOCK TABLE current_kv IN SHARE UPDATE EXCLUSIVE MODE")
+    }
+
+    /// Branch 4 as it happens: the operator's `CREATE INDEX CONCURRENTLY` is
+    /// still running (held in its first wait by an open write), so the index
+    /// is not valid yet. The node boots with one `invalid` warning, without
+    /// waiting for the build and without disturbing it; the build then
+    /// finishes valid. This database is this test's own: the build waits for
+    /// every open transaction of its database.
+    #[tokio::test]
+    async fn postgres_index_build_in_progress_warns_and_boots() {
+        let Some(fixture) = before_this("postgres_index_build_in_progress_warns_and_boots").await
+        else {
+            return;
+        };
+        let db = &fixture.conn;
+        insert_a_key(db).await;
+        let writer = open_writer(db).await;
+        let builder = fixture.connect(1).await;
+        let build = tokio::spawn(async move {
+            builder
+                .execute_unprepared(&operator_create_index_sql())
+                .await
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while postgres_index(db).await.is_none() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "build never started"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(!postgres_index(db).await.unwrap().1, "mid-build is invalid");
+        let migrator = fixture.connect(1).await;
+
+        let (booted, events) = events_of(tokio::time::timeout(
+            Duration::from_secs(5),
+            boot(&migrator),
+        ))
+        .await;
+        writer.rollback().await.unwrap();
+        build.await.unwrap().unwrap();
+
+        booted.expect("boot waited for the build").unwrap();
+        assert_only(
+            &events,
+            EVENT_INVALID,
+            tracing::Level::WARN,
+            INVALID_MESSAGE,
+            "build in progress",
+        );
+        assert_eq!(recorded(db).await, 1);
+        assert!(postgres_index(db).await.unwrap().1, "build finished valid");
+    }
+
+    /// Branch 5: this name, another definition (or another kind of relation,
+    /// or another table). One error-level `wrong_shape` event; the object is
+    /// left alone, boot continues.
+    #[tokio::test]
+    async fn postgres_wrong_shape_under_the_index_name_warns_loudly_and_boots() {
+        let Some(fixture) =
+            before_this("postgres_wrong_shape_under_the_index_name_warns_loudly_and_boots").await
+        else {
+            return;
+        };
+        let db = &fixture.conn;
+        for (setup, populated) in [
+            // The existing index's shape: the database collation, not "C".
+            (
+                format!("CREATE INDEX {INDEX} ON current_kv (space, deleted, key)"),
+                false,
+            ),
+            (
+                format!(
+                    r#"CREATE INDEX {INDEX} ON current_kv (space, deleted, (key COLLATE "POSIX"))"#
+                ),
+                false,
+            ),
+            (
+                format!(
+                    r#"CREATE INDEX {INDEX} ON current_kv (space, deleted, (lower(key) COLLATE "C"))"#
+                ),
+                false,
+            ),
+            (
+                format!(r#"CREATE INDEX {INDEX} ON current_kv (space, (key COLLATE "C"))"#),
+                false,
+            ),
+            (
+                format!(
+                    r#"CREATE INDEX {INDEX} ON current_kv (space, (key COLLATE "C"), deleted)"#
+                ),
+                false,
+            ),
+            (
+                format!(
+                    r#"CREATE INDEX {INDEX} ON current_kv (space, deleted, (key COLLATE "C") DESC)"#
+                ),
+                false,
+            ),
+            (
+                format!(
+                    r#"CREATE INDEX {INDEX} ON current_kv (space, deleted, (key COLLATE "C") varchar_pattern_ops)"#
+                ),
+                false,
+            ),
+            (
+                format!(
+                    r#"CREATE INDEX {INDEX} ON current_kv (space, deleted, (key COLLATE "C")) INCLUDE (seq)"#
+                ),
+                false,
+            ),
+            (
+                format!(
+                    r#"CREATE INDEX {INDEX} ON current_kv (space, deleted, (key COLLATE "C")) WHERE deleted = false"#
+                ),
+                false,
+            ),
+            // Non-empty table too: still no build.
+            (
+                format!("CREATE INDEX {INDEX} ON current_kv (space, deleted, key)"),
+                true,
+            ),
+            // Another table's index of this name.
+            (
+                format!(
+                    r#"CREATE TABLE other_kv (space text, deleted boolean, key varchar);
+                       CREATE INDEX {INDEX} ON other_kv (space, deleted, (key COLLATE "C"))"#
+                ),
+                false,
+            ),
+            // Not an index.
+            (format!("CREATE TABLE {INDEX} (id int)"), false),
+        ] {
+            if populated {
+                insert_a_key(db).await;
+            }
+            clear_index_name(db).await;
+            db.execute_unprepared(&setup).await.unwrap();
+
+            let (_, events) = events_of(run_up(db)).await;
+
+            assert_only(
+                &events,
+                EVENT_WRONG_SHAPE,
+                tracing::Level::ERROR,
+                WRONG_SHAPE_MESSAGE,
+                &setup,
+            );
+        }
+
+        // Through the real boot, recorded as applied.
+        let (booted, events) = events_of(boot(db)).await;
+        booted.unwrap();
+        assert_eq!(recorded(db).await, 1);
+        assert_eq!(events.len(), 1, "{events:?}");
+    }
+
+    /// A different name is a different index: `up` looks only at its own
+    /// name, whatever else is on `current_kv` (existing indexes of any shape,
+    /// even this very definition under another name).
+    #[tokio::test]
+    async fn postgres_other_indexes_are_ignored() {
+        let Some(fixture) = before_this("postgres_other_indexes_are_ignored").await else {
+            return;
+        };
+        let db = &fixture.conn;
+        for statement in [
+            "CREATE INDEX idx_tc1274_other_collation ON current_kv (space, deleted, key)",
+            r#"CREATE INDEX idx_tc1274_other_name ON current_kv (space, deleted, (key COLLATE "C"))"#,
+        ] {
+            db.execute_unprepared(statement).await.unwrap();
+        }
+        let others = || async {
+            db.query_all(Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT c.relname::text AS name, c.oid::int8 AS oid FROM pg_class c \
+                 WHERE c.relname LIKE 'idx_tc1274_other_%' ORDER BY 1"
+                    .to_string(),
+            ))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| {
+                (
+                    row.try_get::<String>("", "name").unwrap(),
+                    row.try_get::<i64>("", "oid").unwrap(),
+                )
+            })
+            .collect::<Vec<_>>()
+        };
+        let before = others().await;
+        assert_eq!(before.len(), 2);
+
+        // Empty table: this index is still built.
+        let (_, events) = events_of(run_up(db)).await;
+        assert!(postgres_index(db).await.unwrap().1);
+        assert!(events.is_empty(), "{events:?}");
+        assert_eq!(others().await, before);
+
+        // Non-empty table without it: still the `missing` warning.
+        db.execute_unprepared(&format!("DROP INDEX {INDEX}"))
             .await
             .unwrap();
-
-        let migrator = fixture.connect(1).await;
-        let error = migrate(&migrator).await.unwrap_err().to_string();
-        holder.rollback().await.unwrap();
-
-        assert!(error.contains("DROP INDEX CONCURRENTLY"), "{error}");
-        assert!(!error.contains("still being built"), "{error}");
-        assert_eq!(recorded(db).await, 0);
+        insert_a_key(db).await;
+        let (_, events) = events_of(run_up(db)).await;
+        assert_eq!(postgres_index(db).await, None);
+        assert_missing(&events, REASON_TABLE_NOT_EMPTY, "other indexes");
+        assert_eq!(others().await, before);
     }
 }

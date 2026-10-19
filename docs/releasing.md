@@ -62,15 +62,22 @@ built from a `1.9.0` tree); the `version-guard` job now blocks the second one.
 A migration that indexes a large PostgreSQL table cannot be built by the boot:
 the boot runs every pending migration in one transaction, so a plain
 `CREATE INDEX` holds a SHARE lock on the table, blocking its writes, for the
-whole build. For these, the operator builds the index online first, and the
-migration then finds it and does nothing. **Order: operator step, then the
-node deploy.**
+whole build. For these, the operator builds the index online first. **Order:
+operator step, then the node deploy.**
+
+An index that only speeds up reads is **performance-only**: the node boots and
+serves without it, so its migration never builds it on a non-empty table and
+never fails the boot over it. It logs a typed warning and keeps serving; an
+index built later is picked up by the planner with no restart.
 
 ### `idx_current_kv_space_deleted_key_c` (TC-1274, `m20261020_000000_current_kv_key_c_index`)
 
 Ships in the release after 1.21.2. It lets the KV list range select seek on
 its byte-order key bounds instead of reading and filtering every live key of
-the space.
+the space. **Performance-only:** the node boots and serves without the index,
+and KV lists are slower until it exists. When it is missing on a non-empty
+`current_kv`, the node logs `current_kv_c_index_missing` (WARN) and keeps
+serving.
 
 1. On the PlanetScale primary, **outside any transaction** (the console, or
    `psql` without `BEGIN`; never through the node or a migration runner):
@@ -100,17 +107,37 @@ the space.
    DROP INDEX CONCURRENTLY idx_current_kv_space_deleted_key_c;
    ```
 
-4. Deploy the node. At boot the migration reads `pg_index`:
+4. Deploy the node. At boot the migration reads `pg_index` for that exact name
+   and **never takes a lock on `current_kv` for a build and never fails the
+   boot over the index**:
    - a valid, ready, live btree of that name on `current_kv` with the shape
-     above: **no DDL, no lock**, and the index keeps its OID;
-   - an INVALID index, or one of another shape (for example the existing
-     `(space, deleted, key)` shape, or `COLLATE "POSIX"`): the boot **fails**
-     with the `DROP INDEX CONCURRENTLY` / `CREATE INDEX CONCURRENTLY`
-     instructions, and nothing is applied;
-   - a build still running: the boot fails and says to wait for it;
-   - no such index: the migration builds it inside the boot transaction. That
-     is instant on an empty database and **must not happen on production**:
-     it blocks every `current_kv` write for the build.
+     above (columns `space, deleted, key`, the third in collation
+     `pg_catalog.C`, default operator classes, ascending, no predicate,
+     expression or INCLUDE): **no DDL, no lock, no warning**, and the index
+     keeps its OID;
+   - no such index and `current_kv` **empty** (a fresh or test database): the
+     migration builds it, which is instant;
+   - no such index and `current_kv` **not empty**: nothing is built. The node
+     logs one `current_kv_c_index_missing` warning, boots and serves with slower
+     KV lists, and the migration is recorded as applied. Run step 1 whenever
+     convenient; the planner uses the index as soon as it is valid. A restart
+     is not needed;
+   - the right shape but INVALID, not ready or not live (a failed or still
+     running `CREATE INDEX CONCURRENTLY`): one `current_kv_c_index_invalid`
+     warning. The index is left alone. If no build is running, follow step 3
+     and redo step 1;
+   - the name with another shape (for example the existing
+     `(space, deleted, key)` shape, `COLLATE "POSIX"`, DESC, another operator
+     class, INCLUDE, a predicate, another table, or a non-index relation): one
+     `current_kv_c_index_wrong_shape` error-level log. The object is left
+     alone, the node serves, and lists are slower. Run
+     `DROP INDEX CONCURRENTLY idx_current_kv_space_deleted_key_c;` and then
+     step 1.
+
+   The log text is constant (no key, space or value; production logs are
+   public, TC-961). The log shipper maps the `warn`/`error` record to
+   `node_warning` / `node_error` with an unclassified code, so look for the
+   event name in the node's own container log.
 
 Rollback: `DROP INDEX CONCURRENTLY IF EXISTS idx_current_kv_space_deleted_key_c;`
 is safe at any time; the list range select goes back to filtering the space,

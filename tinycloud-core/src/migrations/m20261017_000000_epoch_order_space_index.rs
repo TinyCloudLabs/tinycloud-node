@@ -156,7 +156,7 @@ mod tests {
     use crate::hash::{hash, Hash};
     use crate::migrations::Migrator;
     use crate::models::{epoch, space};
-    use crate::test_support::PostgresTestSchema;
+    use crate::test_support::{PostgresTestDatabase, PostgresTestSchema};
     use crate::types::SpaceIdWrap;
     use sea_orm::{
         ConnectionTrait, Database, DbBackend, DbConn, EntityTrait, PaginatorTrait, Statement,
@@ -405,7 +405,7 @@ mod tests {
     /// until every migration has run.
     #[tokio::test]
     async fn postgres_operator_built_index_is_kept_without_blocking_writers() {
-        let Some(fixture) = PostgresTestSchema::migrated_through(
+        let Some(fixture) = PostgresTestDatabase::migrated_through(
             "postgres_operator_built_index_is_kept_without_blocking_writers",
             Some(v1_20_6_migrations()),
         )
@@ -516,7 +516,7 @@ mod tests {
         let test = "postgres_index_build_in_progress_says_wait";
         for restricted in [false, true] {
             let Some(fixture) =
-                PostgresTestSchema::migrated_through(test, Some(steps_before_this())).await
+                PostgresTestDatabase::migrated_through(test, Some(steps_before_this())).await
             else {
                 return;
             };
@@ -531,7 +531,7 @@ mod tests {
                 .unwrap()
                 .try_get("", "s")
                 .unwrap();
-            let role = format!("{schema}_node");
+            let role = format!("{}_node", fixture.name());
 
             let writer = db.begin().await.unwrap();
             writer
