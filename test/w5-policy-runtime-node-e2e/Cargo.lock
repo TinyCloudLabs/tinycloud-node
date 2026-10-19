@@ -8479,6 +8479,7 @@ dependencies = [
  "clap",
  "core-foundation 0.9.4",
  "core-foundation-sys",
+ "ed25519-dalek",
  "futures",
  "hex",
  "hmac 0.12.1",
