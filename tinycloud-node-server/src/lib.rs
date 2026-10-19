@@ -34,6 +34,7 @@ pub mod egress;
 pub mod epoch_head_backfill;
 pub mod hooks;
 pub mod invocation_replay;
+pub mod issuer_set;
 pub mod link;
 pub mod node_control;
 pub mod policy_v3;
@@ -444,6 +445,7 @@ pub fn resolve_runtime_config(tinycloud_config: &Config) -> Result<Config> {
         .share_email
         .validate_for_v2_database(resolved.storage.database())
         .map_err(|error| anyhow::anyhow!(error))?;
+    resolved.share_email.credential_issuer_set()?;
     Ok(resolved)
 }
 
@@ -712,21 +714,11 @@ pub async fn app_with_control(
     if tinycloud_config.share_email.enabled {
         policy_v3_runtime = policy_v3_runtime.with_delivery(&tinycloud_config.share_email)?;
     }
-    if let Some(encoded_key) = tinycloud_config.share_email.issuer_public_key.as_deref() {
-        let decoded = base64::decode_config(encoded_key, base64::URL_SAFE_NO_PAD)
-            .context("policy credential issuer public key must be canonical base64url")?;
-        let public_key: [u8; 32] = decoded
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("policy credential issuer public key must be 32 bytes"))?;
-        policy_v3_runtime = policy_v3_runtime.with_credential_issuer(
-            tinycloud_auth::share_email_evidence::IssuerKey::new(
-                tinycloud_config.share_email.issuer_did.clone(),
-                tinycloud_config.share_email.issuer_vct.clone(),
-                tinycloud_config.share_email.issuer_key_version,
-                tinycloud_config.share_email.issuer_kid.clone(),
-                public_key,
-            ),
-        );
+    // The pinned issuer set is built (and every set-load rule applied) whether
+    // or not share-email is enabled; a violation stops the node from starting.
+    let credential_issuers = tinycloud_config.share_email.credential_issuer_set()?;
+    if !credential_issuers.is_empty() {
+        policy_v3_runtime = policy_v3_runtime.with_credential_issuers(credential_issuers);
     }
 
     #[cfg(feature = "duckdb")]
