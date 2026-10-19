@@ -53,7 +53,11 @@
     "SQL busy: artifact transfer": "sql_busy_artifact_transfer",
     "Request deadline exceeded": "request_timeout",
     "Request completed after its deadline": "deadline_overrun",
-    "Database hydration gave up loading its artifact": "sql_hydration_timeout"
+    "Database hydration gave up loading its artifact": "sql_hydration_timeout",
+    "Read audit wait expired": "read_audit_busy",
+    "Read audit batch slow": "read_audit_batch_slow",
+    "Read audit batch failed": "read_audit_batch_failed",
+    "Read audit drain stalled": "read_audit_drain_stalled"
   },
   "prefix": {
     "dstack socket available but get_info failed: ": "dstack_get_info_failed",

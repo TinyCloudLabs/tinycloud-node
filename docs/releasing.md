@@ -309,11 +309,12 @@ Before any CVM mutation the workflow requires:
 
 - the main compose, with its one node digest replaced by 64 zeros, to hash
   to the reviewed N0 template
-  **`009382266172b76ae1858aa79060da5f58ece66a758dd8fd876b96367d96e1db`**
-  (raw `b25b8414c784ee7d66d6e3a507d3dba29818aca5cbf339e85bcb667e2316e20d` normalized: the 1.21.0 compose
+  **`7fabba70e71423faa2c8b61981d4a7c95ac7c2552074af81c0877af774d6b383`**
+  (raw `1228d81927fc0a3fbba85745103e77b3112606f5d314d15974d400b222409350` normalized: the 1.21.0 compose
   `d95bfb707871c1d626c4a8f2b8d32d354103edbb5077847c6a21fe5f7f6cfa50`, template
   `51f8e9e9…`, with only the embedded Vector config regenerated for TC-1274's
-  warning codes. That compose is the #349 compose
+  and TC-1317's warning codes; TC-1274 alone was template `00938226…`, raw
+  `b25b8414…`. That compose is the #349 compose
   `c33c23021589163b62a71ef245b7194717711922027629f155bdd5cff806b8c7`, which
   keeps `TINYCLOUD_EPOCH_HEAD_BACKFILL__ENABLED: "false"`, with only
   `CLIENT_MAX_BODY_SIZE=32m` → `95m`). Ingress, socat, Vector and the log
@@ -378,8 +379,8 @@ gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref main \
 
 The served/OCI identity remains **1.20.6-dstack / e18578ff9162986ddd813259c60f73866e3e60d1**.
 With the template lock on main this redeploys exactly main's raw compose
-`b25b8414c784ee7d66d6e3a507d3dba29818aca5cbf339e85bcb667e2316e20d`
-(the 1.21.0 compose `d95bfb70…` with TC-1274's Vector config), whatever digest
+`1228d81927fc0a3fbba85745103e77b3112606f5d314d15974d400b222409350`
+(the 1.21.0 compose `d95bfb70…` with the TC-1274 and TC-1317 Vector config), whatever digest
 main's template currently pins. It is not a rollback of a
 later release across a schema migration. Current pre-N0 tag/pinned
 equivalents are separately hash-checked; arbitrary same-image config

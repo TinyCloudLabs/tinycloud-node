@@ -46,6 +46,8 @@ pub enum Stage {
     ArtifactTransfer = 3,
     /// Resolving a SQL or DuckDB database's durable identity.
     IdentityResolution = 4,
+    /// Waiting for a read's audit record to commit (TC-1317).
+    ReadAudit = 5,
 }
 
 impl Stage {
@@ -56,6 +58,7 @@ impl Stage {
             Stage::Hydration => "hydration",
             Stage::ArtifactTransfer => "artifact_transfer",
             Stage::IdentityResolution => "identity_resolution",
+            Stage::ReadAudit => "read_audit",
         }
     }
 
@@ -65,6 +68,7 @@ impl Stage {
             2 => Stage::Hydration,
             3 => Stage::ArtifactTransfer,
             4 => Stage::IdentityResolution,
+            5 => Stage::ReadAudit,
             _ => Stage::Other,
         }
     }

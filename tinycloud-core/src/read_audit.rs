@@ -7,7 +7,7 @@
 //! one transaction. Mutations and audit batches share the same writer lock.
 
 use crate::{
-    db_pool::RecoveringConnection,
+    db_pool::{is_transient_error, transient_error_class, RecoveringConnection},
     encryption::{maybe_encrypt, ColumnEncryption},
     events::Invocation,
     hash::Hash,
@@ -27,6 +27,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
 };
+use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 use tokio::sync::{mpsc, oneshot, Mutex};
 
@@ -67,22 +68,144 @@ impl ReadAuditRecord {
     }
 }
 
-struct Command {
-    record: ReadAuditRecord,
-    committed: oneshot::Sender<Result<(), String>>,
-    context: Option<Arc<RequestContext>>,
+/// Why a read's audit record was not confirmed (TC-1317). The read's data is
+/// never returned without a confirmed record.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ReadAuditError {
+    /// The record was not confirmed within the read-audit wait bound.
+    #[error("read_audit_busy: the read audit is backlogged; retry the request")]
+    Busy,
+    /// The record's batch failed with a transient database error; nothing
+    /// of the read was returned, so a fresh request is safe.
+    #[error(
+        "unavailable_retryable: read audit storage temporarily unavailable; retry the request"
+    )]
+    Unavailable,
+    /// The record's batch failed otherwise.
+    #[error("read audit failed: {0}")]
+    Failed(String),
+    /// The pipeline is gone.
+    #[error("read audit pipeline stopped")]
+    Stopped,
 }
 
-#[derive(Debug, Default)]
+struct Command {
+    record: ReadAuditRecord,
+    committed: oneshot::Sender<Result<(), ReadAuditError>>,
+    context: Option<Arc<RequestContext>>,
+    enqueued: Instant,
+}
+
+#[derive(Debug)]
 struct PipelineStats {
     records: AtomicU64,
     batches: AtomicU64,
+    failed_batches: AtomicU64,
+    abandoned: AtomicU64,
+    busy: AtomicU64,
+    /// Batches whose commit took longer than [`SLOW_BATCH`], and the longest.
+    slow_batches: AtomicU64,
+    max_commit_ms: AtomicU64,
+    /// When the batch now being committed started, in ms since `epoch` plus
+    /// one; 0 when none is in flight.
+    in_flight_since: AtomicU64,
+    /// The longest queue wait of the last formed batch's records.
+    last_queue_wait_ms: AtomicU64,
+    /// The class of the latest failed batch (a fixed string).
+    last_failure_class: std::sync::Mutex<&'static str>,
+    /// Reads whose pipeline was gone when they queued or waited.
+    stopped: AtomicU64,
+    epoch: Instant,
+    /// Test-only fault: this pipeline's next batch commit panics.
+    #[cfg(test)]
+    panic_next_batch: std::sync::atomic::AtomicBool,
 }
+
+impl Default for PipelineStats {
+    fn default() -> Self {
+        Self {
+            records: AtomicU64::new(0),
+            batches: AtomicU64::new(0),
+            failed_batches: AtomicU64::new(0),
+            abandoned: AtomicU64::new(0),
+            busy: AtomicU64::new(0),
+            slow_batches: AtomicU64::new(0),
+            max_commit_ms: AtomicU64::new(0),
+            in_flight_since: AtomicU64::new(0),
+            last_queue_wait_ms: AtomicU64::new(0),
+            last_failure_class: std::sync::Mutex::new("other"),
+            stopped: AtomicU64::new(0),
+            epoch: Instant::now(),
+            #[cfg(test)]
+            panic_next_batch: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+impl PipelineStats {
+    fn in_flight_age(&self) -> Duration {
+        match self.in_flight_since.load(Ordering::Acquire) {
+            0 => Duration::ZERO,
+            since => self
+                .epoch
+                .elapsed()
+                .saturating_sub(Duration::from_millis(since - 1)),
+        }
+    }
+
+    fn failure_class(&self) -> &'static str {
+        *self
+            .last_failure_class
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// A point-in-time view of the pipeline: counts and durations only.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReadAuditHealth {
+    /// Records committed.
+    pub records: u64,
+    /// Batches committed.
+    pub batches: u64,
+    /// Batches that failed.
+    pub failed_batches: u64,
+    /// Records skipped because their waiter was gone when the batch formed.
+    pub abandoned: u64,
+    /// Waits that gave up at the bound.
+    pub busy: u64,
+    /// Records waiting in the queue.
+    pub queue_depth: u64,
+    /// How long the batch being committed has been in flight (0 if none).
+    pub in_flight_batch_age_ms: u64,
+    /// The longest queue wait among the records of the last formed batch.
+    pub last_queue_wait_ms: u64,
+    /// Reads answered `Stopped` because the pipeline was gone.
+    pub stopped: u64,
+    /// The drain is gone: nothing will ever commit a record again.
+    pub drain_stopped: bool,
+}
+
+/// A batch commit slower than this is reported (TC-1317).
+const SLOW_BATCH: Duration = Duration::from_secs(5);
+/// A batch in flight longer than this, or a queue that waited longer than
+/// [`STALLED_QUEUE_WAIT`] with no batch completing, is a stalled drain.
+const STALLED_BATCH: Duration = Duration::from_secs(30);
+const STALLED_QUEUE_WAIT: Duration = Duration::from_secs(10);
+/// How often the watchdog looks, and how often each warning may repeat.
+const WATCHDOG_TICK: Duration = Duration::from_secs(10);
+const WARNING_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Default bound on a read's wait for its audit record (TC-1317).
+pub const DEFAULT_READ_AUDIT_WAIT: Duration = Duration::from_secs(20);
 
 #[derive(Clone, Debug)]
 pub(crate) struct ReadAuditPipeline {
     sender: mpsc::Sender<Command>,
     stats: Arc<PipelineStats>,
+    wait_ms: Arc<AtomicU64>,
+    #[cfg(test)]
+    gate: Arc<Mutex<()>>,
 }
 
 impl ReadAuditPipeline {
@@ -93,40 +216,215 @@ impl ReadAuditPipeline {
         let conn = conn.into();
         let (sender, receiver) = mpsc::channel(CHANNEL_CAPACITY);
         let stats = Arc::new(PipelineStats::default());
-        tokio::spawn(run_pipeline(conn, writer_lock, receiver, stats.clone()));
-        Self { sender, stats }
+        #[cfg(test)]
+        let gate = Arc::new(Mutex::new(()));
+        tokio::spawn(run_pipeline(
+            conn,
+            writer_lock,
+            receiver,
+            stats.clone(),
+            #[cfg(test)]
+            gate.clone(),
+        ));
+        tokio::spawn(run_watchdog(sender.downgrade(), stats.clone()));
+        Self {
+            sender,
+            stats,
+            wait_ms: Arc::new(AtomicU64::new(DEFAULT_READ_AUDIT_WAIT.as_millis() as u64)),
+            #[cfg(test)]
+            gate,
+        }
+    }
+
+    /// Bound a read's wait for its audit record.
+    pub(crate) fn set_wait(&self, wait: Duration) {
+        self.wait_ms
+            .store(wait.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// Hold every batch before it is committed until the guard drops.
+    #[cfg(test)]
+    pub(crate) async fn hold_drain(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.gate.clone().lock_owned().await
     }
 
     pub(crate) async fn record(
         &self,
         invocation: &Invocation,
         encryption: Option<&ColumnEncryption>,
-    ) -> Result<(), DbErr> {
+    ) -> Result<(), ReadAuditError> {
         self.enqueue(ReadAuditRecord::from_invocation(invocation, encryption))
             .await
     }
 
-    async fn enqueue(&self, record: ReadAuditRecord) -> Result<(), DbErr> {
-        let (committed, receipt) = oneshot::channel();
-        self.sender
-            .send(Command {
-                record,
-                committed,
-                context: request_telemetry::current(),
-            })
-            .await
-            .map_err(|_| DbErr::Custom("read audit pipeline stopped".to_string()))?;
-        receipt
-            .await
-            .map_err(|_| DbErr::Custom("read audit pipeline dropped commit receipt".to_string()))?
-            .map_err(DbErr::Custom)
+    /// Queue `record` and wait for its commit, at most the wait bound.
+    ///
+    /// Giving up drops the receipt. The drain then skips the record if its
+    /// batch has not formed yet, and commits it otherwise; either way nothing
+    /// is confirmed to a caller whose record is not committed.
+    async fn enqueue(&self, record: ReadAuditRecord) -> Result<(), ReadAuditError> {
+        let bound = Duration::from_millis(self.wait_ms.load(Ordering::Relaxed));
+        crate::request_cancel::set_stage(crate::request_cancel::Stage::ReadAudit);
+        let waited = tokio::time::timeout(bound, async {
+            let (committed, receipt) = oneshot::channel();
+            self.sender
+                .send(Command {
+                    record,
+                    committed,
+                    context: request_telemetry::current(),
+                    enqueued: Instant::now(),
+                })
+                .await
+                .map_err(|_| ReadAuditError::Stopped)?;
+            receipt.await.map_err(|_| ReadAuditError::Stopped)?
+        })
+        .await;
+        crate::request_cancel::set_stage(crate::request_cancel::Stage::Other);
+        match waited {
+            Ok(Err(ReadAuditError::Stopped)) => {
+                self.stats.stopped.fetch_add(1, Ordering::Relaxed);
+                Err(ReadAuditError::Stopped)
+            }
+            Ok(outcome) => outcome,
+            Err(_) => {
+                self.stats.busy.fetch_add(1, Ordering::Relaxed);
+                Err(ReadAuditError::Busy)
+            }
+        }
     }
 
+    #[cfg(test)]
     pub(crate) fn stats(&self) -> (u64, u64) {
         (
             self.stats.records.load(Ordering::Relaxed),
             self.stats.batches.load(Ordering::Relaxed),
         )
+    }
+
+    pub(crate) fn health(&self) -> ReadAuditHealth {
+        health(&self.stats, &self.sender)
+    }
+}
+
+fn health(stats: &PipelineStats, sender: &mpsc::Sender<Command>) -> ReadAuditHealth {
+    ReadAuditHealth {
+        records: stats.records.load(Ordering::Relaxed),
+        batches: stats.batches.load(Ordering::Relaxed),
+        failed_batches: stats.failed_batches.load(Ordering::Relaxed),
+        abandoned: stats.abandoned.load(Ordering::Relaxed),
+        busy: stats.busy.load(Ordering::Relaxed),
+        queue_depth: (sender.max_capacity() - sender.capacity()) as u64,
+        in_flight_batch_age_ms: stats.in_flight_age().as_millis() as u64,
+        last_queue_wait_ms: stats.last_queue_wait_ms.load(Ordering::Relaxed),
+        stopped: stats.stopped.load(Ordering::Relaxed),
+        drain_stopped: sender.is_closed(),
+    }
+}
+
+/// What the waiters of a failed batch are told: a transient database error
+/// is retryable (nothing of the read was returned), anything else is not.
+fn batch_error(error: DbErr) -> ReadAuditError {
+    if is_transient_error(&error) {
+        ReadAuditError::Unavailable
+    } else {
+        ReadAuditError::Failed(error.to_string())
+    }
+}
+
+/// The warnings the watchdog has emitted, and what it last reported.
+#[derive(Default)]
+struct WatchdogState {
+    reported: ReadAuditHealth,
+    reported_slow: u64,
+    last: [Option<Instant>; 4],
+    /// Batches committed, failed or skipped at the last look that moved.
+    progress: u64,
+    progress_at: Option<Instant>,
+}
+
+/// A drain that is stuck cannot report itself, so a separate task watches
+/// it (TC-1317). Every warning carries counts and durations only, and each
+/// repeats at most once per [`WARNING_INTERVAL`].
+async fn run_watchdog(sender: mpsc::WeakSender<Command>, stats: Arc<PipelineStats>) {
+    let mut state = WatchdogState::default();
+    let mut tick = tokio::time::interval(WATCHDOG_TICK);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        // The pipeline is gone once every sender has been dropped.
+        let Some(sender) = sender.upgrade() else {
+            return;
+        };
+        let now = health(&stats, &sender);
+        drop(sender);
+        watch(&stats, &mut state, now, Instant::now());
+    }
+}
+
+fn watch(stats: &PipelineStats, state: &mut WatchdogState, now: ReadAuditHealth, at: Instant) {
+    let mut due = |kind: usize| {
+        let due = state.last[kind].is_none_or(|last| at.duration_since(last) >= WARNING_INTERVAL);
+        if due {
+            state.last[kind] = Some(at);
+        }
+        due
+    };
+    let busy = now.busy - state.reported.busy;
+    if busy > 0 && due(0) {
+        tracing::warn!(
+            error_class = "read_audit_busy",
+            count = busy,
+            queue_depth = now.queue_depth,
+            last_queue_wait_ms = now.last_queue_wait_ms,
+            "Read audit wait expired"
+        );
+        state.reported.busy = now.busy;
+    }
+    let slow = stats.slow_batches.load(Ordering::Relaxed);
+    if slow > state.reported_slow && due(1) {
+        tracing::warn!(
+            error_class = "read_audit_batch_slow",
+            count = slow - state.reported_slow,
+            max_commit_ms = stats.max_commit_ms.swap(0, Ordering::Relaxed),
+            "Read audit batch slow"
+        );
+        state.reported_slow = slow;
+    }
+    let failed = now.failed_batches - state.reported.failed_batches;
+    if failed > 0 && due(2) {
+        tracing::warn!(
+            error_class = stats.failure_class(),
+            count = failed,
+            "Read audit batch failed"
+        );
+        state.reported.failed_batches = now.failed_batches;
+    }
+    // A queue that has not moved since the last look: nothing committed,
+    // failed or skipped while records waited.
+    let progress = now.batches + now.failed_batches + now.abandoned;
+    if progress != state.progress || now.queue_depth == 0 || state.progress_at.is_none() {
+        state.progress = progress;
+        state.progress_at = Some(at);
+    }
+    let idle_for = state
+        .progress_at
+        .map_or(Duration::ZERO, |since| at.duration_since(since));
+    let stuck_batch = Duration::from_millis(now.in_flight_batch_age_ms) >= STALLED_BATCH;
+    let stuck_queue = now.queue_depth > 0 && idle_for >= STALLED_QUEUE_WAIT;
+    // A dead drain: reads fail as `Stopped` and nothing will ever commit.
+    let dead = now.drain_stopped || now.stopped > state.reported.stopped;
+    if (stuck_batch || stuck_queue || dead) && due(3) {
+        tracing::warn!(
+            error_class = "read_audit_drain_stalled",
+            in_flight_batch_age_ms = now.in_flight_batch_age_ms,
+            queue_depth = now.queue_depth,
+            queue_idle_ms = idle_for.as_millis() as u64,
+            abandoned = now.abandoned,
+            drain_stopped = now.drain_stopped,
+            stopped = now.stopped,
+            "Read audit drain stalled"
+        );
+        state.reported.stopped = now.stopped;
     }
 }
 
@@ -135,6 +433,7 @@ async fn run_pipeline(
     writer_lock: Option<Arc<Mutex<()>>>,
     mut receiver: mpsc::Receiver<Command>,
     stats: Arc<PipelineStats>,
+    #[cfg(test)] gate: Arc<Mutex<()>>,
 ) {
     while let Some(first) = receiver.recv().await {
         let mut batch = vec![first];
@@ -145,14 +444,52 @@ async fn run_pipeline(
                 Err(_) => break,
             }
         }
+        let formed = Instant::now();
+        let queue_wait = batch
+            .iter()
+            .map(|command| formed.duration_since(command.enqueued))
+            .max()
+            .unwrap_or_default();
+        stats
+            .last_queue_wait_ms
+            .store(queue_wait.as_millis() as u64, Ordering::Relaxed);
+        // A waiter that is already gone gave up or was cut: its read was not
+        // and can never be confirmed, since its receipt is closed for good.
+        // Committing its record would only spend drain time on a read nobody
+        // received. A waiter that leaves after this point is still committed.
+        let before = batch.len();
+        batch.retain(|command| !command.committed.is_closed());
+        stats
+            .abandoned
+            .fetch_add((before - batch.len()) as u64, Ordering::Relaxed);
+        if batch.is_empty() {
+            continue;
+        }
 
+        // In flight from here, including the SQLite writer-lock wait, so a
+        // batch stuck on that lock shows as a stalled drain.
+        let started = stats.epoch.elapsed();
+        stats
+            .in_flight_since
+            .store(started.as_millis() as u64 + 1, Ordering::Release);
+        #[cfg(test)]
+        drop(gate.lock().await);
         let _writer = match &writer_lock {
             Some(lock) => Some(lock.lock().await),
             None => None,
         };
         commit_batch(&conn, batch, &stats).await;
+        stats.in_flight_since.store(0, Ordering::Release);
+        let took = stats.epoch.elapsed().saturating_sub(started);
+        if took >= SLOW_BATCH {
+            stats.slow_batches.fetch_add(1, Ordering::Relaxed);
+            stats
+                .max_commit_ms
+                .fetch_max(took.as_millis() as u64, Ordering::Relaxed);
+        }
     }
 }
+
 /// Charge each waiting request the full physical batch, not a share of a
 /// process-wide delta. These totals are non-additive across requests.
 /// Queue/writer-lock waits and detached driver rollback cleanup are excluded.
@@ -162,9 +499,35 @@ async fn commit_batch(
     stats: &PipelineStats,
 ) -> Snapshot {
     let metrics = Arc::new(Metrics::default());
-    let result = sqlx_core::request_telemetry::scope(metrics.clone(), persist_batch(conn, &batch))
-        .await
-        .map_err(|error| error.to_string());
+    let persisted = std::panic::AssertUnwindSafe(sqlx_core::request_telemetry::scope(
+        metrics.clone(),
+        async {
+            #[cfg(test)]
+            if stats.panic_next_batch.swap(false, Ordering::SeqCst) {
+                panic!("injected read-audit batch panic");
+            }
+            persist_batch(conn, &batch).await
+        },
+    ));
+    // A panic fails this batch's waiters; the drain goes on (TC-1317).
+    let result = match futures::FutureExt::catch_unwind(persisted).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => {
+            let class = transient_error_class(&error).unwrap_or("other");
+            *stats
+                .last_failure_class
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = class;
+            Err(batch_error(error))
+        }
+        Err(_) => {
+            *stats
+                .last_failure_class
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = "panic";
+            Err(ReadAuditError::Failed("read audit batch panicked".into()))
+        }
+    };
     let snapshot = metrics.snapshot();
     // At most 64 commands: scanning prior entries avoids a recipient allocation
     // and deduplicates by context identity, never by account or request UUID.
@@ -185,6 +548,8 @@ async fn commit_batch(
             .records
             .fetch_add(batch.len() as u64, Ordering::Relaxed);
         stats.batches.fetch_add(1, Ordering::Relaxed);
+    } else {
+        stats.failed_batches.fetch_add(1, Ordering::Relaxed);
     }
     for command in batch {
         let _ = command.committed.send(result.clone());
@@ -491,6 +856,7 @@ mod tests {
                 record: record(index),
                 committed,
                 context: Some(context),
+                enqueued: Instant::now(),
             });
             receipts.push(receipt);
         }
@@ -540,6 +906,7 @@ mod tests {
         );
         let conn = database(url.clone(), 8).await;
         let pipeline = ReadAuditPipeline::start(conn.clone(), Some(Arc::new(Mutex::new(()))));
+        pipeline.set_wait(COMMIT_TEST_WAIT);
 
         let requests = (0..32)
             .map(|index| {
@@ -586,6 +953,7 @@ mod tests {
         Migrator::up(&conn, None).await.unwrap();
         let writer_lock = Arc::new(Mutex::new(()));
         let pipeline = ReadAuditPipeline::start(conn.clone(), Some(writer_lock.clone()));
+        pipeline.set_wait(COMMIT_TEST_WAIT);
         let writer = writer_lock.lock().await;
 
         let audit = tokio::spawn(async move { pipeline.enqueue(record(0)).await });
@@ -634,6 +1002,7 @@ mod tests {
             record,
             committed,
             context: None,
+            enqueued: Instant::now(),
         }
     }
 
@@ -969,6 +1338,7 @@ mod tests {
         // The pipeline itself, without a writer lock as on PostgreSQL in
         // production: concurrent reads group commit and are durable.
         let pipeline = ReadAuditPipeline::start(single.conn.clone(), None);
+        pipeline.set_wait(COMMIT_TEST_WAIT);
         let before = invocation::Entity::find()
             .count(&single.conn)
             .await
@@ -1255,7 +1625,7 @@ mod tests {
     /// following batches are exactly consecutive runs of `MAX_BATCH_SIZE`.
     struct Stall {
         lock: RowLock,
-        gate: tokio::task::JoinHandle<Result<(), DbErr>>,
+        gate: tokio::task::JoinHandle<Result<(), ReadAuditError>>,
     }
 
     fn gate_read(name: &str) -> ReadAuditRecord {
@@ -1289,7 +1659,7 @@ mod tests {
     async fn enqueue_in_order(
         pipeline: &ReadAuditPipeline,
         reads: Vec<ReadAuditRecord>,
-    ) -> Vec<tokio::task::JoinHandle<Result<(), DbErr>>> {
+    ) -> Vec<tokio::task::JoinHandle<Result<(), ReadAuditError>>> {
         let queued = || CHANNEL_CAPACITY - pipeline.sender.capacity();
         let already = queued();
         let mut receipts = Vec::new();
@@ -1384,6 +1754,7 @@ mod tests {
         };
 
         let pipeline = ReadAuditPipeline::start(schema_pool(TEST, &pipelined.conn, 4).await, None);
+        pipeline.set_wait(COMMIT_TEST_WAIT);
         let locks = schema_pool(TEST, &pipelined.conn, 1).await;
         let stalled = stall(&pipeline, &locks, &pipelined.conn, "overlap-gate").await;
         let receipts = enqueue_in_order(&pipeline, reads(0..SATURATED)).await;
@@ -1465,6 +1836,15 @@ mod tests {
             match self {
                 Failure::MissingParent => "foreign key constraint",
                 Failure::Terminated => "terminating connection",
+            }
+        }
+
+        /// What a waiter of the failed batch is told (TC-1317): a terminated
+        /// connection is a retryable failure, a constraint is not.
+        fn waiter_error(self) -> &'static str {
+            match self {
+                Failure::MissingParent => "foreign key constraint",
+                Failure::Terminated => "unavailable_retryable",
             }
         }
 
@@ -1604,6 +1984,7 @@ mod tests {
                 .await
                 .unwrap();
             let pipeline = ReadAuditPipeline::start(schema_pool(TEST, conn, 4).await, None);
+            pipeline.set_wait(COMMIT_TEST_WAIT);
             let locks = schema_pool(TEST, conn, 2).await;
 
             for failure in [Failure::Terminated, Failure::MissingParent] {
@@ -1644,7 +2025,7 @@ mod tests {
                         .unwrap()
                         .expect_err("a read of a failed batch is not acknowledged");
                     assert!(
-                        error.to_string().contains(failure.error()),
+                        error.to_string().contains(failure.waiter_error()),
                         "{failure:?}: {error}"
                     );
                     failed += 1;
@@ -1743,5 +2124,229 @@ mod tests {
             outcomes.push(outcome);
         }
         assert_eq!(outcomes[0], outcomes[1]);
+    }
+
+    // TC-1317: a bounded wait, abandoned records skipped, and the invariant
+    // that no read is confirmed without its committed record.
+
+    const PATIENCE: Duration = Duration::from_secs(10);
+    /// Tests of commit semantics, not of the bound: a loaded host must not
+    /// turn their waits into `Busy` (TC-1317 review).
+    const COMMIT_TEST_WAIT: Duration = Duration::from_secs(600);
+
+    async fn file_pipeline() -> (tempfile::TempDir, DatabaseConnection, ReadAuditPipeline) {
+        let directory = tempfile::tempdir().unwrap();
+        let url = format!(
+            "sqlite:{}?mode=rwc",
+            directory.path().join("bounded.db").display()
+        );
+        let conn = database(url, 4).await;
+        let pipeline = ReadAuditPipeline::start(conn.clone(), Some(Arc::new(Mutex::new(()))));
+        (directory, conn, pipeline)
+    }
+
+    async fn committed(conn: &DatabaseConnection, index: usize) -> bool {
+        invocation::Entity::find_by_id(record(index).id)
+            .one(conn)
+            .await
+            .unwrap()
+            .is_some()
+    }
+
+    async fn until(mut done: impl FnMut() -> bool) {
+        tokio::time::timeout(PATIENCE, async {
+            while !done() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("condition must hold in time");
+    }
+
+    /// `enqueue`, failing the test rather than hanging if it never returns.
+    async fn bounded(pipeline: &ReadAuditPipeline, index: usize) -> Result<(), ReadAuditError> {
+        tokio::time::timeout(PATIENCE, pipeline.enqueue(record(index)))
+            .await
+            .expect("enqueue must return within its bound")
+    }
+
+    /// The watchdog reports a drain that stopped moving, once per interval,
+    /// and stays quiet while it progresses.
+    #[test]
+    fn tc1317_the_watchdog_reports_a_stalled_drain_once_per_interval() {
+        let stats = PipelineStats::default();
+        let mut state = WatchdogState::default();
+        let start = Instant::now();
+        let waiting = ReadAuditHealth {
+            queue_depth: 3,
+            ..Default::default()
+        };
+        let stalled = |state: &WatchdogState| state.last[3];
+
+        watch(&stats, &mut state, waiting, start);
+        assert_eq!(stalled(&state), None, "just started waiting");
+        watch(&stats, &mut state, waiting, start + STALLED_QUEUE_WAIT);
+        assert_eq!(stalled(&state), Some(start + STALLED_QUEUE_WAIT));
+        watch(&stats, &mut state, waiting, start + STALLED_QUEUE_WAIT * 2);
+        assert_eq!(
+            stalled(&state),
+            Some(start + STALLED_QUEUE_WAIT),
+            "rate-limited"
+        );
+
+        // A batch completes: no longer stalled, even with records queued.
+        let moved = ReadAuditHealth {
+            batches: 1,
+            ..waiting
+        };
+        let later = start + STALLED_QUEUE_WAIT + WARNING_INTERVAL;
+        watch(&stats, &mut state, moved, later);
+        assert_eq!(stalled(&state), Some(start + STALLED_QUEUE_WAIT));
+
+        // A batch in flight too long is stalled whatever the queue does.
+        let hung = ReadAuditHealth {
+            batches: 1,
+            in_flight_batch_age_ms: STALLED_BATCH.as_millis() as u64,
+            ..Default::default()
+        };
+        watch(&stats, &mut state, hung, later + Duration::from_secs(1));
+        assert_eq!(stalled(&state), Some(later + Duration::from_secs(1)));
+    }
+
+    #[tokio::test]
+    async fn tc1317_a_held_drain_answers_busy_within_the_bound() {
+        let (_directory, _conn, pipeline) = file_pipeline().await;
+        pipeline.set_wait(Duration::from_millis(200));
+        let held = pipeline.hold_drain().await;
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(PATIENCE, pipeline.enqueue(record(0)))
+            .await
+            .expect("the wait must end at its bound");
+        assert_eq!(outcome, Err(ReadAuditError::Busy));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(pipeline.health().busy, 1);
+        drop(held);
+    }
+
+    /// Records whose waiters were gone when their batch formed are skipped
+    /// and counted; a waiter still waiting is always committed.
+    #[tokio::test]
+    async fn tc1317_abandoned_records_are_skipped_and_the_drain_recovers() {
+        let (_directory, conn, pipeline) = file_pipeline().await;
+        pipeline.set_wait(Duration::from_millis(100));
+        let held = pipeline.hold_drain().await;
+
+        // Record 0 is taken into a batch, which then waits at the gate.
+        assert_eq!(bounded(&pipeline, 0).await, Err(ReadAuditError::Busy));
+        until(|| pipeline.health().queue_depth == 0).await;
+        // Records 1-5 queue behind it, and their waiters give up.
+        for index in 1..=5 {
+            assert_eq!(bounded(&pipeline, index).await, Err(ReadAuditError::Busy));
+        }
+        assert_eq!(pipeline.health().queue_depth, 5);
+
+        drop(held);
+        until(|| pipeline.health().abandoned == 5).await;
+        // The batch formed before its waiter left is committed (harmless:
+        // nothing was returned); the abandoned ones never reach the DB.
+        until(|| pipeline.health().records == 1).await;
+        assert!(committed(&conn, 0).await);
+        for index in 1..=5 {
+            assert!(!committed(&conn, index).await, "record {index}");
+        }
+
+        pipeline.set_wait(DEFAULT_READ_AUDIT_WAIT);
+        tokio::time::timeout(PATIENCE, pipeline.enqueue(record(6)))
+            .await
+            .expect("a recovered drain answers at once")
+            .unwrap();
+        assert!(committed(&conn, 6).await);
+    }
+
+    /// The invariant: whenever `enqueue` confirms, the record is committed,
+    /// including when waiters around it are cut at random points.
+    #[tokio::test]
+    async fn tc1317_no_read_is_confirmed_without_its_committed_record() {
+        let (_directory, conn, pipeline) = file_pipeline().await;
+        let held = pipeline.hold_drain().await;
+        let waiters = (0..48)
+            .map(|index| {
+                let pipeline = pipeline.clone();
+                tokio::spawn(async move {
+                    // Every third waiter is cut while it waits.
+                    let cut = Duration::from_millis(if index % 3 == 0 { 20 } else { 5_000 });
+                    (
+                        index,
+                        tokio::time::timeout(cut, pipeline.enqueue(record(index))).await,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        // Every cut waiter has gone before the drain is released.
+        let (cut, staying): (Vec<_>, Vec<_>) = waiters
+            .into_iter()
+            .enumerate()
+            .partition(|(index, _)| index % 3 == 0);
+        for (_, waiter) in cut {
+            let (_, outcome) = waiter.await.unwrap();
+            assert!(outcome.is_err(), "a cut waiter is never confirmed");
+        }
+        drop(held);
+        let mut confirmed = 0;
+        for (_, waiter) in staying {
+            let (index, outcome) = waiter.await.unwrap();
+            if matches!(outcome, Ok(Ok(()))) {
+                confirmed += 1;
+                assert!(
+                    committed(&conn, index).await,
+                    "confirmed {index} uncommitted"
+                );
+            }
+        }
+        assert_eq!(confirmed, 32, "every waiter that stayed was confirmed");
+        let health = pipeline.health();
+        assert_eq!(
+            health.records + health.abandoned,
+            48,
+            "each record is either committed or counted as abandoned"
+        );
+    }
+
+    #[tokio::test]
+    async fn tc1317_a_transient_batch_failure_is_retryable() {
+        assert_eq!(
+            batch_error(DbErr::ConnectionAcquire(
+                sea_orm::error::ConnAcquireErr::Timeout
+            )),
+            ReadAuditError::Unavailable
+        );
+        assert!(matches!(
+            batch_error(DbErr::Custom("constraint".into())),
+            ReadAuditError::Failed(_)
+        ));
+    }
+
+    /// A panic while committing one batch fails only that batch's waiters;
+    /// the drain keeps serving.
+    #[tokio::test]
+    async fn tc1317_a_panicking_batch_does_not_stop_the_drain() {
+        let (_directory, conn, pipeline) = file_pipeline().await;
+        pipeline
+            .stats
+            .panic_next_batch
+            .store(true, Ordering::SeqCst);
+        let outcome = tokio::time::timeout(PATIENCE, pipeline.enqueue(record(0)))
+            .await
+            .expect("the panicking batch's waiter must be answered");
+        assert!(
+            matches!(outcome, Err(ReadAuditError::Failed(_))),
+            "{outcome:?}"
+        );
+        assert_eq!(pipeline.health().failed_batches, 1);
+        tokio::time::timeout(PATIENCE, pipeline.enqueue(record(1)))
+            .await
+            .expect("the drain survives")
+            .unwrap();
+        assert!(committed(&conn, 1).await);
     }
 }
