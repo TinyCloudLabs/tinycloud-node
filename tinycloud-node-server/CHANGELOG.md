@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.0](https://github.com/TinyCloudLabs/tinycloud-node/compare/v0.0.1...v1.21.0) - 2026-10-19
+
+### Fixed
+
+- *(TC-1432)* add no-transform to ETag-bearing responses
+- *(TC-1317)* review round 1
+- *(TC-1317)* bound the read-audit wait and skip abandoned records
+- *(TC-1274)* treat an in-flight save as an unknown outcome; review fixes
+- *(TC-1274)* bound SQL waits and add an /invoke deadline
+
+### Other
+
+- Merge remote-tracking branch 'origin/main' into HEAD
+- Merge pull request #348 from TinyCloudLabs/skgbafa/tc-963-dstack-quote-fixtures
+- *(TC-1317)* check the read-audit stage in core, not through logs (B1)
+- *(TC-1317)* review follow-ups F1-F4
+- Merge remote-tracking branch 'origin/skgbafa/tc-1274-sql-wait-bounds' into skgbafa/tc-1317-read-audit-bound
+- Merge remote-tracking branch 'origin/main' into skgbafa/tc-1274-sql-wait-bounds
+- test the dstack GetQuote client against the captured 0.5.7 response shape
+
 - Recheck hook ticket delegation revocation when event streams open and use
   literal segment-prefix matching for hook subscriptions.
 
