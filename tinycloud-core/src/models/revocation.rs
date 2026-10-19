@@ -248,6 +248,32 @@ pub(crate) async fn ancestor_chain_ids_for_roots<C: ConnectionTrait>(
     Ok(ordered)
 }
 
+/// The delegation-control action being authorized. Status is visible to both
+/// parties of a grant; revocation stays on the issuing side, so a recipient
+/// (for example the holder of a shared link key) cannot cut off a grant that
+/// others also rely on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ControlAction {
+    Revoke,
+    Status,
+}
+
+impl ControlAction {
+    fn ability(self) -> &'static str {
+        match self {
+            Self::Revoke => "tinycloud.delegation/revoke",
+            Self::Status => "tinycloud.delegation/status",
+        }
+    }
+
+    /// Whether `principal` is a party to `delegation` that may take this
+    /// action on it directly, without space ownership.
+    pub(crate) fn party_may_act(self, delegation: &delegation::Model, principal: &str) -> bool {
+        did_principal_matches(&delegation.delegator, principal)
+            || (self == Self::Status && did_principal_matches(&delegation.delegatee, principal))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ControlProofDecision {
     DirectSigner(String),
@@ -259,6 +285,7 @@ pub(crate) enum ControlProofDecision {
 /// resources: owning a space does not make a space-scoped grant account-wide.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ScopedControl {
+    action: ControlAction,
     target: Hash,
     grantor: String,
     abilities: Vec<abilities::Model>,
@@ -271,7 +298,7 @@ impl ScopedControl {
             .any(|ability| matches!(ability.resource, Resource::Other(_)))
     }
 
-    /// Check direct grantor/recipient authority within an exact-CID grant.
+    /// Check the grantor's direct party authority within an exact-CID grant.
     pub(crate) fn directly_authorizes_cid(
         &self,
         target: &Hash,
@@ -279,8 +306,7 @@ impl ScopedControl {
     ) -> bool {
         self.target == *target
             && self.has_cid_scope()
-            && (did_principal_matches(&delegation.delegator, &self.grantor)
-                || did_principal_matches(&delegation.delegatee, &self.grantor))
+            && self.action.party_may_act(delegation, &self.grantor)
     }
 
     /// Require exact-CID authority or coverage of every target capability's
@@ -326,7 +352,7 @@ pub(crate) async fn control_proof_decision<C: ConnectionTrait>(
     db: &C,
     signer: &str,
     proofs: &[Cid],
-    requested_action: &str,
+    action: ControlAction,
     target: &Hash,
 ) -> Result<ControlProofDecision, DbErr> {
     if proofs.is_empty() {
@@ -364,7 +390,7 @@ pub(crate) async fn control_proof_decision<C: ConnectionTrait>(
 
     let mut control_abilities = abilities::Entity::find()
         .filter(abilities::Column::Delegation.eq(proof_id))
-        .filter(abilities::Column::Ability.eq(requested_action))
+        .filter(abilities::Column::Ability.eq(action.ability()))
         .all(db)
         .await?;
     let target_resource = format!("urn:cid:{}", target.to_cid(0x55));
@@ -385,6 +411,7 @@ pub(crate) async fn control_proof_decision<C: ConnectionTrait>(
         return Ok(ControlProofDecision::Denied);
     }
     Ok(ControlProofDecision::Scoped(ScopedControl {
+        action,
         target: *target,
         grantor: parent.delegator,
         abilities: control_abilities,
@@ -460,15 +487,15 @@ pub(crate) async fn process<C: ConnectionTrait>(
         .await?
         .ok_or(RevocationError::MissingParents)?;
 
-    // W1 (audit P0 finding 5): three authorization paths are accepted —
-    //   1. revoker == delegator (the directly-cited grantor)
-    //   2. revoker == any space owner targeted by the delegation's
-    //      persisted abilities (owner-authorized active_cutoff)
-    //   3. revoker == delegatee of an attenuable ancestor (so a
-    //      Grant Issuer that itself received the cap can revoke it)
-    // Any one of these is sufficient. The Cacao revoker == delegator
-    // path stays as the cheapest check; owner-authorized falls back to
-    // walking the ability rows.
+    // W1 (audit P0 finding 5) and TC-1436: authorized revokers are
+    //   1. the delegator that issued this delegation (an intermediate
+    //      delegator revokes the descendants it issued), or
+    //   2. the owner of a space the delegation's persisted abilities
+    //      target (owner-authorized active_cutoff), or
+    //   3. the holder of a current revoke control grant issued by one of
+    //      the above.
+    // The delegatee alone is never authorized: it may hold a key that
+    // others share, and revoking would cut them off as well.
     if !revoker_is_authorized(db, &delegation, &r.revoker, &r.parents).await? {
         return Err(RevocationError::UnauthorizedRevoker(r.revoker).into());
     };
@@ -506,45 +533,43 @@ pub(crate) async fn process<C: ConnectionTrait>(
 
 /// W1 (audit P0 finding 5): authorize the revoker.
 ///
-/// Three accepted paths:
-///   * direct delegator match (existing behavior)
-///   * delegatee match (the recipient can self-revoke their own grant)
+/// Accepted paths:
+///   * direct delegator match: the issuer revokes what it issued
 ///   * owner-authorized — the revoker is the owner of a space that the
 ///     delegation's persisted abilities target. This is what unlocks
 ///     `active_cutoff`: the data owner can revoke any grant against their
 ///     own space without needing to be the original SIWE signer.
+///   * a target-bound revoke control grant from either of the above
+///
+/// The delegatee is not a revoker (TC-1436).
 async fn revoker_is_authorized<C: ConnectionTrait>(
     db: &C,
     delegation: &delegation::Model,
     revoker: &str,
     proofs: &[Cid],
 ) -> Result<bool, DbErr> {
-    let principal = match control_proof_decision(
-        db,
-        revoker,
-        proofs,
-        "tinycloud.delegation/revoke",
-        &delegation.id,
-    )
-    .await?
-    {
-        ControlProofDecision::DirectSigner(principal) => principal,
-        ControlProofDecision::Scoped(control) => {
-            if control.directly_authorizes_cid(&delegation.id, delegation) {
-                return Ok(true);
+    let principal =
+        match control_proof_decision(db, revoker, proofs, ControlAction::Revoke, &delegation.id)
+            .await?
+        {
+            ControlProofDecision::DirectSigner(principal) => principal,
+            ControlProofDecision::Scoped(control) => {
+                if control.directly_authorizes_cid(&delegation.id, delegation) {
+                    return Ok(true);
+                }
+                let target_abilities = abilities::Entity::find()
+                    .filter(abilities::Column::Delegation.eq(delegation.id))
+                    .all(db)
+                    .await?;
+                return Ok(control.authorizes_target(
+                    &delegation.id,
+                    delegation,
+                    &target_abilities,
+                ));
             }
-            let target_abilities = abilities::Entity::find()
-                .filter(abilities::Column::Delegation.eq(delegation.id))
-                .all(db)
-                .await?;
-            return Ok(control.authorizes_target(&delegation.id, delegation, &target_abilities));
-        }
-        ControlProofDecision::Denied => return Ok(false),
-    };
-    if did_principal_matches(&delegation.delegator, &principal) {
-        return Ok(true);
-    }
-    if did_principal_matches(&delegation.delegatee, &principal) {
+            ControlProofDecision::Denied => return Ok(false),
+        };
+    if ControlAction::Revoke.party_may_act(delegation, &principal) {
         return Ok(true);
     }
 
