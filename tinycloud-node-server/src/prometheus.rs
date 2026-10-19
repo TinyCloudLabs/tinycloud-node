@@ -105,6 +105,48 @@ lazy_static! {
         "Cumulative durable read-audit commit batches."
     )
     .unwrap();
+    /// Read-audit batches that failed (TC-1317).
+    pub static ref READ_AUDIT_FAILED_BATCHES: IntCounter = register_int_counter!(
+        "tinycloud_read_audit_failed_batches_total",
+        "Read-audit commit batches that failed."
+    )
+    .unwrap();
+    /// Read-audit records skipped because their waiter was gone (TC-1317).
+    pub static ref READ_AUDIT_ABANDONED: IntCounter = register_int_counter!(
+        "tinycloud_read_audit_abandoned_total",
+        "Read-audit records skipped because their waiter was gone when the batch formed."
+    )
+    .unwrap();
+    /// Reads that gave up waiting for their audit record (TC-1317).
+    pub static ref READ_AUDIT_BUSY: IntCounter = register_int_counter!(
+        "tinycloud_read_audit_busy_total",
+        "Reads answered read_audit_busy because their audit record was not committed in time."
+    )
+    .unwrap();
+    /// Reads answered as stopped because the read-audit drain was gone.
+    pub static ref READ_AUDIT_STOPPED: IntCounter = register_int_counter!(
+        "tinycloud_read_audit_stopped_total",
+        "Reads that failed because the read-audit drain was gone."
+    )
+    .unwrap();
+    /// 1 once the read-audit drain is gone and nothing can commit again.
+    pub static ref READ_AUDIT_DRAIN_STOPPED: IntGauge = register_int_gauge!(
+        "tinycloud_read_audit_drain_stopped",
+        "1 if the read-audit drain is gone and no read can be confirmed, else 0."
+    )
+    .unwrap();
+    /// Read-audit records waiting in the queue (TC-1317).
+    pub static ref READ_AUDIT_QUEUE_DEPTH: IntGauge = register_int_gauge!(
+        "tinycloud_read_audit_queue_depth",
+        "Read-audit records waiting in the queue."
+    )
+    .unwrap();
+    /// How long the read-audit batch being committed has been in flight.
+    pub static ref READ_AUDIT_IN_FLIGHT_MS: IntGauge = register_int_gauge!(
+        "tinycloud_read_audit_in_flight_batch_age_ms",
+        "Milliseconds the read-audit batch being committed has been in flight (0 if none)."
+    )
+    .unwrap();
     /// Invocation replay-cache rows inserted (first sighting of an invocation).
     pub static ref REPLAY_ROWS_INSERTED: IntCounter = register_int_counter!(
         "tinycloud_replay_rows_inserted_total",
@@ -182,13 +224,25 @@ pub fn set_db_pool_gauges(size: i64, idle: i64) {
     }
 }
 
-/// Advance the cumulative read-audit counters by the deltas observed since the
-/// previous sampler tick. Read-audit stats are process-cumulative and
-/// monotonic, so the sampler feeds monotonic increments here.
-pub fn add_read_audit_stats(records_delta: u64, batches_delta: u64) {
+/// Advance the cumulative read-audit counters by the deltas since the
+/// previous sampler tick, and set the read-audit gauges. The pipeline's
+/// counts are process-cumulative and monotonic, so the counters advance by
+/// monotonic increments.
+pub fn observe_read_audit(
+    previous: &tinycloud_core::ReadAuditHealth,
+    now: &tinycloud_core::ReadAuditHealth,
+) {
     if enabled() {
-        READ_AUDIT_RECORDS.inc_by(records_delta);
-        READ_AUDIT_BATCHES.inc_by(batches_delta);
+        READ_AUDIT_RECORDS.inc_by(now.records.saturating_sub(previous.records));
+        READ_AUDIT_BATCHES.inc_by(now.batches.saturating_sub(previous.batches));
+        READ_AUDIT_FAILED_BATCHES
+            .inc_by(now.failed_batches.saturating_sub(previous.failed_batches));
+        READ_AUDIT_ABANDONED.inc_by(now.abandoned.saturating_sub(previous.abandoned));
+        READ_AUDIT_BUSY.inc_by(now.busy.saturating_sub(previous.busy));
+        READ_AUDIT_STOPPED.inc_by(now.stopped.saturating_sub(previous.stopped));
+        READ_AUDIT_QUEUE_DEPTH.set(now.queue_depth as i64);
+        READ_AUDIT_IN_FLIGHT_MS.set(now.in_flight_batch_age_ms as i64);
+        READ_AUDIT_DRAIN_STOPPED.set(i64::from(now.drain_stopped));
     }
 }
 
