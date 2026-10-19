@@ -666,10 +666,10 @@ jobs:
           native = 'ghcr.io/tinycloudlabs/tinycloud-node'
           reviewed = native + '@sha256:4bdae4fc232d886bb56bfbce4ec62ed4b8fb4e1369a01f6afb73d06dd68c188f'
           # TC-959: main's N0 compose (#349 c33c2302…) with the 95m ingress body
-          # cap (raw d95bfb70…), the TC-1274 + TC-1317 + TC-1482 Vector config and the
-          # optional TC-1482 NODE_STATS_READ_TOKEN env line (raw d1fcd665…),
+          # cap (raw d95bfb70…), the TC-1274 + TC-1317 + TC-1482 + c_index Vector config and the
+          # optional TC-1482 NODE_STATS_READ_TOKEN env line (raw 32a002ef…),
           # its single node digest normalized to 64 zeros.
-          n0_template_hash = '87b5d12a86f07f33ae68832c802894c061a6b4e194aea078cb5eb95a068719aa'
+          n0_template_hash = '79469f97a8dcecc7856caa11b26e3004b36d4b8ae9e16a51f963d0687992b9fb'
           node_pin = re.compile(rb'(?m)^    image: ghcr\.io/tinycloudlabs/tinycloud-node@sha256:([0-9a-f]{64})$')
           def n0_template(raw):
               pins = list(node_pin.finditer(raw))

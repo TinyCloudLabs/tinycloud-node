@@ -5,7 +5,8 @@
 ### Changes
 
 - `/admin/stats` is a logged route label (TC-1482). The log shipper and the ingress log it as the route template plus status only, with no query string, `Authorization` header, request or response body, or client address (TC-961).
-  - **N0 compose.** The embedded Vector configuration is regenerated for the new route. Together with the optional `NODE_STATS_READ_TOKEN` env line, the reviewed N0 compose template changes to `87b5d12a…` (raw `d1fcd665…`; `docs/releasing.md`).
+  - **N0 compose.** The embedded Vector configuration is regenerated for the new route. Together with the optional `NODE_STATS_READ_TOKEN` env line, the reviewed N0 compose template changes to `79469f97…` (raw `32a002ef…`; `docs/releasing.md`).
+  - **`current_kv` C-index warning codes.** The log sidecar maps the three constant warnings of the TC-1274 `current_kv` C-index migration to `current_kv_c_index_missing`, `current_kv_c_index_invalid` and `current_kv_c_index_wrong_shape` (TC-1274); until then they would ship as `unclassified`. This is part of the same regenerated Vector configuration.
   - **Ingress.** The `/admin/stats` label takes effect once the ingress image is rebuilt from `deploy/ingress` and its digest is pinned in the compose; until then the deployed ingress logs it as `<other>`.
 
 ## [1.21.1] - 2026-10-19
