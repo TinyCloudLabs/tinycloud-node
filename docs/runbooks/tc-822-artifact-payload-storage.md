@@ -32,6 +32,34 @@ ALTER TABLE database_artifact ALTER COLUMN payload SET STORAGE EXTERNAL;
 - A schema created fresh by the migrations stays `EXTENDED`; run the statement once per database.
 - Do not run it inside a migration or the boot transaction. Do not mass-rewrite rows without a separate decision (an `UPDATE ... SET payload = payload || ''::bytea` rewrites every TOAST chunk and is WAL-heavy).
 
+## Production plan
+
+- Run the `ALTER` on the **new US-West** branch **before** the logical-replication initial copy: every row then arrives fresh and uncompressed, sliceable, and no rewrite is ever needed.
+- On us-east the `ALTER` alone converts nothing; each artifact converts at its next full checkpoint. Until then a large, compressed artifact hydrates on the slow path (numbers above: ~360 ms and ~325 MB server memory for a slice at 250 MB of a 256 MiB artifact; 214 s to hydrate 1000 MiB). Node RAM stays bounded either way.
+- The `ALTER` is DDL: run it once per side, outside the replication-copy-to-GO schema freeze window. This change's merge/deploy must not land inside that window either. This PR contains no migration or schema change.
+
+## Cost: `EXTERNAL` disables compression
+
+Compressible rows get larger on disk by `stored_bytes x (ratio - 1)` once they convert (PlanetScale bills above 10 GB; the database is about 6.4 GB in total). Measure the exact figure first with a metadata-only query (it reads the stored datum size and the raw size from the TOAST header; it does not detoast or decompress, verified on a 1000 MiB compressible row: 1 ms, 1 shared buffer hit, no TOAST pages read):
+
+```sql
+SELECT count(*), pg_size_pretty(sum(pg_column_size(payload))) AS stored,
+       pg_size_pretty(sum(octet_length(payload))) AS raw,
+       round(sum(octet_length(payload))::numeric / NULLIF(sum(pg_column_size(payload)), 0), 2) AS ratio
+FROM database_artifact;
+```
+
+The production figure is **unmeasured** until ops runs it (no production role here). Scenarios, growth = X x (r - 1) GB, X = stored `payload` GB, r = raw/stored ratio (3.45 is the synthetic pglz ratio of the test data; real SQLite ratios are likely lower), total 6.4 GB before:
+
+| stored X | r = 1.5 | r = 2.5 | r = 3.45 |
+|---|---|---|---|
+| 0.5 GB | +0.25 GB | +0.75 GB | +1.2 GB |
+| 1 GB | +0.5 GB | +1.5 GB | +2.5 GB |
+| 2 GB | +1.0 GB | +3.0 GB | +4.9 GB (11.3 GB total, over 10) |
+| 4 GB | +2.0 GB | +6.0 GB (12.4 GB, over 10) | +9.8 GB (16.2 GB, over 10) |
+
+The 10 GB line is crossed when growth exceeds 3.6 GB: X = 4 GB at r = 2.5 or 3.45, and X = 2 GB at r = 3.45. All other cells stay under it.
+
 SQLite deployments need nothing, but note that SQLite's `substr` on a BLOB materialises the whole blob inside the SQLite library for every slice (about one blob of transient memory, ~0.3 s per slice per 256 MiB), so the "one slice" memory bound holds for the node's own heap and for Postgres, not for SQLite's internal buffer.
 
 ## Adapting for at-rest encoding (TC-887)
