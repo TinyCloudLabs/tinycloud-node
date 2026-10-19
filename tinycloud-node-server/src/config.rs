@@ -1105,6 +1105,30 @@ pub struct SqlStorageConfig {
     /// callers that gave up on it, so the database still warms.
     #[serde(default = "default_sql_hydration_max_ms")]
     pub hydration_max_ms: u64,
+    /// `PRAGMA synchronous` of file-backed databases (TC-1491): `full` makes
+    /// every local COMMIT fsync the WAL before it returns, `normal` fsyncs
+    /// only at checkpoints. `normal` is the rollback flag.
+    #[serde(default)]
+    pub synchronous: tinycloud_core::sql::durability::Synchronous,
+    /// Per-database size cap (TC-1491). A write that would grow a database past
+    /// it is rolled back before COMMIT (`507 sql_database_size_limit`). An
+    /// unmeasured placeholder: slice 0 sizing and ops tune it.
+    #[serde(default = "default_sql_max_database_bytes")]
+    pub max_database_bytes: ByteUnit,
+    /// Free disk that must remain after the worst-case growth of every write
+    /// in flight (TC-1491); a write that would eat into it is rolled back
+    /// before COMMIT (`507 sql_disk_headroom`). An unmeasured placeholder
+    /// (about 2.5% of the 20 GB CVM disk).
+    #[serde(default = "default_sql_min_free_bytes")]
+    pub min_free_bytes: ByteUnit,
+}
+
+fn default_sql_max_database_bytes() -> ByteUnit {
+    ByteUnit::Gibibyte(1)
+}
+
+fn default_sql_min_free_bytes() -> ByteUnit {
+    ByteUnit::Mebibyte(512)
 }
 
 fn default_sql_memory_threshold() -> ByteUnit {
@@ -1128,6 +1152,16 @@ fn default_sql_hydration_max_ms() -> u64 {
 }
 
 impl SqlStorageConfig {
+    /// The local durability policy the SQL actors run under.
+    pub fn durability(&self) -> tinycloud_core::sql::durability::DurabilityPolicy {
+        tinycloud_core::sql::durability::DurabilityPolicy {
+            synchronous: self.synchronous,
+            max_database_bytes: self.max_database_bytes.as_u64(),
+            min_free_bytes: self.min_free_bytes.as_u64(),
+            ..Default::default()
+        }
+    }
+
     pub fn wait_bounds(&self) -> tinycloud_core::sql::SqlWaitBounds {
         tinycloud_core::sql::SqlWaitBounds {
             lock_wait: Duration::from_millis(self.lock_wait_timeout_ms),
@@ -1147,6 +1181,9 @@ impl Default for SqlStorageConfig {
             hydration_wait_timeout_ms: default_sql_hydration_wait_timeout_ms(),
             artifact_transfer_timeout_ms: default_sql_artifact_transfer_timeout_ms(),
             hydration_max_ms: default_sql_hydration_max_ms(),
+            synchronous: Default::default(),
+            max_database_bytes: default_sql_max_database_bytes(),
+            min_free_bytes: default_sql_min_free_bytes(),
         }
     }
 }

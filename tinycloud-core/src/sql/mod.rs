@@ -1,6 +1,7 @@
 pub mod authorizer;
 pub mod caveats;
 pub mod database;
+pub mod durability;
 pub mod parser;
 pub mod service;
 pub mod storage;

@@ -26,6 +26,12 @@ cors = true
     # hydration_wait_timeout_ms = 30000
     # artifact_transfer_timeout_ms = 45000
     # hydration_max_ms = 600000          # a hydration keeps warming after its callers give up
+    ## Local commit durability and the checks before COMMIT (TC-1491).
+    ## synchronous: "full" fsyncs the WAL on every COMMIT; "normal" is the rollback flag.
+    ## The two sizes are unmeasured placeholders.
+    # synchronous = "full"
+    # max_database_bytes = "1 GiB"       # per database; over it: 507 sql_database_size_limit
+    # min_free_bytes = "512 MiB"         # disk kept free; short of it: 507 sql_disk_headroom
     # [global.storage.duckdb]
     # path = "./data/duckdb"
 

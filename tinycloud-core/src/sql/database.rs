@@ -6,7 +6,7 @@
 //! SQL query time.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -17,6 +17,7 @@ use crate::request_telemetry::{self, QueryTimer, RequestContext};
 
 use super::{
     caveats::SqlCaveats,
+    durability::{cache_used_bytes, unspilled_wal_bound, DurabilityPolicy, ReservationRefused},
     parser,
     storage::{self, StorageMode},
     types::*,
@@ -57,6 +58,11 @@ enum DbMessage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GrowthPolicy {
     Allow,
+    /// The owner's storage budget has this many bytes left: the write may grow
+    /// the database by at most that. SQLite enforces it (`max_page_count`), so
+    /// a write that would pass it is rolled back before COMMIT with
+    /// [`SqlError::StorageWouldGrow`] instead of overshooting by one write.
+    Budget(u64),
     /// The space is full: run the request, but undo it and fail with
     /// [`SqlError::StorageWouldGrow`] if the database grew. No-op DDL,
     /// `DELETE` and `DROP` free pages instead of adding them, so they pass.
@@ -75,7 +81,7 @@ pub struct DatabaseHandle {
 
 impl DatabaseHandle {
     /// Close the connection before acknowledging that its local files can be removed.
-    pub(crate) async fn shutdown(&self) -> Result<(), SqlError> {
+    pub async fn shutdown(&self) -> Result<(), SqlError> {
         let (response_tx, response_rx) = oneshot::channel();
         self.tx
             .send((
@@ -181,6 +187,26 @@ pub fn spawn_actor(
     memory_threshold: u64,
     databases: Arc<DashMap<(String, String), DatabaseHandle>>,
 ) -> DatabaseHandle {
+    spawn_actor_with_policy(
+        space_id,
+        db_name,
+        base_path,
+        memory_threshold,
+        databases,
+        DurabilityPolicy::default(),
+    )
+}
+
+/// [`spawn_actor`] with the node's durability policy (TC-1491): the
+/// `synchronous` level, the size cap and the disk headroom.
+pub fn spawn_actor_with_policy(
+    space_id: String,
+    db_name: String,
+    base_path: String,
+    memory_threshold: u64,
+    databases: Arc<DashMap<(String, String), DatabaseHandle>>,
+    policy: DurabilityPolicy,
+) -> DatabaseHandle {
     let (tx, mut rx) = mpsc::channel::<(Option<Arc<RequestContext>>, DbMessage)>(32);
     let id = NEXT_ACTOR_ID.fetch_add(1, Ordering::Relaxed);
     let initial_context = request_telemetry::current();
@@ -199,7 +225,7 @@ pub fn spawn_actor(
         };
         let mut conn = {
             let _context = request_telemetry::enter(initial_context);
-            let Ok(connection) = storage::open_connection(&mode) else {
+            let Ok(connection) = storage::open_connection(&mode, policy.synchronous) else {
                 tracing::error!("Failed to open database");
                 databases.remove_if(&(space_id, db_name), |_, handle| handle.id == id);
                 return;
@@ -244,11 +270,24 @@ pub fn spawn_actor(
                     growth,
                     response_tx,
                 } => {
+                    let key = format!("{space_id}/{db_name}");
+                    let ctx = WriteContext {
+                        policy: &policy,
+                        key: &key,
+                        dir: existing_ancestor(&file_path),
+                        file_backed: matches!(mode, StorageMode::File(_)),
+                        remaining: match growth {
+                            GrowthPolicy::Budget(remaining) => Some(remaining),
+                            _ => None,
+                        },
+                    };
                     let result = match growth {
-                        GrowthPolicy::Allow => handle_message(&conn, &request, &caveats, &ability),
-                        GrowthPolicy::Forbid => {
-                            handle_message_without_growth(&conn, &request, &caveats, &ability)
+                        GrowthPolicy::Allow | GrowthPolicy::Budget(_) => {
+                            handle_message_ctx(&conn, &request, &caveats, &ability, &ctx)
                         }
+                        GrowthPolicy::Forbid => handle_message_without_growth_ctx(
+                            &conn, &request, &caveats, &ability, &ctx,
+                        ),
                     };
                     conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
 
@@ -256,20 +295,43 @@ pub fn spawn_actor(
                     if result.is_ok() && matches!(mode, StorageMode::InMemory) {
                         if let Ok(size) = storage::database_size(&conn) {
                             if size > memory_threshold {
-                                match storage::promote_to_file(&conn, &file_path) {
-                                    Ok(new_conn) => {
-                                        conn = new_conn;
-                                        mode = StorageMode::File(file_path.clone());
-                                        tracing::info!("Promoted database to file storage");
-                                    }
-                                    Err(_) => {
-                                        tracing::error!("Failed to promote database to file");
+                                // The copy needs the whole database on disk,
+                                // next to what in-flight writes still need.
+                                let room = policy.budget.reserve(
+                                    &key,
+                                    size,
+                                    policy.free_space.as_ref(),
+                                    existing_ancestor(&file_path),
+                                    policy.min_free_bytes,
+                                );
+                                if room.is_err() {
+                                    tracing::warn!(
+                                        "Not enough free disk to promote a database; keeping it in memory"
+                                    );
+                                } else {
+                                    let promoted = storage::promote_to_file(
+                                        &conn,
+                                        &file_path,
+                                        policy.synchronous,
+                                    );
+                                    // The copy is on disk now.
+                                    policy.budget.release(&key);
+                                    match promoted {
+                                        Ok(new_conn) => {
+                                            conn = new_conn;
+                                            mode = StorageMode::File(file_path.clone());
+                                            tracing::info!("Promoted database to file storage");
+                                        }
+                                        Err(_) => {
+                                            tracing::error!("Failed to promote database to file");
+                                        }
                                     }
                                 }
                             }
                         }
                     }
 
+                    seam(&policy.seams.before_response);
                     let _ = response_tx.send(result);
                 }
                 DbMessage::Export { response_tx } => {
@@ -306,6 +368,14 @@ pub fn spawn_actor(
     });
 
     DatabaseHandle { id, tx }
+}
+
+/// The nearest existing ancestor of `path`: where `statvfs` can be asked how
+/// much room the filesystem has before the file or its directory exists.
+fn existing_ancestor(path: &Path) -> &Path {
+    path.ancestors()
+        .find(|ancestor| !ancestor.as_os_str().is_empty() && ancestor.exists())
+        .unwrap_or_else(|| Path::new("."))
 }
 
 fn handle_wal(mode: &StorageMode, file_path: &Path) -> Result<Option<Vec<u8>>, SqlError> {
@@ -381,11 +451,12 @@ const GUARD_UNDO: &str = "ROLLBACK TO tinycloud_storage_guard; RELEASE tinycloud
 /// database did not grow (`PRAGMA page_count` reflects uncommitted pages on
 /// this connection). Every failed guarded request is rolled back, including
 /// schema entries and batch statements that ran before a later rejection.
-fn handle_message_without_growth(
+fn handle_message_without_growth_ctx(
     conn: &rusqlite::Connection,
     request: &SqlRequest,
     caveats: &Option<SqlCaveats>,
     ability: &str,
+    ctx: &WriteContext<'_>,
 ) -> Result<SqlExecutionResult, SqlError> {
     let before = page_count(conn)?;
     {
@@ -393,7 +464,7 @@ fn handle_message_without_growth(
         conn.execute_batch(GUARD_BEGIN)
             .map_err(|e| SqlError::Internal(e.to_string()))?;
     }
-    let result = handle_message(conn, request, caveats, ability);
+    let result = handle_message_ctx(conn, request, caveats, ability, ctx);
     // An early error return can leave the request's authorizer installed.
     conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
     // ROLLBACK conflict handling can already have undone the transaction.
@@ -401,11 +472,28 @@ fn handle_message_without_growth(
         return result;
     }
     let grew = page_count(conn).map(|after| after > before);
+    // The disk check before COMMIT, for a request that is about to be kept.
+    let gate = match (&result, &grew) {
+        (Ok(_), Ok(false)) => baseline(conn).and_then(|base| {
+            precommit_gate(
+                conn,
+                ctx,
+                &Baseline {
+                    pages: u64::try_from(before).unwrap_or(0),
+                    page_size: base.page_size,
+                },
+            )
+        }),
+        _ => Ok(()),
+    };
     let end = match grew {
-        Ok(false) if result.is_ok() => GUARD_KEEP,
+        Ok(false) if result.is_ok() && gate.is_ok() => GUARD_KEEP,
         // Undo earlier statements on any error, even without page growth.
         _ => GUARD_UNDO,
     };
+    if end == GUARD_KEEP {
+        seam(&ctx.policy.seams.before_commit);
+    }
     let end_result = {
         let _timer = QueryTimer::new();
         conn.execute_batch(end)
@@ -419,10 +507,20 @@ fn handle_message_without_growth(
             conn.execute_batch(GUARD_UNDO)
                 .map_err(|e| SqlError::Internal(e.to_string()))?;
         }
-        return Err(SqlError::Sqlite(error.to_string()));
+        ctx.policy.budget.release(ctx.key);
+        return Err(commit_error(&error));
+    }
+    if let Err(error) = gate {
+        ctx.policy.budget.release(ctx.key);
+        return Err(error);
     }
     match grew? {
-        false => result,
+        false => {
+            seam(&ctx.policy.seams.after_commit);
+            // Growth is zero here; the WAL bytes are on disk.
+            ctx.policy.budget.hold(ctx.key, 0);
+            result
+        }
         true => Err(SqlError::StorageWouldGrow),
     }
 }
@@ -433,31 +531,211 @@ fn page_count(conn: &rusqlite::Connection) -> Result<i64, SqlError> {
         .map_err(|e| SqlError::Internal(e.to_string()))
 }
 
+/// The unit tests drive a bare connection: no disk, no budget.
+#[cfg(test)]
+fn handle_message(
+    conn: &rusqlite::Connection,
+    request: &SqlRequest,
+    caveats: &Option<SqlCaveats>,
+    ability: &str,
+) -> Result<SqlExecutionResult, SqlError> {
+    let policy = DurabilityPolicy::default();
+    let ctx = WriteContext {
+        policy: &policy,
+        key: "test/test",
+        dir: Path::new("."),
+        file_backed: false,
+        remaining: None,
+    };
+    handle_message_ctx(conn, request, caveats, ability, &ctx)
+}
+
+#[cfg(test)]
+fn handle_message_without_growth(
+    conn: &rusqlite::Connection,
+    request: &SqlRequest,
+    caveats: &Option<SqlCaveats>,
+    ability: &str,
+) -> Result<SqlExecutionResult, SqlError> {
+    let policy = DurabilityPolicy::default();
+    let ctx = WriteContext {
+        policy: &policy,
+        key: "test/test",
+        dir: Path::new("."),
+        file_backed: false,
+        remaining: None,
+    };
+    handle_message_without_growth_ctx(conn, request, caveats, ability, &ctx)
+}
+
 const REQUEST_BEGIN: &str = "SAVEPOINT tinycloud_request";
 const REQUEST_KEEP: &str = "RELEASE tinycloud_request";
+/// SQLite's default `max_page_count`.
+const UNLIMITED_PAGES: u64 = 4_294_967_294;
+/// Opcodes between the disk checks of a running statement.
+const PROGRESS_INTERVAL_OPS: std::os::raw::c_int = 10_000;
 
-/// Whether `request` runs more than one statement and so needs a transaction
-/// of its own to be all-or-nothing (TC-1491). A single statement is already
-/// atomic. A request with a `PRAGMA` keeps running statement by statement:
-/// several pragmas (`foreign_keys`, `journal_mode`) are no-ops or errors
-/// inside a transaction, and they are admin-only.
-fn is_atomic_request(request: &SqlRequest) -> bool {
+/// What a write request needs to be bounded before it commits (TC-1491).
+struct WriteContext<'a> {
+    policy: &'a DurabilityPolicy,
+    /// `space/db`, the key of this database's reservation.
+    key: &'a str,
+    /// An existing directory on the filesystem holding the database.
+    dir: &'a Path,
+    /// True once the database is a file (and so has a WAL and uses the disk).
+    file_backed: bool,
+    /// Bytes the owner's storage budget still allows this database to grow
+    /// by, or `None` for no budget.
+    remaining: Option<u64>,
+}
+
+/// The state a request starts from.
+struct Baseline {
+    pages: u64,
+    page_size: u64,
+}
+
+fn pragma_u64(conn: &rusqlite::Connection, pragma: &str) -> Result<u64, SqlError> {
+    conn.query_row(&format!("PRAGMA {pragma}"), [], |row| row.get::<_, i64>(0))
+        .map(|value| u64::try_from(value).unwrap_or(0))
+        .map_err(|e| SqlError::Internal(e.to_string()))
+}
+
+fn baseline(conn: &rusqlite::Connection) -> Result<Baseline, SqlError> {
+    Ok(Baseline {
+        pages: pragma_u64(conn, "page_count")?,
+        page_size: pragma_u64(conn, "page_size")?,
+    })
+}
+
+fn set_max_pages(conn: &rusqlite::Connection, pages: u64) -> Result<(), SqlError> {
+    conn.query_row(&format!("PRAGMA max_page_count = {pages}"), [], |_| Ok(()))
+        .map_err(|e| SqlError::Internal(e.to_string()))
+}
+
+/// The page limit SQLite enforces for this request, and whether the owner's
+/// budget (rather than the per-database cap) is the tighter of the two. SQLite
+/// never sets it below the current size, so a database already over the cap
+/// can still run writes that do not grow it.
+fn page_limit(ctx: &WriteContext<'_>, baseline: &Baseline) -> (u64, bool) {
+    let page_size = baseline.page_size.max(1);
+    let cap = (ctx.policy.max_database_bytes / page_size).max(1);
+    match ctx.remaining {
+        Some(remaining) => {
+            let budget = baseline.pages.saturating_add(remaining / page_size);
+            (budget.min(cap), budget < cap)
+        }
+        None => (cap, false),
+    }
+}
+
+fn is_full_error(error: &SqlError) -> bool {
+    matches!(error, SqlError::Sqlite(m) | SqlError::SchemaError(m) if m.contains("database or disk is full"))
+}
+
+/// What a `SQLITE_FULL` means: the size limit SQLite enforces (`max_page_count`)
+/// or the disk itself (ENOSPC). The page count cannot tell them apart, since
+/// SQLite has already undone the failed statement by the time it is read; the
+/// free-space reading can: a disk below its floor is the disk.
+fn classify_full(ctx: &WriteContext<'_>, budget_binding: bool) -> SqlError {
+    let disk_exhausted = ctx.file_backed
+        && ctx
+            .policy
+            .free_space
+            .free_bytes(ctx.dir)
+            .map_or(true, |free| {
+                free < ctx
+                    .policy
+                    .budget
+                    .reserved_excluding(ctx.key)
+                    .saturating_add(ctx.policy.min_free_bytes)
+            });
+    match (disk_exhausted, budget_binding) {
+        (true, _) => SqlError::DiskHeadroom,
+        (false, true) => SqlError::StorageWouldGrow,
+        (false, false) => SqlError::DatabaseSizeLimit,
+    }
+}
+
+/// The last check before COMMIT. Rolling back on an error is the caller's.
+///
+/// The disk bound: the pages COMMIT still writes to the WAL are the dirty
+/// pages that have not spilled yet, and those are all in the connection's
+/// page cache, so `cache_used` bounds them whatever the SQL payload was
+/// (index, trigger and foreign-key writes, freelist and overflow pages are
+/// all just pages). A later checkpoint grows the main file by the page growth
+/// of the request. WAL bytes already spilled are on disk and already out of
+/// the free space the check reads.
+fn precommit_gate(
+    conn: &rusqlite::Connection,
+    ctx: &WriteContext<'_>,
+    baseline: &Baseline,
+) -> Result<(), SqlError> {
+    let now = pragma_u64(conn, "page_count")?;
+    let growth_pages = now.saturating_sub(baseline.pages);
+    let growth_bytes = growth_pages.saturating_mul(baseline.page_size);
+    if ctx
+        .remaining
+        .is_some_and(|remaining| growth_bytes > remaining)
+    {
+        return Err(SqlError::StorageWouldGrow);
+    }
+    if growth_pages > 0 && now.saturating_mul(baseline.page_size) > ctx.policy.max_database_bytes {
+        return Err(SqlError::DatabaseSizeLimit);
+    }
+    if !ctx.file_backed {
+        return Ok(());
+    }
+    let wal_bound = unspilled_wal_bound(cache_used_bytes(conn), baseline.page_size);
+    match ctx.policy.budget.reserve(
+        ctx.key,
+        wal_bound.saturating_add(growth_bytes),
+        ctx.policy.free_space.as_ref(),
+        ctx.dir,
+        ctx.policy.min_free_bytes,
+    ) {
+        Ok(()) => Ok(()),
+        Err(ReservationRefused::Headroom) => Err(SqlError::DiskHeadroom),
+        Err(ReservationRefused::Unknown) => Err(SqlError::Internal(
+            "could not read the free disk space".into(),
+        )),
+    }
+}
+
+fn seam(hook: &Option<Arc<dyn Fn() + Send + Sync>>) {
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Whether `request` runs in a transaction of its own (TC-1491).
+///
+/// Every request that can write does, so the checks before COMMIT have a
+/// transaction to roll back, and a request with several statements is
+/// all-or-nothing. Not wrapped: reads, and a request with a `PRAGMA` (admin
+/// only), which keeps running statement by statement because several pragmas
+/// do nothing, or fail, inside a transaction.
+fn needs_transaction(request: &SqlRequest, caveats: &Option<SqlCaveats>, ability: &str) -> bool {
+    let is_pragma = |sql: &str| parser::is_pragma_sql(sql);
     match request {
+        SqlRequest::Query { sql, .. } => {
+            crate::policy_capability::resolve_alias(ability) != "tinycloud.sql/read"
+                && !is_pragma(sql)
+                && parser::validate_sql(sql, caveats, ability)
+                    .map(|parsed| !parsed.is_read_only)
+                    .unwrap_or(false)
+        }
         SqlRequest::Execute { sql, schema, .. } => {
-            schema.as_ref().is_some_and(|stmts| !stmts.is_empty())
-                && !parser::is_pragma_sql(sql)
-                && !schema
-                    .iter()
-                    .flatten()
-                    .any(|stmt| parser::is_pragma_sql(stmt))
+            !is_pragma(sql) && !schema.iter().flatten().any(|stmt| is_pragma(stmt))
         }
         SqlRequest::Batch { statements } => {
-            statements.len() > 1
-                && !statements
-                    .iter()
-                    .any(|statement| parser::is_pragma_sql(&statement.sql))
+            !statements.iter().any(|statement| is_pragma(&statement.sql))
         }
-        _ => false,
+        SqlRequest::ExecuteStatement { name, .. } => caveats
+            .as_ref()
+            .and_then(|c| c.find_statement(name))
+            .is_some_and(|prepared| !is_pragma(&prepared.sql)),
+        SqlRequest::Export => false,
     }
 }
 
@@ -473,15 +751,78 @@ fn is_atomic_request(request: &SqlRequest) -> bool {
 /// When a transaction is already open, [`handle_message_without_growth`]'s
 /// guard has it and already undoes the whole request on any error (reporting
 /// growth ahead of the SQL error), so this adds nothing there.
-fn handle_message(
+///
+/// Order, for a write: limits (SQLite's `max_page_count`: the per-database
+/// cap and the owner's remaining budget), the statements, the pre-commit gate
+/// ([`precommit_gate`]), COMMIT. Any failure before COMMIT is a ROLLBACK.
+fn handle_message_ctx(
     conn: &rusqlite::Connection,
     request: &SqlRequest,
     caveats: &Option<SqlCaveats>,
     ability: &str,
+    ctx: &WriteContext<'_>,
 ) -> Result<SqlExecutionResult, SqlError> {
-    if !is_atomic_request(request) || !conn.is_autocommit() {
+    if !conn.is_autocommit() || !needs_transaction(request, caveats, ability) {
         return handle_request(conn, request, caveats, ability);
     }
+    let base = baseline(conn)?;
+    set_max_pages(conn, page_limit(ctx, &base).0)?;
+    let tripped = Arc::new(AtomicBool::new(false));
+    if ctx.file_backed {
+        let (budget, free_space) = (ctx.policy.budget.clone(), ctx.policy.free_space.clone());
+        let (key, dir) = (ctx.key.to_string(), ctx.dir.to_path_buf());
+        let (min_free, tripped) = (ctx.policy.min_free_bytes, tripped.clone());
+        // Stops a statement early once the disk is already too full; the
+        // authoritative check is `precommit_gate`.
+        conn.progress_handler(
+            PROGRESS_INTERVAL_OPS,
+            Some(move || {
+                let free = free_space.free_bytes(&dir).unwrap_or(0);
+                let others = budget.reserved_excluding(&key);
+                let exhausted = free < others.saturating_add(min_free);
+                if exhausted {
+                    tripped.store(true, Ordering::Relaxed);
+                }
+                exhausted
+            }),
+        );
+    }
+    let outcome = run_transaction(conn, request, caveats, ability, ctx, &base);
+    if ctx.file_backed {
+        conn.progress_handler(0, None::<fn() -> bool>);
+    }
+    let outcome = outcome.map_err(|error| {
+        if tripped.load(Ordering::Relaxed) {
+            SqlError::DiskHeadroom
+        } else {
+            error
+        }
+    });
+    // A failed request keeps nothing, so nothing of it stays reserved.
+    if outcome.is_err() {
+        ctx.policy.budget.release(ctx.key);
+    }
+    let _ = set_max_pages(conn, UNLIMITED_PAGES);
+    outcome.map(|(result, growth_bytes)| {
+        // Committed: its WAL bytes are on disk now. What stays held, until the
+        // request's outcome is known (the Postgres save), is the checkpoint
+        // growth.
+        ctx.policy
+            .budget
+            .hold(ctx.key, if ctx.file_backed { growth_bytes } else { 0 });
+        result
+    })
+}
+
+/// The transaction itself; on `Err` it has been rolled back.
+fn run_transaction(
+    conn: &rusqlite::Connection,
+    request: &SqlRequest,
+    caveats: &Option<SqlCaveats>,
+    ability: &str,
+    ctx: &WriteContext<'_>,
+    base: &Baseline,
+) -> Result<(SqlExecutionResult, u64), SqlError> {
     {
         let _timer = QueryTimer::new();
         conn.execute_batch(REQUEST_BEGIN)
@@ -490,32 +831,67 @@ fn handle_message(
     let result = handle_request(conn, request, caveats, ability);
     // An early error return can leave the request's authorizer installed.
     conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
-    // SQLite can already have undone the transaction (ROLLBACK conflict
-    // handling); there is then nothing left to undo.
-    if result.is_err() && conn.is_autocommit() {
-        return result;
-    }
-    // A failure rolls the whole transaction back. `ROLLBACK TO` + `RELEASE`
-    // would instead commit an empty write transaction and rewrite the header.
-    let end = if result.is_ok() {
-        REQUEST_KEEP
-    } else {
-        "ROLLBACK"
+    // The error is surfaced before the rollback so the caller can still read
+    // the uncommitted page count to tell a size limit from a full disk.
+    let result = result.and_then(|ok| precommit_gate(conn, ctx, base).map(|()| ok));
+    let result = match result {
+        Ok(ok) => ok,
+        Err(error) => {
+            // SQLite can already have undone the transaction (ROLLBACK
+            // conflict handling); there is then nothing left to undo.
+            let full = is_full_error(&error);
+            let classified = full.then(|| classify_full(ctx, page_limit(ctx, base).1));
+            if !conn.is_autocommit() {
+                // A failure rolls the whole transaction back. `ROLLBACK TO` +
+                // `RELEASE` would instead commit an empty write transaction
+                // and rewrite the header.
+                let _timer = QueryTimer::new();
+                let _ = conn.execute_batch("ROLLBACK");
+            }
+            return Err(classified.unwrap_or(error));
+        }
     };
-    let end_result = {
+    let growth_bytes = pragma_u64(conn, "page_count")
+        .unwrap_or(base.pages)
+        .saturating_sub(base.pages)
+        .saturating_mul(base.page_size);
+    seam(&ctx.policy.seams.before_commit);
+    // RELEASE of the outermost savepoint is the COMMIT.
+    let commit = {
         let _timer = QueryTimer::new();
-        conn.execute_batch(end)
+        conn.execute_batch(REQUEST_KEEP)
     };
-    if let Err(error) = end_result {
-        // RELEASE of the outermost savepoint is the COMMIT. A deferred
-        // constraint can fail it and leave the writes and the savepoint open.
+    if let Err(error) = commit {
         if !conn.is_autocommit() {
             let _timer = QueryTimer::new();
             let _ = conn.execute_batch("ROLLBACK");
         }
-        return result.and(Err(SqlError::Sqlite(error.to_string())));
+        return Err(commit_error(&error));
     }
-    result
+    seam(&ctx.policy.seams.after_commit);
+    Ok((result, growth_bytes))
+}
+
+/// COMMIT failed. A deferred constraint is the request's own fault; anything
+/// else is the disk.
+///
+/// If COMMIT's fsync fails after the WAL frames were written, SQLite reports
+/// the error and rolls the transaction back in memory, but the frames are
+/// already in the file and, if their commit mark reached it, the commit can
+/// reappear when the database is next opened — although we reported the
+/// request as rejected. That is harmless while Postgres is master: the caller
+/// discards the local state and re-hydrates from Postgres, which never saw the
+/// write. Under store-master (1b+) it is an outcome-unknown case: the local
+/// WAL must be kept and the request answered `outcome_unknown`, not rejected.
+fn commit_error(error: &rusqlite::Error) -> SqlError {
+    match error.sqlite_error_code() {
+        Some(rusqlite::ErrorCode::ConstraintViolation) => SqlError::Sqlite(error.to_string()),
+        Some(rusqlite::ErrorCode::DiskFull) => SqlError::DiskHeadroom,
+        code => {
+            tracing::error!(?code, "Local SQL commit failed");
+            SqlError::CommitFailed
+        }
+    }
 }
 
 fn handle_request(
@@ -821,6 +1197,7 @@ fn execute_statement(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::durability::Synchronous;
 
     #[tokio::test]
     async fn tc626_review_release_escape_cannot_survive_checkpoint() {
@@ -912,7 +1289,8 @@ mod tests {
             "BEGIN",
         ] {
             for prefix in ["", "PRAGMA user_version = 1; /* boundary; */ "] {
-                let conn = storage::open_connection(&StorageMode::InMemory).unwrap();
+                let conn =
+                    storage::open_connection(&StorageMode::InMemory, Synchronous::Full).unwrap();
                 conn.execute_batch(
                     "CREATE TABLE data (value TEXT); INSERT INTO data VALUES ('before')",
                 )
@@ -950,7 +1328,7 @@ mod tests {
 
     #[test]
     fn tc626_review_single_pragma_preserves_quoted_semicolons_and_comments() {
-        let conn = storage::open_connection(&StorageMode::InMemory).unwrap();
+        let conn = storage::open_connection(&StorageMode::InMemory, Synchronous::Full).unwrap();
         conn.execute_batch("CREATE TABLE \"quoted;name\" (value TEXT)")
             .unwrap();
         let result = handle_message_without_growth(
@@ -990,7 +1368,7 @@ mod tests {
 
     #[test]
     fn growth_guard_rolls_back_failed_deferred_commit() {
-        let conn = storage::open_connection(&StorageMode::InMemory).unwrap();
+        let conn = storage::open_connection(&StorageMode::InMemory, Synchronous::Full).unwrap();
         conn.execute_batch(
             "CREATE TABLE parents (id INTEGER PRIMARY KEY);
              CREATE TABLE children (
