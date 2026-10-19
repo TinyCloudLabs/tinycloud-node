@@ -48,7 +48,7 @@ use tinycloud_auth::resource::SpaceId;
 use tinycloud_auth::ssi::dids::DIDBuf;
 use tinycloud_auth::ssi::jwk::JWK;
 use tinycloud_core::database_artifacts::{
-    DatabaseArtifactError, DatabaseArtifactRepository, SeaOrmDatabaseArtifactRepository,
+    DatabaseArtifactError, DatabaseArtifactRepository, MemorySink, SeaOrmDatabaseArtifactRepository,
 };
 use tinycloud_core::db_pool::{is_transient_error, transient_error_class, StatementTimeoutMode};
 use tinycloud_core::sea_orm::{
@@ -57,7 +57,6 @@ use tinycloud_core::sea_orm::{
 };
 use tinycloud_core::sql::{SqlError, SqlRequest, SqlResponse, SqlService, SqlValue};
 use tinycloud_core::RecoveringConnection;
-use tinycloud_core::{SizeTrackingArtifactRepository, SqlSizes};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -561,17 +560,16 @@ async fn postgres_large_artifacts_persist_under_default_timeouts() {
     schema.drop().await;
 }
 
-/// A large hydration whose server-side work outlasts the base statement
-/// timeout succeeds, because the size mirror marks the artifact large and
-/// its load runs under the bulk timeout; the same load forced under the base
-/// timeout is cancelled (Opus's M6). The artifact is read through a view
-/// that sleeps 1 s per row, standing in for detoasting and decompressing a
-/// large payload. (A slow network does not exercise this: the artifact is
-/// one row, and PostgreSQL does not cancel a statement while it is writing
-/// a row to the client.)
+/// Hydration is a series of 4 MiB slice statements, each under the BASE
+/// statement timeout (TC-822): a large artifact hydrates through a pool whose
+/// base timeout is far below the whole-artifact transfer, and a slice whose
+/// server-side work outlasts the base timeout is cancelled as a transient
+/// error rather than holding the pool. The slow case reads the artifact
+/// through a view that sleeps 1 s per row, standing in for detoasting a
+/// large payload.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn postgres_large_hydration_runs_under_the_bulk_timeout() {
-    let Some(url) = postgres_url("postgres_large_hydration_runs_under_the_bulk_timeout") else {
+async fn postgres_hydration_slices_run_under_the_base_timeout() {
+    let Some(url) = postgres_url("postgres_hydration_slices_run_under_the_base_timeout") else {
         return;
     };
     let schema = Schema::new(&url, "bulkload").await;
@@ -585,6 +583,29 @@ async fn postgres_large_hydration_runs_under_the_bulk_timeout() {
             write(&seed, &space, "a", 4 * 1024 * 1024).await.unwrap();
         }
     }
+    let strict = pool(schema.url(&url, None), |config| {
+        config.database.statement_timeout_ms = 500;
+        config.database.bulk_statement_timeout_ms = 10_000;
+    })
+    .await;
+    let repository = Arc::new(SeaOrmDatabaseArtifactRepository::new(strict.clone()));
+    let cache = tempfile::TempDir::new().unwrap();
+    let service = SqlService::new(
+        cache.path().to_string_lossy().into_owned(),
+        u64::MAX,
+        repository.clone(),
+    );
+    assert_eq!(
+        count(&service, &space, "a").await.unwrap(),
+        3,
+        "a multi-slice artifact hydrates under the 500 ms base timeout"
+    );
+
+    let meta = repository
+        .load_meta("sql", &space.to_string(), "a")
+        .await
+        .unwrap()
+        .expect("the artifact exists");
     let name = &schema.name;
     schema
         .admin
@@ -597,30 +618,16 @@ async fn postgres_large_hydration_runs_under_the_bulk_timeout() {
         ))
         .await
         .unwrap();
-
-    let strict = pool(schema.url(&url, None), |config| {
-        config.database.statement_timeout_ms = 500;
-        config.database.bulk_statement_timeout_ms = 10_000;
-    })
-    .await;
-    let sizes = SqlSizes::new();
-    sizes.seed_from(&direct).await.unwrap();
-    let repository = Arc::new(SeaOrmDatabaseArtifactRepository::new(strict.clone()));
-    let cache = tempfile::TempDir::new().unwrap();
-    let service = SqlService::new(
-        cache.path().to_string_lossy().into_owned(),
-        u64::MAX,
-        Arc::new(SizeTrackingArtifactRepository::new(
-            repository.clone(),
-            sizes,
-        )),
-    );
-    assert_eq!(count(&service, &space, "a").await.unwrap(), 3);
-
     let error = repository
-        .load_sized("sql", &space.to_string(), "a", Some(0))
+        .read_chunks(
+            "sql",
+            &space.to_string(),
+            "a",
+            &meta,
+            &mut MemorySink::default(),
+        )
         .await
-        .expect_err("the same load under the 500 ms base timeout is cancelled");
+        .expect_err("a slice that outlasts the 500 ms base timeout is cancelled");
     match &error {
         DatabaseArtifactError::Db(error) => {
             assert_eq!(
