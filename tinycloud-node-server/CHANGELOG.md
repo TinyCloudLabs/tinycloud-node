@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.2](https://github.com/TinyCloudLabs/tinycloud-node/compare/v0.0.1...v1.21.2) - 2026-10-19
+
+### Added
+
+- *(admin)* read-only GET /admin/stats owner list (TC-1482)
+
+### Fixed
+
+- *(admin)* do not list owners who only signed in; 32-byte token floor (TC-1482)
+
+### Other
+
+- Merge origin/main (a8ddd90d, #371) into feat/tc-1482-admin-stats
+- admin stats: do not count vault metadata as data
+- Merge remote-tracking branch 'origin/main' into feat/tc-1482-admin-stats
+
 - Recheck hook ticket delegation revocation when event streams open and use
   literal segment-prefix matching for hook subscriptions.
 
