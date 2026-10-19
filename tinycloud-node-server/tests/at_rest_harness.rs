@@ -139,9 +139,10 @@ impl Harness {
                 .with_context(|| format!("{key} missing from harness env file"))
         };
 
-        let sdk = aws_config::from_env()
-            .region(aws_sdk_s3::Region::new(var("TC887_S3_REGION")?))
-            .credentials_provider(aws_sdk_s3::Credentials::new(
+        let sdk = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .http_client(tinycloud::storage::s3::http_client())
+            .region(aws_sdk_s3::config::Region::new(var("TC887_S3_REGION")?))
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
                 var("TC887_S3_ACCESS_KEY_ID")?,
                 var("TC887_S3_SECRET_ACCESS_KEY")?,
                 None,
@@ -150,10 +151,11 @@ impl Harness {
             ))
             .load()
             .await;
-        let endpoint: rocket::http::hyper::Uri = var("TC887_S3_ENDPOINT")?.parse()?;
+        let endpoint = var("TC887_S3_ENDPOINT")?;
         let s3 = aws_sdk_s3::Client::from_conf(
             aws_sdk_s3::config::Builder::from(&sdk)
-                .endpoint_resolver(aws_sdk_s3::Endpoint::immutable(endpoint))
+                .endpoint_url(endpoint)
+                .force_path_style(true)
                 .build(),
         );
         let pg = Database::connect(var("TC887_PG_URL")?)
@@ -199,10 +201,10 @@ impl Harness {
                 .send()
                 .await
                 .context("list the harness bucket")?;
-            for object in page.contents().unwrap_or_default() {
+            for object in page.contents() {
                 keys.insert(object.key().context("object without key")?.to_owned());
             }
-            if !page.is_truncated() {
+            if page.is_truncated() != Some(true) {
                 return Ok(keys);
             }
             token = page.next_continuation_token().map(str::to_owned);
