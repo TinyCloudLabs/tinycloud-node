@@ -16,11 +16,7 @@ use crate::database_artifacts::{
 /// single writer, the Postgres compose runs one node container.
 #[derive(Debug, Clone, Default)]
 #[allow(clippy::type_complexity)]
-pub struct SqlSizes(
-    Arc<RwLock<HashMap<String, HashMap<(String, String), u64>>>>,
-    /// Set once [`SqlSizes::seed_from`] has loaded every artifact's size.
-    Arc<std::sync::atomic::AtomicBool>,
-);
+pub struct SqlSizes(Arc<RwLock<HashMap<String, HashMap<(String, String), u64>>>>);
 
 impl SqlSizes {
     pub fn new() -> Self {
@@ -56,7 +52,6 @@ impl SqlSizes {
                 .insert((service, name), size.max(0) as u64);
         }
         *self.0.write().await = fresh; // overwrite the map wholesale with DB truth
-        self.1.store(true, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 

@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [1.21.3] - 2026-10-19
+
+### Release notes
+
+- Batch reads are cheaper: a read invocation of several `kv/get` or `kv/metadata` capabilities (the SDK's `batchGet` and `batchHead`) now costs 22 database round trips for a 100-key batch instead of 216, with the same responses and the same read-audit record (TC-1274, #375).
+- Index: one migration, `m20261020_000000_current_kv_key_c_index` (TC-1274, #374). It is performance-only. The node boots and serves without the index; until it is built the node logs the warning `current_kv_c_index_missing` and KV list requests are slower. It is built by an operator after the PS-10 resize (the exact SQL is in `docs/releasing.md`), and it is never built during startup on a non-empty table.
+- Stats route (TC-1482, #370, #371, #372): `GET /admin/stats` is disabled (`404`) until `NODE_STATS_READ_TOKEN` (at least 32 bytes) is set. Never delete or blank the `PROD_TINYCLOUD_NODE_STATS_READ_TOKEN` secret once the name is in the CVM's `allowed_envs`: a later deploy without it fails before any change, and that includes rollbacks. The first deploy that adds the token restarts the CVM twice.
+- The SQL/DuckDB legacy-artifact fence scan is reused for 60 s instead of 1 s. The durable fence stays off: turning it on answers every SQL and DuckDB request with `503`.
+- **Rollback:** the same-digest rollback is unaffected. Rolling back to an image below 1.21.3 needs `DELETE FROM seaql_migrations WHERE version = 'm20261020_000000_current_kv_key_c_index';` first, because a node refuses to start with a recorded migration it does not ship.
+
 ### Changes
 
 - A SQL request with more than one statement (a `batch`, or an `execute` that carries `schema` statements) is one transaction (TC-1491): if any statement fails, none of them is kept. Before, each statement committed on its own, so a failing batch left its earlier statements in the node's local copy of the database while the durable copy in Postgres, written only after a fully successful request, did not have them; the two stayed apart until the next successful write persisted both. A failing batch now leaves the local file byte-for-byte unchanged and costs no Postgres round trip. A request that carries a `PRAGMA` statement (admin only) still runs statement by statement, because several pragmas do nothing inside a transaction. Single-statement requests are unchanged. Telemetry: such a request counts two more native SQL calls (the `SAVEPOINT` and its `RELEASE` or `ROLLBACK`). No migration.
