@@ -230,7 +230,7 @@ mod tests {
     use crate::migrations::Migrator;
     use crate::models::space;
     use crate::storage::memory::MemoryStore;
-    use crate::test_support::PostgresTestSchema;
+    use crate::test_support::{PostgresTestDatabase, PostgresTestSchema};
     use crate::SpaceDatabase;
     use sea_orm::{DatabaseConnection, TransactionTrait};
     use sea_orm_migration::MigratorTrait;
@@ -601,7 +601,8 @@ mod tests {
             .position(|migration| migration.name() == "m20261007_010000_database_identity_fence")
             .unwrap() as u32
             + 1;
-        let Some(fixture) = PostgresTestSchema::migrated_through(test, Some(v1_20_6)).await else {
+        let Some(fixture) = PostgresTestDatabase::migrated_through(test, Some(v1_20_6)).await
+        else {
             return;
         };
         let conn = &fixture.conn;
@@ -636,7 +637,13 @@ mod tests {
 
         migrate(&conn.clone().into()).await.unwrap();
 
-        let db = postgres_db(&fixture).await;
+        let db: TestDb = SpaceDatabase::new(
+            fixture.connect(15).await,
+            MemoryStore::default(),
+            StaticSecret::new([0u8; 32].to_vec()).unwrap(),
+        )
+        .await
+        .unwrap();
         assert!(db.repair_epoch_heads(&linear.space).await.unwrap());
         assert_eq!(
             cached(conn, &linear.space).await,
