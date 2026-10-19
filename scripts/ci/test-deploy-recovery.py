@@ -118,6 +118,7 @@ elif name=='git':
 elif name=='node':
     names=[line.split('=',1)[0] for line in Path('.phala-prod.env').read_text().splitlines()]
     assert 'BETTERSTACK_SOURCE_TOKEN' in names and 'QUOTA_BILLING_ADMIN_SECRET' not in names
+    data=json.loads(state.read_text()); data['values']['env_names']=names; state.write_text(json.dumps(data))
     if args[-1]=='--check': event('whitelist-check')
     else:
         event('whitelist-sync')
@@ -199,7 +200,7 @@ class SafeResult(unittest.TextTestResult):
 
 class RecoveryTests(unittest.TestCase):
     def run_deploy(self, compose=CURRENT, changes=None, *, fail_at="", artifact_error="", authority="node-override",
-                   missing_billing=False, missing_authorization=False, approved_privacy="", event="workflow_dispatch",
+                   missing_billing=False, missing_authorization=False, approved_privacy="", event="workflow_dispatch", stats_token=None,
                    ref="refs/heads/main", oci_label=None, oci_revision=None, build_digest="", releases=RELEASED, running=REVISION, order=None):
         inputs = {"deploy_phala": "true", "authorize_quota_values": "true", "image_version": "1.20.6",
                   "deploy_image_digest": DIGEST, "rollback_image_version": "1.20.6", "rollback_image_revision": REVISION,
@@ -259,6 +260,9 @@ class RecoveryTests(unittest.TestCase):
                         "QUOTA_BILLING_URL": BILLING_URL, "PHALA_ENV_TINYCLOUD_QUOTA_URL": BILLING_URL, "TEST_RELEASES": json.dumps(releases),
                         "TEST_ORDER": json.dumps(order or ORDER)})
             if running: env["RUNNING_REVISION"] = running
+            if stats_token is not None:
+                env["PHALA_ENV_NODE_STATS_READ_TOKEN"] = stats_token
+                if stats_token: CANARIES.append(stats_token)
             if missing_billing: env.pop("QUOTA_BILLING_ADMIN_SECRET")
             context = {"github.event_name": event, "github.ref": ref, "job.success": True,
                        **{"inputs." + key: (value == "true" if value in ("true", "false") else value) for key, value in inputs.items()}}
@@ -285,7 +289,8 @@ class RecoveryTests(unittest.TestCase):
             self.assertNotIn(canary, logs + report, "Sealed canary leaked")
             self.assertFalse((root / ".phala-prod.env").exists(), "Sealed env was not cleaned")
             return {"success": context["job.success"], "events": json.loads(state.read_text())["events"],
-                    "compose": compose_path.read_bytes(), "summary": report, "logs": logs}
+                    "compose": compose_path.read_bytes(), "summary": report, "logs": logs,
+                    "env_names": json.loads(state.read_text())["values"].get("env_names", [])}
 
     def test_recovery_current_pre_n0_and_reviewed_n0(self):
         for compose in (PRE_N0_TEMPLATE, PRE_N0, N0):
@@ -296,6 +301,21 @@ class RecoveryTests(unittest.TestCase):
                 self.assertEqual(result["events"].count("quota-put"), 2)
                 self.assertEqual(result["compose"], N0 if compose == N0 else PRE_N0)
                 self.assertNotIn("1.20.7", result["logs"] + result["summary"])
+
+    def test_stats_token_is_optional_and_sealed_only_when_set(self):
+        # TC-1482: an unset token must not block the deploy or reach the sealed file.
+        unset = self.run_deploy()
+        self.assertTrue(unset["success"], "An unset NODE_STATS_READ_TOKEN must not block the deploy")
+        self.assertNotIn("NODE_STATS_READ_TOKEN", unset["env_names"])
+        self.assertNotIn("NODE_STATS_READ_TOKEN", self.run_deploy(stats_token="")["env_names"])
+        token = secrets.token_urlsafe(32)
+        sealed = self.run_deploy(stats_token=token)
+        self.assertTrue(sealed["success"])
+        self.assertEqual(sealed["env_names"].count("NODE_STATS_READ_TOKEN"), 1)
+        self.assertNotIn(token, sealed["logs"] + sealed["summary"], "Stats token leaked")
+        broken = self.run_deploy(stats_token="first\nsecond")
+        self.assertFalse(broken["success"])
+        self.assertEqual(broken["events"].count("cvm-deploy"), 0, "A malformed token must fail before the CVM mutation")
 
     def test_future_digest_gets_preflight_and_general_quota_restore(self):
         result = self.run_deploy(PRE_N0_TEMPLATE, {"deploy_image_digest": "sha256:" + "a" * 64,

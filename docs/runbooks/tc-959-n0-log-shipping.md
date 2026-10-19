@@ -147,7 +147,7 @@ Keep these identities distinct:
 | Before: verifier `docker_compose_file` / hash | Raw preserved pre-N0 compose: `df239749ca0a9c09893a855ae2a8abb94090b8556515ad002105c58ac91f4c91` |
 | Before: application `compose_hash` | `bfe9028a58b23238188aa7d70b82282a7cd6414cd83dcc47a3b295c6f64fe2f8`; a distinct reported identity, not the raw-file hash |
 | After: current profile-enabled raw compose | `c33c23021589163b62a71ef245b7194717711922027629f155bdd5cff806b8c7`; bind this artifact to the final reviewed PR head before any promotion |
-| After the main release: template-locked raw compose | `1228d81927fc0a3fbba85745103e77b3112606f5d314d15974d400b222409350` (the 1.21.0 compose `d95bfb70…`, template `51f8e9e9…`, with the TC-1274 and TC-1317 regenerated Vector config); node digest normalized, template `7fabba70e71423faa2c8b61981d4a7c95ac7c2552074af81c0877af774d6b383`. See [`docs/releasing.md`](../releasing.md#main-release-with-n0-log-shipping-one-dispatch) |
+| After the main release: template-locked raw compose | `8f67b3b25136537c65b154b8729b0a1a7d9911b9963acc121a303cb9d806a6e7` (the 1.21.0 compose `d95bfb70…`, template `51f8e9e9…`, with the TC-1274 and TC-1317 regenerated Vector config and the optional TC-1482 `NODE_STATS_READ_TOKEN` env line; before that line: raw `1228d819…`, template `7fabba70…`); node digest normalized, template `ae497fed720da12219999f4bb8573fb81b235c25086c96142e87f11e948b5832`. See [`docs/releasing.md`](../releasing.md#main-release-with-n0-log-shipping-one-dispatch) |
 
 The raw after hash identifies the profile-enabled compose, not deployment approval. Record its final reviewed PR head and required CI evidence in the officer handoff. Do not infer a raw-file hash from the distinct application-reported compose hash.
 
