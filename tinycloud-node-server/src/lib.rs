@@ -1926,15 +1926,26 @@ mod retry_after_fairing_tests {
 
     #[async_trait::async_trait]
     impl tinycloud_core::database_artifacts::DatabaseArtifactRepository for StalledArtifacts {
-        async fn load(
+        async fn load_meta(
             &self,
             _: &str,
             _: &str,
             _: &str,
         ) -> Result<
-            Option<tinycloud_core::database_artifacts::DatabaseArtifact>,
+            Option<tinycloud_core::database_artifacts::ArtifactMeta>,
             tinycloud_core::database_artifacts::DatabaseArtifactError,
         > {
+            std::future::pending().await
+        }
+
+        async fn read_chunks(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &tinycloud_core::database_artifacts::ArtifactMeta,
+            _: &mut dyn tinycloud_core::database_artifacts::ArtifactSink,
+        ) -> Result<(), tinycloud_core::database_artifacts::DatabaseArtifactError> {
             std::future::pending().await
         }
 
