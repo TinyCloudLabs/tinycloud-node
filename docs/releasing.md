@@ -309,12 +309,16 @@ Before any CVM mutation the workflow requires:
 
 - the main compose, with its one node digest replaced by 64 zeros, to hash
   to the reviewed N0 template
-  **`51f8e9e93edc0e16025d27ee42abe003ed5d1cf26ba8f437d5120894aca64bdb`**
-  (raw `d95bfb707871c1d626c4a8f2b8d32d354103edbb5077847c6a21fe5f7f6cfa50` normalized: the #349 compose
+  **`7fabba70e71423faa2c8b61981d4a7c95ac7c2552074af81c0877af774d6b383`**
+  (raw `1228d81927fc0a3fbba85745103e77b3112606f5d314d15974d400b222409350` normalized: the 1.21.0 compose
+  `d95bfb707871c1d626c4a8f2b8d32d354103edbb5077847c6a21fe5f7f6cfa50`, template
+  `51f8e9e9…`, with only the embedded Vector config regenerated for TC-1274's
+  and TC-1317's warning codes; TC-1274 alone was template `00938226…`, raw
+  `b25b8414…`. That compose is the #349 compose
   `c33c23021589163b62a71ef245b7194717711922027629f155bdd5cff806b8c7`, which
-  keeps `TINYCLOUD_EPOCH_HEAD_BACKFILL__ENABLED: "false"` and #346's Vector
-  config, with only `CLIENT_MAX_BODY_SIZE=32m` → `95m`). Ingress, socat,
-  Vector and the log profile stay byte-exact;
+  keeps `TINYCLOUD_EPOCH_HEAD_BACKFILL__ENABLED: "false"`, with only
+  `CLIENT_MAX_BODY_SIZE=32m` → `95m`). Ingress, socat, Vector and the log
+  profile stay byte-exact;
 - the deployed compose to differ from that template only by
   `deploy_image_digest`;
 - OCI labels `1.21.0-dstack` / `<release-commit-sha>`, the `v1.21.0` tag on
@@ -375,8 +379,8 @@ gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref main \
 
 The served/OCI identity remains **1.20.6-dstack / e18578ff9162986ddd813259c60f73866e3e60d1**.
 With the template lock on main this redeploys exactly main's raw compose
-`d95bfb707871c1d626c4a8f2b8d32d354103edbb5077847c6a21fe5f7f6cfa50`
-(the #349 compose `c33c2302…` plus the 95m ingress body cap), whatever digest
+`1228d81927fc0a3fbba85745103e77b3112606f5d314d15974d400b222409350`
+(the 1.21.0 compose `d95bfb70…` with the TC-1274 and TC-1317 Vector config), whatever digest
 main's template currently pins. It is not a rollback of a
 later release across a schema migration. Current pre-N0 tag/pinned
 equivalents are separately hash-checked; arbitrary same-image config

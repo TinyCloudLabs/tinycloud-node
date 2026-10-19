@@ -17,7 +17,7 @@ use tinycloud_core::encryption_network::{
     NetworkDescriptor, NetworkId, Threshold, WellKnownRecord, NETWORK_CREATE_ACTION,
     NETWORK_REVOKE_ACTION,
 };
-use tinycloud_core::{events::Invocation, util::InvocationInfo};
+use tinycloud_core::{events::Invocation, util::InvocationInfo, TxError, TxStoreError};
 
 #[derive(Debug, Deserialize)]
 pub struct CreateNetworkBody {
@@ -257,7 +257,16 @@ async fn verify_auth(
         .invoke::<BlockStage>(invocation, HashMap::new())
         .await
         .map(|_| ())
-        .map_err(|err| (Status::Unauthorized, err.to_string()));
+        // Infrastructure failures are not authorization failures (TC-1317):
+        // a read-audit or transient database failure is retryable, and must
+        // not tell the client its credentials were refused.
+        .map_err(|err| match &err {
+            TxStoreError::Tx(TxError::ReadAudit(error)) => super::read_audit_failure(error),
+            TxStoreError::Tx(TxError::Db(error) | TxError::EpochInsert(error)) => {
+                super::database_failure(error, false, err.to_string())
+            }
+            _ => (Status::Unauthorized, err.to_string()),
+        });
     crate::prometheus::observe_span(
         span,
         if result.is_ok() { "ok" } else { "error" },
