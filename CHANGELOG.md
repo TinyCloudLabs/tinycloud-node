@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changes
+
+- Tests and docs (no behaviour change): a Policy/v3 root is revoked by its signer, the owner of a space its abilities touch (including a did:pkh wallet over SIWE), or the holder of a revoke control naming the space's delegations and the root's encryption network, over the generic `POST /revoke`; the JSON `RootRevocation/v1` route stays limited to the root's signer and, for the enforcement root, the enforcer. See `docs/policy-root-revocation.md` (TC-1423).
+
 ## [1.21.3] - 2026-10-19
 
 ### Release notes

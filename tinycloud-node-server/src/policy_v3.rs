@@ -10743,3 +10743,12 @@ mod tests {
 #[cfg(test)]
 #[path = "policy_v3/account_alias_tests.rs"]
 mod account_alias_tests;
+
+#[cfg(test)]
+#[macro_use]
+#[path = "policy_v3/test_harness.rs"]
+mod test_harness;
+
+#[cfg(test)]
+#[path = "policy_v3/root_revocation_tests.rs"]
+mod root_revocation_tests;
