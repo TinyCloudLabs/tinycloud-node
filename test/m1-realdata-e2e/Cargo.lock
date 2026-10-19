@@ -7771,7 +7771,7 @@ dependencies = [
 
 [[package]]
 name = "tinycloud-node"
-version = "1.21.2"
+version = "1.21.3"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -7787,6 +7787,7 @@ dependencies = [
  "clap",
  "core-foundation",
  "core-foundation-sys",
+ "ed25519-dalek 2.2.0",
  "futures",
  "hex",
  "hmac",
