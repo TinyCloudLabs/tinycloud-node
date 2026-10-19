@@ -2620,29 +2620,40 @@ where
                 })
             });
         let mut results = sync_outcome.into_iter().collect::<Vec<_>>();
-        for cap in invocation.0.capabilities.iter().filter_map(|capability| {
-            capability
-                .resource
-                .tinycloud_resource()
-                .and_then(|resource| {
-                    Some((
-                        resource.space(),
-                        resource.service().as_str(),
-                        crate::policy_capability::resolve_alias(
-                            capability.ability.as_ref().as_ref(),
-                        ),
-                        resource.path()?,
-                    ))
-                })
-        }) {
+        let caps = invocation
+            .0
+            .capabilities
+            .iter()
+            .filter_map(|capability| {
+                capability
+                    .resource
+                    .tinycloud_resource()
+                    .and_then(|resource| {
+                        Some((
+                            resource.space(),
+                            resource.service().as_str(),
+                            crate::policy_capability::resolve_alias(
+                                capability.ability.as_ref().as_ref(),
+                            ),
+                            resource.path()?,
+                        ))
+                    })
+            })
+            .collect::<Vec<_>>();
+        let mut kv_lookup = KvReadLookup::fetch(&self.conn, &caps).await;
+        for cap in caps {
             match cap {
                 (space, "kv", "tinycloud.kv/get", path) => {
-                    let data = get_kv(&self.conn, &self.storage, space, path)
+                    let data = match kv_lookup
+                        .entity(&self.conn, space, path)
                         .await
-                        .map_err(|error| match error {
-                            EitherError::A(error) => TxStoreError::Tx(error.into()),
-                            EitherError::B(error) => TxStoreError::StoreRead(error),
-                        })?;
+                        .map_err(|error| TxStoreError::Tx(error.into()))?
+                    {
+                        Some(entry) => read_kv_entity(&self.storage, space, entry)
+                            .await
+                            .map_err(TxStoreError::StoreRead)?,
+                        None => None,
+                    };
                     if let (Some(limit), Some((_, _, content))) =
                         (options.max_response_bytes, data.as_ref())
                     {
@@ -2668,7 +2679,10 @@ where
                 }
                 (space, "kv", "tinycloud.kv/metadata", path) => {
                     results.push(InvocationOutcome::KvMetadata(
-                        metadata_with_hash(&self.conn, space, path).await?,
+                        kv_lookup
+                            .entity(&self.conn, space, path)
+                            .await?
+                            .map(|entry| (entry.metadata, entry.value)),
                     ));
                 }
                 (space, "capabilities", "tinycloud.capabilities/read", path)
@@ -3923,12 +3937,20 @@ async fn get_kv<C: ConnectionTrait, B: ImmutableReadStore>(
         Some(entry) => entry,
         None => return Ok(None),
     };
-    let content_hash = e.value;
-    let c = match store
-        .read(space_id, &content_hash)
+    read_kv_entity(store, space_id, e)
         .await
-        .map_err(EitherError::B)?
-    {
+        .map_err(EitherError::B)
+}
+
+/// The stored content of a live `current_kv` row; `None` when the block is
+/// missing from the store.
+async fn read_kv_entity<B: ImmutableReadStore>(
+    store: &B,
+    space_id: &SpaceId,
+    e: current_kv::Model,
+) -> Result<Option<(Metadata, Hash, Content<B::Readable>)>, B::Error> {
+    let content_hash = e.value;
+    let c = match store.read(space_id, &content_hash).await? {
         Some(c) => c,
         None => return Ok(None),
     };
@@ -3966,6 +3988,147 @@ async fn get_kv_entity<C: ConnectionTrait>(
         start.elapsed(),
     );
     Ok(result)
+}
+
+/// Most keys one `IN (...)` statement carries where there is no array
+/// parameter (SQLite), well under its 32766-variable limit.
+const KV_LOOKUP_CHUNK: usize = 500;
+
+/// What a space's batched lookup found: the live rows by key, or the error
+/// that the first capability of that space reports.
+enum KvSpaceLookup {
+    Rows(HashMap<String, current_kv::Model>),
+    Failed(Option<DbErr>),
+}
+
+/// The live `current_kv` rows that a read invocation's `kv/get` and
+/// `kv/metadata` capabilities name (TC-1274), fetched with one statement per
+/// space instead of one per capability. Capabilities are still answered one
+/// at a time in their own order, so responses, their order, and which
+/// capability's error comes first are those of per-capability lookups: a
+/// failed statement is held and reported by the first capability of its
+/// space.
+///
+/// A space with a single capability, and every space on MySQL, keeps the
+/// per-capability point lookup (see [`KvReadLookup::entity`]). MySQL's usual
+/// collations compare keys case- and accent-insensitively, so a row cannot be
+/// matched back to the key that asked for it by comparing strings.
+struct KvReadLookup {
+    spaces: HashMap<SpaceId, KvSpaceLookup>,
+}
+
+impl KvReadLookup {
+    /// One statement per space that has at least two `kv/get` or
+    /// `kv/metadata` capabilities, in order of first appearance.
+    async fn fetch<C: ConnectionTrait>(db: &C, caps: &[(&SpaceId, &str, &str, &Path)]) -> Self {
+        let mut spaces = HashMap::new();
+        if db.get_database_backend() == DbBackend::MySql {
+            return Self { spaces };
+        }
+        let mut wanted: Vec<(&SpaceId, usize, Vec<&Path>)> = Vec::new();
+        for &(space, service, ability, path) in caps {
+            if service != "kv" || !matches!(ability, "tinycloud.kv/get" | "tinycloud.kv/metadata") {
+                continue;
+            }
+            let index = match wanted.iter().position(|(next, ..)| *next == space) {
+                Some(index) => index,
+                None => {
+                    wanted.push((space, 0, Vec::new()));
+                    wanted.len() - 1
+                }
+            };
+            let (_, requested, keys) = &mut wanted[index];
+            *requested += 1;
+            if !keys.contains(&path) {
+                keys.push(path);
+            }
+        }
+        for (space, requested, keys) in wanted {
+            if requested < 2 {
+                continue;
+            }
+            let start = Instant::now();
+            let found = get_kv_entities(db, space, &keys).await;
+            crate::telemetry::observe_stage(
+                crate::telemetry::InvocationStage::KvIndexLookup,
+                crate::telemetry::StageOutcome::from(found.is_ok()),
+                start.elapsed(),
+            );
+            spaces.insert(
+                space.clone(),
+                match found {
+                    Ok(rows) => KvSpaceLookup::Rows(rows),
+                    Err(error) => KvSpaceLookup::Failed(Some(error)),
+                },
+            );
+        }
+        Self { spaces }
+    }
+
+    /// The live row for `key` in `space`, as `get_kv_entity` would return it.
+    async fn entity<C: ConnectionTrait>(
+        &mut self,
+        db: &C,
+        space: &SpaceId,
+        key: &Path,
+    ) -> Result<Option<current_kv::Model>, DbErr> {
+        match self.spaces.get_mut(space) {
+            Some(KvSpaceLookup::Rows(rows)) => Ok(rows.get(key.as_str()).cloned()),
+            Some(KvSpaceLookup::Failed(error)) => Err(error
+                .take()
+                .unwrap_or_else(|| DbErr::Custom("KV lookup failed".to_owned()))),
+            None => get_kv_entity(db, space, key).await,
+        }
+    }
+}
+
+/// The live rows of `keys` in `space`, by key, in one statement (PostgreSQL
+/// `key = ANY($2)`) or one per `KV_LOOKUP_CHUNK` keys (SQLite `IN` lists).
+/// A key with no live row is absent from the map.
+async fn get_kv_entities<C: ConnectionTrait>(
+    db: &C,
+    space_id: &SpaceId,
+    keys: &[&Path],
+) -> Result<HashMap<String, current_kv::Model>, DbErr> {
+    let live = || {
+        current_kv::Entity::find()
+            .filter(current_kv::Column::Space.eq(SpaceIdWrap(space_id.clone())))
+            .filter(current_kv::Column::Deleted.eq(false))
+    };
+    let rows = match db.get_database_backend() {
+        DbBackend::Postgres => {
+            let keys = keys
+                .iter()
+                .map(|key| key.as_str().to_owned())
+                .collect::<Vec<_>>();
+            live()
+                .filter(Expr::cust_with_values(
+                    r#""current_kv"."key" = ANY($1)"#,
+                    [keys],
+                ))
+                .all(db)
+                .await?
+        }
+        _ => {
+            let mut rows = Vec::new();
+            for chunk in keys.chunks(KV_LOOKUP_CHUNK) {
+                rows.extend(
+                    live()
+                        .filter(
+                            current_kv::Column::Key
+                                .is_in(chunk.iter().map(|key| crate::types::Path((*key).clone()))),
+                        )
+                        .all(db)
+                        .await?,
+                );
+            }
+            rows
+        }
+    };
+    Ok(rows
+        .into_iter()
+        .map(|row| (row.key.0.as_str().to_owned(), row))
+        .collect())
 }
 
 /// Half-open `[lower, upper)` bounds selecting every `ability.resource` that
@@ -5340,6 +5503,17 @@ mod test {
     /// `kv_write` + `current_kv` projection path, one invocation per key
     /// (`invocation-{index}`). A repeated key overwrites the earlier write.
     async fn seed_kv_keys<C: ConnectionTrait>(conn: &C, name: &str, keys: &[&str]) -> SpaceId {
+        seed_kv_keys_with_ids(conn, name, keys, "").await
+    }
+
+    /// `seed_kv_keys` with `id_prefix` on its invocation and epoch ids, so a
+    /// second space can be seeded into the same database.
+    async fn seed_kv_keys_with_ids<C: ConnectionTrait>(
+        conn: &C,
+        name: &str,
+        keys: &[&str],
+        id_prefix: &str,
+    ) -> SpaceId {
         use sea_orm::ActiveValue::Set;
 
         let space = test_space_id(name);
@@ -5357,8 +5531,9 @@ mod test {
         .await
         .unwrap();
         for (index, key) in keys.iter().enumerate() {
-            let invocation_id = crate::hash::hash(format!("invocation-{index}").as_bytes());
-            let epoch_id = crate::hash::hash(format!("epoch-{index}").as_bytes());
+            let invocation_id =
+                crate::hash::hash(format!("{id_prefix}invocation-{index}").as_bytes());
+            let epoch_id = crate::hash::hash(format!("{id_prefix}epoch-{index}").as_bytes());
             invocation::ActiveModel {
                 id: Set(invocation_id),
                 invoker: Set(actor_id.clone()),
@@ -5697,6 +5872,202 @@ mod test {
             kv_list_pages(&db.conn, &space, "notes/", 1).await,
             vec![vec!["notes/a"], vec!["notes/b/c"]]
         );
+    }
+
+    /// Deterministic pseudo-random numbers for the fixture mixes.
+    struct Mix(u64);
+
+    impl Mix {
+        fn below(&mut self, bound: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % bound as u64) as usize
+        }
+    }
+
+    /// Two spaces holding the same key names: `live/00..30` readable,
+    /// `dead/00..10` deleted (tombstoned), and `absent/00..10` never written.
+    /// The rows differ between the spaces, so a lookup must not cross them.
+    async fn seed_kv_lookup_fixture<C: ConnectionTrait>(conn: &C) -> Vec<(SpaceId, Vec<Path>)> {
+        let mut spaces = Vec::new();
+        for name in ["lookup-a", "lookup-b"] {
+            let live = (0..30).map(|i| format!("live/{i:02}"));
+            let dead = (0..10).map(|i| format!("dead/{i:02}"));
+            let stored = live.chain(dead.clone()).collect::<Vec<_>>();
+            let space = seed_kv_keys_with_ids(
+                conn,
+                name,
+                &stored.iter().map(String::as_str).collect::<Vec<_>>(),
+                &format!("{name}-"),
+            )
+            .await;
+            for key in dead.clone() {
+                current_kv::Entity::update_many()
+                    .col_expr(current_kv::Column::Deleted, Expr::value(true))
+                    .filter(current_kv::Column::Space.eq(SpaceIdWrap(space.clone())))
+                    .filter(current_kv::Column::Key.eq(crate::types::Path(key.parse().unwrap())))
+                    .exec(conn)
+                    .await
+                    .unwrap();
+            }
+            let universe = stored
+                .into_iter()
+                .chain((0..10).map(|i| format!("absent/{i:02}")))
+                .map(|key| key.parse().unwrap())
+                .collect();
+            spaces.push((space, universe));
+        }
+        spaces
+    }
+
+    /// The batched lookup returns, for every capability of a read invocation,
+    /// the row that the per-capability point lookup returns: live, deleted and
+    /// absent keys, a key present in both spaces, repeated keys, `kv/get` and
+    /// `kv/metadata` mixed with other capabilities, and any number of keys.
+    async fn assert_kv_lookup_matches_point_lookups(conn: &sea_orm::DatabaseConnection) {
+        let fixture = seed_kv_lookup_fixture(conn).await;
+        let mut mix = Mix(0x9e37_79b9_7f4a_7c15);
+        for trial in 0..200 {
+            let mut requested = Vec::new();
+            for _ in 0..1 + mix.below(120) {
+                let (space, universe) = &fixture[mix.below(fixture.len())];
+                let ability = match mix.below(4) {
+                    0 => "tinycloud.kv/metadata",
+                    1 => "tinycloud.kv/list",
+                    _ => "tinycloud.kv/get",
+                };
+                requested.push((space, ability, &universe[mix.below(universe.len())]));
+            }
+            let caps = requested
+                .iter()
+                .map(|(space, ability, key)| (*space, "kv", *ability, *key))
+                .collect::<Vec<_>>();
+            let mut lookup = KvReadLookup::fetch(conn, &caps).await;
+            for (space, ability, key) in requested {
+                if ability == "tinycloud.kv/list" {
+                    continue;
+                }
+                assert_eq!(
+                    lookup.entity(conn, space, key).await.unwrap(),
+                    get_kv_entity(conn, space, key).await.unwrap(),
+                    "trial {trial}: {key} in {space}"
+                );
+            }
+        }
+    }
+
+    /// Statements `fetch` and the lookups after it send, by shape of request.
+    async fn assert_kv_lookup_statement_counts(
+        conn: &mut sea_orm::DatabaseConnection,
+        many_keys_statements: usize,
+    ) {
+        let fixture = seed_kv_lookup_fixture(conn).await;
+        let counter = Arc::new(AtomicU64::new(0));
+        let counted = Arc::clone(&counter);
+        conn.set_metric_callback(move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+        });
+        let conn = &*conn;
+        let ((space_a, keys_a), (space_b, keys_b)) = (&fixture[0], &fixture[1]);
+        let get = "tinycloud.kv/get";
+        /// `(statements sent by fetch, statements sent by fetch and all lookups)`.
+        async fn measure(
+            conn: &sea_orm::DatabaseConnection,
+            counter: &AtomicU64,
+            caps: Vec<(&SpaceId, &str, &str, &Path)>,
+        ) -> (u64, u64) {
+            let before = counter.load(Ordering::SeqCst);
+            let mut lookup = KvReadLookup::fetch(conn, &caps).await;
+            let fetched = counter.load(Ordering::SeqCst) - before;
+            for (space, _, _, key) in &caps {
+                lookup.entity(conn, space, key).await.unwrap();
+            }
+            (fetched, counter.load(Ordering::SeqCst) - before)
+        }
+
+        // One statement for a whole batch of one space, and for one key asked
+        // for repeatedly.
+        let batch = keys_a.iter().map(|key| (space_a, "kv", get, key)).collect();
+        assert_eq!(measure(conn, &counter, batch).await, (1, 1));
+        let repeated = vec![(space_a, "kv", get, &keys_a[0]); 3];
+        assert_eq!(measure(conn, &counter, repeated).await, (1, 1));
+        // One per space, whichever of the two abilities asks.
+        let two_spaces = vec![
+            (space_a, "kv", get, &keys_a[0]),
+            (space_b, "kv", "tinycloud.kv/metadata", &keys_b[1]),
+            (space_a, "kv", "tinycloud.kv/metadata", &keys_a[2]),
+            (space_b, "kv", get, &keys_b[3]),
+        ];
+        assert_eq!(measure(conn, &counter, two_spaces).await, (2, 2));
+        // A lone capability keeps its point lookup, and capabilities that
+        // are not reads of a key are not looked up at all.
+        let single = vec![(space_a, "kv", get, &keys_a[0])];
+        assert_eq!(measure(conn, &counter, single).await, (0, 1));
+        let other = vec![
+            (space_a, "kv", "tinycloud.kv/list", &keys_a[0]),
+            (space_a, "sql", get, &keys_a[1]),
+        ];
+        assert_eq!(measure(conn, &counter, other).await, (0, 2));
+
+        // More keys than one SQLite `IN` list takes.
+        let many = (0..KV_LOOKUP_CHUNK + 20)
+            .map(|i| format!("many/{i:03}").parse::<Path>().unwrap())
+            .collect::<Vec<_>>();
+        let caps = many.iter().map(|key| (space_a, "kv", get, key)).collect();
+        assert_eq!(
+            measure(conn, &counter, caps).await.0,
+            many_keys_statements as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_kv_lookup_matches_point_lookups() {
+        let db = get_db().await.unwrap();
+        assert_kv_lookup_matches_point_lookups(&db.conn).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_kv_lookup_statement_counts() {
+        let mut conn = get_db().await.unwrap().conn;
+        assert_kv_lookup_statement_counts(&mut conn, 2).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_kv_lookup_matches_point_lookups() {
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_kv_lookup_matches_point_lookups",
+        )
+        .await
+        else {
+            return;
+        };
+        assert_kv_lookup_matches_point_lookups(&fixture.conn).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_kv_lookup_statement_counts() {
+        let Some(fixture) =
+            crate::test_support::PostgresTestSchema::new("postgres_kv_lookup_statement_counts")
+                .await
+        else {
+            return;
+        };
+        // `key = ANY($2)` takes any number of keys in one statement.
+        assert_kv_lookup_statement_counts(&mut fixture.conn.clone(), 1).await;
+    }
+
+    /// A lookup that fails is not a panic or a hang: the first capability of
+    /// the space reports the error, as its own point lookup would have.
+    #[tokio::test]
+    async fn failed_kv_lookup_is_reported_by_the_capability_that_needed_it() {
+        let db = get_db().await.unwrap();
+        let fixture = seed_kv_lookup_fixture(&db.conn).await;
+        let (space, keys) = &fixture[0];
+        db.conn.clone().close().await.unwrap();
+        let caps = vec![(space, "kv", "tinycloud.kv/get", &keys[0]); 2];
+        let mut lookup = KvReadLookup::fetch(&db.conn, &caps).await;
+        assert!(lookup.entity(&db.conn, space, &keys[0]).await.is_err());
     }
 
     #[tokio::test]

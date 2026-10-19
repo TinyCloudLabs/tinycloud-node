@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changes
+
+- A read invocation of several `kv/get` or `kv/metadata` capabilities (the SDK's `batchGet` and `batchHead`) looks its keys up with one `current_kv` statement per space instead of one per capability (TC-1274). PostgreSQL uses `key = ANY($2)`; SQLite uses `IN` lists of at most 500 keys; MySQL and a space with a single capability keep the per-capability lookup (MySQL's usual collations compare keys case-insensitively, so a row cannot be matched back to the key that asked for it). Capabilities are still answered one at a time in their own order, so response bodies, their order, duplicate and missing or deleted keys, the per-key `x-tinycloud-max-response-bytes` check and which capability's error is reported first are unchanged, and a failed lookup is reported by the first capability of its space. The read-audit record, written before the data is returned, and its `invoked_abilities` rows are unchanged. A 100-key `batchGet` on PostgreSQL goes from 216 to 22 round trips and from 98 to 1 `current_kv` statements. `tinycloud-core` enables sea-orm's `postgres-array` feature for the array parameter.
+
 ## [1.21.2] - 2026-10-19
 
 ### Release notes
