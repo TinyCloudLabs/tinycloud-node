@@ -721,6 +721,13 @@ where
             .collect())
     }
 
+    /// The distinct owner addresses that hold data beyond the automatic
+    /// `account` space (TC-1482), from a single aggregate statement. See
+    /// [`crate::data_owners`] for exactly what is counted.
+    pub async fn data_owners(&self) -> Result<Vec<String>, crate::data_owners::DataOwnersError> {
+        crate::data_owners::collect(&self.conn).await
+    }
+
     /// Return lifecycle-complete delegations related to the authenticated account.
     ///
     /// The account is derived from the verified invocation signer and its one
@@ -9675,6 +9682,163 @@ mod test {
             .await
             .expect("drop isolated TC-731 collation schema");
         exercise.expect("TC-731 PostgreSQL collation resilience");
+    }
+
+    /// `EXPLAIN ANALYZE` of the `list_bounded_after` range select for
+    /// `prefix`, one line per plan row.
+    async fn explain_kv_list<C: ConnectionTrait>(
+        conn: &C,
+        space: &SpaceId,
+        prefix: &str,
+    ) -> String {
+        let prefix: Path = prefix.parse().unwrap();
+        let list = kv_list_statement(conn.get_database_backend(), space, &prefix, None, None);
+        let explain = Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            match conn.get_database_backend() {
+                DbBackend::Postgres => {
+                    format!(
+                        "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) {}",
+                        list.sql
+                    )
+                }
+                _ => format!("EXPLAIN QUERY PLAN {}", list.sql),
+            },
+            list.values.expect("list statement is parameterised").0,
+        );
+        conn.query_all(explain)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| {
+                row.try_get_by_index::<String>(0)
+                    .or_else(|_| row.try_get::<String>("", "detail"))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// TC-1274: the range select seeks on its byte-order key bounds.
+    ///
+    /// `kv_prefix_condition` compares `key COLLATE "C"`, and
+    /// `idx_current_kv_space_deleted_key` is built in the column's own
+    /// collation. Under a linguistic collation (production's `en_US.UTF-8`;
+    /// here ICU `en`, which CI's C-collated PG16 would otherwise hide) the old
+    /// index can only seek on `(space, deleted)` and filter the rest of the
+    /// space's live keys. `idx_current_kv_space_deleted_key_c` makes the
+    /// bounds index conditions, with no query change.
+    #[tokio::test]
+    async fn postgres_kv_list_range_seeks_on_the_c_collation_index() {
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_kv_list_range_seeks_on_the_c_collation_index",
+        )
+        .await
+        else {
+            return;
+        };
+        let conn = &fixture.conn;
+        conn.execute(Statement::from_string(
+            DbBackend::Postgres,
+            "CREATE COLLATION tc1274_linguistic (provider = icu, locale = 'en')".to_string(),
+        ))
+        .await
+        .unwrap();
+        conn.execute(Statement::from_string(
+            DbBackend::Postgres,
+            "ALTER TABLE current_kv ALTER COLUMN key TYPE character varying \
+             COLLATE tc1274_linguistic"
+                .to_string(),
+        ))
+        .await
+        .unwrap();
+
+        let wanted: Vec<String> = (0..20).map(|i| format!("docs/{i:03}")).collect();
+        let others: Vec<String> = (0..300).map(|i| format!("other/{i:03}")).collect();
+        let keys: Vec<&str> = wanted.iter().chain(&others).map(String::as_str).collect();
+        let space = seed_kv_keys(conn, "pg-range-index", &keys).await;
+        conn.execute(Statement::from_string(
+            DbBackend::Postgres,
+            "ANALYZE current_kv".to_string(),
+        ))
+        .await
+        .unwrap();
+
+        // Planner inputs the test controls: a table this small would be
+        // seq-scanned, and the test is about which index serves the range.
+        // Both runs are rolled back.
+        let plan = |index_present: bool, prefix: &'static str| {
+            let conn = conn.clone();
+            let space = space.clone();
+            async move {
+                let tx = conn.begin().await.unwrap();
+                tx.execute_unprepared("SET LOCAL enable_seqscan = off")
+                    .await
+                    .unwrap();
+                if !index_present {
+                    tx.execute_unprepared("DROP INDEX idx_current_kv_space_deleted_key_c")
+                        .await
+                        .unwrap();
+                }
+                let plan = explain_kv_list(&tx, &space, prefix).await;
+                tx.rollback().await.unwrap();
+                plan
+            }
+        };
+        for prefix in ["docs/", "docs"] {
+            let before = plan(false, prefix).await;
+            println!("TC-1274 plan without the C index, prefix {prefix:?}:\n{before}");
+            assert!(
+                before.contains("Rows Removed by Filter: 300"),
+                "without the C index the whole space is filtered: {before}"
+            );
+
+            let after = plan(true, prefix).await;
+            println!("TC-1274 plan with the C index, prefix {prefix:?}:\n{after}");
+            assert!(
+                after.contains("idx_current_kv_space_deleted_key_c"),
+                "{prefix:?}: {after}"
+            );
+            assert!(
+                after
+                    .lines()
+                    .any(|line| line.contains("Index Cond") && line.contains("< 'docs0'")),
+                "{prefix:?}: the key bounds are Index Cond: {after}"
+            );
+            assert!(
+                !after.contains("Rows Removed by Filter"),
+                "{prefix:?}: nothing is read and discarded: {after}"
+            );
+            assert!(!after.contains("Seq Scan"), "{prefix:?}: {after}");
+        }
+
+        // Same answers either way.
+        let listed = kv_list_pages(conn, &space, "docs", 100).await;
+        assert_eq!(listed, vec![wanted]);
+    }
+
+    /// TC-1274: SQLite needs no `COLLATE` index. Its `BINARY` bounds already
+    /// seek on `idx_current_kv_space_deleted_key` for a prefix ending in `/`,
+    /// so the migration is a no-op there. (A bare prefix is an `OR` with the
+    /// exact key, which SQLite does not seek; that is unchanged here.)
+    #[tokio::test]
+    async fn sqlite_kv_list_range_seeks_on_the_existing_index() {
+        let db = get_db().await.unwrap();
+        let space = seed_kv_keys(
+            &db.conn,
+            "sqlite-range-index",
+            &["docs/a", "docs/b", "other/a"],
+        )
+        .await;
+
+        let plan = explain_kv_list(&db.conn, &space, "docs/").await;
+        println!("TC-1274 SQLite plan:\n{plan}");
+        assert!(
+            plan.contains(
+                "idx_current_kv_space_deleted_key (space=? AND deleted=? AND key>? AND key<?)"
+            ),
+            "{plan}"
+        );
     }
 
     async fn assert_hook_prefix_filter(
