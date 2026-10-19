@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+## [1.21.2] - 2026-10-19
+
+### Release notes
+
+- Revocation authorization tightened (TC-1436, #353); revoke controls carry a typed scope (TC-1423, #356); owner exact-CID revoke grants and canonical CID targets (TC-821, #357).
+- Node CLI dispatch re-wired; unknown arguments now exit 2 (TC-1442, #355).
+- `serve` resolves provider and Auto node identities again; Auto and provider refuse to create an identity where a TEE is indicated (TC-1442, #359).
+- Docs: CLAUDE.md logging carve-out for the node's own DID (TC-961, #365).
+- No database migrations.
+- Rollback is the 1.21.1 image.
+
 ### Changes
 
 - `POST /revoke` authorizes the delegation's issuer, the owner of a space its abilities target, or the holder of a revoke control grant issued by one of them. The delegatee alone is no longer an authorized revoker, directly or through a control grant it issued; an intermediate delegator still revokes the delegations it issued. Delegation status visibility is unchanged (TC-1436).
