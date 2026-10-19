@@ -432,6 +432,7 @@ pub fn resolve_runtime_config(tinycloud_config: &Config) -> Result<Config> {
         .epoch_head_backfill
         .validate()
         .map_err(anyhow::Error::msg)?;
+    resolved.sql_store.validate().map_err(anyhow::Error::msg)?;
     tracing::RequestIdOrigins::new(&resolved.log.request_id_first_party_origins)
         .map_err(anyhow::Error::msg)?;
     resolved.storage.resolve();

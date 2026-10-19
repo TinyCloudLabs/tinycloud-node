@@ -358,16 +358,17 @@ manifest CAS commit in one transaction.
 
 ```toml
 [sql_store]
-enabled         = false      # master switch; false = nothing below runs, tables untouched
-upload_interval = "60s"      # also: TINYCLOUD_SQL_STORE__UPLOAD_INTERVAL
-upload_bytes    = "8 MiB"    # size trigger; TINYCLOUD_SQL_STORE__UPLOAD_BYTES
-backlog_cap     = "64 MiB"   # per node, un-uploaded bytes; TINYCLOUD_SQL_STORE__BACKLOG_CAP
-orphan_after    = "24h"
-enforce_backlog_cap = false  # shadow phase: count and log only (5.2)
-snapshot_every  = "24h"      # a new snapshot at most this often (cost: 1 per day per active db)
-spaces          = []         # allowlist of space IDs; EMPTY = NOTHING UPLOADS even if enabled (fail-closed)
+enabled              = false   # master switch; false = nothing below runs, tables untouched
+upload_interval_secs = 60      # TINYCLOUD_SQL_STORE__UPLOAD_INTERVAL_SECS
+upload_bytes         = "8 MiB" # size trigger; TINYCLOUD_SQL_STORE__UPLOAD_BYTES
+backlog_cap          = "64 MiB"# per node, un-uploaded bytes; TINYCLOUD_SQL_STORE__BACKLOG_CAP
+snapshot_every_secs  = 86400   # a new snapshot at most this often (1 per day per active db)
+orphan_after_secs    = 86400
+enforce_backlog_cap  = false   # shadow phase: shed and count only (5.2)
+spaces               = []      # allowlist of space IDs; EMPTY = NOTHING UPLOADS even if enabled (fail-closed)
 [sql_store.retention]
-history_days    = {}         # tier id -> days; absent = keep all. TINYCLOUD_SQL_STORE__RETENTION__HISTORY_DAYS__FREE=7
+# default_history_days = 30   # optional; absent = keep all
+history_days         = {}      # tier id -> days. TINYCLOUD_SQL_STORE__RETENTION__HISTORY_DAYS__FREE=7
 ```
 
 Env uses the repo's `TINYCLOUD_` prefix with `__` for nesting
@@ -527,7 +528,8 @@ versions; none touches these tables. Rules from #341 / #343 / #374:
   be replaced by a refusing `down`.
 - **Tables are created at boot regardless of the flag** (a migration cannot
   depend on a runtime setting), but with `enabled = false` no code reads or
-  writes them. A test asserts zero queries against them with the flag off.
+  writes them. (Slice 0 ships no reader or writer outside tests; the
+  "zero queries with the flag off" test lands with the uploader in 1b.)
 - **Downgrade (from #374):** a node refuses to start with a recorded migration
   it does not ship. Rolling back past this release means dropping **both
   tables and** `DELETE FROM seaql_migrations WHERE version =
@@ -620,15 +622,15 @@ Tick as each lands. R1–R5 gate the slice-0 merge (doc and code). R6/R7 gate 1b
 code. R8 gates enabling 1b on any node.
 
 - [x] R1 MySQL-safe schema: structured columns, `key` as `text` outside the PK (doc)
-- [ ] R1 migration + MySQL DDL test (code)
+- [x] R1 migration + MySQL DDL test (code; MySQL asserted from sea-query's MySQL output, the repo has no MySQL harness)
 - [x] R2 `base_checkpoint_cid` + `publish_id`; append only on checkpoint match; dead trigger dropped (doc)
-- [ ] R2 columns + CAS tests (code)
+- [x] R2 columns + CAS tests (code)
 - [x] R3 segment/snapshot/lineage-switch CAS written out; re-derive on loss; continue a matching lineage; first publish `ON CONFLICT DO NOTHING` (doc)
-- [ ] R3 CAS tests (code)
+- [x] R3 CAS tests (code; also run against a real PostgreSQL 14, 8-way concurrent publishers)
 - [x] R4 conditional state flips, reconciler, explicit revive (doc)
-- [ ] R4 conditional-flip tests (code)
+- [x] R4 conditional-flip tests (code)
 - [x] R5 lowercase-only alphabet, canonical decoder, proof sketch (doc)
-- [ ] R5 key code + case-folding property test (code)
+- [x] R5 key code + case-folding property test (code)
 - [x] R6 shadow-only labels and [store-master] rules (doc; gates 1b code)
 - [x] R7 capture point and bounded spool (doc; gates 1b code)
 - [x] R8 fail-closed allowlist and deletion disclosure (doc; gates 1b enablement; runbook entry still owed in 1b)
