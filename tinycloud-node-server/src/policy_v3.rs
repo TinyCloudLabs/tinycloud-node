@@ -6009,18 +6009,40 @@ fn verify_opencredentials_credential(
     // The policy names the issuer (and may pin its kid). The pair that selects
     // the pinned entry comes from the policy's issuer and the envelope kid; a
     // credential from an issuer the policy does not name never reaches a key.
+    // The lookup pair comes from the signed JWT header `kid` when present (it
+    // must then agree with the envelope kid, which in turn agrees with the
+    // policy's pinned kid). Only the header is read here, never a claim.
+    let envelope_kid = envelope
+        .get("issuerKid")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let header_kid = envelope
+        .get("credential")
+        .and_then(Value::as_str)
+        .and_then(|credential| credential.split('~').next())
+        .and_then(|compact| compact.split('.').next())
+        .and_then(|header| decode_base64url_json(header).ok())
+        .and_then(|header| header.get("kid").and_then(Value::as_str).map(str::to_owned));
+    if header_kid
+        .as_deref()
+        .is_some_and(|header_kid| header_kid != envelope_kid)
+    {
+        return Err((Status::Forbidden, "credential-signature-invalid".into()));
+    }
     let issuer = issuers
         .resolve_pinned_issuer(
             projection
                 .get("issuerDid")
                 .and_then(Value::as_str)
                 .unwrap_or_default(),
-            envelope
-                .get("issuerKid")
-                .and_then(Value::as_str)
-                .unwrap_or_default(),
+            header_kid.as_deref().unwrap_or(envelope_kid),
         )
         .ok_or((Status::Forbidden, "credential-issuer-untrusted".into()))?;
+    // Configured entries require the header `kid` (held-profile spec 3.1, 6).
+    // The legacy single-issuer entry keeps accepting a header without one.
+    if issuer.require_typ && header_kid.is_none() {
+        return Err((Status::Forbidden, "credential-signature-invalid".into()));
+    }
     let profile_id = projection
         .get("profile")
         .and_then(Value::as_object)
@@ -7297,6 +7319,75 @@ mod tests {
             &legacy_kid,
         );
         assert!(legacy_fixture.verify(&wrong, &legacy).is_err());
+    }
+
+    #[test]
+    fn issuer_set_requires_the_header_kid_and_it_must_agree_with_the_envelope() {
+        let (key_1, key_2) = (keypair(), keypair());
+        let (kid_1, kid_2) = (format!("{ORG_A}#issuing-1"), format!("{ORG_A}#issuing-2"));
+        let set = IssuerSet::load(&[
+            issuer_config(ORG_A, "issuing-1", &key_1),
+            issuer_config(ORG_A, "issuing-2", &key_2),
+        ])
+        .unwrap();
+        let unpinned = SetFixture::new(ORG_A, None, DOMAIN_PROFILE);
+        let good = unpinned.mint(
+            &key_1,
+            json!({"alg": "EdDSA", "typ": "vc+sd-jwt", "kid": kid_1}),
+            &kid_1,
+        );
+        assert!(unpinned.verify(&good, &set).is_ok());
+        // No header kid: refused on a configured entry, even though the
+        // envelope names one and the signature would verify.
+        let no_kid = unpinned.mint(&key_1, json!({"alg": "EdDSA", "typ": "vc+sd-jwt"}), &kid_1);
+        assert_eq!(
+            unpinned.verify(&no_kid, &set).err(),
+            forbidden("credential-signature-invalid")
+        );
+        // Header kid disagrees with the envelope kid, either way round.
+        for (signer, header, envelope) in [
+            (&key_1, &kid_2, &kid_1),
+            (&key_2, &kid_2, &kid_1),
+            (&key_1, &kid_1, &kid_2),
+        ] {
+            let mismatch = unpinned.mint(
+                signer,
+                json!({"alg": "EdDSA", "typ": "vc+sd-jwt", "kid": header}),
+                envelope,
+            );
+            assert_eq!(
+                unpinned.verify(&mismatch, &set).err(),
+                forbidden("credential-signature-invalid")
+            );
+        }
+        // Header and envelope agree with each other but not with the policy's
+        // pinned kid.
+        let pinned_2 = SetFixture::new(ORG_A, Some(&kid_2), DOMAIN_PROFILE);
+        assert!(pinned_2.verify(&good, &set).is_err());
+        // Legacy entry: a header without a kid still verifies, a mismatching
+        // one does not.
+        let legacy_kid = format!("{ORG_A}#controller");
+        let legacy_key = keypair();
+        let legacy = IssuerSet::from_legacy(&IssuerKey::new(
+            ORG_A,
+            "opencredentials.email/v1",
+            1,
+            legacy_kid.clone(),
+            legacy_key.public().to_bytes(),
+        ));
+        let fixture = SetFixture::new(ORG_A, Some(&legacy_kid), DOMAIN_PROFILE);
+        let bare = fixture.mint(
+            &legacy_key,
+            json!({"alg": "EdDSA", "typ": "vc+sd-jwt"}),
+            &legacy_kid,
+        );
+        assert!(fixture.verify(&bare, &legacy).is_ok());
+        let other = fixture.mint(
+            &legacy_key,
+            json!({"alg": "EdDSA", "typ": "vc+sd-jwt", "kid": kid_2}),
+            &legacy_kid,
+        );
+        assert!(fixture.verify(&other, &legacy).is_err());
     }
 
     #[test]

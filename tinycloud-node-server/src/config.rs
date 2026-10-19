@@ -689,12 +689,12 @@ fn contains_placeholder(value: &str) -> bool {
 }
 
 #[cfg(feature = "mounted-fixture")]
-fn allows_hermetic_fixture() -> bool {
+pub(crate) fn allows_hermetic_fixture() -> bool {
     true
 }
 
 #[cfg(not(feature = "mounted-fixture"))]
-fn allows_hermetic_fixture() -> bool {
+pub(crate) fn allows_hermetic_fixture() -> bool {
     false
 }
 
@@ -737,7 +737,7 @@ fn is_repeated_test_key(value: Option<&str>) -> bool {
     bytes.len() == 32 && bytes.windows(2).all(|pair| pair[0] == pair[1])
 }
 
-fn is_fixture_public_key(value: &str) -> bool {
+pub(crate) fn is_fixture_public_key(value: &str) -> bool {
     const FROZEN_NODE_PUBLIC_KEY: &str = "IVL40Zt5HSRFMkLhXy6rbLfP-ntqXtMAl5YOBpiB2xI";
     const FROZEN_ISSUER_PUBLIC_KEY: &str = "Ivwpd5Lwtv_Av8_bftsMCqFOAlo2XsDjQuhuOCnLdLY";
     value == FROZEN_NODE_PUBLIC_KEY

@@ -37,6 +37,10 @@ pub enum IssuerSetError {
         "issuer set entry {index}: publicKey must be a canonical 32-byte Ed25519 key in base64url"
     )]
     PublicKey { index: usize },
+    #[error("issuer set entry {index}: publicKey is a fixture or repeated-byte test key")]
+    FixtureKey { index: usize },
+    #[error("issuer set entry {index}: publicKey is already pinned by another entry")]
+    DuplicatePublicKey { index: usize },
     #[error(
         "issuer set entry {index}: vcts and profiles must be non-empty lists of non-empty strings"
     )]
@@ -45,6 +49,10 @@ pub enum IssuerSetError {
     Time { index: usize, field: &'static str },
     #[error("issuer set entry {index}: retiredAt is after notAfter")]
     RetiredAfterNotAfter { index: usize },
+    #[error(
+        "issuer set entry {index}: notBefore is after notAfter, or retiredAt is before notBefore"
+    )]
+    EmptyWindow { index: usize },
 }
 
 /// One configured issuer, as written in configuration (camelCase, matching the
@@ -209,6 +217,15 @@ impl IssuerSet {
         {
             return Err(IssuerSetError::DuplicateKid { index });
         }
+        // One key under two kids would let the unsigned envelope pick the
+        // more permissive entry for the same signature.
+        if self
+            .entries
+            .values()
+            .any(|existing| existing.public_key == entry.public_key)
+        {
+            return Err(IssuerSetError::DuplicatePublicKey { index });
+        }
         self.entries
             .insert((entry.issuer_did.clone(), entry.kid.clone()), entry);
         Ok(())
@@ -240,6 +257,13 @@ fn parse_entry(
     }
     if !kid_matches(&config.kid, &config.issuer_did) {
         return Err(IssuerSetError::Kid { index });
+    }
+    // The fixture seeds are public: a pasted fixture key would let anyone mint
+    // credentials the node admits. Only the hermetic fixture build keeps them.
+    if !crate::config::allows_hermetic_fixture()
+        && crate::config::is_fixture_public_key(&config.public_key)
+    {
+        return Err(IssuerSetError::FixtureKey { index });
     }
     let public_key =
         canonical_ed25519_key(&config.public_key).ok_or(IssuerSetError::PublicKey { index })?;
@@ -275,6 +299,11 @@ fn parse_entry(
         if retired > stop {
             return Err(IssuerSetError::RetiredAfterNotAfter { index });
         }
+    }
+    if not_after.is_some_and(|stop| not_before > stop)
+        || retired_at.is_some_and(|retired| retired < not_before)
+    {
+        return Err(IssuerSetError::EmptyWindow { index });
     }
     Ok(IssuerSetEntry {
         issuer_did: config.issuer_did.clone(),
@@ -328,9 +357,10 @@ fn canonical_ed25519_key(text: &str) -> Option<[u8; 32]> {
     (key.to_bytes() == bytes && !key.is_weak()).then_some(bytes)
 }
 
-/// The DID-method allow-list (`docs/principles.md`, principle 2): `did:key`,
-/// `did:jwk`, `did:pkh` on `eip155`, and `did:web` for pinned issuers only.
-/// Anything else is refused without a lookup.
+/// The DID methods an issuer may use (`docs/principles.md`, principle 2): only
+/// `did:web`, for issuers TinyCloud lists, with the key pinned here. The other
+/// allow-listed methods (`did:key`, `did:jwk`, `did:pkh`) identify subjects, not
+/// issuers. Anything else is refused without a lookup.
 pub fn did_method_allowed(did: &str) -> bool {
     did_is_canonical(did)
 }
@@ -351,12 +381,9 @@ fn did_is_canonical(did: &str) -> bool {
                         .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
             });
     }
-    if let Some(id) = did.strip_prefix("did:pkh:eip155:") {
-        return !id.is_empty();
-    }
-    ["did:key:", "did:jwk:"]
-        .iter()
-        .any(|prefix| did.strip_prefix(prefix).is_some_and(|id| !id.is_empty()))
+    // did:key and did:jwk are self-describing but the node has no option to
+    // trust one as an issuer, and did:pkh is for subjects only (principle 2).
+    false
 }
 
 #[cfg(test)]
@@ -449,6 +476,9 @@ mod tests {
             "did:ion:abc",
             "did:tz:tz1abc",
             "did:pkh:solana:abc",
+            "did:key:z6MkehRgf7yJbgaGfYsdoAsKdBPE3dj2CYhowQdcjqSJgvVd",
+            "did:jwk:eyJ",
+            "did:pkh:eip155:1:0xabc",
             "did:web:Issuer.Credentials.org",
             "did:web:issuer.credentials.org%3A8443",
             "did:web:issuer.credentials.org:path",
@@ -462,9 +492,7 @@ mod tests {
             );
             assert!(!did_method_allowed(bad), "{bad}");
         }
-        for good in ["did:key:z6Mk", "did:jwk:eyJ", "did:pkh:eip155:1:0xabc", DID] {
-            assert!(did_method_allowed(good), "{good}");
-        }
+        assert!(did_method_allowed(DID));
         let set = IssuerSet::load(&[entry(DID, "k", 1)]).unwrap();
         assert!(set
             .resolve_pinned_issuer("did:ethr:0xabc", "did:ethr:0xabc#k")
@@ -635,6 +663,84 @@ mod tests {
             );
         }
         assert!(IssuerSet::load(&[entry(DID, "k", 1)]).is_ok());
+    }
+
+    #[test]
+    fn refuses_empty_validity_windows() {
+        let mut bad = entry(DID, "k", 1);
+        bad.not_after = Some("2026-09-30T00:00:00Z".into());
+        assert_eq!(
+            IssuerSet::load(&[bad]).unwrap_err(),
+            IssuerSetError::EmptyWindow { index: 0 }
+        );
+        let mut bad = entry(DID, "k", 1);
+        bad.retired_at = Some("2026-09-30T00:00:00Z".into());
+        assert_eq!(
+            IssuerSet::load(&[bad]).unwrap_err(),
+            IssuerSetError::EmptyWindow { index: 0 }
+        );
+        // Equal bounds are degenerate but not inverted.
+        let mut edge = entry(DID, "k", 1);
+        edge.not_after = Some("2026-10-01T00:00:00Z".into());
+        edge.retired_at = Some("2026-10-01T00:00:00Z".into());
+        assert!(IssuerSet::load(&[edge]).is_ok());
+    }
+
+    #[test]
+    fn refuses_one_public_key_pinned_twice() {
+        let a = entry(DID, "issuing-1", 1);
+        let mut b = entry("did:web:acme.credentials.org", "issuing-1", 1);
+        assert_eq!(
+            IssuerSet::load(&[a.clone(), b.clone()]).unwrap_err(),
+            IssuerSetError::DuplicatePublicKey { index: 1 }
+        );
+        b.issuer_did = DID.into();
+        b.kid = format!("{DID}#issuing-2");
+        assert_eq!(
+            IssuerSet::load(&[a.clone(), b]).unwrap_err(),
+            IssuerSetError::DuplicatePublicKey { index: 1 }
+        );
+        // Also against the legacy entry.
+        let legacy = IssuerKey::new(
+            "did:web:legacy.credentials.org",
+            "opencredentials.email/v1",
+            1,
+            "did:web:legacy.credentials.org#controller",
+            decode_config(&a.public_key, URL_SAFE_NO_PAD)
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(
+            IssuerSet::load_with_legacy(&[a], Some(&legacy)).unwrap_err(),
+            IssuerSetError::DuplicatePublicKey { index: 1 }
+        );
+    }
+
+    #[cfg(not(feature = "mounted-fixture"))]
+    #[test]
+    fn refuses_fixture_and_repeated_byte_keys_in_a_production_build() {
+        for key in [
+            "Ivwpd5Lwtv_Av8_bftsMCqFOAlo2XsDjQuhuOCnLdLY",
+            "IVL40Zt5HSRFMkLhXy6rbLfP-ntqXtMAl5YOBpiB2xI",
+            &encode_config([0x43u8; 32], URL_SAFE_NO_PAD),
+        ] {
+            let mut bad = entry(DID, "k", 1);
+            bad.public_key = key.into();
+            assert_eq!(
+                IssuerSet::load(&[bad]).unwrap_err(),
+                IssuerSetError::FixtureKey { index: 0 },
+                "{key}"
+            );
+        }
+    }
+
+    #[cfg(feature = "mounted-fixture")]
+    #[test]
+    fn accepts_the_frozen_fixture_key_only_in_the_hermetic_fixture_build() {
+        let mut fixture = entry(DID, "k", 1);
+        fixture.public_key = "Ivwpd5Lwtv_Av8_bftsMCqFOAlo2XsDjQuhuOCnLdLY".into();
+        assert!(IssuerSet::load(&[fixture]).is_ok());
     }
 
     #[test]
