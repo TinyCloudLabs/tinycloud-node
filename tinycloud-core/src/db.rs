@@ -721,6 +721,13 @@ where
             .collect())
     }
 
+    /// The distinct owner addresses that hold data beyond the automatic
+    /// `account` space (TC-1482), from a single aggregate statement. See
+    /// [`crate::data_owners`] for exactly what is counted.
+    pub async fn data_owners(&self) -> Result<Vec<String>, crate::data_owners::DataOwnersError> {
+        crate::data_owners::collect(&self.conn).await
+    }
+
     /// Return lifecycle-complete delegations related to the authenticated account.
     ///
     /// The account is derived from the verified invocation signer and its one

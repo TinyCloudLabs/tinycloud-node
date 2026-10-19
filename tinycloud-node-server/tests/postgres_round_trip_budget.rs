@@ -1095,6 +1095,136 @@ async fn postgres_round_trip_budget() {
     );
 }
 
+/// TC-1482: `GET /admin/stats` answers from one statement however many spaces
+/// the node holds. Its round trips are counted with 3 spaces and again with
+/// 303 and must be equal, and the window must hold exactly one statement:
+/// the `/admin/usage` shape (one `store_size` call per space) would grow with
+/// the space count and fail both checks.
+///
+/// Measured on PostgreSQL: 2 round trips per request, the statement itself
+/// and sqlx's release ping, with exactly 1 statement.
+const ADMIN_STATS_BUDGET: u64 = 2;
+const ADMIN_STATS_TOKEN: &str = "tc1482-round-trip-token-6e1f0b3a9c5d8274";
+
+/// `count` spaces named from `first`, each owned by its own address and
+/// holding one live key, inserted by two statements outside the proxy.
+async fn seed_stats_spaces(seed: &impl ConnectionTrait, first: u64, count: u64) -> Result<()> {
+    let last = first + count - 1;
+    let id = "'tinycloud:pkh:eip155:1:0x' || lpad(to_hex(g), 40, '0') || ':default'";
+    for sql in [
+        format!("INSERT INTO space (id) SELECT {id} FROM generate_series({first}, {last}) g"),
+        format!(
+            "INSERT INTO current_kv (space, key, invocation, seq, epoch, epoch_seq, value, \
+             metadata, deleted) SELECT {id}, 'k', '\\x01'::bytea, 1, '\\x02'::bytea, 1, \
+             '\\x03'::bytea, '{{}}'::json, false FROM generate_series({first}, {last}) g"
+        ),
+    ] {
+        seed.execute(Statement::from_string(DbBackend::Postgres, sql))
+            .await?;
+    }
+    Ok(())
+}
+
+async fn measure_stats(node: &Node, expected_owners: u64) -> Result<Window> {
+    let mut out = Vec::new();
+    let request = node.client.get("/admin/stats").header(Header::new(
+        "Authorization",
+        format!("Bearer {ADMIN_STATS_TOKEN}"),
+    ));
+    let (status, body) = node
+        .measure("admin stats", "GET /admin/stats", request, &mut out)
+        .await?;
+    ensure!(status == Status::Ok, "GET /admin/stats answered {status}");
+    let body: serde_json::Value = serde_json::from_str(&body)?;
+    ensure!(
+        body["count"] == expected_owners,
+        "expected {expected_owners} owners, the route returned {}",
+        body["count"]
+    );
+    Ok(out.pop().context("no measured window")?.window)
+}
+
+async fn admin_stats_windows(url: &str, schema: &str) -> Result<(Window, Window)> {
+    let (node, _datadir) = start_node(url, schema, Cut::default(), Some(POOL_SIZE)).await?;
+    let result = async {
+        node.open_pool(POOL_SIZE).await?;
+        let mut scoped = reqwest::Url::parse(url)?;
+        scoped
+            .query_pairs_mut()
+            .append_pair("options", &format!("-c search_path={schema}"));
+        let seed = Database::connect(scoped.as_str()).await?;
+
+        seed_stats_spaces(&seed, 1, 3).await?;
+        // Prepare the statement on every pooled connection first.
+        for _ in 0..(2 * POOL_SIZE) {
+            measure_stats(&node, 3).await?;
+        }
+        let few = measure_stats(&node, 3).await?;
+
+        seed_stats_spaces(&seed, 1_000, 300).await?;
+        let many = measure_stats(&node, 303).await?;
+        seed.close().await?;
+        Ok((few, many))
+    }
+    .await;
+    node.pool().close().await;
+    result
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_admin_stats_is_one_round_trip_for_any_space_count() {
+    let Some(url) = postgres_test_url("postgres_admin_stats_is_one_round_trip") else {
+        return;
+    };
+    let admin = Database::connect(url.as_str())
+        .await
+        .expect("connect to PostgreSQL");
+    let schema = format!(
+        "tc1482_rt_{}_{}",
+        std::process::id(),
+        time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+    );
+    admin
+        .execute(Statement::from_string(
+            DbBackend::Postgres,
+            format!("CREATE SCHEMA {schema}"),
+        ))
+        .await
+        .expect("create the isolated schema");
+    std::env::set_var("NODE_STATS_READ_TOKEN", ADMIN_STATS_TOKEN);
+    let result = admin_stats_windows(&url, &schema).await;
+    std::env::remove_var("NODE_STATS_READ_TOKEN");
+    admin
+        .execute(Statement::from_string(
+            DbBackend::Postgres,
+            format!("DROP SCHEMA {schema} CASCADE"),
+        ))
+        .await
+        .expect("drop the isolated schema");
+    let (few, many) = result.expect("measure GET /admin/stats");
+
+    let (few_counts, many_counts) = (few.counts(), many.counts());
+    let mut report = String::from("TC-1482 GET /admin/stats\n  3 spaces:\n");
+    few.describe(&mut report);
+    let _ = writeln!(report, "  303 spaces:");
+    many.describe(&mut report);
+    println!("{report}");
+    assert_eq!(
+        (few_counts.round_trips, few_counts.statements),
+        (many_counts.round_trips, many_counts.statements),
+        "the round trips must not depend on the number of spaces:\n{report}"
+    );
+    assert_eq!(
+        many_counts.statements, 1,
+        "GET /admin/stats must run exactly one statement:\n{report}"
+    );
+    assert_eq!(
+        many_counts.round_trips, ADMIN_STATS_BUDGET,
+        "round trips changed from the budget:\n{report}"
+    );
+    assert_eq!(many_counts.connections, 0, "opened a connection:\n{report}");
+}
+
 /// A signed session for `account`, with the same abilities the SDK asks for.
 fn new_session(account: &Account) -> Result<Session> {
     let now = time::OffsetDateTime::now_utc();
