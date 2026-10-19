@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Changes
+
+- `/admin/stats` is a logged route label (TC-1482). The log shipper and the ingress log it as the route template plus status only, with no query string, `Authorization` header, request or response body, or client address (TC-961).
+  - **N0 compose.** The embedded Vector configuration is regenerated for the new route, so the reviewed N0 compose template changes to `57ab0cb6…` (raw `e38da34f…`; `docs/releasing.md`).
+  - **Ingress.** The `/admin/stats` label takes effect once the ingress image is rebuilt from `deploy/ingress` and its digest is pinned in the compose; until then the deployed ingress logs it as `<other>`.
+
 ## [1.21.1] - 2026-10-19
 
 ### Release notes
