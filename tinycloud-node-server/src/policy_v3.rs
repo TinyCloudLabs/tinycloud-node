@@ -5,6 +5,7 @@
 //! policy-session UCAN: the sibling-root registration, signed status, the
 //! challenge/claim replay boundary, and the first-admission gate.
 
+use crate::issuer_set::{IssuerSet, IssuerWindowError};
 use aes_gcm::{
     aead::{Aead, KeyInit, Payload as AeadPayload},
     Aes256Gcm, Nonce,
@@ -105,7 +106,7 @@ pub struct PolicyV3Runtime {
     pub conn: RecoveringConnection,
     pub node_did: String,
     signer: StaticSecret,
-    credential_issuer: Option<IssuerKey>,
+    credential_issuers: IssuerSet,
     delivery: Option<DeliveryRuntime>,
     sqlite_writer_lock: Option<Arc<tokio::sync::Mutex<()>>>,
 }
@@ -120,7 +121,7 @@ impl PolicyV3Runtime {
             conn: conn.into(),
             node_did: node_did.into(),
             signer,
-            credential_issuer: None,
+            credential_issuers: IssuerSet::default(),
             delivery: None,
             sqlite_writer_lock: None,
         }
@@ -131,11 +132,17 @@ impl PolicyV3Runtime {
         self
     }
 
-    /// Install the operator-authenticated OpenCredentials issuer tuple used
-    /// by policy/v2 admission. Policy/v1 remains available without it.
-    pub fn with_credential_issuer(mut self, issuer: IssuerKey) -> Self {
-        self.credential_issuer = Some(issuer);
+    /// Install the operator-pinned credential issuer set used by policy/v2
+    /// admission. Policy/v1 remains available without it.
+    pub fn with_credential_issuers(mut self, issuers: IssuerSet) -> Self {
+        self.credential_issuers = issuers;
         self
+    }
+
+    /// Install one OpenCredentials issuer as a one-entry set (the legacy
+    /// single-issuer configuration).
+    pub fn with_credential_issuer(self, issuer: IssuerKey) -> Self {
+        self.with_credential_issuers(IssuerSet::from_legacy(&issuer))
     }
 
     /// Configure the Node-owned, proof-producing delivery boundary. The
@@ -4249,7 +4256,14 @@ fn validate_policy_credential_requirement(
         "profile",
         "credentialType",
     ];
-    if object.len() != KEYS.len()
+    // `issuerKid` is optional: a policy always names the issuer and may also
+    // pin one of its keys. Every other key is required.
+    let expected_keys = if object.contains_key("issuerKid") {
+        KEYS.len()
+    } else {
+        KEYS.len() - 1
+    };
+    if object.len() != expected_keys
         || object.keys().any(|key| !KEYS.contains(&key.as_str()))
         || object.get("type").and_then(Value::as_str) != Some(POLICY_CREDENTIAL_REQUIREMENT_V1)
         || object.get("version").and_then(Value::as_u64) != Some(1)
@@ -4267,8 +4281,7 @@ fn validate_policy_credential_requirement(
             .is_none_or(|value| !value.starts_with("did:"))
         || object
             .get("issuerKid")
-            .and_then(Value::as_str)
-            .is_none_or(str::is_empty)
+            .is_some_and(|kid| kid.as_str().is_none_or(str::is_empty))
         || !versioned_identifier(object.get("profile"))
         || !versioned_identifier(object.get("credentialType"))
     {
@@ -5556,15 +5569,17 @@ fn validate_credential_admission_v3(
             .ok_or((Status::Forbidden, "credential-requirement-missing".into()))?,
     )?;
     validate_request_local_requirement(requirement, projection)?;
-    let issuer = runtime.credential_issuer.as_ref().ok_or((
-        Status::ServiceUnavailable,
-        "credential-issuer-unavailable".into(),
-    ))?;
+    if runtime.credential_issuers.is_empty() {
+        return Err((
+            Status::ServiceUnavailable,
+            "credential-issuer-unavailable".into(),
+        ));
+    }
     let verified = verify_opencredentials_credential(
         credential,
         requirement,
         projection,
-        issuer,
+        &runtime.credential_issuers,
         context.recipient_did,
         context.now,
     )?;
@@ -5675,15 +5690,17 @@ fn validate_credential_admission_v4(
             .ok_or((Status::Forbidden, "credential-requirement-missing".into()))?,
     )?;
     validate_request_local_requirement(requirement, projection)?;
-    let issuer = runtime.credential_issuer.as_ref().ok_or((
-        Status::ServiceUnavailable,
-        "credential-issuer-unavailable".into(),
-    ))?;
+    if runtime.credential_issuers.is_empty() {
+        return Err((
+            Status::ServiceUnavailable,
+            "credential-issuer-unavailable".into(),
+        ));
+    }
     let verified = verify_opencredentials_credential(
         credential,
         requirement,
         projection,
-        issuer,
+        &runtime.credential_issuers,
         context.recipient_did,
         context.now,
     )?;
@@ -5880,7 +5897,6 @@ struct VerifiedOpenCredential {
 
 fn pinned_profile_status_freshness_seconds(
     projection: &serde_json::Map<String, Value>,
-    trusted_issuer: &IssuerKey,
 ) -> Option<i64> {
     let profile = projection
         .get("profile")
@@ -5898,20 +5914,27 @@ fn pinned_profile_status_freshness_seconds(
     (matches!(
         profile,
         Some("tinycloud.email-proof/v1" | "tinycloud.email-domain-proof/v1")
-    ) && credential_type == Some("opencredentials.email/v1")
-        && trusted_issuer.vct == "opencredentials.email/v1")
-        .then_some(EMAIL_PROOF_STATUS_FRESHNESS_SECONDS)
+    ) && credential_type == Some("opencredentials.email/v1"))
+    .then_some(EMAIL_PROOF_STATUS_FRESHNESS_SECONDS)
+}
+
+fn issuer_window_code(error: IssuerWindowError) -> &'static str {
+    match error {
+        IssuerWindowError::NotYetValid => "credential-issuer-not-yet-valid",
+        IssuerWindowError::Stopped => "credential-issuer-stopped",
+        IssuerWindowError::Retired => "credential-issuer-retired",
+    }
 }
 
 fn verify_opencredentials_credential(
     envelope: &Value,
     requirement: &Value,
     projection: &serde_json::Map<String, Value>,
-    trusted_issuer: &IssuerKey,
+    issuers: &IssuerSet,
     expected_holder: &str,
     now: OffsetDateTime,
 ) -> Result<VerifiedOpenCredential, (Status, String)> {
-    if !trusted_issuer.enabled || trusted_issuer.key_version == 0 {
+    if issuers.is_empty() {
         return Err((Status::Forbidden, "credential-issuer-untrusted".into()));
     }
     let envelope = envelope
@@ -5958,11 +5981,13 @@ fn verify_opencredentials_credential(
                 .and_then(Value::as_str)
         || envelope.get("issuerDid").and_then(Value::as_str)
             != projection.get("issuerDid").and_then(Value::as_str)
-        || envelope.get("issuerKid").and_then(Value::as_str)
-            != projection.get("issuerKid").and_then(Value::as_str)
-        || envelope.get("issuerDid").and_then(Value::as_str)
-            != Some(trusted_issuer.issuer_did.as_str())
-        || envelope.get("issuerKid").and_then(Value::as_str) != Some(trusted_issuer.kid.as_str())
+        || projection
+            .get("issuerKid")
+            .is_some_and(|named| envelope.get("issuerKid") != Some(named))
+        || envelope
+            .get("issuerKid")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
         || envelope.get("subjectDid").and_then(Value::as_str) != Some(expected_holder)
         || envelope.get("holderDid").and_then(Value::as_str) != Some(expected_holder)
         || envelope.get("descriptorDigest").and_then(Value::as_str)
@@ -5981,6 +6006,61 @@ fn verify_opencredentials_credential(
     {
         return Err((Status::Forbidden, "credential-envelope-invalid".into()));
     }
+    // The policy names the issuer (and may pin its kid). The pair that selects
+    // the pinned entry comes from the policy's issuer and the envelope kid; a
+    // credential from an issuer the policy does not name never reaches a key.
+    // The lookup pair comes from the signed JWT header `kid` when present (it
+    // must then agree with the envelope kid, which in turn agrees with the
+    // policy's pinned kid). Only the header is read here, never a claim.
+    let envelope_kid = envelope
+        .get("issuerKid")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let header_kid = envelope
+        .get("credential")
+        .and_then(Value::as_str)
+        .and_then(|credential| credential.split('~').next())
+        .and_then(|compact| compact.split('.').next())
+        .and_then(|header| decode_base64url_json(header).ok())
+        .and_then(|header| header.get("kid").and_then(Value::as_str).map(str::to_owned));
+    if header_kid
+        .as_deref()
+        .is_some_and(|header_kid| header_kid != envelope_kid)
+    {
+        return Err((Status::Forbidden, "credential-signature-invalid".into()));
+    }
+    let issuer = issuers
+        .resolve_pinned_issuer(
+            projection
+                .get("issuerDid")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            header_kid.as_deref().unwrap_or(envelope_kid),
+        )
+        .ok_or((Status::Forbidden, "credential-issuer-untrusted".into()))?;
+    // Configured entries require the header `kid` (held-profile spec 3.1, 6).
+    // The legacy single-issuer entry keeps accepting a header without one.
+    if issuer.require_typ && header_kid.is_none() {
+        return Err((Status::Forbidden, "credential-signature-invalid".into()));
+    }
+    let profile_id = projection
+        .get("profile")
+        .and_then(Value::as_object)
+        .and_then(|value| value.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let credential_type_id = projection
+        .get("credentialType")
+        .and_then(Value::as_object)
+        .and_then(|value| value.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !issuer.admits(credential_type_id, profile_id) {
+        return Err((Status::Forbidden, "credential-issuer-untrusted".into()));
+    }
+    issuer
+        .check_now(now)
+        .map_err(|error| (Status::Forbidden, issuer_window_code(error).into()))?;
     let credential = envelope
         .get("credential")
         .and_then(Value::as_str)
@@ -5998,12 +6078,13 @@ fn verify_opencredentials_credential(
     let header = decode_base64url_json(jwt[0])?;
     let payload = decode_base64url_json(jwt[1])?;
     if header.get("alg").and_then(Value::as_str) != Some("EdDSA")
-        || header
-            .get("typ")
-            .is_some_and(|value| value.as_str() != Some("vc+sd-jwt"))
+        || match header.get("typ") {
+            Some(value) => value.as_str() != Some("vc+sd-jwt"),
+            None => issuer.require_typ,
+        }
         || header
             .get("kid")
-            .is_some_and(|value| value.as_str() != Some(trusted_issuer.kid.as_str()))
+            .is_some_and(|value| value.as_str() != Some(issuer.kid.as_str()))
     {
         return Err((Status::Forbidden, "credential-signature-invalid".into()));
     }
@@ -6012,10 +6093,20 @@ fn verify_opencredentials_credential(
         return Err((Status::Forbidden, "credential-signature-invalid".into()));
     }
     verify_issuer_signature(
-        &trusted_issuer.public_key,
+        &issuer.public_key,
         format!("{}.{}", jwt[0], jwt[1]).as_bytes(),
         &signature,
     )?;
+    // Only now is the signed `iat` trusted: a key retired before this
+    // credential was issued, or not yet valid when it was, cannot vouch for it.
+    let signed_iat = payload
+        .get("iat")
+        .and_then(Value::as_i64)
+        .and_then(|iat| OffsetDateTime::from_unix_timestamp(iat).ok())
+        .ok_or((Status::Forbidden, "credential-time-invalid".into()))?;
+    issuer
+        .check_issued_at(signed_iat)
+        .map_err(|error| (Status::Forbidden, issuer_window_code(error).into()))?;
     let mut disclosed = payload
         .as_object()
         .cloned()
@@ -6060,9 +6151,9 @@ fn verify_opencredentials_credential(
             Status::Forbidden,
             "credential-holder-binding-invalid".into(),
         ))?;
-    if disclosed.get("iss").and_then(Value::as_str) != Some(trusted_issuer.issuer_did.as_str())
+    if disclosed.get("iss").and_then(Value::as_str) != Some(issuer.issuer_did.as_str())
         || disclosed.get("sub").and_then(Value::as_str) != Some(expected_holder)
-        || disclosed.get("vct").and_then(Value::as_str) != Some(trusted_issuer.vct.as_str())
+        || disclosed.get("vct").and_then(Value::as_str) != Some(credential_type_id)
         || disclosed.get("profile").and_then(Value::as_str)
             != projection
                 .get("profile")
@@ -6107,7 +6198,7 @@ fn verify_opencredentials_credential(
         envelope,
         &disclosed,
         requirement,
-        pinned_profile_status_freshness_seconds(projection, trusted_issuer),
+        pinned_profile_status_freshness_seconds(projection),
         now,
     )?;
     let credential_id = disclosed
@@ -6994,6 +7085,34 @@ mod tests {
         envelope_domain: &str,
         issued: OffsetDateTime,
     ) -> Value {
+        let header = json!({"alg": "EdDSA", "typ": "vc+sd-jwt", "kid": projection["issuerKid"]});
+        email_domain_credential_with_header(
+            issuer_key,
+            projection,
+            holder,
+            email,
+            signed_domain,
+            envelope_domain,
+            issued,
+            header,
+            projection["issuerKid"].clone(),
+        )
+    }
+
+    /// As [`email_domain_credential`], with the signed JWT header and the
+    /// unsigned envelope `issuerKid` chosen by the caller.
+    #[allow(clippy::too_many_arguments)]
+    fn email_domain_credential_with_header(
+        issuer_key: &tinycloud_core::libp2p::identity::ed25519::Keypair,
+        projection: &Value,
+        holder: &str,
+        email: &str,
+        signed_domain: &str,
+        envelope_domain: &str,
+        issued: OffsetDateTime,
+        header: Value,
+        envelope_kid: Value,
+    ) -> Value {
         let disclose = |salt: &str, name: &str, value: &str| {
             encode_config(
                 canonical_json_value(&json!([salt, name, value])),
@@ -7015,7 +7134,6 @@ mod tests {
             "holderBinding": {"did": holder, "signingDomain": "tinycloud.credentials/holder-binding/v1"},
             "_sd_alg": "sha-256", "_sd": [digest(&email_disclosure), digest(&domain_disclosure)]
         });
-        let header = json!({"alg": "EdDSA", "typ": "vc+sd-jwt", "kid": projection["issuerKid"]});
         let signing_input = format!(
             "{}.{}",
             encode_config(canonical_json_value(&header), URL_SAFE_NO_PAD),
@@ -7031,7 +7149,7 @@ mod tests {
             "protocol": "tinycloud.credentials/acquisition/v1",
             "profile": projection["profile"], "credentialType": projection["credentialType"],
             "schema": "opencredentials.email/v1", "format": "vc+sd-jwt",
-            "issuerDid": projection["issuerDid"], "issuerKid": projection["issuerKid"],
+            "issuerDid": projection["issuerDid"], "issuerKid": envelope_kid,
             "subjectDid": holder, "holderDid": holder,
             "claims": claims, "claimsDigest": canonical_digest_base64url(&claims),
             "descriptorDigest": projection["descriptorDigest"], "credentialId": "credential-email-domain",
@@ -7039,6 +7157,398 @@ mod tests {
             "status": {"method": "none", "freshnessSeconds": 300},
             "credential": compact
         })
+    }
+
+    // ---- TC-1452: the pinned per-policy issuer set -------------------------
+
+    const ORG_A: &str = "did:web:a.credentials.org";
+    const ORG_B: &str = "did:web:b.credentials.org";
+
+    struct SetFixture {
+        requirement: Value,
+        projection_value: Value,
+        holder: &'static str,
+        issued: OffsetDateTime,
+    }
+
+    impl SetFixture {
+        fn new(issuer_did: &str, issuer_kid: Option<&str>, profile: &str) -> Self {
+            let requirement = json!({
+                "type": "TinyCloudCredentialRequirement", "version": 1,
+                "profile": {"id": profile, "version": 1},
+                "credentialType": {"id": "opencredentials.email/v1", "version": 1},
+                "claims": {"emailDomain": "tinycloud.xyz"},
+                "maxAgeSeconds": 300
+            });
+            let mut projection_value = json!({
+                "type": POLICY_CREDENTIAL_REQUIREMENT_V1, "version": 1,
+                "requirementDigest": canonical_digest_base64url(&requirement),
+                "descriptorDigest": "DdDdDdDdDdDdDdDdDdDdDdDdDdDdDdDdDdDdDdDdDdD",
+                "issuerDid": issuer_did,
+                "profile": {"id": profile, "version": 1},
+                "credentialType": {"id": "opencredentials.email/v1", "version": 1}
+            });
+            if let Some(kid) = issuer_kid {
+                projection_value["issuerKid"] = json!(kid);
+            }
+            Self {
+                requirement,
+                projection_value,
+                holder: "did:key:z6MkehRgf7yJbgaGfYsdoAsKdBPE3dj2CYhowQdcjqSJgvVd",
+                issued: parse_time("2026-09-25T12:00:00Z").unwrap(),
+            }
+        }
+
+        fn verify(
+            &self,
+            credential: &Value,
+            set: &IssuerSet,
+        ) -> Result<VerifiedOpenCredential, (Status, String)> {
+            let projection = validate_policy_credential_requirement(&self.projection_value)?;
+            verify_opencredentials_credential(
+                credential,
+                &self.requirement,
+                projection,
+                set,
+                self.holder,
+                self.issued + Duration::seconds(30),
+            )
+        }
+
+        fn mint(
+            &self,
+            key: &tinycloud_core::libp2p::identity::ed25519::Keypair,
+            header: Value,
+            envelope_kid: &str,
+        ) -> Value {
+            let mut projection = self.projection_value.clone();
+            projection["issuerKid"] = json!(envelope_kid);
+            email_domain_credential_with_header(
+                key,
+                &projection,
+                self.holder,
+                "alice@tinycloud.xyz",
+                "tinycloud.xyz",
+                "tinycloud.xyz",
+                self.issued,
+                header,
+                json!(envelope_kid),
+            )
+        }
+    }
+
+    fn issuer_config(
+        did: &str,
+        fragment: &str,
+        key: &tinycloud_core::libp2p::identity::ed25519::Keypair,
+    ) -> crate::issuer_set::CredentialIssuerConfig {
+        crate::issuer_set::CredentialIssuerConfig {
+            issuer_did: did.into(),
+            kid: format!("{did}#{fragment}"),
+            alg: "EdDSA".into(),
+            public_key: encode_config(key.public().to_bytes(), URL_SAFE_NO_PAD),
+            vcts: vec!["opencredentials.email/v1".into()],
+            profiles: vec!["tinycloud.email-domain-proof/v1".into()],
+            not_before: "2026-09-01T00:00:00Z".into(),
+            retired_at: None,
+            not_after: None,
+        }
+    }
+
+    fn keypair() -> tinycloud_core::libp2p::identity::ed25519::Keypair {
+        tinycloud_core::libp2p::identity::ed25519::Keypair::generate()
+    }
+
+    const DOMAIN_PROFILE: &str = "tinycloud.email-domain-proof/v1";
+
+    fn forbidden(code: &str) -> Option<(Status, String)> {
+        Some((Status::Forbidden, code.into()))
+    }
+
+    #[test]
+    fn issuer_set_requires_typ_for_configured_entries_only() {
+        let key = keypair();
+        let kid = format!("{ORG_A}#issuing-1");
+        let fixture = SetFixture::new(ORG_A, Some(&kid), DOMAIN_PROFILE);
+        let set = IssuerSet::load(&[issuer_config(ORG_A, "issuing-1", &key)]).unwrap();
+        let good = fixture.mint(
+            &key,
+            json!({"alg": "EdDSA", "typ": "vc+sd-jwt", "kid": kid}),
+            &kid,
+        );
+        assert!(fixture.verify(&good, &set).is_ok());
+        let missing = fixture.mint(&key, json!({"alg": "EdDSA", "kid": kid}), &kid);
+        assert_eq!(
+            fixture.verify(&missing, &set).err(),
+            forbidden("credential-signature-invalid")
+        );
+        for typ in [
+            json!("dc+sd-jwt"),
+            json!("JWT"),
+            json!(""),
+            json!(1),
+            json!(null),
+        ] {
+            let wrong = fixture.mint(&key, json!({"alg": "EdDSA", "typ": typ, "kid": kid}), &kid);
+            assert_eq!(
+                fixture.verify(&wrong, &set).err(),
+                forbidden("credential-signature-invalid"),
+                "{typ}"
+            );
+        }
+        // The legacy single-issuer entry keeps accepting a header with no
+        // `typ`; a wrong `typ` is refused there too.
+        let legacy_kid = format!("{ORG_A}#controller");
+        let legacy_fixture = SetFixture::new(ORG_A, Some(&legacy_kid), DOMAIN_PROFILE);
+        let legacy = IssuerSet::from_legacy(&IssuerKey::new(
+            ORG_A,
+            "opencredentials.email/v1",
+            1,
+            legacy_kid.clone(),
+            key.public().to_bytes(),
+        ));
+        let no_typ = legacy_fixture.mint(
+            &key,
+            json!({"alg": "EdDSA", "kid": legacy_kid}),
+            &legacy_kid,
+        );
+        assert!(legacy_fixture.verify(&no_typ, &legacy).is_ok());
+        let wrong = legacy_fixture.mint(
+            &key,
+            json!({"alg": "EdDSA", "typ": "JWT", "kid": legacy_kid}),
+            &legacy_kid,
+        );
+        assert!(legacy_fixture.verify(&wrong, &legacy).is_err());
+    }
+
+    #[test]
+    fn issuer_set_requires_the_header_kid_and_it_must_agree_with_the_envelope() {
+        let (key_1, key_2) = (keypair(), keypair());
+        let (kid_1, kid_2) = (format!("{ORG_A}#issuing-1"), format!("{ORG_A}#issuing-2"));
+        let set = IssuerSet::load(&[
+            issuer_config(ORG_A, "issuing-1", &key_1),
+            issuer_config(ORG_A, "issuing-2", &key_2),
+        ])
+        .unwrap();
+        let unpinned = SetFixture::new(ORG_A, None, DOMAIN_PROFILE);
+        let good = unpinned.mint(
+            &key_1,
+            json!({"alg": "EdDSA", "typ": "vc+sd-jwt", "kid": kid_1}),
+            &kid_1,
+        );
+        assert!(unpinned.verify(&good, &set).is_ok());
+        // No header kid: refused on a configured entry, even though the
+        // envelope names one and the signature would verify.
+        let no_kid = unpinned.mint(&key_1, json!({"alg": "EdDSA", "typ": "vc+sd-jwt"}), &kid_1);
+        assert_eq!(
+            unpinned.verify(&no_kid, &set).err(),
+            forbidden("credential-signature-invalid")
+        );
+        // Header kid disagrees with the envelope kid, either way round.
+        for (signer, header, envelope) in [
+            (&key_1, &kid_2, &kid_1),
+            (&key_2, &kid_2, &kid_1),
+            (&key_1, &kid_1, &kid_2),
+        ] {
+            let mismatch = unpinned.mint(
+                signer,
+                json!({"alg": "EdDSA", "typ": "vc+sd-jwt", "kid": header}),
+                envelope,
+            );
+            assert_eq!(
+                unpinned.verify(&mismatch, &set).err(),
+                forbidden("credential-signature-invalid")
+            );
+        }
+        // Header and envelope agree with each other but not with the policy's
+        // pinned kid.
+        let pinned_2 = SetFixture::new(ORG_A, Some(&kid_2), DOMAIN_PROFILE);
+        assert!(pinned_2.verify(&good, &set).is_err());
+        // Legacy entry: a header without a kid still verifies, a mismatching
+        // one does not.
+        let legacy_kid = format!("{ORG_A}#controller");
+        let legacy_key = keypair();
+        let legacy = IssuerSet::from_legacy(&IssuerKey::new(
+            ORG_A,
+            "opencredentials.email/v1",
+            1,
+            legacy_kid.clone(),
+            legacy_key.public().to_bytes(),
+        ));
+        let fixture = SetFixture::new(ORG_A, Some(&legacy_kid), DOMAIN_PROFILE);
+        let bare = fixture.mint(
+            &legacy_key,
+            json!({"alg": "EdDSA", "typ": "vc+sd-jwt"}),
+            &legacy_kid,
+        );
+        assert!(fixture.verify(&bare, &legacy).is_ok());
+        let other = fixture.mint(
+            &legacy_key,
+            json!({"alg": "EdDSA", "typ": "vc+sd-jwt", "kid": kid_2}),
+            &legacy_kid,
+        );
+        assert!(fixture.verify(&other, &legacy).is_err());
+    }
+
+    #[test]
+    fn issuer_set_with_two_issuers_keeps_each_org_to_its_own_policies() {
+        let (key_a, key_b) = (keypair(), keypair());
+        let (kid_a, kid_b) = (format!("{ORG_A}#issuing-1"), format!("{ORG_B}#issuing-1"));
+        let set = IssuerSet::load(&[
+            issuer_config(ORG_A, "issuing-1", &key_a),
+            issuer_config(ORG_B, "issuing-1", &key_b),
+        ])
+        .unwrap();
+        let header = |kid: &str| json!({"alg": "EdDSA", "typ": "vc+sd-jwt", "kid": kid});
+        let policy_a = SetFixture::new(ORG_A, Some(&kid_a), DOMAIN_PROFILE);
+        let policy_b = SetFixture::new(ORG_B, Some(&kid_b), DOMAIN_PROFILE);
+        let from_a = policy_a.mint(&key_a, header(&kid_a), &kid_a);
+        let from_b = policy_b.mint(&key_b, header(&kid_b), &kid_b);
+        assert!(policy_a.verify(&from_a, &set).is_ok());
+        assert!(policy_b.verify(&from_b, &set).is_ok());
+        // Org B's credential cannot satisfy org A's policy, however the
+        // unsigned envelope is relabelled.
+        assert!(policy_a.verify(&from_b, &set).is_err());
+        let mut relabelled = from_b.clone();
+        relabelled["issuerDid"] = json!(ORG_A);
+        relabelled["issuerKid"] = json!(kid_a);
+        assert_eq!(
+            policy_a.verify(&relabelled, &set).err(),
+            forbidden("credential-signature-invalid")
+        );
+        let mut kid_only = from_b.clone();
+        kid_only["issuerKid"] = json!(kid_a);
+        assert!(policy_a.verify(&kid_only, &set).is_err());
+        // A policy that names the issuer without pinning a kid selects the
+        // entry from the credential's kid.
+        let unpinned = SetFixture::new(ORG_A, None, DOMAIN_PROFILE);
+        assert!(unpinned.verify(&from_a, &set).is_ok());
+        assert!(unpinned.verify(&from_b, &set).is_err());
+    }
+
+    #[test]
+    fn issuer_set_unknown_kid_profile_vct_and_did_method_fail_closed() {
+        let key = keypair();
+        let kid = format!("{ORG_A}#issuing-1");
+        let set = IssuerSet::load(&[issuer_config(ORG_A, "issuing-1", &key)]).unwrap();
+        let header = |kid: &str| json!({"alg": "EdDSA", "typ": "vc+sd-jwt", "kid": kid});
+        // Unknown kid under the right issuer.
+        let other_kid = format!("{ORG_A}#issuing-2");
+        let fixture = SetFixture::new(ORG_A, Some(&other_kid), DOMAIN_PROFILE);
+        let credential = fixture.mint(&key, header(&other_kid), &other_kid);
+        assert_eq!(
+            fixture.verify(&credential, &set).err(),
+            forbidden("credential-issuer-untrusted")
+        );
+        // Unknown unpinned kid.
+        let unpinned = SetFixture::new(ORG_A, None, DOMAIN_PROFILE);
+        assert_eq!(
+            unpinned.verify(&credential, &set).err(),
+            forbidden("credential-issuer-untrusted")
+        );
+        // A profile the entry does not list.
+        let email_profile = SetFixture::new(ORG_A, Some(&kid), "tinycloud.email-proof/v1");
+        let credential = email_profile.mint(&key, header(&kid), &kid);
+        assert_eq!(
+            email_profile.verify(&credential, &set).err(),
+            forbidden("credential-issuer-untrusted")
+        );
+        // A DID method that is not on the allow-list never reaches a lookup.
+        let ethr = SetFixture::new("did:ethr:0xabc", Some("did:ethr:0xabc#k"), DOMAIN_PROFILE);
+        let credential = ethr.mint(&key, header("did:ethr:0xabc#k"), "did:ethr:0xabc#k");
+        assert_eq!(
+            ethr.verify(&credential, &set).err(),
+            forbidden("credential-issuer-untrusted")
+        );
+    }
+
+    #[test]
+    fn issuer_set_validity_window_is_enforced_with_iat_checked_after_the_signature() {
+        let key = keypair();
+        let kid = format!("{ORG_A}#issuing-1");
+        let fixture = SetFixture::new(ORG_A, Some(&kid), DOMAIN_PROFILE);
+        let header = json!({"alg": "EdDSA", "typ": "vc+sd-jwt", "kid": kid});
+        let credential = fixture.mint(&key, header.clone(), &kid);
+        let with = |edit: &dyn Fn(&mut crate::issuer_set::CredentialIssuerConfig)| {
+            let mut config = issuer_config(ORG_A, "issuing-1", &key);
+            edit(&mut config);
+            IssuerSet::load(&[config]).unwrap()
+        };
+        // now (2026-09-25T12:00:30Z) before notBefore.
+        let early = with(&|c| c.not_before = "2026-09-26T00:00:00Z".into());
+        assert_eq!(
+            fixture.verify(&credential, &early).err(),
+            forbidden("credential-issuer-not-yet-valid")
+        );
+        // iat before notBefore while now is after it.
+        let back_dated = with(&|c| c.not_before = "2026-09-25T12:00:10Z".into());
+        assert_eq!(
+            fixture.verify(&credential, &back_dated).err(),
+            forbidden("credential-issuer-not-yet-valid")
+        );
+        // notAfter is a hard stop on now; notAfter null is no stop.
+        let stopped = with(&|c| c.not_after = Some("2026-09-25T12:00:30Z".into()));
+        assert_eq!(
+            fixture.verify(&credential, &stopped).err(),
+            forbidden("credential-issuer-stopped")
+        );
+        let before_stop = with(&|c| c.not_after = Some("2026-09-25T12:00:31Z".into()));
+        assert!(fixture.verify(&credential, &before_stop).is_ok());
+        // retiredAt limits issuing, not verifying: iat < retiredAt passes even
+        // though now is after retiredAt; iat >= retiredAt is refused.
+        let retired_after = with(&|c| c.retired_at = Some("2026-09-25T12:00:01Z".into()));
+        assert!(fixture.verify(&credential, &retired_after).is_ok());
+        let retired_at_iat = with(&|c| c.retired_at = Some("2026-09-25T12:00:00Z".into()));
+        assert_eq!(
+            fixture.verify(&credential, &retired_at_iat).err(),
+            forbidden("credential-issuer-retired")
+        );
+        // The retired check reads the signed iat only after the signature
+        // verifies: a forged credential under a retired key fails on the
+        // signature, not on retirement.
+        let forger = keypair();
+        let forged = fixture.mint(&forger, header, &kid);
+        assert_eq!(
+            fixture.verify(&forged, &retired_at_iat).err(),
+            forbidden("credential-signature-invalid")
+        );
+    }
+
+    #[test]
+    fn issuer_set_happy_path_with_a_two_issuer_set_and_rotation() {
+        let (old, new) = (keypair(), keypair());
+        let (old_kid, new_kid) = (format!("{ORG_A}#issuing-1"), format!("{ORG_A}#issuing-2"));
+        let mut retired = issuer_config(ORG_A, "issuing-1", &old);
+        retired.retired_at = Some("2026-09-26T00:00:00Z".into());
+        let mut current = issuer_config(ORG_A, "issuing-2", &new);
+        current.not_before = "2026-09-26T00:00:00Z".into();
+        let set = IssuerSet::load(&[retired, current]).unwrap();
+        let header = |kid: &str| json!({"alg": "EdDSA", "typ": "vc+sd-jwt", "kid": kid});
+        // A credential from the retired key issued before retiredAt verifies
+        // under a policy that does not pin a kid.
+        let unpinned = SetFixture::new(ORG_A, None, DOMAIN_PROFILE);
+        let credential = unpinned.mint(&old, header(&old_kid), &old_kid);
+        assert!(unpinned.verify(&credential, &set).is_ok());
+        // A policy pinning the new kid refuses the old key's credential.
+        let pinned_new = SetFixture::new(ORG_A, Some(&new_kid), DOMAIN_PROFILE);
+        assert!(pinned_new.verify(&credential, &set).is_err());
+    }
+
+    #[test]
+    fn policy_requirement_issuer_kid_is_optional_but_never_empty() {
+        let kid = format!("{ORG_A}#issuing-1");
+        let pinned = SetFixture::new(ORG_A, Some(&kid), DOMAIN_PROFILE);
+        assert!(validate_policy_credential_requirement(&pinned.projection_value).is_ok());
+        let unpinned = SetFixture::new(ORG_A, None, DOMAIN_PROFILE);
+        assert!(validate_policy_credential_requirement(&unpinned.projection_value).is_ok());
+        for bad in [json!(""), json!(null), json!(7)] {
+            let mut projection = unpinned.projection_value.clone();
+            projection["issuerKid"] = bad;
+            assert!(validate_policy_credential_requirement(&projection).is_err());
+        }
+        let mut extra = unpinned.projection_value.clone();
+        extra["org"] = json!("acme");
+        assert!(validate_policy_credential_requirement(&extra).is_err());
     }
 
     #[test]
@@ -7077,7 +7587,7 @@ mod tests {
                 credential,
                 &requirement,
                 projection,
-                &trusted,
+                &IssuerSet::from_legacy(&trusted),
                 holder_did,
                 now,
             )
@@ -7219,14 +7729,14 @@ mod tests {
         let lenient_projection =
             validate_policy_credential_requirement(&lenient_projection_value).unwrap();
         assert_eq!(
-            pinned_profile_status_freshness_seconds(lenient_projection, &trusted),
+            pinned_profile_status_freshness_seconds(lenient_projection),
             Some(300)
         );
         let fresh = verify_opencredentials_credential(
             &genuine,
             &lenient_requirement,
             lenient_projection,
-            &trusted,
+            &IssuerSet::from_legacy(&trusted),
             holder,
             issued + Duration::seconds(299),
         );
@@ -7236,7 +7746,7 @@ mod tests {
                 &genuine,
                 &lenient_requirement,
                 lenient_projection,
-                &trusted,
+                &IssuerSet::from_legacy(&trusted),
                 holder,
                 issued + Duration::seconds(301)
             )
@@ -7247,13 +7757,13 @@ mod tests {
         let mut exact_pin = projection_value.clone();
         exact_pin["profile"] = json!({"id": "tinycloud.email-proof/v1", "version": 1});
         assert_eq!(
-            pinned_profile_status_freshness_seconds(exact_pin.as_object().unwrap(), &trusted),
+            pinned_profile_status_freshness_seconds(exact_pin.as_object().unwrap()),
             Some(300)
         );
         let mut other_pin = projection_value.clone();
         other_pin["profile"] = json!({"id": "tinycloud.email-proof-lookalike/v1", "version": 1});
         assert_eq!(
-            pinned_profile_status_freshness_seconds(other_pin.as_object().unwrap(), &trusted),
+            pinned_profile_status_freshness_seconds(other_pin.as_object().unwrap()),
             None
         );
 
@@ -7289,7 +7799,7 @@ mod tests {
             &wrong_issuer,
             requirement,
             projection,
-            &trusted,
+            &IssuerSet::from_legacy(&trusted),
             holder,
             now,
         )
@@ -7301,7 +7811,7 @@ mod tests {
             &wrong_holder,
             requirement,
             projection,
-            &trusted,
+            &IssuerSet::from_legacy(&trusted),
             holder,
             now,
         )
@@ -7310,7 +7820,7 @@ mod tests {
             &Value::Null,
             requirement,
             projection,
-            &trusted,
+            &IssuerSet::from_legacy(&trusted),
             holder,
             now,
         )
@@ -7323,7 +7833,7 @@ mod tests {
                 &Value::Null,
                 requirement,
                 projection,
-                &untrusted,
+                &IssuerSet::from_legacy(&untrusted),
                 holder,
                 now,
             )
@@ -8250,7 +8760,7 @@ mod tests {
             &credential,
             &requirement,
             projection_object,
-            &issuer,
+            &IssuerSet::from_legacy(&issuer),
             &holder_did,
             issued + Duration::seconds(299),
         )
@@ -8264,7 +8774,7 @@ mod tests {
             &freshness_mutated,
             &requirement,
             projection_object,
-            &issuer,
+            &IssuerSet::from_legacy(&issuer),
             &holder_did,
             issued + Duration::seconds(301),
         )
