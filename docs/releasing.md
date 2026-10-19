@@ -112,7 +112,8 @@ serving.
    boot over the index**:
    - a valid, ready, live btree of that name on `current_kv` with the shape
      above (columns `space, deleted, key`, the third in collation
-     `pg_catalog.C`, default operator classes, ascending, no predicate,
+     `pg_catalog.C`, the first two in their own columns' collations, default
+     operator classes, ascending, no predicate,
      expression or INCLUDE): **no DDL, no lock, no warning**, and the index
      keeps its OID;
    - no such index and `current_kv` **empty** (a fresh or test database): the
