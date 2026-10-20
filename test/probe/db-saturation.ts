@@ -11,8 +11,9 @@
  * - CPU: breach when at least `min_breach_points` window points are above
  *   `cpu_pct` (13 of 15 by default, so one or two dips do not reset it).
  * - Pool: the same counting, using the target's `pool` comparator.
- * - Fewer than `min_points` valid points in a series, or no series at all, is
- *   UNKNOWN: the heartbeat gets no ping, so the missed-heartbeat alert fires.
+ * - Fewer than max(`min_points`, `min_breach_points`) valid points in a series,
+ *   or no series at all, is UNKNOWN: the heartbeat gets no ping, so the
+ *   missed-heartbeat alert fires.
  * - A breach on any rule wins over UNKNOWN on another rule.
  * - A target with no `pool` rule is a CONFIG fault and fails the heartbeat.
  */

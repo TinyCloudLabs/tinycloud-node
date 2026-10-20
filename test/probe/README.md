@@ -208,12 +208,12 @@ for that branch only and sends one Better Stack heartbeat decision per target.
 - **CPU:** breach when at least 13 of the last 15 one-minute points of
   `planetscale_primary_pods_cpu_util_percentages` are above `cpu_pct` (85).
   Points newer than 90 s are ignored for ingestion lag.
-- **Pool:** same counting on the target's `pool` rule. Port 6432 uses
-  `planetscale_pgbouncer_pools_client` waiting clients > 0; port 5432 uses
-  active connections >= 15 (`TINYCLOUD_DATABASE__MAX_CONNECTIONS`). `pool: null`
-  is a config fault until the port is confirmed.
+- **Pool:** same counting on the target's `pool` rule. The shipped target pins
+  direct Postgres, port 5432: active connections >= 15
+  (`TINYCLOUD_DATABASE__MAX_CONNECTIONS`). `pool: null` is a config fault. A
+  PgBouncer port (6432) would use `planetscale_pgbouncer_pools_client` waiting clients > 0.
 - **Outcomes:** breach or config fault -> `/fail` with numeric counts. Healthy
-  -> ping. Unknown (too few valid points, no series) or transient API error
+  -> ping. Unknown (fewer than max(`min_points`, `min_breach_points`) valid points, or no series) or transient API error
   (429, 5xx, timeout) -> no call, so the missed-heartbeat alert fires.
 - **Secrets:** each target reads the env names in its `token_secret` and
   `heartbeat_secret`. A target whose secrets are unset is skipped. The token is

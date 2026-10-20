@@ -8,7 +8,7 @@
     "heartbeat_secret": "BETTERSTACK_HEARTBEAT_URL_NODE_DB",
     "cpu_pct": 85,
     "window_min": 15,
-    "min_points": 12,
+    "min_points": 13,
     "min_breach_points": 13,
     "pool": {
       "metric": "planetscale_primary_postgres_connection_state",

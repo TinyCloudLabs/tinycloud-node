@@ -46,10 +46,13 @@ function failBody(label: string, verdict: Verdict, now: Date): string {
   return `TC-1601 db saturation ${verdict.status}: target=${label} ${verdict.detail} at=${at}`;
 }
 
+let targetSecretNames = new Set<string>();
+
 async function main(): Promise<number> {
   const only = process.env.DB_TARGET?.trim() || undefined;
   const override = parseOverride(process.env.THRESHOLD_PCT);
   const targets = loadTargets(JSON.parse(readFileSync(TARGETS_FILE, "utf8")));
+  targetSecretNames = new Set(targets.flatMap((t) => [t.token_secret, t.heartbeat_secret]));
   const selected = only ? targets.filter((t) => t.label === only) : targets;
   if (selected.length === 0) throw new ConfigFault(`no target named ${only}`);
 
@@ -62,7 +65,14 @@ async function main(): Promise<number> {
       console.log(`${target.label}: skipped (${missing} not set)`);
       continue;
     }
-    const heartbeat = heartbeatUrl(heartbeatRaw);
+    let heartbeat: URL | undefined;
+    try {
+      heartbeat = heartbeatUrl(heartbeatRaw);
+    } catch {
+      console.log(`${target.label}: config fault, ${target.heartbeat_secret} is not a Better Stack heartbeat URL`);
+      deliveryFailed = true;
+      continue;
+    }
     const t = override === undefined ? target : { ...target, cpu_pct: override };
     const label = override === undefined ? target.label : `${target.label} (manual cpu threshold ${override}%)`;
     const now = new Date();
@@ -95,7 +105,7 @@ main().then(
   },
   (err: unknown) => {
     const secrets = Object.entries(process.env)
-      .filter(([k, v]) => /^(PLANETSCALE_METRICS_TOKEN|BETTERSTACK_HEARTBEAT_URL)_/.test(k) && v)
+      .filter(([k, v]) => v && (targetSecretNames.has(k) || /^(PLANETSCALE_METRICS_TOKEN|BETTERSTACK_HEARTBEAT_URL)/.test(k)))
       .map(([, v]) => v as string);
     console.error(`[db-saturation] crashed: ${detail(err, secrets)}`);
     process.exitCode = 1;
