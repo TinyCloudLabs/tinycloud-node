@@ -7,7 +7,7 @@
  *   DB_TARGET        optional target label; default runs every target
  *   THRESHOLD_PCT    optional manual CPU threshold (0-100). Proof runs only; the
  *                    label in the log and the /fail body says so.
- *   <token_secret>   PlanetScale token, ID:TOKEN, read_branch on that database only
+ *   <token_secret>   PlanetScale token, ID:TOKEN, read_branch on all branches of that database
  *   <heartbeat_secret> Better Stack heartbeat URL for that target
  *
  * Heartbeat: ok -> ping; breach or config fault -> /fail; unknown or transient
@@ -17,13 +17,14 @@
  */
 import { readFileSync } from "node:fs";
 import { classify, detail, heartbeatUrl, redact, report, type Delivery, type Fetch } from "./probe-core";
-import { ConfigFault, evaluateTarget, loadTargets, metricsUrl, parseSeries, type Series, type Target, type Verdict } from "./db-saturation";
+import { ConfigFault, branchesUrl, evaluateTarget, loadTargets, metricsUrl, parseSeries, productionBranch, type Target, type Verdict } from "./db-saturation";
 
 const TIMEOUT_MS = 10_000;
 const TARGETS_FILE = new URL("./db-saturation-targets.json", import.meta.url);
 
-async function fetchSeries(t: Target, token: string, fetchFn: Fetch): Promise<Series[]> {
-  const res = await fetchFn(metricsUrl(t), {
+/** GET a PlanetScale endpoint. 429 and 5xx are transient; any other non-2xx is a token, scope or path fault. */
+async function getJson(url: string, token: string, fetchFn: Fetch): Promise<unknown> {
+  const res = await fetchFn(url, {
     headers: { authorization: token, accept: "application/json" },
     signal: AbortSignal.timeout(TIMEOUT_MS),
   });
@@ -31,7 +32,7 @@ async function fetchSeries(t: Target, token: string, fetchFn: Fetch): Promise<Se
   if (res.status === 429 || res.status >= 500) throw new Error(`planetscale HTTP ${res.status}`);
   // Any other non-2xx is a token, scope or path fault and must page now.
   if (!res.ok) throw new ConfigFault(`planetscale HTTP ${res.status}`);
-  return parseSeries(await res.json());
+  return res.json();
 }
 
 function parseOverride(raw: string | undefined): number | undefined {
@@ -79,7 +80,10 @@ async function main(): Promise<number> {
 
     let verdict: Verdict;
     try {
-      verdict = evaluateTarget(t, await fetchSeries(t, token, fetch), Math.floor(now.getTime() / 1000));
+      const branch = productionBranch(await getJson(branchesUrl(t), token, fetch));
+      verdict = branch === null
+        ? { status: "unknown", detail: "no single production branch in the branch list" }
+        : evaluateTarget(t, parseSeries(await getJson(metricsUrl(t, branch), token, fetch)), Math.floor(now.getTime() / 1000));
     } catch (error) {
       if (!(error instanceof ConfigFault)) {
         console.log(`${label}: check skipped, no heartbeat: ${redact(classify(error), [token])}`);

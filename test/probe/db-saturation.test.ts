@@ -6,8 +6,10 @@ import {
   LAG_SEC,
   evaluateTarget,
   loadTargets,
+  branchesUrl,
   metricsUrl,
   parseSeries,
+  productionBranch,
   type Point,
   type Series,
   type Target,
@@ -20,7 +22,6 @@ const base: Target = {
   label: "node-db",
   org: "tinycloudlabs",
   database: "tinycloud-node-production",
-  branch: "main",
   token_secret: "PLANETSCALE_METRICS_TOKEN_NODE_DB",
   heartbeat_secret: "BETTERSTACK_HEARTBEAT_URL_NODE_DB",
   cpu_pct: 85,
@@ -124,7 +125,7 @@ test("loadTargets rejects a window smaller than the breach count", () => {
 });
 
 test("metrics request asks for the 1h period, a value PlanetScale accepts", () => {
-  assert.match(metricsUrl(base), /[?&]period=1h(&|$)/);
+  assert.match(metricsUrl(base, "main"), /[?&]period=1h(&|$)/);
 });
 
 test("12 valid points that all breach are unknown when 13 must breach", () => {
@@ -150,10 +151,35 @@ test("loadTargets accepts a null pool and rejects duplicate labels", () => {
 });
 
 test("metrics requests go only to the branch metrics endpoint", () => {
-  const url = new URL(metricsUrl(base));
+  const url = new URL(metricsUrl(base, "main"));
   assert.equal(url.hostname, "api.planetscale.com");
   assert.ok(url.pathname.endsWith("/branches/main/metrics"));
   assert.ok(url.searchParams.get("metrics")?.split(",").includes(CPU_METRIC));
+});
+
+test("branch list requests go to the database's branches endpoint", () => {
+  assert.ok(new URL(branchesUrl(base)).pathname.endsWith("/databases/tinycloud-node-production/branches"));
+});
+
+test("the production branch is the one flagged production, whatever its name", () => {
+  const branches = [
+    { name: "main", production: false },
+    { name: "us-west", production: true },
+    { name: "dev", production: false },
+  ];
+  assert.equal(productionBranch(branches), "us-west");
+});
+
+test("no production branch, two, or an unnamed one fails closed to null", () => {
+  assert.equal(productionBranch([{ name: "dev", production: false }]), null);
+  assert.equal(productionBranch([{ name: "a", production: true }, { name: "b", production: true }]), null);
+  assert.equal(productionBranch([{ production: true }]), null);
+  assert.equal(productionBranch([]), null);
+});
+
+test("a body that is not a bare branch array fails closed to null", () => {
+  assert.equal(productionBranch({ data: [{ name: "main", production: true }] }), null);
+  assert.equal(productionBranch(null), null);
 });
 
 test("parseSeries rejects a body without a series array", () => {

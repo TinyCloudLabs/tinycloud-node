@@ -1,4 +1,4 @@
-# TC-1601: sustained DB saturation alert for PlanetScale branches.
+# TC-1601: sustained DB saturation alert for PlanetScale databases.
 #
 # WHAT: every 5 minutes, read CPU and connection-pool metrics for each target in
 # test/probe/db-saturation-targets.json and send one Better Stack heartbeat
@@ -11,7 +11,7 @@
 #
 # SECRETS (Settings -> Secrets and variables -> Actions):
 #   PLANETSCALE_METRICS_TOKEN_NODE_DB     PlanetScale service token ID:TOKEN,
-#                                         read_branch on tinycloud-node-production only.
+#                                         read_branch on all branches of tinycloud-node-production.
 #   BETTERSTACK_HEARTBEAT_URL_NODE_DB     "Node DB saturation" heartbeat URL.
 #   PLANETSCALE_METRICS_TOKEN_OPENKEY_DB  Added after the 2026-10-22 DB move.
 #   BETTERSTACK_HEARTBEAT_URL_OPENKEY_DB  "OpenKey DB saturation" heartbeat URL.

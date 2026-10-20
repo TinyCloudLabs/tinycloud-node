@@ -1,5 +1,5 @@
 /**
- * TC-1601: sustained DB saturation check for a PlanetScale branch.
+ * TC-1601: sustained DB saturation check for a PlanetScale database's production branch.
  *
  * Pure logic only. The PlanetScale fetch and the heartbeat call live in
  * db-saturation-run.ts. Logs numeric metric values only, never query text.
@@ -36,7 +36,6 @@ export type Target = {
   label: string;
   org: string;
   database: string;
-  branch: string;
   /** Name of the env var holding the PlanetScale token (ID:TOKEN). */
   token_secret: string;
   /** Name of the env var holding the Better Stack heartbeat URL. */
@@ -100,7 +99,6 @@ export function loadTargets(raw: unknown): Target[] {
       label,
       org: str(entry, "org", at),
       database: str(entry, "database", at),
-      branch: str(entry, "branch", at),
       token_secret: str(entry, "token_secret", at),
       heartbeat_secret: str(entry, "heartbeat_secret", at),
       cpu_pct: num(entry, "cpu_pct", at),
@@ -123,14 +121,27 @@ export function loadTargets(raw: unknown): Target[] {
   });
 }
 
+/** Branch list endpoint. Called once per run to find the production branch. */
+export function branchesUrl(t: Target): string {
+  const enc = encodeURIComponent;
+  return `https://api.planetscale.com/v1/organizations/${enc(t.org)}/databases/${enc(t.database)}/branches`;
+}
+
+/** The name of the one branch flagged production, or null when there is not exactly one. */
+export function productionBranch(body: unknown): string | null {
+  if (!Array.isArray(body)) return null;
+  const names = body.flatMap((b): string[] => (isObj(b) && b.production === true && typeof b.name === "string" ? [b.name] : []));
+  return names.length === 1 ? names[0] : null;
+}
+
 /** Metrics endpoint for one branch. Only this endpoint is ever called. */
-export function metricsUrl(t: Target): string {
+export function metricsUrl(t: Target, branch: string): string {
   const metrics = [CPU_METRIC, ...(t.pool ? [t.pool.metric] : [])];
   const enc = encodeURIComponent;
   // 1h covers window_min plus lag; evaluateRule trims to the window.
   return (
     `https://api.planetscale.com/v1/organizations/${enc(t.org)}/databases/${enc(t.database)}` +
-    `/branches/${enc(t.branch)}/metrics?metrics=${metrics.join(",")}&period=1h`
+    `/branches/${enc(branch)}/metrics?metrics=${metrics.join(",")}&period=1h`
   );
 }
 

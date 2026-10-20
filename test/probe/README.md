@@ -202,8 +202,9 @@ Without `BETTERSTACK_HEARTBEAT_URL` nothing is reported to Better Stack.
 ## DB saturation probe (TC-1601)
 
 `db-saturation-run.ts` checks each target in `db-saturation-targets.json` once
-per run (`db-saturation-probe.yml`, every 5 min). It reads PlanetScale metrics
-for that branch only and sends one Better Stack heartbeat decision per target.
+per run (`db-saturation-probe.yml`, every 5 min). It finds the database's production
+branch from the PlanetScale branch list each run, reads that branch's metrics, and
+sends one Better Stack heartbeat decision per target.
 
 - **CPU:** breach when at least 13 of the last 15 one-minute points of
   `planetscale_primary_pods_cpu_util_percentages` are above `cpu_pct` (85).
@@ -213,11 +214,12 @@ for that branch only and sends one Better Stack heartbeat decision per target.
   (`TINYCLOUD_DATABASE__MAX_CONNECTIONS`). `pool: null` is a config fault. A
   PgBouncer port (6432) would use `planetscale_pgbouncer_pools_client` waiting clients > 0.
 - **Outcomes:** breach or config fault -> `/fail` with numeric counts. Healthy
-  -> ping. Unknown (fewer than max(`min_points`, `min_breach_points`) valid points, or no series) or transient API error
+  -> ping. Unknown (fewer than max(`min_points`, `min_breach_points`) valid points,
+  no series, or not exactly one production branch) or transient API error
   (429, 5xx, timeout) -> no call, so the missed-heartbeat alert fires.
 - **Secrets:** each target reads the env names in its `token_secret` and
   `heartbeat_secret`. A target whose secrets are unset is skipped. The token is
-  a PlanetScale service token (`ID:TOKEN`) with `read_branch` on that database.
+  a PlanetScale service token (`ID:TOKEN`) with `read_branch` on all branches of that database.
 
 Proof runs (default branch only): `gh workflow run db-saturation-probe.yml -f threshold_pct=1`
 should send `/fail`; a run with no inputs should send a ping.
