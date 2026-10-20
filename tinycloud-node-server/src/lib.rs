@@ -34,6 +34,7 @@ pub mod egress;
 pub mod epoch_head_backfill;
 pub mod hooks;
 pub mod invocation_replay;
+pub mod issuer_set;
 pub mod link;
 pub mod node_control;
 pub mod policy_v3;
@@ -123,6 +124,7 @@ use routes::tc_bench::{
 };
 use routes::{
     admin::{delete_quota, get_quota, get_usage, list_quotas, set_quota},
+    admin_stats::get_stats,
     attestation::attestation,
     create_signed_kv_url, delegate, delegation_query, delegation_status,
     encryption::{
@@ -443,6 +445,7 @@ pub fn resolve_runtime_config(tinycloud_config: &Config) -> Result<Config> {
         .share_email
         .validate_for_v2_database(resolved.storage.database())
         .map_err(|error| anyhow::anyhow!(error))?;
+    resolved.share_email.credential_issuer_set()?;
     Ok(resolved)
 }
 
@@ -479,6 +482,7 @@ fn production_routes() -> Vec<Route> {
         get_quota,
         list_quotas,
         get_usage,
+        get_stats,
         create_encryption_network,
         get_encryption_network,
         encryption_well_known,
@@ -685,6 +689,11 @@ pub async fn app_with_control(
     // `database_artifact` table now exists (seeding before migrations would
     // fail boot on a fresh datadir). Runs before Rocket serves any request.
     sql_sizes.seed_from(&seed_conn).await?;
+    // TC-1578: the S3 block store sizes spaces from objects with bytes, so a
+    // hosted space with no blocks has no entry after a restart. Give every
+    // space in the table one (existing byte counts are kept).
+    let seeded_spaces = tinycloud.seed_store_sizes().await?;
+    ::tracing::info!(spaces = seeded_spaces, "seeded block-store space sizes");
     #[cfg(feature = "tc-bench-v1")]
     let bench_state = BenchState::new(
         &tinycloud_config.tc_bench,
@@ -702,7 +711,8 @@ pub async fn app_with_control(
         tinycloud_config.storage.sql.memory_threshold.as_u64(),
         database_artifact_repository.clone(),
     )
-    .with_wait_bounds(tinycloud_config.storage.sql.wait_bounds());
+    .with_wait_bounds(tinycloud_config.storage.sql.wait_bounds())
+    .with_ddl_policy(tinycloud_config.storage.sql.ddl_requires_schema);
 
     let mut policy_v3_runtime =
         PolicyV3Runtime::new(seed_conn.clone(), key_setup.node_did(), key_setup.clone())
@@ -710,21 +720,11 @@ pub async fn app_with_control(
     if tinycloud_config.share_email.enabled {
         policy_v3_runtime = policy_v3_runtime.with_delivery(&tinycloud_config.share_email)?;
     }
-    if let Some(encoded_key) = tinycloud_config.share_email.issuer_public_key.as_deref() {
-        let decoded = base64::decode_config(encoded_key, base64::URL_SAFE_NO_PAD)
-            .context("policy credential issuer public key must be canonical base64url")?;
-        let public_key: [u8; 32] = decoded
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("policy credential issuer public key must be 32 bytes"))?;
-        policy_v3_runtime = policy_v3_runtime.with_credential_issuer(
-            tinycloud_auth::share_email_evidence::IssuerKey::new(
-                tinycloud_config.share_email.issuer_did.clone(),
-                tinycloud_config.share_email.issuer_vct.clone(),
-                tinycloud_config.share_email.issuer_key_version,
-                tinycloud_config.share_email.issuer_kid.clone(),
-                public_key,
-            ),
-        );
+    // The pinned issuer set is built (and every set-load rule applied) whether
+    // or not share-email is enabled; a violation stops the node from starting.
+    let credential_issuers = tinycloud_config.share_email.credential_issuer_set()?;
+    if !credential_issuers.is_empty() {
+        policy_v3_runtime = policy_v3_runtime.with_credential_issuers(credential_issuers);
     }
 
     #[cfg(feature = "duckdb")]
