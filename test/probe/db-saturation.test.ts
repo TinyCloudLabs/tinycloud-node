@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import {
   CPU_METRIC,
@@ -148,6 +149,18 @@ test("loadTargets rejects zero, fractional, or oversize integers", () => {
 test("loadTargets accepts a null pool and rejects duplicate labels", () => {
   assert.equal(loadTargets([{ ...base, pool: null }])[0].pool, null);
   assert.throws(() => loadTargets([base, base]), ConfigFault);
+});
+
+test("loadTargets rejects a pool threshold of 0 under gte, or a negative one", () => {
+  const pool = (op: string, threshold: number) => ({ metric: POOL_METRIC, series_labels: {}, op, threshold });
+  assert.throws(() => loadTargets([{ ...base, pool: pool("gte", 0) }]), ConfigFault);
+  assert.throws(() => loadTargets([{ ...base, pool: pool("gte", -1) }]), ConfigFault);
+  assert.throws(() => loadTargets([{ ...base, pool: pool("gt", -1) }]), ConfigFault);
+  assert.equal(loadTargets([{ ...base, pool: pool("gt", 0) }])[0].pool?.threshold, 0);
+});
+
+test("the shipped targets file passes loadTargets, so a bad target fails CI", () => {
+  loadTargets(JSON.parse(readFileSync(new URL("./db-saturation-targets.json", import.meta.url), "utf8")));
 });
 
 test("metrics requests go only to the branch metrics endpoint", () => {

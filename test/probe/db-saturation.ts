@@ -77,11 +77,15 @@ function parsePool(v: unknown, at: string): PoolRule {
     throw new ConfigFault(`${at}: pool.series_labels must map strings to strings`);
   }
   if (v.op !== "gt" && v.op !== "gte") throw new ConfigFault(`${at}: pool.op must be "gt" or "gte"`);
+  const threshold = num(v, "threshold", `${at}.pool`);
+  if (threshold < 0 || (v.op === "gte" && threshold === 0)) {
+    throw new ConfigFault(`${at}: pool.threshold must be >= 0, and > 0 under gte (0 breaches an idle database)`);
+  }
   return {
     metric: str(v, "metric", `${at}.pool`),
     series_labels: labels as Record<string, string>,
     op: v.op,
-    threshold: num(v, "threshold", `${at}.pool`),
+    threshold,
   };
 }
 
