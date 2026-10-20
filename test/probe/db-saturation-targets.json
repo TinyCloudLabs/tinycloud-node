@@ -1,0 +1,15 @@
+[
+  {
+    "label": "node-db",
+    "org": "tinycloudlabs",
+    "database": "tinycloud-node-production",
+    "branch": "main",
+    "token_secret": "PLANETSCALE_METRICS_TOKEN_NODE_DB",
+    "heartbeat_secret": "BETTERSTACK_HEARTBEAT_URL_NODE_DB",
+    "cpu_pct": 85,
+    "window_min": 15,
+    "min_points": 12,
+    "min_breach_points": 13,
+    "pool": null
+  }
+]
