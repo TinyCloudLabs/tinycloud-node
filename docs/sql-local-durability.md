@@ -84,3 +84,5 @@ The kill -9 tests use `before_commit`, `after_commit` and `before_response` seam
 **Retire order.** When that reset fails, the actor is retired. The pre-commit gate and the reservation release are on the same path as before: the reservation is released by a drop guard in `SqlService::execute_locked` when the request returns, whatever the actor did, so the retire order does not change it. A request that triggers the reset held a `PRAGMA`, so it was never wrapped, gated or reserved in the first place.
 
 `Publication` commands are not gated either. DuckDB is untouched.
+
+Details: TC-1491
