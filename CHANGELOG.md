@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+## [1.21.5] - 2026-10-20
+
+### Release notes
+
+- **Fix (TC-1578, #387):** a hosted space that was empty at boot (no blocks and no SQL or DuckDB bytes) was dropped from the block store's size map, so its first write after a restart answered `404 space not found`. On production this affected 2,000 of 3,988 spaces (741 accounts) at about 01:2xZ on 2026-10-20. Boot now gives every row of the `space` table a size entry before the node serves. **A database error at that step fails startup.**
+- **Fix:** re-hosting a space that has data no longer resets its metered block usage to zero (it was a quota bypass). `init_size` is atomic and never lowers an existing entry.
+- No database migrations.
+- Rollback is the 1.21.4 image (digest b4953184), with no database step.
+
 ### Changes
 
 - Fixed hosted spaces with no blocks and no SQL/DuckDB bytes becoming unwritable after a node restart when a storage limit is configured (TC-1578). The write path answered 404 "space not found" because the S3 block store only sizes spaces that have objects at boot. A write to a hosted space the block store has no size for now initialises its entry from the `space` table and is then checked against the limit as usual; only a space absent from the table is 404. Boot also gives every space in the table a size entry. SQL/DuckDB bytes are still counted through the SQL size mirror, not the block store.
