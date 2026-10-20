@@ -174,24 +174,33 @@ test("branch list requests go to the database's branches endpoint", () => {
   assert.ok(new URL(branchesUrl(base)).pathname.endsWith("/databases/tinycloud-node-production/branches"));
 });
 
+test("branch list asks for 100 per page so the production branch is not paged out", () => {
+  assert.equal(new URL(branchesUrl(base)).searchParams.get("per_page"), "100");
+});
+
 test("the production branch is the one flagged production, whatever its name", () => {
   const branches = [
     { name: "main", production: false },
     { name: "us-west", production: true },
     { name: "dev", production: false },
   ];
-  assert.equal(productionBranch(branches), "us-west");
+  assert.equal(productionBranch({ data: branches }), "us-west");
 });
 
 test("no production branch, two, or an unnamed one fails closed to null", () => {
-  assert.equal(productionBranch([{ name: "dev", production: false }]), null);
-  assert.equal(productionBranch([{ name: "a", production: true }, { name: "b", production: true }]), null);
-  assert.equal(productionBranch([{ production: true }]), null);
-  assert.equal(productionBranch([]), null);
+  assert.equal(productionBranch({ data: [{ name: "dev", production: false }] }), null);
+  assert.equal(productionBranch({ data: [{ name: "a", production: true }, { name: "b", production: true }] }), null);
+  assert.equal(productionBranch({ data: [{ production: true }] }), null);
+  assert.equal(productionBranch({ data: [] }), null);
 });
 
-test("a body that is not a bare branch array fails closed to null", () => {
-  assert.equal(productionBranch({ data: [{ name: "main", production: true }] }), null);
+test("the production branch is read from the data field of the list body", () => {
+  assert.equal(productionBranch({ type: "list", data: [{ name: "main", production: true }, { name: "dev", production: false }] }), "main");
+});
+
+test("a body without a data array, or a bare array, fails closed to null", () => {
+  assert.equal(productionBranch([{ name: "main", production: true }]), null);
+  assert.equal(productionBranch({ branches: [{ name: "main", production: true }] }), null);
   assert.equal(productionBranch(null), null);
 });
 

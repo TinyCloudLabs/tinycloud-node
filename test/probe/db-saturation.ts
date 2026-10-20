@@ -128,13 +128,13 @@ export function loadTargets(raw: unknown): Target[] {
 /** Branch list endpoint. Called once per run to find the production branch. */
 export function branchesUrl(t: Target): string {
   const enc = encodeURIComponent;
-  return `https://api.planetscale.com/v1/organizations/${enc(t.org)}/databases/${enc(t.database)}/branches`;
+  return `https://api.planetscale.com/v1/organizations/${enc(t.org)}/databases/${enc(t.database)}/branches?per_page=100`;
 }
 
 /** The name of the one branch flagged production, or null when there is not exactly one. */
 export function productionBranch(body: unknown): string | null {
-  if (!Array.isArray(body)) return null;
-  const names = body.flatMap((b): string[] => (isObj(b) && b.production === true && typeof b.name === "string" ? [b.name] : []));
+  if (!isObj(body) || !Array.isArray(body.data)) return null;
+  const names = body.data.flatMap((b): string[] => (isObj(b) && b.production === true && typeof b.name === "string" ? [b.name] : []));
   return names.length === 1 ? names[0] : null;
 }
 
