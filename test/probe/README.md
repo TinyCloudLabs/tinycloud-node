@@ -198,3 +198,28 @@ PROBE_PRIVATE_KEY=0x... PROBE_MODE=dense npm run probe # promote watch (~66 min)
 ```
 
 Without `BETTERSTACK_HEARTBEAT_URL` nothing is reported to Better Stack.
+
+## DB saturation probe (TC-1601)
+
+`db-saturation-run.ts` checks each target in `db-saturation-targets.json` once
+per run (`db-saturation-probe.yml`, every 5 min). It reads PlanetScale metrics
+for that branch only and sends one Better Stack heartbeat decision per target.
+
+- **CPU:** breach when at least 13 of the last 15 one-minute points of
+  `planetscale_primary_pods_cpu_util_percentages` are above `cpu_pct` (85).
+  Points newer than 90 s are ignored for ingestion lag.
+- **Pool:** same counting on the target's `pool` rule. Port 6432 uses
+  `planetscale_pgbouncer_pools_client` waiting clients > 0; port 5432 uses
+  active connections >= 15 (`TINYCLOUD_DATABASE__MAX_CONNECTIONS`). `pool: null`
+  is a config fault until the port is confirmed.
+- **Outcomes:** breach or config fault -> `/fail` with numeric counts. Healthy
+  -> ping. Unknown (too few valid points, no series) or transient API error
+  (429, 5xx, timeout) -> no call, so the missed-heartbeat alert fires.
+- **Secrets:** each target reads the env names in its `token_secret` and
+  `heartbeat_secret`. A target whose secrets are unset is skipped. The token is
+  a PlanetScale service token (`ID:TOKEN`) with `read_branch` on that database.
+
+Proof runs (default branch only): `gh workflow run db-saturation-probe.yml -f threshold_pct=1`
+should send `/fail`; a run with no inputs should send a ping.
+
+Local: `npm run probe:db` (skips when secrets are unset). Tests: `npm test`.
