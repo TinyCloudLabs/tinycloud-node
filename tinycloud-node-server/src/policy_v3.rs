@@ -88,6 +88,7 @@ const MAX_SEALED_ENVELOPE_BYTES: usize = 4 * 1024 * 1024;
 // freshness bound for its non-revocable status. This is pinned here rather
 // than trusting the unsigned transport envelope around the SD-JWT.
 const EMAIL_PROOF_STATUS_FRESHNESS_SECONDS: i64 = 300;
+const HELD_EMAIL_MAX_AGE_SECONDS: i64 = 31_536_000;
 const INVITATION_REQUEST_SCHEMA: &str = "xyz.tinycloud.credentials/invitation-request/v1";
 const DELIVERY_ADMISSION_SCHEMA: &str = "xyz.tinycloud.policy/delivery-admission/v0";
 /// OpenCredentials profile whose signed `emailDomain` claim backs domain shares.
@@ -842,6 +843,7 @@ fn session_expiry(
     root_expires_at: &str,
     policy_expires_at: Option<&str>,
     account_expires_at: Option<OffsetDateTime>,
+    credential_expires_at: Option<OffsetDateTime>,
 ) -> Result<OffsetDateTime, (Status, String)> {
     let invalid = || (Status::BadRequest, "session-expiry-invalid".to_owned());
     let mut expires = match requested {
@@ -866,6 +868,9 @@ fn session_expiry(
     }
     if let Some(account) = account_expires_at {
         expires = expires.min(account);
+    }
+    if let Some(credential) = credential_expires_at {
+        expires = expires.min(credential);
     }
     Ok(expires)
 }
@@ -2450,6 +2455,9 @@ pub async fn mint(
         account_owner_proof
             .as_ref()
             .and_then(|proof| proof.expires_at),
+        credential_admission_result
+            .as_ref()
+            .and_then(|admission| admission.credential_expires_at),
     )?
     .unix_timestamp();
     if expires <= not_before {
@@ -5438,6 +5446,7 @@ struct CredentialAdmission {
     envelope_digest_hex: String,
     presentation_digest_hex: String,
     credential_space_owner_did: Option<String>,
+    credential_expires_at: Option<OffsetDateTime>,
 }
 
 struct AccountOwnerProof {
@@ -5733,6 +5742,7 @@ fn validate_credential_admission_v3(
             presentation.clone(),
         )))),
         credential_space_owner_did: Some(account_owner.to_owned()),
+        credential_expires_at: None,
     })
 }
 
@@ -5793,6 +5803,7 @@ fn validate_credential_admission_v4(
         envelope_digest_hex: digest_value(credential),
         presentation_digest_hex: hex::encode(Sha256::digest(canonical_json_value(presentation))),
         credential_space_owner_did: None,
+        credential_expires_at: None,
     })
 }
 
@@ -5837,6 +5848,7 @@ async fn validate_held_email_admission(
     {
         return Err((Status::Forbidden, "credential-type-mismatch".into()));
     }
+    held_email_max_age_pinned(requirement)?;
     let issuer_did = projection
         .get("issuerDid")
         .and_then(Value::as_str)
@@ -5883,7 +5895,10 @@ async fn validate_held_email_admission(
         }
     }
     let verified = held_email::verify(&input, &pre, &view).map_err(held_refusal)?;
+    requirement_claims_satisfied(requirement, &verified.claims)?;
     let sd_jwt_digest = Sha256::digest(input.sd_jwt.as_bytes());
+    let credential_expires_at = OffsetDateTime::from_unix_timestamp(verified.expires_at)
+        .map_err(|_| (Status::Forbidden, "credential-expiry-invalid".to_owned()))?;
     Ok(CredentialAdmission {
         claim_jti: presentation_replay_key(held_email::PROFILE, context.recipient_did, &pre.nonce),
         credential_id: verified.credential_id,
@@ -5892,7 +5907,23 @@ async fn validate_held_email_admission(
         envelope_digest_hex: hex::encode(sd_jwt_digest),
         presentation_digest_hex: hex::encode(Sha256::digest(canonical_json_value(presentation))),
         credential_space_owner_did: None,
+        credential_expires_at: Some(credential_expires_at),
     })
+}
+
+/// The held email row pins `maxAgeSeconds` to exactly 31 536 000 so requirement
+/// digests stay stable. The value never shortens a credential's life, so any
+/// other value, including an absent one, is refused rather than enforced.
+fn held_email_max_age_pinned(requirement: &Value) -> Result<(), (Status, String)> {
+    if requirement.get("maxAgeSeconds").and_then(Value::as_i64) == Some(HELD_EMAIL_MAX_AGE_SECONDS)
+    {
+        Ok(())
+    } else {
+        Err((
+            Status::Forbidden,
+            "credential-requirement-invalid".to_owned(),
+        ))
+    }
 }
 
 fn held_refusal(code: held_email::Refusal) -> (Status, String) {
@@ -5902,6 +5933,28 @@ fn held_refusal(code: held_email::Refusal) -> (Status, String) {
         Status::Forbidden
     };
     (status, code.into())
+}
+
+fn requirement_claims_satisfied(
+    requirement: &Value,
+    disclosed: &std::collections::BTreeMap<String, String>,
+) -> Result<(), (Status, String)> {
+    let claims = requirement
+        .get("claims")
+        .and_then(Value::as_object)
+        .ok_or((Status::Forbidden, "credential-requirement-invalid".into()))?;
+    for (name, expected) in claims {
+        let expected = expected
+            .as_str()
+            .ok_or((Status::Forbidden, "credential-requirement-invalid".into()))?;
+        if disclosed.get(name).map(String::as_str) != Some(expected) {
+            return Err((
+                Status::Forbidden,
+                "credential-requirement-not-satisfied".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn presentation_replay_key(schema: &str, holder_did: &str, presentation_jti: &str) -> String {
@@ -6672,6 +6725,41 @@ fn db_error(error: impl std::fmt::Display) -> (Status, String) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn held_email_max_age_is_pinned_to_the_row_value() {
+        let pinned = |seconds: serde_json::Value| {
+            held_email_max_age_pinned(&serde_json::json!({"maxAgeSeconds": seconds}))
+        };
+        assert!(pinned(serde_json::json!(31_536_000)).is_ok());
+        assert!(pinned(serde_json::json!(60)).is_err());
+        assert!(pinned(serde_json::json!(300)).is_err());
+        assert!(held_email_max_age_pinned(&serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn held_requirement_claims_must_match_the_disclosed_values() {
+        let requirement = serde_json::json!({"claims": {"email": "alice@example.com"}});
+        let disclosed = |email: &str| {
+            std::collections::BTreeMap::from([("email".to_owned(), email.to_owned())])
+        };
+        assert!(
+            super::requirement_claims_satisfied(&requirement, &disclosed("alice@example.com"))
+                .is_ok()
+        );
+        // Reviewer repro: a bob@other.example credential must not admit alice@example.com.
+        assert_eq!(
+            super::requirement_claims_satisfied(&requirement, &disclosed("bob@other.example"))
+                .unwrap_err()
+                .1,
+            "credential-requirement-not-satisfied"
+        );
+        assert!(super::requirement_claims_satisfied(
+            &requirement,
+            &std::collections::BTreeMap::new()
+        )
+        .is_err());
+    }
+
     #[tokio::test]
     async fn policy_registration_refuses_both_local_web_roots_before_resolution() {
         use crate::did_resolution_test_support::*;
@@ -8379,6 +8467,7 @@ mod tests {
                 &at(7200),
                 policy,
                 account.map(|seconds| now + Duration::seconds(seconds)),
+                None,
             )
         };
         // Older clients send nothing and keep the 60-second session.
@@ -8414,6 +8503,30 @@ mod tests {
             assert_eq!(status, Status::BadRequest, "{invalid}");
             assert_eq!(error, "session-expiry-invalid");
         }
+    }
+
+    #[test]
+    fn session_expiry_never_outlives_the_held_credential() {
+        let now = parse_time("2026-10-01T12:00:00Z").unwrap();
+        let requested = format_time(now + Duration::seconds(3600));
+        let root = format_time(now + Duration::seconds(7200));
+        let credential = now + Duration::seconds(120);
+        assert_eq!(
+            session_expiry(
+                now,
+                Some(requested.as_str()),
+                &root,
+                None,
+                None,
+                Some(credential)
+            )
+            .unwrap(),
+            credential
+        );
+        assert_eq!(
+            session_expiry(now, Some(requested.as_str()), &root, None, None, None).unwrap(),
+            now + Duration::seconds(3600)
+        );
     }
 
     #[test]
