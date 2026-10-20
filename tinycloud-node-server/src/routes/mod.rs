@@ -2559,7 +2559,12 @@ async fn read_json_body_limited(
 /// body is invoker-controlled, so it must be parsed, never assumed
 /// read-only. An unresolvable name is non-write (execution fails with
 /// "statement not found" before any storage grows). `Export` is a read.
-fn sql_request_is_write(request: &SqlRequest, caveats: &Option<SqlCaveats>) -> bool {
+/// `_ability` is not consulted; it keeps the signature of the duckdb twin.
+fn sql_request_is_write(
+    request: &SqlRequest,
+    caveats: &Option<SqlCaveats>,
+    _ability: &str,
+) -> bool {
     let is_write_sql = |sql: &str| {
         tinycloud_core::sql::parser::classify_sql(sql)
             .map(|class| !class.is_read_only)
@@ -2713,7 +2718,7 @@ async fn handle_sql_invoke(
     // Publication compatibility only exposes status and release. Both remain
     // available when content storage is full.
     let grows_content =
-        publication_command.is_none() && sql_request_is_write(&sql_request, &exec_caveats);
+        publication_command.is_none() && sql_request_is_write(&sql_request, &exec_caveats, ability);
     let full_space = if grows_content {
         storage_check(space, tinycloud, config, quota_cache)
             .await?
@@ -2736,11 +2741,17 @@ async fn handle_sql_invoke(
         meeting_publication::execute(tinycloud, sql_service, space, command).await
     } else if full_space.is_some() {
         sql_service
-            .execute_without_growth(space, &db_name, sql_request, exec_caveats, authority)
+            .execute_without_growth_authorized(
+                space,
+                &db_name,
+                sql_request,
+                exec_caveats,
+                authority,
+            )
             .await
     } else {
         sql_service
-            .execute(space, &db_name, sql_request, exec_caveats, authority)
+            .execute_authorized(space, &db_name, sql_request, exec_caveats, authority)
             .await
     };
     crate::prometheus::observe_span(
@@ -4896,7 +4907,7 @@ mod tests {
                     params: vec![SqlValue::Text("alpha".to_string()), SqlValue::Integer(111)],
                 },
                 None,
-                ["tinycloud.sql/write", "tinycloud.sql/schema"],
+                "tinycloud.sql/admin".to_string(),
             )
             .await
             .unwrap();
@@ -5004,7 +5015,7 @@ mod tests {
                     params: vec![SqlValue::Text("alpha".to_string()), SqlValue::Integer(111)],
                 },
                 None,
-                ["tinycloud.sql/write", "tinycloud.sql/schema"],
+                "tinycloud.sql/admin".to_string(),
             )
             .await?;
         sql_service
@@ -5277,7 +5288,7 @@ mod tests {
                     params: vec![SqlValue::Text("alpha".to_string()), SqlValue::Integer(111)],
                 },
                 None,
-                ["tinycloud.sql/write", "tinycloud.sql/schema"],
+                "tinycloud.sql/admin".to_string(),
             )
             .await?;
         sql_service
@@ -6537,6 +6548,7 @@ mod tests {
     #[tokio::test]
     async fn sql_request_is_write_classifies_variants() {
         use tinycloud_core::sql::types::SqlStatement;
+        let ability = "tinycloud.sql/write";
         let caveats = &None;
 
         // Execute carrying a non-empty schema (DDL) is write-class.
@@ -6547,6 +6559,7 @@ mod tests {
                 params: vec![],
             },
             caveats,
+            ability
         ));
 
         // Execute with no schema but a DML statement is write-class.
@@ -6557,6 +6570,7 @@ mod tests {
                 params: vec![],
             },
             caveats,
+            ability
         ));
 
         // A read-only Query is not write-class.
@@ -6568,6 +6582,7 @@ mod tests {
                 max_bytes: None,
             },
             caveats,
+            ability
         ));
 
         // A Batch containing any write statement is write-class.
@@ -6579,6 +6594,7 @@ mod tests {
                 }],
             },
             caveats,
+            ability
         ));
 
         // ExecuteStatement is read-only by construction; Export is a read.
@@ -6588,8 +6604,9 @@ mod tests {
                 params: vec![],
             },
             caveats,
+            ability
         ));
-        assert!(!sql_request_is_write(&SqlRequest::Export, caveats));
+        assert!(!sql_request_is_write(&SqlRequest::Export, caveats, ability));
     }
 
     /// TC-1581: classification does not depend on the abilities held, so a
@@ -6614,6 +6631,7 @@ mod tests {
                     max_bytes: None,
                 },
                 caveats,
+                "tinycloud.sql/write",
             ));
             assert!(sql_request_is_write(
                 &SqlRequest::Execute {
@@ -6622,6 +6640,7 @@ mod tests {
                     params: vec![],
                 },
                 caveats,
+                "tinycloud.sql/write",
             ));
             assert!(sql_request_is_write(
                 &SqlRequest::Batch {
@@ -6631,6 +6650,7 @@ mod tests {
                     }],
                 },
                 caveats,
+                "tinycloud.sql/write",
             ));
         }
     }
@@ -6726,7 +6746,7 @@ mod tests {
                     params: vec![SqlValue::Text("alpha".to_string()), SqlValue::Integer(111)],
                 },
                 None,
-                ["tinycloud.sql/write", "tinycloud.sql/schema"],
+                "tinycloud.sql/admin".to_string(),
             )
             .await?;
 
@@ -7451,12 +7471,12 @@ mod tests {
             };
             async move {
                 service
-                    .execute(
+                    .execute_authorized(
                         &space,
                         "main",
                         request,
                         None,
-                        ["tinycloud.sql/write", "tinycloud.sql/schema"],
+                        SqlAuthority::new(["tinycloud.sql/write", "tinycloud.sql/schema"]),
                     )
                     .await
             }

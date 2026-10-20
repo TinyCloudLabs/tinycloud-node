@@ -66,6 +66,16 @@ pub fn classify_sql(sql: &str) -> Result<SqlClass, SqlError> {
 pub fn validate_sql(
     sql: &str,
     caveats: &Option<SqlCaveats>,
+    ability: &str,
+) -> Result<ParsedQuery, SqlError> {
+    validate_sql_authorized(sql, caveats, &SqlAuthority::from(ability))
+}
+
+/// As [`validate_sql`], judging the statement against every SQL ability the
+/// invocation holds and the node's DDL policy (TC-1581).
+pub fn validate_sql_authorized(
+    sql: &str,
+    caveats: &Option<SqlCaveats>,
     authority: &SqlAuthority,
 ) -> Result<ParsedQuery, SqlError> {
     if is_pragma_sql(sql) {
@@ -551,42 +561,7 @@ fn unique_names(names: Vec<String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::authority::DdlPolicy;
     use crate::write_hooks::TouchedTables;
-
-    const READ: &str = "tinycloud.sql/read";
-    const WRITE: &str = "tinycloud.sql/write";
-    const SCHEMA: &str = "tinycloud.sql/schema";
-    const ADMIN: &str = "tinycloud.sql/admin";
-    const STAR: &str = "tinycloud.sql/*";
-
-    fn held(abilities: &[&str]) -> SqlAuthority {
-        SqlAuthority::new(abilities.iter().copied())
-    }
-
-    fn validate(sql: &str, abilities: &[&str]) -> Result<ParsedQuery, SqlError> {
-        validate_sql(sql, &None, &held(abilities))
-    }
-
-    /// One statement of every schema-changing kind the parser classifies.
-    const DDL: [&str; 10] = [
-        "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)",
-        "CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY)",
-        "CREATE TEMP TABLE scratch (id INTEGER)",
-        "CREATE TABLE copied AS SELECT id FROM notes",
-        "CREATE VIEW note_ids AS SELECT id FROM notes",
-        "CREATE INDEX notes_body ON notes (body)",
-        "CREATE UNIQUE INDEX notes_id ON notes (id)",
-        "ALTER TABLE notes ADD COLUMN extra TEXT",
-        "DROP TABLE notes",
-        "DROP VIEW note_ids",
-    ];
-
-    const DML: [&str; 3] = [
-        "INSERT INTO notes (id) VALUES (1)",
-        "UPDATE notes SET body = 'x'",
-        "DELETE FROM notes WHERE id = 1",
-    ];
 
     #[test]
     fn tc626_review_pragma_rejects_hidden_statements() {
@@ -597,7 +572,7 @@ mod tests {
             "PRAGMA user_version = 1; /* outer /* inner */ COMMIT; -- */",
         ] {
             assert!(
-                validate(sql, &[ADMIN]).is_err(),
+                validate_sql(sql, &None, "tinycloud.sql/admin").is_err(),
                 "PRAGMA must not bypass single-statement validation: {sql}"
             );
         }
@@ -623,27 +598,179 @@ mod tests {
 
     #[test]
     fn pragma_requires_admin_before_generic_sql_parse() {
-        let err = validate("PRAGMA table_info(secret_records)", &[READ])
-            .expect_err("read ability must not authorize PRAGMA");
+        let err = validate_sql(
+            "PRAGMA table_info(secret_records)",
+            &None,
+            "tinycloud.sql/read",
+        )
+        .expect_err("read ability must not authorize PRAGMA");
 
         assert!(matches!(err, SqlError::PermissionDenied(message) if message.contains("admin")));
     }
 
     #[test]
     fn admin_pragma_is_validated_without_sqlparser() {
-        let parsed = validate(
+        let parsed = validate_sql(
             "
               -- migration introspection
               /* SQLite-specific */
               PRAGMA table_info(secret_records)
             ",
-            &[ADMIN],
+            &None,
+            "tinycloud.sql/admin",
         )
         .expect("admin PRAGMA should not fail sqlparser parsing");
 
         assert!(parsed.is_read_only);
         assert!(parsed.write_targets.is_empty());
     }
+
+    #[test]
+    fn validate_sql_rejects_ddl_ability_for_schema_changes() {
+        let err = validate_sql(
+            "CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, body TEXT)",
+            &None,
+            "tinycloud.sql/ddl",
+        )
+        .expect_err("ddl ability is not a schema permission");
+
+        assert!(matches!(err, SqlError::PermissionDenied(_)));
+    }
+
+    #[test]
+    fn schema_ability_allows_ddl() {
+        let parsed = validate_sql(
+            "CREATE TABLE IF NOT EXISTS conversation (id TEXT PRIMARY KEY)",
+            &None,
+            "tinycloud.sql/schema",
+        )
+        .expect("schema ability should authorize DDL");
+
+        assert!(parsed.is_ddl);
+        assert!(!parsed.is_read_only);
+        assert_eq!(
+            parsed.write_targets,
+            vec![TouchedTables::supported(vec!["conversation".to_string()])]
+        );
+    }
+
+    #[test]
+    fn schema_ability_rejects_dml() {
+        for sql in [
+            "INSERT INTO conversation (id) VALUES ('1')",
+            "UPDATE conversation SET id = '2'",
+            "DELETE FROM conversation WHERE id = '1'",
+        ] {
+            let err = validate_sql(sql, &None, "tinycloud.sql/schema")
+                .expect_err("schema ability must not authorize DML");
+
+            assert!(
+                matches!(err, SqlError::PermissionDenied(ref message) if message.contains("only permits DDL")),
+                "expected DML permission denial for {sql}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_ability_rejects_select() {
+        let err = validate_sql("SELECT id FROM conversation", &None, "tinycloud.sql/schema")
+            .expect_err("schema ability must not authorize reads");
+
+        assert!(
+            matches!(err, SqlError::PermissionDenied(ref message) if message.contains("only permits DDL")),
+            "expected SELECT permission denial, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn schema_ability_rejects_mixed_ddl_and_select() {
+        let err = validate_sql(
+            "CREATE TABLE conversation (id TEXT); SELECT id FROM private_conversation",
+            &None,
+            "tinycloud.sql/schema",
+        )
+        .expect_err("schema ability must not authorize mixed DDL and reads");
+
+        assert!(
+            matches!(err, SqlError::InvalidStatement(ref message) if message.contains("Exactly one")),
+            "expected multi-statement rejection, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn query_rejects_multiple_statements() {
+        let err = validate_sql(
+            "SELECT id FROM conversation; SELECT id FROM private_conversation",
+            &None,
+            "tinycloud.sql/read",
+        )
+        .expect_err("a query request must contain one statement");
+
+        assert!(matches!(
+            err,
+            SqlError::InvalidStatement(ref message) if message.contains("Exactly one")
+        ));
+    }
+
+    #[test]
+    fn schema_ability_allows_create_view() {
+        let parsed = validate_sql(
+            "CREATE VIEW conversation_ids AS SELECT id FROM conversation",
+            &None,
+            "tinycloud.sql/schema",
+        )
+        .expect("schema ability should authorize CREATE VIEW");
+
+        assert!(parsed.is_ddl);
+        assert_eq!(
+            parsed.write_targets,
+            vec![TouchedTables::supported(vec![
+                "conversation_ids".to_string()
+            ])]
+        );
+    }
+}
+
+/// TC-1581: schema-changing statements need `schema`; `write` is data only.
+#[cfg(test)]
+mod ddl_authority_tests {
+    use super::*;
+    use crate::sql::authority::DdlPolicy;
+    use crate::write_hooks::TouchedTables;
+
+    const READ: &str = "tinycloud.sql/read";
+    const WRITE: &str = "tinycloud.sql/write";
+    const SCHEMA: &str = "tinycloud.sql/schema";
+    const ADMIN: &str = "tinycloud.sql/admin";
+    const STAR: &str = "tinycloud.sql/*";
+
+    fn held(abilities: &[&str]) -> SqlAuthority {
+        SqlAuthority::new(abilities.iter().copied())
+    }
+
+    fn validate(sql: &str, abilities: &[&str]) -> Result<ParsedQuery, SqlError> {
+        validate_sql_authorized(sql, &None, &held(abilities))
+    }
+
+    /// One statement of every schema-changing kind the parser classifies.
+    const DDL: [&str; 10] = [
+        "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)",
+        "CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY)",
+        "CREATE TEMP TABLE scratch (id INTEGER)",
+        "CREATE TABLE copied AS SELECT id FROM notes",
+        "CREATE VIEW note_ids AS SELECT id FROM notes",
+        "CREATE INDEX notes_body ON notes (body)",
+        "CREATE UNIQUE INDEX notes_id ON notes (id)",
+        "ALTER TABLE notes ADD COLUMN extra TEXT",
+        "DROP TABLE notes",
+        "DROP VIEW note_ids",
+    ];
+
+    const DML: [&str; 3] = [
+        "INSERT INTO notes (id) VALUES (1)",
+        "UPDATE notes SET body = 'x'",
+        "DELETE FROM notes WHERE id = 1",
+    ];
 
     #[test]
     fn pragma_stays_admin_only_whatever_else_is_held() {
@@ -658,7 +785,7 @@ mod tests {
                     let authority = held(abilities).with_ddl_policy(policy);
                     assert!(
                         matches!(
-                            validate_sql(sql, &None, &authority),
+                            validate_sql_authorized(sql, &None, &authority),
                             Err(SqlError::PermissionDenied(_))
                         ),
                         "{abilities:?} must not run {sql} under {policy:?}"
@@ -825,7 +952,7 @@ mod tests {
         for policy in [DdlPolicy::Off, DdlPolicy::Log] {
             for sql in DDL {
                 let write_only = held(&[WRITE]).with_ddl_policy(policy);
-                let parsed = validate_sql(sql, &None, &write_only)
+                let parsed = validate_sql_authorized(sql, &None, &write_only)
                     .unwrap_or_else(|e| panic!("{policy:?} must run {sql}: {e:?}"));
                 assert_eq!(
                     parsed.ddl_without_schema.is_some(),
@@ -835,19 +962,21 @@ mod tests {
 
                 let both = held(&[WRITE, SCHEMA]).with_ddl_policy(policy);
                 assert_eq!(
-                    validate_sql(sql, &None, &both).unwrap().ddl_without_schema,
+                    validate_sql_authorized(sql, &None, &both)
+                        .unwrap()
+                        .ddl_without_schema,
                     None
                 );
 
                 let read_only = held(&[READ]).with_ddl_policy(policy);
                 assert!(matches!(
-                    validate_sql(sql, &None, &read_only),
+                    validate_sql_authorized(sql, &None, &read_only),
                     Err(SqlError::PermissionDenied(_))
                 ));
             }
             let data = held(&[WRITE]).with_ddl_policy(policy);
             assert_eq!(
-                validate_sql("INSERT INTO notes (id) VALUES (1)", &None, &data)
+                validate_sql_authorized("INSERT INTO notes (id) VALUES (1)", &None, &data)
                     .unwrap()
                     .ddl_without_schema,
                 None
@@ -866,7 +995,7 @@ mod tests {
             ("DROP TABLE t", DdlKind::Drop),
         ] {
             assert_eq!(
-                validate_sql(sql, &None, &write_only)
+                validate_sql_authorized(sql, &None, &write_only)
                     .unwrap()
                     .ddl_without_schema,
                 Some(kind),
@@ -941,7 +1070,7 @@ mod tests {
                 ..SqlCaveats::default()
             });
             assert!(matches!(
-                validate_sql(sql, &read_only, &held(&[WRITE])),
+                validate_sql_authorized(sql, &read_only, &held(&[WRITE])),
                 Err(SqlError::ReadOnlyViolation)
             ));
             let other_table = Some(SqlCaveats {
@@ -949,14 +1078,14 @@ mod tests {
                 ..SqlCaveats::default()
             });
             assert!(matches!(
-                validate_sql(sql, &other_table, &held(&[WRITE])),
+                validate_sql_authorized(sql, &other_table, &held(&[WRITE])),
                 Err(SqlError::PermissionDenied(_))
             ));
             let this_table = Some(SqlCaveats {
                 tables: Some(vec!["notes".to_string()]),
                 ..SqlCaveats::default()
             });
-            validate_sql(sql, &this_table, &held(&[WRITE])).unwrap();
+            validate_sql_authorized(sql, &this_table, &held(&[WRITE])).unwrap();
         }
     }
 
@@ -1004,73 +1133,13 @@ mod tests {
     }
 
     #[test]
-    fn schema_ability_allows_ddl() {
-        let parsed = validate(
-            "CREATE TABLE IF NOT EXISTS conversation (id TEXT PRIMARY KEY)",
-            &[SCHEMA],
-        )
-        .expect("schema ability should authorize DDL");
-
-        assert!(parsed.is_ddl);
-        assert!(!parsed.is_read_only);
-        assert_eq!(
-            parsed.write_targets,
-            vec![TouchedTables::supported(vec!["conversation".to_string()])]
-        );
-    }
-
-    #[test]
-    fn schema_ability_rejects_mixed_ddl_and_select() {
-        let err = validate(
-            "CREATE TABLE conversation (id TEXT); SELECT id FROM private_conversation",
-            &[SCHEMA],
-        )
-        .expect_err("schema ability must not authorize mixed DDL and reads");
-
-        assert!(
-            matches!(err, SqlError::InvalidStatement(ref message) if message.contains("Exactly one")),
-            "expected multi-statement rejection, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn query_rejects_multiple_statements() {
-        let err = validate(
-            "SELECT id FROM conversation; SELECT id FROM private_conversation",
-            &[READ],
-        )
-        .expect_err("a query request must contain one statement");
-
-        assert!(matches!(
-            err,
-            SqlError::InvalidStatement(ref message) if message.contains("Exactly one")
-        ));
-    }
-
-    #[test]
-    fn schema_ability_allows_create_view() {
-        let parsed = validate(
-            "CREATE VIEW conversation_ids AS SELECT id FROM conversation",
-            &[SCHEMA],
-        )
-        .expect("schema ability should authorize CREATE VIEW");
-
-        assert!(parsed.is_ddl);
-        assert_eq!(
-            parsed.write_targets,
-            vec![TouchedTables::supported(vec![
-                "conversation_ids".to_string()
-            ])]
-        );
-    }
-
-    #[test]
     fn read_only_caveat_still_refuses_ddl_for_a_schema_holder() {
         let caveats = Some(SqlCaveats {
             read_only: Some(true),
             ..SqlCaveats::default()
         });
-        let err = validate_sql("CREATE TABLE t (a)", &caveats, &held(&[SCHEMA])).unwrap_err();
+        let err =
+            validate_sql_authorized("CREATE TABLE t (a)", &caveats, &held(&[SCHEMA])).unwrap_err();
         assert!(matches!(err, SqlError::ReadOnlyViolation));
     }
 }

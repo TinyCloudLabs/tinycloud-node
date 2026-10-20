@@ -49,34 +49,6 @@ pub fn open_connection(mode: &StorageMode) -> Result<Connection, SqlError> {
     Ok(conn)
 }
 
-/// Return the connection to the state [`open_connection`] leaves it in (TC-1586).
-///
-/// The actor's connection is shared by every request on a database. A
-/// `PRAGMA` (admin only) changes connection-level state, and that state would
-/// otherwise outlive the request: `writable_schema = ON` would let a later
-/// holder of `write` edit `sqlite_master`, `query_only = ON` would make the
-/// database read-only for everyone, and `foreign_keys = OFF` would disable
-/// integrity checks. Run after every request that held a PRAGMA.
-pub fn reset_connection_state(conn: &Connection, mode: &StorageMode) -> Result<(), SqlError> {
-    let _timer = QueryTimer::new();
-    conn.execute_batch(
-        "PRAGMA writable_schema = OFF;
-         PRAGMA query_only = OFF;
-         PRAGMA ignore_check_constraints = OFF;
-         PRAGMA recursive_triggers = OFF;
-         PRAGMA case_sensitive_like = OFF;
-         PRAGMA foreign_keys = ON;",
-    )
-    .map_err(|e| SqlError::Internal(e.to_string()))?;
-    if matches!(mode, StorageMode::File(_)) {
-        conn.pragma_update(None, "journal_mode", "wal")
-            .map_err(|e| SqlError::Internal(e.to_string()))?;
-        conn.pragma_update(None, "wal_autocheckpoint", 0)
-            .map_err(|e| SqlError::Internal(e.to_string()))?;
-    }
-    Ok(())
-}
-
 pub fn database_size(conn: &Connection) -> Result<u64, SqlError> {
     let page_count: u64 = {
         let _timer = QueryTimer::new();

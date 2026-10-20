@@ -1986,7 +1986,7 @@ mod retry_after_fairing_tests {
                         max_bytes: None,
                     },
                     None,
-                    "tinycloud.sql/read",
+                    "tinycloud.sql/read".into(),
                 )
                 .await
                 .map(|_| "served".to_string())

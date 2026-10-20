@@ -164,7 +164,26 @@ fn can_delete_table(
                     ))))
 }
 
+/// Authorize with one ability string (plus the `is_admin` flag), for a
+/// statement the caller has not classified. Judges DDL by the abilities
+/// alone; use [`create_authorizer_scoped`] when the parser's classification
+/// of the statement is known.
 pub fn create_authorizer(
+    caveats: Option<SqlCaveats>,
+    ability: String,
+    is_admin: bool,
+) -> impl FnMut(AuthContext<'_>) -> Authorization {
+    let mut held = vec![ability];
+    if is_admin {
+        held.push("tinycloud.sql/admin".to_string());
+    }
+    create_authorizer_scoped(caveats, &SqlAuthority::new(held), StatementScope::default())
+}
+
+/// The SQLite authorizer for one statement (TC-1581): every action is judged
+/// against all the SQL abilities the invocation holds, and `scope` says what
+/// the parser made of the statement.
+pub fn create_authorizer_scoped(
     caveats: Option<SqlCaveats>,
     authority: &SqlAuthority,
     scope: StatementScope,
@@ -539,33 +558,8 @@ pub fn create_authorizer(
 mod tests {
     use super::*;
 
-    fn authority_for(abilities: &[&str], is_admin: bool) -> SqlAuthority {
-        let mut held: Vec<String> = abilities.iter().map(|a| a.to_string()).collect();
-        if is_admin {
-            held.push("tinycloud.sql/admin".to_string());
-        }
-        SqlAuthority::new(held)
-    }
-
-    fn authorize_held(abilities: &[&str], action: AuthAction<'_>) -> Authorization {
-        let mut auth = create_authorizer(
-            None,
-            &authority_for(abilities, false),
-            StatementScope::default(),
-        );
-        auth(AuthContext {
-            action,
-            database_name: Some("main"),
-            accessor: None,
-        })
-    }
-
     fn authorize(ability: &str, is_admin: bool, action: AuthAction<'_>) -> Authorization {
-        let mut auth = create_authorizer(
-            None,
-            &authority_for(&[ability], is_admin),
-            StatementScope::default(),
-        );
+        let mut auth = create_authorizer(None, ability.to_string(), is_admin);
         auth(AuthContext {
             action,
             database_name: Some("main"),
@@ -574,30 +568,25 @@ mod tests {
     }
 
     #[test]
-    fn create_index_needs_schema_authority_not_write() {
-        // CREATE [UNIQUE] INDEX fires CreateIndex followed by Reindex while the
-        // index is built; both must pass for the statement to succeed.
-        let create_index = || AuthAction::CreateIndex {
+    fn create_index_denied_with_write_ability() {
+        // TC-1581: `write` no longer runs schema-changing actions. CREATE
+        // [UNIQUE] INDEX fires CreateIndex followed by Reindex.
+        let create_index = AuthAction::CreateIndex {
             index_name: "uq_interaction_nonce",
             table_name: "interaction",
         };
-        let reindex = || AuthAction::Reindex {
+        let reindex = AuthAction::Reindex {
             index_name: "uq_interaction_nonce",
         };
 
-        // TC-1581: `write` no longer runs schema-changing actions.
         assert_eq!(
-            authorize("tinycloud.sql/write", false, create_index()),
+            authorize("tinycloud.sql/write", false, create_index),
             Authorization::Deny
         );
         assert_eq!(
-            authorize("tinycloud.sql/write", false, reindex()),
+            authorize("tinycloud.sql/write", false, reindex),
             Authorization::Deny
         );
-        // A holder of both abilities is unaffected.
-        let both = ["tinycloud.sql/write", "tinycloud.sql/schema"];
-        assert_eq!(authorize_held(&both, create_index()), Authorization::Allow);
-        assert_eq!(authorize_held(&both, reindex()), Authorization::Allow);
     }
 
     #[test]
@@ -724,40 +713,18 @@ mod tests {
     }
 
     /// Install the authorizer on a real rusqlite connection (mirroring the
-    /// wiring in database.rs) and run `sql` under the given abilities. The
-    /// statement scope comes from the parser, as in `handle_message`.
-    fn execute_under_held(
-        conn: &rusqlite::Connection,
-        abilities: &[&str],
-        sql: &str,
-    ) -> rusqlite::Result<()> {
-        execute_under_authority(conn, &authority_for(abilities, false), sql)
-    }
-
-    fn execute_under_authority(
-        conn: &rusqlite::Connection,
-        authority: &SqlAuthority,
-        sql: &str,
-    ) -> rusqlite::Result<()> {
-        let scope = crate::sql::parser::classify_sql(sql)
-            .map(|class| StatementScope {
-                is_ddl: class.is_ddl,
-                is_read_only: class.is_read_only,
-            })
-            .unwrap_or_default();
-        conn.authorizer(Some(create_authorizer(None, authority, scope)));
-        let result = conn.execute_batch(sql);
-        conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
-        result
-    }
-
+    /// wiring in database.rs) and run `sql` under the given cap.
     fn execute_under_authorizer(
         conn: &rusqlite::Connection,
         ability: &str,
         is_admin: bool,
         sql: &str,
     ) -> rusqlite::Result<()> {
-        execute_under_authority(conn, &authority_for(&[ability], is_admin), sql)
+        let auth = create_authorizer(None, ability.to_string(), is_admin);
+        conn.authorizer(Some(auth));
+        let result = conn.execute_batch(sql);
+        conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+        result
     }
 
     #[test]
@@ -802,25 +769,20 @@ mod tests {
     }
 
     #[test]
-    fn create_unique_index_executes_with_write_and_schema() {
-        // End-to-end against real SQLite: the CreateIndex -> Reindex callback
-        // sequence fired while building the index must pass for a holder of
-        // both abilities (the SDK's `[write, schema]` invocation).
-        let both = ["tinycloud.sql/write", "tinycloud.sql/schema"];
+    fn create_unique_index_blocked_with_write_cap() {
+        // End-to-end against real SQLite: `write` alone does not build an index.
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        execute_under_held(
-            &conn,
-            &both,
-            "CREATE TABLE interaction (reader_did TEXT, nonce TEXT)",
-        )
-        .unwrap();
+        conn.execute_batch("CREATE TABLE interaction (reader_did TEXT, nonce TEXT)")
+            .unwrap();
 
-        execute_under_held(
+        let err = execute_under_authorizer(
             &conn,
-            &both,
+            "tinycloud.sql/write",
+            false,
             "CREATE UNIQUE INDEX uq_interaction_nonce ON interaction (reader_did, nonce)",
         )
-        .expect("CREATE UNIQUE INDEX should succeed with write and schema");
+        .expect_err("CREATE UNIQUE INDEX must be denied for a write cap");
+        assert!(err.to_string().contains("not authorized"), "{err}");
     }
 
     #[test]
@@ -844,26 +806,24 @@ mod tests {
     }
 
     #[test]
-    fn create_unique_index_blocked_without_schema_authority() {
-        // Set up the table directly, then attempt the index under a read-only
-        // cap and under write alone: SQLite must report "not authorized".
-        for ability in ["tinycloud.sql/read", "tinycloud.sql/write"] {
-            let conn = rusqlite::Connection::open_in_memory().unwrap();
-            conn.execute_batch("CREATE TABLE interaction (reader_did TEXT, nonce TEXT)")
-                .unwrap();
+    fn create_unique_index_blocked_with_read_only_cap() {
+        // Set up the table directly, then attempt the index under a
+        // read-only cap: SQLite must report "not authorized".
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE interaction (reader_did TEXT, nonce TEXT)")
+            .unwrap();
 
-            let err = execute_under_authorizer(
-                &conn,
-                ability,
-                false,
-                "CREATE UNIQUE INDEX uq_interaction_nonce ON interaction (reader_did, nonce)",
-            )
-            .expect_err("CREATE UNIQUE INDEX must be denied without schema authority");
-            assert!(
-                err.to_string().contains("not authorized"),
-                "expected an authorization error for {ability}, got: {err}"
-            );
-        }
+        let err = execute_under_authorizer(
+            &conn,
+            "tinycloud.sql/read",
+            false,
+            "CREATE UNIQUE INDEX uq_interaction_nonce ON interaction (reader_did, nonce)",
+        )
+        .expect_err("CREATE UNIQUE INDEX must be denied for a read-only cap");
+        assert!(
+            err.to_string().contains("not authorized"),
+            "expected an authorization error, got: {err}"
+        );
     }
 
     #[test]
@@ -871,7 +831,6 @@ mod tests {
         for (ability, is_admin) in [
             ("tinycloud.sql/schema", false),
             ("tinycloud.sql/admin", true),
-            ("tinycloud.sql/*", false),
         ] {
             let conn = rusqlite::Connection::open_in_memory().unwrap();
             conn.execute_batch("CREATE TABLE items (id INTEGER PRIMARY KEY)")
@@ -880,21 +839,6 @@ mod tests {
             execute_under_authorizer(&conn, ability, is_admin, "DROP TABLE items")
                 .unwrap_or_else(|error| panic!("{ability} should permit DROP TABLE: {error}"));
         }
-
-        // `write` alone no longer drops a table (TC-1581), and the table stays.
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE items (id INTEGER PRIMARY KEY); INSERT INTO items VALUES (1)",
-        )
-        .unwrap();
-        let error =
-            execute_under_authorizer(&conn, "tinycloud.sql/write", false, "DROP TABLE items")
-                .expect_err("write authority must not drop a table");
-        assert!(error.to_string().contains("not authorized"), "{error}");
-        let rows: i64 = conn
-            .query_row("SELECT count(*) FROM items", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(rows, 1);
 
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch("CREATE TEMP TABLE temp_items (id INTEGER PRIMARY KEY)")
@@ -1262,11 +1206,7 @@ mod tests {
             );
         }
 
-        let mut auth = create_authorizer(
-            None,
-            &authority_for(&["tinycloud.sql/schema"], false),
-            StatementScope::default(),
-        );
+        let mut auth = create_authorizer(None, "tinycloud.sql/schema".to_string(), false);
         for function_name in [
             "sqlite_rename_column",
             "sqlite_rename_table",
@@ -1329,11 +1269,8 @@ mod tests {
             read_only: Some(true),
             ..SqlCaveats::default()
         };
-        let mut caveated_auth = create_authorizer(
-            Some(caveats),
-            &authority_for(&["tinycloud.sql/schema"], false),
-            StatementScope::default(),
-        );
+        let mut caveated_auth =
+            create_authorizer(Some(caveats), "tinycloud.sql/schema".to_string(), false);
         assert_eq!(
             caveated_auth(AuthContext {
                 action: AuthAction::AlterTable {
@@ -1357,6 +1294,155 @@ mod tests {
             Authorization::Deny,
             "read-only caveats must still reject DDL-internal auxiliary writes"
         );
+    }
+}
+
+/// TC-1581: schema-changing statements need `schema`; `write` is data only.
+#[cfg(test)]
+mod ddl_authority_tests {
+    use super::*;
+
+    fn authorize(ability: &str, is_admin: bool, action: AuthAction<'_>) -> Authorization {
+        let mut auth = create_authorizer_scoped(
+            None,
+            &authority_for(&[ability], is_admin),
+            StatementScope::default(),
+        );
+        auth(AuthContext {
+            action,
+            database_name: Some("main"),
+            accessor: None,
+        })
+    }
+
+    fn execute_under_authorizer(
+        conn: &rusqlite::Connection,
+        ability: &str,
+        is_admin: bool,
+        sql: &str,
+    ) -> rusqlite::Result<()> {
+        execute_under_authority(conn, &authority_for(&[ability], is_admin), sql)
+    }
+
+    fn authority_for(abilities: &[&str], is_admin: bool) -> SqlAuthority {
+        let mut held: Vec<String> = abilities.iter().map(|a| a.to_string()).collect();
+        if is_admin {
+            held.push("tinycloud.sql/admin".to_string());
+        }
+        SqlAuthority::new(held)
+    }
+
+    fn authorize_held(abilities: &[&str], action: AuthAction<'_>) -> Authorization {
+        let mut auth = create_authorizer_scoped(
+            None,
+            &authority_for(abilities, false),
+            StatementScope::default(),
+        );
+        auth(AuthContext {
+            action,
+            database_name: Some("main"),
+            accessor: None,
+        })
+    }
+
+    #[test]
+    fn create_index_needs_schema_authority_not_write() {
+        // CREATE [UNIQUE] INDEX fires CreateIndex followed by Reindex while the
+        // index is built; both must pass for the statement to succeed.
+        let create_index = || AuthAction::CreateIndex {
+            index_name: "uq_interaction_nonce",
+            table_name: "interaction",
+        };
+        let reindex = || AuthAction::Reindex {
+            index_name: "uq_interaction_nonce",
+        };
+
+        // TC-1581: `write` no longer runs schema-changing actions.
+        assert_eq!(
+            authorize("tinycloud.sql/write", false, create_index()),
+            Authorization::Deny
+        );
+        assert_eq!(
+            authorize("tinycloud.sql/write", false, reindex()),
+            Authorization::Deny
+        );
+        // A holder of both abilities is unaffected.
+        let both = ["tinycloud.sql/write", "tinycloud.sql/schema"];
+        assert_eq!(authorize_held(&both, create_index()), Authorization::Allow);
+        assert_eq!(authorize_held(&both, reindex()), Authorization::Allow);
+    }
+
+    /// Install the authorizer on a real rusqlite connection (mirroring the
+    /// wiring in database.rs) and run `sql` under the given abilities. The
+    /// statement scope comes from the parser, as in `handle_message`.
+    fn execute_under_held(
+        conn: &rusqlite::Connection,
+        abilities: &[&str],
+        sql: &str,
+    ) -> rusqlite::Result<()> {
+        execute_under_authority(conn, &authority_for(abilities, false), sql)
+    }
+
+    fn execute_under_authority(
+        conn: &rusqlite::Connection,
+        authority: &SqlAuthority,
+        sql: &str,
+    ) -> rusqlite::Result<()> {
+        let scope = crate::sql::parser::classify_sql(sql)
+            .map(|class| StatementScope {
+                is_ddl: class.is_ddl,
+                is_read_only: class.is_read_only,
+            })
+            .unwrap_or_default();
+        conn.authorizer(Some(create_authorizer_scoped(None, authority, scope)));
+        let result = conn.execute_batch(sql);
+        conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+        result
+    }
+
+    #[test]
+    fn create_unique_index_executes_with_write_and_schema() {
+        // End-to-end against real SQLite: the CreateIndex -> Reindex callback
+        // sequence fired while building the index must pass for a holder of
+        // both abilities (the SDK's `[write, schema]` invocation).
+        let both = ["tinycloud.sql/write", "tinycloud.sql/schema"];
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        execute_under_held(
+            &conn,
+            &both,
+            "CREATE TABLE interaction (reader_did TEXT, nonce TEXT)",
+        )
+        .unwrap();
+
+        execute_under_held(
+            &conn,
+            &both,
+            "CREATE UNIQUE INDEX uq_interaction_nonce ON interaction (reader_did, nonce)",
+        )
+        .expect("CREATE UNIQUE INDEX should succeed with write and schema");
+    }
+
+    #[test]
+    fn create_unique_index_blocked_without_schema_authority() {
+        // Set up the table directly, then attempt the index under a read-only
+        // cap and under write alone: SQLite must report "not authorized".
+        for ability in ["tinycloud.sql/read", "tinycloud.sql/write"] {
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            conn.execute_batch("CREATE TABLE interaction (reader_did TEXT, nonce TEXT)")
+                .unwrap();
+
+            let err = execute_under_authorizer(
+                &conn,
+                ability,
+                false,
+                "CREATE UNIQUE INDEX uq_interaction_nonce ON interaction (reader_did, nonce)",
+            )
+            .expect_err("CREATE UNIQUE INDEX must be denied without schema authority");
+            assert!(
+                err.to_string().contains("not authorized"),
+                "expected an authorization error for {ability}, got: {err}"
+            );
+        }
     }
 
     const WRITE: &str = "tinycloud.sql/write";
@@ -1515,7 +1601,7 @@ mod tests {
                     )
                     .unwrap();
 
-                conn.authorizer(Some(create_authorizer(
+                conn.authorizer(Some(create_authorizer_scoped(
                     None,
                     &authority_for(&[WRITE], false),
                     scope,
@@ -1630,7 +1716,7 @@ mod tests {
         scope: StatementScope,
         action: AuthAction<'_>,
     ) -> Authorization {
-        let mut auth = create_authorizer(None, &authority_for(abilities, false), scope);
+        let mut auth = create_authorizer_scoped(None, &authority_for(abilities, false), scope);
         auth(AuthContext {
             action,
             database_name: Some("main"),

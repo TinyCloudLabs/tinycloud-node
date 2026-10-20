@@ -168,7 +168,7 @@ secret = "{}"
                 params: vec![SqlValue::Text("alpha".to_string()), SqlValue::Integer(111)],
             },
             None,
-            ["tinycloud.sql/write", "tinycloud.sql/schema"],
+            "tinycloud.sql/admin".to_string(),
         )
         .await?;
     sql_service

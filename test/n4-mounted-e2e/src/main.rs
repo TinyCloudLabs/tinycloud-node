@@ -551,7 +551,7 @@ async fn seed_sql(rocket: &Rocket<Build>) -> Result<()> {
         .state::<tinycloud_core::sql::SqlService>()
         .context("SQL service missing")?;
     use tinycloud_core::sql::{SqlRequest, SqlValue};
-    service.execute(&space, "documents", SqlRequest::Execute { sql: "CREATE TABLE IF NOT EXISTS shared_documents (document_id INTEGER PRIMARY KEY, markdown TEXT NOT NULL)".into(), params: vec![], schema: None }, None, "tinycloud.sql/schema").await.map_err(|error| anyhow::anyhow!("SQL schema seed: {error}"))?;
+    service.execute(&space, "documents", SqlRequest::Execute { sql: "CREATE TABLE IF NOT EXISTS shared_documents (document_id INTEGER PRIMARY KEY, markdown TEXT NOT NULL)".into(), params: vec![], schema: None }, None, "tinycloud.sql/schema".into()).await.map_err(|error| anyhow::anyhow!("SQL schema seed: {error}"))?;
     service
         .execute(
             &space,
@@ -567,7 +567,7 @@ async fn seed_sql(rocket: &Rocket<Build>) -> Result<()> {
                 schema: None,
             },
             None,
-            "tinycloud.sql/write",
+            "tinycloud.sql/write".into(),
         )
         .await
         .map_err(|error| anyhow::anyhow!("SQL row seed: {error}"))?;

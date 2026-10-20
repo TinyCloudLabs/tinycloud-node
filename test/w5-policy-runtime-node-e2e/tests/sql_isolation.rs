@@ -150,7 +150,7 @@ async fn legacy_web_artifacts_load_via_invoke_after_alias_cutover_and_restart() 
             physical,
             serde_json::from_value(sql_write_body(row))?,
             None,
-            ["tinycloud.sql/write", "tinycloud.sql/schema"],
+            "tinycloud.sql/admin".into(),
         )
         .await?;
     }
@@ -530,7 +530,7 @@ async fn legacy_alias_collision_refuses_the_whole_transaction() -> Result<()> {
             name,
             serde_json::from_value(sql_write_body("row"))?,
             None,
-            ["tinycloud.sql/write", "tinycloud.sql/schema"],
+            "tinycloud.sql/admin".into(),
         )
         .await?;
     }
@@ -590,7 +590,7 @@ async fn legacy_inventory_attributes_from_invoked_abilities_without_a_grant() ->
         "only",
         serde_json::from_value(sql_write_body("legacy-row"))?,
         None,
-        ["tinycloud.sql/write", "tinycloud.sql/schema"],
+        "tinycloud.sql/admin".into(),
     )
     .await?;
     let items = database_migration::inventory(&conn, &datadir).await?;

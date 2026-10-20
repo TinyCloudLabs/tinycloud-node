@@ -114,6 +114,19 @@ impl DatabaseHandle {
         &self,
         request: SqlRequest,
         caveats: Option<SqlCaveats>,
+        ability: String,
+        growth: GrowthPolicy,
+    ) -> Result<SqlExecutionResult, SqlError> {
+        self.execute_authorized(request, caveats, SqlAuthority::from(ability), growth)
+            .await
+    }
+
+    /// As [`Self::execute`], judging each statement against every SQL ability
+    /// the invocation holds (TC-1581).
+    pub async fn execute_authorized(
+        &self,
+        request: SqlRequest,
+        caveats: Option<SqlCaveats>,
         authority: SqlAuthority,
         growth: GrowthPolicy,
     ) -> Result<SqlExecutionResult, SqlError> {
@@ -248,18 +261,18 @@ pub fn spawn_actor(
                 } => {
                     let result = match growth {
                         GrowthPolicy::Allow => {
-                            handle_message(&conn, &request, &caveats, &authority)
+                            handle_message_authorized(&conn, &request, &caveats, &authority)
                         }
-                        GrowthPolicy::Forbid => {
-                            handle_message_without_growth(&conn, &request, &caveats, &authority)
-                        }
+                        GrowthPolicy::Forbid => handle_message_without_growth_authorized(
+                            &conn, &request, &caveats, &authority,
+                        ),
                     };
                     conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
 
                     // TC-1586: a PRAGMA changes connection state that would
                     // outlive the request on this shared connection.
                     if request_has_pragma(&request, &caveats)
-                        && storage::reset_connection_state(&conn, &mode).is_err()
+                        && reset_connection_state(&conn, &mode).is_err()
                     {
                         tracing::error!("Failed to reset SQL connection state");
                     }
@@ -393,7 +406,17 @@ const GUARD_UNDO: &str = "ROLLBACK TO tinycloud_storage_guard; RELEASE tinycloud
 /// database did not grow (`PRAGMA page_count` reflects uncommitted pages on
 /// this connection). Every failed guarded request is rolled back, including
 /// schema entries and batch statements that ran before a later rejection.
+#[cfg(test)]
 fn handle_message_without_growth(
+    conn: &rusqlite::Connection,
+    request: &SqlRequest,
+    caveats: &Option<SqlCaveats>,
+    ability: &str,
+) -> Result<SqlExecutionResult, SqlError> {
+    handle_message_without_growth_authorized(conn, request, caveats, &SqlAuthority::from(ability))
+}
+
+fn handle_message_without_growth_authorized(
     conn: &rusqlite::Connection,
     request: &SqlRequest,
     caveats: &Option<SqlCaveats>,
@@ -405,7 +428,7 @@ fn handle_message_without_growth(
         conn.execute_batch(GUARD_BEGIN)
             .map_err(|e| SqlError::Internal(e.to_string()))?;
     }
-    let result = handle_message(conn, request, caveats, authority);
+    let result = handle_message_authorized(conn, request, caveats, authority);
     // An early error return can leave the request's authorizer installed.
     conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
     // ROLLBACK conflict handling can already have undone the transaction.
@@ -467,7 +490,17 @@ impl DdlLog {
     }
 }
 
+#[cfg(test)]
 fn handle_message(
+    conn: &rusqlite::Connection,
+    request: &SqlRequest,
+    caveats: &Option<SqlCaveats>,
+    ability: &str,
+) -> Result<SqlExecutionResult, SqlError> {
+    handle_message_authorized(conn, request, caveats, &SqlAuthority::from(ability))
+}
+
+fn handle_message_authorized(
     conn: &rusqlite::Connection,
     request: &SqlRequest,
     caveats: &Option<SqlCaveats>,
@@ -475,7 +508,11 @@ fn handle_message(
 ) -> Result<SqlExecutionResult, SqlError> {
     let mut ddl_log = DdlLog::default();
     let authorizer = |parsed: &parser::ParsedQuery| {
-        super::authorizer::create_authorizer(caveats.clone(), authority, StatementScope::of(parsed))
+        super::authorizer::create_authorizer_scoped(
+            caveats.clone(),
+            authority,
+            StatementScope::of(parsed),
+        )
     };
 
     match request {
@@ -485,7 +522,7 @@ fn handle_message(
             max_rows,
             max_bytes,
         } => {
-            let parsed = parser::validate_sql(sql, caveats, authority)?;
+            let parsed = parser::validate_sql_authorized(sql, caveats, authority)?;
             ddl_log.note(&parsed);
 
             conn.authorizer(Some(authorizer(&parsed)));
@@ -509,7 +546,7 @@ fn handle_message(
             // schema-changing entry needs a schema-conferring ability.
             if let Some(schema_stmts) = schema {
                 for stmt_sql in schema_stmts {
-                    let parsed = parser::validate_sql(stmt_sql, caveats, authority)?;
+                    let parsed = parser::validate_sql_authorized(stmt_sql, caveats, authority)?;
                     ddl_log.note(&parsed);
                     write_targets.extend(parsed.write_targets.iter().cloned());
                     conn.authorizer(Some(authorizer(&parsed)));
@@ -522,7 +559,7 @@ fn handle_message(
                 }
             }
 
-            let parsed = parser::validate_sql(sql, caveats, authority)?;
+            let parsed = parser::validate_sql_authorized(sql, caveats, authority)?;
             ddl_log.note(&parsed);
             conn.authorizer(Some(authorizer(&parsed)));
 
@@ -545,7 +582,7 @@ fn handle_message(
             // If a later statement fails after some earlier statements applied,
             // MVP intentionally under-emits rather than guessing partial success.
             for stmt in statements {
-                let parsed = parser::validate_sql(&stmt.sql, caveats, authority)?;
+                let parsed = parser::validate_sql_authorized(&stmt.sql, caveats, authority)?;
                 ddl_log.note(&parsed);
                 insert_statements.push(is_insert_statement(&parsed));
                 scopes.push(StatementScope::of(&parsed));
@@ -554,7 +591,8 @@ fn handle_message(
 
             let mut results = Vec::new();
             for ((stmt, is_insert), scope) in statements.iter().zip(insert_statements).zip(scopes) {
-                let auth = super::authorizer::create_authorizer(caveats.clone(), authority, scope);
+                let auth =
+                    super::authorizer::create_authorizer_scoped(caveats.clone(), authority, scope);
                 conn.authorizer(Some(auth));
                 let result = execute_statement(conn, &stmt.sql, &stmt.params, is_insert);
                 conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
@@ -577,7 +615,7 @@ fn handle_message(
             // A named statement is judged as the SQL it holds: one that
             // resolves to DDL needs a schema-conferring ability on the
             // invocation, like the same SQL sent directly.
-            let parsed = parser::validate_sql(&prepared.sql, caveats, authority)?;
+            let parsed = parser::validate_sql_authorized(&prepared.sql, caveats, authority)?;
             ddl_log.note(&parsed);
 
             conn.authorizer(Some(authorizer(&parsed)));
@@ -639,6 +677,35 @@ fn request_has_pragma(request: &SqlRequest, caveats: &Option<SqlCaveats>) -> boo
             .is_some_and(|statement| pragma(&statement.sql)),
         SqlRequest::Export => false,
     }
+}
+
+/// Return the connection to the state `storage::open_connection` leaves it in
+/// (TC-1586).
+///
+/// The actor's connection is shared by every request on a database. A
+/// `PRAGMA` (admin only) changes connection-level state, and that state would
+/// otherwise outlive the request: `writable_schema = ON` would let a later
+/// holder of `write` edit `sqlite_master`, `query_only = ON` would make the
+/// database read-only for everyone, and `foreign_keys = OFF` would disable
+/// integrity checks. Run after every request that held a PRAGMA.
+fn reset_connection_state(conn: &rusqlite::Connection, mode: &StorageMode) -> Result<(), SqlError> {
+    let _timer = QueryTimer::new();
+    conn.execute_batch(
+        "PRAGMA writable_schema = OFF;
+         PRAGMA query_only = OFF;
+         PRAGMA ignore_check_constraints = OFF;
+         PRAGMA recursive_triggers = OFF;
+         PRAGMA case_sensitive_like = OFF;
+         PRAGMA foreign_keys = ON;",
+    )
+    .map_err(|e| SqlError::Internal(e.to_string()))?;
+    if matches!(mode, StorageMode::File(_)) {
+        conn.pragma_update(None, "journal_mode", "wal")
+            .map_err(|e| SqlError::Internal(e.to_string()))?;
+        conn.pragma_update(None, "wal_autocheckpoint", 0)
+            .map_err(|e| SqlError::Internal(e.to_string()))?;
+    }
+    Ok(())
 }
 
 fn is_insert_statement(parsed: &parser::ParsedQuery) -> bool {
@@ -888,7 +955,7 @@ mod tests {
                         params: vec![],
                     },
                     &None,
-                    &SqlAuthority::from("tinycloud.sql/admin"),
+                    "tinycloud.sql/admin",
                 );
                 assert!(result.is_err(), "transaction control was accepted: {sql}");
                 let value: String = conn
@@ -921,7 +988,7 @@ mod tests {
                 max_bytes: None,
             },
             &None,
-            &SqlAuthority::from("tinycloud.sql/admin"),
+            "tinycloud.sql/admin",
         )
         .unwrap();
         let SqlResponse::Query(response) = result.response else {
@@ -937,7 +1004,7 @@ mod tests {
                 params: vec![],
             },
             &None,
-            &SqlAuthority::from("tinycloud.sql/admin"),
+            "tinycloud.sql/admin",
         )
         .unwrap();
         let version: i64 = conn
@@ -967,7 +1034,7 @@ mod tests {
                 params: vec![],
             },
             &None,
-            &SqlAuthority::from("tinycloud.sql/write"),
+            "tinycloud.sql/write",
         )
         .unwrap_err();
         assert!(matches!(error, SqlError::Sqlite(_)));
@@ -982,7 +1049,7 @@ mod tests {
                 params: vec![],
             },
             &None,
-            &SqlAuthority::from("tinycloud.sql/write"),
+            "tinycloud.sql/write",
         )
         .unwrap();
         assert!(conn.is_autocommit());
@@ -1055,7 +1122,7 @@ mod tests {
                 schema: None,
             },
             &None,
-            &SqlAuthority::from("tinycloud.sql/write"),
+            "tinycloud.sql/write",
         )
         .unwrap();
         let SqlResponse::Execute(insert) = insert.response else {
@@ -1075,7 +1142,7 @@ mod tests {
                     schema: None,
                 },
                 &None,
-                &SqlAuthority::from("tinycloud.sql/write"),
+                "tinycloud.sql/write",
             )
             .unwrap();
             let SqlResponse::Execute(response) = result.response else {
@@ -1110,7 +1177,7 @@ mod tests {
                 ],
             },
             &None,
-            &SqlAuthority::from("tinycloud.sql/write"),
+            "tinycloud.sql/write",
         )
         .unwrap();
         let SqlResponse::Batch(batch) = batch.response else {
@@ -1133,7 +1200,7 @@ mod tests {
                 params: vec![],
             },
             &Some(caveats),
-            &SqlAuthority::from("tinycloud.sql/write"),
+            "tinycloud.sql/write",
         )
         .unwrap();
         let SqlResponse::Execute(prepared) = prepared.response else {
@@ -1163,7 +1230,7 @@ mod tests {
                 ],
             },
             &None,
-            &SqlAuthority::from("tinycloud.sql/schema"),
+            "tinycloud.sql/schema",
         )
         .expect_err("a prior DDL statement must not authorize a later CTAS source read");
         assert!(
@@ -1211,7 +1278,7 @@ mod publication_rollback_tests {
             "INSERT INTO connector_meeting(id,title) VALUES('new','Legacy sync')",
             "DELETE FROM connector_meeting WHERE id='new'",
         ] {
-            handle_message(&conn, &SqlRequest::Execute { sql: sql.into(), params: vec![], schema: None }, &None, &SqlAuthority::from("tinycloud.sql/write")).unwrap_or_else(|error| panic!("legacy recovery rejected: {error}"));
+            handle_message(&conn, &SqlRequest::Execute { sql: sql.into(), params: vec![], schema: None }, &None, "tinycloud.sql/write").unwrap_or_else(|error| panic!("legacy recovery rejected: {error}"));
         }
         assert_eq!(
             conn.query_row(
@@ -1249,7 +1316,7 @@ mod publication_rollback_tests {
                 schema: None,
             },
             &None,
-            &SqlAuthority::from("tinycloud.sql/read"),
+            "tinycloud.sql/read",
         );
         assert!(result.is_err());
         assert_eq!(
@@ -1330,7 +1397,7 @@ mod ddl_authority_tests {
         caveats: &Option<SqlCaveats>,
         authority: &SqlAuthority,
     ) -> Result<SqlExecutionResult, SqlError> {
-        handle_message(conn, request, caveats, authority)
+        handle_message_authorized(conn, request, caveats, authority)
     }
 
     fn table_exists(conn: &rusqlite::Connection, name: &str) -> bool {
