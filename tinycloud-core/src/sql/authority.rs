@@ -82,6 +82,11 @@ pub fn ddl_without_schema_count(kind: DdlKind) -> u64 {
         .get()
 }
 
+/// Tests that run statements under `DdlPolicy::Log` bump the one process-wide
+/// counter; those that read it hold this so deltas are exact.
+#[cfg(test)]
+pub(crate) static LOG_COUNTER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Every `tinycloud.sql/*` ability the invocation holds, plus the node's DDL
 /// policy.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

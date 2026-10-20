@@ -93,18 +93,10 @@ pub fn validate_sql_authorized(
         let tokens = Tokenizer::new(&SQLiteDialect {}, sql)
             .tokenize()
             .map_err(|e| SqlError::ParseError(e.to_string()))?;
+        reject_nested_block_comments(&tokens)?;
         let mut terminated = false;
         for token in tokens {
             match token {
-                // sqlparser nests block comments, but SQLite ends at the first
-                // */. Fail closed rather than hiding executable SQL in a token.
-                Token::Whitespace(Whitespace::MultiLineComment(comment))
-                    if comment.contains("*/") =>
-                {
-                    return Err(SqlError::InvalidStatement(
-                        "Nested block comments are not supported by SQLite".into(),
-                    ));
-                }
                 Token::Whitespace(_) | Token::EOF => {}
                 Token::SemiColon => terminated = true,
                 _ if terminated => {
@@ -214,8 +206,31 @@ pub fn validate_sql_authorized(
     })
 }
 
+/// sqlparser nests block comments, but SQLite ends a comment at the first
+/// `*/`. Text after that point is executable SQL to SQLite and a comment to
+/// the parser, so a statement that nests them is refused: fail closed rather
+/// than analyze something other than what runs.
+fn reject_nested_block_comments(tokens: &[Token]) -> Result<(), SqlError> {
+    let nested = tokens.iter().any(|token| {
+        matches!(
+            token,
+            Token::Whitespace(Whitespace::MultiLineComment(comment)) if comment.contains("*/")
+        )
+    });
+    if nested {
+        return Err(SqlError::InvalidStatement(
+            "Nested block comments are not supported by SQLite".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn analyze_statements(sql: &str) -> Result<Analysis, SqlError> {
     let dialect = SQLiteDialect {};
+    // A tokenizer error is left for the parser to report.
+    if let Ok(tokens) = Tokenizer::new(&dialect, sql).tokenize() {
+        reject_nested_block_comments(&tokens)?;
+    }
     let statements =
         Parser::parse_sql(&dialect, sql).map_err(|e| SqlError::ParseError(e.to_string()))?;
 
@@ -1162,5 +1177,28 @@ mod ddl_authority_tests {
         for sql in DDL {
             validate(sql, &[SCHEMA, UNREGISTERED]).unwrap();
         }
+    }
+
+    /// sqlparser nests block comments and SQLite does not, so a statement
+    /// that nests them is read differently by the two. It is refused on every
+    /// path, for every ability.
+    #[test]
+    fn nested_block_comments_are_refused_for_every_statement() {
+        for sql in [
+            "SELECT 1 /* a /* b */ ; DELETE FROM notes; /* c */",
+            "INSERT INTO notes (id) VALUES (1) /* /* */ ; DELETE FROM notes; /* */",
+            "CREATE TABLE IF NOT EXISTS made (id INTEGER) /* /* */ ; DELETE FROM notes; /* */",
+            "PRAGMA user_version /* /* */ ; DELETE FROM notes; /* */",
+        ] {
+            for abilities in [&[READ][..], &[WRITE][..], &[SCHEMA][..], &[ADMIN][..]] {
+                let result = validate(sql, abilities);
+                assert!(result.is_err(), "{abilities:?} {sql}: {result:?}");
+                if !is_pragma_sql(sql) {
+                    assert!(classify_sql(sql).is_err(), "{sql}");
+                }
+            }
+        }
+        // An ordinary comment is unaffected.
+        assert!(validate("SELECT 1 /* plain */", &[READ]).is_ok());
     }
 }

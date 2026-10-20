@@ -1742,6 +1742,7 @@ mod ddl_authority_tests {
 
     #[test]
     fn ddl_policy_switch_off_log_enforce() {
+        let _serial = crate::sql::authority::LOG_COUNTER_LOCK.blocking_lock();
         let create = "CREATE TABLE IF NOT EXISTS made (id INTEGER)";
         for (policy, write_only_may_ddl) in [
             (DdlPolicy::Off, true),
@@ -1794,6 +1795,7 @@ mod ddl_authority_tests {
 
     #[test]
     fn log_mode_counts_each_statement_and_warns_once_without_request_content() {
+        let _serial = crate::sql::authority::LOG_COUNTER_LOCK.blocking_lock();
         let captured = Captured::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(captured.clone())
@@ -1862,6 +1864,7 @@ mod ddl_authority_tests {
 
     #[test]
     fn enforce_and_off_neither_count_nor_warn() {
+        let _serial = crate::sql::authority::LOG_COUNTER_LOCK.blocking_lock();
         let captured = Captured::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(captured.clone())
@@ -1983,6 +1986,51 @@ mod ddl_authority_tests {
             .map(|pragma| read(pragma))
             .collect();
             assert_eq!(opening, after, "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn nested_block_comments_hide_nothing_on_any_request_path() {
+        let hidden =
+            "CREATE TABLE IF NOT EXISTS made (id INTEGER) /* /* */ ; DELETE FROM data; /* */";
+        for abilities in [&[SCHEMA][..], &[WRITE, SCHEMA][..], &[ADMIN][..]] {
+            let authority = held(abilities);
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            conn.execute_batch("CREATE TABLE data (value TEXT); INSERT INTO data VALUES ('kept')")
+                .unwrap();
+            let named = caveats_with(&[("change", hidden)]);
+            for (label, result) in [
+                ("query", run(&conn, &query(hidden), &None, &authority)),
+                (
+                    "schema entry",
+                    run(
+                        &conn,
+                        &execute("SELECT 1", Some(&[hidden])),
+                        &None,
+                        &authority,
+                    ),
+                ),
+                ("batch", run(&conn, &batch(&[hidden]), &None, &authority)),
+                (
+                    "named",
+                    run(
+                        &conn,
+                        &SqlRequest::ExecuteStatement {
+                            name: "change".into(),
+                            params: vec![],
+                        },
+                        &named,
+                        &authority,
+                    ),
+                ),
+            ] {
+                assert!(result.is_err(), "{abilities:?} {label}: {result:?}");
+            }
+            let rows: i64 = conn
+                .query_row("SELECT count(*) FROM data", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(rows, 1, "{abilities:?}");
+            assert!(!table_exists(&conn, "made"), "{abilities:?}");
         }
     }
 }

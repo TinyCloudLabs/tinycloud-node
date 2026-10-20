@@ -1590,6 +1590,7 @@ mod tests {
     /// for `write`; the default is `enforce`.
     #[tokio::test]
     async fn ddl_policy_reaches_the_actor_through_the_service() {
+        let _serial = crate::sql::authority::LOG_COUNTER_LOCK.lock().await;
         use crate::sql::authority::DdlPolicy;
         for (policy, write_may_change_schema) in [
             (None, false),
