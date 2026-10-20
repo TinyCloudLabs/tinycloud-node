@@ -43,10 +43,12 @@ struct Tier {
     /// it may not read or write application tables.
     schema_restricted: bool,
     /// The statement may write SQLite's own schema tables: a schema change
-    /// writes them internally, and SQLite reads its schema through them for
-    /// a pure query (a `pragma_*` table-valued function does). A data
-    /// statement may not (TC-1586): `write` does not edit `sqlite_master`.
+    /// writes them internally. A data statement may not (TC-1586): `write`
+    /// does not edit `sqlite_master`.
     may_write_schema_tables: bool,
+    /// The parser classified the statement as a pure read. Only SQLite's own
+    /// schema bookkeeping UPDATE for a `pragma_*` function is allowed to it.
+    read_only_scope: bool,
 }
 
 impl Tier {
@@ -61,9 +63,8 @@ impl Tier {
             schema_restricted: !is_admin
                 && !can_write_data
                 && (scope.is_ddl || authority.is_schema_only()),
-            may_write_schema_tables: is_admin
-                || (scope.is_ddl && can_change_schema)
-                || scope.is_read_only,
+            may_write_schema_tables: is_admin || (scope.is_ddl && can_change_schema),
+            read_only_scope: scope.is_read_only,
         }
     }
 }
@@ -131,6 +132,10 @@ fn can_update_table(
     schema_ddl_state: Option<&SchemaDdlState>,
 ) -> bool {
     can_write_table(tier, table_name)
+        // SQLite's first use of a `pragma_*` table-valued function in a
+        // connection touches the schema table with an UPDATE, and nothing
+        // else: a pure query gets that one action, not INSERT or DELETE.
+        || (tier.read_only_scope && is_sqlite_schema_table(table_name))
         || (tier.schema_restricted
             && matches!(
                 table_name,
@@ -2046,6 +2051,36 @@ mod ddl_authority_tests {
                     pragma_action(abilities, name, value),
                     (Authorization::Deny, false),
                     "{abilities:?} {name}"
+                );
+            }
+        }
+    }
+
+    /// A pure query gets only the one schema-table UPDATE SQLite makes for a
+    /// `pragma_*` function; it never gets INSERT or DELETE there.
+    #[test]
+    fn a_read_only_statement_may_only_update_the_schema_tables() {
+        let read = StatementScope {
+            is_ddl: false,
+            is_read_only: true,
+        };
+        for table in SCHEMA_TABLES {
+            for abilities in [&[READ][..], &[WRITE][..], &[READ, WRITE][..]] {
+                let [insert, update, delete] = schema_table_writes(table);
+                assert_eq!(
+                    authorize_scoped(abilities, read, update),
+                    Authorization::Allow,
+                    "{abilities:?} {table}"
+                );
+                assert_eq!(
+                    authorize_scoped(abilities, read, insert),
+                    Authorization::Deny,
+                    "{abilities:?} {table}"
+                );
+                assert_eq!(
+                    authorize_scoped(abilities, read, delete),
+                    Authorization::Deny,
+                    "{abilities:?} {table}"
                 );
             }
         }
