@@ -221,4 +221,16 @@ impl StoreSize for MemoryStore {
                 .sum::<u64>()
         }))
     }
+
+    async fn init_size(&self, space: &SpaceId) -> Result<u64, Self::Error> {
+        let objects = self
+            .spaces
+            .entry(space.clone())
+            .or_insert_with(|| Arc::new(DashMap::new()))
+            .clone();
+        Ok(objects
+            .iter()
+            .map(|entry| entry.value().len() as u64)
+            .sum::<u64>())
+    }
 }
