@@ -78,4 +78,10 @@ A kill -9 test cannot inject "after COMMIT, before its fsync completed"; `before
 
 ## Scope notes
 
-A request that carries a `PRAGMA` (admin only) is not wrapped and not gated. `Publication` commands are not gated either. DuckDB is untouched.
+**What counts as a write.** `Execute`, `Batch` and `ExecuteStatement` are always wrapped (a read inside a batch is wrapped too; only telemetry notices). A single `Query` is wrapped, gated and reserved when `parser::classify_sql` says it is not read-only. That classification covers writes nested in a query tree (TC-1585): a `WITH … INSERT` or `WITH … UPDATE` is a write, so it gets the transaction, the owner budget, the size cap and the pre-commit gate like any other write. The answer does not depend on the caller's abilities; a read-tier grant is only a shortcut (its writes are refused anyway). The route uses the same classifier (`sql_request_is_write`) to decide whether to read the owner's budget, and calls the `*_authorized` service entry points (`execute_with_budget_authorized`, `execute_without_growth_authorized`, `execute_authorized`), so the budget path carries the per-statement authority of TC-1581. `needs_transaction` is the one place this is decided for a request.
+
+**PRAGMA.** A request that carries a `PRAGMA` (admin only) is not wrapped and not gated. This also keeps the actor's connection reset after a request that held a non-report `PRAGMA` (TC-1586) outside any transaction: the reset runs after the request, after the transaction has ended. `PRAGMA synchronous` is not on the admin allow-list, so it cannot be read or set through a request.
+
+**Retire order.** When that reset fails, the actor is retired (deregistered before the error reply, TC-1594 tracks closing the connection first). The pre-commit gate and the reservation release are on the same path as before: the reservation is released by a drop guard in `SqlService::execute_locked` when the request returns, whatever the actor did, so the retire order does not change it. A request that triggers the reset held a `PRAGMA`, so it was never wrapped, gated or reserved in the first place.
+
+`Publication` commands are not gated either. DuckDB is untouched.

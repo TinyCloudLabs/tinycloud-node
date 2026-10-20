@@ -1297,6 +1297,73 @@ where
 impl<C, B, K> SpaceDatabase<C, B, K>
 where
     C: ConnectionTrait,
+    B: StoreSize,
+{
+    /// [`Self::store_size`] for the write path (TC-1578). The block store only
+    /// tracks spaces it was told about this process lifetime, and an S3 store
+    /// rebuilds its map at boot from objects with bytes, so a hosted space
+    /// with no blocks is absent from it after a restart. When the block store
+    /// has no entry, the `space` table decides: a hosted space gets a zero
+    /// entry (an existing entry is never reset or lowered) and is metered
+    /// from there; only a space absent from the table reports `None`, the
+    /// "space not found" case. SQL/DuckDB bytes stay in `SqlSizes` and are
+    /// added as in `store_size`, never duplicated into the block store.
+    pub async fn store_size_or_init(
+        &self,
+        space_id: &SpaceId,
+    ) -> Result<Option<u64>, EitherError<DbErr, B::Error>> {
+        let blocks = match self
+            .storage
+            .total_size(space_id)
+            .await
+            .map_err(EitherError::B)?
+        {
+            Some(blocks) => Some(blocks),
+            None => {
+                let hosted = space::Entity::find_by_id(SpaceIdWrap(space_id.clone()))
+                    .one(&self.conn)
+                    .await
+                    .map_err(EitherError::A)?
+                    .is_some();
+                if hosted {
+                    Some(
+                        self.storage
+                            .init_size(space_id)
+                            .await
+                            .map_err(EitherError::B)?,
+                    )
+                } else {
+                    None
+                }
+            }
+        };
+        let sql = self.sql_sizes.space_total(space_id).await;
+        Ok(match (blocks, sql) {
+            (None, 0) => None,
+            (blocks, sql) => Some(blocks.unwrap_or(0) + sql),
+        })
+    }
+
+    /// Boot seed (TC-1578): give every space in the `space` table a block-size
+    /// entry, so a hosted space that has no blocks is metered and writable
+    /// after a restart. Entries the store already has (S3/filesystem bytes)
+    /// are kept as they are. Returns the number of spaces in the table. Call
+    /// after migrations, before serving.
+    pub async fn seed_store_sizes(&self) -> Result<usize, EitherError<DbErr, B::Error>> {
+        let spaces = self.list_space_ids().await.map_err(EitherError::A)?;
+        for space_id in &spaces {
+            self.storage
+                .init_size(space_id)
+                .await
+                .map_err(EitherError::B)?;
+        }
+        Ok(spaces.len())
+    }
+}
+
+impl<C, B, K> SpaceDatabase<C, B, K>
+where
+    C: ConnectionTrait,
     B: ImmutableReadStore,
 {
     pub async fn public_kv_get(

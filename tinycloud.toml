@@ -33,6 +33,13 @@ cors = true
     # synchronous = "full"
     # max_database_bytes = 0             # per database; over it: 507 sql_database_size_limit
     # min_free_bytes = 0                 # disk kept free; short of it: 507 sql_disk_headroom
+    ## Schema-changing SQL (CREATE/ALTER/DROP of tables, views and indexes) needs
+    ## tinycloud.sql/schema (TC-1581); tinycloud.sql/write covers data statements.
+    ## "enforce" (default) refuses the statement, "log" runs it and records it
+    ## (a constant warning and a counter by statement kind, no request content),
+    ## "off" restores the earlier rule that write also suffices for those
+    ## statements; the release's other restrictions apply in every mode. See docs/sql-schema-authority.md.
+    # ddl_requires_schema = "enforce"
     # [global.storage.duckdb]
     # path = "./data/duckdb"
 

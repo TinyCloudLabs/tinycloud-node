@@ -498,6 +498,9 @@ impl StoreSize for S3BlockStore {
     async fn total_size(&self, space: &SpaceId) -> Result<Option<u64>, Self::Error> {
         Ok(self.sizes.get_size(space).await)
     }
+    async fn init_size(&self, space: &SpaceId) -> Result<u64, Self::Error> {
+        Ok(self.sizes.init_size(space.clone()).await)
+    }
 }
 
 #[cfg(test)]

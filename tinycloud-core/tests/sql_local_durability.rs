@@ -183,9 +183,14 @@ fn synchronous_is_full_on_every_file_backed_connection_and_normal_on_request() {
     }
 }
 
+/// An actor runs under either `synchronous` setting through promotion to a
+/// file and a reopen. The setting itself is asserted on the connections in
+/// `synchronous_is_full_on_every_file_backed_connection_and_normal_on_request`:
+/// since TC-1586 an admin can no longer read `PRAGMA synchronous` through the
+/// actor (it is not on the PRAGMA allow-list).
 #[tokio::test]
-async fn an_actor_honours_the_synchronous_setting_after_promotion_and_reopen() {
-    for (setting, expected) in [(Synchronous::Full, 2), (Synchronous::Normal, 1)] {
+async fn an_actor_runs_under_either_synchronous_setting_after_promotion_and_reopen() {
+    for setting in [Synchronous::Full, Synchronous::Normal] {
         let dir = tempfile::tempdir().unwrap();
         let policy = DurabilityPolicy {
             synchronous: setting,
@@ -193,17 +198,14 @@ async fn an_actor_honours_the_synchronous_setting_after_promotion_and_reopen() {
         };
         let first = actor(dir.path(), DB, policy.clone());
         ok(&first, "CREATE TABLE t (v INTEGER)").await; // promotes to a file
-        let value = |rows: Vec<Vec<SqlValue>>| rows[0][0].clone();
+        ok(&first, "INSERT INTO t VALUES (1)").await;
         assert_eq!(
-            value(rows(&first, "PRAGMA synchronous").await),
-            SqlValue::Integer(expected)
+            rows(&first, "PRAGMA journal_mode").await[0][0],
+            SqlValue::Text("wal".into())
         );
         first.shutdown().await.unwrap();
         let reopened = actor(dir.path(), DB, policy);
-        assert_eq!(
-            value(rows(&reopened, "PRAGMA synchronous").await),
-            SqlValue::Integer(expected)
-        );
+        assert_eq!(count(&reopened, "t").await, 1);
     }
 }
 
@@ -333,6 +335,83 @@ async fn a_batch_is_all_or_nothing_under_each_kind_of_rejection() {
 
     // And the same batch passes when nothing is wrong.
     ok(&a, "INSERT INTO t (a) VALUES ('kept')").await;
+    assert_eq!(count(&a, "t").await, 1);
+}
+
+/// TC-1585: a `WITH … INSERT` is a query to the parser but a write to the
+/// node. It gets the transaction, the owner's budget, the size cap and the
+/// pre-commit disk gate, and a refusal leaves nothing: no rows, no checkpoint
+/// change, no reservation.
+#[tokio::test]
+async fn a_nested_write_is_bounded_before_commit_like_any_other_write() {
+    const CTE_WRITE: &str =
+        "WITH c AS (SELECT hex(zeroblob(40000)) AS v) INSERT INTO t (a) SELECT v FROM c";
+    let query = |sql: &str| SqlRequest::Query {
+        sql: sql.into(),
+        params: vec![],
+        max_rows: None,
+        max_bytes: None,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let free = FakeFree::new(64 << 20);
+    let policy = DurabilityPolicy {
+        // 32 pages of 4 KiB.
+        max_database_bytes: 128 * 1024,
+        min_free_bytes: 1,
+        free_space: free.clone(),
+        ..Default::default()
+    };
+    let a = actor(dir.path(), DB, policy.clone());
+    for statement in AMPLIFIED_SCHEMA {
+        ok(&a, statement).await;
+    }
+    let baseline_checkpoint = a.checkpoint().await.unwrap();
+    let wal_before = wal_len(dir.path(), DB);
+
+    // The owner's budget.
+    let over_budget = run(&a, query(CTE_WRITE), GrowthPolicy::Budget(8192)).await;
+    assert!(
+        matches!(over_budget, Err(SqlError::StorageWouldGrow)),
+        "{over_budget:?}"
+    );
+    // The per-database cap.
+    let over_cap = run(
+        &a,
+        query("WITH c AS (SELECT hex(zeroblob(200000)) AS v) INSERT INTO t (a) SELECT v FROM c"),
+        GrowthPolicy::Allow,
+    )
+    .await;
+    assert!(
+        matches!(over_cap, Err(SqlError::DatabaseSizeLimit)),
+        "{over_cap:?}"
+    );
+    // The disk gate, at the pre-commit check.
+    free.set(1 << 10);
+    let no_room = run(
+        &a,
+        query("WITH c AS (SELECT hex(zeroblob(2000)) AS v) INSERT INTO t (a) SELECT v FROM c"),
+        GrowthPolicy::Allow,
+    )
+    .await;
+    assert!(
+        matches!(no_room, Err(SqlError::DiskHeadroom)),
+        "{no_room:?}"
+    );
+    free.set(64 << 20);
+
+    assert_eq!(count(&a, "t").await, 0);
+    assert_eq!(a.checkpoint().await.unwrap(), baseline_checkpoint);
+    assert_eq!(wal_len(dir.path(), DB), wal_before);
+    assert_eq!(policy.budget.reserved(), 0);
+
+    // The same write is kept when it fits.
+    let fits = run(
+        &a,
+        query("WITH c AS (SELECT 'small' AS v) INSERT INTO t (a) SELECT v FROM c"),
+        GrowthPolicy::Budget(1 << 20),
+    )
+    .await;
+    assert!(fits.is_ok(), "{fits:?}");
     assert_eq!(count(&a, "t").await, 1);
 }
 

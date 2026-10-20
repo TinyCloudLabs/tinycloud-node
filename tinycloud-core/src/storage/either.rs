@@ -220,4 +220,10 @@ where
             Either::B(b) => b.total_size(space).await.map_err(EitherError::B),
         }
     }
+    async fn init_size(&self, space: &SpaceId) -> Result<u64, Self::Error> {
+        match self {
+            Either::A(a) => a.init_size(space).await.map_err(EitherError::A),
+            Either::B(b) => b.init_size(space).await.map_err(EitherError::B),
+        }
+    }
 }
