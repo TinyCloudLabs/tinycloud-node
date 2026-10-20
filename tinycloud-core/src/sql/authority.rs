@@ -12,7 +12,7 @@ use prometheus::{register_int_counter_vec, IntCounterVec};
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 
-use crate::policy_capability::{ability_matches, resolve_alias};
+use crate::policy_capability::ability_matches;
 
 const ADMIN: &str = "tinycloud.sql/admin";
 const SCHEMA: &str = "tinycloud.sql/schema";
@@ -130,23 +130,25 @@ impl SqlAuthority {
         self.is_admin() || self.confers(WRITE)
     }
 
-    /// Holds something other than the exact `schema` tier. The exact `schema`
-    /// tier is DDL-only, so a holder of nothing else cannot run data statements.
+    /// Holds an ability that confers data access: `read` (or its `select`
+    /// alias), `write`, `admin` or `*`. Only registered abilities count: an
+    /// unrecognised `tinycloud.sql/*` URN confers nothing, so it neither
+    /// widens nor narrows what the holder may do.
     pub fn has_non_schema_ability(&self) -> bool {
-        self.held.iter().any(|held| resolve_alias(held) != SCHEMA)
+        self.is_admin() || self.confers(WRITE) || self.confers(READ)
     }
 
-    /// Every ability other than `schema` is the exact read tier (`read` or its
-    /// `select` alias). `sql/*` implies read but must still permit writes, so
-    /// this compares the resolved URN instead of using `ability_matches`.
+    /// Holds schema authority and nothing that confers data access, so it may
+    /// run schema statements only. This is not a confers-check: `admin` holds
+    /// `schema` but is not restricted here.
+    pub fn is_schema_only(&self) -> bool {
+        self.confers_schema() && !self.has_non_schema_ability()
+    }
+
+    /// Reads but cannot write: `read` (or `select`) without `write`, `admin` or
+    /// `*`. `sql/*` implies read but must still permit writes.
     pub fn is_read_tier_only(&self) -> bool {
-        let mut non_schema = self
-            .held
-            .iter()
-            .map(|held| resolve_alias(held))
-            .filter(|held| *held != SCHEMA)
-            .peekable();
-        non_schema.peek().is_some() && non_schema.all(|held| held == READ)
+        self.confers(READ) && !self.confers_data_write()
     }
 
     /// Whether a schema-changing statement may run for this holder.
@@ -236,6 +238,25 @@ mod tests {
         assert!(!held(&["tinycloud.sql/read", "tinycloud.sql/write"]).is_read_tier_only());
         assert!(!held(&["tinycloud.sql/*"]).is_read_tier_only());
         assert!(!held(&["tinycloud.sql/schema"]).is_read_tier_only());
+    }
+
+    #[test]
+    fn unregistered_abilities_confer_nothing() {
+        const UNREGISTERED: &str = "tinycloud.sql/not-a-registered-ability";
+        let schema_alone = held(&["tinycloud.sql/schema"]);
+        let with_unregistered = held(&["tinycloud.sql/schema", UNREGISTERED]);
+        for authority in [&schema_alone, &with_unregistered] {
+            assert!(authority.is_schema_only());
+            assert!(!authority.has_non_schema_ability());
+            assert!(!authority.is_read_tier_only());
+            assert!(!authority.confers_data_write());
+        }
+        assert!(held(&["tinycloud.sql/read", UNREGISTERED]).is_read_tier_only());
+        assert!(!held(&["tinycloud.sql/write", UNREGISTERED]).is_read_tier_only());
+        let nothing = held(&[UNREGISTERED]);
+        assert!(!nothing.is_schema_only());
+        assert!(!nothing.has_non_schema_ability());
+        assert!(!nothing.confers_schema());
     }
 
     #[test]

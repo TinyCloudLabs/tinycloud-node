@@ -161,7 +161,7 @@ pub fn validate_sql_authorized(
     // Exact-tier restriction: the `schema` ability is DDL-only. A holder of
     // nothing else cannot run a data statement. This is not a confers-check:
     // a broader ability like `admin` is not restricted here.
-    if (!is_ddl || has_non_ddl) && !authority.has_non_schema_ability() {
+    if (!is_ddl || has_non_ddl) && authority.is_schema_only() {
         return Err(SqlError::PermissionDenied(
             "Schema ability only permits DDL operations".to_string(),
         ));
@@ -1141,5 +1141,26 @@ mod ddl_authority_tests {
         let err =
             validate_sql_authorized("CREATE TABLE t (a)", &caveats, &held(&[SCHEMA])).unwrap_err();
         assert!(matches!(err, SqlError::ReadOnlyViolation));
+    }
+
+    #[test]
+    fn an_unregistered_ability_beside_schema_behaves_like_schema_alone() {
+        const UNREGISTERED: &str = "tinycloud.sql/not-a-registered-ability";
+        for sql in DML
+            .iter()
+            .chain(&["SELECT id FROM notes"])
+            .chain(&CTE_WRITES.map(|(sql, _)| sql))
+        {
+            for abilities in [&[SCHEMA][..], &[SCHEMA, UNREGISTERED][..]] {
+                let err = validate(sql, abilities).unwrap_err();
+                assert!(
+                    matches!(&err, SqlError::PermissionDenied(m) if m.contains("only permits DDL")),
+                    "{abilities:?} {sql}: {err:?}"
+                );
+            }
+        }
+        for sql in DDL {
+            validate(sql, &[SCHEMA, UNREGISTERED]).unwrap();
+        }
     }
 }

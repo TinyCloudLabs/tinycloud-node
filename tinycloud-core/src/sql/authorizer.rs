@@ -55,7 +55,7 @@ impl Tier {
             can_change_schema,
             schema_restricted: !is_admin
                 && !can_write_data
-                && (scope.is_ddl || !authority.has_non_schema_ability()),
+                && (scope.is_ddl || authority.is_schema_only()),
             may_write_schema_tables: is_admin
                 || (scope.is_ddl && can_change_schema)
                 || scope.is_read_only,
@@ -1852,5 +1852,33 @@ mod ddl_authority_tests {
         let error = execute_under_held(&conn, &[WRITE], "SELECT * FROM pragma_function_list")
             .expect_err("a PRAGMA outside the whitelist stays denied");
         assert!(error.to_string().contains("not authorized"), "{error}");
+    }
+
+    /// An unregistered `tinycloud.sql/*` URN confers nothing: beside `schema`
+    /// the holder is still schema-only (no data reads or writes, no CTAS copy).
+    #[test]
+    fn an_unregistered_ability_beside_schema_keeps_the_schema_only_rules() {
+        const UNREGISTERED: &str = "tinycloud.sql/not-a-registered-ability";
+        for abilities in [&[SCHEMA][..], &[SCHEMA, UNREGISTERED][..]] {
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            conn.execute_batch("CREATE TABLE source (id INTEGER); INSERT INTO source VALUES (1)")
+                .unwrap();
+            for sql in [
+                "INSERT INTO source VALUES (2)",
+                "UPDATE source SET id = 3",
+                "DELETE FROM source",
+                "SELECT id FROM source",
+                "CREATE TABLE copied AS SELECT id FROM source",
+            ] {
+                let error = execute_under_held(&conn, abilities, sql)
+                    .expect_err("schema authority stays schema-only");
+                let message = error.to_string();
+                assert!(
+                    message.contains("not authorized") || message.contains("is prohibited"),
+                    "{abilities:?} {sql}: {error}"
+                );
+            }
+            execute_under_held(&conn, abilities, "CREATE TABLE made (id INTEGER)").unwrap();
+        }
     }
 }

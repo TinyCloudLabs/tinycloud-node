@@ -1838,4 +1838,29 @@ mod ddl_authority_tests {
         assert_eq!(ddl_without_schema_count(DdlKind::AlterTable), before);
         assert!(captured.0.lock().unwrap().is_empty());
     }
+
+    #[test]
+    fn an_unregistered_ability_beside_schema_runs_no_data_statement() {
+        const UNREGISTERED: &str = "tinycloud.sql/not-a-registered-ability";
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE data (value TEXT)")
+            .unwrap();
+        for abilities in [&[SCHEMA][..], &[SCHEMA, UNREGISTERED][..]] {
+            let authority = held(abilities);
+            for request in [
+                query("SELECT value FROM data"),
+                execute("INSERT INTO data VALUES ('x')", None),
+                batch(&["DELETE FROM data"]),
+                execute(
+                    "SELECT 1",
+                    Some(&["CREATE TABLE IF NOT EXISTS made (id INTEGER)"]),
+                ),
+            ] {
+                let result = run(&conn, &request, &None, &authority);
+                // The schema entry of the last request is the one statement
+                // schema authority may run; its trailing SELECT is refused.
+                assert!(is_denied(&result), "{abilities:?} {request:?}: {result:?}");
+            }
+        }
+    }
 }
