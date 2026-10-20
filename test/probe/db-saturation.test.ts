@@ -123,6 +123,27 @@ test("loadTargets rejects a window smaller than the breach count", () => {
   assert.throws(() => loadTargets([{ ...base, window_min: 10 }]), ConfigFault);
 });
 
+test("metrics request asks for the 1h period, a value PlanetScale accepts", () => {
+  assert.match(metricsUrl(base), /[?&]period=1h(&|$)/);
+});
+
+test("12 valid points that all breach are unknown when 13 must breach", () => {
+  const t = { ...base, min_points: 12, min_breach_points: 13 };
+  assert.equal(evaluateTarget(t, [cpu(Array(12).fill(100)), idlePool], NOW).status, "unknown");
+});
+
+test("a repeated timestamp counts once, so duplicates cannot fake a breach", () => {
+  const t = { ...base, min_points: 13, min_breach_points: 13 };
+  const dup: Series = { metric: CPU_METRIC, labels: {}, points: Array.from({ length: 13 }, (): Point => [NOW - LAG_SEC - 60, 100]) };
+  assert.equal(evaluateTarget(t, [dup, idlePool], NOW).status, "unknown");
+});
+
+test("loadTargets rejects zero, fractional, or oversize integers", () => {
+  assert.throws(() => loadTargets([{ ...base, min_points: 0 }]), ConfigFault);
+  assert.throws(() => loadTargets([{ ...base, min_breach_points: 2.5 }]), ConfigFault);
+  assert.throws(() => loadTargets([{ ...base, window_min: 59 }]), ConfigFault);
+});
+
 test("loadTargets accepts a null pool and rejects duplicate labels", () => {
   assert.equal(loadTargets([{ ...base, pool: null }])[0].pool, null);
   assert.throws(() => loadTargets([base, base]), ConfigFault);

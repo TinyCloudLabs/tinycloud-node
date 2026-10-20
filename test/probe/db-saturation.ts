@@ -109,7 +109,12 @@ export function loadTargets(raw: unknown): Target[] {
       pool: entry.pool === null ? null : parsePool(entry.pool, at),
     };
     if (target.cpu_pct < 0 || target.cpu_pct > 100) throw new ConfigFault(`${at}: cpu_pct out of range`);
-    if (!Number.isInteger(target.window_min) || target.window_min < 1) throw new ConfigFault(`${at}: window_min must be a positive integer`);
+    if (!Number.isInteger(target.window_min) || target.window_min < 1 || target.window_min * 60 + LAG_SEC > 3600) {
+      throw new ConfigFault(`${at}: window_min must be an integer from 1 to 58`);
+    }
+    for (const key of ["min_points", "min_breach_points"] as const) {
+      if (!Number.isInteger(target[key]) || target[key] < 1) throw new ConfigFault(`${at}: ${key} must be a positive integer`);
+    }
     if (target.min_breach_points > target.window_min || target.min_points > target.window_min) {
       throw new ConfigFault(`${at}: min_points and min_breach_points must not exceed window_min`);
     }
@@ -120,11 +125,11 @@ export function loadTargets(raw: unknown): Target[] {
 /** Metrics endpoint for one branch. Only this endpoint is ever called. */
 export function metricsUrl(t: Target): string {
   const metrics = [CPU_METRIC, ...(t.pool ? [t.pool.metric] : [])];
-  const period = Math.ceil((t.window_min * 60 + LAG_SEC) / 60);
   const enc = encodeURIComponent;
+  // 1h covers window_min plus lag; evaluateRule trims to the window.
   return (
     `https://api.planetscale.com/v1/organizations/${enc(t.org)}/databases/${enc(t.database)}` +
-    `/branches/${enc(t.branch)}/metrics?metrics=${metrics.join(",")}&period=${period}m`
+    `/branches/${enc(t.branch)}/metrics?metrics=${metrics.join(",")}&period=1h`
   );
 }
 
@@ -164,19 +169,25 @@ function evaluateRule(args: {
   if (series.length === 0) return { status: "unknown", detail: `${name}: no series` };
   const hi = nowSec - LAG_SEC;
   const lo = hi - t.window_min * 60;
+  // Fewer valid points than this can prove neither a breach nor health.
+  const needed = Math.max(t.min_points, t.min_breach_points);
   let breach = false;
   let unknown = false;
   const parts: string[] = [];
   for (const s of series) {
-    const values = s.points
-      .filter(([ts, v]) => ts > lo && ts <= hi && v !== null)
-      .map(([, v]) => v as number);
+    // Duplicate timestamps collapse to the last value; only the newest window_min points count.
+    const byTime = new Map<number, number>();
+    for (const [ts, v] of s.points) if (ts > lo && ts <= hi && v !== null) byTime.set(ts, v);
+    const values = [...byTime]
+      .sort(([a], [b]) => a - b)
+      .slice(-t.window_min)
+      .map(([, v]) => v);
     const count = values.filter(above).length;
     parts.push(`[${labelText(s)}] ${count}/${values.length}`);
-    if (values.length < t.min_points) unknown = true;
+    if (values.length < needed) unknown = true;
     else if (count >= t.min_breach_points) breach = true;
   }
-  const detail = `${name} ${parts.join(" ")} (need ${t.min_breach_points} of ${t.window_min} for breach, ${t.min_points} valid to judge)`;
+  const detail = `${name} ${parts.join(" ")} (need ${t.min_breach_points} of ${t.window_min} for breach, ${needed} valid to judge)`;
   if (breach) return { status: "breach", detail };
   if (unknown) return { status: "unknown", detail };
   return { status: "ok", detail };

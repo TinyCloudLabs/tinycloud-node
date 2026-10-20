@@ -16,7 +16,7 @@
  * contain the token, the heartbeat URL, or query text.
  */
 import { readFileSync } from "node:fs";
-import { classify, heartbeatUrl, redact, report, type Delivery, type Fetch } from "./probe-core";
+import { classify, detail, heartbeatUrl, redact, report, type Delivery, type Fetch } from "./probe-core";
 import { ConfigFault, evaluateTarget, loadTargets, metricsUrl, parseSeries, type Series, type Target, type Verdict } from "./db-saturation";
 
 const TIMEOUT_MS = 10_000;
@@ -89,6 +89,15 @@ async function main(): Promise<number> {
   return deliveryFailed ? 1 : 0;
 }
 
-main().then((code) => {
-  process.exitCode = code;
-});
+main().then(
+  (code) => {
+    process.exitCode = code;
+  },
+  (err: unknown) => {
+    const secrets = Object.entries(process.env)
+      .filter(([k, v]) => /^(PLANETSCALE_METRICS_TOKEN|BETTERSTACK_HEARTBEAT_URL)_/.test(k) && v)
+      .map(([, v]) => v as string);
+    console.error(`[db-saturation] crashed: ${detail(err, secrets)}`);
+    process.exitCode = 1;
+  },
+);
