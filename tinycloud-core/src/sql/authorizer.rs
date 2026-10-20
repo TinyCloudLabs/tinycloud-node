@@ -37,19 +37,28 @@ struct Tier {
     /// The statement runs with schema authority and nothing that writes data:
     /// it may not read or write application tables.
     schema_restricted: bool,
+    /// The statement may write SQLite's own schema tables: a schema change
+    /// writes them internally, and SQLite reads its schema through them for
+    /// a pure query (a `pragma_*` table-valued function does). A data
+    /// statement may not (TC-1586): `write` does not edit `sqlite_master`.
+    may_write_schema_tables: bool,
 }
 
 impl Tier {
     fn new(authority: &SqlAuthority, scope: StatementScope) -> Self {
         let is_admin = authority.is_admin();
         let can_write_data = authority.confers_data_write();
+        let can_change_schema = authority.may_change_schema();
         Self {
             is_admin,
             can_write_data,
-            can_change_schema: authority.may_change_schema(),
+            can_change_schema,
             schema_restricted: !is_admin
                 && !can_write_data
                 && (scope.is_ddl || !authority.has_non_schema_ability()),
+            may_write_schema_tables: is_admin
+                || (scope.is_ddl && can_change_schema)
+                || scope.is_read_only,
         }
     }
 }
@@ -62,9 +71,12 @@ fn is_sqlite_schema_table(table_name: &str) -> bool {
 }
 
 fn can_write_table(tier: &Tier, table_name: &str) -> bool {
-    // The second clause lets schema-only authority write the sqlite schema
-    // tables while it runs DDL.
-    tier.can_write_data || (tier.schema_restricted && is_sqlite_schema_table(table_name))
+    if is_sqlite_schema_table(table_name) {
+        // The second clause lets schema-only authority write the sqlite
+        // schema tables while it runs DDL.
+        return tier.may_write_schema_tables || tier.schema_restricted;
+    }
+    tier.can_write_data
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1593,5 +1605,166 @@ mod tests {
             let read = authority_for(&[READ], false).with_ddl_policy(policy);
             assert!(execute_under_authority(&conn, &read, "CREATE TABLE u (a)").is_err());
         }
+    }
+
+    const SCHEMA_TABLES: [&str; 4] = [
+        "sqlite_master",
+        "sqlite_schema",
+        "sqlite_temp_master",
+        "sqlite_temp_schema",
+    ];
+
+    fn schema_table_writes(table: &'static str) -> [AuthAction<'static>; 3] {
+        [
+            AuthAction::Insert { table_name: table },
+            AuthAction::Update {
+                table_name: table,
+                column_name: "sql",
+            },
+            AuthAction::Delete { table_name: table },
+        ]
+    }
+
+    fn authorize_scoped(
+        abilities: &[&str],
+        scope: StatementScope,
+        action: AuthAction<'_>,
+    ) -> Authorization {
+        let mut auth = create_authorizer(None, &authority_for(abilities, false), scope);
+        auth(AuthContext {
+            action,
+            database_name: Some("main"),
+            accessor: None,
+        })
+    }
+
+    /// TC-1586: `write` is a data ability. It does not write SQLite's own
+    /// schema tables, whatever the connection's `writable_schema` says.
+    #[test]
+    fn write_does_not_write_the_sqlite_schema_tables() {
+        let data = StatementScope {
+            is_ddl: false,
+            is_read_only: false,
+        };
+        for table in SCHEMA_TABLES {
+            for abilities in [&[WRITE][..], &[READ, WRITE][..], &["tinycloud.sql/*"][..]] {
+                // `*` is admin-equivalent and keeps its authority.
+                let expected = if abilities == ["tinycloud.sql/*"] {
+                    Authorization::Allow
+                } else {
+                    Authorization::Deny
+                };
+                for action in schema_table_writes(table) {
+                    let label = format!("{abilities:?} {action:?}");
+                    assert_eq!(
+                        authorize_scoped(abilities, data, action),
+                        expected,
+                        "{label}"
+                    );
+                }
+            }
+            // Application tables are unaffected.
+            assert_eq!(
+                authorize_scoped(
+                    &[WRITE],
+                    data,
+                    AuthAction::Insert {
+                        table_name: "notes"
+                    }
+                ),
+                Authorization::Allow
+            );
+        }
+    }
+
+    #[test]
+    fn schema_changes_still_write_the_sqlite_schema_tables() {
+        let ddl = StatementScope {
+            is_ddl: true,
+            is_read_only: false,
+        };
+        for table in SCHEMA_TABLES {
+            for abilities in [
+                &[SCHEMA][..],
+                &[WRITE, SCHEMA][..],
+                &["tinycloud.sql/admin"][..],
+            ] {
+                for action in schema_table_writes(table) {
+                    let label = format!("{abilities:?} {action:?}");
+                    assert_eq!(
+                        authorize_scoped(abilities, ddl, action),
+                        Authorization::Allow,
+                        "{label}"
+                    );
+                }
+            }
+            // Write alone is refused the schema change itself, so it never
+            // reaches these callbacks with DDL authority.
+            for action in schema_table_writes(table) {
+                assert_eq!(authorize_scoped(&[WRITE], ddl, action), Authorization::Deny);
+            }
+        }
+    }
+
+    /// With `writable_schema` ON a connection lets SQL edit `sqlite_master`.
+    /// The authorizer still refuses a data statement.
+    #[test]
+    fn write_cannot_edit_sqlite_master_even_when_the_connection_allows_it() {
+        for sql in [
+            "UPDATE sqlite_master SET name = 'renamed' WHERE name = 'items'",
+            "UPDATE sqlite_master SET sql = 'CREATE TABLE items (id)' WHERE name = 'items'",
+            "DELETE FROM sqlite_master WHERE name = 'items'",
+            "INSERT INTO sqlite_master (type, name, tbl_name, rootpage, sql) VALUES ('table', 'fake', 'fake', 0, 'CREATE TABLE fake (id)')",
+        ] {
+            for abilities in [&[WRITE][..], &[READ, WRITE][..]] {
+                let conn = rusqlite::Connection::open_in_memory().unwrap();
+                conn.execute_batch(
+                    "CREATE TABLE items (id INTEGER); INSERT INTO items VALUES (1); PRAGMA writable_schema = ON;",
+                )
+                .unwrap();
+                let before: String = conn
+                    .query_row(
+                        "SELECT group_concat(name || ':' || sql) FROM sqlite_schema",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+
+                let error = execute_under_held(&conn, abilities, sql)
+                    .expect_err("write must not edit sqlite_master");
+                assert!(error.to_string().contains("not authorized"), "{sql}: {error}");
+
+                let after: String = conn
+                    .query_row(
+                        "SELECT group_concat(name || ':' || sql) FROM sqlite_schema",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(before, after, "{sql}");
+            }
+        }
+    }
+
+    /// A table-valued `pragma_*` function reads SQLite's schema through
+    /// callbacks on the schema tables the first time a connection uses it.
+    /// Closing the schema tables to data statements must not break it.
+    #[test]
+    fn pragma_table_functions_still_work_for_write() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE items (id INTEGER, body TEXT)")
+            .unwrap();
+        for abilities in [&[WRITE][..], &[READ][..], &[READ, WRITE][..]] {
+            execute_under_held(
+                &conn,
+                abilities,
+                "SELECT name FROM pragma_table_info('items')",
+            )
+            .unwrap_or_else(|e| panic!("{abilities:?}: {e}"));
+        }
+        // Only the whitelisted PRAGMAs are reachable that way.
+        let error = execute_under_held(&conn, &[WRITE], "SELECT * FROM pragma_function_list")
+            .expect_err("a PRAGMA outside the whitelist stays denied");
+        assert!(error.to_string().contains("not authorized"), "{error}");
     }
 }

@@ -256,6 +256,14 @@ pub fn spawn_actor(
                     };
                     conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
 
+                    // TC-1586: a PRAGMA changes connection state that would
+                    // outlive the request on this shared connection.
+                    if request_has_pragma(&request, &caveats)
+                        && storage::reset_connection_state(&conn, &mode).is_err()
+                    {
+                        tracing::error!("Failed to reset SQL connection state");
+                    }
+
                     // Post-write promotion check
                     if result.is_ok() && matches!(mode, StorageMode::InMemory) {
                         if let Ok(size) = storage::database_size(&conn) {
@@ -611,6 +619,26 @@ fn is_query_statement(parsed: &parser::ParsedQuery) -> bool {
             parsed.statements.as_slice(),
             [sqlparser::ast::Statement::Query(_)]
         )
+}
+
+/// Whether any statement the request carries is a PRAGMA, including the one a
+/// named statement resolves to. Parse-free: only the first token is read.
+fn request_has_pragma(request: &SqlRequest, caveats: &Option<SqlCaveats>) -> bool {
+    let pragma = parser::is_pragma_sql;
+    match request {
+        SqlRequest::Query { sql, .. } => pragma(sql),
+        SqlRequest::Execute { sql, schema, .. } => {
+            pragma(sql) || schema.iter().flatten().any(|statement| pragma(statement))
+        }
+        SqlRequest::Batch { statements } => {
+            statements.iter().any(|statement| pragma(&statement.sql))
+        }
+        SqlRequest::ExecuteStatement { name, .. } => caveats
+            .as_ref()
+            .and_then(|caveats| caveats.find_statement(name))
+            .is_some_and(|statement| pragma(&statement.sql)),
+        SqlRequest::Export => false,
+    }
 }
 
 fn is_insert_statement(parsed: &parser::ParsedQuery) -> bool {

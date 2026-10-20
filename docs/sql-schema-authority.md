@@ -35,3 +35,9 @@ The warning is not mapped in the log shipper (`log-shipper/diagnostics.json`), s
 ## Clients
 
 The SDK has requested `tinycloud.sql/schema` for DDL since js-sdk 2.5.0 and sends `[write, schema]` for requests that mix both. A client or manifest that runs DDL under `sql/write` only needs `tinycloud.sql/schema` added to its grant.
+
+## Connection state and SQLite's schema tables (TC-1586)
+
+A database's SQLite connection is shared by every request on it. After a request that held a `PRAGMA` (admin only), the node returns the connection to the state it was opened in: `writable_schema`, `query_only`, `foreign_keys`, `ignore_check_constraints`, `recursive_triggers`, `case_sensitive_like`, and WAL mode for a file-backed database.
+
+The SQLite authorizer also refuses a data statement that writes `sqlite_master`, `sqlite_schema` or their temp counterparts. Only a schema change (which writes them internally), a pure query (a `pragma_*` table-valued function reads the schema through them) and `admin` may.

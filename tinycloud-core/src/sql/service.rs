@@ -1643,6 +1643,227 @@ mod tests {
         assert_eq!(rows.rows, vec![vec![SqlValue::Text("updated".to_string())]]);
     }
 
+    async fn pragma_value(service: &SqlService, space: &SpaceId, pragma: &str) -> SqlValue {
+        let result = service
+            .execute(
+                space,
+                "main",
+                SqlRequest::Query {
+                    sql: format!("PRAGMA {pragma}"),
+                    params: Vec::new(),
+                    max_rows: None,
+                    max_bytes: None,
+                },
+                None,
+                "tinycloud.sql/admin",
+            )
+            .await
+            .expect("admin reads a pragma");
+        let SqlResponse::Query(rows) = result.response else {
+            panic!("expected rows");
+        };
+        rows.rows[0][0].clone()
+    }
+
+    /// TC-1586: the actor's connection is shared by every request on a
+    /// database, so connection state an admin PRAGMA changes must not outlive
+    /// its request. A later request on the same database starts from the state
+    /// the connection was opened in, and `write` cannot edit `sqlite_master`.
+    /// Covers an in-memory database and one promoted to a WAL-backed file.
+    #[tokio::test]
+    async fn admin_pragma_state_does_not_outlive_its_request() {
+        for (name, memory_threshold) in [("sql-pragma-mem", u64::MAX), ("sql-pragma-file", 0)] {
+            let repo = artifact_repository().await;
+            let cache = TempDir::new().unwrap();
+            let service = SqlService::new(
+                cache.path().to_string_lossy().to_string(),
+                memory_threshold,
+                repo,
+            );
+            let space = test_space_id(name);
+            service
+                .execute(
+                    &space,
+                    "main",
+                    ddl("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)"),
+                    None,
+                    "tinycloud.sql/schema",
+                )
+                .await
+                .unwrap();
+            service
+                .execute(
+                    &space,
+                    "main",
+                    ddl("INSERT INTO items (name) VALUES ('kept')"),
+                    None,
+                    "tinycloud.sql/write",
+                )
+                .await
+                .unwrap();
+            let journal_mode = pragma_value(&service, &space, "journal_mode").await;
+
+            // An admin request sets state that is not meant to be shared.
+            for pragma in [
+                "writable_schema = ON",
+                "query_only = ON",
+                "foreign_keys = OFF",
+                "ignore_check_constraints = ON",
+                "recursive_triggers = ON",
+            ] {
+                service
+                    .execute(
+                        &space,
+                        "main",
+                        ddl(&format!("PRAGMA {pragma}")),
+                        None,
+                        "tinycloud.sql/admin",
+                    )
+                    .await
+                    .unwrap_or_else(|e| panic!("{name}: {pragma}: {e:?}"));
+            }
+            if memory_threshold == 0 {
+                // `journal_mode` answers with the new mode, so ask for rows.
+                service
+                    .execute(
+                        &space,
+                        "main",
+                        SqlRequest::Query {
+                            sql: "PRAGMA journal_mode = DELETE".to_string(),
+                            params: Vec::new(),
+                            max_rows: None,
+                            max_bytes: None,
+                        },
+                        None,
+                        "tinycloud.sql/admin",
+                    )
+                    .await
+                    .unwrap();
+            }
+
+            // The next request sees the opening state.
+            assert_eq!(
+                pragma_value(&service, &space, "writable_schema").await,
+                SqlValue::Integer(0),
+                "{name}"
+            );
+            assert_eq!(
+                pragma_value(&service, &space, "query_only").await,
+                SqlValue::Integer(0),
+                "{name}"
+            );
+            assert_eq!(
+                pragma_value(&service, &space, "foreign_keys").await,
+                SqlValue::Integer(1),
+                "{name}"
+            );
+            assert_eq!(
+                pragma_value(&service, &space, "ignore_check_constraints").await,
+                SqlValue::Integer(0),
+                "{name}"
+            );
+            assert_eq!(
+                pragma_value(&service, &space, "recursive_triggers").await,
+                SqlValue::Integer(0),
+                "{name}"
+            );
+            assert_eq!(
+                pragma_value(&service, &space, "journal_mode").await,
+                journal_mode,
+                "{name}"
+            );
+
+            // A holder of write only can write data, not the schema table.
+            service
+                .execute(
+                    &space,
+                    "main",
+                    ddl("INSERT INTO items (name) VALUES ('more')"),
+                    None,
+                    "tinycloud.sql/write",
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{name}: write must still write data: {e:?}"));
+            for sql in [
+                "UPDATE sqlite_master SET name = 'hijacked' WHERE name = 'items'",
+                "DELETE FROM sqlite_master WHERE name = 'items'",
+                "INSERT INTO sqlite_master (type, name, tbl_name, rootpage, sql) VALUES ('table', 'fake', 'fake', 0, 'CREATE TABLE fake (id)')",
+            ] {
+                let refused = service
+                    .execute(&space, "main", ddl(sql), None, "tinycloud.sql/write")
+                    .await;
+                assert!(refused.is_err(), "{name}: write must not run {sql}: {refused:?}");
+            }
+            assert_eq!(table_count(&service, &space).await, 2, "{name}");
+        }
+    }
+
+    /// A PRAGMA inside a request that fails, and one a named statement
+    /// resolves to, are covered like any other.
+    #[tokio::test]
+    async fn pragma_state_is_reset_after_a_failed_request_and_a_named_statement() {
+        let repo = artifact_repository().await;
+        let cache = TempDir::new().unwrap();
+        let service = SqlService::new(cache.path().to_string_lossy().to_string(), u64::MAX, repo);
+        let space = test_space_id("sql-pragma-failed");
+        service
+            .execute(
+                &space,
+                "main",
+                ddl("CREATE TABLE t (a)"),
+                None,
+                "tinycloud.sql/schema",
+            )
+            .await
+            .unwrap();
+
+        // schema[] sets the pragma, then the request itself fails.
+        let failed = service
+            .execute(
+                &space,
+                "main",
+                SqlRequest::Execute {
+                    schema: Some(vec!["PRAGMA writable_schema = ON".to_string()]),
+                    sql: "SELECT * FROM no_such_table".to_string(),
+                    params: Vec::new(),
+                },
+                None,
+                "tinycloud.sql/admin",
+            )
+            .await;
+        assert!(failed.is_err());
+        assert_eq!(
+            pragma_value(&service, &space, "writable_schema").await,
+            SqlValue::Integer(0)
+        );
+
+        // A named statement that holds a PRAGMA.
+        let named = Some(SqlCaveats {
+            statements: Some(vec![crate::sql::caveats::PreparedStatement {
+                name: "unsafe".into(),
+                sql: "PRAGMA writable_schema = ON".into(),
+            }]),
+            ..SqlCaveats::default()
+        });
+        service
+            .execute(
+                &space,
+                "main",
+                SqlRequest::ExecuteStatement {
+                    name: "unsafe".into(),
+                    params: Vec::new(),
+                },
+                named,
+                "tinycloud.sql/admin",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            pragma_value(&service, &space, "writable_schema").await,
+            SqlValue::Integer(0)
+        );
+    }
+
     /// TC-626: on a full space, writes that cannot grow the database run and
     /// a growing write is undone. Covers both an in-memory database and one
     /// promoted to a WAL-backed file (threshold 0), which is what large
