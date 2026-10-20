@@ -30,7 +30,8 @@ cors = true
     ## tinycloud.sql/schema (TC-1581); tinycloud.sql/write covers data statements.
     ## "enforce" (default) refuses the statement, "log" runs it and records it
     ## (a constant warning and a counter by statement kind, no request content),
-    ## "off" keeps the earlier behaviour. See docs/sql-schema-authority.md.
+    ## "off" restores the earlier rule that write also suffices for those
+    ## statements; the release's other restrictions apply in every mode. See docs/sql-schema-authority.md.
     # ddl_requires_schema = "enforce"
     # [global.storage.duckdb]
     # path = "./data/duckdb"

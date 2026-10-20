@@ -28,7 +28,13 @@ The SQLite authorizer enforces the same rule on the engine's own callbacks, so a
 |---|---|
 | `"enforce"` (default) | A schema statement without a schema-conferring ability is refused with `403`. |
 | `"log"` | The statement runs as before. Each such statement increments `tinycloud_ddl_without_schema_total{service="sql",kind=…}` and the request logs one constant warning (`sql ddl allowed without schema ability (ddl_requires_schema = log)`). Neither carries SQL text, space ids, DIDs or table names. `kind` is one of `create_table`, `create_view`, `create_index`, `alter_table`, `drop`. |
-| `"off"` | The earlier behaviour: `write` also suffices. |
+| `"off"` | The earlier rule: `write` also suffices for the schema statements `log` counts. The other changes in this document (the `CREATE TRIGGER` refusal, nested block comments, CTE write classification, schema-table and PRAGMA restrictions) apply in every mode. |
+
+`log` counts only statements the parser classifies as schema-changing. A statement the parser does not recognise as such is still refused by the SQLite authorizer unless the policy allows it, and is not counted.
+
+A request that carries both `schema` entries and `sql` is not transactional. The `schema` entries run first and can stay applied if a later statement is refused (only the storage-quota guard rolls a refused request back).
+
+A statement that nests block comments (`/* … /* … */ … */`) is refused for every ability: SQLite ends a comment at the first `*/`, the SQL parser nests them, and the two would read different statements.
 
 The warning is not mapped in the log shipper (`log-shipper/diagnostics.json`), so it ships as an unclassified `node_warning` until it is.
 
