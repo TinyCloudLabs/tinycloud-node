@@ -38,6 +38,11 @@ The SDK has requested `tinycloud.sql/schema` for DDL since js-sdk 2.5.0 and send
 
 ## Connection state and SQLite's schema tables (TC-1586)
 
-A database's SQLite connection is shared by every request on it. After a request that held a `PRAGMA` (admin only), the node returns the connection to the state it was opened in: `writable_schema`, `query_only`, `foreign_keys`, `ignore_check_constraints`, `recursive_triggers`, `case_sensitive_like`, and WAL mode for a file-backed database.
+A database's SQLite connection is shared by every request on it, so connection-level state must not outlive the request that set it.
+
+- The SQLite authorizer allows anyone only the plain schema reports (`table_info`, `table_list`, `table_xinfo`, `database_list`, `index_list`, `index_info`, `foreign_key_list`).
+- An `admin` (or `*`) holder may also set and read `user_version` and `application_id` (database header values), run the check pragmas `integrity_check`, `quick_check` and `foreign_key_check`, and read (not set) `schema_version`, `page_count`, `page_size`, `freelist_count`, `data_version`, `encoding`, `journal_mode`, `foreign_keys`, `writable_schema`, `query_only`, `collation_list`, `compile_options` and `pragma_list`.
+- Every other PRAGMA is refused for everyone, including all forms that set connection-level or process-wide settings and maintenance forms such as `wal_checkpoint`, `optimize` and `incremental_vacuum`.
+- After any request in which the authorizer allowed a PRAGMA outside the plain schema reports, the node resets the connection to the state it was opened in, for an in-memory database (journal mode `memory`) and a file-backed one (WAL). If the reset fails, the database's actor is retired and the next request rebuilds it from the durable copy.
 
 The SQLite authorizer also refuses a data statement that writes `sqlite_master`, `sqlite_schema` or their temp counterparts. Only a schema change (which writes them internally), a pure query (a `pragma_*` table-valued function reads the schema through them) and `admin` may.

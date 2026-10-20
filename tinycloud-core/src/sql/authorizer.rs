@@ -1,3 +1,8 @@
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 
 use super::authority::SqlAuthority;
@@ -180,6 +185,61 @@ pub fn create_authorizer(
     create_authorizer_scoped(caveats, &SqlAuthority::new(held), StatementScope::default())
 }
 
+/// Set once the authorizer has allowed a PRAGMA that is not one of the plain
+/// read-only schema reports. The actor resets the connection after any request
+/// in which this was set (TC-1586).
+pub type PragmaTracker = Arc<AtomicBool>;
+
+/// PRAGMAs anyone may run: reports on the schema that change nothing.
+const READ_ONLY_PRAGMAS: [&str; 7] = [
+    "table_info",
+    "table_list",
+    "table_xinfo",
+    "database_list",
+    "index_list",
+    "index_info",
+    "foreign_key_list",
+];
+
+/// PRAGMAs an admin may also set. They live in the database header, not in
+/// connection state.
+const ADMIN_SETTABLE_PRAGMAS: [&str; 2] = ["user_version", "application_id"];
+
+/// PRAGMAs an admin may run in their reporting form (no value).
+const ADMIN_REPORT_PRAGMAS: [&str; 15] = [
+    "user_version",
+    "application_id",
+    "schema_version",
+    "page_count",
+    "page_size",
+    "freelist_count",
+    "data_version",
+    "encoding",
+    "journal_mode",
+    "foreign_keys",
+    "writable_schema",
+    "query_only",
+    "collation_list",
+    "compile_options",
+    "pragma_list",
+];
+
+/// PRAGMAs that check the database; they take an argument and change nothing.
+const ADMIN_CHECK_PRAGMAS: [&str; 3] = ["integrity_check", "quick_check", "foreign_key_check"];
+
+fn pragma_in(list: &[&str], name: &str) -> bool {
+    list.iter().any(|known| known.eq_ignore_ascii_case(name))
+}
+
+/// Whether an admin may run this PRAGMA. Everything that would change
+/// connection-level or process-wide SQLite settings is refused: the allow-list
+/// is the point, so nothing outside it is reachable by name.
+fn admin_pragma_allowed(name: &str, has_value: bool) -> bool {
+    pragma_in(&ADMIN_SETTABLE_PRAGMAS, name)
+        || pragma_in(&ADMIN_CHECK_PRAGMAS, name)
+        || (!has_value && pragma_in(&ADMIN_REPORT_PRAGMAS, name))
+}
+
 /// The SQLite authorizer for one statement (TC-1581): every action is judged
 /// against all the SQL abilities the invocation holds, and `scope` says what
 /// the parser made of the statement.
@@ -187,6 +247,17 @@ pub fn create_authorizer_scoped(
     caveats: Option<SqlCaveats>,
     authority: &SqlAuthority,
     scope: StatementScope,
+) -> impl FnMut(AuthContext<'_>) -> Authorization {
+    create_authorizer_tracked(caveats, authority, scope, PragmaTracker::default())
+}
+
+/// As [`create_authorizer_scoped`], and records in `pragmas` that a PRAGMA
+/// outside the read-only reports was allowed.
+pub fn create_authorizer_tracked(
+    caveats: Option<SqlCaveats>,
+    authority: &SqlAuthority,
+    scope: StatementScope,
+    pragmas: PragmaTracker,
 ) -> impl FnMut(AuthContext<'_>) -> Authorization {
     let tier = Tier::new(authority, scope);
     let is_admin = tier.is_admin;
@@ -198,18 +269,16 @@ pub fn create_authorizer_scoped(
         // Always deny attach/detach
         AuthAction::Attach { .. } | AuthAction::Detach { .. } => Authorization::Deny,
 
-        // Pragma whitelist
-        AuthAction::Pragma { pragma_name, .. } => {
-            let readonly_pragmas = [
-                "table_info",
-                "table_list",
-                "table_xinfo",
-                "database_list",
-                "index_list",
-                "index_info",
-                "foreign_key_list",
-            ];
-            if readonly_pragmas.contains(&pragma_name) || is_admin {
+        // PRAGMA: plain schema reports for everyone; for an admin, the
+        // allow-list above. Any other PRAGMA is refused.
+        AuthAction::Pragma {
+            pragma_name,
+            pragma_value,
+        } => {
+            if pragma_in(&READ_ONLY_PRAGMAS, pragma_name) {
+                Authorization::Allow
+            } else if is_admin && admin_pragma_allowed(pragma_name, pragma_value.is_some()) {
+                pragmas.store(true, Ordering::Relaxed);
                 Authorization::Allow
             } else {
                 Authorization::Deny
@@ -1879,6 +1948,106 @@ mod ddl_authority_tests {
                 );
             }
             execute_under_held(&conn, abilities, "CREATE TABLE made (id INTEGER)").unwrap();
+        }
+    }
+
+    fn pragma_action(abilities: &[&str], name: &str, value: Option<&str>) -> (Authorization, bool) {
+        let tracker = PragmaTracker::default();
+        let mut auth = create_authorizer_tracked(
+            None,
+            &authority_for(abilities, false),
+            StatementScope::default(),
+            tracker.clone(),
+        );
+        let verdict = auth(AuthContext {
+            action: AuthAction::Pragma {
+                pragma_name: name,
+                pragma_value: value,
+            },
+            database_name: None,
+            accessor: None,
+        });
+        (verdict, tracker.load(Ordering::Relaxed))
+    }
+
+    #[test]
+    fn plain_schema_reports_are_open_and_not_tracked() {
+        for abilities in [&[WRITE][..], &[READ][..], &["tinycloud.sql/admin"][..]] {
+            for name in ["table_info", "TABLE_INFO", "index_list", "foreign_key_list"] {
+                assert_eq!(
+                    pragma_action(abilities, name, Some("t")),
+                    (Authorization::Allow, false),
+                    "{abilities:?} {name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_admin_may_run_only_the_allow_listed_pragmas() {
+        for abilities in [&["tinycloud.sql/admin"][..], &["tinycloud.sql/*"][..]] {
+            // Header values, checks and reports: allowed, and tracked so the
+            // connection is reset after the request.
+            for (name, value) in [
+                ("user_version", Some("3")),
+                ("USER_VERSION", None),
+                ("application_id", Some("1")),
+                ("integrity_check", Some("10")),
+                ("quick_check", None),
+                ("foreign_key_check", Some("t")),
+                ("journal_mode", None),
+                ("foreign_keys", None),
+            ] {
+                assert_eq!(
+                    pragma_action(abilities, name, value),
+                    (Authorization::Allow, true),
+                    "{abilities:?} {name}"
+                );
+            }
+            // Anything that would set connection-level or process-wide
+            // state, or run maintenance, is refused.
+            for (name, value) in [
+                ("writable_schema", Some("ON")),
+                ("journal_mode", Some("DELETE")),
+                ("foreign_keys", Some("OFF")),
+                ("query_only", Some("1")),
+                ("max_page_count", Some("1")),
+                ("cache_spill", Some("0")),
+                ("locking_mode", Some("EXCLUSIVE")),
+                ("synchronous", Some("OFF")),
+                ("soft_heap_limit", Some("1")),
+                ("hard_heap_limit", Some("1")),
+                ("temp_store_directory", Some("x")),
+                ("wal_checkpoint", Some("TRUNCATE")),
+                ("wal_checkpoint", None),
+                ("incremental_vacuum", None),
+                ("optimize", None),
+                ("not_a_pragma", None),
+            ] {
+                assert_eq!(
+                    pragma_action(abilities, name, value),
+                    (Authorization::Deny, false),
+                    "{abilities:?} {name} {value:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn only_an_admin_runs_pragmas_beyond_the_schema_reports() {
+        for abilities in [
+            &[WRITE][..],
+            &[SCHEMA][..],
+            &[WRITE, SCHEMA][..],
+            &[READ][..],
+        ] {
+            for (name, value) in [("user_version", Some("3")), ("journal_mode", None)] {
+                assert_eq!(
+                    pragma_action(abilities, name, value),
+                    (Authorization::Deny, false),
+                    "{abilities:?} {name}"
+                );
+            }
         }
     }
 }

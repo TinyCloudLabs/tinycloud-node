@@ -17,7 +17,7 @@ use crate::request_telemetry::{self, QueryTimer, RequestContext};
 
 use super::{
     authority::{record_ddl_without_schema, SqlAuthority},
-    authorizer::StatementScope,
+    authorizer::{PragmaTracker, StatementScope},
     caveats::SqlCaveats,
     parser,
     storage::{self, StorageMode},
@@ -259,22 +259,37 @@ pub fn spawn_actor(
                     growth,
                     response_tx,
                 } => {
+                    let pragmas = PragmaTracker::default();
                     let result = match growth {
-                        GrowthPolicy::Allow => {
-                            handle_message_authorized(&conn, &request, &caveats, &authority)
-                        }
+                        GrowthPolicy::Allow => handle_message_authorized(
+                            &conn, &request, &caveats, &authority, &pragmas,
+                        ),
                         GrowthPolicy::Forbid => handle_message_without_growth_authorized(
-                            &conn, &request, &caveats, &authority,
+                            &conn, &request, &caveats, &authority, &pragmas,
                         ),
                     };
                     conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
 
-                    // TC-1586: a PRAGMA changes connection state that would
-                    // outlive the request on this shared connection.
-                    if request_has_pragma(&request, &caveats)
-                        && reset_connection_state(&conn, &mode).is_err()
+                    // TC-1586: the connection is shared by every request on
+                    // this database. After any request in which the
+                    // authorizer allowed a PRAGMA outside the plain schema
+                    // reports, reset it; if that fails, serve no further
+                    // request on this connection (the next one rebuilds it).
+                    if pragmas.load(Ordering::Relaxed)
+                        && connection_reset_failed(&conn, &mode, &space_id, &db_name)
                     {
-                        tracing::error!("Failed to reset SQL connection state");
+                        tracing::error!(
+                            "SQL connection state could not be reset; retiring the database actor"
+                        );
+                        // Deregister first, so the request that follows the
+                        // error builds a new actor instead of finding this one.
+                        databases.remove_if(&(space_id.clone(), db_name.clone()), |_, handle| {
+                            handle.id == id
+                        });
+                        let _ = response_tx.send(Err(SqlError::Internal(
+                            "SQL connection state could not be reset".into(),
+                        )));
+                        break None;
                     }
 
                     // Post-write promotion check
@@ -413,7 +428,13 @@ fn handle_message_without_growth(
     caveats: &Option<SqlCaveats>,
     ability: &str,
 ) -> Result<SqlExecutionResult, SqlError> {
-    handle_message_without_growth_authorized(conn, request, caveats, &SqlAuthority::from(ability))
+    handle_message_without_growth_authorized(
+        conn,
+        request,
+        caveats,
+        &SqlAuthority::from(ability),
+        &PragmaTracker::default(),
+    )
 }
 
 fn handle_message_without_growth_authorized(
@@ -421,6 +442,7 @@ fn handle_message_without_growth_authorized(
     request: &SqlRequest,
     caveats: &Option<SqlCaveats>,
     authority: &SqlAuthority,
+    pragmas: &PragmaTracker,
 ) -> Result<SqlExecutionResult, SqlError> {
     let before = page_count(conn)?;
     {
@@ -428,7 +450,7 @@ fn handle_message_without_growth_authorized(
         conn.execute_batch(GUARD_BEGIN)
             .map_err(|e| SqlError::Internal(e.to_string()))?;
     }
-    let result = handle_message_authorized(conn, request, caveats, authority);
+    let result = handle_message_authorized(conn, request, caveats, authority, pragmas);
     // An early error return can leave the request's authorizer installed.
     conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
     // ROLLBACK conflict handling can already have undone the transaction.
@@ -497,7 +519,13 @@ fn handle_message(
     caveats: &Option<SqlCaveats>,
     ability: &str,
 ) -> Result<SqlExecutionResult, SqlError> {
-    handle_message_authorized(conn, request, caveats, &SqlAuthority::from(ability))
+    handle_message_authorized(
+        conn,
+        request,
+        caveats,
+        &SqlAuthority::from(ability),
+        &PragmaTracker::default(),
+    )
 }
 
 fn handle_message_authorized(
@@ -505,13 +533,15 @@ fn handle_message_authorized(
     request: &SqlRequest,
     caveats: &Option<SqlCaveats>,
     authority: &SqlAuthority,
+    pragmas: &PragmaTracker,
 ) -> Result<SqlExecutionResult, SqlError> {
     let mut ddl_log = DdlLog::default();
     let authorizer = |parsed: &parser::ParsedQuery| {
-        super::authorizer::create_authorizer_scoped(
+        super::authorizer::create_authorizer_tracked(
             caveats.clone(),
             authority,
             StatementScope::of(parsed),
+            pragmas.clone(),
         )
     };
 
@@ -591,8 +621,12 @@ fn handle_message_authorized(
 
             let mut results = Vec::new();
             for ((stmt, is_insert), scope) in statements.iter().zip(insert_statements).zip(scopes) {
-                let auth =
-                    super::authorizer::create_authorizer_scoped(caveats.clone(), authority, scope);
+                let auth = super::authorizer::create_authorizer_tracked(
+                    caveats.clone(),
+                    authority,
+                    scope,
+                    pragmas.clone(),
+                );
                 conn.authorizer(Some(auth));
                 let result = execute_statement(conn, &stmt.sql, &stmt.params, is_insert);
                 conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
@@ -659,35 +693,14 @@ fn is_query_statement(parsed: &parser::ParsedQuery) -> bool {
         )
 }
 
-/// Whether any statement the request carries is a PRAGMA, including the one a
-/// named statement resolves to. Parse-free: only the first token is read.
-fn request_has_pragma(request: &SqlRequest, caveats: &Option<SqlCaveats>) -> bool {
-    let pragma = parser::is_pragma_sql;
-    match request {
-        SqlRequest::Query { sql, .. } => pragma(sql),
-        SqlRequest::Execute { sql, schema, .. } => {
-            pragma(sql) || schema.iter().flatten().any(|statement| pragma(statement))
-        }
-        SqlRequest::Batch { statements } => {
-            statements.iter().any(|statement| pragma(&statement.sql))
-        }
-        SqlRequest::ExecuteStatement { name, .. } => caveats
-            .as_ref()
-            .and_then(|caveats| caveats.find_statement(name))
-            .is_some_and(|statement| pragma(&statement.sql)),
-        SqlRequest::Export => false,
-    }
-}
-
 /// Return the connection to the state `storage::open_connection` leaves it in
 /// (TC-1586).
 ///
-/// The actor's connection is shared by every request on a database. A
-/// `PRAGMA` (admin only) changes connection-level state, and that state would
-/// otherwise outlive the request: `writable_schema = ON` would let a later
-/// holder of `write` edit `sqlite_master`, `query_only = ON` would make the
-/// database read-only for everyone, and `foreign_keys = OFF` would disable
-/// integrity checks. Run after every request that held a PRAGMA.
+/// The actor's connection is shared by every request on a database, so
+/// connection-level state must not outlive the request that changed it. The
+/// authorizer allows an admin only a short list of PRAGMAs, none of which
+/// change connection state; this reset is the backstop for anything that
+/// list misses. It covers in-memory and file-backed connections alike.
 fn reset_connection_state(conn: &rusqlite::Connection, mode: &StorageMode) -> Result<(), SqlError> {
     let _timer = QueryTimer::new();
     conn.execute_batch(
@@ -696,16 +709,57 @@ fn reset_connection_state(conn: &rusqlite::Connection, mode: &StorageMode) -> Re
          PRAGMA ignore_check_constraints = OFF;
          PRAGMA recursive_triggers = OFF;
          PRAGMA case_sensitive_like = OFF;
+         PRAGMA defer_foreign_keys = OFF;
+         PRAGMA reverse_unordered_selects = OFF;
+         PRAGMA automatic_index = ON;
+         PRAGMA read_uncommitted = OFF;
+         PRAGMA cell_size_check = OFF;
+         PRAGMA legacy_alter_table = OFF;
+         PRAGMA locking_mode = NORMAL;
+         PRAGMA temp_store = DEFAULT;
          PRAGMA foreign_keys = ON;",
     )
     .map_err(|e| SqlError::Internal(e.to_string()))?;
-    if matches!(mode, StorageMode::File(_)) {
-        conn.pragma_update(None, "journal_mode", "wal")
-            .map_err(|e| SqlError::Internal(e.to_string()))?;
+    let (journal_mode, wal) = match mode {
+        StorageMode::File(_) => ("wal", true),
+        StorageMode::InMemory => ("memory", false),
+    };
+    conn.pragma_update(None, "journal_mode", journal_mode)
+        .map_err(|e| SqlError::Internal(e.to_string()))?;
+    if wal {
         conn.pragma_update(None, "wal_autocheckpoint", 0)
             .map_err(|e| SqlError::Internal(e.to_string()))?;
     }
     Ok(())
+}
+
+/// Reset after a request that was allowed a PRAGMA. `true` when it failed, in
+/// which case the actor must not serve another request on this connection.
+fn connection_reset_failed(
+    conn: &rusqlite::Connection,
+    mode: &StorageMode,
+    space_id: &str,
+    db_name: &str,
+) -> bool {
+    injected_reset_failure(space_id, db_name) || reset_connection_state(conn, mode).is_err()
+}
+
+#[cfg(test)]
+pub(crate) static RESET_FAILURES: std::sync::Mutex<Vec<(String, String)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn injected_reset_failure(space_id: &str, db_name: &str) -> bool {
+    RESET_FAILURES
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(space, db)| space == space_id && db == db_name)
+}
+
+#[cfg(not(test))]
+fn injected_reset_failure(_space_id: &str, _db_name: &str) -> bool {
+    false
 }
 
 fn is_insert_statement(parsed: &parser::ParsedQuery) -> bool {
@@ -1397,7 +1451,7 @@ mod ddl_authority_tests {
         caveats: &Option<SqlCaveats>,
         authority: &SqlAuthority,
     ) -> Result<SqlExecutionResult, SqlError> {
-        handle_message_authorized(conn, request, caveats, authority)
+        handle_message_authorized(conn, request, caveats, authority, &PragmaTracker::default())
     }
 
     fn table_exists(conn: &rusqlite::Connection, name: &str) -> bool {
@@ -1861,6 +1915,74 @@ mod ddl_authority_tests {
                 // schema authority may run; its trailing SELECT is refused.
                 assert!(is_denied(&result), "{abilities:?} {request:?}: {result:?}");
             }
+        }
+    }
+
+    /// TC-1586: the reset returns a connection to the state `open_connection`
+    /// leaves it in, for an in-memory connection (journal mode included) and a
+    /// file-backed one.
+    #[test]
+    fn reset_restores_the_opening_state_for_memory_and_file_connections() {
+        let dir = tempfile::TempDir::new().unwrap();
+        for mode in [
+            StorageMode::InMemory,
+            StorageMode::File(dir.path().join("reset.db")),
+        ] {
+            let conn = storage::open_connection(&mode).unwrap();
+            conn.execute_batch("CREATE TABLE t (a)").unwrap();
+            let read = |pragma: &str| -> String {
+                conn.query_row(&format!("PRAGMA {pragma}"), [], |row| {
+                    row.get::<_, rusqlite::types::Value>(0)
+                        .map(|value| match value {
+                            rusqlite::types::Value::Integer(n) => n.to_string(),
+                            rusqlite::types::Value::Text(s) => s,
+                            other => format!("{other:?}"),
+                        })
+                })
+                .unwrap()
+            };
+            let opening: Vec<String> = [
+                "journal_mode",
+                "foreign_keys",
+                "writable_schema",
+                "query_only",
+                "ignore_check_constraints",
+                "recursive_triggers",
+                "reverse_unordered_selects",
+            ]
+            .iter()
+            .map(|pragma| read(pragma))
+            .collect();
+
+            let other_journal_mode = if matches!(mode, StorageMode::InMemory) {
+                "OFF"
+            } else {
+                "DELETE"
+            };
+            conn.execute_batch(&format!(
+                "PRAGMA writable_schema = ON; PRAGMA query_only = ON;
+                 PRAGMA foreign_keys = OFF; PRAGMA ignore_check_constraints = ON;
+                 PRAGMA recursive_triggers = ON; PRAGMA reverse_unordered_selects = ON;
+                 PRAGMA journal_mode = {other_journal_mode};"
+            ))
+            .unwrap();
+            assert_ne!(read("journal_mode"), opening[0], "the test must change it");
+            assert_eq!(read("foreign_keys"), "0");
+
+            reset_connection_state(&conn, &mode).unwrap();
+            let after: Vec<String> = [
+                "journal_mode",
+                "foreign_keys",
+                "writable_schema",
+                "query_only",
+                "ignore_check_constraints",
+                "recursive_triggers",
+                "reverse_unordered_selects",
+            ]
+            .iter()
+            .map(|pragma| read(pragma))
+            .collect();
+            assert_eq!(opening, after, "{mode:?}");
         }
     }
 }
