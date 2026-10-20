@@ -2,6 +2,42 @@
 
 ## [Unreleased]
 
+### Changes
+
+- Schema-changing SQL statements now require `tinycloud.sql/schema` (TC-1581). `tinycloud.sql/write` covers data statements only (`INSERT`, `UPDATE`, `DELETE`, `SELECT`). `CREATE`, `ALTER` and `DROP` of tables, views and indexes need a schema-conferring ability: `sql/schema`, `sql/admin` or `sql/*`. This is judged for every statement of a request against all the SQL abilities the invocation holds, in `query`, `execute`, the `schema` list of `execute`, `batch` and named statements, and again by the SQLite authorizer, which now also refuses `CREATE TRIGGER`. A client that holds both `write` and `schema` (the SDK sends both for `execute({ schema })` and for migrations) is unaffected; the SDK has requested `sql/schema` for DDL since 2.5.0. `PRAGMA` still needs `sql/admin`. The storage-quota gate classifies a statement as a write whoever may run it. Configurable with `[global.storage.sql] ddl_requires_schema = "enforce" | "log" | "off"` (default `enforce`): `log` runs the statement and records it, with one constant warning per request and a counter by service and statement kind, and no SQL text, space ids, DIDs or table names; `off` restores the earlier rule that `write` also suffices for the statements `log` counts; the other changes in this release (the `CREATE TRIGGER` refusal, the nested-block-comment refusal, the CTE write classification, the schema-table and PRAGMA restrictions) apply in every mode. `log` counts only statements the parser classifies as schema-changing. A request that mixes `schema` entries and `sql` is not transactional: the schema entries run first and can stay applied if a later statement is refused. No migration; the default needs no compose change. See `docs/sql-schema-authority.md`.
+- Fixed `WITH … INSERT` and `WITH … UPDATE` SQL statements being classified as reads (TC-1585). They skipped the storage-quota gate, emitted no write-hook events and reported no touched table, so a write that changed the database was not made durable until a later write did. Any statement tree that contains an `INSERT` or `UPDATE` is now a write: it is quota-gated, publishes write events for its table, is persisted, and is refused to a read-tier grant and to a `readOnly` caveat. `WITH … DELETE` is still not accepted by the SQL parser, for any ability.
+- Connection-level SQLite state no longer outlives a request on a database's shared connection (TC-1586). An `sql/admin` holder may now run only an allow-list of PRAGMAs: the plain schema reports, the database header values `user_version` and `application_id` (set or read), the check pragmas `integrity_check`, `quick_check` and `foreign_key_check`, and read-only reports such as `journal_mode`, `foreign_keys` and `page_count`. Any other PRAGMA, including every form that sets connection-level or process-wide settings, is refused. After any request in which the authorizer allowed a PRAGMA outside the plain schema reports, the node also resets the connection to its opening state, for in-memory and file-backed databases alike; if that reset fails, the database's actor is retired and the next request rebuilds it from the durable copy. The SQLite authorizer also no longer lets a data statement write `sqlite_master`, `sqlite_schema` or their temp counterparts: only a schema change (which writes them internally), a pure query, and `admin` do. `sql/write` keeps writing application tables.
+
+## [1.21.5] - 2026-10-20
+
+### Release notes
+
+- **Fix (TC-1578, #387):** a hosted space that was empty at boot (no blocks and no SQL or DuckDB bytes) was dropped from the block store's size map, so its first write after a restart answered `404 space not found`. On production this affected 2,000 of 3,988 spaces (741 accounts) at about 01:2xZ on 2026-10-20. Boot now gives every row of the `space` table a size entry before the node serves. **A database error at that step fails startup.**
+- **Fix:** re-hosting a space that has data no longer resets its metered block usage to zero (it was a quota bypass). `init_size` is atomic and never lowers an existing entry.
+- No database migrations.
+- Rollback is the 1.21.4 image (digest b4953184), with no database step.
+
+### Changes
+
+- Fixed hosted spaces with no blocks and no SQL/DuckDB bytes becoming unwritable after a node restart when a storage limit is configured (TC-1578). The write path answered 404 "space not found" because the S3 block store only sizes spaces that have objects at boot. A write to a hosted space the block store has no size for now initialises its entry from the `space` table and is then checked against the limit as usual; only a space absent from the table is 404. Boot also gives every space in the table a size entry. SQL/DuckDB bytes are still counted through the SQL size mirror, not the block store.
+- Fixed re-hosting a space that has data resetting its metered block usage to zero: `SpaceSizes::init_size` no longer overwrites an existing entry.
+
+## [1.21.4] - 2026-10-19
+
+### Release notes
+
+- Security dependency updates for open Dependabot alerts (#381), including the S3 storage backend's port from `aws-sdk-s3` 0.19 to 1.x. The S3 client sets request checksums and response validation to `WhenRequired` and pins the SDK behaviour version, which restores the checksum behaviour of the 0.19 SDK. `rustls-webpki` 0.101.7 (via `rocket_http` and `reqwest` 0.11) is still in the dependency graph and is not fixed by this release.
+- Pinned per-policy credential issuer set (TC-1452, #378): inert, no runtime effect until `share_email.credential_issuers` is configured.
+- Tests and docs only (#364): Policy/v3 root revocation tests and a doc, no runtime effect.
+- No database migrations.
+- Rollback is the 1.21.3 image (digest 601d91f1), with no database step.
+
+### Changes
+
+- Dependency updates for open Dependabot alerts on the root `Cargo.lock`, including the S3 storage backend's port from `aws-sdk-s3` 0.19 to 1.x (checksums `WhenRequired`, SDK behaviour version pinned); the `test/m1-realdata-e2e` and `test/w5-policy-runtime-node-e2e` lockfiles are refreshed. `rustls-webpki` 0.101.7 via `rocket_http` and `reqwest` 0.11 remains.
+- Pinned per-policy credential issuer set (TC-1452, minor). `share_email.credential_issuers` takes a list of `{issuerDid, kid, alg: "EdDSA", publicKey, vcts, profiles, notBefore, retiredAt?, notAfter?}` entries; the legacy single issuer (`share_email.issuer_*`) joins as one more entry. policy/v3 credential admission looks the issuer up by the exact `(issuerDid, kid)` pair with no network fetch and only for DID methods on the allow-list, applies `notBefore`/`notAfter` to the clock and `notBefore`/`retiredAt` to the signed `iat` after the signature check, and admits only the entry's `vcts` and `profiles`. A policy names the issuer, so another issuer's credential cannot satisfy it; `issuerKid` in a policy's credential requirement is now optional. The node refuses to start on a set-load violation (non-EdDSA entry, duplicate `kid`, `kid` not `issuerDid#fragment`, `retiredAt` after `notAfter`, malformed or non-`Z` time, non-canonical Ed25519 key). Credentials verified through a configured entry must carry the JWT header `typ: "vc+sd-jwt"` and a header `kid`, which selects the entry and must equal the envelope and policy `kid`; the legacy single-issuer entry still accepts a header without `typ` or `kid`. The set also refuses, at start, a fixture or repeated-byte public key (outside the hermetic fixture build), one public key pinned twice, `notBefore` after `notAfter`, `retiredAt` before `notBefore`, and any issuer DID that is not `did:web`. The legacy entry has no validity window: its only compromise lever is removing it from the trust bundle. The issuer pin checks now also run when `issuer_public_key` is set and `share_email.enabled` is off.
+- Tests and docs (no behaviour change): a Policy/v3 root is revoked by its signer, the owner of a space its abilities touch (including a did:pkh wallet over SIWE), or the holder of a revoke control naming the space's delegations and the root's encryption network, over the generic `POST /revoke`; the JSON `RootRevocation/v1` route stays limited to the root's signer and, for the enforcement root, the enforcer. See `docs/policy-root-revocation.md` (TC-1423).
+
 ## [1.21.3] - 2026-10-19
 
 ### Release notes
