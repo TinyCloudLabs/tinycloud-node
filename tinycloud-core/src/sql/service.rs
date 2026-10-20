@@ -3429,7 +3429,7 @@ mod tests {
         let service = SqlService::new(cache.path().to_string_lossy().into_owned(), u64::MAX, repo);
         read(&service, &space).await.unwrap();
         service
-            .execute(&space, "b", insert("w"), None, "tinycloud.sql/write".into())
+            .execute(&space, "b", insert("w"), None, "tinycloud.sql/admin".into())
             .await
             .unwrap();
         let service = service.with_wait_bounds(wait_bounds(200));
