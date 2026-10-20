@@ -32,6 +32,7 @@ pub mod config;
 pub mod dstack;
 pub mod egress;
 pub mod epoch_head_backfill;
+pub mod held_email;
 pub mod hooks;
 pub mod invocation_replay;
 pub mod issuer_set;
@@ -726,6 +727,8 @@ pub async fn app_with_control(
     if !credential_issuers.is_empty() {
         policy_v3_runtime = policy_v3_runtime.with_credential_issuers(credential_issuers);
     }
+    policy_v3_runtime =
+        policy_v3_runtime.with_held_credentials(&tinycloud_config.held_credentials)?;
 
     #[cfg(feature = "duckdb")]
     let duckdb_service = DuckDbService::new(

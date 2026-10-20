@@ -49,6 +49,10 @@ pub struct Config {
     pub public_spaces: PublicSpacesConfig,
     #[serde(default)]
     pub share_email: ShareEmailConfig,
+    /// TC-1452: admission of held email credential presentations. Default OFF;
+    /// inert until enabled.
+    #[serde(default)]
+    pub held_credentials: HeldCredentialsConfig,
     #[serde(default)]
     pub retention: RetentionConfig,
     #[serde(default)]
@@ -180,6 +184,15 @@ fn default_share_clock_skew() -> i64 {
 }
 fn default_share_challenge_ttl() -> u64 {
     120
+}
+/// TC-1452: held email credential admission. Inert unless `enabled`.
+#[derive(Serialize, Deserialize, Debug, Default, Clone, Hash, PartialEq, Eq)]
+#[serde(default)]
+pub struct HeldCredentialsConfig {
+    /// Default OFF. When off, held presentations are refused before any work.
+    pub enabled: bool,
+    /// The relying-party audience a SIWE message must name. Required when enabled.
+    pub audience: Option<String>,
 }
 fn default_share_space_name() -> String {
     "default".to_owned()

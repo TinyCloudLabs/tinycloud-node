@@ -29,6 +29,7 @@ pub mod m20261015_000000_delegation_cursor_index;
 pub mod m20261017_000000_epoch_order_space_index;
 pub mod m20261018_000000_epoch_head;
 pub mod m20261020_000000_current_kv_key_c_index;
+pub mod m20261105_000000_held_credential_nonce;
 
 pub struct Migrator;
 
@@ -66,6 +67,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261017_000000_epoch_order_space_index::Migration),
             Box::new(m20261018_000000_epoch_head::Migration),
             Box::new(m20261020_000000_current_kv_key_c_index::Migration),
+            Box::new(m20261105_000000_held_credential_nonce::Migration),
         ]
     }
 }

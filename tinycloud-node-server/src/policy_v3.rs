@@ -21,10 +21,9 @@ use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
 use tinycloud_auth::authorization::TinyCloudDelegation;
 use tinycloud_auth::multihash_codetable::MultihashDigest;
 use tinycloud_auth::share_email_evidence::{verify_detached_ed25519, IssuerKey};
-use tinycloud_auth::ssi::{
-    dids::DIDBuf,
-    jwk::{Algorithm, Base64urlUInt, OctetParams, Params, JWK},
-};
+use tinycloud_auth::ssi::dids::DIDBuf;
+#[cfg(test)]
+use tinycloud_auth::ssi::jwk::{Algorithm, Base64urlUInt, OctetParams, Params, JWK};
 use tinycloud_auth::{
     identity::{did_principal_matches, parse_pkh_did},
     resource::{ResourceId, SpaceId},
@@ -48,7 +47,11 @@ use tinycloud_core::{
     RecoveringConnection,
 };
 
-use crate::{authorization::AuthHeaderGetter, config::ShareEmailConfig};
+use crate::{
+    authorization::AuthHeaderGetter,
+    config::{HeldCredentialsConfig, ShareEmailConfig},
+    held_email,
+};
 
 pub const POLICY_SESSION_PROFILE: &str = "policy-session-ucan/v1";
 pub const POLICY_V1_SCHEMA: &str = "xyz.tinycloud.policy/policy/v1";
@@ -101,6 +104,13 @@ struct DeliveryRuntime {
     invitation_origin: String,
 }
 
+/// Audience-bound runtime for held email credentials (TC-1452). Absent unless
+/// `held_credentials.enabled` is set; held presentations are refused without it.
+#[derive(Clone)]
+struct HeldCredentialRuntime {
+    audience: String,
+}
+
 #[derive(Clone)]
 pub struct PolicyV3Runtime {
     pub conn: RecoveringConnection,
@@ -109,6 +119,7 @@ pub struct PolicyV3Runtime {
     credential_issuers: IssuerSet,
     delivery: Option<DeliveryRuntime>,
     sqlite_writer_lock: Option<Arc<tokio::sync::Mutex<()>>>,
+    held_credentials: Option<HeldCredentialRuntime>,
 }
 
 impl PolicyV3Runtime {
@@ -124,6 +135,7 @@ impl PolicyV3Runtime {
             credential_issuers: IssuerSet::default(),
             delivery: None,
             sqlite_writer_lock: None,
+            held_credentials: None,
         }
     }
 
@@ -137,6 +149,24 @@ impl PolicyV3Runtime {
     pub fn with_credential_issuers(mut self, issuers: IssuerSet) -> Self {
         self.credential_issuers = issuers;
         self
+    }
+
+    /// Enable held email credential admission (TC-1452). A no-op when the
+    /// feature is disabled. When enabled, the audience is required and must be
+    /// a valid host, so a misconfigured node refuses to start.
+    pub fn with_held_credentials(mut self, config: &HeldCredentialsConfig) -> anyhow::Result<Self> {
+        if !config.enabled {
+            return Ok(self);
+        }
+        let audience = config
+            .audience
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("held credential audience is missing"))?;
+        if !held_email::valid_audience(&audience) {
+            return Err(anyhow::anyhow!("held credential audience is invalid"));
+        }
+        self.held_credentials = Some(HeldCredentialRuntime { audience });
+        Ok(self)
     }
 
     /// Install one OpenCredentials issuer as a one-entry set (the legacy
@@ -2099,9 +2129,18 @@ pub async fn mint(
     let accountless_credential_admission = credential_admission
         && request.presentation.get("schema").and_then(Value::as_str)
             == Some(CREDENTIAL_PRESENTATION_V4_SCHEMA);
+    // A held presentation carries its SD-JWT inside `presentation`, so the
+    // request has no credential envelope. Every other credential admission
+    // still requires one.
+    let held_admission = credential_admission
+        && !accountless_credential_admission
+        && held_email::read_presentation(&request.presentation).is_ok();
+    if held_admission && runtime.held_credentials.is_none() {
+        return Err((Status::Forbidden, "held-credentials-disabled".into()));
+    }
     if credential_admission {
         if request.requirement.is_null()
-            || request.credential.is_null()
+            || request.credential.is_null() == !held_admission
             || !request.claim.is_null()
             || if accountless_credential_admission {
                 !request.account_authorization_cid.is_missing()
@@ -2217,7 +2256,17 @@ pub async fn mint(
         now,
     };
     let credential_admission_result = if credential_admission {
-        Some(if accountless_credential_admission {
+        Some(if held_admission {
+            validate_held_email_admission(
+                &request.requirement,
+                &request.presentation,
+                &registered_policy,
+                &claim_context,
+                runtime,
+                true,
+            )
+            .await?
+        } else if accountless_credential_admission {
             validate_credential_admission_v4(
                 &request.requirement,
                 &request.credential,
@@ -2268,6 +2317,7 @@ pub async fn mint(
         (!credential_admission).then_some(&request.claim),
         &request.presentation,
         &evaluation_context,
+        !held_admission,
     )?;
     validate_requested_policy_capabilities(
         requested,
@@ -2593,7 +2643,17 @@ pub async fn mint(
             .requested_capabilities
             .as_array()
             .ok_or((Status::Forbidden, "requested-capabilities-invalid".into()))?;
-        Some(if accountless_credential_admission {
+        Some(if held_admission {
+            validate_held_email_admission(
+                &request.requirement,
+                &request.presentation,
+                &locked_policy,
+                &locked_claim_context,
+                runtime,
+                false,
+            )
+            .await?
+        } else if accountless_credential_admission {
             validate_credential_admission_v4(
                 &request.requirement,
                 &request.credential,
@@ -2659,6 +2719,7 @@ pub async fn mint(
             node_did: &runtime.node_did,
             now,
         },
+        !held_admission,
     )?;
     if canonical_value_set(&final_allow.approved_capabilities)
         != canonical_value_set(&allow.approved_capabilities)
@@ -5735,6 +5796,114 @@ fn validate_credential_admission_v4(
     })
 }
 
+/// Held email admission (TC-1452). `consume` is true at the first admission
+/// site only; the locked re-evaluation verifies the same presentation without
+/// spending the nonce a second time.
+async fn validate_held_email_admission(
+    requirement: &Value,
+    presentation: &Value,
+    policy: &Value,
+    context: &ClaimPresentationContext<'_>,
+    runtime: &PolicyV3Runtime,
+    consume: bool,
+) -> Result<CredentialAdmission, (Status, String)> {
+    let held = runtime
+        .held_credentials
+        .as_ref()
+        .ok_or((Status::Forbidden, "held-credentials-disabled".into()))?;
+    let projection = validate_policy_credential_requirement(
+        policy
+            .get("credentialRequirement")
+            .ok_or((Status::Forbidden, "credential-requirement-missing".into()))?,
+    )?;
+    validate_request_local_requirement(requirement, projection)?;
+    if runtime.credential_issuers.is_empty() {
+        return Err((
+            Status::ServiceUnavailable,
+            "credential-issuer-unavailable".into(),
+        ));
+    }
+    let requirement_invalid = || {
+        (
+            Status::Forbidden,
+            String::from("credential-requirement-invalid"),
+        )
+    };
+    if projection
+        .get("credentialType")
+        .and_then(|value| value.get("id"))
+        .and_then(Value::as_str)
+        != Some(held_email::VCT)
+    {
+        return Err((Status::Forbidden, "credential-type-mismatch".into()));
+    }
+    let issuer_did = projection
+        .get("issuerDid")
+        .and_then(Value::as_str)
+        .ok_or_else(requirement_invalid)?;
+    let accepted_issuers = [held_email::AcceptedIssuer {
+        did: issuer_did.to_owned(),
+        kid: projection
+            .get("issuerKid")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    }];
+    let profile = projection.get("profile").ok_or_else(requirement_invalid)?;
+    let accepted_profiles = [held_email::AcceptedProfile {
+        id: profile
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(requirement_invalid)?
+            .to_owned(),
+        version: profile
+            .get("version")
+            .and_then(Value::as_i64)
+            .ok_or_else(requirement_invalid)?,
+    }];
+    let caller_account = context
+        .authenticated_account_owner
+        .ok_or((Status::Forbidden, "account-owner-missing".into()))?;
+    let view = held_email::HeldPolicy {
+        now: context.now,
+        audience: &held.audience,
+        caller_account,
+        accepted_issuers: &accepted_issuers,
+        accepted_profiles: &accepted_profiles,
+        issuers: &runtime.credential_issuers,
+    };
+    let input = held_email::read_presentation(presentation).map_err(held_refusal)?;
+    let pre = held_email::precheck(&input, &view).map_err(held_refusal)?;
+    if consume {
+        let spent =
+            held_email::consume_nonce(&runtime.conn, &held.audience, &pre.nonce, &pre.account_key)
+                .await
+                .map_err(db_error)?;
+        if !spent {
+            return Err((Status::Forbidden, "nonce-replayed".into()));
+        }
+    }
+    let verified = held_email::verify(&input, &pre, &view).map_err(held_refusal)?;
+    let sd_jwt_digest = Sha256::digest(input.sd_jwt.as_bytes());
+    Ok(CredentialAdmission {
+        claim_jti: presentation_replay_key(held_email::PROFILE, context.recipient_did, &pre.nonce),
+        credential_id: verified.credential_id,
+        presentation_jti: Some(pre.nonce.clone()),
+        credential_digest: encode_config(sd_jwt_digest, URL_SAFE_NO_PAD),
+        envelope_digest_hex: hex::encode(sd_jwt_digest),
+        presentation_digest_hex: hex::encode(Sha256::digest(canonical_json_value(presentation))),
+        credential_space_owner_did: None,
+    })
+}
+
+fn held_refusal(code: held_email::Refusal) -> (Status, String) {
+    let status = if code == held_email::BAD_CONFIG {
+        Status::InternalServerError
+    } else {
+        Status::Forbidden
+    };
+    (status, code.into())
+}
+
 fn presentation_replay_key(schema: &str, holder_did: &str, presentation_jti: &str) -> String {
     let value = serde_json::json!({
         "schema": schema,
@@ -6366,12 +6535,12 @@ fn verify_issuer_signature(
     message: &[u8],
     signature: &[u8],
 ) -> Result<(), (Status, String)> {
-    let key = JWK::from(Params::OKP(OctetParams {
-        curve: "Ed25519".to_owned(),
-        public_key: Base64urlUInt(public_key.to_vec()),
-        private_key: None,
-    }));
-    tinycloud_auth::ssi::claims::jws::verify_bytes(Algorithm::EdDSA, message, &key, signature)
+    let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(public_key)
+        .map_err(|_| (Status::Forbidden, "credential-signature-invalid".into()))?;
+    let signature = ed25519_dalek::Signature::from_slice(signature)
+        .map_err(|_| (Status::Forbidden, "credential-signature-invalid".into()))?;
+    verifying_key
+        .verify_strict(message, &signature)
         .map_err(|_| (Status::Forbidden, "credential-signature-invalid".into()))
 }
 
@@ -6394,6 +6563,7 @@ fn evaluate_current_allow(
     legacy_claim: Option<&Value>,
     presentation: &Value,
     context: &CurrentAllowContext<'_>,
+    check_presentation_capabilities: bool,
 ) -> Result<CurrentAllow, (Status, String)> {
     let CurrentAllowContext {
         challenge,
@@ -6426,7 +6596,10 @@ fn evaluate_current_allow(
             return Err((Status::Forbidden, "policy-evaluator-denied".into()));
         }
     }
-    let mut capability_sources = vec![(presentation, "presentation-capabilities-mismatch")];
+    let mut capability_sources = Vec::new();
+    if check_presentation_capabilities {
+        capability_sources.push((presentation, "presentation-capabilities-mismatch"));
+    }
     if let Some(claim) = legacy_claim {
         capability_sources.push((claim, "claim-capabilities-mismatch"));
     }

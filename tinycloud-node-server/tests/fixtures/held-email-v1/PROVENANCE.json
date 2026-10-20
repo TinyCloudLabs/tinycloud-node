@@ -1,0 +1,10 @@
+{
+  "sourceRepository": "https://github.com/TinyCloudLabs/opencredentials",
+  "sourceCommit": "103b460b1b2950e05ced8e7ecfe1b26d4a4217d6",
+  "sourcePath": "rust/opencredentials_witness/specs/credential-acquisition-v1/held-email/vector.json",
+  "profile": "tinycloud.email-held/v1",
+  "profileVersion": 1,
+  "vct": "opencredentials.email/v1",
+  "copiedUnmodified": true,
+  "crossCheck": "js-sdk held-credentials verifier (tinycloud sdk-core), held-email vector script"
+}
