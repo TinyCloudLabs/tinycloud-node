@@ -10,6 +10,11 @@
     "window_min": 15,
     "min_points": 12,
     "min_breach_points": 13,
-    "pool": null
+    "pool": {
+      "metric": "planetscale_primary_postgres_connection_state",
+      "series_labels": { "state": "active" },
+      "op": "gte",
+      "threshold": 15
+    }
   }
 ]
