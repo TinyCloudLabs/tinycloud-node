@@ -541,6 +541,7 @@ fn sign_in(node: &Node, account: &Account) -> Result<Session> {
                     vec![
                         "tinycloud.sql/read".parse()?,
                         "tinycloud.sql/write".parse()?,
+                        "tinycloud.sql/schema".parse()?,
                     ],
                 )]),
             ),
@@ -775,7 +776,7 @@ fn authenticated_kv_sql_failure_privacy_forwarding_and_restart() -> Result<()> {
             &session,
             "sql",
             DATABASE,
-            "tinycloud.sql/write",
+            "tinycloud.sql/schema",
             Some(&create),
             None,
         );

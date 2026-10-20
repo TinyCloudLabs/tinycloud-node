@@ -16,6 +16,8 @@ use tokio::sync::{mpsc, oneshot};
 use crate::request_telemetry::{self, QueryTimer, RequestContext};
 
 use super::{
+    authority::{record_ddl_without_schema, SqlAuthority},
+    authorizer::StatementScope,
     caveats::SqlCaveats,
     parser,
     storage::{self, StorageMode},
@@ -35,7 +37,7 @@ enum DbMessage {
     Execute {
         request: SqlRequest,
         caveats: Option<SqlCaveats>,
-        ability: String,
+        authority: SqlAuthority,
         growth: GrowthPolicy,
         response_tx: oneshot::Sender<Result<SqlExecutionResult, SqlError>>,
     },
@@ -112,7 +114,7 @@ impl DatabaseHandle {
         &self,
         request: SqlRequest,
         caveats: Option<SqlCaveats>,
-        ability: String,
+        authority: SqlAuthority,
         growth: GrowthPolicy,
     ) -> Result<SqlExecutionResult, SqlError> {
         let (response_tx, response_rx) = oneshot::channel();
@@ -122,7 +124,7 @@ impl DatabaseHandle {
                 DbMessage::Execute {
                     request,
                     caveats,
-                    ability,
+                    authority,
                     growth,
                     response_tx,
                 },
@@ -240,14 +242,16 @@ pub fn spawn_actor(
                 DbMessage::Execute {
                     request,
                     caveats,
-                    ability,
+                    authority,
                     growth,
                     response_tx,
                 } => {
                     let result = match growth {
-                        GrowthPolicy::Allow => handle_message(&conn, &request, &caveats, &ability),
+                        GrowthPolicy::Allow => {
+                            handle_message(&conn, &request, &caveats, &authority)
+                        }
                         GrowthPolicy::Forbid => {
-                            handle_message_without_growth(&conn, &request, &caveats, &ability)
+                            handle_message_without_growth(&conn, &request, &caveats, &authority)
                         }
                     };
                     conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
@@ -385,7 +389,7 @@ fn handle_message_without_growth(
     conn: &rusqlite::Connection,
     request: &SqlRequest,
     caveats: &Option<SqlCaveats>,
-    ability: &str,
+    authority: &SqlAuthority,
 ) -> Result<SqlExecutionResult, SqlError> {
     let before = page_count(conn)?;
     {
@@ -393,7 +397,7 @@ fn handle_message_without_growth(
         conn.execute_batch(GUARD_BEGIN)
             .map_err(|e| SqlError::Internal(e.to_string()))?;
     }
-    let result = handle_message(conn, request, caveats, ability);
+    let result = handle_message(conn, request, caveats, authority);
     // An early error return can leave the request's authorizer installed.
     conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
     // ROLLBACK conflict handling can already have undone the transaction.
@@ -433,15 +437,38 @@ fn page_count(conn: &rusqlite::Connection) -> Result<i64, SqlError> {
         .map_err(|e| SqlError::Internal(e.to_string()))
 }
 
+/// `DdlPolicy::Log` bookkeeping for one request: count every statement that
+/// only `write` let through, and warn once. The message is constant and the
+/// counter is labelled by statement kind alone, so neither carries SQL text,
+/// space ids, DIDs or table names.
+#[derive(Default)]
+struct DdlLog {
+    warned: bool,
+}
+
+impl DdlLog {
+    fn note(&mut self, parsed: &parser::ParsedQuery) {
+        let Some(kind) = parsed.ddl_without_schema else {
+            return;
+        };
+        record_ddl_without_schema(kind);
+        if !self.warned {
+            self.warned = true;
+            tracing::warn!("sql ddl allowed without schema ability (ddl_requires_schema = log)");
+        }
+    }
+}
+
 fn handle_message(
     conn: &rusqlite::Connection,
     request: &SqlRequest,
     caveats: &Option<SqlCaveats>,
-    ability: &str,
+    authority: &SqlAuthority,
 ) -> Result<SqlExecutionResult, SqlError> {
-    // TC-119: confers-admin gate (registry-aware). `sql/admin` and `sql/*`
-    // (implies admin) pass; identical to the prior `admin | *` match.
-    let is_admin = crate::policy_capability::ability_matches(ability, "tinycloud.sql/admin");
+    let mut ddl_log = DdlLog::default();
+    let authorizer = |parsed: &parser::ParsedQuery| {
+        super::authorizer::create_authorizer(caveats.clone(), authority, StatementScope::of(parsed))
+    };
 
     match request {
         SqlRequest::Query {
@@ -450,14 +477,10 @@ fn handle_message(
             max_rows,
             max_bytes,
         } => {
-            let parsed = parser::validate_sql(sql, caveats, ability)?;
+            let parsed = parser::validate_sql(sql, caveats, authority)?;
+            ddl_log.note(&parsed);
 
-            let auth = super::authorizer::create_authorizer(
-                caveats.clone(),
-                ability.to_string(),
-                is_admin,
-            );
-            conn.authorizer(Some(auth));
+            conn.authorizer(Some(authorizer(&parsed)));
 
             let result = execute_query(conn, sql, params, *max_rows, *max_bytes);
 
@@ -474,17 +497,14 @@ fn handle_message(
             schema,
         } => {
             let mut write_targets = Vec::new();
-            // Schema init
+            // Schema init. Each entry is judged like any other statement: a
+            // schema-changing entry needs a schema-conferring ability.
             if let Some(schema_stmts) = schema {
                 for stmt_sql in schema_stmts {
-                    let parsed = parser::validate_sql(stmt_sql, caveats, ability)?;
-                    write_targets.extend(parsed.write_targets);
-                    let auth = super::authorizer::create_authorizer(
-                        caveats.clone(),
-                        ability.to_string(),
-                        is_admin,
-                    );
-                    conn.authorizer(Some(auth));
+                    let parsed = parser::validate_sql(stmt_sql, caveats, authority)?;
+                    ddl_log.note(&parsed);
+                    write_targets.extend(parsed.write_targets.iter().cloned());
+                    conn.authorizer(Some(authorizer(&parsed)));
                     {
                         let _timer = QueryTimer::new();
                         conn.execute_batch(stmt_sql)
@@ -494,13 +514,9 @@ fn handle_message(
                 }
             }
 
-            let parsed = parser::validate_sql(sql, caveats, ability)?;
-            let auth = super::authorizer::create_authorizer(
-                caveats.clone(),
-                ability.to_string(),
-                is_admin,
-            );
-            conn.authorizer(Some(auth));
+            let parsed = parser::validate_sql(sql, caveats, authority)?;
+            ddl_log.note(&parsed);
+            conn.authorizer(Some(authorizer(&parsed)));
 
             let result = execute_statement(conn, sql, params, is_insert_statement(&parsed));
 
@@ -516,22 +532,21 @@ fn handle_message(
         SqlRequest::Batch { statements } => {
             let mut write_targets = Vec::new();
             let mut insert_statements = Vec::with_capacity(statements.len());
+            let mut scopes = Vec::with_capacity(statements.len());
             // Hooks are emitted only after this branch returns Ok to the caller.
             // If a later statement fails after some earlier statements applied,
             // MVP intentionally under-emits rather than guessing partial success.
             for stmt in statements {
-                let parsed = parser::validate_sql(&stmt.sql, caveats, ability)?;
+                let parsed = parser::validate_sql(&stmt.sql, caveats, authority)?;
+                ddl_log.note(&parsed);
                 insert_statements.push(is_insert_statement(&parsed));
+                scopes.push(StatementScope::of(&parsed));
                 write_targets.extend(parsed.write_targets);
             }
 
             let mut results = Vec::new();
-            for (stmt, is_insert) in statements.iter().zip(insert_statements) {
-                let auth = super::authorizer::create_authorizer(
-                    caveats.clone(),
-                    ability.to_string(),
-                    is_admin,
-                );
+            for ((stmt, is_insert), scope) in statements.iter().zip(insert_statements).zip(scopes) {
+                let auth = super::authorizer::create_authorizer(caveats.clone(), authority, scope);
                 conn.authorizer(Some(auth));
                 let result = execute_statement(conn, &stmt.sql, &stmt.params, is_insert);
                 conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
@@ -551,14 +566,13 @@ fn handle_message(
                 SqlError::InvalidStatement(format!("Statement '{}' not found", name))
             })?;
 
-            let parsed = parser::validate_sql(&prepared.sql, caveats, ability)?;
+            // A named statement is judged as the SQL it holds: one that
+            // resolves to DDL needs a schema-conferring ability on the
+            // invocation, like the same SQL sent directly.
+            let parsed = parser::validate_sql(&prepared.sql, caveats, authority)?;
+            ddl_log.note(&parsed);
 
-            let auth = super::authorizer::create_authorizer(
-                caveats.clone(),
-                ability.to_string(),
-                is_admin,
-            );
-            conn.authorizer(Some(auth));
+            conn.authorizer(Some(authorizer(&parsed)));
 
             let result = if is_query_statement(&parsed) {
                 execute_query(conn, &prepared.sql, params, None, None).map(SqlResponse::Query)
@@ -844,7 +858,7 @@ mod tests {
                         params: vec![],
                     },
                     &None,
-                    "tinycloud.sql/admin",
+                    &SqlAuthority::from("tinycloud.sql/admin"),
                 );
                 assert!(result.is_err(), "transaction control was accepted: {sql}");
                 let value: String = conn
@@ -877,7 +891,7 @@ mod tests {
                 max_bytes: None,
             },
             &None,
-            "tinycloud.sql/admin",
+            &SqlAuthority::from("tinycloud.sql/admin"),
         )
         .unwrap();
         let SqlResponse::Query(response) = result.response else {
@@ -893,7 +907,7 @@ mod tests {
                 params: vec![],
             },
             &None,
-            "tinycloud.sql/admin",
+            &SqlAuthority::from("tinycloud.sql/admin"),
         )
         .unwrap();
         let version: i64 = conn
@@ -923,7 +937,7 @@ mod tests {
                 params: vec![],
             },
             &None,
-            "tinycloud.sql/write",
+            &SqlAuthority::from("tinycloud.sql/write"),
         )
         .unwrap_err();
         assert!(matches!(error, SqlError::Sqlite(_)));
@@ -938,7 +952,7 @@ mod tests {
                 params: vec![],
             },
             &None,
-            "tinycloud.sql/write",
+            &SqlAuthority::from("tinycloud.sql/write"),
         )
         .unwrap();
         assert!(conn.is_autocommit());
@@ -1011,7 +1025,7 @@ mod tests {
                 schema: None,
             },
             &None,
-            "tinycloud.sql/write",
+            &SqlAuthority::from("tinycloud.sql/write"),
         )
         .unwrap();
         let SqlResponse::Execute(insert) = insert.response else {
@@ -1031,7 +1045,7 @@ mod tests {
                     schema: None,
                 },
                 &None,
-                "tinycloud.sql/write",
+                &SqlAuthority::from("tinycloud.sql/write"),
             )
             .unwrap();
             let SqlResponse::Execute(response) = result.response else {
@@ -1066,7 +1080,7 @@ mod tests {
                 ],
             },
             &None,
-            "tinycloud.sql/write",
+            &SqlAuthority::from("tinycloud.sql/write"),
         )
         .unwrap();
         let SqlResponse::Batch(batch) = batch.response else {
@@ -1089,7 +1103,7 @@ mod tests {
                 params: vec![],
             },
             &Some(caveats),
-            "tinycloud.sql/write",
+            &SqlAuthority::from("tinycloud.sql/write"),
         )
         .unwrap();
         let SqlResponse::Execute(prepared) = prepared.response else {
@@ -1119,7 +1133,7 @@ mod tests {
                 ],
             },
             &None,
-            "tinycloud.sql/schema",
+            &SqlAuthority::from("tinycloud.sql/schema"),
         )
         .expect_err("a prior DDL statement must not authorize a later CTAS source read");
         assert!(
@@ -1167,7 +1181,7 @@ mod publication_rollback_tests {
             "INSERT INTO connector_meeting(id,title) VALUES('new','Legacy sync')",
             "DELETE FROM connector_meeting WHERE id='new'",
         ] {
-            handle_message(&conn, &SqlRequest::Execute { sql: sql.into(), params: vec![], schema: None }, &None, "tinycloud.sql/write").unwrap_or_else(|error| panic!("legacy recovery rejected: {error}"));
+            handle_message(&conn, &SqlRequest::Execute { sql: sql.into(), params: vec![], schema: None }, &None, &SqlAuthority::from("tinycloud.sql/write")).unwrap_or_else(|error| panic!("legacy recovery rejected: {error}"));
         }
         assert_eq!(
             conn.query_row(
@@ -1205,7 +1219,7 @@ mod publication_rollback_tests {
                 schema: None,
             },
             &None,
-            "tinycloud.sql/read",
+            &SqlAuthority::from("tinycloud.sql/read"),
         );
         assert!(result.is_err());
         assert_eq!(
@@ -1214,5 +1228,517 @@ mod publication_rollback_tests {
                 .unwrap(),
             "Original"
         );
+    }
+}
+
+/// TC-1581: schema-changing statements need `schema`; `write` is data only.
+/// Every request variant is judged statement by statement against all the
+/// abilities held, not against one preferred ability.
+#[cfg(test)]
+mod ddl_authority_tests {
+    use super::*;
+    use crate::sql::authority::{ddl_without_schema_count, DdlKind, DdlPolicy};
+    use std::sync::{Arc, Mutex};
+
+    const READ: &str = "tinycloud.sql/read";
+    const WRITE: &str = "tinycloud.sql/write";
+    const SCHEMA: &str = "tinycloud.sql/schema";
+    const ADMIN: &str = "tinycloud.sql/admin";
+    const STAR: &str = "tinycloud.sql/*";
+
+    fn held(abilities: &[&str]) -> SqlAuthority {
+        SqlAuthority::new(abilities.iter().copied())
+    }
+
+    fn execute(sql: &str, schema: Option<&[&str]>) -> SqlRequest {
+        SqlRequest::Execute {
+            sql: sql.to_string(),
+            params: vec![],
+            schema: schema.map(|s| s.iter().map(|s| s.to_string()).collect()),
+        }
+    }
+
+    fn batch(statements: &[&str]) -> SqlRequest {
+        SqlRequest::Batch {
+            statements: statements
+                .iter()
+                .map(|sql| SqlStatement {
+                    sql: sql.to_string(),
+                    params: vec![],
+                })
+                .collect(),
+        }
+    }
+
+    fn query(sql: &str) -> SqlRequest {
+        SqlRequest::Query {
+            sql: sql.to_string(),
+            params: vec![],
+            max_rows: None,
+            max_bytes: None,
+        }
+    }
+
+    fn caveats_with(statements: &[(&str, &str)]) -> Option<SqlCaveats> {
+        Some(SqlCaveats {
+            statements: Some(
+                statements
+                    .iter()
+                    .map(|(name, sql)| crate::sql::caveats::PreparedStatement {
+                        name: name.to_string(),
+                        sql: sql.to_string(),
+                    })
+                    .collect(),
+            ),
+            ..SqlCaveats::default()
+        })
+    }
+
+    fn run(
+        conn: &rusqlite::Connection,
+        request: &SqlRequest,
+        caveats: &Option<SqlCaveats>,
+        authority: &SqlAuthority,
+    ) -> Result<SqlExecutionResult, SqlError> {
+        handle_message(conn, request, caveats, authority)
+    }
+
+    fn table_exists(conn: &rusqlite::Connection, name: &str) -> bool {
+        conn.query_row(
+            "SELECT count(*) FROM sqlite_schema WHERE name = ?",
+            [name],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap()
+            > 0
+    }
+
+    fn is_denied(result: &Result<SqlExecutionResult, SqlError>) -> bool {
+        matches!(
+            result,
+            Err(SqlError::PermissionDenied(_)) | Err(SqlError::ReadOnlyViolation)
+        )
+    }
+
+    #[test]
+    fn write_alone_cannot_change_the_schema_on_any_request_path() {
+        let ddl = [
+            "CREATE TABLE made (id INTEGER)",
+            "DROP TABLE data",
+            "ALTER TABLE data ADD COLUMN extra TEXT",
+            "CREATE INDEX data_value ON data (value)",
+            "CREATE VIEW data_view AS SELECT value FROM data",
+        ];
+        for sql in ddl {
+            for abilities in [&[WRITE][..], &[READ, WRITE][..], &[READ][..]] {
+                let authority = held(abilities);
+                let conn = rusqlite::Connection::open_in_memory().unwrap();
+                conn.execute_batch(
+                    "CREATE TABLE data (value TEXT); INSERT INTO data VALUES ('kept')",
+                )
+                .unwrap();
+                let schema_before: i64 = conn
+                    .query_row("SELECT count(*) FROM sqlite_schema", [], |row| row.get(0))
+                    .unwrap();
+
+                let named = caveats_with(&[("change", sql)]);
+                let attempts = [
+                    ("query", run(&conn, &query(sql), &None, &authority)),
+                    (
+                        "execute",
+                        run(&conn, &execute(sql, None), &None, &authority),
+                    ),
+                    (
+                        "execute schema[]",
+                        run(&conn, &execute("SELECT 1", Some(&[sql])), &None, &authority),
+                    ),
+                    (
+                        "batch",
+                        run(
+                            &conn,
+                            &batch(&["INSERT INTO data VALUES ('second')", sql]),
+                            &None,
+                            &authority,
+                        ),
+                    ),
+                    (
+                        "named statement",
+                        run(
+                            &conn,
+                            &SqlRequest::ExecuteStatement {
+                                name: "change".into(),
+                                params: vec![],
+                            },
+                            &named,
+                            &authority,
+                        ),
+                    ),
+                ];
+                for (path, result) in attempts {
+                    assert!(is_denied(&result), "{abilities:?} {path} {sql}: {result:?}");
+                }
+
+                let schema_after: i64 = conn
+                    .query_row("SELECT count(*) FROM sqlite_schema", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(
+                    schema_before, schema_after,
+                    "{abilities:?} changed the schema: {sql}"
+                );
+                let rows: i64 = conn
+                    .query_row("SELECT count(*) FROM data", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(
+                    rows, 1,
+                    "a refused batch must not run its earlier statements"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn schema_conferring_abilities_run_ddl_on_every_request_path() {
+        for abilities in [
+            &[SCHEMA][..],
+            &[WRITE, SCHEMA][..],
+            &[ADMIN][..],
+            &[STAR][..],
+        ] {
+            let authority = held(abilities);
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            let named = caveats_with(&[("mk", "CREATE TABLE IF NOT EXISTS named (id INTEGER)")]);
+            run(
+                &conn,
+                &query("CREATE TABLE via_query (id INTEGER)"),
+                &None,
+                &authority,
+            )
+            .unwrap_or_else(|e| panic!("{abilities:?} query: {e:?}"));
+            run(
+                &conn,
+                &execute("CREATE TABLE via_execute (id INTEGER)", None),
+                &None,
+                &authority,
+            )
+            .unwrap_or_else(|e| panic!("{abilities:?} execute: {e:?}"));
+            run(
+                &conn,
+                &batch(&["CREATE TABLE via_batch (id INTEGER)"]),
+                &None,
+                &authority,
+            )
+            .unwrap_or_else(|e| panic!("{abilities:?} batch: {e:?}"));
+            run(
+                &conn,
+                &SqlRequest::ExecuteStatement {
+                    name: "mk".into(),
+                    params: vec![],
+                },
+                &named,
+                &authority,
+            )
+            .unwrap_or_else(|e| panic!("{abilities:?} named: {e:?}"));
+            for table in ["via_query", "via_execute", "via_batch", "named"] {
+                assert!(table_exists(&conn, table), "{abilities:?} {table}");
+            }
+            run(
+                &conn,
+                &execute("DROP TABLE via_query", None),
+                &None,
+                &authority,
+            )
+            .unwrap_or_else(|e| panic!("{abilities:?} drop: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn mixed_requests_need_both_abilities_or_admin() {
+        let create = "CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, body TEXT)";
+        let insert = "INSERT INTO notes (body) VALUES ('hello')";
+        for (abilities, expected_ok) in [
+            (&[WRITE, SCHEMA][..], true),
+            (&[ADMIN][..], true),
+            (&[STAR][..], true),
+            (&[WRITE][..], false),
+            (&[SCHEMA][..], false),
+            (&[READ][..], false),
+            (&[READ, SCHEMA][..], false),
+        ] {
+            let authority = held(abilities);
+
+            // execute { schema: [DDL], sql: DML }: the SDK's migration shape.
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            let result = run(&conn, &execute(insert, Some(&[create])), &None, &authority);
+            assert_eq!(
+                result.is_ok(),
+                expected_ok,
+                "{abilities:?} execute: {result:?}"
+            );
+
+            // batch [DDL, DML] is validated before anything runs.
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            let result = run(&conn, &batch(&[create, insert]), &None, &authority);
+            assert_eq!(
+                result.is_ok(),
+                expected_ok,
+                "{abilities:?} batch: {result:?}"
+            );
+            if !expected_ok {
+                assert!(
+                    !table_exists(&conn, "notes"),
+                    "{abilities:?}: a refused batch ran its DDL"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn data_statements_still_run_on_write_alone() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE data (id INTEGER PRIMARY KEY, value TEXT)")
+            .unwrap();
+        let authority = held(&[WRITE]);
+        for sql in [
+            "INSERT INTO data (value) VALUES ('a')",
+            "INSERT OR REPLACE INTO data (id, value) VALUES (1, 'b')",
+            "UPDATE data SET value = 'c' WHERE id = 1",
+            "WITH x AS (SELECT 'd' AS value) INSERT INTO data (value) SELECT value FROM x",
+            "DELETE FROM data WHERE id = 1",
+        ] {
+            run(&conn, &execute(sql, None), &None, &authority)
+                .unwrap_or_else(|e| panic!("write must run {sql}: {e:?}"));
+        }
+        run(
+            &conn,
+            &batch(&["INSERT INTO data (value) VALUES ('e')"]),
+            &None,
+            &authority,
+        )
+        .unwrap();
+        let read = run(
+            &conn,
+            &query("SELECT value FROM data ORDER BY id"),
+            &None,
+            &authority,
+        )
+        .unwrap();
+        let SqlResponse::Query(rows) = read.response else {
+            panic!("expected rows");
+        };
+        assert_eq!(rows.row_count, 2);
+
+        // A named statement that is data runs on write alone as well.
+        let named = caveats_with(&[("put", "INSERT INTO data (value) VALUES ('f')")]);
+        run(
+            &conn,
+            &SqlRequest::ExecuteStatement {
+                name: "put".into(),
+                params: vec![],
+            },
+            &named,
+            &authority,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn read_stays_read_only() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE data (value TEXT)")
+            .unwrap();
+        let authority = held(&[READ]);
+        run(&conn, &query("SELECT value FROM data"), &None, &authority).unwrap();
+        let result = run(
+            &conn,
+            &execute("INSERT INTO data VALUES ('x')", None),
+            &None,
+            &authority,
+        );
+        assert!(
+            matches!(result, Err(SqlError::ReadOnlyViolation)),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn pragma_is_unchanged_for_write_and_schema() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        for abilities in [&[WRITE][..], &[SCHEMA][..], &[WRITE, SCHEMA][..]] {
+            let authority = held(abilities);
+            for request in [
+                query("PRAGMA user_version = 9"),
+                execute("PRAGMA user_version = 9", None),
+                execute("SELECT 1", Some(&["PRAGMA user_version = 9"])),
+            ] {
+                let result = run(&conn, &request, &None, &authority);
+                assert!(is_denied(&result), "{abilities:?}: {result:?}");
+            }
+        }
+        for abilities in [&[ADMIN][..], &[STAR][..]] {
+            run(
+                &conn,
+                &execute("PRAGMA user_version = 3", None),
+                &None,
+                &held(abilities),
+            )
+            .unwrap();
+        }
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 3);
+    }
+
+    #[test]
+    fn ddl_policy_switch_off_log_enforce() {
+        let create = "CREATE TABLE IF NOT EXISTS made (id INTEGER)";
+        for (policy, write_only_may_ddl) in [
+            (DdlPolicy::Off, true),
+            (DdlPolicy::Log, true),
+            (DdlPolicy::Enforce, false),
+        ] {
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            let write_only = held(&[WRITE]).with_ddl_policy(policy);
+            let result = run(&conn, &execute(create, None), &None, &write_only);
+            assert_eq!(result.is_ok(), write_only_may_ddl, "{policy:?}: {result:?}");
+            assert_eq!(
+                table_exists(&conn, "made"),
+                write_only_may_ddl,
+                "{policy:?}"
+            );
+
+            // Holders of schema and read are judged the same in every mode.
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            let both = held(&[WRITE, SCHEMA]).with_ddl_policy(policy);
+            run(&conn, &execute(create, None), &None, &both).unwrap();
+            let read = held(&[READ]).with_ddl_policy(policy);
+            assert!(is_denied(&run(
+                &conn,
+                &execute("DROP TABLE made", None),
+                &None,
+                &read
+            )));
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn log_mode_counts_each_statement_and_warns_once_without_request_content() {
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let authority = held(&[WRITE]).with_ddl_policy(DdlPolicy::Log);
+        let secret_table = "tc1581_secret_table_name";
+        let create_before = ddl_without_schema_count(DdlKind::CreateTable);
+        let drop_before = ddl_without_schema_count(DdlKind::Drop);
+
+        run(
+            &conn,
+            &batch(&[
+                &format!("CREATE TABLE {secret_table} (id INTEGER)"),
+                &format!("CREATE TABLE {secret_table}_two (id INTEGER)"),
+                &format!("DROP TABLE {secret_table}_two"),
+                &format!("INSERT INTO {secret_table} (id) VALUES (1)"),
+            ]),
+            &None,
+            &authority,
+        )
+        .unwrap();
+
+        assert_eq!(
+            ddl_without_schema_count(DdlKind::CreateTable) - create_before,
+            2
+        );
+        assert_eq!(ddl_without_schema_count(DdlKind::Drop) - drop_before, 1);
+
+        let logged = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            logged.matches("ddl_requires_schema = log").count(),
+            1,
+            "one warning per request: {logged}"
+        );
+        assert!(
+            !logged.contains(secret_table),
+            "log carried request content: {logged}"
+        );
+        assert!(!logged.to_lowercase().contains("create table"), "{logged}");
+
+        // A holder of schema is not counted, and data statements never are.
+        let before = ddl_without_schema_count(DdlKind::CreateTable);
+        let both = held(&[WRITE, SCHEMA]).with_ddl_policy(DdlPolicy::Log);
+        run(
+            &conn,
+            &execute("CREATE TABLE fine (id INTEGER)", None),
+            &None,
+            &both,
+        )
+        .unwrap();
+        run(
+            &conn,
+            &execute("INSERT INTO fine VALUES (1)", None),
+            &None,
+            &authority,
+        )
+        .unwrap();
+        assert_eq!(ddl_without_schema_count(DdlKind::CreateTable), before);
+        let after_logged = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(after_logged.matches("ddl_requires_schema = log").count(), 1);
+    }
+
+    #[test]
+    fn enforce_and_off_neither_count_nor_warn() {
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let before = ddl_without_schema_count(DdlKind::AlterTable);
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (a)").unwrap();
+        let off = held(&[WRITE]).with_ddl_policy(DdlPolicy::Off);
+        run(
+            &conn,
+            &execute("ALTER TABLE t ADD COLUMN b", None),
+            &None,
+            &off,
+        )
+        .unwrap();
+        let enforce = held(&[WRITE]).with_ddl_policy(DdlPolicy::Enforce);
+        let denied = run(
+            &conn,
+            &execute("ALTER TABLE t ADD COLUMN c", None),
+            &None,
+            &enforce,
+        );
+        assert!(is_denied(&denied));
+
+        assert_eq!(ddl_without_schema_count(DdlKind::AlterTable), before);
+        assert!(captured.0.lock().unwrap().is_empty());
     }
 }

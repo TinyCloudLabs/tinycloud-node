@@ -1,15 +1,57 @@
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 
+use super::authority::SqlAuthority;
 use super::caveats::SqlCaveats;
-use crate::policy_capability::{ability_matches, resolve_alias};
+use super::parser::ParsedQuery;
 
-fn can_write_data(ability: &str, is_admin: bool) -> bool {
-    // TC-119: confers-write gate (registry-aware). `admin` is covered by the
-    // `is_admin` flag; `write` matches directly; `sql/*` matches via the
-    // registry implication `* ⊃ write`. Identical to the prior
-    // `admin | write | *` set. NOTE: `schema` does NOT confer write here (the
-    // registry declares `admin ⊃ schema`, not `schema ⊃ write`).
-    is_admin || ability_matches(ability, "tinycloud.sql/write")
+/// What the statement being authorized is, as the parser classified it.
+///
+/// The authorizer is the authoritative defence. It judges every SQLite
+/// action against the abilities held, and uses the scope only to decide
+/// which restrictions apply to this statement.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StatementScope {
+    pub is_ddl: bool,
+    pub is_read_only: bool,
+}
+
+impl StatementScope {
+    pub fn of(parsed: &ParsedQuery) -> Self {
+        Self {
+            is_ddl: parsed.is_ddl,
+            is_read_only: parsed.is_read_only,
+        }
+    }
+}
+
+/// What the abilities held let this statement do.
+#[derive(Clone, Copy, Debug)]
+struct Tier {
+    is_admin: bool,
+    /// `write` (or admin / `*`): may change data.
+    can_write_data: bool,
+    /// A schema-changing action may run. Under `DdlPolicy::Enforce` this needs
+    /// a schema-conferring ability (`schema`, `admin`, `*`); `write` is not
+    /// enough (TC-1581).
+    can_change_schema: bool,
+    /// The statement runs with schema authority and nothing that writes data:
+    /// it may not read or write application tables.
+    schema_restricted: bool,
+}
+
+impl Tier {
+    fn new(authority: &SqlAuthority, scope: StatementScope) -> Self {
+        let is_admin = authority.is_admin();
+        let can_write_data = authority.confers_data_write();
+        Self {
+            is_admin,
+            can_write_data,
+            can_change_schema: authority.may_change_schema(),
+            schema_restricted: !is_admin
+                && !can_write_data
+                && (scope.is_ddl || !authority.has_non_schema_ability()),
+        }
+    }
 }
 
 fn is_sqlite_schema_table(table_name: &str) -> bool {
@@ -19,12 +61,10 @@ fn is_sqlite_schema_table(table_name: &str) -> bool {
     )
 }
 
-fn can_write_table(ability: &str, is_admin: bool, table_name: &str) -> bool {
-    // The second clause is an exact-tier match on `schema` (writes to the
-    // sqlite schema tables during DDL), NOT a confers-check — so compare the
-    // alias-resolved URN rather than using `ability_matches`.
-    can_write_data(ability, is_admin)
-        || (resolve_alias(ability) == "tinycloud.sql/schema" && is_sqlite_schema_table(table_name))
+fn can_write_table(tier: &Tier, table_name: &str) -> bool {
+    // The second clause lets schema-only authority write the sqlite schema
+    // tables while it runs DDL.
+    tier.can_write_data || (tier.schema_restricted && is_sqlite_schema_table(table_name))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -68,14 +108,13 @@ fn is_sqlite_stat_table(table_name: &str) -> bool {
 }
 
 fn can_update_table(
-    ability: &str,
-    is_admin: bool,
+    tier: &Tier,
     database_name: Option<&str>,
     table_name: &str,
     schema_ddl_state: Option<&SchemaDdlState>,
 ) -> bool {
-    can_write_table(ability, is_admin, table_name)
-        || (resolve_alias(ability) == "tinycloud.sql/schema"
+    can_write_table(tier, table_name)
+        || (tier.schema_restricted
             && matches!(
                 table_name,
                 "sqlite_sequence" | "sqlite_stat1" | "sqlite_stat4"
@@ -88,15 +127,14 @@ fn can_update_table(
 }
 
 fn can_delete_table(
-    ability: &str,
-    is_admin: bool,
+    tier: &Tier,
     database_name: Option<&str>,
     table_name: &str,
     schema_ddl_state: Option<&SchemaDdlState>,
     schema_drop_target: Option<&SchemaDropTarget>,
 ) -> bool {
-    can_write_table(ability, is_admin, table_name)
-        || (resolve_alias(ability) == "tinycloud.sql/schema"
+    can_write_table(tier, table_name)
+        || (tier.schema_restricted
             && (schema_drop_target.is_some_and(|target| {
                 target.database_name.as_deref() == database_name && target.object_name == table_name
             }) || (table_name == "sqlite_sequence"
@@ -116,9 +154,11 @@ fn can_delete_table(
 
 pub fn create_authorizer(
     caveats: Option<SqlCaveats>,
-    ability: String,
-    is_admin: bool,
+    authority: &SqlAuthority,
+    scope: StatementScope,
 ) -> impl FnMut(AuthContext<'_>) -> Authorization {
+    let tier = Tier::new(authority, scope);
+    let is_admin = tier.is_admin;
     let mut schema_ddl_authorized = false;
     let mut schema_ddl_state: Option<SchemaDdlState> = None;
     let mut schema_drop_target: Option<SchemaDropTarget> = None;
@@ -144,6 +184,7 @@ pub fn create_authorizer(
                 Authorization::Deny
             }
         }
+
 
         // Function whitelist
         AuthAction::Function { function_name } => {
@@ -269,8 +310,7 @@ pub fn create_authorizer(
             table_name,
             column_name,
         } => {
-            if !is_admin
-                && resolve_alias(ability.as_str()) == "tinycloud.sql/schema"
+            if tier.schema_restricted
                 && !schema_ddl_authorized
                 && !is_sqlite_schema_table(table_name)
             {
@@ -289,7 +329,7 @@ pub fn create_authorizer(
 
         // Write operations
         AuthAction::Insert { table_name } => {
-            if !can_write_table(ability.as_str(), is_admin, table_name) {
+            if !can_write_table(&tier, table_name) {
                 return Authorization::Deny;
             }
             if let Some(ref caveats) = caveats {
@@ -305,8 +345,7 @@ pub fn create_authorizer(
 
         AuthAction::Delete { table_name } => {
             if !can_delete_table(
-                ability.as_str(),
-                is_admin,
+                &tier,
                 ctx.database_name,
                 table_name,
                 schema_ddl_state.as_ref(),
@@ -330,8 +369,7 @@ pub fn create_authorizer(
             column_name,
         } => {
             if !can_update_table(
-                ability.as_str(),
-                is_admin,
+                &tier,
                 ctx.database_name,
                 table_name,
                 schema_ddl_state.as_ref(),
@@ -352,15 +390,14 @@ pub fn create_authorizer(
             Authorization::Allow
         }
 
-        // DDL operations
+        // DDL operations (TC-1581). Every schema-changing action needs the
+        // schema authority that `tier.can_change_schema` encodes, so a
+        // statement the parser misclassified as data is still refused here.
         AuthAction::CreateTable { .. } | AuthAction::CreateTempTable { .. } => {
             // Do not enable application-table reads for CREATE TABLE. SQLite's
             // authorizer does not emit an Insert callback for CTAS result rows,
             // so allowing its source SELECT would let schema authority copy data.
-            if is_admin
-                || ability_matches(ability.as_str(), "tinycloud.sql/write")
-                || ability_matches(ability.as_str(), "tinycloud.sql/schema")
-            {
+            if tier.can_change_schema {
                 Authorization::Allow
             } else {
                 Authorization::Deny
@@ -373,13 +410,10 @@ pub fn create_authorizer(
         | AuthAction::DropTempTable {
             table_name: object_name,
         } => {
-            if !(is_admin
-                || ability_matches(ability.as_str(), "tinycloud.sql/write")
-                || ability_matches(ability.as_str(), "tinycloud.sql/schema"))
-            {
+            if !tier.can_change_schema {
                 Authorization::Deny
             } else {
-                if !is_admin && resolve_alias(ability.as_str()) == "tinycloud.sql/schema" {
+                if tier.schema_restricted {
                     schema_ddl_authorized = true;
                     schema_ddl_state = Some(SchemaDdlState {
                         database_name: ctx.database_name.map(str::to_owned),
@@ -401,13 +435,10 @@ pub fn create_authorizer(
         | AuthAction::DropTempView {
             view_name: object_name,
         } => {
-            if !(is_admin
-                || ability_matches(ability.as_str(), "tinycloud.sql/write")
-                || ability_matches(ability.as_str(), "tinycloud.sql/schema"))
-            {
+            if !tier.can_change_schema {
                 Authorization::Deny
             } else {
-                if !is_admin && resolve_alias(ability.as_str()) == "tinycloud.sql/schema" {
+                if tier.schema_restricted {
                     schema_ddl_authorized = true;
                     schema_drop_target = Some(SchemaDropTarget {
                         database_name: ctx.database_name.map(str::to_owned),
@@ -420,14 +451,11 @@ pub fn create_authorizer(
         }
 
         AuthAction::AlterTable { database_name, .. } => {
-            if !(is_admin
-                || ability_matches(ability.as_str(), "tinycloud.sql/write")
-                || ability_matches(ability.as_str(), "tinycloud.sql/schema"))
-            {
+            if !tier.can_change_schema {
                 Authorization::Deny
             } else {
                 alter_table_authorized = true;
-                if !is_admin && resolve_alias(ability.as_str()) == "tinycloud.sql/schema" {
+                if tier.schema_restricted {
                     schema_ddl_authorized = true;
                     schema_ddl_state = Some(SchemaDdlState {
                         database_name: Some(database_name.to_owned()),
@@ -439,13 +467,10 @@ pub fn create_authorizer(
         }
 
         AuthAction::DropIndex { .. } | AuthAction::DropTempIndex { .. } => {
-            if !(is_admin
-                || ability_matches(ability.as_str(), "tinycloud.sql/write")
-                || ability_matches(ability.as_str(), "tinycloud.sql/schema"))
-            {
+            if !tier.can_change_schema {
                 Authorization::Deny
             } else {
-                if !is_admin && resolve_alias(ability.as_str()) == "tinycloud.sql/schema" {
+                if tier.schema_restricted {
                     schema_ddl_authorized = true;
                     schema_ddl_state = Some(SchemaDdlState {
                         database_name: ctx.database_name.map(str::to_owned),
@@ -456,27 +481,26 @@ pub fn create_authorizer(
             }
         }
 
+        // The parser cannot parse CREATE TRIGGER; deny it here as well so the
+        // authorizer does not rely on that. A trigger runs later, with the
+        // authority of whoever fires it.
+        AuthAction::CreateTrigger { .. } | AuthAction::CreateTempTrigger { .. } => {
+            Authorization::Deny
+        }
+
         AuthAction::CreateIndex { .. }
-        | AuthAction::CreateTrigger { .. }
         | AuthAction::DropTrigger { .. }
         | AuthAction::CreateView { .. }
         | AuthAction::CreateTempIndex { .. }
-        | AuthAction::CreateTempTrigger { .. }
         | AuthAction::DropTempTrigger { .. }
         | AuthAction::CreateTempView { .. }
         // SQLite fires SQLITE_REINDEX while building an index; gate it like the
         // CreateIndex it accompanies so an authorized CREATE INDEX can complete.
         | AuthAction::Reindex { .. } => {
-            // TC-119: DDL is permitted for abilities that confer write OR
-            // schema (`sql/*` implies both). Equivalent to the prior
-            // `write | schema | *` set; `admin` is handled by `is_admin`.
-            if !(is_admin
-                || ability_matches(ability.as_str(), "tinycloud.sql/write")
-                || ability_matches(ability.as_str(), "tinycloud.sql/schema"))
-            {
+            if !tier.can_change_schema {
                 Authorization::Deny
             } else {
-                if !is_admin && resolve_alias(ability.as_str()) == "tinycloud.sql/schema" {
+                if tier.schema_restricted {
                     schema_ddl_authorized = true;
                 }
                 Authorization::Allow
@@ -488,10 +512,7 @@ pub fn create_authorizer(
         AuthAction::Transaction { .. } | AuthAction::Savepoint { .. } => Authorization::Deny,
 
         AuthAction::Select => {
-            if !is_admin
-                && resolve_alias(ability.as_str()) == "tinycloud.sql/schema"
-                && !schema_ddl_authorized
-            {
+            if tier.schema_restricted && !schema_ddl_authorized {
                 return Authorization::Deny;
             }
             Authorization::Allow
@@ -506,8 +527,33 @@ pub fn create_authorizer(
 mod tests {
     use super::*;
 
+    fn authority_for(abilities: &[&str], is_admin: bool) -> SqlAuthority {
+        let mut held: Vec<String> = abilities.iter().map(|a| a.to_string()).collect();
+        if is_admin {
+            held.push("tinycloud.sql/admin".to_string());
+        }
+        SqlAuthority::new(held)
+    }
+
+    fn authorize_held(abilities: &[&str], action: AuthAction<'_>) -> Authorization {
+        let mut auth = create_authorizer(
+            None,
+            &authority_for(abilities, false),
+            StatementScope::default(),
+        );
+        auth(AuthContext {
+            action,
+            database_name: Some("main"),
+            accessor: None,
+        })
+    }
+
     fn authorize(ability: &str, is_admin: bool, action: AuthAction<'_>) -> Authorization {
-        let mut auth = create_authorizer(None, ability.to_string(), is_admin);
+        let mut auth = create_authorizer(
+            None,
+            &authority_for(&[ability], is_admin),
+            StatementScope::default(),
+        );
         auth(AuthContext {
             action,
             database_name: Some("main"),
@@ -516,25 +562,30 @@ mod tests {
     }
 
     #[test]
-    fn create_index_allowed_with_write_ability() {
+    fn create_index_needs_schema_authority_not_write() {
         // CREATE [UNIQUE] INDEX fires CreateIndex followed by Reindex while the
         // index is built; both must pass for the statement to succeed.
-        let create_index = AuthAction::CreateIndex {
+        let create_index = || AuthAction::CreateIndex {
             index_name: "uq_interaction_nonce",
             table_name: "interaction",
         };
-        let reindex = AuthAction::Reindex {
+        let reindex = || AuthAction::Reindex {
             index_name: "uq_interaction_nonce",
         };
 
+        // TC-1581: `write` no longer runs schema-changing actions.
         assert_eq!(
-            authorize("tinycloud.sql/write", false, create_index),
-            Authorization::Allow
+            authorize("tinycloud.sql/write", false, create_index()),
+            Authorization::Deny
         );
         assert_eq!(
-            authorize("tinycloud.sql/write", false, reindex),
-            Authorization::Allow
+            authorize("tinycloud.sql/write", false, reindex()),
+            Authorization::Deny
         );
+        // A holder of both abilities is unaffected.
+        let both = ["tinycloud.sql/write", "tinycloud.sql/schema"];
+        assert_eq!(authorize_held(&both, create_index()), Authorization::Allow);
+        assert_eq!(authorize_held(&both, reindex()), Authorization::Allow);
     }
 
     #[test]
@@ -661,18 +712,40 @@ mod tests {
     }
 
     /// Install the authorizer on a real rusqlite connection (mirroring the
-    /// wiring in database.rs) and run `sql` under the given cap.
+    /// wiring in database.rs) and run `sql` under the given abilities. The
+    /// statement scope comes from the parser, as in `handle_message`.
+    fn execute_under_held(
+        conn: &rusqlite::Connection,
+        abilities: &[&str],
+        sql: &str,
+    ) -> rusqlite::Result<()> {
+        execute_under_authority(conn, &authority_for(abilities, false), sql)
+    }
+
+    fn execute_under_authority(
+        conn: &rusqlite::Connection,
+        authority: &SqlAuthority,
+        sql: &str,
+    ) -> rusqlite::Result<()> {
+        let scope = crate::sql::parser::classify_sql(sql)
+            .map(|class| StatementScope {
+                is_ddl: class.is_ddl,
+                is_read_only: class.is_read_only,
+            })
+            .unwrap_or_default();
+        conn.authorizer(Some(create_authorizer(None, authority, scope)));
+        let result = conn.execute_batch(sql);
+        conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+        result
+    }
+
     fn execute_under_authorizer(
         conn: &rusqlite::Connection,
         ability: &str,
         is_admin: bool,
         sql: &str,
     ) -> rusqlite::Result<()> {
-        let auth = create_authorizer(None, ability.to_string(), is_admin);
-        conn.authorizer(Some(auth));
-        let result = conn.execute_batch(sql);
-        conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
-        result
+        execute_under_authority(conn, &authority_for(&[ability], is_admin), sql)
     }
 
     #[test]
@@ -717,25 +790,25 @@ mod tests {
     }
 
     #[test]
-    fn create_unique_index_executes_with_write_cap() {
+    fn create_unique_index_executes_with_write_and_schema() {
         // End-to-end against real SQLite: the CreateIndex -> Reindex callback
-        // sequence fired while building the index must pass under a write cap.
+        // sequence fired while building the index must pass for a holder of
+        // both abilities (the SDK's `[write, schema]` invocation).
+        let both = ["tinycloud.sql/write", "tinycloud.sql/schema"];
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        execute_under_authorizer(
+        execute_under_held(
             &conn,
-            "tinycloud.sql/write",
-            false,
+            &both,
             "CREATE TABLE interaction (reader_did TEXT, nonce TEXT)",
         )
         .unwrap();
 
-        execute_under_authorizer(
+        execute_under_held(
             &conn,
-            "tinycloud.sql/write",
-            false,
+            &both,
             "CREATE UNIQUE INDEX uq_interaction_nonce ON interaction (reader_did, nonce)",
         )
-        .expect("CREATE UNIQUE INDEX should succeed with a write cap");
+        .expect("CREATE UNIQUE INDEX should succeed with write and schema");
     }
 
     #[test]
@@ -759,37 +832,34 @@ mod tests {
     }
 
     #[test]
-    fn create_unique_index_blocked_with_read_only_cap() {
-        // Set up the table with a write cap, then attempt the index under a
-        // read-only cap: SQLite must report "not authorized".
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        execute_under_authorizer(
-            &conn,
-            "tinycloud.sql/write",
-            false,
-            "CREATE TABLE interaction (reader_did TEXT, nonce TEXT)",
-        )
-        .unwrap();
+    fn create_unique_index_blocked_without_schema_authority() {
+        // Set up the table directly, then attempt the index under a read-only
+        // cap and under write alone: SQLite must report "not authorized".
+        for ability in ["tinycloud.sql/read", "tinycloud.sql/write"] {
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            conn.execute_batch("CREATE TABLE interaction (reader_did TEXT, nonce TEXT)")
+                .unwrap();
 
-        let err = execute_under_authorizer(
-            &conn,
-            "tinycloud.sql/read",
-            false,
-            "CREATE UNIQUE INDEX uq_interaction_nonce ON interaction (reader_did, nonce)",
-        )
-        .expect_err("CREATE UNIQUE INDEX must be denied for a read-only cap");
-        assert!(
-            err.to_string().contains("not authorized"),
-            "expected an authorization error, got: {err}"
-        );
+            let err = execute_under_authorizer(
+                &conn,
+                ability,
+                false,
+                "CREATE UNIQUE INDEX uq_interaction_nonce ON interaction (reader_did, nonce)",
+            )
+            .expect_err("CREATE UNIQUE INDEX must be denied without schema authority");
+            assert!(
+                err.to_string().contains("not authorized"),
+                "expected an authorization error for {ability}, got: {err}"
+            );
+        }
     }
 
     #[test]
     fn drop_table_obeys_schema_authority() {
         for (ability, is_admin) in [
             ("tinycloud.sql/schema", false),
-            ("tinycloud.sql/write", false),
             ("tinycloud.sql/admin", true),
+            ("tinycloud.sql/*", false),
         ] {
             let conn = rusqlite::Connection::open_in_memory().unwrap();
             conn.execute_batch("CREATE TABLE items (id INTEGER PRIMARY KEY)")
@@ -798,6 +868,21 @@ mod tests {
             execute_under_authorizer(&conn, ability, is_admin, "DROP TABLE items")
                 .unwrap_or_else(|error| panic!("{ability} should permit DROP TABLE: {error}"));
         }
+
+        // `write` alone no longer drops a table (TC-1581), and the table stays.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE items (id INTEGER PRIMARY KEY); INSERT INTO items VALUES (1)",
+        )
+        .unwrap();
+        let error =
+            execute_under_authorizer(&conn, "tinycloud.sql/write", false, "DROP TABLE items")
+                .expect_err("write authority must not drop a table");
+        assert!(error.to_string().contains("not authorized"), "{error}");
+        let rows: i64 = conn
+            .query_row("SELECT count(*) FROM items", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
 
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch("CREATE TEMP TABLE temp_items (id INTEGER PRIMARY KEY)")
@@ -1165,7 +1250,11 @@ mod tests {
             );
         }
 
-        let mut auth = create_authorizer(None, "tinycloud.sql/schema".to_string(), false);
+        let mut auth = create_authorizer(
+            None,
+            &authority_for(&["tinycloud.sql/schema"], false),
+            StatementScope::default(),
+        );
         for function_name in [
             "sqlite_rename_column",
             "sqlite_rename_table",
@@ -1228,8 +1317,11 @@ mod tests {
             read_only: Some(true),
             ..SqlCaveats::default()
         };
-        let mut caveated_auth =
-            create_authorizer(Some(caveats), "tinycloud.sql/schema".to_string(), false);
+        let mut caveated_auth = create_authorizer(
+            Some(caveats),
+            &authority_for(&["tinycloud.sql/schema"], false),
+            StatementScope::default(),
+        );
         assert_eq!(
             caveated_auth(AuthContext {
                 action: AuthAction::AlterTable {
@@ -1253,5 +1345,253 @@ mod tests {
             Authorization::Deny,
             "read-only caveats must still reject DDL-internal auxiliary writes"
         );
+    }
+
+    const WRITE: &str = "tinycloud.sql/write";
+    const SCHEMA: &str = "tinycloud.sql/schema";
+    const READ: &str = "tinycloud.sql/read";
+
+    /// One SQLite action per schema-changing callback the authorizer gates.
+    fn schema_changing_actions() -> Vec<AuthAction<'static>> {
+        vec![
+            AuthAction::CreateTable { table_name: "t" },
+            AuthAction::CreateTempTable { table_name: "t" },
+            AuthAction::CreateIndex {
+                index_name: "i",
+                table_name: "t",
+            },
+            AuthAction::CreateTempIndex {
+                index_name: "i",
+                table_name: "t",
+            },
+            AuthAction::CreateView { view_name: "v" },
+            AuthAction::CreateTempView { view_name: "v" },
+            AuthAction::DropTable { table_name: "t" },
+            AuthAction::DropTempTable { table_name: "t" },
+            AuthAction::DropIndex {
+                index_name: "i",
+                table_name: "t",
+            },
+            AuthAction::DropTempIndex {
+                index_name: "i",
+                table_name: "t",
+            },
+            AuthAction::DropView { view_name: "v" },
+            AuthAction::DropTempView { view_name: "v" },
+            AuthAction::AlterTable {
+                database_name: "main",
+                table_name: "t",
+            },
+            AuthAction::DropTrigger {
+                trigger_name: "g",
+                table_name: "t",
+            },
+            AuthAction::DropTempTrigger {
+                trigger_name: "g",
+                table_name: "t",
+            },
+            AuthAction::Reindex { index_name: "i" },
+        ]
+    }
+
+    #[test]
+    fn every_schema_changing_action_needs_a_schema_conferring_ability() {
+        for (abilities, expected) in [
+            (&[WRITE][..], Authorization::Deny),
+            (&[READ][..], Authorization::Deny),
+            (&[READ, WRITE][..], Authorization::Deny),
+            (&["tinycloud.sql/ddl"][..], Authorization::Deny),
+            (&[SCHEMA][..], Authorization::Allow),
+            (&[WRITE, SCHEMA][..], Authorization::Allow),
+            (&["tinycloud.sql/admin"][..], Authorization::Allow),
+            (&["tinycloud.sql/*"][..], Authorization::Allow),
+        ] {
+            for action in schema_changing_actions() {
+                let label = format!("{abilities:?} {action:?}");
+                assert_eq!(authorize_held(abilities, action), expected, "{label}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_authorizer_denies_create_trigger_for_every_ability() {
+        for abilities in [
+            &[WRITE][..],
+            &[SCHEMA][..],
+            &[WRITE, SCHEMA][..],
+            &["tinycloud.sql/admin"][..],
+            &["tinycloud.sql/*"][..],
+        ] {
+            for action in [
+                AuthAction::CreateTrigger {
+                    trigger_name: "g",
+                    table_name: "t",
+                },
+                AuthAction::CreateTempTrigger {
+                    trigger_name: "g",
+                    table_name: "t",
+                },
+            ] {
+                assert_eq!(
+                    authorize_held(abilities, action),
+                    Authorization::Deny,
+                    "{abilities:?}"
+                );
+            }
+        }
+
+        // End to end: SQLite really calls the authorizer for CREATE TRIGGER,
+        // so a statement the parser could one day accept is still refused.
+        for abilities in [&[WRITE, SCHEMA][..], &["tinycloud.sql/admin"][..]] {
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            conn.execute_batch("CREATE TABLE t (a); CREATE TABLE log (a)")
+                .unwrap();
+            let error = execute_under_held(
+                &conn,
+                abilities,
+                "CREATE TRIGGER g AFTER INSERT ON t BEGIN INSERT INTO log VALUES (1); END",
+            )
+            .expect_err("CREATE TRIGGER must be denied");
+            assert!(error.to_string().contains("not authorized"), "{error}");
+            let triggers: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_schema WHERE type = 'trigger'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(triggers, 0);
+        }
+    }
+
+    #[test]
+    fn a_misclassifying_parser_cannot_give_write_the_schema_actions() {
+        // Defence in depth: hand the authorizer a scope in which the parser
+        // called every statement plain data (or read-only). Write alone must
+        // still be refused by SQLite's own callbacks, and nothing may change.
+        let setup = "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT);
+                     CREATE VIEW v AS SELECT a FROM t;
+                     CREATE INDEX ix ON t (b);
+                     INSERT INTO t VALUES (1, 'x')";
+        let attacks = [
+            "CREATE TABLE made (a)",
+            "CREATE TEMP TABLE made (a)",
+            "CREATE TABLE made AS SELECT a FROM t",
+            "CREATE VIEW w AS SELECT a FROM t",
+            "CREATE INDEX iy ON t (a)",
+            "ALTER TABLE t ADD COLUMN c",
+            "ALTER TABLE t RENAME TO renamed",
+            "DROP TABLE t",
+            "DROP VIEW v",
+            "DROP INDEX ix",
+        ];
+        for scope in [
+            StatementScope::default(),
+            StatementScope {
+                is_ddl: false,
+                is_read_only: true,
+            },
+        ] {
+            for sql in attacks {
+                let conn = rusqlite::Connection::open_in_memory().unwrap();
+                conn.execute_batch(setup).unwrap();
+                let before: String = conn
+                    .query_row(
+                        "SELECT group_concat(name) FROM sqlite_schema ORDER BY name",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+
+                conn.authorizer(Some(create_authorizer(
+                    None,
+                    &authority_for(&[WRITE], false),
+                    scope,
+                )));
+                let result = conn.execute_batch(sql);
+                conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+                let error = result.expect_err(sql);
+                assert!(
+                    error.to_string().contains("not authorized"),
+                    "{sql}: {error}"
+                );
+
+                let after: String = conn
+                    .query_row(
+                        "SELECT group_concat(name) FROM sqlite_schema ORDER BY name",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(before, after, "{sql} changed the schema");
+                let rows: i64 = conn
+                    .query_row("SELECT count(*) FROM t", [], |row| row.get(0))
+                    .unwrap_or(1);
+                assert_eq!(rows, 1, "{sql} changed the data");
+            }
+        }
+    }
+
+    #[test]
+    fn write_alone_still_runs_data_statements_end_to_end() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)")
+            .unwrap();
+        for sql in [
+            "INSERT INTO t (b) VALUES ('one')",
+            "INSERT OR REPLACE INTO t (a, b) VALUES (1, 'uno')",
+            "UPDATE t SET b = 'two' WHERE a = 1",
+            "WITH c AS (SELECT 'three' AS b) INSERT INTO t (b) SELECT b FROM c",
+            "SELECT a, b FROM t",
+            "DELETE FROM t WHERE a = 1",
+        ] {
+            execute_under_held(&conn, &[WRITE], sql)
+                .unwrap_or_else(|error| panic!("write must run {sql}: {error}"));
+        }
+        let rows: i64 = conn
+            .query_row("SELECT count(*) FROM t", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    #[test]
+    fn write_and_schema_together_run_schema_changes_with_write_tier_reads() {
+        // The SDK's `[write, schema]` invocation: DDL runs under the holder's
+        // data authority too, so CREATE TABLE AS SELECT keeps working.
+        let both = [WRITE, SCHEMA];
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE source (id INTEGER); INSERT INTO source VALUES (1)")
+            .unwrap();
+        for sql in [
+            "CREATE TABLE copied AS SELECT id FROM source",
+            "CREATE INDEX copied_id ON copied (id)",
+            "ALTER TABLE copied ADD COLUMN extra TEXT",
+            "CREATE VIEW copied_ids AS SELECT id FROM copied",
+            "DROP VIEW copied_ids",
+            "DROP TABLE copied",
+        ] {
+            execute_under_held(&conn, &both, sql)
+                .unwrap_or_else(|error| panic!("{both:?} must run {sql}: {error}"));
+        }
+    }
+
+    #[test]
+    fn log_and_off_policies_keep_write_able_to_change_the_schema() {
+        use crate::sql::authority::DdlPolicy;
+        for policy in [DdlPolicy::Log, DdlPolicy::Off] {
+            let authority = authority_for(&[WRITE], false).with_ddl_policy(policy);
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            for sql in [
+                "CREATE TABLE t (a)",
+                "ALTER TABLE t ADD COLUMN b",
+                "DROP TABLE t",
+            ] {
+                execute_under_authority(&conn, &authority, sql)
+                    .unwrap_or_else(|error| panic!("{policy:?} must run {sql}: {error}"));
+            }
+            // Read still cannot.
+            let read = authority_for(&[READ], false).with_ddl_policy(policy);
+            assert!(execute_under_authority(&conn, &read, "CREATE TABLE u (a)").is_err());
+        }
     }
 }

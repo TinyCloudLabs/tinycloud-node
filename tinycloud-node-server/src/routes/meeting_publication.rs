@@ -288,7 +288,7 @@ mod tests {
                     max_bytes: None,
                 },
                 None,
-                "tinycloud.sql/read".into(),
+                "tinycloud.sql/read",
             )
             .await
             .unwrap();
@@ -375,7 +375,7 @@ mod tests {
                     max_bytes: None,
                 },
                 None,
-                "tinycloud.sql/read".into(),
+                "tinycloud.sql/read",
             )
             .await
             .unwrap();

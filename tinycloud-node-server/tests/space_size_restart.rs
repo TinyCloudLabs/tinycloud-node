@@ -262,7 +262,7 @@ impl Account {
         let now = time::OffsetDateTime::now_utc();
         let mut abilities = json!({
             "kv": {"": ["tinycloud.kv/put", "tinycloud.kv/get", "tinycloud.kv/del"]},
-            "sql": {"main": ["tinycloud.sql/read", "tinycloud.sql/write"]},
+            "sql": {"main": ["tinycloud.sql/read", "tinycloud.sql/write", "tinycloud.sql/schema"]},
         });
         if cfg!(feature = "duckdb") {
             abilities["duckdb"] =
@@ -371,7 +371,7 @@ async fn sql_write(client: &Client, session: &Session) -> Result<Reply> {
         session,
         "sql",
         "main",
-        "tinycloud.sql/write",
+        "tinycloud.sql/schema",
         ContentType::JSON,
         json!({"action": "execute", "sql": "CREATE TABLE t (v TEXT)", "params": []})
             .to_string()

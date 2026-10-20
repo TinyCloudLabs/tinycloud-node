@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changes
+
+- Schema-changing SQL statements now require `tinycloud.sql/schema` (TC-1581). `tinycloud.sql/write` covers data statements only (`INSERT`, `UPDATE`, `DELETE`, `SELECT`). `CREATE`, `ALTER` and `DROP` of tables, views and indexes need a schema-conferring ability: `sql/schema`, `sql/admin` or `sql/*`. This is judged for every statement of a request against all the SQL abilities the invocation holds, in `query`, `execute`, the `schema` list of `execute`, `batch` and named statements, and again by the SQLite authorizer, which now also refuses `CREATE TRIGGER`. A client that holds both `write` and `schema` (the SDK sends both for `execute({ schema })` and for migrations) is unaffected; the SDK has requested `sql/schema` for DDL since 2.5.0. `PRAGMA` still needs `sql/admin`. The storage-quota gate classifies a statement as a write whoever may run it. Configurable with `[global.storage.sql] ddl_requires_schema = "enforce" | "log" | "off"` (default `enforce`): `log` runs the statement and records it, with one constant warning per request and a counter by service and statement kind, and no SQL text, space ids, DIDs or table names; `off` keeps the earlier behaviour. No migration; the default needs no compose change. See `docs/sql-schema-authority.md`.
+
 ## [1.21.5] - 2026-10-20
 
 ### Release notes

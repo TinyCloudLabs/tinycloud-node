@@ -224,7 +224,7 @@ async fn write(
             db,
             insert_blob(bytes),
             None,
-            "tinycloud.sql/write".into(),
+            ["tinycloud.sql/write", "tinycloud.sql/schema"],
         )
         .await
         .map(|_| ())
@@ -232,7 +232,7 @@ async fn write(
 
 async fn count(service: &SqlService, space: &SpaceId, db: &str) -> Result<i64, SqlError> {
     let result = service
-        .execute(space, db, count_items(), None, "tinycloud.sql/read".into())
+        .execute(space, db, count_items(), None, "tinycloud.sql/read")
         .await?;
     match result.response {
         SqlResponse::Query(query) => match query.rows.as_slice() {

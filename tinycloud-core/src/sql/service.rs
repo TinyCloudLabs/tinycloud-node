@@ -21,6 +21,7 @@ use crate::db_pool::{is_transient_error, track_writes, transient_error_class};
 use crate::{request_cancel, request_telemetry};
 
 use super::{
+    authority::{DdlPolicy, SqlAuthority},
     caveats::SqlCaveats,
     database::{spawn_actor, DatabaseHandle, GrowthPolicy},
     types::*,
@@ -156,6 +157,7 @@ pub struct SqlService {
     memory_threshold: u64,
     artifact_repository: Arc<dyn DatabaseArtifactRepository>,
     bounds: SqlWaitBounds,
+    ddl_policy: DdlPolicy,
 }
 
 impl SqlService {
@@ -173,7 +175,15 @@ impl SqlService {
             memory_threshold,
             artifact_repository,
             bounds: SqlWaitBounds::default(),
+            ddl_policy: DdlPolicy::default(),
         }
+    }
+
+    /// Whether a schema-changing statement needs `tinycloud.sql/schema`
+    /// (TC-1581). Defaults to [`DdlPolicy::Enforce`].
+    pub fn with_ddl_policy(mut self, policy: DdlPolicy) -> Self {
+        self.ddl_policy = policy;
+        self
     }
 
     pub fn with_wait_bounds(mut self, bounds: SqlWaitBounds) -> Self {
@@ -187,14 +197,14 @@ impl SqlService {
         db_name: &str,
         request: SqlRequest,
         caveats: Option<SqlCaveats>,
-        ability: String,
+        authority: impl Into<SqlAuthority>,
     ) -> Result<SqlExecutionResult, SqlError> {
         self.execute_with_growth(
             space,
             db_name,
             request,
             caveats,
-            ability,
+            authority.into().with_ddl_policy(self.ddl_policy),
             GrowthPolicy::Allow,
         )
         .await
@@ -210,14 +220,14 @@ impl SqlService {
         db_name: &str,
         request: SqlRequest,
         caveats: Option<SqlCaveats>,
-        ability: String,
+        authority: impl Into<SqlAuthority>,
     ) -> Result<SqlExecutionResult, SqlError> {
         self.execute_with_growth(
             space,
             db_name,
             request,
             caveats,
-            ability,
+            authority.into().with_ddl_policy(self.ddl_policy),
             GrowthPolicy::Forbid,
         )
         .await
@@ -229,7 +239,7 @@ impl SqlService {
         db_name: &str,
         request: SqlRequest,
         caveats: Option<SqlCaveats>,
-        ability: String,
+        authority: SqlAuthority,
         growth: GrowthPolicy,
     ) -> Result<SqlExecutionResult, SqlError> {
         crate::request_telemetry::observe_space(space);
@@ -237,7 +247,7 @@ impl SqlService {
         let (space, db_name) = (space.clone(), db_name.to_string());
         self.run_locked(guard, move |service| async move {
             service
-                .execute_locked(&space, &db_name, request, caveats, ability, growth)
+                .execute_locked(&space, &db_name, request, caveats, authority, growth)
                 .await
         })
         .await
@@ -250,7 +260,7 @@ impl SqlService {
         db_name: &str,
         request: SqlRequest,
         caveats: Option<SqlCaveats>,
-        ability: String,
+        authority: SqlAuthority,
         growth: GrowthPolicy,
     ) -> Result<SqlExecutionResult, SqlError> {
         let key = (space.to_string(), db_name.to_string());
@@ -258,7 +268,7 @@ impl SqlService {
         begin_write()?;
 
         let result = match handle
-            .execute(request.clone(), caveats.clone(), ability.clone(), growth)
+            .execute(request.clone(), caveats.clone(), authority.clone(), growth)
             .await
         {
             Err(SqlError::Internal(ref msg)) if msg.contains("Database actor not available") => {
@@ -266,7 +276,7 @@ impl SqlService {
                 tracing::warn!("Dead SQL actor detected, respawning");
                 self.databases.remove(&key);
                 handle = self.handle(space, db_name).await?;
-                handle.execute(request, caveats, ability, growth).await
+                handle.execute(request, caveats, authority, growth).await
             }
             other => other,
         };
@@ -1051,6 +1061,10 @@ fn log_busy(stage: SqlBusyStage, bound: Duration, waited: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What the SDK holds for a request that creates tables and writes rows:
+    /// fixtures that are not about ability semantics run with both.
+    const FULL_AUTHORITY: [&str; 2] = ["tinycloud.sql/write", "tinycloud.sql/schema"];
     use crate::{
         database_artifacts::{DatabaseArtifact, DeltaSave, SeaOrmDatabaseArtifactRepository},
         migrations::Migrator,
@@ -1109,7 +1123,7 @@ mod tests {
                             params: vec![],
                         },
                         None,
-                        "tinycloud.sql/write".into(),
+                        FULL_AUTHORITY,
                     )
                     .await;
                 match name {
@@ -1129,7 +1143,7 @@ mod tests {
                             max_bytes: None,
                         },
                         None,
-                        "tinycloud.sql/read".into(),
+                        SqlAuthority::from("tinycloud.sql/read"),
                         GrowthPolicy::Allow,
                     )
                     .await;
@@ -1177,7 +1191,7 @@ mod tests {
                         max_bytes: None,
                     },
                     None,
-                    "tinycloud.sql/read".into(),
+                    "tinycloud.sql/read",
                 )
                 .await
                 .unwrap();
@@ -1224,7 +1238,7 @@ mod tests {
                             params: vec![],
                         },
                         None,
-                        "tinycloud.sql/write".into(),
+                        FULL_AUTHORITY,
                     )
                     .await
                     .expect("dropping an absent table is a successful no-op");
@@ -1267,7 +1281,7 @@ mod tests {
                         params: vec![],
                     },
                     None,
-                    "tinycloud.sql/write".into(),
+                    FULL_AUTHORITY,
                 )
                 .await
                 .unwrap();
@@ -1291,7 +1305,7 @@ mod tests {
                         params: vec![],
                     },
                     None,
-                    "tinycloud.sql/write".into(),
+                    FULL_AUTHORITY,
                 )
                 .await;
             assert!(matches!(failed, Err(SqlError::Sqlite(_))));
@@ -1305,7 +1319,7 @@ mod tests {
                         params: vec![],
                     },
                     None,
-                    "tinycloud.sql/write".into(),
+                    FULL_AUTHORITY,
                 )
                 .await;
             assert!(
@@ -1329,7 +1343,7 @@ mod tests {
                 max_bytes: None,
             };
             let live = service
-                .execute(&space, "main", query(), None, "tinycloud.sql/read".into())
+                .execute(&space, "main", query(), None, "tinycloud.sql/read")
                 .await
                 .unwrap();
             let SqlResponse::Query(live) = live.response else {
@@ -1349,7 +1363,7 @@ mod tests {
                         params: vec![],
                     },
                     None,
-                    "tinycloud.sql/write".into(),
+                    FULL_AUTHORITY,
                 )
                 .await
                 .unwrap();
@@ -1360,7 +1374,7 @@ mod tests {
                 repo,
             );
             let cold = recovered
-                .execute(&space, "main", query(), None, "tinycloud.sql/read".into())
+                .execute(&space, "main", query(), None, "tinycloud.sql/read")
                 .await
                 .unwrap();
             let SqlResponse::Query(cold) = cold.response else {
@@ -1397,6 +1411,159 @@ mod tests {
             .expect("schema ability should create tables");
     }
 
+    fn ddl(sql: &str) -> SqlRequest {
+        SqlRequest::Execute {
+            schema: None,
+            sql: sql.to_string(),
+            params: Vec::new(),
+        }
+    }
+
+    async fn table_count(service: &SqlService, space: &SpaceId) -> i64 {
+        let result = service
+            .execute(
+                space,
+                "main",
+                SqlRequest::Query {
+                    sql: "SELECT count(*) FROM items".to_string(),
+                    params: Vec::new(),
+                    max_rows: None,
+                    max_bytes: None,
+                },
+                None,
+                "tinycloud.sql/read",
+            )
+            .await
+            .expect("count rows");
+        let SqlResponse::Query(rows) = result.response else {
+            panic!("expected rows");
+        };
+        let SqlValue::Integer(count) = rows.rows[0][0] else {
+            panic!("expected an integer");
+        };
+        count
+    }
+
+    /// TC-1581 through the service: `write` alone runs data statements and
+    /// is refused schema-changing ones; the data it wrote is durable.
+    #[tokio::test]
+    async fn sql_write_alone_cannot_change_the_schema_but_writes_data() {
+        let repo = artifact_repository().await;
+        let cache = TempDir::new().unwrap();
+        let service = SqlService::new(cache.path().to_string_lossy().to_string(), u64::MAX, repo);
+        let space = test_space_id("sql-ddl-needs-schema");
+
+        let refused = service
+            .execute(
+                &space,
+                "main",
+                ddl("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)"),
+                None,
+                "tinycloud.sql/write",
+            )
+            .await;
+        assert!(
+            matches!(refused, Err(SqlError::PermissionDenied(_))),
+            "{refused:?}"
+        );
+
+        service
+            .execute(
+                &space,
+                "main",
+                ddl("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)"),
+                None,
+                "tinycloud.sql/schema",
+            )
+            .await
+            .expect("schema creates the table");
+        for sql in [
+            "INSERT INTO items (name) VALUES ('a')",
+            "UPDATE items SET name = 'b'",
+            "WITH c AS (SELECT 'c' AS name) INSERT INTO items (name) SELECT name FROM c",
+        ] {
+            service
+                .execute(&space, "main", ddl(sql), None, "tinycloud.sql/write")
+                .await
+                .unwrap_or_else(|e| panic!("write runs {sql}: {e:?}"));
+        }
+        for sql in [
+            "DROP TABLE items",
+            "ALTER TABLE items ADD COLUMN extra TEXT",
+            "CREATE INDEX items_name ON items (name)",
+        ] {
+            let refused = service
+                .execute(&space, "main", ddl(sql), None, "tinycloud.sql/write")
+                .await;
+            assert!(
+                matches!(refused, Err(SqlError::PermissionDenied(_))),
+                "{sql}: {refused:?}"
+            );
+            // A full space answers the same, not a storage error.
+            let refused = service
+                .execute_without_growth(&space, "main", ddl(sql), None, "tinycloud.sql/write")
+                .await;
+            assert!(
+                matches!(refused, Err(SqlError::PermissionDenied(_))),
+                "{sql}: {refused:?}"
+            );
+        }
+        assert_eq!(table_count(&service, &space).await, 2);
+
+        // Mixed `[write, schema]` request, the SDK's migration shape.
+        service
+            .execute(
+                &space,
+                "main",
+                SqlRequest::Execute {
+                    schema: Some(vec!["ALTER TABLE items ADD COLUMN extra TEXT".to_string()]),
+                    sql: "INSERT INTO items (name, extra) VALUES ('d', 'x')".to_string(),
+                    params: Vec::new(),
+                },
+                None,
+                ["tinycloud.sql/write", "tinycloud.sql/schema"],
+            )
+            .await
+            .expect("write and schema together run both statement kinds");
+        assert_eq!(table_count(&service, &space).await, 3);
+    }
+
+    /// TC-1581 `ddl_requires_schema`: `off` and `log` keep the earlier rule
+    /// for `write`; the default is `enforce`.
+    #[tokio::test]
+    async fn ddl_policy_reaches_the_actor_through_the_service() {
+        use crate::sql::authority::DdlPolicy;
+        for (policy, write_may_change_schema) in [
+            (None, false),
+            (Some(DdlPolicy::Enforce), false),
+            (Some(DdlPolicy::Log), true),
+            (Some(DdlPolicy::Off), true),
+        ] {
+            let repo = artifact_repository().await;
+            let cache = TempDir::new().unwrap();
+            let mut service =
+                SqlService::new(cache.path().to_string_lossy().to_string(), u64::MAX, repo);
+            if let Some(policy) = policy {
+                service = service.with_ddl_policy(policy);
+            }
+            let space = test_space_id("sql-ddl-policy");
+            let result = service
+                .execute(
+                    &space,
+                    "main",
+                    ddl("CREATE TABLE items (id INTEGER)"),
+                    None,
+                    "tinycloud.sql/write",
+                )
+                .await;
+            assert_eq!(
+                result.is_ok(),
+                write_may_change_schema,
+                "{policy:?}: {result:?}"
+            );
+        }
+    }
+
     /// TC-626: on a full space, writes that cannot grow the database run and
     /// a growing write is undone. Covers both an in-memory database and one
     /// promoted to a WAL-backed file (threshold 0), which is what large
@@ -1417,7 +1584,7 @@ mod tests {
                 sql: sql.to_string(),
                 params,
             };
-            let ability = || "tinycloud.sql/write".to_string();
+            let ability = || FULL_AUTHORITY;
             for row in ["a", "b", "c"] {
                 service
                     .execute(
@@ -1567,7 +1734,7 @@ mod tests {
                         max_bytes: None,
                     },
                     None,
-                    "tinycloud.sql/read".into(),
+                    "tinycloud.sql/read",
                 )
                 .await;
             assert!(
@@ -1601,7 +1768,7 @@ mod tests {
                         params: vec![],
                     },
                     None,
-                    "tinycloud.sql/write".into(),
+                    FULL_AUTHORITY,
                 )
                 .await
                 .unwrap();
@@ -1634,7 +1801,7 @@ mod tests {
                         "main",
                         SqlRequest::Batch { statements },
                         None,
-                        "tinycloud.sql/write".into(),
+                        FULL_AUTHORITY,
                     )
                     .await;
                 assert!(matches!(rejected, Err(SqlError::StorageWouldGrow)));
@@ -1652,7 +1819,7 @@ mod tests {
                         params: vec![],
                     },
                     None,
-                    "tinycloud.sql/write".into(),
+                    FULL_AUTHORITY,
                 )
                 .await
                 .unwrap();
@@ -1678,7 +1845,7 @@ mod tests {
                         max_bytes: None,
                     },
                     None,
-                    "tinycloud.sql/read".into(),
+                    "tinycloud.sql/read",
                 )
                 .await
                 .unwrap();
@@ -1730,7 +1897,7 @@ mod tests {
                     params: Vec::new(),
                 },
                 None,
-                "tinycloud.sql/write".to_string(),
+                FULL_AUTHORITY,
             )
             .await
             .expect("grow database");
@@ -1746,7 +1913,7 @@ mod tests {
                     params: Vec::new(),
                 },
                 None,
-                "tinycloud.sql/write".to_string(),
+                FULL_AUTHORITY,
             )
             .await
             .expect("small write");
@@ -1782,7 +1949,7 @@ mod tests {
                     params: vec![SqlValue::Text("durable".to_string())],
                 },
                 None,
-                "tinycloud.sql/write".to_string(),
+                FULL_AUTHORITY,
             )
             .await
             .unwrap();
@@ -1796,7 +1963,7 @@ mod tests {
                     params: vec![SqlValue::Text("updated".to_string())],
                 },
                 None,
-                "tinycloud.sql/write".to_string(),
+                FULL_AUTHORITY,
             )
             .await
             .unwrap();
@@ -1876,7 +2043,7 @@ mod tests {
                     params: Vec::new(),
                 },
                 None,
-                "tinycloud.sql/write".to_string(),
+                FULL_AUTHORITY,
             )
             .await
             .unwrap();
@@ -1920,7 +2087,7 @@ mod tests {
                     params: Vec::new(),
                 },
                 None,
-                "tinycloud.sql/write".to_string(),
+                FULL_AUTHORITY,
             )
             .await
             .unwrap();
@@ -2122,7 +2289,7 @@ mod tests {
                 params: Vec::new(),
             },
             None,
-            "tinycloud.sql/write".to_string(),
+            FULL_AUTHORITY,
         )
         .await
         .unwrap();
@@ -2272,15 +2439,8 @@ mod tests {
             u64::MAX,
             repo.clone(),
         );
-        let write = |value: &'static str| {
-            service.execute(
-                &space,
-                "a",
-                insert(value),
-                None,
-                "tinycloud.sql/write".into(),
-            )
-        };
+        let write =
+            |value: &'static str| service.execute(&space, "a", insert(value), None, FULL_AUTHORITY);
         write("first").await.unwrap();
 
         repo.lost_replies.store(1, Ordering::SeqCst);
@@ -2289,7 +2449,7 @@ mod tests {
         // The write is durable: reading back (after re-hydration) shows it,
         // which is what the client must do before deciding to retry.
         let read = service
-            .execute(&space, "a", count(), None, "tinycloud.sql/read".into())
+            .execute(&space, "a", count(), None, "tinycloud.sql/read")
             .await
             .unwrap();
         match read.response {
@@ -2406,37 +2566,39 @@ mod tests {
             // hydration 30 s, transfer 45 s), so a slow-but-bounded stall
             // surfaces as a typed `Busy(stage)` naming the stage; only an
             // unbounded wait trips this timeout (TC-1317 review).
-            let run = |db: &'static str, request: SqlRequest, ability: &'static str| {
+            let run = |db: &'static str, request: SqlRequest, ability: &'static [&'static str]| {
                 let service = &service;
                 let space = &space;
                 async move {
                     tokio::time::timeout(
                         std::time::Duration::from_secs(60),
-                        service.execute(space, db, request, None, ability.to_string()),
+                        service.execute(
+                            space,
+                            db,
+                            request,
+                            None,
+                            SqlAuthority::new(ability.iter().copied()),
+                        ),
                     )
                     .await
                     .expect("a request on a database whose last request failed must not wait")
                 }
             };
             for db in ["a", "b"] {
-                run(db, insert("seed"), "tinycloud.sql/write")
-                    .await
-                    .unwrap();
+                run(db, insert("seed"), &FULL_AUTHORITY).await.unwrap();
             }
 
             // Persistence fails: the write is refused as retryable.
             repo.failures.store(1, Ordering::SeqCst);
-            let err = run("a", insert("lost"), "tinycloud.sql/write")
+            let err = run("a", insert("lost"), &FULL_AUTHORITY)
                 .await
                 .expect_err("a write whose persist failed must fail");
             assert!(matches!(err, SqlError::Unavailable), "{err:?}");
             // The lock was released and the failed write's local state
             // discarded: the next write on `a` re-hydrates and succeeds,
             // and `b` was never affected.
-            run("a", insert("retried"), "tinycloud.sql/write")
-                .await
-                .unwrap();
-            run("b", count(), "tinycloud.sql/read").await.unwrap();
+            run("a", insert("retried"), &FULL_AUTHORITY).await.unwrap();
+            run("b", count(), &["tinycloud.sql/read"]).await.unwrap();
 
             // Hydration fails on a cold node: retryable, then served.
             let cold_cache = TempDir::new().unwrap();
@@ -2447,13 +2609,13 @@ mod tests {
             );
             repo.failures.store(1, Ordering::SeqCst);
             let err = cold
-                .execute(&space, "a", count(), None, "tinycloud.sql/read".into())
+                .execute(&space, "a", count(), None, "tinycloud.sql/read")
                 .await
                 .expect_err("a read whose hydration failed must fail");
             assert!(matches!(err, SqlError::Unavailable), "{err:?}");
             let served = tokio::time::timeout(
                 std::time::Duration::from_secs(60),
-                cold.execute(&space, "a", count(), None, "tinycloud.sql/read".into()),
+                cold.execute(&space, "a", count(), None, "tinycloud.sql/read"),
             )
             .await
             .expect("the hydration failure released the lock")
@@ -2512,7 +2674,7 @@ mod tests {
                     params: Vec::new(),
                 },
                 None,
-                "tinycloud.sql/write".to_string(),
+                FULL_AUTHORITY,
             )
             .await
             .expect_err("write must fail when durable save fails");
@@ -2543,7 +2705,7 @@ mod tests {
                     ]),
                 },
                 None,
-                "tinycloud.sql/admin".into(),
+                "tinycloud.sql/admin",
             )
             .await
             .unwrap();
@@ -2554,13 +2716,7 @@ mod tests {
             max_bytes: None,
         };
         second
-            .execute(
-                &space,
-                "connectors",
-                query(),
-                None,
-                "tinycloud.sql/read".into(),
-            )
+            .execute(&space, "connectors", query(), None, "tinycloud.sql/read")
             .await
             .unwrap();
         let update = |title: &str| SqlRequest::Execute {
@@ -2569,23 +2725,11 @@ mod tests {
             schema: None,
         };
         first
-            .execute(
-                &space,
-                "connectors",
-                update("First"),
-                None,
-                "tinycloud.sql/write".into(),
-            )
+            .execute(&space, "connectors", update("First"), None, FULL_AUTHORITY)
             .await
             .unwrap();
         assert!(second
-            .execute(
-                &space,
-                "connectors",
-                update("Stale"),
-                None,
-                "tinycloud.sql/write".into()
-            )
+            .execute(&space, "connectors", update("Stale"), None, FULL_AUTHORITY)
             .await
             .is_err());
         second
@@ -2594,18 +2738,12 @@ mod tests {
                 "connectors",
                 update("Recovered"),
                 None,
-                "tinycloud.sql/write".into(),
+                FULL_AUTHORITY,
             )
             .await
             .unwrap();
         let result = second
-            .execute(
-                &space,
-                "connectors",
-                query(),
-                None,
-                "tinycloud.sql/read".into(),
-            )
+            .execute(&space, "connectors", query(), None, "tinycloud.sql/read")
             .await
             .unwrap();
         let SqlResponse::Query(query) = result.response else {
@@ -2719,13 +2857,7 @@ mod tests {
             u64::MAX,
             repo.clone(),
         )
-        .execute(
-            &space,
-            "a",
-            insert("seed"),
-            None,
-            "tinycloud.sql/write".into(),
-        )
+        .execute(&space, "a", insert("seed"), None, FULL_AUTHORITY)
         .await
         .unwrap();
         (repo, space)
@@ -2746,7 +2878,7 @@ mod tests {
 
     async fn read(service: &SqlService, space: &SpaceId) -> Result<SqlExecutionResult, SqlError> {
         service
-            .execute(space, "a", count(), None, "tinycloud.sql/read".into())
+            .execute(space, "a", count(), None, "tinycloud.sql/read")
             .await
     }
 
@@ -2772,7 +2904,7 @@ mod tests {
 
         // Another database in the same space is unaffected.
         service
-            .execute(&space, "b", insert("x"), None, "tinycloud.sql/write".into())
+            .execute(&space, "b", insert("x"), None, FULL_AUTHORITY)
             .await
             .unwrap();
         drop(held);
@@ -2877,13 +3009,7 @@ mod tests {
             Some(Duration::from_millis(200)),
             async move {
                 writer
-                    .execute(
-                        &write_space,
-                        "a",
-                        insert("late"),
-                        None,
-                        "tinycloud.sql/write".into(),
-                    )
+                    .execute(&write_space, "a", insert("late"), None, FULL_AUTHORITY)
                     .await
             },
         ));
@@ -2923,13 +3049,7 @@ mod tests {
         let write_space = space.clone();
         let caller = tokio::spawn(async move {
             writer
-                .execute(
-                    &write_space,
-                    "a",
-                    insert("second"),
-                    None,
-                    "tinycloud.sql/write".into(),
-                )
+                .execute(&write_space, "a", insert("second"), None, FULL_AUTHORITY)
                 .await
         });
         tokio::time::timeout(PATIENCE, async {
@@ -2999,13 +3119,7 @@ mod tests {
         });
         for value in ["seed", "warm"] {
             service
-                .execute(
-                    &space,
-                    "a",
-                    insert(value),
-                    None,
-                    "tinycloud.sql/write".into(),
-                )
+                .execute(&space, "a", insert(value), None, FULL_AUTHORITY)
                 .await
                 .unwrap();
         }
@@ -3018,13 +3132,7 @@ mod tests {
             .unwrap();
         let outcome = tokio::time::timeout(
             PATIENCE,
-            service.execute(
-                &space,
-                "a",
-                insert("once"),
-                None,
-                "tinycloud.sql/write".into(),
-            ),
+            service.execute(&space, "a", insert("once"), None, FULL_AUTHORITY),
         )
         .await;
         // Release before asserting: a failed assertion must not leave the
@@ -3250,13 +3358,7 @@ mod tests {
         let context = crate::request_cancel::RequestCancel::new(Duration::ZERO);
         let err = crate::request_cancel::within(
             Some(Arc::clone(&context)),
-            service.execute(
-                &space,
-                "a",
-                insert("late"),
-                None,
-                "tinycloud.sql/write".into(),
-            ),
+            service.execute(&space, "a", insert("late"), None, FULL_AUTHORITY),
         )
         .await
         .expect_err("a write past its deadline must not start");

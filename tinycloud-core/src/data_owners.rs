@@ -898,7 +898,7 @@ mod tests {
             &other_sql,
             "default",
             "main",
-            "tinycloud.sql/write",
+            "tinycloud.sql/schema",
             crate::sql::SqlRequest::Execute {
                 sql: "CREATE TABLE notes (id INTEGER)".to_string(),
                 params: vec![],

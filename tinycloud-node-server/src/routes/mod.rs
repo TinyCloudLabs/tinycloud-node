@@ -55,7 +55,7 @@ use tinycloud_core::{
     },
     request_cancel,
     sea_orm::{ColumnTrait, DbErr, EntityTrait, QueryFilter, QueryOrder},
-    sql::{SqlCaveats, SqlError, SqlRequest, SqlService},
+    sql::{SqlAuthority, SqlCaveats, SqlError, SqlRequest, SqlService},
     storage::{HashBuffer, ImmutableReadStore, ImmutableStaging},
     types::{Ability, DelegationQuery, DelegationQueryPage, Metadata, Resource},
     util::{Capability, DelegationInfo, InvocationInfo, RevocationInfo},
@@ -2547,20 +2547,22 @@ async fn read_json_body_limited(
 
 /// Classify a SQL request as write-class for the storage quota gate.
 ///
-/// Write-class = `!is_read_only` from `validate_sql`, gating DML + DDL
-/// uniformly. A parse/permission error is NOT a quota decision:
-/// `sql_service.execute` re-validates and surfaces the true error, so
-/// unparseable SQL is treated as non-write here (never masked as 402).
+/// Write-class = `!is_read_only` from `classify_sql`, gating DML + DDL
+/// uniformly. The answer does not depend on the caller's abilities (TC-1581):
+/// a statement the caller may not run is still a write, so a denial is never
+/// read as "not a write". Only a statement that does not parse is treated as
+/// non-write here (never masked as 402): `sql_service.execute` re-validates
+/// and surfaces the true error.
 /// `ExecuteStatement` resolves the named statement from the SAME caveats
 /// the execution path uses (chain caveat first, invocation facts as
 /// fallback) and classifies its SQL: on the facts fallback the statement
 /// body is invoker-controlled, so it must be parsed, never assumed
 /// read-only. An unresolvable name is non-write (execution fails with
 /// "statement not found" before any storage grows). `Export` is a read.
-fn sql_request_is_write(request: &SqlRequest, caveats: &Option<SqlCaveats>, ability: &str) -> bool {
+fn sql_request_is_write(request: &SqlRequest, caveats: &Option<SqlCaveats>) -> bool {
     let is_write_sql = |sql: &str| {
-        tinycloud_core::sql::parser::validate_sql(sql, caveats, ability)
-            .map(|p| !p.is_read_only)
+        tinycloud_core::sql::parser::classify_sql(sql)
+            .map(|class| !class.is_read_only)
             .unwrap_or(false)
     };
     match request {
@@ -2641,6 +2643,11 @@ async fn handle_sql_invoke(
     let body_str = body_result?;
 
     let (space, path, ability) = select_database_scope(sql_caps, "sql")?;
+    // TC-1581: the preferred ability above only gates the publication
+    // compatibility command. Statement authorization sees every SQL ability
+    // the invocation holds, so a `[write, schema]` request can run both data
+    // and schema-changing statements.
+    let authority = SqlAuthority::new(sql_caps.iter().map(|(_, _, held)| held.as_str()));
     // N3 will resolve this logical identity through an explicit alias table.
     // Do not fall back to the legacy final-segment selector here.
     let space_id = space.to_string();
@@ -2706,7 +2713,7 @@ async fn handle_sql_invoke(
     // Publication compatibility only exposes status and release. Both remain
     // available when content storage is full.
     let grows_content =
-        publication_command.is_none() && sql_request_is_write(&sql_request, &exec_caveats, ability);
+        publication_command.is_none() && sql_request_is_write(&sql_request, &exec_caveats);
     let full_space = if grows_content {
         storage_check(space, tinycloud, config, quota_cache)
             .await?
@@ -2729,23 +2736,11 @@ async fn handle_sql_invoke(
         meeting_publication::execute(tinycloud, sql_service, space, command).await
     } else if full_space.is_some() {
         sql_service
-            .execute_without_growth(
-                space,
-                &db_name,
-                sql_request,
-                exec_caveats,
-                ability.to_string(),
-            )
+            .execute_without_growth(space, &db_name, sql_request, exec_caveats, authority)
             .await
     } else {
         sql_service
-            .execute(
-                space,
-                &db_name,
-                sql_request,
-                exec_caveats,
-                ability.to_string(),
-            )
+            .execute(space, &db_name, sql_request, exec_caveats, authority)
             .await
     };
     crate::prometheus::observe_span(
@@ -4901,7 +4896,7 @@ mod tests {
                     params: vec![SqlValue::Text("alpha".to_string()), SqlValue::Integer(111)],
                 },
                 None,
-                "tinycloud.sql/write".to_string(),
+                ["tinycloud.sql/write", "tinycloud.sql/schema"],
             )
             .await
             .unwrap();
@@ -5009,7 +5004,7 @@ mod tests {
                     params: vec![SqlValue::Text("alpha".to_string()), SqlValue::Integer(111)],
                 },
                 None,
-                "tinycloud.sql/write".to_string(),
+                ["tinycloud.sql/write", "tinycloud.sql/schema"],
             )
             .await?;
         sql_service
@@ -5282,7 +5277,7 @@ mod tests {
                     params: vec![SqlValue::Text("alpha".to_string()), SqlValue::Integer(111)],
                 },
                 None,
-                "tinycloud.sql/write".to_string(),
+                ["tinycloud.sql/write", "tinycloud.sql/schema"],
             )
             .await?;
         sql_service
@@ -6542,7 +6537,6 @@ mod tests {
     #[tokio::test]
     async fn sql_request_is_write_classifies_variants() {
         use tinycloud_core::sql::types::SqlStatement;
-        let ability = "tinycloud.sql/write";
         let caveats = &None;
 
         // Execute carrying a non-empty schema (DDL) is write-class.
@@ -6553,7 +6547,6 @@ mod tests {
                 params: vec![],
             },
             caveats,
-            ability
         ));
 
         // Execute with no schema but a DML statement is write-class.
@@ -6564,7 +6557,6 @@ mod tests {
                 params: vec![],
             },
             caveats,
-            ability
         ));
 
         // A read-only Query is not write-class.
@@ -6576,7 +6568,6 @@ mod tests {
                 max_bytes: None,
             },
             caveats,
-            ability
         ));
 
         // A Batch containing any write statement is write-class.
@@ -6588,7 +6579,6 @@ mod tests {
                 }],
             },
             caveats,
-            ability
         ));
 
         // ExecuteStatement is read-only by construction; Export is a read.
@@ -6598,9 +6588,51 @@ mod tests {
                 params: vec![],
             },
             caveats,
-            ability
         ));
-        assert!(!sql_request_is_write(&SqlRequest::Export, caveats, ability));
+        assert!(!sql_request_is_write(&SqlRequest::Export, caveats));
+    }
+
+    /// TC-1581: classification does not depend on the abilities held, so a
+    /// statement the caller may not run (DDL under `write`) is still a write
+    /// for the storage-quota gate, not "unparseable, therefore not a write".
+    #[tokio::test]
+    async fn sql_request_is_write_counts_ddl_whoever_may_run_it() {
+        use tinycloud_core::sql::types::SqlStatement;
+        let caveats = &None;
+        for ddl in [
+            "CREATE TABLE t (a)",
+            "ALTER TABLE t ADD COLUMN b",
+            "DROP TABLE t",
+            "CREATE INDEX i ON t (a)",
+            "CREATE VIEW v AS SELECT 1",
+        ] {
+            assert!(sql_request_is_write(
+                &SqlRequest::Query {
+                    sql: ddl.to_string(),
+                    params: vec![],
+                    max_rows: None,
+                    max_bytes: None,
+                },
+                caveats,
+            ));
+            assert!(sql_request_is_write(
+                &SqlRequest::Execute {
+                    schema: None,
+                    sql: ddl.to_string(),
+                    params: vec![],
+                },
+                caveats,
+            ));
+            assert!(sql_request_is_write(
+                &SqlRequest::Batch {
+                    statements: vec![SqlStatement {
+                        sql: ddl.to_string(),
+                        params: vec![],
+                    }],
+                },
+                caveats,
+            ));
+        }
     }
 
     /// A metered SQL HTTP stack: one shared `SqlSizes` feeds both the SQL
@@ -6694,7 +6726,7 @@ mod tests {
                     params: vec![SqlValue::Text("alpha".to_string()), SqlValue::Integer(111)],
                 },
                 None,
-                "tinycloud.sql/write".to_string(),
+                ["tinycloud.sql/write", "tinycloud.sql/schema"],
             )
             .await?;
 
@@ -6743,10 +6775,15 @@ mod tests {
             None,
         );
 
-        // Grant BOTH read and write with EMPTY caveats on the same parent
-        // delegation so either invocation ability is authorized and the raw
-        // request reaches the gate unconstrained.
-        for ability in ["tinycloud.sql/read", "tinycloud.sql/write"] {
+        // Grant read, write AND schema with EMPTY caveats on the same parent
+        // delegation so any invocation ability (or a `[write, schema]`
+        // pair) is authorized and the raw request reaches the gate
+        // unconstrained.
+        for ability in [
+            "tinycloud.sql/read",
+            "tinycloud.sql/write",
+            "tinycloud.sql/schema",
+        ] {
             abilities::ActiveModel {
                 delegation: Set(parent_hash),
                 resource: Set(Resource::TinyCloud(resource.clone())),
@@ -6793,15 +6830,28 @@ mod tests {
         nonce: &str,
         facts: Vec<serde_json::Value>,
     ) -> Result<String> {
+        sql_invocation_header_for_abilities(setup, &[ability], nonce, facts)
+    }
+
+    /// One invocation carrying several SQL abilities on the database, as the
+    /// SDK's `[write, schema]` requests do.
+    fn sql_invocation_header_for_abilities(
+        setup: &MeteredSqlHttp,
+        abilities: &[&str],
+        nonce: &str,
+        facts: Vec<serde_json::Value>,
+    ) -> Result<String> {
         use tinycloud_auth::ssi::{dids::DIDURLBuf, ucan::Payload};
         use tinycloud_auth::ucan_capabilities_object::Capabilities;
 
         let mut invocation_caps = Capabilities::new();
-        invocation_caps.with_action(
-            setup.resource.as_uri(),
-            ability.parse::<UcanAbility>()?,
-            [std::collections::BTreeMap::<String, serde_json::Value>::new()],
-        );
+        for ability in abilities {
+            invocation_caps.with_action(
+                setup.resource.as_uri(),
+                ability.parse::<UcanAbility>()?,
+                [std::collections::BTreeMap::<String, serde_json::Value>::new()],
+            );
+        }
         let invocation = Payload {
             issuer: setup.verification_method.parse::<DIDURLBuf>()?,
             audience: setup
@@ -7023,10 +7073,12 @@ mod tests {
         let usage_header =
             space_info_invocation_header(&mut setup, "urn:uuid:tc626-full-usage").await?;
         let write = |nonce: &str| sql_invocation_header(&setup, "tinycloud.sql/write", nonce);
-        let ensure = write("urn:uuid:tc626-full-ensure")?;
+        // TC-1581: schema-changing statements ride a `schema` invocation.
+        let schema = |nonce: &str| sql_invocation_header(&setup, "tinycloud.sql/schema", nonce);
+        let ensure = schema("urn:uuid:tc626-full-ensure")?;
         let grow = write("urn:uuid:tc626-full-grow")?;
         let delete = write("urn:uuid:tc626-full-delete")?;
-        let drop_table = write("urn:uuid:tc626-full-drop")?;
+        let drop_table = schema("urn:uuid:tc626-full-drop")?;
         let count =
             sql_invocation_header(&setup, "tinycloud.sql/read", "urn:uuid:tc626-full-count")?;
 
@@ -7114,6 +7166,163 @@ mod tests {
         assert_eq!(status, Status::Ok, "DELETE on a full space: {body}");
         let (status, _, body) = send(drop_table, execute("DROP TABLE labels")?).await;
         assert_eq!(status, Status::Ok, "DROP on a full space: {body}");
+        Ok(())
+    }
+
+    /// TC-1581 over `/invoke`: an invocation holding `write` alone cannot run
+    /// a schema-changing statement, on any request path; one holding
+    /// `[write, schema]` (the SDK's shape) runs data and schema statements in
+    /// one request; `schema` alone runs schema statements only.
+    #[tokio::test]
+    async fn tc1581_invoke_write_alone_cannot_change_the_schema() -> Result<()> {
+        use rocket::data::ByteUnit;
+        use rocket::http::{ContentType, Header, Status};
+        use rocket::local::asynchronous::Client;
+
+        const WRITE: &str = "tinycloud.sql/write";
+        const SCHEMA: &str = "tinycloud.sql/schema";
+        let setup = metered_sql_http_setup("tc1581-invoke").await?;
+        let mut nonce = 0u32;
+        let mut header = |abilities: &[&str]| -> Result<String> {
+            nonce += 1;
+            sql_invocation_header_for_abilities(
+                &setup,
+                abilities,
+                &format!("urn:uuid:tc1581-{nonce}"),
+                Vec::new(),
+            )
+        };
+        let write_only = [header(&[WRITE])?, header(&[WRITE])?, header(&[WRITE])?];
+        let write_only_more = [
+            header(&[WRITE])?,
+            header(&[WRITE])?,
+            header(&[WRITE])?,
+            header(&[WRITE])?,
+        ];
+        let both = [header(&[WRITE, SCHEMA])?, header(&[WRITE, SCHEMA])?];
+        let both_more = [header(&[WRITE, SCHEMA])?, header(&[WRITE, SCHEMA])?];
+        let schema_only = [header(&[SCHEMA])?, header(&[SCHEMA])?];
+        let read = header(&["tinycloud.sql/read"])?;
+
+        let client = Client::tracked(metered_sql_rocket(setup, ByteUnit::Mebibyte(64))).await?;
+        let send = |auth: &String, request: &SqlRequest| {
+            let client = &client;
+            let auth = auth.clone();
+            let body = serde_json::to_string(request);
+            async move {
+                let response = client
+                    .post("/invoke")
+                    .header(Header::new("Authorization", auth))
+                    .header(ContentType::JSON)
+                    .body(body.expect("request serializes"))
+                    .dispatch()
+                    .await;
+                let status = response.status();
+                (status, response.into_string().await.unwrap_or_default())
+            }
+        };
+        let execute = |sql: &str, schema: Option<&str>| SqlRequest::Execute {
+            sql: sql.to_string(),
+            params: vec![],
+            schema: schema.map(|s| vec![s.to_string()]),
+        };
+
+        // `write` alone: data statements run, schema-changing ones are 403.
+        let (status, body) = send(
+            &write_only[0],
+            &execute("INSERT INTO labels (label, val) VALUES ('beta', 2)", None),
+        )
+        .await;
+        assert_eq!(status, Status::Ok, "write runs data statements: {body}");
+        for (auth, request) in write_only[1..].iter().zip([
+            execute("DROP TABLE labels", None),
+            execute("CREATE TABLE intruder (id INTEGER)", None),
+        ]) {
+            let (status, body) = send(auth, &request).await;
+            assert_eq!(status, Status::Forbidden, "{request:?}: {body}");
+            assert!(body.contains("tinycloud.sql/schema"), "{body}");
+        }
+        for (auth, request) in write_only_more.iter().zip([
+            execute("ALTER TABLE labels ADD COLUMN extra TEXT", None),
+            // Request-level `schema` entries are judged like any statement.
+            execute(
+                "INSERT INTO labels (label, val) VALUES ('gamma', 3)",
+                Some("CREATE TABLE IF NOT EXISTS intruder (id INTEGER)"),
+            ),
+            SqlRequest::Batch {
+                statements: vec![tinycloud_core::sql::types::SqlStatement {
+                    sql: "CREATE INDEX labels_val ON labels (val)".into(),
+                    params: vec![],
+                }],
+            },
+            SqlRequest::Query {
+                sql: "DROP VIEW IF EXISTS labels".into(),
+                params: vec![],
+                max_rows: None,
+                max_bytes: None,
+            },
+        ]) {
+            let (status, body) = send(auth, &request).await;
+            assert_eq!(status, Status::Forbidden, "{request:?}: {body}");
+        }
+
+        // `[write, schema]` in one request: the migration shape.
+        let (status, body) = send(
+            &both[0],
+            &execute(
+                "INSERT INTO extra (v) VALUES ('x')",
+                Some("CREATE TABLE IF NOT EXISTS extra (v TEXT)"),
+            ),
+        )
+        .await;
+        assert_eq!(status, Status::Ok, "[write, schema] mixed execute: {body}");
+        let (status, body) = send(&both[1], &execute("DROP TABLE extra", None)).await;
+        assert_eq!(status, Status::Ok, "[write, schema] drop: {body}");
+        let (status, body) = send(
+            &both_more[0],
+            &execute("ALTER TABLE labels ADD COLUMN note TEXT", None),
+        )
+        .await;
+        assert_eq!(status, Status::Ok, "[write, schema] alter: {body}");
+
+        // `schema` alone: schema statements only.
+        let (status, body) = send(
+            &schema_only[0],
+            &execute("CREATE TABLE IF NOT EXISTS from_schema (id INTEGER)", None),
+        )
+        .await;
+        assert_eq!(status, Status::Ok, "schema runs DDL: {body}");
+        let (status, body) = send(
+            &schema_only[1],
+            &execute("INSERT INTO labels (label, val) VALUES ('delta', 4)", None),
+        )
+        .await;
+        assert_eq!(
+            status,
+            Status::Forbidden,
+            "schema alone writes nothing: {body}"
+        );
+
+        // The refused statements changed nothing: `labels` kept its rows
+        // and `intruder` was never created.
+        let (status, body) = send(
+            &read,
+            &SqlRequest::Query {
+                sql: "SELECT (SELECT count(*) FROM labels), \
+                      (SELECT count(*) FROM sqlite_schema WHERE name = 'intruder')"
+                    .to_string(),
+                params: vec![],
+                max_rows: None,
+                max_bytes: None,
+            },
+        )
+        .await;
+        assert_eq!(status, Status::Ok, "{body}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body)?["rows"],
+            serde_json::json!([[2, 0]]),
+            "{body}"
+        );
         Ok(())
     }
 
@@ -8672,7 +8881,9 @@ mod tests {
             &signer,
             &issuer_vm,
             "sql",
-            "tinycloud.sql/write",
+            // The body creates a table and inserts into it. `admin` carries
+            // both: schema changes need `schema` (TC-1581), data needs `write`.
+            "tinycloud.sql/admin",
             None,
             nonce,
         )?;
@@ -9416,13 +9627,19 @@ mod tests {
         }
 
         async fn owner_sql(&self, path: &str, request: SqlRequest) -> Result<SyncReply> {
-            let action = if matches!(request, SqlRequest::Query { .. }) {
-                "tinycloud.sql/read"
+            // The owner holds every ability: a mutating request carries
+            // `write` and `schema` like the SDK's `execute({ schema })`.
+            let actions: &[&str] = if matches!(request, SqlRequest::Query { .. }) {
+                &["tinycloud.sql/read"]
             } else {
-                "tinycloud.sql/write"
+                &["tinycloud.sql/write", "tinycloud.sql/schema"]
             };
             let uri = self.resource_in(&self.space, "sql", path)?.to_string();
-            self.invoke_json(self.owner_invocation(&[(uri, action)])?, &request)
+            let capabilities: Vec<(String, &str)> = actions
+                .iter()
+                .map(|action| (uri.clone(), *action))
+                .collect();
+            self.invoke_json(self.owner_invocation(&capabilities)?, &request)
                 .await
         }
 
