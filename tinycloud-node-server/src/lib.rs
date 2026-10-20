@@ -711,7 +711,8 @@ pub async fn app_with_control(
         tinycloud_config.storage.sql.memory_threshold.as_u64(),
         database_artifact_repository.clone(),
     )
-    .with_wait_bounds(tinycloud_config.storage.sql.wait_bounds());
+    .with_wait_bounds(tinycloud_config.storage.sql.wait_bounds())
+    .with_ddl_policy(tinycloud_config.storage.sql.ddl_requires_schema);
 
     let mut policy_v3_runtime =
         PolicyV3Runtime::new(seed_conn.clone(), key_setup.node_did(), key_setup.clone())
