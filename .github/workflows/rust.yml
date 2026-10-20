@@ -136,7 +136,7 @@ jobs:
       run: cargo test -p tinycloud-core --features duckdb
 
     - name: Run DuckDB policy and request telemetry through node binaries
-      run: cargo test -p tinycloud-node --features duckdb --test request_telemetry_authenticated --test duckdb_diagnostics_policy --test duckdb_offline_policy
+      run: cargo test -p tinycloud-node --features duckdb --test request_telemetry_authenticated --test duckdb_diagnostics_policy --test duckdb_offline_policy --test space_size_restart
 
   clippy:
     name: clippy (workspace)

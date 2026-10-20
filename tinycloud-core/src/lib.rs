@@ -1,6 +1,7 @@
 pub mod admission;
 pub mod at_rest;
 pub(crate) mod auth_graph;
+pub mod data_owners;
 pub mod database_artifacts;
 pub mod database_identity;
 pub mod database_migration;
