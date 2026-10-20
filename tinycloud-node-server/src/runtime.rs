@@ -590,7 +590,6 @@ mod tests {
         let _telemetry_canonical = EnvGuard::set("TINYCLOUD_TELEMETRY__ENABLED", "true");
         let _telemetry_legacy = EnvGuard::unset("TINYCLOUD_TELEMETRY_ENABLED");
         let _pool_canonical = EnvGuard::set("TINYCLOUD_DATABASE__MAX_CONNECTIONS", "200");
-        let _did_network = EnvGuard::set("TINYCLOUD_DID_RESOLUTION__NETWORK_METHODS", "true");
         let _timeout_mode = EnvGuard::set("TINYCLOUD_DATABASE__STATEMENT_TIMEOUT_MODE", "local");
         let _user_timeout = EnvGuard::set("TINYCLOUD_DATABASE__TCP_USER_TIMEOUT_MS", "20000");
         let _keys_env = clear_keys_env();
@@ -606,7 +605,6 @@ mod tests {
         assert!(cfg.telemetry.enabled);
         // The pool knob is env-overridable via the double-underscore form.
         assert_eq!(cfg.database.max_connections, 200);
-        assert!(cfg.did_resolution.network_methods);
         // Absent config falls back to the hardcoded default of 100.
         assert_eq!(config::DatabaseConfig::default().max_connections, 100);
         assert_eq!(config::Config::default().database.max_connections, 100);

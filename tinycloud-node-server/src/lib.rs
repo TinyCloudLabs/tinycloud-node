@@ -516,11 +516,6 @@ pub async fn app_with_control(
     if egress_policy.refresh().await.is_err() {
         ::tracing::warn!("webhook egress closed: internal endpoint lookup failed");
     }
-    tinycloud_core::did_resolution::configure(
-        tinycloud_core::did_resolution::DidResolutionPolicy {
-            network_methods: tinycloud_config.did_resolution.network_methods,
-        },
-    );
     tinycloud_core::did_resolution::set_refusal_observer(
         prometheus::observe_did_resolution_refused,
     );
@@ -540,11 +535,10 @@ pub async fn app_with_control(
         config.extract_inner::<rocket::config::LogLevel>("log_level")?,
     )?;
 
-    ::tracing::info!(network_methods = tinycloud_config.did_resolution.network_methods,
-        offline_methods = ?tinycloud_core::did_resolution::OFFLINE_DID_METHODS, "did resolution policy");
-    if tinycloud_config.did_resolution.network_methods {
-        ::tracing::warn!("network DID resolution enabled: did:web/did:tz fetches use the unhardened ssi client (TC-1080)");
-    }
+    ::tracing::info!(
+        allowed_methods = ?tinycloud_core::did_resolution::ALLOWED_DID_METHODS,
+        "did resolution policy"
+    );
 
     let routes = production_routes();
     #[cfg(feature = "tc-bench-v1")]

@@ -4,7 +4,7 @@ use std::{
     collections::{HashMap, VecDeque},
     env,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
         Mutex, OnceLock,
     },
     time::{Duration, Instant},
@@ -18,26 +18,15 @@ use tinycloud_auth::ssi::{
     ucan::{Ucan, UcanRevocation},
 };
 
-pub const OFFLINE_DID_METHODS: &[&str] = &["key", "pkh", "jwk"];
-static NETWORK_METHODS: AtomicBool = AtomicBool::new(false);
+/// The only issuer DID methods the node resolves. Each derives verification material without
+/// network access. Every other method is refused before any lookup, whatever the configuration.
+pub const ALLOWED_DID_METHODS: &[&str] = &["key", "pkh", "jwk"];
+/// `did:key` is limited to Ed25519: base58btc multibase `z` over the `0xed 0x01` multicodec.
+const ED25519_DID_KEY_PREFIX: &str = "z6Mk";
+/// `did:pkh` is limited to the EVM (`eip155`) namespace.
+const PKH_EVM_NAMESPACE_PREFIX: &str = "eip155:";
 static REFUSED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static REFUSAL_OBSERVER: OnceLock<fn(&str, &str)> = OnceLock::new();
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct DidResolutionPolicy {
-    pub network_methods: bool,
-}
-
-/// Set the process policy from effective startup configuration.
-pub fn configure(policy: DidResolutionPolicy) {
-    NETWORK_METHODS.store(policy.network_methods, Ordering::Relaxed);
-}
-
-pub fn policy() -> DidResolutionPolicy {
-    DidResolutionPolicy {
-        network_methods: NETWORK_METHODS.load(Ordering::Relaxed),
-    }
-}
 
 /// Process-lifetime refusal count. Public status reads never acquire a lock.
 pub fn refused_total() -> u64 {
@@ -61,47 +50,61 @@ pub enum UcanVerifyError {
     Invalid,
 }
 
-/// Defence in depth for callers resolving a DID directly.
-pub struct NodeDidResolver {
-    network_methods: bool,
+/// Defence in depth for callers resolving a DID directly. `inner` is consulted only after
+/// the method and namespace checks pass.
+pub struct NodeDidResolver<R> {
+    inner: R,
 }
-impl NodeDidResolver {
+impl NodeDidResolver<AnyDidMethod> {
     pub fn current() -> Self {
         Self {
-            network_methods: policy().network_methods,
+            inner: AnyDidMethod::default(),
         }
     }
-
+}
+impl<R> NodeDidResolver<R> {
+    /// Wrap `inner` as the lookup backend. Refusal runs before `inner` is consulted.
+    pub fn new(inner: R) -> Self {
+        Self { inner }
+    }
     fn check(&self, issuer: &DIDURL) -> Result<(), UcanVerifyError> {
         if issuer.query().is_some() {
             refused(issuer.did(), "query_rejected");
             return Err(UcanVerifyError::QueryRejected);
         }
-        self.check_method(issuer.did())
-    }
-
-    fn check_method(&self, did: &DID) -> Result<(), UcanVerifyError> {
-        let method = did.method_name();
-        if !self.network_methods && !OFFLINE_DID_METHODS.contains(&method) {
-            refused(did, "method_disabled");
-            return Err(UcanVerifyError::MethodDisabled {
-                method: method.to_owned(),
-            });
-        }
-        Ok(())
+        check_method(issuer.did())
     }
 }
-impl DIDResolver for NodeDidResolver {
+impl<R: DIDResolver> DIDResolver for NodeDidResolver<R> {
     async fn resolve_representation<'a>(
         &'a self,
         did: &'a DID,
         options: Options,
     ) -> Result<Output<Vec<u8>>, resolution::Error> {
-        self.check_method(did)
-            .map_err(resolution::Error::internal)?;
-        AnyDidMethod::default()
-            .resolve_representation(did, options)
-            .await
+        check_method(did).map_err(resolution::Error::internal)?;
+        self.inner.resolve_representation(did, options).await
+    }
+}
+
+/// Admit a DID only when its method is allow-listed and, for `did:key` and `did:pkh`, its
+/// key type or namespace is allowed. Runs before any lookup.
+fn check_method(did: &DID) -> Result<(), UcanVerifyError> {
+    let method = did.method_name();
+    if !ALLOWED_DID_METHODS.contains(&method) || !namespace_allowed(did) {
+        refused(did, "method_disabled");
+        return Err(UcanVerifyError::MethodDisabled {
+            method: method.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn namespace_allowed(did: &DID) -> bool {
+    let id = did.method_specific_id();
+    match did.method_name() {
+        "key" => id.starts_with(ED25519_DID_KEY_PREFIX),
+        "pkh" => id.starts_with(PKH_EVM_NAMESPACE_PREFIX),
+        _ => true,
     }
 }
 
@@ -111,7 +114,20 @@ where
     F: for<'de> Deserialize<'de> + Serialize,
     A: for<'de> Deserialize<'de> + Serialize,
 {
-    let resolver = NodeDidResolver::current();
+    verify_ucan_signature_with(ucan, AnyDidMethod::default()).await
+}
+
+/// Verify a UCAN against an explicit lookup backend. Refusal runs before `inner` is consulted.
+pub async fn verify_ucan_signature_with<F, A, R>(
+    ucan: &Ucan<F, A>,
+    inner: R,
+) -> Result<(), UcanVerifyError>
+where
+    F: for<'de> Deserialize<'de> + Serialize,
+    A: for<'de> Deserialize<'de> + Serialize,
+    R: DIDResolver,
+{
+    let resolver = NodeDidResolver { inner };
     resolver.check(&ucan.payload().issuer)?;
     tokio::time::timeout(did_resolution_timeout(), ucan.verify_signature(&resolver))
         .await
@@ -125,7 +141,17 @@ pub async fn verify_ucan_revocation_signature(
     algorithm: Algorithm,
     jwk: Option<&JWK>,
 ) -> Result<(), UcanVerifyError> {
-    let resolver = NodeDidResolver::current();
+    verify_ucan_revocation_signature_with(revocation, algorithm, jwk, AnyDidMethod::default()).await
+}
+
+/// Revocation counterpart of [`verify_ucan_signature_with`].
+pub async fn verify_ucan_revocation_signature_with<R: DIDResolver>(
+    revocation: &UcanRevocation,
+    algorithm: Algorithm,
+    jwk: Option<&JWK>,
+    inner: R,
+) -> Result<(), UcanVerifyError> {
+    let resolver = NodeDidResolver { inner };
     resolver.check(&revocation.issuer)?;
     tokio::time::timeout(
         did_resolution_timeout(),

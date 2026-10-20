@@ -1523,15 +1523,10 @@ impl Default for DatabaseConfig {
     }
 }
 
-/// UCAN issuer resolution policy (TC-1080). Parsing and identity comparisons are unchanged.
+/// UCAN issuer resolution. The method allow-list is fixed in `tinycloud_core::did_resolution`
+/// and has no settings. The section is still accepted so existing configs keep parsing.
 #[derive(Serialize, Deserialize, Debug, Default, Clone, Hash, PartialEq, Eq)]
-pub struct DidResolutionConfig {
-    /// Allow methods beyond key, pkh and jwk. Default: false.
-    /// Canonical env: TINYCLOUD_DID_RESOLUTION__NETWORK_METHODS=true.
-    /// Requires a restart; issuer queries are always refused.
-    #[serde(default)]
-    pub network_methods: bool,
-}
+pub struct DidResolutionConfig {}
 
 impl DatabaseConfig {
     /// Reject settings that would make the node unusable (TC-1317): a zero

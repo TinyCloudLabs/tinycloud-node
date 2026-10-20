@@ -1,5 +1,5 @@
-//! Real app startup applies the documented environment opt-in and restart policy.
-//! One test in its own process isolates the process-global policy and env fixture.
+//! Real app startup. The retired `network_methods` environment key must not enable any DID
+//! method outside the allow-list. One test in its own process isolates the env fixture.
 #[path = "../../tinycloud-core/tests/support/did_resolution.rs"]
 mod support;
 use rocket::{
@@ -10,10 +10,6 @@ use rocket::{
     local::asynchronous::Client,
 };
 use serde_json::{json, Value};
-use std::{
-    io::{Read, Write},
-    time::Duration,
-};
 use support::*;
 use tinycloud_auth::ssi::jwk::{Algorithm, JWK};
 use tinycloud_core::did_resolution::{verify_ucan_signature, UcanVerifyError};
@@ -88,54 +84,8 @@ async fn assert_web_refused() {
     );
 }
 
-async fn assert_web_verified_locally() {
-    let listener = bound_listener();
-    let did = format!(
-        "did:web:127.0.0.1%3A{}",
-        listener.local_addr().unwrap().port()
-    );
-    let issuer = format!("{did}#key");
-    let key = JWK::generate_ed25519().unwrap();
-    let ucan = signed_ucan(&issuer, &key, Algorithm::EdDSA);
-    let body = json!({"@context":"https://www.w3.org/ns/did/v1", "id":did,
-        "verificationMethod":[{"id":issuer,"type":"JsonWebKey2020","controller":did,"publicKeyJwk":key.to_public()}]}).to_string();
-    let server = std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + Duration::from_secs(4);
-        loop {
-            match listener.accept() {
-                Ok((mut stream, peer)) => {
-                    assert!(peer.ip().is_loopback());
-                    stream
-                        .set_read_timeout(Some(Duration::from_secs(2)))
-                        .unwrap();
-                    stream
-                        .set_write_timeout(Some(Duration::from_secs(2)))
-                        .unwrap();
-                    let mut request = [0; 4096];
-                    let size = stream.read(&mut request).unwrap();
-                    assert!(String::from_utf8_lossy(&request[..size])
-                        .starts_with("GET /.well-known/did.json HTTP/1.1"));
-                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/did+ld+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
-                    return 1;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    if std::time::Instant::now() >= deadline {
-                        return 0;
-                    }
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                result => panic!("local listener failed: {result:?}"),
-            }
-        }
-    });
-    let outcome = tokio::time::timeout(Duration::from_secs(5), verify_ucan_signature(&ucan)).await;
-    let accepted = server.join().unwrap();
-    assert_eq!(outcome, Ok(Ok(())), "app must apply the environment opt-in");
-    assert_eq!(accepted, 1);
-}
-
 #[tokio::test]
-async fn app_startup_honors_default_env_opt_in_and_restart_to_default() {
+async fn app_startup_ignores_retired_network_methods_env() {
     let _restore = RestoreEnv(std::env::var_os(NETWORK_METHODS_ENV));
     std::env::remove_var(NETWORK_METHODS_ENV);
     let (client, _dir) = app().await;
@@ -143,15 +93,8 @@ async fn app_startup_honors_default_env_opt_in_and_restart_to_default() {
     assert_web_refused().await;
     drop(client);
 
+    // The retired key set to true must not enable web or report a different policy.
     std::env::set_var(NETWORK_METHODS_ENV, "true");
-    let (client, _dir) = app().await;
-    // Resolve before checking /info so the configure-removal mutant fails on
-    // refused verification, rather than only on the reported policy boolean.
-    assert_web_verified_locally().await;
-    assert!(network_methods(&client).await);
-    drop(client);
-
-    std::env::remove_var(NETWORK_METHODS_ENV);
     let (client, _dir) = app().await;
     assert!(!network_methods(&client).await);
     assert_web_refused().await;
