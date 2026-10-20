@@ -388,17 +388,15 @@ setting. DID parsing and string comparisons, including share-email `did:web`
 identifiers, are unchanged. Existing route status codes and policy machine codes
 are preserved.
 
-Keep `[global.did_resolution] network_methods = false` in `tinycloud.toml`
-or the canonical environment variable
-`TINYCLOUD_DID_RESOLUTION__NETWORK_METHODS=false`. Network DID methods, including
-`did:web`, remain disabled under the current policy.
+Network DID methods, including `did:web`, `did:tz`, `did:ethr` and `did:ion`, are
+never resolved for UCAN verification. No setting or environment variable enables
+them.
 
-**Full TC-1080 Part B hardening is REQUIRED before any future re-enable**,
-including setting the existing `network_methods` option to `true`. The
-unhardened SSI client is not an acceptable rollback path. Part B is not
-implemented here, and there is no Part B development bypass. The required
-node-side fetcher, destination enforcement, resource limits and local-listener
-acceptance checks are described in the
+**Full TC-1080 Part B hardening is REQUIRED before any future enablement of network
+DID resolution.** The unhardened SSI client is not an acceptable path. Part B is not
+implemented here, and there is no Part B development bypass. The required node-side
+fetcher, destination enforcement, resource limits and local-listener acceptance checks
+are described in the
 [developer gate](docs/delegation-flow.md#network-did-method-future-enable-gate-tc-1132).
 
 The startup log records the effective policy. Refusals increment

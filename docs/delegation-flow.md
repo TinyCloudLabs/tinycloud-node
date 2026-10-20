@@ -25,16 +25,16 @@ The delegation hierarchy enables:
 
 ### Network DID method future-enable gate (TC-1132)
 
-The node's UCAN issuer resolver currently permits only offline `did:key`,
-`did:pkh` and `did:jwk` resolution by default. Network methods, including
-`did:web`, remain disabled with `network_methods = false`. DID identifiers used
-for parsing or identity comparisons (for example share-email `did:web` values)
-are unaffected; this gate concerns network resolution during verification.
+The node's UCAN issuer resolver resolves only the fixed allow-list: `did:key` (Ed25519
+keys only), `did:pkh` (`eip155` namespace only) and `did:jwk`, all offline. Every other
+DID method, including `did:web`, is refused before any resolution, and no setting enables
+another method. DID identifiers used for parsing or identity comparisons (for example
+share-email `did:web` values) are unaffected; this gate concerns network resolution
+during verification.
 
-**Full TC-1080 plan Part B is REQUIRED before any future re-enable**, including
-the existing `network_methods = true` setting. Do not restore the unhardened SSI
-fetcher as a rollback. Part B is not implemented by TC-1132 Parts C/D, and no
-Part B development flag or bypass is provided.
+**Full TC-1080 plan Part B is REQUIRED before any future enablement of a network DID
+method.** Do not restore the unhardened SSI fetcher. Part B is not implemented by
+TC-1132 Parts C/D, and no Part B development flag or bypass is provided.
 
 Before a future change enables `did:web`, it must implement and verify all of
 Part B:
