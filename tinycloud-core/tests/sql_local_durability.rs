@@ -37,7 +37,10 @@ impl FreeSpace for FakeFree {
     }
 }
 
+/// A policy with the headroom check ON (`min_free_bytes` is 0 = off by default,
+/// so the tests that exercise the mechanism pass an explicit value).
 fn policy_with(free: &Arc<FakeFree>, min_free_bytes: u64) -> DurabilityPolicy {
+    assert!(min_free_bytes > 0);
     DurabilityPolicy {
         min_free_bytes,
         free_space: free.clone(),
@@ -210,7 +213,7 @@ async fn an_amplified_transaction_is_rejected_before_commit_and_leaves_no_effect
     // 1 MiB free, no floor: the SQL text is a few hundred bytes, but the pages
     // it dirties are several MiB.
     let free = FakeFree::new(1 << 20);
-    let a = actor(dir.path(), DB, policy_with(&free, 0));
+    let a = actor(dir.path(), DB, policy_with(&free, 1));
     free.set(64 << 20);
     for statement in AMPLIFIED_SCHEMA {
         ok(&a, statement).await;
@@ -252,7 +255,7 @@ async fn a_batch_is_all_or_nothing_under_each_kind_of_rejection() {
     let policy = DurabilityPolicy {
         // 32 pages of 4 KiB.
         max_database_bytes: 128 * 1024,
-        min_free_bytes: 0,
+        min_free_bytes: 1,
         free_space: free.clone(),
         ..Default::default()
     };
@@ -339,7 +342,7 @@ async fn the_size_cap_and_owner_budget_are_enforced_by_sqlite_and_shrinking_writ
     let free = FakeFree::new(64 << 20);
     let policy = DurabilityPolicy {
         max_database_bytes: 64 * 4096,
-        min_free_bytes: 0,
+        min_free_bytes: 1,
         free_space: free.clone(),
         ..Default::default()
     };
@@ -401,6 +404,63 @@ async fn the_size_cap_and_owner_budget_are_enforced_by_sqlite_and_shrinking_writ
     assert!(shrink.is_ok(), "{shrink:?}");
 }
 
+/// The shipped defaults are off: no cap, no headroom check, no reservation
+/// (the limits are Sam's decision, card `sql-storage-report-read`). `synchronous`
+/// is the durability fix, not a limit, and defaults to FULL.
+#[tokio::test]
+async fn the_limits_are_off_by_default_but_the_same_policy_enforces_when_set() {
+    let defaults = DurabilityPolicy::default();
+    assert_eq!(defaults.max_database_bytes, 0);
+    assert_eq!(defaults.min_free_bytes, 0);
+    assert_eq!(defaults.synchronous, Synchronous::Full);
+
+    let dir = tempfile::tempdir().unwrap();
+    // A disk that reports no free space at all, and a blob bigger than any cap
+    // below: with the defaults nothing refuses and nothing is reserved.
+    let free = FakeFree::new(0);
+    let off = DurabilityPolicy {
+        free_space: free.clone(),
+        ..Default::default()
+    };
+    let a = actor(dir.path(), "off", off.clone());
+    ok(&a, "CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB)").await;
+    ok(&a, "INSERT INTO t (v) VALUES (zeroblob(3000000))").await;
+    assert_eq!(count(&a, "t").await, 1);
+    assert_eq!(off.budget.reserved(), 0, "nothing is reserved when off");
+
+    // The same writes under explicit limits are refused.
+    let on = DurabilityPolicy {
+        max_database_bytes: 1 << 20,
+        min_free_bytes: 1,
+        free_space: free.clone(),
+        ..Default::default()
+    };
+    let b = actor(dir.path(), "on", on.clone());
+    free.set(1 << 30);
+    ok(&b, "CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB)").await;
+    let capped = run(
+        &b,
+        exec("INSERT INTO t (v) VALUES (zeroblob(3000000))"),
+        GrowthPolicy::Allow,
+    )
+    .await;
+    assert!(
+        matches!(capped, Err(SqlError::DatabaseSizeLimit)),
+        "{capped:?}"
+    );
+    free.set(0);
+    let no_room = run(
+        &b,
+        exec("INSERT INTO t (v) VALUES (zeroblob(10))"),
+        GrowthPolicy::Allow,
+    )
+    .await;
+    assert!(
+        matches!(no_room, Err(SqlError::DiskHeadroom)),
+        "{no_room:?}"
+    );
+}
+
 #[tokio::test]
 async fn disk_headroom_exhaustion_refuses_writes_and_recovers_without_residue() {
     let dir = tempfile::tempdir().unwrap();
@@ -428,7 +488,7 @@ async fn disk_headroom_exhaustion_refuses_writes_and_recovers_without_residue() 
 async fn concurrent_databases_share_one_reservation_budget() {
     let dir = tempfile::tempdir().unwrap();
     let free = FakeFree::new(64 << 20);
-    let policy = policy_with(&free, 0);
+    let policy = policy_with(&free, 1);
     let a = actor(dir.path(), "a", policy.clone());
     let b = actor(dir.path(), "b", policy.clone());
     ok(&a, "CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB)").await;
@@ -468,7 +528,7 @@ async fn concurrent_databases_share_one_reservation_budget() {
 async fn a_database_over_the_cap_still_runs_writes_that_do_not_grow_it() {
     let dir = tempfile::tempdir().unwrap();
     let free = FakeFree::new(64 << 20);
-    let big = actor(dir.path(), DB, policy_with(&free, 0));
+    let big = actor(dir.path(), DB, policy_with(&free, 1));
     ok(&big, "CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB)").await;
     for _ in 0..10 {
         ok(&big, "INSERT INTO t (v) VALUES (zeroblob(30000))").await;
@@ -477,7 +537,7 @@ async fn a_database_over_the_cap_still_runs_writes_that_do_not_grow_it() {
     // The cap is now below the file's size.
     let small_cap = DurabilityPolicy {
         max_database_bytes: 4096,
-        ..policy_with(&free, 0)
+        ..policy_with(&free, 1)
     };
     let a = actor(dir.path(), DB, small_cap);
     ok(&a, "UPDATE t SET v = zeroblob(10) WHERE id = 1").await;

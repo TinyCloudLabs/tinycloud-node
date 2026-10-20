@@ -1168,24 +1168,26 @@ pub struct SqlStorageConfig {
     #[serde(default)]
     pub synchronous: tinycloud_core::sql::durability::Synchronous,
     /// Per-database size cap (TC-1491). A write that would grow a database past
-    /// it is rolled back before COMMIT (`507 sql_database_size_limit`). An
-    /// unmeasured placeholder: slice 0 sizing and ops tune it.
+    /// it is rolled back before COMMIT (`507 sql_database_size_limit`).
+    /// **0 (the default) = no cap.** The limit is Sam's decision (card
+    /// `sql-storage-report-read`); set it by config once he answers.
     #[serde(default = "default_sql_max_database_bytes")]
     pub max_database_bytes: ByteUnit,
     /// Free disk that must remain after the worst-case growth of every write
     /// in flight (TC-1491); a write that would eat into it is rolled back
-    /// before COMMIT (`507 sql_disk_headroom`). An unmeasured placeholder
-    /// (about 2.5% of the 20 GB CVM disk).
+    /// before COMMIT (`507 sql_disk_headroom`). **0 (the default) = the check
+    /// is off** (no reservation, no free-space reads). The limit is Sam's
+    /// decision (card `sql-storage-report-read`).
     #[serde(default = "default_sql_min_free_bytes")]
     pub min_free_bytes: ByteUnit,
 }
 
 fn default_sql_max_database_bytes() -> ByteUnit {
-    ByteUnit::Gibibyte(1)
+    ByteUnit::Byte(0)
 }
 
 fn default_sql_min_free_bytes() -> ByteUnit {
-    ByteUnit::Mebibyte(512)
+    ByteUnit::Byte(0)
 }
 
 fn default_sql_memory_threshold() -> ByteUnit {

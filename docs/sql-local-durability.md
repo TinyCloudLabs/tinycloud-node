@@ -57,11 +57,13 @@ A kill -9 test cannot inject "after COMMIT, before its fsync completed"; `before
 
 | key | default | meaning |
 |---|---|---|
-| `synchronous` | `"full"` | `"full"` or `"normal"`; the rollback flag |
-| `max_database_bytes` | `"1 GiB"` | per-database size cap |
-| `min_free_bytes` | `"512 MiB"` | disk kept free after all in-flight reservations |
+| `synchronous` | `"full"` | `"full"` or `"normal"`; the rollback flag. This is the durability fix, not a limit. |
+| `max_database_bytes` | `0` (no cap) | per-database size cap, enforced by SQLite's `max_page_count` |
+| `min_free_bytes` | `0` (check off) | disk kept free after all in-flight reservations; `0` disables the gate, the reservation and the free-space reads |
 
-Both sizes are unmeasured placeholders (the production CVM disk is 20 GB, so 512 MiB is about 2.5%).
+**The two limits are off by default.** They are Sam's decision (card `sql-storage-report-read`) and are set by config once he answers; an unmeasured cap could refuse real users' databases. The mechanism is fully tested with explicit values. What stays on by default besides `synchronous`: the transaction per write request and the owner-budget limit below.
+
+**Owner budget is not switchable and can refuse a write today's code allows.** `max_page_count` is set from the owner's remaining quota (`limit - used`, the same `storage_check` read as before). Today a write that overshoots a non-zero remainder is allowed once and only the next one is refused with 402; now the overshooting write itself is refused with 402 before COMMIT. The comparison is the database's page growth against the remainder, the unit the quota already charges (logical database size); growth that frees pages elsewhere in the file is not counted, so it is never stricter than the charge.
 
 ## Errors
 

@@ -297,13 +297,17 @@ pub fn spawn_actor_with_policy(
                             if size > memory_threshold {
                                 // The copy needs the whole database on disk,
                                 // next to what in-flight writes still need.
-                                let room = policy.budget.reserve(
-                                    &key,
-                                    size,
-                                    policy.free_space.as_ref(),
-                                    existing_ancestor(&file_path),
-                                    policy.min_free_bytes,
-                                );
+                                let room = if policy.min_free_bytes == 0 {
+                                    Ok(())
+                                } else {
+                                    policy.budget.reserve(
+                                        &key,
+                                        size,
+                                        policy.free_space.as_ref(),
+                                        existing_ancestor(&file_path),
+                                        policy.min_free_bytes,
+                                    )
+                                };
                                 if room.is_err() {
                                     tracing::warn!(
                                         "Not enough free disk to promote a database; keeping it in memory"
@@ -619,7 +623,10 @@ fn set_max_pages(conn: &rusqlite::Connection, pages: u64) -> Result<(), SqlError
 /// can still run writes that do not grow it.
 fn page_limit(ctx: &WriteContext<'_>, baseline: &Baseline) -> (u64, bool) {
     let page_size = baseline.page_size.max(1);
-    let cap = (ctx.policy.max_database_bytes / page_size).max(1);
+    let cap = match ctx.policy.max_database_bytes {
+        0 => UNLIMITED_PAGES,
+        bytes => (bytes / page_size).max(1),
+    };
     match ctx.remaining {
         Some(remaining) => {
             let budget = baseline.pages.saturating_add(remaining / page_size);
@@ -638,7 +645,12 @@ fn is_full_error(error: &SqlError) -> bool {
 /// SQLite has already undone the failed statement by the time it is read; the
 /// free-space reading can: a disk below its floor is the disk.
 fn classify_full(ctx: &WriteContext<'_>, budget_binding: bool) -> SqlError {
+    if ctx.policy.max_database_bytes == 0 && !budget_binding {
+        // No limit of ours can have fired, so the disk really is full.
+        return SqlError::DiskHeadroom;
+    }
     let disk_exhausted = ctx.file_backed
+        && ctx.policy.min_free_bytes > 0
         && ctx
             .policy
             .free_space
@@ -680,10 +692,13 @@ fn precommit_gate(
     {
         return Err(SqlError::StorageWouldGrow);
     }
-    if growth_pages > 0 && now.saturating_mul(baseline.page_size) > ctx.policy.max_database_bytes {
+    if growth_pages > 0
+        && ctx.policy.max_database_bytes > 0
+        && now.saturating_mul(baseline.page_size) > ctx.policy.max_database_bytes
+    {
         return Err(SqlError::DatabaseSizeLimit);
     }
-    if !ctx.file_backed {
+    if !ctx.file_backed || ctx.policy.min_free_bytes == 0 {
         return Ok(());
     }
     let wal_bound = unspilled_wal_bound(cache_used_bytes(conn), baseline.page_size);
@@ -768,7 +783,8 @@ fn handle_message_ctx(
     let base = baseline(conn)?;
     set_max_pages(conn, page_limit(ctx, &base).0)?;
     let tripped = Arc::new(AtomicBool::new(false));
-    if ctx.file_backed {
+    let disk_checked = ctx.file_backed && ctx.policy.min_free_bytes > 0;
+    if disk_checked {
         let (budget, free_space) = (ctx.policy.budget.clone(), ctx.policy.free_space.clone());
         let (key, dir) = (ctx.key.to_string(), ctx.dir.to_path_buf());
         let (min_free, tripped) = (ctx.policy.min_free_bytes, tripped.clone());
@@ -788,7 +804,7 @@ fn handle_message_ctx(
         );
     }
     let outcome = run_transaction(conn, request, caveats, ability, ctx, &base);
-    if ctx.file_backed {
+    if disk_checked {
         conn.progress_handler(0, None::<fn() -> bool>);
     }
     let outcome = outcome.map_err(|error| {
@@ -809,7 +825,7 @@ fn handle_message_ctx(
         // growth.
         ctx.policy
             .budget
-            .hold(ctx.key, if ctx.file_backed { growth_bytes } else { 0 });
+            .hold(ctx.key, if disk_checked { growth_bytes } else { 0 });
         result
     })
 }

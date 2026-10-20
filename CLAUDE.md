@@ -176,8 +176,8 @@ All use the `TINYCLOUD_` prefix:
 | `TINYCLOUD_KEYS_SECRET` | Key derivation secret | Base64URL string |
 | `TINYCLOUD_SPACES_ALLOWLIST` | Allowlist endpoint | `http://localhost:10000` |
 | `TINYCLOUD_STORAGE__SQL__SYNCHRONOUS` | SQL `PRAGMA synchronous` for file-backed databases: `full` (default) or `normal` (rollback flag) | `full` |
-| `TINYCLOUD_STORAGE__SQL__MAX_DATABASE_BYTES` | Per-database SQL size cap (default `1 GiB`, unmeasured placeholder) | `1 GiB` |
-| `TINYCLOUD_STORAGE__SQL__MIN_FREE_BYTES` | Disk kept free after in-flight SQL writes (default `512 MiB`, unmeasured placeholder) | `512 MiB` |
+| `TINYCLOUD_STORAGE__SQL__MAX_DATABASE_BYTES` | Per-database SQL size cap; `0` (default) = off. Sam's decision (card `sql-storage-report-read`) | `1 GiB` |
+| `TINYCLOUD_STORAGE__SQL__MIN_FREE_BYTES` | Disk kept free after in-flight SQL writes; `0` (default) = check off. Sam's decision (card `sql-storage-report-read`) | `512 MiB` |
 | `ROCKET_MAX_BLOCKING` | Rocket's blocking-thread-pool cap (default 512). `ROCKET_`-prefixed, not `TINYCLOUD_`, because Rocket builds its tokio runtime from its own Figment before TinyCloud's config is loaded — `TINYCLOUD_MAX_BLOCKING` is silently ignored for this setting. | `1024` |
 
 ### Database Support

@@ -187,18 +187,23 @@ impl std::fmt::Debug for CommitSeams {
     }
 }
 
-pub const DEFAULT_MAX_DATABASE_BYTES: u64 = 1024 * 1024 * 1024;
-pub const DEFAULT_MIN_FREE_BYTES: u64 = 512 * 1024 * 1024;
+/// 0 turns the per-database cap off. Off by default: the limit is a product
+/// decision (card `sql-storage-report-read`), set by config once decided.
+pub const DEFAULT_MAX_DATABASE_BYTES: u64 = 0;
+/// 0 turns the disk headroom check off (no reservation, no free-space reads).
+/// Off by default for the same reason.
+pub const DEFAULT_MIN_FREE_BYTES: u64 = 0;
 
 /// Everything the actors need to make a commit durable and to refuse a write
 /// that would not fit.
 #[derive(Clone)]
 pub struct DurabilityPolicy {
     pub synchronous: Synchronous,
-    /// Per-database size cap; also enforced by SQLite itself through
-    /// `max_page_count`.
+    /// Per-database size cap, enforced by SQLite itself through
+    /// `max_page_count`. 0 = no cap.
     pub max_database_bytes: u64,
     /// Free bytes that must remain after every in-flight write's worst case.
+    /// 0 = the disk headroom check is off.
     pub min_free_bytes: u64,
     pub budget: Arc<DiskBudget>,
     pub free_space: Arc<dyn FreeSpace>,

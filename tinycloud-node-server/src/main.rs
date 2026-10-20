@@ -262,12 +262,16 @@ mod tests {
 
         let sql = extract();
         assert_eq!(sql.synchronous, Synchronous::Full, "full by default");
-        assert_eq!(sql.max_database_bytes.as_u64(), 1 << 30);
-        assert_eq!(sql.min_free_bytes.as_u64(), 512 << 20);
+        assert_eq!(sql.max_database_bytes.as_u64(), 0, "no cap by default");
+        assert_eq!(
+            sql.min_free_bytes.as_u64(),
+            0,
+            "headroom check off by default"
+        );
         let policy = sql.durability();
         assert_eq!(policy.synchronous, Synchronous::Full);
-        assert_eq!(policy.max_database_bytes, 1 << 30);
-        assert_eq!(policy.min_free_bytes, 512 << 20);
+        assert_eq!(policy.max_database_bytes, 0);
+        assert_eq!(policy.min_free_bytes, 0);
 
         let _canonical = EnvVarGuard::set("TINYCLOUD_STORAGE__SQL__SYNCHRONOUS", "normal");
         let _max = EnvVarGuard::set("TINYCLOUD_STORAGE__SQL__MAX_DATABASE_BYTES", "2 GiB");
