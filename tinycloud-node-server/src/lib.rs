@@ -689,6 +689,11 @@ pub async fn app_with_control(
     // `database_artifact` table now exists (seeding before migrations would
     // fail boot on a fresh datadir). Runs before Rocket serves any request.
     sql_sizes.seed_from(&seed_conn).await?;
+    // TC-1578: the S3 block store sizes spaces from objects with bytes, so a
+    // hosted space with no blocks has no entry after a restart. Give every
+    // space in the table one (existing byte counts are kept).
+    let seeded_spaces = tinycloud.seed_store_sizes().await?;
+    ::tracing::info!(spaces = seeded_spaces, "seeded block-store space sizes");
     #[cfg(feature = "tc-bench-v1")]
     let bench_state = BenchState::new(
         &tinycloud_config.tc_bench,

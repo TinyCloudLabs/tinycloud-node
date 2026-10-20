@@ -1465,8 +1465,11 @@ async fn storage_check(
     let Some(limit) = effective_storage_limit(space, config, quota_cache).await else {
         return Ok(None);
     };
+    // A hosted space the block store has no entry for (after a restart, an
+    // empty S3 space) is initialised from the `space` table and then checked
+    // against `limit` like any other; only an unhosted space is 404 (TC-1578).
     let used = tinycloud
-        .store_size(space)
+        .store_size_or_init(space)
         .await
         .map_err(|e| (Status::InternalServerError, e.to_string()))?
         .ok_or_else(|| (Status::NotFound, "space not found".to_string()))?;

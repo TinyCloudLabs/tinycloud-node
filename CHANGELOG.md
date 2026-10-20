@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Changes
+
+- Fixed hosted spaces with no blocks and no SQL/DuckDB bytes becoming unwritable after a node restart when a storage limit is configured (TC-1578). The write path answered 404 "space not found" because the S3 block store only sizes spaces that have objects at boot. A write to a hosted space the block store has no size for now initialises its entry from the `space` table and is then checked against the limit as usual; only a space absent from the table is 404. Boot also gives every space in the table a size entry. SQL/DuckDB bytes are still counted through the SQL size mirror, not the block store.
+- Fixed re-hosting a space that has data resetting its metered block usage to zero: `SpaceSizes::init_size` no longer overwrites an existing entry.
+
 ## [1.21.4] - 2026-10-19
 
 ### Release notes
