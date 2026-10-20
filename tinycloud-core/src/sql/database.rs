@@ -605,10 +605,12 @@ fn row_to_sql_value(row: &rusqlite::Row, idx: usize) -> Result<SqlValue, SqlErro
 }
 
 fn is_query_statement(parsed: &parser::ParsedQuery) -> bool {
-    matches!(
-        parsed.statements.as_slice(),
-        [sqlparser::ast::Statement::Query(_)]
-    )
+    // A `WITH … INSERT/UPDATE` is a Query to the parser but runs as a write.
+    parsed.is_read_only
+        && matches!(
+            parsed.statements.as_slice(),
+            [sqlparser::ast::Statement::Query(_)]
+        )
 }
 
 fn is_insert_statement(parsed: &parser::ParsedQuery) -> bool {

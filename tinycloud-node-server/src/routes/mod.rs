@@ -7326,6 +7326,188 @@ mod tests {
         Ok(())
     }
 
+    /// TC-1585 over `/invoke`: a `WITH … INSERT/UPDATE` is a write. On a full
+    /// space the quota gate refuses a growing one (it used to be classed
+    /// read-only and skip the gate), a non-growing one still runs, and a
+    /// read-tier grant is refused.
+    #[tokio::test]
+    async fn tc1585_cte_wrapped_writes_are_quota_gated_and_refused_to_read() -> Result<()> {
+        use rocket::data::ByteUnit;
+        use rocket::http::{ContentType, Header, Status};
+        use rocket::local::asynchronous::Client;
+
+        let setup = metered_sql_http_setup("tc1585-cte").await?;
+        let mut nonce = 0u32;
+        let mut header = |ability: &str| -> Result<String> {
+            nonce += 1;
+            sql_invocation_header(&setup, ability, &format!("urn:uuid:tc1585-{nonce}"))
+        };
+        let growing_insert_auth = header("tinycloud.sql/write")?;
+        let growing_update_auth = header("tinycloud.sql/write")?;
+        let cte_update = header("tinycloud.sql/write")?;
+        let read_cte_insert = header("tinycloud.sql/read")?;
+        let count = header("tinycloud.sql/read")?;
+
+        let client = Client::tracked(metered_sql_rocket(setup, ByteUnit::Byte(1))).await?;
+        let send = |auth: &String, request: &SqlRequest| {
+            let client = &client;
+            let auth = auth.clone();
+            let body = serde_json::to_string(request);
+            async move {
+                let response = client
+                    .post("/invoke")
+                    .header(Header::new("Authorization", auth))
+                    .header(ContentType::JSON)
+                    .body(body.expect("request serializes"))
+                    .dispatch()
+                    .await;
+                let status = response.status();
+                (status, response.into_string().await.unwrap_or_default())
+            }
+        };
+        let execute = |sql: &str, params: Vec<SqlValue>| SqlRequest::Execute {
+            sql: sql.to_string(),
+            params,
+            schema: None,
+        };
+
+        // Growing CTE-wrapped writes on a full space are refused with 402.
+        let big = || vec![SqlValue::Text("g".repeat(64 * 1024))];
+        for (auth, sql) in [
+            (
+                &growing_insert_auth,
+                "WITH c AS (SELECT ? AS body) INSERT INTO labels (label, val) SELECT body, 1 FROM c",
+            ),
+            (
+                &growing_update_auth,
+                "WITH c AS (SELECT ? AS body) UPDATE labels SET label = (SELECT body FROM c)",
+            ),
+        ] {
+            let (status, body) = send(auth, &execute(sql, big())).await;
+            assert_eq!(status, Status::new(402), "{sql}: {body}");
+            assert!(body.contains("storage_quota_exceeded"), "{body}");
+        }
+
+        // A non-growing CTE-wrapped write still runs on a full space.
+        let (status, body) = send(
+            &cte_update,
+            &execute(
+                "WITH c AS (SELECT 5 AS bump) UPDATE labels SET val = val + (SELECT bump FROM c)",
+                vec![],
+            ),
+        )
+        .await;
+        assert_eq!(status, Status::Ok, "{body}");
+
+        // A read-tier grant cannot run one.
+        let (status, body) = send(
+            &read_cte_insert,
+            &execute(
+                "WITH c AS (SELECT 'r' AS body) INSERT INTO labels (label, val) SELECT body, 1 FROM c",
+                vec![],
+            ),
+        )
+        .await;
+        assert_eq!(status, Status::Forbidden, "{body}");
+
+        // The refused statements changed nothing: the seeded row (val 111)
+        // was bumped once by the CTE-wrapped update that ran.
+        let (status, body) = send(
+            &count,
+            &SqlRequest::Query {
+                sql: "SELECT count(*), sum(val) FROM labels".to_string(),
+                params: vec![],
+                max_rows: None,
+                max_bytes: None,
+            },
+        )
+        .await;
+        assert_eq!(status, Status::Ok, "{body}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body)?["rows"],
+            serde_json::json!([[1, 116]]),
+            "{body}"
+        );
+        Ok(())
+    }
+
+    /// TC-1585: a CTE-wrapped write reports the table it changes, so the route
+    /// publishes the same write event as for a plain write (the events are
+    /// built from the service's `write_targets`; before the fix these writes
+    /// reported none and published nothing).
+    #[tokio::test]
+    async fn tc1585_cte_wrapped_writes_report_targets_that_become_write_events() -> Result<()> {
+        let service = fresh_sql_service().await;
+        let space = test_space_id("tc1585-hooks");
+        let hooks = HookRuntime::new(HooksConfig::default(), [5u8; 32]);
+        let mut events = hooks.bus().subscribe();
+        let run = |sql: &str, schema: Option<&str>| {
+            let service = service.clone();
+            let space = space.clone();
+            let request = SqlRequest::Execute {
+                sql: sql.to_string(),
+                params: vec![],
+                schema: schema.map(|s| vec![s.to_string()]),
+            };
+            async move {
+                service
+                    .execute(
+                        &space,
+                        "main",
+                        request,
+                        None,
+                        ["tinycloud.sql/write", "tinycloud.sql/schema"],
+                    )
+                    .await
+            }
+        };
+
+        run(
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)",
+            None,
+        )
+        .await?;
+
+        let mut published = Vec::new();
+        for (sql, schema, what) in [
+            (
+                "INSERT INTO notes (body) VALUES ('plain')",
+                None,
+                "plain insert",
+            ),
+            (
+                "WITH c AS (SELECT 'cte' AS body) INSERT INTO notes (body) SELECT body FROM c",
+                None,
+                "cte insert",
+            ),
+            (
+                "WITH c AS (SELECT 'cte2' AS body) UPDATE notes SET body = (SELECT body FROM c)",
+                None,
+                "cte update",
+            ),
+        ] {
+            let result = run(sql, schema).await?;
+            let batch = database_write_events(
+                &space.to_string(),
+                "sql",
+                Some("main.db"),
+                "did:key:test",
+                what,
+                "2026-01-01T00:00:00Z",
+                &result.write_targets,
+            );
+            assert_eq!(batch.len(), 1, "{what}: one event for the one table");
+            publish_database_hook_events(&hooks, &batch);
+            let event = timeout(Duration::from_secs(1), events.recv()).await??;
+            assert_eq!(event.table_name.as_deref(), Some("notes"), "{what}");
+            assert_eq!(event.ability, "tinycloud.sql/write", "{what}");
+            assert_eq!(event.database_path.as_deref(), Some("main.db"), "{what}");
+            published.push(what);
+        }
+        assert_eq!(published.len(), 3);
+        Ok(())
+    }
+
     /// TC-626: billing's account totals reach both the usage read and the
     /// 402 body, and the quota fetch carries the node's service secret.
     #[tokio::test]

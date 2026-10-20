@@ -1,3 +1,5 @@
+use std::ops::ControlFlow;
+
 use sqlparser::ast::*;
 use sqlparser::dialect::SQLiteDialect;
 use sqlparser::parser::Parser;
@@ -226,10 +228,22 @@ fn analyze_statements(sql: &str) -> Result<Analysis, SqlError> {
 
     for stmt in &statements {
         match stmt {
-            Statement::Query(_) => {
+            Statement::Query(query) => {
                 has_non_ddl = true;
                 extract_tables_from_statement(stmt, &mut tables);
                 extract_columns_from_statement(stmt, &mut columns);
+                // TC-1585: `WITH … INSERT/UPDATE` parses as a Query whose body
+                // is a write. A write anywhere in the tree makes the statement
+                // a write: it is quota-gated, emits write hooks and is made
+                // durable like any other write, and a read tier cannot run it.
+                for write in writes_in_query(query) {
+                    is_read_only = false;
+                    extract_tables_from_statement(&write, &mut tables);
+                    extract_columns_from_statement(&write, &mut columns);
+                    if let Some(targets) = extract_write_targets_from_statement(&write) {
+                        write_targets.push(targets);
+                    }
+                }
             }
             Statement::Insert { .. } => {
                 has_non_ddl = true;
@@ -303,6 +317,22 @@ fn ddl_kind_of(stmt: &Statement) -> DdlKind {
         Statement::Drop { .. } => DdlKind::Drop,
         _ => DdlKind::CreateTable,
     }
+}
+
+/// The INSERT, UPDATE and DELETE statements anywhere inside a query tree
+/// (its CTE bodies, sub-queries and set operations).
+fn writes_in_query(query: &Query) -> Vec<Statement> {
+    let mut writes = Vec::new();
+    let _ = visit_statements(query, |statement| {
+        if matches!(
+            statement,
+            Statement::Insert { .. } | Statement::Update { .. } | Statement::Delete { .. }
+        ) {
+            writes.push(statement.clone());
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    writes
 }
 
 pub fn is_pragma_sql(sql: &str) -> bool {
@@ -842,6 +872,115 @@ mod tests {
                 Some(kind),
                 "{sql}"
             );
+        }
+    }
+
+    /// One CTE-wrapped write per kind the parser can represent, with the
+    /// table it touches.
+    const CTE_WRITES: [(&str, &str); 3] = [
+        (
+            "WITH c AS (SELECT 1 AS id) INSERT INTO notes (id) SELECT id FROM c",
+            "notes",
+        ),
+        (
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 3) INSERT INTO notes (id) SELECT i FROM n",
+            "notes",
+        ),
+        (
+            "WITH c AS (SELECT 'x' AS body) UPDATE notes SET body = (SELECT body FROM c)",
+            "notes",
+        ),
+    ];
+
+    #[test]
+    fn cte_wrapped_writes_are_writes_with_their_targets() {
+        for (sql, table) in CTE_WRITES {
+            let class = classify_sql(sql).unwrap();
+            assert!(!class.is_read_only && !class.is_ddl, "{sql}");
+
+            for abilities in [
+                &[WRITE][..],
+                &[WRITE, SCHEMA][..],
+                &[ADMIN][..],
+                &[STAR][..],
+            ] {
+                let parsed = validate(sql, abilities).unwrap();
+                assert!(!parsed.is_read_only && !parsed.is_ddl, "{sql}");
+                assert_eq!(
+                    parsed.write_targets,
+                    vec![TouchedTables::supported(vec![table.to_string()])],
+                    "{sql} must report its target for write hooks and durability"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cte_wrapped_writes_are_refused_to_read_and_schema_only_holders() {
+        for (sql, _) in CTE_WRITES {
+            for abilities in [
+                &[READ][..],
+                &["tinycloud.sql/select"][..],
+                &[READ, SCHEMA][..],
+            ] {
+                assert!(
+                    matches!(validate(sql, abilities), Err(SqlError::ReadOnlyViolation)),
+                    "{abilities:?} {sql}"
+                );
+            }
+            let err = validate(sql, &[SCHEMA]).unwrap_err();
+            assert!(matches!(err, SqlError::PermissionDenied(m) if m.contains("only permits DDL")));
+        }
+    }
+
+    #[test]
+    fn cte_wrapped_writes_obey_the_caveats_of_a_write() {
+        for (sql, _) in CTE_WRITES {
+            let read_only = Some(SqlCaveats {
+                read_only: Some(true),
+                ..SqlCaveats::default()
+            });
+            assert!(matches!(
+                validate_sql(sql, &read_only, &held(&[WRITE])),
+                Err(SqlError::ReadOnlyViolation)
+            ));
+            let other_table = Some(SqlCaveats {
+                tables: Some(vec!["other".to_string()]),
+                ..SqlCaveats::default()
+            });
+            assert!(matches!(
+                validate_sql(sql, &other_table, &held(&[WRITE])),
+                Err(SqlError::PermissionDenied(_))
+            ));
+            let this_table = Some(SqlCaveats {
+                tables: Some(vec!["notes".to_string()]),
+                ..SqlCaveats::default()
+            });
+            validate_sql(sql, &this_table, &held(&[WRITE])).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_cte_without_a_write_stays_read_only() {
+        for sql in [
+            "WITH c AS (SELECT id FROM notes) SELECT id FROM c",
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 3) SELECT i FROM n",
+            "SELECT id FROM notes WHERE id IN (WITH c AS (SELECT 1) SELECT * FROM c)",
+        ] {
+            let parsed = validate(sql, &[READ]).unwrap();
+            assert!(parsed.is_read_only && parsed.write_targets.is_empty(), "{sql}");
+            assert!(classify_sql(sql).unwrap().is_read_only, "{sql}");
+        }
+    }
+
+    #[test]
+    fn a_cte_wrapped_delete_is_not_accepted_for_any_ability() {
+        // sqlparser 0.44 cannot represent `WITH … DELETE`, so it is rejected
+        // outright rather than classified as a read.
+        let sql = "WITH c AS (SELECT 1 AS id) DELETE FROM notes WHERE id IN (SELECT id FROM c)";
+        assert!(classify_sql(sql).is_err());
+        for abilities in [&[READ][..], &[WRITE][..], &[ADMIN][..], &[STAR][..]] {
+            assert!(validate(sql, abilities).is_err(), "{abilities:?}");
         }
     }
 

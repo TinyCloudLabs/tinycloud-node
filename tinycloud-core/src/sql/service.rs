@@ -1564,6 +1564,85 @@ mod tests {
         }
     }
 
+    /// TC-1585: a `WITH … INSERT/UPDATE` is a write. It is made durable like
+    /// any other write (a fresh node hydrating the artifact sees it) and
+    /// reports its target tables for write hooks.
+    #[tokio::test]
+    async fn cte_wrapped_writes_are_durable_and_reported_as_writes() {
+        let repo = artifact_repository().await;
+        let cache_one = TempDir::new().unwrap();
+        let cache_two = TempDir::new().unwrap();
+        let space = test_space_id("sql-cte-write");
+        let service = SqlService::new(
+            cache_one.path().to_string_lossy().to_string(),
+            u64::MAX,
+            repo.clone(),
+        );
+        service
+            .execute(
+                &space,
+                "main",
+                ddl("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL)"),
+                None,
+                "tinycloud.sql/schema",
+            )
+            .await
+            .unwrap();
+
+        for (sql, kind) in [
+            (
+                "WITH c AS (SELECT 'inserted' AS name) INSERT INTO items (name) SELECT name FROM c",
+                "insert",
+            ),
+            (
+                "WITH c AS (SELECT 'updated' AS name) UPDATE items SET name = (SELECT name FROM c)",
+                "update",
+            ),
+        ] {
+            let result = service
+                .execute(&space, "main", ddl(sql), None, "tinycloud.sql/write")
+                .await
+                .unwrap_or_else(|e| panic!("{kind}: {e:?}"));
+            assert_eq!(
+                result.write_targets,
+                vec![crate::write_hooks::TouchedTables::supported(vec![
+                    "items".to_string()
+                ])],
+                "{kind} must report its target table for write hooks"
+            );
+            let SqlResponse::Execute(response) = result.response else {
+                panic!("{kind}: expected an execute response");
+            };
+            assert_eq!(response.changes, 1, "{kind}");
+        }
+        drop(service);
+
+        let recreated = SqlService::new(
+            cache_two.path().to_string_lossy().to_string(),
+            u64::MAX,
+            repo,
+        );
+        let result = recreated
+            .execute(
+                &space,
+                "main",
+                SqlRequest::Query {
+                    sql: "SELECT name FROM items".to_string(),
+                    params: Vec::new(),
+                    max_rows: None,
+                    max_bytes: None,
+                },
+                None,
+                "tinycloud.sql/read",
+            )
+            .await
+            .unwrap();
+        let SqlResponse::Query(rows) = result.response else {
+            panic!("expected rows");
+        };
+        assert_eq!(rows.rows, vec![vec![SqlValue::Text("updated".to_string())]]);
+    }
+
     /// TC-626: on a full space, writes that cannot grow the database run and
     /// a growing write is undone. Covers both an in-memory database and one
     /// promoted to a WAL-backed file (threshold 0), which is what large
