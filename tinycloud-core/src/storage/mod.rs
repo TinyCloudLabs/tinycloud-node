@@ -204,6 +204,11 @@ pub trait ImmutableDeleteStore: Send + Sync {
 pub trait StoreSize: Send + Sync {
     type Error: StdError;
     async fn total_size(&self, space: &SpaceId) -> Result<Option<u64>, Self::Error>;
+    /// Record `space` with zero block bytes if the store tracks no size for
+    /// it, and return the block bytes now recorded. An existing size is never
+    /// reset or lowered, so this is safe to call for a space that already has
+    /// data and from concurrent first writes.
+    async fn init_size(&self, space: &SpaceId) -> Result<u64, Self::Error>;
 }
 
 #[async_trait]
@@ -299,6 +304,9 @@ where
     type Error = S::Error;
     async fn total_size(&self, space: &SpaceId) -> Result<Option<u64>, Self::Error> {
         (**self).total_size(space).await
+    }
+    async fn init_size(&self, space: &SpaceId) -> Result<u64, Self::Error> {
+        (**self).init_size(space).await
     }
 }
 

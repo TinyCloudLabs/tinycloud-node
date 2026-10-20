@@ -14,6 +14,7 @@ use serde_with::{
 use std::{fs, path::PathBuf, time::Duration};
 use tinycloud_core::db_pool::{StatementTimeoutMode, StatementTimeouts};
 use tinycloud_core::keys::StaticSecret;
+use tinycloud_core::sql::DdlPolicy;
 
 /// The OpenCredentials service that consumes a node-authorized generic
 /// credential-invitation receipt in production. Keep this exact origin pinned:
@@ -1162,6 +1163,13 @@ pub struct SqlStorageConfig {
     /// callers that gave up on it, so the database still warms.
     #[serde(default = "default_sql_hydration_max_ms")]
     pub hydration_max_ms: u64,
+    /// Whether a schema-changing statement (CREATE, ALTER, DROP of tables,
+    /// views and indexes) needs `tinycloud.sql/schema` (TC-1581). `sql/write`
+    /// covers data statements only. `"enforce"` (the default) refuses the
+    /// statement; `"log"` runs it and records it without any request content;
+    /// `"off"` keeps the earlier behaviour, where `write` also sufficed.
+    #[serde(default)]
+    pub ddl_requires_schema: DdlPolicy,
 }
 
 fn default_sql_memory_threshold() -> ByteUnit {
@@ -1204,6 +1212,7 @@ impl Default for SqlStorageConfig {
             hydration_wait_timeout_ms: default_sql_hydration_wait_timeout_ms(),
             artifact_transfer_timeout_ms: default_sql_artifact_transfer_timeout_ms(),
             hydration_max_ms: default_sql_hydration_max_ms(),
+            ddl_requires_schema: DdlPolicy::default(),
         }
     }
 }
@@ -1645,6 +1654,40 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    /// TC-1581: `[global.storage.sql] ddl_requires_schema` defaults to
+    /// `enforce` and accepts only `off`, `log` and `enforce`.
+    #[test]
+    fn tc1581_ddl_requires_schema_defaults_to_enforce_and_parses_its_values() {
+        assert_eq!(
+            SqlStorageConfig::default().ddl_requires_schema,
+            DdlPolicy::Enforce
+        );
+        assert_eq!(
+            serde_json::from_str::<SqlStorageConfig>("{}")
+                .unwrap()
+                .ddl_requires_schema,
+            DdlPolicy::Enforce
+        );
+        for (value, expected) in [
+            ("off", DdlPolicy::Off),
+            ("log", DdlPolicy::Log),
+            ("enforce", DdlPolicy::Enforce),
+        ] {
+            let config: SqlStorageConfig =
+                serde_json::from_str(&format!(r#"{{"ddl_requires_schema":"{value}"}}"#)).unwrap();
+            assert_eq!(config.ddl_requires_schema, expected, "{value}");
+        }
+        for invalid in ["warn", "true", "Enforce", ""] {
+            assert!(
+                serde_json::from_str::<SqlStorageConfig>(&format!(
+                    r#"{{"ddl_requires_schema":"{invalid}"}}"#
+                ))
+                .is_err(),
+                "{invalid:?} must be rejected"
+            );
+        }
+    }
 
     #[test]
     fn tc1132_startup_validates_retry_budget_bounds() {
