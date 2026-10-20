@@ -4087,7 +4087,7 @@ mod tests {
                 "main",
                 write("INSERT INTO notes VALUES (1, 'kept')"),
                 None,
-                "tinycloud.sql/write".into(),
+                "tinycloud.sql/admin".into(),
             )
             .await
             .unwrap();
@@ -4197,7 +4197,7 @@ mod tests {
                 params: vec![],
             },
             None,
-            "tinycloud.sql/write".into(),
+            "tinycloud.sql/admin".into(),
         )
         .await
         .unwrap();
