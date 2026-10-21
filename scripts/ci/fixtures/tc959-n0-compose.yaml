@@ -52,9 +52,7 @@ services:
       # after the 30s sqlx default. Keep this below the instance limit with
       # headroom for admin/psql access, and raise it only alongside the
       # instance's own max_connections.
-      # TC-950: 10, so two containers that overlap during a deploy (2 x 10)
-      # fit in the instance limit with room for admin access.
-      TINYCLOUD_DATABASE__MAX_CONNECTIONS: "10"
+      TINYCLOUD_DATABASE__MAX_CONNECTIONS: "15"
       # TC-1274: production boots with the epoch_head backfill off while the
       # database is CPU-bound. Writes stay correct without it. Re-enable later
       # by setting "true" (or removing this line); the pace keys are
