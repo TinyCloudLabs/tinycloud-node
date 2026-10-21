@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [1.21.7] - 2026-10-21
+
+### Release notes
+
+- **Database connection pool of 10.** The production compose sets `TINYCLOUD_DATABASE__MAX_CONNECTIONS` to 10 (was 15), so two containers that overlap during a deploy fit within the database instance's 25 connections. The compose hash changes. No database migrations. Details: TC-950.
+
 ### Changes
 
 - Production compose: the database pool is `TINYCLOUD_DATABASE__MAX_CONNECTIONS: "10"` (was 15), so two containers that overlap during a deploy fit within the instance's 25 connections. This changes the compose hash; the N0 template lock in `docker.yml` and `scripts/ci/fixtures/tc959-n0-compose.yaml` move with it. Details: TC-950.
