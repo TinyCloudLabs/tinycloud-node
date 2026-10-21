@@ -2559,9 +2559,11 @@ mod tests {
         let message = siwe_message(NONCE, "held-placeholder~");
         let low = sign_siwe(&message);
         let bytes = hex::decode(low.trim_start_matches("0x")).unwrap();
-        let s = k256::Scalar::from_repr(*k256::FieldBytes::from_slice(&bytes[32..64])).unwrap();
+        let mut s_bytes = [0u8; 32];
+        s_bytes.copy_from_slice(&bytes[32..64]);
+        let s = k256::Scalar::from_repr(s_bytes.into()).unwrap();
         let high_s = (-s).to_bytes();
-        assert_ne!(high_s.as_slice(), &bytes[32..64]);
+        assert_ne!(&high_s[..], &bytes[32..64]);
         let mut high = bytes[..32].to_vec();
         high.extend_from_slice(&high_s);
         high.push(if bytes[64] == 27 { 28 } else { 27 });
