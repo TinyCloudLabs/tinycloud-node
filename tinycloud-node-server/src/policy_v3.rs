@@ -9260,6 +9260,50 @@ mod tests {
             admission.credential_space_owner_did.as_deref(),
             Some(account_owner_did.as_str())
         );
+        let mut non_array_capabilities = presentation.clone();
+        non_array_capabilities["requestedCapabilities"] = json!("not-an-array");
+        let refusal = validate_credential_admission_v3(
+            &requirement,
+            &credential,
+            &non_array_capabilities,
+            &policy,
+            &ClaimPresentationContext {
+                challenge_id,
+                nonce,
+                policy_cid: presentation["policyCid"].as_str().unwrap(),
+                owner_did: policy["ownerDid"].as_str().unwrap(),
+                recipient_did: holder_did.as_str(),
+                authenticated_account_owner: Some(&account_owner_did),
+                now,
+            },
+            &runtime,
+            presentation["requestedCapabilities"].as_array().unwrap(),
+        );
+        assert_eq!(
+            refusal.err().map(|(_, error)| error).as_deref(),
+            Some("presentation-capabilities-mismatch")
+        );
+        let refusal = validate_credential_admission_v3(
+            &requirement,
+            &credential,
+            &presentation,
+            &policy,
+            &ClaimPresentationContext {
+                challenge_id,
+                nonce,
+                policy_cid: presentation["policyCid"].as_str().unwrap(),
+                owner_did: policy["ownerDid"].as_str().unwrap(),
+                recipient_did: holder_did.as_str(),
+                authenticated_account_owner: Some(&account_owner_did),
+                now,
+            },
+            &runtime,
+            &[],
+        );
+        assert_eq!(
+            refusal.err().map(|(_, error)| error).as_deref(),
+            Some("credential-presentation-binding-invalid")
+        );
 
         let binding_material =
             json!({"enforcerDid": enforcer_did, "nodeAudience": runtime.node_did});
