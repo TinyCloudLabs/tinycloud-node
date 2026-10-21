@@ -957,7 +957,10 @@ impl Harness {
     /// POST a shape-valid held presentation (`{sdJwt, siwe}`) to the mint
     /// route after a fresh challenge. Used where the verifier must not run
     /// (the held flag is off), so the body needs only the held shape.
-    pub async fn mint_held_presentation(&self, policy: &Registered) -> anyhow::Result<(Status, String)> {
+    pub async fn mint_held_presentation(
+        &self,
+        policy: &Registered,
+    ) -> anyhow::Result<(Status, String)> {
         let (status, body) = self.challenge(policy).await;
         if status != Status::Ok {
             return Ok((status, body));
