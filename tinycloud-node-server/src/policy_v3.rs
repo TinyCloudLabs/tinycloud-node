@@ -6775,6 +6775,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn v3_issuer_signature_refuses_non_canonical_s_at_group_order() {
+        // Identity point as key and R, with S = L (the group order), little-endian.
+        // S >= L is non-canonical; verify_strict must refuse it.
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        let group_order_le: [u8; 32] = [
+            0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9,
+            0xde, 0x14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10,
+        ];
+        let mut forged = [0u8; 64];
+        forged[..32].copy_from_slice(&identity);
+        forged[32..].copy_from_slice(&group_order_le);
+        assert_eq!(
+            super::verify_issuer_signature(&identity, b"held", &forged)
+                .unwrap_err()
+                .1,
+            "credential-signature-invalid"
+        );
+    }
+
     #[tokio::test]
     async fn held_credentials_are_off_unless_enabled_with_a_valid_audience() {
         use crate::config::HeldCredentialsConfig;
