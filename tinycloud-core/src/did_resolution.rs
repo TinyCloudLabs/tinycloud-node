@@ -123,14 +123,32 @@ fn namespace_allowed(did: &DID) -> bool {
     }
 }
 
+/// Longest `did:jwk` identifier that can carry a canonical Ed25519 JWK:
+/// `{"crv":"Ed25519","kty":"OKP","x":"<43 chars>"}` is 79 bytes, which is
+/// 106 unpadded base64url characters. Longer identifiers are refused before decoding.
+const ED25519_DID_JWK_ID_LEN_MAX: usize = 106;
+
+#[cfg(test)]
+thread_local! {
+    static JWK_DECODE_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Decodes a `did:jwk` identifier as the SSI resolver does (unpadded base64url, then JWK JSON).
 /// Admits only an OKP `Ed25519` key, the same key type as `did:key`.
 fn jwk_is_ed25519(id: &str) -> bool {
+    if id.len() > ED25519_DID_JWK_ID_LEN_MAX {
+        return false;
+    }
+    #[cfg(test)]
+    JWK_DECODE_ATTEMPTS.with(|c| c.set(c.get() + 1));
     let Ok(bytes) = URL_SAFE_NO_PAD.decode(id) else {
         return false;
     };
     match serde_json::from_slice::<JWK>(&bytes) {
-        Ok(jwk) => matches!(&jwk.params, Params::OKP(okp) if okp.curve == "Ed25519"),
+        Ok(jwk) => matches!(
+            &jwk.params,
+            Params::OKP(okp) if okp.curve == "Ed25519" && okp.public_key.0.len() == 32
+        ),
         Err(_) => false,
     }
 }
@@ -352,6 +370,48 @@ mod tests {
         assert!(!admitted(&format!("did:key:z6Mk{}", "1".repeat(44))));
         // Oversized: refused by length before any base58 decode.
         assert!(!admitted(&format!("did:key:z6Mk{}", "1".repeat(65_532))));
+    }
+
+    /// Canonical `did:jwk` for an OKP Ed25519 key whose `x` is `key_len` bytes.
+    fn jwk_did(key_len: usize) -> String {
+        let x = URL_SAFE_NO_PAD.encode(vec![7u8; key_len]);
+        let json = format!(r#"{{"crv":"Ed25519","kty":"OKP","x":"{x}"}}"#);
+        format!("did:jwk:{}", URL_SAFE_NO_PAD.encode(json))
+    }
+
+    #[test]
+    fn did_jwk_identifier_is_capped_at_the_canonical_ed25519_length() {
+        let canonical = jwk_did(32);
+        let id = canonical.strip_prefix("did:jwk:").unwrap();
+        assert_eq!(id.len(), ED25519_DID_JWK_ID_LEN_MAX);
+        assert!(admitted(&canonical));
+        // One extra space: still valid JSON for the same key, but 107 characters.
+        let json = format!(
+            r#"{{"crv":"Ed25519", "kty":"OKP","x":"{}"}}"#,
+            URL_SAFE_NO_PAD.encode([7u8; 32])
+        );
+        let padded = format!("did:jwk:{}", URL_SAFE_NO_PAD.encode(json));
+        assert_eq!(padded.len() - "did:jwk:".len(), 107);
+        assert!(!admitted(&padded));
+    }
+
+    #[test]
+    fn did_jwk_is_admitted_only_with_a_32_byte_ed25519_key() {
+        assert!(admitted(&jwk_did(32)));
+        // Shorter key: fits the cap, so only the 32-byte check refuses it.
+        assert!(!admitted(&jwk_did(31)));
+        assert!(!admitted(&jwk_did(0)));
+    }
+
+    #[test]
+    fn oversized_did_jwk_is_refused_without_decoding() {
+        let before = JWK_DECODE_ATTEMPTS.with(std::cell::Cell::get);
+        let oversized = format!("did:jwk:{}", "A".repeat(400_000));
+        assert!(!admitted(&oversized));
+        assert_eq!(JWK_DECODE_ATTEMPTS.with(std::cell::Cell::get), before);
+        // Positive control: a canonical key does reach the decoder.
+        assert!(admitted(&jwk_did(32)));
+        assert_eq!(JWK_DECODE_ATTEMPTS.with(std::cell::Cell::get), before + 1);
     }
 
     #[test]
