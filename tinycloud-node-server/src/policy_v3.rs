@@ -1804,6 +1804,7 @@ pub async fn register_policy(
     let request = request.into_inner();
     let policy_bytes = canonical_json(&request.policy)?;
     validate_policy_document(&request.policy, &policy_bytes, &request.policy_cid)?;
+    validate_registration_credential_issuer(&request.policy, &runtime.credential_issuers)?;
     let projections = registration_projections(&request.policy)?;
     if request.content_source_digest_hex != projections.content_source_digest_hex
         || request.native_projection_hash_hex != projections.native_projection_hash_hex
@@ -4288,6 +4289,45 @@ fn validate_policy_credential_requirement(
         return Err((Status::BadRequest, "credential-requirement-invalid".into()));
     }
     Ok(object)
+}
+
+/// Registration-time issuer check. A requirement whose issuer, pinned `issuerKid`,
+/// `credentialType` or `profile` is not admitted by the configured issuer set is
+/// refused. Inert when no issuer set is configured. Only registration is checked;
+/// policies already stored keep their existing behaviour.
+fn validate_registration_credential_issuer(
+    policy: &Value,
+    issuers: &IssuerSet,
+) -> Result<(), (Status, String)> {
+    if issuers.is_empty() {
+        return Ok(());
+    }
+    let Some(requirement) = policy.get("credentialRequirement") else {
+        return Ok(());
+    };
+    let projection = validate_policy_credential_requirement(requirement)?;
+    let id_of = |field: &str| {
+        projection
+            .get(field)
+            .and_then(Value::as_object)
+            .and_then(|identifier| identifier.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    };
+    let issuer_did = projection
+        .get("issuerDid")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if issuers.permits_requirement(
+        issuer_did,
+        projection.get("issuerKid").and_then(Value::as_str),
+        id_of("credentialType"),
+        id_of("profile"),
+    ) {
+        Ok(())
+    } else {
+        Err((Status::Forbidden, "credential-issuer-untrusted".into()))
+    }
 }
 
 fn versioned_identifier(value: Option<&Value>) -> bool {
@@ -7263,6 +7303,80 @@ mod tests {
 
     fn forbidden(code: &str) -> Option<(Status, String)> {
         Some((Status::Forbidden, code.into()))
+    }
+
+    fn registration_policy(
+        issuer_did: &str,
+        issuer_kid: Option<&str>,
+        vct: &str,
+        profile: &str,
+    ) -> Value {
+        let mut fixture = SetFixture::new(issuer_did, issuer_kid, profile);
+        fixture.projection_value["credentialType"]["id"] = json!(vct);
+        json!({ "credentialRequirement": fixture.projection_value })
+    }
+
+    #[test]
+    fn registration_accepts_only_a_configured_issuer_kid_vct_and_profile() {
+        let key = keypair();
+        let kid = format!("{ORG_A}#issuing-1");
+        let set = IssuerSet::load(&[issuer_config(ORG_A, "issuing-1", &key)]).unwrap();
+        let vct = "opencredentials.email/v1";
+        let check = |policy: &Value| validate_registration_credential_issuer(policy, &set).err();
+        assert_eq!(
+            check(&registration_policy(ORG_A, Some(&kid), vct, DOMAIN_PROFILE)),
+            None
+        );
+        assert_eq!(
+            check(&registration_policy(ORG_A, None, vct, DOMAIN_PROFILE)),
+            None
+        );
+        assert_eq!(
+            check(&registration_policy(ORG_B, None, vct, DOMAIN_PROFILE)),
+            forbidden("credential-issuer-untrusted")
+        );
+        assert_eq!(
+            check(&registration_policy(
+                ORG_A,
+                Some(&format!("{ORG_A}#other")),
+                vct,
+                DOMAIN_PROFILE
+            )),
+            forbidden("credential-issuer-untrusted")
+        );
+        assert_eq!(
+            check(&registration_policy(
+                ORG_A,
+                None,
+                vct,
+                "tinycloud.email-proof/v1"
+            )),
+            forbidden("credential-issuer-untrusted")
+        );
+        assert_eq!(
+            check(&registration_policy(
+                ORG_A,
+                None,
+                "opencredentials.org-membership/v1",
+                DOMAIN_PROFILE
+            )),
+            forbidden("credential-issuer-untrusted")
+        );
+    }
+
+    #[test]
+    fn registration_is_inert_without_a_configured_issuer_set() {
+        let policy = registration_policy(ORG_B, None, "opencredentials.email/v1", DOMAIN_PROFILE);
+        assert_eq!(
+            validate_registration_credential_issuer(&policy, &IssuerSet::default()).err(),
+            None
+        );
+        let key = keypair();
+        let set = IssuerSet::load(&[issuer_config(ORG_A, "issuing-1", &key)]).unwrap();
+        assert_eq!(
+            validate_registration_credential_issuer(&json!({}), &set).err(),
+            None
+        );
     }
 
     #[test]

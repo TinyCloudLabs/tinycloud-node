@@ -1767,11 +1767,48 @@ mod tests {
             alg: "EdDSA".into(),
             public_key: key.into(),
             vcts: vec!["opencredentials.email/v1".into()],
-            profiles: vec!["tinycloud.email-held/v1".into()],
+            profiles: vec!["tinycloud.email-domain-proof/v1".into()],
             not_before: "2026-10-01T00:00:00Z".into(),
             retired_at: None,
             not_after: None,
         }
+    }
+
+    #[test]
+    fn held_profile_rows_fail_startup_for_an_issuer_outside_the_row() {
+        let key = base64::encode_config(
+            ed25519_dalek::SigningKey::from_bytes(&[9; 32])
+                .verifying_key()
+                .to_bytes(),
+            URL_SAFE_NO_PAD,
+        );
+        let held = |did: &str, kid: &str| {
+            let mut entry = explicit_issuer("issuing-1", &key);
+            entry.issuer_did = did.into();
+            entry.kid = kid.into();
+            entry.profiles = vec!["tinycloud.email-held/v1".into()];
+            let mut config = enabled_config();
+            config.credential_issuers = vec![entry];
+            config
+        };
+        // The email row permits only did:web:issuer.credentials.org.
+        assert!(held(
+            "did:web:acme.credentials.org",
+            "did:web:acme.credentials.org#issuing-1"
+        )
+        .credential_issuer_set()
+        .is_err());
+        assert!(held(
+            "did:web:issuer.credentials.org",
+            "did:web:issuer.credentials.org#issuing-1"
+        )
+        .credential_issuer_set()
+        .unwrap()
+        .resolve_pinned_issuer(
+            "did:web:issuer.credentials.org",
+            "did:web:issuer.credentials.org#issuing-1"
+        )
+        .is_some());
     }
 
     #[test]
