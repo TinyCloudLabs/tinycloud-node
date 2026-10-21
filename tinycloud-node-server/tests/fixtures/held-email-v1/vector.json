@@ -1,0 +1,27 @@
+{
+  "account": "did:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+  "email": "alice@example.com",
+  "issuerSet": {
+    "format": "tinycloud.credentials-issuers/v1",
+    "issuers": [
+      {
+        "alg": "EdDSA",
+        "issuerDid": "did:web:issuer.credentials.org",
+        "kid": "did:web:issuer.credentials.org#controller",
+        "notAfter": null,
+        "notBefore": "2025-01-01T00:00:00Z",
+        "profiles": [
+          "tinycloud.email-held/v1"
+        ],
+        "publicKey": "6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw",
+        "retiredAt": null,
+        "vcts": [
+          "opencredentials.email/v1"
+        ]
+      }
+    ],
+    "version": 1
+  },
+  "now": "2026-01-01T01:00:00Z",
+  "sdJwt": "eyJhbGciOiJFZERTQSIsInR5cCI6InZjK3NkLWp3dCIsImtpZCI6ImRpZDp3ZWI6aXNzdWVyLmNyZWRlbnRpYWxzLm9yZyNjb250cm9sbGVyIn0.eyJfc2QiOlsiOUZSM1NySExrSW4tc01vOUIyQ3RIZWtIRTlWdFVjQkpkZDBOdlFDYUJpNCIsIklYb1BsMDRYeEc2YnRNOUE1YzZPYkxmdHBHVmt4UXFrdGxCMl96Vnl2RW8iXSwiX3NkX2FsZyI6InNoYS0yNTYiLCJleHAiOjE3Njk4MTc2MDAsImhvbGRlckJpbmRpbmciOnsiZGlkIjoiZGlkOnBraDplaXAxNTU6MToweGYzOUZkNmU1MWFhZDg4RjZGNGNlNmFCODgyNzI3OWNmZkZiOTIyNjYiLCJzaWduaW5nRG9tYWluIjoidGlueWNsb3VkLmNyZWRlbnRpYWxzL2FjY291bnQtYmluZGluZy92MSJ9LCJpYXQiOjE3NjcyMjU2MDAsImlzcyI6ImRpZDp3ZWI6aXNzdWVyLmNyZWRlbnRpYWxzLm9yZyIsImp0aSI6InVybjp1dWlkOjVmMWM5YTJlLTdiM2QtNGU4YS05YzYxLTJkNGI4ZTdmMGExMyIsIm5iZiI6MTc2NzIyNTYwMCwicHJvZmlsZSI6InRpbnljbG91ZC5lbWFpbC1oZWxkL3YxIiwicHJvZmlsZVZlcnNpb24iOjEsInN0YXR1cyI6eyJtZXRob2QiOiJub25lIn0sInN1YiI6ImRpZDpwa2g6ZWlwMTU1OjE6MHhmMzlGZDZlNTFhYWQ4OEY2RjRjZTZhQjg4MjcyNzljZmZGYjkyMjY2IiwidmN0Ijoib3BlbmNyZWRlbnRpYWxzLmVtYWlsL3YxIn0.N-SNVObviWKHuCgoAlp5rPw_B_URBh3NbRlEzQN5RbqjygjBBo4gwhbZ-Bw7aMR9aXZs2vpkAI27Ev-nO3UsBg~WyIwMHFGc0Jjd1hFckhwWkdoZXp2RlNBIiwiZW1haWwiLCJhbGljZUBleGFtcGxlLmNvbSJd~WyIwTDg2bnAxQ3NPVHZTT0pwVmQxdHhRIiwiZW1haWxEb21haW4iLCJleGFtcGxlLmNvbSJd~"
+}

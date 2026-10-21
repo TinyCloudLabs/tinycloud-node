@@ -20,6 +20,10 @@ path = "src/main.rs"
 anyhow = "1"
 # Canonical-point check for pinned issuer keys (issuer_set.rs).
 ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+k256 = { version = "0.13.4", features = ["ecdsa"] }
+sha3 = "0.10"
+# WHATWG URL parsing for the SIWE origin check (held_email.rs).
+url = "2"
 aes-gcm = "0.10"
 async-trait.workspace = true
 # No default HTTPS client: the SDK's default pulls in rustls with aws-lc-rs,
@@ -118,6 +122,8 @@ default-features = false
 features = ["sqlite", "postgres", "mysql", "tokio", "verification-count-test-hook"]
 
 [dev-dependencies]
+# Builds the small-order-R forgery vector in held_email tests (TC-1541 item 2); already in the lock.
+curve25519-dalek = "4"
 # Parse production Rust items in the DID resolver source guard (tests only).
 syn = { version = "2", features = ["full", "visit"] }
 quote = "1"
@@ -133,8 +139,6 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 # zlib compressibility of raw stored bytes in tests/at_rest_harness.rs (TC-887).
 # Already in the lock through ssi-status; adds no new crate.
 flate2 = "1"
-k256 = { version = "0.13.4", features = ["ecdsa"] }
-sha3 = "0.10"
 # The Rust half of the JS SDK: builds the same host and session SIWE
 # delegations a real `signIn` sends (tests/postgres_round_trip_budget.rs).
 tinycloud-sdk-wasm = { path = "../tinycloud-sdk-wasm" }

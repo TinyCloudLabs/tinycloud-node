@@ -413,12 +413,22 @@ pub(super) struct Harness {
     pub content_space: SpaceId,
     pub content_resource: tinycloud_auth::resource::ResourceId,
     pub network: String,
-    issuer: tinycloud_core::libp2p::identity::ed25519::Keypair,
-    vector: Value,
+    pub(super) issuer: tinycloud_core::libp2p::identity::ed25519::Keypair,
+    pub(super) vector: Value,
 }
 
 impl Harness {
     pub async fn new(backend: Backend, shape: Shape, test: &str) -> anyhow::Result<Option<Self>> {
+        Self::new_with_held(backend, shape, test, false).await
+    }
+
+    /// Same harness, with the held-credentials flag set. An enabled flag needs an audience.
+    pub async fn new_with_held(
+        backend: Backend,
+        shape: Shape,
+        test: &str,
+        held: bool,
+    ) -> anyhow::Result<Option<Self>> {
         let Some(db) = TestDatabase::new(backend, test).await? else {
             return Ok(None);
         };
@@ -442,7 +452,7 @@ impl Harness {
             None,
         );
         let network = format!("urn:tinycloud:encryption:{}:mainnet", space_owner.did());
-        let client = Self::boot_app(&db, &vector, &issuer).await?;
+        let client = Self::boot_app(&db, &vector, &issuer, held).await?;
         let harness = Self {
             client,
             _db: db,
@@ -464,6 +474,7 @@ impl Harness {
         db: &TestDatabase,
         vector: &Value,
         issuer: &tinycloud_core::libp2p::identity::ed25519::Keypair,
+        held: bool,
     ) -> anyhow::Result<Client> {
         let mut config = crate::config::Config::default();
         config.storage.datadir = db.datadir().into();
@@ -482,8 +493,29 @@ impl Harness {
             .as_str()
             .unwrap()
             .to_owned();
-        config.share_email.issuer_public_key =
-            Some(encode_config(issuer.public().to_bytes(), URL_SAFE_NO_PAD));
+        // Held harnesses pin the issuer through one explicit `credential_issuers`
+        // entry (profile `tinycloud.email-held/v1`) and carry no legacy key.
+        if held {
+            config.share_email.credential_issuers =
+                vec![crate::issuer_set::CredentialIssuerConfig {
+                    issuer_did: config.share_email.issuer_did.clone(),
+                    kid: config.share_email.issuer_kid.clone(),
+                    alg: "EdDSA".to_owned(),
+                    public_key: encode_config(issuer.public().to_bytes(), URL_SAFE_NO_PAD),
+                    vcts: vec!["opencredentials.email/v1".to_owned()],
+                    profiles: vec!["tinycloud.email-held/v1".to_owned()],
+                    not_before: "2020-01-01T00:00:00Z".to_owned(),
+                    retired_at: None,
+                    not_after: None,
+                }];
+        } else {
+            config.share_email.issuer_public_key =
+                Some(encode_config(issuer.public().to_bytes(), URL_SAFE_NO_PAD));
+        }
+        config.held_credentials = crate::config::HeldCredentialsConfig {
+            enabled: held,
+            audience: held.then(|| "relying-party.example".to_owned()),
+        };
         let figment = Figment::from(rocket::Config {
             address: "127.0.0.1".parse()?,
             log_level: rocket::config::LogLevel::Off,
@@ -625,8 +657,18 @@ impl Harness {
     /// Register a policy over the content whose roots span `root`, signed
     /// by the policy owner.
     pub async fn register(&self, root: Window) -> anyhow::Result<(Status, String, Registered)> {
-        let owner_did = self.owner.did().to_owned();
         let projection = self.vector["policyProjection"].clone();
+        self.register_with_projection(root, projection).await
+    }
+
+    /// Register a policy over the content whose roots span `root`, with the
+    /// credential requirement projection `projection`.
+    pub(super) async fn register_with_projection(
+        &self,
+        root: Window,
+        projection: Value,
+    ) -> anyhow::Result<(Status, String, Registered)> {
+        let owner_did = self.owner.did().to_owned();
         let created = (now() - Duration::seconds(60)).min(root.not_before);
         let ceiling = vec![
             json!({
@@ -952,6 +994,80 @@ impl Harness {
         self.mint(policy)
             .await?
             .map_err(|(status, body)| anyhow::anyhow!("mint: {status} {body}"))
+    }
+
+    /// POST a shape-valid held presentation (`{sdJwt, siwe}`) to the mint
+    /// route after a fresh challenge. Used where the verifier must not run
+    /// (the held flag is off), so the body needs only the held shape.
+    pub async fn mint_held_presentation(
+        &self,
+        policy: &Registered,
+    ) -> anyhow::Result<(Status, String)> {
+        let (status, body) = self.challenge(policy).await;
+        if status != Status::Ok {
+            return Ok((status, body));
+        }
+        let challenge: Value = serde_json::from_str(&body)?;
+        let response = self
+            .client
+            .post("/policy/v3/delegations")
+            .header(ContentType::JSON)
+            .body(
+                json!({
+                    "policyCid": policy.policy_cid,
+                    "challengeId": challenge["challengeId"],
+                    "nonce": challenge["nonce"],
+                    "requirement": self.vector["sdkRequirement"],
+                    "presentation": {
+                        "sdJwt": "held-placeholder~",
+                        "siwe": {"message": "placeholder", "signature": "0x00"}
+                    },
+                    "requestedExpiresAt": format_time(now() + Duration::seconds(300)),
+                })
+                .to_string(),
+            )
+            .dispatch()
+            .await;
+        let status = response.status();
+        Ok((status, response.into_string().await.unwrap_or_default()))
+    }
+
+    /// A held-shaped request whose `credential` field is set. The request-shape gate
+    /// refuses it before any verifier work.
+    pub async fn mint_held_with_credential(
+        &self,
+        policy: &Registered,
+    ) -> anyhow::Result<(Status, String)> {
+        let (status, body) = self.challenge(policy).await;
+        if status != Status::Ok {
+            return Ok((status, body));
+        }
+        let challenge: Value = serde_json::from_str(&body)?;
+        let response = self
+            .client
+            .post("/policy/v3/delegations")
+            .header(ContentType::JSON)
+            .body(
+                json!({
+                    "policyCid": policy.policy_cid,
+                    "challengeId": challenge["challengeId"],
+                    "nonce": challenge["nonce"],
+                    "requirement": self.vector["sdkRequirement"],
+                    "accountAuthorizationCid": "placeholder",
+                    "credentialSpaceId": "placeholder",
+                    "credential": {},
+                    "presentation": {
+                        "sdJwt": "held-placeholder~",
+                        "siwe": {"message": "placeholder", "signature": "0x00"}
+                    },
+                    "requestedExpiresAt": format_time(now() + Duration::seconds(300)),
+                })
+                .to_string(),
+            )
+            .dispatch()
+            .await;
+        let status = response.status();
+        Ok((status, response.into_string().await.unwrap_or_default()))
     }
 
     /// The holder reads the content under a minted session.

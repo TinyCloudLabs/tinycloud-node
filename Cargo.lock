@@ -9947,6 +9947,7 @@ dependencies = [
  "clap",
  "core-foundation 0.9.4",
  "core-foundation-sys",
+ "curve25519-dalek",
  "ed25519-dalek",
  "flate2",
  "futures",
@@ -10009,6 +10010,7 @@ dependencies = [
  "tracing-log",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "url",
  "uuid",
  "x509-parser 0.16.0",
 ]

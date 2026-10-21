@@ -21,10 +21,9 @@ use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
 use tinycloud_auth::authorization::TinyCloudDelegation;
 use tinycloud_auth::multihash_codetable::MultihashDigest;
 use tinycloud_auth::share_email_evidence::{verify_detached_ed25519, IssuerKey};
-use tinycloud_auth::ssi::{
-    dids::DIDBuf,
-    jwk::{Algorithm, Base64urlUInt, OctetParams, Params, JWK},
-};
+use tinycloud_auth::ssi::dids::DIDBuf;
+#[cfg(test)]
+use tinycloud_auth::ssi::jwk::{Algorithm, Base64urlUInt, OctetParams, Params, JWK};
 use tinycloud_auth::{
     identity::{did_principal_matches, parse_pkh_did},
     resource::{ResourceId, SpaceId},
@@ -48,7 +47,11 @@ use tinycloud_core::{
     RecoveringConnection,
 };
 
-use crate::{authorization::AuthHeaderGetter, config::ShareEmailConfig};
+use crate::{
+    authorization::AuthHeaderGetter,
+    config::{HeldCredentialsConfig, ShareEmailConfig},
+    held_email,
+};
 
 pub const POLICY_SESSION_PROFILE: &str = "policy-session-ucan/v1";
 pub const POLICY_V1_SCHEMA: &str = "xyz.tinycloud.policy/policy/v1";
@@ -85,6 +88,7 @@ const MAX_SEALED_ENVELOPE_BYTES: usize = 4 * 1024 * 1024;
 // freshness bound for its non-revocable status. This is pinned here rather
 // than trusting the unsigned transport envelope around the SD-JWT.
 const EMAIL_PROOF_STATUS_FRESHNESS_SECONDS: i64 = 300;
+const HELD_EMAIL_MAX_AGE_SECONDS: i64 = 31_536_000;
 const INVITATION_REQUEST_SCHEMA: &str = "xyz.tinycloud.credentials/invitation-request/v1";
 const DELIVERY_ADMISSION_SCHEMA: &str = "xyz.tinycloud.policy/delivery-admission/v0";
 /// OpenCredentials profile whose signed `emailDomain` claim backs domain shares.
@@ -101,6 +105,13 @@ struct DeliveryRuntime {
     invitation_origin: String,
 }
 
+/// Audience-bound runtime for held email credentials (TC-1452). Absent unless
+/// `held_credentials.enabled` is set; held presentations are refused without it.
+#[derive(Clone)]
+struct HeldCredentialRuntime {
+    audience: String,
+}
+
 #[derive(Clone)]
 pub struct PolicyV3Runtime {
     pub conn: RecoveringConnection,
@@ -109,6 +120,7 @@ pub struct PolicyV3Runtime {
     credential_issuers: IssuerSet,
     delivery: Option<DeliveryRuntime>,
     sqlite_writer_lock: Option<Arc<tokio::sync::Mutex<()>>>,
+    held_credentials: Option<HeldCredentialRuntime>,
 }
 
 impl PolicyV3Runtime {
@@ -124,6 +136,7 @@ impl PolicyV3Runtime {
             credential_issuers: IssuerSet::default(),
             delivery: None,
             sqlite_writer_lock: None,
+            held_credentials: None,
         }
     }
 
@@ -137,6 +150,24 @@ impl PolicyV3Runtime {
     pub fn with_credential_issuers(mut self, issuers: IssuerSet) -> Self {
         self.credential_issuers = issuers;
         self
+    }
+
+    /// Enable held email credential admission (TC-1452). A no-op when the
+    /// feature is disabled. When enabled, the audience is required and must be
+    /// a valid host, so a misconfigured node refuses to start.
+    pub fn with_held_credentials(mut self, config: &HeldCredentialsConfig) -> anyhow::Result<Self> {
+        if !config.enabled {
+            return Ok(self);
+        }
+        let audience = config
+            .audience
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("held credential audience is missing"))?;
+        if !held_email::valid_audience(&audience) {
+            return Err(anyhow::anyhow!("held credential audience is invalid"));
+        }
+        self.held_credentials = Some(HeldCredentialRuntime { audience });
+        Ok(self)
     }
 
     /// Install one OpenCredentials issuer as a one-entry set (the legacy
@@ -812,6 +843,7 @@ fn session_expiry(
     root_expires_at: &str,
     policy_expires_at: Option<&str>,
     account_expires_at: Option<OffsetDateTime>,
+    credential_expires_at: Option<OffsetDateTime>,
 ) -> Result<OffsetDateTime, (Status, String)> {
     let invalid = || (Status::BadRequest, "session-expiry-invalid".to_owned());
     let mut expires = match requested {
@@ -836,6 +868,9 @@ fn session_expiry(
     }
     if let Some(account) = account_expires_at {
         expires = expires.min(account);
+    }
+    if let Some(credential) = credential_expires_at {
+        expires = expires.min(credential);
     }
     Ok(expires)
 }
@@ -2099,9 +2134,18 @@ pub async fn mint(
     let accountless_credential_admission = credential_admission
         && request.presentation.get("schema").and_then(Value::as_str)
             == Some(CREDENTIAL_PRESENTATION_V4_SCHEMA);
+    // A held presentation carries its SD-JWT inside `presentation`, so the
+    // request has no credential envelope. Every other credential admission
+    // still requires one.
+    let held_admission = credential_admission
+        && !accountless_credential_admission
+        && held_email::read_presentation(&request.presentation).is_ok();
+    if held_admission && runtime.held_credentials.is_none() {
+        return Err((Status::Forbidden, "held-credentials-disabled".into()));
+    }
     if credential_admission {
         if request.requirement.is_null()
-            || request.credential.is_null()
+            || request.credential.is_null() == !held_admission
             || !request.claim.is_null()
             || if accountless_credential_admission {
                 !request.account_authorization_cid.is_missing()
@@ -2217,7 +2261,17 @@ pub async fn mint(
         now,
     };
     let credential_admission_result = if credential_admission {
-        Some(if accountless_credential_admission {
+        Some(if held_admission {
+            validate_held_email_admission(
+                &request.requirement,
+                &request.presentation,
+                &registered_policy,
+                &claim_context,
+                runtime,
+                true,
+            )
+            .await?
+        } else if accountless_credential_admission {
             validate_credential_admission_v4(
                 &request.requirement,
                 &request.credential,
@@ -2268,6 +2322,7 @@ pub async fn mint(
         (!credential_admission).then_some(&request.claim),
         &request.presentation,
         &evaluation_context,
+        !held_admission,
     )?;
     validate_requested_policy_capabilities(
         requested,
@@ -2400,6 +2455,9 @@ pub async fn mint(
         account_owner_proof
             .as_ref()
             .and_then(|proof| proof.expires_at),
+        credential_admission_result
+            .as_ref()
+            .and_then(|admission| admission.credential_expires_at),
     )?
     .unix_timestamp();
     if expires <= not_before {
@@ -2593,7 +2651,17 @@ pub async fn mint(
             .requested_capabilities
             .as_array()
             .ok_or((Status::Forbidden, "requested-capabilities-invalid".into()))?;
-        Some(if accountless_credential_admission {
+        Some(if held_admission {
+            validate_held_email_admission(
+                &request.requirement,
+                &request.presentation,
+                &locked_policy,
+                &locked_claim_context,
+                runtime,
+                false,
+            )
+            .await?
+        } else if accountless_credential_admission {
             validate_credential_admission_v4(
                 &request.requirement,
                 &request.credential,
@@ -2659,6 +2727,7 @@ pub async fn mint(
             node_did: &runtime.node_did,
             now,
         },
+        !held_admission,
     )?;
     if canonical_value_set(&final_allow.approved_capabilities)
         != canonical_value_set(&allow.approved_capabilities)
@@ -4316,7 +4385,7 @@ fn is_base64url_digest(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
-fn canonical_digest_base64url(value: &Value) -> String {
+pub(crate) fn canonical_digest_base64url(value: &Value) -> String {
     base64::encode_config(Sha256::digest(canonical_json_value(value)), URL_SAFE_NO_PAD)
 }
 
@@ -5122,14 +5191,14 @@ fn validate_registration_projection(
     Ok(policy)
 }
 
-struct ClaimPresentationContext<'a> {
-    challenge_id: &'a str,
-    nonce: &'a str,
-    policy_cid: &'a str,
-    owner_did: &'a str,
-    recipient_did: &'a str,
-    authenticated_account_owner: Option<&'a str>,
-    now: OffsetDateTime,
+pub(crate) struct ClaimPresentationContext<'a> {
+    pub(crate) challenge_id: &'a str,
+    pub(crate) nonce: &'a str,
+    pub(crate) policy_cid: &'a str,
+    pub(crate) owner_did: &'a str,
+    pub(crate) recipient_did: &'a str,
+    pub(crate) authenticated_account_owner: Option<&'a str>,
+    pub(crate) now: OffsetDateTime,
 }
 
 fn validate_claim_and_presentation(
@@ -5369,7 +5438,7 @@ fn credential_evidence_digest(value: &Value) -> Result<String, (Status, String)>
     ))
 }
 
-struct CredentialAdmission {
+pub(crate) struct CredentialAdmission {
     claim_jti: String,
     credential_id: String,
     presentation_jti: Option<String>,
@@ -5377,6 +5446,7 @@ struct CredentialAdmission {
     envelope_digest_hex: String,
     presentation_digest_hex: String,
     credential_space_owner_did: Option<String>,
+    credential_expires_at: Option<OffsetDateTime>,
 }
 
 struct AccountOwnerProof {
@@ -5672,6 +5742,7 @@ fn validate_credential_admission_v3(
             presentation.clone(),
         )))),
         credential_space_owner_did: Some(account_owner.to_owned()),
+        credential_expires_at: None,
     })
 }
 
@@ -5732,7 +5803,171 @@ fn validate_credential_admission_v4(
         envelope_digest_hex: digest_value(credential),
         presentation_digest_hex: hex::encode(Sha256::digest(canonical_json_value(presentation))),
         credential_space_owner_did: None,
+        credential_expires_at: None,
     })
+}
+
+/// Held email admission (TC-1452). `consume` is true at the first admission
+/// site only; the locked re-evaluation verifies the same presentation without
+/// spending the nonce a second time.
+pub(crate) async fn validate_held_email_admission(
+    requirement: &Value,
+    presentation: &Value,
+    policy: &Value,
+    context: &ClaimPresentationContext<'_>,
+    runtime: &PolicyV3Runtime,
+    consume: bool,
+) -> Result<CredentialAdmission, (Status, String)> {
+    let held = runtime
+        .held_credentials
+        .as_ref()
+        .ok_or((Status::Forbidden, "held-credentials-disabled".into()))?;
+    let projection = validate_policy_credential_requirement(
+        policy
+            .get("credentialRequirement")
+            .ok_or((Status::Forbidden, "credential-requirement-missing".into()))?,
+    )?;
+    validate_request_local_requirement(requirement, projection)?;
+    if runtime.credential_issuers.is_empty() {
+        return Err((
+            Status::ServiceUnavailable,
+            "credential-issuer-unavailable".into(),
+        ));
+    }
+    let requirement_invalid = || {
+        (
+            Status::Forbidden,
+            String::from("credential-requirement-invalid"),
+        )
+    };
+    if projection
+        .get("credentialType")
+        .and_then(|value| value.get("id"))
+        .and_then(Value::as_str)
+        != Some(held_email::VCT)
+    {
+        return Err((Status::Forbidden, "credential-type-mismatch".into()));
+    }
+    held_email_max_age_pinned(requirement)?;
+    let issuer_did = projection
+        .get("issuerDid")
+        .and_then(Value::as_str)
+        .ok_or_else(requirement_invalid)?;
+    let accepted_issuers = [held_email::AcceptedIssuer {
+        did: issuer_did.to_owned(),
+        kid: projection
+            .get("issuerKid")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    }];
+    let profile = projection.get("profile").ok_or_else(requirement_invalid)?;
+    let accepted_profiles = [held_email::AcceptedProfile {
+        id: profile
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(requirement_invalid)?
+            .to_owned(),
+        version: profile
+            .get("version")
+            .and_then(Value::as_i64)
+            .ok_or_else(requirement_invalid)?,
+    }];
+    let caller_account = context
+        .authenticated_account_owner
+        .ok_or((Status::Forbidden, "account-owner-missing".into()))?;
+    let view = held_email::HeldPolicy {
+        now: context.now,
+        audience: &held.audience,
+        caller_account,
+        accepted_issuers: &accepted_issuers,
+        accepted_profiles: &accepted_profiles,
+        issuers: &runtime.credential_issuers,
+    };
+    let input = held_email::read_presentation(presentation).map_err(held_refusal)?;
+    let pre = held_email::precheck(&input, &view).map_err(held_refusal)?;
+    if consume {
+        let spent = held_email::consume_nonce(
+            &runtime.conn,
+            &held.audience,
+            &pre.nonce,
+            &pre.account_key,
+            context.now,
+        )
+        .await
+        .map_err(db_error)?;
+        if !spent {
+            return Err((Status::Forbidden, "nonce-replayed".into()));
+        }
+    }
+    let verified = held_email::verify(&input, &pre, &view).map_err(held_refusal)?;
+    requirement_claims_satisfied(requirement, &verified.claims)?;
+    let sd_jwt_digest = Sha256::digest(input.sd_jwt.as_bytes());
+    let credential_expires_at = OffsetDateTime::from_unix_timestamp(verified.expires_at)
+        .map_err(|_| (Status::Forbidden, "credential-expiry-invalid".to_owned()))?;
+    Ok(CredentialAdmission {
+        claim_jti: presentation_replay_key(held_email::PROFILE, context.recipient_did, &pre.nonce),
+        credential_id: verified.credential_id,
+        presentation_jti: Some(pre.nonce.clone()),
+        credential_digest: encode_config(sd_jwt_digest, URL_SAFE_NO_PAD),
+        envelope_digest_hex: hex::encode(sd_jwt_digest),
+        presentation_digest_hex: hex::encode(Sha256::digest(canonical_json_value(presentation))),
+        credential_space_owner_did: None,
+        credential_expires_at: Some(credential_expires_at),
+    })
+}
+
+/// The held email row pins `maxAgeSeconds` to exactly 31 536 000 so requirement
+/// digests stay stable. The value never shortens a credential's life, so any
+/// other value, including an absent one, is refused rather than enforced.
+fn held_email_max_age_pinned(requirement: &Value) -> Result<(), (Status, String)> {
+    if requirement.get("maxAgeSeconds").and_then(Value::as_i64) == Some(HELD_EMAIL_MAX_AGE_SECONDS)
+    {
+        Ok(())
+    } else {
+        Err((
+            Status::Forbidden,
+            "credential-requirement-invalid".to_owned(),
+        ))
+    }
+}
+
+fn held_refusal(code: held_email::Refusal) -> (Status, String) {
+    let status = if code == held_email::BAD_CONFIG {
+        Status::InternalServerError
+    } else {
+        Status::Forbidden
+    };
+    (status, code.into())
+}
+
+fn requirement_claims_satisfied(
+    requirement: &Value,
+    disclosed: &std::collections::BTreeMap<String, String>,
+) -> Result<(), (Status, String)> {
+    let claims = requirement
+        .get("claims")
+        .and_then(Value::as_object)
+        .ok_or((Status::Forbidden, "credential-requirement-invalid".into()))?;
+    for (name, expected) in claims {
+        let expected = expected
+            .as_str()
+            .ok_or((Status::Forbidden, "credential-requirement-invalid".into()))?;
+        if disclosed.get(name).map(String::as_str) != Some(expected) {
+            return Err((
+                Status::Forbidden,
+                "credential-requirement-not-satisfied".into(),
+            ));
+        }
+    }
+    for name in disclosed.keys() {
+        if !claims.contains_key(name) {
+            return Err((
+                Status::Forbidden,
+                "credential-requirement-not-satisfied".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn presentation_replay_key(schema: &str, holder_did: &str, presentation_jti: &str) -> String {
@@ -6366,12 +6601,12 @@ fn verify_issuer_signature(
     message: &[u8],
     signature: &[u8],
 ) -> Result<(), (Status, String)> {
-    let key = JWK::from(Params::OKP(OctetParams {
-        curve: "Ed25519".to_owned(),
-        public_key: Base64urlUInt(public_key.to_vec()),
-        private_key: None,
-    }));
-    tinycloud_auth::ssi::claims::jws::verify_bytes(Algorithm::EdDSA, message, &key, signature)
+    let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(public_key)
+        .map_err(|_| (Status::Forbidden, "credential-signature-invalid".into()))?;
+    let signature = ed25519_dalek::Signature::from_slice(signature)
+        .map_err(|_| (Status::Forbidden, "credential-signature-invalid".into()))?;
+    verifying_key
+        .verify_strict(message, &signature)
         .map_err(|_| (Status::Forbidden, "credential-signature-invalid".into()))
 }
 
@@ -6394,6 +6629,7 @@ fn evaluate_current_allow(
     legacy_claim: Option<&Value>,
     presentation: &Value,
     context: &CurrentAllowContext<'_>,
+    check_presentation_capabilities: bool,
 ) -> Result<CurrentAllow, (Status, String)> {
     let CurrentAllowContext {
         challenge,
@@ -6426,7 +6662,10 @@ fn evaluate_current_allow(
             return Err((Status::Forbidden, "policy-evaluator-denied".into()));
         }
     }
-    let mut capability_sources = vec![(presentation, "presentation-capabilities-mismatch")];
+    let mut capability_sources = Vec::new();
+    if check_presentation_capabilities {
+        capability_sources.push((presentation, "presentation-capabilities-mismatch"));
+    }
     if let Some(claim) = legacy_claim {
         capability_sources.push((claim, "claim-capabilities-mismatch"));
     }
@@ -6499,6 +6738,191 @@ fn db_error(error: impl std::fmt::Display) -> (Status, String) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn held_email_max_age_is_pinned_to_the_row_value() {
+        let pinned = |seconds: serde_json::Value| {
+            held_email_max_age_pinned(&serde_json::json!({"maxAgeSeconds": seconds}))
+        };
+        assert!(pinned(serde_json::json!(31_536_000)).is_ok());
+        assert!(pinned(serde_json::json!(60)).is_err());
+        assert!(pinned(serde_json::json!(300)).is_err());
+        assert!(held_email_max_age_pinned(&serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn v3_issuer_signature_refuses_small_order_key_and_r() {
+        use ed25519_dalek::Verifier;
+        // Identity point encoding (y = 1, x = 0) as both public key and R with S = 0.
+        // Non-strict verification accepts this forgery; verify_strict must refuse it.
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        let mut forged = [0u8; 64];
+        forged[..32].copy_from_slice(&identity);
+        let weak_key = ed25519_dalek::VerifyingKey::from_bytes(&identity).unwrap();
+        let weak_sig = ed25519_dalek::Signature::from_slice(&forged).unwrap();
+        assert!(weak_key.verify(b"held", &weak_sig).is_ok());
+        assert_eq!(
+            super::verify_issuer_signature(&identity, b"held", &forged)
+                .unwrap_err()
+                .1,
+            "credential-signature-invalid"
+        );
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let good = ed25519_dalek::Signer::sign(&signing, b"held").to_bytes();
+        assert!(
+            super::verify_issuer_signature(signing.verifying_key().as_bytes(), b"held", &good)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn v3_issuer_signature_refuses_non_canonical_s_at_group_order() {
+        // Identity point as key and R, with S = L (the group order), little-endian.
+        // S >= L is non-canonical; verify_strict must refuse it.
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        let group_order_le: [u8; 32] = [
+            0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9,
+            0xde, 0x14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10,
+        ];
+        let mut forged = [0u8; 64];
+        forged[..32].copy_from_slice(&identity);
+        forged[32..].copy_from_slice(&group_order_le);
+        assert_eq!(
+            super::verify_issuer_signature(&identity, b"held", &forged)
+                .unwrap_err()
+                .1,
+            "credential-signature-invalid"
+        );
+    }
+
+    #[test]
+    fn v3_issuer_signature_refuses_real_key_with_s_plus_group_order() {
+        // A valid signature with S replaced by S + L (same scalar mod L, non-canonical).
+        // Uses a real key so the S >= L check is exercised on a genuine signature.
+        const GROUP_ORDER_LE: [u8; 32] = [
+            0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9,
+            0xde, 0x14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10,
+        ];
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let public = *signing.verifying_key().as_bytes();
+        let good = ed25519_dalek::Signer::sign(&signing, b"held").to_bytes();
+        assert!(super::verify_issuer_signature(&public, b"held", &good).is_ok());
+        let mut malleated = good;
+        let mut carry = 0u16;
+        for i in 0..32 {
+            let sum = good[32 + i] as u16 + GROUP_ORDER_LE[i] as u16 + carry;
+            malleated[32 + i] = sum as u8;
+            carry = sum >> 8;
+        }
+        assert_eq!(carry, 0, "S + L must fit in 32 bytes");
+        assert_ne!(malleated, good);
+        assert_eq!(
+            super::verify_issuer_signature(&public, b"held", &malleated)
+                .unwrap_err()
+                .1,
+            "credential-signature-invalid"
+        );
+    }
+
+    #[tokio::test]
+    async fn held_credentials_are_off_unless_enabled_with_a_valid_audience() {
+        use crate::config::HeldCredentialsConfig;
+        let conn = tinycloud_core::sea_orm::Database::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let runtime = || {
+            super::PolicyV3Runtime::new(
+                conn.clone(),
+                "did:key:z6MkNodeTestOnly",
+                StaticSecret::new(vec![7; 32]).unwrap(),
+            )
+        };
+        let off = runtime()
+            .with_held_credentials(&HeldCredentialsConfig {
+                enabled: false,
+                audience: None,
+            })
+            .unwrap();
+        assert!(off.held_credentials.is_none());
+        let missing = runtime().with_held_credentials(&HeldCredentialsConfig {
+            enabled: true,
+            audience: None,
+        });
+        assert!(missing.is_err());
+        let malformed = runtime().with_held_credentials(&HeldCredentialsConfig {
+            enabled: true,
+            audience: Some("not a host".to_owned()),
+        });
+        assert!(malformed.is_err());
+        let on = runtime()
+            .with_held_credentials(&HeldCredentialsConfig {
+                enabled: true,
+                audience: Some("relying-party.example".to_owned()),
+            })
+            .unwrap();
+        assert_eq!(
+            on.held_credentials
+                .as_ref()
+                .map(|held| held.audience.as_str()),
+            Some("relying-party.example")
+        );
+    }
+
+    #[test]
+    fn malformed_account_owner_maps_to_forbidden_not_internal_error() {
+        let (status, body) = super::held_refusal(crate::held_email::ACCOUNT_OWNER_INVALID);
+        assert_eq!(status, rocket::http::Status::Forbidden);
+        assert_eq!(body, "account-owner-invalid");
+        let (status, _) = super::held_refusal(crate::held_email::BAD_CONFIG);
+        assert_eq!(status, rocket::http::Status::InternalServerError);
+    }
+
+    #[test]
+    fn held_requirement_claims_must_match_the_disclosed_values() {
+        let requirement = serde_json::json!({"claims": {"email": "alice@example.com"}});
+        let disclosed = |email: &str| {
+            std::collections::BTreeMap::from([("email".to_owned(), email.to_owned())])
+        };
+        assert!(
+            super::requirement_claims_satisfied(&requirement, &disclosed("alice@example.com"))
+                .is_ok()
+        );
+        // Reviewer repro: a bob@other.example credential must not admit alice@example.com.
+        assert_eq!(
+            super::requirement_claims_satisfied(&requirement, &disclosed("bob@other.example"))
+                .unwrap_err()
+                .1,
+            "credential-requirement-not-satisfied"
+        );
+        assert!(super::requirement_claims_satisfied(
+            &requirement,
+            &std::collections::BTreeMap::new()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn held_disclosures_beyond_the_requirement_are_refused() {
+        let requirement = serde_json::json!({"claims": {"emailDomain": "example.com"}});
+        let disclosed = std::collections::BTreeMap::from([
+            ("email".to_owned(), "alice@example.com".to_owned()),
+            ("emailDomain".to_owned(), "example.com".to_owned()),
+        ]);
+        // Requirement asks only for the domain; disclosing the full email is refused.
+        assert_eq!(
+            super::requirement_claims_satisfied(&requirement, &disclosed)
+                .unwrap_err()
+                .1,
+            "credential-requirement-not-satisfied"
+        );
+        let domain_only = std::collections::BTreeMap::from([(
+            "emailDomain".to_owned(),
+            "example.com".to_owned(),
+        )]);
+        assert!(super::requirement_claims_satisfied(&requirement, &domain_only).is_ok());
+    }
+
     #[tokio::test]
     async fn policy_registration_refuses_both_local_web_roots_before_resolution() {
         use crate::did_resolution_test_support::*;
@@ -6905,6 +7329,12 @@ mod tests {
         let mut untrusted_signer = original.clone();
         untrusted_signer["signature"]["signerDid"] = json!("did:key:zUntrustedSigner");
         assert!(validate(&untrusted_signer).is_err());
+        let mut non_array = original.clone();
+        non_array["requestedCapabilities"] = json!("not-an-array");
+        assert_eq!(
+            validate(&non_array).unwrap_err().1,
+            "presentation-capabilities-mismatch"
+        );
         assert!(validate(&original).is_ok());
     }
 
@@ -7096,6 +7526,7 @@ mod tests {
             issued,
             header,
             projection["issuerKid"].clone(),
+            "opencredentials.email/v1",
         )
     }
 
@@ -7112,6 +7543,7 @@ mod tests {
         issued: OffsetDateTime,
         header: Value,
         envelope_kid: Value,
+        vct: &str,
     ) -> Value {
         let disclose = |salt: &str, name: &str, value: &str| {
             encode_config(
@@ -7128,7 +7560,7 @@ mod tests {
         let payload = json!({
             "iss": projection["issuerDid"], "sub": holder,
             "iat": issued.unix_timestamp(), "nbf": issued.unix_timestamp(), "exp": expires.unix_timestamp(),
-            "jti": "credential-email-domain", "vct": "opencredentials.email/v1",
+            "jti": "credential-email-domain", "vct": vct,
             "profile": projection["profile"]["id"], "profileVersion": 1,
             "descriptorDigest": projection["descriptorDigest"],
             "holderBinding": {"did": holder, "signingDomain": "tinycloud.credentials/holder-binding/v1"},
@@ -7233,6 +7665,7 @@ mod tests {
                 self.issued,
                 header,
                 json!(envelope_kid),
+                "opencredentials.email/v1",
             )
         }
     }
@@ -7388,6 +7821,44 @@ mod tests {
             &legacy_kid,
         );
         assert!(fixture.verify(&other, &legacy).is_err());
+    }
+
+    #[test]
+    fn kidless_header_is_refused_for_a_configured_entry_in_the_combined_set() {
+        // TC-1541 item 1: legacy issuer and configured list share one set. A
+        // header without `kid` must not vouch for a configured entry, but the
+        // legacy entry keeps accepting one.
+        let (configured_key, legacy_key) = (keypair(), keypair());
+        let configured_kid = format!("{ORG_A}#issuing-1");
+        let legacy_kid = format!("{ORG_A}#controller");
+        let legacy = IssuerKey::new(
+            ORG_A,
+            "opencredentials.email/v1",
+            1,
+            legacy_kid.clone(),
+            legacy_key.public().to_bytes(),
+        );
+        let set = IssuerSet::load_with_legacy(
+            &[issuer_config(ORG_A, "issuing-1", &configured_key)],
+            Some(&legacy),
+        )
+        .unwrap();
+        let unpinned = SetFixture::new(ORG_A, None, DOMAIN_PROFILE);
+        let bare = json!({"alg": "EdDSA", "typ": "vc+sd-jwt"});
+        let kidless = unpinned.mint(&configured_key, bare, &configured_kid);
+        assert_eq!(
+            unpinned.verify(&kidless, &set).err(),
+            forbidden("credential-signature-invalid")
+        );
+        // The same credential carrying its kid verifies, so the refusal is the
+        // missing header kid and nothing else.
+        let with_kid = json!({"alg": "EdDSA", "typ": "vc+sd-jwt", "kid": configured_kid});
+        let keyed = unpinned.mint(&configured_key, with_kid, &configured_kid);
+        assert!(unpinned.verify(&keyed, &set).is_ok());
+        let legacy_fixture = SetFixture::new(ORG_A, Some(&legacy_kid), DOMAIN_PROFILE);
+        let legacy_bare = json!({"alg": "EdDSA", "typ": "vc+sd-jwt"});
+        let legacy_credential = legacy_fixture.mint(&legacy_key, legacy_bare, &legacy_kid);
+        assert!(legacy_fixture.verify(&legacy_credential, &set).is_ok());
     }
 
     #[test]
@@ -7772,6 +8243,73 @@ mod tests {
         let mut substituted = requirement.clone();
         substituted["claims"]["emailDomain"] = json!("evil.example");
         assert!(validate_request_local_requirement(&substituted, projection).is_err());
+    }
+
+    #[test]
+    fn signed_vct_other_than_the_requirement_credential_type_is_refused() {
+        let requirement = json!({
+            "type": "TinyCloudCredentialRequirement", "version": 1,
+            "profile": {"id": "tinycloud.email-domain-proof/v1", "version": 1},
+            "credentialType": {"id": "opencredentials.email/v1", "version": 1},
+            "claims": {"emailDomain": "tinycloud.xyz"},
+            "maxAgeSeconds": 300
+        });
+        let projection_value = json!({
+            "type": POLICY_CREDENTIAL_REQUIREMENT_V1, "version": 1,
+            "requirementDigest": canonical_digest_base64url(&requirement),
+            "descriptorDigest": "DdDdDdDdDdDdDdDdDdDdDdDdDdDdDdDdDdDdDdDdDdD",
+            "issuerDid": "did:web:issuer.credentials.org",
+            "issuerKid": "did:web:issuer.credentials.org#controller",
+            "profile": {"id": "tinycloud.email-domain-proof/v1", "version": 1},
+            "credentialType": {"id": "opencredentials.email/v1", "version": 1}
+        });
+        let projection = validate_policy_credential_requirement(&projection_value).unwrap();
+        let holder = "did:key:z6MkehRgf7yJbgaGfYsdoAsKdBPE3dj2CYhowQdcjqSJgvVd";
+        let issuer_key = tinycloud_core::libp2p::identity::ed25519::Keypair::generate();
+        let trusted = IssuerKey::new(
+            "did:web:issuer.credentials.org",
+            "opencredentials.email/v1",
+            1,
+            "did:web:issuer.credentials.org#controller",
+            issuer_key.public().to_bytes(),
+        );
+        let issued = parse_time("2026-09-25T12:00:00Z").unwrap();
+        let now = issued + Duration::seconds(30);
+        let verify = |credential: &Value| {
+            verify_opencredentials_credential(
+                credential,
+                &requirement,
+                projection,
+                &IssuerSet::from_legacy(&trusted),
+                holder,
+                now,
+            )
+        };
+        // Only the issuer-signed `vct` differs. The signature and disclosure
+        // digests stay valid, so the refusal must come from the disclosed
+        // `vct` comparison against the requirement's credential type.
+        let mint = |vct: &str| {
+            email_domain_credential_with_header(
+                &issuer_key,
+                &projection_value,
+                holder,
+                "alice@tinycloud.xyz",
+                "tinycloud.xyz",
+                "tinycloud.xyz",
+                issued,
+                json!({"alg": "EdDSA", "typ": "vc+sd-jwt", "kid": projection_value["issuerKid"]}),
+                projection_value["issuerKid"].clone(),
+                vct,
+            )
+        };
+        assert!(verify(&mint("opencredentials.email/v1")).is_ok());
+        assert_eq!(
+            verify(&mint("opencredentials.phone/v1")).err(),
+            Some((
+                Status::Forbidden,
+                "credential-holder-binding-invalid".into()
+            ))
+        );
     }
 
     #[test]
@@ -8206,6 +8744,7 @@ mod tests {
                 &at(7200),
                 policy,
                 account.map(|seconds| now + Duration::seconds(seconds)),
+                None,
             )
         };
         // Older clients send nothing and keep the 60-second session.
@@ -8241,6 +8780,30 @@ mod tests {
             assert_eq!(status, Status::BadRequest, "{invalid}");
             assert_eq!(error, "session-expiry-invalid");
         }
+    }
+
+    #[test]
+    fn session_expiry_never_outlives_the_held_credential() {
+        let now = parse_time("2026-10-01T12:00:00Z").unwrap();
+        let requested = format_time(now + Duration::seconds(3600));
+        let root = format_time(now + Duration::seconds(7200));
+        let credential = now + Duration::seconds(120);
+        assert_eq!(
+            session_expiry(
+                now,
+                Some(requested.as_str()),
+                &root,
+                None,
+                None,
+                Some(credential)
+            )
+            .unwrap(),
+            credential
+        );
+        assert_eq!(
+            session_expiry(now, Some(requested.as_str()), &root, None, None, None).unwrap(),
+            now + Duration::seconds(3600)
+        );
     }
 
     #[test]
@@ -8816,6 +9379,50 @@ mod tests {
         assert_eq!(
             admission.credential_space_owner_did.as_deref(),
             Some(account_owner_did.as_str())
+        );
+        let mut non_array_capabilities = presentation.clone();
+        non_array_capabilities["requestedCapabilities"] = json!("not-an-array");
+        let refusal = validate_credential_admission_v3(
+            &requirement,
+            &credential,
+            &non_array_capabilities,
+            &policy,
+            &ClaimPresentationContext {
+                challenge_id,
+                nonce,
+                policy_cid: presentation["policyCid"].as_str().unwrap(),
+                owner_did: policy["ownerDid"].as_str().unwrap(),
+                recipient_did: holder_did.as_str(),
+                authenticated_account_owner: Some(&account_owner_did),
+                now,
+            },
+            &runtime,
+            presentation["requestedCapabilities"].as_array().unwrap(),
+        );
+        assert_eq!(
+            refusal.err().map(|(_, error)| error).as_deref(),
+            Some("presentation-capabilities-mismatch")
+        );
+        let refusal = validate_credential_admission_v3(
+            &requirement,
+            &credential,
+            &presentation,
+            &policy,
+            &ClaimPresentationContext {
+                challenge_id,
+                nonce,
+                policy_cid: presentation["policyCid"].as_str().unwrap(),
+                owner_did: policy["ownerDid"].as_str().unwrap(),
+                recipient_did: holder_did.as_str(),
+                authenticated_account_owner: Some(&account_owner_did),
+                now,
+            },
+            &runtime,
+            &[],
+        );
+        assert_eq!(
+            refusal.err().map(|(_, error)| error).as_deref(),
+            Some("credential-presentation-binding-invalid")
         );
 
         let binding_material =
@@ -10752,3 +11359,11 @@ mod test_harness;
 #[cfg(test)]
 #[path = "policy_v3/root_revocation_tests.rs"]
 mod root_revocation_tests;
+
+#[cfg(test)]
+#[path = "policy_v3/held_route_tests.rs"]
+mod held_route_tests;
+
+#[cfg(test)]
+#[path = "policy_v3/held_fixtures.rs"]
+mod held_fixtures;
