@@ -36,7 +36,16 @@ const BINDING_DOMAIN: &str = "tinycloud.credentials/account-binding/v1";
 const MAX_LIFETIME_SECONDS: i64 = 365 * 24 * 60 * 60;
 const STATUS_METHODS: &[&str] = &["none"];
 const DISCLOSABLE: &[&str] = &["email", "emailDomain"];
-const OPTIONAL_SIGNED: &[&str] = &["descriptorDigest"];
+// Size caps, as the upstream verifier's HELD_LIMITS.
+const MAX_SD_JWT_CHARS: usize = 16384;
+const MAX_SIWE_MESSAGE_CHARS: usize = 2048;
+const MAX_SIWE_SIGNATURE_CHARS: usize = 132;
+const MAX_DISCLOSURES: usize = 8;
+const MAX_DISCLOSURE_CHARS: usize = 1024;
+const MAX_HEADER_CHARS: usize = 1024;
+const MAX_PAYLOAD_CHARS: usize = 4096;
+const MAX_SIGNATURE_CHARS: usize = 128;
+const HEADER_MEMBERS: &[&str] = &["alg", "typ", "kid"];
 const SHARED_SIGNED: &[&str] = &[
     "iss",
     "sub",
@@ -206,6 +215,12 @@ pub fn precheck(
     if !input.sd_jwt.is_ascii() {
         return Err(BAD_PRESENTATION);
     }
+    if input.sd_jwt.len() > MAX_SD_JWT_CHARS
+        || input.siwe_message.len() > MAX_SIWE_MESSAGE_CHARS
+        || input.siwe_signature.len() > MAX_SIWE_SIGNATURE_CHARS
+    {
+        return Err(BAD_PRESENTATION);
+    }
     let siwe = parse_siwe(input.siwe_message)?;
     if siwe.domain != policy.audience {
         return Err(BAD_SIWE);
@@ -241,11 +256,27 @@ pub fn verify(
     if segments.len() != 3 || segments.iter().any(|segment| segment.is_empty()) {
         return Err(BAD_PRESENTATION);
     }
+    if disclosures.len() > MAX_DISCLOSURES
+        || disclosures
+            .iter()
+            .any(|part| part.len() > MAX_DISCLOSURE_CHARS)
+        || segments[0].len() > MAX_HEADER_CHARS
+        || segments[1].len() > MAX_PAYLOAD_CHARS
+        || segments[2].len() > MAX_SIGNATURE_CHARS
+    {
+        return Err(BAD_PRESENTATION);
+    }
 
     // Protected header.
     let header = decode_object(segments[0], BAD_HEADER)?;
     if header.get("alg").and_then(Value::as_str) != Some("EdDSA")
         || header.get("typ").and_then(Value::as_str) != Some("vc+sd-jwt")
+    {
+        return Err(BAD_HEADER);
+    }
+    if header
+        .keys()
+        .any(|key| !HEADER_MEMBERS.contains(&key.as_str()))
     {
         return Err(BAD_HEADER);
     }
@@ -330,7 +361,7 @@ pub fn verify(
 
     for key in payload.keys() {
         let name = key.as_str();
-        if !SHARED_SIGNED.contains(&name) && !OPTIONAL_SIGNED.contains(&name) {
+        if !SHARED_SIGNED.contains(&name) {
             return Err(BAD_PAYLOAD);
         }
     }
@@ -347,6 +378,10 @@ pub fn verify(
                 .collect::<Option<Vec<&str>>>()
         })
         .ok_or(BAD_PAYLOAD)?;
+    let distinct: BTreeSet<&str> = sd_digests.iter().copied().collect();
+    if distinct.len() != sd_digests.len() {
+        return Err(BAD_PAYLOAD);
+    }
 
     let now = policy.now.unix_timestamp();
     if now < nbf {
@@ -362,7 +397,7 @@ pub fn verify(
     let jti = payload
         .get("jti")
         .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
+        .filter(|value| is_uuid_v4_urn(value))
         .ok_or(BAD_PAYLOAD)?;
     let status = payload
         .get("status")
@@ -418,7 +453,6 @@ pub fn verify(
         let value = array[2].as_str().ok_or(BAD_DISCLOSURE)?;
         if !salt_ok
             || RESERVED.contains(&name)
-            || OPTIONAL_SIGNED.contains(&name)
             || !DISCLOSABLE.contains(&name)
             || !seen_names.insert(name.to_owned())
         {
@@ -680,7 +714,7 @@ impl Pkh {
 }
 
 /// Parses `did:pkh:eip155:<chain>:<address>`. Chain is `0` or a decimal with no
-/// leading zero, up to 16 digits. A mixed-case address must be valid EIP-55.
+/// leading zero, up to 16 digits. The address must be valid EIP-55.
 fn parse_pkh(did: &str) -> Option<Pkh> {
     let rest = did.strip_prefix("did:pkh:eip155:")?;
     let (chain, address) = rest.split_once(':')?;
@@ -701,14 +735,10 @@ fn parse_pkh(did: &str) -> Option<Pkh> {
     })
 }
 
-/// EIP-55: a mixed-case address must match the checksum. All-lower or all-upper
-/// addresses carry no checksum and are accepted.
+/// EIP-55: each letter's case must match the keccak-derived checksum, which is
+/// `toChecksumAddress(address) === address`. All-lower and all-upper spellings
+/// pass only when the checksum happens to agree with them.
 fn eip55_ok(hex40: &str) -> bool {
-    let has_lower = hex40.bytes().any(|b| b.is_ascii_lowercase());
-    let has_upper = hex40.bytes().any(|b| b.is_ascii_uppercase());
-    if !(has_lower && has_upper) {
-        return true;
-    }
     let digest = keccak(hex40.to_ascii_lowercase().as_bytes());
     hex40.bytes().enumerate().all(|(index, byte)| {
         if !byte.is_ascii_alphabetic() {
@@ -771,8 +801,26 @@ fn valid_nonce(nonce: &str) -> bool {
     nonce.len() >= 22 && nonce.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
+/// `urn:uuid:` plus a lowercase RFC 4122 version-4 UUID: the upstream
+/// JTI_UUID_V4 pattern.
+fn is_uuid_v4_urn(value: &str) -> bool {
+    let Some(uuid) = value.strip_prefix("urn:uuid:") else {
+        return false;
+    };
+    uuid.len() == 36
+        && uuid.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            14 => byte == b'4',
+            19 => matches!(byte, b'8' | b'9' | b'a' | b'b'),
+            _ => byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte),
+        })
+}
+
 fn is_eth_address(line: &str) -> bool {
-    line.len() == 42 && line.starts_with("0x") && hex::decode(&line[2..]).is_ok()
+    line.len() == 42
+        && line.starts_with("0x")
+        && hex::decode(&line[2..]).is_ok()
+        && eip55_ok(&line[2..])
 }
 
 /// A parsed EIP-4361 message, strictly. Only the fields the verifier reads.
@@ -921,6 +969,9 @@ fn rfc3339_shape(text: &str) -> bool {
         if index == start {
             return false;
         }
+        if index - start > 9 {
+            return false;
+        }
     }
     let tail = &bytes[index..];
     if tail == b"Z" {
@@ -950,13 +1001,19 @@ fn validate_disclosed(claims: &BTreeMap<String, String>) -> Result<(), Refusal> 
             && email == &email.to_ascii_lowercase()
             && email.matches('@').count() == 1
             && (3..=320).contains(&email.len())
-            && email.bytes().all(|b| b > 0x20 && b != 0x7f);
+            && email.bytes().all(|b| b > 0x20 && b != 0x7f)
+            && !email.starts_with('@')
+            && !email.ends_with('@');
         if !ok {
             return Err(BAD_DISCLOSURE);
         }
     }
     if let Some(domain) = claims.get("emailDomain") {
-        if domain.is_empty() || domain.contains('@') || domain != &domain.to_ascii_lowercase() {
+        if domain.is_empty()
+            || domain.contains('@')
+            || !domain.is_ascii()
+            || domain != &domain.to_ascii_lowercase()
+        {
             return Err(BAD_DISCLOSURE);
         }
     }
@@ -1100,7 +1157,7 @@ mod tests {
             "iat": IAT,
             "nbf": IAT,
             "exp": IAT + 30 * DAY,
-            "jti": "urn:uuid:held-test-0001",
+            "jti": "urn:uuid:0b6d2c4e-8a1f-4d3e-9b7a-1c2d3e4f5a6b",
             "vct": VCT,
             "profile": PROFILE,
             "profileVersion": PROFILE_VERSION,
@@ -1309,7 +1366,7 @@ mod tests {
         let disclosures = email_disclosures();
         let payload = default_payload(&disclosures).to_string().replacen(
             '{',
-            "{\"jti\":\"urn:uuid:duplicate\",",
+            "{\"jti\":\"urn:uuid:7c1e4b2a-9d3f-4e5a-8b6c-0d1e2f3a4b5c\",",
             1,
         );
         let sd_jwt = mint(&key, &default_header().to_string(), &payload, &disclosures);
@@ -1327,7 +1384,7 @@ mod tests {
         let header = default_header().to_string();
         let signed = signing_input(&header, &default_payload(&disclosures).to_string());
         let mut altered = default_payload(&disclosures);
-        altered["jti"] = json!("urn:uuid:altered");
+        altered["jti"] = json!("urn:uuid:9e8d7c6b-5a4f-4e3d-8c2b-1a0f9e8d7c6b");
         let signature = key.sign(signed.as_bytes()).to_bytes();
         let sd_jwt = assemble(
             &signing_input(&header, &altered.to_string()),
@@ -1338,6 +1395,118 @@ mod tests {
             outcome(&fixture, &request_for(&sd_jwt)).await,
             "bad-signature"
         );
+    }
+
+    #[tokio::test]
+    async fn descriptor_digest_is_refused_for_the_email_row() {
+        let key = test_key();
+        let fixture = own_fixture(&key);
+        let sd_jwt = credential(&key, default_header(), |p| {
+            p["descriptorDigest"] = json!("unexpected");
+        });
+        assert_eq!(
+            outcome(&fixture, &request_for(&sd_jwt)).await,
+            "bad-payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_sd_digest_is_refused() {
+        let key = test_key();
+        let fixture = own_fixture(&key);
+        let sd_jwt = credential(&key, default_header(), |p| {
+            let first = p["_sd"][0].clone();
+            p["_sd"].as_array_mut().unwrap().push(first);
+        });
+        assert_eq!(
+            outcome(&fixture, &request_for(&sd_jwt)).await,
+            "bad-payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn header_member_outside_alg_typ_kid_is_refused() {
+        let key = test_key();
+        let fixture = own_fixture(&key);
+        let mut header = default_header();
+        header["x5c"] = json!(["AAAA"]);
+        let sd_jwt = credential(&key, header, |_| {});
+        assert_eq!(outcome(&fixture, &request_for(&sd_jwt)).await, "bad-header");
+    }
+
+    #[tokio::test]
+    async fn non_v4_jti_is_refused() {
+        let key = test_key();
+        let fixture = own_fixture(&key);
+        let sd_jwt = credential(&key, default_header(), |p| {
+            p["jti"] = json!("urn:uuid:held-test-0001");
+        });
+        assert_eq!(
+            outcome(&fixture, &request_for(&sd_jwt)).await,
+            "bad-payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_presentation_is_refused_before_decoding() {
+        let key = test_key();
+        let fixture = own_fixture(&key);
+        let sd_jwt = "a".repeat(16385);
+        assert_eq!(
+            outcome(&fixture, &request_for(&sd_jwt)).await,
+            "bad-presentation"
+        );
+    }
+
+    #[test]
+    fn did_pkh_requires_the_exact_eip55_checksum() {
+        assert!(parse_pkh(CALLER).is_some());
+        let lower = CALLER.to_ascii_lowercase();
+        let upper = format!("did:pkh:eip155:1:0x{}", HOLDER[2..].to_ascii_uppercase());
+        assert!(parse_pkh(&lower).is_none());
+        assert!(parse_pkh(&upper).is_none());
+    }
+
+    #[test]
+    fn siwe_address_requires_the_exact_eip55_checksum() {
+        let lowered = siwe_message(NONCE, "x").replacen(HOLDER, &HOLDER.to_ascii_lowercase(), 1);
+        assert_eq!(parse_siwe(&lowered).err(), Some(BAD_SIWE));
+        assert!(parse_siwe(&siwe_message(NONCE, "x")).is_ok());
+    }
+
+    #[test]
+    fn fractional_seconds_are_capped_at_nine_digits() {
+        assert!(rfc3339_shape("2026-01-01T00:00:00.123456789Z"));
+        assert!(!rfc3339_shape("2026-01-01T00:00:00.1234567890Z"));
+    }
+
+    #[test]
+    fn jti_must_be_a_lowercase_v4_uuid_urn() {
+        assert!(is_uuid_v4_urn(
+            "urn:uuid:5f1c9a2e-7b3d-4e8a-9c61-2d4b8e7f0a13"
+        ));
+        assert!(!is_uuid_v4_urn(
+            "urn:uuid:5F1C9A2E-7B3D-4E8A-9C61-2D4B8E7F0A13"
+        ));
+        assert!(!is_uuid_v4_urn(
+            "urn:uuid:5f1c9a2e-7b3d-1e8a-9c61-2d4b8e7f0a13"
+        ));
+        assert!(!is_uuid_v4_urn(
+            "urn:uuid:5f1c9a2e-7b3d-4e8a-1c61-2d4b8e7f0a13"
+        ));
+    }
+
+    #[test]
+    fn email_domain_must_be_ascii_and_email_must_not_start_or_end_with_at() {
+        let check = |name: &str, value: &str| {
+            let mut claims = BTreeMap::new();
+            claims.insert(name.to_owned(), value.to_owned());
+            validate_disclosed(&claims)
+        };
+        assert_eq!(check("emailDomain", "exämple.com"), Err(BAD_DISCLOSURE));
+        assert_eq!(check("email", "@example.com"), Err(BAD_DISCLOSURE));
+        assert_eq!(check("email", "user@"), Err(BAD_DISCLOSURE));
+        assert_eq!(check("email", "user@example.com"), Ok(()));
     }
 
     #[tokio::test]
