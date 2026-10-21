@@ -382,7 +382,7 @@ TinyCloud Protocol is most easily used via the TinyCloud Protocol SDK. See the e
 ### UCAN DID resolution (TC-1080)
 
 UCAN signature verification resolves only `did:key` (Ed25519 keys), `did:pkh`
-(EVM, `eip155` namespace) and `did:jwk` (Ed25519 OKP keys) by default. Other
+(EVM, `eip155` namespace) and `did:jwk` (Ed25519 OKP keys). Other
 methods, and other key types or namespaces, fail before resolution with
 `did_method_disabled:`.
 Issuer DID URLs carrying a query fail with `did_url_query_rejected:` under every
