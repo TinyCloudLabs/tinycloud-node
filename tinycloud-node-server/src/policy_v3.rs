@@ -1804,7 +1804,6 @@ pub async fn register_policy(
     let request = request.into_inner();
     let policy_bytes = canonical_json(&request.policy)?;
     validate_policy_document(&request.policy, &policy_bytes, &request.policy_cid)?;
-    validate_registration_credential_issuer(&request.policy, &runtime.credential_issuers)?;
     let projections = registration_projections(&request.policy)?;
     if request.content_source_digest_hex != projections.content_source_digest_hex
         || request.native_projection_hash_hex != projections.native_projection_hash_hex
@@ -1872,6 +1871,8 @@ pub async fn register_policy(
         .await
         .map_err(|error| (Status::Forbidden, error.into()))?;
     }
+    // Checked only after the owner's authority is proven, before any stored row is read.
+    validate_registration_credential_issuer(&request.policy, &runtime.credential_issuers)?;
     for root in [&policy_root, &enforcement_root] {
         for space in root.0.spaces() {
             tinycloud_core::request_telemetry::observe_space(space);
@@ -8604,7 +8605,7 @@ mod tests {
 
     #[tokio::test]
     async fn policy_v2_admits_v3_account_and_v4_accountless_receivers() -> anyhow::Result<()> {
-        run_policy_v2_flow(PolicyOwner::SpaceOwner).await
+        run_policy_v2_flow(PolicyOwner::SpaceOwner, true).await
     }
 
     /// The real Share and CLI shape: the policy owner is a session key the
@@ -8612,7 +8613,7 @@ mod tests {
     /// space owner revokes that delegation, no new session can be minted.
     #[tokio::test]
     async fn policy_owner_may_be_a_session_the_space_owner_delegated_to() -> anyhow::Result<()> {
-        run_policy_v2_flow(PolicyOwner::DelegatedSession).await
+        run_policy_v2_flow(PolicyOwner::DelegatedSession, true).await
     }
 
     /// The policy owner signs a valid, self-consistent policy over content in
@@ -8620,7 +8621,15 @@ mod tests {
     /// Registration must refuse it, so no session can ever read the bytes.
     #[tokio::test]
     async fn policy_registration_requires_the_owner_to_hold_what_it_grants() -> anyhow::Result<()> {
-        run_policy_v2_flow(PolicyOwner::Unauthorized).await
+        run_policy_v2_flow(PolicyOwner::Unauthorized, true).await
+    }
+
+    /// The node has an issuer set configured, but the policy names an issuer
+    /// outside it. Registration refuses before any row is written.
+    #[tokio::test]
+    async fn policy_registration_refuses_an_issuer_outside_the_configured_set() -> anyhow::Result<()>
+    {
+        run_policy_v2_flow(PolicyOwner::SpaceOwner, false).await
     }
 
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -8633,7 +8642,10 @@ mod tests {
         Unauthorized,
     }
 
-    async fn run_policy_v2_flow(policy_owner: PolicyOwner) -> anyhow::Result<()> {
+    async fn run_policy_v2_flow(
+        policy_owner: PolicyOwner,
+        issuer_trusted: bool,
+    ) -> anyhow::Result<()> {
         use k256::ecdsa::SigningKey;
         use sha3::Keccak256;
         use tinycloud_auth::cacaos::siwe::encode_eip55;
@@ -8906,7 +8918,7 @@ mod tests {
             ..ShareEmailConfig::default()
         };
         let runtime = PolicyV3Runtime::new(db.clone(), node_did.clone(), node_secret)
-            .with_credential_issuer(issuer)
+            .with_credential_issuer(issuer.clone())
             .with_delivery(&delivery_config)?;
         let admission = validate_credential_admission_v3(
             &requirement,
@@ -8926,6 +8938,19 @@ mod tests {
             presentation["requestedCapabilities"].as_array().unwrap(),
         )
         .map_err(|(_, error)| anyhow::anyhow!(error))?;
+        // Admission above ran against the trusted issuer. Registration runs on a node whose
+        // configured set omits that issuer; the gate must refuse it there.
+        let runtime = if issuer_trusted {
+            runtime
+        } else {
+            runtime.with_credential_issuer(IssuerKey::new(
+                "did:web:untrusted.example",
+                "opencredentials.email/v1",
+                1,
+                "did:web:untrusted.example#controller",
+                issuer_key.public().to_bytes(),
+            ))
+        };
         assert_eq!(admission.claim_jti, "credential-tc-470");
         assert_eq!(
             admission.credential_space_owner_did.as_deref(),
@@ -9392,6 +9417,23 @@ mod tests {
         .await;
         let register_status = register_response.status();
         let register_body = register_response.into_string().await.unwrap_or_default();
+        if !issuer_trusted {
+            assert_eq!(
+                register_status,
+                Status::Forbidden,
+                "register: {register_body}"
+            );
+            assert_eq!(register_body, "credential-issuer-untrusted");
+            let conn = &client.rocket().state::<PolicyV3Runtime>().unwrap().conn;
+            assert!(
+                policy_v3_registration::Entity::find_by_id(policy_cid.clone())
+                    .one(conn)
+                    .await?
+                    .is_none()
+            );
+            assert!(policy_v3_root::Entity::find().one(conn).await?.is_none());
+            return Ok(());
+        }
         if policy_owner == PolicyOwner::Unauthorized {
             assert_eq!(
                 register_status,

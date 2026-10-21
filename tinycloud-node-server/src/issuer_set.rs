@@ -34,30 +34,42 @@ enum PermittedIssuers {
     OrgSubdomain,
 }
 
-const HELD_PROFILE_ROWS: &[(&str, PermittedIssuers)] = &[
-    (
-        "tinycloud.email-held/v1",
-        PermittedIssuers::Literal("did:web:issuer.credentials.org"),
-    ),
-    (
-        "tinycloud.org-membership/v1",
-        PermittedIssuers::OrgSubdomain,
-    ),
-    (
-        "tinycloud.org-membership-free/v1",
-        PermittedIssuers::OrgSubdomain,
-    ),
+/// One held-profile row: the `vct` it names and the issuers it permits.
+struct HeldRow {
+    profile: &'static str,
+    vct: &'static str,
+    permitted: PermittedIssuers,
+}
+
+const HELD_PROFILE_ROWS: &[HeldRow] = &[
+    HeldRow {
+        profile: "tinycloud.email-held/v1",
+        vct: "opencredentials.email/v1",
+        permitted: PermittedIssuers::Literal("did:web:issuer.credentials.org"),
+    },
+    HeldRow {
+        profile: "tinycloud.org-membership/v1",
+        vct: "opencredentials.org-membership/v1",
+        permitted: PermittedIssuers::OrgSubdomain,
+    },
+    HeldRow {
+        profile: "tinycloud.org-membership-free/v1",
+        vct: "opencredentials.org-membership/v1",
+        permitted: PermittedIssuers::OrgSubdomain,
+    },
 ];
+
+fn held_row(profile: &str) -> Option<&'static HeldRow> {
+    HELD_PROFILE_ROWS.iter().find(|row| row.profile == profile)
+}
 
 /// Whether the held-profile row for `profile` permits `issuer_did`. `None`
 /// when no held row exists for `profile`, which leaves legacy profiles
 /// unchanged.
 fn held_row_permits(profile: &str, issuer_did: &str) -> Option<bool> {
-    let (_, permitted) = HELD_PROFILE_ROWS
-        .iter()
-        .find(|(row_profile, _)| *row_profile == profile)?;
+    let permitted = held_row(profile)?.permitted;
     Some(match permitted {
-        PermittedIssuers::Literal(did) => issuer_did == *did,
+        PermittedIssuers::Literal(did) => issuer_did == did,
         PermittedIssuers::OrgSubdomain => issuer_did
             .strip_prefix("did:web:o")
             .and_then(|rest| rest.strip_suffix(".orgs.credentials.org"))
@@ -304,6 +316,10 @@ impl IssuerSet {
         vct: &str,
         profile: &str,
     ) -> bool {
+        // Spec §3.3: the requirement's credential type must be the one the profile's row names.
+        if held_row(profile).is_some_and(|row| row.vct != vct) {
+            return false;
+        }
         match kid {
             Some(kid) => self
                 .resolve_pinned_issuer(did, kid)
@@ -566,6 +582,52 @@ mod tests {
         assert!(!set.permits_requirement(DID, Some(&format!("{DID}#other")), vct, profile));
         assert!(!set.permits_requirement(DID, None, "opencredentials.org-membership/v1", profile));
         assert!(!set.permits_requirement(DID, None, vct, "tinycloud.org-membership/v1"));
+        assert!(!set.permits_requirement(
+            DID,
+            Some(&kid),
+            "opencredentials.org-membership/v1",
+            profile
+        ));
+        assert!(!set.permits_requirement(DID, Some(&kid), vct, "tinycloud.org-membership/v1"));
+    }
+
+    #[test]
+    fn registration_membership_requires_the_row_vct_for_the_profile() {
+        // Both vcts are listed, so only the row check can refuse the crossed pair.
+        let mut both = entry(DID, "k", 1);
+        both.vcts = vec![
+            "opencredentials.email/v1".into(),
+            "opencredentials.org-membership/v1".into(),
+        ];
+        let set = IssuerSet::load(&[both]).unwrap();
+        let kid = format!("{DID}#k");
+        let profile = "tinycloud.email-held/v1";
+        assert!(set.permits_requirement(DID, Some(&kid), "opencredentials.email/v1", profile));
+        assert!(set.permits_requirement(DID, None, "opencredentials.email/v1", profile));
+        assert!(!set.permits_requirement(
+            DID,
+            Some(&kid),
+            "opencredentials.org-membership/v1",
+            profile
+        ));
+        assert!(!set.permits_requirement(DID, None, "opencredentials.org-membership/v1", profile));
+    }
+
+    #[test]
+    fn registration_admits_a_free_row_requirement_the_entry_lists() {
+        // Records current behaviour: a requirement naming the free row directly is admitted
+        // when an entry lists it. Spec §3.3 refuses it; the refusal belongs to T10 admittedRows.
+        let did = format!("did:web:o{}.orgs.credentials.org", "a".repeat(26));
+        let mut free = entry(&did, "k", 1);
+        free.vcts = vec!["opencredentials.org-membership/v1".into()];
+        free.profiles = vec!["tinycloud.org-membership-free/v1".into()];
+        let set = IssuerSet::load(&[free]).unwrap();
+        assert!(set.permits_requirement(
+            &did,
+            None,
+            "opencredentials.org-membership/v1",
+            "tinycloud.org-membership-free/v1"
+        ));
     }
 
     #[test]
@@ -987,5 +1049,24 @@ mod tests {
         let mut disabled = key;
         disabled.enabled = false;
         assert!(IssuerSet::from_legacy(&disabled).is_empty());
+    }
+
+    #[test]
+    fn held_row_permits_matches_the_spec_parity_fixture() {
+        // Expected verdicts are derived from the spec §3.3 literal and pattern rules
+        // (email: exact literal; org rows: `^did:web:o[a-z2-7]{26}\.orgs\.credentials\.org$`),
+        // not from this implementation. Fixture: testdata/held_row_parity.tsv.
+        let rows = include_str!("testdata/held_row_parity.tsv");
+        for line in rows.lines().skip(1) {
+            let mut cols = line.split('\t');
+            let profile = cols.next().unwrap();
+            let did = cols.next().unwrap();
+            let want = cols.next().unwrap() == "true";
+            assert_eq!(
+                held_row_permits(profile, did),
+                Some(want),
+                "{profile} {did:?}"
+            );
+        }
     }
 }
