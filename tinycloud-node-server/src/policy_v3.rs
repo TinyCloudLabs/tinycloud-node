@@ -1928,6 +1928,7 @@ pub async fn register_policy(
         &runtime.conn,
         owner_did,
         &policy_root.0.capabilities,
+        &request.policy,
         checked_at,
         None,
         policy_root_expiry,
@@ -1941,6 +1942,14 @@ pub async fn register_policy(
     })?;
     if authority.state == owner_authority::BindingState::Unknown {
         return Err((Status::Forbidden, "policy-owner-not-authorized".into()));
+    }
+    // Design rule 6: a root that outlives its register grant is refused in
+    // both modes; the grant cannot be bound past its own expiry.
+    if authority.register_grant && authority.state == owner_authority::BindingState::BoundUncapped {
+        return Err((
+            Status::Forbidden,
+            "policy-root-outlives-register-grant".into(),
+        ));
     }
     let registered_mode =
         owner_authority::RegisteredMode::current(runtime.owner_authority_expiry());
@@ -5218,6 +5227,21 @@ fn policy_digest_hex(policy: &Value) -> Result<String, (Status, String)> {
     preimage.push(0);
     preimage.extend_from_slice(&canonical_json_value(&Value::Object(unsigned)));
     Ok(hex::encode(Sha256::digest(preimage)))
+}
+
+const REGISTER_TEMPLATE_DOMAIN: &[u8] = b"xyz.tinycloud.policy/RegisterTemplate/v1\0";
+
+/// Template hash `h` for a register grant: domain-separated JCS of the policy
+/// minus the fields that vary per registration (`policyId`, `createdAt`,
+/// `expiresAt`, `signature`). `None` when the policy is not a JSON object.
+fn register_template_digest_hex(policy: &Value) -> Option<String> {
+    let mut unsigned = policy.as_object()?.clone();
+    for key in ["policyId", "createdAt", "expiresAt", "signature"] {
+        unsigned.remove(key);
+    }
+    let mut preimage = REGISTER_TEMPLATE_DOMAIN.to_vec();
+    preimage.extend_from_slice(&canonical_json_value(&Value::Object(unsigned)));
+    Some(hex::encode(Sha256::digest(preimage)))
 }
 
 fn validate_registration_projection(
