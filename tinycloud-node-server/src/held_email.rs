@@ -2420,7 +2420,7 @@ mod tests {
     }
 
     /// Replays the TS differential table, `tests/fixtures/held-email-v1/s1-differential.json`,
-    /// generated from `@tinycloud/sdk` 3.3.0-beta.31 `verifyHeldPresentation`.
+    /// generated from the published `@tinycloud/sdk-core` 3.3.0-beta.37 `held-credentials` verifier.
     #[tokio::test]
     async fn s1_differential_table_matches_ts_verdicts() {
         let table: Value = serde_json::from_str(include_str!(
