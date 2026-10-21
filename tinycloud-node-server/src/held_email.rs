@@ -1363,26 +1363,41 @@ mod tests {
     /// Requirement and policy projection for `validate_held_email_admission`. The projection
     /// pins the digest of the request-local requirement the presenter sends.
     fn held_requirement_and_policy() -> (Value, Value) {
-        let profile = json!({"id": PROFILE, "version": PROFILE_VERSION});
-        let credential_type = json!({"id": VCT, "version": 1});
-        let requirement = json!({
+        let requirement = held_requirement();
+        let policy = policy_for(&requirement);
+        (requirement, policy)
+    }
+
+    fn held_requirement() -> Value {
+        json!({
             "type": "TinyCloudCredentialRequirement",
             "version": 1,
-            "profile": profile,
-            "credentialType": credential_type,
+            "profile": {"id": PROFILE, "version": PROFILE_VERSION},
+            "credentialType": {"id": VCT, "version": 1},
             "claims": {"email": "alice@example.com", "emailDomain": "example.com"},
             "maxAgeSeconds": 31_536_000,
-        });
-        let policy = json!({"credentialRequirement": {
+        })
+    }
+
+    /// The policy projection that binds `requirement` by its digest.
+    fn policy_for(requirement: &Value) -> Value {
+        json!({"credentialRequirement": {
             "type": "TinyCloudPolicyCredentialRequirement",
             "version": 1,
-            "requirementDigest": canonical_digest_base64url(&requirement),
+            "requirementDigest": canonical_digest_base64url(requirement),
             "descriptorDigest": b64url(&sha256(b"held-email-descriptor")),
             "issuerDid": TEST_ISSUER,
             "issuerKid": TEST_KID,
-            "profile": profile,
-            "credentialType": credential_type,
-        }});
+            "profile": requirement["profile"],
+            "credentialType": requirement["credentialType"],
+        }})
+    }
+
+    /// The held requirement with `edit` applied, bound by a digest computed after the edit.
+    fn held_case(edit: impl FnOnce(&mut Value)) -> (Value, Value) {
+        let mut requirement = held_requirement();
+        edit(&mut requirement);
+        let policy = policy_for(&requirement);
         (requirement, policy)
     }
 
@@ -1546,6 +1561,94 @@ mod tests {
         )
         .await
         .expect("locked re-evaluation accepts the spent nonce");
+    }
+
+    #[tokio::test]
+    async fn requirement_for_another_email_is_not_satisfied() {
+        let key = test_key();
+        let (requirement, policy) = held_case(|r| r["claims"]["email"] = json!("bob@example.com"));
+        let presentation = request_for(&credential(&key, default_header(), |_| {}));
+        let conn = conn().await;
+        let runtime = handler_runtime(&conn, &key, true);
+        seed_handler(&conn, &key, &presentation).await;
+        assert_eq!(
+            handler_admit(&runtime, &requirement, &policy, &presentation, CALLER, true).await,
+            Err("credential-requirement-not-satisfied".to_owned())
+        );
+    }
+
+    /// The max age is checked before the nonce is spent, so a refused requirement leaves the
+    /// nonce available for a correct one.
+    #[tokio::test]
+    async fn max_age_other_than_the_pinned_year_is_refused_before_the_nonce_is_spent() {
+        let key = test_key();
+        let (requirement, policy) = held_case(|r| r["maxAgeSeconds"] = json!(60));
+        let presentation = request_for(&credential(&key, default_header(), |_| {}));
+        let conn = conn().await;
+        let runtime = handler_runtime(&conn, &key, true);
+        seed_handler(&conn, &key, &presentation).await;
+        assert_eq!(
+            handler_admit(&runtime, &requirement, &policy, &presentation, CALLER, true).await,
+            Err("credential-requirement-invalid".to_owned())
+        );
+        let (good, good_policy) = held_requirement_and_policy();
+        handler_admit(&runtime, &good, &good_policy, &presentation, CALLER, true)
+            .await
+            .expect("the nonce is still unspent after the refused max age");
+    }
+
+    #[tokio::test]
+    async fn issuer_kid_other_than_the_pinned_kid_is_not_accepted() {
+        let key = test_key();
+        let (requirement, mut policy) = held_requirement_and_policy();
+        policy["credentialRequirement"]["issuerKid"] = json!("other-kid");
+        let presentation = request_for(&credential(&key, default_header(), |_| {}));
+        let conn = conn().await;
+        let runtime = handler_runtime(&conn, &key, true);
+        seed_handler(&conn, &key, &presentation).await;
+        assert_eq!(
+            handler_admit(&runtime, &requirement, &policy, &presentation, CALLER, true).await,
+            Err("issuer-not-accepted".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn upper_case_email_disclosure_is_refused() {
+        let key = test_key();
+        let disclosures = vec![
+            disclosure("upper-salt-email", "email", "Alice@example.com"),
+            disclosure("upper-salt-domain", "emailDomain", "example.com"),
+        ];
+        let sd_jwt = mint(
+            &key,
+            &default_header().to_string(),
+            &default_payload(&disclosures).to_string(),
+            &disclosures,
+        );
+        let presentation = request_for(&sd_jwt);
+        let (requirement, policy) = held_requirement_and_policy();
+        let conn = conn().await;
+        let runtime = handler_runtime(&conn, &key, true);
+        seed_handler(&conn, &key, &presentation).await;
+        assert_eq!(
+            handler_admit(&runtime, &requirement, &policy, &presentation, CALLER, true).await,
+            Err("bad-disclosure".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn credential_type_other_than_the_held_vct_is_a_type_mismatch() {
+        let key = test_key();
+        let (requirement, policy) =
+            held_case(|r| r["credentialType"]["id"] = json!("opencredentials.other/v1"));
+        let presentation = request_for(&credential(&key, default_header(), |_| {}));
+        let conn = conn().await;
+        let runtime = handler_runtime(&conn, &key, true);
+        seed_handler(&conn, &key, &presentation).await;
+        assert_eq!(
+            handler_admit(&runtime, &requirement, &policy, &presentation, CALLER, true).await,
+            Err("credential-type-mismatch".to_owned())
+        );
     }
 
     #[tokio::test]
