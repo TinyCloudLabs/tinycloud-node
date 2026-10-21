@@ -614,6 +614,27 @@ mod tests {
     }
 
     #[test]
+    fn registration_requires_the_entry_to_list_the_row_pair() {
+        // The pair matches its own row, so only the entry's lists can refuse it.
+        let set = IssuerSet::load(&[entry(DID, "k", 1)]).unwrap();
+        let kid = format!("{DID}#k");
+        for kid in [Some(kid.as_str()), None] {
+            assert!(!set.permits_requirement(
+                DID,
+                kid,
+                "opencredentials.org-membership/v1",
+                "tinycloud.org-membership/v1"
+            ));
+            assert!(!set.permits_requirement(
+                DID,
+                kid,
+                "opencredentials.email/v1",
+                "tinycloud.email-proof/v1"
+            ));
+        }
+    }
+
+    #[test]
     fn registration_admits_a_free_row_requirement_the_entry_lists() {
         // Records current behaviour: a requirement naming the free row directly is admitted
         // when an entry lists it. Spec §3.3 refuses it; the refusal belongs to T10 admittedRows.

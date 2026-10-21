@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changes
+
+- Policy registration refuses a requirement whose issuer, pinned `issuerKid`, credential type or profile is not admitted by the configured issuer set, with `403 credential-issuer-untrusted`. The check runs after the owner's authority is proven and before any stored policy is read; it is inert when no issuer set is configured. At load, a configured issuer entry whose `issuerDid` does not match the held row named in its `profiles` now makes the whole issuer set invalid, and the node refuses to load it.
+
 ## [1.21.6] - 2026-10-21
 
 ### Release notes

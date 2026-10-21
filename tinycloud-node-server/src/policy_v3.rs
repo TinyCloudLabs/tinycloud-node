@@ -8632,6 +8632,13 @@ mod tests {
         run_policy_v2_flow(PolicyOwner::SpaceOwner, false).await
     }
 
+    /// An unauthorised owner naming an issuer outside the configured set gets the owner
+    /// refusal. The issuer check runs only after the owner's authority is proven.
+    #[tokio::test]
+    async fn owner_authority_is_checked_before_the_issuer_set() -> anyhow::Result<()> {
+        run_policy_v2_flow(PolicyOwner::Unauthorized, false).await
+    }
+
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum PolicyOwner {
         /// The policy owner is the content space's owner.
@@ -9417,7 +9424,8 @@ mod tests {
         .await;
         let register_status = register_response.status();
         let register_body = register_response.into_string().await.unwrap_or_default();
-        if !issuer_trusted {
+        // An unauthorised owner gets the owner refusal: the issuer check runs only after authority is proven.
+        if !issuer_trusted && policy_owner != PolicyOwner::Unauthorized {
             assert_eq!(
                 register_status,
                 Status::Forbidden,
