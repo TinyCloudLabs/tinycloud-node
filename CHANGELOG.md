@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changes
+
+- Held email credential admission is available behind `[held_credentials]`, off by default. With the flag off, a held presentation is refused before any verifier work. Adds the `held_credential_nonce` table (migration `m20261105_000000_held_credential_nonce`). The migration is forward-only once it has run.
+
 ## [1.21.6] - 2026-10-21
 
 ### Release notes
