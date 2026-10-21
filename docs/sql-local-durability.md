@@ -6,8 +6,8 @@ It adds no migration, no schema change and no new storage.
 
 ## What a request does
 
-A write request runs in one transaction (an outermost `SAVEPOINT`, so a
-`Batch` or an `Execute` with `schema` statements is all-or-nothing):
+A write request runs in one transaction (an outermost `SAVEPOINT`, so every
+write request, whether a single statement, a `Batch` or an `Execute` with `schema` statements, is all-or-nothing):
 
 1. **Limits.** `PRAGMA max_page_count = min(per-database cap, current pages + owner budget / page size)`. SQLite enforces it itself, mid-statement, so the bound is exact. Not applied to the `Forbid` path (budget 0), which keeps its own guard.
 2. The statements run.
@@ -15,13 +15,13 @@ A write request runs in one transaction (an outermost `SAVEPOINT`, so a
    - Owner budget and cap are re-checked against the page growth of the open transaction.
    - Disk: reserve `unspilled WAL bound + page growth * page size` in the node-wide `DiskBudget`. The reservation succeeds only if `free bytes - other in-flight reservations - this reservation >= min_free_bytes`.
 4. `COMMIT` (`RELEASE` of the outermost savepoint). With `synchronous = FULL` the WAL is fsynced before it returns.
-5. The reservation shrinks to the checkpoint growth (the WAL bytes are on disk now) and is released by `SqlService` when the request's outcome is known: after the Postgres save, or its failure.
+5. The reservation shrinks to the checkpoint growth (the WAL bytes are on disk now). The in-flight part ends at COMMIT and is released by `SqlService` when the request's outcome is known; the checkpoint growth stays held until a checkpoint runs or the connection closes.
 
 Any error before COMMIT is a `ROLLBACK` of the whole transaction. Nothing is committed and then reported as failed.
 
 ### Why the disk bound is sound for index, trigger and foreign-key amplification
 
-At COMMIT SQLite appends one WAL frame (`page size + 24` bytes) per dirty page that has not already spilled to the WAL. Dirty pages are a subset of the connection's page cache, so `SQLITE_DBSTATUS_CACHE_USED` (heap bytes of the cache) bounds them, whatever the SQL text or payload was: index entries, the pages of every b-tree touched, freelist, overflow and trigger-written pages are all just pages. A page dirtied twice in a transaction still costs one frame. WAL bytes that already spilled are on disk and already out of the free space the gate reads. The main file grows at the next checkpoint by the transaction's page growth, which is why that term is reserved and held until the save is done.
+At COMMIT SQLite appends one WAL frame (`page size + 24` bytes) per dirty page that has not already spilled to the WAL. Dirty pages are a subset of the connection's page cache, so `SQLITE_DBSTATUS_CACHE_USED` (heap bytes of the cache) bounds them, whatever the SQL text or payload was: index entries, the pages of every b-tree touched, freelist, overflow and trigger-written pages are all just pages. A page dirtied twice in a transaction still costs one frame. WAL bytes that already spilled are on disk and already out of the free space the gate reads. The main file grows at the next checkpoint by the transaction's page growth, which is why that term is reserved and held until a checkpoint runs.
 
 `the_unspilled_wal_bound_covers_what_commit_appends` checks the bound against real commits (1 to 100 000 rows, six indexes, plus an update of half the rows).
 
