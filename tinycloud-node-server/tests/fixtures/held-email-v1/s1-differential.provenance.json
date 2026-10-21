@@ -1,16 +1,24 @@
 {
   "generatedBy": "gen-s1-differential.mjs (committed alongside this file); runs the TS verifier over mutated presentations and writes the cases table",
-  "generatorSha256": "6843644ddc481a67fc0106268c29802e2fd3d6da155b1b67e07678f4089b9b42",
+  "generatorSha256": "09b02ce6d3a05a3ca69f1007a7bdf8e14615a6462f93ca6e3fe6d913c56acfee",
   "package": "@tinycloud/sdk-core",
-  "packageVersion": "3.3.0-beta.31",
+  "packageVersion": "3.3.0-beta.36",
+  "verifierSource": {
+    "repo": "https://github.com/TinyCloudLabs/js-sdk",
+    "pullRequest": "#645",
+    "branch": "skgbafa/tc-1677-email-issuer-literal",
+    "commit": "4ac7592951ae644418077f567a1fe176e0842b2c",
+    "status": "pre-publication (draft PR; no published beta)",
+    "build": "bun install --frozen-lockfile (BUN_INSTALL_CACHE_DIR private, --backend=copyfile); bun run build in packages/sdk-services, then packages/sdk-core"
+  },
   "verifierFile": "dist/held-credentials/index.js",
-  "verifierSha256": "72450604446d20dae4316f281fdf52115f297dd9f4601aee46dee28cc5d23265",
+  "verifierSha256": "04db65be52bafd81629842079b318654dccd8bbba680e9128f202249080dcc65",
   "node": "v22.23.2",
   "cases": 145,
-  "casesSha256": "f1a976b81884ae04f1d8dd08142656572be2f920550b2a2b4f0950560c53b42a",
-  "reproduction": "Re-running the generator yields different SIWE nonces (the SDK's InMemoryNonceStore issues random nonces), so bytes differ. Regenerated TS verdicts match committed verdicts for all 145 cases (0 diffs, names equal). Reviewers check verdict equality, not file hash.",
-  "keyMaterial": "public test vectors only (Anvil account, test issuer did:web:held-test.example)",
-  "specIssuer": "Spec sections 3.3 and 6 allow only did:web:issuer.credentials.org under the email row. This table uses did:web:held-test.example, i.e. pre-TC-1677 TS behaviour. It is NOT spec-aligned.",
-  "regenerationStatus": "BLOCKED: TC-1677 is Backlog with no published sdk-core beta and no pushed js-sdk branch. Regenerate from the TC-1677 build when it lands, then update packageVersion, verifierSha256, cases, casesSha256, and the issuer strings in the generator and table.",
+  "casesSha256": "14ca22e66b370b073939753753ece2d508a3cc2fe18b6e3ff32b774d91945977",
+  "reproduction": "Re-running the generator yields different SIWE nonces (the SDK's InMemoryNonceStore issues random nonces), so bytes differ. Verdicts are compared, not file hashes. Against the prior table (sdk-core 3.3.0-beta.31, issuer did:web:held-test.example), all 145 TS verdict codes are unchanged; the only field difference is the issuer string inside the 11 ok verdicts.",
+  "keyMaterial": "public test vectors only: Anvil account; test issuer did:web:issuer.credentials.org with a fixed-seed Ed25519 test key",
+  "specIssuer": "did:web:issuer.credentials.org (spec sections 3.3 and 6). The table is spec-aligned.",
+  "regenerationStatus": "REGENERATED from js-sdk PR #645 at 4ac7592951ae644418077f567a1fe176e0842b2c (pre-publication). Re-run against the published sdk-core beta once TC-1677 releases, then update packageVersion, verifierSource, verifierSha256, cases, and casesSha256.",
   "consumedBy": "held_email::tests::s1_differential_table_matches_ts_verdicts"
 }

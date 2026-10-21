@@ -16,8 +16,8 @@ const CALLER = "did:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
 const OTHER = "did:pkh:eip155:1:0x1111111111111111111111111111111111111111";
 const HOLDER = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
 const ANVIL_KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
-const ISSUER = "did:web:held-test.example";
-const KID = "did:web:held-test.example#k1";
+const ISSUER = "did:web:issuer.credentials.org";
+const KID = "did:web:issuer.credentials.org#k1";
 const PROFILE = "tinycloud.email-held/v1";
 const VCT = "opencredentials.email/v1";
 const BINDING = "tinycloud.credentials/account-binding/v1";
@@ -210,9 +210,9 @@ add("hdr-kid-bad-char", { jwt: { header: { ...baseHeader, kid: `${ISSUER}#k 1` }
 add("hdr-kid-empty-frag", { jwt: { header: { ...baseHeader, kid: `${ISSUER}#` } } });
 add("hdr-kid-number", { jwt: { header: { ...baseHeader, kid: 7 } } });
 add("hdr-kid-pkh", { jwt: { header: { ...baseHeader, kid: "did:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266#k1" } } });
-add("hdr-kid-did-method-uppercase", { jwt: { header: { ...baseHeader, kid: "did:WEB:held-test.example#k1" } } });
+add("hdr-kid-did-method-uppercase", { jwt: { header: { ...baseHeader, kid: "did:WEB:issuer.credentials.org#k1" } } });
 add("hdr-kid-empty-did-id", { jwt: { header: { ...baseHeader, kid: "did:web:#k1" } } });
-add("hdr-kid-no-method", { jwt: { header: { ...baseHeader, kid: "held-test.example#k1" } } });
+add("hdr-kid-no-method", { jwt: { header: { ...baseHeader, kid: "issuer.credentials.org#k1" } } });
 add("hdr-array", { jwt: { header: "[1,2]" } });
 add("hdr-dup-key", { jwt: { header: '{"alg":"EdDSA","alg":"EdDSA","typ":"vc+sd-jwt","kid":"' + KID + '"}' } });
 add("hdr-not-json", { jwt: { header: "not json" } });
@@ -327,11 +327,11 @@ add("time-now-at-exp", { now: new Date((IAT + 30 * DAY) * 1000).toISOString() })
 add("time-now-after-exp", { now: new Date((IAT + 31 * DAY) * 1000).toISOString() });
 
 // issuer set / policy
-add("iss-kid-not-accepted", { acceptedIssuers: [{ issuerDid: ISSUER, kid: "did:web:held-test.example#k2" }] });
+add("iss-kid-not-accepted", { acceptedIssuers: [{ issuerDid: ISSUER, kid: "did:web:issuer.credentials.org#k2" }] });
 add("iss-did-not-accepted", { acceptedIssuers: [{ issuerDid: "did:web:other.example" }] });
 add("iss-no-accepted", { acceptedIssuers: [] });
 add("iss-kid-accepted-exact", { acceptedIssuers: [{ issuerDid: ISSUER, kid: KID }] });
-add("iss-entry-missing-kid", { issuers: [issuerConfig({ kid: "did:web:held-test.example#k2" })] });
+add("iss-entry-missing-kid", { issuers: [issuerConfig({ kid: "did:web:issuer.credentials.org#k2" })] });
 add("iss-not-yet-valid-key", { issuers: [issuerConfig({ notBefore: "2026-01-01T02:00:00Z" })] });
 add("iss-key-stopped", { issuers: [issuerConfig({ notAfter: "2026-01-01T00:30:00Z" })] });
 add("iss-credential-predates-key", { issuers: [issuerConfig({ notBefore: "2026-01-01T00:00:01Z" })] });
