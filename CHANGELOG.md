@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [1.21.6] - 2026-10-21
+
+### Release notes
+
+- **SQL schema statements use `tinycloud.sql/schema`.** `CREATE`, `ALTER` and `DROP` of tables, views and indexes are run with a schema-conferring ability (`sql/schema`, `sql/admin` or `sql/*`); `tinycloud.sql/write` covers data statements (`INSERT`, `UPDATE`, `DELETE`, `SELECT`). Clients that hold both `write` and `schema`, as the SDK does for `execute({ schema })` and for migrations (since 2.5.0), work as before. The setting `[global.storage.sql] ddl_requires_schema` takes `enforce` (the default), `log` or `off`. Details: TC-1581.
+- **Statements with an `INSERT` or `UPDATE` inside a `WITH`** are write statements: they are quota-gated, publish write events and are persisted. Details: TC-1585.
+- **`sql/admin` PRAGMAs** are an allow-list (schema reports, `user_version`, `application_id`, the check pragmas and read-only reports), and the connection returns to its opening state after a request that ran one. Details: TC-1586.
+- **Authorization graph in one SQL round trip** on PostgreSQL, SQLite and MySQL; authorization decisions are unchanged. Details: TC-735.
+- No database migrations. Rollback is the 1.21.5 image, with no database step.
+
 ### Changes
 
 - Load each invocation's authorization graph in one SQL round trip on PostgreSQL, SQLite and MySQL rather than four. Revocations in that statement resolve through the persisted CID-alias index exactly like `revocation::effective_rows`, so a delegation revoked under another accepted encoding is still refused (TC-1071). Bound metadata lookups to 65 nodes for indexed access on large tables while the unchanged 64-node authorization limit still denies oversized chains. Sort abilities by `(resource, ability)` on every backend; authorization decisions are unchanged, but the diagnostic reason when multiple caveats all reject may normalize. No schema change (TC-735).
