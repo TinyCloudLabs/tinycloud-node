@@ -11243,3 +11243,7 @@ mod root_revocation_tests;
 #[cfg(test)]
 #[path = "policy_v3/held_route_tests.rs"]
 mod held_route_tests;
+
+#[cfg(test)]
+#[path = "policy_v3/held_fixtures.rs"]
+mod held_fixtures;
