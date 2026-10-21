@@ -75,21 +75,44 @@ pub enum ReservationRefused {
     Unknown,
 }
 
+/// What one database holds of the [`DiskBudget`].
+#[derive(Debug, Default, Clone, Copy)]
+struct Held {
+    /// The WAL bytes of the write in flight and the checkpoint growth it
+    /// causes; released when the request's outcome is known.
+    inflight: u64,
+    /// The growth of the main file the next checkpoint will cause: pages
+    /// committed since the last one, which are in the WAL until then. Held
+    /// until a checkpoint runs or the database's connection closes, because
+    /// the disk does not have those bytes until then and nothing else pays for
+    /// them (the save to Postgres ships the WAL, not a checkpoint, while the
+    /// WAL is small).
+    pending: u64,
+}
+
+impl Held {
+    fn total(self) -> u64 {
+        self.inflight.saturating_add(self.pending)
+    }
+}
+
 /// The disk bytes in-flight writes of every database on this node still need.
 /// One per node, shared by all actors, so two databases cannot each take the
 /// same free bytes.
 #[derive(Debug, Default)]
 pub struct DiskBudget {
-    held: Mutex<HashMap<String, u64>>,
+    held: Mutex<HashMap<String, Held>>,
 }
 
 impl DiskBudget {
-    /// Set `key`'s reservation to `bytes` if the disk can still hold it next
-    /// to everyone else's. Leaves the old reservation when refusing.
+    /// Set `key`'s reservation to `inflight` bytes for the write in flight and
+    /// `pending` bytes of checkpoint growth, if the disk can still hold both
+    /// next to everyone else's. Leaves the old reservation when refusing.
     pub fn reserve(
         &self,
         key: &str,
-        bytes: u64,
+        inflight: u64,
+        pending: u64,
         free_space: &dyn FreeSpace,
         dir: &Path,
         min_free_bytes: u64,
@@ -98,31 +121,54 @@ impl DiskBudget {
         let others: u64 = held
             .iter()
             .filter(|(other, _)| other.as_str() != key)
-            .map(|(_, bytes)| *bytes)
+            .map(|(_, held)| held.total())
             .fold(0, u64::saturating_add);
         let free = free_space
             .free_bytes(dir)
             .map_err(|_| ReservationRefused::Unknown)?;
-        let needed = others.saturating_add(bytes).saturating_add(min_free_bytes);
+        let needed = others
+            .saturating_add(inflight)
+            .saturating_add(pending)
+            .saturating_add(min_free_bytes);
         if free < needed {
             return Err(ReservationRefused::Headroom);
         }
-        held.insert(key.to_string(), bytes);
+        held.insert(key.to_string(), Held { inflight, pending });
         Ok(())
     }
 
-    /// Keep `bytes` held for `key` without a free-space check: the commit is
-    /// done and its bytes are on disk.
-    pub fn hold(&self, key: &str, bytes: u64) {
+    /// The write is committed: its WAL bytes are on disk. Keep `pending` bytes
+    /// of checkpoint growth held, without a free-space check.
+    pub fn hold(&self, key: &str, pending: u64) {
         let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
-        if bytes == 0 {
+        if pending == 0 {
             held.remove(key);
         } else {
-            held.insert(key.to_string(), bytes);
+            held.insert(
+                key.to_string(),
+                Held {
+                    inflight: 0,
+                    pending,
+                },
+            );
         }
     }
 
+    /// The write in flight is over (refused, failed or saved): drop what it
+    /// reserved. The checkpoint growth of commits that stay is still held.
     pub fn release(&self, key: &str) {
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = held.get_mut(key) {
+            entry.inflight = 0;
+            if entry.pending == 0 {
+                held.remove(key);
+            }
+        }
+    }
+
+    /// Drop everything held for `key`: a checkpoint has run, or the
+    /// database's connection is gone, and what is on disk is on disk.
+    pub fn forget(&self, key: &str) {
         self.held
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -136,21 +182,22 @@ impl DiskBudget {
             .unwrap_or_else(|e| e.into_inner())
             .iter()
             .filter(|(other, _)| other.as_str() != key)
-            .map(|(_, bytes)| *bytes)
+            .map(|(_, held)| held.total())
             .fold(0, u64::saturating_add)
     }
 
-    /// Bytes currently reserved by all in-flight writes.
+    /// Bytes currently reserved by all databases.
     pub fn reserved(&self) -> u64 {
         self.held
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .values()
-            .fold(0, |sum, bytes| sum.saturating_add(*bytes))
+            .fold(0, |sum, held| sum.saturating_add(held.total()))
     }
 }
 
-/// Releases a database's reservation when the request's outcome is known.
+/// Releases a database's in-flight reservation when the request's outcome is
+/// known.
 pub struct ReservationGuard {
     budget: Arc<DiskBudget>,
     key: String,
@@ -165,6 +212,52 @@ impl ReservationGuard {
 impl Drop for ReservationGuard {
     fn drop(&mut self) {
         self.budget.release(&self.key);
+    }
+}
+
+/// Forgets everything a database holds of the [`DiskBudget`] when its actor
+/// ends, however it ends.
+pub struct HeldGuard {
+    budget: Arc<DiskBudget>,
+    key: String,
+}
+
+impl HeldGuard {
+    pub fn new(budget: Arc<DiskBudget>, key: String) -> Self {
+        Self { budget, key }
+    }
+}
+
+impl Drop for HeldGuard {
+    fn drop(&mut self) {
+        self.budget.forget(&self.key);
+    }
+}
+
+/// Whether the main database has a write transaction open on a connection,
+/// asked of SQLite itself (`sqlite3_txn_state`). A request that never took one
+/// wrote nothing: it needs no room on the disk and nothing to reserve. It is
+/// set by the first statement that writes (an `UPDATE` that matches no row
+/// included) and stays until the transaction ends.
+pub struct WriteProbe(*mut rusqlite::ffi::sqlite3);
+
+// SAFETY: a probe is only used while the connection it was made from is alive
+// and on the thread that runs the request (SQLite calls the progress handler on
+// the thread running the statement), and `sqlite3_txn_state` only reads the
+// connection's own state.
+unsafe impl Send for WriteProbe {}
+
+impl WriteProbe {
+    pub fn of(conn: &Connection) -> Self {
+        // SAFETY: the pointer is only dereferenced by SQLite, through
+        // `writing`, while `conn` is alive (see the `Send` note above).
+        Self(unsafe { conn.handle() })
+    }
+
+    pub fn writing(&self) -> bool {
+        // SAFETY: see `WriteProbe::of`; "main" is a NUL-terminated literal.
+        let state = unsafe { rusqlite::ffi::sqlite3_txn_state(self.0, c"main".as_ptr()) };
+        state == rusqlite::ffi::SQLITE_TXN_WRITE
     }
 }
 

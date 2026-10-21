@@ -4642,6 +4642,67 @@ mod tests {
         assert_eq!(service.durability.budget.reserved(), 0);
     }
 
+    /// TC-1491: with the disk headroom check on, a successful write holds
+    /// nothing once its save is done, except the growth the next checkpoint
+    /// will cause. A save of a small WAL ships the WAL and does not
+    /// checkpoint, so that growth stays held until a checkpoint runs.
+    #[tokio::test]
+    async fn tc1491_a_saved_write_holds_only_its_pending_checkpoint_growth() {
+        let cache = TempDir::new().unwrap();
+        let durability = crate::sql::durability::DurabilityPolicy {
+            min_free_bytes: 1,
+            ..Default::default()
+        };
+        let service = SqlService::new(
+            cache.path().to_string_lossy().into_owned(),
+            0,
+            artifact_repository().await,
+        )
+        .with_durability(durability);
+        let space = test_space_id("sql-reservation-pending");
+        let write = |sql: &str| {
+            service.execute_with_budget(
+                &space,
+                "main",
+                SqlRequest::Execute {
+                    schema: None,
+                    sql: sql.to_string(),
+                    params: Vec::new(),
+                },
+                None,
+                "tinycloud.sql/admin".into(),
+                1 << 30,
+            )
+        };
+        let budget = &service.durability.budget;
+
+        write("CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB)")
+            .await
+            .unwrap();
+        assert_eq!(budget.reserved(), 0);
+
+        // Saved as a WAL delta: no checkpoint, so the growth is still held.
+        write("INSERT INTO t (v) VALUES (zeroblob(400000))")
+            .await
+            .unwrap();
+        let held = budget.reserved();
+        assert!(held >= 390_000, "held {held}");
+        write("INSERT INTO t (v) VALUES (zeroblob(10))")
+            .await
+            .unwrap();
+        assert!(budget.reserved() >= 390_000);
+
+        // A checkpoint puts it on the disk; a write that adds no page then
+        // leaves nothing held after its save.
+        let handle = service.handle(&space, "main").await.unwrap();
+        handle.checkpoint().await.unwrap();
+        assert_eq!(budget.reserved(), 0);
+        write("INSERT INTO t (v) VALUES (zeroblob(10))")
+            .await
+            .unwrap();
+        assert_eq!(budget.reserved(), 0);
+    }
+
     /// TC-1491 + TC-1585: a `WITH … INSERT` is a write, so in a batch it is
     /// one of the statements that must be kept or undone with the rest. A
     /// later failure leaves nothing of it locally, writes nothing to Postgres,

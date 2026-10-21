@@ -6,7 +6,7 @@
 //! SQL query time.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -19,7 +19,10 @@ use super::{
     authority::{record_ddl_without_schema, SqlAuthority},
     authorizer::{PragmaTracker, StatementScope},
     caveats::SqlCaveats,
-    durability::{cache_used_bytes, unspilled_wal_bound, DurabilityPolicy, ReservationRefused},
+    durability::{
+        cache_used_bytes, unspilled_wal_bound, DurabilityPolicy, HeldGuard, ReservationRefused,
+        WriteProbe,
+    },
     parser,
     storage::{self, StorageMode},
     types::*,
@@ -248,6 +251,11 @@ pub fn spawn_actor_with_policy(
             connection
         };
 
+        // What this database holds of the disk budget is dropped when its
+        // connection is gone, however the actor ends.
+        let key = format!("{space_id}/{db_name}");
+        let held_guard = HeldGuard::new(policy.budget.clone(), key.clone());
+
         let shutdown_response = loop {
             // Block on receiving with timeout
             let (context, msg) =
@@ -286,7 +294,6 @@ pub fn spawn_actor_with_policy(
                     response_tx,
                 } => {
                     let pragmas = PragmaTracker::default();
-                    let key = format!("{space_id}/{db_name}");
                     let ctx = WriteContext {
                         policy: &policy,
                         key: &key,
@@ -296,6 +303,7 @@ pub fn spawn_actor_with_policy(
                             GrowthPolicy::Budget(remaining) => Some(remaining),
                             _ => None,
                         },
+                        file: &file_path,
                     };
                     let result = match growth {
                         GrowthPolicy::Allow | GrowthPolicy::Budget(_) => handle_message_ctx(
@@ -351,6 +359,7 @@ pub fn spawn_actor_with_policy(
                                     policy.budget.reserve(
                                         &key,
                                         size,
+                                        0,
                                         policy.free_space.as_ref(),
                                         existing_ancestor(&file_path),
                                         policy.min_free_bytes,
@@ -392,6 +401,11 @@ pub fn spawn_actor_with_policy(
                 }
                 DbMessage::Checkpoint { response_tx } => {
                     let result = handle_checkpoint(&conn, &mode, &file_path);
+                    if result.is_ok() {
+                        // The WAL is in the main file now: its growth is on
+                        // the disk and no longer pending.
+                        policy.budget.forget(&key);
+                    }
                     let _ = response_tx.send(result);
                 }
                 DbMessage::Wal { response_tx } => {
@@ -404,6 +418,7 @@ pub fn spawn_actor_with_policy(
         // SQLite can checkpoint its WAL on close. Finish that before removing
         // the registry entry or allowing a service to replace the local files.
         drop(conn);
+        drop(held_guard);
 
         // Deregister only OUR OWN entry. A replacement actor may already have
         // been hydrated and registered for this key (the dead-actor respawn in
@@ -497,7 +512,10 @@ fn handle_checkpoint(
 
 const GUARD_BEGIN: &str = "SAVEPOINT tinycloud_storage_guard";
 const GUARD_KEEP: &str = "RELEASE tinycloud_storage_guard";
-const GUARD_UNDO: &str = "ROLLBACK TO tinycloud_storage_guard; RELEASE tinycloud_storage_guard";
+/// The guard's savepoint is the outermost transaction, so undoing the request
+/// is a ROLLBACK: it writes nothing, where `ROLLBACK TO` + `RELEASE` would
+/// commit an empty write transaction (a WAL frame for the header).
+const GUARD_UNDO: &str = "ROLLBACK";
 
 /// Run `request` inside a savepoint and keep its effects only if the
 /// database did not grow (`PRAGMA page_count` reflects uncommitted pages on
@@ -525,19 +543,22 @@ fn handle_message_without_growth_ctx(
         return result;
     }
     let grew = page_count(conn).map(|after| after > before);
-    // The disk check before COMMIT, for a request that is about to be kept.
+    // The disk check before COMMIT, for a request that is about to be kept
+    // and has written something. `Some` is what stays held afterwards.
     let gate = match (&result, &grew) {
-        (Ok(_), Ok(false)) => baseline(conn).and_then(|base| {
-            precommit_gate(
-                conn,
-                ctx,
-                &Baseline {
-                    pages: u64::try_from(before).unwrap_or(0),
-                    page_size: base.page_size,
-                },
-            )
-        }),
-        _ => Ok(()),
+        (Ok(_), Ok(false)) if WriteProbe::of(conn).writing() => baseline(conn)
+            .and_then(|base| {
+                precommit_gate(
+                    conn,
+                    ctx,
+                    &Baseline {
+                        pages: u64::try_from(before).unwrap_or(0),
+                        page_size: base.page_size,
+                    },
+                )
+            })
+            .map(Some),
+        _ => Ok(None),
     };
     let end = match grew {
         Ok(false) if result.is_ok() && gate.is_ok() => GUARD_KEEP,
@@ -563,15 +584,20 @@ fn handle_message_without_growth_ctx(
         ctx.policy.budget.release(ctx.key);
         return Err(commit_error(&error));
     }
-    if let Err(error) = gate {
-        ctx.policy.budget.release(ctx.key);
-        return Err(error);
-    }
+    let held = match gate {
+        Ok(held) => held,
+        Err(error) => {
+            ctx.policy.budget.release(ctx.key);
+            return Err(error);
+        }
+    };
     match grew? {
         false => {
             seam(&ctx.policy.seams.after_commit);
-            // Growth is zero here; the WAL bytes are on disk.
-            ctx.policy.budget.hold(ctx.key, 0);
+            // The WAL bytes are on disk; the checkpoint growth is what stays.
+            if let Some(pending) = held {
+                ctx.policy.budget.hold(ctx.key, pending);
+            }
             result
         }
         true => Err(SqlError::StorageWouldGrow),
@@ -599,6 +625,7 @@ fn handle_message(
         dir: Path::new("."),
         file_backed: false,
         remaining: None,
+        file: Path::new(""),
     };
     handle_message_ctx(
         conn,
@@ -624,6 +651,7 @@ fn handle_message_without_growth(
         dir: Path::new("."),
         file_backed: false,
         remaining: None,
+        file: Path::new(""),
     };
     handle_message_without_growth_ctx(
         conn,
@@ -641,6 +669,11 @@ const REQUEST_KEEP: &str = "RELEASE tinycloud_request";
 const UNLIMITED_PAGES: u64 = 4_294_967_294;
 /// Opcodes between the disk checks of a running statement.
 const PROGRESS_INTERVAL_OPS: std::os::raw::c_int = 10_000;
+/// What the progress handler saw: the disk below its floor, or free space it
+/// could not read.
+const TRIPPED_NONE: u8 = 0;
+const TRIPPED_EXHAUSTED: u8 = 1;
+const TRIPPED_UNKNOWN: u8 = 2;
 
 /// What a write request needs to be bounded before it commits (TC-1491).
 struct WriteContext<'a> {
@@ -654,6 +687,8 @@ struct WriteContext<'a> {
     /// Bytes the owner's storage budget still allows this database to grow
     /// by, or `None` for no budget.
     remaining: Option<u64>,
+    /// The database's main file (it may not exist yet).
+    file: &'a Path,
 }
 
 /// The state a request starts from.
@@ -703,28 +738,41 @@ fn is_full_error(error: &SqlError) -> bool {
     matches!(error, SqlError::Sqlite(m) | SqlError::SchemaError(m) if m.contains("database or disk is full"))
 }
 
+/// A disk with fewer free bytes than this many database pages cannot take
+/// another write. Below it, a `SQLITE_FULL` is the disk's (ENOSPC) whatever
+/// the headroom setting: a fixed, small floor, so that no configuration is
+/// needed for a full disk to be reported as one.
+const DISK_FULL_FLOOR_PAGES: u64 = 16;
+
 /// What a `SQLITE_FULL` means: the size limit SQLite enforces (`max_page_count`)
 /// or the disk itself (ENOSPC). The page count cannot tell them apart, since
 /// SQLite has already undone the failed statement by the time it is read; the
-/// free-space reading can: a disk below its floor is the disk.
-fn classify_full(ctx: &WriteContext<'_>, budget_binding: bool) -> SqlError {
+/// free-space reading can, and it is read here whatever `min_free_bytes` is
+/// (one `statvfs`, on this error path only): less than [`DISK_FULL_FLOOR_PAGES`]
+/// pages free, or less than the headroom floor next to what other writes
+/// reserved, is the disk. A full disk is never reported as the owner's quota
+/// or the database's size limit.
+fn classify_full(ctx: &WriteContext<'_>, baseline: &Baseline, budget_binding: bool) -> SqlError {
     if ctx.policy.max_database_bytes == 0 && !budget_binding {
         // No limit of ours can have fired, so the disk really is full.
         return SqlError::DiskHeadroom;
     }
+    let min_free = ctx.policy.min_free_bytes;
     let disk_exhausted = ctx.file_backed
-        && ctx.policy.min_free_bytes > 0
-        && ctx
-            .policy
-            .free_space
-            .free_bytes(ctx.dir)
-            .map_or(true, |free| {
-                free < ctx
-                    .policy
-                    .budget
-                    .reserved_excluding(ctx.key)
-                    .saturating_add(ctx.policy.min_free_bytes)
-            });
+        && match ctx.policy.free_space.free_bytes(ctx.dir) {
+            Ok(free) => {
+                free < DISK_FULL_FLOOR_PAGES.saturating_mul(baseline.page_size)
+                    || (min_free > 0
+                        && free
+                            < ctx
+                                .policy
+                                .budget
+                                .reserved_excluding(ctx.key)
+                                .saturating_add(min_free))
+            }
+            // Unreadable: with the headroom check on, refuse like the gate does.
+            Err(_) => min_free > 0,
+        };
     match (disk_exhausted, budget_binding) {
         (true, _) => SqlError::DiskHeadroom,
         (false, true) => SqlError::StorageWouldGrow,
@@ -732,20 +780,42 @@ fn classify_full(ctx: &WriteContext<'_>, budget_binding: bool) -> SqlError {
     }
 }
 
-/// The last check before COMMIT. Rolling back on an error is the caller's.
+/// Free space could not be read: the headroom check cannot answer, so the
+/// request is refused. One error for every place that reads it.
+fn free_space_unreadable() -> SqlError {
+    SqlError::Internal("could not read the free disk space".into())
+}
+
+/// Bytes the next checkpoint will grow the main file by: the pages the
+/// database has beyond the file's own size, all of them committed since the
+/// last checkpoint and held in the WAL until then. Read from the file, so it
+/// needs no state of its own and counts every earlier commit, not only this
+/// request's.
+fn pending_checkpoint_bytes(ctx: &WriteContext<'_>, pages: u64, page_size: u64) -> u64 {
+    let file_pages = std::fs::metadata(ctx.file)
+        .map(|meta| meta.len() / page_size.max(1))
+        .unwrap_or(pages);
+    pages.saturating_sub(file_pages).saturating_mul(page_size)
+}
+
+/// The last check before COMMIT, for a request that has written. Rolling back
+/// on an error is the caller's. On success, returns the bytes of checkpoint
+/// growth to keep held once the commit is done (the rest of the reservation
+/// ends with the commit).
 ///
 /// The disk bound: the pages COMMIT still writes to the WAL are the dirty
 /// pages that have not spilled yet, and those are all in the connection's
 /// page cache, so `cache_used` bounds them whatever the SQL payload was
 /// (index, trigger and foreign-key writes, freelist and overflow pages are
-/// all just pages). A later checkpoint grows the main file by the page growth
-/// of the request. WAL bytes already spilled are on disk and already out of
-/// the free space the check reads.
+/// all just pages). A later checkpoint grows the main file by every page
+/// committed since the last one ([`pending_checkpoint_bytes`]), which is held
+/// until a checkpoint runs. WAL bytes already spilled are on disk and already
+/// out of the free space the check reads.
 fn precommit_gate(
     conn: &rusqlite::Connection,
     ctx: &WriteContext<'_>,
     baseline: &Baseline,
-) -> Result<(), SqlError> {
+) -> Result<u64, SqlError> {
     let now = pragma_u64(conn, "page_count")?;
     let growth_pages = now.saturating_sub(baseline.pages);
     let growth_bytes = growth_pages.saturating_mul(baseline.page_size);
@@ -762,21 +832,21 @@ fn precommit_gate(
         return Err(SqlError::DatabaseSizeLimit);
     }
     if !ctx.file_backed || ctx.policy.min_free_bytes == 0 {
-        return Ok(());
+        return Ok(0);
     }
     let wal_bound = unspilled_wal_bound(cache_used_bytes(conn), baseline.page_size);
+    let pending = pending_checkpoint_bytes(ctx, now, baseline.page_size);
     match ctx.policy.budget.reserve(
         ctx.key,
-        wal_bound.saturating_add(growth_bytes),
+        wal_bound,
+        pending,
         ctx.policy.free_space.as_ref(),
         ctx.dir,
         ctx.policy.min_free_bytes,
     ) {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(pending),
         Err(ReservationRefused::Headroom) => Err(SqlError::DiskHeadroom),
-        Err(ReservationRefused::Unknown) => Err(SqlError::Internal(
-            "could not read the free disk space".into(),
-        )),
+        Err(ReservationRefused::Unknown) => Err(free_space_unreadable()),
     }
 }
 
@@ -887,22 +957,30 @@ fn handle_message_ctx(
     }
     let base = baseline(conn)?;
     set_max_pages(conn, page_limit(ctx, &base).0)?;
-    let tripped = Arc::new(AtomicBool::new(false));
+    let tripped = Arc::new(AtomicU8::new(TRIPPED_NONE));
     let disk_checked = ctx.file_backed && ctx.policy.min_free_bytes > 0;
     if disk_checked {
         let (budget, free_space) = (ctx.policy.budget.clone(), ctx.policy.free_space.clone());
         let (key, dir) = (ctx.key.to_string(), ctx.dir.to_path_buf());
         let (min_free, tripped) = (ctx.policy.min_free_bytes, tripped.clone());
+        let probe = WriteProbe::of(conn);
         // Stops a statement early once the disk is already too full; the
-        // authoritative check is `precommit_gate`.
+        // authoritative check is `precommit_gate`. A transaction that has
+        // written nothing yet needs no room, so reads are never stopped.
         conn.progress_handler(
             PROGRESS_INTERVAL_OPS,
             Some(move || {
-                let free = free_space.free_bytes(&dir).unwrap_or(0);
+                if !probe.writing() {
+                    return false;
+                }
+                let Ok(free) = free_space.free_bytes(&dir) else {
+                    tripped.store(TRIPPED_UNKNOWN, Ordering::Relaxed);
+                    return true;
+                };
                 let others = budget.reserved_excluding(&key);
                 let exhausted = free < others.saturating_add(min_free);
                 if exhausted {
-                    tripped.store(true, Ordering::Relaxed);
+                    tripped.store(TRIPPED_EXHAUSTED, Ordering::Relaxed);
                 }
                 exhausted
             }),
@@ -912,30 +990,29 @@ fn handle_message_ctx(
     if disk_checked {
         conn.progress_handler(0, None::<fn() -> bool>);
     }
-    let outcome = outcome.map_err(|error| {
-        if tripped.load(Ordering::Relaxed) {
-            SqlError::DiskHeadroom
-        } else {
-            error
-        }
+    let outcome = outcome.map_err(|error| match tripped.load(Ordering::Relaxed) {
+        TRIPPED_EXHAUSTED => SqlError::DiskHeadroom,
+        TRIPPED_UNKNOWN => free_space_unreadable(),
+        _ => error,
     });
     // A failed request keeps nothing, so nothing of it stays reserved.
     if outcome.is_err() {
         ctx.policy.budget.release(ctx.key);
     }
     let _ = set_max_pages(conn, UNLIMITED_PAGES);
-    outcome.map(|(result, growth_bytes)| {
-        // Committed: its WAL bytes are on disk now. What stays held, until the
-        // request's outcome is known (the Postgres save), is the checkpoint
-        // growth.
-        ctx.policy
-            .budget
-            .hold(ctx.key, if disk_checked { growth_bytes } else { 0 });
+    outcome.map(|(result, held)| {
+        // Committed: its WAL bytes are on disk now. What stays held, until a
+        // checkpoint runs, is the checkpoint growth. A request that wrote
+        // nothing changes nothing here.
+        if let Some(pending) = held {
+            ctx.policy.budget.hold(ctx.key, pending);
+        }
         result
     })
 }
 
-/// The transaction itself; on `Err` it has been rolled back.
+/// The transaction itself; on `Err` it has been rolled back. On success, the
+/// checkpoint growth to keep held, if the request wrote anything.
 fn run_transaction(
     conn: &rusqlite::Connection,
     request: &SqlRequest,
@@ -944,7 +1021,7 @@ fn run_transaction(
     pragmas: &PragmaTracker,
     ctx: &WriteContext<'_>,
     base: &Baseline,
-) -> Result<(SqlExecutionResult, u64), SqlError> {
+) -> Result<(SqlExecutionResult, Option<u64>), SqlError> {
     {
         let _timer = QueryTimer::new();
         conn.execute_batch(REQUEST_BEGIN)
@@ -955,14 +1032,22 @@ fn run_transaction(
     conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
     // The error is surfaced before the rollback so the caller can still read
     // the uncommitted page count to tell a size limit from a full disk.
-    let result = result.and_then(|ok| precommit_gate(conn, ctx, base).map(|()| ok));
-    let result = match result {
+    // A request that took no write transaction (reads only, in a batch or an
+    // `execute`) wrote nothing: there is nothing to check, reserve or hold.
+    let result = result.and_then(|ok| {
+        if WriteProbe::of(conn).writing() {
+            precommit_gate(conn, ctx, base).map(|pending| (ok, Some(pending)))
+        } else {
+            Ok((ok, None))
+        }
+    });
+    let (result, held) = match result {
         Ok(ok) => ok,
         Err(error) => {
             // SQLite can already have undone the transaction (ROLLBACK
             // conflict handling); there is then nothing left to undo.
             let full = is_full_error(&error);
-            let classified = full.then(|| classify_full(ctx, page_limit(ctx, base).1));
+            let classified = full.then(|| classify_full(ctx, base, page_limit(ctx, base).1));
             if !conn.is_autocommit() {
                 // A failure rolls the whole transaction back. `ROLLBACK TO` +
                 // `RELEASE` would instead commit an empty write transaction
@@ -973,10 +1058,6 @@ fn run_transaction(
             return Err(classified.unwrap_or(error));
         }
     };
-    let growth_bytes = pragma_u64(conn, "page_count")
-        .unwrap_or(base.pages)
-        .saturating_sub(base.pages)
-        .saturating_mul(base.page_size);
     seam(&ctx.policy.seams.before_commit);
     // RELEASE of the outermost savepoint is the COMMIT.
     let commit = {
@@ -991,7 +1072,7 @@ fn run_transaction(
         return Err(commit_error(&error));
     }
     seam(&ctx.policy.seams.after_commit);
-    Ok((result, growth_bytes))
+    Ok((result, held))
 }
 
 /// COMMIT failed. A deferred constraint is the request's own fault; anything
@@ -1994,16 +2075,10 @@ mod publication_rollback_tests {
 
                 assert_eq!(scalar(&actor, "SELECT count(*) FROM t").await, "1");
                 assert_eq!(scalar(&actor, "SELECT v FROM t").await, "keep");
-                // The `Forbid` guard predates this change and ends a rejected
-                // request with ROLLBACK TO + RELEASE, which commits an empty
-                // transaction and bumps the header's change counter; its
-                // content is checked above, its bytes only for `Allow`.
-                if growth == GrowthPolicy::Allow {
-                    assert!(
-                        actor.checkpoint().await.unwrap() == before,
-                        "a rejected batch must not change a single byte of the checkpoint"
-                    );
-                }
+                assert!(
+                    actor.checkpoint().await.unwrap() == before,
+                    "a rejected batch must not change a single byte of the checkpoint"
+                );
             }
         }
     }
@@ -2388,6 +2463,7 @@ mod ddl_authority_tests {
             dir: Path::new("."),
             file_backed: false,
             remaining: None,
+            file: Path::new(""),
         };
         handle_message_ctx(
             conn,

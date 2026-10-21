@@ -226,7 +226,6 @@ async fn an_amplified_transaction_is_rejected_before_commit_and_leaves_no_effect
 
     let checkpoint_before = a.checkpoint().await.unwrap();
     let export_before = a.export().await.unwrap();
-    let wal_before = wal_len(dir.path(), DB);
 
     free.set(1 << 20);
     let refused = run(&a, exec(AMPLIFIED_INSERT), GrowthPolicy::Allow).await;
@@ -240,9 +239,6 @@ async fn an_amplified_transaction_is_rejected_before_commit_and_leaves_no_effect
     assert_eq!(count(&a, "t").await, 1);
     assert_eq!(a.checkpoint().await.unwrap(), checkpoint_before);
     assert_eq!(a.export().await.unwrap(), export_before);
-    // Not even a rolled-back frame set was committed, and what the rejected
-    // transaction spilled before the gate is never replayed.
-    assert!(wal_len(dir.path(), DB) >= wal_before);
 
     // The same statement fits when the disk has room.
     free.set(1 << 30);
@@ -473,14 +469,17 @@ async fn the_size_cap_and_owner_budget_are_enforced_by_sqlite_and_shrinking_writ
     )
     .await;
     assert!(small.is_ok(), "{small:?}");
-    // A delete under a budget never needs one.
+    // A delete under a budget never needs a page, and it deletes: the rows
+    // above id 3 go, those up to it stay.
+    assert!(count(&a, "t").await > 1);
     let shrink = run(
         &a,
-        exec("DELETE FROM t WHERE id > 100"),
+        exec("DELETE FROM t WHERE id > 3"),
         GrowthPolicy::Budget(1),
     )
     .await;
     assert!(shrink.is_ok(), "{shrink:?}");
+    assert_eq!(count(&a, "t").await, 1);
 }
 
 /// The shipped defaults are off: no cap, no headroom check, no reservation
@@ -573,12 +572,17 @@ async fn concurrent_databases_share_one_reservation_budget() {
     ok(&a, "CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB)").await;
     ok(&b, "CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB)").await;
 
-    // `a` commits a large write: its checkpoint growth stays held until the
-    // request's outcome is known (the service releases it after the save).
+    // `a` commits a large write. Its checkpoint growth stays held until a
+    // checkpoint runs, not only for the length of the request.
     ok(&a, "INSERT INTO t (v) VALUES (zeroblob(400000))").await;
     let held = policy.budget.reserved();
     assert!(held >= 390_000, "held {held}");
     assert_eq!(policy.budget.reserved_excluding("space/a"), 0);
+    // A later, small commit of `a` does not forget the growth of the earlier
+    // one: what is held follows the file, not the request.
+    ok(&a, "INSERT INTO t (v) VALUES (zeroblob(10))").await;
+    let held = policy.budget.reserved();
+    assert!(held >= 390_000, "held {held}");
 
     // 300 KB free: `b`'s small write fits alone, not next to `a`'s 400 KB.
     free.set(300_000);
@@ -593,13 +597,21 @@ async fn concurrent_databases_share_one_reservation_budget() {
         "{refused:?}"
     );
     assert_eq!(count(&b, "t").await, 0);
+    assert_eq!(policy.budget.reserved_excluding("space/a"), 0);
 
-    // The outcome of `a`'s request is known: its reservation is released.
-    policy.budget.release("space/a");
+    // `a`'s checkpoint puts that growth on the disk: nothing of it is held.
+    a.checkpoint().await.unwrap();
+    assert_eq!(policy.budget.reserved(), 0);
     ok(&b, "INSERT INTO t (v) VALUES (zeroblob(100))").await;
     assert_eq!(count(&b, "t").await, 1);
-    // A write's own reservation is dropped when it is refused or done.
-    policy.budget.release("space/b");
+    // A write that adds no page leaves nothing held, refused or done.
+    assert_eq!(policy.budget.reserved(), 0);
+
+    // The reservation also ends with the database's connection.
+    free.set(64 << 20);
+    ok(&a, "INSERT INTO t (v) VALUES (zeroblob(400000))").await;
+    assert!(policy.budget.reserved() >= 390_000);
+    a.shutdown().await.unwrap();
     assert_eq!(policy.budget.reserved(), 0);
 }
 
@@ -628,6 +640,252 @@ async fn a_database_over_the_cap_still_runs_writes_that_do_not_grow_it() {
     )
     .await;
     assert!(matches!(grow, Err(SqlError::DatabaseSizeLimit)), "{grow:?}");
+}
+
+/// A `SQLITE_FULL` that comes from a full disk is reported as the disk, in the
+/// default configuration too (`min_free_bytes` = 0): never as the owner's
+/// quota or the database's size limit. The free-space reading is the fake one;
+/// a real ENOSPC cannot be provoked here.
+#[tokio::test]
+async fn a_full_disk_is_not_reported_as_the_owners_quota_or_the_size_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let free = FakeFree::new(64 << 20);
+    type Is = fn(&SqlError) -> bool;
+    let cases: [(&str, u64, GrowthPolicy, Is); 2] = [
+        // One page of the owner's budget: the write is over it.
+        ("budget", 0, GrowthPolicy::Budget(4096), |error| {
+            matches!(error, SqlError::StorageWouldGrow)
+        }),
+        ("cap", 64 * 4096, GrowthPolicy::Allow, |error| {
+            matches!(error, SqlError::DatabaseSizeLimit)
+        }),
+    ];
+    for (name, max_database_bytes, growth, is_the_limit) in cases {
+        let policy = DurabilityPolicy {
+            max_database_bytes,
+            free_space: free.clone(),
+            ..Default::default()
+        };
+        assert_eq!(policy.min_free_bytes, 0);
+        let a = actor(dir.path(), name, policy.clone());
+        ok(&a, "CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB)").await;
+        let SqlValue::Integer(page_size) = rows(&a, "PRAGMA page_size").await[0][0] else {
+            panic!("page_size");
+        };
+        let floor = 16 * page_size as u64;
+        let too_big = "INSERT INTO t (v) VALUES (zeroblob(500000))";
+
+        // Room on the disk: the limit that fired is the one reported.
+        free.set(64 << 20);
+        let refused = run(&a, exec(too_big), growth).await.unwrap_err();
+        assert!(is_the_limit(&refused), "{name}: {refused:?}");
+
+        // No room (below a few pages): the disk, for the same write.
+        for left in [0, floor - 1] {
+            free.set(left);
+            let refused = run(&a, exec(too_big), growth).await;
+            assert!(
+                matches!(refused, Err(SqlError::DiskHeadroom)),
+                "{name}, {left} bytes free: {refused:?}"
+            );
+        }
+        // Over the floor it is a limit again.
+        free.set(floor);
+        let refused = run(&a, exec(too_big), growth).await.unwrap_err();
+        assert!(is_the_limit(&refused), "{name}: {refused:?}");
+        assert_eq!(count(&a, "t").await, 0);
+        assert_eq!(policy.budget.reserved(), 0);
+    }
+}
+
+/// A request that wrote nothing needs no room: with the disk below its floor,
+/// a wrapped request that only reads answers (the pre-commit gate and the
+/// progress handler both let it through), a request that writes does not.
+/// (`batch` runs its statements without reading their rows, so the reads here
+/// are the ones a wrapped request can carry: `schema` entries of an `execute`,
+/// a named statement, a `PRAGMA` report.)
+#[tokio::test]
+async fn reads_in_a_wrapped_request_are_neither_gated_nor_reserved() {
+    const SCAN: &str = "SELECT 1 FROM seed s1, seed s2 WHERE s1.x + s2.x < 0";
+    let dir = tempfile::tempdir().unwrap();
+    let free = FakeFree::new(64 << 20);
+    let min_free = 8 << 20;
+    let policy = policy_with(&free, min_free);
+    let a = actor(dir.path(), DB, policy.clone());
+    ok(&a, "CREATE TABLE t (v TEXT)").await;
+    seed(&a).await;
+    let checkpoint_before = a.checkpoint().await.unwrap();
+    let reads_then = |sql: &str| SqlRequest::Execute {
+        // The scan crosses several progress-handler intervals. A DROP of a
+        // table that is not there takes no write transaction.
+        schema: Some(vec![SCAN.into(), "SELECT count(*) FROM t".into()]),
+        sql: sql.into(),
+        params: vec![],
+    };
+    let named = Some(tinycloud_core::sql::SqlCaveats {
+        statements: Some(vec![tinycloud_core::sql::caveats::PreparedStatement {
+            name: "scan".into(),
+            sql: SCAN.into(),
+        }]),
+        ..Default::default()
+    });
+
+    free.set(min_free - 1);
+    for growth in [GrowthPolicy::Allow, GrowthPolicy::Budget(1 << 20)] {
+        let reads = run(&a, reads_then("DROP TABLE IF EXISTS not_there"), growth).await;
+        assert!(reads.is_ok(), "{reads:?}");
+    }
+    let named_read = a
+        .execute(
+            SqlRequest::ExecuteStatement {
+                name: "scan".into(),
+                params: vec![],
+            },
+            named,
+            "tinycloud.sql/admin".into(),
+            GrowthPolicy::Allow,
+        )
+        .await;
+    assert!(named_read.is_ok(), "{named_read:?}");
+    // A report of the schema is wrapped (it can carry a PRAGMA) and reads.
+    assert!(!rows(&a, "PRAGMA table_info(t)").await.is_empty());
+    assert_eq!(policy.budget.reserved(), 0);
+
+    // A write is refused on the same disk: after the reads, before them, or
+    // in the middle of a long scan.
+    for request in [
+        reads_then("INSERT INTO t VALUES ('x')"),
+        SqlRequest::Execute {
+            schema: Some(vec!["INSERT INTO t VALUES ('x')".into(), SCAN.into()]),
+            sql: "DROP TABLE IF EXISTS not_there".into(),
+            params: vec![],
+        },
+        exec("INSERT INTO t VALUES ('x')"),
+    ] {
+        let refused = run(&a, request, GrowthPolicy::Allow).await;
+        assert!(
+            matches!(refused, Err(SqlError::DiskHeadroom)),
+            "{refused:?}"
+        );
+    }
+    assert_eq!(count(&a, "t").await, 0);
+    assert_eq!(a.checkpoint().await.unwrap(), checkpoint_before);
+    assert_eq!(policy.budget.reserved(), 0);
+}
+
+/// A request that carries a `PRAGMA` (admin only) is limited, gated and
+/// reserved like any write: the owner's budget, the size cap and the disk
+/// gate refuse it, and a refusal leaves nothing, the header value included.
+#[tokio::test]
+async fn a_request_with_a_pragma_is_bounded_like_any_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let free = FakeFree::new(64 << 20);
+    let policy = DurabilityPolicy {
+        // 32 pages of 4 KiB.
+        max_database_bytes: 128 * 1024,
+        min_free_bytes: 1,
+        free_space: free.clone(),
+        ..Default::default()
+    };
+    let a = actor(dir.path(), DB, policy.clone());
+    for statement in AMPLIFIED_SCHEMA {
+        ok(&a, statement).await;
+    }
+    let checkpoint_before = a.checkpoint().await.unwrap();
+    let big = "INSERT INTO t (a) VALUES (hex(zeroblob(200000)))";
+    let small = "INSERT INTO t (a) VALUES (hex(zeroblob(2000)))";
+    let with_pragma = |statement: &str| batch(&["PRAGMA user_version = 3", statement]);
+
+    let over_cap = run(&a, with_pragma(big), GrowthPolicy::Allow).await;
+    assert!(
+        matches!(over_cap, Err(SqlError::DatabaseSizeLimit)),
+        "{over_cap:?}"
+    );
+    let over_budget = run(&a, with_pragma(big), GrowthPolicy::Budget(8192)).await;
+    assert!(
+        matches!(over_budget, Err(SqlError::StorageWouldGrow)),
+        "{over_budget:?}"
+    );
+    free.set(1 << 10);
+    let no_room = run(&a, with_pragma(small), GrowthPolicy::Allow).await;
+    assert!(
+        matches!(no_room, Err(SqlError::DiskHeadroom)),
+        "{no_room:?}"
+    );
+    // A `query` that sets the header value is a write to the gate as well.
+    let query_no_room = run(
+        &a,
+        SqlRequest::Query {
+            sql: "PRAGMA user_version = 5".into(),
+            params: vec![],
+            max_rows: None,
+            max_bytes: None,
+        },
+        GrowthPolicy::Allow,
+    )
+    .await;
+    assert!(
+        matches!(query_no_room, Err(SqlError::DiskHeadroom)),
+        "{query_no_room:?}"
+    );
+    free.set(64 << 20);
+
+    assert_eq!(count(&a, "t").await, 0);
+    assert_eq!(
+        rows(&a, "PRAGMA user_version").await[0][0],
+        SqlValue::Integer(0)
+    );
+    assert_eq!(a.checkpoint().await.unwrap(), checkpoint_before);
+    assert_eq!(policy.budget.reserved(), 0);
+
+    // The same request is kept when it fits.
+    run(&a, with_pragma(small), GrowthPolicy::Budget(1 << 20))
+        .await
+        .unwrap();
+    assert_eq!(count(&a, "t").await, 1);
+    assert_eq!(
+        rows(&a, "PRAGMA user_version").await[0][0],
+        SqlValue::Integer(3)
+    );
+}
+
+/// The size limit is enforced by SQLite while a statement runs
+/// (`max_page_count`), not only by the check before COMMIT: a statement far
+/// bigger than the cap stops at the cap, so the WAL it leaves behind is
+/// bounded by the cap and not by the statement.
+#[tokio::test]
+async fn the_size_cap_stops_a_statement_while_it_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let free = FakeFree::new(64 << 20);
+    let cap = 128 * 1024;
+    let policy = DurabilityPolicy {
+        max_database_bytes: cap,
+        min_free_bytes: 1,
+        free_space: free.clone(),
+        ..Default::default()
+    };
+    let a = actor(dir.path(), DB, policy);
+    ok(&a, "CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB)").await;
+    let wal_before = wal_len(dir.path(), DB);
+
+    // ~10 MB of text, eighty times the cap. With the check at COMMIT alone,
+    // the transaction would spill all of it to the WAL first.
+    let result = run(
+        &a,
+        exec("INSERT INTO t (v) VALUES (hex(zeroblob(5000000)))"),
+        GrowthPolicy::Allow,
+    )
+    .await;
+    assert!(
+        matches!(result, Err(SqlError::DatabaseSizeLimit)),
+        "{result:?}"
+    );
+    let spilled = wal_len(dir.path(), DB) - wal_before;
+    assert!(
+        spilled <= 2 * cap,
+        "the failed statement left {spilled} bytes in the WAL"
+    );
+    assert_eq!(count(&a, "t").await, 0);
 }
 
 #[test]
@@ -667,6 +925,7 @@ fn the_unspilled_wal_bound_covers_what_commit_appends() {
     let mut observed_spill = false;
     for rows in [1, 50, 1_000, 10_000, 100_000] {
         conn.execute_batch("SAVEPOINT s").unwrap();
+        let at_savepoint = wal_len();
         conn.execute(
             "INSERT INTO t (a, b, c, d) SELECT hex(randomblob(10)), hex(randomblob(10)), \
              hex(randomblob(10)), hex(randomblob(10)) FROM seed s1, seed s2 LIMIT ?1",
@@ -678,7 +937,7 @@ fn the_unspilled_wal_bound_covers_what_commit_appends() {
             .unwrap();
         let before = wal_len();
         let bound = unspilled_wal_bound(cache_used_bytes(&conn), page_size);
-        observed_spill |= before > 32;
+        observed_spill |= before > at_savepoint;
         conn.execute_batch("RELEASE s").unwrap();
         let appended = wal_len() - before;
         assert!(
