@@ -712,17 +712,9 @@ fn timestamp(value: OffsetDateTime) -> Result<String, DataPlaneError> {
 }
 
 fn did_key_public_key(did: &str) -> Result<PublicKey, DataPlaneError> {
-    let encoded = did
-        .strip_prefix("did:key:")
-        .ok_or(DataPlaneError::InvalidProof)?;
-    let (_, bytes) = tinycloud_auth::ipld_core::cid::multibase::decode(encoded)
+    let bytes = tinycloud_auth::share_email_evidence::did_key_public_key(did)
         .map_err(|_| DataPlaneError::InvalidProof)?;
-    let key_bytes = match bytes.as_slice() {
-        [0xed, rest @ ..] if rest.len() == 32 => rest,
-        [0xed, 0x01, rest @ ..] if rest.len() == 32 => rest,
-        _ => return Err(DataPlaneError::InvalidProof),
-    };
-    let key = libp2p::identity::ed25519::PublicKey::try_from_bytes(key_bytes)
+    let key = libp2p::identity::ed25519::PublicKey::try_from_bytes(&bytes)
         .map_err(|_| DataPlaneError::InvalidProof)?;
     Ok(key.into())
 }

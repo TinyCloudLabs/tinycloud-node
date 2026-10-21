@@ -539,6 +539,11 @@ pub async fn app_with_control(
         allowed_methods = ?tinycloud_core::did_resolution::ALLOWED_DID_METHODS,
         "did resolution policy"
     );
+    if tinycloud_config.did_resolution.network_methods {
+        ::tracing::warn!(
+            "did_resolution.network_methods is retired and ignored; network DID methods are never resolved"
+        );
+    }
 
     let routes = production_routes();
     #[cfg(feature = "tc-bench-v1")]

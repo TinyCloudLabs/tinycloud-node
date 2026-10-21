@@ -6598,12 +6598,14 @@ mod tests {
             listener.local_addr().unwrap().port()
         );
         let ucan = signed_ucan(&issuer, &JWK::generate_ed25519().unwrap(), Algorithm::EdDSA);
-        assert!(
-            super::verify_signed_delegation(&TinyCloudDelegation::Ucan(Box::new(ucan)))
-                .await
-                .is_err()
-        );
+        // Bound the test if the refusal regresses and resolution waits for HTTP.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            super::verify_signed_delegation(&TinyCloudDelegation::Ucan(Box::new(ucan))),
+        )
+        .await;
         assert_no_connections(&[&listener]).await;
+        assert!(matches!(result, Ok(Err(_))));
     }
     use super::*;
     use base64::encode_config;

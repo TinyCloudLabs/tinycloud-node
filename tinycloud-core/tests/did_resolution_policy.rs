@@ -1,6 +1,7 @@
 //! DID method allow-list refusal tests. Every socket target is a listener bound by this test.
 #[path = "support/did_resolution.rs"]
 mod support;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use futures::FutureExt;
 use std::{
     sync::{
@@ -68,76 +69,104 @@ const REFUSED: &[(&str, &str)] = &[
 
 #[tokio::test]
 async fn refused_dids_are_refused_with_zero_lookups_at_every_site() {
-    let key = JWK::generate_ed25519().unwrap();
     for (issuer, method) in REFUSED {
-        let refusal = || UcanVerifyError::MethodDisabled {
-            method: (*method).into(),
-        };
-        let message = refusal().to_string();
-
-        let counting = CountingResolver::default();
-        let ucan = signed_ucan(issuer, &key, Algorithm::EdDSA);
-        assert_eq!(
-            verify_ucan_signature_with(&ucan, counting.clone()).await,
-            Err(refusal()),
-            "{issuer}: ucan signature"
-        );
-        assert_eq!(counting.lookups(), 0, "{issuer}: ucan signature lookups");
-
-        let counting = CountingResolver::default();
-        let revocation = UcanRevocation::sign(
-            issuer.parse().unwrap(),
-            ucan.payload().proof[0],
-            &key,
-            Algorithm::EdDSA,
-        )
-        .unwrap();
-        assert_eq!(
-            verify_ucan_revocation_signature_with(
-                &revocation,
-                Algorithm::EdDSA,
-                None,
-                counting.clone()
-            )
-            .await,
-            Err(refusal()),
-            "{issuer}: revocation"
-        );
-        assert_eq!(counting.lookups(), 0, "{issuer}: revocation lookups");
-
-        let did: DIDBuf = issuer.parse().unwrap();
-        let counting = CountingResolver::default();
-        let result = NodeDidResolver::new(counting.clone())
-            .resolve_representation(&did, Options::default())
-            .await;
-        assert!(
-            matches!(&result, Err(ResolutionError::Internal(m)) if *m == message),
-            "{issuer}: direct representation"
-        );
-        assert_eq!(
-            counting.lookups(),
-            0,
-            "{issuer}: direct representation lookups"
-        );
-
-        let url: DIDURLBuf = format!("{issuer}#key").parse().unwrap();
-        let counting = CountingResolver::default();
-        let result = NodeDidResolver::new(counting.clone())
-            .dereference(&url)
-            .await;
-        assert!(
-            matches!(
-                &result,
-                Err(DerefError::Resolution(ResolutionError::Internal(m))) if *m == message
-            ),
-            "{issuer}: direct dereference"
-        );
-        assert_eq!(
-            counting.lookups(),
-            0,
-            "{issuer}: direct dereference lookups"
-        );
+        assert_refused_at_every_site(issuer, method).await;
     }
+}
+
+#[tokio::test]
+async fn non_ed25519_did_jwk_and_oversized_identifiers_are_refused_with_zero_lookups() {
+    let secp = JWK::generate_secp256k1();
+    let p256 = JWK::generate_p256();
+    let rsa = r#"{"kty":"RSA","n":"AQAB","e":"AQAB"}"#;
+    let cases = [
+        (
+            DID_METHODS.generate(&secp, "jwk").unwrap().to_string(),
+            "jwk",
+        ),
+        (
+            DID_METHODS.generate(&p256, "jwk").unwrap().to_string(),
+            "jwk",
+        ),
+        (format!("did:jwk:{}", URL_SAFE_NO_PAD.encode(rsa)), "jwk"),
+        (format!("did:key:z6Mk{}", "1".repeat(65_532)), "key"),
+        (format!("did:pkh:eip155:1:{}", "0".repeat(65_536)), "pkh"),
+    ];
+    for (issuer, method) in &cases {
+        assert_refused_at_every_site(issuer, method).await;
+    }
+}
+
+/// Asserts that `issuer` is refused as `method` with zero lookups at every resolution site.
+async fn assert_refused_at_every_site(issuer: &str, method: &str) {
+    let key = JWK::generate_ed25519().unwrap();
+    let refusal = || UcanVerifyError::MethodDisabled {
+        method: method.into(),
+    };
+    let message = refusal().to_string();
+
+    let counting = CountingResolver::default();
+    let ucan = signed_ucan(issuer, &key, Algorithm::EdDSA);
+    assert_eq!(
+        verify_ucan_signature_with(&ucan, counting.clone()).await,
+        Err(refusal()),
+        "{issuer}: ucan signature"
+    );
+    assert_eq!(counting.lookups(), 0, "{issuer}: ucan signature lookups");
+
+    let counting = CountingResolver::default();
+    let revocation = UcanRevocation::sign(
+        issuer.parse().unwrap(),
+        ucan.payload().proof[0],
+        &key,
+        Algorithm::EdDSA,
+    )
+    .unwrap();
+    assert_eq!(
+        verify_ucan_revocation_signature_with(
+            &revocation,
+            Algorithm::EdDSA,
+            None,
+            counting.clone()
+        )
+        .await,
+        Err(refusal()),
+        "{issuer}: revocation"
+    );
+    assert_eq!(counting.lookups(), 0, "{issuer}: revocation lookups");
+
+    let did: DIDBuf = issuer.parse().unwrap();
+    let counting = CountingResolver::default();
+    let result = NodeDidResolver::new(counting.clone())
+        .resolve_representation(&did, Options::default())
+        .await;
+    assert!(
+        matches!(&result, Err(ResolutionError::Internal(m)) if *m == message),
+        "{issuer}: direct representation"
+    );
+    assert_eq!(
+        counting.lookups(),
+        0,
+        "{issuer}: direct representation lookups"
+    );
+
+    let url: DIDURLBuf = format!("{issuer}#key").parse().unwrap();
+    let counting = CountingResolver::default();
+    let result = NodeDidResolver::new(counting.clone())
+        .dereference(&url)
+        .await;
+    assert!(
+        matches!(
+            &result,
+            Err(DerefError::Resolution(ResolutionError::Internal(m))) if *m == message
+        ),
+        "{issuer}: direct dereference"
+    );
+    assert_eq!(
+        counting.lookups(),
+        0,
+        "{issuer}: direct dereference lookups"
+    );
 }
 
 #[tokio::test]

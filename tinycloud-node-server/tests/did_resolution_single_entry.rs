@@ -108,12 +108,51 @@ fn network_did_module(name: &str) -> bool {
     matches!(name, "web" | "tz" | "ion" | "ethr")
 }
 
+// Signature primitives whose production call sites are reviewed. A new call
+// site must be added to REVIEWED_SIGNATURE_SITES with its gate, or the test fails.
+const SIGNATURE_PRIMITIVES: &[&str] = &[
+    "verify_detached_ed25519",
+    "verify_bytes",
+    "recover_from_prehash",
+    "did_key_public_key",
+];
+const REVIEWED_SIGNATURE_SITES: &[&str] = &[
+    "tinycloud-auth/src/share_email_evidence.rs :: enforce_holder_equation :: did_key_public_key",
+    "tinycloud-auth/src/share_email_evidence.rs :: verify_detached_ed25519 :: did_key_public_key",
+    "tinycloud-auth/src/share_email_evidence.rs :: verify_ed25519 :: verify_bytes",
+    "tinycloud-auth/src/share_email_evidence.rs :: verify_holder_binding_artifact :: did_key_public_key",
+    "tinycloud-core/src/encryption_network/service.rs :: did_key_public_key :: did_key_public_key",
+    "tinycloud-core/src/encryption_network/service.rs :: verify_decryption_signature :: did_key_public_key",
+    "tinycloud-core/src/policy_authority/verifier.rs :: verify_ed25519 :: verify_detached_ed25519",
+    "tinycloud-core/src/policy_authority/verifier.rs :: verify_eip191 :: recover_from_prehash",
+    "tinycloud-core/src/share_email/authority.rs :: load_statuses :: verify_detached_ed25519",
+    "tinycloud-core/src/share_email/authority.rs :: validate_attestation :: verify_detached_ed25519",
+    "tinycloud-core/src/share_email/authority.rs :: verify_wrapper :: verify_detached_ed25519",
+    "tinycloud-core/src/share_email/data_plane.rs :: did_key_public_key :: did_key_public_key",
+    "tinycloud-core/src/share_email/data_plane.rs :: verify_request :: did_key_public_key",
+    "tinycloud-node-server/src/policy_v3.rs :: ingest_status_checkpoint_unmounted :: verify_detached_ed25519",
+    "tinycloud-node-server/src/policy_v3.rs :: ingest_status_checkpoint_unmounted :: verify_detached_ed25519",
+    "tinycloud-node-server/src/policy_v3.rs :: v3_envelope_delivery_projection :: verify_detached_ed25519",
+    "tinycloud-node-server/src/policy_v3.rs :: validate_claim_and_presentation :: verify_detached_ed25519",
+    "tinycloud-node-server/src/policy_v3.rs :: validate_policy_document :: verify_detached_ed25519",
+    "tinycloud-node-server/src/policy_v3.rs :: validate_presentation_signature :: verify_detached_ed25519",
+    "tinycloud-node-server/src/policy_v3.rs :: validate_stored_root_status :: verify_detached_ed25519",
+    "tinycloud-node-server/src/policy_v3.rs :: verify_issuer_signature :: verify_bytes",
+    "tinycloud-node-server/src/policy_v3.rs :: verify_signed_json :: verify_detached_ed25519",
+    "tinycloud-node-server/src/share_v2.rs :: verify_enforcement_delegation :: verify_detached_ed25519",
+    "tinycloud-node-server/src/share_v2.rs :: verify_outer_envelope :: verify_detached_ed25519",
+    "tinycloud-node-server/src/share_v2.rs :: verify_policy_proof :: verify_detached_ed25519",
+    "tinycloud-node-server/src/share_v2.rs :: verify_runtime_delegation :: verify_detached_ed25519",
+    "tinycloud-node-server/src/share_v2.rs :: verify_v2_proof :: verify_detached_ed25519",
+];
+
 #[derive(Default)]
 struct Guard {
     file: String,
     function: String,
     violations: Vec<String>,
     helper_calls: usize,
+    signature_sites: Vec<String>,
     test_modules: Vec<PathBuf>,
     module_dir: PathBuf,
 }
@@ -156,6 +195,13 @@ impl Guard {
             | ("tinycloud-node-server/src/node_control/control.rs", "effective_public_config", "config . storage . resolve ()")
             | ("tinycloud-node-server/src/webhook_dispatcher.rs", "pinned_client", "Client :: builder () . timeout (self . timeout) . redirect (Policy :: none ()) . resolve (host , address)")
         )
+    }
+
+    fn signature_site(&mut self, name: &str) {
+        if SIGNATURE_PRIMITIVES.contains(&name) {
+            self.signature_sites
+                .push(format!("{} :: {} :: {name}", self.file, self.function));
+        }
     }
 
     fn auth_resolver_import(&self, item: &syn::ItemUse) -> bool {
@@ -358,6 +404,7 @@ impl<'ast> Visit<'ast> for Guard {
         {
             self.violations.push(call.to_token_stream().to_string());
         }
+        self.signature_site(&ident_name(&call.method));
         // Ordinary verify() also serves fixed-key cryptography; any resolver
         // types, factories, or calls in its receiver/arguments are still visited.
         visit::visit_expr_method_call(self, call);
@@ -392,6 +439,7 @@ impl<'ast> Visit<'ast> for Guard {
             ) {
                 self.helper_calls += 1;
             }
+            self.signature_site(&name);
         }
         visit::visit_expr_call(self, call);
     }
@@ -448,6 +496,65 @@ fn ucan_resolution_has_one_production_entry_point() {
     assert!(
         calls >= 5,
         "expected at least five production helper calls, found {calls}"
+    );
+}
+
+fn production_signature_sites() -> Vec<String> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let mut files = Vec::new();
+    for dir in [
+        "tinycloud-core/src",
+        "tinycloud-node-server/src",
+        "tinycloud-auth/src",
+    ] {
+        source_files(&root.join(dir), &mut files);
+    }
+    let mut scans = Vec::new();
+    for path in files {
+        let relative = path.strip_prefix(root).unwrap().to_str().unwrap();
+        if relative == "tinycloud-core/src/did_resolution.rs" {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path).unwrap();
+        let ast =
+            syn::parse_file(&source).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        let mut guard = Guard::new(relative);
+        guard.visit_file(&ast);
+        scans.push(guard);
+    }
+    let test_modules: Vec<_> = scans.iter().flat_map(|scan| &scan.test_modules).collect();
+    scans
+        .iter()
+        .filter(|scan| {
+            !test_modules
+                .iter()
+                .any(|path| Path::new(&scan.file).starts_with(path))
+        })
+        .flat_map(|scan| scan.signature_sites.clone())
+        .collect()
+}
+
+#[test]
+fn signature_primitives_are_pinned_to_reviewed_sites() {
+    let mut sites = production_signature_sites();
+    sites.sort();
+    let mut expected: Vec<String> = REVIEWED_SIGNATURE_SITES
+        .iter()
+        .map(|site| site.to_string())
+        .collect();
+    expected.sort();
+    assert_eq!(
+        sites, expected,
+        "signature primitive call site changed; review its gate before pinning it"
+    );
+}
+
+#[test]
+fn signature_primitive_outside_the_reviewed_list_is_reported() {
+    let guard = scan_fixture("fn new_site() { verify_detached_ed25519(a, b, c); }");
+    assert_eq!(
+        guard.signature_sites,
+        vec!["fixture.rs :: new_site :: verify_detached_ed25519".to_string()]
     );
 }
 

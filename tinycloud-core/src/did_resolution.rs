@@ -1,4 +1,5 @@
 //! Node UCAN issuer resolution policy. DID syntax and identity comparisons are unaffected.
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, VecDeque},
@@ -9,22 +10,29 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use tinycloud_auth::share_email_evidence;
 use tinycloud_auth::ssi::{
     dids::{
         resolution::{self, Options, Output},
         AnyDidMethod, DIDResolver, DID, DIDURL,
     },
-    jwk::{Algorithm, JWK},
+    jwk::{Algorithm, Params, JWK},
     ucan::{Ucan, UcanRevocation},
 };
 
 /// The only issuer DID methods the node resolves. Each derives verification material without
 /// network access. Every other method is refused before any lookup, whatever the configuration.
+/// `did:web` credential issuers are configured in `tinycloud-node-server/src/issuer_set.rs` and
+/// are not resolved through this module.
 pub const ALLOWED_DID_METHODS: &[&str] = &["key", "pkh", "jwk"];
 /// `did:key` is limited to Ed25519: base58btc multibase `z` over the `0xed 0x01` multicodec.
 const ED25519_DID_KEY_PREFIX: &str = "z6Mk";
+/// Length of an Ed25519 `did:key` identifier, checked before any decoding.
+const ED25519_DID_KEY_ID_LEN: usize = 48;
 /// `did:pkh` is limited to the EVM (`eip155`) namespace.
 const PKH_EVM_NAMESPACE_PREFIX: &str = "eip155:";
+/// Longest `did:pkh:eip155` identifier: namespace, u64 chain id (<= 20 digits), `0x`, 40 hex.
+const PKH_EVM_ID_MAX_LEN: usize = 70;
 static REFUSED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static REFUSAL_OBSERVER: OnceLock<fn(&str, &str)> = OnceLock::new();
 
@@ -86,8 +94,8 @@ impl<R: DIDResolver> DIDResolver for NodeDidResolver<R> {
     }
 }
 
-/// Admit a DID only when its method is allow-listed and, for `did:key` and `did:pkh`, its
-/// key type or namespace is allowed. Runs before any lookup.
+/// Admit a DID only when its method is allow-listed and its key type or namespace is allowed.
+/// Runs before any lookup.
 fn check_method(did: &DID) -> Result<(), UcanVerifyError> {
     let method = did.method_name();
     if !ALLOWED_DID_METHODS.contains(&method) || !namespace_allowed(did) {
@@ -99,12 +107,31 @@ fn check_method(did: &DID) -> Result<(), UcanVerifyError> {
     Ok(())
 }
 
+/// Admit an identifier only when its key type or namespace is allowed. Length bounds run
+/// before any decoding.
 fn namespace_allowed(did: &DID) -> bool {
     let id = did.method_specific_id();
     match did.method_name() {
-        "key" => id.starts_with(ED25519_DID_KEY_PREFIX),
-        "pkh" => id.starts_with(PKH_EVM_NAMESPACE_PREFIX),
-        _ => true,
+        "key" => {
+            id.len() == ED25519_DID_KEY_ID_LEN
+                && id.starts_with(ED25519_DID_KEY_PREFIX)
+                && share_email_evidence::did_key_public_key(did.as_str()).is_ok()
+        }
+        "pkh" => id.len() <= PKH_EVM_ID_MAX_LEN && id.starts_with(PKH_EVM_NAMESPACE_PREFIX),
+        "jwk" => jwk_is_ed25519(id),
+        _ => false,
+    }
+}
+
+/// Decodes a `did:jwk` identifier as the SSI resolver does (unpadded base64url, then JWK JSON).
+/// Admits only an OKP `Ed25519` key, the same key type as `did:key`.
+fn jwk_is_ed25519(id: &str) -> bool {
+    let Ok(bytes) = URL_SAFE_NO_PAD.decode(id) else {
+        return false;
+    };
+    match serde_json::from_slice::<JWK>(&bytes) {
+        Ok(jwk) => matches!(&jwk.params, Params::OKP(okp) if okp.curve == "Ed25519"),
+        Err(_) => false,
     }
 }
 
@@ -308,6 +335,61 @@ mod tests {
         }
         let did = format!("did:web:{}:private", "a".repeat(300));
         assert_eq!(sanitized_host(DID::new(did.as_bytes()).unwrap()).len(), 253);
+    }
+
+    fn admitted(did: &str) -> bool {
+        namespace_allowed(DID::new(did.as_bytes()).unwrap())
+    }
+
+    #[test]
+    fn did_key_is_admitted_only_at_the_ed25519_identifier_length() {
+        let key = "z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
+        assert_eq!(key.len(), ED25519_DID_KEY_ID_LEN);
+        assert!(admitted(&format!("did:key:{key}")));
+        assert!(!admitted(&format!("did:key:{}", &key[..47])));
+        assert!(!admitted(&format!("did:key:{key}1")));
+        // Right length and prefix, but not an Ed25519 multicodec encoding.
+        assert!(!admitted(&format!("did:key:z6Mk{}", "1".repeat(44))));
+        // Oversized: refused by length before any base58 decode.
+        assert!(!admitted(&format!("did:key:z6Mk{}", "1".repeat(65_532))));
+    }
+
+    #[test]
+    fn did_pkh_is_admitted_only_as_bounded_evm() {
+        assert!(admitted(
+            "did:pkh:eip155:1:0x0000000000000000000000000000000000000001"
+        ));
+        // Longest valid identifier: a 20-digit chain id.
+        assert!(admitted(&format!(
+            "did:pkh:eip155:{}:0x{}",
+            "1".repeat(20),
+            "0".repeat(40)
+        )));
+        assert!(!admitted(&format!(
+            "did:pkh:eip155:{}:0x{}",
+            "1".repeat(21),
+            "0".repeat(40)
+        )));
+        assert!(!admitted("did:pkh:solana:local:abc"));
+        assert!(!admitted(&format!(
+            "did:pkh:eip155:1:{}",
+            "0".repeat(65_536)
+        )));
+    }
+
+    #[test]
+    fn did_jwk_is_admitted_only_as_ed25519_okp() {
+        use base64::Engine as _;
+        let jwk_did = |json: &str| format!("did:jwk:{}", URL_SAFE_NO_PAD.encode(json));
+        assert!(admitted(&jwk_did(
+            r#"{"kty":"OKP","crv":"Ed25519","x":"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"}"#
+        )));
+        assert!(!admitted(&jwk_did(
+            r#"{"kty":"OKP","crv":"X25519","x":"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"}"#
+        )));
+        assert!(!admitted(&jwk_did(
+            r#"{"kty":"RSA","n":"AQAB","e":"AQAB"}"#
+        )));
     }
 
     fn env_lock() -> &'static Mutex<()> {

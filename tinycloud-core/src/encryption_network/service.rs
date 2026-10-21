@@ -1086,17 +1086,9 @@ fn decode_base64(s: &str) -> Result<Vec<u8>, &'static str> {
 }
 
 fn did_key_public_key(did: &str) -> Result<PublicKey, String> {
-    let encoded = did
-        .strip_prefix("did:key:")
-        .ok_or_else(|| "issuer must be a did:key".to_string())?;
-    let (_base, bytes) = tinycloud_auth::ipld_core::cid::multibase::decode(encoded)
-        .map_err(|err| err.to_string())?;
-    let key_bytes = match bytes.as_slice() {
-        [0xed, rest @ ..] if rest.len() == 32 => rest,
-        [0xed, 0x01, rest @ ..] if rest.len() == 32 => rest,
-        _ => return Err("issuer did:key is not an ed25519 public key".to_string()),
-    };
-    let ed = libp2p::identity::ed25519::PublicKey::try_from_bytes(key_bytes)
+    let bytes = tinycloud_auth::share_email_evidence::did_key_public_key(did)
+        .map_err(|_| "issuer must be an ed25519 did:key".to_string())?;
+    let ed = libp2p::identity::ed25519::PublicKey::try_from_bytes(&bytes)
         .map_err(|err| err.to_string())?;
     Ok(ed.into())
 }

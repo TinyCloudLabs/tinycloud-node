@@ -154,6 +154,10 @@ fn verify_eip191(
     if signature.len() != 65 {
         return Err(super::AuthorityError::SchemaInvalid);
     }
+    // Only an eip155 did:pkh names an EVM address to compare against the recovered key.
+    tinycloud_auth::identity::parse_pkh_did(&artifact.issuer_did)
+        .map_err(|_| super::AuthorityError::SchemaInvalid)?
+        .ok_or(super::AuthorityError::SchemaInvalid)?;
     let recovery = match signature[64] {
         27 | 28 => RecoveryId::try_from(signature[64] - 27),
         0 | 1 => RecoveryId::try_from(signature[64]),
@@ -314,6 +318,41 @@ mod tests {
             assert!(
                 AuthorityArtifactVerifier.verify(&bytes).is_err(),
                 "{name} must not bypass signature verification"
+            );
+        }
+    }
+
+    #[test]
+    fn eip191_issuer_must_be_an_eip155_pkh_before_recovery() {
+        let artifact = |issuer: &str| PolicyDelegation {
+            schema: "xyz.tinycloud.policy/enforcement-delegation/v1".to_owned(),
+            role: DelegationRole::PolicySessionRoot,
+            delegation_cid: "placeholder".to_owned(),
+            issuer_did: issuer.to_owned(),
+            audience_did: issuer.to_owned(),
+            capabilities: Vec::new(),
+            proof_cids: Vec::new(),
+            not_before: "2026-07-19T00:00:00Z".to_owned(),
+            expires_at: "2026-07-19T00:05:00Z".to_owned(),
+            delegation_mode: super::super::DelegationMode::Attenuable,
+            facts: std::collections::BTreeMap::new(),
+            signature: DelegationSignature {
+                suite: EIP191_SUITE.to_owned(),
+                value: String::new(),
+            },
+        };
+        let signature = [0u8; 65];
+        for issuer in [
+            "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw",
+            "did:pkh:solana:4sGjMW1sUnHzSxGspuhpqLDx6wiyjNtZ:0x0000000000000000000000000000000000000001",
+            "did:pkh:eip155:0:0x0000000000000000000000000000000000000001",
+        ] {
+            assert!(
+                matches!(
+                    verify_eip191(&artifact(issuer), b"unsigned", &signature),
+                    Err(super::super::AuthorityError::SchemaInvalid)
+                ),
+                "{issuer} must be refused before recovery"
             );
         }
     }

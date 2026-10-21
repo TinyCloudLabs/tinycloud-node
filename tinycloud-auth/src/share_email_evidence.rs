@@ -567,7 +567,14 @@ pub fn verify_detached_ed25519(
     verify_ed25519(&public_key, message, signature)
 }
 
-fn did_key_public_key(did: &str) -> Result<[u8; 32], EvidenceError> {
+/// Length of an Ed25519 `did:key` string: the `did:key:` prefix plus a 48-character identifier.
+const ED25519_DID_KEY_LEN: usize = "did:key:".len() + 48;
+/// Decodes an Ed25519 `did:key` into its 32-byte public key. The length is checked before base58
+/// decoding, and only base58btc multibase over the `0xed 0x01` multicodec is accepted.
+pub fn did_key_public_key(did: &str) -> Result<[u8; 32], EvidenceError> {
+    if did.len() != ED25519_DID_KEY_LEN {
+        return Err(EvidenceError::Invalid);
+    }
     let encoded = did
         .strip_prefix("did:key:z")
         .ok_or(EvidenceError::Invalid)?;

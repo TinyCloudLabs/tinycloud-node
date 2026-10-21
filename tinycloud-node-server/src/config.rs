@@ -1524,9 +1524,22 @@ impl Default for DatabaseConfig {
 }
 
 /// UCAN issuer resolution. The method allow-list is fixed in `tinycloud_core::did_resolution`
-/// and has no settings. The section is still accepted so existing configs keep parsing.
+/// and has no settings. Retired keys are still accepted so existing configs keep parsing.
 #[derive(Serialize, Deserialize, Debug, Default, Clone, Hash, PartialEq, Eq)]
-pub struct DidResolutionConfig {}
+pub struct DidResolutionConfig {
+    /// Retired and ignored: network DID methods are never resolved. `true` when the key is
+    /// present, with any value, so startup can warn that it has no effect.
+    #[serde(default, skip_serializing, deserialize_with = "retired_key_present")]
+    pub network_methods: bool,
+}
+
+fn retired_key_present<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde::de::IgnoredAny::deserialize(deserializer)?;
+    Ok(true)
+}
 
 impl DatabaseConfig {
     /// Reject settings that would make the node unusable (TC-1317): a zero
@@ -1711,6 +1724,21 @@ mod tests {
                 "{wait_ms}"
             );
         }
+    }
+
+    #[test]
+    fn retired_did_resolution_network_methods_is_detected_for_any_value_and_never_written_back() {
+        let absent: DidResolutionConfig = serde_json::from_str("{}").unwrap();
+        assert!(!absent.network_methods);
+        for value in [r#"["web"]"#, r#""web""#, "true", "{}"] {
+            let config: DidResolutionConfig =
+                serde_json::from_str(&format!(r#"{{"network_methods":{value}}}"#)).unwrap();
+            assert!(config.network_methods, "{value}");
+        }
+        let written = DidResolutionConfig {
+            network_methods: true,
+        };
+        assert_eq!(serde_json::to_string(&written).unwrap(), "{}");
     }
 
     /// TC-1274: a running backfill needs a positive rate and progress
