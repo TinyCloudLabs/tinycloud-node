@@ -489,9 +489,14 @@ pub fn verify(
     if siwe.resources[0] != expected_resource {
         return Err(BAD_SIWE);
     }
-    if siwe.expiration.is_some_and(|expiry| policy.now >= expiry)
-        || siwe.not_before.is_some_and(|start| policy.now < start)
-    {
+    let now = truncate_to_millis(policy.now);
+    let expired = siwe
+        .expiration
+        .is_some_and(|expiry| now >= truncate_to_millis(expiry));
+    let early = siwe
+        .not_before
+        .is_some_and(|start| now < truncate_to_millis(start));
+    if expired || early {
         return Err(BAD_SIWE);
     }
     let signature_hex = input
@@ -515,7 +520,7 @@ pub fn verify(
 
     Ok(VerifiedHeld {
         issuer: issuer_did.to_owned(),
-        subject: sub.to_owned(),
+        subject: subject.display_did(),
         subject_address: subject.address,
         expires_at: exp,
         credential_id: jti.to_owned(),
@@ -737,10 +742,19 @@ impl Pkh {
     fn canonical(&self) -> String {
         format!("did:pkh:eip155:{}:{}", self.chain, self.address)
     }
+
+    /// The `did:pkh` with the EIP-55 checksummed address, as TS `canonicalPkhDid`.
+    fn display_did(&self) -> String {
+        format!(
+            "did:pkh:eip155:{}:{}",
+            self.chain,
+            checksum_address(&self.address)
+        )
+    }
 }
 
 /// Parses `did:pkh:eip155:<chain>:<address>`. Chain is `0` or a decimal with no
-/// leading zero, up to 16 digits. The address must be valid EIP-55.
+/// leading zero, up to 16 digits. The address must be all-lowercase or valid EIP-55.
 fn parse_pkh(did: &str) -> Option<Pkh> {
     let rest = did.strip_prefix("did:pkh:eip155:")?;
     let (chain, address) = rest.split_once(':')?;
@@ -752,7 +766,8 @@ fn parse_pkh(did: &str) -> Option<Pkh> {
     }
     let hex_part = &address[2..];
     hex::decode(hex_part).ok()?;
-    if !eip55_ok(hex_part) {
+    // TS `parsePkhDid`: an all-lowercase body is accepted; any other body must be EIP-55.
+    if hex_part != hex_part.to_ascii_lowercase() && !eip55_ok(hex_part) {
         return None;
     }
     Some(Pkh {
@@ -761,22 +776,33 @@ fn parse_pkh(did: &str) -> Option<Pkh> {
     })
 }
 
+/// EIP-55 checksum of a `0x…` address, as `toChecksumAddress`.
+fn checksum_address(address: &str) -> String {
+    let lower = address[2..].to_ascii_lowercase();
+    let digest = keccak(lower.as_bytes());
+    let body: String = lower
+        .char_indices()
+        .map(|(index, c)| {
+            let nibble = if index % 2 == 0 {
+                digest[index / 2] >> 4
+            } else {
+                digest[index / 2] & 0x0f
+            };
+            if c.is_ascii_alphabetic() && nibble >= 8 {
+                c.to_ascii_uppercase()
+            } else {
+                c
+            }
+        })
+        .collect();
+    format!("0x{body}")
+}
+
 /// EIP-55: each letter's case must match the keccak-derived checksum, which is
 /// `toChecksumAddress(address) === address`. All-lower and all-upper spellings
 /// pass only when the checksum happens to agree with them.
 fn eip55_ok(hex40: &str) -> bool {
-    let digest = keccak(hex40.to_ascii_lowercase().as_bytes());
-    hex40.bytes().enumerate().all(|(index, byte)| {
-        if !byte.is_ascii_alphabetic() {
-            return true;
-        }
-        let nibble = if index % 2 == 0 {
-            digest[index / 2] >> 4
-        } else {
-            digest[index / 2] & 0x0f
-        };
-        (nibble >= 8) == byte.is_ascii_uppercase()
-    })
+    checksum_address(&format!("0x{}", hex40.to_ascii_lowercase())) == format!("0x{hex40}")
 }
 
 /// EIP-191 `personal_sign` recovery over the raw message bytes. Accepts v in
@@ -965,6 +991,12 @@ fn parse_rfc3339(text: &str) -> Result<OffsetDateTime, Refusal> {
     OffsetDateTime::parse(text, &Rfc3339).map_err(|_| BAD_SIWE)
 }
 
+/// TS compares SIWE times as JavaScript `Date` values, which keep milliseconds only.
+fn truncate_to_millis(time: OffsetDateTime) -> OffsetDateTime {
+    let nanos = time.nanosecond() - time.nanosecond() % 1_000_000;
+    time.replace_nanosecond(nanos).unwrap_or(time)
+}
+
 fn rfc3339_shape(text: &str) -> bool {
     let bytes = text.as_bytes();
     let digits = |from: usize, len: usize| {
@@ -1011,17 +1043,23 @@ fn rfc3339_shape(text: &str) -> bool {
         && tail[4..6].iter().all(u8::is_ascii_digit)
 }
 
-/// The SIWE URI: https, no userinfo, and the origin host is the audience. A default `:443`
-/// is dropped, as WHATWG `URL.origin` does.
+/// The SIWE URI: https, no userinfo, and its origin (host, plus the port when it is
+/// not the https default) equals the audience, as WHATWG `URL.origin` does.
 fn uri_matches_audience(uri: &str, audience: &str) -> bool {
     let Ok(parsed) = url::Url::parse(uri) else {
         return false;
     };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    let origin = match parsed.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_owned(),
+    };
     parsed.scheme() == "https"
         && parsed.username().is_empty()
         && parsed.password().is_none()
-        && parsed.port().is_none()
-        && parsed.host_str() == Some(audience)
+        && origin == audience
 }
 
 /// Checks the disclosed values against the email row's rules.
@@ -1888,11 +1926,11 @@ mod tests {
     }
 
     #[test]
-    fn did_pkh_requires_the_exact_eip55_checksum() {
+    fn did_pkh_accepts_all_lowercase_or_exact_eip55_only() {
         assert!(parse_pkh(CALLER).is_some());
         let lower = CALLER.to_ascii_lowercase();
         let upper = format!("did:pkh:eip155:1:0x{}", HOLDER[2..].to_ascii_uppercase());
-        assert!(parse_pkh(&lower).is_none());
+        assert!(parse_pkh(&lower).is_some());
         assert!(parse_pkh(&upper).is_none());
     }
 
@@ -1981,6 +2019,25 @@ mod tests {
             outcome(&fixture, &request_for(&sd_jwt)).await,
             "bad-subject"
         );
+    }
+
+    #[tokio::test]
+    async fn subject_with_all_lowercase_body_is_accepted_and_reported_checksummed() {
+        let key = test_key();
+        let fixture = own_fixture(&key);
+        let lower = CALLER.to_ascii_lowercase();
+        let sd_jwt = credential(&key, default_header(), |p| {
+            p["sub"] = json!(lower);
+            p["holderBinding"]["did"] = json!(lower);
+        });
+        let request = request_for(&sd_jwt);
+        let conn = conn().await;
+        seed(&conn, &fixture, &request).await.expect("seed");
+        let verified = admit(&conn, &fixture, &request)
+            .await
+            .expect("all-lowercase body is accepted");
+        assert_eq!(verified.subject, CALLER);
+        assert_eq!(verified.subject_address, HOLDER.to_ascii_lowercase());
     }
 
     #[tokio::test]
@@ -2153,6 +2210,44 @@ mod tests {
         );
         let request = body(&sd_jwt, &message, &sign_siwe(&message));
         assert_eq!(outcome(&fixture, &request).await, "bad-siwe");
+    }
+
+    #[tokio::test]
+    async fn siwe_expiration_is_compared_at_millisecond_precision() {
+        let key = test_key();
+        let mut fixture = own_fixture(&key);
+        fixture.now = OffsetDateTime::parse(NOW, &Rfc3339).unwrap();
+        let sd_jwt = credential(&key, default_header(), |_| {});
+        // TS keeps milliseconds only: `NOW` plus 0.5ms truncates to `NOW`, which is not after `now`.
+        let sub_ms = NOW.replace('Z', ".0005Z");
+        let message = siwe_message(NONCE, &sd_jwt).replacen(
+            &format!("Issued At: {ISSUED_AT}"),
+            &format!("Issued At: {ISSUED_AT}\nExpiration Time: {sub_ms}"),
+            1,
+        );
+        let request = body(&sd_jwt, &message, &sign_siwe(&message));
+        assert_eq!(outcome(&fixture, &request).await, "bad-siwe");
+    }
+
+    #[tokio::test]
+    async fn siwe_not_before_is_compared_at_millisecond_precision() {
+        let key = test_key();
+        let mut fixture = own_fixture(&key);
+        fixture.now = OffsetDateTime::parse(NOW, &Rfc3339).unwrap();
+        let sd_jwt = credential(&key, default_header(), |_| {});
+        // TS keeps milliseconds only: `NOW` plus 0.5ms truncates to `NOW`, so `now` is not before it.
+        let sub_ms = NOW.replace('Z', ".0005Z");
+        let message = siwe_message(NONCE, &sd_jwt).replacen(
+            &format!("Issued At: {ISSUED_AT}"),
+            &format!("Issued At: {ISSUED_AT}\nNot Before: {sub_ms}"),
+            1,
+        );
+        let request = body(&sd_jwt, &message, &sign_siwe(&message));
+        let conn = conn().await;
+        seed(&conn, &fixture, &request).await.expect("seed");
+        admit(&conn, &fixture, &request)
+            .await
+            .expect("not-before truncates to NOW, so it is not in the future");
     }
 
     #[tokio::test]
@@ -2434,6 +2529,20 @@ mod tests {
             ("http://tinycloud.example/", false),
             ("tinycloud.example", false),
             ("", false),
+        ] {
+            assert_eq!(uri_matches_audience(uri, audience), expected, "{uri}");
+        }
+    }
+
+    #[test]
+    fn siwe_uri_origin_includes_the_audience_port() {
+        let audience = "verifier.example:8443";
+        for (uri, expected) in [
+            ("https://verifier.example:8443/nonce", true),
+            ("https://VERIFIER.example:8443/", true),
+            ("https://verifier.example/", false),
+            ("https://verifier.example:9443/", false),
+            ("https://verifier.example:443/", false),
         ] {
             assert_eq!(uri_matches_audience(uri, audience), expected, "{uri}");
         }
