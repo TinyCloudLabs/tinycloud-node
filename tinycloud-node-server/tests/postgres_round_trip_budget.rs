@@ -123,14 +123,15 @@ use tokio::{
     net::{TcpListener, TcpStream},
 };
 
-/// Round trips allowed per flow; see the module docs. Measured with
-/// `test_before_acquire(false)`, database identity resolve as one statement,
-/// the read audit as one statement and no second sequence lock (TC-951):
+/// Round trips allowed per flow; see the module docs. Each invocation's
+/// transaction-scoped authorization snapshot now fetches edges, delegations,
+/// abilities and revocations in one tagged query (TC-735); capability checks
+/// and connection-release pings are unchanged. Measured on PostgreSQL:
 ///
-/// - sign-in 77 = peer key 0 + host `/delegate` 18 + session `/delegate` 19
-///   + account-space SQL write 40;
-/// - kv put 38;
-/// - kv get 22, including the read-audit commit.
+/// - sign-in 71 = peer key 0 + host `/delegate` 18 + session `/delegate` 19
+///   + account-space SQL write 34;
+/// - kv put 35;
+/// - kv get 16, including the read-audit commit.
 ///
 /// TC-1274: each epoch-writing commit (both `/delegate`s and the kv put)
 /// gained one round trip, the `epoch_head` cache write, which replaces the
@@ -138,17 +139,21 @@ use tokio::{
 /// 22; with the cache: 77, 38, 22).
 ///
 /// TC-1274: a batch of 100 `kv/get` or `kv/metadata` capabilities is one
-/// `current_kv` lookup per space, so it costs what a single kv get costs, 22
+/// `current_kv` lookup per space, so it costs what a single kv get costs
 /// (measured before the batching: 216 round trips and 98 `current_kv`
 /// statements for the 98 distinct keys the fixture asks for). The flows also
 /// check the responses against the fixture, and the test fails if a batch
 /// reads `current_kv` in more than one statement.
+///
+/// TC-735: the one-statement authorization snapshot (#302) removes six trips
+/// from sign-in and from every read invocation (kv get and both batches:
+/// main alone is 77 and 22) and three from kv put (main alone: 38).
 const BUDGETS: [(&str, u64); 5] = [
-    ("sign-in", 77),
-    ("kv put", 38),
-    ("kv get", 22),
-    ("kv batch get", 22),
-    ("kv batch head", 22),
+    ("sign-in", 71),
+    ("kv put", 35),
+    ("kv get", 16),
+    ("kv batch get", 16),
+    ("kv batch head", 16),
 ];
 
 /// Full sign-in plus put plus get rounds run before the measured one.

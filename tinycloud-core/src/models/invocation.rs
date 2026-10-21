@@ -299,6 +299,19 @@ pub async fn authorize_holder<C: ConnectionTrait>(
     validate_capabilities(db, capabilities, holder, parents, Some(now), None).await
 }
 
+/// Test oracle: `authorize_holder`'s checks against a caller-built snapshot.
+#[cfg(test)]
+pub(crate) async fn authorize_holder_with_graph<C: ConnectionTrait>(
+    db: &C,
+    holder: &str,
+    capabilities: &[util::Capability],
+    parents: &[tinycloud_auth::ipld_core::cid::Cid],
+    now: OffsetDateTime,
+    graph: &crate::auth_graph::AuthGraphSnapshot,
+) -> Result<(), Error> {
+    validate_capabilities(db, capabilities, holder, parents, Some(now), Some(graph)).await
+}
+
 async fn validate_capabilities<C: ConnectionTrait>(
     db: &C,
     capabilities: &[util::Capability],
