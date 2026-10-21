@@ -1057,10 +1057,16 @@ fn validate_disclosed(claims: &BTreeMap<String, String>) -> Result<(), Refusal> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::HeldCredentialsConfig;
     use crate::issuer_set::CredentialIssuerConfig;
+    use crate::policy_v3::{
+        canonical_digest_base64url, validate_held_email_admission, ClaimPresentationContext,
+        PolicyV3Runtime,
+    };
     use ed25519_dalek::{Signer, SigningKey};
     use serde_json::json;
     use tinycloud_auth::share_email_evidence::IssuerKey;
+    use tinycloud_core::keys::StaticSecret;
     use tinycloud_core::migrations::Migrator;
     use tinycloud_core::sea_orm::Database;
     use tinycloud_core::sea_orm_migration::MigratorTrait;
@@ -1232,9 +1238,13 @@ mod tests {
     }
 
     fn sign_siwe(message: &str) -> String {
+        sign_siwe_with(ANVIL_KEY, message)
+    }
+
+    fn sign_siwe_with(key_hex: &str, message: &str) -> String {
         let prefixed = format!("\x19Ethereum Signed Message:\n{}{}", message.len(), message);
         let digest = keccak(prefixed.as_bytes());
-        let key = k256::ecdsa::SigningKey::from_slice(&hex::decode(ANVIL_KEY).unwrap()).unwrap();
+        let key = k256::ecdsa::SigningKey::from_slice(&hex::decode(key_hex).unwrap()).unwrap();
         let (signature, recovery) = key.sign_prehash_recoverable(&digest).unwrap();
         let mut bytes = signature.to_bytes().to_vec();
         bytes.push(recovery.to_byte() + 27);
@@ -1349,6 +1359,194 @@ mod tests {
         );
     }
 
+    /// Requirement and policy projection for `validate_held_email_admission`. The projection
+    /// pins the digest of the request-local requirement the presenter sends.
+    fn held_requirement_and_policy() -> (Value, Value) {
+        let profile = json!({"id": PROFILE, "version": PROFILE_VERSION});
+        let credential_type = json!({"id": VCT, "version": 1});
+        let requirement = json!({
+            "type": "TinyCloudCredentialRequirement",
+            "version": 1,
+            "profile": profile,
+            "credentialType": credential_type,
+            "claims": {"email": "alice@example.com"},
+            "maxAgeSeconds": 31_536_000,
+        });
+        let policy = json!({"credentialRequirement": {
+            "type": "TinyCloudPolicyCredentialRequirement",
+            "version": 1,
+            "requirementDigest": canonical_digest_base64url(&requirement),
+            "descriptorDigest": b64url(&sha256(b"held-email-descriptor")),
+            "issuerDid": TEST_ISSUER,
+            "issuerKid": TEST_KID,
+            "profile": profile,
+            "credentialType": credential_type,
+        }});
+        (requirement, policy)
+    }
+
+    fn handler_runtime(
+        conn: &RecoveringConnection,
+        key: &SigningKey,
+        held: bool,
+    ) -> PolicyV3Runtime {
+        let runtime = PolicyV3Runtime::new(
+            conn.clone(),
+            "did:web:node.example",
+            StaticSecret::new(vec![7; 32]).unwrap(),
+        )
+        .with_credential_issuers(IssuerSet::load(&[issuer_config(key)]).unwrap());
+        if !held {
+            return runtime;
+        }
+        runtime
+            .with_held_credentials(&HeldCredentialsConfig {
+                enabled: true,
+                audience: Some(AUDIENCE.to_owned()),
+            })
+            .unwrap()
+    }
+
+    /// Runs `validate_held_email_admission` as `mint` does and returns only the outcome code.
+    async fn handler_admit(
+        runtime: &PolicyV3Runtime,
+        requirement: &Value,
+        policy: &Value,
+        presentation: &Value,
+        caller: &str,
+        consume: bool,
+    ) -> Result<(), String> {
+        let context = ClaimPresentationContext {
+            challenge_id: "held-test-challenge",
+            nonce: NONCE,
+            policy_cid: "held-test-policy",
+            owner_did: CALLER,
+            recipient_did: "did:web:verifier.example",
+            authenticated_account_owner: Some(caller),
+            now: OffsetDateTime::parse(NOW, &Rfc3339).unwrap(),
+        };
+        validate_held_email_admission(
+            requirement,
+            presentation,
+            policy,
+            &context,
+            runtime,
+            consume,
+        )
+        .await
+        .map(|_| ())
+        .map_err(|(_, code)| code)
+    }
+
+    /// Records the nonce the way the nonce mint route would. The route is tracked separately,
+    /// so tests stand in for it here.
+    async fn seed_handler(conn: &RecoveringConnection, key: &SigningKey, presentation: &Value) {
+        seed(conn, &own_fixture(key), presentation)
+            .await
+            .expect("seed");
+    }
+
+    #[tokio::test]
+    async fn handler_refuses_held_presentations_when_the_flag_is_off() {
+        let key = test_key();
+        let (requirement, policy) = held_requirement_and_policy();
+        let presentation = request_for(&credential(&key, default_header(), |_| {}));
+        let conn = conn().await;
+        let runtime = handler_runtime(&conn, &key, false);
+        assert_eq!(
+            handler_admit(&runtime, &requirement, &policy, &presentation, CALLER, true).await,
+            Err("held-credentials-disabled".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn held_admission_is_accepted_once_then_replayed() {
+        let key = test_key();
+        let (requirement, policy) = held_requirement_and_policy();
+        let presentation = request_for(&credential(&key, default_header(), |_| {}));
+        let conn = conn().await;
+        let runtime = handler_runtime(&conn, &key, true);
+        seed_handler(&conn, &key, &presentation).await;
+        handler_admit(&runtime, &requirement, &policy, &presentation, CALLER, true)
+            .await
+            .expect("honest held presentation is admitted");
+        assert_eq!(
+            handler_admit(&runtime, &requirement, &policy, &presentation, CALLER, true).await,
+            Err("nonce-replayed".to_owned())
+        );
+    }
+
+    /// Spec §4.4: the nonce is spent before any signature check, so a refused presentation
+    /// cannot be retried against the same nonce.
+    #[tokio::test]
+    async fn refused_presentation_still_spends_the_nonce() {
+        let key = test_key();
+        let other = SigningKey::from_bytes(&[9; 32]);
+        let (requirement, policy) = held_requirement_and_policy();
+        let presentation = request_for(&credential(&other, default_header(), |_| {}));
+        let conn = conn().await;
+        let runtime = handler_runtime(&conn, &key, true);
+        seed_handler(&conn, &key, &presentation).await;
+        assert_eq!(
+            handler_admit(&runtime, &requirement, &policy, &presentation, CALLER, true).await,
+            Err("bad-signature".to_owned())
+        );
+        assert_eq!(
+            handler_admit(&runtime, &requirement, &policy, &presentation, CALLER, true).await,
+            Err("nonce-replayed".to_owned())
+        );
+    }
+
+    /// Spec §4.4 step 2: a nonce is consumed for the caller only. Another account presenting
+    /// the subject's nonce spends nothing, so the subject can still admit it.
+    #[tokio::test]
+    async fn other_account_cannot_spend_the_subjects_nonce() {
+        let key = test_key();
+        let (requirement, policy) = held_requirement_and_policy();
+        let presentation = request_for(&credential(&key, default_header(), |_| {}));
+        let conn = conn().await;
+        let runtime = handler_runtime(&conn, &key, true);
+        seed_handler(&conn, &key, &presentation).await;
+        assert_eq!(
+            handler_admit(
+                &runtime,
+                &requirement,
+                &policy,
+                &presentation,
+                OTHER_ACCOUNT,
+                true
+            )
+            .await,
+            Err("nonce-replayed".to_owned())
+        );
+        handler_admit(&runtime, &requirement, &policy, &presentation, CALLER, true)
+            .await
+            .expect("subject still holds its unspent nonce");
+    }
+
+    #[tokio::test]
+    async fn locked_reevaluation_verifies_without_spending_the_nonce_again() {
+        let key = test_key();
+        let (requirement, policy) = held_requirement_and_policy();
+        let presentation = request_for(&credential(&key, default_header(), |_| {}));
+        let conn = conn().await;
+        let runtime = handler_runtime(&conn, &key, true);
+        seed_handler(&conn, &key, &presentation).await;
+        handler_admit(&runtime, &requirement, &policy, &presentation, CALLER, true)
+            .await
+            .expect("first admission");
+        handler_admit(
+            &runtime,
+            &requirement,
+            &policy,
+            &presentation,
+            CALLER,
+            false,
+        )
+        .await
+        .expect("locked re-evaluation accepts the spent nonce");
+    }
+
     #[tokio::test]
     async fn flipped_siwe_signature_is_refused() {
         let (fixture, sd_jwt, message) = oc_case("heldtestnonce0000000002");
@@ -1383,6 +1581,98 @@ mod tests {
         let header = json!({"alg": "EdDSA", "typ": "vc+sd-jwt"});
         let sd_jwt = credential(&key, header, |_| {});
         assert_eq!(outcome(&fixture, &request_for(&sd_jwt)).await, "bad-header");
+    }
+
+    /// TC-1541 item 1. With the explicit list and a legacy single issuer loaded together, a
+    /// kid-less header is still refused on the held path, and a kid-bearing credential from
+    /// the explicit entry is still accepted.
+    #[tokio::test]
+    async fn kidless_header_is_refused_with_the_combined_issuer_set() {
+        let key = test_key();
+        let legacy_did = "did:web:legacy-held.example";
+        let legacy_kid = "did:web:legacy-held.example#k1";
+        let legacy_key = IssuerKey::new(
+            legacy_did,
+            VCT,
+            1,
+            legacy_kid,
+            SigningKey::from_bytes(&[9u8; 32])
+                .verifying_key()
+                .to_bytes(),
+        );
+        let set = IssuerSet::load_with_legacy(&[issuer_config(&key)], Some(&legacy_key)).unwrap();
+        assert!(set.resolve_pinned_issuer(legacy_did, legacy_kid).is_some());
+        let fixture = Fixture::new(set, TEST_ISSUER);
+
+        let kidless = credential(&key, json!({"alg": "EdDSA", "typ": "vc+sd-jwt"}), |_| {});
+        assert_eq!(
+            outcome(&fixture, &request_for(&kidless)).await,
+            "bad-header"
+        );
+
+        let conn = conn().await;
+        let request = request_for(&credential(&key, default_header(), |_| {}));
+        seed(&conn, &fixture, &request).await.expect("seed");
+        admit(&conn, &fixture, &request)
+            .await
+            .expect("kid-bearing credential is accepted with the combined set");
+    }
+
+    /// TC-1541 item 2. Dalek's `verify` accepts a signature whose `R` is the identity point
+    /// (small order) when `S·B = k·A`; `verify_strict` refuses it. The forgery is built from
+    /// the test key's own secret scalar, so the vector is a genuine instance of that case.
+    #[tokio::test]
+    async fn small_order_r_signature_is_refused_on_the_held_path() {
+        use curve25519_dalek::{
+            constants::ED25519_BASEPOINT_POINT, edwards::CompressedEdwardsY, scalar::Scalar,
+            traits::Identity,
+        };
+        use ed25519_dalek::Verifier;
+
+        let key = test_key();
+        let verifying = key.verifying_key();
+        let disclosures = email_disclosures();
+        let header = default_header().to_string();
+        let payload = default_payload(&disclosures).to_string();
+        let input = signing_input(&header, &payload);
+
+        // RFC 8032 secret scalar: the clamped low half of SHA-512(seed).
+        let expanded = sha2::Sha512::digest(key.to_bytes());
+        let mut clamped = [0u8; 32];
+        clamped.copy_from_slice(&expanded[..32]);
+        clamped[0] &= 248;
+        clamped[31] &= 127;
+        clamped[31] |= 64;
+        let secret = Scalar::from_bytes_mod_order(clamped);
+        assert_eq!(
+            (secret * ED25519_BASEPOINT_POINT).compress().to_bytes(),
+            verifying.to_bytes(),
+            "derived scalar must match the pinned public key"
+        );
+
+        // R is the identity (small order). With S = k·a, S·B − k·A = identity = R.
+        let r = CompressedEdwardsY::identity();
+        let k = Scalar::from_hash(
+            sha2::Sha512::new()
+                .chain_update(r.as_bytes())
+                .chain_update(verifying.to_bytes())
+                .chain_update(input.as_bytes()),
+        );
+        let mut signature = [0u8; 64];
+        signature[..32].copy_from_slice(r.as_bytes());
+        signature[32..].copy_from_slice((k * secret).as_bytes());
+        let forged = Signature::from_bytes(&signature);
+
+        // The vector discriminates: plain `verify` accepts it, `verify_strict` refuses it.
+        assert!(verifying.verify(input.as_bytes(), &forged).is_ok());
+        assert!(verifying.verify_strict(input.as_bytes(), &forged).is_err());
+
+        let sd_jwt = assemble(&input, &signature, &disclosures);
+        let fixture = own_fixture(&key);
+        assert_eq!(
+            outcome(&fixture, &request_for(&sd_jwt)).await,
+            "bad-signature"
+        );
     }
 
     #[tokio::test]
@@ -1651,6 +1941,179 @@ mod tests {
         assert_eq!(
             refused(verify(&input, &pre, &policy)),
             "nonce-account-mismatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn issuer_stopped_at_now_is_refused() {
+        let key = test_key();
+        let mut config = issuer_config(&key);
+        config.not_after = Some("2026-01-01T00:30:00Z".to_owned());
+        let fixture = Fixture::new(IssuerSet::load(&[config]).unwrap(), TEST_ISSUER);
+        let sd_jwt = credential(&key, default_header(), |_| {});
+        assert_eq!(
+            outcome(&fixture, &request_for(&sd_jwt)).await,
+            "issuer-stopped"
+        );
+    }
+
+    #[tokio::test]
+    async fn credential_issued_after_issuer_retirement_is_refused() {
+        let key = test_key();
+        let mut config = issuer_config(&key);
+        config.retired_at = Some("2025-12-31T23:00:00Z".to_owned());
+        let fixture = Fixture::new(IssuerSet::load(&[config]).unwrap(), TEST_ISSUER);
+        let sd_jwt = credential(&key, default_header(), |_| {});
+        assert_eq!(
+            outcome(&fixture, &request_for(&sd_jwt)).await,
+            "issuer-retired"
+        );
+    }
+
+    #[tokio::test]
+    async fn issuer_outside_the_policy_accepted_list_is_refused() {
+        let key = test_key();
+        let mut fixture = own_fixture(&key);
+        fixture.issuers = vec![AcceptedIssuer {
+            did: "did:web:other.example".to_owned(),
+            kid: None,
+        }];
+        let sd_jwt = credential(&key, default_header(), |_| {});
+        assert_eq!(
+            outcome(&fixture, &request_for(&sd_jwt)).await,
+            "issuer-not-accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_kid_pin_must_match_the_presented_kid() {
+        let key = test_key();
+        let mut fixture = own_fixture(&key);
+        fixture.issuers = vec![AcceptedIssuer {
+            did: TEST_ISSUER.to_owned(),
+            kid: Some(format!("{TEST_ISSUER}#k2")),
+        }];
+        let sd_jwt = credential(&key, default_header(), |_| {});
+        assert_eq!(
+            outcome(&fixture, &request_for(&sd_jwt)).await,
+            "issuer-not-accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn credential_type_outside_the_issuer_entry_is_refused() {
+        let key = test_key();
+        let mut config = issuer_config(&key);
+        config.vcts = vec!["urn:example:other-credential".to_owned()];
+        let fixture = Fixture::new(IssuerSet::load(&[config]).unwrap(), TEST_ISSUER);
+        let sd_jwt = credential(&key, default_header(), |_| {});
+        assert_eq!(
+            outcome(&fixture, &request_for(&sd_jwt)).await,
+            "profile-mismatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn siwe_domain_other_than_audience_is_refused() {
+        let key = test_key();
+        let fixture = own_fixture(&key);
+        let sd_jwt = credential(&key, default_header(), |_| {});
+        let message = siwe_message(NONCE, &sd_jwt).replacen(
+            &format!("{AUDIENCE} wants"),
+            "evil.example wants",
+            1,
+        );
+        let request = body(&sd_jwt, &message, &sign_siwe(&message));
+        assert_eq!(outcome(&fixture, &request).await, "bad-siwe");
+    }
+
+    #[tokio::test]
+    async fn siwe_resource_must_hash_the_presented_sd_jwt() {
+        let key = test_key();
+        let fixture = own_fixture(&key);
+        let sd_jwt = credential(&key, default_header(), |_| {});
+        let message = siwe_message(NONCE, "a-different-sd-jwt");
+        let request = body(&sd_jwt, &message, &sign_siwe(&message));
+        assert_eq!(outcome(&fixture, &request).await, "bad-siwe");
+    }
+
+    #[tokio::test]
+    async fn siwe_expiration_time_in_the_past_is_refused() {
+        let key = test_key();
+        let fixture = own_fixture(&key);
+        let sd_jwt = credential(&key, default_header(), |_| {});
+        let message = siwe_message(NONCE, &sd_jwt).replacen(
+            &format!("Issued At: {ISSUED_AT}"),
+            &format!("Issued At: {ISSUED_AT}\nExpiration Time: 2025-12-31T00:00:00Z"),
+            1,
+        );
+        let request = body(&sd_jwt, &message, &sign_siwe(&message));
+        assert_eq!(outcome(&fixture, &request).await, "bad-siwe");
+    }
+
+    #[tokio::test]
+    async fn siwe_signed_by_another_key_is_refused() {
+        let key = test_key();
+        let fixture = own_fixture(&key);
+        let sd_jwt = credential(&key, default_header(), |_| {});
+        let message = siwe_message(NONCE, &sd_jwt);
+        // Anvil account 1: a valid secp256k1 key whose address is not the subject.
+        let other_key = "59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
+        let request = body(&sd_jwt, &message, &sign_siwe_with(other_key, &message));
+        assert_eq!(outcome(&fixture, &request).await, "bad-siwe-signature");
+    }
+
+    #[tokio::test]
+    async fn holder_binding_must_name_the_subject() {
+        let key = test_key();
+        let fixture = own_fixture(&key);
+        let sd_jwt = credential(&key, default_header(), |payload| {
+            payload["holderBinding"]["did"] = json!(OTHER_ACCOUNT);
+        });
+        assert_eq!(
+            outcome(&fixture, &request_for(&sd_jwt)).await,
+            "bad-holder-binding"
+        );
+    }
+
+    #[tokio::test]
+    async fn subject_on_another_chain_is_refused() {
+        let key = test_key();
+        let fixture = own_fixture(&key);
+        let other_chain = format!("did:pkh:eip155:10:{HOLDER}");
+        let sd_jwt = credential(&key, default_header(), |payload| {
+            payload["sub"] = json!(other_chain);
+        });
+        assert_eq!(
+            outcome(&fixture, &request_for(&sd_jwt)).await,
+            "bad-subject"
+        );
+    }
+
+    #[tokio::test]
+    async fn payload_iss_must_name_the_kid_issuer() {
+        let key = test_key();
+        let fixture = own_fixture(&key);
+        let sd_jwt = credential(&key, default_header(), |payload| {
+            payload["iss"] = json!("did:web:other.example");
+        });
+        assert_eq!(
+            outcome(&fixture, &request_for(&sd_jwt)).await,
+            "bad-payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn disclosure_must_be_listed_in_sd() {
+        let key = test_key();
+        let fixture = own_fixture(&key);
+        let first = digest(&email_disclosures()[0]);
+        let sd_jwt = credential(&key, default_header(), |payload| {
+            payload["_sd"] = json!([first]);
+        });
+        assert_eq!(
+            outcome(&fixture, &request_for(&sd_jwt)).await,
+            "bad-disclosure"
         );
     }
 

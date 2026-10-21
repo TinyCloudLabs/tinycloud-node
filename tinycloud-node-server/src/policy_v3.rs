@@ -4385,7 +4385,7 @@ fn is_base64url_digest(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
-fn canonical_digest_base64url(value: &Value) -> String {
+pub(crate) fn canonical_digest_base64url(value: &Value) -> String {
     base64::encode_config(Sha256::digest(canonical_json_value(value)), URL_SAFE_NO_PAD)
 }
 
@@ -5191,14 +5191,14 @@ fn validate_registration_projection(
     Ok(policy)
 }
 
-struct ClaimPresentationContext<'a> {
-    challenge_id: &'a str,
-    nonce: &'a str,
-    policy_cid: &'a str,
-    owner_did: &'a str,
-    recipient_did: &'a str,
-    authenticated_account_owner: Option<&'a str>,
-    now: OffsetDateTime,
+pub(crate) struct ClaimPresentationContext<'a> {
+    pub(crate) challenge_id: &'a str,
+    pub(crate) nonce: &'a str,
+    pub(crate) policy_cid: &'a str,
+    pub(crate) owner_did: &'a str,
+    pub(crate) recipient_did: &'a str,
+    pub(crate) authenticated_account_owner: Option<&'a str>,
+    pub(crate) now: OffsetDateTime,
 }
 
 fn validate_claim_and_presentation(
@@ -5438,7 +5438,7 @@ fn credential_evidence_digest(value: &Value) -> Result<String, (Status, String)>
     ))
 }
 
-struct CredentialAdmission {
+pub(crate) struct CredentialAdmission {
     claim_jti: String,
     credential_id: String,
     presentation_jti: Option<String>,
@@ -5810,7 +5810,7 @@ fn validate_credential_admission_v4(
 /// Held email admission (TC-1452). `consume` is true at the first admission
 /// site only; the locked re-evaluation verifies the same presentation without
 /// spending the nonce a second time.
-async fn validate_held_email_admission(
+pub(crate) async fn validate_held_email_admission(
     requirement: &Value,
     presentation: &Value,
     policy: &Value,
@@ -7707,6 +7707,44 @@ mod tests {
             &legacy_kid,
         );
         assert!(fixture.verify(&other, &legacy).is_err());
+    }
+
+    #[test]
+    fn kidless_header_is_refused_for_a_configured_entry_in_the_combined_set() {
+        // TC-1541 item 1: legacy issuer and configured list share one set. A
+        // header without `kid` must not vouch for a configured entry, but the
+        // legacy entry keeps accepting one.
+        let (configured_key, legacy_key) = (keypair(), keypair());
+        let configured_kid = format!("{ORG_A}#issuing-1");
+        let legacy_kid = format!("{ORG_A}#controller");
+        let legacy = IssuerKey::new(
+            ORG_A,
+            "opencredentials.email/v1",
+            1,
+            legacy_kid.clone(),
+            legacy_key.public().to_bytes(),
+        );
+        let set = IssuerSet::load_with_legacy(
+            &[issuer_config(ORG_A, "issuing-1", &configured_key)],
+            Some(&legacy),
+        )
+        .unwrap();
+        let unpinned = SetFixture::new(ORG_A, None, DOMAIN_PROFILE);
+        let bare = json!({"alg": "EdDSA", "typ": "vc+sd-jwt"});
+        let kidless = unpinned.mint(&configured_key, bare, &configured_kid);
+        assert_eq!(
+            unpinned.verify(&kidless, &set).err(),
+            forbidden("credential-signature-invalid")
+        );
+        // The same credential carrying its kid verifies, so the refusal is the
+        // missing header kid and nothing else.
+        let with_kid = json!({"alg": "EdDSA", "typ": "vc+sd-jwt", "kid": configured_kid});
+        let keyed = unpinned.mint(&configured_key, with_kid, &configured_kid);
+        assert!(unpinned.verify(&keyed, &set).is_ok());
+        let legacy_fixture = SetFixture::new(ORG_A, Some(&legacy_kid), DOMAIN_PROFILE);
+        let legacy_bare = json!({"alg": "EdDSA", "typ": "vc+sd-jwt"});
+        let legacy_credential = legacy_fixture.mint(&legacy_key, legacy_bare, &legacy_kid);
+        assert!(legacy_fixture.verify(&legacy_credential, &set).is_ok());
     }
 
     #[test]

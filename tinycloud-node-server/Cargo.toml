@@ -120,6 +120,8 @@ default-features = false
 features = ["sqlite", "postgres", "mysql", "tokio", "verification-count-test-hook"]
 
 [dev-dependencies]
+# Builds the small-order-R forgery vector in held_email tests (TC-1541 item 2); already in the lock.
+curve25519-dalek = "4"
 # Parse production Rust items in the DID resolver source guard (tests only).
 syn = { version = "2", features = ["full", "visit"] }
 quote = "1"
