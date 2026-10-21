@@ -770,13 +770,27 @@ fn authorization(headers: &impl serde::Serialize) -> Result<String> {
 }
 
 fn invocation(session: &Session, service: &str, path: &str, ability: &str) -> Result<String> {
+    invocation_with(session, service, path, &[ability])
+}
+
+/// An invocation that holds several abilities on one resource, as the SDK
+/// sends for the account index (`write` for its rows, `schema` for its DDL).
+fn invocation_with(
+    session: &Session,
+    service: &str,
+    path: &str,
+    abilities: &[&str],
+) -> Result<String> {
     let invocation = session.invoke(
         [(
             service.parse::<Service>()?,
             path.parse::<Path>()?,
             None,
             None,
-            [ability.parse::<Ability>()?],
+            abilities
+                .iter()
+                .map(|ability| ability.parse::<Ability>())
+                .collect::<Result<Vec<_>, _>>()?,
         )],
         None,
     )?;
@@ -851,6 +865,7 @@ async fn round(node: &Node, account: &Account, out: &mut Vec<Measured>) -> Resul
                     vec![
                         "tinycloud.sql/read".parse()?,
                         "tinycloud.sql/write".parse()?,
+                        "tinycloud.sql/schema".parse()?,
                     ],
                 )]),
             ),
@@ -904,7 +919,12 @@ async fn round(node: &Node, account: &Account, out: &mut Vec<Measured>) -> Resul
                 .post("/invoke")
                 .header(Header::new(
                     "Authorization",
-                    invocation(&session, "sql", ACCOUNT_DATABASE, "tinycloud.sql/write")?,
+                    invocation_with(
+                        &session,
+                        "sql",
+                        ACCOUNT_DATABASE,
+                        &["tinycloud.sql/write", "tinycloud.sql/schema"],
+                    )?,
                 ))
                 .header(ContentType::JSON)
                 .body(serde_json::to_string(&sql)?),

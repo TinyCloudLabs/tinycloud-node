@@ -224,7 +224,7 @@ async fn write(
             db,
             insert_blob(bytes),
             None,
-            "tinycloud.sql/write".into(),
+            "tinycloud.sql/admin".into(),
         )
         .await
         .map(|_| ())
