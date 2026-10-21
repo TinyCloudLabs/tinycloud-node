@@ -1,6 +1,6 @@
 {
   "generatedBy": "gen-s1-differential.mjs (committed alongside this file); runs the TS verifier over mutated presentations and writes the cases table",
-  "generatorSha256": "633b2a62e752e3dda555141df645998725f6052b833b49691953e3dbce92468a",
+  "generatorSha256": "e9e72fce03e0b47b87f2d354dfe952348c406922ac1c33de59ca554c1c09270f",
   "package": "@tinycloud/sdk-core",
   "packageVersion": "3.3.0-beta.37",
   "verifierSource": {
@@ -12,9 +12,10 @@
   "verifierFile": "dist/held-credentials/index.js",
   "verifierSha256": "04db65be52bafd81629842079b318654dccd8bbba680e9128f202249080dcc65",
   "node": "v22.23.2",
-  "cases": 145,
-  "casesSha256": "39942c9fdc8b770964fd3f4e96ae40185d89cd7433004c2997aef9b957053202",
-  "reproduction": "Re-running the generator yields different SIWE nonces (the SDK's InMemoryNonceStore issues random nonces), so bytes differ. Verdicts are compared, not file hashes. Against the prior table (js-sdk PR #645 at 4ac7592951ae644418077f567a1fe176e0842b2c, pre-publication build), 144 of 145 TS verdict codes are unchanged. The one change is disc-empty-salt: bad-disclosure -> ok, because the row now carries a matching _sd digest (see generator change). Rows disc-len-2 through disc-name-not-disclosable and disc-domain-mismatch through disc-empty-salt are rebuilt with their own digests so each reaches its target rule.",
+  "cases": 333,
+  "casesSha256": "45386c3abd155633b2ae693b0a3dea98bf2c2b315a8300aa421f0b836ef5004b",
+  "reconstruction": "The reviewer's 188-case differential file was not saved. This table was rebuilt from the category list in review f41449f6: 126 generic cases and 62 disclosure-value cases, added to the 145 base cases. Case bytes are not identical to the reviewer's file. Verdicts come from the published verifier only.",
+  "reproduction": "Re-running the generator yields different SIWE nonces (the SDK's InMemoryNonceStore issues random nonces), so bytes differ. Verdicts are compared, not file hashes. Regenerating from the published verifier reproduces all 145 base verdicts unchanged and yields 0 THREW cases. The 188 added cases were regenerated in the same run. Eleven cases carry a `deviation` annotation (8 did:pkh casing/encoding rows refused as account-owner-invalid instead of bad-config; siwe-enc-high-s; json-sub-lone-surrogate; cfg-notafter-before-notbefore). The Rust replay requires each annotation to name the exact Rust result and to sit only on a case where Rust and TS disagree.",
   "keyMaterial": "public test vectors only: Anvil account; test issuer did:web:issuer.credentials.org with a fixed-seed Ed25519 test key",
   "specIssuer": "did:web:issuer.credentials.org (spec sections 3.3 and 6). The table is spec-aligned.",
   "regenerationStatus": "REGENERATED from published @tinycloud/sdk-core 3.3.0-beta.37 (gitHead c9bb5550de7cce9330d41995dd1157062c75916b). Verifier sha256 matches the beta.37 dist file. Update packageVersion, verifierSha256, cases, and casesSha256 on the next regeneration.",

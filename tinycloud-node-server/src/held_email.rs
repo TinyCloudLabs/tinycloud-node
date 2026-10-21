@@ -2435,13 +2435,30 @@ mod tests {
             let name = case["name"].as_str().unwrap();
             let expected = case["ts"]["code"].as_str().unwrap();
             let actual = replay(case).await;
-            if actual != expected {
-                diverging.push(format!("{name}: rust={actual} ts={expected}"));
+            match case.get("deviation") {
+                Some(deviation) => {
+                    let rust = deviation["rust"].as_str().unwrap();
+                    assert!(
+                        !deviation["reason"].as_str().unwrap().is_empty(),
+                        "{name}: empty deviation reason"
+                    );
+                    // A deviation must name the Rust result exactly and must only sit on a
+                    // case where Rust and TS actually disagree.
+                    if actual != rust || actual == expected {
+                        diverging.push(format!(
+                            "{name}: deviation rust={rust} ts={expected}, replay gives {actual}"
+                        ));
+                    }
+                }
+                None if actual != expected => {
+                    diverging.push(format!("{name}: rust={actual} ts={expected}"));
+                }
+                None => {}
             }
         }
         assert!(
             diverging.is_empty(),
-            "{} of {} cases diverge from TS:\n{}",
+            "{} of {} cases differ from TS without a matching deviation:\n{}",
             diverging.len(),
             cases.len(),
             diverging.join("\n")
