@@ -6796,6 +6796,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn v3_issuer_signature_refuses_real_key_with_s_plus_group_order() {
+        // A valid signature with S replaced by S + L (same scalar mod L, non-canonical).
+        // Uses a real key so the S >= L check is exercised on a genuine signature.
+        const GROUP_ORDER_LE: [u8; 32] = [
+            0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9,
+            0xde, 0x14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10,
+        ];
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let public = *signing.verifying_key().as_bytes();
+        let good = ed25519_dalek::Signer::sign(&signing, b"held").to_bytes();
+        assert!(super::verify_issuer_signature(&public, b"held", &good).is_ok());
+        let mut malleated = good;
+        let mut carry = 0u16;
+        for i in 0..32 {
+            let sum = good[32 + i] as u16 + GROUP_ORDER_LE[i] as u16 + carry;
+            malleated[32 + i] = sum as u8;
+            carry = sum >> 8;
+        }
+        assert_eq!(carry, 0, "S + L must fit in 32 bytes");
+        assert_ne!(malleated, good);
+        assert_eq!(
+            super::verify_issuer_signature(&public, b"held", &malleated)
+                .unwrap_err()
+                .1,
+            "credential-signature-invalid"
+        );
+    }
+
     #[tokio::test]
     async fn held_credentials_are_off_unless_enabled_with_a_valid_audience() {
         use crate::config::HeldCredentialsConfig;

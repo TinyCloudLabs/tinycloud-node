@@ -1927,6 +1927,76 @@ mod tests {
         );
     }
 
+    /// `MAX_SD_JWT_CHARS` is inclusive: 16384 passes `precheck`, 16385 is refused.
+    #[test]
+    fn sd_jwt_cap_admits_16384_chars_and_refuses_16385() {
+        let key = test_key();
+        let fixture = own_fixture(&key);
+        let policy = fixture.policy();
+        let at_cap = "a".repeat(16384);
+        let message = siwe_message(NONCE, &at_cap);
+        let signature = sign_siwe(&message);
+        let input = HeldPresentation {
+            sd_jwt: &at_cap,
+            siwe_message: &message,
+            siwe_signature: &signature,
+        };
+        assert!(
+            precheck(&input, &policy).is_ok(),
+            "16384 chars is at the cap"
+        );
+
+        let over = "a".repeat(16385);
+        let message = siwe_message(NONCE, &over);
+        let signature = sign_siwe(&message);
+        let input = HeldPresentation {
+            sd_jwt: &over,
+            siwe_message: &message,
+            siwe_signature: &signature,
+        };
+        assert_eq!(
+            precheck(&input, &policy).err(),
+            Some(BAD_PRESENTATION),
+            "16385 chars exceeds the cap"
+        );
+    }
+
+    /// `MAX_SIWE_MESSAGE_CHARS` is inclusive. A 2048-byte message is not refused
+    /// by the cap, so it reaches `parse_siwe`, which refuses it as `bad-siwe`
+    /// because its first line lacks the header. A 2049-byte message is refused
+    /// by the cap before parsing.
+    #[test]
+    fn siwe_message_cap_admits_2048_bytes_and_refuses_2049() {
+        let key = test_key();
+        let fixture = own_fixture(&key);
+        let policy = fixture.policy();
+        let at_cap = "a".repeat(2048);
+        let signature = sign_siwe(&at_cap);
+        let input = HeldPresentation {
+            sd_jwt: "a",
+            siwe_message: &at_cap,
+            siwe_signature: &signature,
+        };
+        assert_eq!(
+            precheck(&input, &policy).err(),
+            Some(BAD_SIWE),
+            "2048 bytes passes the cap and reaches the parser"
+        );
+
+        let over = "a".repeat(2049);
+        let signature = sign_siwe(&over);
+        let input = HeldPresentation {
+            sd_jwt: "a",
+            siwe_message: &over,
+            siwe_signature: &signature,
+        };
+        assert_eq!(
+            precheck(&input, &policy).err(),
+            Some(BAD_PRESENTATION),
+            "2049 bytes exceeds the cap"
+        );
+    }
+
     #[test]
     fn did_pkh_accepts_all_lowercase_or_exact_eip55_only() {
         assert!(parse_pkh(CALLER).is_some());

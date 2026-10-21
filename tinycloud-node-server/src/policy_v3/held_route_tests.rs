@@ -43,7 +43,7 @@ async fn held_request_with_a_credential_field_is_refused_by_the_shape_gate(
     };
     h.grant_owner(Window::until(now() + Duration::days(2)))
         .await?;
-    let policy = h.register_ok(policy_window()).await?;
+    let policy = register_held(&h).await?;
     let (status, body) = h.mint_held_with_credential(&policy).await?;
     assert_eq!(status, Status::BadRequest, "{body}");
     assert!(
