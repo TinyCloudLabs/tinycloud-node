@@ -419,6 +419,16 @@ pub(super) struct Harness {
 
 impl Harness {
     pub async fn new(backend: Backend, shape: Shape, test: &str) -> anyhow::Result<Option<Self>> {
+        Self::new_with_held(backend, shape, test, false).await
+    }
+
+    /// Same harness, with the held-credentials flag set. An enabled flag needs an audience.
+    pub async fn new_with_held(
+        backend: Backend,
+        shape: Shape,
+        test: &str,
+        held: bool,
+    ) -> anyhow::Result<Option<Self>> {
         let Some(db) = TestDatabase::new(backend, test).await? else {
             return Ok(None);
         };
@@ -442,7 +452,7 @@ impl Harness {
             None,
         );
         let network = format!("urn:tinycloud:encryption:{}:mainnet", space_owner.did());
-        let client = Self::boot_app(&db, &vector, &issuer).await?;
+        let client = Self::boot_app(&db, &vector, &issuer, held).await?;
         let harness = Self {
             client,
             _db: db,
@@ -464,6 +474,7 @@ impl Harness {
         db: &TestDatabase,
         vector: &Value,
         issuer: &tinycloud_core::libp2p::identity::ed25519::Keypair,
+        held: bool,
     ) -> anyhow::Result<Client> {
         let mut config = crate::config::Config::default();
         config.storage.datadir = db.datadir().into();
@@ -484,6 +495,10 @@ impl Harness {
             .to_owned();
         config.share_email.issuer_public_key =
             Some(encode_config(issuer.public().to_bytes(), URL_SAFE_NO_PAD));
+        config.held_credentials = crate::config::HeldCredentialsConfig {
+            enabled: held,
+            audience: held.then(|| "relying-party.example".to_owned()),
+        };
         let figment = Figment::from(rocket::Config {
             address: "127.0.0.1".parse()?,
             log_level: rocket::config::LogLevel::Off,
@@ -976,6 +991,44 @@ impl Harness {
                     "challengeId": challenge["challengeId"],
                     "nonce": challenge["nonce"],
                     "requirement": self.vector["sdkRequirement"],
+                    "presentation": {
+                        "sdJwt": "held-placeholder~",
+                        "siwe": {"message": "placeholder", "signature": "0x00"}
+                    },
+                    "requestedExpiresAt": format_time(now() + Duration::seconds(300)),
+                })
+                .to_string(),
+            )
+            .dispatch()
+            .await;
+        let status = response.status();
+        Ok((status, response.into_string().await.unwrap_or_default()))
+    }
+
+    /// A held-shaped request whose `credential` field is set. The request-shape gate
+    /// refuses it before any verifier work.
+    pub async fn mint_held_with_credential(
+        &self,
+        policy: &Registered,
+    ) -> anyhow::Result<(Status, String)> {
+        let (status, body) = self.challenge(policy).await;
+        if status != Status::Ok {
+            return Ok((status, body));
+        }
+        let challenge: Value = serde_json::from_str(&body)?;
+        let response = self
+            .client
+            .post("/policy/v3/delegations")
+            .header(ContentType::JSON)
+            .body(
+                json!({
+                    "policyCid": policy.policy_cid,
+                    "challengeId": challenge["challengeId"],
+                    "nonce": challenge["nonce"],
+                    "requirement": self.vector["sdkRequirement"],
+                    "accountAuthorizationCid": "placeholder",
+                    "credentialSpaceId": "placeholder",
+                    "credential": {},
                     "presentation": {
                         "sdJwt": "held-placeholder~",
                         "siwe": {"message": "placeholder", "signature": "0x00"}
