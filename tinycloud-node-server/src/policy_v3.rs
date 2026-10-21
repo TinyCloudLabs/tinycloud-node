@@ -5959,6 +5959,14 @@ fn requirement_claims_satisfied(
             ));
         }
     }
+    for name in disclosed.keys() {
+        if !claims.contains_key(name) {
+            return Err((
+                Status::Forbidden,
+                "credential-requirement-not-satisfied".into(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -6816,6 +6824,27 @@ mod tests {
             &std::collections::BTreeMap::new()
         )
         .is_err());
+    }
+
+    #[test]
+    fn held_disclosures_beyond_the_requirement_are_refused() {
+        let requirement = serde_json::json!({"claims": {"emailDomain": "example.com"}});
+        let disclosed = std::collections::BTreeMap::from([
+            ("email".to_owned(), "alice@example.com".to_owned()),
+            ("emailDomain".to_owned(), "example.com".to_owned()),
+        ]);
+        // Requirement asks only for the domain; disclosing the full email is refused.
+        assert_eq!(
+            super::requirement_claims_satisfied(&requirement, &disclosed)
+                .unwrap_err()
+                .1,
+            "credential-requirement-not-satisfied"
+        );
+        let domain_only = std::collections::BTreeMap::from([(
+            "emailDomain".to_owned(),
+            "example.com".to_owned(),
+        )]);
+        assert!(super::requirement_claims_satisfied(&requirement, &domain_only).is_ok());
     }
 
     #[tokio::test]
@@ -11134,3 +11163,7 @@ mod test_harness;
 #[cfg(test)]
 #[path = "policy_v3/root_revocation_tests.rs"]
 mod root_revocation_tests;
+
+#[cfg(test)]
+#[path = "policy_v3/held_route_tests.rs"]
+mod held_route_tests;

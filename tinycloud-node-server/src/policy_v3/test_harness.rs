@@ -954,6 +954,39 @@ impl Harness {
             .map_err(|(status, body)| anyhow::anyhow!("mint: {status} {body}"))
     }
 
+    /// POST a shape-valid held presentation (`{sdJwt, siwe}`) to the mint
+    /// route after a fresh challenge. Used where the verifier must not run
+    /// (the held flag is off), so the body needs only the held shape.
+    pub async fn mint_held_presentation(&self, policy: &Registered) -> anyhow::Result<(Status, String)> {
+        let (status, body) = self.challenge(policy).await;
+        if status != Status::Ok {
+            return Ok((status, body));
+        }
+        let challenge: Value = serde_json::from_str(&body)?;
+        let response = self
+            .client
+            .post("/policy/v3/delegations")
+            .header(ContentType::JSON)
+            .body(
+                json!({
+                    "policyCid": policy.policy_cid,
+                    "challengeId": challenge["challengeId"],
+                    "nonce": challenge["nonce"],
+                    "requirement": self.vector["sdkRequirement"],
+                    "presentation": {
+                        "sdJwt": "held-placeholder~",
+                        "siwe": {"message": "placeholder", "signature": "0x00"}
+                    },
+                    "requestedExpiresAt": format_time(now() + Duration::seconds(300)),
+                })
+                .to_string(),
+            )
+            .dispatch()
+            .await;
+        let status = response.status();
+        Ok((status, response.into_string().await.unwrap_or_default()))
+    }
+
     /// The holder reads the content under a minted session.
     pub async fn read(&self, session: &str) -> anyhow::Result<(Status, Vec<u8>)> {
         let s0 = decode_delegation(session).map_err(|(_, error)| anyhow::anyhow!(error))?;

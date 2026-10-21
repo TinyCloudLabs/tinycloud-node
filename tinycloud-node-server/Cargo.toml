@@ -22,6 +22,8 @@ anyhow = "1"
 ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 k256 = { version = "0.13.4", features = ["ecdsa"] }
 sha3 = "0.10"
+# WHATWG URL parsing for the SIWE origin check (held_email.rs).
+url = "2"
 aes-gcm = "0.10"
 async-trait.workspace = true
 # No default HTTPS client: the SDK's default pulls in rustls with aws-lc-rs,

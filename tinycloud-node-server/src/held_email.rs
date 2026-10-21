@@ -1014,13 +1014,14 @@ fn rfc3339_shape(text: &str) -> bool {
 /// The SIWE URI: https, no userinfo, and the origin host is the audience. A default `:443`
 /// is dropped, as WHATWG `URL.origin` does.
 fn uri_matches_audience(uri: &str, audience: &str) -> bool {
-    let Some(rest) = uri.strip_prefix("https://") else {
+    let Ok(parsed) = url::Url::parse(uri) else {
         return false;
     };
-    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let authority = rest[..end].to_ascii_lowercase();
-    let host = authority.strip_suffix(":443").unwrap_or(&authority);
-    !authority.contains('@') && host == audience
+    parsed.scheme() == "https"
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
+        && parsed.port().is_none()
+        && parsed.host_str() == Some(audience)
 }
 
 /// Checks the disclosed values against the email row's rules.
@@ -1076,8 +1077,8 @@ mod tests {
     const CALLER: &str = "did:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
     const OTHER_ACCOUNT: &str = "did:pkh:eip155:1:0x1111111111111111111111111111111111111111";
     const ANVIL_KEY: &str = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
-    const TEST_ISSUER: &str = "did:web:held-test.example";
-    const TEST_KID: &str = "did:web:held-test.example#k1";
+    const TEST_ISSUER: &str = "did:web:issuer.credentials.org";
+    const TEST_KID: &str = "did:web:issuer.credentials.org#k1";
     const ISSUED_AT: &str = "2026-01-01T00:59:00Z";
     const NOW: &str = "2026-01-01T01:00:00Z";
     const IAT: i64 = 1_767_225_600;
@@ -1369,7 +1370,7 @@ mod tests {
             "version": 1,
             "profile": profile,
             "credentialType": credential_type,
-            "claims": {"email": "alice@example.com"},
+            "claims": {"email": "alice@example.com", "emailDomain": "example.com"},
             "maxAgeSeconds": 31_536_000,
         });
         let policy = json!({"credentialRequirement": {
@@ -2311,6 +2312,27 @@ mod tests {
             }
             Ok(_) => "ok-identity-diverges".to_owned(),
             Err(code) => code.to_owned(),
+        }
+    }
+
+    #[test]
+    fn siwe_uri_must_be_https_with_no_userinfo_and_the_exact_audience_host() {
+        let audience = "tinycloud.example";
+        for (uri, expected) in [
+            ("https://tinycloud.example/nonce", true),
+            ("https://TINYCLOUD.example/", true),
+            ("https://tinycloud.example:443/x?y#z", true),
+            ("https://tinycloud.example:8443/", false),
+            ("https://user@tinycloud.example/", false),
+            ("https://user:pw@tinycloud.example/", false),
+            ("https://tinycloud.example.evil/", false),
+            ("https://evil.example/@tinycloud.example", false),
+            ("https://tinycloud.example./", false),
+            ("http://tinycloud.example/", false),
+            ("tinycloud.example", false),
+            ("", false),
+        ] {
+            assert_eq!(uri_matches_audience(uri, audience), expected, "{uri}");
         }
     }
 }

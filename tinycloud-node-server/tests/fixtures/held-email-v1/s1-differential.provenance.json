@@ -10,5 +10,7 @@
   "casesSha256": "f1a976b81884ae04f1d8dd08142656572be2f920550b2a2b4f0950560c53b42a",
   "reproduction": "Re-running the generator yields different SIWE nonces (the SDK's InMemoryNonceStore issues random nonces), so bytes differ. Regenerated TS verdicts match committed verdicts for all 145 cases (0 diffs, names equal). Reviewers check verdict equality, not file hash.",
   "keyMaterial": "public test vectors only (Anvil account, test issuer did:web:held-test.example)",
+  "specIssuer": "Spec sections 3.3 and 6 allow only did:web:issuer.credentials.org under the email row. This table uses did:web:held-test.example, i.e. pre-TC-1677 TS behaviour. It is NOT spec-aligned.",
+  "regenerationStatus": "BLOCKED: TC-1677 is Backlog with no published sdk-core beta and no pushed js-sdk branch. Regenerate from the TC-1677 build when it lands, then update packageVersion, verifierSha256, cases, casesSha256, and the issuer strings in the generator and table.",
   "consumedBy": "held_email::tests::s1_differential_table_matches_ts_verdicts"
 }
