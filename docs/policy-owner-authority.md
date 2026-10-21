@@ -154,6 +154,39 @@ recorded only when both steps found nothing and more candidates exist than
 were examined; unlike the other `unknown` reasons it is not final and is
 classified again on a later use.
 
+### Register grant (classifier version 3)
+
+A policy owner who holds no owner-first or general-window delegation for a
+root can still be authorised by a register grant. Selection tries it only
+when the ordinary selection above returns nothing, so an owner who already
+holds the capabilities keeps the ordinary path. The space owner delegates
+`tinycloud.policy/register` on exactly `<S>/policy/<h>`, where `h` is the
+template digest of the policy:
+
+    h = lowercase hex SHA-256("xyz.tinycloud.policy/RegisterTemplate/v1\0"
+        || JCS(policy without policyId, createdAt, expiresAt, signature))
+
+For a root R with owner O, space S, and time t, a delegation D is a register
+grant when:
+
+1. `D.delegatee` is O.
+2. D carries `tinycloud.policy/register` on `<S>/policy/<h>`, and `h` is the
+   template digest of R's policy.
+3. `D.delegator` is the owner of S.
+4. D has no parents, its ancestor closure is exactly `{D}`, and D is not a
+   policy-fact row.
+5. D is not revoked (alias-aware), and `t` is in `[D.nbf, D.exp)`.
+6. `R.exp <= D.exp`. Otherwise the registration is refused with
+   `policy-root-outlives-register-grant` in both modes, since the grant cannot
+   cover the root's lifetime.
+
+A registration accepted by a register grant is bound with authority until
+`D.exp` and the closure `{D}`.
+
+`/delegate` refuses any delegation with parents that carries a
+`tinycloud.policy/*` ability (`policy-register-grant-must-be-parentless`), so
+a register grant is always a root delegation.
+
 ## Policies registered earlier
 
 A policy with no final binding row is classified on first use, because the
