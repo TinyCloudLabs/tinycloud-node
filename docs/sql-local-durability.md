@@ -34,7 +34,8 @@ If free space cannot be read the write is refused (`Internal`), never allowed.
 - `PRAGMA synchronous` is set on every file-backed connection: `FULL` by default, in `open_connection` and, before the copy, in `promote_to_file`. With WAL, `FULL` fsyncs the WAL on every COMMIT. `NORMAL` (the rollback flag) fsyncs only at checkpoints.
 - SQLite itself fsyncs the directory when it first creates a `-wal` file (the unix VFS `UNIXFILE_DIRSYNC` flag on a new WAL), but not for the main database file. So the node fsyncs: the directories it creates for a database (`create_dir_all_durable`), the directory after `promote_to_file` creates the database file, and the directory after the renames in `CacheFileSink::commit` (the parts are already `sync_all`'d before the rename).
 - Deleting stale cache files before a hydration is not directory-synced: Postgres is master and the cache is re-creatable.
-- Databases below `memory_threshold` (10 MiB) are in-memory SQLite; their durable copy is the Postgres save, as before.
+- `FULL` is necessary, not sufficient. It does not prove the CVM volume honours flushes.
+- Databases below `memory_threshold` (10 MiB) are in-memory SQLite: there is no local file to fsync, and their durability is the Postgres save, as before. Store-master (1b) needs them file-backed.
 
 ## Outcomes in this phase
 
@@ -44,11 +45,11 @@ If free space cannot be read the write is refused (`Internal`), never allowed.
 | **Committed** | The local COMMIT returned and, for a file-backed database with `FULL`, its WAL fsync did; and the Postgres save succeeded. Only then is success returned. |
 | **Unknown** | Unchanged TC-1274 `outcome_unknown`: the Postgres save was sent and its outcome is not known. |
 
-A failed Postgres save discards the local state, and a local commit that was not released is dropped when the service next re-hydrates from Postgres.
+Unchanged on purpose: a failed Postgres save discards the local state. A local commit that was never released (the process died after COMMIT, before the response) is dropped when the service next re-hydrates from Postgres, which is correct while Postgres is master.
 
-**COMMIT error.** If COMMIT returns an error the request is reported as rejected (`sql_commit_failed`); the node discards the local state and re-hydrates from Postgres.
+**COMMIT error.** If COMMIT's fsync fails after the WAL frames were written, SQLite reports the error and the request is reported as rejected, but the commit can still appear when the file is next opened. That is harmless here: the node discards the local state (`CommitFailed`) and re-hydrates from Postgres, which never saw the write. Under store-master (1b and later) it is an outcome-unknown case: keep the local WAL and answer `outcome_unknown`.
 
-The kill -9 tests use `before_commit`, `after_commit` and `before_response` seams to cut the request at each step.
+A kill -9 test cannot inject "after COMMIT, before its fsync completed"; `before_commit`, `after_commit` and `before_response` seams cover the cuts that exist. SIGKILL does not drop the page cache, so the tests prove the commit protocol, not power loss.
 
 ## Settings
 
@@ -60,9 +61,9 @@ The kill -9 tests use `before_commit`, `after_commit` and `before_response` seam
 | `max_database_bytes` | `0` (no cap) | per-database size cap, enforced by SQLite's `max_page_count` |
 | `min_free_bytes` | `0` (check off) | disk kept free after all in-flight reservations; `0` disables the gate, the reservation and the free-space reads |
 
-**The two limits are off by default** and are set by config. The mechanism is tested with explicit values. What stays on by default besides `synchronous`: the transaction per write request and the owner-budget limit below.
+**The two limits are off by default.** They are Sam's decision (card `sql-storage-report-read`) and are set by config once he answers; an unmeasured cap could refuse real users' databases. The mechanism is fully tested with explicit values. What stays on by default besides `synchronous`: the transaction per write request and the owner-budget limit below.
 
-**The owner budget is not switchable.** `max_page_count` is set from the owner's remaining quota (`limit - used`, the same `storage_check` read as before), so a write that would exceed the remaining quota is refused with 402 before COMMIT. The comparison is the database's page growth against the remainder, the unit the quota already charges (logical database size); growth that frees pages elsewhere in the file is not counted.
+**Owner budget is not switchable and can refuse a write today's code allows.** `max_page_count` is set from the owner's remaining quota (`limit - used`, the same `storage_check` read as before). Today a write that overshoots a non-zero remainder is allowed once and only the next one is refused with 402; now the overshooting write itself is refused with 402 before COMMIT. The comparison is the database's page growth against the remainder, the unit the quota already charges (logical database size); growth that frees pages elsewhere in the file is not counted, so it is never stricter than the charge.
 
 ## Errors
 
@@ -81,8 +82,6 @@ The kill -9 tests use `before_commit`, `after_commit` and `before_response` seam
 
 **PRAGMA.** A request that carries a `PRAGMA` (admin only) is not wrapped and not gated. This also keeps the actor's connection reset after a request that held a non-report `PRAGMA` (TC-1586) outside any transaction: the reset runs after the request, after the transaction has ended. `PRAGMA synchronous` is not on the admin allow-list, so it cannot be read or set through a request.
 
-**Retire order.** When that reset fails, the actor is retired. The pre-commit gate and the reservation release are on the same path as before: the reservation is released by a drop guard in `SqlService::execute_locked` when the request returns, whatever the actor did, so the retire order does not change it. A request that triggers the reset held a `PRAGMA`, so it was never wrapped, gated or reserved in the first place.
+**Retire order.** When that reset fails, the actor is retired (deregistered before the error reply, TC-1594 tracks closing the connection first). The pre-commit gate and the reservation release are on the same path as before: the reservation is released by a drop guard in `SqlService::execute_locked` when the request returns, whatever the actor did, so the retire order does not change it. A request that triggers the reset held a `PRAGMA`, so it was never wrapped, gated or reserved in the first place.
 
 `Publication` commands are not gated either. DuckDB is untouched.
-
-Details: TC-1491
