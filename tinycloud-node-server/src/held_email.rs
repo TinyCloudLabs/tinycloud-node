@@ -806,9 +806,9 @@ fn eip55_ok(hex40: &str) -> bool {
 }
 
 /// EIP-191 `personal_sign` recovery over the raw message bytes. Accepts v in
-/// {27, 28, 0, 1}. High-S is refused: `recover_from_prehash` verifies the
-/// signature with `verify_prehash`, which enforces low-S. TS beta.37 recovers
-/// high-S signatures (no low-S check); that divergence is tracked on TC-1540.
+/// {27, 28, 0, 1}. High-S is refused: `recover_from_prehash` calls `verify_prehash`
+/// on the recovered key, which enforces low-S. TS beta.37 recovers high-S signatures;
+/// the replay records that as a `deviation` in `s1-differential.json`.
 fn recover_eip191_address(message: &[u8], signature: &[u8]) -> Option<String> {
     let mut prefixed = format!("\x19Ethereum Signed Message:\n{}", message.len()).into_bytes();
     prefixed.extend_from_slice(message);
@@ -2568,8 +2568,8 @@ mod tests {
     }
 
     /// High-S SIWE signatures (`n - s` with the flipped recovery byte) are refused:
-    /// `recover_eip191_address` verifies with `verify_prehash`, which enforces low-S.
-    /// TS beta.37 recovers them (no low-S check); the divergence is tracked on TC-1540.
+    /// `recover_from_prehash` verifies with `verify_prehash`, which enforces low-S.
+    /// TS beta.37 accepts them; the difference is recorded as a deviation in the table.
     #[test]
     fn siwe_high_s_signature_is_refused_and_low_s_still_recovers() {
         use k256::elliptic_curve::PrimeField;
