@@ -173,6 +173,11 @@ pub enum DelegationError {
     PolicyRootRequiresConjunctiveSession,
     #[error("policy-descendant-fact-invalid")]
     PolicyDescendantFactInvalid,
+    /// A `tinycloud.policy/*` ability is only honoured as a parentless grant
+    /// from the space owner (DESIGN-c-narrow-register Q1). Sub-delegating it
+    /// is refused so stray register rows never enter the graph.
+    #[error("policy-register-grant-must-be-parentless")]
+    PolicyAbilityRequiresNoParents,
     /// W1: child caveats are not a subset of the parent's caveats — the
     /// child dropped, widened, or replaced a constrained-statements caveat
     /// the parent carried (audit P0 finding 1). Maps to the spec rejection
@@ -236,6 +241,17 @@ async fn validate<C: ConnectionTrait>(
     db: &C,
     delegation: &util::DelegationInfo,
 ) -> Result<(), Error> {
+    // DESIGN-c-narrow-register Q1: a `tinycloud.policy/*` grant is only
+    // honoured parentless, from the space owner. A child that carries one is
+    // refused here, before any parent-based authorization runs.
+    if !delegation.parents.is_empty()
+        && delegation
+            .capabilities
+            .iter()
+            .any(|c| c.ability.to_string().starts_with("tinycloud.policy/"))
+    {
+        return Err(DelegationError::PolicyAbilityRequiresNoParents.into());
+    }
     // get caps which rely on delegated caps
     let dependant_caps: Vec<_> = delegation
         .capabilities
