@@ -806,7 +806,9 @@ fn eip55_ok(hex40: &str) -> bool {
 }
 
 /// EIP-191 `personal_sign` recovery over the raw message bytes. Accepts v in
-/// {27, 28, 0, 1}. High-S is not refused.
+/// {27, 28, 0, 1}. High-S is refused: `recover_from_prehash` verifies the
+/// signature with `verify_prehash`, which enforces low-S. TS beta.37 recovers
+/// high-S signatures (no low-S check); that divergence is tracked on TC-1540.
 fn recover_eip191_address(message: &[u8], signature: &[u8]) -> Option<String> {
     let mut prefixed = format!("\x19Ethereum Signed Message:\n{}", message.len()).into_bytes();
     prefixed.extend_from_slice(message);
@@ -2546,5 +2548,30 @@ mod tests {
         ] {
             assert_eq!(uri_matches_audience(uri, audience), expected, "{uri}");
         }
+    }
+
+    /// High-S SIWE signatures (`n - s` with the flipped recovery byte) are refused:
+    /// `recover_eip191_address` verifies with `verify_prehash`, which enforces low-S.
+    /// TS beta.37 recovers them (no low-S check); the divergence is tracked on TC-1540.
+    #[test]
+    fn siwe_high_s_signature_is_refused_and_low_s_still_recovers() {
+        use k256::elliptic_curve::PrimeField;
+        let message = siwe_message(NONCE, "held-placeholder~");
+        let low = sign_siwe(&message);
+        let bytes = hex::decode(low.trim_start_matches("0x")).unwrap();
+        let s = k256::Scalar::from_repr(*k256::FieldBytes::from_slice(&bytes[32..64])).unwrap();
+        let high_s = (-s).to_bytes();
+        assert_ne!(high_s.as_slice(), &bytes[32..64]);
+        let mut high = bytes[..32].to_vec();
+        high.extend_from_slice(&high_s);
+        high.push(if bytes[64] == 27 { 28 } else { 27 });
+        let prefixed_message = message.as_bytes();
+        assert_eq!(recover_eip191_address(prefixed_message, &high), None);
+        assert_eq!(
+            recover_eip191_address(prefixed_message, &bytes)
+                .unwrap()
+                .to_lowercase(),
+            HOLDER.to_lowercase()
+        );
     }
 }
