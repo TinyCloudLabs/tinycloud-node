@@ -4721,4 +4721,170 @@ mod tests {
             );
         }
     }
+
+    /// TC-1491: a single write is all-or-nothing whatever its conflict clause
+    /// says. A statement that stops with `OR FAIL` or `ON CONFLICT FAIL`
+    /// leaves the rows it changed first when it runs on its own; the request
+    /// is one transaction, so it leaves none of them: the local file is
+    /// unchanged and no repository (Postgres) call is made.
+    #[tokio::test]
+    async fn tc1491_a_single_write_with_fail_conflict_resolution_leaves_nothing() {
+        for memory_threshold in [u64::MAX, 0] {
+            let repo = artifact_repository().await;
+            let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let cache = TempDir::new().unwrap();
+            let space = test_space_id("sql-atomic-or-fail");
+            let service = SqlService::new(
+                cache.path().to_string_lossy().into_owned(),
+                memory_threshold,
+                Arc::new(CallCountingRepository {
+                    inner: repo,
+                    calls: calls.clone(),
+                }),
+            );
+            let run = |sql: &str, ability: &str| {
+                service.execute(
+                    &space,
+                    "main",
+                    SqlRequest::Execute {
+                        schema: None,
+                        sql: sql.into(),
+                        params: Vec::new(),
+                    },
+                    None,
+                    ability.into(),
+                )
+            };
+            run(
+                "CREATE TABLE u (id INTEGER PRIMARY KEY, v TEXT UNIQUE)",
+                "tinycloud.sql/admin",
+            )
+            .await
+            .unwrap();
+            run(
+                "INSERT INTO u VALUES (10,'x'),(11,'y'),(12,'z')",
+                "tinycloud.sql/write",
+            )
+            .await
+            .unwrap();
+            let handle = service.handle(&space, "main").await.unwrap();
+            let before = handle.checkpoint().await.unwrap();
+
+            for sql in ["INSERT OR FAIL INTO u VALUES (1,'a'),(2,'b'),(1,'dup')"] {
+                calls.lock().unwrap().clear();
+                let failed = run(sql, "tinycloud.sql/write").await;
+                assert!(
+                    matches!(failed, Err(SqlError::Sqlite(_))),
+                    "{sql}: {failed:?}"
+                );
+                assert!(
+                    calls.lock().unwrap().is_empty(),
+                    "{sql}: a rejected write costs no repository call"
+                );
+                assert_eq!(
+                    rows_of(&service, &space, "SELECT count(*) FROM u").await,
+                    vec![vec![SqlValue::Integer(3)]],
+                    "{sql}"
+                );
+                assert_eq!(
+                    rows_of(&service, &space, "SELECT group_concat(v) FROM u").await,
+                    vec![vec![SqlValue::Text("x,y,z".into())]],
+                    "{sql}"
+                );
+                assert!(
+                    handle.checkpoint().await.unwrap() == before,
+                    "{sql}: the checkpoint must not change"
+                );
+            }
+
+            // The same write as a `query` request, which the classifier
+            // treats as a write too.
+            let failed = service
+                .execute(
+                    &space,
+                    "main",
+                    SqlRequest::Query {
+                        sql: "INSERT OR FAIL INTO u VALUES (1,'a'),(2,'b'),(1,'dup')".into(),
+                        params: Vec::new(),
+                        max_rows: None,
+                        max_bytes: None,
+                    },
+                    None,
+                    "tinycloud.sql/write".into(),
+                )
+                .await;
+            assert!(failed.is_err(), "{failed:?}");
+            assert!(handle.checkpoint().await.unwrap() == before);
+        }
+    }
+
+    /// TC-1491: a deferred foreign key is checked when the request's
+    /// transaction commits. A violation there rolls the request back: nothing
+    /// is kept, the error is reported, and no repository call is made.
+    #[tokio::test]
+    async fn tc1491_a_deferred_constraint_failing_at_commit_leaves_nothing() {
+        for memory_threshold in [u64::MAX, 0] {
+            let repo = artifact_repository().await;
+            let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let cache = TempDir::new().unwrap();
+            let space = test_space_id("sql-atomic-deferred-fk");
+            let service = SqlService::new(
+                cache.path().to_string_lossy().into_owned(),
+                memory_threshold,
+                Arc::new(CallCountingRepository {
+                    inner: repo,
+                    calls: calls.clone(),
+                }),
+            );
+            let run = |request: SqlRequest| {
+                service.execute(&space, "main", request, None, "tinycloud.sql/admin".into())
+            };
+            let execute = |sql: &str| SqlRequest::Execute {
+                schema: None,
+                sql: sql.into(),
+                params: Vec::new(),
+            };
+            for ddl in [
+                "CREATE TABLE parents (id INTEGER PRIMARY KEY)",
+                "CREATE TABLE children (parent_id INTEGER REFERENCES parents(id) DEFERRABLE INITIALLY DEFERRED)",
+                "INSERT INTO parents VALUES (1)",
+                "INSERT INTO children VALUES (1)",
+            ] {
+                run(execute(ddl)).await.unwrap();
+            }
+            let handle = service.handle(&space, "main").await.unwrap();
+            let before = handle.checkpoint().await.unwrap();
+
+            for failing in [
+                execute("DELETE FROM parents"),
+                atomic_batch(&[
+                    "INSERT INTO parents VALUES (2)",
+                    "DELETE FROM parents WHERE id = 1",
+                ]),
+            ] {
+                calls.lock().unwrap().clear();
+                let failed = run(failing).await;
+                assert!(matches!(failed, Err(SqlError::Sqlite(_))), "{failed:?}");
+                assert!(
+                    calls.lock().unwrap().is_empty(),
+                    "a request rejected at commit costs no repository call: {:?}",
+                    calls.lock().unwrap()
+                );
+                assert_eq!(
+                    rows_of(&service, &space, "SELECT id FROM parents ORDER BY id").await,
+                    vec![vec![SqlValue::Integer(1)]]
+                );
+                assert!(handle.checkpoint().await.unwrap() == before);
+            }
+
+            // The connection is not left inside a transaction: the next
+            // request commits and is persisted.
+            calls.lock().unwrap().clear();
+            run(execute("DELETE FROM children")).await.unwrap();
+            assert_eq!(calls.lock().unwrap().len(), 1);
+            assert!(rows_of(&service, &space, "SELECT * FROM children")
+                .await
+                .is_empty());
+        }
+    }
 }
