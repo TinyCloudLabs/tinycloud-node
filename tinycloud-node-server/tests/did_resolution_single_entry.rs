@@ -139,6 +139,7 @@ const REVIEWED_SIGNATURE_SITES: &[&str] = &[
     "tinycloud-node-server/src/policy_v3.rs :: validate_stored_root_status :: verify_detached_ed25519",
     "tinycloud-node-server/src/policy_v3.rs :: verify_issuer_signature :: verify_bytes",
     "tinycloud-node-server/src/policy_v3.rs :: verify_signed_json :: verify_detached_ed25519",
+    "tinycloud-node-server/src/share_email.rs :: verify_did_key_signature :: did_key_public_key",
     "tinycloud-node-server/src/share_v2.rs :: verify_enforcement_delegation :: verify_detached_ed25519",
     "tinycloud-node-server/src/share_v2.rs :: verify_outer_envelope :: verify_detached_ed25519",
     "tinycloud-node-server/src/share_v2.rs :: verify_policy_proof :: verify_detached_ed25519",
@@ -219,8 +220,10 @@ impl Guard {
     }
 
     fn offline_cacao_verification(&self, call: &syn::ExprMethodCall) -> bool {
-        // CACAO's argument-free SIWE verification is offline. Pin these
-        // existing expressions; never exempt a file, function, or receiver.
+        // CACAO's argument-free SIWE verification is offline: EIP-191 recovery over the
+        // supplied message, with no resolver or RPC path. Pin these existing expressions;
+        // never exempt a file, function, or receiver. The client-side verifier crate is
+        // outside this server-side guard's scope.
         matches!(
             (
                 self.file.as_str(),
