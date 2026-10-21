@@ -726,6 +726,16 @@ mod tests {
 
     const HOLDER: &str = "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw";
 
+    #[test]
+    fn did_key_issuer_is_admitted_only_at_the_ed25519_identifier_length() {
+        assert!(did_key_public_key(HOLDER).is_ok());
+        assert!(did_key_public_key(&HOLDER[..HOLDER.len() - 1]).is_err());
+        assert!(did_key_public_key(&format!("{HOLDER}1")).is_err());
+        assert!(did_key_public_key(&format!("did:key:z6Mk{}", "1".repeat(65_532))).is_err());
+        // Right length and prefix, but not the Ed25519 multicodec.
+        assert!(did_key_public_key(&format!("did:key:z6Mk{}", "1".repeat(44))).is_err());
+    }
+
     fn scope() -> ShareScope {
         let space =
             Did::parse("did:pkh:eip155:1:0x1111111111111111111111111111111111111111").unwrap();

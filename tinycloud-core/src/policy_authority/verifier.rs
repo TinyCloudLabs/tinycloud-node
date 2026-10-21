@@ -341,19 +341,36 @@ mod tests {
                 value: String::new(),
             },
         };
-        let signature = [0u8; 65];
-        for issuer in [
-            "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw",
-            "did:pkh:solana:4sGjMW1sUnHzSxGspuhpqLDx6wiyjNtZ:0x0000000000000000000000000000000000000001",
-            "did:pkh:eip155:0:0x0000000000000000000000000000000000000001",
-        ] {
-            assert!(
-                matches!(
-                    verify_eip191(&artifact(issuer), b"unsigned", &signature),
-                    Err(super::super::AuthorityError::SchemaInvalid)
-                ),
-                "{issuer} must be refused before recovery"
-            );
-        }
+        // A real secp256k1 signature over the preimage `verify_eip191` checks. Recovery
+        // succeeds for it, so only the issuer-namespace check can refuse a non-eip155 issuer.
+        let signing_key = k256::ecdsa::SigningKey::from_slice(&[0x11; 32]).unwrap();
+        let public = signing_key.verifying_key().to_encoded_point(false);
+        let address = hex::encode(&Keccak256::digest(&public.as_bytes()[1..])[12..]);
+        let digest = Sha256::digest([ROOT_DOMAIN, b"unsigned".as_slice()].concat());
+        let mut preimage = b"\x19Ethereum Signed Message:\n32".to_vec();
+        preimage.extend_from_slice(&digest);
+        let hash = Keccak256::digest(preimage);
+        let (sig, recovery) = signing_key.sign_prehash_recoverable(&hash).unwrap();
+        let mut signature = [0u8; 65];
+        signature[..64].copy_from_slice(&sig.to_bytes());
+        signature[64] = recovery.to_byte();
+        // Positive control: the same signature verifies under an eip155 issuer.
+        assert!(verify_eip191(
+            &artifact(&format!("did:pkh:eip155:1:0x{address}")),
+            b"unsigned",
+            &signature
+        )
+        .is_ok());
+        // Same signer address under a non-eip155 issuer: refused by the namespace check.
+        assert!(matches!(
+            verify_eip191(
+                &artifact(&format!(
+                    "did:pkh:solana:4sGjMW1sUnHzSxGspuhpqLDx6wiyjNtZ:0x{address}"
+                )),
+                b"unsigned",
+                &signature
+            ),
+            Err(super::super::AuthorityError::SchemaInvalid)
+        ));
     }
 }

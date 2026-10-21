@@ -569,6 +569,10 @@ pub fn verify_detached_ed25519(
 
 /// Length of an Ed25519 `did:key` string: the `did:key:` prefix plus a 48-character identifier.
 const ED25519_DID_KEY_LEN: usize = "did:key:".len() + 48;
+#[cfg(test)]
+thread_local! {
+    static DID_KEY_DECODE_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 /// Decodes an Ed25519 `did:key` into its 32-byte public key. The length is checked before base58
 /// decoding, and only base58btc multibase over the `0xed 0x01` multicodec is accepted.
 pub fn did_key_public_key(did: &str) -> Result<[u8; 32], EvidenceError> {
@@ -578,6 +582,8 @@ pub fn did_key_public_key(did: &str) -> Result<[u8; 32], EvidenceError> {
     let encoded = did
         .strip_prefix("did:key:z")
         .ok_or(EvidenceError::Invalid)?;
+    #[cfg(test)]
+    DID_KEY_DECODE_ATTEMPTS.with(|c| c.set(c.get() + 1));
     let (_, bytes) = crate::ipld_core::cid::multibase::decode(format!("z{encoded}"))
         .map_err(|_| EvidenceError::Invalid)?;
     if bytes.len() != 34 || bytes[..2] != [0xed, 0x01] {
@@ -807,6 +813,25 @@ fn utf16_cmp(left: &str, right: &str) -> Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn did_key_public_key_refuses_wrong_lengths_without_decoding() {
+        let key = "z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
+        let short = format!("did:key:{}", &key[..47]);
+        let long = format!("did:key:{key}1");
+        let oversized = format!("did:key:z6Mk{}", "1".repeat(65_532));
+        let before = DID_KEY_DECODE_ATTEMPTS.with(std::cell::Cell::get);
+        for did in [&short, &long, &oversized] {
+            assert!(did_key_public_key(did).is_err());
+        }
+        assert_eq!(DID_KEY_DECODE_ATTEMPTS.with(std::cell::Cell::get), before);
+        // Positive control: the canonical identifier reaches the decoder exactly once.
+        assert!(did_key_public_key(&format!("did:key:{key}")).is_ok());
+        assert_eq!(
+            DID_KEY_DECODE_ATTEMPTS.with(std::cell::Cell::get),
+            before + 1
+        );
+    }
 
     #[test]
     fn email_normalization_preserves_local_and_only_lowercases_domain() {

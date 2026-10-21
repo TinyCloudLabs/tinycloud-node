@@ -1092,3 +1092,20 @@ fn did_key_public_key(did: &str) -> Result<PublicKey, String> {
         .map_err(|err| err.to_string())?;
     Ok(ed.into())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::did_key_public_key;
+
+    const ISSUER: &str = "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw";
+
+    #[test]
+    fn did_key_issuer_is_admitted_only_at_the_ed25519_identifier_length() {
+        assert!(did_key_public_key(ISSUER).is_ok());
+        assert!(did_key_public_key(&ISSUER[..ISSUER.len() - 1]).is_err());
+        assert!(did_key_public_key(&format!("{ISSUER}1")).is_err());
+        assert!(did_key_public_key(&format!("did:key:z6Mk{}", "1".repeat(65_532))).is_err());
+        // Right length and prefix, but not the Ed25519 multicodec.
+        assert!(did_key_public_key(&format!("did:key:z6Mk{}", "1".repeat(44))).is_err());
+    }
+}
