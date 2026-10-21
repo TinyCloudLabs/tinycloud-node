@@ -4,7 +4,7 @@
 
 ### Changes
 
-- A SQL request with more than one statement (a `batch`, or an `execute` that carries `schema` statements) is one transaction: if any statement fails, none of them is kept, the local file is unchanged and matches the durable copy in Postgres, and the request costs no Postgres round trip. A request that carries a `PRAGMA` statement (admin only) still runs statement by statement. A write nested in a query (`WITH … INSERT`) is one of those statements like any other. Single-statement requests are unchanged. Telemetry: such a request counts two more native SQL calls (the `SAVEPOINT` and its `RELEASE` or `ROLLBACK`). No migration. Details: TC-1491.
+- A SQL request that writes is one transaction: an `execute` (with its `schema` statements), a `batch`, a named statement, and a `query` that writes (`WITH … INSERT`) or carries a `PRAGMA` (admin only). If any statement fails, or a deferred constraint fails at the commit, none of them is kept: the local file is unchanged and matches the durable copy in Postgres, and the request costs no Postgres round trip. This holds for a single statement too, including `INSERT OR FAIL` and a column constraint with `ON CONFLICT FAIL`. Telemetry: such a request counts two more native SQL calls (the `SAVEPOINT` and its `RELEASE` or `ROLLBACK`). No migration. Details: TC-1491.
 
 ## [1.21.6] - 2026-10-21
 

@@ -201,7 +201,8 @@ async fn sqlite_counts_schema_execution_errors_and_guard_controls() {
             .expect_err("a constraint failure is an execution attempt");
     })
     .await;
-    assert_eq!(failed.snapshot().query_count, 1);
+    // The statement, and the request transaction's SAVEPOINT and ROLLBACK.
+    assert_eq!(failed.snapshot().query_count, 3);
     assert!(failed.snapshot().query_time_ns > 0);
     let guarded = request("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
     scope(

@@ -269,26 +269,36 @@ pub fn spawn_actor(
                         ),
                     };
                     conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+                    inject_open_transaction(&conn, &space_id, &db_name);
 
+                    // A request ends its transaction, by commit or rollback.
+                    // One still open here (a rollback that itself failed)
+                    // would swallow the next request's writes, so serve no
+                    // further request on this connection.
+                    //
                     // TC-1586: the connection is shared by every request on
                     // this database. After any request in which the
                     // authorizer allowed a PRAGMA outside the plain schema
                     // reports, reset it; if that fails, serve no further
-                    // request on this connection (the next one rebuilds it).
-                    if pragmas.load(Ordering::Relaxed)
+                    // request on this connection either (the next one
+                    // rebuilds it).
+                    let retire = if !conn.is_autocommit() {
+                        Some("SQL connection transaction could not be ended")
+                    } else if pragmas.load(Ordering::Relaxed)
                         && connection_reset_failed(&conn, &mode, &space_id, &db_name)
                     {
-                        tracing::error!(
-                            "SQL connection state could not be reset; retiring the database actor"
-                        );
+                        Some("SQL connection state could not be reset")
+                    } else {
+                        None
+                    };
+                    if let Some(reason) = retire {
+                        tracing::error!("{reason}; retiring the database actor");
                         // Deregister first, so the request that follows the
                         // error builds a new actor instead of finding this one.
                         databases.remove_if(&(space_id.clone(), db_name.clone()), |_, handle| {
                             handle.id == id
                         });
-                        let _ = response_tx.send(Err(SqlError::Internal(
-                            "SQL connection state could not be reset".into(),
-                        )));
+                        let _ = response_tx.send(Err(SqlError::Internal(reason.into())));
                         break None;
                     }
 
@@ -493,28 +503,44 @@ fn page_count(conn: &rusqlite::Connection) -> Result<i64, SqlError> {
 const REQUEST_BEGIN: &str = "SAVEPOINT tinycloud_request";
 const REQUEST_KEEP: &str = "RELEASE tinycloud_request";
 
-/// Whether `request` runs more than one statement and so needs a transaction
-/// of its own to be all-or-nothing (TC-1491). A single statement is already
-/// atomic. A request with a `PRAGMA` keeps running statement by statement:
-/// several pragmas (`foreign_keys`, `journal_mode`) are no-ops or errors
-/// inside a transaction, and they are admin-only.
-fn is_atomic_request(request: &SqlRequest) -> bool {
+/// Whether `request` runs in a transaction of its own (TC-1491).
+///
+/// Every request that can write does, so it is all-or-nothing whatever its
+/// conflict clauses say: a statement that stops with `OR FAIL` or
+/// `ON CONFLICT FAIL` keeps the rows it changed first when it runs on its
+/// own, and a request with several statements keeps its earlier ones.
+/// A request that carries a `PRAGMA` (admin only) is wrapped like any other.
+/// Every pragma the authorizer admits is transactional (`user_version` and
+/// `application_id` are undone by the rollback; the rest are reports), and
+/// the authorizer's allow-list is what keeps connection-level settings out of
+/// the transaction. The actor's TC-1586 connection reset runs after the
+/// transaction has ended.
+///
+/// Whether a query writes is `parser::classify_sql` (TC-1585), which sees
+/// writes nested in a query tree: a `WITH … INSERT` is wrapped like any other
+/// write. It does not depend on the caller's abilities (a read-tier grant is
+/// only a shortcut: its writes are refused anyway), and a statement that does
+/// not parse is left to `handle_request_authorized` to report. This is the one
+/// place that decides it; `Execute`, `Batch` and `ExecuteStatement` are wrapped
+/// whatever they contain, a read in a batch included.
+fn needs_transaction(
+    request: &SqlRequest,
+    caveats: &Option<SqlCaveats>,
+    authority: &SqlAuthority,
+) -> bool {
     match request {
-        SqlRequest::Execute { sql, schema, .. } => {
-            schema.as_ref().is_some_and(|stmts| !stmts.is_empty())
-                && !parser::is_pragma_sql(sql)
-                && !schema
-                    .iter()
-                    .flatten()
-                    .any(|stmt| parser::is_pragma_sql(stmt))
+        SqlRequest::Query { sql, .. } => {
+            !authority.is_read_tier_only()
+                && (parser::is_pragma_sql(sql)
+                    || parser::classify_sql(sql)
+                        .map(|class| !class.is_read_only)
+                        .unwrap_or(false))
         }
-        SqlRequest::Batch { statements } => {
-            statements.len() > 1
-                && !statements
-                    .iter()
-                    .any(|statement| parser::is_pragma_sql(&statement.sql))
-        }
-        _ => false,
+        SqlRequest::Execute { .. } | SqlRequest::Batch { .. } => true,
+        SqlRequest::ExecuteStatement { name, .. } => caveats
+            .as_ref()
+            .is_some_and(|c| c.find_statement(name).is_some()),
+        SqlRequest::Export => false,
     }
 }
 
@@ -559,23 +585,21 @@ fn handle_message(
 /// Run `request` as one transaction when it needs one: every statement is
 /// kept or none is.
 ///
-/// Before TC-1491 each statement of a batch committed on its own, so a later
-/// failure left a committed prefix in the local file while the durable copy
-/// (written only after a fully successful request) did not have it; the two
-/// stayed apart until the next write persisted both. The transaction is a
-/// `SAVEPOINT`, which opens one when none is active; users cannot issue
-/// transaction control themselves, the authorizer denies it.
-///
-/// The decision counts statements and looks for a `PRAGMA`; it does not ask
-/// whether a statement writes, so a `WITH … INSERT` (a write, TC-1585) is
-/// covered like any other statement of a batch. The wrap sits inside the
-/// request and outside the actor's TC-1586 connection reset, which runs after
-/// the transaction has ended; a request with a `PRAGMA` is never wrapped, so
-/// the reset (itself a set of `PRAGMA`s) never runs inside a transaction.
+/// The transaction is a `SAVEPOINT`, which opens one when none is active;
+/// users cannot issue transaction control themselves, the authorizer denies
+/// it. A failure at any statement, or at the commit (a deferred constraint),
+/// is a `ROLLBACK`: the local file is unchanged and matches the durable copy,
+/// which is only written after a fully successful request. See
+/// [`needs_transaction`] for what is wrapped. The wrap sits inside the request
+/// and outside the actor's TC-1586 connection reset, which runs after the
+/// transaction has ended.
 ///
 /// When a transaction is already open, [`handle_message_without_growth_authorized`]'s
 /// guard has it and already undoes the whole request on any error (reporting
 /// growth ahead of the SQL error), so this adds nothing there.
+///
+/// If the transaction is still open after the final `ROLLBACK`, the actor
+/// retires the connection instead of serving another request on it.
 fn handle_message_authorized(
     conn: &rusqlite::Connection,
     request: &SqlRequest,
@@ -583,7 +607,7 @@ fn handle_message_authorized(
     authority: &SqlAuthority,
     pragmas: &PragmaTracker,
 ) -> Result<SqlExecutionResult, SqlError> {
-    if !is_atomic_request(request) || !conn.is_autocommit() {
+    if !conn.is_autocommit() || !needs_transaction(request, caveats, authority) {
         return handle_request_authorized(conn, request, caveats, authority, pragmas);
     }
     {
@@ -855,6 +879,27 @@ fn injected_reset_failure(space_id: &str, db_name: &str) -> bool {
 fn injected_reset_failure(_space_id: &str, _db_name: &str) -> bool {
     false
 }
+
+/// Test seam: databases whose connection is left inside a transaction after
+/// their next request, as a failed final `ROLLBACK` would leave it.
+#[cfg(test)]
+pub(crate) static OPEN_TRANSACTIONS: std::sync::Mutex<Vec<(String, String)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn inject_open_transaction(conn: &rusqlite::Connection, space_id: &str, db_name: &str) {
+    let injected = OPEN_TRANSACTIONS
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(space, db)| space == space_id && db == db_name);
+    if injected {
+        conn.execute_batch("BEGIN").unwrap();
+    }
+}
+
+#[cfg(not(test))]
+fn inject_open_transaction(_conn: &rusqlite::Connection, _space_id: &str, _db_name: &str) {}
 
 fn is_insert_statement(parsed: &parser::ParsedQuery) -> bool {
     matches!(
@@ -1705,34 +1750,192 @@ mod publication_rollback_tests {
         }
     }
 
+    /// A request that carries a `PRAGMA` is one transaction like any other:
+    /// a failure leaves neither its statements nor the header value it set,
+    /// and the connection is still served afterwards.
     #[tokio::test]
-    async fn tc1491_pragma_requests_keep_running_statement_by_statement() {
+    async fn tc1491_pragma_requests_are_one_transaction() {
+        for memory_threshold in [u64::MAX, 0] {
+            let dir = tempfile::tempdir().unwrap();
+            let actor = spawn_test_actor(&dir, memory_threshold);
+            run(
+                &actor,
+                exec("CREATE TABLE t (v TEXT NOT NULL)"),
+                GrowthPolicy::Allow,
+            )
+            .await
+            .unwrap();
+            let before = actor.checkpoint().await.unwrap();
+
+            // `user_version` is on the admin PRAGMA allow-list (TC-1586);
+            // `foreign_keys = OFF` is not.
+            for failing in [
+                batch(&[
+                    "PRAGMA user_version = 7",
+                    "INSERT INTO t VALUES ('prefix')",
+                    "INSERT INTO t VALUES (NULL)",
+                ]),
+                batch(&[
+                    "INSERT INTO t VALUES ('prefix')",
+                    "PRAGMA application_id = 9",
+                    "INSERT INTO t VALUES (NULL)",
+                ]),
+                SqlRequest::Execute {
+                    schema: Some(vec![
+                        "PRAGMA user_version = 7".into(),
+                        "INSERT INTO t VALUES ('prefix')".into(),
+                    ]),
+                    sql: "INSERT INTO t VALUES (NULL)".into(),
+                    params: vec![],
+                },
+            ] {
+                let failed = run(&actor, failing, GrowthPolicy::Allow).await;
+                assert!(failed.is_err());
+                assert_eq!(scalar(&actor, "SELECT count(*) FROM t").await, "0");
+                assert_eq!(scalar(&actor, "PRAGMA user_version").await, "0");
+                assert_eq!(scalar(&actor, "PRAGMA application_id").await, "0");
+                assert!(
+                    actor.checkpoint().await.unwrap() == before,
+                    "a rejected request with a PRAGMA must not change a single byte"
+                );
+            }
+
+            // The reports an admin may run, in a request that writes: they
+            // return normally inside the transaction and the write is kept.
+            run(
+                &actor,
+                SqlRequest::Execute {
+                    schema: Some(
+                        [
+                            "PRAGMA journal_mode",
+                            "PRAGMA foreign_keys",
+                            "PRAGMA page_count",
+                            "PRAGMA schema_version",
+                            "PRAGMA freelist_count",
+                            "PRAGMA data_version",
+                            "PRAGMA table_info(t)",
+                            "PRAGMA integrity_check",
+                            "PRAGMA quick_check",
+                            "PRAGMA foreign_key_check",
+                            "PRAGMA user_version = 3",
+                        ]
+                        .map(String::from)
+                        .to_vec(),
+                    ),
+                    sql: "INSERT INTO t VALUES ('kept')".into(),
+                    params: vec![],
+                },
+                GrowthPolicy::Allow,
+            )
+            .await
+            .unwrap();
+            assert_eq!(scalar(&actor, "SELECT count(*) FROM t").await, "1");
+            assert_eq!(scalar(&actor, "PRAGMA user_version").await, "3");
+            // A single PRAGMA request runs, and the connection keeps the
+            // state it opened with (the TC-1586 reset ran after the request).
+            assert_eq!(scalar(&actor, "PRAGMA foreign_keys").await, "1");
+        }
+    }
+
+    /// A write that stops with `OR FAIL` or `ON CONFLICT FAIL` keeps the rows
+    /// it changed first when it runs on its own; the request is one
+    /// transaction, so it keeps none of them, in memory and on disk.
+    #[test]
+    fn tc1491_a_single_write_with_fail_conflict_resolution_leaves_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        let actor = spawn_test_actor(&dir, u64::MAX);
-        run(
-            &actor,
-            exec("CREATE TABLE t (v TEXT NOT NULL)"),
-            GrowthPolicy::Allow,
-        )
-        .await
-        .unwrap();
-        // Several pragmas are no-ops inside a transaction, so a request that
-        // carries a PRAGMA is not wrapped: the prefix still commits (and so
-        // does the header value the pragma set). `user_version` is on the
-        // admin PRAGMA allow-list (TC-1586); `foreign_keys = OFF` is not.
-        let failed = run(
-            &actor,
-            batch(&[
-                "PRAGMA user_version = 7",
-                "INSERT INTO t VALUES ('prefix')",
-                "INSERT INTO t VALUES (NULL)",
-            ]),
-            GrowthPolicy::Allow,
-        )
-        .await;
-        assert!(failed.is_err());
-        assert_eq!(scalar(&actor, "SELECT count(*) FROM t").await, "1");
-        assert_eq!(scalar(&actor, "PRAGMA user_version").await, "7");
+        let file = dir.path().join("fail.db");
+        for mode in [StorageMode::InMemory, StorageMode::File(file.clone())] {
+            let conn = storage::open_connection(&mode).unwrap();
+            // `ON CONFLICT FAIL` on a column is outside what the SQL parser
+            // accepts, so the schema is created on the connection directly.
+            conn.execute_batch(
+                "CREATE TABLE u (id INTEGER PRIMARY KEY, v TEXT UNIQUE ON CONFLICT FAIL);
+                 CREATE TABLE n (id INTEGER PRIMARY KEY, v TEXT NOT NULL ON CONFLICT FAIL);
+                 INSERT INTO u VALUES (10, 'x'), (11, 'y'), (12, 'z');",
+            )
+            .unwrap();
+            let bytes = || -> Vec<u8> {
+                match &mode {
+                    StorageMode::File(path) => {
+                        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+                            .unwrap();
+                        std::fs::read(path).unwrap()
+                    }
+                    // In memory there is no file; the rows are the check.
+                    StorageMode::InMemory => Vec::new(),
+                }
+            };
+            let before = bytes();
+            for sql in [
+                "INSERT OR FAIL INTO u VALUES (1, 'a'), (2, 'b'), (1, 'dup')",
+                "UPDATE u SET v = 'same'",
+                "UPDATE OR FAIL u SET v = 'same'",
+                "INSERT INTO n VALUES (1, 'a'), (2, 'b'), (3, NULL)",
+            ] {
+                for request in [
+                    exec(sql),
+                    SqlRequest::Query {
+                        sql: sql.into(),
+                        params: vec![],
+                        max_rows: None,
+                        max_bytes: None,
+                    },
+                    batch(&[sql]),
+                ] {
+                    let failed = handle_message(&conn, &request, &None, "tinycloud.sql/write");
+                    // `UPDATE OR FAIL` is outside what the SQL parser accepts:
+                    // refused, and nothing changes either.
+                    assert!(failed.is_err(), "{sql}: {failed:?}");
+                    let rows = |sql: &str| -> String {
+                        conn.query_row(sql, [], |row| row.get(0)).unwrap()
+                    };
+                    assert_eq!(
+                        rows("SELECT count(*) || ':' || group_concat(v) FROM u"),
+                        "3:x,y,z"
+                    );
+                    assert_eq!(rows("SELECT count(*) || '' FROM n"), "0");
+                    assert!(conn.is_autocommit());
+                    assert!(bytes() == before, "{sql}: the file must not change");
+                }
+            }
+        }
+    }
+
+    /// A connection still inside a transaction after its request is retired:
+    /// the next request would otherwise run inside it.
+    #[tokio::test]
+    async fn tc1491_a_connection_left_in_a_transaction_retires_the_actor() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = ("space".to_string(), "leaks".to_string());
+        for growth in [GrowthPolicy::Allow, GrowthPolicy::Forbid] {
+            let databases = Arc::new(DashMap::new());
+            let actor = spawn_actor(
+                key.0.clone(),
+                key.1.clone(),
+                dir.path().to_str().unwrap().into(),
+                u64::MAX,
+                databases.clone(),
+            );
+            databases.insert(key.clone(), actor.clone());
+            run(&actor, exec("CREATE TABLE t (v TEXT)"), GrowthPolicy::Allow)
+                .await
+                .unwrap();
+
+            OPEN_TRANSACTIONS.lock().unwrap().push(key.clone());
+            let result = run(&actor, exec("INSERT INTO t VALUES ('x')"), growth).await;
+            OPEN_TRANSACTIONS.lock().unwrap().retain(|k| *k != key);
+            assert!(matches!(result, Err(SqlError::Internal(_))), "{result:?}");
+            assert!(
+                !databases.contains_key(&key),
+                "the retired actor must leave the registry"
+            );
+            assert!(
+                run(&actor, exec("INSERT INTO t VALUES ('y')"), growth)
+                    .await
+                    .is_err(),
+                "a retired actor serves no further request"
+            );
+        }
     }
 }
 
