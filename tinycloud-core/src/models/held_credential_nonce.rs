@@ -11,6 +11,8 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub nonce: String,
     pub account: String,
+    /// Unix seconds after which the nonce can no longer be spent.
+    pub expires_at: i64,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

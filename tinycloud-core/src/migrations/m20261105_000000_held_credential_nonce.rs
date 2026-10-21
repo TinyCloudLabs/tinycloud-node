@@ -32,6 +32,11 @@ impl MigrationTrait for Migration {
                             .string()
                             .not_null(),
                     )
+                    .col(
+                        ColumnDef::new(held_credential_nonce::Column::ExpiresAt)
+                            .big_integer()
+                            .not_null(),
+                    )
                     .primary_key(
                         Index::create()
                             .col(held_credential_nonce::Column::Audience)

@@ -85,6 +85,9 @@ const HELD_ISSUER_DID_METHODS: &[&str] = &["web"];
 const MAX_SAFE_INTEGER: i64 = (1 << 53) - 1;
 
 pub(crate) const BAD_CONFIG: Refusal = "bad-config";
+/// The authenticated account owner is not a canonical `did:pkh:eip155` account.
+/// Refused as a client error (403), unlike `BAD_CONFIG`, which is a server 500.
+pub(crate) const ACCOUNT_OWNER_INVALID: Refusal = "account-owner-invalid";
 const BAD_PRESENTATION: Refusal = "bad-presentation";
 const BAD_HEADER: Refusal = "bad-header";
 const DID_METHOD_NOT_ALLOWED: Refusal = "did-method-not-allowed";
@@ -211,7 +214,7 @@ pub fn precheck(
     if !valid_audience(policy.audience) {
         return Err(BAD_CONFIG);
     }
-    let account = parse_pkh(policy.caller_account).ok_or(BAD_CONFIG)?;
+    let account = parse_pkh(policy.caller_account).ok_or(ACCOUNT_OWNER_INVALID)?;
     if !input.sd_jwt.is_ascii() {
         return Err(BAD_PRESENTATION);
     }
@@ -517,37 +520,49 @@ pub fn verify(
     })
 }
 
-/// Consumes a nonce bound to `(audience, account)`. Returns `false` if it was
-/// not outstanding, so the caller refuses with `nonce-replayed`. A mismatched
-/// account matches no row and spends nothing.
+/// Consumes a nonce bound to `(audience, account)` that is still live at `now`.
+/// A nonce is live while `now < expires_at`. Returns `false` if it was not
+/// outstanding, so the caller refuses with `nonce-replayed`. A mismatched
+/// account or an expired nonce matches no row and spends nothing. Rows already
+/// expired are pruned on every call, so the table holds only live nonces.
 pub async fn consume_nonce(
     conn: &RecoveringConnection,
     audience: &str,
     nonce: &str,
     account_key: &str,
+    now: OffsetDateTime,
 ) -> Result<bool, DbErr> {
+    let now = now.unix_timestamp();
+    held_credential_nonce::Entity::delete_many()
+        .filter(held_credential_nonce::Column::ExpiresAt.lte(now))
+        .exec(conn)
+        .await?;
     let deleted = held_credential_nonce::Entity::delete_many()
         .filter(held_credential_nonce::Column::Audience.eq(audience))
         .filter(held_credential_nonce::Column::Nonce.eq(nonce))
         .filter(held_credential_nonce::Column::Account.eq(account_key))
+        .filter(held_credential_nonce::Column::ExpiresAt.gt(now))
         .exec(conn)
         .await?;
     Ok(deleted.rows_affected == 1)
 }
 
-/// Records an outstanding nonce. Used only by tests until the mint slice lands.
+/// Records an outstanding nonce that stops being spendable at `expires_at`
+/// (unix seconds). Used only by tests until the mint slice lands.
 #[cfg(test)]
 pub async fn record_nonce(
     conn: &RecoveringConnection,
     audience: &str,
     nonce: &str,
     account_key: &str,
+    expires_at: i64,
 ) -> Result<(), DbErr> {
     use tinycloud_core::sea_orm::{ActiveModelTrait, Set};
     held_credential_nonce::ActiveModel {
         audience: Set(audience.to_owned()),
         nonce: Set(nonce.to_owned()),
         account: Set(account_key.to_owned()),
+        expires_at: Set(expires_at),
     }
     .insert(conn)
     .await?;
@@ -1252,7 +1267,7 @@ mod tests {
         let input = read_presentation(request)?;
         let policy = fixture.policy();
         let pre = precheck(&input, &policy)?;
-        let fresh = consume_nonce(conn, AUDIENCE, &pre.nonce, &pre.account_key)
+        let fresh = consume_nonce(conn, AUDIENCE, &pre.nonce, &pre.account_key, policy.now)
             .await
             .expect("nonce store");
         if !fresh {
@@ -1281,9 +1296,15 @@ mod tests {
     ) -> Result<(), Refusal> {
         let input = read_presentation(request)?;
         let pre = precheck(&input, &fixture.policy())?;
-        record_nonce(conn, AUDIENCE, &pre.nonce, &pre.account_key)
-            .await
-            .expect("nonce store");
+        record_nonce(
+            conn,
+            AUDIENCE,
+            &pre.nonce,
+            &pre.account_key,
+            fixture.policy().now.unix_timestamp() + 3600,
+        )
+        .await
+        .expect("nonce store");
         Ok(())
     }
 
@@ -1612,16 +1633,84 @@ mod tests {
         );
     }
 
+    #[test]
+    fn malformed_caller_account_is_a_client_refusal_not_a_server_fault() {
+        let key = test_key();
+        let mut fixture = own_fixture(&key);
+        fixture.caller = "did:pkh:eip155:1:not-an-address".to_owned();
+        let sd_jwt = credential(&key, default_header(), |_| {});
+        let request = request_for(&sd_jwt);
+        let input = read_presentation(&request).unwrap();
+        assert_eq!(
+            precheck(&input, &fixture.policy()).err(),
+            Some("account-owner-invalid")
+        );
+    }
+
     #[tokio::test]
     async fn nonce_is_spent_only_by_the_account_it_was_recorded_for() {
         let conn = conn().await;
         let owner = CALLER.to_ascii_lowercase();
-        record_nonce(&conn, AUDIENCE, NONCE, &owner).await.unwrap();
-        assert!(!consume_nonce(&conn, AUDIENCE, NONCE, OTHER_ACCOUNT)
+        let now = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+        record_nonce(&conn, AUDIENCE, NONCE, &owner, 1_000_600)
+            .await
+            .unwrap();
+        assert!(!consume_nonce(&conn, AUDIENCE, NONCE, OTHER_ACCOUNT, now)
             .await
             .unwrap());
-        assert!(consume_nonce(&conn, AUDIENCE, NONCE, &owner).await.unwrap());
-        assert!(!consume_nonce(&conn, AUDIENCE, NONCE, &owner).await.unwrap());
+        assert!(consume_nonce(&conn, AUDIENCE, NONCE, &owner, now)
+            .await
+            .unwrap());
+        assert!(!consume_nonce(&conn, AUDIENCE, NONCE, &owner, now)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn expired_nonce_is_refused_and_spends_nothing() {
+        let conn = conn().await;
+        let owner = CALLER.to_ascii_lowercase();
+        record_nonce(&conn, AUDIENCE, NONCE, &owner, 1_000_600)
+            .await
+            .unwrap();
+        let late = OffsetDateTime::from_unix_timestamp(1_000_601).unwrap();
+        assert!(!consume_nonce(&conn, AUDIENCE, NONCE, &owner, late)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn nonce_expiry_boundary_is_exclusive() {
+        let conn = conn().await;
+        let owner = CALLER.to_ascii_lowercase();
+        record_nonce(&conn, AUDIENCE, NONCE, &owner, 1_000_600)
+            .await
+            .unwrap();
+        let at_expiry = OffsetDateTime::from_unix_timestamp(1_000_600).unwrap();
+        assert!(!consume_nonce(&conn, AUDIENCE, NONCE, &owner, at_expiry)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn expired_rows_are_pruned_on_consume() {
+        let conn = conn().await;
+        let owner = CALLER.to_ascii_lowercase();
+        record_nonce(&conn, AUDIENCE, "stale", &owner, 1_000_100)
+            .await
+            .unwrap();
+        record_nonce(&conn, AUDIENCE, NONCE, &owner, 1_000_600)
+            .await
+            .unwrap();
+        let now = OffsetDateTime::from_unix_timestamp(1_000_200).unwrap();
+        assert!(consume_nonce(&conn, AUDIENCE, NONCE, &owner, now)
+            .await
+            .unwrap());
+        let remaining = held_credential_nonce::Entity::find()
+            .all(&conn)
+            .await
+            .unwrap();
+        assert!(remaining.is_empty());
     }
 
     #[test]

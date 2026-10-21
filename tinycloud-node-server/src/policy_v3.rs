@@ -5886,10 +5886,15 @@ async fn validate_held_email_admission(
     let input = held_email::read_presentation(presentation).map_err(held_refusal)?;
     let pre = held_email::precheck(&input, &view).map_err(held_refusal)?;
     if consume {
-        let spent =
-            held_email::consume_nonce(&runtime.conn, &held.audience, &pre.nonce, &pre.account_key)
-                .await
-                .map_err(db_error)?;
+        let spent = held_email::consume_nonce(
+            &runtime.conn,
+            &held.audience,
+            &pre.nonce,
+            &pre.account_key,
+            context.now,
+        )
+        .await
+        .map_err(db_error)?;
         if !spent {
             return Err((Status::Forbidden, "nonce-replayed".into()));
         }
@@ -6734,6 +6739,59 @@ mod tests {
         assert!(pinned(serde_json::json!(60)).is_err());
         assert!(pinned(serde_json::json!(300)).is_err());
         assert!(held_email_max_age_pinned(&serde_json::json!({})).is_err());
+    }
+
+    #[tokio::test]
+    async fn held_credentials_are_off_unless_enabled_with_a_valid_audience() {
+        use crate::config::HeldCredentialsConfig;
+        let conn = tinycloud_core::sea_orm::Database::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let runtime = || {
+            super::PolicyV3Runtime::new(
+                conn.clone(),
+                "did:key:z6MkNodeTestOnly",
+                StaticSecret::new(vec![7; 32]).unwrap(),
+            )
+        };
+        let off = runtime()
+            .with_held_credentials(&HeldCredentialsConfig {
+                enabled: false,
+                audience: None,
+            })
+            .unwrap();
+        assert!(off.held_credentials.is_none());
+        let missing = runtime().with_held_credentials(&HeldCredentialsConfig {
+            enabled: true,
+            audience: None,
+        });
+        assert!(missing.is_err());
+        let malformed = runtime().with_held_credentials(&HeldCredentialsConfig {
+            enabled: true,
+            audience: Some("not a host".to_owned()),
+        });
+        assert!(malformed.is_err());
+        let on = runtime()
+            .with_held_credentials(&HeldCredentialsConfig {
+                enabled: true,
+                audience: Some("relying-party.example".to_owned()),
+            })
+            .unwrap();
+        assert_eq!(
+            on.held_credentials
+                .as_ref()
+                .map(|held| held.audience.as_str()),
+            Some("relying-party.example")
+        );
+    }
+
+    #[test]
+    fn malformed_account_owner_maps_to_forbidden_not_internal_error() {
+        let (status, body) = super::held_refusal(crate::held_email::ACCOUNT_OWNER_INVALID);
+        assert_eq!(status, rocket::http::Status::Forbidden);
+        assert_eq!(body, "account-owner-invalid");
+        let (status, _) = super::held_refusal(crate::held_email::BAD_CONFIG);
+        assert_eq!(status, rocket::http::Status::InternalServerError);
     }
 
     #[test]
