@@ -981,7 +981,8 @@ fn rfc3339_shape(text: &str) -> bool {
         && digits(8, 2)
         && digits(11, 2)
         && digits(14, 2)
-        && digits(17, 2))
+        && digits(17, 2)
+        && bytes[17] <= b'5')
     {
         return false;
     }
@@ -1512,6 +1513,13 @@ mod tests {
     fn fractional_seconds_are_capped_at_nine_digits() {
         assert!(rfc3339_shape("2026-01-01T00:00:00.123456789Z"));
         assert!(!rfc3339_shape("2026-01-01T00:00:00.1234567890Z"));
+    }
+
+    #[test]
+    fn seconds_must_be_at_most_59() {
+        assert!(rfc3339_shape("2026-01-01T00:00:59Z"));
+        assert!(!rfc3339_shape("2026-01-01T00:00:60Z"));
+        assert!(!rfc3339_shape("2026-01-01T00:00:61Z"));
     }
 
     #[test]
