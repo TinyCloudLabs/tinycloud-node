@@ -252,7 +252,7 @@ pub fn verify(
         return Err(BAD_PRESENTATION);
     }
     let disclosures = &parts[1..parts.len() - 1];
-    if disclosures.is_empty() || disclosures.iter().any(|part| part.is_empty()) {
+    if disclosures.iter().any(|part| part.is_empty()) {
         return Err(BAD_PRESENTATION);
     }
     let segments: Vec<&str> = parts[0].split('.').collect();
@@ -295,7 +295,7 @@ pub fn verify(
     if !is_kid_fragment(&kid[hash + 1..]) {
         return Err(BAD_HEADER);
     }
-    let method = did_method(issuer_did).ok_or(BAD_HEADER)?;
+    let method = did_method(issuer_did).ok_or(DID_METHOD_NOT_ALLOWED)?;
     if !HELD_ISSUER_DID_METHODS.contains(&method) {
         return Err(DID_METHOD_NOT_ALLOWED);
     }
@@ -336,7 +336,13 @@ pub fn verify(
     if nbf != iat {
         return Err(BAD_PAYLOAD);
     }
-    let issued_at = OffsetDateTime::from_unix_timestamp(iat).map_err(|_| BAD_PAYLOAD)?;
+    // Clamp into the representable range. Every configured instant lies inside it, so the
+    // window comparisons are unchanged; `nbf` is compared as an integer below.
+    let issued_at = OffsetDateTime::from_unix_timestamp(iat.clamp(
+        OffsetDateTime::new_utc(time::Date::MIN, time::Time::MIDNIGHT).unix_timestamp(),
+        OffsetDateTime::new_utc(time::Date::MAX, time::Time::MAX).unix_timestamp(),
+    ))
+    .map_err(|_| BAD_PAYLOAD)?;
     entry.check_issued_at(issued_at).map_err(window_refusal)?;
 
     let profile = payload
@@ -704,15 +710,20 @@ fn is_kid_fragment(fragment: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
-/// The method of a `did:<method>:<id>` string.
+/// The method of a `did:<method>:<id>` string, using the `did:[a-z0-9]+:` grammar. The id
+/// is not checked here; an empty id is refused later as an unaccepted issuer.
 fn did_method(did: &str) -> Option<&str> {
     let mut parts = did.splitn(3, ':');
     if parts.next()? != "did" {
         return None;
     }
     let method = parts.next()?;
-    let id = parts.next()?;
-    (!method.is_empty() && !id.is_empty()).then_some(method)
+    parts.next()?;
+    (!method.is_empty()
+        && method
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()))
+    .then_some(method)
 }
 
 /// A `did:pkh:eip155` principal. `address` is lowercase `0x…`.
@@ -999,14 +1010,16 @@ fn rfc3339_shape(text: &str) -> bool {
         && tail[4..6].iter().all(u8::is_ascii_digit)
 }
 
-/// The SIWE URI: https, no userinfo, and the authority is the audience.
+/// The SIWE URI: https, no userinfo, and the origin host is the audience. A default `:443`
+/// is dropped, as WHATWG `URL.origin` does.
 fn uri_matches_audience(uri: &str, audience: &str) -> bool {
     let Some(rest) = uri.strip_prefix("https://") else {
         return false;
     };
     let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let authority = &rest[..end];
-    !authority.contains('@') && authority.to_ascii_lowercase() == audience
+    let authority = rest[..end].to_ascii_lowercase();
+    let host = authority.strip_suffix(":443").unwrap_or(&authority);
+    !authority.contains('@') && host == audience
 }
 
 /// Checks the disclosed values against the email row's rules.
@@ -1734,5 +1747,99 @@ mod tests {
             .resolve_pinned_issuer(TEST_ISSUER, TEST_KID)
             .is_some());
         assert!(legacy.resolve_pinned_issuer(TEST_ISSUER, "").is_none());
+    }
+
+    /// Replays the TS differential table, `tests/fixtures/held-email-v1/s1-differential.json`,
+    /// generated from `@tinycloud/sdk` 3.3.0-beta.31 `verifyHeldPresentation`.
+    #[tokio::test]
+    async fn s1_differential_table_matches_ts_verdicts() {
+        let table: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/held-email-v1/s1-differential.json"
+        ))
+        .unwrap();
+        let cases = table.as_array().unwrap();
+        let mut diverging = Vec::new();
+        for case in cases {
+            let name = case["name"].as_str().unwrap();
+            let expected = case["ts"]["code"].as_str().unwrap();
+            let actual = replay(case).await;
+            if actual != expected {
+                diverging.push(format!("{name}: rust={actual} ts={expected}"));
+            }
+        }
+        assert!(
+            diverging.is_empty(),
+            "{} of {} cases diverge from TS:\n{}",
+            diverging.len(),
+            cases.len(),
+            diverging.join("\n")
+        );
+    }
+
+    /// One table case through the production order (precheck, consume nonce, verify).
+    /// Returns `"ok"` on accept with the TS issuer and subject, otherwise the Rust refusal.
+    async fn replay(case: &Value) -> String {
+        let policy = &case["policy"];
+        assert_eq!(policy["audience"], AUDIENCE);
+        let configured: Vec<CredentialIssuerConfig> =
+            match serde_json::from_value(policy["issuers"].clone()) {
+                Ok(configured) => configured,
+                Err(err) => return format!("config-invalid: {err}"),
+            };
+        let set = match IssuerSet::load(&configured) {
+            Ok(set) => set,
+            // Rust rejects a bad set at startup (`credential_issuer_set()?` in lib.rs), so no
+            // presentation reaches verify. TS reports the same condition per presentation.
+            Err(_) => return "bad-issuer-set".to_owned(),
+        };
+        let fixture = Fixture {
+            set,
+            issuers: policy["acceptedIssuers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|issuer| AcceptedIssuer {
+                    did: issuer["issuerDid"].as_str().unwrap().to_owned(),
+                    kid: issuer["kid"].as_str().map(str::to_owned),
+                })
+                .collect(),
+            profiles: policy["acceptedProfiles"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|profile| AcceptedProfile {
+                    id: profile["id"].as_str().unwrap().to_owned(),
+                    version: profile["version"].as_i64().unwrap(),
+                })
+                .collect(),
+            now: OffsetDateTime::parse(policy["now"].as_str().unwrap(), &Rfc3339).unwrap(),
+            caller: policy["caller"].as_str().unwrap().to_owned(),
+        };
+        let conn = conn().await;
+        for entry in case["nonceStore"].as_array().unwrap() {
+            let (audience, nonce) = entry["key"].as_str().unwrap().split_once('\n').unwrap();
+            record_nonce(
+                &conn,
+                audience,
+                nonce,
+                &parse_pkh(entry["account"].as_str().unwrap())
+                    .expect("nonceStore account is did:pkh")
+                    .canonical(),
+                fixture.now.unix_timestamp() + 3600,
+            )
+            .await
+            .expect("nonce store");
+        }
+        let request = json!({"sdJwt": case["sdJwt"], "siwe": case["siwe"]});
+        match admit(&conn, &fixture, &request).await {
+            Ok(verified)
+                if Some(verified.issuer.as_str()) == case["ts"]["issuer"].as_str()
+                    && Some(verified.subject.as_str()) == case["ts"]["subject"].as_str() =>
+            {
+                "ok".to_owned()
+            }
+            Ok(_) => "ok-identity-diverges".to_owned(),
+            Err(code) => code.to_owned(),
+        }
     }
 }

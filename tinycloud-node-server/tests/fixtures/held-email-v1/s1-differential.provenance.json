@@ -1,0 +1,13 @@
+{
+  "generatedBy": "TS verifyHeldPresentation via a Node script (not committed)",
+  "package": "@tinycloud/sdk-core",
+  "packageVersion": "3.3.0-beta.31",
+  "verifierFile": "dist/held-credentials/index.js",
+  "verifierSha256": "72450604446d20dae4316f281fdf52115f297dd9f4601aee46dee28cc5d23265",
+  "generatorSha256": "971127c1f23e20df209c992f460cc2f469fd3093d52da949234d0527ea559567",
+  "node": "v22.23.2",
+  "cases": 145,
+  "casesSha256": "f1a976b81884ae04f1d8dd08142656572be2f920550b2a2b4f0950560c53b42a",
+  "keyMaterial": "public test vectors only (Anvil account, test issuer did:web:held-test.example)",
+  "consumedBy": "held_email::tests::s1_differential_table_matches_ts_verdicts"
+}
