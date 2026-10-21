@@ -7279,6 +7279,12 @@ mod tests {
         let mut untrusted_signer = original.clone();
         untrusted_signer["signature"]["signerDid"] = json!("did:key:zUntrustedSigner");
         assert!(validate(&untrusted_signer).is_err());
+        let mut non_array = original.clone();
+        non_array["requestedCapabilities"] = json!("not-an-array");
+        assert_eq!(
+            validate(&non_array).unwrap_err().1,
+            "presentation-capabilities-mismatch"
+        );
         assert!(validate(&original).is_ok());
     }
 
