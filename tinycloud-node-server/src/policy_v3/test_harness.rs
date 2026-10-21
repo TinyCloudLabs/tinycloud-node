@@ -413,8 +413,8 @@ pub(super) struct Harness {
     pub content_space: SpaceId,
     pub content_resource: tinycloud_auth::resource::ResourceId,
     pub network: String,
-    issuer: tinycloud_core::libp2p::identity::ed25519::Keypair,
-    vector: Value,
+    pub(super) issuer: tinycloud_core::libp2p::identity::ed25519::Keypair,
+    pub(super) vector: Value,
 }
 
 impl Harness {
@@ -493,8 +493,25 @@ impl Harness {
             .as_str()
             .unwrap()
             .to_owned();
-        config.share_email.issuer_public_key =
-            Some(encode_config(issuer.public().to_bytes(), URL_SAFE_NO_PAD));
+        // Held harnesses pin the issuer through one explicit `credential_issuers`
+        // entry (profile `tinycloud.email-held/v1`) and carry no legacy key.
+        if held {
+            config.share_email.credential_issuers =
+                vec![crate::issuer_set::CredentialIssuerConfig {
+                    issuer_did: config.share_email.issuer_did.clone(),
+                    kid: config.share_email.issuer_kid.clone(),
+                    alg: "EdDSA".to_owned(),
+                    public_key: encode_config(issuer.public().to_bytes(), URL_SAFE_NO_PAD),
+                    vcts: vec!["opencredentials.email/v1".to_owned()],
+                    profiles: vec!["tinycloud.email-held/v1".to_owned()],
+                    not_before: "2020-01-01T00:00:00Z".to_owned(),
+                    retired_at: None,
+                    not_after: None,
+                }];
+        } else {
+            config.share_email.issuer_public_key =
+                Some(encode_config(issuer.public().to_bytes(), URL_SAFE_NO_PAD));
+        }
         config.held_credentials = crate::config::HeldCredentialsConfig {
             enabled: held,
             audience: held.then(|| "relying-party.example".to_owned()),
@@ -640,8 +657,18 @@ impl Harness {
     /// Register a policy over the content whose roots span `root`, signed
     /// by the policy owner.
     pub async fn register(&self, root: Window) -> anyhow::Result<(Status, String, Registered)> {
-        let owner_did = self.owner.did().to_owned();
         let projection = self.vector["policyProjection"].clone();
+        self.register_with_projection(root, projection).await
+    }
+
+    /// Register a policy over the content whose roots span `root`, with the
+    /// credential requirement projection `projection`.
+    pub(super) async fn register_with_projection(
+        &self,
+        root: Window,
+        projection: Value,
+    ) -> anyhow::Result<(Status, String, Registered)> {
+        let owner_did = self.owner.did().to_owned();
         let created = (now() - Duration::seconds(60)).min(root.not_before);
         let ceiling = vec![
             json!({
