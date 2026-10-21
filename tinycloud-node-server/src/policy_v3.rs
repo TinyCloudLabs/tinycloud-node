@@ -6749,6 +6749,32 @@ mod tests {
         assert!(held_email_max_age_pinned(&serde_json::json!({})).is_err());
     }
 
+    #[test]
+    fn v3_issuer_signature_refuses_small_order_key_and_r() {
+        use ed25519_dalek::Verifier;
+        // Identity point encoding (y = 1, x = 0) as both public key and R with S = 0.
+        // Non-strict verification accepts this forgery; verify_strict must refuse it.
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        let mut forged = [0u8; 64];
+        forged[..32].copy_from_slice(&identity);
+        let weak_key = ed25519_dalek::VerifyingKey::from_bytes(&identity).unwrap();
+        let weak_sig = ed25519_dalek::Signature::from_slice(&forged).unwrap();
+        assert!(weak_key.verify(b"held", &weak_sig).is_ok());
+        assert_eq!(
+            super::verify_issuer_signature(&identity, b"held", &forged)
+                .unwrap_err()
+                .1,
+            "credential-signature-invalid"
+        );
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let good = ed25519_dalek::Signer::sign(&signing, b"held").to_bytes();
+        assert!(
+            super::verify_issuer_signature(signing.verifying_key().as_bytes(), b"held", &good)
+                .is_ok()
+        );
+    }
+
     #[tokio::test]
     async fn held_credentials_are_off_unless_enabled_with_a_valid_audience() {
         use crate::config::HeldCredentialsConfig;
