@@ -7497,6 +7497,7 @@ mod tests {
             issued,
             header,
             projection["issuerKid"].clone(),
+            "opencredentials.email/v1",
         )
     }
 
@@ -7513,6 +7514,7 @@ mod tests {
         issued: OffsetDateTime,
         header: Value,
         envelope_kid: Value,
+        vct: &str,
     ) -> Value {
         let disclose = |salt: &str, name: &str, value: &str| {
             encode_config(
@@ -7529,7 +7531,7 @@ mod tests {
         let payload = json!({
             "iss": projection["issuerDid"], "sub": holder,
             "iat": issued.unix_timestamp(), "nbf": issued.unix_timestamp(), "exp": expires.unix_timestamp(),
-            "jti": "credential-email-domain", "vct": "opencredentials.email/v1",
+            "jti": "credential-email-domain", "vct": vct,
             "profile": projection["profile"]["id"], "profileVersion": 1,
             "descriptorDigest": projection["descriptorDigest"],
             "holderBinding": {"did": holder, "signingDomain": "tinycloud.credentials/holder-binding/v1"},
@@ -7634,6 +7636,7 @@ mod tests {
                 self.issued,
                 header,
                 json!(envelope_kid),
+                "opencredentials.email/v1",
             )
         }
     }
@@ -8211,6 +8214,73 @@ mod tests {
         let mut substituted = requirement.clone();
         substituted["claims"]["emailDomain"] = json!("evil.example");
         assert!(validate_request_local_requirement(&substituted, projection).is_err());
+    }
+
+    #[test]
+    fn signed_vct_other_than_the_requirement_credential_type_is_refused() {
+        let requirement = json!({
+            "type": "TinyCloudCredentialRequirement", "version": 1,
+            "profile": {"id": "tinycloud.email-domain-proof/v1", "version": 1},
+            "credentialType": {"id": "opencredentials.email/v1", "version": 1},
+            "claims": {"emailDomain": "tinycloud.xyz"},
+            "maxAgeSeconds": 300
+        });
+        let projection_value = json!({
+            "type": POLICY_CREDENTIAL_REQUIREMENT_V1, "version": 1,
+            "requirementDigest": canonical_digest_base64url(&requirement),
+            "descriptorDigest": "DdDdDdDdDdDdDdDdDdDdDdDdDdDdDdDdDdDdDdDdDdD",
+            "issuerDid": "did:web:issuer.credentials.org",
+            "issuerKid": "did:web:issuer.credentials.org#controller",
+            "profile": {"id": "tinycloud.email-domain-proof/v1", "version": 1},
+            "credentialType": {"id": "opencredentials.email/v1", "version": 1}
+        });
+        let projection = validate_policy_credential_requirement(&projection_value).unwrap();
+        let holder = "did:key:z6MkehRgf7yJbgaGfYsdoAsKdBPE3dj2CYhowQdcjqSJgvVd";
+        let issuer_key = tinycloud_core::libp2p::identity::ed25519::Keypair::generate();
+        let trusted = IssuerKey::new(
+            "did:web:issuer.credentials.org",
+            "opencredentials.email/v1",
+            1,
+            "did:web:issuer.credentials.org#controller",
+            issuer_key.public().to_bytes(),
+        );
+        let issued = parse_time("2026-09-25T12:00:00Z").unwrap();
+        let now = issued + Duration::seconds(30);
+        let verify = |credential: &Value| {
+            verify_opencredentials_credential(
+                credential,
+                &requirement,
+                projection,
+                &IssuerSet::from_legacy(&trusted),
+                holder,
+                now,
+            )
+        };
+        // Only the issuer-signed `vct` differs. The signature and disclosure
+        // digests stay valid, so the refusal must come from the disclosed
+        // `vct` comparison against the requirement's credential type.
+        let mint = |vct: &str| {
+            email_domain_credential_with_header(
+                &issuer_key,
+                &projection_value,
+                holder,
+                "alice@tinycloud.xyz",
+                "tinycloud.xyz",
+                "tinycloud.xyz",
+                issued,
+                json!({"alg": "EdDSA", "typ": "vc+sd-jwt", "kid": projection_value["issuerKid"]}),
+                projection_value["issuerKid"].clone(),
+                vct,
+            )
+        };
+        assert!(verify(&mint("opencredentials.email/v1")).is_ok());
+        assert_eq!(
+            verify(&mint("opencredentials.phone/v1")).err(),
+            Some((
+                Status::Forbidden,
+                "credential-holder-binding-invalid".into()
+            ))
+        );
     }
 
     #[test]

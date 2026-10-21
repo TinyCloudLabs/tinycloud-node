@@ -166,8 +166,69 @@ async fn held_session_expiry_is_clamped_to_the_credential_expiry(
     Ok(())
 }
 
+async fn held_presentation_with_the_required_vct_is_admitted(
+    backend: Backend,
+) -> anyhow::Result<()> {
+    let Some(h) = Harness::new_with_held(
+        backend,
+        Shape::KeySession,
+        "held_presentation_with_the_required_vct_is_admitted",
+        true,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    h.grant_owner(Window::until(now() + Duration::days(2)))
+        .await?;
+    let account = HeldAccount::new()?;
+    let (account_cid, space) = import_account_authorization(&h, &account).await?;
+    let policy = register_held(&h).await?;
+    let presentation = outstanding_presentation_with_vct(&h, &account, 86_400, HELD_VCT).await?;
+    let requested = format_time(now() + Duration::seconds(3600));
+    let (status, body) =
+        mint_held(&h, &policy, &presentation, &account_cid, &space, &requested).await?;
+    assert_eq!(status, Status::Ok, "{body}");
+    Ok(())
+}
+
+async fn held_presentation_with_a_mismatched_vct_is_refused(
+    backend: Backend,
+) -> anyhow::Result<()> {
+    let Some(h) = Harness::new_with_held(
+        backend,
+        Shape::KeySession,
+        "held_presentation_with_a_mismatched_vct_is_refused",
+        true,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    h.grant_owner(Window::until(now() + Duration::days(2)))
+        .await?;
+    let account = HeldAccount::new()?;
+    let (account_cid, space) = import_account_authorization(&h, &account).await?;
+    let policy = register_held(&h).await?;
+    // Issuer-signed with a `vct` other than the held credential type. The
+    // signature and disclosure digests stay valid, so the refusal comes from
+    // `held_email::verify` (`vct != VCT`), not from the signature checks.
+    let presentation =
+        outstanding_presentation_with_vct(&h, &account, 86_400, "opencredentials.phone/v1").await?;
+    let requested = format_time(now() + Duration::seconds(3600));
+    let (status, body) =
+        mint_held(&h, &policy, &presentation, &account_cid, &space, &requested).await?;
+    assert_eq!(status, Status::Forbidden, "{body}");
+    assert!(body.contains("profile-mismatch"), "{body}");
+    Ok(())
+}
+
 on_both_backends!(held_mint_admits_once_and_returns_an_authorization);
 
 on_both_backends!(held_nonce_cannot_be_replayed_with_a_fresh_challenge);
 
 on_both_backends!(held_session_expiry_is_clamped_to_the_credential_expiry);
+
+on_both_backends!(held_presentation_with_the_required_vct_is_admitted);
+
+on_both_backends!(held_presentation_with_a_mismatched_vct_is_refused);

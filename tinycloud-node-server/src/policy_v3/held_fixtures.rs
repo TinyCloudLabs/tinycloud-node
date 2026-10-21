@@ -25,7 +25,7 @@ use tinycloud_core::{models::space, sea_orm::ActiveValue::Set, types::SpaceIdWra
 
 const HELD_EMAIL: &str = "alice@example.test";
 const HELD_PROFILE: &str = "tinycloud.email-held/v1";
-const HELD_VCT: &str = "opencredentials.email/v1";
+pub(super) const HELD_VCT: &str = "opencredentials.email/v1";
 const HELD_AUDIENCE: &str = "relying-party.example";
 const HELD_STATEMENT: &str = "Present a TinyCloud held credential";
 const BINDING_DOMAIN: &str = "tinycloud.credentials/account-binding/v1";
@@ -103,6 +103,7 @@ pub(super) fn held_presentation(
     account: &HeldAccount,
     nonce: &str,
     lifetime_seconds: i64,
+    vct: &str,
 ) -> anyhow::Result<HeldPresentation> {
     let now_unix = now().unix_timestamp();
     let issued = now_unix - 60;
@@ -128,7 +129,7 @@ pub(super) fn held_presentation(
         "nbf": issued,
         "exp": now_unix + lifetime_seconds,
         "jti": held_jti(),
-        "vct": HELD_VCT,
+        "vct": vct,
         "profile": HELD_PROFILE,
         "profileVersion": 1,
         "holderBinding": {"did": account.did, "signingDomain": BINDING_DOMAIN},
@@ -181,6 +182,16 @@ pub(super) async fn outstanding_presentation(
     account: &HeldAccount,
     lifetime_seconds: i64,
 ) -> anyhow::Result<HeldPresentation> {
+    outstanding_presentation_with_vct(h, account, lifetime_seconds, HELD_VCT).await
+}
+
+/// Same as [`outstanding_presentation`], with the disclosed `vct` set to `vct`.
+pub(super) async fn outstanding_presentation_with_vct(
+    h: &Harness,
+    account: &HeldAccount,
+    lifetime_seconds: i64,
+    vct: &str,
+) -> anyhow::Result<HeldPresentation> {
     let nonce = held_nonce();
     crate::held_email::record_nonce(
         &h.client.rocket().state::<PolicyV3Runtime>().unwrap().conn,
@@ -191,7 +202,7 @@ pub(super) async fn outstanding_presentation(
         now().unix_timestamp() + 86_400,
     )
     .await?;
-    held_presentation(h, account, &nonce, lifetime_seconds)
+    held_presentation(h, account, &nonce, lifetime_seconds, vct)
 }
 
 /// Imports the account's SDK session CACAO through `/delegate`, inserts the
