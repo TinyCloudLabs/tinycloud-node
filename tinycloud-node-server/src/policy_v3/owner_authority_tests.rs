@@ -3645,3 +3645,32 @@ async fn postgres_policy_read_latency_gate() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn register_grant_round_trips_through_siwe_recap() -> anyhow::Result<()> {
+    let org = Signer::pkh();
+    let space = SpaceId::new(org.did().parse::<DIDBuf>()?, "org".parse()?);
+    let policy_hash = "ab".repeat(32);
+    let resource = space.to_resource("policy".parse()?, Some(policy_hash.parse()?), None, None);
+    let grants = [(resource.to_string(), "tinycloud.policy/register")];
+    let audience = Signer::key();
+    let encoded = org.delegate(
+        audience.did(),
+        &grants,
+        Window::until(now() + Duration::days(1)),
+        &[],
+    )?;
+    let (decoded, _) = TinyCloudDelegation::decode(&encoded)?;
+    let info = tinycloud_core::util::DelegationInfo::try_from(decoded)?;
+    let [capability] = info.capabilities.as_slice() else {
+        anyhow::bail!("expected one capability, got {:?}", info.capabilities);
+    };
+    assert_eq!(capability.ability.to_string(), "tinycloud.policy/register");
+    let tinycloud_resource = capability
+        .resource
+        .tinycloud_resource()
+        .ok_or_else(|| anyhow::anyhow!("resource is not a tinycloud resource"))?;
+    assert_eq!(tinycloud_resource.service().as_str(), "policy");
+    assert_eq!(tinycloud_resource.to_string(), resource.to_string());
+    Ok(())
+}
