@@ -97,9 +97,9 @@ pub struct IssuerSetEntry {
 pub enum IssuerWindowError {
     /// `now < notBefore`, or the credential was issued before `notBefore`.
     NotYetValid,
-    /// `now >= notAfter`: the hard stop for a compromised key.
+    /// `now >= notAfter`: the entry has been withdrawn.
     Stopped,
-    /// `iat >= retiredAt`: the key was rotated out before it issued this.
+    /// `iat >= retiredAt`: the entry stopped issuing before this credential's `iat`.
     Retired,
 }
 
@@ -133,8 +133,7 @@ impl IssuerSetEntry {
         Ok(())
     }
 
-    /// The legacy single-issuer configuration as an entry: no time window, and
-    /// only the profiles the witness issues today.
+    /// The existing single-issuer configuration as an entry, with the profiles the witness issues today.
     fn from_legacy(key: &IssuerKey) -> Self {
         Self {
             issuer_did: key.issuer_did.clone(),
@@ -258,8 +257,7 @@ fn parse_entry(
     if !kid_matches(&config.kid, &config.issuer_did) {
         return Err(IssuerSetError::Kid { index });
     }
-    // The fixture seeds are public: a pasted fixture key would let anyone mint
-    // credentials the node admits. Only the hermetic fixture build keeps them.
+    // Test-fixture keys are accepted only in the hermetic fixture build; production builds use configured keys. Details: TC-1541
     if !crate::config::allows_hermetic_fixture()
         && crate::config::is_fixture_public_key(&config.public_key)
     {
