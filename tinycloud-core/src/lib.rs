@@ -23,6 +23,7 @@ pub mod migrations;
 pub mod models;
 pub mod policy_authority;
 pub mod policy_capability;
+pub mod policy_owner_authority;
 mod read_audit;
 pub mod relationships;
 pub mod request_cancel;

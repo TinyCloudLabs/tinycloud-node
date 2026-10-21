@@ -26,6 +26,7 @@ use rocket::{
 use serde::{Deserialize, Serialize};
 use std::{future::Future, net::IpAddr, time::Duration, time::Instant};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+use tinycloud_auth::ipld_core::cid::Cid;
 use tinycloud_core::{
     events::Invocation,
     hash::Blake3Hasher,
@@ -46,6 +47,9 @@ use tinycloud_core::{
 struct VerifiedHookInvocation {
     admitted: AdmittedInvocation,
     policy_session: bool,
+    /// For a policy session, the recorded owner-authority closure it passed;
+    /// tickets carry it so open streams watch it too.
+    policy_authority: Vec<Cid>,
 }
 
 impl VerifiedHookInvocation {
@@ -108,13 +112,14 @@ async fn authorize_hook_request(
         start.elapsed(),
     );
     let admitted = admitted?;
-    let policy_session = policy_v3
+    let policy_authority = policy_v3
         .authorize_invocation(tinycloud, &admitted.invocation().0, now)
         .await
         .map_err(|error| (Status::Forbidden, error.to_string()))?;
     Ok(VerifiedHookInvocation {
         admitted,
-        policy_session,
+        policy_session: policy_authority.is_some(),
+        policy_authority: policy_authority.unwrap_or_default(),
     })
 }
 
@@ -239,6 +244,19 @@ async fn mint_hook_ticket(
         ));
     }
 
+    let mut authorizing_delegations = invocation.parents.clone();
+    for cid in &verified.policy_authority {
+        if !authorizing_delegations.contains(cid) {
+            authorizing_delegations.push(*cid);
+        }
+    }
+    // The ticket travels in the stream URL.
+    if authorizing_delegations.len() > MAX_TICKET_AUTHORITIES {
+        return Err((
+            Status::Forbidden,
+            "hook-ticket-authority-too-large".to_string(),
+        ));
+    }
     let claims = HookTicketClaims {
         v: 2,
         sub: invocation.invoker.clone(),
@@ -246,7 +264,7 @@ async fn mint_hook_ticket(
         iat: now.unix_timestamp(),
         exp,
         parent_exp,
-        authorizing_delegations: invocation.parents.clone(),
+        authorizing_delegations,
     };
     let ticket = hooks
         .sign_ticket(&claims)
@@ -257,6 +275,69 @@ async fn mint_hook_ticket(
         .map_err(|e| (Status::InternalServerError, e.to_string()))?;
 
     Ok(HookTicketResponse { ticket, expires_at })
+}
+
+/// Most authority IDs a ticket carries (it travels in the stream URL).
+const MAX_TICKET_AUTHORITIES: usize = 16;
+
+/// Consecutive failed authority checks after which an open stream closes.
+const MAX_CONSECUTIVE_CHECK_ERRORS: u32 = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Recheck {
+    Live,
+    /// The check failed; keep the stream and check again later.
+    Retry,
+    Close,
+}
+
+/// An open stream's authority re-check: before delivering an event at most
+/// once per interval, and on an idle timer. It closes the stream on a
+/// definite "revoked", or after three consecutive check errors, each at
+/// least an interval apart, so a busy database or a burst of events during a
+/// brief error doesn't close streams. While the last check failed, events
+/// are withheld without querying.
+struct AuthorityRecheck {
+    interval: Duration,
+    last: rocket::tokio::time::Instant,
+    consecutive_errors: u32,
+}
+
+impl AuthorityRecheck {
+    fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            last: rocket::tokio::time::Instant::now(),
+            consecutive_errors: 0,
+        }
+    }
+
+    fn due(&self) -> bool {
+        self.last.elapsed() >= self.interval
+    }
+
+    fn failing(&self) -> bool {
+        self.consecutive_errors > 0
+    }
+
+    fn record<E>(&mut self, result: Result<bool, E>) -> Recheck {
+        self.last = rocket::tokio::time::Instant::now();
+        match result {
+            Ok(true) => {
+                self.consecutive_errors = 0;
+                Recheck::Live
+            }
+            Ok(false) => Recheck::Close,
+            Err(_) => {
+                self.consecutive_errors += 1;
+                if self.consecutive_errors >= MAX_CONSECUTIVE_CHECK_ERRORS {
+                    Recheck::Close
+                } else {
+                    Recheck::Retry
+                }
+            }
+        }
+    }
 }
 
 async fn hook_stream_deadline<F, Fut, Clock>(
@@ -355,11 +436,18 @@ pub async fn hook_events<'r>(
         .map_err(|e| (Status::TooManyRequests, e))?;
 
     let mut receiver = hooks.bus().subscribe();
+    let active_recheck = Duration::from_secs(hooks.config().authority_recheck_seconds);
+    let idle_recheck = Duration::from_secs(hooks.config().idle_authority_recheck_seconds);
 
     let stream = EventStream! {
         let _lease = lease;
         let deadline_sleep = rocket::tokio::time::sleep_until(stream_deadline);
         rocket::tokio::pin!(deadline_sleep);
+        let mut idle = rocket::tokio::time::interval_at(
+            rocket::tokio::time::Instant::now() + idle_recheck,
+            idle_recheck,
+        );
+        let mut recheck = AuthorityRecheck::new(active_recheck);
 
         loop {
             rocket::tokio::select! {
@@ -367,10 +455,34 @@ pub async fn hook_events<'r>(
                 _ = &mut deadline_sleep => {
                     break;
                 }
+                _ = idle.tick() => {
+                    let result = tinycloud
+                        .delegation_chains_unrevoked(&claims.authorizing_delegations)
+                        .await;
+                    if recheck.record(result) == Recheck::Close {
+                        break;
+                    }
+                }
                 message = receiver.recv() => {
                     match message {
                         Ok(event) => {
                             if claims.scopes.iter().any(|scope| matches_scope(&event, scope)) {
+                                if recheck.due() {
+                                    let result = tinycloud
+                                        .delegation_chains_unrevoked(&claims.authorizing_delegations)
+                                        .await;
+                                    match recheck.record(result) {
+                                        Recheck::Close => break,
+                                        // A failed check withholds this event;
+                                        // the next check waits an interval.
+                                        Recheck::Retry => continue,
+                                        Recheck::Live => {}
+                                    }
+                                } else if recheck.failing() {
+                                    // Until the next check succeeds, events
+                                    // are withheld without querying.
+                                    continue;
+                                }
                                 yield Event::json(&event)
                                     .id(event.id.clone())
                                     .event("write");
@@ -944,6 +1056,29 @@ async fn find_parent_expiry(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn authority_recheck_closes_on_revoked_or_three_consecutive_errors() {
+        let mut recheck = AuthorityRecheck::new(Duration::from_secs(5));
+        assert!(!recheck.due());
+        assert_eq!(recheck.record::<()>(Ok(true)), Recheck::Live);
+        assert_eq!(recheck.record(Err(())), Recheck::Retry);
+        assert!(
+            !recheck.due() && recheck.failing(),
+            "after a failed check, events are withheld until the interval passes"
+        );
+        assert_eq!(recheck.record(Err(())), Recheck::Retry);
+        assert_eq!(
+            recheck.record::<()>(Ok(true)),
+            Recheck::Live,
+            "a success resets"
+        );
+        assert_eq!(recheck.record(Err(())), Recheck::Retry);
+        assert_eq!(recheck.record(Err(())), Recheck::Retry);
+        assert_eq!(recheck.record(Err(())), Recheck::Close);
+        let mut recheck = AuthorityRecheck::new(Duration::from_secs(5));
+        assert_eq!(recheck.record::<()>(Ok(false)), Recheck::Close);
+    }
+
     use super::*;
     use crate::{
         config::HooksConfig, hooks::HookRuntime,
@@ -1100,6 +1235,7 @@ mod tests {
         Ok(VerifiedHookInvocation {
             admitted: AdmittedInvocation::admit(invocation, 300).await?,
             policy_session: false,
+            policy_authority: Vec::new(),
         })
     }
 
