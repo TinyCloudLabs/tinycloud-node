@@ -440,6 +440,10 @@ its branch policy before any workflow that names it runs.
    a promote, which is why it runs for an hour. Check the run titled
    `Write Probe (dense promote watch)`; to start one by hand:
    `gh workflow run write-probe.yml -R TinyCloudLabs/tinycloud-node --ref main -f mode=dense`.
+   The deploy run's `promote-watch` job only dispatches the dense run, so it
+   can finish before the watch does: read the dense run itself (its
+   `Promote watch` step, and the final `dense watch done: N samples, F failed`
+   line).
    Details: `test/probe/README.md`.
 
 ### Main release with N0 log shipping (one dispatch)
@@ -517,6 +521,28 @@ forward paths; an image that cannot validate config fails before restart.
 The same general quota authority/reconciliation gate runs after the final
 env operation plus version/ingress health, before ancillary Policy probes.
 The downstream watcher cannot skip quota restoration.
+
+### A compose-only change ships as a release
+
+The compose on `main` is the compose that gets deployed, so a change to it
+(for example the database pool in TC-950) reaches production with a release:
+the tag commit must be a strict descendant of the revision running in
+production, which means a version bump even when the node code is unchanged.
+A digest promotion of the revision that is already running, with a changed
+compose, is refused by the ancestry guard ("Released image must be a strict
+descendant of the running production revision").
+
+1. Merge the compose change (the compose, its byte-identical fixture
+   `scripts/ci/fixtures/tc959-n0-compose.yaml`, the template hash in
+   `docker.yml` and the hashes in this file move together).
+2. Cut the release PR (version bump in `Cargo.toml` and the three lockfiles,
+   `[Unreleased]` moved under the new version) and let the tag build finish.
+3. Read the digest and labels of the new `X.Y.Z-dstack` image, then use the
+   promotion command above with that digest, version and revision.
+
+A rollback of such a change follows the same path: a revert plus a new
+release. The same-image recovery command below is for the reviewed 1.20.6
+image only and is refused once a later release is running.
 
 ### Emergency same-image recovery (12c)
 

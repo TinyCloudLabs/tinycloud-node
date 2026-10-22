@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changes
+
+- `docs/releasing.md`: how a compose-only change ships (as a release), and how to read the dense promote watch. Details: TC-950.
+
 ## [1.21.7] - 2026-10-21
 
 ### Release notes
