@@ -7134,7 +7134,7 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&body)?,
             serde_json::json!({
                 "space": {"usedBytes": used, "limitBytes": 1},
-                "manageUrl": "https://account.tinycloud.xyz/billing",
+                "manageUrl": "https://account.tinycloud.xyz/storage",
             })
         );
 
@@ -7569,7 +7569,7 @@ mod tests {
             serde_json::json!({
                 "space": {"usedBytes": used, "limitBytes": 1},
                 "account": account,
-                "manageUrl": "https://account.tinycloud.xyz/billing",
+                "manageUrl": "https://account.tinycloud.xyz/storage",
             })
         );
 
