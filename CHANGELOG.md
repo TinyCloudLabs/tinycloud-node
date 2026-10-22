@@ -5,6 +5,7 @@
 ### Changes
 
 - `docs/releasing.md`: how a compose-only change ships (as a release), and how to read the dense promote watch. Details: TC-950.
+- Database: adds two schema additions for encryption keys (not yet used). Details: TC-1777.
 
 ## [1.21.7] - 2026-10-21
 
