@@ -1,18 +1,15 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Weak,
-    },
+    sync::{Arc, Weak},
 };
 
 use dashmap::DashMap;
 use tinycloud_auth::resource::SpaceId;
 
 use crate::database_artifacts::{
-    read_artifact, ArtifactExpectation, CacheFileSink, DatabaseArtifactError,
-    DatabaseArtifactRepository, MemorySink,
+    read_artifact, staging_path, sweep_stale_staging, ArtifactExpectation, CacheFileSink,
+    DatabaseArtifactError, DatabaseArtifactRepository, MemorySink, StagingRelease,
 };
 
 use crate::request_telemetry::{self, QueryTimer};
@@ -282,7 +279,8 @@ impl DuckDbService {
             .map_err(|e| DuckDbError::Internal(e.to_string()))?;
 
         let final_path = dir.join(format!("{}.duckdb", db_name));
-        let temp_path = temp_write_path(&final_path);
+        let temp_path = staging_path(&final_path);
+        let _live = StagingRelease(temp_path.clone());
 
         // Write to temp file first
         tokio::fs::write(&temp_path, data)
@@ -422,6 +420,7 @@ impl DuckDbService {
     async fn hydrate_cache(&self, space: &SpaceId, db_name: &str) -> Result<(), DuckDbError> {
         let cache_path = self.cache_path(space, db_name);
         let key = (space.to_string(), db_name.to_string());
+        sweep_stale_staging(&[&cache_path, &duckdb_wal_path(&cache_path)]).await;
         let mut sink = CacheFileSink::new(
             "duckdb",
             format!("{space}/{db_name}"),
@@ -641,23 +640,6 @@ fn validate_payload(
     )))
 }
 
-/// A temp sibling of `path`, unique per call.
-///
-/// The suffix is APPENDED to the whole path. `Path::with_extension` replaces
-/// everything after the last `.`, so `main.duckdb` and `main.duckdb.wal` both
-/// mapped to `main.duckdb.tmp` — as did `import_db`'s own staging file. The
-/// checkpoint and WAL writes of one hydration raced on a single file and
-/// cross-consumed each other's bytes, reverting the database silently.
-fn temp_write_path(path: &Path) -> PathBuf {
-    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
-    PathBuf::from(format!(
-        "{}.tmp.{}.{}",
-        path.display(),
-        std::process::id(),
-        NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
-    ))
-}
-
 async fn remove_duckdb_cache_files(path: &Path) -> Result<(), DuckDbError> {
     for candidate in [
         path.to_path_buf(),
@@ -677,6 +659,8 @@ fn duckdb_wal_path(path: &Path) -> PathBuf {
     PathBuf::from(format!("{}.wal", path.display()))
 }
 
+/// `DuckDbError` has no retryable-unavailable variant (adding one would reach
+/// every route mapping), so an exhausted `ArtifactChanged` stays `Internal`.
 fn artifact_error_to_duckdb(err: DatabaseArtifactError) -> DuckDbError {
     DuckDbError::Internal(err.to_string())
 }

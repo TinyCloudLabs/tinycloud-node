@@ -15,8 +15,8 @@ use tokio::{sync::OwnedMutexGuard, time::Instant};
 use tracing::Instrument;
 
 use crate::database_artifacts::{
-    read_artifact, ArtifactExpectation, ArtifactMeta, CacheFileSink, DatabaseArtifactError,
-    DatabaseArtifactRepository,
+    read_artifact, sweep_stale_staging, ArtifactExpectation, ArtifactMeta, CacheFileSink,
+    DatabaseArtifactError, DatabaseArtifactRepository,
 };
 use crate::db_pool::{is_transient_error, track_writes, transient_error_class};
 use crate::{request_cancel, request_telemetry};
@@ -687,6 +687,7 @@ impl SqlService {
     /// and must finish once begun.
     async fn hydrate(&self, space: &SpaceId, db_name: &str, phase: &AtomicU8) -> HydrationOutcome {
         let cache_path = self.cache_path(space, db_name);
+        sweep_stale_staging(&[&cache_path, &sql_wal_path(&cache_path)]).await;
         let mut sink = CacheFileSink::new(
             "sql",
             format!("{space}/{db_name}"),
@@ -967,6 +968,16 @@ fn artifact_error_to_sql(err: DatabaseArtifactError) -> SqlError {
                 service = "sql",
                 error_class = transient_error_class(error).unwrap_or("other"),
                 "Database artifact storage unavailable"
+            );
+            SqlError::Unavailable
+        }
+        // The row kept changing across every restart. Nothing was written, so
+        // a fresh request is safe: the same answer as any contended store.
+        DatabaseArtifactError::ArtifactChanged => {
+            tracing::warn!(
+                service = "sql",
+                error_class = "artifact_changed",
+                "Database artifact kept changing while it was read"
             );
             SqlError::Unavailable
         }
@@ -3412,8 +3423,16 @@ mod tests {
     async fn tc1274_a_held_operation_lock_answers_sql_busy_lock_wait() {
         let (repo, space) = seeded("sql-busy-lock").await;
         let cache = TempDir::new().unwrap();
-        let service = SqlService::new(cache.path().to_string_lossy().into_owned(), u64::MAX, repo)
-            .with_wait_bounds(wait_bounds(200));
+        // Warm both databases under the default bounds first: the hydration
+        // (disk, fsync) is not what this test asserts, only the lock wait,
+        // which must not depend on how fast the disk is.
+        let service = SqlService::new(cache.path().to_string_lossy().into_owned(), u64::MAX, repo);
+        read(&service, &space).await.unwrap();
+        service
+            .execute(&space, "b", insert("w"), None, "tinycloud.sql/admin".into())
+            .await
+            .unwrap();
+        let service = service.with_wait_bounds(wait_bounds(200));
         let held = service.operation_lock(&space, "a").await.lock_owned().await;
 
         let err = tokio::time::timeout(PATIENCE, read(&service, &space))
@@ -3433,6 +3452,25 @@ mod tests {
             .unwrap();
         drop(held);
         assert_eq!(rows(read(&service, &space).await.unwrap()), 1);
+    }
+
+    #[tokio::test]
+    async fn a_hydration_sweeps_temp_files_a_crashed_one_left_behind() {
+        let (repo, space) = seeded("sql-sweep-orphans").await;
+        let cache = TempDir::new().unwrap();
+        let dir = cache.path().join(space.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        // pid 1 never matches this process's live files: a crashed hydration's.
+        let orphan = dir.join("a.db.tmp.1.0");
+        let orphan_wal = dir.join("a.db-wal.tmp.1.1");
+        let unrelated = dir.join("b.db.tmp.1.0");
+        for file in [&orphan, &orphan_wal, &unrelated] {
+            std::fs::write(file, b"x").unwrap();
+        }
+        let service = SqlService::new(cache.path().to_string_lossy().into_owned(), u64::MAX, repo);
+        assert_eq!(rows(read(&service, &space).await.unwrap()), 1);
+        assert!(!orphan.exists() && !orphan_wal.exists());
+        assert!(unrelated.exists(), "another database's file is not ours");
     }
 
     #[tokio::test]
@@ -3758,6 +3796,9 @@ mod tests {
         );
         assert!(service.hydrations.lock().unwrap().is_empty());
 
+        // The fresh hydration does real disk work (fsync); give it the
+        // default bound so only the gated first attempt is bound-limited.
+        let service = service.with_wait_bounds(SqlWaitBounds::default());
         repo.load_open.send_replace(true);
         assert_eq!(rows(read(&service, &space).await.unwrap()), 1);
         assert_eq!(repo.loads(), 2, "the next request hydrated afresh");

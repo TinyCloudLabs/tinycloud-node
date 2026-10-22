@@ -8941,7 +8941,6 @@ mod tests {
         let storage = crate::storage::file_system::FileSystemConfig::new(storage_dir.path())
             .open()
             .await?;
-        let _storage_dir = storage_dir.keep();
         let tinycloud = crate::TinyCloud::new(
             db.clone().into(),
             Either::B(storage),
@@ -8950,7 +8949,6 @@ mod tests {
         .await?;
         let sql_dir = tempfile::TempDir::new()?;
         let sql_path = sql_dir.path().to_string_lossy().to_string();
-        let _sql_dir = sql_dir.keep();
         let sql_service = SqlService::new(
             sql_path,
             u64::MAX,

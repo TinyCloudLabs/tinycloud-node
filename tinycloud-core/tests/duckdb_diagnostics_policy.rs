@@ -235,7 +235,7 @@ async fn invocation_template_is_not_authority_to_execute_ddl_with_read_ability()
 async fn with_prefixed_writes_require_authority_and_persist_query_write_targets() {
     use tinycloud_auth::resource::SpaceId;
     use tinycloud_core::{
-        database_artifacts::{DatabaseArtifactRepository, SeaOrmDatabaseArtifactRepository},
+        database_artifacts::SeaOrmDatabaseArtifactRepository,
         duckdb::{service::DuckDbService, types::DuckDbError},
         migrations::Migrator,
         sea_orm::{ConnectOptions, Database},
@@ -669,7 +669,7 @@ async fn executing_explain_template_still_requires_the_wrapped_write_ability() {
 async fn restricted_invocations_fail_closed_on_unsupported_sql_shapes_without_changing_data() {
     use tinycloud_auth::resource::SpaceId;
     use tinycloud_core::{
-        database_artifacts::{DatabaseArtifactRepository, SeaOrmDatabaseArtifactRepository},
+        database_artifacts::SeaOrmDatabaseArtifactRepository,
         duckdb::{
             service::DuckDbService,
             types::{DuckDbError, DuckDbExecutionResult},
