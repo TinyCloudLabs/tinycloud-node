@@ -469,8 +469,8 @@ Before any CVM mutation the workflow requires:
 
 - the main compose, with its one node digest replaced by 64 zeros, to hash
   to the reviewed N0 template
-  **`79469f97a8dcecc7856caa11b26e3004b36d4b8ae9e16a51f963d0687992b9fb`**
-  (raw `32a002ef5751817619423c9e60776e03f2c3517315f5aa3a9c8654e3394777f1` normalized; before the three `current_kv_c_index_*` warning codes in the Vector config (TC-1274 `current_kv` C-index migration) the template was `87b5d12a…`, raw `d1fcd665…`; before the optional TC-1482 `NODE_STATS_READ_TOKEN` env line and the TC-1482 route in the Vector config the template was `7fabba70…`, raw `1228d81927fc0a3fbba85745103e77b3112606f5d314d15974d400b222409350`: the 1.21.0 compose
+  **`c91e5b7aabd141faf48b206e398474f8d90cde926c2bfe3f1a163b4923605093`**
+  (raw `99013c40e9523ae15a2c315403f0fc47fb9dcbb017825d3aa0f57669232c9047` normalized; before the TC-950 pool of 10 (`TINYCLOUD_DATABASE__MAX_CONNECTIONS` 15 to 10) the template was `79469f97…`, raw `32a002ef…`; before the three `current_kv_c_index_*` warning codes in the Vector config (TC-1274 `current_kv` C-index migration) the template was `87b5d12a…`, raw `d1fcd665…`; before the optional TC-1482 `NODE_STATS_READ_TOKEN` env line and the TC-1482 route in the Vector config the template was `7fabba70…`, raw `1228d81927fc0a3fbba85745103e77b3112606f5d314d15974d400b222409350`: the 1.21.0 compose
   `d95bfb707871c1d626c4a8f2b8d32d354103edbb5077847c6a21fe5f7f6cfa50`, template
   `51f8e9e9…`, with only the embedded Vector config regenerated for TC-1274's,
   TC-1317's and TC-1482's route and warning codes (TC-1274 and TC-1317 were template `7fabba70…`, raw `1228d819…`); TC-1274 alone was template `00938226…`, raw
@@ -539,8 +539,8 @@ gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref main \
 
 The served/OCI identity remains **1.20.6-dstack / e18578ff9162986ddd813259c60f73866e3e60d1**.
 With the template lock on main this redeploys exactly main's raw compose
-`32a002ef5751817619423c9e60776e03f2c3517315f5aa3a9c8654e3394777f1`
-(the 1.21.0 compose `d95bfb70…` with the TC-1274, TC-1317, TC-1482 and `current_kv_c_index_*` Vector config and the optional TC-1482 `NODE_STATS_READ_TOKEN` env line), whatever digest
+`99013c40e9523ae15a2c315403f0fc47fb9dcbb017825d3aa0f57669232c9047`
+(the 1.21.0 compose `d95bfb70…` with the TC-1274, TC-1317, TC-1482 and `current_kv_c_index_*` Vector config, the optional TC-1482 `NODE_STATS_READ_TOKEN` env line and the TC-950 pool of 10), whatever digest
 main's template currently pins. It is not a rollback of a
 later release across a schema migration. Current pre-N0 tag/pinned
 equivalents are separately hash-checked; arbitrary same-image config
