@@ -8,6 +8,16 @@
 - `MemorySink` caps its size hint at 64 MiB and treats a failed reservation as no hint. Details: TC-1491.
 - A SQL request that writes is one transaction: an `execute` (with its `schema` statements), a `batch`, a named statement, and a `query` that writes (`WITH … INSERT`) or carries a `PRAGMA` (admin only). If any statement fails, or a deferred constraint fails at the commit, none of them is kept: the local file is unchanged and matches the durable copy in Postgres, and the request costs no Postgres round trip. This holds for a single statement too, including `INSERT OR FAIL` and a column constraint with `ON CONFLICT FAIL`. Telemetry: such a request counts two more native SQL calls (the `SAVEPOINT` and its `RELEASE` or `ROLLBACK`). No migration. Details: TC-1491.
 
+## [1.21.7] - 2026-10-21
+
+### Release notes
+
+- **Database connection pool of 10.** The production compose sets `TINYCLOUD_DATABASE__MAX_CONNECTIONS` to 10 (was 15), so two containers that overlap during a deploy fit within the database instance's 25 connections. The compose hash changes. No database migrations. Details: TC-950.
+
+### Changes
+
+- Production compose: the database pool is `TINYCLOUD_DATABASE__MAX_CONNECTIONS: "10"` (was 15), so two containers that overlap during a deploy fit within the instance's 25 connections. This changes the compose hash; the N0 template lock in `docker.yml` and `scripts/ci/fixtures/tc959-n0-compose.yaml` move with it. Details: TC-950.
+
 ## [1.21.6] - 2026-10-21
 
 ### Release notes
