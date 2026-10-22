@@ -4327,17 +4327,17 @@ mod tests {
         SpaceId::new(did, name.parse().unwrap())
     }
 
-    async fn test_tinycloud() -> Result<TinyCloud> {
+    async fn test_tinycloud() -> Result<(TempDir, TinyCloud)> {
         let tempdir = TempDir::new()?;
         let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string())).await?;
         let storage = NodeFileSystemConfig::new(tempdir.path()).open().await?;
-        let _persisted = tempdir.keep();
-        Ok(TinyCloud::new(
+        let tinycloud = TinyCloud::new(
             db.into(),
             Either::B(storage),
             StaticSecret::new(vec![0u8; 32]).unwrap(),
         )
-        .await?)
+        .await?;
+        Ok((tempdir, tinycloud))
     }
 
     /// A UCAN expiration far enough ahead to outlast the test yet within the
@@ -4765,7 +4765,7 @@ mod tests {
 
     #[tokio::test]
     async fn enqueue_database_webhook_deliveries_persists_matching_sql_and_duckdb() -> Result<()> {
-        let tinycloud = test_tinycloud().await?;
+        let (_tempdir, tinycloud) = test_tinycloud().await?;
         let sql_sub = subscription_model(
             "sub_sql",
             "tinycloud:space",
@@ -4835,7 +4835,7 @@ mod tests {
 
     #[tokio::test]
     async fn enqueue_database_webhook_deliveries_skips_unsupported_write_targets() -> Result<()> {
-        let tinycloud = test_tinycloud().await?;
+        let (_tempdir, tinycloud) = test_tinycloud().await?;
         let sql_sub = subscription_model(
             "sub_sql",
             "tinycloud:space",
@@ -4888,16 +4888,15 @@ mod tests {
         sql::{SqlExecutionResult, SqlRequest, SqlResponse, SqlService, SqlValue},
     };
 
-    async fn fresh_sql_service() -> SqlService {
+    async fn fresh_sql_service() -> (TempDir, SqlService) {
         let cache = TempDir::new().unwrap();
         let cache_path = cache.path().to_string_lossy().to_string();
-        let _persisted = cache.keep();
         let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
             .await
             .unwrap();
         Migrator::up(&db, None).await.unwrap();
         let repo = Arc::new(SeaOrmDatabaseArtifactRepository::new(db));
-        SqlService::new(cache_path, u64::MAX, repo)
+        (cache, SqlService::new(cache_path, u64::MAX, repo))
     }
 
     fn caveat_one_pin(name: &str, sql: &str, index: i64, value: serde_json::Value) -> PCSqlCaveat {
@@ -5043,7 +5042,7 @@ mod tests {
         // caller never supplied that param. This is the end-to-end
         // proof that audit P0 finding 4 is fixed (`fixedParams`
         // substituted server-side, not just rejected).
-        let service = fresh_sql_service().await;
+        let (_cache, service) = fresh_sql_service().await;
         let space = test_space_id("w1-fp");
 
         // Seed the schema + one row keyed by a label so we can detect
@@ -5139,7 +5138,6 @@ mod tests {
         let tempdir = TempDir::new()?;
         let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string())).await?;
         let storage = NodeFileSystemConfig::new(tempdir.path()).open().await?;
-        let _persisted = tempdir.keep();
         let tinycloud = TinyCloud::new(
             db.clone().into(),
             Either::B(storage),
@@ -5147,7 +5145,7 @@ mod tests {
         )
         .await?;
         let conn = db;
-        let sql_service = fresh_sql_service().await;
+        let (_cache, sql_service) = fresh_sql_service().await;
         let hook_runtime = HookRuntime::new(HooksConfig::default(), [9u8; 32]);
         let space = test_space_id("w1-http-invoke");
         space_model::ActiveModel {
@@ -5410,7 +5408,7 @@ mod tests {
         )
         .await?;
         let conn = db;
-        let sql_service = fresh_sql_service().await;
+        let (_cache, sql_service) = fresh_sql_service().await;
         let hook_runtime = HookRuntime::new(HooksConfig::default(), [9u8; 32]);
         let space = test_space_id("w1-malformed-fact");
         space_model::ActiveModel {
@@ -5613,7 +5611,6 @@ mod tests {
         let tempdir = TempDir::new()?;
         let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string())).await?;
         let storage = NodeFileSystemConfig::new(tempdir.path()).open().await?;
-        let _persisted = tempdir.keep();
         let tinycloud = TinyCloud::new(
             db.clone().into(),
             Either::B(storage),
@@ -5621,7 +5618,7 @@ mod tests {
         )
         .await?;
         let conn = db;
-        let sql_service = fresh_sql_service().await;
+        let (_cache, sql_service) = fresh_sql_service().await;
         let hook_runtime = HookRuntime::new(HooksConfig::default(), [9u8; 32]);
         let space = test_space_id("w5-runtime-node");
         let owner_did = space.did().to_string();
@@ -5863,7 +5860,7 @@ mod tests {
         };
         use tinycloud_core::types::Caveats;
 
-        let tinycloud = test_tinycloud().await?;
+        let (_tempdir, tinycloud) = test_tinycloud().await?;
         let conn = tinycloud.readable().await?;
         let space: SpaceId = test_space_id("w1-revoke");
 
@@ -6069,7 +6066,7 @@ mod tests {
             .encode()?)
         }
 
-        let tinycloud = test_tinycloud().await?;
+        let (_tempdir, tinycloud) = test_tinycloud().await?;
         let conn = tinycloud.readable().await?;
         let mut holder_jwk = JWK::generate_ed25519()?;
         holder_jwk.algorithm = Some(Algorithm::EdDSA);
@@ -6807,7 +6804,7 @@ mod tests {
         use tinycloud_core::types::Caveats;
 
         // Build a TinyCloud-backed db that we can hand the route helper.
-        let tinycloud = test_tinycloud().await?;
+        let (_tempdir, tinycloud) = test_tinycloud().await?;
         let conn = tinycloud.readable().await?;
         let space: SpaceId = test_space_id("w1-chain");
 
@@ -7030,6 +7027,8 @@ mod tests {
         verification_method: String,
         parent_cid: tinycloud_auth::authorization::Cid,
         used: u64,
+        _storage_dir: TempDir,
+        _cache_dir: TempDir,
     }
 
     async fn metered_sql_http_setup(name: &str) -> Result<MeteredSqlHttp> {
@@ -7050,7 +7049,6 @@ mod tests {
         let tempdir = TempDir::new()?;
         let auth_db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string())).await?;
         let storage = NodeFileSystemConfig::new(tempdir.path()).open().await?;
-        let _persisted = tempdir.keep();
         let tinycloud = TinyCloud::new(
             auth_db.clone().into(),
             Either::B(storage),
@@ -7064,7 +7062,6 @@ mod tests {
         // into the shared handle.
         let cache = TempDir::new()?;
         let cache_path = cache.path().to_string_lossy().to_string();
-        let _cache_persisted = cache.keep();
         let sql_db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string())).await?;
         Migrator::up(&sql_db, None).await?;
         let raw_repo: Arc<dyn DatabaseArtifactRepository> =
@@ -7184,6 +7181,8 @@ mod tests {
         Ok(MeteredSqlHttp {
             tinycloud,
             sql_service,
+            _storage_dir: tempdir,
+            _cache_dir: cache,
             #[cfg(feature = "duckdb")]
             duckdb_service,
             replay_db: conn,
@@ -7813,7 +7812,7 @@ mod tests {
     /// reported none and published nothing).
     #[tokio::test]
     async fn tc1585_cte_wrapped_writes_report_targets_that_become_write_events() -> Result<()> {
-        let service = fresh_sql_service().await;
+        let (_cache, service) = fresh_sql_service().await;
         let space = test_space_id("tc1585-hooks");
         let hooks = HookRuntime::new(HooksConfig::default(), [5u8; 32]);
         let mut events = hooks.bus().subscribe();
@@ -8386,7 +8385,6 @@ mod tests {
         let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
         let db = Database::connect(crate::sqlite_connect_options(&db_url)).await?;
         let storage = NodeFileSystemConfig::new(tempdir.path()).open().await?;
-        let _persisted = tempdir.keep();
         let tinycloud = TinyCloud::new(
             db.clone().into(),
             Either::B(storage),
@@ -8693,7 +8691,6 @@ mod tests {
         let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
         let storage_a = tempdir.path().join("storage_a");
         let storage_b = tempdir.path().join("storage_b");
-        let _persisted = tempdir.keep();
 
         std::fs::create_dir_all(&storage_a)?;
         std::fs::create_dir_all(&storage_b)?;
@@ -9043,14 +9040,15 @@ mod tests {
     /// TinyCloud auth DB — sufficient here because a rejected invocation never
     /// reaches TinyCloud processing.
     async fn tc341_invoke_rocket() -> Result<(
+        Vec<TempDir>,
         rocket::Rocket<rocket::Build>,
         tinycloud_core::sea_orm::DatabaseConnection,
     )> {
-        let tinycloud = test_tinycloud().await?;
+        let (storage_dir, tinycloud) = test_tinycloud().await?;
         let replay_db =
             Database::connect(ConnectOptions::new("sqlite::memory:".to_string())).await?;
         Migrator::up(&replay_db, None).await?;
-        let sql_service = fresh_sql_service().await;
+        let (sql_cache, sql_service) = fresh_sql_service().await;
         let hook_runtime = HookRuntime::new(HooksConfig::default(), [9u8; 32]);
         let rocket = rocket::build()
             .mount("/", rocket::routes![invoke])
@@ -9065,7 +9063,7 @@ mod tests {
             .manage(hook_runtime)
             .manage(BlockStage::from(crate::config::StagingStorage::Memory));
         let rocket = manage_tc405_test_state(rocket, replay_db.clone());
-        Ok((rocket, replay_db))
+        Ok((vec![storage_dir, sql_cache], rocket, replay_db))
     }
 
     fn tc341_verification_method(jwk: &JWK) -> Result<String> {
@@ -9139,7 +9137,7 @@ mod tests {
         use rocket::http::{ContentType, Header, Status};
         use rocket::local::asynchronous::Client;
 
-        let (rocket, replay_conn) = tc341_invoke_rocket().await?;
+        let (_tempdirs, rocket, replay_conn) = tc341_invoke_rocket().await?;
         let client = Client::tracked(rocket).await?;
 
         // Parseable, in-window, but signed by a different key than its claimed
@@ -9176,7 +9174,7 @@ mod tests {
         use rocket::http::{ContentType, Header, Status};
         use rocket::local::asynchronous::Client;
 
-        let (rocket, replay_conn) = tc341_invoke_rocket().await?;
+        let (_tempdirs, rocket, replay_conn) = tc341_invoke_rocket().await?;
         let client = Client::tracked(rocket).await?;
 
         // Correctly signed, but already expired: rejected by the cheap
@@ -9210,7 +9208,7 @@ mod tests {
         use rocket::http::{ContentType, Header, Status};
         use rocket::local::asynchronous::Client;
 
-        let (rocket, replay_conn) = tc341_invoke_rocket().await?;
+        let (_tempdirs, rocket, replay_conn) = tc341_invoke_rocket().await?;
         let client = Client::tracked(rocket).await?;
 
         // Correctly signed and not expired, but claims a far-future expiration
@@ -9308,6 +9306,7 @@ mod tests {
     async fn tc409_invoke_rocket(
         space: &SpaceId,
     ) -> Result<(
+        Vec<TempDir>,
         rocket::Rocket<rocket::Build>,
         tinycloud_core::sea_orm::DatabaseConnection,
     )> {
@@ -9319,6 +9318,7 @@ mod tests {
         space: &SpaceId,
         config: Config,
     ) -> Result<(
+        Vec<TempDir>,
         rocket::Rocket<rocket::Build>,
         tinycloud_core::sea_orm::DatabaseConnection,
     )> {
@@ -9342,7 +9342,6 @@ mod tests {
                 .join(space.suffix())
                 .join(space.name().as_str()),
         )?;
-        let _persisted = tempdir.keep();
         let tinycloud = TinyCloud::new(
             db.clone().into(),
             Either::B(storage),
@@ -9359,13 +9358,13 @@ mod tests {
         let replay_db =
             Database::connect(ConnectOptions::new("sqlite::memory:".to_string())).await?;
         Migrator::up(&replay_db, None).await?;
-        let sql_service = fresh_sql_service().await;
+        let (sql_cache, sql_service) = fresh_sql_service().await;
         let hook_runtime = HookRuntime::new(HooksConfig::default(), [9u8; 32]);
         #[cfg(feature = "duckdb")]
         let duckdb_service = {
-            let cache = TempDir::new()?;
-            let path = cache.path().to_string_lossy().to_string();
-            let _persisted = cache.keep();
+            let path = tempdir.path().join("duckdb");
+            std::fs::create_dir_all(&path)?;
+            let path = path.to_string_lossy().to_string();
             let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string())).await?;
             Migrator::up(&db, None).await?;
             let repo = Arc::new(SeaOrmDatabaseArtifactRepository::new(db));
@@ -9387,7 +9386,7 @@ mod tests {
         #[cfg(feature = "duckdb")]
         let rocket = rocket.manage(duckdb_service);
         let rocket = manage_tc405_test_state(rocket, conn.clone());
-        Ok((rocket, conn))
+        Ok((vec![tempdir, sql_cache], rocket, conn))
     }
 
     #[tokio::test]
@@ -9411,7 +9410,7 @@ mod tests {
             nonce,
         )?;
 
-        let (rocket, _conn) = tc409_invoke_rocket(&space).await?;
+        let (_tempdirs, rocket, _conn) = tc409_invoke_rocket(&space).await?;
         let client = Client::tracked(rocket).await?;
 
         let identity = tinycloud_core::hash::hash(nonce.as_bytes());
@@ -9463,7 +9462,7 @@ mod tests {
             Some("doc"),
             nonce,
         )?;
-        let (rocket, _conn) = tc409_invoke_rocket(&space).await?;
+        let (_tempdirs, rocket, _conn) = tc409_invoke_rocket(&space).await?;
         let client = Client::tracked(rocket).await?;
         let response = client
             .post("/invoke")
@@ -9559,7 +9558,7 @@ mod tests {
             nonce,
         )?;
 
-        let (rocket, _conn) = tc409_invoke_rocket(&space).await?;
+        let (_tempdirs, rocket, _conn) = tc409_invoke_rocket(&space).await?;
         let client = Client::tracked(rocket).await?;
 
         let identity = tinycloud_core::hash::hash(nonce.as_bytes());
@@ -9626,7 +9625,7 @@ mod tests {
             Some("docs"),
             "urn:uuid:tc731-probe",
         )?;
-        let (rocket, _conn) = tc409_invoke_rocket(&space).await?;
+        let (_tempdirs, rocket, _conn) = tc409_invoke_rocket(&space).await?;
         let cursor_key = rocket
             .state::<TinyCloud>()
             .expect("TinyCloud is managed")
@@ -9801,6 +9800,7 @@ mod tests {
         nonce: std::sync::atomic::AtomicU64,
         sync_cursor_key: [u8; 32],
         node_did: String,
+        _tempdirs: Vec<TempDir>,
     }
 
     struct SyncReply {
@@ -9856,7 +9856,7 @@ mod tests {
                 Some("probe"),
                 "urn:uuid:tc732-probe",
             )?;
-            let (rocket, conn) = tc409_invoke_rocket_with(&space, config).await?;
+            let (tempdirs, rocket, conn) = tc409_invoke_rocket_with(&space, config).await?;
             let rocket = extend(rocket);
             let sync_cursor_key = rocket
                 .state::<TinyCloud>()
@@ -9883,6 +9883,7 @@ mod tests {
                 nonce: std::sync::atomic::AtomicU64::new(0),
                 sync_cursor_key,
                 node_did,
+                _tempdirs: tempdirs,
             })
         }
 

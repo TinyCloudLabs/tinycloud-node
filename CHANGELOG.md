@@ -4,8 +4,25 @@
 
 ### Changes
 
-- `docs/releasing.md`: how a compose-only change ships (as a release), and how to read the dense promote watch. Details: TC-950.
 - SQL and DuckDB delegations (`tinycloud.sql/*`, `tinycloud.duckdb/*`) are refused when their caveats are not supported, with `DelegationError::UnsupportedCaveat`. SQL accepts empty caveats or a constrained-statements profile (direct or nested). DuckDB accepts empty caveats only. Invocations of SQL and DuckDB abilities are refused the same way (`InvocationError::UnsupportedCaveat`). Invocation `sqlCaveats` and `duckdbCaveats` facts with an unknown key or a wrongly typed value return 400, and every occurrence of the fact is checked. Details: TC-1791.
+
+## [1.21.8] - 2026-10-22
+
+### Release notes
+
+- **A SQL request that writes is one transaction.** If any statement fails, or a deferred constraint fails at the commit, none of them is kept: the local file is unchanged and matches the durable copy in Postgres. Details: TC-1491.
+- **Bounded reads of stored database artifacts.** Hydration reads in 4 MiB slices instead of loading whole rows. On PostgreSQL, setting `payload` to `STORAGE EXTERNAL` is recommended for large artifacts; see Changes. Details: TC-822.
+- **One database migration:** `m20261021_000000_sql_store_manifest` adds two empty tables for the SQL block store, which stays off by default. A node image from before this migration refuses to start while `seaql_migrations` lists a migration it does not ship, so rolling back below 1.21.8 needs `DELETE FROM seaql_migrations WHERE version = 'm20261021_000000_sql_store_manifest';` first. Details: TC-1491.
+
+### Changes
+
+- `docs/releasing.md`: how a compose-only change ships (as a release), and how to read the dense promote watch. Details: TC-950.
+- A SQL request that writes is one transaction: an `execute` (with its `schema` statements), a `batch`, a named statement, and a `query` that writes (`WITH … INSERT`) or carries a `PRAGMA` (admin only). If any statement fails, or a deferred constraint fails at the commit, none of them is kept: the local file is unchanged and matches the durable copy in Postgres, and the request costs no Postgres round trip. This holds for a single statement too, including `INSERT OR FAIL` and a column constraint with `ON CONFLICT FAIL`. Telemetry: such a request counts two more native SQL calls (the `SAVEPOINT` and its `RELEASE` or `ROLLBACK`). Details: TC-1491.
+- Bounded reads of stored database artifacts: the node no longer loads a whole `database_artifact` row. It reads metadata columns for existence and size checks and streams `payload`, then `delta_payload`, in 4 MiB slices while verifying the content hashes. On PostgreSQL, `ALTER TABLE database_artifact ALTER COLUMN payload SET STORAGE EXTERNAL` is a recommended operator step for large artifacts (`docs/runbooks/tc-822-artifact-payload-storage.md`); it is not required and rewrites no data. Details: TC-822.
+- The storage usage read (`tinycloud.space/info`) returns `manageUrl` `https://account.tinycloud.xyz/storage`, the account storage page, for "Manage storage". Details: TC-848.
+- SQL block store: contract types, configuration and the `m20261021_000000_sql_store_manifest` migration, which creates two empty tables. Nothing uses them unless `[sql_store]` is enabled, which it is not by default. Details: TC-1491.
+- Phala deploys fail unless the CVM runs the pinned production OS image (`docker.yml`; `docs/releasing.md`). Details: TC-1630.
+- Tests remove their temporary directories when each test ends. Details: TC-1748.
 
 ## [1.21.7] - 2026-10-21
 
@@ -15,7 +32,6 @@
 
 ### Changes
 
-- The storage usage read (`tinycloud.space/info`) returns `manageUrl` `https://account.tinycloud.xyz/storage`, the account storage page, for "Manage storage". Details: TC-848.
 - Production compose: the database pool is `TINYCLOUD_DATABASE__MAX_CONNECTIONS: "10"` (was 15), so two containers that overlap during a deploy fit within the instance's 25 connections. This changes the compose hash; the N0 template lock in `docker.yml` and `scripts/ci/fixtures/tc959-n0-compose.yaml` move with it. Details: TC-950.
 
 ## [1.21.6] - 2026-10-21

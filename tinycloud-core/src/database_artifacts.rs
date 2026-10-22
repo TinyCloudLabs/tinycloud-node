@@ -192,6 +192,8 @@ pub trait ArtifactSink: Send {
     /// Discard everything received so far; a new attempt is about to begin.
     async fn reset(&mut self) -> Result<(), DatabaseArtifactError>;
     async fn begin_part(&mut self, part: ArtifactPart) -> Result<(), DatabaseArtifactError>;
+    /// The stored size of the part just begun, for sinks that buffer it.
+    fn size_hint(&mut self, _part: ArtifactPart, _bytes: u64) {}
     async fn write(&mut self, bytes: &[u8]) -> Result<(), DatabaseArtifactError>;
     async fn finish_part(&mut self) -> Result<(), DatabaseArtifactError>;
 }
@@ -218,6 +220,16 @@ impl ArtifactSink for MemorySink {
             self.wal = Some(Vec::new());
         }
         Ok(())
+    }
+
+    fn size_hint(&mut self, part: ArtifactPart, bytes: u64) {
+        let target = match part {
+            ArtifactPart::Checkpoint => Some(&mut self.checkpoint),
+            ArtifactPart::Wal => self.wal.as_mut(),
+        };
+        if let Some(target) = target {
+            target.reserve_exact(usize::try_from(bytes).unwrap_or(0));
+        }
     }
 
     async fn write(&mut self, bytes: &[u8]) -> Result<(), DatabaseArtifactError> {
@@ -316,21 +328,26 @@ impl CacheFileSink {
     fn discard(&mut self) {
         if let Some(current) = self.current.take() {
             let _ = std::fs::remove_file(&current.temp);
+            release_staging(&current.temp);
         }
         for (temp, _) in self.staged.drain(..) {
-            let _ = std::fs::remove_file(temp);
+            let _ = std::fs::remove_file(&temp);
+            release_staging(&temp);
         }
     }
 
     /// Move the staged files to their final paths. The caller has already
     /// removed the stale cache files they replace.
     pub async fn commit(&mut self) -> std::io::Result<()> {
-        for (temp, path) in std::mem::take(&mut self.staged) {
+        // Renamed entries leave `staged`; on failure every one still in it
+        // (the failing temp included) is removed by `discard`.
+        while let Some((temp, path)) = self.staged.first().cloned() {
             if let Err(error) = tokio::fs::rename(&temp, &path).await {
-                let _ = tokio::fs::remove_file(&temp).await;
                 self.discard();
                 return Err(error);
             }
+            release_staging(&temp);
+            self.staged.remove(0);
         }
         Ok(())
     }
@@ -342,16 +359,95 @@ impl Drop for CacheFileSink {
     }
 }
 
+/// Staging files this process has created and not yet published or removed.
+/// The sweep never touches these, so it cannot race a live write whose pid
+/// matches a dead process's (pid reuse) or a write of another task.
+fn live_staging() -> &'static std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>> {
+    static LIVE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>,
+    > = std::sync::OnceLock::new();
+    LIVE.get_or_init(Default::default)
+}
+
+/// A temp sibling of `path`, unique per call, registered as live until
+/// [`release_staging`].
 pub(crate) fn staging_path(path: &std::path::Path) -> std::path::PathBuf {
     static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     // Appended to the whole path, never `with_extension`: `main.db` and
     // `main.db-wal` must not share a temp name.
-    std::path::PathBuf::from(format!(
+    let temp = std::path::PathBuf::from(format!(
         "{}.tmp.{}.{}",
         path.display(),
         std::process::id(),
         NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ))
+    ));
+    live_staging()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(temp.clone());
+    temp
+}
+
+/// The staging file at `temp` was published or removed: the sweep may take it
+/// from here on (a no-op if it is already gone).
+pub(crate) fn release_staging(temp: &std::path::Path) {
+    live_staging()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(temp);
+}
+
+#[cfg(feature = "duckdb")]
+/// Releases a [`staging_path`] when dropped, whichever way its writer ends.
+pub(crate) struct StagingRelease(pub(crate) std::path::PathBuf);
+
+#[cfg(feature = "duckdb")]
+impl Drop for StagingRelease {
+    fn drop(&mut self) {
+        release_staging(&self.0);
+    }
+}
+
+/// Remove the `<final>.tmp.<pid>.<n>` files a crashed hydration left beside
+/// each of `finals`: exactly this sink's temp-name pattern, and never a file
+/// this process still has in flight. Run before a hydration begins, under the
+/// database's hydration exclusion.
+pub(crate) async fn sweep_stale_staging(finals: &[&std::path::Path]) {
+    for path in finals {
+        let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+            continue;
+        };
+        let prefix = format!("{}.tmp.", name.to_string_lossy());
+        let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+            continue;
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let file_name = entry.file_name();
+            let Some(rest) = file_name
+                .to_string_lossy()
+                .strip_prefix(&prefix)
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            let is_staging = matches!(
+                rest.split_once('.'),
+                Some((pid, id))
+                    if !pid.is_empty()
+                        && !id.is_empty()
+                        && pid.bytes().all(|b| b.is_ascii_digit())
+                        && id.bytes().all(|b| b.is_ascii_digit())
+            );
+            let temp = entry.path();
+            let live = live_staging()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&temp);
+            if is_staging && !live && tokio::fs::remove_file(&temp).await.is_ok() {
+                tracing::info!("Removed a staging file left by an interrupted hydration");
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -370,7 +466,13 @@ impl ArtifactSink for CacheFileSink {
             tokio::fs::create_dir_all(parent).await.map_err(Self::io)?;
         }
         let temp = staging_path(&path);
-        let file = tokio::fs::File::create(&temp).await.map_err(Self::io)?;
+        let file = match tokio::fs::File::create(&temp).await {
+            Ok(file) => file,
+            Err(error) => {
+                release_staging(&temp);
+                return Err(Self::io(error));
+            }
+        };
         self.current = Some(StagedPart {
             part,
             temp,
@@ -407,6 +509,7 @@ impl ArtifactSink for CacheFileSink {
         } = self.current.take().expect("checked above");
         if let Err(error) = file.sync_all().await {
             let _ = tokio::fs::remove_file(&temp).await;
+            release_staging(&temp);
             return Err(Self::io(error));
         }
         drop(file);
@@ -423,7 +526,7 @@ impl ArtifactSink for CacheFileSink {
 /// changes underneath the read.
 ///
 /// Returns the metadata the delivered bytes belong to, or `None` when there is
-/// no such artifact (the sink is untouched). A concurrent save between two
+/// no such artifact (the sink is reset). A concurrent save between two
 /// slices surfaces from [`DatabaseArtifactRepository::read_chunks`] as
 /// [`DatabaseArtifactError::ArtifactChanged`]; the sink is `reset` and the read
 /// restarts from fresh metadata, at most [`ARTIFACT_READ_RETRIES`] times, so a
@@ -439,6 +542,7 @@ pub async fn read_artifact<R: DatabaseArtifactRepository + ?Sized>(
     let mut retries = 0;
     loop {
         let Some(meta) = repository.load_meta(service, space, name).await? else {
+            sink.reset().await?;
             return Ok(None);
         };
         sink.reset().await?;
@@ -478,7 +582,10 @@ pub trait DatabaseArtifactRepository: Send + Sync {
     /// of at most [`BASE_TIMEOUT_PAYLOAD_BYTES`] stored bytes is one slice per
     /// part.
     ///
-    /// Peak memory is one slice, whatever the artifact's size. Every slice is
+    /// Peak memory is one slice on PostgreSQL. On SQLite it is one stored blob
+    /// transiently (the engine materialises the value before `substr` cuts it)
+    /// and CPU is O(n^2 / chunk) in the artifact size, so the bound there is
+    /// the part's size, not the slice. Every slice is
     /// its own statement (`substr(column, offset, length)`, which runs on
     /// both PostgreSQL `bytea` and SQLite `BLOB`) under the pool's base
     /// timeout, guarded by `WHERE revision = meta.revision AND
@@ -627,13 +734,17 @@ impl SeaOrmDatabaseArtifactRepository {
         let expected_len = u64::try_from(size_bytes).unwrap_or(0);
         // An artifact that fits the base-timeout budget is one slice per part:
         // no extra round trips for the common small database.
-        let slice_bytes = if meta.size_bytes <= BASE_TIMEOUT_PAYLOAD_BYTES as i64 {
+        // Gated on the part's own size as well, so inconsistent metadata
+        // can never ask for a slice past the budget.
+        let budget = BASE_TIMEOUT_PAYLOAD_BYTES as i64;
+        let slice_bytes = if meta.size_bytes <= budget && size_bytes <= budget {
             expected_len.max(1)
         } else {
             ARTIFACT_CHUNK_BYTES as u64
         };
         let mut hasher = Blake3Hasher::new();
         sink.begin_part(part).await?;
+        sink.size_hint(part, expected_len);
         let mut offset = 0_u64;
         while offset < expected_len {
             let len = (expected_len - offset).min(slice_bytes);
@@ -2034,5 +2145,95 @@ mod tests {
             matches!(error, DatabaseArtifactError::HashMismatch { .. }),
             "{error:?}"
         );
+    }
+
+    fn names(dir: &std::path::Path) -> Vec<String> {
+        let mut found: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        found.sort();
+        found
+    }
+
+    async fn stage_both(sink: &mut CacheFileSink) {
+        for (part, body) in [
+            (ArtifactPart::Checkpoint, b"cp"),
+            (ArtifactPart::Wal, b"wl"),
+        ] {
+            sink.begin_part(part).await.unwrap();
+            sink.write(body).await.unwrap();
+            sink.finish_part().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_commit_leaves_no_staged_temp_files() {
+        for blocked in ["main.db", "main.db-wal"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut sink = cache_sink(dir.path());
+            stage_both(&mut sink).await;
+            // A non-empty directory at the destination makes the rename fail.
+            let target = dir.path().join(blocked);
+            std::fs::create_dir(&target).unwrap();
+            std::fs::write(target.join("occupied"), b"x").unwrap();
+
+            sink.commit().await.unwrap_err();
+
+            assert!(
+                names(dir.path()).iter().all(|name| !name.contains(".tmp.")),
+                "{blocked}: {:?}",
+                names(dir.path())
+            );
+            drop(sink);
+            assert!(names(dir.path()).iter().all(|name| !name.contains(".tmp.")));
+        }
+    }
+
+    #[tokio::test]
+    async fn the_sweep_removes_only_orphaned_staging_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let orphans = ["main.db.tmp.4242.0", "main.db-wal.tmp.4242.7"];
+        let kept = [
+            "main.db",
+            "main.db-wal",
+            "other.db.tmp.4242.0",
+            "main.db.tmp.abc.def",
+            "main.db.tmp.1",
+            "main.db.tmp.",
+            "main.db.tmpx.1.2",
+        ];
+        for name in orphans.iter().chain(kept.iter()) {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        // A hydration in progress: one part still streaming, one finished.
+        let mut live = cache_sink(dir.path());
+        live.begin_part(ArtifactPart::Checkpoint).await.unwrap();
+        live.write(b"cp").await.unwrap();
+        live.finish_part().await.unwrap();
+        live.begin_part(ArtifactPart::Wal).await.unwrap();
+        let live_files: Vec<String> = names(dir.path())
+            .into_iter()
+            .filter(|name| name.contains(&format!(".tmp.{}.", std::process::id())))
+            .collect();
+        assert_eq!(live_files.len(), 2, "{live_files:?}");
+
+        let main = dir.path().join("main.db");
+        let wal = dir.path().join("main.db-wal");
+        sweep_stale_staging(&[&main, &wal]).await;
+
+        let left = names(dir.path());
+        for name in orphans {
+            assert!(!left.iter().any(|n| n == name), "{name} survived: {left:?}");
+        }
+        for name in kept.iter().map(|n| n.to_string()).chain(live_files) {
+            assert!(left.contains(&name), "{name} was removed: {left:?}");
+        }
+
+        // Once the hydration ends, its files are no longer protected.
+        drop(live);
+        assert!(names(dir.path())
+            .iter()
+            .all(|n| !n.contains(&format!(".tmp.{}.", std::process::id()))));
     }
 }

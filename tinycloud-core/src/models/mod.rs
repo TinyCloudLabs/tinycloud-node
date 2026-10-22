@@ -41,3 +41,5 @@ pub mod share_policy_presentation_jti;
 pub mod share_session_handle;
 pub mod signed_kv_ticket;
 pub mod space;
+pub mod sql_store_manifest;
+pub mod sql_store_object;
