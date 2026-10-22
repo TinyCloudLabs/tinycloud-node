@@ -13,7 +13,7 @@ write request, whether a single statement, a `Batch` or an `Execute` with `schem
 2. The statements run.
 3. **Pre-commit gate** (`precommit_gate` in `sql/database.rs`).
    - Owner budget and cap are re-checked against the page growth of the open transaction.
-   - Disk: reserve `unspilled WAL bound + page growth * page size` in the node-wide `DiskBudget`. The reservation succeeds only if `free bytes - other in-flight reservations - this reservation >= min_free_bytes`.
+   - Disk: reserve `unspilled WAL bound + pending checkpoint growth` in the node-wide `DiskBudget`, where pending checkpoint growth is the growth of the main file that the next checkpoint will cause (all pages committed since the last checkpoint). A request that wrote nothing reserves nothing. The reservation succeeds only if `free bytes - other in-flight reservations - this reservation >= min_free_bytes`.
 4. `COMMIT` (`RELEASE` of the outermost savepoint). With `synchronous = FULL` the WAL is fsynced before it returns.
 5. The reservation shrinks to the checkpoint growth (the WAL bytes are on disk now). The in-flight part ends at COMMIT and is released by `SqlService` when the request's outcome is known; the checkpoint growth stays held until a checkpoint runs or the connection closes.
 
@@ -76,12 +76,14 @@ A kill -9 test cannot inject "after COMMIT, before its fsync completed"; `before
 
 507, not 413: the SQL client maps 413 to `SQL_RESPONSE_TOO_LARGE`, the KV and quota clients read it as an exhausted storage plan, and TC-1012's 413 is the request body cap.
 
+A write that fails because the disk is full is answered as `sql_disk_headroom` (507) in every configuration. When SQLite reports the database full, the node reads the free space once; if it is below a fixed floor of 16 database pages, the disk is the cause, whatever `min_free_bytes` is set to. Otherwise the owner budget (402) or the per-database cap (`sql_database_size_limit`, 507) is the cause.
+
 ## Scope notes
 
 **What counts as a write.** `Execute`, `Batch` and `ExecuteStatement` are always wrapped (a read inside a batch is wrapped too; only telemetry notices). A single `Query` is wrapped, gated and reserved when `parser::classify_sql` says it is not read-only. That classification covers writes nested in a query tree (TC-1585): a `WITH … INSERT` or `WITH … UPDATE` is a write, so it gets the transaction, the owner budget, the size cap and the pre-commit gate like any other write. The answer does not depend on the caller's abilities; a read-tier grant is only a shortcut (its writes are refused anyway). The route uses the same classifier (`sql_request_is_write`) to decide whether to read the owner's budget, and calls the `*_authorized` service entry points (`execute_with_budget_authorized`, `execute_without_growth_authorized`, `execute_authorized`), so the budget path carries the per-statement authority of TC-1581. `needs_transaction` is the one place this is decided for a request.
 
-**PRAGMA.** A request that carries a `PRAGMA` (admin only) is not wrapped and not gated. This also keeps the actor's connection reset after a request that held a non-report `PRAGMA` (TC-1586) outside any transaction: the reset runs after the request, after the transaction has ended. `PRAGMA synchronous` is not on the admin allow-list, so it cannot be read or set through a request.
+**PRAGMA.** A request that carries a `PRAGMA` (admin only) runs in the same transaction as any other write request, and is limited, gated and reserved like one. The actor's connection reset after a request that held a non-report `PRAGMA` (TC-1586) runs after the request, after the transaction has ended. `PRAGMA synchronous` is not on the admin allow-list, so it cannot be read or set through a request.
 
-**Retire order.** When that reset fails, the actor is retired (deregistered before the error reply, TC-1594 tracks closing the connection first). The pre-commit gate and the reservation release are on the same path as before: the reservation is released by a drop guard in `SqlService::execute_locked` when the request returns, whatever the actor did, so the retire order does not change it. A request that triggers the reset held a `PRAGMA`, so it was never wrapped, gated or reserved in the first place.
+**Retire order.** When that reset fails, the actor is retired (deregistered before the error reply, TC-1594 tracks closing the connection first). The pre-commit gate and the reservation release are on the same path as before: the reservation is released by a drop guard in `SqlService::execute_locked` when the request returns, whatever the actor did, so the retire order does not change it. A request that triggers the reset held a `PRAGMA`; its transaction and its reservation have ended before the reset runs. The actor also retires when a connection is still inside a transaction after a request.
 
 `Publication` commands are not gated either. DuckDB is untouched.
