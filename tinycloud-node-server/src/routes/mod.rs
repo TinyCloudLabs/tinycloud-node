@@ -2635,20 +2635,16 @@ async fn handle_sql_invoke(
     }
     let constrained = resolve_sql_profile(own_profiles, tinycloud, &parent_cids).await?;
 
-    let facts_caveats: Option<SqlCaveats> = admitted
-        .invocation()
-        .0
-        .invocation
-        .payload()
-        .facts
-        .as_ref()
-        .and_then(|facts| {
-            facts.iter().find_map(|fact| {
-                fact.as_object()
-                    .and_then(|obj| obj.get("sqlCaveats"))
-                    .and_then(|v| serde_json::from_value(v.clone()).ok())
-            })
-        });
+    let facts_caveats: Option<SqlCaveats> = parse_caveat_fact(
+        admitted
+            .invocation()
+            .0
+            .invocation
+            .payload()
+            .facts
+            .as_deref(),
+        "sqlCaveats",
+    )?;
 
     let actor = admitted.invocation().0.invoker.clone();
     // TC-409: `admitted` was verified exactly once at the /invoke admission
@@ -3313,6 +3309,168 @@ fn duckdb_request_grows_storage(
     }
 }
 
+/// Allowed keys of a `sqlCaveats` / `duckdbCaveats` invocation fact. These
+/// match the camelCase fields of `SqlCaveats` and `DuckDbCaveats`.
+const CAVEAT_FACT_KEYS: &[&str] = &["tables", "columns", "statements", "readOnly"];
+
+/// TC-1791: read a caveat carried in the invocation facts. An absent fact is
+/// `Ok(None)`. Every fact carrying `fact_key` must be an object whose keys are
+/// all in `CAVEAT_FACT_KEYS` and whose value deserializes into `T`; any other
+/// case is refused with 400. The first such fact is returned.
+fn parse_caveat_fact<T: serde::de::DeserializeOwned>(
+    facts: Option<&[serde_json::Value]>,
+    fact_key: &str,
+) -> Result<Option<T>, (Status, String)> {
+    let mut parsed = None;
+    for value in facts
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|fact| fact.as_object().and_then(|obj| obj.get(fact_key)))
+    {
+        let next = parse_caveat_value::<T>(fact_key, value)?;
+        if parsed.is_none() {
+            parsed = Some(next);
+        }
+    }
+    Ok(parsed)
+}
+
+fn parse_caveat_value<T: serde::de::DeserializeOwned>(
+    fact_key: &str,
+    value: &serde_json::Value,
+) -> Result<T, (Status, String)> {
+    let invalid = |reason: String| {
+        (
+            Status::BadRequest,
+            format!("invalid {fact_key} fact: {reason}"),
+        )
+    };
+    let obj = value
+        .as_object()
+        .ok_or_else(|| invalid("expected an object".to_string()))?;
+    if let Some(unknown) = obj
+        .keys()
+        .find(|key| !CAVEAT_FACT_KEYS.contains(&key.as_str()))
+    {
+        return Err(invalid(format!("unsupported key `{unknown}`")));
+    }
+    serde_json::from_value(value.clone()).map_err(|error| invalid(error.to_string()))
+}
+
+#[cfg(test)]
+mod caveat_fact_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn absent_caveat_fact_is_none() {
+        let facts = [json!({"other": {"tables": ["a"]}})];
+        let parsed: Option<SqlCaveats> = parse_caveat_fact(Some(&facts[..]), "sqlCaveats")
+            .expect("an absent fact is not an error");
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn well_formed_caveat_fact_is_parsed() {
+        let facts = [json!({"sqlCaveats": {"tables": ["a"], "readOnly": true}})];
+        let parsed: SqlCaveats = parse_caveat_fact(Some(&facts[..]), "sqlCaveats")
+            .expect("a well-formed fact parses")
+            .expect("the fact is present");
+        assert_eq!(parsed.tables, Some(vec!["a".to_string()]));
+        assert_eq!(parsed.read_only, Some(true));
+    }
+
+    #[test]
+    fn misspelled_caveat_key_is_refused() {
+        let facts = [json!({"sqlCaveats": {"tabels": ["a"]}})];
+        let (status, _) = parse_caveat_fact::<SqlCaveats>(Some(&facts[..]), "sqlCaveats")
+            .expect_err("an unknown key is refused");
+        assert_eq!(status, Status::BadRequest);
+    }
+
+    #[test]
+    fn wrongly_typed_caveat_value_is_refused() {
+        let facts = [json!({"sqlCaveats": {"readOnly": "yes"}})];
+        let (status, _) = parse_caveat_fact::<SqlCaveats>(Some(&facts[..]), "sqlCaveats")
+            .expect_err("a wrongly typed value is refused");
+        assert_eq!(status, Status::BadRequest);
+    }
+
+    #[test]
+    fn non_object_caveat_fact_is_refused() {
+        let facts = [json!({"sqlCaveats": ["tables"]})];
+        let (status, _) = parse_caveat_fact::<SqlCaveats>(Some(&facts[..]), "sqlCaveats")
+            .expect_err("a non-object caveat is refused");
+        assert_eq!(status, Status::BadRequest);
+    }
+
+    #[test]
+    fn every_caveat_fact_occurrence_is_validated() {
+        let facts = [
+            json!({"sqlCaveats": {"tables": ["a"]}}),
+            json!({"sqlCaveats": {"tabels": ["b"]}}),
+        ];
+        let (status, _) = parse_caveat_fact::<SqlCaveats>(Some(&facts[..]), "sqlCaveats")
+            .expect_err("a later invalid occurrence is refused");
+        assert_eq!(status, Status::BadRequest);
+    }
+
+    #[test]
+    fn first_valid_caveat_fact_occurrence_is_used() {
+        let facts = [
+            json!({"sqlCaveats": {"tables": ["a"]}}),
+            json!({"sqlCaveats": {"tables": ["b"]}}),
+        ];
+        let parsed: SqlCaveats = parse_caveat_fact(Some(&facts[..]), "sqlCaveats")
+            .expect("both occurrences are valid")
+            .expect("the fact is present");
+        assert_eq!(parsed.tables, Some(vec!["a".to_string()]));
+    }
+
+    #[test]
+    fn caveat_fact_keys_match_sql_caveat_fields() {
+        use std::collections::BTreeSet;
+        // The struct literal names every field, so a new SqlCaveats field
+        // stops this test from compiling until CAVEAT_FACT_KEYS is updated.
+        let caveats = SqlCaveats {
+            tables: None,
+            columns: None,
+            statements: None,
+            read_only: None,
+        };
+        let value = serde_json::to_value(&caveats).expect("serializes");
+        let serialized: BTreeSet<&str> = value
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let allowed: BTreeSet<&str> = CAVEAT_FACT_KEYS.iter().copied().collect();
+        assert_eq!(serialized, allowed);
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn duckdb_caveat_fact_keys_match_duckdb_caveat_fields() {
+        use std::collections::BTreeSet;
+        let caveats = tinycloud_core::duckdb::DuckDbCaveats {
+            tables: None,
+            columns: None,
+            statements: None,
+            read_only: None,
+        };
+        let value = serde_json::to_value(&caveats).expect("serializes");
+        let serialized: BTreeSet<&str> = value
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let allowed: BTreeSet<&str> = CAVEAT_FACT_KEYS.iter().copied().collect();
+        assert_eq!(serialized, allowed);
+    }
+}
+
 #[cfg(feature = "duckdb")]
 #[allow(clippy::too_many_arguments)]
 async fn handle_duckdb_invoke(
@@ -3339,20 +3497,16 @@ async fn handle_duckdb_invoke(
             .into());
     }
     request_cancel::set_stage(request_cancel::Stage::Other);
-    let caveats: Option<DuckDbCaveats> = admitted
-        .invocation()
-        .0
-        .invocation
-        .payload()
-        .facts
-        .as_ref()
-        .and_then(|facts| {
-            facts.iter().find_map(|fact| {
-                fact.as_object()
-                    .and_then(|obj| obj.get("duckdbCaveats"))
-                    .and_then(|v| serde_json::from_value(v.clone()).ok())
-            })
-        });
+    let caveats: Option<DuckDbCaveats> = parse_caveat_fact(
+        admitted
+            .invocation()
+            .0
+            .invocation
+            .payload()
+            .facts
+            .as_deref(),
+        "duckdbCaveats",
+    )?;
 
     let actor = admitted.invocation().0.invoker.clone();
     // TC-409: same admitted core entry point as the SQL path above — the
@@ -5349,6 +5503,207 @@ mod tests {
         Ok(())
     }
 
+    /// TC-1791: `/invoke` refuses an invocation whose `sqlCaveats` fact has a
+    /// key outside the caveat schema. The response is 400 with the
+    /// `invalid sqlCaveats fact` reason, and the statement is not executed.
+    #[tokio::test]
+    async fn w1_rocket_http_invoke_malformed_sql_caveat_fact_is_bad_request() -> Result<()> {
+        use rocket::http::{ContentType, Header, Status};
+        use rocket::local::asynchronous::Client;
+        use serde_json::json;
+        use tinycloud_auth::authorization::Cid as AuthCid;
+        use tinycloud_auth::ssi::{dids::DIDURLBuf, ucan::Payload};
+        use tinycloud_auth::ucan_capabilities_object::Capabilities;
+        use tinycloud_core::models::{
+            abilities, actor, delegation as deleg_model, space as space_model,
+        };
+        use tinycloud_core::sea_orm::ActiveModelTrait;
+        use tinycloud_core::sea_orm::ActiveValue::Set;
+        use tinycloud_core::types::{Caveats, SpaceIdWrap};
+
+        let tempdir = TempDir::new()?;
+        let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string())).await?;
+        let storage = NodeFileSystemConfig::new(tempdir.path()).open().await?;
+        let tinycloud = TinyCloud::new(
+            db.clone().into(),
+            Either::B(storage),
+            StaticSecret::new(vec![0u8; 32]).unwrap(),
+        )
+        .await?;
+        let conn = db;
+        let (_cache, sql_service) = fresh_sql_service().await;
+        let hook_runtime = HookRuntime::new(HooksConfig::default(), [9u8; 32]);
+        let space = test_space_id("w1-malformed-fact");
+        space_model::ActiveModel {
+            id: Set(SpaceIdWrap(space.clone())),
+        }
+        .insert(&conn)
+        .await?;
+
+        sql_service
+            .execute(
+                &space,
+                &SqlService::db_name_from_path(Some("main")),
+                SqlRequest::Execute {
+                    schema: Some(vec![
+                        "CREATE TABLE labels (label TEXT PRIMARY KEY, val INTEGER NOT NULL)"
+                            .to_string(),
+                    ]),
+                    sql: "INSERT INTO labels (label, val) VALUES (?, ?)".to_string(),
+                    params: vec![SqlValue::Text("alpha".to_string()), SqlValue::Integer(111)],
+                },
+                None,
+                "tinycloud.sql/admin".to_string(),
+            )
+            .await?;
+
+        let jwk = JWK::generate_ed25519()?;
+        let mut verification_method = DID_METHODS.generate(&jwk, "key")?.to_string();
+        let fragment = verification_method
+            .rsplit_once(':')
+            .ok_or_else(|| anyhow::anyhow!("missing verification method fragment"))?
+            .1
+            .to_string();
+        verification_method.push('#');
+        verification_method.push_str(&fragment);
+        let delegatee = verification_method
+            .split('#')
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("missing did"))?
+            .to_string();
+        let owner_did = space.did().to_string();
+
+        for did in [&owner_did, &delegatee] {
+            actor::ActiveModel {
+                id: Set(did.clone()),
+            }
+            .insert(&conn)
+            .await?;
+        }
+
+        let parent_hash = tinycloud_core::hash::hash(b"w1-malformed-fact-parent");
+        deleg_model::ActiveModel {
+            id: Set(parent_hash),
+            delegator: Set(owner_did),
+            delegatee: Set(delegatee),
+            expiry: Set(None),
+            issued_at: Set(None),
+            not_before: Set(None),
+            facts: Set(None),
+            serialization: Set(b"w1-malformed-fact-parent".to_vec()),
+        }
+        .insert(&conn)
+        .await?;
+
+        let sql_resource: ResourceId = space.clone().to_resource(
+            "sql".parse::<Service>()?,
+            Some("main".parse::<AuthPath>()?),
+            None,
+            None,
+        );
+        let constrained_caveat = json!({
+            "mode": "constrained-statements",
+            "readOnly": true,
+            "statements": [{
+                "name": "get_val",
+                "sql": "SELECT val FROM labels WHERE label=?",
+                "fixedParams": [{"index": 0, "value": "alpha"}]
+            }]
+        });
+        let mut caveats_map = std::collections::BTreeMap::new();
+        caveats_map.insert("0".to_string(), constrained_caveat.clone());
+        abilities::ActiveModel {
+            delegation: Set(parent_hash),
+            resource: Set(Resource::TinyCloud(sql_resource.clone())),
+            ability: Set(Ability::try_from("tinycloud.sql/read".to_string()).unwrap()),
+            caveats: Set(Caveats(caveats_map)),
+        }
+        .insert(&conn)
+        .await?;
+        let parent_cid: AuthCid = parent_hash.to_cid(0x55);
+        let invocation_nb: std::collections::BTreeMap<String, serde_json::Value> =
+            constrained_caveat
+                .as_object()
+                .expect("test caveat must be an object")
+                .clone()
+                .into_iter()
+                .collect();
+
+        let mut invocation_caps = Capabilities::new();
+        invocation_caps.with_action(
+            sql_resource.as_uri(),
+            "tinycloud.sql/read".parse::<UcanAbility>()?,
+            [invocation_nb],
+        );
+        let auth_header = Payload {
+            issuer: verification_method.parse::<DIDURLBuf>()?,
+            audience: verification_method
+                .split('#')
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("missing did"))?
+                .parse::<DIDBuf>()?,
+            not_before: None,
+            expiration: test_invocation_expiration(),
+            nonce: Some("urn:uuid:00000000-0000-4000-8000-000000000002".to_string()),
+            // `tabels` is a misspelled `tables` key, which the fact schema refuses.
+            facts: Some(vec![json!({"sqlCaveats": {"tabels": ["a"]}})]),
+            proof: vec![parent_cid],
+            attenuation: invocation_caps,
+        }
+        .sign(jwk.get_algorithm().unwrap_or_default(), &jwk)?
+        .encode()?;
+
+        #[cfg(feature = "duckdb")]
+        let duckdb_cache = TempDir::new()?;
+        #[cfg(feature = "duckdb")]
+        let duckdb_service = {
+            let path = duckdb_cache.path().to_string_lossy().to_string();
+            let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string())).await?;
+            Migrator::up(&db, None).await?;
+            let repo = Arc::new(SeaOrmDatabaseArtifactRepository::new(db));
+            DuckDbService::new(path, u64::MAX, 300, "256MB".into(), repo)
+        };
+        let rocket = rocket::build()
+            .mount("/", rocket::routes![invoke])
+            .attach(crate::tracing::TracingFairing::for_test(
+                &Config::default().log.tracing,
+            ))
+            .manage(tinycloud)
+            .manage(sql_service)
+            .manage(Config::default())
+            .manage(QuotaCache::new(None, None))
+            .manage(InvocationReplayCache::new(conn.clone()))
+            .manage(hook_runtime)
+            .manage(BlockStage::from(crate::config::StagingStorage::Memory));
+        let rocket = manage_tc405_test_state(rocket, conn.clone());
+        #[cfg(feature = "duckdb")]
+        let rocket = rocket.manage(duckdb_service);
+        let client = Client::tracked(rocket).await?;
+
+        let response = client
+            .post("/invoke")
+            .header(Header::new("Authorization", auth_header))
+            .header(ContentType::JSON)
+            .body(serde_json::to_string(&SqlRequest::ExecuteStatement {
+                name: "get_val".to_string(),
+                params: vec![],
+            })?)
+            .dispatch()
+            .await;
+        let status = response.status();
+        let body = response.into_string().await.unwrap_or_default();
+        assert_eq!(
+            status,
+            Status::BadRequest,
+            "malformed sqlCaveats fact: {body}"
+        );
+        assert!(
+            body.contains("invalid sqlCaveats fact"),
+            "refusal must name the invalid sqlCaveats fact: {body}"
+        );
+        Ok(())
+    }
+
     fn tc1799_profile(
         name: &str,
         value: &str,
@@ -5634,7 +5989,6 @@ mod tests {
         }
         .sign(jwk.get_algorithm().unwrap_or_default(), &jwk)?;
         let auth_header = invocation.encode()?;
-
         let rocket = rocket::build()
             .mount("/", rocket::routes![invoke])
             .attach(crate::tracing::TracingFairing::for_test(
@@ -8695,6 +9049,118 @@ mod tests {
         let epoch_count = epoch::Entity::find().count(&conn).await?;
         assert_eq!(epoch_count, 1, "exactly one epoch row");
 
+        Ok(())
+    }
+
+    /// TC-1791: `/delegate` refuses an SQL grant whose caveat is outside the
+    /// constrained-statements profile. The response is 401 with the
+    /// `unsupported-caveat` reason, and no delegation row is stored.
+    #[tokio::test]
+    async fn rocket_delegate_sql_unsupported_caveat_is_unauthorized() -> Result<()> {
+        use rocket::http::Header;
+        use rocket::local::asynchronous::Client;
+        use std::collections::BTreeMap;
+        use tinycloud_auth::{
+            resource::{Service, SpaceId},
+            ssi::{
+                claims::jwt::NumericDate,
+                dids::{DIDBuf, DIDURLBuf},
+                jwk::Algorithm,
+                ucan::Payload,
+            },
+            ucan_capabilities_object::Capabilities,
+        };
+        use tinycloud_core::models::delegation as deleg_model;
+        use tinycloud_core::sea_orm::{EntityTrait, PaginatorTrait};
+
+        let tempdir = TempDir::new()?;
+        let db_path = tempdir.path().join("delegate_sql_caveat.db");
+        let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
+        let db = Database::connect(crate::sqlite_connect_options(&db_url)).await?;
+        let storage = NodeFileSystemConfig::new(tempdir.path()).open().await?;
+        let tinycloud = TinyCloud::new(
+            db.clone().into(),
+            Either::B(storage),
+            StaticSecret::new(vec![0u8; 32]).unwrap(),
+        )
+        .await?;
+        let conn = db;
+
+        let jwk = JWK::generate_ed25519()?;
+        let mut verification_method = DID_METHODS.generate(&jwk, "key")?.to_string();
+        let fragment = verification_method
+            .rsplit_once(':')
+            .ok_or_else(|| anyhow::anyhow!("missing vm fragment"))?
+            .1
+            .to_string();
+        verification_method.push('#');
+        verification_method.push_str(&fragment);
+        let owner_did: DIDBuf = verification_method
+            .split('#')
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("missing did"))?
+            .parse()?;
+        let space: SpaceId = SpaceId::new(owner_did.clone(), "files".parse()?);
+
+        // SQL grant with a `tables` caveat, which is not a constrained-statements profile.
+        let resource =
+            space
+                .clone()
+                .to_resource("sql".parse::<Service>()?, Some("main".parse()?), None, None);
+        let mut caps = Capabilities::<serde_json::Value>::new();
+        caps.with_actions(
+            resource.as_uri(),
+            std::iter::once((
+                "tinycloud.sql/read".parse()?,
+                [BTreeMap::from([(
+                    "tables".to_string(),
+                    serde_json::json!(["a"]),
+                )])],
+            )),
+        );
+
+        let auth_header = Payload {
+            issuer: verification_method.parse::<DIDURLBuf>()?,
+            audience: owner_did,
+            not_before: None,
+            expiration: NumericDate::try_from_seconds(4_102_444_800.0)?,
+            nonce: Some("unsupported-sql-caveat-nonce".to_string()),
+            facts: Some(Vec::<serde_json::Value>::new()),
+            proof: vec![],
+            attenuation: caps,
+        }
+        .sign(Algorithm::EdDSA, &jwk)?
+        .encode()?;
+
+        let rocket = rocket::build()
+            .mount("/", rocket::routes![delegate])
+            .attach(crate::tracing::TracingFairing::for_test(
+                &Config::default().log.tracing,
+            ))
+            .manage(tinycloud)
+            .manage(Config::default());
+        let rocket = manage_tc405_test_state(rocket, conn.clone());
+        let client = Client::tracked(rocket).await?;
+
+        let resp = client
+            .post("/delegate")
+            .header(Header::new("Authorization", auth_header))
+            .dispatch()
+            .await;
+        let status = resp.status();
+        let body = resp.into_string().await.unwrap_or_default();
+        assert_eq!(
+            status,
+            Status::Unauthorized,
+            "unsupported SQL caveat: {body}"
+        );
+        assert!(
+            body.contains("unsupported-caveat"),
+            "refusal must name the unsupported-caveat reason: {body}"
+        );
+
+        let del_count = deleg_model::Entity::find().count(&conn).await?;
+        assert_eq!(del_count, 0, "refused delegation must not be stored");
         Ok(())
     }
 
