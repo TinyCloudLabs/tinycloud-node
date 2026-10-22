@@ -1111,4 +1111,27 @@ mod tests {
         assert_eq!(resolve_alias("tinycloud.sql/select"), "tinycloud.sql/read");
         assert_eq!(resolve_alias("unknown/x"), "unknown/x");
     }
+
+    #[test]
+    fn only_key_delete_grants_key_delete() {
+        let actions =
+            accepted_actions("tinycloud.encryption").expect("encryption actions are registered");
+        assert!(actions.contains(&"tinycloud.encryption/key.delete"));
+        assert!(ability_matches(
+            "tinycloud.encryption/key.delete",
+            "tinycloud.encryption/key.delete"
+        ));
+        for action in actions {
+            assert!(
+                !action.ends_with("/*"),
+                "wildcard action in encryption service: {action}"
+            );
+            if *action != "tinycloud.encryption/key.delete" {
+                assert!(
+                    !ability_matches(action, "tinycloud.encryption/key.delete"),
+                    "{action} must not grant key.delete"
+                );
+            }
+        }
+    }
 }

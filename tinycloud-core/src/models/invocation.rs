@@ -1804,4 +1804,40 @@ mod tests {
             "unexpected rejection: {err:?}"
         );
     }
+
+    /// Malformed key identifiers are refused as invocation targets, including for the owner.
+    #[tokio::test]
+    async fn malformed_key_identifiers_are_refused_in_invocations() {
+        let db = empty_db().await;
+        for resource in crate::encryption_network::key_id::MALFORMED_KEY_IDS {
+            // Ids that fail URI parsing cannot be built into a capability, so there is nothing to admit or refuse.
+            if resource.parse::<crate::types::Resource>().is_err() {
+                continue;
+            }
+            let capability = caveat_capability(
+                resource,
+                "tinycloud.encryption/key.create",
+                Caveats::default(),
+            );
+            let result = crate::models::invocation::authorize_holder(
+                &db,
+                KEY_OWNER,
+                &[capability],
+                &[],
+                OffsetDateTime::now_utc(),
+            )
+            .await;
+            let err = match result {
+                Err(err) => err,
+                Ok(_) => panic!("accepted malformed key identifier: {resource}"),
+            };
+            assert!(
+                matches!(
+                    &err,
+                    Error::InvalidInvocation(InvocationError::MissingParents)
+                ),
+                "unexpected rejection for {resource}: {err:?}"
+            );
+        }
+    }
 }
