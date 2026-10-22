@@ -611,7 +611,7 @@ mod tests {
 
     use crate::storage::file_system::FileSystemConfig as NodeFileSystemConfig;
 
-    async fn test_tinycloud() -> Result<(TinyCloud, TempDir)> {
+    async fn test_tinycloud() -> Result<(TempDir, TinyCloud)> {
         let tempdir = TempDir::new()?;
         let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string())).await?;
         let storage = NodeFileSystemConfig::new(tempdir.path()).open().await?;
@@ -621,7 +621,7 @@ mod tests {
             StaticSecret::new(vec![0u8; 32]).unwrap(),
         )
         .await?;
-        Ok((tinycloud, tempdir))
+        Ok((tempdir, tinycloud))
     }
 
     fn test_invocation(kv_path: &str) -> Result<(CoreInvocationInfo, SpaceId)> {
@@ -1085,7 +1085,7 @@ mod tests {
 
     #[tokio::test]
     async fn mints_signed_kv_url_for_authorized_exact_scope() -> Result<()> {
-        let (tinycloud, _tempdir) = test_tinycloud().await?;
+        let (_tempdir, tinycloud) = test_tinycloud().await?;
         let runtime = SignedUrlRuntime::new([7u8; 32]);
         let (invocation, space) = test_invocation("documents/audio.wav")?;
         let response = mint_signed_kv_url(
@@ -1126,7 +1126,7 @@ mod tests {
 
     #[tokio::test]
     async fn mints_signed_kv_url_for_broader_kv_get_among_other_caps() -> Result<()> {
-        let (tinycloud, _tempdir) = test_tinycloud().await?;
+        let (_tempdir, tinycloud) = test_tinycloud().await?;
         let runtime = SignedUrlRuntime::new([7u8; 32]);
         let (invocation, space) = test_invocation_with_caps(&[
             ("kv", "documents", "tinycloud.kv/get"),
@@ -1154,7 +1154,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_unauthorized_path_scope() -> Result<()> {
-        let (tinycloud, _tempdir) = test_tinycloud().await?;
+        let (_tempdir, tinycloud) = test_tinycloud().await?;
         let runtime = SignedUrlRuntime::new([7u8; 32]);
         let (invocation, space) = test_invocation_with_caps(&[
             ("kv", "documents", "tinycloud.kv/get"),
@@ -1183,7 +1183,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_max_uses_without_durable_state() -> Result<()> {
-        let (tinycloud, _tempdir) = test_tinycloud().await?;
+        let (_tempdir, tinycloud) = test_tinycloud().await?;
         let runtime = SignedUrlRuntime::new([7u8; 32]);
         let (invocation, space) = test_invocation("documents/audio.wav")?;
 
@@ -1209,7 +1209,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_mismatched_content_hash_and_etag() -> Result<()> {
-        let (tinycloud, _tempdir) = test_tinycloud().await?;
+        let (_tempdir, tinycloud) = test_tinycloud().await?;
         let runtime = SignedUrlRuntime::new([7u8; 32]);
         let (invocation, space) = test_invocation("documents/audio.wav")?;
 
