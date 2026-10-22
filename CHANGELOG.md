@@ -5,6 +5,7 @@
 ### Changes
 
 - SQL requests apply the statements profile carried by the invocation's own SQL capability. The delegation chain supplies a profile only when the invocation's SQL capabilities carry none. An invocation whose SQL capabilities carry different profiles is refused with 403. Details: TC-1799.
+- SQL and DuckDB requests that cite more than one SQL or DuckDB proof are refused. Details: TC-1799
 
 ## [1.21.8] - 2026-10-22
 

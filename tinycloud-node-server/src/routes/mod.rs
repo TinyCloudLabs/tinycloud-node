@@ -1873,6 +1873,8 @@ async fn invoke_impl(
             .collect();
 
         if !sql_caps.is_empty() {
+            refuse_multi_database_proof_invocation(tinycloud, &admitted.invocation().0.parents)
+                .await?;
             // Reject quarantined paths and an active cutover fence before
             // verify_auth_admitted persists invoked_abilities. A rejected
             // request must never become migration attribution evidence.
@@ -1936,6 +1938,8 @@ async fn invoke_impl(
                     .collect();
 
             if !duckdb_caps.is_empty() {
+                refuse_multi_database_proof_invocation(tinycloud, &admitted.invocation().0.parents)
+                    .await?;
                 request_cancel::set_stage(request_cancel::Stage::IdentityResolution);
                 if tinycloud.effective_database_fence(config.database.write_fence)
                     .await.map_err(identity_resolution_error)? {
@@ -2864,6 +2868,66 @@ async fn resolve_sql_profile(
         Vec::new()
     };
     select_sql_profile(&own_profiles, chain_profiles)
+}
+
+/// Refuses a SQL or DuckDB invocation that cites more than one proof carrying
+/// a SQL or DuckDB ability, using the uniform profile-conflict refusal. Proofs
+/// with other abilities, such as KV or share, are not counted. Runs before
+/// identity resolution, so a refused request reaches none of that state.
+async fn refuse_multi_database_proof_invocation(
+    tinycloud: &State<TinyCloud>,
+    parent_cids: &[tinycloud_auth::authorization::Cid],
+) -> Result<(), (Status, String)> {
+    if parent_cids.len() <= 1 {
+        return Ok(());
+    }
+    let conn = tinycloud
+        .readable()
+        .await
+        .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+    refuse_multi_database_proof_invocation_with_conn(&conn, parent_cids).await
+}
+
+/// The count behind `refuse_multi_database_proof_invocation`, against any
+/// seaorm `ConnectionTrait` so it can be exercised directly.
+async fn refuse_multi_database_proof_invocation_with_conn<
+    C: tinycloud_core::sea_orm::ConnectionTrait,
+>(
+    conn: &C,
+    parent_cids: &[tinycloud_auth::authorization::Cid],
+) -> Result<(), (Status, String)> {
+    use std::collections::HashSet;
+    use tinycloud_core::hash::Hash;
+    use tinycloud_core::models::abilities;
+
+    if parent_cids.len() <= 1 {
+        return Ok(());
+    }
+    let parents: Vec<Hash> = parent_cids.iter().copied().map(Hash::from).collect();
+    let rows = abilities::Entity::find()
+        .filter(abilities::Column::Delegation.is_in(parents))
+        .all(conn)
+        .await
+        .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+    let database_proofs: HashSet<Hash> = rows
+        .iter()
+        .filter(|row| is_database_ability(&row.ability.to_string()))
+        .map(|row| row.delegation)
+        .collect();
+    if database_proofs.len() <= 1 {
+        return Ok(());
+    }
+    crate::prometheus::observe_database_multi_proof_refusal();
+    Err((
+        Status::Forbidden,
+        tinycloud_core::policy_capability::sql_caveat::InvocationReject::SqlCapabilityProfilesConflict
+            .as_str()
+            .to_string(),
+    ))
+}
+
+fn is_database_ability(ability: &str) -> bool {
+    ability.starts_with("tinycloud.sql/") || ability.starts_with("tinycloud.duckdb/")
 }
 
 /// Pure profile choice behind `resolve_sql_profile`, split out so the
@@ -5379,23 +5443,46 @@ mod tests {
         );
     }
 
-    // TC-1799 proof: the statements profile that governs a request is the one
-    // carried by the invocation's own SQL capability. The invocation carries
-    // profile P1 (`get_val`) and cites two parents that each grant SQL read:
-    // A carries P2 (`get_beta`) and B carries P1. A request for `get_beta` is
-    // outside the invocation's own profile and must be refused with 403.
-    #[tokio::test]
-    async fn tc1799_invocation_profile_governs_statement_admission() -> Result<()> {
-        use rocket::http::{ContentType, Header, Status};
+    fn tc1799_profile_json(name: &str, value: &str) -> serde_json::Value {
+        tc1799_profile_json_many(&[(name, value)])
+    }
+
+    fn tc1799_profile_json_many(entries: &[(&str, &str)]) -> serde_json::Value {
+        let statements: Vec<serde_json::Value> = entries
+            .iter()
+            .map(|(name, value)| {
+                serde_json::json!({
+                    "name": name,
+                    "sql": "SELECT val FROM labels WHERE label=?",
+                    "fixedParams": [{"index": 0, "value": value}]
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "mode": "constrained-statements",
+            "readOnly": true,
+            "statements": statements
+        })
+    }
+
+    /// Sends one SQL `/invoke` request through the real route. Each entry in
+    /// `parent_profiles` is one parent delegation granting `tinycloud.sql/read`
+    /// on `main`; `Some` attaches that statements profile as the parent's
+    /// caveat. The invocation grants `tinycloud.sql/read` with
+    /// `invocation_profile` as its caveat and cites every parent, in order.
+    async fn tc1799_invoke_sql(
+        parent_profiles: &[Option<serde_json::Value>],
+        invocation_profile: &serde_json::Value,
+        request: SqlRequest,
+    ) -> Result<(rocket::http::Status, String)> {
+        use rocket::http::{ContentType, Header};
         use rocket::local::asynchronous::Client;
-        use serde_json::json;
         use tinycloud_auth::authorization::Cid as AuthCid;
         use tinycloud_auth::ssi::{dids::DIDURLBuf, ucan::Payload};
         use tinycloud_auth::ucan_capabilities_object::Capabilities;
         use tinycloud_core::models::{
             abilities, actor, delegation as deleg_model, space as space_model,
         };
-        use tinycloud_core::policy_capability::sql_caveat::InvocationReject;
         use tinycloud_core::sea_orm::ActiveModelTrait;
         use tinycloud_core::sea_orm::ActiveValue::Set;
         use tinycloud_core::types::{Caveats, SpaceIdWrap};
@@ -5412,7 +5499,17 @@ mod tests {
         let conn = db;
         let (_cache, sql_service) = fresh_sql_service().await;
         let hook_runtime = HookRuntime::new(HooksConfig::default(), [9u8; 32]);
-        let space = test_space_id("tc1799-profile-order");
+        #[cfg(feature = "duckdb")]
+        let duckdb_service = {
+            let path = tempdir.path().join("duckdb");
+            std::fs::create_dir_all(&path)?;
+            let path = path.to_string_lossy().to_string();
+            let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string())).await?;
+            Migrator::up(&db, None).await?;
+            let repo = Arc::new(SeaOrmDatabaseArtifactRepository::new(db));
+            DuckDbService::new(path, u64::MAX, 300, "256MB".into(), repo)
+        };
+        let space = test_space_id("tc1799-sql");
         space_model::ActiveModel {
             id: Set(SpaceIdWrap(space.clone())),
         }
@@ -5473,12 +5570,17 @@ mod tests {
             .await?;
         }
 
-        let hash_a = tinycloud_core::hash::hash(b"tc1799-profile-parent-a");
-        let hash_b = tinycloud_core::hash::hash(b"tc1799-profile-parent-b");
-        for (hash, serialization) in [
-            (hash_a, b"tc1799-profile-parent-a".to_vec()),
-            (hash_b, b"tc1799-profile-parent-b".to_vec()),
-        ] {
+        let sql_resource: ResourceId = space.clone().to_resource(
+            "sql".parse::<Service>()?,
+            Some("main".parse::<AuthPath>()?),
+            None,
+            None,
+        );
+
+        let mut hashes = Vec::new();
+        for (index, profile) in parent_profiles.iter().enumerate() {
+            let serialization = format!("tc1799-parent-{index}").into_bytes();
+            let hash = tinycloud_core::hash::hash(&serialization);
             deleg_model::ActiveModel {
                 id: Set(hash),
                 delegator: Set(owner_did.clone()),
@@ -5491,38 +5593,10 @@ mod tests {
             }
             .insert(&conn)
             .await?;
-        }
-
-        let sql_resource: ResourceId = space.clone().to_resource(
-            "sql".parse::<Service>()?,
-            Some("main".parse::<AuthPath>()?),
-            None,
-            None,
-        );
-        let profile_p1 = json!({
-            "mode": "constrained-statements",
-            "readOnly": true,
-            "statements": [{
-                "name": "get_val",
-                "sql": "SELECT val FROM labels WHERE label=?",
-                "fixedParams": [{"index": 0, "value": "alpha"}]
-            }]
-        });
-        let profile_p2 = json!({
-            "mode": "constrained-statements",
-            "readOnly": true,
-            "statements": [{
-                "name": "get_beta",
-                "sql": "SELECT val FROM labels WHERE label=?",
-                "fixedParams": [{"index": 0, "value": "beta"}]
-            }]
-        });
-        // Parent A carries P2 and parent B carries P1. In this fixture the
-        // unscoped chain scan returns A's row first (rows came back A-first
-        // whether A or B was inserted first).
-        for (hash, profile) in [(hash_a, &profile_p2), (hash_b, &profile_p1)] {
             let mut caveats_map = std::collections::BTreeMap::new();
-            caveats_map.insert("0".to_string(), profile.clone());
+            if let Some(profile) = profile {
+                caveats_map.insert("0".to_string(), profile.clone());
+            }
             abilities::ActiveModel {
                 delegation: Set(hash),
                 resource: Set(Resource::TinyCloud(sql_resource.clone())),
@@ -5531,10 +5605,11 @@ mod tests {
             }
             .insert(&conn)
             .await?;
+            hashes.push(hash);
         }
 
         let mut invocation_nb = std::collections::BTreeMap::new();
-        for (key, value) in profile_p1
+        for (key, value) in invocation_profile
             .as_object()
             .expect("test caveat must be an object")
         {
@@ -5546,7 +5621,7 @@ mod tests {
             "tinycloud.sql/read".parse::<UcanAbility>()?,
             [invocation_nb],
         );
-        let proof: Vec<AuthCid> = vec![hash_a.to_cid(0x55), hash_b.to_cid(0x55)];
+        let proof: Vec<AuthCid> = hashes.iter().map(|hash| hash.to_cid(0x55)).collect();
         let invocation = Payload {
             issuer: verification_method.parse::<DIDURLBuf>()?,
             audience: delegatee.parse::<DIDBuf>()?,
@@ -5572,6 +5647,8 @@ mod tests {
             .manage(InvocationReplayCache::new(conn.clone()))
             .manage(hook_runtime)
             .manage(BlockStage::from(crate::config::StagingStorage::Memory));
+        #[cfg(feature = "duckdb")]
+        let rocket = rocket.manage(duckdb_service);
         let rocket = manage_tc405_test_state(rocket, conn.clone());
 
         let client = Client::tracked(rocket).await?;
@@ -5579,15 +5656,37 @@ mod tests {
             .post("/invoke")
             .header(Header::new("Authorization", auth_header))
             .header(ContentType::JSON)
-            .body(serde_json::to_string(&SqlRequest::ExecuteStatement {
-                name: "get_beta".to_string(),
-                params: vec![],
-            })?)
+            .body(serde_json::to_string(&request)?)
             .dispatch()
             .await;
-
         let status = response.status();
         let body = response.into_string().await.unwrap_or_default();
+        Ok((status, body))
+    }
+
+    // TC-1799 proof: the statements profile that governs a request is the one
+    // carried by the invocation's own SQL capability. The single parent grants
+    // both `get_val` and `get_beta`; the invocation narrows its SQL capability
+    // to P1 (`get_val`). A request for `get_beta` is outside the invocation's
+    // profile even though the parent permits it, so it must be refused with 403.
+    #[tokio::test]
+    async fn tc1799_invocation_profile_governs_statement_admission() -> Result<()> {
+        use rocket::http::Status;
+        use tinycloud_core::policy_capability::sql_caveat::InvocationReject;
+
+        let profile_p1 = tc1799_profile_json("get_val", "alpha");
+        // The parent grants both statements; the invocation narrows to get_val.
+        let parent_profile =
+            tc1799_profile_json_many(&[("get_val", "alpha"), ("get_beta", "beta")]);
+        let (status, body) = tc1799_invoke_sql(
+            &[Some(parent_profile)],
+            &profile_p1,
+            SqlRequest::ExecuteStatement {
+                name: "get_beta".to_string(),
+                params: vec![],
+            },
+        )
+        .await?;
         assert_eq!(
             status,
             Status::Forbidden,
@@ -5597,7 +5696,58 @@ mod tests {
             body.contains(InvocationReject::SqlStatementNotAllowed.as_str()),
             "expected statement-not-allowed rejection, got {body}"
         );
+        Ok(())
+    }
 
+    #[tokio::test]
+    async fn tc1799_single_proof_sql_invocation_is_admitted() -> Result<()> {
+        use rocket::http::Status;
+
+        let profile_p1 = tc1799_profile_json("get_val", "alpha");
+        let (status, body) = tc1799_invoke_sql(
+            &[Some(profile_p1.clone())],
+            &profile_p1,
+            SqlRequest::ExecuteStatement {
+                name: "get_val".to_string(),
+                params: vec![],
+            },
+        )
+        .await?;
+        assert_eq!(
+            status,
+            Status::Ok,
+            "single-proof invocation within its profile must be admitted; response: {body}"
+        );
+        assert!(body.contains("111"), "expected row value 111, got {body}");
+        Ok(())
+    }
+
+    // TC-1799: an invocation that cites more than one proof is refused before
+    // any statement is matched, with the uniform profile-conflict rejection.
+    #[tokio::test]
+    async fn tc1799_two_proof_sql_invocation_is_refused() -> Result<()> {
+        use rocket::http::Status;
+        use tinycloud_core::policy_capability::sql_caveat::InvocationReject;
+
+        let profile_p1 = tc1799_profile_json("get_val", "alpha");
+        let (status, body) = tc1799_invoke_sql(
+            &[Some(profile_p1.clone()), Some(profile_p1.clone())],
+            &profile_p1,
+            SqlRequest::ExecuteStatement {
+                name: "get_val".to_string(),
+                params: vec![],
+            },
+        )
+        .await?;
+        assert_eq!(
+            status,
+            Status::Forbidden,
+            "invocation citing two proofs must be refused; response: {body}"
+        );
+        assert!(
+            body.contains(InvocationReject::SqlCapabilityProfilesConflict.as_str()),
+            "expected profile-conflict rejection, got {body}"
+        );
         Ok(())
     }
 
@@ -12218,6 +12368,50 @@ mod tests {
         .await?;
         assert_eq!(ok.status, Status::Ok, "{}", ok.body);
         assert!(ok.body.contains("granted"), "{}", ok.body);
+        Ok(())
+    }
+
+    // TC-1799: a DuckDB invocation citing more than one DuckDB-bearing proof is
+    // refused with the uniform profile-conflict rejection.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn tc1799_duckdb_two_proof_invocation_is_refused() -> Result<()> {
+        use rocket::http::Status;
+        use tinycloud_core::policy_capability::sql_caveat::InvocationReject;
+
+        let f = KvSyncFixture::new().await?;
+        let mut proofs = Vec::new();
+        for name in ["tc1799-duck-a", "tc1799-duck-b"] {
+            proofs.push(
+                f.grant(
+                    name,
+                    &f.space.did().to_string(),
+                    &f.device_did(),
+                    &[("appA/connectors", "tinycloud.duckdb/read")],
+                    None,
+                    None,
+                    &[],
+                )
+                .await?,
+            );
+        }
+        let reply = tc825_duck_device(
+            &f,
+            &f.space,
+            "appA/connectors",
+            "tinycloud.duckdb/read",
+            &proofs,
+            tc825_duck_query("SELECT v FROM items"),
+        )
+        .await?;
+        assert_eq!(reply.status, Status::Forbidden, "{}", reply.body);
+        assert!(
+            reply
+                .body
+                .contains(InvocationReject::SqlCapabilityProfilesConflict.as_str()),
+            "expected profile-conflict rejection, got {}",
+            reply.body
+        );
         Ok(())
     }
 
