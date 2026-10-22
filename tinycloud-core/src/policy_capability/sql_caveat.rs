@@ -44,6 +44,7 @@ pub enum InvocationReject {
     SqlNonPrimitiveBind,
     SqlMultistatementBlocked,
     SqlCapabilityProfilesConflict,
+    SqlOneDatabaseProofRequired,
 }
 
 impl InvocationReject {
@@ -62,6 +63,7 @@ impl InvocationReject {
             Self::SqlNonPrimitiveBind => "sql-non-primitive-bind",
             Self::SqlMultistatementBlocked => "sql-multistatement-blocked",
             Self::SqlCapabilityProfilesConflict => "sql-capabilities-carry-different-profiles",
+            Self::SqlOneDatabaseProofRequired => "sql-one-database-proof-required",
         }
     }
 }

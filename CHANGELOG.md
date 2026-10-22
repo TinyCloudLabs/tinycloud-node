@@ -5,7 +5,7 @@
 ### Changes
 
 - SQL requests apply the statements profile carried by the invocation's own SQL capability. The delegation chain supplies a profile only when the invocation's SQL capabilities carry none. An invocation whose SQL capabilities carry different profiles is refused with 403. Details: TC-1799.
-- SQL and DuckDB requests that cite more than one SQL or DuckDB proof are refused. Details: TC-1799
+- SQL and DuckDB requests that cite more than one SQL or DuckDB proof are refused. Details: TC-1799.
 - SQL and DuckDB delegations (`tinycloud.sql/*`, `tinycloud.duckdb/*`) are refused when their caveats are not supported, with `DelegationError::UnsupportedCaveat`. SQL accepts empty caveats or a constrained-statements profile (direct or nested). DuckDB accepts empty caveats only. Invocations of delegated SQL and DuckDB capabilities are refused the same way (`InvocationError::UnsupportedCaveat`). Invocation `sqlCaveats` and `duckdbCaveats` facts with an unknown key or a wrongly typed value return 400, and every occurrence of the fact is checked. Details: TC-1791.
 
 ## [1.21.8] - 2026-10-22

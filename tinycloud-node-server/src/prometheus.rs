@@ -160,10 +160,10 @@ lazy_static! {
         "Invocation replay-cache inserts that conflicted with an existing row."
     )
     .unwrap();
-    /// SQL and DuckDB invocations refused because they carried more than one proof.
+    /// SQL and DuckDB invocations refused because they cited more than one SQL or DuckDB proof.
     pub static ref DATABASE_MULTI_PROOF_REFUSED: IntCounter = register_int_counter!(
         "tinycloud_database_multi_proof_refused_total",
-        "SQL and DuckDB invocations refused because they carried more than one proof."
+        "SQL and DuckDB invocations refused because they cited more than one SQL or DuckDB proof."
     )
     .unwrap();
 }
@@ -434,16 +434,5 @@ mod tests {
         // The label set is fixed and bounded.
         assert_eq!(TimeRejection::Expired.as_str(), "expired");
         assert_eq!(TimeRejection::NotYetValid.as_str(), "not_yet_valid");
-    }
-
-    #[test]
-    fn database_multi_proof_refusal_counter_increments_per_refusal() {
-        set_enabled(true);
-        let before = DATABASE_MULTI_PROOF_REFUSED.get();
-        observe_database_multi_proof_refusal();
-        observe_database_multi_proof_refusal();
-        // Other tests in this process may refuse concurrently, so only a lower
-        // bound on the delta is asserted.
-        assert!(DATABASE_MULTI_PROOF_REFUSED.get() >= before + 2);
     }
 }

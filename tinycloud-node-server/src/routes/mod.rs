@@ -2633,7 +2633,6 @@ async fn handle_sql_invoke(
             }
         }
     }
-    let constrained = resolve_sql_profile(own_profiles, tinycloud, &parent_cids).await?;
 
     let facts_caveats: Option<SqlCaveats> = parse_caveat_fact(
         admitted
@@ -2652,6 +2651,7 @@ async fn handle_sql_invoke(
     // shared SQL/DuckDB authorization path does not re-run signature
     // verification a second time.
     let auth_result = verify_auth_admitted("server.sql.auth", admitted, tinycloud).await?;
+    let constrained = resolve_sql_profile(own_profiles, tinycloud, &parent_cids).await?;
     let body_start = Instant::now();
     let body_result =
         read_json_body_limited(data, tinycloud_core::sql::publication::ENVELOPE_LIMIT).await;
@@ -2867,7 +2867,7 @@ async fn resolve_sql_profile(
 }
 
 /// Refuses a SQL or DuckDB invocation that cites more than one proof carrying
-/// a SQL or DuckDB ability, using the uniform profile-conflict refusal. Proofs
+/// a SQL or DuckDB ability, refused with `sql-one-database-proof-required`. Proofs
 /// with other abilities, such as KV or share, are not counted. Runs before
 /// identity resolution, so a refused request reaches none of that state.
 async fn refuse_multi_database_proof_invocation(
@@ -2916,7 +2916,7 @@ async fn refuse_multi_database_proof_invocation_with_conn<
     crate::prometheus::observe_database_multi_proof_refusal();
     Err((
         Status::Forbidden,
-        tinycloud_core::policy_capability::sql_caveat::InvocationReject::SqlCapabilityProfilesConflict
+        tinycloud_core::policy_capability::sql_caveat::InvocationReject::SqlOneDatabaseProofRequired
             .as_str()
             .to_string(),
     ))
@@ -5830,6 +5830,32 @@ mod tests {
         invocation_profile: &serde_json::Value,
         request: SqlRequest,
     ) -> Result<(rocket::http::Status, String)> {
+        let parents: Vec<(&str, Option<serde_json::Value>)> = parent_profiles
+            .iter()
+            .map(|profile| ("tinycloud.sql/read", profile.clone()))
+            .collect();
+        let cited: Vec<usize> = (0..parents.len()).collect();
+        let reply = tc1799_invoke_cited(&parents, &cited, invocation_profile, request).await?;
+        Ok((reply.status, reply.body))
+    }
+
+    /// What `tc1799_invoke_cited` returns: the HTTP reply plus the database
+    /// connection, so a test can count replay rows after the request.
+    struct Tc1799Reply {
+        status: rocket::http::Status,
+        body: String,
+        replay: tinycloud_core::sea_orm::DatabaseConnection,
+    }
+
+    /// `tc1799_invoke_sql` with each parent's ability chosen by the caller and
+    /// the invocation citing `cited`, indices into `parents` in order. A repeated
+    /// index cites the same proof twice.
+    async fn tc1799_invoke_cited(
+        parents: &[(&str, Option<serde_json::Value>)],
+        cited: &[usize],
+        invocation_profile: &serde_json::Value,
+        request: SqlRequest,
+    ) -> Result<Tc1799Reply> {
         use rocket::http::{ContentType, Header};
         use rocket::local::asynchronous::Client;
         use tinycloud_auth::authorization::Cid as AuthCid;
@@ -5933,7 +5959,7 @@ mod tests {
         );
 
         let mut hashes = Vec::new();
-        for (index, profile) in parent_profiles.iter().enumerate() {
+        for (index, (ability_name, profile)) in parents.iter().enumerate() {
             let serialization = format!("tc1799-parent-{index}").into_bytes();
             let hash = tinycloud_core::hash::hash(&serialization);
             deleg_model::ActiveModel {
@@ -5955,7 +5981,7 @@ mod tests {
             abilities::ActiveModel {
                 delegation: Set(hash),
                 resource: Set(Resource::TinyCloud(sql_resource.clone())),
-                ability: Set(Ability::try_from("tinycloud.sql/read".to_string()).unwrap()),
+                ability: Set(Ability::try_from(ability_name.to_string()).unwrap()),
                 caveats: Set(Caveats(caveats_map)),
             }
             .insert(&conn)
@@ -5976,7 +6002,10 @@ mod tests {
             "tinycloud.sql/read".parse::<UcanAbility>()?,
             [invocation_nb],
         );
-        let proof: Vec<AuthCid> = hashes.iter().map(|hash| hash.to_cid(0x55)).collect();
+        let proof: Vec<AuthCid> = cited
+            .iter()
+            .map(|&index| hashes[index].to_cid(0x55))
+            .collect();
         let invocation = Payload {
             issuer: verification_method.parse::<DIDURLBuf>()?,
             audience: delegatee.parse::<DIDBuf>()?,
@@ -6015,7 +6044,11 @@ mod tests {
             .await;
         let status = response.status();
         let body = response.into_string().await.unwrap_or_default();
-        Ok((status, body))
+        Ok(Tc1799Reply {
+            status,
+            body,
+            replay: conn,
+        })
     }
 
     // TC-1799 proof: the statements profile that governs a request is the one
@@ -6076,16 +6109,49 @@ mod tests {
         Ok(())
     }
 
-    // TC-1799: an invocation that cites more than one proof is refused before
-    // any statement is matched, with the uniform profile-conflict rejection.
+    // TC-1799: an invocation that cites more than one SQL or DuckDB proof is refused before
+    // any statement is matched, with the one-database-proof rejection.
     #[tokio::test]
     async fn tc1799_two_proof_sql_invocation_is_refused() -> Result<()> {
+        let profile_p1 = tc1799_profile_json("get_val", "alpha");
+        tc1799_assert_multi_proof_refused(
+            &[
+                ("tinycloud.sql/read", Some(profile_p1.clone())),
+                ("tinycloud.sql/read", Some(profile_p1.clone())),
+            ],
+            &profile_p1,
+        )
+        .await
+    }
+
+    // TC-1799: a wildcard `tinycloud.sql/*` proof is a database proof, so it counts toward
+    // the one-database-proof limit like a `tinycloud.sql/read` proof does.
+    #[tokio::test]
+    async fn tc1799_wildcard_and_read_proofs_are_refused() -> Result<()> {
+        let profile_p1 = tc1799_profile_json("get_val", "alpha");
+        tc1799_assert_multi_proof_refused(
+            &[
+                ("tinycloud.sql/*", Some(profile_p1.clone())),
+                ("tinycloud.sql/read", Some(profile_p1.clone())),
+            ],
+            &profile_p1,
+        )
+        .await
+    }
+
+    // TC-1799: a proof list that cites the same proof twice is refused by the core proof
+    // check before the guard runs. The guard counts distinct proofs, so it neither refuses
+    // nor moves the counter here.
+    #[tokio::test]
+    async fn tc1799_duplicate_proof_invocation_is_refused_by_core() -> Result<()> {
         use rocket::http::Status;
         use tinycloud_core::policy_capability::sql_caveat::InvocationReject;
 
         let profile_p1 = tc1799_profile_json("get_val", "alpha");
-        let (status, body) = tc1799_invoke_sql(
-            &[Some(profile_p1.clone()), Some(profile_p1.clone())],
+        let parents = [("tinycloud.sql/read", Some(profile_p1.clone()))];
+        let (reply, delta) = tc1799_invoke_counted(
+            &parents,
+            &[0, 0],
             &profile_p1,
             SqlRequest::ExecuteStatement {
                 name: "get_val".to_string(),
@@ -6094,13 +6160,86 @@ mod tests {
         )
         .await?;
         assert_eq!(
-            status,
-            Status::Forbidden,
-            "invocation citing two proofs must be refused; response: {body}"
+            reply.status,
+            Status::Unauthorized,
+            "duplicate proof must be refused by core; response: {}",
+            reply.body
         );
         assert!(
-            body.contains(InvocationReject::SqlCapabilityProfilesConflict.as_str()),
-            "expected profile-conflict rejection, got {body}"
+            !reply
+                .body
+                .contains(InvocationReject::SqlOneDatabaseProofRequired.as_str()),
+            "duplicate proof must not reach the one-database-proof guard, got {}",
+            reply.body
+        );
+        assert_eq!(delta, 0, "a core refusal must not move the guard counter");
+        Ok(())
+    }
+
+    /// Serializes the tests that read `DATABASE_MULTI_PROOF_REFUSED`. The counter
+    /// is process-global, so overlapping guard refusals would skew the delta.
+    static TC1799_COUNTER_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+    /// Runs one `tc1799_invoke_cited` with the counter gate on. Returns the reply
+    /// and how far `DATABASE_MULTI_PROOF_REFUSED` moved while it ran.
+    async fn tc1799_invoke_counted(
+        parents: &[(&str, Option<serde_json::Value>)],
+        cited: &[usize],
+        invocation_profile: &serde_json::Value,
+        request: SqlRequest,
+    ) -> Result<(Tc1799Reply, u64)> {
+        let _counter_lock = TC1799_COUNTER_LOCK.lock().await;
+        let was_enabled = crate::prometheus::enabled();
+        crate::prometheus::set_enabled(true);
+        let before = crate::prometheus::DATABASE_MULTI_PROOF_REFUSED.get();
+        let reply = tc1799_invoke_cited(parents, cited, invocation_profile, request).await;
+        let after = crate::prometheus::DATABASE_MULTI_PROOF_REFUSED.get();
+        crate::prometheus::set_enabled(was_enabled);
+        Ok((reply?, after - before))
+    }
+
+    /// Sends an invocation citing every parent and asserts the guard's 403, one
+    /// counter increment, and no replay row for the refused invocation.
+    async fn tc1799_assert_multi_proof_refused(
+        parents: &[(&str, Option<serde_json::Value>)],
+        profile: &serde_json::Value,
+    ) -> Result<()> {
+        use rocket::http::Status;
+        use tinycloud_core::policy_capability::sql_caveat::InvocationReject;
+
+        let cited: Vec<usize> = (0..parents.len()).collect();
+        let (reply, delta) = tc1799_invoke_counted(
+            parents,
+            &cited,
+            profile,
+            SqlRequest::ExecuteStatement {
+                name: "get_val".to_string(),
+                params: vec![],
+            },
+        )
+        .await?;
+        assert_eq!(
+            reply.status,
+            Status::Forbidden,
+            "invocation citing multiple database proofs must be refused; response: {}",
+            reply.body
+        );
+        assert!(
+            reply
+                .body
+                .contains(InvocationReject::SqlOneDatabaseProofRequired.as_str()),
+            "expected one-database-proof rejection, got {}",
+            reply.body
+        );
+        assert_eq!(
+            delta, 1,
+            "the guard refusal must move the counter by exactly one"
+        );
+        assert_eq!(
+            tc341_replay_row_count(&reply.replay).await?,
+            0,
+            "a guard refusal must not persist a replay row"
         );
         Ok(())
     }
@@ -12845,6 +12984,7 @@ mod tests {
         use rocket::http::Status;
         use tinycloud_core::policy_capability::sql_caveat::InvocationReject;
 
+        let _counter_lock = TC1799_COUNTER_LOCK.lock().await;
         let f = KvSyncFixture::new().await?;
         let mut proofs = Vec::new();
         for name in ["tc1799-duck-a", "tc1799-duck-b"] {
@@ -12874,8 +13014,8 @@ mod tests {
         assert!(
             reply
                 .body
-                .contains(InvocationReject::SqlCapabilityProfilesConflict.as_str()),
-            "expected profile-conflict rejection, got {}",
+                .contains(InvocationReject::SqlOneDatabaseProofRequired.as_str()),
+            "expected one-database-proof rejection, got {}",
             reply.body
         );
         Ok(())
