@@ -1289,24 +1289,24 @@ mod tests {
                 .unwrap()
                 .unwrap();
 
-            // Unguarded requests preserve partial-batch semantics. The actor can
-            // therefore contain more pages than its last durable checkpoint.
-            let failed = service
+            // A failing request no longer leaves a committed prefix (TC-1491),
+            // so put the actor ahead of its last durable checkpoint directly:
+            // the durable-size comparison must still hold against live state
+            // that was never persisted.
+            let actor = service.handle(&space, "main").await.unwrap();
+            actor
                 .execute(
-                    &space,
-                    "main",
                     SqlRequest::Execute {
-                        schema: Some(vec![
-                            "INSERT INTO data VALUES (2, hex(zeroblob(65536)))".into()
-                        ]),
-                        sql: "INSERT INTO missing_table VALUES (1)".into(),
+                        schema: None,
+                        sql: "INSERT INTO data VALUES (2, hex(zeroblob(65536)))".into(),
                         params: vec![],
                     },
                     None,
                     "tinycloud.sql/admin".into(),
+                    GrowthPolicy::Allow,
                 )
-                .await;
-            assert!(matches!(failed, Err(SqlError::Sqlite(_))));
+                .await
+                .unwrap();
             let rejected = service
                 .execute_without_growth(
                     &space,
@@ -4126,7 +4126,7 @@ mod tests {
                     params: vec![SqlValue::Text("x".repeat(256 * 1024))],
                 },
                 None,
-                "tinycloud.sql/write".into(),
+                "tinycloud.sql/admin".into(),
             )
             .await;
         assert!(matches!(rejected, Err(SqlError::StorageWouldGrow)));
@@ -4161,7 +4161,7 @@ mod tests {
                     params: vec![],
                 },
                 None,
-                "tinycloud.sql/write".into(),
+                "tinycloud.sql/admin".into(),
             )
             .await
             .unwrap();
@@ -4253,5 +4253,453 @@ mod tests {
             }
         }
         found
+    }
+
+    /// Counts every repository call, by kind.
+    struct CallCountingRepository {
+        inner: Arc<SeaOrmDatabaseArtifactRepository>,
+        calls: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+
+    impl CallCountingRepository {
+        fn note(&self, call: &'static str) {
+            self.calls.lock().unwrap().push(call);
+        }
+    }
+
+    #[async_trait]
+    impl DatabaseArtifactRepository for CallCountingRepository {
+        async fn load_meta(
+            &self,
+            service: &str,
+            space: &str,
+            name: &str,
+        ) -> Result<Option<ArtifactMeta>, DatabaseArtifactError> {
+            self.note("load_meta");
+            self.inner.load_meta(service, space, name).await
+        }
+
+        async fn read_chunks(
+            &self,
+            service: &str,
+            space: &str,
+            name: &str,
+            meta: &ArtifactMeta,
+            sink: &mut dyn ArtifactSink,
+        ) -> Result<(), DatabaseArtifactError> {
+            self.note("read_chunks");
+            self.inner
+                .read_chunks(service, space, name, meta, sink)
+                .await
+        }
+
+        async fn save(
+            &self,
+            service: &str,
+            space: &str,
+            name: &str,
+            payload: Vec<u8>,
+            expected: ArtifactExpectation,
+        ) -> Result<DatabaseArtifact, DatabaseArtifactError> {
+            self.note("save");
+            self.inner
+                .save(service, space, name, payload, expected)
+                .await
+        }
+
+        async fn save_delta(
+            &self,
+            service: &str,
+            space: &str,
+            name: &str,
+            payload: Vec<u8>,
+            expected: ArtifactExpectation,
+        ) -> Result<DeltaSave, DatabaseArtifactError> {
+            self.note("save_delta");
+            self.inner
+                .save_delta(service, space, name, payload, expected)
+                .await
+        }
+    }
+
+    fn atomic_batch(statements: &[&str]) -> SqlRequest {
+        SqlRequest::Batch {
+            statements: statements
+                .iter()
+                .map(|sql| SqlStatement {
+                    sql: (*sql).into(),
+                    params: Vec::new(),
+                })
+                .collect(),
+        }
+    }
+
+    async fn rows_of(service: &SqlService, space: &SpaceId, sql: &str) -> Vec<Vec<SqlValue>> {
+        let result = service
+            .execute(
+                space,
+                "main",
+                SqlRequest::Query {
+                    sql: sql.into(),
+                    params: Vec::new(),
+                    max_rows: None,
+                    max_bytes: None,
+                },
+                None,
+                "tinycloud.sql/read".into(),
+            )
+            .await
+            .unwrap();
+        match result.response {
+            SqlResponse::Query(query) => query.rows,
+            other => panic!("expected a query response, got {other:?}"),
+        }
+    }
+
+    /// TC-1491: a failing batch leaves the local file unchanged, writes
+    /// nothing to Postgres, and the local file still equals the durable
+    /// artifact after the next successful write.
+    #[tokio::test]
+    async fn tc1491_failed_batch_matches_what_the_durable_artifact_holds() {
+        for memory_threshold in [u64::MAX, 0] {
+            let repo = artifact_repository().await;
+            let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let cache = TempDir::new().unwrap();
+            let space = test_space_id("sql-atomic-batch");
+            let service = SqlService::new(
+                cache.path().to_string_lossy().into_owned(),
+                memory_threshold,
+                Arc::new(CallCountingRepository {
+                    inner: repo.clone(),
+                    calls: calls.clone(),
+                }),
+            );
+            let write = |sql: &'static str| {
+                service.execute(
+                    &space,
+                    "main",
+                    SqlRequest::Execute {
+                        schema: None,
+                        sql: sql.into(),
+                        params: Vec::new(),
+                    },
+                    None,
+                    "tinycloud.sql/admin".into(),
+                )
+            };
+            write("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")
+                .await
+                .unwrap();
+            write("INSERT INTO t (v) VALUES ('durable')").await.unwrap();
+            let handle = service.handle(&space, "main").await.unwrap();
+            let before = handle.checkpoint().await.unwrap();
+
+            // The failing request: no repository call at all, no local change.
+            calls.lock().unwrap().clear();
+            let failed = service
+                .execute(
+                    &space,
+                    "main",
+                    atomic_batch(&[
+                        "INSERT INTO t (v) VALUES ('prefix-1')",
+                        "UPDATE t SET v = 'prefix-2'",
+                        "INSERT INTO t (v) VALUES (NULL)",
+                    ]),
+                    None,
+                    "tinycloud.sql/write".into(),
+                )
+                .await;
+            assert!(matches!(failed, Err(SqlError::Sqlite(_))), "{failed:?}");
+            assert!(
+                calls.lock().unwrap().is_empty(),
+                "a rejected batch costs no repository (Postgres) round trip: {:?}",
+                calls.lock().unwrap()
+            );
+            assert_eq!(handle.checkpoint().await.unwrap(), before);
+
+            // A successful 3-statement batch costs exactly the one persist
+            // call a single statement costs.
+            calls.lock().unwrap().clear();
+            service
+                .execute(
+                    &space,
+                    "main",
+                    atomic_batch(&[
+                        "INSERT INTO t (v) VALUES ('next-1')",
+                        "INSERT INTO t (v) VALUES ('next-2')",
+                        "INSERT INTO t (v) VALUES ('next-3')",
+                    ]),
+                    None,
+                    "tinycloud.sql/write".into(),
+                )
+                .await
+                .unwrap();
+            let persisted = calls.lock().unwrap().clone();
+            assert_eq!(persisted.len(), 1, "{persisted:?}");
+            assert!(
+                matches!(persisted[0], "save" | "save_delta"),
+                "{persisted:?}"
+            );
+
+            // What a cold node rebuilds from the repository is the local state.
+            let local = rows_of(&service, &space, "SELECT id, v FROM t ORDER BY id").await;
+            assert_eq!(local.len(), 4);
+            assert!(!format!("{local:?}").contains("prefix"));
+            let cold_cache = TempDir::new().unwrap();
+            let cold = SqlService::new(
+                cold_cache.path().to_string_lossy().into_owned(),
+                memory_threshold,
+                repo,
+            );
+            assert_eq!(
+                rows_of(&cold, &space, "SELECT id, v FROM t ORDER BY id").await,
+                local
+            );
+        }
+    }
+    /// TC-1491 + TC-1585: a `WITH … INSERT` is a write, so in a batch it is
+    /// one of the statements that must be kept or undone with the rest. A
+    /// later failure leaves nothing of it locally, writes nothing to Postgres,
+    /// and a cold node rebuilt from the durable artifact agrees.
+    #[tokio::test]
+    async fn tc1491_nested_write_cte_in_a_failed_batch_leaves_nothing() {
+        for memory_threshold in [u64::MAX, 0] {
+            let repo = artifact_repository().await;
+            let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let cache = TempDir::new().unwrap();
+            let space = test_space_id("sql-atomic-cte");
+            let service = SqlService::new(
+                cache.path().to_string_lossy().into_owned(),
+                memory_threshold,
+                Arc::new(CallCountingRepository {
+                    inner: repo.clone(),
+                    calls: calls.clone(),
+                }),
+            );
+            let run = |request: SqlRequest| {
+                service.execute(&space, "main", request, None, "tinycloud.sql/admin".into())
+            };
+            let batch = |statements: &[&str]| SqlRequest::Batch {
+                statements: statements
+                    .iter()
+                    .map(|sql| SqlStatement {
+                        sql: (*sql).into(),
+                        params: Vec::new(),
+                    })
+                    .collect(),
+            };
+            run(SqlRequest::Execute {
+                schema: None,
+                sql: "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)".into(),
+                params: Vec::new(),
+            })
+            .await
+            .unwrap();
+            let handle = service.handle(&space, "main").await.unwrap();
+            let before = handle.checkpoint().await.unwrap();
+
+            calls.lock().unwrap().clear();
+            let failed = run(batch(&[
+                "WITH c AS (SELECT 'cte-insert' AS v) INSERT INTO t (v) SELECT v FROM c",
+                "INSERT INTO t (v) VALUES (NULL)",
+            ]))
+            .await;
+            assert!(matches!(failed, Err(SqlError::Sqlite(_))), "{failed:?}");
+            assert!(
+                calls.lock().unwrap().is_empty(),
+                "a rejected batch costs no repository (Postgres) round trip: {:?}",
+                calls.lock().unwrap()
+            );
+            assert_eq!(handle.checkpoint().await.unwrap(), before);
+            assert!(rows_of(&service, &space, "SELECT v FROM t")
+                .await
+                .is_empty());
+
+            // The same CTE write kept when the batch succeeds, and durable.
+            run(batch(&[
+                "WITH c AS (SELECT 'cte-insert' AS v) INSERT INTO t (v) SELECT v FROM c",
+                "INSERT INTO t (v) VALUES ('plain')",
+            ]))
+            .await
+            .unwrap();
+            let local = rows_of(&service, &space, "SELECT id, v FROM t ORDER BY id").await;
+            assert_eq!(local.len(), 2);
+            let cold_cache = TempDir::new().unwrap();
+            let cold = SqlService::new(
+                cold_cache.path().to_string_lossy().into_owned(),
+                memory_threshold,
+                repo,
+            );
+            assert_eq!(
+                rows_of(&cold, &space, "SELECT id, v FROM t ORDER BY id").await,
+                local
+            );
+        }
+    }
+
+    /// TC-1491: a single write is all-or-nothing whatever its conflict clause
+    /// says. A statement that stops with `OR FAIL` or `ON CONFLICT FAIL`
+    /// leaves the rows it changed first when it runs on its own; the request
+    /// is one transaction, so it leaves none of them: the local file is
+    /// unchanged and no repository (Postgres) call is made.
+    #[tokio::test]
+    async fn tc1491_a_single_write_with_fail_conflict_resolution_leaves_nothing() {
+        for memory_threshold in [u64::MAX, 0] {
+            let repo = artifact_repository().await;
+            let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let cache = TempDir::new().unwrap();
+            let space = test_space_id("sql-atomic-or-fail");
+            let service = SqlService::new(
+                cache.path().to_string_lossy().into_owned(),
+                memory_threshold,
+                Arc::new(CallCountingRepository {
+                    inner: repo,
+                    calls: calls.clone(),
+                }),
+            );
+            let run = |sql: &str, ability: &str| {
+                service.execute(
+                    &space,
+                    "main",
+                    SqlRequest::Execute {
+                        schema: None,
+                        sql: sql.into(),
+                        params: Vec::new(),
+                    },
+                    None,
+                    ability.into(),
+                )
+            };
+            run(
+                "CREATE TABLE u (id INTEGER PRIMARY KEY, v TEXT UNIQUE)",
+                "tinycloud.sql/admin",
+            )
+            .await
+            .unwrap();
+            run(
+                "INSERT INTO u VALUES (10,'x'),(11,'y'),(12,'z')",
+                "tinycloud.sql/write",
+            )
+            .await
+            .unwrap();
+            let handle = service.handle(&space, "main").await.unwrap();
+            let before = handle.checkpoint().await.unwrap();
+
+            for sql in ["INSERT OR FAIL INTO u VALUES (1,'a'),(2,'b'),(1,'dup')"] {
+                calls.lock().unwrap().clear();
+                let failed = run(sql, "tinycloud.sql/write").await;
+                assert!(
+                    matches!(failed, Err(SqlError::Sqlite(_))),
+                    "{sql}: {failed:?}"
+                );
+                assert!(
+                    calls.lock().unwrap().is_empty(),
+                    "{sql}: a rejected write costs no repository call"
+                );
+                assert_eq!(
+                    rows_of(&service, &space, "SELECT count(*) FROM u").await,
+                    vec![vec![SqlValue::Integer(3)]],
+                    "{sql}"
+                );
+                assert_eq!(
+                    rows_of(&service, &space, "SELECT group_concat(v) FROM u").await,
+                    vec![vec![SqlValue::Text("x,y,z".into())]],
+                    "{sql}"
+                );
+                assert!(
+                    handle.checkpoint().await.unwrap() == before,
+                    "{sql}: the checkpoint must not change"
+                );
+            }
+
+            // The same write as a `query` request, which the classifier
+            // treats as a write too.
+            let failed = service
+                .execute(
+                    &space,
+                    "main",
+                    SqlRequest::Query {
+                        sql: "INSERT OR FAIL INTO u VALUES (1,'a'),(2,'b'),(1,'dup')".into(),
+                        params: Vec::new(),
+                        max_rows: None,
+                        max_bytes: None,
+                    },
+                    None,
+                    "tinycloud.sql/write".into(),
+                )
+                .await;
+            assert!(failed.is_err(), "{failed:?}");
+            assert!(handle.checkpoint().await.unwrap() == before);
+        }
+    }
+
+    /// TC-1491: a deferred foreign key is checked when the request's
+    /// transaction commits. A violation there rolls the request back: nothing
+    /// is kept, the error is reported, and no repository call is made.
+    #[tokio::test]
+    async fn tc1491_a_deferred_constraint_failing_at_commit_leaves_nothing() {
+        for memory_threshold in [u64::MAX, 0] {
+            let repo = artifact_repository().await;
+            let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let cache = TempDir::new().unwrap();
+            let space = test_space_id("sql-atomic-deferred-fk");
+            let service = SqlService::new(
+                cache.path().to_string_lossy().into_owned(),
+                memory_threshold,
+                Arc::new(CallCountingRepository {
+                    inner: repo,
+                    calls: calls.clone(),
+                }),
+            );
+            let run = |request: SqlRequest| {
+                service.execute(&space, "main", request, None, "tinycloud.sql/admin".into())
+            };
+            let execute = |sql: &str| SqlRequest::Execute {
+                schema: None,
+                sql: sql.into(),
+                params: Vec::new(),
+            };
+            for ddl in [
+                "CREATE TABLE parents (id INTEGER PRIMARY KEY)",
+                "CREATE TABLE children (parent_id INTEGER REFERENCES parents(id) DEFERRABLE INITIALLY DEFERRED)",
+                "INSERT INTO parents VALUES (1)",
+                "INSERT INTO children VALUES (1)",
+            ] {
+                run(execute(ddl)).await.unwrap();
+            }
+            let handle = service.handle(&space, "main").await.unwrap();
+            let before = handle.checkpoint().await.unwrap();
+
+            for failing in [
+                execute("DELETE FROM parents"),
+                atomic_batch(&[
+                    "INSERT INTO parents VALUES (2)",
+                    "DELETE FROM parents WHERE id = 1",
+                ]),
+            ] {
+                calls.lock().unwrap().clear();
+                let failed = run(failing).await;
+                assert!(matches!(failed, Err(SqlError::Sqlite(_))), "{failed:?}");
+                assert!(
+                    calls.lock().unwrap().is_empty(),
+                    "a request rejected at commit costs no repository call: {:?}",
+                    calls.lock().unwrap()
+                );
+                assert_eq!(
+                    rows_of(&service, &space, "SELECT id FROM parents ORDER BY id").await,
+                    vec![vec![SqlValue::Integer(1)]]
+                );
+                assert!(handle.checkpoint().await.unwrap() == before);
+            }
+
+            // The connection is not left inside a transaction: the next
+            // request commits and is persisted.
+            calls.lock().unwrap().clear();
+            run(execute("DELETE FROM children")).await.unwrap();
+            assert_eq!(calls.lock().unwrap().len(), 1);
+            assert!(rows_of(&service, &space, "SELECT * FROM children")
+                .await
+                .is_empty());
+        }
     }
 }
