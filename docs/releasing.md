@@ -57,6 +57,22 @@ a version into the `docker.yml` `image_version` input that `Cargo.toml` does not
 already claim. Both have happened (`0b48da2`, and the image tagged `1.10.0`
 built from a `1.9.0` tree); the `version-guard` job now blocks the second one.
 
+## The CVM must run the production OS image
+
+The `deploy-phala` job in `docker.yml` refuses to deploy, and fails after a
+deploy, unless the `tinycloud-node` CVM reports `.os.is_dev == false` with the
+name and hash pinned in `PHALA_OS_IMAGE` / `PHALA_OS_IMAGE_HASH` (`dstack-0.5.12`).
+The Phala KMS only releases app keys to the production image. CI never changes
+the OS. If the check fails, set it by hand, then re-run:
+
+```sh
+phala cvms get tinycloud-node --json | jq .os
+phala api -X PATCH /cvms/<id>/os-image -F os_image_name=dstack-0.5.12
+```
+
+`phala deploy --image/--no-dev-os` is ignored for an existing CVM; the PATCH is
+what changes the OS.
+
 ## Operator steps before a node deploy
 
 A migration that indexes a large PostgreSQL table cannot be built by the boot:
