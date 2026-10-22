@@ -5,6 +5,7 @@
 ### Changes
 
 - `docs/releasing.md`: how a compose-only change ships (as a release), and how to read the dense promote watch. Details: TC-950.
+- SQL and DuckDB delegations (`tinycloud.sql/*`, `tinycloud.duckdb/*`) are refused when their caveats are not supported, with `DelegationError::UnsupportedCaveat`. SQL accepts empty caveats or a constrained-statements profile (direct or nested). DuckDB accepts empty caveats only. Invocations of SQL and DuckDB abilities are refused the same way (`InvocationError::UnsupportedCaveat`). Invocation `sqlCaveats` and `duckdbCaveats` facts with an unknown key or a wrongly typed value return 400, and every occurrence of the fact is checked. Details: TC-1791.
 
 ## [1.21.7] - 2026-10-21
 
