@@ -524,13 +524,16 @@ The downstream watcher cannot skip quota restoration.
 
 ### A compose-only change ships as a release
 
-The compose on `main` is the compose that gets deployed, so a change to it
-(for example the database pool in TC-950) reaches production with a release:
-the tag commit must be a strict descendant of the revision running in
-production, which means a version bump even when the node code is unchanged.
-A digest promotion of the revision that is already running, with a changed
-compose, is refused by the ancestry guard ("Released image must be a strict
-descendant of the running production revision").
+The production compose is the reviewed N0 template (locked by the template
+hash in `docker.yml`), and the compose on `main` is the one that gets
+deployed. For any image digest other than the reviewed 1.20.6 image, the
+N0-template path requires a released image (`require_release`): the tag commit
+must be a strict descendant of the revision running in production. So a change
+to the production compose (for example the database pool in TC-950) reaches
+production with a release, which means a version bump even when the node code
+is unchanged. A digest promotion of the revision that is already running, with
+a changed compose, is refused by the ancestry guard ("Released image must be a
+strict descendant of the running production revision").
 
 1. Merge the compose change (the compose, its byte-identical fixture
    `scripts/ci/fixtures/tc959-n0-compose.yaml`, the template hash in
