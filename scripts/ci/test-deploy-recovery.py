@@ -14,6 +14,8 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = (ROOT / ".github/workflows/docker.yml").read_text()
+# The deploy step reads the workflow-level pin, which the step-only harness must supply itself.
+PHALA_OS_IMAGE = re.search(r"^  PHALA_OS_IMAGE: (\S+)$", SOURCE, re.MULTILINE)[1]
 DIGEST = "sha256:4bdae4fc232d886bb56bfbce4ec62ed4b8fb4e1369a01f6afb73d06dd68c188f"
 REVISION = "e18578ff9162986ddd813259c60f73866e3e60d1"
 # The real PROD_TINYCLOUD_QUOTA_URL shape: billing's bare HTTPS origin, not a /api/quota path.
@@ -251,7 +253,8 @@ class RecoveryTests(unittest.TestCase):
             deploy = shell_for_step("Deploy to Phala Cloud")
             required = deploy.split("required_vars=(\n", 1)[1].split("\n)", 1)[0].split()
             env = {name: canary for name in required}
-            env.update({"PATH": str(binaries) + ":" + str(Path(sys.executable).parent) + ":/usr/bin:/bin",
+            env.update({"PHALA_OS_IMAGE": PHALA_OS_IMAGE,
+                        "PATH": str(binaries) + ":" + str(Path(sys.executable).parent) + ":/usr/bin:/bin",
                         "PYTHONPATH": directory, "TMPDIR": directory, "RUNNER_TEMP": directory, "TEST_STATE": str(state),
                         "FAIL_AT": fail_at, "GITHUB_OUTPUT": str(output), "GITHUB_STEP_SUMMARY": str(summary),
                         "REGISTRY": "ghcr.io", "IMAGE_NAME": "tinycloudlabs/tinycloud-node", "BUILD_DIGEST": build_digest,
