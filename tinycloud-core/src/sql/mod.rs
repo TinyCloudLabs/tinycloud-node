@@ -5,6 +5,7 @@ pub mod database;
 pub mod parser;
 pub mod service;
 pub mod storage;
+pub mod store;
 pub mod types;
 
 pub use authority::{DdlPolicy, SqlAuthority};
