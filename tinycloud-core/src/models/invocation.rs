@@ -570,7 +570,8 @@ fn caveats_contain_child(parent: &Caveats, child: &Caveats) -> Result<(), String
     }
 }
 
-fn extract_sql_caveat(
+/// Parses the constrained-statements profile carried by one capability's caveats.
+pub fn extract_sql_caveat(
     caveats: &Caveats,
 ) -> Option<crate::policy_capability::SqlConstrainedStatementCaveat> {
     for v in caveats.0.values() {
