@@ -43,6 +43,7 @@ pub enum InvocationReject {
     SqlEscapeBlocked,
     SqlNonPrimitiveBind,
     SqlMultistatementBlocked,
+    SqlCapabilityProfilesConflict,
 }
 
 impl InvocationReject {
@@ -60,6 +61,7 @@ impl InvocationReject {
             Self::SqlEscapeBlocked => "sql-escape-blocked",
             Self::SqlNonPrimitiveBind => "sql-non-primitive-bind",
             Self::SqlMultistatementBlocked => "sql-multistatement-blocked",
+            Self::SqlCapabilityProfilesConflict => "sql-capabilities-carry-different-profiles",
         }
     }
 }
