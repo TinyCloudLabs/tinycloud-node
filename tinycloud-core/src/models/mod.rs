@@ -11,6 +11,7 @@ pub(crate) use crate::did_resolution;
 pub mod encryption_audit;
 pub mod encryption_ceremony;
 pub mod encryption_network;
+pub mod encryption_network_key;
 pub mod encryption_network_member;
 pub mod encryption_nonce;
 pub mod epoch;

@@ -942,6 +942,7 @@ impl EncryptionService {
             node_id: Set(self.node_did.clone()),
             outcome: Set(outcome.to_string()),
             decided_at: Set(now_rfc3339()),
+            key_path: Set(None),
         };
         if let Err(err) = row.insert(&self.db).await {
             if !is_unique_violation(&err) {
@@ -967,6 +968,7 @@ impl EncryptionService {
             node_id: Set(self.node_did.clone()),
             outcome: Set(outcome.to_string()),
             decided_at: Set(now_rfc3339()),
+            key_path: Set(None),
         };
         if let Err(err) = row.insert(&self.db).await {
             if !is_unique_violation(&err) {

@@ -121,6 +121,27 @@ mod tests {
 
     const VERSION: &str = "m20261021_000000_sql_store_manifest";
 
+    /// Position of this migration in the registered list, counted from the start (1-based).
+    fn through() -> u32 {
+        (Migrator::migrations()
+            .iter()
+            .position(|m| m.name() == VERSION)
+            .expect("migration registered")
+            + 1) as u32
+    }
+
+    /// Applies pending migrations up to and including this one, never later ones.
+    /// `Migrator::up(_, Some(n))` counts pending migrations, not positions.
+    // On a fresh DB, get_pending_migrations returns the whole registered list; up_through applies only up to VERSION.
+    async fn up_through(conn: &sea_orm::DatabaseConnection) {
+        let pending = Migrator::get_pending_migrations(conn).await.unwrap();
+        let steps = pending
+            .iter()
+            .position(|m| m.name() == VERSION)
+            .map_or(0, |i| i + 1);
+        Migrator::up(conn, Some(steps as u32)).await.unwrap();
+    }
+
     async fn sqlite() -> sea_orm::DatabaseConnection {
         let mut options = ConnectOptions::new("sqlite::memory:".to_string());
         options.max_connections(1).sqlx_logging(false);
@@ -155,13 +176,13 @@ mod tests {
     }
 
     async fn up_down_cycle(conn: sea_orm::DatabaseConnection, backend: DbBackend) {
-        Migrator::up(&conn, None).await.unwrap();
+        up_through(&conn).await;
         assert!(recorded(&conn, backend).await);
         for table in ["sql_store_manifest", "sql_store_object"] {
             assert!(table_exists(&conn, backend, table).await, "{table}");
         }
         // Re-run is a no-op.
-        Migrator::up(&conn, None).await.unwrap();
+        up_through(&conn).await;
         // The migration itself is idempotent on existing tables (an operator
         // pre-created them, or the version row was deleted for a downgrade).
         conn.execute(Statement::from_string(
@@ -171,7 +192,7 @@ mod tests {
         .await
         .unwrap();
         assert!(!recorded(&conn, backend).await);
-        Migrator::up(&conn, None).await.unwrap();
+        up_through(&conn).await;
         assert!(recorded(&conn, backend).await);
         // Rows survive a re-run.
         conn.execute(Statement::from_string(
@@ -187,7 +208,7 @@ mod tests {
         ))
         .await
         .unwrap();
-        Migrator::up(&conn, None).await.unwrap();
+        up_through(&conn).await;
         let rows = conn
             .query_all(Statement::from_string(
                 backend,
@@ -201,7 +222,7 @@ mod tests {
         for table in ["sql_store_manifest", "sql_store_object"] {
             assert!(!table_exists(&conn, backend, table).await, "{table}");
         }
-        Migrator::up(&conn, None).await.unwrap();
+        up_through(&conn).await;
         assert!(table_exists(&conn, backend, "sql_store_object").await);
     }
 
@@ -213,21 +234,19 @@ mod tests {
     #[tokio::test]
     async fn sqlite_upgrade_from_the_previous_release_line() {
         let conn = sqlite().await;
-        let before = (Migrator::migrations().len() - 1) as u32;
+        let before = through() - 1;
         Migrator::up(&conn, Some(before)).await.unwrap();
         assert!(!table_exists(&conn, DbBackend::Sqlite, "sql_store_manifest").await);
-        Migrator::up(&conn, None).await.unwrap();
+        up_through(&conn).await;
         assert!(table_exists(&conn, DbBackend::Sqlite, "sql_store_manifest").await);
-        assert!(Migrator::migrations()
-            .last()
-            .is_some_and(|m| m.name() == VERSION));
+        assert!(Migrator::migrations().iter().any(|m| m.name() == VERSION));
     }
 
     #[tokio::test]
     async fn postgres_fresh_rerun_and_down() {
         let Some(fixture) = PostgresTestSchema::migrated_through(
             "postgres_sql_store_migration",
-            Some((Migrator::migrations().len() - 1) as u32),
+            Some(through() - 1),
         )
         .await
         else {
