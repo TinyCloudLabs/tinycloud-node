@@ -5,8 +5,8 @@ use tinycloud_auth::resource::SpaceId;
 use tokio::sync::RwLock;
 
 use crate::database_artifacts::{
-    ArtifactExpectation, DatabaseArtifact, DatabaseArtifactError, DatabaseArtifactRepository,
-    DeltaSave,
+    ArtifactExpectation, ArtifactMeta, ArtifactSink, DatabaseArtifact, DatabaseArtifactError,
+    DatabaseArtifactRepository, DeltaSave,
 };
 
 /// Process-local mirror of durable SQL artifact sizes, keyed by space then
@@ -60,26 +60,6 @@ impl SqlSizes {
         Ok(())
     }
 
-    /// The stored size of one artifact as far as this node knows: its
-    /// recorded size, `Some(0)` for one absent from a seeded mirror (this
-    /// node is the artifacts' only writer), `None` before the mirror is
-    /// seeded. Stale only after a save whose outcome was unknown, by at most
-    /// that save's delta.
-    pub async fn known_size(&self, service: &str, space: &str, name: &str) -> Option<u64> {
-        if !self.1.load(std::sync::atomic::Ordering::Acquire) {
-            return None;
-        }
-        Some(
-            self.0
-                .read()
-                .await
-                .get(space)
-                .and_then(|inner| inner.get(&(service.to_string(), name.to_string())))
-                .copied()
-                .unwrap_or(0),
-        )
-    }
-
     /// Overwrite (not accumulate) the size for one (service, space, db-name).
     pub async fn update(&self, service: &str, space: &str, name: &str, size_bytes: u64) {
         self.0
@@ -122,27 +102,25 @@ impl SizeTrackingArtifactRepository {
 
 #[async_trait]
 impl DatabaseArtifactRepository for SizeTrackingArtifactRepository {
-    async fn load(
+    async fn load_meta(
         &self,
         service: &str,
         space: &str,
         name: &str,
-    ) -> Result<Option<DatabaseArtifact>, DatabaseArtifactError> {
-        let known_size = self.sizes.known_size(service, space, name).await;
-        self.inner
-            .load_sized(service, space, name, known_size)
-            .await
+    ) -> Result<Option<ArtifactMeta>, DatabaseArtifactError> {
+        self.inner.load_meta(service, space, name).await
     }
 
-    async fn load_sized(
+    async fn read_chunks(
         &self,
         service: &str,
         space: &str,
         name: &str,
-        known_size: Option<u64>,
-    ) -> Result<Option<DatabaseArtifact>, DatabaseArtifactError> {
+        meta: &ArtifactMeta,
+        sink: &mut dyn ArtifactSink,
+    ) -> Result<(), DatabaseArtifactError> {
         self.inner
-            .load_sized(service, space, name, known_size)
+            .read_chunks(service, space, name, meta, sink)
             .await
     }
 
@@ -196,24 +174,6 @@ mod tests {
         resolver::DID_METHODS,
         ssi::{dids::DIDBuf, jwk::JWK},
     };
-
-    #[tokio::test]
-    async fn known_sizes_are_unknown_until_seeded() {
-        let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
-            .await
-            .unwrap();
-        Migrator::up(&db, None).await.unwrap();
-        let sizes = SqlSizes::new();
-        assert_eq!(sizes.known_size("sql", "space", "db").await, None);
-        sizes.seed_from(&db).await.unwrap();
-        assert_eq!(
-            sizes.known_size("sql", "space", "db").await,
-            Some(0),
-            "absent"
-        );
-        sizes.update("sql", "space", "db", 9 << 20).await;
-        assert_eq!(sizes.known_size("sql", "space", "db").await, Some(9 << 20));
-    }
 
     fn test_space_id(name: &str) -> SpaceId {
         let jwk = JWK::generate_ed25519().unwrap();
