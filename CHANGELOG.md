@@ -14,6 +14,7 @@
 
 ### Changes
 
+- The storage usage read (`tinycloud.space/info`) returns `manageUrl` `https://account.tinycloud.xyz/storage`, the account storage page, for "Manage storage". Details: TC-848.
 - Production compose: the database pool is `TINYCLOUD_DATABASE__MAX_CONNECTIONS: "10"` (was 15), so two containers that overlap during a deploy fit within the instance's 25 connections. This changes the compose hash; the N0 template lock in `docker.yml` and `scripts/ci/fixtures/tc959-n0-compose.yaml` move with it. Details: TC-950.
 
 ## [1.21.6] - 2026-10-21

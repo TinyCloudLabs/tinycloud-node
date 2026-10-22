@@ -1,11 +1,17 @@
 use async_trait::async_trait;
 use sea_orm::{
-    sea_query::Expr, ActiveModelTrait, ActiveValue::Set, ColumnTrait, DbErr, EntityTrait,
-    QueryFilter, QuerySelect,
+    sea_query::{Expr, Func},
+    ActiveModelTrait,
+    ActiveValue::Set,
+    ColumnTrait, DbErr, EntityTrait, QueryFilter, QuerySelect,
 };
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
-use crate::{db_pool::BulkScope, hash::hash, models::database_artifact};
+use crate::{
+    db_pool::BulkScope,
+    hash::{hash, Blake3Hasher},
+    models::database_artifact,
+};
 
 #[derive(Debug, Clone)]
 pub struct DatabaseArtifact {
@@ -109,29 +115,395 @@ pub enum DatabaseArtifactError {
     IncrementalPersistenceUnsupported,
     #[error("database artifact was written from a superseded checkpoint")]
     StaleLineage,
+    #[error("database artifact changed while it was being read")]
+    ArtifactChanged,
+    #[error("database artifact {part} failed its content hash")]
+    HashMismatch { part: &'static str },
+    #[error("database artifact {part} is {actual} bytes, expected {expected}")]
+    SizeMismatch {
+        part: &'static str,
+        expected: u64,
+        actual: u64,
+    },
+    /// The sink handed to [`DatabaseArtifactRepository::read_chunks`] refused
+    /// the bytes; the message is the sink's own.
+    #[error("{0}")]
+    Sink(String),
+}
+
+/// The stored metadata of one artifact row: everything but the payload bytes.
+///
+/// Reading it never touches the `payload` / `delta_payload` columns, so its
+/// cost is independent of the artifact's size. It is what an existence check
+/// or a size comparison needs, and what [`DatabaseArtifactRepository::read_chunks`]
+/// pins a streamed read to.
+///
+/// Shape note for at-rest encoding (TC-887): sizes and hashes here describe the
+/// STORED bytes, which today are the plain database file. An encoding column
+/// (`payload_encoding`) would be added to this struct, and chunking would keep
+/// applying to the stored (encoded) bytes, so decoding belongs in the sink.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactMeta {
+    pub revision: i64,
+    pub size_bytes: i64,
+    pub content_hash: String,
+    pub checkpoint_content_hash: String,
+    pub checkpoint_size_bytes: i64,
+    pub delta_content_hash: Option<String>,
+    pub delta_size_bytes: i64,
+    pub updated_at: String,
+    pub storage_mode: String,
+    pub backend: String,
+}
+
+impl ArtifactMeta {
+    /// Whether the row carries a WAL delta next to its checkpoint.
+    pub fn has_delta(&self) -> bool {
+        self.delta_content_hash.is_some()
+    }
+}
+
+/// Which stored column a streamed byte range belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactPart {
+    Checkpoint,
+    Wal,
+}
+
+impl ArtifactPart {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Checkpoint => "checkpoint",
+            Self::Wal => "wal",
+        }
+    }
+}
+
+/// Where [`DatabaseArtifactRepository::read_chunks`] delivers the artifact.
+///
+/// Calls for one attempt arrive as `begin_part(Checkpoint)`, `write`*,
+/// `finish_part`, then, when the row has a delta, the same for `Wal`. A part
+/// with no bytes still gets `begin_part` and `finish_part`. Nothing the sink
+/// received is final until the caller's own commit step: a sink must be able to
+/// `reset` and take the whole sequence again (a changed row restarts the read),
+/// and must publish nothing before its caller says the read succeeded.
+#[async_trait]
+pub trait ArtifactSink: Send {
+    /// Discard everything received so far; a new attempt is about to begin.
+    async fn reset(&mut self) -> Result<(), DatabaseArtifactError>;
+    async fn begin_part(&mut self, part: ArtifactPart) -> Result<(), DatabaseArtifactError>;
+    async fn write(&mut self, bytes: &[u8]) -> Result<(), DatabaseArtifactError>;
+    async fn finish_part(&mut self) -> Result<(), DatabaseArtifactError>;
+}
+
+/// An [`ArtifactSink`] that keeps the bytes in memory, for callers that return
+/// the whole artifact anyway (a DuckDB export) and for tests.
+#[derive(Debug, Default)]
+pub struct MemorySink {
+    pub checkpoint: Vec<u8>,
+    pub wal: Option<Vec<u8>>,
+    current: Option<ArtifactPart>,
+}
+
+#[async_trait]
+impl ArtifactSink for MemorySink {
+    async fn reset(&mut self) -> Result<(), DatabaseArtifactError> {
+        *self = Self::default();
+        Ok(())
+    }
+
+    async fn begin_part(&mut self, part: ArtifactPart) -> Result<(), DatabaseArtifactError> {
+        self.current = Some(part);
+        if part == ArtifactPart::Wal {
+            self.wal = Some(Vec::new());
+        }
+        Ok(())
+    }
+
+    async fn write(&mut self, bytes: &[u8]) -> Result<(), DatabaseArtifactError> {
+        match self.current {
+            Some(ArtifactPart::Checkpoint) => self.checkpoint.extend_from_slice(bytes),
+            Some(ArtifactPart::Wal) => self
+                .wal
+                .get_or_insert_with(Vec::new)
+                .extend_from_slice(bytes),
+            None => return Err(DatabaseArtifactError::Sink("write outside a part".into())),
+        }
+        Ok(())
+    }
+
+    async fn finish_part(&mut self) -> Result<(), DatabaseArtifactError> {
+        self.current = None;
+        Ok(())
+    }
+}
+
+/// An [`ArtifactSink`] that stages the checkpoint and WAL as temp files next
+/// to their final paths: nothing is visible at a final path until
+/// [`CacheFileSink::commit`], which the caller runs only after
+/// [`read_artifact`] succeeded. Dropping the sink (a failed, abandoned or
+/// timed-out hydration) removes whatever was staged.
+///
+/// The leading bytes of each part are checked with the given validators before
+/// the part is accepted, so a payload the database engine would misread (and
+/// silently revert to empty) is refused.
+pub struct CacheFileSink {
+    service: &'static str,
+    label: String,
+    checkpoint_path: std::path::PathBuf,
+    wal_path: std::path::PathBuf,
+    valid_checkpoint: fn(&[u8]) -> bool,
+    valid_wal: fn(&[u8]) -> bool,
+    current: Option<StagedPart>,
+    staged: Vec<(std::path::PathBuf, std::path::PathBuf)>,
+}
+
+struct StagedPart {
+    part: ArtifactPart,
+    temp: std::path::PathBuf,
+    file: tokio::fs::File,
+    validated: bool,
+}
+
+impl CacheFileSink {
+    pub fn new(
+        service: &'static str,
+        label: String,
+        checkpoint_path: std::path::PathBuf,
+        wal_path: std::path::PathBuf,
+        valid_checkpoint: fn(&[u8]) -> bool,
+        valid_wal: fn(&[u8]) -> bool,
+    ) -> Self {
+        Self {
+            service,
+            label,
+            checkpoint_path,
+            wal_path,
+            valid_checkpoint,
+            valid_wal,
+            current: None,
+            staged: Vec::new(),
+        }
+    }
+
+    fn io(error: std::io::Error) -> DatabaseArtifactError {
+        DatabaseArtifactError::Sink(error.to_string())
+    }
+
+    fn validator(&self, part: ArtifactPart) -> fn(&[u8]) -> bool {
+        match part {
+            ArtifactPart::Checkpoint => self.valid_checkpoint,
+            ArtifactPart::Wal => self.valid_wal,
+        }
+    }
+
+    fn validate(&self, part: ArtifactPart, head: &[u8]) -> Result<(), DatabaseArtifactError> {
+        if (self.validator(part))(head) {
+            return Ok(());
+        }
+        tracing::error!(
+            service = self.service,
+            role = part.as_str(),
+            "Durable database artifact does not carry the expected file header; refusing to hydrate"
+        );
+        Err(DatabaseArtifactError::Sink(format!(
+            "database artifact {} for {} does not carry the expected file header",
+            part.as_str(),
+            self.label
+        )))
+    }
+
+    fn discard(&mut self) {
+        if let Some(current) = self.current.take() {
+            let _ = std::fs::remove_file(&current.temp);
+        }
+        for (temp, _) in self.staged.drain(..) {
+            let _ = std::fs::remove_file(temp);
+        }
+    }
+
+    /// Move the staged files to their final paths. The caller has already
+    /// removed the stale cache files they replace.
+    pub async fn commit(&mut self) -> std::io::Result<()> {
+        for (temp, path) in std::mem::take(&mut self.staged) {
+            if let Err(error) = tokio::fs::rename(&temp, &path).await {
+                let _ = tokio::fs::remove_file(&temp).await;
+                self.discard();
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for CacheFileSink {
+    fn drop(&mut self) {
+        self.discard();
+    }
+}
+
+pub(crate) fn staging_path(path: &std::path::Path) -> std::path::PathBuf {
+    static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    // Appended to the whole path, never `with_extension`: `main.db` and
+    // `main.db-wal` must not share a temp name.
+    std::path::PathBuf::from(format!(
+        "{}.tmp.{}.{}",
+        path.display(),
+        std::process::id(),
+        NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ))
+}
+
+#[async_trait]
+impl ArtifactSink for CacheFileSink {
+    async fn reset(&mut self) -> Result<(), DatabaseArtifactError> {
+        self.discard();
+        Ok(())
+    }
+
+    async fn begin_part(&mut self, part: ArtifactPart) -> Result<(), DatabaseArtifactError> {
+        let path = match part {
+            ArtifactPart::Checkpoint => self.checkpoint_path.clone(),
+            ArtifactPart::Wal => self.wal_path.clone(),
+        };
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(Self::io)?;
+        }
+        let temp = staging_path(&path);
+        let file = tokio::fs::File::create(&temp).await.map_err(Self::io)?;
+        self.current = Some(StagedPart {
+            part,
+            temp,
+            file,
+            validated: false,
+        });
+        Ok(())
+    }
+
+    async fn write(&mut self, bytes: &[u8]) -> Result<(), DatabaseArtifactError> {
+        use tokio::io::AsyncWriteExt;
+        let Some(current) = self.current.as_ref() else {
+            return Err(DatabaseArtifactError::Sink("write outside a part".into()));
+        };
+        // The first slice holds every header the validators look at.
+        if !current.validated {
+            self.validate(current.part, bytes)?;
+        }
+        let current = self.current.as_mut().expect("checked above");
+        current.validated = true;
+        current.file.write_all(bytes).await.map_err(Self::io)
+    }
+
+    async fn finish_part(&mut self) -> Result<(), DatabaseArtifactError> {
+        let Some(current) = self.current.as_ref() else {
+            return Err(DatabaseArtifactError::Sink("no part to finish".into()));
+        };
+        // An empty part never saw a write; it is judged as the empty header.
+        if !current.validated {
+            self.validate(current.part, &[])?;
+        }
+        let StagedPart {
+            part, temp, file, ..
+        } = self.current.take().expect("checked above");
+        if let Err(error) = file.sync_all().await {
+            let _ = tokio::fs::remove_file(&temp).await;
+            return Err(Self::io(error));
+        }
+        drop(file);
+        let path = match part {
+            ArtifactPart::Checkpoint => self.checkpoint_path.clone(),
+            ArtifactPart::Wal => self.wal_path.clone(),
+        };
+        self.staged.push((temp, path));
+        Ok(())
+    }
+}
+
+/// Read an artifact into `sink` in bounded slices, restarting when the row
+/// changes underneath the read.
+///
+/// Returns the metadata the delivered bytes belong to, or `None` when there is
+/// no such artifact (the sink is untouched). A concurrent save between two
+/// slices surfaces from [`DatabaseArtifactRepository::read_chunks`] as
+/// [`DatabaseArtifactError::ArtifactChanged`]; the sink is `reset` and the read
+/// restarts from fresh metadata, at most [`ARTIFACT_READ_RETRIES`] times, so a
+/// sink never ends up holding a checkpoint of one revision and a WAL of
+/// another.
+pub async fn read_artifact<R: DatabaseArtifactRepository + ?Sized>(
+    repository: &R,
+    service: &str,
+    space: &str,
+    name: &str,
+    sink: &mut dyn ArtifactSink,
+) -> Result<Option<ArtifactMeta>, DatabaseArtifactError> {
+    let mut retries = 0;
+    loop {
+        let Some(meta) = repository.load_meta(service, space, name).await? else {
+            return Ok(None);
+        };
+        sink.reset().await?;
+        match repository
+            .read_chunks(service, space, name, &meta, sink)
+            .await
+        {
+            Ok(()) => return Ok(Some(meta)),
+            Err(DatabaseArtifactError::ArtifactChanged) if retries < ARTIFACT_READ_RETRIES => {
+                retries += 1;
+                tracing::info!(
+                    service,
+                    retries,
+                    "Database artifact changed mid-read; restarting"
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 #[async_trait]
 pub trait DatabaseArtifactRepository: Send + Sync {
-    async fn load(
+    /// The artifact's stored metadata, with no payload bytes read.
+    ///
+    /// One cheap statement whatever the artifact's size: use it for existence
+    /// checks and size comparisons, never `read_chunks`.
+    async fn load_meta(
         &self,
         service: &str,
         space: &str,
         name: &str,
-    ) -> Result<Option<DatabaseArtifact>, DatabaseArtifactError>;
+    ) -> Result<Option<ArtifactMeta>, DatabaseArtifactError>;
 
-    /// [`Self::load`], told the artifact's stored size when the caller knows
-    /// it, so a repository can skip the bulk statement timeout's extra round
-    /// trips for a small artifact (TC-1054). `None` means unknown.
-    async fn load_sized(
+    /// Stream the stored checkpoint, then the WAL delta when `meta` has one,
+    /// into `sink` in slices of at most [`ARTIFACT_CHUNK_BYTES`]; an artifact
+    /// of at most [`BASE_TIMEOUT_PAYLOAD_BYTES`] stored bytes is one slice per
+    /// part.
+    ///
+    /// Peak memory is one slice, whatever the artifact's size. Every slice is
+    /// its own statement (`substr(column, offset, length)`, which runs on
+    /// both PostgreSQL `bytea` and SQLite `BLOB`) under the pool's base
+    /// timeout, guarded by `WHERE revision = meta.revision AND
+    /// checkpoint_content_hash = meta.checkpoint_content_hash`: a row that
+    /// moved on yields [`DatabaseArtifactError::ArtifactChanged`] instead of
+    /// bytes from two revisions. Round trips are `ceil(size / chunk)` per
+    /// non-empty part, on top of the one `load_meta` that produced `meta`.
+    ///
+    /// The checkpoint is hashed while it streams and compared to
+    /// `checkpoint_content_hash`, the WAL to `delta_content_hash`, and the row's
+    /// logical `content_hash` to what those imply; any mismatch is an error and
+    /// the caller must discard what the sink received. Prefer [`read_artifact`],
+    /// which also handles the restart.
+    ///
+    /// TC-887: chunking applies to the STORED bytes; an encoded payload would
+    /// be decoded by the sink (or a decoding wrapper around it), and the
+    /// hashes verified here would be the stored-bytes hashes.
+    async fn read_chunks(
         &self,
         service: &str,
         space: &str,
         name: &str,
-        _known_size: Option<u64>,
-    ) -> Result<Option<DatabaseArtifact>, DatabaseArtifactError> {
-        self.load(service, space, name).await
-    }
+        meta: &ArtifactMeta,
+        sink: &mut dyn ArtifactSink,
+    ) -> Result<(), DatabaseArtifactError>;
 
     async fn save(
         &self,
@@ -159,10 +531,18 @@ pub trait DatabaseArtifactRepository: Send + Sync {
 /// [`RecoveringConnection::begin_bulk`] scope (TC-1054). It matches the SQL
 /// service's WAL delta bound (8 MiB): the server's work on an 8 MiB value
 /// (compression, TOAST, WAL) takes well under a second, far inside the 30 s
-/// default. Loads use the same bound, judged by the stored size.
+/// default.
 ///
 /// [`RecoveringConnection::begin_bulk`]: crate::db_pool::RecoveringConnection::begin_bulk
 pub const BASE_TIMEOUT_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
+
+/// The slice size of a streamed artifact read. Two slices fit well inside
+/// [`BASE_TIMEOUT_PAYLOAD_BYTES`]'s budget, so each runs under the base
+/// statement timeout.
+pub const ARTIFACT_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+
+/// How many times [`read_artifact`] restarts a read whose row changed.
+pub const ARTIFACT_READ_RETRIES: usize = 2;
 
 /// The stored metadata a full checkpoint save is checked against.
 struct CurrentArtifact {
@@ -223,64 +603,199 @@ impl SeaOrmDatabaseArtifactRepository {
     }
 }
 
+struct ArtifactKey<'a> {
+    service: &'a str,
+    space: &'a str,
+    name: &'a str,
+}
+
+impl SeaOrmDatabaseArtifactRepository {
+    /// Stream one payload column into `sink`, hash it, and return its CID.
+    async fn read_part(
+        &self,
+        key: &ArtifactKey<'_>,
+        meta: &ArtifactMeta,
+        part: ArtifactPart,
+        size_bytes: i64,
+        expected_hash: &str,
+        sink: &mut dyn ArtifactSink,
+    ) -> Result<String, DatabaseArtifactError> {
+        let column = match part {
+            ArtifactPart::Checkpoint => database_artifact::Column::Payload,
+            ArtifactPart::Wal => database_artifact::Column::DeltaPayload,
+        };
+        let expected_len = u64::try_from(size_bytes).unwrap_or(0);
+        // An artifact that fits the base-timeout budget is one slice per part:
+        // no extra round trips for the common small database.
+        let slice_bytes = if meta.size_bytes <= BASE_TIMEOUT_PAYLOAD_BYTES as i64 {
+            expected_len.max(1)
+        } else {
+            ARTIFACT_CHUNK_BYTES as u64
+        };
+        let mut hasher = Blake3Hasher::new();
+        sink.begin_part(part).await?;
+        let mut offset = 0_u64;
+        while offset < expected_len {
+            let len = (expected_len - offset).min(slice_bytes);
+            // `substr` is 1-based and takes int4 on PostgreSQL.
+            let start = i32::try_from(offset + 1)
+                .map_err(|_| DatabaseArtifactError::PayloadTooLarge(expected_len))?;
+            let slice = database_artifact::Entity::find()
+                .select_only()
+                .expr(
+                    Func::cust("substr")
+                        .arg(Expr::col(column))
+                        .arg(start)
+                        .arg(len as i32),
+                )
+                .filter(database_artifact::Column::Service.eq(key.service))
+                .filter(database_artifact::Column::Space.eq(key.space))
+                .filter(database_artifact::Column::Name.eq(key.name))
+                .filter(database_artifact::Column::Revision.eq(meta.revision))
+                .filter(
+                    database_artifact::Column::CheckpointContentHash
+                        .eq(meta.checkpoint_content_hash.as_str()),
+                )
+                .into_tuple::<Option<Vec<u8>>>()
+                .one(&self.conn)
+                .await?;
+            // No row: the artifact was replaced or deleted since `meta`.
+            let Some(slice) = slice else {
+                return Err(DatabaseArtifactError::ArtifactChanged);
+            };
+            let slice = slice.unwrap_or_default();
+            if slice.len() as u64 != len {
+                return Err(DatabaseArtifactError::SizeMismatch {
+                    part: part.as_str(),
+                    expected: expected_len,
+                    actual: offset + slice.len() as u64,
+                });
+            }
+            hasher.update(&slice);
+            sink.write(&slice).await?;
+            offset += len;
+        }
+        let actual = hasher.finalize().to_cid(0x55).to_string();
+        if actual != expected_hash {
+            return Err(DatabaseArtifactError::HashMismatch {
+                part: part.as_str(),
+            });
+        }
+        sink.finish_part().await?;
+        Ok(actual)
+    }
+}
+
 #[async_trait]
 impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
-    async fn load(
+    async fn load_meta(
         &self,
         service: &str,
         space: &str,
         name: &str,
-    ) -> Result<Option<DatabaseArtifact>, DatabaseArtifactError> {
-        self.load_sized(service, space, name, None).await
+    ) -> Result<Option<ArtifactMeta>, DatabaseArtifactError> {
+        use database_artifact::Column;
+        let row = database_artifact::Entity::find_by_id((
+            service.to_string(),
+            space.to_string(),
+            name.to_string(),
+        ))
+        .select_only()
+        .column(Column::Revision)
+        .column(Column::SizeBytes)
+        .column(Column::ContentHash)
+        .column(Column::CheckpointContentHash)
+        .column(Column::CheckpointSizeBytes)
+        .column(Column::DeltaContentHash)
+        .column(Column::DeltaSizeBytes)
+        .column(Column::UpdatedAt)
+        .column(Column::StorageMode)
+        .column(Column::Backend)
+        .into_tuple::<(
+            i64,
+            i64,
+            String,
+            String,
+            i64,
+            Option<String>,
+            i64,
+            String,
+            String,
+            String,
+        )>()
+        .one(&self.conn)
+        .await?;
+        Ok(row.map(
+            |(
+                revision,
+                size_bytes,
+                content_hash,
+                checkpoint_content_hash,
+                checkpoint_size_bytes,
+                delta_content_hash,
+                delta_size_bytes,
+                updated_at,
+                storage_mode,
+                backend,
+            )| ArtifactMeta {
+                revision,
+                size_bytes,
+                content_hash,
+                checkpoint_content_hash,
+                checkpoint_size_bytes,
+                delta_content_hash,
+                delta_size_bytes,
+                updated_at,
+                storage_mode,
+                backend,
+            },
+        ))
     }
 
-    async fn load_sized(
+    async fn read_chunks(
         &self,
         service: &str,
         space: &str,
         name: &str,
-        known_size: Option<u64>,
-    ) -> Result<Option<DatabaseArtifact>, DatabaseArtifactError> {
-        // Hydration reads the whole checkpoint and WAL in one statement. One
-        // that may be larger than a delta runs under the bulk statement
-        // timeout (TC-1054); a known-small one under the base timeout, with
-        // no extra round trip.
-        let bulk = known_size.is_none_or(|size| size > BASE_TIMEOUT_PAYLOAD_BYTES as u64);
-        let find = || {
-            database_artifact::Entity::find_by_id((
-                service.to_string(),
-                space.to_string(),
-                name.to_string(),
-            ))
+        meta: &ArtifactMeta,
+        sink: &mut dyn ArtifactSink,
+    ) -> Result<(), DatabaseArtifactError> {
+        let key = ArtifactKey {
+            service,
+            space,
+            name,
         };
-        let row = if bulk {
-            self.conn
-                .bulk_read("load_artifact", |scope| async move {
-                    let row = find().one(&scope).await?;
-                    scope.commit().await?;
-                    Ok(row)
-                })
-                .await
-        } else {
-            // A read-only statement on the pool, retried like any other.
-            find().one(&self.conn).await
+        let checkpoint = self
+            .read_part(
+                &key,
+                meta,
+                ArtifactPart::Checkpoint,
+                meta.checkpoint_size_bytes,
+                &meta.checkpoint_content_hash,
+                sink,
+            )
+            .await?;
+        let logical = match &meta.delta_content_hash {
+            Some(delta_hash) => {
+                self.read_part(
+                    &key,
+                    meta,
+                    ArtifactPart::Wal,
+                    meta.delta_size_bytes,
+                    delta_hash,
+                    sink,
+                )
+                .await?;
+                hash(format!("{checkpoint}:{delta_hash}").as_bytes())
+                    .to_cid(0x55)
+                    .to_string()
+            }
+            None => checkpoint,
         };
-        row.map(|row| {
-            row.map(|model| DatabaseArtifact {
-                payload: model.payload,
-                content_hash: model.content_hash,
-                revision: model.revision,
-                size_bytes: model.size_bytes,
-                updated_at: model.updated_at,
-                backend: model.backend,
-                storage_mode: model.storage_mode,
-                checkpoint_content_hash: model.checkpoint_content_hash,
-                delta_payload: model.delta_payload,
-                delta_content_hash: model.delta_content_hash,
-                delta_size_bytes: model.delta_size_bytes,
-            })
-        })
-        .map_err(DatabaseArtifactError::Db)
+        if logical != meta.content_hash {
+            return Err(DatabaseArtifactError::HashMismatch { part: "content" });
+        }
+        Ok(())
     }
 
     async fn save(
@@ -575,8 +1090,55 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
     }
 }
 
+/// Test-only whole-artifact read built on the public streaming API, so tests
+/// can assert on payload bytes. There is deliberately no such method on the
+/// repository: the node never reads a whole row.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    #[async_trait]
+    pub(crate) trait ReadAll {
+        async fn read_all(
+            &self,
+            service: &str,
+            space: &str,
+            name: &str,
+        ) -> Result<Option<DatabaseArtifact>, DatabaseArtifactError>;
+    }
+
+    #[async_trait]
+    impl<T: DatabaseArtifactRepository + ?Sized> ReadAll for T {
+        async fn read_all(
+            &self,
+            service: &str,
+            space: &str,
+            name: &str,
+        ) -> Result<Option<DatabaseArtifact>, DatabaseArtifactError> {
+            let mut sink = MemorySink::default();
+            let Some(meta) = read_artifact(self, service, space, name, &mut sink).await? else {
+                return Ok(None);
+            };
+            Ok(Some(DatabaseArtifact {
+                payload: sink.checkpoint,
+                content_hash: meta.content_hash,
+                revision: meta.revision,
+                size_bytes: meta.size_bytes,
+                updated_at: meta.updated_at,
+                backend: meta.backend,
+                storage_mode: meta.storage_mode,
+                checkpoint_content_hash: meta.checkpoint_content_hash,
+                delta_payload: sink.wal,
+                delta_content_hash: meta.delta_content_hash,
+                delta_size_bytes: meta.delta_size_bytes,
+            }))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_support::ReadAll;
     use super::*;
     use crate::migrations::Migrator;
     use sea_orm::{ConnectOptions, Database};
@@ -613,7 +1175,11 @@ mod tests {
         assert_eq!(delta.size_bytes, 112);
         assert_eq!(delta.delta_size_bytes, 12);
 
-        let loaded = repo.load("sql", "space", "main").await.unwrap().unwrap();
+        let loaded = repo
+            .read_all("sql", "space", "main")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded.payload, vec![1; 100]);
         assert_eq!(loaded.delta_payload, Some(vec![2; 12]));
         assert_eq!(loaded.storage_mode, "checkpoint+wal");
@@ -627,7 +1193,11 @@ mod tests {
         )
         .await
         .unwrap();
-        let checkpoint = repo.load("sql", "space", "main").await.unwrap().unwrap();
+        let checkpoint = repo
+            .read_all("sql", "space", "main")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(checkpoint.size_bytes, 80);
         assert_eq!(checkpoint.delta_size_bytes, 0);
         assert_eq!(checkpoint.delta_payload, None);
@@ -685,7 +1255,11 @@ mod tests {
             "expected a lineage rejection, got {err:?}"
         );
 
-        let loaded = repo.load("sql", "space", "main").await.unwrap().unwrap();
+        let loaded = repo
+            .read_all("sql", "space", "main")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded.revision, 2);
         assert_eq!(loaded.payload, vec![2; 200]);
         assert_eq!(loaded.delta_payload, None);
@@ -741,7 +1315,11 @@ mod tests {
             "expected a lineage rejection, got {err:?}"
         );
 
-        let loaded = repo.load("sql", "space", "main").await.unwrap().unwrap();
+        let loaded = repo
+            .read_all("sql", "space", "main")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded.revision, 1);
         assert_eq!(loaded.payload, vec![1; 4096]);
     }
@@ -815,11 +1393,646 @@ mod tests {
 
         // The stale writer must not have clobbered: durable state is the winner's
         // payload at revision 2, never the loser's bytes.
-        let loaded = repo.load("sql", "space", "main").await.unwrap().unwrap();
+        let loaded = repo
+            .read_all("sql", "space", "main")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded.revision, 2);
         assert_eq!(
             loaded.payload, winner.payload,
             "stale writer must not overwrite the winner's checkpoint"
+        );
+    }
+
+    // ---- bounded streaming reads (TC-822) ----
+
+    use sea_orm::{ConnectionTrait, DatabaseConnection};
+    use std::sync::{Arc, Mutex};
+
+    const CHUNK: usize = ARTIFACT_CHUNK_BYTES;
+
+    /// The replacement (checkpoint, optional WAL) a disturbance saves.
+    type Disturb = fn(usize) -> (Vec<u8>, Option<Vec<u8>>);
+
+    fn bytes(len: usize, seed: u8) -> Vec<u8> {
+        (0..len)
+            .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
+            .collect()
+    }
+
+    /// A migrated in-memory SQLite repository plus a log of every statement
+    /// it sends, the "counting connection" of the round-trip assertions.
+    async fn spied_repo() -> (
+        SeaOrmDatabaseArtifactRepository,
+        DatabaseConnection,
+        Arc<Mutex<Vec<String>>>,
+    ) {
+        let mut options = ConnectOptions::new("sqlite::memory:".to_string());
+        options.max_connections(1);
+        let mut conn = Database::connect(options).await.unwrap();
+        Migrator::up(&conn, None).await.unwrap();
+        let statements = Arc::new(Mutex::new(Vec::new()));
+        let log = statements.clone();
+        conn.set_metric_callback(move |info| {
+            log.lock().unwrap().push(info.statement.sql.clone());
+        });
+        (
+            SeaOrmDatabaseArtifactRepository::new(conn.clone()),
+            conn,
+            statements,
+        )
+    }
+
+    fn ceil_div(len: usize) -> usize {
+        len.div_ceil(CHUNK)
+    }
+
+    #[tokio::test]
+    async fn chunk_boundaries_round_trip_within_the_round_trip_budget() {
+        let (repo, _conn, statements) = spied_repo().await;
+        let sizes = [0, 1, CHUNK - 1, CHUNK, CHUNK + 1];
+        let deltas = [None, Some(1), Some(CHUNK), Some(CHUNK + 1)];
+        for (index, len) in sizes.into_iter().enumerate() {
+            for (delta_index, delta) in deltas.into_iter().enumerate() {
+                let name = format!("db-{index}-{delta_index}");
+                let payload = bytes(len, 1);
+                repo.save(
+                    "sql",
+                    "space",
+                    &name,
+                    payload.clone(),
+                    ArtifactExpectation::Any,
+                )
+                .await
+                .unwrap();
+                let wal = delta.map(|len| bytes(len, 2));
+                if let Some(wal) = &wal {
+                    repo.save_delta("sql", "space", &name, wal.clone(), ArtifactExpectation::Any)
+                        .await
+                        .unwrap();
+                }
+
+                statements.lock().unwrap().clear();
+                let mut sink = MemorySink::default();
+                let meta = read_artifact(&repo, "sql", "space", &name, &mut sink)
+                    .await
+                    .unwrap()
+                    .expect("the artifact exists");
+                assert_eq!(sink.checkpoint, payload, "{name}: checkpoint");
+                assert_eq!(sink.wal, wal, "{name}: wal");
+                assert_eq!(meta.has_delta(), wal.is_some(), "{name}");
+
+                // Every statement is a retryable read: a lost connection costs
+                // one slice's retry, not the hydration.
+                for sql in statements.lock().unwrap().iter() {
+                    assert!(crate::db_pool::is_read_only_statement(sql), "{sql}");
+                }
+                // One metadata statement, then one per slice of each part; an
+                // artifact within the base-timeout budget is one slice a part.
+                let total = len + delta.unwrap_or(0);
+                let parts = |part: usize| {
+                    if total <= BASE_TIMEOUT_PAYLOAD_BYTES {
+                        usize::from(part > 0)
+                    } else {
+                        ceil_div(part)
+                    }
+                };
+                let expected = 1 + parts(len) + delta.map_or(0, parts);
+                assert_eq!(
+                    statements.lock().unwrap().len(),
+                    expected,
+                    "{name}: round trips for {len} + {delta:?} bytes"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_and_absence_never_select_payload_columns() {
+        let (repo, _conn, statements) = spied_repo().await;
+        repo.save(
+            "sql",
+            "space",
+            "main",
+            bytes(CHUNK + 5, 3),
+            ArtifactExpectation::Any,
+        )
+        .await
+        .unwrap();
+        repo.save_delta(
+            "sql",
+            "space",
+            "main",
+            bytes(9, 4),
+            ArtifactExpectation::Any,
+        )
+        .await
+        .unwrap();
+
+        statements.lock().unwrap().clear();
+        let meta = repo
+            .load_meta("sql", "space", "main")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(meta.revision, 2);
+        assert_eq!(meta.checkpoint_size_bytes, (CHUNK + 5) as i64);
+        assert_eq!(meta.delta_size_bytes, 9);
+        assert_eq!(meta.size_bytes, (CHUNK + 14) as i64);
+        assert_eq!(meta.storage_mode, "checkpoint+wal");
+        assert!(repo
+            .load_meta("sql", "space", "absent")
+            .await
+            .unwrap()
+            .is_none());
+
+        let seen = statements.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert!(
+            seen.iter().all(|sql| !sql.contains("payload")),
+            "a metadata read must not touch payload columns: {seen:?}"
+        );
+
+        // Reading an absent artifact through the streaming helper stops at the
+        // metadata too.
+        statements.lock().unwrap().clear();
+        let mut sink = MemorySink::default();
+        assert!(read_artifact(&repo, "sql", "space", "absent", &mut sink)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(statements.lock().unwrap().len(), 1);
+    }
+
+    /// Disturbs the row once per attempt, right after the first slice landed,
+    /// the way a concurrent save would between two slice statements.
+    struct RaceSink<'a> {
+        inner: MemorySink,
+        repo: &'a SeaOrmDatabaseArtifactRepository,
+        disturbances_left: usize,
+        disturbed_this_attempt: bool,
+        disturb: Disturb,
+        attempts: usize,
+    }
+
+    #[async_trait]
+    impl ArtifactSink for RaceSink<'_> {
+        async fn reset(&mut self) -> Result<(), DatabaseArtifactError> {
+            self.attempts += 1;
+            self.disturbed_this_attempt = false;
+            self.inner.reset().await
+        }
+        async fn begin_part(&mut self, part: ArtifactPart) -> Result<(), DatabaseArtifactError> {
+            self.inner.begin_part(part).await
+        }
+        async fn write(&mut self, bytes: &[u8]) -> Result<(), DatabaseArtifactError> {
+            self.inner.write(bytes).await?;
+            if self.disturbances_left > 0 && !self.disturbed_this_attempt {
+                self.disturbed_this_attempt = true;
+                self.disturbances_left -= 1;
+                let (checkpoint, wal) = (self.disturb)(self.disturbances_left);
+                self.repo
+                    .save("sql", "space", "main", checkpoint, ArtifactExpectation::Any)
+                    .await
+                    .unwrap();
+                if let Some(wal) = wal {
+                    self.repo
+                        .save_delta("sql", "space", "main", wal, ArtifactExpectation::Any)
+                        .await
+                        .unwrap();
+                }
+            }
+            Ok(())
+        }
+        async fn finish_part(&mut self) -> Result<(), DatabaseArtifactError> {
+            self.inner.finish_part().await
+        }
+    }
+
+    fn race_sink(
+        repo: &SeaOrmDatabaseArtifactRepository,
+        disturbances: usize,
+        disturb: Disturb,
+    ) -> RaceSink<'_> {
+        RaceSink {
+            inner: MemorySink::default(),
+            repo,
+            disturbances_left: disturbances,
+            disturbed_this_attempt: false,
+            disturb,
+            attempts: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_row_replaced_mid_read_restarts_and_never_mixes_revisions() {
+        let (repo, _conn, _) = spied_repo().await;
+        repo.save(
+            "sql",
+            "space",
+            "main",
+            bytes(2 * CHUNK + 7, 1),
+            ArtifactExpectation::Any,
+        )
+        .await
+        .unwrap();
+        let replacement = bytes(CHUNK + 3, 9);
+        let wal = bytes(11, 8);
+
+        let mut sink = race_sink(&repo, 1, |_| (bytes(CHUNK + 3, 9), Some(bytes(11, 8))));
+        let meta = read_artifact(&repo, "sql", "space", "main", &mut sink)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sink.attempts, 2, "one restart");
+        assert_eq!(meta.revision, 3, "save, save, then the WAL delta");
+        assert_eq!(sink.inner.checkpoint, replacement, "only the new revision");
+        assert_eq!(sink.inner.wal, Some(wal));
+    }
+
+    #[tokio::test]
+    async fn a_wal_only_change_mid_read_also_restarts() {
+        let (repo, _conn, _) = spied_repo().await;
+        repo.save(
+            "sql",
+            "space",
+            "main",
+            bytes(2 * CHUNK + 1, 1),
+            ArtifactExpectation::Any,
+        )
+        .await
+        .unwrap();
+        repo.save_delta(
+            "sql",
+            "space",
+            "main",
+            bytes(5, 2),
+            ArtifactExpectation::Any,
+        )
+        .await
+        .unwrap();
+
+        // The checkpoint hash is untouched by a delta, so the revision guard
+        // is what catches this.
+        struct DeltaRace<'a>(RaceSink<'a>, bool);
+        #[async_trait]
+        impl ArtifactSink for DeltaRace<'_> {
+            async fn reset(&mut self) -> Result<(), DatabaseArtifactError> {
+                self.0.reset().await
+            }
+            async fn begin_part(
+                &mut self,
+                part: ArtifactPart,
+            ) -> Result<(), DatabaseArtifactError> {
+                self.0.begin_part(part).await
+            }
+            async fn write(&mut self, bytes: &[u8]) -> Result<(), DatabaseArtifactError> {
+                self.0.inner.write(bytes).await?;
+                if !self.1 {
+                    self.1 = true;
+                    self.0
+                        .repo
+                        .save_delta("sql", "space", "main", vec![7; 6], ArtifactExpectation::Any)
+                        .await
+                        .unwrap();
+                }
+                Ok(())
+            }
+            async fn finish_part(&mut self) -> Result<(), DatabaseArtifactError> {
+                self.0.finish_part().await
+            }
+        }
+        let mut sink = DeltaRace(race_sink(&repo, 0, |_| unreachable!()), false);
+        let meta = read_artifact(&repo, "sql", "space", "main", &mut sink)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(meta.revision, 3);
+        assert_eq!(sink.0.attempts, 2);
+        assert_eq!(sink.0.inner.wal, Some(vec![7; 6]));
+        assert_eq!(sink.0.inner.checkpoint, bytes(2 * CHUNK + 1, 1));
+    }
+
+    #[tokio::test]
+    async fn a_row_that_keeps_changing_gives_up_after_the_retries() {
+        let (repo, _conn, _) = spied_repo().await;
+        repo.save(
+            "sql",
+            "space",
+            "main",
+            bytes(2 * CHUNK + 1, 1),
+            ArtifactExpectation::Any,
+        )
+        .await
+        .unwrap();
+        let mut sink = race_sink(&repo, 10, |left| (bytes(2 * CHUNK + 1, left as u8), None));
+        let error = read_artifact(&repo, "sql", "space", "main", &mut sink)
+            .await
+            .expect_err("every attempt is overtaken");
+        assert!(
+            matches!(error, DatabaseArtifactError::ArtifactChanged),
+            "{error:?}"
+        );
+        assert_eq!(sink.attempts, 1 + ARTIFACT_READ_RETRIES);
+    }
+
+    fn dir_names(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn cache_sink(dir: &std::path::Path) -> CacheFileSink {
+        CacheFileSink::new(
+            "sql",
+            "space/main".to_string(),
+            dir.join("main.db"),
+            dir.join("main.db-wal"),
+            |_| true,
+            |_| true,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_cache_file_is_never_seeded_from_a_mixed_read() {
+        let (repo, _conn, _) = spied_repo().await;
+        repo.save(
+            "sql",
+            "space",
+            "main",
+            bytes(2 * CHUNK + 7, 1),
+            ArtifactExpectation::Any,
+        )
+        .await
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut files = cache_sink(dir.path());
+
+        // Overtaken after the first slice of the old checkpoint reached the
+        // temp file; the restart must rewrite it from the new revision.
+        struct Overtaken<'a>(
+            &'a mut CacheFileSink,
+            &'a SeaOrmDatabaseArtifactRepository,
+            bool,
+        );
+        #[async_trait]
+        impl ArtifactSink for Overtaken<'_> {
+            async fn reset(&mut self) -> Result<(), DatabaseArtifactError> {
+                self.0.reset().await
+            }
+            async fn begin_part(
+                &mut self,
+                part: ArtifactPart,
+            ) -> Result<(), DatabaseArtifactError> {
+                self.0.begin_part(part).await
+            }
+            async fn write(&mut self, bytes: &[u8]) -> Result<(), DatabaseArtifactError> {
+                self.0.write(bytes).await?;
+                if !self.2 {
+                    self.2 = true;
+                    self.1
+                        .save(
+                            "sql",
+                            "space",
+                            "main",
+                            vec![5; CHUNK + 2],
+                            ArtifactExpectation::Any,
+                        )
+                        .await
+                        .unwrap();
+                }
+                Ok(())
+            }
+            async fn finish_part(&mut self) -> Result<(), DatabaseArtifactError> {
+                self.0.finish_part().await
+            }
+        }
+        read_artifact(
+            &repo,
+            "sql",
+            "space",
+            "main",
+            &mut Overtaken(&mut files, &repo, false),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            dir_names(dir.path())
+                .iter()
+                .all(|name| name.contains(".tmp.")),
+            "nothing is published before commit: {:?}",
+            dir_names(dir.path())
+        );
+        files.commit().await.unwrap();
+        assert_eq!(dir_names(dir.path()), ["main.db"]);
+        assert_eq!(
+            std::fs::read(dir.path().join("main.db")).unwrap(),
+            vec![5; CHUNK + 2]
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_artifact_bytes_are_rejected_and_nothing_is_seeded() {
+        let (repo, conn, _) = spied_repo().await;
+        let len = CHUNK + 10;
+        repo.save(
+            "sql",
+            "space",
+            "main",
+            bytes(len, 1),
+            ArtifactExpectation::Any,
+        )
+        .await
+        .unwrap();
+        repo.save_delta(
+            "sql",
+            "space",
+            "main",
+            bytes(20, 2),
+            ArtifactExpectation::Any,
+        )
+        .await
+        .unwrap();
+
+        for (what, sql, part) in [
+            (
+                "checkpoint flipped, same length",
+                format!("UPDATE database_artifact SET payload = zeroblob({len})"),
+                "checkpoint",
+            ),
+            (
+                "wal flipped, same length",
+                "UPDATE database_artifact SET delta_payload = zeroblob(20)".to_string(),
+                "wal",
+            ),
+        ] {
+            // Restore a good row before each corruption.
+            repo.save(
+                "sql",
+                "space",
+                "main",
+                bytes(len, 1),
+                ArtifactExpectation::Any,
+            )
+            .await
+            .unwrap();
+            repo.save_delta(
+                "sql",
+                "space",
+                "main",
+                bytes(20, 2),
+                ArtifactExpectation::Any,
+            )
+            .await
+            .unwrap();
+            conn.execute_unprepared(&sql).await.unwrap();
+
+            let dir = tempfile::tempdir().unwrap();
+            let mut sink = cache_sink(dir.path());
+            let error = read_artifact(&repo, "sql", "space", "main", &mut sink)
+                .await
+                .expect_err(what);
+            assert!(
+                matches!(&error, DatabaseArtifactError::HashMismatch { part: got } if *got == part),
+                "{what}: {error:?}"
+            );
+            drop(sink);
+            assert_eq!(
+                dir_names(dir.path()),
+                Vec::<String>::new(),
+                "{what}: nothing left behind"
+            );
+        }
+
+        // A stored size that disagrees with the bytes is refused too.
+        repo.save(
+            "sql",
+            "space",
+            "main",
+            bytes(len, 1),
+            ArtifactExpectation::Any,
+        )
+        .await
+        .unwrap();
+        conn.execute_unprepared("UPDATE database_artifact SET payload = zeroblob(10)")
+            .await
+            .unwrap();
+        let error = read_artifact(&repo, "sql", "space", "main", &mut MemorySink::default())
+            .await
+            .expect_err("short payload");
+        assert!(
+            matches!(error, DatabaseArtifactError::SizeMismatch { .. }),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_cache_sink_checks_the_leading_bytes_of_each_part() {
+        let (repo, _conn, _) = spied_repo().await;
+        repo.save(
+            "sql",
+            "space",
+            "main",
+            b"MAGIC-body".to_vec(),
+            ArtifactExpectation::Any,
+        )
+        .await
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut sink = CacheFileSink::new(
+            "sql",
+            "space/main".to_string(),
+            dir.path().join("main.db"),
+            dir.path().join("main.db-wal"),
+            |head| head.starts_with(b"OTHER"),
+            |_| true,
+        );
+        let error = read_artifact(&repo, "sql", "space", "main", &mut sink)
+            .await
+            .expect_err("wrong header");
+        assert!(
+            error.to_string().contains("expected file header"),
+            "{error}"
+        );
+        drop(sink);
+        assert!(dir_names(dir.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn postgres_slices_round_trip_at_chunk_boundaries_and_detect_changes() {
+        let Some(fixture) = crate::test_support::PostgresTestSchema::migrated_through(
+            "postgres_slices_round_trip_at_chunk_boundaries_and_detect_changes",
+            None,
+        )
+        .await
+        else {
+            return;
+        };
+        let repo = SeaOrmDatabaseArtifactRepository::new(fixture.conn.clone());
+        for (index, len) in [0, 1, CHUNK - 1, CHUNK, CHUNK + 1].into_iter().enumerate() {
+            for (delta_index, delta) in [None, Some(1), Some(CHUNK + 1)].into_iter().enumerate() {
+                let name = format!("db-{index}-{delta_index}");
+                let payload = bytes(len, 1);
+                repo.save(
+                    "sql",
+                    "space",
+                    &name,
+                    payload.clone(),
+                    ArtifactExpectation::Any,
+                )
+                .await
+                .unwrap();
+                let wal = delta.map(|len| bytes(len, 2));
+                if let Some(wal) = &wal {
+                    repo.save_delta("sql", "space", &name, wal.clone(), ArtifactExpectation::Any)
+                        .await
+                        .unwrap();
+                }
+                let mut sink = MemorySink::default();
+                read_artifact(&repo, "sql", "space", &name, &mut sink)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(sink.checkpoint, payload, "{name}: checkpoint");
+                assert_eq!(sink.wal, wal, "{name}: wal");
+            }
+        }
+
+        // Mid-read replacement restarts on Postgres too.
+        repo.save(
+            "sql",
+            "space",
+            "main",
+            bytes(2 * CHUNK + 7, 1),
+            ArtifactExpectation::Any,
+        )
+        .await
+        .unwrap();
+        let mut sink = race_sink(&repo, 1, |_| (bytes(CHUNK + 3, 9), None));
+        read_artifact(&repo, "sql", "space", "main", &mut sink)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sink.attempts, 2);
+        assert_eq!(sink.inner.checkpoint, bytes(CHUNK + 3, 9));
+
+        // And so does corruption.
+        fixture
+            .conn
+            .execute_unprepared("UPDATE database_artifact SET payload = decode(repeat('00', 8), 'hex') || substr(payload, 9) WHERE name = 'main'")
+            .await
+            .unwrap();
+        let error = read_artifact(&repo, "sql", "space", "main", &mut MemorySink::default())
+            .await
+            .expect_err("corrupt");
+        assert!(
+            matches!(error, DatabaseArtifactError::HashMismatch { .. }),
+            "{error:?}"
         );
     }
 }
