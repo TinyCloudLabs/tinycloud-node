@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [1.21.7] - 2026-10-21
+
+### Release notes
+
+- **Database connection pool of 10.** The production compose sets `TINYCLOUD_DATABASE__MAX_CONNECTIONS` to 10 (was 15), so two containers that overlap during a deploy fit within the database instance's 25 connections. The compose hash changes. No database migrations. Details: TC-950.
+
 ### Changes
 
 - The storage usage read (`tinycloud.space/info`) returns `manageUrl` `https://account.tinycloud.xyz/storage`, the account storage page, for "Manage storage". Details: TC-848.
