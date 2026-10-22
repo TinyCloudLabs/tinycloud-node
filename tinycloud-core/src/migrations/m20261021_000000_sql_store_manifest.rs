@@ -132,6 +132,7 @@ mod tests {
 
     /// Applies pending migrations up to and including this one, never later ones.
     /// `Migrator::up(_, Some(n))` counts pending migrations, not positions.
+    // On a fresh DB, get_pending_migrations returns the whole registered list; up_through applies only up to VERSION.
     async fn up_through(conn: &sea_orm::DatabaseConnection) {
         let pending = Migrator::get_pending_migrations(conn).await.unwrap();
         let steps = pending

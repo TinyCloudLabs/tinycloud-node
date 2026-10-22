@@ -72,18 +72,24 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        manager
-            .alter_table(
-                Table::alter()
-                    .table(encryption_audit::Entity)
-                    .add_column(
-                        ColumnDef::new(encryption_audit::Column::KeyPath)
-                            .string()
-                            .null(),
-                    )
-                    .to_owned(),
-            )
-            .await
+        // Re-running this migration after its `seaql_migrations` row was removed
+        // (without `down`) must not fail on the column that already exists.
+        if !manager.has_column("encryption_audit", "key_path").await? {
+            manager
+                .alter_table(
+                    Table::alter()
+                        .table(encryption_audit::Entity)
+                        .add_column(
+                            ColumnDef::new(encryption_audit::Column::KeyPath)
+                                .string()
+                                .null(),
+                        )
+                        .to_owned(),
+                )
+                .await?;
+        }
+
+        Ok(())
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
@@ -226,5 +232,87 @@ mod tests {
             .expect("query")
             .expect("row present");
         assert_eq!(row.key_path, None);
+    }
+
+    /// Removes only the migration record, as the rollback instruction does, then
+    /// re-runs migrations without `down` and checks the schema accepts new rows.
+    async fn assert_reapplies_after_record_removed(db: &DatabaseConnection) {
+        db.execute(Statement::from_string(
+            db.get_database_backend(),
+            "DELETE FROM seaql_migrations WHERE version = 'm20261022_000000_encryption_network_key'"
+                .to_string(),
+        ))
+        .await
+        .expect("remove migration record");
+        Migrator::up(db, None).await.expect("re-apply without down");
+        db.execute(Statement::from_string(
+            db.get_database_backend(),
+            "INSERT INTO encryption_audit (request_hash, requester, network_id, node_id, outcome, decided_at) \
+             VALUES ('h2', 'did:key:z6MkRequester', 'default', 'did:key:z6MkNode', 'allowed', '2026-10-22T00:00:00Z')"
+                .to_string(),
+        ))
+        .await
+        .expect("audit insert without key_path after re-apply");
+        key_row("net", "apps/app-one/key")
+            .insert(db)
+            .await
+            .expect("key row insert after re-apply");
+    }
+
+    #[tokio::test]
+    async fn reapplies_after_migration_record_is_removed_without_down() {
+        let db = fresh_db().await;
+        assert_reapplies_after_record_removed(&db).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_reapplies_after_migration_record_is_removed_without_down() {
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_reapplies_after_migration_record_is_removed_without_down",
+        )
+        .await
+        else {
+            return;
+        };
+        assert_reapplies_after_record_removed(&fixture.conn).await;
+    }
+
+    #[tokio::test]
+    async fn up_is_a_no_op_when_table_and_column_already_exist() {
+        let db = fresh_db().await;
+        key_row("net", "apps/app-one/key")
+            .insert(&db)
+            .await
+            .expect("insert key row");
+        db.execute(Statement::from_string(
+            DbBackend::Sqlite,
+            "INSERT INTO encryption_audit (request_hash, requester, network_id, node_id, outcome, decided_at, key_path) \
+             VALUES ('h3', 'did:key:z6MkRequester', 'default', 'did:key:z6MkNode', 'allowed', '2026-10-22T00:00:00Z', 'apps/app-one/key')"
+                .to_string(),
+        ))
+        .await
+        .expect("insert audit row with key_path");
+
+        let manager = SchemaManager::new(&db);
+        Migration
+            .up(&manager)
+            .await
+            .expect("up is a no-op over existing table and column");
+
+        let key = encryption_network_key::Entity::find_by_id((
+            "net".to_string(),
+            "apps/app-one/key".to_string(),
+        ))
+        .one(&db)
+        .await
+        .expect("query")
+        .expect("key row survives");
+        assert_eq!(key.kind, "deterministic");
+        let audit = encryption_audit::Entity::find_by_id("h3".to_string())
+            .one(&db)
+            .await
+            .expect("query")
+            .expect("audit row survives");
+        assert_eq!(audit.key_path, Some("apps/app-one/key".to_string()));
     }
 }
