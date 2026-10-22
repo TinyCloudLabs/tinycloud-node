@@ -1322,6 +1322,35 @@ mod tests {
         assert_unsupported_caveat(validate(&db, &info).await);
     }
 
+    /// TC-1791: a caveat array of an empty object and a profile is refused,
+    /// because the empty object at index 0 is not a profile.
+    #[tokio::test]
+    async fn sql_delegation_with_empty_object_beside_profile_is_refused() {
+        let db = database().await;
+        let mut info = root_delegation_info(
+            "tinycloud.sql/read",
+            "files/sql/main",
+            serde_json::json!({}),
+        );
+        info.capabilities[0].caveats = crate::types::Caveats(std::collections::BTreeMap::from([
+            ("0".to_string(), serde_json::json!({})),
+            ("1".to_string(), constrained_profile()),
+        ]));
+        assert_unsupported_caveat(validate(&db, &info).await);
+    }
+
+    /// TC-1791: the SQL caveat rule applies to the admin SQL ability.
+    #[tokio::test]
+    async fn sql_admin_delegation_with_unsupported_caveat_is_refused() {
+        let db = database().await;
+        let info = root_delegation_info(
+            "tinycloud.sql/admin",
+            "files/sql/main",
+            serde_json::json!({"tables": ["a"]}),
+        );
+        assert_unsupported_caveat(validate(&db, &info).await);
+    }
+
     /// TC-1791: a chained (non-owner) SQL delegation with an unsupported caveat
     /// is refused before the parent check runs.
     #[tokio::test]

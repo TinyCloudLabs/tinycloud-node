@@ -5400,7 +5400,6 @@ mod tests {
         let tempdir = TempDir::new()?;
         let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string())).await?;
         let storage = NodeFileSystemConfig::new(tempdir.path()).open().await?;
-        let _persisted = tempdir.keep();
         let tinycloud = TinyCloud::new(
             db.clone().into(),
             Either::B(storage),
@@ -5531,10 +5530,10 @@ mod tests {
         .encode()?;
 
         #[cfg(feature = "duckdb")]
+        let duckdb_cache = TempDir::new()?;
+        #[cfg(feature = "duckdb")]
         let duckdb_service = {
-            let cache = TempDir::new()?;
-            let path = cache.path().to_string_lossy().to_string();
-            let _persisted = cache.keep();
+            let path = duckdb_cache.path().to_string_lossy().to_string();
             let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string())).await?;
             Migrator::up(&db, None).await?;
             let repo = Arc::new(SeaOrmDatabaseArtifactRepository::new(db));
@@ -8549,7 +8548,6 @@ mod tests {
         let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
         let db = Database::connect(crate::sqlite_connect_options(&db_url)).await?;
         let storage = NodeFileSystemConfig::new(tempdir.path()).open().await?;
-        let _persisted = tempdir.keep();
         let tinycloud = TinyCloud::new(
             db.clone().into(),
             Either::B(storage),
