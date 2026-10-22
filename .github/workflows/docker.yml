@@ -93,6 +93,9 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: tinycloudlabs/tinycloud-node
+  # Production dstack OS the tinycloud-node CVM must run (the Phala KMS only releases app keys to this image).
+  PHALA_OS_IMAGE: dstack-0.5.12
+  PHALA_OS_IMAGE_HASH: 8db40cb23008d6213668b5816702d100b37b859a8a5bfd18d938ae3a1b3715bd
 
 jobs:
   rollback-audit:
@@ -513,6 +516,25 @@ jobs:
         # Same SDK generation as phala 1.1.19, isolated from the checkout.
         # Install before any sealed values enter the step environment.
         run: npm install --prefix "$RUNNER_TEMP/phala-env-sync" --no-save --ignore-scripts @phala/cloud@0.2.9
+
+      # Fail closed before any production change if the CVM is not on the pinned production OS.
+      # To fix it, set the OS by hand: `phala api -X PATCH /cvms/<id>/os-image -F os_image_name=dstack-0.5.12`.
+      - name: Require production OS image on the CVM
+        env:
+          PHALA_CLOUD_API_KEY: ${{ secrets.PHALA_CLOUD_API_KEY }}
+        run: |
+          set -euo pipefail
+          if ! cvm="$(phala cvms get tinycloud-node --json 2>/dev/null)"; then
+            echo "::error::Cannot read the OS image of tinycloud-node from Phala"
+            exit 1
+          fi
+          os="$(jq -c '.os' <<<"${cvm}")"
+          if ! jq -e --arg name "${PHALA_OS_IMAGE}" --arg hash "${PHALA_OS_IMAGE_HASH}" \
+            '.is_dev == false and .name == $name and .os_image_hash == $hash' <<<"${os}" >/dev/null; then
+            echo "::error::tinycloud-node is not on the production OS image ${PHALA_OS_IMAGE} (${PHALA_OS_IMAGE_HASH}). Found: ${os}"
+            echo "Set the OS first with PATCH /cvms/<id>/os-image (os_image_name=${PHALA_OS_IMAGE}), then re-run. CI does not change the OS." >&2
+            exit 1
+          fi
 
       - name: Guard production ancestry
         env:
@@ -1044,7 +1066,7 @@ jobs:
           # those responses into Actions logs, even when deployment fails.
           # A failing CLI/update can still have restarted the CVM.
           echo "cvm_mutation_attempted=true" >> "$GITHUB_OUTPUT"
-          if ! phala deploy --cvm-id tinycloud-node -c docker-compose.dstack-postgres.yaml -e .phala-prod.env --no-public-logs --no-public-sysinfo --wait >/dev/null 2>&1; then
+          if ! phala deploy --cvm-id tinycloud-node -c docker-compose.dstack-postgres.yaml -e .phala-prod.env --no-public-logs --no-public-sysinfo --no-dev-os --image "${PHALA_OS_IMAGE}" --wait >/dev/null 2>&1; then
             echo "::error::Phala deployment failed; inspect the private control plane"
             exit 1
           fi
@@ -1055,6 +1077,23 @@ jobs:
       - name: Remove sealed deployment environment
         if: always()
         run: rm -f .phala-prod.env
+
+      # Fail closed if the deploy left the CVM on a different OS image.
+      - name: Verify production OS image after deploy
+        env:
+          PHALA_CLOUD_API_KEY: ${{ secrets.PHALA_CLOUD_API_KEY }}
+        run: |
+          set -euo pipefail
+          if ! cvm="$(phala cvms get tinycloud-node --json 2>/dev/null)"; then
+            echo "::error::Cannot read the OS image of tinycloud-node from Phala after deploy"
+            exit 1
+          fi
+          os="$(jq -c '.os' <<<"${cvm}")"
+          if ! jq -e --arg name "${PHALA_OS_IMAGE}" --arg hash "${PHALA_OS_IMAGE_HASH}" \
+            '.is_dev == false and .name == $name and .os_image_hash == $hash' <<<"${os}" >/dev/null; then
+            echo "::error::tinycloud-node is not on the production OS image ${PHALA_OS_IMAGE} (${PHALA_OS_IMAGE_HASH}) after deploy. Found: ${os}"
+            exit 1
+          fi
 
       # TC-312: prove the deploy actually converged. The image tag matching the
       # crate version is enforced at build time by version-guard, but nothing
