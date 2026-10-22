@@ -179,6 +179,11 @@ pub enum DelegationError {
     /// code from `sql-constrained-statement-caveat.md` containment.
     #[error("child-caveats-not-subset-of-parent: {0}")]
     CaveatsNotContained(String),
+    /// TC-1791: a SQL or DuckDB capability carries a caveat that is neither
+    /// empty nor a constrained-statements profile. Only those two forms are
+    /// accepted.
+    #[error("unsupported-caveat: {0}")]
+    UnsupportedCaveat(String),
 }
 
 /// Verify, validate, and register a delegation inside the caller's transaction.
@@ -231,11 +236,57 @@ async fn verify(delegation: &TinyCloudDelegation) -> Result<(), Error> {
     Ok(())
 }
 
+// TC-1791: refusal reason for a SQL or DuckDB capability whose caveats are
+// not accepted. SQL accepts empty caveats or, per entry, a
+// constrained-statements profile. DuckDB accepts empty caveats only.
+pub(crate) fn unsupported_sql_caveat(
+    ability: &str,
+    caveats: &crate::types::Caveats,
+) -> Option<String> {
+    if ability.starts_with("tinycloud.duckdb/") {
+        return caveats.0.keys().next().map(|key| {
+            format!("{ability} caveat {key} is not accepted; {ability} accepts empty caveats only")
+        });
+    }
+    if !ability.starts_with("tinycloud.sql/") {
+        return None;
+    }
+    caveats.0.iter().find_map(|(key, value)| {
+        let profile = match value.as_object() {
+            Some(map) if map.contains_key("constrained-statements") => {
+                if map.len() != 1 {
+                    return Some(format!(
+                        "{ability} caveat {key} has keys beside constrained-statements"
+                    ));
+                }
+                &map["constrained-statements"]
+            }
+            _ => value,
+        };
+        sql_caveat::parse(profile)
+            .err()
+            .map(|_| format!("{ability} caveat {key} is not a constrained-statements profile"))
+    })
+}
+
+fn check_sql_caveats_supported(cap: &util::Capability) -> Result<(), Error> {
+    match unsupported_sql_caveat(cap.ability.as_ref().as_ref(), &cap.caveats) {
+        Some(reason) => Err(DelegationError::UnsupportedCaveat(reason).into()),
+        None => Ok(()),
+    }
+}
+
 // verify parenthood and authorization
 async fn validate<C: ConnectionTrait>(
     db: &C,
     delegation: &util::DelegationInfo,
 ) -> Result<(), Error> {
+    // TC-1791: SQL and DuckDB caveats are checked for every delegation,
+    // before the root-authority filter.
+    for cap in &delegation.capabilities {
+        check_sql_caveats_supported(cap)?;
+    }
+
     // get caps which rely on delegated caps
     let dependant_caps: Vec<_> = delegation
         .capabilities
@@ -1208,5 +1259,275 @@ mod tests {
             error,
             Error::InvalidDelegation(DelegationError::ParentRevoked(_))
         ));
+    }
+
+    /// TC-1791: an SQL grant with a caveat outside the
+    /// constrained-statements profile is refused.
+    #[tokio::test]
+    async fn sql_delegation_with_unsupported_caveat_key_is_refused() {
+        let db = database().await;
+        let info = root_delegation_info(
+            "tinycloud.sql/read",
+            "files/sql/main",
+            serde_json::json!({"tables": ["a"]}),
+        );
+        let result = validate(&db, &info).await;
+        assert!(
+            matches!(
+                result,
+                Err(Error::InvalidDelegation(
+                    DelegationError::UnsupportedCaveat(_)
+                ))
+            ),
+            "expected UnsupportedCaveat, got {result:?}"
+        );
+    }
+
+    fn assert_unsupported_caveat(result: Result<(), Error>) {
+        assert!(
+            matches!(
+                result,
+                Err(Error::InvalidDelegation(
+                    DelegationError::UnsupportedCaveat(_)
+                ))
+            ),
+            "expected UnsupportedCaveat, got {result:?}"
+        );
+    }
+
+    /// TC-1791: a constrained-statements entry mixed with other keys is refused.
+    #[tokio::test]
+    async fn sql_delegation_mixing_profile_with_other_keys_is_refused() {
+        let db = database().await;
+        let info = root_delegation_info(
+            "tinycloud.sql/read",
+            "files/sql/main",
+            serde_json::json!({
+                "constrained-statements": constrained_profile(),
+                "tables": ["a"]
+            }),
+        );
+        assert_unsupported_caveat(validate(&db, &info).await);
+    }
+
+    /// TC-1791: the SQL caveat rule applies to the wildcard SQL ability.
+    #[tokio::test]
+    async fn sql_wildcard_delegation_with_unsupported_caveat_is_refused() {
+        let db = database().await;
+        let info = root_delegation_info(
+            "tinycloud.sql/*",
+            "files/sql/main",
+            serde_json::json!({"tables": ["a"]}),
+        );
+        assert_unsupported_caveat(validate(&db, &info).await);
+    }
+
+    /// TC-1791: a caveat array of an empty object and a profile is refused,
+    /// because the empty object at index 0 is not a profile.
+    #[tokio::test]
+    async fn sql_delegation_with_empty_object_beside_profile_is_refused() {
+        let db = database().await;
+        let mut info = root_delegation_info(
+            "tinycloud.sql/read",
+            "files/sql/main",
+            serde_json::json!({}),
+        );
+        info.capabilities[0].caveats = crate::types::Caveats(std::collections::BTreeMap::from([
+            ("0".to_string(), serde_json::json!({})),
+            ("1".to_string(), constrained_profile()),
+        ]));
+        assert_unsupported_caveat(validate(&db, &info).await);
+    }
+
+    /// TC-1791: the SQL caveat rule applies to the admin SQL ability.
+    #[tokio::test]
+    async fn sql_admin_delegation_with_unsupported_caveat_is_refused() {
+        let db = database().await;
+        let info = root_delegation_info(
+            "tinycloud.sql/admin",
+            "files/sql/main",
+            serde_json::json!({"tables": ["a"]}),
+        );
+        assert_unsupported_caveat(validate(&db, &info).await);
+    }
+
+    /// TC-1791: a chained (non-owner) SQL delegation with an unsupported caveat
+    /// is refused before the parent check runs.
+    #[tokio::test]
+    async fn chained_sql_delegation_with_unsupported_caveat_is_refused() {
+        let db = database().await;
+        let mut info = root_delegation_info(
+            "tinycloud.sql/read",
+            "files/sql/main",
+            serde_json::json!({"tables": ["a"]}),
+        );
+        info.delegator = "did:key:z6MkchainedDelegatorNotOwner".to_string();
+        assert_unsupported_caveat(validate(&db, &info).await);
+    }
+
+    /// TC-1791: a chained SQL delegation with a supported profile reaches the
+    /// parent check and is rejected there for missing parents.
+    #[tokio::test]
+    async fn chained_sql_delegation_with_constrained_profile_reaches_parent_check() {
+        let db = database().await;
+        let mut info = root_delegation_info(
+            "tinycloud.sql/read",
+            "files/sql/main",
+            constrained_profile(),
+        );
+        info.delegator = "did:key:z6MkchainedDelegatorNotOwner".to_string();
+        assert!(matches!(
+            validate(&db, &info).await,
+            Err(Error::InvalidDelegation(DelegationError::MissingParents))
+        ));
+    }
+
+    /// TC-1791: DuckDB accepts empty caveats only, so a constrained-statements
+    /// profile is refused.
+    #[tokio::test]
+    async fn duckdb_delegation_with_constrained_profile_is_refused() {
+        let db = database().await;
+        let info = root_delegation_info(
+            "tinycloud.duckdb/read",
+            "files/duckdb/main",
+            constrained_profile(),
+        );
+        assert_unsupported_caveat(validate(&db, &info).await);
+    }
+
+    /// TC-1791: a DuckDB grant without caveats is accepted.
+    #[tokio::test]
+    async fn duckdb_delegation_without_caveats_is_accepted() {
+        let db = database().await;
+        let mut info = root_delegation_info(
+            "tinycloud.duckdb/write",
+            "files/duckdb/main",
+            constrained_profile(),
+        );
+        info.capabilities[0].caveats = crate::types::Caveats(std::collections::BTreeMap::new());
+        validate(&db, &info)
+            .await
+            .expect("a DuckDB grant without caveats is accepted");
+    }
+
+    /// TC-1791: a direct constrained-statements profile is a supported SQL caveat.
+    #[tokio::test]
+    async fn sql_delegation_with_constrained_profile_is_accepted() {
+        let db = database().await;
+        let info = root_delegation_info(
+            "tinycloud.sql/read",
+            "files/sql/main",
+            constrained_profile(),
+        );
+        validate(&db, &info)
+            .await
+            .expect("a constrained-statements profile is accepted");
+    }
+
+    /// TC-1791: a constrained-statements profile nested under its own key is accepted.
+    #[tokio::test]
+    async fn sql_delegation_with_nested_constrained_profile_is_accepted() {
+        let db = database().await;
+        let info = root_delegation_info(
+            "tinycloud.sql/read",
+            "files/sql/main",
+            serde_json::json!({"constrained-statements": constrained_profile()}),
+        );
+        validate(&db, &info)
+            .await
+            .expect("a nested constrained-statements profile is accepted");
+    }
+
+    /// TC-1791: an SQL grant without caveats is not affected by the profile rule.
+    #[tokio::test]
+    async fn sql_delegation_without_caveats_is_accepted() {
+        let db = database().await;
+        let mut info = root_delegation_info(
+            "tinycloud.sql/read",
+            "files/sql/main",
+            constrained_profile(),
+        );
+        info.capabilities[0].caveats = crate::types::Caveats(std::collections::BTreeMap::new());
+        validate(&db, &info)
+            .await
+            .expect("an SQL grant without caveats is accepted");
+    }
+
+    /// TC-1791: DuckDB gets the same refusal as SQL for non-profile caveats.
+    #[tokio::test]
+    async fn duckdb_delegation_with_unsupported_caveat_key_is_refused() {
+        let db = database().await;
+        let info = root_delegation_info(
+            "tinycloud.duckdb/write",
+            "files/duckdb/main",
+            serde_json::json!({"readOnly": true}),
+        );
+        let result = validate(&db, &info).await;
+        assert!(
+            matches!(
+                result,
+                Err(Error::InvalidDelegation(
+                    DelegationError::UnsupportedCaveat(_)
+                ))
+            ),
+            "expected UnsupportedCaveat, got {result:?}"
+        );
+    }
+
+    /// TC-1791: the profile rule is scoped to SQL and DuckDB abilities.
+    #[tokio::test]
+    async fn non_sql_delegation_caveats_are_not_checked_by_sql_rule() {
+        let db = database().await;
+        let info = root_delegation_info(
+            "tinycloud.kv/read",
+            "files/kv/main",
+            serde_json::json!({"tables": ["a"]}),
+        );
+        validate(&db, &info)
+            .await
+            .expect("only SQL and DuckDB caveats are checked by this rule");
+    }
+
+    fn constrained_profile() -> serde_json::Value {
+        serde_json::json!({
+            "mode": "constrained-statements",
+            "readOnly": true,
+            "statements": [{"name": "recent", "sql": "SELECT 1"}]
+        })
+    }
+
+    fn root_delegation_info(
+        ability: &str,
+        path: &str,
+        nb: serde_json::Value,
+    ) -> util::DelegationInfo {
+        use crate::test_support::did_resolution::signed_ucan;
+        use tinycloud_auth::ssi::jwk::{Algorithm, JWK};
+        let delegator = "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
+        let ucan = signed_ucan(
+            delegator,
+            &JWK::generate_ed25519().unwrap(),
+            Algorithm::EdDSA,
+        );
+        util::DelegationInfo {
+            capabilities: vec![util::Capability {
+                resource: format!("tinycloud:{}:{path}", delegator.trim_start_matches("did:"))
+                    .parse()
+                    .unwrap(),
+                ability: ability.to_string().try_into().unwrap(),
+                caveats: crate::types::Caveats(std::collections::BTreeMap::from([(
+                    "0".to_string(),
+                    nb,
+                )])),
+            }],
+            delegator: delegator.to_string(),
+            delegate: "did:key:z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH".to_string(),
+            parents: vec![],
+            delegation: tinycloud_auth::authorization::TinyCloudDelegation::Ucan(Box::new(ucan)),
+            expiry: None,
+            not_before: None,
+            issued_at: None,
+            delegation_mode: util::DelegationMode::Attenuable,
+        }
     }
 }
