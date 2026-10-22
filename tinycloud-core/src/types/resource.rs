@@ -1,4 +1,4 @@
-use crate::encryption_network::NetworkId;
+use crate::encryption_network::key_id;
 use sea_orm::{entity::prelude::*, sea_query::ValueTypeErr};
 use serde::{Deserialize, Serialize};
 use std::{fmt::Display, str::FromStr};
@@ -11,6 +11,13 @@ use tinycloud_auth::resource::{
 };
 
 const ENCRYPTION_NETWORK_PREFIX: &str = "urn:tinycloud:encryption:";
+
+/// Case-insensitive match on the encryption namespace, so uppercase variants
+/// are routed to the strict parser and refused rather than string-compared.
+fn is_encryption_urn(uri: &str) -> bool {
+    uri.get(..ENCRYPTION_NETWORK_PREFIX.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(ENCRYPTION_NETWORK_PREFIX))
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(untagged)]
@@ -31,19 +38,13 @@ impl Resource {
         match (self, other) {
             (Resource::TinyCloud(a), Resource::TinyCloud(b)) => a.extends(b).is_ok(),
             (Resource::Other(a), Resource::Other(b)) => {
-                match (
-                    a.as_str().parse::<NetworkId>(),
-                    b.as_str().parse::<NetworkId>(),
-                ) {
-                    (Ok(a), Ok(b)) => a == b,
-                    (Ok(_), Err(_)) | (Err(_), Ok(_)) => false,
-                    (Err(_), Err(_))
-                        if a.as_str().starts_with(ENCRYPTION_NETWORK_PREFIX)
-                            || b.as_str().starts_with(ENCRYPTION_NETWORK_PREFIX) =>
-                    {
-                        false
+                if is_encryption_urn(a.as_str()) || is_encryption_urn(b.as_str()) {
+                    match (key_id::parse(a.as_str()), key_id::parse(b.as_str())) {
+                        (Ok(a), Ok(b)) => a.extends(&b),
+                        _ => false,
                     }
-                    (Err(_), Err(_)) => a.as_str().starts_with(b.as_str()),
+                } else {
+                    a.as_str().starts_with(b.as_str())
                 }
             }
             _ => false,

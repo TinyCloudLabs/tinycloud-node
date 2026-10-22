@@ -1,5 +1,5 @@
 use super::super::{
-    encryption_network::NetworkId,
+    encryption_network::key_id,
     events::{Invocation, VersionedOperation},
     models::*,
     relationships::*,
@@ -111,6 +111,10 @@ pub enum InvocationError {
     /// not accepted for its ability.
     #[error("unsupported-caveat: {0}")]
     UnsupportedCaveat(String),
+    /// Encryption key prefixes are namespaces and cannot be invoked.
+    /// Code: `encryption-prefix-not-invocable`.
+    #[error("encryption-prefix-not-invocable")]
+    EncryptionPrefixNotInvocable,
 }
 
 pub(crate) async fn process<C: ConnectionTrait>(
@@ -324,6 +328,16 @@ async fn validate_capabilities<C: ConnectionTrait>(
     time: Option<OffsetDateTime>,
     auth_graph: Option<&crate::auth_graph::AuthGraphSnapshot>,
 ) -> Result<(), Error> {
+    // A key prefix names a namespace; it cannot be invoked as a target.
+    if capabilities.iter().any(|cap| {
+        matches!(&cap.resource, Resource::Other(uri) if matches!(
+            key_id::parse(uri.as_str()),
+            Ok(key_id::EncryptionResource::KeyPrefix(_))
+        ))
+    }) {
+        return Err(InvocationError::EncryptionPrefixNotInvocable.into());
+    }
+
     // get caps which rely on delegated caps
     let dependant_caps: Vec<_> = capabilities
         .iter()
@@ -597,11 +611,7 @@ fn is_root_authority(cap: &util::Capability, invoker: &str) -> bool {
     }
 
     match &cap.resource {
-        Resource::Other(uri) => uri
-            .as_str()
-            .parse::<NetworkId>()
-            .map(|network_id| did_principal_matches(network_id.owner_did(), invoker))
-            .unwrap_or(false),
+        Resource::Other(uri) => key_id::owned_by(uri.as_str(), invoker),
         Resource::TinyCloud(_) => false,
     }
 }
@@ -1704,5 +1714,94 @@ mod tests {
         )
         .await
         .expect("an empty-caveat DuckDB grant authorizes");
+    }
+
+    const KEY_OWNER: &str = "did:pkh:eip155:1:0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed";
+    const KEY_OTHER: &str = "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
+
+    async fn empty_db() -> DatabaseConnection {
+        let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
+            .await
+            .unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        db
+    }
+
+    /// The owner invoking a key under its own namespace needs no parents.
+    #[tokio::test]
+    async fn owner_invokes_own_key_without_parents() {
+        let db = empty_db().await;
+        let resource = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/tinychat");
+        let capability = caveat_capability(
+            &resource,
+            "tinycloud.encryption/key.create",
+            Caveats::default(),
+        );
+        crate::models::invocation::authorize_holder(
+            &db,
+            KEY_OWNER,
+            &[capability],
+            &[],
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .expect("owner is root authority for own keys");
+    }
+
+    /// A key prefix names a namespace and is refused as an invocation target,
+    /// including for its owner.
+    #[tokio::test]
+    async fn key_prefix_is_not_invocable_even_by_owner() {
+        let db = empty_db().await;
+        let resource = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/tinychat/");
+        let capability = caveat_capability(
+            &resource,
+            "tinycloud.encryption/key.create",
+            Caveats::default(),
+        );
+        let err = crate::models::invocation::authorize_holder(
+            &db,
+            KEY_OWNER,
+            &[capability],
+            &[],
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                Error::InvalidInvocation(InvocationError::EncryptionPrefixNotInvocable)
+            ),
+            "unexpected rejection: {err:?}"
+        );
+    }
+
+    /// A key invoked by a principal that does not own it must cite parents.
+    #[tokio::test]
+    async fn non_owner_key_invocation_without_parents_is_refused() {
+        let db = empty_db().await;
+        let resource = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/tinychat");
+        let capability = caveat_capability(
+            &resource,
+            "tinycloud.encryption/key.create",
+            Caveats::default(),
+        );
+        let err = crate::models::invocation::authorize_holder(
+            &db,
+            KEY_OTHER,
+            &[capability],
+            &[],
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                Error::InvalidInvocation(InvocationError::MissingParents)
+            ),
+            "unexpected rejection: {err:?}"
+        );
     }
 }
