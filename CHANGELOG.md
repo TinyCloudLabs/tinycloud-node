@@ -5,7 +5,7 @@
 ### Changes
 
 - `docs/releasing.md`: how a compose-only change ships (as a release), and how to read the dense promote watch. Details: TC-950.
-- Database: adds two schema additions for encryption keys (not yet used). Details: TC-1777.
+- Database: adds two schema additions for encryption keys (not yet used). Rolling back to an image without it needs DELETE FROM seaql_migrations WHERE version = 'm20261022_000000_encryption_network_key'; first. Details: TC-1777.
 
 ## [1.21.7] - 2026-10-21
 
