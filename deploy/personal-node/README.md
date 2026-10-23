@@ -24,7 +24,7 @@ bash deploy/personal-node/node.sh start
 bash deploy/personal-node/node.sh check-version 1.22.0
 ```
 
-Replace `node.example.com` with the domain you own. `init` writes a unique 48-byte random Static root to a `0600` private `node.env`; it is never echoed. The profile mounts a keyless TOML over the config bundled in the image. The 1.22.0 image's own default configuration contains no key; the 1.20.6 image used in the upgrade rehearsal embeds a sample key, which the mount masks. With the mount, both images **fail** if the installation root is absent; CI exercises the mounted profile and does not start a bare image without the mount. `check-missing-key` must run before `start`; it requires the node's exact `Missing secret` diagnostic and rejects unrelated failures without printing their logs. Caddy obtains and renews a public certificate; do not bypass its trust verification.
+Replace `node.example.com` with the domain you own. `init` writes a unique 48-byte random Static root to a `0600` private `node.env`; it is never echoed. The profile mounts a keyless TOML over the config bundled in the image. The 1.22.0 image's own default configuration contains no key; the 1.20.6 image used in the upgrade rehearsal embeds a sample key, which the mount masks. With the mount, both images **fail** if the installation root is absent. CI also starts the bare 1.22.0 image with no mount, key or environment and requires the same failure (`check-bare-image-missing-key`); the bare 1.20.6 image still embeds the sample key and is never run bare. `check-missing-key` must run before `start`; it requires the node's exact `Missing secret` diagnostic and rejects unrelated failures without printing their logs. Caddy obtains and renews a public certificate; do not bypass its trust verification.
 
 The 1.20.6 and 1.22.0 config loaders accept both the legacy single-underscore nesting (`TINYCLOUD_KEYS_TYPE`, `TINYCLOUD_STORAGE_DATADIR`) and canonical double-underscore nesting (`TINYCLOUD_KEYS__TYPE`, `TINYCLOUD_STORAGE__DATADIR`). They merge canonical values last when both are set. This profile uses the canonical form; the existing dstack Compose retains its working single-underscore key-type setting.
 
@@ -63,7 +63,7 @@ Use a fresh host/directory, not two live nodes serving the same identity and dom
 
 ## Upgrade and rollback rehearsal
 
-CI executes [`ci.sh`](ci.sh) on a clean runner: a fresh 1.22.0 installation with missing-key denial, an unrelated-failure negative control, signed data and restart; then 1.20.6 → 1.22.0, with data checks before and after restart, fresh-volume restores, and rollback by restoring the **pre-upgrade** snapshot into another fresh instance on 1.20.6. An in-place downgrade of a migrated database is not supported. A normal new installation starts directly on 1.22.0; do not install 1.20.6 except to rehearse this upgrade.
+CI executes [`ci.sh`](ci.sh) on a clean runner: a fresh 1.22.0 installation with missing-key denial, an unrelated-failure negative control, the bare 1.22.0 image's missing-key failure, signed data and restart; then 1.20.6 → 1.22.0, with data checks before and after restart, fresh-volume restores, and rollback by restoring the **pre-upgrade** snapshot into another fresh instance on 1.20.6. An in-place downgrade of a migrated database is not supported. A normal new installation starts directly on 1.22.0; do not install 1.20.6 except to rehearse this upgrade.
 
 ```bash
 # Run only on a disposable isolated runner with permission to create Docker

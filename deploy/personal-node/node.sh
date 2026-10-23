@@ -65,6 +65,17 @@ identity() {
   [[ -s "$home/current-identity" ]] || fail 'Node identity is unavailable'
 }
 
+# Accept only exit 1 plus the node's own complete `  Missing secret` line.
+# Other diagnostics are never echoed.
+require_missing_secret() {
+  local status="$1" file="$2" line missing=0
+  while IFS= read -r line; do
+    if [[ "$line" == '  Missing secret' ]]; then missing=1; fi
+  done < "$file"
+  [[ "$status" == 1 && "$missing" == 1 ]] ||
+    fail 'Missing-key check did not report the exact missing-secret error'
+}
+
 case "${1:-}" in
   init)
     [[ $# -ge 2 ]] || fail 'Usage: node.sh init DOMAIN [test] [1.20.6]'
@@ -89,13 +100,18 @@ case "${1:-}" in
     printf 'TINYCLOUD_KEYS__TYPE=Static\n' > "$blank"
     status=0
     NODE_KEY_ENV_FILE="$blank" timeout 30 "$0" compose-check >"$diagnostic" 2>&1 || status=$?
-    missing=0
-    while IFS= read -r line; do
-      if [[ "$line" == '  Missing secret' ]]; then missing=1; fi
-    done < "$diagnostic"
-    [[ "$status" == 1 && "$missing" == 1 ]] ||
-      fail 'Missing-key check did not report the exact missing-secret error'
+    require_missing_secret "$status" "$diagnostic"
     printf '%s\n' 'Missing-key startup failed as required'
+    ;;
+  check-bare-image-missing-key)
+    # The published image started as shipped: no mounted config, no key, no
+    # environment. Its own default configuration must refuse to start.
+    diagnostic="$(mktemp)"
+    trap 'rm -f "$diagnostic"' EXIT
+    status=0
+    timeout 60 docker run --rm "$image_1220" >"$diagnostic" 2>&1 || status=$?
+    require_missing_secret "$status" "$diagnostic"
+    printf '%s\n' 'Bare image startup without a key failed as required'
     ;;
   compose-check)
     compose run --rm --no-deps node
@@ -168,5 +184,5 @@ case "${1:-}" in
     [[ "$(<"$home/tls-mode")" == test && "$(basename "$home")" == tc1282-* ]] || fail 'Only tc1282 test instances may be removed'
     compose down -v
     ;;
-  *) fail 'Usage: node.sh {init|check-missing-key|start|check-version|seed|verify|restart|stop|backup|restore|upgrade|destroy-test}' ;;
+  *) fail 'Usage: node.sh {init|check-missing-key|check-bare-image-missing-key|start|check-version|seed|verify|restart|stop|backup|restore|upgrade|destroy-test}' ;;
 esac

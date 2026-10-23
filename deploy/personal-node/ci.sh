@@ -34,6 +34,7 @@ fi
 printf '%s\n' "$saved_image" > "$NODE_HOME/image"
 "$here/node.sh" start
 "$here/node.sh" check-version 1.22.0
+"$here/node.sh" check-bare-image-missing-key
 "$here/node.sh" seed "$owner"
 "$here/node.sh" restart
 "$here/node.sh" verify "$owner"
