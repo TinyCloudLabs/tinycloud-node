@@ -33,17 +33,17 @@ if "$here/node.sh" check-missing-key; then
 fi
 printf '%s\n' "$saved_image" > "$NODE_HOME/image"
 "$here/node.sh" start
-"$here/node.sh" check-version 1.20.6
+"$here/node.sh" check-version 1.22.0
 "$here/node.sh" seed "$owner"
 "$here/node.sh" restart
 "$here/node.sh" verify "$owner"
 "$here/node.sh" stop
 
 export NODE_HOME="$work/tc1282-a"
-"$here/node.sh" init localhost test 1.20.5
+"$here/node.sh" init localhost test 1.20.6
 "$here/node.sh" check-missing-key
 "$here/node.sh" start
-"$here/node.sh" check-version 1.20.5
+"$here/node.sh" check-version 1.20.6
 "$here/node.sh" seed "$owner"
 "$here/node.sh" restart
 "$here/node.sh" verify "$owner"
@@ -53,10 +53,10 @@ export NODE_HOME="$work/tc1282-a"
 export NODE_HOME="$work/tc1282-b"
 "$here/node.sh" restore "$work/pre-upgrade" "$passphrase"
 "$here/node.sh" start
-"$here/node.sh" check-version 1.20.5
+"$here/node.sh" check-version 1.20.6
 "$here/node.sh" verify "$owner"
 "$here/node.sh" upgrade
-"$here/node.sh" check-version 1.20.6
+"$here/node.sh" check-version 1.22.0
 "$here/node.sh" verify "$owner"
 "$here/node.sh" backup "$work/post-upgrade" "$passphrase"
 "$here/node.sh" stop
@@ -64,16 +64,17 @@ export NODE_HOME="$work/tc1282-b"
 export NODE_HOME="$work/tc1282-c"
 "$here/node.sh" restore "$work/post-upgrade" "$passphrase"
 "$here/node.sh" start
-"$here/node.sh" check-version 1.20.6
+"$here/node.sh" check-version 1.22.0
 "$here/node.sh" verify "$owner"
 "$here/node.sh" stop
 
 # Rollback is a restore from the pre-upgrade snapshot, not an in-place
-# downgrade of a migrated database.
+# downgrade of a migrated database: the upgrade applies database migrations
+# that 1.20.6 does not know.
 export NODE_HOME="$work/tc1282-d"
 "$here/node.sh" restore "$work/pre-upgrade" "$passphrase"
 "$here/node.sh" start
-"$here/node.sh" check-version 1.20.5
+"$here/node.sh" check-version 1.20.6
 "$here/node.sh" verify "$owner"
 "$here/node.sh" stop
 printf '%s\n' 'Personal-node lifecycle passed: TLS, signed KV/SQL, restart, fresh restore, upgrade, rollback restore'

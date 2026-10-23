@@ -4,8 +4,9 @@ umask 077
 
 here="$(cd "$(dirname "$0")" && pwd)"
 home="$(realpath -m "${NODE_HOME:-./personal-node}")"
+image_1220='ghcr.io/tinycloudlabs/tinycloud-node@sha256:2f3c65d85aa94610456bf09cd54713bab5260097bb3d56858025bc6eadb5a4a0'
+# The previous published image, used only to rehearse the upgrade.
 image_1206='ghcr.io/tinycloudlabs/tinycloud-node@sha256:41667d3d133aaa12290a2f3a744afacd838988327552d159c60f04466e66f86f'
-image_1205='ghcr.io/tinycloudlabs/tinycloud-node@sha256:eba68094f922b8d377d4439bfa14e7d12b875de0155f03810cf6b5d4cb3b1ab7'
 
 fail() { printf '%s\n' "$*" >&2; exit 1; }
 require_home() { [[ -f "$home/node.env" && -f "$home/image" && -f "$home/domain" ]] || fail 'Initialize or restore the node first'; }
@@ -66,16 +67,16 @@ identity() {
 
 case "${1:-}" in
   init)
-    [[ $# -ge 2 ]] || fail 'Usage: node.sh init DOMAIN [test] [1.20.5]'
+    [[ $# -ge 2 ]] || fail 'Usage: node.sh init DOMAIN [test] [1.20.6]'
     [[ ! -e "$home" ]] || fail 'Choose a fresh NODE_HOME'
     [[ "$2" =~ ^[a-zA-Z0-9.-]+$ ]] || fail 'Invalid domain'
     [[ "${3:-}" == '' || "${3:-}" == test ]] || fail 'TLS mode must be test or omitted'
-    [[ "${4:-}" == '' || "${4:-}" == 1.20.5 ]] || fail 'Only 1.20.5 is supported as the previous image'
+    [[ "${4:-}" == '' || "${4:-}" == 1.20.6 ]] || fail 'Only 1.20.6 is supported as the previous image'
     mkdir -p "$home/data"
     printf '%s\n' "$2" > "$home/domain"
     printf '%s\n' "${3:-production}" > "$home/tls-mode"
-    printf '%s\n' "$image_1206" > "$home/image"
-    if [[ "${4:-}" == 1.20.5 ]]; then printf '%s\n' "$image_1205" > "$home/image"; fi
+    printf '%s\n' "$image_1220" > "$home/image"
+    if [[ "${4:-}" == 1.20.6 ]]; then printf '%s\n' "$image_1206" > "$home/image"; fi
     printf 'TINYCLOUD_KEYS__TYPE=Static\nTINYCLOUD_KEYS__SECRET=%s\n' \
       "$(openssl rand -base64 48 | tr '+/' '-_' | tr -d '=\n')" > "$home/node.env"
     sudo chown -R 1000:1000 "$home/data"
@@ -111,11 +112,11 @@ case "${1:-}" in
     compose stop
     ;;
   check-version)
-    [[ $# == 2 ]] || fail 'Usage: node.sh check-version 1.20.5|1.20.6'
+    [[ $# == 2 ]] || fail 'Usage: node.sh check-version 1.20.6|1.22.0'
     health
     curl -fsS "${ca_args[@]}" "$(url)/version" |
-      jq -e --arg version "$2" '.version == $version and .quota_url == null and .inTEE == false' >/dev/null ||
-      fail 'Unexpected node version, hosted quota, or TEE mode'
+      jq -e --arg version "$2" '.version == $version and .quota_url == null and .inTEE == false and ((.features | index("encryption-named-keys-v1")) == null) and ((.features | index("sql-delegated-caveats-v1")) == null)' >/dev/null ||
+      fail 'Unexpected node version, hosted quota, TEE mode, or enabled named-key/delegated-SQL feature'
     ;;
   verify|seed)
     [[ $# == 2 && -f "$2" ]] || fail "Usage: node.sh $1 OWNER_KEY_FILE"
@@ -157,9 +158,9 @@ case "${1:-}" in
     ;;
   upgrade)
     require_home
-    [[ "$(<"$home/image")" == "$image_1205" ]] || fail 'Upgrade expects the previous published image'
+    [[ "$(<"$home/image")" == "$image_1206" ]] || fail 'Upgrade expects the previous published image'
     compose stop node
-    printf '%s\n' "$image_1206" > "$home/image"
+    printf '%s\n' "$image_1220" > "$home/image"
     compose up -d node
     health
     ;;
