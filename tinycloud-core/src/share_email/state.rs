@@ -95,51 +95,27 @@ impl ProtocolStateRepository {
             consumed_at: Set(Some(timestamp(now)?)),
         };
         let tx = self.conn.begin().await?;
-        let existed = share_invitation_authorization_jti::Entity::find_by_id(&jti)
-            .one(&tx)
-            .await?
-            .is_some();
-        share_invitation_authorization_jti::Entity::insert(model)
-            .on_conflict(
-                OnConflict::column(share_invitation_authorization_jti::Column::Jti)
-                    .do_nothing()
-                    .to_owned(),
-            )
-            .exec(&tx)
-            .await?;
-        if existed {
-            let existing = share_invitation_authorization_jti::Entity::find_by_id(&jti)
-                .one(&tx)
-                .await?
-                .ok_or(StateError::Storage)?;
-            if existing.authorization_digest != authorization_digest.as_str()
-                || existing.binding_json != binding_json
-            {
-                return Err(StateError::Replay);
-            }
-            if existing.consumed_at.is_some() {
-                return Err(StateError::Replay);
-            }
-            if parse_timestamp(&existing.expires_at)? <= now {
-                return Err(StateError::Expired);
-            }
-            tx.commit().await?;
-            return Ok(());
-        }
-        let existing = share_invitation_authorization_jti::Entity::find_by_id(&jti)
-            .one(&tx)
-            .await?
-            .ok_or(StateError::Storage)?;
-        if existing.authorization_digest != authorization_digest.as_str()
-            || existing.binding_json != binding_json
+        match reserve_invitation_authorization_in(
+            &tx,
+            receipt,
+            &jti,
+            model,
+            &binding_json,
+            authorization_digest,
+            now,
+        )
+        .await
         {
-            return Err(StateError::Replay);
+            Ok(()) => {
+                tx.commit().await?;
+                Ok(())
+            }
+            Err(err) => {
+                // Every refusal ends the transaction here; the original error is returned.
+                let _ = tx.rollback().await;
+                Err(err)
+            }
         }
-        if parse_timestamp(&receipt.authorization.expires_at)? <= now {
-            return Err(StateError::Expired);
-        }
-        tx.commit().await?;
-        Ok(())
     }
 
     /// Consume the addressed-authoring JTI in the same durable replay table
@@ -562,6 +538,62 @@ impl ProtocolStateRepository {
         tx.commit().await?;
         Ok(())
     }
+}
+
+/// Runs the reservation inside `tx` and never ends it: every `Err` return
+/// leaves the transaction for the caller to roll back.
+async fn reserve_invitation_authorization_in(
+    tx: &DatabaseTransaction,
+    receipt: &InvitationAuthorizationReceipt,
+    jti: &str,
+    model: share_invitation_authorization_jti::ActiveModel,
+    binding_json: &Value,
+    authorization_digest: &Sha256Digest,
+    now: OffsetDateTime,
+) -> Result<(), StateError> {
+    let existed = share_invitation_authorization_jti::Entity::find_by_id(jti)
+        .one(tx)
+        .await?
+        .is_some();
+    share_invitation_authorization_jti::Entity::insert(model)
+        .on_conflict(
+            OnConflict::column(share_invitation_authorization_jti::Column::Jti)
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec(tx)
+        .await?;
+    if existed {
+        let existing = share_invitation_authorization_jti::Entity::find_by_id(jti)
+            .one(tx)
+            .await?
+            .ok_or(StateError::Storage)?;
+        if existing.authorization_digest != authorization_digest.as_str()
+            || existing.binding_json != *binding_json
+        {
+            return Err(StateError::Replay);
+        }
+        if existing.consumed_at.is_some() {
+            return Err(StateError::Replay);
+        }
+        if parse_timestamp(&existing.expires_at)? <= now {
+            return Err(StateError::Expired);
+        }
+        return Ok(());
+    }
+    let existing = share_invitation_authorization_jti::Entity::find_by_id(jti)
+        .one(tx)
+        .await?
+        .ok_or(StateError::Storage)?;
+    if existing.authorization_digest != authorization_digest.as_str()
+        || existing.binding_json != *binding_json
+    {
+        return Err(StateError::Replay);
+    }
+    if parse_timestamp(&receipt.authorization.expires_at)? <= now {
+        return Err(StateError::Expired);
+    }
+    Ok(())
 }
 
 #[derive(Clone, PartialEq, Eq)]
