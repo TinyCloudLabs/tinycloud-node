@@ -684,7 +684,10 @@ fn execute_query(
         rows.push(values);
 
         if size_estimate > MAX_RESPONSE_SIZE {
-            return Err(DuckDbError::ResponseTooLarge(size_estimate as u64));
+            return Err(DuckDbError::ResponseTooLarge(
+                size_estimate as u64,
+                MAX_RESPONSE_SIZE as u64,
+            ));
         }
     }
 
@@ -745,7 +748,10 @@ fn execute_query_arrow(
     }
 
     if buf.len() > MAX_RESPONSE_SIZE {
-        return Err(DuckDbError::ResponseTooLarge(buf.len() as u64));
+        return Err(DuckDbError::ResponseTooLarge(
+            buf.len() as u64,
+            MAX_RESPONSE_SIZE as u64,
+        ));
     }
 
     Ok(buf)

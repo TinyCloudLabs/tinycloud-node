@@ -26,6 +26,13 @@ cors = true
     # hydration_wait_timeout_ms = 30000
     # artifact_transfer_timeout_ms = 45000
     # hydration_max_ms = 600000          # a hydration keeps warming after its callers give up
+    ## Schema-changing SQL (CREATE/ALTER/DROP of tables, views and indexes) needs
+    ## tinycloud.sql/schema (TC-1581); tinycloud.sql/write covers data statements.
+    ## "enforce" (default) refuses the statement, "log" runs it and records it
+    ## (a constant warning and a counter by statement kind, no request content),
+    ## "off" restores the earlier rule that write also suffices for those
+    ## statements; the release's other restrictions apply in every mode. See docs/sql-schema-authority.md.
+    # ddl_requires_schema = "enforce"
     # [global.storage.duckdb]
     # path = "./data/duckdb"
 
@@ -78,3 +85,20 @@ cors = true
     ## Rollback: TINYCLOUD_DID_RESOLUTION__NETWORK_METHODS=true, then restart.
     ## Issuer queries remain refused. Opt-in uses the unhardened SSI client (TC-1080).
     # network_methods = false
+
+[global.encryption_network]
+    ## Serve named keys and advertise the `encryption-named-keys-v1` feature in
+    ## GET /info. Only while on are the key routes mounted, key and key-prefix
+    ## resources accepted in delegations and named-key decrypt served on
+    ## POST /invoke. Keep off until named keys are live on OpenKey.
+    ## Env: TINYCLOUD_ENCRYPTION_NETWORK__NAMED_KEYS_V1
+    # named_keys_v1 = false
+
+[global.sql]
+    ## Accept the `tables` / `columns` / `readOnly` caveat form on
+    ## `tinycloud.sql/*` delegations, enforce it from the delegation chain on
+    ## every SQL request, and advertise `sql-delegated-caveats-v1` in GET /info.
+    ## Off = such a delegation is refused as an unsupported caveat and the
+    ## feature is withheld.
+    ## Env: TINYCLOUD_SQL__DELEGATED_CAVEATS_ENFORCED
+    # delegated_caveats_enforced = false

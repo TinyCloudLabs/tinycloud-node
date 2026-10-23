@@ -482,7 +482,7 @@ pub enum DuckDbError {
     DuckDb(String),              // Database engine error
     PermissionDenied(String),    // Ability/caveat violation
     DatabaseNotFound,            // No database at path
-    ResponseTooLarge(u64),       // Exceeds 10MB JSON limit
+    ResponseTooLarge(u64, u64),  // Serialized bytes, limit bytes
     QuotaExceeded,               // Storage quota hit
     InvalidStatement(String),    // Unknown prepared statement name
     SchemaError(String),         // DDL execution failed

@@ -55,7 +55,7 @@ The `200 application/json` response is:
 {
   "space": {"usedBytes": 123, "limitBytes": 456},
   "account": {"usedBytes": 789, "limitBytes": 1000, "plan": "free"},
-  "manageUrl": "https://account.tinycloud.xyz/billing"
+  "manageUrl": "https://account.tinycloud.xyz/storage"
 }
 ```
 

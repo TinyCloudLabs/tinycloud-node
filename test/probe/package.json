@@ -7,7 +7,8 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "probe": "tsx write-probe.ts",
-    "test": "tsx --test probe-core.test.ts"
+    "probe:db": "tsx db-saturation-run.ts",
+    "test": "tsx --test probe-core.test.ts db-saturation.test.ts"
   },
   "dependencies": {
     "@tinycloud/node-sdk": "^2.10.0"

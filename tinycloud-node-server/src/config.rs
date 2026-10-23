@@ -14,6 +14,7 @@ use serde_with::{
 use std::{fs, path::PathBuf, time::Duration};
 use tinycloud_core::db_pool::{StatementTimeoutMode, StatementTimeouts};
 use tinycloud_core::keys::StaticSecret;
+use tinycloud_core::sql::DdlPolicy;
 
 /// The OpenCredentials service that consumes a node-authorized generic
 /// credential-invitation receipt in production. Keep this exact origin pinned:
@@ -53,7 +54,38 @@ pub struct Config {
     #[serde(default)]
     pub epoch_head_backfill: EpochHeadBackfillConfig,
     #[serde(default)]
+    pub sql_store: SqlStoreConfig,
+    #[serde(default)]
+    pub encryption_network: EncryptionNetworkConfig,
+    #[serde(default)]
+    pub sql: SqlConfig,
+    #[serde(default)]
     pub policy_v3: PolicyV3Config,
+}
+
+/// Release gates for the encryption network routes. `named_keys_v1`
+/// advertises the `encryption-named-keys-v1` feature in `/info` and turns on
+/// named keys: the key create, describe, public key, block and unblock
+/// routes are mounted, delegations may grant on key and key-prefix
+/// resources, and named-key decrypt is served on `POST /invoke`. It stays off
+/// until named keys are live on OpenKey; while off, those routes answer 404
+/// and key resources are refused with `named_keys_unavailable`.
+#[derive(Serialize, Deserialize, Debug, Default, Clone, Hash, PartialEq, Eq)]
+pub struct EncryptionNetworkConfig {
+    #[serde(default)]
+    pub named_keys_v1: bool,
+}
+
+/// `[global.sql]` release gate for delegated SQL caveats (TC-1791).
+/// `delegated_caveats_enforced` admits the `tables` / `columns` / `readOnly`
+/// caveat form on `tinycloud.sql/*` delegations, enforces it from the
+/// delegation chain when a request runs, and advertises
+/// `sql-delegated-caveats-v1` in `/info`. Off: such a delegation is refused as
+/// an unsupported caveat and nothing is advertised.
+#[derive(Serialize, Deserialize, Debug, Default, Clone, Hash, PartialEq, Eq)]
+pub struct SqlConfig {
+    #[serde(default)]
+    pub delegated_caveats_enforced: bool,
 }
 
 /// Production exact-email composition.  The capability remains unavailable
@@ -90,6 +122,13 @@ pub struct ShareEmailConfig {
     pub issuer_key_version: u64,
     #[serde(default)]
     pub issuer_public_key: Option<String>,
+    /// The pinned per-policy issuer set (TC-1452): the explicit entries, each
+    /// `{issuerDid, kid, alg, publicKey, vcts, profiles, notBefore, retiredAt?,
+    /// notAfter?}`. The legacy single issuer above, when its public key is
+    /// set, joins as one more entry. A violation of a set-load rule stops the
+    /// node from starting. Nothing here is fetched or resolved.
+    #[serde(default)]
+    pub credential_issuers: Vec<crate::issuer_set::CredentialIssuerConfig>,
     /// Operator-delivered owner-signed authority material. A missing or
     /// unreadable source keeps the capability unavailable.
     #[serde(default)]
@@ -227,6 +266,7 @@ impl Default for ShareEmailConfig {
             issuer_kid: default_share_issuer_kid(),
             issuer_key_version: default_share_issuer_key_version(),
             issuer_public_key: None,
+            credential_issuers: Vec::new(),
             authority_material_path: None,
             trust_bundle_path: None,
             trust_bundle_base64: None,
@@ -244,6 +284,55 @@ impl Default for ShareEmailConfig {
 }
 
 impl ShareEmailConfig {
+    /// The issuer pin checks for the legacy single issuer. They run whenever
+    /// `issuer_public_key` is set, whether or not `enabled` is on: the key is
+    /// used by policy/v3 credential admission either way.
+    pub fn validate_issuer_pin(&self) -> Result<(), &'static str> {
+        let Some(public_key) = self.issuer_public_key.as_deref() else {
+            return Ok(());
+        };
+        if self.issuer_did != tinycloud_auth::share_email_evidence::OPEN_CREDENTIALS_ISSUER_DID
+            || self.issuer_vct != tinycloud_auth::share_email_evidence::EMAIL_VCT
+            || !canonical_kid_matches(&self.issuer_kid, &self.issuer_did)
+            || self.issuer_key_version == 0
+            || !canonical_key(public_key)
+            || (!allows_hermetic_fixture() && is_fixture_public_key(public_key))
+        {
+            return Err("share email issuer pin is invalid");
+        }
+        Ok(())
+    }
+
+    /// Builds the pinned issuer set: the explicit `credential_issuers` plus the
+    /// legacy single issuer as one entry. Applies every set-load rule; the
+    /// caller refuses to start on an error.
+    pub fn credential_issuer_set(&self) -> anyhow::Result<crate::issuer_set::IssuerSet> {
+        use anyhow::Context as _;
+        self.validate_issuer_pin()
+            .map_err(|error| anyhow::anyhow!(error))?;
+        let legacy = self
+            .issuer_public_key
+            .as_deref()
+            .map(|encoded| -> anyhow::Result<_> {
+                let public_key: [u8; 32] = decode_config(encoded, URL_SAFE_NO_PAD)
+                    .context("policy credential issuer public key must be canonical base64url")?
+                    .try_into()
+                    .map_err(|_| {
+                        anyhow::anyhow!("policy credential issuer public key must be 32 bytes")
+                    })?;
+                Ok(tinycloud_auth::share_email_evidence::IssuerKey::new(
+                    self.issuer_did.clone(),
+                    self.issuer_vct.clone(),
+                    self.issuer_key_version,
+                    self.issuer_kid.clone(),
+                    public_key,
+                ))
+            })
+            .transpose()?;
+        crate::issuer_set::IssuerSet::load_with_legacy(&self.credential_issuers, legacy.as_ref())
+            .context("credential issuer set is invalid")
+    }
+
     pub fn resolve_trust_bundle(&self) -> Result<Self, &'static str> {
         if !self.enabled {
             return Ok(self.clone());
@@ -634,12 +723,12 @@ fn contains_placeholder(value: &str) -> bool {
 }
 
 #[cfg(feature = "mounted-fixture")]
-fn allows_hermetic_fixture() -> bool {
+pub(crate) fn allows_hermetic_fixture() -> bool {
     true
 }
 
 #[cfg(not(feature = "mounted-fixture"))]
-fn allows_hermetic_fixture() -> bool {
+pub(crate) fn allows_hermetic_fixture() -> bool {
     false
 }
 
@@ -682,7 +771,7 @@ fn is_repeated_test_key(value: Option<&str>) -> bool {
     bytes.len() == 32 && bytes.windows(2).all(|pair| pair[0] == pair[1])
 }
 
-fn is_fixture_public_key(value: &str) -> bool {
+pub(crate) fn is_fixture_public_key(value: &str) -> bool {
     const FROZEN_NODE_PUBLIC_KEY: &str = "IVL40Zt5HSRFMkLhXy6rbLfP-ntqXtMAl5YOBpiB2xI";
     const FROZEN_ISSUER_PUBLIC_KEY: &str = "Ivwpd5Lwtv_Av8_bftsMCqFOAlo2XsDjQuhuOCnLdLY";
     value == FROZEN_NODE_PUBLIC_KEY
@@ -1008,6 +1097,143 @@ impl EpochHeadBackfillConfig {
     }
 }
 
+/// The SQL block-store shadow upload (TC-1491; `docs/sql-block-store-contract.md`).
+///
+/// Off by default. Postgres stays master: an enabled node copies snapshots and
+/// change segments of the allowlisted spaces' databases to the block store, and
+/// records them in `sql_store_manifest`. Section `[sql_store]`; env
+/// `TINYCLOUD_SQL_STORE__ENABLED`, `TINYCLOUD_SQL_STORE__UPLOAD_INTERVAL_SECS`,
+/// `TINYCLOUD_SQL_STORE__UPLOAD_BYTES`, `TINYCLOUD_SQL_STORE__SPACES`,
+/// `TINYCLOUD_SQL_STORE__RETENTION__HISTORY_DAYS__<TIER>`, ...
+///
+/// The slice-0 contract only defines and validates these settings; no uploader
+/// reads them yet.
+#[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
+pub struct SqlStoreConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Upload this long after a database's first un-uploaded commit. Default
+    /// 60 s for every tier.
+    #[serde(default = "default_sql_store_upload_interval_secs")]
+    pub upload_interval_secs: u64,
+    /// Or once this many bytes are pending (checked between transactions).
+    #[serde(default = "default_sql_store_upload_bytes")]
+    pub upload_bytes: ByteUnit,
+    /// Node-wide un-uploaded bytes at which the spool sheds.
+    #[serde(default = "default_sql_store_backlog_cap")]
+    pub backlog_cap: ByteUnit,
+    /// A new snapshot at most this often.
+    #[serde(default = "default_sql_store_snapshot_every_secs")]
+    pub snapshot_every_secs: u64,
+    #[serde(default = "default_sql_store_orphan_after_secs")]
+    pub orphan_after_secs: u64,
+    /// Refuse writes at the cap. Off in the shadow phase, where refusing buys
+    /// no durability.
+    #[serde(default)]
+    pub enforce_backlog_cap: bool,
+    /// Space IDs whose databases are uploaded. **Empty means none**, even
+    /// when `enabled` (fail-closed, contract D7).
+    #[serde(default)]
+    pub spaces: Vec<String>,
+    #[serde(default)]
+    pub retention: SqlStoreRetentionConfig,
+}
+
+/// History window per tier id (`free`, `paid`, ...). Absent keeps everything.
+#[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq, Default)]
+pub struct SqlStoreRetentionConfig {
+    #[serde(default)]
+    pub default_history_days: Option<u32>,
+    #[serde(default)]
+    pub history_days: std::collections::BTreeMap<String, u32>,
+}
+
+fn default_sql_store_upload_interval_secs() -> u64 {
+    60
+}
+
+fn default_sql_store_upload_bytes() -> ByteUnit {
+    ByteUnit::Mebibyte(8)
+}
+
+fn default_sql_store_backlog_cap() -> ByteUnit {
+    ByteUnit::Mebibyte(64)
+}
+
+fn default_sql_store_snapshot_every_secs() -> u64 {
+    24 * 60 * 60
+}
+
+fn default_sql_store_orphan_after_secs() -> u64 {
+    24 * 60 * 60
+}
+
+impl Default for SqlStoreConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            upload_interval_secs: default_sql_store_upload_interval_secs(),
+            upload_bytes: default_sql_store_upload_bytes(),
+            backlog_cap: default_sql_store_backlog_cap(),
+            snapshot_every_secs: default_sql_store_snapshot_every_secs(),
+            orphan_after_secs: default_sql_store_orphan_after_secs(),
+            enforce_backlog_cap: false,
+            spaces: Vec::new(),
+            retention: SqlStoreRetentionConfig::default(),
+        }
+    }
+}
+
+impl SqlStoreConfig {
+    /// The fields matter only when the feature is on, so a disabled store
+    /// accepts any values.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.upload_interval_secs < 1 {
+            return Err("sql_store.upload_interval_secs must be at least 1");
+        }
+        if self.upload_bytes < ByteUnit::Mebibyte(1) {
+            return Err("sql_store.upload_bytes must be at least 1 MiB");
+        }
+        if self.backlog_cap < self.upload_bytes {
+            return Err("sql_store.backlog_cap must be at least sql_store.upload_bytes");
+        }
+        if self.snapshot_every_secs < 1 || self.orphan_after_secs < 1 {
+            return Err("sql_store.snapshot_every_secs and orphan_after_secs must be at least 1");
+        }
+        if self.spaces.iter().any(|space| space.trim().is_empty()) {
+            return Err("sql_store.spaces must not contain an empty space ID");
+        }
+        Ok(())
+    }
+
+    pub fn upload_policy(&self) -> tinycloud_core::sql::store::UploadPolicy {
+        tinycloud_core::sql::store::UploadPolicy {
+            interval: Duration::from_secs(self.upload_interval_secs),
+            max_bytes: self.upload_bytes.as_u64(),
+            backlog_cap: self.backlog_cap.as_u64(),
+            snapshot_every: Duration::from_secs(self.snapshot_every_secs),
+            orphan_after: Duration::from_secs(self.orphan_after_secs),
+            enforce_backlog_cap: self.enforce_backlog_cap,
+        }
+    }
+
+    pub fn retention_policy(&self) -> tinycloud_core::sql::store::RetentionPolicy {
+        tinycloud_core::sql::store::RetentionPolicy::new(
+            self.retention.default_history_days,
+            self.retention.history_days.clone(),
+        )
+    }
+
+    /// Whether `space`'s databases are uploaded: the feature is on and the
+    /// space is listed. An empty list uploads nothing.
+    pub fn uploads_space(&self, space: &str) -> bool {
+        self.enabled && self.spaces.iter().any(|s| s == space)
+    }
+}
+
 /// Policy/v3 owner-authority bindings (TC-1423). Section `[policy_v3]`.
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq, Default)]
 pub struct PolicyV3Config {
@@ -1229,6 +1455,13 @@ pub struct SqlStorageConfig {
     /// callers that gave up on it, so the database still warms.
     #[serde(default = "default_sql_hydration_max_ms")]
     pub hydration_max_ms: u64,
+    /// Whether a schema-changing statement (CREATE, ALTER, DROP of tables,
+    /// views and indexes) needs `tinycloud.sql/schema` (TC-1581). `sql/write`
+    /// covers data statements only. `"enforce"` (the default) refuses the
+    /// statement; `"log"` runs it and records it without any request content;
+    /// `"off"` keeps the earlier behaviour, where `write` also sufficed.
+    #[serde(default)]
+    pub ddl_requires_schema: DdlPolicy,
 }
 
 fn default_sql_memory_threshold() -> ByteUnit {
@@ -1271,6 +1504,7 @@ impl Default for SqlStorageConfig {
             hydration_wait_timeout_ms: default_sql_hydration_wait_timeout_ms(),
             artifact_transfer_timeout_ms: default_sql_artifact_transfer_timeout_ms(),
             hydration_max_ms: default_sql_hydration_max_ms(),
+            ddl_requires_schema: DdlPolicy::default(),
         }
     }
 }
@@ -1713,6 +1947,40 @@ mod tests {
     use std::io::Write;
     use tempfile::NamedTempFile;
 
+    /// TC-1581: `[global.storage.sql] ddl_requires_schema` defaults to
+    /// `enforce` and accepts only `off`, `log` and `enforce`.
+    #[test]
+    fn tc1581_ddl_requires_schema_defaults_to_enforce_and_parses_its_values() {
+        assert_eq!(
+            SqlStorageConfig::default().ddl_requires_schema,
+            DdlPolicy::Enforce
+        );
+        assert_eq!(
+            serde_json::from_str::<SqlStorageConfig>("{}")
+                .unwrap()
+                .ddl_requires_schema,
+            DdlPolicy::Enforce
+        );
+        for (value, expected) in [
+            ("off", DdlPolicy::Off),
+            ("log", DdlPolicy::Log),
+            ("enforce", DdlPolicy::Enforce),
+        ] {
+            let config: SqlStorageConfig =
+                serde_json::from_str(&format!(r#"{{"ddl_requires_schema":"{value}"}}"#)).unwrap();
+            assert_eq!(config.ddl_requires_schema, expected, "{value}");
+        }
+        for invalid in ["warn", "true", "Enforce", ""] {
+            assert!(
+                serde_json::from_str::<SqlStorageConfig>(&format!(
+                    r#"{{"ddl_requires_schema":"{invalid}"}}"#
+                ))
+                .is_err(),
+                "{invalid:?} must be rejected"
+            );
+        }
+    }
+
     #[test]
     fn tc1132_startup_validates_retry_budget_bounds() {
         for attempts in [0, 1, 10] {
@@ -1739,6 +2007,120 @@ mod tests {
                 ok,
                 "{wait_ms}"
             );
+        }
+    }
+
+    /// TC-1491: off by default, 60 s / 8 MiB for every tier, and nothing is
+    /// validated while the feature is off.
+    #[test]
+    fn sql_store_defaults_match_the_contract() {
+        let config = SqlStoreConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.upload_interval_secs, 60);
+        assert_eq!(config.upload_bytes, ByteUnit::Mebibyte(8));
+        assert!(!config.enforce_backlog_cap);
+        assert!(config.spaces.is_empty());
+        let policy = config.upload_policy();
+        assert_eq!(policy, tinycloud_core::sql::store::UploadPolicy::default());
+        assert_eq!(config.retention_policy().history_days("free"), None);
+        assert_eq!(Config::default().sql_store, config);
+    }
+
+    #[test]
+    fn encryption_network_named_keys_is_off_by_default() {
+        assert!(!Config::default().encryption_network.named_keys_v1);
+        let config: EncryptionNetworkConfig = toml::from_str("").unwrap();
+        assert!(!config.named_keys_v1);
+    }
+
+    #[test]
+    fn encryption_network_named_keys_parses_from_toml() {
+        let config: EncryptionNetworkConfig = toml::from_str("named_keys_v1 = true").unwrap();
+        assert!(config.named_keys_v1);
+    }
+
+    #[test]
+    fn sql_delegated_caveats_is_off_by_default_and_parses_from_toml() {
+        assert!(!Config::default().sql.delegated_caveats_enforced);
+        let config: SqlConfig = toml::from_str("").unwrap();
+        assert!(!config.delegated_caveats_enforced);
+        let config: SqlConfig = toml::from_str("delegated_caveats_enforced = true").unwrap();
+        assert!(config.delegated_caveats_enforced);
+    }
+
+    #[test]
+    fn sql_store_parses_from_toml_and_fills_defaults() {
+        let config: SqlStoreConfig = toml::from_str(
+            r#"
+            enabled = true
+            upload_interval_secs = 30
+            upload_bytes = "4 MiB"
+            spaces = ["tinycloud:pkh:eip155:1:0xab://default"]
+            [retention]
+            history_days = { free = 7, paid = 30 }
+            "#,
+        )
+        .unwrap();
+        assert!(config.enabled);
+        assert_eq!(config.upload_interval_secs, 30);
+        assert_eq!(config.upload_bytes, ByteUnit::Mebibyte(4));
+        assert_eq!(config.backlog_cap, ByteUnit::Mebibyte(64));
+        assert!(config.validate().is_ok());
+        assert!(config.uploads_space("tinycloud:pkh:eip155:1:0xab://default"));
+        assert!(!config.uploads_space("tinycloud:other"));
+        let retention = config.retention_policy();
+        assert_eq!(retention.history_days("free"), Some(7));
+        assert_eq!(retention.history_days("paid"), Some(30));
+        assert_eq!(retention.history_days("team"), None);
+    }
+
+    #[test]
+    fn sql_store_empty_allowlist_uploads_nothing_even_when_enabled() {
+        let config = SqlStoreConfig {
+            enabled: true,
+            ..SqlStoreConfig::default()
+        };
+        assert!(config.validate().is_ok());
+        assert!(!config.uploads_space("tinycloud:pkh:eip155:1:0xab://default"));
+        let off = SqlStoreConfig {
+            spaces: vec!["tinycloud:x".into()],
+            ..SqlStoreConfig::default()
+        };
+        assert!(
+            !off.uploads_space("tinycloud:x"),
+            "disabled uploads nothing"
+        );
+    }
+
+    #[test]
+    fn sql_store_settings_are_checked_only_when_enabled() {
+        let bad = |edit: fn(&mut SqlStoreConfig)| {
+            let mut config = SqlStoreConfig {
+                enabled: true,
+                ..SqlStoreConfig::default()
+            };
+            edit(&mut config);
+            config
+        };
+        for config in [
+            bad(|c| c.upload_interval_secs = 0),
+            bad(|c| c.upload_bytes = ByteUnit::Kibibyte(512)),
+            bad(|c| c.backlog_cap = ByteUnit::Mebibyte(4)),
+            bad(|c| c.snapshot_every_secs = 0),
+            bad(|c| c.orphan_after_secs = 0),
+            bad(|c| c.spaces = vec![" ".into()]),
+        ] {
+            assert!(config.validate().is_err(), "{config:?}");
+            let disabled = SqlStoreConfig {
+                enabled: false,
+                ..config.clone()
+            };
+            assert!(disabled.validate().is_ok());
+            assert!(crate::resolve_runtime_config(&Config {
+                sql_store: config,
+                ..Config::default()
+            })
+            .is_err());
         }
     }
 
@@ -1782,6 +2164,129 @@ mod tests {
             authority_material_path: Some("/run/tinycloud/authority-material.json".into()),
             ..ShareEmailConfig::default()
         }
+    }
+
+    fn explicit_issuer(fragment: &str, key: &str) -> crate::issuer_set::CredentialIssuerConfig {
+        crate::issuer_set::CredentialIssuerConfig {
+            issuer_did: "did:web:acme.credentials.org".into(),
+            kid: format!("did:web:acme.credentials.org#{fragment}"),
+            alg: "EdDSA".into(),
+            public_key: key.into(),
+            vcts: vec!["opencredentials.email/v1".into()],
+            profiles: vec!["tinycloud.email-held/v1".into()],
+            not_before: "2026-10-01T00:00:00Z".into(),
+            retired_at: None,
+            not_after: None,
+        }
+    }
+
+    #[test]
+    fn issuer_pin_checks_run_whenever_the_issuer_key_is_set() {
+        // enabled is off, so the trust-bundle path never validated this.
+        let mut config = ShareEmailConfig {
+            issuer_did: "did:web:issuer.credentials.org".into(),
+            issuer_kid: "did:web:issuer.credentials.org#email-signing-key-1".into(),
+            issuer_public_key: Some("AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA".into()),
+            ..ShareEmailConfig::default()
+        };
+        assert_eq!(config.credential_issuer_set().unwrap().len(), 1);
+        // No key set: nothing to pin, no legacy entry.
+        let mut unset = config.clone();
+        unset.issuer_public_key = None;
+        unset.issuer_did.clear();
+        assert!(unset.credential_issuer_set().unwrap().is_empty());
+        for edit in [
+            (|c: &mut ShareEmailConfig| c.issuer_did = "did:web:other.example".into())
+                as fn(&mut ShareEmailConfig),
+            |c| c.issuer_did.clear(),
+            |c| c.issuer_vct = "opencredentials.email/v2".into(),
+            |c| c.issuer_kid = "did:web:other.example#k".into(),
+            |c| c.issuer_kid = "did:web:issuer.credentials.org".into(),
+            |c| c.issuer_key_version = 0,
+            |c| c.issuer_public_key = Some("AQID".into()),
+            |c| c.issuer_public_key = Some("Ivwpd5Lwtv_Av8_bftsMCqFOAlo2XsDjQuhuOCnLdLY".into()),
+        ] {
+            let mut bad = config.clone();
+            edit(&mut bad);
+            assert!(bad.credential_issuer_set().is_err());
+        }
+        config.enabled = false;
+        assert!(config.validate_issuer_pin().is_ok());
+    }
+
+    #[test]
+    fn credential_issuer_set_joins_the_legacy_issuer_and_refuses_bad_sets() {
+        let key = &base64::encode_config(
+            ed25519_dalek::SigningKey::from_bytes(&[9; 32])
+                .verifying_key()
+                .to_bytes(),
+            URL_SAFE_NO_PAD,
+        );
+        let mut config = enabled_config();
+        config.credential_issuers = vec![explicit_issuer("issuing-1", key)];
+        let set = config.credential_issuer_set().unwrap();
+        assert_eq!(set.len(), 2);
+        assert!(set
+            .resolve_pinned_issuer(
+                "did:web:acme.credentials.org",
+                "did:web:acme.credentials.org#issuing-1"
+            )
+            .is_some());
+        assert!(set
+            .resolve_pinned_issuer(
+                "did:web:issuer.credentials.org",
+                "did:web:issuer.credentials.org#email-signing-key-1"
+            )
+            .is_some());
+        // Each set-load violation stops startup, with share-email off as well.
+        for edit in [
+            (|e: &mut crate::issuer_set::CredentialIssuerConfig| e.alg = "ES256K".into())
+                as fn(&mut crate::issuer_set::CredentialIssuerConfig),
+            |e| e.kid = "did:web:acme.credentials.org".into(),
+            |e| e.not_before = "2026-10-01T00:00:00+00:00".into(),
+            |e| e.public_key = "AQID".into(),
+            |e| {
+                e.retired_at = Some("2027-02-01T00:00:00Z".into());
+                e.not_after = Some("2027-01-01T00:00:00Z".into());
+            },
+        ] {
+            for enabled in [true, false] {
+                let mut bad = enabled_config();
+                bad.enabled = enabled;
+                let mut entry = explicit_issuer("issuing-1", key);
+                edit(&mut entry);
+                bad.credential_issuers = vec![entry];
+                assert!(bad.credential_issuer_set().is_err());
+            }
+        }
+        // A duplicate kid refuses the set.
+        let mut duplicate = enabled_config();
+        duplicate.credential_issuers = vec![
+            explicit_issuer("issuing-1", key),
+            explicit_issuer("issuing-1", key),
+        ];
+        assert!(duplicate.credential_issuer_set().is_err());
+        // The preflight that runs before the node starts catches it too.
+        let preflight = Config {
+            share_email: ShareEmailConfig {
+                credential_issuers: vec![explicit_issuer("issuing-1", "AQID")],
+                ..ShareEmailConfig::default()
+            },
+            ..Config::default()
+        };
+        assert!(crate::resolve_runtime_config(&preflight).is_err());
+    }
+
+    #[test]
+    fn credential_issuers_parse_from_the_documented_json_shape() {
+        let parsed: Vec<crate::issuer_set::CredentialIssuerConfig> = serde_json::from_str(
+            r#"[{"issuerDid":"did:web:acme.credentials.org","kid":"did:web:acme.credentials.org#issuing-1",
+            "alg":"EdDSA","publicKey":"AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA",
+            "vcts":["opencredentials.email/v1"],"profiles":["tinycloud.email-held/v1"],
+            "notBefore":"2026-10-01T00:00:00Z","retiredAt":null,"notAfter":null}]"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.len(), 1);
     }
 
     /// The exact `emailOrigin` (generic invitation audience) the committed
