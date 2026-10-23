@@ -30,6 +30,8 @@ pub enum EncryptionError {
     Decrypt(String),
     #[error("encrypted data too short")]
     TooShort,
+    #[error("unsupported version byte")]
+    UnsupportedVersion,
 }
 
 impl ColumnEncryption {
@@ -51,6 +53,15 @@ impl ColumnEncryption {
         result.extend_from_slice(&nonce);
         result.extend_from_slice(&ciphertext);
         result
+    }
+
+    /// Strict decrypt for wire envelopes: requires the 0x01 version byte and
+    /// never passes unversioned input through (unlike `decrypt`).
+    pub fn decrypt_strict(&self, data: &[u8]) -> Result<Vec<u8>, EncryptionError> {
+        if data.first() != Some(&VERSION_ENCRYPTED) {
+            return Err(EncryptionError::UnsupportedVersion);
+        }
+        self.decrypt(data)
     }
 
     /// Decrypt data. Handles version dispatch:
