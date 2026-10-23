@@ -1,5 +1,5 @@
 use super::super::{
-    encryption_network::NetworkId,
+    encryption_network::key_id,
     events::{Invocation, VersionedOperation},
     models::*,
     relationships::*,
@@ -107,6 +107,14 @@ pub enum InvocationError {
     /// invocation boundary).
     #[error("invocation-caveats-not-subset-of-chain: {0}")]
     CaveatsNotContained(String),
+    /// TC-1791: a SQL or DuckDB invocation capability carries a caveat that is
+    /// not accepted for its ability.
+    #[error("unsupported-caveat: {0}")]
+    UnsupportedCaveat(String),
+    /// Encryption key prefixes are namespaces and cannot be invoked.
+    /// Code: `encryption-prefix-not-invocable`.
+    #[error("encryption-prefix-not-invocable")]
+    EncryptionPrefixNotInvocable,
 }
 
 pub(crate) async fn process<C: ConnectionTrait>(
@@ -115,6 +123,7 @@ pub(crate) async fn process<C: ConnectionTrait>(
     ops: Vec<VersionedOperation>,
     encryption: Option<&ColumnEncryption>,
     auth_graph: Option<&crate::auth_graph::AuthGraphSnapshot>,
+    delegated_sql_caveats: bool,
 ) -> Result<Hash, Error> {
     let (i, serialized) = (invocation.0, invocation.1);
     verify_invocation(&i.invocation).await?;
@@ -123,7 +132,7 @@ pub(crate) async fn process<C: ConnectionTrait>(
     }
 
     let now = OffsetDateTime::now_utc();
-    validate(db, &i, Some(now), auth_graph).await?;
+    validate(db, &i, Some(now), auth_graph, delegated_sql_caveats).await?;
 
     save(db, i, Some(now), serialized, ops, encryption).await
 }
@@ -169,6 +178,7 @@ pub(crate) async fn process_admitted<C: ConnectionTrait>(
     ops: Vec<VersionedOperation>,
     encryption: Option<&ColumnEncryption>,
     auth_graph: Option<&crate::auth_graph::AuthGraphSnapshot>,
+    delegated_sql_caveats: bool,
 ) -> Result<Hash, Error> {
     let (i, serialized) = (invocation.0, invocation.1);
     i.invocation
@@ -180,7 +190,7 @@ pub(crate) async fn process_admitted<C: ConnectionTrait>(
     }
 
     let now = OffsetDateTime::now_utc();
-    validate(db, &i, Some(now), auth_graph).await?;
+    validate(db, &i, Some(now), auth_graph, delegated_sql_caveats).await?;
 
     save(db, i, Some(now), serialized, ops, encryption).await
 }
@@ -195,6 +205,7 @@ pub(crate) async fn authorize_admitted<C: ConnectionTrait>(
     invocation: &util::InvocationInfo,
     now: OffsetDateTime,
     auth_graph: Option<&crate::auth_graph::AuthGraphSnapshot>,
+    delegated_sql_caveats: bool,
 ) -> Result<(), Error> {
     invocation
         .invocation
@@ -204,7 +215,7 @@ pub(crate) async fn authorize_admitted<C: ConnectionTrait>(
     for space in invocation.spaces() {
         crate::request_telemetry::observe_space(space);
     }
-    validate(db, invocation, Some(now), auth_graph).await
+    validate(db, invocation, Some(now), auth_graph, delegated_sql_caveats).await
 }
 
 pub async fn verify_invocation(invocation: &TinyCloudInvocation) -> Result<(), Error> {
@@ -246,7 +257,17 @@ pub async fn verify_and_authorize<C: ConnectionTrait>(
     invocation: &util::InvocationInfo,
     now: OffsetDateTime,
 ) -> Result<(), Error> {
-    verify_and_authorize_with_graph(db, invocation, now, None).await
+    verify_and_authorize_with_setting(db, invocation, now, false).await
+}
+
+/// [`verify_and_authorize`] with the delegated-SQL-caveat setting stated.
+pub async fn verify_and_authorize_with_setting<C: ConnectionTrait>(
+    db: &C,
+    invocation: &util::InvocationInfo,
+    now: OffsetDateTime,
+    delegated_sql_caveats: bool,
+) -> Result<(), Error> {
+    verify_and_authorize_with_graph(db, invocation, now, None, delegated_sql_caveats).await
 }
 
 /// [`verify_and_authorize`] against a caller-loaded authorization snapshot,
@@ -257,12 +278,13 @@ pub(crate) async fn verify_and_authorize_with_graph<C: ConnectionTrait>(
     invocation: &util::InvocationInfo,
     now: OffsetDateTime,
     auth_graph: Option<&crate::auth_graph::AuthGraphSnapshot>,
+    delegated_sql_caveats: bool,
 ) -> Result<(), Error> {
     verify_invocation(&invocation.invocation).await?;
     for space in invocation.spaces() {
         crate::request_telemetry::observe_space(space);
     }
-    validate(db, invocation, Some(now), auth_graph).await
+    validate(db, invocation, Some(now), auth_graph, delegated_sql_caveats).await
 }
 
 // verify parenthood and authorization
@@ -271,6 +293,7 @@ async fn validate<C: ConnectionTrait>(
     invocation: &util::InvocationInfo,
     time: Option<OffsetDateTime>,
     auth_graph: Option<&crate::auth_graph::AuthGraphSnapshot>,
+    delegated_sql_caveats: bool,
 ) -> Result<(), Error> {
     validate_capabilities(
         db,
@@ -279,6 +302,7 @@ async fn validate<C: ConnectionTrait>(
         &invocation.parents,
         time,
         auth_graph,
+        delegated_sql_caveats,
     )
     .await
 }
@@ -296,7 +320,29 @@ pub async fn authorize_holder<C: ConnectionTrait>(
     parents: &[tinycloud_auth::ipld_core::cid::Cid],
     now: OffsetDateTime,
 ) -> Result<(), Error> {
-    validate_capabilities(db, capabilities, holder, parents, Some(now), None).await
+    validate_capabilities(db, capabilities, holder, parents, Some(now), None, false).await
+}
+
+/// [`authorize_holder`] with the delegated-SQL-caveat setting stated.
+#[cfg(test)]
+pub(crate) async fn authorize_holder_with_setting<C: ConnectionTrait>(
+    db: &C,
+    holder: &str,
+    capabilities: &[util::Capability],
+    parents: &[tinycloud_auth::ipld_core::cid::Cid],
+    now: OffsetDateTime,
+    delegated_sql_caveats: bool,
+) -> Result<(), Error> {
+    validate_capabilities(
+        db,
+        capabilities,
+        holder,
+        parents,
+        Some(now),
+        None,
+        delegated_sql_caveats,
+    )
+    .await
 }
 
 /// Test oracle: `authorize_holder`'s checks against a caller-built snapshot.
@@ -309,7 +355,16 @@ pub(crate) async fn authorize_holder_with_graph<C: ConnectionTrait>(
     now: OffsetDateTime,
     graph: &crate::auth_graph::AuthGraphSnapshot,
 ) -> Result<(), Error> {
-    validate_capabilities(db, capabilities, holder, parents, Some(now), Some(graph)).await
+    validate_capabilities(
+        db,
+        capabilities,
+        holder,
+        parents,
+        Some(now),
+        Some(graph),
+        false,
+    )
+    .await
 }
 
 async fn validate_capabilities<C: ConnectionTrait>(
@@ -319,7 +374,18 @@ async fn validate_capabilities<C: ConnectionTrait>(
     parents: &[tinycloud_auth::ipld_core::cid::Cid],
     time: Option<OffsetDateTime>,
     auth_graph: Option<&crate::auth_graph::AuthGraphSnapshot>,
+    delegated_sql_caveats: bool,
 ) -> Result<(), Error> {
+    // A key prefix names a namespace; it cannot be invoked as a target.
+    if capabilities.iter().any(|cap| {
+        matches!(&cap.resource, Resource::Other(uri) if matches!(
+            key_id::parse(uri.as_str()),
+            Ok(key_id::EncryptionResource::KeyPrefix(_))
+        ))
+    }) {
+        return Err(InvocationError::EncryptionPrefixNotInvocable.into());
+    }
+
     // get caps which rely on delegated caps
     let dependant_caps: Vec<_> = capabilities
         .iter()
@@ -360,7 +426,11 @@ async fn validate_capabilities<C: ConnectionTrait>(
                 }
             };
 
-            // every cited parent must resolve to a distinct persisted row
+            // every cited CID must name a delegation row that is already persisted.
+            // Rows are written only by the delegation registration path
+            // (`Database::delegate` -> `delegation::process`), so a delegation that
+            // was refused at registration has no row and cannot be cited here, alone
+            // or alongside a persisted parent.
             let mut cited = std::collections::HashSet::new();
             let mut parents = Vec::with_capacity(root_ids.len());
             for id in &root_ids {
@@ -476,7 +546,12 @@ async fn validate_capabilities<C: ConnectionTrait>(
                 let mut last_reason: Option<String> = None;
                 let mut authorized = false;
                 for pc in candidates {
-                    match caveats_contain_child(&pc.caveats, &c.caveats) {
+                    match ability_caveats_contain_child(
+                        c.ability.as_ref().as_ref(),
+                        &pc.caveats,
+                        &c.caveats,
+                        delegated_sql_caveats,
+                    ) {
                         Ok(()) => {
                             authorized = true;
                             break;
@@ -502,13 +577,34 @@ async fn validate_capabilities<C: ConnectionTrait>(
                     Resource::TinyCloud(resource)
                         if matches!(resource.service().as_str(), "sql" | "duckdb")
                 ) {
+                    // TC-1791: the invocation's own SQL/DuckDB caveats must be
+                    // accepted, and a stored row whose caveats are not accepted
+                    // does not cover the invocation.
+                    if let Some(reason) = crate::models::delegation::unsupported_sql_caveat(
+                        c.ability.as_ref().as_ref(),
+                        &c.caveats,
+                    ) {
+                        return Err(InvocationError::UnsupportedCaveat(reason).into());
+                    }
                     let covers = |ability: &abilities::Model| {
                         c.resource.extends(&ability.resource)
                             && crate::policy_capability::ability_matches(
                                 ability.ability.as_ref().as_ref(),
                                 c.ability.as_ref().as_ref(),
                             )
-                            && caveats_contain_child(&ability.caveats, &c.caveats).is_ok()
+                            && ability_caveats_contain_child(
+                                c.ability.as_ref().as_ref(),
+                                &ability.caveats,
+                                &c.caveats,
+                                delegated_sql_caveats,
+                            )
+                            .is_ok()
+                            && crate::models::delegation::unsupported_stored_sql_caveat(
+                                ability.ability.as_ref().as_ref(),
+                                &ability.caveats,
+                                delegated_sql_caveats,
+                            )
+                            .is_none()
                     };
                     let valid_chain = graph.has_covering_chain(
                         parents.iter().map(|(parent, _)| parent.id),
@@ -552,7 +648,41 @@ fn caveats_contain_child(parent: &Caveats, child: &Caveats) -> Result<(), String
     }
 }
 
-fn extract_sql_caveat(
+/// TC-1791: [`caveats_contain_child`] for one invoked ability. A stored
+/// delegated `tables` / `columns` / `readOnly` form on a SQL ability does not
+/// refuse an invocation whose own capability carries no caveat: the restriction
+/// is applied to the request from the whole chain when it executes. An
+/// invocation capability that carries a delegated form of its own is refused by
+/// the `unsupported_sql_caveat` check below.
+fn ability_caveats_contain_child(
+    ability: &str,
+    parent: &Caveats,
+    child: &Caveats,
+    delegated_sql_caveats: bool,
+) -> Result<(), String> {
+    if delegated_sql_caveats && ability.starts_with("tinycloud.sql/") {
+        use crate::sql::delegated_caveats::{classify, AbilityCaveats, Reading};
+        match (
+            classify(parent, Reading::Stored),
+            classify(child, Reading::Stored),
+        ) {
+            (Ok(AbilityCaveats::Form(_)), Ok(AbilityCaveats::Unrestricted)) => return Ok(()),
+            (Ok(AbilityCaveats::Form(_)), _) => {
+                return Err("invocation-caveats-not-subset-of-chain".to_string());
+            }
+            // A parent of only empty entries imposes nothing, whatever shape
+            // the empty entries take.
+            (Ok(AbilityCaveats::Unrestricted), Ok(_)) if !parent.0.is_empty() => {
+                return caveats_contain_child(&Caveats::default(), child);
+            }
+            _ => {}
+        }
+    }
+    caveats_contain_child(parent, child)
+}
+
+/// Parses the constrained-statements profile carried by one capability's caveats.
+pub fn extract_sql_caveat(
     caveats: &Caveats,
 ) -> Option<crate::policy_capability::SqlConstrainedStatementCaveat> {
     for v in caveats.0.values() {
@@ -579,11 +709,7 @@ fn is_root_authority(cap: &util::Capability, invoker: &str) -> bool {
     }
 
     match &cap.resource {
-        Resource::Other(uri) => uri
-            .as_str()
-            .parse::<NetworkId>()
-            .map(|network_id| did_principal_matches(network_id.owner_did(), invoker))
-            .unwrap_or(false),
+        Resource::Other(uri) => key_id::owned_by(uri.as_str(), invoker),
         Resource::TinyCloud(_) => false,
     }
 }
@@ -1504,5 +1630,608 @@ mod tests {
         let child_with_constraints = make_sql_constrained_caveat("get", "SELECT 1");
         caveats_contain_child(&parent, &child_with_constraints)
             .expect("narrowing on an unconstrained parent must be allowed");
+    }
+
+    async fn caveat_chain_db(
+        resource: &str,
+        ability: &str,
+        parent_caveats: Caveats,
+    ) -> (DatabaseConnection, tinycloud_auth::ipld_core::cid::Cid) {
+        let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
+            .await
+            .unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        for actor_id in ["did:key:owner", "did:key:alias"] {
+            actor::ActiveModel {
+                id: Set(actor_id.to_string()),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+        }
+        let id = crate::hash::hash(format!("parent-{ability}").as_bytes());
+        delegation::ActiveModel {
+            id: Set(id),
+            delegator: Set("did:key:owner".to_string()),
+            delegatee: Set("did:key:alias".to_string()),
+            expiry: Set(None),
+            issued_at: Set(None),
+            not_before: Set(None),
+            facts: Set(None),
+            serialization: Set(id.as_ref().to_vec()),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        abilities::ActiveModel {
+            delegation: Set(id),
+            resource: Set(resource.parse().unwrap()),
+            ability: Set(ability.to_string().try_into().unwrap()),
+            caveats: Set(parent_caveats),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        (db, id.to_cid(0x55))
+    }
+
+    fn caveat_capability(
+        resource: &str,
+        ability: &str,
+        caveats: Caveats,
+    ) -> crate::util::Capability {
+        crate::util::Capability {
+            resource: resource.parse().unwrap(),
+            ability: ability.to_string().try_into().unwrap(),
+            caveats,
+        }
+    }
+
+    fn tables_caveat() -> Caveats {
+        Caveats(BTreeMap::from([(
+            "tables".to_string(),
+            serde_json::json!(["a"]),
+        )]))
+    }
+
+    fn mixed_sql_caveat() -> Caveats {
+        let mut caveats = make_sql_constrained_caveat("get", "SELECT 1");
+        caveats
+            .0
+            .insert("tables".to_string(), serde_json::json!(["a"]));
+        caveats
+    }
+
+    #[tokio::test]
+    async fn sql_invocation_with_unsupported_caveat_is_refused() {
+        let resource = "tinycloud:did:key:owner/sql/db";
+        let (db, parent) =
+            caveat_chain_db(resource, "tinycloud.sql/read", Caveats::default()).await;
+        let capability = caveat_capability(resource, "tinycloud.sql/read", tables_caveat());
+        let err = crate::models::invocation::authorize_holder(
+            &db,
+            "did:key:alias",
+            &[capability],
+            &[parent],
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                Error::InvalidInvocation(InvocationError::UnsupportedCaveat(_))
+            ),
+            "unexpected rejection: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stored_unsupported_sql_row_does_not_cover_invocation() {
+        let resource = "tinycloud:did:key:owner/sql/db";
+        let (db, parent) =
+            caveat_chain_db(resource, "tinycloud.sql/read", mixed_sql_caveat()).await;
+        let capability = caveat_capability(
+            resource,
+            "tinycloud.sql/read",
+            make_sql_constrained_caveat("get", "SELECT 1"),
+        );
+        let err = crate::models::invocation::authorize_holder(
+            &db,
+            "did:key:alias",
+            &[capability],
+            &[parent],
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                Error::InvalidInvocation(InvocationError::UnauthorizedAction(_, _))
+            ),
+            "unexpected rejection: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sql_constrained_profile_grant_authorizes_invocation() {
+        let resource = "tinycloud:did:key:owner/sql/db";
+        let caveats = make_sql_constrained_caveat("get", "SELECT 1");
+        let (db, parent) = caveat_chain_db(resource, "tinycloud.sql/read", caveats.clone()).await;
+        crate::models::invocation::authorize_holder(
+            &db,
+            "did:key:alias",
+            &[caveat_capability(resource, "tinycloud.sql/read", caveats)],
+            &[parent],
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .expect("a matching constrained-statements grant authorizes");
+    }
+
+    fn delegated_form_caveat(list: serde_json::Value) -> Caveats {
+        Caveats(BTreeMap::from([("0".to_string(), list)]))
+    }
+
+    async fn holder_under(
+        db: &DatabaseConnection,
+        parent: tinycloud_auth::ipld_core::cid::Cid,
+        own: Caveats,
+        setting: bool,
+    ) -> Result<(), Error> {
+        let resource = "tinycloud:did:key:owner/sql/db";
+        crate::models::invocation::authorize_holder_with_setting(
+            db,
+            "did:key:alias",
+            &[caveat_capability(resource, "tinycloud.sql/read", own)],
+            &[parent],
+            OffsetDateTime::now_utc(),
+            setting,
+        )
+        .await
+    }
+
+    fn not_subset_of_chain(error: &Error) -> bool {
+        matches!(
+            error,
+            Error::InvalidInvocation(InvocationError::CaveatsNotContained(reason))
+                if reason == "invocation-caveats-not-subset-of-chain"
+        )
+    }
+
+    /// TC-1791: with the setting on, a stored delegated `tables` form does not
+    /// refuse an invocation whose own capability carries no caveat (the chain's
+    /// restriction is applied when the request runs), and an invocation cannot
+    /// carry the form itself. With the setting off the stored form is refused
+    /// as any non-profile caveat is.
+    #[tokio::test]
+    async fn stored_delegated_form_covers_an_invocation_only_with_the_setting_on() {
+        let resource = "tinycloud:did:key:owner/sql/db";
+        let stored = delegated_form_caveat(serde_json::json!({"tables": ["a"]}));
+        let (db, parent) = caveat_chain_db(resource, "tinycloud.sql/read", stored).await;
+        holder_under(&db, parent, Caveats::default(), true)
+            .await
+            .expect("a stored delegated form covers an invocation without a caveat");
+
+        for own in [
+            delegated_form_caveat(serde_json::json!({"tables": ["a"]})),
+            delegated_form_caveat(serde_json::json!({"tables": ["b"]})),
+            make_sql_constrained_caveat("get", "SELECT 1"),
+        ] {
+            let err = holder_under(&db, parent, own, true).await.unwrap_err();
+            assert!(
+                matches!(&err, Error::InvalidInvocation(_)),
+                "unexpected rejection: {err:?}"
+            );
+        }
+
+        // Setting off: refused as any non-profile stored caveat is, and an
+        // invocation capability carrying the form is an unsupported caveat.
+        let err = holder_under(&db, parent, Caveats::default(), false)
+            .await
+            .unwrap_err();
+        assert!(not_subset_of_chain(&err), "unexpected rejection: {err:?}");
+        let err = holder_under(
+            &db,
+            parent,
+            delegated_form_caveat(serde_json::json!({"tables": ["a"]})),
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                Error::InvalidInvocation(InvocationError::UnsupportedCaveat(_))
+            ),
+            "unexpected rejection: {err:?}"
+        );
+    }
+
+    /// TC-1791: with the setting on, a stored grant of only empty entries
+    /// imposes nothing; with it off it is refused.
+    #[tokio::test]
+    async fn stored_grant_of_only_empty_entries_covers_any_invocation_only_with_the_setting_on() {
+        let resource = "tinycloud:did:key:owner/sql/db";
+        let stored = Caveats(BTreeMap::from([
+            ("0".to_string(), serde_json::json!({})),
+            ("1".to_string(), serde_json::json!({})),
+        ]));
+        let (db, parent) = caveat_chain_db(resource, "tinycloud.sql/read", stored).await;
+        for own in [
+            Caveats::default(),
+            make_sql_constrained_caveat("get", "SELECT 1"),
+        ] {
+            holder_under(&db, parent, own.clone(), true)
+                .await
+                .expect("empty entries restrict nothing");
+            let err = holder_under(&db, parent, own, false).await.unwrap_err();
+            assert!(not_subset_of_chain(&err), "unexpected rejection: {err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn duckdb_invocation_with_caveat_is_refused() {
+        let resource = "tinycloud:did:key:owner/duckdb/db";
+        let (db, parent) =
+            caveat_chain_db(resource, "tinycloud.duckdb/read", Caveats::default()).await;
+        let capability = caveat_capability(resource, "tinycloud.duckdb/read", tables_caveat());
+        let err = crate::models::invocation::authorize_holder(
+            &db,
+            "did:key:alias",
+            &[capability],
+            &[parent],
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                Error::InvalidInvocation(InvocationError::UnsupportedCaveat(_))
+            ),
+            "unexpected rejection: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn duckdb_empty_caveat_grant_authorizes_invocation() {
+        let resource = "tinycloud:did:key:owner/duckdb/db";
+        let (db, parent) =
+            caveat_chain_db(resource, "tinycloud.duckdb/read", Caveats::default()).await;
+        crate::models::invocation::authorize_holder(
+            &db,
+            "did:key:alias",
+            &[caveat_capability(
+                resource,
+                "tinycloud.duckdb/read",
+                Caveats::default(),
+            )],
+            &[parent],
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .expect("an empty-caveat DuckDB grant authorizes");
+    }
+
+    const KEY_OWNER: &str = "did:pkh:eip155:1:0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed";
+    const KEY_OTHER: &str = "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
+
+    async fn empty_db() -> DatabaseConnection {
+        let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
+            .await
+            .unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        db
+    }
+
+    /// The owner invoking a key under its own namespace needs no parents.
+    #[tokio::test]
+    async fn owner_invokes_own_key_without_parents() {
+        let db = empty_db().await;
+        let resource = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/tinychat");
+        let capability = caveat_capability(
+            &resource,
+            "tinycloud.encryption/key.create",
+            Caveats::default(),
+        );
+        crate::models::invocation::authorize_holder(
+            &db,
+            KEY_OWNER,
+            &[capability],
+            &[],
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .expect("owner is root authority for own keys");
+    }
+
+    /// A key prefix names a namespace and is refused as an invocation target,
+    /// including for its owner.
+    #[tokio::test]
+    async fn key_prefix_is_not_invocable_even_by_owner() {
+        let db = empty_db().await;
+        let resource = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/tinychat/");
+        let capability = caveat_capability(
+            &resource,
+            "tinycloud.encryption/key.create",
+            Caveats::default(),
+        );
+        let err = crate::models::invocation::authorize_holder(
+            &db,
+            KEY_OWNER,
+            &[capability],
+            &[],
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                Error::InvalidInvocation(InvocationError::EncryptionPrefixNotInvocable)
+            ),
+            "unexpected rejection: {err:?}"
+        );
+    }
+
+    /// A key invoked by a principal that does not own it must cite parents.
+    #[tokio::test]
+    async fn non_owner_key_invocation_without_parents_is_refused() {
+        let db = empty_db().await;
+        let resource = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/tinychat");
+        let capability = caveat_capability(
+            &resource,
+            "tinycloud.encryption/key.create",
+            Caveats::default(),
+        );
+        let err = crate::models::invocation::authorize_holder(
+            &db,
+            KEY_OTHER,
+            &[capability],
+            &[],
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                Error::InvalidInvocation(InvocationError::MissingParents)
+            ),
+            "unexpected rejection: {err:?}"
+        );
+    }
+
+    /// Malformed key identifiers are refused as invocation targets, including for the owner.
+    #[tokio::test]
+    async fn malformed_key_identifiers_are_refused_in_invocations() {
+        let db = empty_db().await;
+        let mut skipped = 0;
+        for resource in crate::encryption_network::key_id::MALFORMED_KEY_IDS {
+            // Ids that fail URI parsing cannot be built into a capability, so there is nothing to admit or refuse.
+            if resource.parse::<crate::types::Resource>().is_err() {
+                skipped += 1;
+                continue;
+            }
+            let capability = caveat_capability(
+                resource,
+                "tinycloud.encryption/key.create",
+                Caveats::default(),
+            );
+            let result = crate::models::invocation::authorize_holder(
+                &db,
+                KEY_OWNER,
+                &[capability],
+                &[],
+                OffsetDateTime::now_utc(),
+            )
+            .await;
+            let err = match result {
+                Err(err) => err,
+                Ok(_) => panic!("accepted malformed key identifier: {resource}"),
+            };
+            assert!(
+                matches!(
+                    &err,
+                    Error::InvalidInvocation(InvocationError::MissingParents)
+                ),
+                "unexpected rejection for {resource}: {err:?}"
+            );
+        }
+        assert_eq!(
+            skipped, 2,
+            "URI-invalid key identifiers in MALFORMED_KEY_IDS"
+        );
+    }
+
+    /// An owner-issued prefix grant, re-delegated for one exact key, admits an
+    /// invocation of that key and refuses a sibling prefix that only shares its text.
+    #[tokio::test]
+    async fn chained_key_grant_admits_exact_key_and_refuses_sibling_prefix() {
+        const KEY_MIDDLE: &str = "did:pkh:eip155:1:0x0000000000000000000000000000000000000001";
+        let db = empty_db().await;
+        for actor_id in [KEY_OWNER, KEY_MIDDLE, KEY_OTHER] {
+            actor::ActiveModel {
+                id: Set(actor_id.to_string()),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+        }
+        let prefix_grant = crate::hash::hash(b"owner-prefix-grant");
+        let key_grant = crate::hash::hash(b"middle-exact-key-grant");
+        let prefix = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/foo/");
+        let key = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/foo/x");
+        for (id, delegator, delegatee, resource) in [
+            (prefix_grant, KEY_OWNER, KEY_MIDDLE, prefix.as_str()),
+            (key_grant, KEY_MIDDLE, KEY_OTHER, key.as_str()),
+        ] {
+            delegation::ActiveModel {
+                id: Set(id),
+                delegator: Set(delegator.to_string()),
+                delegatee: Set(delegatee.to_string()),
+                expiry: Set(None),
+                issued_at: Set(None),
+                not_before: Set(None),
+                facts: Set(None),
+                serialization: Set(id.as_ref().to_vec()),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+            abilities::ActiveModel {
+                delegation: Set(id),
+                resource: Set(resource.parse().unwrap()),
+                ability: Set("tinycloud.encryption/decrypt"
+                    .to_string()
+                    .try_into()
+                    .unwrap()),
+                caveats: Set(Caveats::default()),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+        }
+        parent_delegations::ActiveModel {
+            parent: Set(prefix_grant),
+            child: Set(key_grant),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        let capability =
+            caveat_capability(&key, "tinycloud.encryption/decrypt", Caveats::default());
+        crate::models::invocation::authorize_holder(
+            &db,
+            KEY_OTHER,
+            &[capability],
+            &[key_grant.to_cid(0x55)],
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .expect("chained exact-key grant admits its key");
+
+        let sibling = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/foobar/x");
+        let capability =
+            caveat_capability(&sibling, "tinycloud.encryption/decrypt", Caveats::default());
+        let err = crate::models::invocation::authorize_holder(
+            &db,
+            KEY_OTHER,
+            &[capability],
+            &[key_grant.to_cid(0x55)],
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                Error::InvalidInvocation(InvocationError::UnauthorizedAction(_, _))
+            ),
+            "unexpected rejection: {err:?}"
+        );
+    }
+
+    /// Persists one terminal grant (`disableSubDelegation: true`) from KEY_OWNER to KEY_OTHER.
+    async fn terminal_grant_db() -> (sea_orm::DatabaseConnection, Hash, String) {
+        let db = empty_db().await;
+        for actor_id in [KEY_OWNER, KEY_OTHER] {
+            actor::ActiveModel {
+                id: Set(actor_id.to_string()),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+        }
+        let parent = crate::hash::hash(b"terminal-grant-invocation");
+        let prefix = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/foo/");
+        delegation::ActiveModel {
+            id: Set(parent),
+            delegator: Set(KEY_OWNER.to_string()),
+            delegatee: Set(KEY_OTHER.to_string()),
+            expiry: Set(None),
+            issued_at: Set(None),
+            not_before: Set(None),
+            facts: Set(Some(crate::types::Facts(std::collections::BTreeMap::from(
+                [(
+                    crate::util::DelegationMode::FACT_KEY.to_string(),
+                    serde_json::json!("terminal"),
+                )],
+            )))),
+            serialization: Set(parent.as_ref().to_vec()),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        abilities::ActiveModel {
+            delegation: Set(parent),
+            resource: Set(prefix.parse().unwrap()),
+            ability: Set("tinycloud.encryption/decrypt"
+                .to_string()
+                .try_into()
+                .unwrap()),
+            caveats: Set(Caveats::default()),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        let key = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/foo/x");
+        (db, parent, key)
+    }
+
+    /// A terminal grant still authorizes its delegatee: terminal forbids redelegation, not use.
+    #[tokio::test]
+    async fn terminal_grant_authorizes_its_delegatee() {
+        let (db, parent, key) = terminal_grant_db().await;
+        let capability =
+            caveat_capability(&key, "tinycloud.encryption/decrypt", Caveats::default());
+        crate::models::invocation::authorize_holder(
+            &db,
+            KEY_OTHER,
+            &[capability],
+            &[parent.to_cid(0x55)],
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .expect("terminal grant authorizes its delegatee");
+    }
+
+    /// Invocations citing a delegation CID with no persisted row are refused, alone or alongside a persisted parent.
+    #[tokio::test]
+    async fn invocation_citing_unpersisted_delegation_cid_is_refused() {
+        let (db, parent, key) = terminal_grant_db().await;
+        let parent_cid = parent.to_cid(0x55);
+        let unpersisted = crate::hash::hash(b"delegation-never-persisted").to_cid(0x55);
+        let unknown = crate::hash::hash(b"delegation-unknown").to_cid(0x55);
+        for (label, cited) in [
+            ("unpersisted cid alone", vec![unpersisted]),
+            (
+                "persisted parent plus unpersisted cid",
+                vec![parent_cid, unpersisted],
+            ),
+            ("unknown cid", vec![unknown]),
+        ] {
+            let capability =
+                caveat_capability(&key, "tinycloud.encryption/decrypt", Caveats::default());
+            let err = crate::models::invocation::authorize_holder(
+                &db,
+                KEY_OTHER,
+                &[capability],
+                &cited,
+                OffsetDateTime::now_utc(),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(
+                    &err,
+                    Error::InvalidInvocation(InvocationError::MissingParents)
+                ),
+                "{label}: unexpected rejection: {err:?}"
+            );
+        }
     }
 }
