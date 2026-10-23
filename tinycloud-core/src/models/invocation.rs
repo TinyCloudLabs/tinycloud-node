@@ -378,7 +378,11 @@ async fn validate_capabilities<C: ConnectionTrait>(
                 }
             };
 
-            // every cited parent must resolve to a distinct persisted row
+            // every cited CID must name a delegation row that is already persisted.
+            // Rows are written only by the delegation registration path
+            // (`Database::delegate` -> `delegation::process`), so a delegation that
+            // was refused at registration has no row and cannot be cited here, alone
+            // or alongside a persisted parent.
             let mut cited = std::collections::HashSet::new();
             let mut parents = Vec::with_capacity(root_ids.len());
             for id in &root_ids {
@@ -1935,5 +1939,105 @@ mod tests {
             ),
             "unexpected rejection: {err:?}"
         );
+    }
+
+    /// Persists one terminal grant (`disableSubDelegation: true`) from KEY_OWNER to KEY_OTHER.
+    async fn terminal_grant_db() -> (sea_orm::DatabaseConnection, Hash, String) {
+        let db = empty_db().await;
+        for actor_id in [KEY_OWNER, KEY_OTHER] {
+            actor::ActiveModel {
+                id: Set(actor_id.to_string()),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+        }
+        let parent = crate::hash::hash(b"terminal-grant-invocation");
+        let prefix = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/foo/");
+        delegation::ActiveModel {
+            id: Set(parent),
+            delegator: Set(KEY_OWNER.to_string()),
+            delegatee: Set(KEY_OTHER.to_string()),
+            expiry: Set(None),
+            issued_at: Set(None),
+            not_before: Set(None),
+            facts: Set(Some(crate::types::Facts(std::collections::BTreeMap::from(
+                [(
+                    crate::util::DelegationMode::FACT_KEY.to_string(),
+                    serde_json::json!("terminal"),
+                )],
+            )))),
+            serialization: Set(parent.as_ref().to_vec()),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        abilities::ActiveModel {
+            delegation: Set(parent),
+            resource: Set(prefix.parse().unwrap()),
+            ability: Set("tinycloud.encryption/decrypt"
+                .to_string()
+                .try_into()
+                .unwrap()),
+            caveats: Set(Caveats::default()),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        let key = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/foo/x");
+        (db, parent, key)
+    }
+
+    /// A terminal grant still authorizes its delegatee: terminal forbids redelegation, not use.
+    #[tokio::test]
+    async fn terminal_grant_authorizes_its_delegatee() {
+        let (db, parent, key) = terminal_grant_db().await;
+        let capability =
+            caveat_capability(&key, "tinycloud.encryption/decrypt", Caveats::default());
+        crate::models::invocation::authorize_holder(
+            &db,
+            KEY_OTHER,
+            &[capability],
+            &[parent.to_cid(0x55)],
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .expect("terminal grant authorizes its delegatee");
+    }
+
+    /// Invocations citing a delegation CID with no persisted row are refused, alone or alongside a persisted parent.
+    #[tokio::test]
+    async fn invocation_citing_unpersisted_delegation_cid_is_refused() {
+        let (db, parent, key) = terminal_grant_db().await;
+        let parent_cid = parent.to_cid(0x55);
+        let unpersisted = crate::hash::hash(b"delegation-never-persisted").to_cid(0x55);
+        let unknown = crate::hash::hash(b"delegation-unknown").to_cid(0x55);
+        for (label, cited) in [
+            ("unpersisted cid alone", vec![unpersisted]),
+            (
+                "persisted parent plus unpersisted cid",
+                vec![parent_cid, unpersisted],
+            ),
+            ("unknown cid", vec![unknown]),
+        ] {
+            let capability =
+                caveat_capability(&key, "tinycloud.encryption/decrypt", Caveats::default());
+            let err = crate::models::invocation::authorize_holder(
+                &db,
+                KEY_OTHER,
+                &[capability],
+                &cited,
+                OffsetDateTime::now_utc(),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(
+                    &err,
+                    Error::InvalidInvocation(InvocationError::MissingParents)
+                ),
+                "{label}: unexpected rejection: {err:?}"
+            );
+        }
     }
 }
