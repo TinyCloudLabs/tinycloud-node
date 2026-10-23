@@ -1,0 +1,220 @@
+//! TC-1777: with `[global.encryption_network] named_keys_v1` off (the
+//! default), the production app does not mount the named-key routes and
+//! `/delegate` refuses delegations on keys and key prefixes, for UCAN and
+//! SIWE (CACAO) delegations alike. Booted through `app_with_control`, so the
+//! route set is the one a node serves.
+
+use super::test_harness::*;
+use super::*;
+use rocket::http::{ContentType, Header};
+use tinycloud_core::encryption_network::{CreateNetworkRequest, EncryptionService, Threshold};
+
+const NAMED_KEYS_UNAVAILABLE: &str =
+    "named_keys_unavailable: named keys are not enabled on this node";
+const KEY_DECRYPT: &str = "tinycloud.encryption/decrypt";
+const KEY_CREATE: &str = "tinycloud.encryption/key.create";
+
+/// Status, body and content type of a response.
+async fn answer(
+    request: rocket::local::asynchronous::LocalRequest<'_>,
+) -> (Status, String, String) {
+    let response = request.dispatch().await;
+    let status = response.status();
+    let content_type = response
+        .content_type()
+        .map(|content_type| content_type.to_string())
+        .unwrap_or_default();
+    (
+        status,
+        response.into_string().await.unwrap_or_default(),
+        content_type,
+    )
+}
+
+/// The four named-key routes answer exactly as an unmounted path does, and the
+/// network routes still answer.
+async fn named_key_routes_are_unmounted_and_network_routes_are_not(
+    backend: Backend,
+) -> anyhow::Result<()> {
+    let Some(h) = Harness::new(
+        backend,
+        Shape::KeySession,
+        "named_key_routes_are_unmounted_and_network_routes_are_not",
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let network = h
+        .client
+        .rocket()
+        .state::<EncryptionService>()
+        .expect("EncryptionService is managed")
+        .create_one_of_one_network(CreateNetworkRequest {
+            name: "net".to_string(),
+            owner_did: h.space_owner.did().to_string(),
+            threshold: Threshold::one_of_one(),
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("{error}"))?
+        .network_id
+        .to_string();
+    let json = || ContentType::JSON;
+    let authorization = || Header::new("Authorization", "not-a-token");
+    let remote = || "127.0.0.1:0".parse().expect("socket address");
+
+    let unmounted_post = answer(
+        h.client
+            .post(format!("/encryption/networks/{network}/no-such-route"))
+            .header(json())
+            .body("{}"),
+    )
+    .await;
+    let unmounted_get = answer(
+        h.client
+            .get(format!(
+                "/encryption/networks/{network}/no-such-route/docs/a"
+            ))
+            .remote(remote()),
+    )
+    .await;
+    assert_eq!(unmounted_post.0, Status::NotFound);
+    assert_eq!(unmounted_get.0, Status::NotFound);
+
+    let key_routes = [
+        (
+            "create",
+            answer(
+                h.client
+                    .post(format!("/encryption/networks/{network}/keys"))
+                    .header(json())
+                    .header(authorization())
+                    .body("{}"),
+            )
+            .await,
+            &unmounted_post,
+        ),
+        (
+            "public key",
+            answer(
+                h.client
+                    .get(format!("/encryption/networks/{network}/keys/docs/a"))
+                    .remote(remote()),
+            )
+            .await,
+            &unmounted_get,
+        ),
+        (
+            "describe",
+            answer(
+                h.client
+                    .get(format!("/encryption/networks/{network}/keys/docs/a"))
+                    .header(authorization())
+                    .remote(remote()),
+            )
+            .await,
+            &unmounted_get,
+        ),
+        (
+            "block",
+            answer(
+                h.client
+                    .post(format!("/encryption/networks/{network}/key-actions/block"))
+                    .header(json())
+                    .header(authorization())
+                    .body("{}"),
+            )
+            .await,
+            &unmounted_post,
+        ),
+        (
+            "unblock",
+            answer(
+                h.client
+                    .post(format!(
+                        "/encryption/networks/{network}/key-actions/unblock"
+                    ))
+                    .header(json())
+                    .header(authorization())
+                    .body("{}"),
+            )
+            .await,
+            &unmounted_post,
+        ),
+    ];
+    for (label, got, unmounted) in key_routes {
+        assert_eq!(got.0, Status::NotFound, "{label}: {got:?}");
+        assert_eq!(&got, unmounted, "{label} differs from an unmounted path");
+    }
+
+    // The network routes keep their own answers.
+    let (status, body, _) = answer(h.client.get(format!("/encryption/networks/{network}"))).await;
+    assert_eq!(status, Status::Ok, "{body}");
+    let (status, body, _) = answer(h.client.get("/encryption/networks/not-a-network")).await;
+    assert_eq!(status, Status::BadRequest, "{body}");
+    for path in ["decrypt", "revoke"] {
+        let (status, body, _) = answer(
+            h.client
+                .post(format!("/encryption/networks/{network}/{path}"))
+                .header(json())
+                .header(authorization())
+                .body("{}"),
+        )
+        .await;
+        assert_ne!(status, Status::NotFound, "{path}: {body}");
+    }
+    Ok(())
+}
+on_both_backends!(named_key_routes_are_unmounted_and_network_routes_are_not);
+
+/// An owner-signed delegation on a key or a key prefix is refused with the
+/// code and nothing is stored, for a did:key owner (UCAN) and a did:pkh
+/// owner (SIWE CACAO); the owner's grant on the bare network is admitted.
+async fn delegations_on_named_keys_are_refused(backend: Backend) -> anyhow::Result<()> {
+    for (shape, label) in [
+        (
+            Shape::KeySession,
+            "delegations_on_named_keys_are_refused_ucan",
+        ),
+        (
+            Shape::PkhSession,
+            "delegations_on_named_keys_are_refused_cacao",
+        ),
+    ] {
+        let Some(h) = Harness::new(backend, shape, label).await? else {
+            return Ok(());
+        };
+        let window = || Window::until(now() + Duration::hours(1));
+        let key = format!("{}/docs/a", h.network);
+        let prefix = format!("{}/docs/", h.network);
+        for (what, grants) in [
+            ("key", vec![(key.clone(), KEY_DECRYPT)]),
+            ("prefix", vec![(prefix.clone(), KEY_DECRYPT)]),
+            ("key create", vec![(key.clone(), KEY_CREATE)]),
+            (
+                "network and prefix",
+                vec![
+                    (h.network.clone(), KEY_DECRYPT),
+                    (prefix.clone(), KEY_DECRYPT),
+                ],
+            ),
+        ] {
+            let authorization = h
+                .space_owner
+                .delegate(h.owner.did(), &grants, window(), &[])?;
+            let (status, body) = h.delegate(authorization).await;
+            assert_eq!(status, Status::Unauthorized, "{label} {what}: {body}");
+            assert_eq!(body, NAMED_KEYS_UNAVAILABLE, "{label} {what}");
+        }
+        let authorization = h.space_owner.delegate(
+            h.owner.did(),
+            &[(h.network.clone(), KEY_DECRYPT)],
+            window(),
+            &[],
+        )?;
+        let (status, body) = h.delegate(authorization).await;
+        assert_eq!(status, Status::Ok, "{label} bare network: {body}");
+    }
+    Ok(())
+}
+on_both_backends!(delegations_on_named_keys_are_refused);

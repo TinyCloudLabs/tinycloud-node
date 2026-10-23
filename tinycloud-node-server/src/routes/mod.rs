@@ -1795,6 +1795,25 @@ async fn invoke_impl(
             tinycloud_core::request_telemetry::observe_space(space);
         }
 
+        // Named keys are served only while `named_keys_v1` is on: with it
+        // off, an invocation on a key or key prefix is refused before any
+        // specialized dispatch. The bare network resource is unaffected.
+        if !config.encryption_network.named_keys_v1
+            && admitted
+                .invocation()
+                .0
+                .capabilities
+                .iter()
+                .any(|capability| capability.resource.is_named_key())
+        {
+            return Err((
+                Status::Forbidden,
+                tinycloud_core::models::delegation::DelegationError::NamedKeysUnavailable
+                    .to_string(),
+            )
+                .into());
+        }
+
         // TC-732: `kv/sync` must be the invocation's only capability and
         // target a KV resource. The KV root is the whole-space feed. Check
         // shape before any specialized dispatch so mixed invocations fail
@@ -10291,7 +10310,8 @@ mod tests {
             StaticSecret::new(vec![0u8; 32]).unwrap(),
         )
         .await?
-        .with_delegated_sql_caveats(config.sql.delegated_caveats_enforced);
+        .with_delegated_sql_caveats(config.sql.delegated_caveats_enforced)
+        .with_named_keys(config.encryption_network.named_keys_v1);
         let conn = db;
         space_model::ActiveModel {
             id: Set(SpaceIdWrap(space.clone())),
@@ -10775,10 +10795,14 @@ mod tests {
         }
 
         /// [`Self::new`] with extra routes or managed state on the same rocket.
+        /// Named keys are on, so the fixture serves the key routes and
+        /// resources; use [`Self::new_configured`] for a node with them off.
         async fn new_with(
             extend: impl FnOnce(rocket::Rocket<rocket::Build>) -> rocket::Rocket<rocket::Build>,
         ) -> Result<Self> {
-            Self::new_configured(Config::default(), extend).await
+            let mut config = Config::default();
+            config.encryption_network.named_keys_v1 = true;
+            Self::new_configured(config, extend).await
         }
 
         /// [`Self::new_with`] with `config` instead of the default.

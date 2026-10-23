@@ -29,9 +29,20 @@ fn owner_did(fixture: &KvSyncFixture) -> String {
         .to_string()
 }
 
-/// Fixture with the key routes mounted and one active 1-of-1 network.
+/// Fixture with the key routes mounted, named keys on, and one active 1-of-1
+/// network.
 async fn setup() -> Result<(KvSyncFixture, String)> {
-    let fixture = KvSyncFixture::new_with(|rocket| {
+    setup_with(true).await
+}
+
+/// As [`setup`], with `[encryption_network] named_keys_v1` set to
+/// `named_keys`. The fixture mounts the key handlers either way; production
+/// mounting is covered by `policy_v3::named_keys_gate_tests`. What this
+/// setting changes here is what `/delegate` and `/invoke` accept.
+async fn setup_with(named_keys: bool) -> Result<(KvSyncFixture, String)> {
+    let mut config = Config::default();
+    config.encryption_network.named_keys_v1 = named_keys;
+    let fixture = KvSyncFixture::new_configured(config, |rocket| {
         rocket
             .mount(
                 "/",
@@ -2049,5 +2060,143 @@ async fn doubled_network_segment_in_a_key_url_is_a_bad_request() -> Result<()> {
         let (status, text) = get(&fixture.client, &url, None).await;
         assert_eq!(status, Status::BadRequest, "{url}: {text}");
     }
+    Ok(())
+}
+
+const NAMED_KEYS_UNAVAILABLE: &str =
+    "named_keys_unavailable: named keys are not enabled on this node";
+
+/// `POST /delegate` of `caps` (resource, ability), signed by the fixture
+/// owner with no proofs, to the fixture device.
+async fn delegate_caps(fixture: &KvSyncFixture, caps: &[(&str, &str)]) -> Result<(Status, String)> {
+    use tinycloud_auth::ssi::{
+        dids::{DIDBuf, DIDURLBuf},
+        ucan::Payload,
+    };
+    use tinycloud_auth::ucan_capabilities_object::Capabilities;
+    let mut capabilities = Capabilities::new();
+    for (uri, action) in caps {
+        capabilities.with_action(
+            uri.parse()?,
+            action.parse::<UcanAbility>()?,
+            [std::collections::BTreeMap::<String, Value>::new()],
+        );
+    }
+    let token = Payload {
+        issuer: fixture.owner_vm.parse::<DIDURLBuf>()?,
+        audience: fixture.device_did().parse::<DIDBuf>()?,
+        not_before: None,
+        expiration: NumericDate::try_from_seconds(4_102_444_800.0)?,
+        nonce: Some(fixture.next_nonce()),
+        facts: Some(Vec::<Value>::new()),
+        proof: vec![],
+        attenuation: capabilities,
+    }
+    .sign(
+        fixture.owner.get_algorithm().unwrap_or_default(),
+        &fixture.owner,
+    )?
+    .encode()?;
+    let response = fixture
+        .client
+        .post("/delegate")
+        .header(Header::new("Authorization", token))
+        .dispatch()
+        .await;
+    let status = response.status();
+    Ok((status, response.into_string().await.unwrap_or_default()))
+}
+
+async fn stored_delegations(fixture: &KvSyncFixture) -> Result<u64> {
+    use tinycloud_core::sea_orm::{EntityTrait, PaginatorTrait};
+    Ok(tinycloud_core::models::delegation::Entity::find()
+        .count(&fixture.conn)
+        .await?)
+}
+
+/// With named keys off, `/delegate` refuses every capability on a key or a
+/// key prefix, including a grant the key's owner signs with no proofs, and
+/// stores nothing. A grant on the bare network is unaffected.
+#[tokio::test]
+async fn delegate_refuses_named_key_resources_when_named_keys_are_off() -> Result<()> {
+    let (fixture, network) = setup_with(false).await?;
+    let key = key_uri(&network, "docs/a");
+    let prefix = format!("{network}/docs/");
+    let before = stored_delegations(&fixture).await?;
+    let cases: [(&str, Vec<(&str, &str)>); 5] = [
+        ("key", vec![(key.as_str(), DECRYPT_ACTION)]),
+        ("prefix", vec![(prefix.as_str(), DECRYPT_ACTION)]),
+        ("key create", vec![(key.as_str(), KEY_CREATE_ACTION)]),
+        ("prefix block", vec![(prefix.as_str(), KEY_BLOCK_ACTION)]),
+        (
+            "network and key",
+            vec![
+                (network.as_str(), DECRYPT_ACTION),
+                (key.as_str(), DECRYPT_ACTION),
+            ],
+        ),
+    ];
+    for (label, caps) in cases {
+        let (status, text) = delegate_caps(&fixture, &caps).await?;
+        assert_eq!(status, Status::Unauthorized, "{label}: {text}");
+        assert_eq!(text, NAMED_KEYS_UNAVAILABLE, "{label}");
+    }
+    assert_eq!(stored_delegations(&fixture).await?, before);
+
+    let (status, text) = delegate_caps(&fixture, &[(network.as_str(), DECRYPT_ACTION)]).await?;
+    assert_eq!(status, Status::Ok, "bare network grant: {text}");
+    assert_eq!(stored_delegations(&fixture).await?, before + 1);
+    Ok(())
+}
+
+/// With named keys on, the same owner-signed grants on a key and on a key
+/// prefix are admitted.
+#[tokio::test]
+async fn delegate_admits_named_key_resources_when_named_keys_are_on() -> Result<()> {
+    let (fixture, network) = setup().await?;
+    let key = key_uri(&network, "docs/a");
+    let prefix = format!("{network}/docs/");
+    for (label, resource) in [("key", key.as_str()), ("prefix", prefix.as_str())] {
+        let (status, text) = delegate_caps(&fixture, &[(resource, DECRYPT_ACTION)]).await?;
+        assert_eq!(status, Status::Ok, "{label}: {text}");
+    }
+    Ok(())
+}
+
+/// With named keys off, `/invoke` answers 403 with the code for a decrypt
+/// on a key or a key prefix, even for a key that exists; the bare network
+/// decrypt on the same route is not refused with it.
+#[tokio::test]
+async fn invoke_refuses_named_key_resources_when_named_keys_are_off() -> Result<()> {
+    let (fixture, network) = setup_with(false).await?;
+    let key_public = created_key(&fixture, &network, "docs/a").await;
+    let case = DecryptCase::wrapped_to(&key_public);
+    let (status, text) = invoke_named(&fixture, &network, "docs/a", &case).await;
+    assert_eq!(status, Status::Forbidden, "{text}");
+    assert_eq!(text, NAMED_KEYS_UNAVAILABLE);
+
+    let prefix = format!("{network}/docs/");
+    let (body, facts) = decrypt_request(&fixture, &network, &case, Some("docs/a"));
+    let auth = invocation(
+        &fixture,
+        &fixture.node_did,
+        &[(prefix.as_str(), DECRYPT_ACTION)],
+        vec![facts],
+    )?;
+    let (status, text) = invoke(&fixture, &auth, &body).await;
+    assert_eq!(status, Status::Forbidden, "{text}");
+    assert_eq!(text, NAMED_KEYS_UNAVAILABLE);
+
+    let root_public = root_public_key(&fixture, &network).await;
+    let case = DecryptCase::wrapped_to(&root_public);
+    let (body, facts) = decrypt_request(&fixture, &network, &case, None);
+    let auth = invocation(
+        &fixture,
+        &fixture.node_did,
+        &[(network.as_str(), DIRECT_DECRYPT_ABILITY)],
+        vec![facts],
+    )?;
+    let (status, text) = invoke(&fixture, &auth, &body).await;
+    assert_eq!(status, Status::Ok, "bare network decrypt: {text}");
     Ok(())
 }

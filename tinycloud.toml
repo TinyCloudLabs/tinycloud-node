@@ -87,8 +87,10 @@ cors = true
     # network_methods = false
 
 [global.encryption_network]
-    ## Advertise the `encryption-named-keys-v1` feature in GET /info.
-    ## Keep off until named keys are live on OpenKey. Off = feature withheld.
+    ## Serve named keys and advertise the `encryption-named-keys-v1` feature in
+    ## GET /info. Only while on are the key routes mounted, key and key-prefix
+    ## resources accepted in delegations and named-key decrypt served on
+    ## POST /invoke. Keep off until named keys are live on OpenKey.
     ## Env: TINYCLOUD_ENCRYPTION_NETWORK__NAMED_KEYS_V1
     # named_keys_v1 = false
 
