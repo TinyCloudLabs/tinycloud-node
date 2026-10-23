@@ -1017,11 +1017,9 @@ CREATE TRIGGER tc1836_fail_manifest_readback BEFORE UPDATE ON sql_store_manifest
             ))
             .expect("manifest row lock released after the failed read-back");
         // The CAS rolled back: with the trigger gone, the row still holds `f`.
-        m.db.execute_unprepared(
-            "DROP TRIGGER tc1836_fail_manifest_readback ON sql_store_manifest",
-        )
-        .await
-        .unwrap();
+        m.db.execute_unprepared("DROP TRIGGER tc1836_fail_manifest_readback ON sql_store_manifest")
+            .await
+            .unwrap();
         assert_eq!(m.current(&DB).await.unwrap().unwrap(), f, "CAS rolled back");
     }
 
