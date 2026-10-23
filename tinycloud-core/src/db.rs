@@ -332,37 +332,23 @@ where
 /// holder is a short transaction that 30s outlasts; a stuck session fails
 /// the boot with a clear error instead of hanging it. This bounds each lock
 /// wait, not how long a migration runs.
-const MIGRATION_LOCK_TIMEOUT: &str = "30s";
+pub(crate) const MIGRATION_LOCK_TIMEOUT: &str = "30s";
 
 /// Apply the schema migrations on `pool`.
 ///
-/// On PostgreSQL sea-orm-migration runs them in one transaction; it runs
-/// here inside an outer one that first lifts the pool's `statement_timeout`
-/// (TC-1054), since a migration or its backfill may legitimately run for
-/// minutes, and bounds every lock wait with `lock_timeout`
-/// ([`MIGRATION_LOCK_TIMEOUT`]). Both are `SET LOCAL`, so they end with the
-/// transaction and never reach the pooled session. The nested `BEGIN`
-/// becomes a savepoint, so the migrations stay atomic as before: a lock-wait
-/// failure rolls them all back, records none, and is reported as a
-/// [`DbErr::Migration`].
+/// On PostgreSQL the migrator in [`crate::migrations`] runs ordinary
+/// migrations inside transactions that first lift the pool's
+/// `statement_timeout` (TC-1054), since a migration or its backfill may
+/// legitimately run for minutes, and bound every lock wait with
+/// `lock_timeout` ([`MIGRATION_LOCK_TIMEOUT`]). Both are `SET LOCAL`, so they
+/// end with the transaction and never reach the pooled session. It commits
+/// before the concurrent `current_kv` index build (TC-737) and resumes
+/// afterward. A lock-wait failure rolls back the batch it was in, records
+/// none of it, and is reported as a [`DbErr::Migration`].
 pub async fn migrate(pool: &RecoveringConnection) -> Result<(), DbErr> {
-    let conn = pool.sea_orm_connection();
-    if conn.get_database_backend() != sea_orm::DatabaseBackend::Postgres {
-        return Migrator::up(conn, None).await;
-    }
-    let transaction = conn.begin().await?;
-    transaction
-        .execute_unprepared(crate::db_pool::EXEMPT_STATEMENT_TIMEOUT)
-        .await?;
-    transaction
-        .execute_unprepared(&format!(
-            "SET LOCAL lock_timeout = '{MIGRATION_LOCK_TIMEOUT}'"
-        ))
-        .await?;
-    Migrator::up(&transaction, None)
+    Migrator::up(pool.sea_orm_connection(), None)
         .await
-        .map_err(migration_lock_wait_error)?;
-    transaction.commit().await
+        .map_err(migration_lock_wait_error)
 }
 
 /// Name a migration's lock-wait failure (SQLSTATE 55P03, which
@@ -3873,9 +3859,8 @@ async fn list_bounded<C: ConnectionTrait>(
 ///
 /// The empty prefix covers the whole space. That is where this rule departs
 /// from `ResourceId::extends`, under which an empty base path covers only the
-/// empty key and keys starting with `/`. The departure is deliberate: a
-/// path-less `kv/list` lists the whole space. `tinycloud.kv/sync` rejects an
-/// empty prefix (TC-732), so a feed's scope never depends on the difference.
+/// empty key and keys starting with `/`. Both path-less `kv/list` and the
+/// root-scoped `kv/sync` feed cover the whole space.
 pub fn kv_prefix_covers(prefix: &str, key: &str) -> bool {
     prefix.is_empty()
         || key
@@ -3886,6 +3871,20 @@ pub fn kv_prefix_covers(prefix: &str, key: &str) -> bool {
 /// A list cursor must name a key inside the listed prefix; no cursor is fine.
 fn kv_list_cursor_in_prefix(prefix: &Path, cursor: Option<&Path>) -> bool {
     cursor.is_none_or(|cursor| kv_prefix_covers(prefix.as_str(), cursor.as_str()))
+}
+
+/// Half-open byte range of descendants, and whether the bare key also matches.
+pub(crate) fn kv_prefix_bounds(prefix: &str) -> Option<(String, String, bool)> {
+    if prefix.is_empty() {
+        return None;
+    }
+    let (lower, bare_prefix) = if prefix.ends_with('/') {
+        (prefix.to_owned(), false)
+    } else {
+        (format!("{prefix}/"), true)
+    };
+    let upper = format!("{}0", &lower[..lower.len() - 1]);
+    Some((lower, upper, bare_prefix))
 }
 
 /// Compare arbitrary resource columns in byte order on every backend. See
@@ -3899,15 +3898,7 @@ fn prefix_condition(
     column: impl Into<SimpleExpr> + Clone,
     prefix: &str,
 ) -> Option<Condition> {
-    if prefix.is_empty() {
-        return None;
-    }
-    let (lower, bare_prefix) = if prefix.ends_with('/') {
-        (prefix.to_owned(), false)
-    } else {
-        (format!("{prefix}/"), true)
-    };
-    let upper = format!("{}0", &lower[..lower.len() - 1]);
+    let (lower, upper, bare_prefix) = kv_prefix_bounds(prefix)?;
     let descendants = Condition::all()
         .add(byte_ordered(backend, column.clone()).gte(lower))
         .add(byte_ordered(backend, column.clone()).lt(upper));
@@ -3928,11 +3919,68 @@ pub(crate) fn kv_prefix_condition(backend: DbBackend, prefix: &str) -> Option<Co
     )
 }
 
-/// The `list_bounded_after` query. Paging compares (`key > after`) and orders
-/// (`ORDER BY key`) in one collation -- the column's own -- inside SQL, so a
-/// page boundary can never skip or repeat a key; membership is decided by the
-/// byte-ordered `kv_prefix_condition`. One more row than `limit` is fetched to
-/// detect truncation.
+#[derive(Debug, Clone, Copy)]
+enum KvListBranch {
+    All,
+    Bare,
+    Descendants,
+}
+
+/// On PostgreSQL, compare the keyset cursor and order rows in the same byte
+/// collation used for prefix membership. Other backends retain their existing
+/// native listing order (SQLite's is already byte order).
+fn kv_list_branch_statement(
+    backend: DbBackend,
+    space_id: &SpaceId,
+    prefix: &Path,
+    after: Option<&Path>,
+    row_limit: Option<usize>,
+    branch: KvListBranch,
+) -> Statement {
+    let key = Expr::col((current_kv::Entity, current_kv::Column::Key));
+    let mut condition = Condition::all()
+        .add(Expr::col(current_kv::Column::Deleted).eq(false))
+        .add(
+            Expr::col((current_kv::Entity, current_kv::Column::Space))
+                .eq(SpaceIdWrap(space_id.clone())),
+        );
+    match branch {
+        KvListBranch::All => {
+            if let Some(prefix) = kv_prefix_condition(backend, prefix.as_str()) {
+                condition = condition.add(prefix);
+            }
+        }
+        KvListBranch::Bare => {
+            condition = condition.add(byte_ordered(backend, key.clone()).eq(prefix.as_str()));
+        }
+        KvListBranch::Descendants => {
+            let (lower, upper, _) =
+                kv_prefix_bounds(prefix.as_str()).expect("descendants need a prefix");
+            condition = condition
+                .add(byte_ordered(backend, key.clone()).gte(lower))
+                .add(byte_ordered(backend, key.clone()).lt(upper));
+        }
+    }
+    let ordered_key: SimpleExpr = if backend == DbBackend::Postgres {
+        byte_ordered(backend, key.clone())
+    } else {
+        key.clone().into()
+    };
+    if let Some(after) = after {
+        condition = condition.add(ordered_key.clone().gt(after.as_str()));
+    }
+    let mut query = Query::select();
+    query
+        .column((current_kv::Entity, current_kv::Column::Key))
+        .from(current_kv::Entity)
+        .cond_where(condition)
+        .order_by_expr(ordered_key, Order::Asc);
+    if let Some(row_limit) = row_limit {
+        query.limit(row_limit as u64);
+    }
+    backend.build(&query)
+}
+
 fn kv_list_statement(
     backend: DbBackend,
     space_id: &SpaceId,
@@ -3940,29 +3988,14 @@ fn kv_list_statement(
     limit: Option<usize>,
     after: Option<&Path>,
 ) -> Statement {
-    let mut condition = Condition::all()
-        .add(Expr::col(current_kv::Column::Deleted).eq(false))
-        .add(
-            Expr::col((current_kv::Entity, current_kv::Column::Space))
-                .eq(SpaceIdWrap(space_id.clone())),
-        );
-    if let Some(prefix) = kv_prefix_condition(backend, prefix.as_str()) {
-        condition = condition.add(prefix);
-    }
-    if let Some(after) = after {
-        condition = condition
-            .add(Expr::col((current_kv::Entity, current_kv::Column::Key)).gt(after.as_str()));
-    }
-    let mut query = Query::select();
-    query
-        .column((current_kv::Entity, current_kv::Column::Key))
-        .from(current_kv::Entity)
-        .cond_where(condition)
-        .order_by((current_kv::Entity, current_kv::Column::Key), Order::Asc);
-    if let Some(limit) = limit {
-        query.limit(limit.saturating_add(1) as u64);
-    }
-    backend.build(&query)
+    kv_list_branch_statement(
+        backend,
+        space_id,
+        prefix,
+        after,
+        limit.map(|limit| limit.saturating_add(1)),
+        KvListBranch::All,
+    )
 }
 
 /// List live keys inside `prefix` (by `kv_prefix_covers`), at most `limit` of
@@ -3975,10 +4008,48 @@ async fn list_bounded_after<C: ConnectionTrait>(
     limit: Option<usize>,
     after: Option<&Path>,
 ) -> Result<(Vec<Path>, bool), DbErr> {
-    let statement = kv_list_statement(db.get_database_backend(), space_id, prefix, limit, after);
-    let mut list = db
-        .query_all(statement)
-        .await?
+    let backend = db.get_database_backend();
+    let rows = if backend == DbBackend::Postgres
+        && !prefix.as_str().is_empty()
+        && !prefix.as_str().ends_with('/')
+    {
+        // An OR between the bare key and descendants can make a generic
+        // plan scan the whole space. The bare key sorts before every child.
+        let max_rows = limit.map(|limit| limit.saturating_add(1));
+        let mut rows = Vec::new();
+        if after.is_none() {
+            rows.extend(
+                db.query_all(kv_list_branch_statement(
+                    backend,
+                    space_id,
+                    prefix,
+                    None,
+                    Some(1),
+                    KvListBranch::Bare,
+                ))
+                .await?,
+            );
+        }
+        if max_rows.is_none_or(|max_rows| rows.len() < max_rows) {
+            let remaining = max_rows.map(|max_rows| max_rows - rows.len());
+            rows.extend(
+                db.query_all(kv_list_branch_statement(
+                    backend,
+                    space_id,
+                    prefix,
+                    after,
+                    remaining,
+                    KvListBranch::Descendants,
+                ))
+                .await?,
+            );
+        }
+        rows
+    } else {
+        db.query_all(kv_list_statement(backend, space_id, prefix, limit, after))
+            .await?
+    };
+    let mut list = rows
         .into_iter()
         .map(|row| row.try_get::<String>("", current_kv::Column::Key.as_str()))
         .collect::<Result<Vec<_>, _>>()?
@@ -4339,7 +4410,7 @@ fn byte_ordered_resource(backend: DbBackend) -> SimpleExpr {
 }
 
 /// `column`, compared in byte order on `backend` (see `byte_ordered_resource`).
-fn byte_ordered(backend: DbBackend, column: impl Into<SimpleExpr>) -> SimpleExpr {
+pub(crate) fn byte_ordered(backend: DbBackend, column: impl Into<SimpleExpr>) -> SimpleExpr {
     // `$1` / `?` is sea-query's per-backend placeholder for the embedded
     // column expression, not for a bound value.
     match backend {
@@ -6231,6 +6302,585 @@ mod test {
         assert_eq!(
             kv_list_pages(&db.conn, &space, "docs", 2).await,
             vec![vec!["docs", "docs/a"], vec!["docs/b"]]
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_kv_list_byte_pages_match_sqlite_with_tombstones() {
+        let Some(schema) = crate::test_support::PostgresTestSchema::new(
+            "postgres_kv_list_byte_pages_match_sqlite_with_tombstones",
+        )
+        .await
+        else {
+            return;
+        };
+        let sqlite = get_db().await.unwrap();
+        let keys = [
+            "docs/é",
+            "docs/Z",
+            "docs/a",
+            "docs",
+            "docs/界",
+            "docsecret/x",
+            "docs/Q",
+        ];
+        for (conn, backend, name) in [
+            (&schema.conn, DbBackend::Postgres, "pg-byte-order"),
+            (&sqlite.conn, DbBackend::Sqlite, "sqlite-byte-order"),
+        ] {
+            let space = seed_kv_keys(conn, name, &keys).await;
+            conn.execute(Statement::from_sql_and_values(
+                backend,
+                if backend == DbBackend::Postgres {
+                    "UPDATE current_kv SET deleted = true WHERE space = $1 AND key = 'docs/Q'"
+                } else {
+                    "UPDATE current_kv SET deleted = true WHERE space = ? AND key = 'docs/Q'"
+                },
+                [SpaceIdWrap(space.clone()).into()],
+            ))
+            .await
+            .unwrap();
+            assert_eq!(
+                kv_list_pages(conn, &space, "docs", 2).await,
+                vec![
+                    vec!["docs", "docs/Z"],
+                    vec!["docs/a", "docs/é"],
+                    vec!["docs/界"],
+                ],
+                "{backend:?}"
+            );
+            assert_eq!(
+                kv_list_pages(conn, &space, "docs/", 1).await,
+                vec![
+                    vec!["docs/Z"],
+                    vec!["docs/a"],
+                    vec!["docs/é"],
+                    vec!["docs/界"],
+                ],
+                "{backend:?}"
+            );
+        }
+    }
+
+    /// Dense continuations seek by sequence, while quiet prefixes seek by
+    /// byte key, in both auto and generic plans. This fixture is too large
+    /// for the default suite.
+    #[tokio::test]
+    #[ignore = "PG18.6 planner fixture: 2 spaces x 300k current_kv rows"]
+    async fn postgres_kv_prefix_actual_builders_seek_under_skew() {
+        let Some(schema) = crate::test_support::PostgresTestSchema::new(
+            "postgres_kv_prefix_actual_builders_seek_under_skew",
+        )
+        .await
+        else {
+            return;
+        };
+        let db = &schema.conn;
+        let rare = seed_kv_keys(db, "tc737-skew-rare", &["busy/only"]).await;
+        let dense = seed_kv_keys(db, "tc737-skew-dense", &[]).await;
+        let epoch = crate::hash::hash(b"tc737 skew epoch");
+        for (space, prefix) in [(&rare, "noise/"), (&dense, "busy/")] {
+            db.execute(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "INSERT INTO current_kv (space, key, invocation, seq, epoch, epoch_seq, value, metadata, deleted) \
+                 SELECT $1, $3::text || lpad(n::text, 6, '0'), $2, n + 10, $2, 0, $2, '{}', false \
+                 FROM generate_series(1, 300000) AS n",
+                [
+                    SpaceIdWrap(space.clone()).into(),
+                    epoch.into(),
+                    prefix.into(),
+                ],
+            ))
+            .await
+            .unwrap();
+        }
+        // Keep actual event_order anchors at the middle, the next whole
+        // invocation, near the end, and at the end. Other bulk rows only
+        // shape the planner's space/prefix distribution.
+        let mut dense_anchors = Vec::new();
+        for (seq, keys) in [
+            (150_010, &["busy/150000"][..]),
+            (
+                150_011,
+                &["busy/150001", "busy/150002", "busy/150003", "busy/150004"][..],
+            ),
+            (299_910, &["busy/299900"][..]),
+            (300_010, &["busy/300000"][..]),
+        ] {
+            let epoch_id = crate::hash::hash(format!("tc737-dense-epoch-{seq}").as_bytes());
+            epoch::ActiveModel {
+                seq: Set(seq),
+                id: Set(epoch_id),
+                space: Set(SpaceIdWrap(dense.clone())),
+            }
+            .insert(db)
+            .await
+            .unwrap();
+            event_order::ActiveModel {
+                seq: Set(seq),
+                epoch: Set(epoch_id),
+                epoch_seq: Set(0),
+                event: Set(crate::hash::hash(
+                    format!("tc737-dense-event-{seq}").as_bytes(),
+                )),
+                space: Set(SpaceIdWrap(dense.clone())),
+            }
+            .insert(db)
+            .await
+            .unwrap();
+            for key in keys {
+                db.execute(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "UPDATE current_kv SET seq = $2, epoch = $3 WHERE space = $1 AND key = $4",
+                    [
+                        SpaceIdWrap(dense.clone()).into(),
+                        seq.into(),
+                        epoch_id.into(),
+                        (*key).into(),
+                    ],
+                ))
+                .await
+                .unwrap();
+            }
+            dense_anchors.push(crate::kv_sync::KvSyncAnchor {
+                seq,
+                epoch: epoch_id,
+                epoch_seq: 0,
+            });
+        }
+        db.execute(Statement::from_string(
+            DbBackend::Postgres,
+            "ANALYZE current_kv",
+        ))
+        .await
+        .unwrap();
+
+        async fn explain<C: ConnectionTrait>(db: &C, statement: Statement) -> String {
+            static NEXT_PLAN: AtomicU64 = AtomicU64::new(0);
+            let name = format!(
+                "tc737_builder_{}",
+                NEXT_PLAN.fetch_add(1, Ordering::Relaxed)
+            );
+            let values = statement.values.map(|values| values.0).unwrap_or_default();
+            let args = (1..=values.len())
+                .map(|i| format!("${i}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            db.execute(Statement::from_string(
+                DbBackend::Postgres,
+                format!("PREPARE {name} AS {}", statement.sql),
+            ))
+            .await
+            .unwrap();
+            let execute = Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                format!("EXECUTE {name}({args})"),
+                values,
+            )
+            .to_string();
+            let plan = db
+                .query_all(Statement::from_string(
+                    DbBackend::Postgres,
+                    format!("EXPLAIN (ANALYZE, BUFFERS) {execute}"),
+                ))
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| row.try_get_by_index::<String>(0).unwrap())
+                .collect::<Vec<_>>()
+                .join("\n");
+            db.execute(Statement::from_string(
+                DbBackend::Postgres,
+                format!("DEALLOCATE {name}"),
+            ))
+            .await
+            .unwrap();
+            plan
+        }
+        fn execution_buffers(plan: &str) -> usize {
+            plan.lines()
+                .find(|line| line.trim_start().starts_with("Buffers: shared "))
+                .expect("EXPLAIN must report execution buffers")
+                .split_whitespace()
+                .filter_map(|part| {
+                    part.strip_prefix("hit=")
+                        .or_else(|| part.strip_prefix("read="))
+                        .map(|count| count.parse::<usize>().unwrap())
+                })
+                .sum()
+        }
+        // seed_kv_keys wrote a real event_order row at this floor/position.
+        let pos = crate::kv_sync::KvSyncAnchor {
+            seq: 0,
+            epoch: crate::hash::hash(b"epoch-0"),
+            epoch_seq: 0,
+        };
+        let floor = pos;
+        let bare: Path = "busy".parse().unwrap();
+        let slash: Path = "busy/".parse().unwrap();
+        let after: Path = "busy/000500".parse().unwrap();
+        for mode in ["auto", "force_generic_plan"] {
+            let tx = db.begin().await.unwrap();
+            tx.execute(Statement::from_string(
+                DbBackend::Postgres,
+                format!("SET LOCAL plan_cache_mode = {mode}"),
+            ))
+            .await
+            .unwrap();
+            let actual_mode = tx
+                .query_one(Statement::from_string(
+                    DbBackend::Postgres,
+                    "SHOW plan_cache_mode",
+                ))
+                .await
+                .unwrap()
+                .unwrap()
+                .try_get_by_index::<String>(0)
+                .unwrap();
+            assert_eq!(actual_mode, mode);
+            println!("TC-737 skew planner mode: {actual_mode}");
+            for (label, space, prefix, cursor, floor, found, seen) in [
+                ("rare-bare", &rare, &bare, &pos, &floor, false, 64),
+                ("rare-slash", &rare, &slash, &pos, &floor, false, 64),
+                (
+                    "dense-mid-bare",
+                    &dense,
+                    &bare,
+                    &dense_anchors[0],
+                    &dense_anchors[3],
+                    true,
+                    64,
+                ),
+                (
+                    "dense-mid-slash",
+                    &dense,
+                    &slash,
+                    &dense_anchors[0],
+                    &dense_anchors[3],
+                    true,
+                    64,
+                ),
+                (
+                    "dense-group-more",
+                    &dense,
+                    &slash,
+                    &dense_anchors[1],
+                    &dense_anchors[3],
+                    true,
+                    64,
+                ),
+                (
+                    "dense-late",
+                    &dense,
+                    &bare,
+                    &dense_anchors[2],
+                    &dense_anchors[3],
+                    true,
+                    64,
+                ),
+                (
+                    "dense-caught-up",
+                    &dense,
+                    &slash,
+                    &dense_anchors[3],
+                    &dense_anchors[3],
+                    false,
+                    0,
+                ),
+            ] {
+                let statement = crate::kv_sync::kv_sync_candidate_statement(
+                    DbBackend::Postgres,
+                    space,
+                    prefix,
+                    Some(cursor),
+                    Some(floor),
+                );
+                let row = tx.query_one(statement.clone()).await.unwrap().unwrap();
+                assert_eq!(row.try_get::<i64>("", "seen").unwrap(), seen, "{label}");
+                assert_eq!(row.try_get::<bool>("", "found").unwrap(), found, "{label}");
+                let plan = explain(&tx, statement).await;
+                println!("{mode} {label} bounded candidate:\n{plan}");
+                assert!(
+                    plan.contains("idx_current_kv_space_order")
+                        && plan.contains("Limit")
+                        && execution_buffers(&plan) <= 96,
+                    "{mode} {label} preflight must stay bounded:\n{plan}"
+                );
+                if mode == "force_generic_plan" {
+                    assert!(
+                        plan.contains("$1"),
+                        "{mode} {label} was not generic:\n{plan}"
+                    );
+                }
+                if found && space == &dense {
+                    let feed = explain(
+                        &tx,
+                        crate::kv_sync::kv_sync_bounded_feed_statement(
+                            DbBackend::Postgres,
+                            space,
+                            prefix,
+                            500,
+                            Some(cursor),
+                            Some(floor),
+                        ),
+                    )
+                    .await;
+                    println!("{mode} {label} bounded sequence feed:\n{feed}");
+                    assert!(
+                        feed.contains("idx_current_kv_space_order")
+                            && feed.contains("Limit")
+                            && execution_buffers(&plan) + execution_buffers(&feed) <= 160,
+                        "{mode} {label} preflight+feed scanned consumed keys:\n{plan}\n{feed}"
+                    );
+                }
+            }
+            for (space, label) in [(&rare, "rare"), (&dense, "dense")] {
+                for (prefix, branch) in [
+                    (&bare, crate::kv_sync::KvPrefixProbe::Exact),
+                    (&bare, crate::kv_sync::KvPrefixProbe::Descendants),
+                    (&slash, crate::kv_sync::KvPrefixProbe::Descendants),
+                ] {
+                    let plan = explain(
+                        &tx,
+                        crate::kv_sync::kv_sync_probe_statement(
+                            DbBackend::Postgres,
+                            space,
+                            prefix,
+                            if label == "rare" { Some(&pos) } else { None },
+                            if label == "rare" { Some(&floor) } else { None },
+                            branch,
+                        ),
+                    )
+                    .await;
+                    println!(
+                        "{mode} {label} probe {branch:?} {}:\n{plan}",
+                        prefix.as_str()
+                    );
+                    if label == "rare" && !matches!(branch, crate::kv_sync::KvPrefixProbe::Exact) {
+                        assert!(
+                            plan.contains("idx_current_kv_space_key_c")
+                                && plan.lines().any(
+                                    |line| line.contains("Index Cond:") && line.contains("key")
+                                ),
+                            "{mode} rare prefix must seek by C key:\n{plan}"
+                        );
+                        if mode == "force_generic_plan" {
+                            assert!(
+                                plan.contains("$1"),
+                                "generic execution must retain parameter placeholders:\n{plan}"
+                            );
+                        }
+                        let filtered = plan
+                            .lines()
+                            .filter_map(|line| line.split("Rows Removed by Filter: ").nth(1))
+                            .map(|count| count.trim().parse::<usize>().unwrap())
+                            .sum::<usize>();
+                        assert!(
+                            filtered <= 10,
+                            "{mode} rare prefix filtered {filtered} unrelated rows:\n{plan}"
+                        );
+                    }
+                }
+                for (prefix, after, branch) in [
+                    (&bare, None, KvListBranch::Bare),
+                    (&slash, None, KvListBranch::All),
+                    (&bare, None, KvListBranch::Descendants),
+                    (&slash, Some(&after), KvListBranch::All),
+                    (&bare, Some(&after), KvListBranch::Descendants),
+                ] {
+                    let plan = explain(
+                        &tx,
+                        kv_list_branch_statement(
+                            DbBackend::Postgres,
+                            space,
+                            prefix,
+                            after,
+                            Some(501),
+                            branch,
+                        ),
+                    )
+                    .await;
+                    println!(
+                        "{mode} {label} list {branch:?} {} after={after:?}:\n{plan}",
+                        prefix.as_str()
+                    );
+                    assert!(
+                        (matches!(branch, KvListBranch::Bare)
+                            || plan.contains("idx_current_kv_space_key_c"))
+                            && plan
+                                .lines()
+                                .any(|line| line.contains("Index Cond:") && line.contains("key")),
+                        "{mode} {label} list must seek by key:\n{plan}"
+                    );
+                    if label == "rare" {
+                        let filtered = plan
+                            .lines()
+                            .filter_map(|line| line.split("Rows Removed by Filter: ").nth(1))
+                            .map(|count| count.trim().parse::<usize>().unwrap())
+                            .sum::<usize>();
+                        assert!(
+                            filtered <= 10,
+                            "{mode} rare list filtered {filtered}:\n{plan}"
+                        );
+                    }
+                }
+            }
+            tx.rollback().await.unwrap();
+        }
+        for prefix in [&bare, &slash] {
+            let state = crate::kv_sync::KvSyncState {
+                pos: Some(pos),
+                floor: Some(floor),
+            };
+            let (changes, more, next) =
+                crate::kv_sync::kv_sync_page(db, &rare, prefix, 500, Some(&state))
+                    .await
+                    .unwrap();
+            assert!(changes.is_empty() && !more);
+            assert_eq!(next, state, "quiet poll must preserve the cursor state");
+            let cursor_key = [7; 32];
+            let cursor =
+                crate::kv_sync::encode_kv_sync_cursor(&cursor_key, &rare, prefix, &state).unwrap();
+            let (changes, more, echo) = crate::kv_sync::kv_sync_read(
+                db,
+                &rare,
+                prefix,
+                &crate::kv_sync::KvSyncRequest {
+                    limit: 500,
+                    cursor: Some(cursor.clone()),
+                    cursor_key,
+                    retention_grant: None,
+                },
+            )
+            .await
+            .unwrap();
+            assert!(changes.is_empty() && !more);
+            assert_eq!(
+                echo, cursor,
+                "outside writes cannot change the cursor bytes"
+            );
+        }
+        let mid = crate::kv_sync::KvSyncState {
+            pos: Some(dense_anchors[0]),
+            floor: Some(dense_anchors[3]),
+        };
+        let (group, more, next) = crate::kv_sync::kv_sync_page(db, &dense, &slash, 1, Some(&mid))
+            .await
+            .unwrap();
+        assert_eq!(
+            group
+                .iter()
+                .map(|change| change.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["busy/150001", "busy/150002", "busy/150003", "busy/150004",]
+        );
+        assert!(more);
+        assert_eq!(next.pos, Some(dense_anchors[1]));
+        let (following, more, _) = crate::kv_sync::kv_sync_page(db, &dense, &slash, 2, Some(&next))
+            .await
+            .unwrap();
+        assert_eq!(
+            following
+                .iter()
+                .map(|change| change.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["busy/150005", "busy/150006"]
+        );
+        assert!(more);
+        let late = crate::kv_sync::KvSyncState {
+            pos: Some(dense_anchors[2]),
+            floor: Some(dense_anchors[3]),
+        };
+        let (following, more, _) = crate::kv_sync::kv_sync_page(db, &dense, &bare, 2, Some(&late))
+            .await
+            .unwrap();
+        assert_eq!(
+            following
+                .iter()
+                .map(|change| change.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["busy/299901", "busy/299902"]
+        );
+        assert!(more);
+        let caught_up = crate::kv_sync::KvSyncState {
+            pos: Some(dense_anchors[3]),
+            floor: Some(dense_anchors[3]),
+        };
+        let (changes, more, next) =
+            crate::kv_sync::kv_sync_page(db, &dense, &slash, 500, Some(&caught_up))
+                .await
+                .unwrap();
+        assert!(changes.is_empty() && !more);
+        assert_eq!(next, caught_up);
+        // A qualifying key beyond a full 64-row window must still be found
+        // by the C-key fallback; the window is not a cursor advance.
+        let rare_next = crate::kv_sync::KvSyncAnchor {
+            seq: 300_011,
+            epoch: crate::hash::hash(b"tc737-skew-rare-next"),
+            epoch_seq: 0,
+        };
+        epoch::ActiveModel {
+            seq: Set(rare_next.seq),
+            id: Set(rare_next.epoch),
+            space: Set(SpaceIdWrap(rare.clone())),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        event_order::ActiveModel {
+            seq: Set(rare_next.seq),
+            epoch: Set(rare_next.epoch),
+            epoch_seq: Set(0),
+            event: Set(crate::hash::hash(b"tc737-skew-rare-next-event")),
+            space: Set(SpaceIdWrap(rare.clone())),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        db.execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "UPDATE current_kv SET seq = $2, epoch = $3 \
+             WHERE space = $1 AND key = 'busy/only'",
+            [
+                SpaceIdWrap(rare.clone()).into(),
+                rare_next.seq.into(),
+                rare_next.epoch.into(),
+            ],
+        ))
+        .await
+        .unwrap();
+        for prefix in [&bare, &slash] {
+            let state = crate::kv_sync::KvSyncState {
+                pos: Some(pos),
+                floor: Some(floor),
+            };
+            let (changes, more, next) =
+                crate::kv_sync::kv_sync_page(db, &rare, prefix, 500, Some(&state))
+                    .await
+                    .unwrap();
+            assert_eq!(
+                changes
+                    .iter()
+                    .map(|change| change.key.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["busy/only"]
+            );
+            assert!(!more);
+            assert_eq!(next.pos, Some(rare_next));
+        }
+        assert_eq!(
+            kv_list_pages(db, &rare, "busy", 1).await,
+            vec![vec!["busy/only"]]
+        );
+        assert_eq!(
+            list_bounded_after(db, &dense, &slash, Some(2), None)
+                .await
+                .unwrap()
+                .0
+                .iter()
+                .map(Path::as_str)
+                .collect::<Vec<_>>(),
+            vec!["busy/000001", "busy/000002"]
         );
     }
 

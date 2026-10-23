@@ -654,6 +654,35 @@ for these digest commands. `allow_non_descendant` is not normally needed;
 all recorded revisions must remain in main history. Binary rollback across
 a database schema migration still needs a separate DB-safety decision.
 
+TC-737's `m20261023_000000_current_kv_prefix_index` builds
+`idx_current_kv_space_key_c ON current_kv (space, key COLLATE "C")` with
+`CREATE INDEX CONCURRENTLY`, so the PostgreSQL migrator commits before it and
+resumes afterward. Ordinary batches keep the TC-1176 `lock_timeout` and the
+exempt `statement_timeout`. The concurrent build runs outside a transaction
+with no `lock_timeout`.
+
+- After that migration is recorded, an older node binary cannot restart
+  against that database: SeaORM rejects unknown applied migration versions.
+  Already-running older writers can keep writing while PostgreSQL builds the
+  additive index concurrently, but binary rollback is not safe. Recover by
+  rolling forward through the coordinated release sequence, not by promoting
+  an older image.
+- TC-737 also orders PostgreSQL `tinycloud.kv/list` pages by key bytes,
+  matching SQLite's BINARY order. Newly issued list cursors use version 2.
+  A valid version-1 cursor from before this cutover returns HTTP 400 with
+  "restart listing"; the client must omit `x-tinycloud-cursor` and begin a
+  new listing. The node rejects rather than silently skipping or repeating
+  keys when a database's native collation differs from byte order.
+- PostgreSQL `tinycloud.kv/sync` prefix polls first inspect at most 64 raw
+  sequence-index candidates; dense continuations use a bounded sequence feed,
+  while a full window without a match falls back to the C-ordered key index.
+  Empty polls preserve the supplied cursor bytes. The root feed and
+  SQLite/MySQL behavior are unchanged.
+- The PostgreSQL migrator supports `up` and `down` across the concurrent index.
+  `fresh`, `refresh`, and `reset` reject before changing schema or migration
+  history; SeaORM's inherited implementations require one transaction and
+  cannot execute `CREATE/DROP INDEX CONCURRENTLY`. SQLite and MySQL keep their
+  standard migrator operations.
 
 ## Why the version bump is manual
 
