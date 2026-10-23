@@ -1,0 +1,471 @@
+{
+ "appIdRegex": "^[a-z0-9][a-z0-9._-]{0,63}$",
+ "appIdValid": [
+  {
+   "id": "a",
+   "valid": true
+  },
+  {
+   "id": "tinychat",
+   "valid": true
+  },
+  {
+   "id": "xyz.tinycloud.tinychat",
+   "valid": true
+  },
+  {
+   "id": "a-b.c",
+   "valid": true
+  },
+  {
+   "id": "0abc",
+   "valid": true
+  },
+  {
+   "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "valid": true
+  },
+  {
+   "id": "a.b.c",
+   "valid": true
+  },
+  {
+   "id": "a--b",
+   "valid": true
+  },
+  {
+   "id": "a..b",
+   "valid": true
+  },
+  {
+   "id": "x1",
+   "valid": true
+  },
+  {
+   "id": "foo_bar",
+   "valid": true
+  },
+  {
+   "id": "",
+   "valid": false
+  },
+  {
+   "id": "Foo",
+   "valid": false
+  },
+  {
+   "id": "xyz.App",
+   "valid": false
+  },
+  {
+   "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "valid": false
+  },
+  {
+   "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "valid": false
+  },
+  {
+   "id": "-foo",
+   "valid": false
+  },
+  {
+   "id": ".foo",
+   "valid": false
+  },
+  {
+   "id": "_foo",
+   "valid": false
+  },
+  {
+   "id": "foo/bar",
+   "valid": false
+  },
+  {
+   "id": "foo/",
+   "valid": false
+  },
+  {
+   "id": "foo:bar",
+   "valid": false
+  },
+  {
+   "id": "foo bar",
+   "valid": false
+  },
+  {
+   "id": " foo",
+   "valid": false
+  },
+  {
+   "id": "foo ",
+   "valid": false
+  },
+  {
+   "id": "foo\n",
+   "valid": false
+  },
+  {
+   "id": "fo\u00f6",
+   "valid": false
+  },
+  {
+   "id": "f\u043eo",
+   "valid": false
+  },
+  {
+   "id": "\u212aelvin",
+   "valid": false
+  },
+  {
+   "id": "foo\u200b",
+   "valid": false
+  },
+  {
+   "id": "foo%41",
+   "valid": false
+  },
+  {
+   "id": "foo#x",
+   "valid": false
+  },
+  {
+   "id": "foo?x",
+   "valid": false
+  },
+  {
+   "id": "foo\u0000",
+   "valid": false
+  },
+  {
+   "id": "\u0130stanbul",
+   "valid": false
+  },
+  {
+   "id": "foo\r",
+   "valid": false
+  },
+  {
+   "id": "foo\t",
+   "valid": false
+  },
+  {
+   "id": "\uff46oo",
+   "valid": false
+  },
+  {
+   "id": "xn--bcher-kva.example",
+   "valid": true
+  }
+ ],
+ "prefixCovers": [
+  {
+   "prefix": "apps/foo/",
+   "key": "apps/foo/x",
+   "covers": true
+  },
+  {
+   "prefix": "apps/foo/",
+   "key": "apps/foo/x/y",
+   "covers": true
+  },
+  {
+   "prefix": "apps/foo/",
+   "key": "apps/foo/x/y/z",
+   "covers": true
+  },
+  {
+   "prefix": "apps/foo/",
+   "key": "apps/foo",
+   "covers": false
+  },
+  {
+   "prefix": "apps/foo/",
+   "key": "apps/foobar/x",
+   "covers": false
+  },
+  {
+   "prefix": "apps/foo/",
+   "key": "apps/foo.bar/x",
+   "covers": false
+  },
+  {
+   "prefix": "apps/foo/",
+   "key": "apps/foo-bar/x",
+   "covers": false
+  },
+  {
+   "prefix": "apps/foo/",
+   "key": "apps/fo/x",
+   "covers": false
+  },
+  {
+   "prefix": "apps/foo/",
+   "key": "other/foo/x",
+   "covers": false
+  },
+  {
+   "prefix": "apps/foo/",
+   "key": "secrets/apps/foo/x",
+   "covers": false
+  },
+  {
+   "prefix": "apps/foo.bar/",
+   "key": "apps/foo.bar/x",
+   "covers": true
+  },
+  {
+   "prefix": "apps/foo_bar/",
+   "key": "apps/foo.bar/x",
+   "covers": false
+  },
+  {
+   "prefix": "apps/foo_bar/",
+   "key": "apps/foo-bar/x",
+   "covers": false
+  },
+  {
+   "prefix": "apps/foo_bar/",
+   "key": "apps/fooxbar/x",
+   "covers": false
+  },
+  {
+   "prefix": "apps/foo/x/",
+   "key": "apps/foo/x",
+   "covers": false
+  }
+ ],
+ "nodeKeyPathUnderApps": [
+  {
+   "keyPath": "apps/foo/x",
+   "accepted": true
+  },
+  {
+   "keyPath": "apps/foo/x/y",
+   "accepted": true
+  },
+  {
+   "keyPath": "apps/foo",
+   "accepted": false
+  },
+  {
+   "keyPath": "apps",
+   "accepted": false
+  },
+  {
+   "keyPath": "apps/Foo/x",
+   "accepted": false
+  },
+  {
+   "keyPath": "apps/foo_bar/x",
+   "accepted": true
+  },
+  {
+   "keyPath": "apps/foo/x/",
+   "accepted": false
+  },
+  {
+   "keyPath": "secrets/x",
+   "accepted": true
+  },
+  {
+   "keyPath": "appsx/y",
+   "accepted": true
+  },
+  {
+   "keyPath": "apps.x/y",
+   "accepted": true
+  }
+ ],
+ "keyPathsRefusedByGrammar": [
+  {
+   "keyPath": "apps/Foo/x"
+  },
+  {
+   "keyPath": "apps//x"
+  },
+  {
+   "keyPath": "apps/foo//x"
+  },
+  {
+   "keyPath": "apps/foo/"
+  }
+ ],
+ "prefixValid": [
+  {
+   "prefix": "apps/",
+   "valid": false
+  },
+  {
+   "prefix": "apps/foo/",
+   "valid": true
+  },
+  {
+   "prefix": "apps/foo/x/",
+   "valid": true
+  },
+  {
+   "prefix": "apps/Foo/",
+   "valid": false
+  },
+  {
+   "prefix": "apps/foo//",
+   "valid": false
+  },
+  {
+   "prefix": "appsx/",
+   "valid": true
+  },
+  {
+   "prefix": "apps.x/",
+   "valid": true
+  },
+  {
+   "prefix": "apps",
+   "valid": false
+  },
+  {
+   "prefix": "apps/foo",
+   "valid": false
+  }
+ ],
+ "createFlagMatchesPath": [
+  {
+   "keyPath": "apps/foo/x",
+   "deletable": false,
+   "accepted": false
+  },
+  {
+   "keyPath": "apps/foo/x",
+   "deletable": true,
+   "accepted": true
+  },
+  {
+   "keyPath": "secrets/x",
+   "deletable": true,
+   "accepted": false
+  },
+  {
+   "keyPath": "secrets/x",
+   "deletable": false,
+   "accepted": true
+  }
+ ],
+ "hostBinding": [
+  {
+   "origin": "https://listen.tinycloud.xyz",
+   "id": "xyz.tinycloud.listen",
+   "bound": true
+  },
+  {
+   "origin": "https://listen.tinycloud.xyz",
+   "id": "xyz.tinycloud.listen.digest",
+   "bound": true
+  },
+  {
+   "origin": "https://listen.tinycloud.xyz",
+   "id": "xyz.tinycloud",
+   "bound": false
+  },
+  {
+   "origin": "https://listen.tinycloud.xyz",
+   "id": "xyz.tinycloud.listenx",
+   "bound": false
+  },
+  {
+   "origin": "https://notes.tinycloud.xyz",
+   "id": "xyz.tinycloud.listen",
+   "bound": false
+  },
+  {
+   "origin": "https://alice.github.io",
+   "id": "io.github.bob.app",
+   "bound": false
+  },
+  {
+   "origin": "https://alice.github.io",
+   "id": "io.github.alice.app",
+   "bound": true
+  },
+  {
+   "origin": "https://listen.tinycloud.xyz:8443",
+   "id": "xyz.tinycloud.listen",
+   "bound": false
+  },
+  {
+   "origin": "http://listen.tinycloud.xyz",
+   "id": "xyz.tinycloud.listen",
+   "bound": false
+  },
+  {
+   "origin": "https://LISTEN.tinycloud.xyz",
+   "id": "xyz.tinycloud.listen",
+   "bound": true
+  },
+  {
+   "origin": "https://localhost",
+   "id": "localhost",
+   "bound": false
+  },
+  {
+   "origin": "https://127.0.0.1",
+   "id": "1.0.0.127",
+   "bound": false
+  },
+  {
+   "origin": "https://listen.tinycloud.xyz.",
+   "id": "xyz.tinycloud.listen",
+   "bound": false
+  },
+  {
+   "origin": "https://intranet",
+   "id": "intranet",
+   "bound": false
+  },
+  {
+   "origin": "https://xn--bcher-kva.example",
+   "id": "example.xn--bcher-kva",
+   "bound": true
+  },
+  {
+   "origin": "https://xn--bcher-kva.example",
+   "id": "example.b\u00fccher",
+   "bound": false
+  },
+  {
+   "origin": "https://b\u00fccher.example",
+   "id": "example.xn--bcher-kva",
+   "bound": true
+  },
+  {
+   "origin": "https://b\u00fccher.example",
+   "id": "example.b\u00fccher",
+   "bound": false
+  },
+  {
+   "origin": "https://a.b.example.com",
+   "id": "com.example.b.a",
+   "bound": true
+  },
+  {
+   "origin": "https://a.b.example.com",
+   "id": "com.example",
+   "bound": false
+  },
+  {
+   "origin": "https://example.com",
+   "id": "com.example",
+   "bound": true
+  },
+  {
+   "origin": "https://example.com",
+   "id": "com.example.app",
+   "bound": true
+  },
+  {
+   "origin": "https://EXAMPLE.com",
+   "id": "com.example.app",
+   "bound": true
+  }
+ ]
+}

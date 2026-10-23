@@ -1930,7 +1930,7 @@ mod tests {
     #[tokio::test]
     async fn owner_invokes_own_key_without_parents() {
         let db = empty_db().await;
-        let resource = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/tinychat");
+        let resource = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/docs/tinychat");
         let capability = caveat_capability(
             &resource,
             "tinycloud.encryption/key.create",
@@ -1952,7 +1952,7 @@ mod tests {
     #[tokio::test]
     async fn key_prefix_is_not_invocable_even_by_owner() {
         let db = empty_db().await;
-        let resource = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/tinychat/");
+        let resource = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/docs/tinychat/");
         let capability = caveat_capability(
             &resource,
             "tinycloud.encryption/key.create",
@@ -1980,7 +1980,7 @@ mod tests {
     #[tokio::test]
     async fn non_owner_key_invocation_without_parents_is_refused() {
         let db = empty_db().await;
-        let resource = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/tinychat");
+        let resource = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/docs/tinychat");
         let capability = caveat_capability(
             &resource,
             "tinycloud.encryption/key.create",
@@ -2062,8 +2062,8 @@ mod tests {
         }
         let prefix_grant = crate::hash::hash(b"owner-prefix-grant");
         let key_grant = crate::hash::hash(b"middle-exact-key-grant");
-        let prefix = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/foo/");
-        let key = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/foo/x");
+        let prefix = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/docs/foo/");
+        let key = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/docs/foo/x");
         for (id, delegator, delegatee, resource) in [
             (prefix_grant, KEY_OWNER, KEY_MIDDLE, prefix.as_str()),
             (key_grant, KEY_MIDDLE, KEY_OTHER, key.as_str()),
@@ -2114,7 +2114,7 @@ mod tests {
         .await
         .expect("chained exact-key grant admits its key");
 
-        let sibling = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/foobar/x");
+        let sibling = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/docs/foobar/x");
         let capability =
             caveat_capability(&sibling, "tinycloud.encryption/decrypt", Caveats::default());
         let err = crate::models::invocation::authorize_holder(
@@ -2147,7 +2147,7 @@ mod tests {
             .unwrap();
         }
         let parent = crate::hash::hash(b"terminal-grant-invocation");
-        let prefix = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/foo/");
+        let prefix = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/docs/foo/");
         delegation::ActiveModel {
             id: Set(parent),
             delegator: Set(KEY_OWNER.to_string()),
@@ -2178,7 +2178,7 @@ mod tests {
         .insert(&db)
         .await
         .unwrap();
-        let key = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/foo/x");
+        let key = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/docs/foo/x");
         (db, parent, key)
     }
 
