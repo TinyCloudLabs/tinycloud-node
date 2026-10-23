@@ -50,7 +50,9 @@ use tinycloud_core::{
     db_pool::{classify_failure, track_writes, TransientFailure},
     encryption_network::EncryptionService,
     events::Invocation,
-    failure_diagnostic::{failure_kind, FailureCode, FailureNote, Service},
+    failure_diagnostic::{
+        failure_kind, FailureCode, FailureNote, Service, KIND_READ_AUDIT_BUSY, KIND_REQUEST_TIMEOUT,
+    },
     models::{
         hook_delivery, hook_subscription, invocation as invocation_model, kv_delete, kv_write,
     },
@@ -149,12 +151,22 @@ pub const READ_AUDIT_BUSY: &str = "read_audit_busy";
 /// The response to a read whose audit record was not confirmed (TC-1317).
 /// Its data was not returned, so retrying with a fresh request is safe
 /// whenever the failure was transient.
-fn read_audit_failure(error: &tinycloud_core::ReadAuditError) -> (Status, String) {
+fn read_audit_failure(
+    service: Service,
+    error: &tinycloud_core::ReadAuditError,
+) -> (Status, String) {
     use tinycloud_core::ReadAuditError;
     let status = match error {
         ReadAuditError::Busy | ReadAuditError::Unavailable => Status::ServiceUnavailable,
         ReadAuditError::Failed(_) | ReadAuditError::Stopped => Status::InternalServerError,
     };
+    if matches!(error, ReadAuditError::Busy) {
+        tinycloud_core::request_telemetry::note_failure(FailureNote::busy(
+            service,
+            KIND_READ_AUDIT_BUSY,
+            None,
+        ));
+    }
     (status, error.to_string())
 }
 
@@ -862,6 +874,11 @@ pub(crate) async fn with_invoke_deadline<T>(
     request_cancel::run_with_deadline(config.invocation.deadline(), handler)
         .await
         .unwrap_or_else(|request_cancel::DeadlineExceeded| {
+            tinycloud_core::request_telemetry::note_failure(FailureNote::busy(
+                Service::Other,
+                KIND_REQUEST_TIMEOUT,
+                None,
+            ));
             Err(InvokeError::Text(
                 Status::ServiceUnavailable,
                 REQUEST_TIMEOUT_BODY.to_string(),
@@ -2325,7 +2342,7 @@ async fn invoke_impl(
                     return Err(too_many_mutations().into());
                 }
                 if let TxStoreError::Tx(TxError::ReadAudit(error)) = &e {
-                    return Err(read_audit_failure(error).into());
+                    return Err(read_audit_failure(Service::Kv, error).into());
                 }
                 if let TxStoreError::Tx(TxError::Db(error) | TxError::EpochInsert(error)) = &e {
                     return Err(
@@ -3299,7 +3316,12 @@ pub(crate) fn sql_error_to_status(err: &SqlError) -> Status {
         SqlError::SchemaError(_) => Status::BadRequest,
         SqlError::ReadOnlyViolation => Status::Forbidden,
         SqlError::ParseError(_) => Status::BadRequest,
-        SqlError::Internal(_) => Status::InternalServerError,
+        SqlError::Internal(_) => {
+            // The only SQL 500 that names no database failure of its own:
+            // recorded for the node's diagnostic line (TC-1796).
+            tinycloud_core::request_telemetry::note_failure(FailureNote::internal(Service::Sql));
+            Status::InternalServerError
+        }
         SqlError::Unavailable => Status::ServiceUnavailable,
         SqlError::OutcomeUnknown => Status::InternalServerError,
         SqlError::Busy(_) | SqlError::RequestTimeout => Status::ServiceUnavailable,
@@ -4076,7 +4098,9 @@ async fn verify_auth(
             TxStoreError::Tx(TxError::Db(error) | TxError::EpochInsert(error)) => {
                 database_failure(auth_service(span), error, false, e.to_string())
             }
-            TxStoreError::Tx(TxError::ReadAudit(error)) => read_audit_failure(error),
+            TxStoreError::Tx(TxError::ReadAudit(error)) => {
+                read_audit_failure(auth_service(span), error)
+            }
             TxStoreError::Tx(TxError::SpaceNotFound) => (Status::NotFound, e.to_string()),
             _ => (Status::Unauthorized, e.to_string()),
         })
@@ -4108,7 +4132,9 @@ async fn verify_auth_admitted(
             TxStoreError::Tx(TxError::Db(error) | TxError::EpochInsert(error)) => {
                 database_failure(auth_service(span), error, false, e.to_string())
             }
-            TxStoreError::Tx(TxError::ReadAudit(error)) => read_audit_failure(error),
+            TxStoreError::Tx(TxError::ReadAudit(error)) => {
+                read_audit_failure(auth_service(span), error)
+            }
             TxStoreError::Tx(TxError::SpaceNotFound) => (Status::NotFound, e.to_string()),
             _ => (Status::Unauthorized, e.to_string()),
         })
@@ -4523,6 +4549,66 @@ mod tests {
         )
         .await;
         assert!(matches!(unbounded, Ok("served")), "{unbounded:?}");
+    }
+
+    /// TC-1796: the route-level paths that answer a 5xx without a database
+    /// error record it on the request for the diagnostic line.
+    #[tokio::test]
+    async fn deadlines_audit_backlogs_and_sql_internal_errors_record_a_note() {
+        use tinycloud_core::failure_diagnostic as diag;
+        use tinycloud_core::request_telemetry::{self, RequestContext};
+
+        let context = RequestContext::new(
+            uuid::Uuid::nil(),
+            std::sync::Arc::new(tinycloud_core::telemetry::Pseudonymizer::new(
+                &tinycloud_core::keys::StaticSecret::new(vec![0x42; 32]).unwrap(),
+            )),
+        );
+
+        let mut config = Config::default();
+        config.invocation.deadline_ms = 50;
+        let cut = request_telemetry::scope(
+            std::sync::Arc::clone(&context),
+            with_invoke_deadline(
+                &config,
+                Box::pin(std::future::pending::<Result<(), InvokeError>>()),
+            ),
+        )
+        .await;
+        assert!(matches!(
+            &cut,
+            Err(InvokeError::Text(status, _)) if *status == Status::ServiceUnavailable
+        ));
+        assert_eq!(
+            context.failure(),
+            Some(diag::FailureNote::busy(
+                diag::Service::Other,
+                diag::KIND_REQUEST_TIMEOUT,
+                None
+            ))
+        );
+
+        let _request = request_telemetry::enter(Some(std::sync::Arc::clone(&context)));
+        let (status, _) =
+            read_audit_failure(diag::Service::Kv, &tinycloud_core::ReadAuditError::Busy);
+        assert_eq!(status, Status::ServiceUnavailable);
+        assert_eq!(
+            context.failure(),
+            Some(diag::FailureNote::busy(
+                diag::Service::Kv,
+                diag::KIND_READ_AUDIT_BUSY,
+                None
+            ))
+        );
+
+        assert_eq!(
+            sql_error_to_status(&SqlError::Internal("secret".into())),
+            Status::InternalServerError
+        );
+        assert_eq!(
+            context.failure(),
+            Some(diag::FailureNote::internal(diag::Service::Sql))
+        );
     }
 
     fn test_space_id(name: &str) -> SpaceId {

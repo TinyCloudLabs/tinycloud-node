@@ -14,7 +14,7 @@ use pin_project::pin_project;
 use tinycloud_auth::resource::SpaceId;
 use uuid::Uuid;
 
-use crate::failure_diagnostic::{FailureCode, FailureNote};
+use crate::failure_diagnostic::{FailureCode, FailureNote, Service};
 use crate::telemetry::{Pseudonym, Pseudonymizer};
 
 pub use sqlx_core::request_telemetry::{Metrics, PoolTimer, QueryTimer, Snapshot};
@@ -144,18 +144,23 @@ impl RequestContext {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(note);
     }
 
-    /// Mark the recorded failure as one after which a write may have been
-    /// applied.
-    pub fn note_outcome_unknown(&self) {
-        if let Some(note) = self
+    /// The recorded failure becomes one after which a write may have been
+    /// applied; with none recorded, `service` and `db_hash` start one of
+    /// kind `other`.
+    pub fn note_outcome_unknown(&self, service: Service, db_hash: Option<String>) {
+        let mut failure = self
             .failure
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_mut()
-        {
-            note.code = FailureCode::OutcomeUnknown;
-            note.write_may_have_applied = true;
-        }
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let note = failure.get_or_insert_with(|| FailureNote {
+            service,
+            code: FailureCode::OutcomeUnknown,
+            kind: "other",
+            write_may_have_applied: true,
+            db_hash,
+        });
+        note.code = FailureCode::OutcomeUnknown;
+        note.write_may_have_applied = true;
     }
 
     /// The request's recorded database failure, if any.
@@ -200,11 +205,13 @@ pub fn note_failure(note: FailureNote) {
     }
 }
 
-/// The recorded failure turned out to be one whose write may have been
-/// applied (the request's artifact write was sent before it failed).
-pub fn note_outcome_unknown() {
+/// The request's write may have been applied before it failed (its artifact
+/// write was sent): the recorded failure becomes
+/// [`FailureCode::OutcomeUnknown`]. A request with no recorded failure gets
+/// one for `service` and `db_hash`, kind `other`.
+pub fn note_outcome_unknown(service: Service, db_hash: Option<String>) {
     if let Some(context) = current() {
-        context.note_outcome_unknown();
+        context.note_outcome_unknown(service, db_hash);
     }
 }
 

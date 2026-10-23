@@ -19,7 +19,9 @@ use crate::database_artifacts::{
     DatabaseArtifactError, DatabaseArtifactRepository,
 };
 use crate::db_pool::{is_transient_error, track_writes, transient_error_class};
-use crate::failure_diagnostic::{failure_kind, FailureCode, FailureNote, Service};
+use crate::failure_diagnostic::{
+    failure_kind, FailureCode, FailureNote, Service, KIND_REQUEST_TIMEOUT,
+};
 use crate::{request_cancel, request_telemetry};
 
 use super::{
@@ -357,7 +359,10 @@ impl SqlService {
                 // could apply it twice (TC-1054, TC-1274).
                 return Err(match e {
                     SqlError::Unavailable | SqlError::Busy(_) if write_may_have_applied => {
-                        request_telemetry::note_outcome_unknown();
+                        request_telemetry::note_outcome_unknown(
+                            Service::Sql,
+                            request_telemetry::db_hash("sql", space, db_name),
+                        );
                         SqlError::OutcomeUnknown
                     }
                     e => e,
@@ -389,6 +394,7 @@ impl SqlService {
     ) -> Result<OwnedMutexGuard<()>, SqlError> {
         let lock = self.operation_lock(space, db_name).await;
         self.bounded(
+            (space, db_name),
             || SqlBusyStage::LockWait,
             self.bounds.lock_wait,
             lock.lock_owned(),
@@ -438,6 +444,7 @@ impl SqlService {
     /// was being waited on when the bound expired.
     async fn bounded<T>(
         &self,
+        db: (&SpaceId, &str),
         stage: impl Fn() -> SqlBusyStage,
         bound: Duration,
         future: impl Future<Output = T>,
@@ -463,11 +470,13 @@ impl SqlService {
                 // Logged once, by whichever of this wait and the route's
                 // deadline claims the cut first.
                 context.cut();
+                note_busy(KIND_REQUEST_TIMEOUT, Some(db));
                 Err(SqlError::RequestTimeout)
             }
             (Err(_), _) => {
                 let stage = stage();
                 log_busy(stage, bound, started.elapsed());
+                note_busy(stage.as_str(), Some(db));
                 Err(SqlError::Busy(stage))
             }
         }
@@ -521,6 +530,7 @@ impl SqlService {
 
         if self
             .bounded(
+                (space, db_name),
                 || SqlBusyStage::ArtifactTransfer,
                 self.bounds.artifact_transfer,
                 self.artifact_repository
@@ -610,7 +620,7 @@ impl SqlService {
             if let Some(start) = start {
                 start();
             }
-            match self.join_hydration(flight).await? {
+            match self.join_hydration(flight, space, db_name).await? {
                 HydrationOutcome::Ready => continue,
                 HydrationOutcome::Unavailable(kind) => {
                     note_unavailable(kind, space, db_name);
@@ -636,14 +646,19 @@ impl SqlService {
     }
 
     /// Wait for a hydration to end, at most the hydration bound.
-    async fn join_hydration(&self, flight: HydrationFlight) -> Result<HydrationOutcome, SqlError> {
+    async fn join_hydration(
+        &self,
+        flight: HydrationFlight,
+        space: &SpaceId,
+        db_name: &str,
+    ) -> Result<HydrationOutcome, SqlError> {
         let HydrationFlight { phase, mut outcome } = flight;
         let stage = || match phase.load(Ordering::Acquire) {
             PHASE_LOADING => SqlBusyStage::ArtifactTransfer,
             _ => SqlBusyStage::Hydration,
         };
         let ended = self
-            .bounded(stage, self.bounds.hydration_wait, async {
+            .bounded((space, db_name), stage, self.bounds.hydration_wait, async {
                 outcome
                     .wait_for(Option::is_some)
                     .await
@@ -854,6 +869,7 @@ impl SqlService {
         if let Some(wal) = wal.filter(|wal| wal.len() < MAX_WAL_DELTA_BYTES) {
             match self
                 .bounded(
+                    (space, db_name),
                     || SqlBusyStage::ArtifactTransfer,
                     self.bounds.artifact_transfer,
                     self.artifact_repository.save_delta(
@@ -894,6 +910,7 @@ impl SqlService {
         if growth == GrowthPolicy::Forbid {
             let durable_bytes = self
                 .bounded(
+                    (space, db_name),
                     || SqlBusyStage::ArtifactTransfer,
                     self.bounds.artifact_transfer,
                     self.artifact_repository.load_meta("sql", &key.0, db_name),
@@ -907,6 +924,7 @@ impl SqlService {
         }
         let saved = self
             .bounded(
+                (space, db_name),
                 || SqlBusyStage::ArtifactTransfer,
                 self.bounds.artifact_transfer,
                 self.artifact_repository.save(
@@ -979,6 +997,17 @@ fn unavailable_kind(err: &DatabaseArtifactError) -> Option<&'static str> {
     }
 }
 
+/// Record on the current request that a bounded wait or its deadline ended
+/// it with `503` before any write began, for the node's diagnostic line
+/// (TC-1796). `kind` is a [`SqlBusyStage`] name or [`KIND_REQUEST_TIMEOUT`].
+fn note_busy(kind: &'static str, db: Option<(&SpaceId, &str)>) {
+    request_telemetry::note_failure(FailureNote::busy(
+        Service::Sql,
+        kind,
+        db.and_then(|(space, db_name)| request_telemetry::db_hash("sql", space, db_name)),
+    ));
+}
+
 /// Record on the current request that its database (`space`, `db_name`) was
 /// unavailable, for the node's diagnostic line (TC-1796).
 fn note_unavailable(kind: &'static str, space: &SpaceId, db_name: &str) {
@@ -1039,11 +1068,13 @@ fn begin_write() -> Result<(), SqlError> {
         return Ok(());
     };
     if context.is_open() && Instant::now() >= context.deadline() && context.cut() {
+        note_busy(KIND_REQUEST_TIMEOUT, None);
         return Err(SqlError::RequestTimeout);
     }
     if context.latch() {
         Ok(())
     } else {
+        note_busy(KIND_REQUEST_TIMEOUT, None);
         Err(SqlError::RequestTimeout)
     }
 }
@@ -3865,9 +3896,10 @@ mod tests {
             repo.clone(),
         );
 
+        let (context, pseudonymizer) = noted_request();
         let first = tokio::spawn({
-            let (service, space) = (service.clone(), space.clone());
-            async move { read(&service, &space).await }
+            let (service, space, context) = (service.clone(), space.clone(), context.clone());
+            async move { crate::request_telemetry::scope(context, read(&service, &space)).await }
         });
         // The second caller queues behind the first on the operation lock
         // and then joins the same failed hydration, or finds it retired and
@@ -3889,7 +3921,7 @@ mod tests {
                     .get(&(space.to_string(), "a".to_string()))
                     .cloned()
                     .expect("the hydration is in flight");
-                service.join_hydration(flight).await
+                service.join_hydration(flight, &space, "a").await
             }
         });
         repo.load_open.send_replace(true);
@@ -3903,8 +3935,16 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(
-            matches!(joined, Ok(HydrationOutcome::Unavailable(_))),
+            matches!(joined, Ok(HydrationOutcome::Unavailable("pool_timeout"))),
             "{joined:?}"
+        );
+        // The caller that waited on the hydration recorded how it failed.
+        assert_note(
+            &context,
+            &pseudonymizer,
+            &space,
+            (FailureCode::UnavailableRetryable, "pool_timeout", false),
+            Some("a"),
         );
         assert_eq!(repo.loads(), 1, "one hydration served both");
     }
@@ -4019,6 +4059,244 @@ mod tests {
         assert!(matches!(err, SqlError::RequestTimeout), "{err:?}");
         assert!(!context.latch(), "the request was cut, not latched");
         assert_eq!(rows(read(&service, &space).await.unwrap()), 1);
+    }
+
+    fn noted_request() -> (
+        Arc<crate::request_telemetry::RequestContext>,
+        Arc<crate::telemetry::Pseudonymizer>,
+    ) {
+        let pseudonymizer = Arc::new(crate::telemetry::Pseudonymizer::new(
+            &crate::keys::StaticSecret::new(vec![0x42; 32]).unwrap(),
+        ));
+        (
+            crate::request_telemetry::RequestContext::new(
+                uuid::Uuid::nil(),
+                Arc::clone(&pseudonymizer),
+            ),
+            pseudonymizer,
+        )
+    }
+
+    /// The request's recorded failure (TC-1796) is `expected` for the SQL
+    /// service, and names database `db_name` by its keyed pseudonym only.
+    fn assert_note(
+        context: &crate::request_telemetry::RequestContext,
+        pseudonymizer: &crate::telemetry::Pseudonymizer,
+        space: &SpaceId,
+        expected: (FailureCode, &str, bool),
+        db_name: Option<&str>,
+    ) {
+        let note = context
+            .failure()
+            .expect("the failure is recorded on the request");
+        assert_eq!(
+            (
+                note.service,
+                note.code,
+                note.kind,
+                note.write_may_have_applied
+            ),
+            (Service::Sql, expected.0, expected.1, expected.2)
+        );
+        let hash = db_name.map(|name| {
+            hex::encode(
+                pseudonymizer
+                    .db_hash("sql", space, name)
+                    .unwrap()
+                    .into_bytes(),
+            )
+        });
+        assert_eq!(note.db_hash, hash);
+    }
+
+    #[tokio::test]
+    async fn tc1796_a_lock_wait_records_a_busy_note() {
+        let (repo, space) = seeded("sql-note-lock").await;
+        let cache = TempDir::new().unwrap();
+        let service = SqlService::new(cache.path().to_string_lossy().into_owned(), u64::MAX, repo);
+        read(&service, &space).await.unwrap();
+        let service = service.with_wait_bounds(wait_bounds(200));
+        let held = service.operation_lock(&space, "a").await.lock_owned().await;
+
+        let (context, pseudonymizer) = noted_request();
+        let err = tokio::time::timeout(
+            PATIENCE,
+            crate::request_telemetry::scope(Arc::clone(&context), read(&service, &space)),
+        )
+        .await
+        .expect("the waiter must give up at its bound")
+        .expect_err("a held lock must answer busy");
+        assert!(
+            matches!(err, SqlError::Busy(SqlBusyStage::LockWait)),
+            "{err:?}"
+        );
+        assert_note(
+            &context,
+            &pseudonymizer,
+            &space,
+            (FailureCode::Busy, "lock_wait", false),
+            Some("a"),
+        );
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn tc1796_a_stalled_hydration_records_a_busy_note() {
+        let (inner, space) = seeded("sql-note-hydration").await;
+        let repo = GatedArtifactRepository::new(inner);
+        repo.load_open.send_replace(false);
+        let cache = TempDir::new().unwrap();
+        let service = SqlService::new(
+            cache.path().to_string_lossy().into_owned(),
+            u64::MAX,
+            repo.clone(),
+        )
+        .with_wait_bounds(wait_bounds(200));
+
+        let (context, pseudonymizer) = noted_request();
+        let err = tokio::time::timeout(
+            PATIENCE,
+            crate::request_telemetry::scope(Arc::clone(&context), read(&service, &space)),
+        )
+        .await
+        .expect("the caller must give up at its bound")
+        .expect_err("a stalled artifact load must answer busy");
+        assert!(
+            matches!(err, SqlError::Busy(SqlBusyStage::ArtifactTransfer)),
+            "{err:?}"
+        );
+        assert_note(
+            &context,
+            &pseudonymizer,
+            &space,
+            (FailureCode::Busy, "artifact_transfer", false),
+            Some("a"),
+        );
+        repo.load_open.send_replace(true);
+    }
+
+    /// A bounded wait cut short by the request deadline records
+    /// `request_timeout`, with the database it was waiting on.
+    #[tokio::test]
+    async fn tc1796_a_wait_cut_by_the_deadline_records_a_request_timeout_note() {
+        let (inner, space) = seeded("sql-note-deadline").await;
+        let repo = GatedArtifactRepository::new(inner);
+        repo.load_open.send_replace(false);
+        let cache = TempDir::new().unwrap();
+        let service = SqlService::new(
+            cache.path().to_string_lossy().into_owned(),
+            u64::MAX,
+            repo.clone(),
+        )
+        .with_wait_bounds(wait_bounds(30_000));
+
+        let (context, pseudonymizer) = noted_request();
+        let err = tokio::time::timeout(
+            PATIENCE,
+            crate::request_cancel::within(
+                Some(crate::request_cancel::RequestCancel::new(
+                    Duration::from_millis(100),
+                )),
+                crate::request_telemetry::scope(Arc::clone(&context), read(&service, &space)),
+            ),
+        )
+        .await
+        .expect("the deadline must cut the wait")
+        .expect_err("a cut wait must fail");
+        assert!(matches!(err, SqlError::RequestTimeout), "{err:?}");
+        assert_note(
+            &context,
+            &pseudonymizer,
+            &space,
+            (FailureCode::Busy, KIND_REQUEST_TIMEOUT, false),
+            Some("a"),
+        );
+        repo.load_open.send_replace(true);
+    }
+
+    /// A write refused at its point of no return records `request_timeout`;
+    /// that layer does not know the database, so there is no `db_hash`.
+    #[tokio::test]
+    async fn tc1796_a_write_past_its_deadline_records_a_request_timeout_note() {
+        let (repo, space) = seeded("sql-note-begin-write").await;
+        let cache = TempDir::new().unwrap();
+        let service = SqlService::new(cache.path().to_string_lossy().into_owned(), u64::MAX, repo);
+        read(&service, &space).await.unwrap();
+
+        let (context, pseudonymizer) = noted_request();
+        let err = crate::request_cancel::within(
+            Some(crate::request_cancel::RequestCancel::new(Duration::ZERO)),
+            crate::request_telemetry::scope(
+                Arc::clone(&context),
+                service.execute(
+                    &space,
+                    "a",
+                    insert("late"),
+                    None,
+                    "tinycloud.sql/admin".into(),
+                ),
+            ),
+        )
+        .await
+        .expect_err("a write past its deadline must not start");
+        assert!(matches!(err, SqlError::RequestTimeout), "{err:?}");
+        assert_note(
+            &context,
+            &pseudonymizer,
+            &space,
+            (FailureCode::Busy, KIND_REQUEST_TIMEOUT, false),
+            None,
+        );
+    }
+
+    /// An artifact save whose reply was lost records the failure kind and
+    /// then the unknown outcome of its write.
+    #[tokio::test]
+    async fn tc1796_a_lost_commit_reply_records_an_unknown_outcome_note() {
+        let repo = Arc::new(LostReplyArtifactRepository {
+            inner: artifact_repository().await,
+            lost_replies: AtomicU64::new(0),
+        });
+        let cache = TempDir::new().unwrap();
+        let space = test_space_id("sql-note-lost-reply");
+        let service = SqlService::new(
+            cache.path().to_string_lossy().into_owned(),
+            u64::MAX,
+            repo.clone(),
+        );
+        service
+            .execute(
+                &space,
+                "a",
+                insert("first"),
+                None,
+                "tinycloud.sql/admin".into(),
+            )
+            .await
+            .unwrap();
+
+        repo.lost_replies.store(1, Ordering::SeqCst);
+        let (context, pseudonymizer) = noted_request();
+        let err = crate::request_telemetry::scope(
+            Arc::clone(&context),
+            service.execute(
+                &space,
+                "a",
+                insert("second"),
+                None,
+                "tinycloud.sql/admin".into(),
+            ),
+        )
+        .await
+        .expect_err("the reply was lost");
+        assert!(matches!(err, SqlError::OutcomeUnknown), "{err:?}");
+        assert_note(
+            &context,
+            &pseudonymizer,
+            &space,
+            (FailureCode::OutcomeUnknown, "io", true),
+            Some("a"),
+        );
     }
 
     /// Counts metadata reads and the payload bytes delivered to sinks.

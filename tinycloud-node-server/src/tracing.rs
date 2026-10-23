@@ -16,7 +16,7 @@ use std::{
 };
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tinycloud_core::{
-    failure_diagnostic::{FailureCode, FailureNote},
+    failure_diagnostic::{FailureCode, FailureNote, KIND_READ_AUDIT_BUSY, KIND_REQUEST_TIMEOUT},
     request_telemetry::{self, RequestContext},
     telemetry::Pseudonymizer,
 };
@@ -265,8 +265,9 @@ struct DatabaseFailureLine<'a> {
 impl<'a> DatabaseFailureLine<'a> {
     /// The line for a request that recorded `note` and was answered `status`,
     /// or `None` when the answer is not the one the note describes (a `503`
-    /// is `unavailable_retryable`, nothing else is), so a line never states a
-    /// code the client did not receive.
+    /// is `unavailable_retryable` or a busy code, a `500` is
+    /// `outcome_unknown` or `internal`), so a line never states a code the
+    /// client did not receive.
     fn new(
         note: FailureNote,
         status: u16,
@@ -282,6 +283,14 @@ impl<'a> DatabaseFailureLine<'a> {
                 (crate::routes::OUTCOME_UNKNOWN, Status::InternalServerError)
             }
             FailureCode::Internal => ("internal", Status::InternalServerError),
+            FailureCode::Busy => (
+                match note.kind {
+                    KIND_REQUEST_TIMEOUT => crate::routes::REQUEST_TIMEOUT,
+                    KIND_READ_AUDIT_BUSY => crate::routes::READ_AUDIT_BUSY,
+                    _ => crate::routes::SQL_BUSY,
+                },
+                Status::ServiceUnavailable,
+            ),
         };
         (status == expected_status.code).then(|| Self {
             status,
@@ -924,11 +933,17 @@ mod tests {
             line(FailureCode::Internal, 500),
             Some(("internal", 500, 41_900, false))
         );
+        assert_eq!(
+            line(FailureCode::Busy, 503),
+            Some(("sql_busy", 503, 41_900, false))
+        );
         for (code, status) in [
             (FailureCode::UnavailableRetryable, 500),
             (FailureCode::OutcomeUnknown, 503),
             (FailureCode::Internal, 503),
             (FailureCode::Internal, 200),
+            (FailureCode::Busy, 500),
+            (FailureCode::Busy, 200),
         ] {
             assert!(line(code, status).is_none(), "{code:?} answered {status}");
         }
@@ -1096,5 +1111,197 @@ mod tests {
         assert_eq!(fields["service"], "kv");
         assert_eq!(fields["failure_kind"], "io");
         assert_eq!(fields["write_may_have_applied"], true);
+    }
+
+    fn busy(kind: &'static str, with_db: bool) -> FailureNote {
+        FailureNote {
+            code: FailureCode::Busy,
+            kind,
+            db_hash: with_db.then(|| {
+                request_telemetry::db_hash("sql", &SECRET_SPACE.parse().unwrap(), SECRET_DB)
+                    .unwrap()
+            }),
+            ..note(FailureCode::Busy)
+        }
+    }
+
+    #[rocket::get("/tc1796-lock-wait")]
+    fn busy_lock_wait() -> (Status, &'static str) {
+        request_telemetry::note_failure(busy("lock_wait", true));
+        (Status::ServiceUnavailable, "sql_busy: lock_wait: busy")
+    }
+
+    #[rocket::get("/tc1796-hydration")]
+    fn busy_hydration() -> (Status, &'static str) {
+        request_telemetry::note_failure(busy("hydration", true));
+        (Status::ServiceUnavailable, "sql_busy: hydration: busy")
+    }
+
+    #[rocket::get("/tc1796-artifact-transfer")]
+    fn busy_artifact_transfer() -> (Status, &'static str) {
+        request_telemetry::note_failure(busy("artifact_transfer", true));
+        (
+            Status::ServiceUnavailable,
+            "sql_busy: artifact_transfer: busy",
+        )
+    }
+
+    #[rocket::get("/tc1796-timeout")]
+    fn busy_request_timeout() -> (Status, &'static str) {
+        request_telemetry::note_failure(busy(KIND_REQUEST_TIMEOUT, false));
+        (
+            Status::ServiceUnavailable,
+            "request_timeout: no change was applied",
+        )
+    }
+
+    #[rocket::get("/tc1796-read-audit")]
+    fn busy_read_audit() -> (Status, &'static str) {
+        request_telemetry::note_failure(busy(KIND_READ_AUDIT_BUSY, false));
+        (Status::ServiceUnavailable, "read_audit_busy: backlogged")
+    }
+
+    /// A busy wait whose outcome turned out unknown is answered 500.
+    #[rocket::get("/tc1796-busy-then-unknown")]
+    fn busy_then_unknown() -> (Status, &'static str) {
+        request_telemetry::note_failure(busy("artifact_transfer", true));
+        request_telemetry::note_outcome_unknown(
+            tinycloud_core::failure_diagnostic::Service::Other,
+            None,
+        );
+        (
+            Status::InternalServerError,
+            "outcome_unknown: may have applied",
+        )
+    }
+
+    #[rocket::get("/tc1796-internal")]
+    fn sql_internal() -> (Status, &'static str) {
+        request_telemetry::note_failure(FailureNote::internal(
+            tinycloud_core::failure_diagnostic::Service::Sql,
+        ));
+        (Status::InternalServerError, "Internal error: boom")
+    }
+
+    /// A busy note answered with another status (here a 500) logs nothing.
+    #[rocket::get("/tc1796-busy-mismatch")]
+    fn busy_answered_500() -> (Status, &'static str) {
+        request_telemetry::note_failure(busy("lock_wait", true));
+        (Status::InternalServerError, "something else")
+    }
+
+    /// Each busy, timeout and internal path logs exactly one line, with the
+    /// code the client received, the elapsed time and the fixed kind.
+    #[tokio::test]
+    async fn busy_timeout_and_internal_5xxs_log_one_line_each_with_elapsed_time() {
+        let captured = Captured::default();
+        let _subscriber = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .json()
+                .with_writer(captured.clone())
+                .with_max_level(Level::WARN)
+                .finish(),
+        );
+        let routes: Vec<_> = rocket::routes![
+            busy_lock_wait,
+            busy_hydration,
+            busy_artifact_transfer,
+            busy_request_timeout,
+            busy_read_audit,
+            busy_then_unknown,
+            sql_internal,
+            busy_answered_500
+        ]
+        .into_iter()
+        .map(instrument_route)
+        .collect();
+        let client = Client::tracked(
+            rocket::build()
+                .mount("/", routes)
+                .attach(disabled_fairing()),
+        )
+        .await
+        .expect("valid rocket instance");
+
+        // (path, status, code, kind, write_may_have_applied, has db_hash)
+        let expected = [
+            (
+                "/tc1796-lock-wait",
+                503,
+                "sql_busy",
+                "lock_wait",
+                false,
+                true,
+            ),
+            (
+                "/tc1796-hydration",
+                503,
+                "sql_busy",
+                "hydration",
+                false,
+                true,
+            ),
+            (
+                "/tc1796-artifact-transfer",
+                503,
+                "sql_busy",
+                "artifact_transfer",
+                false,
+                true,
+            ),
+            (
+                "/tc1796-timeout",
+                503,
+                "request_timeout",
+                "request_timeout",
+                false,
+                false,
+            ),
+            (
+                "/tc1796-read-audit",
+                503,
+                "read_audit_busy",
+                "read_audit_busy",
+                false,
+                false,
+            ),
+            (
+                "/tc1796-busy-then-unknown",
+                500,
+                "outcome_unknown",
+                "artifact_transfer",
+                true,
+                true,
+            ),
+            ("/tc1796-internal", 500, "internal", "other", false, false),
+        ];
+        for (path, status, ..) in expected {
+            let response = client.get(path).dispatch().await;
+            assert_eq!(response.status().code, status, "{path}");
+        }
+        let response = client.get("/tc1796-busy-mismatch").dispatch().await;
+        assert_eq!(response.status(), Status::InternalServerError);
+
+        let output = String::from_utf8(captured.0.lock().clone()).unwrap();
+        let events: Vec<Value> = output
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            events.len(),
+            expected.len(),
+            "one line per request: {output}"
+        );
+        for (event, (path, status, code, kind, write, has_hash)) in events.iter().zip(expected) {
+            let fields = &event["fields"];
+            assert_eq!(fields["route"], path);
+            assert_eq!(fields["status"], status, "{path}");
+            assert_eq!(fields["code"], code, "{path}");
+            assert_eq!(fields["failure_kind"], kind, "{path}");
+            assert_eq!(fields["write_may_have_applied"], write, "{path}");
+            assert!(fields["elapsed_ms"].is_u64(), "{path}: {fields}");
+            assert_eq!(fields.get("db_hash").is_some(), has_hash, "{path}");
+            assert_eq!(fields.as_object().unwrap().len(), 8 + usize::from(has_hash));
+        }
     }
 }

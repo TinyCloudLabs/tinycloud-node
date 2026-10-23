@@ -44,6 +44,10 @@ pub enum FailureCode {
     OutcomeUnknown,
     /// `500`: any other database failure.
     Internal,
+    /// `503`: a bounded wait or the request deadline ended before any write
+    /// began (or, once [`crate::request_telemetry::note_outcome_unknown`]
+    /// applies, `500` [`FailureCode::OutcomeUnknown`]).
+    Busy,
 }
 
 /// What the failing layer knows about the failure. See the module docs for
@@ -59,6 +63,39 @@ pub struct FailureNote {
     /// [`crate::telemetry::Pseudonymizer::db_hash`]), when the failing layer
     /// knows it.
     pub db_hash: Option<String>,
+}
+
+/// [`FailureNote::kind`] of a request that reached its deadline.
+pub const KIND_REQUEST_TIMEOUT: &str = "request_timeout";
+/// [`FailureNote::kind`] of a read whose audit record was not confirmed in
+/// time.
+pub const KIND_READ_AUDIT_BUSY: &str = "read_audit_busy";
+
+impl FailureNote {
+    /// A wait that gave up with `503` before any write began. `kind` is a
+    /// [`SqlBusyStage`](crate::sql::SqlBusyStage) name (`lock_wait`,
+    /// `hydration`, `artifact_transfer`), [`KIND_REQUEST_TIMEOUT`] or
+    /// [`KIND_READ_AUDIT_BUSY`].
+    pub fn busy(service: Service, kind: &'static str, db_hash: Option<String>) -> Self {
+        Self {
+            service,
+            code: FailureCode::Busy,
+            kind,
+            write_may_have_applied: false,
+            db_hash,
+        }
+    }
+
+    /// A failure that is not a database error, answered `500`.
+    pub fn internal(service: Service) -> Self {
+        Self {
+            service,
+            code: FailureCode::Internal,
+            kind: "other",
+            write_may_have_applied: false,
+            db_hash: None,
+        }
+    }
 }
 
 /// A fixed class of a database failure, from the error's variant and, for a
@@ -222,5 +259,60 @@ mod tests {
             Some(&hash),
             request_telemetry::db_hash("sql", &other_space, "notes.db").as_ref()
         );
+    }
+
+    #[test]
+    fn an_unknown_outcome_upgrades_or_creates_the_note_and_a_later_note_replaces_it() {
+        use crate::{
+            keys::StaticSecret, request_telemetry::RequestContext, telemetry::Pseudonymizer,
+        };
+        use std::sync::Arc;
+
+        let new_request = || {
+            RequestContext::new(
+                uuid::Uuid::nil(),
+                Arc::new(Pseudonymizer::new(
+                    &StaticSecret::new(vec![0x42; 32]).unwrap(),
+                )),
+            )
+        };
+
+        // After a busy wait: the kind and database stay, the code changes.
+        let request = new_request();
+        request.note_failure(FailureNote::busy(
+            Service::Sql,
+            "artifact_transfer",
+            Some("hash".into()),
+        ));
+        request.note_outcome_unknown(Service::Other, None);
+        assert_eq!(
+            request.failure(),
+            Some(FailureNote {
+                service: Service::Sql,
+                code: FailureCode::OutcomeUnknown,
+                kind: "artifact_transfer",
+                write_may_have_applied: true,
+                db_hash: Some("hash".into()),
+            })
+        );
+
+        // With no earlier note: one is created from what the caller knows.
+        let request = new_request();
+        assert_eq!(request.failure(), None);
+        request.note_outcome_unknown(Service::Sql, Some("hash".into()));
+        assert_eq!(
+            request.failure(),
+            Some(FailureNote {
+                service: Service::Sql,
+                code: FailureCode::OutcomeUnknown,
+                kind: "other",
+                write_may_have_applied: true,
+                db_hash: Some("hash".into()),
+            })
+        );
+
+        // The last failure recorded is the one reported.
+        request.note_failure(FailureNote::internal(Service::Kv));
+        assert_eq!(request.failure(), Some(FailureNote::internal(Service::Kv)));
     }
 }

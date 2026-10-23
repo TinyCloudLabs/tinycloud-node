@@ -607,7 +607,9 @@ async fn verify_auth(
         // a read-audit or transient database failure is retryable, and must
         // not tell the client its credentials were refused.
         .map_err(|err| match &err {
-            TxStoreError::Tx(TxError::ReadAudit(error)) => super::read_audit_failure(error),
+            TxStoreError::Tx(TxError::ReadAudit(error)) => {
+                super::read_audit_failure(tinycloud_core::failure_diagnostic::Service::Other, error)
+            }
             TxStoreError::Tx(TxError::Db(error) | TxError::EpochInsert(error)) => {
                 super::database_failure(
                     tinycloud_core::failure_diagnostic::Service::Other,
