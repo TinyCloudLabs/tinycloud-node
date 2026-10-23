@@ -15,7 +15,7 @@
 //! unrestricted".
 //!
 //! Names are matched ASCII-case-insensitively and exactly otherwise (no
-//! wildcards, no `table.column`). Each list has 1..=[`MAX_NAMES`] elements, each
+//! wildcards, no `table.column`). Each list has 0..=[`MAX_NAMES`] elements, each
 //! element 1..=[`MAX_NAME_BYTES`] bytes of UTF-8 without a `.`, without control
 //! characters and without leading or trailing whitespace.
 

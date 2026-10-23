@@ -14,9 +14,9 @@ The caveats of one ability are a list of objects. One entry may be:
 | `{"tables": [...], "columns": [...], "readOnly": true}` | the delegated form; keys are any subset of the three |
 | a constrained-statements profile (`mode` key, or nested `constrained-statements`) | the request is bound to the profile's statements |
 
-- `tables` and `columns` are lists of 1 to 256 names. A name is 1 to 128 bytes, has no `.` (so no `table.column`), no control character, and no leading or trailing whitespace. There are no wildcards: a name matches only itself.
+- `tables` and `columns` are lists of 0 to 256 names, each non-empty. A name is 1 to 128 bytes, has no `.` (so no `table.column`), no control character, and no leading or trailing whitespace. There are no wildcards: a name matches only itself.
 - Names compare ASCII-case-insensitively, on both sides, everywhere (admission, containment, execution). Only the ASCII letters fold: the Kelvin sign (U+212A) is a different name from `k`.
-- `readOnly` is a boolean. `false` is the same as absent. An absent key is no restriction on that axis; `"tables": []` is a restriction that allows no table.
+- `readOnly` is a boolean. `false` is the same as absent. An absent key is no restriction on that axis. An empty list is a restriction: `"tables": []` allows no table, and `"columns": []` allows no column (a read that names no column, such as `count(*)`, is still allowed when its table is).
 - A list with a delegated entry has exactly that one entry. Entries of a list are alternatives, so a second entry, even an empty one, is refused. A list of only empty entries (`[{}]`, `[{}, {}]`) restricts nothing. An entry that has `mode` and also `tables` or `columns` is refused.
 - Anything else (unknown key, wrong type, empty or over-long name, too many names) is refused at `/delegate` with `unsupported-caveat: <ability> caveat <index> <reason>`; the reason never repeats a name from the request.
 
