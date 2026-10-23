@@ -10,10 +10,9 @@ services:
       ROCKET_ADDRESS: 0.0.0.0
     volumes:
       - ${NODE_DATA_DIR:?Set the node data directory}:/data
-      # This config masks the one copied into the image. The 1.20.6 image,
-      # the starting point of the upgrade rehearsal, embeds a sample key in
-      # its default TOML; the 1.22.0 image does not. The mount applies to both
-      # and fails closed when the operator key is absent.
+      # This config replaces the one bundled in the image and fails closed
+      # when the operator key is absent. The upgrade rehearsal starts from
+      # the 1.20.6 image; CI runs the bare image check on 1.22.0.
       - ./tinycloud.toml:/tinycloud.toml:ro
     security_opt:
       - no-new-privileges:true
