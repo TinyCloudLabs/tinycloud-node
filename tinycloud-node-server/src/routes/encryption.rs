@@ -665,11 +665,13 @@ fn map_service_err(err: EncryptionServiceError) -> (Status, String) {
         EncryptionServiceError::NetworkNotActive(_) => Status::Conflict,
         EncryptionServiceError::KeyExists => Status::Conflict,
         EncryptionServiceError::KeyNotFound => Status::NotFound,
-        EncryptionServiceError::DeletableUnavailable
+        EncryptionServiceError::KeyDeleted
         | EncryptionServiceError::KeyBlocked
         | EncryptionServiceError::KeyLimitExceeded
         | EncryptionServiceError::KeyUnwrapFailed(_) => Status::Forbidden,
-        EncryptionServiceError::CorruptKeyRow => Status::InternalServerError,
+        EncryptionServiceError::CorruptKeyRow | EncryptionServiceError::StrayAppKeyRows(_) => {
+            Status::InternalServerError
+        }
         EncryptionServiceError::KeyPathInvalid(_) => Status::BadRequest,
         EncryptionServiceError::InvalidBody(_)
         | EncryptionServiceError::InvalidReceiverPublicKey

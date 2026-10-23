@@ -2,11 +2,12 @@
 //!
 //! V1 ships the `LocalOneOfOneBackend`, which generates a single X25519 keypair
 //! per network and stores the private key sealed with the same key material the
-//! node uses for DB column encryption. Future threshold backends must avoid
+//! node uses for DB column encryption. Deletable named keys carry a per-key
+//! random seed, sealed the same way. Future threshold backends must avoid
 //! ever assembling the full network private key.
 
 use hkdf::Hkdf;
-use rand::rngs::OsRng;
+use rand::{rngs::OsRng, RngCore};
 use sha2::Sha256;
 use thiserror::Error;
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -73,20 +74,33 @@ pub trait KeyBackend: Send + Sync {
     ) -> Result<StaticSecret, KeyBackendError>;
 
     /// Public key of the named key at `canonical_urn` under `network_secret`.
+    /// `seed` is the per-key seed of a deletable key and `None` for a
+    /// deterministic key.
     fn derive_named_public_key(
         &self,
         network_secret: &StaticSecret,
         canonical_urn: &str,
+        seed: Option<&KeySeed>,
     ) -> Result<Vec<u8>, KeyBackendError>;
 
     /// Unwrap a key wrapped to the named key at `canonical_urn` under
-    /// `network_secret`.
+    /// `network_secret` and `seed`.
     fn unwrap_named(
         &self,
         network_secret: &StaticSecret,
         canonical_urn: &str,
+        seed: Option<&KeySeed>,
         wrapped_key: &[u8],
     ) -> Result<Vec<u8>, KeyBackendError>;
+
+    /// A fresh 32-byte seed from the OS CSPRNG, with its sealed form for
+    /// storage.
+    fn generate_seed(&self) -> Result<(KeySeed, Vec<u8>), KeyBackendError>;
+
+    /// Opens a sealed seed. Only the strict unseal is used: input that is not
+    /// a versioned sealed value, or that does not hold exactly 32 bytes, is
+    /// refused.
+    fn open_seed(&self, sealed_seed: &[u8]) -> Result<KeySeed, KeyBackendError>;
 }
 
 /// X25519 ECIES-style key wrap backed by AES-256-GCM. Used both for wrapping to
@@ -146,18 +160,56 @@ fn unwrap_with_secret(secret: &StaticSecret, wrapped: &[u8]) -> Result<Vec<u8>, 
 }
 
 const NAMED_KEY_SALT: &[u8] = b"tinycloud.encryption.named-key/v1";
-const NAMED_KEY_INFO_PREFIX: &[u8] = b"deterministic\n";
+const DETERMINISTIC_INFO_PREFIX: &[u8] = b"deterministic\n";
+const SEEDED_INFO_PREFIX: &[u8] = b"seeded\n";
 
-/// Deterministic named-key secret = HKDF-SHA256(ikm = raw network secret,
-/// salt = fixed label, info = `deterministic\n` || canonical key URN).
-fn named_key_secret(network_secret: &[u8; 32], canonical_urn: &str) -> StaticSecret {
-    let mut info = Vec::with_capacity(NAMED_KEY_INFO_PREFIX.len() + canonical_urn.len());
-    info.extend_from_slice(NAMED_KEY_INFO_PREFIX);
+/// Per-key seed of a deletable key. Zeroized on drop.
+pub struct KeySeed(Zeroizing<[u8; 32]>);
+
+impl KeySeed {
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(Zeroizing::new(bytes))
+    }
+
+    fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// Named-key secret. With no seed (deterministic key): HKDF-SHA256(ikm = raw
+/// network secret, salt = fixed label, info = `deterministic\n` || canonical
+/// key URN). With a seed (deletable key): the same with ikm = HKDF-Extract(
+/// salt = seed, ikm = raw network secret) and info = `seeded\n` || URN.
+fn named_key_secret(
+    network_secret: &[u8; 32],
+    canonical_urn: &str,
+    seed: Option<&KeySeed>,
+) -> StaticSecret {
+    let prefix = if seed.is_some() {
+        SEEDED_INFO_PREFIX
+    } else {
+        DETERMINISTIC_INFO_PREFIX
+    };
+    let mut info = Vec::with_capacity(prefix.len() + canonical_urn.len());
+    info.extend_from_slice(prefix);
     info.extend_from_slice(canonical_urn.as_bytes());
-    let hk = Hkdf::<Sha256>::new(Some(NAMED_KEY_SALT), network_secret);
     let mut okm = [0u8; 32];
-    hk.expand(&info, &mut okm)
-        .expect("32 bytes is a valid HKDF-SHA256 output length");
+    match seed {
+        None => {
+            Hkdf::<Sha256>::new(Some(NAMED_KEY_SALT), network_secret)
+                .expand(&info, &mut okm)
+                .expect("32 bytes is a valid HKDF-SHA256 output length");
+        }
+        Some(seed) => {
+            let (extracted, _) =
+                Hkdf::<Sha256>::extract(Some(seed.as_bytes().as_slice()), network_secret);
+            let mut prk: [u8; 32] = extracted.into();
+            Hkdf::<Sha256>::new(Some(NAMED_KEY_SALT), &prk)
+                .expand(&info, &mut okm)
+                .expect("32 bytes is a valid HKDF-SHA256 output length");
+            prk.zeroize();
+        }
+    }
     let secret = StaticSecret::from(okm);
     okm.zeroize();
     secret
@@ -222,8 +274,9 @@ impl KeyBackend for LocalOneOfOneBackend {
         &self,
         network_secret: &StaticSecret,
         canonical_urn: &str,
+        seed: Option<&KeySeed>,
     ) -> Result<Vec<u8>, KeyBackendError> {
-        let secret = named_key_secret(network_secret.as_bytes(), canonical_urn);
+        let secret = named_key_secret(network_secret.as_bytes(), canonical_urn, seed);
         Ok(PublicKey::from(&secret).as_bytes().to_vec())
     }
 
@@ -231,10 +284,27 @@ impl KeyBackend for LocalOneOfOneBackend {
         &self,
         network_secret: &StaticSecret,
         canonical_urn: &str,
+        seed: Option<&KeySeed>,
         wrapped_key: &[u8],
     ) -> Result<Vec<u8>, KeyBackendError> {
-        let secret = named_key_secret(network_secret.as_bytes(), canonical_urn);
+        let secret = named_key_secret(network_secret.as_bytes(), canonical_urn, seed);
         unwrap_with_secret(&secret, wrapped_key)
+    }
+
+    fn generate_seed(&self) -> Result<(KeySeed, Vec<u8>), KeyBackendError> {
+        let mut bytes = Zeroizing::new([0u8; 32]);
+        OsRng.fill_bytes(bytes.as_mut_slice());
+        let sealed = self.seal.encrypt(bytes.as_slice());
+        Ok((KeySeed::from_bytes(*bytes), sealed))
+    }
+
+    fn open_seed(&self, sealed_seed: &[u8]) -> Result<KeySeed, KeyBackendError> {
+        let opened = Zeroizing::new(self.seal.decrypt_strict(sealed_seed)?);
+        let bytes: [u8; 32] = opened
+            .as_slice()
+            .try_into()
+            .map_err(|_| KeyBackendError::InvalidSealedKey)?;
+        Ok(KeySeed::from_bytes(bytes))
     }
 
     fn rewrap(
@@ -358,6 +428,16 @@ mod tests {
 
     const KAT_URN_NOTES: &str = "urn:tinycloud:encryption:did:key:z6Mk:default/apps/notes";
     const KAT_URN_A: &str = "urn:tinycloud:encryption:did:key:z6Mk:default/a";
+    const KAT_URN_NOTES_A: &str = "urn:tinycloud:encryption:did:key:z6Mk:default/apps/notes/a";
+
+    /// Seed bytes 0x20..=0x3f, used by the seeded known-answer vectors.
+    fn kat_seed() -> KeySeed {
+        let mut s = [0u8; 32];
+        for (i, b) in s.iter_mut().enumerate() {
+            *b = 0x20 + i as u8;
+        }
+        KeySeed::from_bytes(s)
+    }
 
     /// Known-answer vectors generated independently with Python `cryptography`:
     /// HKDF-SHA256(ikm = network secret, salt = "tinycloud.encryption.named-key/v1",
@@ -377,7 +457,44 @@ mod tests {
             ),
         ];
         for (urn, secret_hex, public_hex) in cases {
-            let secret = named_key_secret(&kat_network_secret(), urn);
+            let secret = named_key_secret(&kat_network_secret(), urn, None);
+            assert_eq!(hex(secret.as_bytes()), secret_hex, "secret for {urn}");
+            assert_eq!(
+                hex(PublicKey::from(&secret).as_bytes()),
+                public_hex,
+                "public key for {urn}"
+            );
+        }
+    }
+
+    /// Seeded known-answer vectors generated independently with Python
+    /// `cryptography`/`hmac`: prk = HKDF-Extract(salt = seed, ikm = network
+    /// secret), then HKDF-SHA256(ikm = prk, salt =
+    /// "tinycloud.encryption.named-key/v1", info = "seeded\n" || URN), then
+    /// X25519 public-key derivation. Network secret bytes 0x00..=0x1f, seed
+    /// bytes 0x20..=0x3f.
+    #[test]
+    fn seeded_named_key_secret_known_answer() {
+        let cases = [
+            (
+                KAT_URN_NOTES,
+                "6dfc78d8bfad5426a807a0d28d215b9d0724f399017b7208bcc0a0059d56699b",
+                "a4ce43c1b98d2289215722623801c8ca0896122872427557e32547b6f393477f",
+            ),
+            (
+                KAT_URN_A,
+                "cb3f04c506504e1148d6e6d567a2cb7a4675297434bda9d30532b893259a8ed5",
+                "d9dd603f57bbae80ba23995bc322f0dc2c8c681e8a049ac8fe5469d5ee4d5e65",
+            ),
+            (
+                KAT_URN_NOTES_A,
+                "5b66844f3beed84737dc6e3b5a389c313c92d9a22dd9311d3c4371aa904f5a3d",
+                "55fea451945fed9ab2e6a3a7922f2e175dee1bb2c7e076caa8971a69aaf56f53",
+            ),
+        ];
+        let seed = kat_seed();
+        for (urn, secret_hex, public_hex) in cases {
+            let secret = named_key_secret(&kat_network_secret(), urn, Some(&seed));
             assert_eq!(hex(secret.as_bytes()), secret_hex, "secret for {urn}");
             assert_eq!(
                 hex(PublicKey::from(&secret).as_bytes()),
@@ -393,17 +510,105 @@ mod tests {
         let gk = backend.generate().unwrap();
         let network = backend.open_network_secret(&gk.sealed_private_key).unwrap();
         let named_pub = backend
-            .derive_named_public_key(&network, KAT_URN_NOTES)
+            .derive_named_public_key(&network, KAT_URN_NOTES, None)
             .unwrap();
         let symmetric = [0x5Au8; 32];
         let wrapped = wrap_to_public_key(&named_pub, &symmetric).unwrap();
         let recovered = backend
-            .unwrap_named(&network, KAT_URN_NOTES, &wrapped)
+            .unwrap_named(&network, KAT_URN_NOTES, None, &wrapped)
             .unwrap();
         assert_eq!(recovered, symmetric);
         // Wrapped to the notes key: a sibling key and the root key cannot open it.
-        assert!(backend.unwrap_named(&network, KAT_URN_A, &wrapped).is_err());
+        assert!(backend
+            .unwrap_named(&network, KAT_URN_A, None, &wrapped)
+            .is_err());
         assert!(backend.unwrap(&gk.sealed_private_key, &wrapped).is_err());
+    }
+
+    #[test]
+    fn seeded_key_round_trip_and_isolation() {
+        let backend = LocalOneOfOneBackend::new(seal_key());
+        let gk = backend.generate().unwrap();
+        let network = backend.open_network_secret(&gk.sealed_private_key).unwrap();
+        let (seed, sealed_seed) = backend.generate_seed().unwrap();
+        let (other_seed, _) = backend.generate_seed().unwrap();
+        let opened = backend.open_seed(&sealed_seed).unwrap();
+
+        let public = backend
+            .derive_named_public_key(&network, KAT_URN_NOTES, Some(&seed))
+            .unwrap();
+        let symmetric = [0x5Au8; 32];
+        let wrapped = wrap_to_public_key(&public, &symmetric).unwrap();
+        assert_eq!(
+            backend
+                .unwrap_named(&network, KAT_URN_NOTES, Some(&opened), &wrapped)
+                .unwrap(),
+            symmetric
+        );
+        // Another seed, no seed, another URN and the network key cannot open it.
+        assert!(backend
+            .unwrap_named(&network, KAT_URN_NOTES, Some(&other_seed), &wrapped)
+            .is_err());
+        assert!(backend
+            .unwrap_named(&network, KAT_URN_NOTES, None, &wrapped)
+            .is_err());
+        assert!(backend
+            .unwrap_named(&network, KAT_URN_A, Some(&seed), &wrapped)
+            .is_err());
+        assert!(backend.unwrap(&gk.sealed_private_key, &wrapped).is_err());
+        // The same URN with and without a seed names different keys.
+        assert_ne!(
+            public,
+            backend
+                .derive_named_public_key(&network, KAT_URN_NOTES, None)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn generated_seeds_differ_and_open_to_the_stored_bytes() {
+        let backend = LocalOneOfOneBackend::new(seal_key());
+        let (first, first_sealed) = backend.generate_seed().unwrap();
+        let (second, second_sealed) = backend.generate_seed().unwrap();
+        assert_ne!(first.as_bytes(), second.as_bytes());
+        assert_ne!(first_sealed, second_sealed);
+        assert_ne!(first.as_bytes(), &[0u8; 32]);
+        assert_eq!(
+            backend.open_seed(&first_sealed).unwrap().as_bytes(),
+            first.as_bytes()
+        );
+    }
+
+    #[test]
+    fn seeds_open_only_through_the_strict_unseal() {
+        let backend = LocalOneOfOneBackend::new(seal_key());
+        // The lenient unseal returns input without the version byte unchanged.
+        // A zeroed value would therefore open as an all-zero seed; the strict
+        // unseal refuses it.
+        for refused in [
+            vec![0u8; 32],
+            vec![0u8; 45],
+            vec![],
+            vec![0x02; 60],
+            vec![0x01; 10],
+        ] {
+            assert!(
+                backend.open_seed(&refused).is_err(),
+                "opened {} bytes",
+                refused.len()
+            );
+        }
+        // A sealed value that is not 32 bytes is refused.
+        let short = ColumnEncryption::new([7u8; 32]).encrypt(&[1u8; 16]);
+        assert!(matches!(
+            backend.open_seed(&short),
+            Err(KeyBackendError::InvalidSealedKey)
+        ));
+        // A seed sealed under another key does not open.
+        let (_, other) = LocalOneOfOneBackend::new(ColumnEncryption::new([8u8; 32]))
+            .generate_seed()
+            .unwrap();
+        assert!(backend.open_seed(&other).is_err());
     }
 
     #[test]
