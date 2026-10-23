@@ -248,6 +248,8 @@ pub enum SqlError {
     DatabaseNotFound,
     #[error("sql_response_too_large: Response too large: {0} bytes (limit {1} bytes)")]
     ResponseTooLarge(u64, u64),
+    #[error("sql_response_too_large: Response too large: row limit exceeded (limit {0} rows)")]
+    RowLimitExceeded(usize),
     #[error("Quota exceeded")]
     QuotaExceeded,
     /// The space is full and the request would have grown the database; it

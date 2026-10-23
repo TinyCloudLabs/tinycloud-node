@@ -11,7 +11,7 @@ The body is read after the invocation is authorized.
 | SQL `/invoke` | 2,097,152 bytes | `sql_request_too_large` |
 | DuckDB `/invoke` | 1,048,576 bytes | `duckdb_request_too_large` |
 
-The encryption decrypt path on `/invoke` uses 1,048,576 bytes. Meeting publication uses 2,097,152 bytes. Both refuse with `request_too_large`.
+The encryption decrypt path on `/invoke` uses 1,048,576 bytes and refuses with `request_too_large`. Meeting publication runs on the SQL `/invoke` path, so it uses the SQL limit of 2,097,152 bytes and refuses with `sql_request_too_large`.
 
 The detail states the limit that was applied.
 
@@ -23,7 +23,7 @@ The detail states the limit that was applied.
 | DuckDB query | 10,485,760 bytes | `duckdb_response_too_large` |
 
 - SQL `maxBytes` must be 1 to 4,194,304. It can only lower the 10 MiB limit.
-- SQL `maxRows` must be 1 to 1,000. A query whose rows exceed `maxRows` is refused with `sql_response_too_large` and status 413. In that case the detail reports the bytes serialized so far, not the limit.
+- SQL `maxRows` must be 1 to 1,000. A query that returns more rows than `maxRows` is refused with `sql_response_too_large` and status 413. The detail states the row limit applied.
 - DuckDB JSON responses are checked against an estimate of the serialized size. DuckDB Arrow responses are checked against the length of the encoded buffer.
 
 ## Not body-size limits

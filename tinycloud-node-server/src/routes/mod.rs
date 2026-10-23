@@ -3268,7 +3268,7 @@ pub(crate) fn sql_error_to_status(err: &SqlError) -> Status {
         SqlError::Sqlite(_) => Status::BadRequest,
         SqlError::PermissionDenied(_) => Status::Forbidden,
         SqlError::DatabaseNotFound => Status::NotFound,
-        SqlError::ResponseTooLarge(..) => Status::new(413),
+        SqlError::ResponseTooLarge(..) | SqlError::RowLimitExceeded(_) => Status::new(413),
         SqlError::QuotaExceeded => Status::new(429),
         SqlError::StorageWouldGrow => Status::new(402),
         SqlError::InvalidStatement(_) => Status::BadRequest,
@@ -4412,6 +4412,34 @@ mod tests {
             .starts_with(&format!("{SQL_BUSY}: hydration:")));
         // The SQL service's own timeout answer is the route's, word for word.
         assert_eq!(SqlError::RequestTimeout.to_string(), REQUEST_TIMEOUT_BODY);
+    }
+
+    #[test]
+    fn sql_size_refusals_are_413_with_stable_codes() {
+        let row_limit = SqlError::RowLimitExceeded(1);
+        assert_eq!(sql_error_to_status(&row_limit), Status::new(413));
+        assert_eq!(
+            row_limit.to_string(),
+            "sql_response_too_large: Response too large: row limit exceeded (limit 1 rows)"
+        );
+
+        let byte_cap = SqlError::ResponseTooLarge(60, 50);
+        assert_eq!(sql_error_to_status(&byte_cap), Status::new(413));
+        assert_eq!(
+            byte_cap.to_string(),
+            "sql_response_too_large: Response too large: 60 bytes (limit 50 bytes)"
+        );
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn duckdb_response_refusal_is_413_with_stable_code() {
+        let error = DuckDbError::ResponseTooLarge(60, 50);
+        assert_eq!(duckdb_error_to_status(&error), Status::new(413));
+        assert_eq!(
+            error.to_string(),
+            "duckdb_response_too_large: Response too large: 60 bytes (limit 50 bytes)"
+        );
     }
 
     /// TC-1274: an `/invoke` that has not begun a write is answered
@@ -13060,6 +13088,34 @@ mod tests {
             "expected one-database-proof rejection, got {}",
             reply.body
         );
+        Ok(())
+    }
+
+    // An oversized DuckDB request body is refused at the route with the
+    // stable `duckdb_request_too_large` code, before the request is parsed.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn duckdb_request_body_over_limit_returns_413_with_code() -> Result<()> {
+        use rocket::http::Status;
+
+        let f = KvSyncFixture::new().await?;
+        let uri = f
+            .resource_in(&f.space, "duckdb", "appA/connectors")?
+            .to_string();
+        let oversized = "x".repeat(1_048_576);
+        let reply = f
+            .invoke_json(
+                f.owner_invocation(&[(uri, "tinycloud.duckdb/read")])?,
+                &tc825_duck_query(&format!("SELECT '{oversized}'")),
+            )
+            .await?;
+        assert_eq!(reply.status, Status::PayloadTooLarge, "{}", reply.body);
+        assert!(
+            reply.body.starts_with("duckdb_request_too_large: "),
+            "{}",
+            reply.body
+        );
+        assert!(reply.body.contains("limit 1048576 bytes"), "{}", reply.body);
         Ok(())
     }
 
