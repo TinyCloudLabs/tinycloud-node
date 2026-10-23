@@ -99,6 +99,17 @@ pub struct ShareEmailConfig {
     pub node_audience: String,
     #[serde(default = "default_share_return_origin")]
     pub return_origin: String,
+    /// The links API the node reads a share record from for a delivery
+    /// authorization: exactly `https://host[:port]`. The link never names an
+    /// API origin; this is the only source. Validated when the configuration
+    /// loads, and the node refuses to start with an invalid value.
+    #[serde(default = "default_share_links_origin")]
+    pub links_origin: String,
+    /// For a self-hosted links API on a private network: permit a
+    /// `links_origin` whose host is, or resolves to, a private, loopback,
+    /// link-local or CGNAT address.
+    #[serde(default)]
+    pub links_origin_allow_private: bool,
     /// The only browser origin allowed to call the node's share-email API.
     /// This is deliberately a list so the deployed value is visible in the
     /// configuration and cannot accidentally become a wildcard.
@@ -185,6 +196,9 @@ fn default_share_node_audience() -> String {
 fn default_share_return_origin() -> String {
     "https://share.tinycloud.xyz".to_owned()
 }
+fn default_share_links_origin() -> String {
+    "https://api.tinycloud.xyz".to_owned()
+}
 fn default_share_allowed_origins() -> Vec<String> {
     vec![default_share_return_origin()]
 }
@@ -255,6 +269,8 @@ impl Default for ShareEmailConfig {
             target_origin: default_share_target_origin(),
             node_audience: default_share_node_audience(),
             return_origin: default_share_return_origin(),
+            links_origin: default_share_links_origin(),
+            links_origin_allow_private: false,
             allowed_origins: default_share_allowed_origins(),
             node_signing_kid: default_share_node_signing_kid(),
             invitation_kid: default_share_invitation_kid(),
@@ -282,6 +298,44 @@ impl Default for ShareEmailConfig {
 }
 
 impl ShareEmailConfig {
+    /// The links origin checks, run whenever the configuration loads: the
+    /// value must be exactly `https://host[:port]`, and its host must not be a
+    /// private, loopback, link-local or CGNAT address unless
+    /// `links_origin_allow_private` is set. When delivery is enabled the host
+    /// is also resolved here and every answer is checked the same way; a
+    /// failed lookup does not stop the start, because every fetch vets the
+    /// address it connects to.
+    pub fn validate_links_origin(&self) -> Result<crate::links_fetch::LinksOrigin, &'static str> {
+        self.validate_links_origin_with(&|host, port| {
+            if !self.enabled {
+                return None;
+            }
+            let host = host.to_owned();
+            let (sender, receiver) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = sender.send(
+                    std::net::ToSocketAddrs::to_socket_addrs(&(host.as_str(), port))
+                        .map(|addresses| addresses.map(|address| address.ip()).collect::<Vec<_>>()),
+                );
+            });
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .ok()?
+                .ok()
+        })
+    }
+
+    fn validate_links_origin_with(
+        &self,
+        resolve: &dyn Fn(&str, u16) -> Option<Vec<std::net::IpAddr>>,
+    ) -> Result<crate::links_fetch::LinksOrigin, &'static str> {
+        crate::links_fetch::LinksOrigin::validate(
+            &self.links_origin,
+            self.links_origin_allow_private,
+            Some(resolve),
+        )
+    }
+
     /// The issuer pin checks for the legacy single issuer. They run whenever
     /// `issuer_public_key` is set, whether or not `enabled` is on: the key is
     /// used by policy/v3 credential admission either way.
@@ -2699,5 +2753,104 @@ mod tests {
             config.validate_for_v2_database("postgresql://user:password@db.example/share"),
             Err("share email PostgreSQL requires sslmode=verify-full")
         );
+    }
+
+    #[test]
+    fn links_origin_defaults_to_the_public_api_and_reads_from_configuration() {
+        let defaults = ShareEmailConfig::default();
+        assert_eq!(defaults.links_origin, "https://api.tinycloud.xyz");
+        assert!(!defaults.links_origin_allow_private);
+        assert!(defaults.validate_links_origin().is_ok());
+
+        let empty: ShareEmailConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(empty.links_origin, "https://api.tinycloud.xyz");
+        assert!(!empty.links_origin_allow_private);
+        let set: ShareEmailConfig = serde_json::from_value(serde_json::json!({
+            "links_origin": "https://links.example.org:8443",
+            "links_origin_allow_private": true,
+        }))
+        .unwrap();
+        assert_eq!(set.links_origin, "https://links.example.org:8443");
+        assert!(set.links_origin_allow_private);
+    }
+
+    #[test]
+    fn links_origin_must_be_https_host_and_port_and_a_public_host() {
+        let with = |origin: &str, allow_private: bool| ShareEmailConfig {
+            links_origin: origin.into(),
+            links_origin_allow_private: allow_private,
+            ..ShareEmailConfig::default()
+        };
+        for refused in [
+            "",
+            "http://api.tinycloud.xyz",
+            "https://api.tinycloud.xyz/",
+            "https://api.tinycloud.xyz/v1",
+            "https://api.tinycloud.xyz?x=1",
+            "https://api.tinycloud.xyz#x",
+            "https://user@api.tinycloud.xyz",
+            "https://127.0.0.1",
+            "https://10.1.2.3:8443",
+            "https://169.254.169.254",
+            "https://100.64.0.1",
+            "https://[::1]",
+            "https://localhost",
+        ] {
+            assert!(
+                with(refused, false).validate_links_origin().is_err(),
+                "{refused}"
+            );
+        }
+        // The self-host flag admits a private host, never a malformed value.
+        assert!(with("https://10.1.2.3:8443", true)
+            .validate_links_origin()
+            .is_ok());
+        assert!(with("https://localhost", true)
+            .validate_links_origin()
+            .is_ok());
+        assert!(with("https://10.1.2.3/v1", true)
+            .validate_links_origin()
+            .is_err());
+        assert!(with("http://10.1.2.3", true)
+            .validate_links_origin()
+            .is_err());
+    }
+
+    #[test]
+    fn links_origin_host_that_resolves_to_a_private_address_is_refused() {
+        let config = |allow_private| ShareEmailConfig {
+            links_origin: "https://links.example.org".into(),
+            links_origin_allow_private: allow_private,
+            ..ShareEmailConfig::default()
+        };
+        let private = |_: &str, _: u16| Some(vec!["10.0.0.9".parse().unwrap()]);
+        let mixed = |_: &str, _: u16| {
+            Some(vec![
+                "93.184.216.34".parse().unwrap(),
+                "169.254.169.254".parse().unwrap(),
+            ])
+        };
+        let public = |_: &str, _: u16| Some(vec!["93.184.216.34".parse().unwrap()]);
+        assert!(config(false).validate_links_origin_with(&private).is_err());
+        assert!(config(false).validate_links_origin_with(&mixed).is_err());
+        assert!(config(false).validate_links_origin_with(&public).is_ok());
+        assert!(config(true).validate_links_origin_with(&private).is_ok());
+    }
+
+    #[test]
+    fn the_node_refuses_to_start_with_an_invalid_links_origin() {
+        let mut config = Config::default();
+        assert!(crate::resolve_runtime_config(&config).is_ok());
+        for invalid in [
+            "http://api.tinycloud.xyz",
+            "https://api.tinycloud.xyz/links",
+            "https://127.0.0.1",
+        ] {
+            config.share_email.links_origin = invalid.into();
+            assert!(crate::resolve_runtime_config(&config).is_err(), "{invalid}");
+        }
+        config.share_email.links_origin = "https://127.0.0.1".into();
+        config.share_email.links_origin_allow_private = true;
+        assert!(crate::resolve_runtime_config(&config).is_ok());
     }
 }

@@ -36,6 +36,7 @@ pub mod hooks;
 pub mod invocation_replay;
 pub mod issuer_set;
 pub mod link;
+pub mod links_fetch;
 pub mod node_control;
 pub mod policy_v3;
 pub mod prometheus;
@@ -577,6 +578,10 @@ pub fn resolve_runtime_config(tinycloud_config: &Config) -> Result<Config> {
         .validate_for_v2_database(resolved.storage.database())
         .map_err(|error| anyhow::anyhow!(error))?;
     resolved.share_email.credential_issuer_set()?;
+    resolved
+        .share_email
+        .validate_links_origin()
+        .map_err(|error| anyhow::anyhow!(error))?;
     Ok(resolved)
 }
 
