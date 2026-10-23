@@ -166,6 +166,7 @@ pub struct SpaceDatabase<C, B, S> {
     encryption: Option<ColumnEncryption>,
     sql_sizes: SqlSizes,
     delegated_sql_caveats: bool,
+    named_keys: bool,
     revocation_chain_locks: ChainLockRegistry,
     kv_object_locks: KvObjectLockRegistry,
     space_sequence_locks: SpaceSequenceLockRegistry,
@@ -425,6 +426,7 @@ where
             encryption,
             sql_sizes: SqlSizes::default(),
             delegated_sql_caveats: false,
+            named_keys: false,
             revocation_chain_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             kv_object_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             space_sequence_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -441,6 +443,14 @@ where
     /// delegation is refused as an unsupported caveat.
     pub fn with_delegated_sql_caveats(mut self, enabled: bool) -> Self {
         self.delegated_sql_caveats = enabled;
+        self
+    }
+
+    /// Serve named-key resources (keys and key prefixes): delegations that
+    /// grant on them are admitted. Off by default: such a delegation is
+    /// refused with `named_keys_unavailable`.
+    pub fn with_named_keys(mut self, enabled: bool) -> Self {
+        self.named_keys = enabled;
         self
     }
 
@@ -1681,6 +1691,7 @@ where
             None,
             &[],
             self.delegated_sql_caveats,
+            self.named_keys,
         )
         .await?;
 
@@ -1972,6 +1983,7 @@ where
             None,
             &[],
             self.delegated_sql_caveats,
+            self.named_keys,
         )
         .await
     }
@@ -2447,6 +2459,7 @@ where
             // Taken on this `tx` right after BEGIN, above.
             &sequence_spaces,
             self.delegated_sql_caveats,
+            self.named_keys,
         )
         .await?;
 
@@ -3335,6 +3348,7 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
     auth_graph: Option<&crate::auth_graph::AuthGraphSnapshot>,
     sequence_locks_held: &[SpaceId],
     delegated_sql_caveats: bool,
+    named_keys: bool,
 ) -> Result<TransactResult, TxError<S, K>> {
     // for each event, get the hash and the relevent space(s)
     let event_hashes = events
@@ -3359,7 +3373,9 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
     let mut registered: HashMap<Hash, delegation::DelegationRegistration> = HashMap::new();
     for (hash, event) in &event_hashes {
         if let Event::Delegation(d) = event {
-            let reg = delegation::process_with(db, d, encryption, delegated_sql_caveats).await?;
+            let reg =
+                delegation::process_with(db, d, encryption, delegated_sql_caveats, named_keys)
+                    .await?;
             registered.insert(*hash, reg);
         }
     }

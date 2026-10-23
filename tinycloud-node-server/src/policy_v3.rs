@@ -10779,6 +10779,10 @@ mod account_alias_tests;
 mod test_harness;
 
 #[cfg(test)]
+#[path = "policy_v3/named_keys_gate_tests.rs"]
+mod named_keys_gate_tests;
+
+#[cfg(test)]
 #[path = "policy_v3/root_revocation_tests.rs"]
 mod root_revocation_tests;
 

@@ -908,14 +908,14 @@ async fn create_key_rejects_existing_blocked_key() {
 }
 
 #[tokio::test]
-async fn create_key_rejects_shreddable() {
+async fn create_key_rejects_deletable() {
     let svc = make_service(fresh_db().await);
     create_network(&svc).await;
     let err = svc
         .create_key(&key_loc("apps/alpha"), true)
         .await
         .unwrap_err();
-    assert!(matches!(err, EncryptionServiceError::ShreddableUnavailable));
+    assert!(matches!(err, EncryptionServiceError::DeletableUnavailable));
 }
 
 #[tokio::test]

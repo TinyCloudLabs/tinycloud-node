@@ -62,8 +62,12 @@ pub struct Config {
 }
 
 /// Release gates for the encryption network routes. `named_keys_v1`
-/// advertises the `encryption-named-keys-v1` feature in `/info`; it stays off
-/// until named keys are live on OpenKey.
+/// advertises the `encryption-named-keys-v1` feature in `/info` and turns on
+/// named keys: the key create, describe, public key, block and unblock
+/// routes are mounted, delegations may grant on key and key-prefix
+/// resources, and named-key decrypt is served on `POST /invoke`. It stays off
+/// until named keys are live on OpenKey; while off, those routes answer 404
+/// and key resources are refused with `named_keys_unavailable`.
 #[derive(Serialize, Deserialize, Debug, Default, Clone, Hash, PartialEq, Eq)]
 pub struct EncryptionNetworkConfig {
     #[serde(default)]

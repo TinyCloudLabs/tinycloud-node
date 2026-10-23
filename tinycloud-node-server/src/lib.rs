@@ -580,11 +580,23 @@ pub fn resolve_runtime_config(tinycloud_config: &Config) -> Result<Config> {
     Ok(resolved)
 }
 
+/// The named-key routes. Mounted only while `named_keys_v1` is on, so with it
+/// off these paths answer as any unmounted path does.
+fn named_key_routes() -> Vec<Route> {
+    rocket::routes![
+        create_encryption_key,
+        describe_encryption_key,
+        public_encryption_key,
+        block_encryption_key,
+        unblock_encryption_key,
+    ]
+}
+
 /// The public Node surface keeps policy admission separate from the generic
 /// delegation and invocation data plane. Share-specific data routes are not
 /// mounted.
-fn production_routes() -> Vec<Route> {
-    rocket::routes![
+fn production_routes(named_keys_v1: bool) -> Vec<Route> {
+    let mut routes = rocket::routes![
         healthcheck,
         cors,
         info,
@@ -619,11 +631,6 @@ fn production_routes() -> Vec<Route> {
         encryption_well_known,
         encryption_decrypt,
         revoke_encryption_network,
-        create_encryption_key,
-        describe_encryption_key,
-        public_encryption_key,
-        block_encryption_key,
-        unblock_encryption_key,
         register_policy_v3,
         get_policy_v3_status,
         policy_v3_enforcer_binding,
@@ -632,7 +639,11 @@ fn production_routes() -> Vec<Route> {
         policy_v3_mint,
         policy_v3_status,
         revoke_policy_v3_root,
-    ]
+    ];
+    if named_keys_v1 {
+        routes.extend(named_key_routes());
+    }
+    routes
 }
 
 pub async fn app_with_control(
@@ -682,7 +693,7 @@ pub async fn app_with_control(
         ::tracing::warn!("network DID resolution enabled: did:web/did:tz fetches use the unhardened ssi client (TC-1080)");
     }
 
-    let routes = production_routes();
+    let routes = production_routes(tinycloud_config.encryption_network.named_keys_v1);
     #[cfg(feature = "tc-bench-v1")]
     let mut routes = routes;
 
@@ -810,7 +821,8 @@ pub async fn app_with_control(
     )
     .await?
     .with_sql_sizes(sql_sizes.clone())
-    .with_delegated_sql_caveats(tinycloud_config.sql.delegated_caveats_enforced);
+    .with_delegated_sql_caveats(tinycloud_config.sql.delegated_caveats_enforced)
+    .with_named_keys(tinycloud_config.encryption_network.named_keys_v1);
     tinycloud.set_read_audit_wait(Duration::from_millis(
         tinycloud_config.database.read_audit_wait_ms,
     ));
@@ -1265,11 +1277,11 @@ fn is_mounted_share_path(path: &str) -> bool {
 
 #[cfg(test)]
 mod production_route_tests {
-    use super::production_routes;
+    use super::{named_key_routes, production_routes};
 
     #[test]
     fn generic_data_plane_and_embedded_policy_admission_are_mounted_without_share_data_routes() {
-        let routes: std::collections::HashSet<_> = production_routes()
+        let routes: std::collections::HashSet<_> = production_routes(true)
             .into_iter()
             .map(|route| format!("{} {}", route.method, route.uri))
             .collect();
@@ -1307,6 +1319,37 @@ mod production_route_tests {
                 .all(|route| !route.split_once(' ').unwrap().1.starts_with("/share/")),
             "production routes must not mount any /share/* handler"
         );
+    }
+
+    /// The five key routes are mounted only with `named_keys_v1` on; the
+    /// network routes are mounted either way.
+    #[test]
+    fn named_key_routes_are_mounted_only_when_named_keys_are_on() {
+        let describe = |routes: Vec<rocket::Route>| -> Vec<String> {
+            routes
+                .into_iter()
+                .map(|route| format!("{} {}", route.method, route.uri))
+                .collect()
+        };
+        let key_routes = describe(named_key_routes());
+        assert_eq!(key_routes.len(), 5, "{key_routes:?}");
+        let off = describe(production_routes(false));
+        let on = describe(production_routes(true));
+        for route in &key_routes {
+            assert!(!off.contains(route), "mounted while off: {route}");
+            assert!(on.contains(route), "missing while on: {route}");
+        }
+        for route in [
+            "POST /encryption/networks",
+            "GET /encryption/networks/<network_id>",
+            "POST /encryption/networks/<network_id>/decrypt",
+            "POST /encryption/networks/<network_id>/revoke",
+        ] {
+            let route = route.to_string();
+            assert!(off.contains(&route), "missing while off: {route}");
+            assert!(on.contains(&route), "missing while on: {route}");
+        }
+        assert_eq!(on.len(), off.len() + 5);
     }
 }
 
