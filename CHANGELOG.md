@@ -2,8 +2,21 @@
 
 ## [Unreleased]
 
+## [1.22.0] - 2026-10-23
+
+### Release notes
+
+- **Named keys are off by default.** Named-key routes and key resources are served only when `[global.encryption_network] named_keys_v1` is enabled. With it off, the named-key routes are not mounted, and key resources in delegations and invocations are not accepted. Details: TC-1777.
+- **SQL delegated caveats flag.** A `tinycloud.sql/*` delegation's `tables`, `columns` and `readOnly` caveats are enforced only when `[global.sql] delegated_caveats_enforced` is enabled (default off). With it off, such a delegation is refused with 401 as an unsupported caveat, and `GET /info` does not list `sql-delegated-caveats-v1`. Details: TC-1791.
+- **SIWE caveat refusal.** A SIWE (CACAO) delegation whose ReCap gives a caveat a non-null value on any ability is refused as an unsupported caveat; empty caveat entries and entries whose values are all null are accepted as no restriction. Details: TC-1844.
+- **Database failure diagnostic line.** A request that ends in a database failure or a busy/timeout 5xx logs one structured line with its status, code, service, route, elapsed time, failure kind and a keyed database pseudonym (`db_hash`). Details: TC-1796.
+- **Log sidecar `db_failure_5xx` event.** The node's database-failure 5xx line ships to Better Stack as an individual `node_warning` event with `event_code` `db_failure_5xx`; it carries fixed fields only, with no SQL, ids, DIDs, paths or messages. Details: TC-1840.
+- **Transaction end on every exit.** Policy registration, policy status changes, SQL store manifest publication and share-email state writes end their database transaction on every exit, so locks are released when the call returns. Details: TC-1836.
+- No database migration since 1.21.9.
+
 ### Changes
 
+- A SIWE (CACAO) delegation whose ReCap gives a caveat a non-null value on any ability is refused as an unsupported caveat; empty caveat entries and entries whose values are all null are accepted as no restriction. Details: TC-1844.
 - Named-key routes and key resources are served only when `[global.encryption_network] named_keys_v1` is enabled. Details: TC-1777.
 - The node logs one structured diagnostic line (status, code, service, route, elapsed time, failure kind, a keyed database pseudonym `db_hash`) when a request ends in a database failure or a busy/timeout 5xx. Details: TC-1796.
 - Log sidecar: the node's one warning line per database-failure 5xx (`database failure answered with a 5xx`) ships to Better Stack as an individual `node_warning` event with `event_code` `db_failure_5xx` and exactly eight fields: `status`, `code`, `service`, `route`, `elapsed_ms`, `failure_kind`, `write_may_have_applied` and, when known, `db_hash`. They are fixed vocabulary, the route template, a duration, a flag and a keyed database pseudonym; no SQL, ids, DIDs, paths or messages. A line with any other field or an unexpected value is counted as `unclassified` as before. Details: TC-1840.
