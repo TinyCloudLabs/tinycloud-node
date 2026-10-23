@@ -2054,7 +2054,7 @@ mod tests {
             assert_eq!(config, Config::default(), "omitting `{field}`");
         }
         let mut only_required = full.clone();
-        only_required.retain(|key, _| REQUIRED.contains(&key.as_str()));
+        only_required.retain(|key, _| REQUIRED.contains(&key));
         assert_eq!(load(only_required).unwrap(), Config::default());
     }
 
