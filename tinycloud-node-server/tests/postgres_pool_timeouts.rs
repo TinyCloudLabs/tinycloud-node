@@ -10,9 +10,9 @@
 //! - Large artifacts still persist and hydrate under the default limits.
 //!
 //! PostgreSQL-backed tests connect only when `TINYCLOUD_TEST_POSTGRES_URL` is set
-//! and either `CI=true` (the CI job) or `TINYCLOUD_ALLOW_LOCAL_PG=1` (an isolated
-//! server you started yourself). Otherwise they skip. Under `CI`, an unset URL
-//! fails the test (TC-381).
+//! and either `GITHUB_ACTIONS=true` (GitHub Actions) or `TINYCLOUD_ALLOW_LOCAL_PG=1`
+//! (an isolated server you started yourself). Otherwise they skip. On GitHub
+//! Actions, an unset URL fails the test (TC-381).
 //!
 //! ```text
 //! TINYCLOUD_ALLOW_LOCAL_PG=1 \
@@ -74,8 +74,8 @@ fn postgres_url(test: &str) -> Option<String> {
 fn blackhole_url(test: &str) -> Option<String> {
     if std::env::var("TINYCLOUD_TEST_BLACKHOLE").as_deref() != Ok("1") {
         assert!(
-            std::env::var_os("CI").is_none(),
-            "{test} requires TINYCLOUD_TEST_BLACKHOLE=1 in CI (TC-1054)"
+            std::env::var("GITHUB_ACTIONS").as_deref() != Ok("true"),
+            "{test} requires TINYCLOUD_TEST_BLACKHOLE=1 on GitHub Actions (TC-1054)"
         );
         use std::io::Write;
         // Written to the process stderr directly: libtest captures `eprintln!` output of passing tests.
