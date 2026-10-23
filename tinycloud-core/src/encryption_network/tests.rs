@@ -1200,6 +1200,49 @@ async fn postgres_concurrent_creates_respect_the_key_cap() {
     assert_eq!(rows.len() as u64, CAP, "cap is never exceeded");
 }
 
+// PostgreSQL-backed; CI-only. `create_key` must end its transaction before it
+// returns. A dropped transaction is rolled back by a task sqlx spawns, which
+// cannot run while `execute_blocking` holds this runtime's only thread, so a
+// create that returns without ending its transaction still holds the network
+// row lock here.
+#[tokio::test]
+async fn postgres_create_key_ends_its_transaction_before_returning() {
+    let Some(fixture) = PostgresTestSchema::migrated_through(
+        "postgres_create_key_ends_its_transaction_before_returning",
+        None,
+    )
+    .await
+    else {
+        return;
+    };
+    const LOCK: &str = "SELECT 1 FROM encryption_network FOR UPDATE NOWAIT";
+    let db = fixture.connect(2).await;
+    let svc = make_service(db.clone()).with_key_cap_per_network(1);
+    create_network(&svc).await;
+
+    svc.create_key(&key_loc("apps/alpha"), false).await.unwrap();
+    fixture
+        .execute_blocking(LOCK)
+        .expect("a create that inserts releases the network row lock");
+
+    svc.create_key(&key_loc("apps/alpha"), false).await.unwrap();
+    fixture
+        .execute_blocking(LOCK)
+        .expect("an identical create answered from the existing row releases the network row lock");
+
+    let err = svc
+        .create_key(&key_loc("apps/beta"), false)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, EncryptionServiceError::KeyLimitExceeded),
+        "{err:?}"
+    );
+    fixture
+        .execute_blocking(LOCK)
+        .expect("a create refused by the cap releases the network row lock");
+}
+
 use crate::encryption_network::{keys::canonical_key_urn, DecryptTarget};
 
 fn key_body(
