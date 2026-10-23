@@ -2079,6 +2079,7 @@ pub async fn register_policy(
 
 /// The writes of `register_policy`, inside the transaction its caller opened.
 /// The caller commits when this returns `Ok` and rolls back on `Err`.
+#[allow(clippy::too_many_arguments)]
 async fn register_policy_writes(
     txn: &DatabaseTransaction,
     tinycloud: &crate::TinyCloud,
