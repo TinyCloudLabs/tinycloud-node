@@ -10,7 +10,8 @@
 - Tests that read `TINYCLOUD_TEST_POSTGRES_URL` connect only on GitHub Actions (`GITHUB_ACTIONS=true`) or with `TINYCLOUD_ALLOW_LOCAL_PG=1` set for an isolated server you started yourself, and skip otherwise. `CI=true` alone no longer connects, since automation shells set it by default. `tinycloud-node-server/tests/at_rest_harness.rs` (reads `TC887_PG_URL`) is excluded. Details: TC-1748.
 - Encryption: key and prefix network names must match `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`; bare network resources keep the existing network name rule. Details: TC-1777.
 - Encryption: key route errors start with a stable code: `network_not_found:`, `unauthorized:`, `key_not_found:` or `key_path_invalid:`. Request bodies that fail to parse on the key routes return 400 with the text `request body is malformed: <reason>`. Key paths are read from the request as sent, so a path with encoded or relative segments is refused rather than normalized. Network ids are accepted only in canonical form. Details: TC-1777.
-- Encryption: named-key decrypt is served on `POST /invoke` (a key capability plus `keyPath` in the body); the direct network decrypt route refuses key resources and `keyPath`. A root-key unwrap failure on the direct route returns 403 `key_unwrap_failed`. Decrypt requests whose receiver key is not a valid 32-byte X25519 public key, or is a low-order point, are refused. Details: TC-1777.
+- Encryption: named-key decrypt is served on `POST /invoke` (a key capability plus `keyPath` in the body); the direct network decrypt route refuses key resources and `keyPath`. A root-key unwrap failure on the direct route returns 403 `key_unwrap_failed`. Decrypt requests whose receiver key is not a valid 32-byte X25519 public key, or is a low-order point, are refused with 400 and the code `receiver_key_invalid`. Details: TC-1777.
+- Configuration: adds `[encryption_network] named_keys_v1`, off by default. Details: TC-1777.
 
 ## [1.21.9] - 2026-10-23
 

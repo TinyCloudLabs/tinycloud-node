@@ -277,6 +277,7 @@ fn build_info(
     tee: &State<Option<crate::tee::TeeContext>>,
     quota_cache: &State<QuotaCache>,
     encryption: &State<EncryptionService>,
+    config: &State<crate::config::Config>,
     database: Option<&tinycloud_core::RecoveringConnection>,
 ) -> NodeInfo {
     #[allow(unused_mut)]
@@ -292,6 +293,9 @@ fn build_info(
     ]);
     #[cfg(feature = "dstack")]
     features.push("tee");
+    if config.encryption_network.named_keys_v1 {
+        features.push("encryption-named-keys-v1");
+    }
     NodeInfo {
         protocol: tinycloud_auth::protocol::PROTOCOL_VERSION,
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -340,9 +344,10 @@ pub fn info(
     tee: &State<Option<crate::tee::TeeContext>>,
     quota_cache: &State<QuotaCache>,
     encryption: &State<EncryptionService>,
+    config: &State<crate::config::Config>,
     pool: NodePool<'_>,
 ) -> Json<NodeInfo> {
-    Json(build_info(tee, quota_cache, encryption, pool.0))
+    Json(build_info(tee, quota_cache, encryption, config, pool.0))
 }
 
 #[get("/version")]
@@ -350,9 +355,10 @@ pub fn version(
     tee: &State<Option<crate::tee::TeeContext>>,
     quota_cache: &State<QuotaCache>,
     encryption: &State<EncryptionService>,
+    config: &State<crate::config::Config>,
     pool: NodePool<'_>,
 ) -> Json<NodeInfo> {
-    Json(build_info(tee, quota_cache, encryption, pool.0))
+    Json(build_info(tee, quota_cache, encryption, config, pool.0))
 }
 
 #[allow(clippy::let_unit_value)]
@@ -11430,6 +11436,40 @@ mod tests {
             .await?;
         assert_eq!(reply.status, Status::Ok, "{}", reply.body);
         assert_eq!(reply.json["rows"], serde_json::json!([]), "{}", reply.body);
+        Ok(())
+    }
+
+    /// TC-1777 N5: `encryption-named-keys-v1` is advertised by `/info` only
+    /// while its release gate is on.
+    #[tokio::test]
+    async fn named_keys_feature_is_advertised_only_behind_its_gate() -> Result<()> {
+        async fn features(config: Config) -> Result<Vec<String>> {
+            let fixture = KvSyncFixture::new_configured(config, |rocket| rocket).await?;
+            let response = fixture.client.get("/info").dispatch().await;
+            assert_eq!(response.status(), rocket::http::Status::Ok);
+            let info: serde_json::Value =
+                serde_json::from_str(&response.into_string().await.unwrap_or_default())?;
+            Ok(info["features"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|feature| feature.as_str().unwrap().to_string())
+                .collect())
+        }
+
+        let withheld = features(Config::default()).await?;
+        assert!(
+            !withheld.iter().any(|f| f == "encryption-named-keys-v1"),
+            "{withheld:?}"
+        );
+
+        let mut gated = Config::default();
+        gated.encryption_network.named_keys_v1 = true;
+        let advertised = features(gated).await?;
+        assert!(
+            advertised.iter().any(|f| f == "encryption-named-keys-v1"),
+            "{advertised:?}"
+        );
         Ok(())
     }
 
