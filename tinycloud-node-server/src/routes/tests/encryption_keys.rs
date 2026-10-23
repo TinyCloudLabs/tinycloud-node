@@ -239,9 +239,9 @@ async fn create(
     fixture: &KvSyncFixture,
     network: &str,
     key_path: &str,
-    shreddable: bool,
+    deletable: bool,
 ) -> Result<(Status, String)> {
-    let body = json!({"keyPath": key_path, "shreddable": shreddable});
+    let body = json!({"keyPath": key_path, "deletable": deletable});
     let auth = admin_auth(fixture, network, key_path, KEY_CREATE_ACTION, &body)?;
     Ok(post_json(&fixture.client, &keys_url(network), &auth, &body).await)
 }
@@ -438,7 +438,7 @@ async fn block_and_unblock_are_idempotent() -> Result<()> {
 #[tokio::test]
 async fn create_refuses_wrong_audience() -> Result<()> {
     let (fixture, network) = setup().await?;
-    let body = json!({"keyPath": "docs/a", "shreddable": false});
+    let body = json!({"keyPath": "docs/a", "deletable": false});
     let cap = key_uri(&network, "docs/a");
     let auth = invocation(
         &fixture,
@@ -460,7 +460,7 @@ async fn create_refuses_wrong_audience() -> Result<()> {
 #[tokio::test]
 async fn create_refuses_wrong_target_node() -> Result<()> {
     let (fixture, network) = setup().await?;
-    let body = json!({"keyPath": "docs/a", "shreddable": false});
+    let body = json!({"keyPath": "docs/a", "deletable": false});
     let cap = key_uri(&network, "docs/a");
     let auth = invocation(
         &fixture,
@@ -482,7 +482,7 @@ async fn create_refuses_wrong_target_node() -> Result<()> {
 #[tokio::test]
 async fn create_refuses_expired_invocation() -> Result<()> {
     let (fixture, network) = setup().await?;
-    let body = json!({"keyPath": "docs/a", "shreddable": false});
+    let body = json!({"keyPath": "docs/a", "deletable": false});
     let cap = key_uri(&network, "docs/a");
     let expired = NumericDate::try_from_seconds(
         time::OffsetDateTime::now_utc().unix_timestamp() as f64 - 3600.0,
@@ -508,7 +508,7 @@ async fn create_refuses_expired_invocation() -> Result<()> {
 #[tokio::test]
 async fn create_refuses_a_capability_for_another_ability() -> Result<()> {
     let (fixture, network) = setup().await?;
-    let body = json!({"keyPath": "docs/a", "shreddable": false});
+    let body = json!({"keyPath": "docs/a", "deletable": false});
     let cap = key_uri(&network, "docs/a");
     let auth = invocation(
         &fixture,
@@ -530,7 +530,7 @@ async fn create_refuses_a_capability_for_another_ability() -> Result<()> {
 #[tokio::test]
 async fn create_refuses_a_capability_on_a_prefix() -> Result<()> {
     let (fixture, network) = setup().await?;
-    let body = json!({"keyPath": "docs/a", "shreddable": false});
+    let body = json!({"keyPath": "docs/a", "deletable": false});
     let prefix = format!("{network}/docs/");
     let auth = invocation(
         &fixture,
@@ -552,7 +552,7 @@ async fn create_refuses_a_capability_on_a_prefix() -> Result<()> {
 #[tokio::test]
 async fn create_refuses_a_capability_on_the_bare_network() -> Result<()> {
     let (fixture, network) = setup().await?;
-    let body = json!({"keyPath": "docs/a", "shreddable": false});
+    let body = json!({"keyPath": "docs/a", "deletable": false});
     let auth = invocation(
         &fixture,
         &fixture.node_did,
@@ -573,7 +573,7 @@ async fn create_refuses_a_capability_on_the_bare_network() -> Result<()> {
 #[tokio::test]
 async fn create_refuses_two_capabilities() -> Result<()> {
     let (fixture, network) = setup().await?;
-    let body = json!({"keyPath": "docs/a", "shreddable": false});
+    let body = json!({"keyPath": "docs/a", "deletable": false});
     let cap = key_uri(&network, "docs/a");
     let auth = invocation(
         &fixture,
@@ -598,7 +598,7 @@ async fn create_refuses_two_capabilities() -> Result<()> {
 #[tokio::test]
 async fn create_refuses_a_missing_body_hash() -> Result<()> {
     let (fixture, network) = setup().await?;
-    let body = json!({"keyPath": "docs/a", "shreddable": false});
+    let body = json!({"keyPath": "docs/a", "deletable": false});
     let cap = key_uri(&network, "docs/a");
     let fact = json!({
         "type": KEY_ADMIN_TYPE,
@@ -622,8 +622,8 @@ async fn create_refuses_a_missing_body_hash() -> Result<()> {
 #[tokio::test]
 async fn create_refuses_a_mismatched_body_hash() -> Result<()> {
     let (fixture, network) = setup().await?;
-    let body = json!({"keyPath": "docs/a", "shreddable": false});
-    let other = json!({"keyPath": "docs/b", "shreddable": false});
+    let body = json!({"keyPath": "docs/a", "deletable": false});
+    let other = json!({"keyPath": "docs/b", "deletable": false});
     let auth = admin_auth(&fixture, &network, "docs/a", KEY_CREATE_ACTION, &other)?;
     let (status, text) = post_json(&fixture.client, &keys_url(&network), &auth, &body).await;
     assert_eq!(status, Status::Unauthorized, "{text}");
@@ -633,7 +633,7 @@ async fn create_refuses_a_mismatched_body_hash() -> Result<()> {
 #[tokio::test]
 async fn create_refuses_a_replayed_invocation() -> Result<()> {
     let (fixture, network) = setup().await?;
-    let body = json!({"keyPath": "docs/a", "shreddable": false});
+    let body = json!({"keyPath": "docs/a", "deletable": false});
     let auth = admin_auth(&fixture, &network, "docs/a", KEY_CREATE_ACTION, &body)?;
     let (status, text) = post_json(&fixture.client, &keys_url(&network), &auth, &body).await;
     assert_eq!(status, Status::Ok, "first: {text}");
@@ -645,7 +645,7 @@ async fn create_refuses_a_replayed_invocation() -> Result<()> {
 #[tokio::test]
 async fn create_refuses_a_grammar_invalid_key_path() -> Result<()> {
     let (fixture, network) = setup().await?;
-    let body = json!({"keyPath": "docs/Bad", "shreddable": false});
+    let body = json!({"keyPath": "docs/Bad", "deletable": false});
     let auth = admin_auth(&fixture, &network, "docs/a", KEY_CREATE_ACTION, &body)?;
     let (status, text) = post_json(&fixture.client, &keys_url(&network), &auth, &body).await;
     assert_eq!(status, Status::BadRequest, "{text}");
@@ -654,11 +654,37 @@ async fn create_refuses_a_grammar_invalid_key_path() -> Result<()> {
 }
 
 #[tokio::test]
-async fn create_refuses_shreddable_keys() -> Result<()> {
+async fn create_refuses_deletable_keys() -> Result<()> {
     let (fixture, network) = setup().await?;
     let (status, text) = create(&fixture, &network, "docs/a", true).await?;
     assert_eq!(status, Status::Forbidden, "{text}");
-    assert!(text.starts_with("shreddable_unavailable"), "{text}");
+    assert!(text.starts_with("deletable_unavailable"), "{text}");
+    let auth = describe_auth(&fixture, &network, "docs/a", KEY_CREATE_ACTION)?;
+    let (status, text) = describe_get(&fixture, &network, "docs/a", &auth).await;
+    assert_eq!(status, Status::NotFound, "no key after refusal: {text}");
+    assert!(text.starts_with("key_not_found"), "{text}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_rejects_unknown_body_fields() -> Result<()> {
+    let (fixture, network) = setup().await?;
+    for body in [
+        json!({"keyPath": "docs/a", "shreddable": true}),
+        json!({"keyPath": "docs/a", "shreddable": false}),
+    ] {
+        let auth = admin_auth(&fixture, &network, "docs/a", KEY_CREATE_ACTION, &body)?;
+        let (status, text) = post_json(&fixture.client, &keys_url(&network), &auth, &body).await;
+        assert_eq!(status, Status::BadRequest, "{body}: {text}");
+        assert!(
+            text.starts_with("request body is malformed: "),
+            "{body}: {text}"
+        );
+    }
+    let auth = describe_auth(&fixture, &network, "docs/a", KEY_CREATE_ACTION)?;
+    let (status, text) = describe_get(&fixture, &network, "docs/a", &auth).await;
+    assert_eq!(status, Status::NotFound, "no key after refusal: {text}");
+    assert!(text.starts_with("key_not_found"), "{text}");
     Ok(())
 }
 
@@ -1136,7 +1162,7 @@ async fn owner_delegated_create_and_block_work_for_the_granted_key() -> Result<(
     )
     .await?;
 
-    let body = json!({"keyPath": "docs/a", "shreddable": false});
+    let body = json!({"keyPath": "docs/a", "deletable": false});
     let auth = delegated_admin_auth(
         &fixture,
         proof,
@@ -1179,7 +1205,7 @@ async fn delegate_for_another_key_or_prefix_is_refused() -> Result<()> {
     )
     .await?;
 
-    let body = json!({"keyPath": "docs/a", "shreddable": false});
+    let body = json!({"keyPath": "docs/a", "deletable": false});
     for proof in [proof_key, proof_prefix] {
         let auth = delegated_admin_auth(
             &fixture,
@@ -1237,7 +1263,7 @@ async fn request_with_capability_on(
         "create" => (
             KEY_CREATE_ACTION,
             keys_url(network),
-            json!({"keyPath": key_path, "shreddable": false}),
+            json!({"keyPath": key_path, "deletable": false}),
         ),
         "block" => (
             KEY_BLOCK_ACTION,
@@ -1361,7 +1387,7 @@ async fn block_refuses_a_missing_body_hash() -> Result<()> {
 #[tokio::test]
 async fn key_route_bodies_that_do_not_parse_are_named_by_the_route() -> Result<()> {
     let (fixture, network) = setup().await?;
-    let body = json!({"keyPath": "docs/a", "shreddable": "true"});
+    let body = json!({"keyPath": "docs/a", "deletable": "true"});
     let auth = admin_auth(&fixture, &network, "docs/a", KEY_CREATE_ACTION, &body)?;
     let (status, text) = post_json(&fixture.client, &keys_url(&network), &auth, &body).await;
     assert_eq!(status, Status::BadRequest, "create: {text}");

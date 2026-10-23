@@ -175,10 +175,10 @@ impl EncryptionService {
     pub async fn create_key(
         &self,
         loc: &KeyLocation,
-        shreddable: bool,
+        deletable: bool,
     ) -> Result<KeyDescriptor, EncryptionServiceError> {
-        if shreddable {
-            return Err(EncryptionServiceError::ShreddableUnavailable);
+        if deletable {
+            return Err(EncryptionServiceError::DeletableUnavailable);
         }
         let _writer = match &self.sqlite_writer_lock {
             Some(lock) => Some(lock.lock().await),

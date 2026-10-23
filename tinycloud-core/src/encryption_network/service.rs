@@ -211,8 +211,8 @@ pub enum EncryptionServiceError {
     Base64(&'static str),
     #[error("node response signing failed: {0}")]
     Signing(String),
-    #[error("shreddable_unavailable: shreddable keys are not available in this release")]
-    ShreddableUnavailable,
+    #[error("deletable_unavailable: deletable keys are not available in this release")]
+    DeletableUnavailable,
     #[error("key_exists: a key already exists at this path")]
     KeyExists,
     #[error("key_not_found: no key exists at this path")]
