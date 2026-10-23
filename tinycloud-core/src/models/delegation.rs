@@ -1,5 +1,5 @@
 use crate::encryption::ColumnEncryption;
-use crate::encryption_network::NetworkId;
+use crate::encryption_network::key_id;
 use crate::hash::Hash;
 use crate::models::did_resolution::{verify_ucan_signature, UcanVerifyError};
 use crate::policy_capability::sql_caveat;
@@ -184,6 +184,9 @@ pub enum DelegationError {
     /// accepted.
     #[error("unsupported-caveat: {0}")]
     UnsupportedCaveat(String),
+    /// Key deletion is never delegated. Code: `key-delete-not-delegable`.
+    #[error("key-delete-not-delegable")]
+    KeyDeleteNotDelegable,
 }
 
 /// Verify, validate, and register a delegation inside the caller's transaction.
@@ -285,6 +288,15 @@ async fn validate<C: ConnectionTrait>(
     // before the root-authority filter.
     for cap in &delegation.capabilities {
         check_sql_caveats_supported(cap)?;
+    }
+    // Key deletion is never delegated, including by the key's owner.
+    if delegation.capabilities.iter().any(|cap| {
+        crate::policy_capability::ability_matches(
+            &cap.ability.to_string(),
+            "tinycloud.encryption/key.delete",
+        )
+    }) {
+        return Err(DelegationError::KeyDeleteNotDelegable.into());
     }
 
     // get caps which rely on delegated caps
@@ -861,11 +873,7 @@ fn is_root_authority(cap: &util::Capability, delegator: &str) -> bool {
     }
 
     match &cap.resource {
-        Resource::Other(uri) => uri
-            .as_str()
-            .parse::<NetworkId>()
-            .map(|network_id| did_principal_matches(network_id.owner_did(), delegator))
-            .unwrap_or(false),
+        Resource::Other(uri) => key_id::owned_by(uri.as_str(), delegator),
         Resource::TinyCloud(_) => false,
     }
 }
@@ -1529,5 +1537,270 @@ mod tests {
             issued_at: None,
             delegation_mode: util::DelegationMode::Attenuable,
         }
+    }
+
+    const KEY_OWNER: &str = "did:pkh:eip155:1:0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed";
+    const KEY_RESOURCE: &str = "urn:tinycloud:encryption:did:pkh:eip155:1:0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed:default/apps/tinychat";
+    const OTHER_DID: &str = "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
+
+    fn key_delegation_info(delegator: &str, ability: &str) -> util::DelegationInfo {
+        use crate::test_support::did_resolution::signed_ucan;
+        use tinycloud_auth::ssi::jwk::{Algorithm, JWK};
+        let ucan = signed_ucan(
+            OTHER_DID,
+            &JWK::generate_ed25519().unwrap(),
+            Algorithm::EdDSA,
+        );
+        util::DelegationInfo {
+            capabilities: vec![util::Capability {
+                resource: KEY_RESOURCE.parse().unwrap(),
+                ability: ability.to_string().try_into().unwrap(),
+                caveats: crate::types::Caveats::default(),
+            }],
+            delegator: delegator.to_string(),
+            delegate: OTHER_DID.to_string(),
+            parents: vec![],
+            delegation: tinycloud_auth::authorization::TinyCloudDelegation::Ucan(Box::new(ucan)),
+            expiry: None,
+            not_before: None,
+            issued_at: None,
+            delegation_mode: util::DelegationMode::Attenuable,
+        }
+    }
+
+    /// The key owner is root authority for keys under its own namespace.
+    #[tokio::test]
+    async fn owner_issued_key_grant_is_admitted_without_parents() {
+        let db = database().await;
+        let info = key_delegation_info(KEY_OWNER, "tinycloud.encryption/key.create");
+        validate(&db, &info)
+            .await
+            .expect("owner is root authority for own keys");
+    }
+
+    /// A delegator that does not own the key must cite parents.
+    #[tokio::test]
+    async fn non_owner_key_grant_without_parents_is_refused() {
+        let db = database().await;
+        let info = key_delegation_info(OTHER_DID, "tinycloud.encryption/key.create");
+        assert!(matches!(
+            validate(&db, &info).await,
+            Err(Error::InvalidDelegation(DelegationError::MissingParents))
+        ));
+    }
+
+    /// key.delete is refused even when the owner issues it.
+    #[tokio::test]
+    async fn owner_issued_key_delete_is_refused() {
+        let db = database().await;
+        let info = key_delegation_info(KEY_OWNER, "tinycloud.encryption/key.delete");
+        assert!(matches!(
+            validate(&db, &info).await,
+            Err(Error::InvalidDelegation(
+                DelegationError::KeyDeleteNotDelegable
+            ))
+        ));
+    }
+
+    /// key.delete refusal runs before the parent check, so a non-owner
+    /// delete without parents reports the delete refusal.
+    #[tokio::test]
+    async fn non_owner_key_delete_is_refused_before_parent_check() {
+        let db = database().await;
+        let info = key_delegation_info(OTHER_DID, "tinycloud.encryption/key.delete");
+        assert!(matches!(
+            validate(&db, &info).await,
+            Err(Error::InvalidDelegation(
+                DelegationError::KeyDeleteNotDelegable
+            ))
+        ));
+    }
+
+    /// key.delete is refused for the owner even when a parent is cited. The
+    /// refusal runs before the root-authority filter and the parent branches.
+    #[tokio::test]
+    async fn owner_issued_key_delete_with_parent_is_refused() {
+        let db = database().await;
+        let parent = crate::hash::hash(b"owner-delete-with-parent");
+        let prefix = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/");
+        insert_parent_grant(&db, parent, KEY_OWNER, OTHER_DID, &prefix, KEY_DECRYPT).await;
+        let info = key_grant_info(
+            KEY_OWNER,
+            KEY_RESOURCE,
+            "tinycloud.encryption/key.delete",
+            &[parent],
+        );
+        assert!(matches!(
+            validate(&db, &info).await,
+            Err(Error::InvalidDelegation(
+                DelegationError::KeyDeleteNotDelegable
+            ))
+        ));
+    }
+
+    fn key_grant_info(
+        delegator: &str,
+        resource: &str,
+        ability: &str,
+        parents: &[Hash],
+    ) -> util::DelegationInfo {
+        use crate::test_support::did_resolution::signed_ucan;
+        use tinycloud_auth::ssi::jwk::{Algorithm, JWK};
+        let ucan = signed_ucan(
+            OTHER_DID,
+            &JWK::generate_ed25519().unwrap(),
+            Algorithm::EdDSA,
+        );
+        util::DelegationInfo {
+            capabilities: vec![util::Capability {
+                resource: resource.parse().unwrap(),
+                ability: ability.to_string().try_into().unwrap(),
+                caveats: crate::types::Caveats::default(),
+            }],
+            delegator: delegator.to_string(),
+            delegate: OTHER_DID.to_string(),
+            parents: parents.iter().map(|parent| parent.to_cid(0x55)).collect(),
+            delegation: tinycloud_auth::authorization::TinyCloudDelegation::Ucan(Box::new(ucan)),
+            expiry: None,
+            not_before: None,
+            issued_at: None,
+            delegation_mode: util::DelegationMode::Attenuable,
+        }
+    }
+
+    /// Inserts a grant (delegation row plus ability row) that a child can cite.
+    async fn insert_parent_grant(
+        db: &sea_orm::DbConn,
+        id: Hash,
+        delegator: &str,
+        delegatee: &str,
+        resource: &str,
+        ability: &str,
+    ) {
+        insert_delegation(db, id, delegator, delegatee).await;
+        abilities::Entity::insert(abilities::ActiveModel {
+            delegation: Set(id),
+            resource: Set(resource.parse().unwrap()),
+            ability: Set(ability.to_string().try_into().unwrap()),
+            caveats: Set(Default::default()),
+        })
+        .exec(db)
+        .await
+        .unwrap();
+    }
+
+    const KEY_DECRYPT: &str = "tinycloud.encryption/decrypt";
+
+    /// A prefix grant cited as a parent covers a key below it.
+    #[tokio::test]
+    async fn key_prefix_grant_covers_key_below_it_through_parent() {
+        let db = database().await;
+        let parent = crate::hash::hash(b"prefix-grant-covers-key");
+        let prefix = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/foo/");
+        insert_parent_grant(&db, parent, KEY_OWNER, OTHER_DID, &prefix, KEY_DECRYPT).await;
+        let key = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/foo/x");
+        let info = key_grant_info(OTHER_DID, &key, KEY_DECRYPT, &[parent]);
+        validate(&db, &info)
+            .await
+            .expect("parent prefix covers key below it");
+    }
+
+    /// A child prefix wider than the parent's prefix is not covered.
+    #[tokio::test]
+    async fn broader_child_prefix_is_not_covered_by_parent() {
+        let db = database().await;
+        let parent = crate::hash::hash(b"prefix-grant-narrow");
+        let prefix = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/foo/");
+        insert_parent_grant(&db, parent, KEY_OWNER, OTHER_DID, &prefix, KEY_DECRYPT).await;
+        let child = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/");
+        let info = key_grant_info(OTHER_DID, &child, KEY_DECRYPT, &[parent]);
+        assert!(matches!(
+            validate(&db, &info).await,
+            Err(Error::InvalidDelegation(
+                DelegationError::UnauthorizedCapability(_, _)
+            ))
+        ));
+    }
+
+    /// A parent issued in another owner's namespace does not cover this owner's key.
+    #[tokio::test]
+    async fn parent_for_other_owner_does_not_cover_key() {
+        const OTHER_OWNER: &str = "did:pkh:eip155:1:0x0000000000000000000000000000000000000001";
+        let db = database().await;
+        let parent = crate::hash::hash(b"prefix-grant-other-owner");
+        let prefix = format!("urn:tinycloud:encryption:{OTHER_OWNER}:default/apps/foo/");
+        insert_parent_grant(&db, parent, OTHER_OWNER, OTHER_DID, &prefix, KEY_DECRYPT).await;
+        let key = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/foo/x");
+        let info = key_grant_info(OTHER_DID, &key, KEY_DECRYPT, &[parent]);
+        assert!(matches!(
+            validate(&db, &info).await,
+            Err(Error::InvalidDelegation(
+                DelegationError::UnauthorizedCapability(_, _)
+            ))
+        ));
+    }
+
+    /// key.delete is refused in a chain even when a parent grants the key's prefix.
+    #[tokio::test]
+    async fn chained_key_delete_is_refused_with_parent_cited() {
+        let db = database().await;
+        let parent = crate::hash::hash(b"prefix-grant-for-chained-delete");
+        let prefix = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/");
+        insert_parent_grant(&db, parent, KEY_OWNER, OTHER_DID, &prefix, KEY_DECRYPT).await;
+        let info = key_grant_info(
+            OTHER_DID,
+            KEY_RESOURCE,
+            "tinycloud.encryption/key.delete",
+            &[parent],
+        );
+        assert!(matches!(
+            validate(&db, &info).await,
+            Err(Error::InvalidDelegation(
+                DelegationError::KeyDeleteNotDelegable
+            ))
+        ));
+    }
+
+    /// Malformed key identifiers are not root authority, even for the owner,
+    /// and a valid parent prefix does not cover them.
+    #[tokio::test]
+    async fn malformed_key_identifiers_are_refused_in_delegations() {
+        let db = database().await;
+        let prefix = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/");
+        let mut skipped = 0;
+        for (index, resource) in key_id::MALFORMED_KEY_IDS.iter().enumerate() {
+            // Ids that fail URI parsing cannot be built into a capability, so there is nothing to admit or refuse.
+            if resource.parse::<crate::types::Resource>().is_err() {
+                skipped += 1;
+                continue;
+            }
+            let owner_info =
+                key_grant_info(KEY_OWNER, resource, "tinycloud.encryption/key.create", &[]);
+            assert!(
+                matches!(
+                    validate(&db, &owner_info).await,
+                    Err(Error::InvalidDelegation(DelegationError::MissingParents))
+                ),
+                "owner-issued malformed key {} accepted: {resource}",
+                index + 7
+            );
+            let parent = crate::hash::hash(resource.as_bytes());
+            insert_parent_grant(&db, parent, KEY_OWNER, OTHER_DID, &prefix, KEY_DECRYPT).await;
+            let info = key_grant_info(OTHER_DID, resource, KEY_DECRYPT, &[parent]);
+            assert!(
+                matches!(
+                    validate(&db, &info).await,
+                    Err(Error::InvalidDelegation(
+                        DelegationError::UnauthorizedCapability(_, _)
+                    ))
+                ),
+                "parent covered malformed key {}: {resource}",
+                index + 7
+            );
+        }
+        assert_eq!(
+            skipped, 2,
+            "URI-invalid key identifiers in MALFORMED_KEY_IDS"
+        );
     }
 }

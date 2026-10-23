@@ -1,4 +1,4 @@
-use crate::encryption_network::NetworkId;
+use crate::encryption_network::key_id;
 use sea_orm::{entity::prelude::*, sea_query::ValueTypeErr};
 use serde::{Deserialize, Serialize};
 use std::{fmt::Display, str::FromStr};
@@ -11,6 +11,13 @@ use tinycloud_auth::resource::{
 };
 
 const ENCRYPTION_NETWORK_PREFIX: &str = "urn:tinycloud:encryption:";
+
+/// Case-insensitive match on the encryption namespace, so uppercase variants
+/// are routed to the strict parser and refused rather than string-compared.
+fn is_encryption_urn(uri: &str) -> bool {
+    uri.get(..ENCRYPTION_NETWORK_PREFIX.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(ENCRYPTION_NETWORK_PREFIX))
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(untagged)]
@@ -27,23 +34,19 @@ impl Resource {
         }
     }
 
+    /// `child.extends(&parent)` is true when `parent` covers `child`.
+    /// The receiver is the requested (child) resource; the argument is the grant.
     pub fn extends(&self, other: &Self) -> bool {
         match (self, other) {
             (Resource::TinyCloud(a), Resource::TinyCloud(b)) => a.extends(b).is_ok(),
             (Resource::Other(a), Resource::Other(b)) => {
-                match (
-                    a.as_str().parse::<NetworkId>(),
-                    b.as_str().parse::<NetworkId>(),
-                ) {
-                    (Ok(a), Ok(b)) => a == b,
-                    (Ok(_), Err(_)) | (Err(_), Ok(_)) => false,
-                    (Err(_), Err(_))
-                        if a.as_str().starts_with(ENCRYPTION_NETWORK_PREFIX)
-                            || b.as_str().starts_with(ENCRYPTION_NETWORK_PREFIX) =>
-                    {
-                        false
+                if is_encryption_urn(a.as_str()) || is_encryption_urn(b.as_str()) {
+                    match (key_id::parse(a.as_str()), key_id::parse(b.as_str())) {
+                        (Ok(a), Ok(b)) => b.extends(&a),
+                        _ => false,
                     }
-                    (Err(_), Err(_)) => a.as_str().starts_with(b.as_str()),
+                } else {
+                    a.as_str().starts_with(b.as_str())
                 }
             }
             _ => false,
@@ -223,5 +226,45 @@ mod tests {
         let parent: Resource = "urn:example:resource".parse().unwrap();
 
         assert!(child.extends(&parent));
+    }
+
+    /// `child.extends(&parent)` is true when `parent` covers `child`.
+    #[test]
+    fn encryption_containment_is_checked_child_first() {
+        const OWNER: &str = "did:pkh:eip155:1:0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed";
+        let uri = |scope: &str| -> Resource {
+            format!("urn:tinycloud:encryption:{OWNER}:{scope}")
+                .parse()
+                .unwrap()
+        };
+
+        let covered = [
+            (uri("default/apps/foo/a/b"), uri("default/apps/foo/")),
+            (uri("default/apps/foo/x"), uri("default/apps/foo/")),
+            (uri("default/apps/foo/"), uri("default/apps/")),
+            (uri("default/apps/foo/"), uri("default/apps/foo/")),
+            (uri("default/apps/x"), uri("default/apps/x")),
+        ];
+        for (child, parent) in &covered {
+            assert!(
+                child.extends(parent),
+                "{child:?} should be covered by {parent:?}"
+            );
+        }
+
+        let not_covered = [
+            (uri("default/apps/foobar/x"), uri("default/apps/foo/")),
+            (uri("default/apps/foo"), uri("default/apps/foo/")),
+            (uri("default/apps/x"), uri("default")),
+            (uri("default"), uri("default/apps/x")),
+            (uri("default/apps/"), uri("default/apps/foo/")),
+            (uri("default/apps/x"), uri("default/apps/y")),
+        ];
+        for (child, parent) in &not_covered {
+            assert!(
+                !child.extends(parent),
+                "{child:?} should not be covered by {parent:?}"
+            );
+        }
     }
 }
