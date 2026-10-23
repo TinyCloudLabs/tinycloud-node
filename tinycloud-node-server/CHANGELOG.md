@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.22.0](https://github.com/TinyCloudLabs/tinycloud-node/compare/v0.0.1...v1.22.0) - 2026-10-23
+
+### Other
+
+- update Cargo.toml dependencies
+
 - Recheck hook ticket delegation revocation when event streams open and use
   literal segment-prefix matching for hook subscriptions.
 
