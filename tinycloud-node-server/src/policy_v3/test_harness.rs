@@ -3,7 +3,7 @@
 //! registration, sessions, reads, decrypts, re-shares and revocations.
 //!
 //! PostgreSQL runs need `TINYCLOUD_TEST_POSTGRES_URL` (each test uses its own
-//! schema); they are skipped when it is unset outside CI.
+//! schema); they are skipped when it is unset and the gate does not allow a connection.
 
 use super::*;
 use rocket::{
@@ -59,17 +59,7 @@ macro_rules! on_both_backends {
 }
 
 fn postgres_url(test: &str) -> Option<String> {
-    match std::env::var("TINYCLOUD_TEST_POSTGRES_URL") {
-        Ok(url) if !url.trim().is_empty() => Some(url),
-        _ => {
-            assert!(
-                std::env::var_os("CI").is_none(),
-                "{test} requires TINYCLOUD_TEST_POSTGRES_URL, which is unset in CI (TC-381)"
-            );
-            eprintln!("skipping {test}: TINYCLOUD_TEST_POSTGRES_URL is unset");
-            None
-        }
-    }
+    crate::test_support::postgres_test_url(test)
 }
 
 pub(super) fn unique(label: &str) -> String {
@@ -458,6 +448,12 @@ impl Harness {
         };
         harness.seed_content().await?;
         Ok(Some(harness))
+    }
+
+    /// The database URL the app is booted on, for probes that open their own
+    /// sessions.
+    pub fn database_url(&self) -> &str {
+        self._db.url()
     }
 
     async fn boot_app(

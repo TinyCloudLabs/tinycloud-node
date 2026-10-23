@@ -1,17 +1,15 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Weak,
-    },
+    sync::{Arc, Weak},
 };
 
 use dashmap::DashMap;
 use tinycloud_auth::resource::SpaceId;
 
 use crate::database_artifacts::{
-    ArtifactExpectation, DatabaseArtifactError, DatabaseArtifactRepository,
+    read_artifact, staging_path, sweep_stale_staging, ArtifactExpectation, CacheFileSink,
+    DatabaseArtifactError, DatabaseArtifactRepository, MemorySink, StagingRelease,
 };
 
 use crate::request_telemetry::{self, QueryTimer};
@@ -207,21 +205,28 @@ impl DuckDbService {
         let operation_lock = Self::database_lock(&self.operation_locks, &key).await;
         let _operation = operation_lock.lock().await;
 
-        let artifact = self
-            .artifact_repository
-            .load("duckdb", &key.0, db_name)
-            .await
-            .map_err(artifact_error_to_duckdb)?
-            .ok_or(DuckDbError::DatabaseNotFound)?;
+        // The export is the response body, so it is buffered whole; the read
+        // itself still streams in slices.
+        let mut artifact = MemorySink::default();
+        read_artifact(
+            self.artifact_repository.as_ref(),
+            "duckdb",
+            &key.0,
+            db_name,
+            &mut artifact,
+        )
+        .await
+        .map_err(artifact_error_to_duckdb)?
+        .ok_or(DuckDbError::DatabaseNotFound)?;
         validate_payload(
             space,
             db_name,
             "checkpoint",
-            &artifact.payload,
+            &artifact.checkpoint,
             is_duckdb_file,
         )?;
-        let Some(delta) = artifact.delta_payload else {
-            return Ok(artifact.payload);
+        let Some(delta) = artifact.wal else {
+            return Ok(artifact.checkpoint);
         };
         validate_payload(space, db_name, "wal", &delta, |payload| {
             !is_duckdb_file(payload)
@@ -236,7 +241,7 @@ impl DuckDbService {
             let _context = request_telemetry::enter(context);
             let temp = tempfile::tempdir().map_err(|e| DuckDbError::Internal(e.to_string()))?;
             let path = temp.path().join("export.duckdb");
-            std::fs::write(&path, artifact.payload)
+            std::fs::write(&path, artifact.checkpoint)
                 .map_err(|e| DuckDbError::Internal(e.to_string()))?;
             std::fs::write(duckdb_wal_path(&path), delta)
                 .map_err(|e| DuckDbError::Internal(e.to_string()))?;
@@ -274,7 +279,8 @@ impl DuckDbService {
             .map_err(|e| DuckDbError::Internal(e.to_string()))?;
 
         let final_path = dir.join(format!("{}.duckdb", db_name));
-        let temp_path = temp_write_path(&final_path);
+        let temp_path = staging_path(&final_path);
+        let _live = StagingRelease(temp_path.clone());
 
         // Write to temp file first
         tokio::fs::write(&temp_path, data)
@@ -414,51 +420,46 @@ impl DuckDbService {
     async fn hydrate_cache(&self, space: &SpaceId, db_name: &str) -> Result<(), DuckDbError> {
         let cache_path = self.cache_path(space, db_name);
         let key = (space.to_string(), db_name.to_string());
-        match self
-            .artifact_repository
-            .load("duckdb", &space.to_string(), db_name)
-            .await
-            .map_err(artifact_error_to_duckdb)?
+        sweep_stale_staging(&[&cache_path, &duckdb_wal_path(&cache_path)]).await;
+        let mut sink = CacheFileSink::new(
+            "duckdb",
+            format!("{space}/{db_name}"),
+            cache_path.clone(),
+            duckdb_wal_path(&cache_path),
+            is_duckdb_file,
+            is_not_duckdb_file,
+        );
+        match read_artifact(
+            self.artifact_repository.as_ref(),
+            "duckdb",
+            &space.to_string(),
+            db_name,
+            &mut sink,
+        )
+        .await
+        .map_err(artifact_error_to_duckdb)?
         {
-            Some(artifact) => {
+            Some(meta) => {
                 tracing::info!(
                     service = "duckdb",
-                    revision = artifact.revision,
-                    storage_mode = %artifact.storage_mode,
-                    bytes = artifact.payload.len(),
-                    delta_bytes = artifact.delta_size_bytes,
-                    logical_bytes = artifact.size_bytes,
-                    content_hash = %artifact.content_hash,
-                    checkpoint_content_hash = %artifact.checkpoint_content_hash,
+                    revision = meta.revision,
+                    storage_mode = %meta.storage_mode,
+                    bytes = meta.checkpoint_size_bytes,
+                    delta_bytes = meta.delta_size_bytes,
+                    logical_bytes = meta.size_bytes,
+                    content_hash = %meta.content_hash,
+                    checkpoint_content_hash = %meta.checkpoint_content_hash,
                     "Loaded database artifact"
                 );
-                // Refuse to seed the cache with bytes DuckDB would misread. The
-                // checkpoint must be a database; the WAL, which carries no
-                // header of its own, must at least not be one — that is the
-                // shape a crossed hydration writes.
-                validate_payload(
-                    space,
-                    db_name,
-                    "checkpoint",
-                    &artifact.payload,
-                    is_duckdb_file,
-                )?;
-                if let Some(delta) = artifact.delta_payload.as_deref() {
-                    validate_payload(space, db_name, "wal", delta, |payload| {
-                        !is_duckdb_file(payload)
-                    })?;
-                }
-
                 remove_duckdb_cache_files(&cache_path).await?;
-                write_cache_file(&cache_path, &artifact.payload).await?;
-                if let Some(delta) = artifact.delta_payload {
-                    write_cache_file(&duckdb_wal_path(&cache_path), &delta).await?;
-                }
+                sink.commit()
+                    .await
+                    .map_err(|e| DuckDbError::Internal(e.to_string()))?;
                 self.lineage.insert(
                     key,
                     ArtifactExpectation::Derived {
-                        revision: artifact.revision,
-                        checkpoint_content_hash: artifact.checkpoint_content_hash,
+                        revision: meta.revision,
+                        checkpoint_content_hash: meta.checkpoint_content_hash,
                     },
                 );
                 Ok(())
@@ -571,7 +572,7 @@ impl DuckDbService {
         if without_growth {
             let durable_bytes = self
                 .artifact_repository
-                .load("duckdb", &key.0, db_name)
+                .load_meta("duckdb", &key.0, db_name)
                 .await
                 .map_err(artifact_error_to_duckdb)?
                 .map_or(0, |artifact| artifact.size_bytes.max(0) as u64);
@@ -601,6 +602,12 @@ impl DuckDbService {
         );
         Ok(())
     }
+}
+
+/// The WAL carries no header of its own; it must at least not be a database,
+/// which is the shape a crossed hydration writes.
+fn is_not_duckdb_file(payload: &[u8]) -> bool {
+    !is_duckdb_file(payload)
 }
 
 /// Whether `payload` carries DuckDB's main-database header.
@@ -633,42 +640,6 @@ fn validate_payload(
     )))
 }
 
-/// A temp sibling of `path`, unique per call.
-///
-/// The suffix is APPENDED to the whole path. `Path::with_extension` replaces
-/// everything after the last `.`, so `main.duckdb` and `main.duckdb.wal` both
-/// mapped to `main.duckdb.tmp` — as did `import_db`'s own staging file. The
-/// checkpoint and WAL writes of one hydration raced on a single file and
-/// cross-consumed each other's bytes, reverting the database silently.
-fn temp_write_path(path: &Path) -> PathBuf {
-    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
-    PathBuf::from(format!(
-        "{}.tmp.{}.{}",
-        path.display(),
-        std::process::id(),
-        NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
-    ))
-}
-
-async fn write_cache_file(path: &Path, payload: &[u8]) -> Result<(), DuckDbError> {
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|e| DuckDbError::Internal(e.to_string()))?;
-    }
-
-    let temp_path = temp_write_path(path);
-    if let Err(e) = tokio::fs::write(&temp_path, payload).await {
-        let _ = tokio::fs::remove_file(&temp_path).await;
-        return Err(DuckDbError::Internal(e.to_string()));
-    }
-    if let Err(e) = tokio::fs::rename(&temp_path, path).await {
-        let _ = tokio::fs::remove_file(&temp_path).await;
-        return Err(DuckDbError::Internal(e.to_string()));
-    }
-    Ok(())
-}
-
 async fn remove_duckdb_cache_files(path: &Path) -> Result<(), DuckDbError> {
     for candidate in [
         path.to_path_buf(),
@@ -688,6 +659,8 @@ fn duckdb_wal_path(path: &Path) -> PathBuf {
     PathBuf::from(format!("{}.wal", path.display()))
 }
 
+/// `DuckDbError` has no retryable-unavailable variant (adding one would reach
+/// every route mapping), so an exhausted `ArtifactChanged` stays `Internal`.
 fn artifact_error_to_duckdb(err: DatabaseArtifactError) -> DuckDbError {
     DuckDbError::Internal(err.to_string())
 }
@@ -696,7 +669,7 @@ fn artifact_error_to_duckdb(err: DatabaseArtifactError) -> DuckDbError {
 mod tests {
     use super::*;
     use crate::{
-        database_artifacts::SeaOrmDatabaseArtifactRepository,
+        database_artifacts::{test_support::ReadAll, SeaOrmDatabaseArtifactRepository},
         migrations::Migrator,
         sea_orm::{ConnectOptions, Database},
         sea_orm_migration::MigratorTrait,
@@ -788,7 +761,7 @@ mod tests {
                 assert_eq!(sizes.space_total(&space).await, 0);
                 assert!(matches!(exported, Err(DuckDbError::DatabaseNotFound)));
                 assert!(repo
-                    .load("duckdb", &space.to_string(), name)
+                    .read_all("duckdb", &space.to_string(), name)
                     .await
                     .unwrap()
                     .is_none());
@@ -847,7 +820,7 @@ mod tests {
         assert_eq!(sizes.space_total(&space).await, 0);
         assert!(matches!(exported, Err(DuckDbError::DatabaseNotFound)));
         assert!(repo
-            .load("duckdb", &space.to_string(), "absent")
+            .read_all("duckdb", &space.to_string(), "absent")
             .await
             .unwrap()
             .is_none());
@@ -888,7 +861,7 @@ mod tests {
                     .expect("dropping an absent table is a successful no-op");
                 assert_eq!(sizes.space_total(&space).await, 0);
                 assert!(repo
-                    .load("duckdb", &space.to_string(), name)
+                    .read_all("duckdb", &space.to_string(), name)
                     .await
                     .unwrap()
                     .is_none());
@@ -933,7 +906,7 @@ mod tests {
                 .await
                 .unwrap();
             let before = repo
-                .load("duckdb", &space.to_string(), "main")
+                .read_all("duckdb", &space.to_string(), "main")
                 .await
                 .unwrap()
                 .unwrap();
@@ -973,7 +946,7 @@ mod tests {
                 "{rejected:?}"
             );
             let after = repo
-                .load("duckdb", &space.to_string(), "main")
+                .read_all("duckdb", &space.to_string(), "main")
                 .await
                 .unwrap()
                 .unwrap();
@@ -1174,7 +1147,7 @@ mod tests {
             .await
             .unwrap();
         let artifact = repo
-            .load("duckdb", &space.to_string(), "analytics")
+            .read_all("duckdb", &space.to_string(), "analytics")
             .await
             .unwrap()
             .unwrap();
@@ -1205,7 +1178,7 @@ mod tests {
                 .unwrap();
             assert_eq!(names, "one");
             let after = repo
-                .load("duckdb", &space.to_string(), "analytics")
+                .read_all("duckdb", &space.to_string(), "analytics")
                 .await
                 .unwrap()
                 .unwrap();

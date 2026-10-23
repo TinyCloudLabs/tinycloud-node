@@ -1,11 +1,13 @@
-//! TC-1482: `GET /admin/stats` over the real node, on SQLite and (when
-//! `TINYCLOUD_TEST_POSTGRES_URL` is set, mandatory in CI) PostgreSQL.
+//! TC-1482: `GET /admin/stats` over the real node, on SQLite and on PostgreSQL
+//! (when the gate in `tests/common/mod.rs` allows it).
 //!
 //! The response rules are pinned in `tinycloud-core`'s `data_owners` tests; the
 //! tests here cover the HTTP surface: the authentication matrix, the disabled
 //! route, the response shape and one end-to-end data scenario per backend.
 //! `tests/admin_stats_logs.rs` covers the logs and
 //! `tests/postgres_round_trip_budget.rs` the round trips.
+
+mod common;
 
 use std::ffi::OsString;
 
@@ -129,23 +131,11 @@ impl Reply {
 }
 
 fn postgres_test_url(test: &str) -> Option<String> {
-    match std::env::var("TINYCLOUD_TEST_POSTGRES_URL") {
-        Ok(url) if !url.trim().is_empty() => Some(url),
-        _ => {
-            if std::env::var_os("CI").is_some() {
-                panic!(
-                    "{test} requires TINYCLOUD_TEST_POSTGRES_URL, which is unset (or empty) in CI \
-                     (TC-381)."
-                );
-            }
-            eprintln!("skipping {test}: TINYCLOUD_TEST_POSTGRES_URL is unset");
-            None
-        }
-    }
+    common::postgres_test_url(test)
 }
 
 impl Node {
-    /// `None` only when PostgreSQL is requested, not configured, and not CI.
+    /// `None` only when PostgreSQL is requested and the gate skips it.
     async fn start(backend: Backend, test: &str) -> Option<Node> {
         let dir = tempfile::tempdir().unwrap();
         let (database, schema) = match backend {

@@ -167,8 +167,9 @@ pub fn validate_sql_authorized(
         return Err(SqlError::ReadOnlyViolation);
     }
 
-    // Validate caveats
-    if let Some(caveats) = caveats {
+    // Validate caveats. Under the delegated-caveat rules (TC-1791) the
+    // authorizer is the one place they are decided, and it names the arm.
+    if let Some(caveats) = caveats.as_ref().filter(|_| !authority.delegated_caveats()) {
         if caveats.read_only.unwrap_or(false) && !is_read_only {
             return Err(SqlError::ReadOnlyViolation);
         }

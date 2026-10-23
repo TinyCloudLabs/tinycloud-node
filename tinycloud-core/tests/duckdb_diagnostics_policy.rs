@@ -131,6 +131,53 @@ fn tenant_diagnostics_cannot_escape_process_streams_and_normal_sql_still_works()
     assert!(String::from_utf8_lossy(&output.stderr).contains("tc1304_stderr_capture_control"));
 }
 
+/// Whole-artifact read for assertions, built on the streaming API: the
+/// repository itself has no whole-row read.
+#[async_trait::async_trait]
+trait ReadAll {
+    async fn read_all(
+        &self,
+        service: &str,
+        space: &str,
+        name: &str,
+    ) -> Result<
+        Option<tinycloud_core::database_artifacts::DatabaseArtifact>,
+        tinycloud_core::database_artifacts::DatabaseArtifactError,
+    >;
+}
+
+#[async_trait::async_trait]
+impl<T: tinycloud_core::database_artifacts::DatabaseArtifactRepository + ?Sized> ReadAll for T {
+    async fn read_all(
+        &self,
+        service: &str,
+        space: &str,
+        name: &str,
+    ) -> Result<
+        Option<tinycloud_core::database_artifacts::DatabaseArtifact>,
+        tinycloud_core::database_artifacts::DatabaseArtifactError,
+    > {
+        use tinycloud_core::database_artifacts::{read_artifact, DatabaseArtifact, MemorySink};
+        let mut sink = MemorySink::default();
+        let Some(meta) = read_artifact(self, service, space, name, &mut sink).await? else {
+            return Ok(None);
+        };
+        Ok(Some(DatabaseArtifact {
+            payload: sink.checkpoint,
+            content_hash: meta.content_hash,
+            revision: meta.revision,
+            size_bytes: meta.size_bytes,
+            updated_at: meta.updated_at,
+            backend: meta.backend,
+            storage_mode: meta.storage_mode,
+            checkpoint_content_hash: meta.checkpoint_content_hash,
+            delta_payload: sink.wal,
+            delta_content_hash: meta.delta_content_hash,
+            delta_size_bytes: meta.delta_size_bytes,
+        }))
+    }
+}
+
 #[tokio::test]
 async fn invocation_template_is_not_authority_to_execute_ddl_with_read_ability() {
     let directory = tempfile::tempdir().unwrap();
@@ -188,7 +235,7 @@ async fn invocation_template_is_not_authority_to_execute_ddl_with_read_ability()
 async fn with_prefixed_writes_require_authority_and_persist_query_write_targets() {
     use tinycloud_auth::resource::SpaceId;
     use tinycloud_core::{
-        database_artifacts::{DatabaseArtifactRepository, SeaOrmDatabaseArtifactRepository},
+        database_artifacts::SeaOrmDatabaseArtifactRepository,
         duckdb::{service::DuckDbService, types::DuckDbError},
         migrations::Migrator,
         sea_orm::{ConnectOptions, Database},
@@ -285,7 +332,7 @@ async fn with_prefixed_writes_require_authority_and_persist_query_write_targets(
     let before_rows = rows(&service, &space, data_sql).await;
     let before_catalog = rows(&service, &space, catalog_sql).await;
     let before_artifact = repository
-        .load("duckdb", &space.to_string(), "nested")
+        .read_all("duckdb", &space.to_string(), "nested")
         .await
         .unwrap()
         .unwrap();
@@ -341,7 +388,7 @@ async fn with_prefixed_writes_require_authority_and_persist_query_write_targets(
     assert_eq!(rows(&service, &space, data_sql).await, before_rows);
     assert_eq!(rows(&service, &space, catalog_sql).await, before_catalog);
     let denied_artifact = repository
-        .load("duckdb", &space.to_string(), "nested")
+        .read_all("duckdb", &space.to_string(), "nested")
         .await
         .unwrap()
         .unwrap();
@@ -382,7 +429,7 @@ async fn with_prefixed_writes_require_authority_and_persist_query_write_targets(
                         }
                     };
                     let prior = repository
-                        .load("duckdb", &space.to_string(), "nested")
+                        .read_all("duckdb", &space.to_string(), "nested")
                         .await
                         .unwrap()
                         .unwrap();
@@ -415,7 +462,7 @@ async fn with_prefixed_writes_require_authority_and_persist_query_write_targets(
                     next_value += 1;
                     assert_eq!(rows(&service, &space, data_sql).await, expected);
                     let persisted = repository
-                        .load("duckdb", &space.to_string(), "nested")
+                        .read_all("duckdb", &space.to_string(), "nested")
                         .await
                         .unwrap()
                         .unwrap();
@@ -622,7 +669,7 @@ async fn executing_explain_template_still_requires_the_wrapped_write_ability() {
 async fn restricted_invocations_fail_closed_on_unsupported_sql_shapes_without_changing_data() {
     use tinycloud_auth::resource::SpaceId;
     use tinycloud_core::{
-        database_artifacts::{DatabaseArtifactRepository, SeaOrmDatabaseArtifactRepository},
+        database_artifacts::SeaOrmDatabaseArtifactRepository,
         duckdb::{
             service::DuckDbService,
             types::{DuckDbError, DuckDbExecutionResult},
@@ -754,7 +801,7 @@ async fn restricted_invocations_fail_closed_on_unsupported_sql_shapes_without_ch
     let before_rows = query_rows(run(&service, &space, snapshot_sql, None, READ).await);
     let before_catalog = query_rows(run(&service, &space, catalog_sql, None, READ).await);
     let before_artifact = repository
-        .load("duckdb", &space.to_string(), "restrictions")
+        .read_all("duckdb", &space.to_string(), "restrictions")
         .await
         .unwrap()
         .unwrap();
@@ -859,7 +906,7 @@ async fn restricted_invocations_fail_closed_on_unsupported_sql_shapes_without_ch
         before_catalog
     );
     let after_artifact = repository
-        .load("duckdb", &space.to_string(), "restrictions")
+        .read_all("duckdb", &space.to_string(), "restrictions")
         .await
         .unwrap()
         .unwrap();

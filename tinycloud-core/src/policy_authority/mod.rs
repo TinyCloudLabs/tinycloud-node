@@ -3400,6 +3400,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn postgres_refused_status_change_releases_its_row_lock() {
+        use sea_orm::{ConnectOptions, Database};
+
+        let Some(database_url) = crate::test_support::postgres_test_url(
+            "postgres_refused_status_change_releases_its_row_lock",
+        ) else {
+            return;
+        };
+        let admin = Database::connect(ConnectOptions::new(database_url.clone()))
+            .await
+            .expect("connect to PostgreSQL test database");
+        let f = fixture();
+        let (schema, _db, first, _second) =
+            postgres_two_store_fixture(&admin, &database_url, &f, "status_refusal_lock").await;
+        let revoked_at = f.bindings.now + time::Duration::seconds(1);
+        let active_at = f.bindings.now + time::Duration::seconds(2);
+        first
+            .set_status(
+                ENFORCE_CID,
+                AuthorityStatus::revoked_for_test(revoked_at, 2),
+            )
+            .await
+            .expect("revoke before the refused change");
+        // Resurrection after revocation is refused by validate_status_transition.
+        first
+            .set_status(ENFORCE_CID, AuthorityStatus::active_for_test(active_at, 3))
+            .await
+            .expect_err("resurrection after revocation must be refused");
+        // The refused call has returned, so its FOR UPDATE lock must be released.
+        // The probe is a fresh session on its own thread, not the store's pool:
+        // a rollback the refused call left queued on this test's runtime has
+        // not run yet. The row is seeded by the fixture and was read above.
+        crate::test_support::execute_in_schema_blocking(
+            database_url.clone(),
+            schema.clone(),
+            &format!(
+                "SELECT delegation_cid FROM policy_delegation WHERE delegation_cid = '{ENFORCE_CID}' FOR UPDATE NOWAIT"
+            ),
+        )
+        .expect("row lock released after the refused status change");
+        drop_postgres_schema(&admin, schema).await;
+    }
+
+    #[tokio::test]
     async fn postgres_policy_authority_concurrency_matrix_across_stores() {
         use sea_orm::{ConnectOptions, Database};
 

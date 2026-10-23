@@ -220,6 +220,37 @@ mod tests {
     }
 
     #[test]
+    fn sql_store_loads_from_the_double_underscore_keys() {
+        let _lock = lock_env();
+        let keys = [
+            "TINYCLOUD_SQL_STORE__ENABLED",
+            "TINYCLOUD_SQL_STORE__UPLOAD_INTERVAL_SECS",
+            "TINYCLOUD_SQL_STORE__UPLOAD_BYTES",
+            "TINYCLOUD_SQL_STORE__RETENTION__HISTORY_DAYS__FREE",
+        ];
+        let _unset: Vec<_> = keys.iter().map(|k| EnvVarGuard::unset(k)).collect();
+        let extract = || {
+            build_config_figment()
+                .extract::<config::Config>()
+                .expect("config should parse")
+                .sql_store
+        };
+        let defaults = extract();
+        assert!(!defaults.enabled);
+        assert_eq!(defaults.upload_interval_secs, 60);
+
+        let _e = EnvVarGuard::set(keys[0], "true");
+        let _i = EnvVarGuard::set(keys[1], "15");
+        let _b = EnvVarGuard::set(keys[2], "2 MiB");
+        let _r = EnvVarGuard::set(keys[3], "7");
+        let loaded = extract();
+        assert!(loaded.enabled);
+        assert_eq!(loaded.upload_interval_secs, 15);
+        assert_eq!(loaded.upload_bytes, rocket::data::ByteUnit::Mebibyte(2));
+        assert_eq!(loaded.retention.history_days.get("free"), Some(&7));
+    }
+
+    #[test]
     fn canonical_double_underscore_loads_storage_database() {
         let _lock = lock_env();
         let _legacy = EnvVarGuard::unset("TINYCLOUD_STORAGE_DATABASE");

@@ -4916,10 +4916,28 @@ fn selftest_blocks_carry_no_derived_secret() -> Result<()> {
     Ok(())
 }
 
+/// The DEK pieces the salt selftest injects, each with a filler byte that
+/// cannot extend it. `salt_findings` reports the smallest matching 16-byte
+/// window, so a filler byte equal to the DEK byte next to an injected piece
+/// moves the label one offset early: `half_b[15] == dek[15]` makes the
+/// finding `15..31` instead of `16..32`. Forcing that byte off its DEK
+/// neighbour rules the coincidence out. Only `half_b`'s forced byte changes a
+/// label; the forced bytes in `truncated` and `half_a` are for symmetry.
+/// Returns (truncated, half_a, half_b).
+fn salt_selftest_pieces(dek: &[u8]) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let mut truncated = dek[..31].to_vec();
+    truncated.push(dek[31] ^ 0xFF);
+    let mut half_a = [&dek[..16], &random_bytes(16)[..]].concat();
+    half_a[16] = dek[16] ^ 0xFF;
+    let mut half_b = [&random_bytes(16)[..], &dek[16..]].concat();
+    half_b[15] = dek[15] ^ 0xFF;
+    (truncated, half_a, half_b)
+}
+
 /// Round 7, offline: no TCE1 salt may hold any 16-byte piece of a harness
-/// secret, in any mode: (a) a salt of DEK[0..31] plus one random byte; (b)
-/// DEK[0..16] in one block's salt and DEK[16..32] in another's. Random salts
-/// (fresh seals) never match.
+/// secret, in any mode: (a) a salt of DEK[0..31] plus one byte other than
+/// DEK[31]; (b) DEK[0..16] in one block's salt and DEK[16..32] in another's.
+/// Random salts (fresh seals) never match.
 #[test]
 fn selftest_salts_hold_no_piece_of_a_secret() -> Result<()> {
     let fx = MirrorFixture::new();
@@ -4942,9 +4960,7 @@ fn selftest_salts_hold_no_piece_of_a_secret() -> Result<()> {
             .filter(|f| f.contains("TCE1 header salt holds bytes"))
             .count()
     };
-    let truncated = [&dek[..31], &random_bytes(1)[..]].concat();
-    let half_a = [&dek[..16], &random_bytes(16)[..]].concat();
-    let half_b = [&random_bytes(16)[..], &dek[16..]].concat();
+    let (truncated, half_a, half_b) = salt_selftest_pieces(&dek);
     for policy in [ENCRYPT, key_mirror::Policy::default()] {
         let findings = fx.check_with(&all, &[with_salt(&a, &truncated)], &puts, policy);
         ensure!(
@@ -4981,6 +4997,65 @@ fn selftest_salts_hold_no_piece_of_a_secret() -> Result<()> {
     ensure!(
         pieces(&findings) == 0,
         "a random salt matched a piece of a secret: {findings:#?}"
+    );
+    Ok(())
+}
+
+/// Regression for the salt selftest's ~1/256 flake. A filler byte equal to the
+/// adjacent DEK byte moves the label of an injected half (`15..31` for
+/// `half_b`). The fixed construction never does; the old one does, within the
+/// trial count below.
+#[test]
+fn selftest_salt_piece_labels_do_not_depend_on_filler_bytes() -> Result<()> {
+    let fx = MirrorFixture::new();
+    let dek = fx.keys.deks[0];
+    let (block, _) = fx.sealed_block(0, b"first value");
+    let label_of = |salt: &[u8]| {
+        let mut body = block.body.clone();
+        body[20..52].copy_from_slice(salt);
+        key_mirror::salt_findings(
+            "selftest",
+            &key_mirror::ObjectRef {
+                key: &block.key,
+                body: &body,
+            },
+            &[key_mirror::Secret {
+                label: "DEK 1".into(),
+                bytes: dek.to_vec(),
+            }],
+        )
+    };
+    // Old construction with the coincidence: filler's last byte == dek[15].
+    let mut old_half_b = [&random_bytes(16)[..], &dek[16..]].concat();
+    old_half_b[15] = dek[15];
+    ensure!(
+        any_contains(&label_of(&old_half_b), "salt holds bytes 15..31 of"),
+        "a filler byte equal to dek[15] did not move the label to 15..31"
+    );
+    let (_, _, half_b) = salt_selftest_pieces(&dek);
+    ensure!(
+        any_contains(&label_of(&half_b), "salt holds bytes 16..32 of"),
+        "the fixed half_b was not labelled 16..32"
+    );
+    const TRIALS: usize = 20_000;
+    let (mut old_missed, mut fixed_missed) = (0usize, 0usize);
+    for _ in 0..TRIALS {
+        let old = [&random_bytes(16)[..], &dek[16..]].concat();
+        if !any_contains(&label_of(&old), "salt holds bytes 16..32 of") {
+            old_missed += 1;
+        }
+        let (_, _, half_b) = salt_selftest_pieces(&dek);
+        if !any_contains(&label_of(&half_b), "salt holds bytes 16..32 of") {
+            fixed_missed += 1;
+        }
+    }
+    ensure!(
+        fixed_missed == 0,
+        "the fixed construction was mislabelled {fixed_missed} of {TRIALS} times"
+    );
+    ensure!(
+        old_missed > 0,
+        "the old construction was never mislabelled in {TRIALS} trials; this test no longer reproduces the flake"
     );
     Ok(())
 }

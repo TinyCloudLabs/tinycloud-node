@@ -165,6 +165,8 @@ pub struct SpaceDatabase<C, B, S> {
     secrets: S,
     encryption: Option<ColumnEncryption>,
     sql_sizes: SqlSizes,
+    delegated_sql_caveats: bool,
+    named_keys: bool,
     revocation_chain_locks: ChainLockRegistry,
     kv_object_locks: KvObjectLockRegistry,
     space_sequence_locks: SpaceSequenceLockRegistry,
@@ -423,6 +425,8 @@ where
             secrets,
             encryption,
             sql_sizes: SqlSizes::default(),
+            delegated_sql_caveats: false,
+            named_keys: false,
             revocation_chain_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             kv_object_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             space_sequence_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -432,6 +436,22 @@ where
                 crate::database_migration::EffectiveFenceCache::default(),
             ),
         })
+    }
+
+    /// Admit the delegated `tables` / `columns` / `readOnly` caveat form on
+    /// `tinycloud.sql/*` abilities (TC-1791). Off by default: such a
+    /// delegation is refused as an unsupported caveat.
+    pub fn with_delegated_sql_caveats(mut self, enabled: bool) -> Self {
+        self.delegated_sql_caveats = enabled;
+        self
+    }
+
+    /// Serve named-key resources (keys and key prefixes): delegations that
+    /// grant on them are admitted. Off by default: such a delegation is
+    /// refused with `named_keys_unavailable`.
+    pub fn with_named_keys(mut self, enabled: bool) -> Self {
+        self.named_keys = enabled;
+        self
     }
 
     pub fn with_sql_sizes(mut self, sql_sizes: SqlSizes) -> Self {
@@ -653,7 +673,13 @@ where
         invocation: &crate::util::InvocationInfo,
         now: OffsetDateTime,
     ) -> Result<(), crate::models::invocation::Error> {
-        invocation::verify_and_authorize(&self.conn, invocation, now).await
+        invocation::verify_and_authorize_with_setting(
+            &self.conn,
+            invocation,
+            now,
+            self.delegated_sql_caveats,
+        )
+        .await
     }
 
     /// [`Self::authorize_invocation`] for an invocation whose signature and
@@ -665,7 +691,14 @@ where
         invocation: &crate::AdmittedInvocation,
         now: OffsetDateTime,
     ) -> Result<(), crate::models::invocation::Error> {
-        invocation::authorize_admitted(&self.conn, &invocation.invocation().0, now, None).await
+        invocation::authorize_admitted(
+            &self.conn,
+            &invocation.invocation().0,
+            now,
+            None,
+            self.delegated_sql_caveats,
+        )
+        .await
     }
 
     /// Check the persisted revocation state for cited delegations and every
@@ -738,9 +771,14 @@ where
         query: &DelegationQuery,
     ) -> Result<DelegationQueryPage, AccountDelegationQueryError> {
         let now = OffsetDateTime::now_utc();
-        invocation::verify_and_authorize(&self.conn, invocation, now)
-            .await
-            .map_err(|_| AccountDelegationQueryError::Unauthorized)?;
+        invocation::verify_and_authorize_with_setting(
+            &self.conn,
+            invocation,
+            now,
+            self.delegated_sql_caveats,
+        )
+        .await
+        .map_err(|_| AccountDelegationQueryError::Unauthorized)?;
         let principal = account_query_principal(&self.conn, invocation)
             .await?
             .ok_or(AccountDelegationQueryError::Unauthorized)?;
@@ -1652,6 +1690,8 @@ where
             self.encryption.as_ref(),
             None,
             &[],
+            self.delegated_sql_caveats,
+            self.named_keys,
         )
         .await?;
 
@@ -1942,6 +1982,8 @@ where
             self.encryption.as_ref(),
             None,
             &[],
+            self.delegated_sql_caveats,
+            self.named_keys,
         )
         .await
     }
@@ -2416,6 +2458,8 @@ where
             Some(&auth_graph),
             // Taken on this `tx` right after BEGIN, above.
             &sequence_spaces,
+            self.delegated_sql_caveats,
+            self.named_keys,
         )
         .await?;
 
@@ -2594,17 +2638,22 @@ where
         // signed-time validity here rather than verifying the signature a
         // second time.
         match mode {
-            InvokeMode::Admitted => {
-                invocation::authorize_admitted(&self.conn, &invocation.0, now, sync_graph.as_ref())
-                    .await
-                    .map_err(TxError::<B, K>::from)?
-            }
+            InvokeMode::Admitted => invocation::authorize_admitted(
+                &self.conn,
+                &invocation.0,
+                now,
+                sync_graph.as_ref(),
+                self.delegated_sql_caveats,
+            )
+            .await
+            .map_err(TxError::<B, K>::from)?,
             InvokeMode::Public | InvokeMode::Internal | InvokeMode::MeetingPublication => {
                 invocation::verify_and_authorize_with_graph(
                     &self.conn,
                     &invocation.0,
                     now,
                     sync_graph.as_ref(),
+                    self.delegated_sql_caveats,
                 )
                 .await
                 .map_err(TxError::<B, K>::from)?
@@ -3289,6 +3338,7 @@ async fn event_spaces<'a, C: ConnectionTrait>(
 /// `sequence_locks_held` lists the spaces whose sequence lock the caller has
 /// already taken on `db` (this same transaction) with
 /// `kv_sync::lock_space_sequences`; `&[]` when it has taken none.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
     db: &C,
     store_setup: &S,
@@ -3297,6 +3347,8 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
     encryption: Option<&ColumnEncryption>,
     auth_graph: Option<&crate::auth_graph::AuthGraphSnapshot>,
     sequence_locks_held: &[SpaceId],
+    delegated_sql_caveats: bool,
+    named_keys: bool,
 ) -> Result<TransactResult, TxError<S, K>> {
     // for each event, get the hash and the relevent space(s)
     let event_hashes = events
@@ -3321,7 +3373,9 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
     let mut registered: HashMap<Hash, delegation::DelegationRegistration> = HashMap::new();
     for (hash, event) in &event_hashes {
         if let Event::Delegation(d) = event {
-            let reg = delegation::process(db, d, encryption).await?;
+            let reg =
+                delegation::process_with(db, d, encryption, delegated_sql_caveats, named_keys)
+                    .await?;
             registered.insert(*hash, reg);
         }
     }
@@ -3649,6 +3703,7 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                             .collect(),
                         encryption,
                         auth_graph,
+                        delegated_sql_caveats,
                     )
                     .await?;
                 }
@@ -3684,6 +3739,7 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                             .collect(),
                         encryption,
                         auth_graph,
+                        delegated_sql_caveats,
                     )
                     .await?;
                 }
@@ -3739,14 +3795,29 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                     }
                 }
                 Event::Invocation(i, _ops) => {
-                    invocation::process(db, *i, Vec::new(), encryption, auth_graph).await?;
+                    invocation::process(
+                        db,
+                        *i,
+                        Vec::new(),
+                        encryption,
+                        auth_graph,
+                        delegated_sql_caveats,
+                    )
+                    .await?;
                 }
                 Event::InternalInvocation(i, _ops) => {
                     invocation::process_internal(db, *i, Vec::new(), encryption).await?;
                 }
                 Event::AdmittedInvocation(i, _ops) => {
-                    invocation::process_admitted(db, *i, Vec::new(), encryption, auth_graph)
-                        .await?;
+                    invocation::process_admitted(
+                        db,
+                        *i,
+                        Vec::new(),
+                        encryption,
+                        auth_graph,
+                        delegated_sql_caveats,
+                    )
+                    .await?;
                 }
                 Event::Revocation(r) => {
                     revocation::process(db, *r).await?;

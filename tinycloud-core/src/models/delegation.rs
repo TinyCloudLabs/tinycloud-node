@@ -1,5 +1,5 @@
 use crate::encryption::ColumnEncryption;
-use crate::encryption_network::NetworkId;
+use crate::encryption_network::key_id;
 use crate::hash::Hash;
 use crate::models::did_resolution::{verify_ucan_signature, UcanVerifyError};
 use crate::policy_capability::sql_caveat;
@@ -179,6 +179,18 @@ pub enum DelegationError {
     /// code from `sql-constrained-statement-caveat.md` containment.
     #[error("child-caveats-not-subset-of-parent: {0}")]
     CaveatsNotContained(String),
+    /// TC-1791: a SQL or DuckDB capability carries a caveat that is neither
+    /// empty nor a constrained-statements profile. Only those two forms are
+    /// accepted.
+    #[error("unsupported-caveat: {0}")]
+    UnsupportedCaveat(String),
+    /// Key deletion is never delegated. Code: `key-delete-not-delegable`.
+    #[error("key-delete-not-delegable")]
+    KeyDeleteNotDelegable,
+    /// Named-key resources (keys and key prefixes) are served only while the
+    /// node's named-keys setting is on.
+    #[error("named_keys_unavailable: named keys are not enabled on this node")]
+    NamedKeysUnavailable,
 }
 
 /// Verify, validate, and register a delegation inside the caller's transaction.
@@ -186,16 +198,30 @@ pub enum DelegationError {
 /// Returns `New` when the exact serialization was inserted (and actors,
 /// abilities, and parents written). Returns `Existing` when the hash was
 /// already present; no dependent rows are duplicated in that case.
+#[cfg(test)]
 pub(crate) async fn process<C: ConnectionTrait>(
     db: &C,
     delegation: &Delegation,
     encryption: Option<&ColumnEncryption>,
 ) -> Result<DelegationRegistration, Error> {
+    process_with(db, delegation, encryption, false, true).await
+}
+
+/// As `process`; with `delegated_sql_caveats` a SQL capability may carry the
+/// delegated `tables` / `columns` / `readOnly` caveat form (TC-1791). Without
+/// `named_keys` a capability on a key or key prefix is refused.
+pub(crate) async fn process_with<C: ConnectionTrait>(
+    db: &C,
+    delegation: &Delegation,
+    encryption: Option<&ColumnEncryption>,
+    delegated_sql_caveats: bool,
+    named_keys: bool,
+) -> Result<DelegationRegistration, Error> {
     verify(&delegation.0.delegation).await?;
     for space in delegation.0.spaces() {
         crate::request_telemetry::observe_space(space);
     }
-    validate(db, &delegation.0).await?;
+    validate_with(db, &delegation.0, delegated_sql_caveats, named_keys).await?;
     save(db, delegation.0.clone(), delegation.1.clone(), encryption).await
 }
 
@@ -231,11 +257,127 @@ async fn verify(delegation: &TinyCloudDelegation) -> Result<(), Error> {
     Ok(())
 }
 
+// TC-1791: refusal reason for a SQL or DuckDB capability whose caveats are
+// not accepted. SQL accepts empty caveats or, per entry, a
+// constrained-statements profile. DuckDB accepts empty caveats only.
+pub(crate) fn unsupported_sql_caveat(
+    ability: &str,
+    caveats: &crate::types::Caveats,
+) -> Option<String> {
+    if ability.starts_with("tinycloud.duckdb/") {
+        return caveats.0.keys().next().map(|key| {
+            format!("{ability} caveat {key} is not accepted; {ability} accepts empty caveats only")
+        });
+    }
+    if !ability.starts_with("tinycloud.sql/") {
+        return None;
+    }
+    caveats.0.iter().find_map(|(key, value)| {
+        let profile = match value.as_object() {
+            Some(map) if map.contains_key("constrained-statements") => {
+                if map.len() != 1 {
+                    return Some(format!(
+                        "{ability} caveat {key} has keys beside constrained-statements"
+                    ));
+                }
+                &map["constrained-statements"]
+            }
+            _ => value,
+        };
+        sql_caveat::parse(profile)
+            .err()
+            .map(|_| format!("{ability} caveat {key} is not a constrained-statements profile"))
+    })
+}
+
+/// Reason a SQL or DuckDB capability's caveats are refused at admission. With
+/// `delegated_sql_caveats` a SQL capability may also carry the delegated
+/// `tables` / `columns` / `readOnly` form; DuckDB takes empty caveats only.
+pub(crate) fn unsupported_sql_caveat_at_ingress(
+    ability: &str,
+    caveats: &crate::types::Caveats,
+    delegated_sql_caveats: bool,
+) -> Option<String> {
+    use crate::sql::delegated_caveats::{classify, Reading};
+    if delegated_sql_caveats && ability.starts_with("tinycloud.sql/") {
+        return classify(caveats, Reading::Ingress)
+            .err()
+            .map(|refusal| refusal.reason(ability));
+    }
+    unsupported_sql_caveat(ability, caveats)
+}
+
+/// As [`unsupported_sql_caveat`], for a row already stored. With
+/// `delegated_sql_caveats` the delegated form is read as well.
+pub(crate) fn unsupported_stored_sql_caveat(
+    ability: &str,
+    caveats: &crate::types::Caveats,
+    delegated_sql_caveats: bool,
+) -> Option<String> {
+    use crate::sql::delegated_caveats::{classify, Reading};
+    if delegated_sql_caveats && ability.starts_with("tinycloud.sql/") {
+        return classify(caveats, Reading::Stored)
+            .err()
+            .map(|refusal| refusal.reason(ability));
+    }
+    unsupported_sql_caveat(ability, caveats)
+}
+
+fn check_sql_caveats_supported(
+    cap: &util::Capability,
+    delegated_sql_caveats: bool,
+) -> Result<(), Error> {
+    match unsupported_sql_caveat_at_ingress(
+        cap.ability.as_ref().as_ref(),
+        &cap.caveats,
+        delegated_sql_caveats,
+    ) {
+        Some(reason) => Err(DelegationError::UnsupportedCaveat(reason).into()),
+        None => Ok(()),
+    }
+}
+
 // verify parenthood and authorization
+#[cfg(test)]
 async fn validate<C: ConnectionTrait>(
     db: &C,
     delegation: &util::DelegationInfo,
 ) -> Result<(), Error> {
+    validate_with(db, delegation, false, true).await
+}
+
+async fn validate_with<C: ConnectionTrait>(
+    db: &C,
+    delegation: &util::DelegationInfo,
+    delegated_sql_caveats: bool,
+    named_keys: bool,
+) -> Result<(), Error> {
+    // Without named keys, a capability on a key or key prefix is refused for
+    // every delegation, before the root-authority filter, so a delegation
+    // issued by the key's owner is covered too.
+    if !named_keys
+        && delegation
+            .capabilities
+            .iter()
+            .any(|cap| cap.resource.is_named_key())
+    {
+        return Err(DelegationError::NamedKeysUnavailable.into());
+    }
+    // TC-1791: SQL and DuckDB caveats are checked for every delegation,
+    // before the root-authority filter.
+    for cap in &delegation.capabilities {
+        check_sql_caveats_supported(cap, delegated_sql_caveats)?;
+    }
+    // Key deletion is never delegated, including by the key's owner.
+    if delegation.capabilities.iter().any(|cap| {
+        crate::policy_capability::ability_matches(
+            &cap.ability.to_string(),
+            "tinycloud.encryption/key.delete",
+        )
+    }) {
+        return Err(DelegationError::KeyDeleteNotDelegable.into());
+    }
+
     // get caps which rely on delegated caps
     let dependant_caps: Vec<_> = delegation
         .capabilities
@@ -464,7 +606,12 @@ async fn validate<C: ConnectionTrait>(
                 let mut last_reason: Option<String> = None;
                 let mut authorized = false;
                 for pc in candidates {
-                    match caveats_contain_child(&pc.caveats, &c.caveats) {
+                    match caveats_contain_child(
+                        c.ability.as_ref().as_ref(),
+                        &pc.caveats,
+                        &c.caveats,
+                        delegated_sql_caveats,
+                    ) {
                         Ok(()) => {
                             authorized = true;
                             break;
@@ -712,12 +859,49 @@ fn validate_policy_descendant(
 /// caveat (delegating to `sql_caveat::contains` for narrow/identical chain
 /// shapes) and otherwise requires structural equality so a child cannot
 /// silently drop or replace caveats the parent carried.
-fn caveats_contain_child(parent: &Caveats, child: &Caveats) -> Result<(), String> {
+fn caveats_contain_child(
+    ability: &str,
+    parent: &Caveats,
+    child: &Caveats,
+    delegated_sql_caveats: bool,
+) -> Result<(), String> {
     if let Some(contained) = crate::policy_capability::selector_caveats_contain(&parent.0, &child.0)
     {
         return contained
             .then_some(())
             .ok_or_else(|| "selector-caveat-not-contained".to_string());
+    }
+    // TC-1791: delegated tables / columns / readOnly caveats on SQL
+    // abilities. The parent decides which axes the child may not widen.
+    if delegated_sql_caveats && ability.starts_with("tinycloud.sql/") {
+        use crate::sql::delegated_caveats::{classify, AbilityCaveats, DelegatedCaveat, Reading};
+        match (
+            classify(parent, Reading::Stored),
+            classify(child, Reading::Stored),
+        ) {
+            (Ok(AbilityCaveats::Form(p)), Ok(AbilityCaveats::Form(c))) => {
+                return p.contains(&c).map_err(str::to_string);
+            }
+            (Ok(AbilityCaveats::Form(p)), Ok(AbilityCaveats::Unrestricted)) => {
+                return p
+                    .contains(&DelegatedCaveat::default())
+                    .map_err(str::to_string);
+            }
+            (Ok(AbilityCaveats::Form(_)), Ok(AbilityCaveats::Profile)) => {
+                return Err("sql-caveats-mixed".to_string());
+            }
+            // A parent of only empty entries imposes nothing, whatever shape
+            // the empty entries take.
+            (Ok(AbilityCaveats::Unrestricted), Ok(_)) if !parent.0.is_empty() => {
+                return caveats_contain_child(
+                    "",
+                    &Caveats::default(),
+                    child,
+                    delegated_sql_caveats,
+                );
+            }
+            _ => {}
+        }
     }
     let parent_sql = extract_sql_caveat(parent);
     let child_sql = extract_sql_caveat(child);
@@ -810,11 +994,7 @@ fn is_root_authority(cap: &util::Capability, delegator: &str) -> bool {
     }
 
     match &cap.resource {
-        Resource::Other(uri) => uri
-            .as_str()
-            .parse::<NetworkId>()
-            .map(|network_id| did_principal_matches(network_id.owner_did(), delegator))
-            .unwrap_or(false),
+        Resource::Other(uri) => key_id::owned_by(uri.as_str(), delegator),
         Resource::TinyCloud(_) => false,
     }
 }
@@ -1208,5 +1388,722 @@ mod tests {
             error,
             Error::InvalidDelegation(DelegationError::ParentRevoked(_))
         ));
+    }
+
+    /// TC-1791: an SQL grant with a caveat outside the
+    /// constrained-statements profile is refused.
+    #[tokio::test]
+    async fn sql_delegation_with_unsupported_caveat_key_is_refused() {
+        let db = database().await;
+        let info = root_delegation_info(
+            "tinycloud.sql/read",
+            "files/sql/main",
+            serde_json::json!({"tables": ["a"]}),
+        );
+        let result = validate(&db, &info).await;
+        assert!(
+            matches!(
+                result,
+                Err(Error::InvalidDelegation(
+                    DelegationError::UnsupportedCaveat(_)
+                ))
+            ),
+            "expected UnsupportedCaveat, got {result:?}"
+        );
+    }
+
+    fn assert_unsupported_caveat(result: Result<(), Error>) {
+        assert!(
+            matches!(
+                result,
+                Err(Error::InvalidDelegation(
+                    DelegationError::UnsupportedCaveat(_)
+                ))
+            ),
+            "expected UnsupportedCaveat, got {result:?}"
+        );
+    }
+
+    /// TC-1791: a constrained-statements entry mixed with other keys is refused.
+    #[tokio::test]
+    async fn sql_delegation_mixing_profile_with_other_keys_is_refused() {
+        let db = database().await;
+        let info = root_delegation_info(
+            "tinycloud.sql/read",
+            "files/sql/main",
+            serde_json::json!({
+                "constrained-statements": constrained_profile(),
+                "tables": ["a"]
+            }),
+        );
+        assert_unsupported_caveat(validate(&db, &info).await);
+    }
+
+    /// TC-1791: the SQL caveat rule applies to the wildcard SQL ability.
+    #[tokio::test]
+    async fn sql_wildcard_delegation_with_unsupported_caveat_is_refused() {
+        let db = database().await;
+        let info = root_delegation_info(
+            "tinycloud.sql/*",
+            "files/sql/main",
+            serde_json::json!({"tables": ["a"]}),
+        );
+        assert_unsupported_caveat(validate(&db, &info).await);
+    }
+
+    /// TC-1791: a caveat array of an empty object and a profile is refused,
+    /// because the empty object at index 0 is not a profile.
+    #[tokio::test]
+    async fn sql_delegation_with_empty_object_beside_profile_is_refused() {
+        let db = database().await;
+        let mut info = root_delegation_info(
+            "tinycloud.sql/read",
+            "files/sql/main",
+            serde_json::json!({}),
+        );
+        info.capabilities[0].caveats = crate::types::Caveats(std::collections::BTreeMap::from([
+            ("0".to_string(), serde_json::json!({})),
+            ("1".to_string(), constrained_profile()),
+        ]));
+        assert_unsupported_caveat(validate(&db, &info).await);
+    }
+
+    /// TC-1791: the SQL caveat rule applies to the admin SQL ability.
+    #[tokio::test]
+    async fn sql_admin_delegation_with_unsupported_caveat_is_refused() {
+        let db = database().await;
+        let info = root_delegation_info(
+            "tinycloud.sql/admin",
+            "files/sql/main",
+            serde_json::json!({"tables": ["a"]}),
+        );
+        assert_unsupported_caveat(validate(&db, &info).await);
+    }
+
+    /// TC-1791: a chained (non-owner) SQL delegation with an unsupported caveat
+    /// is refused before the parent check runs.
+    #[tokio::test]
+    async fn chained_sql_delegation_with_unsupported_caveat_is_refused() {
+        let db = database().await;
+        let mut info = root_delegation_info(
+            "tinycloud.sql/read",
+            "files/sql/main",
+            serde_json::json!({"tables": ["a"]}),
+        );
+        info.delegator = "did:key:z6MkchainedDelegatorNotOwner".to_string();
+        assert_unsupported_caveat(validate(&db, &info).await);
+    }
+
+    /// TC-1791: a chained SQL delegation with a supported profile reaches the
+    /// parent check and is rejected there for missing parents.
+    #[tokio::test]
+    async fn chained_sql_delegation_with_constrained_profile_reaches_parent_check() {
+        let db = database().await;
+        let mut info = root_delegation_info(
+            "tinycloud.sql/read",
+            "files/sql/main",
+            constrained_profile(),
+        );
+        info.delegator = "did:key:z6MkchainedDelegatorNotOwner".to_string();
+        assert!(matches!(
+            validate(&db, &info).await,
+            Err(Error::InvalidDelegation(DelegationError::MissingParents))
+        ));
+    }
+
+    /// TC-1791: DuckDB accepts empty caveats only, so a constrained-statements
+    /// profile is refused.
+    #[tokio::test]
+    async fn duckdb_delegation_with_constrained_profile_is_refused() {
+        let db = database().await;
+        let info = root_delegation_info(
+            "tinycloud.duckdb/read",
+            "files/duckdb/main",
+            constrained_profile(),
+        );
+        assert_unsupported_caveat(validate(&db, &info).await);
+    }
+
+    /// TC-1791: a DuckDB grant without caveats is accepted.
+    #[tokio::test]
+    async fn duckdb_delegation_without_caveats_is_accepted() {
+        let db = database().await;
+        let mut info = root_delegation_info(
+            "tinycloud.duckdb/write",
+            "files/duckdb/main",
+            constrained_profile(),
+        );
+        info.capabilities[0].caveats = crate::types::Caveats(std::collections::BTreeMap::new());
+        validate(&db, &info)
+            .await
+            .expect("a DuckDB grant without caveats is accepted");
+    }
+
+    /// TC-1791: a direct constrained-statements profile is a supported SQL caveat.
+    #[tokio::test]
+    async fn sql_delegation_with_constrained_profile_is_accepted() {
+        let db = database().await;
+        let info = root_delegation_info(
+            "tinycloud.sql/read",
+            "files/sql/main",
+            constrained_profile(),
+        );
+        validate(&db, &info)
+            .await
+            .expect("a constrained-statements profile is accepted");
+    }
+
+    /// TC-1791: a constrained-statements profile nested under its own key is accepted.
+    #[tokio::test]
+    async fn sql_delegation_with_nested_constrained_profile_is_accepted() {
+        let db = database().await;
+        let info = root_delegation_info(
+            "tinycloud.sql/read",
+            "files/sql/main",
+            serde_json::json!({"constrained-statements": constrained_profile()}),
+        );
+        validate(&db, &info)
+            .await
+            .expect("a nested constrained-statements profile is accepted");
+    }
+
+    /// TC-1791: an SQL grant without caveats is not affected by the profile rule.
+    #[tokio::test]
+    async fn sql_delegation_without_caveats_is_accepted() {
+        let db = database().await;
+        let mut info = root_delegation_info(
+            "tinycloud.sql/read",
+            "files/sql/main",
+            constrained_profile(),
+        );
+        info.capabilities[0].caveats = crate::types::Caveats(std::collections::BTreeMap::new());
+        validate(&db, &info)
+            .await
+            .expect("an SQL grant without caveats is accepted");
+    }
+
+    /// TC-1791: DuckDB gets the same refusal as SQL for non-profile caveats.
+    #[tokio::test]
+    async fn duckdb_delegation_with_unsupported_caveat_key_is_refused() {
+        let db = database().await;
+        let info = root_delegation_info(
+            "tinycloud.duckdb/write",
+            "files/duckdb/main",
+            serde_json::json!({"readOnly": true}),
+        );
+        let result = validate(&db, &info).await;
+        assert!(
+            matches!(
+                result,
+                Err(Error::InvalidDelegation(
+                    DelegationError::UnsupportedCaveat(_)
+                ))
+            ),
+            "expected UnsupportedCaveat, got {result:?}"
+        );
+    }
+
+    /// TC-1791: the profile rule is scoped to SQL and DuckDB abilities.
+    #[tokio::test]
+    async fn non_sql_delegation_caveats_are_not_checked_by_sql_rule() {
+        let db = database().await;
+        let info = root_delegation_info(
+            "tinycloud.kv/read",
+            "files/kv/main",
+            serde_json::json!({"tables": ["a"]}),
+        );
+        validate(&db, &info)
+            .await
+            .expect("only SQL and DuckDB caveats are checked by this rule");
+    }
+
+    fn constrained_profile() -> serde_json::Value {
+        serde_json::json!({
+            "mode": "constrained-statements",
+            "readOnly": true,
+            "statements": [{"name": "recent", "sql": "SELECT 1"}]
+        })
+    }
+
+    fn root_delegation_info(
+        ability: &str,
+        path: &str,
+        nb: serde_json::Value,
+    ) -> util::DelegationInfo {
+        use crate::test_support::did_resolution::signed_ucan;
+        use tinycloud_auth::ssi::jwk::{Algorithm, JWK};
+        let delegator = "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
+        let ucan = signed_ucan(
+            delegator,
+            &JWK::generate_ed25519().unwrap(),
+            Algorithm::EdDSA,
+        );
+        util::DelegationInfo {
+            capabilities: vec![util::Capability {
+                resource: format!("tinycloud:{}:{path}", delegator.trim_start_matches("did:"))
+                    .parse()
+                    .unwrap(),
+                ability: ability.to_string().try_into().unwrap(),
+                caveats: crate::types::Caveats(std::collections::BTreeMap::from([(
+                    "0".to_string(),
+                    nb,
+                )])),
+            }],
+            delegator: delegator.to_string(),
+            delegate: "did:key:z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH".to_string(),
+            parents: vec![],
+            delegation: tinycloud_auth::authorization::TinyCloudDelegation::Ucan(Box::new(ucan)),
+            expiry: None,
+            not_before: None,
+            issued_at: None,
+            delegation_mode: util::DelegationMode::Attenuable,
+        }
+    }
+
+    const KEY_OWNER: &str = "did:pkh:eip155:1:0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed";
+    const KEY_RESOURCE: &str = "urn:tinycloud:encryption:did:pkh:eip155:1:0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed:default/apps/tinychat";
+    const OTHER_DID: &str = "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
+
+    fn key_delegation_info(delegator: &str, ability: &str) -> util::DelegationInfo {
+        use crate::test_support::did_resolution::signed_ucan;
+        use tinycloud_auth::ssi::jwk::{Algorithm, JWK};
+        let ucan = signed_ucan(
+            OTHER_DID,
+            &JWK::generate_ed25519().unwrap(),
+            Algorithm::EdDSA,
+        );
+        util::DelegationInfo {
+            capabilities: vec![util::Capability {
+                resource: KEY_RESOURCE.parse().unwrap(),
+                ability: ability.to_string().try_into().unwrap(),
+                caveats: crate::types::Caveats::default(),
+            }],
+            delegator: delegator.to_string(),
+            delegate: OTHER_DID.to_string(),
+            parents: vec![],
+            delegation: tinycloud_auth::authorization::TinyCloudDelegation::Ucan(Box::new(ucan)),
+            expiry: None,
+            not_before: None,
+            issued_at: None,
+            delegation_mode: util::DelegationMode::Attenuable,
+        }
+    }
+
+    /// The key owner is root authority for keys under its own namespace.
+    #[tokio::test]
+    async fn owner_issued_key_grant_is_admitted_without_parents() {
+        let db = database().await;
+        let info = key_delegation_info(KEY_OWNER, "tinycloud.encryption/key.create");
+        validate(&db, &info)
+            .await
+            .expect("owner is root authority for own keys");
+    }
+
+    /// A delegator that does not own the key must cite parents.
+    #[tokio::test]
+    async fn non_owner_key_grant_without_parents_is_refused() {
+        let db = database().await;
+        let info = key_delegation_info(OTHER_DID, "tinycloud.encryption/key.create");
+        assert!(matches!(
+            validate(&db, &info).await,
+            Err(Error::InvalidDelegation(DelegationError::MissingParents))
+        ));
+    }
+
+    /// Without named keys, a grant on a key or a key prefix is refused for
+    /// the key's owner and for anyone else, before any parent is looked up;
+    /// a grant on the bare network is not affected.
+    #[tokio::test]
+    async fn named_key_grants_are_refused_when_named_keys_are_off() {
+        let db = database().await;
+        let key = KEY_RESOURCE.to_string();
+        let prefix = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/");
+        let network = format!("urn:tinycloud:encryption:{KEY_OWNER}:default");
+        for delegator in [KEY_OWNER, OTHER_DID] {
+            for resource in [&key, &prefix] {
+                let info = key_grant_info(delegator, resource, KEY_DECRYPT, &[]);
+                let refused = validate_with(&db, &info, false, false).await;
+                assert!(
+                    matches!(
+                        refused,
+                        Err(Error::InvalidDelegation(
+                            DelegationError::NamedKeysUnavailable
+                        ))
+                    ),
+                    "{delegator} on {resource}: {refused:?}"
+                );
+            }
+        }
+        assert_eq!(
+            DelegationError::NamedKeysUnavailable.to_string(),
+            "named_keys_unavailable: named keys are not enabled on this node"
+        );
+        let info = key_grant_info(KEY_OWNER, &network, KEY_DECRYPT, &[]);
+        validate_with(&db, &info, false, false)
+            .await
+            .expect("the owner's bare network grant is not a named-key grant");
+        let info = key_grant_info(KEY_OWNER, &key, KEY_DECRYPT, &[]);
+        validate_with(&db, &info, false, true)
+            .await
+            .expect("the same grant is admitted with named keys on");
+    }
+
+    /// key.delete is refused even when the owner issues it.
+    #[tokio::test]
+    async fn owner_issued_key_delete_is_refused() {
+        let db = database().await;
+        let info = key_delegation_info(KEY_OWNER, "tinycloud.encryption/key.delete");
+        assert!(matches!(
+            validate(&db, &info).await,
+            Err(Error::InvalidDelegation(
+                DelegationError::KeyDeleteNotDelegable
+            ))
+        ));
+    }
+
+    /// key.delete refusal runs before the parent check, so a non-owner
+    /// delete without parents reports the delete refusal.
+    #[tokio::test]
+    async fn non_owner_key_delete_is_refused_before_parent_check() {
+        let db = database().await;
+        let info = key_delegation_info(OTHER_DID, "tinycloud.encryption/key.delete");
+        assert!(matches!(
+            validate(&db, &info).await,
+            Err(Error::InvalidDelegation(
+                DelegationError::KeyDeleteNotDelegable
+            ))
+        ));
+    }
+
+    /// key.delete is refused for the owner even when a parent is cited. The
+    /// refusal runs before the root-authority filter and the parent branches.
+    #[tokio::test]
+    async fn owner_issued_key_delete_with_parent_is_refused() {
+        let db = database().await;
+        let parent = crate::hash::hash(b"owner-delete-with-parent");
+        let prefix = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/");
+        insert_parent_grant(&db, parent, KEY_OWNER, OTHER_DID, &prefix, KEY_DECRYPT).await;
+        let info = key_grant_info(
+            KEY_OWNER,
+            KEY_RESOURCE,
+            "tinycloud.encryption/key.delete",
+            &[parent],
+        );
+        assert!(matches!(
+            validate(&db, &info).await,
+            Err(Error::InvalidDelegation(
+                DelegationError::KeyDeleteNotDelegable
+            ))
+        ));
+    }
+
+    fn key_grant_info(
+        delegator: &str,
+        resource: &str,
+        ability: &str,
+        parents: &[Hash],
+    ) -> util::DelegationInfo {
+        use crate::test_support::did_resolution::signed_ucan;
+        use tinycloud_auth::ssi::jwk::{Algorithm, JWK};
+        let ucan = signed_ucan(
+            OTHER_DID,
+            &JWK::generate_ed25519().unwrap(),
+            Algorithm::EdDSA,
+        );
+        util::DelegationInfo {
+            capabilities: vec![util::Capability {
+                resource: resource.parse().unwrap(),
+                ability: ability.to_string().try_into().unwrap(),
+                caveats: crate::types::Caveats::default(),
+            }],
+            delegator: delegator.to_string(),
+            delegate: OTHER_DID.to_string(),
+            parents: parents.iter().map(|parent| parent.to_cid(0x55)).collect(),
+            delegation: tinycloud_auth::authorization::TinyCloudDelegation::Ucan(Box::new(ucan)),
+            expiry: None,
+            not_before: None,
+            issued_at: None,
+            delegation_mode: util::DelegationMode::Attenuable,
+        }
+    }
+
+    /// Inserts a grant (delegation row plus ability row) that a child can cite.
+    async fn insert_parent_grant(
+        db: &sea_orm::DbConn,
+        id: Hash,
+        delegator: &str,
+        delegatee: &str,
+        resource: &str,
+        ability: &str,
+    ) {
+        insert_delegation(db, id, delegator, delegatee).await;
+        abilities::Entity::insert(abilities::ActiveModel {
+            delegation: Set(id),
+            resource: Set(resource.parse().unwrap()),
+            ability: Set(ability.to_string().try_into().unwrap()),
+            caveats: Set(Default::default()),
+        })
+        .exec(db)
+        .await
+        .unwrap();
+    }
+
+    const KEY_DECRYPT: &str = "tinycloud.encryption/decrypt";
+
+    /// A prefix grant cited as a parent covers a key below it.
+    #[tokio::test]
+    async fn key_prefix_grant_covers_key_below_it_through_parent() {
+        let db = database().await;
+        let parent = crate::hash::hash(b"prefix-grant-covers-key");
+        let prefix = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/foo/");
+        insert_parent_grant(&db, parent, KEY_OWNER, OTHER_DID, &prefix, KEY_DECRYPT).await;
+        let key = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/foo/x");
+        let info = key_grant_info(OTHER_DID, &key, KEY_DECRYPT, &[parent]);
+        validate(&db, &info)
+            .await
+            .expect("parent prefix covers key below it");
+    }
+
+    /// A child prefix wider than the parent's prefix is not covered.
+    #[tokio::test]
+    async fn broader_child_prefix_is_not_covered_by_parent() {
+        let db = database().await;
+        let parent = crate::hash::hash(b"prefix-grant-narrow");
+        let prefix = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/foo/");
+        insert_parent_grant(&db, parent, KEY_OWNER, OTHER_DID, &prefix, KEY_DECRYPT).await;
+        let child = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/");
+        let info = key_grant_info(OTHER_DID, &child, KEY_DECRYPT, &[parent]);
+        assert!(matches!(
+            validate(&db, &info).await,
+            Err(Error::InvalidDelegation(
+                DelegationError::UnauthorizedCapability(_, _)
+            ))
+        ));
+    }
+
+    /// A parent issued in another owner's namespace does not cover this owner's key.
+    #[tokio::test]
+    async fn parent_for_other_owner_does_not_cover_key() {
+        const OTHER_OWNER: &str = "did:pkh:eip155:1:0x0000000000000000000000000000000000000001";
+        let db = database().await;
+        let parent = crate::hash::hash(b"prefix-grant-other-owner");
+        let prefix = format!("urn:tinycloud:encryption:{OTHER_OWNER}:default/apps/foo/");
+        insert_parent_grant(&db, parent, OTHER_OWNER, OTHER_DID, &prefix, KEY_DECRYPT).await;
+        let key = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/foo/x");
+        let info = key_grant_info(OTHER_DID, &key, KEY_DECRYPT, &[parent]);
+        assert!(matches!(
+            validate(&db, &info).await,
+            Err(Error::InvalidDelegation(
+                DelegationError::UnauthorizedCapability(_, _)
+            ))
+        ));
+    }
+
+    /// key.delete is refused in a chain even when a parent grants the key's prefix.
+    #[tokio::test]
+    async fn chained_key_delete_is_refused_with_parent_cited() {
+        let db = database().await;
+        let parent = crate::hash::hash(b"prefix-grant-for-chained-delete");
+        let prefix = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/");
+        insert_parent_grant(&db, parent, KEY_OWNER, OTHER_DID, &prefix, KEY_DECRYPT).await;
+        let info = key_grant_info(
+            OTHER_DID,
+            KEY_RESOURCE,
+            "tinycloud.encryption/key.delete",
+            &[parent],
+        );
+        assert!(matches!(
+            validate(&db, &info).await,
+            Err(Error::InvalidDelegation(
+                DelegationError::KeyDeleteNotDelegable
+            ))
+        ));
+    }
+
+    /// Malformed key identifiers are not root authority, even for the owner,
+    /// and a valid parent prefix does not cover them.
+    #[tokio::test]
+    async fn malformed_key_identifiers_are_refused_in_delegations() {
+        let db = database().await;
+        let prefix = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/");
+        let mut skipped = 0;
+        for (index, resource) in key_id::MALFORMED_KEY_IDS.iter().enumerate() {
+            // Ids that fail URI parsing cannot be built into a capability, so there is nothing to admit or refuse.
+            if resource.parse::<crate::types::Resource>().is_err() {
+                skipped += 1;
+                continue;
+            }
+            let owner_info =
+                key_grant_info(KEY_OWNER, resource, "tinycloud.encryption/key.create", &[]);
+            assert!(
+                matches!(
+                    validate(&db, &owner_info).await,
+                    Err(Error::InvalidDelegation(DelegationError::MissingParents))
+                ),
+                "owner-issued malformed key {} accepted: {resource}",
+                index + 7
+            );
+            let parent = crate::hash::hash(resource.as_bytes());
+            insert_parent_grant(&db, parent, KEY_OWNER, OTHER_DID, &prefix, KEY_DECRYPT).await;
+            let info = key_grant_info(OTHER_DID, resource, KEY_DECRYPT, &[parent]);
+            assert!(
+                matches!(
+                    validate(&db, &info).await,
+                    Err(Error::InvalidDelegation(
+                        DelegationError::UnauthorizedCapability(_, _)
+                    ))
+                ),
+                "parent covered malformed key {}: {resource}",
+                index + 7
+            );
+        }
+        assert_eq!(
+            skipped, 2,
+            "URI-invalid key identifiers in MALFORMED_KEY_IDS"
+        );
+    }
+
+    /// Inserts a terminal grant (`disableSubDelegation: true`) that a child may cite.
+    async fn insert_terminal_parent_grant(
+        db: &sea_orm::DbConn,
+        id: Hash,
+        delegator: &str,
+        delegatee: &str,
+        resource: &str,
+        ability: &str,
+    ) {
+        for actor_id in [delegator, delegatee] {
+            actor::ActiveModel {
+                id: Set(actor_id.to_string()),
+            }
+            .insert(db)
+            .await
+            .ok();
+        }
+        ActiveModel {
+            id: Set(id),
+            delegator: Set(delegator.to_string()),
+            delegatee: Set(delegatee.to_string()),
+            expiry: Set(None),
+            issued_at: Set(None),
+            not_before: Set(None),
+            facts: Set(Some(Facts(BTreeMap::from([(
+                DelegationMode::FACT_KEY.to_string(),
+                serde_json::json!("terminal"),
+            )])))),
+            serialization: Set(id.as_ref().to_vec()),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        abilities::Entity::insert(abilities::ActiveModel {
+            delegation: Set(id),
+            resource: Set(resource.parse().unwrap()),
+            ability: Set(ability.to_string().try_into().unwrap()),
+            caveats: Set(Default::default()),
+        })
+        .exec(db)
+        .await
+        .unwrap();
+    }
+
+    /// A terminal grant cannot be cited as a parent for a redelegation, even when it covers the child's resource.
+    #[tokio::test]
+    async fn terminal_parent_grant_cannot_be_redelegated() {
+        let db = database().await;
+        let parent = crate::hash::hash(b"terminal-parent-grant");
+        let prefix = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/foo/");
+        insert_terminal_parent_grant(&db, parent, KEY_OWNER, OTHER_DID, &prefix, KEY_DECRYPT).await;
+        let key = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/foo/x");
+        let info = key_grant_info(OTHER_DID, &key, KEY_DECRYPT, &[parent]);
+        assert!(
+            matches!(
+                validate(&db, &info).await,
+                Err(Error::InvalidDelegation(
+                    DelegationError::TerminalParentCannotRedelegate
+                ))
+            ),
+            "terminal parent accepted for redelegation"
+        );
+    }
+
+    fn wire(list: serde_json::Value) -> Caveats {
+        let entries = list.as_array().expect("a list");
+        if entries.len() == 1 && entries[0] == serde_json::json!({}) {
+            return Caveats::default();
+        }
+        Caveats(
+            entries
+                .iter()
+                .enumerate()
+                .map(|(index, entry)| (index.to_string(), entry.clone()))
+                .collect(),
+        )
+    }
+
+    /// TC-1791: the per-hop containment of the delegated form goes through the
+    /// same `caveats_contain_child` as every other caveat (S1 to S8).
+    #[test]
+    fn delegated_form_hops_are_contained_per_axis() {
+        use serde_json::json;
+        const SQL: &str = "tinycloud.sql/read";
+        let ok = |parent: serde_json::Value, child: serde_json::Value| {
+            caveats_contain_child(SQL, &wire(parent), &wire(child), true)
+        };
+        assert!(ok(
+            json!([{"tables": ["Notes", "t2"]}]),
+            json!([{"tables": ["Notes"]}])
+        )
+        .is_ok()); // S1
+        assert!(ok(
+            json!([{"tables": ["Notes"]}]),
+            json!([{"tables": ["Notes", "plain"]}])
+        )
+        .is_err()); // S2
+        assert!(ok(json!([{}]), json!([{"tables": ["Notes"]}])).is_ok()); // S3
+        assert!(ok(json!([{"readOnly": true}]), json!([{"readOnly": false}])).is_err()); // S4
+        assert!(ok(json!([{"readOnly": true}]), json!([{}])).is_err()); // S4
+        assert!(ok(json!([{}]), json!([{"readOnly": true}])).is_ok()); // S4
+        assert!(ok(
+            json!([{"columns": ["id"]}]),
+            json!([{"columns": ["id", "body"]}])
+        )
+        .is_err()); // S5
+        assert!(ok(json!([{"columns": ["id"]}]), json!([{"columns": ["id"]}])).is_ok()); // S5
+        assert!(ok(
+            json!([{"tables": ["notes"]}]),
+            json!([{"tables": ["NOTES"]}])
+        )
+        .is_ok()); // S6
+        assert!(ok(json!([{}]), json!([{}])).is_ok()); // S7
+        assert!(ok(json!([{"tables": ["a"]}]), json!([{}])).is_err()); // S7
+        assert!(ok(json!([{"tables": ["Notes"]}]), json!([{"readOnly": true}])).is_err()); // S8
+                                                                                           // A parent of only empty entries imposes nothing, in any shape.
+        assert!(ok(json!([{}, {}]), json!([{"tables": ["a"]}])).is_ok());
+        assert!(ok(json!([{}, {}]), json!([{}])).is_ok());
+        assert!(ok(json!([{}, {}]), json!([{}, {}])).is_ok());
+        // A profile and the delegated form do not mix across a hop.
+        let profile = json!({"mode": "constrained-statements", "readOnly": true,
+                             "statements": [{"name": "n", "sql": "SELECT 1"}]});
+        assert!(ok(json!([{"tables": ["a"]}]), json!([profile.clone()])).is_err());
+        assert!(ok(json!([profile]), json!([{"tables": ["a"]}])).is_err());
+        // Other services: equal caveats, or an empty parent.
+        let kv = |parent: serde_json::Value, child: serde_json::Value| {
+            caveats_contain_child("tinycloud.kv/get", &wire(parent), &wire(child), true)
+        };
+        assert!(kv(json!([{}, {}]), json!([{"tables": ["a"]}])).is_err());
+        assert!(kv(json!([{}]), json!([{"tables": ["a"]}])).is_ok());
+
+        // Setting off: SQL caveats are contained as every other caveat is
+        // (equal caveats, or an empty parent).
+        let off = |parent: serde_json::Value, child: serde_json::Value| {
+            caveats_contain_child(SQL, &wire(parent), &wire(child), false)
+        };
+        assert!(off(json!([{}, {}]), json!([{"tables": ["a"]}])).is_err());
+        assert!(off(json!([{}, {}]), json!([{}])).is_err());
+        assert!(off(json!([{}]), json!([{"tables": ["a"]}])).is_ok());
+        assert!(off(json!([{"tables": ["a"]}]), json!([{"tables": ["a"]}])).is_ok());
+        assert!(off(json!([{"tables": ["a"]}]), json!([{"tables": ["A"]}])).is_err());
+        assert!(off(json!([{"tables": ["a"]}]), json!([{}])).is_err());
     }
 }
