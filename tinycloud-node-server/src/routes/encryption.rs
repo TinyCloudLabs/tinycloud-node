@@ -353,26 +353,34 @@ fn key_location(
     Ok((network, location))
 }
 
-/// Raw key path: the request path after `/networks/<network_id>/keys/`. Decoded
-/// segments drop empty and dot segments, so the key path is taken from the raw
-/// request path and checked against the key grammar as received. Percent-escapes
-/// are refused outright.
+/// Raw key path: the request path after `/networks/<network_id>/keys/`. Rocket's
+/// decoded segments drop empty segments (and a `PathBuf` conversion would
+/// normalize dot segments), so the key path is taken from the raw request path
+/// and checked against the key grammar as received. Rocket
+/// decodes the `<network_id>` parameter, so a percent-escape in the network id
+/// breaks the raw prefix match; the detail then names the escape. Percent-escapes
+/// in the key path are refused outright.
 fn raw_key_path(origin: &Origin<'_>, network_id: &str) -> Result<String, (Status, String)> {
-    let raw = origin
-        .path()
-        .as_str()
-        .strip_prefix(&format!("/encryption/networks/{network_id}/keys/"))
-        .ok_or_else(|| {
+    let path = origin.path().as_str();
+    let Some(raw) = path.strip_prefix(&format!("/encryption/networks/{network_id}/keys/")) else {
+        return Err(if path.contains('%') {
+            percent_refused()
+        } else {
             map_service_err(EncryptionServiceError::KeyPathInvalid(
                 "key path is not present in the request".to_string(),
             ))
-        })?;
+        });
+    };
     if raw.contains('%') {
-        return Err(map_service_err(EncryptionServiceError::KeyPathInvalid(
-            "percent-encoding is not accepted in key paths".to_string(),
-        )));
+        return Err(percent_refused());
     }
     Ok(raw.to_string())
+}
+
+fn percent_refused() -> (Status, String) {
+    map_service_err(EncryptionServiceError::KeyPathInvalid(
+        "percent-encoding is not accepted in key route URLs (send the network id and key path unencoded)".to_string(),
+    ))
 }
 
 #[post(
