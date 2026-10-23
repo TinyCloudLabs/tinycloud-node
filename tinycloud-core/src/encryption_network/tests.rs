@@ -1227,12 +1227,12 @@ fn key_facts(
         target_node: NODE_DID.to_string(),
         network_id: net.clone(),
         body_hash: canonical_hash(body_value),
-        encrypted_symmetric_key_hash: canonical_hash(&Value::String(STANDARD.encode(
-            &ctx.wrapped_key,
-        ))),
-        receiver_public_key_hash: canonical_hash(&Value::String(STANDARD.encode(
-            &ctx.receiver_pub,
-        ))),
+        encrypted_symmetric_key_hash: canonical_hash(&Value::String(
+            STANDARD.encode(&ctx.wrapped_key),
+        )),
+        receiver_public_key_hash: canonical_hash(&Value::String(
+            STANDARD.encode(&ctx.receiver_pub),
+        )),
         key_path: Some(path.to_string()),
         alg: ALG_X25519_AES256GCM.to_string(),
         key_version,
@@ -1268,7 +1268,10 @@ async fn key_decrypt_round_trip_returns_rewrapped_key() {
     let rewrapped = STANDARD
         .decode(&verified.response.wrapped_key)
         .expect("base64 wrapped key");
-    assert_eq!(unwrap_with_secret(&ctx.receiver_secret, &rewrapped), ctx.symmetric);
+    assert_eq!(
+        unwrap_with_secret(&ctx.receiver_secret, &rewrapped),
+        ctx.symmetric
+    );
 }
 
 #[tokio::test]

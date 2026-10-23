@@ -20,6 +20,8 @@ use super::types::ALG_X25519_AES256GCM;
 pub enum KeyBackendError {
     #[error("private key material unavailable")]
     SealedKeyMissing,
+    #[error("network private key could not be unsealed")]
+    SealedKeyUnreadable,
     #[error("invalid sealed key length")]
     InvalidSealedKey,
     #[error("invalid public key length")]
@@ -193,7 +195,9 @@ impl KeyBackend for LocalOneOfOneBackend {
         sealed_private_key: &[u8],
         wrapped_key: &[u8],
     ) -> Result<Vec<u8>, KeyBackendError> {
-        let secret = self.open_network_secret(sealed_private_key)?;
+        let secret = self
+            .open_network_secret(sealed_private_key)
+            .map_err(|_| KeyBackendError::SealedKeyUnreadable)?;
         unwrap_with_secret(&secret, wrapped_key)
     }
 

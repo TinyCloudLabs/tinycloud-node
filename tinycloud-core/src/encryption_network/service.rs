@@ -65,7 +65,10 @@ fn network_id_matches(actual: &str, expected: &NetworkId) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecryptTarget {
     Root(NetworkId),
-    Key { network: NetworkId, loc: KeyLocation },
+    Key {
+        network: NetworkId,
+        loc: KeyLocation,
+    },
 }
 
 impl DecryptTarget {
@@ -857,13 +860,14 @@ impl EncryptionService {
         let body: DecryptRequestBody = serde_json::from_value(body_value.clone())
             .map_err(|e| EncryptionServiceError::InvalidBody(e.to_string()))?;
         let facts = native_decrypt_facts(invocation)?;
-        if body.ty != DECRYPT_REQUEST_TYPE
-            || facts.ty != DECRYPT_REQUEST_TYPE
-            || invocation.invocation.payload().audience != self.node_did.as_str()
-            || facts.target_node != self.node_did
-            || body.target_node != self.node_did
-        {
+        if body.ty != DECRYPT_REQUEST_TYPE || facts.ty != DECRYPT_REQUEST_TYPE {
             return Err(EncryptionServiceError::WrongInvocationType);
+        }
+        if invocation.invocation.payload().audience != self.node_did.as_str() {
+            return Err(EncryptionServiceError::AudienceMismatch);
+        }
+        if facts.target_node != self.node_did || body.target_node != self.node_did {
+            return Err(EncryptionServiceError::TargetNodeMismatch);
         }
         if &facts.network_id != network_id || &body.network_id != network_id {
             return Err(EncryptionServiceError::NetworkMismatch);
@@ -1007,16 +1011,23 @@ impl EncryptionService {
                     .one(&self.db)
                     .await?
                     .ok_or(EncryptionServiceError::NetworkNotFound)?;
-                let sealed_private_key =
-                    network_row
-                        .sealed_private_key
-                        .as_deref()
-                        .ok_or(EncryptionServiceError::Backend(
-                            KeyBackendError::SealedKeyMissing,
-                        ))?;
+                let sealed_private_key = network_row.sealed_private_key.as_deref().ok_or(
+                    EncryptionServiceError::Backend(KeyBackendError::SealedKeyMissing),
+                )?;
                 let symmetric = self
                     .backend
-                    .unwrap(sealed_private_key, &wrapped_key_bytes)?;
+                    .unwrap(sealed_private_key, &wrapped_key_bytes)
+                    .map_err(|err| {
+                        if matches!(
+                            err,
+                            KeyBackendError::SealedKeyMissing
+                                | KeyBackendError::SealedKeyUnreadable
+                        ) {
+                            EncryptionServiceError::Backend(err)
+                        } else {
+                            EncryptionServiceError::KeyUnwrapFailed(err)
+                        }
+                    })?;
                 (descriptor.key_version, symmetric)
             }
             DecryptTarget::Key { loc, .. } => {
