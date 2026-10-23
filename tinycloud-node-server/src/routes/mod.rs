@@ -1797,7 +1797,7 @@ async fn invoke_impl(
             let target =
                 tinycloud_core::encryption_network::DecryptTarget::from_resource(&resource)
                     .map_err(|error| (Status::Forbidden, error.to_string()))?;
-            let body = read_json_body(data).await?;
+            let body = read_json_body(data, "request_too_large").await?;
             let body = serde_json::from_str(&body)
                 .map_err(|error| (Status::BadRequest, error.to_string()))?;
             tinycloud
@@ -2516,12 +2516,13 @@ async fn emit_kv_hook_events(
 }
 
 /// Read the request body as a JSON string.
-async fn read_json_body(data: DataIn<'_>) -> Result<String, (Status, String)> {
-    read_json_body_limited(data, 1_048_576).await
+async fn read_json_body(data: DataIn<'_>, code: &'static str) -> Result<String, (Status, String)> {
+    read_json_body_limited(data, 1_048_576, code).await
 }
 async fn read_json_body_limited(
     data: DataIn<'_>,
     limit: usize,
+    code: &'static str,
 ) -> Result<String, (Status, String)> {
     let start = Instant::now();
     match data {
@@ -2535,7 +2536,9 @@ async fn read_json_body_limited(
             if buf.len() > limit {
                 return Err((
                     Status::PayloadTooLarge,
-                    "JSON body exceeds complete envelope limit".into(),
+                    format!(
+                        "{code}: JSON body exceeds complete envelope limit (limit {limit} bytes)"
+                    ),
                 ));
             }
             let result = String::from_utf8(buf).map_err(|e| (Status::BadRequest, e.to_string()));
@@ -2662,8 +2665,12 @@ async fn handle_sql_invoke(
     let auth_result = verify_auth_admitted("server.sql.auth", admitted, tinycloud).await?;
     let constrained = resolve_sql_profile(own_profiles, tinycloud, &parent_cids).await?;
     let body_start = Instant::now();
-    let body_result =
-        read_json_body_limited(data, tinycloud_core::sql::publication::ENVELOPE_LIMIT).await;
+    let body_result = read_json_body_limited(
+        data,
+        tinycloud_core::sql::publication::ENVELOPE_LIMIT,
+        "sql_request_too_large",
+    )
+    .await;
     crate::prometheus::observe_span(
         "server.sql.read_body",
         if body_result.is_ok() { "ok" } else { "error" },
@@ -3267,7 +3274,7 @@ pub(crate) fn sql_error_to_status(err: &SqlError) -> Status {
         SqlError::Sqlite(_) => Status::BadRequest,
         SqlError::PermissionDenied(_) => Status::Forbidden,
         SqlError::DatabaseNotFound => Status::NotFound,
-        SqlError::ResponseTooLarge(_) => Status::new(413),
+        SqlError::ResponseTooLarge(..) | SqlError::RowLimitExceeded(_) => Status::new(413),
         SqlError::QuotaExceeded => Status::new(429),
         SqlError::StorageWouldGrow => Status::new(402),
         SqlError::InvalidStatement(_) => Status::BadRequest,
@@ -3577,7 +3584,7 @@ async fn handle_duckdb_invoke(
     }
 
     let body_start = Instant::now();
-    let body_result = read_json_body(data).await;
+    let body_result = read_json_body(data, "duckdb_request_too_large").await;
     crate::prometheus::observe_span(
         "server.duckdb.read_body",
         if body_result.is_ok() { "ok" } else { "error" },
@@ -3709,7 +3716,7 @@ fn duckdb_error_to_status(err: &DuckDbError) -> Status {
         DuckDbError::PermissionDenied(_) => Status::Forbidden,
         DuckDbError::ReadOnlyViolation => Status::Forbidden,
         DuckDbError::DatabaseNotFound => Status::NotFound,
-        DuckDbError::ResponseTooLarge(_) => Status::new(413),
+        DuckDbError::ResponseTooLarge(..) => Status::new(413),
         DuckDbError::QuotaExceeded => Status::new(429),
         DuckDbError::StorageWouldGrow => Status::new(402),
         DuckDbError::IngestError(_) => Status::InternalServerError,
@@ -4411,6 +4418,34 @@ mod tests {
             .starts_with(&format!("{SQL_BUSY}: hydration:")));
         // The SQL service's own timeout answer is the route's, word for word.
         assert_eq!(SqlError::RequestTimeout.to_string(), REQUEST_TIMEOUT_BODY);
+    }
+
+    #[test]
+    fn sql_size_refusals_are_413_with_stable_codes() {
+        let row_limit = SqlError::RowLimitExceeded(1);
+        assert_eq!(sql_error_to_status(&row_limit), Status::new(413));
+        assert_eq!(
+            row_limit.to_string(),
+            "sql_response_too_large: Response too large: row limit exceeded (limit 1 rows)"
+        );
+
+        let byte_cap = SqlError::ResponseTooLarge(60, 50);
+        assert_eq!(sql_error_to_status(&byte_cap), Status::new(413));
+        assert_eq!(
+            byte_cap.to_string(),
+            "sql_response_too_large: Response too large: 60 bytes (limit 50 bytes)"
+        );
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn duckdb_response_refusal_is_413_with_stable_code() {
+        let error = DuckDbError::ResponseTooLarge(60, 50);
+        assert_eq!(duckdb_error_to_status(&error), Status::new(413));
+        assert_eq!(
+            error.to_string(),
+            "duckdb_response_too_large: Response too large: 60 bytes (limit 50 bytes)"
+        );
     }
 
     /// TC-1274: an `/invoke` that has not begun a write is answered
@@ -8840,6 +8875,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sql_request_body_over_envelope_limit_returns_413_with_code() -> Result<()> {
+        use rocket::data::ByteUnit;
+        use rocket::http::{ContentType, Header, Status};
+        use rocket::local::asynchronous::Client;
+
+        let setup = metered_sql_http_setup("sql-request-413").await?;
+        let auth_header = sql_invocation_header(
+            &setup,
+            "tinycloud.sql/read",
+            "urn:uuid:00000000-0000-4000-8000-0000000000t3",
+        )?;
+
+        let limit = tinycloud_core::sql::publication::ENVELOPE_LIMIT;
+        let client = Client::tracked(metered_sql_rocket(setup, ByteUnit::Byte(1))).await?;
+        let response = client
+            .post("/invoke")
+            .header(Header::new("Authorization", auth_header))
+            .header(ContentType::JSON)
+            .body("x".repeat(limit + 1))
+            .dispatch()
+            .await;
+
+        let status = response.status();
+        let text = response.into_string().await.unwrap_or_default();
+        assert_eq!(status, Status::PayloadTooLarge, "{text}");
+        assert!(text.starts_with("sql_request_too_large: "), "{text}");
+        assert!(text.contains("limit 2097152 bytes"), "{text}");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn sql_write_under_limit_returns_200() -> Result<()> {
         use rocket::data::ByteUnit;
         use rocket::http::{ContentType, Header, Status};
@@ -13062,6 +13128,34 @@ mod tests {
             "expected one-database-proof rejection, got {}",
             reply.body
         );
+        Ok(())
+    }
+
+    // An oversized DuckDB request body is refused at the route with the
+    // stable `duckdb_request_too_large` code, before the request is parsed.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn duckdb_request_body_over_limit_returns_413_with_code() -> Result<()> {
+        use rocket::http::Status;
+
+        let f = KvSyncFixture::new().await?;
+        let uri = f
+            .resource_in(&f.space, "duckdb", "appA/connectors")?
+            .to_string();
+        let oversized = "x".repeat(1_048_576);
+        let reply = f
+            .invoke_json(
+                f.owner_invocation(&[(uri, "tinycloud.duckdb/read")])?,
+                &tc825_duck_query(&format!("SELECT '{oversized}'")),
+            )
+            .await?;
+        assert_eq!(reply.status, Status::PayloadTooLarge, "{}", reply.body);
+        assert!(
+            reply.body.starts_with("duckdb_request_too_large: "),
+            "{}",
+            reply.body
+        );
+        assert!(reply.body.contains("limit 1048576 bytes"), "{}", reply.body);
         Ok(())
     }
 
