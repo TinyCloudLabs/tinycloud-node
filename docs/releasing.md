@@ -489,8 +489,8 @@ Before any CVM mutation the workflow requires:
 
 - the main compose, with its one node digest replaced by 64 zeros, to hash
   to the reviewed N0 template
-  **`c91e5b7aabd141faf48b206e398474f8d90cde926c2bfe3f1a163b4923605093`**
-  (raw `99013c40e9523ae15a2c315403f0fc47fb9dcbb017825d3aa0f57669232c9047` normalized; before the TC-950 pool of 10 (`TINYCLOUD_DATABASE__MAX_CONNECTIONS` 15 to 10) the template was `79469f97…`, raw `32a002ef…`; before the three `current_kv_c_index_*` warning codes in the Vector config (TC-1274 `current_kv` C-index migration) the template was `87b5d12a…`, raw `d1fcd665…`; before the optional TC-1482 `NODE_STATS_READ_TOKEN` env line and the TC-1482 route in the Vector config the template was `7fabba70…`, raw `1228d81927fc0a3fbba85745103e77b3112606f5d314d15974d400b222409350`: the 1.21.0 compose
+  **`7c3456dc12c5b7a5368c3020b9d0a582899ece3f9942c7dd12b5f10d958c1f9c`**
+  (raw `d0e72bded501855653994a111ec17f988253f8db1ca19c8c5d25fdd6b9d71789` normalized; before the TC-1840 `db_failure_5xx` event (the node's 5xx diagnostic line shipped as an individual event) in the Vector config the template was `c91e5b7a…`, raw `99013c40…`; before the TC-950 pool of 10 (`TINYCLOUD_DATABASE__MAX_CONNECTIONS` 15 to 10) the template was `79469f97…`, raw `32a002ef…`; before the three `current_kv_c_index_*` warning codes in the Vector config (TC-1274 `current_kv` C-index migration) the template was `87b5d12a…`, raw `d1fcd665…`; before the optional TC-1482 `NODE_STATS_READ_TOKEN` env line and the TC-1482 route in the Vector config the template was `7fabba70…`, raw `1228d81927fc0a3fbba85745103e77b3112606f5d314d15974d400b222409350`: the 1.21.0 compose
   `d95bfb707871c1d626c4a8f2b8d32d354103edbb5077847c6a21fe5f7f6cfa50`, template
   `51f8e9e9…`, with only the embedded Vector config regenerated for TC-1274's,
   TC-1317's and TC-1482's route and warning codes (TC-1274 and TC-1317 were template `7fabba70…`, raw `1228d819…`); TC-1274 alone was template `00938226…`, raw
@@ -584,8 +584,8 @@ gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref main \
 
 The served/OCI identity remains **1.20.6-dstack / e18578ff9162986ddd813259c60f73866e3e60d1**.
 With the template lock on main this redeploys exactly main's raw compose
-`99013c40e9523ae15a2c315403f0fc47fb9dcbb017825d3aa0f57669232c9047`
-(the 1.21.0 compose `d95bfb70…` with the TC-1274, TC-1317, TC-1482 and `current_kv_c_index_*` Vector config, the optional TC-1482 `NODE_STATS_READ_TOKEN` env line and the TC-950 pool of 10), whatever digest
+`d0e72bded501855653994a111ec17f988253f8db1ca19c8c5d25fdd6b9d71789`
+(the 1.21.0 compose `d95bfb70…` with the TC-1274, TC-1317, TC-1482, `current_kv_c_index_*` and `db_failure_5xx` Vector config, the optional TC-1482 `NODE_STATS_READ_TOKEN` env line and the TC-950 pool of 10), whatever digest
 main's template currently pins. It is not a rollback of a
 later release across a schema migration. Current pre-N0 tag/pinned
 equivalents are separately hash-checked; arbitrary same-image config

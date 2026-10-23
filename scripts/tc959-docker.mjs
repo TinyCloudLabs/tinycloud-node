@@ -78,8 +78,21 @@ export function assertCapture(events, fields) {
       assert.equal(event.svc, 'api');
       assert.equal(event.level, event.event === 'node_warning' ? 'warn' : 'error');
       assert.ok(fields?.event_code?.values.includes(event.event_code));
-      assert.ok(Number.isSafeInteger(event.event_count) && event.event_count > 0);
-      allowed = [...base, 'event_code', 'event_count'];
+      if (event.event === 'node_warning' && event.event_code === 'db_failure_5xx') {
+        // TC-1840: the individual 5xx diagnostic; no event_count, exactly the eight declared fields, each held to its fields.json type.
+        assert.ok(Number.isInteger(event.status) && event.status >= 500 && event.status <= 599);
+        assert.ok(fields?.code?.values.includes(event.code));
+        assert.ok(fields?.service?.values.includes(event.service));
+        assert.ok((fields?.route?.values ?? [...routes]).includes(event.route));
+        assert.ok(Number.isSafeInteger(event.elapsed_ms) && event.elapsed_ms >= 0);
+        assert.ok(fields?.failure_kind?.values.includes(event.failure_kind));
+        assert.equal(typeof event.write_may_have_applied, 'boolean');
+        allowed = [...base, 'event_code', 'status', 'code', 'service', 'route', 'elapsed_ms', 'failure_kind', 'write_may_have_applied'];
+        if ('db_hash' in event) { assert.equal(typeof event.db_hash, 'string'); assert.match(event.db_hash, new RegExp(fields?.db_hash?.regex ?? '^[0-9a-f]{64}$')); allowed.push('db_hash'); }
+      } else {
+        assert.ok(Number.isSafeInteger(event.event_count) && event.event_count > 0);
+        allowed = [...base, 'event_code', 'event_count'];
+      }
     } else {
       assert.equal(event.event, 'logship_gate_summary_total');
       assert.equal(event.svc, 'logship');
