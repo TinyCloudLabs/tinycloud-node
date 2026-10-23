@@ -25,7 +25,7 @@ permissions:
 jobs:
   boundary:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
@@ -51,6 +51,9 @@ jobs:
           /tmp/vector-x86_64-unknown-linux-gnu/bin/vector test /tmp/tc959-all-requests.json
       - name: Exercise native UDP-to-HTTP delivery and console leak canaries
         run: node log-shipper/native-check.mjs /tmp/vector-x86_64-unknown-linux-gnu/bin/vector
+      - name: Exercise the per-minute caps and dropped-count events with real Vector (stdin source, console sink, no sockets)
+        timeout-minutes: 6
+        run: node log-shipper/cap-check.mjs /tmp/vector-x86_64-unknown-linux-gnu/bin/vector
       - name: Validate the actual HTTP sink without contacting it
         run: |
           node scripts/tc959-logship.mjs render-vector /tmp/tc959-runtime.json http://127.0.0.1:9599/
