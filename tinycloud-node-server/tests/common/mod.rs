@@ -46,7 +46,10 @@ pub fn postgres_gate(
 }
 
 fn skip_postgres_test(test: &str) {
-    eprintln!(
+    use std::io::Write;
+    // Written to the process stderr directly: libtest captures `eprintln!` output of passing tests.
+    let _ = writeln!(
+        std::io::stderr(),
         "skipping {test}: PostgreSQL-backed tests run only when CI=true (or TINYCLOUD_ALLOW_LOCAL_PG=1 for an isolated server you started yourself); not connecting"
     );
 }
