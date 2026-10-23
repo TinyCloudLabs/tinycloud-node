@@ -14,16 +14,15 @@
 
 use rocket::{
     form::FromForm,
-    http::{uri::Origin, Status},
+    http::{
+        uri::{error::PathError, Origin},
+        Status,
+    },
     serde::json::Json,
     State,
 };
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-    time::Instant,
-};
+use std::{collections::HashMap, path::PathBuf, time::Instant};
 
 use super::public::{ClientIp, RateLimiter};
 use crate::{authorization::AuthHeaderGetter, BlockStage, TinyCloud};
@@ -326,7 +325,8 @@ impl From<KeyPublic> for KeyPublicView {
     }
 }
 
-/// Parses the network id and key path, refusing any key path the grammar rejects.
+/// Parses the network id and key path. The network id must be in canonical form,
+/// and any key path the grammar rejects is refused.
 fn key_location(
     network_id: &str,
     key_path: &str,
@@ -334,27 +334,38 @@ fn key_location(
     let network = network_id
         .parse::<NetworkId>()
         .map_err(|err| (Status::BadRequest, err.to_string()))?;
+    if network.to_string() != network_id {
+        return Err((
+            Status::BadRequest,
+            "network id is not in canonical form".to_string(),
+        ));
+    }
     let location = KeyLocation::new(&network, key_path)
         .map_err(|err| map_service_err(EncryptionServiceError::KeyPathInvalid(err.to_string())))?;
     Ok((network, location))
 }
 
-/// Key path segments from a URL. The raw request path is checked first, since
-/// decoded segments would hide a percent-escape.
-fn key_path_from_url<'a>(
-    key_path: &'a Path,
-    origin: &Origin<'_>,
-) -> Result<&'a str, (Status, String)> {
-    if origin.path().as_str().contains('%') {
+/// Raw key path: the request path after `/networks/<network_id>/keys/`. Decoded
+/// segments drop empty and dot segments, so the key path is taken from the raw
+/// request path and checked against the key grammar as received. Percent-escapes
+/// are refused outright.
+fn raw_key_path(origin: &Origin<'_>, network_id: &str) -> Result<String, (Status, String)> {
+    let raw = origin
+        .path()
+        .as_str()
+        .split_once(&format!("/networks/{network_id}/keys/"))
+        .map(|(_, rest)| rest)
+        .ok_or_else(|| {
+            map_service_err(EncryptionServiceError::KeyPathInvalid(
+                "key path is not present in the request".to_string(),
+            ))
+        })?;
+    if raw.contains('%') {
         return Err(map_service_err(EncryptionServiceError::KeyPathInvalid(
             "percent-encoding is not accepted in key paths".to_string(),
         )));
     }
-    key_path.to_str().ok_or_else(|| {
-        map_service_err(EncryptionServiceError::KeyPathInvalid(
-            "key path is not valid UTF-8".to_string(),
-        ))
-    })
+    Ok(raw.to_string())
 }
 
 #[post(
@@ -380,8 +391,12 @@ pub async fn create_encryption_key(
     .await?;
 
     let body_value = body.into_inner();
-    let body: CreateKeyBody = serde_json::from_value(body_value.clone())
-        .map_err(|err| (Status::BadRequest, err.to_string()))?;
+    let body: CreateKeyBody = serde_json::from_value(body_value.clone()).map_err(|err| {
+        (
+            Status::BadRequest,
+            format!("request body is malformed: {err}"),
+        )
+    })?;
     let (network, location) = key_location(network_id, &body.key_path)?;
     service
         .verify_key_admin_authorized(
@@ -406,7 +421,7 @@ pub async fn create_encryption_key(
 #[get("/encryption/networks/<network_id>/keys/<key_path..>", rank = 1)]
 pub async fn describe_encryption_key(
     network_id: &str,
-    key_path: PathBuf,
+    key_path: Result<PathBuf, PathError>,
     origin: &Origin<'_>,
     authorization: AuthHeaderGetter<InvocationInfo>,
     service: &State<EncryptionService>,
@@ -422,16 +437,18 @@ pub async fn describe_encryption_key(
     )
     .await?;
 
-    let key_path = key_path_from_url(&key_path, origin)?;
-    let (network, location) = key_location(network_id, key_path)?;
+    // Routing guard only; the key path is read from the raw request path.
+    let _ = key_path;
+    let key_path = raw_key_path(origin, network_id)?;
+    let (network, location) = key_location(network_id, &key_path)?;
     service
         .verify_key_describe_authorized(&network, &location, &invocation_info)
         .await
-        .map_err(map_service_err)?;
+        .map_err(map_key_service_err)?;
     let descriptor = service
         .describe_key(&location)
         .await
-        .map_err(map_service_err)?;
+        .map_err(map_key_service_err)?;
     Ok(Json(descriptor.into()))
 }
 
@@ -440,7 +457,7 @@ pub async fn describe_encryption_key(
 #[get("/encryption/networks/<network_id>/keys/<key_path..>", rank = 2)]
 pub async fn public_encryption_key(
     network_id: &str,
-    key_path: PathBuf,
+    key_path: Result<PathBuf, PathError>,
     origin: &Origin<'_>,
     client_ip: ClientIp,
     rate_limiter: &State<RateLimiter>,
@@ -449,8 +466,10 @@ pub async fn public_encryption_key(
     rate_limiter
         .check(client_ip.0)
         .map_err(|status| (status, "Rate limit exceeded".to_string()))?;
-    let key_path = key_path_from_url(&key_path, origin)?;
-    let (_, location) = key_location(network_id, key_path)?;
+    // Routing guard only; the key path is read from the raw request path.
+    let _ = key_path;
+    let key_path = raw_key_path(origin, network_id)?;
+    let (_, location) = key_location(network_id, &key_path)?;
     let public = service
         .public_key(&location)
         .await
@@ -481,8 +500,12 @@ pub async fn block_encryption_key(
     .await?;
 
     let body_value = body.into_inner();
-    let body: KeyPathBody = serde_json::from_value(body_value.clone())
-        .map_err(|err| (Status::BadRequest, err.to_string()))?;
+    let body: KeyPathBody = serde_json::from_value(body_value.clone()).map_err(|err| {
+        (
+            Status::BadRequest,
+            format!("request body is malformed: {err}"),
+        )
+    })?;
     let (network, location) = key_location(network_id, &body.key_path)?;
     service
         .verify_key_admin_authorized(
@@ -524,8 +547,12 @@ pub async fn unblock_encryption_key(
     .await?;
 
     let body_value = body.into_inner();
-    let body: KeyPathBody = serde_json::from_value(body_value.clone())
-        .map_err(|err| (Status::BadRequest, err.to_string()))?;
+    let body: KeyPathBody = serde_json::from_value(body_value.clone()).map_err(|err| {
+        (
+            Status::BadRequest,
+            format!("request body is malformed: {err}"),
+        )
+    })?;
     let (network, location) = key_location(network_id, &body.key_path)?;
     service
         .verify_key_admin_authorized(

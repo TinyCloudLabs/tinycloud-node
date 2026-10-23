@@ -723,6 +723,66 @@ async fn public_get_refuses_a_grammar_invalid_key_path() -> Result<()> {
 }
 
 #[tokio::test]
+async fn key_paths_outside_the_grammar_are_refused_as_received() -> Result<()> {
+    let (fixture, network) = setup().await?;
+    let auth = describe_auth(&fixture, &network, "docs/a", KEY_CREATE_ACTION)?;
+    for key_path in [
+        "docs//a",
+        "docs/a/",
+        "docs/x/../a",
+        "docs/./a",
+        "docs%2fa",
+        ".hidden/a",
+        "docs/a:",
+        "docs/*a",
+    ] {
+        let (status, text) = public_get(&fixture, &network, key_path).await;
+        assert_eq!(status, Status::BadRequest, "public {key_path}: {text}");
+        assert!(
+            text.starts_with("key_path_invalid"),
+            "public {key_path}: {text}"
+        );
+        let (status, text) = describe_get(&fixture, &network, key_path, &auth).await;
+        assert_eq!(status, Status::BadRequest, "describe {key_path}: {text}");
+        assert!(
+            text.starts_with("key_path_invalid"),
+            "describe {key_path}: {text}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn key_routes_refuse_a_network_id_that_is_not_canonical() -> Result<()> {
+    let (fixture, _) = setup().await?;
+    let network =
+        "urn:tinycloud:encryption:did:pkh:eip155:1:0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266:net";
+    let (status, text) = public_get(&fixture, network, "docs/a").await;
+    assert_eq!(status, Status::BadRequest, "{text}");
+    assert!(
+        text.starts_with("network id is not in canonical form"),
+        "{text}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn public_get_is_rate_limited_per_client_ip() -> Result<()> {
+    let (fixture, network) = setup().await?;
+    let mut limited = None;
+    for _ in 0..40 {
+        let (status, text) = public_get(&fixture, &network, "docs/a").await;
+        if status == Status::TooManyRequests {
+            limited = Some(text);
+            break;
+        }
+    }
+    let text = limited.ok_or_else(|| anyhow::anyhow!("no request was rate limited"))?;
+    assert_eq!(text, "Rate limit exceeded");
+    Ok(())
+}
+
+#[tokio::test]
 async fn describe_missing_key_is_not_found() -> Result<()> {
     let (fixture, network) = setup().await?;
     let auth = describe_auth(&fixture, &network, "docs/absent", KEY_CREATE_ACTION)?;
@@ -1240,5 +1300,34 @@ async fn block_refuses_a_missing_body_hash() -> Result<()> {
     .await;
     assert_eq!(status, Status::BadRequest, "{text}");
     assert!(text.contains("bodyHash"), "{text}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn key_route_bodies_that_do_not_parse_are_named_by_the_route() -> Result<()> {
+    let (fixture, network) = setup().await?;
+    let body = json!({"keyPath": "docs/a", "shreddable": "true"});
+    let auth = admin_auth(&fixture, &network, "docs/a", KEY_CREATE_ACTION, &body)?;
+    let (status, text) = post_json(&fixture.client, &keys_url(&network), &auth, &body).await;
+    assert_eq!(status, Status::BadRequest, "create: {text}");
+    assert!(
+        text.starts_with("request body is malformed: "),
+        "create: {text}"
+    );
+
+    let body = json!({"keyPath": 7});
+    let auth = admin_auth(&fixture, &network, "docs/a", KEY_BLOCK_ACTION, &body)?;
+    let (status, text) = post_json(
+        &fixture.client,
+        &action_url(&network, "block"),
+        &auth,
+        &body,
+    )
+    .await;
+    assert_eq!(status, Status::BadRequest, "block: {text}");
+    assert!(
+        text.starts_with("request body is malformed: "),
+        "block: {text}"
+    );
     Ok(())
 }

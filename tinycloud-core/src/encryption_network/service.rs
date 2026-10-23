@@ -89,7 +89,7 @@ pub enum EncryptionServiceError {
     AlgKeyVersionMismatch,
     #[error("invocation signature is invalid: {0}")]
     SignatureInvalid(String),
-    #[error("invocation type is not a decrypt invocation")]
+    #[error("invocation type does not match this route")]
     WrongInvocationType,
     #[error("nonce already used")]
     NonceReplay,
