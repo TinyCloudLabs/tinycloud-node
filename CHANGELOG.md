@@ -4,6 +4,8 @@
 
 ### Changes
 
+- Log sidecar: the node's one warning line per database-failure 5xx (`database failure answered with a 5xx`) ships to Better Stack as an individual `node_warning` event with `event_code` `db_failure_5xx` and exactly eight fields: `status`, `code`, `service`, `route`, `elapsed_ms`, `failure_kind`, `write_may_have_applied` and, when known, `db_hash`. They are fixed vocabulary, the route template, a duration, a flag and a keyed database pseudonym; no SQL, ids, DIDs, paths or messages. A line with any other field or an unexpected value is counted as `unclassified` as before. Details: TC-1840.
+  - **N0 compose.** The embedded Vector configuration is regenerated for the new event. The reviewed N0 compose template changes to `7c3456dc…` (raw `d0e72bde…`; `docs/releasing.md`).
 - Policy registration, policy status changes, SQL store manifest publication and share-email state writes now end their database transaction on every exit, so locks are released when the call returns. Details: TC-1836.
 - Creating a named key now ends its database transaction on every exit, so the network row lock is released when the call returns. Details: TC-1834.
 - Encryption: clearer error for percent-encoded key route URLs. The public-key and describe routes for named keys read the network id and key path as sent; a percent-escape returns 400 `key_path_invalid` with a message naming the escape. Details: TC-1777.

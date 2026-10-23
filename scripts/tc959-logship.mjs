@@ -28,6 +28,9 @@ export function buildConfig({ sinkUri = 'https://s2795437.us-west-2a.betterstack
   let sanitize = readFileSync(resolve(root, 'log-shipper/sanitize.vrl'), 'utf8')
     .replaceAll('__METHODS__', JSON.stringify(schema.fields.method.values))
     .replaceAll('__ROUTES__', JSON.stringify(schema.fields.route.values))
+    .replaceAll('__DB_FAILURE_CODES__', JSON.stringify(schema.fields.code.values))
+    .replaceAll('__DB_FAILURE_SERVICES__', JSON.stringify(schema.fields.service.values))
+    .replaceAll('__DB_FAILURE_KINDS__', JSON.stringify(schema.fields.failure_kind.values))
     .replace('__ROUTE_ALIASES__', JSON.stringify(aliases))
     .replace('__DIAGNOSTICS__', JSON.stringify(diagnostics.exact))
     .replace('__PREFIX_DIAGNOSTICS__', Object.entries(diagnostics.prefix).sort(([a], [b]) => a.length - b.length).map(([prefix, code]) => `if starts_with(msg, ${JSON.stringify(prefix)}) { code = ${JSON.stringify(code)} }`).join('\n'));
@@ -89,12 +92,13 @@ if !includes(${JSON.stringify(schema.fields.reason.values)}, reason) { reason = 
       gate_reduce: { type: 'reduce', inputs: ['gate_counts'], group_by: ['reason'], end_every_period_ms: 60000, expire_after_ms: 75000, flush_period_ms: 1000, merge_strategies: { count: 'sum' } },
       gate_output: remap(['gate_reduce'], `. = {"ts": format_timestamp!(now(), format: "%Y-%m-%dT%H:%M:%S%.3fZ"), "level": "warn", "event": "logship_gate_summary_total", "svc": "logship", "reason": .reason, "count": .count}`),
       request_profile: { type: 'filter', inputs: ['allowlist'], condition: `${profileExpression} == "all_requests" || includes(["node_warning", "node_error"], .event) || (int(.status) ?? 0) >= 400 || (.event == "node_request" && (int(.latency_us) ?? 0) > ${slowThresholdUs}) || (.event == "ingress_request" && (to_float(.request_time_seconds) ?? 0.0) > ${(slowThresholdUs / 1000000).toFixed(6)})` },
-      event_route: { type: 'route', inputs: ['request_profile'], route: { request: '.event == "node_request" || .event == "ingress_request"', diagnostic: '.event == "node_warning" || .event == "node_error"' } },
+      // The 5xx diagnostic (TC-1840) is an individual event: it bypasses the count reducer, which would drop its fields.
+      event_route: { type: 'route', inputs: ['request_profile'], route: { request: '.event == "node_request" || .event == "ingress_request"', db_failure: '.event == "node_warning" && .event_code == "db_failure_5xx"', diagnostic: '(.event == "node_warning" && .event_code != "db_failure_5xx") || .event == "node_error"' } },
       diagnostic_reduce: { type: 'reduce', inputs: ['event_route.diagnostic'], group_by: ['event', 'event_code', 'level', 'svc'], end_every_period_ms: 60000, expire_after_ms: 75000, flush_period_ms: 1000, merge_strategies: { event_count: 'sum', ts: 'discard' } },
       diagnostic_output: remap(['diagnostic_reduce'], `. = {"ts": format_timestamp!(now(), format: "%Y-%m-%dT%H:%M:%S%.3fZ"), "level": .level, "event": .event, "svc": "api", "event_code": .event_code, "event_count": .event_count}`),
     },
     sinks: { betterstack: {
-      type: 'http', inputs: ['event_route.request', 'diagnostic_output', 'gate_output'], method: 'post', uri: sinkUri,
+      type: 'http', inputs: ['event_route.request', 'event_route.db_failure', 'diagnostic_output', 'gate_output'], method: 'post', uri: sinkUri,
       encoding: { codec: 'json' }, framing: { method: 'newline_delimited' }, compression: 'gzip',
       auth: { strategy: 'bearer', token: token ?? 'SECRET[bs.bs_token]' },
       batch: { max_bytes: 262144, timeout_secs: 1 },
@@ -115,7 +119,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   const config = buildConfig({ profile, ...(sinkUri ? { sinkUri, token: 'tc959-synthetic-only' } : {}) });
   if (command === 'render-tests') {
     delete config.secret;
-    config.sinks = { discard: { type: 'blackhole', inputs: ['event_route.request', 'diagnostic_output', 'gate_output'] } };
+    config.sinks = { discard: { type: 'blackhole', inputs: ['event_route.request', 'event_route.db_failure', 'diagnostic_output', 'gate_output'] } };
     config.tests = [...vectorTests, ...requestProfileTests(profile)];
   }
   writeFileSync(output, JSON.stringify(config, null, 2) + '\n');

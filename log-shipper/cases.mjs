@@ -20,6 +20,16 @@ const correlated = (name, input, assertion) => ({ name, inputs: [{ insert_at: 'l
 const goodId = 'a8098c1a-f86e-4b1f-92a7-4b50b53ec932';
 const goodHash = 'a'.repeat(64);
 const goodSpace = '0123456789abcdef'.repeat(4);
+// TC-1840: the node's 5xx diagnostic line (target, message and fields as emitted by tinycloud-node). It ships
+// as an individual event with exactly eight fields; any deviation falls back to the unclassified count.
+const dbMessage = 'database failure answered with a 5xx';
+const dbFailure = (fields = {}, extra = {}) => ({ timestamp, level: 'WARN', target: 'tinycloud::request', ...extra, fields: { message: dbMessage, status: 503, code: 'sql_busy', service: 'sql', route: '/invoke', elapsed_ms: 30001, failure_kind: 'lock_wait', write_may_have_applied: false, db_hash: goodHash, ...fields } });
+const dbShipped = ['code', 'db_hash', 'elapsed_ms', 'event', 'event_code', 'failure_kind', 'level', 'route', 'service', 'status', 'svc', 'ts', 'write_may_have_applied'];
+const keysAre = names => `keys(.) == ${JSON.stringify(names)}`;
+const dbFallback = (name, fields, extra) => check(name, envelope(dbFailure(fields, extra)), `.event == "node_warning" && .event_code == "unclassified" && .event_count == 1 && ${keysAre(['event', 'event_code', 'event_count', 'level', 'svc', 'ts'])}`);
+const dbCodes = ['unavailable_retryable', 'outcome_unknown', 'internal', 'sql_busy', 'request_timeout', 'read_audit_busy'];
+const dbServices = ['sql', 'duckdb', 'kv', 'other'];
+const dbKinds = ['pool_timeout', 'pool_closed', 'io', 'statement_timeout', 'serialization', 'connection_lost', 'artifact_changed', 'lock_wait', 'hydration', 'artifact_transfer', 'request_timeout', 'read_audit_busy', 'other'];
 const reject = (name, input, insertAt = 'logship_gate') => ({ name, inputs: [{ insert_at: insertAt, type: 'log', log_fields: logFields(input) }], no_outputs_from: ['allowlist'], outputs: [{ extract_from: 'gate_counts', conditions: [{ type: 'vrl', source: 'assert!(.count == 1)\nassert!(!contains(encode_json(.), "TC959_SYNTHETIC"))' }] }] });
 export const vectorTests = [
   check('INFO node request validates as a safe individual event', envelope(nodeRequest()), '.event == "node_request" && .svc == "api" && .method == "POST" && .route == "/invoke" && .status == 200 && .latency_us == 1234'),
@@ -55,6 +65,36 @@ export const vectorTests = [
   check('hydration timeout warning maps to sql_hydration_timeout without its fields', envelope({ timestamp, level: 'WARN', target: 'tinycloud_core::sql::service', fields: { message: 'Database hydration gave up loading its artifact', service: 'sql', error_class: canary, bound_ms: 600000 } }), '.event == "node_warning" && .event_code == "sql_hydration_timeout" && .event_count == 1'),
   ...[['Read audit wait expired', 'read_audit_busy'], ['Read audit batch slow', 'read_audit_batch_slow'], ['Read audit batch failed', 'read_audit_batch_failed'], ['Read audit drain stalled', 'read_audit_drain_stalled']].map(([message, code]) => check(`read-audit warning maps to ${code} without its fields`, envelope({ timestamp, level: 'WARN', target: 'tinycloud_core::read_audit', fields: { message, error_class: canary, count: 3, queue_depth: 1024, in_flight_batch_age_ms: 30001, abandoned: 7 } }), `.event == "node_warning" && .event_code == "${code}" && .event_count == 1`)),
   ...[['missing', 'WARN', 'node_warning', 'current_kv_c_index_missing'], ['invalid', 'WARN', 'node_warning', 'current_kv_c_index_invalid'], ['wrong_shape', 'ERROR', 'node_error', 'current_kv_c_index_wrong_shape']].map(([key, level, event, code]) => check(`current_kv C index ${key} message maps to ${code} with only the fixed diagnostic keys`, envelope({ timestamp, level, target: 'tinycloud_core::migrations::m20261020_000000_current_kv_key_c_index', fields: { message: currentKvCIndexMessages[key], event: canary, index: canary, reason: canary } }), `.event == "${event}" && .event_code == "${code}" && .event_count == 1 && .level == "${level.toLowerCase()}" && keys(.) == ["event", "event_code", "event_count", "level", "svc", "ts"]`)),
+  check('node 5xx diagnostic ships exactly its eight fields as an individual event', envelope(dbFailure()), `.event == "node_warning" && .svc == "api" && .level == "warn" && .event_code == "db_failure_5xx" && .status == 503 && .code == "sql_busy" && .service == "sql" && .route == "/invoke" && .elapsed_ms == 30001 && .failure_kind == "lock_wait" && .write_may_have_applied == false && .db_hash == "${goodHash}" && !exists(.event_count) && ${keysAre(dbShipped)}`),
+  check('node 5xx diagnostic without a database ships without db_hash', envelope(dbFailure({ db_hash: undefined, status: 500, code: 'internal', service: 'other', failure_kind: 'other' })), `.event_code == "db_failure_5xx" && .status == 500 && .code == "internal" && .service == "other" && .failure_kind == "other" && ${keysAre(dbShipped.filter(key => key !== 'db_hash'))}`),
+  check('node 5xx diagnostic with an unknown outcome ships the write flag', envelope(dbFailure({ status: 500, code: 'outcome_unknown', write_may_have_applied: true })), `.event_code == "db_failure_5xx" && .status == 500 && .code == "outcome_unknown" && .write_may_have_applied == true && ${keysAre(dbShipped)}`),
+  ...dbCodes.map(code => check(`node 5xx diagnostic ships code ${code}`, envelope(dbFailure({ code })), `.event_code == "db_failure_5xx" && .code == "${code}" && ${keysAre(dbShipped)}`)),
+  ...dbServices.map(service => check(`node 5xx diagnostic ships service ${service}`, envelope(dbFailure({ service })), `.event_code == "db_failure_5xx" && .service == "${service}" && ${keysAre(dbShipped)}`)),
+  ...dbKinds.map(failure_kind => check(`node 5xx diagnostic ships failure_kind ${failure_kind}`, envelope(dbFailure({ failure_kind })), `.event_code == "db_failure_5xx" && .failure_kind == "${failure_kind}" && ${keysAre(dbShipped)}`)),
+  ...[[500, 0], [599, 9007199254740991]].map(([status, elapsed_ms]) => check(`node 5xx diagnostic ships status ${status} and elapsed_ms ${elapsed_ms}`, envelope(dbFailure({ status, elapsed_ms })), `.event_code == "db_failure_5xx" && .status == ${status} && .elapsed_ms == ${elapsed_ms} && ${keysAre(dbShipped)}`)),
+  check('node 5xx diagnostic normalizes a Rocket query template like a request', envelope(dbFailure({ route: '/attestation?<nonce>' })), `.event_code == "db_failure_5xx" && .route == "/attestation" && ${keysAre(dbShipped)}`),
+  check('node 5xx diagnostic ships a parameterized route template', envelope(dbFailure({ route: '/signed/kv/<ticket_id>' })), `.event_code == "db_failure_5xx" && .route == "/signed/kv/<ticket_id>" && ${keysAre(dbShipped)}`),
+  check('node 5xx diagnostic discards span, spans and envelope extras', envelope({ ...dbFailure(), span: { account: canary, sql: canary }, spans: [{ request_id: canary }], filename: canary, thread_id: canary }), `.event_code == "db_failure_5xx" && ${keysAre(dbShipped)}`),
+  dbFallback('node 5xx diagnostic with an unknown code falls back to unclassified', { code: 'sql_busy_but_new' }),
+  dbFallback('node 5xx diagnostic with a free-text code falls back to unclassified', { code: canary }),
+  dbFallback('node 5xx diagnostic with an uppercase code falls back to unclassified', { code: 'SQL_BUSY' }),
+  dbFallback('node 5xx diagnostic with an unknown service falls back to unclassified', { service: 'postgres' }),
+  dbFallback('node 5xx diagnostic with a free-text service falls back to unclassified', { service: canary }),
+  dbFallback('node 5xx diagnostic with an unknown failure_kind falls back to unclassified', { failure_kind: 'lock_wait ' }),
+  dbFallback('node 5xx diagnostic with a free-text failure_kind falls back to unclassified', { failure_kind: canary }),
+  ...[['not a template', '/not-a-template'], ['raw URI', `/signed/kv/${canary}`], ['query value', `/invoke?token=${canary}`], ['empty', ''], ['over-long', `/${'x'.repeat(300)}`], ['not a string', null], ['object', { path: canary }]].map(([label, route]) => dbFallback(`node 5xx diagnostic with a route that is ${label} falls back to unclassified`, { route })),
+  ...[['uppercase', 'A'.repeat(64)], ['63 chars', 'a'.repeat(63)], ['65 chars', 'a'.repeat(65)], ['trailing newline', `${goodHash}\n`], ['trailing text', `${goodHash}TC959_SYNTHETIC`], ['raw DID', 'did:pkh:eip155:1:0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef'], ['raw database name', 'notes.db'], ['null', null], ['number', 7], ['boolean', true], ['object', { hash: goodHash }]].map(([label, db_hash]) => dbFallback(`node 5xx diagnostic with a db_hash that is ${label} falls back to unclassified`, { db_hash })),
+  ...[['sql', canary], ['error', canary], ['space', 'tinycloud:pkh:eip155:1:0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef:default'], ['database', 'notes.db'], ['message_detail', canary], ['count', 3], ['empty', null]].map(([key, value]) => dbFallback(`node 5xx diagnostic with an extra ${key} field falls back to unclassified`, { [key]: value })),
+  ...['status', 'code', 'service', 'route', 'elapsed_ms', 'failure_kind', 'write_may_have_applied'].map(key => dbFallback(`node 5xx diagnostic missing ${key} falls back to unclassified`, { [key]: undefined })),
+  ...[['string', '503'], ['float', 503.5], ['below 5xx', 499], ['success', 200], ['above range', 600], ['null', null]].map(([label, status]) => dbFallback(`node 5xx diagnostic with a status that is ${label} falls back to unclassified`, { status })),
+  ...[['negative', -1], ['string', '30001'], ['float', 1.5], ['above the safe integer range', 9007199254740992], ['null', null]].map(([label, elapsed_ms]) => dbFallback(`node 5xx diagnostic with an elapsed_ms that is ${label} falls back to unclassified`, { elapsed_ms })),
+  ...[['string', 'false'], ['number', 0], ['null', null]].map(([label, write_may_have_applied]) => dbFallback(`node 5xx diagnostic with a write_may_have_applied that is ${label} falls back to unclassified`, { write_may_have_applied })),
+  ...[['a suffix', `${dbMessage}: ${canary}`], ['a different case', dbMessage.toUpperCase()], ['free text', canary]].map(([label, message]) => dbFallback(`node 5xx diagnostic with a message that is ${label} falls back to unclassified`, { message })),
+  dbFallback('node 5xx diagnostic on a dependency target falls back to unclassified', {}, { target: 'dependency' }),
+  dbFallback('node 5xx diagnostic on another node target falls back to unclassified', {}, { target: 'tinycloud_core::request_cancel' }),
+  check('node 5xx diagnostic at error level is a plain unclassified error', envelope(dbFailure({}, { level: 'ERROR' })), `.event == "node_error" && .event_code == "unclassified" && .event_count == 1 && ${keysAre(['event', 'event_code', 'event_count', 'level', 'svc', 'ts'])}`),
+  check('node 5xx diagnostic input with SQL, ids and message-like text in extra fields ships none of it', envelope({ ...dbFailure({ sql: `SELECT ${canary} FROM t`, error: canary, space_id: 'tinycloud:pkh:eip155:1:0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef:default', db_name: 'notes.db', did: 'did:pkh:eip155:1:0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef' }), span: { sql: canary } }), `.event == "node_warning" && .event_code == "unclassified" && .event_count == 1 && ${keysAre(['event', 'event_code', 'event_count', 'level', 'svc', 'ts'])} && !contains(encode_json(.), "SELECT") && !contains(encode_json(.), "notes.db") && !contains(encode_json(.), "did:") && !contains(encode_json(.), "tinycloud:")`),
+  reject('node 5xx diagnostic at info level is not an individual event', envelope(dbFailure({}, { level: 'INFO' }))),
   check('dependency warning is a fixed unclassified diagnostic', envelope({ timestamp, level: 'WARN', target: 'hyper::proto', fields: { message: canary, error: canary } }), '.event == "node_warning" && .event_code == "unclassified" && .event_count == 1'),
   check('dependency error without a message still counts', envelope({ timestamp, level: 'ERROR', target: 'sqlx::pool', fields: { error: canary } }), '.event == "node_error" && .event_code == "unclassified" && .event_count == 1'),
   check('warning without a target or fields still counts', envelope({ timestamp, level: 'WARN' }), '.event == "node_warning" && .event_code == "unclassified" && .event_count == 1'),
@@ -123,5 +163,17 @@ export function requestProfileTests(profile) {
       inputs: [{ insert_at: 'logship_gate', type: 'log', log_fields: logFields(envelope({ timestamp, level, target: 'dependency', fields: { message: canary, status: 200, latency_us: 0 } })) }],
       outputs: [{ extract_from: 'event_route.diagnostic', conditions: [{ type: 'vrl', source: `assert!(.event_count == 1 && .event_code == "unclassified")\nassert!(${safe})` }] }],
     })),
+    {
+      name: `${profile}: node 5xx diagnostic routes as an individual event, never into the count reducer`,
+      inputs: [{ insert_at: 'logship_gate', type: 'log', log_fields: logFields(envelope(dbFailure())) }],
+      no_outputs_from: ['event_route.diagnostic', 'event_route.request'],
+      outputs: [{ extract_from: 'event_route.db_failure', conditions: [{ type: 'vrl', source: `assert!(.event_code == "db_failure_5xx" && .elapsed_ms == 30001 && .db_hash == "${goodHash}")\nassert!(${keysAre(dbShipped)})\nassert!(${safe})` }] }],
+    },
+    {
+      name: `${profile}: invalid node 5xx diagnostic is counted as unclassified, never an individual event`,
+      inputs: [{ insert_at: 'logship_gate', type: 'log', log_fields: logFields(envelope(dbFailure({ code: canary, sql: canary }))) }],
+      no_outputs_from: ['event_route.db_failure', 'event_route.request'],
+      outputs: [{ extract_from: 'event_route.diagnostic', conditions: [{ type: 'vrl', source: `assert!(.event_count == 1 && .event_code == "unclassified")\nassert!(${keysAre(['event', 'event_code', 'event_count', 'level', 'svc', 'ts'])})\nassert!(${safe})` }] }],
+    },
   ];
 }
