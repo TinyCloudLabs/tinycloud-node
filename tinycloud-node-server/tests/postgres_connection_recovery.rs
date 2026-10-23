@@ -12,13 +12,19 @@
 //!   TCP proxy between the pool and Postgres.
 //!
 //! Each test runs in its own schema and identifies its pool's backends by a
-//! unique `application_name`. They skip (or, in CI, fail) when
-//! `TINYCLOUD_TEST_POSTGRES_URL` is unset:
+//! unique `application_name`. PostgreSQL-backed tests connect only when
+//! `TINYCLOUD_TEST_POSTGRES_URL` is set and either `GITHUB_ACTIONS=true` (GitHub
+//! Actions) or `TINYCLOUD_ALLOW_LOCAL_PG=1` (an isolated server you started
+//! yourself). Otherwise they skip. On GitHub Actions, an unset URL fails the
+//! test (TC-381).
 //!
 //! ```text
-//! TINYCLOUD_TEST_POSTGRES_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres \
+//! TINYCLOUD_ALLOW_LOCAL_PG=1 \
+//! TINYCLOUD_TEST_POSTGRES_URL=postgres://<user>:<password>@<host>:<port>/<database> \
 //!   cargo test -p tinycloud-node --test postgres_connection_recovery
 //! ```
+
+mod common;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::SocketAddr;
@@ -83,17 +89,7 @@ async fn server_slot() -> tokio::sync::SemaphorePermit<'static> {
 }
 
 fn postgres_url(test: &str) -> Option<String> {
-    match std::env::var("TINYCLOUD_TEST_POSTGRES_URL") {
-        Ok(url) if !url.trim().is_empty() => Some(url),
-        _ => {
-            assert!(
-                std::env::var_os("CI").is_none(),
-                "{test} requires TINYCLOUD_TEST_POSTGRES_URL, which is unset in CI (TC-381)"
-            );
-            eprintln!("skipping {test}: TINYCLOUD_TEST_POSTGRES_URL is unset");
-            None
-        }
-    }
+    common::postgres_test_url(test)
 }
 
 /// One space owner: its signing key, verification method, and space.

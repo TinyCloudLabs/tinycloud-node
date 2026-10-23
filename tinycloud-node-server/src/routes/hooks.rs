@@ -1149,11 +1149,12 @@ mod tests {
     #[tokio::test]
     async fn hook_event_stream_does_not_emit_queued_events_after_expiry() -> Result<()> {
         let hooks = test_hook_runtime();
+        let (_tempdir, tinycloud) = test_tinycloud().await?;
         let client = rocket::local::asynchronous::Client::tracked(
             rocket::build()
                 .mount("/", rocket::routes![hook_events])
                 .manage(hooks.clone())
-                .manage(test_tinycloud().await?),
+                .manage(tinycloud),
         )
         .await?;
         rocket::tokio::time::pause();
@@ -1209,17 +1210,17 @@ mod tests {
         Ok(())
     }
 
-    async fn test_tinycloud() -> Result<TinyCloud> {
+    async fn test_tinycloud() -> Result<(TempDir, TinyCloud)> {
         let tempdir = TempDir::new()?;
         let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string())).await?;
         let storage = NodeFileSystemConfig::new(tempdir.path()).open().await?;
-        let _persisted = tempdir.keep();
-        Ok(TinyCloud::new(
+        let tinycloud = TinyCloud::new(
             db.into(),
             Either::B(storage),
             StaticSecret::new(vec![0u8; 32]).unwrap(),
         )
-        .await?)
+        .await?;
+        Ok((tempdir, tinycloud))
     }
 
     /// Admits a signed invocation as a non-policy session, skipping only the
@@ -1949,7 +1950,7 @@ mod tests {
 
     #[tokio::test]
     async fn mints_ticket_for_sql_scope() -> Result<()> {
-        let tinycloud = test_tinycloud().await?;
+        let (_tempdir, tinycloud) = test_tinycloud().await?;
         let hooks = test_hook_runtime();
         let (invocation, space) = test_invocation("sql/main.db").await?;
         let request = HookTicketRequest {
@@ -1973,7 +1974,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_partially_authorized_ticket_requests() -> Result<()> {
-        let tinycloud = test_tinycloud().await?;
+        let (_tempdir, tinycloud) = test_tinycloud().await?;
         let hooks = test_hook_runtime();
         let (invocation, space) = test_invocation("kv/documents").await?;
 
@@ -2004,7 +2005,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_wrong_space_subscription() -> Result<()> {
-        let tinycloud = test_tinycloud().await?;
+        let (_tempdir, tinycloud) = test_tinycloud().await?;
         let hooks = test_hook_runtime();
         let (invocation, _space) = test_invocation("kv/documents").await?;
         let request = HookTicketRequest {
@@ -2114,6 +2115,7 @@ mod tests {
         owner: (JWK, String),
         session: (JWK, String),
         session_proof: Cid,
+        _tempdir: TempDir,
     }
 
     fn did_key() -> Result<(JWK, String)> {
@@ -2186,7 +2188,6 @@ mod tests {
         let tempdir = TempDir::new()?;
         let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string())).await?;
         let storage = NodeFileSystemConfig::new(tempdir.path()).open().await?;
-        let _persisted = tempdir.keep();
         for id in [&space, &other_space] {
             storage.create(id).await?;
         }
@@ -2265,6 +2266,7 @@ mod tests {
             owner,
             session,
             session_proof: proof_hash.to_cid(0x55),
+            _tempdir: tempdir,
         })
     }
 
@@ -2842,11 +2844,12 @@ mod tests {
             .verify_ticket(&current.sign_ticket(&claims).unwrap())
             .is_ok());
 
+        let (_tempdir, tinycloud) = test_tinycloud().await?;
         let client = rocket::local::asynchronous::Client::tracked(
             rocket::build()
                 .mount("/", rocket::routes![hook_events])
                 .manage(current)
-                .manage(test_tinycloud().await?),
+                .manage(tinycloud),
         )
         .await?;
         let response = client

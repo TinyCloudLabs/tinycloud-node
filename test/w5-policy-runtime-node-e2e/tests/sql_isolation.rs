@@ -150,7 +150,7 @@ async fn legacy_web_artifacts_load_via_invoke_after_alias_cutover_and_restart() 
             physical,
             serde_json::from_value(sql_write_body(row))?,
             None,
-            "tinycloud.sql/write".into(),
+            "tinycloud.sql/admin".into(),
         )
         .await?;
     }
@@ -322,7 +322,9 @@ async fn legacy_web_artifacts_load_via_invoke_after_alias_cutover_and_restart() 
         &owner_vm,
         vec![],
         &fresh_resource,
-        "tinycloud.sql/write",
+        // `sql_write_body` creates its table and inserts a row: `admin`
+        // carries both (schema changes need `schema`, TC-1581).
+        "tinycloud.sql/admin",
         "urn:uuid:00000000-0000-4000-8000-000000000024",
     )?;
     let (status, response) = invoke_json(&client, fresh_write, &sql_write_body("new-row")).await;
@@ -528,7 +530,7 @@ async fn legacy_alias_collision_refuses_the_whole_transaction() -> Result<()> {
             name,
             serde_json::from_value(sql_write_body("row"))?,
             None,
-            "tinycloud.sql/write".into(),
+            "tinycloud.sql/admin".into(),
         )
         .await?;
     }
@@ -575,7 +577,7 @@ async fn legacy_inventory_attributes_from_invoked_abilities_without_a_grant() ->
         &owner_vm,
         vec![],
         &resource,
-        "tinycloud.sql/write",
+        "tinycloud.sql/admin",
         "urn:uuid:00000000-0000-4000-8000-000000000025",
     )?;
     let (status, response) = invoke_json(&client, header, &sql_write_body("digest-row")).await;
@@ -588,7 +590,7 @@ async fn legacy_inventory_attributes_from_invoked_abilities_without_a_grant() ->
         "only",
         serde_json::from_value(sql_write_body("legacy-row"))?,
         None,
-        "tinycloud.sql/write".into(),
+        "tinycloud.sql/admin".into(),
     )
     .await?;
     let items = database_migration::inventory(&conn, &datadir).await?;
@@ -608,7 +610,7 @@ async fn legacy_inventory_attributes_from_invoked_abilities_without_a_grant() ->
         &owner_vm,
         vec![],
         &resource,
-        "tinycloud.sql/write",
+        "tinycloud.sql/admin",
         "urn:uuid:00000000-0000-4000-8000-000000000026",
     )?;
     let (status, response) = invoke_json(&client, unfenced_write, &sql_write_body("blocked")).await;
@@ -994,7 +996,7 @@ async fn sql_paths_do_not_share_databases_and_grants_are_exact() -> Result<()> {
     let tempdir = TempDir::new()?;
     let engine = Engine {
         service: "sql",
-        write_ability: "tinycloud.sql/write",
+        write_ability: "tinycloud.sql/admin",
         read_ability: "tinycloud.sql/read",
         grant_seed: b"tc780-n1-sql-read-appA-connectors",
         nonce_prefix: "000000000a",
@@ -1046,7 +1048,7 @@ fn regression_engine(service: &'static str) -> Result<Engine> {
     Ok(match service {
         "sql" => Engine {
             service,
-            write_ability: "tinycloud.sql/write",
+            write_ability: "tinycloud.sql/admin",
             read_ability: "tinycloud.sql/read",
             grant_seed: b"tc780-n2-ancestor-sql",
             nonce_prefix: "000000000c",

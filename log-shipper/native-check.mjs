@@ -11,7 +11,7 @@ import { gunzipSync } from 'node:zlib';
 import { buildConfig } from '../scripts/tc959-logship.mjs';
 import { assertCapture } from '../scripts/tc959-docker.mjs';
 import { hasUdpListener } from '../scripts/tc959-readiness.mjs';
-import { canary, nodeRequest, ingressRequest } from './cases.mjs';
+import { canary, nodeRequest, ingressRequest, dbFailure } from './cases.mjs';
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -75,9 +75,11 @@ export async function checkNativeVector(vector, baseline) {
       // Native GELF JSON decoding used to quote this value in its own console.
       await send(frame(nodeRequest({ route: '/healthz' }), 'tinycloud-node', { level: canary, full_message: canary }));
       await send(`{"version":"1.1","short_message":"${canary}`);
+      // TC-1840: the individual 5xx diagnostic must reach the HTTP sink through the real route, not the count reducer.
+      await send(frame(dbFailure()));
     } finally { sender.close(); }
     for (let attempt = 0; attempt < 100; attempt++) {
-      if (events.filter(event => event.event === 'node_request' || event.event === 'ingress_request').length >= 5) break;
+      if (events.filter(event => event.event === 'node_request' || event.event === 'ingress_request').length >= 5 && events.some(event => event.event_code === 'db_failure_5xx')) break;
       await sleep(30);
     }
     child.kill('SIGTERM');
@@ -87,8 +89,9 @@ export async function checkNativeVector(vector, baseline) {
     const schema = JSON.parse(await readFile(new URL('./fields.json', import.meta.url), 'utf8'));
     try { assertCapture(events, schema.services['tinycloud-node'].fields); } catch { wireSafe = false; }
     const requests = events.filter(event => event.event === 'node_request' || event.event === 'ingress_request').length;
+    const dbFailures = events.filter(event => event.event_code === 'db_failure_5xx').length;
     const consoleHits = consoleText.split(canary).length - 1;
-    return { status: wireSafe && !malformedHttp && !overflow && requests === 5 && consoleHits === 0 ? 'passed' : 'failed', request_events: requests, console_canary_hits: consoleHits, wire_safe: wireSafe, positive_controls: 5, console_overflow: overflow };
+    return { status: wireSafe && !malformedHttp && !overflow && requests === 5 && dbFailures === 1 && consoleHits === 0 ? 'passed' : 'failed', request_events: requests, db_failure_events: dbFailures, console_canary_hits: consoleHits, wire_safe: wireSafe, positive_controls: 6, console_overflow: overflow };
   } finally {
     if (child) { child.kill('SIGTERM'); await closed; }
     server.closeAllConnections();

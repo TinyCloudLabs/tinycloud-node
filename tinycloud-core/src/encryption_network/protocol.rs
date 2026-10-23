@@ -20,6 +20,11 @@ pub const NETWORK_ADMIN_TYPE: &str = "tinycloud.encryption.network-admin/v1";
 pub const DECRYPT_ACTION: &str = "tinycloud.encryption/decrypt";
 pub const NETWORK_CREATE_ACTION: &str = "tinycloud.encryption/network.create";
 pub const NETWORK_REVOKE_ACTION: &str = "tinycloud.encryption/network.revoke";
+pub const KEY_ADMIN_TYPE: &str = "tinycloud.encryption.key-admin/v1";
+pub const KEY_DESCRIBE_TYPE: &str = "tinycloud.encryption.key-describe/v1";
+pub const KEY_CREATE_ACTION: &str = "tinycloud.encryption/key.create";
+pub const KEY_BLOCK_ACTION: &str = "tinycloud.encryption/key.block";
+pub const KEY_UNBLOCK_ACTION: &str = "tinycloud.encryption/key.unblock";
 
 /// Body of a POST /encryption/networks/<networkId>/decrypt request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,6 +49,9 @@ pub struct DecryptRequestBody {
     pub receiver_public_key: String,
     #[serde(rename = "receiverPublicKeyHash")]
     pub receiver_public_key_hash: String,
+    /// Named-key path; present iff the capability names a key (`/invoke` only).
+    #[serde(rename = "keyPath", default, skip_serializing_if = "Option::is_none")]
+    pub key_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,6 +138,9 @@ pub struct DecryptFacts {
     pub alg: String,
     #[serde(rename = "keyVersion")]
     pub key_version: i64,
+    /// Named-key path; present iff the capability names a key.
+    #[serde(rename = "keyPath", default, skip_serializing_if = "Option::is_none")]
+    pub key_path: Option<String>,
 }
 
 /// UCAN-style invocation envelope for encryption-network lifecycle actions.
@@ -161,6 +172,33 @@ pub struct NetworkAdminFacts {
     #[serde(rename = "bodyHash")]
     pub body_hash: String,
     pub action: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyAdminFacts {
+    #[serde(rename = "type")]
+    pub ty: String,
+    #[serde(rename = "targetNode")]
+    pub target_node: String,
+    #[serde(rename = "networkId")]
+    pub network_id: NetworkId,
+    #[serde(rename = "keyPath")]
+    pub key_path: String,
+    pub action: String,
+    #[serde(rename = "bodyHash")]
+    pub body_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyDescribeFacts {
+    #[serde(rename = "type")]
+    pub ty: String,
+    #[serde(rename = "targetNode")]
+    pub target_node: String,
+    #[serde(rename = "networkId")]
+    pub network_id: NetworkId,
+    #[serde(rename = "keyPath")]
+    pub key_path: String,
 }
 
 impl DecryptInvocation {
@@ -229,6 +267,7 @@ mod tests {
                 receiver_public_key_hash: "cc".repeat(32),
                 alg: "x25519-aes256gcm/v1".to_string(),
                 key_version: 1,
+                key_path: None,
             },
             nonce: "nonce-1".to_string(),
             not_before: None,
@@ -288,6 +327,7 @@ mod tests {
             encrypted_symmetric_key_hash: "aa".repeat(32),
             receiver_public_key: "BAUG".to_string(),
             receiver_public_key_hash: "bb".repeat(32),
+            key_path: None,
         };
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(json["type"], json!(DECRYPT_REQUEST_TYPE));
@@ -309,6 +349,7 @@ mod tests {
             encrypted_symmetric_key_hash: "aa".repeat(32),
             receiver_public_key: "BAUG".to_string(),
             receiver_public_key_hash: "bb".repeat(32),
+            key_path: None,
         };
         let mut body_json = serde_json::to_value(body).unwrap();
         body_json["unsupported"] = json!(true);

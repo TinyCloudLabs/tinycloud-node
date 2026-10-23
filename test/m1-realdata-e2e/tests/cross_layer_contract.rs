@@ -1180,7 +1180,7 @@ async fn seed_listen_sql(sql: &SqlService, space: &SpaceId) -> Result<()> {
             ],
         },
         None,
-        "tinycloud.sql/write".to_string(),
+        "tinycloud.sql/admin".to_string(),
     )
     .await?;
     sql.execute(
@@ -1861,7 +1861,7 @@ async fn seed_grant_vector_sql(sql: &SqlService, space: &SpaceId) -> Result<()> 
             ],
         },
         None,
-        "tinycloud.sql/write".to_string(),
+        "tinycloud.sql/admin".to_string(),
     )
     .await?;
     Ok(())
