@@ -450,6 +450,12 @@ impl Harness {
         Ok(Some(harness))
     }
 
+    /// The database URL the app is booted on, for probes that open their own
+    /// sessions.
+    pub fn database_url(&self) -> &str {
+        self._db.url()
+    }
+
     async fn boot_app(
         db: &TestDatabase,
         vector: &Value,

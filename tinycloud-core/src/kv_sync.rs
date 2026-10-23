@@ -68,7 +68,7 @@ const SPACE_SEQUENCE_LOCK_DOMAIN: &[u8] = b"tinycloud/kv-seq/v1\0";
 
 /// Advisory-lock key for `space`: the first 8 bytes of
 /// `blake3("tinycloud/kv-seq/v1\0" || space)`, big-endian.
-fn space_sequence_lock_key(space: &SpaceId) -> i64 {
+pub fn space_sequence_lock_key(space: &SpaceId) -> i64 {
     let mut preimage = SPACE_SEQUENCE_LOCK_DOMAIN.to_vec();
     preimage.extend_from_slice(space.to_string().as_bytes());
     let digest = crate::hash::hash(&preimage);

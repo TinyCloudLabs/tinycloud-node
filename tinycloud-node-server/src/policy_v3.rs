@@ -10781,3 +10781,7 @@ mod test_harness;
 #[cfg(test)]
 #[path = "policy_v3/root_revocation_tests.rs"]
 mod root_revocation_tests;
+
+#[cfg(test)]
+#[path = "policy_v3/registration_probe_tests.rs"]
+mod registration_probe_tests;
