@@ -57,13 +57,23 @@ a version into the `docker.yml` `image_version` input that `Cargo.toml` does not
 already claim. Both have happened (`0b48da2`, and the image tagged `1.10.0`
 built from a `1.9.0` tree); the `version-guard` job now blocks the second one.
 
-## The CVM must run the production OS image
+## The CVM must run a permitted OS image
 
 The `deploy-phala` job in `docker.yml` refuses to deploy, and fails after a
-deploy, unless the `tinycloud-node` CVM reports `.os.is_dev == false` with the
-name and hash pinned in `PHALA_OS_IMAGE` / `PHALA_OS_IMAGE_HASH` (`dstack-0.5.12`).
-The Phala KMS only releases app keys to the production image. CI never changes
-the OS. If the check fails, set it by hand, then re-run:
+deploy, unless the `tinycloud-node` CVM reports one of:
+
+- the production image: `.os.is_dev == false` with the name and hash pinned in
+  `PHALA_OS_IMAGE` / `PHALA_OS_IMAGE_HASH` (`dstack-0.5.12`); or
+- a dev image whose `.os.os_image_hash` is listed in
+  `scripts/ci/phala-dev-os-allowlist.txt` (today only `dstack-dev-0.5.12`), and
+  that passes a fresh check in the same job: `download.dstack.org` serves
+  `mr_<hash>.tar.gz`, and `sha256sum sha256sum.txt` of the extracted archive
+  equals `<hash>`.
+
+Anything else fails closed: an unknown dev hash, a missing field, a failed fetch
+or a hash mismatch. The allowlist is changed only by a reviewed PR. The logic is
+`scripts/ci/phala-os-guard.sh`, tested by `scripts/ci/test-phala-os-guard.sh`.
+CI never changes the OS. If the check fails, set it by hand, then re-run:
 
 ```sh
 phala cvms get tinycloud-node --json | jq .os
