@@ -27,18 +27,28 @@ use crate::util::InvocationInfo;
 
 use super::backend::{KeyBackend, KeyBackendError};
 use super::canonical::{canonical_hash, canonical_json_bytes, hash_hex};
+use super::key_id::{self, EncryptionResource, KeyLocation};
 use super::keys::DEFAULT_KEY_CAP_PER_NETWORK;
 use super::network_id::NetworkId;
 use super::protocol::{
-    DecryptFacts, DecryptInvocation, DecryptRequestBody, DecryptResponseBody, NetworkAdminFacts,
-    NetworkAdminInvocation, DECRYPT_ACTION, DECRYPT_REQUEST_TYPE, DECRYPT_RESULT_TYPE,
-    NETWORK_ADMIN_TYPE,
+    DecryptFacts, DecryptInvocation, DecryptRequestBody, DecryptResponseBody, KeyAdminFacts,
+    KeyDescribeFacts, NetworkAdminFacts, NetworkAdminInvocation, DECRYPT_ACTION,
+    DECRYPT_REQUEST_TYPE, DECRYPT_RESULT_TYPE, KEY_ADMIN_TYPE, KEY_BLOCK_ACTION, KEY_CREATE_ACTION,
+    KEY_DESCRIBE_TYPE, KEY_UNBLOCK_ACTION, NETWORK_ADMIN_TYPE,
 };
 use super::types::{
     KeyBackendKind, NetworkDescriptor, NetworkMemberDescriptor, NetworkState, Threshold,
 };
 
 const DEFAULT_INVOCATION_TTL_SECONDS: i64 = 300;
+
+/// Abilities a key-describe invocation may carry on the exact key.
+const KEY_DESCRIBE_ABILITIES: &[&str] = &[
+    DECRYPT_ACTION,
+    KEY_CREATE_ACTION,
+    KEY_BLOCK_ACTION,
+    KEY_UNBLOCK_ACTION,
+];
 
 fn network_id_matches(actual: &str, expected: &NetworkId) -> bool {
     actual
@@ -51,15 +61,15 @@ fn network_id_matches(actual: &str, expected: &NetworkId) -> bool {
 pub enum EncryptionServiceError {
     #[error("db error: {0}")]
     Db(#[from] DbErr),
-    #[error("network not found")]
+    #[error("network_not_found: no network exists with this id")]
     NetworkNotFound,
     #[error("network already exists")]
     NetworkAlreadyExists,
-    #[error("network is not active (state: {0})")]
+    #[error("network_not_active: the network is not active (state: {0})")]
     NetworkNotActive(String),
     #[error("network has been revoked")]
     NetworkRevoked,
-    #[error("decrypt action not permitted")]
+    #[error("unauthorized: the invocation does not grant this action on this resource")]
     Unauthorized,
     #[error("invocation audience does not match this node")]
     AudienceMismatch,
@@ -105,6 +115,8 @@ pub enum EncryptionServiceError {
     KeyUnwrapFailed(#[source] KeyBackendError),
     #[error("corrupt_key_row: stored key row is not readable")]
     CorruptKeyRow,
+    #[error("key_path_invalid: {0}")]
+    KeyPathInvalid(String),
 }
 
 pub struct EncryptionService {
@@ -454,6 +466,94 @@ impl EncryptionService {
         let expected_body_hash = canonical_hash(body_value);
         if expected_body_hash != facts.body_hash {
             return Err(EncryptionServiceError::HashMismatch("bodyHash"));
+        }
+
+        let exp = native_invocation_exp(invocation)?;
+        self.consume_nonce(
+            &invocation.invoker,
+            native_invocation_nonce(invocation)?,
+            exp,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Verifies a key-admin invocation (`key.create`, `key.block`,
+    /// `key.unblock`) for one key. The invocation carries exactly one
+    /// capability, and it must name exactly this key.
+    pub async fn verify_key_admin_authorized(
+        &self,
+        network_id: &NetworkId,
+        key: &KeyLocation,
+        action: &str,
+        invocation: &InvocationInfo,
+        body_value: &Value,
+    ) -> Result<(), EncryptionServiceError> {
+        let facts: KeyAdminFacts = native_typed_fact(invocation, KEY_ADMIN_TYPE)?;
+        if invocation.invocation.payload().audience != self.node_did.as_str() {
+            return Err(EncryptionServiceError::AudienceMismatch);
+        }
+        if facts.target_node != self.node_did {
+            return Err(EncryptionServiceError::TargetNodeMismatch);
+        }
+        if &facts.network_id != network_id {
+            return Err(EncryptionServiceError::NetworkMismatch);
+        }
+        if facts.key_path != key.path() || facts.action != action {
+            return Err(EncryptionServiceError::Unauthorized);
+        }
+        let [cap] = invocation.capabilities.as_slice() else {
+            return Err(EncryptionServiceError::Unauthorized);
+        };
+        if cap.ability.to_string() != action
+            || !key_resource_matches(&cap.resource.to_string(), key)
+        {
+            return Err(EncryptionServiceError::Unauthorized);
+        }
+        if canonical_hash(body_value) != facts.body_hash {
+            return Err(EncryptionServiceError::HashMismatch("bodyHash"));
+        }
+
+        let exp = native_invocation_exp(invocation)?;
+        self.consume_nonce(
+            &invocation.invoker,
+            native_invocation_nonce(invocation)?,
+            exp,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Verifies a key-describe invocation for one key. The invocation carries
+    /// exactly one capability on this key, with one of the key-scoped
+    /// abilities.
+    pub async fn verify_key_describe_authorized(
+        &self,
+        network_id: &NetworkId,
+        key: &KeyLocation,
+        invocation: &InvocationInfo,
+    ) -> Result<(), EncryptionServiceError> {
+        let facts: KeyDescribeFacts = native_typed_fact(invocation, KEY_DESCRIBE_TYPE)?;
+        if invocation.invocation.payload().audience != self.node_did.as_str() {
+            return Err(EncryptionServiceError::AudienceMismatch);
+        }
+        if facts.target_node != self.node_did {
+            return Err(EncryptionServiceError::TargetNodeMismatch);
+        }
+        if &facts.network_id != network_id {
+            return Err(EncryptionServiceError::NetworkMismatch);
+        }
+        if facts.key_path != key.path() {
+            return Err(EncryptionServiceError::Unauthorized);
+        }
+        let [cap] = invocation.capabilities.as_slice() else {
+            return Err(EncryptionServiceError::Unauthorized);
+        };
+        let ability = cap.ability.to_string();
+        if !KEY_DESCRIBE_ABILITIES.contains(&ability.as_str())
+            || !key_resource_matches(&cap.resource.to_string(), key)
+        {
+            return Err(EncryptionServiceError::Unauthorized);
         }
 
         let exp = native_invocation_exp(invocation)?;
@@ -1031,6 +1131,34 @@ where
         .ok_or_else(|| {
             EncryptionServiceError::InvalidBody("missing encryption invocation facts".to_string())
         })
+}
+
+/// Finds the fact whose `type` matches `ty` and decodes it. A missing match is
+/// `WrongInvocationType`, so a fact of another kind is refused before its
+/// fields are read.
+fn native_typed_fact<T>(invocation: &InvocationInfo, ty: &str) -> Result<T, EncryptionServiceError>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let facts = invocation
+        .invocation
+        .payload()
+        .facts
+        .as_deref()
+        .unwrap_or_default();
+    let fact = facts
+        .iter()
+        .find(|fact| fact.get("type").and_then(Value::as_str) == Some(ty))
+        .ok_or(EncryptionServiceError::WrongInvocationType)?;
+    serde_json::from_value::<T>(fact.clone()).map_err(|error| {
+        EncryptionServiceError::InvalidBody(format!("malformed invocation fact: {error}"))
+    })
+}
+
+/// True only when `resource` is the URN of exactly `key`. Prefixes, the bare
+/// network and other keys are not a match.
+fn key_resource_matches(resource: &str, key: &KeyLocation) -> bool {
+    matches!(key_id::parse(resource), Ok(EncryptionResource::Key(loc)) if &loc == key)
 }
 
 fn native_invocation_exp(invocation: &InvocationInfo) -> Result<i64, EncryptionServiceError> {

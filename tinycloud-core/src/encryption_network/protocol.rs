@@ -20,6 +20,11 @@ pub const NETWORK_ADMIN_TYPE: &str = "tinycloud.encryption.network-admin/v1";
 pub const DECRYPT_ACTION: &str = "tinycloud.encryption/decrypt";
 pub const NETWORK_CREATE_ACTION: &str = "tinycloud.encryption/network.create";
 pub const NETWORK_REVOKE_ACTION: &str = "tinycloud.encryption/network.revoke";
+pub const KEY_ADMIN_TYPE: &str = "tinycloud.encryption.key-admin/v1";
+pub const KEY_DESCRIBE_TYPE: &str = "tinycloud.encryption.key-describe/v1";
+pub const KEY_CREATE_ACTION: &str = "tinycloud.encryption/key.create";
+pub const KEY_BLOCK_ACTION: &str = "tinycloud.encryption/key.block";
+pub const KEY_UNBLOCK_ACTION: &str = "tinycloud.encryption/key.unblock";
 
 /// Body of a POST /encryption/networks/<networkId>/decrypt request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -161,6 +166,33 @@ pub struct NetworkAdminFacts {
     #[serde(rename = "bodyHash")]
     pub body_hash: String,
     pub action: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyAdminFacts {
+    #[serde(rename = "type")]
+    pub ty: String,
+    #[serde(rename = "targetNode")]
+    pub target_node: String,
+    #[serde(rename = "networkId")]
+    pub network_id: NetworkId,
+    #[serde(rename = "keyPath")]
+    pub key_path: String,
+    pub action: String,
+    #[serde(rename = "bodyHash")]
+    pub body_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyDescribeFacts {
+    #[serde(rename = "type")]
+    pub ty: String,
+    #[serde(rename = "targetNode")]
+    pub target_node: String,
+    #[serde(rename = "networkId")]
+    pub network_id: NetworkId,
+    #[serde(rename = "keyPath")]
+    pub key_path: String,
 }
 
 impl DecryptInvocation {
