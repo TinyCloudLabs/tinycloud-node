@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
-import { calculateBudget, representativeEvents, serializedEventBytes, INDIVIDUAL_EVENT_CODES, MINUTES_30_DAYS, REQUEST_ALLOCATION_BYTES } from './budget.mjs';
+import { calculateBudget, representativeEvents, serializedEventBytes, INDIVIDUAL_EVENT_CODES, SHIPPER_EVENT_CODES, CAPPED_CLASSES, CAPPED_ALLOCATION_BYTES, CAP_WINDOW_SECONDS, MINUTES_30_DAYS, REQUEST_ALLOCATION_BYTES } from './budget.mjs';
 
 const fields = JSON.parse(await readFile(new URL('./fields.json', import.meta.url), 'utf8'));
 const nodeSchema = fields.services['tinycloud-node'];
@@ -76,7 +76,7 @@ test('fixed diagnostic reserve is separate from the request allocation', () => {
 
 test('diagnostic storm reserve covers every code at both severity levels', () => {
   const budget = calculateBudget({ requestsPerMinute: 0 });
-  const maximumGroups = nodeSchema.fields.event_code.values.filter(code => !INDIVIDUAL_EVENT_CODES.includes(code)).length * 2;
+  const maximumGroups = nodeSchema.fields.event_code.values.filter(code => !INDIVIDUAL_EVENT_CODES.includes(code) && !SHIPPER_EVENT_CODES.includes(code)).length * 2;
   assert.ok(budget.diagnosticEventsPerMinute >= maximumGroups);
   assert.ok(budget.diagnosticReserveBytes30Days >= maximumGroups * serializedEventBytes(representativeEvents.diagnostic) * MINUTES_30_DAYS);
 });
@@ -84,7 +84,7 @@ test('diagnostic storm reserve covers every code at both severity levels', () =>
 test('the 5xx diagnostic is an individual event: not an aggregated code, and its representative is worst-valid (TC-1840)', () => {
   assert.deepEqual(INDIVIDUAL_EVENT_CODES, ['db_failure_5xx']);
   assert.ok(nodeSchema.fields.event_code.values.includes('db_failure_5xx'));
-  assert.equal(calculateBudget({ requestsPerMinute: 0 }).diagnosticEventsPerMinute, (nodeSchema.fields.event_code.values.length - 1) * 2);
+  assert.equal(calculateBudget({ requestsPerMinute: 0 }).diagnosticEventsPerMinute, (nodeSchema.fields.event_code.values.length - INDIVIDUAL_EVENT_CODES.length - SHIPPER_EVENT_CODES.length) * 2);
   assert.notEqual(representativeEvents.diagnostic.event_code, 'db_failure_5xx');
   const row = representativeEvents.dbFailure;
   assert.equal(row.event_code, 'db_failure_5xx');
@@ -94,6 +94,59 @@ test('the 5xx diagnostic is an individual event: not an aggregated code, and its
   assert.match(row.db_hash, new RegExp(nodeSchema.fields.db_hash.regex));
   assert.equal(row.elapsed_ms, nodeSchema.fields.elapsed_ms.max);
   assert.equal(calculateBudget({ requestsPerMinute: 0 }).eventBytes.dbFailure, serializedEventBytes(row, 'ndjson'));
+});
+
+test('the dropped-count event is emitted by the shipper: not an aggregated code, worst-valid, and no node log line maps to it (TC-1843)', async () => {
+  assert.deepEqual(SHIPPER_EVENT_CODES, ['errors_dropped']);
+  assert.ok(nodeSchema.fields.event_code.values.includes('errors_dropped'));
+  assert.notEqual(representativeEvents.diagnostic.event_code, 'errors_dropped');
+  const row = representativeEvents.errorsDropped;
+  assert.deepEqual(Object.keys(row).sort(), ['class', 'dropped', 'event', 'event_code', 'level', 'svc', 'ts', 'window_s']);
+  assert.equal(row.event_code, 'errors_dropped');
+  assert.equal(row.class, 'ingress_request_5xx');
+  assert.ok(nodeSchema.fields.class.values.includes(row.class));
+  assert.equal(row.dropped, nodeSchema.fields.dropped.max);
+  assert.equal(row.window_s, 60);
+  assert.equal(calculateBudget({ requestsPerMinute: 0 }).eventBytes.errorsDropped, serializedEventBytes(row, 'ndjson'));
+  const diagnostics = JSON.parse(await readFile(new URL('./diagnostics.json', import.meta.url), 'utf8'));
+  assert.equal([...Object.values(diagnostics.exact), ...Object.values(diagnostics.prefix)].includes('errors_dropped'), false);
+});
+
+test('capped classes: worst case is cap x worst-valid bytes x 43,200 minutes plus one dropped-count event per class per minute, within 600 MB (TC-1843)', () => {
+  assert.equal(CAP_WINDOW_SECONDS, 60);
+  assert.equal(CAPPED_ALLOCATION_BYTES, 600_000_000);
+  assert.ok(CAPPED_ALLOCATION_BYTES <= 0.2 * 3_000_000_000);
+  assert.deepEqual(Object.keys(CAPPED_CLASSES).sort(), [...nodeSchema.fields.class.values].sort());
+  for (const { capPerMinute } of Object.values(CAPPED_CLASSES)) assert.ok(Number.isSafeInteger(capPerMinute) && capPerMinute >= 1);
+  for (const framing of ['ndjson', 'json-array']) {
+    const budget = calculateBudget({ requestsPerMinute: 0, framing });
+    const bytes = name => serializedEventBytes(representativeEvents[name], framing);
+    assert.equal(budget.cappedClasses.db_failure_5xx.bytes30Days, CAPPED_CLASSES.db_failure_5xx.capPerMinute * bytes('dbFailure') * 43200);
+    assert.equal(budget.cappedClasses.node_request_5xx.bytes30Days, CAPPED_CLASSES.node_request_5xx.capPerMinute * bytes('node') * 43200);
+    assert.equal(budget.cappedClasses.ingress_request_5xx.bytes30Days, CAPPED_CLASSES.ingress_request_5xx.capPerMinute * bytes('ingress') * 43200);
+    assert.equal(budget.cappedClasses.node_request_4xx.bytes30Days, CAPPED_CLASSES.node_request_4xx.capPerMinute * bytes('node') * 43200);
+    assert.equal(budget.cappedClasses.ingress_request_4xx.bytes30Days, CAPPED_CLASSES.ingress_request_4xx.capPerMinute * bytes('ingress') * 43200);
+    assert.equal(budget.droppedCountBytes30Days, 5 * bytes('errorsDropped') * 43200);
+    assert.equal(budget.cappedReserveBytes30Days, budget.cappedEventBytes30Days + budget.droppedCountBytes30Days);
+    assert.equal(budget.cappedEventBytes30Days, Object.values(budget.cappedClasses).reduce((sum, row) => sum + row.bytes30Days, 0));
+    assert.equal(budget.cappedAllocationBytes, CAPPED_ALLOCATION_BYTES);
+    assert.equal(budget.withinCappedAllocation, true);
+    assert.ok(budget.cappedReserveBytes30Days <= CAPPED_ALLOCATION_BYTES);
+    // The reserve is additional: the request and diagnostic totals do not change, and the combined worst case adds it.
+    assert.equal(budget.totalBytes30Days, budget.requestBytes30Days + budget.diagnosticReserveBytes30Days);
+    assert.equal(budget.totalWithCappedBytes30Days, budget.totalBytes30Days + budget.cappedReserveBytes30Days);
+  }
+  // The figures quoted in the runbook: 10 per minute for each 5xx class, 3 per minute for each 4xx class.
+  assert.deepEqual(Object.entries(CAPPED_CLASSES).map(([name, row]) => [name, row.capPerMinute]), [['db_failure_5xx', 10], ['node_request_5xx', 10], ['ingress_request_5xx', 10], ['node_request_4xx', 3], ['ingress_request_4xx', 3]]);
+  const ndjson = calculateBudget({ requestsPerMinute: 0 });
+  assert.equal(ndjson.cappedClasses.node_request_4xx.bytes30Days, 3 * 439 * 43200);
+  assert.equal(ndjson.cappedClasses.ingress_request_4xx.bytes30Days, 3 * 223 * 43200);
+  assert.equal(ndjson.cappedEventBytes30Days, (10 * (402 + 439 + 223) + 3 * (439 + 223)) * 43200);
+  assert.equal(ndjson.cappedEventBytes30Days, 545_443_200);
+  assert.equal(ndjson.droppedCountBytes30Days, 39_960_000);
+  assert.equal(ndjson.cappedReserveBytes30Days, 585_403_200);
+  // The 4xx cap is the largest whole number that fits: one more per minute per 4xx class exceeds the reserve.
+  assert.ok(ndjson.cappedReserveBytes30Days + (439 + 223) * 43200 > CAPPED_ALLOCATION_BYTES);
 });
 
 test('invalid numeric budgets fail rather than hiding impossible volume', () => {
@@ -113,6 +166,7 @@ test('diagnostic mapping uses only closed schema codes and cannot assert a panic
   for (const code of [...Object.values(diagnostics.exact), ...Object.values(diagnostics.prefix), diagnostics.fallback]) {
     assert.ok(codes.includes(code));
     assert.equal(code.includes('panic'), false);
+    assert.notEqual(code, 'errors_dropped');
   }
   assert.equal(Object.hasOwn(diagnostics.exact, 'node fatal panic'), false);
   assert.equal(diagnostics.exact['invalid link bind address; LAN listener not started'], 'link_bind_invalid');
