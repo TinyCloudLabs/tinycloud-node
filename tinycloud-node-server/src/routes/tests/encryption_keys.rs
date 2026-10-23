@@ -1438,6 +1438,24 @@ fn decrypt_request(
     (body, facts)
 }
 
+/// `decrypt_request` with the receiver key replaced by `receiver`, hashes kept consistent so
+/// only the receiver key itself is malformed.
+fn decrypt_request_with_receiver(
+    fixture: &KvSyncFixture,
+    network: &str,
+    case: &DecryptCase,
+    key_path: Option<&str>,
+    receiver: &[u8],
+) -> (Value, Value) {
+    let (mut body, mut facts) = decrypt_request(fixture, network, case, key_path);
+    let receiver_hash = canonical_hash(&Value::String(base64::encode(receiver)));
+    body["receiverPublicKey"] = json!(base64::encode(receiver));
+    body["receiverPublicKeyHash"] = json!(receiver_hash);
+    facts["receiverPublicKeyHash"] = json!(receiver_hash);
+    facts["bodyHash"] = json!(canonical_hash(&body));
+    (body, facts)
+}
+
 /// POST a decrypt body to `/invoke`.
 async fn invoke(fixture: &KvSyncFixture, auth: &str, body: &Value) -> (Status, String) {
     post_json(&fixture.client, "/invoke", auth, body).await
@@ -1553,8 +1571,8 @@ async fn named_key_decrypt_over_invoke_round_trips_and_audits_key_path() -> Resu
 #[tokio::test]
 async fn direct_route_refuses_a_named_key_capability_with_a_well_formed_body() -> Result<()> {
     let (fixture, network) = setup().await?;
-    let key_public = created_key(&fixture, &network, "docs/a").await;
-    let case = DecryptCase::wrapped_to(&key_public);
+    let root_public = root_public_key(&fixture, &network).await;
+    let case = DecryptCase::wrapped_to(&root_public);
     let (body, facts) = decrypt_request(&fixture, &network, &case, None);
     let resource = key_uri(&network, "docs/a");
     let auth = invocation(
@@ -1565,6 +1583,83 @@ async fn direct_route_refuses_a_named_key_capability_with_a_well_formed_body() -
     )?;
     let (status, text) = post_json(&fixture.client, &decrypt_url(&network), &auth, &body).await;
     assert_eq!(status, Status::Unauthorized, "{text}");
+    assert!(!text.contains("wrappedKey"), "{text}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn direct_route_refuses_a_malformed_or_low_order_receiver() -> Result<()> {
+    let (fixture, network) = setup().await?;
+    let root_public = root_public_key(&fixture, &network).await;
+    let case = DecryptCase::wrapped_to(&root_public);
+    for receiver in [vec![0x11u8; 31], vec![0u8; 32]] {
+        let (body, facts) =
+            decrypt_request_with_receiver(&fixture, &network, &case, None, &receiver);
+        let auth = invocation(
+            &fixture,
+            &fixture.node_did,
+            &[(network.as_str(), DIRECT_DECRYPT_ABILITY)],
+            vec![facts],
+        )?;
+        let (status, text) = post_json(&fixture.client, &decrypt_url(&network), &auth, &body).await;
+        assert_eq!(status, Status::BadRequest, "{text}");
+        assert!(!text.contains("wrappedKey"), "{text}");
+        assert!(!text.contains(&base64::encode(&case.symmetric)), "{text}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn invoke_refuses_a_malformed_or_low_order_receiver_before_unwrap() -> Result<()> {
+    let (fixture, network) = setup().await?;
+    let key_public = created_key(&fixture, &network, "docs/a").await;
+    let case = DecryptCase::wrapped_to(&key_public);
+    let resource = key_uri(&network, "docs/a");
+    for receiver in [vec![0x11u8; 31], vec![0u8; 32]] {
+        let (body, facts) =
+            decrypt_request_with_receiver(&fixture, &network, &case, Some("docs/a"), &receiver);
+        let auth = invocation(
+            &fixture,
+            &fixture.node_did,
+            &[(resource.as_str(), DECRYPT_ACTION)],
+            vec![facts],
+        )?;
+        let (status, text) = invoke(&fixture, &auth, &body).await;
+        assert_eq!(status, Status::BadRequest, "{text}");
+        assert!(!text.contains("wrappedKey"), "{text}");
+        assert!(!text.contains(&base64::encode(&case.symmetric)), "{text}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn invoke_refuses_a_blocked_key_even_with_a_valid_wrap() -> Result<()> {
+    let (fixture, network) = setup().await?;
+    let key_public = created_key(&fixture, &network, "docs/a").await;
+    let (status, text) = key_action(&fixture, &network, "docs/a", "block").await?;
+    assert_eq!(status, Status::Ok, "block: {text}");
+    let case = DecryptCase::wrapped_to(&key_public);
+    let (status, text) = invoke_named(&fixture, &network, "docs/a", &case).await;
+    assert_eq!(status, Status::Forbidden, "{text}");
+    assert!(!text.contains("wrappedKey"), "{text}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn invoke_refuses_a_key_prefix_as_the_decrypt_target() -> Result<()> {
+    let (fixture, network) = setup().await?;
+    let key_public = created_key(&fixture, &network, "apps/foo/x").await;
+    let case = DecryptCase::wrapped_to(&key_public);
+    let (body, facts) = decrypt_request(&fixture, &network, &case, Some("apps/foo/x"));
+    let prefix = format!("{network}/apps/foo/");
+    let auth = invocation(
+        &fixture,
+        &fixture.node_did,
+        &[(prefix.as_str(), DECRYPT_ACTION)],
+        vec![facts],
+    )?;
+    let (status, text) = invoke(&fixture, &auth, &body).await;
+    assert_eq!(status, Status::Forbidden, "{text}");
     assert!(!text.contains("wrappedKey"), "{text}");
     Ok(())
 }

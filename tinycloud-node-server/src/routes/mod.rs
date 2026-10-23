@@ -1801,7 +1801,12 @@ async fn invoke_impl(
             encryption
                 .validate_authorized_decrypt_request(&target, &admitted.invocation().0, &body)
                 .await
-                .map_err(|error| (Status::Forbidden, error.to_string()))?;
+                .map_err(|error| match error {
+                    tinycloud_core::encryption_network::EncryptionServiceError::InvalidBody(_) => {
+                        (Status::BadRequest, error.to_string())
+                    }
+                    _ => (Status::Forbidden, error.to_string()),
+                })?;
             if policy_session_invocation {
                 invocation_replay_cache
                     .check_and_insert_invoker_nonce(admitted.invocation(), 60)

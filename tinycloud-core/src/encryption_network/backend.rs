@@ -106,12 +106,29 @@ pub fn wrap_to_public_key(
     let ephemeral = StaticSecret::random_from_rng(OsRng);
     let ephemeral_pub = PublicKey::from(&ephemeral);
     let shared = ephemeral.diffie_hellman(&recipient);
+    if !shared.was_contributory() {
+        return Err(KeyBackendError::NonContributory);
+    }
     let cipher = ColumnEncryption::new(*shared.as_bytes());
     let mut envelope = Vec::with_capacity(32 + plaintext.len() + 32);
     envelope.extend_from_slice(ephemeral_pub.as_bytes());
     let ct = cipher.encrypt(plaintext);
     envelope.extend_from_slice(&ct);
     Ok(envelope)
+}
+
+/// Refuses a receiver public key that cannot receive a wrap: wrong length, or a low-order
+/// point, where the agreement with any ephemeral key is all-zero.
+pub fn validate_receiver_public_key(receiver_public_key: &[u8]) -> Result<(), KeyBackendError> {
+    let recipient = PublicKey::from(
+        <[u8; 32]>::try_from(receiver_public_key).map_err(|_| KeyBackendError::InvalidPublicKey)?,
+    );
+    let ephemeral = StaticSecret::random_from_rng(OsRng);
+    if ephemeral.diffie_hellman(&recipient).was_contributory() {
+        Ok(())
+    } else {
+        Err(KeyBackendError::NonContributory)
+    }
 }
 
 fn unwrap_with_secret(secret: &StaticSecret, wrapped: &[u8]) -> Result<Vec<u8>, KeyBackendError> {
@@ -274,6 +291,28 @@ mod tests {
         let backend = LocalOneOfOneBackend::new(seal_key());
         let err = backend.rewrap(&[0u8; 32], &[1u8; 10]).unwrap_err();
         assert!(matches!(err, KeyBackendError::InvalidPublicKey));
+    }
+
+    #[test]
+    fn receiver_key_validation_refuses_wrong_length_and_low_order_points() {
+        assert!(matches!(
+            validate_receiver_public_key(&[0x11u8; 31]).unwrap_err(),
+            KeyBackendError::InvalidPublicKey
+        ));
+        let mut one = [0u8; 32];
+        one[0] = 1;
+        for low_order in [[0u8; 32], one] {
+            assert!(matches!(
+                validate_receiver_public_key(&low_order).unwrap_err(),
+                KeyBackendError::NonContributory
+            ));
+            assert!(matches!(
+                wrap_to_public_key(&low_order, &[0x33u8; 32]).unwrap_err(),
+                KeyBackendError::NonContributory
+            ));
+        }
+        let receiver = StaticSecret::random_from_rng(OsRng);
+        assert!(validate_receiver_public_key(PublicKey::from(&receiver).as_bytes()).is_ok());
     }
 
     fn hex(bytes: &[u8]) -> String {

@@ -25,7 +25,7 @@ use crate::models::{
 };
 use crate::util::InvocationInfo;
 
-use super::backend::{KeyBackend, KeyBackendError};
+use super::backend::{validate_receiver_public_key, KeyBackend, KeyBackendError};
 use super::canonical::{canonical_hash, canonical_json_bytes, hash_hex};
 use super::key_id::{self, EncryptionResource, KeyLocation};
 use super::keys::{canonical_key_urn, network_of, DEFAULT_KEY_CAP_PER_NETWORK};
@@ -889,7 +889,9 @@ impl EncryptionService {
             native_invocation_not_before(invocation),
             native_invocation_exp(invocation)?,
         )?;
-        decode_base64(&body.receiver_public_key).map_err(EncryptionServiceError::Base64)?;
+        let receiver_key =
+            decode_base64(&body.receiver_public_key).map_err(EncryptionServiceError::Base64)?;
+        check_receiver_public_key(&receiver_key)?;
         decode_base64(&body.encrypted_symmetric_key).map_err(EncryptionServiceError::Base64)?;
         let receiver_hash = canonical_hash(&Value::String(body.receiver_public_key.clone()));
         let key_hash = canonical_hash(&Value::String(body.encrypted_symmetric_key.clone()));
@@ -919,12 +921,12 @@ impl EncryptionService {
             return Err(EncryptionServiceError::WrongInvocationType);
         }
         if invocation.invocation.payload().audience != self.node_did.as_str() {
-            self.record_native_audit(invocation, network_id, &facts, "denied:audience")
+            self.record_native_audit(invocation, target, &facts, "denied:audience")
                 .await?;
             return Err(EncryptionServiceError::AudienceMismatch);
         }
         if facts.target_node != self.node_did || body.target_node != self.node_did {
-            self.record_native_audit(invocation, network_id, &facts, "denied:target-node")
+            self.record_native_audit(invocation, target, &facts, "denied:target-node")
                 .await?;
             return Err(EncryptionServiceError::TargetNodeMismatch);
         }
@@ -943,12 +945,12 @@ impl EncryptionService {
         match descriptor.state {
             NetworkState::Active => {}
             NetworkState::Revoked => {
-                self.record_native_audit(invocation, network_id, &facts, "denied:revoked")
+                self.record_native_audit(invocation, target, &facts, "denied:revoked")
                     .await?;
                 return Err(EncryptionServiceError::NetworkRevoked);
             }
             other => {
-                self.record_native_audit(invocation, network_id, &facts, "denied:state")
+                self.record_native_audit(invocation, target, &facts, "denied:state")
                     .await?;
                 return Err(EncryptionServiceError::NetworkNotActive(
                     other.as_str().to_string(),
@@ -962,6 +964,7 @@ impl EncryptionService {
 
         let receiver_key_bytes =
             decode_base64(&body.receiver_public_key).map_err(EncryptionServiceError::Base64)?;
+        check_receiver_public_key(&receiver_key_bytes)?;
         let wrapped_key_bytes =
             decode_base64(&body.encrypted_symmetric_key).map_err(EncryptionServiceError::Base64)?;
 
@@ -970,7 +973,7 @@ impl EncryptionService {
         if expected_receiver_hash != body.receiver_public_key_hash
             || expected_receiver_hash != facts.receiver_public_key_hash
         {
-            self.record_native_audit(invocation, network_id, &facts, "denied:receiver-hash")
+            self.record_native_audit(invocation, target, &facts, "denied:receiver-hash")
                 .await?;
             return Err(EncryptionServiceError::HashMismatch(
                 "receiverPublicKeyHash",
@@ -982,7 +985,7 @@ impl EncryptionService {
         if expected_key_hash != body.encrypted_symmetric_key_hash
             || expected_key_hash != facts.encrypted_symmetric_key_hash
         {
-            self.record_native_audit(invocation, network_id, &facts, "denied:key-hash")
+            self.record_native_audit(invocation, target, &facts, "denied:key-hash")
                 .await?;
             return Err(EncryptionServiceError::HashMismatch(
                 "encryptedSymmetricKeyHash",
@@ -991,7 +994,7 @@ impl EncryptionService {
 
         let expected_body_hash = canonical_hash(body_value);
         if expected_body_hash != facts.body_hash {
-            self.record_native_audit(invocation, network_id, &facts, "denied:body-hash")
+            self.record_native_audit(invocation, target, &facts, "denied:body-hash")
                 .await?;
             return Err(EncryptionServiceError::HashMismatch("bodyHash"));
         }
@@ -999,11 +1002,10 @@ impl EncryptionService {
         let invocation_cid = native_invocation_cid(invocation)?;
         let request_hash =
             hash_hex(&[invocation_cid.as_bytes(), expected_body_hash.as_bytes()].concat());
-        // `/invoke` owns the single common invoker+nonce reservation for both
-        // KV and decrypt.  This authorized helper is only called after that
-        // reservation and must not consume the legacy encryption_nonce table a
-        // second time.  The direct encryption route still uses `decrypt`,
-        // which retains its own legacy replay boundary for compatibility.
+        // `/invoke` owns the single common invoker+nonce reservation for both KV and decrypt.
+        // This helper runs only after that reservation and must not consume the legacy
+        // encryption_nonce table a second time. The direct encryption route also reaches this
+        // helper without a reservation of its own; that gap is unchanged here.
 
         let (key_version, symmetric) = match target {
             DecryptTarget::Root(_) => {
@@ -1039,7 +1041,7 @@ impl EncryptionService {
                         Err(err) => {
                             self.record_native_audit(
                                 invocation,
-                                network_id,
+                                target,
                                 &facts,
                                 key_denial_outcome(&err),
                             )
@@ -1048,7 +1050,7 @@ impl EncryptionService {
                         }
                     };
                 if key_version != body.key_version || key_version != facts.key_version {
-                    self.record_native_audit(invocation, network_id, &facts, "denied:key-version")
+                    self.record_native_audit(invocation, target, &facts, "denied:key-version")
                         .await?;
                     return Err(EncryptionServiceError::AlgKeyVersionMismatch);
                 }
@@ -1074,7 +1076,7 @@ impl EncryptionService {
         };
         response.node_signature = self.sign_response(&response)?;
 
-        self.record_native_audit(invocation, network_id, &facts, "allowed")
+        self.record_native_audit(invocation, target, &facts, "allowed")
             .await?;
 
         Ok(VerifiedDecrypt {
@@ -1210,20 +1212,26 @@ impl EncryptionService {
     async fn record_native_audit(
         &self,
         invocation: &InvocationInfo,
-        network_id: &NetworkId,
+        target: &DecryptTarget,
         facts: &DecryptFacts,
         outcome: &str,
     ) -> Result<(), EncryptionServiceError> {
         let cid = native_invocation_cid(invocation)?;
         let request_hash = hash_hex(&[cid.as_bytes(), facts.body_hash.as_bytes()].concat());
+        // The audit row names the decrypt target, never the request or facts: this runs before
+        // `check_decrypt_scope`, so `facts.key_path` is unchecked and may name another key.
+        let key_path = match target {
+            DecryptTarget::Root(_) => None,
+            DecryptTarget::Key { loc, .. } => Some(loc.path().to_string()),
+        };
         let row = encryption_audit::ActiveModel {
             request_hash: Set(request_hash),
             requester: Set(invocation.invoker.clone()),
-            network_id: Set(network_id.to_string()),
+            network_id: Set(target.network_id().to_string()),
             node_id: Set(self.node_did.clone()),
             outcome: Set(outcome.to_string()),
             decided_at: Set(now_rfc3339()),
-            key_path: Set(facts.key_path.clone()),
+            key_path: Set(key_path),
         };
         if let Err(err) = row.insert(&self.db).await {
             if !is_unique_violation(&err) {
@@ -1238,6 +1246,17 @@ fn native_decrypt_facts(
     invocation: &InvocationInfo,
 ) -> Result<DecryptFacts, EncryptionServiceError> {
     native_fact(invocation)
+}
+
+/// Refuses a receiver key that cannot receive a wrap (wrong length or a low-order point).
+/// Runs before the `/invoke` replay reservation, so a refused request is not consumed.
+fn check_receiver_public_key(receiver_key: &[u8]) -> Result<(), EncryptionServiceError> {
+    validate_receiver_public_key(receiver_key).map_err(|_| {
+        EncryptionServiceError::InvalidBody(
+            "receiverPublicKey must be a 32-byte X25519 public key that is not a low-order point"
+                .to_string(),
+        )
+    })
 }
 
 fn native_network_admin_facts(

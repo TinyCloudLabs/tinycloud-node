@@ -1473,3 +1473,99 @@ async fn root_decrypt_refuses_a_key_capability() {
         .unwrap_err();
     assert!(matches!(err, EncryptionServiceError::NetworkMismatch));
 }
+
+#[tokio::test]
+async fn denied_audit_row_for_root_target_never_takes_the_request_key_path() {
+    let db = fresh_db().await;
+    let svc = make_service(db.clone());
+    let net = network_id();
+    let descriptor = svc
+        .create_one_of_one_network(CreateNetworkRequest {
+            name: NETWORK_NAME.to_string(),
+            owner_did: owner_did(),
+            threshold: Threshold::one_of_one(),
+        })
+        .await
+        .unwrap();
+    let ctx = make_client_request(&descriptor.public_encryption_key);
+    let (_, body_value) = build_body(&ctx, &net);
+    // Denied before `check_decrypt_scope`: the request names a key path the root target never had.
+    let facts = serde_json::to_value(DecryptFacts {
+        ty: DECRYPT_REQUEST_TYPE.to_string(),
+        target_node: "did:key:z6MkOther".to_string(),
+        network_id: net.clone(),
+        body_hash: canonical_hash(&body_value),
+        encrypted_symmetric_key_hash: canonical_hash(&Value::String(
+            STANDARD.encode(&ctx.wrapped_key),
+        )),
+        receiver_public_key_hash: canonical_hash(&Value::String(
+            STANDARD.encode(&ctx.receiver_pub),
+        )),
+        key_path: Some("apps/alpha".to_string()),
+        alg: ALG_X25519_AES256GCM.to_string(),
+        key_version: 1,
+    })
+    .unwrap();
+    let invocation = build_session_invocation_info(&net, DECRYPT_ACTION, vec![facts], NODE_DID);
+
+    let err = svc
+        .decrypt_authorized(
+            &crate::encryption_network::DecryptTarget::Root(net.clone()),
+            &invocation,
+            &body_value,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EncryptionServiceError::TargetNodeMismatch));
+
+    let rows = crate::models::encryption_audit::Entity::find()
+        .all(&db)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].outcome, "denied:target-node");
+    assert_eq!(rows[0].key_path, None);
+}
+
+#[tokio::test]
+async fn decrypt_authorized_refuses_a_low_order_receiver_key() {
+    let svc = make_service(fresh_db().await);
+    let net = network_id();
+    let descriptor = svc
+        .create_one_of_one_network(CreateNetworkRequest {
+            name: NETWORK_NAME.to_string(),
+            owner_did: owner_did(),
+            threshold: Threshold::one_of_one(),
+        })
+        .await
+        .unwrap();
+    let ctx = make_client_request(&descriptor.public_encryption_key);
+    let low_order = [0u8; 32];
+    let (_, mut body_value) = build_body(&ctx, &net);
+    body_value["receiverPublicKey"] = serde_json::json!(STANDARD.encode(low_order));
+    let facts = serde_json::to_value(DecryptFacts {
+        ty: DECRYPT_REQUEST_TYPE.to_string(),
+        target_node: NODE_DID.to_string(),
+        network_id: net.clone(),
+        body_hash: canonical_hash(&body_value),
+        encrypted_symmetric_key_hash: canonical_hash(&Value::String(
+            STANDARD.encode(&ctx.wrapped_key),
+        )),
+        receiver_public_key_hash: canonical_hash(&Value::String(STANDARD.encode(low_order))),
+        key_path: None,
+        alg: ALG_X25519_AES256GCM.to_string(),
+        key_version: 1,
+    })
+    .unwrap();
+    let invocation = build_session_invocation_info(&net, DECRYPT_ACTION, vec![facts], NODE_DID);
+
+    let err = svc
+        .decrypt_authorized(
+            &crate::encryption_network::DecryptTarget::Root(net.clone()),
+            &invocation,
+            &body_value,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EncryptionServiceError::InvalidBody(_)));
+}
