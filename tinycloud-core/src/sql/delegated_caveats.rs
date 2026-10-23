@@ -6,7 +6,7 @@
 //!
 //! - empty (`{}`): no restriction,
 //! - a constrained-statements profile (a `mode` key, or the nested
-//!   `{"constrained-statements": {...}}` form): unchanged,
+//!   `{"constrained-statements": {...}}` form): read by the profile rules,
 //! - the delegated form: keys exactly a subset of `tables`, `columns`,
 //!   `readOnly`.
 //!
@@ -507,7 +507,19 @@ mod tests {
     }
 
     #[test]
-    fn the_setting_off_keeps_every_earlier_refusal_and_acceptance() {
+    fn only_ascii_letters_fold() {
+        // The Kelvin sign is accepted as a name and is not `k`.
+        assert_eq!(ingress(json!([{"tables": ["\u{212A}x"]}])), None);
+        assert_ne!(
+            form(json!([{"tables": ["\u{212A}x"]}])),
+            form(json!([{"tables": ["kx"]}]))
+        );
+        assert_eq!(fold("\u{212A}X"), "\u{212A}x");
+        assert_eq!(fold("KX"), "kx");
+    }
+
+    #[test]
+    fn with_the_setting_off_only_empty_caveats_and_profiles_are_accepted() {
         let off = |list: Value| unsupported_sql_caveat_at_ingress(SQL, &wire(list), false);
         for list in [
             json!([{"tables": ["Notes"]}]),
@@ -525,7 +537,7 @@ mod tests {
         for list in [json!([]), json!([{}]), json!([profile()])] {
             assert_eq!(off(list), None);
         }
-        // The legacy reading ignores keys beside `mode`: unchanged.
+        // With the setting off a profile entry keeps the keys beside `mode`.
         assert_eq!(
             off(json!([{"mode": "constrained-statements", "readOnly": true,
                          "tables": ["a"], "statements": []}])),
@@ -557,16 +569,16 @@ mod tests {
     }
 
     #[test]
-    fn a_stored_row_keeps_the_earlier_reading_of_a_profile() {
-        // Admitted before the delegated form existed: keys beside `mode` were
-        // ignored and stay ignored.
-        let legacy = wire(json!([{"mode": "constrained-statements", "readOnly": true,
+    fn a_stored_profile_entry_ignores_keys_beside_mode() {
+        // A profile entry carrying `tables` beside `mode` is a profile; the
+        // setting-on admission check refuses the mixture.
+        let stored = wire(json!([{"mode": "constrained-statements", "readOnly": true,
                                    "tables": ["a"], "statements": []}]));
         assert_eq!(
-            classify(&legacy, Reading::Stored),
+            classify(&stored, Reading::Stored),
             Ok(AbilityCaveats::Profile)
         );
-        assert!(classify(&legacy, Reading::Ingress).is_err());
+        assert!(classify(&stored, Reading::Ingress).is_err());
     }
 
     #[test]

@@ -3,10 +3,11 @@
 //! statement of the case list (read from the arm tracker, never from SQLite's
 //! error text), plus the rules that do not depend on a statement.
 
+use rusqlite::hooks::{AuthAction, AuthContext, TransactionOperation};
 use rusqlite::Connection;
 
 use super::authority::SqlAuthority;
-use super::authorizer::{create_authorizer_scoped, StatementScope};
+use super::authorizer::{create_authorizer_scoped, delegated_denial, StatementScope};
 use super::caveats::SqlCaveats;
 use super::parser;
 use super::types::CaveatArm;
@@ -23,6 +24,7 @@ CREATE TRIGGER tr AFTER INSERT ON Notes BEGIN INSERT INTO log VALUES(new.body); 
 INSERT INTO Notes VALUES (1,'a','s'),(2,'b','t');
 INSERT INTO t2 VALUES (1,1,'q');
 INSERT INTO plain VALUES (1,2);
+CREATE INDEX t2x ON t2(x);
 ";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -81,8 +83,19 @@ fn run(
     caveats: Option<SqlCaveats>,
     authority: &SqlAuthority,
 ) -> (Result<(), rusqlite::Error>, Option<CaveatArm>) {
+    run_with(sql, caveats, authority, "")
+}
+
+/// [`run`] on the fixture plus `setup`.
+fn run_with(
+    sql: &str,
+    caveats: Option<SqlCaveats>,
+    authority: &SqlAuthority,
+    setup: &str,
+) -> (Result<(), rusqlite::Error>, Option<CaveatArm>) {
     let conn = Connection::open_in_memory().expect("in-memory database");
     conn.execute_batch(FIXTURE).expect("fixture");
+    conn.execute_batch(setup).expect("setup");
     // The scope classifies the statement; the abilities are judged by the
     // authorizer, so classify with an authority that is never the reason for a
     // refusal.
@@ -273,6 +286,33 @@ const ROWS: &[Row] = &[
     row("E1", "CREATE TABLE z(a)", None, None, true, Deny(Write)),
     row("E2", "PRAGMA user_version = 5", None, None, true, Deny(Write)),
     row("E3", "PRAGMA user_version", None, None, true, Allow),
+    // M. DDL judged against the table it names (`sqlite_master` listed so
+    // that the bookkeeping of a schema change is not the reason).
+    row("M1", "ALTER TABLE t2 ADD COLUMN z", Some(&["Notes", "sqlite_master"]), None, false, Deny(Table)),
+    row("M1b", "ALTER TABLE t2 ADD COLUMN z", Some(&["t2", "sqlite_master"]), None, false, Allow),
+    row("M2", "DROP INDEX t2x", Some(&["Notes", "sqlite_master"]), None, false, Deny(Table)),
+    row("M2b", "DROP INDEX t2x", Some(&["t2", "sqlite_master"]), None, false, Allow),
+    row("M3", "CREATE INDEX i2 ON plain(a)", Some(&["Notes", "sqlite_master"]), None, false, Deny(Table)),
+    row("M3b", "CREATE INDEX i2 ON plain(a)", Some(&["plain", "sqlite_master"]), None, false, Allow),
+    row("M4", "CREATE TABLE z(a)", Some(&["Notes", "sqlite_master"]), None, false, Deny(Table)),
+    row("M4b", "CREATE TABLE z(a)", Some(&["z", "sqlite_master"]), None, false, Allow),
+    row("M5", "CREATE VIEW v2 AS SELECT id FROM Notes", Some(&["Notes", "sqlite_master"]), None, false, Deny(Table)),
+    row("M5b", "CREATE VIEW v2 AS SELECT id FROM Notes", Some(&["Notes", "v2", "sqlite_master"]), None, false, Allow),
+    row("M6", "DROP VIEW v", Some(&["Notes", "sqlite_master"]), None, false, Deny(Table)),
+    row("M6b", "DROP VIEW v", Some(&["v", "sqlite_master"]), None, false, Allow),
+    row("M7", "DROP TABLE plain", Some(&["Notes", "sqlite_master"]), None, false, Deny(Table)),
+    row("M7b", "DROP TABLE plain", Some(&["plain", "sqlite_master"]), None, false, Allow),
+    row("M8", "CREATE TEMP TABLE tt(a)", Some(&["Notes", "sqlite_temp_master"]), None, false, Deny(Table)),
+    row("M8b", "CREATE TEMP TABLE tt(a)", Some(&["tt", "sqlite_temp_master"]), None, false, Allow),
+    row("M9", "ALTER TABLE t2 ADD COLUMN z", Some(&["Notes", "sqlite_master"]), None, true, Deny(Write)),
+    // P. PRAGMAs under a table or column limit.
+    row("P1", "PRAGMA foreign_key_check", Some(&["Notes"]), None, false, Deny(Table)),
+    row("P2", "PRAGMA integrity_check", None, Some(&["a"]), false, Deny(Table)),
+    row("P3", "PRAGMA quick_check", Some(&["plain"]), None, false, Deny(Table)),
+    row("P4", "PRAGMA user_version = 5", Some(&["plain"]), None, false, Deny(Write)),
+    row("P5", "PRAGMA application_id = 7", None, Some(&["a"]), false, Deny(Write)),
+    row("P6", "PRAGMA user_version", Some(&["plain"]), None, false, Allow),
+    row("P7", "PRAGMA integrity_check", None, None, true, Allow),
 ];
 
 #[test]
@@ -338,7 +378,7 @@ fn the_abilities_decide_before_the_caveats() {
 }
 
 #[test]
-fn without_the_delegated_rules_the_caveats_keep_their_earlier_reading() {
+fn without_the_delegated_rules_names_compare_exactly() {
     // Not delegated: table and column names compare exactly, and a read that
     // names no column is judged as the column "".
     let authority = SqlAuthority::new(["tinycloud.sql/admin"]);
@@ -394,5 +434,458 @@ fn schema_reports_are_refused_under_a_table_or_column_restriction() {
             }
         };
         assert_eq!(observed, expected);
+    }
+}
+
+/// What `delegated_denial` answers for one rusqlite action, under a `tables`
+/// limit that lists `listed` only (with a table that is not listed, and with
+/// the listed one) and under `readOnly`.
+struct Audit {
+    variant: &'static str,
+    action: for<'a> fn(&'a str) -> AuthAction<'a>,
+    unlisted: Option<CaveatArm>,
+    listed: Option<CaveatArm>,
+    read_only: Option<CaveatArm>,
+}
+
+macro_rules! audit {
+    ($variant:literal, $action:expr, $unlisted:expr, $listed:expr, $read_only:expr) => {
+        Audit {
+            variant: $variant,
+            action: $action,
+            unlisted: $unlisted,
+            listed: $listed,
+            read_only: $read_only,
+        }
+    };
+}
+
+/// One entry per variant of rusqlite 0.32's `AuthAction` (and per PRAGMA
+/// form). Actions that name a table are judged against it; the others involve
+/// no table and say so.
+fn audit_table() -> Vec<Audit> {
+    vec![
+        // Actions that name a table: the table arm unless it is listed;
+        // `readOnly` refuses every one that changes anything.
+        audit!(
+            "CreateIndex",
+            |t| AuthAction::CreateIndex {
+                index_name: "i",
+                table_name: t
+            },
+            Some(Table),
+            None,
+            Some(Write)
+        ),
+        audit!(
+            "CreateTable",
+            |t| AuthAction::CreateTable { table_name: t },
+            Some(Table),
+            None,
+            Some(Write)
+        ),
+        audit!(
+            "CreateTempIndex",
+            |t| AuthAction::CreateTempIndex {
+                index_name: "i",
+                table_name: t
+            },
+            Some(Table),
+            None,
+            Some(Write)
+        ),
+        audit!(
+            "CreateTempTable",
+            |t| AuthAction::CreateTempTable { table_name: t },
+            Some(Table),
+            None,
+            Some(Write)
+        ),
+        audit!(
+            "CreateTempTrigger",
+            |t| AuthAction::CreateTempTrigger {
+                trigger_name: "g",
+                table_name: t
+            },
+            Some(Table),
+            None,
+            Some(Write)
+        ),
+        audit!(
+            "CreateTempView",
+            |t| AuthAction::CreateTempView { view_name: t },
+            Some(Table),
+            None,
+            Some(Write)
+        ),
+        audit!(
+            "CreateTrigger",
+            |t| AuthAction::CreateTrigger {
+                trigger_name: "g",
+                table_name: t
+            },
+            Some(Table),
+            None,
+            Some(Write)
+        ),
+        audit!(
+            "CreateView",
+            |t| AuthAction::CreateView { view_name: t },
+            Some(Table),
+            None,
+            Some(Write)
+        ),
+        audit!(
+            "Delete",
+            |t| AuthAction::Delete { table_name: t },
+            Some(Table),
+            None,
+            Some(Write)
+        ),
+        audit!(
+            "DropIndex",
+            |t| AuthAction::DropIndex {
+                index_name: "i",
+                table_name: t
+            },
+            Some(Table),
+            None,
+            Some(Write)
+        ),
+        audit!(
+            "DropTable",
+            |t| AuthAction::DropTable { table_name: t },
+            Some(Table),
+            None,
+            Some(Write)
+        ),
+        audit!(
+            "DropTempIndex",
+            |t| AuthAction::DropTempIndex {
+                index_name: "i",
+                table_name: t
+            },
+            Some(Table),
+            None,
+            Some(Write)
+        ),
+        audit!(
+            "DropTempTable",
+            |t| AuthAction::DropTempTable { table_name: t },
+            Some(Table),
+            None,
+            Some(Write)
+        ),
+        audit!(
+            "DropTempTrigger",
+            |t| AuthAction::DropTempTrigger {
+                trigger_name: "g",
+                table_name: t
+            },
+            Some(Table),
+            None,
+            Some(Write)
+        ),
+        audit!(
+            "DropTempView",
+            |t| AuthAction::DropTempView { view_name: t },
+            Some(Table),
+            None,
+            Some(Write)
+        ),
+        audit!(
+            "DropTrigger",
+            |t| AuthAction::DropTrigger {
+                trigger_name: "g",
+                table_name: t
+            },
+            Some(Table),
+            None,
+            Some(Write)
+        ),
+        audit!(
+            "DropView",
+            |t| AuthAction::DropView { view_name: t },
+            Some(Table),
+            None,
+            Some(Write)
+        ),
+        audit!(
+            "Insert",
+            |t| AuthAction::Insert { table_name: t },
+            Some(Table),
+            None,
+            Some(Write)
+        ),
+        audit!(
+            "Read",
+            |t| AuthAction::Read {
+                table_name: t,
+                column_name: "c"
+            },
+            Some(Table),
+            None,
+            None
+        ),
+        audit!(
+            "Update",
+            |t| AuthAction::Update {
+                table_name: t,
+                column_name: "c"
+            },
+            Some(Table),
+            None,
+            Some(Write)
+        ),
+        audit!(
+            "AlterTable",
+            |t| AuthAction::AlterTable {
+                database_name: "main",
+                table_name: t
+            },
+            Some(Table),
+            None,
+            Some(Write)
+        ),
+        audit!(
+            "Analyze",
+            |t| AuthAction::Analyze { table_name: t },
+            Some(Table),
+            None,
+            Some(Write)
+        ),
+        audit!(
+            "CreateVtable",
+            |t| AuthAction::CreateVtable {
+                table_name: t,
+                module_name: "m"
+            },
+            Some(Table),
+            None,
+            Some(Write)
+        ),
+        audit!(
+            "DropVtable",
+            |t| AuthAction::DropVtable {
+                table_name: t,
+                module_name: "m"
+            },
+            Some(Table),
+            None,
+            Some(Write)
+        ),
+        // PRAGMA: a schema report or a check lists tables whichever table is
+        // named; a PRAGMA that sets a header value is database-wide state.
+        audit!(
+            "Pragma table_info(t)",
+            |t| AuthAction::Pragma {
+                pragma_name: "table_info",
+                pragma_value: Some(t)
+            },
+            Some(Table),
+            Some(Table),
+            None
+        ),
+        audit!(
+            "Pragma foreign_key_check",
+            |_| AuthAction::Pragma {
+                pragma_name: "foreign_key_check",
+                pragma_value: None
+            },
+            Some(Table),
+            Some(Table),
+            None
+        ),
+        audit!(
+            "Pragma integrity_check",
+            |_| AuthAction::Pragma {
+                pragma_name: "integrity_check",
+                pragma_value: None
+            },
+            Some(Table),
+            Some(Table),
+            None
+        ),
+        audit!(
+            "Pragma quick_check",
+            |_| AuthAction::Pragma {
+                pragma_name: "quick_check",
+                pragma_value: None
+            },
+            Some(Table),
+            Some(Table),
+            None
+        ),
+        audit!(
+            "Pragma user_version = n",
+            |_| AuthAction::Pragma {
+                pragma_name: "user_version",
+                pragma_value: Some("5")
+            },
+            Some(Write),
+            Some(Write),
+            Some(Write)
+        ),
+        audit!(
+            "Pragma application_id = n",
+            |_| AuthAction::Pragma {
+                pragma_name: "application_id",
+                pragma_value: Some("5")
+            },
+            Some(Write),
+            Some(Write),
+            Some(Write)
+        ),
+        audit!(
+            "Pragma user_version",
+            |_| AuthAction::Pragma {
+                pragma_name: "user_version",
+                pragma_value: None
+            },
+            None,
+            None,
+            None
+        ),
+        // REINDEX names an index; the table it belongs to is judged by the
+        // actions that build the index.
+        audit!(
+            "Reindex",
+            |t| AuthAction::Reindex { index_name: t },
+            None,
+            None,
+            Some(Write)
+        ),
+        // No table is involved. The abilities refuse transaction control,
+        // ATTACH and DETACH for every holder.
+        audit!("Select", |_| AuthAction::Select, None, None, None),
+        audit!(
+            "Function",
+            |_| AuthAction::Function {
+                function_name: "count"
+            },
+            None,
+            None,
+            None
+        ),
+        audit!("Recursive", |_| AuthAction::Recursive, None, None, None),
+        audit!(
+            "Transaction",
+            |_| AuthAction::Transaction {
+                operation: TransactionOperation::Begin
+            },
+            None,
+            None,
+            None
+        ),
+        audit!(
+            "Savepoint",
+            |_| AuthAction::Savepoint {
+                operation: TransactionOperation::Begin,
+                savepoint_name: "s"
+            },
+            None,
+            None,
+            None
+        ),
+        audit!(
+            "Attach",
+            |_| AuthAction::Attach { filename: "f" },
+            None,
+            None,
+            None
+        ),
+        audit!(
+            "Detach",
+            |_| AuthAction::Detach { database_name: "d" },
+            None,
+            None,
+            None
+        ),
+        // An action this code does not know: refused under `tables`.
+        audit!(
+            "Unknown",
+            |_| AuthAction::Unknown {
+                code: -1,
+                arg1: None,
+                arg2: None
+            },
+            Some(Table),
+            Some(Table),
+            None
+        ),
+    ]
+}
+
+#[test]
+fn every_authorizer_action_is_judged_against_the_table_it_names_or_involves_none() {
+    let tables = SqlCaveats {
+        tables: Some(vec!["listed".to_string()]),
+        ..SqlCaveats::default()
+    };
+    let read_only = SqlCaveats {
+        read_only: Some(true),
+        ..SqlCaveats::default()
+    };
+    let mut mismatches = Vec::new();
+    let audit = audit_table();
+    assert_eq!(audit.len(), 40, "one entry per action and PRAGMA form");
+    for entry in &audit {
+        for (name, caveats, expected) in [
+            ("unlisted", &tables, entry.unlisted),
+            ("listed", &tables, entry.listed),
+            ("readOnly", &read_only, entry.read_only),
+        ] {
+            let table = if name == "listed" { "listed" } else { "other" };
+            let ctx = AuthContext {
+                action: (entry.action)(table),
+                database_name: Some("main"),
+                accessor: None,
+            };
+            let observed = delegated_denial(caveats, true, &ctx);
+            if observed != expected {
+                mismatches.push(format!(
+                    "{} ({name}): expected {expected:?}, observed {observed:?}",
+                    entry.variant
+                ));
+            }
+        }
+        // A statement the parser classed as a write is refused under
+        // `readOnly` at whatever callback comes first.
+        let ctx = AuthContext {
+            action: (entry.action)("other"),
+            database_name: Some("main"),
+            accessor: None,
+        };
+        if delegated_denial(&read_only, false, &ctx) != Some(Write) {
+            mismatches.push(format!("{} (readOnly, write statement)", entry.variant));
+        }
+    }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}
+
+/// Only the ASCII letters fold, as in SQLite: the Kelvin sign is not `k`.
+#[test]
+fn non_ascii_names_match_only_exactly() {
+    const SETUP: &str = "CREATE TABLE Kelvin(a); CREATE TABLE \"\u{212A}x\"(a);";
+    for (listed, sql, expected) in [
+        ("\u{212A}elvin", "SELECT a FROM Kelvin", Deny(Table)),
+        ("kx", "SELECT a FROM \"\u{212A}x\"", Deny(Table)),
+        ("\u{212A}X", "SELECT a FROM \"\u{212A}x\"", Allow),
+        ("kelvin", "SELECT a FROM Kelvin", Allow),
+    ] {
+        let authority = admin();
+        let caveats = SqlCaveats {
+            tables: Some(vec![listed.to_string()]),
+            ..SqlCaveats::default()
+        };
+        let (result, arm) = run_with(sql, Some(caveats), &authority, SETUP);
+        let observed = match arm {
+            Some(arm) => Deny(arm),
+            None => {
+                assert!(result.is_ok(), "{listed:?} {sql}");
+                Allow
+            }
+        };
+        assert_eq!(observed, expected, "{listed:?} {sql}");
     }
 }

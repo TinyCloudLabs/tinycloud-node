@@ -1850,7 +1850,7 @@ mod tests {
     }
 
     /// TC-1791: with the setting on, a stored grant of only empty entries
-    /// imposes nothing; with it off it is refused as before.
+    /// imposes nothing; with it off it is refused.
     #[tokio::test]
     async fn stored_grant_of_only_empty_entries_covers_any_invocation_only_with_the_setting_on() {
         let resource = "tinycloud:did:key:owner/sql/db";

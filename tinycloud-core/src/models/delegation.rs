@@ -286,7 +286,7 @@ pub(crate) fn unsupported_sql_caveat(
 
 /// Reason a SQL or DuckDB capability's caveats are refused at admission. With
 /// `delegated_sql_caveats` a SQL capability may also carry the delegated
-/// `tables` / `columns` / `readOnly` form; DuckDB is unchanged.
+/// `tables` / `columns` / `readOnly` form; DuckDB takes empty caveats only.
 pub(crate) fn unsupported_sql_caveat_at_ingress(
     ability: &str,
     caveats: &crate::types::Caveats,
@@ -2031,7 +2031,7 @@ mod tests {
                              "statements": [{"name": "n", "sql": "SELECT 1"}]});
         assert!(ok(json!([{"tables": ["a"]}]), json!([profile.clone()])).is_err());
         assert!(ok(json!([profile]), json!([{"tables": ["a"]}])).is_err());
-        // Other services keep the earlier rule: equal caveats or an empty parent.
+        // Other services: equal caveats, or an empty parent.
         let kv = |parent: serde_json::Value, child: serde_json::Value| {
             caveats_contain_child("tinycloud.kv/get", &wire(parent), &wire(child), true)
         };
