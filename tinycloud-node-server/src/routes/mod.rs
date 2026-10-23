@@ -4079,6 +4079,7 @@ async fn verify_auth_admitted(
 
 #[cfg(test)]
 mod tests {
+    mod encryption_keys;
     mod revocation_scope;
 
     use super::*;

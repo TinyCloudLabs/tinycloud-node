@@ -1,21 +1,38 @@
 //! HTTP routes for the encryption network module.
 //!
 //! Layout:
-//! - `POST /encryption/networks`                      — create + ceremony for a network
-//! - `GET  /encryption/networks/<network_id>`         — fetch authoritative descriptor
-//! - `GET  /.well-known/encryption/network/<name>`    — public discovery record
-//! - `POST /encryption/networks/<network_id>/decrypt` — UCAN-style decrypt invocation
-//! - `POST /encryption/networks/<network_id>/revoke`  — admin revoke (placeholder)
+//! - `POST /encryption/networks`                                  — create + ceremony for a network
+//! - `GET  /encryption/networks/<network_id>`                     — fetch authoritative descriptor
+//! - `GET  /.well-known/encryption/network/<name>`                — public discovery record
+//! - `POST /encryption/networks/<network_id>/decrypt`             — UCAN-style decrypt invocation
+//! - `POST /encryption/networks/<network_id>/revoke`              — admin revoke (placeholder)
+//! - `POST /encryption/networks/<network_id>/keys`                — create a named key (`key-admin/v1`)
+//! - `GET  /encryption/networks/<network_id>/keys/<key_path..>`   — authenticated describe (`key-describe/v1`)
+//! - `GET  /encryption/networks/<network_id>/keys/<key_path..>`   — public key read (no auth)
+//! - `POST /encryption/networks/<network_id>/key-actions/block`   — block a key (`key-admin/v1`)
+//! - `POST /encryption/networks/<network_id>/key-actions/unblock` — unblock a key (`key-admin/v1`)
 
-use rocket::{form::FromForm, http::Status, serde::json::Json, State};
+use rocket::{
+    form::FromForm,
+    http::{uri::Origin, Status},
+    serde::json::Json,
+    State,
+};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, time::Instant};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    time::Instant,
+};
 
+use super::public::{ClientIp, RateLimiter};
 use crate::{authorization::AuthHeaderGetter, BlockStage, TinyCloud};
 use tinycloud_core::encryption_network::{
+    key_id::KeyLocation,
+    keys::{KeyDescriptor, KeyPublic},
     CreateNetworkRequest, DecryptResponseBody, EncryptionService, EncryptionServiceError,
-    NetworkDescriptor, NetworkId, Threshold, WellKnownRecord, NETWORK_CREATE_ACTION,
-    NETWORK_REVOKE_ACTION,
+    NetworkDescriptor, NetworkId, Threshold, WellKnownRecord, KEY_BLOCK_ACTION, KEY_CREATE_ACTION,
+    KEY_UNBLOCK_ACTION, NETWORK_CREATE_ACTION, NETWORK_REVOKE_ACTION,
 };
 use tinycloud_core::{events::Invocation, util::InvocationInfo, TxError, TxStoreError};
 
@@ -240,6 +257,293 @@ pub async fn revoke_network(
     Ok(Status::NoContent)
 }
 
+#[derive(Debug, Deserialize)]
+pub struct CreateKeyBody {
+    #[serde(rename = "keyPath")]
+    pub key_path: String,
+    #[serde(default)]
+    pub shreddable: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct KeyPathBody {
+    #[serde(rename = "keyPath")]
+    pub key_path: String,
+}
+
+/// Full key descriptor, returned by create, block, unblock and the
+/// authenticated describe GET.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyDescriptorView {
+    network_id: String,
+    key_path: String,
+    alg: String,
+    key_version: i64,
+    public_encryption_key: String,
+    kind: String,
+    state: &'static str,
+    created_at: String,
+    updated_at: String,
+}
+
+impl From<KeyDescriptor> for KeyDescriptorView {
+    fn from(descriptor: KeyDescriptor) -> Self {
+        Self {
+            network_id: descriptor.network_id,
+            key_path: descriptor.key_path,
+            alg: descriptor.alg,
+            key_version: descriptor.key_version,
+            public_encryption_key: base64::encode(&descriptor.public_encryption_key),
+            kind: descriptor.kind,
+            state: descriptor.state.as_str(),
+            created_at: descriptor.created_at,
+            updated_at: descriptor.updated_at,
+        }
+    }
+}
+
+/// Public-only view served by the unauthenticated GET.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyPublicView {
+    network_id: String,
+    key_path: String,
+    alg: String,
+    key_version: i64,
+    public_encryption_key: String,
+}
+
+impl From<KeyPublic> for KeyPublicView {
+    fn from(public: KeyPublic) -> Self {
+        Self {
+            network_id: public.network_id,
+            key_path: public.key_path,
+            alg: public.alg,
+            key_version: public.key_version,
+            public_encryption_key: base64::encode(&public.public_encryption_key),
+        }
+    }
+}
+
+/// Parses the network id and key path, refusing any key path the grammar rejects.
+fn key_location(
+    network_id: &str,
+    key_path: &str,
+) -> Result<(NetworkId, KeyLocation), (Status, String)> {
+    let network = network_id
+        .parse::<NetworkId>()
+        .map_err(|err| (Status::BadRequest, err.to_string()))?;
+    let location = KeyLocation::new(&network, key_path)
+        .map_err(|err| map_service_err(EncryptionServiceError::KeyPathInvalid(err.to_string())))?;
+    Ok((network, location))
+}
+
+/// Key path segments from a URL. The raw request path is checked first, since
+/// decoded segments would hide a percent-escape.
+fn key_path_from_url<'a>(
+    key_path: &'a Path,
+    origin: &Origin<'_>,
+) -> Result<&'a str, (Status, String)> {
+    if origin.path().as_str().contains('%') {
+        return Err(map_service_err(EncryptionServiceError::KeyPathInvalid(
+            "percent-encoding is not accepted in key paths".to_string(),
+        )));
+    }
+    key_path.to_str().ok_or_else(|| {
+        map_service_err(EncryptionServiceError::KeyPathInvalid(
+            "key path is not valid UTF-8".to_string(),
+        ))
+    })
+}
+
+#[post(
+    "/encryption/networks/<network_id>/keys",
+    format = "json",
+    data = "<body>"
+)]
+pub async fn create_encryption_key(
+    network_id: &str,
+    authorization: AuthHeaderGetter<InvocationInfo>,
+    body: Json<serde_json::Value>,
+    service: &State<EncryptionService>,
+    tinycloud: &State<TinyCloud>,
+) -> Result<Json<KeyDescriptorView>, (Status, String)> {
+    let invocation = authorization.0;
+    let invocation_info = invocation.0.clone();
+    verify_auth(
+        "server.encryption.key_create.auth",
+        invocation,
+        tinycloud,
+        service.node_did(),
+    )
+    .await?;
+
+    let body_value = body.into_inner();
+    let body: CreateKeyBody = serde_json::from_value(body_value.clone())
+        .map_err(|err| (Status::BadRequest, err.to_string()))?;
+    let (network, location) = key_location(network_id, &body.key_path)?;
+    service
+        .verify_key_admin_authorized(
+            &network,
+            &location,
+            KEY_CREATE_ACTION,
+            &invocation_info,
+            &body_value,
+        )
+        .await
+        .map_err(map_service_err)?;
+    let descriptor = service
+        .create_key(&location, body.shreddable)
+        .await
+        .map_err(map_service_err)?;
+    Ok(Json(descriptor.into()))
+}
+
+/// Authenticated describe. Accepts a `decrypt`, `key.create`, `key.block` or
+/// `key.unblock` capability on the exact key. Ranked ahead of the public GET,
+/// which handles requests without an `Authorization` header.
+#[get("/encryption/networks/<network_id>/keys/<key_path..>", rank = 1)]
+pub async fn describe_encryption_key(
+    network_id: &str,
+    key_path: PathBuf,
+    origin: &Origin<'_>,
+    authorization: AuthHeaderGetter<InvocationInfo>,
+    service: &State<EncryptionService>,
+    tinycloud: &State<TinyCloud>,
+) -> Result<Json<KeyDescriptorView>, (Status, String)> {
+    let invocation = authorization.0;
+    let invocation_info = invocation.0.clone();
+    verify_auth(
+        "server.encryption.key_describe.auth",
+        invocation,
+        tinycloud,
+        service.node_did(),
+    )
+    .await?;
+
+    let key_path = key_path_from_url(&key_path, origin)?;
+    let (network, location) = key_location(network_id, key_path)?;
+    service
+        .verify_key_describe_authorized(&network, &location, &invocation_info)
+        .await
+        .map_err(map_service_err)?;
+    let descriptor = service
+        .describe_key(&location)
+        .await
+        .map_err(map_service_err)?;
+    Ok(Json(descriptor.into()))
+}
+
+/// Unauthenticated public key read, rate-limited per client IP like the other
+/// public routes. Returns the same shape for missing, blocked and active keys.
+#[get("/encryption/networks/<network_id>/keys/<key_path..>", rank = 2)]
+pub async fn public_encryption_key(
+    network_id: &str,
+    key_path: PathBuf,
+    origin: &Origin<'_>,
+    client_ip: ClientIp,
+    rate_limiter: &State<RateLimiter>,
+    service: &State<EncryptionService>,
+) -> Result<Json<KeyPublicView>, (Status, String)> {
+    rate_limiter
+        .check(client_ip.0)
+        .map_err(|status| (status, "Rate limit exceeded".to_string()))?;
+    let key_path = key_path_from_url(&key_path, origin)?;
+    let (_, location) = key_location(network_id, key_path)?;
+    let public = service
+        .public_key(&location)
+        .await
+        .map_err(map_service_err)?;
+    Ok(Json(public.into()))
+}
+
+#[post(
+    "/encryption/networks/<network_id>/key-actions/block",
+    format = "json",
+    data = "<body>"
+)]
+pub async fn block_encryption_key(
+    network_id: &str,
+    authorization: AuthHeaderGetter<InvocationInfo>,
+    body: Json<serde_json::Value>,
+    service: &State<EncryptionService>,
+    tinycloud: &State<TinyCloud>,
+) -> Result<Json<KeyDescriptorView>, (Status, String)> {
+    let invocation = authorization.0;
+    let invocation_info = invocation.0.clone();
+    verify_auth(
+        "server.encryption.key_block.auth",
+        invocation,
+        tinycloud,
+        service.node_did(),
+    )
+    .await?;
+
+    let body_value = body.into_inner();
+    let body: KeyPathBody = serde_json::from_value(body_value.clone())
+        .map_err(|err| (Status::BadRequest, err.to_string()))?;
+    let (network, location) = key_location(network_id, &body.key_path)?;
+    service
+        .verify_key_admin_authorized(
+            &network,
+            &location,
+            KEY_BLOCK_ACTION,
+            &invocation_info,
+            &body_value,
+        )
+        .await
+        .map_err(map_service_err)?;
+    let descriptor = service
+        .block_key(&location)
+        .await
+        .map_err(map_service_err)?;
+    Ok(Json(descriptor.into()))
+}
+
+#[post(
+    "/encryption/networks/<network_id>/key-actions/unblock",
+    format = "json",
+    data = "<body>"
+)]
+pub async fn unblock_encryption_key(
+    network_id: &str,
+    authorization: AuthHeaderGetter<InvocationInfo>,
+    body: Json<serde_json::Value>,
+    service: &State<EncryptionService>,
+    tinycloud: &State<TinyCloud>,
+) -> Result<Json<KeyDescriptorView>, (Status, String)> {
+    let invocation = authorization.0;
+    let invocation_info = invocation.0.clone();
+    verify_auth(
+        "server.encryption.key_unblock.auth",
+        invocation,
+        tinycloud,
+        service.node_did(),
+    )
+    .await?;
+
+    let body_value = body.into_inner();
+    let body: KeyPathBody = serde_json::from_value(body_value.clone())
+        .map_err(|err| (Status::BadRequest, err.to_string()))?;
+    let (network, location) = key_location(network_id, &body.key_path)?;
+    service
+        .verify_key_admin_authorized(
+            &network,
+            &location,
+            KEY_UNBLOCK_ACTION,
+            &invocation_info,
+            &body_value,
+        )
+        .await
+        .map_err(map_service_err)?;
+    let descriptor = service
+        .unblock_key(&location)
+        .await
+        .map_err(map_service_err)?;
+    Ok(Json(descriptor.into()))
+}
+
 async fn verify_auth(
     span: &'static str,
     invocation: Invocation,
@@ -303,6 +607,7 @@ fn map_service_err(err: EncryptionServiceError) -> (Status, String) {
         | EncryptionServiceError::KeyLimitExceeded
         | EncryptionServiceError::KeyUnwrapFailed(_) => Status::Forbidden,
         EncryptionServiceError::CorruptKeyRow => Status::InternalServerError,
+        EncryptionServiceError::KeyPathInvalid(_) => Status::BadRequest,
         EncryptionServiceError::InvalidBody(_) | EncryptionServiceError::Base64(_) => {
             Status::BadRequest
         }
