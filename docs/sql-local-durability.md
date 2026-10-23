@@ -59,7 +59,7 @@ A kill -9 test cannot inject "after COMMIT, before its fsync completed"; `before
 |---|---|---|
 | `synchronous` | `"full"` | `"full"` or `"normal"`; the rollback flag. This is the durability fix, not a limit. |
 | `max_database_bytes` | `0` (no cap) | per-database size cap, enforced by SQLite's `max_page_count` |
-| `min_free_bytes` | `0` (check off) | disk kept free after all in-flight reservations; `0` disables the gate, the reservation and the free-space reads |
+| `min_free_bytes` | `0` (check off) | disk kept free after all in-flight reservations; `0` disables the gate, the reservation and the free-space checks before COMMIT (a full-disk error still reads free space once, see Errors) |
 
 **The two limits are off by default.** They are Sam's decision (card `sql-storage-report-read`) and are set by config once he answers; an unmeasured cap could refuse real users' databases. The mechanism is fully tested with explicit values. What stays on by default besides `synchronous`: the transaction per write request and the owner-budget limit below.
 
