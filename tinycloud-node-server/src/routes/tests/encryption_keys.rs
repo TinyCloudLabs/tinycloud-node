@@ -1603,6 +1603,7 @@ async fn direct_route_refuses_a_malformed_or_low_order_receiver() -> Result<()> 
         )?;
         let (status, text) = post_json(&fixture.client, &decrypt_url(&network), &auth, &body).await;
         assert_eq!(status, Status::BadRequest, "{text}");
+        assert!(text.starts_with("receiver_key_invalid: "), "{text}");
         assert!(!text.contains("wrappedKey"), "{text}");
         assert!(!text.contains(&base64::encode(&case.symmetric)), "{text}");
     }
@@ -1626,6 +1627,7 @@ async fn invoke_refuses_a_malformed_or_low_order_receiver_before_unwrap() -> Res
         )?;
         let (status, text) = invoke(&fixture, &auth, &body).await;
         assert_eq!(status, Status::BadRequest, "{text}");
+        assert!(text.starts_with("receiver_key_invalid: "), "{text}");
         assert!(!text.contains("wrappedKey"), "{text}");
         assert!(!text.contains(&base64::encode(&case.symmetric)), "{text}");
     }

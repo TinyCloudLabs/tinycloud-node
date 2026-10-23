@@ -205,7 +205,7 @@ pub enum EncryptionServiceError {
     Backend(#[from] KeyBackendError),
     #[error("decrypt request body is malformed: {0}")]
     InvalidBody(String),
-    #[error("receiverPublicKey must be a 32-byte X25519 public key that is not a low-order point")]
+    #[error("receiver_key_invalid: receiverPublicKey must be a 32-byte X25519 public key that is not a low-order point")]
     InvalidReceiverPublicKey,
     #[error("hex decode error: {0}")]
     Base64(&'static str),
