@@ -102,6 +102,134 @@ pub(crate) mod test_support {
             }
         }
     }
+
+    /// Resolve the PostgreSQL URL that the `postgres_*` tests connect to, or
+    /// `None` when they skip. The rule is in [`postgres_gate`].
+    pub fn postgres_test_url(test: &str) -> Option<String> {
+        postgres_gate(
+            std::env::var("TINYCLOUD_TEST_POSTGRES_URL").ok(),
+            std::env::var_os("GITHUB_ACTIONS").map(|value| value.to_string_lossy().into_owned()),
+            std::env::var("TINYCLOUD_ALLOW_LOCAL_PG").ok(),
+            test,
+        )
+    }
+
+    /// Decides whether a PostgreSQL-backed test connects. Pure, so the rule is
+    /// unit-tested without touching the process environment.
+    ///
+    /// A test connects only when `url` is set and non-empty AND either
+    /// `github_actions` is `"true"` (set by GitHub Actions) or `allow_local` is
+    /// `"1"` (an isolated server the developer started). Otherwise it skips with
+    /// one line on stderr. When `github_actions` is `"true"` and `url` is not, it
+    /// panics: the CI job must never skip these tests silently (TC-381).
+    pub fn postgres_gate(
+        url: Option<String>,
+        github_actions: Option<String>,
+        allow_local: Option<String>,
+        test: &str,
+    ) -> Option<String> {
+        let Some(url) = url.filter(|url| !url.trim().is_empty()) else {
+            if github_actions.as_deref() == Some("true") {
+                panic!(
+                    "{test} requires TINYCLOUD_TEST_POSTGRES_URL, which is unset (or empty) on GitHub Actions. \
+                     This test must not be allowed to skip on GitHub Actions — see TC-381. Check the \
+                     `postgres` service container and the `env:` block in .github/workflows/rust.yml."
+                );
+            }
+            skip_postgres_test(test);
+            return None;
+        };
+        if github_actions.as_deref() == Some("true") || allow_local.as_deref() == Some("1") {
+            return Some(url);
+        }
+        skip_postgres_test(test);
+        None
+    }
+
+    fn skip_postgres_test(test: &str) {
+        use std::io::Write;
+        // Written to the process stderr directly: libtest captures `eprintln!` output of passing tests.
+        let _ = writeln!(
+            std::io::stderr(),
+            "skipping {test}: PostgreSQL-backed tests run only on GitHub Actions (or with TINYCLOUD_ALLOW_LOCAL_PG=1 for an isolated server you started yourself); not connecting"
+        );
+    }
+
+    #[cfg(test)]
+    mod postgres_gate_tests {
+        use super::postgres_gate;
+
+        const URL: &str = "postgres://gate.invalid:1/x";
+        const TEST: &str = "gate_case";
+
+        fn some(value: &str) -> Option<String> {
+            Some(value.to_owned())
+        }
+
+        #[test]
+        fn ci_true_without_github_actions_skips_even_when_the_url_is_set() {
+            // `CI` is not an input to the rule. With GITHUB_ACTIONS and the local
+            // opt-in both unset, a set URL is never connected to.
+            assert_eq!(postgres_gate(some(URL), None, None, TEST), None);
+        }
+
+        #[test]
+        fn url_with_github_actions_true_connects() {
+            assert_eq!(
+                postgres_gate(some(URL), some("true"), None, TEST),
+                some(URL)
+            );
+        }
+
+        #[test]
+        fn url_with_github_actions_other_than_true_skips() {
+            for github_actions in ["1", "TRUE", "false", ""] {
+                assert_eq!(
+                    postgres_gate(some(URL), some(github_actions), None, TEST),
+                    None,
+                    "GITHUB_ACTIONS={github_actions:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn url_with_allow_local_one_connects() {
+            assert_eq!(postgres_gate(some(URL), None, some("1"), TEST), some(URL));
+        }
+
+        #[test]
+        fn url_with_allow_local_other_than_one_skips() {
+            for allow in ["true", "0"] {
+                assert_eq!(
+                    postgres_gate(some(URL), None, some(allow), TEST),
+                    None,
+                    "TINYCLOUD_ALLOW_LOCAL_PG={allow:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn url_unset_without_github_actions_skips() {
+            assert_eq!(postgres_gate(None, None, None, TEST), None);
+        }
+
+        #[test]
+        fn blank_url_without_github_actions_skips() {
+            assert_eq!(postgres_gate(some("  "), None, None, TEST), None);
+        }
+
+        #[test]
+        #[should_panic(expected = "requires TINYCLOUD_TEST_POSTGRES_URL")]
+        fn url_unset_with_github_actions_true_panics() {
+            postgres_gate(None, some("true"), None, TEST);
+        }
+
+        #[test]
+        #[should_panic(expected = "requires TINYCLOUD_TEST_POSTGRES_URL")]
+        fn blank_url_with_github_actions_true_panics() {
+            postgres_gate(some(""), some("true"), None, TEST);
+        }
+    }
 }
 
 use config::{BlockStorage, Config, Keys, StagingStorage};
@@ -128,8 +256,10 @@ use routes::{
     attestation::attestation,
     create_signed_kv_url, delegate, delegation_query, delegation_status,
     encryption::{
-        create_network as create_encryption_network, decrypt as encryption_decrypt,
-        get_network as get_encryption_network, revoke_network as revoke_encryption_network,
+        block_encryption_key, create_encryption_key, create_network as create_encryption_network,
+        decrypt as encryption_decrypt, describe_encryption_key,
+        get_network as get_encryption_network, public_encryption_key,
+        revoke_network as revoke_encryption_network, unblock_encryption_key,
         well_known_network as encryption_well_known,
     },
     hooks::{create_hook_ticket, create_webhook, delete_webhook, hook_events, list_webhooks},
@@ -434,6 +564,7 @@ pub fn resolve_runtime_config(tinycloud_config: &Config) -> Result<Config> {
         .epoch_head_backfill
         .validate()
         .map_err(anyhow::Error::msg)?;
+    resolved.sql_store.validate().map_err(anyhow::Error::msg)?;
     tracing::RequestIdOrigins::new(&resolved.log.request_id_first_party_origins)
         .map_err(anyhow::Error::msg)?;
     resolved.storage.resolve();
@@ -449,11 +580,23 @@ pub fn resolve_runtime_config(tinycloud_config: &Config) -> Result<Config> {
     Ok(resolved)
 }
 
+/// The named-key routes. Mounted only while `named_keys_v1` is on, so with it
+/// off these paths answer as any unmounted path does.
+fn named_key_routes() -> Vec<Route> {
+    rocket::routes![
+        create_encryption_key,
+        describe_encryption_key,
+        public_encryption_key,
+        block_encryption_key,
+        unblock_encryption_key,
+    ]
+}
+
 /// The public Node surface keeps policy admission separate from the generic
 /// delegation and invocation data plane. Share-specific data routes are not
 /// mounted.
-fn production_routes() -> Vec<Route> {
-    rocket::routes![
+fn production_routes(named_keys_v1: bool) -> Vec<Route> {
+    let mut routes = rocket::routes![
         healthcheck,
         cors,
         info,
@@ -496,7 +639,11 @@ fn production_routes() -> Vec<Route> {
         policy_v3_mint,
         policy_v3_status,
         revoke_policy_v3_root,
-    ]
+    ];
+    if named_keys_v1 {
+        routes.extend(named_key_routes());
+    }
+    routes
 }
 
 pub async fn app_with_control(
@@ -546,7 +693,7 @@ pub async fn app_with_control(
         ::tracing::warn!("network DID resolution enabled: did:web/did:tz fetches use the unhardened ssi client (TC-1080)");
     }
 
-    let routes = production_routes();
+    let routes = production_routes(tinycloud_config.encryption_network.named_keys_v1);
     #[cfg(feature = "tc-bench-v1")]
     let mut routes = routes;
 
@@ -673,7 +820,9 @@ pub async fn app_with_control(
         Some(webhook_encryption.clone()),
     )
     .await?
-    .with_sql_sizes(sql_sizes.clone());
+    .with_sql_sizes(sql_sizes.clone())
+    .with_delegated_sql_caveats(tinycloud_config.sql.delegated_caveats_enforced)
+    .with_named_keys(tinycloud_config.encryption_network.named_keys_v1);
     tinycloud.set_read_audit_wait(Duration::from_millis(
         tinycloud_config.database.read_audit_wait_ms,
     ));
@@ -1128,11 +1277,11 @@ fn is_mounted_share_path(path: &str) -> bool {
 
 #[cfg(test)]
 mod production_route_tests {
-    use super::production_routes;
+    use super::{named_key_routes, production_routes};
 
     #[test]
     fn generic_data_plane_and_embedded_policy_admission_are_mounted_without_share_data_routes() {
-        let routes: std::collections::HashSet<_> = production_routes()
+        let routes: std::collections::HashSet<_> = production_routes(true)
             .into_iter()
             .map(|route| format!("{} {}", route.method, route.uri))
             .collect();
@@ -1170,6 +1319,37 @@ mod production_route_tests {
                 .all(|route| !route.split_once(' ').unwrap().1.starts_with("/share/")),
             "production routes must not mount any /share/* handler"
         );
+    }
+
+    /// The five key routes are mounted only with `named_keys_v1` on; the
+    /// network routes are mounted either way.
+    #[test]
+    fn named_key_routes_are_mounted_only_when_named_keys_are_on() {
+        let describe = |routes: Vec<rocket::Route>| -> Vec<String> {
+            routes
+                .into_iter()
+                .map(|route| format!("{} {}", route.method, route.uri))
+                .collect()
+        };
+        let key_routes = describe(named_key_routes());
+        assert_eq!(key_routes.len(), 5, "{key_routes:?}");
+        let off = describe(production_routes(false));
+        let on = describe(production_routes(true));
+        for route in &key_routes {
+            assert!(!off.contains(route), "mounted while off: {route}");
+            assert!(on.contains(route), "missing while on: {route}");
+        }
+        for route in [
+            "POST /encryption/networks",
+            "GET /encryption/networks/<network_id>",
+            "POST /encryption/networks/<network_id>/decrypt",
+            "POST /encryption/networks/<network_id>/revoke",
+        ] {
+            let route = route.to_string();
+            assert!(off.contains(&route), "missing while off: {route}");
+            assert!(on.contains(&route), "missing while on: {route}");
+        }
+        assert_eq!(on.len(), off.len() + 5);
     }
 }
 
@@ -1924,15 +2104,26 @@ mod retry_after_fairing_tests {
 
     #[async_trait::async_trait]
     impl tinycloud_core::database_artifacts::DatabaseArtifactRepository for StalledArtifacts {
-        async fn load(
+        async fn load_meta(
             &self,
             _: &str,
             _: &str,
             _: &str,
         ) -> Result<
-            Option<tinycloud_core::database_artifacts::DatabaseArtifact>,
+            Option<tinycloud_core::database_artifacts::ArtifactMeta>,
             tinycloud_core::database_artifacts::DatabaseArtifactError,
         > {
+            std::future::pending().await
+        }
+
+        async fn read_chunks(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &tinycloud_core::database_artifacts::ArtifactMeta,
+            _: &mut dyn tinycloud_core::database_artifacts::ArtifactSink,
+        ) -> Result<(), tinycloud_core::database_artifacts::DatabaseArtifactError> {
             std::future::pending().await
         }
 

@@ -14,6 +14,7 @@ use pin_project::pin_project;
 use tinycloud_auth::resource::SpaceId;
 use uuid::Uuid;
 
+use crate::failure_diagnostic::{FailureCode, FailureNote, Service};
 use crate::telemetry::{Pseudonym, Pseudonymizer};
 
 pub use sqlx_core::request_telemetry::{Metrics, PoolTimer, QueryTimer, Snapshot};
@@ -71,6 +72,7 @@ pub struct RequestContext {
     metrics: Arc<Metrics>,
     pseudonymizer: Arc<Pseudonymizer>,
     identities: Mutex<IdentityState>,
+    failure: Mutex<Option<FailureNote>>,
 }
 
 impl RequestContext {
@@ -81,6 +83,7 @@ impl RequestContext {
             metrics: Arc::new(Metrics::default()),
             pseudonymizer,
             identities: Mutex::new(IdentityState::default()),
+            failure: Mutex::new(None),
         })
     }
 
@@ -132,6 +135,41 @@ impl RequestContext {
             space_hash: identities.space.hash(),
         }
     }
+
+    /// Record the request's database failure, replacing an earlier one.
+    pub fn note_failure(&self, note: FailureNote) {
+        *self
+            .failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(note);
+    }
+
+    /// The recorded failure becomes one after which a write may have been
+    /// applied; with none recorded, `service` and `db_hash` start one of
+    /// kind `other`.
+    pub fn note_outcome_unknown(&self, service: Service, db_hash: Option<String>) {
+        let mut failure = self
+            .failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let note = failure.get_or_insert_with(|| FailureNote {
+            service,
+            code: FailureCode::OutcomeUnknown,
+            kind: "other",
+            write_may_have_applied: true,
+            db_hash,
+        });
+        note.code = FailureCode::OutcomeUnknown;
+        note.write_may_have_applied = true;
+    }
+
+    /// The request's recorded database failure, if any.
+    pub fn failure(&self) -> Option<FailureNote> {
+        self.failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
 }
 
 /// Return the request installed for the current poll or synchronous worker.
@@ -143,6 +181,37 @@ pub fn current() -> Option<Arc<RequestContext>> {
 pub fn observe_space(space: &SpaceId) {
     if let Some(context) = current() {
         context.observe_space(space);
+    }
+}
+
+/// The keyed pseudonym of the database (`service`, `space`, `physical_name`)
+/// as 64 lowercase hex digits, from the current request's pseudonymizer
+/// ([`Pseudonymizer::db_hash`]). `None` outside an HTTP request.
+pub fn db_hash(service: &str, space: &SpaceId, physical_name: &str) -> Option<String> {
+    let context = current()?;
+    let hash = context
+        .pseudonymizer
+        .db_hash(service, space, physical_name)
+        .ok()?;
+    Some(hex::encode(hash.into_bytes()))
+}
+
+/// Record the database failure the current request is about to answer with a
+/// 5xx (TC-1796); a later note replaces an earlier one. A no-op outside an
+/// HTTP request.
+pub fn note_failure(note: FailureNote) {
+    if let Some(context) = current() {
+        context.note_failure(note);
+    }
+}
+
+/// The request's write may have been applied before it failed (its artifact
+/// write was sent): the recorded failure becomes
+/// [`FailureCode::OutcomeUnknown`]. A request with no recorded failure gets
+/// one for `service` and `db_hash`, kind `other`.
+pub fn note_outcome_unknown(service: Service, db_hash: Option<String>) {
+    if let Some(context) = current() {
+        context.note_outcome_unknown(service, db_hash);
     }
 }
 

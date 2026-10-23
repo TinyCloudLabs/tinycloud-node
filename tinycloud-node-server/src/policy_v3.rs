@@ -1952,20 +1952,7 @@ pub async fn register_policy(
     let txn = tinycloud_core::db::begin_write_transaction(&runtime.conn, None)
         .await
         .map_err(db_error)?;
-    tinycloud_core::kv_sync::lock_space_sequences(&txn, &sequence_spaces)
-        .await
-        .map_err(db_error)?;
-    // The normal graph rows, abilities, and signed-byte projections share one
-    // SQL transaction. A failure in either side leaves no partial authority.
-    tinycloud
-        .delegate_batch_in_transaction(&txn, root_delegations)
-        .await
-        .map_err(|error| (Status::Forbidden, error.to_string()))?;
-    registration
-        .insert(&txn)
-        .await
-        .map_err(|e| (Status::Conflict, e.to_string()))?;
-    for (cid, role, bytes, status) in [
+    let roots = [
         (
             policy_root_cid.clone(),
             "policy-authority",
@@ -1978,14 +1965,63 @@ pub async fn register_policy(
             request.enforcement_root.into_bytes(),
             enforcement_status,
         ),
-    ] {
+    ];
+    let written = register_policy_writes(
+        &txn,
+        tinycloud,
+        &sequence_spaces,
+        root_delegations,
+        registration,
+        &request.policy_cid,
+        roots,
+    )
+    .await;
+    match written {
+        Ok(()) => txn.commit().await.map_err(db_error)?,
+        Err(err) => {
+            let _ = txn.rollback().await;
+            return Err(err);
+        }
+    }
+    Ok(Json(RegisterResponse {
+        policy_cid: request.policy_cid,
+        policy_root_cid,
+        enforcement_root_cid,
+    }))
+}
+
+/// The writes of `register_policy`, inside the transaction its caller opened.
+/// The caller commits when this returns `Ok` and rolls back on `Err`.
+async fn register_policy_writes(
+    txn: &DatabaseTransaction,
+    tinycloud: &crate::TinyCloud,
+    sequence_spaces: &[SpaceId],
+    root_delegations: Vec<Delegation>,
+    registration: policy_v3_registration::ActiveModel,
+    policy_cid: &str,
+    roots: [(String, &'static str, Vec<u8>, Vec<u8>); 2],
+) -> Result<(), (Status, String)> {
+    tinycloud_core::kv_sync::lock_space_sequences(txn, sequence_spaces)
+        .await
+        .map_err(db_error)?;
+    // The normal graph rows, abilities, and signed-byte projections share one
+    // SQL transaction. A failure in either side leaves no partial authority.
+    tinycloud
+        .delegate_batch_in_transaction(txn, root_delegations)
+        .await
+        .map_err(|error| (Status::Forbidden, error.to_string()))?;
+    registration
+        .insert(txn)
+        .await
+        .map_err(|e| (Status::Conflict, e.to_string()))?;
+    for (cid, role, bytes, status) in roots {
         let checked_at = status_field(&status, "checkedAt")
             .ok_or((Status::InternalServerError, "status-invalid".into()))?;
         let fresh_until = status_field(&status, "freshUntil")
             .ok_or((Status::InternalServerError, "status-invalid".into()))?;
         policy_v3_root::ActiveModel {
             root_cid: Set(cid),
-            policy_cid: Set(request.policy_cid.clone()),
+            policy_cid: Set(policy_cid.to_owned()),
             role: Set(role.to_owned()),
             authorization_bytes: Set(bytes),
             status_checkpoint_bytes: Set(Some(status)),
@@ -1997,16 +2033,11 @@ pub async fn register_policy(
             revoked_at: Set(None),
             revocation_bytes: Set(None),
         }
-        .insert(&txn)
+        .insert(txn)
         .await
         .map_err(|e| (Status::Conflict, e.to_string()))?;
     }
-    txn.commit().await.map_err(db_error)?;
-    Ok(Json(RegisterResponse {
-        policy_cid: request.policy_cid,
-        policy_root_cid,
-        enforcement_root_cid,
-    }))
+    Ok(())
 }
 
 #[post("/policy/v3/challenges", format = "json", data = "<request>")]
@@ -9087,7 +9118,6 @@ mod tests {
         let storage = crate::storage::file_system::FileSystemConfig::new(storage_dir.path())
             .open()
             .await?;
-        let _storage_dir = storage_dir.keep();
         let tinycloud = crate::TinyCloud::new(
             db.clone().into(),
             Either::B(storage),
@@ -9096,7 +9126,6 @@ mod tests {
         .await?;
         let sql_dir = tempfile::TempDir::new()?;
         let sql_path = sql_dir.path().to_string_lossy().to_string();
-        let _sql_dir = sql_dir.keep();
         let sql_service = SqlService::new(
             sql_path,
             u64::MAX,
@@ -10914,5 +10943,13 @@ mod account_alias_tests;
 mod test_harness;
 
 #[cfg(test)]
+#[path = "policy_v3/named_keys_gate_tests.rs"]
+mod named_keys_gate_tests;
+
+#[cfg(test)]
 #[path = "policy_v3/root_revocation_tests.rs"]
 mod root_revocation_tests;
+
+#[cfg(test)]
+#[path = "policy_v3/registration_probe_tests.rs"]
+mod registration_probe_tests;
