@@ -18,9 +18,10 @@
 //!
 //! This is a manual benchmark, not a regression gate: it is `#[ignore]`d and
 //! never fails on put errors (only reports them). It connects only when
-//! `TINYCLOUD_TEST_POSTGRES_URL` is set and either `CI=true` or
-//! `TINYCLOUD_ALLOW_LOCAL_PG=1` (an isolated server you started yourself);
-//! otherwise it skips. Under `CI`, an unset URL fails the test (TC-381). Run it with:
+//! `TINYCLOUD_TEST_POSTGRES_URL` is set and either `GITHUB_ACTIONS=true` (GitHub
+//! Actions) or `TINYCLOUD_ALLOW_LOCAL_PG=1` (an isolated server you started
+//! yourself); otherwise it skips. On GitHub Actions, an unset URL fails the
+//! test (TC-381). Run it with:
 //!
 //! ```text
 //! TINYCLOUD_ALLOW_LOCAL_PG=1 \

@@ -3,7 +3,7 @@
 //! registration, sessions, reads, decrypts, re-shares and revocations.
 //!
 //! PostgreSQL runs need `TINYCLOUD_TEST_POSTGRES_URL` (each test uses its own
-//! schema); they are skipped when it is unset outside CI.
+//! schema); they are skipped when it is unset and the gate does not allow a connection.
 
 use super::*;
 use rocket::{

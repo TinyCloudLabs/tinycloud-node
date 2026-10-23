@@ -132,6 +132,6 @@ cargo test -p tinycloud-node --test request_telemetry --test request_telemetry_a
 cargo test -p tinycloud-node --features duckdb --test request_telemetry_authenticated --test duckdb_diagnostics_policy --test duckdb_offline_policy
 ```
 
-PostgreSQL-backed tests run in CI. Locally they connect only when `TINYCLOUD_ALLOW_LOCAL_PG=1` is set together with `TINYCLOUD_TEST_POSTGRES_URL` pointing at an isolated server the developer started; otherwise they skip.
+PostgreSQL-backed tests run on GitHub Actions. Locally they connect only when `TINYCLOUD_ALLOW_LOCAL_PG=1` is set together with `TINYCLOUD_TEST_POSTGRES_URL` pointing at an isolated server the developer started; otherwise they skip. `CI=true` alone does not connect: automation shells set it by default.
 
 The existing full workspace suite requires PostgreSQL 16+ with ICU collation support; PostgreSQL 14 cannot run its existing ICU `rules` regression. The existing privileged black-hole tests additionally require their explicit opt-in and host/network authorization; they are not implied by a telemetry smoke or a shared build slot. Never point tests at production databases. No local Docker proof, production ingestion, deployment or merge is implied by these commands.

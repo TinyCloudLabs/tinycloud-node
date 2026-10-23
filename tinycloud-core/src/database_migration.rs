@@ -1472,7 +1472,7 @@ mod tests {
     }
 
     /// Connects to `TINYCLOUD_TEST_POSTGRES_URL` inside a fresh, migrated schema that the guard
-    /// drops. `None` when the URL is unset outside CI.
+    /// drops. `None` when the URL is unset and the gate does not allow a connection.
     async fn migrated_postgres_schema(
         test: &str,
     ) -> Option<(PostgresSchemaGuard, DatabaseConnection)> {
