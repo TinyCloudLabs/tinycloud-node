@@ -58,7 +58,7 @@ use tinycloud_core::{
     },
     request_cancel,
     sea_orm::{ColumnTrait, DbErr, EntityTrait, QueryFilter, QueryOrder},
-    sql::{SqlAuthority, SqlCaveats, SqlError, SqlRequest, SqlService},
+    sql::{CaveatArm, SqlAuthority, SqlCaveats, SqlError, SqlRequest, SqlService},
     storage::{HashBuffer, ImmutableReadStore, ImmutableStaging},
     types::{Ability, DelegationQuery, DelegationQueryPage, Metadata, Resource},
     util::{Capability, DelegationInfo, InvocationInfo, RevocationInfo},
@@ -2696,12 +2696,52 @@ async fn handle_sql_invoke(
     )?;
 
     let actor = admitted.invocation().0.invoker.clone();
+    let sql_invoked: Vec<tinycloud_core::util::Capability> = admitted
+        .invocation()
+        .0
+        .capabilities
+        .iter()
+        .filter(|cap| {
+            matches!(
+                (&cap.resource, cap.ability.as_ref().as_ref()),
+                (Resource::TinyCloud(r), ability)
+                    if r.service().as_str() == "sql" && ability.starts_with("tinycloud.sql/")
+            )
+        })
+        .cloned()
+        .collect();
     // TC-409: `admitted` was verified exactly once at the /invoke admission
     // boundary; `verify_auth_admitted` uses the admitted core entry point so this
     // shared SQL/DuckDB authorization path does not re-run signature
     // verification a second time.
     let auth_result = verify_auth_admitted("server.sql.auth", admitted, tinycloud).await?;
     let constrained = resolve_sql_profile(own_profiles, tinycloud, &parent_cids).await?;
+    // TC-1791: with the node setting on, the effective caveat is the
+    // intersection over every stored delegation on the cited chain; the
+    // invocation's own `sqlCaveats` fact only narrows it further.
+    let chain_caveat = if config.sql.delegated_caveats_enforced {
+        let conn = tinycloud
+            .readable()
+            .await
+            .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+        let roots: Vec<tinycloud_core::hash::Hash> = parent_cids
+            .iter()
+            .copied()
+            .map(tinycloud_core::hash::Hash::from)
+            .collect();
+        let chain =
+            tinycloud_core::sql::delegated_caveats::chain_caveat(&conn, &roots, &sql_invoked)
+                .await
+                .map_err(chain_caveat_refusal)?;
+        if chain.has_form && (chain.has_profile || constrained.is_some()) {
+            return Err(caveat_violation(CaveatArm::Chain).into());
+        }
+        chain
+    } else {
+        Default::default()
+    };
+    // The delegated-caveat rules judge a request that no profile governs.
+    let delegated_mode = config.sql.delegated_caveats_enforced && constrained.is_none();
     let body_start = Instant::now();
     let body_result = read_json_body_limited(
         data,
@@ -2721,7 +2761,8 @@ async fn handle_sql_invoke(
     // compatibility command. Statement authorization sees every SQL ability
     // the invocation holds, so a `[write, schema]` request can run both data
     // and schema-changing statements.
-    let authority = SqlAuthority::new(sql_caps.iter().map(|(_, _, held)| held.as_str()));
+    let authority = SqlAuthority::new(sql_caps.iter().map(|(_, _, held)| held.as_str()))
+        .with_delegated_caveats(delegated_mode);
     // N3 will resolve this logical identity through an explicit alias table.
     // Do not fall back to the legacy final-segment selector here.
     let space_id = space.to_string();
@@ -2747,6 +2788,29 @@ async fn handle_sql_invoke(
         sql_request
     };
 
+    // Bind SQL service execution to the resolved profile when one applies.
+    // The invocation's `sqlCaveats` facts are a fallback used only when no
+    // profile applies; they never override a resolved profile. With the
+    // delegated-caveat setting on, the facts narrow the chain's caveat.
+    let exec_caveats: Option<SqlCaveats> = match &constrained {
+        Some(c) => Some(constrained_caveat_to_sql_caveats(c)),
+        None if delegated_mode => chain_caveat.form.narrowed_by_facts(facts_caveats),
+        None => facts_caveats,
+    };
+
+    // Refuse a database export under a table or column restriction: the
+    // export is the whole file, not a statement the authorizer can judge.
+    if matches!(sql_request, SqlRequest::Export) && delegated_mode {
+        let arm = match &exec_caveats {
+            Some(c) if c.tables.is_some() => Some(CaveatArm::Table),
+            Some(c) if c.columns.is_some() => Some(CaveatArm::Column),
+            _ => None,
+        };
+        if let Some(arm) = arm {
+            return Err(caveat_violation(arm).into());
+        }
+    }
+
     if matches!(sql_request, SqlRequest::Export) {
         let export_start = Instant::now();
         let export_result = sql_service.export(space, &db_name).await;
@@ -2758,14 +2822,6 @@ async fn handle_sql_invoke(
         let data = export_result.map_err(|e| (sql_error_to_status(&e), e.to_string()))?;
         return Ok(DataOut::One(InvOut(InvocationOutcome::SqlExport(data))));
     }
-
-    // Bind SQL service execution to the resolved profile when one applies.
-    // The invocation's `sqlCaveats` facts are a fallback used only when no
-    // profile applies; they never override a resolved profile.
-    let exec_caveats: Option<SqlCaveats> = match &constrained {
-        Some(c) => Some(constrained_caveat_to_sql_caveats(c)),
-        None => facts_caveats,
-    };
 
     // SQL storage gate — same limit resolution as the KV path. Reads never
     // 402. Under the limit, one-write overshoot is accepted: usage is only
@@ -3328,6 +3384,26 @@ pub(crate) fn sql_error_to_status(err: &SqlError) -> Status {
         SqlError::Unavailable => Status::ServiceUnavailable,
         SqlError::OutcomeUnknown => Status::InternalServerError,
         SqlError::Busy(_) | SqlError::RequestTimeout => Status::ServiceUnavailable,
+    }
+}
+
+/// The refusal of a request a delegated caveat does not allow. The body is the
+/// fixed `sql_caveat_violation: <arm>` text; it carries no SQL, table or
+/// column name.
+fn caveat_violation(arm: CaveatArm) -> (Status, String) {
+    let error = SqlError::CaveatViolation(arm);
+    (sql_error_to_status(&error), error.to_string())
+}
+
+fn chain_caveat_refusal(
+    error: tinycloud_core::sql::delegated_caveats::ChainCaveatError,
+) -> (Status, String) {
+    use tinycloud_core::sql::delegated_caveats::ChainCaveatError;
+    match error {
+        ChainCaveatError::Db(error) => (Status::InternalServerError, error.to_string()),
+        ChainCaveatError::Unevaluable | ChainCaveatError::LimitExceeded => {
+            caveat_violation(CaveatArm::Chain)
+        }
     }
 }
 
