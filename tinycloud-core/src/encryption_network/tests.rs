@@ -7,7 +7,9 @@ use std::convert::TryInto;
 use std::sync::Arc;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use sea_orm::{ConnectOptions, Database, DatabaseConnection, EntityTrait};
+use sea_orm::{
+    ActiveModelTrait, ActiveValue::Set, ConnectOptions, Database, DatabaseConnection, EntityTrait,
+};
 use sea_orm_migration::MigratorTrait;
 use serde_json::Value;
 use time::OffsetDateTime;
@@ -43,7 +45,8 @@ use crate::encryption_network::types::{
 };
 use crate::keys::{public_key_to_did_key, Keypair, StaticSecret as NodeStaticSecret};
 use crate::migrations::Migrator;
-use crate::models::encryption_ceremony;
+use crate::models::{encryption_ceremony, encryption_network_key};
+use crate::test_support::PostgresTestSchema;
 
 const NODE_DID: &str = "did:key:z6MkNodeTest";
 const NETWORK_NAME: &str = "default";
@@ -913,7 +916,10 @@ async fn create_key_refuses_revoked_network() {
         .create_key(&key_loc("apps/alpha"), false)
         .await
         .unwrap_err();
-    assert!(matches!(err, EncryptionServiceError::NetworkRevoked));
+    assert!(
+        matches!(&err, EncryptionServiceError::NetworkNotActive(s) if s == "revoked"),
+        "revoked network must map to network_not_active(revoked), got {err:?}"
+    );
 }
 
 #[tokio::test]
@@ -1023,4 +1029,152 @@ async fn unwrap_named_key_rejects_wrapping_to_other_key() {
         .await
         .unwrap_err();
     assert!(matches!(err, EncryptionServiceError::KeyUnwrapFailed(_)));
+}
+
+#[tokio::test]
+async fn unwrap_named_key_refuses_revoked_network() {
+    let svc = make_service(fresh_db().await);
+    create_network(&svc).await;
+    let loc = key_loc("apps/alpha");
+    let key = svc.create_key(&loc, false).await.unwrap();
+    let wrapped = wrap_to_public_key(&key.public_encryption_key, &[0x5Au8; 32]).unwrap();
+    svc.revoke_network(&network_id()).await.unwrap();
+    let err = svc.unwrap_named_key(&loc, &wrapped).await.unwrap_err();
+    assert!(
+        matches!(&err, EncryptionServiceError::NetworkNotActive(s) if s == "revoked"),
+        "unwrap after network revoke must be refused, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn public_key_refuses_revoked_network() {
+    let svc = make_service(fresh_db().await);
+    create_network(&svc).await;
+    let loc = key_loc("apps/alpha");
+    svc.create_key(&loc, false).await.unwrap();
+    svc.revoke_network(&network_id()).await.unwrap();
+    let err = svc.public_key(&loc).await.unwrap_err();
+    assert!(
+        matches!(&err, EncryptionServiceError::NetworkNotActive(s) if s == "revoked"),
+        "public GET after network revoke must be refused, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn stored_unknown_state_is_refused_as_corrupt() {
+    let db = fresh_db().await;
+    let svc = make_service(db.clone());
+    create_network(&svc).await;
+    let loc = key_loc("apps/alpha");
+    let key = svc.create_key(&loc, false).await.unwrap();
+    let wrapped = wrap_to_public_key(&key.public_encryption_key, &[0x5Au8; 32]).unwrap();
+    // A raw row in a state this build does not know, as a future build might write.
+    let mut row: encryption_network_key::ActiveModel = encryption_network_key::Entity::find_by_id(
+        (network_id().to_string(), "apps/alpha".to_string()),
+    )
+    .one(&db)
+    .await
+    .unwrap()
+    .unwrap()
+    .into();
+    row.state = Set("deleted".to_string());
+    row.update(&db).await.unwrap();
+
+    let err = svc.unwrap_named_key(&loc, &wrapped).await.unwrap_err();
+    assert!(
+        matches!(err, EncryptionServiceError::CorruptKeyRow),
+        "unwrap: {err:?}"
+    );
+    let err = svc.describe_key(&loc).await.unwrap_err();
+    assert!(
+        matches!(err, EncryptionServiceError::CorruptKeyRow),
+        "describe: {err:?}"
+    );
+    let err = svc.block_key(&loc).await.unwrap_err();
+    assert!(
+        matches!(err, EncryptionServiceError::CorruptKeyRow),
+        "block: {err:?}"
+    );
+    let err = svc.unblock_key(&loc).await.unwrap_err();
+    assert!(
+        matches!(err, EncryptionServiceError::CorruptKeyRow),
+        "unblock: {err:?}"
+    );
+    let err = svc.create_key(&loc, false).await.unwrap_err();
+    assert!(
+        matches!(err, EncryptionServiceError::CorruptKeyRow),
+        "create: {err:?}"
+    );
+}
+
+// PostgreSQL-backed. Locally these return early unless
+// TINYCLOUD_TEST_POSTGRES_URL is set; CI runs them with a PostgreSQL service.
+#[tokio::test]
+async fn postgres_concurrent_identical_creates_return_one_row() {
+    let Some(fixture) = PostgresTestSchema::migrated_through(
+        "postgres_concurrent_identical_creates_return_one_row",
+        None,
+    )
+    .await
+    else {
+        return;
+    };
+    let db = fixture.connect(8).await;
+    let svc = Arc::new(make_service(db.clone()));
+    create_network(&svc).await;
+
+    let results = futures::future::join_all((0..8).map(|_| {
+        let svc = svc.clone();
+        async move { svc.create_key(&key_loc("apps/alpha"), false).await }
+    }))
+    .await;
+    let descriptors: Vec<_> = results
+        .into_iter()
+        .map(|r| r.expect("identical concurrent create must be Ok"))
+        .collect();
+    assert!(descriptors.windows(2).all(|w| w[0] == w[1]));
+    let rows = encryption_network_key::Entity::find()
+        .all(&db)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "one row per (network, key_path)");
+}
+
+// PostgreSQL-backed; CI-only, see the note on the identical-create test.
+#[tokio::test]
+async fn postgres_concurrent_creates_respect_the_key_cap() {
+    let Some(fixture) = PostgresTestSchema::migrated_through(
+        "postgres_concurrent_creates_respect_the_key_cap",
+        None,
+    )
+    .await
+    else {
+        return;
+    };
+    const CAP: u64 = 3;
+    let db = fixture.connect(8).await;
+    let svc = Arc::new(make_service(db.clone()).with_key_cap_per_network(CAP));
+    create_network(&svc).await;
+    for seed in 0..(CAP - 1) {
+        svc.create_key(&key_loc(&format!("seed-{seed}")), false)
+            .await
+            .unwrap();
+    }
+
+    let results = futures::future::join_all((0..8).map(|i| {
+        let svc = svc.clone();
+        async move { svc.create_key(&key_loc(&format!("race-{i}")), false).await }
+    }))
+    .await;
+    let won = results.iter().filter(|r| r.is_ok()).count();
+    assert_eq!(won, 1, "exactly one create fits under the cap");
+    assert!(results
+        .iter()
+        .filter_map(|r| r.as_ref().err())
+        .all(|e| matches!(e, EncryptionServiceError::KeyLimitExceeded)));
+    let rows = encryption_network_key::Entity::find()
+        .all(&db)
+        .await
+        .unwrap();
+    assert_eq!(rows.len() as u64, CAP, "cap is never exceeded");
 }

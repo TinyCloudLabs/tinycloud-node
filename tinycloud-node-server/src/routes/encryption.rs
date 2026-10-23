@@ -302,7 +302,7 @@ fn map_service_err(err: EncryptionServiceError) -> (Status, String) {
         | EncryptionServiceError::KeyBlocked
         | EncryptionServiceError::KeyLimitExceeded
         | EncryptionServiceError::KeyUnwrapFailed(_) => Status::Forbidden,
-        EncryptionServiceError::CorruptKeyRow(_) => Status::InternalServerError,
+        EncryptionServiceError::CorruptKeyRow => Status::InternalServerError,
         EncryptionServiceError::InvalidBody(_) | EncryptionServiceError::Base64(_) => {
             Status::BadRequest
         }

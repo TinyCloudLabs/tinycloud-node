@@ -10,7 +10,7 @@ use rand::rngs::OsRng;
 use sha2::Sha256;
 use thiserror::Error;
 use x25519_dalek::{PublicKey, StaticSecret};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::encryption::{ColumnEncryption, EncryptionError};
 
@@ -63,18 +63,25 @@ pub trait KeyBackend: Send + Sync {
         receiver_public_key: &[u8],
     ) -> Result<Vec<u8>, KeyBackendError>;
 
-    /// Public key of the named key at `canonical_urn` under the network key
-    /// sealed in `sealed_private_key` (D4).
-    fn derive_named_public_key(
+    /// Unseal the network private key. A failure here is a backend fault,
+    /// reported separately from a failed unwrap.
+    fn open_network_secret(
         &self,
         sealed_private_key: &[u8],
+    ) -> Result<StaticSecret, KeyBackendError>;
+
+    /// Public key of the named key at `canonical_urn` under `network_secret`.
+    fn derive_named_public_key(
+        &self,
+        network_secret: &StaticSecret,
         canonical_urn: &str,
     ) -> Result<Vec<u8>, KeyBackendError>;
 
-    /// Unwrap a key wrapped to the named key at `canonical_urn` (D4).
+    /// Unwrap a key wrapped to the named key at `canonical_urn` under
+    /// `network_secret`.
     fn unwrap_named(
         &self,
-        sealed_private_key: &[u8],
+        network_secret: &StaticSecret,
         canonical_urn: &str,
         wrapped_key: &[u8],
     ) -> Result<Vec<u8>, KeyBackendError>;
@@ -122,7 +129,7 @@ fn unwrap_with_secret(secret: &StaticSecret, wrapped: &[u8]) -> Result<Vec<u8>, 
 const NAMED_KEY_SALT: &[u8] = b"tinycloud.encryption.named-key/v1";
 const NAMED_KEY_INFO_PREFIX: &[u8] = b"deterministic\n";
 
-/// D4: deterministic named-key secret = HKDF-SHA256(ikm = raw network secret,
+/// Deterministic named-key secret = HKDF-SHA256(ikm = raw network secret,
 /// salt = fixed label, info = `deterministic\n` || canonical key URN).
 fn named_key_secret(network_secret: &[u8; 32], canonical_urn: &str) -> StaticSecret {
     let mut info = Vec::with_capacity(NAMED_KEY_INFO_PREFIX.len() + canonical_urn.len());
@@ -148,21 +155,26 @@ impl LocalOneOfOneBackend {
     pub fn new(seal: ColumnEncryption) -> Self {
         Self { seal }
     }
-
-    fn open_private(&self, sealed: &[u8]) -> Result<StaticSecret, KeyBackendError> {
-        let opened = self.seal.decrypt(sealed)?;
-        if opened.len() != 32 {
-            return Err(KeyBackendError::InvalidSealedKey);
-        }
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&opened);
-        Ok(StaticSecret::from(arr))
-    }
 }
 
 impl KeyBackend for LocalOneOfOneBackend {
     fn kind(&self) -> super::types::KeyBackendKind {
         super::types::KeyBackendKind::LocalOneOfOne
+    }
+
+    fn open_network_secret(
+        &self,
+        sealed_private_key: &[u8],
+    ) -> Result<StaticSecret, KeyBackendError> {
+        let opened = Zeroizing::new(self.seal.decrypt(sealed_private_key)?);
+        if opened.len() != 32 {
+            return Err(KeyBackendError::InvalidSealedKey);
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&opened);
+        let secret = StaticSecret::from(arr);
+        arr.zeroize();
+        Ok(secret)
     }
 
     fn generate(&self) -> Result<GeneratedKey, KeyBackendError> {
@@ -181,28 +193,26 @@ impl KeyBackend for LocalOneOfOneBackend {
         sealed_private_key: &[u8],
         wrapped_key: &[u8],
     ) -> Result<Vec<u8>, KeyBackendError> {
-        let secret = self.open_private(sealed_private_key)?;
+        let secret = self.open_network_secret(sealed_private_key)?;
         unwrap_with_secret(&secret, wrapped_key)
     }
 
     fn derive_named_public_key(
         &self,
-        sealed_private_key: &[u8],
+        network_secret: &StaticSecret,
         canonical_urn: &str,
     ) -> Result<Vec<u8>, KeyBackendError> {
-        let network = self.open_private(sealed_private_key)?;
-        let secret = named_key_secret(network.as_bytes(), canonical_urn);
+        let secret = named_key_secret(network_secret.as_bytes(), canonical_urn);
         Ok(PublicKey::from(&secret).as_bytes().to_vec())
     }
 
     fn unwrap_named(
         &self,
-        sealed_private_key: &[u8],
+        network_secret: &StaticSecret,
         canonical_urn: &str,
         wrapped_key: &[u8],
     ) -> Result<Vec<u8>, KeyBackendError> {
-        let network = self.open_private(sealed_private_key)?;
-        let secret = named_key_secret(network.as_bytes(), canonical_urn);
+        let secret = named_key_secret(network_secret.as_bytes(), canonical_urn);
         unwrap_with_secret(&secret, wrapped_key)
     }
 
@@ -310,19 +320,18 @@ mod tests {
     fn named_key_round_trip_and_isolation() {
         let backend = LocalOneOfOneBackend::new(seal_key());
         let gk = backend.generate().unwrap();
+        let network = backend.open_network_secret(&gk.sealed_private_key).unwrap();
         let named_pub = backend
-            .derive_named_public_key(&gk.sealed_private_key, KAT_URN_NOTES)
+            .derive_named_public_key(&network, KAT_URN_NOTES)
             .unwrap();
         let symmetric = [0x5Au8; 32];
         let wrapped = wrap_to_public_key(&named_pub, &symmetric).unwrap();
         let recovered = backend
-            .unwrap_named(&gk.sealed_private_key, KAT_URN_NOTES, &wrapped)
+            .unwrap_named(&network, KAT_URN_NOTES, &wrapped)
             .unwrap();
         assert_eq!(recovered, symmetric);
         // Wrapped to the notes key: a sibling key and the root key cannot open it.
-        assert!(backend
-            .unwrap_named(&gk.sealed_private_key, KAT_URN_A, &wrapped)
-            .is_err());
+        assert!(backend.unwrap_named(&network, KAT_URN_A, &wrapped).is_err());
         assert!(backend.unwrap(&gk.sealed_private_key, &wrapped).is_err());
     }
 

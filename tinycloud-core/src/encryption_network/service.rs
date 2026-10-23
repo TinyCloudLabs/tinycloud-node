@@ -103,8 +103,8 @@ pub enum EncryptionServiceError {
     KeyLimitExceeded,
     #[error("key_unwrap_failed: the wrapped key could not be unwrapped")]
     KeyUnwrapFailed(#[source] KeyBackendError),
-    #[error("stored key row is corrupt: {0}")]
-    CorruptKeyRow(String),
+    #[error("corrupt_key_row: stored key row is not readable")]
+    CorruptKeyRow,
 }
 
 pub struct EncryptionService {
@@ -1097,7 +1097,7 @@ pub(super) fn now_rfc3339() -> String {
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
 
-fn is_unique_violation(err: &DbErr) -> bool {
+pub(super) fn is_unique_violation(err: &DbErr) -> bool {
     let s = err.to_string().to_lowercase();
     s.contains("unique") || s.contains("primary") || s.contains("duplicate")
 }
