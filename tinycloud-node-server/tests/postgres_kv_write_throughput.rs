@@ -16,16 +16,21 @@
 //! credentials. Every put stores a distinct value, so each one is a real
 //! S3 HEAD + PUT.
 //!
-//! This is a manual benchmark, not a regression gate: it is `#[ignore]`d,
-//! never fails on put errors (only reports them), and skips — without
-//! panicking, even when `CI` is set — when `TINYCLOUD_TEST_POSTGRES_URL` is
-//! unset. Run it with:
+//! This is a manual benchmark, not a regression gate: it is `#[ignore]`d and
+//! never fails on put errors (only reports them). It connects only when
+//! `TINYCLOUD_TEST_POSTGRES_URL` is set and either `GITHUB_ACTIONS=true` (GitHub
+//! Actions) or `TINYCLOUD_ALLOW_LOCAL_PG=1` (an isolated server you started
+//! yourself); otherwise it skips. On GitHub Actions, an unset URL fails the
+//! test (TC-381). Run it with:
 //!
 //! ```text
-//! TINYCLOUD_TEST_POSTGRES_URL=postgres://postgres:postgres@127.0.0.1:55516/postgres \
+//! TINYCLOUD_ALLOW_LOCAL_PG=1 \
+//! TINYCLOUD_TEST_POSTGRES_URL=postgres://<user>:<password>@<host>:<port>/<database> \
 //!   cargo test --release -p tinycloud-node --test postgres_kv_write_throughput \
 //!   -- --ignored --nocapture
 //! ```
+
+mod common;
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -463,14 +468,8 @@ fn print_table(store: &str, reports: &[CellReport]) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "manual benchmark; requires TINYCLOUD_TEST_POSTGRES_URL"]
 async fn postgres_kv_write_throughput() {
-    let database_url = match std::env::var("TINYCLOUD_TEST_POSTGRES_URL") {
-        Ok(url) if !url.trim().is_empty() => url,
-        _ => {
-            eprintln!(
-                "skipping postgres_kv_write_throughput: TINYCLOUD_TEST_POSTGRES_URL is unset"
-            );
-            return;
-        }
+    let Some(database_url) = common::postgres_test_url("postgres_kv_write_throughput") else {
+        return;
     };
 
     let admin = Database::connect(ConnectOptions::new(database_url.clone()))

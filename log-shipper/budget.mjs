@@ -3,6 +3,9 @@ import { pathToFileURL } from 'node:url';
 
 const schema = JSON.parse(readFileSync(new URL('./fields.json', import.meta.url), 'utf8')).services['tinycloud-node'];
 const longest = values => values.reduce((chosen, value) => Buffer.byteLength(value) > Buffer.byteLength(chosen) ? value : chosen, '');
+/** Event codes that ship as individual events, outside the count reducer (TC-1840). */
+export const INDIVIDUAL_EVENT_CODES = Object.freeze(['db_failure_5xx']);
+const aggregatedCodes = schema.fields.event_code.values.filter(code => !INDIVIDUAL_EVENT_CODES.includes(code));
 
 /** Thirty days, not a calendar-month or billing-period guarantee. */
 export const MINUTES_30_DAYS = 30 * 24 * 60;
@@ -10,6 +13,11 @@ export const MINUTES_30_DAYS = 30 * 24 * 60;
 export const REQUEST_ALLOCATION_BYTES = 480_000_000;
 
 const common = { level: 'info', ts: '9999-12-31T23:59:59.999Z' };
+// Worst-valid N2 correlation fields on a node request: longest request id, both full-width pseudonyms.
+const correlation = {
+  request_id: 'ffffffff-ffff-8fff-bfff-ffffffffffff', request_id_replaced: true,
+  account_hash: 'f'.repeat(64), space_hash: 'f'.repeat(64),
+};
 const request = {
   method: longest(schema.fields.method.values), route: longest(schema.fields.route.values),
   status: schema.fields.status.max,
@@ -18,14 +26,21 @@ const request = {
 /**
  * Representative worst-valid N0 wire records: longest schema strings, maximum
  * integer widths, and a long round-trippable fractional ingress duration.
- * N2 UUIDs/hashes are reserved by the canonical schema but are NOT emitted in N0.
+ * Only node_request carries N2 correlation fields (request_id, request_id_replaced, account_hash,
+ * space_hash); the ingress log carries none. db_hash is emitted by the F6 typed events only. The node's 5xx
+ * diagnostic (dbFailure) ships individually, one event per failing request: it is not an aggregated code.
  * Bytes below are exact for these records, not a proven Vector float-serializer
  * upper bound or a fixed event-size guard. Actual ingestion/billing can differ.
  */
 export const representativeEvents = Object.freeze({
-  node: Object.freeze({ ...common, event: 'node_request', svc: 'api', ...request, latency_us: schema.fields.latency_us.max }),
+  node: Object.freeze({ ...common, event: 'node_request', svc: 'api', ...request, latency_us: schema.fields.latency_us.max, ...correlation }),
   ingress: Object.freeze({ ...common, event: 'ingress_request', svc: 'ingress', ...request, request_time_seconds: 0.0000010000000000000002 }),
-  diagnostic: Object.freeze({ level: 'warn', ts: common.ts, event: 'node_warning', svc: 'api', event_code: longest(schema.fields.event_code.values), event_count: schema.fields.event_count.max }),
+  diagnostic: Object.freeze({ level: 'warn', ts: common.ts, event: 'node_warning', svc: 'api', event_code: longest(aggregatedCodes), event_count: schema.fields.event_count.max }),
+  dbFailure: Object.freeze({
+    level: 'warn', ts: common.ts, event: 'node_warning', svc: 'api', event_code: INDIVIDUAL_EVENT_CODES[0], status: 599,
+    code: longest(schema.fields.code.values), service: longest(schema.fields.service.values), route: request.route,
+    elapsed_ms: schema.fields.elapsed_ms.max, failure_kind: longest(schema.fields.failure_kind.values), write_may_have_applied: false, db_hash: 'f'.repeat(64),
+  }),
   gate: Object.freeze({ level: 'warn', ts: common.ts, event: 'logship_gate_summary_total', svc: 'logship', reason: longest(schema.fields.reason.values), count: schema.fields.count.max }),
 });
 
@@ -52,7 +67,7 @@ export function serializedEventBytes(event, framing = 'ndjson') {
  */
 export function calculateBudget({
   requestsPerMinute = 1,
-  diagnosticEventsPerMinute = schema.fields.event_code.values.length * 2,
+  diagnosticEventsPerMinute = aggregatedCodes.length * 2,
   gateEventsPerMinute = schema.fields.reason.values.length,
   allocationBytes = REQUEST_ALLOCATION_BYTES,
   framing = 'ndjson',

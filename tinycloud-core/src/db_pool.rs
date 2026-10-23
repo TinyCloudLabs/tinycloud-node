@@ -206,6 +206,7 @@ impl RecoveringConnection {
     {
         let retry = is_read_only_statement(&stmt.sql).then(|| stmt.clone());
         let write = retry.is_none();
+        let in_flight = InFlightWrite::arm(write);
         let started = Instant::now();
         let result = match attempt(stmt).await {
             Err(error) if is_connection_error(&error) => {
@@ -218,6 +219,7 @@ impl RecoveringConnection {
             }
             result => result,
         };
+        in_flight.disarm();
         if write {
             note_write_outcome(&result);
         }
@@ -238,6 +240,7 @@ impl RecoveringConnection {
     /// conflict as a replay, so it must not be retried.
     pub async fn execute_idempotent(&self, stmt: Statement) -> Result<ExecResult, DbErr> {
         let started = Instant::now();
+        let in_flight = InFlightWrite::arm(true);
         let result = match self.conn.execute(stmt.clone()).await {
             Err(error) if is_connection_error(&error) && !self.within_retry_window(started) => {
                 self.lost("execute_idempotent", &error, false);
@@ -252,6 +255,7 @@ impl RecoveringConnection {
             }
             result => result,
         };
+        in_flight.disarm();
         note_write_outcome(&result);
         result
     }
@@ -294,7 +298,7 @@ impl RecoveringConnection {
     /// transaction opened with `SET LOCAL statement_timeout`: three more
     /// round trips (`BEGIN`, `SET LOCAL`, `COMMIT`), so use it only on
     /// infrequent paths. Statements in it are not retried after a lost
-    /// connection; wrap a read in [`Self::bulk_read`] for that. Everywhere
+    /// connection; a read-only scope is not retried either. Everywhere
     /// else the scope is the pool itself, statement by statement, under the
     /// usual retry policy.
     pub async fn begin_bulk(&self) -> Result<BulkScope, DbErr> {
@@ -316,30 +320,6 @@ impl RecoveringConnection {
             .execute_unprepared(&set_local_statement_timeout(timeout))
             .await?;
         Ok(BulkScope::Transaction(transaction))
-    }
-
-    /// Run `read` in a [`Self::begin_bulk_read`] scope, and run the whole
-    /// attempt once more if it lost its connection within the retry window,
-    /// as a read-only statement on the pool would be. The attempt's `BEGIN` is
-    /// not retried on its own: nested retries would let one request wait for
-    /// several connection-loss detections.
-    pub async fn bulk_read<T, F, Fut>(&self, operation: &'static str, read: F) -> Result<T, DbErr>
-    where
-        F: Fn(BulkScope) -> Fut,
-        Fut: Future<Output = Result<T, DbErr>>,
-    {
-        let Some(timeout) = self.bulk_statement_timeout() else {
-            // The scope is the pool, whose statements retry themselves.
-            return read(BulkScope::Pool(self.clone())).await;
-        };
-        self.run(operation, true, || async {
-            let transaction = self.conn.begin().await?;
-            transaction
-                .execute_unprepared(&set_local_statement_timeout(timeout))
-                .await?;
-            read(BulkScope::Transaction(transaction)).await
-        })
-        .await
     }
 
     /// The `statement_timeout` a [`Self::begin_bulk`] transaction runs with, or
@@ -552,9 +532,11 @@ impl ConnectionTrait for RecoveringConnection {
 
     async fn execute_unprepared(&self, sql: &str) -> Result<ExecResult, DbErr> {
         let read_only = is_read_only_statement(sql);
+        let in_flight = InFlightWrite::arm(!read_only);
         let result = self
             .run("execute", read_only, || self.conn.execute_unprepared(sql))
             .await;
+        in_flight.disarm();
         if !read_only {
             note_write_outcome(&result);
         }
@@ -924,6 +906,37 @@ fn note_write_outcome<T>(result: &Result<T, DbErr>) {
     }
 }
 
+/// A write statement that may already be on the wire (TC-1274).
+///
+/// Dropping the statement's future does not cancel it on the server: the
+/// released connection is only pinged, which waits for the statement to
+/// finish, so an autocommit write dropped by a timeout can still commit. If
+/// the future is dropped before its result arrives, the guard notes the write
+/// as possibly applied, so [`track_writes`] reports an unknown outcome
+/// instead of a safe retry.
+struct InFlightWrite {
+    armed: bool,
+}
+
+impl InFlightWrite {
+    fn arm(write: bool) -> Self {
+        Self { armed: write }
+    }
+
+    /// The result arrived; [`note_write_outcome`] classifies it.
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for InFlightWrite {
+    fn drop(&mut self) {
+        if self.armed {
+            note_write_may_have_applied();
+        }
+    }
+}
+
 /// How a [transient](is_transient_error) failure of an operation may be
 /// reported to its client (TC-1054).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -964,7 +977,7 @@ const WRITE_KEYWORDS: [&str; 5] = ["INSERT", "UPDATE", "DELETE", "MERGE", "INTO"
 /// of anything else (`nextval`, `setval`, `pg_advisory_lock`,
 /// `pg_terminate_backend`, `set_config`, `lo_*`, a user-defined function)
 /// may have side effects, so it makes the statement non-retryable.
-const CALL_ALLOWLIST: [&str; 36] = [
+const CALL_ALLOWLIST: [&str; 37] = [
     // keywords
     "SELECT",
     "FROM",
@@ -1003,6 +1016,7 @@ const CALL_ALLOWLIST: [&str; 36] = [
     "COALESCE",
     "LOWER",
     "UPPER",
+    "SUBSTR",
 ];
 
 #[derive(Debug, PartialEq, Eq)]

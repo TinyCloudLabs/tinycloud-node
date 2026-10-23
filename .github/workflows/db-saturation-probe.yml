@@ -1,0 +1,84 @@
+# TC-1601: sustained DB saturation alert for PlanetScale databases.
+#
+# WHAT: every 5 minutes, read CPU and connection-pool metrics for each target in
+# test/probe/db-saturation-targets.json and send one Better Stack heartbeat
+# decision per target. Breach -> POST the heartbeat's /fail URL (pages team@).
+# Healthy -> GET the heartbeat (ping). Unknown or transient API error -> no call,
+# so the missed-heartbeat alert covers it.
+#
+# A target is skipped with a notice until its two secrets are set, so this
+# workflow stays green while unconfigured.
+#
+# SECRETS (Settings -> Secrets and variables -> Actions):
+#   PLANETSCALE_METRICS_TOKEN_NODE_DB     PlanetScale service token ID:TOKEN,
+#                                         read_branch on all branches of tinycloud-node-production.
+#   BETTERSTACK_HEARTBEAT_URL_NODE_DB     "Node DB saturation" heartbeat URL.
+#   PLANETSCALE_METRICS_TOKEN_OPENKEY_DB  Added after the 2026-10-22 DB move.
+#   BETTERSTACK_HEARTBEAT_URL_OPENKEY_DB  "OpenKey DB saturation" heartbeat URL.
+#
+# PROOF RUNS: gh workflow run db-saturation-probe.yml -f threshold_pct=1
+#   expect /fail (pages team@). Then with no inputs: expect a ping.
+#   Dispatch only from the default branch, and warn on-call first.
+#
+# Adding a target: add its entry to db-saturation-targets.json and set its two
+# secrets. Secrets must also appear in the env block below, because Actions only
+# passes secrets that are named here.
+
+name: DB Saturation Probe
+run-name: >-
+  ${{ github.event_name == 'workflow_dispatch' && inputs.threshold_pct != '' && format('DB saturation probe (manual CPU threshold {0}%)', inputs.threshold_pct) || 'DB saturation probe' }}
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      threshold_pct:
+        description: "Proof runs only: manual CPU threshold (0-100). Empty uses the targets file (85)."
+        required: false
+        default: ""
+        type: string
+      target:
+        description: "Target label from db-saturation-targets.json. Empty runs every target."
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: db-saturation-probe
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    defaults:
+      run:
+        working-directory: test/probe
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: test/probe/package-lock.json
+
+      - name: Install probe dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Type-check probe
+        run: npm run typecheck
+
+      - name: Run saturation check
+        env:
+          DB_TARGET: ${{ inputs.target }}
+          THRESHOLD_PCT: ${{ inputs.threshold_pct }}
+          PLANETSCALE_METRICS_TOKEN_NODE_DB: ${{ secrets.PLANETSCALE_METRICS_TOKEN_NODE_DB }}
+          BETTERSTACK_HEARTBEAT_URL_NODE_DB: ${{ secrets.BETTERSTACK_HEARTBEAT_URL_NODE_DB }}
+          PLANETSCALE_METRICS_TOKEN_OPENKEY_DB: ${{ secrets.PLANETSCALE_METRICS_TOKEN_OPENKEY_DB }}
+          BETTERSTACK_HEARTBEAT_URL_OPENKEY_DB: ${{ secrets.BETTERSTACK_HEARTBEAT_URL_OPENKEY_DB }}
+        run: npm run probe:db

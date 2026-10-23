@@ -93,6 +93,9 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: tinycloudlabs/tinycloud-node
+  # Production dstack OS the tinycloud-node CVM must run (the Phala KMS only releases app keys to this image).
+  PHALA_OS_IMAGE: dstack-0.5.12
+  PHALA_OS_IMAGE_HASH: 8db40cb23008d6213668b5816702d100b37b859a8a5bfd18d938ae3a1b3715bd
 
 jobs:
   rollback-audit:
@@ -416,7 +419,7 @@ jobs:
       - uses: actions/checkout@v4
 
       # TC-970: no ticket, identifier or client address in the ingress logs;
-      # TC-910 header buffers and the 32 MB body limit still hold. Runs before
+      # TC-910 header buffers and the 95 MiB body limit still hold. Runs before
       # the push so a failing wrapper is never published.
       - name: Test redacted ingress logging
         run: deploy/ingress/test-redacted-logging.sh
@@ -514,6 +517,25 @@ jobs:
         # Install before any sealed values enter the step environment.
         run: npm install --prefix "$RUNNER_TEMP/phala-env-sync" --no-save --ignore-scripts @phala/cloud@0.2.9
 
+      # Fail closed before any production change if the CVM is not on the pinned production OS.
+      # To fix it, set the OS by hand: `phala api -X PATCH /cvms/<id>/os-image -F os_image_name=dstack-0.5.12`.
+      - name: Require production OS image on the CVM
+        env:
+          PHALA_CLOUD_API_KEY: ${{ secrets.PHALA_CLOUD_API_KEY }}
+        run: |
+          set -euo pipefail
+          if ! cvm="$(phala cvms get tinycloud-node --json 2>/dev/null)"; then
+            echo "::error::Cannot read the OS image of tinycloud-node from Phala"
+            exit 1
+          fi
+          os="$(jq -c '.os' <<<"${cvm}")"
+          if ! jq -e --arg name "${PHALA_OS_IMAGE}" --arg hash "${PHALA_OS_IMAGE_HASH}" \
+            '.is_dev == false and .name == $name and .os_image_hash == $hash' <<<"${os}" >/dev/null; then
+            echo "::error::tinycloud-node is not on the production OS image ${PHALA_OS_IMAGE} (${PHALA_OS_IMAGE_HASH}). Found: ${os}"
+            echo "Set the OS first with PATCH /cvms/<id>/os-image (os_image_name=${PHALA_OS_IMAGE}), then re-run. CI does not change the OS." >&2
+            exit 1
+          fi
+
       - name: Guard production ancestry
         env:
           PHALA_CLOUD_API_KEY: ${{ secrets.PHALA_CLOUD_API_KEY }}
@@ -594,6 +616,8 @@ jobs:
             exit 1
           fi
           echo "Running production revision ${RUNNING_REVISION} is an ancestor of ${GITHUB_SHA}."
+          # Later steps refuse a deployment older than what is running.
+          echo "RUNNING_REVISION=${RUNNING_REVISION}" >> "$GITHUB_ENV"
 
       - name: Preflight quota authority
         env:
@@ -639,10 +663,11 @@ jobs:
             echo "::error::Image revision/version labels do not match the selected checkout and requested features"
             exit 1
           fi
-          python3 - <<'PY'
+          LABEL_VERSION="${VERSION}" LABEL_REVISION="${REVISION}" python3 - <<'PY'
           import hashlib
           import os
           import re
+          import subprocess
           from pathlib import Path
           def read_artifact(relative):
               path = Path(relative)
@@ -653,12 +678,59 @@ jobs:
               except OSError:
                   raise SystemExit('::error::Reviewed deployment artifact is unavailable') from None
 
+          def git(*args):
+              result = subprocess.run(['git', *args], capture_output=True, text=True)
+              return result.stdout if result.returncode == 0 else ''
+
           path = Path('docker-compose.dstack-postgres.yaml')
           if path.is_symlink() or path.resolve() != Path.cwd().resolve() / path:
               raise SystemExit('::error::Deployment destination is not the fixed reviewed path')
           native = 'ghcr.io/tinycloudlabs/tinycloud-node'
           reviewed = native + '@sha256:4bdae4fc232d886bb56bfbce4ec62ed4b8fb4e1369a01f6afb73d06dd68c188f'
-          n0_hash = 'ca110b0bae6d5a06a1002fb80df3f71cffec11659c9f9dbfa5d72624735546f6'
+          # TC-959: main's N0 compose (#349 c33c2302…) with the 95m ingress body
+          # cap (raw d95bfb70…), the TC-1274 + TC-1317 + TC-1482 + c_index + TC-1840 Vector config and the
+          # optional TC-1482 NODE_STATS_READ_TOKEN env line and the TC-950 pool of 10 (raw d0e72bde…),
+          # its single node digest normalized to 64 zeros.
+          n0_template_hash = '7c3456dc12c5b7a5368c3020b9d0a582899ece3f9942c7dd12b5f10d958c1f9c'
+          node_pin = re.compile(rb'(?m)^    image: ghcr\.io/tinycloudlabs/tinycloud-node@sha256:([0-9a-f]{64})$')
+          def n0_template(raw):
+              pins = list(node_pin.finditer(raw))
+              if len(pins) != 1:
+                  return False
+              normalized = raw[:pins[0].start(1)] + b'0' * 64 + raw[pins[0].end(1):]
+              return hashlib.sha256(normalized).hexdigest() == n0_template_hash
+
+          def require_release():
+              # Only a recorded, released main image may replace the N0 pin:
+              # its labels, vX.Y.Z tag and crate version must all agree.
+              refuse = '::error::Reviewed N0 compose accepts only a recorded released main image; deployment not attempted'
+              label = re.fullmatch(r'([0-9]+\.[0-9]+\.[0-9]+)-dstack', os.environ['LABEL_VERSION'])
+              revision = os.environ['LABEL_REVISION']
+              if (not label or not re.fullmatch(r'[0-9a-f]{40}', revision) or not os.environ.get('INPUT_DEPLOY_DIGEST')
+                      or os.environ['RESOLVED_IMAGE'] != native + '@' + os.environ['INPUT_DEPLOY_DIGEST']
+                      or os.environ.get('ROLLBACK_VERSION') != label[1] or os.environ.get('ROLLBACK_REVISION') != revision):
+                  raise SystemExit(refuse)
+              if git('rev-parse', '--verify', '--quiet', f'refs/tags/v{label[1]}^{{commit}}').strip() != revision:
+                  raise SystemExit(refuse)
+              crate = re.search(r'(?m)^version = "([^"]*)"$', git('show', f'{revision}:tinycloud-node-server/Cargo.toml'))
+              if not crate or crate[1] != label[1]:
+                  raise SystemExit(refuse)
+              require_release_descends(revision)
+
+          def is_ancestor(older, newer):
+              return subprocess.run(['git', 'merge-base', '--is-ancestor', older, newer], capture_output=True).returncode == 0
+
+          running = os.environ.get('RUNNING_REVISION', '')
+
+          def require_not_older_than_running(revision):
+              # No cross-migration downgrade: the running production revision
+              # must be the deployed image's revision or its ancestor.
+              if running and not is_ancestor(running, revision):
+                  raise SystemExit('::error::Refusing to deploy an image older than the running production revision; use the captured pre-N0 rollback for an intentional rollback')
+
+          def require_release_descends(revision):
+              if not re.fullmatch(r'[0-9a-f]{40}', running) or running == revision or not is_ancestor(running, revision):
+                  raise SystemExit('::error::Released image must be a strict descendant of the running production revision; deployment not attempted')
           pre_n0_hash = 'df239749ca0a9c09893a855ae2a8abb94090b8556515ad002105c58ac91f4c91'
           pre_n0_template_hash = '28302d6761d841b7cc5c11314aed2d377735e6bbdcaf85972a752e03bc9fdc93'
           rollback = os.environ.get('ROLLBACK_PRE_N0') == 'true'
@@ -679,22 +751,29 @@ jobs:
                   raise SystemExit('::error::Rollback privacy cannot modify a forward/current-compose deployment')
               raw = read_artifact(str(path))
               digest = hashlib.sha256(raw).hexdigest()
-              n0_configuration = digest == n0_hash
-              if n0_configuration and os.environ['RESOLVED_IMAGE'] != reviewed:
-                  raise SystemExit('::error::Reviewed N0 compose cannot substitute a different image')
-              if os.environ['RESOLVED_IMAGE'] == reviewed and digest not in (n0_hash, pre_n0_hash, pre_n0_template_hash):
-                  raise SystemExit('::error::Same-image recovery requires the exact current pre-N0 or reviewed N0 compose')
+              n0_configuration = n0_template(raw)
+              if os.environ['RESOLVED_IMAGE'] == reviewed:
+                  if not n0_configuration and digest not in (pre_n0_hash, pre_n0_template_hash):
+                      raise SystemExit('::error::Same-image recovery requires the exact current pre-N0 or reviewed N0 compose')
+                  require_not_older_than_running(os.environ['LABEL_REVISION'])
+              elif n0_configuration:
+                  require_release()
           content = raw.decode('utf-8')
           images = [
               image for image in re.finditer(r'(?m)^([ \t]+image:[ \t]+)([^\n]+)$', content)
               if image[2].strip().strip('"\'').startswith((native + ':', native + '@'))
           ]
-          if len(images) != 1 or images[0][2].strip().strip('"\'') not in (native + ':dstack', reviewed):
+          value = images[0][2].strip().strip('"\'') if len(images) == 1 else ''
+          if not n0_configuration and value not in (native + ':dstack', reviewed):
               raise SystemExit('Expected exactly one :dstack or reviewed digest-pinned native image')
-          image = images[0]
-          if image[2].strip().strip('"\'') == reviewed and reviewed != os.environ['RESOLVED_IMAGE']:
+          if not n0_configuration and value == reviewed and reviewed != os.environ['RESOLVED_IMAGE']:
               raise SystemExit('Reviewed compose digest does not match the selected deployment image')
-          path.write_bytes((content[:image.start(2)] + os.environ['RESOLVED_IMAGE'] + content[image.end(2):]).encode('utf-8'))
+          image = images[0]
+          deployed = (content[:image.start(2)] + os.environ['RESOLVED_IMAGE'] + content[image.end(2):]).encode('utf-8')
+          selected_digest = os.environ['RESOLVED_IMAGE'].rsplit(':', 1)[1].encode()
+          if n0_configuration and (not n0_template(deployed) or [pin[1] for pin in node_pin.finditer(deployed)] != [selected_digest]):
+              raise SystemExit('::error::Deployed N0 compose must differ from the reviewed template only by the selected digest')
+          path.write_bytes(deployed)
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
               output.write(f'n0_configuration_verified={str(n0_configuration).lower()}\n')
               output.write(f'rollback_pre_n0_verified={str(rollback).lower()}\n')
@@ -870,6 +949,7 @@ jobs:
           PHALA_ENV_AWS_REGION: ${{ secrets.PROD_TINYCLOUD_AWS_REGION }}
           PHALA_ENV_TINYCLOUD_QUOTA_URL: ${{ secrets.PROD_TINYCLOUD_QUOTA_URL }}
           PHALA_ENV_TINYCLOUD_ADMIN_SECRET: ${{ secrets.PROD_TINYCLOUD_ADMIN_SECRET }}
+          PHALA_ENV_NODE_STATS_READ_TOKEN: ${{ secrets.PROD_TINYCLOUD_NODE_STATS_READ_TOKEN }}
           PHALA_ENV_SHARE_TRUST_BUNDLE_BASE64: ${{ secrets.PROD_TINYCLOUD_SHARE_TRUST_BUNDLE_BASE64 }}
           PHALA_ENV_CLOUDFLARE_API_TOKEN: ${{ secrets.PROD_TINYCLOUD_CLOUDFLARE_API_TOKEN }}
           PHALA_ENV_DSTACK_GATEWAY_DOMAIN: ${{ secrets.PROD_TINYCLOUD_DSTACK_GATEWAY_DOMAIN }}
@@ -914,6 +994,31 @@ jobs:
             fi
           done
 
+          # Optional (TC-1482): the same single-line rule, but absence is allowed.
+          if [[ "${PHALA_ENV_NODE_STATS_READ_TOKEN:-}" == *$'\n'* || "${PHALA_ENV_NODE_STATS_READ_TOKEN:-}" == *$'\r'* ]]; then
+            echo "::error::Phala deploy inputs must be single-line values"
+            exit 1
+          fi
+
+          # TC-1482: the node keeps GET /admin/stats disabled (404) when the token
+          # equals TINYCLOUD_ADMIN_SECRET or is shorter than 32 bytes (surrounding
+          # whitespace ignored), which would surface only as an OpenKey 503. Refuse
+          # both here, before anything is written, with constant messages; no value
+          # is printed. `wc -c` counts bytes.
+          if [ -n "${PHALA_ENV_NODE_STATS_READ_TOKEN:-}" ]; then
+            if [ "$PHALA_ENV_NODE_STATS_READ_TOKEN" = "$PHALA_ENV_TINYCLOUD_ADMIN_SECRET" ]; then
+              echo "::error::NODE_STATS_READ_TOKEN must differ from TINYCLOUD_ADMIN_SECRET"
+              exit 1
+            fi
+            stats_token_trimmed="${PHALA_ENV_NODE_STATS_READ_TOKEN#"${PHALA_ENV_NODE_STATS_READ_TOKEN%%[![:space:]]*}"}"
+            stats_token_trimmed="${stats_token_trimmed%"${stats_token_trimmed##*[![:space:]]}"}"
+            if [ "$(printf '%s' "$stats_token_trimmed" | wc -c)" -lt 32 ]; then
+              echo "::error::NODE_STATS_READ_TOKEN must be at least 32 bytes"
+              exit 1
+            fi
+            unset stats_token_trimmed
+          fi
+
           # Also restrict a file left by an earlier failed runner step before
           # writing any value; umask alone does not tighten an existing file.
           : > .phala-prod.env
@@ -933,6 +1038,11 @@ jobs:
             printf 'CERTBOT_EMAIL=%s\n' "$PHALA_ENV_CERTBOT_EMAIL"
             printf 'BETTERSTACK_SOURCE_TOKEN=%s\n' "$PHALA_ENV_BETTERSTACK_SOURCE_TOKEN"
             printf 'SQL_IDENTITY_FENCE=%s\n' "$PHALA_ENV_SQL_IDENTITY_FENCE"
+            # TC-1482: optional. Unset keeps the node starting with
+            # GET /admin/stats disabled (404); never written empty.
+            if [ -n "${PHALA_ENV_NODE_STATS_READ_TOKEN:-}" ]; then
+              printf 'NODE_STATS_READ_TOKEN=%s\n' "$PHALA_ENV_NODE_STATS_READ_TOKEN"
+            fi
             # SSH public keys authorized on the CVM (checked into the repo,
             # see dstack-authorized-keys). The Phala Cloud pre-launch script
             # writes DSTACK_AUTHORIZED_KEYS to /home/root/.ssh/authorized_keys
@@ -956,7 +1066,7 @@ jobs:
           # those responses into Actions logs, even when deployment fails.
           # A failing CLI/update can still have restarted the CVM.
           echo "cvm_mutation_attempted=true" >> "$GITHUB_OUTPUT"
-          if ! phala deploy --cvm-id tinycloud-node -c docker-compose.dstack-postgres.yaml -e .phala-prod.env --no-public-logs --no-public-sysinfo --wait >/dev/null 2>&1; then
+          if ! phala deploy --cvm-id tinycloud-node -c docker-compose.dstack-postgres.yaml -e .phala-prod.env --no-public-logs --no-public-sysinfo --no-dev-os --image "${PHALA_OS_IMAGE}" --wait >/dev/null 2>&1; then
             echo "::error::Phala deployment failed; inspect the private control plane"
             exit 1
           fi
@@ -967,6 +1077,23 @@ jobs:
       - name: Remove sealed deployment environment
         if: always()
         run: rm -f .phala-prod.env
+
+      # Fail closed if the deploy left the CVM on a different OS image.
+      - name: Verify production OS image after deploy
+        env:
+          PHALA_CLOUD_API_KEY: ${{ secrets.PHALA_CLOUD_API_KEY }}
+        run: |
+          set -euo pipefail
+          if ! cvm="$(phala cvms get tinycloud-node --json 2>/dev/null)"; then
+            echo "::error::Cannot read the OS image of tinycloud-node from Phala after deploy"
+            exit 1
+          fi
+          os="$(jq -c '.os' <<<"${cvm}")"
+          if ! jq -e --arg name "${PHALA_OS_IMAGE}" --arg hash "${PHALA_OS_IMAGE_HASH}" \
+            '.is_dev == false and .name == $name and .os_image_hash == $hash' <<<"${os}" >/dev/null; then
+            echo "::error::tinycloud-node is not on the production OS image ${PHALA_OS_IMAGE} (${PHALA_OS_IMAGE_HASH}) after deploy. Found: ${os}"
+            exit 1
+          fi
 
       # TC-312: prove the deploy actually converged. The image tag matching the
       # crate version is enforced at build time by version-guard, but nothing

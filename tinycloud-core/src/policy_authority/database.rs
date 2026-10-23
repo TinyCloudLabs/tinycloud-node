@@ -147,83 +147,96 @@ impl DatabaseAuthorityStore {
                 .begin_with_config(policy_isolation_level(&self.db), None)
                 .await
                 .map_err(|_| AuthorityError::TransactionFailed)?;
-            let row = delegation_row(&transaction, cid, true).await?;
-            let previous = status_from_model(&row)?;
-            validate_status_transition(&previous, &status)?;
-            let previous_checked_at = row.status_checked_at.clone();
-            let previous_fresh_until = row.status_fresh_until.clone();
-            let previous_sequence = row.status_sequence;
-            let previous_revoked_at = row.revoked_at.clone();
-            #[cfg(test)]
-            if attempt == 0 {
-                self.wait_at_race_barrier().await;
-            }
-            let mut update = policy_delegation::Entity::update_many()
-                .col_expr(
-                    policy_delegation::Column::StatusCheckedAt,
-                    Expr::value(db_time(status.checked_at)?),
-                )
-                .col_expr(
-                    policy_delegation::Column::StatusFreshUntil,
-                    Expr::value(db_time(status.fresh_until)?),
-                )
-                .col_expr(
-                    policy_delegation::Column::StatusSequence,
-                    Expr::value(
-                        i64::try_from(status.sequence)
-                            .map_err(|_| AuthorityError::AuthorityStateUnavailable)?,
-                    ),
-                )
-                .col_expr(
-                    policy_delegation::Column::RevokedAt,
-                    Expr::value(status.revoked_at.map(db_time).transpose()?),
-                )
-                .filter(policy_delegation::Column::DelegationCid.eq(cid))
-                .filter(policy_delegation::Column::StatusSequence.eq(previous_sequence))
-                .filter(policy_delegation::Column::StatusCheckedAt.eq(previous_checked_at))
-                .filter(policy_delegation::Column::StatusFreshUntil.eq(previous_fresh_until));
-            update = match previous_revoked_at {
-                Some(revoked_at) => {
-                    update.filter(policy_delegation::Column::RevokedAt.eq(revoked_at))
-                }
-                None => update.filter(policy_delegation::Column::RevokedAt.is_null()),
-            };
-            match update.exec(&transaction).await {
-                Ok(updated) if updated.rows_affected == 1 => match transaction.commit().await {
-                    Ok(()) => return Ok(()),
-                    Err(error)
-                        if attempt + 1 < MAX_ATTEMPTS && retryable_sqlite_conflict(&error) =>
-                    {
-                        sqlite_conflict_backoff(attempt).await;
-                        continue;
-                    }
-                    Err(_) => return Err(AuthorityError::TransactionFailed),
-                },
-                Ok(_) => {
-                    transaction
-                        .rollback()
-                        .await
-                        .map_err(|_| AuthorityError::TransactionFailed)?;
-                    if attempt + 1 < MAX_ATTEMPTS {
-                        tokio::task::yield_now().await;
-                        continue;
-                    }
-                    return Err(AuthorityError::AuthorityStateUnavailable);
-                }
-                Err(error) => {
-                    transaction
-                        .rollback()
-                        .await
-                        .map_err(|_| AuthorityError::TransactionFailed)?;
+            let updated = match self
+                .set_status_update(&transaction, cid, &status, attempt)
+                .await
+            {
+                Ok(Ok(rows)) => rows,
+                Ok(Err(error)) => {
+                    let _ = transaction.rollback().await;
                     if attempt + 1 < MAX_ATTEMPTS && retryable_sqlite_conflict(&error) {
                         sqlite_conflict_backoff(attempt).await;
                         continue;
                     }
                     return Err(AuthorityError::TransactionFailed);
                 }
+                Err(error) => {
+                    let _ = transaction.rollback().await;
+                    return Err(error);
+                }
+            };
+            if updated != 1 {
+                let _ = transaction.rollback().await;
+                if attempt + 1 < MAX_ATTEMPTS {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                return Err(AuthorityError::AuthorityStateUnavailable);
+            }
+            match transaction.commit().await {
+                Ok(()) => return Ok(()),
+                Err(error) if attempt + 1 < MAX_ATTEMPTS && retryable_sqlite_conflict(&error) => {
+                    sqlite_conflict_backoff(attempt).await;
+                    continue;
+                }
+                Err(_) => return Err(AuthorityError::TransactionFailed),
             }
         }
         Err(AuthorityError::AuthorityStateUnavailable)
+    }
+
+    /// One attempt's guarded read and conditional update, inside the caller's
+    /// transaction. The caller ends the transaction on every path.
+    async fn set_status_update(
+        &self,
+        transaction: &DatabaseTransaction,
+        cid: &str,
+        status: &AuthorityStatus,
+        #[cfg_attr(not(test), allow(unused_variables))] attempt: usize,
+    ) -> Result<Result<u64, sea_orm::DbErr>, AuthorityError> {
+        let row = delegation_row(transaction, cid, true).await?;
+        let previous = status_from_model(&row)?;
+        validate_status_transition(&previous, status)?;
+        let previous_checked_at = row.status_checked_at.clone();
+        let previous_fresh_until = row.status_fresh_until.clone();
+        let previous_sequence = row.status_sequence;
+        let previous_revoked_at = row.revoked_at.clone();
+        #[cfg(test)]
+        if attempt == 0 {
+            self.wait_at_race_barrier().await;
+        }
+        let mut update = policy_delegation::Entity::update_many()
+            .col_expr(
+                policy_delegation::Column::StatusCheckedAt,
+                Expr::value(db_time(status.checked_at)?),
+            )
+            .col_expr(
+                policy_delegation::Column::StatusFreshUntil,
+                Expr::value(db_time(status.fresh_until)?),
+            )
+            .col_expr(
+                policy_delegation::Column::StatusSequence,
+                Expr::value(
+                    i64::try_from(status.sequence)
+                        .map_err(|_| AuthorityError::AuthorityStateUnavailable)?,
+                ),
+            )
+            .col_expr(
+                policy_delegation::Column::RevokedAt,
+                Expr::value(status.revoked_at.map(db_time).transpose()?),
+            )
+            .filter(policy_delegation::Column::DelegationCid.eq(cid))
+            .filter(policy_delegation::Column::StatusSequence.eq(previous_sequence))
+            .filter(policy_delegation::Column::StatusCheckedAt.eq(previous_checked_at))
+            .filter(policy_delegation::Column::StatusFreshUntil.eq(previous_fresh_until));
+        update = match previous_revoked_at {
+            Some(revoked_at) => update.filter(policy_delegation::Column::RevokedAt.eq(revoked_at)),
+            None => update.filter(policy_delegation::Column::RevokedAt.is_null()),
+        };
+        Ok(update
+            .exec(transaction)
+            .await
+            .map(|updated| updated.rows_affected))
     }
 
     /// Apply an authenticated status observation while the composing caller's

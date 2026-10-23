@@ -10,6 +10,7 @@ pub struct Model {
     pub node_id: String,
     pub outcome: String,
     pub decided_at: String,
+    pub key_path: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

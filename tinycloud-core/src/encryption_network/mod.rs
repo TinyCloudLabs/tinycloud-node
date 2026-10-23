@@ -7,6 +7,8 @@
 
 pub mod backend;
 pub mod canonical;
+pub mod key_id;
+pub mod keys;
 pub mod network_id;
 pub mod protocol;
 pub mod service;
@@ -20,11 +22,12 @@ pub use network_id::{NetworkId, NetworkIdError};
 pub use protocol::{
     DecryptFacts, DecryptInvocation, DecryptRequestBody, DecryptResponseBody, InvocationCapability,
     NetworkAdminFacts, NetworkAdminInvocation, DECRYPT_ACTION, DECRYPT_REQUEST_TYPE,
-    DECRYPT_RESULT_TYPE, NETWORK_ADMIN_TYPE, NETWORK_CREATE_ACTION, NETWORK_REVOKE_ACTION,
+    DECRYPT_RESULT_TYPE, KEY_ADMIN_TYPE, KEY_BLOCK_ACTION, KEY_CREATE_ACTION, KEY_DESCRIBE_TYPE,
+    KEY_UNBLOCK_ACTION, NETWORK_ADMIN_TYPE, NETWORK_CREATE_ACTION, NETWORK_REVOKE_ACTION,
 };
 pub use service::{
-    CreateNetworkRequest, EncryptionService, EncryptionServiceError, VerifiedDecrypt,
-    WellKnownRecord,
+    CreateNetworkRequest, DecryptTarget, EncryptionService, EncryptionServiceError,
+    VerifiedDecrypt, WellKnownRecord,
 };
 pub use types::{
     InlineEnvelope, KeyBackendKind, NetworkDescriptor, NetworkState, Threshold,

@@ -324,6 +324,7 @@ TC887_S3_ACCESS_KEY_ID=$minio_user
 TC887_S3_SECRET_ACCESS_KEY=$minio_password
 TC887_NODE_ROOT_FILE=$run/secrets/node-static-secret
 TC887_SPACES_LOG=$run/spaces.log
+TC887_PUTS_LOG=$run/puts.log
 TC887_BOOT_SNAPSHOT=$run/boot-snapshot
 EOF
   # The node's whole environment; sourced inside the child, never on argv.

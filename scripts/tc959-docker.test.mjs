@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { parseArgs, assertCapture, resourceNames } from './tc959-docker.mjs';
 import { assertHostedRunner, cleanupOwnedResources, burstEvidence, assertHealthyBurst, progressEvidence, assertServiceParity, assertLogshipNetwork, composeRuntimeValues, socketEvidence, numericMetrics, diagnosticCounts } from './tc959-compose-proof.mjs';
@@ -34,9 +35,47 @@ test('capture rejects unsafe values even when all request positive controls are 
   const baseline = [request, { ...request, route: '/version' }, { ...request, method: 'POST', route: '/invoke', status: 401 }, ingress];
   assert.doesNotThrow(() => assertCapture(baseline));
   assert.doesNotThrow(() => assertCapture([request])); // errors_slow intentionally excludes fast healthy controls.
-  for (const poison of [{ authorization: 'synthetic-bearer' }, { route: '/raw-secret' }, { request_id: 'anything' }, { request_id_replaced: true }, { latency_us: -1 }, { status: 999 }, { extra: 'TC959_SYNTHETIC' }]) {
+  for (const poison of [{ authorization: 'synthetic-bearer' }, { route: '/raw-secret' }, { latency_us: -1 }, { status: 999 }, { extra: 'TC959_SYNTHETIC' }]) {
     assert.throws(() => assertCapture([{ ...request, ...poison }, ...baseline.slice(1)]));
   }
+});
+
+const goodId = 'a8098c1a-f86e-4b1f-92a7-4b50b53ec932';
+test('capture accepts well-formed N2 correlation fields on node_request only', () => {
+  const correlated = { ...request, request_id: goodId, request_id_replaced: false, account_hash: 'a'.repeat(64), space_hash: '0123456789abcdef'.repeat(4) };
+  assert.doesNotThrow(() => assertCapture([correlated]));
+  assert.doesNotThrow(() => assertCapture([{ ...request, request_id: goodId }])); // each key is optional
+  for (const bad of [
+    { request_id: 'anything' }, { request_id: goodId.toUpperCase() }, { request_id: `${goodId}0` }, { request_id: `x${goodId}` },
+    { request_id_replaced: 'true' }, { account_hash: 'A'.repeat(64) }, { space_hash: 'a'.repeat(63) }, { space_hash: `${'a'.repeat(64)}f` },
+    { account_hash: 'did:pkh:eip155:1:0xabc' }, { request_id: 7 },
+  ]) {
+    assert.throws(() => assertCapture([{ ...request, ...bad }]), JSON.stringify(bad));
+  }
+  // Never anywhere else: ingress rows, diagnostics and gate counters.
+  const warning = { ts: request.ts, level: 'warn', event: 'node_warning', svc: 'api', event_code: 'unclassified', event_count: 1 };
+  for (const key of ['request_id', 'request_id_replaced', 'account_hash', 'space_hash']) {
+    const value = key === 'request_id' ? goodId : key === 'request_id_replaced' ? true : 'a'.repeat(64);
+    assert.throws(() => assertCapture([{ ...ingress, [key]: value }]), `ingress ${key}`);
+    assert.throws(() => assertCapture([{ ...warning, [key]: value }], { event_code: { values: ['unclassified'] } }), `warning ${key}`);
+  }
+});
+
+test('capture accepts the individual 5xx diagnostic with exactly its eight typed fields (TC-1840)', () => {
+  const fields = JSON.parse(readFileSync(new URL('../log-shipper/fields.json', import.meta.url), 'utf8')).services['tinycloud-node'].fields;
+  const dbFailure = { ts: request.ts, level: 'warn', event: 'node_warning', svc: 'api', event_code: 'db_failure_5xx', status: 503, code: 'sql_busy', service: 'sql', route: '/invoke', elapsed_ms: 30001, failure_kind: 'lock_wait', write_may_have_applied: false, db_hash: 'a'.repeat(64) };
+  assert.doesNotThrow(() => assertCapture([dbFailure], fields));
+  const { db_hash, ...withoutDatabase } = dbFailure;
+  assert.doesNotThrow(() => assertCapture([withoutDatabase], fields)); // db_hash is optional
+  for (const bad of [
+    { event_count: 1 }, { message: 'TC959_SYNTHETIC' }, { sql: 'select 1' }, { status: 200 }, { status: 503.5 }, { code: 'sql_busy ' }, { service: 'postgres' },
+    { route: '/raw-secret' }, { elapsed_ms: -1 }, { elapsed_ms: '1' }, { failure_kind: 'timeout' }, { write_may_have_applied: 'false' },
+    { db_hash: 'A'.repeat(64) }, { db_hash: 'a'.repeat(63) }, { db_hash: `${'a'.repeat(64)}\n` }, { db_hash: 'notes.db' }, { db_hash: null },
+  ]) {
+    assert.throws(() => assertCapture([{ ...dbFailure, ...bad }], fields), JSON.stringify(bad));
+  }
+  assert.throws(() => assertCapture([{ ...withoutDatabase, level: 'error' }], fields));
+  assert.throws(() => assertCapture([{ ...ingress, event_code: 'db_failure_5xx' }], fields));
 });
 
 const hosted = { GITHUB_ACTIONS: 'true', RUNNER_ENVIRONMENT: 'github-hosted', RUNNER_OS: 'Linux', GITHUB_RUN_ID: '12345', GITHUB_RUN_ATTEMPT: '1', RUNNER_TEMP: '/home/runner/work/_temp' };

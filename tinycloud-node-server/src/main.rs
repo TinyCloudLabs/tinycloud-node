@@ -49,9 +49,37 @@ fn install_panic_hook() {
     }));
 }
 
-#[rocket::main]
-async fn main() {
+/// The server start path is only for the two invocations that exist outside
+/// the CLI: no arguments (the container entrypoint, `cargo run`) and exactly
+/// `--validate-config` (the deploy preflight). Every other argv goes to clap,
+/// which also rejects anything it does not recognise instead of booting.
+fn starts_server(args: &[std::ffi::OsString]) -> bool {
+    match args {
+        [] => true,
+        [only] => only == "--validate-config",
+        _ => false,
+    }
+}
+
+fn main() {
     install_panic_hook();
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if !starts_server(&args) {
+        if let Err(e) = tinycloud::cli::run() {
+            eprintln!("\n✗ tinycloud-node failed:\n");
+            for cause in e.chain() {
+                eprintln!("  {cause}");
+            }
+            std::process::exit(1);
+        }
+        return;
+    }
+    // The runtime `#[rocket::main]` used to set up: worker and blocking
+    // thread counts come from ROCKET_WORKERS / ROCKET_MAX_BLOCKING.
+    rocket::execute(start_server());
+}
+
+async fn start_server() {
     let config = build_config_figment(); // That's just for easy access to ROCKET_LOG_LEVEL
     let tinycloud_config = config.extract::<config::Config>().unwrap();
 
@@ -175,6 +203,73 @@ mod tests {
             .expect("config should parse");
 
         assert_eq!(cfg.hooks.max_ticket_ttl_seconds, 777);
+    }
+
+    #[test]
+    fn epoch_head_backfill_enabled_reads_only_the_double_underscore_key() {
+        let _lock = lock_env();
+        let single = "TINYCLOUD_EPOCH_HEAD_BACKFILL_ENABLED";
+        let double = "TINYCLOUD_EPOCH_HEAD_BACKFILL__ENABLED";
+        let rate = "TINYCLOUD_EPOCH_HEAD_BACKFILL__SPACES_PER_SECOND";
+        let extract = || {
+            build_config_figment()
+                .extract::<config::Config>()
+                .expect("config should parse")
+                .epoch_head_backfill
+        };
+
+        let _s = EnvVarGuard::unset(single);
+        let _d = EnvVarGuard::unset(double);
+        let _r = EnvVarGuard::unset(rate);
+        assert!(extract().enabled, "backfill is on by default");
+
+        // The production compose sets this key (TC-1274).
+        let _d = EnvVarGuard::set(double, "false");
+        assert!(!extract().enabled);
+        drop(_d);
+
+        // The trap: a single underscore is a silent no-op.
+        let _s = EnvVarGuard::set(single, "false");
+        assert!(
+            extract().enabled,
+            "single-underscore form must not disable it"
+        );
+        drop(_s);
+
+        // The key the later ramp tunes.
+        let _r = EnvVarGuard::set(rate, "7");
+        assert_eq!(extract().spaces_per_second, 7);
+    }
+
+    #[test]
+    fn sql_store_loads_from_the_double_underscore_keys() {
+        let _lock = lock_env();
+        let keys = [
+            "TINYCLOUD_SQL_STORE__ENABLED",
+            "TINYCLOUD_SQL_STORE__UPLOAD_INTERVAL_SECS",
+            "TINYCLOUD_SQL_STORE__UPLOAD_BYTES",
+            "TINYCLOUD_SQL_STORE__RETENTION__HISTORY_DAYS__FREE",
+        ];
+        let _unset: Vec<_> = keys.iter().map(|k| EnvVarGuard::unset(k)).collect();
+        let extract = || {
+            build_config_figment()
+                .extract::<config::Config>()
+                .expect("config should parse")
+                .sql_store
+        };
+        let defaults = extract();
+        assert!(!defaults.enabled);
+        assert_eq!(defaults.upload_interval_secs, 60);
+
+        let _e = EnvVarGuard::set(keys[0], "true");
+        let _i = EnvVarGuard::set(keys[1], "15");
+        let _b = EnvVarGuard::set(keys[2], "2 MiB");
+        let _r = EnvVarGuard::set(keys[3], "7");
+        let loaded = extract();
+        assert!(loaded.enabled);
+        assert_eq!(loaded.upload_interval_secs, 15);
+        assert_eq!(loaded.upload_bytes, rocket::data::ByteUnit::Mebibyte(2));
+        assert_eq!(loaded.retention.history_days.get("free"), Some(&7));
     }
 
     #[test]

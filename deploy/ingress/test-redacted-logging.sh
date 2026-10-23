@@ -4,7 +4,7 @@
 # credentials and identifiers from a separate client container, and check that
 # none of them, nor the client address, reaches the ingress container's
 # stdout/stderr or any file under /var/log/nginx. Also re-checks the TC-910
-# 32 KB header buffers and the production compose's body limit (32 MB, TC-940).
+# 32 KB header buffers and the production compose's body limit (95 MiB, TC-1012).
 #
 # Usage: deploy/ingress/test-redacted-logging.sh
 #   IMAGE=<ref>   test an existing image instead of building deploy/ingress
@@ -43,6 +43,7 @@ echo "testing $IMAGE"
 hex() { od -An -N"$1" -tx1 /dev/urandom | tr -d ' \n'; }
 TICKET="tc970ticket$(hex 12)"
 HOOK_TICKET="tc970hookticket$(hex 12)"
+STATS_TOKEN="tc1482statstoken$(hex 12)"
 WALLET="$(hex 20)"
 SPACE="tinycloud:pkh:eip155:1:0x${WALLET}:default"
 KEY="tc970key$(hex 12)"
@@ -87,7 +88,7 @@ exec nginx -g "daemon off;"
 $DOCKER network create "$NETWORK" >/dev/null
 $DOCKER run -d --name "$INGRESS" --network "$NETWORK" \
     -e DOMAIN="$DOMAIN" -e PORT=443 -e TARGET_ENDPOINT=http://127.0.0.1:8000 \
-    -e CLIENT_MAX_BODY_SIZE=32m \
+    -e CLIENT_MAX_BODY_SIZE=95m \
     --entrypoint /bin/bash "$IMAGE" -c "$INGRESS_SETUP" >/dev/null
 $DOCKER run -d --name "$CLIENT" --network "$NETWORK" --entrypoint sleep "$IMAGE" infinity >/dev/null
 
@@ -128,6 +129,8 @@ expect_status() {
 
 expect_status 401 "https://$DOMAIN/signed/kv/$TICKET"
 expect_status 200 "https://$DOMAIN/hooks/events?ticket=$HOOK_TICKET"
+# TC-1482: /admin/stats is its own route; its query string never reaches the log.
+expect_status 200 "https://$DOMAIN/admin/stats?token=$STATS_TOKEN"
 expect_status 502 "https://$DOMAIN/public/$SPACE/kv/$KEY"
 expect_status 401 "https://$DOMAIN/signed/kv/$TICKET/unmatched"
 # HTTP/1.1, a client-chosen method, and a 400 raised before routing (a header
@@ -141,10 +144,13 @@ expect_status 400 --http1.1 -H "X-Large: $(head -c 40000 /dev/zero | tr '\0' a)"
 LARGE_HEADER="X-Large: $(head -c 30000 /dev/zero | tr '\0' a)"
 expect_status 200 -H "$LARGE_HEADER" "https://$DOMAIN/delegate"
 
-# TC-940: CLIENT_MAX_BODY_SIZE=32m admits 30 MB and refuses more than 32 MiB.
-$DOCKER exec "$CLIENT" sh -c 'head -c 30000000 /dev/zero >/tmp/under && head -c 34000000 /dev/zero >/tmp/over'
-expect_status 200 -X POST --data-binary @/tmp/under "https://$DOMAIN/invoke"
+# TC-1012: CLIENT_MAX_BODY_SIZE=95m admits exactly 95 MiB (99,614,720 bytes)
+# and refuses one byte more, declared or chunked.
+$DOCKER exec "$CLIENT" sh -c 'head -c 99614720 /dev/zero >/tmp/at && head -c 99614721 /dev/zero >/tmp/over'
+expect_status 200 -X POST --data-binary @/tmp/at "https://$DOMAIN/invoke"
 expect_status 413 -X POST --data-binary @/tmp/over "https://$DOMAIN/invoke"
+expect_status 413 --http1.1 -H "Transfer-Encoding: chunked" -X POST --data-binary @/tmp/over \
+    "https://$DOMAIN/invoke"
 
 sleep 1
 LOGS=$($DOCKER logs "$INGRESS" 2>&1)
@@ -153,6 +159,7 @@ FILES=$($DOCKER exec "$INGRESS" sh -c 'find /var/log/nginx -type f -exec cat {} 
 for pair in \
     "signed-KV ticket=$TICKET" \
     "hook ticket=$HOOK_TICKET" \
+    "admin stats query token=$STATS_TOKEN" \
     "space id=$SPACE" \
     "wallet address=$WALLET" \
     "KV key=$KEY" \
@@ -197,6 +204,7 @@ expect_line() {
 }
 expect_line GET "/signed/kv/<ticket_id>" 401
 expect_line GET "/hooks/events" 200
+expect_line GET "/admin/stats" 200
 expect_line GET "/public/<space_id>/kv/<key..>" 502
 expect_line GET "<other>" 401
 expect_line "<other>" "/signed/kv/<ticket_id>" 401
@@ -207,4 +215,4 @@ expect_line POST "/invoke" 413
 
 echo "ingress container output:"
 sed 's/^/  /' <<<"$LOGS"
-echo "PASS: no ticket, identifier or client address in the ingress logs; 32 KB headers and 32 MB bodies still accepted"
+echo "PASS: no ticket, identifier or client address in the ingress logs; 32 KB headers and 95 MiB bodies accepted, larger bodies refused"
