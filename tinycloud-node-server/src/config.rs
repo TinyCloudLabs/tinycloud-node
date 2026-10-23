@@ -2074,17 +2074,39 @@ mod tests {
         assert_eq!(retention.history_days("team"), None);
     }
 
-    /// A config file written before `[sql_store]` and `[policy_v3]` existed
-    /// still loads: both sections fall back to their defaults.
+    /// Every `Config` field except the ones listed here must load from a file
+    /// that omits it, so a config written before a section existed (for
+    /// example `[sql_store]` or `[policy_v3]`) still loads. The fields are
+    /// read from the struct's own serialization: a new field without
+    /// `#[serde(default)]` fails here, and so does one that loses it.
     #[test]
-    fn config_without_sql_store_and_policy_v3_sections_loads() {
-        let mut value = serde_json::to_value(Config::default()).unwrap();
-        let object = value.as_object_mut().unwrap();
-        assert!(object.remove("sql_store").is_some());
-        assert!(object.remove("policy_v3").is_some());
-        let config: Config = serde_json::from_value(value).unwrap();
-        assert_eq!(config.sql_store, SqlStoreConfig::default());
-        assert_eq!(config.policy_v3, PolicyV3Config::default());
+    fn config_fields_without_a_required_marker_load_when_omitted() {
+        const REQUIRED: [&str; 6] = ["log", "storage", "spaces", "relay", "prometheus", "cors"];
+        let full = toml::Value::try_from(Config::default()).unwrap();
+        let full = full.as_table().unwrap().clone();
+        for field in REQUIRED {
+            assert!(full.contains_key(field), "required field {field} missing");
+        }
+        let load = |table: toml::Table| -> Result<Config, toml::de::Error> {
+            toml::Value::Table(table).try_into::<Config>()
+        };
+        assert_eq!(load(full.clone()).unwrap(), Config::default());
+        let optional: Vec<&String> = full
+            .keys()
+            .filter(|key| !REQUIRED.contains(&String::as_str(key)))
+            .collect();
+        assert!(optional.iter().any(|key| *key == "sql_store"));
+        assert!(optional.iter().any(|key| *key == "policy_v3"));
+        for field in &optional {
+            let mut table = full.clone();
+            table.remove(*field);
+            let config = load(table)
+                .unwrap_or_else(|error| panic!("a config without `{field}` must load: {error}"));
+            assert_eq!(config, Config::default(), "omitting `{field}`");
+        }
+        let mut only_required = full.clone();
+        only_required.retain(|key, _| REQUIRED.contains(&key));
+        assert_eq!(load(only_required).unwrap(), Config::default());
     }
 
     #[test]
