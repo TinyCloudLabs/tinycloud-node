@@ -30,14 +30,27 @@ At `/invoke`, the node computes the effective caveat from the stored delegations
 
 A request the effective caveat does not allow fails with 403 and the text `sql_caveat_violation: write`, `sql_caveat_violation: table` or `sql_caveat_violation: column`. The text names the arm and nothing else: no SQL, table or column name. When several arms apply, `write` wins over `table` over `column`. The abilities are checked first: a `read` grant that writes is refused as before. A request with several statements is refused whole: nothing it did is kept.
 
+## Additional refusals
+
+Three kinds of refusal are not decided by one statement's table, column or write. All are 403.
+
+| Request | Limit | Text |
+|---|---|---|
+| `{"action":"query","sql":"PRAGMA table_info(<table>)"}` (any PRAGMA schema report: `table_info`, `table_xinfo`, `table_list`, `database_list`, `index_list`, `index_info`, `foreign_key_list`; admin ability), and `SELECT ... FROM pragma_table_info('<table>')` even when the function is listed | `tables` or `columns` | `sql_caveat_violation: table` |
+| `{"action":"export"}` | `tables` | `sql_caveat_violation: table` |
+| `{"action":"export"}` | `columns` without `tables` | `sql_caveat_violation: column` |
+| any request whose chain has an unreadable caveat on a hop that grants the invoked ability, or mixes a constrained-statements profile with the delegated form | any | `sql_caveat_violation: chain` |
+
+Under `readOnly` alone, the PRAGMA schema reports and the export are allowed.
+
 ## What each limit does
 
 - **`readOnly`** refuses every write and schema statement, a `PRAGMA` that sets a value (`PRAGMA user_version = 5`), and any statement the parser does not classify as read-only.
-- **`tables`** lists every table a statement reads or writes, including the tables reached through a view, a trigger or a foreign key. Writing to a table with a trigger or a foreign key needs the tables they touch listed too. Reading a view needs the view and its underlying tables. `sqlite_master` and the `pragma_*` table functions are refused unless listed; the `PRAGMA` schema reports (`table_info` and the like) and the database export are refused under any `tables` or `columns` limit.
+- **`tables`** lists every table a statement reads or writes, including the tables reached through a view, a trigger or a foreign key. Writing to a table with a trigger or a foreign key needs the tables they touch listed too. Reading a view needs the view and its underlying tables. `sqlite_master` and the `pragma_*` table functions are refused unless listed (see Additional refusals for the PRAGMA they report).
 - **`columns`** lists every column a statement reads, plus the columns an `UPDATE` sets; `SELECT *` needs every column of the table listed. `INSERT` and `DELETE` name no column and are refused. A read that names no column, such as `count(*)` or `SELECT 1 FROM t`, is allowed when the table is allowed; it shows the row count and nothing else. A table without an integer primary key reads as the column `rowid`, which must be listed to be read.
 - `REPLACE INTO` is judged as the `INSERT` it reports; under `columns` it is refused, under `readOnly` it is a write.
 - The grant is checked against the names as created, folded: `SELECT body FROM NOTES` against `tables: ["notes"]` is allowed.
 
 ## Settings
 
-`[global.sql] delegated_caveats_enforced = true` turns on admission, enforcement and the `/info` feature together. Turning it off again stops admitting the form; delegations already stored keep being enforced when a request cites them.
+`[global.sql] delegated_caveats_enforced = true` turns on admission, enforcement and the `/info` feature together. With it off the node behaves as without this feature: the delegated form is refused at `/delegate` with `unsupported-caveat: <ability> caveat <index> is not a constrained-statements profile`; a stored delegation that carries a non-profile caveat on a `tinycloud.sql/*` ability, as one stored while the setting was on does, does not cover an invocation (`invocation-caveats-not-subset-of-chain`), and nothing runs under it; `/info` does not list the feature.

@@ -12381,6 +12381,124 @@ mod tests {
         Ok(())
     }
 
+    /// TC-1791: with the setting off, stored rows are judged as any non-profile
+    /// caveat is: a stored delegated form or a list of only empty entries does
+    /// not cover an invocation, and nothing runs under it; a row with an
+    /// unsupported caveat beside a good row for the ability is ignored.
+    #[tokio::test]
+    async fn stored_rows_are_judged_as_before_when_the_setting_is_off() -> Result<()> {
+        use rocket::http::Status;
+        use serde_json::json;
+        let fixture = KvSyncFixture::new_configured(Config::default(), |rocket| rocket).await?;
+        tc1791_seed(&fixture).await?;
+        let owner = fixture.space.did().to_string();
+        let device = fixture.device_did();
+        let write = "tinycloud.sql/write";
+
+        for (label, list) in [
+            ("form", json!([{"tables": ["Notes"]}])),
+            ("read-only", json!([{"readOnly": true}])),
+            ("two-empty", json!([{}, {}])),
+        ] {
+            let row = fixture
+                .grant_sql(label, &owner, &device, write, list, &[])
+                .await?;
+            let refused = fixture
+                .sql_device(row, tc1791_execute("INSERT INTO plain (a) VALUES (5)"))
+                .await?;
+            assert_eq!(
+                refused.status,
+                Status::Unauthorized,
+                "{label}: {}",
+                refused.body
+            );
+            assert!(
+                refused
+                    .body
+                    .contains("invocation-caveats-not-subset-of-chain"),
+                "{label}: {}",
+                refused.body
+            );
+        }
+        assert_eq!(tc1791_count(&fixture, "plain").await?, 1);
+
+        let beside_good = fixture
+            .grant_sql_rows(
+                "bad-beside-good",
+                &owner,
+                &device,
+                &[
+                    ("tinycloud.sql/*", "db", json!([{"tables": "Notes"}])),
+                    (write, "db", json!([{}])),
+                ],
+                &[],
+            )
+            .await?;
+        let read = fixture
+            .sql_device(beside_good, tc1791_query("SELECT a FROM plain"))
+            .await?;
+        assert_eq!(read.status, Status::Ok, "{}", read.body);
+        Ok(())
+    }
+
+    /// TC-1791: under a `tables` or `columns` limit a PRAGMA schema report and
+    /// the database export are refused outright; a `readOnly` limit alone
+    /// leaves both available.
+    #[tokio::test]
+    async fn schema_reports_and_export_are_refused_under_a_table_or_column_limit() -> Result<()> {
+        use rocket::http::Status;
+        use serde_json::json;
+        let fixture = KvSyncFixture::new_configured(tc1791_on(), |rocket| rocket).await?;
+        tc1791_seed(&fixture).await?;
+        let owner = fixture.space.did().to_string();
+        let device = fixture.device_did();
+        let admin = "tinycloud.sql/admin";
+
+        for (label, list, export_arm) in [
+            ("tables", json!([{"tables": ["Notes"]}]), "table"),
+            ("columns", json!([{"columns": ["body"]}]), "column"),
+        ] {
+            let row = fixture
+                .grant_sql(label, &owner, &device, admin, list, &[])
+                .await?;
+            let held = [admin];
+            let proof = [row];
+            let run = |request: SqlRequest| {
+                fixture.sql_as(&fixture.device, &fixture.device_vm, &held, &proof, request)
+            };
+            let pragma = run(tc1791_query("PRAGMA table_info(Notes)")).await?;
+            assert_eq!(pragma.status, Status::Forbidden, "{label}: {}", pragma.body);
+            assert_eq!(pragma.body, "sql_caveat_violation: table", "{label}");
+            let export = run(SqlRequest::Export).await?;
+            assert_eq!(export.status, Status::Forbidden, "{label}: {}", export.body);
+            assert_eq!(
+                export.body,
+                format!("sql_caveat_violation: {export_arm}"),
+                "{label}"
+            );
+        }
+
+        let row = fixture
+            .grant_sql(
+                "read-only",
+                &owner,
+                &device,
+                admin,
+                json!([{"readOnly": true}]),
+                &[],
+            )
+            .await?;
+        let held = [admin];
+        let proof = [row];
+        let run = |request: SqlRequest| {
+            fixture.sql_as(&fixture.device, &fixture.device_vm, &held, &proof, request)
+        };
+        let pragma = run(tc1791_query("PRAGMA table_info(Notes)")).await?;
+        assert_eq!(pragma.status, Status::Ok, "{}", pragma.body);
+        let export = run(SqlRequest::Export).await?;
+        assert_eq!(export.status, Status::Ok, "{}", export.body);
+        Ok(())
+    }
     /// TC-1317 review R2: a deadline shorter than the read-audit wait cuts a
     /// read waiting on its audit with `503 request_timeout` and
     /// `Retry-After: 1`, no data. That the wait is reported as

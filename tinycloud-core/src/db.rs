@@ -663,7 +663,13 @@ where
         invocation: &crate::util::InvocationInfo,
         now: OffsetDateTime,
     ) -> Result<(), crate::models::invocation::Error> {
-        invocation::verify_and_authorize(&self.conn, invocation, now).await
+        invocation::verify_and_authorize_with_setting(
+            &self.conn,
+            invocation,
+            now,
+            self.delegated_sql_caveats,
+        )
+        .await
     }
 
     /// [`Self::authorize_invocation`] for an invocation whose signature and
@@ -675,7 +681,14 @@ where
         invocation: &crate::AdmittedInvocation,
         now: OffsetDateTime,
     ) -> Result<(), crate::models::invocation::Error> {
-        invocation::authorize_admitted(&self.conn, &invocation.invocation().0, now, None).await
+        invocation::authorize_admitted(
+            &self.conn,
+            &invocation.invocation().0,
+            now,
+            None,
+            self.delegated_sql_caveats,
+        )
+        .await
     }
 
     /// Check the persisted revocation state for cited delegations and every
@@ -748,9 +761,14 @@ where
         query: &DelegationQuery,
     ) -> Result<DelegationQueryPage, AccountDelegationQueryError> {
         let now = OffsetDateTime::now_utc();
-        invocation::verify_and_authorize(&self.conn, invocation, now)
-            .await
-            .map_err(|_| AccountDelegationQueryError::Unauthorized)?;
+        invocation::verify_and_authorize_with_setting(
+            &self.conn,
+            invocation,
+            now,
+            self.delegated_sql_caveats,
+        )
+        .await
+        .map_err(|_| AccountDelegationQueryError::Unauthorized)?;
         let principal = account_query_principal(&self.conn, invocation)
             .await?
             .ok_or(AccountDelegationQueryError::Unauthorized)?;
@@ -2607,17 +2625,22 @@ where
         // signed-time validity here rather than verifying the signature a
         // second time.
         match mode {
-            InvokeMode::Admitted => {
-                invocation::authorize_admitted(&self.conn, &invocation.0, now, sync_graph.as_ref())
-                    .await
-                    .map_err(TxError::<B, K>::from)?
-            }
+            InvokeMode::Admitted => invocation::authorize_admitted(
+                &self.conn,
+                &invocation.0,
+                now,
+                sync_graph.as_ref(),
+                self.delegated_sql_caveats,
+            )
+            .await
+            .map_err(TxError::<B, K>::from)?,
             InvokeMode::Public | InvokeMode::Internal | InvokeMode::MeetingPublication => {
                 invocation::verify_and_authorize_with_graph(
                     &self.conn,
                     &invocation.0,
                     now,
                     sync_graph.as_ref(),
+                    self.delegated_sql_caveats,
                 )
                 .await
                 .map_err(TxError::<B, K>::from)?
@@ -3664,6 +3687,7 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                             .collect(),
                         encryption,
                         auth_graph,
+                        delegated_sql_caveats,
                     )
                     .await?;
                 }
@@ -3699,6 +3723,7 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                             .collect(),
                         encryption,
                         auth_graph,
+                        delegated_sql_caveats,
                     )
                     .await?;
                 }
@@ -3754,14 +3779,29 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                     }
                 }
                 Event::Invocation(i, _ops) => {
-                    invocation::process(db, *i, Vec::new(), encryption, auth_graph).await?;
+                    invocation::process(
+                        db,
+                        *i,
+                        Vec::new(),
+                        encryption,
+                        auth_graph,
+                        delegated_sql_caveats,
+                    )
+                    .await?;
                 }
                 Event::InternalInvocation(i, _ops) => {
                     invocation::process_internal(db, *i, Vec::new(), encryption).await?;
                 }
                 Event::AdmittedInvocation(i, _ops) => {
-                    invocation::process_admitted(db, *i, Vec::new(), encryption, auth_graph)
-                        .await?;
+                    invocation::process_admitted(
+                        db,
+                        *i,
+                        Vec::new(),
+                        encryption,
+                        auth_graph,
+                        delegated_sql_caveats,
+                    )
+                    .await?;
                 }
                 Event::Revocation(r) => {
                     revocation::process(db, *r).await?;

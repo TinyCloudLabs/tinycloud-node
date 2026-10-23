@@ -301,14 +301,15 @@ pub(crate) fn unsupported_sql_caveat_at_ingress(
     unsupported_sql_caveat(ability, caveats)
 }
 
-/// As [`unsupported_sql_caveat`], for a row already stored: the delegated form
-/// is read whatever the admission setting is today.
+/// As [`unsupported_sql_caveat`], for a row already stored. With
+/// `delegated_sql_caveats` the delegated form is read as well.
 pub(crate) fn unsupported_stored_sql_caveat(
     ability: &str,
     caveats: &crate::types::Caveats,
+    delegated_sql_caveats: bool,
 ) -> Option<String> {
     use crate::sql::delegated_caveats::{classify, Reading};
-    if ability.starts_with("tinycloud.sql/") {
+    if delegated_sql_caveats && ability.starts_with("tinycloud.sql/") {
         return classify(caveats, Reading::Stored)
             .err()
             .map(|refusal| refusal.reason(ability));
@@ -591,6 +592,7 @@ async fn validate_with<C: ConnectionTrait>(
                         c.ability.as_ref().as_ref(),
                         &pc.caveats,
                         &c.caveats,
+                        delegated_sql_caveats,
                     ) {
                         Ok(()) => {
                             authorized = true;
@@ -839,7 +841,12 @@ fn validate_policy_descendant(
 /// caveat (delegating to `sql_caveat::contains` for narrow/identical chain
 /// shapes) and otherwise requires structural equality so a child cannot
 /// silently drop or replace caveats the parent carried.
-fn caveats_contain_child(ability: &str, parent: &Caveats, child: &Caveats) -> Result<(), String> {
+fn caveats_contain_child(
+    ability: &str,
+    parent: &Caveats,
+    child: &Caveats,
+    delegated_sql_caveats: bool,
+) -> Result<(), String> {
     if let Some(contained) = crate::policy_capability::selector_caveats_contain(&parent.0, &child.0)
     {
         return contained
@@ -848,7 +855,7 @@ fn caveats_contain_child(ability: &str, parent: &Caveats, child: &Caveats) -> Re
     }
     // TC-1791: delegated tables / columns / readOnly caveats on SQL
     // abilities. The parent decides which axes the child may not widen.
-    if ability.starts_with("tinycloud.sql/") {
+    if delegated_sql_caveats && ability.starts_with("tinycloud.sql/") {
         use crate::sql::delegated_caveats::{classify, AbilityCaveats, DelegatedCaveat, Reading};
         match (
             classify(parent, Reading::Stored),
@@ -868,7 +875,12 @@ fn caveats_contain_child(ability: &str, parent: &Caveats, child: &Caveats) -> Re
             // A parent of only empty entries imposes nothing, whatever shape
             // the empty entries take.
             (Ok(AbilityCaveats::Unrestricted), Ok(_)) if !parent.0.is_empty() => {
-                return caveats_contain_child("", &Caveats::default(), child);
+                return caveats_contain_child(
+                    "",
+                    &Caveats::default(),
+                    child,
+                    delegated_sql_caveats,
+                );
             }
             _ => {}
         }
@@ -1980,7 +1992,7 @@ mod tests {
         use serde_json::json;
         const SQL: &str = "tinycloud.sql/read";
         let ok = |parent: serde_json::Value, child: serde_json::Value| {
-            caveats_contain_child(SQL, &wire(parent), &wire(child))
+            caveats_contain_child(SQL, &wire(parent), &wire(child), true)
         };
         assert!(ok(
             json!([{"tables": ["Notes", "t2"]}]),
@@ -2021,9 +2033,21 @@ mod tests {
         assert!(ok(json!([profile]), json!([{"tables": ["a"]}])).is_err());
         // Other services keep the earlier rule: equal caveats or an empty parent.
         let kv = |parent: serde_json::Value, child: serde_json::Value| {
-            caveats_contain_child("tinycloud.kv/get", &wire(parent), &wire(child))
+            caveats_contain_child("tinycloud.kv/get", &wire(parent), &wire(child), true)
         };
         assert!(kv(json!([{}, {}]), json!([{"tables": ["a"]}])).is_err());
         assert!(kv(json!([{}]), json!([{"tables": ["a"]}])).is_ok());
+
+        // Setting off: SQL caveats are contained as every other caveat is
+        // (equal caveats, or an empty parent).
+        let off = |parent: serde_json::Value, child: serde_json::Value| {
+            caveats_contain_child(SQL, &wire(parent), &wire(child), false)
+        };
+        assert!(off(json!([{}, {}]), json!([{"tables": ["a"]}])).is_err());
+        assert!(off(json!([{}, {}]), json!([{}])).is_err());
+        assert!(off(json!([{}]), json!([{"tables": ["a"]}])).is_ok());
+        assert!(off(json!([{"tables": ["a"]}]), json!([{"tables": ["a"]}])).is_ok());
+        assert!(off(json!([{"tables": ["a"]}]), json!([{"tables": ["A"]}])).is_err());
+        assert!(off(json!([{"tables": ["a"]}]), json!([{}])).is_err());
     }
 }
