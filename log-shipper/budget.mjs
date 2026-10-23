@@ -5,12 +5,32 @@ const schema = JSON.parse(readFileSync(new URL('./fields.json', import.meta.url)
 const longest = values => values.reduce((chosen, value) => Buffer.byteLength(value) > Buffer.byteLength(chosen) ? value : chosen, '');
 /** Event codes that ship as individual events, outside the count reducer (TC-1840). */
 export const INDIVIDUAL_EVENT_CODES = Object.freeze(['db_failure_5xx']);
-const aggregatedCodes = schema.fields.event_code.values.filter(code => !INDIVIDUAL_EVENT_CODES.includes(code));
+/** Event codes the shipper emits itself; no node log line maps to them (TC-1840). */
+export const SHIPPER_EVENT_CODES = Object.freeze(['errors_dropped']);
+const aggregatedCodes = schema.fields.event_code.values.filter(code => !INDIVIDUAL_EVENT_CODES.includes(code) && !SHIPPER_EVENT_CODES.includes(code));
 
 /** Thirty days, not a calendar-month or billing-period guarantee. */
 export const MINUTES_30_DAYS = 30 * 24 * 60;
 /** Decimal 0.48 GB allocated to requests only; diagnostic reserve is additional. */
 export const REQUEST_ALLOCATION_BYTES = 480_000_000;
+/** Seconds in one cap window; the shipper caps and counts per window and reports it as `window_s`. */
+export const CAP_WINDOW_SECONDS = 60;
+/**
+ * Decimal 0.6 GB (20% of the shared 3 GB) reserved, worst case, for the capped classes and their dropped-count
+ * events; additional to the request allocation and the diagnostic reserve. With the caps below the worst case is
+ * sum(capPerMinute x worst-valid bytes) x 43,200 minutes, plus one dropped-count event per class per minute.
+ */
+export const CAPPED_ALLOCATION_BYTES = 600_000_000;
+/**
+ * Per-minute caps (TC-1840): db_failure_5xx is the node's 5xx diagnostic event; node_request_5xx and
+ * ingress_request_5xx are the node and ingress request events with status >= 500. `representative` names the
+ * worst-valid event in representativeEvents used for the size arithmetic.
+ */
+export const CAPPED_CLASSES = Object.freeze({
+  db_failure_5xx: Object.freeze({ capPerMinute: 10, representative: 'dbFailure' }),
+  node_request_5xx: Object.freeze({ capPerMinute: 10, representative: 'node' }),
+  ingress_request_5xx: Object.freeze({ capPerMinute: 10, representative: 'ingress' }),
+});
 
 const common = { level: 'info', ts: '9999-12-31T23:59:59.999Z' };
 // Worst-valid N2 correlation fields on a node request: longest request id, both full-width pseudonyms.
@@ -28,7 +48,8 @@ const request = {
  * integer widths, and a long round-trippable fractional ingress duration.
  * Only node_request carries N2 correlation fields (request_id, request_id_replaced, account_hash,
  * space_hash); the ingress log carries none. db_hash is emitted by the F6 typed events only. The node's 5xx
- * diagnostic (dbFailure) ships individually, one event per failing request: it is not an aggregated code.
+ * diagnostic (dbFailure) ships individually, one event per failing request: it is not an aggregated code. The
+ * shipper's dropped-count event (errorsDropped) is emitted by the shipper itself, one per capped class per window.
  * Bytes below are exact for these records, not a proven Vector float-serializer
  * upper bound or a fixed event-size guard. Actual ingestion/billing can differ.
  */
@@ -40,6 +61,10 @@ export const representativeEvents = Object.freeze({
     level: 'warn', ts: common.ts, event: 'node_warning', svc: 'api', event_code: INDIVIDUAL_EVENT_CODES[0], status: 599,
     code: longest(schema.fields.code.values), service: longest(schema.fields.service.values), route: request.route,
     elapsed_ms: schema.fields.elapsed_ms.max, failure_kind: longest(schema.fields.failure_kind.values), write_may_have_applied: false, db_hash: 'f'.repeat(64),
+  }),
+  errorsDropped: Object.freeze({
+    level: 'warn', ts: common.ts, event: 'node_warning', svc: 'api', event_code: SHIPPER_EVENT_CODES[0],
+    class: longest(schema.fields.class.values), dropped: schema.fields.dropped.max, window_s: schema.fields.window_s.max,
   }),
   gate: Object.freeze({ level: 'warn', ts: common.ts, event: 'logship_gate_summary_total', svc: 'logship', reason: longest(schema.fields.reason.values), count: schema.fields.count.max }),
 });
@@ -58,7 +83,9 @@ export function serializedEventBytes(event, framing = 'ndjson') {
 
 /**
  * Full individual-request retention: each request costs one node plus one ingress
- * event. This is arithmetic only: no sampling, aggregation, throttle, or sink cap.
+ * event. This is arithmetic only: no sampling, aggregation or sink cap applies to the
+ * requests counted here. The classes in CAPPED_CLASSES (5xx request events and the 5xx
+ * diagnostic) are capped per window and are reserved separately below.
  * Diagnostic and gate group-rate assumptions reserve additional bytes separately;
  * defaults are conservative planning rates, NOT guaranteed emission ceilings.
  * The shared Better Stack 3 GB free tier is shared with other sources and is NOT
@@ -80,15 +107,28 @@ export function calculateBudget({
   const requestBytes30Days = requestsPerMinute * requestPairBytes * MINUTES_30_DAYS;
   const diagnosticReserveBytes30Days = (diagnosticEventsPerMinute * eventBytes.diagnostic + gateEventsPerMinute * eventBytes.gate) * MINUTES_30_DAYS;
   const sustainableRequestsPerMinute = allocationBytes / (requestPairBytes * MINUTES_30_DAYS);
+  const cappedClasses = Object.fromEntries(Object.entries(CAPPED_CLASSES).map(([name, { capPerMinute, representative }]) => [name, {
+    capPerMinute, eventBytes: eventBytes[representative], bytes30Days: capPerMinute * eventBytes[representative] * MINUTES_30_DAYS,
+  }]));
+  // Worst case: every window ships its full cap and one dropped-count event per class.
+  const cappedEventBytes30Days = Object.values(cappedClasses).reduce((sum, { bytes30Days }) => sum + bytes30Days, 0);
+  const droppedCountBytes30Days = Object.keys(CAPPED_CLASSES).length * eventBytes.errorsDropped * MINUTES_30_DAYS;
+  const cappedReserveBytes30Days = cappedEventBytes30Days + droppedCountBytes30Days;
+  const totalBytes30Days = requestBytes30Days + diagnosticReserveBytes30Days;
   return {
     sizeBasis: 'exact JSON bytes of representative worst-valid N0 events; not a hard serialized-size ceiling',
     framing, eventBytes, requestPairBytes, requestsPerMinute, allocationBytes,
     requestBytes30Days, diagnosticReserveBytes30Days,
-    totalBytes30Days: requestBytes30Days + diagnosticReserveBytes30Days,
+    totalBytes30Days,
     sustainableRequestsPerMinute,
     sustainableWholeRequestsPerMinute: Math.floor(sustainableRequestsPerMinute),
     withinRequestAllocation: requestBytes30Days <= allocationBytes,
     diagnosticEventsPerMinute, gateEventsPerMinute,
+    cappedWindowSeconds: CAP_WINDOW_SECONDS, cappedClasses,
+    cappedEventBytes30Days, droppedCountBytes30Days, cappedReserveBytes30Days,
+    cappedAllocationBytes: CAPPED_ALLOCATION_BYTES,
+    withinCappedAllocation: cappedReserveBytes30Days <= CAPPED_ALLOCATION_BYTES,
+    totalWithCappedBytes30Days: totalBytes30Days + cappedReserveBytes30Days,
     freeTierGuaranteed: false,
   };
 }

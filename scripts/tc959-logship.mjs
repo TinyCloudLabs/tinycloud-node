@@ -2,6 +2,7 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
 import { vectorTests, requestProfileTests } from '../log-shipper/cases.mjs';
+import { CAPPED_CLASSES, CAP_WINDOW_SECONDS } from '../log-shipper/budget.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const load = name => JSON.parse(readFileSync(resolve(root, 'log-shipper', name), 'utf8'));
@@ -9,6 +10,43 @@ export const nodeImage = 'ghcr.io/tinycloudlabs/tinycloud-node@sha256:4bdae4fc23
 export const ingressImage = 'ghcr.io/tinycloudlabs/tinycloud-node-ingress@sha256:63c1c44e2ded5b73a5f174807b91ca677826974df0f9ab3045f6ec87865a5744';
 export const vectorImage = 'timberio/vector:0.59.0-alpine@sha256:0e36bc2a290039e9b6a5e92f04bd2f133223506f72d09682c1df16c015172b7a';
 const remap = (inputs, source, options = {}) => ({ type: 'remap', inputs, source, drop_on_error: true, drop_on_abort: true, ...options });
+const status5xx = '(int(.status) ?? 0) >= 500';
+const capName = name => `cap_${name}`;
+/**
+ * TC-1843: per-window cap on one class. Vector 0.59.0's `throttle` has no dropped output (no `reroute_dropped`), so the
+ * count of held-back events is unavailable to a throttle. This `lua` transform keeps two counters per window: the first
+ * `cap` events of each window pass unchanged, the rest are counted and discarded, and when the window ends a timer emits
+ * one `errors_dropped` event (only if something was dropped) with the class, the count and the window length. The event is
+ * built from literals and the integer counter; nothing from a dropped event is read. Vector starts a Lua transform's
+ * timers when its first event arrives and the first tick fires at once, so `flush` ignores that tick: every window then
+ * runs the full CAP_WINDOW_SECONDS from the first event (or the previous tick) and holds at most `cap` events.
+ */
+const capTransform = (name, cap) => ({
+  type: 'lua', version: '2', inputs: [`event_route.${name}`],
+  hooks: { process: 'process' }, timers: [{ interval_seconds: CAP_WINDOW_SECONDS, handler: 'flush' }],
+  source: `local class = ${JSON.stringify(name)}
+local cap = ${cap}
+local passed = 0
+local dropped = 0
+local ticks = 0
+function process(event, emit)
+  if passed < cap then
+    passed = passed + 1
+    emit(event)
+  else
+    dropped = dropped + 1
+  end
+end
+function flush(emit)
+  ticks = ticks + 1
+  if ticks == 1 then return end
+  if dropped > 0 then
+    emit({log = {ts = os.date("!%Y-%m-%dT%H:%M:%S.000Z"), level = "warn", event = "node_warning", svc = "api", event_code = "errors_dropped", class = class, dropped = dropped, window_s = ${CAP_WINDOW_SECONDS}}})
+  end
+  passed = 0
+  dropped = 0
+end`,
+});
 const aliases = {
   '/attestation?<nonce>': '/attestation',
   '/.well-known/encryption/network/<name>?<query..>': '/.well-known/encryption/network/<name>',
@@ -93,12 +131,20 @@ if !includes(${JSON.stringify(schema.fields.reason.values)}, reason) { reason = 
       gate_output: remap(['gate_reduce'], `. = {"ts": format_timestamp!(now(), format: "%Y-%m-%dT%H:%M:%S%.3fZ"), "level": "warn", "event": "logship_gate_summary_total", "svc": "logship", "reason": .reason, "count": .count}`),
       request_profile: { type: 'filter', inputs: ['allowlist'], condition: `${profileExpression} == "all_requests" || includes(["node_warning", "node_error"], .event) || (int(.status) ?? 0) >= 400 || (.event == "node_request" && (int(.latency_us) ?? 0) > ${slowThresholdUs}) || (.event == "ingress_request" && (to_float(.request_time_seconds) ?? 0.0) > ${(slowThresholdUs / 1000000).toFixed(6)})` },
       // The 5xx diagnostic (TC-1840) is an individual event: it bypasses the count reducer, which would drop its fields.
-      event_route: { type: 'route', inputs: ['request_profile'], route: { request: '.event == "node_request" || .event == "ingress_request"', db_failure: '.event == "node_warning" && .event_code == "db_failure_5xx"', diagnostic: '(.event == "node_warning" && .event_code != "db_failure_5xx") || .event == "node_error"' } },
+      // The three capped classes (TC-1843) each have their own route; every other request event stays on `request`, unsampled.
+      event_route: { type: 'route', inputs: ['request_profile'], route: {
+        request: `(.event == "node_request" || .event == "ingress_request") && !(${status5xx})`,
+        node_request_5xx: `.event == "node_request" && ${status5xx}`,
+        ingress_request_5xx: `.event == "ingress_request" && ${status5xx}`,
+        db_failure_5xx: '.event == "node_warning" && .event_code == "db_failure_5xx"',
+        diagnostic: '(.event == "node_warning" && .event_code != "db_failure_5xx") || .event == "node_error"',
+      } },
+      ...Object.fromEntries(Object.entries(CAPPED_CLASSES).map(([name, { capPerMinute }]) => [capName(name), capTransform(name, capPerMinute)])),
       diagnostic_reduce: { type: 'reduce', inputs: ['event_route.diagnostic'], group_by: ['event', 'event_code', 'level', 'svc'], end_every_period_ms: 60000, expire_after_ms: 75000, flush_period_ms: 1000, merge_strategies: { event_count: 'sum', ts: 'discard' } },
       diagnostic_output: remap(['diagnostic_reduce'], `. = {"ts": format_timestamp!(now(), format: "%Y-%m-%dT%H:%M:%S%.3fZ"), "level": .level, "event": .event, "svc": "api", "event_code": .event_code, "event_count": .event_count}`),
     },
     sinks: { betterstack: {
-      type: 'http', inputs: ['event_route.request', 'event_route.db_failure', 'diagnostic_output', 'gate_output'], method: 'post', uri: sinkUri,
+      type: 'http', inputs: ['event_route.request', ...Object.keys(CAPPED_CLASSES).map(capName), 'diagnostic_output', 'gate_output'], method: 'post', uri: sinkUri,
       encoding: { codec: 'json' }, framing: { method: 'newline_delimited' }, compression: 'gzip',
       auth: { strategy: 'bearer', token: token ?? 'SECRET[bs.bs_token]' },
       batch: { max_bytes: 262144, timeout_secs: 1 },

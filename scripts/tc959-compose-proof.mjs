@@ -37,7 +37,7 @@ export function cleanupOwnedResources(resources, remove, runId) {
 /** Distinct existing safe timing values identify the complete controlled burst without new wire fields. */
 export function burstEvidence(events, first, count) {
   const seen = new Map();
-  for (const event of events) if (event?.event === 'node_request' && event.status === 503
+  for (const event of events) if (event?.event === 'node_request' && event.status === 429
     && Number.isSafeInteger(event.latency_us) && event.latency_us >= first && event.latency_us < first + count) {
     seen.set(event.latency_us, (seen.get(event.latency_us) ?? 0) + 1);
   }
