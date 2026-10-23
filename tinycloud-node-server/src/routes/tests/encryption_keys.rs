@@ -1907,6 +1907,41 @@ async fn prefix_grant_covers_keys_at_any_depth_but_not_a_sibling_prefix() -> Res
 }
 
 #[tokio::test]
+async fn delegate_granted_key_a_cannot_decrypt_key_b_over_invoke() -> Result<()> {
+    let (fixture, network) = setup().await?;
+    let key_a_public = created_key(&fixture, &network, "docs/a").await;
+    let key_b_public = created_key(&fixture, &network, "docs/b").await;
+    let resource_a = key_uri(&network, "docs/a");
+    let proof = grant_owner_to_device(
+        &fixture,
+        "docs-a-decrypt-only",
+        &[(resource_a.as_str(), DECRYPT_ACTION)],
+    )
+    .await?;
+    // Body keyPath and capability both name docs/b; the delegation covers only docs/a.
+    let (status, text) = device_decrypt(
+        &fixture,
+        proof,
+        &network,
+        "docs/b",
+        &DecryptCase::wrapped_to(&key_b_public),
+    )
+    .await;
+    assert_eq!(status, Status::Forbidden, "{text}");
+    // Positive control: the same delegation decrypts docs/a.
+    let (status, text) = device_decrypt(
+        &fixture,
+        proof,
+        &network,
+        "docs/a",
+        &DecryptCase::wrapped_to(&key_a_public),
+    )
+    .await;
+    assert_eq!(status, Status::Ok, "{text}");
+    Ok(())
+}
+
+#[tokio::test]
 async fn decrypt_invocation_that_is_expired_or_misaddressed_is_refused() -> Result<()> {
     let (fixture, network) = setup().await?;
     let key_public = created_key(&fixture, &network, "docs/a").await;
