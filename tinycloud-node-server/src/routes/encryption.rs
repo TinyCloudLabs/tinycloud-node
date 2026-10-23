@@ -354,8 +354,9 @@ fn key_location(
 }
 
 /// Raw key path: the request path after `/networks/<network_id>/keys/`. Rocket's
-/// decoded segments drop empty and dot segments, so the key path is taken from
-/// the raw request path and checked against the key grammar as received. Rocket
+/// decoded segments drop empty segments (and a `PathBuf` conversion would
+/// normalize dot segments), so the key path is taken from the raw request path
+/// and checked against the key grammar as received. Rocket
 /// decodes the `<network_id>` parameter, so a percent-escape in the network id
 /// breaks the raw prefix match; the detail then names the escape. Percent-escapes
 /// in the key path are refused outright.
