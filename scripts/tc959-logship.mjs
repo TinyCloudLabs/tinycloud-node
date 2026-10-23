@@ -119,7 +119,8 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   const config = buildConfig({ profile, ...(sinkUri ? { sinkUri, token: 'tc959-synthetic-only' } : {}) });
   if (command === 'render-tests') {
     delete config.secret;
-    config.sinks = { discard: { type: 'blackhole', inputs: ['event_route.request', 'event_route.db_failure', 'diagnostic_output', 'gate_output'] } };
+    // Same inputs as the real sink: dropping a route from the real sink must not stay green here.
+    config.sinks = { discard: { type: 'blackhole', inputs: [...config.sinks.betterstack.inputs] } };
     config.tests = [...vectorTests, ...requestProfileTests(profile)];
   }
   writeFileSync(output, JSON.stringify(config, null, 2) + '\n');
