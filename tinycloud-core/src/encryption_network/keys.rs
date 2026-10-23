@@ -234,7 +234,8 @@ impl EncryptionService {
         }
     }
 
-    /// `key.block`. Idempotent; returns the descriptor.
+    /// `key.block`. Idempotent; returns the descriptor. Does not check the
+    /// network's state.
     pub async fn block_key(
         &self,
         loc: &KeyLocation,
@@ -242,7 +243,8 @@ impl EncryptionService {
         self.set_key_state(loc, KeyState::Blocked).await
     }
 
-    /// `key.unblock`. Idempotent; returns the descriptor.
+    /// `key.unblock`. Idempotent; returns the descriptor. Does not check the
+    /// network's state.
     pub async fn unblock_key(
         &self,
         loc: &KeyLocation,
@@ -273,6 +275,7 @@ impl EncryptionService {
     }
 
     /// Authenticated descriptor GET. `key_not_found` is only reported here.
+    /// Does not check the network's state.
     pub async fn describe_key(
         &self,
         loc: &KeyLocation,

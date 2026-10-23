@@ -64,6 +64,19 @@ impl KeyLocation {
     fn same_network(&self, other: &Self) -> bool {
         self.owner == other.owner && self.network == other.network
     }
+
+    /// Key location for `path` under `network`, validated with the same
+    /// owner, network and path grammar as [`parse`].
+    pub fn new(network: &NetworkId, path: &str) -> Result<Self, KeyIdError> {
+        validate_owner(network.owner_did())?;
+        validate_network(network.name())?;
+        validate_path(path)?;
+        Ok(Self {
+            owner: network.owner_did().to_string(),
+            network: network.name().to_string(),
+            path: path.to_string(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
