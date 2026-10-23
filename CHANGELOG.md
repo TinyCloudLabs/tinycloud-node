@@ -4,6 +4,7 @@
 
 ### Changes
 
+- A SIWE (CACAO) delegation whose ReCap attaches a non-empty caveat to any ability is refused as an unsupported caveat; empty caveat maps are accepted as no restriction. Details: TC-1844.
 - The node logs one structured diagnostic line (status, code, service, route, elapsed time, failure kind, a keyed database pseudonym `db_hash`) when a request ends in a database failure or a busy/timeout 5xx. Details: TC-1796.
 - Log sidecar: the node's one warning line per database-failure 5xx (`database failure answered with a 5xx`) ships to Better Stack as an individual `node_warning` event with `event_code` `db_failure_5xx` and exactly eight fields: `status`, `code`, `service`, `route`, `elapsed_ms`, `failure_kind`, `write_may_have_applied` and, when known, `db_hash`. They are fixed vocabulary, the route template, a duration, a flag and a keyed database pseudonym; no SQL, ids, DIDs, paths or messages. A line with any other field or an unexpected value is counted as `unclassified` as before. Details: TC-1840.
   - **N0 compose.** The embedded Vector configuration is regenerated for the new event. The reviewed N0 compose template changes to `7c3456dc…` (raw `d0e72bde…`; `docs/releasing.md`).

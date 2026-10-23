@@ -29,7 +29,7 @@ pub struct Capability {
     /// UCAN-shaped caveats attached to this capability. Persisted with the
     /// delegation row (W1 native contract requirement); MUST NOT be dropped
     /// at save time. For UCAN delegations these come from the per-ability
-    /// caveat list; for SIWE-ReCap they default to empty.
+    /// caveat list; for SIWE-ReCap they are always empty (non-empty SIWE caveats are refused).
     #[serde(default)]
     pub caveats: Caveats,
 }
@@ -74,24 +74,31 @@ fn extract_ucan_caps<T: serde::Serialize>(caps: &UcanCapabilities<T>) -> Vec<Cap
     capabilities
 }
 
-fn extract_siwe_cap(c: SiweCap<()>) -> (Vec<Capability>, Vec<Cid>) {
+fn extract_siwe_cap(
+    c: SiweCap<serde_json::Value>,
+) -> Result<(Vec<Capability>, Vec<Cid>), DelegationError> {
     let (c, p) = c.into_inner();
-    (
-        c.into_inner()
-            .into_iter()
-            .flat_map(|(r, acs)| {
-                // r is UriString, acs is BTreeMap<Ability, Caveats<()>>
-                acs.into_keys() // Iterate over Ability keys
-                    .map(|ability| Capability {
-                        resource: Resource::from(r.clone()),
-                        ability: ability.into(),
-                        caveats: Caveats::default(),
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect(),
-        p,
-    )
+    let mut capabilities = Vec::new();
+    for (r, acs) in c.into_inner() {
+        for (ability, caveats) in acs {
+            // A SIWE caveat is accepted only as an empty placeholder: every
+            // value in every entry must be null. Any other value is refused,
+            // because nothing enforces it. Caveat values are never echoed.
+            for (i, entry) in caveats.into_inner().into_iter().enumerate() {
+                if entry.values().any(|v| !v.is_null()) {
+                    return Err(DelegationError::UnsupportedCaveat(format!(
+                        "{ability} caveat {i} is not accepted; SIWE delegations accept only null caveat values"
+                    )));
+                }
+            }
+            capabilities.push(Capability {
+                resource: Resource::from(r.clone()),
+                ability: ability.into(),
+                caveats: Caveats::default(),
+            });
+        }
+    }
+    Ok((capabilities, p))
 }
 
 #[derive(Debug, Clone)]
@@ -170,6 +177,8 @@ pub enum DelegationError {
     SiweCapError(#[from] SiweError),
     #[error("Invalid Siwe Statement")]
     InvalidStatement,
+    #[error("unsupported-caveat: {0}")]
+    UnsupportedCaveat(String),
 }
 
 impl TryFrom<TinyCloudDelegation> for DelegationInfo {
@@ -197,18 +206,13 @@ impl TryFrom<TinyCloudDelegation> for DelegationInfo {
             },
             TinyCloudDelegation::Cacao(ref c) => {
                 let m: Message = c.payload().clone().try_into()?;
-                // Use the public extract_and_verify, which returns Result<Option<SiweCap<()>>, VerificationError>
+                // Decode the ReCap caveats as JSON values so extract_siwe_cap can refuse them explicitly.
                 let maybe_siwe_cap = SiweCap::extract_and_verify(&m)?;
 
                 let (capabilities, parents) = match maybe_siwe_cap {
-                    Some(siwe_cap) => {
-                        // Pass the extracted cap to the helper function
-                        extract_siwe_cap(siwe_cap)
-                    }
-                    None => {
-                        // No capabilities found
-                        (vec![], vec![])
-                    }
+                    // Non-empty caveats are refused inside extract_siwe_cap.
+                    Some(siwe_cap) => extract_siwe_cap(siwe_cap)?,
+                    None => (vec![], vec![]),
                 };
 
                 Self {
@@ -365,5 +369,100 @@ mod tests {
         );
         // An empty list does not parse at all: no delegation can carry it.
         assert!(seen_by_the_node("[]").is_err());
+    }
+
+    /// Caveat entries for one ability, as a ReCap encodes them.
+    fn recap_caveats(json: serde_json::Value) -> Vec<BTreeMap<String, serde_json::Value>> {
+        serde_json::from_value(json).unwrap()
+    }
+
+    /// A SIWE CACAO whose ReCap grants each ability with the given caveat list.
+    /// Only the ReCap is read here: `DelegationInfo::try_from` does not check
+    /// the signature, so it is left zeroed.
+    fn siwe_with_recap(
+        grants: &[(&str, Vec<BTreeMap<String, serde_json::Value>>)],
+    ) -> TinyCloudDelegation {
+        use tinycloud_auth::cacaos::{
+            siwe::Version,
+            siwe_cacao::{Header, Signature, SiweCacao},
+        };
+        let mut recap = tinycloud_auth::siwe_recap::Capability::<serde_json::Value>::new();
+        for (ability, caveats) in grants {
+            recap.with_action(
+                RESOURCE.parse().unwrap(),
+                ability.parse().unwrap(),
+                caveats.clone(),
+            );
+        }
+        let message = Message {
+            scheme: Some("https".parse().unwrap()),
+            domain: "tinycloud.invalid".parse().unwrap(),
+            address: [1; 20],
+            statement: None,
+            uri: "did:key:z6MkTestDelegatee".parse().unwrap(),
+            version: Version::V1,
+            chain_id: 1,
+            nonce: "tc1844nonce".into(),
+            issued_at: "2020-01-01T00:00:00Z".parse().unwrap(),
+            expiration_time: Some("2100-01-01T00:00:00Z".parse().unwrap()),
+            not_before: None,
+            request_id: None,
+            resources: vec![],
+        };
+        let message = recap.build_message(message).unwrap();
+        TinyCloudDelegation::Cacao(Box::new(SiweCacao::new(
+            message.into(),
+            Signature::from([0u8; 65]),
+            Header,
+        )))
+    }
+
+    /// TC-1844: a SIWE ReCap caveat with a non-null value is refused for every
+    /// ability, because the node has no enforcement for it.
+    #[test]
+    fn a_siwe_caveat_with_a_value_is_refused_for_every_ability() {
+        use serde_json::json;
+        let profile = recap_caveats(json!([{"tables": ["Notes"], "readOnly": true}]));
+        for ability in [
+            "tinycloud.sql/read",
+            "tinycloud.duckdb/read",
+            "tinycloud.kv/get",
+        ] {
+            let delegation = siwe_with_recap(&[(ability, profile.clone())]);
+            assert!(
+                matches!(
+                    DelegationInfo::try_from(delegation),
+                    Err(DelegationError::UnsupportedCaveat(_))
+                ),
+                "{ability} must refuse a non-null SIWE caveat"
+            );
+        }
+    }
+
+    /// An empty map is still a value, so `{"tables": {}}` is refused too.
+    #[test]
+    fn a_siwe_caveat_holding_an_empty_map_is_refused() {
+        use serde_json::json;
+        let delegation =
+            siwe_with_recap(&[("tinycloud.sql/read", recap_caveats(json!([{"tables": {}}])))]);
+        assert!(matches!(
+            DelegationInfo::try_from(delegation),
+            Err(DelegationError::UnsupportedCaveat(_))
+        ));
+    }
+
+    /// Null values and empty entries carry no restriction. They are accepted
+    /// and stored as the empty caveat map.
+    #[test]
+    fn null_and_empty_siwe_caveats_are_accepted_as_no_restriction() {
+        use serde_json::json;
+        for caveats in [json!([{}]), json!([{}, {}]), json!([{"tables": null}])] {
+            let delegation =
+                siwe_with_recap(&[("tinycloud.sql/read", recap_caveats(caveats.clone()))]);
+            let info = DelegationInfo::try_from(delegation)
+                .unwrap_or_else(|e| panic!("{caveats} must be accepted: {e}"));
+            assert_eq!(info.capabilities.len(), 1);
+            assert_eq!(info.capabilities[0].caveats, Caveats::default());
+        }
     }
 }
