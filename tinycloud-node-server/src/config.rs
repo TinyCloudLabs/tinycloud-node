@@ -2042,7 +2042,7 @@ mod tests {
         assert_eq!(load(full.clone()).unwrap(), Config::default());
         let optional: Vec<&String> = full
             .keys()
-            .filter(|key| !REQUIRED.contains(&key.as_str()))
+            .filter(|key| !REQUIRED.contains(&String::as_str(key)))
             .collect();
         assert!(optional.iter().any(|key| *key == "sql_store"));
         assert!(optional.iter().any(|key| *key == "policy_v3"));
