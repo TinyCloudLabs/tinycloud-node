@@ -142,10 +142,7 @@ fn owner_ucan(
 async fn fixture() -> Result<KvSyncFixture> {
     let mut config = Config::default();
     config.encryption_network.named_keys_v1 = true;
-    KvSyncFixture::new_configured(config, |rocket| {
-        rocket.mount("/", rocket::routes![revoke])
-    })
-    .await
+    KvSyncFixture::new_configured(config, |rocket| rocket.mount("/", rocket::routes![revoke])).await
 }
 
 async fn post(fixture: &KvSyncFixture, uri: &str, auth: String) -> (Status, String) {
