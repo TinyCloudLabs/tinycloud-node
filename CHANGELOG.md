@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changes
+
+- Encryption: key and prefix network names must match `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`; bare network resources keep the existing network name rule. Details: TC-1777.
+
 ## [1.21.9] - 2026-10-23
 
 ### Release notes
