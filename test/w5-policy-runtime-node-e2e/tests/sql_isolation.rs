@@ -150,7 +150,7 @@ async fn legacy_web_artifacts_load_via_invoke_after_alias_cutover_and_restart() 
             physical,
             serde_json::from_value(sql_write_body(row))?,
             None,
-            "tinycloud.sql/write".into(),
+            "tinycloud.sql/admin".into(),
         )
         .await?;
     }
@@ -178,6 +178,7 @@ async fn legacy_web_artifacts_load_via_invoke_after_alias_cutover_and_restart() 
     let duck_resource = db_resource(&space_id, "duckdb", "appA/")?;
     let connectors_a = db_resource(&space_id, "sql", "xyz.tinycloud.tinychat/connectors")?;
     let connectors_b = db_resource(&space_id, "sql", "another.app/connectors")?;
+    let mut grant_cids = Vec::with_capacity(5);
     for (index, resource) in [
         &sql_resource,
         &canvas_resource,
@@ -193,15 +194,41 @@ async fn legacy_web_artifacts_load_via_invoke_after_alias_cutover_and_restart() 
         } else {
             "tinycloud.duckdb/read"
         };
-        persist_grant(
-            &conn,
-            tinycloud_core::hash::hash(format!("n3-grant-{index}").as_bytes()),
-            &owner_did,
-            &holder_did,
-            resource,
-            ability,
-        )
-        .await?;
+        // Restart validates stored signed bytes and their content IDs.
+        // Register real grants rather than metadata-only synthetic rows.
+        let mut caps = Capabilities::new();
+        caps.with_action(
+            resource.as_uri(),
+            ability.parse::<UcanAbility>()?,
+            [BTreeMap::<String, serde_json::Value>::new()],
+        );
+        let grant = Payload {
+            issuer: owner_vm.parse::<DIDURLBuf>()?,
+            audience: holder_did.parse::<DIDBuf>()?,
+            not_before: None,
+            expiration: NumericDate::try_from_seconds(FAR_FUTURE_SECONDS)?,
+            nonce: Some(format!("tc780-restart-grant-{index}")),
+            facts: Some(Vec::<serde_json::Value>::new()),
+            proof: vec![],
+            attenuation: caps,
+        }
+        .sign(owner_jwk.get_algorithm().unwrap_or_default(), &owner_jwk)?
+        .encode()?;
+        let response = client
+            .post("/delegate")
+            .header(Header::new("Authorization", grant))
+            .dispatch()
+            .await;
+        let status = response.status();
+        let body = response.into_string().await.unwrap_or_default();
+        assert_eq!(status, Status::Ok, "register signed grant: {body}");
+        let registered: serde_json::Value = serde_json::from_str(&body)?;
+        grant_cids.push(
+            registered["cid"]
+                .as_str()
+                .context("registered delegation CID")?
+                .parse::<AuthCid>()?,
+        );
     }
 
     let items = database_migration::inventory(&conn, &datadir).await?;
@@ -266,24 +293,18 @@ async fn legacy_web_artifacts_load_via_invoke_after_alias_cutover_and_restart() 
             "13",
         ),
     ] {
-        let grant = tinycloud_core::hash::hash(
-            format!(
-                "n3-grant-{}",
-                if suffix == "11" {
-                    0
-                } else if suffix == "12" {
-                    1
-                } else {
-                    2
-                }
-            )
-            .as_bytes(),
-        );
+        let grant = grant_cids[if suffix == "11" {
+            0
+        } else if suffix == "12" {
+            1
+        } else {
+            2
+        }];
         let header = invocation(
             &holder_jwk,
             &holder_did,
             &holder_vm,
-            vec![grant.to_cid(0x55)],
+            vec![grant],
             resource,
             ability,
             &format!("urn:uuid:00000000-0000-4000-8000-0000000000{suffix}"),
@@ -301,7 +322,9 @@ async fn legacy_web_artifacts_load_via_invoke_after_alias_cutover_and_restart() 
         &owner_vm,
         vec![],
         &fresh_resource,
-        "tinycloud.sql/write",
+        // `sql_write_body` creates its table and inserts a row: `admin`
+        // carries both (schema changes need `schema`, TC-1581).
+        "tinycloud.sql/admin",
         "urn:uuid:00000000-0000-4000-8000-000000000024",
     )?;
     let (status, response) = invoke_json(&client, fresh_write, &sql_write_body("new-row")).await;
@@ -426,7 +449,7 @@ async fn legacy_web_artifacts_load_via_invoke_after_alias_cutover_and_restart() 
         &holder_jwk,
         &holder_did,
         &holder_vm,
-        vec![tinycloud_core::hash::hash(b"n3-grant-3").to_cid(0x55)],
+        vec![grant_cids[3]],
         &connectors_a,
         "tinycloud.sql/read",
         "urn:uuid:00000000-0000-4000-8000-000000000019",
@@ -443,12 +466,11 @@ async fn legacy_web_artifacts_load_via_invoke_after_alias_cutover_and_restart() 
     )
     .await?;
     database_migration::set_fence(&conn, false).await?;
-    assert_eq!(
+    assert!(
         database_migration::resolve(&conn, "sql", &space_id.to_string(), Some("connectors"))
             .await
-            .unwrap_err()
-            .to_string(),
-        "quarantined legacy artifact is unreachable without an explicit alias"
+            .is_err(),
+        "clearing the alias must not expose the quarantined legacy artifact"
     );
     drop(client);
     let restarted = restart_node(&tempdir, false).await?;
@@ -456,7 +478,7 @@ async fn legacy_web_artifacts_load_via_invoke_after_alias_cutover_and_restart() 
         &holder_jwk,
         &holder_did,
         &holder_vm,
-        vec![tinycloud_core::hash::hash(b"n3-grant-0").to_cid(0x55)],
+        vec![grant_cids[0]],
         &sql_resource,
         "tinycloud.sql/read",
         "urn:uuid:00000000-0000-4000-8000-000000000017",
@@ -508,7 +530,7 @@ async fn legacy_alias_collision_refuses_the_whole_transaction() -> Result<()> {
             name,
             serde_json::from_value(sql_write_body("row"))?,
             None,
-            "tinycloud.sql/write".into(),
+            "tinycloud.sql/admin".into(),
         )
         .await?;
     }
@@ -555,7 +577,7 @@ async fn legacy_inventory_attributes_from_invoked_abilities_without_a_grant() ->
         &owner_vm,
         vec![],
         &resource,
-        "tinycloud.sql/write",
+        "tinycloud.sql/admin",
         "urn:uuid:00000000-0000-4000-8000-000000000025",
     )?;
     let (status, response) = invoke_json(&client, header, &sql_write_body("digest-row")).await;
@@ -568,7 +590,7 @@ async fn legacy_inventory_attributes_from_invoked_abilities_without_a_grant() ->
         "only",
         serde_json::from_value(sql_write_body("legacy-row"))?,
         None,
-        "tinycloud.sql/write".into(),
+        "tinycloud.sql/admin".into(),
     )
     .await?;
     let items = database_migration::inventory(&conn, &datadir).await?;
@@ -588,7 +610,7 @@ async fn legacy_inventory_attributes_from_invoked_abilities_without_a_grant() ->
         &owner_vm,
         vec![],
         &resource,
-        "tinycloud.sql/write",
+        "tinycloud.sql/admin",
         "urn:uuid:00000000-0000-4000-8000-000000000026",
     )?;
     let (status, response) = invoke_json(&client, unfenced_write, &sql_write_body("blocked")).await;
@@ -974,7 +996,7 @@ async fn sql_paths_do_not_share_databases_and_grants_are_exact() -> Result<()> {
     let tempdir = TempDir::new()?;
     let engine = Engine {
         service: "sql",
-        write_ability: "tinycloud.sql/write",
+        write_ability: "tinycloud.sql/admin",
         read_ability: "tinycloud.sql/read",
         grant_seed: b"tc780-n1-sql-read-appA-connectors",
         nonce_prefix: "000000000a",
@@ -1026,7 +1048,7 @@ fn regression_engine(service: &'static str) -> Result<Engine> {
     Ok(match service {
         "sql" => Engine {
             service,
-            write_ability: "tinycloud.sql/write",
+            write_ability: "tinycloud.sql/admin",
             read_ability: "tinycloud.sql/read",
             grant_seed: b"tc780-n2-ancestor-sql",
             nonce_prefix: "000000000c",

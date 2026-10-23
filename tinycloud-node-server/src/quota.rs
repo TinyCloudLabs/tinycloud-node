@@ -65,7 +65,7 @@ struct RemoteQuota {
 }
 
 /// Where every storage surface sends the owner to free space or upgrade.
-pub const MANAGE_STORAGE_URL: &str = "https://account.tinycloud.xyz/billing";
+pub const MANAGE_STORAGE_URL: &str = "https://account.tinycloud.xyz/storage";
 
 /// One space's metered usage against its effective limit (`None` = no limit).
 #[derive(Serialize, Debug, Clone, PartialEq, Eq)]
@@ -226,6 +226,7 @@ pub struct QuotaCache {
     /// Sent as `Authorization: Bearer <secret>` on quota fetches so billing
     /// can require the node's service credential (TC-627).
     service_secret: Option<Arc<str>>,
+    request_id_origin_allowed: bool,
 }
 
 impl QuotaCache {
@@ -246,6 +247,7 @@ impl QuotaCache {
             quota_url,
             client,
             service_secret: None,
+            request_id_origin_allowed: false,
         }
     }
 
@@ -254,6 +256,25 @@ impl QuotaCache {
     pub fn with_service_secret(mut self, secret: Option<String>) -> Self {
         self.service_secret = secret.filter(|s| !s.is_empty()).map(Arc::from);
         self
+    }
+
+    pub(crate) fn with_request_id_origins(
+        mut self,
+        origins: &crate::tracing::RequestIdOrigins,
+    ) -> Self {
+        self.request_id_origin_allowed = self
+            .quota_url
+            .as_deref()
+            .is_some_and(|url| origins.allows(url));
+        self
+    }
+
+    fn propagated_request_id(&self) -> Option<uuid::Uuid> {
+        if self.request_id_origin_allowed {
+            tinycloud_core::request_telemetry::current().map(|context| context.request_id())
+        } else {
+            None
+        }
     }
 
     /// Get the effective storage limit for a space.
@@ -268,6 +289,7 @@ impl QuotaCache {
     /// (`FETCH_TIMEOUT`) synchronous fetch, so paid limits above the env
     /// default apply from the first byte.
     pub async fn get_limit(&self, space_id: &SpaceId) -> Option<ByteUnit> {
+        tinycloud_core::request_telemetry::observe_space(space_id);
         let key = space_id.to_string();
 
         {
@@ -334,6 +356,7 @@ impl QuotaCache {
             self.quota_url.as_deref()?,
             self.service_secret.as_deref(),
             key,
+            self.propagated_request_id(),
         )
         .await;
         let limit = fetched.as_ref().map(|q| q.limit_bytes);
@@ -356,8 +379,11 @@ impl QuotaCache {
         let remote = self.remote.clone();
         let inflight = self.inflight.clone();
         let secret = self.service_secret.clone();
+        // Correlate the deferred HTTP fetch without retaining the request's DB
+        // counters: a cache refresh is not synchronous request DB work.
+        let request_id = self.propagated_request_id();
         tokio::spawn(async move {
-            let fetched = fetch_remote(&client, &url, secret.as_deref(), &key).await;
+            let fetched = fetch_remote(&client, &url, secret.as_deref(), &key, request_id).await;
             record_fetch(&remote, &key, fetched).await;
             inflight.write().await.remove(&key);
         });
@@ -447,6 +473,7 @@ async fn fetch_remote(
     url: &str,
     secret: Option<&str>,
     key: &str,
+    request_id: Option<uuid::Uuid>,
 ) -> Option<RemoteQuota> {
     // Encode only the space key, not the operator-controlled base URL.
     // Cache/override keys remain the original SpaceId string.
@@ -455,6 +482,10 @@ async fn fetch_remote(
         url,
         percent_encoding::utf8_percent_encode(key, percent_encoding::NON_ALPHANUMERIC),
     ));
+    if let Some(id) = request_id {
+        let mut encoded = [0; 36];
+        request = request.header("x-request-id", &*id.hyphenated().encode_lower(&mut encoded));
+    }
     if let Some(secret) = secret {
         request = request.bearer_auth(secret);
     }
@@ -464,22 +495,25 @@ async fn fetch_remote(
                 limit_bytes: info.storage_limit_bytes,
                 account: info.account(),
             }),
-            Err(e) => {
+            Err(_) => {
                 tracing::warn!(
-                    "quota service returned an invalid body: {}",
-                    e.without_url()
+                    error_class = "decode",
+                    "quota service returned an invalid body"
                 );
                 None
             }
         },
         Ok(resp) => {
-            tracing::warn!("quota service returned {}, using fallback", resp.status());
+            tracing::warn!(
+                status = resp.status().as_u16(),
+                "quota service returned an error, using fallback"
+            );
             None
         }
-        Err(e) => {
+        Err(error) => {
             tracing::debug!(
-                "quota service unavailable ({}), using fallback",
-                e.without_url()
+                timed_out = error.is_timeout(),
+                "quota service unavailable, using fallback"
             );
             None
         }

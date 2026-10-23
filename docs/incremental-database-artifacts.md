@@ -61,6 +61,10 @@ Explicit DuckDB exports checkpoint the engine and durably install that
 checkpoint before returning. SQLite exports use a non-destructive backup, so
 they do not disturb the WAL baseline.
 
+## Bounded reads (TC-822)
+
+The node never reads a whole artifact row. Existence and size checks use `load_meta` (metadata columns only); hydration streams `payload` then `delta_payload` in 4 MiB slices into a cache-file sink, verifying the content hashes as it goes and restarting if the row changes mid-read. See `docs/runbooks/tc-822-artifact-payload-storage.md` for the Postgres `STORAGE EXTERNAL` operator step.
+
 ## Observability
 
 Every persistence operation emits structured fields:

@@ -11,16 +11,9 @@ use rocket::{
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
-use tinycloud_auth::{
-    authorization::{EncodingError, HeaderEncode},
-    ipld_core::cid::Cid,
-    resource::SpaceId,
-};
+use tinycloud_auth::{authorization::TinyCloudDelegation, ipld_core::cid::Cid, resource::SpaceId};
 use tinycloud_core::{
-    hash::Hash,
-    types::Metadata,
-    util::{Capability, DelegationInfo},
-    InvocationOutcome,
+    events::Delegation, hash::Hash, types::Metadata, util::Capability, InvocationOutcome,
 };
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tracing::{info_span, Instrument};
@@ -250,7 +243,7 @@ where
             InvocationOutcome::DelegationChain(chain) => Json(
                 chain
                     .into_iter()
-                    .map(|del| Ok(CapJsonRep::from_delegation(del)?))
+                    .map(CapJsonRep::from_delegation)
                     .collect::<Result<Vec<CapJsonRep>>>()
                     .map_err(|_| Status::InternalServerError)?,
             )
@@ -281,6 +274,93 @@ mod tests {
     use futures::io::Cursor;
     use rocket::{get, http::Header, local::asynchronous::Client, routes};
     use tinycloud_core::{hash::hash, KvBatchReadItem, KvBatchReadValue};
+
+    type HistoricalDb = tinycloud_core::db::SpaceDatabase<
+        tinycloud_core::sea_orm::DatabaseConnection,
+        tinycloud_core::storage::memory::MemoryStore,
+        tinycloud_core::keys::StaticSecret,
+    >;
+
+    #[get("/historical/<cid>?<chain>")]
+    async fn historical_delegation_response(
+        db: &rocket::State<HistoricalDb>,
+        cid: &str,
+        chain: bool,
+    ) -> Result<InvOut<Cursor<Vec<u8>>>, Status> {
+        let cid: Cid = cid.parse().map_err(|_| Status::BadRequest)?;
+        let (_, event) = db
+            .load_signed_delegation(cid)
+            .await
+            .map_err(|_| Status::InternalServerError)?
+            .ok_or(Status::NotFound)?;
+        Ok(InvOut(if chain {
+            InvocationOutcome::DelegationChain(vec![event])
+        } else {
+            InvocationOutcome::OpenSessions(HashMap::from([(Hash::from(cid), event)]))
+        }))
+    }
+
+    #[tokio::test]
+    async fn historical_list_and_chain_json_preserve_raw_header_cids() -> Result<()> {
+        use tinycloud_core::{keys::StaticSecret, sea_orm::Database, storage::memory::MemoryStore};
+        let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../tinycloud-core/tests/fixtures/tc1071/generated");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(fixture_dir.join("manifest.json"))?)?;
+        let fixture = manifest
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|fixture| fixture["database"] == "active.sqlite")
+            .unwrap();
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("caps.sqlite");
+        std::fs::copy(fixture_dir.join("active.sqlite"), &path)?;
+        let db = HistoricalDb::new(
+            Database::connect(format!("sqlite:{}?mode=rwc", path.display())).await?,
+            MemoryStore::default(),
+            StaticSecret::new(vec![31; 32]).unwrap(),
+        )
+        .await?;
+        let client = Client::tracked(
+            rocket::build()
+                .manage(db)
+                .mount("/", routes![historical_delegation_response]),
+        )
+        .await?;
+        for row in fixture["rows"].as_array().unwrap() {
+            for (id, header) in [("raw_cid", "header"), ("child_cid", "child_header")] {
+                let cid = row[id].as_str().unwrap();
+                let header = row[header].as_str().unwrap();
+                for chain in [false, true] {
+                    let response = client
+                        .get(format!("/historical/{cid}?chain={chain}"))
+                        .dispatch()
+                        .await;
+                    assert_eq!(response.status(), Status::Ok);
+                    let json: serde_json::Value =
+                        serde_json::from_str(&response.into_string().await.unwrap())?;
+                    let record = if chain { &json[0] } else { &json[cid] };
+                    let raw = record["raw"].as_str().unwrap();
+                    assert_eq!(raw, header);
+                    let bytes = if raw.contains('.') {
+                        raw.as_bytes().to_vec()
+                    } else {
+                        base64::decode_config(raw, base64::URL_SAFE)?
+                    };
+                    assert_eq!(hash(&bytes).to_cid(0x55).to_string(), cid);
+                    if id == "child_cid" {
+                        let parents: Vec<Cid> = serde_json::from_value(record["parents"].clone())?;
+                        assert_eq!(
+                            parents,
+                            vec![row["raw_cid"].as_str().unwrap().parse::<Cid>()?]
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 
     #[get("/")]
     fn conditional_kv_response() -> KVResponse<Cursor<Vec<u8>>> {
@@ -330,6 +410,55 @@ mod tests {
         assert_eq!(second.status(), Status::NotModified);
         assert!(second.headers().get_one("Content-Length").is_none());
         assert!(second.into_string().await.is_none());
+    }
+
+    #[get("/put?<written>")]
+    fn mutation_response(written: bool) -> KvMutationResponse {
+        KvMutationResponse(written.then(|| hash(b"hello")))
+    }
+
+    #[get("/metadata")]
+    fn metadata_response() -> KvMetadataResponse {
+        KvMetadataResponse(
+            Metadata(BTreeMap::from([(
+                "Content-Type".to_string(),
+                "text/plain".to_string(),
+            )])),
+            hash(b"hello"),
+        )
+    }
+
+    /// TC-1432: the KV put and metadata/HEAD responses carry a strong ETag, so
+    /// the node forbids CDN re-encoding on them. A put that wrote nothing has
+    /// no ETag and no `Cache-Control`.
+    #[tokio::test]
+    async fn kv_put_and_metadata_etags_carry_no_transform() {
+        let client = Client::tracked(crate::attach_response_fairings(
+            rocket::build().mount("/", routes![mutation_response, metadata_response]),
+            "https://share.tinycloud.xyz".into(),
+        ))
+        .await
+        .unwrap();
+
+        for path in ["/put?written=true", "/metadata"] {
+            let response = client.get(path).dispatch().await;
+            assert_eq!(response.status(), Status::Ok, "{path}");
+            assert_eq!(
+                response.headers().get_one("ETag"),
+                Some(kv_etag(hash(b"hello")).as_str()),
+                "{path}"
+            );
+            assert_eq!(
+                response.headers().get_one("Cache-Control"),
+                Some("no-transform"),
+                "{path}"
+            );
+        }
+
+        let unwritten = client.get("/put?written=false").dispatch().await;
+        assert_eq!(unwritten.status(), Status::Ok);
+        assert!(unwritten.headers().get_one("ETag").is_none());
+        assert!(unwritten.headers().get_one("Cache-Control").is_none());
     }
 
     #[test]
@@ -520,13 +649,21 @@ pub struct CapJsonRep {
 }
 
 impl CapJsonRep {
-    pub fn from_delegation(d: DelegationInfo) -> Result<Self, EncodingError> {
+    /// Return the exact persisted header, whose bytes hash to the advertised
+    /// CID. Re-encoding a decoded historical CACAO would change that identity.
+    pub fn from_delegation(d: Delegation) -> Result<Self> {
+        let raw = match &d.0.delegation {
+            TinyCloudDelegation::Ucan(_) => std::str::from_utf8(d.serialized_bytes())?.to_owned(),
+            TinyCloudDelegation::Cacao(_) => {
+                base64::encode_config(d.serialized_bytes(), base64::URL_SAFE)
+            }
+        };
         Ok(Self {
-            capabilities: d.capabilities,
-            delegator: d.delegator,
-            delegate: d.delegate,
-            parents: d.parents,
-            raw: d.delegation.encode()?,
+            capabilities: d.0.capabilities,
+            delegator: d.0.delegator,
+            delegate: d.0.delegate,
+            parents: d.0.parents,
+            raw,
         })
     }
 }

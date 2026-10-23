@@ -20,6 +20,19 @@ cors = true
     # database = "sqlite:./data/caps.db"
     # [global.storage.sql]
     # path = "./data/sql"
+    ## Wait bounds before a SQL request answers 503 sql_busy (TC-1274).
+    ## Env: TINYCLOUD_STORAGE__SQL__<NAME>, e.g. TINYCLOUD_STORAGE__SQL__LOCK_WAIT_TIMEOUT_MS
+    # lock_wait_timeout_ms = 30000
+    # hydration_wait_timeout_ms = 30000
+    # artifact_transfer_timeout_ms = 45000
+    # hydration_max_ms = 600000          # a hydration keeps warming after its callers give up
+    ## Schema-changing SQL (CREATE/ALTER/DROP of tables, views and indexes) needs
+    ## tinycloud.sql/schema (TC-1581); tinycloud.sql/write covers data statements.
+    ## "enforce" (default) refuses the statement, "log" runs it and records it
+    ## (a constant warning and a counter by statement kind, no request content),
+    ## "off" restores the earlier rule that write also suffices for those
+    ## statements; the release's other restrictions apply in every mode. See docs/sql-schema-authority.md.
+    # ddl_requires_schema = "enforce"
     # [global.storage.duckdb]
     # path = "./data/duckdb"
 
@@ -42,10 +55,21 @@ cors = true
     # statement_timeout_ms = 30000
     # bulk_statement_timeout_ms = 120000
     # retry_window_ms = 10000
+    ## How long an authorized read waits for its audit record before 503
+    ## read_audit_busy (TC-1317). Its data is never returned without the record.
+    # read_audit_wait_ms = 20000
+
+[global.invocation]
+    ## /invoke deadline (TC-1274): before any write, the request is stopped and
+    ## answered 503 request_timeout. Keep it below the ingress timeout (60 s). 0 = off.
+    ## Env: TINYCLOUD_INVOCATION__DEADLINE_MS
+    # deadline_ms = 55000
 
 [global.keys]
+    # Provision a unique, persistent root before starting this node.
+    # TINYCLOUD_KEYS__SECRET supplies it; Dstack deployments explicitly
+    # select TINYCLOUD_KEYS__TYPE=Dstack instead.
     type = "Static"
-    secret = "U29tZSBsb25nIHBpZWNlIG9mIGVudHJvcHkgd2hpY2ggaXMgYSBzZWNyZXQgYW5kIG1vcmUgdGhhbiAzMiBieXRlcw"
 
 [global.spaces]
 ## Space allow list api endpoint
@@ -61,3 +85,20 @@ cors = true
     ## Rollback: TINYCLOUD_DID_RESOLUTION__NETWORK_METHODS=true, then restart.
     ## Issuer queries remain refused. Opt-in uses the unhardened SSI client (TC-1080).
     # network_methods = false
+
+[global.encryption_network]
+    ## Serve named keys and advertise the `encryption-named-keys-v1` feature in
+    ## GET /info. Only while on are the key routes mounted, key and key-prefix
+    ## resources accepted in delegations and named-key decrypt served on
+    ## POST /invoke. Keep off until named keys are live on OpenKey.
+    ## Env: TINYCLOUD_ENCRYPTION_NETWORK__NAMED_KEYS_V1
+    # named_keys_v1 = false
+
+[global.sql]
+    ## Accept the `tables` / `columns` / `readOnly` caveat form on
+    ## `tinycloud.sql/*` delegations, enforce it from the delegation chain on
+    ## every SQL request, and advertise `sql-delegated-caveats-v1` in GET /info.
+    ## Off = such a delegation is refused as an unsupported caveat and the
+    ## feature is withheld.
+    ## Env: TINYCLOUD_SQL__DELEGATED_CAVEATS_ENFORCED
+    # delegated_caveats_enforced = false

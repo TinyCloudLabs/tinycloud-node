@@ -1,4 +1,7 @@
-use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement, TransactionTrait};
+use sea_orm::{
+    ConnectionTrait, DatabaseConnection, DatabaseTransaction, DbBackend, Statement,
+    TransactionTrait,
+};
 use sea_orm_migration::prelude::*;
 use sea_orm_migration::{IntoSchemaManagerConnection, SchemaManagerConnection};
 pub mod m20230510_101010_init_tables;
@@ -26,10 +29,31 @@ pub mod m20261005_000000_current_kv_sync_order;
 pub mod m20261005_000000_deactivate_hook_subscriptions;
 pub mod m20261007_000000_database_alias;
 pub mod m20261007_010000_database_identity_fence;
+pub mod m20261014_000000_delegation_cid_alias;
 pub mod m20261015_000000_delegation_cursor_index;
-pub mod m20261015_010000_current_kv_prefix_index;
+pub mod m20261017_000000_epoch_order_space_index;
+pub mod m20261018_000000_epoch_head;
+pub mod m20261020_000000_current_kv_key_c_index;
+pub mod m20261021_000000_sql_store_manifest;
+pub mod m20261022_000000_encryption_network_key;
+pub mod m20261023_000000_current_kv_prefix_index;
 
 pub struct Migrator;
+
+/// One PostgreSQL migration batch: a transaction that lifts the pool's
+/// `statement_timeout` (TC-1054) and bounds every lock wait (TC-1176). Both are
+/// `SET LOCAL`, so they end with the transaction.
+async fn begin_postgres_batch(db: &DatabaseConnection) -> Result<DatabaseTransaction, DbErr> {
+    let open = db.begin().await?;
+    open.execute_unprepared(crate::db_pool::EXEMPT_STATEMENT_TIMEOUT)
+        .await?;
+    open.execute_unprepared(&format!(
+        "SET LOCAL lock_timeout = '{}'",
+        crate::db::MIGRATION_LOCK_TIMEOUT
+    ))
+    .await?;
+    Ok(open)
+}
 
 /// SeaORM wraps every PostgreSQL migration batch in a transaction. The
 /// byte-ordered index cannot be built or dropped there: CONCURRENTLY must run
@@ -39,10 +63,7 @@ async fn postgres_migrate(
     steps: Option<u32>,
     rollback: bool,
 ) -> Result<(), DbErr> {
-    let initial = db.begin().await?;
-    initial
-        .execute_unprepared(crate::db_pool::EXEMPT_STATEMENT_TIMEOUT)
-        .await?;
+    let initial = begin_postgres_batch(db).await?;
     Migrator::install(&initial).await?;
     let mut selected = if rollback {
         Migrator::get_applied_migrations(&initial).await?
@@ -66,7 +87,7 @@ async fn postgres_migrate(
         if !selected.iter().any(|name| name == migration.name()) {
             continue;
         }
-        let concurrent = migration.name() == m20261015_010000_current_kv_prefix_index::NAME;
+        let concurrent = migration.name() == m20261023_000000_current_kv_prefix_index::NAME;
         if concurrent {
             if let Some(open) = transaction.take() {
                 open.commit().await?;
@@ -79,10 +100,7 @@ async fn postgres_migrate(
             }
         } else {
             if transaction.is_none() {
-                let open = db.begin().await?;
-                open.execute_unprepared(crate::db_pool::EXEMPT_STATEMENT_TIMEOUT)
-                    .await?;
-                transaction = Some(open);
+                transaction = Some(begin_postgres_batch(db).await?);
             }
             let open = transaction.as_ref().expect("transaction opened above");
             let manager = SchemaManager::new(open);
@@ -93,10 +111,7 @@ async fn postgres_migrate(
             }
         }
         if transaction.is_none() {
-            let open = db.begin().await?;
-            open.execute_unprepared(crate::db_pool::EXEMPT_STATEMENT_TIMEOUT)
-                .await?;
-            transaction = Some(open);
+            transaction = Some(begin_postgres_batch(db).await?);
         }
         let connection: &dyn ConnectionTrait =
             transaction.as_ref().expect("transaction opened above");
@@ -191,8 +206,14 @@ impl MigratorTrait for Migrator {
             Box::new(m20261005_000000_deactivate_hook_subscriptions::Migration),
             Box::new(m20261007_000000_database_alias::Migration),
             Box::new(m20261007_010000_database_identity_fence::Migration),
+            Box::new(m20261014_000000_delegation_cid_alias::Migration),
             Box::new(m20261015_000000_delegation_cursor_index::Migration),
-            Box::new(m20261015_010000_current_kv_prefix_index::Migration),
+            Box::new(m20261017_000000_epoch_order_space_index::Migration),
+            Box::new(m20261018_000000_epoch_head::Migration),
+            Box::new(m20261020_000000_current_kv_key_c_index::Migration),
+            Box::new(m20261021_000000_sql_store_manifest::Migration),
+            Box::new(m20261022_000000_encryption_network_key::Migration),
+            Box::new(m20261023_000000_current_kv_prefix_index::Migration),
         ]
     }
 
@@ -285,7 +306,7 @@ mod release_line_tests {
             return;
         };
         let admin = Database::connect(url.clone()).await.unwrap();
-        let base_count = (Migrator::migrations().len() - 2) as u32;
+        let base_count = (Migrator::migrations().len() - 3) as u32;
         for path in ["fresh", "release"] {
             let schema = format!(
                 "tc780_{path}_{}_{}",
@@ -342,6 +363,7 @@ mod release_line_tests {
                 .collect();
             assert!(versions.contains(&"m20261007_000000_database_alias".to_string()));
             assert!(versions.contains(&"m20261007_010000_database_identity_fence".to_string()));
+            assert!(versions.contains(&"m20261014_000000_delegation_cid_alias".to_string()));
             drop(db);
             admin
                 .execute(Statement::from_string(
@@ -471,6 +493,12 @@ mod release_line_tests {
             .iter()
             .position(|migration| migration.name() == "m20261015_000000_delegation_cursor_index")
             .unwrap() as u32;
+        // Migrations main added after TC-1195 sit between it and TC-737's.
+        let after_737 = migrations
+            .iter()
+            .position(|migration| migration.name() == "m20261023_000000_current_kv_prefix_index")
+            .unwrap() as u32
+            + 1;
         // Older same-timestamp migrations have historical registration order;
         // the new release-line tail must never precede an already applied one.
         for pair in migrations[before_1195 as usize..].windows(2) {
@@ -509,10 +537,11 @@ mod release_line_tests {
             }
             Migrator::up(
                 &db,
-                Some(if prior == "fresh" {
-                    before_1195 + 1 + u32::from(with_737)
-                } else {
-                    1 + u32::from(with_737)
+                Some(match (prior, with_737) {
+                    ("fresh", false) => before_1195 + 1,
+                    ("fresh", true) => after_737,
+                    (_, false) => 1,
+                    (_, true) => after_737 - before_1195,
                 }),
             )
             .await

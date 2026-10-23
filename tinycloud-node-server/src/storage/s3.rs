@@ -1,29 +1,47 @@
-use aws_sdk_s3::{
-    error::{
-        GetObjectAttributesError, GetObjectAttributesErrorKind, GetObjectError, GetObjectErrorKind,
-        HeadObjectError, HeadObjectErrorKind,
-    },
-    types::{ByteStream, SdkError},
-    Client, // Config,
-    Error as S3Error,
+use aws_config::{BehaviorVersion, SdkConfig};
+use aws_sdk_s3::config::{
+    RequestChecksumCalculation, ResponseChecksumValidation, SharedHttpClient,
 };
-use aws_smithy_http::{byte_stream::Error as ByteStreamError, endpoint::Endpoint};
-use aws_types::sdk_config::SdkConfig;
+use aws_sdk_s3::{
+    error::{ProvideErrorMetadata, SdkError},
+    operation::{get_object::GetObjectError, head_object::HeadObjectError},
+    primitives::{ByteStream, ByteStreamError},
+    Client, Error as S3Error,
+};
+use aws_smithy_http_client::tls;
 use futures::{
     future::Either as AsyncEither,
-    stream::{IntoAsyncRead, MapErr, TryStreamExt},
+    stream::{IntoAsyncRead, Stream, TryStreamExt},
 };
 use rocket::{async_trait, http::hyper::Uri};
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DisplayFromStr};
-use std::{collections::HashMap, io::Error as IoError, ops::AddAssign, time::Instant};
+use std::{collections::HashMap, io::Error as IoError, ops::AddAssign, pin::Pin, time::Instant};
 use tinycloud_auth::resource::SpaceId;
 use tinycloud_core::{hash::Hash, storage::*};
+use tokio_util::bytes::Bytes;
 
 use super::{file_system, size::SpaceSizes};
 
+/// Pinned so an SDK bump cannot change client defaults unnoticed.
+pub fn behavior_version() -> BehaviorVersion {
+    BehaviorVersion::v2026_01_12()
+}
+
+/// HTTPS client for the SDK, with rustls on the `ring` provider.
+pub fn http_client() -> SharedHttpClient {
+    aws_smithy_http_client::Builder::new()
+        .tls_provider(tls::Provider::Rustls(
+            tls::rustls_provider::CryptoMode::Ring,
+        ))
+        .build_https()
+}
+
 async fn aws_config() -> SdkConfig {
-    aws_config::from_env().load().await
+    aws_config::defaults(behavior_version())
+        .http_client(http_client())
+        .load()
+        .await
 }
 
 #[derive(Debug, Clone)]
@@ -61,9 +79,19 @@ impl StorageSetup for S3BlockStore {
 
 async fn new_client(config: &S3BlockConfig) -> Client {
     let general_config = aws_config().await;
-    let sdk_config = aws_sdk_s3::config::Builder::from(&general_config);
+    // Checksums only when an operation requires them: the SDK 1.x defaults
+    // (CRC32 trailers, aws-chunked uploads, checksum-mode GETs) are rejected
+    // by some S3-compatible providers and older MinIO, and the pre-1.0 SDK
+    // sent none.
+    let sdk_config = aws_sdk_s3::config::Builder::from(&general_config)
+        .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
+        .response_checksum_validation(ResponseChecksumValidation::WhenRequired);
     let sdk_config = match &config.endpoint {
-        Some(e) => sdk_config.endpoint_resolver(Endpoint::immutable(e.clone())),
+        // A custom endpoint (MinIO etc.) addresses buckets by path, as the
+        // pre-1.0 SDK's immutable endpoint did.
+        Some(e) => sdk_config
+            .endpoint_url(e.to_string())
+            .force_path_style(true),
         None => sdk_config,
     };
     let sdk_config = sdk_config.build();
@@ -73,31 +101,29 @@ async fn new_client(config: &S3BlockConfig) -> Client {
 impl S3BlockStore {
     async fn new_(config: &S3BlockConfig) -> Result<Self, S3Error> {
         let client = new_client(config).await;
-        let sizes = client
+        let mut pages = client
             .list_objects_v2()
             .bucket(&config.bucket)
             .into_paginator()
-            .send()
-            // get the sum of all objects in each page
-            .try_fold(HashMap::new(), |mut acc, page| async move {
-                // get the sum of all objects per space in this particular page
-                for (space, obj_size) in page.contents.into_iter().flatten().filter_map(|content| {
-                    content.key().and_then(|key| {
-                        let (o, _) = key.rsplit_once('/')?;
-                        let space: SpaceId = o.parse().ok()?;
-                        if content.size() > 0 {
-                            Some((space, content.size() as u64))
-                        } else {
-                            None
-                        }
-                    })
-                }) {
-                    acc.entry(space).or_insert(0).add_assign(obj_size);
-                }
-                Ok(acc)
-            })
-            .await?
-            .into();
+            .send();
+        // get the sum of all objects per space across all pages
+        let mut acc: HashMap<SpaceId, u64> = HashMap::new();
+        while let Some(page) = pages.try_next().await.map_err(S3Error::from)? {
+            for content in page.contents() {
+                let Some((space, size)) = content.key().and_then(|key| {
+                    let (o, _) = key.rsplit_once('/')?;
+                    let space: SpaceId = o.parse().ok()?;
+                    match content.size() {
+                        Some(size) if size > 0 => Some((space, size as u64)),
+                        _ => None,
+                    }
+                }) else {
+                    continue;
+                };
+                acc.entry(space).or_insert(0).add_assign(size);
+            }
+        }
+        let sizes = acc.into();
         Ok(S3BlockStore {
             client,
             bucket: config.bucket.clone(),
@@ -119,16 +145,57 @@ impl S3BlockStore {
     async fn decrement_size(&self, space: &SpaceId, size: u64) {
         self.sizes.decrement_size(space, size).await;
     }
+
+    /// The stored size of an object, or `None` if absent. HeadObject, not
+    /// GetObjectAttributes: that call needs an explicit attribute list, and
+    /// S3 (and MinIO) reject it without one.
+    async fn object_size(&self, key: &str) -> Result<Option<u64>, S3StoreError> {
+        match self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(o) => Ok(Some(o.content_length().unwrap_or_default().try_into()?)),
+            Err(SdkError::ServiceError(e)) if matches!(e.err(), HeadObjectError::NotFound(_)) => {
+                Ok(None)
+            }
+            Err(e) => Err(S3Error::from(e).into()),
+        }
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), S3StoreError> {
+        self.client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(S3Error::from)?;
+        Ok(())
+    }
 }
 
-pub fn convert(e: ByteStreamError) -> IoError {
-    e.into()
+/// An object body as a `futures` byte stream (`ByteStream` itself only
+/// offers `try_next`).
+pub type BodyStream = Pin<Box<dyn Stream<Item = Result<Bytes, IoError>> + Send + Sync>>;
+
+pub fn body_stream(body: ByteStream) -> BodyStream {
+    Box::pin(futures::stream::try_unfold(body, |mut body| async move {
+        match body.try_next().await {
+            Ok(Some(chunk)) => Ok(Some((chunk, body))),
+            Ok(None) => Ok(None),
+            Err(e) => Err(IoError::from(e)),
+        }
+    }))
 }
 
 #[derive(thiserror::Error, Debug)]
 pub enum S3StoreError {
     #[error(transparent)]
-    S3(#[from] S3Error),
+    S3(Box<S3Error>),
     #[error(transparent)]
     Io(#[from] IoError),
     #[error(transparent)]
@@ -139,10 +206,16 @@ pub enum S3StoreError {
     InvalidContentRange(String),
 }
 
+impl From<S3Error> for S3StoreError {
+    fn from(e: S3Error) -> Self {
+        Self::S3(Box::new(e))
+    }
+}
+
 #[async_trait]
 impl ImmutableReadStore for S3BlockStore {
     type Error = S3StoreError;
-    type Readable = IntoAsyncRead<MapErr<ByteStream, fn(ByteStreamError) -> IoError>>;
+    type Readable = IntoAsyncRead<BodyStream>;
     async fn contains(&self, space: &SpaceId, id: &Hash) -> Result<bool, Self::Error> {
         match self
             .client
@@ -153,14 +226,9 @@ impl ImmutableReadStore for S3BlockStore {
             .await
         {
             Ok(_) => Ok(true),
-            Err(SdkError::ServiceError {
-                err:
-                    HeadObjectError {
-                        kind: HeadObjectErrorKind::NotFound(_),
-                        ..
-                    },
-                ..
-            }) => Ok(false),
+            Err(SdkError::ServiceError(e)) if matches!(e.err(), HeadObjectError::NotFound(_)) => {
+                Ok(false)
+            }
             Err(e) => Err(S3Error::from(e).into()),
         }
     }
@@ -180,19 +248,12 @@ impl ImmutableReadStore for S3BlockStore {
             .await;
         let result = match res {
             Ok(o) => Ok(Some(Content::new(
-                o.content_length().try_into()?,
-                o.body
-                    .map_err(convert as fn(ByteStreamError) -> IoError)
-                    .into_async_read(),
+                o.content_length().unwrap_or_default().try_into()?,
+                body_stream(o.body).into_async_read(),
             ))),
-            Err(SdkError::ServiceError {
-                err:
-                    GetObjectError {
-                        kind: GetObjectErrorKind::NoSuchKey(_),
-                        ..
-                    },
-                ..
-            }) => Ok(None),
+            Err(SdkError::ServiceError(e)) if matches!(e.err(), GetObjectError::NoSuchKey(_)) => {
+                Ok(None)
+            }
             Err(e) => Err(S3Error::from(e).into()),
         };
         crate::prometheus::observe_stage(
@@ -224,28 +285,17 @@ impl ImmutableReadStore for S3BlockStore {
                     S3StoreError::InvalidContentRange("missing header".to_string())
                 })?;
                 let (range, total_size) = parse_content_range(content_range)?;
-                let content = Content::new(
-                    range.len(),
-                    output
-                        .body
-                        .map_err(convert as fn(ByteStreamError) -> IoError)
-                        .into_async_read(),
-                );
+                let content = Content::new(range.len(), body_stream(output.body).into_async_read());
                 Ok(Some(RangeRead::Content {
                     total_size,
                     range,
                     content,
                 }))
             }
-            Err(SdkError::ServiceError {
-                err:
-                    GetObjectError {
-                        kind: GetObjectErrorKind::NoSuchKey(_),
-                        ..
-                    },
-                ..
-            }) => return Ok(None),
-            Err(SdkError::ServiceError { err, .. }) if err.code() == Some("InvalidRange") => {
+            Err(SdkError::ServiceError(e)) if matches!(e.err(), GetObjectError::NoSuchKey(_)) => {
+                return Ok(None)
+            }
+            Err(SdkError::ServiceError(e)) if e.err().code() == Some("InvalidRange") => {
                 let head = self
                     .client
                     .head_object()
@@ -255,16 +305,13 @@ impl ImmutableReadStore for S3BlockStore {
                     .await;
                 match head {
                     Ok(output) => Ok(Some(RangeRead::Unsatisfiable {
-                        total_size: output.content_length().try_into()?,
+                        total_size: output.content_length().unwrap_or_default().try_into()?,
                     })),
-                    Err(SdkError::ServiceError {
-                        err:
-                            HeadObjectError {
-                                kind: HeadObjectErrorKind::NotFound(_),
-                                ..
-                            },
-                        ..
-                    }) => Ok(None),
+                    Err(SdkError::ServiceError(e))
+                        if matches!(e.err(), HeadObjectError::NotFound(_)) =>
+                    {
+                        Ok(None)
+                    }
                     Err(error) => Err(S3Error::from(error).into()),
                 }
             }
@@ -435,41 +482,13 @@ impl ImmutableWriteStore<either::Either<file_system::TempFileSystemStage, memory
 impl ImmutableDeleteStore for S3BlockStore {
     type Error = S3StoreError;
     async fn remove(&self, space: &SpaceId, id: &Hash) -> Result<Option<()>, Self::Error> {
-        let size: u64 = match self
-            .client
-            .get_object_attributes()
-            .bucket(&self.bucket)
-            .key(self.key(space, id))
-            .send()
-            .await
-        {
-            Ok(o) if !o.delete_marker() => o.object_size().try_into()?,
-            Ok(_) => return Ok(None),
-            Err(SdkError::ServiceError {
-                err:
-                    GetObjectAttributesError {
-                        kind: GetObjectAttributesErrorKind::NoSuchKey(_),
-                        ..
-                    },
-                ..
-            }) => return Ok(None),
-            Err(e) => return Err(S3Error::from(e).into()),
+        let key = self.key(space, id);
+        let Some(size) = self.object_size(&key).await? else {
+            return Ok(None);
         };
-        match self
-            .client
-            .delete_object()
-            .bucket(&self.bucket)
-            .key(self.key(space, id))
-            .send()
-            .await
-        {
-            Ok(_) => {
-                self.decrement_size(space, size).await;
-                Ok(Some(()))
-            }
-            // TODO does this distinguish between object missing and object present?
-            Err(e) => Err(S3Error::from(e).into()),
-        }
+        self.delete(&key).await?;
+        self.decrement_size(space, size).await;
+        Ok(Some(()))
     }
 }
 
@@ -478,6 +497,9 @@ impl StoreSize for S3BlockStore {
     type Error = S3StoreError;
     async fn total_size(&self, space: &SpaceId) -> Result<Option<u64>, Self::Error> {
         Ok(self.sizes.get_size(space).await)
+    }
+    async fn init_size(&self, space: &SpaceId) -> Result<u64, Self::Error> {
+        Ok(self.sizes.init_size(space.clone()).await)
     }
 }
 

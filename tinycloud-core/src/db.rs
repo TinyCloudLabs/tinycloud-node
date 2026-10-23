@@ -20,7 +20,7 @@ use crate::types::{
     DelegationQueryPage, DelegationQueryStatus, DelegationResource, ListFilters, Metadata,
     Resource, SpaceIdWrap,
 };
-use crate::util::{Capability, DelegationInfo, DelegationMode};
+use crate::util::DelegationInfo;
 use sea_orm::{
     entity::prelude::*,
     error::{DbErr, RuntimeErr, SqlxError},
@@ -165,6 +165,8 @@ pub struct SpaceDatabase<C, B, S> {
     secrets: S,
     encryption: Option<ColumnEncryption>,
     sql_sizes: SqlSizes,
+    delegated_sql_caveats: bool,
+    named_keys: bool,
     revocation_chain_locks: ChainLockRegistry,
     kv_object_locks: KvObjectLockRegistry,
     space_sequence_locks: SpaceSequenceLockRegistry,
@@ -258,6 +260,10 @@ pub enum TxError<S: StorageSetup, K: Secrets> {
     Encryption(#[from] crate::encryption::EncryptionError),
     #[error("delegation-chain-traversal-limit-exceeded")]
     ChainTraversalLimitExceeded,
+    /// The read's audit record was not confirmed; its data was not returned
+    /// (TC-1317).
+    #[error(transparent)]
+    ReadAudit(#[from] crate::read_audit::ReadAuditError),
 }
 
 #[non_exhaustive]
@@ -319,22 +325,83 @@ where
     }
 }
 
-/// Apply schema migrations on `pool`. The migrator keeps ordinary PostgreSQL
-/// migrations transactional with an exempt statement timeout, but commits
-/// before the concurrent current_kv index build and resumes afterward.
+/// How long a boot migration on PostgreSQL waits for any one lock before it
+/// fails (TC-1176). Schema changes need strong table locks, which queue
+/// behind any open transaction on the table and, while queued, block every
+/// later query on it. Deploys run with the writer stopped, so a legitimate
+/// holder is a short transaction that 30s outlasts; a stuck session fails
+/// the boot with a clear error instead of hanging it. This bounds each lock
+/// wait, not how long a migration runs.
+pub(crate) const MIGRATION_LOCK_TIMEOUT: &str = "30s";
+
+/// Apply the schema migrations on `pool`.
+///
+/// On PostgreSQL the migrator in [`crate::migrations`] runs ordinary
+/// migrations inside transactions that first lift the pool's
+/// `statement_timeout` (TC-1054), since a migration or its backfill may
+/// legitimately run for minutes, and bound every lock wait with
+/// `lock_timeout` ([`MIGRATION_LOCK_TIMEOUT`]). Both are `SET LOCAL`, so they
+/// end with the transaction and never reach the pooled session. It commits
+/// before the concurrent `current_kv` index build (TC-737) and resumes
+/// afterward. A lock-wait failure rolls back the batch it was in, records
+/// none of it, and is reported as a [`DbErr::Migration`].
 pub async fn migrate(pool: &RecoveringConnection) -> Result<(), DbErr> {
-    Migrator::up(pool.sea_orm_connection(), None).await
+    Migrator::up(pool.sea_orm_connection(), None)
+        .await
+        .map_err(migration_lock_wait_error)
+}
+
+/// Name a migration's lock-wait failure (SQLSTATE 55P03, which
+/// `lock_timeout` raises) so the boot error says what to fix. sea-orm-migration
+/// returns the failing statement's error without the migration's name; its
+/// `Applying migration` log line names it. Other errors pass through unchanged.
+fn migration_lock_wait_error(error: DbErr) -> DbErr {
+    let (DbErr::Conn(RuntimeErr::SqlxError(SqlxError::Database(database)))
+    | DbErr::Exec(RuntimeErr::SqlxError(SqlxError::Database(database)))
+    | DbErr::Query(RuntimeErr::SqlxError(SqlxError::Database(database)))) = &error
+    else {
+        return error;
+    };
+    if database.code().as_deref() != Some("55P03") {
+        return error;
+    }
+    DbErr::Migration(format!(
+        "a migration gave up after waiting {MIGRATION_LOCK_TIMEOUT} (lock_timeout) for a table \
+         lock; another session holds a conflicting lock (SQLSTATE 55P03: {database}). Nothing \
+         was applied; end that session and restart."
+    ))
 }
 
 impl<C, B, K> SpaceDatabase<C, B, K>
 where
     C: ConnectionTrait + Clone + Into<RecoveringConnection>,
 {
+    /// Open an unencrypted delegation database and complete historical CID
+    /// indexing before accepting requests.
     pub async fn new(conn: C, storage: B, secrets: K) -> Result<Self, DbErr> {
+        Self::new_with_encryption(conn, storage, secrets, None).await
+    }
+
+    /// Open a database with its column encryption key available before the
+    /// historical CID backfill. Missing/wrong keys or undecodable history fail
+    /// startup; signed records and proof edges are never rewritten.
+    pub async fn new_with_encryption(
+        conn: C,
+        storage: B,
+        secrets: K,
+        encryption: Option<ColumnEncryption>,
+    ) -> Result<Self, DbErr> {
         let pool: RecoveringConnection = conn.clone().into();
         // sea-orm-migration's schema manager accepts only the raw sea-orm
         // connection. Migrations run once at boot, before any request.
         migrate(&pool).await?;
+        let tx = begin_write_transaction(&pool, None).await?;
+        if pool.get_database_backend() == DbBackend::Postgres {
+            tx.execute_unprepared(crate::db_pool::EXEMPT_STATEMENT_TIMEOUT)
+                .await?;
+        }
+        delegation_cid_alias::backfill(&tx, encryption.as_ref()).await?;
+        tx.commit().await?;
         let writer_lock = (pool.get_database_backend() == sea_orm::DatabaseBackend::Sqlite)
             .then(|| Arc::new(tokio::sync::Mutex::new(())));
         let read_audit = ReadAuditPipeline::start(pool, writer_lock.clone());
@@ -342,8 +409,10 @@ where
             conn,
             storage,
             secrets,
-            encryption: None,
+            encryption,
             sql_sizes: SqlSizes::default(),
+            delegated_sql_caveats: false,
+            named_keys: false,
             revocation_chain_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             kv_object_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             space_sequence_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -355,8 +424,19 @@ where
         })
     }
 
-    pub fn with_encryption(mut self, encryption: Option<ColumnEncryption>) -> Self {
-        self.encryption = encryption;
+    /// Admit the delegated `tables` / `columns` / `readOnly` caveat form on
+    /// `tinycloud.sql/*` abilities (TC-1791). Off by default: such a
+    /// delegation is refused as an unsupported caveat.
+    pub fn with_delegated_sql_caveats(mut self, enabled: bool) -> Self {
+        self.delegated_sql_caveats = enabled;
+        self
+    }
+
+    /// Serve named-key resources (keys and key prefixes): delegations that
+    /// grant on them are admitted. Off by default: such a delegation is
+    /// refused with `named_keys_unavailable`.
+    pub fn with_named_keys(mut self, enabled: bool) -> Self {
+        self.named_keys = enabled;
         self
     }
 
@@ -386,9 +466,20 @@ impl<C, B, K> SpaceDatabase<C, B, K>
 where
     K: Secrets,
 {
-    /// Number of durable read-audit records and group commits completed.
-    pub fn read_audit_commit_stats(&self) -> (u64, u64) {
-        self.read_audit.stats()
+    /// Counts and ages of the read-audit pipeline, for metrics and logs.
+    pub fn read_audit_health(&self) -> crate::read_audit::ReadAuditHealth {
+        self.read_audit.health()
+    }
+
+    /// Bound how long a read waits for its audit record (TC-1317). Takes
+    /// effect for waits that start afterwards.
+    pub fn set_read_audit_wait(&self, wait: std::time::Duration) {
+        self.read_audit.set_wait(wait);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_audit_pipeline(&self) -> &crate::read_audit::ReadAuditPipeline {
+        &self.read_audit
     }
 
     pub async fn stage_key(&self, space_id: &SpaceId) -> Result<String, K::Error> {
@@ -471,6 +562,44 @@ where
     pub async fn begin_graph_transaction(&self) -> Result<DatabaseTransaction, DbErr> {
         begin_write_transaction(&self.conn, chain_isolation_level(&self.conn)).await
     }
+
+    /// TC-1274 backfill: up to `limit` space IDs after `after`, in ID order.
+    pub async fn epoch_head_backfill_page(
+        &self,
+        after: Option<&SpaceId>,
+        limit: u64,
+    ) -> Result<Vec<SpaceId>, DbErr> {
+        let mut query = space::Entity::find().order_by_asc(space::Column::Id);
+        if let Some(after) = after {
+            query = query.filter(space::Column::Id.gt(SpaceIdWrap(after.clone())));
+        }
+        Ok(query
+            .limit(limit)
+            .all(&self.conn)
+            .await?
+            .into_iter()
+            .map(|space| space.id.0)
+            .collect())
+    }
+
+    /// TC-1274 backfill of one space: rewrite its cached head epochs from
+    /// history unless they are provably current. Takes the space's sequence
+    /// locks as a write does, so it serializes with that space's writers and
+    /// holds no other space. Returns whether it rewrote the cache.
+    pub async fn repair_epoch_heads(&self, space: &SpaceId) -> Result<bool, DbErr> {
+        let _sequence = self
+            .acquire_space_sequence_guards(std::slice::from_ref(space))
+            .await;
+        let _writer = match &self.writer_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+        let tx = self.begin_graph_transaction().await?;
+        crate::kv_sync::lock_space_sequences(&tx, [space]).await?;
+        let repaired = crate::epoch_head::repair(&tx, &SpaceIdWrap(space.clone())).await?;
+        tx.commit().await?;
+        Ok(repaired)
+    }
 }
 
 impl<C, B, K> SpaceDatabase<C, B, K>
@@ -530,7 +659,13 @@ where
         invocation: &crate::util::InvocationInfo,
         now: OffsetDateTime,
     ) -> Result<(), crate::models::invocation::Error> {
-        invocation::verify_and_authorize(&self.conn, invocation, now).await
+        invocation::verify_and_authorize_with_setting(
+            &self.conn,
+            invocation,
+            now,
+            self.delegated_sql_caveats,
+        )
+        .await
     }
 
     /// [`Self::authorize_invocation`] for an invocation whose signature and
@@ -542,7 +677,14 @@ where
         invocation: &crate::AdmittedInvocation,
         now: OffsetDateTime,
     ) -> Result<(), crate::models::invocation::Error> {
-        invocation::authorize_admitted(&self.conn, &invocation.invocation().0, now, None).await
+        invocation::authorize_admitted(
+            &self.conn,
+            &invocation.invocation().0,
+            now,
+            None,
+            self.delegated_sql_caveats,
+        )
+        .await
     }
 
     /// Check the persisted revocation state for cited delegations and every
@@ -579,10 +721,7 @@ where
         };
         let bytes = crate::encryption::maybe_decrypt(self.encryption.as_ref(), &row.serialization)
             .map_err(|error| error.to_string())?;
-        let delegation =
-            TinyCloudDelegation::from_bytes(&bytes).map_err(|error| error.to_string())?;
-        let info = DelegationInfo::try_from(delegation).map_err(|error| error.to_string())?;
-        let event = SerializedEvent(info, bytes);
+        let event = decode_stored_delegation(bytes).map_err(|error| error.to_string())?;
         if event.content_hash() != row.id || event.content_hash() != Hash::from(cid) {
             return Err("delegation-signed-bytes-mismatch".to_string());
         }
@@ -601,6 +740,13 @@ where
             .collect())
     }
 
+    /// The distinct owner addresses that hold data beyond the automatic
+    /// `account` space (TC-1482), from a single aggregate statement. See
+    /// [`crate::data_owners`] for exactly what is counted.
+    pub async fn data_owners(&self) -> Result<Vec<String>, crate::data_owners::DataOwnersError> {
+        crate::data_owners::collect(&self.conn).await
+    }
+
     /// Return lifecycle-complete delegations related to the authenticated account.
     ///
     /// The account is derived from the verified invocation signer and its one
@@ -611,9 +757,14 @@ where
         query: &DelegationQuery,
     ) -> Result<DelegationQueryPage, AccountDelegationQueryError> {
         let now = OffsetDateTime::now_utc();
-        invocation::verify_and_authorize(&self.conn, invocation, now)
-            .await
-            .map_err(|_| AccountDelegationQueryError::Unauthorized)?;
+        invocation::verify_and_authorize_with_setting(
+            &self.conn,
+            invocation,
+            now,
+            self.delegated_sql_caveats,
+        )
+        .await
+        .map_err(|_| AccountDelegationQueryError::Unauthorized)?;
         let principal = account_query_principal(&self.conn, invocation)
             .await?
             .ok_or(AccountDelegationQueryError::Unauthorized)?;
@@ -1170,6 +1321,73 @@ where
 impl<C, B, K> SpaceDatabase<C, B, K>
 where
     C: ConnectionTrait,
+    B: StoreSize,
+{
+    /// [`Self::store_size`] for the write path (TC-1578). The block store only
+    /// tracks spaces it was told about this process lifetime, and an S3 store
+    /// rebuilds its map at boot from objects with bytes, so a hosted space
+    /// with no blocks is absent from it after a restart. When the block store
+    /// has no entry, the `space` table decides: a hosted space gets a zero
+    /// entry (an existing entry is never reset or lowered) and is metered
+    /// from there; only a space absent from the table reports `None`, the
+    /// "space not found" case. SQL/DuckDB bytes stay in `SqlSizes` and are
+    /// added as in `store_size`, never duplicated into the block store.
+    pub async fn store_size_or_init(
+        &self,
+        space_id: &SpaceId,
+    ) -> Result<Option<u64>, EitherError<DbErr, B::Error>> {
+        let blocks = match self
+            .storage
+            .total_size(space_id)
+            .await
+            .map_err(EitherError::B)?
+        {
+            Some(blocks) => Some(blocks),
+            None => {
+                let hosted = space::Entity::find_by_id(SpaceIdWrap(space_id.clone()))
+                    .one(&self.conn)
+                    .await
+                    .map_err(EitherError::A)?
+                    .is_some();
+                if hosted {
+                    Some(
+                        self.storage
+                            .init_size(space_id)
+                            .await
+                            .map_err(EitherError::B)?,
+                    )
+                } else {
+                    None
+                }
+            }
+        };
+        let sql = self.sql_sizes.space_total(space_id).await;
+        Ok(match (blocks, sql) {
+            (None, 0) => None,
+            (blocks, sql) => Some(blocks.unwrap_or(0) + sql),
+        })
+    }
+
+    /// Boot seed (TC-1578): give every space in the `space` table a block-size
+    /// entry, so a hosted space that has no blocks is metered and writable
+    /// after a restart. Entries the store already has (S3/filesystem bytes)
+    /// are kept as they are. Returns the number of spaces in the table. Call
+    /// after migrations, before serving.
+    pub async fn seed_store_sizes(&self) -> Result<usize, EitherError<DbErr, B::Error>> {
+        let spaces = self.list_space_ids().await.map_err(EitherError::A)?;
+        for space_id in &spaces {
+            self.storage
+                .init_size(space_id)
+                .await
+                .map_err(EitherError::B)?;
+        }
+        Ok(spaces.len())
+    }
+}
+
+impl<C, B, K> SpaceDatabase<C, B, K>
+where
+    C: ConnectionTrait,
     B: ImmutableReadStore,
 {
     pub async fn public_kv_get(
@@ -1279,7 +1497,7 @@ where
         &self,
         roots: &[Hash],
     ) -> Result<Vec<ExclusiveChainGuard>, TxError<B, K>> {
-        let keys = revocation::ancestor_chain_ids_for_roots(&self.conn, roots)
+        let keys = crate::auth_graph::load_chain_lock_ids(&self.conn, roots)
             .await
             .map_err(|error| match error {
                 revocation::ChainTraversalError::Db(error) => TxError::Db(error),
@@ -1288,6 +1506,25 @@ where
                 }
             })?;
         Ok(self.acquire_exclusive_chain_guards_for_keys(keys).await)
+    }
+
+    /// Hold shared guards for the canonical ancestor identities of `roots`.
+    ///
+    /// These coordinate admission with delegation/revocation writers using
+    /// this database and its clones. Acquire before space-sequence guards or
+    /// SQL transactions, and retain through commit or rollback. Callers must
+    /// still recheck effective revocation inside their admission transaction.
+    pub async fn guard_delegation_chains(
+        &self,
+        roots: &[Hash],
+    ) -> Result<Vec<SharedChainGuard>, DbErr> {
+        let keys = crate::auth_graph::load_chain_lock_ids(&self.conn, roots)
+            .await
+            .map_err(|error| match error {
+                revocation::ChainTraversalError::Db(error) => error,
+                error => DbErr::Custom(error.to_string()),
+            })?;
+        Ok(self.acquire_shared_chain_guards_for_keys(keys).await)
     }
 
     /// Resolve `keys` to their per-delegation locks in a stable global order.
@@ -1439,6 +1676,8 @@ where
             self.encryption.as_ref(),
             None,
             &[],
+            self.delegated_sql_caveats,
+            self.named_keys,
         )
         .await?;
 
@@ -1661,7 +1900,13 @@ where
             .one(&self.conn)
             .await
         {
-            Ok(Some(_)) => return Ok(already_registered_result(retained_hash)),
+            Ok(Some(_)) => {
+                // The content-addressed row authenticates these exact signed bytes.
+                for space in delegation.0.spaces() {
+                    crate::request_telemetry::observe_space(space);
+                }
+                return Ok(already_registered_result(retained_hash));
+            }
             Ok(None) => {}
             Err(e) => return Err(TxError::Db(e)),
         }
@@ -1723,6 +1968,8 @@ where
             self.encryption.as_ref(),
             None,
             &[],
+            self.delegated_sql_caveats,
+            self.named_keys,
         )
         .await
     }
@@ -1751,18 +1998,20 @@ where
         if proofs.len() > 1 {
             return Ok(None);
         }
-        let Some(delegation) = delegation::Entity::find_by_id(target)
-            .one(&self.conn)
-            .await?
-        else {
+        // A canonical CID may name a historical stored row; the requested CID
+        // keeps its own authority scope, the stored row supplies the grant.
+        let Some(delegation) = revocation::target_for_cid(&self.conn, target).await? else {
             return Ok(None);
         };
         let abilities = abilities::Entity::find()
-            .filter(abilities::Column::Delegation.eq(target))
+            .filter(abilities::Column::Delegation.eq(delegation.id))
             .all(&self.conn)
             .await?;
 
         let mut roots = vec![target];
+        if delegation.id != target {
+            roots.push(delegation.id);
+        }
         roots.extend(proofs.iter().copied().map(Hash::from));
         let _chain_guards = match self.acquire_chain_guards(&roots).await {
             Ok(guards) => guards,
@@ -1772,28 +2021,30 @@ where
             Err(error) => return Err(error),
         };
 
-        let principal = match revocation::control_proof_decision(
+        let authorized = match revocation::control_proof_decision(
             &self.conn,
             invoker,
             proofs,
-            "tinycloud.delegation/status",
+            revocation::ControlAction::Status,
             &target,
         )
         .await?
         {
-            revocation::ControlProofDecision::DirectSigner(principal)
-            | revocation::ControlProofDecision::PersistentPrincipal(principal) => principal,
-            revocation::ControlProofDecision::Denied => return Ok(None),
+            revocation::ControlProofDecision::DirectSigner(principal) => {
+                revocation::ControlAction::Status.party_may_act(&delegation, &principal)
+                    || abilities.iter().any(|ability| {
+                        ability
+                            .resource
+                            .space()
+                            .map(|space| did_principal_matches(space.did().as_str(), &principal))
+                            .unwrap_or(false)
+                    })
+            }
+            revocation::ControlProofDecision::Scoped(control) => {
+                control.authorizes_target(&target, &delegation, &abilities)
+            }
+            revocation::ControlProofDecision::Denied => false,
         };
-        let authorized = did_principal_matches(&delegation.delegator, &principal)
-            || did_principal_matches(&delegation.delegatee, &principal)
-            || abilities.iter().any(|ability| {
-                ability
-                    .resource
-                    .space()
-                    .map(|space| did_principal_matches(space.did().as_str(), &principal))
-                    .unwrap_or(false)
-            });
         if !authorized {
             return Ok(None);
         }
@@ -1801,7 +2052,7 @@ where
         if revocation::is_revoked(&self.conn, &target).await? {
             return Ok(Some(DelegationStatus::Revoked));
         }
-        match revocation::first_revoked_ancestor(&self.conn, &target).await {
+        match revocation::first_revoked_ancestor(&self.conn, &delegation.id).await {
             Ok(Some(_)) => return Ok(Some(DelegationStatus::Revoked)),
             Ok(None) => {}
             Err(revocation::ChainTraversalError::LimitExceeded) => {
@@ -1967,9 +2218,8 @@ where
         );
         let authz_start = Instant::now();
         let closure_start = Instant::now();
-        let lock_keys = crate::auth_graph::load_closure_edges(&self.conn, &guard_roots)
+        let lock_keys = crate::auth_graph::load_chain_lock_ids(&self.conn, &guard_roots)
             .await
-            .map(|(keys, _)| keys)
             .map_err(|error| match error {
                 revocation::ChainTraversalError::Db(error) => TxError::Db(error),
                 revocation::ChainTraversalError::LimitExceeded => {
@@ -2085,6 +2335,12 @@ where
             Some(lock) => Some(lock.lock().await),
             None => None,
         };
+        // TC-1274: the write transaction begins here, so the request deadline
+        // may no longer cut this request; it completes and reports its outcome.
+        // The handler task is never polled after a cut, so this is not
+        // refused here.
+        let latched = crate::request_cancel::latch();
+        debug_assert!(latched, "a cut handler is not polled again");
         let begin_start = Instant::now();
         let tx_result = self.begin_graph_transaction().await;
         crate::telemetry::observe_stage(
@@ -2188,6 +2444,8 @@ where
             Some(&auth_graph),
             // Taken on this `tx` right after BEGIN, above.
             &sequence_spaces,
+            self.delegated_sql_caveats,
+            self.named_keys,
         )
         .await?;
 
@@ -2366,17 +2624,22 @@ where
         // signed-time validity here rather than verifying the signature a
         // second time.
         match mode {
-            InvokeMode::Admitted => {
-                invocation::authorize_admitted(&self.conn, &invocation.0, now, sync_graph.as_ref())
-                    .await
-                    .map_err(TxError::<B, K>::from)?
-            }
+            InvokeMode::Admitted => invocation::authorize_admitted(
+                &self.conn,
+                &invocation.0,
+                now,
+                sync_graph.as_ref(),
+                self.delegated_sql_caveats,
+            )
+            .await
+            .map_err(TxError::<B, K>::from)?,
             InvokeMode::Public | InvokeMode::Internal | InvokeMode::MeetingPublication => {
                 invocation::verify_and_authorize_with_graph(
                     &self.conn,
                     &invocation.0,
                     now,
                     sync_graph.as_ref(),
+                    self.delegated_sql_caveats,
                 )
                 .await
                 .map_err(TxError::<B, K>::from)?
@@ -2466,29 +2729,40 @@ where
                 })
             });
         let mut results = sync_outcome.into_iter().collect::<Vec<_>>();
-        for cap in invocation.0.capabilities.iter().filter_map(|capability| {
-            capability
-                .resource
-                .tinycloud_resource()
-                .and_then(|resource| {
-                    Some((
-                        resource.space(),
-                        resource.service().as_str(),
-                        crate::policy_capability::resolve_alias(
-                            capability.ability.as_ref().as_ref(),
-                        ),
-                        resource.path()?,
-                    ))
-                })
-        }) {
+        let caps = invocation
+            .0
+            .capabilities
+            .iter()
+            .filter_map(|capability| {
+                capability
+                    .resource
+                    .tinycloud_resource()
+                    .and_then(|resource| {
+                        Some((
+                            resource.space(),
+                            resource.service().as_str(),
+                            crate::policy_capability::resolve_alias(
+                                capability.ability.as_ref().as_ref(),
+                            ),
+                            resource.path()?,
+                        ))
+                    })
+            })
+            .collect::<Vec<_>>();
+        let mut kv_lookup = KvReadLookup::fetch(&self.conn, &caps).await;
+        for cap in caps {
             match cap {
                 (space, "kv", "tinycloud.kv/get", path) => {
-                    let data = get_kv(&self.conn, &self.storage, space, path)
+                    let data = match kv_lookup
+                        .entity(&self.conn, space, path)
                         .await
-                        .map_err(|error| match error {
-                            EitherError::A(error) => TxStoreError::Tx(error.into()),
-                            EitherError::B(error) => TxStoreError::StoreRead(error),
-                        })?;
+                        .map_err(|error| TxStoreError::Tx(error.into()))?
+                    {
+                        Some(entry) => read_kv_entity(&self.storage, space, entry)
+                            .await
+                            .map_err(TxStoreError::StoreRead)?,
+                        None => None,
+                    };
                     if let (Some(limit), Some((_, _, content))) =
                         (options.max_response_bytes, data.as_ref())
                     {
@@ -2514,7 +2788,10 @@ where
                 }
                 (space, "kv", "tinycloud.kv/metadata", path) => {
                     results.push(InvocationOutcome::KvMetadata(
-                        metadata_with_hash(&self.conn, space, path).await?,
+                        kv_lookup
+                            .entity(&self.conn, space, path)
+                            .await?
+                            .map(|entry| (entry.metadata, entry.value)),
                     ));
                 }
                 (space, "capabilities", "tinycloud.capabilities/read", path)
@@ -2564,7 +2841,7 @@ where
             crate::telemetry::StageOutcome::from(record_result.is_ok()),
             read_audit_start.elapsed(),
         );
-        record_result?;
+        record_result.map_err(TxError::<B, K>::from)?;
         Ok((
             TransactResult {
                 commits: HashMap::new(),
@@ -2867,9 +3144,9 @@ pub enum InvocationOutcome<R> {
     KvBatchWrite(Vec<Path>),
     KvBatchRead(Vec<KvBatchReadItem>),
     KvRead(Option<(Metadata, Hash, Content<R>)>),
-    OpenSessions(HashMap<Hash, DelegationInfo>),
-    /// Ordered delegation chain from leaf to root
-    DelegationChain(Vec<DelegationInfo>),
+    OpenSessions(HashMap<Hash, Delegation>),
+    /// Ordered delegation chain from leaf to root, retaining exact signed bytes.
+    DelegationChain(Vec<Delegation>),
     SqlResult(serde_json::Value),
     SqlExport(Vec<u8>),
     DuckDbResult(serde_json::Value),
@@ -2940,8 +3217,12 @@ async fn sequence_spaces<C: ConnectionTrait>(
         }
     }
     if !revoked.is_empty() {
+        let mut stored = Vec::with_capacity(revoked.len());
+        for target in revoked {
+            stored.push(stored_revocation_target(db, target).await?);
+        }
         for row in event_order::Entity::find()
-            .filter(event_order::Column::Event.is_in(revoked))
+            .filter(event_order::Column::Event.is_in(stored))
             .all(db)
             .await?
         {
@@ -2951,19 +3232,29 @@ async fn sequence_spaces<C: ConnectionTrait>(
     Ok(spaces.into_iter().collect())
 }
 
+/// The stored delegation a revocation's signed target names: the target itself,
+/// or the stored historical encoding a canonical CID resolves to. `event_order`
+/// records the stored row, so the revocation is sequenced in its spaces.
+async fn stored_revocation_target<C: ConnectionTrait>(db: &C, target: Hash) -> Result<Hash, DbErr> {
+    Ok(revocation::target_for_cid(db, target)
+        .await?
+        .map(|delegation| delegation.id)
+        .unwrap_or(target))
+}
+
 async fn event_spaces<'a, C: ConnectionTrait>(
     db: &C,
     ev: &'a [(Hash, Event)],
 ) -> Result<HashMap<SpaceId, Vec<&'a (Hash, Event)>>, DbErr> {
     // get orderings of events listed as revoked by events in the ev list
     let mut spaces = HashMap::<SpaceId, Vec<&'a (Hash, Event)>>::new();
-    let revoked = ev
-        .iter()
-        .filter_map(|(_, e)| match e {
-            Event::Revocation(r) => Some(Hash::from(r.0.revoked)),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
+    let mut revoked = Vec::new();
+    for (_, e) in ev {
+        if let Event::Revocation(r) = e {
+            let signed = Hash::from(r.0.revoked);
+            revoked.push((signed, stored_revocation_target(db, signed).await?));
+        }
+    }
     // TC-732: `transact` now calls this before any write. Issue no read when
     // there is nothing to look up: on SQLite a read that opens the
     // transaction's snapshot ahead of its first write turns a concurrent
@@ -2972,7 +3263,7 @@ async fn event_spaces<'a, C: ConnectionTrait>(
         Vec::new()
     } else {
         event_order::Entity::find()
-            .filter(event_order::Column::Event.is_in(revoked))
+            .filter(event_order::Column::Event.is_in(revoked.iter().map(|(_, stored)| *stored)))
             .all(db)
             .await?
     };
@@ -3011,9 +3302,13 @@ async fn event_spaces<'a, C: ConnectionTrait>(
                 }
             }
             Event::Revocation(r) => {
-                let r_hash = Hash::from(r.0.revoked);
+                let signed = Hash::from(r.0.revoked);
+                let Some(&(_, stored)) = revoked.iter().find(|(target, _)| *target == signed)
+                else {
+                    continue;
+                };
                 for revoked in &revoked_events {
-                    if r_hash == revoked.event {
+                    if stored == revoked.event {
                         let entry = spaces.entry(revoked.space.0.clone()).or_default();
                         if !entry.iter().any(|(h, _)| h == &e.0) {
                             entry.push(e);
@@ -3029,6 +3324,7 @@ async fn event_spaces<'a, C: ConnectionTrait>(
 /// `sequence_locks_held` lists the spaces whose sequence lock the caller has
 /// already taken on `db` (this same transaction) with
 /// `kv_sync::lock_space_sequences`; `&[]` when it has taken none.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
     db: &C,
     store_setup: &S,
@@ -3037,6 +3333,8 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
     encryption: Option<&ColumnEncryption>,
     auth_graph: Option<&crate::auth_graph::AuthGraphSnapshot>,
     sequence_locks_held: &[SpaceId],
+    delegated_sql_caveats: bool,
+    named_keys: bool,
 ) -> Result<TransactResult, TxError<S, K>> {
     // for each event, get the hash and the relevent space(s)
     let event_hashes = events
@@ -3061,7 +3359,9 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
     let mut registered: HashMap<Hash, delegation::DelegationRegistration> = HashMap::new();
     for (hash, event) in &event_hashes {
         if let Event::Delegation(d) = event {
-            let reg = delegation::process(db, d, encryption).await?;
+            let reg =
+                delegation::process_with(db, d, encryption, delegated_sql_caveats, named_keys)
+                    .await?;
             registered.insert(*hash, reg);
         }
     }
@@ -3250,34 +3550,18 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
             }
         }
 
-        // get 'most recent' epochs for each of the spaces
-        let mut most_recent = epoch::Entity::find()
-            .select_only()
-            .left_join(epoch_order::Entity)
-            .filter(
-                Condition::all()
-                    .add(epoch::Column::Space.is_in(event_spaces.keys().cloned().map(SpaceIdWrap)))
-                    .add(epoch_order::Column::Child.is_null()),
-            )
-            .column(epoch::Column::Space)
-            .column(epoch::Column::Id)
-            .into_tuple::<(SpaceIdWrap, Hash)>()
-            .all(db)
-            .await?
-            .into_iter()
-            .fold(
-                HashMap::new(),
-                |mut m: HashMap<SpaceIdWrap, Vec<Hash>>, (space, epoch)| {
-                    m.entry(space).or_default().push(epoch);
-                    m
-                },
-            );
+        // The current heads of each space (TC-1274): O(#heads) from the
+        // `epoch_head` cache, falling back to history only for a space whose
+        // cache is not provably current. The sequence locks taken above are
+        // held to commit.
+        let head_spaces: Vec<SpaceIdWrap> = event_spaces.keys().cloned().map(SpaceIdWrap).collect();
+        let mut heads = crate::epoch_head::current(db, &head_spaces, &max_seqs).await?;
 
         // get all the orderings and associated data
         let (epoch_order, space_order, event_order, epochs) = event_spaces
             .into_iter()
             .map(|(space, events)| {
-                let parents = most_recent.remove(&space).unwrap_or_default();
+                let parents = heads.parents.remove(&space).unwrap_or_default();
                 let epoch = epoch_hash(&space, &events, &parents)?;
                 let seq = max_seqs.remove(&space).unwrap_or(0);
                 Ok((space, (epoch, events, seq, parents)))
@@ -3348,20 +3632,25 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
             .exec(db)
             .await
             .map_err(|e| {
-                if let DbErr::Exec(RuntimeErr::SqlxError(SqlxError::Database(db_err))) = &e {
-                    tracing::error!(
-                        error = %e,
-                        db_error = %db_err,
-                        db_error_code = ?db_err.code(),
-                        db_error_kind = ?db_err.kind(),
-                        "epoch insert failed with database error after space pre-check; \
-                         treating as integrity error"
-                    );
-                } else {
-                    tracing::error!(error = %e, "epoch insert failed");
-                }
+                tracing::error!(
+                    operation = "epoch_insert",
+                    error_class = "database",
+                    "epoch insert failed"
+                );
                 TxError::EpochInsert(e)
             })?;
+
+        // Each space's only head is now the epoch just appended: its parents
+        // were all of the previous heads.
+        crate::epoch_head::advance(
+            db,
+            &heads,
+            space_order
+                .iter()
+                .map(|(space, (seq, epoch, _, _))| (SpaceIdWrap(space.clone()), *epoch, *seq))
+                .collect(),
+        )
+        .await?;
 
         // save epoch orderings
         if !epoch_order.is_empty() {
@@ -3400,6 +3689,7 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                             .collect(),
                         encryption,
                         auth_graph,
+                        delegated_sql_caveats,
                     )
                     .await?;
                 }
@@ -3435,11 +3725,17 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                             .collect(),
                         encryption,
                         auth_graph,
+                        delegated_sql_caveats,
                     )
                     .await?;
                 }
                 Event::Revocation(r) => {
                     revocation::process(db, *r).await?;
+                    for (space, (_, _, _, hashes)) in &space_order {
+                        if hashes.contains_key(&hash) {
+                            crate::request_telemetry::observe_space(space);
+                        }
+                    }
                 }
             };
         }
@@ -3485,14 +3781,29 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                     }
                 }
                 Event::Invocation(i, _ops) => {
-                    invocation::process(db, *i, Vec::new(), encryption, auth_graph).await?;
+                    invocation::process(
+                        db,
+                        *i,
+                        Vec::new(),
+                        encryption,
+                        auth_graph,
+                        delegated_sql_caveats,
+                    )
+                    .await?;
                 }
                 Event::InternalInvocation(i, _ops) => {
                     invocation::process_internal(db, *i, Vec::new(), encryption).await?;
                 }
                 Event::AdmittedInvocation(i, _ops) => {
-                    invocation::process_admitted(db, *i, Vec::new(), encryption, auth_graph)
-                        .await?;
+                    invocation::process_admitted(
+                        db,
+                        *i,
+                        Vec::new(),
+                        encryption,
+                        auth_graph,
+                        delegated_sql_caveats,
+                    )
+                    .await?;
                 }
                 Event::Revocation(r) => {
                     revocation::process(db, *r).await?;
@@ -3842,12 +4153,20 @@ async fn get_kv<C: ConnectionTrait, B: ImmutableReadStore>(
         Some(entry) => entry,
         None => return Ok(None),
     };
-    let content_hash = e.value;
-    let c = match store
-        .read(space_id, &content_hash)
+    read_kv_entity(store, space_id, e)
         .await
-        .map_err(EitherError::B)?
-    {
+        .map_err(EitherError::B)
+}
+
+/// The stored content of a live `current_kv` row; `None` when the block is
+/// missing from the store.
+async fn read_kv_entity<B: ImmutableReadStore>(
+    store: &B,
+    space_id: &SpaceId,
+    e: current_kv::Model,
+) -> Result<Option<(Metadata, Hash, Content<B::Readable>)>, B::Error> {
+    let content_hash = e.value;
+    let c = match store.read(space_id, &content_hash).await? {
         Some(c) => c,
         None => return Ok(None),
     };
@@ -3885,6 +4204,147 @@ async fn get_kv_entity<C: ConnectionTrait>(
         start.elapsed(),
     );
     Ok(result)
+}
+
+/// Most keys one `IN (...)` statement carries where there is no array
+/// parameter (SQLite), well under its 32766-variable limit.
+const KV_LOOKUP_CHUNK: usize = 500;
+
+/// What a space's batched lookup found: the live rows by key, or the error
+/// that the first capability of that space reports.
+enum KvSpaceLookup {
+    Rows(HashMap<String, current_kv::Model>),
+    Failed(Option<DbErr>),
+}
+
+/// The live `current_kv` rows that a read invocation's `kv/get` and
+/// `kv/metadata` capabilities name (TC-1274), fetched with one statement per
+/// space instead of one per capability. Capabilities are still answered one
+/// at a time in their own order, so responses, their order, and which
+/// capability's error comes first are those of per-capability lookups: a
+/// failed statement is held and reported by the first capability of its
+/// space.
+///
+/// A space with a single capability, and every space on MySQL, keeps the
+/// per-capability point lookup (see [`KvReadLookup::entity`]). MySQL's usual
+/// collations compare keys case- and accent-insensitively, so a row cannot be
+/// matched back to the key that asked for it by comparing strings.
+struct KvReadLookup {
+    spaces: HashMap<SpaceId, KvSpaceLookup>,
+}
+
+impl KvReadLookup {
+    /// One statement per space that has at least two `kv/get` or
+    /// `kv/metadata` capabilities, in order of first appearance.
+    async fn fetch<C: ConnectionTrait>(db: &C, caps: &[(&SpaceId, &str, &str, &Path)]) -> Self {
+        let mut spaces = HashMap::new();
+        if db.get_database_backend() == DbBackend::MySql {
+            return Self { spaces };
+        }
+        let mut wanted: Vec<(&SpaceId, usize, Vec<&Path>)> = Vec::new();
+        for &(space, service, ability, path) in caps {
+            if service != "kv" || !matches!(ability, "tinycloud.kv/get" | "tinycloud.kv/metadata") {
+                continue;
+            }
+            let index = match wanted.iter().position(|(next, ..)| *next == space) {
+                Some(index) => index,
+                None => {
+                    wanted.push((space, 0, Vec::new()));
+                    wanted.len() - 1
+                }
+            };
+            let (_, requested, keys) = &mut wanted[index];
+            *requested += 1;
+            if !keys.contains(&path) {
+                keys.push(path);
+            }
+        }
+        for (space, requested, keys) in wanted {
+            if requested < 2 {
+                continue;
+            }
+            let start = Instant::now();
+            let found = get_kv_entities(db, space, &keys).await;
+            crate::telemetry::observe_stage(
+                crate::telemetry::InvocationStage::KvIndexLookup,
+                crate::telemetry::StageOutcome::from(found.is_ok()),
+                start.elapsed(),
+            );
+            spaces.insert(
+                space.clone(),
+                match found {
+                    Ok(rows) => KvSpaceLookup::Rows(rows),
+                    Err(error) => KvSpaceLookup::Failed(Some(error)),
+                },
+            );
+        }
+        Self { spaces }
+    }
+
+    /// The live row for `key` in `space`, as `get_kv_entity` would return it.
+    async fn entity<C: ConnectionTrait>(
+        &mut self,
+        db: &C,
+        space: &SpaceId,
+        key: &Path,
+    ) -> Result<Option<current_kv::Model>, DbErr> {
+        match self.spaces.get_mut(space) {
+            Some(KvSpaceLookup::Rows(rows)) => Ok(rows.get(key.as_str()).cloned()),
+            Some(KvSpaceLookup::Failed(error)) => Err(error
+                .take()
+                .unwrap_or_else(|| DbErr::Custom("KV lookup failed".to_owned()))),
+            None => get_kv_entity(db, space, key).await,
+        }
+    }
+}
+
+/// The live rows of `keys` in `space`, by key, in one statement (PostgreSQL
+/// `key = ANY($2)`) or one per `KV_LOOKUP_CHUNK` keys (SQLite `IN` lists).
+/// A key with no live row is absent from the map.
+async fn get_kv_entities<C: ConnectionTrait>(
+    db: &C,
+    space_id: &SpaceId,
+    keys: &[&Path],
+) -> Result<HashMap<String, current_kv::Model>, DbErr> {
+    let live = || {
+        current_kv::Entity::find()
+            .filter(current_kv::Column::Space.eq(SpaceIdWrap(space_id.clone())))
+            .filter(current_kv::Column::Deleted.eq(false))
+    };
+    let rows = match db.get_database_backend() {
+        DbBackend::Postgres => {
+            let keys = keys
+                .iter()
+                .map(|key| key.as_str().to_owned())
+                .collect::<Vec<_>>();
+            live()
+                .filter(Expr::cust_with_values(
+                    r#""current_kv"."key" = ANY($1)"#,
+                    [keys],
+                ))
+                .all(db)
+                .await?
+        }
+        _ => {
+            let mut rows = Vec::new();
+            for chunk in keys.chunks(KV_LOOKUP_CHUNK) {
+                rows.extend(
+                    live()
+                        .filter(
+                            current_kv::Column::Key
+                                .is_in(chunk.iter().map(|key| crate::types::Path((*key).clone()))),
+                        )
+                        .all(db)
+                        .await?,
+                );
+            }
+            rows
+        }
+    };
+    Ok(rows
+        .into_iter()
+        .map(|row| (row.key.0.as_str().to_owned(), row))
+        .collect())
 }
 
 /// Half-open `[lower, upper)` bounds selecting every `ability.resource` that
@@ -3984,15 +4444,25 @@ fn delegations_touching_space(backend: DbBackend, space_id: &SpaceId) -> SimpleE
     )
 }
 
+/// Reparse response projections from their signed source, preserving complete
+/// proof CIDs (including codecs and order) rather than reconstructing them from
+/// the graph's hash-only edges.
+fn decode_stored_delegation(serialization: Vec<u8>) -> Result<Delegation, DbErr> {
+    let delegation = TinyCloudDelegation::from_bytes(&serialization)
+        .map_err(|_| DbErr::Custom("delegation-signed-bytes-invalid".into()))?;
+    let info = DelegationInfo::try_from(delegation)
+        .map_err(|_| DbErr::Custom("delegation-signed-info-invalid".into()))?;
+    Ok(SerializedEvent(info, serialization))
+}
+
 async fn get_valid_delegations<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
     db: &C,
     space_id: &SpaceId,
     encryption: Option<&ColumnEncryption>,
-) -> Result<HashMap<Hash, DelegationInfo>, TxError<S, K>> {
+) -> Result<HashMap<Hash, Delegation>, TxError<S, K>> {
     let (dels, abilities): (Vec<delegation::Model>, Vec<Vec<abilities::Model>>) =
         delegation::Entity::find()
-            .left_join(revocation::Entity)
-            .filter(revocation::Column::Id.is_null())
+            .filter(revocation::unrevoked_condition())
             .filter(delegations_touching_space(
                 db.get_database_backend(),
                 space_id,
@@ -4002,12 +4472,10 @@ async fn get_valid_delegations<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
             .await?
             .into_iter()
             .unzip();
-    let parents = dels.load_many(parent_delegations::Entity, db).await?;
     let now = time::OffsetDateTime::now_utc();
     dels.into_iter()
         .zip(abilities)
-        .zip(parents)
-        .filter_map(|((del, ability), parents)| {
+        .filter_map(|(del, ability)| {
             // `delegations_touching_space` has already narrowed this to the
             // delegations whose resources fall in the space's prefix range;
             // the space check below is the exact filter over that superset.
@@ -4020,51 +4488,16 @@ async fn get_valid_delegations<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                         Ok(s) => s,
                         Err(e) => return Some(Err(TxError::Encryption(e))),
                     };
-                Some(match TinyCloudDelegation::from_bytes(&serialization) {
-                    Ok(delegation) => Ok((
-                        del.id,
-                        DelegationInfo {
-                            delegator: del.delegator,
-                            delegate: del.delegatee,
-                            parents: parents.into_iter().map(|p| p.parent.to_cid(0x55)).collect(),
-                            expiry: del.expiry,
-                            not_before: del.not_before,
-                            issued_at: del.issued_at,
-                            delegation_mode: mode_from_facts(&del.facts),
-                            capabilities: ability
-                                .into_iter()
-                                .map(|a| Capability {
-                                    resource: a.resource,
-                                    ability: a.ability,
-                                    caveats: a.caveats,
-                                })
-                                .collect(),
-                            delegation,
-                        },
-                    )),
-                    Err(e) => Err(TxError::Encoding(e)),
-                })
+                Some(
+                    decode_stored_delegation(serialization)
+                        .map(|event| (del.id, event))
+                        .map_err(TxError::Db),
+                )
             } else {
                 None
             }
         })
-        .collect::<Result<HashMap<Hash, DelegationInfo>, TxError<S, K>>>()
-}
-
-/// Decode the persisted `xyz.tinycloud.policy/delegationMode` marker from
-/// a stored delegation row's facts column.
-fn mode_from_facts(facts: &Option<crate::types::Facts>) -> DelegationMode {
-    facts
-        .as_ref()
-        .and_then(|f| f.0.get(DelegationMode::FACT_KEY).and_then(|v| v.as_str()))
-        .map(|s| {
-            if s == "terminal" {
-                DelegationMode::Terminal
-            } else {
-                DelegationMode::Attenuable
-            }
-        })
-        .unwrap_or(DelegationMode::Attenuable)
+        .collect::<Result<HashMap<Hash, Delegation>, TxError<S, K>>>()
 }
 
 /// Resolve a session key DID (did:key:...) to its root PKH DID (did:pkh:...).
@@ -4380,17 +4813,14 @@ async fn load_account_ancestor_state<C: ConnectionTrait>(
         .filter(delegation::Column::Id.is_in(ids.iter().copied()))
         .all(db)
         .await?;
-    let revocation_rows = revocation::Entity::find()
-        .filter(revocation::Column::Revoked.is_in(ids))
-        .all(db)
-        .await?;
+    let revocation_rows = revocation::effective_rows(db, &ids).await?;
     let delegations = delegation_rows
         .into_iter()
         .map(|row| (row.id, row))
         .collect();
     let mut revocations: HashMap<Hash, Vec<revocation::Model>> = HashMap::new();
-    for row in revocation_rows {
-        revocations.entry(row.revoked).or_default().push(row);
+    for (id, row) in revocation_rows {
+        revocations.entry(id).or_default().push(row);
     }
     for values in revocations.values_mut() {
         values.sort_by(|left, right| left.id.as_ref().cmp(right.id.as_ref()));
@@ -4410,7 +4840,7 @@ async fn get_filtered_delegations<C: ConnectionTrait, S: StorageSetup, K: Secret
     invoker: &str,
     filters: Option<&ListFilters>,
     encryption: Option<&ColumnEncryption>,
-) -> Result<HashMap<Hash, DelegationInfo>, TxError<S, K>> {
+) -> Result<HashMap<Hash, Delegation>, TxError<S, K>> {
     // Resolve session key DID to PKH DID for direction filtering
     let pkh_did = resolve_pkh_did(db, invoker)
         .await
@@ -4418,8 +4848,7 @@ async fn get_filtered_delegations<C: ConnectionTrait, S: StorageSetup, K: Secret
 
     let (dels, abilities): (Vec<delegation::Model>, Vec<Vec<abilities::Model>>) =
         delegation::Entity::find()
-            .left_join(revocation::Entity)
-            .filter(revocation::Column::Id.is_null())
+            .filter(revocation::unrevoked_condition())
             .filter(delegations_touching_space(
                 db.get_database_backend(),
                 space_id,
@@ -4429,7 +4858,6 @@ async fn get_filtered_delegations<C: ConnectionTrait, S: StorageSetup, K: Secret
             .await?
             .into_iter()
             .unzip();
-    let parents = dels.load_many(parent_delegations::Entity, db).await?;
     let now = time::OffsetDateTime::now_utc();
 
     // Extract filter values
@@ -4439,8 +4867,7 @@ async fn get_filtered_delegations<C: ConnectionTrait, S: StorageSetup, K: Secret
 
     dels.into_iter()
         .zip(abilities)
-        .zip(parents)
-        .filter_map(|((del, ability), parents)| {
+        .filter_map(|(del, ability)| {
             // Time validity check
             if !(del.expiry.map(|e| e > now).unwrap_or(true)
                 && del.not_before.map(|n| n <= now).unwrap_or(true))
@@ -4497,32 +4924,13 @@ async fn get_filtered_delegations<C: ConnectionTrait, S: StorageSetup, K: Secret
                     Ok(s) => s,
                     Err(e) => return Some(Err(TxError::Encryption(e))),
                 };
-            Some(match TinyCloudDelegation::from_bytes(&serialization) {
-                Ok(delegation) => Ok((
-                    del.id,
-                    DelegationInfo {
-                        delegator: del.delegator,
-                        delegate: del.delegatee,
-                        parents: parents.into_iter().map(|p| p.parent.to_cid(0x55)).collect(),
-                        expiry: del.expiry,
-                        not_before: del.not_before,
-                        issued_at: del.issued_at,
-                        delegation_mode: mode_from_facts(&del.facts),
-                        capabilities: ability
-                            .into_iter()
-                            .map(|a| Capability {
-                                resource: a.resource,
-                                ability: a.ability,
-                                caveats: a.caveats,
-                            })
-                            .collect(),
-                        delegation,
-                    },
-                )),
-                Err(e) => Err(TxError::Encoding(e)),
-            })
+            Some(
+                decode_stored_delegation(serialization)
+                    .map(|event| (del.id, event))
+                    .map_err(TxError::Db),
+            )
         })
-        .collect::<Result<HashMap<Hash, DelegationInfo>, TxError<S, K>>>()
+        .collect::<Result<HashMap<Hash, Delegation>, TxError<S, K>>>()
 }
 
 /// Get the delegation chain for a specific delegation, ordered from leaf to root.
@@ -4532,7 +4940,7 @@ async fn get_delegation_chain<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
     space_id: &SpaceId,
     delegation_cid: &str,
     encryption: Option<&ColumnEncryption>,
-) -> Result<Vec<DelegationInfo>, TxError<S, K>> {
+) -> Result<Vec<Delegation>, TxError<S, K>> {
     use tinycloud_auth::ipld_core::cid::Cid;
 
     // Parse the delegation CID
@@ -4549,8 +4957,7 @@ async fn get_delegation_chain<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
     loop {
         // Find the delegation with this hash
         let del_with_abilities = delegation::Entity::find_by_id(current_hash)
-            .left_join(revocation::Entity)
-            .filter(revocation::Column::Id.is_null())
+            .filter(revocation::unrevoked_condition())
             .find_with_related(abilities::Entity)
             .all(db)
             .await?;
@@ -4579,31 +4986,8 @@ async fn get_delegation_chain<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
             .all(db)
             .await?;
 
-        let parent_cids: Vec<Cid> = parents.iter().map(|p| p.parent.to_cid(0x55)).collect();
-
-        // Create DelegationInfo
         let serialization = crate::encryption::maybe_decrypt(encryption, &del.serialization)?;
-        let delegation = TinyCloudDelegation::from_bytes(&serialization)?;
-        let info = DelegationInfo {
-            delegator: del.delegator,
-            delegate: del.delegatee,
-            parents: parent_cids.clone(),
-            expiry: del.expiry,
-            not_before: del.not_before,
-            issued_at: del.issued_at,
-            delegation_mode: mode_from_facts(&del.facts),
-            capabilities: ability
-                .into_iter()
-                .map(|a| Capability {
-                    resource: a.resource,
-                    ability: a.ability,
-                    caveats: a.caveats,
-                })
-                .collect(),
-            delegation,
-        };
-
-        chain.push(info);
+        chain.push(decode_stored_delegation(serialization)?);
 
         // Move to the first parent (if any) to continue the chain
         // Note: We follow the first parent; for multiple parents, this gives one path
@@ -5335,6 +5719,17 @@ mod test {
     /// `kv_write` + `current_kv` projection path, one invocation per key
     /// (`invocation-{index}`). A repeated key overwrites the earlier write.
     async fn seed_kv_keys<C: ConnectionTrait>(conn: &C, name: &str, keys: &[&str]) -> SpaceId {
+        seed_kv_keys_with_ids(conn, name, keys, "").await
+    }
+
+    /// `seed_kv_keys` with `id_prefix` on its invocation and epoch ids, so a
+    /// second space can be seeded into the same database.
+    async fn seed_kv_keys_with_ids<C: ConnectionTrait>(
+        conn: &C,
+        name: &str,
+        keys: &[&str],
+        id_prefix: &str,
+    ) -> SpaceId {
         use sea_orm::ActiveValue::Set;
 
         let space = test_space_id(name);
@@ -5352,8 +5747,9 @@ mod test {
         .await
         .unwrap();
         for (index, key) in keys.iter().enumerate() {
-            let invocation_id = crate::hash::hash(format!("invocation-{index}").as_bytes());
-            let epoch_id = crate::hash::hash(format!("epoch-{index}").as_bytes());
+            let invocation_id =
+                crate::hash::hash(format!("{id_prefix}invocation-{index}").as_bytes());
+            let epoch_id = crate::hash::hash(format!("{id_prefix}epoch-{index}").as_bytes());
             invocation::ActiveModel {
                 id: Set(invocation_id),
                 invoker: Set(actor_id.clone()),
@@ -5692,6 +6088,202 @@ mod test {
             kv_list_pages(&db.conn, &space, "notes/", 1).await,
             vec![vec!["notes/a"], vec!["notes/b/c"]]
         );
+    }
+
+    /// Deterministic pseudo-random numbers for the fixture mixes.
+    struct Mix(u64);
+
+    impl Mix {
+        fn below(&mut self, bound: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % bound as u64) as usize
+        }
+    }
+
+    /// Two spaces holding the same key names: `live/00..30` readable,
+    /// `dead/00..10` deleted (tombstoned), and `absent/00..10` never written.
+    /// The rows differ between the spaces, so a lookup must not cross them.
+    async fn seed_kv_lookup_fixture<C: ConnectionTrait>(conn: &C) -> Vec<(SpaceId, Vec<Path>)> {
+        let mut spaces = Vec::new();
+        for name in ["lookup-a", "lookup-b"] {
+            let live = (0..30).map(|i| format!("live/{i:02}"));
+            let dead = (0..10).map(|i| format!("dead/{i:02}"));
+            let stored = live.chain(dead.clone()).collect::<Vec<_>>();
+            let space = seed_kv_keys_with_ids(
+                conn,
+                name,
+                &stored.iter().map(String::as_str).collect::<Vec<_>>(),
+                &format!("{name}-"),
+            )
+            .await;
+            for key in dead.clone() {
+                current_kv::Entity::update_many()
+                    .col_expr(current_kv::Column::Deleted, Expr::value(true))
+                    .filter(current_kv::Column::Space.eq(SpaceIdWrap(space.clone())))
+                    .filter(current_kv::Column::Key.eq(crate::types::Path(key.parse().unwrap())))
+                    .exec(conn)
+                    .await
+                    .unwrap();
+            }
+            let universe = stored
+                .into_iter()
+                .chain((0..10).map(|i| format!("absent/{i:02}")))
+                .map(|key| key.parse().unwrap())
+                .collect();
+            spaces.push((space, universe));
+        }
+        spaces
+    }
+
+    /// The batched lookup returns, for every capability of a read invocation,
+    /// the row that the per-capability point lookup returns: live, deleted and
+    /// absent keys, a key present in both spaces, repeated keys, `kv/get` and
+    /// `kv/metadata` mixed with other capabilities, and any number of keys.
+    async fn assert_kv_lookup_matches_point_lookups(conn: &sea_orm::DatabaseConnection) {
+        let fixture = seed_kv_lookup_fixture(conn).await;
+        let mut mix = Mix(0x9e37_79b9_7f4a_7c15);
+        for trial in 0..200 {
+            let mut requested = Vec::new();
+            for _ in 0..1 + mix.below(120) {
+                let (space, universe) = &fixture[mix.below(fixture.len())];
+                let ability = match mix.below(4) {
+                    0 => "tinycloud.kv/metadata",
+                    1 => "tinycloud.kv/list",
+                    _ => "tinycloud.kv/get",
+                };
+                requested.push((space, ability, &universe[mix.below(universe.len())]));
+            }
+            let caps = requested
+                .iter()
+                .map(|(space, ability, key)| (*space, "kv", *ability, *key))
+                .collect::<Vec<_>>();
+            let mut lookup = KvReadLookup::fetch(conn, &caps).await;
+            for (space, ability, key) in requested {
+                if ability == "tinycloud.kv/list" {
+                    continue;
+                }
+                assert_eq!(
+                    lookup.entity(conn, space, key).await.unwrap(),
+                    get_kv_entity(conn, space, key).await.unwrap(),
+                    "trial {trial}: {key} in {space}"
+                );
+            }
+        }
+    }
+
+    /// Statements `fetch` and the lookups after it send, by shape of request.
+    async fn assert_kv_lookup_statement_counts(
+        conn: &mut sea_orm::DatabaseConnection,
+        many_keys_statements: usize,
+    ) {
+        let fixture = seed_kv_lookup_fixture(conn).await;
+        let counter = Arc::new(AtomicU64::new(0));
+        let counted = Arc::clone(&counter);
+        conn.set_metric_callback(move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+        });
+        let conn = &*conn;
+        let ((space_a, keys_a), (space_b, keys_b)) = (&fixture[0], &fixture[1]);
+        let get = "tinycloud.kv/get";
+        /// `(statements sent by fetch, statements sent by fetch and all lookups)`.
+        async fn measure(
+            conn: &sea_orm::DatabaseConnection,
+            counter: &AtomicU64,
+            caps: Vec<(&SpaceId, &str, &str, &Path)>,
+        ) -> (u64, u64) {
+            let before = counter.load(Ordering::SeqCst);
+            let mut lookup = KvReadLookup::fetch(conn, &caps).await;
+            let fetched = counter.load(Ordering::SeqCst) - before;
+            for (space, _, _, key) in &caps {
+                lookup.entity(conn, space, key).await.unwrap();
+            }
+            (fetched, counter.load(Ordering::SeqCst) - before)
+        }
+
+        // One statement for a whole batch of one space, and for one key asked
+        // for repeatedly.
+        let batch = keys_a.iter().map(|key| (space_a, "kv", get, key)).collect();
+        assert_eq!(measure(conn, &counter, batch).await, (1, 1));
+        let repeated = vec![(space_a, "kv", get, &keys_a[0]); 3];
+        assert_eq!(measure(conn, &counter, repeated).await, (1, 1));
+        // One per space, whichever of the two abilities asks.
+        let two_spaces = vec![
+            (space_a, "kv", get, &keys_a[0]),
+            (space_b, "kv", "tinycloud.kv/metadata", &keys_b[1]),
+            (space_a, "kv", "tinycloud.kv/metadata", &keys_a[2]),
+            (space_b, "kv", get, &keys_b[3]),
+        ];
+        assert_eq!(measure(conn, &counter, two_spaces).await, (2, 2));
+        // A lone capability keeps its point lookup, and capabilities that
+        // are not reads of a key are not looked up at all.
+        let single = vec![(space_a, "kv", get, &keys_a[0])];
+        assert_eq!(measure(conn, &counter, single).await, (0, 1));
+        let other = vec![
+            (space_a, "kv", "tinycloud.kv/list", &keys_a[0]),
+            (space_a, "sql", get, &keys_a[1]),
+        ];
+        assert_eq!(measure(conn, &counter, other).await, (0, 2));
+
+        // More keys than one SQLite `IN` list takes.
+        let many = (0..KV_LOOKUP_CHUNK + 20)
+            .map(|i| format!("many/{i:03}").parse::<Path>().unwrap())
+            .collect::<Vec<_>>();
+        let caps = many.iter().map(|key| (space_a, "kv", get, key)).collect();
+        assert_eq!(
+            measure(conn, &counter, caps).await.0,
+            many_keys_statements as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_kv_lookup_matches_point_lookups() {
+        let db = get_db().await.unwrap();
+        assert_kv_lookup_matches_point_lookups(&db.conn).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_kv_lookup_statement_counts() {
+        let mut conn = get_db().await.unwrap().conn;
+        assert_kv_lookup_statement_counts(&mut conn, 2).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_kv_lookup_matches_point_lookups() {
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_kv_lookup_matches_point_lookups",
+        )
+        .await
+        else {
+            return;
+        };
+        assert_kv_lookup_matches_point_lookups(&fixture.conn).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_kv_lookup_statement_counts() {
+        let Some(fixture) =
+            crate::test_support::PostgresTestSchema::new("postgres_kv_lookup_statement_counts")
+                .await
+        else {
+            return;
+        };
+        // `key = ANY($2)` takes any number of keys in one statement.
+        assert_kv_lookup_statement_counts(&mut fixture.conn.clone(), 1).await;
+    }
+
+    /// A lookup that fails is not a panic or a hang: the first capability of
+    /// the space reports the error, as its own point lookup would have.
+    #[tokio::test]
+    async fn failed_kv_lookup_is_reported_by_the_capability_that_needed_it() {
+        let db = get_db().await.unwrap();
+        let fixture = seed_kv_lookup_fixture(&db.conn).await;
+        let (space, keys) = &fixture[0];
+        db.conn.clone().close().await.unwrap();
+        let caps = vec![(space, "kv", "tinycloud.kv/get", &keys[0]); 2];
+        let mut lookup = KvReadLookup::fetch(&db.conn, &caps).await;
+        assert!(lookup.entity(&db.conn, space, &keys[0]).await.is_err());
     }
 
     #[tokio::test]
@@ -7207,9 +7799,8 @@ mod test {
     /// Resolve the ancestor closure exactly as `invoke_with_options_mode`
     /// does, then take the guards shared — the production invocation path.
     async fn invocation_chain_keys(db: &TestDb, roots: &[Hash]) -> Vec<Hash> {
-        crate::auth_graph::load_closure_edges(&db.conn, roots)
+        crate::auth_graph::load_chain_lock_ids(&db.conn, roots)
             .await
-            .map(|(keys, _)| keys)
             .expect("chain closure query")
     }
 
@@ -7237,6 +7828,49 @@ mod test {
     async fn settle() {
         tokio::task::yield_now().await;
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+
+    /// Equivalent historical parents and an as-yet unregistered canonical CID
+    /// must contend on the same guard as an invocation citing the signed child.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn historical_alias_revocation_waits_for_signed_child_invocation() {
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set};
+
+        let db = get_db().await.unwrap();
+        insert_chain_guard_actors(&db).await;
+        let (legacy, child) = insert_test_chain(&db, "historical-alias-lock").await;
+        let (other_legacy, _) = insert_test_chain(&db, "other-historical-alias-lock").await;
+        let canonical = crate::hash::hash(b"canonical parent not registered as a delegation");
+        for id in [legacy, other_legacy] {
+            delegation_cid_alias::ActiveModel {
+                id: Set(id),
+                canonical: Set(canonical),
+                encrypted: Set(false),
+            }
+            .insert(&db.conn)
+            .await
+            .unwrap();
+        }
+
+        for target in [legacy, other_legacy, canonical] {
+            let in_flight = acquire_invocation_guards(&db, &[child]).await;
+            let revoke_db = db.clone();
+            let revoke =
+                tokio::spawn(async move { revoke_db.acquire_chain_guards(&[target]).await });
+            settle().await;
+            assert!(
+                !revoke.is_finished(),
+                "equivalent ancestor revocation must wait for the signed child's invocation"
+            );
+            drop(in_flight);
+            let guards = tokio::time::timeout(std::time::Duration::from_secs(10), revoke)
+                .await
+                .expect("alias revocation proceeds after the child releases its guards")
+                .unwrap()
+                .ok()
+                .expect("alias revocation guards");
+            drop(guards);
+        }
     }
 
     /// TC-324 requirement 1: invocations sharing one root delegation must
@@ -9836,6 +10470,163 @@ mod test {
             .await
             .expect("drop isolated TC-731 collation schema");
         exercise.expect("TC-731 PostgreSQL collation resilience");
+    }
+
+    /// `EXPLAIN ANALYZE` of the `list_bounded_after` range select for
+    /// `prefix`, one line per plan row.
+    async fn explain_kv_list<C: ConnectionTrait>(
+        conn: &C,
+        space: &SpaceId,
+        prefix: &str,
+    ) -> String {
+        let prefix: Path = prefix.parse().unwrap();
+        let list = kv_list_statement(conn.get_database_backend(), space, &prefix, None, None);
+        let explain = Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            match conn.get_database_backend() {
+                DbBackend::Postgres => {
+                    format!(
+                        "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) {}",
+                        list.sql
+                    )
+                }
+                _ => format!("EXPLAIN QUERY PLAN {}", list.sql),
+            },
+            list.values.expect("list statement is parameterised").0,
+        );
+        conn.query_all(explain)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| {
+                row.try_get_by_index::<String>(0)
+                    .or_else(|_| row.try_get::<String>("", "detail"))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// TC-1274: the range select seeks on its byte-order key bounds.
+    ///
+    /// `kv_prefix_condition` compares `key COLLATE "C"`, and
+    /// `idx_current_kv_space_deleted_key` is built in the column's own
+    /// collation. Under a linguistic collation (production's `en_US.UTF-8`;
+    /// here ICU `en`, which CI's C-collated PG16 would otherwise hide) the old
+    /// index can only seek on `(space, deleted)` and filter the rest of the
+    /// space's live keys. `idx_current_kv_space_deleted_key_c` makes the
+    /// bounds index conditions, with no query change.
+    #[tokio::test]
+    async fn postgres_kv_list_range_seeks_on_the_c_collation_index() {
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_kv_list_range_seeks_on_the_c_collation_index",
+        )
+        .await
+        else {
+            return;
+        };
+        let conn = &fixture.conn;
+        conn.execute(Statement::from_string(
+            DbBackend::Postgres,
+            "CREATE COLLATION tc1274_linguistic (provider = icu, locale = 'en')".to_string(),
+        ))
+        .await
+        .unwrap();
+        conn.execute(Statement::from_string(
+            DbBackend::Postgres,
+            "ALTER TABLE current_kv ALTER COLUMN key TYPE character varying \
+             COLLATE tc1274_linguistic"
+                .to_string(),
+        ))
+        .await
+        .unwrap();
+
+        let wanted: Vec<String> = (0..20).map(|i| format!("docs/{i:03}")).collect();
+        let others: Vec<String> = (0..300).map(|i| format!("other/{i:03}")).collect();
+        let keys: Vec<&str> = wanted.iter().chain(&others).map(String::as_str).collect();
+        let space = seed_kv_keys(conn, "pg-range-index", &keys).await;
+        conn.execute(Statement::from_string(
+            DbBackend::Postgres,
+            "ANALYZE current_kv".to_string(),
+        ))
+        .await
+        .unwrap();
+
+        // Planner inputs the test controls: a table this small would be
+        // seq-scanned, and the test is about which index serves the range.
+        // Both runs are rolled back.
+        let plan = |index_present: bool, prefix: &'static str| {
+            let conn = conn.clone();
+            let space = space.clone();
+            async move {
+                let tx = conn.begin().await.unwrap();
+                tx.execute_unprepared("SET LOCAL enable_seqscan = off")
+                    .await
+                    .unwrap();
+                if !index_present {
+                    tx.execute_unprepared("DROP INDEX idx_current_kv_space_deleted_key_c")
+                        .await
+                        .unwrap();
+                }
+                let plan = explain_kv_list(&tx, &space, prefix).await;
+                tx.rollback().await.unwrap();
+                plan
+            }
+        };
+        for prefix in ["docs/", "docs"] {
+            let before = plan(false, prefix).await;
+            println!("TC-1274 plan without the C index, prefix {prefix:?}:\n{before}");
+            assert!(
+                before.contains("Rows Removed by Filter: 300"),
+                "without the C index the whole space is filtered: {before}"
+            );
+
+            let after = plan(true, prefix).await;
+            println!("TC-1274 plan with the C index, prefix {prefix:?}:\n{after}");
+            assert!(
+                after.contains("idx_current_kv_space_deleted_key_c"),
+                "{prefix:?}: {after}"
+            );
+            assert!(
+                after
+                    .lines()
+                    .any(|line| line.contains("Index Cond") && line.contains("< 'docs0'")),
+                "{prefix:?}: the key bounds are Index Cond: {after}"
+            );
+            assert!(
+                !after.contains("Rows Removed by Filter"),
+                "{prefix:?}: nothing is read and discarded: {after}"
+            );
+            assert!(!after.contains("Seq Scan"), "{prefix:?}: {after}");
+        }
+
+        // Same answers either way.
+        let listed = kv_list_pages(conn, &space, "docs", 100).await;
+        assert_eq!(listed, vec![wanted]);
+    }
+
+    /// TC-1274: SQLite needs no `COLLATE` index. Its `BINARY` bounds already
+    /// seek on `idx_current_kv_space_deleted_key` for a prefix ending in `/`,
+    /// so the migration is a no-op there. (A bare prefix is an `OR` with the
+    /// exact key, which SQLite does not seek; that is unchanged here.)
+    #[tokio::test]
+    async fn sqlite_kv_list_range_seeks_on_the_existing_index() {
+        let db = get_db().await.unwrap();
+        let space = seed_kv_keys(
+            &db.conn,
+            "sqlite-range-index",
+            &["docs/a", "docs/b", "other/a"],
+        )
+        .await;
+
+        let plan = explain_kv_list(&db.conn, &space, "docs/").await;
+        println!("TC-1274 SQLite plan:\n{plan}");
+        assert!(
+            plan.contains(
+                "idx_current_kv_space_deleted_key (space=? AND deleted=? AND key>? AND key<?)"
+            ),
+            "{plan}"
+        );
     }
 
     async fn assert_hook_prefix_filter(

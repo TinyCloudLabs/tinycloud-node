@@ -238,16 +238,44 @@ pub struct SqlExecutionResult {
     pub write_targets: Vec<TouchedTables>,
 }
 
+/// Which part of a delegated caveat refused a request (TC-1791). `Write`,
+/// `Table` and `Column` come from the authorizer; `Chain` means the
+/// delegation chain's caveats could not be evaluated.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CaveatArm {
+    Column,
+    Table,
+    Write,
+    Chain,
+}
+
+impl CaveatArm {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Column => "column",
+            Self::Table => "table",
+            Self::Write => "write",
+            Self::Chain => "chain",
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SqlError {
+    /// A delegated caveat refused the request. The text is fixed: it names the
+    /// arm and nothing from the request.
+    #[error("sql_caveat_violation: {}", .0.as_str())]
+    CaveatViolation(CaveatArm),
     #[error("SQLite error: {0}")]
     Sqlite(String),
     #[error("Permission denied: {0}")]
     PermissionDenied(String),
     #[error("Database not found")]
     DatabaseNotFound,
-    #[error("Response too large: {0} bytes")]
-    ResponseTooLarge(u64),
+    #[error("sql_response_too_large: Response too large: {0} bytes (limit {1} bytes)")]
+    ResponseTooLarge(u64, u64),
+    #[error("sql_response_too_large: Response too large: row limit exceeded (limit {0} rows)")]
+    RowLimitExceeded(usize),
     #[error("Quota exceeded")]
     QuotaExceeded,
     /// The space is full and the request would have grown the database; it
@@ -278,4 +306,40 @@ pub enum SqlError {
         "outcome_unknown: the write may have been applied; read the database back before retrying"
     )]
     OutcomeUnknown,
+    /// A bounded wait gave up before the request's write began, so nothing
+    /// was applied (TC-1274). A retry after `Retry-After` is safe.
+    #[error("sql_busy: {0}: the database is busy; retry the request")]
+    Busy(SqlBusyStage),
+    /// The request deadline was reached before the request's write began, so
+    /// nothing was applied (TC-1274).
+    #[error("request_timeout: no change was applied; retry the request")]
+    RequestTimeout,
+}
+
+/// Where a [`SqlError::Busy`] request was waiting when its bound expired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqlBusyStage {
+    /// The per-(space, db) operation lock.
+    LockWait,
+    /// Joining a hydration of the database's local cache that is still
+    /// writing its files.
+    Hydration,
+    /// Loading or saving the durable database artifact.
+    ArtifactTransfer,
+}
+
+impl SqlBusyStage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SqlBusyStage::LockWait => "lock_wait",
+            SqlBusyStage::Hydration => "hydration",
+            SqlBusyStage::ArtifactTransfer => "artifact_transfer",
+        }
+    }
+}
+
+impl std::fmt::Display for SqlBusyStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }

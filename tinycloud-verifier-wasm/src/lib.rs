@@ -675,8 +675,8 @@ mod tests {
 
     fn mutate_signature(signature: &str) -> String {
         let mut chars: Vec<char> = signature.chars().collect();
-        let last = chars.last_mut().expect("signature length");
-        *last = if *last == '0' { '1' } else { '0' };
+        let nibble = &mut chars[if signature.starts_with("0x") { 2 } else { 0 }];
+        *nibble = if *nibble == '0' { '1' } else { '0' };
         chars.into_iter().collect()
     }
 

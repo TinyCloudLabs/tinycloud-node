@@ -38,6 +38,7 @@ The SDK checks this endpoint during sign-in and requires an exact protocol versi
 | `POST` | `/delegate` | Yes | Create capability delegations |
 | `GET` | `/peer/generate/<space>` | No | Generate space host key pair |
 | `GET` | `/healthz` | No | Health check |
+| `GET` | `/admin/stats` | `NODE_STATS_READ_TOKEN` bearer | Distinct owner addresses that hold data beyond automatic sign-in records and vault metadata (read-only; disabled unless the token is set, at least 32 bytes) |
 
 ### Storage usage and full-space writes
 
@@ -54,7 +55,7 @@ The `200 application/json` response is:
 {
   "space": {"usedBytes": 123, "limitBytes": 456},
   "account": {"usedBytes": 789, "limitBytes": 1000, "plan": "free"},
-  "manageUrl": "https://account.tinycloud.xyz/billing"
+  "manageUrl": "https://account.tinycloud.xyz/storage"
 }
 ```
 
@@ -110,6 +111,75 @@ so the service bearer is sent only on the configured billing request. A `3xx`
 answer uses the existing quota fallback policy, with the existing 3-second total
 and 2-second connect deadlines.
 
+### Admin stats (`GET /admin/stats`)
+
+Read-only list of the wallet addresses that hold data on this node, for the
+scoreboard's protocol-user count (TC-1482). It is **disabled** (answers `404`,
+exactly like an unknown route) unless `NODE_STATS_READ_TOKEN` is set to a
+value of at least 32 bytes that differs from `TINYCLOUD_ADMIN_SECRET`. Send it as
+`Authorization: Bearer <NODE_STATS_READ_TOKEN>`; a missing or wrong credential
+is a bare `401`. The token is separate from the admin secret: the admin secret
+does not open this route and this token opens no other `/admin/*` route. Use a
+random value of at least 32 bytes (a shorter value disables the route; use
+`openssl rand -hex 32`, 64 hex characters), kept in the secret store; the node never
+logs it or any address.
+
+```json
+{ "owners": ["0x…", "0x…"], "count": 2, "generatedAt": "2026-10-19T12:00:00Z" }
+```
+
+- **What is counted** (the complete rule).
+  - **Counts:** an owner holding live (`deleted = false`) KV in any space
+    except `account`, or a SQL/DuckDB database artifact in any space except
+    `account` and `secrets`, **except** KV in the `public` space whose key
+    starts with `.well-known/vault-` (vault metadata).
+  - **Excluded** (automatic sign-in records, not use of the node): the
+    `account` space entirely (its KV and its databases); the `secrets` table
+    that OpenKey's bootstrap creates (database artifacts in `secrets`; KV
+    stored in `secrets` still counts); and the vault metadata that
+    `vault.unlock()` writes (`.well-known/vault-pubkey`,
+    `.well-known/vault-version`, `.well-known/vault-space` in `public`). An
+    app may unlock the vault automatically, so counting those rows would
+    inflate "users with data" the same way the `secrets` table did.
+  - **App first-use data counts.** A database an app creates on first use
+    (for example listen's `conversations` database or feed-learn's tables) is
+    a person actually using an app that stores on TinyCloud. Artifact rows are
+    never deleted, so a database that was created and later emptied or dropped
+    still counts.
+
+  The space match is on the exact space name (the last `:`-separated segment
+  of the space id), so `secrets2`, `my-account`, `Secrets` or `Account` are
+  ordinary spaces. The vault exclusion is exactly the `public` space and keys
+  that start with `.well-known/vault-` (case-sensitive, starts-with): other
+  `.well-known/*` keys (including `.well-known/vault`), any other KV in
+  `public`, and the same prefix in any other space all count, and a `public`
+  space with at least one live KV row that is not vault metadata makes its
+  owner count. An owner who only signed in, or only signed in and unlocked the
+  vault, is therefore not listed. This is stricter than "spaces with
+  `usage_bytes > 0`" (`/admin/usage`), which counts the `account` space's
+  bytes.
+- **Owner.** Parsed from `tinycloud:pkh:eip155:<chain>:0x<address>:<name>`,
+  lowercased and de-duplicated across spaces and chains. Spaces whose owner is
+  not an `eip155` address (a `did:key` owner) are skipped. `owners` is sorted.
+- **Cost.** One SQL statement (one round trip) however many spaces exist; no
+  per-space `store_size` call. For each space it makes one primary-key probe of
+  `current_kv`, plus one pass over `database_artifact`'s space column. The cost
+  grows with the number of `space` rows (about six per bootstrapped account),
+  not only with listed owners: 4.35 s warm on a local PostgreSQL 14 with
+  300,000 spaces and 1.5 million keys (measured before the vault-metadata
+  condition, which adds one prefix comparison per `current_kv` row a probe
+  reads; in a `public` space that is at most the vault rows before the first
+  other live row). Re-measure before the node holds several times that many
+  spaces; the consumer gives up after 15 s.
+- **Bound, never a partial list.** The consumer makes no partial use of a
+  response, so the route never answers a shorter list with `200`. More than
+  200,000 owners (or more than 400,000 distinct counted spaces, which bounds
+  memory; spaces that do not count are not included) is a
+  bare `507`. Every entry is exactly `0x` followed by 40 lowercase hex digits;
+  a space whose owner is not such an `eip155` address is left out.
+- **Nothing else** about spaces, keys, sizes or timing is returned, and the
+  response is `Cache-Control: no-store`.
+
 ### Signed KV URLs
 
 `POST /signed/kv` accepts a normal TinyCloud invocation whose authorized capabilities include a `tinycloud.kv/get` capability that can be attenuated to the requested `{space, path}`. The invocation may include other capabilities. The JSON body is:
@@ -150,35 +220,35 @@ With telemetry enabled, backend time-to-first-byte is recorded under the `server
 
 ## Quickstart
 
-To run TinyCloud Protocol locally, install [Rustup](https://rustup.rs). The
-repository selects the reviewed Rust `1.97.1` toolchain automatically through
-`rust-toolchain.toml`; do not substitute a floating `stable` compiler.
+For a self-hosted HTTPS deployment with persistent data, unique identity,
+backup/restore, and a verified upgrade path, follow the
+[personal-node guide](deploy/personal-node/README.md). The source-checkout
+example below is for local development only. It deliberately requires a unique
+key: the shipped configuration no longer contains a usable key.
 
+Install [Rustup](https://rustup.rs); `rust-toolchain.toml` selects Rust 1.97.1.
+Provision a private key file once and retain it across restarts:
 
-You will need to create a directory for TinyCloud Protocol to store data in:
 ```bash
-mkdir data
+umask 077
+mkdir -p data/blocks
+openssl rand -base64 48 | tr '+/' '-_' | tr -d '=\n' > node.key
+TINYCLOUD_KEYS__SECRET="$(cat node.key)" cargo run
 ```
 
-Within this directory, create one more directories `blocks` and a database file `caps.db`:
-```bash
-mkdir data/blocks
-touch data/caps.db
-```
+Keep `node.key` out of git, back it up separately from the data directory, and
+do not replace it during an upgrade: derived node identities and sealed data
+depend on it. `TINYCLOUD_KEYS__TYPE=Dstack` remains an explicit alternative
+only for a properly configured dstack TEE.
 
-To setup local data storage you can also run `./scripts/init-tinycloud-data.sh`
+For an existing node, do **not** generate a new root during upgrade. Recover
+the installation's original key from its private backup or its existing
+operator configuration, provide that same root explicitly, and compare the
+public node identity and encrypted/sealed data before accepting the upgrade.
+If the original root is unavailable, stop: a replacement is a different node
+identity and does not recover data sealed under the prior root. Changing the
+identity also invalidates trust bindings that refer to its DID or public keys.
 
-You will then need to set the environment variables to point to those directories:
-```bash
-export TINYCLOUD_STORAGE_BLOCKS_PATH="data/blocks"
-export TINYCLOUD_STORAGE_DATABASE="data/caps.db"
-```
-
-Finally you can run TinyCloud Protocol using `cargo`:
-```bash
-cargo build
-cargo run
-```
 
 
 ## Configuration
@@ -201,6 +271,7 @@ The following common options are available:
 | spaces.allowlist    | TINYCLOUD_SPACES_ALLOWLIST    | Set the URL of an allowlist service for gating the creation of Space Peers |
 | telemetry.enabled   | TINYCLOUD_TELEMETRY__ENABLED  | Enable Prometheus latency metrics on the configured Prometheus port        |
 | (n/a)               | ROCKET_MAX_BLOCKING           | Set Rocket's blocking-thread-pool cap (default 512). Note the `ROCKET_` prefix, not `TINYCLOUD_` — Rocket builds its tokio runtime from its own Figment before TinyCloud's config is loaded, so `TINYCLOUD_MAX_BLOCKING` is silently ignored for this setting |
+| (n/a)               | NODE_STATS_READ_TOKEN         | Bearer token for the read-only `GET /admin/stats` (TC-1482). Unset, blank, shorter than 32 bytes, or equal to `TINYCLOUD_ADMIN_SECRET` disables the route (`404`). Generate it with `openssl rand -hex 32` (64 hex characters). Separate from `TINYCLOUD_ADMIN_SECRET`, which it does not replace and which does not open it. Secret: set it in the deployment secret store, never in `tinycloud.toml` or a committed env file. See [Admin stats](#admin-stats-get-adminstats) |
 
 ### Database Config
 
@@ -233,7 +304,7 @@ These bound how long one PostgreSQL round trip can block a request (TC-1054). Ea
 | database.bulk_statement_timeout_ms | `120000` | `statement_timeout` for statements on a whole SQL or DuckDB artifact larger than 8 MiB (or of unknown size): hydration loads and checkpoint saves, whose server-side work on a ~100 MiB value can outlast the base limit. PostgreSQL does not cancel a statement while it writes a row to the client, so the download itself is not limited by either value. |
 | database.retry_window_ms | `10000` | A read (or `BEGIN`) whose connection is lost is retried once only if that attempt failed within this window. A connection found dead at once is retried; one whose loss took a keepalive expiry to detect is not, so a lost connection costs a read at most one detection plus this window (about 40 s) instead of two detections (about 60 s). This bounds the retry, not the request or the per-database lock hold: acquisition waits, legitimate transfers and queueing behind the lock add to it, and a general deadline is later TC-1054 work. |
 
-Schema migrations always run with no statement timeout. Customer SQL (`tinycloud.sql/*`) runs in the node's local SQLite engine, never on PostgreSQL, so `statement_timeout` does not limit it.
+Schema migrations always run with no statement timeout. On PostgreSQL they wait at most 30 s for any lock (`lock_timeout`), so a session holding a conflicting table lock makes the node fail to start with an error naming the lock wait instead of hanging; the migrations roll back together and the next start applies them (TC-1176). Customer SQL (`tinycloud.sql/*`) runs in the node's local SQLite engine, never on PostgreSQL, so `statement_timeout` does not limit it.
 
 A database failure gets one of two responses, which clients must tell apart by the body's leading code:
 

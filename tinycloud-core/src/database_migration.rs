@@ -140,8 +140,8 @@ fn fingerprint_sqlite(path: &Path) -> Result<ArtifactFingerprint, MigrationError
 
 #[cfg(feature = "duckdb")]
 fn fingerprint_duckdb(path: &Path) -> Result<ArtifactFingerprint, MigrationError> {
-    let db =
-        duckdb::Connection::open(path).map_err(|e| MigrationError::Checkpoint(e.to_string()))?;
+    let db = crate::duckdb::storage::open_offline_connection(path)
+        .map_err(|e| MigrationError::Checkpoint(e.to_string()))?;
     let mut statement = db.prepare("SELECT table_schema, table_name FROM information_schema.tables WHERE table_type='BASE TABLE' AND table_schema NOT IN ('information_schema', 'pg_catalog') ORDER BY table_schema, table_name")
         .map_err(|e| MigrationError::Checkpoint(e.to_string()))?;
     let names: Vec<(String, String)> = statement
@@ -339,6 +339,8 @@ async fn offline_fingerprint<C: ConnectionTrait>(
 
 /// Full schema and row-count inspection is limited to an operator-designated
 /// local snapshot. The caller must enforce that boundary before invoking it.
+/// DuckDB snapshots undergo the same locked native policy and stored-code audit
+/// as node connections, while retaining the offline tool's native memory default.
 pub async fn offline_inventory(
     conn: &DatabaseConnection,
     datadir: &Path,
@@ -436,6 +438,47 @@ async fn has_unmigrated_artifacts_exact<C: ConnectionTrait>(
         .any(|row| !is_digest_name(&row.2) && !registered.contains(&row)))
 }
 
+/// How long `EffectiveFenceCache` reuses a legacy-artifact scan (TC-1274).
+///
+/// This was 1 s, so while the durable fence was off every SQL/DuckDB request
+/// more than 1 s after the last one re-ran `has_unmigrated_artifacts`, an
+/// anti-join over every artifact row (~12% of the database's query CPU).
+///
+/// Why 60 s of staleness is safe:
+/// - **What the boolean gates.** `true` (a SQL/DuckDB artifact with a
+///   non-digest name and no `database_legacy_artifact` row) makes every
+///   SQL/DuckDB `/invoke`, and the share-email SQL store, answer 503 before
+///   any database is touched. `false` lets the request on to `resolve`, which
+///   reads `database_legacy_artifact` and `database_alias` live on every
+///   request, quarantines a registered legacy name or routes it through its
+///   alias. The cached value is only a tripwire for artifacts nobody has
+///   inventoried yet.
+/// - **The operator's fence is never cached.** The configured fence and the
+///   durable `database_identity_fence` row are read on every call before the
+///   cache. `fence on` takes effect at once, and `apply`, `set_alias` and
+///   `clear_alias` all require that row, so every migration step runs behind a
+///   live fence. `set_fence(false)` runs its own uncached scan.
+/// - **Stale `false` (the unsafe direction) needs a writer this binary does
+///   not have.** Artifact names come from `logical_name` (an N2 digest) or
+///   from an alias, which `resolve` returns only when its legacy row is
+///   registered; the legacy selector exists for N3's inventory only. So the
+///   answer turns from `false` to `true` only if an older release or a restore
+///   writes an unregistered legacy artifact. For up to 60 s requests for that
+///   path then resolve to its digest name (an empty database) instead of
+///   503. That is the 1 s window made longer, and it overwrites nothing. A
+///   digest artifact created in the window makes the later `apply` fail with
+///   `Collision` for the operator to resolve.
+/// - **Stale `true` is fail-closed.** After the last legacy artifact is
+///   registered, requests keep getting a retryable 503 for at most 60 s, and
+///   only while the durable fence is off.
+/// - **Restarts and instances.** The cache lives in the process
+///   (`SpaceDatabase`) and starts empty, so a restarted node scans on its
+///   first request. A migration run or the `tinycloud-sql-identity` CLI is
+///   another process and does not invalidate it; nothing above needs that.
+///   Nodes sharing one database each hold their own entry, each at most 60 s
+///   stale. Entries are aged from the start of their scan.
+pub const LEGACY_SCAN_TTL: Duration = Duration::from_secs(60);
+
 /// Caches only the expensive legacy-artifact inventory. The durable metadata
 /// fence is read on every check, so turning it on takes effect even while an
 /// earlier "unfenced" inventory result is cached.
@@ -449,7 +492,7 @@ impl Default for EffectiveFenceCache {
     fn default() -> Self {
         Self {
             legacy: tokio::sync::Mutex::new(None),
-            ttl: Duration::from_secs(1),
+            ttl: LEGACY_SCAN_TTL,
         }
     }
 }
@@ -1242,6 +1285,8 @@ pub async fn quarantined(
 /// Checkpoint every local cache with the node stopped. Artifact rows and
 /// their durable checkpoint/delta columns are untouched. Built without the
 /// `duckdb` feature, this refuses a directory containing DuckDB files.
+/// DuckDB caches must pass the node's native policy and stored-code audit before
+/// checkpointing; the tool preserves DuckDB's native default memory limit.
 pub fn checkpoint_cache(datadir: &Path) -> Result<(usize, usize), MigrationError> {
     let mut sqlite_count = 0;
     #[cfg(feature = "duckdb")]
@@ -1277,7 +1322,7 @@ pub fn checkpoint_cache(datadir: &Path) -> Result<(usize, usize), MigrationError
                 } else {
                     #[cfg(feature = "duckdb")]
                     {
-                        let db = duckdb::Connection::open(entry.path())
+                        let db = crate::duckdb::storage::open_offline_connection(&entry.path())
                             .map_err(|e| MigrationError::Checkpoint(e.to_string()))?;
                         db.execute_batch("CHECKPOINT;")
                             .map_err(|e| MigrationError::Checkpoint(e.to_string()))?;
@@ -1427,7 +1472,7 @@ mod tests {
     }
 
     /// Connects to `TINYCLOUD_TEST_POSTGRES_URL` inside a fresh, migrated schema that the guard
-    /// drops. `None` when the URL is unset outside CI.
+    /// drops. `None` when the URL is unset and the gate does not allow a connection.
     async fn migrated_postgres_schema(
         test: &str,
     ) -> Option<(PostgresSchemaGuard, DatabaseConnection)> {
@@ -1755,6 +1800,46 @@ mod tests {
         };
         assert_unregistered_scan_matches_old_scan(&conn).await;
         conn.close().await.unwrap();
+    }
+
+    /// The scan is reused for `LEGACY_SCAN_TTL`, measured on the monotonic
+    /// clock from the start of the scan, and re-run after it. The entry's
+    /// timestamp is moved instead of sleeping the TTL.
+    #[tokio::test]
+    async fn effective_fence_reuses_a_legacy_scan_for_the_ttl_and_rescans_after_it() {
+        use sea_orm::Database;
+        use sea_orm_migration::MigratorTrait;
+
+        let conn = Database::connect("sqlite::memory:").await.unwrap();
+        crate::migrations::Migrator::up(&conn, None).await.unwrap();
+        let cache = EffectiveFenceCache::default();
+        let aged = |age: Duration| Instant::now().checked_sub(age).expect("monotonic clock");
+
+        assert!(!cache.check(&conn, false).await.unwrap());
+        artifact("sql", "test-space", "threads")
+            .insert(&conn)
+            .await
+            .unwrap();
+
+        cache.legacy.lock().await.as_mut().unwrap().0 =
+            aged(LEGACY_SCAN_TTL - Duration::from_secs(5));
+        assert!(
+            !cache.check(&conn, false).await.unwrap(),
+            "a scan younger than the TTL is reused"
+        );
+
+        cache.legacy.lock().await.as_mut().unwrap().0 =
+            aged(LEGACY_SCAN_TTL + Duration::from_secs(1));
+        assert!(
+            cache.check(&conn, false).await.unwrap(),
+            "a scan older than the TTL is re-run and sees the new artifact"
+        );
+        let (checked_at, fenced) = cache.legacy.lock().await.unwrap();
+        assert!(fenced);
+        assert!(
+            checked_at.elapsed() < Duration::from_secs(5),
+            "the re-run is timestamped now"
+        );
     }
 
     #[tokio::test]

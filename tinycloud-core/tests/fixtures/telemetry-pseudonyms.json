@@ -1,0 +1,80 @@
+{
+  "derivation_context": "tinycloud/telemetry/pseudonyms/v1",
+  "synthetic_secret_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+  "identities": [
+    {
+      "id": "space-a",
+      "space": "tinycloud:pkh:eip155:1:0x1234567890123456789012345678901234567890:telemetry-a",
+      "account_hash": "bbba9d7b3a7c9e7965851920ec79142f77cf0837972ec2fd0116a2399db81493",
+      "space_hash": "fa97c9aa299d59ba1ceef0d40241aa1edbcd64e20bd7eb233473ab210ce1dbe5"
+    },
+    {
+      "id": "space-b",
+      "space": "tinycloud:pkh:eip155:1:0x1234567890123456789012345678901234567890:telemetry-b",
+      "account_hash": "bbba9d7b3a7c9e7965851920ec79142f77cf0837972ec2fd0116a2399db81493",
+      "space_hash": "584353a5730194be93ecbdb3c18d4a10b231ab284a23cb40f115f32882e0dbdc"
+    }
+  ],
+  "databases": [
+    {
+      "id": "sql-v2n",
+      "service": "sql",
+      "space": "tinycloud:pkh:eip155:1:0x1234567890123456789012345678901234567890:telemetry-a",
+      "physical_name": "v2n",
+      "db_hash": "22e7cd040b4df2879489941d446a5360cff5fa764487fd334a14017741605931"
+    },
+    {
+      "id": "sql-v2d",
+      "service": "sql",
+      "space": "tinycloud:pkh:eip155:1:0x1234567890123456789012345678901234567890:telemetry-a",
+      "physical_name": "v2d8caa7c2eef6b1e246c3e9343983559eff75321e4a962df247ce5b09f0d9e9da9",
+      "db_hash": "62e0eec0fd9e231886108332d79e6e10c518723b2cb04df39b1821c7057c306e"
+    },
+    {
+      "id": "sql-legacy-alias",
+      "service": "sql",
+      "space": "tinycloud:pkh:eip155:1:0x1234567890123456789012345678901234567890:telemetry-a",
+      "physical_name": "default",
+      "db_hash": "cff0dac0436e50201110cf38be4bc913465c744fd07d2863f45a9233e8a3dbb0"
+    },
+    {
+      "id": "sql-connectors-space-a",
+      "service": "sql",
+      "space": "tinycloud:pkh:eip155:1:0x1234567890123456789012345678901234567890:telemetry-a",
+      "physical_name": "connectors",
+      "db_hash": "e9c9cf107fe00132ecf5c9e1743f1b2dcb71bedb8cae7a8bf2a13c76790567e7"
+    },
+    {
+      "id": "sql-connectors-space-b",
+      "service": "sql",
+      "space": "tinycloud:pkh:eip155:1:0x1234567890123456789012345678901234567890:telemetry-b",
+      "physical_name": "connectors",
+      "db_hash": "9e4f0254c53e91365ad2a053f7f55d2dadc63591189b8cea0c0b8137db2581fd"
+    },
+    {
+      "id": "duckdb-connectors-space-a",
+      "service": "duckdb",
+      "space": "tinycloud:pkh:eip155:1:0x1234567890123456789012345678901234567890:telemetry-a",
+      "physical_name": "connectors",
+      "db_hash": "d07f4eccd709397c094acb269e95caf65253fda61c2cfac7ff46b1a2de07f87a"
+    },
+    {
+      "id": "nul-boundary-a",
+      "service": "sql",
+      "space": "tinycloud:pkh:eip155:1:0x1234567890123456789012345678901234567890:telemetry-a",
+      "physical_name": "bridge\u0000tinycloud:pkh:eip155:1:0x1234567890123456789012345678901234567890:telemetry-b\u0000connectors",
+      "db_hash": "63de57957591a7134c00f7bbecba77305c7470dadd907fcd47c82be7f9db9a82"
+    },
+    {
+      "id": "nul-boundary-b",
+      "service": "sql\u0000tinycloud:pkh:eip155:1:0x1234567890123456789012345678901234567890:telemetry-a\u0000bridge",
+      "space": "tinycloud:pkh:eip155:1:0x1234567890123456789012345678901234567890:telemetry-b",
+      "physical_name": "connectors",
+      "db_hash": "ca9a24a16b532a822bb2c39e430a6974f4db0b8756fbfa773d1961886e028231"
+    }
+  ],
+  "old_separator_collision_pair": [
+    "nul-boundary-a",
+    "nul-boundary-b"
+  ]
+}

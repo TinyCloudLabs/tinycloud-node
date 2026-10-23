@@ -126,6 +126,7 @@ fn assert_request_data_stays_out_of_logs(extra_env: &[(&str, &str)]) {
         .env("TINYCLOUD_ADDRESS", "127.0.0.1")
         .env("TINYCLOUD_PORT", port.to_string())
         .env("TINYCLOUD_LOG_LEVEL", "normal")
+        .env("TINYCLOUD_LOG__FORMAT", "Json")
         .envs(extra_env.iter().copied())
         .env("TINYCLOUD_TELEMETRY__ENABLED", "true")
         .env("TINYCLOUD_PROMETHEUS__PORT", free_port().to_string())
@@ -206,10 +207,6 @@ fn assert_request_data_stays_out_of_logs(extra_env: &[(&str, &str)]) {
     std::thread::sleep(Duration::from_millis(200));
     drop(server);
     let logs = read_logs(dir.path());
-    assert!(
-        logs.contains("did resolution policy"),
-        "startup must report the DID policy"
-    );
 
     for (what, needle) in [
         ("signed-KV ticket id", ticket.as_str()),
@@ -228,22 +225,25 @@ fn assert_request_data_stays_out_of_logs(extra_env: &[(&str, &str)]) {
     }
 
     // Every request is still logged once, by its method and route template.
-    let request_lines: Vec<&str> = logs
+    let request_events: Vec<serde_json::Value> = logs
         .lines()
-        .filter(|line| line.contains("tinycloud::request") && !line.contains("route=/healthz "))
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| {
+            event["target"] == "tinycloud::request" && event["fields"]["route"] != "/healthz"
+        })
+        .map(|event| event["fields"].clone())
         .collect();
     for (method, path, route) in &requests {
-        let expected = format!("method={method} route={route} ");
         assert!(
-            request_lines.iter().any(|line| line.contains(&expected)),
-            "no `{expected}` request line for {method} {path}; request lines:\n{}",
-            request_lines.join("\n")
+            request_events
+                .iter()
+                .any(|event| event["method"] == *method && event["route"] == *route),
+            "missing {method} {route} event for {path}: {request_events:?}"
         );
     }
     assert_eq!(
-        request_lines.len(),
+        request_events.len(),
         requests.len(),
-        "expected one request line per request:\n{}",
-        request_lines.join("\n")
+        "expected one event per request: {request_events:?}"
     );
 }

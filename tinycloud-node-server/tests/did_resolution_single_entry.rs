@@ -145,7 +145,11 @@ impl Guard {
             | ("tinycloud-core/src/share_email/ports.rs", "resolve_exact", "self . resolve (policy , delegation)")
             | ("tinycloud-core/src/storage/memory.rs", "read_range", "range . resolve (total_size)")
             | ("tinycloud-node-server/src/storage/file_system.rs", "read_range", "range . resolve (total_size)")
+            // TC-1491: the SQL object store's byte range, not a DID.
+            | ("tinycloud-core/src/sql/store/memory.rs", "get_range", "range . resolve (total)")
             | ("tinycloud-node-server/src/storage/s3.rs", "parse_content_range", "ByteRangeSpec :: Inclusive { start , end } . resolve (total_size)")
+            // TC-887: at-rest Range mapping resolves an HTTP byte range against the plaintext length.
+            | ("tinycloud-core/src/at_rest/stream.rs", "map_range", "spec . resolve (self . plaintext_len ())")
             | ("tinycloud-node-server/src/lib.rs", "resolve_runtime_config", "resolved . storage . resolve ()")
             | ("tinycloud-node-server/src/runtime.rs", "serve_config_figment", "resolved . storage . resolve ()")
             | ("tinycloud-node-server/src/runtime.rs", "launch_with_figment", "tinycloud_config . storage . resolve ()")

@@ -1,5 +1,7 @@
 use duckdb::Connection;
 
+use crate::request_telemetry::QueryTimer;
+
 use super::caveats::DuckDbCaveats;
 use super::types::{ColumnInfo, DuckDbError, SchemaInfo, TableInfo, ViewInfo};
 
@@ -30,6 +32,7 @@ pub fn describe_schema(
 }
 
 fn describe_tables(conn: &Connection) -> Result<Vec<TableInfo>, DuckDbError> {
+    let timer = QueryTimer::new();
     let mut stmt = conn
         .prepare(
             "SELECT table_name FROM information_schema.tables \
@@ -43,6 +46,7 @@ fn describe_tables(conn: &Connection) -> Result<Vec<TableInfo>, DuckDbError> {
         .map_err(|e| DuckDbError::DuckDb(e.to_string()))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e: duckdb::Error| DuckDbError::DuckDb(e.to_string()))?;
+    drop(timer);
 
     let mut tables = Vec::new();
     for table_name in table_names {
@@ -57,6 +61,7 @@ fn describe_tables(conn: &Connection) -> Result<Vec<TableInfo>, DuckDbError> {
 }
 
 fn describe_columns(conn: &Connection, table_name: &str) -> Result<Vec<ColumnInfo>, DuckDbError> {
+    let _timer = QueryTimer::new();
     let mut stmt = conn
         .prepare(
             "SELECT column_name, data_type, is_nullable \
@@ -85,6 +90,7 @@ fn describe_columns(conn: &Connection, table_name: &str) -> Result<Vec<ColumnInf
 }
 
 fn describe_views(conn: &Connection) -> Result<Vec<ViewInfo>, DuckDbError> {
+    let _timer = QueryTimer::new();
     let mut stmt = conn
         .prepare(
             "SELECT view_name, sql FROM duckdb_views() \

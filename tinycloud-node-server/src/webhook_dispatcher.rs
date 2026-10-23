@@ -53,8 +53,12 @@ impl WebhookDispatcher {
         // so a revocation or expiry applies by the next pass.
         let mut authority = HashMap::<String, bool>::new();
         for delivery in deliveries {
-            if let Err(error) = self.dispatch_delivery(delivery, &mut authority).await {
-                tracing::warn!(error = %error, "webhook delivery attempt failed");
+            if self
+                .dispatch_delivery(delivery, &mut authority)
+                .await
+                .is_err()
+            {
+                tracing::warn!("webhook delivery attempt failed");
             }
         }
 
@@ -249,8 +253,8 @@ impl WebhookDispatcher {
 pub fn spawn_webhook_dispatcher(dispatcher: WebhookDispatcher) {
     rocket::tokio::spawn(async move {
         loop {
-            if let Err(error) = dispatcher.dispatch_due_once().await {
-                tracing::warn!(error = %error, "webhook dispatcher loop failed");
+            if dispatcher.dispatch_due_once().await.is_err() {
+                tracing::warn!("webhook dispatcher loop failed");
             }
 
             rocket::tokio::time::sleep(POLL_INTERVAL).await;
@@ -308,20 +312,20 @@ mod tests {
     const OWNER_DID: &str = "did:key:z6Mkpcii8rkJV79k3JV37Wm5utAU6WkRsziqXf6mpMs734vB";
     const SPACE_ID: &str = "tinycloud:key:z6Mkpcii8rkJV79k3JV37Wm5utAU6WkRsziqXf6mpMs734vB:files";
 
-    async fn test_tinycloud() -> Result<(TinyCloud, DatabaseConnection, ColumnEncryption)> {
+    async fn test_tinycloud() -> Result<(TempDir, TinyCloud, DatabaseConnection, ColumnEncryption)>
+    {
         let tempdir = TempDir::new()?;
         let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string())).await?;
         let storage = NodeFileSystemConfig::new(tempdir.path()).open().await?;
-        let _persisted = tempdir.keep();
         let encryption = ColumnEncryption::new([9u8; 32]);
-        let tinycloud = TinyCloud::new(
+        let tinycloud = TinyCloud::new_with_encryption(
             db.clone().into(),
             Either::B(storage),
             StaticSecret::new(vec![0u8; 32]).unwrap(),
+            Some(encryption.clone()),
         )
-        .await?
-        .with_encryption(Some(encryption.clone()));
-        Ok((tinycloud, db, encryption))
+        .await?;
+        Ok((tempdir, tinycloud, db, encryption))
     }
 
     async fn spawn_callback_server(
@@ -451,7 +455,7 @@ mod tests {
 
     #[tokio::test]
     async fn tc1132_dispatcher_rejects_excessive_attempt_config() -> Result<()> {
-        let (tinycloud, _, encryption) = test_tinycloud().await?;
+        let (_tempdir, tinycloud, _db, encryption) = test_tinycloud().await?;
         assert!(WebhookDispatcher::new(
             tinycloud,
             HooksConfig {
@@ -467,7 +471,7 @@ mod tests {
 
     #[tokio::test]
     async fn tc1132_sixth_failure_schedules_hour_backoff() -> Result<()> {
-        let (tinycloud, db, encryption) = test_tinycloud().await?;
+        let (_tempdir, tinycloud, db, encryption) = test_tinycloud().await?;
         let (callback, _receiver) =
             spawn_callback_server(StatusCode::INTERNAL_SERVER_ERROR).await?;
         let id = insert_pending_delivery(&db, &encryption, &callback, 5).await?;
@@ -502,7 +506,7 @@ mod tests {
     }
     #[tokio::test]
     async fn dispatches_due_delivery_and_marks_it_delivered() -> Result<()> {
-        let (tinycloud, db, encryption) = test_tinycloud().await?;
+        let (_tempdir, tinycloud, db, encryption) = test_tinycloud().await?;
         let (callback_url, mut receiver) = spawn_callback_server(StatusCode::OK).await?;
         let delivery_id = insert_pending_delivery(&db, &encryption, &callback_url, 0).await?;
         let dispatcher = WebhookDispatcher::new(
@@ -540,7 +544,7 @@ mod tests {
 
     #[tokio::test]
     async fn retries_then_dead_letters_failed_delivery() -> Result<()> {
-        let (tinycloud, db, encryption) = test_tinycloud().await?;
+        let (_tempdir, tinycloud, db, encryption) = test_tinycloud().await?;
         let (callback_url, _receiver) =
             spawn_callback_server(StatusCode::INTERNAL_SERVER_ERROR).await?;
         let delivery_id = insert_pending_delivery(&db, &encryption, &callback_url, 0).await?;
@@ -608,14 +612,13 @@ mod tests {
         // Booting the upgraded node applies the remaining migration.
         let tempdir = TempDir::new()?;
         let storage = NodeFileSystemConfig::new(tempdir.path()).open().await?;
-        let _persisted = tempdir.keep();
-        let tinycloud = TinyCloud::new(
+        let tinycloud = TinyCloud::new_with_encryption(
             db.clone().into(),
             Either::B(storage),
             StaticSecret::new(vec![0u8; 32]).unwrap(),
+            Some(encryption.clone()),
         )
-        .await?
-        .with_encryption(Some(encryption.clone()));
+        .await?;
         let dispatcher = WebhookDispatcher::new(
             tinycloud,
             HooksConfig::default(),
@@ -674,17 +677,7 @@ mod tests {
         const IDLE_CONNECTIONS: usize = 8;
 
         fn postgres_url(test: &str) -> Option<String> {
-            match std::env::var("TINYCLOUD_TEST_POSTGRES_URL") {
-                Ok(url) if !url.trim().is_empty() => Some(url),
-                _ => {
-                    assert!(
-                        std::env::var_os("CI").is_none(),
-                        "{test} requires TINYCLOUD_TEST_POSTGRES_URL, which is unset in CI (TC-381)"
-                    );
-                    eprintln!("skipping {test}: TINYCLOUD_TEST_POSTGRES_URL is unset");
-                    None
-                }
-            }
+            crate::test_support::postgres_test_url(test)
         }
 
         /// Resets the client connection that sends `marker`, before the
@@ -779,6 +772,7 @@ mod tests {
             holder: String,
             callback_url: String,
             callbacks: tokio::sync::mpsc::UnboundedReceiver<(String, String, String)>,
+            _tempdir: TempDir,
         }
 
         impl Fixture {
@@ -834,16 +828,15 @@ mod tests {
                     .open()
                     .await
                     .unwrap();
-                let _persisted = tempdir.keep();
                 let encryption = ColumnEncryption::new([9u8; 32]);
-                let tinycloud = TinyCloud::new(
+                let tinycloud = TinyCloud::new_with_encryption(
                     conn,
                     Either::B(storage),
                     StaticSecret::new(vec![0u8; 32]).unwrap(),
+                    Some(encryption.clone()),
                 )
                 .await
-                .unwrap()
-                .with_encryption(Some(encryption.clone()));
+                .unwrap();
 
                 let mut setup_options = ConnectOptions::new(url.to_owned());
                 setup_options
@@ -866,6 +859,7 @@ mod tests {
                     holder,
                     callback_url,
                     callbacks,
+                    _tempdir: tempdir,
                 }
             }
 

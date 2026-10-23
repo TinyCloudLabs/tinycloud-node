@@ -21,6 +21,10 @@
   "include": [
     "write-probe.ts",
     "probe-core.ts",
-    "probe-core.test.ts"
+    "probe-core.test.ts",
+    "db-saturation.ts",
+    "db-saturation-run.ts",
+    "db-saturation.test.ts",
+    "personal-node-check.ts"
   ]
 }

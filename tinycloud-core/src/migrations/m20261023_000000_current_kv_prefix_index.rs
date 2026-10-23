@@ -5,7 +5,7 @@ use sea_orm_migration::prelude::*;
 #[cfg(feature = "postgres")]
 use sea_orm_migration::SchemaManagerConnection;
 
-pub(crate) const NAME: &str = "m20261015_010000_current_kv_prefix_index";
+pub(crate) const NAME: &str = "m20261023_000000_current_kv_prefix_index";
 
 /// A dedicated connection holds the session advisory lock and has no
 /// statement timeout. Try the lock without waiting in a PostgreSQL query:

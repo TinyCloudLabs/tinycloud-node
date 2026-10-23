@@ -1,0 +1,13 @@
+{
+  "authority": "billing",
+  "overrides": {
+    "tinycloud:pkh:eip155:1:0xd559CCd9EB87c530A9a349262669386dE93cf412:applications": {
+      "limit_bytes": 5368709120,
+      "_comment": "Billing-mode FLOOR, verified read-only after each authorized deploy: billing /api/admin/storage-comp storage_limit_bytes must be >= this floor and node override_bytes must be null. Value from internal D1 quota_overrides (applications 5368709120), migrated to a billing comp via /storage (TC-1162/TC-1164). Merge only after that migration is verified."
+    },
+    "tinycloud:pkh:eip155:1:0xd559CCd9EB87c530A9a349262669386dE93cf412:secrets": {
+      "limit_bytes": 1073741824,
+      "_comment": "Billing-mode FLOOR, verified read-only after each authorized deploy: billing /api/admin/storage-comp storage_limit_bytes must be >= this floor and node override_bytes must be null. Value from internal D1 quota_overrides (secrets 1073741824, set by Sam via /storage 2026-10-17T05:36:53Z), migrated to a billing comp via /storage (TC-1162/TC-1164). Merge only after that migration is verified."
+    }
+  }
+}

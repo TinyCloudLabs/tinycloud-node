@@ -1,0 +1,102 @@
+{
+  "version": 1,
+  "common": {
+    "level": { "type": "enum", "values": ["debug", "info", "warn", "error"] },
+    "ts": { "type": "string", "regex": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$", "max_len": 24 },
+    "event": { "type": "event" }
+  },
+  "reader_output": {
+    "bucket": { "type": "string", "regex": "^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}$", "max_len": 19 },
+    "status_class": { "type": "enum", "values": ["1xx", "2xx", "3xx", "4xx", "5xx", "unknown"] },
+    "count": { "type": "integer", "min": 0, "max": 1000000000 }
+  },
+  "services": {
+    "ptx-batch": {
+      "events": [
+        "batch_artifact_deletion_failed",
+        "batch_claim_recovered",
+        "batch_artifact_reappeared_after_verified_deletion",
+        "batch_transcription_create",
+        "batch_transcription_cancel",
+        "batch_transcription_delete",
+        "batch_retention_lag_exceeded",
+        "batch_request_failed",
+        "batch_admission_mode_changed",
+        "batch_admission_stopped_by_disk_high_water",
+        "batch_upload_refused_by_disk_high_water",
+        "batch_upload_accepted",
+        "batch_upload_rejected",
+        "batch_job_finished",
+        "batch_claim_fenced_out",
+        "batch_job_failed_unexpectedly",
+        "batch_vad_fell_back_to_the_floor_threshold",
+        "batch_vad_could_not_cover_the_recording",
+        "batch_diarization_failed",
+        "batch_provider_rejected_the_service_credential_or_model",
+        "batch_job_failed_at_dispatch",
+        "batch_worker_heartbeat_failed",
+        "batch_sweep_failed",
+        "batch_worker_iteration_failed",
+        "batch_worker_started",
+        "batch_worker_heartbeat"
+      ],
+      "fields": {
+        "svc": { "type": "enum", "values": ["api", "worker"] },
+        "correlationId": { "type": "string", "regex": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", "max_len": 36 },
+        "transcriptionId": { "type": "string", "regex": "^trn_[0-9A-HJKMNP-TV-Z]{26}$", "max_len": 30 },
+        "job_id": { "type": "string", "regex": "^trn_[0-9A-HJKMNP-TV-Z]{26}$", "max_len": 30 },
+        "stage": { "type": "enum", "values": ["create", "cancel", "delete", "health", "api_unhandled", "admission", "upload", "deletion", "claim_recovery", "reconcile", "vad", "diarize", "pipeline", "fence", "dispatch", "heartbeat", "sweep", "loop"] },
+        "code": { "type": "enum", "values": ["invalid_request", "diarization_unavailable", "unauthorized", "insufficient_scope", "idempotency_conflict", "transcription_not_found", "active_transcription_exists", "recording_too_large", "quota_exceeded", "service_busy", "service_paused", "service_unavailable", "upload_capability_limit", "upload_capability_invalid", "upload_capability_expired", "upload_length_mismatch", "unsupported_media_type", "upload_in_progress", "upload_interrupted", "upload_rejected", "transcript_expired", "not_found", "internal_error", "upload_expired", "upload_integrity_failed", "invalid_audio", "recording_too_long", "unsupported_recording", "no_speech", "provider_unavailable", "provider_outcome_unknown", "processing_timeout", "processing_failed", "transcription_failed", "cancelled"], "nullable": true },
+        "alert": { "type": "boolean" },
+        "outcome": { "type": "enum", "values": ["completed", "failed", "no_speech"] },
+        "duration_seconds": { "type": "number", "min": 0, "max": 86400 },
+        "tinfoil_calls": { "type": "integer", "min": 0, "max": 100000, "nullable": true },
+        "tinfoil_audio_seconds": { "type": "number", "min": 0, "max": 7200, "nullable": true },
+        "voiced_seconds": { "type": "number", "min": 0, "max": 7200, "nullable": true },
+        "dropped_above_floor_pct": { "type": "number", "min": 0, "max": 100, "nullable": true },
+        "vad_fallback": { "type": "boolean", "nullable": true },
+        "segments": { "type": "integer", "min": 0, "max": 100000, "nullable": true },
+        "content_type": { "type": "enum", "values": ["audio/mpeg", "audio/wav", "audio/ogg", "audio/mp4", "audio/webm", "audio/flac"] },
+        "retentionLagSeconds": { "type": "number", "min": 0, "max": 31536000 },
+        "usedPercent": { "type": "number", "min": 0, "max": 100 },
+        "mode": { "type": "enum", "values": ["open", "drain", "closed"] },
+        "created": { "type": "boolean" }
+      }
+    },
+    "tinycloud-node": {
+      "events": [
+        "node_request",
+        "ingress_request",
+        "node_warning",
+        "node_error",
+        "logship_gate_summary_total"
+      ],
+      "fields": {
+        "svc": { "type": "enum", "values": ["api", "ingress", "logship"] },
+        "method": { "type": "enum", "values": ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "<other>"] },
+        "route": { "type": "enum", "values": ["/healthz", "/info", "/version", "/invoke", "/delegate", "/revoke", "/attestation", "/signed/kv", "/signed/kv/<ticket_id>", "/admin/quota", "/admin/quota/<space_id>", "/admin/usage", "/admin/stats", "/hooks/events", "/hooks/tickets", "/hooks/webhooks", "/hooks/webhooks/<subscription_id>", "/delegation/query", "/delegation/status", "/encryption/networks", "/encryption/networks/<network_id>", "/encryption/networks/<network_id>/revoke", "/encryption/networks/<network_id>/decrypt", "/policy/v3/status", "/policy/v3/status/<root_cid>", "/policy/v3/policies", "/policy/v3/challenges", "/policy/v3/delegations", "/policy/v3/enforcer-bindings", "/policy/v3/deliveries/authorize", "/.well-known/tinycloud/node-keys", "/.well-known/encryption/network/<name>", "/public/<space_id>/kv", "/public/<space_id>/kv/<key..>", "/peer/generate/<space>", "/evidences/<file>", "/share/v2/readiness", "/share/v2/policies", "/share/v2/policy/challenges", "/share/v2/policy/session", "/share/v2/invoke", "/share/v2/deliveries/authorize", "/<_s..>", "/public/<_space_id>/kv/<_key..>", "<unmatched>"] },
+        "status": { "type": "integer", "min": 100, "max": 599 },
+        "latency_us": { "type": "integer", "min": 0, "max": 9007199254740991 },
+        "request_time_seconds": { "type": "number", "min": 0, "max": 86400 },
+        "event_code": { "type": "enum", "values": ["invocation_replay_insert_failed", "invocation_replay_cleanup_failed", "dstack_get_info_failed", "share_local_tee_identity", "retention_hook_delivery_prune_failed", "retention_dead_letter_prune_failed", "retention_signed_ticket_prune_failed", "quota_invalid_body", "quota_fallback", "tunnel_state_load_failed", "tunnel_address_invalid", "link_state_load_failed", "link_bind_invalid", "link_address_invalid", "link_bind_failed", "link_bind_state_write_failed", "link_tls_config_failed", "link_listener_error", "link_listener_state_write_failed", "link_auto_renew_config_failed", "link_auto_renew_failed", "link_cert_reload_failed", "link_cert_state_missing", "link_listener_cert_reload_failed", "link_disable_failed", "link_connection_error", "link_listener_accept_failed", "webhook_delivery_failed", "webhook_dispatcher_failed", "share_authorization_failed", "share_native_authorization_denied", "share_native_kv_put_failed", "share_v2_readiness_failed", "share_invitation_key_missing", "share_invitation_key_mismatch", "share_policy_denied", "attestation_quote_failed", "hook_events_read_failed", "hook_rows_load_failed", "missing_committed_hook_row", "webhook_enqueue_failed", "tunnel_connection_prepare_failed", "tunnel_idle_timeout", "tunnel_read_failed", "tunnel_malformed_frame", "tunnel_relay_error", "tunnel_write_failed", "tunnel_state_record_failed", "tunnel_state_clear_failed", "tunnel_auth_rejected", "network_did_resolution_enabled", "unclassified", "sql_busy_lock_wait", "sql_busy_hydration", "sql_busy_artifact_transfer", "request_timeout", "deadline_overrun", "sql_hydration_timeout", "read_audit_busy", "read_audit_batch_slow", "read_audit_batch_failed", "read_audit_drain_stalled", "current_kv_c_index_missing", "current_kv_c_index_invalid", "current_kv_c_index_wrong_shape", "db_failure_5xx"] },
+        "event_count": { "type": "integer", "min": 1, "max": 9007199254740991 },
+        "reason": { "type": "enum", "values": ["malformed_envelope", "unexpected_label", "unlabelled", "non_json", "oversized", "partial", "invalid_fields", "unknown_target", "filtered_level"] },
+        "count": { "type": "integer", "min": 1, "max": 9007199254740991 },
+        "request_id": { "type": "string", "regex": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", "max_len": 36 },
+        "request_id_replaced": { "type": "boolean" },
+        "account_hash": { "type": "string", "regex": "^[0-9a-f]{64}$", "max_len": 64 },
+        "space_hash": { "type": "string", "regex": "^[0-9a-f]{64}$", "max_len": 64 },
+        "db_hash": { "type": "string", "regex": "^[0-9a-f]{64}$", "max_len": 64 },
+        "code": { "type": "enum", "values": ["unavailable_retryable", "outcome_unknown", "internal", "sql_busy", "request_timeout", "read_audit_busy"] },
+        "service": { "type": "enum", "values": ["sql", "duckdb", "kv", "other"] },
+        "elapsed_ms": { "type": "integer", "min": 0, "max": 9007199254740991 },
+        "failure_kind": { "type": "enum", "values": ["pool_timeout", "pool_closed", "io", "statement_timeout", "serialization", "connection_lost", "artifact_changed", "lock_wait", "hydration", "artifact_transfer", "request_timeout", "read_audit_busy", "other"] },
+        "write_may_have_applied": { "type": "boolean" }
+      }
+    },
+    "tinychat-backend": { "events": [], "fields": {} },
+    "tinycloud-mcp": { "events": [], "fields": {} },
+    "ptx-dev": { "events": [], "fields": {} },
+    "openkey-api": { "events": [], "fields": {} }
+  }
+}

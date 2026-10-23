@@ -11,10 +11,10 @@
 //! # What is driven
 //!
 //! The real node: `tinycloud::app_with_control` behind
-//! `rocket::local::asynchronous::Client`, so the pool is built by the
-//! production code with the production settings. Only its database URL
-//! differs: it points at an in-test TCP proxy in front of PostgreSQL, with TLS
-//! off and a throwaway schema on the search path. The flows are the node side
+//! `rocket::local::asynchronous::Client`, so the pool is built through the
+//! production configuration path. The budget fixture caps its pool as described
+//! below; its database URL points at an in-test TCP proxy in front of PostgreSQL,
+//! with TLS off and a throwaway schema on the search path. The flows are the node side
 //! of what `@tinycloud/node-sdk` sends, built with the SDK's own Rust half
 //! (`tinycloud-sdk-wasm`). The SDK's sign-in touches several spaces and
 //! repeats these requests for each; one space is enough to price them:
@@ -25,7 +25,9 @@
 //!   `CREATE TABLE IF NOT EXISTS`, through the TC-780 fence and resolve);
 //! - **kv put**: an `/invoke` `tinycloud.kv/put` of a new key;
 //! - **kv get**: an `/invoke` `tinycloud.kv/get` of that key, which waits for
-//!   the durable read-audit commit before it answers.
+//!   the durable read-audit commit before it answers;
+//! - **kv batch get / kv batch head**: one `/invoke` of `tinycloud.kv/get` or
+//!   `tinycloud.kv/metadata` over 100 keys (TC-1274).
 //!
 //! # What is counted
 //!
@@ -56,8 +58,16 @@
 //! The counts are deterministic without sleeping for them: every request is
 //! measured between two barriers that wait until every pooled connection is
 //! idle again, so the release ping of the last statement is inside the window
-//! and no request overlaps another's traffic. The flows run three times
-//! first, so the pool has grown to the connections it needs and the
+//! and no request overlaps another's traffic. The barriers cannot stop the
+//! webhook dispatcher from checking a connection out just after a mark, and a
+//! request that then finds no idle connection opens one and pays its
+//! `SET statement_timeout` round trip. So the pool is capped at `POOL_SIZE`
+//! and every connection it may hold is opened before the first flow, and a
+//! measured request that still opens a connection fails the test instead of
+//! being counted. The cap only keeps the fully opened pool small, because
+//! test binaries run concurrently against one CI PostgreSQL and the default
+//! of 100 connections each could exhaust it; a request's round trips do not
+//! depend on the pool size. The flows then run three times first, so the
 //! statements are prepared.
 //!
 //! # Budgets
@@ -67,12 +77,17 @@
 //! prints the measured counts for that. Run it with:
 //!
 //! ```text
-//! TINYCLOUD_TEST_POSTGRES_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres \
+//! TINYCLOUD_ALLOW_LOCAL_PG=1 \
+//! TINYCLOUD_TEST_POSTGRES_URL=postgres://<user>:<password>@<host>:<port>/<database> \
 //!   cargo test -p tinycloud-node --test postgres_round_trip_budget -- --nocapture
 //! ```
 //!
-//! Without `TINYCLOUD_TEST_POSTGRES_URL` the test skips, except under `CI`,
-//! where it fails (TC-381).
+//! PostgreSQL-backed tests connect only when `TINYCLOUD_TEST_POSTGRES_URL` is set
+//! and either `GITHUB_ACTIONS=true` (GitHub Actions) or `TINYCLOUD_ALLOW_LOCAL_PG=1`
+//! (an isolated server you started yourself). Otherwise they skip. On GitHub
+//! Actions, an unset URL fails the test (TC-381).
+
+mod common;
 
 use std::{
     collections::HashMap,
@@ -113,18 +128,45 @@ use tokio::{
     net::{TcpListener, TcpStream},
 };
 
-/// Round trips allowed per flow; see the module docs. Measured with
-/// `test_before_acquire(false)`, database identity resolve as one statement,
-/// the read audit as one statement and no second sequence lock (TC-951):
+/// Round trips allowed per flow; see the module docs. Each invocation's
+/// transaction-scoped authorization snapshot now fetches edges, delegations,
+/// abilities and revocations in one tagged query (TC-735); capability checks
+/// and connection-release pings are unchanged. Measured on PostgreSQL:
 ///
-/// - sign-in 75 = peer key 0 + host `/delegate` 17 + session `/delegate` 18
-///   + account-space SQL write 40;
-/// - kv put 37;
-/// - kv get 22, including the read-audit commit.
-const BUDGETS: [(&str, u64); 3] = [("sign-in", 75), ("kv put", 37), ("kv get", 22)];
+/// - sign-in 71 = peer key 0 + host `/delegate` 18 + session `/delegate` 19
+///   + account-space SQL write 34;
+/// - kv put 35;
+/// - kv get 16, including the read-audit commit.
+///
+/// TC-1274: each epoch-writing commit (both `/delegate`s and the kv put)
+/// gained one round trip, the `epoch_head` cache write, which replaces the
+/// head anti-join over the space's whole history (measured on main: 75, 37,
+/// 22; with the cache: 77, 38, 22).
+///
+/// TC-1274: a batch of 100 `kv/get` or `kv/metadata` capabilities is one
+/// `current_kv` lookup per space, so it costs what a single kv get costs
+/// (measured before the batching: 216 round trips and 98 `current_kv`
+/// statements for the 98 distinct keys the fixture asks for). The flows also
+/// check the responses against the fixture, and the test fails if a batch
+/// reads `current_kv` in more than one statement.
+///
+/// TC-735: the one-statement authorization snapshot (#302) removes six trips
+/// from sign-in and from every read invocation (kv get and both batches:
+/// main alone is 77 and 22) and three from kv put (main alone: 38).
+const BUDGETS: [(&str, u64); 5] = [
+    ("sign-in", 71),
+    ("kv put", 35),
+    ("kv get", 16),
+    ("kv batch get", 16),
+    ("kv batch head", 16),
+];
 
 /// Full sign-in plus put plus get rounds run before the measured one.
 const WARM_UP_ROUNDS: u8 = 3;
+
+/// Connections in the measured node's pool, all opened before the flows run;
+/// see the module docs.
+const POOL_SIZE: u32 = 4;
 
 /// The account space and SQL database the SDK bootstraps at sign-in.
 const ACCOUNT_SPACE: &str = "account";
@@ -144,26 +186,9 @@ const KV_VALUE: &[u8] = br#"{"version":1}"#;
 /// PostgreSQL protocol 3.0, the version field of a StartupMessage.
 const PROTOCOL_V3: i32 = 196_608;
 
-/// TC-381, mirroring `tinycloud_core::test_support::postgres_test_url`: skip
-/// locally when the URL is unset, but never on CI.
+/// TC-381: see `common::postgres_test_url`.
 fn postgres_test_url(test: &str) -> Option<String> {
-    match std::env::var("TINYCLOUD_TEST_POSTGRES_URL") {
-        Ok(url) if !url.trim().is_empty() => Some(url),
-        _ => {
-            if std::env::var_os("CI").is_some() {
-                panic!(
-                    "{test} requires TINYCLOUD_TEST_POSTGRES_URL, which is unset (or empty) in CI. \
-                     This test must not be allowed to skip on CI — see TC-381. Check the \
-                     `postgres` service container and the `env:` block in .github/workflows/rust.yml."
-                );
-            }
-            eprintln!(
-                "skipping {test}: TINYCLOUD_TEST_POSTGRES_URL is unset (set it to run this \
-                 locally; it is mandatory in CI)"
-            );
-            None
-        }
-    }
+    common::postgres_test_url(test)
 }
 
 // ---------------------------------------------------------------------------
@@ -559,6 +584,16 @@ impl Window {
         counts
     }
 
+    /// Counted statements that read `current_kv`: the KV index lookups.
+    fn current_kv_statements(&self) -> u64 {
+        self.round_trips
+            .iter()
+            .filter(|round_trip| round_trip.kind == Kind::Counted)
+            .flat_map(|round_trip| &round_trip.executed)
+            .filter(|sql| sql.contains(r#"FROM "current_kv""#))
+            .count() as u64
+    }
+
     fn describe(&self, out: &mut String) {
         for round_trip in &self.round_trips {
             let kind = match round_trip.kind {
@@ -621,6 +656,24 @@ impl Node {
             );
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
+    }
+
+    /// Open all `max` connections the pool may hold at once, then return them
+    /// to idle, so no later request has to connect.
+    async fn open_pool(&self, max: u32) -> Result<()> {
+        self.settle().await?;
+        let pool = self.pool();
+        let mut held = Vec::with_capacity(max as usize);
+        for _ in 0..max {
+            held.push(pool.acquire().await?);
+        }
+        ensure!(
+            pool.size() == max,
+            "the pool holds {} connections, not {max}",
+            pool.size()
+        );
+        drop(held);
+        self.settle().await
     }
 
     /// Dispatch `request` between two settled marks.
@@ -705,13 +758,27 @@ fn authorization(headers: &impl serde::Serialize) -> Result<String> {
 }
 
 fn invocation(session: &Session, service: &str, path: &str, ability: &str) -> Result<String> {
+    invocation_with(session, service, path, &[ability])
+}
+
+/// An invocation that holds several abilities on one resource, as the SDK
+/// sends for the account index (`write` for its rows, `schema` for its DDL).
+fn invocation_with(
+    session: &Session,
+    service: &str,
+    path: &str,
+    abilities: &[&str],
+) -> Result<String> {
     let invocation = session.invoke(
         [(
             service.parse::<Service>()?,
             path.parse::<Path>()?,
             None,
             None,
-            [ability.parse::<Ability>()?],
+            abilities
+                .iter()
+                .map(|ability| ability.parse::<Ability>())
+                .collect::<Result<Vec<_>, _>>()?,
         )],
         None,
     )?;
@@ -786,6 +853,7 @@ async fn round(node: &Node, account: &Account, out: &mut Vec<Measured>) -> Resul
                     vec![
                         "tinycloud.sql/read".parse()?,
                         "tinycloud.sql/write".parse()?,
+                        "tinycloud.sql/schema".parse()?,
                     ],
                 )]),
             ),
@@ -839,7 +907,12 @@ async fn round(node: &Node, account: &Account, out: &mut Vec<Measured>) -> Resul
                 .post("/invoke")
                 .header(Header::new(
                     "Authorization",
-                    invocation(&session, "sql", ACCOUNT_DATABASE, "tinycloud.sql/write")?,
+                    invocation_with(
+                        &session,
+                        "sql",
+                        ACCOUNT_DATABASE,
+                        &["tinycloud.sql/write", "tinycloud.sql/schema"],
+                    )?,
                 ))
                 .header(ContentType::JSON)
                 .body(serde_json::to_string(&sql)?),
@@ -883,6 +956,262 @@ async fn round(node: &Node, account: &Account, out: &mut Vec<Measured>) -> Resul
         read.as_bytes() == KV_VALUE,
         "kv get returned {read:?}, not the value just put"
     );
+    batch_reads(node, &session, out).await?;
+    Ok(())
+}
+
+/// Keys the batch flows read: `batch/000`..`batch/099` holding `v<n>`, of
+/// which `DELETED_KEY` is then deleted, plus two oversized values.
+const BATCH_ITEMS: usize = 100;
+const DELETED_KEY: usize = 7;
+const BIG_KEY: &str = "batch/big";
+const HUGE_KEY: &str = "batch/huge";
+const BIG_VALUE: [u8; 64] = [b'b'; 64];
+const HUGE_VALUE: [u8; 128] = [b'h'; 128];
+
+fn batch_key(index: usize) -> String {
+    format!("batch/{index:03}")
+}
+
+/// The value `key` holds after the fixture is written, or `None` when a read
+/// of it finds nothing (never written, or deleted).
+fn batch_value(key: &str) -> Option<Vec<u8>> {
+    match key {
+        BIG_KEY => Some(BIG_VALUE.to_vec()),
+        HUGE_KEY => Some(HUGE_VALUE.to_vec()),
+        _ => {
+            let index: usize = key.strip_prefix("batch/")?.parse().ok()?;
+            (index < BATCH_ITEMS && index != DELETED_KEY).then(|| format!("v{index}").into_bytes())
+        }
+    }
+}
+
+/// One invocation of `ability` over every key in `keys`, in that order.
+fn batch_invocation(session: &Session, ability: &str, keys: &[String]) -> Result<String> {
+    let ability: Ability = ability.parse()?;
+    let capabilities = keys
+        .iter()
+        .map(|key| {
+            Ok((
+                "kv".parse::<Service>()?,
+                key.parse::<Path>()?,
+                None,
+                None,
+                [ability.clone()],
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(session.invoke(capabilities, None)?.encode()?)
+}
+
+/// The keys a 100-key batch asks for, in request order: a permutation of the
+/// fixture (so present, deleted and capability order all vary), with a
+/// duplicate pair and two keys that were never written.
+fn batch_request() -> Vec<String> {
+    let mut keys: Vec<String> = (0..BATCH_ITEMS)
+        .map(|n| batch_key(n * 37 % BATCH_ITEMS))
+        .collect();
+    keys[10] = keys[3].clone();
+    keys[90] = keys[3].clone();
+    keys[50] = "batch/missing-a".to_owned();
+    keys[51] = "batch/missing-b".to_owned();
+    keys
+}
+
+/// An invocation's capabilities are a map: a repeated key is one capability,
+/// and the order they are answered in is the map's, by resource.
+fn capability_order(keys: &[String]) -> Vec<String> {
+    let mut order = keys.to_vec();
+    order.sort();
+    order.dedup();
+    order
+}
+
+/// The error for the first key, in `order`, whose value is over `limit`.
+fn batch_too_large(order: &[String], limit: usize) -> Option<String> {
+    order.iter().find_map(|key| {
+        let size = batch_value(key)?.len();
+        (size > limit).then(|| {
+            format!("KV response is {size} bytes, exceeding the requested limit of {limit} bytes")
+        })
+    })
+}
+
+async fn batch_put(node: &Node, session: &Session, key: &str, value: &[u8]) -> Result<()> {
+    let (status, body, _) = dispatch(
+        node.client
+            .post("/invoke")
+            .header(Header::new(
+                "Authorization",
+                invocation(session, "kv", key, "tinycloud.kv/put")?,
+            ))
+            .header(ContentType::JSON)
+            .body(value),
+    )
+    .await;
+    expect_ok("batch fixture put", (status, body))?;
+    Ok(())
+}
+
+fn parse_batch(body: &str) -> Result<Vec<serde_json::Value>> {
+    let parsed: serde_json::Value = serde_json::from_str(body)?;
+    Ok(parsed["results"]
+        .as_array()
+        .context("batch response has results")?
+        .clone())
+}
+
+/// Batch `kv/get` and `kv/metadata` reads of 100 keys (TC-1274): measured as
+/// two flows, with the response of each checked against the fixture, so the
+/// same assertions hold before and after the reads are batched in the node.
+async fn batch_reads(node: &Node, session: &Session, out: &mut Vec<Measured>) -> Result<()> {
+    for index in 0..BATCH_ITEMS {
+        let key = batch_key(index);
+        batch_put(
+            node,
+            session,
+            &key,
+            &batch_value(&key).unwrap_or_else(|| b"gone".to_vec()),
+        )
+        .await?;
+    }
+    batch_put(node, session, BIG_KEY, &BIG_VALUE).await?;
+    batch_put(node, session, HUGE_KEY, &HUGE_VALUE).await?;
+    let (status, body, _) = dispatch(node.client.post("/invoke").header(Header::new(
+        "Authorization",
+        invocation(session, "kv", &batch_key(DELETED_KEY), "tinycloud.kv/del")?,
+    )))
+    .await;
+    expect_ok("batch fixture delete", (status, body))?;
+
+    let keys = batch_request();
+    let order = capability_order(&keys);
+    let auth = |ability: &str, keys: &[String]| -> Result<Header<'static>> {
+        Ok(Header::new(
+            "Authorization",
+            batch_invocation(session, ability, keys)?,
+        ))
+    };
+
+    let body = expect_ok(
+        "batch get",
+        node.measure(
+            "kv batch get",
+            "POST /invoke kv/get x100",
+            node.client
+                .post("/invoke")
+                .header(auth("tinycloud.kv/get", &keys)?),
+            out,
+        )
+        .await?,
+    )?;
+    let results = parse_batch(&body)?;
+    ensure!(
+        results.len() == order.len(),
+        "batch get returned {} results",
+        results.len()
+    );
+    let mut etags = HashMap::new();
+    for (key, result) in order.iter().zip(&results) {
+        ensure!(
+            result["key"] == key.as_str(),
+            "result order: {key} is {}",
+            result["key"]
+        );
+        match batch_value(key) {
+            Some(value) => {
+                ensure!(result["ok"] == true, "{key} must be found: {result}");
+                let data = base64::decode(result["dataBase64"].as_str().context("data")?)?;
+                ensure!(data == value, "{key} returned {data:?}");
+                etags.insert(key.clone(), result["headers"]["etag"].clone());
+            }
+            None => ensure!(
+                result["ok"] == false && result["error"]["code"] == "KV_NOT_FOUND",
+                "{key} must be missing: {result}"
+            ),
+        }
+    }
+    let get_digest = hex::encode(Keccak256::digest(body.as_bytes()));
+
+    let body = expect_ok(
+        "batch head",
+        node.measure(
+            "kv batch head",
+            "POST /invoke kv/metadata x100",
+            node.client
+                .post("/invoke")
+                .header(auth("tinycloud.kv/metadata", &keys)?),
+            out,
+        )
+        .await?,
+    )?;
+    let heads = parse_batch(&body)?;
+    ensure!(
+        heads.len() == order.len(),
+        "batch head returned {} results",
+        heads.len()
+    );
+    for (key, head) in order.iter().zip(&heads) {
+        ensure!(
+            head["key"] == key.as_str(),
+            "head order: {key} is {}",
+            head["key"]
+        );
+        match etags.get(key) {
+            Some(etag) => ensure!(
+                head["ok"] == true
+                    && head.get("dataBase64").is_none()
+                    && head["headers"]["etag"] == *etag,
+                "{key} head: {head}"
+            ),
+            None => ensure!(head["ok"] == false, "{key} head: {head}"),
+        }
+    }
+    let head_digest = hex::encode(Keccak256::digest(body.as_bytes()));
+    println!("TC-1274 batch body digests: get {get_digest}, head {head_digest}");
+
+    // The per-key response limit: the first oversized capability, in
+    // capability order, is the one reported (not the largest), and a value of
+    // exactly the limit is not oversized.
+    fn sized<'a>(
+        node: &'a Node,
+        session: &Session,
+        keys: &[String],
+        limit: u64,
+    ) -> Result<LocalRequest<'a>> {
+        Ok(node
+            .client
+            .post("/invoke")
+            .header(Header::new(
+                "Authorization",
+                batch_invocation(session, "tinycloud.kv/get", keys)?,
+            ))
+            .header(Header::new(
+                "x-tinycloud-max-response-bytes",
+                limit.to_string(),
+            )))
+    }
+    for limit in [32, 64] {
+        let keys = [
+            batch_key(1),
+            HUGE_KEY.to_owned(),
+            batch_key(2),
+            BIG_KEY.to_owned(),
+        ];
+        let expected = batch_too_large(&capability_order(&keys), limit as usize)
+            .context("an oversized key")?;
+        let (status, body, _) = dispatch(sized(node, session, &keys, limit)?).await;
+        ensure!(
+            status == Status::PayloadTooLarge && body == expected,
+            "limit {limit}: {status} {body} (expected {expected})"
+        );
+    }
+    let keys = [batch_key(1), BIG_KEY.to_owned(), batch_key(2)];
+    let (status, body, _) = dispatch(sized(node, session, &keys, 64)?).await;
+    ensure!(
+        status == Status::Ok,
+        "a value of exactly the limit: {status} {body}"
+    );
     Ok(())
 }
 
@@ -910,12 +1239,18 @@ fn upstream(url: &str) -> Result<(String, u16)> {
     Ok((host, url.port().unwrap_or(5432)))
 }
 
-/// The real node, its pool behind the test proxy (with `cut`), on `schema`.
-async fn start_node(url: &str, schema: &str, cut: Cut) -> Result<(Node, tempfile::TempDir)> {
+/// The real node, its pool behind the test proxy (with `cut`), on `schema`;
+/// `max_connections` overrides the pool's default size.
+async fn start_node(
+    url: &str,
+    schema: &str,
+    cut: Cut,
+    max_connections: Option<u32>,
+) -> Result<(Node, tempfile::TempDir)> {
     let wire = Wire::default();
     let proxy = start_proxy(upstream(url)?, wire.clone(), cut).await?;
     let datadir = tempfile::TempDir::new()?;
-    let overlay = format!(
+    let mut overlay = format!(
         r#"
 log_level = "critical"
 [storage]
@@ -924,11 +1259,18 @@ database = "{}"
 [keys]
 type = "Static"
 secret = "{}"
+# Background traffic that is not a request's (TC-1274): off, so it cannot
+# land inside a measured window.
+[epoch_head_backfill]
+enabled = false
 "#,
         datadir.path().join("data").display(),
         proxied_url(url, proxy, schema)?,
         base64::encode_config([7u8; 32], base64::URL_SAFE_NO_PAD),
     );
+    if let Some(max_connections) = max_connections {
+        let _ = write!(overlay, "[database]\nmax_connections = {max_connections}\n");
+    }
     let figment = rocket::Config::figment()
         .merge(Serialized::defaults(tinycloud::config::Config::default()))
         .merge(Toml::string(&overlay));
@@ -942,9 +1284,10 @@ secret = "{}"
 }
 
 async fn run(url: &str, schema: &str) -> Result<Vec<Measured>> {
-    let (node, _datadir) = start_node(url, schema, Cut::default()).await?;
+    let (node, _datadir) = start_node(url, schema, Cut::default(), Some(POOL_SIZE)).await?;
 
     let result = async {
+        node.open_pool(POOL_SIZE).await?;
         let mut warm_up = Vec::new();
         for seed in 1..=WARM_UP_ROUNDS {
             round(&node, &Account::new(seed)?, &mut warm_up)
@@ -1006,15 +1349,30 @@ async fn postgres_round_trip_budget() {
             total += counts;
             let _ = writeln!(
                 detail,
-                "    {:<34} {:>3} rt  {:>3} stmt  {} cache  {} excl  {} conn",
+                "    {:<34} {:>3} rt  {:>3} stmt ({} current_kv)  {} cache  {} excl  {} conn",
                 request.request,
                 counts.round_trips,
                 counts.statements,
+                request.window.current_kv_statements(),
                 counts.statement_cache,
                 counts.excluded,
                 counts.connections
             );
             request.window.describe(&mut detail);
+            if counts.connections > 0 {
+                violations.push(format!(
+                    "{flow}: {} opened {} connection(s) inside its measured window",
+                    request.request, counts.connections
+                ));
+            }
+            // TC-1274: a 100-key batch does O(1) KV lookups, not one per key.
+            if flow.starts_with("kv batch") && request.window.current_kv_statements() > 1 {
+                violations.push(format!(
+                    "{flow}: {} read current_kv in {} statements, not one",
+                    request.request,
+                    request.window.current_kv_statements()
+                ));
+            }
         }
         let _ = writeln!(
             report,
@@ -1035,9 +1393,139 @@ async fn postgres_round_trip_budget() {
     println!("{report}");
     assert!(
         violations.is_empty(),
-        "PostgreSQL round-trip budget exceeded (TC-951):\n  {}\n\n{report}",
+        "PostgreSQL round-trip budget check failed (TC-951):\n  {}\n\n{report}",
         violations.join("\n  ")
     );
+}
+
+/// TC-1482: `GET /admin/stats` answers from one statement however many spaces
+/// the node holds. Its round trips are counted with 3 spaces and again with
+/// 303 and must be equal, and the window must hold exactly one statement:
+/// the `/admin/usage` shape (one `store_size` call per space) would grow with
+/// the space count and fail both checks.
+///
+/// Measured on PostgreSQL: 2 round trips per request, the statement itself
+/// and sqlx's release ping, with exactly 1 statement.
+const ADMIN_STATS_BUDGET: u64 = 2;
+const ADMIN_STATS_TOKEN: &str = "tc1482-round-trip-token-6e1f0b3a9c5d8274";
+
+/// `count` spaces named from `first`, each owned by its own address and
+/// holding one live key, inserted by two statements outside the proxy.
+async fn seed_stats_spaces(seed: &impl ConnectionTrait, first: u64, count: u64) -> Result<()> {
+    let last = first + count - 1;
+    let id = "'tinycloud:pkh:eip155:1:0x' || lpad(to_hex(g), 40, '0') || ':default'";
+    for sql in [
+        format!("INSERT INTO space (id) SELECT {id} FROM generate_series({first}, {last}) g"),
+        format!(
+            "INSERT INTO current_kv (space, key, invocation, seq, epoch, epoch_seq, value, \
+             metadata, deleted) SELECT {id}, 'k', '\\x01'::bytea, 1, '\\x02'::bytea, 1, \
+             '\\x03'::bytea, '{{}}'::json, false FROM generate_series({first}, {last}) g"
+        ),
+    ] {
+        seed.execute(Statement::from_string(DbBackend::Postgres, sql))
+            .await?;
+    }
+    Ok(())
+}
+
+async fn measure_stats(node: &Node, expected_owners: u64) -> Result<Window> {
+    let mut out = Vec::new();
+    let request = node.client.get("/admin/stats").header(Header::new(
+        "Authorization",
+        format!("Bearer {ADMIN_STATS_TOKEN}"),
+    ));
+    let (status, body) = node
+        .measure("admin stats", "GET /admin/stats", request, &mut out)
+        .await?;
+    ensure!(status == Status::Ok, "GET /admin/stats answered {status}");
+    let body: serde_json::Value = serde_json::from_str(&body)?;
+    ensure!(
+        body["count"] == expected_owners,
+        "expected {expected_owners} owners, the route returned {}",
+        body["count"]
+    );
+    Ok(out.pop().context("no measured window")?.window)
+}
+
+async fn admin_stats_windows(url: &str, schema: &str) -> Result<(Window, Window)> {
+    let (node, _datadir) = start_node(url, schema, Cut::default(), Some(POOL_SIZE)).await?;
+    let result = async {
+        node.open_pool(POOL_SIZE).await?;
+        let mut scoped = reqwest::Url::parse(url)?;
+        scoped
+            .query_pairs_mut()
+            .append_pair("options", &format!("-c search_path={schema}"));
+        let seed = Database::connect(scoped.as_str()).await?;
+
+        seed_stats_spaces(&seed, 1, 3).await?;
+        // Prepare the statement on every pooled connection first.
+        for _ in 0..(2 * POOL_SIZE) {
+            measure_stats(&node, 3).await?;
+        }
+        let few = measure_stats(&node, 3).await?;
+
+        seed_stats_spaces(&seed, 1_000, 300).await?;
+        let many = measure_stats(&node, 303).await?;
+        seed.close().await?;
+        Ok((few, many))
+    }
+    .await;
+    node.pool().close().await;
+    result
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_admin_stats_is_one_round_trip_for_any_space_count() {
+    let Some(url) = postgres_test_url("postgres_admin_stats_is_one_round_trip") else {
+        return;
+    };
+    let admin = Database::connect(url.as_str())
+        .await
+        .expect("connect to PostgreSQL");
+    let schema = format!(
+        "tc1482_rt_{}_{}",
+        std::process::id(),
+        time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+    );
+    admin
+        .execute(Statement::from_string(
+            DbBackend::Postgres,
+            format!("CREATE SCHEMA {schema}"),
+        ))
+        .await
+        .expect("create the isolated schema");
+    std::env::set_var("NODE_STATS_READ_TOKEN", ADMIN_STATS_TOKEN);
+    let result = admin_stats_windows(&url, &schema).await;
+    std::env::remove_var("NODE_STATS_READ_TOKEN");
+    admin
+        .execute(Statement::from_string(
+            DbBackend::Postgres,
+            format!("DROP SCHEMA {schema} CASCADE"),
+        ))
+        .await
+        .expect("drop the isolated schema");
+    let (few, many) = result.expect("measure GET /admin/stats");
+
+    let (few_counts, many_counts) = (few.counts(), many.counts());
+    let mut report = String::from("TC-1482 GET /admin/stats\n  3 spaces:\n");
+    few.describe(&mut report);
+    let _ = writeln!(report, "  303 spaces:");
+    many.describe(&mut report);
+    println!("{report}");
+    assert_eq!(
+        (few_counts.round_trips, few_counts.statements),
+        (many_counts.round_trips, many_counts.statements),
+        "the round trips must not depend on the number of spaces:\n{report}"
+    );
+    assert_eq!(
+        many_counts.statements, 1,
+        "GET /admin/stats must run exactly one statement:\n{report}"
+    );
+    assert_eq!(
+        many_counts.round_trips, ADMIN_STATS_BUDGET,
+        "round trips changed from the budget:\n{report}"
+    );
+    assert_eq!(many_counts.connections, 0, "opened a connection:\n{report}");
 }
 
 /// A signed session for `account`, with the same abilities the SDK asks for.
@@ -1169,7 +1657,7 @@ async fn postgres_write_routes_tell_retryable_failures_from_unknown_outcomes() {
         .await
         .expect("create the isolated schema");
     let cut = Cut::default();
-    let (node, _datadir) = start_node(&url, &schema, cut.clone())
+    let (node, _datadir) = start_node(&url, &schema, cut.clone(), None)
         .await
         .expect("start the node");
 
@@ -1355,7 +1843,7 @@ async fn postgres_info_reports_connection_counters() {
         ))
         .await
         .expect("create the isolated schema");
-    let (node, _datadir) = start_node(&url, &schema, Cut::default())
+    let (node, _datadir) = start_node(&url, &schema, Cut::default(), None)
         .await
         .expect("start the node");
 
