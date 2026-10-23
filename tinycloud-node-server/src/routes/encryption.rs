@@ -668,8 +668,11 @@ fn map_service_err(err: EncryptionServiceError) -> (Status, String) {
         EncryptionServiceError::DeletableUnavailable
         | EncryptionServiceError::KeyBlocked
         | EncryptionServiceError::KeyLimitExceeded
-        | EncryptionServiceError::KeyUnwrapFailed(_) => Status::Forbidden,
-        EncryptionServiceError::CorruptKeyRow => Status::InternalServerError,
+        | EncryptionServiceError::KeyUnwrapFailed(_)
+        | EncryptionServiceError::OwnerOnly(_) => Status::Forbidden,
+        EncryptionServiceError::CorruptKeyRow | EncryptionServiceError::DeletionLedger(_) => {
+            Status::InternalServerError
+        }
         EncryptionServiceError::KeyPathInvalid(_) => Status::BadRequest,
         EncryptionServiceError::InvalidBody(_)
         | EncryptionServiceError::InvalidReceiverPublicKey

@@ -565,6 +565,10 @@ pub fn resolve_runtime_config(tinycloud_config: &Config) -> Result<Config> {
         .validate()
         .map_err(anyhow::Error::msg)?;
     resolved.sql_store.validate().map_err(anyhow::Error::msg)?;
+    resolved
+        .encryption_network
+        .validate()
+        .map_err(anyhow::Error::msg)?;
     tracing::RequestIdOrigins::new(&resolved.log.request_id_first_party_origins)
         .map_err(anyhow::Error::msg)?;
     resolved.storage.resolve();
@@ -826,8 +830,17 @@ pub async fn app_with_control(
     tinycloud.set_read_audit_wait(Duration::from_millis(
         tinycloud_config.database.read_audit_wait_ms,
     ));
-    let encryption_service =
-        encryption_service.with_sqlite_writer_lock(tinycloud.sqlite_writer_lock());
+    let deletion_ledger = tinycloud_config
+        .encryption_network
+        .deletion_ledger_path
+        .as_deref()
+        .map(tinycloud_core::encryption_network::deletion_ledger::DeletionLedger::open)
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("failed to open the deletion ledger: {error}"))?
+        .map(Arc::new);
+    let encryption_service = encryption_service
+        .with_sqlite_writer_lock(tinycloud.sqlite_writer_lock())
+        .with_deletion_ledger(deletion_ledger);
     let database_artifact_repository: Arc<dyn DatabaseArtifactRepository> =
         Arc::new(SizeTrackingArtifactRepository::new(
             Arc::new(node_artifact_repository(&tinycloud)),

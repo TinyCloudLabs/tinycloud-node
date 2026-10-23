@@ -63,15 +63,39 @@ pub struct Config {
 
 /// Release gates for the encryption network routes. `named_keys_v1`
 /// advertises the `encryption-named-keys-v1` feature in `/info` and turns on
-/// named keys: the key create, describe, public key, block and unblock
-/// routes are mounted, delegations may grant on key and key-prefix
+/// named keys: the key create, describe, public key, block, unblock and
+/// delete routes are mounted, delegations may grant on key and key-prefix
 /// resources, and named-key decrypt is served on `POST /invoke`. It stays off
 /// until named keys are live on OpenKey; while off, those routes answer 404
 /// and key resources are refused with `named_keys_unavailable`.
+///
+/// `deletion_ledger_path` is the append-only file, outside the database, that
+/// records every deleted key (one JSON line each). It is required while
+/// `named_keys_v1` is on, and must be an absolute path.
 #[derive(Serialize, Deserialize, Debug, Default, Clone, Hash, PartialEq, Eq)]
 pub struct EncryptionNetworkConfig {
     #[serde(default)]
     pub named_keys_v1: bool,
+    #[serde(default)]
+    pub deletion_ledger_path: Option<std::path::PathBuf>,
+}
+
+impl EncryptionNetworkConfig {
+    /// Startup validation. Does not touch the filesystem; the ledger file is
+    /// opened when the node starts.
+    pub fn validate(&self) -> Result<(), String> {
+        match (&self.deletion_ledger_path, self.named_keys_v1) {
+            (None, true) => Err(
+                "encryption_network.deletion_ledger_path is required when named_keys_v1 is on"
+                    .to_string(),
+            ),
+            (None, false) => Ok(()),
+            (Some(path), _) => {
+                tinycloud_core::encryption_network::deletion_ledger::validate_path(path)
+                    .map_err(|reason| format!("encryption_network.deletion_ledger_path {reason}"))
+            }
+        }
+    }
 }
 
 /// `[global.sql]` release gate for delegated SQL caveats (TC-1791).
@@ -1913,6 +1937,35 @@ mod tests {
     fn encryption_network_named_keys_parses_from_toml() {
         let config: EncryptionNetworkConfig = toml::from_str("named_keys_v1 = true").unwrap();
         assert!(config.named_keys_v1);
+    }
+
+    #[test]
+    fn deletion_ledger_path_is_required_while_named_keys_are_on() {
+        let off: EncryptionNetworkConfig = toml::from_str("").unwrap();
+        assert!(off.validate().is_ok());
+
+        let missing: EncryptionNetworkConfig = toml::from_str("named_keys_v1 = true").unwrap();
+        assert!(missing
+            .validate()
+            .unwrap_err()
+            .contains("deletion_ledger_path is required"));
+
+        let present: EncryptionNetworkConfig = toml::from_str(
+            "named_keys_v1 = true\ndeletion_ledger_path = \"/var/lib/tinycloud/ledger.jsonl\"",
+        )
+        .unwrap();
+        assert!(present.validate().is_ok());
+    }
+
+    #[test]
+    fn deletion_ledger_path_must_be_an_absolute_file_path() {
+        for bad in ["", "ledger.jsonl", "/var/lib/", "/a/../b"] {
+            let config = EncryptionNetworkConfig {
+                named_keys_v1: false,
+                deletion_ledger_path: Some(bad.into()),
+            };
+            assert!(config.validate().is_err(), "{bad:?}");
+        }
     }
 
     #[test]
