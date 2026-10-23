@@ -29,6 +29,7 @@ pub mod auth_guards;
 pub mod authorization;
 pub mod cli;
 pub mod config;
+pub mod delivery_link;
 pub mod dstack;
 pub mod egress;
 pub mod epoch_head_backfill;
@@ -872,7 +873,16 @@ pub async fn app_with_control(
         PolicyV3Runtime::new(seed_conn.clone(), key_setup.node_did(), key_setup.clone())
             .with_sqlite_writer_lock(tinycloud.sqlite_writer_lock());
     if tinycloud_config.share_email.enabled {
-        policy_v3_runtime = policy_v3_runtime.with_delivery(&tinycloud_config.share_email)?;
+        let links_origin =
+            links_fetch::LinksOrigin::parse(&tinycloud_config.share_email.links_origin)
+                .map_err(|error| anyhow::anyhow!(error))?;
+        let links = Arc::new(links_fetch::ApiLinkFetcher::new(
+            egress_policy.clone(),
+            links_origin,
+            tinycloud_config.share_email.links_origin_allow_private,
+        ));
+        policy_v3_runtime =
+            policy_v3_runtime.with_delivery(&tinycloud_config.share_email, links)?;
     }
     // The pinned issuer set is built (and every set-load rule applied) whether
     // or not share-email is enabled; a violation stops the node from starting.

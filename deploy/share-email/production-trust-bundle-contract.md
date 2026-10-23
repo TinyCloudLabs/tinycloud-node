@@ -22,13 +22,21 @@ match the origin receiving `POST /v1/credential-invitations`.
 Node exposes Policy/v3 admission/control and ordinary `/delegate` and `/invoke`
 data-plane routes only; it does not expose `/share` routes or proxy delivery.
 
-For addressed delivery, Share sends the SDK's `sealedEnvelope` and
-`envelopeKey` request fields. The recipient-bearing, owner-signed envelope is
-AES-256-GCM sealed; its CID addresses `/s/<cid>` and its envelope key is kept
-only in `#k=<key>`. This key unwraps share-envelope metadata, not document
-content. Node rejects plaintext recipient envelopes in a query or path and
-checks that the sealed CID, decrypted canonical envelope, exact recipient, and
-delivery authorization all agree.
+For addressed delivery, Share sends `POST /policy/v3/deliveries/authorize` a
+body of `shareUrl`, `recipientEmail`, `documentName`, `jti`, `expiresAt` and
+`requestBodyDigest`. `shareUrl` is the short link
+`<returnOrigin>/s/<id>#v=4&k=<key>&c=<cid>`: the id names a record in the links
+API, the key is the AES-256-GCM key of the record's sealed envelope and `c` is
+the CID of the sealed bytes. The key stays in the link's fragment. Node reads
+the record for `<id>` from `share_email.links_origin` (default
+`https://api.tinycloud.xyz`; `https://host[:port]` only, checked when the
+configuration loads; `share_email.links_origin_allow_private = true` permits a
+host on a private network for a self-hosted links API), checks that the
+record's header is signed by the policy owner's key, that the sealed bytes
+match both `bodyCid` and `c`, that the record expires no later than the share,
+and that the decrypted canonical envelope, exact recipient and delivery
+authorization all agree. Node never writes the link or its key to a log, an
+error response or a stored row.
 
 The node identity must be internally exact, not merely a canonical DID:
 

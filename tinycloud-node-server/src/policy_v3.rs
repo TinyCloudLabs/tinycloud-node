@@ -48,7 +48,12 @@ use tinycloud_core::{
     RecoveringConnection,
 };
 
-use crate::{authorization::AuthHeaderGetter, config::ShareEmailConfig};
+use crate::{
+    authorization::AuthHeaderGetter,
+    config::ShareEmailConfig,
+    delivery_link::{open_link_record, ShortLink},
+    links_fetch::{LinkFetchError, LinkRecordFetcher},
+};
 
 pub const POLICY_SESSION_PROFILE: &str = "policy-session-ucan/v1";
 pub const POLICY_V1_SCHEMA: &str = "xyz.tinycloud.policy/policy/v1";
@@ -75,18 +80,19 @@ const NATIVE_PROJECTION_DOMAIN: &[u8] = b"xyz.tinycloud.policy/NativeProjection/
 /// Default lifetime of a minted policy session when the holder does not ask
 /// for a longer grant (older clients reject anything longer).
 const MAX_SESSION_TTL_SECONDS: i64 = 60;
-const DELIVERY_ADMISSION_DOMAIN: &[u8] = b"xyz.tinycloud.policy/delivery-admission/v0\0";
-const SEALED_ENVELOPE_AAD: &[u8] = b"tinycloud-share-envelope-v1";
-const SEALED_ENVELOPE_VERSION: u8 = 1;
-const SEALED_ENVELOPE_NONCE_BYTES: usize = 12;
-const SEALED_ENVELOPE_TAG_BYTES: usize = 16;
+const DELIVERY_ADMISSION_DOMAIN: &[u8] = b"xyz.tinycloud.policy/delivery-admission/v1\0";
+pub(crate) const SEALED_ENVELOPE_AAD: &[u8] = b"tinycloud-share-envelope-v1";
+pub(crate) const SEALED_ENVELOPE_VERSION: u8 = 1;
+pub(crate) const SEALED_ENVELOPE_NONCE_BYTES: usize = 12;
+pub(crate) const SEALED_ENVELOPE_TAG_BYTES: usize = 16;
+#[cfg_attr(not(test), allow(dead_code))]
 const MAX_SEALED_ENVELOPE_BYTES: usize = 4 * 1024 * 1024;
 // The reviewed `tinycloud.email-proof/v1` descriptor defines a 300-second
 // freshness bound for its non-revocable status. This is pinned here rather
 // than trusting the unsigned transport envelope around the SD-JWT.
 const EMAIL_PROOF_STATUS_FRESHNESS_SECONDS: i64 = 300;
 const INVITATION_REQUEST_SCHEMA: &str = "xyz.tinycloud.credentials/invitation-request/v1";
-const DELIVERY_ADMISSION_SCHEMA: &str = "xyz.tinycloud.policy/delivery-admission/v0";
+const DELIVERY_ADMISSION_SCHEMA: &str = "xyz.tinycloud.policy/delivery-admission/v1";
 /// OpenCredentials profile whose signed `emailDomain` claim backs domain shares.
 const EMAIL_DOMAIN_PROOF_PROFILE: &str = "tinycloud.email-domain-proof/v1";
 /// How many of the policy owner's own delegations are tried as proof of the
@@ -99,6 +105,8 @@ struct DeliveryRuntime {
     target_origin: String,
     return_origin: String,
     invitation_origin: String,
+    /// Reads the record a short link points at, from the configured links API.
+    links: Arc<dyn LinkRecordFetcher>,
 }
 
 #[derive(Clone)]
@@ -148,7 +156,13 @@ impl PolicyV3Runtime {
     /// Configure the Node-owned, proof-producing delivery boundary. The
     /// signing key must be the same derived key published in the operator's
     /// trust bundle; an absent or mismatched key keeps v3 delivery disabled.
-    pub fn with_delivery(mut self, config: &ShareEmailConfig) -> anyhow::Result<Self> {
+    /// `links` reads the record for the short link a delivery is authorized
+    /// for.
+    pub fn with_delivery(
+        mut self,
+        config: &ShareEmailConfig,
+        links: Arc<dyn LinkRecordFetcher>,
+    ) -> anyhow::Result<Self> {
         if !config.enabled {
             return Ok(self);
         }
@@ -169,6 +183,7 @@ impl PolicyV3Runtime {
             target_origin: config.target_origin.clone(),
             return_origin: config.return_origin.clone(),
             invitation_origin,
+            links,
         });
         Ok(self)
     }
@@ -935,19 +950,62 @@ pub struct RegisterResponse {
     pub enforcement_root_cid: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+/// The body of `POST /policy/v3/deliveries/authorize`. The node reads the
+/// share record from the short link in `shareUrl`; the link's fragment holds
+/// the key, so this type has no `Debug` output that includes it.
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DeliveryAuthorizationRequest {
-    pub envelope: Value,
-    pub sealed_envelope: String,
-    pub envelope_key: String,
-    pub share_cid: String,
-    pub recipient_email: String,
     pub share_url: String,
+    pub recipient_email: String,
     pub document_name: String,
     pub jti: String,
     pub expires_at: String,
     pub request_body_digest: String,
+}
+
+impl std::fmt::Debug for DeliveryAuthorizationRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DeliveryAuthorizationRequest(..)")
+    }
+}
+
+/// The delivery authorization body as a data guard. Rocket's `Json` guard
+/// logs the whole request body when parsing fails, and this body holds a link
+/// with its key; this guard reads and parses the same JSON with the same
+/// statuses (413, 422, 400) and a failure value that carries nothing.
+pub struct DeliveryBody(pub DeliveryAuthorizationRequest);
+
+/// Why [`DeliveryBody`] refused a body. Fieldless: Rocket prints this value.
+#[derive(Debug)]
+pub struct DeliveryBodyRejected;
+
+#[rocket::async_trait]
+impl<'r> rocket::data::FromData<'r> for DeliveryBody {
+    type Error = DeliveryBodyRejected;
+
+    async fn from_data(
+        req: &'r rocket::Request<'_>,
+        data: rocket::Data<'r>,
+    ) -> rocket::data::Outcome<'r, Self> {
+        use rocket::outcome::Outcome;
+        let limit = req
+            .limits()
+            .get("json")
+            .unwrap_or(rocket::data::Limits::JSON);
+        let text = match data.open(limit).into_string().await {
+            Ok(text) if text.is_complete() => text.into_inner(),
+            Ok(_) => return Outcome::Error((Status::PayloadTooLarge, DeliveryBodyRejected)),
+            Err(_) => return Outcome::Error((Status::BadRequest, DeliveryBodyRejected)),
+        };
+        match serde_json::from_str::<DeliveryAuthorizationRequest>(&text) {
+            Ok(request) => Outcome::Success(Self(request)),
+            Err(error) if error.classify() == serde_json::error::Category::Data => {
+                Outcome::Error((Status::UnprocessableEntity, DeliveryBodyRejected))
+            }
+            Err(_) => Outcome::Error((Status::BadRequest, DeliveryBodyRejected)),
+        }
+    }
 }
 
 fn delivery_request_digest(request: &DeliveryAuthorizationRequest) -> Result<String, ()> {
@@ -1015,6 +1073,9 @@ fn is_canonical_delivery_domain(value: &str) -> bool {
             .is_some_and(|tld| tld.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
+/// Kept with its tests until the legacy-removal commit; the route no longer
+/// calls it.
+#[cfg_attr(not(test), allow(dead_code))]
 /// The Share SDK stores the signed recipient envelope as a versioned,
 /// AES-256-GCM sealed blob.  The public URL addresses only that ciphertext;
 /// its decryption key is a fragment and must never be sent in a query string.
@@ -1300,66 +1361,88 @@ struct DeliveryAuthorizationReceipt {
     authorization_digest: String,
 }
 
-#[allow(clippy::too_many_arguments)]
-fn build_delivery_authorization_receipt(
-    request: &DeliveryAuthorizationRequest,
-    registration: &policy_v3_registration::Model,
-    resource: &str,
-    credential_type: &str,
-    sender_key_did: &str,
-    audience: &str,
-    issued_at: &str,
-    runtime: &PolicyV3Runtime,
-) -> Result<DeliveryAuthorizationReceipt, (Status, String)> {
-    let invitation_request = serde_json::json!({
-        "schema": INVITATION_REQUEST_SCHEMA,
-        "policyId": registration.policy_cid,
-        "recipient": request.recipient_email,
-        "resource": resource,
-        "credentialType": credential_type,
-        "returnLink": request.share_url,
-        "envelopeRef": request.share_cid,
-        "label": request.document_name,
-        "shareExpiresAt": registration.expires_at,
-        "audience": audience,
-        "issuedAt": issued_at,
-        "expiresAt": request.expires_at,
-        "nonce": request.jti,
-    });
-    let mut admission = serde_json::json!({
+/// What a delivery receipt is built from besides the request: the link's `c`
+/// is the admission's `envelopeRef`, and `request.share_url` is the admission's
+/// `returnLink`, byte for byte.
+struct DeliveryReceiptSource<'a> {
+    request: &'a DeliveryAuthorizationRequest,
+    registration: &'a policy_v3_registration::Model,
+    envelope_ref: &'a str,
+    resource: &'a str,
+    credential_type: &'a str,
+    sender_key_did: &'a str,
+    audience: &'a str,
+}
+
+/// The delivery admission v1 before it is signed: the same fields as v0.
+fn delivery_admission_value(source: &DeliveryReceiptSource<'_>, issued_at: &str) -> Value {
+    serde_json::json!({
         "schema": DELIVERY_ADMISSION_SCHEMA,
-        "policyId": registration.policy_cid,
-        "ownerDid": registration.owner_did,
-        "recipient": request.recipient_email,
-        "resource": resource,
+        "policyId": source.registration.policy_cid,
+        "ownerDid": source.registration.owner_did,
+        "recipient": source.request.recipient_email,
+        "resource": source.resource,
         "actions": ["tinycloud.kv/get"],
-        "credentialType": credential_type,
-        "returnLink": request.share_url,
-        "envelopeRef": request.share_cid,
-        "label": request.document_name,
-        "shareExpiresAt": registration.expires_at,
-        "senderKeyDid": sender_key_did,
-        "audience": audience,
+        "credentialType": source.credential_type,
+        "returnLink": source.request.share_url,
+        "envelopeRef": source.envelope_ref,
+        "label": source.request.document_name,
+        "shareExpiresAt": source.registration.expires_at,
+        "senderKeyDid": source.sender_key_did,
+        "audience": source.audience,
         "issuedAt": issued_at,
-        "expiresAt": request.expires_at,
-        "nonce": request.jti,
-    });
-    let authorization_digest = encode_config(
-        Sha256::digest(canonical_json_value(&admission)),
-        URL_SAFE_NO_PAD,
-    );
+        "expiresAt": source.request.expires_at,
+        "nonce": source.request.jti,
+    })
+}
+
+/// Sign the admission: Ed25519 over `SHA-256(domain ‖ JCS(admission))`, then
+/// attach the detached signature object.
+fn sign_delivery_admission(
+    admission: &mut Value,
+    signer: &tinycloud_core::libp2p::identity::Keypair,
+    signer_did: &str,
+) -> Result<(), (Status, String)> {
     let mut signed = DELIVERY_ADMISSION_DOMAIN.to_vec();
-    signed.extend_from_slice(&canonical_json_value(&admission));
-    let signature = runtime
-        .signer
-        .node_keypair()
+    signed.extend_from_slice(&canonical_json_value(admission));
+    let signature = signer
         .sign(&Sha256::digest(signed))
         .map_err(|error| (Status::InternalServerError, error.to_string()))?;
     admission["signature"] = serde_json::json!({
         "suite": "eddsa-ed25519-sha256-jcs-v1",
-        "signerDid": runtime.node_did,
+        "signerDid": signer_did,
         "value": encode_config(signature, URL_SAFE_NO_PAD),
     });
+    Ok(())
+}
+
+fn build_delivery_authorization_receipt(
+    source: &DeliveryReceiptSource<'_>,
+    issued_at: &str,
+    signer: &tinycloud_core::libp2p::identity::Keypair,
+    signer_did: &str,
+) -> Result<DeliveryAuthorizationReceipt, (Status, String)> {
+    let invitation_request = serde_json::json!({
+        "schema": INVITATION_REQUEST_SCHEMA,
+        "policyId": source.registration.policy_cid,
+        "recipient": source.request.recipient_email,
+        "resource": source.resource,
+        "credentialType": source.credential_type,
+        "returnLink": source.request.share_url,
+        "envelopeRef": source.envelope_ref,
+        "label": source.request.document_name,
+        "shareExpiresAt": source.registration.expires_at,
+        "audience": source.audience,
+        "issuedAt": issued_at,
+        "expiresAt": source.request.expires_at,
+        "nonce": source.request.jti,
+    });
+    let mut admission = delivery_admission_value(source, issued_at);
+    let authorization_digest = encode_config(
+        Sha256::digest(canonical_json_value(&admission)),
+        URL_SAFE_NO_PAD,
+    );
+    sign_delivery_admission(&mut admission, signer, signer_did)?;
     Ok(DeliveryAuthorizationReceipt {
         value: serde_json::json!({
             "request": invitation_request,
@@ -1371,7 +1454,7 @@ fn build_delivery_authorization_receipt(
 
 #[post("/policy/v3/deliveries/authorize", format = "json", data = "<request>")]
 pub async fn authorize_delivery(
-    request: Json<DeliveryAuthorizationRequest>,
+    request: DeliveryBody,
     runtime: &State<PolicyV3Runtime>,
     invocation: AuthHeaderGetter<InvocationInfo>,
 ) -> Result<Json<Value>, (Status, String)> {
@@ -1391,23 +1474,23 @@ pub async fn authorize_delivery(
             "delivery-authorization-invalid".into(),
         )
     })?;
-    let request = request.into_inner();
+    let request = request.0;
+    let invalid = || {
+        (
+            Status::BadRequest,
+            "delivery-authorization-invalid".to_owned(),
+        )
+    };
     if delivery_request_digest(&request).as_deref() != Ok(request.request_body_digest.as_str())
         || decode_config(&request.jti, URL_SAFE_NO_PAD)
             .ok()
             .is_none_or(|value| value.len() != 16)
-        || !v3_delivery_url_matches(
-            &request.share_url,
-            &delivery.return_origin,
-            &request.share_cid,
-            &request.sealed_envelope,
-            &request.envelope_key,
-            &request.envelope,
-        )
-        || tinycloud_auth::ipld_core::cid::Cid::try_from(request.share_cid.as_str()).is_err()
     {
-        return Err((Status::BadRequest, "delivery-authorization-invalid".into()));
+        return Err(invalid());
     }
+    // Only the short `v=4` form on the share path, at the configured share
+    // origin. The link is never logged or echoed from here on.
+    let link = ShortLink::parse(&request.share_url, &delivery.return_origin).ok_or_else(invalid)?;
     let sender_key_did = invocation.0 .0.invoker.as_str();
     let replay = share_invitation_authorization_jti::Entity::find_by_id(request.jti.clone())
         .one(&runtime.conn)
@@ -1418,30 +1501,68 @@ pub async fn authorize_delivery(
     }) {
         return Err((Status::Conflict, "delivery-authorization-replayed".into()));
     }
-    let policy_cid = request
-        .envelope
+    // One read of the record, no retries, no other source. The API's 404 and
+    // every outage have their own answers; everything else about the record
+    // is the sender's.
+    let fetched = delivery
+        .links
+        .fetch(link.id())
+        .await
+        .map_err(|error| match error {
+            LinkFetchError::NotFound => (Status::NotFound, "delivery-link-unavailable".to_owned()),
+            LinkFetchError::Unavailable => (
+                Status::ServiceUnavailable,
+                "delivery-links-unavailable".to_owned(),
+            ),
+            LinkFetchError::RecordHeaderInvalid => invalid(),
+        })?;
+    let now = OffsetDateTime::now_utc();
+    let opened = open_link_record(&link, &fetched, now).map_err(|_| invalid())?;
+    // The envelope is the plaintext of the record, in its canonical form.
+    let envelope_value: Value = serde_json::from_slice(&opened.plaintext).map_err(|_| invalid())?;
+    if canonical_json_value(&envelope_value) != opened.plaintext {
+        return Err(invalid());
+    }
+    let policy_cid = envelope_value
         .get("policyCid")
         .and_then(Value::as_str)
-        .ok_or((Status::BadRequest, "delivery-authorization-invalid".into()))?;
+        .ok_or_else(invalid)?;
     let registration = policy_v3_registration::Entity::find_by_id(policy_cid.to_owned())
         .one(&runtime.conn)
         .await
         .map_err(db_error)?
         .ok_or((Status::NotFound, "delivery-authorization-invalid".into()))?;
-    let now = OffsetDateTime::now_utc();
+    // The link cannot outlive the share, and one key issued the record, signed
+    // the envelope and owns the registration.
+    let share_expires = parse_time(&registration.expires_at).map_err(|_| {
+        (
+            Status::Forbidden,
+            "delivery-authorization-invalid".to_owned(),
+        )
+    })?;
+    opened
+        .within_share_expiry(share_expires)
+        .map_err(|_| invalid())?;
+    opened
+        .bind_issuer(
+            envelope_value
+                .pointer("/signature/signerDid")
+                .and_then(Value::as_str),
+            &registration.owner_did,
+        )
+        .map_err(|_| invalid())?;
     if !v3_registration_is_live(&registration, now) {
         return Err((Status::Forbidden, "delivery-authorization-invalid".into()));
     }
-    let expires = parse_time(&request.expires_at)
-        .map_err(|_| (Status::BadRequest, "delivery-authorization-invalid".into()))?;
+    let expires = parse_time(&request.expires_at).map_err(|_| invalid())?;
     if format_time(expires) != request.expires_at
         || expires <= now
         || expires > now + Duration::minutes(5)
     {
-        return Err((Status::BadRequest, "delivery-authorization-invalid".into()));
+        return Err(invalid());
     }
     let (envelope, _, actions) =
-        v3_envelope_delivery_projection(&request.envelope, &registration, delivery, &request)
+        v3_envelope_delivery_projection(&envelope_value, &registration, delivery, &request)
             .map_err(|_| (Status::Forbidden, "delivery-authorization-invalid".into()))?;
     if !normal_invocation_allows_v3_delivery(&invocation.0 .0, envelope) {
         return Err((
@@ -1490,14 +1611,25 @@ pub async fn authorize_delivery(
     if share_expires_at != registration.expires_at {
         return Err((Status::Forbidden, "delivery-authorization-invalid".into()));
     }
+    // Digests and ids only: no link, no key, no recipient.
     let binding_json = serde_json::json!({
         "version": 3,
         "policyCid": policy_cid,
-        "shareCid": request.share_cid,
+        "shareCid": link.cid(),
         "policyId": registration.policy_cid,
         "requestBodyDigest": request.request_body_digest,
         "senderKeyDid": sender_key_did,
     });
+    let signer = runtime.signer.node_keypair();
+    let source = DeliveryReceiptSource {
+        request: &request,
+        registration: &registration,
+        envelope_ref: link.cid(),
+        resource,
+        credential_type,
+        sender_key_did,
+        audience: &delivery.invitation_origin,
+    };
     let _writer = match &runtime.sqlite_writer_lock {
         Some(lock) => Some(lock.lock().await),
         None => None,
@@ -1520,14 +1652,10 @@ pub async fn authorize_delivery(
             return Err((Status::Conflict, "delivery-authorization-replayed".into()));
         }
         let receipt = build_delivery_authorization_receipt(
-            &request,
-            &registration,
-            resource,
-            credential_type,
-            sender_key_did,
-            &delivery.invitation_origin,
+            &source,
             &existing.issued_at,
-            runtime,
+            &signer,
+            &runtime.node_did,
         )?;
         if receipt.authorization_digest != existing.authorization_digest {
             return Err((Status::Conflict, "delivery-authorization-replayed".into()));
@@ -1536,16 +1664,8 @@ pub async fn authorize_delivery(
     }
 
     let issued_at = format_time(now);
-    let receipt = build_delivery_authorization_receipt(
-        &request,
-        &registration,
-        resource,
-        credential_type,
-        sender_key_did,
-        &delivery.invitation_origin,
-        &issued_at,
-        runtime,
-    )?;
+    let receipt =
+        build_delivery_authorization_receipt(&source, &issued_at, &signer, &runtime.node_did)?;
     let insert = share_invitation_authorization_jti::ActiveModel {
         jti: Set(request.jti.clone()),
         authorization_digest: Set(receipt.authorization_digest.clone()),
@@ -1576,14 +1696,10 @@ pub async fn authorize_delivery(
         return Err((Status::Conflict, "delivery-authorization-replayed".into()));
     }
     let recovered = build_delivery_authorization_receipt(
-        &request,
-        &registration,
-        resource,
-        credential_type,
-        sender_key_did,
-        &delivery.invitation_origin,
+        &source,
         &existing.issued_at,
-        runtime,
+        &signer,
+        &runtime.node_did,
     )?;
     if recovered.authorization_digest != existing.authorization_digest {
         return Err((Status::Conflict, "delivery-authorization-replayed".into()));
@@ -6813,13 +6929,19 @@ mod tests {
             ..ShareEmailConfig::default()
         };
         let runtime = PolicyV3Runtime::new(db.clone(), node_did.clone(), signer.clone())
-            .with_delivery(&config)
+            .with_delivery(
+                &config,
+                Arc::new(crate::delivery_link::test_support::StubLinks::default()),
+            )
             .unwrap();
         assert!(runtime.delivery.is_some());
 
         config.invitation_public_key = Some(encode_config([0_u8; 32], URL_SAFE_NO_PAD));
         assert!(PolicyV3Runtime::new(db, node_did, signer)
-            .with_delivery(&config)
+            .with_delivery(
+                &config,
+                Arc::new(crate::delivery_link::test_support::StubLinks::default()),
+            )
             .is_err());
     }
 
@@ -7986,11 +8108,83 @@ mod tests {
         )
     }
 
+    /// Every event and span field recorded on this thread while a test runs.
+    /// It keeps no span registry, so spans that outlive the scope (a pool
+    /// worker drops them on another thread) cannot trip another subscriber.
+    #[derive(Clone, Default)]
+    struct CapturedLog(
+        Arc<parking_lot::Mutex<Vec<u8>>>,
+        Arc<std::sync::atomic::AtomicU64>,
+    );
+
+    struct FieldWriter<'a>(&'a mut Vec<u8>);
+
+    impl tracing::field::Visit for FieldWriter<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::io::Write;
+            let _ = write!(self.0, " {}={value:?}", field.name());
+        }
+    }
+
+    impl tracing::Subscriber for CapturedLog {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, attributes: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            let mut log = self.0.lock();
+            log.extend_from_slice(attributes.metadata().name().as_bytes());
+            attributes.record(&mut FieldWriter(&mut log));
+            log.push(b'\n');
+            tracing::span::Id::from_u64(
+                self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1,
+            )
+        }
+        fn record(&self, _: &tracing::span::Id, values: &tracing::span::Record<'_>) {
+            let mut log = self.0.lock();
+            values.record(&mut FieldWriter(&mut log));
+            log.push(b'\n');
+        }
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut log = self.0.lock();
+            log.extend_from_slice(event.metadata().target().as_bytes());
+            event.record(&mut FieldWriter(&mut log));
+            log.push(b'\n');
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// The new request body plus the sealed envelope pieces the retired
+    /// compact/inline URL matcher still takes in its tests.
+    #[derive(Clone)]
+    struct FixtureRequest {
+        inner: DeliveryAuthorizationRequest,
+        envelope: Value,
+        sealed_envelope: String,
+        envelope_key: String,
+        share_cid: String,
+        legacy_url: String,
+    }
+
+    impl std::ops::Deref for FixtureRequest {
+        type Target = DeliveryAuthorizationRequest;
+        fn deref(&self) -> &Self::Target {
+            &self.inner
+        }
+    }
+
+    impl std::ops::DerefMut for FixtureRequest {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.inner
+        }
+    }
+
     fn delivery_fixture() -> (
         tinycloud_core::libp2p::identity::ed25519::Keypair,
         policy_v3_registration::Model,
         DeliveryRuntime,
-        DeliveryAuthorizationRequest,
+        FixtureRequest,
     ) {
         let owner = tinycloud_core::libp2p::identity::ed25519::Keypair::generate();
         let owner_did = tinycloud_core::keys::public_key_to_did_key(
@@ -8020,6 +8214,7 @@ mod tests {
             target_origin: "https://tee.node.tinycloud.xyz".into(),
             return_origin: "https://share.tinycloud.xyz".into(),
             invitation_origin: "https://witness.credentials.org".into(),
+            links: Arc::new(crate::delivery_link::test_support::StubLinks::default()),
         };
         let content_source = policy["contentSource"].clone();
         let mut envelope = json!({
@@ -8051,17 +8246,25 @@ mod tests {
         });
         let (sealed_envelope, envelope_key, share_cid) =
             seal_delivery_envelope(&envelope, [9; 32], [10; SEALED_ENVELOPE_NONCE_BYTES]);
-        let request = DeliveryAuthorizationRequest {
+        let built = crate::delivery_link::test_support::build(
+            &canonical_json_value(&envelope),
+            &owner,
+            "2026-08-07T11:00:00.000Z",
+        );
+        let request = FixtureRequest {
+            inner: DeliveryAuthorizationRequest {
+                share_url: built.href,
+                recipient_email: "alice@example.com".into(),
+                document_name: "report.pdf".into(),
+                jti: encode_config([7_u8; 16], URL_SAFE_NO_PAD),
+                expires_at: "2026-08-06T12:05:00Z".into(),
+                request_body_digest: "unused".into(),
+            },
             envelope,
             sealed_envelope,
             envelope_key: envelope_key.clone(),
             share_cid: share_cid.clone(),
-            recipient_email: "alice@example.com".into(),
-            share_url: format!("https://share.tinycloud.xyz/s/{share_cid}#k={envelope_key}"),
-            document_name: "report.pdf".into(),
-            jti: encode_config([7_u8; 16], URL_SAFE_NO_PAD),
-            expires_at: "2026-08-06T12:05:00Z".into(),
-            request_body_digest: "unused".into(),
+            legacy_url: format!("https://share.tinycloud.xyz/s/{share_cid}#k={envelope_key}"),
         };
         (owner, registration, delivery, request)
     }
@@ -8110,7 +8313,7 @@ mod tests {
     fn v3_delivery_binds_cid_to_the_sealed_envelope() {
         let (_, _, delivery, request) = delivery_fixture();
         assert!(v3_delivery_url_matches(
-            &request.share_url,
+            &request.legacy_url,
             &delivery.return_origin,
             &request.share_cid,
             &request.sealed_envelope,
@@ -8120,7 +8323,7 @@ mod tests {
 
         let altered_cid = "bafkreieeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
         assert!(!v3_delivery_url_matches(
-            &request.share_url,
+            &request.legacy_url,
             &delivery.return_origin,
             altered_cid,
             &request.sealed_envelope,
@@ -8140,7 +8343,7 @@ mod tests {
             binding_json: json!({
                 "version": 3,
                 "policyCid": registration.policy_cid,
-                "shareCid": request.share_cid,
+                "shareCid": ShortLink::parse(&request.share_url, crate::delivery_link::test_support::ORIGIN).unwrap().cid(),
                 "policyId": registration.policy_cid,
                 "requestBodyDigest": request.request_body_digest,
                 "senderKeyDid": sender_key_did,
@@ -8165,13 +8368,17 @@ mod tests {
             sender_key_did
         ));
 
-        let mut rebound_resource = request.clone();
-        rebound_resource.envelope["contentSource"]["kvResource"] =
-            Value::String("did:key:zOwner/kv/shares/other/report.pdf".into());
-        rebound_resource.request_body_digest = delivery_request_digest(&rebound_resource).unwrap();
+        let mut rebound_link = request.clone();
+        rebound_link.share_url = crate::delivery_link::test_support::short_link(
+            crate::delivery_link::test_support::ORIGIN,
+            crate::delivery_link::test_support::LINK_ID,
+            &crate::delivery_link::test_support::TEST_KEY,
+            "bafkreieeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        );
+        rebound_link.request_body_digest = delivery_request_digest(&rebound_link).unwrap();
         assert!(!delivery_replay_request_matches(
             &existing,
-            &rebound_resource,
+            &rebound_link,
             sender_key_did
         ));
         assert!(!delivery_replay_request_matches(
@@ -8182,15 +8389,17 @@ mod tests {
 
         let stored = existing.binding_json.to_string();
         assert!(!stored.contains("alice@example.com"));
-        assert!(!stored.contains(&request.envelope_key));
+        assert!(!stored.contains(&crate::delivery_link::test_support::b64(
+            &crate::delivery_link::test_support::TEST_KEY
+        )));
     }
 
     #[test]
     fn v3_delivery_rejects_fragment_or_query_substitution() {
         let (_, _, delivery, request) = delivery_fixture();
         for altered_url in [
-            format!("{}#k=secret", request.share_url),
-            format!("{}&k=secret", request.share_url),
+            format!("{}#k=secret", request.legacy_url),
+            format!("{}&k=secret", request.legacy_url),
             format!(
                 "https://share.tinycloud.xyz/viewer?tc2={}",
                 encode_config(canonical_json_value(&request.envelope), URL_SAFE_NO_PAD)
@@ -8284,7 +8493,7 @@ mod tests {
             .unwrap()
             .remove("deliveryEmail");
         resign_delivery_envelope(&mut request.envelope, &owner);
-        let admits = |request: &DeliveryAuthorizationRequest| {
+        let admits = |request: &FixtureRequest| {
             v3_envelope_delivery_projection(&request.envelope, &registration, &delivery, request)
                 .is_ok()
         };
@@ -8358,7 +8567,7 @@ mod tests {
             json!({"kind":"exactEmail","value":"Alice.Smith@Example.com"});
         request.envelope["deliveryEmail"] = json!("Alice.Smith@example.com");
         resign_delivery_envelope(&mut request.envelope, &owner);
-        let admits = |request: &DeliveryAuthorizationRequest| {
+        let admits = |request: &FixtureRequest| {
             v3_envelope_delivery_projection(&request.envelope, &registration, &delivery, request)
                 .is_ok()
         };
@@ -8473,7 +8682,7 @@ mod tests {
     #[test]
     fn v3_delivery_url_keeps_recipient_material_out_of_loggable_portion() {
         let (_, registration, delivery, request) = delivery_fixture();
-        let public_url = request.share_url.split('#').next().unwrap();
+        let public_url = request.legacy_url.split('#').next().unwrap();
         assert_eq!(
             public_url,
             format!("https://share.tinycloud.xyz/s/{}", request.share_cid)
@@ -8481,7 +8690,7 @@ mod tests {
         assert!(!public_url.contains("?"));
         assert!(!public_url.contains("alice@example.com"));
         assert!(v3_delivery_url_matches(
-            &request.share_url,
+            &request.legacy_url,
             &delivery.return_origin,
             &request.share_cid,
             &request.sealed_envelope,
@@ -8550,10 +8759,315 @@ mod tests {
         Unauthorized,
     }
 
+    struct MatrixContext<'a> {
+        client: &'a rocket::local::asynchronous::Client,
+        resource: &'a ResourceId,
+        sender_cid: &'a tinycloud_auth::ipld_core::cid::Cid,
+        jwk: &'a JWK,
+        holder_did: &'a str,
+        links: &'a crate::delivery_link::test_support::StubLinks,
+        owner_key: &'a tinycloud_core::libp2p::identity::ed25519::Keypair,
+        expires: OffsetDateTime,
+        link_expires: &'a str,
+        envelope: &'a Value,
+        success_request: &'a DeliveryAuthorizationRequest,
+        success_body: &'a str,
+        log: &'a CapturedLog,
+    }
+
+    impl MatrixContext<'_> {
+        /// POST a delivery authorization with a fresh invocation.
+        async fn post(&self, nonce: &str, body: String) -> anyhow::Result<(Status, String)> {
+            use tinycloud_auth::{
+                authorization::{make_invocation, InvocationOptions},
+                siwe_recap::Ability as RecapAbility,
+            };
+            let invocation = make_invocation(
+                [(
+                    self.resource.clone(),
+                    ["tinycloud.kv/get".parse::<RecapAbility>()?],
+                )],
+                self.sender_cid,
+                self.jwk,
+                &format!(
+                    "{}#{}",
+                    self.holder_did,
+                    self.holder_did.trim_start_matches("did:key:")
+                ),
+                (OffsetDateTime::now_utc() + Duration::seconds(45)).unix_timestamp() as f64,
+                InvocationOptions {
+                    nonce: Some(nonce.into()),
+                    ..InvocationOptions::default()
+                },
+            )?;
+            let response = self
+                .client
+                .post("/policy/v3/deliveries/authorize")
+                .header(rocket::http::ContentType::JSON)
+                .header(rocket::http::Header::new(
+                    "Authorization",
+                    invocation.encode()?,
+                ))
+                .body(body)
+                .dispatch()
+                .await;
+            let status = response.status();
+            Ok((status, response.into_string().await.unwrap_or_default()))
+        }
+
+        /// Send a request for `share_url` and expect `(status, code)`.
+        async fn deliver(
+            &self,
+            n: u8,
+            label: &str,
+            share_url: String,
+            expected: (Status, &str),
+            bodies: &mut Vec<String>,
+        ) -> anyhow::Result<()> {
+            let mut request = DeliveryAuthorizationRequest {
+                share_url,
+                recipient_email: "alice@example.test".into(),
+                document_name: "document.txt".into(),
+                jti: encode_config([100 + n; 16], URL_SAFE_NO_PAD),
+                expires_at: format_time(OffsetDateTime::now_utc() + Duration::minutes(4)),
+                request_body_digest: String::new(),
+            };
+            request.request_body_digest = delivery_request_digest(&request)
+                .map_err(|_| anyhow::anyhow!("matrix request digest"))?;
+            let (status, body) = self
+                .post(
+                    &format!("slice5-matrix-{n}"),
+                    serde_json::to_string(&request)?,
+                )
+                .await?;
+            assert_eq!((status, body.as_str()), expected, "{label}");
+            bodies.push(body);
+            Ok(())
+        }
+    }
+
+    /// The node's error table (every refusal is a fixed code with no text
+    /// from the record) and the key-handling rule: neither the link nor its
+    /// key reaches a log line, a response body or a stored row.
+    async fn delivery_error_matrix(ctx: MatrixContext<'_>) -> anyhow::Result<()> {
+        use crate::delivery_link::test_support as ts;
+        use crate::links_fetch::LinkFetchError;
+        let plaintext = canonical_json_value(ctx.envelope);
+        let other_signer = tinycloud_core::libp2p::identity::ed25519::Keypair::generate();
+        let base = ts::build(&plaintext, ctx.owner_key, ctx.link_expires);
+        let key = ts::b64(&ts::TEST_KEY);
+        let link_id = |n: usize| {
+            let alphabet = b"234567";
+            format!(
+                "{}{}{}",
+                "2".repeat(24),
+                alphabet[n / 6] as char,
+                alphabet[n % 6] as char
+            )
+        };
+        let at_link = |id: &str| base.href.replace(ts::LINK_ID, id);
+        let mut bodies = vec![];
+        const LINK_GONE: &str = "delivery-link-unavailable";
+        const LINKS_DOWN: &str = "delivery-links-unavailable";
+        const INVALID: &str = "delivery-authorization-invalid";
+        let not_found = (Status::NotFound, LINK_GONE);
+        let down = (Status::ServiceUnavailable, LINKS_DOWN);
+        let invalid = (Status::BadRequest, INVALID);
+
+        // The API's answers.
+        ctx.deliver(
+            1,
+            "unknown id",
+            at_link(&link_id(1)),
+            not_found,
+            &mut bodies,
+        )
+        .await?;
+        ctx.links.fail(&link_id(2), LinkFetchError::Unavailable);
+        ctx.deliver(2, "api outage", at_link(&link_id(2)), down, &mut bodies)
+            .await?;
+        ctx.links
+            .fail(&link_id(3), LinkFetchError::RecordHeaderInvalid);
+        ctx.deliver(
+            3,
+            "no record header",
+            at_link(&link_id(3)),
+            invalid,
+            &mut bodies,
+        )
+        .await?;
+
+        // Each check on the record, the sender's to answer for.
+        let mut tampered = ts::build(&plaintext, ctx.owner_key, ctx.link_expires);
+        tampered.fetched.body[3] ^= 1;
+        ctx.links.put(&link_id(4), &tampered);
+        ctx.deliver(
+            4,
+            "cid mismatch",
+            at_link(&link_id(4)),
+            invalid,
+            &mut bodies,
+        )
+        .await?;
+
+        let mut forged = ts::build(&plaintext, ctx.owner_key, ctx.link_expires);
+        forged.fetched.record_header = ts::record_header(
+            &forged.header,
+            Some(&ts::sign_header(&forged.header, &other_signer)),
+        );
+        ctx.links.put(&link_id(5), &forged);
+        ctx.deliver(
+            5,
+            "bad signature",
+            at_link(&link_id(5)),
+            invalid,
+            &mut bodies,
+        )
+        .await?;
+
+        ctx.links.put(&link_id(6), &base);
+        ctx.deliver(
+            6,
+            "key does not open the body",
+            at_link(&link_id(6)).replace(&key, &ts::b64(&[0x5b; 32])),
+            invalid,
+            &mut bodies,
+        )
+        .await?;
+
+        let expired = ts::build(&plaintext, ctx.owner_key, "2020-01-01T00:00:00.000Z");
+        ctx.links.put(&link_id(7), &expired);
+        ctx.deliver(
+            7,
+            "link expired",
+            at_link(&link_id(7)),
+            invalid,
+            &mut bodies,
+        )
+        .await?;
+
+        let outliving = ts::build(
+            &plaintext,
+            ctx.owner_key,
+            &ts::millis(ctx.expires + Duration::hours(1)),
+        );
+        ctx.links.put(&link_id(8), &outliving);
+        ctx.deliver(
+            8,
+            "link outlives the share",
+            at_link(&link_id(8)),
+            invalid,
+            &mut bodies,
+        )
+        .await?;
+
+        let other_issuer = ts::build(&plaintext, &other_signer, ctx.link_expires);
+        ctx.links.put(&link_id(9), &other_issuer);
+        ctx.deliver(
+            9,
+            "issuer is not the envelope signer",
+            at_link(&link_id(9)),
+            invalid,
+            &mut bodies,
+        )
+        .await?;
+
+        // Links the grammar refuses never reach the API.
+        ctx.links.put(&link_id(10), &base);
+        let fetches = ctx.links.fetch_count();
+        for (n, (label, share_url)) in [
+            (
+                "another origin",
+                at_link(&link_id(10)).replace("share.tinycloud.xyz", "share.example"),
+            ),
+            (
+                "removed v=3 form",
+                at_link(&link_id(10)).replace("#v=4", "#v=3"),
+            ),
+            (
+                "compact registry link",
+                format!("{}/s/{}#k={key}", ts::ORIGIN, link_id(10)),
+            ),
+            (
+                "full link",
+                format!("{}/s/full#v=4&k={key}&r=AAAA", ts::ORIGIN),
+            ),
+            ("courier path", at_link(&link_id(10)).replace("/s/", "/c/")),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            ctx.deliver(10 + n as u8, label, share_url, invalid, &mut bodies)
+                .await?;
+        }
+        assert_eq!(
+            ctx.links.fetch_count(),
+            fetches,
+            "no fetch for a refused link"
+        );
+
+        // A body in the retired shape is refused as a whole.
+        let old_shape = json!({
+            "envelope": {},
+            "sealedEnvelope": "AAAA",
+            "envelopeKey": key,
+            "shareCid": "bafkreiaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "recipientEmail": "alice@example.test",
+            "shareUrl": ctx.success_request.share_url,
+            "documentName": "document.txt",
+            "jti": encode_config([99_u8; 16], URL_SAFE_NO_PAD),
+            "expiresAt": ctx.success_request.expires_at,
+            "requestBodyDigest": ctx.success_request.request_body_digest,
+        });
+        let (status, body) = ctx.post("slice5-old-shape", old_shape.to_string()).await?;
+        assert_eq!(status, Status::UnprocessableEntity);
+        bodies.push(body);
+
+        // Nothing that was logged, answered or stored holds the key or the
+        // link. The one place the link appears is the receipt's own
+        // `returnLink`, which the sender forwards.
+        let log = String::from_utf8(ctx.log.0.lock().clone())?;
+        let rows = share_invitation_authorization_jti::Entity::find()
+            .all(&ctx.client.rocket().state::<PolicyV3Runtime>().unwrap().conn)
+            .await?
+            .iter()
+            .map(|row| {
+                format!(
+                    "{} {} {} {} {} {:?}\n",
+                    row.jti,
+                    row.authorization_digest,
+                    row.binding_json,
+                    row.issued_at,
+                    row.expires_at,
+                    row.consumed_at
+                )
+            })
+            .collect::<String>();
+        assert!(rows.contains(&ctx.success_request.jti), "rows were read");
+        let link = &ctx.success_request.share_url;
+        let receipt_without_link = ctx.success_body.replace(link, "");
+        for (what, text) in [
+            ("log", &log),
+            ("rows", &rows),
+            ("receipt", &receipt_without_link),
+        ]
+        .into_iter()
+        .chain(bodies.iter().map(|body| ("response", body)))
+        {
+            assert!(!text.contains(&key), "{what} holds the key");
+            assert!(!text.contains("#v=4"), "{what} holds a link fragment");
+            assert!(!text.contains(link.as_str()), "{what} holds the link");
+        }
+        assert!(!log.is_empty(), "the capture saw log output");
+        Ok(())
+    }
+
     async fn run_policy_v2_flow(policy_owner: PolicyOwner) -> anyhow::Result<()> {
         use k256::ecdsa::SigningKey;
         use sha3::Keccak256;
         use tinycloud_auth::cacaos::siwe::encode_eip55;
+        let captured_log = CapturedLog::default();
+        let _log_capture = tracing::subscriber::set_default(captured_log.clone());
 
         let vector: Value = serde_json::from_str(include_str!(
             "../test-fixtures/tc-470-policy-credential-requirement.json"
@@ -8822,9 +9336,10 @@ mod tests {
             )),
             ..ShareEmailConfig::default()
         };
+        let links = Arc::new(crate::delivery_link::test_support::StubLinks::default());
         let runtime = PolicyV3Runtime::new(db.clone(), node_did.clone(), node_secret)
             .with_credential_issuer(issuer)
-            .with_delivery(&delivery_config)?;
+            .with_delivery(&delivery_config, links.clone())?;
         let admission = validate_credential_admission_v3(
             &requirement,
             &credential,
@@ -9368,18 +9883,19 @@ mod tests {
             "signerDid":owner_did,
             "value":encode_config(owner_key.sign(&Sha256::digest(envelope_preimage)), URL_SAFE_NO_PAD),
         });
-        let (sealed_envelope, envelope_key, share_cid) = seal_delivery_envelope(
-            &delivery_envelope,
-            [11; 32],
-            [12; SEALED_ENVELOPE_NONCE_BYTES],
+        let envelope_for_domain = delivery_envelope.clone();
+        let link_expires = crate::delivery_link::test_support::millis(expires);
+        let built_link = crate::delivery_link::test_support::build(
+            &canonical_json_value(&delivery_envelope),
+            &owner_key,
+            &link_expires,
         );
+        links.put(crate::delivery_link::test_support::LINK_ID, &built_link);
+        let envelope_key =
+            crate::delivery_link::test_support::b64(&crate::delivery_link::test_support::TEST_KEY);
         let mut delivery_request = DeliveryAuthorizationRequest {
-            envelope: delivery_envelope,
-            sealed_envelope,
-            envelope_key: envelope_key.clone(),
-            share_cid: share_cid.clone(),
+            share_url: built_link.href.clone(),
             recipient_email: "alice@example.test".into(),
-            share_url: format!("https://share.tinycloud.xyz/s/{share_cid}#k={envelope_key}"),
             document_name: "document.txt".into(),
             jti: encode_config([8_u8; 16], URL_SAFE_NO_PAD),
             expires_at: format_time(OffsetDateTime::now_utc() + Duration::minutes(4)),
@@ -9501,7 +10017,7 @@ mod tests {
         // A domain envelope may be emailed only at the policy owner's request.
         // The owner's delegate can read the file but cannot use the Node to
         // email the link to other mailboxes at the domain.
-        let mut domain_envelope = delivery_request.envelope.clone();
+        let mut domain_envelope = envelope_for_domain;
         let unsigned_domain = domain_envelope.as_object_mut().unwrap();
         unsigned_domain.remove("signature");
         unsigned_domain.remove("deliveryEmail");
@@ -9513,18 +10029,18 @@ mod tests {
             "signerDid":owner_did,
             "value":encode_config(owner_key.sign(&Sha256::digest(domain_preimage)), URL_SAFE_NO_PAD),
         });
-        let (domain_sealed, domain_key, domain_cid) = seal_delivery_envelope(
-            &domain_envelope,
-            [13; 32],
-            [14; SEALED_ENVELOPE_NONCE_BYTES],
+        let domain_built = crate::delivery_link::test_support::build(
+            &canonical_json_value(&domain_envelope),
+            &owner_key,
+            &link_expires,
         );
+        let domain_link_id = "22222222222222222222222222";
+        links.put(domain_link_id, &domain_built);
         let mut domain_request = DeliveryAuthorizationRequest {
-            envelope: domain_envelope,
-            sealed_envelope: domain_sealed,
-            envelope_key: domain_key.clone(),
-            share_cid: domain_cid.clone(),
+            share_url: domain_built
+                .href
+                .replace(crate::delivery_link::test_support::LINK_ID, domain_link_id),
             recipient_email: "bob@example.test".into(),
-            share_url: format!("https://share.tinycloud.xyz/s/{domain_cid}#k={domain_key}"),
             document_name: "document.txt".into(),
             jti: encode_config([9_u8; 16], URL_SAFE_NO_PAD),
             expires_at: format_time(OffsetDateTime::now_utc() + Duration::minutes(4)),
@@ -9557,6 +10073,26 @@ mod tests {
             .dispatch()
             .await;
         assert_eq!(domain_response.status(), Status::Forbidden);
+
+        // The node's error table, and the rule that neither the link nor its
+        // key reaches a log line, a response body or a stored row. It runs as
+        // a boxed future of its own so this test's stack frame stays small.
+        Box::pin(delivery_error_matrix(MatrixContext {
+            client: &client,
+            resource: &content_resource,
+            sender_cid: &sender_cid,
+            jwk: &delivery_jwk,
+            holder_did: &holder_did,
+            links: &links,
+            owner_key: &owner_key,
+            expires,
+            link_expires: &link_expires,
+            envelope: &delivery_envelope,
+            success_request: &delivery_request,
+            success_body: &delivery_body,
+            log: &captured_log,
+        }))
+        .await?;
 
         if std::env::var("TC498_EMIT_DELIVERY_RECEIPT").as_deref() == Ok("1") {
             let request = delivery_receipt["request"].clone();
@@ -10789,3 +11325,7 @@ mod root_revocation_tests;
 #[cfg(test)]
 #[path = "policy_v3/registration_probe_tests.rs"]
 mod registration_probe_tests;
+
+#[cfg(test)]
+#[path = "policy_v3/delivery_admission_tests.rs"]
+mod delivery_admission_tests;
