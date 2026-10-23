@@ -134,9 +134,9 @@ use tokio::{
 /// checks and connection-release pings are unchanged. Measured on PostgreSQL
 /// before the pre-persist write path:
 ///
-/// - sign-in 71 = peer key 0 + host `/delegate` 18 + session `/delegate` 19
-///   + account-space SQL write 34, including TC-1274's `epoch_head` cache
-///   write on each epoch-writing commit;
+/// - sign-in 71 = peer key 0 plus host `/delegate` 18 plus session
+///   `/delegate` 19 plus account-space SQL write 34, including TC-1274's
+///   `epoch_head` cache write on each epoch-writing commit;
 /// - kv get 16, including its durable read-audit commit.
 ///
 /// TC-1274: a batch of 100 `kv/get` or `kv/metadata` capabilities is one
