@@ -1803,4 +1803,68 @@ mod tests {
             "URI-invalid key identifiers in MALFORMED_KEY_IDS"
         );
     }
+
+    /// Inserts a terminal grant (`disableSubDelegation: true`) that a child may cite.
+    async fn insert_terminal_parent_grant(
+        db: &sea_orm::DbConn,
+        id: Hash,
+        delegator: &str,
+        delegatee: &str,
+        resource: &str,
+        ability: &str,
+    ) {
+        for actor_id in [delegator, delegatee] {
+            actor::ActiveModel {
+                id: Set(actor_id.to_string()),
+            }
+            .insert(db)
+            .await
+            .ok();
+        }
+        ActiveModel {
+            id: Set(id),
+            delegator: Set(delegator.to_string()),
+            delegatee: Set(delegatee.to_string()),
+            expiry: Set(None),
+            issued_at: Set(None),
+            not_before: Set(None),
+            facts: Set(Some(Facts(BTreeMap::from([(
+                DelegationMode::FACT_KEY.to_string(),
+                serde_json::json!("terminal"),
+            )])))),
+            serialization: Set(id.as_ref().to_vec()),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        abilities::Entity::insert(abilities::ActiveModel {
+            delegation: Set(id),
+            resource: Set(resource.parse().unwrap()),
+            ability: Set(ability.to_string().try_into().unwrap()),
+            caveats: Set(Default::default()),
+        })
+        .exec(db)
+        .await
+        .unwrap();
+    }
+
+    /// A terminal grant cannot be cited as a parent for a redelegation, even when it covers the child's resource.
+    #[tokio::test]
+    async fn terminal_parent_grant_cannot_be_redelegated() {
+        let db = database().await;
+        let parent = crate::hash::hash(b"terminal-parent-grant");
+        let prefix = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/foo/");
+        insert_terminal_parent_grant(&db, parent, KEY_OWNER, OTHER_DID, &prefix, KEY_DECRYPT).await;
+        let key = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/foo/x");
+        let info = key_grant_info(OTHER_DID, &key, KEY_DECRYPT, &[parent]);
+        assert!(
+            matches!(
+                validate(&db, &info).await,
+                Err(Error::InvalidDelegation(
+                    DelegationError::TerminalParentCannotRedelegate
+                ))
+            ),
+            "terminal parent accepted for redelegation"
+        );
+    }
 }
