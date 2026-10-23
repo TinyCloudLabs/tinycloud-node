@@ -28,6 +28,8 @@ use tinycloud_auth::{
 use crate::encryption::ColumnEncryption;
 use crate::encryption_network::backend::{wrap_to_public_key, LocalOneOfOneBackend};
 use crate::encryption_network::canonical::{canonical_hash, canonical_json_bytes};
+use crate::encryption_network::key_id::{parse as parse_resource, EncryptionResource, KeyLocation};
+use crate::encryption_network::keys::KeyState;
 use crate::encryption_network::network_id::NetworkId;
 use crate::encryption_network::protocol::{
     DecryptFacts, DecryptInvocation, DecryptRequestBody, InvocationCapability, NetworkAdminFacts,
@@ -821,4 +823,204 @@ async fn unique_request_hashes_per_decrypt() {
     let r2 = svc.decrypt(&net, &inv2, &body2).await.unwrap();
 
     assert_ne!(r1.request_hash, r2.request_hash);
+}
+
+fn key_loc(path: &str) -> KeyLocation {
+    let urn = format!(
+        "urn:tinycloud:encryption:{}:{}/{}",
+        owner_did(),
+        NETWORK_NAME,
+        path
+    );
+    match parse_resource(&urn).expect("parse key urn") {
+        EncryptionResource::Key(loc) => loc,
+        other => panic!("expected key resource, got {other:?}"),
+    }
+}
+
+async fn create_network(svc: &EncryptionService) {
+    svc.create_one_of_one_network(CreateNetworkRequest {
+        name: NETWORK_NAME.to_string(),
+        owner_did: owner_did(),
+        threshold: Threshold::one_of_one(),
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn create_key_returns_active_deterministic_descriptor() {
+    let svc = make_service(fresh_db().await);
+    create_network(&svc).await;
+    let key = svc.create_key(&key_loc("apps/alpha"), false).await.unwrap();
+    assert_eq!(key.state, KeyState::Active);
+    assert_eq!(key.kind, "deterministic");
+    assert_eq!(key.key_version, 1);
+    assert_eq!(key.alg, ALG_X25519_AES256GCM);
+    assert_eq!(key.key_path, "apps/alpha");
+    assert_eq!(key.public_encryption_key.len(), 32);
+}
+
+#[tokio::test]
+async fn create_key_is_idempotent_for_active_key() {
+    let svc = make_service(fresh_db().await);
+    create_network(&svc).await;
+    let first = svc.create_key(&key_loc("apps/alpha"), false).await.unwrap();
+    let second = svc.create_key(&key_loc("apps/alpha"), false).await.unwrap();
+    assert_eq!(first, second);
+}
+
+#[tokio::test]
+async fn create_key_rejects_existing_blocked_key() {
+    let svc = make_service(fresh_db().await);
+    create_network(&svc).await;
+    svc.create_key(&key_loc("apps/alpha"), false).await.unwrap();
+    svc.block_key(&key_loc("apps/alpha")).await.unwrap();
+    let err = svc
+        .create_key(&key_loc("apps/alpha"), false)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EncryptionServiceError::KeyExists));
+}
+
+#[tokio::test]
+async fn create_key_rejects_shreddable() {
+    let svc = make_service(fresh_db().await);
+    create_network(&svc).await;
+    let err = svc
+        .create_key(&key_loc("apps/alpha"), true)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EncryptionServiceError::ShreddableUnavailable));
+}
+
+#[tokio::test]
+async fn create_key_requires_existing_network() {
+    let svc = make_service(fresh_db().await);
+    let err = svc
+        .create_key(&key_loc("apps/alpha"), false)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EncryptionServiceError::NetworkNotFound));
+}
+
+#[tokio::test]
+async fn create_key_refuses_revoked_network() {
+    let svc = make_service(fresh_db().await);
+    create_network(&svc).await;
+    svc.revoke_network(&network_id()).await.unwrap();
+    let err = svc
+        .create_key(&key_loc("apps/alpha"), false)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EncryptionServiceError::NetworkRevoked));
+}
+
+#[tokio::test]
+async fn create_key_cap_counts_blocked_rows() {
+    let svc = make_service(fresh_db().await).with_key_cap_per_network(2);
+    create_network(&svc).await;
+    svc.create_key(&key_loc("a"), false).await.unwrap();
+    svc.create_key(&key_loc("b"), false).await.unwrap();
+    svc.block_key(&key_loc("a")).await.unwrap();
+    let err = svc.create_key(&key_loc("c"), false).await.unwrap_err();
+    assert!(matches!(err, EncryptionServiceError::KeyLimitExceeded));
+}
+
+#[tokio::test]
+async fn block_and_unblock_are_idempotent_round_trip() {
+    let svc = make_service(fresh_db().await);
+    create_network(&svc).await;
+    svc.create_key(&key_loc("apps/alpha"), false).await.unwrap();
+    let blocked = svc.block_key(&key_loc("apps/alpha")).await.unwrap();
+    assert_eq!(blocked.state, KeyState::Blocked);
+    assert_eq!(
+        svc.block_key(&key_loc("apps/alpha")).await.unwrap(),
+        blocked
+    );
+    let active = svc.unblock_key(&key_loc("apps/alpha")).await.unwrap();
+    assert_eq!(active.state, KeyState::Active);
+}
+
+#[tokio::test]
+async fn block_missing_key_is_not_found() {
+    let svc = make_service(fresh_db().await);
+    create_network(&svc).await;
+    let err = svc.block_key(&key_loc("apps/missing")).await.unwrap_err();
+    assert!(matches!(err, EncryptionServiceError::KeyNotFound));
+}
+
+#[tokio::test]
+async fn public_get_derives_without_writing_and_matches_created_key() {
+    let svc = make_service(fresh_db().await);
+    create_network(&svc).await;
+    let loc = key_loc("apps/beta");
+    let derived = svc.public_key(&loc).await.unwrap();
+    let err = svc.describe_key(&loc).await.unwrap_err();
+    assert!(matches!(err, EncryptionServiceError::KeyNotFound));
+    let created = svc.create_key(&loc, false).await.unwrap();
+    assert_eq!(derived.public_encryption_key, created.public_encryption_key);
+}
+
+#[tokio::test]
+async fn public_get_is_identical_for_missing_active_and_blocked_keys() {
+    let svc = make_service(fresh_db().await);
+    create_network(&svc).await;
+    let loc = key_loc("apps/gamma");
+    let missing = svc.public_key(&loc).await.unwrap();
+    svc.create_key(&loc, false).await.unwrap();
+    let active = svc.public_key(&loc).await.unwrap();
+    svc.block_key(&loc).await.unwrap();
+    let blocked = svc.public_key(&loc).await.unwrap();
+    assert_eq!(missing, active);
+    assert_eq!(active, blocked);
+}
+
+#[tokio::test]
+async fn unwrap_named_key_round_trip_for_active_key() {
+    let svc = make_service(fresh_db().await);
+    create_network(&svc).await;
+    let loc = key_loc("apps/alpha");
+    let key = svc.create_key(&loc, false).await.unwrap();
+    let symmetric = vec![0x5Au8; 32];
+    let wrapped = wrap_to_public_key(&key.public_encryption_key, &symmetric).unwrap();
+    let unwrapped = svc.unwrap_named_key(&loc, &wrapped).await.unwrap();
+    assert_eq!(unwrapped, symmetric);
+}
+
+#[tokio::test]
+async fn unwrap_named_key_refuses_blocked_key() {
+    let svc = make_service(fresh_db().await);
+    create_network(&svc).await;
+    let loc = key_loc("apps/alpha");
+    let key = svc.create_key(&loc, false).await.unwrap();
+    let wrapped = wrap_to_public_key(&key.public_encryption_key, &[0x5Au8; 32]).unwrap();
+    svc.block_key(&loc).await.unwrap();
+    let err = svc.unwrap_named_key(&loc, &wrapped).await.unwrap_err();
+    assert!(matches!(err, EncryptionServiceError::KeyBlocked));
+}
+
+#[tokio::test]
+async fn unwrap_named_key_refuses_missing_row() {
+    let svc = make_service(fresh_db().await);
+    create_network(&svc).await;
+    let err = svc
+        .unwrap_named_key(&key_loc("apps/alpha"), &[0u8; 96])
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EncryptionServiceError::KeyNotFound));
+}
+
+#[tokio::test]
+async fn unwrap_named_key_rejects_wrapping_to_other_key() {
+    let svc = make_service(fresh_db().await);
+    create_network(&svc).await;
+    let alpha = svc.create_key(&key_loc("apps/alpha"), false).await.unwrap();
+    svc.create_key(&key_loc("apps/beta"), false).await.unwrap();
+    let wrapped = wrap_to_public_key(&alpha.public_encryption_key, &[0x5Au8; 32]).unwrap();
+    let err = svc
+        .unwrap_named_key(&key_loc("apps/beta"), &wrapped)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EncryptionServiceError::KeyUnwrapFailed(_)));
 }

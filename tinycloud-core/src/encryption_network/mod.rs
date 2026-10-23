@@ -8,6 +8,7 @@
 pub mod backend;
 pub mod canonical;
 pub mod key_id;
+pub mod keys;
 pub mod network_id;
 pub mod protocol;
 pub mod service;

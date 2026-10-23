@@ -296,6 +296,13 @@ fn map_service_err(err: EncryptionServiceError) -> (Status, String) {
         | EncryptionServiceError::AlgKeyVersionMismatch
         | EncryptionServiceError::HashMismatch(_) => Status::Unauthorized,
         EncryptionServiceError::NetworkNotActive(_) => Status::Conflict,
+        EncryptionServiceError::KeyExists => Status::Conflict,
+        EncryptionServiceError::KeyNotFound => Status::NotFound,
+        EncryptionServiceError::ShreddableUnavailable
+        | EncryptionServiceError::KeyBlocked
+        | EncryptionServiceError::KeyLimitExceeded
+        | EncryptionServiceError::KeyUnwrapFailed(_) => Status::Forbidden,
+        EncryptionServiceError::CorruptKeyRow(_) => Status::InternalServerError,
         EncryptionServiceError::InvalidBody(_) | EncryptionServiceError::Base64(_) => {
             Status::BadRequest
         }

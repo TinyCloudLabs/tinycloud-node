@@ -27,6 +27,7 @@ use crate::util::InvocationInfo;
 
 use super::backend::{KeyBackend, KeyBackendError};
 use super::canonical::{canonical_hash, canonical_json_bytes, hash_hex};
+use super::keys::DEFAULT_KEY_CAP_PER_NETWORK;
 use super::network_id::NetworkId;
 use super::protocol::{
     DecryptFacts, DecryptInvocation, DecryptRequestBody, DecryptResponseBody, NetworkAdminFacts,
@@ -90,15 +91,30 @@ pub enum EncryptionServiceError {
     Base64(&'static str),
     #[error("node response signing failed: {0}")]
     Signing(String),
+    #[error("shreddable_unavailable: shreddable keys are not available in this release")]
+    ShreddableUnavailable,
+    #[error("key_exists: a key already exists at this path")]
+    KeyExists,
+    #[error("key_not_found: no key exists at this path")]
+    KeyNotFound,
+    #[error("key_blocked: the key is blocked")]
+    KeyBlocked,
+    #[error("key_limit_exceeded: the network has reached its key limit")]
+    KeyLimitExceeded,
+    #[error("key_unwrap_failed: the wrapped key could not be unwrapped")]
+    KeyUnwrapFailed(#[source] KeyBackendError),
+    #[error("stored key row is corrupt: {0}")]
+    CorruptKeyRow(String),
 }
 
 pub struct EncryptionService {
-    db: RecoveringConnection,
+    pub(super) db: RecoveringConnection,
     node_did: String,
     node_keypair: Option<Keypair>,
-    backend: Arc<dyn KeyBackend>,
+    pub(super) backend: Arc<dyn KeyBackend>,
     invocation_ttl_seconds: i64,
-    sqlite_writer_lock: Option<Arc<tokio::sync::Mutex<()>>>,
+    pub(super) sqlite_writer_lock: Option<Arc<tokio::sync::Mutex<()>>>,
+    pub(super) key_cap_per_network: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -127,6 +143,7 @@ impl EncryptionService {
             backend,
             invocation_ttl_seconds: DEFAULT_INVOCATION_TTL_SECONDS,
             sqlite_writer_lock: None,
+            key_cap_per_network: DEFAULT_KEY_CAP_PER_NETWORK,
         }
     }
 
@@ -143,11 +160,17 @@ impl EncryptionService {
             backend,
             invocation_ttl_seconds: DEFAULT_INVOCATION_TTL_SECONDS,
             sqlite_writer_lock: None,
+            key_cap_per_network: DEFAULT_KEY_CAP_PER_NETWORK,
         }
     }
 
     pub fn with_sqlite_writer_lock(mut self, lock: Option<Arc<tokio::sync::Mutex<()>>>) -> Self {
         self.sqlite_writer_lock = lock;
+        self
+    }
+
+    pub fn with_key_cap_per_network(mut self, cap: u64) -> Self {
+        self.key_cap_per_network = cap;
         self
     }
 
@@ -1068,7 +1091,7 @@ impl From<&NetworkDescriptor> for WellKnownRecord {
     }
 }
 
-fn now_rfc3339() -> String {
+pub(super) fn now_rfc3339() -> String {
     OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
