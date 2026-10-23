@@ -710,12 +710,61 @@ async fn create_refuses_once_the_network_key_cap_is_reached() -> Result<()> {
 
 // --------------------------------------------------------- public and describe
 
+/// Full error text for a percent-escape on a key route URL.
+const PERCENT_KEY_ROUTE_ERROR: &str = "key_path_invalid: percent-encoding is not accepted in key route URLs (send the network id and key path unencoded)";
+
+/// The network id with its last colon percent-encoded, as a client would send it.
+fn percent_encoded_network(network: &str) -> String {
+    let (head, name) = network.rsplit_once(':').expect("network id has a colon");
+    format!("{head}%3A{name}")
+}
+
 #[tokio::test]
 async fn public_get_refuses_a_percent_in_the_key_path() -> Result<()> {
     let (fixture, network) = setup().await?;
     let (status, text) = public_get(&fixture, &network, "docs%41").await;
     assert_eq!(status, Status::BadRequest, "{text}");
-    assert!(text.starts_with("key_path_invalid"), "{text}");
+    assert_eq!(text, PERCENT_KEY_ROUTE_ERROR);
+    Ok(())
+}
+
+#[tokio::test]
+async fn describe_refuses_a_percent_in_the_key_path() -> Result<()> {
+    let (fixture, network) = setup().await?;
+    let auth = describe_auth(&fixture, &network, "docs/a", KEY_CREATE_ACTION)?;
+    let (status, text) = describe_get(&fixture, &network, "docs%41", &auth).await;
+    assert_eq!(status, Status::BadRequest, "{text}");
+    assert_eq!(text, PERCENT_KEY_ROUTE_ERROR);
+    Ok(())
+}
+
+#[tokio::test]
+async fn public_get_refuses_a_percent_escape_in_the_network_id() -> Result<()> {
+    let (fixture, network) = setup().await?;
+    let encoded = percent_encoded_network(&network);
+    let (status, text) = public_get(&fixture, &encoded, "docs/a").await;
+    assert_eq!(status, Status::BadRequest, "{text}");
+    assert_eq!(text, PERCENT_KEY_ROUTE_ERROR);
+    Ok(())
+}
+
+#[tokio::test]
+async fn describe_refuses_a_percent_escape_in_the_network_id() -> Result<()> {
+    let (fixture, network) = setup().await?;
+    let auth = describe_auth(&fixture, &network, "docs/a", KEY_CREATE_ACTION)?;
+    let encoded = percent_encoded_network(&network);
+    let (status, text) = describe_get(&fixture, &encoded, "docs/a", &auth).await;
+    assert_eq!(status, Status::BadRequest, "{text}");
+    assert_eq!(text, PERCENT_KEY_ROUTE_ERROR);
+    Ok(())
+}
+
+#[tokio::test]
+async fn public_get_of_a_clean_raw_path_with_a_colon_network_id_succeeds() -> Result<()> {
+    let (fixture, network) = setup().await?;
+    assert!(network.contains(':'), "{network}");
+    let (status, text) = public_get(&fixture, &network, "docs/a").await;
+    assert_eq!(status, Status::Ok, "{text}");
     Ok(())
 }
 
