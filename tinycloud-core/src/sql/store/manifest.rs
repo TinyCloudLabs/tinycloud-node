@@ -10,8 +10,8 @@ use async_trait::async_trait;
 use sea_orm::{
     sea_query::{Expr, OnConflict},
     ActiveValue::Set,
-    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder,
-    TransactionTrait,
+    ColumnTrait, ConnectionTrait, DatabaseConnection, DatabaseTransaction, EntityTrait,
+    QueryFilter, QueryOrder, TransactionTrait,
 };
 
 use super::key::{DbRef, Lineage, ObjectKey, ObjectKind, PublishId};
@@ -238,6 +238,14 @@ fn manifest_row(
     })
 }
 
+/// What the transactional part of a publish decided.
+enum PublishStep {
+    /// The CAS and the object flip ran; carries the frontier read in the same transaction.
+    Won(Option<Frontier>),
+    /// The CAS lost; the caller rolls back and reads the winner.
+    Lost,
+}
+
 impl DbSqlManifest {
     async fn read<C: ConnectionTrait>(
         conn: &C,
@@ -314,6 +322,52 @@ impl DbSqlManifest {
         }
         Ok(update.exec(conn).await?.rows_affected)
     }
+
+    /// The transactional part of one publish. Returns with `txn` still open;
+    /// the caller commits after `Won` and rolls back on every other outcome,
+    /// including the errors returned here.
+    async fn publish_in(
+        txn: &DatabaseTransaction,
+        db: &DbRef<'_>,
+        expected: Option<&CasToken>,
+        publish: &Publish,
+    ) -> Result<PublishStep, SqlStoreError> {
+        let obj = &publish.object;
+        let won = match expected {
+            // INSERT … ON CONFLICT DO NOTHING: a raw primary-key violation
+            // would abort the whole Postgres transaction.
+            None => {
+                let inserted =
+                    manifest::Entity::insert(manifest_row(db, publish, SHADOW_EPOCH, 0)?)
+                        .on_conflict(
+                            OnConflict::columns([manifest::Column::Space, manifest::Column::DbId])
+                                .do_nothing()
+                                .to_owned(),
+                        )
+                        .exec_without_returning(txn)
+                        .await?;
+                inserted == 1
+            }
+            Some(token) => Self::cas(txn, db, token, publish).await? == 1,
+        };
+        if !won {
+            return Ok(PublishStep::Lost);
+        }
+        let flipped = object::Entity::update_many()
+            .col_expr(
+                object::Column::State,
+                Expr::value(ObjectState::Published.as_str()),
+            )
+            .filter(object_pk(db, obj)?)
+            .filter(object::Column::State.eq(ObjectState::Uploaded.as_str()))
+            .exec(txn)
+            .await?
+            .rows_affected;
+        if flipped != 1 {
+            return Err(SqlStoreError::ObjectNotUploaded);
+        }
+        Ok(PublishStep::Won(Self::read(txn, db).await?))
+    }
 }
 
 #[async_trait]
@@ -346,48 +400,27 @@ impl SqlManifest for DbSqlManifest {
             }
         }
         let txn = self.db.begin().await?;
-        let won = match expected {
-            // INSERT … ON CONFLICT DO NOTHING: a raw primary-key violation
-            // would abort the whole Postgres transaction.
-            None => {
-                let inserted =
-                    manifest::Entity::insert(manifest_row(db, &publish, SHADOW_EPOCH, 0)?)
-                        .on_conflict(
-                            OnConflict::columns([manifest::Column::Space, manifest::Column::DbId])
-                                .do_nothing()
-                                .to_owned(),
-                        )
-                        .exec_without_returning(&txn)
-                        .await?;
-                inserted == 1
+        let step = match Self::publish_in(&txn, db, expected, &publish).await {
+            Ok(step) => step,
+            Err(err) => {
+                let _ = txn.rollback().await;
+                return Err(err);
             }
-            Some(token) => Self::cas(&txn, db, token, &publish).await? == 1,
         };
-        if !won {
-            txn.rollback().await?;
-            return Ok(PublishOutcome::Lost(Self::read(&self.db, db).await?));
-        }
-        let flipped = object::Entity::update_many()
-            .col_expr(
-                object::Column::State,
-                Expr::value(ObjectState::Published.as_str()),
-            )
-            .filter(object_pk(db, obj)?)
-            .filter(object::Column::State.eq(ObjectState::Uploaded.as_str()))
-            .exec(&txn)
-            .await?
-            .rows_affected;
-        if flipped != 1 {
-            txn.rollback().await?;
-            return Err(SqlStoreError::ObjectNotUploaded);
-        }
-        let published = Self::read(&txn, db).await?;
-        txn.commit().await?;
-        match published {
-            Some(frontier) => Ok(PublishOutcome::Published(frontier)),
-            None => Err(SqlStoreError::Invalid(
-                "manifest row vanished after publish",
-            )),
+        match step {
+            PublishStep::Lost => {
+                txn.rollback().await?;
+                Ok(PublishOutcome::Lost(Self::read(&self.db, db).await?))
+            }
+            PublishStep::Won(published) => {
+                txn.commit().await?;
+                match published {
+                    Some(frontier) => Ok(PublishOutcome::Published(frontier)),
+                    None => Err(SqlStoreError::Invalid(
+                        "manifest row vanished after publish",
+                    )),
+                }
+            }
         }
     }
 
@@ -928,6 +961,66 @@ mod tests {
             Err(SqlStoreError::ObjectNotUploaded)
         ));
         assert_eq!(m.current(&DB).await.unwrap().unwrap(), f2);
+    }
+
+    /// A publish whose read-back fails in Rust after the manifest row UPDATE
+    /// ends its write transaction, so the row lock it took is released. The
+    /// fault is a `BEFORE UPDATE` trigger storing a negative `frontier_bytes`,
+    /// which `from_model` refuses as `negative seq`. A PostgreSQL statement
+    /// error would abort the transaction and free the lock by itself, so the
+    /// fault is Rust-side. PostgreSQL only; the probe runs in CI, not locally.
+    #[tokio::test]
+    async fn postgres_failed_readback_publish_releases_its_manifest_row_lock() {
+        use sea_orm::ConnectionTrait;
+
+        const FAIL_READBACK_SQL: &str = "
+CREATE FUNCTION tc1836_fail_manifest_readback() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    NEW.frontier_bytes := -1;
+    RETURN NEW;
+END
+$$;
+CREATE TRIGGER tc1836_fail_manifest_readback BEFORE UPDATE ON sql_store_manifest
+    FOR EACH ROW EXECUTE FUNCTION tc1836_fail_manifest_readback();
+";
+        let Some(fixture) =
+            PostgresTestSchema::new("postgres_sql_store_failed_readback_row_lock").await
+        else {
+            return;
+        };
+        let m = DbSqlManifest::new(fixture.connect(10).await);
+        let f = first(&m, &Lineage::random(), 5).await;
+        let key = seg(&f.lineage, f.base_seq, 6, 7, "readback");
+        record(&m, &key).await;
+        m.db.execute_unprepared(FAIL_READBACK_SQL).await.unwrap();
+        assert!(matches!(
+            m.publish_cas(
+                &DB,
+                Some(&f.token()),
+                publish(
+                    PublishKind::Segment {
+                        base_snapshot_key: f.base_snapshot_key.clone(),
+                    },
+                    &key,
+                    CID,
+                ),
+            )
+            .await,
+            Err(SqlStoreError::Invalid("negative seq"))
+        ));
+        // The refused publish has returned, so its manifest row lock must be
+        // released. Fresh session on its own thread, not the manifest's pool.
+        fixture
+            .execute_blocking(&format!(
+                "SELECT space FROM sql_store_manifest WHERE space = '{}' AND db_id = '{}' FOR UPDATE NOWAIT",
+                DB.space, DB.db_id
+            ))
+            .expect("manifest row lock released after the failed read-back");
+        // The CAS rolled back: with the trigger gone, the row still holds `f`.
+        m.db.execute_unprepared("DROP TRIGGER tc1836_fail_manifest_readback ON sql_store_manifest")
+            .await
+            .unwrap();
+        assert_eq!(m.current(&DB).await.unwrap().unwrap(), f, "CAS rolled back");
     }
 
     async fn inventory_listing_and_conflicts(m: DbSqlManifest) {
