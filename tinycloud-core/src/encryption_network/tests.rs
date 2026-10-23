@@ -1571,4 +1571,8 @@ async fn decrypt_authorized_refuses_a_low_order_receiver_key() {
         err,
         EncryptionServiceError::InvalidReceiverPublicKey
     ));
+    assert!(
+        err.to_string().starts_with("receiver_key_invalid: "),
+        "{err}"
+    );
 }
