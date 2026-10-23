@@ -55,6 +55,17 @@ pub struct Config {
     pub epoch_head_backfill: EpochHeadBackfillConfig,
     #[serde(default)]
     pub sql_store: SqlStoreConfig,
+    #[serde(default)]
+    pub encryption_network: EncryptionNetworkConfig,
+}
+
+/// Release gates for the encryption network routes. `named_keys_v1`
+/// advertises the `encryption-named-keys-v1` feature in `/info`; it stays off
+/// until named keys are live on OpenKey.
+#[derive(Serialize, Deserialize, Debug, Default, Clone, Hash, PartialEq, Eq)]
+pub struct EncryptionNetworkConfig {
+    #[serde(default)]
+    pub named_keys_v1: bool,
 }
 
 /// Production exact-email composition.  The capability remains unavailable
