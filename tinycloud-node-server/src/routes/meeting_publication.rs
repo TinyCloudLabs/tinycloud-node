@@ -540,9 +540,13 @@ mod tests {
     }
     #[rocket::post("/", data = "<data>")]
     async fn framing(data: rocket::Data<'_>) -> Result<String, (Status, String)> {
-        super::super::read_json_body_limited(DataIn::One(data), publication::ENVELOPE_LIMIT)
-            .await
-            .map(|body| body.len().to_string())
+        super::super::read_json_body_limited(
+            DataIn::One(data),
+            publication::ENVELOPE_LIMIT,
+            "request_too_large",
+        )
+        .await
+        .map(|body| body.len().to_string())
     }
     #[rocket::async_test]
     async fn publication_route_checks_complete_utf8_framing() {
@@ -561,15 +565,10 @@ mod tests {
                 .status(),
             Status::Ok
         );
-        assert_eq!(
-            client
-                .post("/")
-                .body(format!("{body} "))
-                .dispatch()
-                .await
-                .status(),
-            Status::PayloadTooLarge
-        );
+        let response = client.post("/").body(format!("{body} ")).dispatch().await;
+        assert_eq!(response.status(), Status::PayloadTooLarge);
+        let text = response.into_string().await.unwrap();
+        assert!(text.starts_with("request_too_large: "), "{text}");
         assert_eq!(
             client.post("/").body(vec![255]).dispatch().await.status(),
             Status::BadRequest
