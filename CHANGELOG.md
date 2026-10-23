@@ -4,6 +4,7 @@
 
 ### Changes
 
+- Tests that read `TINYCLOUD_TEST_POSTGRES_URL` connect only when `CI=true` or `TINYCLOUD_ALLOW_LOCAL_PG=1` is set, and skip otherwise. `tinycloud-node-server/tests/at_rest_harness.rs` (reads `TC887_PG_URL`) is excluded.
 - Encryption: parsing and containment for key resource identifiers; owners are root authority for their keys; key prefixes are refused as invocation targets, and key.delete is refused in delegations. Named keys can be created, blocked and unblocked, and their public key is derived, but no route uses them yet. Root-key decrypt on both live routes now uses strict unwrap: wrapped keys must carry the 0x01 version byte, and non-contributory key exchanges are refused. On the direct route a refused wrap returns 500 until the route-mapping change lands. Create, public key and named-key unwrap on a revoked network return 409 (`NetworkNotActive`). Details: TC-1777.
 - Encryption: key and prefix network names must match `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`; bare network resources keep the existing network name rule. Details: TC-1777.
 
