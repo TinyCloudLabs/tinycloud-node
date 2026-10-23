@@ -8,7 +8,9 @@ use tinycloud_auth::{
     cacaos::siwe::Message,
     ipld_core::cid::Cid,
     resource::SpaceId,
-    siwe_recap::{Capability as SiweCap, VerificationError as SiweError},
+    siwe_recap::{
+        Capability as SiweCap, DecodingError as SiweDecodingError, VerificationError as SiweError,
+    },
 };
 use ucan_capabilities_object::Capabilities as UcanCapabilities;
 
@@ -29,7 +31,7 @@ pub struct Capability {
     /// UCAN-shaped caveats attached to this capability. Persisted with the
     /// delegation row (W1 native contract requirement); MUST NOT be dropped
     /// at save time. For UCAN delegations these come from the per-ability
-    /// caveat list; for SIWE-ReCap they are always empty (non-empty SIWE caveats are refused).
+    /// caveat list; for SIWE-ReCap they are always empty (a non-null SIWE caveat value is refused).
     #[serde(default)]
     pub caveats: Caveats,
 }
@@ -74,23 +76,47 @@ fn extract_ucan_caps<T: serde::Serialize>(caps: &UcanCapabilities<T>) -> Vec<Cap
     capabilities
 }
 
-fn extract_siwe_cap(
-    c: SiweCap<serde_json::Value>,
-) -> Result<(Vec<Capability>, Vec<Cid>), DelegationError> {
+/// Refusal text for a SIWE ReCap caveat value that is not null. It never
+/// includes the value or its key.
+const SIWE_CAVEAT_REFUSED: &str = "SIWE delegations accept only null caveat values";
+
+/// A SIWE ReCap caveat value, checked as it is decoded. The check runs on each
+/// occurrence, so a key repeated in one object cannot hide a non-null value.
+struct SiweCaveatValue;
+
+impl<'de> Deserialize<'de> for SiweCaveatValue {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match Option::<serde::de::IgnoredAny>::deserialize(deserializer)? {
+            None => Ok(Self),
+            Some(_) => Err(serde::de::Error::custom(SIWE_CAVEAT_REFUSED)),
+        }
+    }
+}
+
+/// Maps a SIWE ReCap decode failure. Only a refused caveat value becomes
+/// `UnsupportedCaveat`; every other failure keeps `SiweCapError`.
+///
+/// The refusal is recognized by the start of the serde message. A parser error
+/// could match only if its text begins with this exact sentence; the result is
+/// still a refusal, so no caveat is accepted by such a match.
+fn siwe_decode_error(e: SiweError) -> DelegationError {
+    let refused = matches!(
+        &e,
+        SiweError::Decoding(SiweDecodingError::De(de))
+            if de.to_string().starts_with(SIWE_CAVEAT_REFUSED)
+    );
+    if refused {
+        DelegationError::UnsupportedCaveat(SIWE_CAVEAT_REFUSED.to_string())
+    } else {
+        DelegationError::SiweCapError(e)
+    }
+}
+
+fn extract_siwe_cap(c: SiweCap<SiweCaveatValue>) -> (Vec<Capability>, Vec<Cid>) {
     let (c, p) = c.into_inner();
     let mut capabilities = Vec::new();
     for (r, acs) in c.into_inner() {
-        for (ability, caveats) in acs {
-            // A SIWE caveat is accepted only as an empty placeholder: every
-            // value in every entry must be null. Any other value is refused,
-            // because nothing enforces it. Caveat values are never echoed.
-            for (i, entry) in caveats.into_inner().into_iter().enumerate() {
-                if entry.values().any(|v| !v.is_null()) {
-                    return Err(DelegationError::UnsupportedCaveat(format!(
-                        "{ability} caveat {i} is not accepted; SIWE delegations accept only null caveat values"
-                    )));
-                }
-            }
+        for (ability, _) in acs {
             capabilities.push(Capability {
                 resource: Resource::from(r.clone()),
                 ability: ability.into(),
@@ -98,7 +124,7 @@ fn extract_siwe_cap(
             });
         }
     }
-    Ok((capabilities, p))
+    (capabilities, p)
 }
 
 #[derive(Debug, Clone)]
@@ -206,12 +232,12 @@ impl TryFrom<TinyCloudDelegation> for DelegationInfo {
             },
             TinyCloudDelegation::Cacao(ref c) => {
                 let m: Message = c.payload().clone().try_into()?;
-                // Decode the ReCap caveats as JSON values so extract_siwe_cap can refuse them explicitly.
-                let maybe_siwe_cap = SiweCap::extract_and_verify(&m)?;
+                // Each caveat value is checked while it is decoded (SiweCaveatValue).
+                let maybe_siwe_cap = SiweCap::<SiweCaveatValue>::extract_and_verify(&m)
+                    .map_err(siwe_decode_error)?;
 
                 let (capabilities, parents) = match maybe_siwe_cap {
-                    // Non-empty caveats are refused inside extract_siwe_cap.
-                    Some(siwe_cap) => extract_siwe_cap(siwe_cap)?,
+                    Some(siwe_cap) => extract_siwe_cap(siwe_cap),
                     None => (vec![], vec![]),
                 };
 
@@ -382,10 +408,6 @@ mod tests {
     fn siwe_with_recap(
         grants: &[(&str, Vec<BTreeMap<String, serde_json::Value>>)],
     ) -> TinyCloudDelegation {
-        use tinycloud_auth::cacaos::{
-            siwe::Version,
-            siwe_cacao::{Header, Signature, SiweCacao},
-        };
         let mut recap = tinycloud_auth::siwe_recap::Capability::<serde_json::Value>::new();
         for (ability, caveats) in grants {
             recap.with_action(
@@ -394,7 +416,38 @@ mod tests {
                 caveats.clone(),
             );
         }
-        let message = Message {
+        cacao(recap.build_message(base_message()).unwrap())
+    }
+
+    /// A SIWE CACAO whose ReCap resource is `recap_json` verbatim, so a test
+    /// controls the JSON text the decoder sees, repeated keys included.
+    fn siwe_with_raw_recap(recap_json: &str) -> TinyCloudDelegation {
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(recap_json);
+        let mut message = base_message();
+        message.resources.push(
+            format!("{}{encoded}", tinycloud_auth::siwe_recap::RESOURCE_PREFIX)
+                .parse()
+                .unwrap(),
+        );
+        cacao(message)
+    }
+
+    /// A ReCap whose attenuation is `body`. `@RES` and `@KV` stand in for the
+    /// sql and kv resource URIs.
+    fn raw_recap(body: &str) -> String {
+        let kv =
+            "tinycloud:pkh:eip155:1:0x0000000000000000000000000000000000000001:default/kv/main";
+        format!(
+            r#"{{"att":{},"prf":[]}}"#,
+            body.replace("@RES", RESOURCE).replace("@KV", kv)
+        )
+    }
+
+    /// The message every test CACAO shares. Only its ReCap resource differs.
+    fn base_message() -> Message {
+        use tinycloud_auth::cacaos::siwe::Version;
+        Message {
             scheme: Some("https".parse().unwrap()),
             domain: "tinycloud.invalid".parse().unwrap(),
             address: [1; 20],
@@ -408,8 +461,11 @@ mod tests {
             not_before: None,
             request_id: None,
             resources: vec![],
-        };
-        let message = recap.build_message(message).unwrap();
+        }
+    }
+
+    fn cacao(message: Message) -> TinyCloudDelegation {
+        use tinycloud_auth::cacaos::siwe_cacao::{Header, Signature, SiweCacao};
         TinyCloudDelegation::Cacao(Box::new(SiweCacao::new(
             message.into(),
             Signature::from([0u8; 65]),
@@ -417,10 +473,9 @@ mod tests {
         )))
     }
 
-    /// TC-1844: a SIWE ReCap caveat with a non-null value is refused for every
-    /// ability, because the node has no enforcement for it.
+    /// TC-1844: a SIWE caveat with a non-null value is refused for every ability.
     #[test]
-    fn a_siwe_caveat_with_a_value_is_refused_for_every_ability() {
+    fn a_non_null_siwe_caveat_value_is_refused_for_every_ability() {
         use serde_json::json;
         let profile = recap_caveats(json!([{"tables": ["Notes"], "readOnly": true}]));
         for ability in [
@@ -439,16 +494,45 @@ mod tests {
         }
     }
 
-    /// An empty map is still a value, so `{"tables": {}}` is refused too.
+    /// TC-1844: each attenuation carries a non-null caveat value somewhere. Each
+    /// is refused with the same message, which never includes the value. Repeated
+    /// keys reach the decoder as written.
     #[test]
-    fn a_siwe_caveat_holding_an_empty_map_is_refused() {
-        use serde_json::json;
-        let delegation =
-            siwe_with_recap(&[("tinycloud.sql/read", recap_caveats(json!([{"tables": {}}])))]);
-        assert!(matches!(
-            DelegationInfo::try_from(delegation),
-            Err(DelegationError::UnsupportedCaveat(_))
-        ));
+    fn a_non_null_siwe_caveat_value_is_refused_wherever_it_appears() {
+        for body in [
+            // A caveat value that is a list, a boolean, a number, a string or an object.
+            r#"{"@RES":{"tinycloud.sql/read":[{"k":[]}]}}"#,
+            r#"{"@RES":{"tinycloud.sql/read":[{"k":false}]}}"#,
+            r#"{"@RES":{"tinycloud.sql/read":[{"k":0}]}}"#,
+            r#"{"@RES":{"tinycloud.sql/read":[{"k":""}]}}"#,
+            r#"{"@RES":{"tinycloud.sql/read":[{"k":{"x":null}}]}}"#,
+            // An empty map is still a value.
+            r#"{"@RES":{"tinycloud.sql/read":[{"tables":{}}]}}"#,
+            r#"{"@RES":{"tinycloud.sql/read":[{"tables":["Notes"],"readOnly":true}]}}"#,
+            // A non-null value in a later entry.
+            r#"{"@RES":{"tinycloud.sql/read":[{},{"k":"SECRETVALUE"}]}}"#,
+            // A repeated key within one entry, with the non-null value first or last.
+            r#"{"@RES":{"tinycloud.sql/read":[{"k":"SECRETVALUE","k":null}]}}"#,
+            r#"{"@RES":{"tinycloud.sql/read":[{"k":null,"k":"SECRETVALUE"}]}}"#,
+            // A repeated ability key whose first occurrence is non-null.
+            r#"{"@RES":{"tinycloud.sql/read":[{"k":"SECRETVALUE"}],"tinycloud.sql/read":[{"k":null}]}}"#,
+            // A non-null value on a second ability.
+            r#"{"@RES":{"tinycloud.sql/read":[{}],"tinycloud.sql/write":[{"k":"SECRETVALUE"}]}}"#,
+            // A non-null value on a second resource.
+            r#"{"@RES":{"tinycloud.sql/read":[{}]},"@KV":{"tinycloud.kv/get":[{"k":"SECRETVALUE"}]}}"#,
+        ] {
+            let err =
+                DelegationInfo::try_from(siwe_with_raw_recap(&raw_recap(body))).expect_err(body);
+            assert!(
+                matches!(err, DelegationError::UnsupportedCaveat(_)),
+                "{body}: got {err}"
+            );
+            assert_eq!(
+                err.to_string(),
+                format!("unsupported-caveat: {}", SIWE_CAVEAT_REFUSED)
+            );
+            assert!(!err.to_string().contains("SECRETVALUE"), "{body}");
+        }
     }
 
     /// Null values and empty entries carry no restriction. They are accepted
@@ -456,7 +540,12 @@ mod tests {
     #[test]
     fn null_and_empty_siwe_caveats_are_accepted_as_no_restriction() {
         use serde_json::json;
-        for caveats in [json!([{}]), json!([{}, {}]), json!([{"tables": null}])] {
+        for caveats in [
+            json!([{}]),
+            json!([{}, {}]),
+            json!([{"tables": null}]),
+            json!([{}, {"k": null, "j": null}]),
+        ] {
             let delegation =
                 siwe_with_recap(&[("tinycloud.sql/read", recap_caveats(caveats.clone()))]);
             let info = DelegationInfo::try_from(delegation)
@@ -464,5 +553,14 @@ mod tests {
             assert_eq!(info.capabilities.len(), 1);
             assert_eq!(info.capabilities[0].caveats, Caveats::default());
         }
+    }
+
+    /// A ReCap that does not decode keeps its decode error. Only a refused
+    /// caveat value becomes `UnsupportedCaveat`.
+    #[test]
+    fn a_malformed_siwe_recap_keeps_its_decode_error() {
+        let err = DelegationInfo::try_from(siwe_with_raw_recap(r#"{"att":5,"prf":[]}"#))
+            .expect_err("a non-object attenuation must not decode");
+        assert!(matches!(err, DelegationError::SiweCapError(_)), "got {err}");
     }
 }
