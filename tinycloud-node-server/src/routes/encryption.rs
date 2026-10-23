@@ -353,11 +353,12 @@ fn key_location(
     Ok((network, location))
 }
 
-/// Raw key path: the request path after `/networks/<network_id>/keys/`. Key
-/// routes read the network id and the key path as sent. Rocket decodes the
-/// `<network_id>` parameter, so a percent-escape in the network id breaks the
-/// raw prefix match; the detail then names the escape. Percent-escapes in the
-/// key path are refused outright.
+/// Raw key path: the request path after `/networks/<network_id>/keys/`. Rocket's
+/// decoded segments drop empty and dot segments, so the key path is taken from
+/// the raw request path and checked against the key grammar as received. Rocket
+/// decodes the `<network_id>` parameter, so a percent-escape in the network id
+/// breaks the raw prefix match; the detail then names the escape. Percent-escapes
+/// in the key path are refused outright.
 fn raw_key_path(origin: &Origin<'_>, network_id: &str) -> Result<String, (Status, String)> {
     let path = origin.path().as_str();
     let Some(raw) = path.strip_prefix(&format!("/encryption/networks/{network_id}/keys/")) else {
