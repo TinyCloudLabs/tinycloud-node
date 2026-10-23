@@ -1,11 +1,16 @@
-//! TC-1836: a refused `register_policy` ends its write transaction, so the
-//! space-sequence advisory lock it took inside that transaction is released.
+//! TC-1836: a registration whose insert is skipped ends its write transaction,
+//! so the space-sequence advisory lock it took inside that transaction is
+//! released.
 //!
-//! The refusal is injected in the database: a `BEFORE INSERT` trigger on
-//! `policy_v3_registration` in the test's own schema raises. That runs after
-//! `begin_write_transaction`, after `lock_space_sequences`, and after
-//! `delegate_batch_in_transaction`, and the handler maps it to `Conflict`.
-//! PostgreSQL only; the probe runs in CI, not locally.
+//! The skip is injected in the database: a `BEFORE INSERT` trigger on
+//! `policy_v3_registration` in the test's own schema returns NULL. PostgreSQL
+//! then inserts nothing, sea-orm reports `Failed to find inserted item`, and the
+//! handler answers `409 Conflict`. That path runs after `begin_write_transaction`,
+//! `lock_space_sequences`, and `delegate_batch_in_transaction`.
+//!
+//! The fault is Rust-side on purpose: a statement that raises in PostgreSQL
+//! aborts the transaction and frees its locks by itself, which would pass on
+//! main as well. PostgreSQL only; the probe runs in CI, not locally.
 
 use super::test_harness::*;
 use super::*;
@@ -17,7 +22,7 @@ use tinycloud_core::sea_orm::{
 const REFUSE_REGISTRATION_SQL: &str = "
 CREATE FUNCTION tc1836_refuse_registration() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
-    RAISE EXCEPTION 'tc1836 probe: registration refused';
+    RETURN NULL;
 END
 $$;
 CREATE TRIGGER tc1836_refuse_registration BEFORE INSERT ON policy_v3_registration
@@ -98,7 +103,7 @@ fn key_free_and_rows(url: String, key: i64) -> anyhow::Result<(bool, Rows)> {
 
 /// A refused registration releases the space-sequence lock it took, and
 /// leaves the policy and delegation rows as they were.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test]
 async fn postgres_refused_registration_releases_its_space_lock() -> anyhow::Result<()> {
     let test = "postgres_refused_registration_releases_its_space_lock";
     let Some(h) = Harness::new(Backend::Postgres, Shape::KeySession, test).await? else {
@@ -115,8 +120,8 @@ async fn postgres_refused_registration_releases_its_space_lock() -> anyhow::Resu
         "refused register: {status} {body}"
     );
     anyhow::ensure!(
-        body.contains("tc1836 probe: registration refused"),
-        "refusal was not the injected fault: {body}"
+        body.contains("Failed to find inserted item"),
+        "skipped insert did not surface as RecordNotFound: {body}"
     );
 
     // The only sequence space the registration locks is the content space:

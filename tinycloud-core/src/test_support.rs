@@ -142,27 +142,38 @@ impl PostgresTestSchema {
     /// meanwhile: this observes what the caller left behind before any task
     /// it spawned (such as sqlx's drop-time rollback) could run.
     pub(crate) fn execute_blocking(&self, sql: &str) -> Result<(), sea_orm::DbErr> {
-        use sea_orm::ConnectionTrait;
-
-        let (url, schema, sql) = (self.url.clone(), self.schema.clone(), sql.to_owned());
-        std::thread::spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("blocking probe runtime")
-                .block_on(async move {
-                    let mut options = sea_orm::ConnectOptions::new(url);
-                    options
-                        .max_connections(1)
-                        .sqlx_logging(false)
-                        .set_schema_search_path(schema);
-                    let db = sea_orm::Database::connect(options).await?;
-                    db.execute_unprepared(&sql).await.map(|_| ())
-                })
-        })
-        .join()
-        .expect("blocking probe thread")
+        execute_in_schema_blocking(self.url.clone(), self.schema.clone(), sql)
     }
+}
+
+/// `PostgresTestSchema::execute_blocking` for callers that hold only a URL and
+/// a schema name. Same guarantees: a fresh single-connection session on the
+/// schema, run from a thread and runtime of its own, joined before returning.
+pub(crate) fn execute_in_schema_blocking(
+    url: String,
+    schema: String,
+    sql: &str,
+) -> Result<(), sea_orm::DbErr> {
+    use sea_orm::ConnectionTrait;
+
+    let sql = sql.to_owned();
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("blocking probe runtime")
+            .block_on(async move {
+                let mut options = sea_orm::ConnectOptions::new(url);
+                options
+                    .max_connections(1)
+                    .sqlx_logging(false)
+                    .set_schema_search_path(schema);
+                let db = sea_orm::Database::connect(options).await?;
+                db.execute_unprepared(&sql).await.map(|_| ())
+            })
+    })
+    .join()
+    .expect("blocking probe thread")
 }
 
 impl Drop for PostgresTestSchema {

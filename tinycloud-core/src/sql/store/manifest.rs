@@ -963,39 +963,65 @@ mod tests {
         assert_eq!(m.current(&DB).await.unwrap().unwrap(), f2);
     }
 
+    /// A publish whose read-back fails in Rust after the manifest row UPDATE
+    /// ends its write transaction, so the row lock it took is released. The
+    /// fault is a `BEFORE UPDATE` trigger storing a negative `frontier_bytes`,
+    /// which `from_model` refuses as `negative seq`. A PostgreSQL statement
+    /// error would abort the transaction and free the lock by itself, so the
+    /// fault is Rust-side. PostgreSQL only; the probe runs in CI, not locally.
     #[tokio::test]
-    async fn postgres_not_uploaded_publish_releases_its_manifest_row_lock() {
-        use sea_orm::{ConnectionTrait, DbBackend, Statement};
+    async fn postgres_failed_readback_publish_releases_its_manifest_row_lock() {
+        use sea_orm::ConnectionTrait;
 
+        const FAIL_READBACK_SQL: &str = "
+CREATE FUNCTION tc1836_fail_manifest_readback() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    NEW.frontier_bytes := -1;
+    RETURN NEW;
+END
+$$;
+CREATE TRIGGER tc1836_fail_manifest_readback BEFORE UPDATE ON sql_store_manifest
+    FOR EACH ROW EXECUTE FUNCTION tc1836_fail_manifest_readback();
+";
         let Some(fixture) =
-            PostgresTestSchema::new("postgres_sql_store_not_uploaded_row_lock").await
+            PostgresTestSchema::new("postgres_sql_store_failed_readback_row_lock").await
         else {
             return;
         };
         let m = DbSqlManifest::new(fixture.connect(10).await);
         let f = first(&m, &Lineage::random(), 5).await;
-        // Never recorded: the CAS writes the manifest row, then the object flip
-        // matches nothing and the publish is refused.
-        let ghost = seg(&f.lineage, 5, 6, 20, "ghost");
-        let kind = PublishKind::Segment {
-            base_snapshot_key: f.base_snapshot_key.clone(),
-        };
+        let key = seg(&f.lineage, f.base_seq, 6, 7, "readback");
+        record(&m, &key).await;
+        m.db.execute_unprepared(FAIL_READBACK_SQL).await.unwrap();
         assert!(matches!(
-            m.publish_cas(&DB, Some(&f.token()), publish(kind, &ghost, CID))
-                .await,
-            Err(SqlStoreError::ObjectNotUploaded)
+            m.publish_cas(
+                &DB,
+                Some(&f.token()),
+                publish(
+                    PublishKind::Segment {
+                        base_snapshot_key: f.base_snapshot_key.clone(),
+                    },
+                    &key,
+                    CID,
+                ),
+            )
+            .await,
+            Err(SqlStoreError::Invalid("negative seq"))
         ));
-        // The refused publish has returned, so its manifest row lock must be released.
-        let probe = m
-            .db
-            .query_one(Statement::from_sql_and_values(
-                DbBackend::Postgres,
-                "SELECT space FROM sql_store_manifest WHERE space = $1 AND db_id = $2 FOR UPDATE NOWAIT",
-                [DB.space.into(), DB.db_id.into()],
+        // The refused publish has returned, so its manifest row lock must be
+        // released. Fresh session on its own thread, not the manifest's pool.
+        fixture
+            .execute_blocking(&format!(
+                "SELECT space FROM sql_store_manifest WHERE space = '{}' AND db_id = '{}' FOR UPDATE NOWAIT",
+                DB.space, DB.db_id
             ))
-            .await
-            .expect("manifest row lock released after ObjectNotUploaded");
-        assert!(probe.is_some(), "probe must read the manifest row");
+            .expect("manifest row lock released after the failed read-back");
+        // The CAS rolled back: with the trigger gone, the row still holds `f`.
+        m.db.execute_unprepared(
+            "DROP TRIGGER tc1836_fail_manifest_readback ON sql_store_manifest",
+        )
+        .await
+        .unwrap();
         assert_eq!(m.current(&DB).await.unwrap().unwrap(), f, "CAS rolled back");
     }
 
