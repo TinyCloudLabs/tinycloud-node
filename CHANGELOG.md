@@ -6,10 +6,10 @@
 
 ### Release notes
 
-- **SQL statements profile.** A SQL request is checked against the statements profile carried by its own invocation. An invocation whose SQL capabilities carry different profiles is refused with 403.
-- **One database proof per SQL or DuckDB request.** A SQL or DuckDB request that cites more than one proof carrying a SQL or DuckDB ability is refused with 403 `sql-one-database-proof-required`. A request with one such proof and any number of unrelated proofs is unchanged. The counter `tinycloud_database_multi_proof_refused_total` counts the refusals.
-- **SQL and DuckDB caveats.** Delegations and invocations of `tinycloud.sql/*` and `tinycloud.duckdb/*` with caveats that are not supported are refused (`UnsupportedCaveat`).
-- **One database migration:** `m20261022_000000_encryption_network_key` adds a table and a nullable column for encryption keys; nothing uses them yet. A node image from before this migration refuses to start against a database that has it, so rolling back below 1.21.9 needs `DELETE FROM seaql_migrations WHERE version = 'm20261022_000000_encryption_network_key';` first. If 1.21.8 was never deployed, the database also receives `m20261021_000000_sql_store_manifest`.
+- **SQL statements profile.** A SQL request is checked against the statements profile carried by its own invocation. An invocation whose SQL capabilities carry different profiles is refused with 403. Details: TC-1799.
+- **One database proof per SQL or DuckDB request.** A SQL or DuckDB request that cites more than one proof carrying a SQL or DuckDB ability is refused with 403 `sql-one-database-proof-required`. A request with one such proof and any number of unrelated proofs is unchanged. The counter `tinycloud_database_multi_proof_refused_total` counts the refusals. Details: TC-1799.
+- **SQL and DuckDB caveats.** Delegations and invocations of `tinycloud.sql/*` and `tinycloud.duckdb/*` with caveats that are not supported are refused (`UnsupportedCaveat`). Details: TC-1791.
+- **One database migration:** `m20261022_000000_encryption_network_key` adds a table and a nullable column for encryption keys; nothing uses them yet. A node image from before this migration refuses to start against a database that has it, so rolling back below 1.21.9 needs `DELETE FROM seaql_migrations WHERE version = 'm20261022_000000_encryption_network_key';` first. If 1.21.8 was never deployed, the database also receives `m20261021_000000_sql_store_manifest`, and rolling back below 1.21.9 must delete BOTH rows: `DELETE FROM seaql_migrations WHERE version IN ('m20261021_000000_sql_store_manifest', 'm20261022_000000_encryption_network_key');`. Details: TC-1777.
 
 ### Changes
 
