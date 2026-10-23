@@ -9932,7 +9932,7 @@ dependencies = [
 
 [[package]]
 name = "tinycloud-node"
-version = "1.21.7"
+version = "1.22.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -10011,6 +10011,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "uuid",
+ "x25519-dalek",
  "x509-parser 0.16.0",
 ]
 

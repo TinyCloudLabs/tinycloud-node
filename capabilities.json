@@ -169,6 +169,26 @@
       "status": "active"
     },
     {
+      "urn": "tinycloud.encryption/key.create",
+      "service": "tinycloud.encryption",
+      "status": "active"
+    },
+    {
+      "urn": "tinycloud.encryption/key.block",
+      "service": "tinycloud.encryption",
+      "status": "active"
+    },
+    {
+      "urn": "tinycloud.encryption/key.unblock",
+      "service": "tinycloud.encryption",
+      "status": "active"
+    },
+    {
+      "urn": "tinycloud.encryption/key.delete",
+      "service": "tinycloud.encryption",
+      "status": "active"
+    },
+    {
       "urn": "tinycloud.space/host",
       "service": "tinycloud.space",
       "status": "active",

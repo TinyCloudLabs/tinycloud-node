@@ -57,6 +57,22 @@ a version into the `docker.yml` `image_version` input that `Cargo.toml` does not
 already claim. Both have happened (`0b48da2`, and the image tagged `1.10.0`
 built from a `1.9.0` tree); the `version-guard` job now blocks the second one.
 
+## The CVM must run the production OS image
+
+The `deploy-phala` job in `docker.yml` refuses to deploy, and fails after a
+deploy, unless the `tinycloud-node` CVM reports `.os.is_dev == false` with the
+name and hash pinned in `PHALA_OS_IMAGE` / `PHALA_OS_IMAGE_HASH` (`dstack-0.5.12`).
+The Phala KMS only releases app keys to the production image. CI never changes
+the OS. If the check fails, set it by hand, then re-run:
+
+```sh
+phala cvms get tinycloud-node --json | jq .os
+phala api -X PATCH /cvms/<id>/os-image -F os_image_name=dstack-0.5.12
+```
+
+`phala deploy --image/--no-dev-os` is ignored for an existing CVM; the PATCH is
+what changes the OS.
+
 ## Operator steps before a node deploy
 
 A migration that indexes a large PostgreSQL table cannot be built by the boot:
@@ -440,6 +456,10 @@ its branch policy before any workflow that names it runs.
    a promote, which is why it runs for an hour. Check the run titled
    `Write Probe (dense promote watch)`; to start one by hand:
    `gh workflow run write-probe.yml -R TinyCloudLabs/tinycloud-node --ref main -f mode=dense`.
+   The deploy run's `promote-watch` job only dispatches the dense run, so it
+   can finish before the watch does: read the dense run itself (its
+   `Promote watch` step, and the final `dense watch done: N samples, F failed`
+   line).
    Details: `test/probe/README.md`.
 
 ### Main release with N0 log shipping (one dispatch)
@@ -469,8 +489,8 @@ Before any CVM mutation the workflow requires:
 
 - the main compose, with its one node digest replaced by 64 zeros, to hash
   to the reviewed N0 template
-  **`c91e5b7aabd141faf48b206e398474f8d90cde926c2bfe3f1a163b4923605093`**
-  (raw `99013c40e9523ae15a2c315403f0fc47fb9dcbb017825d3aa0f57669232c9047` normalized; before the TC-950 pool of 10 (`TINYCLOUD_DATABASE__MAX_CONNECTIONS` 15 to 10) the template was `79469f97…`, raw `32a002ef…`; before the three `current_kv_c_index_*` warning codes in the Vector config (TC-1274 `current_kv` C-index migration) the template was `87b5d12a…`, raw `d1fcd665…`; before the optional TC-1482 `NODE_STATS_READ_TOKEN` env line and the TC-1482 route in the Vector config the template was `7fabba70…`, raw `1228d81927fc0a3fbba85745103e77b3112606f5d314d15974d400b222409350`: the 1.21.0 compose
+  **`7c3456dc12c5b7a5368c3020b9d0a582899ece3f9942c7dd12b5f10d958c1f9c`**
+  (raw `d0e72bded501855653994a111ec17f988253f8db1ca19c8c5d25fdd6b9d71789` normalized; before the TC-1840 `db_failure_5xx` event (the node's 5xx diagnostic line shipped as an individual event) in the Vector config the template was `c91e5b7a…`, raw `99013c40…`; before the TC-950 pool of 10 (`TINYCLOUD_DATABASE__MAX_CONNECTIONS` 15 to 10) the template was `79469f97…`, raw `32a002ef…`; before the three `current_kv_c_index_*` warning codes in the Vector config (TC-1274 `current_kv` C-index migration) the template was `87b5d12a…`, raw `d1fcd665…`; before the optional TC-1482 `NODE_STATS_READ_TOKEN` env line and the TC-1482 route in the Vector config the template was `7fabba70…`, raw `1228d81927fc0a3fbba85745103e77b3112606f5d314d15974d400b222409350`: the 1.21.0 compose
   `d95bfb707871c1d626c4a8f2b8d32d354103edbb5077847c6a21fe5f7f6cfa50`, template
   `51f8e9e9…`, with only the embedded Vector config regenerated for TC-1274's,
   TC-1317's and TC-1482's route and warning codes (TC-1274 and TC-1317 were template `7fabba70…`, raw `1228d819…`); TC-1274 alone was template `00938226…`, raw
@@ -518,6 +538,31 @@ The same general quota authority/reconciliation gate runs after the final
 env operation plus version/ingress health, before ancillary Policy probes.
 The downstream watcher cannot skip quota restoration.
 
+### A compose-only change ships as a release
+
+The production compose is the reviewed N0 template (locked by the template
+hash in `docker.yml`), and the compose on `main` is the one that gets
+deployed. For any image digest other than the reviewed 1.20.6 image, the
+N0-template path requires a released image (`require_release`): the tag commit
+must be a strict descendant of the revision running in production. So a change
+to the production compose (for example the database pool in TC-950) reaches
+production with a release, which means a version bump even when the node code
+is unchanged. A digest promotion of the revision that is already running, with
+a changed compose, is refused by the ancestry guard ("Released image must be a
+strict descendant of the running production revision").
+
+1. Merge the compose change (the compose, its byte-identical fixture
+   `scripts/ci/fixtures/tc959-n0-compose.yaml`, the template hash in
+   `docker.yml` and the hashes in this file move together).
+2. Cut the release PR (version bump in `Cargo.toml` and the three lockfiles,
+   `[Unreleased]` moved under the new version) and let the tag build finish.
+3. Read the digest and labels of the new `X.Y.Z-dstack` image, then use the
+   promotion command above with that digest, version and revision.
+
+A rollback of such a change follows the same path: a revert plus a new
+release. The same-image recovery command below is for the reviewed 1.20.6
+image only and is refused once a later release is running.
+
 ### Emergency same-image recovery (12c)
 
 After the combined workflow is reviewed/landed and a named operator has fresh
@@ -539,8 +584,8 @@ gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref main \
 
 The served/OCI identity remains **1.20.6-dstack / e18578ff9162986ddd813259c60f73866e3e60d1**.
 With the template lock on main this redeploys exactly main's raw compose
-`99013c40e9523ae15a2c315403f0fc47fb9dcbb017825d3aa0f57669232c9047`
-(the 1.21.0 compose `d95bfb70…` with the TC-1274, TC-1317, TC-1482 and `current_kv_c_index_*` Vector config, the optional TC-1482 `NODE_STATS_READ_TOKEN` env line and the TC-950 pool of 10), whatever digest
+`d0e72bded501855653994a111ec17f988253f8db1ca19c8c5d25fdd6b9d71789`
+(the 1.21.0 compose `d95bfb70…` with the TC-1274, TC-1317, TC-1482, `current_kv_c_index_*` and `db_failure_5xx` Vector config, the optional TC-1482 `NODE_STATS_READ_TOKEN` env line and the TC-950 pool of 10), whatever digest
 main's template currently pins. It is not a rollback of a
 later release across a schema migration. Current pre-N0 tag/pinned
 equivalents are separately hash-checked; arbitrary same-image config

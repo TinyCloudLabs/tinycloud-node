@@ -455,8 +455,8 @@ pub enum DuckDbError {
     PermissionDenied(String),
     #[error("Database not found")]
     DatabaseNotFound,
-    #[error("Response too large: {0} bytes")]
-    ResponseTooLarge(u64),
+    #[error("duckdb_response_too_large: Response too large: {0} bytes (limit {1} bytes)")]
+    ResponseTooLarge(u64, u64),
     #[error("Quota exceeded")]
     QuotaExceeded,
     #[error("Operation would increase database storage")]

@@ -9,11 +9,14 @@
 //!   `SqlError::Unavailable` (503) that releases the database's lock.
 //! - Large artifacts still persist and hydrate under the default limits.
 //!
-//! These run wherever `TINYCLOUD_TEST_POSTGRES_URL` is set, and fail in CI
-//! without it (TC-381):
+//! PostgreSQL-backed tests connect only when `TINYCLOUD_TEST_POSTGRES_URL` is set
+//! and either `GITHUB_ACTIONS=true` (GitHub Actions) or `TINYCLOUD_ALLOW_LOCAL_PG=1`
+//! (an isolated server you started yourself). Otherwise they skip. On GitHub
+//! Actions, an unset URL fails the test (TC-381).
 //!
 //! ```text
-//! TINYCLOUD_TEST_POSTGRES_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres \
+//! TINYCLOUD_ALLOW_LOCAL_PG=1 \
+//! TINYCLOUD_TEST_POSTGRES_URL=postgres://<user>:<password>@<host>:<port>/<database> \
 //!   cargo test -p tinycloud-node --test postgres_pool_timeouts
 //! ```
 //!
@@ -33,9 +36,12 @@
 //! cargo test -p tinycloud-node --test postgres_pool_timeouts --no-run   # note the binary path
 //! docker cp target/debug/deps/postgres_pool_timeouts-<hash> tc1054-pg:/t
 //! docker exec -e TINYCLOUD_TEST_BLACKHOLE=1 \
+//!   -e TINYCLOUD_ALLOW_LOCAL_PG=1 \
 //!   -e TINYCLOUD_TEST_POSTGRES_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres \
 //!   tc1054-pg /t blackhole --test-threads 1 --nocapture
 //! ```
+
+mod common;
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -61,27 +67,22 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 fn postgres_url(test: &str) -> Option<String> {
-    match std::env::var("TINYCLOUD_TEST_POSTGRES_URL") {
-        Ok(url) if !url.trim().is_empty() => Some(url),
-        _ => {
-            assert!(
-                std::env::var_os("CI").is_none(),
-                "{test} requires TINYCLOUD_TEST_POSTGRES_URL, which is unset in CI (TC-381)"
-            );
-            eprintln!("skipping {test}: TINYCLOUD_TEST_POSTGRES_URL is unset");
-            None
-        }
-    }
+    common::postgres_test_url(test)
 }
 
 /// The black-hole tests' URL, when `TINYCLOUD_TEST_BLACKHOLE=1` allows them.
 fn blackhole_url(test: &str) -> Option<String> {
     if std::env::var("TINYCLOUD_TEST_BLACKHOLE").as_deref() != Ok("1") {
         assert!(
-            std::env::var_os("CI").is_none(),
-            "{test} requires TINYCLOUD_TEST_BLACKHOLE=1 in CI (TC-1054)"
+            std::env::var("GITHUB_ACTIONS").as_deref() != Ok("true"),
+            "{test} requires TINYCLOUD_TEST_BLACKHOLE=1 on GitHub Actions (TC-1054)"
         );
-        eprintln!("skipping {test}: TINYCLOUD_TEST_BLACKHOLE is not 1");
+        use std::io::Write;
+        // Written to the process stderr directly: libtest captures `eprintln!` output of passing tests.
+        let _ = writeln!(
+            std::io::stderr(),
+            "skipping {test}: TINYCLOUD_TEST_BLACKHOLE is not 1"
+        );
         return None;
     }
     postgres_url(test)

@@ -1,7 +1,7 @@
 [package]
 name = "tinycloud-node"
 build = "build.rs"
-version = "1.21.7"
+version = "1.22.0"
 authors = ["TinyCloud Protocol"]
 edition = "2021"
 description = "TinyCloud Protocol Node"
@@ -135,6 +135,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 flate2 = "1"
 k256 = { version = "0.13.4", features = ["ecdsa"] }
 sha3 = "0.10"
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 # The Rust half of the JS SDK: builds the same host and session SIWE
 # delegations a real `signIn` sends (tests/postgres_round_trip_budget.rs).
 tinycloud-sdk-wasm = { path = "../tinycloud-sdk-wasm" }

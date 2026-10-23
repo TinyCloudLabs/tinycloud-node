@@ -53,6 +53,37 @@ pub struct Config {
     pub retention: RetentionConfig,
     #[serde(default)]
     pub epoch_head_backfill: EpochHeadBackfillConfig,
+    #[serde(default)]
+    pub sql_store: SqlStoreConfig,
+    #[serde(default)]
+    pub encryption_network: EncryptionNetworkConfig,
+    #[serde(default)]
+    pub sql: SqlConfig,
+}
+
+/// Release gates for the encryption network routes. `named_keys_v1`
+/// advertises the `encryption-named-keys-v1` feature in `/info` and turns on
+/// named keys: the key create, describe, public key, block and unblock
+/// routes are mounted, delegations may grant on key and key-prefix
+/// resources, and named-key decrypt is served on `POST /invoke`. It stays off
+/// until named keys are live on OpenKey; while off, those routes answer 404
+/// and key resources are refused with `named_keys_unavailable`.
+#[derive(Serialize, Deserialize, Debug, Default, Clone, Hash, PartialEq, Eq)]
+pub struct EncryptionNetworkConfig {
+    #[serde(default)]
+    pub named_keys_v1: bool,
+}
+
+/// `[global.sql]` release gate for delegated SQL caveats (TC-1791).
+/// `delegated_caveats_enforced` admits the `tables` / `columns` / `readOnly`
+/// caveat form on `tinycloud.sql/*` delegations, enforces it from the
+/// delegation chain when a request runs, and advertises
+/// `sql-delegated-caveats-v1` in `/info`. Off: such a delegation is refused as
+/// an unsupported caveat and nothing is advertised.
+#[derive(Serialize, Deserialize, Debug, Default, Clone, Hash, PartialEq, Eq)]
+pub struct SqlConfig {
+    #[serde(default)]
+    pub delegated_caveats_enforced: bool,
 }
 
 /// Production exact-email composition.  The capability remains unavailable
@@ -1043,6 +1074,143 @@ impl EpochHeadBackfillConfig {
     }
 }
 
+/// The SQL block-store shadow upload (TC-1491; `docs/sql-block-store-contract.md`).
+///
+/// Off by default. Postgres stays master: an enabled node copies snapshots and
+/// change segments of the allowlisted spaces' databases to the block store, and
+/// records them in `sql_store_manifest`. Section `[sql_store]`; env
+/// `TINYCLOUD_SQL_STORE__ENABLED`, `TINYCLOUD_SQL_STORE__UPLOAD_INTERVAL_SECS`,
+/// `TINYCLOUD_SQL_STORE__UPLOAD_BYTES`, `TINYCLOUD_SQL_STORE__SPACES`,
+/// `TINYCLOUD_SQL_STORE__RETENTION__HISTORY_DAYS__<TIER>`, ...
+///
+/// The slice-0 contract only defines and validates these settings; no uploader
+/// reads them yet.
+#[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
+pub struct SqlStoreConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Upload this long after a database's first un-uploaded commit. Default
+    /// 60 s for every tier.
+    #[serde(default = "default_sql_store_upload_interval_secs")]
+    pub upload_interval_secs: u64,
+    /// Or once this many bytes are pending (checked between transactions).
+    #[serde(default = "default_sql_store_upload_bytes")]
+    pub upload_bytes: ByteUnit,
+    /// Node-wide un-uploaded bytes at which the spool sheds.
+    #[serde(default = "default_sql_store_backlog_cap")]
+    pub backlog_cap: ByteUnit,
+    /// A new snapshot at most this often.
+    #[serde(default = "default_sql_store_snapshot_every_secs")]
+    pub snapshot_every_secs: u64,
+    #[serde(default = "default_sql_store_orphan_after_secs")]
+    pub orphan_after_secs: u64,
+    /// Refuse writes at the cap. Off in the shadow phase, where refusing buys
+    /// no durability.
+    #[serde(default)]
+    pub enforce_backlog_cap: bool,
+    /// Space IDs whose databases are uploaded. **Empty means none**, even
+    /// when `enabled` (fail-closed, contract D7).
+    #[serde(default)]
+    pub spaces: Vec<String>,
+    #[serde(default)]
+    pub retention: SqlStoreRetentionConfig,
+}
+
+/// History window per tier id (`free`, `paid`, ...). Absent keeps everything.
+#[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq, Default)]
+pub struct SqlStoreRetentionConfig {
+    #[serde(default)]
+    pub default_history_days: Option<u32>,
+    #[serde(default)]
+    pub history_days: std::collections::BTreeMap<String, u32>,
+}
+
+fn default_sql_store_upload_interval_secs() -> u64 {
+    60
+}
+
+fn default_sql_store_upload_bytes() -> ByteUnit {
+    ByteUnit::Mebibyte(8)
+}
+
+fn default_sql_store_backlog_cap() -> ByteUnit {
+    ByteUnit::Mebibyte(64)
+}
+
+fn default_sql_store_snapshot_every_secs() -> u64 {
+    24 * 60 * 60
+}
+
+fn default_sql_store_orphan_after_secs() -> u64 {
+    24 * 60 * 60
+}
+
+impl Default for SqlStoreConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            upload_interval_secs: default_sql_store_upload_interval_secs(),
+            upload_bytes: default_sql_store_upload_bytes(),
+            backlog_cap: default_sql_store_backlog_cap(),
+            snapshot_every_secs: default_sql_store_snapshot_every_secs(),
+            orphan_after_secs: default_sql_store_orphan_after_secs(),
+            enforce_backlog_cap: false,
+            spaces: Vec::new(),
+            retention: SqlStoreRetentionConfig::default(),
+        }
+    }
+}
+
+impl SqlStoreConfig {
+    /// The fields matter only when the feature is on, so a disabled store
+    /// accepts any values.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.upload_interval_secs < 1 {
+            return Err("sql_store.upload_interval_secs must be at least 1");
+        }
+        if self.upload_bytes < ByteUnit::Mebibyte(1) {
+            return Err("sql_store.upload_bytes must be at least 1 MiB");
+        }
+        if self.backlog_cap < self.upload_bytes {
+            return Err("sql_store.backlog_cap must be at least sql_store.upload_bytes");
+        }
+        if self.snapshot_every_secs < 1 || self.orphan_after_secs < 1 {
+            return Err("sql_store.snapshot_every_secs and orphan_after_secs must be at least 1");
+        }
+        if self.spaces.iter().any(|space| space.trim().is_empty()) {
+            return Err("sql_store.spaces must not contain an empty space ID");
+        }
+        Ok(())
+    }
+
+    pub fn upload_policy(&self) -> tinycloud_core::sql::store::UploadPolicy {
+        tinycloud_core::sql::store::UploadPolicy {
+            interval: Duration::from_secs(self.upload_interval_secs),
+            max_bytes: self.upload_bytes.as_u64(),
+            backlog_cap: self.backlog_cap.as_u64(),
+            snapshot_every: Duration::from_secs(self.snapshot_every_secs),
+            orphan_after: Duration::from_secs(self.orphan_after_secs),
+            enforce_backlog_cap: self.enforce_backlog_cap,
+        }
+    }
+
+    pub fn retention_policy(&self) -> tinycloud_core::sql::store::RetentionPolicy {
+        tinycloud_core::sql::store::RetentionPolicy::new(
+            self.retention.default_history_days,
+            self.retention.history_days.clone(),
+        )
+    }
+
+    /// Whether `space`'s databases are uploaded: the feature is on and the
+    /// space is listed. An empty list uploads nothing.
+    pub fn uploads_space(&self, space: &str) -> bool {
+        self.enabled && self.spaces.iter().any(|s| s == space)
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq, Default)]
 #[serde(tag = "type")]
 pub enum Keys {
@@ -1754,6 +1922,120 @@ mod tests {
                 ok,
                 "{wait_ms}"
             );
+        }
+    }
+
+    /// TC-1491: off by default, 60 s / 8 MiB for every tier, and nothing is
+    /// validated while the feature is off.
+    #[test]
+    fn sql_store_defaults_match_the_contract() {
+        let config = SqlStoreConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.upload_interval_secs, 60);
+        assert_eq!(config.upload_bytes, ByteUnit::Mebibyte(8));
+        assert!(!config.enforce_backlog_cap);
+        assert!(config.spaces.is_empty());
+        let policy = config.upload_policy();
+        assert_eq!(policy, tinycloud_core::sql::store::UploadPolicy::default());
+        assert_eq!(config.retention_policy().history_days("free"), None);
+        assert_eq!(Config::default().sql_store, config);
+    }
+
+    #[test]
+    fn encryption_network_named_keys_is_off_by_default() {
+        assert!(!Config::default().encryption_network.named_keys_v1);
+        let config: EncryptionNetworkConfig = toml::from_str("").unwrap();
+        assert!(!config.named_keys_v1);
+    }
+
+    #[test]
+    fn encryption_network_named_keys_parses_from_toml() {
+        let config: EncryptionNetworkConfig = toml::from_str("named_keys_v1 = true").unwrap();
+        assert!(config.named_keys_v1);
+    }
+
+    #[test]
+    fn sql_delegated_caveats_is_off_by_default_and_parses_from_toml() {
+        assert!(!Config::default().sql.delegated_caveats_enforced);
+        let config: SqlConfig = toml::from_str("").unwrap();
+        assert!(!config.delegated_caveats_enforced);
+        let config: SqlConfig = toml::from_str("delegated_caveats_enforced = true").unwrap();
+        assert!(config.delegated_caveats_enforced);
+    }
+
+    #[test]
+    fn sql_store_parses_from_toml_and_fills_defaults() {
+        let config: SqlStoreConfig = toml::from_str(
+            r#"
+            enabled = true
+            upload_interval_secs = 30
+            upload_bytes = "4 MiB"
+            spaces = ["tinycloud:pkh:eip155:1:0xab://default"]
+            [retention]
+            history_days = { free = 7, paid = 30 }
+            "#,
+        )
+        .unwrap();
+        assert!(config.enabled);
+        assert_eq!(config.upload_interval_secs, 30);
+        assert_eq!(config.upload_bytes, ByteUnit::Mebibyte(4));
+        assert_eq!(config.backlog_cap, ByteUnit::Mebibyte(64));
+        assert!(config.validate().is_ok());
+        assert!(config.uploads_space("tinycloud:pkh:eip155:1:0xab://default"));
+        assert!(!config.uploads_space("tinycloud:other"));
+        let retention = config.retention_policy();
+        assert_eq!(retention.history_days("free"), Some(7));
+        assert_eq!(retention.history_days("paid"), Some(30));
+        assert_eq!(retention.history_days("team"), None);
+    }
+
+    #[test]
+    fn sql_store_empty_allowlist_uploads_nothing_even_when_enabled() {
+        let config = SqlStoreConfig {
+            enabled: true,
+            ..SqlStoreConfig::default()
+        };
+        assert!(config.validate().is_ok());
+        assert!(!config.uploads_space("tinycloud:pkh:eip155:1:0xab://default"));
+        let off = SqlStoreConfig {
+            spaces: vec!["tinycloud:x".into()],
+            ..SqlStoreConfig::default()
+        };
+        assert!(
+            !off.uploads_space("tinycloud:x"),
+            "disabled uploads nothing"
+        );
+    }
+
+    #[test]
+    fn sql_store_settings_are_checked_only_when_enabled() {
+        let bad = |edit: fn(&mut SqlStoreConfig)| {
+            let mut config = SqlStoreConfig {
+                enabled: true,
+                ..SqlStoreConfig::default()
+            };
+            edit(&mut config);
+            config
+        };
+        for config in [
+            bad(|c| c.upload_interval_secs = 0),
+            bad(|c| c.upload_bytes = ByteUnit::Kibibyte(512)),
+            bad(|c| c.backlog_cap = ByteUnit::Mebibyte(4)),
+            bad(|c| c.snapshot_every_secs = 0),
+            bad(|c| c.orphan_after_secs = 0),
+            bad(|c| c.spaces = vec![" ".into()]),
+        ] {
+            assert!(config.validate().is_err(), "{config:?}");
+            let disabled = SqlStoreConfig {
+                enabled: false,
+                ..config.clone()
+            };
+            assert!(disabled.validate().is_ok());
+            assert!(crate::resolve_runtime_config(&Config {
+                sql_store: config,
+                ..Config::default()
+            })
+            .is_err());
         }
     }
 
