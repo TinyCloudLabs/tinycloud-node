@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changes
+
+- PostgreSQL-backed tests connect only when `CI=true` or `TINYCLOUD_ALLOW_LOCAL_PG=1` is set, and skip otherwise.
+
 ## [1.21.9] - 2026-10-23
 
 ### Release notes

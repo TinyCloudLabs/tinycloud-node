@@ -1,35 +1,52 @@
 //! Shared helpers for tinycloud-core's own tests.
 
-/// Resolve the PostgreSQL URL that the `postgres_*` regressions run against.
-///
-/// TC-381: these tests used to `return` silently whenever
-/// `TINYCLOUD_TEST_POSTGRES_URL` was unset. Combined with a CI command that
-/// filtered on the name `postgres_` — and libtest exiting 0 when a filter
-/// matches nothing — the whole PostgreSQL job could report green having
-/// asserted nothing at all, twice over. A test that no-ops in silence is worse
-/// than no test, because it manufactures confidence.
-///
-/// So: skipping stays available locally, where not everyone wants to run a
-/// PostgreSQL server just to `cargo test`, but in CI (`CI` is always set by
-/// GitHub Actions) a missing URL is a hard failure rather than a shrug.
+/// Resolve the PostgreSQL URL that the `postgres_*` tests connect to, or
+/// `None` when they skip. The rule is in [`postgres_gate`].
 pub(crate) fn postgres_test_url(test: &str) -> Option<String> {
-    match std::env::var("TINYCLOUD_TEST_POSTGRES_URL") {
-        Ok(url) if !url.trim().is_empty() => Some(url),
-        _ => {
-            if std::env::var_os("CI").is_some() {
-                panic!(
-                    "{test} requires TINYCLOUD_TEST_POSTGRES_URL, which is unset (or empty) in CI. \
-                     This test must not be allowed to skip on CI — see TC-381. Check the \
-                     `postgres` service container and the `env:` block in .github/workflows/rust.yml."
-                );
-            }
-            eprintln!(
-                "skipping {test}: TINYCLOUD_TEST_POSTGRES_URL is unset (set it to run this \
-                 locally; it is mandatory in CI)"
+    postgres_gate(
+        std::env::var("TINYCLOUD_TEST_POSTGRES_URL").ok(),
+        std::env::var_os("CI").map(|value| value.to_string_lossy().into_owned()),
+        std::env::var("TINYCLOUD_ALLOW_LOCAL_PG").ok(),
+        test,
+    )
+}
+
+/// Decides whether a PostgreSQL-backed test connects. Pure, so the rule is
+/// unit-tested without touching the process environment.
+///
+/// A test connects only when `url` is set and non-empty AND either `ci` is
+/// `"true"` (GitHub Actions) or `allow_local` is `"1"` (an isolated server the
+/// developer started). Otherwise it skips with one line on stderr. When `ci` is
+/// set and `url` is not, it panics: the CI job must never skip these tests
+/// silently (TC-381).
+pub(crate) fn postgres_gate(
+    url: Option<String>,
+    ci: Option<String>,
+    allow_local: Option<String>,
+    test: &str,
+) -> Option<String> {
+    let Some(url) = url.filter(|url| !url.trim().is_empty()) else {
+        if ci.is_some() {
+            panic!(
+                "{test} requires TINYCLOUD_TEST_POSTGRES_URL, which is unset (or empty) in CI. \
+                 This test must not be allowed to skip on CI — see TC-381. Check the \
+                 `postgres` service container and the `env:` block in .github/workflows/rust.yml."
             );
-            None
         }
+        skip_postgres_test(test);
+        return None;
+    };
+    if ci.as_deref() == Some("true") || allow_local.as_deref() == Some("1") {
+        return Some(url);
     }
+    skip_postgres_test(test);
+    None
+}
+
+fn skip_postgres_test(test: &str) {
+    eprintln!(
+        "skipping {test}: PostgreSQL-backed tests run only when CI=true (or TINYCLOUD_ALLOW_LOCAL_PG=1 for an isolated server you started yourself); not connecting"
+    );
 }
 
 /// A name no other fixture of this run has: the clock alone is not enough,
@@ -353,4 +370,78 @@ pub(crate) mod events {
 
 pub(crate) mod did_resolution {
     include!("../tests/support/did_resolution.rs");
+}
+
+#[cfg(test)]
+mod postgres_gate_tests {
+    use super::postgres_gate;
+
+    const URL: &str = "postgres://gate.invalid:1/x";
+    const TEST: &str = "gate_case";
+
+    fn some(value: &str) -> Option<String> {
+        Some(value.to_owned())
+    }
+
+    #[test]
+    fn url_without_ci_or_allow_skips() {
+        assert_eq!(postgres_gate(some(URL), None, None, TEST), None);
+    }
+
+    #[test]
+    fn url_with_ci_true_connects() {
+        assert_eq!(
+            postgres_gate(some(URL), some("true"), None, TEST),
+            some(URL)
+        );
+    }
+
+    #[test]
+    fn url_with_ci_other_than_true_skips() {
+        for ci in ["1", "false", ""] {
+            assert_eq!(
+                postgres_gate(some(URL), some(ci), None, TEST),
+                None,
+                "CI={ci:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn url_with_allow_local_one_connects() {
+        assert_eq!(postgres_gate(some(URL), None, some("1"), TEST), some(URL));
+    }
+
+    #[test]
+    fn url_with_allow_local_other_than_one_skips() {
+        for allow in ["true", "0"] {
+            assert_eq!(
+                postgres_gate(some(URL), None, some(allow), TEST),
+                None,
+                "TINYCLOUD_ALLOW_LOCAL_PG={allow:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn url_unset_outside_ci_skips() {
+        assert_eq!(postgres_gate(None, None, None, TEST), None);
+    }
+
+    #[test]
+    fn blank_url_outside_ci_skips() {
+        assert_eq!(postgres_gate(some("  "), None, None, TEST), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "requires TINYCLOUD_TEST_POSTGRES_URL")]
+    fn url_unset_in_ci_panics() {
+        postgres_gate(None, some("true"), None, TEST);
+    }
+
+    #[test]
+    #[should_panic(expected = "requires TINYCLOUD_TEST_POSTGRES_URL")]
+    fn blank_url_in_ci_panics() {
+        postgres_gate(some(""), some("true"), None, TEST);
+    }
 }
