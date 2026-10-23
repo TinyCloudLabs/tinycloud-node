@@ -3317,7 +3317,7 @@ pub(crate) fn sql_error_to_status(err: &SqlError) -> Status {
         SqlError::StorageWouldGrow => Status::new(402),
         SqlError::InvalidStatement(_) => Status::BadRequest,
         SqlError::SchemaError(_) => Status::BadRequest,
-        SqlError::ReadOnlyViolation => Status::Forbidden,
+        SqlError::ReadOnlyViolation | SqlError::CaveatViolation(_) => Status::Forbidden,
         SqlError::ParseError(_) => Status::BadRequest,
         SqlError::Internal(_) => {
             // The only SQL 500 that names no database failure of its own:

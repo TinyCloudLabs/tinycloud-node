@@ -13,8 +13,11 @@ pub use authority::{DdlPolicy, SqlAuthority};
 pub use caveats::SqlCaveats;
 pub use service::{SqlService, SqlWaitBounds};
 pub use types::{
-    BatchResponse, ExecuteResponse, QueryResponse, SqlBusyStage, SqlError, SqlExecutionResult,
-    SqlRequest, SqlResponse, SqlValue,
+    BatchResponse, CaveatArm, ExecuteResponse, QueryResponse, SqlBusyStage, SqlError,
+    SqlExecutionResult, SqlRequest, SqlResponse, SqlValue,
 };
 
 pub mod publication;
+
+#[cfg(test)]
+mod delegated_authorizer_tests;

@@ -238,8 +238,34 @@ pub struct SqlExecutionResult {
     pub write_targets: Vec<TouchedTables>,
 }
 
+/// Which part of a delegated caveat refused a request (TC-1791). `Write`,
+/// `Table` and `Column` come from the authorizer; `Chain` means the
+/// delegation chain's caveats could not be evaluated.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CaveatArm {
+    Column,
+    Table,
+    Write,
+    Chain,
+}
+
+impl CaveatArm {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Column => "column",
+            Self::Table => "table",
+            Self::Write => "write",
+            Self::Chain => "chain",
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SqlError {
+    /// A delegated caveat refused the request. The text is fixed: it names the
+    /// arm and nothing from the request.
+    #[error("sql_caveat_violation: {}", .0.as_str())]
+    CaveatViolation(CaveatArm),
     #[error("SQLite error: {0}")]
     Sqlite(String),
     #[error("Permission denied: {0}")]
