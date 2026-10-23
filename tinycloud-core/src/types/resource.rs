@@ -34,6 +34,12 @@ impl Resource {
         }
     }
 
+    /// Whether this resource names a key or a key prefix under an encryption
+    /// network; a bare network is not one.
+    pub fn is_named_key(&self) -> bool {
+        matches!(self, Resource::Other(uri) if key_id::is_named_key(uri.as_str()))
+    }
+
     /// `child.extends(&parent)` is true when `parent` covers `child`.
     /// The receiver is the requested (child) resource; the argument is the grant.
     pub fn extends(&self, other: &Self) -> bool {

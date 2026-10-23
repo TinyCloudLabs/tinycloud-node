@@ -187,6 +187,10 @@ pub enum DelegationError {
     /// Key deletion is never delegated. Code: `key-delete-not-delegable`.
     #[error("key-delete-not-delegable")]
     KeyDeleteNotDelegable,
+    /// Named-key resources (keys and key prefixes) are served only while the
+    /// node's named-keys setting is on.
+    #[error("named_keys_unavailable: named keys are not enabled on this node")]
+    NamedKeysUnavailable,
 }
 
 /// Verify, validate, and register a delegation inside the caller's transaction.
@@ -200,22 +204,24 @@ pub(crate) async fn process<C: ConnectionTrait>(
     delegation: &Delegation,
     encryption: Option<&ColumnEncryption>,
 ) -> Result<DelegationRegistration, Error> {
-    process_with(db, delegation, encryption, false).await
+    process_with(db, delegation, encryption, false, true).await
 }
 
 /// As `process`; with `delegated_sql_caveats` a SQL capability may carry the
-/// delegated `tables` / `columns` / `readOnly` caveat form (TC-1791).
+/// delegated `tables` / `columns` / `readOnly` caveat form (TC-1791). Without
+/// `named_keys` a capability on a key or key prefix is refused.
 pub(crate) async fn process_with<C: ConnectionTrait>(
     db: &C,
     delegation: &Delegation,
     encryption: Option<&ColumnEncryption>,
     delegated_sql_caveats: bool,
+    named_keys: bool,
 ) -> Result<DelegationRegistration, Error> {
     verify(&delegation.0.delegation).await?;
     for space in delegation.0.spaces() {
         crate::request_telemetry::observe_space(space);
     }
-    validate_with(db, &delegation.0, delegated_sql_caveats).await?;
+    validate_with(db, &delegation.0, delegated_sql_caveats, named_keys).await?;
     save(db, delegation.0.clone(), delegation.1.clone(), encryption).await
 }
 
@@ -337,14 +343,26 @@ async fn validate<C: ConnectionTrait>(
     db: &C,
     delegation: &util::DelegationInfo,
 ) -> Result<(), Error> {
-    validate_with(db, delegation, false).await
+    validate_with(db, delegation, false, true).await
 }
 
 async fn validate_with<C: ConnectionTrait>(
     db: &C,
     delegation: &util::DelegationInfo,
     delegated_sql_caveats: bool,
+    named_keys: bool,
 ) -> Result<(), Error> {
+    // Without named keys, a capability on a key or key prefix is refused for
+    // every delegation, before the root-authority filter, so a delegation
+    // issued by the key's owner is covered too.
+    if !named_keys
+        && delegation
+            .capabilities
+            .iter()
+            .any(|cap| cap.resource.is_named_key())
+    {
+        return Err(DelegationError::NamedKeysUnavailable.into());
+    }
     // TC-1791: SQL and DuckDB caveats are checked for every delegation,
     // before the root-authority filter.
     for cap in &delegation.capabilities {
@@ -1690,6 +1708,44 @@ mod tests {
             validate(&db, &info).await,
             Err(Error::InvalidDelegation(DelegationError::MissingParents))
         ));
+    }
+
+    /// Without named keys, a grant on a key or a key prefix is refused for
+    /// the key's owner and for anyone else, before any parent is looked up;
+    /// a grant on the bare network is not affected.
+    #[tokio::test]
+    async fn named_key_grants_are_refused_when_named_keys_are_off() {
+        let db = database().await;
+        let key = KEY_RESOURCE.to_string();
+        let prefix = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/");
+        let network = format!("urn:tinycloud:encryption:{KEY_OWNER}:default");
+        for delegator in [KEY_OWNER, OTHER_DID] {
+            for resource in [&key, &prefix] {
+                let info = key_grant_info(delegator, resource, KEY_DECRYPT, &[]);
+                let refused = validate_with(&db, &info, false, false).await;
+                assert!(
+                    matches!(
+                        refused,
+                        Err(Error::InvalidDelegation(
+                            DelegationError::NamedKeysUnavailable
+                        ))
+                    ),
+                    "{delegator} on {resource}: {refused:?}"
+                );
+            }
+        }
+        assert_eq!(
+            DelegationError::NamedKeysUnavailable.to_string(),
+            "named_keys_unavailable: named keys are not enabled on this node"
+        );
+        let info = key_grant_info(KEY_OWNER, &network, KEY_DECRYPT, &[]);
+        validate_with(&db, &info, false, false)
+            .await
+            .expect("the owner's bare network grant is not a named-key grant");
+        let info = key_grant_info(KEY_OWNER, &key, KEY_DECRYPT, &[]);
+        validate_with(&db, &info, false, true)
+            .await
+            .expect("the same grant is admitted with named keys on");
     }
 
     /// key.delete is refused even when the owner issues it.

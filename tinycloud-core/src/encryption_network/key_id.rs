@@ -165,6 +165,15 @@ pub(crate) fn owned_by(uri: &str, principal: &str) -> bool {
     parse(uri).is_ok_and(|resource| did_principal_matches(resource.owner_did(), principal))
 }
 
+/// Whether `uri` names a key or a key prefix (not a bare network). A string
+/// that does not parse as an encryption resource is not one.
+pub fn is_named_key(uri: &str) -> bool {
+    matches!(
+        parse(uri),
+        Ok(EncryptionResource::Key(_) | EncryptionResource::KeyPrefix(_))
+    )
+}
+
 fn is_below(ancestor: &str, path: &str) -> bool {
     path.strip_prefix(ancestor)
         .is_some_and(|rest| rest.starts_with('/'))
