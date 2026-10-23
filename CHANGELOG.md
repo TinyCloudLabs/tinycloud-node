@@ -4,6 +4,8 @@
 
 ### Changes
 
+- SQL requests apply the statements profile carried by the invocation's own SQL capability. The delegation chain supplies a profile only when the invocation's SQL capabilities carry none. An invocation whose SQL capabilities carry different profiles is refused with 403. Details: TC-1799.
+- SQL and DuckDB requests that cite more than one SQL or DuckDB proof are refused. Details: TC-1799.
 - Database: adds two schema additions for encryption keys (not yet used). Rolling back to an image without it needs DELETE FROM seaql_migrations WHERE version = 'm20261022_000000_encryption_network_key'; first. Details: TC-1777.
 - SQL and DuckDB delegations (`tinycloud.sql/*`, `tinycloud.duckdb/*`) are refused when their caveats are not supported, with `DelegationError::UnsupportedCaveat`. SQL accepts empty caveats or a constrained-statements profile (direct or nested). DuckDB accepts empty caveats only. Invocations of delegated SQL and DuckDB capabilities are refused the same way (`InvocationError::UnsupportedCaveat`). Invocation `sqlCaveats` and `duckdbCaveats` facts with an unknown key or a wrongly typed value return 400, and every occurrence of the fact is checked. Details: TC-1791.
 - Encryption: parsing and containment for key resource identifiers; owners are root authority for their keys; key prefixes are refused as invocation targets, and key.delete is refused in delegations. Nothing creates or stores keys yet. Details: TC-1777.
