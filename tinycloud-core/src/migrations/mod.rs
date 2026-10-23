@@ -30,6 +30,8 @@ pub mod m20261017_000000_epoch_order_space_index;
 pub mod m20261018_000000_epoch_head;
 pub mod m20261019_000000_policy_v3_owner_authority;
 pub mod m20261020_000000_current_kv_key_c_index;
+pub mod m20261021_000000_sql_store_manifest;
+pub mod m20261022_000000_encryption_network_key;
 
 pub struct Migrator;
 
@@ -68,6 +70,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20261018_000000_epoch_head::Migration),
             Box::new(m20261020_000000_current_kv_key_c_index::Migration),
             Box::new(m20261019_000000_policy_v3_owner_authority::Migration),
+            Box::new(m20261021_000000_sql_store_manifest::Migration),
+            Box::new(m20261022_000000_encryption_network_key::Migration),
         ]
     }
 }

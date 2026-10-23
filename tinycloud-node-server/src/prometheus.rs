@@ -160,6 +160,12 @@ lazy_static! {
         "Invocation replay-cache inserts that conflicted with an existing row."
     )
     .unwrap();
+    /// SQL and DuckDB invocations refused because they cited more than one SQL or DuckDB proof.
+    pub static ref DATABASE_MULTI_PROOF_REFUSED: IntCounter = register_int_counter!(
+        "tinycloud_database_multi_proof_refused_total",
+        "SQL and DuckDB invocations refused because they cited more than one SQL or DuckDB proof."
+    )
+    .unwrap();
 }
 
 pub fn observe_signed_kv_transfer(object_bytes: u64, served_bytes: u64) {
@@ -207,6 +213,12 @@ pub fn observe_replay_insert(inserted: bool) {
         } else {
             REPLAY_ROWS_CONFLICTED.inc();
         }
+    }
+}
+
+pub fn observe_database_multi_proof_refusal() {
+    if enabled() {
+        DATABASE_MULTI_PROOF_REFUSED.inc();
     }
 }
 

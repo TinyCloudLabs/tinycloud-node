@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { parseArgs, assertCapture, resourceNames } from './tc959-docker.mjs';
 import { assertHostedRunner, cleanupOwnedResources, burstEvidence, assertHealthyBurst, progressEvidence, assertServiceParity, assertLogshipNetwork, composeRuntimeValues, socketEvidence, numericMetrics, diagnosticCounts } from './tc959-compose-proof.mjs';
@@ -58,6 +59,23 @@ test('capture accepts well-formed N2 correlation fields on node_request only', (
     assert.throws(() => assertCapture([{ ...ingress, [key]: value }]), `ingress ${key}`);
     assert.throws(() => assertCapture([{ ...warning, [key]: value }], { event_code: { values: ['unclassified'] } }), `warning ${key}`);
   }
+});
+
+test('capture accepts the individual 5xx diagnostic with exactly its eight typed fields (TC-1840)', () => {
+  const fields = JSON.parse(readFileSync(new URL('../log-shipper/fields.json', import.meta.url), 'utf8')).services['tinycloud-node'].fields;
+  const dbFailure = { ts: request.ts, level: 'warn', event: 'node_warning', svc: 'api', event_code: 'db_failure_5xx', status: 503, code: 'sql_busy', service: 'sql', route: '/invoke', elapsed_ms: 30001, failure_kind: 'lock_wait', write_may_have_applied: false, db_hash: 'a'.repeat(64) };
+  assert.doesNotThrow(() => assertCapture([dbFailure], fields));
+  const { db_hash, ...withoutDatabase } = dbFailure;
+  assert.doesNotThrow(() => assertCapture([withoutDatabase], fields)); // db_hash is optional
+  for (const bad of [
+    { event_count: 1 }, { message: 'TC959_SYNTHETIC' }, { sql: 'select 1' }, { status: 200 }, { status: 503.5 }, { code: 'sql_busy ' }, { service: 'postgres' },
+    { route: '/raw-secret' }, { elapsed_ms: -1 }, { elapsed_ms: '1' }, { failure_kind: 'timeout' }, { write_may_have_applied: 'false' },
+    { db_hash: 'A'.repeat(64) }, { db_hash: 'a'.repeat(63) }, { db_hash: `${'a'.repeat(64)}\n` }, { db_hash: 'notes.db' }, { db_hash: null },
+  ]) {
+    assert.throws(() => assertCapture([{ ...dbFailure, ...bad }], fields), JSON.stringify(bad));
+  }
+  assert.throws(() => assertCapture([{ ...withoutDatabase, level: 'error' }], fields));
+  assert.throws(() => assertCapture([{ ...ingress, event_code: 'db_failure_5xx' }], fields));
 });
 
 const hosted = { GITHUB_ACTIONS: 'true', RUNNER_ENVIRONMENT: 'github-hosted', RUNNER_OS: 'Linux', GITHUB_RUN_ID: '12345', GITHUB_RUN_ATTEMPT: '1', RUNNER_TEMP: '/home/runner/work/_temp' };
