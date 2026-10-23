@@ -77,7 +77,7 @@ jobs:
       TINYCLOUD_TEST_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/postgres
       # TC-1054: tests/postgres_pool_timeouts.rs black-holes chosen loopback
       # connections with exact-4-tuple iptables DROP rules (the runner is a
-      # throwaway VM with passwordless sudo). Unset, they fail under CI.
+      # throwaway VM with passwordless sudo). Unset, they fail on GitHub Actions.
       TINYCLOUD_TEST_BLACKHOLE: "1"
     steps:
     - name: Checkout TinyCloud repository

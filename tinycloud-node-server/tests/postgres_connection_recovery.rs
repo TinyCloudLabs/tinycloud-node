@@ -13,9 +13,10 @@
 //!
 //! Each test runs in its own schema and identifies its pool's backends by a
 //! unique `application_name`. PostgreSQL-backed tests connect only when
-//! `TINYCLOUD_TEST_POSTGRES_URL` is set and either `CI=true` (the CI job) or
-//! `TINYCLOUD_ALLOW_LOCAL_PG=1` (an isolated server you started yourself).
-//! Otherwise they skip. Under `CI`, an unset URL fails the test (TC-381).
+//! `TINYCLOUD_TEST_POSTGRES_URL` is set and either `GITHUB_ACTIONS=true` (GitHub
+//! Actions) or `TINYCLOUD_ALLOW_LOCAL_PG=1` (an isolated server you started
+//! yourself). Otherwise they skip. On GitHub Actions, an unset URL fails the
+//! test (TC-381).
 //!
 //! ```text
 //! TINYCLOUD_ALLOW_LOCAL_PG=1 \

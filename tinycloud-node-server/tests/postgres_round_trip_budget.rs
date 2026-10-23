@@ -83,9 +83,9 @@
 //! ```
 //!
 //! PostgreSQL-backed tests connect only when `TINYCLOUD_TEST_POSTGRES_URL` is set
-//! and either `CI=true` (the CI job) or `TINYCLOUD_ALLOW_LOCAL_PG=1` (an isolated
-//! server you started yourself). Otherwise they skip. Under `CI`, an unset URL
-//! fails the test (TC-381).
+//! and either `GITHUB_ACTIONS=true` (GitHub Actions) or `TINYCLOUD_ALLOW_LOCAL_PG=1`
+//! (an isolated server you started yourself). Otherwise they skip. On GitHub
+//! Actions, an unset URL fails the test (TC-381).
 
 mod common;
 
