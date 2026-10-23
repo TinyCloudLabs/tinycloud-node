@@ -65,7 +65,7 @@ struct RemoteQuota {
 }
 
 /// Where every storage surface sends the owner to free space or upgrade.
-pub const MANAGE_STORAGE_URL: &str = "https://account.tinycloud.xyz/billing";
+pub const MANAGE_STORAGE_URL: &str = "https://account.tinycloud.xyz/storage";
 
 /// One space's metered usage against its effective limit (`None` = no limit).
 #[derive(Serialize, Debug, Clone, PartialEq, Eq)]

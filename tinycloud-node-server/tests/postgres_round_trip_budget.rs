@@ -77,12 +77,17 @@
 //! prints the measured counts for that. Run it with:
 //!
 //! ```text
-//! TINYCLOUD_TEST_POSTGRES_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres \
+//! TINYCLOUD_ALLOW_LOCAL_PG=1 \
+//! TINYCLOUD_TEST_POSTGRES_URL=postgres://<user>:<password>@<host>:<port>/<database> \
 //!   cargo test -p tinycloud-node --test postgres_round_trip_budget -- --nocapture
 //! ```
 //!
-//! Without `TINYCLOUD_TEST_POSTGRES_URL` the test skips, except under `CI`,
-//! where it fails (TC-381).
+//! PostgreSQL-backed tests connect only when `TINYCLOUD_TEST_POSTGRES_URL` is set
+//! and either `GITHUB_ACTIONS=true` (GitHub Actions) or `TINYCLOUD_ALLOW_LOCAL_PG=1`
+//! (an isolated server you started yourself). Otherwise they skip. On GitHub
+//! Actions, an unset URL fails the test (TC-381).
+
+mod common;
 
 use std::{
     collections::HashMap,
@@ -181,26 +186,9 @@ const KV_VALUE: &[u8] = br#"{"version":1}"#;
 /// PostgreSQL protocol 3.0, the version field of a StartupMessage.
 const PROTOCOL_V3: i32 = 196_608;
 
-/// TC-381, mirroring `tinycloud_core::test_support::postgres_test_url`: skip
-/// locally when the URL is unset, but never on CI.
+/// TC-381: see `common::postgres_test_url`.
 fn postgres_test_url(test: &str) -> Option<String> {
-    match std::env::var("TINYCLOUD_TEST_POSTGRES_URL") {
-        Ok(url) if !url.trim().is_empty() => Some(url),
-        _ => {
-            if std::env::var_os("CI").is_some() {
-                panic!(
-                    "{test} requires TINYCLOUD_TEST_POSTGRES_URL, which is unset (or empty) in CI. \
-                     This test must not be allowed to skip on CI — see TC-381. Check the \
-                     `postgres` service container and the `env:` block in .github/workflows/rust.yml."
-                );
-            }
-            eprintln!(
-                "skipping {test}: TINYCLOUD_TEST_POSTGRES_URL is unset (set it to run this \
-                 locally; it is mandatory in CI)"
-            );
-            None
-        }
-    }
+    common::postgres_test_url(test)
 }
 
 // ---------------------------------------------------------------------------

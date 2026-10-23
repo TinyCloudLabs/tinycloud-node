@@ -95,51 +95,27 @@ impl ProtocolStateRepository {
             consumed_at: Set(Some(timestamp(now)?)),
         };
         let tx = self.conn.begin().await?;
-        let existed = share_invitation_authorization_jti::Entity::find_by_id(&jti)
-            .one(&tx)
-            .await?
-            .is_some();
-        share_invitation_authorization_jti::Entity::insert(model)
-            .on_conflict(
-                OnConflict::column(share_invitation_authorization_jti::Column::Jti)
-                    .do_nothing()
-                    .to_owned(),
-            )
-            .exec(&tx)
-            .await?;
-        if existed {
-            let existing = share_invitation_authorization_jti::Entity::find_by_id(&jti)
-                .one(&tx)
-                .await?
-                .ok_or(StateError::Storage)?;
-            if existing.authorization_digest != authorization_digest.as_str()
-                || existing.binding_json != binding_json
-            {
-                return Err(StateError::Replay);
-            }
-            if existing.consumed_at.is_some() {
-                return Err(StateError::Replay);
-            }
-            if parse_timestamp(&existing.expires_at)? <= now {
-                return Err(StateError::Expired);
-            }
-            tx.commit().await?;
-            return Ok(());
-        }
-        let existing = share_invitation_authorization_jti::Entity::find_by_id(&jti)
-            .one(&tx)
-            .await?
-            .ok_or(StateError::Storage)?;
-        if existing.authorization_digest != authorization_digest.as_str()
-            || existing.binding_json != binding_json
+        match reserve_invitation_authorization_in(
+            &tx,
+            receipt,
+            &jti,
+            model,
+            &binding_json,
+            authorization_digest,
+            now,
+        )
+        .await
         {
-            return Err(StateError::Replay);
+            Ok(()) => {
+                tx.commit().await?;
+                Ok(())
+            }
+            Err(err) => {
+                // Every refusal ends the transaction here; the original error is returned.
+                let _ = tx.rollback().await;
+                Err(err)
+            }
         }
-        if parse_timestamp(&receipt.authorization.expires_at)? <= now {
-            return Err(StateError::Expired);
-        }
-        tx.commit().await?;
-        Ok(())
     }
 
     /// Consume the addressed-authoring JTI in the same durable replay table
@@ -564,6 +540,62 @@ impl ProtocolStateRepository {
     }
 }
 
+/// Runs the reservation inside `tx` and never ends it: every `Err` return
+/// leaves the transaction for the caller to roll back.
+async fn reserve_invitation_authorization_in(
+    tx: &DatabaseTransaction,
+    receipt: &InvitationAuthorizationReceipt,
+    jti: &str,
+    model: share_invitation_authorization_jti::ActiveModel,
+    binding_json: &Value,
+    authorization_digest: &Sha256Digest,
+    now: OffsetDateTime,
+) -> Result<(), StateError> {
+    let existed = share_invitation_authorization_jti::Entity::find_by_id(jti)
+        .one(tx)
+        .await?
+        .is_some();
+    share_invitation_authorization_jti::Entity::insert(model)
+        .on_conflict(
+            OnConflict::column(share_invitation_authorization_jti::Column::Jti)
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec(tx)
+        .await?;
+    if existed {
+        let existing = share_invitation_authorization_jti::Entity::find_by_id(jti)
+            .one(tx)
+            .await?
+            .ok_or(StateError::Storage)?;
+        if existing.authorization_digest != authorization_digest.as_str()
+            || existing.binding_json != *binding_json
+        {
+            return Err(StateError::Replay);
+        }
+        if existing.consumed_at.is_some() {
+            return Err(StateError::Replay);
+        }
+        if parse_timestamp(&existing.expires_at)? <= now {
+            return Err(StateError::Expired);
+        }
+        return Ok(());
+    }
+    let existing = share_invitation_authorization_jti::Entity::find_by_id(jti)
+        .one(tx)
+        .await?
+        .ok_or(StateError::Storage)?;
+    if existing.authorization_digest != authorization_digest.as_str()
+        || existing.binding_json != *binding_json
+    {
+        return Err(StateError::Replay);
+    }
+    if parse_timestamp(&receipt.authorization.expires_at)? <= now {
+        return Err(StateError::Expired);
+    }
+    Ok(())
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct AnonymousChallengeRequest {
     pub challenge_id: String,
@@ -786,5 +818,98 @@ mod tests {
             Err(StateError::Replay)
         );
         tx.rollback().await.unwrap();
+    }
+
+    /// An expired reservation ends its write transaction after the JTI INSERT,
+    /// so the INSERT's row lock is released. A fresh session with a lock
+    /// timeout fails only if an open transaction still holds that row.
+    /// PostgreSQL only; the database part runs in CI, not locally. The receipt
+    /// is built before the gate, so local runs still exercise the issuance.
+    #[tokio::test]
+    async fn postgres_expired_authorization_releases_its_jti_row() {
+        use super::super::invitation::{
+            issue_invitation_authorization, CanonicalEmail, DocumentName, Ed25519InvitationSigner,
+            InvitationAuthorizationInput, SenderTrust,
+        };
+        use super::super::types::{
+            AuthorityMaterialHandle, ContentSource, Did, KvGetAction, Path, PolicyCid, ShareCid,
+            ShareDelegationCid, ShareId, TargetOrigin, KV_POLICY_CID, KV_SHARE_CID,
+        };
+        use crate::test_support::PostgresTestSchema;
+        use libp2p::identity::Keypair;
+
+        let signer = Ed25519InvitationSigner::new(
+            "did:web:node.example#invitation-key-1",
+            Keypair::generate_ed25519(),
+        )
+        .unwrap();
+        let content_source = ContentSource::Kv {
+            action: KvGetAction::Get,
+            space: Did::parse("did:pkh:eip155:1:0x1111111111111111111111111111111111111111")
+                .unwrap(),
+            path: Path::parse("documents/plan.md").unwrap(),
+        };
+        let content_source_digest = Sha256Digest::from_bytes(
+            <sha2::Sha256 as sha2::Digest>::digest(crate::policy_capability::jcs::canonicalize(
+                &serde_json::to_value(&content_source).unwrap(),
+            ))
+            .into(),
+        );
+        let input = InvitationAuthorizationInput {
+            jti: ProtocolJti::from_bytes([1; 16]),
+            report_abuse_token: ProtocolJti::from_bytes([2; 16]),
+            sender_did: Did::parse("did:web:sender.example").unwrap(),
+            share_cid: ShareCid::parse(KV_SHARE_CID).unwrap(),
+            share_id: ShareId::parse("share-1").unwrap(),
+            policy_cid: PolicyCid::parse(KV_POLICY_CID).unwrap(),
+            delegation_cid: ShareDelegationCid::parse(
+                "bafkreiehcdfj3fkj6xnkwsiwteiqdoa5nwkcfz5gcpijuew2wsdimly67q",
+            )
+            .unwrap(),
+            authority_material_handle: AuthorityMaterialHandle::parse("amh_kv_001").unwrap(),
+            authority_material_digest: Sha256Digest::from_bytes([3; 32]),
+            recipient_email: Some(CanonicalEmail::parse("alice@example.com").unwrap()),
+            recipient_matcher: None,
+            delivery_email: None,
+            actions: None,
+            resource: None,
+            target_origin: TargetOrigin::parse("https://node.example").unwrap(),
+            node_audience: Did::parse("did:web:node.example").unwrap(),
+            document_name: DocumentName::parse("plan.md").unwrap(),
+            sender_trust: SenderTrust::Verified,
+            content_source,
+            content_source_digest,
+            share_expires_at: "2030-01-01T00:00:00.000Z".to_owned(),
+            request_body_digest: Sha256Digest::from_bytes([4; 32]),
+            share_url: None,
+            delivery_provenance: None,
+            idempotency_key: None,
+        };
+        let issued = OffsetDateTime::parse("2029-01-01T00:00:00Z", &Rfc3339).unwrap();
+        let receipt = issue_invitation_authorization(input, &signer, issued).unwrap();
+        let jti = receipt.authorization.jti.as_str().to_owned();
+
+        let Some(fixture) = PostgresTestSchema::new("postgres_share_email_expired_jti").await
+        else {
+            return;
+        };
+        let repo = ProtocolStateRepository::new(fixture.connect(10).await);
+        // Past the receipt's expiry: the reservation INSERTs, then returns Expired.
+        let expired_at = OffsetDateTime::parse("2031-01-01T00:00:00Z", &Rfc3339).unwrap();
+        assert_eq!(
+            repo.reserve_invitation_authorization(
+                &receipt,
+                serde_json::json!({"binding": "tc1836"}),
+                &Sha256Digest::from_bytes([7; 32]),
+                expired_at,
+            )
+            .await,
+            Err(StateError::Expired)
+        );
+        fixture
+            .execute_blocking(&format!(
+                "SET lock_timeout = '200ms'; INSERT INTO share_invitation_authorization_jti (jti, authorization_digest, binding_json, issued_at, expires_at) VALUES ('{jti}', 'probe', '{{}}', '2029-01-01T00:00:00Z', '2030-01-01T00:00:00Z')"
+            ))
+            .expect("authorization JTI unlocked after the expired reservation");
     }
 }

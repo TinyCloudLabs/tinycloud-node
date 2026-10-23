@@ -14,6 +14,7 @@ pub mod encryption;
 pub mod encryption_network;
 pub(crate) mod epoch_head;
 pub mod events;
+pub mod failure_diagnostic;
 pub mod hash;
 pub mod keys;
 pub mod kv_sync;

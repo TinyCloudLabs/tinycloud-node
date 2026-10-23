@@ -1111,4 +1111,66 @@ mod tests {
         assert_eq!(resolve_alias("tinycloud.sql/select"), "tinycloud.sql/read");
         assert_eq!(resolve_alias("unknown/x"), "unknown/x");
     }
+
+    #[test]
+    fn only_key_delete_grants_key_delete() {
+        let actions =
+            accepted_actions("tinycloud.encryption").expect("encryption actions are registered");
+        assert!(actions.contains(&"tinycloud.encryption/key.delete"));
+        assert!(ability_matches(
+            "tinycloud.encryption/key.delete",
+            "tinycloud.encryption/key.delete"
+        ));
+        for action in actions {
+            assert!(
+                !action.ends_with("/*"),
+                "wildcard action in encryption service: {action}"
+            );
+            if *action != "tinycloud.encryption/key.delete" {
+                assert!(
+                    !ability_matches(action, "tinycloud.encryption/key.delete"),
+                    "{action} must not grant key.delete"
+                );
+            }
+        }
+    }
+
+    /// No registry entry in any service declares an alias or implication that
+    /// targets an encryption key ability, and none matches one under
+    /// `ability_matches` in either direction.
+    #[test]
+    fn no_registry_entry_aliases_or_implies_encryption_key_abilities() {
+        let registry: Registry = serde_json::from_str(REGISTRY_JSON).unwrap();
+        let key_abilities: Vec<&str> = registry
+            .capabilities
+            .iter()
+            .filter(|e| e.urn.starts_with("tinycloud.encryption/key."))
+            .map(|e| e.urn.as_str())
+            .collect();
+        assert_eq!(key_abilities.len(), 4, "encryption key abilities");
+        for entry in &registry.capabilities {
+            for target in entry.alias_of.iter().chain(entry.implies.iter()) {
+                assert!(
+                    !target.starts_with("tinycloud.encryption/key."),
+                    "{} declares {target}",
+                    entry.urn
+                );
+            }
+            for key in &key_abilities {
+                if entry.urn == *key {
+                    continue;
+                }
+                assert!(
+                    !ability_matches(&entry.urn, key),
+                    "{} matches {key}",
+                    entry.urn
+                );
+                assert!(
+                    !ability_matches(key, &entry.urn),
+                    "{key} matches {}",
+                    entry.urn
+                );
+            }
+        }
+    }
 }

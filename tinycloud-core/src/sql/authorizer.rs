@@ -8,6 +8,7 @@ use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use super::authority::SqlAuthority;
 use super::caveats::SqlCaveats;
 use super::parser::ParsedQuery;
+use super::types::CaveatArm;
 
 /// What the statement being authorized is, as the parser classified it.
 ///
@@ -258,7 +259,174 @@ pub fn create_authorizer_scoped(
 
 /// As [`create_authorizer_scoped`], and records in `pragmas` that a PRAGMA
 /// outside the read-only reports was allowed.
+///
+/// When `authority` carries the delegated-caveat rules
+/// ([`SqlAuthority::with_delegated_caveats`]), the abilities decide first, as
+/// always; then `caveats` are judged by [`delegated_denial`], and the arm that
+/// refused is recorded in the authority's [`DeniedArm`](super::authority::DeniedArm).
 pub fn create_authorizer_tracked(
+    caveats: Option<SqlCaveats>,
+    authority: &SqlAuthority,
+    scope: StatementScope,
+    pragmas: PragmaTracker,
+) -> impl FnMut(AuthContext<'_>) -> Authorization {
+    let denied = authority.denied_arm().clone();
+    let (ability_caveats, delegated_caveats) = if authority.delegated_caveats() {
+        (None, caveats)
+    } else {
+        (caveats, None)
+    };
+    let mut judge = create_ability_authorizer(ability_caveats, authority, scope, pragmas);
+    move |ctx: AuthContext<'_>| {
+        let verdict = judge(ctx);
+        if verdict != Authorization::Allow {
+            return verdict;
+        }
+        match delegated_caveats
+            .as_ref()
+            .and_then(|caveats| delegated_denial(caveats, scope.is_read_only, &ctx))
+        {
+            Some(arm) => {
+                denied.record(arm);
+                Authorization::Deny
+            }
+            None => Authorization::Allow,
+        }
+    }
+}
+
+/// Which caveat arm refuses `ctx`, if one does (TC-1791). Precedence: write,
+/// then table, then column. Names compare ASCII-case-insensitively.
+///
+/// - `readOnly`: a statement the parser did not classify as read-only is
+///   refused at its first callback, whatever the action. Otherwise every
+///   write and DDL action, and a PRAGMA that sets a value, is refused.
+/// - `tables`: every table an action reads, writes or changes must be listed,
+///   including the tables a trigger, a foreign key or a view reaches, the
+///   target of every DDL action, and `sqlite_master`. The PRAGMA schema
+///   reports and checks, and the PRAGMAs that set a header value, are refused.
+/// - `columns`: a read or an UPDATE of a column must list it; a read that
+///   names no column (`count(*)`) is allowed. INSERT and DELETE name no
+///   column and are refused.
+pub(super) fn delegated_denial(
+    caveats: &SqlCaveats,
+    statement_is_read_only: bool,
+    ctx: &AuthContext<'_>,
+) -> Option<CaveatArm> {
+    let read_only = caveats.read_only.unwrap_or(false);
+    if read_only && !statement_is_read_only {
+        return Some(CaveatArm::Write);
+    }
+    let table_arm = |table: &str| (!caveats.is_table_listed(table)).then_some(CaveatArm::Table);
+    let column_arm =
+        |column: &str| (!caveats.is_column_listed(column)).then_some(CaveatArm::Column);
+    match ctx.action {
+        AuthAction::Read {
+            table_name,
+            column_name,
+        } => table_arm(table_name).or_else(|| {
+            if column_name.is_empty() {
+                None
+            } else {
+                column_arm(column_name)
+            }
+        }),
+        AuthAction::Insert { table_name } | AuthAction::Delete { table_name } => read_only
+            .then_some(CaveatArm::Write)
+            .or_else(|| table_arm(table_name))
+            .or_else(|| caveats.columns.is_some().then_some(CaveatArm::Column)),
+        AuthAction::Update {
+            table_name,
+            column_name,
+        } => {
+            // SQLite's own bookkeeping UPDATE of the schema table when a
+            // read-only query first uses a `pragma_*` function is not a write.
+            if statement_is_read_only && is_sqlite_schema_table(table_name) {
+                table_arm(table_name)
+            } else {
+                read_only
+                    .then_some(CaveatArm::Write)
+                    .or_else(|| table_arm(table_name))
+                    .or_else(|| column_arm(column_name))
+            }
+        }
+        AuthAction::Pragma {
+            pragma_name,
+            pragma_value,
+        } => {
+            let restricted = caveats.tables.is_some() || caveats.columns.is_some();
+            let is_report = pragma_in(&READ_ONLY_PRAGMAS, pragma_name);
+            let is_check = pragma_in(&ADMIN_CHECK_PRAGMAS, pragma_name);
+            // SQLite reports `PRAGMA name(arg)` and `PRAGMA name = value` alike
+            // as a PRAGMA with a value. The schema reports and the checks take
+            // an argument and change nothing; any other PRAGMA with a value may
+            // set something. The two header values a PRAGMA can set are
+            // database-wide state, not a table: a table or column limit
+            // refuses them as a write too.
+            let sets_something = pragma_value.is_some() && !is_report && !is_check;
+            let sets_header =
+                pragma_value.is_some() && pragma_in(&ADMIN_SETTABLE_PRAGMAS, pragma_name);
+            if (sets_something && read_only) || (sets_header && restricted) {
+                Some(CaveatArm::Write)
+            // The schema reports and the checks list tables and rowids.
+            } else if restricted && (is_report || is_check) {
+                Some(CaveatArm::Table)
+            } else {
+                None
+            }
+        }
+        // An action that names a table (a view counts as one: a grant lists
+        // it): `readOnly` refuses it, and under `tables` the table must be
+        // listed.
+        AuthAction::CreateTable { table_name }
+        | AuthAction::CreateTempTable { table_name }
+        | AuthAction::DropTable { table_name }
+        | AuthAction::DropTempTable { table_name }
+        | AuthAction::AlterTable { table_name, .. }
+        | AuthAction::CreateIndex { table_name, .. }
+        | AuthAction::CreateTempIndex { table_name, .. }
+        | AuthAction::DropIndex { table_name, .. }
+        | AuthAction::DropTempIndex { table_name, .. }
+        | AuthAction::CreateTrigger { table_name, .. }
+        | AuthAction::CreateTempTrigger { table_name, .. }
+        | AuthAction::DropTrigger { table_name, .. }
+        | AuthAction::DropTempTrigger { table_name, .. }
+        | AuthAction::Analyze { table_name }
+        | AuthAction::CreateVtable { table_name, .. }
+        | AuthAction::DropVtable { table_name, .. }
+        | AuthAction::CreateView {
+            view_name: table_name,
+        }
+        | AuthAction::CreateTempView {
+            view_name: table_name,
+        }
+        | AuthAction::DropView {
+            view_name: table_name,
+        }
+        | AuthAction::DropTempView {
+            view_name: table_name,
+        } => read_only
+            .then_some(CaveatArm::Write)
+            .or_else(|| table_arm(table_name)),
+        // REINDEX names an index; the table it belongs to is judged by the
+        // actions that build the index.
+        AuthAction::Reindex { .. } => read_only.then_some(CaveatArm::Write),
+        // No table is involved. The abilities refuse transaction control,
+        // ATTACH and DETACH for every holder.
+        AuthAction::Select
+        | AuthAction::Function { .. }
+        | AuthAction::Recursive
+        | AuthAction::Transaction { .. }
+        | AuthAction::Savepoint { .. }
+        | AuthAction::Attach { .. }
+        | AuthAction::Detach { .. } => None,
+        // An action this code does not know (the abilities refuse it for every
+        // holder): under `tables` it is refused rather than guessed at.
+        _ => caveats.tables.is_some().then_some(CaveatArm::Table),
+    }
+}
+
+fn create_ability_authorizer(
     caveats: Option<SqlCaveats>,
     authority: &SqlAuthority,
     scope: StatementScope,
