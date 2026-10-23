@@ -27,6 +27,7 @@ use crate::util::InvocationInfo;
 
 use super::backend::{validate_receiver_public_key, KeyBackend, KeyBackendError};
 use super::canonical::{canonical_hash, canonical_json_bytes, hash_hex};
+use super::deletion_ledger::DeletionLedger;
 use super::key_id::{self, EncryptionResource, KeyLocation};
 use super::keys::{canonical_key_urn, network_of, DEFAULT_KEY_CAP_PER_NETWORK};
 use super::network_id::NetworkId;
@@ -227,16 +228,21 @@ pub enum EncryptionServiceError {
     CorruptKeyRow,
     #[error("key_path_invalid: {0}")]
     KeyPathInvalid(String),
+    #[error("owner_only: {0}")]
+    OwnerOnly(String),
+    #[error("deletion_ledger_unavailable: {0}")]
+    DeletionLedger(String),
 }
 
 pub struct EncryptionService {
     pub(super) db: RecoveringConnection,
-    node_did: String,
+    pub(super) node_did: String,
     node_keypair: Option<Keypair>,
     pub(super) backend: Arc<dyn KeyBackend>,
     invocation_ttl_seconds: i64,
     pub(super) sqlite_writer_lock: Option<Arc<tokio::sync::Mutex<()>>>,
     pub(super) key_cap_per_network: u64,
+    pub(super) deletion_ledger: Option<Arc<DeletionLedger>>,
 }
 
 #[derive(Debug, Clone)]
@@ -266,6 +272,7 @@ impl EncryptionService {
             invocation_ttl_seconds: DEFAULT_INVOCATION_TTL_SECONDS,
             sqlite_writer_lock: None,
             key_cap_per_network: DEFAULT_KEY_CAP_PER_NETWORK,
+            deletion_ledger: None,
         }
     }
 
@@ -283,6 +290,7 @@ impl EncryptionService {
             invocation_ttl_seconds: DEFAULT_INVOCATION_TTL_SECONDS,
             sqlite_writer_lock: None,
             key_cap_per_network: DEFAULT_KEY_CAP_PER_NETWORK,
+            deletion_ledger: None,
         }
     }
 
@@ -293,6 +301,13 @@ impl EncryptionService {
 
     pub fn with_key_cap_per_network(mut self, cap: u64) -> Self {
         self.key_cap_per_network = cap;
+        self
+    }
+
+    /// The append-only ledger every key deletion is recorded in before it
+    /// commits. Without one, deletes are refused.
+    pub fn with_deletion_ledger(mut self, ledger: Option<Arc<DeletionLedger>>) -> Self {
+        self.deletion_ledger = ledger;
         self
     }
 
@@ -1165,7 +1180,18 @@ impl EncryptionService {
         nonce: &str,
         exp: i64,
     ) -> Result<(), EncryptionServiceError> {
-        let nonce_expires_at = OffsetDateTime::from_unix_timestamp(exp)
+        self.consume_nonce_until(requester_did, nonce, exp).await
+    }
+
+    /// Records `(requester_did, nonce)` as used until `expires_at` (unix
+    /// seconds). A second insert of the same pair is `NonceReplay`.
+    pub(super) async fn consume_nonce_until(
+        &self,
+        requester_did: &str,
+        nonce: &str,
+        expires_at: i64,
+    ) -> Result<(), EncryptionServiceError> {
+        let nonce_expires_at = OffsetDateTime::from_unix_timestamp(expires_at)
             .unwrap_or_else(|_| OffsetDateTime::now_utc())
             .format(&Rfc3339)
             .unwrap_or_else(|_| now_rfc3339());

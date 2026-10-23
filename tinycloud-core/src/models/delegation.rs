@@ -1797,6 +1797,39 @@ mod tests {
         ));
     }
 
+    /// key.delete is refused on every key and prefix resource shape, for the
+    /// owner and for anyone else.
+    #[tokio::test]
+    async fn key_delete_is_refused_on_every_prefix_and_key_shape() {
+        let db = database().await;
+        let base = format!("urn:tinycloud:encryption:{KEY_OWNER}:default");
+        for resource in [
+            format!("{base}/apps/foo/"),
+            format!("{base}/apps/foo/x/"),
+            format!("{base}/apps/foo/x"),
+            format!("{base}/apps/"),
+            format!("{base}/apps/foo"),
+            format!("{base}/secrets/"),
+            format!("{base}/appsx/y/"),
+            base.clone(),
+        ] {
+            for delegator in [KEY_OWNER, OTHER_DID] {
+                let info =
+                    key_grant_info(delegator, &resource, "tinycloud.encryption/key.delete", &[]);
+                let refused = validate(&db, &info).await;
+                assert!(
+                    matches!(
+                        refused,
+                        Err(Error::InvalidDelegation(
+                            DelegationError::KeyDeleteNotDelegable
+                        ))
+                    ),
+                    "{delegator} on {resource}: {refused:?}"
+                );
+            }
+        }
+    }
+
     fn key_grant_info(
         delegator: &str,
         resource: &str,
