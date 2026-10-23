@@ -12719,7 +12719,7 @@ mod tests {
         let held = [write];
         let statements = vec![json!({"sqlCaveats": {"statements": [
             {"name": "get", "sql": "SELECT body FROM Notes ORDER BY id"},
-            {"name": "leak", "sql": "SELECT a FROM plain"},
+            {"name": "other", "sql": "SELECT a FROM plain"},
             {"name": "put", "sql": "INSERT INTO Notes (id, body) VALUES (7, 'n')"},
         ]}})];
         let named = |name: &str| SqlRequest::ExecuteStatement {
@@ -12756,9 +12756,9 @@ mod tests {
             "{}",
             get.body
         );
-        let leak = run(named("leak")).await?;
-        assert_eq!(leak.status, Status::Forbidden, "{}", leak.body);
-        assert_eq!(leak.body, "sql_caveat_violation: table");
+        let other = run(named("other")).await?;
+        assert_eq!(other.status, Status::Forbidden, "{}", other.body);
+        assert_eq!(other.body, "sql_caveat_violation: table");
         let put = run(named("put")).await?;
         assert_eq!(put.status, Status::Ok, "{}", put.body);
         assert_eq!(tc1791_count(&fixture, "Notes").await?, 3);
