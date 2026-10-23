@@ -77,7 +77,12 @@ fn blackhole_url(test: &str) -> Option<String> {
             std::env::var_os("CI").is_none(),
             "{test} requires TINYCLOUD_TEST_BLACKHOLE=1 in CI (TC-1054)"
         );
-        eprintln!("skipping {test}: TINYCLOUD_TEST_BLACKHOLE is not 1");
+        use std::io::Write;
+        // Written to the process stderr directly: libtest captures `eprintln!` output of passing tests.
+        let _ = writeln!(
+            std::io::stderr(),
+            "skipping {test}: TINYCLOUD_TEST_BLACKHOLE is not 1"
+        );
         return None;
     }
     postgres_url(test)
