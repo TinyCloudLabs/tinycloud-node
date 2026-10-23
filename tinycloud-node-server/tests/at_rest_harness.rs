@@ -4921,7 +4921,9 @@ fn selftest_blocks_carry_no_derived_secret() -> Result<()> {
 /// window, so a filler byte equal to the DEK byte next to an injected piece
 /// moves the label one offset early: `half_b[15] == dek[15]` makes the
 /// finding `15..31` instead of `16..32`. Forcing that byte off its DEK
-/// neighbour rules the coincidence out. Returns (truncated, half_a, half_b).
+/// neighbour rules the coincidence out. Only `half_b`'s forced byte changes a
+/// label; the forced bytes in `truncated` and `half_a` are for symmetry.
+/// Returns (truncated, half_a, half_b).
 fn salt_selftest_pieces(dek: &[u8]) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let mut truncated = dek[..31].to_vec();
     truncated.push(dek[31] ^ 0xFF);
