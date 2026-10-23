@@ -243,13 +243,13 @@ fn hash_field<'a>(hash: Option<&[u8; 32]>, buffer: &'a mut [u8; 64]) -> Option<&
     Some(std::str::from_utf8(buffer).expect("hex is ASCII"))
 }
 
-/// The one diagnostic line a request logs when it ends in a database-failure
-/// 5xx (TC-1796).
+/// The one diagnostic line a request logs when it ends in a database failure
+/// or a busy/timeout 5xx (TC-1796).
 ///
 /// Its fields are all there is: fixed vocabulary, the route template, the
-/// elapsed time and a hashed database reference. It never carries a space
-/// id, DID, database name or path, SQL, parameters, the database's error
-/// text, headers, tokens, addresses or bodies.
+/// elapsed time and the keyed `db_hash` pseudonym of the database. It never
+/// carries a space id, DID, database name or path, SQL, parameters, the
+/// database's error text, headers, tokens, addresses or bodies.
 struct DatabaseFailureLine<'a> {
     status: u16,
     code: &'static str,
