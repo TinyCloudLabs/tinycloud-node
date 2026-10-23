@@ -4,7 +4,7 @@
 
 ### Changes
 
-- Encryption: parsing and containment for key resource identifiers; owners are root authority for their keys; key prefixes are refused as invocation targets, and key.delete is refused in delegations. Named keys can be created, blocked and unblocked, and their public key is derived, but no route uses them yet. Root-key decrypt on both live routes now uses strict unwrap: wrapped keys must carry the 0x01 version byte, and non-contributory key exchanges are refused. On the direct route a refused wrap returns 500 until the route-mapping change lands. Key operations on a revoked network return 409 (`NetworkNotActive`). Details: TC-1777.
+- Encryption: parsing and containment for key resource identifiers; owners are root authority for their keys; key prefixes are refused as invocation targets, and key.delete is refused in delegations. Named keys can be created, blocked and unblocked, and their public key is derived, but no route uses them yet. Root-key decrypt on both live routes now uses strict unwrap: wrapped keys must carry the 0x01 version byte, and non-contributory key exchanges are refused. On the direct route a refused wrap returns 500 until the route-mapping change lands. Create, public key and named-key unwrap on a revoked network return 409 (`NetworkNotActive`). Details: TC-1777.
 
 ## [1.21.9] - 2026-10-23
 
