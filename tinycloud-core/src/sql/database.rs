@@ -260,6 +260,7 @@ pub fn spawn_actor(
                     response_tx,
                 } => {
                     let pragmas = PragmaTracker::default();
+                    authority.denied_arm().clear();
                     let result = match growth {
                         GrowthPolicy::Allow => handle_message_authorized(
                             &conn, &request, &caveats, &authority, &pragmas,
@@ -267,6 +268,13 @@ pub fn spawn_actor(
                         GrowthPolicy::Forbid => handle_message_without_growth_authorized(
                             &conn, &request, &caveats, &authority, &pragmas,
                         ),
+                    };
+                    // A statement the authorizer refused for a caveat fails the
+                    // request with the arm that refused it, whatever text
+                    // SQLite gave the refusal.
+                    let result = match (result, authority.denied_arm().get()) {
+                        (Err(_), Some(arm)) => Err(SqlError::CaveatViolation(arm)),
+                        (result, _) => result,
                     };
                     conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
                     inject_open_transaction(&conn, &space_id, &db_name);

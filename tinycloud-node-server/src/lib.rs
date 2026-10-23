@@ -809,7 +809,8 @@ pub async fn app_with_control(
         Some(webhook_encryption.clone()),
     )
     .await?
-    .with_sql_sizes(sql_sizes.clone());
+    .with_sql_sizes(sql_sizes.clone())
+    .with_delegated_sql_caveats(tinycloud_config.sql.delegated_caveats_enforced);
     tinycloud.set_read_audit_wait(Duration::from_millis(
         tinycloud_config.database.read_audit_wait_ms,
     ));

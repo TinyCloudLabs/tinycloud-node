@@ -123,6 +123,7 @@ pub(crate) async fn process<C: ConnectionTrait>(
     ops: Vec<VersionedOperation>,
     encryption: Option<&ColumnEncryption>,
     auth_graph: Option<&crate::auth_graph::AuthGraphSnapshot>,
+    delegated_sql_caveats: bool,
 ) -> Result<Hash, Error> {
     let (i, serialized) = (invocation.0, invocation.1);
     verify_invocation(&i.invocation).await?;
@@ -131,7 +132,7 @@ pub(crate) async fn process<C: ConnectionTrait>(
     }
 
     let now = OffsetDateTime::now_utc();
-    validate(db, &i, Some(now), auth_graph).await?;
+    validate(db, &i, Some(now), auth_graph, delegated_sql_caveats).await?;
 
     save(db, i, Some(now), serialized, ops, encryption).await
 }
@@ -177,6 +178,7 @@ pub(crate) async fn process_admitted<C: ConnectionTrait>(
     ops: Vec<VersionedOperation>,
     encryption: Option<&ColumnEncryption>,
     auth_graph: Option<&crate::auth_graph::AuthGraphSnapshot>,
+    delegated_sql_caveats: bool,
 ) -> Result<Hash, Error> {
     let (i, serialized) = (invocation.0, invocation.1);
     i.invocation
@@ -188,7 +190,7 @@ pub(crate) async fn process_admitted<C: ConnectionTrait>(
     }
 
     let now = OffsetDateTime::now_utc();
-    validate(db, &i, Some(now), auth_graph).await?;
+    validate(db, &i, Some(now), auth_graph, delegated_sql_caveats).await?;
 
     save(db, i, Some(now), serialized, ops, encryption).await
 }
@@ -203,6 +205,7 @@ pub(crate) async fn authorize_admitted<C: ConnectionTrait>(
     invocation: &util::InvocationInfo,
     now: OffsetDateTime,
     auth_graph: Option<&crate::auth_graph::AuthGraphSnapshot>,
+    delegated_sql_caveats: bool,
 ) -> Result<(), Error> {
     invocation
         .invocation
@@ -212,7 +215,7 @@ pub(crate) async fn authorize_admitted<C: ConnectionTrait>(
     for space in invocation.spaces() {
         crate::request_telemetry::observe_space(space);
     }
-    validate(db, invocation, Some(now), auth_graph).await
+    validate(db, invocation, Some(now), auth_graph, delegated_sql_caveats).await
 }
 
 pub async fn verify_invocation(invocation: &TinyCloudInvocation) -> Result<(), Error> {
@@ -254,7 +257,17 @@ pub async fn verify_and_authorize<C: ConnectionTrait>(
     invocation: &util::InvocationInfo,
     now: OffsetDateTime,
 ) -> Result<(), Error> {
-    verify_and_authorize_with_graph(db, invocation, now, None).await
+    verify_and_authorize_with_setting(db, invocation, now, false).await
+}
+
+/// [`verify_and_authorize`] with the delegated-SQL-caveat setting stated.
+pub async fn verify_and_authorize_with_setting<C: ConnectionTrait>(
+    db: &C,
+    invocation: &util::InvocationInfo,
+    now: OffsetDateTime,
+    delegated_sql_caveats: bool,
+) -> Result<(), Error> {
+    verify_and_authorize_with_graph(db, invocation, now, None, delegated_sql_caveats).await
 }
 
 /// [`verify_and_authorize`] against a caller-loaded authorization snapshot,
@@ -265,12 +278,13 @@ pub(crate) async fn verify_and_authorize_with_graph<C: ConnectionTrait>(
     invocation: &util::InvocationInfo,
     now: OffsetDateTime,
     auth_graph: Option<&crate::auth_graph::AuthGraphSnapshot>,
+    delegated_sql_caveats: bool,
 ) -> Result<(), Error> {
     verify_invocation(&invocation.invocation).await?;
     for space in invocation.spaces() {
         crate::request_telemetry::observe_space(space);
     }
-    validate(db, invocation, Some(now), auth_graph).await
+    validate(db, invocation, Some(now), auth_graph, delegated_sql_caveats).await
 }
 
 // verify parenthood and authorization
@@ -279,6 +293,7 @@ async fn validate<C: ConnectionTrait>(
     invocation: &util::InvocationInfo,
     time: Option<OffsetDateTime>,
     auth_graph: Option<&crate::auth_graph::AuthGraphSnapshot>,
+    delegated_sql_caveats: bool,
 ) -> Result<(), Error> {
     validate_capabilities(
         db,
@@ -287,6 +302,7 @@ async fn validate<C: ConnectionTrait>(
         &invocation.parents,
         time,
         auth_graph,
+        delegated_sql_caveats,
     )
     .await
 }
@@ -304,7 +320,29 @@ pub async fn authorize_holder<C: ConnectionTrait>(
     parents: &[tinycloud_auth::ipld_core::cid::Cid],
     now: OffsetDateTime,
 ) -> Result<(), Error> {
-    validate_capabilities(db, capabilities, holder, parents, Some(now), None).await
+    validate_capabilities(db, capabilities, holder, parents, Some(now), None, false).await
+}
+
+/// [`authorize_holder`] with the delegated-SQL-caveat setting stated.
+#[cfg(test)]
+pub(crate) async fn authorize_holder_with_setting<C: ConnectionTrait>(
+    db: &C,
+    holder: &str,
+    capabilities: &[util::Capability],
+    parents: &[tinycloud_auth::ipld_core::cid::Cid],
+    now: OffsetDateTime,
+    delegated_sql_caveats: bool,
+) -> Result<(), Error> {
+    validate_capabilities(
+        db,
+        capabilities,
+        holder,
+        parents,
+        Some(now),
+        None,
+        delegated_sql_caveats,
+    )
+    .await
 }
 
 /// Test oracle: `authorize_holder`'s checks against a caller-built snapshot.
@@ -317,7 +355,16 @@ pub(crate) async fn authorize_holder_with_graph<C: ConnectionTrait>(
     now: OffsetDateTime,
     graph: &crate::auth_graph::AuthGraphSnapshot,
 ) -> Result<(), Error> {
-    validate_capabilities(db, capabilities, holder, parents, Some(now), Some(graph)).await
+    validate_capabilities(
+        db,
+        capabilities,
+        holder,
+        parents,
+        Some(now),
+        Some(graph),
+        false,
+    )
+    .await
 }
 
 async fn validate_capabilities<C: ConnectionTrait>(
@@ -327,6 +374,7 @@ async fn validate_capabilities<C: ConnectionTrait>(
     parents: &[tinycloud_auth::ipld_core::cid::Cid],
     time: Option<OffsetDateTime>,
     auth_graph: Option<&crate::auth_graph::AuthGraphSnapshot>,
+    delegated_sql_caveats: bool,
 ) -> Result<(), Error> {
     // A key prefix names a namespace; it cannot be invoked as a target.
     if capabilities.iter().any(|cap| {
@@ -498,7 +546,12 @@ async fn validate_capabilities<C: ConnectionTrait>(
                 let mut last_reason: Option<String> = None;
                 let mut authorized = false;
                 for pc in candidates {
-                    match caveats_contain_child(&pc.caveats, &c.caveats) {
+                    match ability_caveats_contain_child(
+                        c.ability.as_ref().as_ref(),
+                        &pc.caveats,
+                        &c.caveats,
+                        delegated_sql_caveats,
+                    ) {
                         Ok(()) => {
                             authorized = true;
                             break;
@@ -539,10 +592,17 @@ async fn validate_capabilities<C: ConnectionTrait>(
                                 ability.ability.as_ref().as_ref(),
                                 c.ability.as_ref().as_ref(),
                             )
-                            && caveats_contain_child(&ability.caveats, &c.caveats).is_ok()
-                            && crate::models::delegation::unsupported_sql_caveat(
+                            && ability_caveats_contain_child(
+                                c.ability.as_ref().as_ref(),
+                                &ability.caveats,
+                                &c.caveats,
+                                delegated_sql_caveats,
+                            )
+                            .is_ok()
+                            && crate::models::delegation::unsupported_stored_sql_caveat(
                                 ability.ability.as_ref().as_ref(),
                                 &ability.caveats,
+                                delegated_sql_caveats,
                             )
                             .is_none()
                     };
@@ -586,6 +646,39 @@ fn caveats_contain_child(parent: &Caveats, child: &Caveats) -> Result<(), String
             }
         }
     }
+}
+
+/// TC-1791: [`caveats_contain_child`] for one invoked ability. A stored
+/// delegated `tables` / `columns` / `readOnly` form on a SQL ability does not
+/// refuse an invocation whose own capability carries no caveat: the restriction
+/// is applied to the request from the whole chain when it executes. An
+/// invocation capability that carries a delegated form of its own is refused by
+/// the `unsupported_sql_caveat` check below.
+fn ability_caveats_contain_child(
+    ability: &str,
+    parent: &Caveats,
+    child: &Caveats,
+    delegated_sql_caveats: bool,
+) -> Result<(), String> {
+    if delegated_sql_caveats && ability.starts_with("tinycloud.sql/") {
+        use crate::sql::delegated_caveats::{classify, AbilityCaveats, Reading};
+        match (
+            classify(parent, Reading::Stored),
+            classify(child, Reading::Stored),
+        ) {
+            (Ok(AbilityCaveats::Form(_)), Ok(AbilityCaveats::Unrestricted)) => return Ok(()),
+            (Ok(AbilityCaveats::Form(_)), _) => {
+                return Err("invocation-caveats-not-subset-of-chain".to_string());
+            }
+            // A parent of only empty entries imposes nothing, whatever shape
+            // the empty entries take.
+            (Ok(AbilityCaveats::Unrestricted), Ok(_)) if !parent.0.is_empty() => {
+                return caveats_contain_child(&Caveats::default(), child);
+            }
+            _ => {}
+        }
+    }
+    caveats_contain_child(parent, child)
 }
 
 /// Parses the constrained-statements profile carried by one capability's caveats.
@@ -1675,6 +1768,107 @@ mod tests {
         )
         .await
         .expect("a matching constrained-statements grant authorizes");
+    }
+
+    fn delegated_form_caveat(list: serde_json::Value) -> Caveats {
+        Caveats(BTreeMap::from([("0".to_string(), list)]))
+    }
+
+    async fn holder_under(
+        db: &DatabaseConnection,
+        parent: tinycloud_auth::ipld_core::cid::Cid,
+        own: Caveats,
+        setting: bool,
+    ) -> Result<(), Error> {
+        let resource = "tinycloud:did:key:owner/sql/db";
+        crate::models::invocation::authorize_holder_with_setting(
+            db,
+            "did:key:alias",
+            &[caveat_capability(resource, "tinycloud.sql/read", own)],
+            &[parent],
+            OffsetDateTime::now_utc(),
+            setting,
+        )
+        .await
+    }
+
+    fn not_subset_of_chain(error: &Error) -> bool {
+        matches!(
+            error,
+            Error::InvalidInvocation(InvocationError::CaveatsNotContained(reason))
+                if reason == "invocation-caveats-not-subset-of-chain"
+        )
+    }
+
+    /// TC-1791: with the setting on, a stored delegated `tables` form does not
+    /// refuse an invocation whose own capability carries no caveat (the chain's
+    /// restriction is applied when the request runs), and an invocation cannot
+    /// carry the form itself. With the setting off the stored form is refused
+    /// as any non-profile caveat is.
+    #[tokio::test]
+    async fn stored_delegated_form_covers_an_invocation_only_with_the_setting_on() {
+        let resource = "tinycloud:did:key:owner/sql/db";
+        let stored = delegated_form_caveat(serde_json::json!({"tables": ["a"]}));
+        let (db, parent) = caveat_chain_db(resource, "tinycloud.sql/read", stored).await;
+        holder_under(&db, parent, Caveats::default(), true)
+            .await
+            .expect("a stored delegated form covers an invocation without a caveat");
+
+        for own in [
+            delegated_form_caveat(serde_json::json!({"tables": ["a"]})),
+            delegated_form_caveat(serde_json::json!({"tables": ["b"]})),
+            make_sql_constrained_caveat("get", "SELECT 1"),
+        ] {
+            let err = holder_under(&db, parent, own, true).await.unwrap_err();
+            assert!(
+                matches!(&err, Error::InvalidInvocation(_)),
+                "unexpected rejection: {err:?}"
+            );
+        }
+
+        // Setting off: refused as any non-profile stored caveat is, and an
+        // invocation capability carrying the form is an unsupported caveat.
+        let err = holder_under(&db, parent, Caveats::default(), false)
+            .await
+            .unwrap_err();
+        assert!(not_subset_of_chain(&err), "unexpected rejection: {err:?}");
+        let err = holder_under(
+            &db,
+            parent,
+            delegated_form_caveat(serde_json::json!({"tables": ["a"]})),
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                Error::InvalidInvocation(InvocationError::UnsupportedCaveat(_))
+            ),
+            "unexpected rejection: {err:?}"
+        );
+    }
+
+    /// TC-1791: with the setting on, a stored grant of only empty entries
+    /// imposes nothing; with it off it is refused.
+    #[tokio::test]
+    async fn stored_grant_of_only_empty_entries_covers_any_invocation_only_with_the_setting_on() {
+        let resource = "tinycloud:did:key:owner/sql/db";
+        let stored = Caveats(BTreeMap::from([
+            ("0".to_string(), serde_json::json!({})),
+            ("1".to_string(), serde_json::json!({})),
+        ]));
+        let (db, parent) = caveat_chain_db(resource, "tinycloud.sql/read", stored).await;
+        for own in [
+            Caveats::default(),
+            make_sql_constrained_caveat("get", "SELECT 1"),
+        ] {
+            holder_under(&db, parent, own.clone(), true)
+                .await
+                .expect("empty entries restrict nothing");
+            let err = holder_under(&db, parent, own, false).await.unwrap_err();
+            assert!(not_subset_of_chain(&err), "unexpected rejection: {err:?}");
+        }
     }
 
     #[tokio::test]

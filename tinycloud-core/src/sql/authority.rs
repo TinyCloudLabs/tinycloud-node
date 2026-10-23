@@ -10,8 +10,12 @@
 
 use prometheus::{register_int_counter_vec, IntCounterVec};
 use serde::{Deserialize, Serialize};
-use std::sync::LazyLock;
+use std::sync::{
+    atomic::{AtomicU8, Ordering},
+    Arc, LazyLock,
+};
 
+use super::types::CaveatArm;
 use crate::policy_capability::ability_matches;
 
 const ADMIN: &str = "tinycloud.sql/admin";
@@ -87,12 +91,58 @@ pub fn ddl_without_schema_count(kind: DdlKind) -> u64 {
 #[cfg(test)]
 pub(crate) static LOG_COUNTER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Which caveat arm refused a statement, recorded by the authorizer while the
+/// statement is prepared. Clones share one cell. The arm with the highest
+/// precedence wins: write, then table, then column.
+#[derive(Clone, Debug, Default)]
+pub struct DeniedArm(Arc<AtomicU8>);
+
+impl DeniedArm {
+    fn rank(arm: CaveatArm) -> u8 {
+        match arm {
+            CaveatArm::Column => 1,
+            CaveatArm::Table => 2,
+            CaveatArm::Write => 3,
+            CaveatArm::Chain => 4,
+        }
+    }
+
+    pub fn record(&self, arm: CaveatArm) {
+        self.0.fetch_max(Self::rank(arm), Ordering::Relaxed);
+    }
+
+    pub fn get(&self) -> Option<CaveatArm> {
+        match self.0.load(Ordering::Relaxed) {
+            1 => Some(CaveatArm::Column),
+            2 => Some(CaveatArm::Table),
+            3 => Some(CaveatArm::Write),
+            4 => Some(CaveatArm::Chain),
+            _ => None,
+        }
+    }
+
+    pub fn clear(&self) {
+        self.0.store(0, Ordering::Relaxed);
+    }
+}
+
+impl PartialEq for DeniedArm {
+    fn eq(&self, other: &Self) -> bool {
+        self.get() == other.get()
+    }
+}
+
+impl Eq for DeniedArm {}
+
 /// Every `tinycloud.sql/*` ability the invocation holds, plus the node's DDL
-/// policy.
+/// policy and, when the delegated-caveat rules apply to the request, the cell
+/// that records which caveat arm refused a statement.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SqlAuthority {
     held: Vec<String>,
     ddl_policy: DdlPolicy,
+    delegated_caveats: bool,
+    denied: DeniedArm,
 }
 
 impl SqlAuthority {
@@ -104,6 +154,8 @@ impl SqlAuthority {
         Self {
             held: held.into_iter().map(Into::into).collect(),
             ddl_policy: DdlPolicy::default(),
+            delegated_caveats: false,
+            denied: DeniedArm::default(),
         }
     }
 
@@ -114,6 +166,24 @@ impl SqlAuthority {
 
     pub fn ddl_policy(&self) -> DdlPolicy {
         self.ddl_policy
+    }
+
+    /// Judge the request's caveats by the delegated-caveat rules (TC-1791):
+    /// names match ASCII-case-insensitively, the authorizer is the one place
+    /// a `tables` / `columns` / `readOnly` restriction is decided, and it
+    /// records which arm refused.
+    pub fn with_delegated_caveats(mut self, enabled: bool) -> Self {
+        self.delegated_caveats = enabled;
+        self
+    }
+
+    pub fn delegated_caveats(&self) -> bool {
+        self.delegated_caveats
+    }
+
+    /// The cell the authorizer records a refusing arm in.
+    pub fn denied_arm(&self) -> &DeniedArm {
+        &self.denied
     }
 
     fn confers(&self, required: &str) -> bool {

@@ -91,3 +91,12 @@ cors = true
     ## Keep off until named keys are live on OpenKey. Off = feature withheld.
     ## Env: TINYCLOUD_ENCRYPTION_NETWORK__NAMED_KEYS_V1
     # named_keys_v1 = false
+
+[global.sql]
+    ## Accept the `tables` / `columns` / `readOnly` caveat form on
+    ## `tinycloud.sql/*` delegations, enforce it from the delegation chain on
+    ## every SQL request, and advertise `sql-delegated-caveats-v1` in GET /info.
+    ## Off = such a delegation is refused as an unsupported caveat and the
+    ## feature is withheld.
+    ## Env: TINYCLOUD_SQL__DELEGATED_CAVEATS_ENFORCED
+    # delegated_caveats_enforced = false

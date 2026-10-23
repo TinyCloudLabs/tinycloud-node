@@ -57,6 +57,8 @@ pub struct Config {
     pub sql_store: SqlStoreConfig,
     #[serde(default)]
     pub encryption_network: EncryptionNetworkConfig,
+    #[serde(default)]
+    pub sql: SqlConfig,
 }
 
 /// Release gates for the encryption network routes. `named_keys_v1`
@@ -66,6 +68,18 @@ pub struct Config {
 pub struct EncryptionNetworkConfig {
     #[serde(default)]
     pub named_keys_v1: bool,
+}
+
+/// `[global.sql]` release gate for delegated SQL caveats (TC-1791).
+/// `delegated_caveats_enforced` admits the `tables` / `columns` / `readOnly`
+/// caveat form on `tinycloud.sql/*` delegations, enforces it from the
+/// delegation chain when a request runs, and advertises
+/// `sql-delegated-caveats-v1` in `/info`. Off: such a delegation is refused as
+/// an unsupported caveat and nothing is advertised.
+#[derive(Serialize, Deserialize, Debug, Default, Clone, Hash, PartialEq, Eq)]
+pub struct SqlConfig {
+    #[serde(default)]
+    pub delegated_caveats_enforced: bool,
 }
 
 /// Production exact-email composition.  The capability remains unavailable
@@ -1895,6 +1909,15 @@ mod tests {
     fn encryption_network_named_keys_parses_from_toml() {
         let config: EncryptionNetworkConfig = toml::from_str("named_keys_v1 = true").unwrap();
         assert!(config.named_keys_v1);
+    }
+
+    #[test]
+    fn sql_delegated_caveats_is_off_by_default_and_parses_from_toml() {
+        assert!(!Config::default().sql.delegated_caveats_enforced);
+        let config: SqlConfig = toml::from_str("").unwrap();
+        assert!(!config.delegated_caveats_enforced);
+        let config: SqlConfig = toml::from_str("delegated_caveats_enforced = true").unwrap();
+        assert!(config.delegated_caveats_enforced);
     }
 
     #[test]

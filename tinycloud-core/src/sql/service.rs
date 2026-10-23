@@ -5026,4 +5026,202 @@ mod tests {
                 .is_empty());
         }
     }
+
+    /// TC-1791: a request a delegated caveat refuses is refused whole. Nothing
+    /// of it is kept, no repository call is made, the answer is the fixed
+    /// `sql_caveat_violation: <arm>` text, and the abilities still decide first.
+    #[tokio::test]
+    async fn delegated_caveat_refusals_are_whole_free_and_carry_only_the_arm() {
+        use crate::sql::CaveatArm;
+        for memory_threshold in [u64::MAX, 0] {
+            let repo = artifact_repository().await;
+            let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let cache = TempDir::new().unwrap();
+            let space = test_space_id("sql-delegated-caveats");
+            let service = SqlService::new(
+                cache.path().to_string_lossy().into_owned(),
+                memory_threshold,
+                Arc::new(CallCountingRepository {
+                    inner: repo,
+                    calls: calls.clone(),
+                }),
+            );
+            for sql in [
+                "CREATE TABLE plain (a, b)",
+                "CREATE TABLE Notes (id INTEGER PRIMARY KEY, body TEXT, secret TEXT)",
+                "INSERT INTO plain (a) VALUES (0)",
+            ] {
+                service
+                    .execute(
+                        &space,
+                        "main",
+                        SqlRequest::Execute {
+                            schema: None,
+                            sql: sql.into(),
+                            params: Vec::new(),
+                        },
+                        None,
+                        "tinycloud.sql/admin".into(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let handle = service.handle(&space, "main").await.unwrap();
+            let before = handle.checkpoint().await.unwrap();
+            let run = |request: SqlRequest, caveats: SqlCaveats, held: &[&str]| {
+                service.execute_authorized(
+                    &space,
+                    "main",
+                    request,
+                    Some(caveats),
+                    SqlAuthority::new(held.iter().copied()).with_delegated_caveats(true),
+                )
+            };
+            let tables = |names: &[&str]| SqlCaveats {
+                tables: Some(names.iter().map(|n| n.to_string()).collect()),
+                ..SqlCaveats::default()
+            };
+            let write = ["tinycloud.sql/write"];
+            let untouched = |calls: &Arc<std::sync::Mutex<Vec<&'static str>>>| {
+                assert!(
+                    calls.lock().unwrap().is_empty(),
+                    "a refused request costs no repository (Postgres) round trip: {:?}",
+                    calls.lock().unwrap()
+                );
+            };
+
+            // The refused statement last, first, and alone.
+            for statements in [
+                [
+                    "INSERT INTO plain (a) VALUES (1)",
+                    "INSERT INTO Notes (id) VALUES (9)",
+                ],
+                [
+                    "INSERT INTO Notes (id) VALUES (9)",
+                    "INSERT INTO plain (a) VALUES (1)",
+                ],
+            ] {
+                calls.lock().unwrap().clear();
+                let refused = run(atomic_batch(&statements), tables(&["plain"]), &write).await;
+                let error = refused.unwrap_err();
+                assert!(matches!(error, SqlError::CaveatViolation(CaveatArm::Table)));
+                // Only the arm: no SQL text, table or column name.
+                assert_eq!(error.to_string(), "sql_caveat_violation: table");
+                untouched(&calls);
+                assert_eq!(handle.checkpoint().await.unwrap(), before);
+                assert_eq!(
+                    rows_of(&service, &space, "SELECT a FROM plain").await,
+                    vec![vec![SqlValue::Integer(0)]]
+                );
+            }
+
+            // Schema statements and a write under `readOnly`: refused whole, and
+            // the table the schema statement would create does not exist.
+            calls.lock().unwrap().clear();
+            let read_only = SqlCaveats {
+                read_only: Some(true),
+                ..SqlCaveats::default()
+            };
+            for request in [
+                SqlRequest::Execute {
+                    schema: Some(vec!["CREATE TABLE z (a)".into()]),
+                    sql: "INSERT INTO plain (a) VALUES (1)".into(),
+                    params: Vec::new(),
+                },
+                SqlRequest::Execute {
+                    schema: None,
+                    sql: "INSERT INTO plain (a) VALUES (1)".into(),
+                    params: Vec::new(),
+                },
+            ] {
+                let error = run(
+                    request,
+                    read_only.clone(),
+                    &["tinycloud.sql/write", "tinycloud.sql/schema"],
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(error.to_string(), "sql_caveat_violation: write");
+            }
+            untouched(&calls);
+            assert_eq!(handle.checkpoint().await.unwrap(), before);
+            assert!(rows_of(
+                &service,
+                &space,
+                "SELECT name FROM sqlite_master WHERE name = 'z'"
+            )
+            .await
+            .is_empty());
+
+            // The column arm, also on a full space.
+            let columns = SqlCaveats {
+                tables: Some(vec!["Notes".into()]),
+                columns: Some(vec!["body".into()]),
+                ..SqlCaveats::default()
+            };
+            let query = |sql: &str| SqlRequest::Query {
+                sql: sql.into(),
+                params: Vec::new(),
+                max_rows: None,
+                max_bytes: None,
+            };
+            let error = run(query("SELECT secret FROM Notes"), columns.clone(), &write)
+                .await
+                .unwrap_err();
+            assert_eq!(error.to_string(), "sql_caveat_violation: column");
+            let error = service
+                .execute_without_growth_authorized(
+                    &space,
+                    "main",
+                    query("SELECT secret FROM Notes"),
+                    Some(columns.clone()),
+                    SqlAuthority::new(write).with_delegated_caveats(true),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.to_string(), "sql_caveat_violation: column");
+            untouched(&calls);
+
+            // A read-tier grant may not write whatever the caveat lists: the
+            // ability refuses first. The read follows the caveat.
+            let error = run(
+                SqlRequest::Execute {
+                    schema: None,
+                    sql: "INSERT INTO Notes (id) VALUES (9)".into(),
+                    params: Vec::new(),
+                },
+                tables(&["Notes"]),
+                &["tinycloud.sql/read"],
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(error, SqlError::ReadOnlyViolation), "{error:?}");
+            assert!(run(
+                query("SELECT id FROM Notes"),
+                tables(&["Notes"]),
+                &["tinycloud.sql/read"]
+            )
+            .await
+            .is_ok());
+            untouched(&calls);
+
+            // A request the caveat allows is kept and persisted once.
+            run(
+                SqlRequest::Execute {
+                    schema: None,
+                    sql: "INSERT INTO plain (a) VALUES (2)".into(),
+                    params: Vec::new(),
+                },
+                tables(&["PLAIN"]),
+                &write,
+            )
+            .await
+            .unwrap();
+            assert_eq!(calls.lock().unwrap().len(), 1);
+            assert_eq!(
+                rows_of(&service, &space, "SELECT a FROM plain ORDER BY a").await,
+                vec![vec![SqlValue::Integer(0)], vec![SqlValue::Integer(2)]]
+            );
+        }
+    }
 }

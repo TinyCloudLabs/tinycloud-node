@@ -325,3 +325,45 @@ impl TryFrom<TinyCloudRevocation> for RevocationInfo {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const RESOURCE: &str =
+        "tinycloud:pkh:eip155:1:0x0000000000000000000000000000000000000001:default/sql/main";
+
+    /// What the node sees as `cap.caveats` for one ability's caveat list.
+    fn seen_by_the_node(list: &str) -> Result<serde_json::Value, serde_json::Error> {
+        let capabilities: UcanCapabilities<serde_json::Value> = serde_json::from_str(&format!(
+            r#"{{"{RESOURCE}": {{"tinycloud.sql/read": {list}}}}}"#
+        ))?;
+        let extracted = extract_ucan_caps(&capabilities);
+        assert_eq!(extracted.len(), 1);
+        Ok(serde_json::to_value(&extracted[0].caveats).unwrap())
+    }
+
+    /// TC-1791: how a caveat list reaches `cap.caveats`, the form every
+    /// delegated-caveat rule reads.
+    #[test]
+    fn a_caveat_list_reaches_the_node_as_entries_keyed_by_index() {
+        use serde_json::json;
+        // One empty entry is collapsed to no caveat at all.
+        assert_eq!(seen_by_the_node("[{}]").unwrap(), json!({}));
+        // Two empty entries are kept, as two empty objects.
+        assert_eq!(
+            seen_by_the_node("[{}, {}]").unwrap(),
+            json!({"0": {}, "1": {}})
+        );
+        assert_eq!(
+            seen_by_the_node(r#"[{"tables": ["Notes"]}]"#).unwrap(),
+            json!({"0": {"tables": ["Notes"]}})
+        );
+        assert_eq!(
+            seen_by_the_node(r#"[{"tables": ["a"]}, {"readOnly": true}]"#).unwrap(),
+            json!({"0": {"tables": ["a"]}, "1": {"readOnly": true}})
+        );
+        // An empty list does not parse at all: no delegation can carry it.
+        assert!(seen_by_the_node("[]").is_err());
+    }
+}
