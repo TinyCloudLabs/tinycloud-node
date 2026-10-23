@@ -135,6 +135,34 @@ impl PostgresTestSchema {
             .await
             .expect("connect to isolated test schema")
     }
+
+    /// Run `sql` on a fresh connection to the schema, from a thread and
+    /// runtime of its own, and block the calling thread until it finishes.
+    /// A `#[tokio::test]` runtime has one thread, so none of its tasks run
+    /// meanwhile: this observes what the caller left behind before any task
+    /// it spawned (such as sqlx's drop-time rollback) could run.
+    pub(crate) fn execute_blocking(&self, sql: &str) -> Result<(), sea_orm::DbErr> {
+        use sea_orm::ConnectionTrait;
+
+        let (url, schema, sql) = (self.url.clone(), self.schema.clone(), sql.to_owned());
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("blocking probe runtime")
+                .block_on(async move {
+                    let mut options = sea_orm::ConnectOptions::new(url);
+                    options
+                        .max_connections(1)
+                        .sqlx_logging(false)
+                        .set_schema_search_path(schema);
+                    let db = sea_orm::Database::connect(options).await?;
+                    db.execute_unprepared(&sql).await.map(|_| ())
+                })
+        })
+        .join()
+        .expect("blocking probe thread")
+    }
 }
 
 impl Drop for PostgresTestSchema {
@@ -148,8 +176,29 @@ impl Drop for PostgresTestSchema {
                 .build()
                 .expect("schema drop runtime")
                 .block_on(async move {
-                    Database::connect(ConnectOptions::new(url))
-                        .await?
+                    let admin = Database::connect(ConnectOptions::new(url)).await?;
+                    // DROP SCHEMA waits for every lock held in the schema. A
+                    // transaction the test dropped without commit or rollback
+                    // is rolled back by a task sqlx spawned on the test's
+                    // runtime, which cannot run while this thread is joined:
+                    // end the sessions still holding locks in the schema
+                    // first, as `DROP DATABASE ... WITH (FORCE)` does for
+                    // `PostgresTestDatabase`.
+                    admin
+                        .execute(Statement::from_sql_and_values(
+                            DbBackend::Postgres,
+                            "SELECT pg_terminate_backend(holders.pid) FROM ( \
+                               SELECT DISTINCT l.pid FROM pg_locks l \
+                               JOIN pg_class c ON c.oid = l.relation \
+                               JOIN pg_namespace n ON n.oid = c.relnamespace \
+                               WHERE l.database = (SELECT oid FROM pg_database \
+                                                   WHERE datname = current_database()) \
+                                 AND n.nspname = $1 AND l.pid <> pg_backend_pid() \
+                             ) holders",
+                            [schema.clone().into()],
+                        ))
+                        .await?;
+                    admin
                         .execute(Statement::from_string(
                             DbBackend::Postgres,
                             format!("DROP SCHEMA IF EXISTS {schema} CASCADE"),
@@ -448,5 +497,44 @@ mod postgres_gate_tests {
     #[should_panic(expected = "requires TINYCLOUD_TEST_POSTGRES_URL")]
     fn blank_url_with_github_actions_true_panics() {
         postgres_gate(some(""), some("true"), None, TEST);
+    }
+}
+
+#[cfg(test)]
+mod postgres_schema_fixture_tests {
+    use std::time::Duration;
+
+    use sea_orm::{ConnectionTrait, TransactionTrait};
+
+    use super::PostgresTestSchema;
+
+    // A transaction dropped without commit or rollback is rolled back by a task
+    // sqlx spawns on the dropping runtime. Dropping the fixture blocks that
+    // runtime's only thread, so the task cannot run and DROP SCHEMA must not
+    // wait for the transaction's locks.
+    #[tokio::test]
+    async fn postgres_schema_drop_ends_a_transaction_left_to_drop_time_rollback() {
+        let Some(fixture) = PostgresTestSchema::new(
+            "postgres_schema_drop_ends_a_transaction_left_to_drop_time_rollback",
+        )
+        .await
+        else {
+            return;
+        };
+        let db = fixture.connect(1).await;
+        let tx = db.begin().await.unwrap();
+        tx.execute_unprepared("SELECT 1 FROM encryption_network FOR UPDATE")
+            .await
+            .unwrap();
+        drop(tx);
+
+        let (done, dropped) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(fixture);
+            let _ = done.send(());
+        });
+        dropped.recv_timeout(Duration::from_secs(30)).expect(
+            "dropping the schema fixture waits on a transaction left to drop-time rollback",
+        );
     }
 }

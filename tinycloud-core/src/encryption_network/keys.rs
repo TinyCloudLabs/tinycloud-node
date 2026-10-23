@@ -6,8 +6,8 @@
 //! module.
 
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DbBackend, DbErr,
-    EntityTrait, PaginatorTrait, QueryFilter, QuerySelect,
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseTransaction,
+    DbBackend, DbErr, EntityTrait, PaginatorTrait, QueryFilter, QuerySelect,
 };
 
 use crate::db::begin_write_transaction;
@@ -158,6 +158,14 @@ async fn lock_network_row<C: ConnectionTrait>(db: &C, network: &NetworkId) -> Re
     Ok(())
 }
 
+/// What `key.create` found or did inside its transaction.
+enum CreateStep {
+    Inserted(encryption_network_key::Model),
+    Existing(encryption_network_key::Model),
+    /// The insert lost a unique-key race to another writer.
+    Raced,
+}
+
 impl EncryptionService {
     /// `key.create`. Idempotent for an identical ACTIVE deterministic key
     /// (returns the existing descriptor). Any other existing row, in any state,
@@ -178,16 +186,52 @@ impl EncryptionService {
         };
         let network = network_of(loc)?;
         let tx = begin_write_transaction(&self.db, None).await?;
-        lock_network_row(&tx, &network).await?;
-        let net = load_active_network(&tx, &network).await?;
+        // Every outcome ends the transaction here. A dropped transaction is
+        // rolled back by a task sqlx spawns, and the network row lock would
+        // outlive this call until that task runs.
+        match self.create_key_in(&tx, &network, loc).await {
+            Ok(CreateStep::Inserted(row)) => {
+                tx.commit().await?;
+                descriptor(row)
+            }
+            Ok(CreateStep::Existing(row)) => {
+                tx.rollback().await?;
+                existing_create_answer(row)
+            }
+            Ok(CreateStep::Raced) => {
+                // Another writer committed the same key first. Roll back, then
+                // answer from the committed row on the pool.
+                tx.rollback().await?;
+                match find_key_row(&self.db, &network, loc.path()).await? {
+                    Some(existing) => existing_create_answer(existing),
+                    None => Err(EncryptionServiceError::KeyExists),
+                }
+            }
+            Err(err) => {
+                // The original error is the answer. A rollback that fails has
+                // lost the connection, which ends the transaction anyway.
+                let _ = tx.rollback().await;
+                Err(err)
+            }
+        }
+    }
 
-        if let Some(existing) = find_key_row(&tx, &network, loc.path()).await? {
-            return existing_create_answer(existing);
+    async fn create_key_in(
+        &self,
+        tx: &DatabaseTransaction,
+        network: &NetworkId,
+        loc: &KeyLocation,
+    ) -> Result<CreateStep, EncryptionServiceError> {
+        lock_network_row(tx, network).await?;
+        let net = load_active_network(tx, network).await?;
+
+        if let Some(existing) = find_key_row(tx, network, loc.path()).await? {
+            return Ok(CreateStep::Existing(existing));
         }
 
         let count = encryption_network_key::Entity::find()
             .filter(encryption_network_key::Column::NetworkId.eq(network.to_string()))
-            .count(&tx)
+            .count(tx)
             .await?;
         if count >= self.key_cap_per_network {
             return Err(EncryptionServiceError::KeyLimitExceeded);
@@ -214,22 +258,11 @@ impl EncryptionService {
             created_at: Set(now.clone()),
             updated_at: Set(now),
         }
-        .insert(&tx)
+        .insert(tx)
         .await;
         match inserted {
-            Ok(row) => {
-                tx.commit().await?;
-                descriptor(row)
-            }
-            Err(err) if is_unique_violation(&err) => {
-                // Another writer committed the same key first. Roll back, then
-                // answer from the committed row on the pool.
-                tx.rollback().await?;
-                match find_key_row(&self.db, &network, loc.path()).await? {
-                    Some(existing) => existing_create_answer(existing),
-                    None => Err(EncryptionServiceError::KeyExists),
-                }
-            }
+            Ok(row) => Ok(CreateStep::Inserted(row)),
+            Err(err) if is_unique_violation(&err) => Ok(CreateStep::Raced),
             Err(err) => Err(err.into()),
         }
     }
