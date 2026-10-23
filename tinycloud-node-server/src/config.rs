@@ -1885,6 +1885,19 @@ mod tests {
     }
 
     #[test]
+    fn encryption_network_named_keys_is_off_by_default() {
+        assert!(!Config::default().encryption_network.named_keys_v1);
+        let config: EncryptionNetworkConfig = toml::from_str("").unwrap();
+        assert!(!config.named_keys_v1);
+    }
+
+    #[test]
+    fn encryption_network_named_keys_parses_from_toml() {
+        let config: EncryptionNetworkConfig = toml::from_str("named_keys_v1 = true").unwrap();
+        assert!(config.named_keys_v1);
+    }
+
+    #[test]
     fn sql_store_parses_from_toml_and_fills_defaults() {
         let config: SqlStoreConfig = toml::from_str(
             r#"

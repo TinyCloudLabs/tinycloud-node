@@ -85,3 +85,9 @@ cors = true
     ## Rollback: TINYCLOUD_DID_RESOLUTION__NETWORK_METHODS=true, then restart.
     ## Issuer queries remain refused. Opt-in uses the unhardened SSI client (TC-1080).
     # network_methods = false
+
+[global.encryption_network]
+    ## Advertise the `encryption-named-keys-v1` feature in GET /info.
+    ## Keep off until named keys are live on OpenKey. Off = feature withheld.
+    ## Env: TINYCLOUD_ENCRYPTION_NETWORK__NAMED_KEYS_V1
+    # named_keys_v1 = false
