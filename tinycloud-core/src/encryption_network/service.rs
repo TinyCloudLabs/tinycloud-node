@@ -205,6 +205,8 @@ pub enum EncryptionServiceError {
     Backend(#[from] KeyBackendError),
     #[error("decrypt request body is malformed: {0}")]
     InvalidBody(String),
+    #[error("receiverPublicKey must be a 32-byte X25519 public key that is not a low-order point")]
+    InvalidReceiverPublicKey,
     #[error("hex decode error: {0}")]
     Base64(&'static str),
     #[error("node response signing failed: {0}")]
@@ -1251,12 +1253,8 @@ fn native_decrypt_facts(
 /// Refuses a receiver key that cannot receive a wrap (wrong length or a low-order point).
 /// Runs before the `/invoke` replay reservation, so a refused request is not consumed.
 fn check_receiver_public_key(receiver_key: &[u8]) -> Result<(), EncryptionServiceError> {
-    validate_receiver_public_key(receiver_key).map_err(|_| {
-        EncryptionServiceError::InvalidBody(
-            "receiverPublicKey must be a 32-byte X25519 public key that is not a low-order point"
-                .to_string(),
-        )
-    })
+    validate_receiver_public_key(receiver_key)
+        .map_err(|_| EncryptionServiceError::InvalidReceiverPublicKey)
 }
 
 fn native_network_admin_facts(

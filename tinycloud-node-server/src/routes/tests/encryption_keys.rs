@@ -1664,6 +1664,41 @@ async fn invoke_refuses_a_key_prefix_as_the_decrypt_target() -> Result<()> {
     Ok(())
 }
 
+/// `InvalidBody` from invocation facts is 403 on `/invoke` and 400 on the direct route.
+#[tokio::test]
+async fn invoke_fact_errors_stay_forbidden_and_direct_route_stays_bad_request() -> Result<()> {
+    let (fixture, network) = setup().await?;
+    let key_public = created_key(&fixture, &network, "docs/a").await;
+    let case = DecryptCase::wrapped_to(&key_public);
+    let resource = key_uri(&network, "docs/a");
+    let (body, _) = decrypt_request(&fixture, &network, &case, Some("docs/a"));
+    for facts in [vec![], vec![json!({ "type": DECRYPT_REQUEST_TYPE })]] {
+        let auth = invocation(
+            &fixture,
+            &fixture.node_did,
+            &[(resource.as_str(), DECRYPT_ACTION)],
+            facts,
+        )?;
+        let (status, text) = invoke(&fixture, &auth, &body).await;
+        assert_eq!(status, Status::Forbidden, "{text}");
+        assert!(!text.contains("wrappedKey"), "{text}");
+    }
+    let root_public = root_public_key(&fixture, &network).await;
+    let root_case = DecryptCase::wrapped_to(&root_public);
+    let (body, _) = decrypt_request(&fixture, &network, &root_case, None);
+    for facts in [vec![], vec![json!({ "type": DECRYPT_REQUEST_TYPE })]] {
+        let auth = invocation(
+            &fixture,
+            &fixture.node_did,
+            &[(network.as_str(), DIRECT_DECRYPT_ABILITY)],
+            facts,
+        )?;
+        let (status, text) = post_json(&fixture.client, &decrypt_url(&network), &auth, &body).await;
+        assert_eq!(status, Status::BadRequest, "{text}");
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn invoke_refuses_sibling_ciphertext_as_key_unwrap_failed() -> Result<()> {
     let (fixture, network) = setup().await?;

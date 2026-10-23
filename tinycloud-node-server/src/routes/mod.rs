@@ -1802,7 +1802,7 @@ async fn invoke_impl(
                 .validate_authorized_decrypt_request(&target, &admitted.invocation().0, &body)
                 .await
                 .map_err(|error| match error {
-                    tinycloud_core::encryption_network::EncryptionServiceError::InvalidBody(_) => {
+                    tinycloud_core::encryption_network::EncryptionServiceError::InvalidReceiverPublicKey => {
                         (Status::BadRequest, error.to_string())
                     }
                     _ => (Status::Forbidden, error.to_string()),

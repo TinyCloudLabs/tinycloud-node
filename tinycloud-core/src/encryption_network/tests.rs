@@ -1567,5 +1567,8 @@ async fn decrypt_authorized_refuses_a_low_order_receiver_key() {
         )
         .await
         .unwrap_err();
-    assert!(matches!(err, EncryptionServiceError::InvalidBody(_)));
+    assert!(matches!(
+        err,
+        EncryptionServiceError::InvalidReceiverPublicKey
+    ));
 }

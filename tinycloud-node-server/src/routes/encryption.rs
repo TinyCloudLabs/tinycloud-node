@@ -655,9 +655,9 @@ fn map_service_err(err: EncryptionServiceError) -> (Status, String) {
         | EncryptionServiceError::KeyUnwrapFailed(_) => Status::Forbidden,
         EncryptionServiceError::CorruptKeyRow => Status::InternalServerError,
         EncryptionServiceError::KeyPathInvalid(_) => Status::BadRequest,
-        EncryptionServiceError::InvalidBody(_) | EncryptionServiceError::Base64(_) => {
-            Status::BadRequest
-        }
+        EncryptionServiceError::InvalidBody(_)
+        | EncryptionServiceError::InvalidReceiverPublicKey
+        | EncryptionServiceError::Base64(_) => Status::BadRequest,
     };
     (status, err.to_string())
 }
