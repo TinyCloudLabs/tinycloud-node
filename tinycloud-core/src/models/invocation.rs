@@ -498,7 +498,11 @@ async fn validate_capabilities<C: ConnectionTrait>(
                 let mut last_reason: Option<String> = None;
                 let mut authorized = false;
                 for pc in candidates {
-                    match caveats_contain_child(&pc.caveats, &c.caveats) {
+                    match ability_caveats_contain_child(
+                        c.ability.as_ref().as_ref(),
+                        &pc.caveats,
+                        &c.caveats,
+                    ) {
                         Ok(()) => {
                             authorized = true;
                             break;
@@ -539,8 +543,13 @@ async fn validate_capabilities<C: ConnectionTrait>(
                                 ability.ability.as_ref().as_ref(),
                                 c.ability.as_ref().as_ref(),
                             )
-                            && caveats_contain_child(&ability.caveats, &c.caveats).is_ok()
-                            && crate::models::delegation::unsupported_sql_caveat(
+                            && ability_caveats_contain_child(
+                                c.ability.as_ref().as_ref(),
+                                &ability.caveats,
+                                &c.caveats,
+                            )
+                            .is_ok()
+                            && crate::models::delegation::unsupported_stored_sql_caveat(
                                 ability.ability.as_ref().as_ref(),
                                 &ability.caveats,
                             )
@@ -586,6 +595,38 @@ fn caveats_contain_child(parent: &Caveats, child: &Caveats) -> Result<(), String
             }
         }
     }
+}
+
+/// TC-1791: [`caveats_contain_child`] for one invoked ability. A stored
+/// delegated `tables` / `columns` / `readOnly` form on a SQL ability does not
+/// refuse an invocation whose own capability carries no caveat: the restriction
+/// is applied to the request from the whole chain when it executes. An
+/// invocation capability that carries a delegated form of its own is refused by
+/// the `unsupported_sql_caveat` check below.
+fn ability_caveats_contain_child(
+    ability: &str,
+    parent: &Caveats,
+    child: &Caveats,
+) -> Result<(), String> {
+    if ability.starts_with("tinycloud.sql/") {
+        use crate::sql::delegated_caveats::{classify, AbilityCaveats, Reading};
+        match (
+            classify(parent, Reading::Stored),
+            classify(child, Reading::Stored),
+        ) {
+            (Ok(AbilityCaveats::Form(_)), Ok(AbilityCaveats::Unrestricted)) => return Ok(()),
+            (Ok(AbilityCaveats::Form(_)), _) => {
+                return Err("invocation-caveats-not-subset-of-chain".to_string());
+            }
+            // A parent of only empty entries imposes nothing, whatever shape
+            // the empty entries take.
+            (Ok(AbilityCaveats::Unrestricted), Ok(_)) if !parent.0.is_empty() => {
+                return caveats_contain_child(&Caveats::default(), child);
+            }
+            _ => {}
+        }
+    }
+    caveats_contain_child(parent, child)
 }
 
 /// Parses the constrained-statements profile carried by one capability's caveats.
@@ -1675,6 +1716,78 @@ mod tests {
         )
         .await
         .expect("a matching constrained-statements grant authorizes");
+    }
+
+    fn delegated_form_caveat(list: serde_json::Value) -> Caveats {
+        Caveats(BTreeMap::from([("0".to_string(), list)]))
+    }
+
+    /// TC-1791: a stored delegated `tables` form does not refuse an invocation
+    /// whose own capability carries no caveat (the chain's restriction is applied
+    /// when the request runs), and an invocation cannot carry the form itself.
+    #[tokio::test]
+    async fn stored_delegated_form_covers_an_invocation_without_a_caveat() {
+        let resource = "tinycloud:did:key:owner/sql/db";
+        let stored = delegated_form_caveat(serde_json::json!({"tables": ["a"]}));
+        let (db, parent) = caveat_chain_db(resource, "tinycloud.sql/read", stored).await;
+        crate::models::invocation::authorize_holder(
+            &db,
+            "did:key:alias",
+            &[caveat_capability(
+                resource,
+                "tinycloud.sql/read",
+                Caveats::default(),
+            )],
+            &[parent],
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .expect("a stored delegated form covers an invocation without a caveat");
+
+        for own in [
+            delegated_form_caveat(serde_json::json!({"tables": ["a"]})),
+            delegated_form_caveat(serde_json::json!({"tables": ["b"]})),
+            make_sql_constrained_caveat("get", "SELECT 1"),
+        ] {
+            let err = crate::models::invocation::authorize_holder(
+                &db,
+                "did:key:alias",
+                &[caveat_capability(resource, "tinycloud.sql/read", own)],
+                &[parent],
+                OffsetDateTime::now_utc(),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(&err, Error::InvalidInvocation(_)),
+                "unexpected rejection: {err:?}"
+            );
+        }
+    }
+
+    /// TC-1791: a stored grant of only empty entries imposes nothing.
+    #[tokio::test]
+    async fn stored_grant_of_only_empty_entries_covers_any_invocation() {
+        let resource = "tinycloud:did:key:owner/sql/db";
+        let stored = Caveats(BTreeMap::from([
+            ("0".to_string(), serde_json::json!({})),
+            ("1".to_string(), serde_json::json!({})),
+        ]));
+        let (db, parent) = caveat_chain_db(resource, "tinycloud.sql/read", stored).await;
+        for own in [
+            Caveats::default(),
+            make_sql_constrained_caveat("get", "SELECT 1"),
+        ] {
+            crate::models::invocation::authorize_holder(
+                &db,
+                "did:key:alias",
+                &[caveat_capability(resource, "tinycloud.sql/read", own)],
+                &[parent],
+                OffsetDateTime::now_utc(),
+            )
+            .await
+            .expect("empty entries restrict nothing");
+        }
     }
 
     #[tokio::test]

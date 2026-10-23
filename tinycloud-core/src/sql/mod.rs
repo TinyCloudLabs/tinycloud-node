@@ -2,6 +2,7 @@ pub mod authority;
 pub mod authorizer;
 pub mod caveats;
 pub mod database;
+pub mod delegated_caveats;
 pub mod parser;
 pub mod service;
 pub mod storage;

@@ -194,16 +194,28 @@ pub enum DelegationError {
 /// Returns `New` when the exact serialization was inserted (and actors,
 /// abilities, and parents written). Returns `Existing` when the hash was
 /// already present; no dependent rows are duplicated in that case.
+#[cfg(test)]
 pub(crate) async fn process<C: ConnectionTrait>(
     db: &C,
     delegation: &Delegation,
     encryption: Option<&ColumnEncryption>,
 ) -> Result<DelegationRegistration, Error> {
+    process_with(db, delegation, encryption, false).await
+}
+
+/// As `process`; with `delegated_sql_caveats` a SQL capability may carry the
+/// delegated `tables` / `columns` / `readOnly` caveat form (TC-1791).
+pub(crate) async fn process_with<C: ConnectionTrait>(
+    db: &C,
+    delegation: &Delegation,
+    encryption: Option<&ColumnEncryption>,
+    delegated_sql_caveats: bool,
+) -> Result<DelegationRegistration, Error> {
     verify(&delegation.0.delegation).await?;
     for space in delegation.0.spaces() {
         crate::request_telemetry::observe_space(space);
     }
-    validate(db, &delegation.0).await?;
+    validate_with(db, &delegation.0, delegated_sql_caveats).await?;
     save(db, delegation.0.clone(), delegation.1.clone(), encryption).await
 }
 
@@ -272,22 +284,70 @@ pub(crate) fn unsupported_sql_caveat(
     })
 }
 
-fn check_sql_caveats_supported(cap: &util::Capability) -> Result<(), Error> {
-    match unsupported_sql_caveat(cap.ability.as_ref().as_ref(), &cap.caveats) {
+/// Reason a SQL or DuckDB capability's caveats are refused at admission. With
+/// `delegated_sql_caveats` a SQL capability may also carry the delegated
+/// `tables` / `columns` / `readOnly` form; DuckDB is unchanged.
+pub(crate) fn unsupported_sql_caveat_at_ingress(
+    ability: &str,
+    caveats: &crate::types::Caveats,
+    delegated_sql_caveats: bool,
+) -> Option<String> {
+    use crate::sql::delegated_caveats::{classify, Reading};
+    if delegated_sql_caveats && ability.starts_with("tinycloud.sql/") {
+        return classify(caveats, Reading::Ingress)
+            .err()
+            .map(|refusal| refusal.reason(ability));
+    }
+    unsupported_sql_caveat(ability, caveats)
+}
+
+/// As [`unsupported_sql_caveat`], for a row already stored: the delegated form
+/// is read whatever the admission setting is today.
+pub(crate) fn unsupported_stored_sql_caveat(
+    ability: &str,
+    caveats: &crate::types::Caveats,
+) -> Option<String> {
+    use crate::sql::delegated_caveats::{classify, Reading};
+    if ability.starts_with("tinycloud.sql/") {
+        return classify(caveats, Reading::Stored)
+            .err()
+            .map(|refusal| refusal.reason(ability));
+    }
+    unsupported_sql_caveat(ability, caveats)
+}
+
+fn check_sql_caveats_supported(
+    cap: &util::Capability,
+    delegated_sql_caveats: bool,
+) -> Result<(), Error> {
+    match unsupported_sql_caveat_at_ingress(
+        cap.ability.as_ref().as_ref(),
+        &cap.caveats,
+        delegated_sql_caveats,
+    ) {
         Some(reason) => Err(DelegationError::UnsupportedCaveat(reason).into()),
         None => Ok(()),
     }
 }
 
 // verify parenthood and authorization
+#[cfg(test)]
 async fn validate<C: ConnectionTrait>(
     db: &C,
     delegation: &util::DelegationInfo,
 ) -> Result<(), Error> {
+    validate_with(db, delegation, false).await
+}
+
+async fn validate_with<C: ConnectionTrait>(
+    db: &C,
+    delegation: &util::DelegationInfo,
+    delegated_sql_caveats: bool,
+) -> Result<(), Error> {
     // TC-1791: SQL and DuckDB caveats are checked for every delegation,
     // before the root-authority filter.
     for cap in &delegation.capabilities {
-        check_sql_caveats_supported(cap)?;
+        check_sql_caveats_supported(cap, delegated_sql_caveats)?;
     }
     // Key deletion is never delegated, including by the key's owner.
     if delegation.capabilities.iter().any(|cap| {
@@ -527,7 +587,11 @@ async fn validate<C: ConnectionTrait>(
                 let mut last_reason: Option<String> = None;
                 let mut authorized = false;
                 for pc in candidates {
-                    match caveats_contain_child(&pc.caveats, &c.caveats) {
+                    match caveats_contain_child(
+                        c.ability.as_ref().as_ref(),
+                        &pc.caveats,
+                        &c.caveats,
+                    ) {
                         Ok(()) => {
                             authorized = true;
                             break;
@@ -775,12 +839,39 @@ fn validate_policy_descendant(
 /// caveat (delegating to `sql_caveat::contains` for narrow/identical chain
 /// shapes) and otherwise requires structural equality so a child cannot
 /// silently drop or replace caveats the parent carried.
-fn caveats_contain_child(parent: &Caveats, child: &Caveats) -> Result<(), String> {
+fn caveats_contain_child(ability: &str, parent: &Caveats, child: &Caveats) -> Result<(), String> {
     if let Some(contained) = crate::policy_capability::selector_caveats_contain(&parent.0, &child.0)
     {
         return contained
             .then_some(())
             .ok_or_else(|| "selector-caveat-not-contained".to_string());
+    }
+    // TC-1791: delegated tables / columns / readOnly caveats on SQL
+    // abilities. The parent decides which axes the child may not widen.
+    if ability.starts_with("tinycloud.sql/") {
+        use crate::sql::delegated_caveats::{classify, AbilityCaveats, DelegatedCaveat, Reading};
+        match (
+            classify(parent, Reading::Stored),
+            classify(child, Reading::Stored),
+        ) {
+            (Ok(AbilityCaveats::Form(p)), Ok(AbilityCaveats::Form(c))) => {
+                return p.contains(&c).map_err(str::to_string);
+            }
+            (Ok(AbilityCaveats::Form(p)), Ok(AbilityCaveats::Unrestricted)) => {
+                return p
+                    .contains(&DelegatedCaveat::default())
+                    .map_err(str::to_string);
+            }
+            (Ok(AbilityCaveats::Form(_)), Ok(AbilityCaveats::Profile)) => {
+                return Err("sql-caveats-mixed".to_string());
+            }
+            // A parent of only empty entries imposes nothing, whatever shape
+            // the empty entries take.
+            (Ok(AbilityCaveats::Unrestricted), Ok(_)) if !parent.0.is_empty() => {
+                return caveats_contain_child("", &Caveats::default(), child);
+            }
+            _ => {}
+        }
     }
     let parent_sql = extract_sql_caveat(parent);
     let child_sql = extract_sql_caveat(child);
@@ -1866,5 +1957,73 @@ mod tests {
             ),
             "terminal parent accepted for redelegation"
         );
+    }
+
+    fn wire(list: serde_json::Value) -> Caveats {
+        let entries = list.as_array().expect("a list");
+        if entries.len() == 1 && entries[0] == serde_json::json!({}) {
+            return Caveats::default();
+        }
+        Caveats(
+            entries
+                .iter()
+                .enumerate()
+                .map(|(index, entry)| (index.to_string(), entry.clone()))
+                .collect(),
+        )
+    }
+
+    /// TC-1791: the per-hop containment of the delegated form goes through the
+    /// same `caveats_contain_child` as every other caveat (S1 to S8).
+    #[test]
+    fn delegated_form_hops_are_contained_per_axis() {
+        use serde_json::json;
+        const SQL: &str = "tinycloud.sql/read";
+        let ok = |parent: serde_json::Value, child: serde_json::Value| {
+            caveats_contain_child(SQL, &wire(parent), &wire(child))
+        };
+        assert!(ok(
+            json!([{"tables": ["Notes", "t2"]}]),
+            json!([{"tables": ["Notes"]}])
+        )
+        .is_ok()); // S1
+        assert!(ok(
+            json!([{"tables": ["Notes"]}]),
+            json!([{"tables": ["Notes", "plain"]}])
+        )
+        .is_err()); // S2
+        assert!(ok(json!([{}]), json!([{"tables": ["Notes"]}])).is_ok()); // S3
+        assert!(ok(json!([{"readOnly": true}]), json!([{"readOnly": false}])).is_err()); // S4
+        assert!(ok(json!([{"readOnly": true}]), json!([{}])).is_err()); // S4
+        assert!(ok(json!([{}]), json!([{"readOnly": true}])).is_ok()); // S4
+        assert!(ok(
+            json!([{"columns": ["id"]}]),
+            json!([{"columns": ["id", "body"]}])
+        )
+        .is_err()); // S5
+        assert!(ok(json!([{"columns": ["id"]}]), json!([{"columns": ["id"]}])).is_ok()); // S5
+        assert!(ok(
+            json!([{"tables": ["notes"]}]),
+            json!([{"tables": ["NOTES"]}])
+        )
+        .is_ok()); // S6
+        assert!(ok(json!([{}]), json!([{}])).is_ok()); // S7
+        assert!(ok(json!([{"tables": ["a"]}]), json!([{}])).is_err()); // S7
+        assert!(ok(json!([{"tables": ["Notes"]}]), json!([{"readOnly": true}])).is_err()); // S8
+                                                                                           // A parent of only empty entries imposes nothing, in any shape.
+        assert!(ok(json!([{}, {}]), json!([{"tables": ["a"]}])).is_ok());
+        assert!(ok(json!([{}, {}]), json!([{}])).is_ok());
+        assert!(ok(json!([{}, {}]), json!([{}, {}])).is_ok());
+        // A profile and the delegated form do not mix across a hop.
+        let profile = json!({"mode": "constrained-statements", "readOnly": true,
+                             "statements": [{"name": "n", "sql": "SELECT 1"}]});
+        assert!(ok(json!([{"tables": ["a"]}]), json!([profile.clone()])).is_err());
+        assert!(ok(json!([profile]), json!([{"tables": ["a"]}])).is_err());
+        // Other services keep the earlier rule: equal caveats or an empty parent.
+        let kv = |parent: serde_json::Value, child: serde_json::Value| {
+            caveats_contain_child("tinycloud.kv/get", &wire(parent), &wire(child))
+        };
+        assert!(kv(json!([{}, {}]), json!([{"tables": ["a"]}])).is_err());
+        assert!(kv(json!([{}]), json!([{"tables": ["a"]}])).is_ok());
     }
 }

@@ -325,6 +325,9 @@ fn build_info(
     if config.encryption_network.named_keys_v1 {
         features.push("encryption-named-keys-v1");
     }
+    if config.sql.delegated_caveats_enforced {
+        features.push("sql-delegated-caveats-v1");
+    }
     NodeInfo {
         protocol: tinycloud_auth::protocol::PROTOCOL_VERSION,
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -10211,7 +10214,8 @@ mod tests {
             Either::B(storage),
             StaticSecret::new(vec![0u8; 32]).unwrap(),
         )
-        .await?;
+        .await?
+        .with_delegated_sql_caveats(config.sql.delegated_caveats_enforced);
         let conn = db;
         space_model::ActiveModel {
             id: Set(SpaceIdWrap(space.clone())),

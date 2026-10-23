@@ -165,6 +165,7 @@ pub struct SpaceDatabase<C, B, S> {
     secrets: S,
     encryption: Option<ColumnEncryption>,
     sql_sizes: SqlSizes,
+    delegated_sql_caveats: bool,
     revocation_chain_locks: ChainLockRegistry,
     kv_object_locks: KvObjectLockRegistry,
     space_sequence_locks: SpaceSequenceLockRegistry,
@@ -423,6 +424,7 @@ where
             secrets,
             encryption,
             sql_sizes: SqlSizes::default(),
+            delegated_sql_caveats: false,
             revocation_chain_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             kv_object_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             space_sequence_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -432,6 +434,14 @@ where
                 crate::database_migration::EffectiveFenceCache::default(),
             ),
         })
+    }
+
+    /// Admit the delegated `tables` / `columns` / `readOnly` caveat form on
+    /// `tinycloud.sql/*` abilities (TC-1791). Off by default: such a
+    /// delegation is refused as an unsupported caveat.
+    pub fn with_delegated_sql_caveats(mut self, enabled: bool) -> Self {
+        self.delegated_sql_caveats = enabled;
+        self
     }
 
     pub fn with_sql_sizes(mut self, sql_sizes: SqlSizes) -> Self {
@@ -1652,6 +1662,7 @@ where
             self.encryption.as_ref(),
             None,
             &[],
+            self.delegated_sql_caveats,
         )
         .await?;
 
@@ -1942,6 +1953,7 @@ where
             self.encryption.as_ref(),
             None,
             &[],
+            self.delegated_sql_caveats,
         )
         .await
     }
@@ -2416,6 +2428,7 @@ where
             Some(&auth_graph),
             // Taken on this `tx` right after BEGIN, above.
             &sequence_spaces,
+            self.delegated_sql_caveats,
         )
         .await?;
 
@@ -3289,6 +3302,7 @@ async fn event_spaces<'a, C: ConnectionTrait>(
 /// `sequence_locks_held` lists the spaces whose sequence lock the caller has
 /// already taken on `db` (this same transaction) with
 /// `kv_sync::lock_space_sequences`; `&[]` when it has taken none.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
     db: &C,
     store_setup: &S,
@@ -3297,6 +3311,7 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
     encryption: Option<&ColumnEncryption>,
     auth_graph: Option<&crate::auth_graph::AuthGraphSnapshot>,
     sequence_locks_held: &[SpaceId],
+    delegated_sql_caveats: bool,
 ) -> Result<TransactResult, TxError<S, K>> {
     // for each event, get the hash and the relevent space(s)
     let event_hashes = events
@@ -3321,7 +3336,7 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
     let mut registered: HashMap<Hash, delegation::DelegationRegistration> = HashMap::new();
     for (hash, event) in &event_hashes {
         if let Event::Delegation(d) = event {
-            let reg = delegation::process(db, d, encryption).await?;
+            let reg = delegation::process_with(db, d, encryption, delegated_sql_caveats).await?;
             registered.insert(*hash, reg);
         }
     }
