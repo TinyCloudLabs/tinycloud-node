@@ -5,7 +5,7 @@ const schema = JSON.parse(readFileSync(new URL('./fields.json', import.meta.url)
 const longest = values => values.reduce((chosen, value) => Buffer.byteLength(value) > Buffer.byteLength(chosen) ? value : chosen, '');
 /** Event codes that ship as individual events, outside the count reducer (TC-1840). */
 export const INDIVIDUAL_EVENT_CODES = Object.freeze(['db_failure_5xx']);
-/** Event codes the shipper emits itself; no node log line maps to them (TC-1840). */
+/** Event codes the shipper emits itself; no node log line maps to them (TC-1843). */
 export const SHIPPER_EVENT_CODES = Object.freeze(['errors_dropped']);
 const aggregatedCodes = schema.fields.event_code.values.filter(code => !INDIVIDUAL_EVENT_CODES.includes(code) && !SHIPPER_EVENT_CODES.includes(code));
 
@@ -22,14 +22,19 @@ export const CAP_WINDOW_SECONDS = 60;
  */
 export const CAPPED_ALLOCATION_BYTES = 600_000_000;
 /**
- * Per-minute caps (TC-1840): db_failure_5xx is the node's 5xx diagnostic event; node_request_5xx and
- * ingress_request_5xx are the node and ingress request events with status >= 500. `representative` names the
- * worst-valid event in representativeEvents used for the size arithmetic.
+ * Per-minute caps (TC-1843): db_failure_5xx is the node's 5xx diagnostic event; node_request_5xx and
+ * ingress_request_5xx are the node and ingress request events with status >= 500; node_request_4xx and
+ * ingress_request_4xx are the node and ingress request events with status 400 to 499. `representative` names the
+ * worst-valid event in representativeEvents used for the size arithmetic (its status is three digits, as in 4xx).
+ * The 4xx cap is the largest whole number that keeps the worst case, including one dropped-count event per class
+ * per minute, within CAPPED_ALLOCATION_BYTES: 3 (a cap of 4 gives 614,001,600 bytes).
  */
 export const CAPPED_CLASSES = Object.freeze({
   db_failure_5xx: Object.freeze({ capPerMinute: 10, representative: 'dbFailure' }),
   node_request_5xx: Object.freeze({ capPerMinute: 10, representative: 'node' }),
   ingress_request_5xx: Object.freeze({ capPerMinute: 10, representative: 'ingress' }),
+  node_request_4xx: Object.freeze({ capPerMinute: 3, representative: 'node' }),
+  ingress_request_4xx: Object.freeze({ capPerMinute: 3, representative: 'ingress' }),
 });
 
 const common = { level: 'info', ts: '9999-12-31T23:59:59.999Z' };
@@ -84,8 +89,8 @@ export function serializedEventBytes(event, framing = 'ndjson') {
 /**
  * Full individual-request retention: each request costs one node plus one ingress
  * event. This is arithmetic only: no sampling, aggregation or sink cap applies to the
- * requests counted here. The classes in CAPPED_CLASSES (5xx request events and the 5xx
- * diagnostic) are capped per window and are reserved separately below.
+ * requests counted here (status below 400). The classes in CAPPED_CLASSES (request events with status 400 and
+ * above and the 5xx diagnostic) are capped per window and are reserved separately below.
  * Diagnostic and gate group-rate assumptions reserve additional bytes separately;
  * defaults are conservative planning rates, NOT guaranteed emission ceilings.
  * The shared Better Stack 3 GB free tier is shared with other sources and is NOT

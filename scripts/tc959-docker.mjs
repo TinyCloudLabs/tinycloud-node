@@ -16,7 +16,7 @@ import { owner, assertHostedRunner, cleanupOwnedResources, burstEvidence, assert
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const token = 'TC959_SYNTHETIC_HOSTED_SINK_BEARER';
-const burstFirst = 100000; // Fast errors: all 500 markers remain below the slow threshold.
+const burstFirst = 2000000; // Slow successes: every marker is above the 1 s slow threshold (forwarded) and no marker is a capped 4xx/5xx event.
 const burstSize = 500;
 const fastMarker = 800000;
 const methods = new Set(['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', '<other>']);
@@ -510,7 +510,9 @@ export async function main(args = process.argv.slice(2)) {
       if (probe.status === 0) reverseReachable++;
       assert.equal(inspect(names.vector).State.Running, true);
     }
-    const gelf = latency_us => JSON.stringify({ version: '1.1', host: 'synthetic', short_message: JSON.stringify(nodeRequest({ method: 'GET', route: '/healthz', status: 503, latency_us })), '_tc.logship': 'tinycloud-node', timestamp: Date.now() / 1000 });
+    // Control sends are slow status-200 requests: errors_slow forwards them, and no per-minute cap (status 400 and above) covers them,
+    // so a real 4xx or 5xx never shares a window with them. A control accepted from the wrong network would be forwarded.
+    const gelf = latency_us => JSON.stringify({ version: '1.1', host: 'synthetic', short_message: JSON.stringify(nodeRequest({ method: 'GET', route: '/healthz', status: 200, latency_us })), '_tc.logship': 'tinycloud-node', timestamp: Date.now() / 1000 });
     const hostControl = 7654322;
     const peerControl = 7654323;
     const injected = 7654321;
@@ -550,10 +552,11 @@ export async function main(args = process.argv.slice(2)) {
     cpuBefore = cpu();
     startedAt = Date.now();
     sample();
-    // 429, not a 5xx: status >= 500 request events are capped per minute (TC-1843), and this burst measures transport loss.
-    const payload = JSON.stringify(nodeRequest({ route: '/healthz', status: 429, latency_us: '__MARKER__', authorization: canary, uri: canary }));
+    // Status 200 with a latency above the slow threshold: errors_slow forwards it, and it is outside the per-minute caps on
+    // request events with status >= 400 (TC-1843), so the burst still measures transport loss.
+    const payload = JSON.stringify(nodeRequest({ route: '/healthz', status: 200, latency_us: '__MARKER__', authorization: canary, uri: canary }));
     const [prefix, suffix] = payload.split('"__MARKER__"');
-    // One exec; 500 distinct 429 lines, no sleeps, no pacing, no emission reduction.
+    // One exec; 500 distinct slow-success lines, no sleeps, no pacing, no emission reduction.
     const emitted = docker('exec', names.emitter, '/bin/sh', '-ec', 'i=0; while [ "$i" -lt 500 ]; do printf "%s%s%s\\n" "$1" "$(($3+i))" "$2" || exit 71; i=$((i+1)); done > /proc/1/fd/1; printf "%s\\n" "$i" > /tmp/tc959-emitted-count; printf "%s\\n" "$i"', 'burst', prefix, suffix, String(burstFirst));
     assert.match(emitted, /^500$/);
     burstSent = Number(emitted);
@@ -575,7 +578,7 @@ export async function main(args = process.argv.slice(2)) {
     assert.ok(Date.now() - continuityStart < 15000);
     docker('unpause', names.vector);
     const resumeMarker = 7654324;
-    emit(JSON.stringify(nodeRequest({ route: '/healthz', status: 503, latency_us: resumeMarker })));
+    emit(JSON.stringify(nodeRequest({ route: '/healthz', status: 200, latency_us: resumeMarker })));
     await waitFor(() => capture().events.some(event => event.latency_us === resumeMarker));
     report.continuity_requests = 30;
     report.resumed_delivery = true;
@@ -600,7 +603,7 @@ export async function main(args = process.argv.slice(2)) {
     emitDiagnostic('error', 'ERROR', 'native share KV put failed');
     emitDiagnostic('unclassified', 'WARN', undefined, 'hyper::proto');
     emitDiagnostic('dependency_error', 'ERROR', undefined, 'sqlx::pool');
-    emit(JSON.stringify(nodeRequest({ route: `/signed/kv/${canary}`, status: 503 })));
+    emit(JSON.stringify(nodeRequest({ route: `/signed/kv/${canary}`, status: 200 })));
     emit(`raw panic ${canary}`);
     sample();
     await waitFor(() => {

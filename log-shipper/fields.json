@@ -92,7 +92,7 @@
         "elapsed_ms": { "type": "integer", "min": 0, "max": 9007199254740991 },
         "failure_kind": { "type": "enum", "values": ["pool_timeout", "pool_closed", "io", "statement_timeout", "serialization", "connection_lost", "artifact_changed", "lock_wait", "hydration", "artifact_transfer", "request_timeout", "read_audit_busy", "other"] },
         "write_may_have_applied": { "type": "boolean" },
-        "class": { "type": "enum", "values": ["db_failure_5xx", "node_request_5xx", "ingress_request_5xx"] },
+        "class": { "type": "enum", "values": ["db_failure_5xx", "node_request_5xx", "ingress_request_5xx", "node_request_4xx", "ingress_request_4xx"] },
         "dropped": { "type": "integer", "min": 1, "max": 9007199254740991 },
         "window_s": { "type": "integer", "min": 60, "max": 60 }
       }

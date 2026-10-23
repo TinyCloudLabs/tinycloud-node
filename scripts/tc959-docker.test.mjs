@@ -82,11 +82,11 @@ test('capture accepts the dropped-count event with exactly class, dropped and wi
   const fields = JSON.parse(readFileSync(new URL('../log-shipper/fields.json', import.meta.url), 'utf8')).services['tinycloud-node'].fields;
   const dropped = { ts: request.ts, level: 'warn', event: 'node_warning', svc: 'api', event_code: 'errors_dropped', class: 'node_request_5xx', dropped: 7, window_s: 60 };
   assert.doesNotThrow(() => assertCapture([dropped], fields));
-  for (const cls of ['db_failure_5xx', 'node_request_5xx', 'ingress_request_5xx']) assert.doesNotThrow(() => assertCapture([{ ...dropped, class: cls }], fields));
+  for (const cls of ['db_failure_5xx', 'node_request_5xx', 'ingress_request_5xx', 'node_request_4xx', 'ingress_request_4xx']) assert.doesNotThrow(() => assertCapture([{ ...dropped, class: cls }], fields));
   assert.doesNotThrow(() => assertCapture([{ ...dropped, dropped: Number.MAX_SAFE_INTEGER }], fields));
   for (const bad of [
     { event_count: 1 }, { message: 'TC959_SYNTHETIC' }, { sql: 'select 1' }, { route: '/invoke' }, { status: 503 }, { db_hash: 'a'.repeat(64) },
-    { class: 'node_request_4xx' }, { class: 'unclassified' }, { class: '' }, { class: 'node_request_5xx ' }, { class: null },
+    { class: 'node_request_3xx' }, { class: 'db_failure_4xx' }, { class: 'request_4xx' }, { class: 'NODE_REQUEST_4XX' }, { class: 'unclassified' }, { class: '' }, { class: 'node_request_5xx ' }, { class: null },
     { dropped: 0 }, { dropped: -1 }, { dropped: 1.5 }, { dropped: '7' }, { dropped: null }, { dropped: Number.MAX_SAFE_INTEGER + 1 },
     { window_s: 0 }, { window_s: 59 }, { window_s: 61 }, { window_s: '60' }, { window_s: null },
     { level: 'error' }, { level: 'info' }, { svc: 'ingress' }, { event: 'node_error' },
@@ -127,7 +127,7 @@ test('cleanup validates the entire ownership boundary before deleting anything',
 });
 
 test('healthy burst requires its exact distinct set, not a compensating duplicate or a fast success', () => {
-  const events = Array.from({ length: 500 }, (_, index) => ({ ...request, status: 429, latency_us: 9000000 + index }));
+  const events = Array.from({ length: 500 }, (_, index) => ({ ...request, status: 200, latency_us: 9000000 + index }));
   assert.deepEqual(burstEvidence(events, 9000000, 500), { expected: 500, received: 500, unique: 500, missing: [], duplicates: [] });
   assert.doesNotThrow(() => assertHealthyBurst(events, 9000000, 500, 500));
   assert.throws(() => assertHealthyBurst(events, 9000000, 500, 499));
@@ -139,7 +139,7 @@ test('healthy burst requires its exact distinct set, not a compensating duplicat
   assert.throws(() => assertHealthyBurst(compensated, 9000000, 500, 500));
   assert.throws(() => assertHealthyBurst(events.slice(1), 9000000, 500, 500));
   assert.equal(burstEvidence([{ ...request, latency_us: 8000000 }], 9000000, 500).received, 0);
-  assert.equal(burstEvidence([{ ...events[0], status: 503 }], 9000000, 500).received, 0, 'a capped 5xx is not burst evidence');
+  for (const status of [429, 503]) assert.equal(burstEvidence([{ ...events[0], status }], 9000000, 500).received, 0, `a capped ${status} is not burst evidence`);
 });
 
 test('timed per-hop evidence distinguishes continued drainage from an observed plateau', () => {

@@ -21,12 +21,12 @@ test('runtime profile interpolation is an explicit boolean compiler choice', () 
   }
 });
 
-test('the real sink receives the uncapped requests, the three cap transforms, the count reducers and the gate counts; the reducer only the counted diagnostics (TC-1840, TC-1843)', () => {
+test('the real sink receives the uncapped requests, the five cap transforms, the count reducers and the gate counts; the reducer only the counted diagnostics (TC-1843)', () => {
   for (const profile of ['errors_slow', 'all_requests']) {
     const { sinks, transforms } = buildConfig({ profile });
-    assert.deepEqual(sinks.betterstack.inputs, ['event_route.request', 'cap_db_failure_5xx', 'cap_node_request_5xx', 'cap_ingress_request_5xx', 'diagnostic_output', 'gate_output']);
+    assert.deepEqual(sinks.betterstack.inputs, ['event_route.request', 'cap_db_failure_5xx', 'cap_node_request_5xx', 'cap_ingress_request_5xx', 'cap_node_request_4xx', 'cap_ingress_request_4xx', 'diagnostic_output', 'gate_output']);
     assert.deepEqual(transforms.diagnostic_reduce.inputs, ['event_route.diagnostic']);
-    assert.deepEqual(Object.keys(transforms.event_route.route), ['request', 'node_request_5xx', 'ingress_request_5xx', 'db_failure_5xx', 'diagnostic']);
+    assert.deepEqual(Object.keys(transforms.event_route.route), ['request', 'node_request_5xx', 'ingress_request_5xx', 'node_request_4xx', 'ingress_request_4xx', 'db_failure_5xx', 'diagnostic']);
     assert.match(transforms.event_route.route.diagnostic, /event_code != "db_failure_5xx"/);
   }
 });
@@ -34,7 +34,7 @@ test('the real sink receives the uncapped requests, the three cap transforms, th
 test('each capped class reaches the sink only through its own cap transform, with the stated cap and window (TC-1843)', () => {
   for (const profile of ['errors_slow', 'all_requests']) {
     const { sinks, transforms } = buildConfig({ profile });
-    assert.deepEqual(Object.keys(CAPPED_CLASSES), ['db_failure_5xx', 'node_request_5xx', 'ingress_request_5xx']);
+    assert.deepEqual(Object.keys(CAPPED_CLASSES), ['db_failure_5xx', 'node_request_5xx', 'ingress_request_5xx', 'node_request_4xx', 'ingress_request_4xx']);
     assert.equal(CAP_WINDOW_SECONDS, 60);
     for (const [name, { capPerMinute }] of Object.entries(CAPPED_CLASSES)) {
       const cap = transforms[`cap_${name}`];
@@ -54,10 +54,10 @@ test('each capped class reaches the sink only through its own cap transform, wit
   }
 });
 
-test('the uncapped request route feeds only the sink, and the only caps are the three Lua cap transforms (TC-1843)', () => {
+test('the uncapped request route feeds only the sink, and the only caps are the five Lua cap transforms (TC-1843)', () => {
   const { sinks, transforms } = buildConfig();
   const types = Object.values(transforms).map(node => node.type);
-  assert.equal(types.filter(type => type === 'lua').length, 3);
+  assert.equal(types.filter(type => type === 'lua').length, 5);
   for (const type of ['throttle', 'sample', 'dedupe']) assert.equal(types.includes(type), false);
   const nodes = { ...transforms, ...sinks };
   assert.deepEqual(Object.keys(nodes).filter(id => nodes[id].inputs?.includes('event_route.request')), ['betterstack']);

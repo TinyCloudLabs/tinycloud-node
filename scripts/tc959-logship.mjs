@@ -10,6 +10,7 @@ export const nodeImage = 'ghcr.io/tinycloudlabs/tinycloud-node@sha256:4bdae4fc23
 export const ingressImage = 'ghcr.io/tinycloudlabs/tinycloud-node-ingress@sha256:63c1c44e2ded5b73a5f174807b91ca677826974df0f9ab3045f6ec87865a5744';
 export const vectorImage = 'timberio/vector:0.59.0-alpine@sha256:0e36bc2a290039e9b6a5e92f04bd2f133223506f72d09682c1df16c015172b7a';
 const remap = (inputs, source, options = {}) => ({ type: 'remap', inputs, source, drop_on_error: true, drop_on_abort: true, ...options });
+const status4xx = '((int(.status) ?? 0) >= 400 && (int(.status) ?? 0) < 500)';
 const status5xx = '(int(.status) ?? 0) >= 500';
 const capName = name => `cap_${name}`;
 /**
@@ -131,11 +132,14 @@ if !includes(${JSON.stringify(schema.fields.reason.values)}, reason) { reason = 
       gate_output: remap(['gate_reduce'], `. = {"ts": format_timestamp!(now(), format: "%Y-%m-%dT%H:%M:%S%.3fZ"), "level": "warn", "event": "logship_gate_summary_total", "svc": "logship", "reason": .reason, "count": .count}`),
       request_profile: { type: 'filter', inputs: ['allowlist'], condition: `${profileExpression} == "all_requests" || includes(["node_warning", "node_error"], .event) || (int(.status) ?? 0) >= 400 || (.event == "node_request" && (int(.latency_us) ?? 0) > ${slowThresholdUs}) || (.event == "ingress_request" && (to_float(.request_time_seconds) ?? 0.0) > ${(slowThresholdUs / 1000000).toFixed(6)})` },
       // The 5xx diagnostic (TC-1840) is an individual event: it bypasses the count reducer, which would drop its fields.
-      // The three capped classes (TC-1843) each have their own route; every other request event stays on `request`, unsampled.
+      // The five capped classes (TC-1843) each have their own route; request events below status 400 (slow 1xx-3xx
+      // requests, and every request under all_requests) stay on `request`, unsampled.
       event_route: { type: 'route', inputs: ['request_profile'], route: {
-        request: `(.event == "node_request" || .event == "ingress_request") && !(${status5xx})`,
+        request: `(.event == "node_request" || .event == "ingress_request") && !(${status4xx}) && !(${status5xx})`,
         node_request_5xx: `.event == "node_request" && ${status5xx}`,
         ingress_request_5xx: `.event == "ingress_request" && ${status5xx}`,
+        node_request_4xx: `.event == "node_request" && ${status4xx}`,
+        ingress_request_4xx: `.event == "ingress_request" && ${status4xx}`,
         db_failure_5xx: '.event == "node_warning" && .event_code == "db_failure_5xx"',
         diagnostic: '(.event == "node_warning" && .event_code != "db_failure_5xx") || .event == "node_error"',
       } },

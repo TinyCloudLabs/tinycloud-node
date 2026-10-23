@@ -39,8 +39,10 @@ const capShapes = {
   node_request_5xx: n => ({ level: 'info', ts: timestamp, event: 'node_request', svc: 'api', method: 'POST', route: '/invoke', status: 503, latency_us: n }),
   ingress_request_5xx: n => ({ level: 'info', ts: timestamp, event: 'ingress_request', svc: 'ingress', method: 'GET', route: '/healthz', status: 502, request_time_seconds: n + 0.5 }),
   db_failure_5xx: n => ({ level: 'warn', ts: timestamp, event: 'node_warning', svc: 'api', event_code: 'db_failure_5xx', status: 503, code: 'sql_busy', service: 'sql', route: '/invoke', elapsed_ms: n, failure_kind: 'lock_wait', write_may_have_applied: false }),
+  node_request_4xx: n => ({ level: 'info', ts: timestamp, event: 'node_request', svc: 'api', method: 'POST', route: '/invoke', status: 404, latency_us: n }),
+  ingress_request_4xx: n => ({ level: 'info', ts: timestamp, event: 'ingress_request', svc: 'ingress', method: 'GET', route: '/healthz', status: 429, request_time_seconds: n + 0.5 }),
 };
-const capSeq = { node_request_5xx: n => `.latency_us == ${n}`, ingress_request_5xx: n => `.request_time_seconds == ${n}.5`, db_failure_5xx: n => `.elapsed_ms == ${n}` };
+const capSeq = { node_request_5xx: n => `.latency_us == ${n}`, ingress_request_5xx: n => `.request_time_seconds == ${n}.5`, db_failure_5xx: n => `.elapsed_ms == ${n}`, node_request_4xx: n => `.latency_us == ${n}`, ingress_request_4xx: n => `.request_time_seconds == ${n}.5` };
 const capNames = Object.keys(CAPPED_CLASSES);
 const capOf = name => CAPPED_CLASSES[name].capPerMinute;
 const uncappedCount = 5 * Math.max(...capNames.map(capOf));
@@ -54,15 +56,15 @@ const capCases = [
     no_outputs_from: [...capNames.filter(other => other !== name).map(other => `cap_${other}`), 'event_route.request', 'event_route.diagnostic'],
   }))),
   {
-    name: 'cap: the three classes are counted independently',
+    name: 'cap: the five classes are counted independently',
     inputs: capNames.flatMap(name => inject(name, capOf(name) + 3)),
     outputs: capNames.map(name => capOutput(name, capOf(name))),
   },
   {
-    name: 'cap: request events below status 500 are never capped',
+    name: 'cap: request events below status 400 are never capped',
     inputs: Array.from({ length: uncappedCount }, (_, index) => ({ insert_at: 'event_route', type: 'log', log_fields: index % 2
-      ? { level: 'info', ts: timestamp, event: 'node_request', svc: 'api', method: 'POST', route: '/invoke', status: [200, 404, 429, 499][index % 4], latency_us: index }
-      : { level: 'info', ts: timestamp, event: 'ingress_request', svc: 'ingress', method: 'GET', route: '/healthz', status: [200, 404, 429, 499][index % 4], request_time_seconds: index + 0.5 } })),
+      ? { level: 'info', ts: timestamp, event: 'node_request', svc: 'api', method: 'POST', route: '/invoke', status: [100, 200, 301, 399][index % 4], latency_us: index }
+      : { level: 'info', ts: timestamp, event: 'ingress_request', svc: 'ingress', method: 'GET', route: '/healthz', status: [100, 200, 301, 399][index % 4], request_time_seconds: index + 0.5 } })),
     outputs: [{ extract_from: 'event_route.request', expected_event_count: uncappedCount }],
     no_outputs_from: capNames.map(name => `cap_${name}`),
   },
@@ -72,14 +74,15 @@ const capCases = [
     outputs: [{ extract_from: 'event_route.diagnostic', expected_event_count: uncappedCount }],
     no_outputs_from: capNames.map(name => `cap_${name}`),
   },
-  ...[['node_request_5xx', 'node_request', 'api', 'latency_us'], ['ingress_request_5xx', 'ingress_request', 'ingress', 'request_time_seconds']].map(([name, event, svc, timing]) => ({
-    name: `cap: ${event} status 499 stays on the uncapped route, 500 and 599 take the capped one`,
-    inputs: [499, 500, 599].map(status => ({ insert_at: 'event_route', type: 'log', log_fields: { level: 'info', ts: timestamp, event, svc, method: 'GET', route: '/healthz', status, [timing]: 1 } })),
+  ...[['node_request', 'api', 'latency_us', 'node_request_4xx', 'node_request_5xx'], ['ingress_request', 'ingress', 'request_time_seconds', 'ingress_request_4xx', 'ingress_request_5xx']].map(([event, svc, timing, name4, name5]) => ({
+    name: `cap: ${event} status 399 stays on the uncapped route, 400 and 499 take the 4xx cap, 500 and 599 the 5xx cap`,
+    inputs: [399, 400, 499, 500, 599].map(status => ({ insert_at: 'event_route', type: 'log', log_fields: { level: 'info', ts: timestamp, event, svc, method: 'GET', route: '/healthz', status, [timing]: 1 } })),
     outputs: [
-      { extract_from: 'event_route.request', expected_event_count: 1, conditions: [{ type: 'vrl', source: 'assert!(.status == 499)' }] },
-      { extract_from: `cap_${name}`, expected_event_count: 2, conditions: [{ type: 'vrl', source: 'assert!(.status == 500)' }, { type: 'vrl', source: 'assert!(.status == 599)' }] },
+      { extract_from: 'event_route.request', expected_event_count: 1, conditions: [{ type: 'vrl', source: 'assert!(.status == 399)' }] },
+      { extract_from: `cap_${name4}`, expected_event_count: 2, conditions: [{ type: 'vrl', source: 'assert!(.status == 400)' }, { type: 'vrl', source: 'assert!(.status == 499)' }] },
+      { extract_from: `cap_${name5}`, expected_event_count: 2, conditions: [{ type: 'vrl', source: 'assert!(.status == 500)' }, { type: 'vrl', source: 'assert!(.status == 599)' }] },
     ],
-    no_outputs_from: capNames.filter(other => other !== name).map(other => `cap_${other}`),
+    no_outputs_from: capNames.filter(other => ![name4, name5].includes(other)).map(other => `cap_${other}`),
   })),
 ];
 const unclassifiedKeys = ['event', 'event_code', 'event_count', 'level', 'svc', 'ts'];
@@ -199,8 +202,8 @@ export function requestProfileTests(profile) {
     const status = node ? payload.fields.status : payload.status;
     const timing = node ? `.latency_us == ${payload.fields.latency_us}` : `.request_time_seconds == ${payload.request_time}`;
     const fixture = { name: `${profile}: ${name}`, inputs: [{ insert_at: 'logship_gate', type: 'log', log_fields: logFields(envelope(payload, label)) }] };
-    // Status >= 500 request events take the capped class route (TC-1843); every other status stays on `request`.
-    const route = status >= 500 ? `event_route.${node ? 'node' : 'ingress'}_request_5xx` : 'event_route.request';
+    // Status >= 500 and status 400-499 request events take their capped class route (TC-1843); lower statuses stay on `request`.
+    const route = status >= 500 ? `event_route.${node ? 'node' : 'ingress'}_request_5xx` : status >= 400 ? `event_route.${node ? 'node' : 'ingress'}_request_4xx` : 'event_route.request';
     return profile === 'all_requests' || eligible
       ? { ...fixture, outputs: [{ extract_from: route, conditions: [{ type: 'vrl', source: `assert!(.status == ${status} && ${timing})\nassert!(${safe})` }] }] }
       : { ...fixture, no_outputs_from: [route] };
@@ -213,6 +216,7 @@ export function requestProfileTests(profile) {
       ['node status399 fast', 399, 0, false],
       ['node status400 fast', 400, 0, true],
       ['node error at one second', 503, 1000000, true],
+      ['node slow client error', 404, 1000001, true],
     ].map(([name, status, latency_us, eligible]) => requestCase(name, nodeRequest({ status, latency_us }), 'tinycloud-node', eligible)),
     ...[
       ['ingress fast success', 200, 0.999999, false],
@@ -221,6 +225,7 @@ export function requestProfileTests(profile) {
       ['ingress status399 fast', 399, 0, false],
       ['ingress status400 fast', 400, 0, true],
       ['ingress error at one second', 503, 1.0, true],
+      ['ingress slow client error', 404, 1.000001, true],
     ].map(([name, status, request_time, eligible]) => requestCase(name, ingressRequest({ status, request_time }), 'tinycloud-ingress', eligible)),
     ...['WARN', 'ERROR'].map(level => ({
       name: `${profile}: dependency ${level} always eligible`,
@@ -230,7 +235,7 @@ export function requestProfileTests(profile) {
     {
       name: `${profile}: node 5xx diagnostic routes as an individual event, never into the count reducer`,
       inputs: [{ insert_at: 'logship_gate', type: 'log', log_fields: logFields(envelope(dbFailure())) }],
-      no_outputs_from: ['event_route.diagnostic', 'event_route.request', 'event_route.node_request_5xx', 'event_route.ingress_request_5xx'],
+      no_outputs_from: ['event_route.diagnostic', 'event_route.request', ...capNames.filter(name => name !== 'db_failure_5xx').map(name => `event_route.${name}`)],
       outputs: [{ extract_from: 'event_route.db_failure_5xx', conditions: [{ type: 'vrl', source: `assert!(.event_code == "db_failure_5xx" && .elapsed_ms == 30001 && .db_hash == "${goodHash}")\nassert!(${keysAre(dbShipped)})\nassert!(${safe})` }] }],
     },
     {
@@ -239,30 +244,25 @@ export function requestProfileTests(profile) {
       no_outputs_from: ['event_route.db_failure_5xx', 'event_route.request'],
       outputs: [{ extract_from: 'event_route.diagnostic', conditions: [{ type: 'vrl', source: `assert!(.event_count == 1 && .event_code == "unclassified")\nassert!(${keysAre(['event', 'event_code', 'event_count', 'level', 'svc', 'ts'])})\nassert!(${safe})` }] }],
     },
-    // TC-1843: the capped classes reach their cap transform from the raw envelope, with the same fields as before the cap.
-    {
-      name: `${profile}: node request with status 503 reaches only the node_request_5xx cap`,
-      inputs: [{ insert_at: 'logship_gate', type: 'log', log_fields: logFields(envelope(nodeRequest({ status: 503 }))) }],
-      no_outputs_from: ['event_route.request', 'cap_ingress_request_5xx', 'cap_db_failure_5xx'],
-      outputs: [{ extract_from: 'cap_node_request_5xx', expected_event_count: 1, conditions: [{ type: 'vrl', source: `assert!(.event == "node_request" && .status == 503 && .latency_us == 1234)\nassert!(${keysAre(['event', 'latency_us', 'level', 'method', 'route', 'status', 'svc', 'ts'])})\nassert!(${safe})` }] }],
-    },
-    {
-      name: `${profile}: ingress request with status 502 reaches only the ingress_request_5xx cap`,
-      inputs: [{ insert_at: 'logship_gate', type: 'log', log_fields: logFields(envelope(ingressRequest({ status: 502 }), 'tinycloud-ingress')) }],
-      no_outputs_from: ['event_route.request', 'cap_node_request_5xx', 'cap_db_failure_5xx'],
-      outputs: [{ extract_from: 'cap_ingress_request_5xx', expected_event_count: 1, conditions: [{ type: 'vrl', source: `assert!(.event == "ingress_request" && .status == 502 && .svc == "ingress")\nassert!(${keysAre(['event', 'level', 'method', 'request_time_seconds', 'route', 'status', 'svc', 'ts'])})\nassert!(${safe})` }] }],
-    },
-    {
-      name: `${profile}: node 5xx diagnostic reaches only the db_failure_5xx cap`,
-      inputs: [{ insert_at: 'logship_gate', type: 'log', log_fields: logFields(envelope(dbFailure())) }],
-      no_outputs_from: ['event_route.request', 'cap_node_request_5xx', 'cap_ingress_request_5xx'],
-      outputs: [{ extract_from: 'cap_db_failure_5xx', expected_event_count: 1, conditions: [{ type: 'vrl', source: `assert!(.event_code == "db_failure_5xx" && .elapsed_ms == 30001)\nassert!(${keysAre(dbShipped)})\nassert!(${safe})` }] }],
-    },
-    ...[['node', envelope(nodeRequest({ status: 429 }))], ['ingress', envelope(ingressRequest({ status: 429 }), 'tinycloud-ingress')]].map(([side, input]) => ({
-      name: `${profile}: ${side} request with status 429 is not capped`,
+    // TC-1843: the capped classes reach their cap transform from the raw envelope, with the same fields.
+    ...[
+      ['node request with status 503', 'node_request_5xx', envelope(nodeRequest({ status: 503 })), `.event == "node_request" && .status == 503 && .latency_us == 1234)\nassert!(${keysAre(['event', 'latency_us', 'level', 'method', 'route', 'status', 'svc', 'ts'])}`],
+      ['ingress request with status 502', 'ingress_request_5xx', envelope(ingressRequest({ status: 502 }), 'tinycloud-ingress'), `.event == "ingress_request" && .status == 502 && .svc == "ingress")\nassert!(${keysAre(['event', 'level', 'method', 'request_time_seconds', 'route', 'status', 'svc', 'ts'])}`],
+      ['node 5xx diagnostic', 'db_failure_5xx', envelope(dbFailure()), `.event_code == "db_failure_5xx" && .elapsed_ms == 30001)\nassert!(${keysAre(dbShipped)}`],
+      ['node request with status 429', 'node_request_4xx', envelope(nodeRequest({ status: 429 })), `.event == "node_request" && .status == 429 && .latency_us == 1234)\nassert!(${keysAre(['event', 'latency_us', 'level', 'method', 'route', 'status', 'svc', 'ts'])}`],
+      ['ingress request with status 404', 'ingress_request_4xx', envelope(ingressRequest({ status: 404 }), 'tinycloud-ingress'), `.event == "ingress_request" && .status == 404 && .svc == "ingress")\nassert!(${keysAre(['event', 'level', 'method', 'request_time_seconds', 'route', 'status', 'svc', 'ts'])}`],
+    ].map(([label, name, input, assertion]) => ({
+      name: `${profile}: ${label} reaches only the ${name} cap`,
       inputs: [{ insert_at: 'logship_gate', type: 'log', log_fields: logFields(input) }],
-      no_outputs_from: ['cap_node_request_5xx', 'cap_ingress_request_5xx', 'cap_db_failure_5xx'],
-      outputs: [{ extract_from: 'event_route.request', expected_event_count: 1, conditions: [{ type: 'vrl', source: 'assert!(.status == 429)' }] }],
+      no_outputs_from: ['event_route.request', ...capNames.filter(other => other !== name).map(other => `cap_${other}`)],
+      outputs: [{ extract_from: `cap_${name}`, expected_event_count: 1, conditions: [{ type: 'vrl', source: `assert!(${assertion})\nassert!(${safe})` }] }],
+    })),
+    // Slow requests below status 400 are forwarded by errors_slow and are not capped.
+    ...[['node', envelope(nodeRequest({ status: 200, latency_us: 1000001 })), 'latency_us == 1000001'], ['ingress', envelope(ingressRequest({ status: 301, request_time: 1.000001 }), 'tinycloud-ingress'), 'status == 301']].map(([side, input, condition]) => ({
+      name: `${profile}: slow ${side} request with a status below 400 is not capped`,
+      inputs: [{ insert_at: 'logship_gate', type: 'log', log_fields: logFields(input) }],
+      no_outputs_from: capNames.map(name => `cap_${name}`),
+      outputs: [{ extract_from: 'event_route.request', expected_event_count: 1, conditions: [{ type: 'vrl', source: `assert!(.${condition})` }] }],
     })),
   ];
 }
