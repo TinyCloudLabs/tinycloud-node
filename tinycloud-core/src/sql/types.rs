@@ -246,8 +246,8 @@ pub enum SqlError {
     PermissionDenied(String),
     #[error("Database not found")]
     DatabaseNotFound,
-    #[error("Response too large: {0} bytes")]
-    ResponseTooLarge(u64),
+    #[error("sql_response_too_large: Response too large: {0} bytes (limit {1} bytes)")]
+    ResponseTooLarge(u64, u64),
     #[error("Quota exceeded")]
     QuotaExceeded,
     /// The space is full and the request would have grown the database; it

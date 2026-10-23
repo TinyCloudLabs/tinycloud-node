@@ -941,7 +941,10 @@ fn execute_query(
     .map_err(|e| SqlError::Internal(format!("Failed to serialize query response: {e}")))?
     .len();
     if serialized_size > response_limit {
-        return Err(SqlError::ResponseTooLarge(serialized_size as u64));
+        return Err(SqlError::ResponseTooLarge(
+            serialized_size as u64,
+            response_limit as u64,
+        ));
     }
 
     timer.resume();
@@ -958,7 +961,10 @@ fn execute_query(
             break;
         };
         if max_rows.is_some_and(|limit| rows.len() >= limit) {
-            return Err(SqlError::ResponseTooLarge(serialized_size as u64));
+            return Err(SqlError::ResponseTooLarge(
+                serialized_size as u64,
+                response_limit as u64,
+            ));
         }
         let mut values = Vec::new();
         for i in 0..columns.len() {
@@ -974,7 +980,10 @@ fn execute_query(
         serialized_size +=
             row_size + usize::from(!rows.is_empty()) + new_row_count_digits - old_row_count_digits;
         if serialized_size > response_limit {
-            return Err(SqlError::ResponseTooLarge(serialized_size as u64));
+            return Err(SqlError::ResponseTooLarge(
+                serialized_size as u64,
+                response_limit as u64,
+            ));
         }
         rows.push(values);
     }
@@ -989,7 +998,10 @@ fn execute_query(
         .map_err(|e| SqlError::Internal(format!("Failed to serialize query response: {e}")))?
         .len();
     if serialized_size > response_limit {
-        return Err(SqlError::ResponseTooLarge(serialized_size as u64));
+        return Err(SqlError::ResponseTooLarge(
+            serialized_size as u64,
+            response_limit as u64,
+        ));
     }
 
     Ok(response)
@@ -1261,7 +1273,7 @@ mod tests {
         let err = execute_query(&conn, "SELECT 1 UNION ALL SELECT 2", &[], Some(1), None)
             .expect_err("the second row must exceed maxRows");
 
-        assert!(matches!(err, SqlError::ResponseTooLarge(_)));
+        assert!(matches!(err, SqlError::ResponseTooLarge(..)));
     }
 
     #[test]
@@ -1270,7 +1282,7 @@ mod tests {
         let err = execute_query(&conn, "SELECT 'payload'", &[], None, Some(1))
             .expect_err("the text value must exceed maxBytes");
 
-        assert!(matches!(err, SqlError::ResponseTooLarge(_)));
+        assert!(matches!(err, SqlError::ResponseTooLarge(_, limit) if limit == 1));
     }
 
     #[test]
@@ -1296,7 +1308,7 @@ mod tests {
                 .expect_err("one byte below the serialized response size must fail");
             assert!(matches!(
                 err,
-                SqlError::ResponseTooLarge(actual) if actual == exact_size as u64
+                SqlError::ResponseTooLarge(actual, _) if actual == exact_size as u64
             ));
         }
     }
