@@ -50,6 +50,7 @@ use tinycloud_core::{
     db_pool::{classify_failure, track_writes, TransientFailure},
     encryption_network::EncryptionService,
     events::Invocation,
+    failure_diagnostic::{failure_kind, FailureCode, FailureNote, Service},
     models::{
         hook_delivery, hook_subscription, invocation as invocation_model, kv_delete, kv_write,
     },
@@ -172,24 +173,40 @@ fn read_audit_failure(error: &tinycloud_core::ReadAuditError) -> (Status, String
 /// - `500` with the error otherwise.
 ///
 /// `write_may_have_applied` comes from [`track_writes`] around the operation.
+///
+/// The failure is also recorded on the request, for the node's one diagnostic
+/// line per failed request (TC-1796): the `service` it served, the failure
+/// kind of `error`, and the code of the answer. The database in use is not
+/// known here, so the record has no database reference.
 fn database_failure(
+    service: Service,
     error: &DbErr,
     write_may_have_applied: bool,
     message: String,
 ) -> (Status, String) {
-    match classify_failure(error, write_may_have_applied) {
+    let (code, status, body) = match classify_failure(error, write_may_have_applied) {
         Some(TransientFailure::Retryable) => (
+            FailureCode::UnavailableRetryable,
             Status::ServiceUnavailable,
             format!("{UNAVAILABLE_RETRYABLE}: {message}"),
         ),
         Some(TransientFailure::OutcomeUnknown) => (
+            FailureCode::OutcomeUnknown,
             Status::InternalServerError,
             format!(
                 "{OUTCOME_UNKNOWN}: the write may have been applied; read it back before retrying: {message}"
             ),
         ),
-        None => (Status::InternalServerError, message),
-    }
+        None => (FailureCode::Internal, Status::InternalServerError, message),
+    };
+    tinycloud_core::request_telemetry::note_failure(FailureNote {
+        service,
+        code,
+        kind: failure_kind(error),
+        write_may_have_applied,
+        db_ref: None,
+    });
+    (status, body)
 }
 
 /// `/invoke` failure: plain text for everything except storage rejections,
@@ -659,7 +676,7 @@ pub async fn delegate(
         let res = res
             .map_err(|e| match &e {
                 TxError::Db(error) | TxError::EpochInsert(error) => {
-                    database_failure(error, write_may_have_applied, e.to_string())
+                    database_failure(Service::Other, error, write_may_have_applied, e.to_string())
                 }
                 TxError::SpaceNotFound => (Status::NotFound, e.to_string()),
                 _ => (Status::Unauthorized, e.to_string()),
@@ -730,7 +747,7 @@ pub async fn revoke(
         let (res, write_may_have_applied) = track_writes(tinycloud.revoke(r.0)).await;
         let res = res.map_err(|e| match &e {
             TxError::Db(error) | TxError::EpochInsert(error) => {
-                database_failure(error, write_may_have_applied, e.to_string())
+                database_failure(Service::Other, error, write_may_have_applied, e.to_string())
             }
             TxError::SpaceNotFound => (Status::NotFound, e.to_string()),
             _ => (Status::Forbidden, e.to_string()),
@@ -2312,7 +2329,8 @@ async fn invoke_impl(
                 }
                 if let TxStoreError::Tx(TxError::Db(error) | TxError::EpochInsert(error)) = &e {
                     return Err(
-                        database_failure(error, write_may_have_applied, e.to_string()).into()
+                        database_failure(Service::Kv, error, write_may_have_applied, e.to_string())
+                            .into()
                     );
                 }
                 Err((
@@ -4026,6 +4044,16 @@ fn missing_database_admin_capability_error(
     )
 }
 
+/// The service of the request an authorization `span` belongs to.
+fn auth_service(span: &str) -> Service {
+    match span {
+        "server.sql.auth" => Service::Sql,
+        "server.duckdb.auth" => Service::Duckdb,
+        "server.signed_kv.auth" => Service::Kv,
+        _ => Service::Other,
+    }
+}
+
 /// Verify authorization by invoking with empty inputs.
 ///
 /// Shared by SQL and DuckDB invoke handlers. The caller must extract caveats
@@ -4046,7 +4074,7 @@ async fn verify_auth(
         // authorizes has not run, so a database failure here is retryable.
         .map_err(|e| match &e {
             TxStoreError::Tx(TxError::Db(error) | TxError::EpochInsert(error)) => {
-                database_failure(error, false, e.to_string())
+                database_failure(auth_service(span), error, false, e.to_string())
             }
             TxStoreError::Tx(TxError::ReadAudit(error)) => read_audit_failure(error),
             TxStoreError::Tx(TxError::SpaceNotFound) => (Status::NotFound, e.to_string()),
@@ -4078,7 +4106,7 @@ async fn verify_auth_admitted(
         // authorizes has not run, so a database failure here is retryable.
         .map_err(|e| match &e {
             TxStoreError::Tx(TxError::Db(error) | TxError::EpochInsert(error)) => {
-                database_failure(error, false, e.to_string())
+                database_failure(auth_service(span), error, false, e.to_string())
             }
             TxStoreError::Tx(TxError::ReadAudit(error)) => read_audit_failure(error),
             TxStoreError::Tx(TxError::SpaceNotFound) => (Status::NotFound, e.to_string()),
@@ -4355,7 +4383,14 @@ mod tests {
 
     #[tokio::test]
     async fn database_failures_are_retryable_only_before_a_write_may_apply() {
-        let status = |error: &DbErr, applied| database_failure(error, applied, String::new());
+        let status = |error: &DbErr, applied| {
+            database_failure(
+                tinycloud_core::failure_diagnostic::Service::Other,
+                error,
+                applied,
+                String::new(),
+            )
+        };
         // Refused by the server, or no connection: definitely not applied.
         for code in ["40001", "40P01", "57014"] {
             let (code_status, body) = status(&db_error_with_sqlstate(code), false);

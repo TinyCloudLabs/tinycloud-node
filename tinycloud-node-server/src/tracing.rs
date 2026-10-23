@@ -12,10 +12,11 @@ use serde_json::{Map, Value};
 use std::{
     collections::VecDeque,
     sync::{Arc, Mutex, OnceLock},
-    time::Instant,
+    time::{Duration, Instant},
 };
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tinycloud_core::{
+    failure_diagnostic::{FailureCode, FailureNote},
     request_telemetry::{self, RequestContext},
     telemetry::Pseudonymizer,
 };
@@ -240,6 +241,74 @@ fn hash_field<'a>(hash: Option<&[u8; 32]>, buffer: &'a mut [u8; 64]) -> Option<&
     let hash = hash?;
     hex::encode_to_slice(hash, &mut *buffer).expect("32 bytes encode to 64 hex bytes");
     Some(std::str::from_utf8(buffer).expect("hex is ASCII"))
+}
+
+/// The one diagnostic line a request logs when it ends in a database-failure
+/// 5xx (TC-1796).
+///
+/// Its fields are all there is: fixed vocabulary, the route template, the
+/// elapsed time and a hashed database reference. It never carries a space
+/// id, DID, database name or path, SQL, parameters, the database's error
+/// text, headers, tokens, addresses or bodies.
+struct DatabaseFailureLine<'a> {
+    status: u16,
+    code: &'static str,
+    service: &'static str,
+    route: &'a str,
+    elapsed_ms: u64,
+    failure_kind: &'static str,
+    write_may_have_applied: bool,
+    /// Absent when the failing layer does not know its database.
+    db_ref: Option<String>,
+}
+
+impl<'a> DatabaseFailureLine<'a> {
+    /// The line for a request that recorded `note` and was answered `status`,
+    /// or `None` when the answer is not the one the note describes (a `503`
+    /// is `unavailable_retryable`, nothing else is), so a line never states a
+    /// code the client did not receive.
+    fn new(
+        note: FailureNote,
+        status: u16,
+        route: &'a str,
+        elapsed: Duration,
+    ) -> Option<DatabaseFailureLine<'a>> {
+        let (code, expected_status) = match note.code {
+            FailureCode::UnavailableRetryable => (
+                crate::routes::UNAVAILABLE_RETRYABLE,
+                Status::ServiceUnavailable,
+            ),
+            FailureCode::OutcomeUnknown => {
+                (crate::routes::OUTCOME_UNKNOWN, Status::InternalServerError)
+            }
+            FailureCode::Internal => ("internal", Status::InternalServerError),
+        };
+        (status == expected_status.code).then(|| Self {
+            status,
+            code,
+            service: note.service.as_str(),
+            route,
+            elapsed_ms: elapsed.as_millis() as u64,
+            failure_kind: note.kind,
+            write_may_have_applied: note.write_may_have_applied,
+            db_ref: note.db_ref,
+        })
+    }
+
+    fn emit(&self) {
+        tracing::warn!(
+            target: REQUEST_LOG_TARGET,
+            status = self.status,
+            code = self.code,
+            service = self.service,
+            route = self.route,
+            elapsed_ms = self.elapsed_ms,
+            failure_kind = self.failure_kind,
+            write_may_have_applied = self.write_may_have_applied,
+            db_ref = self.db_ref.as_deref(),
+            "database failure answered with a 5xx"
+        );
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -630,6 +699,15 @@ impl Fairing for TracingFairing {
             space_hash,
             "request"
         );
+        if status >= 500 {
+            if let Some(line) = telemetry
+                .context
+                .failure()
+                .and_then(|note| DatabaseFailureLine::new(note, status, route, elapsed))
+            {
+                line.emit();
+            }
+        }
         if crate::prometheus::enabled() {
             crate::prometheus::REQUEST_HISTOGRAM
                 .with_label_values(&[req.method().as_str(), route, status.to_string().as_str()])
@@ -809,5 +887,216 @@ mod tests {
             response.headers().get_one("TinyCloud-Trace-Id").is_some(),
             "trace header should still be set (as the all-zero id) when tracing is disabled"
         );
+    }
+
+    fn note(code: FailureCode) -> FailureNote {
+        FailureNote {
+            service: tinycloud_core::failure_diagnostic::Service::Sql,
+            code,
+            kind: "pool_timeout",
+            write_may_have_applied: code == FailureCode::OutcomeUnknown,
+            db_ref: None,
+        }
+    }
+
+    #[test]
+    fn a_diagnostic_line_states_only_the_code_the_client_received() {
+        let line = |code, status| {
+            DatabaseFailureLine::new(note(code), status, "/invoke", Duration::from_millis(41_900))
+                .map(|line| {
+                    (
+                        line.code,
+                        line.status,
+                        line.elapsed_ms,
+                        line.write_may_have_applied,
+                    )
+                })
+        };
+        assert_eq!(
+            line(FailureCode::UnavailableRetryable, 503),
+            Some(("unavailable_retryable", 503, 41_900, false))
+        );
+        assert_eq!(
+            line(FailureCode::OutcomeUnknown, 500),
+            Some(("outcome_unknown", 500, 41_900, true))
+        );
+        assert_eq!(
+            line(FailureCode::Internal, 500),
+            Some(("internal", 500, 41_900, false))
+        );
+        for (code, status) in [
+            (FailureCode::UnavailableRetryable, 500),
+            (FailureCode::OutcomeUnknown, 503),
+            (FailureCode::Internal, 503),
+            (FailureCode::Internal, 200),
+        ] {
+            assert!(line(code, status).is_none(), "{code:?} answered {status}");
+        }
+    }
+
+    /// Log output written at the WARN level, as JSON.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<parking_lot::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    const SECRET_SPACE: &str =
+        "tinycloud:pkh:eip155:1:0x00000000000000000000000000000000000000aa:secret-space";
+    const SECRET_DB: &str = "secret-db-name";
+    const SECRET_TEXT: &str = "secret-database-error-text";
+
+    #[rocket::get("/tc1796-with-db")]
+    fn failing_with_db() -> (Status, String) {
+        request_telemetry::note_failure(FailureNote {
+            db_ref: Some(tinycloud_core::failure_diagnostic::db_ref(
+                SECRET_SPACE,
+                SECRET_DB,
+            )),
+            ..note(FailureCode::UnavailableRetryable)
+        });
+        (
+            Status::ServiceUnavailable,
+            format!("unavailable_retryable: {SECRET_TEXT} {SECRET_SPACE} {SECRET_DB}"),
+        )
+    }
+
+    #[rocket::get("/tc1796-without-db")]
+    fn failing_without_db() -> (Status, String) {
+        request_telemetry::note_failure(FailureNote {
+            service: tinycloud_core::failure_diagnostic::Service::Kv,
+            kind: "io",
+            ..note(FailureCode::OutcomeUnknown)
+        });
+        (
+            Status::InternalServerError,
+            format!("outcome_unknown: {SECRET_TEXT}"),
+        )
+    }
+
+    #[rocket::get("/tc1796-no-note")]
+    fn failing_without_note() -> (Status, &'static str) {
+        (Status::ServiceUnavailable, "sql_busy: lock_wait")
+    }
+
+    /// A request that ends in a database-failure 5xx logs exactly one WARN
+    /// line with the allowed fields and nothing else, and the response is
+    /// the route's, untouched. `#[tokio::test]` runs on one thread, so the
+    /// thread-scoped subscriber sees the fairing's event.
+    #[tokio::test]
+    async fn a_database_failure_5xx_logs_one_line_with_only_the_allowed_fields() {
+        let captured = Captured::default();
+        let _subscriber = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .json()
+                .with_writer(captured.clone())
+                .with_max_level(Level::WARN)
+                .finish(),
+        );
+        let routes: Vec<_> =
+            rocket::routes![failing_with_db, failing_without_db, failing_without_note]
+                .into_iter()
+                .map(instrument_route)
+                .collect();
+        let client = Client::tracked(
+            rocket::build()
+                .mount("/", routes)
+                .attach(disabled_fairing()),
+        )
+        .await
+        .expect("valid rocket instance");
+
+        let response = client.get("/tc1796-with-db").dispatch().await;
+        assert_eq!(response.status(), Status::ServiceUnavailable);
+        assert_eq!(
+            response.into_string().await.unwrap(),
+            format!("unavailable_retryable: {SECRET_TEXT} {SECRET_SPACE} {SECRET_DB}"),
+            "the response body is the route's"
+        );
+        let response = client.get("/tc1796-without-db").dispatch().await;
+        assert_eq!(response.status(), Status::InternalServerError);
+        let response = client.get("/tc1796-no-note").dispatch().await;
+        assert_eq!(response.status(), Status::ServiceUnavailable);
+
+        let output = String::from_utf8(captured.0.lock().clone()).unwrap();
+        for secret in [SECRET_SPACE, SECRET_DB, SECRET_TEXT, "secret"] {
+            assert!(!output.contains(secret), "{secret} in {output}");
+        }
+        let events: Vec<Value> = output
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events.len(), 2, "one line per failing request: {output}");
+        let allowed = |with_db: bool| -> Vec<&str> {
+            let mut fields = vec![
+                "code",
+                "elapsed_ms",
+                "failure_kind",
+                "message",
+                "route",
+                "service",
+                "status",
+                "write_may_have_applied",
+            ];
+            if with_db {
+                fields.push("db_ref");
+            }
+            fields.sort_unstable();
+            fields
+        };
+        let keys = |event: &Value| -> Vec<String> {
+            let mut keys: Vec<String> = event["fields"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect();
+            keys.sort_unstable();
+            keys
+        };
+
+        let first = &events[0];
+        assert_eq!(first["level"], "WARN");
+        assert_eq!(first["target"], REQUEST_LOG_TARGET);
+        assert_eq!(keys(first), allowed(true));
+        let fields = &first["fields"];
+        assert_eq!(fields["status"], 503);
+        assert_eq!(fields["code"], "unavailable_retryable");
+        assert_eq!(fields["service"], "sql");
+        assert_eq!(fields["route"], "/tc1796-with-db");
+        assert_eq!(fields["failure_kind"], "pool_timeout");
+        assert_eq!(fields["write_may_have_applied"], false);
+        assert_eq!(
+            fields["db_ref"],
+            tinycloud_core::failure_diagnostic::db_ref(SECRET_SPACE, SECRET_DB)
+        );
+        assert!(fields["elapsed_ms"].is_u64());
+
+        let second = &events[1];
+        assert_eq!(
+            keys(second),
+            allowed(false),
+            "db_ref is omitted when unknown"
+        );
+        let fields = &second["fields"];
+        assert_eq!(fields["status"], 500);
+        assert_eq!(fields["code"], "outcome_unknown");
+        assert_eq!(fields["service"], "kv");
+        assert_eq!(fields["failure_kind"], "io");
+        assert_eq!(fields["write_may_have_applied"], true);
     }
 }

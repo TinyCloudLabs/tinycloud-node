@@ -19,6 +19,7 @@ use crate::database_artifacts::{
     DatabaseArtifactError, DatabaseArtifactRepository,
 };
 use crate::db_pool::{is_transient_error, track_writes, transient_error_class};
+use crate::failure_diagnostic::{db_ref, failure_kind, FailureCode, FailureNote, Service};
 use crate::{request_cancel, request_telemetry};
 
 use super::{
@@ -45,7 +46,7 @@ type OperationLockRegistry =
 #[derive(Clone, Debug)]
 enum HydrationOutcome {
     Ready,
-    Unavailable,
+    Unavailable(&'static str),
     Failed(String),
     TimedOut,
 }
@@ -356,6 +357,7 @@ impl SqlService {
                 // could apply it twice (TC-1054, TC-1274).
                 return Err(match e {
                     SqlError::Unavailable | SqlError::Busy(_) if write_may_have_applied => {
+                        request_telemetry::note_outcome_unknown();
                         SqlError::OutcomeUnknown
                     }
                     e => e,
@@ -525,7 +527,7 @@ impl SqlService {
                     .load_meta("sql", &space.to_string(), db_name),
             )
             .await?
-            .map_err(artifact_error_to_sql)?
+            .map_err(request_artifact_error(space, db_name))?
             .is_none()
         {
             return Err(SqlError::DatabaseNotFound);
@@ -610,7 +612,10 @@ impl SqlService {
             }
             match self.join_hydration(flight).await? {
                 HydrationOutcome::Ready => continue,
-                HydrationOutcome::Unavailable => return Err(SqlError::Unavailable),
+                HydrationOutcome::Unavailable(kind) => {
+                    note_unavailable(kind, space, db_name);
+                    return Err(SqlError::Unavailable);
+                }
                 HydrationOutcome::Failed(message) => return Err(SqlError::Internal(message)),
                 HydrationOutcome::TimedOut => {
                     log_busy(
@@ -709,7 +714,10 @@ impl SqlService {
         .await;
         let meta = match loaded {
             Ok(Ok(meta)) => meta,
-            Ok(Err(error)) => return hydration_failure(artifact_error_to_sql(error)),
+            Ok(Err(error)) => {
+                let kind = unavailable_kind(&error).unwrap_or("other");
+                return hydration_failure(artifact_error_to_sql(error), kind);
+            }
             Err(_) => {
                 tracing::warn!(
                     service = "sql",
@@ -722,7 +730,7 @@ impl SqlService {
         };
         phase.store(PHASE_WRITING, Ordering::Release);
         if let Err(error) = self.seed_cache(space, db_name, meta, sink).await {
-            return hydration_failure(error);
+            return hydration_failure(error, "other");
         }
         self.databases
             .entry((space.to_string(), db_name.to_string()))
@@ -877,7 +885,7 @@ impl SqlService {
                     DatabaseArtifactError::MissingCheckpoint
                     | DatabaseArtifactError::IncrementalPersistenceUnsupported,
                 ) => {}
-                Err(error) => return Err(artifact_error_to_sql(error)),
+                Err(error) => return Err(request_artifact_error(space, db_name)(error)),
             }
         }
 
@@ -891,7 +899,7 @@ impl SqlService {
                     self.artifact_repository.load_meta("sql", &key.0, db_name),
                 )
                 .await?
-                .map_err(artifact_error_to_sql)?
+                .map_err(request_artifact_error(space, db_name))?
                 .map_or(0, |artifact| artifact.size_bytes.max(0) as u64);
             if bytes as u64 > durable_bytes {
                 return Err(SqlError::StorageWouldGrow);
@@ -910,7 +918,7 @@ impl SqlService {
                 ),
             )
             .await?
-            .map_err(artifact_error_to_sql)?;
+            .map_err(request_artifact_error(space, db_name))?;
         self.lineage.insert(
             key,
             ArtifactExpectation::Derived {
@@ -961,6 +969,43 @@ fn sql_wal_path(path: &Path) -> PathBuf {
     PathBuf::from(format!("{}-wal", path.display()))
 }
 
+/// The fixed failure class of an artifact error that
+/// [`artifact_error_to_sql`] answers `Unavailable` (TC-1796).
+fn unavailable_kind(err: &DatabaseArtifactError) -> Option<&'static str> {
+    match err {
+        DatabaseArtifactError::Db(error) if is_transient_error(error) => Some(failure_kind(error)),
+        DatabaseArtifactError::ArtifactChanged => Some("artifact_changed"),
+        _ => None,
+    }
+}
+
+/// Record on the current request that its database (`space`, `db_name`) was
+/// unavailable, for the node's diagnostic line (TC-1796).
+fn note_unavailable(kind: &'static str, space: &SpaceId, db_name: &str) {
+    request_telemetry::note_failure(FailureNote {
+        service: Service::Sql,
+        code: FailureCode::UnavailableRetryable,
+        kind,
+        write_may_have_applied: false,
+        db_ref: Some(db_ref(&space.to_string(), db_name)),
+    });
+}
+
+/// [`artifact_error_to_sql`] for an error met on the request's own task,
+/// recording it on the request. A hydration runs on its own task and its
+/// joiners record the outcome themselves ([`HydrationOutcome::Unavailable`]).
+fn request_artifact_error<'a>(
+    space: &'a SpaceId,
+    db_name: &'a str,
+) -> impl Fn(DatabaseArtifactError) -> SqlError + 'a {
+    move |error| {
+        if let Some(kind) = unavailable_kind(&error) {
+            note_unavailable(kind, space, db_name);
+        }
+        artifact_error_to_sql(error)
+    }
+}
+
 fn artifact_error_to_sql(err: DatabaseArtifactError) -> SqlError {
     match err {
         DatabaseArtifactError::Db(ref error) if is_transient_error(error) => {
@@ -1003,9 +1048,10 @@ fn begin_write() -> Result<(), SqlError> {
     }
 }
 
-fn hydration_failure(error: SqlError) -> HydrationOutcome {
+/// `kind` is [`unavailable_kind`] of the error behind an `Unavailable` one.
+fn hydration_failure(error: SqlError, kind: &'static str) -> HydrationOutcome {
     match error {
-        SqlError::Unavailable => HydrationOutcome::Unavailable,
+        SqlError::Unavailable => HydrationOutcome::Unavailable(kind),
         SqlError::Internal(message) => HydrationOutcome::Failed(message),
         error => HydrationOutcome::Failed(error.to_string()),
     }
@@ -3857,7 +3903,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(
-            matches!(joined, Ok(HydrationOutcome::Unavailable)),
+            matches!(joined, Ok(HydrationOutcome::Unavailable(_))),
             "{joined:?}"
         );
         assert_eq!(repo.loads(), 1, "one hydration served both");

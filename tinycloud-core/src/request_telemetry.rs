@@ -14,6 +14,7 @@ use pin_project::pin_project;
 use tinycloud_auth::resource::SpaceId;
 use uuid::Uuid;
 
+use crate::failure_diagnostic::{FailureCode, FailureNote};
 use crate::telemetry::{Pseudonym, Pseudonymizer};
 
 pub use sqlx_core::request_telemetry::{Metrics, PoolTimer, QueryTimer, Snapshot};
@@ -71,6 +72,7 @@ pub struct RequestContext {
     metrics: Arc<Metrics>,
     pseudonymizer: Arc<Pseudonymizer>,
     identities: Mutex<IdentityState>,
+    failure: Mutex<Option<FailureNote>>,
 }
 
 impl RequestContext {
@@ -81,6 +83,7 @@ impl RequestContext {
             metrics: Arc::new(Metrics::default()),
             pseudonymizer,
             identities: Mutex::new(IdentityState::default()),
+            failure: Mutex::new(None),
         })
     }
 
@@ -132,6 +135,36 @@ impl RequestContext {
             space_hash: identities.space.hash(),
         }
     }
+
+    /// Record the request's database failure, replacing an earlier one.
+    pub fn note_failure(&self, note: FailureNote) {
+        *self
+            .failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(note);
+    }
+
+    /// Mark the recorded failure as one after which a write may have been
+    /// applied.
+    pub fn note_outcome_unknown(&self) {
+        if let Some(note) = self
+            .failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+        {
+            note.code = FailureCode::OutcomeUnknown;
+            note.write_may_have_applied = true;
+        }
+    }
+
+    /// The request's recorded database failure, if any.
+    pub fn failure(&self) -> Option<FailureNote> {
+        self.failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
 }
 
 /// Return the request installed for the current poll or synchronous worker.
@@ -143,6 +176,23 @@ pub fn current() -> Option<Arc<RequestContext>> {
 pub fn observe_space(space: &SpaceId) {
     if let Some(context) = current() {
         context.observe_space(space);
+    }
+}
+
+/// Record the database failure the current request is about to answer with a
+/// 5xx (TC-1796); a later note replaces an earlier one. A no-op outside an
+/// HTTP request.
+pub fn note_failure(note: FailureNote) {
+    if let Some(context) = current() {
+        context.note_failure(note);
+    }
+}
+
+/// The recorded failure turned out to be one whose write may have been
+/// applied (the request's artifact write was sent before it failed).
+pub fn note_outcome_unknown() {
+    if let Some(context) = current() {
+        context.note_outcome_unknown();
     }
 }
 

@@ -609,7 +609,12 @@ async fn verify_auth(
         .map_err(|err| match &err {
             TxStoreError::Tx(TxError::ReadAudit(error)) => super::read_audit_failure(error),
             TxStoreError::Tx(TxError::Db(error) | TxError::EpochInsert(error)) => {
-                super::database_failure(error, false, err.to_string())
+                super::database_failure(
+                    tinycloud_core::failure_diagnostic::Service::Other,
+                    error,
+                    false,
+                    err.to_string(),
+                )
             }
             _ => (Status::Unauthorized, err.to_string()),
         });
