@@ -677,17 +677,7 @@ mod tests {
         const IDLE_CONNECTIONS: usize = 8;
 
         fn postgres_url(test: &str) -> Option<String> {
-            match std::env::var("TINYCLOUD_TEST_POSTGRES_URL") {
-                Ok(url) if !url.trim().is_empty() => Some(url),
-                _ => {
-                    assert!(
-                        std::env::var_os("CI").is_none(),
-                        "{test} requires TINYCLOUD_TEST_POSTGRES_URL, which is unset in CI (TC-381)"
-                    );
-                    eprintln!("skipping {test}: TINYCLOUD_TEST_POSTGRES_URL is unset");
-                    None
-                }
-            }
+            crate::test_support::postgres_test_url(test)
         }
 
         /// Resets the client connection that sends `marker`, before the
