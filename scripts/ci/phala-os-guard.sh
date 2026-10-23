@@ -67,4 +67,14 @@ tar -xzf "${work}/image.tar.gz" -C "${work}/image" || fail "Cannot extract the i
 got="$(cd "${work}/image" && sha256sum sha256sum.txt)" || fail "Cannot hash sha256sum.txt"
 got="${got%% *}"
 [ "${got}" = "${hash}" ] || fail "sha256sum.txt of the image from ${url} hashes to ${got}, not ${hash}"
+# The manifest hash is pinned, so its entries are trusted: now check every listed file against them. Entries
+# that are malformed, absolute or contain ".." are refused so no path leaves the extracted directory.
+manifest_re='^[0-9a-f]{64} [ *](.+)$'
+while IFS= read -r line || [ -n "${line}" ]; do
+  [[ "${line}" =~ ${manifest_re} ]] || fail "sha256sum.txt of the image from ${url} has a malformed line"
+  entry="${BASH_REMATCH[1]}"
+  [[ "${entry}" != /* && "${entry}" != *..* ]] || fail "sha256sum.txt of the image from ${url} lists a path outside the image: ${entry}"
+done <"${work}/image/sha256sum.txt"
+chk="$(cd "${work}/image" && sha256sum -c --strict sha256sum.txt 2>&1)" ||
+  fail "A file of the image from ${url} does not match its sha256sum.txt: ${chk//$'\n'/; }"
 echo "The CVM runs the pinned dev OS image ${name} (${hash}); its integrity check passed"

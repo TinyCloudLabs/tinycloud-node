@@ -68,7 +68,7 @@ deploy, unless the `tinycloud-node` CVM reports one of:
   `scripts/ci/phala-dev-os-allowlist.txt` (today only `dstack-dev-0.5.12`), and
   that passes a fresh check in the same job: `download.dstack.org` serves
   `mr_<hash>.tar.gz`, and `sha256sum sha256sum.txt` of the extracted archive
-  equals `<hash>`.
+  equals `<hash>`, and every file it lists matches (`sha256sum -c`).
 
 Anything else fails closed: an unknown dev hash, a missing field, a failed fetch
 or a hash mismatch. The allowlist is changed only by a reviewed PR. The logic is

@@ -39,17 +39,30 @@ cp "${STUB_TARBALL}" "${out}"
 STUB
 chmod +x "${root}/bin/phala" "${root}/bin/curl"
 
-# A fake image whose sha256sum.txt hashes to GOOD_HASH, and one that does not match it.
-make_image() { # <dir> <content>
-  mkdir "$1"
-  printf '%s\n' "$2" >"$1/sha256sum.txt"
-  echo kernel >"$1/bzImage"
-  tar -czf "$1.tar.gz" -C "$1" sha256sum.txt bzImage
+# A fake image: bzImage and ovmf.fd plus a sha256sum.txt that lists them (or <manifest-extra>), packed with <omit> left out.
+make_image() { # <name> [<manifest-extra-line>] [<omit-file>] [<tamper-file>]
+  local dir="${root}/fixtures/$1"
+  mkdir "${dir}"
+  echo kernel >"${dir}/bzImage"; echo firmware >"${dir}/ovmf.fd"
+  (cd "${dir}" && sha256sum bzImage ovmf.fd >sha256sum.txt)
+  [ -z "${2:-}" ] || printf '%s\n' "$2" >>"${dir}/sha256sum.txt"
+  [ -z "${4:-}" ] || echo changed >"${dir}/$4"
+  [ -z "${3:-}" ] || rm "${dir}/$3"
+  (cd "${dir}" && tar -czf "../$1.tar.gz" *)
+  sha256sum "${dir}/sha256sum.txt" | cut -d' ' -f1
 }
-make_image "${root}/fixtures/good" "good image manifest"
-make_image "${root}/fixtures/other" "tampered image manifest"
-GOOD_HASH="$(sha256sum "${root}/fixtures/good/sha256sum.txt" | cut -d' ' -f1)"
+ZERO="$(printf '0%.0s' {1..64})"
+GOOD_HASH="$(make_image good)"
+# Same manifest as good, but a listed file was altered or is absent from the archive.
+make_image tampered "" "" bzImage >/dev/null
+make_image missing "" ovmf.fd >/dev/null
+# A manifest of its own (so its own hash), whose extra entry is the thing under test.
+ABSOLUTE_HASH="$(make_image absolute "${ZERO}  /etc/hostname")"
+DOTDOT_HASH="$(make_image dotdot "${ZERO}  ../escape")"
+MALFORMED_HASH="$(make_image malformed "not a manifest line")"
+make_image other "${ZERO}  ovmf.fd" >/dev/null
 printf '# test allowlist\n%s  # the fake dev image\n' "${GOOD_HASH}" >"${root}/allowlist.txt"
+printf '%s\n' "${ABSOLUTE_HASH}" "${DOTDOT_HASH}" "${MALFORMED_HASH}" >>"${root}/allowlist.txt"
 echo "not a tarball" >"${root}/fixtures/garbage.tar.gz"
 
 os_json() { # <is_dev> <name> <hash>
@@ -94,6 +107,21 @@ no_leftovers "good pre-check"
 
 run "$(os_json true "dstack-dev-0.5.12" "${GOOD_HASH}")" STUB_TARBALL="${root}/fixtures/other.tar.gz"
 expect "pinned dev image with a bad sha is refused" 1 "hashes to [0-9a-f]{64}, not ${GOOD_HASH}"; no_leftovers "bad sha"
+
+run "$(os_json true "dstack-dev-0.5.12" "${GOOD_HASH}")" STUB_TARBALL="${root}/fixtures/tampered.tar.gz"
+expect "a tampered file listed in the manifest is refused" 1 "bzImage: FAILED"; no_leftovers "tampered file"
+
+run "$(os_json true "dstack-dev-0.5.12" "${GOOD_HASH}")" STUB_TARBALL="${root}/fixtures/missing.tar.gz"
+expect "a manifest entry with a missing file is refused" 1 "ovmf.fd: FAILED open or read"; no_leftovers "missing file"
+
+run "$(os_json true "dstack-dev-0.5.12" "${ABSOLUTE_HASH}")" STUB_TARBALL="${root}/fixtures/absolute.tar.gz"
+expect "a manifest entry with an absolute path is refused" 1 "lists a path outside the image: /etc/hostname"; no_leftovers "absolute path"
+
+run "$(os_json true "dstack-dev-0.5.12" "${DOTDOT_HASH}")" STUB_TARBALL="${root}/fixtures/dotdot.tar.gz"
+expect "a manifest entry with .. is refused" 1 "lists a path outside the image: ../escape"; no_leftovers "dotdot path"
+
+run "$(os_json true "dstack-dev-0.5.12" "${MALFORMED_HASH}")" STUB_TARBALL="${root}/fixtures/malformed.tar.gz"
+expect "a malformed manifest line is refused" 1 "has a malformed line"; no_leftovers "malformed manifest"
 
 run "$(os_json true "dstack-dev-0.5.12" "$(printf 'b%.0s' {1..64})")"
 expect "an unknown dev hash is refused" 1 "not in the pinned allowlist"; no_curl "unknown dev hash"
