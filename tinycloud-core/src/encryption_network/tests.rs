@@ -2085,3 +2085,22 @@ async fn postgres_block_and_unblock_take_and_release_the_network_row_lock() {
     .await;
     assert!(results.iter().all(|r| r.is_ok()));
 }
+
+#[tokio::test]
+async fn per_app_prefix_cap_ignores_keys_of_an_app_id_that_extends_it() {
+    let svc = make_service(fresh_db().await).with_key_cap_per_app_prefix(2);
+    create_network(&svc).await;
+    svc.create_key(&key_loc("apps/ab/x"), true).await.unwrap();
+    svc.create_key(&key_loc("apps/ab/y"), true).await.unwrap();
+    svc.create_key(&key_loc("apps/ab.c/x"), true).await.unwrap();
+    svc.create_key(&key_loc("apps/a/x"), true).await.unwrap();
+    svc.create_key(&key_loc("apps/a/y"), true).await.unwrap();
+    let err = svc
+        .create_key(&key_loc("apps/a/z"), true)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, EncryptionServiceError::KeyLimitExceeded),
+        "{err:?}"
+    );
+}
