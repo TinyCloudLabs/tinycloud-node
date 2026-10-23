@@ -5,8 +5,8 @@
 //! ([`crate::request_telemetry::note_failure`]); the node's tracing fairing
 //! turns it into one log line when the response is sent. A note holds only
 //! fixed vocabulary (a [`Service`], a [`FailureCode`], a [`failure_kind`]) and
-//! a [`db_ref`] hash. It never holds an error message, SQL, a space id or a
-//! database name.
+//! a keyed database pseudonym. It never holds an error message, SQL, a space
+//! id or a database name.
 
 use sea_orm::{
     error::{ConnAcquireErr, RuntimeErr, SqlxError},
@@ -55,8 +55,10 @@ pub struct FailureNote {
     /// One of the fixed strings of [`failure_kind`].
     pub kind: &'static str,
     pub write_may_have_applied: bool,
-    /// [`db_ref`], when the failing layer knows which database it was using.
-    pub db_ref: Option<String>,
+    /// The keyed pseudonym of the database in use (64 lowercase hex digits,
+    /// [`crate::telemetry::Pseudonymizer::db_hash`]), when the failing layer
+    /// knows it.
+    pub db_hash: Option<String>,
 }
 
 /// A fixed class of a database failure, from the error's variant and, for a
@@ -82,19 +84,6 @@ pub fn failure_kind(error: &DbErr) -> &'static str {
         },
         _ => "other",
     }
-}
-
-/// A short stable reference to a database: the first 8 bytes of
-/// `BLAKE3("tc-diag-db-v1" || space id || "/" || database name)`, as 16
-/// lowercase hex characters. It lets two log lines be matched to the same
-/// database without naming it.
-pub fn db_ref(space: &str, db_name: &str) -> String {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"tc-diag-db-v1");
-    hasher.update(space.as_bytes());
-    hasher.update(b"/");
-    hasher.update(db_name.as_bytes());
-    hex::encode(&hasher.finalize().as_bytes()[..8])
 }
 
 #[cfg(test)]
@@ -185,29 +174,53 @@ mod tests {
     }
 
     #[test]
-    fn db_ref_is_a_stable_16_hex_hash_of_the_space_and_database() {
-        let space = "tinycloud:pkh:eip155:1:0xAbC0000000000000000000000000000000000001:default";
-        let reference = db_ref(space, "notes.db");
-        assert_eq!(reference, db_ref(space, "notes.db"), "stable");
-        assert_eq!(reference.len(), 16);
-        assert!(
-            reference
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
-            "{reference}"
-        );
-        assert_ne!(reference, db_ref(space, "other.db"), "differs per database");
+    fn db_hash_is_the_requests_keyed_pseudonym_and_never_holds_its_inputs() {
+        use crate::{
+            keys::StaticSecret,
+            request_telemetry::{self, RequestContext},
+            telemetry::Pseudonymizer,
+        };
+        use std::sync::Arc;
+
+        let pseudonymizer = Arc::new(Pseudonymizer::new(
+            &StaticSecret::new(vec![0x42; 32]).unwrap(),
+        ));
+        let space: tinycloud_auth::resource::SpaceId =
+            "tinycloud:pkh:eip155:1:0x1234567890123456789012345678901234567890:default"
+                .parse()
+                .unwrap();
+        let other_space: tinycloud_auth::resource::SpaceId =
+            "tinycloud:pkh:eip155:1:0x1234567890123456789012345678901234567890:other"
+                .parse()
+                .unwrap();
+
+        assert_eq!(request_telemetry::db_hash("sql", &space, "notes.db"), None);
+
+        let _request = request_telemetry::enter(Some(RequestContext::new(
+            uuid::Uuid::nil(),
+            Arc::clone(&pseudonymizer),
+        )));
+        let hash = request_telemetry::db_hash("sql", &space, "notes.db").unwrap();
+        let expected = pseudonymizer.db_hash("sql", &space, "notes.db").unwrap();
+        assert_eq!(hash, hex::encode(expected.into_bytes()));
+        assert_eq!(hash.len(), 64);
+        assert!(hash
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+        for input in [
+            "notes.db",
+            "default",
+            "1234567890123456789012345678901234567890",
+        ] {
+            assert!(!hash.contains(input), "{input}");
+        }
         assert_ne!(
-            reference,
-            db_ref(
-                "tinycloud:pkh:eip155:1:0xAbC0000000000000000000000000000000000002:default",
-                "notes.db"
-            ),
-            "differs per space"
+            Some(&hash),
+            request_telemetry::db_hash("sql", &space, "x.db").as_ref()
         );
-        assert!(!space.contains(&reference) && !reference.contains("notes"));
-        // The documented construction, not merely some hash.
-        let expected = blake3::hash(format!("tc-diag-db-v1{space}/notes.db").as_bytes());
-        assert_eq!(reference, hex::encode(&expected.as_bytes()[..8]));
+        assert_ne!(
+            Some(&hash),
+            request_telemetry::db_hash("sql", &other_space, "notes.db").as_ref()
+        );
     }
 }

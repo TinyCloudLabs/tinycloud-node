@@ -259,7 +259,7 @@ struct DatabaseFailureLine<'a> {
     failure_kind: &'static str,
     write_may_have_applied: bool,
     /// Absent when the failing layer does not know its database.
-    db_ref: Option<String>,
+    db_hash: Option<String>,
 }
 
 impl<'a> DatabaseFailureLine<'a> {
@@ -291,7 +291,7 @@ impl<'a> DatabaseFailureLine<'a> {
             elapsed_ms: elapsed.as_millis() as u64,
             failure_kind: note.kind,
             write_may_have_applied: note.write_may_have_applied,
-            db_ref: note.db_ref,
+            db_hash: note.db_hash,
         })
     }
 
@@ -305,7 +305,7 @@ impl<'a> DatabaseFailureLine<'a> {
             elapsed_ms = self.elapsed_ms,
             failure_kind = self.failure_kind,
             write_may_have_applied = self.write_may_have_applied,
-            db_ref = self.db_ref.as_deref(),
+            db_hash = self.db_hash.as_deref(),
             "database failure answered with a 5xx"
         );
     }
@@ -895,7 +895,7 @@ mod tests {
             code,
             kind: "pool_timeout",
             write_may_have_applied: code == FailureCode::OutcomeUnknown,
-            db_ref: None,
+            db_hash: None,
         }
     }
 
@@ -956,17 +956,14 @@ mod tests {
     }
 
     const SECRET_SPACE: &str =
-        "tinycloud:pkh:eip155:1:0x00000000000000000000000000000000000000aa:secret-space";
+        "tinycloud:pkh:eip155:1:0x1234567890123456789012345678901234567890:secret-space";
     const SECRET_DB: &str = "secret-db-name";
     const SECRET_TEXT: &str = "secret-database-error-text";
 
     #[rocket::get("/tc1796-with-db")]
     fn failing_with_db() -> (Status, String) {
         request_telemetry::note_failure(FailureNote {
-            db_ref: Some(tinycloud_core::failure_diagnostic::db_ref(
-                SECRET_SPACE,
-                SECRET_DB,
-            )),
+            db_hash: request_telemetry::db_hash("sql", &SECRET_SPACE.parse().unwrap(), SECRET_DB),
             ..note(FailureCode::UnavailableRetryable)
         });
         (
@@ -1053,7 +1050,7 @@ mod tests {
                 "write_may_have_applied",
             ];
             if with_db {
-                fields.push("db_ref");
+                fields.push("db_hash");
             }
             fields.sort_unstable();
             fields
@@ -1080,17 +1077,18 @@ mod tests {
         assert_eq!(fields["route"], "/tc1796-with-db");
         assert_eq!(fields["failure_kind"], "pool_timeout");
         assert_eq!(fields["write_may_have_applied"], false);
-        assert_eq!(
-            fields["db_ref"],
-            tinycloud_core::failure_diagnostic::db_ref(SECRET_SPACE, SECRET_DB)
-        );
+        let expected_hash =
+            Pseudonymizer::new(&tinycloud_core::keys::StaticSecret::new(vec![0x42; 32]).unwrap())
+                .db_hash("sql", &SECRET_SPACE.parse().unwrap(), SECRET_DB)
+                .unwrap();
+        assert_eq!(fields["db_hash"], hex::encode(expected_hash.into_bytes()));
         assert!(fields["elapsed_ms"].is_u64());
 
         let second = &events[1];
         assert_eq!(
             keys(second),
             allowed(false),
-            "db_ref is omitted when unknown"
+            "db_hash is omitted when unknown"
         );
         let fields = &second["fields"];
         assert_eq!(fields["status"], 500);

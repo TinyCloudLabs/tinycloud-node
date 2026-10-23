@@ -179,6 +179,18 @@ pub fn observe_space(space: &SpaceId) {
     }
 }
 
+/// The keyed pseudonym of the database (`service`, `space`, `physical_name`)
+/// as 64 lowercase hex digits, from the current request's pseudonymizer
+/// ([`Pseudonymizer::db_hash`]). `None` outside an HTTP request.
+pub fn db_hash(service: &str, space: &SpaceId, physical_name: &str) -> Option<String> {
+    let context = current()?;
+    let hash = context
+        .pseudonymizer
+        .db_hash(service, space, physical_name)
+        .ok()?;
+    Some(hex::encode(hash.into_bytes()))
+}
+
 /// Record the database failure the current request is about to answer with a
 /// 5xx (TC-1796); a later note replaces an earlier one. A no-op outside an
 /// HTTP request.

@@ -19,7 +19,7 @@ use crate::database_artifacts::{
     DatabaseArtifactError, DatabaseArtifactRepository,
 };
 use crate::db_pool::{is_transient_error, track_writes, transient_error_class};
-use crate::failure_diagnostic::{db_ref, failure_kind, FailureCode, FailureNote, Service};
+use crate::failure_diagnostic::{failure_kind, FailureCode, FailureNote, Service};
 use crate::{request_cancel, request_telemetry};
 
 use super::{
@@ -987,7 +987,7 @@ fn note_unavailable(kind: &'static str, space: &SpaceId, db_name: &str) {
         code: FailureCode::UnavailableRetryable,
         kind,
         write_may_have_applied: false,
-        db_ref: Some(db_ref(&space.to_string(), db_name)),
+        db_hash: request_telemetry::db_hash("sql", space, db_name),
     });
 }
 

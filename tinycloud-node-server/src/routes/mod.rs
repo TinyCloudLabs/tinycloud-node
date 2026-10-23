@@ -204,7 +204,7 @@ fn database_failure(
         code,
         kind: failure_kind(error),
         write_may_have_applied,
-        db_ref: None,
+        db_hash: None,
     });
     (status, body)
 }
