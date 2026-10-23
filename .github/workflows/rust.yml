@@ -127,7 +127,7 @@ jobs:
     # service container above. tinycloud-core's other ~300 tests — which no CI
     # job had ever executed — run here too.
     - name: Run the workspace test suite
-      timeout-minutes: 15
+      timeout-minutes: 25
       run: cargo test --workspace
 
     # The workspace suite does not enable tinycloud-core's DuckDB feature.
