@@ -184,20 +184,25 @@ impl Drop for PostgresTestSchema {
                     // end the sessions still holding locks in the schema
                     // first, as `DROP DATABASE ... WITH (FORCE)` does for
                     // `PostgresTestDatabase`.
-                    admin
+                    // Best effort: a terminate that fails (for example on a
+                    // session that already exited) must not stop the schema
+                    // from being dropped below.
+                    let _ = admin
                         .execute(Statement::from_sql_and_values(
                             DbBackend::Postgres,
                             "SELECT pg_terminate_backend(holders.pid) FROM ( \
                                SELECT DISTINCT l.pid FROM pg_locks l \
                                JOIN pg_class c ON c.oid = l.relation \
                                JOIN pg_namespace n ON n.oid = c.relnamespace \
+                               JOIN pg_stat_activity a ON a.pid = l.pid \
+                                 AND a.backend_type = 'client backend' \
                                WHERE l.database = (SELECT oid FROM pg_database \
                                                    WHERE datname = current_database()) \
                                  AND n.nspname = $1 AND l.pid <> pg_backend_pid() \
                              ) holders",
                             [schema.clone().into()],
                         ))
-                        .await?;
+                        .await;
                     admin
                         .execute(Statement::from_string(
                             DbBackend::Postgres,
