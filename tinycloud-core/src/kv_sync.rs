@@ -68,7 +68,8 @@ const SPACE_SEQUENCE_LOCK_DOMAIN: &[u8] = b"tinycloud/kv-seq/v1\0";
 
 /// Advisory-lock key for `space`: the first 8 bytes of
 /// `blake3("tinycloud/kv-seq/v1\0" || space)`, big-endian.
-fn space_sequence_lock_key(space: &SpaceId) -> i64 {
+#[doc(hidden)]
+pub fn space_sequence_lock_key(space: &SpaceId) -> i64 {
     let mut preimage = SPACE_SEQUENCE_LOCK_DOMAIN.to_vec();
     preimage.extend_from_slice(space.to_string().as_bytes());
     let digest = crate::hash::hash(&preimage);
@@ -927,6 +928,8 @@ pub(crate) mod tests {
         Put(&'a str, &'a [u8]),
         PutMeta(&'a str, &'a [u8], &'a [(&'a str, &'a str)]),
         Del(&'a str),
+        /// A read: it goes through the read-audit pipeline (TC-1317).
+        Get(&'a str),
     }
 
     impl Owner {
@@ -956,6 +959,7 @@ pub(crate) mod tests {
                 let (key, ability) = match op {
                     Op::Put(key, _) | Op::PutMeta(key, _, _) => (key, "tinycloud.kv/put"),
                     Op::Del(key) => (key, "tinycloud.kv/del"),
+                    Op::Get(key) => (key, "tinycloud.kv/get"),
                 };
                 let resource = (*space).clone().to_resource(
                     "kv".parse::<Service>().unwrap(),
@@ -1043,7 +1047,7 @@ pub(crate) mod tests {
             let (key, value, metadata) = match op {
                 Op::Put(key, value) => (key, value, &[][..]),
                 Op::PutMeta(key, value, metadata) => (key, value, *metadata),
-                Op::Del(_) => continue,
+                Op::Del(_) | Op::Get(_) => continue,
             };
             let mut stage = HashBuffer::new(Vec::new());
             stage.write_all(value).await.unwrap();
@@ -1075,6 +1079,46 @@ pub(crate) mod tests {
         invoke(db, owner, ops, KvInvokeOptions::default())
             .await
             .unwrap()
+    }
+
+    /// TC-1317: with the read-audit drain held, a KV read answers busy at
+    /// its bound without returning data, while KV writes, which are not
+    /// audited reads, are unaffected.
+    #[tokio::test]
+    async fn tc1317_a_held_read_audit_bounds_reads_and_spares_writes() {
+        let db = sqlite_db().await;
+        db.set_read_audit_wait(std::time::Duration::from_millis(200));
+        let owner = Owner::generate();
+        host(&db, &owner).await;
+        run(&db, &owner, &[Op::Put("notes/a", b"a")]).await;
+
+        let held = db.read_audit_pipeline().hold_drain().await;
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            invoke(
+                &db,
+                &owner,
+                &[Op::Get("notes/a")],
+                KvInvokeOptions::default(),
+            ),
+        )
+        .await
+        .expect("a read must not wait past its bound");
+        let error = read.expect_err("a read whose audit is not confirmed must fail");
+        assert!(error.starts_with("read_audit_busy:"), "{error}");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            invoke(
+                &db,
+                &owner,
+                &[Op::Put("notes/b", b"b")],
+                KvInvokeOptions::default(),
+            ),
+        )
+        .await
+        .expect("a write does not wait on the read audit")
+        .unwrap();
+        drop(held);
     }
 
     /// A delivered change: the key and its etag, `None` for a tombstone.

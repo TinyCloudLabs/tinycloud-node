@@ -33,7 +33,7 @@ async-std = [
 [dependencies]
 dashmap = "5.5"
 async-trait.workspace = true
-sea-orm = { version = "1.1", default-features = false, features = ["macros", "with-time", "with-json"] }
+sea-orm = { version = "1.1", default-features = false, features = ["macros", "with-time", "with-json", "postgres-array"] }
 sea-orm-migration = { version = "1.1", default-features = false }
 futures.workspace = true
 pin-project.workspace = true
@@ -50,7 +50,7 @@ multihash-derive = "0.9"
 rusqlite.workspace = true
 sqlparser.workspace = true
 tracing.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
 duckdb = { version = "1.1", features = ["bundled", "appender-arrow"], optional = true }
 arrow = { version = "56", features = ["ipc"], optional = true }
 tempfile = "3"
@@ -84,6 +84,7 @@ unicode-normalization = "0.1"
 [dev-dependencies]
 sea-orm = { version = "1.1", features = ["runtime-tokio-rustls", "sqlx-sqlite"] }
 async-std = { version = "1", features = ["attributes"] }
-tokio.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber = "0.3"
 iri-string.workspace = true
 proptest = "1"

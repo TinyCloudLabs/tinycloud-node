@@ -888,15 +888,8 @@ async fn status_signed_invocation_cannot_revoke_but_revoke_signed_invocation_can
                 .body(json!({"cid": target.to_string()}).to_string()),
         )
         .await;
-        assert_eq!(
-            status_response,
-            if target == raw {
-                Status::Ok
-            } else {
-                Status::NotFound
-            },
-            "{target}: {body}"
-        );
+        // A canonical CID resolves to its stored historical encoding (TC-821).
+        assert_eq!(status_response, Status::Ok, "{target}: {body}");
         let before_revocations = revocation::Entity::find().count(state.connection()).await?;
         let before_events = event_order::Entity::find()
             .count(state.connection())
@@ -925,11 +918,7 @@ async fn status_signed_invocation_cannot_revoke_but_revoke_signed_invocation_can
                 .delegation_status(Hash::from(target), &owner, &[])
                 .await
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?,
-            if target == raw {
-                Some(DelegationStatus::Active)
-            } else {
-                None
-            }
+            Some(DelegationStatus::Active)
         );
     }
     let revoke = make_invocation_from_uris(
@@ -975,5 +964,183 @@ async fn status_signed_invocation_cannot_revoke_but_revoke_signed_invocation_can
             .map_err(|error| anyhow::anyhow!(error.to_string()))?,
         Some(DelegationStatus::Revoked)
     );
+    Ok(())
+}
+
+/// TC-821: a revocation naming the unstored canonical CID enters the target
+/// space's event history exactly as one naming the stored raw CID does, by the
+/// owner directly and through an owner exact-CID revoke grant.
+#[tokio::test]
+async fn canonical_cid_revocations_are_sequenced_like_raw_ones() -> Result<()> {
+    use tinycloud_core::{
+        hash::{hash, Hash},
+        models::revocation,
+        relationships::event_order,
+        sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder},
+    };
+
+    let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../tinycloud-core/tests/fixtures/tc1071/generated");
+    let fixtures: Vec<Value> =
+        serde_json::from_slice(&std::fs::read(fixture_dir.join("manifest.json"))?)?;
+    let fixture = fixtures
+        .iter()
+        .find(|row| row["database"] == "single-v0.sqlite")
+        .ok_or_else(|| anyhow::anyhow!("missing genuine single-v0 fixture"))?;
+    let raw: Cid = fixture["rows"][0]["raw_cid"].as_str().unwrap().parse()?;
+    let canonical_header = fixture["canonical_header"].as_str().unwrap();
+    let (_, canonical_bytes) = TinyCloudDelegation::decode(canonical_header)?;
+    let canonical = hash(&canonical_bytes).to_cid(0x55);
+    assert_ne!(raw, canonical);
+    let key = SigningKey::from_bytes(&[7; 32].into())?;
+    let public = key.verifying_key().to_encoded_point(false);
+    let address: [u8; 20] = Keccak256::digest(&public.as_bytes()[1..])[12..].try_into()?;
+    let owner = format!("did:pkh:eip155:1:0x{}", encode_eip55(&address));
+    let wallet = Wallet {
+        key,
+        address,
+        space: SpaceId::new(owner.parse()?, "single-v0".parse()?),
+    };
+
+    for grant_path in [false, true] {
+        let mut placements = Vec::new();
+        for target in [raw, canonical] {
+            let label = format!("{} {target}", if grant_path { "grant" } else { "direct" });
+            let directory = tempfile::tempdir()?;
+            let path = directory.path().join("historical.sqlite");
+            std::fs::copy(fixture_dir.join("single-v0.sqlite"), &path)?;
+            let (client, _data) =
+                client_with_database(&format!("sqlite:{}?mode=rwc", path.display()), [31; 32])
+                    .await?;
+            let state = client
+                .rocket()
+                .state::<tinycloud::TinyCloud>()
+                .expect("managed database");
+            let target_row = event_order::Entity::find()
+                .filter(event_order::Column::Event.eq(Hash::from(raw)))
+                .one(state.connection())
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("raw grant has an event_order row"))?;
+
+            let revocation_header = if grant_path {
+                let now = time::OffsetDateTime::now_utc();
+                let prepared = prepare_session(SessionConfig {
+                    abilities: HashMap::new(),
+                    space_abilities: None,
+                    raw_abilities: HashMap::from([(
+                        format!("urn:cid:{target}"),
+                        vec!["tinycloud.delegation/revoke".parse()?],
+                    )]),
+                    address: wallet.address,
+                    chain_id: 1,
+                    domain: "localhost".parse()?,
+                    issued_at: now.into(),
+                    space_id: wallet.space.clone(),
+                    additional_spaces: None,
+                    not_before: None,
+                    expiration_time: (now + time::Duration::hours(1)).into(),
+                    parents: None,
+                    jwk: None,
+                    delegate_uri: None,
+                    nonce: None,
+                    invocation_ttl_secs: None,
+                })?;
+                let signature = wallet.sign(&prepared.siwe)?;
+                let control = complete_session_setup(SignedSession {
+                    session: prepared,
+                    signature,
+                })?;
+                let activated: Value = serde_json::from_str(
+                    &expect_ok(
+                        &format!("{label}: owner exact-CID control"),
+                        client.post("/delegate").header(Header::new(
+                            "Authorization",
+                            authorization(&control.delegation_header)?,
+                        )),
+                    )
+                    .await?,
+                )?;
+                let control_cid: Cid = activated["cid"].as_str().unwrap().parse()?;
+                make_invocation_from_uris(
+                    [(
+                        format!("urn:cid:{target}").parse()?,
+                        ["tinycloud.delegation/revoke".parse()?],
+                    )],
+                    &control_cid,
+                    &control.jwk,
+                    &control.verification_method,
+                    (time::OffsetDateTime::now_utc() + time::Duration::minutes(5)).unix_timestamp()
+                        as f64,
+                    InvocationOptions::default(),
+                )?
+                .encode()?
+            } else {
+                let (TinyCloudDelegation::Cacao(cacao), _) =
+                    TinyCloudDelegation::decode(canonical_header)?
+                else {
+                    panic!("historical CACAO");
+                };
+                let mut message: Message = cacao.payload().clone().try_into()?;
+                message.uri = format!("ucan:{target}").parse()?;
+                message.statement = None;
+                message.resources.clear();
+                let signature = wallet.sign(&message)?;
+                TinyCloudRevocation::Cacao(Box::new(
+                    tinycloud_auth::cacaos::siwe_cacao::Payload::from(message)
+                        .sign::<tinycloud_auth::cacaos::siwe_cacao::Eip191>(signature),
+                ))
+                .encode()?
+            };
+
+            let before_revocations = revocation::Entity::find().count(state.connection()).await?;
+            let before_events = event_order::Entity::find()
+                .count(state.connection())
+                .await?;
+            let space_head = event_order::Entity::find()
+                .filter(event_order::Column::Space.eq(target_row.space.clone()))
+                .order_by_desc(event_order::Column::Seq)
+                .one(state.connection())
+                .await?
+                .expect("target space has events")
+                .seq;
+            let response: Value = serde_json::from_str(
+                &expect_ok(
+                    &format!("{label}: revoke"),
+                    client
+                        .post("/revoke")
+                        .header(Header::new("Authorization", revocation_header)),
+                )
+                .await?,
+            )?;
+            assert_eq!(response["cid"], target.to_string(), "{label}");
+            assert_eq!(
+                revocation::Entity::find().count(state.connection()).await?,
+                before_revocations + 1,
+                "{label}"
+            );
+            assert_eq!(
+                event_order::Entity::find()
+                    .count(state.connection())
+                    .await?,
+                before_events + 1,
+                "{label}: the revocation enters the event history"
+            );
+            let appended = event_order::Entity::find()
+                .filter(event_order::Column::Seq.gt(space_head))
+                .all(state.connection())
+                .await?;
+            assert_eq!(appended.len(), 1, "{label}");
+            assert_eq!(appended[0].space, target_row.space, "{label}: target space");
+            assert!(
+                revocation::Entity::find_by_id(appended[0].event)
+                    .one(state.connection())
+                    .await?
+                    .is_some(),
+                "{label}: the appended event is the revocation"
+            );
+            placements.push((appended[0].space.clone(), appended[0].seq - space_head));
+        }
+        assert_eq!(placements[0], placements[1], "canonical ordered like raw");
+    }
     Ok(())
 }

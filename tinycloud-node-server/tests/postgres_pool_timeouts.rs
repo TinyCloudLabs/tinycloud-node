@@ -9,11 +9,14 @@
 //!   `SqlError::Unavailable` (503) that releases the database's lock.
 //! - Large artifacts still persist and hydrate under the default limits.
 //!
-//! These run wherever `TINYCLOUD_TEST_POSTGRES_URL` is set, and fail in CI
-//! without it (TC-381):
+//! PostgreSQL-backed tests connect only when `TINYCLOUD_TEST_POSTGRES_URL` is set
+//! and either `GITHUB_ACTIONS=true` (GitHub Actions) or `TINYCLOUD_ALLOW_LOCAL_PG=1`
+//! (an isolated server you started yourself). Otherwise they skip. On GitHub
+//! Actions, an unset URL fails the test (TC-381).
 //!
 //! ```text
-//! TINYCLOUD_TEST_POSTGRES_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres \
+//! TINYCLOUD_ALLOW_LOCAL_PG=1 \
+//! TINYCLOUD_TEST_POSTGRES_URL=postgres://<user>:<password>@<host>:<port>/<database> \
 //!   cargo test -p tinycloud-node --test postgres_pool_timeouts
 //! ```
 //!
@@ -33,9 +36,12 @@
 //! cargo test -p tinycloud-node --test postgres_pool_timeouts --no-run   # note the binary path
 //! docker cp target/debug/deps/postgres_pool_timeouts-<hash> tc1054-pg:/t
 //! docker exec -e TINYCLOUD_TEST_BLACKHOLE=1 \
+//!   -e TINYCLOUD_ALLOW_LOCAL_PG=1 \
 //!   -e TINYCLOUD_TEST_POSTGRES_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres \
 //!   tc1054-pg /t blackhole --test-threads 1 --nocapture
 //! ```
+
+mod common;
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -48,7 +54,7 @@ use tinycloud_auth::resource::SpaceId;
 use tinycloud_auth::ssi::dids::DIDBuf;
 use tinycloud_auth::ssi::jwk::JWK;
 use tinycloud_core::database_artifacts::{
-    DatabaseArtifactError, DatabaseArtifactRepository, SeaOrmDatabaseArtifactRepository,
+    DatabaseArtifactError, DatabaseArtifactRepository, MemorySink, SeaOrmDatabaseArtifactRepository,
 };
 use tinycloud_core::db_pool::{is_transient_error, transient_error_class, StatementTimeoutMode};
 use tinycloud_core::sea_orm::{
@@ -57,32 +63,26 @@ use tinycloud_core::sea_orm::{
 };
 use tinycloud_core::sql::{SqlError, SqlRequest, SqlResponse, SqlService, SqlValue};
 use tinycloud_core::RecoveringConnection;
-use tinycloud_core::{SizeTrackingArtifactRepository, SqlSizes};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 fn postgres_url(test: &str) -> Option<String> {
-    match std::env::var("TINYCLOUD_TEST_POSTGRES_URL") {
-        Ok(url) if !url.trim().is_empty() => Some(url),
-        _ => {
-            assert!(
-                std::env::var_os("CI").is_none(),
-                "{test} requires TINYCLOUD_TEST_POSTGRES_URL, which is unset in CI (TC-381)"
-            );
-            eprintln!("skipping {test}: TINYCLOUD_TEST_POSTGRES_URL is unset");
-            None
-        }
-    }
+    common::postgres_test_url(test)
 }
 
 /// The black-hole tests' URL, when `TINYCLOUD_TEST_BLACKHOLE=1` allows them.
 fn blackhole_url(test: &str) -> Option<String> {
     if std::env::var("TINYCLOUD_TEST_BLACKHOLE").as_deref() != Ok("1") {
         assert!(
-            std::env::var_os("CI").is_none(),
-            "{test} requires TINYCLOUD_TEST_BLACKHOLE=1 in CI (TC-1054)"
+            std::env::var("GITHUB_ACTIONS").as_deref() != Ok("true"),
+            "{test} requires TINYCLOUD_TEST_BLACKHOLE=1 on GitHub Actions (TC-1054)"
         );
-        eprintln!("skipping {test}: TINYCLOUD_TEST_BLACKHOLE is not 1");
+        use std::io::Write;
+        // Written to the process stderr directly: libtest captures `eprintln!` output of passing tests.
+        let _ = writeln!(
+            std::io::stderr(),
+            "skipping {test}: TINYCLOUD_TEST_BLACKHOLE is not 1"
+        );
         return None;
     }
     postgres_url(test)
@@ -224,7 +224,7 @@ async fn write(
             db,
             insert_blob(bytes),
             None,
-            "tinycloud.sql/write".into(),
+            "tinycloud.sql/admin".into(),
         )
         .await
         .map(|_| ())
@@ -561,17 +561,16 @@ async fn postgres_large_artifacts_persist_under_default_timeouts() {
     schema.drop().await;
 }
 
-/// A large hydration whose server-side work outlasts the base statement
-/// timeout succeeds, because the size mirror marks the artifact large and
-/// its load runs under the bulk timeout; the same load forced under the base
-/// timeout is cancelled (Opus's M6). The artifact is read through a view
-/// that sleeps 1 s per row, standing in for detoasting and decompressing a
-/// large payload. (A slow network does not exercise this: the artifact is
-/// one row, and PostgreSQL does not cancel a statement while it is writing
-/// a row to the client.)
+/// Hydration is a series of 4 MiB slice statements, each under the BASE
+/// statement timeout (TC-822): a large artifact hydrates through a pool whose
+/// base timeout is far below the whole-artifact transfer, and a slice whose
+/// server-side work outlasts the base timeout is cancelled as a transient
+/// error rather than holding the pool. The slow case reads the artifact
+/// through a view that sleeps 1 s per row, standing in for detoasting a
+/// large payload.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn postgres_large_hydration_runs_under_the_bulk_timeout() {
-    let Some(url) = postgres_url("postgres_large_hydration_runs_under_the_bulk_timeout") else {
+async fn postgres_hydration_slices_run_under_the_base_timeout() {
+    let Some(url) = postgres_url("postgres_hydration_slices_run_under_the_base_timeout") else {
         return;
     };
     let schema = Schema::new(&url, "bulkload").await;
@@ -585,6 +584,29 @@ async fn postgres_large_hydration_runs_under_the_bulk_timeout() {
             write(&seed, &space, "a", 4 * 1024 * 1024).await.unwrap();
         }
     }
+    let strict = pool(schema.url(&url, None), |config| {
+        config.database.statement_timeout_ms = 500;
+        config.database.bulk_statement_timeout_ms = 10_000;
+    })
+    .await;
+    let repository = Arc::new(SeaOrmDatabaseArtifactRepository::new(strict.clone()));
+    let cache = tempfile::TempDir::new().unwrap();
+    let service = SqlService::new(
+        cache.path().to_string_lossy().into_owned(),
+        u64::MAX,
+        repository.clone(),
+    );
+    assert_eq!(
+        count(&service, &space, "a").await.unwrap(),
+        3,
+        "a multi-slice artifact hydrates under the 500 ms base timeout"
+    );
+
+    let meta = repository
+        .load_meta("sql", &space.to_string(), "a")
+        .await
+        .unwrap()
+        .expect("the artifact exists");
     let name = &schema.name;
     schema
         .admin
@@ -597,30 +619,16 @@ async fn postgres_large_hydration_runs_under_the_bulk_timeout() {
         ))
         .await
         .unwrap();
-
-    let strict = pool(schema.url(&url, None), |config| {
-        config.database.statement_timeout_ms = 500;
-        config.database.bulk_statement_timeout_ms = 10_000;
-    })
-    .await;
-    let sizes = SqlSizes::new();
-    sizes.seed_from(&direct).await.unwrap();
-    let repository = Arc::new(SeaOrmDatabaseArtifactRepository::new(strict.clone()));
-    let cache = tempfile::TempDir::new().unwrap();
-    let service = SqlService::new(
-        cache.path().to_string_lossy().into_owned(),
-        u64::MAX,
-        Arc::new(SizeTrackingArtifactRepository::new(
-            repository.clone(),
-            sizes,
-        )),
-    );
-    assert_eq!(count(&service, &space, "a").await.unwrap(), 3);
-
     let error = repository
-        .load_sized("sql", &space.to_string(), "a", Some(0))
+        .read_chunks(
+            "sql",
+            &space.to_string(),
+            "a",
+            &meta,
+            &mut MemorySink::default(),
+        )
         .await
-        .expect_err("the same load under the 500 ms base timeout is cancelled");
+        .expect_err("a slice that outlasts the 500 ms base timeout is cancelled");
     match &error {
         DatabaseArtifactError::Db(error) => {
             assert_eq!(
@@ -991,19 +999,21 @@ async fn blackhole_mid_hydration_waits_for_one_detection_only() {
     assert!(elapsed < Duration::from_secs(6), "{elapsed:?}");
 }
 
-/// The case CI found: the hydration's `BEGIN` draws an idle connection that
-/// died silently, and the load on the next connection is cut mid-transfer.
-/// The attempt is retried as a whole, its `BEGIN` never on its own, so the
-/// request waits for at most two detections, not three.
+/// The case CI found: a hydration statement draws an idle connection that
+/// died silently, and a later slice on the next connection is cut
+/// mid-transfer. Hydration is a series of independently retried statements
+/// (TC-822), so the request waits for at most three detections: the dead idle
+/// connection (the metadata statement, retried once), then the cut slice and
+/// its one retry. Never more: each statement retries once, within the window.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn blackhole_dead_idle_connection_then_cut_hydration_waits_two_detections_at_most() {
+async fn blackhole_dead_idle_connection_then_cut_hydration_waits_three_detections_at_most() {
     let Some(url) = blackhole_url(
-        "blackhole_dead_idle_connection_then_cut_hydration_waits_two_detections_at_most",
+        "blackhole_dead_idle_connection_then_cut_hydration_waits_three_detections_at_most",
     ) else {
         return;
     };
     let (elapsed, _) = mid_hydration_blackhole_with(&url, "bhidlecut", |_| {}, true).await;
-    assert!(elapsed < Duration::from_secs(9), "{elapsed:?}");
+    assert!(elapsed < Duration::from_secs(14), "{elapsed:?}");
 }
 
 /// Black-hole every connection streaming db `a`'s hydration on a cold node,
