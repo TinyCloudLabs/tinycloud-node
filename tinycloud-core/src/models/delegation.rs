@@ -2190,7 +2190,7 @@ mod tests {
             recap.with_action(
                 format!("urn:tinycloud:encryption:{owner}:default/{tail}")
                     .parse()
-                    .unwrap(),
+                    .unwrap_or_else(|e| panic!("resource {tail}: {e:?}")),
                 ability.parse().unwrap(),
                 vec![BTreeMap::<String, serde_json::Value>::new()],
             );
@@ -2332,12 +2332,13 @@ mod tests {
             let origin = case["origin"].as_str().unwrap();
             let id = case["id"].as_str().unwrap();
             let bound = case["bound"].as_bool().unwrap();
-            // A SIWE domain is a bare ASCII authority: the scheme is not part
-            // of it, and a name that is not ASCII cannot be one.
+            // A SIWE domain is a bare ASCII authority and an app id is ASCII:
+            // neither can carry a Unicode name, and a domain cannot have a
+            // trailing dot (those cases are decided on the host in `app_id`).
             let Some(domain) = origin.strip_prefix("https://") else {
                 continue;
             };
-            if !domain.is_ascii() {
+            if !domain.is_ascii() || !id.is_ascii() || domain.ends_with('.') {
                 continue;
             }
             decided += 1;
