@@ -5,6 +5,7 @@
 //! - `urn:tinycloud:encryption:<owner>:<network>/<path>/` names a key prefix.
 //!
 //! Paths are `/`-separated segments of `[a-z0-9][a-z0-9._-]*`.
+//! Key and prefix networks are `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`; bare networks follow [`NetworkId`].
 
 use super::network_id::{NetworkId, NetworkIdError};
 use std::fmt;
@@ -178,15 +179,21 @@ fn validate_owner(owner: &str) -> Result<(), KeyIdError> {
     }
 }
 
+/// Maximum length of a network name inside a key or prefix.
+const MAX_KEY_NETWORK_BYTES: usize = 64;
+
+/// Key and prefix network names match `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`.
 fn validate_network(network: &str) -> Result<(), KeyIdError> {
-    let invalid = network.is_empty()
-        || network
-            .chars()
-            .any(|c| matches!(c, ':' | '/' | '#' | '?' | '%') || c.is_whitespace());
-    if invalid {
-        Err(KeyIdError::InvalidNetwork)
-    } else {
+    let bytes = network.as_bytes();
+    let valid = bytes.len() <= MAX_KEY_NETWORK_BYTES
+        && matches!(bytes.first(), Some(b) if b.is_ascii_alphanumeric())
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+    if valid {
         Ok(())
+    } else {
+        Err(KeyIdError::InvalidNetwork)
     }
 }
 
@@ -219,7 +226,7 @@ fn valid_segment(segment: &str) -> bool {
 
 /// Malformed key identifiers that the grammar must refuse.
 #[cfg(test)]
-pub(crate) const MALFORMED_KEY_IDS: [&str; 15] = [
+pub(crate) const MALFORMED_KEY_IDS: [&str; 18] = [
     "urn:tinycloud:encryption:did:pkh:eip155:1:0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed:default/apps/x//",
     "urn:tinycloud:encryption:did:pkh:eip155:1:0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed:default/apps//x",
     "urn:tinycloud:encryption:did:pkh:eip155:1:0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed:default//apps",
@@ -235,6 +242,9 @@ pub(crate) const MALFORMED_KEY_IDS: [&str; 15] = [
     "urn:tinycloud:encryption:did:pkh:eip155:1:0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed:default/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "urn:tinycloud:encryption:did:pkh:eip155:1:0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed:default/.hidden",
     "urn:tinycloud:encryption:did:pkh:eip155:1:0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed:default/-x",
+    "urn:tinycloud:encryption:did:pkh:eip155:1:0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed:-default/apps/x",
+    "urn:tinycloud:encryption:did:pkh:eip155:1:0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed:.a/apps/x",
+    "urn:tinycloud:encryption:did:pkh:eip155:1:0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/apps/x",
 ];
 
 #[cfg(test)]
@@ -393,6 +403,54 @@ mod tests {
         for input in cases {
             assert!(parse(&input).is_err(), "accepted: {input}");
         }
+    }
+
+    /// Key and prefix networks outside `[A-Za-z0-9][A-Za-z0-9._-]{0,63}` are refused.
+    #[test]
+    fn rejects_network_names_outside_the_key_network_class() {
+        let longer_than_64 = "a".repeat(65);
+        let cases = [
+            // bidi override, key and prefix
+            uri("de\u{202e}fault/apps/x"),
+            uri("de\u{202e}fault/apps/x/"),
+            // zero-width space and byte-order mark
+            uri("de\u{200b}fault/apps/x"),
+            uri("\u{feff}default/apps/x"),
+            // control character and non-ASCII letter
+            uri("de\u{7}fault/apps/x"),
+            uri("d\u{e9}fault/apps/x"),
+            // leading `-` and `.`
+            uri("-default/apps/x"),
+            uri(".a/apps/x"),
+            // longer than 64 characters
+            uri(&format!("{longer_than_64}/apps/x")),
+            // newline inside the network, and newline after the path
+            uri("default\n/apps/x"),
+            uri("default/apps/x\n"),
+        ];
+        for input in cases {
+            assert!(parse(&input).is_err(), "accepted: {input:?}");
+        }
+    }
+
+    #[test]
+    fn accepts_network_names_at_the_class_boundaries() {
+        let longest = "a".repeat(64);
+        for network in [longest.as_str(), "DeFault", "0.x_-y"] {
+            match parse(&uri(&format!("{network}/apps/x"))) {
+                Ok(EncryptionResource::Key(loc)) => assert_eq!(loc.network(), network),
+                other => panic!("expected key for {network:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn bare_networks_keep_the_network_id_rule() {
+        let longer_than_64 = "a".repeat(65);
+        assert!(matches!(
+            parse(&uri(&longer_than_64)),
+            Ok(EncryptionResource::Network(_))
+        ));
     }
 
     #[test]
