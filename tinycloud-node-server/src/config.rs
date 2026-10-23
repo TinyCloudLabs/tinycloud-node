@@ -2023,6 +2023,19 @@ mod tests {
         assert_eq!(retention.history_days("team"), None);
     }
 
+    /// A config file written before `[sql_store]` and `[policy_v3]` existed
+    /// still loads: both sections fall back to their defaults.
+    #[test]
+    fn config_without_sql_store_and_policy_v3_sections_loads() {
+        let mut value = serde_json::to_value(Config::default()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        assert!(object.remove("sql_store").is_some());
+        assert!(object.remove("policy_v3").is_some());
+        let config: Config = serde_json::from_value(value).unwrap();
+        assert_eq!(config.sql_store, SqlStoreConfig::default());
+        assert_eq!(config.policy_v3, PolicyV3Config::default());
+    }
+
     #[test]
     fn sql_store_empty_allowlist_uploads_nothing_even_when_enabled() {
         let config = SqlStoreConfig {
