@@ -1809,9 +1809,11 @@ mod tests {
     #[tokio::test]
     async fn malformed_key_identifiers_are_refused_in_invocations() {
         let db = empty_db().await;
+        let mut skipped = 0;
         for resource in crate::encryption_network::key_id::MALFORMED_KEY_IDS {
             // Ids that fail URI parsing cannot be built into a capability, so there is nothing to admit or refuse.
             if resource.parse::<crate::types::Resource>().is_err() {
+                skipped += 1;
                 continue;
             }
             let capability = caveat_capability(
@@ -1839,5 +1841,98 @@ mod tests {
                 "unexpected rejection for {resource}: {err:?}"
             );
         }
+        assert_eq!(
+            skipped, 2,
+            "URI-invalid key identifiers in MALFORMED_KEY_IDS"
+        );
+    }
+
+    /// An owner-issued prefix grant, re-delegated for one exact key, admits an
+    /// invocation of that key and refuses a sibling prefix that only shares its text.
+    #[tokio::test]
+    async fn chained_key_grant_admits_exact_key_and_refuses_sibling_prefix() {
+        const KEY_MIDDLE: &str = "did:pkh:eip155:1:0x0000000000000000000000000000000000000001";
+        let db = empty_db().await;
+        for actor_id in [KEY_OWNER, KEY_MIDDLE, KEY_OTHER] {
+            actor::ActiveModel {
+                id: Set(actor_id.to_string()),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+        }
+        let prefix_grant = crate::hash::hash(b"owner-prefix-grant");
+        let key_grant = crate::hash::hash(b"middle-exact-key-grant");
+        let prefix = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/foo/");
+        let key = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/foo/x");
+        for (id, delegator, delegatee, resource) in [
+            (prefix_grant, KEY_OWNER, KEY_MIDDLE, prefix.as_str()),
+            (key_grant, KEY_MIDDLE, KEY_OTHER, key.as_str()),
+        ] {
+            delegation::ActiveModel {
+                id: Set(id),
+                delegator: Set(delegator.to_string()),
+                delegatee: Set(delegatee.to_string()),
+                expiry: Set(None),
+                issued_at: Set(None),
+                not_before: Set(None),
+                facts: Set(None),
+                serialization: Set(id.as_ref().to_vec()),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+            abilities::ActiveModel {
+                delegation: Set(id),
+                resource: Set(resource.parse().unwrap()),
+                ability: Set("tinycloud.encryption/decrypt"
+                    .to_string()
+                    .try_into()
+                    .unwrap()),
+                caveats: Set(Caveats::default()),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+        }
+        parent_delegations::ActiveModel {
+            parent: Set(prefix_grant),
+            child: Set(key_grant),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        let capability =
+            caveat_capability(&key, "tinycloud.encryption/decrypt", Caveats::default());
+        crate::models::invocation::authorize_holder(
+            &db,
+            KEY_OTHER,
+            &[capability],
+            &[key_grant.to_cid(0x55)],
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .expect("chained exact-key grant admits its key");
+
+        let sibling = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/foobar/x");
+        let capability =
+            caveat_capability(&sibling, "tinycloud.encryption/decrypt", Caveats::default());
+        let err = crate::models::invocation::authorize_holder(
+            &db,
+            KEY_OTHER,
+            &[capability],
+            &[key_grant.to_cid(0x55)],
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                Error::InvalidInvocation(InvocationError::UnauthorizedAction(_, _))
+            ),
+            "unexpected rejection: {err:?}"
+        );
     }
 }

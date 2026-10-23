@@ -1616,6 +1616,28 @@ mod tests {
         ));
     }
 
+    /// key.delete is refused for the owner even when a parent is cited. The
+    /// refusal runs before the root-authority filter and the parent branches.
+    #[tokio::test]
+    async fn owner_issued_key_delete_with_parent_is_refused() {
+        let db = database().await;
+        let parent = crate::hash::hash(b"owner-delete-with-parent");
+        let prefix = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/");
+        insert_parent_grant(&db, parent, KEY_OWNER, OTHER_DID, &prefix, KEY_DECRYPT).await;
+        let info = key_grant_info(
+            KEY_OWNER,
+            KEY_RESOURCE,
+            "tinycloud.encryption/key.delete",
+            &[parent],
+        );
+        assert!(matches!(
+            validate(&db, &info).await,
+            Err(Error::InvalidDelegation(
+                DelegationError::KeyDeleteNotDelegable
+            ))
+        ));
+    }
+
     fn key_grant_info(
         delegator: &str,
         resource: &str,
@@ -1745,9 +1767,11 @@ mod tests {
     async fn malformed_key_identifiers_are_refused_in_delegations() {
         let db = database().await;
         let prefix = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/");
+        let mut skipped = 0;
         for (index, resource) in key_id::MALFORMED_KEY_IDS.iter().enumerate() {
             // Ids that fail URI parsing cannot be built into a capability, so there is nothing to admit or refuse.
             if resource.parse::<crate::types::Resource>().is_err() {
+                skipped += 1;
                 continue;
             }
             let owner_info =
@@ -1774,5 +1798,9 @@ mod tests {
                 index + 7
             );
         }
+        assert_eq!(
+            skipped, 2,
+            "URI-invalid key identifiers in MALFORMED_KEY_IDS"
+        );
     }
 }
