@@ -6,10 +6,6 @@
 //! challenge/claim replay boundary, and the first-admission gate.
 
 use crate::issuer_set::{IssuerSet, IssuerWindowError};
-use aes_gcm::{
-    aead::{Aead, KeyInit, Payload as AeadPayload},
-    Aes256Gcm, Nonce,
-};
 use base64::{decode_config, encode_config, URL_SAFE_NO_PAD};
 use rand::RngCore;
 use rocket::{http::Status, serde::json::Json, State};
@@ -85,8 +81,6 @@ pub(crate) const SEALED_ENVELOPE_AAD: &[u8] = b"tinycloud-share-envelope-v1";
 pub(crate) const SEALED_ENVELOPE_VERSION: u8 = 1;
 pub(crate) const SEALED_ENVELOPE_NONCE_BYTES: usize = 12;
 pub(crate) const SEALED_ENVELOPE_TAG_BYTES: usize = 16;
-#[cfg_attr(not(test), allow(dead_code))]
-const MAX_SEALED_ENVELOPE_BYTES: usize = 4 * 1024 * 1024;
 // The reviewed `tinycloud.email-proof/v1` descriptor defines a 300-second
 // freshness bound for its non-revocable status. This is pinned here rather
 // than trusting the unsigned transport envelope around the SD-JWT.
@@ -1071,97 +1065,6 @@ fn is_canonical_delivery_domain(value: &str) -> bool {
         && !labels
             .last()
             .is_some_and(|tld| tld.bytes().all(|byte| byte.is_ascii_digit()))
-}
-
-/// Kept with its tests until the legacy-removal commit; the route no longer
-/// calls it.
-#[cfg_attr(not(test), allow(dead_code))]
-/// The Share SDK stores the signed recipient envelope as a versioned,
-/// AES-256-GCM sealed blob.  The public URL addresses only that ciphertext;
-/// its decryption key is a fragment and must never be sent in a query string.
-fn v3_delivery_url_matches(
-    url: &str,
-    origin: &str,
-    share_cid: &str,
-    sealed_envelope: &str,
-    envelope_key: &str,
-    envelope: &Value,
-) -> bool {
-    let Ok(sealed) = decode_config(sealed_envelope, URL_SAFE_NO_PAD) else {
-        return false;
-    };
-    let Ok(key) = decode_config(envelope_key, URL_SAFE_NO_PAD) else {
-        return false;
-    };
-    if encode_config(&sealed, URL_SAFE_NO_PAD) != sealed_envelope
-        || sealed.len() < 1 + SEALED_ENVELOPE_NONCE_BYTES + SEALED_ENVELOPE_TAG_BYTES
-        || sealed.len() > MAX_SEALED_ENVELOPE_BYTES
-        || sealed[0] != SEALED_ENVELOPE_VERSION
-        || encode_config(&key, URL_SAFE_NO_PAD) != envelope_key
-        || key.len() != 32
-    {
-        return false;
-    }
-    let sealed_cid = tinycloud_auth::ipld_core::cid::Cid::new_v1(
-        0x55,
-        tinycloud_auth::multihash_codetable::Code::Sha2_256.digest(&sealed),
-    )
-    .to_string();
-    if sealed_cid != share_cid {
-        return false;
-    }
-    let nonce = Nonce::from(
-        <[u8; SEALED_ENVELOPE_NONCE_BYTES]>::try_from(&sealed[1..1 + SEALED_ENVELOPE_NONCE_BYTES])
-            .expect("sealed envelope nonce length is fixed"),
-    );
-    let Ok(cipher) = Aes256Gcm::new_from_slice(&key) else {
-        return false;
-    };
-    let Ok(plaintext) = cipher.decrypt(
-        &nonce,
-        AeadPayload {
-            msg: &sealed[1 + SEALED_ENVELOPE_NONCE_BYTES..],
-            aad: SEALED_ENVELOPE_AAD,
-        },
-    ) else {
-        return false;
-    };
-    if plaintext != canonical_json_value(envelope) {
-        return false;
-    }
-
-    // Compact links are the normal Share SDK form. The path is the ciphertext
-    // CID; only the fragment carries the decryption key.
-    if url == format!("{origin}/s/{share_cid}#k={envelope_key}") {
-        return true;
-    }
-
-    // The SDK also supports a sealed inline form. Its complete payload stays
-    // in the fragment, so no recipient material reaches HTTP logs either.
-    let prefix = format!("{origin}/s/inline#v=2&p=");
-    let Some(encoded) = url.strip_prefix(&prefix) else {
-        return false;
-    };
-    let Ok(bytes) = decode_config(encoded, URL_SAFE_NO_PAD) else {
-        return false;
-    };
-    if encode_config(&bytes, URL_SAFE_NO_PAD) != encoded
-        || bytes.len() > MAX_SEALED_ENVELOPE_BYTES * 2
-    {
-        return false;
-    }
-    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
-        return false;
-    };
-    let Some(payload) = value.as_object() else {
-        return false;
-    };
-    payload.len() == 4
-        && payload.get("v").and_then(Value::as_u64) == Some(2)
-        && payload.get("c").and_then(Value::as_str) == Some(sealed_envelope)
-        && payload.get("cid").and_then(Value::as_str) == Some(share_cid)
-        && payload.get("k").and_then(Value::as_str) == Some(envelope_key)
-        && canonical_json_value(&value) == bytes
 }
 
 fn v3_registration_is_live(
@@ -8077,37 +7980,6 @@ mod tests {
         assert!(validate_policy_document(&altered, &altered_bytes, &cid).is_err());
     }
 
-    fn seal_delivery_envelope(
-        envelope: &Value,
-        key: [u8; 32],
-        nonce: [u8; SEALED_ENVELOPE_NONCE_BYTES],
-    ) -> (String, String, String) {
-        let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
-        let ciphertext = cipher
-            .encrypt(
-                &Nonce::from(nonce),
-                AeadPayload {
-                    msg: &canonical_json_value(envelope),
-                    aad: SEALED_ENVELOPE_AAD,
-                },
-            )
-            .unwrap();
-        let mut sealed = Vec::with_capacity(1 + nonce.len() + ciphertext.len());
-        sealed.push(SEALED_ENVELOPE_VERSION);
-        sealed.extend_from_slice(&nonce);
-        sealed.extend_from_slice(&ciphertext);
-        let share_cid = tinycloud_auth::ipld_core::cid::Cid::new_v1(
-            0x55,
-            tinycloud_auth::multihash_codetable::Code::Sha2_256.digest(&sealed),
-        )
-        .to_string();
-        (
-            encode_config(&sealed, URL_SAFE_NO_PAD),
-            encode_config(key, URL_SAFE_NO_PAD),
-            share_cid,
-        )
-    }
-
     /// Every event and span field recorded on this thread while a test runs.
     /// It keeps no span registry, so spans that outlive the scope (a pool
     /// worker drops them on another thread) cannot trip another subscriber.
@@ -8155,16 +8027,11 @@ mod tests {
         fn exit(&self, _: &tracing::span::Id) {}
     }
 
-    /// The new request body plus the sealed envelope pieces the retired
-    /// compact/inline URL matcher still takes in its tests.
+    /// The request body and the owner-signed envelope behind its link.
     #[derive(Clone)]
     struct FixtureRequest {
         inner: DeliveryAuthorizationRequest,
         envelope: Value,
-        sealed_envelope: String,
-        envelope_key: String,
-        share_cid: String,
-        legacy_url: String,
     }
 
     impl std::ops::Deref for FixtureRequest {
@@ -8244,8 +8111,6 @@ mod tests {
             "signerDid":owner_did,
             "value":encode_config(owner.sign(&Sha256::digest(bytes)), URL_SAFE_NO_PAD),
         });
-        let (sealed_envelope, envelope_key, share_cid) =
-            seal_delivery_envelope(&envelope, [9; 32], [10; SEALED_ENVELOPE_NONCE_BYTES]);
         let built = crate::delivery_link::test_support::build(
             &canonical_json_value(&envelope),
             &owner,
@@ -8261,10 +8126,6 @@ mod tests {
                 request_body_digest: "unused".into(),
             },
             envelope,
-            sealed_envelope,
-            envelope_key: envelope_key.clone(),
-            share_cid: share_cid.clone(),
-            legacy_url: format!("https://share.tinycloud.xyz/s/{share_cid}#k={envelope_key}"),
         };
         (owner, registration, delivery, request)
     }
@@ -8307,29 +8168,6 @@ mod tests {
             &request,
         )
         .is_err());
-    }
-
-    #[test]
-    fn v3_delivery_binds_cid_to_the_sealed_envelope() {
-        let (_, _, delivery, request) = delivery_fixture();
-        assert!(v3_delivery_url_matches(
-            &request.legacy_url,
-            &delivery.return_origin,
-            &request.share_cid,
-            &request.sealed_envelope,
-            &request.envelope_key,
-            &request.envelope,
-        ));
-
-        let altered_cid = "bafkreieeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
-        assert!(!v3_delivery_url_matches(
-            &request.legacy_url,
-            &delivery.return_origin,
-            altered_cid,
-            &request.sealed_envelope,
-            &request.envelope_key,
-            &request.envelope,
-        ));
     }
 
     #[test]
@@ -8392,28 +8230,6 @@ mod tests {
         assert!(!stored.contains(&crate::delivery_link::test_support::b64(
             &crate::delivery_link::test_support::TEST_KEY
         )));
-    }
-
-    #[test]
-    fn v3_delivery_rejects_fragment_or_query_substitution() {
-        let (_, _, delivery, request) = delivery_fixture();
-        for altered_url in [
-            format!("{}#k=secret", request.legacy_url),
-            format!("{}&k=secret", request.legacy_url),
-            format!(
-                "https://share.tinycloud.xyz/viewer?tc2={}",
-                encode_config(canonical_json_value(&request.envelope), URL_SAFE_NO_PAD)
-            ),
-        ] {
-            assert!(!v3_delivery_url_matches(
-                &altered_url,
-                &delivery.return_origin,
-                &request.share_cid,
-                &request.sealed_envelope,
-                &request.envelope_key,
-                &request.envelope,
-            ));
-        }
     }
 
     #[test]
@@ -8676,55 +8492,6 @@ mod tests {
         assert!(!v3_registration_is_live(
             &registration,
             parse_time("2026-08-07T12:00:00Z").unwrap(),
-        ));
-    }
-
-    #[test]
-    fn v3_delivery_url_keeps_recipient_material_out_of_loggable_portion() {
-        let (_, registration, delivery, request) = delivery_fixture();
-        let public_url = request.legacy_url.split('#').next().unwrap();
-        assert_eq!(
-            public_url,
-            format!("https://share.tinycloud.xyz/s/{}", request.share_cid)
-        );
-        assert!(!public_url.contains("?"));
-        assert!(!public_url.contains("alice@example.com"));
-        assert!(v3_delivery_url_matches(
-            &request.legacy_url,
-            &delivery.return_origin,
-            &request.share_cid,
-            &request.sealed_envelope,
-            &request.envelope_key,
-            &request.envelope,
-        ));
-        assert!(v3_envelope_delivery_projection(
-            &request.envelope,
-            &registration,
-            &delivery,
-            &request,
-        )
-        .is_ok());
-
-        let inline_payload = canonical_json_value(&json!({
-            "v": 2,
-            "c": request.sealed_envelope,
-            "cid": request.share_cid,
-            "k": request.envelope_key,
-        }));
-        let inline_url = format!(
-            "https://share.tinycloud.xyz/s/inline#v=2&p={}",
-            encode_config(inline_payload, URL_SAFE_NO_PAD)
-        );
-        let inline_public_url = inline_url.split('#').next().unwrap();
-        assert_eq!(inline_public_url, "https://share.tinycloud.xyz/s/inline");
-        assert!(!inline_public_url.contains("alice@example.com"));
-        assert!(v3_delivery_url_matches(
-            &inline_url,
-            &delivery.return_origin,
-            &request.share_cid,
-            &request.sealed_envelope,
-            &request.envelope_key,
-            &request.envelope,
         ));
     }
 
