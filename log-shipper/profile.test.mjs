@@ -19,3 +19,13 @@ test('runtime profile interpolation is an explicit boolean compiler choice', () 
     assert.throws(() => buildConfig({ runtimeProfile }));
   }
 });
+
+test('the real sink receives the individual events, including the 5xx diagnostic, and the reducer only the counted ones (TC-1840)', () => {
+  for (const profile of ['errors_slow', 'all_requests']) {
+    const { sinks, transforms } = buildConfig({ profile });
+    assert.deepEqual(sinks.betterstack.inputs, ['event_route.request', 'event_route.db_failure', 'diagnostic_output', 'gate_output']);
+    assert.deepEqual(transforms.diagnostic_reduce.inputs, ['event_route.diagnostic']);
+    assert.deepEqual(Object.keys(transforms.event_route.route), ['request', 'db_failure', 'diagnostic']);
+    assert.match(transforms.event_route.route.diagnostic, /event_code != "db_failure_5xx"/);
+  }
+});
