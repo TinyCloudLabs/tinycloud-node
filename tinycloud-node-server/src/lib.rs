@@ -976,8 +976,7 @@ pub async fn app_with_control(
         .manage(encryption_service)
         .manage(policy_v3_runtime)
         .manage(seed_conn.clone())
-        .manage(tinycloud_config.storage.staging.open().await?)
-        .manage(tinycloud_config.clone());
+        .manage(tinycloud_config.storage.staging.open().await?);
 
     // TC-287: opt-in retention sweeper. Mirrors the invocation-replay cleanup
     // fairing above — an on-liftoff task that prunes terminal hook deliveries
