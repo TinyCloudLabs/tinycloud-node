@@ -16,7 +16,7 @@ import { owner, assertHostedRunner, cleanupOwnedResources, burstEvidence, assert
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const token = 'TC959_SYNTHETIC_HOSTED_SINK_BEARER';
-const burstFirst = 100000; // Fast errors: all 500 markers remain below the slow threshold.
+const burstFirst = 2000000; // Slow successes: every marker is above the 1 s slow threshold (forwarded) and no marker is a capped 4xx/5xx event.
 const burstSize = 500;
 const fastMarker = 800000;
 const methods = new Set(['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', '<other>']);
@@ -89,6 +89,12 @@ export function assertCapture(events, fields) {
         assert.equal(typeof event.write_may_have_applied, 'boolean');
         allowed = [...base, 'event_code', 'status', 'code', 'service', 'route', 'elapsed_ms', 'failure_kind', 'write_may_have_applied'];
         if ('db_hash' in event) { assert.equal(typeof event.db_hash, 'string'); assert.match(event.db_hash, new RegExp(fields?.db_hash?.regex ?? '^[0-9a-f]{64}$')); allowed.push('db_hash'); }
+      } else if (event.event === 'node_warning' && event.event_code === 'errors_dropped') {
+        // TC-1843: the shipper's dropped-count event; exactly class, dropped and window_s beyond the common fields, no event_count.
+        assert.ok(fields?.class?.values.includes(event.class));
+        assert.ok(Number.isSafeInteger(event.dropped) && event.dropped >= 1);
+        assert.equal(event.window_s, 60);
+        allowed = [...base, 'event_code', 'class', 'dropped', 'window_s'];
       } else {
         assert.ok(Number.isSafeInteger(event.event_count) && event.event_count > 0);
         allowed = [...base, 'event_code', 'event_count'];
@@ -504,7 +510,9 @@ export async function main(args = process.argv.slice(2)) {
       if (probe.status === 0) reverseReachable++;
       assert.equal(inspect(names.vector).State.Running, true);
     }
-    const gelf = latency_us => JSON.stringify({ version: '1.1', host: 'synthetic', short_message: JSON.stringify(nodeRequest({ method: 'GET', route: '/healthz', status: 503, latency_us })), '_tc.logship': 'tinycloud-node', timestamp: Date.now() / 1000 });
+    // Control sends are slow status-200 requests: errors_slow forwards them, and no per-minute cap (status 400 and above) covers them,
+    // so a real 4xx or 5xx never shares a window with them. A control accepted from the wrong network would be forwarded.
+    const gelf = latency_us => JSON.stringify({ version: '1.1', host: 'synthetic', short_message: JSON.stringify(nodeRequest({ method: 'GET', route: '/healthz', status: 200, latency_us })), '_tc.logship': 'tinycloud-node', timestamp: Date.now() / 1000 });
     const hostControl = 7654322;
     const peerControl = 7654323;
     const injected = 7654321;
@@ -544,9 +552,11 @@ export async function main(args = process.argv.slice(2)) {
     cpuBefore = cpu();
     startedAt = Date.now();
     sample();
-    const payload = JSON.stringify(nodeRequest({ route: '/healthz', status: 503, latency_us: '__MARKER__', authorization: canary, uri: canary }));
+    // Status 200 with a latency above the slow threshold: errors_slow forwards it, and it is outside the per-minute caps on
+    // request events with status >= 400 (TC-1843), so the burst still measures transport loss.
+    const payload = JSON.stringify(nodeRequest({ route: '/healthz', status: 200, latency_us: '__MARKER__', authorization: canary, uri: canary }));
     const [prefix, suffix] = payload.split('"__MARKER__"');
-    // One exec; 500 distinct 503 lines, no sleeps, no pacing, no emission reduction.
+    // One exec; 500 distinct slow-success lines, no sleeps, no pacing, no emission reduction.
     const emitted = docker('exec', names.emitter, '/bin/sh', '-ec', 'i=0; while [ "$i" -lt 500 ]; do printf "%s%s%s\\n" "$1" "$(($3+i))" "$2" || exit 71; i=$((i+1)); done > /proc/1/fd/1; printf "%s\\n" "$i" > /tmp/tc959-emitted-count; printf "%s\\n" "$i"', 'burst', prefix, suffix, String(burstFirst));
     assert.match(emitted, /^500$/);
     burstSent = Number(emitted);
@@ -568,7 +578,7 @@ export async function main(args = process.argv.slice(2)) {
     assert.ok(Date.now() - continuityStart < 15000);
     docker('unpause', names.vector);
     const resumeMarker = 7654324;
-    emit(JSON.stringify(nodeRequest({ route: '/healthz', status: 503, latency_us: resumeMarker })));
+    emit(JSON.stringify(nodeRequest({ route: '/healthz', status: 200, latency_us: resumeMarker })));
     await waitFor(() => capture().events.some(event => event.latency_us === resumeMarker));
     report.continuity_requests = 30;
     report.resumed_delivery = true;
@@ -593,7 +603,7 @@ export async function main(args = process.argv.slice(2)) {
     emitDiagnostic('error', 'ERROR', 'native share KV put failed');
     emitDiagnostic('unclassified', 'WARN', undefined, 'hyper::proto');
     emitDiagnostic('dependency_error', 'ERROR', undefined, 'sqlx::pool');
-    emit(JSON.stringify(nodeRequest({ route: `/signed/kv/${canary}`, status: 503 })));
+    emit(JSON.stringify(nodeRequest({ route: `/signed/kv/${canary}`, status: 200 })));
     emit(`raw panic ${canary}`);
     sample();
     await waitFor(() => {
