@@ -4,6 +4,7 @@
 
 ### Changes
 
+- The node logs one structured diagnostic line (status, code, service, route, elapsed time, failure kind, a keyed database pseudonym `db_hash`) when a request ends in a database failure or a busy/timeout 5xx. Details: TC-1796.
 - Policy registration, policy status changes, SQL store manifest publication and share-email state writes now end their database transaction on every exit, so locks are released when the call returns. Details: TC-1836.
 - Creating a named key now ends its database transaction on every exit, so the network row lock is released when the call returns. Details: TC-1834.
 - Encryption: clearer error for percent-encoded key route URLs. The public-key and describe routes for named keys read the network id and key path as sent; a percent-escape returns 400 `key_path_invalid` with a message naming the escape. Details: TC-1777.
