@@ -1079,3 +1079,166 @@ async fn delegate_for_another_key_or_prefix_is_refused() -> Result<()> {
     }
     Ok(())
 }
+
+/// Creates a second active network owned by the fixture node DID. Its key
+/// URNs name a different owner from the fixture owner.
+async fn other_owner_network(fixture: &KvSyncFixture) -> Result<String> {
+    let service = fixture
+        .client
+        .rocket()
+        .state::<EncryptionService>()
+        .expect("EncryptionService is managed");
+    let network = service
+        .create_one_of_one_network(CreateNetworkRequest {
+            name: "net".to_string(),
+            owner_did: fixture.node_did.to_string(),
+            threshold: Threshold::one_of_one(),
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(network.network_id.to_string())
+}
+
+/// Sends one request for `docs/a` on `network` through `route` (`create`,
+/// `describe`, `block` or `unblock`). The invocation carries a single
+/// capability on `resource` with the route's own ability.
+async fn request_with_capability_on(
+    fixture: &KvSyncFixture,
+    network: &str,
+    route: &str,
+    resource: &str,
+) -> Result<(Status, String)> {
+    let key_path = "docs/a";
+    if route == "describe" {
+        let auth = invocation(
+            fixture,
+            &fixture.node_did,
+            &[(resource, KEY_CREATE_ACTION)],
+            vec![describe_fact_for(&fixture.node_did, network, key_path)],
+        )?;
+        return Ok(describe_get(fixture, network, key_path, &auth).await);
+    }
+    let (action, url, body) = match route {
+        "create" => (
+            KEY_CREATE_ACTION,
+            keys_url(network),
+            json!({"keyPath": key_path, "shreddable": false}),
+        ),
+        "block" => (
+            KEY_BLOCK_ACTION,
+            action_url(network, "block"),
+            json!({"keyPath": key_path}),
+        ),
+        "unblock" => (
+            KEY_UNBLOCK_ACTION,
+            action_url(network, "unblock"),
+            json!({"keyPath": key_path}),
+        ),
+        other => panic!("unknown key route {other}"),
+    };
+    let fact = admin_fact_for(
+        &fixture.node_did,
+        network,
+        key_path,
+        action,
+        &canonical_hash(&body),
+    );
+    let auth = invocation(
+        fixture,
+        &fixture.node_did,
+        &[(resource, action)],
+        vec![fact],
+    )?;
+    Ok(post_json(&fixture.client, &url, &auth, &body).await)
+}
+
+/// For `route`, a capability on a prefix, on a different key of the same
+/// owner, or on a key of another owner is refused with 401. The target key
+/// keeps its state.
+async fn assert_off_key_capabilities_are_refused(route: &str) -> Result<()> {
+    let (fixture, network) = setup().await?;
+    let (status, text) = create(&fixture, &network, "docs/a", false).await?;
+    assert_eq!(status, Status::Ok, "create: {text}");
+    let other_network = other_owner_network(&fixture).await?;
+    let cases = [
+        ("a prefix", format!("{network}/docs/")),
+        (
+            "a different key of the same owner",
+            key_uri(&network, "docs/b"),
+        ),
+        ("a key of another owner", key_uri(&other_network, "docs/a")),
+    ];
+    for (case, resource) in &cases {
+        let (status, text) =
+            request_with_capability_on(&fixture, &network, route, resource).await?;
+        assert_eq!(status, Status::Unauthorized, "{route} with {case}: {text}");
+    }
+    let auth = describe_auth(&fixture, &network, "docs/a", KEY_CREATE_ACTION)?;
+    let (status, text) = describe_get(&fixture, &network, "docs/a", &auth).await;
+    assert_eq!(status, Status::Ok, "{text}");
+    assert_eq!(state_of(&text)?, "active");
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_refuses_capabilities_outside_the_exact_key() -> Result<()> {
+    assert_off_key_capabilities_are_refused("create").await
+}
+
+#[tokio::test]
+async fn describe_refuses_capabilities_outside_the_exact_key() -> Result<()> {
+    assert_off_key_capabilities_are_refused("describe").await
+}
+
+#[tokio::test]
+async fn block_refuses_capabilities_outside_the_exact_key() -> Result<()> {
+    assert_off_key_capabilities_are_refused("block").await
+}
+
+#[tokio::test]
+async fn unblock_refuses_capabilities_outside_the_exact_key() -> Result<()> {
+    assert_off_key_capabilities_are_refused("unblock").await
+}
+
+#[tokio::test]
+async fn block_and_unblock_of_a_missing_key_are_not_found() -> Result<()> {
+    let (fixture, network) = setup().await?;
+    for action in ["block", "unblock"] {
+        let (status, text) = key_action(&fixture, &network, "docs/absent", action).await?;
+        assert_eq!(status, Status::NotFound, "{action}: {text}");
+        assert!(text.starts_with("key_not_found"), "{action}: {text}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn block_refuses_a_missing_body_hash() -> Result<()> {
+    let (fixture, network) = setup().await?;
+    let (status, text) = create(&fixture, &network, "docs/a", false).await?;
+    assert_eq!(status, Status::Ok, "create: {text}");
+    let body = json!({"keyPath": "docs/a"});
+    let cap = key_uri(&network, "docs/a");
+    let fact = json!({
+        "type": KEY_ADMIN_TYPE,
+        "targetNode": fixture.node_did,
+        "networkId": network,
+        "keyPath": "docs/a",
+        "action": KEY_BLOCK_ACTION,
+    });
+    let auth = invocation(
+        &fixture,
+        &fixture.node_did,
+        &[(cap.as_str(), KEY_BLOCK_ACTION)],
+        vec![fact],
+    )?;
+    let (status, text) = post_json(
+        &fixture.client,
+        &action_url(&network, "block"),
+        &auth,
+        &body,
+    )
+    .await;
+    assert_eq!(status, Status::BadRequest, "{text}");
+    assert!(text.contains("bodyHash"), "{text}");
+    Ok(())
+}

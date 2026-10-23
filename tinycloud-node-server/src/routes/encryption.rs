@@ -392,11 +392,11 @@ pub async fn create_encryption_key(
             &body_value,
         )
         .await
-        .map_err(map_service_err)?;
+        .map_err(map_key_service_err)?;
     let descriptor = service
         .create_key(&location, body.shreddable)
         .await
-        .map_err(map_service_err)?;
+        .map_err(map_key_service_err)?;
     Ok(Json(descriptor.into()))
 }
 
@@ -493,11 +493,11 @@ pub async fn block_encryption_key(
             &body_value,
         )
         .await
-        .map_err(map_service_err)?;
+        .map_err(map_key_service_err)?;
     let descriptor = service
         .block_key(&location)
         .await
-        .map_err(map_service_err)?;
+        .map_err(map_key_service_err)?;
     Ok(Json(descriptor.into()))
 }
 
@@ -536,11 +536,11 @@ pub async fn unblock_encryption_key(
             &body_value,
         )
         .await
-        .map_err(map_service_err)?;
+        .map_err(map_key_service_err)?;
     let descriptor = service
         .unblock_key(&location)
         .await
-        .map_err(map_service_err)?;
+        .map_err(map_key_service_err)?;
     Ok(Json(descriptor.into()))
 }
 
@@ -577,6 +577,19 @@ async fn verify_auth(
         start.elapsed(),
     );
     result
+}
+
+/// Error mapper for the key routes that take a JSON body. A malformed body or
+/// invocation fact is a request-body error; every other error uses
+/// `map_service_err`.
+fn map_key_service_err(err: EncryptionServiceError) -> (Status, String) {
+    match err {
+        EncryptionServiceError::InvalidBody(detail) => (
+            Status::BadRequest,
+            format!("request body is malformed: {detail}"),
+        ),
+        other => map_service_err(other),
+    }
 }
 
 fn map_service_err(err: EncryptionServiceError) -> (Status, String) {

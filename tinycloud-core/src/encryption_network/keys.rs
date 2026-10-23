@@ -287,31 +287,27 @@ impl EncryptionService {
         descriptor(row)
     }
 
-    /// Unauthenticated public GET. Requires an ACTIVE network. Uses the stored
-    /// public key when a row exists and derives it from the network secret
-    /// otherwise. Missing, blocked and active keys return identical output.
-    /// Writes nothing and never reports key state or absence.
+    /// Unauthenticated public GET. Requires an ACTIVE network. Always derives
+    /// from the network secret, never from the stored row, so missing, blocked
+    /// and active keys return identical output. Writes nothing and never
+    /// reports key state or absence.
     pub async fn public_key(&self, loc: &KeyLocation) -> Result<KeyPublic, EncryptionServiceError> {
         let network = network_of(loc)?;
         let net = load_active_network(&self.db, &network).await?;
-        let public_encryption_key = match find_key_row(&self.db, &network, loc.path()).await? {
-            Some(row) => row.public_key,
-            None => {
-                let sealed = net
-                    .sealed_private_key
-                    .as_deref()
-                    .ok_or(KeyBackendError::SealedKeyMissing)?;
-                let network_secret = self.backend.open_network_secret(sealed)?;
-                self.backend
-                    .derive_named_public_key(&network_secret, &canonical_key_urn(loc))?
-            }
-        };
+        let sealed = net
+            .sealed_private_key
+            .as_deref()
+            .ok_or(KeyBackendError::SealedKeyMissing)?;
+        let network_secret = self.backend.open_network_secret(sealed)?;
+        let public = self
+            .backend
+            .derive_named_public_key(&network_secret, &canonical_key_urn(loc))?;
         Ok(KeyPublic {
             network_id: network.to_string(),
             key_path: loc.path().to_string(),
             alg: ALG_X25519_AES256GCM.to_string(),
             key_version: KEY_VERSION_INITIAL,
-            public_encryption_key,
+            public_encryption_key: public,
         })
     }
 
