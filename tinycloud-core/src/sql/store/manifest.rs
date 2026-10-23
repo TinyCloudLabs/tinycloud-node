@@ -10,8 +10,8 @@ use async_trait::async_trait;
 use sea_orm::{
     sea_query::{Expr, OnConflict},
     ActiveValue::Set,
-    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder,
-    TransactionTrait,
+    ColumnTrait, ConnectionTrait, DatabaseConnection, DatabaseTransaction, EntityTrait,
+    QueryFilter, QueryOrder, TransactionTrait,
 };
 
 use super::key::{DbRef, Lineage, ObjectKey, ObjectKind, PublishId};
@@ -238,6 +238,14 @@ fn manifest_row(
     })
 }
 
+/// What the transactional part of a publish decided.
+enum PublishStep {
+    /// The CAS and the object flip ran; carries the frontier read in the same transaction.
+    Won(Option<Frontier>),
+    /// The CAS lost; the caller rolls back and reads the winner.
+    Lost,
+}
+
 impl DbSqlManifest {
     async fn read<C: ConnectionTrait>(
         conn: &C,
@@ -314,6 +322,52 @@ impl DbSqlManifest {
         }
         Ok(update.exec(conn).await?.rows_affected)
     }
+
+    /// The transactional part of one publish. Returns with `txn` still open;
+    /// the caller commits after `Won` and rolls back on every other outcome,
+    /// including the errors returned here.
+    async fn publish_in(
+        txn: &DatabaseTransaction,
+        db: &DbRef<'_>,
+        expected: Option<&CasToken>,
+        publish: &Publish,
+    ) -> Result<PublishStep, SqlStoreError> {
+        let obj = &publish.object;
+        let won = match expected {
+            // INSERT … ON CONFLICT DO NOTHING: a raw primary-key violation
+            // would abort the whole Postgres transaction.
+            None => {
+                let inserted =
+                    manifest::Entity::insert(manifest_row(db, publish, SHADOW_EPOCH, 0)?)
+                        .on_conflict(
+                            OnConflict::columns([manifest::Column::Space, manifest::Column::DbId])
+                                .do_nothing()
+                                .to_owned(),
+                        )
+                        .exec_without_returning(txn)
+                        .await?;
+                inserted == 1
+            }
+            Some(token) => Self::cas(txn, db, token, publish).await? == 1,
+        };
+        if !won {
+            return Ok(PublishStep::Lost);
+        }
+        let flipped = object::Entity::update_many()
+            .col_expr(
+                object::Column::State,
+                Expr::value(ObjectState::Published.as_str()),
+            )
+            .filter(object_pk(db, obj)?)
+            .filter(object::Column::State.eq(ObjectState::Uploaded.as_str()))
+            .exec(txn)
+            .await?
+            .rows_affected;
+        if flipped != 1 {
+            return Err(SqlStoreError::ObjectNotUploaded);
+        }
+        Ok(PublishStep::Won(Self::read(txn, db).await?))
+    }
 }
 
 #[async_trait]
@@ -346,48 +400,27 @@ impl SqlManifest for DbSqlManifest {
             }
         }
         let txn = self.db.begin().await?;
-        let won = match expected {
-            // INSERT … ON CONFLICT DO NOTHING: a raw primary-key violation
-            // would abort the whole Postgres transaction.
-            None => {
-                let inserted =
-                    manifest::Entity::insert(manifest_row(db, &publish, SHADOW_EPOCH, 0)?)
-                        .on_conflict(
-                            OnConflict::columns([manifest::Column::Space, manifest::Column::DbId])
-                                .do_nothing()
-                                .to_owned(),
-                        )
-                        .exec_without_returning(&txn)
-                        .await?;
-                inserted == 1
+        let step = match Self::publish_in(&txn, db, expected, &publish).await {
+            Ok(step) => step,
+            Err(err) => {
+                let _ = txn.rollback().await;
+                return Err(err);
             }
-            Some(token) => Self::cas(&txn, db, token, &publish).await? == 1,
         };
-        if !won {
-            txn.rollback().await?;
-            return Ok(PublishOutcome::Lost(Self::read(&self.db, db).await?));
-        }
-        let flipped = object::Entity::update_many()
-            .col_expr(
-                object::Column::State,
-                Expr::value(ObjectState::Published.as_str()),
-            )
-            .filter(object_pk(db, obj)?)
-            .filter(object::Column::State.eq(ObjectState::Uploaded.as_str()))
-            .exec(&txn)
-            .await?
-            .rows_affected;
-        if flipped != 1 {
-            txn.rollback().await?;
-            return Err(SqlStoreError::ObjectNotUploaded);
-        }
-        let published = Self::read(&txn, db).await?;
-        txn.commit().await?;
-        match published {
-            Some(frontier) => Ok(PublishOutcome::Published(frontier)),
-            None => Err(SqlStoreError::Invalid(
-                "manifest row vanished after publish",
-            )),
+        match step {
+            PublishStep::Lost => {
+                txn.rollback().await?;
+                Ok(PublishOutcome::Lost(Self::read(&self.db, db).await?))
+            }
+            PublishStep::Won(published) => {
+                txn.commit().await?;
+                match published {
+                    Some(frontier) => Ok(PublishOutcome::Published(frontier)),
+                    None => Err(SqlStoreError::Invalid(
+                        "manifest row vanished after publish",
+                    )),
+                }
+            }
         }
     }
 
@@ -928,6 +961,42 @@ mod tests {
             Err(SqlStoreError::ObjectNotUploaded)
         ));
         assert_eq!(m.current(&DB).await.unwrap().unwrap(), f2);
+    }
+
+    #[tokio::test]
+    async fn postgres_not_uploaded_publish_releases_its_manifest_row_lock() {
+        use sea_orm::{ConnectionTrait, DbBackend, Statement};
+
+        let Some(fixture) =
+            PostgresTestSchema::new("postgres_sql_store_not_uploaded_row_lock").await
+        else {
+            return;
+        };
+        let m = DbSqlManifest::new(fixture.connect(10).await);
+        let f = first(&m, &Lineage::random(), 5).await;
+        // Never recorded: the CAS writes the manifest row, then the object flip
+        // matches nothing and the publish is refused.
+        let ghost = seg(&f.lineage, 5, 6, 20, "ghost");
+        let kind = PublishKind::Segment {
+            base_snapshot_key: f.base_snapshot_key.clone(),
+        };
+        assert!(matches!(
+            m.publish_cas(&DB, Some(&f.token()), publish(kind, &ghost, CID))
+                .await,
+            Err(SqlStoreError::ObjectNotUploaded)
+        ));
+        // The refused publish has returned, so its manifest row lock must be released.
+        let probe = m
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT space FROM sql_store_manifest WHERE space = $1 AND db_id = $2 FOR UPDATE NOWAIT",
+                [DB.space.into(), DB.db_id.into()],
+            ))
+            .await
+            .expect("manifest row lock released after ObjectNotUploaded");
+        assert!(probe.is_some(), "probe must read the manifest row");
+        assert_eq!(m.current(&DB).await.unwrap().unwrap(), f, "CAS rolled back");
     }
 
     async fn inventory_listing_and_conflicts(m: DbSqlManifest) {
