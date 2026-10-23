@@ -265,11 +265,12 @@ pub async fn revoke_network(
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateKeyBody {
     #[serde(rename = "keyPath")]
     pub key_path: String,
     #[serde(default)]
-    pub shreddable: bool,
+    pub deletable: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -424,7 +425,7 @@ pub async fn create_encryption_key(
         .await
         .map_err(map_key_service_err)?;
     let descriptor = service
-        .create_key(&location, body.shreddable)
+        .create_key(&location, body.deletable)
         .await
         .map_err(map_key_service_err)?;
     Ok(Json(descriptor.into()))
@@ -664,7 +665,7 @@ fn map_service_err(err: EncryptionServiceError) -> (Status, String) {
         EncryptionServiceError::NetworkNotActive(_) => Status::Conflict,
         EncryptionServiceError::KeyExists => Status::Conflict,
         EncryptionServiceError::KeyNotFound => Status::NotFound,
-        EncryptionServiceError::ShreddableUnavailable
+        EncryptionServiceError::DeletableUnavailable
         | EncryptionServiceError::KeyBlocked
         | EncryptionServiceError::KeyLimitExceeded
         | EncryptionServiceError::KeyUnwrapFailed(_) => Status::Forbidden,
