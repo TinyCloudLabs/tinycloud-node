@@ -218,3 +218,88 @@ async fn delegations_on_named_keys_are_refused(backend: Backend) -> anyhow::Resu
     Ok(())
 }
 on_both_backends!(delegations_on_named_keys_are_refused);
+
+const KEY_BLOCK: &str = "tinycloud.encryption/key.block";
+const APP_ID_NOT_BOUND: &str = "app_id_not_bound";
+
+/// With named keys on, a SIWE (CACAO) root grants an ability other than
+/// `key.block` under `apps/<app id>` only when the app id is bound to the
+/// SIWE domain (`tc1423.test` here, so `test.tc1423` and `test.tc1423.<more>`);
+/// a UCAN root is not checked.
+async fn siwe_app_grants_need_an_app_id_bound_to_the_domain(
+    backend: Backend,
+) -> anyhow::Result<()> {
+    let on = |config: &mut crate::config::Config| {
+        config.encryption_network.named_keys_v1 = true;
+    };
+    let window = || Window::until(now() + Duration::hours(1));
+
+    let Some(h) = Harness::new_with(
+        backend,
+        Shape::PkhSession,
+        "siwe_app_grants_need_an_app_id_bound_to_the_domain_cacao",
+        on,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let key = |tail: &str| format!("{}/{tail}", h.network);
+    for (what, grants) in [
+        ("bound key", vec![(key("apps/test.tc1423/x"), KEY_DECRYPT)]),
+        (
+            "bound prefix",
+            vec![(key("apps/test.tc1423.notes/"), KEY_CREATE)],
+        ),
+        ("foreign block", vec![(key("apps/other.app/"), KEY_BLOCK)]),
+        ("ordinary key", vec![(key("docs/a"), KEY_DECRYPT)]),
+        ("reserved lookalike", vec![(key("appsx/y"), KEY_DECRYPT)]),
+    ] {
+        let authorization = h
+            .space_owner
+            .delegate(h.owner.did(), &grants, window(), &[])?;
+        let (status, body) = h.delegate(authorization).await;
+        assert_eq!(status, Status::Ok, "{what}: {body}");
+    }
+    for (what, grants) in [
+        ("foreign key", vec![(key("apps/other.app/x"), KEY_DECRYPT)]),
+        ("foreign prefix", vec![(key("apps/other.app/"), KEY_CREATE)]),
+        (
+            "prefix of the domain only",
+            vec![(key("apps/test.tc1423x/"), KEY_CREATE)],
+        ),
+        (
+            "bound block, foreign decrypt",
+            vec![
+                (key("apps/test.tc1423/"), KEY_BLOCK),
+                (key("apps/other.app/x"), KEY_DECRYPT),
+            ],
+        ),
+    ] {
+        let authorization = h
+            .space_owner
+            .delegate(h.owner.did(), &grants, window(), &[])?;
+        let (status, body) = h.delegate(authorization).await;
+        assert_ne!(status, Status::Ok, "{what}: {body}");
+        assert!(body.starts_with(APP_ID_NOT_BOUND), "{what}: {body}");
+    }
+
+    let Some(h) = Harness::new_with(
+        backend,
+        Shape::KeySession,
+        "siwe_app_grants_need_an_app_id_bound_to_the_domain_ucan",
+        on,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let grants = vec![(format!("{}/apps/other.app/x", h.network), KEY_DECRYPT)];
+    let authorization = h
+        .space_owner
+        .delegate(h.owner.did(), &grants, window(), &[])?;
+    let (status, body) = h.delegate(authorization).await;
+    assert_eq!(status, Status::Ok, "UCAN root: {body}");
+    Ok(())
+}
+on_both_backends!(siwe_app_grants_need_an_app_id_bound_to_the_domain);
