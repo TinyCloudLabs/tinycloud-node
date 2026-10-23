@@ -1777,22 +1777,20 @@ async fn invoke_impl(
             let resource = capability.resource.to_string();
             (is_decrypt && resource.starts_with("urn:tinycloud:encryption:")).then_some(resource)
         });
-        if let Some(network) = decrypt_network {
+        if let Some(resource) = decrypt_network {
             if admitted.invocation().0.capabilities.iter().any(|capability| {
                 capability.ability.as_ref().as_ref()
                     == tinycloud_core::encryption_network::DECRYPT_ACTION
-                    && capability.resource.to_string() != network
+                    && capability.resource.to_string() != resource
             }) {
                 return Err((
                     Status::Forbidden,
-                    "decrypt invocation contains multiple networks".to_string(),
+                    "decrypt invocation contains multiple decrypt resources".to_string(),
                 ).into());
             }
-            let network = network.parse().map_err(
-                |error: tinycloud_core::encryption_network::NetworkIdError| {
-                    (Status::Forbidden, error.to_string())
-                },
-            )?;
+            let target =
+                tinycloud_core::encryption_network::DecryptTarget::from_resource(&resource)
+                    .map_err(|error| (Status::Forbidden, error.to_string()))?;
             let body = read_json_body(data).await?;
             let body = serde_json::from_str(&body)
                 .map_err(|error| (Status::BadRequest, error.to_string()))?;
@@ -1801,9 +1799,14 @@ async fn invoke_impl(
                 .await
                 .map_err(|error| (Status::Forbidden, error.to_string()))?;
             encryption
-                .validate_authorized_decrypt_request(&network, &admitted.invocation().0, &body)
+                .validate_authorized_decrypt_request(&target, &admitted.invocation().0, &body)
                 .await
-                .map_err(|error| (Status::Forbidden, error.to_string()))?;
+                .map_err(|error| match error {
+                    tinycloud_core::encryption_network::EncryptionServiceError::InvalidReceiverPublicKey => {
+                        (Status::BadRequest, error.to_string())
+                    }
+                    _ => (Status::Forbidden, error.to_string()),
+                })?;
             if policy_session_invocation {
                 invocation_replay_cache
                     .check_and_insert_invoker_nonce(admitted.invocation(), 60)
@@ -1818,7 +1821,7 @@ async fn invoke_impl(
             let latched = request_cancel::latch();
             debug_assert!(latched, "a cut handler is not polled again");
             let verified = encryption
-                .decrypt_authorized(&network, &admitted.invocation().0, &body)
+                .decrypt_authorized(&target, &admitted.invocation().0, &body)
                 .await
                 .map_err(|error| (Status::Forbidden, error.to_string()))?;
             if let Some(timer) = timer {

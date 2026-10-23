@@ -194,9 +194,17 @@ pub async fn decrypt(
                 (Status::BadRequest, e.to_string())
             })?;
     let body = body.into_inner();
+    if body.get("keyPath").is_some() {
+        return Err((
+            Status::BadRequest,
+            "key_path_invalid: keyPath is not accepted on the network decrypt route; use /invoke with a key capability"
+                .to_string(),
+        ));
+    }
+    let target = tinycloud_core::encryption_network::DecryptTarget::Root(net.clone());
     let decrypt_start = Instant::now();
     let decrypt_result = service
-        .decrypt_authorized(&net, &invocation_info, &body)
+        .decrypt_authorized(&target, &invocation_info, &body)
         .await;
     crate::prometheus::observe_span(
         "server.encryption.decrypt_authorized",
@@ -353,8 +361,7 @@ fn raw_key_path(origin: &Origin<'_>, network_id: &str) -> Result<String, (Status
     let raw = origin
         .path()
         .as_str()
-        .split_once(&format!("/networks/{network_id}/keys/"))
-        .map(|(_, rest)| rest)
+        .strip_prefix(&format!("/encryption/networks/{network_id}/keys/"))
         .ok_or_else(|| {
             map_service_err(EncryptionServiceError::KeyPathInvalid(
                 "key path is not present in the request".to_string(),
@@ -648,9 +655,9 @@ fn map_service_err(err: EncryptionServiceError) -> (Status, String) {
         | EncryptionServiceError::KeyUnwrapFailed(_) => Status::Forbidden,
         EncryptionServiceError::CorruptKeyRow => Status::InternalServerError,
         EncryptionServiceError::KeyPathInvalid(_) => Status::BadRequest,
-        EncryptionServiceError::InvalidBody(_) | EncryptionServiceError::Base64(_) => {
-            Status::BadRequest
-        }
+        EncryptionServiceError::InvalidBody(_)
+        | EncryptionServiceError::InvalidReceiverPublicKey
+        | EncryptionServiceError::Base64(_) => Status::BadRequest,
     };
     (status, err.to_string())
 }

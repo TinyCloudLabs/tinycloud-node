@@ -122,6 +122,7 @@ fn build_body(ctx: &ClientCtx, net: &NetworkId) -> (DecryptRequestBody, Value) {
         encrypted_symmetric_key_hash: canonical_hash(&Value::String(encrypted_symmetric_key)),
         receiver_public_key: receiver_public_key.clone(),
         receiver_public_key_hash: canonical_hash(&Value::String(receiver_public_key)),
+        key_path: None,
     };
     let value = serde_json::to_value(&body).unwrap();
     (body, value)
@@ -153,6 +154,7 @@ fn build_invocation(
             receiver_public_key_hash: canonical_hash(&Value::String(
                 STANDARD.encode(&ctx.receiver_pub),
             )),
+            key_path: None,
             alg: ALG_X25519_AES256GCM.to_string(),
             key_version: 1,
         },
@@ -169,6 +171,15 @@ fn build_invocation(
 
 fn build_session_invocation_info(
     resource: &NetworkId,
+    action: &str,
+    facts: Vec<Value>,
+    audience: &str,
+) -> crate::util::InvocationInfo {
+    build_session_invocation_for(&resource.to_string(), action, facts, audience)
+}
+
+fn build_session_invocation_for(
+    resource: &str,
     action: &str,
     facts: Vec<Value>,
     audience: &str,
@@ -421,6 +432,7 @@ async fn decrypt_authorized_accepts_session_invoker() {
         receiver_public_key_hash: canonical_hash(&Value::String(
             STANDARD.encode(&ctx.receiver_pub),
         )),
+        key_path: None,
         alg: ALG_X25519_AES256GCM.to_string(),
         key_version: 1,
     })
@@ -428,7 +440,11 @@ async fn decrypt_authorized_accepts_session_invoker() {
     let invocation = build_session_invocation_info(&net, DECRYPT_ACTION, vec![facts], NODE_DID);
 
     let verified = svc
-        .decrypt_authorized(&net, &invocation, &body_value)
+        .decrypt_authorized(
+            &crate::encryption_network::DecryptTarget::Root(net.clone()),
+            &invocation,
+            &body_value,
+        )
         .await
         .unwrap();
     let rewrapped = STANDARD
@@ -464,6 +480,7 @@ async fn decrypt_authorized_rejects_audience_mismatch() {
         receiver_public_key_hash: canonical_hash(&Value::String(
             STANDARD.encode(&ctx.receiver_pub),
         )),
+        key_path: None,
         alg: ALG_X25519_AES256GCM.to_string(),
         key_version: 1,
     })
@@ -476,7 +493,11 @@ async fn decrypt_authorized_rejects_audience_mismatch() {
     );
 
     let err = svc
-        .decrypt_authorized(&net, &invocation, &body_value)
+        .decrypt_authorized(
+            &crate::encryption_network::DecryptTarget::Root(net.clone()),
+            &invocation,
+            &body_value,
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, EncryptionServiceError::AudienceMismatch));
@@ -990,7 +1011,7 @@ async fn unwrap_named_key_round_trip_for_active_key() {
     let key = svc.create_key(&loc, false).await.unwrap();
     let symmetric = vec![0x5Au8; 32];
     let wrapped = wrap_to_public_key(&key.public_encryption_key, &symmetric).unwrap();
-    let unwrapped = svc.unwrap_named_key(&loc, &wrapped).await.unwrap();
+    let (_, unwrapped) = svc.unwrap_named_key(&loc, &wrapped).await.unwrap();
     assert_eq!(unwrapped, symmetric);
 }
 
@@ -1177,4 +1198,377 @@ async fn postgres_concurrent_creates_respect_the_key_cap() {
         .await
         .unwrap();
     assert_eq!(rows.len() as u64, CAP, "cap is never exceeded");
+}
+
+use crate::encryption_network::{keys::canonical_key_urn, DecryptTarget};
+
+fn key_body(
+    ctx: &ClientCtx,
+    net: &NetworkId,
+    path: &str,
+    key_version: i64,
+) -> (DecryptRequestBody, Value) {
+    let (mut body, _) = build_body(ctx, net);
+    body.key_path = Some(path.to_string());
+    body.key_version = key_version;
+    let value = serde_json::to_value(&body).unwrap();
+    (body, value)
+}
+
+fn key_facts(
+    ctx: &ClientCtx,
+    net: &NetworkId,
+    body_value: &Value,
+    path: &str,
+    key_version: i64,
+) -> Value {
+    serde_json::to_value(DecryptFacts {
+        ty: DECRYPT_REQUEST_TYPE.to_string(),
+        target_node: NODE_DID.to_string(),
+        network_id: net.clone(),
+        body_hash: canonical_hash(body_value),
+        encrypted_symmetric_key_hash: canonical_hash(&Value::String(
+            STANDARD.encode(&ctx.wrapped_key),
+        )),
+        receiver_public_key_hash: canonical_hash(&Value::String(
+            STANDARD.encode(&ctx.receiver_pub),
+        )),
+        key_path: Some(path.to_string()),
+        alg: ALG_X25519_AES256GCM.to_string(),
+        key_version,
+    })
+    .unwrap()
+}
+
+fn key_invocation(loc: &KeyLocation, facts: Value) -> crate::util::InvocationInfo {
+    build_session_invocation_for(
+        &canonical_key_urn(loc),
+        DECRYPT_ACTION,
+        vec![facts],
+        NODE_DID,
+    )
+}
+
+#[tokio::test]
+async fn key_decrypt_round_trip_returns_rewrapped_key() {
+    let svc = make_service(fresh_db().await);
+    create_network(&svc).await;
+    let net = network_id();
+    let loc = key_loc("apps/alpha");
+    let key = svc.create_key(&loc, false).await.unwrap();
+    let ctx = make_client_request(&key.public_encryption_key);
+    let (_, body_value) = key_body(&ctx, &net, "apps/alpha", 1);
+    let invocation = key_invocation(&loc, key_facts(&ctx, &net, &body_value, "apps/alpha", 1));
+    let target = DecryptTarget::from_resource(&canonical_key_urn(&loc)).unwrap();
+
+    let verified = svc
+        .decrypt_authorized(&target, &invocation, &body_value)
+        .await
+        .unwrap();
+    let rewrapped = STANDARD
+        .decode(&verified.response.wrapped_key)
+        .expect("base64 wrapped key");
+    assert_eq!(
+        unwrap_with_secret(&ctx.receiver_secret, &rewrapped),
+        ctx.symmetric
+    );
+}
+
+#[tokio::test]
+async fn key_decrypt_refuses_body_key_path_mismatch() {
+    let svc = make_service(fresh_db().await);
+    create_network(&svc).await;
+    let net = network_id();
+    let alpha = key_loc("apps/alpha");
+    let key = svc.create_key(&alpha, false).await.unwrap();
+    let ctx = make_client_request(&key.public_encryption_key);
+    let (_, body_value) = key_body(&ctx, &net, "apps/beta", 1);
+    let invocation = key_invocation(&alpha, key_facts(&ctx, &net, &body_value, "apps/beta", 1));
+    let target = DecryptTarget::from_resource(&canonical_key_urn(&alpha)).unwrap();
+
+    let err = svc
+        .decrypt_authorized(&target, &invocation, &body_value)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EncryptionServiceError::KeyPathInvalid(_)));
+}
+
+#[tokio::test]
+async fn key_decrypt_refuses_capability_for_sibling_key() {
+    let svc = make_service(fresh_db().await);
+    create_network(&svc).await;
+    let net = network_id();
+    let alpha = key_loc("apps/alpha");
+    let beta = key_loc("apps/beta");
+    let key = svc.create_key(&alpha, false).await.unwrap();
+    svc.create_key(&beta, false).await.unwrap();
+    let ctx = make_client_request(&key.public_encryption_key);
+    let (_, body_value) = key_body(&ctx, &net, "apps/alpha", 1);
+    let invocation = key_invocation(&beta, key_facts(&ctx, &net, &body_value, "apps/alpha", 1));
+    let target = DecryptTarget::from_resource(&canonical_key_urn(&alpha)).unwrap();
+
+    let err = svc
+        .decrypt_authorized(&target, &invocation, &body_value)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EncryptionServiceError::Unauthorized));
+}
+
+#[tokio::test]
+async fn root_decrypt_refuses_body_key_path() {
+    let svc = make_service(fresh_db().await);
+    let net = network_id();
+    let descriptor = svc
+        .create_one_of_one_network(CreateNetworkRequest {
+            name: NETWORK_NAME.to_string(),
+            owner_did: owner_did(),
+            threshold: Threshold::one_of_one(),
+        })
+        .await
+        .unwrap();
+    let ctx = make_client_request(&descriptor.public_encryption_key);
+    let (_, body_value) = key_body(&ctx, &net, "apps/alpha", 1);
+    let invocation = build_session_invocation_info(
+        &net,
+        DECRYPT_ACTION,
+        vec![key_facts(&ctx, &net, &body_value, "apps/alpha", 1)],
+        NODE_DID,
+    );
+
+    let err = svc
+        .decrypt_authorized(&DecryptTarget::Root(net.clone()), &invocation, &body_value)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EncryptionServiceError::KeyPathInvalid(_)));
+}
+
+#[tokio::test]
+async fn key_decrypt_refuses_blocked_key() {
+    let svc = make_service(fresh_db().await);
+    create_network(&svc).await;
+    let net = network_id();
+    let loc = key_loc("apps/alpha");
+    let key = svc.create_key(&loc, false).await.unwrap();
+    svc.block_key(&loc).await.unwrap();
+    let ctx = make_client_request(&key.public_encryption_key);
+    let (_, body_value) = key_body(&ctx, &net, "apps/alpha", 1);
+    let invocation = key_invocation(&loc, key_facts(&ctx, &net, &body_value, "apps/alpha", 1));
+    let target = DecryptTarget::from_resource(&canonical_key_urn(&loc)).unwrap();
+
+    let err = svc
+        .decrypt_authorized(&target, &invocation, &body_value)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EncryptionServiceError::KeyBlocked));
+}
+
+#[tokio::test]
+async fn key_decrypt_refuses_missing_key() {
+    let svc = make_service(fresh_db().await);
+    create_network(&svc).await;
+    let net = network_id();
+    let loc = key_loc("apps/missing");
+    let derived = svc.public_key(&loc).await.unwrap();
+    let ctx = make_client_request(&derived.public_encryption_key);
+    let (_, body_value) = key_body(&ctx, &net, "apps/missing", 1);
+    let invocation = key_invocation(&loc, key_facts(&ctx, &net, &body_value, "apps/missing", 1));
+    let target = DecryptTarget::from_resource(&canonical_key_urn(&loc)).unwrap();
+
+    let err = svc
+        .decrypt_authorized(&target, &invocation, &body_value)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EncryptionServiceError::KeyNotFound));
+}
+
+#[tokio::test]
+async fn key_decrypt_wrong_key_material_is_key_unwrap_failed() {
+    let svc = make_service(fresh_db().await);
+    create_network(&svc).await;
+    let net = network_id();
+    let alpha = key_loc("apps/alpha");
+    let beta = key_loc("apps/beta");
+    svc.create_key(&alpha, false).await.unwrap();
+    let other = svc.create_key(&beta, false).await.unwrap();
+    let ctx = make_client_request(&other.public_encryption_key);
+    let (_, body_value) = key_body(&ctx, &net, "apps/alpha", 1);
+    let invocation = key_invocation(&alpha, key_facts(&ctx, &net, &body_value, "apps/alpha", 1));
+    let target = DecryptTarget::from_resource(&canonical_key_urn(&alpha)).unwrap();
+
+    let err = svc
+        .decrypt_authorized(&target, &invocation, &body_value)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EncryptionServiceError::KeyUnwrapFailed(_)));
+}
+
+#[tokio::test]
+async fn key_decrypt_refuses_key_version_mismatch() {
+    let svc = make_service(fresh_db().await);
+    create_network(&svc).await;
+    let net = network_id();
+    let loc = key_loc("apps/alpha");
+    let key = svc.create_key(&loc, false).await.unwrap();
+    let ctx = make_client_request(&key.public_encryption_key);
+    let (_, body_value) = key_body(&ctx, &net, "apps/alpha", 2);
+    let invocation = key_invocation(&loc, key_facts(&ctx, &net, &body_value, "apps/alpha", 2));
+    let target = DecryptTarget::from_resource(&canonical_key_urn(&loc)).unwrap();
+
+    let err = svc
+        .decrypt_authorized(&target, &invocation, &body_value)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EncryptionServiceError::AlgKeyVersionMismatch));
+}
+
+#[test]
+fn decrypt_target_classifies_resources() {
+    let net = network_id();
+    assert!(matches!(
+        &DecryptTarget::from_resource(&net.to_string()),
+        Ok(DecryptTarget::Root(n)) if n == &net
+    ));
+    let loc = key_loc("apps/alpha");
+    assert!(matches!(
+        DecryptTarget::from_resource(&canonical_key_urn(&loc)),
+        Ok(DecryptTarget::Key { .. })
+    ));
+    let prefix = format!(
+        "urn:tinycloud:encryption:{}:{}/apps/",
+        owner_did(),
+        NETWORK_NAME
+    );
+    assert!(matches!(
+        DecryptTarget::from_resource(&prefix),
+        Err(EncryptionServiceError::Unauthorized)
+    ));
+    assert!(matches!(
+        DecryptTarget::from_resource("not-a-resource"),
+        Err(EncryptionServiceError::Unauthorized)
+    ));
+}
+
+#[tokio::test]
+async fn root_decrypt_refuses_a_key_capability() {
+    let svc = make_service(fresh_db().await);
+    let net = network_id();
+    let descriptor = svc
+        .create_one_of_one_network(CreateNetworkRequest {
+            name: NETWORK_NAME.to_string(),
+            owner_did: owner_did(),
+            threshold: Threshold::one_of_one(),
+        })
+        .await
+        .unwrap();
+    let ctx = make_client_request(&descriptor.public_encryption_key);
+    let (_, body_value) = build_body(&ctx, &net);
+    let mut facts = key_facts(&ctx, &net, &body_value, "apps/alpha", 1);
+    facts.as_object_mut().unwrap().remove("keyPath");
+    let loc = key_loc("apps/alpha");
+    let invocation = key_invocation(&loc, facts);
+
+    let err = svc
+        .decrypt_authorized(&DecryptTarget::Root(net.clone()), &invocation, &body_value)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EncryptionServiceError::NetworkMismatch));
+}
+
+#[tokio::test]
+async fn denied_audit_row_for_root_target_never_takes_the_request_key_path() {
+    let db = fresh_db().await;
+    let svc = make_service(db.clone());
+    let net = network_id();
+    let descriptor = svc
+        .create_one_of_one_network(CreateNetworkRequest {
+            name: NETWORK_NAME.to_string(),
+            owner_did: owner_did(),
+            threshold: Threshold::one_of_one(),
+        })
+        .await
+        .unwrap();
+    let ctx = make_client_request(&descriptor.public_encryption_key);
+    let (_, body_value) = build_body(&ctx, &net);
+    // Denied before `check_decrypt_scope`: the request names a key path the root target never had.
+    let facts = serde_json::to_value(DecryptFacts {
+        ty: DECRYPT_REQUEST_TYPE.to_string(),
+        target_node: "did:key:z6MkOther".to_string(),
+        network_id: net.clone(),
+        body_hash: canonical_hash(&body_value),
+        encrypted_symmetric_key_hash: canonical_hash(&Value::String(
+            STANDARD.encode(&ctx.wrapped_key),
+        )),
+        receiver_public_key_hash: canonical_hash(&Value::String(
+            STANDARD.encode(&ctx.receiver_pub),
+        )),
+        key_path: Some("apps/alpha".to_string()),
+        alg: ALG_X25519_AES256GCM.to_string(),
+        key_version: 1,
+    })
+    .unwrap();
+    let invocation = build_session_invocation_info(&net, DECRYPT_ACTION, vec![facts], NODE_DID);
+
+    let err = svc
+        .decrypt_authorized(
+            &crate::encryption_network::DecryptTarget::Root(net.clone()),
+            &invocation,
+            &body_value,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EncryptionServiceError::TargetNodeMismatch));
+
+    let rows = crate::models::encryption_audit::Entity::find()
+        .all(&db)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].outcome, "denied:target-node");
+    assert_eq!(rows[0].key_path, None);
+}
+
+#[tokio::test]
+async fn decrypt_authorized_refuses_a_low_order_receiver_key() {
+    let svc = make_service(fresh_db().await);
+    let net = network_id();
+    let descriptor = svc
+        .create_one_of_one_network(CreateNetworkRequest {
+            name: NETWORK_NAME.to_string(),
+            owner_did: owner_did(),
+            threshold: Threshold::one_of_one(),
+        })
+        .await
+        .unwrap();
+    let ctx = make_client_request(&descriptor.public_encryption_key);
+    let low_order = [0u8; 32];
+    let (_, mut body_value) = build_body(&ctx, &net);
+    body_value["receiverPublicKey"] = serde_json::json!(STANDARD.encode(low_order));
+    let facts = serde_json::to_value(DecryptFacts {
+        ty: DECRYPT_REQUEST_TYPE.to_string(),
+        target_node: NODE_DID.to_string(),
+        network_id: net.clone(),
+        body_hash: canonical_hash(&body_value),
+        encrypted_symmetric_key_hash: canonical_hash(&Value::String(
+            STANDARD.encode(&ctx.wrapped_key),
+        )),
+        receiver_public_key_hash: canonical_hash(&Value::String(STANDARD.encode(low_order))),
+        key_path: None,
+        alg: ALG_X25519_AES256GCM.to_string(),
+        key_version: 1,
+    })
+    .unwrap();
+    let invocation = build_session_invocation_info(&net, DECRYPT_ACTION, vec![facts], NODE_DID);
+
+    let err = svc
+        .decrypt_authorized(
+            &crate::encryption_network::DecryptTarget::Root(net.clone()),
+            &invocation,
+            &body_value,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        EncryptionServiceError::InvalidReceiverPublicKey
+    ));
 }
