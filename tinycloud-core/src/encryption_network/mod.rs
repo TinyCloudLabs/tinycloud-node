@@ -26,8 +26,8 @@ pub use protocol::{
     KEY_UNBLOCK_ACTION, NETWORK_ADMIN_TYPE, NETWORK_CREATE_ACTION, NETWORK_REVOKE_ACTION,
 };
 pub use service::{
-    CreateNetworkRequest, EncryptionService, EncryptionServiceError, VerifiedDecrypt,
-    WellKnownRecord,
+    CreateNetworkRequest, DecryptTarget, EncryptionService, EncryptionServiceError,
+    VerifiedDecrypt, WellKnownRecord,
 };
 pub use types::{
     InlineEnvelope, KeyBackendKind, NetworkDescriptor, NetworkState, Threshold,

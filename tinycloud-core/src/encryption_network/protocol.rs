@@ -49,6 +49,9 @@ pub struct DecryptRequestBody {
     pub receiver_public_key: String,
     #[serde(rename = "receiverPublicKeyHash")]
     pub receiver_public_key_hash: String,
+    /// Named-key path; present iff the capability names a key (`/invoke` only).
+    #[serde(rename = "keyPath", default, skip_serializing_if = "Option::is_none")]
+    pub key_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,6 +138,9 @@ pub struct DecryptFacts {
     pub alg: String,
     #[serde(rename = "keyVersion")]
     pub key_version: i64,
+    /// Named-key path; present iff the capability names a key.
+    #[serde(rename = "keyPath", default, skip_serializing_if = "Option::is_none")]
+    pub key_path: Option<String>,
 }
 
 /// UCAN-style invocation envelope for encryption-network lifecycle actions.
@@ -261,6 +267,7 @@ mod tests {
                 receiver_public_key_hash: "cc".repeat(32),
                 alg: "x25519-aes256gcm/v1".to_string(),
                 key_version: 1,
+                key_path: None,
             },
             nonce: "nonce-1".to_string(),
             not_before: None,
@@ -320,6 +327,7 @@ mod tests {
             encrypted_symmetric_key_hash: "aa".repeat(32),
             receiver_public_key: "BAUG".to_string(),
             receiver_public_key_hash: "bb".repeat(32),
+            key_path: None,
         };
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(json["type"], json!(DECRYPT_REQUEST_TYPE));
@@ -341,6 +349,7 @@ mod tests {
             encrypted_symmetric_key_hash: "aa".repeat(32),
             receiver_public_key: "BAUG".to_string(),
             receiver_public_key_hash: "bb".repeat(32),
+            key_path: None,
         };
         let mut body_json = serde_json::to_value(body).unwrap();
         body_json["unsupported"] = json!(true);

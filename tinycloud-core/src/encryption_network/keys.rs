@@ -76,12 +76,12 @@ pub struct KeyPublic {
     pub public_encryption_key: Vec<u8>,
 }
 
-fn network_of(loc: &KeyLocation) -> Result<NetworkId, EncryptionServiceError> {
+pub(crate) fn network_of(loc: &KeyLocation) -> Result<NetworkId, EncryptionServiceError> {
     NetworkId::new(loc.owner_did(), loc.network())
         .map_err(|e| EncryptionServiceError::InvalidBody(format!("invalid network id: {e}")))
 }
 
-fn canonical_key_urn(loc: &KeyLocation) -> String {
+pub(crate) fn canonical_key_urn(loc: &KeyLocation) -> String {
     EncryptionResource::Key(loc.clone()).to_string()
 }
 
@@ -319,7 +319,7 @@ impl EncryptionService {
         &self,
         loc: &KeyLocation,
         wrapped_key: &[u8],
-    ) -> Result<Vec<u8>, EncryptionServiceError> {
+    ) -> Result<(i64, Vec<u8>), EncryptionServiceError> {
         let network = network_of(loc)?;
         let net = load_active_network(&self.db, &network).await?;
         let row = find_key_row(&self.db, &network, loc.path())
@@ -334,8 +334,10 @@ impl EncryptionService {
             .as_deref()
             .ok_or(KeyBackendError::SealedKeyMissing)?;
         let network_secret = self.backend.open_network_secret(sealed)?;
-        self.backend
+        let symmetric = self
+            .backend
             .unwrap_named(&network_secret, &canonical_key_urn(loc), wrapped_key)
-            .map_err(EncryptionServiceError::KeyUnwrapFailed)
+            .map_err(EncryptionServiceError::KeyUnwrapFailed)?;
+        Ok((row.key_version, symmetric))
     }
 }

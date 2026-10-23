@@ -36,7 +36,8 @@ async fn setup() -> Result<(KvSyncFixture, String)> {
                     crate::routes::encryption::describe_encryption_key,
                     crate::routes::encryption::public_encryption_key,
                     crate::routes::encryption::block_encryption_key,
-                    crate::routes::encryption::unblock_encryption_key
+                    crate::routes::encryption::unblock_encryption_key,
+                    crate::routes::encryption::decrypt
                 ],
             )
             .manage(crate::routes::public::RateLimiter::new(
@@ -1329,5 +1330,27 @@ async fn key_route_bodies_that_do_not_parse_are_named_by_the_route() -> Result<(
         text.starts_with("request body is malformed: "),
         "block: {text}"
     );
+    Ok(())
+}
+
+const DIRECT_DECRYPT_ABILITY: &str = "tinycloud.encryption/decrypt";
+
+fn decrypt_url(network: &str) -> String {
+    format!("/encryption/networks/{network}/decrypt")
+}
+
+#[tokio::test]
+async fn direct_decrypt_refuses_a_body_key_path() -> Result<()> {
+    let (fixture, network) = setup().await?;
+    let auth = invocation(
+        &fixture,
+        &fixture.node_did,
+        &[(network.as_str(), DIRECT_DECRYPT_ABILITY)],
+        vec![],
+    )?;
+    let body = json!({"keyPath": "apps/alpha"});
+    let (status, text) = post_json(&fixture.client, &decrypt_url(&network), &auth, &body).await;
+    assert_eq!(status, Status::BadRequest, "{text}");
+    assert!(text.starts_with("key_path_invalid: "), "{text}");
     Ok(())
 }
