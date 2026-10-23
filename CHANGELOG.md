@@ -4,7 +4,8 @@
 
 ### Changes
 
-- PostgreSQL-backed tests connect only when `CI=true` or `TINYCLOUD_ALLOW_LOCAL_PG=1` is set, and skip otherwise.
+- Tests that read `TINYCLOUD_TEST_POSTGRES_URL` connect only when `CI=true` or `TINYCLOUD_ALLOW_LOCAL_PG=1` is set, and skip otherwise. `tinycloud-node-server/tests/at_rest_harness.rs` (reads `TC887_PG_URL`) is excluded.
+- Encryption: key and prefix network names must match `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`; bare network resources keep the existing network name rule. Details: TC-1777.
 
 ## [1.21.9] - 2026-10-23
 
