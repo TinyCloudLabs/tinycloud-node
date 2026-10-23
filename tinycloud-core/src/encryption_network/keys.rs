@@ -310,8 +310,8 @@ impl EncryptionService {
 
     /// Release-guard state read and unwrap. Order: network ACTIVE, then key row
     /// exists and is ACTIVE, then strict unwrap. Callers must invoke this after
-    /// replay reservation. Any unwrap failure is `KeyUnwrapFailed`. A failure to
-    /// unseal the network secret is `Backend`.
+    /// replay reservation. Any ECIES unwrap failure is `KeyUnwrapFailed`; a failure
+    /// to unseal the network key is `Backend`.
     pub async fn unwrap_named_key(
         &self,
         loc: &KeyLocation,
