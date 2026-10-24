@@ -767,3 +767,86 @@ async fn postgres_delete_keys_ends_its_transaction_before_returning() {
     .expect("the network row lock was released")
     .unwrap();
 }
+
+// PostgreSQL-backed; CI-only. The node does not learn how the commit ended
+// while the commit is still running on the server (a deferred trigger
+// stretches it to about two seconds). The settling read waits for the network
+// row lock that the committing transaction holds, so the ledger ends
+// `committed` and a restore plus replay deletes the key.
+#[tokio::test]
+async fn postgres_a_commit_still_running_is_settled_as_committed_once_it_finishes() {
+    use sea_orm::ConnectionTrait;
+    let Some(fixture) = PostgresTestSchema::migrated_through(
+        "postgres_a_commit_still_running_is_settled_as_committed_once_it_finishes",
+        None,
+    )
+    .await
+    else {
+        return;
+    };
+    let db = fixture.connect(4).await;
+    let dir = tempfile::tempdir().unwrap();
+    let ledger_path = dir.path().join("ledger.jsonl");
+    let ledger = Arc::new(DeletionLedger::open(&ledger_path).unwrap());
+    let service = service_over(db.clone(), Some(ledger));
+    create_network(&service).await;
+    service.create_key(&loc("apps/foo/a"), true).await.unwrap();
+    db.execute_unprepared(
+        "CREATE FUNCTION slow_commit() RETURNS trigger LANGUAGE plpgsql AS \
+         $$ BEGIN PERFORM pg_sleep(2); RETURN NULL; END $$",
+    )
+    .await
+    .unwrap();
+    db.execute_unprepared(
+        "CREATE CONSTRAINT TRIGGER slow_commit AFTER UPDATE ON encryption_network_key \
+         DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION slow_commit()",
+    )
+    .await
+    .unwrap();
+    service
+        .delete_faults
+        .detach_commit
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let err = service
+        .delete_keys(&network(), &prefix("foo"), &verified("cid-slow"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EncryptionServiceError::Db(_)), "{err:?}");
+
+    let records = deletion_ledger::read(&ledger_path).unwrap().records;
+    assert_eq!(records.len(), 2, "{records:?}");
+    assert!(matches!(&records[0], Record::Intent(i) if i.op == "cid-slow"));
+    assert_eq!(records[1], Record::committed("cid-slow"));
+    let row = encryption_network_key::Entity::find_by_id((
+        network().to_string(),
+        "apps/foo/a".to_string(),
+    ))
+    .one(&db)
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(row.state, "deleted");
+
+    // A restore brings the row back as it was before the delete; the replay
+    // deletes it again.
+    db.execute_unprepared(
+        "UPDATE encryption_network_key SET state = 'active', sealed_seed = decode('09', 'hex') \
+         WHERE key_path = 'apps/foo/a'",
+    )
+    .await
+    .unwrap();
+    let report = deletion_ledger::replay(&db, &ledger_path).await.unwrap();
+    assert_eq!(report.aborted_operations, 0);
+    assert_eq!(report.applied, 1);
+    let row = encryption_network_key::Entity::find_by_id((
+        network().to_string(),
+        "apps/foo/a".to_string(),
+    ))
+    .one(&db)
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(row.state, "deleted");
+    assert!(row.sealed_seed.is_none());
+}

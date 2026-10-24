@@ -544,6 +544,24 @@ async fn cacao_for_another_prefix_is_refused() {
             "{label}: {result:?}"
         );
     }
+    // The refusal for the path without its trailing slash is the recap
+    // check itself, not a later one.
+    let mut spec = CacaoSpec::valid(&owner, &target, at);
+    spec.recap = vec![(
+        target.urn().strip_suffix('/').unwrap().to_string(),
+        vec![KEY_DELETE_ACTION],
+    )];
+    assert_refused(
+        verify(
+            &spec.header(&target),
+            &network,
+            &target,
+            &body_for(&target),
+            at,
+        )
+        .await,
+        "ReCap is not key.delete on exactly the requested target",
+    );
 }
 
 #[tokio::test]

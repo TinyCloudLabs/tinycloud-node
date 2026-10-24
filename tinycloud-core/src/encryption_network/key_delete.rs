@@ -9,7 +9,8 @@ use sea_orm::{
     sea_query::{Alias, Expr, Func, SimpleExpr},
     ActiveModelTrait,
     ActiveValue::Set,
-    ColumnTrait, DatabaseTransaction, EntityTrait, QueryFilter, QueryOrder,
+    ColumnTrait, ConnectionTrait, DatabaseTransaction, DbBackend, EntityTrait, QueryFilter,
+    QueryOrder, TransactionTrait,
 };
 
 use crate::{
@@ -96,7 +97,8 @@ impl EncryptionService {
     }
 
     /// Commits the delete's transaction. Tests can make it fail before the
-    /// commit (rolled back) or after it (committed, reply lost).
+    /// commit (rolled back), after it (committed, reply lost), or return
+    /// without waiting for a commit that is still running.
     async fn commit_delete(&self, tx: DatabaseTransaction) -> Result<(), sea_orm::DbErr> {
         #[cfg(test)]
         {
@@ -111,6 +113,14 @@ impl EncryptionService {
                 tx.commit().await?;
                 return Err(sea_orm::DbErr::Custom(
                     "injected loss of the commit reply".to_string(),
+                ));
+            }
+            if self.delete_faults.detach_commit.swap(false, SeqCst) {
+                tokio::spawn(async move {
+                    let _ = tx.commit().await;
+                });
+                return Err(sea_orm::DbErr::Custom(
+                    "injected: the commit outcome is not awaited".to_string(),
                 ));
             }
         }
@@ -258,6 +268,11 @@ impl EncryptionService {
         }
     }
 
+    /// Whether the intent's delete committed, read in a new transaction that
+    /// first takes the network row lock. A commit that is still running holds
+    /// that lock, so the read waits for its outcome (at most 30 seconds on
+    /// PostgreSQL) instead of seeing the rows as they were before it. Any
+    /// error, a lock timeout included, leaves the intent open.
     async fn reread_committed(&self, intent: &Intent) -> Result<bool, sea_orm::DbErr> {
         #[cfg(test)]
         if self
@@ -267,7 +282,22 @@ impl EncryptionService {
         {
             return Err(sea_orm::DbErr::Custom("injected read failure".to_string()));
         }
-        intent_committed(&self.db, intent).await
+        let network = intent
+            .network_id
+            .parse::<NetworkId>()
+            .map_err(|error| sea_orm::DbErr::Custom(error.to_string()))?;
+        let tx = self.db.begin().await?;
+        if tx.get_database_backend() == DbBackend::Postgres {
+            tx.execute_unprepared("SET LOCAL lock_timeout = '30s'")
+                .await?;
+        }
+        let verdict = async {
+            lock_network_row(&tx, &network).await?;
+            intent_committed(&tx, intent).await
+        }
+        .await;
+        let _ = tx.rollback().await;
+        verdict
     }
 }
 
@@ -278,6 +308,7 @@ pub(super) struct DeleteFaults {
     pub(super) fail_before_commit: std::sync::atomic::AtomicBool,
     pub(super) lose_commit_reply: std::sync::atomic::AtomicBool,
     pub(super) fail_reread: std::sync::atomic::AtomicBool,
+    pub(super) detach_commit: std::sync::atomic::AtomicBool,
 }
 
 /// `sha256(auth CID || 0x00 || key path)`, hex. The audit table's primary key.

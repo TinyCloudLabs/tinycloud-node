@@ -674,6 +674,84 @@ async fn a_failing_ledger_turns_the_key_routes_off_and_the_rest_of_the_node_serv
     let (status, body, _) = answer(h.client.get("/version")).await;
     assert_eq!(status, Status::Ok, "{body}");
 
+    // The configuration the routes read says named keys are off.
+    let config = h
+        .client
+        .rocket()
+        .state::<crate::config::Config>()
+        .expect("Config is managed");
+    assert!(!config.encryption_network.named_keys_v1);
+    let (status, body, _) = answer(h.client.get("/info")).await;
+    assert_eq!(status, Status::Ok, "{body}");
+    let info: serde_json::Value = serde_json::from_str(&body)?;
+    assert!(
+        !info["features"]
+            .as_array()
+            .expect("features")
+            .iter()
+            .any(|feature| feature == "encryption-named-keys-v1"),
+        "{body}"
+    );
+    // A delegation on a key is refused as it is with named keys off.
+    let authorization = h.space_owner.delegate(
+        h.owner.did(),
+        &[(format!("{}/docs/a", h.network), KEY_DECRYPT)],
+        Window::until(now() + Duration::hours(1)),
+        &[],
+    )?;
+    let (status, body) = h.delegate(authorization).await;
+    assert_eq!(status, Status::Unauthorized, "{body}");
+    assert_eq!(body, NAMED_KEYS_UNAVAILABLE);
+    // Every key route answers as an unmounted path does.
+    let network = &h.network;
+    let remote = || "127.0.0.1:0".parse().expect("socket address");
+    let unmounted_get = answer(
+        h.client
+            .get(format!(
+                "/encryption/networks/{network}/no-such-route/docs/a"
+            ))
+            .remote(remote()),
+    )
+    .await;
+    let authorization = || Header::new("Authorization", "not-a-token");
+    for action in ["block", "unblock", "delete"] {
+        let got = answer(
+            h.client
+                .post(format!(
+                    "/encryption/networks/{network}/key-actions/{action}"
+                ))
+                .header(ContentType::JSON)
+                .header(authorization())
+                .body("{}"),
+        )
+        .await;
+        assert_eq!(got, unmounted, "{action}");
+    }
+    let create = answer(
+        h.client
+            .post(format!("/encryption/networks/{network}/keys"))
+            .header(ContentType::JSON)
+            .header(authorization())
+            .body("{}"),
+    )
+    .await;
+    assert_eq!(create, unmounted, "create");
+    let public_key = answer(
+        h.client
+            .get(format!("/encryption/networks/{network}/keys/docs/a"))
+            .remote(remote()),
+    )
+    .await;
+    assert_eq!(public_key, unmounted_get, "public key");
+    let describe = answer(
+        h.client
+            .get(format!("/encryption/networks/{network}/keys/docs/a"))
+            .header(authorization())
+            .remote(remote()),
+    )
+    .await;
+    assert_eq!(describe, unmounted_get, "describe");
+
     let logged = events.0.lock().expect("event log").clone();
     let alerts: Vec<_> = logged
         .iter()
