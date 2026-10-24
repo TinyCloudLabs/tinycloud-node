@@ -1065,6 +1065,49 @@ async fn issuing_delegator_and_owner_revoke_a_descendant_its_recipient_cannot() 
     Ok(())
 }
 
+/// A session key carries its delegation as a proof that grants no revoke
+/// ability, and revokes a sub-delegation it issued itself.
+#[tokio::test]
+async fn session_delegator_revokes_its_sub_delegation_with_grantless_proof() -> Result<()> {
+    let fixture = scoped_fixture().await?;
+    let device_did = fixture.device_did();
+    let (session, session_vm, session_did) = registered_key(&fixture).await?;
+    let session_grant = fixture
+        .grant(
+            "session-proof-no-revoke",
+            &device_did,
+            &session_did,
+            &[],
+            None,
+            Some(whole_seconds_from_now(3600)),
+            &[],
+        )
+        .await?;
+    let (_recipient, _recipient_vm, recipient_did) = registered_key(&fixture).await?;
+    let sub_delegation = fixture
+        .grant(
+            "session-sub-delegation",
+            &session_did,
+            &recipient_did,
+            &[("notes/", "tinycloud.kv/get")],
+            None,
+            Some(whole_seconds_from_now(1800)),
+            &[session_grant],
+        )
+        .await?;
+    let header = fixture.signed_scope_token(
+        &session,
+        &session_vm,
+        &session_did,
+        &format!("urn:cid:{}", sub_delegation.to_cid(0x55)),
+        "tinycloud.delegation/revoke",
+        whole_seconds_from_now(3600),
+        &[session_grant.to_cid(0x55)],
+    )?;
+    assert_revoked_ok(&fixture, sub_delegation, header).await?;
+    Ok(())
+}
+
 /// POST `/delegate` and return the status, body and receipt CID.
 async fn activate(fixture: &KvSyncFixture, header: String) -> (Status, String, Option<Hash>) {
     let response = fixture

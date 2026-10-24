@@ -285,6 +285,9 @@ impl ControlAction {
 pub(crate) enum ControlProofDecision {
     DirectSigner(String),
     Scoped(ScopedControl),
+    /// A valid proof that carries no grant for this action. It adds no
+    /// authority; the signer keeps only its own party authority.
+    Ungranted,
     Denied,
 }
 
@@ -474,7 +477,7 @@ pub(crate) async fn control_proof_decision<C: ConnectionTrait>(
         }
     }
     if scopes.is_empty() {
-        return Ok(ControlProofDecision::Denied);
+        return Ok(ControlProofDecision::Ungranted);
     }
     Ok(ControlProofDecision::Scoped(ScopedControl {
         action,
@@ -704,7 +707,15 @@ async fn revoker_is_authorized<C: ConnectionTrait>(
                 .filter(abilities::Column::Delegation.eq(delegation.id))
                 .all(db)
                 .await?;
-            return Ok(control.authorizes_target(requested, delegation, &target_abilities));
+            if control.authorizes_target(requested, delegation, &target_abilities) {
+                return Ok(true);
+            }
+            // A proof that does not grant revoke leaves the signer's own
+            // party authority in force: the delegator of this delegation.
+            return Ok(ControlAction::Revoke.party_may_act(delegation, revoker));
+        }
+        ControlProofDecision::Ungranted => {
+            return Ok(ControlAction::Revoke.party_may_act(delegation, revoker))
         }
         ControlProofDecision::Denied => return Ok(false),
     };
@@ -989,5 +1000,122 @@ mod tests {
         insert_link(&db, second, first).await;
 
         assert_eq!(first_revoked_ancestor(&db, &first).await.unwrap(), None);
+    }
+
+    async fn insert_actor<C: ConnectionTrait>(db: &C, id: &str) {
+        actor::ActiveModel {
+            id: Set(id.to_string()),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+    }
+
+    async fn insert_delegation_between<C: ConnectionTrait>(
+        db: &C,
+        id: Hash,
+        delegator: &str,
+        delegatee: &str,
+    ) {
+        delegation::ActiveModel {
+            id: Set(id),
+            delegator: Set(delegator.to_string()),
+            delegatee: Set(delegatee.to_string()),
+            expiry: Set(None),
+            issued_at: Set(None),
+            not_before: Set(None),
+            facts: Set(None),
+            serialization: Set(id.as_ref().to_vec()),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+    }
+
+    async fn insert_revocation_of<C: ConnectionTrait>(db: &C, id: Hash, revoked: Hash) {
+        ActiveModel {
+            id: Set(id),
+            revoker: Set("did:key:owner".to_string()),
+            revoked: Set(revoked),
+            serialization: Set(id.as_ref().to_vec()),
+            revoked_at: Set(None),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+    }
+
+    async fn revoker_may_revoke(
+        db: &sea_orm::DbConn,
+        target: Hash,
+        revoker: &str,
+        proof: Hash,
+    ) -> bool {
+        let target_row = delegation::Entity::find_by_id(target)
+            .one(db)
+            .await
+            .unwrap()
+            .unwrap();
+        super::revoker_is_authorized(db, &target_row, &target, revoker, &[proof.to_cid(0x55)])
+            .await
+            .unwrap()
+    }
+
+    // Owner O grants session S a delegation P with no revoke ability. S
+    // sub-delegates target D to recipient X. S is the delegator of D, so S
+    // must be able to revoke D while carrying P as its proof.
+    #[tokio::test]
+    async fn delegator_revokes_sub_delegation_with_proof_that_grants_no_revoke() {
+        let db = database().await;
+        for did in ["did:key:owner", "did:key:session", "did:key:recipient"] {
+            insert_actor(&db, did).await;
+        }
+        let proof = hash(b"session-proof");
+        let target = hash(b"sub-delegation");
+        insert_delegation_between(&db, proof, "did:key:owner", "did:key:session").await;
+        insert_delegation_between(&db, target, "did:key:session", "did:key:recipient").await;
+
+        assert!(revoker_may_revoke(&db, target, "did:key:session", proof).await);
+    }
+
+    // A signer that is not the delegator of D gains nothing from carrying a
+    // proof that grants no revoke ability: its own party authority is absent.
+    #[tokio::test]
+    async fn non_delegator_cannot_revoke_with_proof_that_grants_no_revoke() {
+        let db = database().await;
+        for did in [
+            "did:key:owner",
+            "did:key:session",
+            "did:key:recipient",
+            "did:key:other",
+        ] {
+            insert_actor(&db, did).await;
+        }
+        let proof = hash(b"other-proof");
+        let target = hash(b"sub-delegation");
+        insert_delegation_between(&db, proof, "did:key:owner", "did:key:other").await;
+        insert_delegation_between(&db, target, "did:key:session", "did:key:recipient").await;
+
+        assert!(!revoker_may_revoke(&db, target, "did:key:other", proof).await);
+    }
+
+    // A proof whose ancestor is revoked is invalid, so it is Denied rather
+    // than Ungranted and must not authorize even the delegator.
+    #[tokio::test]
+    async fn revoked_proof_chain_is_refused_even_for_delegator() {
+        let db = database().await;
+        for did in ["did:key:owner", "did:key:session", "did:key:recipient"] {
+            insert_actor(&db, did).await;
+        }
+        let proof = hash(b"session-proof");
+        let ancestor = hash(b"revoked-ancestor");
+        let target = hash(b"sub-delegation");
+        insert_delegation_between(&db, ancestor, "did:key:owner", "did:key:owner").await;
+        insert_delegation_between(&db, proof, "did:key:owner", "did:key:session").await;
+        insert_delegation_between(&db, target, "did:key:session", "did:key:recipient").await;
+        insert_link(&db, proof, ancestor).await;
+        insert_revocation_of(&db, hash(b"revocation-of-ancestor"), ancestor).await;
+
+        assert!(!revoker_may_revoke(&db, target, "did:key:session", proof).await);
     }
 }
