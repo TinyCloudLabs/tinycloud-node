@@ -303,3 +303,65 @@ async fn siwe_app_grants_need_an_app_id_bound_to_the_domain(
     Ok(())
 }
 on_both_backends!(siwe_app_grants_need_an_app_id_bound_to_the_domain);
+
+/// The app refuses to start while a key row under `apps/` is not a deletable
+/// key, and starts once the row is gone.
+async fn startup_refuses_a_non_deletable_key_row_under_apps(
+    backend: Backend,
+) -> anyhow::Result<()> {
+    use tinycloud_core::models::encryption_network_key;
+    use tinycloud_core::sea_orm::{ActiveModelTrait, ActiveValue::Set, Database, ModelTrait};
+
+    let Some(h) = Harness::new(
+        backend,
+        Shape::KeySession,
+        "startup_refuses_a_non_deletable_key_row_under_apps",
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    h.boot_again(|_| {}).await.expect("boots with no stray row");
+
+    let db = Database::connect(h.database_url()).await?;
+    let stray = |path: &str, kind: &str| encryption_network_key::ActiveModel {
+        network_id: Set(h.network.clone()),
+        key_path: Set(path.to_string()),
+        kind: Set(kind.to_string()),
+        state: Set("active".to_string()),
+        public_key: Set(vec![7u8; 32]),
+        sealed_seed: Set(None),
+        key_version: Set(1),
+        created_at: Set("2026-01-01T00:00:00Z".to_string()),
+        updated_at: Set("2026-01-01T00:00:00Z".to_string()),
+    };
+    // Rows outside the rule do not stop the start.
+    stray("docs/a", "deterministic").insert(&db).await?;
+    stray("appsx/y", "deterministic").insert(&db).await?;
+    h.boot_again(|_| {})
+        .await
+        .expect("boots with ordinary rows");
+
+    let row = stray("apps/foo/old", "deterministic").insert(&db).await?;
+    let Err(error) = h.boot_again(|_| {}).await else {
+        panic!("a stray row under apps/ stops the start");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("1 key rows under apps/ are not deletable keys"),
+        "{error}"
+    );
+    // The same with the named-keys setting on.
+    assert!(h
+        .boot_again(|config| config.encryption_network.named_keys_v1 = true)
+        .await
+        .is_err());
+
+    row.delete(&db).await?;
+    h.boot_again(|_| {})
+        .await
+        .expect("boots once the row is gone");
+    Ok(())
+}
+on_both_backends!(startup_refuses_a_non_deletable_key_row_under_apps);

@@ -466,6 +466,15 @@ impl Harness {
         self._db.url()
     }
 
+    /// Boots another app on this harness's database with `configure` applied
+    /// to the node config, and returns the boot error if there is one.
+    pub async fn boot_again(
+        &self,
+        configure: impl FnOnce(&mut crate::config::Config),
+    ) -> anyhow::Result<Client> {
+        Self::boot_app(&self._db, &self.vector, &self.issuer, configure).await
+    }
+
     async fn boot_app(
         db: &TestDatabase,
         vector: &Value,
