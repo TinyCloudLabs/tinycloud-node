@@ -505,3 +505,31 @@ pub fn observe_policy_owner_binding_backfill(outcome: &'static str) {
         .with_label_values(&[outcome])
         .inc();
 }
+
+lazy_static! {
+    static ref POLICY_OWNER_AUTHORITY_DENIED: IntCounterVec = register_int_counter_vec!(
+        "tinycloud_policy_owner_authority_denied_total",
+        "Policy/v3 uses denied by the recorded owner authority, by reason.",
+        &["reason"]
+    )
+    .unwrap();
+    static ref POLICY_OWNER_AUTHORITY_UNKNOWN_ALLOWED: IntCounterVec = register_int_counter_vec!(
+        "tinycloud_policy_owner_authority_unknown_allowed_total",
+        "Policy/v3 uses of legacy registrations without owner authority served under policy_v3.legacy_unknown_allow, by reason.",
+        &["reason"]
+    )
+    .unwrap();
+}
+
+/// `revoked`, `expired` or `unknown`.
+pub fn observe_policy_owner_authority_denied(reason: &'static str) {
+    POLICY_OWNER_AUTHORITY_DENIED
+        .with_label_values(&[reason])
+        .inc();
+}
+
+pub fn observe_policy_owner_authority_unknown_allowed(reason: &'static str) {
+    POLICY_OWNER_AUTHORITY_UNKNOWN_ALLOWED
+        .with_label_values(&[reason])
+        .inc();
+}

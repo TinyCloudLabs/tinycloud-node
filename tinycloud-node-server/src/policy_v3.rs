@@ -298,6 +298,10 @@ impl PolicyV3Runtime {
                 return Err("policy-session-root-graph-mismatch");
             }
         }
+        // TC-1423: the owner authority must hold; its code passes
+        // through.
+        self.validate_owner_authority(&self.conn, &registration, OffsetDateTime::now_utc())
+            .await?;
         Ok(())
     }
 
@@ -363,12 +367,15 @@ impl PolicyV3Runtime {
         Ok(())
     }
 
+    /// `Ok(None)` for an ordinary invocation; for a policy-session chain,
+    /// `Ok(Some(closure))` with the recorded owner-authority closure it
+    /// passed (empty for root authority).
     pub async fn authorize_invocation(
         &self,
         tinycloud: &crate::TinyCloud,
         invocation: &InvocationInfo,
         now: OffsetDateTime,
-    ) -> Result<bool, &'static str> {
+    ) -> Result<Option<Vec<tinycloud_auth::ipld_core::cid::Cid>>, &'static str> {
         if invocation.parents.len() != 1 {
             for parent in invocation.parents.iter().copied() {
                 if tinycloud
@@ -381,7 +388,7 @@ impl PolicyV3Runtime {
                     return Err("policy-session-requires-one-immediate-parent");
                 }
             }
-            return Ok(false);
+            return Ok(None);
         }
         let parent_cid = invocation.parents[0];
         let loaded = tinycloud.load_signed_delegation(parent_cid).await;
@@ -390,9 +397,9 @@ impl PolicyV3Runtime {
             Err(_) if self.is_policy_protected_parent(parent_cid).await? => {
                 return Err("policy-session-invalid");
             }
-            Err(_) => return Ok(false),
+            Err(_) => return Ok(None),
         }) else {
-            return Ok(false);
+            return Ok(None);
         };
         // Sibling roots are stored in the ordinary graph only so S0 can have
         // normal proof edges. Neither root is invocation authority by itself.
@@ -405,7 +412,7 @@ impl PolicyV3Runtime {
             return Err("policy-root-cannot-authorize-invocation");
         }
         if !is_policy_session(&immediate.0) {
-            return Ok(false);
+            return Ok(None);
         }
         if immediate_row.delegatee != invocation.invoker
             || immediate.0.delegate != invocation.invoker
@@ -413,12 +420,12 @@ impl PolicyV3Runtime {
             // Principal/audience mismatch is an ordinary graph authorization
             // failure. Defer it to the existing authorization path so TC-405
             // does not change its status contract or error vocabulary.
-            return Ok(false);
+            return Ok(None);
         }
         if !capabilities_are_contained(&invocation.capabilities, &immediate.0.capabilities) {
             return Err("policy-invocation-capability-widening");
         }
-        let (row, session) = self
+        let (row, session, owner_authority) = self
             .validate_policy_chain(tinycloud, invocation.parents[0])
             .await?;
         let payload = invocation.invocation.payload();
@@ -528,7 +535,13 @@ impl PolicyV3Runtime {
             }
             validate_root_liveness(&self.conn, &root, &root_cid, &self.node_did, now, true).await?;
         }
-        Ok(true)
+        Ok(Some(
+            owner_authority
+                .closure
+                .iter()
+                .map(|id| id.to_cid(0x55))
+                .collect(),
+        ))
     }
 
     async fn is_policy_protected_parent(
@@ -568,7 +581,14 @@ impl PolicyV3Runtime {
         &self,
         tinycloud: &crate::TinyCloud,
         start: tinycloud_auth::ipld_core::cid::Cid,
-    ) -> Result<(policy_v3_session::Model, Delegation), &'static str> {
+    ) -> Result<
+        (
+            policy_v3_session::Model,
+            Delegation,
+            owner_authority::OwnerAuthority,
+        ),
+        &'static str,
+    > {
         let mut current_cid = start;
         let mut child: Option<Delegation> = None;
         let mut visited = std::collections::HashSet::new();
@@ -583,9 +603,12 @@ impl PolicyV3Runtime {
             else {
                 return Err("policy-session-parent-missing");
             };
-            verify_signed_delegation(&event.0.delegation)
+            verify_delegation_signature(&event.0.delegation)
                 .await
                 .map_err(|_| "policy-session-signature-invalid")?;
+            if !delegation_time_valid(&event.0.delegation) {
+                return Err("policy-session-expired");
+            }
             self.validate_graph_projection(&row, &event).await?;
             if !is_policy_session(&event.0) {
                 return Err("policy-session-protected-fact-missing");
@@ -645,7 +668,8 @@ impl PolicyV3Runtime {
                 {
                     return Err("policy-session-proof-index-mismatch");
                 }
-                self.authorize_roots(&registration, OffsetDateTime::now_utc())
+                let owner_authority = self
+                    .authorize_roots(&registration, OffsetDateTime::now_utc())
                     .await?;
                 for root_cid in event.0.parents.iter().copied() {
                     let Some((_, root)) = tinycloud
@@ -659,7 +683,7 @@ impl PolicyV3Runtime {
                         return Err("policy-session-capability-widening");
                     }
                 }
-                return Ok((index, event));
+                return Ok((index, event, owner_authority));
             }
             if event.0.parents.len() != 1 {
                 return Err("policy-session-parent-count-invalid");
@@ -894,9 +918,22 @@ async fn validate_persisted_root(
     if fact(&event.0.delegation, "role") != Some(expected_role) {
         return Err("policy-root-role-invalid");
     }
-    verify_signed_delegation(&event.0.delegation)
+    verify_delegation_signature(&event.0.delegation)
         .await
         .map_err(|_| "policy-root-signature-invalid")?;
+    if !delegation_time_valid(&event.0.delegation) {
+        return Err(
+            if event
+                .0
+                .expiry
+                .is_some_and(|expiry| OffsetDateTime::now_utc() >= expiry)
+            {
+                "root-expired"
+            } else {
+                "root-not-live"
+            },
+        );
+    }
     for space in event.0.spaces() {
         tinycloud_core::request_telemetry::observe_space(space);
     }
@@ -1469,6 +1506,10 @@ pub async fn authorize_delivery(
             .await
             .map_err(|_| (Status::Forbidden, "delivery-authorization-invalid".into()))?;
     }
+    runtime
+        .validate_owner_authority(&runtime.conn, &registration, now)
+        .await
+        .map_err(|_| (Status::Forbidden, "delivery-authorization-invalid".into()))?;
     let resource = envelope
         .get("contentSource")
         .and_then(Value::as_object)
@@ -2238,24 +2279,27 @@ pub async fn mint(
     )?;
     let enforcer_did = fact(&enforcement_root.0.delegation, "enforcerDid")
         .ok_or((Status::Forbidden, "sibling-root-mismatch".into()))?;
-    runtime
+    let owner_authority = runtime
         .authorize_roots(&registration, now)
         .await
         .map_err(|e| (Status::Forbidden, e.into()))?;
-    // Policies registered before owners had to hold what they grant are
-    // checked here too: the owner must have held every root capability when
+    // A policy served under the legacy escape has no recorded authority, so
+    // the owner must be shown to have held every root capability when
     // the policy was registered. (Owner sessions may since have expired.)
-    let registered_at = parse_time(&registration.registered_at)
-        .map_err(|_| (Status::Forbidden, "policy-registration-invalid".into()))?;
-    for root in [&policy_root, &enforcement_root] {
-        owner_holds_capabilities(
-            &runtime.conn,
-            &registration.owner_did,
-            &root.0.capabilities,
-            registered_at,
-        )
-        .await
-        .map_err(|error| (Status::Forbidden, error.into()))?;
+    // A recorded authority covers this check for other policies.
+    if owner_authority.escaped {
+        let registered_at = parse_time(&registration.registered_at)
+            .map_err(|_| (Status::Forbidden, "policy-registration-invalid".into()))?;
+        for root in [&policy_root, &enforcement_root] {
+            owner_holds_capabilities(
+                &runtime.conn,
+                &registration.owner_did,
+                &root.0.capabilities,
+                registered_at,
+            )
+            .await
+            .map_err(|error| (Status::Forbidden, error.into()))?;
+        }
     }
     for (cid, expected) in [
         (&registration.policy_root_cid, &policy_root),
@@ -2638,6 +2682,16 @@ pub async fn mint(
         validate_root_liveness(&txn, &root, root_cid, &runtime.node_did, now, true)
             .await
             .map_err(|error| (Status::Forbidden, error.into()))?;
+        // The recorded owner authority, rechecked on the locked transaction.
+        // Only a revoke landing between the earlier check and this
+        // transaction reaches it, so no test pins it (it is race-only).
+        if !tinycloud_core::policy_owner_authority::revoked_ids(&txn, &owner_authority.closure)
+            .await
+            .map_err(db_error)?
+            .is_empty()
+        {
+            return Err((Status::Forbidden, "policy-owner-authority-revoked".into()));
+        }
         let current_event = decode_delegation(
             std::str::from_utf8(&root.authorization_bytes)
                 .map_err(|_| (Status::Forbidden, "policy-root-invalid".into()))?,
@@ -2827,7 +2881,7 @@ impl PolicyV3Runtime {
         &self,
         registration: &policy_v3_registration::Model,
         now: OffsetDateTime,
-    ) -> Result<(), &'static str> {
+    ) -> Result<owner_authority::OwnerAuthority, &'static str> {
         let policy = validate_registration_projection(registration)
             .map_err(|_| "policy-registration-projection-mismatch")?;
         let mut roots = Vec::new();
@@ -2880,11 +2934,10 @@ impl PolicyV3Runtime {
             now,
         )
         .map_err(|_| "enforcer-binding-invalid")?;
-        // TC-1423: classify a registration made before owner-authority
-        // bindings existed, in the background. Recorded only; it does not
-        // gate this request or add work to it.
-        self.note_owner_binding(registration);
-        Ok(())
+        // TC-1423: the owner authority the roots were registered under must
+        // hold.
+        self.validate_owner_authority(&self.conn, registration, now)
+            .await
     }
 }
 
@@ -2959,12 +3012,11 @@ fn validate_stored_root_status(
     )
     .map_err(|_| "root-status-invalid")?;
     let advertised_expiry = root_advertised_expiry(root)?;
-    if checked > now
-        || checked >= advertised_expiry
-        || fresh != advertised_expiry
-        || (require_fresh && advertised_expiry <= now)
-    {
+    if checked > now || checked >= advertised_expiry || fresh != advertised_expiry {
         return Err("root-not-live");
+    }
+    if require_fresh && advertised_expiry <= now {
+        return Err("root-expired");
     }
     let previous_digest = object
         .get("previousCheckpointDigestHex")
@@ -4431,6 +4483,21 @@ fn decode_root(
 fn decode_delegation(value: &str) -> Result<tinycloud_core::events::Delegation, (Status, String)> {
     SerializedEvent::<DelegationInfo>::from_header_ser::<TinyCloudDelegation>(value)
         .map_err(|e| (Status::BadRequest, e.to_string()))
+}
+
+/// The signature alone; see [`delegation_time_valid`].
+async fn verify_delegation_signature(delegation: &TinyCloudDelegation) -> Result<(), ()> {
+    let TinyCloudDelegation::Ucan(ucan) = delegation else {
+        return Err(());
+    };
+    tinycloud_core::did_resolution::verify_ucan_signature(ucan)
+        .await
+        .map_err(|_| ())
+}
+
+/// Whether a UCAN is within its signed validity window now.
+fn delegation_time_valid(delegation: &TinyCloudDelegation) -> bool {
+    matches!(delegation, TinyCloudDelegation::Ucan(ucan) if ucan.payload().validate_time(None).is_ok())
 }
 
 async fn verify_signed_delegation(delegation: &TinyCloudDelegation) -> Result<(), ()> {
@@ -8711,6 +8778,7 @@ mod tests {
 
     #[tokio::test]
     async fn policy_v2_admits_v3_account_and_v4_accountless_receivers() -> anyhow::Result<()> {
+        // Boxed: the flow's future is too large for a test thread's stack.
         Box::pin(run_policy_v2_flow(PolicyOwner::SpaceOwner)).await
     }
 
@@ -8719,6 +8787,7 @@ mod tests {
     /// space owner revokes that delegation, no new session can be minted.
     #[tokio::test]
     async fn policy_owner_may_be_a_session_the_space_owner_delegated_to() -> anyhow::Result<()> {
+        // Boxed: the flow's future is too large for a test thread's stack.
         Box::pin(run_policy_v2_flow(PolicyOwner::DelegatedSession)).await
     }
 
@@ -8727,6 +8796,7 @@ mod tests {
     /// Registration must refuse it, so no session can ever read the bytes.
     #[tokio::test]
     async fn policy_registration_requires_the_owner_to_hold_what_it_grants() -> anyhow::Result<()> {
+        // Boxed: the flow's future is too large for a test thread's stack.
         Box::pin(run_policy_v2_flow(PolicyOwner::Unauthorized)).await
     }
 
@@ -10471,8 +10541,25 @@ mod tests {
         assert_eq!(replay.status(), Status::Unauthorized);
 
         if let Some(owner_delegation_cid) = owner_delegation_cid.as_deref() {
-            // Revoking the delegation the policy owner held stops new
-            // sessions, although the policy and its roots are untouched.
+            // Revoking the delegation the policy owner held ends the policy:
+            // the already-admitted session, new challenges and new sessions,
+            // although the policy and its roots are untouched.
+            // A challenge issued before the revoke, to try the mint with after it.
+            let pre_revoke_challenge = client
+                .post("/policy/v3/challenges")
+                .header(ContentType::JSON)
+                .body(
+                    json!({
+                        "policyCid": policy_cid,
+                        "recipientDid": holder_did,
+                        "requestedCapabilities": requested,
+                    })
+                    .to_string(),
+                )
+                .dispatch()
+                .await;
+            assert_eq!(pre_revoke_challenge.status(), Status::Ok);
+            let fresh_challenge: Value = pre_revoke_challenge.into_json().await.unwrap();
             let mut capabilities = Capabilities::<Value>::new();
             capabilities.with_action(
                 format!("urn:cid:{owner_delegation_cid}").parse()?,
@@ -10510,6 +10597,37 @@ mod tests {
                 "owner session revoke: {revoked_body}"
             );
 
+            let post_owner_revoke_read = Payload {
+                issuer: reader_vm.parse()?,
+                audience: reader_did.parse()?,
+                not_before: Some(NumericDate::try_from_seconds(
+                    OffsetDateTime::now_utc().unix_timestamp() as f64,
+                )?),
+                expiration: NumericDate::try_from_seconds(
+                    (OffsetDateTime::now_utc() + Duration::seconds(30)).unix_timestamp() as f64,
+                )?,
+                nonce: Some("tc1423-read-after-owner-revoke".into()),
+                facts: Some(Vec::<Value>::new()),
+                proof: vec![child_cid],
+                attenuation: serde_json::from_value::<Capabilities<Value>>(
+                    attenuation_for_policy_capabilities(&requested)
+                        .map_err(|(_, error)| anyhow::anyhow!(error))?,
+                )?,
+            }
+            .sign(Algorithm::EdDSA, &reader_jwk)?;
+            let refused_read = client
+                .post("/invoke")
+                .header(rocket::http::Header::new(
+                    "Authorization",
+                    post_owner_revoke_read.encode()?,
+                ))
+                .dispatch()
+                .await;
+            assert_eq!(refused_read.status(), Status::Forbidden);
+            assert_eq!(
+                refused_read.into_string().await.unwrap_or_default(),
+                "policy-owner-authority-revoked"
+            );
             let challenge_response = client
                 .post("/policy/v3/challenges")
                 .header(ContentType::JSON)
@@ -10523,8 +10641,12 @@ mod tests {
                 )
                 .dispatch()
                 .await;
-            assert_eq!(challenge_response.status(), Status::Ok);
-            let fresh_challenge: Value = challenge_response.into_json().await.unwrap();
+            assert_eq!(challenge_response.status(), Status::Forbidden);
+            assert_eq!(
+                challenge_response.into_string().await.unwrap_or_default(),
+                "policy-owner-authority-revoked"
+            );
+            // A mint with the challenge issued before the revoke is refused too.
             let mut fresh = presentation.clone();
             fresh["schema"] = json!(CREDENTIAL_PRESENTATION_V4_SCHEMA);
             fresh["jti"] = json!("presentation-tc-597-after-owner-revoke");
@@ -10569,7 +10691,38 @@ mod tests {
                 Status::Forbidden,
                 "mint after owner revoke: {refused_body}"
             );
-            assert_eq!(refused_body, "policy-owner-not-authorized");
+            assert_eq!(refused_body, "policy-owner-authority-revoked");
+            // Delivery checks the same authority: the retry that returned the
+            // stored receipt above is refused.
+            let owner_revoked_delivery = make_invocation(
+                [(
+                    content_resource.clone(),
+                    ["tinycloud.kv/get".parse::<RecapAbility>()?],
+                )],
+                &sender_cid,
+                &delivery_jwk,
+                &format!("{holder_did}#{}", holder_did.trim_start_matches("did:key:")),
+                (OffsetDateTime::now_utc() + Duration::seconds(45)).unix_timestamp() as f64,
+                InvocationOptions {
+                    nonce: Some("tc1423-delivery-after-owner-revoke".into()),
+                    ..InvocationOptions::default()
+                },
+            )?;
+            let refused_delivery = client
+                .post("/policy/v3/deliveries/authorize")
+                .header(ContentType::JSON)
+                .header(rocket::http::Header::new(
+                    "Authorization",
+                    owner_revoked_delivery.encode()?,
+                ))
+                .body(serde_json::to_string(&delivery_request)?)
+                .dispatch()
+                .await;
+            assert_eq!(refused_delivery.status(), Status::Forbidden);
+            assert_eq!(
+                refused_delivery.into_string().await.unwrap_or_default(),
+                "delivery-authorization-invalid"
+            );
         }
 
         // SDK revocation writes the generic graph. Policy/v3 joins that
