@@ -21,7 +21,7 @@ Two tables, created by migration `m20261019_000000_policy_v3_owner_authority`:
 | `bound` | at least one delegation recorded; the root expires no later than it |
 | `bound-uncapped` | at least one delegation recorded; the root outlives it |
 | `root-authority` | every root capability is held as root authority (space or network owner) |
-| `unknown` | no authority found; `unknown_reason` is `revoked`, `missing` or `starved` |
+| `unknown` | no authority found; `unknown_reason` is `revoked`, `missing`, `starved` or `foreign_network` |
 
 `registered_mode` is `record` for policies classified at registration, and
 `backfill` for policies registered before the legacy cutover and classified
@@ -49,6 +49,18 @@ closure outlives the policy root is chosen, else the newest. `starved` is
 recorded only when both steps found nothing and more candidates exist than
 were examined; unlike the other `unknown` reasons it is not final and is
 classified again on a later use.
+
+## Source networks
+
+A registration is also held to the source-network rule that new registrations
+must meet (`content_owner_networks`): every encryption network the policy
+names, and every `kv` ceiling entry, must belong to the owner of the content
+source's space. A policy registered before that rule, or by a binary that
+predates it, that does not meet it is classified `unknown` with reason
+`foreign_network`, in either mode, whatever delegations the owner holds. The
+rule is a pure check of the stored policy: it does not look up whether the
+network exists. `foreign_network` is final: the row is not classified again
+unless `classifier_version` changes.
 
 ## Policies registered earlier
 
@@ -92,13 +104,15 @@ override), otherwise at `info`.
 
 ## Rollback
 
-The migration is unknown to 1.21.0, which refuses to boot with it applied. To
-roll back, run the migration's `down` (it drops both tables), then deploy
-1.21.0. While rolled back, policies have only the checks 1.21.0 has.
+The migration is unknown to the previous release image (1.22.0), which refuses to boot while `seaql_migrations` lists it. To roll back, run on the database: `DROP TABLE IF EXISTS policy_v3_owner_authority; DROP TABLE IF EXISTS policy_v3_owner_binding; DELETE FROM seaql_migrations WHERE version = 'm20261019_000000_policy_v3_owner_authority';` (the same as the migration's `down`), then deploy 1.22.0. If a migration released after this one has also been applied, delete its row too, as its release notes say. Policies registered while this release ran stay registered and get only the checks 1.22.0 has. On the re-upgrade, `policy_v3.legacy_cutover` must be set to this release's first deploy time; otherwise every policy registered during the rollback window, including roots longer than 31 days, is treated as legacy.
 
-On the re-upgrade, set `policy_v3.legacy_cutover` to the first deploy time:
-`down` erased the original applied-at time, and without the override every
-policy registered during the rollback window would be classified as legacy.
+Checklist (tick each step):
+
+1. [ ] Run the three statements above on the database.
+2. [ ] If a migration released after this one was applied, delete its `seaql_migrations` row as well, as its release notes say.
+3. [ ] Deploy 1.22.0 and check that the node boots.
+4. [ ] Before the re-upgrade starts, set `policy_v3.legacy_cutover` (`TINYCLOUD_POLICY_V3__LEGACY_CUTOVER`) to this release's first deploy time, as an RFC 3339 UTC timestamp. This is the time of the first deploy of this release, not the time of the re-upgrade.
+5. [ ] After the re-upgrade, check that the boot log shows the effective cutover with source `config` and the value from step 4.
 
 ## Listing
 
