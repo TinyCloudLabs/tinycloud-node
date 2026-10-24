@@ -1,6 +1,6 @@
 //! Durable fences for blobs uploaded before a KV transaction's sequence lock.
 
-use std::{borrow::Cow, error::Error as StdError};
+use std::{borrow::Cow, error::Error as StdError, future::Future};
 
 use sea_orm::{
     sea_query::{Expr, LockBehavior, LockType, OnConflict},
@@ -67,31 +67,29 @@ pub async fn register_candidates<C: ConnectionTrait>(
     register_candidates_hosted(conn, blobs, attempt_id, &[]).await
 }
 
-/// [`register_candidates`] for PostgreSQL's one-statement preparatory path
-/// (TC-735). With `hosted_spaces` non-empty, every registration statement
-/// writes nothing unless each listed space exists, and reports
-/// [`is_space_not_hosted`] otherwise, so an unhosted space is refused before
-/// any bytes reach the store without a separate COUNT round trip. Other
-/// backends ignore it: their callers check hosting in the same transaction.
-pub async fn register_candidates_hosted<C: ConnectionTrait>(
-    conn: &C,
+/// PostgreSQL registration: one statement per distinct blob, each run by
+/// `query`. The ledger upsert serializes registration against deletion; a
+/// deleting fence returns no row, so no caller starts an upload. Every
+/// statement is idempotent for its attempt ID, so a runner may retry one after
+/// a lost connection.
+pub(crate) async fn register_candidates_postgres<F, Fut>(
     blobs: &[(SpaceId, Hash)],
     attempt_id: &str,
     hosted_spaces: &[SpaceId],
-) -> Result<Vec<(SpaceId, Hash, i64)>, DbErr> {
+    mut query: F,
+) -> Result<Vec<(SpaceId, Hash, i64)>, DbErr>
+where
+    F: FnMut(Statement) -> Fut,
+    Fut: Future<Output = Result<Option<sea_orm::QueryResult>, DbErr>>,
+{
     let hosted_ids: Vec<String> = hosted_spaces.iter().map(ToString::to_string).collect();
     let hosted_count = hosted_ids.len() as i64;
-    let mut registered_at = None;
     let mut generations = Vec::with_capacity(blobs.len());
     for (space, value) in ordered_unique(blobs).iter() {
         let key = SpaceIdWrap(space.clone());
-        if conn.get_database_backend() == DbBackend::Postgres {
-            // The ledger upsert serializes registration against deletion. A
-            // deleting fence returns no row, so no caller starts an upload.
-            let row = conn
-                .query_one(Statement::from_sql_and_values(
-                    DbBackend::Postgres,
-                    "WITH generation AS (
+        let row = query(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "WITH generation AS (
                     INSERT INTO kv_blob_generation (space, value, generation)
                     SELECT $1::text, $2::bytea, 0
                     WHERE $5 = 0
@@ -119,28 +117,52 @@ pub async fn register_candidates_hosted<C: ConnectionTrait>(
                        (SELECT COUNT(*) FROM claim) AS inserted,
                        ($5 = 0
                         OR (SELECT COUNT(*) FROM space WHERE id = ANY($4::text[])) = $5) AS hosted",
-                    [
-                        key.into(),
-                        (*value).into(),
-                        attempt_id.to_owned().into(),
-                        hosted_ids.clone().into(),
-                        hosted_count.into(),
-                    ],
-                ))
-                .await?
-                .ok_or_else(|| DbErr::Custom("KV candidate registration returned no row".into()))?;
-            // The statement wrote nothing when a required space is unhosted.
-            if !row.try_get::<bool>("", "hosted")? {
-                return Err(DbErr::Custom(UNHOSTED_SPACE.into()));
-            }
-            let generation: Option<i64> = row.try_get("", "generation")?;
-            generations.push((
-                space.clone(),
-                *value,
-                generation.ok_or_else(|| DbErr::Custom(UNAVAILABLE_DELETING.into()))?,
-            ));
-            continue;
+            [
+                key.into(),
+                (*value).into(),
+                attempt_id.to_owned().into(),
+                hosted_ids.clone().into(),
+                hosted_count.into(),
+            ],
+        ))
+        .await?
+        .ok_or_else(|| DbErr::Custom("KV candidate registration returned no row".into()))?;
+        // The statement wrote nothing when a required space is unhosted.
+        if !row.try_get::<bool>("", "hosted")? {
+            return Err(DbErr::Custom(UNHOSTED_SPACE.into()));
         }
+        let generation: Option<i64> = row.try_get("", "generation")?;
+        generations.push((
+            space.clone(),
+            *value,
+            generation.ok_or_else(|| DbErr::Custom(UNAVAILABLE_DELETING.into()))?,
+        ));
+    }
+    Ok(generations)
+}
+
+/// [`register_candidates`] for PostgreSQL's one-statement preparatory path
+/// (TC-735). With `hosted_spaces` non-empty, every registration statement
+/// writes nothing unless each listed space exists, and reports
+/// [`is_space_not_hosted`] otherwise, so an unhosted space is refused before
+/// any bytes reach the store without a separate COUNT round trip. Other
+/// backends ignore it: their callers check hosting in the same transaction.
+pub async fn register_candidates_hosted<C: ConnectionTrait>(
+    conn: &C,
+    blobs: &[(SpaceId, Hash)],
+    attempt_id: &str,
+    hosted_spaces: &[SpaceId],
+) -> Result<Vec<(SpaceId, Hash, i64)>, DbErr> {
+    if conn.get_database_backend() == DbBackend::Postgres {
+        return register_candidates_postgres(blobs, attempt_id, hosted_spaces, |statement| {
+            conn.query_one(statement)
+        })
+        .await;
+    }
+    let mut registered_at = None;
+    let mut generations = Vec::with_capacity(blobs.len());
+    for (space, value) in ordered_unique(blobs).iter() {
+        let key = SpaceIdWrap(space.clone());
         if conn.get_database_backend() == DbBackend::MySql {
             conn.execute(Statement::from_sql_and_values(
                 DbBackend::MySql,

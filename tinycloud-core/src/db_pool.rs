@@ -276,29 +276,38 @@ impl RecoveringConnection {
         self.scope_local_timeout(transaction).await
     }
 
-    /// The connection for PostgreSQL's autocommit preparatory path (TC-735):
+    /// Whether PostgreSQL's autocommit preparatory path (TC-735) applies:
     /// authorization is one read statement and registration one write
     /// statement, each its own autocommit statement with no `BEGIN`/`COMMIT`.
-    /// Like [`Self::begin_preparatory`] it bypasses this type's write
-    /// tracking: the registration is retryable candidate metadata, never a
-    /// user-visible KV write, and the caller retries it once with the same
-    /// attempt ID.
     ///
-    /// `None` where a transaction is required: other backends (SQLite
-    /// reserves its writer at `BEGIN`), and [`StatementTimeoutMode::Local`],
-    /// which scopes the timeout to a transaction with `SET LOCAL`.
-    pub(crate) fn preparatory_autocommit(&self) -> Option<&DatabaseConnection> {
-        if self.conn.get_database_backend() != DatabaseBackend::Postgres {
-            return None;
-        }
-        match self.statement_timeouts {
-            Some(timeouts)
-                if timeouts.mode == StatementTimeoutMode::Local && timeouts.is_enabled() =>
-            {
-                None
-            }
-            _ => Some(&self.conn),
-        }
+    /// False where a transaction is required: other backends (SQLite reserves
+    /// its writer at `BEGIN`), and [`StatementTimeoutMode::Local`], which
+    /// scopes the timeout to a transaction with `SET LOCAL`.
+    pub(crate) fn uses_preparatory_autocommit(&self) -> bool {
+        self.conn.get_database_backend() == DatabaseBackend::Postgres
+            && !matches!(
+                self.statement_timeouts,
+                Some(timeouts)
+                    if timeouts.mode == StatementTimeoutMode::Local && timeouts.is_enabled()
+            )
+    }
+
+    /// Run the one idempotent registration statement of the autocommit
+    /// preparatory path. A connection-class failure is recorded and the
+    /// statement retried once, like [`Self::begin_preparatory`]'s `BEGIN`:
+    /// every row it writes is keyed by the statement's own attempt ID, so a
+    /// second run after a lost reply writes nothing new. Like that `BEGIN` it
+    /// bypasses this type's write tracking: the registration is candidate
+    /// metadata, never a user-visible KV write, so a failure after it is still
+    /// reported as one before any write.
+    pub(crate) async fn preparatory_query_one(
+        &self,
+        stmt: Statement,
+    ) -> Result<Option<QueryResult>, DbErr> {
+        self.run("preparatory_register", true, || {
+            self.conn.query_one(stmt.clone())
+        })
+        .await
     }
 
     /// The outcome of the one retry. It is never retried again, but a

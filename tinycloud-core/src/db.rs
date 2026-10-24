@@ -2794,9 +2794,12 @@ where
     where
         B: StorageSetup,
     {
-        if let Some(conn) = self.candidate_conn.preparatory_autocommit() {
+        if self.candidate_conn.uses_preparatory_autocommit() {
+            // Read-only authorization statements recover and retry like any
+            // pooled read; the registration statement is idempotent for this
+            // attempt ID and retried once by `preparatory_query_one`.
             authorize_mutation_preupload::<_, B, K>(
-                conn,
+                &self.candidate_conn,
                 invocation,
                 mode,
                 now,
@@ -2808,8 +2811,11 @@ where
             if blobs.is_empty() {
                 return Ok(Vec::new());
             }
-            return Ok(crate::kv_orphans::register_candidates_hosted(
-                conn, blobs, attempt_id, spaces,
+            return Ok(crate::kv_orphans::register_candidates_postgres(
+                blobs,
+                attempt_id,
+                spaces,
+                |statement| self.candidate_conn.preparatory_query_one(statement),
             )
             .await?);
         }
