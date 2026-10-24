@@ -7555,6 +7555,651 @@
       }
     ]
   },
+  "deliveryRequestDigest": {
+    "algorithm": "requestBodyDigest = base64url (unpadded) of SHA-256 over the UTF-8 bytes of JCS (RFC 8785) of the request body with the `requestBodyDigest` field removed (contract section 11.6).",
+    "jcsStringRule": "Strings are written as raw UTF-8 except: `\"` and `\\` are escaped, U+0008, U+000C, U+000A, U+000D, U+0009 are `\\b \\f \\n \\r \\t`, every other code point below U+0020 is `\\u00xx` (lower-case hex). Everything else is raw UTF-8, including `<`, `>`, `&`, U+007F, U+2028, U+2029 and code points outside the BMP. Keys are sorted by UTF-16 code units.",
+    "vectors": [
+      {
+        "name": "plain ASCII documentName (control row)",
+        "notes": "Same fields as the next row with an ASCII documentName; a consumer that fails only the next row has a non-ASCII bug.",
+        "request": {
+          "shareUrl": "https://share.tinycloud.xyz/s/lqdw5iopqq2tkkvjj6gbbi5vbv#v=4&k=WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo&c=bafkreiewixmt5nwgi3ych6durcsheaql3ybswbplpjmpbdhfkvdkidzt5u",
+          "recipientEmail": "recipient@example.com",
+          "documentName": "Project plan.md",
+          "jti": "BwcHBwcHBwcHBwcHBwcHBw",
+          "expiresAt": "2026-10-24T12:05:00.000Z"
+        },
+        "jcs": "{\"documentName\":\"Project plan.md\",\"expiresAt\":\"2026-10-24T12:05:00.000Z\",\"jti\":\"BwcHBwcHBwcHBwcHBwcHBw\",\"recipientEmail\":\"recipient@example.com\",\"shareUrl\":\"https://share.tinycloud.xyz/s/lqdw5iopqq2tkkvjj6gbbi5vbv#v=4&k=WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo&c=bafkreiewixmt5nwgi3ych6durcsheaql3ybswbplpjmpbdhfkvdkidzt5u\"}",
+        "jcsHex": "7b22646f63756d656e744e616d65223a2250726f6a65637420706c616e2e6d64222c22657870697265734174223a22323032362d31302d32345431323a30353a30302e3030305a222c226a7469223a2242776348427763484277634842776348427763484277222c22726563697069656e74456d61696c223a22726563697069656e74406578616d706c652e636f6d222c22736861726555726c223a2268747470733a2f2f73686172652e74696e79636c6f75642e78797a2f732f6c71647735696f70717132746b6b766a6a36676262693576627623763d34266b3d576c7061576c7061576c7061576c7061576c7061576c7061576c7061576c7061576c7061576c7061576c6f26633d6261666b726569657769786d74356e77676933796368366475726373686561716c337962737762706c706a6d70626468666b76646b69647a743575227d",
+        "jcsBytes": 327,
+        "requestBodyDigest": "IiEN-z6UfhRheqTHLRkKP8Nh__iuK6KwI5UAr9oxHZc",
+        "body": {
+          "shareUrl": "https://share.tinycloud.xyz/s/lqdw5iopqq2tkkvjj6gbbi5vbv#v=4&k=WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo&c=bafkreiewixmt5nwgi3ych6durcsheaql3ybswbplpjmpbdhfkvdkidzt5u",
+          "recipientEmail": "recipient@example.com",
+          "documentName": "Project plan.md",
+          "jti": "BwcHBwcHBwcHBwcHBwcHBw",
+          "expiresAt": "2026-10-24T12:05:00.000Z",
+          "requestBodyDigest": "IiEN-z6UfhRheqTHLRkKP8Nh__iuK6KwI5UAr9oxHZc"
+        }
+      },
+      {
+        "name": "documentName with U+1F4C4 (outside the BMP), '<', '&' and U+2028",
+        "notes": "The JCS bytes carry U+1F4C4 as f0 9f 93 84, '<' as 3c and '&' as 26 (not escaped), and U+2028 raw as e2 80 a8 (not the six characters \\u2028). expiresAt has a non-zero fraction (.120Z).",
+        "request": {
+          "shareUrl": "https://share.tinycloud.xyz/s/lqdw5iopqq2tkkvjj6gbbi5vbv#v=4&k=WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo&c=bafkreiewixmt5nwgi3ych6durcsheaql3ybswbplpjmpbdhfkvdkidzt5u",
+          "recipientEmail": "recipient@example.com",
+          "documentName": "Project 📄 plan <v2> & notes\u2028end.md",
+          "jti": "BwcHBwcHBwcHBwcHBwcHBw",
+          "expiresAt": "2026-10-24T12:05:00.120Z"
+        },
+        "jcs": "{\"documentName\":\"Project 📄 plan <v2> & notes\u2028end.md\",\"expiresAt\":\"2026-10-24T12:05:00.120Z\",\"jti\":\"BwcHBwcHBwcHBwcHBwcHBw\",\"recipientEmail\":\"recipient@example.com\",\"shareUrl\":\"https://share.tinycloud.xyz/s/lqdw5iopqq2tkkvjj6gbbi5vbv#v=4&k=WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo&c=bafkreiewixmt5nwgi3ych6durcsheaql3ybswbplpjmpbdhfkvdkidzt5u\"}",
+        "jcsHex": "7b22646f63756d656e744e616d65223a2250726f6a65637420f09f938420706c616e203c76323e2026206e6f746573e280a8656e642e6d64222c22657870697265734174223a22323032362d31302d32345431323a30353a30302e3132305a222c226a7469223a2242776348427763484277634842776348427763484277222c22726563697069656e74456d61696c223a22726563697069656e74406578616d706c652e636f6d222c22736861726555726c223a2268747470733a2f2f73686172652e74696e79636c6f75642e78797a2f732f6c71647735696f70717132746b6b766a6a36676262693576627623763d34266b3d576c7061576c7061576c7061576c7061576c7061576c7061576c7061576c7061576c7061576c7061576c6f26633d6261666b726569657769786d74356e77676933796368366475726373686561716c337962737762706c706a6d70626468666b76646b69647a743575227d",
+        "jcsBytes": 351,
+        "requestBodyDigest": "dSa1Jazh6Cobw2CNxe7njSBEIELj14iVv5tYeSHw_II",
+        "body": {
+          "shareUrl": "https://share.tinycloud.xyz/s/lqdw5iopqq2tkkvjj6gbbi5vbv#v=4&k=WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo&c=bafkreiewixmt5nwgi3ych6durcsheaql3ybswbplpjmpbdhfkvdkidzt5u",
+          "recipientEmail": "recipient@example.com",
+          "documentName": "Project 📄 plan <v2> & notes\u2028end.md",
+          "jti": "BwcHBwcHBwcHBwcHBwcHBw",
+          "expiresAt": "2026-10-24T12:05:00.120Z",
+          "requestBodyDigest": "dSa1Jazh6Cobw2CNxe7njSBEIELj14iVv5tYeSHw_II"
+        }
+      }
+    ]
+  },
+  "nodeReadAuth": {
+    "notice": "TEST ONLY, public. The signer is the TEST ONLY seed 0x33 repeated 32 times (the same test key that signs the deliveryAdmission vectors). Never allow-list a test seed in production.",
+    "contractSection": "4.11 (PROPOSED)",
+    "domain": "xyz.tinycloud.links/read-auth/v1\u0000",
+    "domainNote": "Ends with one NUL byte (U+0000). In JSON it is written \\u0000.",
+    "headerName": "TinyCloud-Read-Auth",
+    "headerEncoding": "unpadded base64url (strict) of the JCS bytes of {issuedAt, signature, signerDid}; at most 512 bytes. signature = unpadded base64url of the 64-byte Ed25519 signature.",
+    "signedMessage": "Ed25519 (RFC 8032 strict, contract section 2.5) over SHA-256( utf8(domain) || utf8(JCS({audience, issuedAt, method, path, signerDid})) ). method, path and audience come from the request the service received and from its configuration; issuedAt and signerDid come from the header.",
+    "windowSeconds": 120,
+    "headerMaxBytes": 512,
+    "signer": {
+      "seedHex": "3333333333333333333333333333333333333333333333333333333333333333",
+      "publicKeyHex": "17cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce",
+      "did": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5",
+      "label": "service:node"
+    },
+    "allowList": [
+      {
+        "label": "service:node",
+        "did": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5"
+      }
+    ],
+    "serviceNow": "2026-10-24T12:00:00.000Z",
+    "audience": "https://api.tinycloud.xyz",
+    "howToUse": "For each vector, a service holding `allowList` (or the row's own `allowList`) and the clock `serviceNow` MUST give `expect`. `reason` is a test label, never a wire value: on the wire every refused row is served as an ordinary unauthenticated read (same status, same body as a request with no header). `request` is what the service received; `signed.object` is what the signer signed (it differs from the object the service rebuilds in the wrong-method, wrong-path and wrong-audience rows).",
+    "vectors": [
+      {
+        "name": "valid, issuedAt = serviceNow (.000Z)",
+        "request": {
+          "method": "GET",
+          "path": "/v1/links/lqdw5iopqq2tkkvjj6gbbi5vbv",
+          "audience": "https://api.tinycloud.xyz"
+        },
+        "signed": {
+          "object": {
+            "audience": "https://api.tinycloud.xyz",
+            "issuedAt": "2026-10-24T12:00:00.000Z",
+            "method": "GET",
+            "path": "/v1/links/lqdw5iopqq2tkkvjj6gbbi5vbv",
+            "signerDid": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5"
+          },
+          "jcs": "{\"audience\":\"https://api.tinycloud.xyz\",\"issuedAt\":\"2026-10-24T12:00:00.000Z\",\"method\":\"GET\",\"path\":\"/v1/links/lqdw5iopqq2tkkvjj6gbbi5vbv\",\"signerDid\":\"did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5\"}",
+          "preimageHex": "78797a2e74696e79636c6f75642e6c696e6b732f726561642d617574682f7631007b2261756469656e6365223a2268747470733a2f2f6170692e74696e79636c6f75642e78797a222c226973737565644174223a22323032362d31302d32345431323a30303a30302e3030305a222c226d6574686f64223a22474554222c2270617468223a222f76312f6c696e6b732f6c71647735696f70717132746b6b766a6a366762626935766276222c227369676e6572446964223a226469643a6b65793a7a364d6b6734394e745152324c795952444351464b347731565648716879705a5353526f37487379754e375356377635227d",
+          "digestHex": "13ce38b3494aa83914fec11d28ca48ca269dd48cc329cb3bf3dd52d6c7205163"
+        },
+        "header": {
+          "issuedAt": "2026-10-24T12:00:00.000Z",
+          "signature": "-FOOQUkvDokL_VVRQTCkLG1Yug_2_L61inha2dG7gs6EHcHnSB2M7AUHLD_GwyAcpH_roU8-ArBj4nNEhDmiDw",
+          "signerDid": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5"
+        },
+        "headerValue": "eyJpc3N1ZWRBdCI6IjIwMjYtMTAtMjRUMTI6MDA6MDAuMDAwWiIsInNpZ25hdHVyZSI6Ii1GT09RVWt2RG9rTF9WVlJRVENrTEcxWXVnXzJfTDYxaW5oYTJkRzdnczZFSGNIblNCMk03QVVITERfR3d5QWNwSF9yb1U4LUFyQmo0bk5FaERtaUR3Iiwic2lnbmVyRGlkIjoiZGlkOmtleTp6Nk1rZzQ5TnRRUjJMeVlSRENRRks0dzFWVkhxaHlwWlNTUm83SHN5dU43U1Y3djUifQ",
+        "expect": {
+          "authenticated": true,
+          "label": "service:node"
+        }
+      },
+      {
+        "name": "valid, issuedAt 120 ms after serviceNow (.120Z)",
+        "request": {
+          "method": "GET",
+          "path": "/v1/links/lqdw5iopqq2tkkvjj6gbbi5vbv",
+          "audience": "https://api.tinycloud.xyz"
+        },
+        "signed": {
+          "object": {
+            "audience": "https://api.tinycloud.xyz",
+            "issuedAt": "2026-10-24T12:00:00.120Z",
+            "method": "GET",
+            "path": "/v1/links/lqdw5iopqq2tkkvjj6gbbi5vbv",
+            "signerDid": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5"
+          },
+          "jcs": "{\"audience\":\"https://api.tinycloud.xyz\",\"issuedAt\":\"2026-10-24T12:00:00.120Z\",\"method\":\"GET\",\"path\":\"/v1/links/lqdw5iopqq2tkkvjj6gbbi5vbv\",\"signerDid\":\"did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5\"}",
+          "preimageHex": "78797a2e74696e79636c6f75642e6c696e6b732f726561642d617574682f7631007b2261756469656e6365223a2268747470733a2f2f6170692e74696e79636c6f75642e78797a222c226973737565644174223a22323032362d31302d32345431323a30303a30302e3132305a222c226d6574686f64223a22474554222c2270617468223a222f76312f6c696e6b732f6c71647735696f70717132746b6b766a6a366762626935766276222c227369676e6572446964223a226469643a6b65793a7a364d6b6734394e745152324c795952444351464b347731565648716879705a5353526f37487379754e375356377635227d",
+          "digestHex": "e45815a81601c30cc6c57c975ed655866e711b22fec0a32df41d700a70deb340"
+        },
+        "header": {
+          "issuedAt": "2026-10-24T12:00:00.120Z",
+          "signature": "aIZy2_G9-xHDoZHdNHluYN3AXPj8Wwb7mLUYFOb64O3HbgiS5Gml82hgQGqYxM0mkZJTV-aoUw6nBUDQV6fJBQ",
+          "signerDid": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5"
+        },
+        "headerValue": "eyJpc3N1ZWRBdCI6IjIwMjYtMTAtMjRUMTI6MDA6MDAuMTIwWiIsInNpZ25hdHVyZSI6ImFJWnkyX0c5LXhIRG9aSGROSGx1WU4zQVhQajhXd2I3bUxVWUZPYjY0TzNIYmdpUzVHbWw4MmhnUUdxWXhNMG1rWkpUVi1hb1V3Nm5CVURRVjZmSkJRIiwic2lnbmVyRGlkIjoiZGlkOmtleTp6Nk1rZzQ5TnRRUjJMeVlSRENRRks0dzFWVkhxaHlwWlNTUm83SHN5dU43U1Y3djUifQ",
+        "expect": {
+          "authenticated": true,
+          "label": "service:node"
+        }
+      },
+      {
+        "name": "valid, issuedAt exactly 120 s before serviceNow (inclusive)",
+        "request": {
+          "method": "GET",
+          "path": "/v1/links/lqdw5iopqq2tkkvjj6gbbi5vbv",
+          "audience": "https://api.tinycloud.xyz"
+        },
+        "signed": {
+          "object": {
+            "audience": "https://api.tinycloud.xyz",
+            "issuedAt": "2026-10-24T11:58:00.000Z",
+            "method": "GET",
+            "path": "/v1/links/lqdw5iopqq2tkkvjj6gbbi5vbv",
+            "signerDid": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5"
+          },
+          "jcs": "{\"audience\":\"https://api.tinycloud.xyz\",\"issuedAt\":\"2026-10-24T11:58:00.000Z\",\"method\":\"GET\",\"path\":\"/v1/links/lqdw5iopqq2tkkvjj6gbbi5vbv\",\"signerDid\":\"did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5\"}",
+          "preimageHex": "78797a2e74696e79636c6f75642e6c696e6b732f726561642d617574682f7631007b2261756469656e6365223a2268747470733a2f2f6170692e74696e79636c6f75642e78797a222c226973737565644174223a22323032362d31302d32345431313a35383a30302e3030305a222c226d6574686f64223a22474554222c2270617468223a222f76312f6c696e6b732f6c71647735696f70717132746b6b766a6a366762626935766276222c227369676e6572446964223a226469643a6b65793a7a364d6b6734394e745152324c795952444351464b347731565648716879705a5353526f37487379754e375356377635227d",
+          "digestHex": "c280c1bb304f8a99e0837129b90344547c0e1bcaa13907e26c70c85fff45930c"
+        },
+        "header": {
+          "issuedAt": "2026-10-24T11:58:00.000Z",
+          "signature": "Sc-esteUELMn0X94jOyqHOMbSYNgsjR_25-BthH7gqe5jeruLVFzIJVH1-Vtt-hDd7EhVV3Y6FpVdq2nEPLwBw",
+          "signerDid": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5"
+        },
+        "headerValue": "eyJpc3N1ZWRBdCI6IjIwMjYtMTAtMjRUMTE6NTg6MDAuMDAwWiIsInNpZ25hdHVyZSI6IlNjLWVzdGVVRUxNbjBYOTRqT3lxSE9NYlNZTmdzalJfMjUtQnRoSDdncWU1amVydUxWRnpJSlZIMS1WdHQtaERkN0VoVlYzWTZGcFZkcTJuRVBMd0J3Iiwic2lnbmVyRGlkIjoiZGlkOmtleTp6Nk1rZzQ5TnRRUjJMeVlSRENRRks0dzFWVkhxaHlwWlNTUm83SHN5dU43U1Y3djUifQ",
+        "expect": {
+          "authenticated": true,
+          "label": "service:node"
+        }
+      },
+      {
+        "name": "valid, issuedAt exactly 120 s after serviceNow (inclusive)",
+        "request": {
+          "method": "GET",
+          "path": "/v1/links/lqdw5iopqq2tkkvjj6gbbi5vbv",
+          "audience": "https://api.tinycloud.xyz"
+        },
+        "signed": {
+          "object": {
+            "audience": "https://api.tinycloud.xyz",
+            "issuedAt": "2026-10-24T12:02:00.000Z",
+            "method": "GET",
+            "path": "/v1/links/lqdw5iopqq2tkkvjj6gbbi5vbv",
+            "signerDid": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5"
+          },
+          "jcs": "{\"audience\":\"https://api.tinycloud.xyz\",\"issuedAt\":\"2026-10-24T12:02:00.000Z\",\"method\":\"GET\",\"path\":\"/v1/links/lqdw5iopqq2tkkvjj6gbbi5vbv\",\"signerDid\":\"did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5\"}",
+          "preimageHex": "78797a2e74696e79636c6f75642e6c696e6b732f726561642d617574682f7631007b2261756469656e6365223a2268747470733a2f2f6170692e74696e79636c6f75642e78797a222c226973737565644174223a22323032362d31302d32345431323a30323a30302e3030305a222c226d6574686f64223a22474554222c2270617468223a222f76312f6c696e6b732f6c71647735696f70717132746b6b766a6a366762626935766276222c227369676e6572446964223a226469643a6b65793a7a364d6b6734394e745152324c795952444351464b347731565648716879705a5353526f37487379754e375356377635227d",
+          "digestHex": "0b9f35c834bfd415cef5a6fa2df01f59f867fafbc570babdde95ffa2c3063bae"
+        },
+        "header": {
+          "issuedAt": "2026-10-24T12:02:00.000Z",
+          "signature": "zwD3szQk5aMyAsv7ZTSqBizDNbC_RPQRJtAk3RABdNRwWrdhynuBsx98I6NPhvzWVl8zjtPkdAPYTFlDN7wZCg",
+          "signerDid": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5"
+        },
+        "headerValue": "eyJpc3N1ZWRBdCI6IjIwMjYtMTAtMjRUMTI6MDI6MDAuMDAwWiIsInNpZ25hdHVyZSI6Inp3RDNzelFrNWFNeUFzdjdaVFNxQml6RE5iQ19SUFFSSnRBazNSQUJkTlJ3V3JkaHludUJzeDk4STZOUGh2eldWbDh6anRQa2RBUFlURmxETjd3WkNnIiwic2lnbmVyRGlkIjoiZGlkOmtleTp6Nk1rZzQ5TnRRUjJMeVlSRENRRks0dzFWVkhxaHlwWlNTUm83SHN5dU43U1Y3djUifQ",
+        "expect": {
+          "authenticated": true,
+          "label": "service:node"
+        }
+      },
+      {
+        "name": "stale: issuedAt 120.001 s before serviceNow (signature itself valid)",
+        "request": {
+          "method": "GET",
+          "path": "/v1/links/lqdw5iopqq2tkkvjj6gbbi5vbv",
+          "audience": "https://api.tinycloud.xyz"
+        },
+        "signed": {
+          "object": {
+            "audience": "https://api.tinycloud.xyz",
+            "issuedAt": "2026-10-24T11:57:59.999Z",
+            "method": "GET",
+            "path": "/v1/links/lqdw5iopqq2tkkvjj6gbbi5vbv",
+            "signerDid": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5"
+          },
+          "jcs": "{\"audience\":\"https://api.tinycloud.xyz\",\"issuedAt\":\"2026-10-24T11:57:59.999Z\",\"method\":\"GET\",\"path\":\"/v1/links/lqdw5iopqq2tkkvjj6gbbi5vbv\",\"signerDid\":\"did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5\"}",
+          "preimageHex": "78797a2e74696e79636c6f75642e6c696e6b732f726561642d617574682f7631007b2261756469656e6365223a2268747470733a2f2f6170692e74696e79636c6f75642e78797a222c226973737565644174223a22323032362d31302d32345431313a35373a35392e3939395a222c226d6574686f64223a22474554222c2270617468223a222f76312f6c696e6b732f6c71647735696f70717132746b6b766a6a366762626935766276222c227369676e6572446964223a226469643a6b65793a7a364d6b6734394e745152324c795952444351464b347731565648716879705a5353526f37487379754e375356377635227d",
+          "digestHex": "9d43a9e8f47619f229bc293c8c0b763179a18c75bff2377d82d0d2402f0230e7"
+        },
+        "header": {
+          "issuedAt": "2026-10-24T11:57:59.999Z",
+          "signature": "Xipg33e6HSwrlJAakJP1Al1roQuAr0JaFMdyF9dhwMIpYY2aXkS36JcbRnVmyOvJdqzeDTcbXOxsuRe2pSu5CA",
+          "signerDid": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5"
+        },
+        "headerValue": "eyJpc3N1ZWRBdCI6IjIwMjYtMTAtMjRUMTE6NTc6NTkuOTk5WiIsInNpZ25hdHVyZSI6IlhpcGczM2U2SFN3cmxKQWFrSlAxQWwxcm9RdUFyMEphRk1keUY5ZGh3TUlwWVkyYVhrUzM2SmNiUm5WbXlPdkpkcXplRFRjYlhPeHN1UmUycFN1NUNBIiwic2lnbmVyRGlkIjoiZGlkOmtleTp6Nk1rZzQ5TnRRUjJMeVlSRENRRks0dzFWVkhxaHlwWlNTUm83SHN5dU43U1Y3djUifQ",
+        "expect": {
+          "authenticated": false,
+          "reason": "stale"
+        }
+      },
+      {
+        "name": "future: issuedAt 120.001 s after serviceNow (signature itself valid)",
+        "request": {
+          "method": "GET",
+          "path": "/v1/links/lqdw5iopqq2tkkvjj6gbbi5vbv",
+          "audience": "https://api.tinycloud.xyz"
+        },
+        "signed": {
+          "object": {
+            "audience": "https://api.tinycloud.xyz",
+            "issuedAt": "2026-10-24T12:02:00.001Z",
+            "method": "GET",
+            "path": "/v1/links/lqdw5iopqq2tkkvjj6gbbi5vbv",
+            "signerDid": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5"
+          },
+          "jcs": "{\"audience\":\"https://api.tinycloud.xyz\",\"issuedAt\":\"2026-10-24T12:02:00.001Z\",\"method\":\"GET\",\"path\":\"/v1/links/lqdw5iopqq2tkkvjj6gbbi5vbv\",\"signerDid\":\"did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5\"}",
+          "preimageHex": "78797a2e74696e79636c6f75642e6c696e6b732f726561642d617574682f7631007b2261756469656e6365223a2268747470733a2f2f6170692e74696e79636c6f75642e78797a222c226973737565644174223a22323032362d31302d32345431323a30323a30302e3030315a222c226d6574686f64223a22474554222c2270617468223a222f76312f6c696e6b732f6c71647735696f70717132746b6b766a6a366762626935766276222c227369676e6572446964223a226469643a6b65793a7a364d6b6734394e745152324c795952444351464b347731565648716879705a5353526f37487379754e375356377635227d",
+          "digestHex": "d8920b87a626e56f47262f0e39b58fec5f1d425f6df6dab85529f0216d0da5a6"
+        },
+        "header": {
+          "issuedAt": "2026-10-24T12:02:00.001Z",
+          "signature": "Z0Mx61VBy1ixoS5mpC1pBVlKBLcO3vvEpnixq1QQ_zvvvMmMeK_ReG72oMGDz4U_OciL3bq7S-L8f020w4S1Aw",
+          "signerDid": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5"
+        },
+        "headerValue": "eyJpc3N1ZWRBdCI6IjIwMjYtMTAtMjRUMTI6MDI6MDAuMDAxWiIsInNpZ25hdHVyZSI6IlowTXg2MVZCeTFpeG9TNW1wQzFwQlZsS0JMY08zdnZFcG5peHExUVFfenZ2dk1tTWVLX1JlRzcyb01HRHo0VV9PY2lMM2JxN1MtTDhmMDIwdzRTMUF3Iiwic2lnbmVyRGlkIjoiZGlkOmtleTp6Nk1rZzQ5TnRRUjJMeVlSRENRRks0dzFWVkhxaHlwWlNTUm83SHN5dU43U1Y3djUifQ",
+        "expect": {
+          "authenticated": false,
+          "reason": "future"
+        }
+      },
+      {
+        "name": "wrong domain: signed under the delivery admission domain",
+        "request": {
+          "method": "GET",
+          "path": "/v1/links/lqdw5iopqq2tkkvjj6gbbi5vbv",
+          "audience": "https://api.tinycloud.xyz"
+        },
+        "signed": {
+          "domain": "xyz.tinycloud.policy/delivery-admission/v1\u0000",
+          "object": {
+            "audience": "https://api.tinycloud.xyz",
+            "issuedAt": "2026-10-24T12:00:00.000Z",
+            "method": "GET",
+            "path": "/v1/links/lqdw5iopqq2tkkvjj6gbbi5vbv",
+            "signerDid": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5"
+          },
+          "jcs": "{\"audience\":\"https://api.tinycloud.xyz\",\"issuedAt\":\"2026-10-24T12:00:00.000Z\",\"method\":\"GET\",\"path\":\"/v1/links/lqdw5iopqq2tkkvjj6gbbi5vbv\",\"signerDid\":\"did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5\"}",
+          "preimageHex": "78797a2e74696e79636c6f75642e706f6c6963792f64656c69766572792d61646d697373696f6e2f7631007b2261756469656e6365223a2268747470733a2f2f6170692e74696e79636c6f75642e78797a222c226973737565644174223a22323032362d31302d32345431323a30303a30302e3030305a222c226d6574686f64223a22474554222c2270617468223a222f76312f6c696e6b732f6c71647735696f70717132746b6b766a6a366762626935766276222c227369676e6572446964223a226469643a6b65793a7a364d6b6734394e745152324c795952444351464b347731565648716879705a5353526f37487379754e375356377635227d",
+          "digestHex": "75e700a369136033a8256c04fb7e9befa7b716431f7eeccbf468e81815bf712f"
+        },
+        "header": {
+          "issuedAt": "2026-10-24T12:00:00.000Z",
+          "signature": "cq3yWgMo53T_CIPQxcLIp6L4k8P9PKNKB31xvDCAKJQT4fbCflFUzAplHppnElceKcNP74SXygMEQ9ri2ncuAQ",
+          "signerDid": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5"
+        },
+        "headerValue": "eyJpc3N1ZWRBdCI6IjIwMjYtMTAtMjRUMTI6MDA6MDAuMDAwWiIsInNpZ25hdHVyZSI6ImNxM3lXZ01vNTNUX0NJUFF4Y0xJcDZMNGs4UDlQS05LQjMxeHZEQ0FLSlFUNGZiQ2ZsRlV6QXBsSHBwbkVsY2VLY05QNzRTWHlnTUVROXJpMm5jdUFRIiwic2lnbmVyRGlkIjoiZGlkOmtleTp6Nk1rZzQ5TnRRUjJMeVlSRENRRks0dzFWVkhxaHlwWlNTUm83SHN5dU43U1Y3djUifQ",
+        "expect": {
+          "authenticated": false,
+          "reason": "bad-signature"
+        }
+      },
+      {
+        "name": "wrong domain: the read-auth domain without its final NUL",
+        "request": {
+          "method": "GET",
+          "path": "/v1/links/lqdw5iopqq2tkkvjj6gbbi5vbv",
+          "audience": "https://api.tinycloud.xyz"
+        },
+        "signed": {
+          "domain": "xyz.tinycloud.links/read-auth/v1",
+          "object": {
+            "audience": "https://api.tinycloud.xyz",
+            "issuedAt": "2026-10-24T12:00:00.000Z",
+            "method": "GET",
+            "path": "/v1/links/lqdw5iopqq2tkkvjj6gbbi5vbv",
+            "signerDid": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5"
+          },
+          "jcs": "{\"audience\":\"https://api.tinycloud.xyz\",\"issuedAt\":\"2026-10-24T12:00:00.000Z\",\"method\":\"GET\",\"path\":\"/v1/links/lqdw5iopqq2tkkvjj6gbbi5vbv\",\"signerDid\":\"did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5\"}",
+          "preimageHex": "78797a2e74696e79636c6f75642e6c696e6b732f726561642d617574682f76317b2261756469656e6365223a2268747470733a2f2f6170692e74696e79636c6f75642e78797a222c226973737565644174223a22323032362d31302d32345431323a30303a30302e3030305a222c226d6574686f64223a22474554222c2270617468223a222f76312f6c696e6b732f6c71647735696f70717132746b6b766a6a366762626935766276222c227369676e6572446964223a226469643a6b65793a7a364d6b6734394e745152324c795952444351464b347731565648716879705a5353526f37487379754e375356377635227d",
+          "digestHex": "d58dcea66b1e9e99ce38f5dd57aff87d021d84c50e9e97b4e67de323eadc530b"
+        },
+        "header": {
+          "issuedAt": "2026-10-24T12:00:00.000Z",
+          "signature": "mfKo0AH3z1AOkbHbe5V6WB4q6QXA3BvPmv6cvfdFqfPO1XwpPvNmwoStpvin7G__Et-YezLmtOFg56nQ-DPcBA",
+          "signerDid": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5"
+        },
+        "headerValue": "eyJpc3N1ZWRBdCI6IjIwMjYtMTAtMjRUMTI6MDA6MDAuMDAwWiIsInNpZ25hdHVyZSI6Im1mS28wQUgzejFBT2tiSGJlNVY2V0I0cTZRWEEzQnZQbXY2Y3ZmZEZxZlBPMVh3cFB2Tm13b1N0cHZpbjdHX19FdC1ZZXpMbXRPRmc1Nm5RLURQY0JBIiwic2lnbmVyRGlkIjoiZGlkOmtleTp6Nk1rZzQ5TnRRUjJMeVlSRENRRks0dzFWVkhxaHlwWlNTUm83SHN5dU43U1Y3djUifQ",
+        "expect": {
+          "authenticated": false,
+          "reason": "bad-signature"
+        }
+      },
+      {
+        "name": "wrong method: signed for POST, received as GET",
+        "request": {
+          "method": "GET",
+          "path": "/v1/links/lqdw5iopqq2tkkvjj6gbbi5vbv",
+          "audience": "https://api.tinycloud.xyz"
+        },
+        "signed": {
+          "object": {
+            "audience": "https://api.tinycloud.xyz",
+            "issuedAt": "2026-10-24T12:00:00.000Z",
+            "method": "POST",
+            "path": "/v1/links/lqdw5iopqq2tkkvjj6gbbi5vbv",
+            "signerDid": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5"
+          },
+          "jcs": "{\"audience\":\"https://api.tinycloud.xyz\",\"issuedAt\":\"2026-10-24T12:00:00.000Z\",\"method\":\"POST\",\"path\":\"/v1/links/lqdw5iopqq2tkkvjj6gbbi5vbv\",\"signerDid\":\"did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5\"}",
+          "preimageHex": "78797a2e74696e79636c6f75642e6c696e6b732f726561642d617574682f7631007b2261756469656e6365223a2268747470733a2f2f6170692e74696e79636c6f75642e78797a222c226973737565644174223a22323032362d31302d32345431323a30303a30302e3030305a222c226d6574686f64223a22504f5354222c2270617468223a222f76312f6c696e6b732f6c71647735696f70717132746b6b766a6a366762626935766276222c227369676e6572446964223a226469643a6b65793a7a364d6b6734394e745152324c795952444351464b347731565648716879705a5353526f37487379754e375356377635227d",
+          "digestHex": "e27a07c7a38582a36b79566673b60c5c72ed88cef9708c4a6124112919d4e2dd"
+        },
+        "header": {
+          "issuedAt": "2026-10-24T12:00:00.000Z",
+          "signature": "bhdYoq5hNjacuLvJlvBRApSFP5FJAdxZ1m5BXP-pkTNw4C3TwoWJ-cJ7dtG7wWxt-MvTsEMci5tq2kFjs_-nDA",
+          "signerDid": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5"
+        },
+        "headerValue": "eyJpc3N1ZWRBdCI6IjIwMjYtMTAtMjRUMTI6MDA6MDAuMDAwWiIsInNpZ25hdHVyZSI6ImJoZFlvcTVoTmphY3VMdkpsdkJSQXBTRlA1RkpBZHhaMW01QlhQLXBrVE53NEMzVHdvV0otY0o3ZHRHN3dXeHQtTXZUc0VNY2k1dHEya0Zqc18tbkRBIiwic2lnbmVyRGlkIjoiZGlkOmtleTp6Nk1rZzQ5TnRRUjJMeVlSRENRRks0dzFWVkhxaHlwWlNTUm83SHN5dU43U1Y3djUifQ",
+        "expect": {
+          "authenticated": false,
+          "reason": "bad-signature"
+        }
+      },
+      {
+        "name": "wrong path: signed for another link id",
+        "request": {
+          "method": "GET",
+          "path": "/v1/links/lqdw5iopqq2tkkvjj6gbbi5vbv",
+          "audience": "https://api.tinycloud.xyz"
+        },
+        "signed": {
+          "object": {
+            "audience": "https://api.tinycloud.xyz",
+            "issuedAt": "2026-10-24T12:00:00.000Z",
+            "method": "GET",
+            "path": "/v1/links/mqdw5iopqq2tkkvjj6gbbi5vbv",
+            "signerDid": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5"
+          },
+          "jcs": "{\"audience\":\"https://api.tinycloud.xyz\",\"issuedAt\":\"2026-10-24T12:00:00.000Z\",\"method\":\"GET\",\"path\":\"/v1/links/mqdw5iopqq2tkkvjj6gbbi5vbv\",\"signerDid\":\"did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5\"}",
+          "preimageHex": "78797a2e74696e79636c6f75642e6c696e6b732f726561642d617574682f7631007b2261756469656e6365223a2268747470733a2f2f6170692e74696e79636c6f75642e78797a222c226973737565644174223a22323032362d31302d32345431323a30303a30302e3030305a222c226d6574686f64223a22474554222c2270617468223a222f76312f6c696e6b732f6d71647735696f70717132746b6b766a6a366762626935766276222c227369676e6572446964223a226469643a6b65793a7a364d6b6734394e745152324c795952444351464b347731565648716879705a5353526f37487379754e375356377635227d",
+          "digestHex": "3d4418d40b1b15751e0594060a796d07f2837e44b1354df8282bec927448804e"
+        },
+        "header": {
+          "issuedAt": "2026-10-24T12:00:00.000Z",
+          "signature": "L0CTI4hyDu5Pmj58jjuZIOsCmR8pR3etNMK6cBMUHWPaRxLwOFSlrIdiR1cF4DCeF6Nu1mjrjgx7kPtfHPa8DQ",
+          "signerDid": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5"
+        },
+        "headerValue": "eyJpc3N1ZWRBdCI6IjIwMjYtMTAtMjRUMTI6MDA6MDAuMDAwWiIsInNpZ25hdHVyZSI6IkwwQ1RJNGh5RHU1UG1qNThqanVaSU9zQ21SOHBSM2V0Tk1LNmNCTVVIV1BhUnhMd09GU2xySWRpUjFjRjREQ2VGNk51MW1qcmpneDdrUHRmSFBhOERRIiwic2lnbmVyRGlkIjoiZGlkOmtleTp6Nk1rZzQ5TnRRUjJMeVlSRENRRks0dzFWVkhxaHlwWlNTUm83SHN5dU43U1Y3djUifQ",
+        "expect": {
+          "authenticated": false,
+          "reason": "bad-signature"
+        }
+      },
+      {
+        "name": "wrong audience: signed for another API instance",
+        "request": {
+          "method": "GET",
+          "path": "/v1/links/lqdw5iopqq2tkkvjj6gbbi5vbv",
+          "audience": "https://api.tinycloud.xyz"
+        },
+        "signed": {
+          "object": {
+            "audience": "https://api.example.test",
+            "issuedAt": "2026-10-24T12:00:00.000Z",
+            "method": "GET",
+            "path": "/v1/links/lqdw5iopqq2tkkvjj6gbbi5vbv",
+            "signerDid": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5"
+          },
+          "jcs": "{\"audience\":\"https://api.example.test\",\"issuedAt\":\"2026-10-24T12:00:00.000Z\",\"method\":\"GET\",\"path\":\"/v1/links/lqdw5iopqq2tkkvjj6gbbi5vbv\",\"signerDid\":\"did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5\"}",
+          "preimageHex": "78797a2e74696e79636c6f75642e6c696e6b732f726561642d617574682f7631007b2261756469656e6365223a2268747470733a2f2f6170692e6578616d706c652e74657374222c226973737565644174223a22323032362d31302d32345431323a30303a30302e3030305a222c226d6574686f64223a22474554222c2270617468223a222f76312f6c696e6b732f6c71647735696f70717132746b6b766a6a366762626935766276222c227369676e6572446964223a226469643a6b65793a7a364d6b6734394e745152324c795952444351464b347731565648716879705a5353526f37487379754e375356377635227d",
+          "digestHex": "0359911d52481288bd6b33057f84ad093ae046b38add40bc82a2b3c4c57804ec"
+        },
+        "header": {
+          "issuedAt": "2026-10-24T12:00:00.000Z",
+          "signature": "an5LsqM-kZ2-PwkdPZGpRwK2QZBOHaP5ck1DKBTyiyknTPL7Rl8GNIJbJwpQBOoEGlaE6Tem7kN6bxPh3qjCAQ",
+          "signerDid": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5"
+        },
+        "headerValue": "eyJpc3N1ZWRBdCI6IjIwMjYtMTAtMjRUMTI6MDA6MDAuMDAwWiIsInNpZ25hdHVyZSI6ImFuNUxzcU0ta1oyLVB3a2RQWkdwUndLMlFaQk9IYVA1Y2sxREtCVHlpeWtuVFBMN1JsOEdOSUpiSndwUUJPb0VHbGFFNlRlbTdrTjZieFBoM3FqQ0FRIiwic2lnbmVyRGlkIjoiZGlkOmtleTp6Nk1rZzQ5TnRRUjJMeVlSRENRRks0dzFWVkhxaHlwWlNTUm83SHN5dU43U1Y3djUifQ",
+        "expect": {
+          "authenticated": false,
+          "reason": "bad-signature"
+        }
+      },
+      {
+        "name": "different signer: signed by another key, header names the node's DID",
+        "request": {
+          "method": "GET",
+          "path": "/v1/links/lqdw5iopqq2tkkvjj6gbbi5vbv",
+          "audience": "https://api.tinycloud.xyz"
+        },
+        "signed": {
+          "object": {
+            "audience": "https://api.tinycloud.xyz",
+            "issuedAt": "2026-10-24T12:00:00.000Z",
+            "method": "GET",
+            "path": "/v1/links/lqdw5iopqq2tkkvjj6gbbi5vbv",
+            "signerDid": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5"
+          },
+          "jcs": "{\"audience\":\"https://api.tinycloud.xyz\",\"issuedAt\":\"2026-10-24T12:00:00.000Z\",\"method\":\"GET\",\"path\":\"/v1/links/lqdw5iopqq2tkkvjj6gbbi5vbv\",\"signerDid\":\"did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5\"}",
+          "preimageHex": "78797a2e74696e79636c6f75642e6c696e6b732f726561642d617574682f7631007b2261756469656e6365223a2268747470733a2f2f6170692e74696e79636c6f75642e78797a222c226973737565644174223a22323032362d31302d32345431323a30303a30302e3030305a222c226d6574686f64223a22474554222c2270617468223a222f76312f6c696e6b732f6c71647735696f70717132746b6b766a6a366762626935766276222c227369676e6572446964223a226469643a6b65793a7a364d6b6734394e745152324c795952444351464b347731565648716879705a5353526f37487379754e375356377635227d",
+          "digestHex": "13ce38b3494aa83914fec11d28ca48ca269dd48cc329cb3bf3dd52d6c7205163"
+        },
+        "header": {
+          "issuedAt": "2026-10-24T12:00:00.000Z",
+          "signature": "ipMDANI9FXKJj82YkvSjI5tMceVM_vrX4lhPxQnm2ufCQewXeigZ4SoxtbDaAM8zj3xF3oUvXw0Qv6Dp5T2CAQ",
+          "signerDid": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5"
+        },
+        "headerValue": "eyJpc3N1ZWRBdCI6IjIwMjYtMTAtMjRUMTI6MDA6MDAuMDAwWiIsInNpZ25hdHVyZSI6ImlwTURBTkk5RlhLSmo4MllrdlNqSTV0TWNlVk1fdnJYNGxoUHhRbm0ydWZDUWV3WGVpZ1o0U294dGJEYUFNOHpqM3hGM29Vdlh3MFF2NkRwNVQyQ0FRIiwic2lnbmVyRGlkIjoiZGlkOmtleTp6Nk1rZzQ5TnRRUjJMeVlSRENRRks0dzFWVkhxaHlwWlNTUm83SHN5dU43U1Y3djUifQ",
+        "expect": {
+          "authenticated": false,
+          "reason": "bad-signature"
+        }
+      },
+      {
+        "name": "unknown signer: valid signature by a key that is not on the allow-list",
+        "request": {
+          "method": "GET",
+          "path": "/v1/links/lqdw5iopqq2tkkvjj6gbbi5vbv",
+          "audience": "https://api.tinycloud.xyz"
+        },
+        "signed": {
+          "object": {
+            "audience": "https://api.tinycloud.xyz",
+            "issuedAt": "2026-10-24T12:00:00.000Z",
+            "method": "GET",
+            "path": "/v1/links/lqdw5iopqq2tkkvjj6gbbi5vbv",
+            "signerDid": "did:key:z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK"
+          },
+          "jcs": "{\"audience\":\"https://api.tinycloud.xyz\",\"issuedAt\":\"2026-10-24T12:00:00.000Z\",\"method\":\"GET\",\"path\":\"/v1/links/lqdw5iopqq2tkkvjj6gbbi5vbv\",\"signerDid\":\"did:key:z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK\"}",
+          "preimageHex": "78797a2e74696e79636c6f75642e6c696e6b732f726561642d617574682f7631007b2261756469656e6365223a2268747470733a2f2f6170692e74696e79636c6f75642e78797a222c226973737565644174223a22323032362d31302d32345431323a30303a30302e3030305a222c226d6574686f64223a22474554222c2270617468223a222f76312f6c696e6b732f6c71647735696f70717132746b6b766a6a366762626935766276222c227369676e6572446964223a226469643a6b65793a7a364d6b714743336e575a6859696545565456444b573576353838436947667344536d525647395a77775754764c534b227d",
+          "digestHex": "9bca13a893ad70fecb8cabcd6ad58fb955535a01552f6faee8517331d1785eec"
+        },
+        "header": {
+          "issuedAt": "2026-10-24T12:00:00.000Z",
+          "signature": "OgzGJlnu07bwLNVbjuKos1zBm4zs_UpmgrXhl2Ut2joYJNpgn_KcAoJhA97HmzpCkjtSw05TaA7WKgdPzg4JCQ",
+          "signerDid": "did:key:z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK"
+        },
+        "headerValue": "eyJpc3N1ZWRBdCI6IjIwMjYtMTAtMjRUMTI6MDA6MDAuMDAwWiIsInNpZ25hdHVyZSI6Ik9nekdKbG51MDdid0xOVmJqdUtvczF6Qm00enNfVXBtZ3JYaGwyVXQyam9ZSk5wZ25fS2NBb0poQTk3SG16cENranRTdzA1VGFBN1dLZ2RQemc0SkNRIiwic2lnbmVyRGlkIjoiZGlkOmtleTp6Nk1rcUdDM25XWmhZaWVFVlRWREtXNXY1ODhDaUdmc0RTbVJWRzlad3dXVHZMU0sifQ",
+        "expect": {
+          "authenticated": false,
+          "reason": "unlisted-signer"
+        }
+      },
+      {
+        "name": "weak key: small-order (identity) public key as signerDid, listed (the Worker refuses to start with such a list; this row tests the verification rule)",
+        "request": {
+          "method": "GET",
+          "path": "/v1/links/lqdw5iopqq2tkkvjj6gbbi5vbv",
+          "audience": "https://api.tinycloud.xyz"
+        },
+        "allowList": [
+          {
+            "label": "service:node",
+            "did": "did:key:z6MkeXATEjyXENzBXBxgC5EHk2JE5aqd7qMGGtDpLUH1e2Sj"
+          }
+        ],
+        "signed": {
+          "object": {
+            "audience": "https://api.tinycloud.xyz",
+            "issuedAt": "2026-10-24T12:00:00.000Z",
+            "method": "GET",
+            "path": "/v1/links/lqdw5iopqq2tkkvjj6gbbi5vbv",
+            "signerDid": "did:key:z6MkeXATEjyXENzBXBxgC5EHk2JE5aqd7qMGGtDpLUH1e2Sj"
+          },
+          "jcs": "{\"audience\":\"https://api.tinycloud.xyz\",\"issuedAt\":\"2026-10-24T12:00:00.000Z\",\"method\":\"GET\",\"path\":\"/v1/links/lqdw5iopqq2tkkvjj6gbbi5vbv\",\"signerDid\":\"did:key:z6MkeXATEjyXENzBXBxgC5EHk2JE5aqd7qMGGtDpLUH1e2Sj\"}",
+          "preimageHex": "78797a2e74696e79636c6f75642e6c696e6b732f726561642d617574682f7631007b2261756469656e6365223a2268747470733a2f2f6170692e74696e79636c6f75642e78797a222c226973737565644174223a22323032362d31302d32345431323a30303a30302e3030305a222c226d6574686f64223a22474554222c2270617468223a222f76312f6c696e6b732f6c71647735696f70717132746b6b766a6a366762626935766276222c227369676e6572446964223a226469643a6b65793a7a364d6b65584154456a7958454e7a4258427867433545486b324a453561716437714d47477444704c5548316532536a227d",
+          "digestHex": "6b5e57f9d71df63d5e31dc604dae7388a31bdb5f5f2706b8551523ce52706773"
+        },
+        "header": {
+          "issuedAt": "2026-10-24T12:00:00.000Z",
+          "signature": "AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+          "signerDid": "did:key:z6MkeXATEjyXENzBXBxgC5EHk2JE5aqd7qMGGtDpLUH1e2Sj"
+        },
+        "headerValue": "eyJpc3N1ZWRBdCI6IjIwMjYtMTAtMjRUMTI6MDA6MDAuMDAwWiIsInNpZ25hdHVyZSI6IkFRQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBIiwic2lnbmVyRGlkIjoiZGlkOmtleTp6Nk1rZVhBVEVqeVhFTnpCWEJ4Z0M1RUhrMkpFNWFxZDdxTUdHdERwTFVIMWUyU2oifQ",
+        "expect": {
+          "authenticated": false,
+          "reason": "weak-key"
+        }
+      },
+      {
+        "name": "non-canonical key: non-canonical encoding of the identity as signerDid, listed (same note as the weak-key row)",
+        "request": {
+          "method": "GET",
+          "path": "/v1/links/lqdw5iopqq2tkkvjj6gbbi5vbv",
+          "audience": "https://api.tinycloud.xyz"
+        },
+        "allowList": [
+          {
+            "label": "service:node",
+            "did": "did:key:z6MkvYDV6cfbwNp6jpaZGAcYpZgdfuK59wb3FKdA8t7sBVka"
+          }
+        ],
+        "signed": {
+          "object": {
+            "audience": "https://api.tinycloud.xyz",
+            "issuedAt": "2026-10-24T12:00:00.000Z",
+            "method": "GET",
+            "path": "/v1/links/lqdw5iopqq2tkkvjj6gbbi5vbv",
+            "signerDid": "did:key:z6MkvYDV6cfbwNp6jpaZGAcYpZgdfuK59wb3FKdA8t7sBVka"
+          },
+          "jcs": "{\"audience\":\"https://api.tinycloud.xyz\",\"issuedAt\":\"2026-10-24T12:00:00.000Z\",\"method\":\"GET\",\"path\":\"/v1/links/lqdw5iopqq2tkkvjj6gbbi5vbv\",\"signerDid\":\"did:key:z6MkvYDV6cfbwNp6jpaZGAcYpZgdfuK59wb3FKdA8t7sBVka\"}",
+          "preimageHex": "78797a2e74696e79636c6f75642e6c696e6b732f726561642d617574682f7631007b2261756469656e6365223a2268747470733a2f2f6170692e74696e79636c6f75642e78797a222c226973737565644174223a22323032362d31302d32345431323a30303a30302e3030305a222c226d6574686f64223a22474554222c2270617468223a222f76312f6c696e6b732f6c71647735696f70717132746b6b766a6a366762626935766276222c227369676e6572446964223a226469643a6b65793a7a364d6b7659445636636662774e70366a70615a47416359705a676466754b3539776233464b64413874377342566b61227d",
+          "digestHex": "ae3a422343e32a659198df34f7f9addf864cc0aa813c6b36c7f4bf66631d3889"
+        },
+        "header": {
+          "issuedAt": "2026-10-24T12:00:00.000Z",
+          "signature": "AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+          "signerDid": "did:key:z6MkvYDV6cfbwNp6jpaZGAcYpZgdfuK59wb3FKdA8t7sBVka"
+        },
+        "headerValue": "eyJpc3N1ZWRBdCI6IjIwMjYtMTAtMjRUMTI6MDA6MDAuMDAwWiIsInNpZ25hdHVyZSI6IkFRQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBIiwic2lnbmVyRGlkIjoiZGlkOmtleTp6Nk1rdllEVjZjZmJ3TnA2anBhWkdBY1lwWmdkZnVLNTl3YjNGS2RBOHQ3c0JWa2EifQ",
+        "expect": {
+          "authenticated": false,
+          "reason": "noncanonical-key"
+        }
+      },
+      {
+        "name": "non-canonical signature: S replaced by S + L (same point equation)",
+        "request": {
+          "method": "GET",
+          "path": "/v1/links/lqdw5iopqq2tkkvjj6gbbi5vbv",
+          "audience": "https://api.tinycloud.xyz"
+        },
+        "signed": {
+          "object": {
+            "audience": "https://api.tinycloud.xyz",
+            "issuedAt": "2026-10-24T12:00:00.000Z",
+            "method": "GET",
+            "path": "/v1/links/lqdw5iopqq2tkkvjj6gbbi5vbv",
+            "signerDid": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5"
+          },
+          "jcs": "{\"audience\":\"https://api.tinycloud.xyz\",\"issuedAt\":\"2026-10-24T12:00:00.000Z\",\"method\":\"GET\",\"path\":\"/v1/links/lqdw5iopqq2tkkvjj6gbbi5vbv\",\"signerDid\":\"did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5\"}",
+          "preimageHex": "78797a2e74696e79636c6f75642e6c696e6b732f726561642d617574682f7631007b2261756469656e6365223a2268747470733a2f2f6170692e74696e79636c6f75642e78797a222c226973737565644174223a22323032362d31302d32345431323a30303a30302e3030305a222c226d6574686f64223a22474554222c2270617468223a222f76312f6c696e6b732f6c71647735696f70717132746b6b766a6a366762626935766276222c227369676e6572446964223a226469643a6b65793a7a364d6b6734394e745152324c795952444351464b347731565648716879705a5353526f37487379754e375356377635227d",
+          "digestHex": "13ce38b3494aa83914fec11d28ca48ca269dd48cc329cb3bf3dd52d6c7205163"
+        },
+        "header": {
+          "issuedAt": "2026-10-24T12:00:00.000Z",
+          "signature": "-FOOQUkvDokL_VVRQTCkLG1Yug_2_L61inha2dG7gs5x8bZEY4CeRNyjI-Kkvf8wpH_roU8-ArBj4nNEhDmiHw",
+          "signerDid": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5"
+        },
+        "headerValue": "eyJpc3N1ZWRBdCI6IjIwMjYtMTAtMjRUMTI6MDA6MDAuMDAwWiIsInNpZ25hdHVyZSI6Ii1GT09RVWt2RG9rTF9WVlJRVENrTEcxWXVnXzJfTDYxaW5oYTJkRzdnczV4OGJaRVk0Q2VSTnlqSS1La3ZmOHdwSF9yb1U4LUFyQmo0bk5FaERtaUh3Iiwic2lnbmVyRGlkIjoiZGlkOmtleTp6Nk1rZzQ5TnRRUjJMeVlSRENRRks0dzFWVkhxaHlwWlNTUm83SHN5dU43U1Y3djUifQ",
+        "expect": {
+          "authenticated": false,
+          "reason": "non-canonical-signature"
+        }
+      },
+      {
+        "name": "malformed header value (not base64url)",
+        "request": {
+          "method": "GET",
+          "path": "/v1/links/lqdw5iopqq2tkkvjj6gbbi5vbv",
+          "audience": "https://api.tinycloud.xyz"
+        },
+        "header": null,
+        "headerValue": "not base64url!",
+        "expect": {
+          "authenticated": false,
+          "reason": "malformed"
+        }
+      },
+      {
+        "name": "malformed header: an extra field",
+        "request": {
+          "method": "GET",
+          "path": "/v1/links/lqdw5iopqq2tkkvjj6gbbi5vbv",
+          "audience": "https://api.tinycloud.xyz"
+        },
+        "signed": {
+          "object": {
+            "audience": "https://api.tinycloud.xyz",
+            "issuedAt": "2026-10-24T12:00:00.000Z",
+            "method": "GET",
+            "path": "/v1/links/lqdw5iopqq2tkkvjj6gbbi5vbv",
+            "signerDid": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5"
+          },
+          "jcs": "{\"audience\":\"https://api.tinycloud.xyz\",\"issuedAt\":\"2026-10-24T12:00:00.000Z\",\"method\":\"GET\",\"path\":\"/v1/links/lqdw5iopqq2tkkvjj6gbbi5vbv\",\"signerDid\":\"did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5\"}",
+          "preimageHex": "78797a2e74696e79636c6f75642e6c696e6b732f726561642d617574682f7631007b2261756469656e6365223a2268747470733a2f2f6170692e74696e79636c6f75642e78797a222c226973737565644174223a22323032362d31302d32345431323a30303a30302e3030305a222c226d6574686f64223a22474554222c2270617468223a222f76312f6c696e6b732f6c71647735696f70717132746b6b766a6a366762626935766276222c227369676e6572446964223a226469643a6b65793a7a364d6b6734394e745152324c795952444351464b347731565648716879705a5353526f37487379754e375356377635227d",
+          "digestHex": "13ce38b3494aa83914fec11d28ca48ca269dd48cc329cb3bf3dd52d6c7205163"
+        },
+        "header": {
+          "issuedAt": "2026-10-24T12:00:00.000Z",
+          "signature": "-FOOQUkvDokL_VVRQTCkLG1Yug_2_L61inha2dG7gs6EHcHnSB2M7AUHLD_GwyAcpH_roU8-ArBj4nNEhDmiDw",
+          "signerDid": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5",
+          "kid": "1"
+        },
+        "headerValue": "eyJpc3N1ZWRBdCI6IjIwMjYtMTAtMjRUMTI6MDA6MDAuMDAwWiIsImtpZCI6IjEiLCJzaWduYXR1cmUiOiItRk9PUVVrdkRva0xfVlZSUVRDa0xHMVl1Z18yX0w2MWluaGEyZEc3Z3M2RUhjSG5TQjJNN0FVSExEX0d3eUFjcEhfcm9VOC1BckJqNG5ORWhEbWlEdyIsInNpZ25lckRpZCI6ImRpZDprZXk6ejZNa2c0OU50UVIyTHlZUkRDUUZLNHcxVlZIcWh5cFpTU1JvN0hzeXVON1NWN3Y1In0",
+        "expect": {
+          "authenticated": false,
+          "reason": "malformed"
+        }
+      },
+      {
+        "name": "no header",
+        "request": {
+          "method": "GET",
+          "path": "/v1/links/lqdw5iopqq2tkkvjj6gbbi5vbv",
+          "audience": "https://api.tinycloud.xyz"
+        },
+        "signed": {
+          "object": {
+            "audience": "https://api.tinycloud.xyz",
+            "issuedAt": "2026-10-24T12:00:00.000Z",
+            "method": "GET",
+            "path": "/v1/links/lqdw5iopqq2tkkvjj6gbbi5vbv",
+            "signerDid": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5"
+          },
+          "jcs": "{\"audience\":\"https://api.tinycloud.xyz\",\"issuedAt\":\"2026-10-24T12:00:00.000Z\",\"method\":\"GET\",\"path\":\"/v1/links/lqdw5iopqq2tkkvjj6gbbi5vbv\",\"signerDid\":\"did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5\"}",
+          "preimageHex": "78797a2e74696e79636c6f75642e6c696e6b732f726561642d617574682f7631007b2261756469656e6365223a2268747470733a2f2f6170692e74696e79636c6f75642e78797a222c226973737565644174223a22323032362d31302d32345431323a30303a30302e3030305a222c226d6574686f64223a22474554222c2270617468223a222f76312f6c696e6b732f6c71647735696f70717132746b6b766a6a366762626935766276222c227369676e6572446964223a226469643a6b65793a7a364d6b6734394e745152324c795952444351464b347731565648716879705a5353526f37487379754e375356377635227d",
+          "digestHex": "13ce38b3494aa83914fec11d28ca48ca269dd48cc329cb3bf3dd52d6c7205163"
+        },
+        "header": null,
+        "headerValue": null,
+        "expect": {
+          "authenticated": false,
+          "reason": "missing"
+        }
+      }
+    ]
+  },
   "deliveryAdmission": {
     "vectors": [
       {
@@ -7629,6 +8274,46 @@
         "expect": {
           "valid": false
         }
+      },
+      {
+        "name": "node signs a v1 delivery admission whose label is non-ASCII (U+1F4C4 outside the BMP, '<', '&' and U+2028 together; all values TEST ONLY, synthetic)",
+        "signerSeed": "node (TEST ONLY, public)",
+        "signerDid": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5",
+        "admission": {
+          "schema": "xyz.tinycloud.policy/delivery-admission/v1",
+          "policyId": "bafyreitestonlypolicyidtestonlypolicyidtestonlypolicyid1",
+          "ownerDid": "did:key:z6MktULudTtAsAhRegYPiZ6631RV3viv12qd4GQF8z1xB22S",
+          "recipient": "recipient@example.com",
+          "resource": "tinycloud:pkh:eip155:1:0x0000000000000000000000000000000000000000:default/kv/shares/test/file.md",
+          "actions": [
+            "tinycloud.kv/get"
+          ],
+          "credentialType": "TinyCloudEmailCredential",
+          "returnLink": "https://share.tinycloud.xyz/s/lqdw5iopqq2tkkvjj6gbbi5vbv#v=4&k=WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo&c=bafkreiewixmt5nwgi3ych6durcsheaql3ybswbplpjmpbdhfkvdkidzt5u",
+          "envelopeRef": "bafkreiewixmt5nwgi3ych6durcsheaql3ybswbplpjmpbdhfkvdkidzt5u",
+          "label": "Project 📄 plan <v2> & notes\u2028end.md",
+          "shareExpiresAt": "2026-10-25T12:00:00.000Z",
+          "senderKeyDid": "did:key:z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK",
+          "audience": "https://witness.example.test",
+          "issuedAt": "2026-10-24T12:00:00.000Z",
+          "expiresAt": "2026-10-24T12:05:00.000Z",
+          "nonce": "CQkJCQkJCQkJCQkJCQkJCQ"
+        },
+        "jcs": "{\"actions\":[\"tinycloud.kv/get\"],\"audience\":\"https://witness.example.test\",\"credentialType\":\"TinyCloudEmailCredential\",\"envelopeRef\":\"bafkreiewixmt5nwgi3ych6durcsheaql3ybswbplpjmpbdhfkvdkidzt5u\",\"expiresAt\":\"2026-10-24T12:05:00.000Z\",\"issuedAt\":\"2026-10-24T12:00:00.000Z\",\"label\":\"Project 📄 plan <v2> & notes\u2028end.md\",\"nonce\":\"CQkJCQkJCQkJCQkJCQkJCQ\",\"ownerDid\":\"did:key:z6MktULudTtAsAhRegYPiZ6631RV3viv12qd4GQF8z1xB22S\",\"policyId\":\"bafyreitestonlypolicyidtestonlypolicyidtestonlypolicyid1\",\"recipient\":\"recipient@example.com\",\"resource\":\"tinycloud:pkh:eip155:1:0x0000000000000000000000000000000000000000:default/kv/shares/test/file.md\",\"returnLink\":\"https://share.tinycloud.xyz/s/lqdw5iopqq2tkkvjj6gbbi5vbv#v=4&k=WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo&c=bafkreiewixmt5nwgi3ych6durcsheaql3ybswbplpjmpbdhfkvdkidzt5u\",\"schema\":\"xyz.tinycloud.policy/delivery-admission/v1\",\"senderKeyDid\":\"did:key:z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK\",\"shareExpiresAt\":\"2026-10-25T12:00:00.000Z\"}",
+        "preimageHex": "78797a2e74696e79636c6f75642e706f6c6963792f64656c69766572792d61646d697373696f6e2f7631007b22616374696f6e73223a5b2274696e79636c6f75642e6b762f676574225d2c2261756469656e6365223a2268747470733a2f2f7769746e6573732e6578616d706c652e74657374222c2263726564656e7469616c54797065223a2254696e79436c6f7564456d61696c43726564656e7469616c222c22656e76656c6f7065526566223a226261666b726569657769786d74356e77676933796368366475726373686561716c337962737762706c706a6d70626468666b76646b69647a743575222c22657870697265734174223a22323032362d31302d32345431323a30353a30302e3030305a222c226973737565644174223a22323032362d31302d32345431323a30303a30302e3030305a222c226c6162656c223a2250726f6a65637420f09f938420706c616e203c76323e2026206e6f746573e280a8656e642e6d64222c226e6f6e6365223a2243516b4a43516b4a43516b4a43516b4a43516b4a4351222c226f776e6572446964223a226469643a6b65793a7a364d6b74554c75645474417341685265675950695a363633315256337669763132716434475146387a317842323253222c22706f6c6963794964223a2262616679726569746573746f6e6c79706f6c6963796964746573746f6e6c79706f6c6963796964746573746f6e6c79706f6c696379696431222c22726563697069656e74223a22726563697069656e74406578616d706c652e636f6d222c227265736f75726365223a2274696e79636c6f75643a706b683a6569703135353a313a3078303030303030303030303030303030303030303030303030303030303030303030303030303030303a64656661756c742f6b762f7368617265732f746573742f66696c652e6d64222c2272657475726e4c696e6b223a2268747470733a2f2f73686172652e74696e79636c6f75642e78797a2f732f6c71647735696f70717132746b6b766a6a36676262693576627623763d34266b3d576c7061576c7061576c7061576c7061576c7061576c7061576c7061576c7061576c7061576c7061576c6f26633d6261666b726569657769786d74356e77676933796368366475726373686561716c337962737762706c706a6d70626468666b76646b69647a743575222c22736368656d61223a2278797a2e74696e79636c6f75642e706f6c6963792f64656c69766572792d61646d697373696f6e2f7631222c2273656e6465724b6579446964223a226469643a6b65793a7a364d6b714743336e575a6859696545565456444b573576353838436947667344536d525647395a77775754764c534b222c227368617265457870697265734174223a22323032362d31302d32355431323a30303a30302e3030305a227d",
+        "digestHex": "bc5b11d3a408c4976c31181eb146903fb0f2285176377aa7c1af110c9744ff1a",
+        "signature": {
+          "suite": "eddsa-ed25519-sha256-jcs-v1",
+          "signerDid": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5",
+          "value": "KSppYUIkjE-da_VLcgbfyeGV2PWsgSzrpfRnTpgDGckXGLJ_5fQZv9QA5d71BqVUOj7SqIsjeZASlNSslxyFAA"
+        },
+        "expect": {
+          "valid": true
+        },
+        "rules": [
+          "label is JCS-escaped like every other string: U+1F4C4 is the four bytes f0 9f 93 84, '<' and '&' are not escaped, and U+2028 is the three bytes e2 80 a8 (not the six characters \\u2028).",
+          "Every other field is the same as the first admission row."
+        ]
       }
     ],
     "ocReturnLinks": [

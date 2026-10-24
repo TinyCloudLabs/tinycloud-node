@@ -6,8 +6,8 @@
 use sha2::{Digest, Sha256};
 
 /// samgbafa/tinycloud-dev, the commit the copy is taken from.
-const SOURCE_COMMIT: &str = "b079f38943d64953819890d994ad3f36fbdd84be";
-const SHA256: &str = "72db4cd91ba0ae9c530d541ad0f7b1a05c76b8de942b0fe247f1356ff5899d25";
+const SOURCE_COMMIT: &str = "ae7349958f232ef4afc4e7586353265d7f34f1ef";
+const SHA256: &str = "59641c44536e5f53d7230205ff7d277bd5441cc8ddac10b7bee63f1d2358f3e6";
 
 #[test]
 fn the_vectors_copy_is_the_pinned_file() {

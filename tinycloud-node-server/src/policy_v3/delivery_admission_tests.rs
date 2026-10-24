@@ -282,3 +282,106 @@ fn the_request_expiry_is_after_now_and_at_most_five_minutes_ahead() {
     );
     assert_eq!(delivery_request_expiry("2026-10-24T12:03:00Z", now), None);
 }
+
+#[test]
+fn the_request_digest_rows_match_byte_for_byte_through_the_nodes_jcs_path() {
+    let vectors = vectors();
+    let rows = vectors["deliveryRequestDigest"]["vectors"]
+        .as_array()
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    for row in rows {
+        // The body as the route reads it: the strict request type.
+        let body: DeliveryAuthorizationRequest =
+            serde_json::from_value(row["body"].clone()).unwrap();
+        let mut without_digest = serde_json::to_value(&body).unwrap();
+        without_digest
+            .as_object_mut()
+            .unwrap()
+            .remove("requestBodyDigest");
+        assert_eq!(without_digest, row["request"], "{}", row["name"]);
+
+        // JCS bytes, as text and as hex, and their length.
+        let jcs = canonical_json_value(&without_digest);
+        assert_eq!(String::from_utf8(jcs.clone()).unwrap(), text(row, "jcs"));
+        assert_eq!(hex::encode(&jcs), text(row, "jcsHex"));
+        assert_eq!(jcs.len() as u64, row["jcsBytes"].as_u64().unwrap());
+
+        // The digest, by the route's own function and by hand.
+        let expected = text(row, "requestBodyDigest");
+        assert_eq!(delivery_request_digest(&body).unwrap(), expected);
+        assert_eq!(body.request_body_digest, expected);
+        assert_eq!(
+            encode_config(Sha256::digest(&jcs), URL_SAFE_NO_PAD),
+            expected
+        );
+    }
+    // The second row writes its non-ASCII characters as raw UTF-8: U+2028 is
+    // three bytes, not an escape.
+    let non_ascii = text(&rows[1], "jcs");
+    assert!(non_ascii.contains('\u{2028}') && non_ascii.contains('\u{1F4C4}'));
+    assert!(!non_ascii.contains("\\u2028") && !non_ascii.contains("\\ud83d"));
+}
+
+#[test]
+fn the_node_reproduces_the_non_ascii_admission_vector_byte_for_byte() {
+    let vectors = vectors();
+    let vector = &vectors["deliveryAdmission"]["vectors"][2];
+    let admission = &vector["admission"];
+    assert!(text(admission, "label").contains('\u{2028}'));
+    let (signer, signer_did) = node_signer(&vectors);
+    let registration = policy_v3_registration::Model {
+        policy_cid: text(admission, "policyId").into(),
+        policy_bytes: Vec::new(),
+        policy_digest_hex: String::new(),
+        owner_did: text(admission, "ownerDid").into(),
+        policy_root_cid: String::new(),
+        enforcement_root_cid: String::new(),
+        content_source_digest_hex: String::new(),
+        native_projection_hash_hex: String::new(),
+        attested_enforcer_binding_bytes: Vec::new(),
+        registered_at: String::new(),
+        expires_at: text(admission, "shareExpiresAt").into(),
+    };
+    let request = DeliveryAuthorizationRequest {
+        share_url: text(admission, "returnLink").into(),
+        recipient_email: text(admission, "recipient").into(),
+        document_name: text(admission, "label").into(),
+        jti: text(admission, "nonce").into(),
+        expires_at: text(admission, "expiresAt").into(),
+        request_body_digest: "unused".into(),
+    };
+    let receipt = build_delivery_authorization_receipt(
+        &DeliveryReceiptSource {
+            request: &request,
+            registration: &registration,
+            envelope_ref: text(admission, "envelopeRef"),
+            resource: text(admission, "resource"),
+            credential_type: text(admission, "credentialType"),
+            sender_key_did: text(admission, "senderKeyDid"),
+            audience: text(admission, "audience"),
+        },
+        text(admission, "issuedAt"),
+        &signer,
+        &signer_did,
+    )
+    .unwrap();
+    let mut produced = receipt.value["admission"].clone();
+    let signature = produced
+        .as_object_mut()
+        .unwrap()
+        .remove("signature")
+        .unwrap();
+    assert_eq!(&produced, admission);
+    let jcs = canonical_json_value(&produced);
+    assert_eq!(String::from_utf8(jcs.clone()).unwrap(), text(vector, "jcs"));
+    let mut preimage = DELIVERY_ADMISSION_DOMAIN.to_vec();
+    preimage.extend_from_slice(&jcs);
+    assert_eq!(hex::encode(&preimage), text(vector, "preimageHex"));
+    assert_eq!(
+        hex::encode(Sha256::digest(&preimage)),
+        text(vector, "digestHex")
+    );
+    assert_eq!(signature, vector["signature"]);
+    assert!(verifies(vector, DELIVERY_ADMISSION_DOMAIN));
+}
