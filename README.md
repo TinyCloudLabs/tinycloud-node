@@ -394,9 +394,9 @@ Network DID methods, including `did:web`, `did:tz`, `did:ethr` and `did:ion`, ar
 never resolved for UCAN verification. No setting or environment variable enables
 them.
 
-Enabling network DID resolution requires the hardening described in TC-1080 Part B.
-The unhardened SSI client is not an option. Part B is not implemented in this node,
-and there is no Part B development bypass. The required node-side
+Network DID resolution requires the hardening described in TC-1080 Part B. This node
+does not implement Part B, and no setting or development flag provides it. The
+required node-side
 fetcher, destination enforcement, resource limits and local-listener acceptance checks
 are described in the
 [developer gate](docs/delegation-flow.md#network-did-method-future-enable-gate-tc-1132).

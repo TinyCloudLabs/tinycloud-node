@@ -385,7 +385,7 @@ mod tests {
         let id = canonical.strip_prefix("did:jwk:").unwrap();
         assert_eq!(id.len(), ED25519_DID_JWK_ID_LEN_MAX);
         assert!(admitted(&canonical));
-        // One extra space: still valid JSON for the same key, but 107 characters.
+        // One extra space: valid JSON for the same key, but 107 characters.
         let json = format!(
             r#"{{"crv":"Ed25519", "kty":"OKP","x":"{}"}}"#,
             URL_SAFE_NO_PAD.encode([7u8; 32])

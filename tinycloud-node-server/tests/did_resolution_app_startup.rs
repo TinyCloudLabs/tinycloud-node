@@ -1,4 +1,4 @@
-//! Real app startup. The retired `network_methods` environment key must not enable any DID
+//! Real app startup. The ignored `network_methods` environment key must not enable any DID
 //! method outside the allow-list. One test in its own process isolates the env fixture.
 #[path = "../../tinycloud-core/tests/support/did_resolution.rs"]
 mod support;
@@ -93,7 +93,7 @@ async fn app_startup_ignores_retired_network_methods_env() {
     assert_web_refused().await;
     drop(client);
 
-    // The retired key set to true must not enable web or report a different policy.
+    // The ignored key set to true must not enable web or report a different policy.
     std::env::set_var(NETWORK_METHODS_ENV, "true");
     let (client, _dir) = app().await;
     assert!(!network_methods(&client).await);

@@ -606,7 +606,7 @@ mod tests {
         assert!(cfg.telemetry.enabled);
         // The pool knob is env-overridable via the double-underscore form.
         assert_eq!(cfg.database.max_connections, 200);
-        // The retired key is detected from the environment (it has no effect
+        // The ignored key is detected from the environment (it has no effect
         // on resolution, and startup warns about it).
         assert!(cfg.did_resolution.network_methods);
         // Absent config falls back to the hardcoded default of 100.

@@ -32,9 +32,9 @@ another method. DID identifiers used for parsing or identity comparisons (for ex
 share-email `did:web` values) are unaffected; this gate concerns network resolution
 during verification.
 
-Enabling a network DID method requires all of TC-1080 plan Part B. The unhardened
-SSI fetcher is not an option. Part B is not implemented by TC-1132 Parts C/D, and
-no Part B development flag or bypass is provided.
+Enabling a network DID method requires all of TC-1080 plan Part B. Part B is not
+implemented by TC-1132 Parts C/D, and no development flag provides it. The SSI
+fetcher is not an acceptable resolver.
 
 Before a future change enables `did:web`, it must implement and verify all of
 Part B:

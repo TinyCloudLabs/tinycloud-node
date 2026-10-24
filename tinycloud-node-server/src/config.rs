@@ -1816,10 +1816,10 @@ impl Default for DatabaseConfig {
 }
 
 /// UCAN issuer resolution. The method allow-list is fixed in `tinycloud_core::did_resolution`
-/// and has no settings. Retired keys are still accepted so existing configs keep parsing.
+/// and has no settings. A config that sets `network_methods` parses; the key is ignored.
 #[derive(Serialize, Deserialize, Debug, Default, Clone, Hash, PartialEq, Eq)]
 pub struct DidResolutionConfig {
-    /// Retired and ignored: network DID methods are never resolved. `true` when the key is
+    /// Ignored: network DID methods are never resolved. `true` when the key is
     /// present, with any value, so startup can warn that it has no effect.
     #[serde(default, skip_serializing, deserialize_with = "retired_key_present")]
     pub network_methods: bool,
