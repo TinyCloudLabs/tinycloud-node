@@ -775,6 +775,10 @@ mod tests {
             segment_outcome(&m, &f, 8, 9, "gap", CID).await,
             Err(SqlStoreError::Invalid(_))
         ));
+        // The refused segment is recorded but never applied.
+        let gap = seg(&f.lineage, f.base_seq, 8, 9, "gap");
+        assert_eq!(state_of(&m, &gap).await, ObjectState::Uploaded);
+        assert_eq!(m.current(&DB).await.unwrap().unwrap(), f);
         // Cumulative WAL segments always start at base_seq + 1.
         let PublishOutcome::Published(f1) = publish_segment(&m, &f, 6, 8, "a", CID).await else {
             panic!("append lost");
