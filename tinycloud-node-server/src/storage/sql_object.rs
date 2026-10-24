@@ -17,11 +17,12 @@
 
 use std::{
     collections::HashMap,
+    fmt,
     fs::{File, OpenOptions},
     future::Future,
     io::{ErrorKind, Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
     time::Duration,
 };
 
@@ -83,19 +84,79 @@ pub struct S3SqlObjectStore {
     bucket: String,
     mode: WriteMode,
     /// Per-key gates: creators of one key in this process go one at a time.
-    gates: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    gates: Gates,
+}
+
+type Gates = Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>;
+
+fn lock_gates(gates: &Gates) -> MutexGuard<'_, HashMap<String, Arc<tokio::sync::Mutex<()>>>> {
+    gates.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A key's gate, removed from the map when the last holder or waiter lets go,
+/// including when its future is dropped part-way.
+struct GateGuard<'a> {
+    gates: &'a Gates,
+    key: &'a str,
+    gate: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl<'a> GateGuard<'a> {
+    fn new(gates: &'a Gates, key: &'a str) -> Self {
+        let gate = lock_gates(gates).entry(key.to_owned()).or_default().clone();
+        Self { gates, key, gate }
+    }
+
+    async fn lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.gate.lock().await
+    }
+}
+
+impl Drop for GateGuard<'_> {
+    fn drop(&mut self) {
+        let mut gates = lock_gates(self.gates);
+        // The map holds one reference and this guard one; any other is a waiter.
+        if Arc::strong_count(&self.gate) == 2 {
+            gates.remove(self.key);
+        }
+    }
+}
+
+/// The status and error code of a response.
+struct Answer {
+    status: Option<u16>,
+    code: Option<String>,
+}
+
+impl Answer {
+    fn of<E: ProvideErrorMetadata>(error: &SdkError<E>) -> Self {
+        Self {
+            status: status(error),
+            code: ProvideErrorMetadata::code(error).map(str::to_owned),
+        }
+    }
+}
+
+impl fmt::Display for Answer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.status {
+            Some(status) => write!(f, "status {status}")?,
+            None => write!(f, "status none")?,
+        }
+        write!(f, ", code {}", self.code.as_deref().unwrap_or("none"))
+    }
 }
 
 /// What one PUT of the probe or of an object came back as.
 enum PutResult {
     Created,
     /// 412: the object exists, the condition was honoured.
-    PreconditionFailed,
+    PreconditionFailed(Answer),
     /// 409 ConditionalRequestConflict: another conditional write of the key
     /// is in flight.
-    InFlight,
-    /// The provider does not implement the header (501, 400, NotImplemented).
-    Unsupported,
+    InFlight(Answer),
+    /// The provider does not implement the header (501, NotImplemented).
+    Unsupported(Answer),
     Failed(SqlStoreError),
 }
 
@@ -142,11 +203,13 @@ fn classify_put<T>(result: Result<T, SdkError<PutObjectError>>) -> PutResult {
         Ok(_) => return PutResult::Created,
         Err(error) => error,
     };
-    let code = ProvideErrorMetadata::code(&error).map(str::to_owned);
-    match (status(&error), code.as_deref()) {
-        (Some(412), _) | (_, Some("PreconditionFailed")) => PutResult::PreconditionFailed,
-        (Some(409), Some("ConditionalRequestConflict")) => PutResult::InFlight,
-        (Some(501 | 400), _) | (_, Some("NotImplemented")) => PutResult::Unsupported,
+    let answer = Answer::of(&error);
+    match (answer.status, answer.code.as_deref()) {
+        (Some(412), _) | (_, Some("PreconditionFailed")) => PutResult::PreconditionFailed(answer),
+        (Some(409), Some("ConditionalRequestConflict")) => PutResult::InFlight(answer),
+        // Only 501 and NotImplemented mean the header is not supported; any
+        // other status, 400 included, is a failure.
+        (Some(501), _) | (_, Some("NotImplemented")) => PutResult::Unsupported(answer),
         _ => PutResult::Failed(backend("put", &error)),
     }
 }
@@ -173,23 +236,28 @@ async fn put_object(
     classify_put(request.send().await)
 }
 
-/// Decide the write mode from the answers to two conditional PUTs of one key.
-/// The second answering 412 means the provider honours the condition; the
-/// second succeeding, or either answering that the header is unsupported,
-/// means it does not. A first 412 (the probe object exists from an earlier
-/// start) already shows the condition is honoured.
-async fn probe_with<F, Fut>(mut put: F) -> Result<WriteMode, SqlStoreError>
+/// Decide the write mode from the answers to two conditional PUTs of one key,
+/// and name the answer that decided it. The second answering 412 means the
+/// provider honours the condition; the second succeeding, or an answer of 501
+/// or NotImplemented, means it does not. A first 412 (the probe object exists
+/// from an earlier start) already shows the condition is honoured. Any other
+/// answer is an error.
+async fn probe_with<F, Fut>(mut put: F) -> Result<(WriteMode, String), SqlStoreError>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = PutResult>,
 {
     for attempt in 0..2 {
         match put().await {
-            PutResult::PreconditionFailed | PutResult::InFlight => {
-                return Ok(WriteMode::Conditional)
+            PutResult::PreconditionFailed(answer) | PutResult::InFlight(answer) => {
+                return Ok((WriteMode::Conditional, answer.to_string()))
             }
-            PutResult::Unsupported => return Ok(WriteMode::CheckThenWrite),
-            PutResult::Created if attempt == 1 => return Ok(WriteMode::CheckThenWrite),
+            PutResult::Unsupported(answer) => {
+                return Ok((WriteMode::CheckThenWrite, answer.to_string()))
+            }
+            PutResult::Created if attempt == 1 => {
+                return Ok((WriteMode::CheckThenWrite, "created".to_owned()))
+            }
             PutResult::Created => {}
             PutResult::Failed(error) => return Err(error),
         }
@@ -279,13 +347,20 @@ impl S3SqlObjectStore {
 
     /// Write a fixed small body to `sql/v1/_probe/v1` with `If-None-Match: *`
     /// twice. A 412 on the second request means the provider honours
-    /// conditional writes; a second success, or a provider that answers 501,
-    /// 400 or NotImplemented for the header, selects the check-then-create
-    /// mode. Any other failure is an error, not a fallback. The object stays.
+    /// conditional writes; a second success, or an answer of 501 or
+    /// NotImplemented for the header, selects the check-then-create mode.
+    /// Any other failure, any other status included, is an error, not a
+    /// fallback. The object stays. The mode and the deciding answer's status
+    /// and code are logged once.
     pub async fn probe(client: &Client, bucket: &str) -> Result<WriteMode, SqlStoreError> {
-        let mode =
+        let (mode, answer) =
             probe_with(|| put_object(client, bucket, PROBE_KEY, PROBE_BODY.to_vec(), true)).await?;
-        tracing::info!(target: LOG_TARGET, mode = mode.as_str(), "sql object store write mode");
+        tracing::info!(
+            target: LOG_TARGET,
+            mode = mode.as_str(),
+            answer = %answer,
+            "sql object store write mode"
+        );
         Ok(mode)
     }
 
@@ -311,14 +386,12 @@ impl S3SqlObjectStore {
         for attempt in 0..=CONFLICT_RETRIES {
             match put_object(&self.client, &self.bucket, key.as_str(), body.clone(), true).await {
                 PutResult::Created => return Ok(PutOutcome::Created),
-                PutResult::PreconditionFailed => return self.existing_matches(key, len).await,
-                PutResult::InFlight => {
+                PutResult::PreconditionFailed(_) => return self.existing_matches(key, len).await,
+                PutResult::InFlight(_) => {
                     tokio::time::sleep(Duration::from_millis(100 * (u64::from(attempt) + 1))).await
                 }
-                PutResult::Unsupported => {
-                    return Err(SqlStoreError::Backend(
-                        "s3 provider refused the conditional create".into(),
-                    ))
+                PutResult::Unsupported(answer) => {
+                    return Err(SqlStoreError::Backend(format!("s3 put failed ({answer})")))
                 }
                 PutResult::Failed(error) => return Err(error),
             }
@@ -356,26 +429,12 @@ impl SqlObjectStore for S3SqlObjectStore {
             return Err(SqlStoreError::BodyMismatch);
         }
         // Creators of one key in this process go one at a time.
-        let gate = self
-            .gates
-            .lock()
-            .unwrap()
-            .entry(key.as_str().to_owned())
-            .or_default()
-            .clone();
-        let outcome = {
-            let _held = gate.lock().await;
-            match self.mode {
-                WriteMode::Conditional => self.create_conditionally(key, body).await,
-                WriteMode::CheckThenWrite => self.check_then_create(key, body).await,
-            }
-        };
-        let mut gates = self.gates.lock().unwrap();
-        // The map holds one reference and this call one; any other is a waiter.
-        if Arc::strong_count(&gate) == 2 {
-            gates.remove(key.as_str());
+        let gate = GateGuard::new(&self.gates, key.as_str());
+        let _held = gate.lock().await;
+        match self.mode {
+            WriteMode::Conditional => self.create_conditionally(key, body).await,
+            WriteMode::CheckThenWrite => self.check_then_create(key, body).await,
         }
-        outcome
     }
 
     async fn get_range(
@@ -493,28 +552,29 @@ pub struct FsSqlObjectStore {
     root: PathBuf,
 }
 
-/// Refuse a SQL store root the node must not use: one that is not absolute,
-/// or that is equal to, inside, or a parent of the KV block-store root. Both
-/// paths are compared as written (they must be absolute and free of `.` and
-/// `..`); nothing is read from the filesystem.
+/// `path` made absolute against the current directory, lexically: `.` and
+/// repeated separators are removed, nothing is read from the filesystem.
+fn absolute_path(path: &Path) -> Result<PathBuf, SqlStoreError> {
+    std::path::absolute(path)
+        .map_err(|_| SqlStoreError::Invalid("the SQL store root cannot be made absolute"))
+}
+
+/// Refuse a SQL store root the node must not use: one that is equal to,
+/// inside, or a parent of the KV block-store root. Both paths are made
+/// absolute (relative to the current directory) and compared as written; they
+/// must be free of `..` components, and nothing is read from the filesystem.
 pub fn check_fs_root(root: &Path, blocks_root: &Path) -> Result<(), SqlStoreError> {
     if cfg!(windows) {
         return Err(SqlStoreError::Invalid(
             "the filesystem SQL store is not supported on this platform",
         ));
     }
-    for path in [root, blocks_root] {
-        if !path.is_absolute() {
+    let root = absolute_path(root)?;
+    let blocks_root = absolute_path(blocks_root)?;
+    for path in [&root, &blocks_root] {
+        if path.components().any(|c| matches!(c, Component::ParentDir)) {
             return Err(SqlStoreError::Invalid(
-                "the SQL store root and the block store root must be absolute paths",
-            ));
-        }
-        if path
-            .components()
-            .any(|c| matches!(c, Component::CurDir | Component::ParentDir))
-        {
-            return Err(SqlStoreError::Invalid(
-                "the SQL store root and the block store root must not contain . or .. components",
+                "the SQL store root and the block store root must not contain .. components",
             ));
         }
     }
@@ -523,12 +583,12 @@ pub fn check_fs_root(root: &Path, blocks_root: &Path) -> Result<(), SqlStoreErro
             "the SQL store root must differ from the block store root",
         ));
     }
-    if root.starts_with(blocks_root) {
+    if root.starts_with(&blocks_root) {
         return Err(SqlStoreError::Invalid(
             "the SQL store root must not be inside the block store root",
         ));
     }
-    if blocks_root.starts_with(root) {
+    if blocks_root.starts_with(&root) {
         return Err(SqlStoreError::Invalid(
             "the SQL store root must not contain the block store root",
         ));
@@ -572,8 +632,10 @@ fn sync_dir(dir: &Path) -> Result<(), SqlStoreError> {
         .map_err(|e| io_error("directory sync", &e))
 }
 
-/// Create the directories from `root` down to `dir`, fsyncing each new one
-/// and its parent.
+/// Create the directories from `root` down to `dir`. Each new directory and
+/// its parent are fsynced; for a directory that already exists its parent is
+/// fsynced too, so the whole chain is durable before the object is reported
+/// created, whoever made the directories.
 fn create_dirs(root: &Path, dir: &Path) -> Result<(), SqlStoreError> {
     let relative = dir
         .strip_prefix(root)
@@ -587,7 +649,7 @@ fn create_dirs(root: &Path, dir: &Path) -> Result<(), SqlStoreError> {
                 sync_dir(&current)?;
                 sync_dir(&parent)?;
             }
-            Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => sync_dir(&parent)?,
             Err(e) => return Err(io_error("create directory", &e)),
         }
     }
@@ -722,6 +784,7 @@ impl FsSqlObjectStore {
     /// needed, after [`check_fs_root`] against the KV block-store root.
     pub fn open(root: PathBuf, blocks_root: &Path) -> Result<Self, SqlStoreError> {
         check_fs_root(&root, blocks_root)?;
+        let root = absolute_path(&root)?;
         std::fs::create_dir_all(&root).map_err(|e| io_error("create root", &e))?;
         sync_dir(&root)?;
         if let Some(parent) = root.parent() {
@@ -778,7 +841,7 @@ mod tests {
 
     #[cfg(not(windows))]
     #[test]
-    fn fs_root_must_be_absolute_and_outside_the_block_store() {
+    fn fs_root_must_be_outside_the_block_store() {
         let blocks = Path::new("/data/blocks");
         for ok in [
             "/data/sql-store",
@@ -794,19 +857,46 @@ mod tests {
             "/data/blocks/sql-store",
             "/data",
             "/",
-            "sql-store",
-            "./sql-store",
             "/data/../data/sql-store",
         ] {
             assert!(check_fs_root(Path::new(bad), blocks).is_err(), "{bad}");
         }
-        // The block store root is checked the same way.
-        assert!(check_fs_root(Path::new("/data/sql-store"), Path::new("blocks")).is_err());
         assert!(check_fs_root(
             Path::new("/data/sql-store"),
             Path::new("/data/../data/blocks")
         )
         .is_err());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn relative_roots_are_made_absolute_before_the_check() {
+        // The default layout: `./data` for the data directory and the blocks.
+        let blocks = Path::new("./data/blocks");
+        for ok in [
+            "./data/sql-store",
+            "data/sql-store",
+            "sql-store",
+            "./data/blocks2",
+        ] {
+            assert!(check_fs_root(Path::new(ok), blocks).is_ok(), "{ok}");
+        }
+        for bad in [
+            "data/blocks",
+            "./data/blocks",
+            "./data/blocks/sql-store",
+            "data/blocks/sql-store",
+            "./data",
+            "data",
+            "",
+        ] {
+            assert!(check_fs_root(Path::new(bad), blocks).is_err(), "{bad:?}");
+        }
+        // A relative root against an absolute block store root, and the reverse.
+        let cwd = std::env::current_dir().unwrap();
+        assert!(check_fs_root(Path::new("sql-store"), &cwd.join("blocks")).is_ok());
+        assert!(check_fs_root(Path::new("blocks/sql-store"), &cwd.join("blocks")).is_err());
+        assert!(check_fs_root(&cwd.join("blocks/sql-store"), Path::new("blocks")).is_err());
     }
 
     #[test]
@@ -874,7 +964,7 @@ mod tests {
         }
     }
 
-    fn scripted(answers: Vec<PutResult>) -> (Result<WriteMode, SqlStoreError>, usize) {
+    fn scripted(answers: Vec<PutResult>) -> (Result<(WriteMode, String), SqlStoreError>, usize) {
         let calls = AtomicUsize::new(0);
         let answers = Mutex::new(answers.into_iter());
         let result = futures::executor::block_on(probe_with(|| {
@@ -889,20 +979,35 @@ mod tests {
         (result, calls.load(Ordering::SeqCst))
     }
 
+    fn answer(status: u16, code: &str) -> Answer {
+        Answer {
+            status: Some(status),
+            code: Some(code.to_owned()),
+        }
+    }
+
     #[test]
     fn probe_selects_the_write_mode_from_the_second_answer() {
         use PutResult::*;
-        let (mode, calls) = scripted(vec![Created, PreconditionFailed]);
-        assert_eq!((mode.unwrap(), calls), (WriteMode::Conditional, 2));
+        let refused = || PreconditionFailed(answer(412, "PreconditionFailed"));
+        let unsupported = || Unsupported(answer(501, "NotImplemented"));
+        let (mode, calls) = scripted(vec![Created, refused()]);
+        let (mode, decided_by) = mode.unwrap();
+        assert_eq!((mode, calls), (WriteMode::Conditional, 2));
+        assert_eq!(decided_by, "status 412, code PreconditionFailed");
         // An object left by an earlier start answers the first request.
-        let (mode, calls) = scripted(vec![PreconditionFailed]);
-        assert_eq!((mode.unwrap(), calls), (WriteMode::Conditional, 1));
+        let (mode, calls) = scripted(vec![refused()]);
+        assert_eq!((mode.unwrap().0, calls), (WriteMode::Conditional, 1));
         let (mode, calls) = scripted(vec![Created, Created]);
-        assert_eq!((mode.unwrap(), calls), (WriteMode::CheckThenWrite, 2));
-        let (mode, calls) = scripted(vec![Unsupported]);
-        assert_eq!((mode.unwrap(), calls), (WriteMode::CheckThenWrite, 1));
-        let (mode, calls) = scripted(vec![Created, Unsupported]);
-        assert_eq!((mode.unwrap(), calls), (WriteMode::CheckThenWrite, 2));
+        let (mode, decided_by) = mode.unwrap();
+        assert_eq!((mode, calls), (WriteMode::CheckThenWrite, 2));
+        assert_eq!(decided_by, "created");
+        let (mode, calls) = scripted(vec![unsupported()]);
+        let (mode, decided_by) = mode.unwrap();
+        assert_eq!((mode, calls), (WriteMode::CheckThenWrite, 1));
+        assert_eq!(decided_by, "status 501, code NotImplemented");
+        let (mode, calls) = scripted(vec![Created, unsupported()]);
+        assert_eq!((mode.unwrap().0, calls), (WriteMode::CheckThenWrite, 2));
     }
 
     #[test]
@@ -914,5 +1019,85 @@ mod tests {
         assert_eq!(calls, 1);
         let (mode, _) = scripted(vec![Created, failure()]);
         assert!(matches!(mode, Err(SqlStoreError::Backend(_))));
+    }
+
+    #[test]
+    fn kv_keys_start_with_the_scan_prefix() {
+        use tinycloud_auth::resource::{SpaceId, SPACE_ID_PREFIX};
+        use tinycloud_core::hash::hash;
+
+        use super::super::s3::{kv_object_key, KV_SCAN_PREFIX};
+
+        assert_eq!(KV_SCAN_PREFIX, SPACE_ID_PREFIX);
+        let space: SpaceId =
+            "tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:default"
+                .parse()
+                .unwrap();
+        assert!(space.to_string().starts_with(SPACE_ID_PREFIX));
+        let key = kv_object_key(&space, &hash(b"block"));
+        assert!(key.starts_with(KV_SCAN_PREFIX), "{key}");
+        assert!(key.starts_with(&format!("{space}/")));
+        // SQL objects live outside the scanned prefix.
+        assert!(!KEY_ROOT.starts_with(KV_SCAN_PREFIX));
+    }
+
+    #[tokio::test]
+    async fn cancelled_creates_leave_no_gate_behind() {
+        // A server that accepts connections and never answers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepter = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        let client = Client::from_conf(
+            aws_sdk_s3::Config::builder()
+                .behavior_version(super::super::s3::behavior_version())
+                .region(aws_sdk_s3::config::Region::new("us-east-1"))
+                .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                    "id", "secret", None, None, "test",
+                ))
+                .endpoint_url(format!("http://{addr}"))
+                .force_path_style(true)
+                .http_client(super::super::s3::http_client())
+                .build(),
+        );
+        let body = b"abc".to_vec();
+        let key = ObjectKey::snapshot(
+            &tinycloud_core::sql::store::DbRef {
+                space: "tinycloud:s",
+                db_id: "d",
+            },
+            &tinycloud_core::sql::store::Lineage::random(),
+            1,
+            &sha256(&body),
+        )
+        .unwrap();
+        for mode in [WriteMode::Conditional, WriteMode::CheckThenWrite] {
+            let store = S3SqlObjectStore::new(client.clone(), "bucket".into(), mode);
+            tokio::time::timeout(Duration::from_secs(30), async {
+                // One creator holds the gate in its request, one waits for it;
+                // both are dropped by their timeouts.
+                let first = tokio::time::timeout(
+                    Duration::from_millis(300),
+                    store.put_if_absent(&key, body.clone()),
+                );
+                let second = tokio::time::timeout(
+                    Duration::from_millis(300),
+                    store.put_if_absent(&key, body.clone()),
+                );
+                let (first, second) = tokio::join!(first, second);
+                assert!(
+                    first.is_err() && second.is_err(),
+                    "the server never answers"
+                );
+            })
+            .await
+            .expect("the cancelled creates did not return");
+            assert!(lock_gates(&store.gates).is_empty(), "{mode:?}");
+        }
+        accepter.abort();
     }
 }

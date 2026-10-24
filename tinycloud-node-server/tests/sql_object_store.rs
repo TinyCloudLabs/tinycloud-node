@@ -49,6 +49,13 @@ fn body(len: usize) -> Vec<u8> {
     (0..len).map(|i| ((i * 13 + salt) % 251) as u8).collect()
 }
 
+/// Same length as `bytes`, different content.
+fn differing(bytes: &[u8]) -> Vec<u8> {
+    let mut other = bytes.to_vec();
+    other[0] ^= 1;
+    other
+}
+
 /// A key of a fresh, random database and lineage: unique per call and per run.
 fn key_for(bytes: &[u8]) -> ObjectKey {
     key_in(&format!("tinycloud:sqltest:{}", tag()), "v2n", bytes)
@@ -241,7 +248,11 @@ async fn conformance<S: SqlObjectStore + 'static>(store: Arc<S>, planter: Option
     if let Some(planter) = planter {
         for (len, planted_len) in [(64usize, 64usize), (64, 7)] {
             let wanted = body(len);
-            let other = body(planted_len);
+            let other = if planted_len == len {
+                differing(&wanted)
+            } else {
+                body(planted_len)
+            };
             assert_ne!(wanted, other);
             let key = key_for(&wanted);
             planter.plant(&key, other.clone()).await;
@@ -375,7 +386,7 @@ async fn fs_leftover_temp_files_never_block_a_create() {
         PutOutcome::AlreadyPresent
     );
     assert_eq!(names_in(parent), expected);
-    let planted = body(2048);
+    let planted = differing(&b);
     let conflicted = key_for(&b);
     let conflicted_path = store.path_for(&conflicted).unwrap();
     std::fs::create_dir_all(conflicted_path.parent().unwrap()).unwrap();
@@ -464,10 +475,16 @@ fn fs_open_refuses_a_root_that_overlaps_the_block_store() {
         ));
     }
     assert!(!blocks.join("sql-store").exists());
+    // Relative paths are made absolute first: a relative root inside a
+    // relative block store root is refused, and nothing is created.
     assert!(matches!(
-        FsSqlObjectStore::open("relative/sql-store".into(), &blocks),
+        FsSqlObjectStore::open(
+            "tc1491-relative/blocks/sql-store".into(),
+            Path::new("./tc1491-relative/blocks")
+        ),
         Err(SqlStoreError::Invalid(_))
     ));
+    assert!(!Path::new("tc1491-relative").exists());
 }
 
 // ---------------------------------------------------------------------------
@@ -995,16 +1012,52 @@ async fn mock_s3_probe_selects_the_mode_the_provider_supports() -> Result<()> {
     assert_eq!(mode?, WriteMode::CheckThenWrite);
     assert_eq!(s3.requests.lock().len(), 2);
 
-    // The provider rejects the header.
-    for (status, code) in [(501, "NotImplemented"), (400, "InvalidArgument")] {
-        let (_s3, mode) = probe_against(Conditional::Reject(status, code)).await?;
-        assert_eq!(mode?, WriteMode::CheckThenWrite, "{status}");
-    }
+    // The provider does not implement the header.
+    let (_s3, mode) = probe_against(Conditional::Reject(501, "NotImplemented")).await?;
+    assert_eq!(mode?, WriteMode::CheckThenWrite);
 
-    // Any other failure is an error, not a silent fallback.
-    for (status, code) in [(500, "InternalError"), (403, "AccessDenied")] {
+    // Any other failure, a 400 included, is an error, not a silent fallback.
+    for (status, code) in [
+        (400, "InvalidArgument"),
+        (400, "RequestTimeout"),
+        (400, "ExpiredToken"),
+        (500, "InternalError"),
+        (403, "AccessDenied"),
+    ] {
         let (_s3, mode) = probe_against(Conditional::Reject(status, code)).await?;
-        assert!(matches!(mode, Err(SqlStoreError::Backend(_))), "{status}");
+        let Err(SqlStoreError::Backend(message)) = mode else {
+            panic!("{status} {code}: expected a backend error");
+        };
+        assert!(message.contains(&format!("status {status}")), "{message}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn mock_s3_a_rejected_conditional_create_is_an_error_with_its_status_and_code() -> Result<()>
+{
+    for (status, code) in [
+        (400, "InvalidArgument"),
+        (400, "RequestTimeout"),
+        (501, "NotImplemented"),
+    ] {
+        let (s3, config) = start_mock(Conditional::Reject(status, code)).await?;
+        let store = S3SqlObjectStore::open_with_mode(&config, WriteMode::Conditional).await;
+        let b = body(40);
+        let k = key_for(&b);
+        let Err(SqlStoreError::Backend(message)) = store.put_if_absent(&k, b).await else {
+            panic!("{status} {code}: expected a backend error");
+        };
+        assert!(
+            message.contains(&format!("status {status}")) && message.contains(code),
+            "{message}"
+        );
+        // No unconditional PUT follows.
+        assert!(s3
+            .requests
+            .lock()
+            .iter()
+            .all(|r| r.ends_with("conditional=true")));
     }
     Ok(())
 }
