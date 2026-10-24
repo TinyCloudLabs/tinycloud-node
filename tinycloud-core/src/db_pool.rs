@@ -322,6 +322,68 @@ impl RecoveringConnection {
     }
 }
 
+/// The pool as the autocommit preparatory path reads it (TC-735): every
+/// statement is retried once after a connection-class failure and recorded
+/// like [`RecoveringConnection::begin_preparatory`]'s `BEGIN`, and none counts
+/// as a write for [`track_writes`]. [`RecoveringConnection`] itself infers
+/// that from the statement text and treats the authorization snapshot's many
+/// CTEs as a possible write, so it must not be used for these reads. Only
+/// reads may be issued through it.
+pub(crate) struct PreparatoryReads<'a>(&'a RecoveringConnection);
+
+impl RecoveringConnection {
+    pub(crate) fn preparatory_reads(&self) -> PreparatoryReads<'_> {
+        PreparatoryReads(self)
+    }
+}
+
+#[async_trait::async_trait]
+impl ConnectionTrait for PreparatoryReads<'_> {
+    fn get_database_backend(&self) -> DatabaseBackend {
+        self.0.conn.get_database_backend()
+    }
+
+    async fn execute(&self, stmt: Statement) -> Result<ExecResult, DbErr> {
+        self.0
+            .run("preparatory_read", true, || {
+                self.0.conn.execute(stmt.clone())
+            })
+            .await
+    }
+
+    async fn execute_unprepared(&self, sql: &str) -> Result<ExecResult, DbErr> {
+        self.0
+            .run("preparatory_read", true, || {
+                self.0.conn.execute_unprepared(sql)
+            })
+            .await
+    }
+
+    async fn query_one(&self, stmt: Statement) -> Result<Option<QueryResult>, DbErr> {
+        self.0
+            .run("preparatory_read", true, || {
+                self.0.conn.query_one(stmt.clone())
+            })
+            .await
+    }
+
+    async fn query_all(&self, stmt: Statement) -> Result<Vec<QueryResult>, DbErr> {
+        self.0
+            .run("preparatory_read", true, || {
+                self.0.conn.query_all(stmt.clone())
+            })
+            .await
+    }
+
+    fn support_returning(&self) -> bool {
+        self.0.conn.support_returning()
+    }
+
+    fn is_mock_connection(&self) -> bool {
+        self.0.conn.is_mock_connection()
+    }
+}
+
 impl RecoveringConnection {
     /// Open a scope whose statements are allowed the bulk `statement_timeout`
     /// ([`StatementTimeouts::bulk`]), for statements that legitimately move a

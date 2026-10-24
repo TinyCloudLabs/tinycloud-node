@@ -2801,11 +2801,12 @@ where
         B: StorageSetup,
     {
         if self.candidate_conn.uses_preparatory_autocommit() {
-            // Read-only authorization statements recover and retry like any
-            // pooled read; the registration statement is idempotent for this
-            // attempt ID and retried once by `preparatory_query_one`.
+            // Authorization statements are reads that recover and retry once
+            // after a lost connection, without counting as writes; the
+            // registration statement is idempotent for this attempt ID and
+            // retried once by `preparatory_query_one`.
             authorize_mutation_preupload::<_, B, K>(
-                &self.candidate_conn,
+                &self.candidate_conn.preparatory_reads(),
                 invocation,
                 mode,
                 now,
