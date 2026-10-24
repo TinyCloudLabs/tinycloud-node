@@ -46,6 +46,12 @@ address). A request over either limit is answered `429 delivery-rate-limited`
 with `Retry-After` before anything is fetched; only requests that reach the
 fetch count against the limits.
 
+Each links API read is signed with the node identity key (`TinyCloud-Read-Auth`).
+An operator reads the node's DID from `GET /info`, field `nodeId`, and lists it
+in the API's `links.readSigners`. A read signed by a DID that is not listed is
+served as an ordinary unauthenticated read, at the lower unauthenticated rate;
+the node's handling of the response is the same.
+
 The node identity must be internally exact, not merely a canonical DID:
 
 - `nodeAudience` is `did:web:<nodeOrigin host>`;
