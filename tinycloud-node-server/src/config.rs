@@ -801,6 +801,16 @@ fn is_postgres_database(database: &str) -> bool {
     database.starts_with("postgres://") || database.starts_with("postgresql://")
 }
 
+fn is_supported_sql_store_database(database: &str) -> bool {
+    let scheme = database
+        .split_once(':')
+        .map_or(database, |(scheme, _)| scheme);
+    matches!(
+        scheme.to_ascii_lowercase().as_str(),
+        "postgres" | "postgresql" | "sqlite"
+    )
+}
+
 fn database_has_query(database: &str, expected_key: &str, expected_value: &str) -> bool {
     let Some((_, query)) = database.split_once('?') else {
         return false;
@@ -1114,6 +1124,21 @@ pub struct SqlStoreConfig {
     pub spaces: Vec<String>,
     #[serde(default)]
     pub retention: SqlStoreRetentionConfig,
+    /// Seconds to keep draining pending uploads at shutdown.
+    #[serde(default = "default_sql_store_drain_secs")]
+    pub drain_secs: u64,
+    /// Maximum number of concurrent PostgreSQL operations the uploader may run (1 to 4).
+    #[serde(default = "default_sql_store_pg_concurrency")]
+    pub pg_concurrency: u32,
+    /// Minimum time between snapshots of one database.
+    #[serde(default = "default_sql_store_snapshot_min_interval_secs")]
+    pub snapshot_min_interval_secs: u64,
+    /// Bytes the uploader may upload for one database per UTC day. Captures over the budget are shed, not queued.
+    #[serde(default = "default_sql_store_daily_upload_byte_budget")]
+    pub daily_upload_byte_budget: ByteUnit,
+    /// Disk bytes the local upload spool may hold. Captures are shed before the spool would exceed this.
+    #[serde(default = "default_sql_store_spool_cap")]
+    pub spool_cap: ByteUnit,
 }
 
 /// History window per tier id (`free`, `paid`, ...). Absent keeps everything.
@@ -1145,6 +1170,26 @@ fn default_sql_store_orphan_after_secs() -> u64 {
     24 * 60 * 60
 }
 
+fn default_sql_store_drain_secs() -> u64 {
+    8
+}
+
+fn default_sql_store_pg_concurrency() -> u32 {
+    2
+}
+
+fn default_sql_store_snapshot_min_interval_secs() -> u64 {
+    15 * 60
+}
+
+fn default_sql_store_daily_upload_byte_budget() -> ByteUnit {
+    ByteUnit::Gibibyte(2)
+}
+
+fn default_sql_store_spool_cap() -> ByteUnit {
+    ByteUnit::Gibibyte(1)
+}
+
 impl Default for SqlStoreConfig {
     fn default() -> Self {
         Self {
@@ -1157,6 +1202,11 @@ impl Default for SqlStoreConfig {
             enforce_backlog_cap: false,
             spaces: Vec::new(),
             retention: SqlStoreRetentionConfig::default(),
+            drain_secs: default_sql_store_drain_secs(),
+            pg_concurrency: default_sql_store_pg_concurrency(),
+            snapshot_min_interval_secs: default_sql_store_snapshot_min_interval_secs(),
+            daily_upload_byte_budget: default_sql_store_daily_upload_byte_budget(),
+            spool_cap: default_sql_store_spool_cap(),
         }
     }
 }
@@ -1183,7 +1233,42 @@ impl SqlStoreConfig {
         if self.spaces.iter().any(|space| space.trim().is_empty()) {
             return Err("sql_store.spaces must not contain an empty space ID");
         }
+        if self.drain_secs < 1 {
+            return Err("sql_store.drain_secs must be at least 1");
+        }
+        if !(1..=4).contains(&self.pg_concurrency) {
+            return Err("sql_store.pg_concurrency must be between 1 and 4");
+        }
+        if self.snapshot_min_interval_secs < 1 {
+            return Err("sql_store.snapshot_min_interval_secs must be at least 1");
+        }
+        if self.daily_upload_byte_budget.as_u64() == 0 {
+            return Err("sql_store.daily_upload_byte_budget must be greater than 0");
+        }
+        if self.spool_cap < self.upload_bytes {
+            return Err("sql_store.spool_cap must be at least sql_store.upload_bytes");
+        }
         Ok(())
+    }
+
+    /// Checks that need the database backend and the space list. Runs only
+    /// when `enabled`. An enabled store is refused after these checks, because
+    /// this build has no uploader.
+    pub fn validate_for_database(&self, database: &str) -> Result<(), &'static str> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if !is_supported_sql_store_database(database) {
+            return Err("sql_store supports PostgreSQL and SQLite control databases");
+        }
+        if self
+            .spaces
+            .iter()
+            .any(|space| !matches!(space.parse::<tinycloud_auth::resource::SpaceId>(), Ok(id) if id.to_string() == *space))
+        {
+            return Err("sql_store.spaces must contain only canonical space IDs");
+        }
+        Err("sql_store is not available in this build")
     }
 
     pub fn upload_policy(&self) -> tinycloud_core::sql::store::UploadPolicy {
@@ -1986,6 +2071,14 @@ mod tests {
         assert!(config.delegated_caveats_enforced);
     }
 
+    /// A space ID in the canonical form that `validate_for_database` accepts.
+    fn canonical_fixture() -> String {
+        format!("tinycloud:pkh:eip155:1:0x{}:default", "ab".repeat(20))
+            .parse::<tinycloud_auth::resource::SpaceId>()
+            .unwrap()
+            .to_string()
+    }
+
     #[test]
     fn sql_store_parses_from_toml_and_fills_defaults() {
         let config: SqlStoreConfig = toml::from_str(
@@ -2054,12 +2147,130 @@ mod tests {
                 ..config.clone()
             };
             assert!(disabled.validate().is_ok());
-            assert!(crate::resolve_runtime_config(&Config {
-                sql_store: config,
+            let refused = crate::resolve_runtime_config(&Config {
+                sql_store: config.clone(),
                 ..Config::default()
             })
-            .is_err());
+            .unwrap_err();
+            assert_eq!(refused.to_string(), config.validate().unwrap_err());
         }
+    }
+
+    #[test]
+    fn sql_store_new_settings_parse_and_are_bounded() {
+        let config: SqlStoreConfig = toml::from_str(
+            r#"
+            enabled = true
+            drain_secs = 3
+            pg_concurrency = 4
+            snapshot_min_interval_secs = 600
+            daily_upload_byte_budget = "3 GiB"
+            spool_cap = "2 GiB"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.drain_secs, 3);
+        assert_eq!(config.pg_concurrency, 4);
+        assert_eq!(config.snapshot_min_interval_secs, 600);
+        assert_eq!(config.daily_upload_byte_budget, ByteUnit::Gibibyte(3));
+        assert_eq!(config.spool_cap, ByteUnit::Gibibyte(2));
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn sql_store_new_setting_defaults_and_pg_concurrency_floor() {
+        let defaults = SqlStoreConfig::default();
+        assert_eq!(defaults.drain_secs, 8);
+        assert_eq!(defaults.pg_concurrency, 2);
+        assert_eq!(defaults.snapshot_min_interval_secs, 900);
+        assert_eq!(defaults.daily_upload_byte_budget, ByteUnit::Gibibyte(2));
+        assert_eq!(defaults.spool_cap, ByteUnit::Gibibyte(1));
+        let floor = SqlStoreConfig {
+            enabled: true,
+            pg_concurrency: 1,
+            ..SqlStoreConfig::default()
+        };
+        assert!(floor.validate().is_ok());
+    }
+
+    #[test]
+    fn sql_store_new_settings_are_bounded_when_enabled() {
+        let mutations: [fn(&mut SqlStoreConfig); 6] = [
+            |c| c.drain_secs = 0,
+            |c| c.pg_concurrency = 0,
+            |c| c.pg_concurrency = 5,
+            |c| c.snapshot_min_interval_secs = 0,
+            |c| c.daily_upload_byte_budget = ByteUnit::Byte(0),
+            |c| c.spool_cap = ByteUnit::Mebibyte(4),
+        ];
+        for mutate in mutations {
+            let mut config = SqlStoreConfig {
+                enabled: true,
+                ..SqlStoreConfig::default()
+            };
+            mutate(&mut config);
+            assert!(config.validate().is_err());
+        }
+        let disabled = SqlStoreConfig {
+            drain_secs: 0,
+            ..SqlStoreConfig::default()
+        };
+        assert!(disabled.validate().is_ok());
+    }
+
+    #[test]
+    fn sql_store_refuses_enable_mysql_and_non_canonical_spaces() {
+        let postgres = "postgres://localhost/tinycloud";
+        let enabled = SqlStoreConfig {
+            enabled: true,
+            spaces: vec![canonical_fixture()],
+            ..SqlStoreConfig::default()
+        };
+        for database in [
+            postgres,
+            "postgresql://localhost/tinycloud",
+            "sqlite:./data/caps.db",
+        ] {
+            assert_eq!(
+                enabled.validate_for_database(database),
+                Err("sql_store is not available in this build"),
+                "{database}"
+            );
+        }
+        for database in [
+            "mysql://localhost/tinycloud",
+            "MYSQL://localhost/tinycloud",
+            "mysql:tinycloud",
+        ] {
+            assert_eq!(
+                enabled.validate_for_database(database),
+                Err("sql_store supports PostgreSQL and SQLite control databases"),
+                "{database}"
+            );
+        }
+        let lowercase = format!("tinycloud:pkh:eip155:1:0x{}:default", "ab".repeat(20));
+        let chain_id = format!("tinycloud:pkh:eip155:01:0x{}:default", "ab".repeat(20));
+        for space in [
+            "tinycloud:pkh:eip155:1:0xab://default".to_owned(),
+            lowercase,
+            chain_id,
+        ] {
+            let bad_space = SqlStoreConfig {
+                enabled: true,
+                spaces: vec![space.clone()],
+                ..SqlStoreConfig::default()
+            };
+            assert_eq!(
+                bad_space.validate_for_database(postgres),
+                Err("sql_store.spaces must contain only canonical space IDs"),
+                "{space}"
+            );
+        }
+        let disabled = SqlStoreConfig {
+            spaces: vec!["not a space".to_owned()],
+            ..SqlStoreConfig::default()
+        };
+        assert!(disabled.validate_for_database(postgres).is_ok());
     }
 
     /// TC-1274: a running backfill needs a positive rate and progress
