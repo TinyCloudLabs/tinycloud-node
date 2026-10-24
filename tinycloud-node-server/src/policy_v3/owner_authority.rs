@@ -969,8 +969,8 @@ impl PolicyV3Runtime {
     pub async fn log_owner_authority_cutover(&self) {
         match self.legacy_cutover().await {
             // Warn when the default cutover is under a day old: that is a
-            // fresh migration, or a re-upgrade after a rollback that still
-            // needs `policy_v3.legacy_cutover` set to the first deploy time.
+            // fresh migration, or a re-upgrade after a rollback that needs
+            // `policy_v3.legacy_cutover` set to the first deploy time.
             Ok((cutover, CutoverSource::Migration))
                 if OffsetDateTime::now_utc() - cutover < Duration::days(1) =>
             {
@@ -2015,7 +2015,7 @@ mod tests {
 
     /// A stored registration whose policy names a network that is not its
     /// content owner's is classified `unknown` / `foreign_network`, whether
-    /// it was registered before the cutover (`backfill`) or after it
+    /// it is registered before the cutover (`backfill`) or after it
     /// (`record`). A policy over the content owner's network goes on to the
     /// delegation search, which here fails for lack of a stored root.
     #[tokio::test]
