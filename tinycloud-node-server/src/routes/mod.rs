@@ -2860,13 +2860,16 @@ async fn handle_sql_invoke(
     // available when content storage is full.
     let grows_content =
         publication_command.is_none() && sql_request_is_write(&sql_request, &exec_caveats, ability);
-    let full_space = if grows_content {
-        storage_check(space, tinycloud, config, quota_cache)
-            .await?
-            .filter(|check| check.remaining().is_none())
+    // One read, as before: it now also carries the budget a write may still
+    // use, so the service can refuse an overshooting write before COMMIT
+    // instead of one write late (TC-1491). No extra database round trip.
+    let storage = if grows_content {
+        storage_check(space, tinycloud, config, quota_cache).await?
     } else {
         None
     };
+    let full_space = storage.filter(|check| check.remaining().is_none());
+    let remaining_budget = storage.and_then(StorageCheck::remaining);
     let execute_start = Instant::now();
     if publication_command
         .as_ref()
@@ -2890,6 +2893,17 @@ async fn handle_sql_invoke(
                 authority,
             )
             .await
+    } else if let Some(remaining) = remaining_budget {
+        sql_service
+            .execute_with_budget_authorized(
+                space,
+                &db_name,
+                sql_request,
+                exec_caveats,
+                authority,
+                remaining,
+            )
+            .await
     } else {
         sql_service
             .execute_authorized(space, &db_name, sql_request, exec_caveats, authority)
@@ -2905,7 +2919,7 @@ async fn handle_sql_invoke(
         execute_start.elapsed(),
     );
     let response = execute_result.map_err(|e| -> InvokeError {
-        match (&e, full_space) {
+        match (&e, storage) {
             (SqlError::StorageWouldGrow, Some(check)) => check
                 .reject(StorageRejectionKind::QuotaExceeded, space)
                 .into(),
@@ -3391,6 +3405,10 @@ pub(crate) fn sql_error_to_status(err: &SqlError) -> Status {
         SqlError::ResponseTooLarge(..) | SqlError::RowLimitExceeded(_) => Status::new(413),
         SqlError::QuotaExceeded => Status::new(429),
         SqlError::StorageWouldGrow => Status::new(402),
+        // 507, not 413: the SQL client reads 413 as `SQL_RESPONSE_TOO_LARGE`
+        // and the KV and quota clients as an exhausted storage plan, and
+        // TC-1012's 413 is the request body cap. Neither is true here.
+        SqlError::DatabaseSizeLimit | SqlError::DiskHeadroom => Status::new(507),
         SqlError::InvalidStatement(_) => Status::BadRequest,
         SqlError::SchemaError(_) => Status::BadRequest,
         SqlError::ReadOnlyViolation | SqlError::CaveatViolation(_) => Status::Forbidden,
@@ -3401,6 +3419,7 @@ pub(crate) fn sql_error_to_status(err: &SqlError) -> Status {
             tinycloud_core::request_telemetry::note_failure(FailureNote::internal(Service::Sql));
             Status::InternalServerError
         }
+        SqlError::CommitFailed => Status::InternalServerError,
         SqlError::Unavailable => Status::ServiceUnavailable,
         SqlError::OutcomeUnknown => Status::InternalServerError,
         SqlError::Busy(_) | SqlError::RequestTimeout => Status::ServiceUnavailable,
@@ -7831,6 +7850,33 @@ mod tests {
 
     // ---- T2: write-class SQL 402 gate ---------------------------------
 
+    #[test]
+    fn tc1491_reservation_refusals_are_507_with_distinct_codes() {
+        assert_eq!(
+            sql_error_to_status(&SqlError::DatabaseSizeLimit),
+            Status::new(507)
+        );
+        assert_eq!(
+            sql_error_to_status(&SqlError::DiskHeadroom),
+            Status::new(507)
+        );
+        assert_eq!(
+            sql_error_to_status(&SqlError::StorageWouldGrow),
+            Status::new(402)
+        );
+        assert_eq!(
+            sql_error_to_status(&SqlError::CommitFailed),
+            Status::InternalServerError
+        );
+        let size = SqlError::DatabaseSizeLimit.to_string();
+        let disk = SqlError::DiskHeadroom.to_string();
+        assert!(size.starts_with("sql_database_size_limit:"), "{size}");
+        assert!(disk.starts_with("sql_disk_headroom:"), "{disk}");
+        assert!(SqlError::CommitFailed
+            .to_string()
+            .starts_with("sql_commit_failed:"));
+    }
+
     #[tokio::test]
     async fn sql_request_is_write_classifies_variants() {
         use tinycloud_core::sql::types::SqlStatement;
@@ -8734,6 +8780,85 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&body)?["rows"],
             serde_json::json!([[1, 116]]),
+            "{body}"
+        );
+        Ok(())
+    }
+
+    /// TC-1585 + TC-1491 over `/invoke`: a `WITH … INSERT` inside the owner's
+    /// remaining budget (not a full space) takes the budget path like a plain
+    /// write: a growth past the budget is refused before COMMIT with 402 and
+    /// changes nothing, a small one passes.
+    #[tokio::test]
+    async fn tc1585_cte_wrapped_write_over_the_remaining_budget_is_402_and_leaves_nothing(
+    ) -> Result<()> {
+        use rocket::data::ByteUnit;
+        use rocket::http::{ContentType, Header, Status};
+        use rocket::local::asynchronous::Client;
+
+        let setup = metered_sql_http_setup("tc1585-cte-budget").await?;
+        // Room for a page or two, not for 64 KiB.
+        let limit = ByteUnit::Byte(setup.used + 8 * 1024);
+        let mut nonce = 0u32;
+        let mut header = |ability: &str| -> Result<String> {
+            nonce += 1;
+            sql_invocation_header(&setup, ability, &format!("urn:uuid:tc1585b-{nonce}"))
+        };
+        let big = header("tinycloud.sql/write")?;
+        let small = header("tinycloud.sql/write")?;
+        let count = header("tinycloud.sql/read")?;
+
+        let client = Client::tracked(metered_sql_rocket(setup, limit)).await?;
+        let send = |auth: &String, request: &SqlRequest| {
+            let client = &client;
+            let auth = auth.clone();
+            let body = serde_json::to_string(request);
+            async move {
+                let response = client
+                    .post("/invoke")
+                    .header(Header::new("Authorization", auth))
+                    .header(ContentType::JSON)
+                    .body(body.expect("request serializes"))
+                    .dispatch()
+                    .await;
+                let status = response.status();
+                (status, response.into_string().await.unwrap_or_default())
+            }
+        };
+        let cte_insert = |params: Vec<SqlValue>| SqlRequest::Execute {
+            sql:
+                "WITH c AS (SELECT ? AS body) INSERT INTO labels (label, val) SELECT body, 1 FROM c"
+                    .to_string(),
+            params,
+            schema: None,
+        };
+
+        let (status, body) = send(
+            &big,
+            &cte_insert(vec![SqlValue::Text("g".repeat(64 * 1024))]),
+        )
+        .await;
+        assert_eq!(status, Status::new(402), "{body}");
+        assert!(body.contains("storage_quota_exceeded"), "{body}");
+
+        let (status, body) = send(&small, &cte_insert(vec![SqlValue::Text("ok".into())])).await;
+        assert_eq!(status, Status::Ok, "{body}");
+
+        // Only the small write is there: the seeded row plus one.
+        let (status, body) = send(
+            &count,
+            &SqlRequest::Query {
+                sql: "SELECT count(*) FROM labels".to_string(),
+                params: vec![],
+                max_rows: None,
+                max_bytes: None,
+            },
+        )
+        .await;
+        assert_eq!(status, Status::Ok, "{body}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body)?["rows"],
+            serde_json::json!([[2]]),
             "{body}"
         );
         Ok(())
