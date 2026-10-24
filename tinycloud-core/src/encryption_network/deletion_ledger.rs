@@ -9,9 +9,11 @@
 //!   failed while the process lives.
 //!
 //! A crash between the intent and its settling line leaves the intent open.
-//! Every node start settles open intents against the database before the
-//! routes mount ([`DeletionLedger::settle_open_intents`]): rows deleted at that
-//! version mean the commit happened, otherwise the delete is aborted.
+//! Every node start replays the ledger onto the database before the routes
+//! mount ([`DeletionLedger::replay_at_start`]): committed and still-open
+//! operations are applied, and each open operation is then closed with a
+//! `committed` line. Only an operation whose commit is known not to have
+//! happened is settled `aborted`.
 //!
 //! [`replay`] re-applies a ledger to a database (seed NULL, state `deleted`)
 //! and is the first step of a restore. It applies committed and still-open
@@ -23,7 +25,10 @@ use std::{
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
 };
 
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, ConnectionTrait, EntityTrait, TransactionTrait};
@@ -162,6 +167,9 @@ pub struct DeletionLedger {
     path: PathBuf,
     file: Mutex<File>,
     dropped_tail_bytes: usize,
+    /// Set when a failed append left bytes that could not be removed; later
+    /// appends fail rather than write after them.
+    unrepaired: AtomicBool,
 }
 
 impl DeletionLedger {
@@ -195,6 +203,7 @@ impl DeletionLedger {
             path: path.to_path_buf(),
             file: Mutex::new(file),
             dropped_tail_bytes,
+            unrepaired: AtomicBool::new(false),
         })
     }
 
@@ -205,6 +214,7 @@ impl DeletionLedger {
             path: path.to_path_buf(),
             file: Mutex::new(file),
             dropped_tail_bytes: 0,
+            unrepaired: AtomicBool::new(false),
         }
     }
 
@@ -219,18 +229,48 @@ impl DeletionLedger {
 
     /// Appends one line and fsyncs. Returns only after the line is durable, and
     /// fails, writing nothing, if the file the handle names is no longer the
-    /// file at the ledger path. Blocking; async callers use
+    /// file at the ledger path. If the write or the fsync fails, the file is
+    /// cut back to its length before the call, so a partial line is never
+    /// followed by another. Blocking; async callers use
     /// [`DeletionLedger::append_async`].
     pub fn append(&self, record: &Record) -> Result<(), DeletionLedgerError> {
         let mut line = serde_json::to_vec(record)?;
         line.push(b'\n');
+        self.append_line(&line, |file, bytes| file.write_all(bytes))
+    }
+
+    /// [`DeletionLedger::append`] with the write step supplied by the caller.
+    pub(super) fn append_line(
+        &self,
+        line: &[u8],
+        write: impl FnOnce(&mut File, &[u8]) -> std::io::Result<()>,
+    ) -> Result<(), DeletionLedgerError> {
         let mut file = self
             .file
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         self.check_not_moved(&file)?;
-        file.write_all(&line)?;
-        file.sync_all()?;
+        if self.unrepaired.load(Ordering::SeqCst) {
+            return Err(std::io::Error::other(
+                "an earlier failed append left bytes in the ledger that could not be removed",
+            )
+            .into());
+        }
+        let length_before = file.metadata()?.len();
+        if let Err(error) = write(&mut file, line).and_then(|()| file.sync_all()) {
+            let unchanged = file
+                .metadata()
+                .is_ok_and(|metadata| metadata.len() == length_before);
+            if !unchanged
+                && file
+                    .set_len(length_before)
+                    .and_then(|()| file.sync_all())
+                    .is_err()
+            {
+                self.unrepaired.store(true, Ordering::SeqCst);
+            }
+            return Err(error.into());
+        }
         Ok(())
     }
 

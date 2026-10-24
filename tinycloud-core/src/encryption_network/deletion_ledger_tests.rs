@@ -223,6 +223,56 @@ fn an_append_fails_closed_once_the_file_was_renamed_or_removed() {
     ));
 }
 
+/// A write that stores `written` bytes of the line and then fails, as a full
+/// disk does.
+fn fails_after(written: usize) -> impl FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    move |file, line| {
+        file.write_all(&line[..written.min(line.len())])?;
+        Err(std::io::Error::other("no space left on device"))
+    }
+}
+
+#[tokio::test]
+async fn a_failed_append_leaves_no_partial_line_and_later_appends_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, ledger) = ledger_in(&dir);
+    let db = fresh_db().await;
+    active_key(&db, "apps/a/x").await;
+    active_key(&db, "apps/a/y").await;
+    ledger
+        .append(&Record::Intent(intent("first", &[("apps/a/x", 1)])))
+        .unwrap();
+    ledger.append(&Record::committed("first")).unwrap();
+    let before = std::fs::read(&path).unwrap();
+
+    // A failure after some bytes, after none, and after all but the newline.
+    let mut second =
+        serde_json::to_vec(&Record::Intent(intent("second", &[("apps/a/y", 1)]))).unwrap();
+    second.push(b'\n');
+    for written in [0, 10, second.len() - 1] {
+        let result = ledger.append_line(&second, fails_after(written));
+        assert!(
+            matches!(result, Err(DeletionLedgerError::Io(_))),
+            "{written}: {result:?}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before, "{written}");
+    }
+
+    // The next append lands on a whole line and the file reads and replays.
+    ledger
+        .append(&Record::Intent(intent("second", &[("apps/a/y", 1)])))
+        .unwrap();
+    ledger.append(&Record::committed("second")).unwrap();
+    let read = read(&path).unwrap();
+    assert!(!read.torn_tail);
+    assert_eq!(read.records.len(), 4);
+    let report = replay(&db, &path).await.unwrap();
+    assert_eq!(report.applied, 2);
+    assert_eq!(row(&db, "apps/a/x").await.state, "deleted");
+    assert_eq!(row(&db, "apps/a/y").await.state, "deleted");
+}
+
 #[test]
 fn the_path_is_validated_without_touching_the_filesystem() {
     for ok in ["/var/lib/tinycloud/deletion-ledger.jsonl", "/a"] {

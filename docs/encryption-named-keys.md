@@ -148,7 +148,13 @@ If the commit fails, the node reads the rows again and appends `committed`
 when every key is `deleted` at that version and `aborted` only when the commit
 did not happen; when the rows cannot be read the operation stays open. If the
 ledger cannot be written, or the file was renamed or removed, the delete is
-rolled back and answers 500 `deletion_ledger_unavailable`.
+rolled back and answers 500 `deletion_ledger_unavailable`. An append whose write
+or fsync fails is cut back to the file's length before it, so the file never
+holds a partial line before a later one.
+
+The node image contains the directory `/var/lib/tinycloud/ledger`, owned by
+uid 1000 (the node's user) with mode 0700; a volume mounted there is writable
+by the node.
 
 At every start, before any route is served, the node replays the ledger onto
 the database (as `tinycloud node deletion-ledger replay` does) and closes each
