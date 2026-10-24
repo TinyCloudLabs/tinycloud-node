@@ -447,6 +447,21 @@ impl Harness {
             vector,
         };
         harness.seed_content().await?;
+        // Registration requires the content owner's network to exist and be
+        // active (TC-1423 N1b), so the harness creates the network its
+        // policies name.
+        harness
+            .client
+            .rocket()
+            .state::<tinycloud_core::encryption_network::EncryptionService>()
+            .expect("EncryptionService is managed")
+            .create_one_of_one_network(tinycloud_core::encryption_network::CreateNetworkRequest {
+                name: "mainnet".to_owned(),
+                owner_did: harness.space_owner.did().to_owned(),
+                threshold: tinycloud_core::encryption_network::Threshold::one_of_one(),
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
         Ok(Some(harness))
     }
 

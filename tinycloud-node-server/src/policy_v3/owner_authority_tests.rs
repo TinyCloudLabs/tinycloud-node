@@ -409,6 +409,67 @@ pub(super) struct Registered {
     pub policy_root_cid: String,
 }
 
+/// A Policy/v3 document over `content_resource`, signed by `owner`, whose
+/// source and decrypt ceiling name `network`.
+pub(super) fn signed_policy(
+    owner: &Signer,
+    vector: &Value,
+    content_resource: &str,
+    network: &str,
+    root: &Window,
+) -> Value {
+    let owner_did = owner.did().to_owned();
+    let projection = vector["policyProjection"].clone();
+    let created = (now() - Duration::seconds(60)).min(root.not_before);
+    let ceiling = vec![
+        json!({
+            "kind": "kv",
+            "resource": content_resource,
+            "selector": "exact",
+            "actions": [KV_GET, KV_METADATA],
+        }),
+        json!({
+            "kind": "encryption",
+            "resource": network,
+            "action": DECRYPT,
+        }),
+    ];
+    let mut policy = json!({
+        "schema": POLICY_V2_SCHEMA,
+        "policyId": "pending",
+        "ownerDid": owner_did,
+        "createdAt": format_time(created),
+        // The policy may outlive its roots; the roots' expiry is what the
+        // tests exercise.
+        "expiresAt": format_time(root.expiry + Duration::hours(1)),
+        "contentSource": {
+            "shareId": unique("share-tc-1423-"),
+            "kvResource": content_resource,
+            "selector": "exact",
+            "encryptionNetwork": network,
+            "encryptedSymmetricKeyDigestHex": "aa".repeat(32),
+            "keyVersion": 1,
+            "mode": "immutable",
+            "initialCiphertextDigestHex": "bb".repeat(32)
+        },
+        "capabilityCeiling": ceiling,
+        "credentialRequirement": projection,
+        "signature": {"suite": "Ed25519", "signerDid": owner_did, "value": ""}
+    });
+    let mut unsigned = policy.clone();
+    unsigned.as_object_mut().unwrap().remove("policyId");
+    unsigned.as_object_mut().unwrap().remove("signature");
+    let mut preimage = POLICY_V2_SCHEMA.as_bytes().to_vec();
+    preimage.push(0);
+    preimage.extend_from_slice(&canonical_json_value(&unsigned));
+    policy["policyId"] = json!(format!("pol_{}", base32_lower(&Sha256::digest(&preimage))));
+    policy["signature"]["value"] = json!(encode_config(
+        owner.keypair().sign(&Sha256::digest(preimage)),
+        URL_SAFE_NO_PAD
+    ));
+    policy
+}
+
 /// Which principal owns the content space, and who owns the policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Shape {
@@ -495,6 +556,19 @@ impl Harness {
         );
         let network = format!("urn:tinycloud:encryption:{}:mainnet", space_owner.did());
         let client = Self::boot_app(&db, &vector, &issuer, &boot).await?;
+        // Registration requires the source network to exist and to be the
+        // content owner's (TC-1423 N1b), so the harness creates it.
+        client
+            .rocket()
+            .state::<tinycloud_core::encryption_network::EncryptionService>()
+            .expect("encryption service")
+            .create_one_of_one_network(tinycloud_core::encryption_network::CreateNetworkRequest {
+                name: "mainnet".into(),
+                owner_did: space_owner.did().to_string(),
+                threshold: tinycloud_core::encryption_network::Threshold::one_of_one(),
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
         let harness = Self {
             client,
             db,
@@ -699,45 +773,13 @@ impl Harness {
     /// policy owner. Each build draws a fresh `shareId`, so each build has
     /// its own template digest.
     pub fn build_policy(&self, root: Window) -> Value {
-        let owner_did = self.owner.did().to_owned();
-        let projection = self.vector["policyProjection"].clone();
-        let created = (now() - Duration::seconds(60)).min(root.not_before);
-        let ceiling = vec![
-            json!({
-                "kind": "kv",
-                "resource": self.content_resource.to_string(),
-                "selector": "exact",
-                "actions": [KV_GET, KV_METADATA],
-            }),
-            json!({
-                "kind": "encryption",
-                "resource": self.network,
-                "action": DECRYPT,
-            }),
-        ];
-        let policy = json!({
-            "schema": POLICY_V2_SCHEMA,
-            "policyId": "pending",
-            "ownerDid": owner_did,
-            "createdAt": format_time(created),
-            // The policy may outlive its roots; the roots' expiry is what
-            // the tests exercise.
-            "expiresAt": format_time(root.expiry + Duration::hours(1)),
-            "contentSource": {
-                "shareId": unique("share-tc-1423-"),
-                "kvResource": self.content_resource.to_string(),
-                "selector": "exact",
-                "encryptionNetwork": self.network,
-                "encryptedSymmetricKeyDigestHex": "aa".repeat(32),
-                "keyVersion": 1,
-                "mode": "immutable",
-                "initialCiphertextDigestHex": "bb".repeat(32)
-            },
-            "capabilityCeiling": ceiling,
-            "credentialRequirement": projection,
-            "signature": {"suite": "Ed25519", "signerDid": owner_did, "value": ""}
-        });
-        self.sign_policy(policy)
+        signed_policy(
+            &self.owner,
+            &self.vector,
+            &self.content_resource.to_string(),
+            &self.network,
+            &root,
+        )
     }
 
     /// Set `policyId` and `signature` on `policy` as the policy owner. The
@@ -1200,14 +1242,24 @@ impl Harness {
         Ok(())
     }
 
-    /// Use the policy (a challenge) and wait for its background
-    /// classification.
+    /// Use the policy (a challenge), wait for its background classification,
+    /// and check that the use was admitted when the policy has authority
+    /// (`bound`, `bound-uncapped`, `root-authority`: 200) and refused with
+    /// the fixed code when it has none (`unknown`: 403).
     pub async fn classify_on_use(&self, policy: &Registered) -> anyhow::Result<BindingRow> {
-        // The use may be refused once the classification gates it.
-        self.challenge(policy).await;
-        self.wait_for_binding(&policy.policy_cid, std::time::Duration::from_secs(20))
+        let (status, body) = self.challenge(policy).await;
+        let row = self
+            .wait_for_binding(&policy.policy_cid, std::time::Duration::from_secs(20))
             .await?
-            .ok_or_else(|| anyhow::anyhow!("not classified"))
+            .ok_or_else(|| anyhow::anyhow!("not classified"))?;
+        match row.state.as_str() {
+            "unknown" => anyhow::ensure!(
+                status == Status::Forbidden && body == "policy-owner-authority-unknown",
+                "challenge on an unknown policy: {status} {body}"
+            ),
+            _ => anyhow::ensure!(status == Status::Ok, "challenge: {status} {body}"),
+        }
+        Ok(row)
     }
 
     /// Wait until `policy_cid` is classified as `state`, or time out;
@@ -1335,7 +1387,7 @@ async fn roots_outliving_their_authority_are_recorded_uncapped(
 }
 on_both_backends!(roots_outliving_their_authority_are_recorded_uncapped);
 
-/// [F1] A link holder that delegates back to the policy owner, or the owner
+/// A link holder that delegates back to the policy owner, or the owner
 /// delegating to itself, never becomes the recorded authority.
 async fn delegations_back_to_the_owner_are_never_recorded(backend: Backend) -> anyhow::Result<()> {
     let Some(h) = Harness::new(
@@ -1383,7 +1435,7 @@ async fn delegations_back_to_the_owner_are_never_recorded(backend: Backend) -> a
 }
 on_both_backends!(delegations_back_to_the_owner_are_never_recorded);
 
-/// [F1] The same in the general window, where the owner's authority is
+/// The same in the general window, where the owner's authority is
 /// re-delegated (so the owner-first step finds nothing) and the loop-back
 /// delegations sort ahead of it.
 async fn loop_back_delegations_are_skipped_in_the_general_window(
@@ -1497,16 +1549,16 @@ fn sorting_before(
     anyhow::bail!("no delegation sorted before the target")
 }
 
-/// [C1] Delegations to the policy owner from strangers' own spaces, with
-/// future or backdated issue times, cannot push the space owner's grant out
+/// Delegations to the policy owner from other issuers' own spaces, with
+/// future or backdated issue times, do not push the space owner's grant out
 /// of the candidate window, at registration or in the legacy backfill.
-async fn stranger_delegations_cannot_starve_the_owner_grant(
+async fn delegations_from_other_issuers_do_not_displace_the_owner_grant(
     backend: Backend,
 ) -> anyhow::Result<()> {
     let Some(h) = Harness::with_boot(
         backend,
         Shape::KeySession,
-        "stranger_delegations_cannot_starve_the_owner_grant",
+        "delegations_from_other_issuers_do_not_displace_the_owner_grant",
         legacy_boot(),
     )
     .await?
@@ -1521,8 +1573,8 @@ async fn stranger_delegations_cannot_starve_the_owner_grant(
     // More than the general window (256 rows) on each side of the
     // registration time: future issue times lead it at registration, and
     // backdated ones lead it in the legacy backfill.
-    flood(&h, 260, Duration::days(300)).await?;
-    flood(&h, 260, -Duration::days(300)).await?;
+    import_delegations_from_other_issuers(&h, 260, Duration::days(300)).await?;
+    import_delegations_from_other_issuers(&h, 260, -Duration::days(300)).await?;
     let policy = h.register_ok(policy_window()).await?;
     assert_eq!(
         h.closure(&policy.policy_cid).await?,
@@ -1535,15 +1587,19 @@ async fn stranger_delegations_cannot_starve_the_owner_grant(
     assert_eq!(h.closure(&legacy.policy_cid).await?, vec![authority]);
     Ok(())
 }
-on_both_backends!(stranger_delegations_cannot_starve_the_owner_grant);
+on_both_backends!(delegations_from_other_issuers_do_not_displace_the_owner_grant);
 
-/// SIWE delegations from strangers' own spaces to the policy owner.
-async fn flood(h: &Harness, count: usize, issued_offset: Duration) -> anyhow::Result<()> {
+/// SIWE delegations from other issuers' own spaces to the policy owner.
+async fn import_delegations_from_other_issuers(
+    h: &Harness,
+    count: usize,
+    issued_offset: Duration,
+) -> anyhow::Result<()> {
     for _ in 0..count {
-        let stranger = Signer::pkh();
-        let space = SpaceId::new(stranger.did().parse::<DIDBuf>()?, "applications".parse()?);
+        let issuer = Signer::pkh();
+        let space = SpaceId::new(issuer.did().parse::<DIDBuf>()?, "applications".parse()?);
         let resource = space.to_resource("kv".parse()?, Some("x".parse()?), None, None);
-        h.import(stranger.delegate(
+        h.import(issuer.delegate(
             h.owner.did(),
             &[(resource.to_string(), KV_GET)],
             Window::until(now() + Duration::days(400)).issued(now() + issued_offset),
@@ -1555,13 +1611,15 @@ async fn flood(h: &Harness, count: usize, issued_offset: Duration) -> anyhow::Re
 }
 
 /// The general window only holds delegations touching the capability's space
-/// or network, so strangers cannot crowd out a re-delegated authority that
-/// the owner-first step does not see.
-async fn strangers_cannot_crowd_the_general_window(backend: Backend) -> anyhow::Result<()> {
+/// or network, so delegations from other issuers do not crowd out a
+/// re-delegated authority that the owner-first step does not see.
+async fn delegations_from_other_issuers_do_not_fill_the_general_window(
+    backend: Backend,
+) -> anyhow::Result<()> {
     let Some(h) = Harness::with_boot(
         backend,
         Shape::KeySession,
-        "strangers_cannot_crowd_the_general_window",
+        "delegations_from_other_issuers_do_not_fill_the_general_window",
         legacy_boot(),
     )
     .await?
@@ -1586,7 +1644,7 @@ async fn strangers_cannot_crowd_the_general_window(backend: Backend) -> anyhow::
         .await?;
     let legacy = h.register_ok(policy_window()).await?;
     h.forget_binding(&legacy.policy_cid).await?;
-    flood(&h, 300, -Duration::days(300)).await?;
+    import_delegations_from_other_issuers(&h, 300, -Duration::days(300)).await?;
     let binding = h.classify_on_use(&legacy).await?;
     assert_eq!(binding.state, "bound");
     let mut expected = vec![authority, upstream];
@@ -1594,7 +1652,7 @@ async fn strangers_cannot_crowd_the_general_window(backend: Backend) -> anyhow::
     assert_eq!(h.closure(&legacy.policy_cid).await?, expected);
     Ok(())
 }
-on_both_backends!(strangers_cannot_crowd_the_general_window);
+on_both_backends!(delegations_from_other_issuers_do_not_fill_the_general_window);
 
 /// `starved` needs both steps to miss with candidates left unexamined: here
 /// the general window is full of loop-back delegations (skipped without using
@@ -1780,16 +1838,16 @@ async fn the_legacy_classifier_ignores_grants_issued_after_registration(
 }
 on_both_backends!(the_legacy_classifier_ignores_grants_issued_after_registration);
 
-/// [C1] With a SIWE owner grant: strangers' delegations issued after it
-/// (future at registration, or between it and a legacy registration) don't
+/// With a SIWE owner grant: delegations from other issuers issued after it
+/// (future at registration, or between it and a legacy registration) do not
 /// displace it.
-async fn stranger_delegations_cannot_starve_a_siwe_owner_grant(
+async fn delegations_from_other_issuers_do_not_displace_a_siwe_owner_grant(
     backend: Backend,
 ) -> anyhow::Result<()> {
     let Some(h) = Harness::with_boot(
         backend,
         Shape::PkhSession,
-        "stranger_delegations_cannot_starve_a_siwe_owner_grant",
+        "delegations_from_other_issuers_do_not_displace_a_siwe_owner_grant",
         legacy_boot(),
     )
     .await?
@@ -1806,8 +1864,8 @@ async fn stranger_delegations_cannot_starve_a_siwe_owner_grant(
     let legacy = h.register_ok(policy_window()).await?;
     h.forget_binding(&legacy.policy_cid).await?;
     backdate(&h, &legacy.policy_cid, now() - Duration::minutes(30)).await?;
-    flood(&h, 260, -Duration::hours(1)).await?;
-    flood(&h, 260, Duration::days(300)).await?;
+    import_delegations_from_other_issuers(&h, 260, -Duration::hours(1)).await?;
+    import_delegations_from_other_issuers(&h, 260, Duration::days(300)).await?;
     let policy = h.register_ok(policy_window()).await?;
     assert_eq!(
         h.closure(&policy.policy_cid).await?,
@@ -1818,9 +1876,9 @@ async fn stranger_delegations_cannot_starve_a_siwe_owner_grant(
     assert_eq!(h.closure(&legacy.policy_cid).await?, vec![authority]);
     Ok(())
 }
-on_both_backends!(stranger_delegations_cannot_starve_a_siwe_owner_grant);
+on_both_backends!(delegations_from_other_issuers_do_not_displace_a_siwe_owner_grant);
 
-/// [F9] An older grant that outlives the root is recorded over a newer one
+/// An older grant that outlives the root is recorded over a newer one
 /// that does not.
 async fn a_grant_outliving_the_root_is_preferred(backend: Backend) -> anyhow::Result<()> {
     let Some(h) = Harness::new(
@@ -1892,7 +1950,7 @@ async fn concurrent_first_uses_store_one_classification(backend: Backend) -> any
 }
 on_both_backends!(concurrent_first_uses_store_one_classification);
 
-/// [F3] A classification that cannot be stored is served from memory and
+/// A classification that cannot be stored is served from memory and
 /// leaves the row pending.
 async fn a_failed_classification_write_still_serves(backend: Backend) -> anyhow::Result<()> {
     let Some(h) = Harness::with_boot(
@@ -1924,7 +1982,7 @@ async fn a_failed_classification_write_still_serves(backend: Backend) -> anyhow:
 }
 on_both_backends!(a_failed_classification_write_still_serves);
 
-/// [F8] A legacy registration whose original authority was revoked binds
+/// A legacy registration whose original authority was revoked binds
 /// to a live alternate; with none left it is recorded `unknown`.
 async fn legacy_classification_falls_through_to_a_live_alternate(
     backend: Backend,
@@ -2065,7 +2123,7 @@ async fn the_sweep_runs_only_when_enabled(backend: Backend) -> anyhow::Result<()
 }
 on_both_backends!(the_sweep_runs_only_when_enabled);
 
-/// [F5][F6] Rollback: `down` drops both tables; after a re-upgrade only
+/// Rollback: `down` drops both tables; after a re-upgrade only
 /// registrations before the configured cutover are legacy.
 async fn rollback_and_reupgrade_respect_the_configured_cutover(
     backend: Backend,
@@ -2279,7 +2337,7 @@ fn counter(name: &str, labels: &[(&str, &str)]) -> f64 {
         .sum()
 }
 
-/// [F2][C2] Roots are capped at registration time + 31 days (+5 minutes of
+/// Roots are capped at registration time + 31 days (+5 minutes of
 /// skew) with `nbf <= exp`, in both modes; a root shaped like a released
 /// SDK's is accepted.
 async fn root_lifetime_is_capped_in_both_modes(backend: Backend) -> anyhow::Result<()> {
@@ -2397,7 +2455,7 @@ async fn enforce_refuses_roots_outliving_their_authority(backend: Backend) -> an
 }
 on_both_backends!(enforce_refuses_roots_outliving_their_authority);
 
-/// [F9] Under `enforce`, an older grant that outlives the root is chosen
+/// Under `enforce`, an older grant that outlives the root is chosen
 /// over a newer one that does not, so the registration is accepted.
 async fn enforce_chooses_the_grant_that_outlives_the_root(backend: Backend) -> anyhow::Result<()> {
     let Some(h) = Harness::with_boot(
@@ -2462,7 +2520,7 @@ async fn info_advertises_the_owner_authority_mode(backend: Backend) -> anyhow::R
 }
 on_both_backends!(info_advertises_the_owner_authority_mode);
 
-/// [F2] A legacy registration whose root outlives 31 days is classified as
+/// A legacy registration whose root outlives 31 days is classified as
 /// before and counted, not refused.
 async fn legacy_long_roots_are_counted_not_refused(backend: Backend) -> anyhow::Result<()> {
     let Some(h) = Harness::new(
@@ -2503,7 +2561,7 @@ async fn legacy_long_roots_are_counted_not_refused(backend: Backend) -> anyhow::
 }
 on_both_backends!(legacy_long_roots_are_counted_not_refused);
 
-/// [F6] A registration after the cutover with no classification (written by
+/// A registration after the cutover with no classification (written by
 /// an older binary) gets the lifetime cap, unlike a legacy one.
 async fn post_cutover_unclassified_rows_get_the_lifetime_cap(
     backend: Backend,
@@ -2539,7 +2597,7 @@ async fn post_cutover_unclassified_rows_get_the_lifetime_cap(
 }
 on_both_backends!(post_cutover_unclassified_rows_get_the_lifetime_cap);
 
-/// [F6] Under `enforce`, a post-cutover unclassified row whose root outlives
+/// Under `enforce`, a post-cutover unclassified row whose root outlives
 /// its only authority is recorded `unknown`.
 async fn post_cutover_rows_outliving_their_authority_are_unknown_under_enforce(
     backend: Backend,
@@ -2762,7 +2820,7 @@ impl Harness {
     }
 }
 
-/// [1][4][8][11] Revoking the owner's grant ends already-admitted sessions:
+/// Revoking the owner's grant ends already-admitted sessions:
 /// read, decrypt, a re-shared child, challenge, mint, signed-KV mint and new
 /// re-share admission, with a fixed, opaque code.
 async fn revoking_the_owner_grant_ends_admitted_sessions(backend: Backend) -> anyhow::Result<()> {
@@ -2782,8 +2840,19 @@ async fn revoking_the_owner_grant_ends_admitted_sessions(backend: Backend) -> an
     let session = h.mint_ok(&policy).await?;
     let (status, body) = h.read(&session).await?;
     assert_eq!((status, body.as_slice()), (Status::Ok, CONTENT));
-    let (_, decrypt_before) = h.decrypt(&session).await?;
-    assert_ne!(decrypt_before, REVOKED);
+    // The request body is empty on purpose: the route checks the owner
+    // authority before it parses the body, so a malformed-body 400 here shows
+    // the session passed the check, and the same request is a 403 after the
+    // revoke below.
+    let (decrypt_status_before, decrypt_before) = h.decrypt(&session).await?;
+    assert_eq!(
+        (
+            decrypt_status_before,
+            decrypt_before.starts_with("decrypt request body is malformed")
+        ),
+        (Status::BadRequest, true),
+        "decrypt before: {decrypt_before}"
+    );
     let (status, body, reader, child) = h.reshare(&session).await?;
     assert_eq!(status, Status::Ok, "{body}");
     let child = child.unwrap();
@@ -2869,7 +2938,7 @@ async fn revoking_the_agent_session_ends_its_policies(backend: Backend) -> anyho
 }
 on_both_backends!(revoking_the_agent_session_ends_its_policies);
 
-/// [2] Revoking an ancestor of the recorded grant ends sessions too.
+/// Revoking an ancestor of the recorded grant ends sessions too.
 async fn revoking_an_ancestor_ends_admitted_sessions(backend: Backend) -> anyhow::Result<()> {
     let Some(h) = Harness::new(
         backend,
@@ -2905,7 +2974,7 @@ async fn revoking_an_ancestor_ends_admitted_sessions(backend: Backend) -> anyhow
 }
 on_both_backends!(revoking_an_ancestor_ends_admitted_sessions);
 
-/// [2] A revocation stored under an alias CID of a closure node counts.
+/// A revocation stored under an alias CID of a closure node counts.
 async fn a_revocation_under_an_alias_cid_ends_sessions(backend: Backend) -> anyhow::Result<()> {
     let Some(h) = Harness::new(
         backend,
@@ -2985,7 +3054,7 @@ async fn a_revocation_under_an_alias_cid_ends_sessions(backend: Backend) -> anyh
 }
 on_both_backends!(a_revocation_under_an_alias_cid_ends_sessions);
 
-/// [7] All-of: kv granted by one delegation and decrypt by another; revoking
+/// All-of: kv granted by one delegation and decrypt by another; revoking
 /// either ends the policy.
 async fn each_recorded_grant_is_required(backend: Backend) -> anyhow::Result<()> {
     for revoke_kv in [true, false] {
@@ -3021,7 +3090,7 @@ async fn each_recorded_grant_is_required(backend: Backend) -> anyhow::Result<()>
 }
 on_both_backends!(each_recorded_grant_is_required);
 
-/// [3] A root bound to its authority's expiry: once both pass, reads see the
+/// A root bound to its authority's expiry: once both pass, reads see the
 /// session expired and mints see the root expired.
 async fn expiry_codes_are_typed(backend: Backend) -> anyhow::Result<()> {
     let Some(h) = Harness::new(backend, Shape::KeySession, "expiry_codes_are_typed").await? else {
@@ -3046,7 +3115,7 @@ async fn expiry_codes_are_typed(backend: Backend) -> anyhow::Result<()> {
 }
 on_both_backends!(expiry_codes_are_typed);
 
-/// [O2][9] A legacy registration with no authority is denied; the operator
+/// A legacy registration with no authority is denied; the operator
 /// escape restores root-only checks and is counted.
 async fn legacy_registrations_without_authority_are_denied_unless_escaped(
     backend: Backend,
@@ -3106,7 +3175,7 @@ async fn legacy_registrations_without_authority_are_denied_unless_escaped(
 }
 on_both_backends!(legacy_registrations_without_authority_are_denied_unless_escaped);
 
-/// [9][F2] Legacy rows get liveness but no expiry cap: a legacy session
+/// Legacy rows get liveness but no expiry cap: a legacy session
 /// whose authority expired since registration still reads, and so does a
 /// legacy root longer than 31 days.
 async fn legacy_registrations_are_never_expiry_capped(backend: Backend) -> anyhow::Result<()> {
@@ -3155,7 +3224,7 @@ async fn legacy_registrations_are_never_expiry_capped(backend: Backend) -> anyho
 }
 on_both_backends!(legacy_registrations_are_never_expiry_capped);
 
-/// [O2] The escape covers legacy rows only: a post-cutover row without
+/// The escape covers legacy rows only: a post-cutover row without
 /// authority is denied with the flag on.
 async fn the_escape_never_serves_post_cutover_rows(backend: Backend) -> anyhow::Result<()> {
     let Some(mut h) = Harness::new(
@@ -3207,7 +3276,7 @@ async fn the_escape_never_serves_post_cutover_rows(backend: Backend) -> anyhow::
 }
 on_both_backends!(the_escape_never_serves_post_cutover_rows);
 
-/// [O2] An escaped legacy policy serves its admitted sessions, but a mint
+/// An escaped legacy policy serves its admitted sessions, but a mint
 /// still needs the owner to have held what the policy grants when it
 /// registered.
 async fn escaped_mints_still_check_the_owner_held_the_capability(
@@ -3252,7 +3321,7 @@ async fn escaped_mints_still_check_the_owner_held_the_capability(
 }
 on_both_backends!(escaped_mints_still_check_the_owner_held_the_capability);
 
-/// [8] An admitted session can't be imported again once its owner authority
+/// An admitted session can't be imported again once its owner authority
 /// is revoked.
 async fn admitted_sessions_are_not_reimported_after_a_revoke(
     backend: Backend,
@@ -3280,7 +3349,7 @@ async fn admitted_sessions_are_not_reimported_after_a_revoke(
 }
 on_both_backends!(admitted_sessions_are_not_reimported_after_a_revoke);
 
-/// [F3] Concurrent first uses of an unclassified policy share one
+/// Concurrent first uses of an unclassified policy share one
 /// classification.
 async fn concurrent_first_uses_share_one_classification(backend: Backend) -> anyhow::Result<()> {
     let Some(mut h) = Harness::with_boot(
@@ -3487,7 +3556,7 @@ async fn drain_stream(
         .map(Option::unwrap_or_default)
 }
 
-/// [8][C3] An open hook stream stops delivering after its grant is revoked:
+/// An open hook stream stops delivering after its grant is revoked:
 /// the next event after the re-check interval is withheld and the stream
 /// closes (with no idle re-check to close it otherwise); an idle stream
 /// closes on the idle re-check.
@@ -3549,7 +3618,7 @@ async fn hook_streams_close_after_their_grant_is_revoked(backend: Backend) -> an
 }
 on_both_backends!(hook_streams_close_after_their_grant_is_revoked);
 
-/// [C3] Re-check errors close a stream only after three in a row.
+/// Re-check errors close a stream only after three in a row.
 async fn hook_streams_close_after_repeated_check_errors(backend: Backend) -> anyhow::Result<()> {
     let Some(h) = Harness::with_boot(
         backend,
@@ -3585,7 +3654,7 @@ async fn hook_streams_close_after_repeated_check_errors(backend: Backend) -> any
 }
 on_both_backends!(hook_streams_close_after_repeated_check_errors);
 
-/// [C3] A ticket would carry more than 16 authority IDs: refused.
+/// A ticket would carry more than 16 authority IDs: refused.
 async fn hook_tickets_carry_at_most_16_authorities(backend: Backend) -> anyhow::Result<()> {
     let Some(h) = Harness::new(
         backend,
@@ -3605,7 +3674,7 @@ async fn hook_tickets_carry_at_most_16_authorities(backend: Backend) -> anyhow::
 }
 on_both_backends!(hook_tickets_carry_at_most_16_authorities);
 
-/// [F13] PostgreSQL latency gate for a policy read (the owner-authority
+/// PostgreSQL latency gate for a policy read (the owner-authority
 /// check adds one indexed revocation query per read). Ignored by default;
 /// run the same test on the baseline and candidate trees:
 ///
@@ -3723,7 +3792,7 @@ fn template_digest(policy: &Value) -> anyhow::Result<String> {
         .ok_or_else(|| anyhow::anyhow!("policy has no template digest"))
 }
 
-/// [C2] A register grant from the space owner, naming the template digest of
+/// A register grant from the space owner, naming the template digest of
 /// the policy, authorises the policy owner with no ordinary owner grant.
 async fn register_grant_authorizes_the_owner_for_its_template(
     backend: Backend,
@@ -3754,7 +3823,7 @@ async fn register_grant_authorizes_the_owner_for_its_template(
 }
 on_both_backends!(register_grant_authorizes_the_owner_for_its_template);
 
-/// [C2 rule 2] A register grant on another template digest does not
+/// A register grant on another template digest does not
 /// authorise this policy.
 async fn register_grant_must_name_this_template(backend: Backend) -> anyhow::Result<()> {
     let Some(h) = Harness::with_boot(
@@ -3784,7 +3853,7 @@ async fn register_grant_must_name_this_template(backend: Backend) -> anyhow::Res
 }
 on_both_backends!(register_grant_must_name_this_template);
 
-/// [C2 rule 5] A revoked register grant no longer authorises the policy.
+/// A revoked register grant no longer authorises the policy.
 async fn revoked_register_grant_does_not_authorize(backend: Backend) -> anyhow::Result<()> {
     let Some(h) = Harness::with_boot(
         backend,
@@ -3814,7 +3883,7 @@ async fn revoked_register_grant_does_not_authorize(backend: Backend) -> anyhow::
 }
 on_both_backends!(revoked_register_grant_does_not_authorize);
 
-/// [C2 rule 6] A root that outlives the register grant is refused in both
+/// A root that outlives the register grant is refused in both
 /// modes, because the grant cannot cover the root's lifetime.
 async fn register_grant_refuses_roots_outliving_it(h: &Harness) -> anyhow::Result<()> {
     let policy = h.build_policy(policy_window());
@@ -3859,7 +3928,7 @@ async fn register_grant_outlives_check_runs_in_both_modes(backend: Backend) -> a
 }
 on_both_backends!(register_grant_outlives_check_runs_in_both_modes);
 
-/// [C2 rule 5] The authority a register grant gives lasts until the grant
+/// The authority a register grant gives lasts until the grant
 /// expires: the policy is bound until then, and its use is refused after.
 async fn register_grant_authority_ends_with_the_grant(backend: Backend) -> anyhow::Result<()> {
     let Some(h) = Harness::with_boot(
@@ -3899,7 +3968,7 @@ async fn register_grant_authority_ends_with_the_grant(backend: Backend) -> anyho
 }
 on_both_backends!(register_grant_authority_ends_with_the_grant);
 
-/// [C2 rule 6, background] A registration whose grant is revoked is
+/// A registration whose grant is revoked is
 /// re-classified against the grant that remains. A shorter grant cannot cover
 /// the root, so the registration is unknown (outlives-authority): the answer a
 /// fresh registration gets.
@@ -3961,8 +4030,8 @@ async fn register_grant_reclassification_refuses_outliving_roots(
 }
 on_both_backends!(register_grant_reclassification_refuses_outliving_roots);
 
-/// [C2 rule 6, background, backfill] The re-classification of the
-/// reclassification test in backfill mode: the remaining grant cannot cover the
+/// The re-classification in backfill mode:
+/// the remaining grant cannot cover the
 /// root, so the stored answer is unknown (outlives-authority), never bound
 /// uncapped. Backfill has no mode-level mapping, so only the background check
 /// keeps this honest.
@@ -4012,7 +4081,7 @@ async fn register_grant_background_refuses_outliving_roots_in_backfill(
 }
 on_both_backends!(register_grant_background_refuses_outliving_roots_in_backfill);
 
-/// [C2 core guard] A delegation with parents may not carry a `tinycloud.policy/*`
+/// A delegation with parents may not carry a `tinycloud.policy/*`
 /// ability: the register grant must be a root delegation.
 async fn register_grant_must_be_parentless(backend: Backend) -> anyhow::Result<()> {
     let Some(h) = Harness::new(

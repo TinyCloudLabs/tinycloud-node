@@ -174,8 +174,8 @@ pub enum DelegationError {
     #[error("policy-descendant-fact-invalid")]
     PolicyDescendantFactInvalid,
     /// A `tinycloud.policy/*` ability is only honoured as a parentless grant
-    /// from the space owner (DESIGN-c-narrow-register Q1). Sub-delegating it
-    /// is refused so stray register rows never enter the graph.
+    /// from the space owner. A delegation with parents that carries one is
+    /// refused, so register grants are always root delegations.
     #[error("policy-register-grant-must-be-parentless")]
     PolicyAbilityRequiresNoParents,
     /// W1: child caveats are not a subset of the parent's caveats — the
@@ -382,9 +382,9 @@ async fn validate_with<C: ConnectionTrait>(
     }) {
         return Err(DelegationError::KeyDeleteNotDelegable.into());
     }
-    // DESIGN-c-narrow-register Q1: a `tinycloud.policy/*` grant is only
-    // honoured parentless, from the space owner. A child that carries one is
-    // refused here, before any parent-based authorization runs.
+    // A `tinycloud.policy/*` grant is only honoured parentless, from the
+    // space owner. A child that carries one is refused here, before any
+    // parent-based authorization runs.
     if !delegation.parents.is_empty()
         && delegation
             .capabilities
