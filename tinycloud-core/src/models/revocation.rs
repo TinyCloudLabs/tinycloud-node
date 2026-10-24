@@ -1118,4 +1118,98 @@ mod tests {
 
         assert!(!revoker_may_revoke(&db, target, "did:key:session", proof).await);
     }
+
+    async fn insert_ability<C: ConnectionTrait>(
+        db: &C,
+        delegation: Hash,
+        resource: &str,
+        ability: &str,
+    ) {
+        abilities::ActiveModel {
+            delegation: Set(delegation),
+            resource: Set(resource.parse().unwrap()),
+            ability: Set(ability.to_string().try_into().unwrap()),
+            caveats: Set(crate::types::Caveats(Default::default())),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+    }
+
+    // Valid did:key values are required: space resources parse only when the
+    // DID is real.
+    const OWNER_DID: &str = "did:key:z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK";
+    const SESSION_DID: &str = "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw";
+    const RECIPIENT_DID: &str = "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5";
+    const OTHER_DID: &str = "did:key:z6MkjHi79SMX4doJyo2w7jDTM6Fa7iX6EVZWXNbJ6RzBm3Wi";
+
+    // Space resources are `tinycloud:key:<multibase>:<name>/<service>`: the
+    // parser re-adds the `did:` prefix to the segment before the space name.
+    fn space_resource(did: &str, rest: &str) -> String {
+        format!(
+            "tinycloud:{}:default/{rest}",
+            did.trim_start_matches("did:")
+        )
+    }
+
+    // Owner O grants session S revoke authority over O's space only. S
+    // sub-delegates D whose ability lives in another space, so the proof
+    // does not cover D. The Scoped fallthrough keeps S's party authority.
+    #[tokio::test]
+    async fn delegator_revokes_when_scoped_proof_covers_another_space() {
+        let db = database().await;
+        for did in [OWNER_DID, SESSION_DID, RECIPIENT_DID] {
+            insert_actor(&db, did).await;
+        }
+        let proof = hash(b"session-revoke-proof");
+        let target = hash(b"sub-delegation");
+        insert_delegation_between(&db, proof, OWNER_DID, SESSION_DID).await;
+        insert_ability(
+            &db,
+            proof,
+            &space_resource(OWNER_DID, "delegation"),
+            "tinycloud.delegation/revoke",
+        )
+        .await;
+        insert_delegation_between(&db, target, SESSION_DID, RECIPIENT_DID).await;
+        insert_ability(
+            &db,
+            target,
+            &space_resource(RECIPIENT_DID, "kv/a"),
+            "tinycloud.kv/get",
+        )
+        .await;
+
+        assert!(revoker_may_revoke(&db, target, SESSION_DID, proof).await);
+    }
+
+    // Same uncovered scope, but the signer is not D's delegator: the proof
+    // must not confer party authority on a non-party.
+    #[tokio::test]
+    async fn non_delegator_is_refused_when_scoped_proof_covers_another_space() {
+        let db = database().await;
+        for did in [OWNER_DID, SESSION_DID, RECIPIENT_DID, OTHER_DID] {
+            insert_actor(&db, did).await;
+        }
+        let proof = hash(b"other-revoke-proof");
+        let target = hash(b"sub-delegation");
+        insert_delegation_between(&db, proof, OWNER_DID, OTHER_DID).await;
+        insert_ability(
+            &db,
+            proof,
+            &space_resource(OWNER_DID, "delegation"),
+            "tinycloud.delegation/revoke",
+        )
+        .await;
+        insert_delegation_between(&db, target, SESSION_DID, RECIPIENT_DID).await;
+        insert_ability(
+            &db,
+            target,
+            &space_resource(RECIPIENT_DID, "kv/a"),
+            "tinycloud.kv/get",
+        )
+        .await;
+
+        assert!(!revoker_may_revoke(&db, target, OTHER_DID, proof).await);
+    }
 }
