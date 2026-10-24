@@ -543,7 +543,7 @@ impl Harness {
         let network = format!("urn:tinycloud:encryption:{}:mainnet", space_owner.did());
         let client = Self::boot_app(&db, &vector, &issuer, &boot).await?;
         // Registration requires the source network to exist and to be the
-        // content owner's (TC-1423 N1b), so the harness creates it.
+        // content owner's (TC-1423), so the harness creates it.
         client
             .rocket()
             .state::<tinycloud_core::encryption_network::EncryptionService>()
@@ -1243,7 +1243,7 @@ fn legacy_boot() -> Boot {
 }
 
 // ---------------------------------------------------------------------------
-// N1: registration records the owner authority it used.
+// Registration records the owner authority it used.
 // ---------------------------------------------------------------------------
 
 async fn registration_records_the_owner_authority(backend: Backend) -> anyhow::Result<()> {
@@ -1649,7 +1649,7 @@ async fn a_general_window_full_of_skipped_rows_is_starved(backend: Backend) -> a
 on_both_backends!(a_general_window_full_of_skipped_rows_is_starved);
 
 /// Loop-back candidates ahead of the authority in the general window don't
-/// use up its tries: 40 of them (more than the 32 tries) still leave the
+/// use up its tries: 40 of them (more than the 32 tries) leave the
 /// authority reachable.
 async fn loop_back_rows_do_not_use_up_tries(backend: Backend) -> anyhow::Result<()> {
     let Some(h) = Harness::new(
@@ -1697,7 +1697,7 @@ on_both_backends!(loop_back_rows_do_not_use_up_tries);
 
 /// Delegations to the owner from holders of the space owner's authority
 /// (they pass the general window's scope) sort ahead of the space owner's
-/// own grant; the owner-first step still records that grant.
+/// own grant; the owner-first step records that grant.
 async fn owner_derived_delegations_cannot_displace_the_owner_grant(
     backend: Backend,
 ) -> anyhow::Result<()> {
@@ -1834,7 +1834,7 @@ async fn a_grant_outliving_the_root_is_preferred(backend: Backend) -> anyhow::Re
 on_both_backends!(a_grant_outliving_the_root_is_preferred);
 
 // ---------------------------------------------------------------------------
-// N1: legacy registrations are classified on first use, claim-first.
+// Legacy registrations are classified on first use, claim-first.
 // ---------------------------------------------------------------------------
 
 async fn concurrent_first_uses_store_one_classification(backend: Backend) -> anyhow::Result<()> {
@@ -1908,7 +1908,7 @@ async fn a_failed_classification_write_still_serves(backend: Backend) -> anyhow:
 }
 on_both_backends!(a_failed_classification_write_still_serves);
 
-/// A legacy registration whose original authority was revoked binds
+/// A legacy registration whose original authority is revoked binds
 /// to a live alternate; with none left it is recorded `unknown`.
 async fn legacy_classification_falls_through_to_a_live_alternate(
     backend: Backend,
@@ -2092,7 +2092,7 @@ async fn rollback_and_reupgrade_respect_the_configured_cutover(
 on_both_backends!(rollback_and_reupgrade_respect_the_configured_cutover);
 
 // ---------------------------------------------------------------------------
-// N1: listing by any closure member.
+// Listing by any closure member.
 // ---------------------------------------------------------------------------
 
 async fn listing_is_limited_to_parties_of_the_delegation(backend: Backend) -> anyhow::Result<()> {

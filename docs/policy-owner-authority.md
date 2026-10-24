@@ -202,8 +202,8 @@ legacy_cutover = "2026-10-20T00:00:00Z"  # TINYCLOUD_POLICY_V3__LEGACY_CUTOVER
 ```
 
 The node logs the effective cutover and its source (`config` or `migration`)
-at boot: at `warn` when the source is the migration and it was applied less
-than a day earlier (a fresh migration, or a re-upgrade that still needs the
+at boot: at `warn` when the source is the migration and its applied-at time is
+less than a day before boot (a fresh migration, or a re-upgrade that needs the
 override), otherwise at `info`.
 
 ## Rollback
@@ -213,7 +213,7 @@ The migration is unknown to the previous release image (1.22.0), which refuses t
 Checklist (tick each step):
 
 1. [ ] Run the three statements above on the database.
-2. [ ] If a migration released after this one was applied, delete its `seaql_migrations` row as well, as its release notes say.
+2. [ ] If a migration released after this one has been applied, delete its `seaql_migrations` row as well, as its release notes say.
 3. [ ] Deploy 1.22.0 and check that the node boots.
 4. [ ] Before the re-upgrade starts, set `policy_v3.legacy_cutover` (`TINYCLOUD_POLICY_V3__LEGACY_CUTOVER`) to this release's first deploy time, as an RFC 3339 UTC timestamp. This is the time of the first deploy of this release, not the time of the re-upgrade.
 5. [ ] After the re-upgrade, check that the boot log shows the effective cutover with source `config` and the value from step 4.
