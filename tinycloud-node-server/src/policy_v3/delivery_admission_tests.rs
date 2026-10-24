@@ -257,3 +257,28 @@ fn both_admission_vectors_pass_the_request_expiry_format_as_requests() {
         );
     }
 }
+
+#[test]
+fn the_request_expiry_is_after_now_and_at_most_five_minutes_ahead() {
+    use crate::delivery_link::test_support::millis;
+    // The clock is injected: `now` is a parameter of the check.
+    let now = parse_time("2026-10-24T12:00:00Z").unwrap();
+    let accepts = |offset: Duration| delivery_request_expiry(&millis(now + offset), now).is_some();
+
+    assert!(accepts(Duration::minutes(5) - Duration::seconds(1)));
+    // The bound is inclusive, and one millisecond past it is refused.
+    assert!(accepts(Duration::minutes(5)));
+    assert!(!accepts(Duration::minutes(5) + Duration::milliseconds(1)));
+    assert!(!accepts(Duration::minutes(5) + Duration::seconds(1)));
+    assert!(!accepts(Duration::hours(1)));
+    // The lower end: `now` itself and the past are refused.
+    assert!(accepts(Duration::milliseconds(1)));
+    assert!(!accepts(Duration::ZERO));
+    assert!(!accepts(-Duration::seconds(1)));
+    // The window is read from the parsed instant of an exact-form string.
+    assert_eq!(
+        delivery_request_expiry("2026-10-24T12:04:59.999Z", now),
+        Some(now + Duration::minutes(5) - Duration::milliseconds(1))
+    );
+    assert_eq!(delivery_request_expiry("2026-10-24T12:03:00Z", now), None);
+}

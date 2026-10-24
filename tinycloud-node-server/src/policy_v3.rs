@@ -1067,6 +1067,15 @@ fn is_canonical_delivery_domain(value: &str) -> bool {
             .is_some_and(|tld| tld.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
+/// The delivery request's `expiresAt`: exactly `YYYY-MM-DDTHH:mm:ss.SSSZ`
+/// (UTC, three fractional digits; the string is signed into the admission and
+/// echoed as sent, so one instant has one spelling), after `now` and at most
+/// five minutes after it. The window applies to the parsed instant.
+fn delivery_request_expiry(expires_at: &str, now: OffsetDateTime) -> Option<OffsetDateTime> {
+    let expires = utc_millis(expires_at)?;
+    (expires > now && expires <= now + Duration::minutes(5)).then_some(expires)
+}
+
 fn v3_registration_is_live(
     registration: &policy_v3_registration::Model,
     now: OffsetDateTime,
@@ -1457,14 +1466,7 @@ pub async fn authorize_delivery(
     if !v3_registration_is_live(&registration, now) {
         return Err((Status::Forbidden, "delivery-authorization-invalid".into()));
     }
-    // The request's `expiresAt` is exactly `YYYY-MM-DDTHH:mm:ss.SSSZ` (UTC,
-    // three fractional digits): the string is signed into the admission and
-    // echoed as sent, so one instant has one spelling. The window below
-    // applies to the parsed instant.
-    let expires = utc_millis(&request.expires_at).ok_or_else(invalid)?;
-    if expires <= now || expires > now + Duration::minutes(5) {
-        return Err(invalid());
-    }
+    delivery_request_expiry(&request.expires_at, now).ok_or_else(invalid)?;
     let (envelope, _, actions) =
         v3_envelope_delivery_projection(&envelope_value, &registration, delivery, &request)
             .map_err(|_| (Status::Forbidden, "delivery-authorization-invalid".into()))?;
@@ -8815,6 +8817,45 @@ mod tests {
             .await?;
         }
 
+        // The plaintext must be the envelope's canonical JSON: a record whose
+        // plaintext spells the same envelope with whitespace, with a repeated
+        // key, or with its keys reordered is refused.
+        let canonical = String::from_utf8(plaintext.clone())?;
+        let reordered = {
+            let mut object: Vec<_> = ctx
+                .envelope
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(key, value)| format!("{}:{}", json!(key), value))
+                .collect();
+            object.reverse();
+            format!("{{{}}}", object.join(","))
+        };
+        for (n, (label, text)) in [
+            ("whitespace", serde_json::to_string_pretty(ctx.envelope)?),
+            (
+                "repeated key",
+                canonical.replacen('{', r#"{"version":3,"#, 1),
+            ),
+            ("reordered keys", reordered),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_ne!(text, canonical, "{label} differs from the canonical text");
+            let built = ts::build(text.as_bytes(), ctx.owner_key, ctx.link_expires);
+            ctx.links.put(&link_id(11 + n), &built);
+            ctx.deliver(
+                20 + n as u8,
+                label,
+                at_link(&link_id(11 + n)),
+                invalid,
+                &mut bodies,
+            )
+            .await?;
+        }
+
         // A body in the retired shape is refused as a whole.
         let old_shape = json!({
             "envelope": {},
@@ -9760,6 +9801,11 @@ mod tests {
             delivery_receipt["admission"]["returnLink"],
             delivery_request.share_url
         );
+        // `envelopeRef` is the link's `c`, in the admission and in the
+        // invitation request the sender forwards.
+        let link_cid = delivery_request.share_url.rsplit("&c=").next().unwrap();
+        assert_eq!(delivery_receipt["admission"]["envelopeRef"], link_cid);
+        assert_eq!(delivery_receipt["request"]["envelopeRef"], link_cid);
         assert_eq!(
             delivery_receipt["admission"]["audience"],
             "https://witness.credentials.org"
@@ -9800,6 +9846,11 @@ mod tests {
             delivery_request.request_body_digest
         );
         assert_eq!(persisted_replay.binding_json["senderKeyDid"], holder_did);
+        // `shareCid` in the stored binding is the link's `c`.
+        assert_eq!(
+            persisted_replay.binding_json["shareCid"],
+            delivery_request.share_url.rsplit("&c=").next().unwrap()
+        );
         let persisted_binding = persisted_replay.binding_json.to_string();
         assert!(!persisted_binding.contains("alice@example.test"));
         assert!(!persisted_binding.contains(&envelope_key));

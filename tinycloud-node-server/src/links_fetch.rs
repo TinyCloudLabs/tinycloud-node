@@ -14,7 +14,11 @@ use std::{net::IpAddr, sync::Arc, time::Duration};
 /// `MAX_LINK_BODY_BYTES` (contract §3): the one limit on a sealed body, 64 KiB,
 /// the same for every link type.
 pub const MAX_LINK_BODY_BYTES: usize = 65_536;
-/// The `X-Link-Record` header cap.
+/// The `X-Link-Record` header cap. It is checked after the response headers
+/// have arrived, not while they stream: reqwest 0.11 has no response-header
+/// size setting, so the bound on the header block while it streams is hyper's
+/// own header limit, and the one deadline bounds the time. The body cap, in
+/// contrast, is enforced chunk by chunk while the body streams.
 pub const MAX_LINK_RECORD_HEADER_BYTES: usize = 2_048;
 /// One deadline for connecting, the response headers and the whole body.
 pub const LINK_TOTAL_TIMEOUT: Duration = Duration::from_secs(5);

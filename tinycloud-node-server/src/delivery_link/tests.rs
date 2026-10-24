@@ -653,3 +653,85 @@ fn a_sealed_body_of_exactly_the_limit_opens_and_one_byte_more_does_not() {
     assert_eq!(over.sealed.len(), MAX_LINK_BODY_BYTES + 1);
     assert_eq!(open(&over).unwrap_err(), LinkRefusal::SizeMismatch);
 }
+
+#[test]
+fn a_non_canonical_spelling_of_a_low_y_point_is_not_an_accepted_key() {
+    use ed25519_dalek::VerifyingKey;
+    // `y < 19` has a second spelling `y + p` below 2^255, with p = 2^255 - 19
+    // (little-endian: 0xed, 0xff x 30, 0x7f). dalek decompresses both.
+    let canonical = |y: u8| {
+        let mut bytes = [0_u8; 32];
+        bytes[0] = y;
+        bytes
+    };
+    let spelled_with_p = |y: u8| {
+        let mut bytes = [0xff_u8; 32];
+        bytes[0] = 0xed + y;
+        bytes[31] = 0x7f;
+        bytes
+    };
+    let mut on_curve = vec![];
+    for y in 3..=18_u8 {
+        let Ok(key) = VerifyingKey::from_bytes(&canonical(y)) else {
+            continue;
+        };
+        // Both spellings are the same point, and it is not a small-order one:
+        // a weak-key check alone would keep it.
+        let other =
+            VerifyingKey::from_bytes(&spelled_with_p(y)).expect("the p + y spelling decompresses");
+        assert_eq!(key.to_edwards(), other.to_edwards(), "y = {y}");
+        assert!(!key.is_weak(), "y = {y}");
+        assert!(!is_canonical_prime_order(&spelled_with_p(y)), "p + {y}");
+        assert!(!is_canonical_prime_order(&canonical(y)), "{y}");
+        on_curve.push(y);
+    }
+    // y = 3 is one of them, so the loop is not vacuous.
+    assert!(on_curve.contains(&3), "{on_curve:?}");
+    // None of these low-y points has order exactly the group order, so for
+    // them the torsion check and the canonical-spelling check agree; the
+    // spelling check is the one that also covers a prime-order point if one
+    // is ever spelled this way.
+    // A signature under such a key is refused as a whole.
+    let signature = [0x42_u8; 64];
+    assert!(!verify_strict_prime_order(
+        &spelled_with_p(3),
+        b"m",
+        &signature
+    ));
+}
+
+#[test]
+fn a_key_with_a_torsion_component_is_refused_though_it_is_not_a_weak_key() {
+    use ed25519_dalek::VerifyingKey;
+    let signer = ed25519::Keypair::generate();
+    let key_bytes: [u8; 32] = signer.public().to_bytes();
+    let key = VerifyingKey::from_bytes(&key_bytes).unwrap();
+    assert!(
+        is_canonical_prime_order(&key_bytes),
+        "an ordinary key is accepted"
+    );
+
+    // T2, the point of order two: (0, -1), y = p - 1.
+    let mut order_two = [0xff_u8; 32];
+    order_two[0] = 0xec;
+    order_two[31] = 0x7f;
+    let t2 = VerifyingKey::from_bytes(&order_two).unwrap();
+    assert!(t2.is_weak());
+
+    // A + T2 has order 2 * l: it is canonical and not small-order, and only
+    // the torsion check refuses it.
+    let mixed = VerifyingKey::from(key.to_edwards() + t2.to_edwards());
+    assert!(!mixed.is_weak());
+    assert_eq!(
+        mixed.to_edwards().compress().to_bytes(),
+        mixed.to_bytes(),
+        "the sum is spelled canonically"
+    );
+    assert!(!mixed.to_edwards().is_torsion_free());
+    assert!(!is_canonical_prime_order(&mixed.to_bytes()));
+    assert!(!verify_strict_prime_order(
+        &mixed.to_bytes(),
+        b"m",
+        &[0x42; 64]
+    ));
+}

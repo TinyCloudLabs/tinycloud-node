@@ -401,6 +401,17 @@ fn did_key_ed25519(did: &str) -> Option<[u8; 32]> {
     <[u8; 32]>::try_from(&bytes[2..]).ok()
 }
 
+/// An Ed25519 point encoding the links contract accepts for `A` and for `R`:
+/// it decompresses, it is the canonical spelling (`y < p`, and `x = 0` with a
+/// clear sign bit), and the point has order exactly ℓ: not the identity, not a
+/// small-order point, no torsion component.
+pub(crate) fn is_canonical_prime_order(encoded: &[u8; 32]) -> bool {
+    ed25519_dalek::VerifyingKey::from_bytes(encoded).is_ok_and(|key| {
+        let point = key.to_edwards();
+        point.compress().to_bytes() == *encoded && !key.is_weak() && point.is_torsion_free()
+    })
+}
+
 /// RFC 8032 strict verification plus the prime-order rule of the links
 /// contract: `S < ℓ`; the encodings of `A` and `R` are canonical; `A` and `R`
 /// each have order exactly ℓ (not the identity, not a small-order point, no
@@ -410,14 +421,8 @@ pub(crate) fn verify_strict_prime_order(
     message: &[u8],
     signature: &[u8; 64],
 ) -> bool {
-    let prime_order = |encoded: &[u8; 32]| {
-        ed25519_dalek::VerifyingKey::from_bytes(encoded).is_ok_and(|key| {
-            let point = key.to_edwards();
-            point.compress().to_bytes() == *encoded && !key.is_weak() && point.is_torsion_free()
-        })
-    };
     let r: [u8; 32] = signature[..32].try_into().expect("32 bytes");
-    if !prime_order(public_key) || !prime_order(&r) {
+    if !is_canonical_prime_order(public_key) || !is_canonical_prime_order(&r) {
         return false;
     }
     let Ok(key) = ed25519_dalek::VerifyingKey::from_bytes(public_key) else {
