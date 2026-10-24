@@ -125,28 +125,40 @@ whose only resource is that ReCap, whose `uri` is
 `Delete the TinyCloud key <key URN>.` (one key), then a space and the ReCap
 text. The URL network and the body `keyPath` must name the ReCap URN.
 
-Both credentials last at most 300 seconds (`exp - iat`; a UCAN has no `iat`, so
-`exp - now`), with `iat` and `nbf` at most 30 seconds ahead. The `(owner,
-nonce)` pair is consumed before the keys are touched, so a delete that fails
-after verification still uses up the signature; it is kept until 30 seconds
-after `exp`. Credential refusals answer 403 `owner_only`.
+Both credentials last at most 300 seconds. A SIWE credential measures
+`exp - iat`, with `iat` and `nbf` at most 30 seconds ahead. A UCAN has no `iat`,
+so it must carry `nbf` (the time it was signed): `nbf` at most 30 seconds
+ahead, `now < exp` and `exp - nbf` at most 300 seconds. The `(owner, nonce)`
+pair is consumed before the keys are touched, so a delete that fails after
+verification still uses up the signature; it is kept until 30 seconds after
+`exp`, and pairs past that are removed. Credential refusals answer 403
+`owner_only`.
 
 ### Deletion ledger
 
 `[global.encryption_network] deletion_ledger_path` names an append-only file
-outside the database; it is required while `named_keys_v1` is on. One JSON line
-per deleted key: `{ "networkId", "keyPath", "keyVersion", "deletedAt" }`. The
-lines of a delete are written and fsynced after its database changes and before
-the transaction commits, so the ledger holds at least every committed delete. If
-the ledger cannot be written the delete is rolled back and answers 500
-`deletion_ledger_unavailable`.
+outside the database; it is required while `named_keys_v1` is on. The file is
+created with mode 0600 and is never rotated. One JSON line per delete
+operation: `{ "op", "networkId", "keys": [{ "keyPath", "keyVersion" }],
+"deletedAt" }`, where `op` is the CID of the owner's credential. The line is
+written and fsynced after the delete's database changes and before the
+transaction commits. After the commit the node appends `{"committed": <op>}`;
+if the commit fails it appends `{"aborted": <op>}` before answering. If the
+ledger cannot be written, or the file was renamed or removed, the delete is
+rolled back and answers 500 `deletion_ledger_unavailable`.
+
+At every start, before any route is served, the node settles each operation
+that has neither line: it is committed when every key is `deleted` at that key
+version (or at a later one), otherwise aborted.
 
 After restoring a database, before starting the node, run
 `tinycloud node deletion-ledger replay [--config <file>] [--ledger <file>]`. It
-sets every listed key to `deleted` with no seed (a row with a newer
-`keyVersion` than the line is left alone), applies each line once, and exits
-non-zero after applying the valid lines if the file has lines that are not
-entries.
+sets every key of every committed or still-open operation to `deleted` with no
+seed. It skips aborted operations, rows that are not deletable keys, rows with
+a newer `keyVersion`, and entries whose network or key path is not valid
+(reported as `refused`; the command then exits non-zero after applying the rest).
+A final line that is not a whole record is reported as `tornTail`; a malformed
+line anywhere else stops the replay. Replay is idempotent.
 
 ## Startup check
 
