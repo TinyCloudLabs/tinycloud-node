@@ -9898,6 +9898,7 @@ dependencies = [
  "hmac 0.12.1",
  "iri-string",
  "k256",
+ "libc",
  "libp2p",
  "multihash-derive 0.9.1",
  "pin-project",
