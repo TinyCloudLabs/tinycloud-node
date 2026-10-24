@@ -64,8 +64,7 @@ fn held_row(profile: &str) -> Option<&'static HeldRow> {
 }
 
 /// Whether the held-profile row for `profile` permits `issuer_did`. `None`
-/// when no held row exists for `profile`, which leaves legacy profiles
-/// unchanged.
+/// when no held row exists for `profile`; such profiles are not row-checked.
 fn held_row_permits(profile: &str, issuer_did: &str) -> Option<bool> {
     let permitted = held_row(profile)?.permitted;
     Some(match permitted {
