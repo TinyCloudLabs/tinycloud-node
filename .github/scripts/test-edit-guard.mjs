@@ -11,18 +11,34 @@
 // included. Deleting an existing test file counts as an edit. A renamed test
 // file is a delete plus an add, so it counts too (diffs run with --no-renames).
 //
+// Guard files: any change to the guard's own files (GUARD_FILES below: this
+// script and its workflow), including pure additions, needs the same
+// `test-ruling:` line. Without it a PR could weaken the guard in the same
+// change that edits tests. Limit: the guard runs from the PR's own copy, so a
+// PR that rewrites it can still make itself pass; the ruling line makes that
+// edit explicit, it does not make it impossible.
+//
+// Known limitation: git quotes paths containing a tab, quote or backslash in the
+// `diff --git` header and this script does not unquote them, so such a file may
+// not be classified correctly. No such paths exist in this repo today.
+//
 // Test files in this repo (CONFIG.testPatterns below; the only part of this
 // script that differs between repos):
 //   *.test.* / *.spec.* for js, jsx, ts, tsx, mjs, cjs
-//   anything under a tests/, test/ or __tests__/ directory
+//   anything under a tests/, test/ or __tests__/ directory (helpers, scripts and fixtures included)
+//   fixture and test-data directories: test-fixtures/, fixtures/, __fixtures__/, testdata/, test-support/
+//   test helper scripts: test-*.sh, test_*.py (and test-*.py, test_*.sh)
+//   *_test.sh / *_test.py
 //   tests.rs (the file behind `#[cfg(test)] mod tests;`)
 //   *_test.rs / *_tests.rs
+//   test_*.rs helpers (test_support.rs, test_harness.rs)
 //
 // Rust: a file that is not a test file but contains a `#[cfg(test)]` (or
 // `#![cfg(test)]`) line is only counted for removed lines at or after the FIRST
 // such line in the merge-base version of the file. This is deliberately cheap
 // (no brace matching): code after a `#[cfg(test)]` that is not the test module
 // is over-counted, and edits before the first `#[cfg(test)]` are never counted.
+//
 // Usage (CI): BASE_REF=main HEAD_SHA=<sha> PR_BODY="$body" node test-edit-guard.mjs
 //   HEAD_SHA defaults to HEAD. Needs a full-history checkout with origin/$BASE_REF.
 // Self-test: node test-edit-guard.mjs --self-test   (fixture diffs, no git, no files)
@@ -36,8 +52,12 @@ const CONFIG = {
   testPatterns: [
     /\.(test|spec)\.[cm]?[jt]sx?$/,
     /(^|\/)(__tests__|tests?)\//,
+    /(^|\/)(test-fixtures|fixtures|__fixtures__|testdata|test-support)\//,
+    /(^|\/)test[-_][^/]*\.(sh|py)$/,
+    /_test\.(sh|py)$/,
     /(^|\/)tests\.rs$/,
     /_tests?\.rs$/,
+    /(^|\/)test_[^/]*\.rs$/,
   ],
   rustCfgTest: true,
   // Self-test only: paths that must / must not be classified as test files.
@@ -47,13 +67,21 @@ const CONFIG = {
       "tinycloud-core/tests/fixtures/x.json",
       "test/probe/run.mjs",
       "scripts/tc959-docker.test.mjs",
-      "tinycloud-node-server/src/policy_v3/tests.rs"
+      "tinycloud-node-server/src/policy_v3/tests.rs",
+      "tinycloud-core/src/test_harness.rs",
+      "x/test-fixtures/golden.json",
+      "pkg/fixtures/a.ts",
+      "pkg/__fixtures__/b.json",
+      "pkg/testdata/c.txt",
+      "scripts/ci/test-redact.sh",
+      "mobile/scripts/test_fixtures.py"
     ],
     notTest: [
       "tinycloud-core/src/lib.rs",
       "scripts/tc959-docker.mjs",
+      "tinycloud-core/src/latest.rs",
       ".github/scripts/test-edit-guard.mjs",
-      "tinycloud-core/src/latest.rs"
+      "docs/testing.md"
     ],
   },
 };
@@ -62,11 +90,13 @@ const RULING_RE = /^test-ruling: TC-[0-9]+/im;
 const RULING_LINE = "test-ruling: TC-<N>";
 const GIT_TIMEOUT_MS = 60_000;
 
+const GUARD_FILES = [".github/scripts/test-edit-guard.mjs", ".github/workflows/test-edit-guard.yml"];
+
 export function hasRuling(body) {
   return RULING_RE.test(body ?? "");
 }
 
-// Parse `git diff -U0` output into [{ path, deleted, binary, removed: [oldLineNo] }].
+// Parse `git diff -U0` output into [{ path, deleted, binary, added, removed: [oldLineNo] }].
 export function parseDiff(text) {
   const files = [];
   let cur = null;
@@ -77,7 +107,7 @@ export function parseDiff(text) {
     if (oldLeft > 0 || newLeft > 0) {
       const c = line[0];
       if (c === "-") { cur.removed.push(oldNo++); oldLeft--; continue; }
-      if (c === "+") { newLeft--; continue; }
+      if (c === "+") { cur.added++; newLeft--; continue; }
       if (c === " ") { oldNo++; oldLeft--; newLeft--; continue; }
       if (c === "\\") continue;
       oldLeft = newLeft = 0; // malformed hunk: resync on headers
@@ -85,10 +115,12 @@ export function parseDiff(text) {
     if (line.startsWith("diff --git ")) {
       // Both sides share one path because renames are disabled: "a/P b/P".
       const rest = line.slice("diff --git a/".length);
-      cur = { path: rest.slice(0, (rest.length - 3) / 2), deleted: false, binary: false, removed: [] };
+      cur = { path: rest.slice(0, (rest.length - 3) / 2), deleted: false, created: false, binary: false, added: 0, removed: [] };
       files.push(cur);
     } else if (!cur) {
       continue;
+    } else if (line.startsWith("new file mode")) {
+      cur.created = true;
     } else if (line.startsWith("deleted file mode")) {
       cur.deleted = true;
     } else if (line.startsWith("Binary files ")) {
@@ -110,12 +142,17 @@ function firstCfgTestLine(source) {
   return idx < 0 ? 0 : idx + 1;
 }
 
-// Returns [{ path, removed, deleted }] for edited existing test files.
+// Returns [{ path, removed, deleted }] for edited existing test files, plus
+// [{ path, removed, deleted, guard: true }] for any changed guard file.
 export function findEdits(files, config, readBase) {
   const isTest = (p) => config.testPatterns.some((re) => re.test(p));
   const hits = [];
   for (const f of files) {
-    if (isTest(f.path)) {
+    if (GUARD_FILES.includes(f.path)) {
+      if (!f.created && (f.removed.length > 0 || f.added > 0 || f.deleted || f.binary)) {
+        hits.push({ path: f.path, removed: f.removed.length, deleted: f.deleted, guard: true });
+      }
+    } else if (isTest(f.path)) {
       const removed = f.removed.length + (f.binary ? 1 : 0);
       if (removed > 0 || f.deleted) hits.push({ path: f.path, removed, deleted: f.deleted });
     } else if (config.rustCfgTest && f.path.endsWith(".rs") && f.removed.length > 0) {
@@ -131,7 +168,7 @@ export function check({ diffText, body, config, readBase }) {
   const hits = findEdits(parseDiff(diffText), config, readBase);
   if (hits.length === 0) return { pass: true, hits, report: "test-edit-guard: no existing test lines removed or changed." };
   const list = hits
-    .map((h) => `  ${h.path}: ${h.removed} removed line(s)${h.deleted ? " (file deleted)" : ""}`)
+    .map((h) => `  ${h.path}: ${h.removed} removed line(s)${h.deleted ? " (file deleted)" : ""}${h.guard ? " (guard file: any change needs a ruling)" : ""}`)
     .join("\n");
   if (hasRuling(body)) {
     return { pass: true, hits, report: `test-edit-guard: existing tests edited, PR body names a ruling.\n${list}` };
@@ -201,6 +238,11 @@ function selfTest() {
     rustInCfgTest: `${hdr("src/lib.rs")}@@ -12 +12 @@\n-    assert_eq!(a, 1);\n+    assert_eq!(a, 2);\n`,
     rustBeforeCfgTest: `${hdr("src/lib.rs")}@@ -2 +2 @@\n-fn a() {}\n+fn b() {}\n`,
     rustNoCfgTest: `${hdr("src/other.rs")}@@ -12 +12 @@\n-x\n+y\n`,
+    guardScriptEdit: `${hdr(GUARD_FILES[0])}@@ -40 +40 @@\n-const GIT_TIMEOUT_MS = 60_000;\n+const GIT_TIMEOUT_MS = 600_000;\n`,
+    guardScriptAddition: `${hdr(GUARD_FILES[0])}@@ -10,0 +11 @@\n+process.exit(0);\n`,
+    guardWorkflowEdit: `${hdr(GUARD_FILES[1])}@@ -5 +5 @@\n-    timeout-minutes: 10\n+    timeout-minutes: 99\n`,
+    guardScriptDeleted: `diff --git a/${GUARD_FILES[0]} b/${GUARD_FILES[0]}\ndeleted file mode 100644\nindex 111..000\n--- a/${GUARD_FILES[0]}\n+++ /dev/null\n@@ -1 +0,0 @@\n-x\n`,
+    guardFileNew: `diff --git a/${GUARD_FILES[0]} b/${GUARD_FILES[0]}\nnew file mode 100644\nindex 000..222\n--- /dev/null\n+++ b/${GUARD_FILES[0]}\n@@ -0,0 +1 @@\n+x\n`,
   };
   const rustSrc = "fn a() {}\n\n".concat("x\n".repeat(7), "#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() {\n        assert_eq!(a, 1);\n    }\n}\n");
   const readBase = (p) => (p === "src/lib.rs" ? rustSrc : "fn x() {}\n");
@@ -266,6 +308,17 @@ function selfTest() {
     const r = check({ diffText: diffs.rustInCfgTest, body: "", config: { ...cfg, rustCfgTest: false }, readBase });
     assert.equal(r.pass, true);
   });
+  t("edit to the guard script without a ruling fails", () => {
+    const r = run(diffs.guardScriptEdit, "");
+    assert.equal(r.pass, false);
+    assert.deepEqual(r.hits, [{ path: GUARD_FILES[0], removed: 1, deleted: false, guard: true }]);
+    assert.match(r.report, /guard file/);
+  });
+  t("pure addition to the guard script without a ruling fails", () => assert.equal(run(diffs.guardScriptAddition, "").pass, false));
+  t("edit to the guard workflow without a ruling fails", () => assert.equal(run(diffs.guardWorkflowEdit, "").pass, false));
+  t("deleting the guard script without a ruling fails", () => assert.equal(run(diffs.guardScriptDeleted, "").pass, false));
+  t("guard script edit + test-ruling: TC-123 passes", () => assert.equal(run(diffs.guardScriptEdit, RULED).pass, true));
+  t("adding the guard files in the first PR passes", () => assert.equal(run(diffs.guardFileNew, "").pass, true));
   for (const p of CONFIG.examples.test) {
     t(`repo pattern: ${p} is a test file`, () => assert.ok(CONFIG.testPatterns.some((re) => re.test(p))));
   }
