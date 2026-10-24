@@ -366,32 +366,29 @@ fn delete_prefix_follows_the_shared_vectors() {
     struct Vectors {
         #[serde(rename = "appIdValid")]
         app_ids: Vec<AppId>,
-        #[serde(rename = "deletePrefix")]
-        delete_prefix: Vec<DeletePrefix>,
     }
     #[derive(serde::Deserialize)]
     struct AppId {
         id: String,
         valid: bool,
     }
-    #[derive(serde::Deserialize)]
-    struct DeletePrefix {
-        prefix: String,
-        accepted: bool,
-    }
-    let vectors: Vectors =
-        serde_json::from_str(include_str!("../../tests/fixtures/app-id-vectors.json")).unwrap();
+    let vectors: Vectors = serde_json::from_str(include_str!(
+        "../../tests/fixtures/encryption/app-key-vectors.json"
+    ))
+    .unwrap();
     let network = pkh_network(&Wallet::new(1));
-    for case in vectors.delete_prefix {
-        // A path without a trailing slash is a key delete, not a prefix one.
-        if !case.prefix.ends_with('/') {
-            continue;
-        }
+    // The shared `deletePrefix` vectors that end in a slash; a path without
+    // one is a key delete, not a prefix delete.
+    for (prefix, accepted) in [
+        ("apps/foo/", true),
+        ("apps/", false),
+        ("apps/foo/x/", false),
+        ("secrets/", false),
+    ] {
         assert_eq!(
-            DeleteTarget::parse(&network, &case.prefix).is_ok(),
-            case.accepted,
-            "{:?}",
-            case.prefix
+            DeleteTarget::parse(&network, prefix).is_ok(),
+            accepted,
+            "{prefix:?}"
         );
     }
     for case in vectors.app_ids {

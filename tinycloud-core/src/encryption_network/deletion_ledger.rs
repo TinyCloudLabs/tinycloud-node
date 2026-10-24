@@ -117,6 +117,15 @@ impl DeletionLedger {
         })
     }
 
+    /// A ledger over an already opened file, to exercise write failures.
+    #[cfg(test)]
+    pub(super) fn from_file(path: &Path, file: File) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            file: Mutex::new(file),
+        }
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }

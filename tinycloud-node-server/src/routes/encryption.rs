@@ -11,7 +11,9 @@
 //! - `GET  /encryption/networks/<network_id>/keys/<key_path..>`   — public key read (no auth)
 //! - `POST /encryption/networks/<network_id>/key-actions/block`   — block a key (`key-admin/v1`)
 //! - `POST /encryption/networks/<network_id>/key-actions/unblock` — unblock a key (`key-admin/v1`)
+//! - `POST /encryption/networks/<network_id>/key-actions/delete`  — delete a key or every key under `apps/<app id>/` (owner-signed)
 
+use rocket::request::{FromRequest, Outcome, Request};
 use rocket::{
     form::FromForm,
     http::{
@@ -27,6 +29,7 @@ use std::{collections::HashMap, path::PathBuf, time::Instant};
 use super::public::{ClientIp, RateLimiter};
 use crate::{authorization::AuthHeaderGetter, BlockStage, TinyCloud};
 use tinycloud_core::encryption_network::{
+    delete_auth::DeleteTarget,
     key_id::KeyLocation,
     keys::{KeyDescriptor, KeyPublic},
     CreateNetworkRequest, DecryptResponseBody, EncryptionService, EncryptionServiceError,
@@ -587,6 +590,81 @@ pub async fn unblock_encryption_key(
     Ok(Json(descriptor.into()))
 }
 
+/// The raw `Authorization` header. The delete route verifies the owner's
+/// credential itself, so it takes the header as sent.
+pub struct RawAuthorization(String);
+
+#[rocket::async_trait]
+impl<'r> FromRequest<'r> for RawAuthorization {
+    type Error = ();
+    async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
+        match request.headers().get_one("Authorization") {
+            Some(value) => Outcome::Success(Self(value.to_string())),
+            None => Outcome::Error((Status::Unauthorized, ())),
+        }
+    }
+}
+
+/// The keys an owner-signed delete touched.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyDeleteView {
+    key_path: String,
+    state: &'static str,
+    deleted: Vec<String>,
+    already_deleted: Vec<String>,
+    count: usize,
+}
+
+/// Deletes one key (`keyPath` without a trailing `/`) or every key under
+/// `apps/<app id>/` (`keyPath` with one). The caller is the network owner and
+/// signs the request itself: a UCAN invocation for a `did:key` owner, a SIWE
+/// CACAO for a `did:pkh` owner. Neither is stored as a delegation.
+#[post(
+    "/encryption/networks/<network_id>/key-actions/delete",
+    format = "json",
+    data = "<body>"
+)]
+pub async fn delete_encryption_key(
+    network_id: &str,
+    authorization: RawAuthorization,
+    body: Json<serde_json::Value>,
+    service: &State<EncryptionService>,
+) -> Result<Json<KeyDeleteView>, (Status, String)> {
+    let body_value = body.into_inner();
+    let body: KeyPathBody = serde_json::from_value(body_value.clone()).map_err(|err| {
+        (
+            Status::BadRequest,
+            format!("request body is malformed: {err}"),
+        )
+    })?;
+    let network = network_id
+        .parse::<NetworkId>()
+        .map_err(|err| (Status::BadRequest, err.to_string()))?;
+    if network.to_string() != network_id {
+        return Err((
+            Status::BadRequest,
+            "network id is not in canonical form".to_string(),
+        ));
+    }
+    let target = DeleteTarget::parse(&network, &body.key_path).map_err(map_key_service_err)?;
+    let verified = service
+        .authorize_owner_delete(&authorization.0, &network, &target, &body_value)
+        .await
+        .map_err(map_key_service_err)?;
+    let outcome = service
+        .delete_keys(&network, &target, &verified)
+        .await
+        .map_err(map_key_service_err)?;
+    Ok(Json(KeyDeleteView {
+        key_path: outcome.key_path,
+        state: "deleted",
+        count: outcome.deleted.len(),
+        deleted: outcome.deleted,
+        already_deleted: outcome.already_deleted,
+    }))
+}
+
 async fn verify_auth(
     span: &'static str,
     invocation: Invocation,
@@ -664,15 +742,16 @@ fn map_service_err(err: EncryptionServiceError) -> (Status, String) {
         | EncryptionServiceError::HashMismatch(_) => Status::Unauthorized,
         EncryptionServiceError::NetworkNotActive(_) => Status::Conflict,
         EncryptionServiceError::KeyExists => Status::Conflict,
+        EncryptionServiceError::KeyNotDeletable => Status::Conflict,
         EncryptionServiceError::KeyNotFound => Status::NotFound,
-        EncryptionServiceError::DeletableUnavailable
+        EncryptionServiceError::KeyDeleted
         | EncryptionServiceError::KeyBlocked
         | EncryptionServiceError::KeyLimitExceeded
         | EncryptionServiceError::KeyUnwrapFailed(_)
         | EncryptionServiceError::OwnerOnly(_) => Status::Forbidden,
-        EncryptionServiceError::CorruptKeyRow | EncryptionServiceError::DeletionLedger(_) => {
-            Status::InternalServerError
-        }
+        EncryptionServiceError::CorruptKeyRow
+        | EncryptionServiceError::StrayAppKeyRows(_)
+        | EncryptionServiceError::DeletionLedger(_) => Status::InternalServerError,
         EncryptionServiceError::KeyPathInvalid(_) => Status::BadRequest,
         EncryptionServiceError::InvalidBody(_)
         | EncryptionServiceError::InvalidReceiverPublicKey

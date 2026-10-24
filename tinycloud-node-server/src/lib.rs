@@ -257,7 +257,7 @@ use routes::{
     create_signed_kv_url, delegate, delegation_query, delegation_status,
     encryption::{
         block_encryption_key, create_encryption_key, create_network as create_encryption_network,
-        decrypt as encryption_decrypt, describe_encryption_key,
+        decrypt as encryption_decrypt, delete_encryption_key, describe_encryption_key,
         get_network as get_encryption_network, public_encryption_key,
         revoke_network as revoke_encryption_network, unblock_encryption_key,
         well_known_network as encryption_well_known,
@@ -593,6 +593,7 @@ fn named_key_routes() -> Vec<Route> {
         public_encryption_key,
         block_encryption_key,
         unblock_encryption_key,
+        delete_encryption_key,
     ]
 }
 
@@ -841,6 +842,9 @@ pub async fn app_with_control(
     let encryption_service = encryption_service
         .with_sqlite_writer_lock(tinycloud.sqlite_writer_lock())
         .with_deletion_ledger(deletion_ledger);
+    // Runs after the migrations: a key row under `apps/` that is not a
+    // deletable key stops the node from starting.
+    tinycloud_core::encryption_network::keys::ensure_no_deterministic_app_keys(&seed_conn).await?;
     let database_artifact_repository: Arc<dyn DatabaseArtifactRepository> =
         Arc::new(SizeTrackingArtifactRepository::new(
             Arc::new(node_artifact_repository(&tinycloud)),

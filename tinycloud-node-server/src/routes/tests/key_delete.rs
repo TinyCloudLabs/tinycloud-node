@@ -295,3 +295,467 @@ async fn revoke_refuses_owner_delete_credentials() -> Result<()> {
     );
     Ok(())
 }
+
+// ------------------------------------------------------------ delete route
+
+use super::encryption_keys::{
+    admin_auth, created_key, describe_auth, describe_get, invocation, invoke_named, post_json,
+    setup, DecryptCase,
+};
+use tinycloud_core::encryption_network::{
+    deletion_ledger, key_id::KeyLocation, CreateNetworkRequest, EncryptionService, NetworkId,
+    Threshold, KEY_BLOCK_ACTION,
+};
+use tinycloud_core::models::encryption_audit;
+
+fn delete_url(network: &str) -> String {
+    format!("/encryption/networks/{network}/key-actions/delete")
+}
+
+/// A UCAN delete invocation by the fixture owner for `key_path` (a prefix
+/// keeps its trailing `/`).
+fn delete_auth(fixture: &KvSyncFixture, network: &str, key_path: &str) -> Result<String> {
+    admin_auth(
+        fixture,
+        network,
+        key_path,
+        KEY_DELETE,
+        &json!({ "keyPath": key_path }),
+    )
+}
+
+async fn delete_with(
+    fixture: &KvSyncFixture,
+    network: &str,
+    key_path: &str,
+    auth: &str,
+) -> (Status, String) {
+    post_json(
+        &fixture.client,
+        &delete_url(network),
+        auth,
+        &json!({ "keyPath": key_path }),
+    )
+    .await
+}
+
+fn ledger_paths(fixture: &KvSyncFixture) -> Vec<String> {
+    let dir = fixture
+        .client
+        .rocket()
+        .state::<LedgerDir>()
+        .expect("ledger directory is managed");
+    deletion_ledger::read(&dir.0.path().join("deletion-ledger.jsonl"))
+        .expect("ledger reads")
+        .entries
+        .into_iter()
+        .map(|entry| entry.key_path)
+        .collect()
+}
+
+async fn deleted_audit_rows(fixture: &KvSyncFixture) -> Result<usize> {
+    Ok(encryption_audit::Entity::find()
+        .filter(encryption_audit::Column::Outcome.eq("deleted"))
+        .all(&fixture.conn)
+        .await?
+        .len())
+}
+
+fn service(fixture: &KvSyncFixture) -> &EncryptionService {
+    fixture
+        .client
+        .rocket()
+        .state::<EncryptionService>()
+        .expect("EncryptionService is managed")
+}
+
+#[tokio::test]
+async fn a_did_key_owner_deletes_an_app_prefix_and_decrypt_is_refused_after() -> Result<()> {
+    let (fixture, network) = setup().await?;
+    let public = created_key(&fixture, &network, "apps/foo/a").await;
+    created_key(&fixture, &network, "apps/foo/b").await;
+    let sibling = created_key(&fixture, &network, "apps/foobar/x").await;
+    created_key(&fixture, &network, "docs/a").await;
+    let (status, text) = invoke_named(
+        &fixture,
+        &network,
+        "apps/foo/a",
+        &DecryptCase::wrapped_to(&public),
+    )
+    .await;
+    assert_eq!(status, Status::Ok, "{text}");
+
+    let auth = delete_auth(&fixture, &network, "apps/foo/")?;
+    let (status, text) = delete_with(&fixture, &network, "apps/foo/", &auth).await;
+    assert_eq!(status, Status::Ok, "{text}");
+    let view: Value = serde_json::from_str(&text)?;
+    assert_eq!(
+        view,
+        json!({
+            "keyPath": "apps/foo/",
+            "state": "deleted",
+            "deleted": ["apps/foo/a", "apps/foo/b"],
+            "alreadyDeleted": [],
+            "count": 2,
+        })
+    );
+
+    let (status, text) = invoke_named(
+        &fixture,
+        &network,
+        "apps/foo/a",
+        &DecryptCase::wrapped_to(&public),
+    )
+    .await;
+    assert_eq!(status, Status::Forbidden, "{text}");
+    assert!(text.starts_with("key_deleted"), "{text}");
+    // A sibling app id and a key outside apps/ are untouched.
+    let (status, text) = invoke_named(
+        &fixture,
+        &network,
+        "apps/foobar/x",
+        &DecryptCase::wrapped_to(&sibling),
+    )
+    .await;
+    assert_eq!(status, Status::Ok, "{text}");
+    let describe = describe_auth(&fixture, &network, "apps/foo/b", KEY_CREATE)?;
+    let (status, text) = describe_get(&fixture, &network, "apps/foo/b", &describe).await;
+    assert_eq!(status, Status::Ok, "{text}");
+    assert_eq!(serde_json::from_str::<Value>(&text)?["state"], "deleted");
+
+    assert_eq!(deleted_audit_rows(&fixture).await?, 2);
+    assert_eq!(ledger_paths(&fixture), vec!["apps/foo/a", "apps/foo/b"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn per_key_delete_is_idempotent_and_refuses_a_deterministic_key() -> Result<()> {
+    let (fixture, network) = setup().await?;
+    created_key(&fixture, &network, "apps/foo/a").await;
+    created_key(&fixture, &network, "docs/a").await;
+
+    let auth = delete_auth(&fixture, &network, "apps/foo/a")?;
+    let (status, text) = delete_with(&fixture, &network, "apps/foo/a", &auth).await;
+    assert_eq!(status, Status::Ok, "{text}");
+    let view: Value = serde_json::from_str(&text)?;
+    assert_eq!(view["deleted"], json!(["apps/foo/a"]));
+    assert_eq!(view["keyPath"], "apps/foo/a");
+
+    let auth = delete_auth(&fixture, &network, "apps/foo/a")?;
+    let (status, text) = delete_with(&fixture, &network, "apps/foo/a", &auth).await;
+    assert_eq!(status, Status::Ok, "{text}");
+    let view: Value = serde_json::from_str(&text)?;
+    assert_eq!(view["deleted"], json!([]));
+    assert_eq!(view["alreadyDeleted"], json!(["apps/foo/a"]));
+    assert_eq!(view["count"], 0);
+
+    let auth = delete_auth(&fixture, &network, "apps/foo/missing")?;
+    let (status, text) = delete_with(&fixture, &network, "apps/foo/missing", &auth).await;
+    assert_eq!(status, Status::NotFound, "{text}");
+    assert!(text.starts_with("key_not_found"), "{text}");
+
+    let auth = delete_auth(&fixture, &network, "docs/a")?;
+    let (status, text) = delete_with(&fixture, &network, "docs/a", &auth).await;
+    assert_eq!(status, Status::Conflict, "{text}");
+    assert!(text.starts_with("key_not_deletable"), "{text}");
+    assert_eq!(deleted_audit_rows(&fixture).await?, 1);
+    assert_eq!(ledger_paths(&fixture), vec!["apps/foo/a"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_signature_is_used_once_even_when_the_delete_failed() -> Result<()> {
+    let (fixture, network) = setup().await?;
+    created_key(&fixture, &network, "docs/a").await;
+    created_key(&fixture, &network, "apps/foo/a").await;
+
+    // A delete that fails after verification (a deterministic key) burns the
+    // signature: the same header is refused, not answered 409 again.
+    let auth = delete_auth(&fixture, &network, "docs/a")?;
+    let (status, text) = delete_with(&fixture, &network, "docs/a", &auth).await;
+    assert_eq!(status, Status::Conflict, "{text}");
+    let (status, text) = delete_with(&fixture, &network, "docs/a", &auth).await;
+    assert_eq!(status, Status::Forbidden, "{text}");
+    assert!(text.starts_with("owner_only"), "{text}");
+    assert!(text.contains("already used"), "{text}");
+
+    // A delete that succeeded cannot be replayed either.
+    let auth = delete_auth(&fixture, &network, "apps/foo/")?;
+    let (status, text) = delete_with(&fixture, &network, "apps/foo/", &auth).await;
+    assert_eq!(status, Status::Ok, "{text}");
+    let (status, text) = delete_with(&fixture, &network, "apps/foo/", &auth).await;
+    assert_eq!(status, Status::Forbidden, "{text}");
+    assert!(text.contains("already used"), "{text}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn delete_refuses_a_credential_that_does_not_match_the_request() -> Result<()> {
+    let (fixture, network) = setup().await?;
+    created_key(&fixture, &network, "apps/foo/a").await;
+    created_key(&fixture, &network, "apps/bar/a").await;
+    let owner_only = |text: &str| text.starts_with("owner_only");
+
+    // The body names another prefix than the credential.
+    let auth = delete_auth(&fixture, &network, "apps/foo/")?;
+    let (status, text) = delete_with(&fixture, &network, "apps/bar/", &auth).await;
+    assert_eq!(status, Status::Forbidden, "{text}");
+    assert!(owner_only(&text), "{text}");
+
+    // The body names the key, the credential its prefix.
+    let auth = delete_auth(&fixture, &network, "apps/foo/")?;
+    let (status, text) = delete_with(&fixture, &network, "apps/foo/a", &auth).await;
+    assert_eq!(status, Status::Forbidden, "{text}");
+    assert!(owner_only(&text), "{text}");
+
+    // key.block is not key.delete.
+    let block = admin_auth(
+        &fixture,
+        &network,
+        "apps/foo/",
+        KEY_BLOCK_ACTION,
+        &json!({ "keyPath": "apps/foo/" }),
+    )?;
+    let (status, text) = delete_with(&fixture, &network, "apps/foo/", &block).await;
+    assert_eq!(status, Status::Forbidden, "{text}");
+    assert!(owner_only(&text), "{text}");
+
+    // A credential addressed to another node.
+    let prefix = key_uri_for(&network, "apps/foo/");
+    let other_node = invocation(
+        &fixture,
+        "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK",
+        &[(prefix.as_str(), KEY_DELETE)],
+        vec![admin_fact(&fixture.node_did, &network, "apps/foo/")],
+    )?;
+    let (status, text) = delete_with(&fixture, &network, "apps/foo/", &other_node).await;
+    assert_eq!(status, Status::Forbidden, "{text}");
+    assert!(owner_only(&text), "{text}");
+
+    // A credential for another network than the URL names.
+    let auth = delete_auth(&fixture, &network, "apps/foo/")?;
+    let other_network = format!("{}x", network);
+    let (status, text) = delete_with(&fixture, &other_network, "apps/foo/", &auth).await;
+    assert!(
+        matches!(status, Status::BadRequest | Status::Forbidden),
+        "{status} {text}"
+    );
+
+    // No Authorization header.
+    let response = fixture
+        .client
+        .post(delete_url(&network))
+        .header(rocket::http::ContentType::JSON)
+        .body(json!({ "keyPath": "apps/foo/" }).to_string())
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Unauthorized);
+
+    // Nothing above deleted anything.
+    assert_eq!(deleted_audit_rows(&fixture).await?, 0);
+    assert!(ledger_paths(&fixture).is_empty());
+    Ok(())
+}
+
+fn key_uri_for(network: &str, path: &str) -> String {
+    format!("{network}/{path}")
+}
+
+fn admin_fact(node_did: &str, network: &str, key_path: &str) -> Value {
+    json!({
+        "type": "tinycloud.encryption.key-admin/v1",
+        "targetNode": node_did,
+        "networkId": network,
+        "keyPath": key_path,
+        "action": KEY_DELETE,
+        "bodyHash": tinycloud_core::encryption_network::canonical::canonical_hash(
+            &json!({ "keyPath": key_path })
+        ),
+    })
+}
+
+#[tokio::test]
+async fn delete_key_paths_outside_the_two_accepted_shapes_are_bad_requests() -> Result<()> {
+    let (fixture, network) = setup().await?;
+    created_key(&fixture, &network, "apps/foo/a").await;
+    let auth = delete_auth(&fixture, &network, "apps/foo/")?;
+    for key_path in [
+        "apps/",
+        "apps//",
+        "apps/foo/x/",
+        "apps/foo//",
+        "apps/foo",
+        "apps/Foo/",
+        "apps",
+        "secrets/",
+        "secrets/x/",
+        "appsx/y/",
+        "/",
+        "",
+    ] {
+        let (status, text) = delete_with(&fixture, &network, key_path, &auth).await;
+        assert_eq!(status, Status::BadRequest, "{key_path:?}: {text}");
+        assert!(text.starts_with("key_path_invalid"), "{key_path:?}: {text}");
+    }
+    // These never reached the credential: it is still unused.
+    let (status, text) = delete_with(&fixture, &network, "apps/foo/", &auth).await;
+    assert_eq!(status, Status::Ok, "{text}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn delete_body_that_is_not_a_key_path_object_is_a_bad_request() -> Result<()> {
+    let (fixture, network) = setup().await?;
+    let (status, text) = post_json(
+        &fixture.client,
+        &delete_url(&network),
+        "x",
+        &json!({ "path": "apps/foo/" }),
+    )
+    .await;
+    assert_eq!(status, Status::BadRequest, "{text}");
+    assert!(text.starts_with("request body is malformed"), "{text}");
+    Ok(())
+}
+
+// ------------------------------------------------------------ did:pkh owner
+
+/// A network owned by `wallet`, with `paths` created as deletable keys.
+async fn wallet_network(
+    fixture: &KvSyncFixture,
+    wallet: &Wallet,
+    paths: &[&str],
+) -> Result<NetworkId> {
+    let service = service(fixture);
+    let network = service
+        .create_one_of_one_network(CreateNetworkRequest {
+            name: "default".to_string(),
+            owner_did: wallet.did(),
+            threshold: Threshold::one_of_one(),
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .network_id;
+    for path in paths {
+        service
+            .create_key(&KeyLocation::new(&network, path)?, true)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    Ok(network)
+}
+
+fn prefix_credential(
+    fixture: &KvSyncFixture,
+    wallet: &Wallet,
+    network: &NetworkId,
+    id: &str,
+    nonce: &str,
+) -> String {
+    let prefix = format!("{network}/apps/{id}/");
+    wallet.cacao(
+        &prefix,
+        KEY_DELETE,
+        Some(format!("Delete all TinyCloud keys under {prefix}.")),
+        &format!("{KEY_DELETE_URI_PREFIX}{}", fixture.node_did),
+        nonce,
+        300,
+    )
+}
+
+#[tokio::test]
+async fn a_did_pkh_owner_deletes_an_app_prefix_with_a_siwe_credential() -> Result<()> {
+    let (fixture, _) = setup().await?;
+    let wallet = Wallet::new(5);
+    let network = wallet_network(
+        &fixture,
+        &wallet,
+        &["apps/foo/a", "apps/foo/b", "apps/bar/a"],
+    )
+    .await?;
+    let credential = prefix_credential(&fixture, &wallet, &network, "foo", "pkhnonce001");
+
+    let (status, text) =
+        delete_with(&fixture, &network.to_string(), "apps/foo/", &credential).await;
+    assert_eq!(status, Status::Ok, "{text}");
+    let view: Value = serde_json::from_str(&text)?;
+    assert_eq!(view["deleted"], json!(["apps/foo/a", "apps/foo/b"]));
+    assert_eq!(view["count"], 2);
+    assert_eq!(ledger_paths(&fixture), vec!["apps/foo/a", "apps/foo/b"]);
+
+    // The same credential is used up.
+    let (status, text) =
+        delete_with(&fixture, &network.to_string(), "apps/foo/", &credential).await;
+    assert_eq!(status, Status::Forbidden, "{text}");
+    assert!(text.contains("already used"), "{text}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_did_pkh_credential_must_match_the_request_and_the_node() -> Result<()> {
+    let (fixture, _) = setup().await?;
+    let wallet = Wallet::new(5);
+    let other = Wallet::new(6);
+    let network = wallet_network(&fixture, &wallet, &["apps/foo/a", "apps/bar/a"]).await?;
+    let url_network = network.to_string();
+    let prefix = format!("{network}/apps/foo/");
+    let uri = format!("{KEY_DELETE_URI_PREFIX}{}", fixture.node_did);
+    let lead = format!("Delete all TinyCloud keys under {prefix}.");
+
+    let refused: Vec<(&str, String, &str)> = vec![
+        (
+            "another wallet signs",
+            {
+                let other_network = NetworkId::new(other.did(), "default".to_string())?;
+                let p = format!("{other_network}/apps/foo/");
+                other.cacao(&p, KEY_DELETE, Some(format!("Delete all TinyCloud keys under {p}.")), &uri, "n-other-01", 300)
+            },
+            "apps/foo/",
+        ),
+        (
+            "the credential names another prefix",
+            prefix_credential(&fixture, &wallet, &network, "bar", "n-prefix-01"),
+            "apps/foo/",
+        ),
+        (
+            "another node",
+            wallet.cacao(
+                &prefix,
+                KEY_DELETE,
+                Some(lead.clone()),
+                &format!("{KEY_DELETE_URI_PREFIX}did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK"),
+                "n-node-001",
+                300,
+            ),
+            "apps/foo/",
+        ),
+        (
+            "another ability",
+            wallet.cacao(&prefix, KEY_BLOCK_ACTION, Some(lead.clone()), &uri, "n-ability-1", 300),
+            "apps/foo/",
+        ),
+        (
+            "the statement does not state the delete",
+            wallet.cacao(&prefix, KEY_DELETE, Some("Sign in.".to_string()), &uri, "n-stmt-001", 300),
+            "apps/foo/",
+        ),
+        (
+            "a lifetime over 300 seconds",
+            wallet.cacao(&prefix, KEY_DELETE, Some(lead.clone()), &uri, "n-life-001", 301),
+            "apps/foo/",
+        ),
+    ];
+    for (label, credential, key_path) in refused {
+        let (status, text) = delete_with(&fixture, &url_network, key_path, &credential).await;
+        assert_eq!(status, Status::Forbidden, "{label}: {text}");
+        assert!(text.starts_with("owner_only"), "{label}: {text}");
+    }
+    assert!(ledger_paths(&fixture).is_empty());
+    assert_eq!(deleted_audit_rows(&fixture).await?, 0);
+
+    // A credential for the prefix refuses to delete one key of it.
+    let credential = prefix_credential(&fixture, &wallet, &network, "foo", "n-ok-000001");
+    let (status, text) = delete_with(&fixture, &url_network, "apps/foo/a", &credential).await;
+    assert_eq!(status, Status::Forbidden, "{text}");
+    Ok(())
+}

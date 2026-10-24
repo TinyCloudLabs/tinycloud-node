@@ -5,10 +5,12 @@
 //! invocation verification. The module deliberately does not expose a node-side
 //! encrypt API — clients encrypt to the network public key locally.
 
+pub mod app_id;
 pub mod backend;
 pub mod canonical;
 pub mod delete_auth;
 pub mod deletion_ledger;
+pub mod key_delete;
 pub mod key_id;
 pub mod keys;
 pub mod network_id;
@@ -20,6 +22,8 @@ pub mod types;
 mod delete_auth_tests;
 #[cfg(test)]
 mod deletion_ledger_tests;
+#[cfg(test)]
+mod key_delete_tests;
 #[cfg(test)]
 mod tests;
 

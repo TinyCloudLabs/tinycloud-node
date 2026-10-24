@@ -1,4 +1,5 @@
 {
+ "appIdRegex": "^[a-z0-9][a-z0-9._-]{0,63}$",
  "appIdValid": [
   {
    "id": "a",
@@ -328,28 +329,6 @@
    "valid": false
   }
  ],
- "deletePrefix": [
-  {
-   "prefix": "apps/foo/",
-   "accepted": true
-  },
-  {
-   "prefix": "apps/",
-   "accepted": false
-  },
-  {
-   "prefix": "apps/foo/x/",
-   "accepted": false
-  },
-  {
-   "prefix": "secrets/",
-   "accepted": false
-  },
-  {
-   "prefix": "apps/foo",
-   "accepted": false
-  }
- ],
  "createFlagMatchesPath": [
   {
    "keyPath": "apps/foo/x",
@@ -370,6 +349,123 @@
    "keyPath": "secrets/x",
    "deletable": false,
    "accepted": true
+  }
+ ],
+ "hostBinding": [
+  {
+   "origin": "https://listen.tinycloud.xyz",
+   "id": "xyz.tinycloud.listen",
+   "bound": true
+  },
+  {
+   "origin": "https://listen.tinycloud.xyz",
+   "id": "xyz.tinycloud.listen.digest",
+   "bound": true
+  },
+  {
+   "origin": "https://listen.tinycloud.xyz",
+   "id": "xyz.tinycloud",
+   "bound": false
+  },
+  {
+   "origin": "https://listen.tinycloud.xyz",
+   "id": "xyz.tinycloud.listenx",
+   "bound": false
+  },
+  {
+   "origin": "https://notes.tinycloud.xyz",
+   "id": "xyz.tinycloud.listen",
+   "bound": false
+  },
+  {
+   "origin": "https://alice.github.io",
+   "id": "io.github.bob.app",
+   "bound": false
+  },
+  {
+   "origin": "https://alice.github.io",
+   "id": "io.github.alice.app",
+   "bound": true
+  },
+  {
+   "origin": "https://listen.tinycloud.xyz:8443",
+   "id": "xyz.tinycloud.listen",
+   "bound": false
+  },
+  {
+   "origin": "http://listen.tinycloud.xyz",
+   "id": "xyz.tinycloud.listen",
+   "bound": false
+  },
+  {
+   "origin": "https://LISTEN.tinycloud.xyz",
+   "id": "xyz.tinycloud.listen",
+   "bound": true
+  },
+  {
+   "origin": "https://localhost",
+   "id": "localhost",
+   "bound": false
+  },
+  {
+   "origin": "https://127.0.0.1",
+   "id": "1.0.0.127",
+   "bound": false
+  },
+  {
+   "origin": "https://listen.tinycloud.xyz.",
+   "id": "xyz.tinycloud.listen",
+   "bound": false
+  },
+  {
+   "origin": "https://intranet",
+   "id": "intranet",
+   "bound": false
+  },
+  {
+   "origin": "https://xn--bcher-kva.example",
+   "id": "example.xn--bcher-kva",
+   "bound": true
+  },
+  {
+   "origin": "https://xn--bcher-kva.example",
+   "id": "example.b\u00fccher",
+   "bound": false
+  },
+  {
+   "origin": "https://b\u00fccher.example",
+   "id": "example.xn--bcher-kva",
+   "bound": true
+  },
+  {
+   "origin": "https://b\u00fccher.example",
+   "id": "example.b\u00fccher",
+   "bound": false
+  },
+  {
+   "origin": "https://a.b.example.com",
+   "id": "com.example.b.a",
+   "bound": true
+  },
+  {
+   "origin": "https://a.b.example.com",
+   "id": "com.example",
+   "bound": false
+  },
+  {
+   "origin": "https://example.com",
+   "id": "com.example",
+   "bound": true
+  },
+  {
+   "origin": "https://example.com",
+   "id": "com.example.app",
+   "bound": true
+  },
+  {
+   "origin": "https://EXAMPLE.com",
+   "id": "com.example.app",
+   "bound": true
   }
  ]
 }

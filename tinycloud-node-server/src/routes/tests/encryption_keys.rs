@@ -20,7 +20,7 @@ use tinycloud_core::models::encryption_audit;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 /// Owner DID: the `did:key` part of the owner verification method.
-fn owner_did(fixture: &KvSyncFixture) -> String {
+pub(super) fn owner_did(fixture: &KvSyncFixture) -> String {
     fixture
         .owner_vm
         .split('#')
@@ -31,7 +31,7 @@ fn owner_did(fixture: &KvSyncFixture) -> String {
 
 /// Fixture with the key routes mounted, named keys on, and one active 1-of-1
 /// network.
-async fn setup() -> Result<(KvSyncFixture, String)> {
+pub(super) async fn setup() -> Result<(KvSyncFixture, String)> {
     setup_with(true).await
 }
 
@@ -53,6 +53,7 @@ async fn setup_with(named_keys: bool) -> Result<(KvSyncFixture, String)> {
                     crate::routes::encryption::public_encryption_key,
                     crate::routes::encryption::block_encryption_key,
                     crate::routes::encryption::unblock_encryption_key,
+                    crate::routes::encryption::delete_encryption_key,
                     crate::routes::encryption::decrypt
                 ],
             )
@@ -118,7 +119,7 @@ fn signed(
 }
 
 /// Current-expiry invocation to `audience`.
-fn invocation(
+pub(super) fn invocation(
     fixture: &KvSyncFixture,
     audience: &str,
     caps: &[(&str, &str)],
@@ -161,7 +162,7 @@ fn describe_fact_for(target_node: &str, network: &str, key_path: &str) -> Value 
 
 /// A valid key-admin invocation for `body` on the exact key, with `action`
 /// as both the capability ability and the fact action.
-fn admin_auth(
+pub(super) fn admin_auth(
     fixture: &KvSyncFixture,
     network: &str,
     key_path: &str,
@@ -184,7 +185,7 @@ fn admin_auth(
 }
 
 /// A valid describe invocation on the exact key with `ability`.
-fn describe_auth(
+pub(super) fn describe_auth(
     fixture: &KvSyncFixture,
     network: &str,
     key_path: &str,
@@ -211,7 +212,7 @@ fn action_url(network: &str, action: &str) -> String {
     format!("/encryption/networks/{network}/key-actions/{action}")
 }
 
-async fn post_json(
+pub(super) async fn post_json(
     client: &rocket::local::asynchronous::Client,
     uri: &str,
     auth: &str,
@@ -246,7 +247,7 @@ async fn get(
 }
 
 /// POST a create request on the exact key with a valid invocation.
-async fn create(
+pub(super) async fn create(
     fixture: &KvSyncFixture,
     network: &str,
     key_path: &str,
@@ -280,7 +281,7 @@ async fn public_get(fixture: &KvSyncFixture, network: &str, key_path: &str) -> (
 }
 
 /// Authenticated describe GET of a key.
-async fn describe_get(
+pub(super) async fn describe_get(
     fixture: &KvSyncFixture,
     network: &str,
     key_path: &str,
@@ -665,15 +666,35 @@ async fn create_refuses_a_grammar_invalid_key_path() -> Result<()> {
 }
 
 #[tokio::test]
-async fn create_refuses_deletable_keys() -> Result<()> {
+async fn create_requires_the_deletable_flag_to_match_the_path() -> Result<()> {
     let (fixture, network) = setup().await?;
-    let (status, text) = create(&fixture, &network, "docs/a", true).await?;
-    assert_eq!(status, Status::Forbidden, "{text}");
-    assert!(text.starts_with("deletable_unavailable"), "{text}");
-    let auth = describe_auth(&fixture, &network, "docs/a", KEY_CREATE_ACTION)?;
-    let (status, text) = describe_get(&fixture, &network, "docs/a", &auth).await;
-    assert_eq!(status, Status::NotFound, "no key after refusal: {text}");
-    assert!(text.starts_with("key_not_found"), "{text}");
+    for (path, deletable) in [("docs/a", true), ("apps/foo/x", false)] {
+        let (status, text) = create(&fixture, &network, path, deletable).await?;
+        assert_eq!(status, Status::BadRequest, "{path} {deletable}: {text}");
+        assert!(text.starts_with("key_path_invalid"), "{text}");
+        let auth = describe_auth(&fixture, &network, path, KEY_CREATE_ACTION)?;
+        let (status, text) = describe_get(&fixture, &network, path, &auth).await;
+        assert_eq!(status, Status::NotFound, "no key after refusal: {text}");
+        assert!(text.starts_with("key_not_found"), "{text}");
+    }
+    // An omitted flag is `false`.
+    let body = json!({"keyPath": "apps/foo/x"});
+    let auth = admin_auth(&fixture, &network, "apps/foo/x", KEY_CREATE_ACTION, &body)?;
+    let (status, text) = post_json(&fixture.client, &keys_url(&network), &auth, &body).await;
+    assert_eq!(status, Status::BadRequest, "{text}");
+
+    let (status, text) = create(&fixture, &network, "apps/foo/x", true).await?;
+    assert_eq!(status, Status::Ok, "{text}");
+    let value: Value = serde_json::from_str(&text)?;
+    assert_eq!(value["kind"], "deletable");
+    assert_eq!(value["state"], "active");
+    assert_eq!(value["keyVersion"], 1);
+    let (status, text) = create(&fixture, &network, "docs/a", false).await?;
+    assert_eq!(status, Status::Ok, "{text}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&text)?["kind"],
+        "deterministic"
+    );
     Ok(())
 }
 
@@ -1447,7 +1468,7 @@ async fn direct_decrypt_refuses_a_body_key_path() -> Result<()> {
 }
 
 /// Receiver key pair and a symmetric key wrapped to one recipient public key.
-struct DecryptCase {
+pub(super) struct DecryptCase {
     receiver: StaticSecret,
     receiver_public: [u8; 32],
     wrapped: Vec<u8>,
@@ -1455,7 +1476,7 @@ struct DecryptCase {
 }
 
 impl DecryptCase {
-    fn wrapped_to(recipient_public: &[u8]) -> Self {
+    pub(super) fn wrapped_to(recipient_public: &[u8]) -> Self {
         let symmetric = vec![0xCD; 32];
         let wrapped = wrap_to_public_key(recipient_public, &symmetric).expect("wrap to recipient");
         let receiver = StaticSecret::random_from_rng(rand::rngs::OsRng);
@@ -1548,7 +1569,7 @@ async fn invoke(fixture: &KvSyncFixture, auth: &str, body: &Value) -> (Status, S
 }
 
 /// Owner-authorized named-key decrypt over `/invoke`.
-async fn invoke_named(
+pub(super) async fn invoke_named(
     fixture: &KvSyncFixture,
     network: &str,
     key_path: &str,
@@ -1587,15 +1608,22 @@ async fn device_decrypt(
     invoke(fixture, &auth, &body).await
 }
 
-/// Creates a named key and returns its public key from the public GET route.
-async fn created_key(fixture: &KvSyncFixture, network: &str, key_path: &str) -> Vec<u8> {
-    let (status, text) = create(fixture, network, key_path, false)
+/// Creates a named key (deletable under `apps/`) and returns its public key
+/// from the authenticated describe GET.
+pub(super) async fn created_key(fixture: &KvSyncFixture, network: &str, key_path: &str) -> Vec<u8> {
+    let (status, text) = create(fixture, network, key_path, key_path.starts_with("apps/"))
         .await
         .expect("create invocation");
     assert_eq!(status, Status::Ok, "{text}");
-    let (status, text) = public_get(fixture, network, key_path).await;
+    described_public_key(fixture, network, key_path).await
+}
+
+/// Public key of an existing key from the authenticated describe GET.
+async fn described_public_key(fixture: &KvSyncFixture, network: &str, key_path: &str) -> Vec<u8> {
+    let auth = describe_auth(fixture, network, key_path, KEY_CREATE_ACTION).expect("describe auth");
+    let (status, text) = describe_get(fixture, network, key_path, &auth).await;
     assert_eq!(status, Status::Ok, "{text}");
-    let value: Value = serde_json::from_str(&text).expect("public key json");
+    let value: Value = serde_json::from_str(&text).expect("descriptor json");
     base64::decode(
         value["publicEncryptionKey"]
             .as_str()
@@ -2224,5 +2252,429 @@ async fn invoke_refuses_named_key_resources_when_named_keys_are_off() -> Result<
     )?;
     let (status, text) = invoke(&fixture, &auth, &body).await;
     assert_eq!(status, Status::Ok, "bare network decrypt: {text}");
+    Ok(())
+}
+
+// ------------------------------------------------------------ app keys
+
+fn app_key_vectors() -> Value {
+    serde_json::from_str(include_str!(
+        "../../../../tinycloud-core/tests/fixtures/encryption/app-key-vectors.json"
+    ))
+    .expect("vector file parses")
+}
+
+fn key_row_filter(network: &str, key_path: &str) -> (String, String) {
+    (network.to_string(), key_path.to_string())
+}
+
+async fn stored_key_row(
+    fixture: &KvSyncFixture,
+    network: &str,
+    key_path: &str,
+) -> Option<tinycloud_core::models::encryption_network_key::Model> {
+    use tinycloud_core::sea_orm::EntityTrait;
+    tinycloud_core::models::encryption_network_key::Entity::find_by_id(key_row_filter(
+        network, key_path,
+    ))
+    .one(&fixture.conn)
+    .await
+    .expect("key row query")
+}
+
+/// Writes a state and seed straight into a key row, as a delete would.
+async fn force_key_row(
+    fixture: &KvSyncFixture,
+    network: &str,
+    key_path: &str,
+    state: &str,
+    sealed_seed: Option<Vec<u8>>,
+) {
+    use tinycloud_core::sea_orm::{ActiveModelTrait, ActiveValue::Set};
+    let mut row: tinycloud_core::models::encryption_network_key::ActiveModel =
+        stored_key_row(fixture, network, key_path)
+            .await
+            .expect("row exists")
+            .into();
+    row.state = Set(state.to_string());
+    row.sealed_seed = Set(sealed_seed);
+    row.update(&fixture.conn).await.expect("row update");
+}
+
+/// Status, headers (sorted, without the per-request id) and body of a GET.
+async fn get_full(fixture: &KvSyncFixture, uri: &str) -> (Status, Vec<(String, String)>, String) {
+    let response = fixture
+        .client
+        .get(uri.to_string())
+        .remote("127.0.0.1:0".parse().expect("valid socket address"))
+        .dispatch()
+        .await;
+    let status = response.status();
+    let mut headers: Vec<(String, String)> = response
+        .headers()
+        .iter()
+        .filter(|h| !h.name().as_str().eq_ignore_ascii_case("x-request-id"))
+        .map(|h| (h.name().to_string(), h.value().to_string()))
+        .collect();
+    headers.sort();
+    (
+        status,
+        headers,
+        response.into_string().await.unwrap_or_default(),
+    )
+}
+
+/// Decrypt of `case` for `key_path` at `version`, authorized by the owner.
+async fn invoke_named_at_version(
+    fixture: &KvSyncFixture,
+    network: &str,
+    key_path: &str,
+    case: &DecryptCase,
+    version: i64,
+) -> (Status, String) {
+    let (mut body, mut facts) = decrypt_request(fixture, network, case, Some(key_path));
+    body["keyVersion"] = json!(version);
+    facts["keyVersion"] = json!(version);
+    facts["bodyHash"] = json!(canonical_hash(&body));
+    let resource = key_uri(network, key_path);
+    let auth = invocation(
+        fixture,
+        &fixture.node_did,
+        &[(resource.as_str(), DECRYPT_ACTION)],
+        vec![facts],
+    )
+    .expect("decrypt invocation");
+    invoke(fixture, &auth, &body).await
+}
+
+#[tokio::test]
+async fn apps_key_paths_follow_the_shared_depth_vectors_on_the_create_route() -> Result<()> {
+    let (fixture, network) = setup().await?;
+    let vectors = app_key_vectors();
+    let cases = vectors["nodeKeyPathUnderApps"].as_array().unwrap();
+    assert_eq!(cases.len(), 10);
+    for case in cases {
+        let path = case["keyPath"].as_str().unwrap();
+        let accepted = case["accepted"].as_bool().unwrap();
+        let deletable = path.split('/').next() == Some("apps");
+        if accepted {
+            let (status, text) = create(&fixture, &network, path, deletable).await?;
+            assert_eq!(status, Status::Ok, "{path}: {text}");
+            let kind = serde_json::from_str::<Value>(&text)?["kind"].clone();
+            assert_eq!(
+                kind,
+                if deletable {
+                    "deletable"
+                } else {
+                    "deterministic"
+                }
+            );
+        } else {
+            // The body names a path the grammar refuses while the invocation
+            // is valid for another key.
+            let body = json!({"keyPath": path, "deletable": deletable});
+            let auth = admin_auth(&fixture, &network, "docs/a", KEY_CREATE_ACTION, &body)?;
+            let (status, text) =
+                post_json(&fixture.client, &keys_url(&network), &auth, &body).await;
+            assert_eq!(status, Status::BadRequest, "{path}: {text}");
+            assert!(text.starts_with("key_path_invalid"), "{path}: {text}");
+            // The same path as the invocation's own resource is refused too.
+            let (status, text) = create(&fixture, &network, path, deletable).await?;
+            assert_ne!(status, Status::Ok, "{path}: {text}");
+            assert!(
+                stored_key_row(&fixture, &network, path).await.is_none(),
+                "{path} stored"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn apps_prefix_depth_is_enforced_for_delegation_and_invocation() -> Result<()> {
+    let (fixture, network) = setup().await?;
+    let before = stored_delegations(&fixture).await?;
+    let vectors = app_key_vectors();
+    let cases = vectors["prefixValid"].as_array().unwrap();
+    assert_eq!(cases.len(), 9);
+    let mut admitted = 0;
+    for case in cases {
+        let prefix = case["prefix"].as_str().unwrap();
+        let valid = case["valid"].as_bool().unwrap();
+        let resource = format!("{network}/{prefix}");
+        for ability in [DECRYPT_ACTION, KEY_CREATE_ACTION, KEY_BLOCK_ACTION] {
+            let (status, text) = delegate_caps(&fixture, &[(resource.as_str(), ability)]).await?;
+            assert_eq!(status == Status::Ok, valid, "{prefix} {ability}: {text}");
+            admitted += usize::from(valid);
+        }
+    }
+    assert_eq!(
+        stored_delegations(&fixture).await?,
+        before + admitted as u64
+    );
+
+    // A key with fewer than three segments under `apps/` is refused as a
+    // grant and as a decrypt target.
+    for path in ["apps", "apps/foo"] {
+        let resource = key_uri(&network, path);
+        let (status, text) =
+            delegate_caps(&fixture, &[(resource.as_str(), DECRYPT_ACTION)]).await?;
+        assert_ne!(status, Status::Ok, "{path}: {text}");
+        let case = DecryptCase::wrapped_to(&root_public_key(&fixture, &network).await);
+        let (status, text) = invoke_named(&fixture, &network, path, &case).await;
+        assert_eq!(status, Status::Forbidden, "{path}: {text}");
+    }
+    // A prefix is never an invocation target, whatever its depth.
+    let case = DecryptCase::wrapped_to(&root_public_key(&fixture, &network).await);
+    let (body, facts) = decrypt_request(&fixture, &network, &case, Some("apps/foo/x"));
+    let prefix = format!("{network}/apps/foo/");
+    let auth = invocation(
+        &fixture,
+        &fixture.node_did,
+        &[(prefix.as_str(), DECRYPT_ACTION)],
+        vec![facts],
+    )?;
+    let (status, text) = invoke(&fixture, &auth, &body).await;
+    assert_eq!(status, Status::Forbidden, "{text}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn public_get_under_apps_is_one_uniform_not_found() -> Result<()> {
+    let (fixture, network) = setup().await?;
+    created_key(&fixture, &network, "apps/foo/active").await;
+    created_key(&fixture, &network, "apps/foo/blocked").await;
+    let (status, text) = key_action(&fixture, &network, "apps/foo/blocked", "block").await?;
+    assert_eq!(status, Status::Ok, "{text}");
+    created_key(&fixture, &network, "apps/foo/gone").await;
+    force_key_row(&fixture, &network, "apps/foo/gone", "deleted", None).await;
+    let other_owner = other_owner_network(&fixture).await?;
+    let absent = NetworkId::new(owner_did(&fixture), "absent")?.to_string();
+
+    let mut seen = Vec::new();
+    for (net, path) in [
+        (&network, "apps/foo/active"),
+        (&network, "apps/foo/blocked"),
+        (&network, "apps/foo/gone"),
+        (&network, "apps/foo/missing"),
+        (&network, "apps/foo/deep/er/missing"),
+        (&network, "apps/nobody/missing"),
+        (&other_owner, "apps/foo/active"),
+        (&other_owner, "apps/foo/missing"),
+        (&absent, "apps/foo/missing"),
+    ] {
+        seen.push(get_full(&fixture, &key_url(net, path)).await);
+        let (status, _, body) = seen.last().unwrap();
+        assert_eq!(*status, Status::NotFound, "{net} {path}: {body}");
+    }
+    assert!(
+        seen.windows(2).all(|pair| pair[0] == pair[1]),
+        "answers differ: {seen:?}"
+    );
+    assert!(seen[0].2.starts_with("key_not_found"), "{}", seen[0].2);
+    assert!(!seen[0].2.contains("foo") && !seen[0].2.contains(&network));
+
+    // Outside `apps/` a missing key still answers with its derived public key.
+    let (status, text) = public_get(&fixture, &network, "docs/never-created").await;
+    assert_eq!(status, Status::Ok, "{text}");
+    created_key(&fixture, &network, "appsx/y").await;
+    let (status, text) = public_get(&fixture, &network, "appsx/y").await;
+    assert_eq!(status, Status::Ok, "{text}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn describe_returns_app_keys_with_their_kind_and_state() -> Result<()> {
+    let (fixture, network) = setup().await?;
+    let (status, text) = create(&fixture, &network, "apps/foo/x", true).await?;
+    assert_eq!(status, Status::Ok, "{text}");
+    let created: Value = serde_json::from_str(&text)?;
+    let auth = describe_auth(&fixture, &network, "apps/foo/x", DECRYPT_ACTION)?;
+    let (status, text) = describe_get(&fixture, &network, "apps/foo/x", &auth).await;
+    assert_eq!(status, Status::Ok, "{text}");
+    let described: Value = serde_json::from_str(&text)?;
+    assert_eq!(described, created);
+    assert_eq!(described["kind"], "deletable");
+
+    force_key_row(&fixture, &network, "apps/foo/x", "deleted", None).await;
+    let auth = describe_auth(&fixture, &network, "apps/foo/x", DECRYPT_ACTION)?;
+    let (status, text) = describe_get(&fixture, &network, "apps/foo/x", &auth).await;
+    assert_eq!(status, Status::Ok, "{text}");
+    assert_eq!(state_of(&text)?, "deleted");
+    Ok(())
+}
+
+#[tokio::test]
+async fn deleted_app_key_is_refused_by_block_unblock_and_decrypt_and_reinstalled_by_create(
+) -> Result<()> {
+    let (fixture, network) = setup().await?;
+    let key = "apps/foo/x";
+    let old_public = created_key(&fixture, &network, key).await;
+    let old_case = DecryptCase::wrapped_to(&old_public);
+    let (status, text) = invoke_named(&fixture, &network, key, &old_case).await;
+    assert_eq!(status, Status::Ok, "decrypt before delete: {text}");
+    let value: Value = serde_json::from_str(&text)?;
+    assert_eq!(value["keyVersion"], 1);
+
+    force_key_row(&fixture, &network, key, "deleted", None).await;
+    for action in ["block", "unblock"] {
+        let (status, text) = key_action(&fixture, &network, key, action).await?;
+        assert_eq!(status, Status::Forbidden, "{action}: {text}");
+        assert!(text.starts_with("key_deleted"), "{action}: {text}");
+    }
+    let row = stored_key_row(&fixture, &network, key).await.unwrap();
+    assert_eq!(row.state, "deleted");
+    assert!(row.sealed_seed.is_none());
+    let (status, text) = invoke_named(&fixture, &network, key, &old_case).await;
+    assert_eq!(status, Status::Forbidden, "{text}");
+    assert!(text.starts_with("key_deleted"), "{text}");
+
+    // Create reuses the row with a new seed and the next version.
+    let (status, text) = create(&fixture, &network, key, true).await?;
+    assert_eq!(status, Status::Ok, "{text}");
+    let value: Value = serde_json::from_str(&text)?;
+    assert_eq!(
+        (value["state"].as_str(), value["keyVersion"].as_i64()),
+        (Some("active"), Some(2))
+    );
+    let new_public = described_public_key(&fixture, &network, key).await;
+    assert_ne!(new_public, old_public);
+    assert!(stored_key_row(&fixture, &network, key)
+        .await
+        .unwrap()
+        .sealed_seed
+        .is_some());
+
+    // Ciphertext for the earlier key is refused at the earlier version and
+    // cannot be opened at the current one.
+    let (status, text) = invoke_named_at_version(&fixture, &network, key, &old_case, 1).await;
+    assert_eq!(status, Status::Forbidden, "{text}");
+    assert!(text.starts_with("key_deleted"), "{text}");
+    let old_case = DecryptCase::wrapped_to(&old_public);
+    let (status, text) = invoke_named_at_version(&fixture, &network, key, &old_case, 2).await;
+    assert_eq!(status, Status::Forbidden, "{text}");
+    assert!(text.starts_with("key_unwrap_failed"), "{text}");
+    // The new key decrypts at version 2 only.
+    let new_case = DecryptCase::wrapped_to(&new_public);
+    let (status, text) = invoke_named_at_version(&fixture, &network, key, &new_case, 1).await;
+    assert_eq!(status, Status::Forbidden, "{text}");
+    assert!(text.starts_with("key_deleted"), "{text}");
+    let new_case = DecryptCase::wrapped_to(&new_public);
+    let (status, text) = invoke_named_at_version(&fixture, &network, key, &new_case, 2).await;
+    assert_eq!(status, Status::Ok, "{text}");
+    assert_eq!(serde_json::from_str::<Value>(&text)?["keyVersion"], 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn deleted_row_that_is_not_deletable_stays_deleted_on_create() -> Result<()> {
+    let (fixture, network) = setup().await?;
+    let (status, text) = create(&fixture, &network, "docs/a", false).await?;
+    assert_eq!(status, Status::Ok, "{text}");
+    force_key_row(&fixture, &network, "docs/a", "deleted", None).await;
+    let (status, text) = create(&fixture, &network, "docs/a", false).await?;
+    assert_eq!(status, Status::Forbidden, "{text}");
+    assert!(text.starts_with("key_deleted"), "{text}");
+    let (status, text) = key_action(&fixture, &network, "docs/a", "unblock").await?;
+    assert_eq!(status, Status::Forbidden, "{text}");
+    let row = stored_key_row(&fixture, &network, "docs/a").await.unwrap();
+    assert_eq!((row.state.as_str(), row.key_version), ("deleted", 1));
+    Ok(())
+}
+
+#[tokio::test]
+async fn concurrent_creates_of_one_app_key_make_one_key() -> Result<()> {
+    let (fixture, network) = setup().await?;
+    let results = futures::future::join_all((0..4).map(|_| {
+        let fixture = &fixture;
+        let network = &network;
+        async move { create(fixture, network, "apps/foo/x", true).await }
+    }))
+    .await;
+    let statuses: Vec<Status> = results.into_iter().map(|r| r.unwrap().0).collect();
+    assert_eq!(
+        statuses.iter().filter(|s| **s == Status::Ok).count(),
+        1,
+        "{statuses:?}"
+    );
+    assert!(statuses
+        .iter()
+        .all(|s| *s == Status::Ok || *s == Status::Conflict));
+    let row = stored_key_row(&fixture, &network, "apps/foo/x")
+        .await
+        .unwrap();
+    assert_eq!((row.state.as_str(), row.key_version), ("active", 1));
+    Ok(())
+}
+
+#[tokio::test]
+async fn concurrent_reinstall_creates_bump_the_version_once() -> Result<()> {
+    let (fixture, network) = setup().await?;
+    created_key(&fixture, &network, "apps/foo/x").await;
+    force_key_row(&fixture, &network, "apps/foo/x", "deleted", None).await;
+    let results = futures::future::join_all((0..4).map(|_| {
+        let fixture = &fixture;
+        let network = &network;
+        async move { create(fixture, network, "apps/foo/x", true).await }
+    }))
+    .await;
+    let statuses: Vec<Status> = results.into_iter().map(|r| r.unwrap().0).collect();
+    assert_eq!(
+        statuses.iter().filter(|s| **s == Status::Ok).count(),
+        1,
+        "{statuses:?}"
+    );
+    let row = stored_key_row(&fixture, &network, "apps/foo/x")
+        .await
+        .unwrap();
+    assert_eq!((row.state.as_str(), row.key_version), ("active", 2));
+    Ok(())
+}
+
+#[tokio::test]
+async fn concurrent_block_and_unblock_leave_a_consistent_key() -> Result<()> {
+    let (fixture, network) = setup().await?;
+    created_key(&fixture, &network, "apps/foo/x").await;
+    let results = futures::future::join_all((0..6).map(|i| {
+        let fixture = &fixture;
+        let network = &network;
+        async move {
+            let action = if i % 2 == 0 { "block" } else { "unblock" };
+            key_action(fixture, network, "apps/foo/x", action).await
+        }
+    }))
+    .await;
+    for result in results {
+        let (status, text) = result?;
+        assert_eq!(status, Status::Ok, "{text}");
+    }
+    let row = stored_key_row(&fixture, &network, "apps/foo/x")
+        .await
+        .unwrap();
+    assert!(matches!(row.state.as_str(), "active" | "blocked"));
+    assert!(row.sealed_seed.is_some());
+    Ok(())
+}
+
+/// With named keys off, app key and app prefix resources are refused like
+/// every other key resource.
+#[tokio::test]
+async fn app_key_resources_are_refused_when_named_keys_are_off() -> Result<()> {
+    let (fixture, network) = setup_with(false).await?;
+    let before = stored_delegations(&fixture).await?;
+    let key = key_uri(&network, "apps/foo/x");
+    let prefix = format!("{network}/apps/foo/");
+    for resource in [key.as_str(), prefix.as_str()] {
+        for ability in [DECRYPT_ACTION, KEY_CREATE_ACTION, KEY_BLOCK_ACTION] {
+            let (status, text) = delegate_caps(&fixture, &[(resource, ability)]).await?;
+            assert_eq!(status, Status::Unauthorized, "{resource} {ability}: {text}");
+            assert_eq!(text, NAMED_KEYS_UNAVAILABLE);
+        }
+    }
+    assert_eq!(stored_delegations(&fixture).await?, before);
+    let case = DecryptCase::wrapped_to(&root_public_key(&fixture, &network).await);
+    let (status, text) = invoke_named(&fixture, &network, "apps/foo/x", &case).await;
+    assert_eq!(status, Status::Forbidden, "{text}");
+    assert_eq!(text, NAMED_KEYS_UNAVAILABLE);
     Ok(())
 }
