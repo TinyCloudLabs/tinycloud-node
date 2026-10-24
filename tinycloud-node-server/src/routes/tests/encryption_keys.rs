@@ -2474,7 +2474,7 @@ async fn public_get_under_apps_is_one_uniform_not_found() -> Result<()> {
     assert!(seen[0].2.starts_with("key_not_found"), "{}", seen[0].2);
     assert!(!seen[0].2.contains("foo") && !seen[0].2.contains(&network));
 
-    // Outside `apps/` a missing key still answers with its derived public key.
+    // Outside `apps/` a missing key has a derived public key.
     let (status, text) = public_get(&fixture, &network, "docs/never-created").await;
     assert_eq!(status, Status::Ok, "{text}");
     created_key(&fixture, &network, "appsx/y").await;
@@ -2676,5 +2676,149 @@ async fn app_key_resources_are_refused_when_named_keys_are_off() -> Result<()> {
     let (status, text) = invoke_named(&fixture, &network, "apps/foo/x", &case).await;
     assert_eq!(status, Status::Forbidden, "{text}");
     assert_eq!(text, NAMED_KEYS_UNAVAILABLE);
+    Ok(())
+}
+
+#[tokio::test]
+async fn invoke_refuses_a_blocked_missing_or_revoked_app_key() -> Result<()> {
+    let (fixture, network) = setup().await?;
+    let key = "apps/foo/x";
+    let key_public = created_key(&fixture, &network, key).await;
+    let (status, text) = invoke_named(
+        &fixture,
+        &network,
+        key,
+        &DecryptCase::wrapped_to(&key_public),
+    )
+    .await;
+    assert_eq!(status, Status::Ok, "active: {text}");
+
+    let (status, text) = key_action(&fixture, &network, key, "block").await?;
+    assert_eq!(status, Status::Ok, "block: {text}");
+    let (status, text) = invoke_named(
+        &fixture,
+        &network,
+        key,
+        &DecryptCase::wrapped_to(&key_public),
+    )
+    .await;
+    assert_eq!(status, Status::Forbidden, "{text}");
+    assert!(text.starts_with("key_blocked"), "{text}");
+    assert!(!text.contains("wrappedKey"), "{text}");
+    let (status, text) = key_action(&fixture, &network, key, "unblock").await?;
+    assert_eq!(status, Status::Ok, "unblock: {text}");
+
+    let (status, text) = invoke_named(
+        &fixture,
+        &network,
+        "apps/foo/never-created",
+        &DecryptCase::wrapped_to(&key_public),
+    )
+    .await;
+    assert_eq!(status, Status::Forbidden, "{text}");
+    assert!(text.starts_with("key_not_found"), "{text}");
+
+    let service = fixture
+        .client
+        .rocket()
+        .state::<EncryptionService>()
+        .expect("encryption service is managed");
+    let id: NetworkId = network.parse()?;
+    service.revoke_network(&id).await.expect("revoke network");
+    let (status, text) = invoke_named(
+        &fixture,
+        &network,
+        key,
+        &DecryptCase::wrapped_to(&key_public),
+    )
+    .await;
+    assert_eq!(status, Status::Forbidden, "{text}");
+    assert!(!text.contains("wrappedKey"), "{text}");
+    let (status, text) = create(&fixture, &network, "apps/foo/y", true).await?;
+    assert_eq!(status, Status::Conflict, "create after revoke: {text}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn invoke_refuses_an_app_key_path_that_differs_from_the_capability() -> Result<()> {
+    let (fixture, network) = setup().await?;
+    created_key(&fixture, &network, "apps/foo/a").await;
+    let b_public = created_key(&fixture, &network, "apps/foo/b").await;
+    let case = DecryptCase::wrapped_to(&b_public);
+    let (body, facts) = decrypt_request(&fixture, &network, &case, Some("apps/foo/b"));
+    let resource = key_uri(&network, "apps/foo/a");
+    let auth = invocation(
+        &fixture,
+        &fixture.node_did,
+        &[(resource.as_str(), DECRYPT_ACTION)],
+        vec![facts],
+    )?;
+    let (status, text) = invoke(&fixture, &auth, &body).await;
+    assert_eq!(status, Status::Forbidden, "{text}");
+    assert!(!text.contains("wrappedKey"), "{text}");
+    assert!(text.contains("key_path_invalid"), "{text}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn bare_network_grant_cannot_decrypt_an_app_key() -> Result<()> {
+    let (fixture, network) = setup().await?;
+    let key_public = created_key(&fixture, &network, "apps/foo/x").await;
+    let case = DecryptCase::wrapped_to(&key_public);
+    let (body, facts) = decrypt_request(&fixture, &network, &case, Some("apps/foo/x"));
+    let auth = invocation(
+        &fixture,
+        &fixture.node_did,
+        &[(network.as_str(), DECRYPT_ACTION)],
+        vec![facts.clone()],
+    )?;
+    let (status, text) = invoke(&fixture, &auth, &body).await;
+    assert_eq!(status, Status::Forbidden, "{text}");
+    assert!(!text.contains("wrappedKey"), "{text}");
+    let auth = invocation(
+        &fixture,
+        &fixture.node_did,
+        &[(network.as_str(), DIRECT_DECRYPT_ABILITY)],
+        vec![facts],
+    )?;
+    let (status, text) = post_json(&fixture.client, &decrypt_url(&network), &auth, &body).await;
+    assert_eq!(status, Status::BadRequest, "{text}");
+    assert!(text.starts_with("key_path_invalid: "), "{text}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn prefix_grant_decrypts_deterministic_keys_below_it_but_not_a_sibling() -> Result<()> {
+    let (fixture, network) = setup().await?;
+    let inside = created_key(&fixture, &network, "docs/foo/x").await;
+    let deep = created_key(&fixture, &network, "docs/foo/deep/y").await;
+    let sibling = created_key(&fixture, &network, "docs/foobar/x").await;
+    let prefix = format!("{network}/docs/foo/");
+    let proof = grant_owner_to_device(
+        &fixture,
+        "docs-foo-prefix",
+        &[(prefix.as_str(), DECRYPT_ACTION)],
+    )
+    .await?;
+    for (path, public) in [("docs/foo/x", &inside), ("docs/foo/deep/y", &deep)] {
+        let (status, text) = device_decrypt(
+            &fixture,
+            proof,
+            &network,
+            path,
+            &DecryptCase::wrapped_to(public),
+        )
+        .await;
+        assert_eq!(status, Status::Ok, "{path}: {text}");
+    }
+    let (status, text) = device_decrypt(
+        &fixture,
+        proof,
+        &network,
+        "docs/foobar/x",
+        &DecryptCase::wrapped_to(&sibling),
+    )
+    .await;
+    assert_eq!(status, Status::Forbidden, "{text}");
     Ok(())
 }

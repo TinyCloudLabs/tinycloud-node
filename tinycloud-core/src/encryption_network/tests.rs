@@ -1865,8 +1865,8 @@ async fn rows_that_cannot_be_read_as_keys_are_corrupt() {
     // A deletable row that is not deleted and has no seed.
     svc.create_key(&key_loc("apps/foo/x"), true).await.unwrap();
     force_row(&db, "apps/foo/x", "active", None).await;
-    // A deletable row whose seed is 32 zero bytes, not a sealed value: the
-    // lenient unseal would return it unchanged as an all-zero seed.
+    // A deletable row whose seed is 32 zero bytes, which is not a sealed
+    // value: a seed opens only through the versioned, authenticated unseal.
     svc.create_key(&key_loc("apps/foo/y"), true).await.unwrap();
     force_row(&db, "apps/foo/y", "active", Some(vec![0u8; 32])).await;
     // A deterministic row under apps/, and a deletable row outside it.
@@ -1889,8 +1889,7 @@ async fn rows_that_cannot_be_read_as_keys_are_corrupt() {
             );
         }
     }
-    // A zeroed seed is refused by the strict unseal when the key is read; the
-    // lenient unseal would have returned it unchanged.
+    // A zeroed seed does not open when the key is read.
     let err = svc
         .unwrap_named_key(&key_loc("apps/foo/y"), &[0u8; 96], 1)
         .await
@@ -1930,7 +1929,7 @@ async fn public_get_under_apps_never_answers_with_a_key() {
         matches!(err, EncryptionServiceError::KeyNotFound),
         "{err:?}"
     );
-    // Outside apps/ the derived key is still served for a missing path.
+    // Outside apps/ the network state is checked: a revoked network is refused.
     let err = svc.public_key(&key_loc("docs/a")).await.unwrap_err();
     assert!(
         matches!(err, EncryptionServiceError::NetworkNotActive(_)),
@@ -2103,4 +2102,252 @@ async fn per_app_prefix_cap_ignores_keys_of_an_app_id_that_extends_it() {
         matches!(err, EncryptionServiceError::KeyLimitExceeded),
         "{err:?}"
     );
+}
+
+// `apps/` keys through the release guard and the key lifecycle.
+
+/// A decrypt request for `body_path` at `version` carrying `key_public` as the
+/// wrapping key, authorized by a capability on `capability_loc`.
+async fn app_decrypt(
+    svc: &EncryptionService,
+    key_public: &[u8],
+    capability_loc: &KeyLocation,
+    body_path: &str,
+    version: i64,
+) -> Result<(), EncryptionServiceError> {
+    let net = network_id();
+    let ctx = make_client_request(key_public);
+    let (_, body_value) = key_body(&ctx, &net, body_path, version);
+    let invocation = key_invocation(
+        capability_loc,
+        key_facts(&ctx, &net, &body_value, body_path, version),
+    );
+    let target = DecryptTarget::from_resource(&canonical_key_urn(capability_loc)).unwrap();
+    svc.decrypt_authorized(&target, &invocation, &body_value)
+        .await
+        .map(|_| ())
+}
+
+#[tokio::test]
+async fn app_key_decrypt_round_trip_returns_rewrapped_key_at_its_version() {
+    let svc = make_service(fresh_db().await);
+    create_network(&svc).await;
+    let net = network_id();
+    let loc = key_loc("apps/foo/alpha");
+    let key = svc.create_key(&loc, true).await.unwrap();
+    let ctx = make_client_request(&key.public_encryption_key);
+    let (_, body_value) = key_body(&ctx, &net, "apps/foo/alpha", 1);
+    let invocation = key_invocation(
+        &loc,
+        key_facts(&ctx, &net, &body_value, "apps/foo/alpha", 1),
+    );
+    let target = DecryptTarget::from_resource(&canonical_key_urn(&loc)).unwrap();
+    let verified = svc
+        .decrypt_authorized(&target, &invocation, &body_value)
+        .await
+        .unwrap();
+    assert_eq!(verified.response.key_version, 1);
+    let rewrapped = STANDARD
+        .decode(&verified.response.wrapped_key)
+        .expect("base64 wrapped key");
+    assert_eq!(
+        unwrap_with_secret(&ctx.receiver_secret, &rewrapped),
+        ctx.symmetric
+    );
+}
+
+#[tokio::test]
+async fn app_key_decrypt_refuses_body_key_path_mismatch_and_sibling_capability() {
+    let svc = make_service(fresh_db().await);
+    create_network(&svc).await;
+    let alpha = key_loc("apps/foo/alpha");
+    let beta = key_loc("apps/foo/beta");
+    let key = svc.create_key(&alpha, true).await.unwrap();
+    svc.create_key(&beta, true).await.unwrap();
+    let public = key.public_encryption_key;
+    let err = app_decrypt(&svc, &public, &alpha, "apps/foo/beta", 1)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, EncryptionServiceError::KeyPathInvalid(_)),
+        "{err:?}"
+    );
+    // The request names alpha while the invocation's capability is on beta.
+    let net = network_id();
+    let ctx = make_client_request(&public);
+    let (_, body_value) = key_body(&ctx, &net, "apps/foo/alpha", 1);
+    let invocation = key_invocation(
+        &beta,
+        key_facts(&ctx, &net, &body_value, "apps/foo/alpha", 1),
+    );
+    let target = DecryptTarget::from_resource(&canonical_key_urn(&alpha)).unwrap();
+    let err = svc
+        .decrypt_authorized(&target, &invocation, &body_value)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, EncryptionServiceError::Unauthorized),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn app_key_decrypt_refuses_blocked_missing_and_other_version() {
+    let svc = make_service(fresh_db().await);
+    create_network(&svc).await;
+    let loc = key_loc("apps/foo/alpha");
+    let key = svc.create_key(&loc, true).await.unwrap();
+    let public = key.public_encryption_key;
+    let err = app_decrypt(&svc, &public, &loc, "apps/foo/alpha", 2)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EncryptionServiceError::KeyDeleted), "{err:?}");
+
+    svc.block_key(&loc).await.unwrap();
+    let err = app_decrypt(&svc, &public, &loc, "apps/foo/alpha", 1)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EncryptionServiceError::KeyBlocked), "{err:?}");
+    svc.unblock_key(&loc).await.unwrap();
+    app_decrypt(&svc, &public, &loc, "apps/foo/alpha", 1)
+        .await
+        .expect("an unblocked key decrypts");
+
+    let missing = key_loc("apps/foo/missing");
+    let err = app_decrypt(&svc, &public, &missing, "apps/foo/missing", 1)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, EncryptionServiceError::KeyNotFound),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn unwrap_named_key_refuses_blocked_and_missing_app_keys() {
+    let svc = make_service(fresh_db().await);
+    create_network(&svc).await;
+    let loc = key_loc("apps/foo/alpha");
+    let key = svc.create_key(&loc, true).await.unwrap();
+    let wrapped = wrap_to_public_key(&key.public_encryption_key, &[0x5Au8; 32]).unwrap();
+    svc.block_key(&loc).await.unwrap();
+    let err = svc.unwrap_named_key(&loc, &wrapped, 1).await.unwrap_err();
+    assert!(matches!(err, EncryptionServiceError::KeyBlocked), "{err:?}");
+    let err = svc
+        .unwrap_named_key(&key_loc("apps/foo/missing"), &wrapped, 1)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, EncryptionServiceError::KeyNotFound),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn app_keys_need_an_existing_active_network() {
+    let svc = make_service(fresh_db().await);
+    let loc = key_loc("apps/foo/alpha");
+    let err = svc.create_key(&loc, true).await.unwrap_err();
+    assert!(
+        matches!(err, EncryptionServiceError::NetworkNotFound),
+        "{err:?}"
+    );
+
+    create_network(&svc).await;
+    let key = svc.create_key(&loc, true).await.unwrap();
+    let wrapped = wrap_to_public_key(&key.public_encryption_key, &[0x5Au8; 32]).unwrap();
+    svc.revoke_network(&network_id()).await.unwrap();
+    let err = svc
+        .create_key(&key_loc("apps/foo/beta"), true)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, EncryptionServiceError::NetworkNotActive(s) if s == "revoked"),
+        "{err:?}"
+    );
+    let err = svc.unwrap_named_key(&loc, &wrapped, 1).await.unwrap_err();
+    assert!(
+        matches!(&err, EncryptionServiceError::NetworkNotActive(s) if s == "revoked"),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn unknown_stored_state_on_an_app_key_is_a_corrupt_row() {
+    let (db, svc) = service_with_network().await;
+    let loc = key_loc("apps/foo/alpha");
+    let key = svc.create_key(&loc, true).await.unwrap();
+    let wrapped = wrap_to_public_key(&key.public_encryption_key, &[0x5Au8; 32]).unwrap();
+    let seed = key_row(&db, "apps/foo/alpha").await.sealed_seed;
+    force_row(&db, "apps/foo/alpha", "retired", seed).await;
+    for result in [
+        svc.unwrap_named_key(&loc, &wrapped, 1).await.map(|_| ()),
+        svc.describe_key(&loc).await.map(|_| ()),
+        svc.block_key(&loc).await.map(|_| ()),
+        svc.unblock_key(&loc).await.map(|_| ()),
+        svc.create_key(&loc, true).await.map(|_| ()),
+    ] {
+        assert!(
+            matches!(result, Err(EncryptionServiceError::CorruptKeyRow)),
+            "{result:?}"
+        );
+    }
+}
+
+// PostgreSQL-backed; CI-only. Block, unblock and create wait for the network
+// row lock: with a transaction on a second pool holding it, each operation is
+// still pending after 800 ms and completes once the lock is released.
+#[tokio::test]
+async fn postgres_key_writes_wait_for_the_network_row_lock() {
+    use sea_orm::{ConnectionTrait, TransactionTrait};
+    use std::time::Duration;
+
+    let Some(fixture) = PostgresTestSchema::migrated_through(
+        "postgres_key_writes_wait_for_the_network_row_lock",
+        None,
+    )
+    .await
+    else {
+        return;
+    };
+    let db = fixture.connect(4).await;
+    let holder_pool = fixture.connect(1).await;
+    let svc = Arc::new(make_service(db.clone()));
+    create_network(&svc).await;
+    svc.create_key(&key_loc("apps/foo/x"), true).await.unwrap();
+    svc.create_key(&key_loc("apps/foo/gone"), true)
+        .await
+        .unwrap();
+    force_row(&db, "apps/foo/gone", "deleted", None).await;
+
+    for operation in ["block", "unblock", "create", "reinstall"] {
+        let lock = holder_pool.begin().await.unwrap();
+        lock.execute_unprepared("SELECT 1 FROM encryption_network FOR UPDATE")
+            .await
+            .unwrap();
+        let pending = {
+            let svc = svc.clone();
+            tokio::spawn(async move {
+                match operation {
+                    "block" => svc.block_key(&key_loc("apps/foo/x")).await,
+                    "unblock" => svc.unblock_key(&key_loc("apps/foo/x")).await,
+                    "create" => svc.create_key(&key_loc("apps/foo/new"), true).await,
+                    _ => svc.create_key(&key_loc("apps/foo/gone"), true).await,
+                }
+            })
+        };
+        let mut pending = pending;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(800), &mut pending)
+                .await
+                .is_err(),
+            "{operation} finished while the network row lock was held"
+        );
+        lock.commit().await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(20), pending)
+            .await
+            .unwrap_or_else(|_| panic!("{operation} did not finish after the lock was released"))
+            .unwrap();
+        result.unwrap_or_else(|e| panic!("{operation}: {e}"));
+    }
 }

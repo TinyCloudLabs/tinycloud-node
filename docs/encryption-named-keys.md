@@ -81,7 +81,8 @@ request's `keyVersion` must equal the row's version, otherwise 403
 
 A SIWE (CACAO) delegation issued by the key owner that carries any ability
 other than `key.block` on a key or prefix under `apps/<app id>` requires the
-app id to be bound to the SIWE `domain`: the domain has no port, is a DNS name
+app id to be bound to the SIWE `domain`. The SIWE `scheme` is absent or
+`https`. The domain has no port (and no empty port or user info), is a DNS name
 of at least two labels (no IP literal, no `localhost`, no trailing dot), and the
 app id equals its labels reversed and joined with `.`, or starts with that and
 `.` (the domain is compared in its lowercase ASCII form). UCAN delegations are

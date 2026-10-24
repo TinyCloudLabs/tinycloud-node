@@ -582,9 +582,8 @@ mod tests {
     #[test]
     fn seeds_open_only_through_the_strict_unseal() {
         let backend = LocalOneOfOneBackend::new(seal_key());
-        // The lenient unseal returns input without the version byte unchanged.
-        // A zeroed value would therefore open as an all-zero seed; the strict
-        // unseal refuses it.
+        // A seed opens only when it is a versioned, authenticated sealed value
+        // of exactly 32 bytes; an all-zero value of any length is refused.
         for refused in [
             vec![0u8; 32],
             vec![0u8; 45],
