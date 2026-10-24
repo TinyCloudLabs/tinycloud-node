@@ -2261,7 +2261,7 @@ fn counter(name: &str, labels: &[(&str, &str)]) -> f64 {
         .sum()
 }
 
-/// [F2][C2] Roots are capped at registration time + 31 days (+5 minutes of
+/// Roots are capped at registration time + 31 days (+5 minutes of
 /// skew) with `nbf <= exp`, in both modes; a root shaped like a released
 /// SDK's is accepted.
 async fn root_lifetime_is_capped_in_both_modes(backend: Backend) -> anyhow::Result<()> {
@@ -2379,7 +2379,7 @@ async fn enforce_refuses_roots_outliving_their_authority(backend: Backend) -> an
 }
 on_both_backends!(enforce_refuses_roots_outliving_their_authority);
 
-/// [F9] Under `enforce`, an older grant that outlives the root is chosen
+/// Under `enforce`, an older grant that outlives the root is chosen
 /// over a newer one that does not, so the registration is accepted.
 async fn enforce_chooses_the_grant_that_outlives_the_root(backend: Backend) -> anyhow::Result<()> {
     let Some(h) = Harness::with_boot(
@@ -2444,7 +2444,7 @@ async fn info_advertises_the_owner_authority_mode(backend: Backend) -> anyhow::R
 }
 on_both_backends!(info_advertises_the_owner_authority_mode);
 
-/// [F2] A legacy registration whose root outlives 31 days is classified as
+/// A legacy registration whose root outlives 31 days is classified as
 /// before and counted, not refused.
 async fn legacy_long_roots_are_counted_not_refused(backend: Backend) -> anyhow::Result<()> {
     let Some(h) = Harness::new(
@@ -2485,7 +2485,7 @@ async fn legacy_long_roots_are_counted_not_refused(backend: Backend) -> anyhow::
 }
 on_both_backends!(legacy_long_roots_are_counted_not_refused);
 
-/// [F6] A registration after the cutover with no classification (written by
+/// A registration after the cutover with no classification (written by
 /// an older binary) gets the lifetime cap, unlike a legacy one.
 async fn post_cutover_unclassified_rows_get_the_lifetime_cap(
     backend: Backend,
@@ -2521,7 +2521,7 @@ async fn post_cutover_unclassified_rows_get_the_lifetime_cap(
 }
 on_both_backends!(post_cutover_unclassified_rows_get_the_lifetime_cap);
 
-/// [F6] Under `enforce`, a post-cutover unclassified row whose root outlives
+/// Under `enforce`, a post-cutover unclassified row whose root outlives
 /// its only authority is recorded `unknown`.
 async fn post_cutover_rows_outliving_their_authority_are_unknown_under_enforce(
     backend: Backend,
