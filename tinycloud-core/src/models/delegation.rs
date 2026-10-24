@@ -344,13 +344,18 @@ fn check_sql_caveats_supported(
 
 /// A SIWE (CACAO) delegation issued by the owner of a key or key prefix under
 /// `apps/<app id>` carries only `key.block` on it, unless the app id is bound
-/// to the SIWE domain (a host name with no port). UCAN delegations are not
-/// checked.
+/// to the SIWE domain: the SIWE scheme is absent or `https`, and the domain is
+/// a host name with no port. UCAN delegations are not checked.
 fn check_app_id_domain_binding(delegation: &util::DelegationInfo) -> Result<(), DelegationError> {
     let TinyCloudDelegation::Cacao(cacao) = &delegation.delegation else {
         return Ok(());
     };
-    let domain = &cacao.payload().domain;
+    let payload = cacao.payload();
+    let domain = &payload.domain;
+    let https = payload
+        .scheme
+        .as_ref()
+        .is_none_or(|scheme| scheme.as_str() == "https");
     for cap in &delegation.capabilities {
         if cap.ability.to_string() == crate::encryption_network::KEY_BLOCK_ACTION
             || !is_root_authority(cap, &delegation.delegator)
@@ -370,8 +375,10 @@ fn check_app_id_domain_binding(delegation: &util::DelegationInfo) -> Result<(), 
         let Some(app_id) = key_id::app_id_of(location.path()) else {
             continue;
         };
-        let bound = domain.port().is_none()
+        let bound = https
+            && domain.port().is_none()
             && !domain.as_str().contains('@')
+            && !domain.as_str().ends_with(':')
             && crate::encryption_network::app_id::app_id_bound_to_host(domain.host(), app_id);
         if !bound {
             return Err(DelegationError::AppIdNotBound);
@@ -1969,7 +1976,7 @@ mod tests {
     #[tokio::test]
     async fn malformed_key_identifiers_are_refused_in_delegations() {
         let db = database().await;
-        let prefix = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/docs/");
+        let prefix = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/");
         let mut skipped = 0;
         for (index, resource) in key_id::MALFORMED_KEY_IDS.iter().enumerate() {
             // Ids that fail URI parsing cannot be built into a capability, so there is nothing to admit or refuse.
@@ -2002,7 +2009,7 @@ mod tests {
             );
         }
         assert_eq!(
-            skipped, 2,
+            skipped, 4,
             "URI-invalid key identifiers in MALFORMED_KEY_IDS"
         );
     }
@@ -2069,6 +2076,193 @@ mod tests {
             ),
             "terminal parent accepted for redelegation"
         );
+    }
+
+    fn app_key() -> String {
+        format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/foo/x")
+    }
+
+    fn app_prefix() -> String {
+        format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/foo/")
+    }
+
+    const KEY_DELETE: &str = "tinycloud.encryption/key.delete";
+
+    /// key.delete on a key or prefix under `apps/` is refused in every shape
+    /// of delegation: owner root, non-owner, with a parent, chained, and a SIWE
+    /// root whose app id is bound to its domain.
+    #[tokio::test]
+    async fn app_key_delete_is_refused_in_every_delegation() {
+        let db = database().await;
+        let parent = crate::hash::hash(b"app-prefix-grant-for-delete");
+        insert_parent_grant(
+            &db,
+            parent,
+            KEY_OWNER,
+            OTHER_DID,
+            &app_prefix(),
+            KEY_DECRYPT,
+        )
+        .await;
+        let refused = |result: Result<(), Error>| {
+            matches!(
+                result,
+                Err(Error::InvalidDelegation(
+                    DelegationError::KeyDeleteNotDelegable
+                ))
+            )
+        };
+        for resource in [app_key(), app_prefix()] {
+            let owner = key_grant_info(KEY_OWNER, &resource, KEY_DELETE, &[]);
+            assert!(
+                refused(validate(&db, &owner).await),
+                "owner root {resource}"
+            );
+            let stranger = key_grant_info(OTHER_DID, &resource, KEY_DELETE, &[]);
+            assert!(
+                refused(validate(&db, &stranger).await),
+                "non-owner {resource}"
+            );
+            let owner_with_parent = key_grant_info(KEY_OWNER, &resource, KEY_DELETE, &[parent]);
+            assert!(
+                refused(validate(&db, &owner_with_parent).await),
+                "owner with parent {resource}"
+            );
+            let chained = key_grant_info(OTHER_DID, &resource, KEY_DELETE, &[parent]);
+            assert!(refused(validate(&db, &chained).await), "chained {resource}");
+        }
+        let tail = ["apps/xyz.tinycloud.listen/x", "apps/xyz.tinycloud.listen/"];
+        for tail in tail {
+            let info = siwe_key_grants("listen.tinycloud.xyz", &[(tail, KEY_DELETE)]);
+            assert!(
+                refused(validate(&db, &info).await),
+                "bound SIWE root {tail}"
+            );
+        }
+    }
+
+    /// A prefix grant cited as a parent covers a key and a narrower prefix
+    /// below it, under `apps/`.
+    #[tokio::test]
+    async fn app_prefix_grant_covers_app_keys_below_it_through_parent() {
+        let db = database().await;
+        let parent = crate::hash::hash(b"app-prefix-grant-covers");
+        insert_parent_grant(
+            &db,
+            parent,
+            KEY_OWNER,
+            OTHER_DID,
+            &app_prefix(),
+            KEY_DECRYPT,
+        )
+        .await;
+        for child in [
+            app_key(),
+            format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/foo/a/b"),
+            format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/foo/sub/"),
+        ] {
+            let info = key_grant_info(OTHER_DID, &child, KEY_DECRYPT, &[parent]);
+            validate(&db, &info)
+                .await
+                .unwrap_or_else(|e| panic!("{child}: {e}"));
+        }
+        // Not the prefix's own key name, a sibling app id, nor the owner's other namespaces.
+        for child in [
+            format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/foobar/x"),
+            format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/foo.bar/x"),
+            format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/bar/x"),
+            format!("urn:tinycloud:encryption:{KEY_OWNER}:default/docs/foo/x"),
+            format!("urn:tinycloud:encryption:{KEY_OWNER}:other/apps/foo/x"),
+        ] {
+            let info = key_grant_info(OTHER_DID, &child, KEY_DECRYPT, &[parent]);
+            assert!(
+                matches!(
+                    validate(&db, &info).await,
+                    Err(Error::InvalidDelegation(
+                        DelegationError::UnauthorizedCapability(_, _)
+                    ))
+                ),
+                "{child} covered"
+            );
+        }
+    }
+
+    /// A child prefix wider than the parent's prefix is not covered, under `apps/`.
+    #[tokio::test]
+    async fn broader_app_prefix_is_not_covered_by_parent() {
+        let db = database().await;
+        let parent = crate::hash::hash(b"app-prefix-grant-narrow");
+        let narrow = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/foo/x/");
+        insert_parent_grant(&db, parent, KEY_OWNER, OTHER_DID, &narrow, KEY_DECRYPT).await;
+        let info = key_grant_info(OTHER_DID, &app_prefix(), KEY_DECRYPT, &[parent]);
+        assert!(matches!(
+            validate(&db, &info).await,
+            Err(Error::InvalidDelegation(
+                DelegationError::UnauthorizedCapability(_, _)
+            ))
+        ));
+    }
+
+    /// A parent issued in another owner's namespace does not cover an `apps/` key.
+    #[tokio::test]
+    async fn app_parent_for_other_owner_does_not_cover_key() {
+        const OTHER_OWNER: &str = "did:pkh:eip155:1:0x0000000000000000000000000000000000000001";
+        let db = database().await;
+        let parent = crate::hash::hash(b"app-prefix-grant-other-owner");
+        let prefix = format!("urn:tinycloud:encryption:{OTHER_OWNER}:default/apps/foo/");
+        insert_parent_grant(&db, parent, OTHER_OWNER, OTHER_DID, &prefix, KEY_DECRYPT).await;
+        let info = key_grant_info(OTHER_DID, &app_key(), KEY_DECRYPT, &[parent]);
+        assert!(matches!(
+            validate(&db, &info).await,
+            Err(Error::InvalidDelegation(
+                DelegationError::UnauthorizedCapability(_, _)
+            ))
+        ));
+    }
+
+    /// A terminal grant on an `apps/` prefix cannot be cited for a redelegation.
+    #[tokio::test]
+    async fn terminal_app_parent_grant_cannot_be_redelegated() {
+        let db = database().await;
+        let parent = crate::hash::hash(b"terminal-app-parent-grant");
+        insert_terminal_parent_grant(
+            &db,
+            parent,
+            KEY_OWNER,
+            OTHER_DID,
+            &app_prefix(),
+            KEY_DECRYPT,
+        )
+        .await;
+        let info = key_grant_info(OTHER_DID, &app_key(), KEY_DECRYPT, &[parent]);
+        assert!(matches!(
+            validate(&db, &info).await,
+            Err(Error::InvalidDelegation(
+                DelegationError::TerminalParentCannotRedelegate
+            ))
+        ));
+    }
+
+    /// With named keys off, a grant on an `apps/` key or prefix is refused for
+    /// the owner and for anyone else, before any parent is looked up.
+    #[tokio::test]
+    async fn app_key_grants_are_refused_when_named_keys_are_off() {
+        let db = database().await;
+        for delegator in [KEY_OWNER, OTHER_DID] {
+            for resource in [app_key(), app_prefix()] {
+                let info = key_grant_info(delegator, &resource, KEY_DECRYPT, &[]);
+                let refused = validate_with(&db, &info, false, false).await;
+                assert!(
+                    matches!(
+                        refused,
+                        Err(Error::InvalidDelegation(
+                            DelegationError::NamedKeysUnavailable
+                        ))
+                    ),
+                    "{delegator} on {resource}: {refused:?}"
+                );
+            }
+        }
     }
 
     fn wire(list: serde_json::Value) -> Caveats {
@@ -2153,22 +2347,27 @@ mod tests {
 
     // Domain binding of app ids in SIWE roots.
 
-    /// A SIWE CACAO from the fixed test address with `domain`, granting each
-    /// `(resource tail under the key owner's `default` network, ability)`.
-    /// The delegator is the address's did:pkh; resources use that owner.
-    fn siwe_key_grants(domain: &str, grants: &[(&str, &str)]) -> util::DelegationInfo {
+    /// A SIWE CACAO from the fixed test address with `scheme` (None: absent)
+    /// and `domain`, granting each `(resource tail under the key owner's
+    /// `default` network, ability)`. The delegator is the address's did:pkh;
+    /// resources use that owner.
+    fn siwe_key_grants_with_scheme(
+        scheme: Option<&str>,
+        domain: &str,
+        grants: &[(&str, &str)],
+    ) -> util::DelegationInfo {
         use std::collections::BTreeMap;
         use tinycloud_auth::cacaos::siwe::{Message, Version};
         use tinycloud_auth::cacaos::siwe_cacao::{Header, Signature, SiweCacao};
         let message = |domain: &str| Message {
-            scheme: Some("https".parse().unwrap()),
+            scheme: scheme.map(|scheme| scheme.parse().unwrap()),
             domain: domain.parse().unwrap(),
             address: [1; 20],
             statement: None,
             uri: "did:key:z6MkTestDelegatee".parse().unwrap(),
             version: Version::V1,
             chain_id: 1,
-            nonce: "n2bnonce".into(),
+            nonce: "siwenonce".into(),
             issued_at: "2020-01-01T00:00:00Z".parse().unwrap(),
             expiration_time: Some("2100-01-01T00:00:00Z".parse().unwrap()),
             not_before: None,
@@ -2196,6 +2395,11 @@ mod tests {
             );
         }
         util::DelegationInfo::try_from(wrap(recap.build_message(message(domain)).unwrap())).unwrap()
+    }
+
+    /// As [`siwe_key_grants_with_scheme`], with scheme `https`.
+    fn siwe_key_grants(domain: &str, grants: &[(&str, &str)]) -> util::DelegationInfo {
+        siwe_key_grants_with_scheme(Some("https"), domain, grants)
     }
 
     const KEY_CREATE: &str = "tinycloud.encryption/key.create";
@@ -2291,6 +2495,43 @@ mod tests {
         }
     }
 
+    /// The SIWE scheme must be absent (EIP-4361: https) or `https`.
+    #[tokio::test]
+    async fn siwe_scheme_other_than_https_binds_nothing() {
+        let db = database().await;
+        let grants = [("apps/xyz.tinycloud.listen/x", KEY_CREATE)];
+        for scheme in ["http", "wss", "ws", "ftp"] {
+            let info = siwe_key_grants_with_scheme(Some(scheme), "listen.tinycloud.xyz", &grants);
+            assert!(
+                app_binding_refused(validate(&db, &info).await),
+                "scheme {scheme}"
+            );
+        }
+        for scheme in [None, Some("https")] {
+            let info = siwe_key_grants_with_scheme(scheme, "listen.tinycloud.xyz", &grants);
+            validate(&db, &info)
+                .await
+                .unwrap_or_else(|e| panic!("scheme {scheme:?}: {e}"));
+        }
+        // `key.block` is exempt whatever the scheme.
+        let info = siwe_key_grants_with_scheme(
+            Some("http"),
+            "listen.tinycloud.xyz",
+            &[("apps/xyz.tinycloud.listen/x", KEY_BLOCK)],
+        );
+        validate(&db, &info).await.expect("block is exempt");
+    }
+
+    #[tokio::test]
+    async fn siwe_domain_with_an_empty_port_binds_nothing() {
+        let db = database().await;
+        let info = siwe_key_grants(
+            "listen.tinycloud.xyz:",
+            &[("apps/xyz.tinycloud.listen/x", KEY_CREATE)],
+        );
+        assert!(app_binding_refused(validate(&db, &info).await));
+    }
+
     #[tokio::test]
     async fn domain_binding_covers_only_keys_under_apps_and_only_siwe_roots() {
         let db = database().await;
@@ -2327,28 +2568,32 @@ mod tests {
         .unwrap();
         let cases = vectors["hostBinding"].as_array().unwrap();
         assert_eq!(cases.len(), 23);
-        let mut decided = 0;
+        let (mut decided, mut skipped) = (0, 0);
         for case in cases {
             let origin = case["origin"].as_str().unwrap();
             let id = case["id"].as_str().unwrap();
             let bound = case["bound"].as_bool().unwrap();
-            // A SIWE domain is a bare ASCII authority and an app id is ASCII:
-            // neither can carry a Unicode name, and a domain cannot have a
-            // trailing dot (those cases are decided on the host in `app_id`).
-            let Some(domain) = origin.strip_prefix("https://") else {
-                continue;
-            };
-            if !domain.is_ascii() || !id.is_ascii() || domain.ends_with('.') {
+            let (scheme, domain) = origin.split_once("://").unwrap();
+            // A SIWE domain is an ASCII authority and an app id is ASCII: a
+            // Unicode host name or id cannot be carried (those cases are
+            // decided on the host in `app_id`).
+            if !domain.is_ascii() || !id.is_ascii() {
+                skipped += 1;
                 continue;
             }
             decided += 1;
-            let info = siwe_key_grants(domain, &[(&format!("apps/{id}/x"), KEY_CREATE)]);
-            assert_eq!(
-                validate(&db, &info).await.is_ok(),
-                bound,
-                "origin {origin} id {id}"
+            let info = siwe_key_grants_with_scheme(
+                Some(scheme),
+                domain,
+                &[(&format!("apps/{id}/x"), KEY_CREATE)],
             );
+            let result = validate(&db, &info).await;
+            if bound {
+                result.unwrap_or_else(|e| panic!("origin {origin} id {id}: {e}"));
+            } else {
+                assert!(app_binding_refused(result), "origin {origin} id {id}");
+            }
         }
-        assert!(decided >= 18, "decided {decided}");
+        assert_eq!((decided, skipped), (20, 3));
     }
 }
