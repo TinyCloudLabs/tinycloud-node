@@ -222,6 +222,7 @@ impl Signer {
 
     fn siwe_message(
         &self,
+        scheme: Option<&str>,
         uri: &str,
         nonce: &str,
         issued_at: OffsetDateTime,
@@ -232,7 +233,7 @@ impl Signer {
             anyhow::bail!("not a did:pkh signer");
         };
         Ok(Message {
-            scheme: Some("https".parse()?),
+            scheme: scheme.map(|scheme| scheme.parse()).transpose()?,
             domain: "tc1423.test".parse()?,
             address: *address,
             statement: None,
@@ -251,6 +252,19 @@ impl Signer {
     /// An encoded delegation to `audience`.
     pub fn delegate(
         &self,
+        audience: &str,
+        grants: &[(String, &str)],
+        window: Window,
+        proofs: &[Cid],
+    ) -> anyhow::Result<String> {
+        self.delegate_with_scheme(Some("https"), audience, grants, window, proofs)
+    }
+
+    /// As [`Signer::delegate`], with the SIWE `scheme` of a did:pkh signer
+    /// (`None`: absent).
+    pub fn delegate_with_scheme(
+        &self,
+        scheme: Option<&str>,
         audience: &str,
         grants: &[(String, &str)],
         window: Window,
@@ -283,6 +297,7 @@ impl Signer {
                     );
                 }
                 let message = recap.build_message(self.siwe_message(
+                    scheme,
                     audience,
                     &nonce,
                     window.not_before,
@@ -328,6 +343,7 @@ impl Signer {
             Self::Pkh { .. } => {
                 anyhow::ensure!(proofs.is_empty(), "SIWE fixtures carry no proofs");
                 let message = self.siwe_message(
+                    Some("https"),
                     &format!("ucan:{cid}"),
                     &unique("tc1423revoke"),
                     now(),

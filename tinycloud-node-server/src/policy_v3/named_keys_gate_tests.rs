@@ -365,3 +365,46 @@ async fn startup_refuses_a_non_deletable_key_row_under_apps(
     Ok(())
 }
 on_both_backends!(startup_refuses_a_non_deletable_key_row_under_apps);
+
+/// With named keys on, `/delegate` refuses an `apps/` grant from a SIWE whose
+/// scheme is not `https` even when its domain is bound to the app id, and
+/// admits it when the scheme is `https` (any case) or absent.
+async fn siwe_app_grants_need_an_https_or_absent_scheme(backend: Backend) -> anyhow::Result<()> {
+    let Some(h) = Harness::new_with(
+        backend,
+        Shape::PkhSession,
+        "siwe_app_grants_need_an_https_or_absent_scheme",
+        |config| config.encryption_network.named_keys_v1 = true,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let window = || Window::until(now() + Duration::hours(1));
+    // `tc1423.test` is the harness SIWE domain, so `test.tc1423` is bound to it.
+    let grants = vec![(format!("{}/apps/test.tc1423/x", h.network), KEY_CREATE)];
+    for scheme in ["http", "wss", "ws"] {
+        let authorization = h.space_owner.delegate_with_scheme(
+            Some(scheme),
+            h.owner.did(),
+            &grants,
+            window(),
+            &[],
+        )?;
+        let (status, body) = h.delegate(authorization).await;
+        assert_ne!(status, Status::Ok, "scheme {scheme}: {body}");
+        assert!(
+            body.starts_with(APP_ID_NOT_BOUND),
+            "scheme {scheme}: {body}"
+        );
+    }
+    for scheme in [Some("https"), Some("HTTPS"), None] {
+        let authorization =
+            h.space_owner
+                .delegate_with_scheme(scheme, h.owner.did(), &grants, window(), &[])?;
+        let (status, body) = h.delegate(authorization).await;
+        assert_eq!(status, Status::Ok, "scheme {scheme:?}: {body}");
+    }
+    Ok(())
+}
+on_both_backends!(siwe_app_grants_need_an_https_or_absent_scheme);

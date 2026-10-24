@@ -355,7 +355,7 @@ fn check_app_id_domain_binding(delegation: &util::DelegationInfo) -> Result<(), 
     let https = payload
         .scheme
         .as_ref()
-        .is_none_or(|scheme| scheme.as_str() == "https");
+        .is_none_or(|scheme| scheme.as_str().eq_ignore_ascii_case("https"));
     for cap in &delegation.capabilities {
         if cap.ability.to_string() == crate::encryption_network::KEY_BLOCK_ACTION
             || !is_root_authority(cap, &delegation.delegator)
@@ -2520,6 +2520,21 @@ mod tests {
             &[("apps/xyz.tinycloud.listen/x", KEY_BLOCK)],
         );
         validate(&db, &info).await.expect("block is exempt");
+    }
+
+    /// Schemes are case-insensitive (RFC 3986).
+    #[tokio::test]
+    async fn siwe_scheme_https_is_matched_ignoring_case() {
+        let db = database().await;
+        let grants = [("apps/xyz.tinycloud.listen/x", KEY_CREATE)];
+        for scheme in ["HTTPS", "Https"] {
+            let info = siwe_key_grants_with_scheme(Some(scheme), "listen.tinycloud.xyz", &grants);
+            validate(&db, &info)
+                .await
+                .unwrap_or_else(|e| panic!("scheme {scheme}: {e}"));
+        }
+        let info = siwe_key_grants_with_scheme(Some("HTTP"), "listen.tinycloud.xyz", &grants);
+        assert!(app_binding_refused(validate(&db, &info).await));
     }
 
     #[tokio::test]
