@@ -101,7 +101,9 @@ impl EncryptionService {
             .swap(false, std::sync::atomic::Ordering::SeqCst)
         {
             tx.rollback().await?;
-            return Err(sea_orm::DbErr::Custom("injected commit failure".to_string()));
+            return Err(sea_orm::DbErr::Custom(
+                "injected commit failure".to_string(),
+            ));
         }
         tx.commit().await
     }
