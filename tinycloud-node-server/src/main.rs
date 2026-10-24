@@ -273,6 +273,51 @@ mod tests {
     }
 
     #[test]
+    fn sql_durability_settings_default_and_take_env_overrides() {
+        use tinycloud_core::sql::durability::Synchronous;
+        let _lock = lock_env();
+        let names = [
+            "TINYCLOUD_STORAGE__SQL__SYNCHRONOUS",
+            "TINYCLOUD_STORAGE_SQL_SYNCHRONOUS",
+            "TINYCLOUD_STORAGE__SQL__MAX_DATABASE_BYTES",
+            "TINYCLOUD_STORAGE__SQL__MIN_FREE_BYTES",
+        ];
+        let _unset: Vec<_> = names.iter().map(|name| EnvVarGuard::unset(name)).collect();
+        let extract = || {
+            build_config_figment()
+                .extract::<config::Config>()
+                .expect("config should parse")
+                .storage
+                .sql
+        };
+
+        let sql = extract();
+        assert_eq!(sql.synchronous, Synchronous::Full, "full by default");
+        assert_eq!(sql.max_database_bytes.as_u64(), 0, "no cap by default");
+        assert_eq!(
+            sql.min_free_bytes.as_u64(),
+            0,
+            "headroom check off by default"
+        );
+        let policy = sql.durability();
+        assert_eq!(policy.synchronous, Synchronous::Full);
+        assert_eq!(policy.max_database_bytes, 0);
+        assert_eq!(policy.min_free_bytes, 0);
+
+        let _canonical = EnvVarGuard::set("TINYCLOUD_STORAGE__SQL__SYNCHRONOUS", "normal");
+        let _max = EnvVarGuard::set("TINYCLOUD_STORAGE__SQL__MAX_DATABASE_BYTES", "2 GiB");
+        let _free = EnvVarGuard::set("TINYCLOUD_STORAGE__SQL__MIN_FREE_BYTES", "1 GiB");
+        let sql = extract();
+        assert_eq!(sql.synchronous, Synchronous::Normal);
+        assert_eq!(sql.max_database_bytes.as_u64(), 2 << 30);
+        assert_eq!(sql.min_free_bytes.as_u64(), 1 << 30);
+        drop(_canonical);
+
+        let _legacy = EnvVarGuard::set("TINYCLOUD_STORAGE_SQL_SYNCHRONOUS", "normal");
+        assert_eq!(extract().synchronous, Synchronous::Normal);
+    }
+
+    #[test]
     fn canonical_double_underscore_loads_storage_database() {
         let _lock = lock_env();
         let _legacy = EnvVarGuard::unset("TINYCLOUD_STORAGE_DATABASE");
