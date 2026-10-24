@@ -2458,7 +2458,8 @@ where
         let attempt_id = hex::encode(attempt_bytes);
         // Registration and authorization commit before any blob can be
         // persisted. Retrying an uncertain preparatory COMMIT uses exactly the
-        // same attempt ID, so it cannot duplicate or steal another writer.
+        // same attempt ID, so the claim is recorded once and no other
+        // writer's claim is affected.
         // SQLite's preparatory write follows sequence→writer→BEGIN and
         // releases every guard before an ordinary upload.
         let mut retried = false;
@@ -2774,9 +2775,9 @@ where
     /// distinct blob, committing all claims or none; a lost connection retries
     /// the whole block with the same attempt ID. On PostgreSQL each claim
     /// statement also checks that every space the invocation names exists, so
-    /// an unhosted space is refused with the same `SpaceNotFound`, after
-    /// authorization and before any upload, as the separate COUNT it replaces.
-    /// Without a blob to claim, and on other backends, that COUNT still runs.
+    /// an unhosted space is refused with `SpaceNotFound`, after authorization
+    /// and before any upload. Without a blob to claim, and on other backends,
+    /// a separate COUNT makes that check.
     ///
     /// A separate function, not inline in the caller: see
     /// [`Self::persist_registered_blobs`].

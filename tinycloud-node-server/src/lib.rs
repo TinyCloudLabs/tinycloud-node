@@ -819,10 +819,11 @@ pub async fn app_with_control(
 
     // Migrate before opening S3: its one bucket listing both reconstructs
     // SpaceSizes and records which in-flight DELETE fences were counted.
-    // A separate HEAD after listing could race an old DELETE and leak quota.
-    // This is main's lock_timeout-bounded boot migration; the second pass in
-    // `new_with_encryption` finds the history current, then runs the CID-alias
-    // backfill with the column key before any request is served.
+    // Object sizes come from that listing; a separate HEAD afterwards could
+    // observe a DELETE in progress. The boot migration is bounded by
+    // `lock_timeout`; the second pass in `new_with_encryption` finds the
+    // history current, then runs the CID-alias backfill with the column key
+    // before any request is served.
     tinycloud_core::db::migrate(&database_connection).await?;
     let deleting_fences = tinycloud_core::kv_orphans::deleting_fences(&database_connection).await?;
     let block_store: BlockStores = match &tinycloud_config.storage.blocks {

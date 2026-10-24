@@ -383,8 +383,8 @@ pub async fn lock_candidates(
         }
         let own = attempt::Entity::find_by_id((key, *value, attempt_id.to_owned()))
             .filter(attempt::Column::Generation.eq(*generation));
-        // MySQL repeatable-read may already have an older snapshot from KV
-        // authorization. A locking read observes attempts removed by GC.
+        // MySQL repeatable-read can hold a snapshot, taken during KV authorization,
+        // from before GC removed attempts. A locking read observes the current rows.
         let own = if tx.get_database_backend() == DbBackend::MySql {
             own.lock_exclusive()
         } else {
@@ -500,8 +500,8 @@ pub async fn finish_candidates(
     Ok(())
 }
 
-/// A writer leaving makes older deferred stage claims eligible immediately
-/// without restoring their old first-attempt priority. Keep them in the retry
+/// A writer leaving makes deferred stage claims eligible immediately
+/// without restoring their first-attempt priority. Keep them in the retry
 /// queue at the database's current time so an unrelated orphan cannot be
 /// starved by repeated departures. Registration age remains immutable.
 async fn wake_attempts<C: ConnectionTrait>(

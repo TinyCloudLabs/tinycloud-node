@@ -1908,6 +1908,89 @@ pub(crate) mod tests {
         assert_eq!(store.total_size(&owner.space).await.unwrap(), Some(0));
     }
 
+    /// A put of two blobs whose later-registered blob has a pending deletion is
+    /// refused, and nothing of it is claimed: the earlier blob keeps no claim,
+    /// fence or ledger row.
+    #[tokio::test]
+    async fn two_blob_put_with_a_pending_deletion_claims_nothing() {
+        use crate::models::{kv_blob_generation, kv_orphan_attempt, kv_orphan_candidate};
+        use crate::storage::ImmutableReadStore;
+        use crate::types::SpaceIdWrap;
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set, EntityTrait};
+
+        let store = MemoryStore::default();
+        let db = SpaceDatabase::new(
+            Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
+                .await
+                .unwrap(),
+            store.clone(),
+            StaticSecret::new([0u8; 32].to_vec()).unwrap(),
+        )
+        .await
+        .unwrap();
+        let owner = Owner::generate();
+        host(&db, &owner).await;
+        let (one, two): (&[u8], &[u8]) = (b"two-blob first", b"two-blob second");
+        let (early, late) = if crate::hash::hash(one) < crate::hash::hash(two) {
+            (one, two)
+        } else {
+            (two, one)
+        };
+        let space = SpaceIdWrap(owner.space.clone());
+        let late_hash = crate::hash::hash(late);
+        let now = time::OffsetDateTime::now_utc();
+        kv_blob_generation::ActiveModel {
+            space: Set(space.clone()),
+            value: Set(late_hash),
+            generation: Set(0),
+        }
+        .insert(db.connection())
+        .await
+        .unwrap();
+        kv_orphan_candidate::ActiveModel {
+            space: Set(space.clone()),
+            value: Set(late_hash),
+            generation: Set(0),
+            created_at: Set(now),
+            deleting_at: Set(Some(now)),
+            deletion_bytes: Set(Some(1)),
+        }
+        .insert(db.connection())
+        .await
+        .unwrap();
+
+        invoke(
+            &db,
+            &owner,
+            &[Op::Put("notes/early", early), Op::Put("notes/late", late)],
+            KvInvokeOptions::default(),
+        )
+        .await
+        .unwrap_err();
+
+        let early_hash = crate::hash::hash(early);
+        let claims = kv_orphan_attempt::Entity::find()
+            .all(db.connection())
+            .await
+            .unwrap();
+        let fences = kv_orphan_candidate::Entity::find()
+            .all(db.connection())
+            .await
+            .unwrap();
+        let ledger = kv_blob_generation::Entity::find()
+            .all(db.connection())
+            .await
+            .unwrap();
+        assert!(claims.iter().all(|row| row.value != early_hash));
+        assert!(fences.iter().all(|row| row.value != early_hash));
+        assert!(ledger.iter().all(|row| row.value != early_hash));
+        assert!(
+            fences.iter().any(|row| row.value == late_hash),
+            "the pending deletion is intact"
+        );
+        assert!(!store.contains(&owner.space, &early_hash, 0).await.unwrap());
+    }
+
     /// Simulate an object store that accepted the PUT but lost its success
     /// response. The caller must still delete and refund the possible object.
     #[derive(Clone, Default)]

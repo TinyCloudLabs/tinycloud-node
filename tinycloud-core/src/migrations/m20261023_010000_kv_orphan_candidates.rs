@@ -8,9 +8,10 @@ pub struct Migration;
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
-    /// Re-runnable: every table and index is created if absent and the
-    /// `generation` columns are added only where missing, so applying the
-    /// migration again over existing tables (and their rows) changes nothing.
+    /// Re-runnable on PostgreSQL and SQLite: every table and index is created
+    /// if absent and the `generation` columns are added only where missing, so
+    /// applying the migration again over existing tables (and their rows)
+    /// changes nothing. MySQL index creation has no such guard.
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let schema = Schema::new(manager.get_database_backend());
         manager

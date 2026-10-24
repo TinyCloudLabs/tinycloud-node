@@ -574,7 +574,7 @@ async fn postgres_s3_orphan_cleanup_reclaims_space_usage() {
     )
     .await
     .unwrap();
-    assert_eq!(first[0].2, 0, "the first upload uses the legacy bare key");
+    assert_eq!(first[0].2, 0, "the first upload uses the bare key");
     assert_eq!(
         ImmutableWriteStore::<MemoryStaging>::persist(&store, &owner.space, stage, first[0].2)
             .await

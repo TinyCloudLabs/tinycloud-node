@@ -144,18 +144,17 @@ use tokio::{
 /// flows also check the responses against the fixture, and the test fails if a
 /// batch reads `current_kv` in more than one statement.
 ///
-/// KV PUT: before TC-735 on this main it is 35 (31 statements and pings, with
-/// #302 and the `epoch_head` cache write). TC-735 adds, around the upload: the
-/// preparatory transaction's `BEGIN` and `COMMIT` that pin the pre-upload
-/// authorization graph, the candidate-and-attempt registration CTE (which also
-/// checks every invocation space is hosted, so no separate query does) that
-/// durably protects the blob before upload, the preparatory connection's
-/// release ping, the joined active-fence/own-attempt lock that excludes GC
-/// after upload, and the successful-commit CTE that retires the attempt and
-/// only an already referenced last fence. A failed last attempt instead
-/// persists a deleting fence until physical absence is confirmed. SQLite and
-/// MySQL use the equivalent guarded multi-statement paths rather than the
-/// PostgreSQL-only CTEs.
+/// KV PUT is 42: 35 round trips for the put itself (31 statements and pings,
+/// with #302 and the `epoch_head` cache write) plus seven around the upload:
+/// the preparatory transaction's `BEGIN`, its authorization graph read, the
+/// candidate-and-attempt claim CTE (which also checks that every invocation
+/// space is hosted) and its `COMMIT`; the preparatory connection's release
+/// ping; the joined active-fence/own-attempt lock that excludes GC after
+/// upload; and the successful-commit CTE that retires the attempt and an
+/// already referenced last fence. A failed last attempt persists a deleting
+/// fence until physical absence is confirmed. SQLite and MySQL use the
+/// equivalent guarded multi-statement paths rather than the PostgreSQL-only
+/// CTEs.
 ///
 /// Multi-write puts (a multipart `kv/put` of several keys, one invocation):
 /// the two-key rows use the same request shape, so they differ only in how
@@ -1961,6 +1960,115 @@ async fn postgres_kv_put_begin_retry_is_bounded_and_never_follows_a_statement() 
         .await
         .expect("drop the isolated schema");
     result.expect("begin retry bounds");
+}
+
+/// TC-735: a two-blob put whose later-registered blob has a pending deletion is
+/// refused with 503 and claims nothing. The earlier blob keeps no claim, fence
+/// or ledger row, so the claims share the preparatory transaction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_two_blob_put_with_a_pending_deletion_claims_nothing() {
+    let Some(url) =
+        postgres_test_url("postgres_two_blob_put_with_a_pending_deletion_claims_nothing")
+    else {
+        return;
+    };
+    let admin = Database::connect(url.as_str())
+        .await
+        .expect("connect to PostgreSQL");
+    let schema = format!(
+        "tc735_claims_{}_{}",
+        std::process::id(),
+        time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+    );
+    admin
+        .execute(Statement::from_string(
+            DbBackend::Postgres,
+            format!("CREATE SCHEMA {schema}"),
+        ))
+        .await
+        .expect("create the isolated schema");
+    let (node, _datadir) = start_node(&url, &schema, Cut::default(), None)
+        .await
+        .expect("start the node");
+
+    let result = async {
+        let account = Account::new(44)?;
+        let session = sign_in(&node, &account).await?;
+        let (status, body, _) = kv_put(&node, &session, "tc735/warm").await?;
+        ensure!(status == Status::Ok, "warm-up put: {status} {body}");
+
+        let (one, two): (&[u8], &[u8]) = (b"route two-blob first", b"route two-blob second");
+        let (early, late) = if tinycloud_core::hash::hash(one) < tinycloud_core::hash::hash(two) {
+            (one, two)
+        } else {
+            (two, one)
+        };
+        let space = account.space.to_string();
+        let early_hash = Vec::<u8>::from(tinycloud_core::hash::hash(early));
+        let late_hash = Vec::<u8>::from(tinycloud_core::hash::hash(late));
+        let pool = node.pool();
+        tinycloud_core::sea_orm::sqlx::query(
+            "INSERT INTO kv_blob_generation (space, value, generation) VALUES ($1, $2, 0)",
+        )
+        .bind(&space)
+        .bind(&late_hash)
+        .execute(pool)
+        .await?;
+        tinycloud_core::sea_orm::sqlx::query(
+            "INSERT INTO kv_orphan_candidate
+                (space, value, generation, created_at, deleting_at, deletion_bytes)
+             VALUES ($1, $2, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 1)",
+        )
+        .bind(&space)
+        .bind(&late_hash)
+        .execute(pool)
+        .await?;
+
+        let keys = vec![
+            "tc735/pending-early".to_owned(),
+            "tc735/pending-late".to_owned(),
+        ];
+        let (content_type, multipart) = multipart_put(&keys, &[early, late]);
+        let (status, body, _) = dispatch(
+            node.client
+                .post("/invoke")
+                .header(Header::new(
+                    "Authorization",
+                    batch_invocation(&session, "tinycloud.kv/put", &keys)?,
+                ))
+                .header(content_type)
+                .body(multipart),
+        )
+        .await;
+        ensure!(
+            status == Status::ServiceUnavailable && body.starts_with("unavailable_retryable:"),
+            "two-blob put with a pending deletion: {status} {body}"
+        );
+        for table in [
+            "kv_orphan_attempt",
+            "kv_orphan_candidate",
+            "kv_blob_generation",
+        ] {
+            let rows: i64 = tinycloud_core::sea_orm::sqlx::query_scalar(&format!(
+                "SELECT count(*) FROM {table} WHERE value = $1"
+            ))
+            .bind(&early_hash)
+            .fetch_one(pool)
+            .await?;
+            ensure!(rows == 0, "{table} kept {rows} row(s) for the earlier blob");
+        }
+        Ok(())
+    }
+    .await;
+    node.pool().close().await;
+    admin
+        .execute(Statement::from_string(
+            DbBackend::Postgres,
+            format!("DROP SCHEMA {schema} CASCADE"),
+        ))
+        .await
+        .expect("drop the isolated schema");
+    result.expect("two-blob put with a pending deletion");
 }
 
 /// The `postgres` object of `/info`: exactly the two counters.

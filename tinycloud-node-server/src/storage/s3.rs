@@ -242,7 +242,7 @@ impl S3BlockStore {
         // operation. A second KV path cannot charge the same bytes again.
         let _operation = self.operations.lock(key.clone()).await;
         if self.contains(space, &hash, generation).await? {
-            // A retry of an ambiguous PUT can find its original object.
+            // A retry of an ambiguous PUT can find the object it uploaded.
             self.pending.lock().await.remove(&key);
             return Ok(());
         }

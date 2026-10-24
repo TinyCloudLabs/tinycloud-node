@@ -135,7 +135,7 @@ Read audit records every poll. Poll on demand, or no more often than every
 KV puts stage and authorize content before upload. A short preparatory
 transaction checks authorization and hosting, then commits an active
 `(space, content hash, generation)` fence and a separate claim for each
-writer. The first generation is zero and retains the original bare-hash
+writer. The first generation is zero and keeps the bare-hash
 storage key; a generation above zero is allocated only after a prior
 generation's physical deletion is confirmed. Ordinary writes release every
 pooled connection and database lock before S3 or filesystem I/O. A
@@ -168,6 +168,10 @@ nor a committed write is replayed on an uncertain outcome. A missing claim
 or a fence already deleting returns a retryable error, never a reference to
 a potentially removed object.
 
+A lost connection during the preparatory transaction that survives its retry
+answers 503 `unavailable_retryable`. The claims are idempotent per attempt ID
+and hold only candidate metadata, so no committed KV write can be affected.
+
 On PostgreSQL each claim statement also checks that every space the invocation
 names is hosted, so an unhosted space is refused after authorization and
 before any upload without a separate query. The claims of all distinct blobs
@@ -181,7 +185,7 @@ and byte entitlement, releases the DB connection, then deletes that
 generation's object. A writer seeing `deleting` cannot deduplicate or
 upload over it. Only confirmed physical absence refunds the per-process
 quota exactly once; only then is the fence retired and the next generation
-made available. Each delete targets its original generation's storage key,
+made available. Each delete targets the storage key of its own generation,
 so even a delayed second delete cannot remove a later committed generation.
 A lost DELETE response or a crash mid-delete leaves the fence for
 idempotent GC retry. Reads get the generation from their existing KV lookup,
@@ -208,23 +212,54 @@ stores the content under the next generation.
 
 ## Recovery after deploying generation-keyed blobs
 
-A fault after this change is deployed is recovered by a forward fix. Rolling
-back to a binary without this change is not a supported path. Take a named
-full database backup (a PlanetScale backup or branch) before the deployment.
+A forward fix is the default. An image rollback alone cannot boot: a binary
+without this change refuses to start while the migration row
+`m20261023_010000_kv_orphan_candidates` is recorded in `seaql_migrations`.
+Take a named full database backup (a PlanetScale backup or branch) before the
+deployment. Never run a binary without this change and one with it against the
+same database at the same time.
 
-What a binary without this change does with the data this change writes:
+What a binary without this change does with the data this change writes, once
+it is made to start:
 
-- It does not know migration `m20261023_010000_kv_orphan_candidates` and does
-  not start while that history row is recorded.
 - It reads every record at the bare hash key. A record with `generation` above
   zero is stored at `hash@N`, so it is reported as missing.
 - When it overwrites a key whose `current_kv.generation` is above zero, it
-  does not update that column. After the next deployment of this change the
-  key reads as missing until the column is repaired.
+  does not update that column. After the return to this change the key reads
+  as missing until the column is repaired.
 - It does not run the claim collector, so the claim tables stop being
   maintained.
 
-Repair `current_kv.generation` after such a window:
+Emergency path, available only while no record has `generation` above zero.
+Stop the node and run it as one `psql` script with `-v ON_ERROR_STOP=1`. The
+script raises, and changes nothing, when such a record exists:
+
+```sql
+BEGIN;
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM current_kv WHERE generation > 0)
+     OR EXISTS (SELECT 1 FROM kv_write WHERE generation > 0) THEN
+    RAISE EXCEPTION 'generation > 0 rows exist: forward fix only';
+  END IF;
+END $$;
+DELETE FROM seaql_migrations
+  WHERE version = 'm20261023_010000_kv_orphan_candidates';
+DROP TABLE kv_orphan_attempt, kv_orphan_candidate, kv_blob_generation;
+COMMIT;
+```
+
+The `generation` columns stay. Dropping the tables abandons pending deletions:
+the objects they named are not deleted, which leaks objects and loses no data.
+Deleting only the history row and keeping the tables is also supported: the
+binary without this change starts, and the return to this change applies the
+migration again over the retained tables. A deleting fence retained across such
+a window is closed by the collector without deleting a blob that a committed
+write references.
+
+On the return to this change the migration is applied again, then run the
+repair statement. It changes only rows whose generation differs from their
+write and is safe to run every time:
 
 ```sql
 UPDATE current_kv c
@@ -234,18 +269,5 @@ WHERE w.space = c.space AND w.key = c.key AND w.invocation = c.invocation
   AND c.generation <> w.generation AND NOT c.deleted;
 ```
 
-Emergency path, only while no record has `generation` above zero. Run it as
-one transaction with the node stopped, and abandon it if either count is not
-zero:
-
-```sql
-SELECT count(*) FROM current_kv WHERE generation > 0;
-SELECT count(*) FROM kv_write WHERE generation > 0;
-DELETE FROM seaql_migrations WHERE version = 'm20261023_010000_kv_orphan_candidates';
-DROP TABLE kv_orphan_attempt, kv_orphan_candidate, kv_blob_generation;
-```
-
-The `generation` columns stay. The migration skips a column that exists and
-can be applied again over existing tables and rows. A deleting fence that
-survives such a window is closed by the collector without deleting a blob that
-a committed write references.
+The migration can be applied again over its own tables and rows on PostgreSQL
+and SQLite. On MySQL its indexes are created without a guard, so it cannot.
