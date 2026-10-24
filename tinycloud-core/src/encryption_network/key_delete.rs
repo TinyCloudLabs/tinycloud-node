@@ -76,18 +76,8 @@ impl EncryptionService {
                 return Err(err);
             }
         };
-        #[cfg(test)]
-        if self
-            .fail_next_delete_commit
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
-        {
-            let _ = tx.rollback().await;
-            self.settle_aborted(&ledger, op.as_deref()).await;
-            return Err(EncryptionServiceError::Db(sea_orm::DbErr::Custom(
-                "injected commit failure".to_string(),
-            )));
-        }
-        if let Err(err) = tx.commit().await {
+        let committed = self.commit_delete(tx).await;
+        if let Err(err) = committed {
             // The commit did not happen: say so before answering.
             self.settle_aborted(&ledger, op.as_deref()).await;
             return Err(err.into());
@@ -100,6 +90,20 @@ impl EncryptionService {
             }
         }
         Ok(outcome)
+    }
+
+    /// Commits the delete's transaction. In tests the next call can be made
+    /// to fail instead, with the transaction rolled back.
+    async fn commit_delete(&self, tx: DatabaseTransaction) -> Result<(), sea_orm::DbErr> {
+        #[cfg(test)]
+        if self
+            .fail_next_delete_commit
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            tx.rollback().await?;
+            return Err(sea_orm::DbErr::Custom("injected commit failure".to_string()));
+        }
+        tx.commit().await
     }
 
     async fn delete_keys_in(
