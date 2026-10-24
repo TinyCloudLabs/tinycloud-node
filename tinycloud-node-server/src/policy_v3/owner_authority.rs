@@ -641,7 +641,7 @@ pub(super) struct OwnerAuthorityState {
     in_flight: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Slots for background classifications.
     background: BackgroundSlots,
-    /// Policies whose last classification was not final, until when.
+    /// Policies whose last classification is not final, until when.
     retry_after: std::sync::Mutex<HashMap<String, tokio::time::Instant>>,
 }
 
@@ -803,8 +803,8 @@ impl PolicyV3Runtime {
     pub async fn log_owner_authority_cutover(&self) {
         match self.legacy_cutover().await {
             // Warn when the default cutover is under a day old: that is a
-            // fresh migration, or a re-upgrade after a rollback that still
-            // needs `policy_v3.legacy_cutover` set to the first deploy time.
+            // fresh migration, or a re-upgrade after a rollback that needs
+            // `policy_v3.legacy_cutover` set to the first deploy time.
             Ok((cutover, CutoverSource::Migration))
                 if OffsetDateTime::now_utc() - cutover < Duration::days(1) =>
             {
@@ -830,7 +830,7 @@ impl PolicyV3Runtime {
 
     /// The stored classification of `registration`, classifying it first if
     /// none is stored (or a stored `unknown` came from an older classifier).
-    /// A classification that cannot be stored is still returned, unstored.
+    /// A classification that cannot be stored is returned, unstored.
     pub(super) async fn owner_binding(
         &self,
         registration: &policy_v3_registration::Model,
@@ -1511,7 +1511,7 @@ mod tests {
 
     /// A stored registration whose policy names a network that is not its
     /// content owner's is classified `unknown` / `foreign_network`, whether
-    /// it was registered before the cutover (`backfill`) or after it
+    /// it is registered before the cutover (`backfill`) or after it
     /// (`record`). A policy over the content owner's network goes on to the
     /// delegation search, which here fails for lack of a stored root.
     #[tokio::test]

@@ -2157,7 +2157,7 @@ mod tests {
 
     /// Every `Config` field except the ones listed here must load from a file
     /// that omits it, so a config written before a section existed (for
-    /// example `[sql_store]` or `[policy_v3]`) still loads. The fields are
+    /// example `[sql_store]` or `[policy_v3]`) loads. The fields are
     /// read from the struct's own serialization: a new field without
     /// `#[serde(default)]` fails here, and so does one that loses it.
     #[test]
