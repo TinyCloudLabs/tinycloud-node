@@ -13,6 +13,7 @@ use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseConnection, DatabaseTransaction, EntityTrait,
     QueryFilter, QueryOrder, TransactionTrait,
 };
+use time::{format_description::well_known::Rfc3339, OffsetDateTime, UtcOffset};
 
 use super::key::{DbRef, Lineage, ObjectKey, ObjectKind, PublishId};
 use super::object::SqlStoreError;
@@ -22,6 +23,49 @@ use crate::models::{sql_store_manifest as manifest, sql_store_object as object};
 pub const SHADOW_EPOCH: i64 = 0;
 /// Longest `space` / `db_id` the `varchar(255)` columns hold.
 const MAX_ID_CHARS: usize = 255;
+
+/// The `format` each object kind must be recorded with.
+const SNAPSHOT_FORMAT: &str = "sqlite-v1";
+const SEGMENT_FORMAT: &str = "wal-cum-v1";
+
+fn required_format(kind: ObjectKind) -> &'static str {
+    match kind {
+        ObjectKind::Snapshot => SNAPSHOT_FORMAT,
+        ObjectKind::Segment => SEGMENT_FORMAT,
+    }
+}
+
+/// Current time in the canonical `created_at` form.
+fn now_timestamp() -> String {
+    canonical_format(OffsetDateTime::now_utc())
+}
+
+/// Fixed-width UTC form `YYYY-MM-DDTHH:MM:SS.ffffffZ`, so text comparison
+/// orders by time. `at` must already be in UTC.
+fn canonical_format(at: OffsetDateTime) -> String {
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:06}Z",
+        at.year(),
+        u8::from(at.month()),
+        at.day(),
+        at.hour(),
+        at.minute(),
+        at.second(),
+        at.microsecond(),
+    )
+}
+
+/// Parses an RFC 3339 timestamp and returns its canonical UTC form.
+fn canonical_timestamp(text: &str) -> Result<String, SqlStoreError> {
+    let at = OffsetDateTime::parse(text, &Rfc3339)
+        .map_err(|_| SqlStoreError::Invalid("created_at is not an RFC 3339 timestamp"))?;
+    // Converting to UTC can leave the representable range, so it is checked.
+    let utc = at
+        .checked_to_offset(UtcOffset::UTC)
+        .filter(|utc| (0..=9999).contains(&utc.year()))
+        .ok_or(SqlStoreError::Invalid("created_at is out of range"))?;
+    Ok(canonical_format(utc))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectState {
@@ -135,9 +179,9 @@ pub struct Publish {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PublishOutcome {
     Published(Frontier),
-    /// The CAS matched nothing (stale epoch, lineage or revision, a gap, a
-    /// regressing `last_seq`, or a lost first-publish race). Not an error.
-    /// Carries the current row, if any.
+    /// The CAS matched nothing (stale epoch, lineage or revision, a regressing
+    /// `last_seq`, or a lost first-publish race). Not an error. Carries the
+    /// current row, if any.
     Lost(Option<Frontier>),
 }
 
@@ -307,9 +351,9 @@ impl DbSqlManifest {
                     .filter(C_::Lineage.eq(token.lineage.as_str()));
             }
             PublishKind::Segment { base_snapshot_key } => {
-                // from_seq > base_seq is enforced by the key, so from_seq - 1
-                // cannot underflow. last_seq in [from_seq - 1, to_seq): no gap,
-                // and it strictly advances.
+                // wal-cum-v1 segments are cumulative from base_seq + 1; publish_cas
+                // has already checked from_seq.
+                // last_seq in [from_seq - 1, to_seq): no gap, and it strictly advances.
                 let from_prev = to_i64(p.object.from_seq() - 1)?;
                 update = update
                     .filter(C_::Lineage.eq(token.lineage.as_str()))
@@ -360,6 +404,7 @@ impl DbSqlManifest {
             )
             .filter(object_pk(db, obj)?)
             .filter(object::Column::State.eq(ObjectState::Uploaded.as_str()))
+            .filter(object::Column::Format.eq(required_format(obj.kind())))
             .exec(txn)
             .await?
             .rows_affected;
@@ -399,6 +444,11 @@ impl SqlManifest for DbSqlManifest {
                 ))
             }
         }
+        if matches!(publish.kind, PublishKind::Segment { .. })
+            && obj.from_seq() != obj.base_seq() + 1
+        {
+            return Err(SqlStoreError::Invalid("segment must start at base_seq + 1"));
+        }
         let txn = self.db.begin().await?;
         let step = match Self::publish_in(&txn, db, expected, &publish).await {
             Ok(step) => step,
@@ -431,6 +481,12 @@ impl SqlManifest for DbSqlManifest {
     ) -> Result<ObjectState, SqlStoreError> {
         check_db(db)?;
         let key = &record.key;
+        if record.format != required_format(key.kind()) {
+            return Err(SqlStoreError::Invalid(
+                "object format does not match its kind",
+            ));
+        }
+        let created_at = canonical_timestamp(&record.created_at)?;
         let row = object::ActiveModel {
             space: Set(db.space.to_owned()),
             db_id: Set(db.db_id.to_owned()),
@@ -444,7 +500,7 @@ impl SqlManifest for DbSqlManifest {
             key: Set(key.as_str().to_owned()),
             bytes: Set(to_i64(record.bytes)?),
             state: Set(ObjectState::Uploaded.as_str().to_owned()),
-            created_at: Set(record.created_at.clone()),
+            created_at: Set(created_at),
         };
         use object::Column as C;
         let inserted = object::Entity::insert(row)
@@ -558,6 +614,7 @@ impl SqlManifest for DbSqlManifest {
                 object::Column::State,
                 Expr::value(ObjectState::Uploaded.as_str()),
             )
+            .col_expr(object::Column::CreatedAt, Expr::value(now_timestamp()))
             .filter(object_pk(db, key)?)
             .filter(object::Column::State.eq(ObjectState::Orphan.as_str()))
             .exec(&self.db)
@@ -642,14 +699,14 @@ mod tests {
         }
     }
 
-    async fn publish_segment(
+    async fn segment_outcome(
         m: &DbSqlManifest,
         f: &Frontier,
         from: u64,
         to: u64,
         tag: &str,
         cid: &str,
-    ) -> PublishOutcome {
+    ) -> Result<PublishOutcome, SqlStoreError> {
         let key = seg(&f.lineage, f.base_seq, from, to, tag);
         record(m, &key).await;
         m.publish_cas(
@@ -664,7 +721,17 @@ mod tests {
             ),
         )
         .await
-        .unwrap()
+    }
+
+    async fn publish_segment(
+        m: &DbSqlManifest,
+        f: &Frontier,
+        from: u64,
+        to: u64,
+        tag: &str,
+        cid: &str,
+    ) -> PublishOutcome {
+        segment_outcome(m, f, from, to, tag, cid).await.unwrap()
     }
 
     fn lost(outcome: PublishOutcome) -> Option<Frontier> {
@@ -703,8 +770,15 @@ mod tests {
 
     async fn segments_are_contiguous_and_advance(m: DbSqlManifest) {
         let f = first(&m, &Lineage::random(), 5).await;
-        // A gap (6 is missing) loses.
-        assert!(lost(publish_segment(&m, &f, 8, 9, "gap", CID).await).is_some());
+        // A gap (6 is missing) is an invalid request, not a lost CAS.
+        assert!(matches!(
+            segment_outcome(&m, &f, 8, 9, "gap", CID).await,
+            Err(SqlStoreError::Invalid(_))
+        ));
+        // The refused segment is recorded but never applied.
+        let gap = seg(&f.lineage, f.base_seq, 8, 9, "gap");
+        assert_eq!(state_of(&m, &gap).await, ObjectState::Uploaded);
+        assert_eq!(m.current(&DB).await.unwrap().unwrap(), f);
         // Cumulative WAL segments always start at base_seq + 1.
         let PublishOutcome::Published(f1) = publish_segment(&m, &f, 6, 8, "a", CID).await else {
             panic!("append lost");
@@ -718,6 +792,50 @@ mod tests {
         assert!(lost(publish_segment(&m, &f2, 6, 11, "back", CID).await).is_some());
         assert!(lost(publish_segment(&m, &f2, 6, 12, "same", CID).await).is_some());
         assert_eq!(m.current(&DB).await.unwrap().unwrap(), f2);
+    }
+
+    async fn segment_from_must_follow_base_seq(m: DbSqlManifest) {
+        let f = first(&m, &Lineage::random(), 5).await;
+        // from_seq = base_seq + 2 skips one sequence number. No frontier accepts
+        // this key, so it is refused as invalid rather than reported as a lost CAS.
+        let skipped = seg(&f.lineage, 5, 7, 9, "skip");
+        assert!(matches!(
+            segment_outcome(&m, &f, 7, 9, "skip", CID).await,
+            Err(SqlStoreError::Invalid(_))
+        ));
+        assert_eq!(state_of(&m, &skipped).await, ObjectState::Uploaded);
+        assert_eq!(m.current(&DB).await.unwrap().unwrap(), f);
+        // from_seq = base_seq + 1 is the only accepted start.
+        let PublishOutcome::Published(f1) = publish_segment(&m, &f, 6, 8, "a", CID).await else {
+            panic!("base_seq + 1 segment lost");
+        };
+        // The frontier is at 8. A segment from 9 passes the last_seq check
+        // (8 >= 9 - 1), so only the from_seq rule refuses it.
+        let gap = seg(&f.lineage, 5, 9, 12, "gap");
+        assert!(matches!(
+            segment_outcome(&m, &f1, 9, 12, "gap", CID).await,
+            Err(SqlStoreError::Invalid(_))
+        ));
+        assert_eq!(state_of(&m, &gap).await, ObjectState::Uploaded);
+        assert_eq!(m.current(&DB).await.unwrap().unwrap(), f1);
+    }
+
+    async fn object_state_flip_checks_the_format(m: DbSqlManifest) {
+        let key = snap(&Lineage::random(), 5, "flip");
+        record(&m, &key).await;
+        // Corrupt the stored format behind the manifest's back.
+        object::Entity::update_many()
+            .col_expr(object::Column::Format, Expr::value("wal-cum-v1"))
+            .filter(object::Column::Key.eq(key.as_str()))
+            .exec(&m.db)
+            .await
+            .unwrap();
+        assert!(matches!(
+            m.publish_cas(&DB, None, publish(PublishKind::Snapshot, &key, CID))
+                .await,
+            Err(SqlStoreError::ObjectNotUploaded)
+        ));
+        assert!(m.current(&DB).await.unwrap().is_none());
     }
 
     async fn stale_epoch_lineage_and_revision_are_rejected(m: DbSqlManifest) {
@@ -1032,7 +1150,7 @@ CREATE TRIGGER tc1836_fail_manifest_readback BEFORE UPDATE ON sql_store_manifest
             key: a.clone(),
             format: "sqlite-v1".into(),
             bytes: 11,
-            created_at: "x".into(),
+            created_at: "2026-10-21T00:00:00Z".into(),
         };
         assert!(matches!(
             m.record_object(&DB, &different_size).await,
@@ -1131,6 +1249,85 @@ CREATE TRIGGER tc1836_fail_manifest_readback BEFORE UPDATE ON sql_store_manifest
         assert_eq!(published.len(), 2, "one snapshot and one segment");
     }
 
+    async fn object_format_must_match_its_kind(m: DbSqlManifest) {
+        let l = Lineage::random();
+        let s = snap(&l, 1, "fmt-s");
+        let g = seg(&l, 1, 2, 3, "fmt-g");
+        for (key, format) in [(&s, "wal-cum-v1"), (&g, "sqlite-v1")] {
+            let rec = ObjectRecord {
+                key: key.clone(),
+                format: format.into(),
+                bytes: 10,
+                created_at: "2026-10-21T00:00:00Z".into(),
+            };
+            assert!(matches!(
+                m.record_object(&DB, &rec).await,
+                Err(SqlStoreError::Invalid(_))
+            ));
+        }
+        assert!(m.list_objects(&DB, None).await.unwrap().is_empty());
+    }
+
+    async fn created_at_is_stored_canonically(m: DbSqlManifest) {
+        let l = Lineage::random();
+        let rec = ObjectRecord {
+            key: snap(&l, 1, "ts-a"),
+            format: "sqlite-v1".into(),
+            bytes: 10,
+            created_at: "2026-10-21T02:00:00+02:00".into(),
+        };
+        assert_eq!(
+            m.record_object(&DB, &rec).await.unwrap(),
+            ObjectState::Uploaded
+        );
+        let listed = m.list_objects(&DB, None).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].created_at, "2026-10-21T00:00:00.000000Z");
+        let malformed = ObjectRecord {
+            key: snap(&l, 2, "ts-b"),
+            format: "sqlite-v1".into(),
+            bytes: 10,
+            created_at: "not a time".into(),
+        };
+        assert!(matches!(
+            m.record_object(&DB, &malformed).await,
+            Err(SqlStoreError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn created_at_out_of_range_is_invalid_not_a_panic() {
+        // Both inputs are valid RFC 3339, but UTC conversion leaves years 0..=9999.
+        for text in ["9999-12-31T23:30:00-01:00", "0000-01-01T00:30:00+01:00"] {
+            assert!(matches!(
+                canonical_timestamp(text),
+                Err(SqlStoreError::Invalid(_))
+            ));
+        }
+    }
+
+    async fn revive_restarts_the_orphan_clock(m: DbSqlManifest) {
+        let l = Lineage::random();
+        let a = snap(&l, 1, "revive");
+        let rec = ObjectRecord {
+            key: a.clone(),
+            format: "sqlite-v1".into(),
+            bytes: 10,
+            created_at: "2020-01-01T00:00:00Z".into(),
+        };
+        m.record_object(&DB, &rec).await.unwrap();
+        let cutoff = "2021-01-01T00:00:00.000000Z";
+        assert_eq!(m.mark_orphans(&DB, cutoff).await.unwrap(), 1);
+        assert!(m.revive_object(&DB, &a).await.unwrap());
+        let listed = m
+            .list_objects(&DB, Some(ObjectState::Uploaded))
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].created_at.as_str() > cutoff);
+        assert_eq!(m.mark_orphans(&DB, cutoff).await.unwrap(), 0);
+    }
+
     macro_rules! on_both {
         ($($name:ident),* $(,)?) => {$(
             mod $name {
@@ -1165,5 +1362,10 @@ CREATE TRIGGER tc1836_fail_manifest_readback BEFORE UPDATE ON sql_store_manifest
         state_flips_are_conditional,
         inventory_listing_and_conflicts,
         concurrent_publishers_have_one_winner,
+        object_format_must_match_its_kind,
+        created_at_is_stored_canonically,
+        revive_restarts_the_orphan_clock,
+        segment_from_must_follow_base_seq,
+        object_state_flip_checks_the_format,
     );
 }
