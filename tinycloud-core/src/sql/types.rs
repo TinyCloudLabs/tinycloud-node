@@ -306,6 +306,21 @@ pub enum SqlError {
         "outcome_unknown: the write may have been applied; read the database back before retrying"
     )]
     OutcomeUnknown,
+    /// The write would take the database past its size cap. Rolled back before
+    /// COMMIT; nothing was applied (TC-1491).
+    #[error("sql_database_size_limit: the write would exceed the database size limit; no change was applied")]
+    DatabaseSizeLimit,
+    /// The node's disk cannot hold the write's worst-case growth next to the
+    /// writes already in flight. Rolled back before COMMIT; nothing was
+    /// applied, and a later retry may succeed (TC-1491).
+    #[error("sql_disk_headroom: the node does not have room to commit this write; no change was applied")]
+    DiskHeadroom,
+    /// COMMIT itself failed (disk error). The request is reported as rejected:
+    /// Postgres was never written. If the failing fsync came after WAL frames
+    /// were written, the commit can still appear when the file is next opened
+    /// (it is discarded and re-hydrated while Postgres is master).
+    #[error("sql_commit_failed: the write could not be committed locally; no change was applied")]
+    CommitFailed,
     /// A bounded wait gave up before the request's write began, so nothing
     /// was applied (TC-1274). A retry after `Retry-After` is safe.
     #[error("sql_busy: {0}: the database is busy; retry the request")]
