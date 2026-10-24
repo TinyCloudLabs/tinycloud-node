@@ -26,6 +26,13 @@ cors = true
     # hydration_wait_timeout_ms = 30000
     # artifact_transfer_timeout_ms = 45000
     # hydration_max_ms = 600000          # a hydration keeps warming after its callers give up
+    ## Local commit durability and the checks before COMMIT (TC-1491).
+    ## synchronous: "full" fsyncs the WAL on every COMMIT; "normal" is the rollback flag.
+    ## The two limits are off by default (0 = off): they are Sam's decision (card
+    ## sql-storage-report-read); set them here once he answers.
+    # synchronous = "full"
+    # max_database_bytes = 0             # per database; over it: 507 sql_database_size_limit
+    # min_free_bytes = 0                 # disk kept free; short of it: 507 sql_disk_headroom
     ## Schema-changing SQL (CREATE/ALTER/DROP of tables, views and indexes) needs
     ## tinycloud.sql/schema (TC-1581); tinycloud.sql/write covers data statements.
     ## "enforce" (default) refuses the statement, "log" runs it and records it
