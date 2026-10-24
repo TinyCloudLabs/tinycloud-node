@@ -47,7 +47,7 @@ use tinycloud_core::{
 use crate::{
     authorization::AuthHeaderGetter,
     config::ShareEmailConfig,
-    delivery_link::{open_link_record, ShortLink},
+    delivery_link::{open_link_record, utc_millis, ShortLink},
     links_fetch::{LinkFetchError, LinkRecordFetcher},
 };
 
@@ -1457,11 +1457,12 @@ pub async fn authorize_delivery(
     if !v3_registration_is_live(&registration, now) {
         return Err((Status::Forbidden, "delivery-authorization-invalid".into()));
     }
-    let expires = parse_time(&request.expires_at).map_err(|_| invalid())?;
-    if format_time(expires) != request.expires_at
-        || expires <= now
-        || expires > now + Duration::minutes(5)
-    {
+    // The request's `expiresAt` is exactly `YYYY-MM-DDTHH:mm:ss.SSSZ` (UTC,
+    // three fractional digits): the string is signed into the admission and
+    // echoed as sent, so one instant has one spelling. The window below
+    // applies to the parsed instant.
+    let expires = utc_millis(&request.expires_at).ok_or_else(invalid)?;
+    if expires <= now || expires > now + Duration::minutes(5) {
         return Err(invalid());
     }
     let (envelope, _, actions) =
@@ -8591,12 +8592,29 @@ mod tests {
             expected: (Status, &str),
             bodies: &mut Vec<String>,
         ) -> anyhow::Result<()> {
+            let expires_at = crate::delivery_link::test_support::millis(
+                OffsetDateTime::now_utc() + Duration::minutes(4),
+            );
+            self.deliver_expiring(n, label, share_url, expires_at, expected, bodies)
+                .await
+        }
+
+        /// As [`Self::deliver`], with the request's `expiresAt` as given.
+        async fn deliver_expiring(
+            &self,
+            n: u8,
+            label: &str,
+            share_url: String,
+            expires_at: String,
+            expected: (Status, &str),
+            bodies: &mut Vec<String>,
+        ) -> anyhow::Result<()> {
             let mut request = DeliveryAuthorizationRequest {
                 share_url,
                 recipient_email: "alice@example.test".into(),
                 document_name: "document.txt".into(),
                 jti: encode_config([100 + n; 16], URL_SAFE_NO_PAD),
-                expires_at: format_time(OffsetDateTime::now_utc() + Duration::minutes(4)),
+                expires_at,
                 request_body_digest: String::new(),
             };
             request.request_body_digest = delivery_request_digest(&request)
@@ -8772,6 +8790,30 @@ mod tests {
             fetches,
             "no fetch for a refused link"
         );
+
+        // The request's `expiresAt` has one spelling, `YYYY-MM-DDTHH:mm:ss.SSSZ`;
+        // a valid link and every other textual form of the instant is refused.
+        let ms = ts::millis(OffsetDateTime::now_utc() + Duration::minutes(4));
+        for (n, (label, expires_at)) in [
+            ("whole second", format!("{}Z", &ms[..19])),
+            ("trimmed fraction", format!("{}12Z", &ms[..20])),
+            ("four-digit fraction", format!("{}0Z", &ms[..23])),
+            ("numeric offset", format!("{}+00:00", &ms[..23])),
+            ("lower-case z", format!("{}z", &ms[..23])),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            ctx.deliver_expiring(
+                30 + n as u8,
+                label,
+                at_link(&link_id(10)),
+                expires_at,
+                invalid,
+                &mut bodies,
+            )
+            .await?;
+        }
 
         // A body in the retired shape is refused as a whole.
         let old_shape = json!({
@@ -9665,7 +9707,9 @@ mod tests {
             recipient_email: "alice@example.test".into(),
             document_name: "document.txt".into(),
             jti: encode_config([8_u8; 16], URL_SAFE_NO_PAD),
-            expires_at: format_time(OffsetDateTime::now_utc() + Duration::minutes(4)),
+            expires_at: crate::delivery_link::test_support::millis(
+                OffsetDateTime::now_utc() + Duration::minutes(4),
+            ),
             request_body_digest: String::new(),
         };
         delivery_request.request_body_digest = delivery_request_digest(&delivery_request)
@@ -9765,8 +9809,9 @@ mod tests {
         // so recipient/resource/link rebinding cannot change the error class.
         let mut rebound_request: DeliveryAuthorizationRequest =
             serde_json::from_value(serde_json::to_value(&delivery_request)?)?;
-        rebound_request.expires_at =
-            format_time(parse_time(&delivery_request.expires_at)? - Duration::seconds(1));
+        rebound_request.expires_at = crate::delivery_link::test_support::millis(
+            parse_time(&delivery_request.expires_at)? - Duration::seconds(1),
+        );
         rebound_request.request_body_digest = delivery_request_digest(&rebound_request)
             .map_err(|_| anyhow::anyhow!("rebound delivery request digest"))?;
         let rebound_response = client
@@ -9810,7 +9855,9 @@ mod tests {
             recipient_email: "bob@example.test".into(),
             document_name: "document.txt".into(),
             jti: encode_config([9_u8; 16], URL_SAFE_NO_PAD),
-            expires_at: format_time(OffsetDateTime::now_utc() + Duration::minutes(4)),
+            expires_at: crate::delivery_link::test_support::millis(
+                OffsetDateTime::now_utc() + Duration::minutes(4),
+            ),
             request_body_digest: String::new(),
         };
         domain_request.request_body_digest = delivery_request_digest(&domain_request)

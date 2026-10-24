@@ -173,3 +173,87 @@ fn the_constants_are_the_contracts() {
         SEALED_ENVELOPE_AAD
     );
 }
+
+#[test]
+fn request_expires_at_is_exactly_the_contract_millisecond_form() {
+    use crate::delivery_link::utc_millis;
+    // `YYYY-MM-DDTHH:mm:ss.SSSZ`, UTC, three fractional digits: what
+    // `toISOString()` writes, trailing zeros included.
+    for text in [
+        "2026-10-24T12:00:00.123Z",
+        "2026-10-24T12:00:00.000Z",
+        "2026-10-24T12:00:00.120Z",
+        "2026-10-24T12:00:00.100Z",
+    ] {
+        let parsed = utc_millis(text).unwrap_or_else(|| panic!("{text} is refused"));
+        assert_eq!(parsed, parse_time(text).unwrap(), "{text}");
+    }
+    // Every other spelling is refused, whatever instant it names.
+    for text in [
+        "2026-10-24T12:00:00Z",
+        "2026-10-24T12:00:00.12Z",
+        "2026-10-24T12:00:00.1Z",
+        "2026-10-24T12:00:00.1230Z",
+        "2026-10-24T12:00:00.123456789Z",
+        "2026-10-24T12:00:00.123+00:00",
+        "2026-10-24T12:00:00.123+01:00",
+        "2026-10-24T13:00:00.123+01:00",
+        "2026-10-24T12:00:00.123z",
+        "2026-10-24t12:00:00.123Z",
+        "2026-10-24 12:00:00.123Z",
+        "2026-10-24T12:00:00.123",
+        "2026-10-24T12:00:00,123Z",
+        "2026-02-30T12:00:00.123Z",
+        " 2026-10-24T12:00:00.123Z",
+        "2026-10-24T12:00:00.123Z ",
+        "",
+    ] {
+        assert!(utc_millis(text).is_none(), "{text:?} is accepted");
+    }
+}
+
+#[test]
+fn both_admission_vectors_pass_the_request_expiry_format_as_requests() {
+    use crate::delivery_link::utc_millis;
+    let vectors = vectors();
+    for vector in vectors["deliveryAdmission"]["vectors"].as_array().unwrap() {
+        // The admission's `expiresAt` is the request's, echoed byte for byte.
+        let expires_at = text(&vector["admission"], "expiresAt");
+        assert!(utc_millis(expires_at).is_some(), "{expires_at}");
+        let request = DeliveryAuthorizationRequest {
+            share_url: text(&vector["admission"], "returnLink").into(),
+            recipient_email: text(&vector["admission"], "recipient").into(),
+            document_name: text(&vector["admission"], "label").into(),
+            jti: text(&vector["admission"], "nonce").into(),
+            expires_at: expires_at.into(),
+            request_body_digest: "unused".into(),
+        };
+        assert_eq!(
+            delivery_admission_value(
+                &DeliveryReceiptSource {
+                    request: &request,
+                    registration: &policy_v3_registration::Model {
+                        policy_cid: text(&vector["admission"], "policyId").into(),
+                        policy_bytes: Vec::new(),
+                        policy_digest_hex: String::new(),
+                        owner_did: text(&vector["admission"], "ownerDid").into(),
+                        policy_root_cid: String::new(),
+                        enforcement_root_cid: String::new(),
+                        content_source_digest_hex: String::new(),
+                        native_projection_hash_hex: String::new(),
+                        attested_enforcer_binding_bytes: Vec::new(),
+                        registered_at: String::new(),
+                        expires_at: text(&vector["admission"], "shareExpiresAt").into(),
+                    },
+                    envelope_ref: text(&vector["admission"], "envelopeRef"),
+                    resource: text(&vector["admission"], "resource"),
+                    credential_type: text(&vector["admission"], "credentialType"),
+                    sender_key_did: text(&vector["admission"], "senderKeyDid"),
+                    audience: text(&vector["admission"], "audience"),
+                },
+                text(&vector["admission"], "issuedAt"),
+            )["expiresAt"],
+            expires_at
+        );
+    }
+}

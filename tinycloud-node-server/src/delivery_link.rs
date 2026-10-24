@@ -369,8 +369,9 @@ fn is_audience(value: &str) -> bool {
             .all(|byte| alphanumeric(*byte) || matches!(byte, b'.' | b'-'))
 }
 
-/// `YYYY-MM-DDTHH:mm:ss.SSSZ` that is a real date.
-fn utc_millis(value: &str) -> Option<OffsetDateTime> {
+/// `YYYY-MM-DDTHH:mm:ss.SSSZ` that is a real date: UTC, `Z`, exactly three
+/// fractional digits, and no other spelling of the instant.
+pub(crate) fn utc_millis(value: &str) -> Option<OffsetDateTime> {
     let time = OffsetDateTime::parse(value, &Rfc3339).ok()?;
     let formatted = format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
