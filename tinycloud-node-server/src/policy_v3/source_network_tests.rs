@@ -1,4 +1,4 @@
-//! TC-1423 N1b: every encryption network a Policy/v3 names must be the
+//! TC-1423: every encryption network a Policy/v3 names must be the
 //! content owner's, and active on this node, when the policy is registered.
 //!
 //! Registration-only fixtures over the real routes: `/delegate` imports the

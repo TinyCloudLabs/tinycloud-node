@@ -1329,15 +1329,15 @@ pub struct PolicyV3Config {
     /// `TINYCLOUD_POLICY_V3__LEGACY_CUTOVER`.
     #[serde(default)]
     pub legacy_cutover: Option<String>,
-    /// Whether a policy root may outlive the owner authority it was
+    /// Whether a policy root may outlive the owner authority it is
     /// registered under. `record` (the default) accepts and counts such
     /// roots; `enforce` refuses them. Env
     /// `TINYCLOUD_POLICY_V3__OWNER_AUTHORITY_EXPIRY`.
     #[serde(default)]
     pub owner_authority_expiry: OwnerAuthorityExpiry,
     /// Operator escape: serve policies registered before the legacy cutover
-    /// for which no owner authority was found with the root-only checks
-    /// instead of denying them. Off by default; logged at boot and per
+    /// for which no owner authority is recorded with the root-only checks;
+    /// when off they are denied. Off by default; logged at boot and per
     /// policy when used. Env `TINYCLOUD_POLICY_V3__LEGACY_UNKNOWN_ALLOW`.
     #[serde(default)]
     pub legacy_unknown_allow: bool,
@@ -2208,7 +2208,7 @@ mod tests {
 
     /// Every `Config` field except the ones listed here must load from a file
     /// that omits it, so a config written before a section existed (for
-    /// example `[sql_store]` or `[policy_v3]`) still loads. The fields are
+    /// example `[sql_store]` or `[policy_v3]`) loads. The fields are
     /// read from the struct's own serialization: a new field without
     /// `#[serde(default)]` fails here, and so does one that loses it.
     #[test]

@@ -557,7 +557,7 @@ impl Harness {
         let network = format!("urn:tinycloud:encryption:{}:mainnet", space_owner.did());
         let client = Self::boot_app(&db, &vector, &issuer, &boot).await?;
         // Registration requires the source network to exist and to be the
-        // content owner's (TC-1423 N1b), so the harness creates it.
+        // content owner's (TC-1423), so the harness creates it.
         client
             .rocket()
             .state::<tinycloud_core::encryption_network::EncryptionService>()
@@ -1243,7 +1243,7 @@ impl Harness {
     }
 
     /// Use the policy (a challenge), wait for its background classification,
-    /// and check that the use was admitted when the policy has authority
+    /// and check that the use is admitted when the policy has authority
     /// (`bound`, `bound-uncapped`, `root-authority`: 200) and refused with
     /// the fixed code when it has none (`unknown`: 403).
     pub async fn classify_on_use(&self, policy: &Registered) -> anyhow::Result<BindingRow> {
@@ -1317,7 +1317,7 @@ fn legacy_boot() -> Boot {
 }
 
 // ---------------------------------------------------------------------------
-// N1: registration records the owner authority it used.
+// Registration records the owner authority it used.
 // ---------------------------------------------------------------------------
 
 async fn registration_records_the_owner_authority(backend: Backend) -> anyhow::Result<()> {
@@ -1723,7 +1723,7 @@ async fn a_general_window_full_of_skipped_rows_is_starved(backend: Backend) -> a
 on_both_backends!(a_general_window_full_of_skipped_rows_is_starved);
 
 /// Loop-back candidates ahead of the authority in the general window don't
-/// use up its tries: 40 of them (more than the 32 tries) still leave the
+/// use up its tries: 40 of them (more than the 32 tries) leave the
 /// authority reachable.
 async fn loop_back_rows_do_not_use_up_tries(backend: Backend) -> anyhow::Result<()> {
     let Some(h) = Harness::new(
@@ -1771,7 +1771,7 @@ on_both_backends!(loop_back_rows_do_not_use_up_tries);
 
 /// Delegations to the owner from holders of the space owner's authority
 /// (they pass the general window's scope) sort ahead of the space owner's
-/// own grant; the owner-first step still records that grant.
+/// own grant; the owner-first step records that grant.
 async fn owner_derived_delegations_cannot_displace_the_owner_grant(
     backend: Backend,
 ) -> anyhow::Result<()> {
@@ -1908,7 +1908,7 @@ async fn a_grant_outliving_the_root_is_preferred(backend: Backend) -> anyhow::Re
 on_both_backends!(a_grant_outliving_the_root_is_preferred);
 
 // ---------------------------------------------------------------------------
-// N1: legacy registrations are classified on first use, claim-first.
+// Legacy registrations are classified on first use, claim-first.
 // ---------------------------------------------------------------------------
 
 async fn concurrent_first_uses_store_one_classification(backend: Backend) -> anyhow::Result<()> {
@@ -1982,7 +1982,7 @@ async fn a_failed_classification_write_still_serves(backend: Backend) -> anyhow:
 }
 on_both_backends!(a_failed_classification_write_still_serves);
 
-/// A legacy registration whose original authority was revoked binds
+/// A legacy registration whose original authority is revoked binds
 /// to a live alternate; with none left it is recorded `unknown`.
 async fn legacy_classification_falls_through_to_a_live_alternate(
     backend: Backend,
@@ -2167,7 +2167,7 @@ async fn rollback_and_reupgrade_respect_the_configured_cutover(
 on_both_backends!(rollback_and_reupgrade_respect_the_configured_cutover);
 
 // ---------------------------------------------------------------------------
-// N1: listing by any closure member.
+// Listing by any closure member.
 // ---------------------------------------------------------------------------
 
 async fn listing_is_limited_to_parties_of_the_delegation(backend: Backend) -> anyhow::Result<()> {
@@ -2305,7 +2305,7 @@ async fn insert_synthetic(
 }
 
 // ---------------------------------------------------------------------------
-// N2: the root-lifetime cap, the record/enforce mode and the advertised mode.
+// The root-lifetime cap, the record/enforce mode and the advertised mode.
 // ---------------------------------------------------------------------------
 
 fn boot(policy_v3: Value) -> Boot {
@@ -2520,8 +2520,8 @@ async fn info_advertises_the_owner_authority_mode(backend: Backend) -> anyhow::R
 }
 on_both_backends!(info_advertises_the_owner_authority_mode);
 
-/// A legacy registration whose root outlives 31 days is classified as
-/// before and counted, not refused.
+/// A legacy registration whose root outlives 31 days is classified
+/// (`bound`, `backfill`) and counted, not refused.
 async fn legacy_long_roots_are_counted_not_refused(backend: Backend) -> anyhow::Result<()> {
     let Some(h) = Harness::new(
         backend,
@@ -2636,7 +2636,7 @@ async fn post_cutover_rows_outliving_their_authority_are_unknown_under_enforce(
 on_both_backends!(post_cutover_rows_outliving_their_authority_are_unknown_under_enforce);
 
 // ---------------------------------------------------------------------------
-// N3: the recorded owner authority is checked whenever a policy is used.
+// The recorded owner authority is checked whenever a policy is used.
 // ---------------------------------------------------------------------------
 
 const REVOKED: &str = "policy-owner-authority-revoked";
@@ -2922,7 +2922,7 @@ async fn revoking_the_agent_session_ends_its_policies(backend: Backend) -> anyho
         (Status::Forbidden, REVOKED.to_owned())
     );
     assert_eq!(h.signed_kv(&session).await?.0, Status::Forbidden);
-    // The root itself was never revoked.
+    // The root itself is not revoked.
     assert_eq!(
         h.root_status(&policy.policy_root_cid).await["state"],
         json!("active")
@@ -3176,7 +3176,7 @@ async fn legacy_registrations_without_authority_are_denied_unless_escaped(
 on_both_backends!(legacy_registrations_without_authority_are_denied_unless_escaped);
 
 /// Legacy rows get liveness but no expiry cap: a legacy session
-/// whose authority expired since registration still reads, and so does a
+/// whose authority expired since registration reads, and so does a
 /// legacy root longer than 31 days.
 async fn legacy_registrations_are_never_expiry_capped(backend: Backend) -> anyhow::Result<()> {
     let Some(h) = Harness::with_boot(
@@ -3277,7 +3277,7 @@ async fn the_escape_never_serves_post_cutover_rows(backend: Backend) -> anyhow::
 on_both_backends!(the_escape_never_serves_post_cutover_rows);
 
 /// An escaped legacy policy serves its admitted sessions, but a mint
-/// still needs the owner to have held what the policy grants when it
+/// needs the owner to have held what the policy grants when it
 /// registered.
 async fn escaped_mints_still_check_the_owner_held_the_capability(
     backend: Backend,

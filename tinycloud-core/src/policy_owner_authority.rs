@@ -24,7 +24,7 @@ pub const OWNER_AUTHORITY_MIGRATION: &str = "m20261019_000000_policy_v3_owner_au
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClosureNode {
     pub id: Hash,
-    /// Distance from the nearest leaf the closure was loaded for.
+    /// Distance from the nearest leaf of the loaded closure.
     pub depth: u32,
     pub delegator: String,
     pub expiry: Option<OffsetDateTime>,
@@ -112,7 +112,7 @@ pub async fn equivalent_ids<C: ConnectionTrait>(db: &C, id: Hash) -> Result<Vec<
     Ok(ids)
 }
 
-/// When `version` was applied, in Unix seconds, if it was.
+/// The applied-at time of `version`, in Unix seconds; `None` when it is not applied.
 pub async fn migration_applied_at<C: ConnectionTrait>(
     db: &C,
     version: &str,

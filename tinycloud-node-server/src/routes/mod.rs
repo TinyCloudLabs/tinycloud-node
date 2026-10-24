@@ -365,7 +365,7 @@ fn build_info(
 }
 
 /// The Policy/v3 owner-authority mode, if the node serves Policy/v3. Never
-/// fails, so a fixture without the policy runtime still launches.
+/// fails, so a fixture without the policy runtime launches.
 pub struct OwnerAuthorityMode(Option<crate::config::OwnerAuthorityExpiry>);
 
 #[rocket::async_trait]
