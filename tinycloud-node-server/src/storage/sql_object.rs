@@ -123,7 +123,9 @@ fn backend<E: ProvideErrorMetadata>(op: &str, error: &SdkError<E>) -> SqlStoreEr
     let code = ProvideErrorMetadata::code(error).unwrap_or("none");
     let mut cause = String::new();
     if let SdkError::DispatchFailure(failure) = error {
-        let mut source = std::error::Error::source(failure);
+        let mut source = failure
+            .as_connector_error()
+            .map(|e| e as &dyn std::error::Error);
         while let Some(error) = source {
             cause.push_str(&format!(": {error}"));
             source = error.source();
