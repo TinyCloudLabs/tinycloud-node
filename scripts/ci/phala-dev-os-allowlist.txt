@@ -1,0 +1,5 @@
+# Dev dstack OS images a production deploy may target, one sha256 hash per line.
+# Changed only by a reviewed PR. Every entry is also re-verified against
+# download.dstack.org on each deploy (see phala-os-guard.sh).
+# dstack-dev-0.5.12
+e866e987221db357129ebc3f066b6706ef955889ea95e5510acbdf3d3055186b
