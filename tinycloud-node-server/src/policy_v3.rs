@@ -4695,14 +4695,13 @@ impl SourceNetworkRefusal {
 /// names a space of that owner; otherwise why not. Pure, so it applies to
 /// stored registrations as well as new ones.
 ///
-/// A DID is root authority over every network URN that names it, created or
-/// not, and any DID may create such a network. Without this check, a
-/// registrant holding only kv on someone's content could hand that content
-/// out under a network of its own: named in the source, or with the source
-/// moved to its own space and the content added as a second kv entry. With
-/// it, every resource the policy grants belongs to one owner, and a
-/// registrant other than that owner holds decrypt on its networks only
-/// through a delegation rooted at that owner.
+/// A network URN is rooted at the DID it names, whether or not the network
+/// exists, and any DID may create a network that names itself. Every
+/// resource a policy grants therefore has to belong to one owner: the
+/// content source's network and every ceiling network are that owner's, and
+/// every `kv` entry names that owner's space. A registrant other than that
+/// owner holds decrypt on those networks only through a delegation rooted at
+/// that owner.
 ///
 /// The owner is the space's DID (`ResourceId::space().did()`), compared with
 /// `did_principal_matches`: EIP-55 letter case is ignored, the chain id is
@@ -8672,23 +8671,20 @@ mod tests {
         Box::pin(run_policy_v2_flow(PolicyOwner::Unauthorized)).await
     }
 
-    /// TC-1423 (B2, N1b): a policy owner that holds only `kv/get` and
+    /// TC-1423 (N1b): a policy owner that holds only `kv/get` and
     /// `kv/metadata` on the content (no decrypt on the content owner's
     /// network) registers a policy whose content source names a network
-    /// called after the policy owner itself, which needs no grant: a DID is
-    /// root authority over networks that name it. Registration refuses it:
-    /// the source network must exist and belong to the content space's owner.
+    /// called after the policy owner itself. Registration refuses it: the
+    /// source network must exist and belong to the content space's owner.
     #[tokio::test]
     async fn policy_source_network_must_belong_to_the_content_owner() -> anyhow::Result<()> {
         Box::pin(run_policy_v2_flow(PolicyOwner::KvOnlySelfNamedNetwork)).await
     }
 
-    /// TC-1423 (N1b, review B1): the same kv-only policy owner moves the
-    /// content source to its own space, on a network it created, and adds a
-    /// second kv ceiling entry on the space owner's content. Every kv entry
-    /// must name a space of the content source's owner, so registration
-    /// refuses it; otherwise recipients would read the space owner's content
-    /// through a policy that outlives the owner's revocation.
+    /// TC-1423 (N1b): the same kv-only policy owner moves the content source
+    /// to its own space, on a network it created, and adds a second kv
+    /// ceiling entry on the space owner's content. Every kv entry must name
+    /// a space of the content source's owner, so registration refuses it.
     #[tokio::test]
     async fn policy_kv_entries_must_belong_to_the_content_owner() -> anyhow::Result<()> {
         Box::pin(run_policy_v2_flow(PolicyOwner::KvOnlyOwnSpaceSource)).await

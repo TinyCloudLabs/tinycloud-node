@@ -856,11 +856,10 @@ async fn chain_id_mismatch_is_refused() -> anyhow::Result<()> {
     .await
 }
 
-/// The B1 shape (review of #363): K holds only kv on V's content. K creates a
-/// network named after itself (any DID may, with no proof) and registers a
-/// policy whose source is K's own space on that network, with a second kv
-/// ceiling entry on V's content. Every kv entry must name a space of the
-/// source's owner, so it is refused.
+/// A policy owner K that holds only kv on V's content creates a network named
+/// after itself and registers a policy whose source is K's own space on that
+/// network, with a second kv ceiling entry on V's content. Every kv entry must
+/// name a space of the source's owner, so registration is refused.
 #[tokio::test]
 async fn kv_entry_outside_the_content_owner_is_refused() -> anyhow::Result<()> {
     let case = KeyOwnerCase::new(&[]).await?;
