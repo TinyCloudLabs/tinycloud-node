@@ -103,11 +103,28 @@ fn status<E>(error: &SdkError<E>) -> Option<u16> {
     error.raw_response().map(|r| r.status().as_u16())
 }
 
+/// Which stage failed, without the message or URL (they can carry the key).
+fn failure_kind<E>(error: &SdkError<E>) -> &'static str {
+    match error {
+        SdkError::ConstructionFailure(_) => "construction",
+        SdkError::TimeoutError(_) => "timeout",
+        SdkError::DispatchFailure(f) if f.is_timeout() => "dispatch timeout",
+        SdkError::DispatchFailure(f) if f.is_io() => "dispatch io",
+        SdkError::DispatchFailure(f) if f.is_user() => "dispatch user",
+        SdkError::DispatchFailure(_) => "dispatch",
+        SdkError::ResponseError(_) => "response",
+        SdkError::ServiceError(_) => "service",
+        _ => "other",
+    }
+}
+
 fn backend<E: ProvideErrorMetadata>(op: &str, error: &SdkError<E>) -> SqlStoreError {
-    // Status and error code only: the message and URL can carry the key.
     let status = status(error).map_or_else(|| "none".to_owned(), |s| s.to_string());
     let code = ProvideErrorMetadata::code(error).unwrap_or("none");
-    SqlStoreError::Backend(format!("s3 {op} failed (status {status}, code {code})"))
+    SqlStoreError::Backend(format!(
+        "s3 {op} failed ({}, status {status}, code {code})",
+        failure_kind(error)
+    ))
 }
 
 fn classify_put<T>(result: Result<T, SdkError<PutObjectError>>) -> PutResult {
