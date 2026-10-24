@@ -1355,7 +1355,7 @@ mod production_route_tests {
         );
     }
 
-    /// The five key routes are mounted only with `named_keys_v1` on; the
+    /// The six key routes are mounted only with `named_keys_v1` on; the
     /// network routes are mounted either way.
     #[test]
     fn named_key_routes_are_mounted_only_when_named_keys_are_on() {
@@ -1366,7 +1366,7 @@ mod production_route_tests {
                 .collect()
         };
         let key_routes = describe(named_key_routes());
-        assert_eq!(key_routes.len(), 5, "{key_routes:?}");
+        assert_eq!(key_routes.len(), 6, "{key_routes:?}");
         let off = describe(production_routes(false));
         let on = describe(production_routes(true));
         for route in &key_routes {
@@ -1383,7 +1383,7 @@ mod production_route_tests {
             assert!(off.contains(&route), "missing while off: {route}");
             assert!(on.contains(&route), "missing while on: {route}");
         }
-        assert_eq!(on.len(), off.len() + 5);
+        assert_eq!(on.len(), off.len() + 6);
     }
 }
 
