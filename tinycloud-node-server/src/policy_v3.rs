@@ -5,6 +5,7 @@
 //! policy-session UCAN: the sibling-root registration, signed status, the
 //! challenge/claim replay boundary, and the first-admission gate.
 
+use crate::delivery_limiter::FetchLimiter;
 use crate::issuer_set::{IssuerSet, IssuerWindowError};
 use base64::{decode_config, encode_config, URL_SAFE_NO_PAD};
 use rand::RngCore;
@@ -111,6 +112,7 @@ pub struct PolicyV3Runtime {
     credential_issuers: IssuerSet,
     delivery: Option<DeliveryRuntime>,
     sqlite_writer_lock: Option<Arc<tokio::sync::Mutex<()>>>,
+    fetch_limiter: Arc<FetchLimiter>,
 }
 
 impl PolicyV3Runtime {
@@ -126,7 +128,13 @@ impl PolicyV3Runtime {
             credential_issuers: IssuerSet::default(),
             delivery: None,
             sqlite_writer_lock: None,
+            fetch_limiter: Arc::new(FetchLimiter::default()),
         }
+    }
+
+    /// The limits on links fetches made for delivery authorizations.
+    pub fn fetch_limiter(&self) -> &Arc<FetchLimiter> {
+        &self.fetch_limiter
     }
 
     pub fn with_sqlite_writer_lock(mut self, lock: Option<Arc<tokio::sync::Mutex<()>>>) -> Self {
@@ -173,6 +181,10 @@ impl PolicyV3Runtime {
         if configured != self.signer.share_invitation_public_key() {
             anyhow::bail!("v3 delivery invitation signing key does not match configured trust");
         }
+        self.fetch_limiter = Arc::new(FetchLimiter::new(
+            config.links_fetch_per_invoker_per_minute,
+            config.links_fetch_global_per_minute,
+        ));
         self.delivery = Some(DeliveryRuntime {
             target_origin: config.target_origin.clone(),
             return_origin: config.return_origin.clone(),
@@ -974,6 +986,27 @@ pub struct DeliveryBody(pub DeliveryAuthorizationRequest);
 #[derive(Debug)]
 pub struct DeliveryBodyRejected;
 
+/// A delivery authorization refusal: the status and the fixed code, and for a
+/// rate-limit refusal the seconds to wait as `Retry-After`.
+pub struct DeliveryFailure {
+    status: Status,
+    body: String,
+    retry_after: Option<u64>,
+}
+
+impl<'r> rocket::response::Responder<'r, 'static> for DeliveryFailure {
+    fn respond_to(self, request: &'r rocket::Request<'_>) -> rocket::response::Result<'static> {
+        let mut response = (self.status, self.body).respond_to(request)?;
+        if let Some(seconds) = self.retry_after {
+            response.set_header(rocket::http::Header::new(
+                "Retry-After",
+                seconds.to_string(),
+            ));
+        }
+        Ok(response)
+    }
+}
+
 #[rocket::async_trait]
 impl<'r> rocket::data::FromData<'r> for DeliveryBody {
     type Error = DeliveryBodyRejected;
@@ -1369,6 +1402,22 @@ pub async fn authorize_delivery(
     request: DeliveryBody,
     runtime: &State<PolicyV3Runtime>,
     invocation: AuthHeaderGetter<InvocationInfo>,
+) -> Result<Json<Value>, DeliveryFailure> {
+    let mut retry_after = None;
+    authorize_delivery_inner(request, runtime, invocation, &mut retry_after)
+        .await
+        .map_err(|(status, body)| DeliveryFailure {
+            status,
+            body,
+            retry_after,
+        })
+}
+
+async fn authorize_delivery_inner(
+    request: DeliveryBody,
+    runtime: &PolicyV3Runtime,
+    invocation: AuthHeaderGetter<InvocationInfo>,
+    retry_after: &mut Option<u64>,
 ) -> Result<Json<Value>, (Status, String)> {
     let delivery = runtime
         .delivery
@@ -1412,6 +1461,17 @@ pub async fn authorize_delivery(
         !delivery_replay_request_matches(existing, &request, sender_key_did)
     }) {
         return Err((Status::Conflict, "delivery-authorization-replayed".into()));
+    }
+    // The links API limits reads per client address and the node reads from
+    // one: a request that reaches the fetch first passes the per-invoker and
+    // node-wide limits. Nothing was fetched, opened or stored for a request
+    // refused here, and the answer names neither the invoker nor the link.
+    if let Err(refused) = runtime
+        .fetch_limiter
+        .check(sender_key_did, std::time::Instant::now())
+    {
+        *retry_after = Some(refused.retry_after_secs);
+        return Err((Status::TooManyRequests, "delivery-rate-limited".to_owned()));
     }
     // One read of the record, no retries, no other source. The API's 404 and
     // every outage have their own answers; everything else about the record
@@ -8548,6 +8608,16 @@ mod tests {
     impl MatrixContext<'_> {
         /// POST a delivery authorization with a fresh invocation.
         async fn post(&self, nonce: &str, body: String) -> anyhow::Result<(Status, String)> {
+            let (status, body, _) = self.post_full(nonce, body).await?;
+            Ok((status, body))
+        }
+
+        /// As [`Self::post`], with the answer's `Retry-After` header.
+        async fn post_full(
+            &self,
+            nonce: &str,
+            body: String,
+        ) -> anyhow::Result<(Status, String, Option<String>)> {
             use tinycloud_auth::{
                 authorization::{make_invocation, InvocationOptions},
                 siwe_recap::Ability as RecapAbility,
@@ -8582,7 +8652,12 @@ mod tests {
                 .dispatch()
                 .await;
             let status = response.status();
-            Ok((status, response.into_string().await.unwrap_or_default()))
+            let retry_after = response.headers().get_one("Retry-After").map(str::to_owned);
+            Ok((
+                status,
+                response.into_string().await.unwrap_or_default(),
+                retry_after,
+            ))
         }
 
         /// Send a request for `share_url` and expect `(status, code)`.
@@ -8611,6 +8686,20 @@ mod tests {
             expected: (Status, &str),
             bodies: &mut Vec<String>,
         ) -> anyhow::Result<()> {
+            let (status, body, _) = self.send(n, share_url, expires_at).await?;
+            assert_eq!((status, body.as_str()), expected, "{label}");
+            bodies.push(body);
+            Ok(())
+        }
+
+        /// Send a request for `share_url`; the answer's status, body and
+        /// `Retry-After`.
+        async fn send(
+            &self,
+            n: u8,
+            share_url: String,
+            expires_at: String,
+        ) -> anyhow::Result<(Status, String, Option<String>)> {
             let mut request = DeliveryAuthorizationRequest {
                 share_url,
                 recipient_email: "alice@example.test".into(),
@@ -8621,15 +8710,11 @@ mod tests {
             };
             request.request_body_digest = delivery_request_digest(&request)
                 .map_err(|_| anyhow::anyhow!("matrix request digest"))?;
-            let (status, body) = self
-                .post(
-                    &format!("slice5-matrix-{n}"),
-                    serde_json::to_string(&request)?,
-                )
-                .await?;
-            assert_eq!((status, body.as_str()), expected, "{label}");
-            bodies.push(body);
-            Ok(())
+            self.post_full(
+                &format!("slice5-matrix-{n}"),
+                serde_json::to_string(&request)?,
+            )
+            .await
         }
     }
 
@@ -8640,6 +8725,16 @@ mod tests {
         use crate::delivery_link::test_support as ts;
         use crate::links_fetch::LinkFetchError;
         let plaintext = canonical_json_value(ctx.envelope);
+        // The matrix sends far more fetches from one invoker than the default
+        // limits admit; the limits get their own checks at its end.
+        let limiter = ctx
+            .client
+            .rocket()
+            .state::<PolicyV3Runtime>()
+            .unwrap()
+            .fetch_limiter()
+            .clone();
+        limiter.set_limits(1000, 1000, 1000);
         let other_signer = tinycloud_core::libp2p::identity::ed25519::Keypair::generate();
         let base = ts::build(&plaintext, ctx.owner_key, ctx.link_expires);
         let key = ts::b64(&ts::TEST_KEY);
@@ -8872,6 +8967,79 @@ mod tests {
         let (status, body) = ctx.post("slice5-old-shape", old_shape.to_string()).await?;
         assert_eq!(status, Status::UnprocessableEntity);
         bodies.push(body);
+
+        // The fetch limits: a request over one is refused before any fetch,
+        // with a fixed code and `Retry-After`, and names neither the invoker
+        // nor the link.
+        use crate::delivery_limiter::Scope;
+        limiter.set_limits(20, 2, 110);
+        let fetches = ctx.links.fetch_count();
+        for n in 0..2_u8 {
+            ctx.deliver(
+                50 + n,
+                "within the burst",
+                at_link(&link_id(1)),
+                not_found,
+                &mut bodies,
+            )
+            .await?;
+        }
+        assert_eq!(ctx.links.fetch_count(), fetches + 2);
+        let expires_at = ts::millis(OffsetDateTime::now_utc() + Duration::minutes(4));
+        for n in 0..3_u8 {
+            let (status, body, retry_after) = ctx
+                .send(52 + n, at_link(&link_id(1)), expires_at.clone())
+                .await?;
+            assert_eq!(
+                (status, body.as_str()),
+                (Status::TooManyRequests, "delivery-rate-limited")
+            );
+            let seconds: u64 = retry_after.expect("Retry-After").parse()?;
+            assert!((1..=3).contains(&seconds), "{seconds}");
+            bodies.push(body);
+        }
+        assert_eq!(
+            ctx.links.fetch_count(),
+            fetches + 2,
+            "a refused request does not reach the fetcher"
+        );
+        assert_eq!(limiter.take_refusals(), vec![(Scope::Invoker, 3)]);
+        // The node-wide cap answers the same way.
+        limiter.set_limits(110, 110, 1);
+        ctx.deliver(
+            60,
+            "within the node-wide cap",
+            at_link(&link_id(1)),
+            not_found,
+            &mut bodies,
+        )
+        .await?;
+        let (status, body, retry_after) = ctx
+            .send(61, at_link(&link_id(1)), expires_at.clone())
+            .await?;
+        assert_eq!(
+            (status, body.as_str()),
+            (Status::TooManyRequests, "delivery-rate-limited")
+        );
+        let seconds: u64 = retry_after.expect("Retry-After").parse()?;
+        assert!((1..=60).contains(&seconds), "{seconds}");
+        bodies.push(body);
+        assert_eq!(ctx.links.fetch_count(), fetches + 3);
+        assert_eq!(limiter.take_refusals(), vec![(Scope::Global, 1)]);
+        // A request refused before the fetch step costs no token: a link the
+        // grammar refuses, over and over, never trips the limit.
+        limiter.set_limits(20, 1, 110);
+        for n in 0..4_u8 {
+            ctx.deliver(
+                70 + n,
+                "refused by the grammar",
+                at_link(&link_id(1)).replace("#v=4", "#v=3"),
+                invalid,
+                &mut bodies,
+            )
+            .await?;
+        }
+        assert!(limiter.take_refusals().is_empty());
 
         // Nothing that was logged, answered or stored holds the key or the
         // link. The one place the link appears is the receipt's own

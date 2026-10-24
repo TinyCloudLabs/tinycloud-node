@@ -38,6 +38,14 @@ and that the decrypted canonical envelope, exact recipient and delivery
 authorization all agree. Node never writes the link or its key to a log, an
 error response or a stored row.
 
+Before the fetch, each request passes a per-invoker token bucket (burst 5,
+`share_email.links_fetch_per_invoker_per_minute`, default 20) and a node-wide
+cap on fetches in any 60 seconds (`share_email.links_fetch_global_per_minute`,
+default 90, at most 110: the links API allows 120 reads a minute per client
+address). A request over either limit is answered `429 delivery-rate-limited`
+with `Retry-After` before anything is fetched; only requests that reach the
+fetch count against the limits.
+
 The node identity must be internally exact, not merely a canonical DID:
 
 - `nodeAudience` is `did:web:<nodeOrigin host>`;

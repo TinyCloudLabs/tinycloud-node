@@ -110,6 +110,15 @@ pub struct ShareEmailConfig {
     /// link-local or CGNAT address.
     #[serde(default)]
     pub links_origin_allow_private: bool,
+    /// Links fetches one authenticated invoker may start in a minute (a burst
+    /// of five, then refilled at this rate). A request over it is answered
+    /// `429 delivery-rate-limited` before any fetch.
+    #[serde(default = "default_links_fetch_per_invoker_per_minute")]
+    pub links_fetch_per_invoker_per_minute: u32,
+    /// Links fetches the node starts in any 60 seconds, for all invokers; kept
+    /// below the links API's per-address read allowance.
+    #[serde(default = "default_links_fetch_global_per_minute")]
+    pub links_fetch_global_per_minute: u32,
     /// The only browser origin allowed to call the node's share-email API.
     /// This is deliberately a list so the deployed value is visible in the
     /// configuration and cannot accidentally become a wildcard.
@@ -199,6 +208,12 @@ fn default_share_return_origin() -> String {
 fn default_share_links_origin() -> String {
     "https://api.tinycloud.xyz".to_owned()
 }
+fn default_links_fetch_per_invoker_per_minute() -> u32 {
+    crate::delivery_limiter::DEFAULT_PER_INVOKER_PER_MINUTE
+}
+fn default_links_fetch_global_per_minute() -> u32 {
+    crate::delivery_limiter::DEFAULT_GLOBAL_PER_MINUTE
+}
 fn default_share_allowed_origins() -> Vec<String> {
     vec![default_share_return_origin()]
 }
@@ -271,6 +286,9 @@ impl Default for ShareEmailConfig {
             return_origin: default_share_return_origin(),
             links_origin: default_share_links_origin(),
             links_origin_allow_private: false,
+            links_fetch_per_invoker_per_minute:
+                crate::delivery_limiter::DEFAULT_PER_INVOKER_PER_MINUTE,
+            links_fetch_global_per_minute: crate::delivery_limiter::DEFAULT_GLOBAL_PER_MINUTE,
             allowed_origins: default_share_allowed_origins(),
             node_signing_kid: default_share_node_signing_kid(),
             invitation_kid: default_share_invitation_kid(),
@@ -298,6 +316,16 @@ impl Default for ShareEmailConfig {
 }
 
 impl ShareEmailConfig {
+    /// The links fetch limits: each at least 1, the node-wide one at most 110
+    /// (the links API allows 120 reads a minute per client address). Checked
+    /// when the configuration loads; the node does not start otherwise.
+    pub fn validate_links_fetch_limits(&self) -> Result<(), &'static str> {
+        crate::delivery_limiter::validate_limits(
+            self.links_fetch_per_invoker_per_minute,
+            self.links_fetch_global_per_minute,
+        )
+    }
+
     /// The links origin checks, run whenever the configuration loads: the
     /// value must be exactly `https://host[:port]`, and its host must not be a
     /// private, loopback, link-local or CGNAT address unless
