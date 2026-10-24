@@ -203,7 +203,7 @@ impl Binding {
 }
 
 /// The owner authority a policy use passed: the closure to watch for
-/// revocation, and whether it was served under the legacy escape.
+/// revocation, and whether it is served under the legacy escape.
 #[derive(Clone, Debug, Default)]
 pub struct OwnerAuthority {
     pub closure: Arc<[Hash]>,
@@ -748,7 +748,7 @@ pub(super) struct OwnerAuthorityState {
     in_flight: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Slots for background writes.
     background: BackgroundSlots,
-    /// When each escaped policy was last logged.
+    /// The last log time of each escaped policy.
     escape_logged: std::sync::Mutex<HashMap<String, tokio::time::Instant>>,
     /// Request-path classifications running, one per policy; concurrent uses
     /// of the policy wait for it and share its result.
@@ -1026,7 +1026,7 @@ impl PolicyV3Runtime {
     }
 
     /// Store a computed classification claim-first, count it, and remember
-    /// it when final. Returns what is now in force.
+    /// it when final. Returns what is in force.
     async fn store_classification(
         &self,
         policy_cid: &str,
@@ -1077,7 +1077,7 @@ impl PolicyV3Runtime {
     /// loaded once (row and closure) and remembered. A policy without one is
     /// classified in the request, served from that result, and stored in the
     /// background; a result that isn't final is reused for
-    /// [`RETRY_BACKOFF`] instead of recomputed.
+    /// [`RETRY_BACKOFF`] rather than recomputed.
     async fn binding_for_use(
         &self,
         registration: &policy_v3_registration::Model,
@@ -1118,7 +1118,7 @@ impl PolicyV3Runtime {
         };
         let binding = Binding::from_classification(&classification, mode);
         // The write runs in the background (one per policy, a few at once).
-        // Without a free slot this request still uses its result; the write
+        // Without a free slot this request uses its result; the write
         // is retried once the in-memory result expires.
         if let Some(claim) = InFlight::claim(state, policy_cid) {
             let runtime = self.clone();
@@ -2152,7 +2152,7 @@ mod tests {
     }
 
     /// At most `MAX_BACKGROUND_CLASSIFICATIONS` background writes run at
-    /// once. A use that finds no free slot is still served and starts none;
+    /// once. A use that finds no free slot is served and starts none;
     /// once a slot is free, a use of another policy stores its result.
     #[tokio::test]
     async fn background_classifications_are_limited_without_backing_off() {

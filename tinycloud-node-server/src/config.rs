@@ -1336,8 +1336,8 @@ pub struct PolicyV3Config {
     #[serde(default)]
     pub owner_authority_expiry: OwnerAuthorityExpiry,
     /// Operator escape: serve policies registered before the legacy cutover
-    /// for which no owner authority was found with the root-only checks
-    /// instead of denying them. Off by default; logged at boot and per
+    /// for which no owner authority is recorded with the root-only checks;
+    /// when off they are denied. Off by default; logged at boot and per
     /// policy when used. Env `TINYCLOUD_POLICY_V3__LEGACY_UNKNOWN_ALLOW`.
     #[serde(default)]
     pub legacy_unknown_allow: bool,

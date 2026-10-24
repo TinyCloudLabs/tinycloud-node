@@ -1209,7 +1209,7 @@ impl Harness {
     }
 
     /// Use the policy (a challenge), wait for its background classification,
-    /// and check that the use was admitted when the policy has authority
+    /// and check that the use is admitted when the policy has authority
     /// (`bound`, `bound-uncapped`, `root-authority`: 200) and refused with
     /// the fixed code when it has none (`unknown`: 403).
     pub async fn classify_on_use(&self, policy: &Registered) -> anyhow::Result<BindingRow> {
@@ -2602,7 +2602,7 @@ async fn post_cutover_rows_outliving_their_authority_are_unknown_under_enforce(
 on_both_backends!(post_cutover_rows_outliving_their_authority_are_unknown_under_enforce);
 
 // ---------------------------------------------------------------------------
-// N3: the recorded owner authority is checked whenever a policy is used.
+// The recorded owner authority is checked whenever a policy is used.
 // ---------------------------------------------------------------------------
 
 const REVOKED: &str = "policy-owner-authority-revoked";
@@ -2877,7 +2877,7 @@ async fn revoking_the_agent_session_ends_its_policies(backend: Backend) -> anyho
         (Status::Forbidden, REVOKED.to_owned())
     );
     assert_eq!(h.signed_kv(&session).await?.0, Status::Forbidden);
-    // The root itself was never revoked.
+    // The root itself is not revoked.
     assert_eq!(
         h.root_status(&policy.policy_root_cid).await["state"],
         json!("active")
@@ -3131,7 +3131,7 @@ async fn legacy_registrations_without_authority_are_denied_unless_escaped(
 on_both_backends!(legacy_registrations_without_authority_are_denied_unless_escaped);
 
 /// Legacy rows get liveness but no expiry cap: a legacy session
-/// whose authority expired since registration still reads, and so does a
+/// whose authority expired since registration reads, and so does a
 /// legacy root longer than 31 days.
 async fn legacy_registrations_are_never_expiry_capped(backend: Backend) -> anyhow::Result<()> {
     let Some(h) = Harness::with_boot(
@@ -3232,7 +3232,7 @@ async fn the_escape_never_serves_post_cutover_rows(backend: Backend) -> anyhow::
 on_both_backends!(the_escape_never_serves_post_cutover_rows);
 
 /// An escaped legacy policy serves its admitted sessions, but a mint
-/// still needs the owner to have held what the policy grants when it
+/// needs the owner to have held what the policy grants when it
 /// registered.
 async fn escaped_mints_still_check_the_owner_held_the_capability(
     backend: Backend,

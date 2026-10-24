@@ -298,7 +298,7 @@ impl PolicyV3Runtime {
                 return Err("policy-session-root-graph-mismatch");
             }
         }
-        // TC-1423: the owner authority must still hold; its code passes
+        // TC-1423: the owner authority must hold; its code passes
         // through.
         self.validate_owner_authority(&self.conn, &registration, OffsetDateTime::now_utc())
             .await?;
@@ -2284,9 +2284,9 @@ pub async fn mint(
         .await
         .map_err(|e| (Status::Forbidden, e.into()))?;
     // A policy served under the legacy escape has no recorded authority, so
-    // the owner must still be shown to have held every root capability when
+    // the owner must be shown to have held every root capability when
     // the policy was registered. (Owner sessions may since have expired.)
-    // Recorded authority replaces this rescan.
+    // A recorded authority covers this check for other policies.
     if owner_authority.escaped {
         let registered_at = parse_time(&registration.registered_at)
             .map_err(|_| (Status::Forbidden, "policy-registration-invalid".into()))?;
@@ -2935,7 +2935,7 @@ impl PolicyV3Runtime {
         )
         .map_err(|_| "enforcer-binding-invalid")?;
         // TC-1423: the owner authority the roots were registered under must
-        // still hold.
+        // hold.
         self.validate_owner_authority(&self.conn, registration, now)
             .await
     }
@@ -10693,7 +10693,7 @@ mod tests {
             );
             assert_eq!(refused_body, "policy-owner-authority-revoked");
             // Delivery checks the same authority: the retry that returned the
-            // stored receipt above is now refused.
+            // stored receipt above is refused.
             let owner_revoked_delivery = make_invocation(
                 [(
                     content_resource.clone(),
