@@ -570,6 +570,10 @@ pub fn resolve_runtime_config(tinycloud_config: &Config) -> Result<Config> {
     tracing::RequestIdOrigins::new(&resolved.log.request_id_first_party_origins)
         .map_err(anyhow::Error::msg)?;
     resolved.storage.resolve();
+    resolved
+        .sql_store
+        .validate_for_database(resolved.storage.database())
+        .map_err(anyhow::Error::msg)?;
     resolved.share_email = resolved
         .share_email
         .resolve_trust_bundle()
