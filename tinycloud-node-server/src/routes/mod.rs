@@ -3467,7 +3467,10 @@ pub(crate) fn sql_error_to_status(err: &SqlError) -> Status {
             tinycloud_core::request_telemetry::note_failure(FailureNote::internal(Service::Sql));
             Status::InternalServerError
         }
-        SqlError::CommitFailed => Status::InternalServerError,
+        SqlError::CommitFailed => {
+            tinycloud_core::request_telemetry::note_failure(FailureNote::internal(Service::Sql));
+            Status::InternalServerError
+        }
         SqlError::Unavailable => Status::ServiceUnavailable,
         SqlError::OutcomeUnknown => Status::InternalServerError,
         SqlError::Busy(_) | SqlError::RequestTimeout => Status::ServiceUnavailable,
@@ -4769,6 +4772,31 @@ mod tests {
 
         assert_eq!(
             sql_error_to_status(&SqlError::Internal("secret".into())),
+            Status::InternalServerError
+        );
+        assert_eq!(
+            context.failure(),
+            Some(diag::FailureNote::internal(diag::Service::Sql))
+        );
+    }
+
+    /// A local SQL commit failure answers 500 and records the same
+    /// diagnostic note as the other SQL 500 arms.
+    #[tokio::test]
+    async fn sql_commit_failed_records_an_internal_sql_note() {
+        use tinycloud_core::failure_diagnostic as diag;
+        use tinycloud_core::request_telemetry::{self, RequestContext};
+
+        let context = RequestContext::new(
+            uuid::Uuid::nil(),
+            std::sync::Arc::new(tinycloud_core::telemetry::Pseudonymizer::new(
+                &tinycloud_core::keys::StaticSecret::new(vec![0x42; 32]).unwrap(),
+            )),
+        );
+
+        let _request = request_telemetry::enter(Some(std::sync::Arc::clone(&context)));
+        assert_eq!(
+            sql_error_to_status(&SqlError::CommitFailed),
             Status::InternalServerError
         );
         assert_eq!(
