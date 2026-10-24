@@ -218,3 +218,193 @@ async fn delegations_on_named_keys_are_refused(backend: Backend) -> anyhow::Resu
     Ok(())
 }
 on_both_backends!(delegations_on_named_keys_are_refused);
+
+const KEY_BLOCK: &str = "tinycloud.encryption/key.block";
+const APP_ID_NOT_BOUND: &str = "app_id_not_bound";
+
+/// With named keys on, a SIWE (CACAO) root grants an ability other than
+/// `key.block` under `apps/<app id>` only when the app id is bound to the
+/// SIWE domain (`tc1423.test` here, so `test.tc1423` and `test.tc1423.<more>`);
+/// a UCAN root is not checked.
+async fn siwe_app_grants_need_an_app_id_bound_to_the_domain(
+    backend: Backend,
+) -> anyhow::Result<()> {
+    let on = |config: &mut crate::config::Config| {
+        config.encryption_network.named_keys_v1 = true;
+    };
+    let window = || Window::until(now() + Duration::hours(1));
+
+    let Some(h) = Harness::new_with(
+        backend,
+        Shape::PkhSession,
+        "siwe_app_grants_need_an_app_id_bound_to_the_domain_cacao",
+        on,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let key = |tail: &str| format!("{}/{tail}", h.network);
+    for (what, grants) in [
+        ("bound key", vec![(key("apps/test.tc1423/x"), KEY_DECRYPT)]),
+        (
+            "bound prefix",
+            vec![(key("apps/test.tc1423.notes/"), KEY_CREATE)],
+        ),
+        ("foreign block", vec![(key("apps/other.app/"), KEY_BLOCK)]),
+        ("ordinary key", vec![(key("docs/a"), KEY_DECRYPT)]),
+        ("reserved lookalike", vec![(key("appsx/y"), KEY_DECRYPT)]),
+    ] {
+        let authorization = h
+            .space_owner
+            .delegate(h.owner.did(), &grants, window(), &[])?;
+        let (status, body) = h.delegate(authorization).await;
+        assert_eq!(status, Status::Ok, "{what}: {body}");
+    }
+    for (what, grants) in [
+        ("foreign key", vec![(key("apps/other.app/x"), KEY_DECRYPT)]),
+        ("foreign prefix", vec![(key("apps/other.app/"), KEY_CREATE)]),
+        (
+            "prefix of the domain only",
+            vec![(key("apps/test.tc1423x/"), KEY_CREATE)],
+        ),
+        (
+            "bound block, foreign decrypt",
+            vec![
+                (key("apps/test.tc1423/"), KEY_BLOCK),
+                (key("apps/other.app/x"), KEY_DECRYPT),
+            ],
+        ),
+    ] {
+        let authorization = h
+            .space_owner
+            .delegate(h.owner.did(), &grants, window(), &[])?;
+        let (status, body) = h.delegate(authorization).await;
+        assert_ne!(status, Status::Ok, "{what}: {body}");
+        assert!(body.starts_with(APP_ID_NOT_BOUND), "{what}: {body}");
+    }
+
+    let Some(h) = Harness::new_with(
+        backend,
+        Shape::KeySession,
+        "siwe_app_grants_need_an_app_id_bound_to_the_domain_ucan",
+        on,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let grants = vec![(format!("{}/apps/other.app/x", h.network), KEY_DECRYPT)];
+    let authorization = h
+        .space_owner
+        .delegate(h.owner.did(), &grants, window(), &[])?;
+    let (status, body) = h.delegate(authorization).await;
+    assert_eq!(status, Status::Ok, "UCAN root: {body}");
+    Ok(())
+}
+on_both_backends!(siwe_app_grants_need_an_app_id_bound_to_the_domain);
+
+/// The app refuses to start while a key row under `apps/` is not a deletable
+/// key, and starts once the row is gone.
+async fn startup_refuses_a_non_deletable_key_row_under_apps(
+    backend: Backend,
+) -> anyhow::Result<()> {
+    use tinycloud_core::models::encryption_network_key;
+    use tinycloud_core::sea_orm::{ActiveModelTrait, ActiveValue::Set, Database, ModelTrait};
+
+    let Some(h) = Harness::new(
+        backend,
+        Shape::KeySession,
+        "startup_refuses_a_non_deletable_key_row_under_apps",
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    h.boot_again(|_| {}).await.expect("boots with no stray row");
+
+    let db = Database::connect(h.database_url()).await?;
+    let stray = |path: &str, kind: &str| encryption_network_key::ActiveModel {
+        network_id: Set(h.network.clone()),
+        key_path: Set(path.to_string()),
+        kind: Set(kind.to_string()),
+        state: Set("active".to_string()),
+        public_key: Set(vec![7u8; 32]),
+        sealed_seed: Set(None),
+        key_version: Set(1),
+        created_at: Set("2026-01-01T00:00:00Z".to_string()),
+        updated_at: Set("2026-01-01T00:00:00Z".to_string()),
+    };
+    // Rows outside the rule do not stop the start.
+    stray("docs/a", "deterministic").insert(&db).await?;
+    stray("appsx/y", "deterministic").insert(&db).await?;
+    h.boot_again(|_| {})
+        .await
+        .expect("boots with ordinary rows");
+
+    let row = stray("apps/foo/old", "deterministic").insert(&db).await?;
+    let Err(error) = h.boot_again(|_| {}).await else {
+        panic!("a stray row under apps/ stops the start");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("1 key rows under apps/ are not deletable keys"),
+        "{error}"
+    );
+    // The same with the named-keys setting on.
+    assert!(h
+        .boot_again(|config| config.encryption_network.named_keys_v1 = true)
+        .await
+        .is_err());
+
+    row.delete(&db).await?;
+    h.boot_again(|_| {})
+        .await
+        .expect("boots once the row is gone");
+    Ok(())
+}
+on_both_backends!(startup_refuses_a_non_deletable_key_row_under_apps);
+
+/// With named keys on, `/delegate` refuses an `apps/` grant from a SIWE whose
+/// scheme is not `https` even when its domain is bound to the app id, and
+/// admits it when the scheme is `https` (any case) or absent.
+async fn siwe_app_grants_need_an_https_or_absent_scheme(backend: Backend) -> anyhow::Result<()> {
+    let Some(h) = Harness::new_with(
+        backend,
+        Shape::PkhSession,
+        "siwe_app_grants_need_an_https_or_absent_scheme",
+        |config| config.encryption_network.named_keys_v1 = true,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let window = || Window::until(now() + Duration::hours(1));
+    // `tc1423.test` is the harness SIWE domain, so `test.tc1423` is bound to it.
+    let grants = vec![(format!("{}/apps/test.tc1423/x", h.network), KEY_CREATE)];
+    for scheme in ["http", "wss", "ws"] {
+        let authorization = h.space_owner.delegate_with_scheme(
+            Some(scheme),
+            h.owner.did(),
+            &grants,
+            window(),
+            &[],
+        )?;
+        let (status, body) = h.delegate(authorization).await;
+        assert_ne!(status, Status::Ok, "scheme {scheme}: {body}");
+        assert!(
+            body.starts_with(APP_ID_NOT_BOUND),
+            "scheme {scheme}: {body}"
+        );
+    }
+    for scheme in [Some("https"), Some("HTTPS"), None] {
+        let authorization =
+            h.space_owner
+                .delegate_with_scheme(scheme, h.owner.did(), &grants, window(), &[])?;
+        let (status, body) = h.delegate(authorization).await;
+        assert_eq!(status, Status::Ok, "scheme {scheme:?}: {body}");
+    }
+    Ok(())
+}
+on_both_backends!(siwe_app_grants_need_an_https_or_absent_scheme);

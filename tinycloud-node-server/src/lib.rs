@@ -828,6 +828,9 @@ pub async fn app_with_control(
     ));
     let encryption_service =
         encryption_service.with_sqlite_writer_lock(tinycloud.sqlite_writer_lock());
+    // Runs after the migrations: a key row under `apps/` that is not a
+    // deletable key stops the node from starting.
+    tinycloud_core::encryption_network::keys::ensure_no_deterministic_app_keys(&seed_conn).await?;
     let database_artifact_repository: Arc<dyn DatabaseArtifactRepository> =
         Arc::new(SizeTrackingArtifactRepository::new(
             Arc::new(node_artifact_repository(&tinycloud)),

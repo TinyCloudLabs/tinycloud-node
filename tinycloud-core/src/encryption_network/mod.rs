@@ -5,6 +5,7 @@
 //! invocation verification. The module deliberately does not expose a node-side
 //! encrypt API — clients encrypt to the network public key locally.
 
+pub mod app_id;
 pub mod backend;
 pub mod canonical;
 pub mod key_id;
