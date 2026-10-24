@@ -4,6 +4,7 @@ use rusqlite::Connection;
 
 use crate::request_telemetry::QueryTimer;
 
+use super::durability::{create_dir_all_durable, set_synchronous, sync_dir, Synchronous};
 use super::types::SqlError;
 
 #[derive(Debug, Clone)]
@@ -12,14 +13,17 @@ pub enum StorageMode {
     File(PathBuf),
 }
 
-pub fn open_connection(mode: &StorageMode) -> Result<Connection, SqlError> {
+pub fn open_connection(
+    mode: &StorageMode,
+    synchronous: Synchronous,
+) -> Result<Connection, SqlError> {
     let conn = match mode {
         StorageMode::InMemory => {
             Connection::open_in_memory().map_err(|e| SqlError::Internal(e.to_string()))?
         }
         StorageMode::File(path) => {
             if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| SqlError::Internal(e.to_string()))?;
+                create_dir_all_durable(parent).map_err(|e| SqlError::Internal(e.to_string()))?;
             }
             Connection::open(path).map_err(|e| SqlError::Internal(e.to_string()))?
         }
@@ -27,6 +31,8 @@ pub fn open_connection(mode: &StorageMode) -> Result<Connection, SqlError> {
 
     // Enable WAL mode for file-backed databases
     if matches!(mode, StorageMode::File(_)) {
+        // Before the journal mode: the WAL switch is itself a write.
+        set_synchronous(&conn, synchronous)?;
         {
             let _timer = QueryTimer::new();
             conn.pragma_update(None, "journal_mode", "wal")
@@ -63,9 +69,13 @@ pub fn database_size(conn: &Connection) -> Result<u64, SqlError> {
     Ok(page_count * page_size)
 }
 
-pub fn promote_to_file(conn: &Connection, path: &PathBuf) -> Result<Connection, SqlError> {
+pub fn promote_to_file(
+    conn: &Connection,
+    path: &PathBuf,
+    synchronous: Synchronous,
+) -> Result<Connection, SqlError> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| SqlError::Internal(e.to_string()))?;
+        create_dir_all_durable(parent).map_err(|e| SqlError::Internal(e.to_string()))?;
     }
 
     // rusqlite appends the file path, which holds the space id, to open
@@ -76,6 +86,9 @@ pub fn promote_to_file(conn: &Connection, path: &PathBuf) -> Result<Connection, 
             e.sqlite_error_code()
         ))
     })?;
+
+    // The copy below is a write to the new file: sync it like any other.
+    set_synchronous(&file_conn, synchronous)?;
 
     // Use SQLite backup API
     // Native backup and filesystem I/O are not SQL query attempts.
@@ -109,6 +122,12 @@ pub fn promote_to_file(conn: &Connection, path: &PathBuf) -> Result<Connection, 
         file_conn
             .pragma_update(None, "foreign_keys", "ON")
             .map_err(|e| SqlError::Internal(e.to_string()))?;
+    }
+
+    // SQLite syncs the file's contents but not the directory entry that
+    // names it; without this a crash can lose the whole new database file.
+    if let Some(parent) = path.parent() {
+        sync_dir(parent).map_err(|e| SqlError::Internal(e.to_string()))?;
     }
 
     Ok(file_conn)

@@ -198,6 +198,9 @@ pub trait ArtifactSink: Send {
     async fn finish_part(&mut self) -> Result<(), DatabaseArtifactError>;
 }
 
+/// The most [`MemorySink`] allocates ahead of the bytes it is given.
+const MAX_SIZE_HINT_BYTES: u64 = 64 * 1024 * 1024;
+
 /// An [`ArtifactSink`] that keeps the bytes in memory, for callers that return
 /// the whole artifact anyway (a DuckDB export) and for tests.
 #[derive(Debug, Default)]
@@ -228,7 +231,11 @@ impl ArtifactSink for MemorySink {
             ArtifactPart::Wal => self.wal.as_mut(),
         };
         if let Some(target) = target {
-            target.reserve_exact(usize::try_from(bytes).unwrap_or(0));
+            // The hint comes from stored metadata. A corrupt value must not
+            // abort the node (`reserve_exact` panics or aborts on overflow or
+            // a failed allocation), so cap it and treat a refusal as no hint.
+            let hint = usize::try_from(bytes.min(MAX_SIZE_HINT_BYTES)).unwrap_or(0);
+            let _ = target.try_reserve_exact(hint);
         }
     }
 
@@ -341,6 +348,7 @@ impl CacheFileSink {
     pub async fn commit(&mut self) -> std::io::Result<()> {
         // Renamed entries leave `staged`; on failure every one still in it
         // (the failing temp included) is removed by `discard`.
+        let mut dirs = std::collections::BTreeSet::new();
         while let Some((temp, path)) = self.staged.first().cloned() {
             if let Err(error) = tokio::fs::rename(&temp, &path).await {
                 self.discard();
@@ -348,6 +356,14 @@ impl CacheFileSink {
             }
             release_staging(&temp);
             self.staged.remove(0);
+            if let Some(parent) = path.parent() {
+                dirs.insert(parent.to_path_buf());
+            }
+        }
+        // The parts were synced before the rename; the rename itself is only
+        // durable once its directory is (TC-1491).
+        for dir in dirs {
+            tokio::fs::File::open(&dir).await?.sync_all().await?;
         }
         Ok(())
     }
@@ -2235,5 +2251,36 @@ mod tests {
         assert!(names(dir.path())
             .iter()
             .all(|n| !n.contains(&format!(".tmp.{}.", std::process::id()))));
+    }
+
+    /// A corrupt size in the artifact metadata is only a hint: it must not
+    /// abort or panic the node, and the bytes still arrive intact.
+    #[tokio::test]
+    async fn tc1491_memory_sink_survives_an_absurd_size_hint() {
+        for hint in [
+            u64::MAX,
+            usize::MAX as u64,
+            (isize::MAX as u64) + 1,
+            1 << 62,
+            1 << 40,
+        ] {
+            let mut sink = MemorySink::default();
+            sink.begin_part(ArtifactPart::Checkpoint).await.unwrap();
+            sink.size_hint(ArtifactPart::Checkpoint, hint);
+            sink.write(b"SQLite format 3\0").await.unwrap();
+            sink.write(b"checkpoint").await.unwrap();
+            sink.finish_part().await.unwrap();
+            sink.begin_part(ArtifactPart::Wal).await.unwrap();
+            sink.size_hint(ArtifactPart::Wal, hint);
+            sink.write(b"wal").await.unwrap();
+            sink.finish_part().await.unwrap();
+            assert_eq!(sink.checkpoint, b"SQLite format 3\0checkpoint", "{hint}");
+            assert_eq!(sink.wal.as_deref(), Some(&b"wal"[..]), "{hint}");
+            assert!(
+                sink.checkpoint.capacity() <= 64 * 1024 * 1024 + 64,
+                "a hint of {hint} reserved {} bytes",
+                sink.checkpoint.capacity()
+            );
+        }
     }
 }
