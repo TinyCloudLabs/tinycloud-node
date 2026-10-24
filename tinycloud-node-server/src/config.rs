@@ -59,6 +59,8 @@ pub struct Config {
     pub encryption_network: EncryptionNetworkConfig,
     #[serde(default)]
     pub sql: SqlConfig,
+    #[serde(default)]
+    pub policy_v3: PolicyV3Config,
 }
 
 /// Release gates for the encryption network routes. `named_keys_v1`
@@ -919,6 +921,22 @@ pub struct HooksConfig {
     pub webhook_timeout_seconds: u64,
     #[serde(default = "default_hooks_webhook_max_attempts")]
     pub webhook_max_attempts: usize,
+    /// An open event stream re-checks its ticket's authority before
+    /// delivering an event, at most this often.
+    #[serde(default = "default_hooks_authority_recheck_seconds")]
+    pub authority_recheck_seconds: u64,
+    /// An open event stream re-checks its ticket's authority this often
+    /// even when no event arrives.
+    #[serde(default = "default_hooks_idle_authority_recheck_seconds")]
+    pub idle_authority_recheck_seconds: u64,
+}
+
+fn default_hooks_authority_recheck_seconds() -> u64 {
+    5
+}
+
+fn default_hooks_idle_authority_recheck_seconds() -> u64 {
+    30
 }
 
 fn default_hooks_max_ticket_ttl_seconds() -> u64 {
@@ -960,6 +978,8 @@ impl Default for HooksConfig {
             ),
             webhook_timeout_seconds: default_hooks_webhook_timeout_seconds(),
             webhook_max_attempts: default_hooks_webhook_max_attempts(),
+            authority_recheck_seconds: default_hooks_authority_recheck_seconds(),
+            idle_authority_recheck_seconds: default_hooks_idle_authority_recheck_seconds(),
         }
     }
 }
@@ -969,6 +989,9 @@ impl HooksConfig {
     pub fn validate(&self) -> Result<(), &'static str> {
         if self.webhook_max_attempts > 10 {
             return Err("hooks.webhook_max_attempts must not exceed 10");
+        }
+        if self.authority_recheck_seconds == 0 || self.idle_authority_recheck_seconds == 0 {
+            return Err("hooks authority re-check intervals must be at least 1 second");
         }
         Ok(())
     }
@@ -1293,6 +1316,107 @@ impl SqlStoreConfig {
     /// space is listed. An empty list uploads nothing.
     pub fn uploads_space(&self, space: &str) -> bool {
         self.enabled && self.spaces.iter().any(|s| s == space)
+    }
+}
+
+/// Policy/v3 owner-authority bindings (TC-1423). Section `[policy_v3]`.
+#[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq, Default)]
+pub struct PolicyV3Config {
+    /// Registrations before this instant (RFC 3339) are classified as legacy.
+    /// Unset: the applied-at time of the migration that created the binding
+    /// tables. Set it to the first deploy time after a rollback and
+    /// re-upgrade (the rollback drops that migration record). Env
+    /// `TINYCLOUD_POLICY_V3__LEGACY_CUTOVER`.
+    #[serde(default)]
+    pub legacy_cutover: Option<String>,
+    /// Whether a policy root may outlive the owner authority it is
+    /// registered under. `record` (the default) accepts and counts such
+    /// roots; `enforce` refuses them. Env
+    /// `TINYCLOUD_POLICY_V3__OWNER_AUTHORITY_EXPIRY`.
+    #[serde(default)]
+    pub owner_authority_expiry: OwnerAuthorityExpiry,
+    /// Operator escape: serve policies registered before the legacy cutover
+    /// for which no owner authority is recorded with the root-only checks;
+    /// when off they are denied. Off by default; logged at boot and per
+    /// policy when used. Env `TINYCLOUD_POLICY_V3__LEGACY_UNKNOWN_ALLOW`.
+    #[serde(default)]
+    pub legacy_unknown_allow: bool,
+    #[serde(default)]
+    pub owner_binding_backfill: OwnerBindingBackfillConfig,
+}
+
+/// See [`PolicyV3Config::owner_authority_expiry`].
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Hash, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum OwnerAuthorityExpiry {
+    #[default]
+    Record,
+    Enforce,
+}
+
+impl OwnerAuthorityExpiry {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Record => "record",
+            Self::Enforce => "enforce",
+        }
+    }
+}
+
+impl PolicyV3Config {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if let Some(cutover) = &self.legacy_cutover {
+            time::OffsetDateTime::parse(cutover, &time::format_description::well_known::Rfc3339)
+                .map_err(|_| "policy_v3.legacy_cutover must be an RFC 3339 timestamp")?;
+        }
+        self.owner_binding_backfill.validate()
+    }
+
+    /// The configured legacy cutover, if any. Call [`Self::validate`] first.
+    pub fn legacy_cutover(&self) -> Option<time::OffsetDateTime> {
+        self.legacy_cutover.as_deref().and_then(|value| {
+            time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339).ok()
+        })
+    }
+}
+
+/// The online sweep that classifies Policy/v3 registrations made before the
+/// binding tables existed. Policies are classified lazily on first use
+/// without it; the sweep only moves that work off the request path.
+///
+/// Off by default: production PostgreSQL is CPU-bound. Section
+/// `[policy_v3.owner_binding_backfill]`; env
+/// `TINYCLOUD_POLICY_V3__OWNER_BINDING_BACKFILL__ENABLED`,
+/// `TINYCLOUD_POLICY_V3__OWNER_BINDING_BACKFILL__POLICIES_PER_SECOND`.
+#[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
+pub struct OwnerBindingBackfillConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Upper bound on policies classified per second. After each policy the
+    /// sweep also pauses at least as long as that policy took.
+    #[serde(default = "default_owner_binding_backfill_policies_per_second")]
+    pub policies_per_second: u32,
+}
+
+fn default_owner_binding_backfill_policies_per_second() -> u32 {
+    1
+}
+
+impl Default for OwnerBindingBackfillConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            policies_per_second: default_owner_binding_backfill_policies_per_second(),
+        }
+    }
+}
+
+impl OwnerBindingBackfillConfig {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.enabled && self.policies_per_second == 0 {
+            return Err("policy_v3.owner_binding_backfill.policies_per_second must be at least 1; set enabled = false to turn the sweep off");
+        }
+        Ok(())
     }
 }
 
@@ -2082,6 +2206,41 @@ mod tests {
         assert_eq!(retention.history_days("team"), None);
     }
 
+    /// Every `Config` field except the ones listed here must load from a file
+    /// that omits it, so a config written before a section existed (for
+    /// example `[sql_store]` or `[policy_v3]`) loads. The fields are
+    /// read from the struct's own serialization: a new field without
+    /// `#[serde(default)]` fails here, and so does one that loses it.
+    #[test]
+    fn config_fields_without_a_required_marker_load_when_omitted() {
+        const REQUIRED: [&str; 6] = ["log", "storage", "spaces", "relay", "prometheus", "cors"];
+        let full = toml::Value::try_from(Config::default()).unwrap();
+        let full = full.as_table().unwrap().clone();
+        for field in REQUIRED {
+            assert!(full.contains_key(field), "required field {field} missing");
+        }
+        let load = |table: toml::Table| -> Result<Config, toml::de::Error> {
+            toml::Value::Table(table).try_into::<Config>()
+        };
+        assert_eq!(load(full.clone()).unwrap(), Config::default());
+        let optional: Vec<&String> = full
+            .keys()
+            .filter(|key| !REQUIRED.contains(&String::as_str(key)))
+            .collect();
+        assert!(optional.iter().any(|key| *key == "sql_store"));
+        assert!(optional.iter().any(|key| *key == "policy_v3"));
+        for field in &optional {
+            let mut table = full.clone();
+            table.remove(*field);
+            let config = load(table)
+                .unwrap_or_else(|error| panic!("a config without `{field}` must load: {error}"));
+            assert_eq!(config, Config::default(), "omitting `{field}`");
+        }
+        let mut only_required = full.clone();
+        only_required.retain(|key, _| REQUIRED.contains(&key));
+        assert_eq!(load(only_required).unwrap(), Config::default());
+    }
+
     #[test]
     fn sql_store_empty_allowlist_uploads_nothing_even_when_enabled() {
         let config = SqlStoreConfig {
@@ -2299,11 +2458,48 @@ mod tests {
             alg: "EdDSA".into(),
             public_key: key.into(),
             vcts: vec!["opencredentials.email/v1".into()],
-            profiles: vec!["tinycloud.email-held/v1".into()],
+            profiles: vec!["tinycloud.email-domain-proof/v1".into()],
             not_before: "2026-10-01T00:00:00Z".into(),
             retired_at: None,
             not_after: None,
         }
+    }
+
+    #[test]
+    fn held_profile_rows_fail_startup_for_an_issuer_outside_the_row() {
+        let key = base64::encode_config(
+            ed25519_dalek::SigningKey::from_bytes(&[9; 32])
+                .verifying_key()
+                .to_bytes(),
+            URL_SAFE_NO_PAD,
+        );
+        let held = |did: &str, kid: &str| {
+            let mut entry = explicit_issuer("issuing-1", &key);
+            entry.issuer_did = did.into();
+            entry.kid = kid.into();
+            entry.profiles = vec!["tinycloud.email-held/v1".into()];
+            let mut config = enabled_config();
+            config.credential_issuers = vec![entry];
+            config
+        };
+        // The email row permits only did:web:issuer.credentials.org.
+        assert!(held(
+            "did:web:acme.credentials.org",
+            "did:web:acme.credentials.org#issuing-1"
+        )
+        .credential_issuer_set()
+        .is_err());
+        assert!(held(
+            "did:web:issuer.credentials.org",
+            "did:web:issuer.credentials.org#issuing-1"
+        )
+        .credential_issuer_set()
+        .unwrap()
+        .resolve_pinned_issuer(
+            "did:web:issuer.credentials.org",
+            "did:web:issuer.credentials.org#issuing-1"
+        )
+        .is_some());
     }
 
     #[test]

@@ -23,6 +23,64 @@ const LEGACY_PROFILES: &[&str] = &[
     "tinycloud.email-domain-proof/v1",
 ];
 
+/// Permitted issuers for the held-credential profile rows (held credential
+/// profile spec §3.3). A configured entry must name, for every profile in
+/// `profiles` that has a row here, an `issuerDid` that row permits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PermittedIssuers {
+    /// Exactly this DID.
+    Literal(&'static str),
+    /// `did:web:o` + 26 characters of `[a-z2-7]` + `.orgs.credentials.org`.
+    OrgSubdomain,
+}
+
+/// One held-profile row: the `vct` it names and the issuers it permits.
+struct HeldRow {
+    profile: &'static str,
+    vct: &'static str,
+    permitted: PermittedIssuers,
+}
+
+const HELD_PROFILE_ROWS: &[HeldRow] = &[
+    HeldRow {
+        profile: "tinycloud.email-held/v1",
+        vct: "opencredentials.email/v1",
+        permitted: PermittedIssuers::Literal("did:web:issuer.credentials.org"),
+    },
+    HeldRow {
+        profile: "tinycloud.org-membership/v1",
+        vct: "opencredentials.org-membership/v1",
+        permitted: PermittedIssuers::OrgSubdomain,
+    },
+    HeldRow {
+        profile: "tinycloud.org-membership-free/v1",
+        vct: "opencredentials.org-membership/v1",
+        permitted: PermittedIssuers::OrgSubdomain,
+    },
+];
+
+fn held_row(profile: &str) -> Option<&'static HeldRow> {
+    HELD_PROFILE_ROWS.iter().find(|row| row.profile == profile)
+}
+
+/// Whether the held-profile row for `profile` permits `issuer_did`. `None`
+/// when no held row exists for `profile`; such profiles are not row-checked.
+fn held_row_permits(profile: &str, issuer_did: &str) -> Option<bool> {
+    let permitted = held_row(profile)?.permitted;
+    Some(match permitted {
+        PermittedIssuers::Literal(did) => issuer_did == did,
+        PermittedIssuers::OrgSubdomain => issuer_did
+            .strip_prefix("did:web:o")
+            .and_then(|rest| rest.strip_suffix(".orgs.credentials.org"))
+            .is_some_and(|label| {
+                label.len() == 26
+                    && label
+                        .bytes()
+                        .all(|byte| matches!(byte, b'a'..=b'z' | b'2'..=b'7'))
+            }),
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum IssuerSetError {
     #[error("issuer set entry {index}: alg must be EdDSA")]
@@ -41,6 +99,10 @@ pub enum IssuerSetError {
     FixtureKey { index: usize },
     #[error("issuer set entry {index}: publicKey is already pinned by another entry")]
     DuplicatePublicKey { index: usize },
+    #[error(
+        "issuer set entry {index}: a profile whose held row is defined does not permit this issuerDid"
+    )]
+    PermittedIssuer { index: usize },
     #[error(
         "issuer set entry {index}: vcts and profiles must be non-empty lists of non-empty strings"
     )]
@@ -242,6 +304,34 @@ impl IssuerSet {
         }
         self.entries.get(&(did.to_owned(), kid.to_owned()))
     }
+
+    /// Registration-time membership check. True when the configured set names
+    /// `did` (and `kid`, when given) for this `vct` and `profile`. Validity
+    /// windows are enforced at acceptance, not here.
+    pub fn permits_requirement(
+        &self,
+        did: &str,
+        kid: Option<&str>,
+        vct: &str,
+        profile: &str,
+    ) -> bool {
+        // Spec §3.3: the requirement's credential type must be the one the profile's row names.
+        if held_row(profile).is_some_and(|row| row.vct != vct) {
+            return false;
+        }
+        match kid {
+            Some(kid) => self
+                .resolve_pinned_issuer(did, kid)
+                .is_some_and(|entry| entry.admits(vct, profile)),
+            None => {
+                did_method_allowed(did)
+                    && self
+                        .entries
+                        .values()
+                        .any(|entry| entry.issuer_did == did && entry.admits(vct, profile))
+            }
+        }
+    }
 }
 
 fn parse_entry(
@@ -268,6 +358,15 @@ fn parse_entry(
     let non_empty = |values: &[String]| !values.is_empty() && values.iter().all(|v| !v.is_empty());
     if !non_empty(&config.vcts) || !non_empty(&config.profiles) {
         return Err(IssuerSetError::Admission { index });
+    }
+    // Every held row a profile names must permit this issuer. One violation
+    // invalidates the whole set.
+    if config
+        .profiles
+        .iter()
+        .any(|profile| held_row_permits(profile, &config.issuer_did) == Some(false))
+    {
+        return Err(IssuerSetError::PermittedIssuer { index });
     }
     let not_before = parse_utc(&config.not_before).ok_or(IssuerSetError::Time {
         index,
@@ -414,9 +513,146 @@ mod tests {
         OffsetDateTime::parse(text, &Rfc3339).unwrap()
     }
 
+    /// An entry under a legacy profile: it has no held row and is not row-checked.
+    fn legacy_entry(did: &str, fragment: &str, seed: u8) -> CredentialIssuerConfig {
+        let mut config = entry(did, fragment, seed);
+        config.profiles = vec!["tinycloud.email-domain-proof/v1".into()];
+        config
+    }
+
+    #[test]
+    fn held_rows_permit_only_their_issuer_shapes() {
+        let email = "tinycloud.email-held/v1";
+        assert_eq!(held_row_permits(email, DID), Some(true));
+        assert_eq!(
+            held_row_permits(email, "did:web:issuer.credentials.org.evil"),
+            Some(false)
+        );
+        assert_eq!(
+            held_row_permits(email, "did:web:other.credentials.org"),
+            Some(false)
+        );
+        let org = "did:web:oabcdefghijklmnopqrstuvwxyz.orgs.credentials.org";
+        for profile in [
+            "tinycloud.org-membership/v1",
+            "tinycloud.org-membership-free/v1",
+        ] {
+            assert_eq!(held_row_permits(profile, org), Some(true), "{profile}");
+            for bad in [
+                "did:web:oabcdefghijklmnopqrstuvwxy.orgs.credentials.org",
+                "did:web:oabcdefghijklmnopqrstuvwxyz0.orgs.credentials.org",
+                "did:web:oABCDEFGHIJKLMNOPQRSTUVWXYZ.orgs.credentials.org",
+                "did:web:oabcdefghijklmnopqrstuvwxy1.orgs.credentials.org",
+                "did:web:oabcdefghijklmnopqrstuvwxyz.orgs.credentials.org.evil",
+                "did:web:oabcdefghijklmnopqrstuvwxyz.x.orgs.credentials.org",
+                "did:web:xabcdefghijklmnopqrstuvwxyz.orgs.credentials.org",
+            ] {
+                assert_eq!(held_row_permits(profile, bad), Some(false), "{bad}");
+            }
+        }
+        // Profiles without a held row are not row-checked.
+        assert_eq!(
+            held_row_permits("tinycloud.email-proof/v1", "did:web:a.example"),
+            None
+        );
+    }
+
+    #[test]
+    fn held_row_violation_invalidates_the_whole_set() {
+        let mut bad = entry("did:web:acme.credentials.org", "k", 1);
+        assert_eq!(
+            IssuerSet::load(std::slice::from_ref(&bad)).err(),
+            Some(IssuerSetError::PermittedIssuer { index: 0 })
+        );
+        // The same DID under a legacy profile has no row and loads.
+        bad.profiles = vec!["tinycloud.email-domain-proof/v1".into()];
+        assert_eq!(IssuerSet::load(&[bad]).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn registration_membership_follows_did_kid_vct_and_profile() {
+        let set = IssuerSet::load(&[entry(DID, "k", 1)]).unwrap();
+        let kid = format!("{DID}#k");
+        let vct = "opencredentials.email/v1";
+        let profile = "tinycloud.email-held/v1";
+        assert!(set.permits_requirement(DID, None, vct, profile));
+        assert!(set.permits_requirement(DID, Some(&kid), vct, profile));
+        assert!(!set.permits_requirement("did:web:other.credentials.org", None, vct, profile));
+        assert!(!set.permits_requirement(DID, Some(&format!("{DID}#other")), vct, profile));
+        assert!(!set.permits_requirement(DID, None, "opencredentials.org-membership/v1", profile));
+        assert!(!set.permits_requirement(DID, None, vct, "tinycloud.org-membership/v1"));
+        assert!(!set.permits_requirement(
+            DID,
+            Some(&kid),
+            "opencredentials.org-membership/v1",
+            profile
+        ));
+        assert!(!set.permits_requirement(DID, Some(&kid), vct, "tinycloud.org-membership/v1"));
+    }
+
+    #[test]
+    fn registration_membership_requires_the_row_vct_for_the_profile() {
+        // Both vcts are listed, so only the row check can refuse the crossed pair.
+        let mut both = entry(DID, "k", 1);
+        both.vcts = vec![
+            "opencredentials.email/v1".into(),
+            "opencredentials.org-membership/v1".into(),
+        ];
+        let set = IssuerSet::load(&[both]).unwrap();
+        let kid = format!("{DID}#k");
+        let profile = "tinycloud.email-held/v1";
+        assert!(set.permits_requirement(DID, Some(&kid), "opencredentials.email/v1", profile));
+        assert!(set.permits_requirement(DID, None, "opencredentials.email/v1", profile));
+        assert!(!set.permits_requirement(
+            DID,
+            Some(&kid),
+            "opencredentials.org-membership/v1",
+            profile
+        ));
+        assert!(!set.permits_requirement(DID, None, "opencredentials.org-membership/v1", profile));
+    }
+
+    #[test]
+    fn registration_requires_the_entry_to_list_the_row_pair() {
+        // The pair matches its own row, so only the entry's lists can refuse it.
+        let set = IssuerSet::load(&[entry(DID, "k", 1)]).unwrap();
+        let kid = format!("{DID}#k");
+        for kid in [Some(kid.as_str()), None] {
+            assert!(!set.permits_requirement(
+                DID,
+                kid,
+                "opencredentials.org-membership/v1",
+                "tinycloud.org-membership/v1"
+            ));
+            assert!(!set.permits_requirement(
+                DID,
+                kid,
+                "opencredentials.email/v1",
+                "tinycloud.email-proof/v1"
+            ));
+        }
+    }
+
+    #[test]
+    fn registration_admits_a_free_row_requirement_the_entry_lists() {
+        // Records current behaviour: a requirement naming the free row directly is admitted
+        // when an entry lists it. Spec §3.3 refuses it; the refusal belongs to T10 admittedRows.
+        let did = format!("did:web:o{}.orgs.credentials.org", "a".repeat(26));
+        let mut free = entry(&did, "k", 1);
+        free.vcts = vec!["opencredentials.org-membership/v1".into()];
+        free.profiles = vec!["tinycloud.org-membership-free/v1".into()];
+        let set = IssuerSet::load(&[free]).unwrap();
+        assert!(set.permits_requirement(
+            &did,
+            None,
+            "opencredentials.org-membership/v1",
+            "tinycloud.org-membership-free/v1"
+        ));
+    }
+
     #[test]
     fn loads_a_valid_two_issuer_set_and_returns_the_full_entry() {
-        let mut second = entry("did:web:acme.credentials.org", "issuing-1", 2);
+        let mut second = legacy_entry("did:web:acme.credentials.org", "issuing-1", 2);
         second.retired_at = Some("2027-01-01T00:00:00Z".into());
         second.not_after = Some("2028-01-01T00:00:00Z".into());
         let set = IssuerSet::load(&[entry(DID, "issuing-1", 1), second]).unwrap();
@@ -443,7 +679,7 @@ mod tests {
     fn lookup_is_the_exact_pair_and_fails_closed() {
         let set = IssuerSet::load(&[
             entry(DID, "issuing-1", 1),
-            entry("did:web:acme.credentials.org", "issuing-1", 2),
+            legacy_entry("did:web:acme.credentials.org", "issuing-1", 2),
         ])
         .unwrap();
         // Right issuer, wrong kid.
@@ -687,7 +923,7 @@ mod tests {
     #[test]
     fn refuses_one_public_key_pinned_twice() {
         let a = entry(DID, "issuing-1", 1);
-        let mut b = entry("did:web:acme.credentials.org", "issuing-1", 1);
+        let mut b = legacy_entry("did:web:acme.credentials.org", "issuing-1", 1);
         assert_eq!(
             IssuerSet::load(&[a.clone(), b.clone()]).unwrap_err(),
             IssuerSetError::DuplicatePublicKey { index: 1 }
@@ -833,5 +1069,24 @@ mod tests {
         let mut disabled = key;
         disabled.enabled = false;
         assert!(IssuerSet::from_legacy(&disabled).is_empty());
+    }
+
+    #[test]
+    fn held_row_permits_matches_the_spec_parity_fixture() {
+        // Expected verdicts are derived from the spec §3.3 literal and pattern rules
+        // (email: exact literal; org rows: `^did:web:o[a-z2-7]{26}\.orgs\.credentials\.org$`),
+        // not from this implementation. Fixture: testdata/held_row_parity.tsv.
+        let rows = include_str!("testdata/held_row_parity.tsv");
+        for line in rows.lines().skip(1) {
+            let mut cols = line.split('\t');
+            let profile = cols.next().unwrap();
+            let did = cols.next().unwrap();
+            let want = cols.next().unwrap() == "true";
+            assert_eq!(
+                held_row_permits(profile, did),
+                Some(want),
+                "{profile} {did:?}"
+            );
+        }
     }
 }

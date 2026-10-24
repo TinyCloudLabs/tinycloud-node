@@ -308,6 +308,7 @@ fn build_info(
     encryption: &State<EncryptionService>,
     config: &State<crate::config::Config>,
     database: Option<&tinycloud_core::RecoveringConnection>,
+    owner_authority: Option<crate::config::OwnerAuthorityExpiry>,
 ) -> NodeInfo {
     #[allow(unused_mut)]
     let mut features = vec!["kv", "delegation", "sharing", "sql"];
@@ -322,6 +323,17 @@ fn build_info(
     ]);
     #[cfg(feature = "dstack")]
     features.push("tee");
+    // TC-1423: Policy/v3 registrations are bound to the owner authority
+    // (`-v1`), plus exactly one active expiry mode. Clients treat the node as
+    // enforcing only when `-enforce` is listed. Listed before the features
+    // gated by settings, which are appended last.
+    if let Some(mode) = owner_authority {
+        features.push("policy-owner-authority-v1");
+        features.push(match mode {
+            crate::config::OwnerAuthorityExpiry::Record => "policy-owner-authority-record",
+            crate::config::OwnerAuthorityExpiry::Enforce => "policy-owner-authority-enforce",
+        });
+    }
     if config.encryption_network.named_keys_v1 {
         features.push("encryption-named-keys-v1");
     }
@@ -352,6 +364,26 @@ fn build_info(
     }
 }
 
+/// The Policy/v3 owner-authority mode, if the node serves Policy/v3. Never
+/// fails, so a fixture without the policy runtime launches.
+pub struct OwnerAuthorityMode(Option<crate::config::OwnerAuthorityExpiry>);
+
+#[rocket::async_trait]
+impl<'r> rocket::request::FromRequest<'r> for OwnerAuthorityMode {
+    type Error = std::convert::Infallible;
+
+    async fn from_request(
+        request: &'r rocket::Request<'_>,
+    ) -> rocket::request::Outcome<Self, Self::Error> {
+        rocket::request::Outcome::Success(OwnerAuthorityMode(
+            request
+                .rocket()
+                .state::<crate::policy_v3::PolicyV3Runtime>()
+                .map(crate::policy_v3::PolicyV3Runtime::owner_authority_expiry),
+        ))
+    }
+}
+
 /// The node's pool, if it manages one. Unlike a `State` guard it never
 /// fails, so a node without a pool (a test fixture) still launches.
 pub struct NodePool<'r>(Option<&'r tinycloud_core::RecoveringConnection>);
@@ -378,8 +410,16 @@ pub fn info(
     encryption: &State<EncryptionService>,
     config: &State<crate::config::Config>,
     pool: NodePool<'_>,
+    owner_authority: OwnerAuthorityMode,
 ) -> Json<NodeInfo> {
-    Json(build_info(tee, quota_cache, encryption, config, pool.0))
+    Json(build_info(
+        tee,
+        quota_cache,
+        encryption,
+        config,
+        pool.0,
+        owner_authority.0,
+    ))
 }
 
 #[get("/version")]
@@ -389,8 +429,16 @@ pub fn version(
     encryption: &State<EncryptionService>,
     config: &State<crate::config::Config>,
     pool: NodePool<'_>,
+    owner_authority: OwnerAuthorityMode,
 ) -> Json<NodeInfo> {
-    Json(build_info(tee, quota_cache, encryption, config, pool.0))
+    Json(build_info(
+        tee,
+        quota_cache,
+        encryption,
+        config,
+        pool.0,
+        owner_authority.0,
+    ))
 }
 
 #[allow(clippy::let_unit_value)]
@@ -1826,7 +1874,8 @@ async fn invoke_impl(
         let policy_session_invocation = policy_v3
             .authorize_invocation(tinycloud, &admitted.invocation().0, now)
             .await
-            .map_err(|error| (Status::Forbidden, error.to_string()))?;
+            .map_err(|error| (Status::Forbidden, error.to_string()))?
+            .is_some();
 
         let decrypt_network = admitted
             .invocation()
