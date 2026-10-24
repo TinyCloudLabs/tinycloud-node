@@ -152,6 +152,15 @@ rolled back and answers 500 `deletion_ledger_unavailable`. An append whose write
 or fsync fails is cut back to the file's length before it, so the file never
 holds a partial line before a later one.
 
+While the node runs, the ledger is locked: it takes an exclusive lock (`flock`)
+on the file `<deletion_ledger_path>.lock`, created with mode 0600 and never
+removed. A second process that opens the same ledger tries the lock every
+500 ms for up to 60 seconds and logs `deletion_ledger_lock_wait` once. After
+that it fails to open the ledger: the node logs `deletion_ledger_open_failed`
+with `error_kind` `lock_held`, the named-key routes stay off, and the rest of
+the node serves. A failed append that could not be cut back logs
+`deletion_ledger_unrepaired`, and later appends fail.
+
 The node image contains the directory `/var/lib/tinycloud/ledger`, owned by
 uid 1000 (the node's user) with mode 0700; a volume mounted there is writable
 by the node.
