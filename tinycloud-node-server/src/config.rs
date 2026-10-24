@@ -1355,6 +1355,24 @@ pub struct SqlStorageConfig {
     /// callers that gave up on it, so the database still warms.
     #[serde(default = "default_sql_hydration_max_ms")]
     pub hydration_max_ms: u64,
+    /// `PRAGMA synchronous` of file-backed databases (TC-1491): `full` makes
+    /// every local COMMIT fsync the WAL before it returns, `normal` fsyncs
+    /// only at checkpoints. `normal` is the rollback flag.
+    #[serde(default)]
+    pub synchronous: tinycloud_core::sql::durability::Synchronous,
+    /// Per-database size cap (TC-1491). A write that would grow a database past
+    /// it is rolled back before COMMIT (`507 sql_database_size_limit`).
+    /// **0 (the default) = no cap.** The limit is Sam's decision (card
+    /// `sql-storage-report-read`); set it by config once he answers.
+    #[serde(default = "default_sql_max_database_bytes")]
+    pub max_database_bytes: ByteUnit,
+    /// Free disk that must remain after the worst-case growth of every write
+    /// in flight (TC-1491); a write that would eat into it is rolled back
+    /// before COMMIT (`507 sql_disk_headroom`). **0 (the default) = the check
+    /// is off** (no reservation, no free-space reads). The limit is Sam's
+    /// decision (card `sql-storage-report-read`).
+    #[serde(default = "default_sql_min_free_bytes")]
+    pub min_free_bytes: ByteUnit,
     /// Whether a schema-changing statement (CREATE, ALTER, DROP of tables,
     /// views and indexes) needs `tinycloud.sql/schema` (TC-1581). `sql/write`
     /// covers data statements only. `"enforce"` (the default) refuses the
@@ -1362,6 +1380,14 @@ pub struct SqlStorageConfig {
     /// `"off"` keeps the earlier behaviour, where `write` also sufficed.
     #[serde(default)]
     pub ddl_requires_schema: DdlPolicy,
+}
+
+fn default_sql_max_database_bytes() -> ByteUnit {
+    ByteUnit::Byte(0)
+}
+
+fn default_sql_min_free_bytes() -> ByteUnit {
+    ByteUnit::Byte(0)
 }
 
 fn default_sql_memory_threshold() -> ByteUnit {
@@ -1385,6 +1411,16 @@ fn default_sql_hydration_max_ms() -> u64 {
 }
 
 impl SqlStorageConfig {
+    /// The local durability policy the SQL actors run under.
+    pub fn durability(&self) -> tinycloud_core::sql::durability::DurabilityPolicy {
+        tinycloud_core::sql::durability::DurabilityPolicy {
+            synchronous: self.synchronous,
+            max_database_bytes: self.max_database_bytes.as_u64(),
+            min_free_bytes: self.min_free_bytes.as_u64(),
+            ..Default::default()
+        }
+    }
+
     pub fn wait_bounds(&self) -> tinycloud_core::sql::SqlWaitBounds {
         tinycloud_core::sql::SqlWaitBounds {
             lock_wait: Duration::from_millis(self.lock_wait_timeout_ms),
@@ -1404,6 +1440,9 @@ impl Default for SqlStorageConfig {
             hydration_wait_timeout_ms: default_sql_hydration_wait_timeout_ms(),
             artifact_transfer_timeout_ms: default_sql_artifact_transfer_timeout_ms(),
             hydration_max_ms: default_sql_hydration_max_ms(),
+            synchronous: Default::default(),
+            max_database_bytes: default_sql_max_database_bytes(),
+            min_free_bytes: default_sql_min_free_bytes(),
             ddl_requires_schema: DdlPolicy::default(),
         }
     }

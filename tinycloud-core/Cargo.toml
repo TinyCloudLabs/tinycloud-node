@@ -48,6 +48,7 @@ serde_ipld_dagcbor = "0.3"
 ucan-capabilities-object.workspace = true
 multihash-derive = "0.9"
 rusqlite.workspace = true
+libc = "0.2"
 sqlparser.workspace = true
 tracing.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }

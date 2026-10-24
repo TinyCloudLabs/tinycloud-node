@@ -878,6 +878,7 @@ pub async fn app_with_control(
         database_artifact_repository.clone(),
     )
     .with_wait_bounds(tinycloud_config.storage.sql.wait_bounds())
+    .with_durability(tinycloud_config.storage.sql.durability())
     .with_ddl_policy(tinycloud_config.storage.sql.ddl_requires_schema);
 
     let mut policy_v3_runtime =

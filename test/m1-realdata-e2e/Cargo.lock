@@ -7986,6 +7986,7 @@ dependencies = [
  "hkdf",
  "hmac 0.12.1",
  "k256",
+ "libc",
  "libp2p",
  "multihash-derive 0.9.1",
  "pin-project",
@@ -8017,7 +8018,7 @@ dependencies = [
 
 [[package]]
 name = "tinycloud-node"
-version = "1.21.9"
+version = "1.22.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
