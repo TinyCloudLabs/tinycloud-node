@@ -257,7 +257,7 @@ use routes::{
     create_signed_kv_url, delegate, delegation_query, delegation_status,
     encryption::{
         block_encryption_key, create_encryption_key, create_network as create_encryption_network,
-        decrypt as encryption_decrypt, describe_encryption_key,
+        decrypt as encryption_decrypt, delete_encryption_key, describe_encryption_key,
         get_network as get_encryption_network, public_encryption_key,
         revoke_network as revoke_encryption_network, unblock_encryption_key,
         well_known_network as encryption_well_known,
@@ -565,6 +565,10 @@ pub fn resolve_runtime_config(tinycloud_config: &Config) -> Result<Config> {
         .validate()
         .map_err(anyhow::Error::msg)?;
     resolved.sql_store.validate().map_err(anyhow::Error::msg)?;
+    resolved
+        .encryption_network
+        .validate()
+        .map_err(anyhow::Error::msg)?;
     tracing::RequestIdOrigins::new(&resolved.log.request_id_first_party_origins)
         .map_err(anyhow::Error::msg)?;
     resolved.storage.resolve();
@@ -593,6 +597,7 @@ fn named_key_routes() -> Vec<Route> {
         public_encryption_key,
         block_encryption_key,
         unblock_encryption_key,
+        delete_encryption_key,
     ]
 }
 
@@ -696,20 +701,6 @@ pub async fn app_with_control(
     if tinycloud_config.did_resolution.network_methods {
         ::tracing::warn!("network DID resolution enabled: did:web/did:tz fetches use the unhardened ssi client (TC-1080)");
     }
-
-    let routes = production_routes(tinycloud_config.encryption_network.named_keys_v1);
-    #[cfg(feature = "tc-bench-v1")]
-    let mut routes = routes;
-
-    #[cfg(feature = "tc-bench-v1")]
-    routes.extend(rocket::routes![
-        tc_bench_auth_verify,
-        tc_bench_kv_put,
-        tc_bench_kv_get,
-        tc_bench_block_put,
-        tc_bench_block_get,
-        tc_bench_health,
-    ]);
 
     let key_setup: StaticSecret =
         match resolve_keys(&tinycloud_config.keys, &tinycloud_config.tee).await? {
@@ -830,8 +821,90 @@ pub async fn app_with_control(
     tinycloud.set_read_audit_wait(Duration::from_millis(
         tinycloud_config.database.read_audit_wait_ms,
     ));
-    let encryption_service =
-        encryption_service.with_sqlite_writer_lock(tinycloud.sqlite_writer_lock());
+    let mut named_keys_enabled = tinycloud_config.encryption_network.named_keys_v1;
+    let deletion_ledger = match tinycloud_config
+        .encryption_network
+        .deletion_ledger_path
+        .as_deref()
+        .map(tinycloud_core::encryption_network::deletion_ledger::DeletionLedger::open)
+        .transpose()
+    {
+        Ok(ledger) => ledger.map(Arc::new),
+        Err(error) => {
+            named_keys_enabled = false;
+            ::tracing::error!(
+                event = "deletion_ledger_open_failed",
+                error_kind = error.kind(),
+                "deletion ledger could not be opened: the named-key routes are off"
+            );
+            None
+        }
+    };
+    let encryption_service = encryption_service
+        .with_sqlite_writer_lock(tinycloud.sqlite_writer_lock())
+        .with_deletion_ledger(deletion_ledger.clone());
+    // Runs after the migrations: a key row under `apps/` that is not a
+    // deletable key stops the node from starting.
+    tinycloud_core::encryption_network::keys::ensure_no_deterministic_app_keys(&seed_conn).await?;
+    // The deletion ledger is replayed onto the database before any route is
+    // served, so a delete that a restore or a crash left out is applied
+    // first. If the replay fails the named-key routes stay off (as with
+    // `named_keys_v1` off) and the rest of the node serves.
+    // (`named_keys_enabled` is false if the ledger could not be opened.)
+    if let Some(ledger) = &deletion_ledger {
+        match ledger.replay_at_start(&seed_conn).await {
+            Ok(report) => {
+                if ledger.dropped_tail_bytes() > 0 || report.applied > 0 || report.torn_tail {
+                    ::tracing::warn!(
+                        event = "deletion_ledger_replayed",
+                        operations = report.operations,
+                        aborted_operations = report.aborted_operations,
+                        applied = report.applied,
+                        not_deletable = report.not_deletable,
+                        newer_version = report.newer_version,
+                        dropped_tail_bytes = ledger.dropped_tail_bytes(),
+                        torn_tail = report.torn_tail,
+                        "deletion ledger replayed at start"
+                    );
+                }
+            }
+            Err(error) => {
+                named_keys_enabled = false;
+                ::tracing::error!(
+                    event = "deletion_ledger_replay_failed",
+                    error_kind = error.kind(),
+                    "deletion ledger replay failed: the named-key routes are off"
+                );
+            }
+        }
+    }
+    let tinycloud = tinycloud.with_named_keys(named_keys_enabled);
+    let figment_named_keys_off;
+    let config = if named_keys_enabled == tinycloud_config.encryption_network.named_keys_v1 {
+        config
+    } else {
+        figment_named_keys_off =
+            config
+                .clone()
+                .merge(rocket::figment::providers::Serialized::global(
+                    "encryption_network.named_keys_v1",
+                    false,
+                ));
+        &figment_named_keys_off
+    };
+    let routes = production_routes(named_keys_enabled);
+    #[cfg(feature = "tc-bench-v1")]
+    let mut routes = routes;
+
+    #[cfg(feature = "tc-bench-v1")]
+    routes.extend(rocket::routes![
+        tc_bench_auth_verify,
+        tc_bench_kv_put,
+        tc_bench_kv_get,
+        tc_bench_block_put,
+        tc_bench_block_get,
+        tc_bench_health,
+    ]);
     let database_artifact_repository: Arc<dyn DatabaseArtifactRepository> =
         Arc::new(SizeTrackingArtifactRepository::new(
             Arc::new(node_artifact_repository(&tinycloud)),
@@ -1326,7 +1399,7 @@ mod production_route_tests {
         );
     }
 
-    /// The five key routes are mounted only with `named_keys_v1` on; the
+    /// The six key routes are mounted only with `named_keys_v1` on; the
     /// network routes are mounted either way.
     #[test]
     fn named_key_routes_are_mounted_only_when_named_keys_are_on() {
@@ -1337,7 +1410,7 @@ mod production_route_tests {
                 .collect()
         };
         let key_routes = describe(named_key_routes());
-        assert_eq!(key_routes.len(), 5, "{key_routes:?}");
+        assert_eq!(key_routes.len(), 6, "{key_routes:?}");
         let off = describe(production_routes(false));
         let on = describe(production_routes(true));
         for route in &key_routes {
@@ -1354,7 +1427,7 @@ mod production_route_tests {
             assert!(off.contains(&route), "missing while off: {route}");
             assert!(on.contains(&route), "missing while on: {route}");
         }
-        assert_eq!(on.len(), off.len() + 5);
+        assert_eq!(on.len(), off.len() + 6);
     }
 }
 

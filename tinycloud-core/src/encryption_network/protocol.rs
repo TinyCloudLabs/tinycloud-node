@@ -25,6 +25,7 @@ pub const KEY_DESCRIBE_TYPE: &str = "tinycloud.encryption.key-describe/v1";
 pub const KEY_CREATE_ACTION: &str = "tinycloud.encryption/key.create";
 pub const KEY_BLOCK_ACTION: &str = "tinycloud.encryption/key.block";
 pub const KEY_UNBLOCK_ACTION: &str = "tinycloud.encryption/key.unblock";
+pub const KEY_DELETE_ACTION: &str = "tinycloud.encryption/key.delete";
 
 /// Body of a POST /encryption/networks/<networkId>/decrypt request.
 #[derive(Debug, Clone, Serialize, Deserialize)]

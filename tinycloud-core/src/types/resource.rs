@@ -245,11 +245,11 @@ mod tests {
         };
 
         let covered = [
-            (uri("default/apps/foo/a/b"), uri("default/apps/foo/")),
-            (uri("default/apps/foo/x"), uri("default/apps/foo/")),
-            (uri("default/apps/foo/"), uri("default/apps/")),
-            (uri("default/apps/foo/"), uri("default/apps/foo/")),
-            (uri("default/apps/x"), uri("default/apps/x")),
+            (uri("default/docs/foo/a/b"), uri("default/docs/foo/")),
+            (uri("default/docs/foo/x"), uri("default/docs/foo/")),
+            (uri("default/docs/foo/"), uri("default/docs/")),
+            (uri("default/docs/foo/"), uri("default/docs/foo/")),
+            (uri("default/docs/x"), uri("default/docs/x")),
         ];
         for (child, parent) in &covered {
             assert!(
@@ -259,12 +259,12 @@ mod tests {
         }
 
         let not_covered = [
-            (uri("default/apps/foobar/x"), uri("default/apps/foo/")),
-            (uri("default/apps/foo"), uri("default/apps/foo/")),
-            (uri("default/apps/x"), uri("default")),
-            (uri("default"), uri("default/apps/x")),
-            (uri("default/apps/"), uri("default/apps/foo/")),
-            (uri("default/apps/x"), uri("default/apps/y")),
+            (uri("default/docs/foobar/x"), uri("default/docs/foo/")),
+            (uri("default/docs/foo"), uri("default/docs/foo/")),
+            (uri("default/docs/x"), uri("default")),
+            (uri("default"), uri("default/docs/x")),
+            (uri("default/docs/"), uri("default/docs/foo/")),
+            (uri("default/docs/x"), uri("default/docs/y")),
         ];
         for (child, parent) in &not_covered {
             assert!(

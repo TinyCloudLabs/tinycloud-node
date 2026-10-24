@@ -4270,6 +4270,7 @@ async fn verify_auth_admitted(
 #[cfg(test)]
 mod tests {
     mod encryption_keys;
+    mod key_delete;
     mod revocation_scope;
 
     use super::*;
@@ -4301,6 +4302,10 @@ mod tests {
     };
     use tokio::time::{timeout, Duration};
 
+    /// Keeps a test rocket's deletion-ledger directory alive.
+    #[allow(dead_code)]
+    struct LedgerDir(TempDir);
+
     fn manage_tc405_test_state(
         rocket: rocket::Rocket<rocket::Build>,
         conn: tinycloud_core::sea_orm::DatabaseConnection,
@@ -4310,14 +4315,23 @@ mod tests {
         let backend = std::sync::Arc::new(LocalOneOfOneBackend::new(ColumnEncryption::new(
             secret.derive_key(b"tinycloud/encryption/network-seal"),
         )));
+        // A ledger in a directory that lives as long as the rocket, so a
+        // test can delete keys.
+        let ledger_dir = TempDir::new().expect("ledger directory");
+        let ledger = tinycloud_core::encryption_network::deletion_ledger::DeletionLedger::open(
+            &ledger_dir.path().join("deletion-ledger.jsonl"),
+        )
+        .expect("deletion ledger");
         let encryption =
-            EncryptionService::new_with_node_keypair(conn.clone(), secret.node_keypair(), backend);
+            EncryptionService::new_with_node_keypair(conn.clone(), secret.node_keypair(), backend)
+                .with_deletion_ledger(Some(std::sync::Arc::new(ledger)));
 
         rocket
             .manage(crate::policy_v3::PolicyV3Runtime::new(
                 conn, node_did, secret,
             ))
             .manage(encryption)
+            .manage(LedgerDir(ledger_dir))
     }
 
     #[derive(Debug)]
