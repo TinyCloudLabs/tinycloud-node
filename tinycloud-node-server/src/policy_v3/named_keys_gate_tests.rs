@@ -381,3 +381,327 @@ async fn startup_refuses_a_non_deletable_key_row_under_apps(
     Ok(())
 }
 on_both_backends!(startup_refuses_a_non_deletable_key_row_under_apps);
+
+// ---------------------------------------------------------------------------
+// Deletion ledger replay at start
+
+/// One delete operation as the ledger holds it.
+fn ledger_op(op: &str, network: &str, paths: &[&str]) -> String {
+    serde_json::json!({
+        "op": op,
+        "networkId": network,
+        "keys": paths
+            .iter()
+            .map(|path| serde_json::json!({ "keyPath": path, "keyVersion": 1 }))
+            .collect::<Vec<_>>(),
+        "deletedAt": "2026-10-23T12:00:00Z",
+    })
+    .to_string()
+}
+
+fn append_to_ledger(path: &std::path::Path, lines: &[String]) -> anyhow::Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(path)?;
+    for line in lines {
+        writeln!(file, "{line}")?;
+    }
+    Ok(())
+}
+
+fn delete_route(network: &str) -> String {
+    format!("/encryption/networks/{network}/key-actions/delete")
+}
+
+/// A network owned by the harness's space owner, with `paths` created as
+/// deletable keys. Returns the network id.
+async fn network_with_keys(
+    h: &Harness,
+    paths: &[&str],
+) -> anyhow::Result<tinycloud_core::encryption_network::NetworkId> {
+    use tinycloud_core::encryption_network::key_id::KeyLocation;
+    let service = h
+        .client
+        .rocket()
+        .state::<EncryptionService>()
+        .expect("EncryptionService is managed");
+    service
+        .create_one_of_one_network(CreateNetworkRequest {
+            name: "mainnet".to_string(),
+            owner_did: h.space_owner.did().to_string(),
+            threshold: Threshold::one_of_one(),
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let network: tinycloud_core::encryption_network::NetworkId = h.network.parse()?;
+    for path in paths {
+        service
+            .create_key(&KeyLocation::new(&network, path)?, true)
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+    }
+    Ok(network)
+}
+
+async fn key_state(
+    client: &rocket::local::asynchronous::Client,
+    network: &tinycloud_core::encryption_network::NetworkId,
+    path: &str,
+) -> anyhow::Result<String> {
+    use tinycloud_core::encryption_network::key_id::KeyLocation;
+    let service = client
+        .rocket()
+        .state::<EncryptionService>()
+        .expect("EncryptionService is managed");
+    let key = service
+        .describe_key(&KeyLocation::new(network, path)?)
+        .await
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    Ok(key.state.as_str().to_string())
+}
+
+/// A database a restore brought back, with every key still active, and a
+/// ledger that knows better: when the node starts, the committed operation
+/// and the still-open one are applied and the aborted one is not; only then
+/// are the key routes served.
+async fn a_restored_database_has_the_ledger_applied_before_the_key_routes_serve(
+    backend: Backend,
+) -> anyhow::Result<()> {
+    let ledger_dir = tempfile::tempdir()?;
+    let ledger_path = ledger_dir.path().join("deletion-ledger.jsonl");
+    let on = |config: &mut crate::config::Config| {
+        config.encryption_network.named_keys_v1 = true;
+        config.encryption_network.deletion_ledger_path = Some(ledger_path.clone());
+    };
+    let Some(h) = Harness::new_with(
+        backend,
+        Shape::KeySession,
+        "a_restored_database_has_the_ledger_applied_before_the_key_routes_serve",
+        on,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let network = network_with_keys(
+        &h,
+        &[
+            "apps/a/committed",
+            "apps/a/open",
+            "apps/a/aborted",
+            "apps/a/untouched",
+        ],
+    )
+    .await?;
+    append_to_ledger(
+        &ledger_path,
+        &[
+            ledger_op("c", &h.network, &["apps/a/committed"]),
+            r#"{"committed":"c"}"#.to_string(),
+            ledger_op("o", &h.network, &["apps/a/open"]),
+            ledger_op("x", &h.network, &["apps/a/aborted"]),
+            r#"{"aborted":"x"}"#.to_string(),
+        ],
+    )?;
+
+    let restarted = h.boot_again(on).await?;
+    for (path, state) in [
+        ("apps/a/committed", "deleted"),
+        ("apps/a/open", "deleted"),
+        ("apps/a/aborted", "active"),
+        ("apps/a/untouched", "active"),
+    ] {
+        assert_eq!(
+            key_state(&restarted, &network, path).await?,
+            state,
+            "{path}"
+        );
+    }
+    // The open operation was closed, so the next start does not repeat it.
+    let text = std::fs::read_to_string(&ledger_path)?;
+    assert!(text.contains(r#"{"committed":"o"}"#), "{text}");
+    // The key routes serve: the delete route is mounted and asks for a credential.
+    let (status, _, _) = answer(
+        restarted
+            .post(delete_route(&h.network))
+            .header(ContentType::JSON)
+            .body("{}"),
+    )
+    .await;
+    assert_eq!(status, Status::Unauthorized);
+    Ok(())
+}
+on_both_backends!(a_restored_database_has_the_ledger_applied_before_the_key_routes_serve);
+
+/// A start with a clean database and a ledger that holds nothing changes
+/// nothing and serves the key routes.
+async fn a_start_with_an_empty_ledger_changes_nothing(backend: Backend) -> anyhow::Result<()> {
+    let ledger_dir = tempfile::tempdir()?;
+    let ledger_path = ledger_dir.path().join("deletion-ledger.jsonl");
+    let on = |config: &mut crate::config::Config| {
+        config.encryption_network.named_keys_v1 = true;
+        config.encryption_network.deletion_ledger_path = Some(ledger_path.clone());
+    };
+    let Some(h) = Harness::new_with(
+        backend,
+        Shape::KeySession,
+        "a_start_with_an_empty_ledger_changes_nothing",
+        on,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let network = network_with_keys(&h, &["apps/a/x", "apps/a/y"]).await?;
+
+    let restarted = h.boot_again(on).await?;
+    for path in ["apps/a/x", "apps/a/y"] {
+        assert_eq!(key_state(&restarted, &network, path).await?, "active");
+    }
+    assert_eq!(std::fs::metadata(&ledger_path)?.len(), 0);
+    let (status, _, _) = answer(
+        restarted
+            .post(delete_route(&h.network))
+            .header(ContentType::JSON)
+            .body("{}"),
+    )
+    .await;
+    assert_eq!(status, Status::Unauthorized);
+    Ok(())
+}
+on_both_backends!(a_start_with_an_empty_ledger_changes_nothing);
+
+/// The events a test run logged, with their fields.
+#[derive(Clone, Default)]
+struct EventLog(std::sync::Arc<std::sync::Mutex<Vec<std::collections::BTreeMap<String, String>>>>);
+
+impl ::tracing::Subscriber for EventLog {
+    fn enabled(&self, _metadata: &::tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _attributes: &::tracing::span::Attributes<'_>) -> ::tracing::span::Id {
+        ::tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &::tracing::span::Id, _values: &::tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &::tracing::span::Id, _follows: &::tracing::span::Id) {}
+
+    fn enter(&self, _span: &::tracing::span::Id) {}
+
+    fn exit(&self, _span: &::tracing::span::Id) {}
+
+    fn event(&self, event: &::tracing::Event<'_>) {
+        #[derive(Default)]
+        struct Fields(std::collections::BTreeMap<String, String>);
+        impl ::tracing::field::Visit for Fields {
+            fn record_debug(
+                &mut self,
+                field: &::tracing::field::Field,
+                value: &dyn std::fmt::Debug,
+            ) {
+                self.0
+                    .insert(field.name().to_string(), format!("{value:?}"));
+            }
+        }
+        let mut fields = Fields::default();
+        event.record(&mut fields);
+        self.0.lock().expect("event log").push(fields.0);
+    }
+}
+
+/// A ledger the node cannot replay (or cannot open) turns the key routes off
+/// as if `named_keys_v1` were off, logs one alert event with a fixed name and
+/// a fixed error kind, and the rest of the node serves. Runs on one thread so
+/// the thread-scoped subscriber sees every event of the start.
+async fn a_failing_ledger_turns_the_key_routes_off_and_the_rest_of_the_node_serves(
+    ledger: impl FnOnce(&std::path::Path) -> (std::path::PathBuf, &'static str, &'static str),
+) -> anyhow::Result<()> {
+    let events = EventLog::default();
+    let _subscriber = ::tracing::subscriber::set_default(events.clone());
+    let ledger_dir = tempfile::tempdir()?;
+    let (ledger_path, event, error_kind) = ledger(ledger_dir.path());
+    let on = |config: &mut crate::config::Config| {
+        config.encryption_network.named_keys_v1 = true;
+        config.encryption_network.deletion_ledger_path = Some(ledger_path.clone());
+    };
+    let Some(h) = Harness::new_with(
+        Backend::Sqlite,
+        Shape::KeySession,
+        "a_failing_ledger_turns_the_key_routes_off",
+        on,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+
+    let unmounted = answer(
+        h.client
+            .post(format!("/encryption/networks/{}/no-such-route", h.network))
+            .header(ContentType::JSON)
+            .body("{}"),
+    )
+    .await;
+    let delete = answer(
+        h.client
+            .post(delete_route(&h.network))
+            .header(ContentType::JSON)
+            .body("{}"),
+    )
+    .await;
+    assert_eq!(unmounted.0, Status::NotFound);
+    assert_eq!(
+        delete, unmounted,
+        "the delete route answers as an unmounted path"
+    );
+    let (status, body, _) = answer(h.client.get("/version")).await;
+    assert_eq!(status, Status::Ok, "{body}");
+
+    let logged = events.0.lock().expect("event log").clone();
+    let alerts: Vec<_> = logged
+        .iter()
+        .filter(|fields| fields.get("event").map(String::as_str) == Some(&format!("{event:?}")))
+        .collect();
+    assert_eq!(alerts.len(), 1, "{logged:?}");
+    assert_eq!(
+        alerts[0].get("error_kind").map(String::as_str),
+        Some(format!("{error_kind:?}").as_str())
+    );
+    // The alert carries the event name and a kind, and nothing else but the message.
+    assert!(
+        alerts[0]
+            .keys()
+            .all(|name| ["event", "error_kind", "message"].contains(&name.as_str())),
+        "{:?}",
+        alerts[0]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_ledger_with_a_malformed_line_turns_the_key_routes_off() -> anyhow::Result<()> {
+    a_failing_ledger_turns_the_key_routes_off_and_the_rest_of_the_node_serves(|dir| {
+        let path = dir.join("deletion-ledger.jsonl");
+        let op = ledger_op("o", "urn:tinycloud:encryption:did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK:mainnet", &["apps/a/x"]);
+        std::fs::write(&path, format!("{op}\nnot a ledger line\n{op}\n")).expect("write ledger");
+        (path, "deletion_ledger_replay_failed", "malformed")
+    })
+    .await
+}
+
+#[tokio::test]
+async fn a_ledger_that_cannot_be_opened_turns_the_key_routes_off() -> anyhow::Result<()> {
+    a_failing_ledger_turns_the_key_routes_off_and_the_rest_of_the_node_serves(|dir| {
+        // The directory does not exist, so the file cannot be created.
+        (
+            dir.join("missing").join("deletion-ledger.jsonl"),
+            "deletion_ledger_open_failed",
+            "io",
+        )
+    })
+    .await
+}

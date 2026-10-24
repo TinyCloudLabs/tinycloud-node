@@ -282,6 +282,14 @@ pub struct KeyPathBody {
     pub key_path: String,
 }
 
+/// The body of a key delete: the key path and nothing else.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteKeyBody {
+    #[serde(rename = "keyPath")]
+    pub key_path: String,
+}
+
 /// Full key descriptor, returned by create, block, unblock and the
 /// authenticated describe GET.
 #[derive(Debug, Serialize)]
@@ -632,7 +640,7 @@ pub async fn delete_encryption_key(
     service: &State<EncryptionService>,
 ) -> Result<Json<KeyDeleteView>, (Status, String)> {
     let body_value = body.into_inner();
-    let body: KeyPathBody = serde_json::from_value(body_value.clone()).map_err(|err| {
+    let body: DeleteKeyBody = serde_json::from_value(body_value.clone()).map_err(|err| {
         (
             Status::BadRequest,
             format!("request body is malformed: {err}"),

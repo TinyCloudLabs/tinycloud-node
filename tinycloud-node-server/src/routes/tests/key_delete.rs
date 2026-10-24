@@ -865,3 +865,40 @@ async fn a_did_pkh_credential_must_match_the_request_and_the_node() -> Result<()
     assert_eq!(status, Status::Forbidden, "{text}");
     Ok(())
 }
+
+#[tokio::test]
+async fn delete_refuses_a_network_id_that_is_not_in_canonical_form() -> Result<()> {
+    let (fixture, _) = setup().await?;
+    let wallet = Wallet::new(5);
+    let network = wallet_network(&fixture, &wallet, &["apps/foo/a"]).await?;
+    let credential = prefix_credential(&fixture, &wallet, &network, "foo", "n-canon-0001");
+    // The same owner address in lower case names the same network but is not
+    // the canonical spelling of its id.
+    let lowercase = network.to_string().to_lowercase();
+    assert_ne!(lowercase, network.to_string());
+    let (status, text) = delete_with(&fixture, &lowercase, "apps/foo/", &credential).await;
+    assert_eq!(status, Status::BadRequest, "{text}");
+    assert!(text.contains("canonical form"), "{text}");
+    assert!(ledger_paths(&fixture).is_empty());
+
+    // Nothing was consumed: the credential still deletes through the canonical id.
+    let (status, text) =
+        delete_with(&fixture, &network.to_string(), "apps/foo/", &credential).await;
+    assert_eq!(status, Status::Ok, "{text}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn delete_body_with_another_field_is_a_bad_request() -> Result<()> {
+    let (fixture, network) = setup().await?;
+    let (status, text) = post_json(
+        &fixture.client,
+        &delete_url(&network),
+        "x",
+        &json!({ "keyPath": "apps/foo/", "extra": true }),
+    )
+    .await;
+    assert_eq!(status, Status::BadRequest, "{text}");
+    assert!(text.starts_with("request body is malformed"), "{text}");
+    Ok(())
+}

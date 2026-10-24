@@ -143,16 +143,23 @@ created with mode 0600 and is never rotated. One JSON line per delete
 operation: `{ "op", "networkId", "keys": [{ "keyPath", "keyVersion" }],
 "deletedAt" }`, where `op` is the CID of the owner's credential. The line is
 written and fsynced after the delete's database changes and before the
-transaction commits. After the commit the node appends `{"committed": <op>}`;
-if the commit fails it appends `{"aborted": <op>}` before answering. If the
+transaction commits. After the commit the node appends `{"committed": <op>}`.
+If the commit fails, the node reads the rows again and appends `committed`
+when every key is `deleted` at that version and `aborted` only when the commit
+did not happen; when the rows cannot be read the operation stays open. If the
 ledger cannot be written, or the file was renamed or removed, the delete is
 rolled back and answers 500 `deletion_ledger_unavailable`.
 
-At every start, before any route is served, the node settles each operation
-that has neither line: it is committed when every key is `deleted` at that key
-version (or at a later one), otherwise aborted.
+At every start, before any route is served, the node replays the ledger onto
+the database (as `tinycloud node deletion-ledger replay` does) and closes each
+operation that was still open with a `committed` line. If the ledger cannot be
+opened or replayed, the named-key routes stay off, as with `named_keys_v1` off,
+the node logs the event `deletion_ledger_open_failed` or
+`deletion_ledger_replay_failed` with an `error_kind`, and the rest of the node
+serves.
 
-After restoring a database, before starting the node, run
+Before restoring a database, stop the node and disable its automatic restart.
+After the restore, before the node starts, run
 `tinycloud node deletion-ledger replay [--config <file>] [--ledger <file>]`. It
 sets every key of every committed or still-open operation to `deleted` with no
 seed. It skips aborted operations, rows that are not deletable keys, rows with

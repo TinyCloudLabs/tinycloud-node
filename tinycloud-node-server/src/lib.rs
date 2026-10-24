@@ -698,20 +698,6 @@ pub async fn app_with_control(
         ::tracing::warn!("network DID resolution enabled: did:web/did:tz fetches use the unhardened ssi client (TC-1080)");
     }
 
-    let routes = production_routes(tinycloud_config.encryption_network.named_keys_v1);
-    #[cfg(feature = "tc-bench-v1")]
-    let mut routes = routes;
-
-    #[cfg(feature = "tc-bench-v1")]
-    routes.extend(rocket::routes![
-        tc_bench_auth_verify,
-        tc_bench_kv_put,
-        tc_bench_kv_get,
-        tc_bench_block_put,
-        tc_bench_block_get,
-        tc_bench_health,
-    ]);
-
     let key_setup: StaticSecret =
         match resolve_keys(&tinycloud_config.keys, &tinycloud_config.tee).await? {
             Some(key_setup) => key_setup,
@@ -831,36 +817,90 @@ pub async fn app_with_control(
     tinycloud.set_read_audit_wait(Duration::from_millis(
         tinycloud_config.database.read_audit_wait_ms,
     ));
-    let deletion_ledger = tinycloud_config
+    let mut named_keys_enabled = tinycloud_config.encryption_network.named_keys_v1;
+    let deletion_ledger = match tinycloud_config
         .encryption_network
         .deletion_ledger_path
         .as_deref()
         .map(tinycloud_core::encryption_network::deletion_ledger::DeletionLedger::open)
         .transpose()
-        .map_err(|error| anyhow::anyhow!("failed to open the deletion ledger: {error}"))?
-        .map(Arc::new);
+    {
+        Ok(ledger) => ledger.map(Arc::new),
+        Err(error) => {
+            named_keys_enabled = false;
+            ::tracing::error!(
+                event = "deletion_ledger_open_failed",
+                error_kind = error.kind(),
+                "deletion ledger could not be opened: the named-key routes are off"
+            );
+            None
+        }
+    };
     let encryption_service = encryption_service
         .with_sqlite_writer_lock(tinycloud.sqlite_writer_lock())
         .with_deletion_ledger(deletion_ledger.clone());
     // Runs after the migrations: a key row under `apps/` that is not a
     // deletable key stops the node from starting.
     tinycloud_core::encryption_network::keys::ensure_no_deterministic_app_keys(&seed_conn).await?;
-    // A delete that was cut off between its ledger intent and its settling
-    // line is settled from the database before any route is served.
+    // The deletion ledger is replayed onto the database before any route is
+    // served, so a delete that a restore or a crash left out is applied
+    // first. If the replay fails the named-key routes stay off (as with
+    // `named_keys_v1` off) and the rest of the node serves.
+    // (`named_keys_enabled` is false if the ledger could not be opened.)
     if let Some(ledger) = &deletion_ledger {
-        let settled = ledger
-            .settle_open_intents(&seed_conn)
-            .await
-            .map_err(|error| anyhow::anyhow!("failed to settle the deletion ledger: {error}"))?;
-        if ledger.dropped_tail_bytes() > 0 || settled != Default::default() {
-            ::tracing::warn!(
-                committed = settled.committed,
-                aborted = settled.aborted,
-                dropped_tail_bytes = ledger.dropped_tail_bytes(),
-                "deletion ledger settled at start"
-            );
+        match ledger.replay_at_start(&seed_conn).await {
+            Ok(report) => {
+                if ledger.dropped_tail_bytes() > 0 || report.applied > 0 || report.torn_tail {
+                    ::tracing::warn!(
+                        event = "deletion_ledger_replayed",
+                        operations = report.operations,
+                        aborted_operations = report.aborted_operations,
+                        applied = report.applied,
+                        not_deletable = report.not_deletable,
+                        newer_version = report.newer_version,
+                        dropped_tail_bytes = ledger.dropped_tail_bytes(),
+                        torn_tail = report.torn_tail,
+                        "deletion ledger replayed at start"
+                    );
+                }
+            }
+            Err(error) => {
+                named_keys_enabled = false;
+                ::tracing::error!(
+                    event = "deletion_ledger_replay_failed",
+                    error_kind = error.kind(),
+                    "deletion ledger replay failed: the named-key routes are off"
+                );
+            }
         }
     }
+    let tinycloud = tinycloud.with_named_keys(named_keys_enabled);
+    let figment_named_keys_off;
+    let config = if named_keys_enabled == tinycloud_config.encryption_network.named_keys_v1 {
+        config
+    } else {
+        figment_named_keys_off =
+            config
+                .clone()
+                .merge(rocket::figment::providers::Serialized::global(
+                    "encryption_network.named_keys_v1",
+                    false,
+                ));
+        &figment_named_keys_off
+    };
+    let routes = production_routes(named_keys_enabled);
+    #[cfg(feature = "tc-bench-v1")]
+    let mut routes = routes;
+
+    #[cfg(feature = "tc-bench-v1")]
+    routes.extend(rocket::routes![
+        tc_bench_auth_verify,
+        tc_bench_kv_put,
+        tc_bench_kv_get,
+        tc_bench_block_put,
+        tc_bench_block_get,
+        tc_bench_health,
+    ]);
     let database_artifact_repository: Arc<dyn DatabaseArtifactRepository> =
         Arc::new(SizeTrackingArtifactRepository::new(
             Arc::new(node_artifact_repository(&tinycloud)),
