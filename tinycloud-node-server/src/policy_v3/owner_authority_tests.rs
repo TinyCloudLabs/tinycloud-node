@@ -3853,7 +3853,7 @@ async fn register_grant_must_name_this_template(backend: Backend) -> anyhow::Res
 }
 on_both_backends!(register_grant_must_name_this_template);
 
-/// A revoked register grant no longer authorises the policy.
+/// A revoked register grant does not authorise the policy.
 async fn revoked_register_grant_does_not_authorize(backend: Backend) -> anyhow::Result<()> {
     let Some(h) = Harness::with_boot(
         backend,

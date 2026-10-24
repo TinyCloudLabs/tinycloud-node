@@ -157,7 +157,7 @@ classified again on a later use.
 ### Register grant (classifier version 3)
 
 A policy owner who holds no owner-first or general-window delegation for a
-root can still be authorised by a register grant. Selection tries it only
+root can be authorised by a register grant. Selection tries it only
 when the ordinary selection above returns nothing, so an owner who already
 holds the capabilities keeps the ordinary path. The space owner delegates
 `tinycloud.policy/register` on exactly `<S>/policy/<h>`, where `h` is the
