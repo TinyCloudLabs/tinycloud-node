@@ -2,7 +2,7 @@
 //!
 //! One row per registered policy, written in the registration transaction or
 //! lazily on first use for policies registered before this table existed. A
-//! missing row means the policy is still pending classification.
+//! missing row means the policy is pending classification.
 
 use sea_orm::entity::prelude::*;
 
@@ -16,7 +16,7 @@ pub struct Model {
     /// Minimum expiry over the recorded authority closure (RFC 3339 UTC);
     /// `None` when no closure node expires or nothing is recorded.
     pub authority_expires_at: Option<String>,
-    /// Why no authority was found (`unknown` rows only).
+    /// Why no authority is recorded (`unknown` rows only).
     pub unknown_reason: Option<String>,
     /// Version of the classifier that wrote the row; `unknown` rows written
     /// by an older version are classified again.

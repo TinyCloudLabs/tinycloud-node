@@ -298,7 +298,7 @@ impl PolicyV3Runtime {
                 return Err("policy-session-root-graph-mismatch");
             }
         }
-        // TC-1423: the owner authority must still hold; its code passes
+        // TC-1423: the owner authority must hold; its code passes
         // through.
         self.validate_owner_authority(&self.conn, &registration, OffsetDateTime::now_utc())
             .await?;
@@ -2286,9 +2286,9 @@ pub async fn mint(
         .await
         .map_err(|e| (Status::Forbidden, e.into()))?;
     // A policy served under the legacy escape has no recorded authority, so
-    // the owner must still be shown to have held every root capability when
+    // the owner must be shown to have held every root capability when
     // the policy was registered. (Owner sessions may since have expired.)
-    // Recorded authority replaces this rescan.
+    // A recorded authority covers this check for other policies.
     if owner_authority.escaped {
         let registered_at = parse_time(&registration.registered_at)
             .map_err(|_| (Status::Forbidden, "policy-registration-invalid".into()))?;
@@ -2937,7 +2937,7 @@ impl PolicyV3Runtime {
         )
         .map_err(|_| "enforcer-binding-invalid")?;
         // TC-1423: the owner authority the roots were registered under must
-        // still hold.
+        // hold.
         self.validate_owner_authority(&self.conn, registration, now)
             .await
     }
@@ -4856,7 +4856,7 @@ impl SourceNetworkRefusal {
     }
 }
 
-/// TC-1423 N1b: the encryption networks a policy names (the content source's
+/// TC-1423: the encryption networks a policy names (the content source's
 /// and every `encryption` ceiling entry), when every one parses and belongs to
 /// the owner of the content source's space, and every `kv` ceiling entry
 /// names a space of that owner; otherwise why not. Pure, so it applies to
@@ -8930,7 +8930,7 @@ mod tests {
         Box::pin(run_policy_v2_flow(PolicyOwner::Unauthorized, false)).await
     }
 
-    /// TC-1423 (N1b): a policy owner that holds only `kv/get` and
+    /// TC-1423: a policy owner that holds only `kv/get` and
     /// `kv/metadata` on the content (no decrypt on the content owner's
     /// network) registers a policy whose content source names a network
     /// called after the policy owner itself. Registration refuses it: the
@@ -8944,7 +8944,7 @@ mod tests {
         .await
     }
 
-    /// TC-1423 (N1b): the same kv-only policy owner moves the content source
+    /// TC-1423: the same kv-only policy owner moves the content source
     /// to its own space, on a network it created, and adds a second kv
     /// ceiling entry on the space owner's content. Every kv entry must name
     /// a space of the content source's owner, so registration refuses it.
@@ -9459,7 +9459,7 @@ mod tests {
             encryption_backend,
         );
         // Registration requires the source network to exist on this node and
-        // to be the content owner's (TC-1423 N1b). The self-named network of
+        // to be the content owner's (TC-1423). The self-named network of
         // `KvOnlySelfNamedNetwork` is deliberately never created.
         encryption
             .create_one_of_one_network(tinycloud_core::encryption_network::CreateNetworkRequest {
@@ -10861,7 +10861,7 @@ mod tests {
             );
             assert_eq!(refused_body, "policy-owner-authority-revoked");
             // Delivery checks the same authority: the retry that returned the
-            // stored receipt above is now refused.
+            // stored receipt above is refused.
             let owner_revoked_delivery = make_invocation(
                 [(
                     content_resource.clone(),
