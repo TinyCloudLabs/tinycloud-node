@@ -1308,7 +1308,7 @@ pub struct PolicyV3Config {
     /// `TINYCLOUD_POLICY_V3__LEGACY_CUTOVER`.
     #[serde(default)]
     pub legacy_cutover: Option<String>,
-    /// Whether a policy root may outlive the owner authority it was
+    /// Whether a policy root may outlive the owner authority it is
     /// registered under. `record` (the default) accepts and counts such
     /// roots; `enforce` refuses them. Env
     /// `TINYCLOUD_POLICY_V3__OWNER_AUTHORITY_EXPIRY`.

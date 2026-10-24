@@ -2230,7 +2230,7 @@ async fn insert_synthetic(
 }
 
 // ---------------------------------------------------------------------------
-// N2: the root-lifetime cap, the record/enforce mode and the advertised mode.
+// The root-lifetime cap, the record/enforce mode and the advertised mode.
 // ---------------------------------------------------------------------------
 
 fn boot(policy_v3: Value) -> Boot {
@@ -2444,8 +2444,8 @@ async fn info_advertises_the_owner_authority_mode(backend: Backend) -> anyhow::R
 }
 on_both_backends!(info_advertises_the_owner_authority_mode);
 
-/// A legacy registration whose root outlives 31 days is classified as
-/// before and counted, not refused.
+/// A legacy registration whose root outlives 31 days is classified
+/// (`bound`, `backfill`) and counted, not refused.
 async fn legacy_long_roots_are_counted_not_refused(backend: Backend) -> anyhow::Result<()> {
     let Some(h) = Harness::new(
         backend,

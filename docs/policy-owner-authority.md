@@ -23,7 +23,7 @@ Two tables, created by migration `m20261019_000000_policy_v3_owner_authority`:
 | `root-authority` | every root capability is held as root authority (space or network owner) |
 | `unknown` | no authority found (`revoked`, `missing`, `starved`), a policy whose stored networks or `kv` spaces do not belong to its content owner (`foreign_network`), or a post-cutover registration that breaks the current rules (`lifetime-exceeded`, `outlives-authority`) |
 
-`registered_mode` is the mode (`record` or `enforce`) a policy was classified
+`registered_mode` is the mode (`record` or `enforce`) a policy is classified
 under, or `backfill` for policies registered before the legacy cutover and
 classified later.
 
