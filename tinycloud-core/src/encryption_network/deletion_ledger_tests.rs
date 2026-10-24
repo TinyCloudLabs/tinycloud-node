@@ -273,6 +273,105 @@ async fn a_failed_append_leaves_no_partial_line_and_later_appends_replay() {
     assert_eq!(row(&db, "apps/a/y").await.state, "deleted");
 }
 
+/// The whole line is written and the write step then reports an error, as a
+/// failed fsync does: the line is cut back too.
+#[test]
+fn a_whole_line_followed_by_an_error_is_cut_back() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let (path, ledger) = ledger_in(&dir);
+    ledger.append(&Record::committed("before")).unwrap();
+    let before = std::fs::read(&path).unwrap();
+
+    let mut line = serde_json::to_vec(&Record::committed("after")).unwrap();
+    line.push(b'\n');
+    let result = ledger.append_line(&line, |file, bytes| {
+        file.write_all(bytes)?;
+        Err(std::io::Error::other("fsync failed"))
+    });
+    assert!(
+        matches!(result, Err(DeletionLedgerError::Io(_))),
+        "{result:?}"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+
+    ledger.append(&Record::committed("later")).unwrap();
+    assert_eq!(read(&path).unwrap().records.len(), 2);
+}
+
+const SHORT: std::time::Duration = std::time::Duration::from_millis(20);
+
+#[test]
+fn a_second_open_waits_for_the_first_to_close() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, first) = ledger_in(&dir);
+    first.append(&Record::committed("one")).unwrap();
+
+    let closer = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        drop(first);
+    });
+    let started = std::time::Instant::now();
+    let second =
+        DeletionLedger::open_waiting(&path, SHORT, std::time::Duration::from_secs(30)).unwrap();
+    assert!(started.elapsed() >= std::time::Duration::from_millis(100));
+    closer.join().unwrap();
+    // The second holds the lock now, and sees the first's line.
+    second.append(&Record::committed("two")).unwrap();
+    assert_eq!(read(&path).unwrap().records.len(), 2);
+    let lock = std::path::PathBuf::from(format!("{}.lock", path.display()));
+    assert!(matches!(
+        DeletionLedger::open_waiting(&path, SHORT, SHORT),
+        Err(DeletionLedgerError::LockHeld)
+    ));
+    drop(second);
+    // The lock file stays after the ledger closes and is free again.
+    assert!(lock.exists());
+    DeletionLedger::open_waiting(&path, SHORT, SHORT).unwrap();
+}
+
+#[test]
+fn a_second_open_fails_as_lock_held_and_leaves_the_file_as_it_was() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let (path, first) = ledger_in(&dir);
+    first.append(&Record::committed("one")).unwrap();
+    // An unfinished final line, as a crash would leave.
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"{\"committed\":\"tw")
+        .unwrap();
+    let before = std::fs::read(&path).unwrap();
+
+    let error = DeletionLedger::open_waiting(&path, SHORT, std::time::Duration::from_millis(100))
+        .unwrap_err();
+    assert!(matches!(error, DeletionLedgerError::LockHeld), "{error:?}");
+    assert_eq!(error.kind(), "lock_held");
+    // The refused open did not trim the partial line.
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+
+    drop(first);
+    let reopened = DeletionLedger::open(&path).unwrap();
+    assert!(reopened.dropped_tail_bytes() > 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn the_lock_file_is_forced_to_mode_0600() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let lock = dir.path().join("ledger.jsonl.lock");
+    std::fs::write(&lock, "").unwrap();
+    std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let (_path, _ledger) = ledger_in(&dir);
+    assert_eq!(
+        std::fs::metadata(&lock).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
 #[test]
 fn the_path_is_validated_without_touching_the_filesystem() {
     for ok in ["/var/lib/tinycloud/deletion-ledger.jsonl", "/a"] {

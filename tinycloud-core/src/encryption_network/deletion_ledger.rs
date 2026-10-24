@@ -29,6 +29,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
+    time::{Duration, Instant},
 };
 
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, ConnectionTrait, EntityTrait, TransactionTrait};
@@ -109,6 +110,8 @@ pub enum DeletionLedgerError {
     Encode(#[from] serde_json::Error),
     #[error("deletion ledger file was renamed or removed")]
     Moved,
+    #[error("deletion ledger is locked by another process")]
+    LockHeld,
     #[error("deletion ledger line {0} is malformed")]
     Malformed(usize),
     #[error("deletion ledger holds {0} key entries that are not valid keys")]
@@ -125,6 +128,7 @@ impl DeletionLedgerError {
             Self::Path(_) => "path",
             Self::Encode(_) => "encode",
             Self::Moved => "moved",
+            Self::LockHeld => "lock_held",
             Self::Malformed(_) => "malformed",
             Self::Refused(_) => "refused",
             Self::Db(_) => "db",
@@ -161,7 +165,89 @@ pub fn validate_path(path: &Path) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// An open ledger file. Appends are serialized and durable on return.
+/// How often `open` tries the lock while another process holds it.
+const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(500);
+/// How long `open` waits for the lock before it fails with
+/// [`DeletionLedgerError::LockHeld`].
+const LOCK_WAIT_LIMIT: Duration = Duration::from_secs(60);
+
+/// The lock file of a ledger: the ledger path with `.lock` appended.
+fn lock_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".lock");
+    PathBuf::from(name)
+}
+
+/// Takes a non-blocking exclusive `flock`. `Ok(false)` means another open
+/// file description holds it.
+#[cfg(unix)]
+fn try_lock_exclusive(file: &File) -> std::io::Result<bool> {
+    use std::os::unix::io::AsRawFd;
+    loop {
+        // SAFETY: `flock` takes a descriptor that `file` keeps open for the
+        // duration of the call and reads or writes no memory of ours.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return Ok(true);
+        }
+        let error = std::io::Error::last_os_error();
+        match error.kind() {
+            std::io::ErrorKind::WouldBlock => return Ok(false),
+            std::io::ErrorKind::Interrupted => continue,
+            _ => return Err(error),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn try_lock_exclusive(_file: &File) -> std::io::Result<bool> {
+    Ok(true)
+}
+
+/// Creates (never deletes) the lock file next to the ledger with mode 0600
+/// and takes its exclusive lock, retrying every `interval` for up to `limit`.
+/// The lock lasts as long as the returned file is open.
+fn acquire_lock(
+    path: &Path,
+    interval: Duration,
+    limit: Duration,
+) -> Result<File, DeletionLedgerError> {
+    let mut options = OpenOptions::new();
+    options.write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let lock_file = options.open(lock_path(path))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        lock_file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    let started = Instant::now();
+    let mut waited = false;
+    loop {
+        if try_lock_exclusive(&lock_file)? {
+            return Ok(lock_file);
+        }
+        if !waited {
+            waited = true;
+            ::tracing::warn!(
+                event = "deletion_ledger_lock_wait",
+                "deletion ledger is locked by another process: waiting for it"
+            );
+        }
+        if started.elapsed() >= limit {
+            return Err(DeletionLedgerError::LockHeld);
+        }
+        std::thread::sleep(interval);
+    }
+}
+
+/// An open ledger file. Appends are serialized and durable on return. While
+/// the value lives, an exclusive lock on `<ledger path>.lock` keeps another
+/// process from opening the same ledger.
 #[derive(Debug)]
 pub struct DeletionLedger {
     path: PathBuf,
@@ -170,17 +256,33 @@ pub struct DeletionLedger {
     /// Set when a failed append left bytes that could not be removed; later
     /// appends fail rather than write after them.
     unrepaired: AtomicBool,
+    /// Holds the lock; closed with the ledger.
+    _lock: Option<File>,
 }
 
 impl DeletionLedger {
-    /// Opens (creating if absent) the ledger for appending. The file mode is
+    /// Opens (creating if absent) the ledger for appending. Before it reads or
+    /// changes the ledger file it takes an exclusive lock on
+    /// `<ledger path>.lock`, waiting up to 60 seconds (one try every 500 ms)
+    /// when another process holds it, then fails with
+    /// [`DeletionLedgerError::LockHeld`]. The file mode is
     /// forced to 0600. A final line that a crash left unterminated is kept if
     /// it is a whole record and otherwise dropped: a record is acted on only
     /// after its append returned, so an unterminated partial line was never
     /// followed by a commit. The file and its directory are fsynced before
     /// this returns.
     pub fn open(path: &Path) -> Result<Self, DeletionLedgerError> {
+        Self::open_waiting(path, LOCK_RETRY_INTERVAL, LOCK_WAIT_LIMIT)
+    }
+
+    /// [`DeletionLedger::open`] with the lock retry interval and limit given.
+    pub(super) fn open_waiting(
+        path: &Path,
+        lock_interval: Duration,
+        lock_limit: Duration,
+    ) -> Result<Self, DeletionLedgerError> {
         validate_path(path).map_err(DeletionLedgerError::Path)?;
+        let lock = acquire_lock(path, lock_interval, lock_limit)?;
         let mut options = OpenOptions::new();
         options.read(true).append(true).create(true);
         #[cfg(unix)]
@@ -204,6 +306,7 @@ impl DeletionLedger {
             file: Mutex::new(file),
             dropped_tail_bytes,
             unrepaired: AtomicBool::new(false),
+            _lock: Some(lock),
         })
     }
 
@@ -215,6 +318,7 @@ impl DeletionLedger {
             file: Mutex::new(file),
             dropped_tail_bytes: 0,
             unrepaired: AtomicBool::new(false),
+            _lock: None,
         }
     }
 
@@ -268,6 +372,10 @@ impl DeletionLedger {
                     .is_err()
             {
                 self.unrepaired.store(true, Ordering::SeqCst);
+                ::tracing::error!(
+                    event = "deletion_ledger_unrepaired",
+                    "a failed ledger append left bytes that could not be removed: later appends fail"
+                );
             }
             return Err(error.into());
         }

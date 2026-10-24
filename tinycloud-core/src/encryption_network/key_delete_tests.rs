@@ -577,7 +577,7 @@ async fn a_crash_between_the_intent_and_the_commit_is_applied_at_the_next_start(
     let f = fixture().await;
     f.create(&["apps/foo/a"]).await;
     // The intent is on disk; the process died before the commit.
-    let ledger = DeletionLedger::open(&f.ledger_path).unwrap();
+    let ledger = f.service.deletion_ledger.clone().unwrap();
     ledger
         .append(&Record::Intent(Intent {
             op: "cid-crash".to_string(),

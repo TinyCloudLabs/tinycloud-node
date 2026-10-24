@@ -248,6 +248,12 @@ async fn siwe_app_grants_need_an_app_id_bound_to_the_domain(
         config.encryption_network.named_keys_v1 = true;
         config.encryption_network.deletion_ledger_path = Some(ledger_path.clone());
     };
+    // The second harness below runs while the first is alive: its own file.
+    let on_ucan = |config: &mut crate::config::Config| {
+        config.encryption_network.named_keys_v1 = true;
+        config.encryption_network.deletion_ledger_path =
+            Some(ledger_dir.path().join("deletion-ledger-ucan.jsonl"));
+    };
     let window = || Window::until(now() + Duration::hours(1));
 
     let Some(h) = Harness::new_with(
@@ -304,7 +310,7 @@ async fn siwe_app_grants_need_an_app_id_bound_to_the_domain(
         backend,
         Shape::KeySession,
         "siwe_app_grants_need_an_app_id_bound_to_the_domain_ucan",
-        on,
+        on_ucan,
     )
     .await?
     else {
@@ -488,11 +494,18 @@ async fn a_restored_database_has_the_ledger_applied_before_the_key_routes_serve(
         config.encryption_network.named_keys_v1 = true;
         config.encryption_network.deletion_ledger_path = Some(ledger_path.clone());
     };
+    // The first boot has its own ledger file; the restart reads the restored
+    // one, which only one process opens at a time.
+    let first_boot = |config: &mut crate::config::Config| {
+        config.encryption_network.named_keys_v1 = true;
+        config.encryption_network.deletion_ledger_path =
+            Some(ledger_dir.path().join("deletion-ledger-first.jsonl"));
+    };
     let Some(h) = Harness::new_with(
         backend,
         Shape::KeySession,
         "a_restored_database_has_the_ledger_applied_before_the_key_routes_serve",
-        on,
+        first_boot,
     )
     .await?
     else {
@@ -557,11 +570,16 @@ async fn a_start_with_an_empty_ledger_changes_nothing(backend: Backend) -> anyho
         config.encryption_network.named_keys_v1 = true;
         config.encryption_network.deletion_ledger_path = Some(ledger_path.clone());
     };
+    let first_boot = |config: &mut crate::config::Config| {
+        config.encryption_network.named_keys_v1 = true;
+        config.encryption_network.deletion_ledger_path =
+            Some(ledger_dir.path().join("deletion-ledger-first.jsonl"));
+    };
     let Some(h) = Harness::new_with(
         backend,
         Shape::KeySession,
         "a_start_with_an_empty_ledger_changes_nothing",
-        on,
+        first_boot,
     )
     .await?
     else {
