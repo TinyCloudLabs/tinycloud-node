@@ -41,9 +41,8 @@ fn now_timestamp() -> String {
 }
 
 /// Fixed-width UTC form `YYYY-MM-DDTHH:MM:SS.ffffffZ`, so text comparison
-/// orders by time.
+/// orders by time. `at` must already be in UTC.
 fn canonical_format(at: OffsetDateTime) -> String {
-    let at = at.to_offset(UtcOffset::UTC);
     format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:06}Z",
         at.year(),
@@ -56,14 +55,16 @@ fn canonical_format(at: OffsetDateTime) -> String {
     )
 }
 
-/// Parses an RFC 3339 timestamp and returns its canonical form.
+/// Parses an RFC 3339 timestamp and returns its canonical UTC form.
 fn canonical_timestamp(text: &str) -> Result<String, SqlStoreError> {
     let at = OffsetDateTime::parse(text, &Rfc3339)
         .map_err(|_| SqlStoreError::Invalid("created_at is not an RFC 3339 timestamp"))?;
-    if !(0..=9999).contains(&at.year()) {
-        return Err(SqlStoreError::Invalid("created_at is out of range"));
-    }
-    Ok(canonical_format(at))
+    // Converting to UTC can leave the representable range, so it is checked.
+    let utc = at
+        .checked_to_offset(UtcOffset::UTC)
+        .filter(|utc| (0..=9999).contains(&utc.year()))
+        .ok_or(SqlStoreError::Invalid("created_at is out of range"))?;
+    Ok(canonical_format(utc))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,9 +179,9 @@ pub struct Publish {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PublishOutcome {
     Published(Frontier),
-    /// The CAS matched nothing (stale epoch, lineage or revision, a gap, a
-    /// regressing `last_seq`, or a lost first-publish race). Not an error.
-    /// Carries the current row, if any.
+    /// The CAS matched nothing (stale epoch, lineage or revision, a regressing
+    /// `last_seq`, or a lost first-publish race). Not an error. Carries the
+    /// current row, if any.
     Lost(Option<Frontier>),
 }
 
@@ -350,11 +351,8 @@ impl DbSqlManifest {
                     .filter(C_::Lineage.eq(token.lineage.as_str()));
             }
             PublishKind::Segment { base_snapshot_key } => {
-                // wal-cum-v1 segments are cumulative from base_seq + 1; any other
-                // from_seq cannot follow this frontier and loses the CAS.
-                if p.object.from_seq() != p.object.base_seq() + 1 {
-                    return Ok(0);
-                }
+                // wal-cum-v1 segments are cumulative from base_seq + 1; publish_cas
+                // has already checked from_seq.
                 // last_seq in [from_seq - 1, to_seq): no gap, and it strictly advances.
                 let from_prev = to_i64(p.object.from_seq() - 1)?;
                 update = update
@@ -445,6 +443,11 @@ impl SqlManifest for DbSqlManifest {
                     "publish kind does not match its inputs",
                 ))
             }
+        }
+        if matches!(publish.kind, PublishKind::Segment { .. })
+            && obj.from_seq() != obj.base_seq() + 1
+        {
+            return Err(SqlStoreError::Invalid("segment must start at base_seq + 1"));
         }
         let txn = self.db.begin().await?;
         let step = match Self::publish_in(&txn, db, expected, &publish).await {
@@ -696,14 +699,14 @@ mod tests {
         }
     }
 
-    async fn publish_segment(
+    async fn segment_outcome(
         m: &DbSqlManifest,
         f: &Frontier,
         from: u64,
         to: u64,
         tag: &str,
         cid: &str,
-    ) -> PublishOutcome {
+    ) -> Result<PublishOutcome, SqlStoreError> {
         let key = seg(&f.lineage, f.base_seq, from, to, tag);
         record(m, &key).await;
         m.publish_cas(
@@ -718,7 +721,17 @@ mod tests {
             ),
         )
         .await
-        .unwrap()
+    }
+
+    async fn publish_segment(
+        m: &DbSqlManifest,
+        f: &Frontier,
+        from: u64,
+        to: u64,
+        tag: &str,
+        cid: &str,
+    ) -> PublishOutcome {
+        segment_outcome(m, f, from, to, tag, cid).await.unwrap()
     }
 
     fn lost(outcome: PublishOutcome) -> Option<Frontier> {
@@ -757,8 +770,11 @@ mod tests {
 
     async fn segments_are_contiguous_and_advance(m: DbSqlManifest) {
         let f = first(&m, &Lineage::random(), 5).await;
-        // A gap (6 is missing) loses.
-        assert!(lost(publish_segment(&m, &f, 8, 9, "gap", CID).await).is_some());
+        // A gap (6 is missing) is an invalid request, not a lost CAS.
+        assert!(matches!(
+            segment_outcome(&m, &f, 8, 9, "gap", CID).await,
+            Err(SqlStoreError::Invalid(_))
+        ));
         // Cumulative WAL segments always start at base_seq + 1.
         let PublishOutcome::Published(f1) = publish_segment(&m, &f, 6, 8, "a", CID).await else {
             panic!("append lost");
@@ -776,17 +792,28 @@ mod tests {
 
     async fn segment_from_must_follow_base_seq(m: DbSqlManifest) {
         let f = first(&m, &Lineage::random(), 5).await;
-        // from_seq = base_seq + 2 skips one sequence number: the CAS loses and the object stays uploaded.
+        // from_seq = base_seq + 2 skips one sequence number. No frontier accepts
+        // this key, so it is refused as invalid rather than reported as a lost CAS.
         let skipped = seg(&f.lineage, 5, 7, 9, "skip");
-        assert!(lost(publish_segment(&m, &f, 7, 9, "skip", CID).await).is_some());
+        assert!(matches!(
+            segment_outcome(&m, &f, 7, 9, "skip", CID).await,
+            Err(SqlStoreError::Invalid(_))
+        ));
         assert_eq!(state_of(&m, &skipped).await, ObjectState::Uploaded);
         assert_eq!(m.current(&DB).await.unwrap().unwrap(), f);
         // from_seq = base_seq + 1 is the only accepted start.
-        let PublishOutcome::Published(next) = publish_segment(&m, &f, 6, 7, "next", CID).await
-        else {
+        let PublishOutcome::Published(f1) = publish_segment(&m, &f, 6, 8, "a", CID).await else {
             panic!("base_seq + 1 segment lost");
         };
-        assert_eq!((next.revision, next.last_seq, next.base_seq), (1, 7, 5));
+        // The frontier is at 8. A segment from 9 passes the last_seq check
+        // (8 >= 9 - 1), so only the from_seq rule refuses it.
+        let gap = seg(&f.lineage, 5, 9, 12, "gap");
+        assert!(matches!(
+            segment_outcome(&m, &f1, 9, 12, "gap", CID).await,
+            Err(SqlStoreError::Invalid(_))
+        ));
+        assert_eq!(state_of(&m, &gap).await, ObjectState::Uploaded);
+        assert_eq!(m.current(&DB).await.unwrap().unwrap(), f1);
     }
 
     async fn object_state_flip_checks_the_format(m: DbSqlManifest) {
@@ -1262,6 +1289,17 @@ CREATE TRIGGER tc1836_fail_manifest_readback BEFORE UPDATE ON sql_store_manifest
             m.record_object(&DB, &malformed).await,
             Err(SqlStoreError::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn created_at_out_of_range_is_invalid_not_a_panic() {
+        // Both inputs are valid RFC 3339, but UTC conversion leaves years 0..=9999.
+        for text in ["9999-12-31T23:30:00-01:00", "0000-01-01T00:30:00+01:00"] {
+            assert!(matches!(
+                canonical_timestamp(text),
+                Err(SqlStoreError::Invalid(_))
+            ));
+        }
     }
 
     async fn revive_restarts_the_orphan_clock(m: DbSqlManifest) {
