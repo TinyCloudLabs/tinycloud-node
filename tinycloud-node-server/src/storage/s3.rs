@@ -17,11 +17,23 @@ use rocket::{async_trait, http::hyper::Uri};
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DisplayFromStr};
 use std::{collections::HashMap, io::Error as IoError, ops::AddAssign, pin::Pin, time::Instant};
-use tinycloud_auth::resource::SpaceId;
+use tinycloud_auth::resource::{SpaceId, SPACE_ID_PREFIX};
 use tinycloud_core::{hash::Hash, storage::*};
 use tokio_util::bytes::Bytes;
 
 use super::{file_system, size::SpaceSizes};
+
+/// Prefix of the boot scan's listing: every KV object key starts with it.
+pub(crate) const KV_SCAN_PREFIX: &str = SPACE_ID_PREFIX;
+
+/// The key of a KV block: `{space}/{base64url(hash)}`.
+pub(crate) fn kv_object_key(space: &SpaceId, id: &Hash) -> String {
+    format!(
+        "{}/{}",
+        space,
+        base64::encode_config(id.as_ref(), base64::URL_SAFE)
+    )
+}
 
 /// Pinned so an SDK bump cannot change client defaults unnoticed.
 pub fn behavior_version() -> BehaviorVersion {
@@ -77,7 +89,7 @@ impl StorageSetup for S3BlockStore {
     }
 }
 
-async fn new_client(config: &S3BlockConfig) -> Client {
+pub(crate) async fn new_client(config: &S3BlockConfig) -> Client {
     let general_config = aws_config().await;
     // Checksums only when an operation requires them: the SDK 1.x defaults
     // (CRC32 trailers, aws-chunked uploads, checksum-mode GETs) are rejected
@@ -104,6 +116,9 @@ impl S3BlockStore {
         let mut pages = client
             .list_objects_v2()
             .bucket(&config.bucket)
+            // Every KV object key is `{space}/{hash}` and a space id string
+            // starts with `SPACE_ID_PREFIX`; only such keys count towards a space.
+            .prefix(KV_SCAN_PREFIX)
             .into_paginator()
             .send();
         // get the sum of all objects per space across all pages
@@ -132,11 +147,7 @@ impl S3BlockStore {
     }
 
     fn key(&self, space: &SpaceId, id: &Hash) -> String {
-        format!(
-            "{}/{}",
-            space,
-            base64::encode_config(id.as_ref(), base64::URL_SAFE)
-        )
+        kv_object_key(space, id)
     }
 
     async fn increment_size(&self, space: &SpaceId, size: u64) {
