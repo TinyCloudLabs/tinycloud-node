@@ -751,6 +751,75 @@ where
     Ok(true)
 }
 
+/// The ledger row of `(space, value)`, locked for the transaction.
+async fn lock_ledger(
+    tx: &DatabaseTransaction,
+    key: &SpaceIdWrap,
+    value: Hash,
+) -> Result<Option<ledger::Model>, DbErr> {
+    if tx.get_database_backend() == DbBackend::Sqlite {
+        ledger::Entity::update_many()
+            .col_expr(
+                ledger::Column::Generation,
+                Expr::col(ledger::Column::Generation).into(),
+            )
+            .filter(ledger::Column::Space.eq(key.clone()))
+            .filter(ledger::Column::Value.eq(value))
+            .exec(tx)
+            .await?;
+        ledger::Entity::find_by_id((key.clone(), value))
+            .one(tx)
+            .await
+    } else {
+        ledger::Entity::find_by_id((key.clone(), value))
+            .lock_exclusive()
+            .one(tx)
+            .await
+    }
+}
+
+/// Close a deleting fence whose generation something still references,
+/// without removing the bytes. A fence left behind while another process
+/// committed a reference to the same `(space, content, generation)` must not
+/// delete the object that reference reads. The fence is retired, the ledger
+/// generation is kept, and a fixed event is logged. Returns whether it did.
+async fn retire_if_referenced<C: ConnectionTrait + TransactionTrait>(
+    conn: &C,
+    space: &SpaceId,
+    value: Hash,
+    generation: i64,
+) -> Result<bool, DbErr> {
+    let tx = conn.begin().await?;
+    let key = SpaceIdWrap(space.clone());
+    let current = lock_ledger(&tx, &key, value).await?;
+    let referenced = if current.is_some_and(|row| row.generation == generation)
+        && lock_fence(&tx, &key, value, generation, false)
+            .await?
+            .is_some_and(|fence| fence.deleting_at.is_some())
+    {
+        has_references(&tx, &key, value, generation).await?
+    } else {
+        false
+    };
+    if referenced {
+        candidate::Entity::delete_many()
+            .filter(candidate::Column::Space.eq(key))
+            .filter(candidate::Column::Value.eq(value))
+            .filter(candidate::Column::Generation.eq(generation))
+            .filter(candidate::Column::DeletingAt.is_not_null())
+            .exec(&tx)
+            .await?;
+    }
+    tx.commit().await?;
+    if referenced {
+        tracing::warn!(
+            event = "kv_blob_deletion_skipped_referenced",
+            "a deleting fence named a blob that a committed write references; it was closed without deleting the blob"
+        );
+    }
+    Ok(referenced)
+}
+
 /// Complete a committed deleting fence, with no DB transaction or checked-out
 /// DB connection during the object-store call. A lost response leaves it for GC.
 async fn complete_deletion<C, S>(
@@ -764,6 +833,9 @@ where
     C: ConnectionTrait + TransactionTrait,
     S: ImmutableDeleteStore,
 {
+    if retire_if_referenced(conn, space, value, generation).await? {
+        return Ok(false);
+    }
     let removed = store
         .remove(space, &value, generation)
         .await
@@ -773,25 +845,7 @@ where
     // exactly the deleting generation and allocate the next storage key.
     let tx = conn.begin().await?;
     let key = SpaceIdWrap(space.clone());
-    let current = if tx.get_database_backend() == DbBackend::Sqlite {
-        ledger::Entity::update_many()
-            .col_expr(
-                ledger::Column::Generation,
-                Expr::col(ledger::Column::Generation).into(),
-            )
-            .filter(ledger::Column::Space.eq(key.clone()))
-            .filter(ledger::Column::Value.eq(value))
-            .exec(&tx)
-            .await?;
-        ledger::Entity::find_by_id((key.clone(), value))
-            .one(&tx)
-            .await?
-    } else {
-        ledger::Entity::find_by_id((key.clone(), value))
-            .lock_exclusive()
-            .one(&tx)
-            .await?
-    };
+    let current = lock_ledger(&tx, &key, value).await?;
     if current.is_some_and(|row| row.generation == generation) {
         let retired = candidate::Entity::delete_many()
             .filter(candidate::Column::Space.eq(key.clone()))
@@ -2393,6 +2447,178 @@ mod tests {
         assert_eq!(rows().await, (1, 1, 1));
     }
 
+    /// A deleting fence for `(space, content, 0)` with no claim, as a stopped
+    /// node leaves it, while a committed write references the same bytes at
+    /// generation zero.
+    async fn stale_fence_with_reference(
+        db: &DatabaseConnection,
+        store: &MemoryStore,
+    ) -> (SpaceId, Hash) {
+        let space = space();
+        let value = upload(store, &space, b"stale-deleting-fence").await;
+        register(db, &[(space.clone(), value)], "a").await;
+        kv_orphan_attempt::Entity::delete_many()
+            .exec(db)
+            .await
+            .unwrap();
+        kv_orphan_candidate::Entity::update_many()
+            .col_expr(
+                kv_orphan_candidate::Column::DeletingAt,
+                Expr::value(time::OffsetDateTime::now_utc() - time::Duration::hours(1)),
+            )
+            .col_expr(
+                kv_orphan_candidate::Column::DeletionBytes,
+                Expr::value(1i64),
+            )
+            .exec(db)
+            .await
+            .unwrap();
+        if db.get_database_backend() == DbBackend::Postgres {
+            // Replication role replica skips the foreign keys this fixture does
+            // not need.
+            let tx = db.begin().await.unwrap();
+            tx.execute_unprepared("SET LOCAL session_replication_role = replica")
+                .await
+                .unwrap();
+            tx.execute(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "INSERT INTO kv_write
+                    (space, key, invocation, seq, epoch, epoch_seq, value, metadata, generation)
+                 VALUES ($1, 'a', $2, 1, $3, 1, $4, '{}', 0)",
+                [
+                    space.to_string().into(),
+                    Vec::<u8>::from(hash(b"stale-invocation")).into(),
+                    Vec::<u8>::from(hash(b"epoch")).into(),
+                    Vec::<u8>::from(value).into(),
+                ],
+            ))
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+        } else {
+            reference(db, "kv_write", &space, value, 0).await;
+        }
+        (space, value)
+    }
+
+    async fn assert_referenced_blob_survives_collection(db: &DatabaseConnection) {
+        let store = MemoryStore::default();
+        let (space, value) = stale_fence_with_reference(db, &store).await;
+        let removed = collect_candidates(db, &store, 10, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(
+            removed, 0,
+            "a referenced blob must not be counted as removed"
+        );
+        assert!(
+            store.contains(&space, &value, 0).await.unwrap(),
+            "the collector deleted a blob that a committed write references"
+        );
+        assert!(kv_orphan_candidate::Entity::find()
+            .all(db)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            ledger::Entity::find_by_id((SpaceIdWrap(space), value))
+                .one(db)
+                .await
+                .unwrap()
+                .unwrap()
+                .generation,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_deleting_fence_does_not_remove_a_referenced_blob() {
+        assert_referenced_blob_survives_collection(&database().await).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_stale_deleting_fence_does_not_remove_a_referenced_blob() {
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_stale_deleting_fence_does_not_remove_a_referenced_blob",
+        )
+        .await
+        else {
+            return;
+        };
+        assert_referenced_blob_survives_collection(&fixture.conn).await;
+    }
+
+    /// A put of two blobs whose second has a pending deletion claims neither:
+    /// the first blob's claim, fence and ledger row are rolled back with it.
+    async fn assert_two_blob_registration_is_all_or_nothing(db: &DatabaseConnection) {
+        let store = MemoryStore::default();
+        let space = space();
+        let first = upload(&store, &space, b"all-or-nothing first").await;
+        let second = upload(&store, &space, b"all-or-nothing second").await;
+        let mut blobs = [(space.clone(), first), (space.clone(), second)];
+        blobs.sort_unstable();
+        let blocked = blobs[1].clone();
+        register(db, std::slice::from_ref(&blocked), "earlier").await;
+        kv_orphan_candidate::Entity::update_many()
+            .col_expr(
+                kv_orphan_candidate::Column::DeletingAt,
+                Expr::value(time::OffsetDateTime::now_utc()),
+            )
+            .exec(db)
+            .await
+            .unwrap();
+        let tx = db.begin().await.unwrap();
+        let error = register_candidates(&tx, &blobs, "later").await.unwrap_err();
+        assert!(is_candidate_unavailable(&error), "{error}");
+        tx.rollback().await.unwrap();
+
+        let claimed = |value| {
+            let key = SpaceIdWrap(space.clone());
+            async move {
+                (
+                    kv_orphan_attempt::Entity::find_by_id((key.clone(), value, "later".to_owned()))
+                        .one(db)
+                        .await
+                        .unwrap()
+                        .is_some(),
+                    kv_orphan_candidate::Entity::find_by_id((key.clone(), value))
+                        .one(db)
+                        .await
+                        .unwrap()
+                        .is_some(),
+                    ledger::Entity::find_by_id((key, value))
+                        .one(db)
+                        .await
+                        .unwrap()
+                        .is_some(),
+                )
+            }
+        };
+        assert_eq!(
+            claimed(blobs[0].1).await,
+            (false, false, false),
+            "the first blob kept a claim, fence or ledger row"
+        );
+        assert!(claimed(blocked.1).await.1, "the pending deletion is intact");
+    }
+
+    #[tokio::test]
+    async fn two_blob_registration_is_all_or_nothing() {
+        assert_two_blob_registration_is_all_or_nothing(&database().await).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_two_blob_registration_is_all_or_nothing() {
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_two_blob_registration_is_all_or_nothing",
+        )
+        .await
+        else {
+            return;
+        };
+        assert_two_blob_registration_is_all_or_nothing(&fixture.conn).await;
+    }
+
     #[tokio::test]
     async fn postgres_held_old_fence_does_not_starve_an_independent_orphan_across_ticks() {
         let Some(fixture) = crate::test_support::PostgresTestSchema::new(
@@ -2466,7 +2692,7 @@ mod tests {
             }
         }
         // Always release the independent transaction and pool before checking
-        // the assertions; otherwise a RED test can deadlock schema teardown.
+        // the assertions; otherwise a failing assertion can deadlock schema teardown.
         held.rollback().await.unwrap();
         let after_release = tokio::time::timeout(
             std::time::Duration::from_secs(20),

@@ -242,7 +242,7 @@ mod tests {
             metadata: Metadata(BTreeMap::from([("label".to_string(), label.to_string())])),
         };
         let mut legacy = kv_write::ActiveModel::from(write.clone());
-        // Older writers omit the field; a fresh table defaults it to zero.
+        // The column is omitted here; a fresh table defaults it to zero.
         legacy.generation = sea_orm::ActiveValue::NotSet;
         legacy.insert(db).await.unwrap();
         write

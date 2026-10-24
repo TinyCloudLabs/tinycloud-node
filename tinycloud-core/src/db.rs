@@ -2474,7 +2474,7 @@ where
             };
             // TC-1274: the first data write (candidate registration, then the
             // upload and the commit transaction) starts here, so the request
-            // deadline may no longer cut this request. The sequence and writer
+            // deadline cannot cut this request after this point. The sequence and writer
             // waits above stay cuttable. The handler task is never polled after
             // a cut, so this is not refused here.
             let latched = crate::request_cancel::latch();
@@ -2571,8 +2571,8 @@ where
                     }
                 }
             };
-            // TC-1260: protected legacy paths deliberately retain the old
-            // lock_writer transaction across upload. Freeze ACK must wait
+            // TC-1260: protected legacy paths hold their `lock_writer`
+            // transaction across upload. Freeze ACK must wait
             // until such an in-flight write commits or aborts. Ordinary paths
             // never hold a transaction, pool connection, sequence or writer
             // lock during upload.
@@ -2819,7 +2819,7 @@ where
     ///
     /// A separate function, not inline in the commit future: debug builds give
     /// every awaited temporary its own stack slot, and the commit future runs
-    /// the deepest request path (TC-735 #301 overflowed CI's 2 MiB stack).
+    /// the deepest request path, so the upload loop stays out of its frame.
     async fn persist_registered_blobs<S>(
         &self,
         stages: HashMap<(SpaceId, Path), HashBuffer<S::Writable>>,

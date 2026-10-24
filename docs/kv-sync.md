@@ -199,3 +199,53 @@ at restart count until GC. Quota is conservative physical accounting,
 temporarily over-count. `SpaceSizes` remains in-memory and per process; other
 nodes' writes and deletes do not synchronize it. Globally exact multi-node
 accounting requires a separate shared byte ledger (TC-1162).
+
+A put waits for the per-space sequence lock after its upload. The upload
+deadline (240 seconds) does not cover that wait. If the wait outlasts the
+five-minute grace, the collector can reclaim the claim and the commit answers
+503 `unavailable_retryable`; nothing is stored for that attempt, and a retry
+stores the content under the next generation.
+
+## Recovery after deploying generation-keyed blobs
+
+A fault after this change is deployed is recovered by a forward fix. Rolling
+back to a binary without this change is not a supported path. Take a named
+full database backup (a PlanetScale backup or branch) before the deployment.
+
+What a binary without this change does with the data this change writes:
+
+- It does not know migration `m20261023_010000_kv_orphan_candidates` and does
+  not start while that history row is recorded.
+- It reads every record at the bare hash key. A record with `generation` above
+  zero is stored at `hash@N`, so it is reported as missing.
+- When it overwrites a key whose `current_kv.generation` is above zero, it
+  does not update that column. After the next deployment of this change the
+  key reads as missing until the column is repaired.
+- It does not run the claim collector, so the claim tables stop being
+  maintained.
+
+Repair `current_kv.generation` after such a window:
+
+```sql
+UPDATE current_kv c
+SET generation = w.generation
+FROM kv_write w
+WHERE w.space = c.space AND w.key = c.key AND w.invocation = c.invocation
+  AND c.generation <> w.generation AND NOT c.deleted;
+```
+
+Emergency path, only while no record has `generation` above zero. Run it as
+one transaction with the node stopped, and abandon it if either count is not
+zero:
+
+```sql
+SELECT count(*) FROM current_kv WHERE generation > 0;
+SELECT count(*) FROM kv_write WHERE generation > 0;
+DELETE FROM seaql_migrations WHERE version = 'm20261023_010000_kv_orphan_candidates';
+DROP TABLE kv_orphan_attempt, kv_orphan_candidate, kv_blob_generation;
+```
+
+The `generation` columns stay. The migration skips a column that exists and
+can be applied again over existing tables and rows. A deleting fence that
+survives such a window is closed by the collector without deleting a blob that
+a committed write references.

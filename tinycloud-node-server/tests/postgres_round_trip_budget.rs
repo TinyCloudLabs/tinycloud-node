@@ -131,8 +131,8 @@ use tokio::{
 /// Round trips allowed per flow; see the module docs. Each invocation's
 /// transaction-scoped authorization snapshot fetches edges, delegations,
 /// abilities and revocations in one tagged query (TC-735, #302); capability
-/// checks and connection-release pings are unchanged. Measured on PostgreSQL
-/// before the pre-persist write path:
+/// checks and connection-release pings are part of each flow's count. Measured
+/// on PostgreSQL before the pre-persist write path:
 ///
 /// - sign-in 71 = peer key 0 plus host `/delegate` 18 plus session
 ///   `/delegate` 19 plus account-space SQL write 34, including TC-1274's
@@ -164,15 +164,15 @@ use tokio::{
 /// precondition read and write rows. All claims of one put share one
 /// preparatory transaction.
 ///
-/// Each value is a ceiling set to the count measured on PostgreSQL in CI.
+/// Each value is the count measured on PostgreSQL in CI, used as a ceiling.
 const BUDGETS: [(&str, u64); 7] = [
     ("sign-in", 71),
-    ("kv put", 41),
+    ("kv put", 42),
     ("kv get", 16),
     ("kv batch get", 16),
     ("kv batch head", 16),
-    ("kv put 2 blobs", 47),
-    ("kv put 1 blob 2 keys", 44),
+    ("kv put 2 blobs", 48),
+    ("kv put 1 blob 2 keys", 45),
 ];
 
 /// Full sign-in plus put plus get rounds run before the measured one.
@@ -445,24 +445,28 @@ impl FrontendParser {
 /// route tests): the server receives the last one, the node never sees a
 /// reply to it, and the connection is reset. Armed for `times` connections.
 #[derive(Clone, Default)]
-struct Cut(Arc<Mutex<Armed>>);
+struct Cut(Arc<parking_lot::Mutex<Armed>>);
 
 /// The markers still to match, in order, and how many connections to cut.
 type Armed = Option<(Vec<Vec<u8>>, usize)>;
 
 impl Cut {
     fn arm(&self, markers: &[&[u8]], times: usize) {
-        *self.0.lock().unwrap() = Some((markers.iter().map(|m| m.to_vec()).collect(), times));
+        *self.0.lock() = Some((markers.iter().map(|m| m.to_vec()).collect(), times));
     }
 
     fn armed(&self) -> bool {
-        self.0.lock().unwrap().is_some()
+        self.0.lock().is_some()
+    }
+
+    fn disarm(&self) {
+        *self.0.lock() = None;
     }
 
     /// Advance a connection's `progress` through the armed markers over
     /// `bytes`; whether the connection must now be cut.
     fn observe(&self, progress: &mut usize, bytes: &[u8]) -> bool {
-        let mut armed = self.0.lock().unwrap();
+        let mut armed = self.0.lock();
         let Some((markers, times)) = armed.as_mut() else {
             *progress = 0;
             return false;
@@ -1876,6 +1880,87 @@ async fn postgres_write_routes_tell_retryable_failures_from_unknown_outcomes() {
         .await
         .expect("drop the isolated schema");
     result.expect("route outcomes");
+}
+
+/// TC-735: a KV put's preparatory `BEGIN` is retried a bounded number of times
+/// (two in the recovering pool, around two passes of the preparatory block),
+/// and only while the `BEGIN` itself fails. Once a statement of the commit
+/// transaction has run, a lost connection is an unknown outcome and nothing is
+/// retried: a put that retried would answer 200.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_kv_put_begin_retry_is_bounded_and_never_follows_a_statement() {
+    let Some(url) =
+        postgres_test_url("postgres_kv_put_begin_retry_is_bounded_and_never_follows_a_statement")
+    else {
+        return;
+    };
+    let admin = Database::connect(url.as_str())
+        .await
+        .expect("connect to PostgreSQL");
+    let schema = format!(
+        "tc735_begin_{}_{}",
+        std::process::id(),
+        time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+    );
+    admin
+        .execute(Statement::from_string(
+            DbBackend::Postgres,
+            format!("CREATE SCHEMA {schema}"),
+        ))
+        .await
+        .expect("create the isolated schema");
+    let cut = Cut::default();
+    let (node, _datadir) = start_node(&url, &schema, cut.clone(), None)
+        .await
+        .expect("start the node");
+
+    let result = async {
+        let account = Account::new(43)?;
+        let session = sign_in(&node, &account).await?;
+        let (status, body, _) = kv_put(&node, &session, "tc735/warm").await?;
+        ensure!(status == Status::Ok, "warm-up put: {status} {body}");
+
+        // Five BEGIN cuts are armed, but a put makes four attempts at most, so
+        // one cut is still armed after it answers.
+        node.settle().await?;
+        cut.arm(&[b"BEGIN"], 5);
+        let (status, body, _) = kv_put(&node, &session, "tc735/bounded").await?;
+        ensure!(
+            cut.armed(),
+            "a fifth BEGIN was attempted: the retry is not bounded"
+        );
+        ensure!(
+            status == Status::ServiceUnavailable && body.starts_with("unavailable_retryable:"),
+            "kv put whose BEGIN never succeeded: {status} {body}"
+        );
+        cut.disarm();
+
+        // Cut a statement inside the commit transaction (the fence lock that
+        // follows the upload): the put is not retried.
+        node.settle().await?;
+        cut.arm(&[b"FOR UPDATE OF fence"], 1);
+        let (status, body, retry_after) = kv_put(&node, &session, "tc735/after-statement").await?;
+        ensure!(!cut.armed(), "the fence lock statement was cut");
+        ensure!(
+            status == Status::InternalServerError && body.starts_with("outcome_unknown:"),
+            "kv put after a statement of its transaction ran: {status} {body}"
+        );
+        ensure!(
+            retry_after.is_none(),
+            "no Retry-After on outcome_unknown: {retry_after:?}"
+        );
+        Ok(())
+    }
+    .await;
+    node.pool().close().await;
+    admin
+        .execute(Statement::from_string(
+            DbBackend::Postgres,
+            format!("DROP SCHEMA {schema} CASCADE"),
+        ))
+        .await
+        .expect("drop the isolated schema");
+    result.expect("begin retry bounds");
 }
 
 /// The `postgres` object of `/info`: exactly the two counters.

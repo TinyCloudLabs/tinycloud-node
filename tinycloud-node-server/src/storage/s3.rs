@@ -877,8 +877,8 @@ mod tests {
         let second_space = space.clone();
         let mut second =
             tokio::spawn(async move { second_store.remove(&second_space, &hash, 0).await });
-        // Without per-generation serialization, second DELETE completes
-        // while the first retains a stale positive HEAD. With the fix, it
+        // Without per-generation serialization, the second DELETE completes
+        // while the first retains a stale positive HEAD. With it, the second
         // waits and then observes the confirmed absence.
         let early_second =
             tokio::time::timeout(std::time::Duration::from_secs(2), &mut second).await;
