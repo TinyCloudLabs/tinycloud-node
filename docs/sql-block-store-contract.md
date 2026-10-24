@@ -637,3 +637,64 @@ code. R8 gates enabling 1b on any node.
 - [x] D1–D8 timing recorded (section 9)
 - [ ] CI green on the slice-0 PR
 - [ ] Opus delta review at the PR's exact head, after CI is green
+
+## 11. Slice 1b PR A: format, timestamp, gating and settings rules
+
+This section applies from slice 1b PR A. Where sections 4.1, 5.1, 5.2, 5.3 or 8 differ from it, this section governs. Sections 11.1 to 11.4 are the rules PR A enforces. Sections 11.5 to 11.8 are the rules that the uploader and object store follow in the slices that add them.
+
+### 11.1 Object format and kind
+
+- A snapshot is accepted only with `format = "sqlite-v1"`. A segment is accepted only with `format = "wal-cum-v1"`. Any other pairing is rejected as invalid.
+- A segment publish whose `from_seq` is not `base_seq + 1` is rejected as invalid. The manifest does not change, and the object row stays `uploaded`. This is a request error, not a lost CAS.
+- A publish moves its object row from `uploaded` to `published` only when the row's `format` is the one its kind requires.
+
+### 11.2 Timestamps
+
+- `created_at` is stored as a fixed-width UTC RFC 3339 string with microseconds, `YYYY-MM-DDTHH:MM:SS.ffffffZ`. Input with another offset is converted to UTC before it is stored.
+- Input that is not RFC 3339, or whose year is outside 0 to 9999 after conversion to UTC, is rejected as invalid.
+- Reviving an orphan object sets `created_at` to the current time. The orphan age is therefore measured from the most recent revive.
+
+### 11.3 Backend and gating
+
+- When `enabled = true`, boot refuses a database URL whose scheme is not `postgres`, `postgresql` or `sqlite` (case-insensitive), with the error `sql_store supports PostgreSQL and SQLite control databases`.
+- When `enabled = true`, boot refuses to start in this build, because the uploader is not part of it. `enabled = false` is unaffected.
+- When `enabled = true`, every `sql_store.spaces` entry must be a canonical space ID: it parses as a space ID and renders back to the same string, for example `tinycloud:pkh:eip155:1:0x<checksummed 40 hex>:default`. Boot refuses any other value. The error does not repeat the value.
+
+### 11.4 Settings
+
+These keys sit under `[sql_store]`. They are checked at boot only when `enabled = true`.
+
+- `drain_secs`, default 8, at least 1: time budget for draining pending uploader work at shutdown. It is set explicitly and is not derived from the HTTP server's shutdown grace or the container stop timeout.
+- `pg_concurrency`, default 2, from 1 to 4: maximum number of concurrent Postgres operations made by the uploader. Manifest reads and CAS, the sweep and bootstrap reads share this limit.
+- `snapshot_min_interval_secs`, default 900, at least 1: minimum interval between two snapshots of one database. It applies together with `snapshot_every` in section 5.3.
+- `daily_upload_byte_budget`, default 2 GiB, nonzero: bytes the uploader may upload for one database per UTC day. Captures over the budget are shed and counted. They are not queued.
+- `spool_cap`, default 1 GiB, at least `upload_bytes`: upper bound on the local spool.
+
+### 11.5 Rules for the uploader: spool and disk
+
+- The spool reserves its bytes through the node's disk budget. Spooling does not cause a user write to fail for lack of space.
+- The capture channel is bounded in bytes, not in items.
+- The shed decision is taken before the copy. A capture that will be shed is not copied.
+- A node with `enabled = false` deletes leftover spool files at boot. Spool file names include the process ID. A lock file refuses a second process on the same data directory.
+
+### 11.6 Rules for the uploader: bootstrap
+
+- The checkpoint is read guarded by `checkpoint_content_hash` only, not by `revision`. The delta is read separately, so a database that keeps committing does not block the bootstrap.
+- Exception to section 8: the bootstrap reads `P` (the checkpoint and the delta) to publish the initial snapshot. This bounded exception applies to the bootstrap read only. Capture keeps the section 8 rule that the node never reads `P`.
+- The snapshot is published as `seq = R-1` and the delta as segment `R..R`, where `R` is the current revision. Both come from one consistent read pair. If the checkpoint hash changes between the two reads, the pair is retried once and then backed off. A snapshot is never labelled with a revision it was not taken at. When a delta exists, the snapshot alone is not a restore point: restoring to `R` uses the snapshot and the highest segment. With no delta, the snapshot is `seq = R`.
+- One database is bootstrapped at a time. The bootstrap is paced, hash-verified against `checkpoint_content_hash`, run off the request path, and counted against `pg_concurrency`.
+
+### 11.7 Rules for the uploader: revision regression
+
+- If `checkpoint_content_hash` or the checkpoint CID no longer matches the manifest, the uploader starts a new lineage. A revision that moved backwards, for example after point-in-time recovery, does not leave the database idle.
+
+### 11.8 Rules for the object store: conditional writes
+
+- Immutable objects are written with `If-None-Match: *`.
+- A 412 response is accepted only after the stored object is checked for matching length and hash.
+- A startup probe under `sql/v1/_probe/` selects the write mode. If the provider rejects the header, the uploader uses a check-then-write fallback. The probe result is logged and is never fatal.
+
+### 11.9 Tests for this section
+
+PR A tests: `object_format_must_match_its_kind`, `segment_from_must_follow_base_seq` and `object_state_flip_checks_the_format` (11.1); `created_at_is_stored_canonically`, `created_at_out_of_range_is_invalid_not_a_panic` and `revive_restarts_the_orphan_clock` (11.2); `sql_store_refuses_enable_mysql_and_non_canonical_spaces` (11.3); `sql_store_defaults_match_the_contract`, `sql_store_new_setting_defaults_and_pg_concurrency_floor`, `sql_store_new_settings_parse_and_are_bounded`, `sql_store_settings_are_checked_only_when_enabled` and `sql_store_new_settings_are_bounded_when_enabled` (11.4). The manifest tests run against SQLite and PostgreSQL.
+
