@@ -2019,24 +2019,23 @@ mod tests {
 
     #[test]
     fn sql_store_parses_from_toml_and_fills_defaults() {
-        let space = canonical_fixture();
-        let config: SqlStoreConfig = toml::from_str(&format!(
+        let config: SqlStoreConfig = toml::from_str(
             r#"
             enabled = true
             upload_interval_secs = 30
             upload_bytes = "4 MiB"
-            spaces = ["{space}"]
+            spaces = ["tinycloud:pkh:eip155:1:0xab://default"]
             [retention]
-            history_days = {{ free = 7, paid = 30 }}
-            "#
-        ))
+            history_days = { free = 7, paid = 30 }
+            "#,
+        )
         .unwrap();
         assert!(config.enabled);
         assert_eq!(config.upload_interval_secs, 30);
         assert_eq!(config.upload_bytes, ByteUnit::Mebibyte(4));
         assert_eq!(config.backlog_cap, ByteUnit::Mebibyte(64));
         assert!(config.validate().is_ok());
-        assert!(config.uploads_space(&space));
+        assert!(config.uploads_space("tinycloud:pkh:eip155:1:0xab://default"));
         assert!(!config.uploads_space("tinycloud:other"));
         let retention = config.retention_policy();
         assert_eq!(retention.history_days("free"), Some(7));
@@ -2051,7 +2050,7 @@ mod tests {
             ..SqlStoreConfig::default()
         };
         assert!(config.validate().is_ok());
-        assert!(!config.uploads_space(&canonical_fixture()));
+        assert!(!config.uploads_space("tinycloud:pkh:eip155:1:0xab://default"));
         let off = SqlStoreConfig {
             spaces: vec!["tinycloud:x".into()],
             ..SqlStoreConfig::default()
