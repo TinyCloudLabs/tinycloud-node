@@ -121,8 +121,16 @@ fn failure_kind<E>(error: &SdkError<E>) -> &'static str {
 fn backend<E: ProvideErrorMetadata>(op: &str, error: &SdkError<E>) -> SqlStoreError {
     let status = status(error).map_or_else(|| "none".to_owned(), |s| s.to_string());
     let code = ProvideErrorMetadata::code(error).unwrap_or("none");
+    let mut cause = String::new();
+    if let SdkError::DispatchFailure(failure) = error {
+        let mut source = std::error::Error::source(failure);
+        while let Some(error) = source {
+            cause.push_str(&format!(": {error}"));
+            source = error.source();
+        }
+    }
     SqlStoreError::Backend(format!(
-        "s3 {op} failed ({}, status {status}, code {code})",
+        "s3 {op} failed ({}, status {status}, code {code}){cause}",
         failure_kind(error)
     ))
 }
