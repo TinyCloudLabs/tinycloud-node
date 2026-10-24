@@ -2752,10 +2752,16 @@ where
         if result.is_err() && !blobs.is_empty() {
             // The failed transaction (including any hash locks) has ended.
             // A commit error may be outcome-unknown: the candidate fence and
-            // committed-reference check distinguish that from an orphan.
-            if let Err(error) =
-                crate::kv_orphans::refund_failed(&self.conn, &self.storage, &blobs, &attempt_id)
-                    .await
+            // committed-reference check distinguish that from an orphan. The
+            // cleanup only touches candidate metadata, so it does not turn a
+            // failure before any KV transaction began into an unknown outcome.
+            if let Err(error) = crate::db_pool::untracked_writes(crate::kv_orphans::refund_failed(
+                &self.conn,
+                &self.storage,
+                &blobs,
+                &attempt_id,
+            ))
+            .await
             {
                 tracing::warn!(
                     ?error,

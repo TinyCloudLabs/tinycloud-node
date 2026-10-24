@@ -931,6 +931,19 @@ fn note_write_may_have_applied() {
     let _ = WRITE_MAY_HAVE_APPLIED.try_with(|flag| flag.set(true));
 }
 
+/// Run `operation` without its writes counting toward [`track_writes`]: after
+/// it, the flag is what it was before. For cleanup of candidate metadata, which
+/// is never a user-visible write, so a failure that came before any KV
+/// transaction began is still reported as safe to retry.
+pub(crate) async fn untracked_writes<F: Future>(operation: F) -> F::Output {
+    let before = WRITE_MAY_HAVE_APPLIED.try_with(std::cell::Cell::get);
+    let output = operation.await;
+    if let Ok(before) = before {
+        let _ = WRITE_MAY_HAVE_APPLIED.try_with(|flag| flag.set(before));
+    }
+    output
+}
+
 /// Record a write statement's result for [`track_writes`].
 fn note_write_outcome<T>(result: &Result<T, DbErr>) {
     match result {

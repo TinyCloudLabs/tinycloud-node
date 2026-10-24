@@ -144,27 +144,34 @@ use tokio::{
 /// flows also check the responses against the fixture, and the test fails if a
 /// batch reads `current_kv` in more than one statement.
 ///
-/// KV PUT is 43. Before TC-735 on this main it is 35 (31 statements + pings,
-/// with #302 and the `epoch_head` cache write). TC-735 adds eight: BEGIN/COMMIT
-/// pin pre-upload work for retry-safe atomicity (two), the pre-upload
-/// authorization graph and hosted-space COUNT reject before S3 (two), the
-/// PostgreSQL candidate-and-attempt registration CTE durably protects the blob
-/// before upload (one), the joined active-fence/own-attempt lock excludes GC
-/// after upload (one), the successful-commit CTE retires the attempt and only
-/// an already referenced last fence (one), and the extra preparatory
-/// transaction releases one more pooled connection whose mandatory ping
-/// flushes cancelled/unfinished statements (one). A failed last attempt
-/// instead persists a deleting fence until physical absence is confirmed.
-/// SQLite/MySQL use the equivalent guarded multi-statement paths rather than
-/// the PostgreSQL-only CTEs.
+/// KV PUT is 41, measured. Before TC-735 on this main it is 35 (31 statements
+/// and pings, with #302 and the `epoch_head` cache write). TC-735 adds six, all
+/// PostgreSQL autocommit statements with no `BEGIN`/`COMMIT`: the pre-upload
+/// authorization graph read rejects before S3 (one) and its pooled connection's
+/// release ping (one); the candidate-and-attempt registration CTE, which also
+/// checks every invocation space is hosted, durably protects the blob before
+/// upload (one) and its release ping (one); the joined active-fence/own-attempt
+/// lock excludes GC after upload (one); the successful-commit CTE retires the
+/// attempt and only an already referenced last fence (one). A failed last
+/// attempt instead persists a deleting fence until physical absence is
+/// confirmed. SQLite/MySQL use the equivalent guarded multi-statement paths
+/// rather than the PostgreSQL-only CTEs.
+///
+/// Multi-write puts (a multipart `kv/put` of several keys, one invocation): the
+/// two-key rows are measured on the same request shape, so they differ only in
+/// how many distinct blobs the keys hold. Two keys holding one blob cost 44;
+/// two holding different bytes cost 48. Each extra DISTINCT blob adds 4: its
+/// registration statement and that statement's release ping, its fence lock
+/// and its finish. A further key on a blob already registered adds none of
+/// those.
 const BUDGETS: [(&str, u64); 7] = [
     ("sign-in", 71),
-    ("kv put", 43),
+    ("kv put", 41),
     ("kv get", 16),
     ("kv batch get", 16),
     ("kv batch head", 16),
-    ("kv put 2 blobs", 1),
-    ("kv put 1 blob 2 keys", 1),
+    ("kv put 2 blobs", 48),
+    ("kv put 1 blob 2 keys", 44),
 ];
 
 /// Full sign-in plus put plus get rounds run before the measured one.
