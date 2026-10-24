@@ -13,11 +13,11 @@
 //!   no delegation;
 //! - step 1 looks only at delegations to the owner issued by the owner of
 //!   that capability's space or network, the only principal that can issue
-//!   them, so delegations from strangers cannot push them out of the window;
+//!   them, so delegations from other issuers do not displace them in the window;
 //! - step 2 falls back to the general window of delegations to the owner;
 //! - a candidate whose closure contains a delegation issued by the policy
 //!   owner itself is skipped: authority that loops back through the owner key
-//!   adds nothing and would let a downstream holder steer the record;
+//!   adds nothing and would let a downstream holder alter the record;
 //! - among satisfying candidates the first, newest-first, whose closure
 //!   outlives the policy root wins, else the newest.
 
@@ -109,6 +109,10 @@ pub enum UnknownReason {
     /// Registered after the legacy cutover without a classification, and
     /// under `enforce` its root outlives the recorded authority.
     OutlivesAuthority,
+    /// The stored policy names a network or kv space that does not belong to
+    /// the owner of its content source (the registration-time source-network
+    /// check, applied to a registration made before that check).
+    ForeignNetwork,
 }
 
 impl UnknownReason {
@@ -119,6 +123,7 @@ impl UnknownReason {
             Self::Starved => "starved",
             Self::LifetimeExceeded => "lifetime-exceeded",
             Self::OutlivesAuthority => "outlives-authority",
+            Self::ForeignNetwork => "foreign_network",
         }
     }
 
@@ -129,6 +134,7 @@ impl UnknownReason {
             "starved" => Self::Starved,
             "lifetime-exceeded" => Self::LifetimeExceeded,
             "outlives-authority" => Self::OutlivesAuthority,
+            "foreign_network" => Self::ForeignNetwork,
             _ => return None,
         })
     }
@@ -224,6 +230,18 @@ impl Classification {
     /// classifier.
     fn is_final(&self) -> bool {
         self.persisted && self.reason != Some(UnknownReason::Starved)
+    }
+
+    /// A policy over a network or kv space that is not its content owner's:
+    /// no recorded delegation, no closure.
+    fn foreign_network() -> Self {
+        Self {
+            state: BindingState::Unknown,
+            reason: Some(UnknownReason::ForeignNetwork),
+            authority_expires_at: None,
+            closure: Vec::new(),
+            persisted: false,
+        }
     }
 
     fn from_selection(
@@ -1255,6 +1273,14 @@ impl PolicyV3Runtime {
             // current mode's registration rules apply.
             RegisteredMode::current(self.owner_authority_expiry())
         };
+        // A registration made before the source-network check is held to the
+        // same predicate: a policy over a network or kv space that is not its
+        // content owner's is not served by any recorded delegation.
+        let policy = super::validate_registration_projection(registration)
+            .map_err(|_| "policy-registration-projection-mismatch")?;
+        if super::content_owner_networks(&policy).is_err() {
+            return Ok((Classification::foreign_network(), mode));
+        }
         let root = policy_v3_root::Entity::find_by_id(registration.policy_root_cid.clone())
             .one(&self.conn)
             .await
@@ -1927,6 +1953,149 @@ mod tests {
                 bucket,
                 "{remaining}"
             );
+        }
+    }
+
+    /// A stored registration over a signed policy that names `network` as its
+    /// source, as a registration made before the source-network check could
+    /// have been stored.
+    fn stored_registration(
+        owner: &super::super::owner_authority_tests::Signer,
+        content_resource: &str,
+        network: &str,
+        registered_at: OffsetDateTime,
+    ) -> policy_v3_registration::Model {
+        use super::super::owner_authority_tests::{signed_policy, Window};
+        let vector: Value = serde_json::from_str(include_str!(
+            "../../test-fixtures/tc-470-policy-credential-requirement.json"
+        ))
+        .unwrap();
+        let policy = signed_policy(
+            owner,
+            &vector,
+            content_resource,
+            network,
+            &Window::until(OffsetDateTime::now_utc() + Duration::days(2)),
+        );
+        let policy_bytes = canonical_json_value(&policy);
+        let projections = registration_projections(&policy).unwrap();
+        policy_v3_registration::Model {
+            policy_cid: tinycloud_auth::ipld_core::cid::Cid::new_v1(
+                0x55,
+                tinycloud_auth::multihash_codetable::Code::Sha2_256.digest(&policy_bytes),
+            )
+            .to_string(),
+            policy_digest_hex: policy_digest_hex(&policy).unwrap(),
+            policy_bytes,
+            owner_did: owner.did().to_owned(),
+            policy_root_cid: "root-not-stored".into(),
+            enforcement_root_cid: "enforcement-not-stored".into(),
+            content_source_digest_hex: projections.content_source_digest_hex,
+            native_projection_hash_hex: projections.native_projection_hash_hex,
+            attested_enforcer_binding_bytes: b"{}".to_vec(),
+            registered_at: format_time(registered_at),
+            expires_at: format_time(registered_at + Duration::days(2)),
+        }
+    }
+
+    /// The content's resource in a space owned by `space_owner`.
+    fn content_in_space_of(space_owner: &str) -> String {
+        SpaceId::new(
+            space_owner.parse::<DIDBuf>().unwrap(),
+            "applications".parse().unwrap(),
+        )
+        .to_resource(
+            "kv".parse().unwrap(),
+            Some("shares/document.txt".parse().unwrap()),
+            None,
+            None,
+        )
+        .to_string()
+    }
+
+    /// A stored registration whose policy names a network that is not its
+    /// content owner's is classified `unknown` / `foreign_network`, whether
+    /// it was registered before the cutover (`backfill`) or after it
+    /// (`record`). A policy over the content owner's network goes on to the
+    /// delegation search, which here fails for lack of a stored root.
+    #[tokio::test]
+    async fn stored_registrations_over_foreign_networks_are_unknown() {
+        use super::super::owner_authority_tests::Signer;
+        let (runtime, _) = counted_runtime().await;
+        let space_owner = Signer::key();
+        let policy_owner = Signer::key();
+        let content = content_in_space_of(space_owner.did());
+        let own_network = format!("urn:tinycloud:encryption:{}:share", policy_owner.did());
+        let third_network = format!("urn:tinycloud:encryption:{}:share", Signer::key().did());
+        let content_owner_network =
+            format!("urn:tinycloud:encryption:{}:mainnet", space_owner.did());
+        let (before, after) = (
+            OffsetDateTime::now_utc() - Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
+        );
+        for (registered_at, mode) in [
+            (before, RegisteredMode::Backfill),
+            (after, RegisteredMode::Record),
+        ] {
+            for network in [&own_network, &third_network] {
+                let registration =
+                    stored_registration(&policy_owner, &content, network, registered_at);
+                let (classification, classified_mode) =
+                    runtime.classify_registration(&registration).await.unwrap();
+                assert_eq!(classified_mode, mode);
+                assert_eq!(classification.state, BindingState::Unknown, "{network}");
+                assert_eq!(classification.reason, Some(UnknownReason::ForeignNetwork));
+                assert!(classification.closure.is_empty());
+                assert_eq!(classification.authority_expires_at, None);
+            }
+            let registration = stored_registration(
+                &policy_owner,
+                &content,
+                &content_owner_network,
+                registered_at,
+            );
+            assert_eq!(
+                runtime.classify_registration(&registration).await.err(),
+                Some("policy-root-missing"),
+                "a policy over the content owner's network reaches the delegation search"
+            );
+        }
+    }
+
+    /// `foreign_network` is a final, stored reason: it reads back from the
+    /// binding row and is not re-evaluated on use.
+    #[tokio::test]
+    async fn foreign_network_classifications_are_final_once_stored() {
+        let (runtime, _) = counted_runtime().await;
+        let registration = registration(&runtime, "policy-foreign").await;
+        insert_classification(
+            &runtime.conn,
+            &registration.policy_cid,
+            &Classification::foreign_network(),
+            RegisteredMode::Backfill,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
+        let row = policy_v3_owner_binding::Entity::find_by_id(registration.policy_cid.clone())
+            .one(&runtime.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.unknown_reason.as_deref(), Some("foreign_network"));
+        let read_back = Classification::from_row(&row).unwrap();
+        assert_eq!(read_back.state, BindingState::Unknown);
+        assert_eq!(read_back.reason, Some(UnknownReason::ForeignNetwork));
+        assert!(read_back.is_final());
+        for reason in [
+            UnknownReason::Revoked,
+            UnknownReason::Missing,
+            UnknownReason::Starved,
+            UnknownReason::ForeignNetwork,
+            UnknownReason::LifetimeExceeded,
+            UnknownReason::OutlivesAuthority,
+        ] {
+            assert_eq!(UnknownReason::parse(reason.as_str()), Some(reason));
         }
     }
 }
