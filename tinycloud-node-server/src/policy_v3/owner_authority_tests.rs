@@ -399,6 +399,65 @@ pub(super) struct Registered {
     pub policy_root_cid: String,
 }
 
+/// A Policy/v3 document over `content_resource`, signed by `owner`, whose
+/// source and decrypt ceiling name `network`.
+pub(super) fn signed_policy(
+    owner: &Signer,
+    vector: &Value,
+    content_resource: &str,
+    network: &str,
+    root: &Window,
+) -> Value {
+    let owner_did = owner.did().to_owned();
+    let projection = vector["policyProjection"].clone();
+    let created = (now() - Duration::seconds(60)).min(root.not_before);
+    let ceiling = vec![
+        json!({
+            "kind": "kv",
+            "resource": content_resource,
+            "selector": "exact",
+            "actions": [KV_GET, KV_METADATA],
+        }),
+        json!({
+            "kind": "encryption",
+            "resource": network,
+            "action": DECRYPT,
+        }),
+    ];
+    let mut policy = json!({
+        "schema": POLICY_V2_SCHEMA,
+        "policyId": "pending",
+        "ownerDid": owner_did,
+        "createdAt": format_time(created),
+        "expiresAt": format_time(root.expiry),
+        "contentSource": {
+            "shareId": unique("share-tc-1423-"),
+            "kvResource": content_resource,
+            "selector": "exact",
+            "encryptionNetwork": network,
+            "encryptedSymmetricKeyDigestHex": "aa".repeat(32),
+            "keyVersion": 1,
+            "mode": "immutable",
+            "initialCiphertextDigestHex": "bb".repeat(32)
+        },
+        "capabilityCeiling": ceiling,
+        "credentialRequirement": projection,
+        "signature": {"suite": "Ed25519", "signerDid": owner_did, "value": ""}
+    });
+    let mut unsigned = policy.clone();
+    unsigned.as_object_mut().unwrap().remove("policyId");
+    unsigned.as_object_mut().unwrap().remove("signature");
+    let mut preimage = POLICY_V2_SCHEMA.as_bytes().to_vec();
+    preimage.push(0);
+    preimage.extend_from_slice(&canonical_json_value(&unsigned));
+    policy["policyId"] = json!(format!("pol_{}", base32_lower(&Sha256::digest(&preimage))));
+    policy["signature"]["value"] = json!(encode_config(
+        owner.keypair().sign(&Sha256::digest(preimage)),
+        URL_SAFE_NO_PAD
+    ));
+    policy
+}
+
 /// Which principal owns the content space, and who owns the policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Shape {
@@ -483,6 +542,19 @@ impl Harness {
         );
         let network = format!("urn:tinycloud:encryption:{}:mainnet", space_owner.did());
         let client = Self::boot_app(&db, &vector, &issuer, &boot).await?;
+        // Registration requires the source network to exist and to be the
+        // content owner's (TC-1423 N1b), so the harness creates it.
+        client
+            .rocket()
+            .state::<tinycloud_core::encryption_network::EncryptionService>()
+            .expect("encryption service")
+            .create_one_of_one_network(tinycloud_core::encryption_network::CreateNetworkRequest {
+                name: "mainnet".into(),
+                owner_did: space_owner.did().to_string(),
+                threshold: tinycloud_core::encryption_network::Threshold::one_of_one(),
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
         let harness = Self {
             client,
             db,
@@ -672,52 +744,13 @@ impl Harness {
     /// by the policy owner.
     pub async fn register(&self, root: Window) -> anyhow::Result<(Status, String, Registered)> {
         let owner_did = self.owner.did().to_owned();
-        let projection = self.vector["policyProjection"].clone();
-        let created = (now() - Duration::seconds(60)).min(root.not_before);
-        let ceiling = vec![
-            json!({
-                "kind": "kv",
-                "resource": self.content_resource.to_string(),
-                "selector": "exact",
-                "actions": [KV_GET, KV_METADATA],
-            }),
-            json!({
-                "kind": "encryption",
-                "resource": self.network,
-                "action": DECRYPT,
-            }),
-        ];
-        let mut policy = json!({
-            "schema": POLICY_V2_SCHEMA,
-            "policyId": "pending",
-            "ownerDid": owner_did,
-            "createdAt": format_time(created),
-            "expiresAt": format_time(root.expiry),
-            "contentSource": {
-                "shareId": unique("share-tc-1423-"),
-                "kvResource": self.content_resource.to_string(),
-                "selector": "exact",
-                "encryptionNetwork": self.network,
-                "encryptedSymmetricKeyDigestHex": "aa".repeat(32),
-                "keyVersion": 1,
-                "mode": "immutable",
-                "initialCiphertextDigestHex": "bb".repeat(32)
-            },
-            "capabilityCeiling": ceiling,
-            "credentialRequirement": projection,
-            "signature": {"suite": "Ed25519", "signerDid": owner_did, "value": ""}
-        });
-        let mut unsigned = policy.clone();
-        unsigned.as_object_mut().unwrap().remove("policyId");
-        unsigned.as_object_mut().unwrap().remove("signature");
-        let mut preimage = POLICY_V2_SCHEMA.as_bytes().to_vec();
-        preimage.push(0);
-        preimage.extend_from_slice(&canonical_json_value(&unsigned));
-        policy["policyId"] = json!(format!("pol_{}", base32_lower(&Sha256::digest(&preimage))));
-        policy["signature"]["value"] = json!(encode_config(
-            self.owner.keypair().sign(&Sha256::digest(preimage)),
-            URL_SAFE_NO_PAD
-        ));
+        let policy = signed_policy(
+            &self.owner,
+            &self.vector,
+            &self.content_resource.to_string(),
+            &self.network,
+            &root,
+        );
         let policy_bytes = canonical_json_value(&policy);
         let policy_cid = Cid::new_v1(
             0x55,
@@ -1280,7 +1313,7 @@ async fn roots_outliving_their_authority_are_recorded_uncapped(
 }
 on_both_backends!(roots_outliving_their_authority_are_recorded_uncapped);
 
-/// [F1] A link holder that delegates back to the policy owner, or the owner
+/// A link holder that delegates back to the policy owner, or the owner
 /// delegating to itself, never becomes the recorded authority.
 async fn delegations_back_to_the_owner_are_never_recorded(backend: Backend) -> anyhow::Result<()> {
     let Some(h) = Harness::new(
@@ -1328,7 +1361,7 @@ async fn delegations_back_to_the_owner_are_never_recorded(backend: Backend) -> a
 }
 on_both_backends!(delegations_back_to_the_owner_are_never_recorded);
 
-/// [F1] The same in the general window, where the owner's authority is
+/// The same in the general window, where the owner's authority is
 /// re-delegated (so the owner-first step finds nothing) and the loop-back
 /// delegations sort ahead of it.
 async fn loop_back_delegations_are_skipped_in_the_general_window(
@@ -1442,16 +1475,16 @@ fn sorting_before(
     anyhow::bail!("no delegation sorted before the target")
 }
 
-/// [C1] Delegations to the policy owner from strangers' own spaces, with
-/// future or backdated issue times, cannot push the space owner's grant out
+/// Delegations to the policy owner from other issuers' own spaces, with
+/// future or backdated issue times, do not push the space owner's grant out
 /// of the candidate window, at registration or in the legacy backfill.
-async fn stranger_delegations_cannot_starve_the_owner_grant(
+async fn delegations_from_other_issuers_do_not_displace_the_owner_grant(
     backend: Backend,
 ) -> anyhow::Result<()> {
     let Some(h) = Harness::with_boot(
         backend,
         Shape::KeySession,
-        "stranger_delegations_cannot_starve_the_owner_grant",
+        "delegations_from_other_issuers_do_not_displace_the_owner_grant",
         legacy_boot(),
     )
     .await?
@@ -1466,8 +1499,8 @@ async fn stranger_delegations_cannot_starve_the_owner_grant(
     // More than the general window (256 rows) on each side of the
     // registration time: future issue times lead it at registration, and
     // backdated ones lead it in the legacy backfill.
-    flood(&h, 260, Duration::days(300)).await?;
-    flood(&h, 260, -Duration::days(300)).await?;
+    import_delegations_from_other_issuers(&h, 260, Duration::days(300)).await?;
+    import_delegations_from_other_issuers(&h, 260, -Duration::days(300)).await?;
     let policy = h.register_ok(policy_window()).await?;
     assert_eq!(
         h.closure(&policy.policy_cid).await?,
@@ -1480,15 +1513,19 @@ async fn stranger_delegations_cannot_starve_the_owner_grant(
     assert_eq!(h.closure(&legacy.policy_cid).await?, vec![authority]);
     Ok(())
 }
-on_both_backends!(stranger_delegations_cannot_starve_the_owner_grant);
+on_both_backends!(delegations_from_other_issuers_do_not_displace_the_owner_grant);
 
-/// SIWE delegations from strangers' own spaces to the policy owner.
-async fn flood(h: &Harness, count: usize, issued_offset: Duration) -> anyhow::Result<()> {
+/// SIWE delegations from other issuers' own spaces to the policy owner.
+async fn import_delegations_from_other_issuers(
+    h: &Harness,
+    count: usize,
+    issued_offset: Duration,
+) -> anyhow::Result<()> {
     for _ in 0..count {
-        let stranger = Signer::pkh();
-        let space = SpaceId::new(stranger.did().parse::<DIDBuf>()?, "applications".parse()?);
+        let issuer = Signer::pkh();
+        let space = SpaceId::new(issuer.did().parse::<DIDBuf>()?, "applications".parse()?);
         let resource = space.to_resource("kv".parse()?, Some("x".parse()?), None, None);
-        h.import(stranger.delegate(
+        h.import(issuer.delegate(
             h.owner.did(),
             &[(resource.to_string(), KV_GET)],
             Window::until(now() + Duration::days(400)).issued(now() + issued_offset),
@@ -1500,13 +1537,15 @@ async fn flood(h: &Harness, count: usize, issued_offset: Duration) -> anyhow::Re
 }
 
 /// The general window only holds delegations touching the capability's space
-/// or network, so strangers cannot crowd out a re-delegated authority that
-/// the owner-first step does not see.
-async fn strangers_cannot_crowd_the_general_window(backend: Backend) -> anyhow::Result<()> {
+/// or network, so delegations from other issuers do not crowd out a
+/// re-delegated authority that the owner-first step does not see.
+async fn delegations_from_other_issuers_do_not_fill_the_general_window(
+    backend: Backend,
+) -> anyhow::Result<()> {
     let Some(h) = Harness::with_boot(
         backend,
         Shape::KeySession,
-        "strangers_cannot_crowd_the_general_window",
+        "delegations_from_other_issuers_do_not_fill_the_general_window",
         legacy_boot(),
     )
     .await?
@@ -1531,7 +1570,7 @@ async fn strangers_cannot_crowd_the_general_window(backend: Backend) -> anyhow::
         .await?;
     let legacy = h.register_ok(policy_window()).await?;
     h.forget_binding(&legacy.policy_cid).await?;
-    flood(&h, 300, -Duration::days(300)).await?;
+    import_delegations_from_other_issuers(&h, 300, -Duration::days(300)).await?;
     let binding = h.classify_on_use(&legacy).await?;
     assert_eq!(binding.state, "bound");
     let mut expected = vec![authority, upstream];
@@ -1539,7 +1578,7 @@ async fn strangers_cannot_crowd_the_general_window(backend: Backend) -> anyhow::
     assert_eq!(h.closure(&legacy.policy_cid).await?, expected);
     Ok(())
 }
-on_both_backends!(strangers_cannot_crowd_the_general_window);
+on_both_backends!(delegations_from_other_issuers_do_not_fill_the_general_window);
 
 /// `starved` needs both steps to miss with candidates left unexamined: here
 /// the general window is full of loop-back delegations (skipped without using
@@ -1725,16 +1764,16 @@ async fn the_legacy_classifier_ignores_grants_issued_after_registration(
 }
 on_both_backends!(the_legacy_classifier_ignores_grants_issued_after_registration);
 
-/// [C1] With a SIWE owner grant: strangers' delegations issued after it
-/// (future at registration, or between it and a legacy registration) don't
+/// With a SIWE owner grant: delegations from other issuers issued after it
+/// (future at registration, or between it and a legacy registration) do not
 /// displace it.
-async fn stranger_delegations_cannot_starve_a_siwe_owner_grant(
+async fn delegations_from_other_issuers_do_not_displace_a_siwe_owner_grant(
     backend: Backend,
 ) -> anyhow::Result<()> {
     let Some(h) = Harness::with_boot(
         backend,
         Shape::PkhSession,
-        "stranger_delegations_cannot_starve_a_siwe_owner_grant",
+        "delegations_from_other_issuers_do_not_displace_a_siwe_owner_grant",
         legacy_boot(),
     )
     .await?
@@ -1751,8 +1790,8 @@ async fn stranger_delegations_cannot_starve_a_siwe_owner_grant(
     let legacy = h.register_ok(policy_window()).await?;
     h.forget_binding(&legacy.policy_cid).await?;
     backdate(&h, &legacy.policy_cid, now() - Duration::minutes(30)).await?;
-    flood(&h, 260, -Duration::hours(1)).await?;
-    flood(&h, 260, Duration::days(300)).await?;
+    import_delegations_from_other_issuers(&h, 260, -Duration::hours(1)).await?;
+    import_delegations_from_other_issuers(&h, 260, Duration::days(300)).await?;
     let policy = h.register_ok(policy_window()).await?;
     assert_eq!(
         h.closure(&policy.policy_cid).await?,
@@ -1763,9 +1802,9 @@ async fn stranger_delegations_cannot_starve_a_siwe_owner_grant(
     assert_eq!(h.closure(&legacy.policy_cid).await?, vec![authority]);
     Ok(())
 }
-on_both_backends!(stranger_delegations_cannot_starve_a_siwe_owner_grant);
+on_both_backends!(delegations_from_other_issuers_do_not_displace_a_siwe_owner_grant);
 
-/// [F9] An older grant that outlives the root is recorded over a newer one
+/// An older grant that outlives the root is recorded over a newer one
 /// that does not.
 async fn a_grant_outliving_the_root_is_preferred(backend: Backend) -> anyhow::Result<()> {
     let Some(h) = Harness::new(
@@ -1837,7 +1876,7 @@ async fn concurrent_first_uses_store_one_classification(backend: Backend) -> any
 }
 on_both_backends!(concurrent_first_uses_store_one_classification);
 
-/// [F3] A classification that cannot be stored is served from memory and
+/// A classification that cannot be stored is served from memory and
 /// leaves the row pending.
 async fn a_failed_classification_write_still_serves(backend: Backend) -> anyhow::Result<()> {
     let Some(h) = Harness::with_boot(
@@ -1869,7 +1908,7 @@ async fn a_failed_classification_write_still_serves(backend: Backend) -> anyhow:
 }
 on_both_backends!(a_failed_classification_write_still_serves);
 
-/// [F8] A legacy registration whose original authority was revoked binds
+/// A legacy registration whose original authority was revoked binds
 /// to a live alternate; with none left it is recorded `unknown`.
 async fn legacy_classification_falls_through_to_a_live_alternate(
     backend: Backend,
@@ -2010,7 +2049,7 @@ async fn the_sweep_runs_only_when_enabled(backend: Backend) -> anyhow::Result<()
 }
 on_both_backends!(the_sweep_runs_only_when_enabled);
 
-/// [F5][F6] Rollback: `down` drops both tables; after a re-upgrade only
+/// Rollback: `down` drops both tables; after a re-upgrade only
 /// registrations before the configured cutover are legacy.
 async fn rollback_and_reupgrade_respect_the_configured_cutover(
     backend: Backend,

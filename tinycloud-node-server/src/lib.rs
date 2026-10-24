@@ -679,6 +679,7 @@ pub async fn app_with_control(
         prometheus::observe_did_resolution_refused,
     );
     lazy_static::initialize(&prometheus::DID_RESOLUTION_REFUSED);
+    lazy_static::initialize(&prometheus::POLICY_SOURCE_NETWORK_REFUSED);
 
     // Ensure local storage directories exist.
     // SQLite file paths and local dirs are resources the server owns — auto-create them.
