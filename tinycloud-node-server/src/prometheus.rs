@@ -38,11 +38,23 @@ pub fn observe_delivery_rate_limited(scope: &str) {
     DELIVERY_RATE_LIMITED.with_label_values(&[scope]).inc();
 }
 
+/// Count one links API response whose `Date` is more than 60 seconds from the
+/// node clock.
+pub fn observe_links_read_clock_skew() {
+    LINKS_READ_CLOCK_SKEW.inc();
+}
+
 lazy_static! {
     pub static ref DID_RESOLUTION_REFUSED: IntCounterVec = register_int_counter_vec!(
         "tinycloud_did_resolution_refused_total",
         "UCAN issuer resolution refusals by method and reason.",
         &["method", "reason"]
+    ).unwrap();
+    /// Links API responses whose `Date` differs from the node clock by more
+    /// than 60 seconds. No label.
+    pub static ref LINKS_READ_CLOCK_SKEW: IntCounter = register_int_counter!(
+        "tinycloud_links_read_clock_skew_total",
+        "Links API responses whose Date header differs from the node clock by more than 60 seconds."
     ).unwrap();
     /// Delivery authorizations refused by the links-fetch rate limit. The one
     /// label is the limit that held (`invoker` or `global`): never an invoker,

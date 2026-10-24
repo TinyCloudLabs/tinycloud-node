@@ -39,6 +39,7 @@ pub mod invocation_replay;
 pub mod issuer_set;
 pub mod link;
 pub mod links_fetch;
+pub mod links_read_auth;
 pub mod node_control;
 pub mod policy_v3;
 pub mod prometheus;
@@ -882,11 +883,16 @@ pub async fn app_with_control(
         let links_origin =
             links_fetch::LinksOrigin::parse(&tinycloud_config.share_email.links_origin)
                 .map_err(|error| anyhow::anyhow!(error))?;
-        let links = Arc::new(links_fetch::ApiLinkFetcher::new(
-            egress_policy.clone(),
-            links_origin,
-            tinycloud_config.share_email.links_origin_allow_private,
-        ));
+        let links = Arc::new(
+            links_fetch::ApiLinkFetcher::new(
+                egress_policy.clone(),
+                links_origin,
+                tinycloud_config.share_email.links_origin_allow_private,
+            )
+            // Every read is signed with the node identity key, the key that
+            // signs the delivery admission.
+            .with_read_signer(links_read_auth::ReadSigner::new(key_setup.clone())),
+        );
         policy_v3_runtime =
             policy_v3_runtime.with_delivery(&tinycloud_config.share_email, links)?;
     }

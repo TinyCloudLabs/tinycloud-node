@@ -8,8 +8,10 @@
 //! configured host name. The body is capped while it streams.
 
 use crate::egress::{self, AddressScope, EgressPolicy, GetError};
+use crate::links_read_auth::{ClockSkew, ReadSigner, READ_AUTH_HEADER};
 use reqwest::{StatusCode, Url};
 use std::{net::IpAddr, sync::Arc, time::Duration};
+use time::OffsetDateTime;
 
 /// `MAX_LINK_BODY_BYTES` (contract §3): the one limit on a sealed body, 64 KiB,
 /// the same for every link type.
@@ -113,6 +115,12 @@ impl LinksOrigin {
     fn record_url(&self, id: &LinkId) -> Option<Url> {
         self.url.join(&format!("v1/links/{}", id.as_str())).ok()
     }
+
+    /// The API instance as the contract writes its audience: the origin,
+    /// `https://host[:port]`.
+    pub(crate) fn audience(&self) -> String {
+        self.url.origin().ascii_serialization()
+    }
 }
 
 /// What a successful read returns: the raw `X-Link-Record` header value and
@@ -146,6 +154,10 @@ pub struct ApiLinkFetcher {
     origin: LinksOrigin,
     scope: AddressScope,
     total_timeout: Duration,
+    /// Signs each read with the node identity key when present.
+    signer: Option<ReadSigner>,
+    skew: ClockSkew,
+    clock: Arc<dyn Fn() -> OffsetDateTime + Send + Sync>,
 }
 
 impl ApiLinkFetcher {
@@ -159,13 +171,43 @@ impl ApiLinkFetcher {
                 AddressScope::PublicOnly
             },
             total_timeout: LINK_TOTAL_TIMEOUT,
+            signer: None,
+            skew: ClockSkew::default(),
+            clock: Arc::new(OffsetDateTime::now_utc),
         }
+    }
+
+    /// Sign every read with the node identity key (contract section 4.11).
+    pub fn with_read_signer(mut self, signer: ReadSigner) -> Self {
+        self.signer = Some(signer);
+        self
     }
 
     #[cfg(test)]
     pub(crate) fn with_total_timeout(mut self, timeout: Duration) -> Self {
         self.total_timeout = timeout;
         self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_clock(
+        mut self,
+        clock: Arc<dyn Fn() -> OffsetDateTime + Send + Sync>,
+    ) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// The `TinyCloud-Read-Auth` value for a `GET` of `url`, only when a
+    /// signer is set and `url` is at the configured origin (scheme, host and
+    /// port) over `https`. Any other URL gets none.
+    pub(crate) fn read_auth_value(&self, url: &Url) -> Option<String> {
+        let signer = self.signer.as_ref()?;
+        let configured = self.origin.url.origin();
+        if url.origin() != configured || url.scheme() != "https" {
+            return None;
+        }
+        Some(signer.header_value(&self.origin.audience(), url.path(), (self.clock)()))
     }
 }
 
@@ -181,23 +223,35 @@ impl LinkRecordFetcher for ApiLinkFetcher {
             .resolve_url_scoped(&url, self.scope)
             .await
             .map_err(|_| LinkFetchError::Unavailable)?;
-        let response = egress::get(
+        let mut request = egress::get(
             self.policy.clone(),
             destination,
             self.total_timeout,
             MAX_LINK_BODY_BYTES,
         )
         .header("accept", "application/octet-stream")
-        .header("accept-encoding", "identity")
-        .send()
-        .await
-        .map_err(|error| match error {
+        .header("accept-encoding", "identity");
+        // The signature goes only to the configured origin; no redirect is
+        // followed, so a response cannot move the request elsewhere.
+        if let Some(value) = self.read_auth_value(&url) {
+            request = request.header(READ_AUTH_HEADER, value);
+        }
+        let response = request.send().await.map_err(|error| match error {
             GetError::Policy(_)
             | GetError::Transport(_)
             | GetError::Header
             | GetError::Timeout
             | GetError::BodyTooLarge => LinkFetchError::Unavailable,
         })?;
+        // Any response carries the API's clock in `Date`.
+        self.skew.observe(
+            response
+                .headers
+                .get("date")
+                .and_then(|value| value.to_str().ok()),
+            (self.clock)(),
+            std::time::Instant::now(),
+        );
         match response.status {
             StatusCode::OK => {}
             StatusCode::NOT_FOUND => return Err(LinkFetchError::NotFound),

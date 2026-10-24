@@ -517,3 +517,229 @@ fn a_host_that_resolves_to_a_private_address_is_refused() {
     // A failed lookup is not a refusal at load; every fetch vets its address.
     assert!(check(false, &|_, _| None));
 }
+
+mod signed_reads {
+    use super::*;
+    use crate::links_read_auth::test_support::{lines, verify, Captured, Request as ApiRequest};
+    use time::format_description::well_known::Rfc3339;
+    use tinycloud_core::keys::StaticSecret;
+
+    const NOW: &str = "2026-10-24T12:00:00.000Z";
+    /// A TEST node secret; nothing protects anything with it.
+    const SECRET: [u8; 32] = [0x5e; 32];
+
+    fn clock(at: &'static str) -> Arc<dyn Fn() -> OffsetDateTime + Send + Sync> {
+        Arc::new(move || OffsetDateTime::parse(at, &Rfc3339).unwrap())
+    }
+
+    fn signed(rig: Rig, at: &'static str) -> Rig {
+        Rig {
+            fetcher: rig
+                .fetcher
+                .with_read_signer(ReadSigner::new(StaticSecret::new(SECRET.to_vec()).unwrap()))
+                .with_clock(clock(at)),
+            ..rig
+        }
+    }
+
+    fn dated(mut response: Response<Body>, date: &str) -> Response<Body> {
+        response
+            .headers_mut()
+            .insert("date", hyper::header::HeaderValue::from_str(date).unwrap());
+        response
+    }
+
+    fn node_did() -> String {
+        StaticSecret::new(SECRET.to_vec()).unwrap().node_did()
+    }
+
+    #[tokio::test]
+    async fn every_read_carries_one_header_the_api_verifies_and_nothing_secret() {
+        let captured = Captured::default();
+        let _log = captured.install();
+        let rig = signed(
+            rig(|_| {
+                dated(
+                    ok(Some("r"), b"sealed".to_vec()),
+                    "Sat, 24 Oct 2026 12:00:00 GMT",
+                )
+            })
+            .await,
+            NOW,
+        );
+        rig.fetcher.fetch(&id()).await.unwrap();
+
+        let seen = rig.server.seen.lock();
+        let (uri, headers) = &seen[0];
+        assert_eq!(uri, &format!("/v1/links/{ID}"));
+        let values: Vec<_> = headers.get_all("tinycloud-read-auth").iter().collect();
+        assert_eq!(values.len(), 1);
+        let value = values[0].to_str().unwrap();
+        let listed = vec![("service:node".to_owned(), node_did())];
+        let audience = format!("https://{HOST}:{}", rig.server.port);
+        let path = format!("/v1/links/{ID}");
+        let request = ApiRequest {
+            method: "GET",
+            path: &path,
+            audience: &audience,
+        };
+        let now = OffsetDateTime::parse(NOW, &Rfc3339).unwrap();
+        assert_eq!(
+            verify(Some(value), &request, &listed, now),
+            Ok("service:node".to_owned())
+        );
+        // Bound to this link and this API instance.
+        let other = ApiRequest {
+            path: "/v1/links/22222222222222222222222222",
+            ..request
+        };
+        assert_eq!(
+            verify(Some(value), &other, &listed, now),
+            Err("bad-signature")
+        );
+
+        // Nothing of the node secret, its derived signing seed or any other
+        // credential rides on the request, and nothing is logged.
+        let secret = StaticSecret::new(SECRET.to_vec()).unwrap();
+        let everything = format!("{headers:?}");
+        let decoded =
+            String::from_utf8(base64::decode_config(value, base64::URL_SAFE_NO_PAD).unwrap())
+                .unwrap();
+        for secret_bytes in [
+            SECRET.to_vec(),
+            secret.derive_key(b"tinycloud/node/identity").to_vec(),
+        ] {
+            for spelling in [
+                hex::encode(&secret_bytes),
+                base64::encode_config(&secret_bytes, base64::URL_SAFE_NO_PAD),
+                base64::encode(&secret_bytes),
+            ] {
+                assert!(!everything.contains(&spelling) && !decoded.contains(&spelling));
+            }
+        }
+        for absent in ["authorization", "cookie", "referer", "proxy-authorization"] {
+            assert!(headers.get(absent).is_none(), "{absent}");
+        }
+        assert!(captured.text().is_empty(), "{}", captured.text());
+    }
+
+    #[tokio::test]
+    async fn a_fetcher_without_a_signer_sends_no_header() {
+        let rig = rig(|_| ok(Some("r"), b"sealed".to_vec())).await;
+        rig.fetcher.fetch(&id()).await.unwrap();
+        assert!(rig.server.seen.lock()[0]
+            .1
+            .get("tinycloud-read-auth")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn the_signature_is_for_the_configured_origin_only() {
+        let rig = signed(rig(|_| status(404)).await, NOW);
+        let port = rig.server.port;
+        let value = |url: &str| rig.fetcher.read_auth_value(&Url::parse(url).unwrap());
+        assert!(value(&format!("https://{HOST}:{port}/v1/links/{ID}")).is_some());
+        for foreign in [
+            format!("https://other.test:{port}/v1/links/{ID}"),
+            format!("https://{HOST}:{}/v1/links/{ID}", port + 1),
+            format!("http://{HOST}:{port}/v1/links/{ID}"),
+            format!("https://{HOST}.evil.test:{port}/v1/links/{ID}"),
+            format!("https://{HOST}:{port}@evil.test/v1/links/{ID}"),
+            format!("https://evil.test/{HOST}/v1/links/{ID}"),
+        ] {
+            assert_eq!(value(&foreign), None, "{foreign}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_redirect_is_not_followed_and_the_header_goes_to_no_other_host() {
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let location = format!("https://{}/v1/links/{ID}", target.local_addr().unwrap());
+        let rig = signed(
+            rig(move |_| {
+                Response::builder()
+                    .status(307)
+                    .header("location", location.clone())
+                    .body(Body::empty())
+                    .unwrap()
+            })
+            .await,
+            NOW,
+        );
+        assert_eq!(
+            rig.fetcher.fetch(&id()).await.err(),
+            Some(LinkFetchError::Unavailable)
+        );
+        // One request, to the configured host; nothing reached the target.
+        assert_eq!(rig.server.requests(), 1);
+        assert!(rig.server.seen.lock()[0]
+            .1
+            .get("tinycloud-read-auth")
+            .is_some());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), target.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_clock_over_a_minute_off_logs_one_capped_line_on_any_status_and_changes_no_outcome() {
+        let api_clock = "Sat, 24 Oct 2026 12:03:00 GMT";
+        for (code, expected) in [
+            (200, Ok(())),
+            (404, Err(LinkFetchError::NotFound)),
+            (429, Err(LinkFetchError::Unavailable)),
+        ] {
+            let captured = Captured::default();
+            let _log = captured.install();
+            let rig = signed(
+                rig(move |_| {
+                    dated(
+                        if code == 200 {
+                            ok(Some("r"), b"sealed".to_vec())
+                        } else {
+                            status(code)
+                        },
+                        api_clock,
+                    )
+                })
+                .await,
+                NOW,
+            );
+            let outcome = rig.fetcher.fetch(&id()).await.map(|_| ());
+            assert_eq!(outcome, expected, "{code}");
+            assert_eq!(rig.server.requests(), 1, "{code}: no retry");
+            // The same fetcher again within the minute: still one line.
+            let _ = rig.fetcher.fetch(&id()).await;
+            let logged = lines(&captured);
+            assert_eq!(logged.len(), 1, "{code}: {logged:?}");
+            assert_eq!(logged[0]["fields"]["event"], "links_read_clock_skew");
+            assert_eq!(logged[0]["fields"]["skew_ms"], -180_000);
+            assert_eq!(logged[0]["fields"]["window_s"], 120);
+            let text = captured.text();
+            assert!(
+                !text.contains(ID) && !text.contains(HOST) && !text.contains("tinycloud-read-auth")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_clock_within_a_minute_or_no_readable_date_logs_nothing() {
+        let captured = Captured::default();
+        let _log = captured.install();
+        for date in [
+            "Sat, 24 Oct 2026 12:00:59 GMT",
+            "Sat, 24 Oct 2026 11:59:01 GMT",
+            "not a date",
+            "",
+        ] {
+            let rig = signed(
+                rig(move |_| dated(ok(Some("r"), b"sealed".to_vec()), date)).await,
+                NOW,
+            );
+            assert!(rig.fetcher.fetch(&id()).await.is_ok(), "{date}");
+        }
+        assert!(captured.text().is_empty(), "{}", captured.text());
+    }
+}

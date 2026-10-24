@@ -376,11 +376,11 @@ fn is_audience(value: &str) -> bool {
             .all(|byte| alphanumeric(*byte) || matches!(byte, b'.' | b'-'))
 }
 
-/// `YYYY-MM-DDTHH:mm:ss.SSSZ` that is a real date: UTC, `Z`, exactly three
-/// fractional digits, and no other spelling of the instant.
-pub(crate) fn utc_millis(value: &str) -> Option<OffsetDateTime> {
-    let time = OffsetDateTime::parse(value, &Rfc3339).ok()?;
-    let formatted = format!(
+/// `YYYY-MM-DDTHH:mm:ss.SSSZ`: the one spelling the contract writes for a
+/// time, UTC with three fractional digits.
+pub(crate) fn format_utc_millis(time: OffsetDateTime) -> String {
+    let time = time.to_offset(time::UtcOffset::UTC);
+    format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
         time.year(),
         u8::from(time.month()),
@@ -389,12 +389,18 @@ pub(crate) fn utc_millis(value: &str) -> Option<OffsetDateTime> {
         time.minute(),
         time.second(),
         time.millisecond()
-    );
-    (formatted == value).then_some(time)
+    )
+}
+
+/// `YYYY-MM-DDTHH:mm:ss.SSSZ` that is a real date: UTC, `Z`, exactly three
+/// fractional digits, and no other spelling of the instant.
+pub(crate) fn utc_millis(value: &str) -> Option<OffsetDateTime> {
+    let time = OffsetDateTime::parse(value, &Rfc3339).ok()?;
+    (format_utc_millis(time) == value).then_some(time)
 }
 
 /// The 32-byte key of a canonical `did:key:z…` Ed25519 identifier.
-fn did_key_ed25519(did: &str) -> Option<[u8; 32]> {
+pub(crate) fn did_key_ed25519(did: &str) -> Option<[u8; 32]> {
     use tinycloud_auth::ipld_core::cid::multibase::{self, Base};
     let encoded = did.strip_prefix("did:key:")?;
     let (base, bytes) = multibase::decode(encoded).ok()?;
