@@ -241,8 +241,12 @@ const APP_ID_NOT_BOUND: &str = "app_id_not_bound";
 async fn siwe_app_grants_need_an_app_id_bound_to_the_domain(
     backend: Backend,
 ) -> anyhow::Result<()> {
+    // Named keys on needs a deletion ledger path.
+    let ledger_dir = tempfile::tempdir()?;
+    let ledger_path = ledger_dir.path().join("deletion-ledger.jsonl");
     let on = |config: &mut crate::config::Config| {
         config.encryption_network.named_keys_v1 = true;
+        config.encryption_network.deletion_ledger_path = Some(ledger_path.clone());
     };
     let window = || Window::until(now() + Duration::hours(1));
 

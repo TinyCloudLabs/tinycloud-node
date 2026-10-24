@@ -87,6 +87,67 @@ app id equals its labels reversed and joined with `.`, or starts with that and
 `.` (the domain is compared in its lowercase ASCII form). UCAN delegations are
 not checked. A refusal answers `app_id_not_bound`.
 
+## Delete
+
+`POST /encryption/networks/<network>/key-actions/delete` with body
+`{ "keyPath": "<path>" }`. The network owner signs the request; it is never a
+delegation and `key.delete` is refused in every delegation.
+
+- `keyPath` without a trailing `/` deletes one key. A deterministic key (a path
+  outside `apps/`) answers 409 `key_not_deletable`; a missing key answers 404
+  `key_not_found`.
+- `keyPath` `apps/<app id>/` (exactly two segments and one trailing `/`) deletes
+  every key under it. Any other path ending in `/` answers 400
+  `key_path_invalid`. Keys are selected by an exact byte comparison of the
+  prefix, so `apps/foo_bar/` never selects `apps/foo.bar/…`. If a selected row
+  is not a deletable key, nothing changes and the answer is 409
+  `key_not_deletable`.
+- A deleted key keeps its row with state `deleted` and no seed. `keyVersion` is
+  unchanged until the path is created again.
+- The response is `{ keyPath, state: "deleted", deleted, alreadyDeleted,
+  count }`; `deleted` lists the keys this call deleted (in path order),
+  `alreadyDeleted` those that already were, and `count` is the length of
+  `deleted`. Repeating a delete changes nothing.
+- Each deleted key adds one `encryption_audit` row (outcome `deleted`, request
+  hash `sha256(credential CID || 0x00 || key path)`) and one line in the
+  deletion ledger.
+
+Credential for a `did:key` owner: a UCAN invocation by the owner, no proofs,
+one capability `tinycloud.encryption/key.delete` on the exact key or prefix URN
+(a prefix keeps its trailing `/`), `key-admin/v1` facts naming this node, the
+network, the body `keyPath`, the action and the body hash, and a nonce.
+
+Credential for a `did:pkh:eip155` owner: a SIWE CACAO signed by the owner whose
+ReCap is exactly `{ <key or prefix URN>: ["tinycloud.encryption/key.delete"] }`,
+whose only resource is that ReCap, whose `uri` is
+`urn:tinycloud:encryption:key-delete:<node DID>`, and whose statement is
+`Delete all TinyCloud keys under <prefix URN>.` (a prefix) or
+`Delete the TinyCloud key <key URN>.` (one key), then a space and the ReCap
+text. The URL network and the body `keyPath` must name the ReCap URN.
+
+Both credentials last at most 300 seconds (`exp - iat`; a UCAN has no `iat`, so
+`exp - now`), with `iat` and `nbf` at most 30 seconds ahead. The `(owner,
+nonce)` pair is consumed before the keys are touched, so a delete that fails
+after verification still uses up the signature; it is kept until 30 seconds
+after `exp`. Credential refusals answer 403 `owner_only`.
+
+### Deletion ledger
+
+`[global.encryption_network] deletion_ledger_path` names an append-only file
+outside the database; it is required while `named_keys_v1` is on. One JSON line
+per deleted key: `{ "networkId", "keyPath", "keyVersion", "deletedAt" }`. The
+lines of a delete are written and fsynced after its database changes and before
+the transaction commits, so the ledger holds at least every committed delete. If
+the ledger cannot be written the delete is rolled back and answers 500
+`deletion_ledger_unavailable`.
+
+After restoring a database, before starting the node, run
+`tinycloud node deletion-ledger replay [--config <file>] [--ledger <file>]`. It
+sets every listed key to `deleted` with no seed (a row with a newer
+`keyVersion` than the line is left alone), applies each line once, and exits
+non-zero after applying the valid lines if the file has lines that are not
+entries.
+
 ## Startup check
 
 The node does not start while a row in `encryption_network_key` under `apps/`

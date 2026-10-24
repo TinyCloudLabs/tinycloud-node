@@ -179,7 +179,7 @@ async fn delegate_refuses_key_delete_on_every_target_shape() -> Result<()> {
     let (status, body) = post(&fixture, "/delegate", control).await;
     assert_eq!(status, Status::Ok, "{body}");
     let control = wallet.cacao(
-        &prefix_urn(&wallet_did, "foo"),
+        &prefix_urn(&wallet_did, "com.example.foo"),
         KEY_CREATE,
         None,
         &device,
@@ -193,17 +193,17 @@ async fn delegate_refuses_key_delete_on_every_target_shape() -> Result<()> {
         (
             "app prefix",
             prefix_urn(&did_key_owner, "foo"),
-            prefix_urn(&wallet_did, "foo"),
+            prefix_urn(&wallet_did, "com.example.foo"),
         ),
         (
             "deeper prefix",
             format!("urn:tinycloud:encryption:{did_key_owner}:default/apps/foo/x/"),
-            format!("urn:tinycloud:encryption:{wallet_did}:default/apps/foo/x/"),
+            format!("urn:tinycloud:encryption:{wallet_did}:default/apps/com.example.foo/x/"),
         ),
         (
             "exact key",
             key_urn(&did_key_owner, "apps/foo/token"),
-            key_urn(&wallet_did, "apps/foo/token"),
+            key_urn(&wallet_did, "apps/com.example.foo/token"),
         ),
         (
             "reserved segment prefix",
@@ -247,7 +247,7 @@ async fn an_owner_delete_credential_is_not_a_delegation() -> Result<()> {
     let fixture = fixture().await?;
     let wallet = Wallet::new(3);
     let wallet_did = wallet.did();
-    let prefix = prefix_urn(&wallet_did, "foo");
+    let prefix = prefix_urn(&wallet_did, "com.example.foo");
     let credential = wallet.cacao(
         &prefix,
         KEY_DELETE,
@@ -536,10 +536,8 @@ async fn delete_refuses_a_credential_that_does_not_match_the_request() -> Result
     let auth = delete_auth(&fixture, &network, "apps/foo/")?;
     let other_network = format!("{}x", network);
     let (status, text) = delete_with(&fixture, &other_network, "apps/foo/", &auth).await;
-    assert!(
-        matches!(status, Status::BadRequest | Status::Forbidden),
-        "{status} {text}"
-    );
+    assert_eq!(status, Status::Forbidden, "{text}");
+    assert!(owner_only(&text), "{text}");
 
     // No Authorization header.
     let response = fixture
