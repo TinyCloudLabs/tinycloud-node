@@ -494,19 +494,26 @@ async fn a_ledger_that_was_renamed_refuses_the_delete() {
     assert!(deletion_ledger::read(&moved).unwrap().records.is_empty());
 }
 
+/// What the ledger holds after a delete whose commit failed: the operation
+/// and what settled it, if anything.
+fn ledger_records(f: &Fixture) -> Vec<Record> {
+    deletion_ledger::read(&f.ledger_path).unwrap().records
+}
+
 #[tokio::test]
-async fn a_commit_that_fails_leaves_an_aborted_line_and_deletes_nothing() {
+async fn a_commit_that_did_not_happen_is_settled_as_aborted_from_the_rows() {
     let f = fixture().await;
     f.create(&["apps/foo/a", "apps/foo/b"]).await;
     f.service
-        .fail_next_delete_commit
+        .delete_faults
+        .fail_before_commit
         .store(true, std::sync::atomic::Ordering::SeqCst);
 
     let err = f.delete(&prefix("foo"), "cid-abort").await.unwrap_err();
     assert!(matches!(err, EncryptionServiceError::Db(_)), "{err:?}");
     f.assert_unchanged(&["apps/foo/a", "apps/foo/b"]).await;
     assert!(f.audit_rows().await.is_empty());
-    let records = deletion_ledger::read(&f.ledger_path).unwrap().records;
+    let records = ledger_records(&f);
     assert_eq!(records.len(), 2);
     assert!(matches!(&records[0], Record::Intent(i) if i.op == "cid-abort"));
     assert_eq!(records[1], Record::aborted("cid-abort"));
@@ -521,7 +528,52 @@ async fn a_commit_that_fails_leaves_an_aborted_line_and_deletes_nothing() {
 }
 
 #[tokio::test]
-async fn a_crash_between_the_intent_and_the_commit_is_settled_at_the_next_start() {
+async fn a_commit_whose_reply_was_lost_is_settled_as_committed_from_the_rows() {
+    let f = fixture().await;
+    f.create(&["apps/foo/a", "apps/foo/b"]).await;
+    // The database commits, then the answer is lost: the call fails.
+    f.service
+        .delete_faults
+        .lose_commit_reply
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let err = f.delete(&prefix("foo"), "cid-lost").await.unwrap_err();
+    assert!(matches!(err, EncryptionServiceError::Db(_)), "{err:?}");
+    for path in ["apps/foo/a", "apps/foo/b"] {
+        assert_eq!(f.row(path).await.state, "deleted", "{path}");
+    }
+    let records = ledger_records(&f);
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[1], Record::committed("cid-lost"));
+    // A restore applies it: it is not skipped as aborted.
+    let report = deletion_ledger::replay(&f.db, &f.ledger_path)
+        .await
+        .unwrap();
+    assert_eq!(report.aborted_operations, 0);
+}
+
+#[tokio::test]
+async fn a_commit_error_that_cannot_be_checked_leaves_the_operation_open() {
+    let f = fixture().await;
+    f.create(&["apps/foo/a"]).await;
+    f.service
+        .delete_faults
+        .fail_before_commit
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    f.service
+        .delete_faults
+        .fail_reread
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let err = f.delete(&prefix("foo"), "cid-open").await.unwrap_err();
+    assert!(matches!(err, EncryptionServiceError::Db(_)), "{err:?}");
+    let contents = deletion_ledger::read(&f.ledger_path).unwrap();
+    assert_eq!(contents.records.len(), 1, "only the operation is written");
+    assert_eq!(contents.open_intents().len(), 1);
+}
+
+#[tokio::test]
+async fn a_crash_between_the_intent_and_the_commit_is_applied_at_the_next_start() {
     let f = fixture().await;
     f.create(&["apps/foo/a"]).await;
     // The intent is on disk; the process died before the commit.
@@ -538,23 +590,45 @@ async fn a_crash_between_the_intent_and_the_commit_is_settled_at_the_next_start(
         }))
         .unwrap();
 
-    let settled = ledger.settle_open_intents(&f.db).await.unwrap();
-    assert_eq!((settled.committed, settled.aborted), (0, 1));
-    f.assert_unchanged(&["apps/foo/a"]).await;
+    // The owner authorized this delete, so the start applies it.
+    ledger.replay_at_start(&f.db).await.unwrap();
+    assert_eq!(f.row("apps/foo/a").await.state, "deleted");
+    assert_eq!(f.row("apps/foo/a").await.sealed_seed, None);
+    assert!(deletion_ledger::read(&f.ledger_path)
+        .unwrap()
+        .open_intents()
+        .is_empty());
+}
 
-    // The same crash after the commit: the key is deleted, so it settles as committed.
-    f.delete(&key("apps/foo/a"), "cid-done").await.unwrap();
-    let mut crashed = deletion_ledger::read(&f.ledger_path).unwrap().records;
-    crashed.retain(|record| !matches!(record, Record::Committed(_)));
-    let rewritten = f.ledger_path.with_file_name("crashed.jsonl");
-    let lines: Vec<String> = crashed
-        .iter()
-        .map(|record| serde_json::to_string(record).unwrap())
-        .collect();
-    std::fs::write(&rewritten, lines.join("\n") + "\n").unwrap();
-    let crashed_ledger = DeletionLedger::open(&rewritten).unwrap();
-    let settled = crashed_ledger.settle_open_intents(&f.db).await.unwrap();
-    assert_eq!((settled.committed, settled.aborted), (1, 0));
+#[tokio::test]
+async fn a_deleted_row_that_still_holds_a_seed_is_deleted_again_with_no_seed() {
+    let f = fixture().await;
+    f.create(&["apps/foo/a", "apps/foo/b"]).await;
+    let mut row: encryption_network_key::ActiveModel = f.row("apps/foo/a").await.into();
+    row.state = Set("deleted".to_string());
+    row.update(&f.db).await.unwrap();
+    assert!(f.row("apps/foo/a").await.sealed_seed.is_some());
+
+    let outcome = f.delete(&prefix("foo"), "cid-seed").await.unwrap();
+    assert_eq!(outcome.deleted, strings(&["apps/foo/a", "apps/foo/b"]));
+    assert!(outcome.already_deleted.is_empty());
+    assert_eq!(f.row("apps/foo/a").await.sealed_seed, None);
+}
+
+#[tokio::test]
+async fn a_row_of_an_unknown_kind_is_corrupt_and_nothing_is_deleted() {
+    let f = fixture().await;
+    f.create(&["apps/foo/a"]).await;
+    f.insert_raw("apps/foo/odd", "mystery", true).await;
+
+    let err = f.delete(&prefix("foo"), "cid-kind").await.unwrap_err();
+    assert!(
+        matches!(err, EncryptionServiceError::CorruptKeyRow),
+        "{err:?}"
+    );
+    f.assert_unchanged(&["apps/foo/a"]).await;
+    assert!(f.audit_rows().await.is_empty());
+    assert!(f.ledger_paths().is_empty());
 }
 
 #[tokio::test]

@@ -1237,8 +1237,18 @@ async fn nonces_past_their_expiry_are_pruned_and_live_ones_kept() {
     let target = prefix_target(&network, "foo");
     let body = body_for(&target);
     let (service, db) = service().await;
+    let ago = |seconds: i64| {
+        OffsetDateTime::from_unix_timestamp(now() - seconds)
+            .unwrap()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap()
+    };
+    let (ten_seconds_ago, a_minute_ago) = (ago(10), ago(60));
     for (requester, nonce, expires_at) in [
         ("did:key:old", "n-old", "2020-01-01T00:00:00Z"),
+        // Within the 30 s window after its expiry a nonce is still kept.
+        ("did:key:recent", "n-recent", ten_seconds_ago.as_str()),
+        ("did:key:minute", "n-minute", a_minute_ago.as_str()),
         ("did:key:live", "n-live", "2999-01-01T00:00:00Z"),
     ] {
         encryption_nonce::ActiveModel {
@@ -1263,7 +1273,14 @@ async fn nonces_past_their_expiry_are_pruned_and_live_ones_kept() {
         .map(|row| row.nonce)
         .collect();
     kept.sort();
-    assert_eq!(kept, vec!["n-live".to_string(), "nonce-0001".to_string()]);
+    assert_eq!(
+        kept,
+        vec![
+            "n-live".to_string(),
+            "n-recent".to_string(),
+            "nonce-0001".to_string()
+        ]
+    );
 }
 
 #[tokio::test]

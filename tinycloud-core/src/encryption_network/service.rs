@@ -251,9 +251,9 @@ pub struct EncryptionService {
     pub(super) key_cap_per_network: u64,
     pub(super) deletion_ledger: Option<Arc<DeletionLedger>>,
     pub(super) key_cap_per_app_prefix: u64,
-    /// Makes the next key delete fail where it would commit.
+    /// Makes the next key delete fail around its commit.
     #[cfg(test)]
-    pub(super) fail_next_delete_commit: std::sync::atomic::AtomicBool,
+    pub(super) delete_faults: super::key_delete::DeleteFaults,
 }
 
 #[derive(Debug, Clone)]
@@ -285,7 +285,7 @@ impl EncryptionService {
             key_cap_per_network: DEFAULT_KEY_CAP_PER_NETWORK,
             deletion_ledger: None,
             #[cfg(test)]
-            fail_next_delete_commit: Default::default(),
+            delete_faults: Default::default(),
             key_cap_per_app_prefix: DEFAULT_KEY_CAP_PER_APP_PREFIX,
         }
     }
@@ -306,7 +306,7 @@ impl EncryptionService {
             key_cap_per_network: DEFAULT_KEY_CAP_PER_NETWORK,
             deletion_ledger: None,
             #[cfg(test)]
-            fail_next_delete_commit: Default::default(),
+            delete_faults: Default::default(),
             key_cap_per_app_prefix: DEFAULT_KEY_CAP_PER_APP_PREFIX,
         }
     }

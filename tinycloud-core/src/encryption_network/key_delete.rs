@@ -6,8 +6,10 @@
 //! so the ledger always names every committed deletion.
 
 use sea_orm::{
-    sea_query::Expr, ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseTransaction,
-    EntityTrait, QueryFilter, QueryOrder, Value,
+    sea_query::{Alias, Expr, Func, SimpleExpr},
+    ActiveModelTrait,
+    ActiveValue::Set,
+    ColumnTrait, DatabaseTransaction, EntityTrait, QueryFilter, QueryOrder,
 };
 
 use crate::{
@@ -18,7 +20,7 @@ use crate::{
 use super::{
     canonical::hash_hex,
     delete_auth::{DeleteTarget, VerifiedOwnerDelete},
-    deletion_ledger::{DeletionLedger, Intent, LedgerKey, Record},
+    deletion_ledger::{intent_committed, DeletionLedger, Intent, LedgerKey, Record},
     key_id::KeyKind,
     keys::{find_key_row, lock_network_row, KeyState},
     network_id::NetworkId,
@@ -69,41 +71,48 @@ impl EncryptionService {
         let result = self
             .delete_keys_in(&tx, network, target, verified, &ledger)
             .await;
-        let (outcome, op) = match result {
+        let (outcome, intent) = match result {
             Ok(done) => done,
             Err(err) => {
                 let _ = tx.rollback().await;
                 return Err(err);
             }
         };
-        let committed = self.commit_delete(tx).await;
-        if let Err(err) = committed {
-            // The commit did not happen: say so before answering.
-            self.settle_aborted(&ledger, op.as_deref()).await;
+        if let Err(err) = self.commit_delete(tx).await {
+            // PostgreSQL can commit and then lose the reply, so the answer to
+            // "did it commit" comes from the rows, not from this error.
+            self.settle_after_commit_error(&ledger, intent.as_ref())
+                .await;
             return Err(err.into());
         }
-        if let Some(op) = op {
+        if let Some(intent) = intent {
             // A missing `committed` line is settled from the database at the
             // next start, so a failure here does not undo the delete.
-            if ledger.append_async(Record::committed(&op)).await.is_err() {
-                ::tracing::warn!("deletion ledger: committed line was not written");
+            if let Err(error) = ledger.append_async(Record::committed(&intent.op)).await {
+                ::tracing::warn!(%error, "deletion ledger: committed line was not written");
             }
         }
         Ok(outcome)
     }
 
-    /// Commits the delete's transaction. In tests the next call can be made
-    /// to fail instead, with the transaction rolled back.
+    /// Commits the delete's transaction. Tests can make it fail before the
+    /// commit (rolled back) or after it (committed, reply lost).
     async fn commit_delete(&self, tx: DatabaseTransaction) -> Result<(), sea_orm::DbErr> {
         #[cfg(test)]
-        if self
-            .fail_next_delete_commit
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
         {
-            tx.rollback().await?;
-            return Err(sea_orm::DbErr::Custom(
-                "injected commit failure".to_string(),
-            ));
+            use std::sync::atomic::Ordering::SeqCst;
+            if self.delete_faults.fail_before_commit.swap(false, SeqCst) {
+                tx.rollback().await?;
+                return Err(sea_orm::DbErr::Custom(
+                    "injected failure before the commit".to_string(),
+                ));
+            }
+            if self.delete_faults.lose_commit_reply.swap(false, SeqCst) {
+                tx.commit().await?;
+                return Err(sea_orm::DbErr::Custom(
+                    "injected loss of the commit reply".to_string(),
+                ));
+            }
         }
         tx.commit().await
     }
@@ -115,7 +124,10 @@ impl EncryptionService {
         target: &DeleteTarget,
         verified: &VerifiedOwnerDelete,
         ledger: &std::sync::Arc<DeletionLedger>,
-    ) -> Result<(DeleteOutcome, Option<String>), EncryptionServiceError> {
+    ) -> Result<(DeleteOutcome, Option<Intent>), EncryptionServiceError> {
+        // Serializes this delete with create, block and unblock on the network.
+        // The guarded updates (the key version must still match) keep each
+        // row's write correct without it; the lock is defense in depth.
         lock_network_row(tx, network).await?;
         if encryption_network::Entity::find_by_id(network.to_string())
             .one(tx)
@@ -198,18 +210,17 @@ impl EncryptionService {
         // The intent is durable before the commit: a crash after this point
         // leaves an open intent that the next start settles against the
         // database, so the ledger always names every committed deletion.
-        let op = if ledger_keys.is_empty() {
+        let intent = if ledger_keys.is_empty() {
             None
         } else {
-            ledger
-                .append_async(Record::Intent(Intent {
-                    op: verified.auth_cid.clone(),
-                    network_id: network.to_string(),
-                    keys: ledger_keys,
-                    deleted_at: now,
-                }))
-                .await?;
-            Some(verified.auth_cid.clone())
+            let intent = Intent {
+                op: verified.auth_cid.clone(),
+                network_id: network.to_string(),
+                keys: ledger_keys,
+                deleted_at: now,
+            };
+            ledger.append_async(Record::Intent(intent.clone())).await?;
+            Some(intent)
         };
 
         Ok((
@@ -218,19 +229,55 @@ impl EncryptionService {
                 deleted,
                 already_deleted,
             },
-            op,
+            intent,
         ))
     }
 
-    /// Appends `aborted` for an operation whose commit did not happen. A
-    /// failure here is settled from the database at the next start.
-    async fn settle_aborted(&self, ledger: &std::sync::Arc<DeletionLedger>, op: Option<&str>) {
-        if let Some(op) = op {
-            if ledger.append_async(Record::aborted(op)).await.is_err() {
-                ::tracing::warn!("deletion ledger: aborted line was not written");
+    /// After a failed commit: reads the rows again, through the pool and not
+    /// the failed connection, and appends `committed` when every key is
+    /// deleted at its version and `aborted` when the commit did not happen.
+    /// When the rows cannot be read the intent stays open, and the next start
+    /// settles it.
+    async fn settle_after_commit_error(
+        &self,
+        ledger: &std::sync::Arc<DeletionLedger>,
+        intent: Option<&Intent>,
+    ) {
+        let Some(intent) = intent else { return };
+        let verdict = self.reread_committed(intent).await;
+        let record = match verdict {
+            Ok(true) => Record::committed(&intent.op),
+            Ok(false) => Record::aborted(&intent.op),
+            Err(error) => {
+                ::tracing::warn!(%error, "deletion ledger: could not tell whether a delete committed; the operation stays open");
+                return;
             }
+        };
+        if let Err(error) = ledger.append_async(record).await {
+            ::tracing::warn!(%error, "deletion ledger: the settling line was not written");
         }
     }
+
+    async fn reread_committed(&self, intent: &Intent) -> Result<bool, sea_orm::DbErr> {
+        #[cfg(test)]
+        if self
+            .delete_faults
+            .fail_reread
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(sea_orm::DbErr::Custom("injected read failure".to_string()));
+        }
+        intent_committed(&self.db, intent).await
+    }
+}
+
+/// Switches for tests to make a delete fail around its commit.
+#[cfg(test)]
+#[derive(Default)]
+pub(super) struct DeleteFaults {
+    pub(super) fail_before_commit: std::sync::atomic::AtomicBool,
+    pub(super) lose_commit_reply: std::sync::atomic::AtomicBool,
+    pub(super) fail_reread: std::sync::atomic::AtomicBool,
 }
 
 /// `sha256(auth CID || 0x00 || key path)`, hex. The audit table's primary key.
@@ -253,13 +300,16 @@ async fn rows_under_prefix(
 ) -> Result<Vec<encryption_network_key::Model>, EncryptionServiceError> {
     let rows = encryption_network_key::Entity::find()
         .filter(encryption_network_key::Column::NetworkId.eq(network.to_string()))
-        .filter(Expr::cust_with_values(
-            "substr(key_path, 1, ?) = ?",
-            [
-                Value::Int(Some(prefix.len() as i32)),
-                Value::String(Some(Box::new(prefix.to_string()))),
-            ],
-        ))
+        // `substr(key_path, 1, n) = prefix`: an exact comparison of the
+        // first n characters, the same SQL on SQLite and PostgreSQL.
+        .filter(
+            Expr::expr(Func::cust(Alias::new("substr")).args([
+                Expr::col(encryption_network_key::Column::KeyPath).into(),
+                SimpleExpr::from(1i32),
+                SimpleExpr::from(prefix.len() as i32),
+            ]))
+            .eq(prefix.to_string()),
+        )
         .order_by_asc(encryption_network_key::Column::KeyPath)
         .all(tx)
         .await?;

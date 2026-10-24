@@ -106,8 +106,25 @@ pub enum DeletionLedgerError {
     Moved,
     #[error("deletion ledger line {0} is malformed")]
     Malformed(usize),
+    #[error("deletion ledger holds {0} key entries that are not valid keys")]
+    Refused(usize),
     #[error("database error: {0}")]
     Db(#[from] sea_orm::DbErr),
+}
+
+impl DeletionLedgerError {
+    /// A fixed name for logs: it carries no path, key or database text.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Io(_) => "io",
+            Self::Path(_) => "path",
+            Self::Encode(_) => "encode",
+            Self::Moved => "moved",
+            Self::Malformed(_) => "malformed",
+            Self::Refused(_) => "refused",
+            Self::Db(_) => "db",
+        }
+    }
 }
 
 impl From<DeletionLedgerError> for EncryptionServiceError {
@@ -241,53 +258,54 @@ impl DeletionLedger {
         Ok(())
     }
 
-    /// Settles every open intent against the database: the delete committed
-    /// when each of its keys is `deleted` at the intent's key version (or at a
-    /// later one, after a re-create), otherwise it did not. Appends the
-    /// matching `committed` or `aborted` line. Runs at every node start,
-    /// before the routes mount.
-    pub async fn settle_open_intents<C: ConnectionTrait>(
+    /// The start-time replay. Applies the ledger to the database exactly as a
+    /// restore does (see [`replay`]: committed and still-open operations
+    /// apply, aborted ones do not), then closes every operation that was
+    /// still open with a `committed` line, since the replay has made it
+    /// true. Fails, closing nothing, when the ledger cannot be read, the
+    /// database errors, or the ledger holds entries that are not valid keys.
+    pub async fn replay_at_start<C: TransactionTrait>(
         &self,
         db: &C,
-    ) -> Result<SettleReport, DeletionLedgerError> {
-        let contents = read(&self.path)?;
-        let mut report = SettleReport::default();
-        for intent in contents.open_intents() {
-            let mut committed = true;
-            for key in &intent.keys {
-                let row = encryption_network_key::Entity::find_by_id((
-                    intent.network_id.clone(),
-                    key.key_path.clone(),
-                ))
-                .one(db)
-                .await?;
-                let deleted = row.is_some_and(|row| {
-                    row.key_version > key.key_version
-                        || (row.key_version == key.key_version
-                            && row.state == KeyState::Deleted.as_str())
-                });
-                if !deleted {
-                    committed = false;
-                    break;
-                }
-            }
-            if committed {
-                self.append(&Record::committed(&intent.op))?;
-                report.committed += 1;
-            } else {
-                self.append(&Record::aborted(&intent.op))?;
-                report.aborted += 1;
-            }
+    ) -> Result<ReplayReport, DeletionLedgerError> {
+        let report = replay(db, &self.path).await?;
+        if report.refused > 0 {
+            return Err(DeletionLedgerError::Refused(report.refused));
+        }
+        let open: Vec<String> = read(&self.path)?
+            .open_intents()
+            .into_iter()
+            .map(|intent| intent.op.clone())
+            .collect();
+        for op in open {
+            self.append(&Record::committed(&op))?;
         }
         Ok(report)
     }
 }
 
-/// Result of [`DeletionLedger::settle_open_intents`].
-#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
-pub struct SettleReport {
-    pub committed: usize,
-    pub aborted: usize,
+/// Whether the delete named by `intent` committed: every key is `deleted` at
+/// the intent's key version, or at a later one after a re-create.
+pub(super) async fn intent_committed<C: ConnectionTrait>(
+    db: &C,
+    intent: &Intent,
+) -> Result<bool, sea_orm::DbErr> {
+    for key in &intent.keys {
+        let row = encryption_network_key::Entity::find_by_id((
+            intent.network_id.clone(),
+            key.key_path.clone(),
+        ))
+        .one(db)
+        .await?;
+        let deleted = row.is_some_and(|row| {
+            row.key_version > key.key_version
+                || (row.key_version == key.key_version && row.state == KeyState::Deleted.as_str())
+        });
+        if !deleted {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Keeps a final line that is a whole record (adding its newline) and removes

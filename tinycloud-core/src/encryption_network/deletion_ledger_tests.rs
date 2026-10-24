@@ -9,7 +9,7 @@ use sea_orm_migration::MigratorTrait;
 
 use super::deletion_ledger::{
     read, replay, validate_path, DeletionLedger, DeletionLedgerError, Intent, LedgerKey, Record,
-    ReplayReport, SettleReport,
+    ReplayReport,
 };
 use crate::{migrations::Migrator, models::encryption_network_key};
 
@@ -407,47 +407,93 @@ async fn replay_leaves_a_newer_key_version_and_counts_missing_rows() {
     assert_eq!(row(&db, "apps/a/x").await.sealed_seed, None);
 }
 
-// ------------------------------------------------------------------ settle
+// ------------------------------------------------------------ replay at start
 
 #[tokio::test]
-async fn open_intents_are_settled_against_the_database() {
+async fn replay_at_start_applies_open_operations_and_closes_them() {
     let db = fresh_db().await;
-    // `done` committed: its keys are deleted at the intent's version. `lost`
-    // did not: its key is still active. `again` committed and the key was
-    // created again afterwards (a later version).
+    // `done` committed. `lost` is open and its key is still active: the
+    // owner authorized the delete, so it is applied. `again` is open and its
+    // key was created again afterwards (a later version). `aborted` did not
+    // commit.
     insert_key(&db, "apps/a/done", "deletable", "deleted", false, 1).await;
     active_key(&db, "apps/a/lost").await;
     insert_key(&db, "apps/a/again", "deletable", "active", true, 2).await;
+    active_key(&db, "apps/a/aborted").await;
     let dir = tempfile::tempdir().unwrap();
     let (path, ledger) = ledger_in(&dir);
     for (op, key) in [
         ("done", ("apps/a/done", 1)),
         ("lost", ("apps/a/lost", 1)),
         ("again", ("apps/a/again", 1)),
+        ("aborted", ("apps/a/aborted", 1)),
     ] {
         ledger.append(&Record::Intent(intent(op, &[key]))).unwrap();
     }
     ledger.append(&Record::committed("done")).unwrap();
-    // `done` is settled already; the other two are open.
-    let settled = ledger.settle_open_intents(&db).await.unwrap();
+    ledger.append(&Record::aborted("aborted")).unwrap();
+
+    let report = ledger.replay_at_start(&db).await.unwrap();
     assert_eq!(
-        settled,
-        SettleReport {
-            committed: 1,
-            aborted: 1
+        report,
+        ReplayReport {
+            operations: 4,
+            aborted_operations: 1,
+            applied: 1,
+            already_deleted: 1,
+            newer_version: 1,
+            ..ReplayReport::default()
         }
     );
+    assert_eq!(row(&db, "apps/a/lost").await.state, "deleted");
+    assert_eq!(row(&db, "apps/a/lost").await.sealed_seed, None);
+    assert_eq!(row(&db, "apps/a/again").await.state, "active");
+    assert_eq!(row(&db, "apps/a/aborted").await.state, "active");
+    // Every open operation is closed, as committed, and none stays open.
     let text = std::fs::read_to_string(&path).unwrap();
-    assert!(text.contains(r#"{"aborted":"lost"}"#));
+    assert!(text.contains(r#"{"committed":"lost"}"#));
     assert!(text.contains(r#"{"committed":"again"}"#));
     assert!(read(&path).unwrap().open_intents().is_empty());
 
-    // Settled again, nothing is left to do, and replay skips the aborted one.
-    assert_eq!(
-        ledger.settle_open_intents(&db).await.unwrap(),
-        SettleReport::default()
+    // A second start has nothing left to apply.
+    let second = ledger.replay_at_start(&db).await.unwrap();
+    assert_eq!(second.applied, 0);
+}
+
+#[tokio::test]
+async fn replay_at_start_fails_and_closes_nothing_when_the_ledger_holds_a_refused_key() {
+    let db = fresh_db().await;
+    active_key(&db, "apps/a/x").await;
+    let dir = tempfile::tempdir().unwrap();
+    let (path, ledger) = ledger_in(&dir);
+    ledger
+        .append(&Record::Intent(intent(
+            "op",
+            &[("apps/a", 1), ("apps/a/x", 1)],
+        )))
+        .unwrap();
+
+    let Err(error) = ledger.replay_at_start(&db).await else {
+        panic!("a ledger with a refused key fails the start");
+    };
+    assert!(
+        matches!(error, DeletionLedgerError::Refused(1)),
+        "{error:?}"
     );
-    let report = replay(&db, &path).await.unwrap();
-    assert_eq!(report.aborted_operations, 1);
-    assert_eq!(row(&db, "apps/a/lost").await.state, "active");
+    assert_eq!(error.kind(), "refused");
+    assert_eq!(read(&path).unwrap().open_intents().len(), 1);
+}
+
+#[tokio::test]
+async fn replay_at_start_fails_on_a_malformed_middle_line() {
+    let db = fresh_db().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ledger.jsonl");
+    let whole = serde_json::to_string(&Record::Intent(intent("op", &[("apps/a/x", 1)]))).unwrap();
+    std::fs::write(&path, format!("{whole}\nnot json\n{whole}\n")).unwrap();
+    let ledger = DeletionLedger::open(&path).unwrap();
+    let Err(error) = ledger.replay_at_start(&db).await else {
+        panic!("a malformed middle line fails the start");
+    };
+    assert_eq!(error.kind(), "malformed");
 }

@@ -40,7 +40,7 @@ use super::{
     keys::network_of,
     network_id::NetworkId,
     protocol::{KeyAdminFacts, KEY_ADMIN_TYPE, KEY_DELETE_ACTION},
-    service::{now_rfc3339, EncryptionService, EncryptionServiceError},
+    service::{EncryptionService, EncryptionServiceError},
 };
 
 /// The SIWE `uri` of an owner delete names the node it is for.
@@ -458,11 +458,19 @@ impl EncryptionService {
         let now = OffsetDateTime::now_utc().unix_timestamp();
         let verified =
             verify_owner_delete(header, &self.node_did, network, target, body_value, now).await?;
-        // Expired nonces are of no use: a credential past its `exp` is refused
-        // before its nonce is looked at. Timestamps are RFC 3339 UTC and sort
-        // as text.
+        // Nonces whose expiry is more than the retention window in the past
+        // are of no use: a credential past its `exp` is refused before its
+        // nonce is looked at, and the window covers a clock that steps back.
+        // Timestamps are RFC 3339 UTC and sort as text.
+        let cutoff = OffsetDateTime::from_unix_timestamp(now - NONCE_RETENTION_SECS)
+            .ok()
+            .and_then(|at| {
+                at.format(&time::format_description::well_known::Rfc3339)
+                    .ok()
+            })
+            .ok_or_else(|| refuse("the clock is out of range"))?;
         encryption_nonce::Entity::delete_many()
-            .filter(encryption_nonce::Column::ExpiresAt.lt(now_rfc3339()))
+            .filter(encryption_nonce::Column::ExpiresAt.lt(cutoff))
             .exec(&self.db)
             .await?;
         self.consume_nonce_until(
