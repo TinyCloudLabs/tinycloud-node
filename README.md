@@ -381,24 +381,24 @@ TinyCloud Protocol is most easily used via the TinyCloud Protocol SDK. See the e
 
 ### UCAN DID resolution (TC-1080)
 
-UCAN signature verification resolves only `did:key`, `did:pkh` and `did:jwk`
-by default. Other methods fail before resolution with `did_method_disabled:`.
+UCAN signature verification resolves only `did:key` (Ed25519 keys), `did:pkh`
+(EVM, `eip155` namespace) and `did:jwk` (Ed25519 OKP keys). Other
+methods, and other key types or namespaces, fail before resolution with
+`did_method_disabled:`.
 Issuer DID URLs carrying a query fail with `did_url_query_rejected:` under every
 setting. DID parsing and string comparisons, including share-email `did:web`
 identifiers, are unchanged. Existing route status codes and policy machine codes
 are preserved.
 
-Keep `[global.did_resolution] network_methods = false` in `tinycloud.toml`
-or the canonical environment variable
-`TINYCLOUD_DID_RESOLUTION__NETWORK_METHODS=false`. Network DID methods, including
-`did:web`, remain disabled under the current policy.
+Network DID methods, including `did:web`, `did:tz`, `did:ethr` and `did:ion`, are
+never resolved for UCAN verification. No setting or environment variable enables
+them.
 
-**Full TC-1080 Part B hardening is REQUIRED before any future re-enable**,
-including setting the existing `network_methods` option to `true`. The
-unhardened SSI client is not an acceptable rollback path. Part B is not
-implemented here, and there is no Part B development bypass. The required
-node-side fetcher, destination enforcement, resource limits and local-listener
-acceptance checks are described in the
+Network DID resolution requires the hardening described in TC-1080 Part B. This node
+does not implement Part B, and no setting or development flag provides it. The
+required node-side
+fetcher, destination enforcement, resource limits and local-listener acceptance checks
+are described in the
 [developer gate](docs/delegation-flow.md#network-did-method-future-enable-gate-tc-1132).
 
 The startup log records the effective policy. Refusals increment

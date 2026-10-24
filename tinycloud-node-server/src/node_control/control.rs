@@ -499,11 +499,6 @@ pub async fn spawn_control_plane(
 ) -> Result<ControlPlaneServer> {
     let mut effective_config = config.clone();
     effective_config.storage.resolve();
-    tinycloud_core::did_resolution::configure(
-        tinycloud_core::did_resolution::DidResolutionPolicy {
-            network_methods: effective_config.did_resolution.network_methods,
-        },
-    );
 
     let pid = std::process::id();
     let data_path = effective_config.storage.datadir.clone();
@@ -1914,11 +1909,6 @@ mod tests {
         let figment = runtime::serve_config_figment(&base_config_path).unwrap();
         let mut config = figment.extract::<Config>().unwrap();
         config.storage.resolve();
-        tinycloud_core::did_resolution::configure(
-            tinycloud_core::did_resolution::DidResolutionPolicy {
-                network_methods: config.did_resolution.network_methods,
-            },
-        );
         let server = spawn_control_plane(&config, base_config_path, profile)
             .await
             .unwrap();

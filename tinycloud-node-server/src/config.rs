@@ -1815,14 +1815,22 @@ impl Default for DatabaseConfig {
     }
 }
 
-/// UCAN issuer resolution policy (TC-1080). Parsing and identity comparisons are unchanged.
+/// UCAN issuer resolution. The method allow-list is fixed in `tinycloud_core::did_resolution`
+/// and has no settings. A config that sets `network_methods` parses; the key is ignored.
 #[derive(Serialize, Deserialize, Debug, Default, Clone, Hash, PartialEq, Eq)]
 pub struct DidResolutionConfig {
-    /// Allow methods beyond key, pkh and jwk. Default: false.
-    /// Canonical env: TINYCLOUD_DID_RESOLUTION__NETWORK_METHODS=true.
-    /// Requires a restart; issuer queries are always refused.
-    #[serde(default)]
+    /// Ignored: network DID methods are never resolved. `true` when the key is
+    /// present, with any value, so startup can warn that it has no effect.
+    #[serde(default, skip_serializing, deserialize_with = "retired_key_present")]
     pub network_methods: bool,
+}
+
+fn retired_key_present<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde::de::IgnoredAny::deserialize(deserializer)?;
+    Ok(true)
 }
 
 impl DatabaseConfig {
@@ -2008,6 +2016,21 @@ mod tests {
                 "{wait_ms}"
             );
         }
+    }
+
+    #[test]
+    fn retired_did_resolution_network_methods_is_detected_for_any_value_and_never_written_back() {
+        let absent: DidResolutionConfig = serde_json::from_str("{}").unwrap();
+        assert!(!absent.network_methods);
+        for value in [r#"["web"]"#, r#""web""#, "true", "{}"] {
+            let config: DidResolutionConfig =
+                serde_json::from_str(&format!(r#"{{"network_methods":{value}}}"#)).unwrap();
+            assert!(config.network_methods, "{value}");
+        }
+        let written = DidResolutionConfig {
+            network_methods: true,
+        };
+        assert_eq!(serde_json::to_string(&written).unwrap(), "{}");
     }
 
     /// TC-1491: off by default, 60 s / 8 MiB for every tier, and nothing is
