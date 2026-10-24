@@ -29,6 +29,8 @@ pub mod policy_delegation;
 pub mod policy_edge;
 pub mod policy_issuance_audit;
 pub mod policy_v3_challenge;
+pub mod policy_v3_owner_authority;
+pub mod policy_v3_owner_binding;
 pub mod policy_v3_registration;
 pub mod policy_v3_root;
 pub mod policy_v3_session;

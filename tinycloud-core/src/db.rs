@@ -708,15 +708,11 @@ where
         if roots.is_empty() {
             return Ok(true);
         }
-        let chain_ids = revocation::ancestor_chain_ids_for_roots(&self.conn, &roots)
+        // TC-1423: one closure query plus one alias-aware revocation query,
+        // whatever the depth; hook streams re-check this while open.
+        crate::policy_owner_authority::chains_unrevoked(&self.conn, &roots)
             .await
-            .map_err(|error| DbErr::Custom(error.to_string()))?;
-        for id in chain_ids {
-            if revocation::is_revoked(&self.conn, &id).await? {
-                return Ok(false);
-            }
-        }
-        Ok(true)
+            .map_err(|error| DbErr::Custom(error.to_string()))
     }
 
     /// Load and reparse a delegation from its exact signed Authorization
