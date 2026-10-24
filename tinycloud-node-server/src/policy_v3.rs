@@ -2105,15 +2105,9 @@ async fn register_policy_writes(
         .insert(txn)
         .await
         .map_err(|e| (Status::Conflict, e.to_string()))?;
-    owner_authority::insert_classification(
-        txn,
-        policy_cid,
-        authority,
-        registered_mode,
-        now,
-    )
-    .await
-    .map_err(db_error)?;
+    owner_authority::insert_classification(txn, policy_cid, authority, registered_mode, now)
+        .await
+        .map_err(db_error)?;
     for (cid, role, bytes, status) in roots {
         let checked_at = status_field(&status, "checkedAt")
             .ok_or((Status::InternalServerError, "status-invalid".into()))?;

@@ -323,21 +323,22 @@ fn build_info(
     ]);
     #[cfg(feature = "dstack")]
     features.push("tee");
-    if config.encryption_network.named_keys_v1 {
-        features.push("encryption-named-keys-v1");
-    }
-    if config.sql.delegated_caveats_enforced {
-        features.push("sql-delegated-caveats-v1");
-    }
     // TC-1423: Policy/v3 registrations are bound to the owner authority
     // (`-v1`), plus exactly one active expiry mode. Clients treat the node as
-    // enforcing only when `-enforce` is listed.
+    // enforcing only when `-enforce` is listed. Listed before the features
+    // gated by settings, which are appended last.
     if let Some(mode) = owner_authority {
         features.push("policy-owner-authority-v1");
         features.push(match mode {
             crate::config::OwnerAuthorityExpiry::Record => "policy-owner-authority-record",
             crate::config::OwnerAuthorityExpiry::Enforce => "policy-owner-authority-enforce",
         });
+    }
+    if config.encryption_network.named_keys_v1 {
+        features.push("encryption-named-keys-v1");
+    }
+    if config.sql.delegated_caveats_enforced {
+        features.push("sql-delegated-caveats-v1");
     }
     NodeInfo {
         protocol: tinycloud_auth::protocol::PROTOCOL_VERSION,
