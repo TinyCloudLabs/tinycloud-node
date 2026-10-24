@@ -2098,4 +2098,135 @@ mod tests {
             assert_eq!(UnknownReason::parse(reason.as_str()), Some(reason));
         }
     }
+
+    /// A stored registration over another owner's network: classifying it
+    /// needs no root rows.
+    fn foreign_registration() -> policy_v3_registration::Model {
+        use super::super::owner_authority_tests::Signer;
+        let space_owner = Signer::key();
+        let policy_owner = Signer::key();
+        stored_registration(
+            &policy_owner,
+            &content_in_space_of(space_owner.did()),
+            &format!("urn:tinycloud:encryption:{}:share", policy_owner.did()),
+            OffsetDateTime::now_utc() - Duration::hours(1),
+        )
+    }
+
+    /// Holds every background slot until dropped.
+    fn hold_every_slot(state: &Arc<OwnerAuthorityState>) -> Vec<InFlight> {
+        (0..MAX_BACKGROUND_CLASSIFICATIONS)
+            .map(|index| InFlight::claim(state, &format!("policy-held-{index}")).expect("a slot"))
+            .collect()
+    }
+
+    /// A policy with a final stored classification adds no query to the
+    /// request path once its row is loaded.
+    #[tokio::test]
+    async fn final_classifications_cost_the_request_path_nothing() {
+        let (runtime, queries) = counted_runtime().await;
+        let registration = foreign_registration();
+        insert_classification(
+            &runtime.conn,
+            &registration.policy_cid,
+            &Classification::foreign_network(),
+            RegisteredMode::Backfill,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
+        runtime.binding_for_use(&registration).await.unwrap();
+        let before = queries.load(Ordering::SeqCst);
+        for _ in 0..10 {
+            runtime.binding_for_use(&registration).await.unwrap();
+        }
+        assert_eq!(queries.load(Ordering::SeqCst), before);
+        assert_eq!(
+            runtime
+                .owner_authority
+                .classifications
+                .load(Ordering::SeqCst),
+            0,
+            "a stored final row is not classified again"
+        );
+    }
+
+    /// At most `MAX_BACKGROUND_CLASSIFICATIONS` background writes run at
+    /// once. A use that finds no free slot is still served and starts none;
+    /// once a slot is free, a use of another policy stores its result.
+    #[tokio::test]
+    async fn background_classifications_are_limited_without_backing_off() {
+        let (runtime, _) = counted_runtime().await;
+        let state = &runtime.owner_authority;
+        // Three background writes may run at once; a fourth finds no slot.
+        let held = (0..3)
+            .map(|index| {
+                InFlight::claim(state, &format!("policy-held-{index}")).expect("one of three slots")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            InFlight::claim(state, "policy-over-the-limit").is_none(),
+            "no slot beyond the third"
+        );
+        let busy = foreign_registration();
+        let binding = runtime.binding_for_use(&busy).await.unwrap();
+        assert_eq!(binding.reason, Some(UnknownReason::ForeignNetwork));
+        tokio::task::yield_now().await;
+        assert!(
+            policy_v3_owner_binding::Entity::find_by_id(busy.policy_cid.clone())
+                .one(&runtime.conn)
+                .await
+                .unwrap()
+                .is_none(),
+            "nothing is stored while every slot is held"
+        );
+        drop(held);
+        let free = foreign_registration();
+        runtime.binding_for_use(&free).await.unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let stored = policy_v3_owner_binding::Entity::find_by_id(free.policy_cid.clone())
+                .one(&runtime.conn)
+                .await
+                .unwrap();
+            if stored.is_some() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the background write did not run"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// A classification that is not final (here it could not be stored, as
+    /// every slot is held) is reused for the back-off window: later uses
+    /// compute nothing and query nothing.
+    #[tokio::test]
+    async fn non_final_classifications_back_off() {
+        let (runtime, queries) = counted_runtime().await;
+        let _held = hold_every_slot(&runtime.owner_authority);
+        let registration = foreign_registration();
+        runtime.binding_for_use(&registration).await.unwrap();
+        assert_eq!(
+            runtime
+                .owner_authority
+                .classifications
+                .load(Ordering::SeqCst),
+            1
+        );
+        let before = queries.load(Ordering::SeqCst);
+        for _ in 0..10 {
+            runtime.binding_for_use(&registration).await.unwrap();
+        }
+        assert_eq!(queries.load(Ordering::SeqCst), before);
+        assert_eq!(
+            runtime
+                .owner_authority
+                .classifications
+                .load(Ordering::SeqCst),
+            1
+        );
+    }
 }

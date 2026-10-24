@@ -260,7 +260,7 @@ authorization.
 | `root-authority` | nothing more |
 | `unknown` | denied (`403 policy-owner-authority-unknown`) |
 
-The mint no longer rescans the owner's delegations as of registration for
+The mint does not rescan the owner's delegations as of registration for
 policies with a recorded authority.
 
 What to check is cached in process once a classification is final (bounded);
@@ -273,8 +273,8 @@ Concurrent first uses of one policy share a single classification.
 A revocation takes effect on commit; a request already past the check may
 finish. Signed-KV tickets minted before a revocation last at most 60 seconds.
 
-Other codes: an expired root now gives `root-expired` (other non-live status
-remains `root-not-live`); S0 admission returns the owner-authority code itself;
+Other codes: an expired root gives `root-expired` (other non-live status
+gives `root-not-live`); S0 admission returns the owner-authority code itself;
 delivery keeps `delivery-authorization-invalid`. No code carries a CID or DID.
 `policy-owner-authority-expired` is not reached by stored rows: a `bound`
 root expires no later than its authority, and the root and session expiry
@@ -289,8 +289,8 @@ legacy_unknown_allow = false  # TINYCLOUD_POLICY_V3__LEGACY_UNKNOWN_ALLOW
 ```
 
 When true, legacy (`backfill`) policies classified `unknown` are served with
-the root-only checks (and the mint's registration-time rescan) instead of
-being denied. The node logs a warning at boot, and per policy at most once an
+the root-only checks (and the mint's registration-time rescan); when false they
+are denied. The node logs a warning at boot, and per policy at most once an
 hour when it serves one; uses are counted in
 `tinycloud_policy_owner_authority_unknown_allowed_total{reason}`. Denials are
 counted in `tinycloud_policy_owner_authority_denied_total{reason=revoked|expired|unknown}`.

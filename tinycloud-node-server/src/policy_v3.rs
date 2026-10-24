@@ -10544,6 +10544,22 @@ mod tests {
             // Revoking the delegation the policy owner held ends the policy:
             // the already-admitted session, new challenges and new sessions,
             // although the policy and its roots are untouched.
+            // A challenge issued before the revoke, to try the mint with after it.
+            let pre_revoke_challenge = client
+                .post("/policy/v3/challenges")
+                .header(ContentType::JSON)
+                .body(
+                    json!({
+                        "policyCid": policy_cid,
+                        "recipientDid": holder_did,
+                        "requestedCapabilities": requested,
+                    })
+                    .to_string(),
+                )
+                .dispatch()
+                .await;
+            assert_eq!(pre_revoke_challenge.status(), Status::Ok);
+            let fresh_challenge: Value = pre_revoke_challenge.into_json().await.unwrap();
             let mut capabilities = Capabilities::<Value>::new();
             capabilities.with_action(
                 format!("urn:cid:{owner_delegation_cid}").parse()?,
@@ -10630,6 +10646,52 @@ mod tests {
                 challenge_response.into_string().await.unwrap_or_default(),
                 "policy-owner-authority-revoked"
             );
+            // A mint with the challenge issued before the revoke is refused too.
+            let mut fresh = presentation.clone();
+            fresh["schema"] = json!(CREDENTIAL_PRESENTATION_V4_SCHEMA);
+            fresh["jti"] = json!("presentation-tc-597-after-owner-revoke");
+            fresh["challengeId"] = fresh_challenge["challengeId"].clone();
+            fresh["nonce"] = fresh_challenge["nonce"].clone();
+            fresh
+                .as_object_mut()
+                .unwrap()
+                .remove("credentialSpaceOwnerDid");
+            fresh["issuedAt"] = json!(format_time(OffsetDateTime::now_utc()));
+            fresh["expiresAt"] = json!(format_time(
+                OffsetDateTime::now_utc() + Duration::seconds(45)
+            ));
+            let mut unsigned_fresh = fresh.clone();
+            unsigned_fresh.as_object_mut().unwrap().remove("signature");
+            let mut fresh_preimage = CREDENTIAL_PRESENTATION_V4_DOMAIN.to_vec();
+            fresh_preimage.extend_from_slice(&canonical_json_value(&unsigned_fresh));
+            fresh["signature"]["value"] = json!(encode_config(
+                holder_key.sign(&Sha256::digest(fresh_preimage)),
+                URL_SAFE_NO_PAD
+            ));
+            let refused = client
+                .post("/policy/v3/delegations")
+                .header(ContentType::JSON)
+                .body(
+                    json!({
+                        "policyCid": policy_cid,
+                        "challengeId": fresh_challenge["challengeId"],
+                        "nonce": fresh_challenge["nonce"],
+                        "requirement": requirement,
+                        "credential": credential,
+                        "presentation": fresh,
+                    })
+                    .to_string(),
+                )
+                .dispatch()
+                .await;
+            let refused_status = refused.status();
+            let refused_body = refused.into_string().await.unwrap_or_default();
+            assert_eq!(
+                refused_status,
+                Status::Forbidden,
+                "mint after owner revoke: {refused_body}"
+            );
+            assert_eq!(refused_body, "policy-owner-authority-revoked");
             // Delivery checks the same authority: the retry that returned the
             // stored receipt above is now refused.
             let owner_revoked_delivery = make_invocation(

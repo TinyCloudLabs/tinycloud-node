@@ -1208,14 +1208,24 @@ impl Harness {
         Ok(())
     }
 
-    /// Use the policy (a challenge) and wait for its background
-    /// classification.
+    /// Use the policy (a challenge), wait for its background classification,
+    /// and check that the use was admitted when the policy has authority
+    /// (`bound`, `bound-uncapped`, `root-authority`: 200) and refused with
+    /// the fixed code when it has none (`unknown`: 403).
     pub async fn classify_on_use(&self, policy: &Registered) -> anyhow::Result<BindingRow> {
-        // The use may be refused once the classification gates it.
-        self.challenge(policy).await;
-        self.wait_for_binding(&policy.policy_cid, std::time::Duration::from_secs(20))
+        let (status, body) = self.challenge(policy).await;
+        let row = self
+            .wait_for_binding(&policy.policy_cid, std::time::Duration::from_secs(20))
             .await?
-            .ok_or_else(|| anyhow::anyhow!("not classified"))
+            .ok_or_else(|| anyhow::anyhow!("not classified"))?;
+        match row.state.as_str() {
+            "unknown" => anyhow::ensure!(
+                status == Status::Forbidden && body == "policy-owner-authority-unknown",
+                "challenge on an unknown policy: {status} {body}"
+            ),
+            _ => anyhow::ensure!(status == Status::Ok, "challenge: {status} {body}"),
+        }
+        Ok(row)
     }
 
     /// Wait until `policy_cid` is classified as `state`, or time out;
@@ -2776,7 +2786,7 @@ impl Harness {
     }
 }
 
-/// [1][4][8][11] Revoking the owner's grant ends already-admitted sessions:
+/// Revoking the owner's grant ends already-admitted sessions:
 /// read, decrypt, a re-shared child, challenge, mint, signed-KV mint and new
 /// re-share admission, with a fixed, opaque code.
 async fn revoking_the_owner_grant_ends_admitted_sessions(backend: Backend) -> anyhow::Result<()> {
@@ -2883,7 +2893,7 @@ async fn revoking_the_agent_session_ends_its_policies(backend: Backend) -> anyho
 }
 on_both_backends!(revoking_the_agent_session_ends_its_policies);
 
-/// [2] Revoking an ancestor of the recorded grant ends sessions too.
+/// Revoking an ancestor of the recorded grant ends sessions too.
 async fn revoking_an_ancestor_ends_admitted_sessions(backend: Backend) -> anyhow::Result<()> {
     let Some(h) = Harness::new(
         backend,
@@ -2919,7 +2929,7 @@ async fn revoking_an_ancestor_ends_admitted_sessions(backend: Backend) -> anyhow
 }
 on_both_backends!(revoking_an_ancestor_ends_admitted_sessions);
 
-/// [2] A revocation stored under an alias CID of a closure node counts.
+/// A revocation stored under an alias CID of a closure node counts.
 async fn a_revocation_under_an_alias_cid_ends_sessions(backend: Backend) -> anyhow::Result<()> {
     let Some(h) = Harness::new(
         backend,
@@ -2999,7 +3009,7 @@ async fn a_revocation_under_an_alias_cid_ends_sessions(backend: Backend) -> anyh
 }
 on_both_backends!(a_revocation_under_an_alias_cid_ends_sessions);
 
-/// [7] All-of: kv granted by one delegation and decrypt by another; revoking
+/// All-of: kv granted by one delegation and decrypt by another; revoking
 /// either ends the policy.
 async fn each_recorded_grant_is_required(backend: Backend) -> anyhow::Result<()> {
     for revoke_kv in [true, false] {
@@ -3035,7 +3045,7 @@ async fn each_recorded_grant_is_required(backend: Backend) -> anyhow::Result<()>
 }
 on_both_backends!(each_recorded_grant_is_required);
 
-/// [3] A root bound to its authority's expiry: once both pass, reads see the
+/// A root bound to its authority's expiry: once both pass, reads see the
 /// session expired and mints see the root expired.
 async fn expiry_codes_are_typed(backend: Backend) -> anyhow::Result<()> {
     let Some(h) = Harness::new(backend, Shape::KeySession, "expiry_codes_are_typed").await? else {
@@ -3060,7 +3070,7 @@ async fn expiry_codes_are_typed(backend: Backend) -> anyhow::Result<()> {
 }
 on_both_backends!(expiry_codes_are_typed);
 
-/// [O2][9] A legacy registration with no authority is denied; the operator
+/// A legacy registration with no authority is denied; the operator
 /// escape restores root-only checks and is counted.
 async fn legacy_registrations_without_authority_are_denied_unless_escaped(
     backend: Backend,
@@ -3120,7 +3130,7 @@ async fn legacy_registrations_without_authority_are_denied_unless_escaped(
 }
 on_both_backends!(legacy_registrations_without_authority_are_denied_unless_escaped);
 
-/// [9][F2] Legacy rows get liveness but no expiry cap: a legacy session
+/// Legacy rows get liveness but no expiry cap: a legacy session
 /// whose authority expired since registration still reads, and so does a
 /// legacy root longer than 31 days.
 async fn legacy_registrations_are_never_expiry_capped(backend: Backend) -> anyhow::Result<()> {
@@ -3169,7 +3179,7 @@ async fn legacy_registrations_are_never_expiry_capped(backend: Backend) -> anyho
 }
 on_both_backends!(legacy_registrations_are_never_expiry_capped);
 
-/// [O2] The escape covers legacy rows only: a post-cutover row without
+/// The escape covers legacy rows only: a post-cutover row without
 /// authority is denied with the flag on.
 async fn the_escape_never_serves_post_cutover_rows(backend: Backend) -> anyhow::Result<()> {
     let Some(mut h) = Harness::new(
@@ -3221,7 +3231,7 @@ async fn the_escape_never_serves_post_cutover_rows(backend: Backend) -> anyhow::
 }
 on_both_backends!(the_escape_never_serves_post_cutover_rows);
 
-/// [O2] An escaped legacy policy serves its admitted sessions, but a mint
+/// An escaped legacy policy serves its admitted sessions, but a mint
 /// still needs the owner to have held what the policy grants when it
 /// registered.
 async fn escaped_mints_still_check_the_owner_held_the_capability(
@@ -3266,7 +3276,7 @@ async fn escaped_mints_still_check_the_owner_held_the_capability(
 }
 on_both_backends!(escaped_mints_still_check_the_owner_held_the_capability);
 
-/// [8] An admitted session can't be imported again once its owner authority
+/// An admitted session can't be imported again once its owner authority
 /// is revoked.
 async fn admitted_sessions_are_not_reimported_after_a_revoke(
     backend: Backend,
@@ -3294,7 +3304,7 @@ async fn admitted_sessions_are_not_reimported_after_a_revoke(
 }
 on_both_backends!(admitted_sessions_are_not_reimported_after_a_revoke);
 
-/// [F3] Concurrent first uses of an unclassified policy share one
+/// Concurrent first uses of an unclassified policy share one
 /// classification.
 async fn concurrent_first_uses_share_one_classification(backend: Backend) -> anyhow::Result<()> {
     let Some(mut h) = Harness::with_boot(
@@ -3501,7 +3511,7 @@ async fn drain_stream(
         .map(Option::unwrap_or_default)
 }
 
-/// [8][C3] An open hook stream stops delivering after its grant is revoked:
+/// An open hook stream stops delivering after its grant is revoked:
 /// the next event after the re-check interval is withheld and the stream
 /// closes (with no idle re-check to close it otherwise); an idle stream
 /// closes on the idle re-check.
@@ -3563,7 +3573,7 @@ async fn hook_streams_close_after_their_grant_is_revoked(backend: Backend) -> an
 }
 on_both_backends!(hook_streams_close_after_their_grant_is_revoked);
 
-/// [C3] Re-check errors close a stream only after three in a row.
+/// Re-check errors close a stream only after three in a row.
 async fn hook_streams_close_after_repeated_check_errors(backend: Backend) -> anyhow::Result<()> {
     let Some(h) = Harness::with_boot(
         backend,
@@ -3599,7 +3609,7 @@ async fn hook_streams_close_after_repeated_check_errors(backend: Backend) -> any
 }
 on_both_backends!(hook_streams_close_after_repeated_check_errors);
 
-/// [C3] A ticket would carry more than 16 authority IDs: refused.
+/// A ticket would carry more than 16 authority IDs: refused.
 async fn hook_tickets_carry_at_most_16_authorities(backend: Backend) -> anyhow::Result<()> {
     let Some(h) = Harness::new(
         backend,
@@ -3619,7 +3629,7 @@ async fn hook_tickets_carry_at_most_16_authorities(backend: Backend) -> anyhow::
 }
 on_both_backends!(hook_tickets_carry_at_most_16_authorities);
 
-/// [F13] PostgreSQL latency gate for a policy read (the owner-authority
+/// PostgreSQL latency gate for a policy read (the owner-authority
 /// check adds one indexed revocation query per read). Ignored by default;
 /// run the same test on the baseline and candidate trees:
 ///
