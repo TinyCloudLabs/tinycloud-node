@@ -735,3 +735,82 @@ fn a_key_with_a_torsion_component_is_refused_though_it_is_not_a_weak_key() {
         &[0x42; 64]
     ));
 }
+
+#[test]
+fn a_non_canonical_cid_spelling_and_impossible_dates_are_refused_without_a_panic() {
+    let signer = owner();
+    let refuse_header = |edit: &dyn Fn(&mut Value)| {
+        let mut built = build(b"{}", &signer, FUTURE);
+        resigned(&mut built, &signer, |header| edit(header));
+        assert_eq!(open(&built).unwrap_err(), LinkRefusal::RecordShape);
+    };
+    // The last base32 character of a sha2-256 CID carries two bits that must
+    // be zero: the same bytes spelled with the next character are a second
+    // spelling of one CID.
+    let cid = raw_cid(&build(b"{}", &signer, FUTURE).sealed);
+    let (head, last) = cid.split_at(cid.len() - 1);
+    let alphabet = "abcdefghijklmnopqrstuvwxyz234567";
+    let index = alphabet.find(last).unwrap();
+    assert_eq!(
+        index % 4,
+        0,
+        "the canonical last character has zero low bits"
+    );
+    let second_spelling = format!("{head}{}", &alphabet[index + 1..index + 2]);
+    refuse_header(&|header| header["bodyCid"] = json!(second_spelling));
+
+    for (field, date) in [
+        ("issuedAt", "2026-13-24T12:00:00.000Z"),
+        ("expiresAt", "2026-13-24T12:10:00.000Z"),
+        ("issuedAt", "2026-02-30T12:00:00.000Z"),
+        ("expiresAt", "2026-02-30T12:10:00.000Z"),
+        ("expiresAt", "2026-10-24T24:00:00.000Z"),
+        ("expiresAt", "2026-10-24T12:60:00.000Z"),
+        ("expiresAt", "0000-00-00T00:00:00.000Z"),
+        ("expiresAt", "9999-12-31T23:59:59.999Z-"),
+    ] {
+        refuse_header(&|header| header[field] = json!(date));
+    }
+}
+
+#[test]
+fn a_proto_key_or_any_extra_key_makes_the_header_a_refused_shape() {
+    let signer = owner();
+    let built = build(b"{}", &signer, FUTURE);
+    let signature = sign_header(&built.header, &signer);
+    // Raw JSON text, as a JavaScript `JSON.parse` would see it: `__proto__`
+    // is an ordinary own key here.
+    let canonical = |value: &Value| {
+        String::from_utf8(tinycloud_core::policy_capability::jcs::canonicalize(value)).unwrap()
+    };
+    let header = canonical(&built.header);
+    let signature_object = canonical(&json!({"algorithm": "Ed25519", "value": signature}));
+    let with = |header_text: &str, signature_text: &str, outer: &str| {
+        let text = format!(r#"{{{outer}"header":{header_text},"signature":{signature_text}}}"#);
+        FetchedLink {
+            record_header: b64(text.as_bytes()),
+            body: built.fetched.body.clone(),
+        }
+    };
+    let link = ShortLink::parse(&built.href, ORIGIN).unwrap();
+    let now = at("2026-10-24T12:00:00.000Z");
+    // The unmodified text opens, so each refusal below is the extra key.
+    assert!(open_link_record(&link, &with(&header, &signature_object, ""), now).is_ok());
+    let proto_header = header.replacen('{', r#"{"__proto__":{"x":1},"#, 1);
+    let proto_signature = signature_object.replacen('{', r#"{"__proto__":{"x":1},"#, 1);
+    for fetched in [
+        with(&proto_header, &signature_object, ""),
+        with(&header, &proto_signature, ""),
+        with(&header, &signature_object, r#""__proto__":{"x":1},"#),
+        with(
+            &header.replacen('{', r#"{"extra":1,"#, 1),
+            &signature_object,
+            "",
+        ),
+    ] {
+        assert_eq!(
+            open_link_record(&link, &fetched, now).unwrap_err(),
+            LinkRefusal::RecordShape
+        );
+    }
+}
