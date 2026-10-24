@@ -77,7 +77,7 @@ impl StorageSetup for S3BlockStore {
     }
 }
 
-async fn new_client(config: &S3BlockConfig) -> Client {
+pub(crate) async fn new_client(config: &S3BlockConfig) -> Client {
     let general_config = aws_config().await;
     // Checksums only when an operation requires them: the SDK 1.x defaults
     // (CRC32 trailers, aws-chunked uploads, checksum-mode GETs) are rejected
@@ -104,6 +104,9 @@ impl S3BlockStore {
         let mut pages = client
             .list_objects_v2()
             .bucket(&config.bucket)
+            // Every KV object key is `{space}/{hash}` and a space id string
+            // starts with `tinycloud:`; only such keys count towards a space.
+            .prefix("tinycloud:")
             .into_paginator()
             .send();
         // get the sum of all objects per space across all pages
