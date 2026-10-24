@@ -1,7 +1,7 @@
 name: personal-node
 services:
   node:
-    image: ${NODE_IMAGE:-ghcr.io/tinycloudlabs/tinycloud-node@sha256:41667d3d133aaa12290a2f3a744afacd838988327552d159c60f04466e66f86f}
+    image: ${NODE_IMAGE:-ghcr.io/tinycloudlabs/tinycloud-node@sha256:2f3c65d85aa94610456bf09cd54713bab5260097bb3d56858025bc6eadb5a4a0}
     restart: unless-stopped
     env_file:
       - ${NODE_KEY_ENV_FILE:?Set the private node key file}
@@ -10,8 +10,9 @@ services:
       ROCKET_ADDRESS: 0.0.0.0
     volumes:
       - ${NODE_DATA_DIR:?Set the node data directory}:/data
-      # 1.20.6 still embeds a sample key in its default TOML. This clean
-      # config masks the image copy, even when the operator key is absent.
+      # This config replaces the one bundled in the image and fails closed
+      # when the operator key is absent. The upgrade rehearsal starts from
+      # the 1.20.6 image; CI runs the bare image check on 1.22.0.
       - ./tinycloud.toml:/tinycloud.toml:ro
     security_opt:
       - no-new-privileges:true
