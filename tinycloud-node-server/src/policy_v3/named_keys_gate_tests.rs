@@ -368,11 +368,24 @@ async fn startup_refuses_a_non_deletable_key_row_under_apps(
             .contains("1 key rows under apps/ are not deletable keys"),
         "{error}"
     );
-    // The same with the named-keys setting on.
-    assert!(h
-        .boot_again(|config| config.encryption_network.named_keys_v1 = true)
-        .await
-        .is_err());
+    // The same with the named-keys setting on (and a ledger path, which that
+    // setting requires).
+    let ledger_dir = tempfile::tempdir()?;
+    let ledger_path = ledger_dir.path().join("deletion-ledger.jsonl");
+    let named_keys = |config: &mut crate::config::Config| {
+        config.encryption_network.named_keys_v1 = true;
+        config.encryption_network.deletion_ledger_path = Some(ledger_path.clone());
+    };
+    assert!(h.boot_again(named_keys).await.is_err());
+    let Err(error) = h.boot_again(named_keys).await else {
+        panic!("a stray row under apps/ stops the start with named keys on");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("1 key rows under apps/ are not deletable keys"),
+        "{error}"
+    );
 
     row.delete(&db).await?;
     h.boot_again(|_| {})
@@ -710,11 +723,16 @@ async fn a_ledger_that_cannot_be_opened_turns_the_key_routes_off() -> anyhow::Re
 /// scheme is not `https` even when its domain is bound to the app id, and
 /// admits it when the scheme is `https` (any case) or absent.
 async fn siwe_app_grants_need_an_https_or_absent_scheme(backend: Backend) -> anyhow::Result<()> {
+    let ledger_dir = tempfile::tempdir()?;
     let Some(h) = Harness::new_with(
         backend,
         Shape::PkhSession,
         "siwe_app_grants_need_an_https_or_absent_scheme",
-        |config| config.encryption_network.named_keys_v1 = true,
+        |config| {
+            config.encryption_network.named_keys_v1 = true;
+            config.encryption_network.deletion_ledger_path =
+                Some(ledger_dir.path().join("deletion-ledger.jsonl"));
+        },
     )
     .await?
     else {
