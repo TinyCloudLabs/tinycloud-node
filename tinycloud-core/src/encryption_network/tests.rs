@@ -1865,9 +1865,10 @@ async fn rows_that_cannot_be_read_as_keys_are_corrupt() {
     // A deletable row that is not deleted and has no seed.
     svc.create_key(&key_loc("apps/foo/x"), true).await.unwrap();
     force_row(&db, "apps/foo/x", "active", None).await;
-    // A deletable row whose seed is zeroed (not a sealed value).
+    // A deletable row whose seed is 32 zero bytes, not a sealed value: the
+    // lenient unseal would return it unchanged as an all-zero seed.
     svc.create_key(&key_loc("apps/foo/y"), true).await.unwrap();
-    force_row(&db, "apps/foo/y", "active", Some(vec![0u8; 61])).await;
+    force_row(&db, "apps/foo/y", "active", Some(vec![0u8; 32])).await;
     // A deterministic row under apps/, and a deletable row outside it.
     insert_raw_row(&db, "apps/foo/z", "deterministic", None).await;
     insert_raw_row(&db, "docs/seeded", "deletable", Some(vec![1u8; 61])).await;
@@ -2083,4 +2084,23 @@ async fn postgres_block_and_unblock_take_and_release_the_network_row_lock() {
     }))
     .await;
     assert!(results.iter().all(|r| r.is_ok()));
+}
+
+#[tokio::test]
+async fn per_app_prefix_cap_ignores_keys_of_an_app_id_that_extends_it() {
+    let svc = make_service(fresh_db().await).with_key_cap_per_app_prefix(2);
+    create_network(&svc).await;
+    svc.create_key(&key_loc("apps/ab/x"), true).await.unwrap();
+    svc.create_key(&key_loc("apps/ab/y"), true).await.unwrap();
+    svc.create_key(&key_loc("apps/ab.c/x"), true).await.unwrap();
+    svc.create_key(&key_loc("apps/a/x"), true).await.unwrap();
+    svc.create_key(&key_loc("apps/a/y"), true).await.unwrap();
+    let err = svc
+        .create_key(&key_loc("apps/a/z"), true)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, EncryptionServiceError::KeyLimitExceeded),
+        "{err:?}"
+    );
 }
