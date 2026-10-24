@@ -326,7 +326,7 @@ pub(super) fn valid_segment(segment: &str) -> bool {
 
 /// Malformed key identifiers that the grammar must refuse.
 #[cfg(test)]
-pub(crate) const MALFORMED_KEY_IDS: [&str; 21] = [
+pub(crate) const MALFORMED_KEY_IDS: [&str; 28] = [
     "urn:tinycloud:encryption:did:pkh:eip155:1:0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed:default/apps/x//",
     "urn:tinycloud:encryption:did:pkh:eip155:1:0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed:default/apps//x",
     "urn:tinycloud:encryption:did:pkh:eip155:1:0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed:default//apps",
@@ -348,6 +348,13 @@ pub(crate) const MALFORMED_KEY_IDS: [&str; 21] = [
     "urn:tinycloud:encryption:did:pkh:eip155:1:0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed:default/apps/foo",
     "urn:tinycloud:encryption:did:pkh:eip155:1:0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed:.a/apps/x",
     "urn:tinycloud:encryption:did:pkh:eip155:1:0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/apps/x",
+    "urn:tinycloud:encryption:did:pkh:eip155:1:0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed:default/apps/x/a%2Fb",
+    "urn:tinycloud:encryption:did:pkh:eip155:1:0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed:default/apps/x/a:b",
+    "urn:tinycloud:encryption:did:pkh:eip155:1:0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed:default/apps/x/a b",
+    "urn:tinycloud:encryption:did:pkh:eip155:1:0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed:default/apps/x/café",
+    "urn:tinycloud:encryption:did:pkh:eip155:1:0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed:-default/apps/x/n",
+    "urn:tinycloud:encryption:did:pkh:eip155:1:0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed:.a/apps/x/n",
+    "urn:tinycloud:encryption:did:pkh:eip155:1:0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/apps/x/n",
 ];
 
 #[cfg(test)]
@@ -778,5 +785,34 @@ mod tests {
         for id in MALFORMED_KEY_IDS {
             assert!(parse(id).is_err(), "accepted: {id}");
         }
+    }
+
+    #[test]
+    fn app_keys_and_networks_never_cover_each_other() {
+        let p = |tail: &str| parse(&uri(tail)).unwrap();
+        assert!(!p("default").extends(&p("default/apps/foo/x")));
+        assert!(!p("default").extends(&p("default/apps/foo/")));
+        assert!(!p("default/apps/foo/x").extends(&p("default")));
+        assert!(!p("default/apps/foo/").extends(&p("default")));
+        assert!(p("default/apps/foo/x").extends(&p("default/apps/foo/x")));
+        assert!(!p("default/apps/foo/x").extends(&p("default/apps/foo/y")));
+    }
+
+    #[test]
+    fn an_app_prefix_does_not_cover_another_owner_or_network() {
+        let other_owner = parse(
+            "urn:tinycloud:encryption:did:key:z6MkjHi79SMX4doJyo2w7jDTM6Fa7iX6EVZWXNbJ6RzBm3Wi:default/apps/foo/x",
+        )
+        .unwrap();
+        let granted = parse(&uri("default/apps/foo/")).unwrap();
+        assert!(!granted.extends(&other_owner));
+        assert!(!granted.extends(&parse(&uri("other/apps/foo/x")).unwrap()));
+        assert!(!granted.extends(&parse(&uri("other/apps/foo/")).unwrap()));
+        assert!(owned_by(&uri("default/apps/foo/x"), OWNER));
+        assert!(owned_by(&uri("default/apps/foo/"), OWNER));
+        assert!(!owned_by(
+            &uri("default/apps/foo/x"),
+            "did:key:z6MkjHi79SMX4doJyo2w7jDTM6Fa7iX6EVZWXNbJ6RzBm3Wi"
+        ));
     }
 }
