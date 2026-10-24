@@ -448,7 +448,7 @@ impl Harness {
         };
         harness.seed_content().await?;
         // Registration requires the content owner's network to exist and be
-        // active (TC-1423 N1b), so the harness creates the network its
+        // active (TC-1423), so the harness creates the network its
         // policies name.
         harness
             .client

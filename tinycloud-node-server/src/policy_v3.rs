@@ -4689,7 +4689,7 @@ impl SourceNetworkRefusal {
     }
 }
 
-/// TC-1423 N1b: the encryption networks a policy names (the content source's
+/// TC-1423: the encryption networks a policy names (the content source's
 /// and every `encryption` ceiling entry), when every one parses and belongs to
 /// the owner of the content source's space, and every `kv` ceiling entry
 /// names a space of that owner; otherwise why not. Pure, so it applies to
@@ -8671,7 +8671,7 @@ mod tests {
         Box::pin(run_policy_v2_flow(PolicyOwner::Unauthorized)).await
     }
 
-    /// TC-1423 (N1b): a policy owner that holds only `kv/get` and
+    /// TC-1423: a policy owner that holds only `kv/get` and
     /// `kv/metadata` on the content (no decrypt on the content owner's
     /// network) registers a policy whose content source names a network
     /// called after the policy owner itself. Registration refuses it: the
@@ -8681,7 +8681,7 @@ mod tests {
         Box::pin(run_policy_v2_flow(PolicyOwner::KvOnlySelfNamedNetwork)).await
     }
 
-    /// TC-1423 (N1b): the same kv-only policy owner moves the content source
+    /// TC-1423: the same kv-only policy owner moves the content source
     /// to its own space, on a network it created, and adds a second kv
     /// ceiling entry on the space owner's content. Every kv entry must name
     /// a space of the content source's owner, so registration refuses it.
@@ -9180,7 +9180,7 @@ mod tests {
             encryption_backend,
         );
         // Registration requires the source network to exist on this node and
-        // to be the content owner's (TC-1423 N1b). The self-named network of
+        // to be the content owner's (TC-1423). The self-named network of
         // `KvOnlySelfNamedNetwork` is deliberately never created.
         encryption
             .create_one_of_one_network(tinycloud_core::encryption_network::CreateNetworkRequest {
