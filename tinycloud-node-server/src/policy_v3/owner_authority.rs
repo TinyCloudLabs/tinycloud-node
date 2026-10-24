@@ -22,6 +22,7 @@
 //!   outlives the policy root wins, else the newest.
 
 use super::*;
+use crate::config::OwnerAuthorityExpiry;
 use std::collections::HashMap;
 use std::future::Future;
 use tinycloud_core::{
@@ -103,6 +104,12 @@ pub enum UnknownReason {
     /// No candidate satisfied the capability within the examined windows,
     /// and more delegations to the owner exist than were examined.
     Starved,
+    /// Registered after the legacy cutover without a classification, and
+    /// its root breaks the registration-time lifetime cap.
+    LifetimeExceeded,
+    /// Registered after the legacy cutover without a classification, and
+    /// under `enforce` its root outlives the recorded authority.
+    OutlivesAuthority,
     /// The stored policy names a network or kv space that does not belong to
     /// the owner of its content source (the registration-time source-network
     /// check, applied to a registration made before that check).
@@ -115,6 +122,8 @@ impl UnknownReason {
             Self::Revoked => "revoked",
             Self::Missing => "missing",
             Self::Starved => "starved",
+            Self::LifetimeExceeded => "lifetime-exceeded",
+            Self::OutlivesAuthority => "outlives-authority",
             Self::ForeignNetwork => "foreign_network",
         }
     }
@@ -124,6 +133,8 @@ impl UnknownReason {
             "revoked" => Self::Revoked,
             "missing" => Self::Missing,
             "starved" => Self::Starved,
+            "lifetime-exceeded" => Self::LifetimeExceeded,
+            "outlives-authority" => Self::OutlivesAuthority,
             "foreign_network" => Self::ForeignNetwork,
             _ => return None,
         })
@@ -135,15 +146,26 @@ pub enum RegisteredMode {
     /// Classified at registration, without refusing roots that outlive
     /// their authority.
     Record,
+    /// Classified at registration, refusing roots that outlive their
+    /// authority.
+    Enforce,
     /// Classified after registration, for a policy registered before the
     /// legacy cutover.
     Backfill,
 }
 
 impl RegisteredMode {
+    pub(super) fn current(expiry: OwnerAuthorityExpiry) -> Self {
+        match expiry {
+            OwnerAuthorityExpiry::Record => Self::Record,
+            OwnerAuthorityExpiry::Enforce => Self::Enforce,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Record => "record",
+            Self::Enforce => "enforce",
             Self::Backfill => "backfill",
         }
     }
@@ -219,6 +241,10 @@ impl Classification {
         }
     }
 
+    fn unknown(reason: UnknownReason) -> Self {
+        Self::from_selection(Err(reason), OffsetDateTime::UNIX_EPOCH)
+    }
+
     fn from_row(row: &policy_v3_owner_binding::Model) -> Result<Self, &'static str> {
         Ok(Self {
             state: BindingState::parse(&row.state).ok_or("policy-owner-binding-invalid")?,
@@ -241,6 +267,41 @@ impl Classification {
 /// The selection failed for a reason other than missing authority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct SelectionUnavailable;
+
+/// Longest a policy root may live past its registration, and the clock skew
+/// allowed on top.
+const MAX_ROOT_LIFETIME: Duration = Duration::days(31);
+const ROOT_LIFETIME_SKEW: Duration = Duration::minutes(5);
+
+/// The registration-time root-lifetime cap: `exp <= registered_at + 31 d
+/// (+5 min)` and `nbf <= exp`. `nbf` is signer-chosen, so it doesn't anchor
+/// the cap.
+pub(super) fn root_lifetime_allowed(
+    registered_at: OffsetDateTime,
+    not_before: OffsetDateTime,
+    expiry: OffsetDateTime,
+) -> bool {
+    not_before <= expiry && expiry <= registered_at + MAX_ROOT_LIFETIME + ROOT_LIFETIME_SKEW
+}
+
+/// The `authority_ttl_bucket` of a root that outlives its authority, by
+/// how long the authority had left at registration: `le_1h` (released
+/// Share, signed by a login session), `le_30d` (CLI device sessions) or
+/// `gt_30d`. Only `bound-uncapped` roots are bucketed, and their authority
+/// always expires.
+pub(super) fn authority_ttl_bucket(
+    registered_at: OffsetDateTime,
+    authority_expires_at: OffsetDateTime,
+) -> &'static str {
+    let remaining = authority_expires_at - registered_at;
+    if remaining <= Duration::hours(1) {
+        "le_1h"
+    } else if remaining <= Duration::days(30) {
+        "le_30d"
+    } else {
+        "gt_30d"
+    }
+}
 
 fn min_expiry(closure: &[ClosureNode]) -> Option<OffsetDateTime> {
     closure.iter().filter_map(|node| node.expiry).min()
@@ -634,6 +695,7 @@ impl CutoverSource {
 #[derive(Default)]
 pub(super) struct OwnerAuthorityState {
     configured_cutover: Option<OffsetDateTime>,
+    expiry: OwnerAuthorityExpiry,
     migration_cutover: tokio::sync::OnceCell<OffsetDateTime>,
     /// Policies whose stored classification is final.
     final_policies: std::sync::Mutex<HashMap<String, BindingState>>,
@@ -768,9 +830,16 @@ impl PolicyV3Runtime {
     pub fn with_policy_config(mut self, config: &crate::config::PolicyV3Config) -> Self {
         self.owner_authority = Arc::new(OwnerAuthorityState {
             configured_cutover: config.legacy_cutover(),
+            expiry: config.owner_authority_expiry,
             ..OwnerAuthorityState::default()
         });
         self
+    }
+
+    /// Whether roots may outlive their authority (`record`) or not
+    /// (`enforce`).
+    pub fn owner_authority_expiry(&self) -> OwnerAuthorityExpiry {
+        self.owner_authority.expiry
     }
 
     /// Registrations before this instant are legacy: the configured cutover,
@@ -812,6 +881,7 @@ impl PolicyV3Runtime {
                     event = "policy_owner_authority",
                     legacy_cutover = %format_time(cutover),
                     source = CutoverSource::Migration.as_str(),
+                    owner_authority_expiry = self.owner_authority_expiry().as_str(),
                     "policy owner-authority legacy cutover is the binding migration's applied-at time, less than a day ago; after a rollback and re-upgrade, set policy_v3.legacy_cutover to the first deploy time"
                 )
             }
@@ -819,10 +889,12 @@ impl PolicyV3Runtime {
                 event = "policy_owner_authority",
                 legacy_cutover = %format_time(cutover),
                 source = source.as_str(),
+                owner_authority_expiry = self.owner_authority_expiry().as_str(),
                 "policy owner-authority legacy cutover"
             ),
             Err(_) => ::tracing::warn!(
                 event = "policy_owner_authority",
+                owner_authority_expiry = self.owner_authority_expiry().as_str(),
                 "policy owner-authority legacy cutover is unavailable; legacy policies are classified when it can be read"
             ),
         }
@@ -855,6 +927,14 @@ impl PolicyV3Runtime {
             .await
         {
             LazyWrite::Written => {
+                crate::prometheus::observe_policy_owner_binding_backfill(
+                    match classification.state {
+                        BindingState::Bound => "bound",
+                        BindingState::BoundUncapped => "bound_uncapped",
+                        BindingState::RootAuthority => "root_authority",
+                        BindingState::Unknown => "unknown",
+                    },
+                );
                 let classification = Classification {
                     persisted: true,
                     ..classification
@@ -871,7 +951,10 @@ impl PolicyV3Runtime {
                     .remember_final(&registration.policy_cid, classification.state);
                 Ok(classification)
             }
-            LazyWrite::Failed => Ok(classification),
+            LazyWrite::Failed => {
+                crate::prometheus::observe_policy_owner_binding_backfill("write_failed_served");
+                Ok(classification)
+            }
         }
     }
 
@@ -916,8 +999,9 @@ impl PolicyV3Runtime {
             RegisteredMode::Backfill
         } else {
             // Registered without a binding after the cutover: by a binary
-            // that predates it (a rollback window or a mixed deploy).
-            RegisteredMode::Record
+            // that predates it (a rollback window or a mixed deploy). The
+            // current mode's registration rules apply.
+            RegisteredMode::current(self.owner_authority_expiry())
         };
         // A registration made before the source-network check is held to the
         // same predicate: a policy over a network or kv space that is not its
@@ -937,9 +1021,17 @@ impl PolicyV3Runtime {
         )
         .map_err(|_| "policy-root-invalid")?;
         let root_expiry = root.0.expiry.ok_or("policy-root-expiry-missing")?;
+        let root_not_before = root.0.not_before.ok_or("policy-root-invalid")?;
+        let lifetime_allowed = root_lifetime_allowed(registered_at, root_not_before, root_expiry);
+        if mode != RegisteredMode::Backfill && !lifetime_allowed {
+            return Ok((
+                Classification::unknown(UnknownReason::LifetimeExceeded),
+                mode,
+            ));
+        }
         // As the mint check always has: the authority the owner held when
         // it registered, revoked as of now.
-        let classification = classify(
+        let mut classification = classify(
             &self.conn,
             &registration.owner_did,
             &root.0.capabilities,
@@ -949,6 +1041,16 @@ impl PolicyV3Runtime {
         )
         .await
         .map_err(|_| "policy-owner-authority-unavailable")?;
+        match mode {
+            // Legacy roots longer than the cap are counted, never refused.
+            RegisteredMode::Backfill if !lifetime_allowed => {
+                crate::prometheus::observe_policy_legacy_root_lifetime_exceeded();
+            }
+            RegisteredMode::Enforce if classification.state == BindingState::BoundUncapped => {
+                classification = Classification::unknown(UnknownReason::OutlivesAuthority);
+            }
+            _ => {}
+        }
         Ok((classification, mode))
     }
 
@@ -1452,6 +1554,47 @@ mod tests {
         assert_eq!(queries.load(Ordering::SeqCst), before);
     }
 
+    /// The cap is exact: registration + 31 days + 5 minutes is accepted, one
+    /// second more is refused; `nbf` may equal `exp` but not pass it.
+    #[test]
+    fn root_lifetime_cap_boundaries_are_exact() {
+        let registered_at = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let cap = registered_at + Duration::days(31) + Duration::minutes(5);
+        assert!(root_lifetime_allowed(registered_at, registered_at, cap));
+        assert!(!root_lifetime_allowed(
+            registered_at,
+            registered_at,
+            cap + Duration::seconds(1)
+        ));
+        assert!(root_lifetime_allowed(registered_at, cap, cap));
+        assert!(!root_lifetime_allowed(
+            registered_at,
+            cap,
+            cap - Duration::seconds(1)
+        ));
+    }
+
+    /// The flip signal's buckets: exactly one hour left is `le_1h`, one
+    /// second more `le_30d`; exactly 30 days `le_30d`, one second more
+    /// `gt_30d`.
+    #[test]
+    fn authority_ttl_bucket_edges_are_exact() {
+        let at = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        for (remaining, bucket) in [
+            (Duration::seconds(90), "le_1h"),
+            (Duration::hours(1), "le_1h"),
+            (Duration::hours(1) + Duration::seconds(1), "le_30d"),
+            (Duration::days(30), "le_30d"),
+            (Duration::days(30) + Duration::seconds(1), "gt_30d"),
+        ] {
+            assert_eq!(
+                authority_ttl_bucket(at, at + remaining),
+                bucket,
+                "{remaining}"
+            );
+        }
+    }
+
     /// A stored registration over a signed policy that names `network` as its
     /// source, as a registration made before the source-network check could
     /// have been stored.
@@ -1588,6 +1731,8 @@ mod tests {
             UnknownReason::Missing,
             UnknownReason::Starved,
             UnknownReason::ForeignNetwork,
+            UnknownReason::LifetimeExceeded,
+            UnknownReason::OutlivesAuthority,
         ] {
             assert_eq!(UnknownReason::parse(reason.as_str()), Some(reason));
         }
