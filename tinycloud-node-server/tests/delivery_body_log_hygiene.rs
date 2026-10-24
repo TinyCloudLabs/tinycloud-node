@@ -101,6 +101,16 @@ async fn the_delivery_guard_never_logs_the_body() {
             Status::UnprocessableEntity,
         ),
         (
+            "duplicate field, another value",
+            body(r#","jti":"BBBBBBBBBBBBBBBBBBBBBB""#),
+            Status::UnprocessableEntity,
+        ),
+        (
+            "duplicate field, the same value",
+            body(r#","documentName":"d""#),
+            Status::UnprocessableEntity,
+        ),
+        (
             "removed fields",
             body(r#","envelope":{},"sealedEnvelope":"AAAA","shareCid":"c""#),
             Status::UnprocessableEntity,
@@ -116,6 +126,11 @@ async fn the_delivery_guard_never_logs_the_body() {
             Status::UnprocessableEntity,
         ),
         ("not json", format!("{{{KEY} not json"), Status::BadRequest),
+        (
+            "byte order mark before an otherwise valid body",
+            format!("\u{feff}{}", body("")),
+            Status::BadRequest,
+        ),
         ("truncated", body("")[..80].to_owned(), Status::BadRequest),
         (
             "over the limit",

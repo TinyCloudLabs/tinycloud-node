@@ -247,9 +247,16 @@ impl RecordHeader {
             return Err(shape);
         }
         let bytes = decode_strict(value).ok_or(shape)?;
-        let Value::Object(mut record) =
-            serde_json::from_slice::<Value>(&bytes).map_err(|_| shape)?
-        else {
+        let parsed = serde_json::from_slice::<Value>(&bytes).map_err(|_| shape)?;
+        // The record text is the JCS of the record (contract section 2.2,
+        // rule (d)). A duplicate key at any depth (the parse keeps one),
+        // extra whitespace, another key order or another spelling of a
+        // character gives a text that is not the JCS of the value it parsed
+        // to.
+        if tinycloud_core::policy_capability::jcs::canonicalize(&parsed) != bytes {
+            return Err(shape);
+        }
+        let Value::Object(mut record) = parsed else {
             return Err(shape);
         };
         let signature = record.remove("signature");

@@ -814,3 +814,190 @@ fn a_proto_key_or_any_extra_key_makes_the_header_a_refused_shape() {
         );
     }
 }
+
+/// The record text must be the JCS of its own parsed value (contract section
+/// 2.2 rule (d)): a duplicate key at any depth, whitespace, another key order
+/// or another spelling of a character is a refused shape, though the parsed
+/// value (and so the signature check) would be the same.
+#[test]
+fn a_record_text_that_is_not_the_jcs_of_its_own_parsed_value_is_a_refused_shape() {
+    let signer = owner();
+    let built = build(b"{}", &signer, FUTURE);
+    let signature = sign_header(&built.header, &signer);
+    let canonical = |value: &Value| {
+        String::from_utf8(tinycloud_core::policy_capability::jcs::canonicalize(value)).unwrap()
+    };
+    let header = canonical(&built.header);
+    let signature_object = canonical(&json!({"algorithm": "Ed25519", "value": signature}));
+    let size = built.sealed.len();
+    let link = ShortLink::parse(&built.href, ORIGIN).unwrap();
+    let now = at("2026-10-24T12:00:00.000Z");
+    let outcome = |text: &str| {
+        open_link_record(
+            &link,
+            &FetchedLink {
+                record_header: b64(text.as_bytes()),
+                body: built.fetched.body.clone(),
+            },
+            now,
+        )
+    };
+    let assemble =
+        |header: &str, signature: &str| format!(r#"{{"header":{header},"signature":{signature}}}"#);
+
+    // The canonical text opens, and it is what the record builder writes.
+    assert_eq!(assemble(&header, &signature_object), {
+        String::from_utf8(decode_config(&built.fetched.record_header, URL_SAFE_NO_PAD).unwrap())
+            .unwrap()
+    });
+    assert!(outcome(&assemble(&header, &signature_object)).is_ok());
+
+    let wrong_size = size + 1;
+    let size_member = format!(r#""size":{size},"#);
+    assert!(header.contains(&size_member));
+    let in_header = |replacement: String| header.replacen(&size_member, &replacement, 1);
+    let wrong_value = "A".repeat(86);
+    let algorithm = r#""algorithm":"Ed25519","#;
+    let value_member = format!(r#""value":"{signature}""#);
+    assert!(signature_object.contains(&value_member));
+    let in_signature =
+        |replacement: String| signature_object.replacen(&value_member, &replacement, 1);
+
+    // `version` is the last key of the header's JCS: write it first.
+    let version_first = {
+        let rest = header.strip_suffix(r#","version":1}"#).unwrap();
+        format!(r#"{{"version":1,{}}}"#, rest.strip_prefix('{').unwrap())
+    };
+    let texts = [
+        // A duplicate `size`: the last one is the signed value, or the first.
+        assemble(
+            &in_header(format!(r#""size":{wrong_size},{size_member}"#)),
+            &signature_object,
+        ),
+        assemble(
+            &in_header(format!(r#"{size_member}"size":{wrong_size},"#)),
+            &signature_object,
+        ),
+        // The same value twice, and a duplicate of any other header field.
+        assemble(
+            &in_header(format!("{size_member}{size_member}")),
+            &signature_object,
+        ),
+        assemble(
+            &header.replacen(r#""type":"share","#, r#""type":"share","type":"share","#, 1),
+            &signature_object,
+        ),
+        // A duplicate inside the signature object: the value, and the algorithm.
+        assemble(
+            &header,
+            &in_signature(format!(r#""value":"{wrong_value}",{value_member}"#)),
+        ),
+        assemble(
+            &header,
+            &in_signature(format!(r#"{value_member},"value":"{wrong_value}""#)),
+        ),
+        assemble(
+            &header,
+            &signature_object.replacen(algorithm, &format!("{algorithm}{algorithm}"), 1),
+        ),
+        // A duplicate at the top of the record.
+        format!(r#"{{"header":{header},"header":{header},"signature":{signature_object}}}"#),
+        format!(r#"{{"header":{header},"signature":{signature_object},"header":{header}}}"#),
+        format!(
+            r#"{{"header":{header},"signature":{signature_object},"signature":{signature_object}}}"#
+        ),
+        // Whitespace anywhere, including around the text.
+        format!(r#"{{"header": {header},"signature":{signature_object}}}"#),
+        format!(r#"{{"header":{header}, "signature":{signature_object}}}"#),
+        format!(" {}", assemble(&header, &signature_object)),
+        format!("{}\n", assemble(&header, &signature_object)),
+        assemble(
+            &header.replacen(r#""size""#, r#""size" "#, 1),
+            &signature_object,
+        ),
+        // Another key order: the record, the header, the signature object.
+        format!(r#"{{"signature":{signature_object},"header":{header}}}"#),
+        assemble(&version_first, &signature_object),
+        assemble(
+            &header,
+            &format!(r#"{{{value_member},"algorithm":"Ed25519"}}"#),
+        ),
+        // Another spelling of a character the parser reads the same way.
+        assemble(
+            &header.replacen(r#""type":"share""#, r#""type":"shar\u0065""#, 1),
+            &signature_object,
+        ),
+        assemble(
+            &header.replacen(r#""type""#, r#""t\u0079pe""#, 1),
+            &signature_object,
+        ),
+        assemble(
+            &header.replacen("https://", r"https:\/\/", 1),
+            &signature_object,
+        ),
+    ];
+    for (index, text) in texts.iter().enumerate() {
+        // Every one of these parses to a header whose signature verifies
+        // except where the parsed value itself changed; the refusal is the
+        // shape in every case.
+        assert_eq!(
+            outcome(text).unwrap_err(),
+            LinkRefusal::RecordShape,
+            "case {index}: {text}"
+        );
+    }
+}
+
+/// The JCS identity compares bytes: a text decoder may drop a leading byte
+/// order mark, the comparison must not.
+#[test]
+fn a_byte_order_mark_before_the_record_is_a_refused_shape_and_one_inside_a_string_is_a_character() {
+    let signer = owner();
+    let built = build(b"{}", &signer, FUTURE);
+    let link = ShortLink::parse(&built.href, ORIGIN).unwrap();
+    let now = at("2026-10-24T12:00:00.000Z");
+    let canonical = decode_config(&built.fetched.record_header, URL_SAFE_NO_PAD).unwrap();
+    let outcome = |bytes: &[u8]| {
+        open_link_record(
+            &link,
+            &FetchedLink {
+                record_header: b64(bytes),
+                body: built.fetched.body.clone(),
+            },
+            now,
+        )
+    };
+    assert!(outcome(&canonical).is_ok());
+    let bom = [0xEF, 0xBB, 0xBF];
+    let with_bom = [bom.as_slice(), canonical.as_slice()].concat();
+    assert_eq!(outcome(&with_bom).unwrap_err(), LinkRefusal::RecordShape);
+    // The bytes of the BOM alone, and after the text.
+    assert_eq!(outcome(&bom).unwrap_err(), LinkRefusal::RecordShape);
+    let trailing = [canonical.as_slice(), bom.as_slice()].concat();
+    assert_eq!(outcome(&trailing).unwrap_err(), LinkRefusal::RecordShape);
+
+    // U+FEFF inside a string value is a character. JCS writes it as the raw
+    // bytes EF BB BF, so that spelling is the canonical one and passes the
+    // identity check (the issuer is then not a key: a later refusal); the
+    // `\ufeff` spelling of the same string is not the JCS and is a shape.
+    let mut header = built.header.clone();
+    header["issuer"] = json!(format!("{}\u{feff}", did_of(&signer)));
+    let signature = sign_header(&header, &signer);
+    let text = |header: &Value| {
+        let value =
+            json!({"header": header, "signature": {"algorithm": "Ed25519", "value": signature}});
+        String::from_utf8(tinycloud_core::policy_capability::jcs::canonicalize(&value)).unwrap()
+    };
+    let raw = text(&header);
+    assert!(raw.as_bytes().windows(3).any(|window| window == bom));
+    assert_eq!(
+        outcome(raw.as_bytes()).unwrap_err(),
+        LinkRefusal::BadSignature
+    );
+    let escaped = raw.replace('\u{feff}', r"\ufeff");
+    assert!(!escaped.contains('\u{feff}'));
+    assert_eq!(
+        outcome(escaped.as_bytes()).unwrap_err(),
+        LinkRefusal::RecordShape
+    );
+}
