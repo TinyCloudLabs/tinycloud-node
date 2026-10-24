@@ -27,7 +27,8 @@ use crate::{request_cancel, request_telemetry};
 use super::{
     authority::{DdlPolicy, SqlAuthority},
     caveats::SqlCaveats,
-    database::{spawn_actor, DatabaseHandle, GrowthPolicy},
+    database::{spawn_actor_with_policy, DatabaseHandle, GrowthPolicy},
+    durability::{DurabilityPolicy, ReservationGuard},
     types::*,
 };
 
@@ -161,6 +162,7 @@ pub struct SqlService {
     memory_threshold: u64,
     artifact_repository: Arc<dyn DatabaseArtifactRepository>,
     bounds: SqlWaitBounds,
+    durability: DurabilityPolicy,
     ddl_policy: DdlPolicy,
 }
 
@@ -179,8 +181,16 @@ impl SqlService {
             memory_threshold,
             artifact_repository,
             bounds: SqlWaitBounds::default(),
+            durability: DurabilityPolicy::default(),
             ddl_policy: DdlPolicy::default(),
         }
+    }
+
+    /// The node's local durability policy (TC-1491): `synchronous`, the
+    /// per-database size cap and the disk headroom.
+    pub fn with_durability(mut self, durability: DurabilityPolicy) -> Self {
+        self.durability = durability;
+        self
     }
 
     /// Whether a schema-changing statement needs `tinycloud.sql/schema`
@@ -279,6 +289,52 @@ impl SqlService {
         .await
     }
 
+    /// Execute with the owner's remaining storage budget: a write that would
+    /// grow the database by more than `remaining_bytes` is rolled back before
+    /// COMMIT with [`SqlError::StorageWouldGrow`].
+    pub async fn execute_with_budget(
+        &self,
+        space: &SpaceId,
+        db_name: &str,
+        request: SqlRequest,
+        caveats: Option<SqlCaveats>,
+        ability: String,
+        remaining_bytes: u64,
+    ) -> Result<SqlExecutionResult, SqlError> {
+        self.execute_with_budget_authorized(
+            space,
+            db_name,
+            request,
+            caveats,
+            SqlAuthority::from(ability),
+            remaining_bytes,
+        )
+        .await
+    }
+
+    /// As [`Self::execute_with_budget`], judging each statement against every
+    /// SQL ability the invocation holds (TC-1581). This is the entry point
+    /// `/invoke` uses for a write inside the owner's remaining budget.
+    pub async fn execute_with_budget_authorized(
+        &self,
+        space: &SpaceId,
+        db_name: &str,
+        request: SqlRequest,
+        caveats: Option<SqlCaveats>,
+        authority: SqlAuthority,
+        remaining_bytes: u64,
+    ) -> Result<SqlExecutionResult, SqlError> {
+        self.execute_with_growth(
+            space,
+            db_name,
+            request,
+            caveats,
+            authority.with_ddl_policy(self.ddl_policy),
+            GrowthPolicy::Budget(remaining_bytes),
+        )
+        .await
+    }
+
     async fn execute_with_growth(
         &self,
         space: &SpaceId,
@@ -310,6 +366,12 @@ impl SqlService {
         growth: GrowthPolicy,
     ) -> Result<SqlExecutionResult, SqlError> {
         let key = (space.to_string(), db_name.to_string());
+        // Whatever the request still holds of the disk budget is released once
+        // its outcome is known: after the durable save, or its failure.
+        let _reservation = ReservationGuard::new(
+            self.durability.budget.clone(),
+            format!("{}/{}", key.0, key.1),
+        );
         let mut handle = self.handle(space, db_name).await?;
         begin_write()?;
 
@@ -331,8 +393,11 @@ impl SqlService {
         let result = match result {
             Ok(result) => result,
             Err(error) => {
-                if growth == GrowthPolicy::Forbid
-                    && self.expectation(&key) == ArtifactExpectation::Absent
+                if (growth == GrowthPolicy::Forbid
+                    && self.expectation(&key) == ArtifactExpectation::Absent)
+                    // The disk failed the commit: its WAL is not to be trusted
+                    // (Postgres never saw the write), so start over from it.
+                    || matches!(error, SqlError::CommitFailed)
                 {
                     self.discard_local_state(&key).await?;
                 }
@@ -750,12 +815,13 @@ impl SqlService {
         self.databases
             .entry((space.to_string(), db_name.to_string()))
             .or_insert_with(|| {
-                spawn_actor(
+                spawn_actor_with_policy(
                     space.to_string(),
                     db_name.to_string(),
                     self.base_path.clone(),
                     self.memory_threshold,
                     self.databases.clone(),
+                    self.durability.clone(),
                 )
             });
         HydrationOutcome::Ready
@@ -861,7 +927,7 @@ impl SqlService {
         // adding a database page. Full spaces replace checkpoint + WAL, but
         // must also bound the resulting image against the durable charge:
         // live state can include partial writes from an earlier failed request.
-        let wal = if growth == GrowthPolicy::Allow {
+        let wal = if growth != GrowthPolicy::Forbid {
             handle.wal().await?
         } else {
             None
@@ -4781,6 +4847,186 @@ mod tests {
             );
         }
     }
+
+    /// TC-1491: the budget and the disk reservation cost no Postgres round
+    /// trip, and a refused write costs none at all.
+    #[tokio::test]
+    async fn tc1491_reservation_adds_no_repository_round_trips() {
+        for memory_threshold in [u64::MAX, 0] {
+            let mut sequences = Vec::new();
+            for budget in [None, Some(1 << 30)] {
+                let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let cache = TempDir::new().unwrap();
+                let service = SqlService::new(
+                    cache.path().to_string_lossy().into_owned(),
+                    memory_threshold,
+                    Arc::new(CallCountingRepository {
+                        inner: artifact_repository().await,
+                        calls: calls.clone(),
+                    }),
+                );
+                let space = test_space_id("sql-reservation-trips");
+                let write = |sql: &str| {
+                    let request = SqlRequest::Execute {
+                        schema: None,
+                        sql: sql.to_string(),
+                        params: Vec::new(),
+                    };
+                    let ability = "tinycloud.sql/admin".to_string();
+                    let space = space.clone();
+                    let service = service.clone();
+                    async move {
+                        match budget {
+                            None => {
+                                service
+                                    .execute(&space, "main", request, None, ability)
+                                    .await
+                            }
+                            Some(left) => {
+                                service
+                                    .execute_with_budget(
+                                        &space, "main", request, None, ability, left,
+                                    )
+                                    .await
+                            }
+                        }
+                    }
+                };
+                write("CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB)")
+                    .await
+                    .unwrap();
+                write("INSERT INTO t (v) VALUES (zeroblob(1000))")
+                    .await
+                    .unwrap();
+                sequences.push(calls.lock().unwrap().clone());
+            }
+            assert_eq!(
+                sequences[0], sequences[1],
+                "a budget changes which repository calls a write makes"
+            );
+            // One persist per write, after the initial hydration lookup.
+            let persists = sequences[0]
+                .iter()
+                .filter(|call| matches!(**call, "save" | "save_delta"))
+                .count();
+            assert_eq!(persists, 2, "{:?}", sequences[0]);
+        }
+
+        // A write the budget refuses reaches Postgres not at all, and leaves the
+        // local database as it was.
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cache = TempDir::new().unwrap();
+        let service = SqlService::new(
+            cache.path().to_string_lossy().into_owned(),
+            0,
+            Arc::new(CallCountingRepository {
+                inner: artifact_repository().await,
+                calls: calls.clone(),
+            }),
+        );
+        let space = test_space_id("sql-reservation-refused");
+        let request = |sql: &str| SqlRequest::Execute {
+            schema: None,
+            sql: sql.to_string(),
+            params: Vec::new(),
+        };
+        service
+            .execute(
+                &space,
+                "main",
+                request("CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB)"),
+                None,
+                "tinycloud.sql/admin".into(),
+            )
+            .await
+            .unwrap();
+        calls.lock().unwrap().clear();
+        let refused = service
+            .execute_with_budget(
+                &space,
+                "main",
+                request("INSERT INTO t (v) VALUES (zeroblob(500000))"),
+                None,
+                "tinycloud.sql/write".into(),
+                4096,
+            )
+            .await;
+        assert!(
+            matches!(refused, Err(SqlError::StorageWouldGrow)),
+            "{refused:?}"
+        );
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "{:?}",
+            calls.lock().unwrap()
+        );
+        assert!(rows_of(&service, &space, "SELECT id FROM t")
+            .await
+            .is_empty());
+        assert_eq!(service.durability.budget.reserved(), 0);
+    }
+
+    /// TC-1491: with the disk headroom check on, a successful write holds
+    /// nothing once its save is done, except the growth the next checkpoint
+    /// will cause. A save of a small WAL ships the WAL and does not
+    /// checkpoint, so that growth stays held until a checkpoint runs.
+    #[tokio::test]
+    async fn tc1491_a_saved_write_holds_only_its_pending_checkpoint_growth() {
+        let cache = TempDir::new().unwrap();
+        let durability = crate::sql::durability::DurabilityPolicy {
+            min_free_bytes: 1,
+            ..Default::default()
+        };
+        let service = SqlService::new(
+            cache.path().to_string_lossy().into_owned(),
+            0,
+            artifact_repository().await,
+        )
+        .with_durability(durability);
+        let space = test_space_id("sql-reservation-pending");
+        let write = |sql: &str| {
+            service.execute_with_budget(
+                &space,
+                "main",
+                SqlRequest::Execute {
+                    schema: None,
+                    sql: sql.to_string(),
+                    params: Vec::new(),
+                },
+                None,
+                "tinycloud.sql/admin".into(),
+                1 << 30,
+            )
+        };
+        let budget = &service.durability.budget;
+
+        write("CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB)")
+            .await
+            .unwrap();
+        assert_eq!(budget.reserved(), 0);
+
+        // Saved as a WAL delta: no checkpoint, so the growth is still held.
+        write("INSERT INTO t (v) VALUES (zeroblob(400000))")
+            .await
+            .unwrap();
+        let held = budget.reserved();
+        assert!(held >= 390_000, "held {held}");
+        write("INSERT INTO t (v) VALUES (zeroblob(10))")
+            .await
+            .unwrap();
+        assert!(budget.reserved() >= 390_000);
+
+        // A checkpoint puts it on the disk; a write that adds no page then
+        // leaves nothing held after its save.
+        let handle = service.handle(&space, "main").await.unwrap();
+        handle.checkpoint().await.unwrap();
+        assert_eq!(budget.reserved(), 0);
+        write("INSERT INTO t (v) VALUES (zeroblob(10))")
+            .await
+            .unwrap();
+        assert_eq!(budget.reserved(), 0);
+    }
+
     /// TC-1491 + TC-1585: a `WITH … INSERT` is a write, so in a batch it is
     /// one of the statements that must be kept or undone with the rest. A
     /// later failure leaves nothing of it locally, writes nothing to Postgres,
