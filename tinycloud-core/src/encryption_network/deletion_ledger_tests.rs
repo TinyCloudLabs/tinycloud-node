@@ -497,3 +497,26 @@ async fn replay_at_start_fails_on_a_malformed_middle_line() {
     };
     assert_eq!(error.kind(), "malformed");
 }
+
+#[tokio::test]
+async fn an_operation_committed_means_every_key_is_deleted_at_its_version_or_later() {
+    use super::deletion_ledger::intent_committed;
+    let db = fresh_db().await;
+    insert_key(&db, "apps/a/deleted", "deletable", "deleted", false, 1).await;
+    active_key(&db, "apps/a/active").await;
+    // Deleted at version 1 and created again as version 2.
+    insert_key(&db, "apps/a/again", "deletable", "active", true, 2).await;
+
+    let committed = |keys: &[(&str, i64)]| {
+        let intent = intent("op", keys);
+        let db = db.clone();
+        async move { intent_committed(&db, &intent).await.unwrap() }
+    };
+    assert!(committed(&[("apps/a/deleted", 1)]).await);
+    assert!(committed(&[("apps/a/deleted", 1), ("apps/a/again", 1)]).await);
+    assert!(!committed(&[("apps/a/active", 1)]).await);
+    assert!(!committed(&[("apps/a/deleted", 1), ("apps/a/active", 1)]).await);
+    assert!(!committed(&[("apps/a/missing", 1)]).await);
+    // A key that is only deleted at an older version than the operation's.
+    assert!(!committed(&[("apps/a/deleted", 2)]).await);
+}
