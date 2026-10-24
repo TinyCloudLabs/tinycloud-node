@@ -157,12 +157,14 @@ use tokio::{
 /// instead persists a deleting fence until physical absence is confirmed.
 /// SQLite/MySQL use the equivalent guarded multi-statement paths rather than
 /// the PostgreSQL-only CTEs.
-const BUDGETS: [(&str, u64); 5] = [
+const BUDGETS: [(&str, u64); 7] = [
     ("sign-in", 71),
     ("kv put", 43),
     ("kv get", 16),
     ("kv batch get", 16),
     ("kv batch head", 16),
+    ("kv put 2 blobs", 1),
+    ("kv put 1 blob 2 keys", 1),
 ];
 
 /// Full sign-in plus put plus get rounds run before the measured one.
@@ -960,7 +962,85 @@ async fn round(node: &Node, account: &Account, out: &mut Vec<Measured>) -> Resul
         read.as_bytes() == KV_VALUE,
         "kv get returned {read:?}, not the value just put"
     );
+    multi_write_puts(node, &session, out).await?;
     batch_reads(node, &session, out).await?;
+    Ok(())
+}
+
+/// TC-735: one invocation writing two keys is a multipart `kv/put` batch. Its
+/// pre-upload registration, fence lock and finish run once per DISTINCT blob
+/// (three round trips each), whatever the number of keys. Two keys holding
+/// different bytes are two blobs; two keys holding the same bytes are one.
+fn multipart_put(keys: &[String], values: &[&[u8]]) -> (ContentType, Vec<u8>) {
+    let boundary = "tc735-multi-write-boundary";
+    let mut body = Vec::new();
+    for (key, value) in keys.iter().zip(values) {
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"{key}\"\r\n\
+                 Content-Type: application/octet-stream\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(value);
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    (
+        ContentType::new("multipart", "form-data").with_params(("boundary", boundary)),
+        body,
+    )
+}
+
+async fn multi_write_puts(node: &Node, session: &Session, out: &mut Vec<Measured>) -> Result<()> {
+    let distinct = vec!["multi/distinct-a".to_owned(), "multi/distinct-b".to_owned()];
+    let (content_type, body) = multipart_put(
+        &distinct,
+        &[b"tc735 multi-write blob a", b"tc735 multi-write blob b"],
+    );
+    expect_ok(
+        "kv put 2 blobs",
+        node.measure(
+            "kv put 2 blobs",
+            "POST /invoke kv/put x2 (two blobs)",
+            node.client
+                .post("/invoke")
+                .header(Header::new(
+                    "Authorization",
+                    batch_invocation(session, "tinycloud.kv/put", &distinct)?,
+                ))
+                .header(content_type)
+                .body(body),
+            out,
+        )
+        .await?,
+    )?;
+
+    let same = vec!["multi/same-a".to_owned(), "multi/same-b".to_owned()];
+    let (content_type, body) = multipart_put(
+        &same,
+        &[
+            b"tc735 multi-write shared blob",
+            b"tc735 multi-write shared blob",
+        ],
+    );
+    expect_ok(
+        "kv put 1 blob 2 keys",
+        node.measure(
+            "kv put 1 blob 2 keys",
+            "POST /invoke kv/put x2 (one blob)",
+            node.client
+                .post("/invoke")
+                .header(Header::new(
+                    "Authorization",
+                    batch_invocation(session, "tinycloud.kv/put", &same)?,
+                ))
+                .header(content_type)
+                .body(body),
+            out,
+        )
+        .await?,
+    )?;
     Ok(())
 }
 

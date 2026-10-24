@@ -340,6 +340,8 @@ where
 
 /// Reject unauthorized or unhosted mutations before any content upload.
 /// The commit transaction repeats authorization after the sequence lock.
+/// `check_hosted` is false only where the caller's registration statement
+/// checks that every space exists itself.
 async fn authorize_mutation_preupload<C: ConnectionTrait, B: StorageSetup, K: Secrets>(
     conn: &C,
     invocation: &Invocation,
@@ -347,6 +349,7 @@ async fn authorize_mutation_preupload<C: ConnectionTrait, B: StorageSetup, K: Se
     now: OffsetDateTime,
     spaces: &[SpaceId],
     delegated_sql_caveats: bool,
+    check_hosted: bool,
 ) -> Result<(), TxError<B, K>> {
     match mode {
         InvokeMode::Admitted => {
@@ -366,12 +369,14 @@ async fn authorize_mutation_preupload<C: ConnectionTrait, B: StorageSetup, K: Se
         }
         InvokeMode::Internal | InvokeMode::MeetingPublication => {}
     }
-    let hosted = space::Entity::find()
-        .filter(space::Column::Id.is_in(spaces.iter().cloned().map(SpaceIdWrap)))
-        .count(conn)
-        .await?;
-    if hosted != spaces.len() as u64 {
-        return Err(TxError::SpaceNotFound);
+    if check_hosted {
+        let hosted = space::Entity::find()
+            .filter(space::Column::Id.is_in(spaces.iter().cloned().map(SpaceIdWrap)))
+            .count(conn)
+            .await?;
+        if hosted != spaces.len() as u64 {
+            return Err(TxError::SpaceNotFound);
+        }
     }
     Ok(())
 }
@@ -2451,8 +2456,8 @@ where
         let mut attempt_bytes = [0u8; 16];
         OsRng.fill_bytes(&mut attempt_bytes);
         let attempt_id = hex::encode(attempt_bytes);
-        // Registration and authorization commit before any blob can be
-        // persisted. Retrying an uncertain preparatory COMMIT uses exactly the
+        // Registration and authorization finish before any blob can be
+        // persisted. Retrying an uncertain registration uses exactly the
         // same attempt ID, so it cannot duplicate or steal another writer.
         // SQLite's preparatory write follows sequence→writer→BEGIN and
         // releases every guard before an ordinary upload.
@@ -2474,25 +2479,14 @@ where
             // a cut, so this is not refused here.
             let latched = crate::request_cancel::latch();
             debug_assert!(latched, "a cut handler is not polled again");
-            let prepared = async {
-                let tx = self.candidate_conn.begin_preparatory().await?;
-                authorize_mutation_preupload::<_, B, K>(
-                    &tx,
-                    &invocation,
-                    mode,
-                    now,
-                    &sequence_spaces,
-                    self.delegated_sql_caveats,
-                )
-                .await?;
-                let generations = if blobs.is_empty() {
-                    Vec::new()
-                } else {
-                    crate::kv_orphans::register_candidates(&tx, &blobs, &attempt_id).await?
-                };
-                tx.commit().await?;
-                Ok::<_, TxError<B, K>>(generations)
-            }
+            let prepared = Box::pin(self.register_preupload(
+                &invocation,
+                mode,
+                now,
+                &sequence_spaces,
+                &blobs,
+                &attempt_id,
+            ))
             .await;
             match prepared {
                 Ok(generations) => break generations,
@@ -2503,6 +2497,9 @@ where
                 }
                 Err(TxError::Db(error)) if crate::kv_orphans::is_candidate_unavailable(&error) => {
                     return Err(TxStoreError::KvCandidateUnavailable);
+                }
+                Err(TxError::Db(error)) if crate::kv_orphans::is_space_not_hosted(&error) => {
+                    return Err(TxError::<B, K>::SpaceNotFound.into());
                 }
                 Err(error) => return Err(error.into()),
             }
@@ -2767,6 +2764,73 @@ where
             }
         }
         result
+    }
+
+    /// Pre-upload authorization and candidate registration (TC-735), before
+    /// any bytes reach the store. The commit transaction still repeats
+    /// authorization under the sequence lock.
+    ///
+    /// On PostgreSQL there is no `BEGIN`/`COMMIT`: authorization is one read
+    /// statement and registration one write statement that also checks every
+    /// invocation space exists, so an unhosted space is refused with the same
+    /// `SpaceNotFound`, after authorization and before any upload, as the
+    /// separate COUNT it replaces. Where the registration of several blobs
+    /// stops partway (a later blob is being deleted, or the connection is
+    /// lost), earlier blobs keep their claims; the collector reclaims them
+    /// after the grace period like any crashed attempt. Other backends keep
+    /// one transaction.
+    ///
+    /// A separate function, not inline in the caller: see
+    /// [`Self::persist_registered_blobs`].
+    async fn register_preupload(
+        &self,
+        invocation: &Invocation,
+        mode: InvokeMode,
+        now: OffsetDateTime,
+        spaces: &[SpaceId],
+        blobs: &[(SpaceId, Hash)],
+        attempt_id: &str,
+    ) -> Result<Vec<(SpaceId, Hash, i64)>, TxError<B, K>>
+    where
+        B: StorageSetup,
+    {
+        if let Some(conn) = self.candidate_conn.preparatory_autocommit() {
+            authorize_mutation_preupload::<_, B, K>(
+                conn,
+                invocation,
+                mode,
+                now,
+                spaces,
+                self.delegated_sql_caveats,
+                blobs.is_empty(),
+            )
+            .await?;
+            if blobs.is_empty() {
+                return Ok(Vec::new());
+            }
+            return Ok(crate::kv_orphans::register_candidates_hosted(
+                conn, blobs, attempt_id, spaces,
+            )
+            .await?);
+        }
+        let tx = self.candidate_conn.begin_preparatory().await?;
+        authorize_mutation_preupload::<_, B, K>(
+            &tx,
+            invocation,
+            mode,
+            now,
+            spaces,
+            self.delegated_sql_caveats,
+            true,
+        )
+        .await?;
+        let generations = if blobs.is_empty() {
+            Vec::new()
+        } else {
+            crate::kv_orphans::register_candidates(&tx, blobs, attempt_id).await?
+        };
+        tx.commit().await?;
+        Ok(generations)
     }
 
     /// Upload staged KV blobs under their registered generations before any

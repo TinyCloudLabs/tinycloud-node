@@ -39,6 +39,14 @@ pub(crate) fn is_candidate_unavailable(error: &DbErr) -> bool {
     matches!(error, DbErr::Custom(message) if message == UNAVAILABLE_DELETING || message == UNAVAILABLE_MISSING)
 }
 
+const UNHOSTED_SPACE: &str = "KV blob space is not hosted";
+
+/// A registration that [`register_candidates_hosted`] refused because a
+/// required space does not exist. Nothing was written.
+pub(crate) fn is_space_not_hosted(error: &DbErr) -> bool {
+    matches!(error, DbErr::Custom(message) if message == UNHOSTED_SPACE)
+}
+
 fn ordered_unique(blobs: &[(SpaceId, Hash)]) -> Cow<'_, [(SpaceId, Hash)]> {
     if blobs.windows(2).all(|pair| pair[0] < pair[1]) {
         return Cow::Borrowed(blobs);
@@ -56,6 +64,23 @@ pub async fn register_candidates<C: ConnectionTrait>(
     blobs: &[(SpaceId, Hash)],
     attempt_id: &str,
 ) -> Result<Vec<(SpaceId, Hash, i64)>, DbErr> {
+    register_candidates_hosted(conn, blobs, attempt_id, &[]).await
+}
+
+/// [`register_candidates`] for PostgreSQL's one-statement preparatory path
+/// (TC-735). With `hosted_spaces` non-empty, every registration statement
+/// writes nothing unless each listed space exists, and reports
+/// [`is_space_not_hosted`] otherwise, so an unhosted space is refused before
+/// any bytes reach the store without a separate COUNT round trip. Other
+/// backends ignore it: their callers check hosting in the same transaction.
+pub async fn register_candidates_hosted<C: ConnectionTrait>(
+    conn: &C,
+    blobs: &[(SpaceId, Hash)],
+    attempt_id: &str,
+    hosted_spaces: &[SpaceId],
+) -> Result<Vec<(SpaceId, Hash, i64)>, DbErr> {
+    let hosted_ids: Vec<String> = hosted_spaces.iter().map(ToString::to_string).collect();
+    let hosted_count = hosted_ids.len() as i64;
     let mut registered_at = None;
     let mut generations = Vec::with_capacity(blobs.len());
     for (space, value) in ordered_unique(blobs).iter() {
@@ -68,7 +93,9 @@ pub async fn register_candidates<C: ConnectionTrait>(
                     DbBackend::Postgres,
                     "WITH generation AS (
                     INSERT INTO kv_blob_generation (space, value, generation)
-                    VALUES ($1, $2, 0)
+                    SELECT $1::text, $2::bytea, 0
+                    WHERE $5 = 0
+                       OR (SELECT COUNT(*) FROM space WHERE id = ANY($4::text[])) = $5
                     ON CONFLICT (space, value) DO UPDATE
                         SET generation = kv_blob_generation.generation
                     RETURNING space, value, generation
@@ -89,11 +116,23 @@ pub async fn register_candidates<C: ConnectionTrait>(
                     RETURNING attempt_id
                 )
                 SELECT (SELECT generation FROM fence) AS generation,
-                       (SELECT COUNT(*) FROM claim) AS inserted",
-                    [key.into(), (*value).into(), attempt_id.to_owned().into()],
+                       (SELECT COUNT(*) FROM claim) AS inserted,
+                       ($5 = 0
+                        OR (SELECT COUNT(*) FROM space WHERE id = ANY($4::text[])) = $5) AS hosted",
+                    [
+                        key.into(),
+                        (*value).into(),
+                        attempt_id.to_owned().into(),
+                        hosted_ids.clone().into(),
+                        hosted_count.into(),
+                    ],
                 ))
                 .await?
                 .ok_or_else(|| DbErr::Custom("KV candidate registration returned no row".into()))?;
+            // The statement wrote nothing when a required space is unhosted.
+            if !row.try_get::<bool>("", "hosted")? {
+                return Err(DbErr::Custom(UNHOSTED_SPACE.into()));
+            }
             let generation: Option<i64> = row.try_get("", "generation")?;
             generations.push((
                 space.clone(),
@@ -2255,6 +2294,78 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn postgres_one_statement_registration_refuses_an_unhosted_space_without_writing() {
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set};
+
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_one_statement_registration_refuses_an_unhosted_space_without_writing",
+        )
+        .await
+        else {
+            return;
+        };
+        let store = MemoryStore::default();
+        let hosted = space();
+        let unhosted = space();
+        let value = upload(&store, &hosted, b"hosted-guard").await;
+        let rows = || async {
+            (
+                ledger::Entity::find()
+                    .all(&fixture.conn)
+                    .await
+                    .unwrap()
+                    .len(),
+                candidate::Entity::find()
+                    .all(&fixture.conn)
+                    .await
+                    .unwrap()
+                    .len(),
+                attempt::Entity::find()
+                    .all(&fixture.conn)
+                    .await
+                    .unwrap()
+                    .len(),
+            )
+        };
+        let blobs = [(hosted.clone(), value)];
+
+        // Neither space exists: refused, and not one row is written.
+        let error =
+            register_candidates_hosted(&fixture.conn, &blobs, "a", std::slice::from_ref(&hosted))
+                .await
+                .unwrap_err();
+        assert!(is_space_not_hosted(&error), "{error}");
+        assert_eq!(rows().await, (0, 0, 0));
+
+        // The blob's own space exists but another space of the invocation does
+        // not: still refused, still nothing written.
+        crate::models::space::ActiveModel {
+            id: Set(SpaceIdWrap(hosted.clone())),
+        }
+        .insert(&fixture.conn)
+        .await
+        .unwrap();
+        let error = register_candidates_hosted(
+            &fixture.conn,
+            &blobs,
+            "a",
+            &[hosted.clone(), unhosted.clone()],
+        )
+        .await
+        .unwrap_err();
+        assert!(is_space_not_hosted(&error), "{error}");
+        assert_eq!(rows().await, (0, 0, 0));
+
+        // Every listed space exists: one registration, generation zero.
+        let generations =
+            register_candidates_hosted(&fixture.conn, &blobs, "a", std::slice::from_ref(&hosted))
+                .await
+                .unwrap();
+        assert_eq!(generations, vec![(hosted, value, 0)]);
+        assert_eq!(rows().await, (1, 1, 1));
     }
 
     #[tokio::test]

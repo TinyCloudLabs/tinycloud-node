@@ -276,6 +276,31 @@ impl RecoveringConnection {
         self.scope_local_timeout(transaction).await
     }
 
+    /// The connection for PostgreSQL's autocommit preparatory path (TC-735):
+    /// authorization is one read statement and registration one write
+    /// statement, each its own autocommit statement with no `BEGIN`/`COMMIT`.
+    /// Like [`Self::begin_preparatory`] it bypasses this type's write
+    /// tracking: the registration is retryable candidate metadata, never a
+    /// user-visible KV write, and the caller retries it once with the same
+    /// attempt ID.
+    ///
+    /// `None` where a transaction is required: other backends (SQLite
+    /// reserves its writer at `BEGIN`), and [`StatementTimeoutMode::Local`],
+    /// which scopes the timeout to a transaction with `SET LOCAL`.
+    pub(crate) fn preparatory_autocommit(&self) -> Option<&DatabaseConnection> {
+        if self.conn.get_database_backend() != DatabaseBackend::Postgres {
+            return None;
+        }
+        match self.statement_timeouts {
+            Some(timeouts)
+                if timeouts.mode == StatementTimeoutMode::Local && timeouts.is_enabled() =>
+            {
+                None
+            }
+            _ => Some(&self.conn),
+        }
+    }
+
     /// The outcome of the one retry. It is never retried again, but a
     /// connection lost again is still recorded.
     fn retried<T>(&self, operation: &'static str, result: Result<T, DbErr>) -> Result<T, DbErr> {
