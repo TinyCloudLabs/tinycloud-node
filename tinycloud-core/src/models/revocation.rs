@@ -285,6 +285,9 @@ impl ControlAction {
 pub(crate) enum ControlProofDecision {
     DirectSigner(String),
     Scoped(ScopedControl),
+    /// A valid proof that carries no grant for this action. It adds no
+    /// authority; the signer keeps only its own party authority.
+    Ungranted,
     Denied,
 }
 
@@ -474,7 +477,7 @@ pub(crate) async fn control_proof_decision<C: ConnectionTrait>(
         }
     }
     if scopes.is_empty() {
-        return Ok(ControlProofDecision::Denied);
+        return Ok(ControlProofDecision::Ungranted);
     }
     Ok(ControlProofDecision::Scoped(ScopedControl {
         action,
@@ -704,7 +707,15 @@ async fn revoker_is_authorized<C: ConnectionTrait>(
                 .filter(abilities::Column::Delegation.eq(delegation.id))
                 .all(db)
                 .await?;
-            return Ok(control.authorizes_target(requested, delegation, &target_abilities));
+            if control.authorizes_target(requested, delegation, &target_abilities) {
+                return Ok(true);
+            }
+            // A proof that does not grant revoke leaves the signer's own
+            // party authority in force: the delegator of this delegation.
+            return Ok(ControlAction::Revoke.party_may_act(delegation, revoker));
+        }
+        ControlProofDecision::Ungranted => {
+            return Ok(ControlAction::Revoke.party_may_act(delegation, revoker))
         }
         ControlProofDecision::Denied => return Ok(false),
     };
@@ -989,5 +1000,216 @@ mod tests {
         insert_link(&db, second, first).await;
 
         assert_eq!(first_revoked_ancestor(&db, &first).await.unwrap(), None);
+    }
+
+    async fn insert_actor<C: ConnectionTrait>(db: &C, id: &str) {
+        actor::ActiveModel {
+            id: Set(id.to_string()),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+    }
+
+    async fn insert_delegation_between<C: ConnectionTrait>(
+        db: &C,
+        id: Hash,
+        delegator: &str,
+        delegatee: &str,
+    ) {
+        delegation::ActiveModel {
+            id: Set(id),
+            delegator: Set(delegator.to_string()),
+            delegatee: Set(delegatee.to_string()),
+            expiry: Set(None),
+            issued_at: Set(None),
+            not_before: Set(None),
+            facts: Set(None),
+            serialization: Set(id.as_ref().to_vec()),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+    }
+
+    async fn insert_revocation_of<C: ConnectionTrait>(db: &C, id: Hash, revoked: Hash) {
+        ActiveModel {
+            id: Set(id),
+            revoker: Set("did:key:owner".to_string()),
+            revoked: Set(revoked),
+            serialization: Set(id.as_ref().to_vec()),
+            revoked_at: Set(None),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+    }
+
+    async fn revoker_may_revoke(
+        db: &sea_orm::DbConn,
+        target: Hash,
+        revoker: &str,
+        proof: Hash,
+    ) -> bool {
+        let target_row = delegation::Entity::find_by_id(target)
+            .one(db)
+            .await
+            .unwrap()
+            .unwrap();
+        super::revoker_is_authorized(db, &target_row, &target, revoker, &[proof.to_cid(0x55)])
+            .await
+            .unwrap()
+    }
+
+    // Owner O grants session S a delegation P with no revoke ability. S
+    // sub-delegates target D to recipient X. S is the delegator of D, so S
+    // must be able to revoke D while carrying P as its proof.
+    #[tokio::test]
+    async fn delegator_revokes_sub_delegation_with_proof_that_grants_no_revoke() {
+        let db = database().await;
+        for did in ["did:key:owner", "did:key:session", "did:key:recipient"] {
+            insert_actor(&db, did).await;
+        }
+        let proof = hash(b"session-proof");
+        let target = hash(b"sub-delegation");
+        insert_delegation_between(&db, proof, "did:key:owner", "did:key:session").await;
+        insert_delegation_between(&db, target, "did:key:session", "did:key:recipient").await;
+
+        assert!(revoker_may_revoke(&db, target, "did:key:session", proof).await);
+    }
+
+    // A signer that is not the delegator of D gains nothing from carrying a
+    // proof that grants no revoke ability: its own party authority is absent.
+    #[tokio::test]
+    async fn non_delegator_cannot_revoke_with_proof_that_grants_no_revoke() {
+        let db = database().await;
+        for did in [
+            "did:key:owner",
+            "did:key:session",
+            "did:key:recipient",
+            "did:key:other",
+        ] {
+            insert_actor(&db, did).await;
+        }
+        let proof = hash(b"other-proof");
+        let target = hash(b"sub-delegation");
+        insert_delegation_between(&db, proof, "did:key:owner", "did:key:other").await;
+        insert_delegation_between(&db, target, "did:key:session", "did:key:recipient").await;
+
+        assert!(!revoker_may_revoke(&db, target, "did:key:other", proof).await);
+    }
+
+    // A proof whose ancestor is revoked is invalid, so it is Denied rather
+    // than Ungranted and must not authorize even the delegator.
+    #[tokio::test]
+    async fn revoked_proof_chain_is_refused_even_for_delegator() {
+        let db = database().await;
+        for did in ["did:key:owner", "did:key:session", "did:key:recipient"] {
+            insert_actor(&db, did).await;
+        }
+        let proof = hash(b"session-proof");
+        let ancestor = hash(b"revoked-ancestor");
+        let target = hash(b"sub-delegation");
+        insert_delegation_between(&db, ancestor, "did:key:owner", "did:key:owner").await;
+        insert_delegation_between(&db, proof, "did:key:owner", "did:key:session").await;
+        insert_delegation_between(&db, target, "did:key:session", "did:key:recipient").await;
+        insert_link(&db, proof, ancestor).await;
+        insert_revocation_of(&db, hash(b"revocation-of-ancestor"), ancestor).await;
+
+        assert!(!revoker_may_revoke(&db, target, "did:key:session", proof).await);
+    }
+
+    async fn insert_ability<C: ConnectionTrait>(
+        db: &C,
+        delegation: Hash,
+        resource: &str,
+        ability: &str,
+    ) {
+        abilities::ActiveModel {
+            delegation: Set(delegation),
+            resource: Set(resource.parse().unwrap()),
+            ability: Set(ability.to_string().try_into().unwrap()),
+            caveats: Set(crate::types::Caveats(Default::default())),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+    }
+
+    // Valid did:key values are required: space resources parse only when the
+    // DID is real.
+    const OWNER_DID: &str = "did:key:z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK";
+    const SESSION_DID: &str = "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw";
+    const RECIPIENT_DID: &str = "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5";
+    const OTHER_DID: &str = "did:key:z6MkjHi79SMX4doJyo2w7jDTM6Fa7iX6EVZWXNbJ6RzBm3Wi";
+
+    // Space resources are `tinycloud:key:<multibase>:<name>/<service>`: the
+    // parser re-adds the `did:` prefix to the segment before the space name.
+    fn space_resource(did: &str, rest: &str) -> String {
+        format!(
+            "tinycloud:{}:default/{rest}",
+            did.trim_start_matches("did:")
+        )
+    }
+
+    // Owner O grants session S revoke authority over O's space only. S
+    // sub-delegates D whose ability lives in another space, so the proof
+    // does not cover D. The Scoped fallthrough keeps S's party authority.
+    #[tokio::test]
+    async fn delegator_revokes_when_scoped_proof_covers_another_space() {
+        let db = database().await;
+        for did in [OWNER_DID, SESSION_DID, RECIPIENT_DID] {
+            insert_actor(&db, did).await;
+        }
+        let proof = hash(b"session-revoke-proof");
+        let target = hash(b"sub-delegation");
+        insert_delegation_between(&db, proof, OWNER_DID, SESSION_DID).await;
+        insert_ability(
+            &db,
+            proof,
+            &space_resource(OWNER_DID, "delegation"),
+            "tinycloud.delegation/revoke",
+        )
+        .await;
+        insert_delegation_between(&db, target, SESSION_DID, RECIPIENT_DID).await;
+        insert_ability(
+            &db,
+            target,
+            &space_resource(RECIPIENT_DID, "kv/a"),
+            "tinycloud.kv/get",
+        )
+        .await;
+
+        assert!(revoker_may_revoke(&db, target, SESSION_DID, proof).await);
+    }
+
+    // Same uncovered scope, but the signer is not D's delegator: the proof
+    // must not confer party authority on a non-party.
+    #[tokio::test]
+    async fn non_delegator_is_refused_when_scoped_proof_covers_another_space() {
+        let db = database().await;
+        for did in [OWNER_DID, SESSION_DID, RECIPIENT_DID, OTHER_DID] {
+            insert_actor(&db, did).await;
+        }
+        let proof = hash(b"other-revoke-proof");
+        let target = hash(b"sub-delegation");
+        insert_delegation_between(&db, proof, OWNER_DID, OTHER_DID).await;
+        insert_ability(
+            &db,
+            proof,
+            &space_resource(OWNER_DID, "delegation"),
+            "tinycloud.delegation/revoke",
+        )
+        .await;
+        insert_delegation_between(&db, target, SESSION_DID, RECIPIENT_DID).await;
+        insert_ability(
+            &db,
+            target,
+            &space_resource(RECIPIENT_DID, "kv/a"),
+            "tinycloud.kv/get",
+        )
+        .await;
+
+        assert!(!revoker_may_revoke(&db, target, OTHER_DID, proof).await);
     }
 }
