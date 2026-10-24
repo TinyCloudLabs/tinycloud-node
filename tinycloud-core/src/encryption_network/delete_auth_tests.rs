@@ -237,7 +237,7 @@ impl<'a> UcanSpec<'a> {
             facts: vec![admin_facts(network, target, body)],
             proof: vec![],
             exp: now + 300,
-            nbf: None,
+            nbf: Some(now),
             nonce: Some("urn:uuid:nonce-0001".to_string()),
         }
     }
@@ -366,35 +366,82 @@ fn delete_prefix_follows_the_shared_vectors() {
     struct Vectors {
         #[serde(rename = "appIdValid")]
         app_ids: Vec<AppId>,
+        #[serde(rename = "deletePrefix")]
+        delete_prefix: Vec<DeletePrefix>,
     }
     #[derive(serde::Deserialize)]
     struct AppId {
         id: String,
         valid: bool,
     }
+    #[derive(serde::Deserialize)]
+    struct DeletePrefix {
+        prefix: String,
+        accepted: bool,
+    }
     let vectors: Vectors = serde_json::from_str(include_str!(
         "../../tests/fixtures/encryption/app-key-vectors.json"
     ))
     .unwrap();
     let network = pkh_network(&Wallet::new(1));
-    // The shared `deletePrefix` vectors that end in a slash; a path without
-    // one is a key delete, not a prefix delete.
-    for (prefix, accepted) in [
-        ("apps/foo/", true),
-        ("apps/", false),
-        ("apps/foo/x/", false),
-        ("secrets/", false),
-    ] {
+    for case in vectors.delete_prefix {
+        // Without a trailing slash the path is a key delete and `apps/foo` is
+        // not a key.
         assert_eq!(
-            DeleteTarget::parse(&network, prefix).is_ok(),
-            accepted,
-            "{prefix:?}"
+            DeleteTarget::parse(&network, &case.prefix).is_ok(),
+            case.accepted,
+            "{:?}",
+            case.prefix
         );
     }
     for case in vectors.app_ids {
         let parsed = DeleteTarget::parse(&network, &format!("apps/{}/", case.id));
         assert_eq!(parsed.is_ok(), case.valid, "app id {:?}", case.id);
     }
+}
+
+#[test]
+fn delete_statements_match_the_shared_vectors_exactly() {
+    #[derive(serde::Deserialize)]
+    struct Vectors {
+        #[serde(rename = "deleteUriPrefix")]
+        uri_prefix: String,
+        #[serde(rename = "deleteStatements")]
+        statements: Vec<Statement>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Statement {
+        owner: String,
+        network: String,
+        #[serde(rename = "keyPath")]
+        key_path: String,
+        statement: String,
+    }
+    let vectors: Vectors = serde_json::from_str(include_str!(
+        "../../tests/fixtures/encryption/app-key-vectors.json"
+    ))
+    .unwrap();
+    assert_eq!(vectors.uri_prefix, KEY_DELETE_URI_PREFIX);
+    assert_eq!(vectors.statements.len(), 2, "one prefix and one key vector");
+    for case in vectors.statements {
+        let network = NetworkId::new(case.owner, case.network).unwrap();
+        let target = DeleteTarget::parse(&network, &case.key_path).unwrap();
+        assert_eq!(target.siwe_statement().unwrap(), case.statement);
+    }
+}
+
+#[tokio::test]
+async fn a_request_network_other_than_the_targets_is_refused() {
+    let wallet = Wallet::new(1);
+    let network = pkh_network(&wallet);
+    let other = NetworkId::new(wallet.did(), "other".to_string()).unwrap();
+    let target = prefix_target(&network, "foo");
+    let at = now();
+    let header = CacaoSpec::valid(&wallet, &target, at).header(&target);
+    assert_refused(
+        verify(&header, &other, &target, &body_for(&target), at).await,
+        "the target's network",
+    );
 }
 
 // ----------------------------------------------------------- CACAO: accepted
@@ -994,7 +1041,7 @@ async fn ucan_audience_and_facts_are_bound_to_the_request() {
 }
 
 #[tokio::test]
-async fn ucan_lifetime_follows_the_rule() {
+async fn ucan_lifetime_runs_from_nbf() {
     let (jwk, _, vm, network) = did_key_network();
     let target = prefix_target(&network, "foo");
     let body = body_for(&target);
@@ -1005,20 +1052,74 @@ async fn ucan_lifetime_follows_the_rule() {
         spec.header()
     };
 
-    verify(&spec(&|s| s.exp = at + 300), &network, &target, &body, at)
+    // exp - nbf = 300 is the longest accepted lifetime.
+    verify(&spec(&|_| {}), &network, &target, &body, at)
         .await
         .unwrap();
     assert_refused(
         verify(&spec(&|s| s.exp = at + 301), &network, &target, &body, at).await,
         "lifetime exceeds 300 seconds",
     );
+    // A long-lived credential is refused for its whole life, also near its
+    // end: signed 35760 s ago for 36000 s, verified 240 s before it expires.
+    let long = spec(&|s| {
+        s.nbf = Some(at - 35_760);
+        s.exp = at + 240;
+    });
     assert_refused(
-        verify(&spec(&|s| s.exp = at), &network, &target, &body, at).await,
+        verify(&long, &network, &target, &body, at).await,
+        "lifetime exceeds 300 seconds",
+    );
+    // Without nbf there is no start to measure from.
+    assert_refused(
+        verify(&spec(&|s| s.nbf = None), &network, &target, &body, at).await,
+        "must carry nbf",
+    );
+    // now < exp.
+    let ended = spec(&|s| {
+        s.nbf = Some(at - 100);
+        s.exp = at;
+    });
+    assert_refused(
+        verify(&ended, &network, &target, &body, at).await,
         "expired",
     );
+    verify(&ended, &network, &target, &body, at - 1)
+        .await
+        .unwrap();
+    // exp must come after nbf.
+    let inverted = spec(&|s| {
+        s.nbf = Some(at + 10);
+        s.exp = at + 5;
+    });
+    assert_refused(
+        verify(&inverted, &network, &target, &body, at).await,
+        "expires before it is valid",
+    );
+    let empty = spec(&|s| {
+        s.nbf = Some(at);
+        s.exp = at + 100;
+    });
+    verify(&empty, &network, &target, &body, at).await.unwrap();
+    // nbf up to 30 s ahead is skew; 31 s is not.
+    verify(
+        &spec(&|s| {
+            s.nbf = Some(at + 30);
+            s.exp = at + 330;
+        }),
+        &network,
+        &target,
+        &body,
+        at,
+    )
+    .await
+    .unwrap();
     assert_refused(
         verify(
-            &spec(&|s| s.nbf = Some(at + 31)),
+            &spec(&|s| {
+                s.nbf = Some(at + 31);
+                s.exp = at + 331;
+            }),
             &network,
             &target,
             &body,
@@ -1027,15 +1128,6 @@ async fn ucan_lifetime_follows_the_rule() {
         .await,
         "not yet valid",
     );
-    verify(
-        &spec(&|s| s.nbf = Some(at + 30)),
-        &network,
-        &target,
-        &body,
-        at,
-    )
-    .await
-    .unwrap();
     assert_refused(
         verify(&spec(&|s| s.nonce = None), &network, &target, &body, at).await,
         "nonce",
@@ -1135,6 +1227,43 @@ async fn an_owner_nonce_is_consumed_once_and_kept_past_exp() {
         .authorize_owner_delete(&header, &network, &target, &body)
         .await;
     assert_refused(second, "nonce was already used");
+}
+
+#[tokio::test]
+async fn nonces_past_their_expiry_are_pruned_and_live_ones_kept() {
+    use sea_orm::ActiveModelTrait;
+    let wallet = Wallet::new(1);
+    let network = pkh_network(&wallet);
+    let target = prefix_target(&network, "foo");
+    let body = body_for(&target);
+    let (service, db) = service().await;
+    for (requester, nonce, expires_at) in [
+        ("did:key:old", "n-old", "2020-01-01T00:00:00Z"),
+        ("did:key:live", "n-live", "2999-01-01T00:00:00Z"),
+    ] {
+        encryption_nonce::ActiveModel {
+            requester_did: sea_orm::ActiveValue::Set(requester.to_string()),
+            nonce: sea_orm::ActiveValue::Set(nonce.to_string()),
+            expires_at: sea_orm::ActiveValue::Set(expires_at.to_string()),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+    }
+    let header = CacaoSpec::valid(&wallet, &target, now()).header(&target);
+    service
+        .authorize_owner_delete(&header, &network, &target, &body)
+        .await
+        .unwrap();
+    let mut kept: Vec<String> = encryption_nonce::Entity::find()
+        .all(&db)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.nonce)
+        .collect();
+    kept.sort();
+    assert_eq!(kept, vec!["n-live".to_string(), "nonce-0001".to_string()]);
 }
 
 #[tokio::test]

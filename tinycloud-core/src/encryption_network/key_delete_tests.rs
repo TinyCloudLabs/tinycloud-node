@@ -12,7 +12,7 @@ use sea_orm_migration::MigratorTrait;
 use super::{
     backend::wrap_to_public_key,
     delete_auth::{DeleteTarget, VerifiedOwnerDelete},
-    deletion_ledger::{self, DeletionLedger},
+    deletion_ledger::{self, DeletionLedger, Intent, LedgerKey, Record},
     key_delete::{audit_request_hash, DeleteOutcome},
     key_id::KeyLocation,
     network_id::NetworkId,
@@ -142,12 +142,11 @@ impl Fixture {
             .unwrap()
     }
 
+    /// Key paths of every operation in the ledger, in order.
     fn ledger_paths(&self) -> Vec<String> {
-        deletion_ledger::read(&self.ledger_path)
-            .unwrap()
-            .entries
+        ledger_keys(&self.ledger_path)
             .into_iter()
-            .map(|entry| entry.key_path)
+            .map(|key| key.key_path)
             .collect()
     }
 
@@ -172,6 +171,20 @@ impl Fixture {
 
 fn strings(values: &[&str]) -> Vec<String> {
     values.iter().map(|v| v.to_string()).collect()
+}
+
+/// The keys of every operation in a ledger, in order.
+fn ledger_keys(path: &std::path::Path) -> Vec<LedgerKey> {
+    deletion_ledger::read(path)
+        .unwrap()
+        .records
+        .into_iter()
+        .filter_map(|record| match record {
+            Record::Intent(intent) => Some(intent.keys),
+            _ => None,
+        })
+        .flatten()
+        .collect()
 }
 
 #[tokio::test]
@@ -240,10 +253,16 @@ async fn one_audit_row_and_one_ledger_line_per_deleted_key() {
     );
     assert_ne!(audit_request_hash("a", "bc"), audit_request_hash("ab", "c"));
     assert_eq!(f.ledger_paths(), strings(&["apps/foo/a", "apps/foo/b"]));
-    let entries = deletion_ledger::read(&f.ledger_path).unwrap().entries;
-    assert!(entries
-        .iter()
-        .all(|e| e.key_version == 1 && e.network_id == network().to_string()));
+    // One operation line, then its committed line.
+    let records = deletion_ledger::read(&f.ledger_path).unwrap().records;
+    assert_eq!(records.len(), 2);
+    let Record::Intent(intent) = &records[0] else {
+        panic!("the first line is the operation");
+    };
+    assert_eq!(intent.op, "cid-audit");
+    assert_eq!(intent.network_id, network().to_string());
+    assert!(intent.keys.iter().all(|key| key.key_version == 1));
+    assert_eq!(records[1], Record::committed("cid-audit"));
 }
 
 #[tokio::test]
@@ -396,11 +415,9 @@ async fn deleted_keys_are_refused_everywhere_and_reinstall_is_a_new_version() {
         .unwrap();
     assert_eq!(again.key_version, 2);
     f.delete(&prefix("foo"), "cid-2").await.unwrap();
-    let versions: Vec<i64> = deletion_ledger::read(&f.ledger_path)
-        .unwrap()
-        .entries
+    let versions: Vec<i64> = ledger_keys(&f.ledger_path)
         .into_iter()
-        .map(|e| e.key_version)
+        .map(|key| key.key_version)
         .collect();
     assert_eq!(versions, vec![1, 2]);
 }
@@ -460,6 +477,87 @@ async fn a_ledger_that_cannot_be_written_rolls_the_delete_back() {
 }
 
 #[tokio::test]
+async fn a_ledger_that_was_renamed_refuses_the_delete() {
+    let f = fixture().await;
+    f.create(&["apps/foo/a"]).await;
+    let moved = f.ledger_path.with_file_name("moved.jsonl");
+    std::fs::rename(&f.ledger_path, &moved).unwrap();
+
+    let err = f.delete(&prefix("foo"), "cid-moved").await.unwrap_err();
+    assert!(
+        matches!(err, EncryptionServiceError::DeletionLedger(_)),
+        "{err:?}"
+    );
+    f.assert_unchanged(&["apps/foo/a"]).await;
+    assert!(f.audit_rows().await.is_empty());
+    assert!(!f.ledger_path.exists());
+    assert!(deletion_ledger::read(&moved).unwrap().records.is_empty());
+}
+
+#[tokio::test]
+async fn a_commit_that_fails_leaves_an_aborted_line_and_deletes_nothing() {
+    let f = fixture().await;
+    f.create(&["apps/foo/a", "apps/foo/b"]).await;
+    f.service
+        .fail_next_delete_commit
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let err = f.delete(&prefix("foo"), "cid-abort").await.unwrap_err();
+    assert!(matches!(err, EncryptionServiceError::Db(_)), "{err:?}");
+    f.assert_unchanged(&["apps/foo/a", "apps/foo/b"]).await;
+    assert!(f.audit_rows().await.is_empty());
+    let records = deletion_ledger::read(&f.ledger_path).unwrap().records;
+    assert_eq!(records.len(), 2);
+    assert!(matches!(&records[0], Record::Intent(i) if i.op == "cid-abort"));
+    assert_eq!(records[1], Record::aborted("cid-abort"));
+
+    // A restore replays the ledger without that operation.
+    let report = deletion_ledger::replay(&f.db, &f.ledger_path)
+        .await
+        .unwrap();
+    assert_eq!(report.aborted_operations, 1);
+    assert_eq!(report.applied, 0);
+    f.assert_unchanged(&["apps/foo/a", "apps/foo/b"]).await;
+}
+
+#[tokio::test]
+async fn a_crash_between_the_intent_and_the_commit_is_settled_at_the_next_start() {
+    let f = fixture().await;
+    f.create(&["apps/foo/a"]).await;
+    // The intent is on disk; the process died before the commit.
+    let ledger = DeletionLedger::open(&f.ledger_path).unwrap();
+    ledger
+        .append(&Record::Intent(Intent {
+            op: "cid-crash".to_string(),
+            network_id: network().to_string(),
+            keys: vec![LedgerKey {
+                key_path: "apps/foo/a".to_string(),
+                key_version: 1,
+            }],
+            deleted_at: "2026-10-23T12:00:00Z".to_string(),
+        }))
+        .unwrap();
+
+    let settled = ledger.settle_open_intents(&f.db).await.unwrap();
+    assert_eq!((settled.committed, settled.aborted), (0, 1));
+    f.assert_unchanged(&["apps/foo/a"]).await;
+
+    // The same crash after the commit: the key is deleted, so it settles as committed.
+    f.delete(&key("apps/foo/a"), "cid-done").await.unwrap();
+    let mut crashed = deletion_ledger::read(&f.ledger_path).unwrap().records;
+    crashed.retain(|record| !matches!(record, Record::Committed(_)));
+    let rewritten = f.ledger_path.with_file_name("crashed.jsonl");
+    let lines: Vec<String> = crashed
+        .iter()
+        .map(|record| serde_json::to_string(record).unwrap())
+        .collect();
+    std::fs::write(&rewritten, lines.join("\n") + "\n").unwrap();
+    let crashed_ledger = DeletionLedger::open(&rewritten).unwrap();
+    let settled = crashed_ledger.settle_open_intents(&f.db).await.unwrap();
+    assert_eq!((settled.committed, settled.aborted), (1, 0));
+}
+
+#[tokio::test]
 async fn creates_racing_a_prefix_delete_are_deleted_too_or_created_after() {
     let f = fixture().await;
     let service = Arc::new(f.service);
@@ -493,11 +591,9 @@ async fn creates_racing_a_prefix_delete_are_deleted_too_or_created_after() {
         "a key is deleted exactly when the delete listed it"
     );
     assert_eq!(
-        deletion_ledger::read(&f.ledger_path)
-            .unwrap()
-            .entries
+        ledger_keys(&f.ledger_path)
             .into_iter()
-            .map(|e| e.key_path)
+            .map(|key| key.key_path)
             .collect::<BTreeSet<_>>(),
         deleted_rows
     );

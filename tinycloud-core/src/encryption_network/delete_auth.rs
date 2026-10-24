@@ -27,14 +27,20 @@ use tinycloud_auth::{
     siwe_recap::{Capability as Recap, VerificationError, RESOURCE_PREFIX},
 };
 
-use crate::{did_resolution::verify_ucan_signature, hash::hash, util::InvocationInfo};
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+use crate::{
+    did_resolution::verify_ucan_signature, hash::hash, models::encryption_nonce,
+    util::InvocationInfo,
+};
 
 use super::{
     canonical::canonical_hash,
     key_id::{self, EncryptionResource, KeyLocation},
+    keys::network_of,
     network_id::NetworkId,
     protocol::{KeyAdminFacts, KEY_ADMIN_TYPE, KEY_DELETE_ACTION},
-    service::{EncryptionService, EncryptionServiceError},
+    service::{now_rfc3339, EncryptionService, EncryptionServiceError},
 };
 
 /// The SIWE `uri` of an owner delete names the node it is for.
@@ -125,14 +131,22 @@ impl DeleteTarget {
     }
 
     /// The SIWE statement the owner signs: the target, then the EIP-5573
-    /// recap sentence for the one capability.
-    fn siwe_statement(&self, recap: &Recap<NoCaveat>) -> String {
+    /// recap sentence for the one capability, joined by one space.
+    pub fn siwe_statement(&self) -> Result<String, EncryptionServiceError> {
         let lead = if self.prefix {
             format!("Delete all TinyCloud keys under {}.", self.urn())
         } else {
             format!("Delete the TinyCloud key {}.", self.urn())
         };
-        format!("{lead} {}", recap.to_statement())
+        let mut recap = Recap::<Value>::default();
+        recap
+            .with_action_convert(
+                self.urn(),
+                KEY_DELETE_ACTION,
+                Vec::<std::collections::BTreeMap<String, Value>>::new(),
+            )
+            .map_err(|_| refuse("the delete target cannot be stated"))?;
+        Ok(format!("{lead} {}", recap.to_statement()))
     }
 }
 
@@ -175,11 +189,10 @@ fn decode_credential(header: &str) -> Result<(Credential, Vec<u8>), EncryptionSe
     Ok((credential, canonical))
 }
 
-/// The one lifetime rule: `now < exp`; with an `iat`, `exp - iat <= 300 s` and
-/// `iat <= now + 30 s`; `nbf <= now + 30 s`. A UCAN carries no `iat`, so
-/// `now` stands in for it: `exp - now <= 300 s`.
-fn check_lifetime(
-    iat: Option<i64>,
+/// The lifetime rule of a SIWE credential: `now < exp`, `0 < exp - iat <= 300 s`,
+/// `iat <= now + 30 s` and `nbf <= now + 30 s`.
+fn check_cacao_lifetime(
+    iat: i64,
     nbf: Option<i64>,
     exp: i64,
     now: i64,
@@ -187,23 +200,37 @@ fn check_lifetime(
     if now >= exp {
         return Err(refuse("credential has expired"));
     }
-    let start = match iat {
-        Some(iat) => {
-            if iat > now + CLOCK_SKEW_SECS {
-                return Err(refuse("credential is not yet valid"));
-            }
-            if exp <= iat {
-                return Err(refuse("credential expires before it is issued"));
-            }
-            iat
-        }
-        None => now,
-    };
-    if exp - start > MAX_LIFETIME_SECS {
+    if iat > now + CLOCK_SKEW_SECS {
+        return Err(refuse("credential is not yet valid"));
+    }
+    if exp <= iat {
+        return Err(refuse("credential expires before it is issued"));
+    }
+    if exp - iat > MAX_LIFETIME_SECS {
         return Err(refuse("credential lifetime exceeds 300 seconds"));
     }
     if nbf.is_some_and(|nbf| nbf > now + CLOCK_SKEW_SECS) {
         return Err(refuse("credential is not yet valid"));
+    }
+    Ok(())
+}
+
+/// The lifetime rule of a UCAN credential. A UCAN has no `iat`, so it must
+/// carry `nbf`, the time it was signed: `nbf <= now + 30 s`, `now < exp` and
+/// `0 < exp - nbf <= 300 s`.
+fn check_ucan_lifetime(nbf: Option<i64>, exp: i64, now: i64) -> Result<(), EncryptionServiceError> {
+    let nbf = nbf.ok_or_else(|| refuse("a delete invocation must carry nbf"))?;
+    if nbf > now + CLOCK_SKEW_SECS {
+        return Err(refuse("credential is not yet valid"));
+    }
+    if now >= exp {
+        return Err(refuse("credential has expired"));
+    }
+    if exp <= nbf {
+        return Err(refuse("credential expires before it is valid"));
+    }
+    if exp - nbf > MAX_LIFETIME_SECS {
+        return Err(refuse("credential lifetime exceeds 300 seconds"));
     }
     Ok(())
 }
@@ -243,6 +270,10 @@ pub async fn verify_owner_delete(
     body_value: &Value,
     now: i64,
 ) -> Result<VerifiedOwnerDelete, EncryptionServiceError> {
+    // The URL network and the target name one network.
+    if &network_of(target.location())? != network {
+        return Err(refuse("the request network is not the target's network"));
+    }
     let owner = network.owner_did();
     let (credential, canonical) = decode_credential(header)?;
     let auth_cid = hash(&canonical).to_cid(0x55).to_string();
@@ -320,7 +351,7 @@ async fn verify_ucan(
     }
     let exp = payload.expiration.as_seconds() as i64;
     let nbf = payload.not_before.map(|t| t.as_seconds() as i64);
-    check_lifetime(None, nbf, exp, now)?;
+    check_ucan_lifetime(nbf, exp, now)?;
     let nonce = payload.nonce.as_deref().unwrap_or_default();
     check_nonce(nonce)?;
     Ok((nonce.to_string(), exp))
@@ -392,7 +423,7 @@ async fn verify_cacao(
     if message.uri.as_str() != format!("{KEY_DELETE_URI_PREFIX}{node_did}") {
         return Err(refuse("the SIWE uri does not name this node"));
     }
-    if message.statement.as_deref() != Some(target.siwe_statement(&recap).as_str()) {
+    if message.statement.as_deref() != Some(target.siwe_statement()?.as_str()) {
         return Err(refuse("the SIWE statement does not state the delete"));
     }
 
@@ -407,7 +438,7 @@ async fn verify_cacao(
         .map(seconds)
         .ok_or_else(|| refuse("the SIWE message has no expiration"))?;
     let nbf = message.not_before.as_ref().map(seconds);
-    check_lifetime(Some(iat), nbf, exp, now)?;
+    check_cacao_lifetime(iat, nbf, exp, now)?;
     check_nonce(&message.nonce)?;
     Ok((message.nonce.clone(), exp))
 }
@@ -427,6 +458,13 @@ impl EncryptionService {
         let now = OffsetDateTime::now_utc().unix_timestamp();
         let verified =
             verify_owner_delete(header, &self.node_did, network, target, body_value, now).await?;
+        // Expired nonces are of no use: a credential past its `exp` is refused
+        // before its nonce is looked at. Timestamps are RFC 3339 UTC and sort
+        // as text.
+        encryption_nonce::Entity::delete_many()
+            .filter(encryption_nonce::Column::ExpiresAt.lt(now_rfc3339()))
+            .exec(&self.db)
+            .await?;
         self.consume_nonce_until(
             &verified.owner,
             &verified.nonce,

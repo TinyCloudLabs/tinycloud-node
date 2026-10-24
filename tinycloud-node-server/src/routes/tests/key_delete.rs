@@ -288,6 +288,35 @@ async fn revoke_refuses_owner_delete_credentials() -> Result<()> {
     let (status, body) = post(&fixture, "/revoke", ucan).await;
     assert_eq!(status, Status::Forbidden, "ucan: {body}");
 
+    // The cause is structural: neither credential names a delegation to
+    // revoke (a revocation targets `ucan:<cid>`), so neither is a revocation.
+    use tinycloud_auth::authorization::TinyCloudRevocation;
+    use tinycloud_core::util::{RevocationError, RevocationInfo};
+    let cacao = wallet.cacao(
+        &prefix,
+        KEY_DELETE,
+        Some(format!("Delete all TinyCloud keys under {prefix}.")),
+        &format!("{KEY_DELETE_URI_PREFIX}{}", fixture.node_did),
+        "nonce0004",
+        300,
+    );
+    let ucan = owner_ucan(
+        &fixture,
+        &fixture.node_did,
+        &prefix_urn(&owner_did(&fixture), "foo"),
+        KEY_DELETE,
+    )?;
+    for (label, header) in [("cacao", &cacao), ("ucan", &ucan)] {
+        let (decoded, _) = TinyCloudRevocation::decode(header)?;
+        assert!(
+            matches!(
+                RevocationInfo::try_from(decoded),
+                Err(RevocationError::InvalidTarget)
+            ),
+            "{label}"
+        );
+    }
+
     assert_eq!(
         revocation::Entity::find().count(&fixture.conn).await?,
         0,
@@ -299,8 +328,7 @@ async fn revoke_refuses_owner_delete_credentials() -> Result<()> {
 // ------------------------------------------------------------ delete route
 
 use super::encryption_keys::{
-    admin_auth, created_key, describe_auth, describe_get, invocation, invoke_named, post_json,
-    setup, DecryptCase,
+    created_key, describe_auth, describe_get, invoke_named, post_json, setup, DecryptCase,
 };
 use tinycloud_core::encryption_network::{
     deletion_ledger, key_id::KeyLocation, CreateNetworkRequest, EncryptionService, NetworkId,
@@ -312,15 +340,58 @@ fn delete_url(network: &str) -> String {
     format!("/encryption/networks/{network}/key-actions/delete")
 }
 
+fn unix_now() -> i64 {
+    OffsetDateTime::now_utc().unix_timestamp()
+}
+
+/// A UCAN by the fixture owner with the given capabilities and facts, valid
+/// from `nbf` until `exp`.
+fn delete_ucan(
+    fixture: &KvSyncFixture,
+    audience: &str,
+    caps: &[(&str, &str)],
+    facts: Vec<Value>,
+    nbf: Option<i64>,
+    exp: i64,
+) -> Result<String> {
+    let mut capabilities = Capabilities::new();
+    for (resource, ability) in caps {
+        capabilities.with_action(
+            resource.parse()?,
+            ability.parse::<UcanAbility>()?,
+            [BTreeMap::<String, Value>::new()],
+        );
+    }
+    Ok(Payload {
+        issuer: fixture.owner_vm.parse::<DIDURLBuf>()?,
+        audience: audience.parse::<DIDBuf>()?,
+        not_before: nbf
+            .map(|t| NumericDate::try_from_seconds(t as f64))
+            .transpose()?,
+        expiration: NumericDate::try_from_seconds(exp as f64)?,
+        nonce: Some(fixture.next_nonce()),
+        facts: Some(facts),
+        proof: vec![],
+        attenuation: capabilities,
+    }
+    .sign(
+        fixture.owner.get_algorithm().unwrap_or_default(),
+        &fixture.owner,
+    )?
+    .encode()?)
+}
+
 /// A UCAN delete invocation by the fixture owner for `key_path` (a prefix
-/// keeps its trailing `/`).
+/// keeps its trailing `/`), signed now and valid for 300 seconds.
 fn delete_auth(fixture: &KvSyncFixture, network: &str, key_path: &str) -> Result<String> {
-    admin_auth(
+    let now = unix_now();
+    delete_ucan(
         fixture,
-        network,
-        key_path,
-        KEY_DELETE,
-        &json!({ "keyPath": key_path }),
+        &fixture.node_did,
+        &[(key_uri_for(network, key_path).as_str(), KEY_DELETE)],
+        vec![admin_fact(&fixture.node_did, network, key_path)],
+        Some(now),
+        now + 300,
     )
 }
 
@@ -347,9 +418,14 @@ fn ledger_paths(fixture: &KvSyncFixture) -> Vec<String> {
         .expect("ledger directory is managed");
     deletion_ledger::read(&dir.0.path().join("deletion-ledger.jsonl"))
         .expect("ledger reads")
-        .entries
+        .records
         .into_iter()
-        .map(|entry| entry.key_path)
+        .filter_map(|record| match record {
+            deletion_ledger::Record::Intent(intent) => Some(intent.keys),
+            _ => None,
+        })
+        .flatten()
+        .map(|key| key.key_path)
         .collect()
 }
 
@@ -494,50 +570,82 @@ async fn delete_refuses_a_credential_that_does_not_match_the_request() -> Result
     let (fixture, network) = setup().await?;
     created_key(&fixture, &network, "apps/foo/a").await;
     created_key(&fixture, &network, "apps/bar/a").await;
-    let owner_only = |text: &str| text.starts_with("owner_only");
+    let refused = |status: Status, text: &str, reason: &str| {
+        assert_eq!(status, Status::Forbidden, "{text}");
+        assert!(text.starts_with("owner_only"), "{text}");
+        assert!(text.contains(reason), "wanted {reason:?}: {text}");
+    };
+    let not_the_target = "not key.delete on exactly the requested target";
 
     // The body names another prefix than the credential.
     let auth = delete_auth(&fixture, &network, "apps/foo/")?;
     let (status, text) = delete_with(&fixture, &network, "apps/bar/", &auth).await;
-    assert_eq!(status, Status::Forbidden, "{text}");
-    assert!(owner_only(&text), "{text}");
+    refused(status, &text, not_the_target);
 
     // The body names the key, the credential its prefix.
     let auth = delete_auth(&fixture, &network, "apps/foo/")?;
     let (status, text) = delete_with(&fixture, &network, "apps/foo/a", &auth).await;
-    assert_eq!(status, Status::Forbidden, "{text}");
-    assert!(owner_only(&text), "{text}");
+    refused(status, &text, not_the_target);
 
     // key.block is not key.delete.
-    let block = admin_auth(
+    let now = unix_now();
+    let mut block_fact = admin_fact(&fixture.node_did, &network, "apps/foo/");
+    block_fact["action"] = json!(KEY_BLOCK_ACTION);
+    let block = delete_ucan(
         &fixture,
-        &network,
-        "apps/foo/",
-        KEY_BLOCK_ACTION,
-        &json!({ "keyPath": "apps/foo/" }),
+        &fixture.node_did,
+        &[(
+            key_uri_for(&network, "apps/foo/").as_str(),
+            KEY_BLOCK_ACTION,
+        )],
+        vec![block_fact],
+        Some(now),
+        now + 300,
     )?;
     let (status, text) = delete_with(&fixture, &network, "apps/foo/", &block).await;
-    assert_eq!(status, Status::Forbidden, "{text}");
-    assert!(owner_only(&text), "{text}");
+    refused(status, &text, not_the_target);
 
     // A credential addressed to another node.
-    let prefix = key_uri_for(&network, "apps/foo/");
-    let other_node = invocation(
+    let other_node = delete_ucan(
         &fixture,
         "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK",
-        &[(prefix.as_str(), KEY_DELETE)],
+        &[(key_uri_for(&network, "apps/foo/").as_str(), KEY_DELETE)],
         vec![admin_fact(&fixture.node_did, &network, "apps/foo/")],
+        Some(now),
+        now + 300,
     )?;
     let (status, text) = delete_with(&fixture, &network, "apps/foo/", &other_node).await;
-    assert_eq!(status, Status::Forbidden, "{text}");
-    assert!(owner_only(&text), "{text}");
+    refused(status, &text, "audience is not this node");
 
     // A credential for another network than the URL names.
     let auth = delete_auth(&fixture, &network, "apps/foo/")?;
     let other_network = format!("{}x", network);
     let (status, text) = delete_with(&fixture, &other_network, "apps/foo/", &auth).await;
-    assert_eq!(status, Status::Forbidden, "{text}");
-    assert!(owner_only(&text), "{text}");
+    refused(status, &text, not_the_target);
+
+    // A UCAN without nbf has no start to measure its lifetime from.
+    let no_nbf = delete_ucan(
+        &fixture,
+        &fixture.node_did,
+        &[(key_uri_for(&network, "apps/foo/").as_str(), KEY_DELETE)],
+        vec![admin_fact(&fixture.node_did, &network, "apps/foo/")],
+        None,
+        now + 300,
+    )?;
+    let (status, text) = delete_with(&fixture, &network, "apps/foo/", &no_nbf).await;
+    refused(status, &text, "must carry nbf");
+
+    // A long-lived UCAN is refused for its whole life, also near its end.
+    let long_lived = delete_ucan(
+        &fixture,
+        &fixture.node_did,
+        &[(key_uri_for(&network, "apps/foo/").as_str(), KEY_DELETE)],
+        vec![admin_fact(&fixture.node_did, &network, "apps/foo/")],
+        Some(now - 35_760),
+        now + 240,
+    )?;
+    let (status, text) = delete_with(&fixture, &network, "apps/foo/", &long_lived).await;
+    refused(status, &text, "lifetime exceeds 300 seconds");
 
     // No Authorization header.
     let response = fixture

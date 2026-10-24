@@ -1,9 +1,9 @@
 //! `key.delete`: the effect of an owner-signed delete on key rows.
 //!
 //! One transaction, taken under the network row lock that `key.create`,
-//! `key.block` and `key.unblock` also take. Every row it deletes is recorded
-//! in the deletion ledger before the transaction commits, so the ledger always
-//! holds every committed deletion.
+//! `key.block` and `key.unblock` also take. The delete's intent is appended
+//! to the deletion ledger before the transaction commits and settled after it,
+//! so the ledger always names every committed deletion.
 
 use sea_orm::{
     sea_query::Expr, ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseTransaction,
@@ -18,7 +18,7 @@ use crate::{
 use super::{
     canonical::hash_hex,
     delete_auth::{DeleteTarget, VerifiedOwnerDelete},
-    deletion_ledger::{DeletionLedger, LedgerEntry, KEY_STATE_DELETED},
+    deletion_ledger::{DeletionLedger, Intent, LedgerKey, Record},
     key_id::KeyKind,
     keys::{find_key_row, lock_network_row, KeyState},
     network_id::NetworkId,
@@ -66,19 +66,40 @@ impl EncryptionService {
         let tx = begin_write_transaction(&self.db, None).await?;
         // Every outcome ends the transaction here, so the network row lock is
         // released before this call returns.
-        match self
+        let result = self
             .delete_keys_in(&tx, network, target, verified, &ledger)
-            .await
-        {
-            Ok(outcome) => {
-                tx.commit().await?;
-                Ok(outcome)
-            }
+            .await;
+        let (outcome, op) = match result {
+            Ok(done) => done,
             Err(err) => {
                 let _ = tx.rollback().await;
-                Err(err)
+                return Err(err);
+            }
+        };
+        #[cfg(test)]
+        if self
+            .fail_next_delete_commit
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            let _ = tx.rollback().await;
+            self.settle_aborted(&ledger, op.as_deref()).await;
+            return Err(EncryptionServiceError::Db(sea_orm::DbErr::Custom(
+                "injected commit failure".to_string(),
+            )));
+        }
+        if let Err(err) = tx.commit().await {
+            // The commit did not happen: say so before answering.
+            self.settle_aborted(&ledger, op.as_deref()).await;
+            return Err(err.into());
+        }
+        if let Some(op) = op {
+            // A missing `committed` line is settled from the database at the
+            // next start, so a failure here does not undo the delete.
+            if ledger.append_async(Record::committed(&op)).await.is_err() {
+                ::tracing::warn!("deletion ledger: committed line was not written");
             }
         }
+        Ok(outcome)
     }
 
     async fn delete_keys_in(
@@ -88,7 +109,7 @@ impl EncryptionService {
         target: &DeleteTarget,
         verified: &VerifiedOwnerDelete,
         ledger: &std::sync::Arc<DeletionLedger>,
-    ) -> Result<DeleteOutcome, EncryptionServiceError> {
+    ) -> Result<(DeleteOutcome, Option<String>), EncryptionServiceError> {
         lock_network_row(tx, network).await?;
         if encryption_network::Entity::find_by_id(network.to_string())
             .one(tx)
@@ -127,12 +148,12 @@ impl EncryptionService {
 
         let now = now_rfc3339();
         let mut deleted = Vec::with_capacity(to_delete.len());
-        let mut entries = Vec::with_capacity(to_delete.len());
+        let mut ledger_keys = Vec::with_capacity(to_delete.len());
         for row in to_delete {
             let updated = encryption_network_key::Entity::update_many()
                 .col_expr(
                     encryption_network_key::Column::State,
-                    Expr::value(KEY_STATE_DELETED),
+                    Expr::value(KeyState::Deleted.as_str()),
                 )
                 .col_expr(
                     encryption_network_key::Column::SealedSeed,
@@ -161,24 +182,48 @@ impl EncryptionService {
             }
             .insert(tx)
             .await?;
-            entries.push(LedgerEntry {
-                network_id: network.to_string(),
+            ledger_keys.push(LedgerKey {
                 key_path: row.key_path.clone(),
                 key_version: row.key_version,
-                deleted_at: now.clone(),
             });
             deleted.push(row.key_path);
         }
 
-        // The ledger lines are durable before the commit: a crash after this
-        // point leaves the ledger holding at least every committed deletion.
-        ledger.append_blocking_task(entries).await?;
+        // The intent is durable before the commit: a crash after this point
+        // leaves an open intent that the next start settles against the
+        // database, so the ledger always names every committed deletion.
+        let op = if ledger_keys.is_empty() {
+            None
+        } else {
+            ledger
+                .append_async(Record::Intent(Intent {
+                    op: verified.auth_cid.clone(),
+                    network_id: network.to_string(),
+                    keys: ledger_keys,
+                    deleted_at: now,
+                }))
+                .await?;
+            Some(verified.auth_cid.clone())
+        };
 
-        Ok(DeleteOutcome {
-            key_path: target.key_path(),
-            deleted,
-            already_deleted,
-        })
+        Ok((
+            DeleteOutcome {
+                key_path: target.key_path(),
+                deleted,
+                already_deleted,
+            },
+            op,
+        ))
+    }
+
+    /// Appends `aborted` for an operation whose commit did not happen. A
+    /// failure here is settled from the database at the next start.
+    async fn settle_aborted(&self, ledger: &std::sync::Arc<DeletionLedger>, op: Option<&str>) {
+        if let Some(op) = op {
+            if ledger.append_async(Record::aborted(op)).await.is_err() {
+                ::tracing::warn!("deletion ledger: aborted line was not written");
+            }
+        }
     }
 }
 

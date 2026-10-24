@@ -841,10 +841,26 @@ pub async fn app_with_control(
         .map(Arc::new);
     let encryption_service = encryption_service
         .with_sqlite_writer_lock(tinycloud.sqlite_writer_lock())
-        .with_deletion_ledger(deletion_ledger);
+        .with_deletion_ledger(deletion_ledger.clone());
     // Runs after the migrations: a key row under `apps/` that is not a
     // deletable key stops the node from starting.
     tinycloud_core::encryption_network::keys::ensure_no_deterministic_app_keys(&seed_conn).await?;
+    // A delete that was cut off between its ledger intent and its settling
+    // line is settled from the database before any route is served.
+    if let Some(ledger) = &deletion_ledger {
+        let settled = ledger
+            .settle_open_intents(&seed_conn)
+            .await
+            .map_err(|error| anyhow::anyhow!("failed to settle the deletion ledger: {error}"))?;
+        if ledger.dropped_tail_bytes() > 0 || settled != Default::default() {
+            ::tracing::warn!(
+                committed = settled.committed,
+                aborted = settled.aborted,
+                dropped_tail_bytes = ledger.dropped_tail_bytes(),
+                "deletion ledger settled at start"
+            );
+        }
+    }
     let database_artifact_repository: Arc<dyn DatabaseArtifactRepository> =
         Arc::new(SizeTrackingArtifactRepository::new(
             Arc::new(node_artifact_repository(&tinycloud)),

@@ -364,10 +364,10 @@ async fn replay_deletion_ledger(args: ReplayArgs) -> Result<()> {
     let db = crate::connect_database(&config).await?;
     let report = tinycloud_core::encryption_network::deletion_ledger::replay(&db, &ledger).await?;
     emit_json(&report, args.json.json)?;
-    if !report.malformed_lines.is_empty() {
+    if report.refused > 0 {
         anyhow::bail!(
-            "the ledger has {} line(s) that are not ledger entries; every valid entry was applied",
-            report.malformed_lines.len()
+            "the ledger has {} key entr(ies) that are not valid keys; every valid entry was applied",
+            report.refused
         );
     }
     Ok(())

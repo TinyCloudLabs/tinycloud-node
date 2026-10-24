@@ -1,14 +1,25 @@
 //! Append-only deletion ledger, kept outside the database.
 //!
-//! Every deleted key adds one JSON line `{networkId, keyPath, keyVersion,
-//! deletedAt}`. The delete path appends and fsyncs the lines of a delete
-//! before its database transaction commits, so a crash cannot lose a
-//! deletion that the database recorded. [`replay`] re-applies a ledger to a
-//! database (seed NULL, state `deleted`); a restore runs it as its first step.
+//! One JSON line per delete OPERATION, then one line that settles it:
 //!
-//! The file is only ever appended to. Replay is idempotent.
+//! - an intent `{op, networkId, keys: [{keyPath, keyVersion}], deletedAt}`,
+//!   appended and fsynced after the delete's database changes and before the
+//!   transaction commits (`op` is the CID of the owner's credential);
+//! - `{"committed": op}` after the commit, or `{"aborted": op}` when the commit
+//!   failed while the process lives.
+//!
+//! A crash between the intent and its settling line leaves the intent open.
+//! Every node start settles open intents against the database before the
+//! routes mount ([`DeletionLedger::settle_open_intents`]): rows deleted at that
+//! version mean the commit happened, otherwise the delete is aborted.
+//!
+//! [`replay`] re-applies a ledger to a database (seed NULL, state `deleted`)
+//! and is the first step of a restore. It applies committed and still-open
+//! intents and skips aborted ones. The file is only ever appended to, never
+//! rotated.
 
 use std::{
+    collections::HashMap,
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -20,19 +31,67 @@ use serde::{Deserialize, Serialize};
 
 use crate::{db::begin_write_transaction, models::encryption_network_key};
 
-use super::service::{now_rfc3339, EncryptionServiceError};
+use super::{
+    key_id::{KeyKind, KeyLocation},
+    keys::KeyState,
+    network_id::NetworkId,
+    service::{now_rfc3339, EncryptionServiceError},
+};
 
-/// Key row state written by a delete.
-pub const KEY_STATE_DELETED: &str = "deleted";
-
-/// One deleted key.
+/// One key a delete operation deleted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct LedgerEntry {
-    pub network_id: String,
+pub struct LedgerKey {
     pub key_path: String,
     pub key_version: i64,
+}
+
+/// One delete operation: every key it deleted, in one line.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Intent {
+    /// CID of the credential the owner signed.
+    pub op: String,
+    pub network_id: String,
+    pub keys: Vec<LedgerKey>,
     pub deleted_at: String,
+}
+
+/// The operation `committed` names has committed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Committed {
+    pub committed: String,
+}
+
+/// The operation `aborted` names did not commit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Aborted {
+    pub aborted: String,
+}
+
+/// A ledger line.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Record {
+    Intent(Intent),
+    Committed(Committed),
+    Aborted(Aborted),
+}
+
+impl Record {
+    pub fn committed(op: &str) -> Self {
+        Self::Committed(Committed {
+            committed: op.to_string(),
+        })
+    }
+
+    pub fn aborted(op: &str) -> Self {
+        Self::Aborted(Aborted {
+            aborted: op.to_string(),
+        })
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -43,6 +102,10 @@ pub enum DeletionLedgerError {
     Path(&'static str),
     #[error("deletion ledger entry could not be encoded: {0}")]
     Encode(#[from] serde_json::Error),
+    #[error("deletion ledger file was renamed or removed")]
+    Moved,
+    #[error("deletion ledger line {0} is malformed")]
+    Malformed(usize),
     #[error("database error: {0}")]
     Db(#[from] sea_orm::DbErr),
 }
@@ -81,13 +144,16 @@ pub fn validate_path(path: &Path) -> Result<(), &'static str> {
 pub struct DeletionLedger {
     path: PathBuf,
     file: Mutex<File>,
+    dropped_tail_bytes: usize,
 }
 
 impl DeletionLedger {
-    /// Opens (creating if absent) the ledger for appending. The file is
-    /// created with mode 0600. A final line left without its newline by a
-    /// crash is terminated so later appends start on a fresh line. The file
-    /// and its directory are fsynced before this returns.
+    /// Opens (creating if absent) the ledger for appending. The file mode is
+    /// forced to 0600. A final line that a crash left unterminated is kept if
+    /// it is a whole record and otherwise dropped: a record is acted on only
+    /// after its append returned, so an unterminated partial line was never
+    /// followed by a commit. The file and its directory are fsynced before
+    /// this returns.
     pub fn open(path: &Path) -> Result<Self, DeletionLedgerError> {
         validate_path(path).map_err(DeletionLedgerError::Path)?;
         let mut options = OpenOptions::new();
@@ -98,15 +164,12 @@ impl DeletionLedger {
             options.mode(0o600);
         }
         let mut file = options.open(path)?;
-        let length = file.metadata()?.len();
-        if length > 0 {
-            let mut last = [0u8; 1];
-            file.seek(SeekFrom::Start(length - 1))?;
-            file.read_exact(&mut last)?;
-            if last[0] != b'\n' {
-                file.write_all(b"\n")?;
-            }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         }
+        let dropped_tail_bytes = repair_tail(&mut file)?;
         file.sync_all()?;
         if let Some(parent) = path.parent() {
             File::open(parent)?.sync_all()?;
@@ -114,6 +177,7 @@ impl DeletionLedger {
         Ok(Self {
             path: path.to_path_buf(),
             file: Mutex::new(file),
+            dropped_tail_bytes,
         })
     }
 
@@ -123,6 +187,7 @@ impl DeletionLedger {
         Self {
             path: path.to_path_buf(),
             file: Mutex::new(file),
+            dropped_tail_bytes: 0,
         }
     }
 
@@ -130,58 +195,180 @@ impl DeletionLedger {
         &self.path
     }
 
-    /// Appends one line per entry in a single write, then fsyncs. Returns only
-    /// after the lines are durable. Blocking; async callers use
-    /// [`DeletionLedger::append_blocking_task`].
-    pub fn append(&self, entries: &[LedgerEntry]) -> Result<(), DeletionLedgerError> {
-        if entries.is_empty() {
-            return Ok(());
-        }
-        let mut lines = Vec::new();
-        for entry in entries {
-            serde_json::to_writer(&mut lines, entry)?;
-            lines.push(b'\n');
-        }
+    /// Bytes of an unfinished final line that [`DeletionLedger::open`] removed.
+    pub fn dropped_tail_bytes(&self) -> usize {
+        self.dropped_tail_bytes
+    }
+
+    /// Appends one line and fsyncs. Returns only after the line is durable, and
+    /// fails, writing nothing, if the file the handle names is no longer the
+    /// file at the ledger path. Blocking; async callers use
+    /// [`DeletionLedger::append_async`].
+    pub fn append(&self, record: &Record) -> Result<(), DeletionLedgerError> {
+        let mut line = serde_json::to_vec(record)?;
+        line.push(b'\n');
         let mut file = self
             .file
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        file.write_all(&lines)?;
+        self.check_not_moved(&file)?;
+        file.write_all(&line)?;
         file.sync_all()?;
         Ok(())
     }
 
     /// [`DeletionLedger::append`] on the blocking pool.
-    pub async fn append_blocking_task(
-        self: &Arc<Self>,
-        entries: Vec<LedgerEntry>,
-    ) -> Result<(), DeletionLedgerError> {
+    pub async fn append_async(self: &Arc<Self>, record: Record) -> Result<(), DeletionLedgerError> {
         let ledger = Arc::clone(self);
-        tokio::task::spawn_blocking(move || ledger.append(&entries))
+        tokio::task::spawn_blocking(move || ledger.append(&record))
             .await
             .map_err(|err| std::io::Error::other(err.to_string()))?
     }
+
+    #[cfg(unix)]
+    fn check_not_moved(&self, file: &File) -> Result<(), DeletionLedgerError> {
+        use std::os::unix::fs::MetadataExt;
+        let handle = file.metadata()?;
+        let on_disk = std::fs::metadata(&self.path).map_err(|_| DeletionLedgerError::Moved)?;
+        if handle.dev() != on_disk.dev() || handle.ino() != on_disk.ino() {
+            return Err(DeletionLedgerError::Moved);
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn check_not_moved(&self, _file: &File) -> Result<(), DeletionLedgerError> {
+        Ok(())
+    }
+
+    /// Settles every open intent against the database: the delete committed
+    /// when each of its keys is `deleted` at the intent's key version (or at a
+    /// later one, after a re-create), otherwise it did not. Appends the
+    /// matching `committed` or `aborted` line. Runs at every node start,
+    /// before the routes mount.
+    pub async fn settle_open_intents<C: ConnectionTrait>(
+        &self,
+        db: &C,
+    ) -> Result<SettleReport, DeletionLedgerError> {
+        let contents = read(&self.path)?;
+        let mut report = SettleReport::default();
+        for intent in contents.open_intents() {
+            let mut committed = true;
+            for key in &intent.keys {
+                let row = encryption_network_key::Entity::find_by_id((
+                    intent.network_id.clone(),
+                    key.key_path.clone(),
+                ))
+                .one(db)
+                .await?;
+                let deleted = row.is_some_and(|row| {
+                    row.key_version > key.key_version
+                        || (row.key_version == key.key_version
+                            && row.state == KeyState::Deleted.as_str())
+                });
+                if !deleted {
+                    committed = false;
+                    break;
+                }
+            }
+            if committed {
+                self.append(&Record::committed(&intent.op))?;
+                report.committed += 1;
+            } else {
+                self.append(&Record::aborted(&intent.op))?;
+                report.aborted += 1;
+            }
+        }
+        Ok(report)
+    }
+}
+
+/// Result of [`DeletionLedger::settle_open_intents`].
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
+pub struct SettleReport {
+    pub committed: usize,
+    pub aborted: usize,
+}
+
+/// Keeps a final line that is a whole record (adding its newline) and removes
+/// one that is not. Returns the bytes removed.
+fn repair_tail(file: &mut File) -> Result<usize, DeletionLedgerError> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    if bytes.last().is_none_or(|last| *last == b'\n') {
+        return Ok(0);
+    }
+    let start = bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |at| at + 1);
+    if serde_json::from_slice::<Record>(&bytes[start..]).is_ok() {
+        file.write_all(b"\n")?;
+        return Ok(0);
+    }
+    file.set_len(start as u64)?;
+    Ok(bytes.len() - start)
 }
 
 /// What a ledger file holds.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct LedgerContents {
-    pub entries: Vec<LedgerEntry>,
-    /// 1-based numbers of non-empty lines that are not a ledger entry.
-    pub malformed_lines: Vec<usize>,
+    pub records: Vec<Record>,
+    /// The final line is not a whole record.
+    pub torn_tail: bool,
 }
 
-/// Reads every line of a ledger file.
+impl LedgerContents {
+    /// Intents that no `committed` or `aborted` line names.
+    pub fn open_intents(&self) -> Vec<&Intent> {
+        let settled: std::collections::HashSet<&str> = self
+            .records
+            .iter()
+            .filter_map(|record| match record {
+                Record::Committed(Committed { committed }) => Some(committed.as_str()),
+                Record::Aborted(Aborted { aborted }) => Some(aborted.as_str()),
+                Record::Intent(_) => None,
+            })
+            .collect();
+        self.intents()
+            .filter(|intent| !settled.contains(intent.op.as_str()))
+            .collect()
+    }
+
+    fn intents(&self) -> impl Iterator<Item = &Intent> {
+        self.records.iter().filter_map(|record| match record {
+            Record::Intent(intent) => Some(intent),
+            _ => None,
+        })
+    }
+
+    fn aborted_ops(&self) -> std::collections::HashSet<&str> {
+        self.records
+            .iter()
+            .filter_map(|record| match record {
+                Record::Aborted(Aborted { aborted }) => Some(aborted.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+/// Reads every line of a ledger file. An unfinished final line is reported as
+/// `torn_tail`; a malformed line anywhere else is an error.
 pub fn read(path: &Path) -> Result<LedgerContents, DeletionLedgerError> {
     let bytes = std::fs::read(path)?;
+    let lines: Vec<(usize, &[u8])> = bytes
+        .split(|byte| *byte == b'\n')
+        .enumerate()
+        .filter(|(_, line)| !line.iter().all(u8::is_ascii_whitespace))
+        .collect();
     let mut contents = LedgerContents::default();
-    for (index, line) in bytes.split(|byte| *byte == b'\n').enumerate() {
-        if line.iter().all(u8::is_ascii_whitespace) {
-            continue;
-        }
-        match serde_json::from_slice::<LedgerEntry>(line) {
-            Ok(entry) => contents.entries.push(entry),
-            Err(_) => contents.malformed_lines.push(index + 1),
+    for (position, (index, line)) in lines.iter().enumerate() {
+        match serde_json::from_slice::<Record>(line) {
+            Ok(record) => contents.records.push(record),
+            Err(_) if position + 1 == lines.len() => contents.torn_tail = true,
+            Err(_) => return Err(DeletionLedgerError::Malformed(index + 1)),
         }
     }
     Ok(contents)
@@ -191,34 +378,54 @@ pub fn read(path: &Path) -> Result<LedgerContents, DeletionLedgerError> {
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReplayReport {
-    pub entries: usize,
+    /// Delete operations in the ledger.
+    pub operations: usize,
+    /// Operations skipped because they aborted.
+    pub aborted_operations: usize,
     /// Rows set to `deleted` with a NULL seed.
     pub applied: usize,
     /// Rows already `deleted` with no seed.
     pub already_deleted: usize,
-    /// Rows whose key version is newer than the ledger entry (a later
-    /// re-create): left alone.
+    /// Rows whose key version is newer than the ledger's (a later re-create):
+    /// left alone.
     pub newer_version: usize,
-    /// Entries with no row in this database.
+    /// Keys with no row in this database.
     pub missing_row: usize,
-    pub malformed_lines: Vec<usize>,
+    /// Keys whose row is not a deletable key: left alone.
+    pub not_deletable: usize,
+    /// Keys whose network id or path is not a valid key: skipped.
+    pub refused: usize,
+    /// The final line was not a whole record.
+    pub torn_tail: bool,
 }
 
-/// Re-applies the ledger at `path`: every named key row whose version is at
-/// most the entry's is set to `deleted` with a NULL seed. One transaction;
-/// idempotent. Rows the database does not have are counted, not created.
+/// Re-applies the ledger at `path`: every named key whose row is a deletable
+/// key of at most the entry's version is set to `deleted` with a NULL seed.
+/// Committed and still-open operations apply; aborted ones do not. One
+/// transaction; idempotent. Rows the database does not have are counted, not
+/// created.
 pub async fn replay<C: TransactionTrait>(
     db: &C,
     path: &Path,
 ) -> Result<ReplayReport, DeletionLedgerError> {
     let contents = read(path)?;
+    let aborted = contents.aborted_ops();
     let mut report = ReplayReport {
-        entries: contents.entries.len(),
-        malformed_lines: contents.malformed_lines,
+        torn_tail: contents.torn_tail,
         ..ReplayReport::default()
     };
+    let mut to_apply = Vec::new();
+    let mut seen = HashMap::new();
+    for intent in contents.intents() {
+        report.operations += 1;
+        if aborted.contains(intent.op.as_str()) {
+            report.aborted_operations += 1;
+        } else if seen.insert(intent.op.as_str(), ()).is_none() {
+            to_apply.push(intent);
+        }
+    }
     let tx = begin_write_transaction(db, None).await?;
-    match apply(&tx, &contents.entries, &mut report).await {
+    match apply(&tx, &to_apply, &mut report).await {
         Ok(()) => tx.commit().await?,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -230,34 +437,51 @@ pub async fn replay<C: TransactionTrait>(
 
 async fn apply<C: ConnectionTrait>(
     db: &C,
-    entries: &[LedgerEntry],
+    intents: &[&Intent],
     report: &mut ReplayReport,
 ) -> Result<(), DeletionLedgerError> {
-    for entry in entries {
-        let row = encryption_network_key::Entity::find_by_id((
-            entry.network_id.clone(),
-            entry.key_path.clone(),
-        ))
-        .one(db)
-        .await?;
-        let Some(row) = row else {
-            report.missing_row += 1;
+    for intent in intents {
+        let Ok(network) = intent.network_id.parse::<NetworkId>() else {
+            report.refused += intent.keys.len();
             continue;
         };
-        if row.key_version > entry.key_version {
-            report.newer_version += 1;
-            continue;
+        for key in &intent.keys {
+            // A path the key grammar refuses is never applied.
+            if network.to_string() != intent.network_id
+                || KeyLocation::new(&network, &key.key_path).is_err()
+            {
+                report.refused += 1;
+                continue;
+            }
+            let row = encryption_network_key::Entity::find_by_id((
+                intent.network_id.clone(),
+                key.key_path.clone(),
+            ))
+            .one(db)
+            .await?;
+            let Some(row) = row else {
+                report.missing_row += 1;
+                continue;
+            };
+            if KeyKind::parse(&row.kind) != Some(KeyKind::Deletable) {
+                report.not_deletable += 1;
+                continue;
+            }
+            if row.key_version > key.key_version {
+                report.newer_version += 1;
+                continue;
+            }
+            if row.state == KeyState::Deleted.as_str() && row.sealed_seed.is_none() {
+                report.already_deleted += 1;
+                continue;
+            }
+            let mut active: encryption_network_key::ActiveModel = row.into();
+            active.state = Set(KeyState::Deleted.as_str().to_string());
+            active.sealed_seed = Set(None);
+            active.updated_at = Set(now_rfc3339());
+            active.update(db).await?;
+            report.applied += 1;
         }
-        if row.state == KEY_STATE_DELETED && row.sealed_seed.is_none() {
-            report.already_deleted += 1;
-            continue;
-        }
-        let mut active: encryption_network_key::ActiveModel = row.into();
-        active.state = Set(KEY_STATE_DELETED.to_string());
-        active.sealed_seed = Set(None);
-        active.updated_at = Set(now_rfc3339());
-        active.update(db).await?;
-        report.applied += 1;
     }
     Ok(())
 }

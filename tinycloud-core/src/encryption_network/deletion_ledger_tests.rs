@@ -1,4 +1,4 @@
-//! Deletion ledger: durable append, tail repair, and replay onto a database.
+//! Deletion ledger: durable append, tail repair, settling and replay.
 
 use std::path::Path;
 
@@ -8,19 +8,38 @@ use sea_orm::{
 use sea_orm_migration::MigratorTrait;
 
 use super::deletion_ledger::{
-    read, replay, validate_path, DeletionLedger, LedgerEntry, ReplayReport,
+    read, replay, validate_path, DeletionLedger, DeletionLedgerError, Intent, LedgerKey, Record,
+    ReplayReport, SettleReport,
 };
 use crate::{migrations::Migrator, models::encryption_network_key};
 
-const NETWORK: &str = "did:key:z6MkOwner:default";
+const OWNER: &str = "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
 
-fn entry(path: &str, version: i64) -> LedgerEntry {
-    LedgerEntry {
-        network_id: NETWORK.to_string(),
-        key_path: path.to_string(),
-        key_version: version,
+fn network() -> String {
+    super::NetworkId::new(OWNER.to_string(), "default".to_string())
+        .unwrap()
+        .to_string()
+}
+
+fn intent(op: &str, keys: &[(&str, i64)]) -> Intent {
+    Intent {
+        op: op.to_string(),
+        network_id: network(),
+        keys: keys
+            .iter()
+            .map(|(key_path, key_version)| LedgerKey {
+                key_path: key_path.to_string(),
+                key_version: *key_version,
+            })
+            .collect(),
         deleted_at: "2026-10-23T12:00:00Z".to_string(),
     }
+}
+
+fn ledger_in(dir: &tempfile::TempDir) -> (std::path::PathBuf, DeletionLedger) {
+    let path = dir.path().join("ledger.jsonl");
+    let ledger = DeletionLedger::open(&path).unwrap();
+    (path, ledger)
 }
 
 async fn fresh_db() -> DatabaseConnection {
@@ -31,11 +50,18 @@ async fn fresh_db() -> DatabaseConnection {
     db
 }
 
-async fn insert_key(db: &DatabaseConnection, path: &str, state: &str, seed: bool, version: i64) {
+async fn insert_key(
+    db: &DatabaseConnection,
+    path: &str,
+    kind: &str,
+    state: &str,
+    seed: bool,
+    version: i64,
+) {
     encryption_network_key::ActiveModel {
-        network_id: Set(NETWORK.to_string()),
+        network_id: Set(network()),
         key_path: Set(path.to_string()),
-        kind: Set("deletable".to_string()),
+        kind: Set(kind.to_string()),
         state: Set(state.to_string()),
         public_key: Set(vec![7; 32]),
         sealed_seed: Set(seed.then(|| vec![9; 60])),
@@ -48,8 +74,12 @@ async fn insert_key(db: &DatabaseConnection, path: &str, state: &str, seed: bool
     .unwrap();
 }
 
+async fn active_key(db: &DatabaseConnection, path: &str) {
+    insert_key(db, path, "deletable", "active", true, 1).await;
+}
+
 async fn row(db: &DatabaseConnection, path: &str) -> encryption_network_key::Model {
-    encryption_network_key::Entity::find_by_id((NETWORK.to_string(), path.to_string()))
+    encryption_network_key::Entity::find_by_id((network(), path.to_string()))
         .one(db)
         .await
         .unwrap()
@@ -57,80 +87,140 @@ async fn row(db: &DatabaseConnection, path: &str) -> encryption_network_key::Mod
 }
 
 #[test]
-fn append_writes_one_json_line_per_entry_and_reopening_keeps_appending() {
+fn an_operation_is_one_line_and_is_settled_by_a_later_line() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("ledger.jsonl");
-    let ledger = DeletionLedger::open(&path).unwrap();
+    let (path, ledger) = ledger_in(&dir);
     ledger
-        .append(&[entry("apps/a/x", 1), entry("apps/a/y", 3)])
+        .append(&Record::Intent(intent(
+            "op-1",
+            &[("apps/a/x", 1), ("apps/a/y", 3)],
+        )))
         .unwrap();
+    ledger.append(&Record::committed("op-1")).unwrap();
+    ledger
+        .append(&Record::Intent(intent("op-2", &[("apps/b/z", 1)])))
+        .unwrap();
+    ledger.append(&Record::aborted("op-2")).unwrap();
     drop(ledger);
     let ledger = DeletionLedger::open(&path).unwrap();
-    ledger.append(&[entry("apps/b/z", 1)]).unwrap();
+    ledger
+        .append(&Record::Intent(intent("op-3", &[("apps/c/z", 1)])))
+        .unwrap();
 
     let text = std::fs::read_to_string(&path).unwrap();
-    assert_eq!(text.lines().count(), 3);
+    assert_eq!(text.lines().count(), 5);
     assert!(text.ends_with('\n'));
     let first: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
     assert_eq!(
         first,
         serde_json::json!({
-            "networkId": NETWORK,
-            "keyPath": "apps/a/x",
-            "keyVersion": 1,
+            "op": "op-1",
+            "networkId": network(),
+            "keys": [
+                { "keyPath": "apps/a/x", "keyVersion": 1 },
+                { "keyPath": "apps/a/y", "keyVersion": 3 },
+            ],
             "deletedAt": "2026-10-23T12:00:00Z",
         })
     );
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines[1], r#"{"committed":"op-1"}"#);
+    assert_eq!(lines[3], r#"{"aborted":"op-2"}"#);
+
     let contents = read(&path).unwrap();
-    assert_eq!(
-        contents.entries,
-        vec![
-            entry("apps/a/x", 1),
-            entry("apps/a/y", 3),
-            entry("apps/b/z", 1)
-        ]
-    );
-    assert!(contents.malformed_lines.is_empty());
+    assert!(!contents.torn_tail);
+    let open: Vec<&str> = contents
+        .open_intents()
+        .into_iter()
+        .map(|i| i.op.as_str())
+        .collect();
+    assert_eq!(open, vec!["op-3"]);
 }
 
 #[cfg(unix)]
 #[test]
-fn the_ledger_file_is_private_to_the_node_user() {
+fn the_ledger_file_is_forced_to_mode_0600() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("ledger.jsonl");
     DeletionLedger::open(&path).unwrap();
-    let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-    assert_eq!(mode & 0o077, 0, "mode {mode:o}");
+    let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&path), 0o600);
+
+    // A file that exists with a wider mode is narrowed, not trusted.
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    DeletionLedger::open(&path).unwrap();
+    assert_eq!(mode(&path), 0o600);
 }
 
 #[test]
-fn an_unterminated_last_line_is_closed_before_the_next_append() {
+fn an_unfinished_final_line_is_dropped_and_a_whole_one_is_kept() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("ledger.jsonl");
-    let mut torn = serde_json::to_string(&entry("apps/a/x", 1)).unwrap();
-    torn.push('\n');
-    torn.push_str("{\"networkId\":\"did:key:z6MkOw");
-    std::fs::write(&path, torn).unwrap();
+    let whole = serde_json::to_string(&Record::Intent(intent("op-1", &[("apps/a/x", 1)]))).unwrap();
+    let partial = r#"{"op":"op-2","networkId":"did:key:z6Mk"#;
+    std::fs::write(&path, format!("{whole}\n{partial}")).unwrap();
 
     let ledger = DeletionLedger::open(&path).unwrap();
-    ledger.append(&[entry("apps/b/y", 1)]).unwrap();
-
+    assert_eq!(ledger.dropped_tail_bytes(), partial.len());
+    ledger.append(&Record::committed("op-1")).unwrap();
     let contents = read(&path).unwrap();
-    assert_eq!(
-        contents.entries,
-        vec![entry("apps/a/x", 1), entry("apps/b/y", 1)]
-    );
-    assert_eq!(contents.malformed_lines, vec![2]);
+    assert_eq!(contents.records.len(), 2);
+    assert!(!contents.torn_tail);
+
+    // The same file with a whole last record that lacks only its newline.
+    let path = dir.path().join("whole.jsonl");
+    std::fs::write(&path, &whole).unwrap();
+    let ledger = DeletionLedger::open(&path).unwrap();
+    assert_eq!(ledger.dropped_tail_bytes(), 0);
+    ledger.append(&Record::committed("op-1")).unwrap();
+    assert_eq!(read(&path).unwrap().records.len(), 2);
 }
 
 #[test]
-fn appending_nothing_writes_nothing() {
+fn a_torn_final_line_is_reported_and_a_malformed_middle_line_is_an_error() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("ledger.jsonl");
-    let ledger = DeletionLedger::open(&path).unwrap();
-    ledger.append(&[]).unwrap();
-    assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+    let whole = serde_json::to_string(&Record::Intent(intent("op-1", &[("apps/a/x", 1)]))).unwrap();
+
+    std::fs::write(&path, format!("{whole}\n{{\"op\":\"op-2\",\"netw")).unwrap();
+    let contents = read(&path).unwrap();
+    assert!(contents.torn_tail);
+    assert_eq!(contents.records.len(), 1);
+
+    std::fs::write(&path, format!("{whole}\nnot json\n{whole}\n")).unwrap();
+    assert!(matches!(
+        read(&path),
+        Err(DeletionLedgerError::Malformed(2))
+    ));
+}
+
+#[test]
+fn an_append_fails_closed_once_the_file_was_renamed_or_removed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, ledger) = ledger_in(&dir);
+    ledger.append(&Record::committed("before")).unwrap();
+
+    let moved = dir.path().join("moved.jsonl");
+    std::fs::rename(&path, &moved).unwrap();
+    assert!(matches!(
+        ledger.append(&Record::committed("after-rename")),
+        Err(DeletionLedgerError::Moved)
+    ));
+    assert!(!path.exists(), "nothing was created at the old path");
+    assert_eq!(read(&moved).unwrap().records.len(), 1);
+
+    // A different file at the path is not the open one either.
+    std::fs::write(&path, "").unwrap();
+    assert!(matches!(
+        ledger.append(&Record::committed("after-replace")),
+        Err(DeletionLedgerError::Moved)
+    ));
+    std::fs::remove_file(&path).unwrap();
+    assert!(matches!(
+        ledger.append(&Record::committed("after-remove")),
+        Err(DeletionLedgerError::Moved)
+    ));
 }
 
 #[test]
@@ -150,47 +240,63 @@ fn the_path_is_validated_without_touching_the_filesystem() {
     }
 }
 
+// ------------------------------------------------------------------ replay
+
 #[tokio::test]
-async fn replay_sets_named_keys_deleted_with_no_seed() {
+async fn replay_applies_committed_and_open_operations_and_skips_aborted_ones() {
     let db = fresh_db().await;
-    insert_key(&db, "apps/a/active", "active", true, 1).await;
-    insert_key(&db, "apps/a/blocked", "blocked", true, 1).await;
-    insert_key(&db, "apps/a/untouched", "active", true, 1).await;
+    for path in [
+        "apps/a/committed",
+        "apps/a/open",
+        "apps/a/aborted",
+        "apps/a/untouched",
+    ] {
+        active_key(&db, path).await;
+    }
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("ledger.jsonl");
-    let ledger = DeletionLedger::open(&path).unwrap();
+    let (path, ledger) = ledger_in(&dir);
     ledger
-        .append(&[entry("apps/a/active", 1), entry("apps/a/blocked", 1)])
+        .append(&Record::Intent(intent("c", &[("apps/a/committed", 1)])))
         .unwrap();
+    ledger.append(&Record::committed("c")).unwrap();
+    ledger
+        .append(&Record::Intent(intent("o", &[("apps/a/open", 1)])))
+        .unwrap();
+    ledger
+        .append(&Record::Intent(intent("a", &[("apps/a/aborted", 1)])))
+        .unwrap();
+    ledger.append(&Record::aborted("a")).unwrap();
 
     let report = replay(&db, &path).await.unwrap();
     assert_eq!(
         report,
         ReplayReport {
-            entries: 2,
+            operations: 3,
+            aborted_operations: 1,
             applied: 2,
             ..ReplayReport::default()
         }
     );
-    for deleted in ["apps/a/active", "apps/a/blocked"] {
+    for deleted in ["apps/a/committed", "apps/a/open"] {
         let row = row(&db, deleted).await;
-        assert_eq!(row.state, "deleted");
-        assert_eq!(row.sealed_seed, None);
+        assert_eq!(row.state, "deleted", "{deleted}");
+        assert_eq!(row.sealed_seed, None, "{deleted}");
     }
-    let untouched = row(&db, "apps/a/untouched").await;
-    assert_eq!(untouched.state, "active");
-    assert!(untouched.sealed_seed.is_some());
+    for kept in ["apps/a/aborted", "apps/a/untouched"] {
+        let row = row(&db, kept).await;
+        assert_eq!(row.state, "active", "{kept}");
+        assert!(row.sealed_seed.is_some(), "{kept}");
+    }
 }
 
 #[tokio::test]
 async fn replay_is_idempotent() {
     let db = fresh_db().await;
-    insert_key(&db, "apps/a/x", "active", true, 1).await;
+    active_key(&db, "apps/a/x").await;
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("ledger.jsonl");
-    DeletionLedger::open(&path)
-        .unwrap()
-        .append(&[entry("apps/a/x", 1)])
+    let (path, ledger) = ledger_in(&dir);
+    ledger
+        .append(&Record::Intent(intent("op", &[("apps/a/x", 1)])))
         .unwrap();
 
     assert_eq!(replay(&db, &path).await.unwrap().applied, 1);
@@ -201,15 +307,88 @@ async fn replay_is_idempotent() {
 }
 
 #[tokio::test]
+async fn a_torn_batch_applies_nothing() {
+    let db = fresh_db().await;
+    for path in ["apps/a/x", "apps/a/y", "apps/a/z"] {
+        active_key(&db, path).await;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ledger.jsonl");
+    // One operation, cut off after its first key.
+    let whole = serde_json::to_string(&Record::Intent(intent(
+        "op",
+        &[("apps/a/x", 1), ("apps/a/y", 1), ("apps/a/z", 1)],
+    )))
+    .unwrap();
+    let cut = whole.find("apps/a/y").unwrap();
+    std::fs::write(&path, &whole[..cut]).unwrap();
+
+    let report = replay(&db, &path).await.unwrap();
+    assert!(report.torn_tail);
+    assert_eq!(report.applied, 0);
+    for key in ["apps/a/x", "apps/a/y", "apps/a/z"] {
+        assert_eq!(row(&db, key).await.state, "active", "{key}");
+    }
+}
+
+#[tokio::test]
+async fn replay_leaves_a_key_that_is_not_a_deletable_key() {
+    let db = fresh_db().await;
+    insert_key(&db, "docs/a", "deterministic", "active", false, 1).await;
+    insert_key(&db, "apps/a/stray", "deterministic", "active", false, 1).await;
+    active_key(&db, "apps/a/x").await;
+    let dir = tempfile::tempdir().unwrap();
+    let (path, ledger) = ledger_in(&dir);
+    ledger
+        .append(&Record::Intent(intent(
+            "op",
+            &[("docs/a", 1), ("apps/a/stray", 1), ("apps/a/x", 1)],
+        )))
+        .unwrap();
+
+    let report = replay(&db, &path).await.unwrap();
+    assert_eq!(report.not_deletable, 2);
+    assert_eq!(report.applied, 1);
+    assert_eq!(row(&db, "docs/a").await.state, "active");
+    assert_eq!(row(&db, "apps/a/stray").await.state, "active");
+}
+
+#[tokio::test]
+async fn replay_refuses_keys_and_networks_the_grammar_refuses() {
+    let db = fresh_db().await;
+    active_key(&db, "apps/a").await;
+    active_key(&db, "apps/a/x").await;
+    let dir = tempfile::tempdir().unwrap();
+    let (path, ledger) = ledger_in(&dir);
+    ledger
+        .append(&Record::Intent(intent(
+            "op",
+            // `apps/a` is not a key (R1); the rest of the operation applies.
+            &[("apps/a", 1), ("apps/A/x", 1), ("apps/a/x", 1)],
+        )))
+        .unwrap();
+    let mut other = intent("op-network", &[("apps/a/x", 1)]);
+    other.network_id = "not a network".to_string();
+    ledger.append(&Record::Intent(other)).unwrap();
+
+    let report = replay(&db, &path).await.unwrap();
+    assert_eq!(report.refused, 3);
+    assert_eq!(report.applied, 1);
+    assert_eq!(row(&db, "apps/a").await.state, "active");
+}
+
+#[tokio::test]
 async fn replay_leaves_a_newer_key_version_and_counts_missing_rows() {
     let db = fresh_db().await;
     // A key deleted at version 1, then created again as version 2.
-    insert_key(&db, "apps/a/x", "active", true, 2).await;
+    insert_key(&db, "apps/a/x", "deletable", "active", true, 2).await;
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("ledger.jsonl");
-    DeletionLedger::open(&path)
-        .unwrap()
-        .append(&[entry("apps/a/x", 1), entry("apps/a/gone", 1)])
+    let (path, ledger) = ledger_in(&dir);
+    ledger
+        .append(&Record::Intent(intent(
+            "v1",
+            &[("apps/a/x", 1), ("apps/a/gone", 1)],
+        )))
         .unwrap();
 
     let report = replay(&db, &path).await.unwrap();
@@ -220,28 +399,55 @@ async fn replay_leaves_a_newer_key_version_and_counts_missing_rows() {
     assert_eq!(kept.state, "active");
     assert!(kept.sealed_seed.is_some());
 
-    // The ledger entry for the version that row holds does apply.
-    DeletionLedger::open(&path)
-        .unwrap()
-        .append(&[entry("apps/a/x", 2)])
+    // The operation for the version that row holds does apply.
+    ledger
+        .append(&Record::Intent(intent("v2", &[("apps/a/x", 2)])))
         .unwrap();
     assert_eq!(replay(&db, &path).await.unwrap().applied, 1);
     assert_eq!(row(&db, "apps/a/x").await.sealed_seed, None);
 }
 
-#[tokio::test]
-async fn replay_applies_valid_entries_and_reports_malformed_lines() {
-    let db = fresh_db().await;
-    insert_key(&db, "apps/a/x", "active", true, 1).await;
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("ledger.jsonl");
-    let mut text = String::from("not json\n");
-    text.push_str(&serde_json::to_string(&entry("apps/a/x", 1)).unwrap());
-    text.push_str("\n{\"networkId\":\"x\"}\n");
-    std::fs::write(&path, text).unwrap();
+// ------------------------------------------------------------------ settle
 
+#[tokio::test]
+async fn open_intents_are_settled_against_the_database() {
+    let db = fresh_db().await;
+    // `done` committed: its keys are deleted at the intent's version. `lost`
+    // did not: its key is still active. `again` committed and the key was
+    // created again afterwards (a later version).
+    insert_key(&db, "apps/a/done", "deletable", "deleted", false, 1).await;
+    active_key(&db, "apps/a/lost").await;
+    insert_key(&db, "apps/a/again", "deletable", "active", true, 2).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (path, ledger) = ledger_in(&dir);
+    for (op, key) in [
+        ("done", ("apps/a/done", 1)),
+        ("lost", ("apps/a/lost", 1)),
+        ("again", ("apps/a/again", 1)),
+    ] {
+        ledger.append(&Record::Intent(intent(op, &[key]))).unwrap();
+    }
+    ledger.append(&Record::committed("done")).unwrap();
+    // `done` is settled already; the other two are open.
+    let settled = ledger.settle_open_intents(&db).await.unwrap();
+    assert_eq!(
+        settled,
+        SettleReport {
+            committed: 1,
+            aborted: 1
+        }
+    );
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains(r#"{"aborted":"lost"}"#));
+    assert!(text.contains(r#"{"committed":"again"}"#));
+    assert!(read(&path).unwrap().open_intents().is_empty());
+
+    // Settled again, nothing is left to do, and replay skips the aborted one.
+    assert_eq!(
+        ledger.settle_open_intents(&db).await.unwrap(),
+        SettleReport::default()
+    );
     let report = replay(&db, &path).await.unwrap();
-    assert_eq!(report.applied, 1);
-    assert_eq!(report.malformed_lines, vec![1, 3]);
-    assert_eq!(row(&db, "apps/a/x").await.state, "deleted");
+    assert_eq!(report.aborted_operations, 1);
+    assert_eq!(row(&db, "apps/a/lost").await.state, "active");
 }
