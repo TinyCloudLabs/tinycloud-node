@@ -206,6 +206,20 @@ fn same_object(meta: &ObjectMeta, key: &ObjectKey, len: u64) -> Result<PutOutcom
     }
 }
 
+/// The first and last byte `range` selects in an object of `total` bytes,
+/// clamped to the object; `None` when it selects no byte.
+fn select_range(range: ByteRangeSpec, total: u64) -> Option<(u64, u64)> {
+    let last = total.checked_sub(1)?;
+    match range {
+        ByteRangeSpec::Inclusive { start, end } if start <= end && start < total => {
+            Some((start, end.min(last)))
+        }
+        ByteRangeSpec::From { start } if start < total => Some((start, last)),
+        ByteRangeSpec::Suffix { length } if length > 0 => Some((total - length.min(total), last)),
+        _ => None,
+    }
+}
+
 fn parse_sha256(value: &str) -> Result<[u8; 32], SqlStoreError> {
     hex::decode(value)
         .ok()
@@ -425,10 +439,10 @@ impl SqlObjectStore for S3SqlObjectStore {
             // A provider that ignored the header sent the whole object.
             None => {
                 let total = data.len() as u64;
-                Ok(range.resolve(total).map(|r| ObjectRange {
+                Ok(select_range(range, total).map(|(first, last)| ObjectRange {
                     total_size: total,
-                    start: r.start(),
-                    data: data[r.start() as usize..=r.end() as usize].to_vec(),
+                    start: first,
+                    data: data[first as usize..=last as usize].to_vec(),
                 }))
             }
         }
@@ -677,18 +691,18 @@ fn fs_get_range(path: &Path, range: ByteRangeSpec) -> Result<Option<ObjectRange>
         ));
     }
     let total = metadata.len();
-    let Some(resolved) = range.resolve(total) else {
+    let Some((first, last)) = select_range(range, total) else {
         return Ok(None);
     };
-    let len = usize::try_from(resolved.end() - resolved.start() + 1)
+    let len = usize::try_from(last - first + 1)
         .map_err(|_| SqlStoreError::Invalid("range does not fit in memory"))?;
     let mut data = vec![0u8; len];
-    file.seek(SeekFrom::Start(resolved.start()))
+    file.seek(SeekFrom::Start(first))
         .and_then(|_| file.read_exact(&mut data))
         .map_err(|e| io_error("read", &e))?;
     Ok(Some(ObjectRange {
         total_size: total,
-        start: resolved.start(),
+        start: first,
         data,
     }))
 }
@@ -815,6 +829,28 @@ mod tests {
             "other/v1/a",
         ] {
             assert!(resolve_path(root, bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn range_selection_matches_byte_range_spec() {
+        let edges = [0u64, 1, 2, 4, 5, 6, 9, 10, 11];
+        let mut specs = Vec::new();
+        for &a in &edges {
+            specs.push(ByteRangeSpec::From { start: a });
+            specs.push(ByteRangeSpec::Suffix { length: a });
+            for &b in &edges {
+                specs.push(ByteRangeSpec::Inclusive { start: a, end: b });
+            }
+        }
+        for total in [0u64, 1, 2, 5, 10] {
+            for spec in &specs {
+                assert_eq!(
+                    select_range(*spec, total),
+                    spec.resolve(total).map(|r| (r.start(), r.end())),
+                    "{spec:?} of {total}"
+                );
+            }
         }
     }
 
