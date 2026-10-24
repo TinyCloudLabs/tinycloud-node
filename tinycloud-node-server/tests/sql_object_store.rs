@@ -1077,6 +1077,58 @@ async fn minio_check_then_write_conformance() -> Result<()> {
     Ok(())
 }
 
+/// The provider itself: concurrent conditional PUTs of one key, with no
+/// store in between. Exactly one is created; the others are refused with 412
+/// (or 409 while another write of the key is in flight), and none hangs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs the at-rest harness MinIO (TC887_S3_* env)"]
+async fn minio_concurrent_conditional_puts_create_one_object() -> Result<()> {
+    let config = minio_config()?;
+    let store = Arc::new(S3SqlObjectStore::open_with_mode(&config, WriteMode::Conditional).await);
+    for round in 0..10 {
+        let b = body(1024);
+        let key = key_for(&b);
+        let tasks: Vec<_> = (0..8)
+            .map(|_| {
+                let (store, key, b) = (store.clone(), key.as_str().to_owned(), b.clone());
+                tokio::spawn(async move {
+                    let started = std::time::Instant::now();
+                    let result = limited(
+                        "conditional put",
+                        store
+                            .client()
+                            .put_object()
+                            .bucket(store.bucket())
+                            .key(key)
+                            .if_none_match("*")
+                            .body(aws_sdk_s3::primitives::ByteStream::from(b))
+                            .send(),
+                    )
+                    .await;
+                    let outcome = match result {
+                        Ok(_) => "created".to_owned(),
+                        Err(e) => {
+                            format!("status {:?}", e.raw_response().map(|r| r.status().as_u16()))
+                        }
+                    };
+                    (outcome, started.elapsed())
+                })
+            })
+            .collect();
+        let mut outcomes = Vec::new();
+        for task in tasks {
+            outcomes.push(task.await?);
+        }
+        let created = outcomes.iter().filter(|(o, _)| o == "created").count();
+        let refused = outcomes
+            .iter()
+            .filter(|(o, _)| o == "status Some(412)" || o == "status Some(409)")
+            .count();
+        assert!(created == 1 && refused == 7, "round {round}: {outcomes:?}");
+    }
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs the at-rest harness MinIO (TC887_S3_* env)"]
 async fn minio_object_without_hash_metadata_is_an_error() -> Result<()> {

@@ -82,7 +82,7 @@ pub struct S3SqlObjectStore {
     client: Client,
     bucket: String,
     mode: WriteMode,
-    /// Per-key gates that serialise check-then-create inside this process.
+    /// Per-key gates: creators of one key in this process go one at a time.
     gates: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
@@ -319,34 +319,15 @@ impl S3SqlObjectStore {
         key: &ObjectKey,
         body: Vec<u8>,
     ) -> Result<PutOutcome, SqlStoreError> {
-        let gate = self
-            .gates
-            .lock()
-            .unwrap()
-            .entry(key.as_str().to_owned())
-            .or_default()
-            .clone();
-        let outcome = async {
-            let _held = gate.lock().await;
-            let len = body.len() as u64;
-            match self.head(key).await? {
-                Some(meta) => same_object(&meta, key, len),
-                None => {
-                    match put_object(&self.client, &self.bucket, key.as_str(), body, false).await {
-                        PutResult::Created => Ok(PutOutcome::Created),
-                        PutResult::Failed(error) => Err(error),
-                        _ => Err(SqlStoreError::Backend("s3 put was refused".into())),
-                    }
-                }
-            }
+        let len = body.len() as u64;
+        match self.head(key).await? {
+            Some(meta) => same_object(&meta, key, len),
+            None => match put_object(&self.client, &self.bucket, key.as_str(), body, false).await {
+                PutResult::Created => Ok(PutOutcome::Created),
+                PutResult::Failed(error) => Err(error),
+                _ => Err(SqlStoreError::Backend("s3 put was refused".into())),
+            },
         }
-        .await;
-        let mut gates = self.gates.lock().unwrap();
-        // The map holds one reference and this call one; any other is a waiter.
-        if Arc::strong_count(&gate) == 2 {
-            gates.remove(key.as_str());
-        }
-        outcome
     }
 }
 
@@ -360,10 +341,27 @@ impl SqlObjectStore for S3SqlObjectStore {
         if &sha256(&body) != key.sha256() {
             return Err(SqlStoreError::BodyMismatch);
         }
-        match self.mode {
-            WriteMode::Conditional => self.create_conditionally(key, body).await,
-            WriteMode::CheckThenWrite => self.check_then_create(key, body).await,
+        // Creators of one key in this process go one at a time.
+        let gate = self
+            .gates
+            .lock()
+            .unwrap()
+            .entry(key.as_str().to_owned())
+            .or_default()
+            .clone();
+        let outcome = {
+            let _held = gate.lock().await;
+            match self.mode {
+                WriteMode::Conditional => self.create_conditionally(key, body).await,
+                WriteMode::CheckThenWrite => self.check_then_create(key, body).await,
+            }
+        };
+        let mut gates = self.gates.lock().unwrap();
+        // The map holds one reference and this call one; any other is a waiter.
+        if Arc::strong_count(&gate) == 2 {
+            gates.remove(key.as_str());
         }
+        outcome
     }
 
     async fn get_range(
