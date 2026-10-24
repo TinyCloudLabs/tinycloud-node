@@ -133,7 +133,7 @@ Read audit records every poll. Poll on demand, or no more often than every
 ## Write ordering and blob recovery
 
 KV puts stage and authorize content before upload. A short preparatory
-transaction checks authorization and hosting, then commits an active
+transaction (see below for PostgreSQL's one-blob form) checks authorization and hosting, then commits an active
 `(space, content hash, generation)` fence and a separate claim for each
 writer. The first generation is zero and retains the original bare-hash
 storage key; a generation above zero is allocated only after a prior
@@ -167,6 +167,15 @@ with the same attempt ID. The registration is idempotent; neither an upload
 nor a committed write is replayed on an uncertain outcome. A missing claim
 or a fence already deleting returns a retryable error, never a reference to
 a potentially removed object.
+
+On PostgreSQL, a put with at most one distinct blob skips the preparatory
+`BEGIN`/`COMMIT`: authorization is one read, retried once after a lost
+connection, and the claim is one statement that also checks every space the
+invocation names is hosted, so an unhosted space is refused after
+authorization and before any upload. That claim statement is a write and is
+not retried: a lost connection around it is an unknown outcome. Puts of
+several distinct blobs keep the single preparatory transaction, which
+commits every claim or none.
 
 A failed upload, precondition or database write removes only its own claim.
 If another claim or a current or historical KV reference exists, it leaves

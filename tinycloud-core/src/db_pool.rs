@@ -292,22 +292,28 @@ impl RecoveringConnection {
             )
     }
 
-    /// Run the one idempotent registration statement of the autocommit
-    /// preparatory path. A connection-class failure is recorded and the
-    /// statement retried once, like [`Self::begin_preparatory`]'s `BEGIN`:
-    /// every row it writes is keyed by the statement's own attempt ID, so a
-    /// second run after a lost reply writes nothing new. Like that `BEGIN` it
-    /// bypasses this type's write tracking: the registration is candidate
-    /// metadata, never a user-visible KV write, so a failure after it is still
-    /// reported as one before any write.
-    pub(crate) async fn preparatory_query_one(
+    /// Run the one registration statement of the autocommit preparatory path.
+    /// It is a write: it is never retried here, and a connection-class failure
+    /// is recorded and marks the request as having possibly written, so the
+    /// route reports it as an unknown outcome, as for any write statement.
+    /// A statement dropped before its result arrives is marked the same way.
+    /// A success is not marked: it only claimed candidate blobs, never a
+    /// user-visible KV write, and a later failure before the KV transaction
+    /// began stays retryable.
+    pub(crate) async fn preparatory_write(
         &self,
         stmt: Statement,
     ) -> Result<Option<QueryResult>, DbErr> {
-        self.run("preparatory_register", true, || {
-            self.conn.query_one(stmt.clone())
-        })
-        .await
+        let in_flight = InFlightWrite::arm(true);
+        let result = self.conn.query_one(stmt).await;
+        in_flight.disarm();
+        if let Err(error) = &result {
+            if is_connection_error(error) {
+                self.lost("preparatory_register", error, false);
+                note_write_may_have_applied();
+            }
+        }
+        result
     }
 
     /// The outcome of the one retry. It is never retried again, but a
@@ -322,13 +328,14 @@ impl RecoveringConnection {
     }
 }
 
-/// The pool as the autocommit preparatory path reads it (TC-735): every
-/// statement is retried once after a connection-class failure and recorded
-/// like [`RecoveringConnection::begin_preparatory`]'s `BEGIN`, and none counts
-/// as a write for [`track_writes`]. [`RecoveringConnection`] itself infers
-/// that from the statement text and treats the authorization snapshot's many
-/// CTEs as a possible write, so it must not be used for these reads. Only
-/// reads may be issued through it.
+/// The pool as the autocommit preparatory path reads it (TC-735): the
+/// authorization reads. Each is retried once after a connection-class failure
+/// and recorded like [`RecoveringConnection::begin_preparatory`]'s `BEGIN`,
+/// and none counts as a write for [`track_writes`]. [`RecoveringConnection`]
+/// itself infers read-only from the statement text and treats the
+/// authorization snapshot's many CTEs as a possible write, so it is not used
+/// for these reads. Only pure reads are accepted: any statement with a write
+/// keyword, and every `execute`, is refused rather than run.
 pub(crate) struct PreparatoryReads<'a>(&'a RecoveringConnection);
 
 impl RecoveringConnection {
@@ -337,29 +344,41 @@ impl RecoveringConnection {
     }
 }
 
+/// A `SELECT` or `WITH` statement with no write keyword anywhere in it.
+pub(crate) fn is_pure_read(sql: &str) -> bool {
+    let Some(tokens) = tokens(sql) else {
+        return false;
+    };
+    let is_word = |token: Option<&Token<'_>>, keyword: &str| matches!(token, Some(Token::Word(word)) if word.eq_ignore_ascii_case(keyword));
+    (is_word(tokens.first(), "SELECT") || is_word(tokens.first(), "WITH"))
+        && !tokens.iter().any(|token| {
+            matches!(token, Token::Word(word)
+                if WRITE_KEYWORDS.iter().any(|keyword| word.eq_ignore_ascii_case(keyword)))
+        })
+}
+
+fn not_a_pure_read() -> DbErr {
+    DbErr::Custom("the preparatory read view only runs pure reads".to_owned())
+}
+
 #[async_trait::async_trait]
 impl ConnectionTrait for PreparatoryReads<'_> {
     fn get_database_backend(&self) -> DatabaseBackend {
         self.0.conn.get_database_backend()
     }
 
-    async fn execute(&self, stmt: Statement) -> Result<ExecResult, DbErr> {
-        self.0
-            .run("preparatory_read", true, || {
-                self.0.conn.execute(stmt.clone())
-            })
-            .await
+    async fn execute(&self, _stmt: Statement) -> Result<ExecResult, DbErr> {
+        Err(not_a_pure_read())
     }
 
-    async fn execute_unprepared(&self, sql: &str) -> Result<ExecResult, DbErr> {
-        self.0
-            .run("preparatory_read", true, || {
-                self.0.conn.execute_unprepared(sql)
-            })
-            .await
+    async fn execute_unprepared(&self, _sql: &str) -> Result<ExecResult, DbErr> {
+        Err(not_a_pure_read())
     }
 
     async fn query_one(&self, stmt: Statement) -> Result<Option<QueryResult>, DbErr> {
+        if !is_pure_read(&stmt.sql) {
+            return Err(not_a_pure_read());
+        }
         self.0
             .run("preparatory_read", true, || {
                 self.0.conn.query_one(stmt.clone())
@@ -368,6 +387,9 @@ impl ConnectionTrait for PreparatoryReads<'_> {
     }
 
     async fn query_all(&self, stmt: Statement) -> Result<Vec<QueryResult>, DbErr> {
+        if !is_pure_read(&stmt.sql) {
+            return Err(not_a_pure_read());
+        }
         self.0
             .run("preparatory_read", true, || {
                 self.0.conn.query_all(stmt.clone())

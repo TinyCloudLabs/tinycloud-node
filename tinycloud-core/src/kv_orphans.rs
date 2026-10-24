@@ -69,9 +69,11 @@ pub async fn register_candidates<C: ConnectionTrait>(
 
 /// PostgreSQL registration: one statement per distinct blob, each run by
 /// `query`. The ledger upsert serializes registration against deletion; a
-/// deleting fence returns no row, so no caller starts an upload. Every
-/// statement is idempotent for its attempt ID, so a runner may retry one after
-/// a lost connection.
+/// deleting fence returns no row, so no caller starts an upload. One
+/// statement claims its blob or nothing. Several blobs are all-or-nothing only
+/// if `query` runs inside one transaction; the autocommit caller passes a
+/// single blob. The runner decides whether a failed statement is retried:
+/// every row is keyed by the attempt ID, so a second run writes nothing new.
 pub(crate) async fn register_candidates_postgres<F, Fut>(
     blobs: &[(SpaceId, Hash)],
     attempt_id: &str,

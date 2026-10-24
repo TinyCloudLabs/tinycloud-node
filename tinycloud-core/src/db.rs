@@ -2457,10 +2457,11 @@ where
         OsRng.fill_bytes(&mut attempt_bytes);
         let attempt_id = hex::encode(attempt_bytes);
         // Registration and authorization finish before any blob can be
-        // persisted. Retrying an uncertain registration uses exactly the
-        // same attempt ID, so it cannot duplicate or steal another writer.
-        // SQLite's preparatory write follows sequence→writer→BEGIN and
+        // persisted. A transaction-path retry after a lost connection uses
+        // exactly the same attempt ID, so it cannot duplicate or steal another
+        // writer. SQLite's preparatory write follows sequence→writer→BEGIN and
         // releases every guard before an ordinary upload.
+        let autocommit = blobs.len() <= 1 && self.candidate_conn.uses_preparatory_autocommit();
         let mut retried = false;
         let blobs = loop {
             let _sequence = if self.writer_lock.is_some() {
@@ -2486,12 +2487,15 @@ where
                 &sequence_spaces,
                 &blobs,
                 &attempt_id,
+                autocommit,
             ))
             .await;
             match prepared {
                 Ok(generations) => break generations,
+                // The transaction path retries its whole block once, with the
+                // same attempt ID. The autocommit path never retries its write.
                 Err(TxError::Db(error))
-                    if !retried && crate::db_pool::is_connection_error(&error) =>
+                    if !autocommit && !retried && crate::db_pool::is_connection_error(&error) =>
                 {
                     retried = true;
                 }
@@ -2776,18 +2780,23 @@ where
     /// any bytes reach the store. The commit transaction still repeats
     /// authorization under the sequence lock.
     ///
-    /// On PostgreSQL there is no `BEGIN`/`COMMIT`: authorization is one read
-    /// statement and registration one write statement that also checks every
-    /// invocation space exists, so an unhosted space is refused with the same
-    /// `SpaceNotFound`, after authorization and before any upload, as the
-    /// separate COUNT it replaces. Where the registration of several blobs
-    /// stops partway (a later blob is being deleted, or the connection is
-    /// lost), earlier blobs keep their claims; the collector reclaims them
-    /// after the grace period like any crashed attempt. Other backends keep
-    /// one transaction.
+    /// With `autocommit` (PostgreSQL, at most one distinct blob) there is no
+    /// `BEGIN`/`COMMIT`: authorization is one pure read, retried once after a
+    /// lost connection, and registration is one write statement that also
+    /// checks every invocation space exists, so an unhosted space is refused
+    /// with the same `SpaceNotFound`, after authorization and before any
+    /// upload, as the separate COUNT it replaces. The registration is a write:
+    /// it is not retried, and a lost connection around it is an unknown
+    /// outcome. A single statement claims the one blob or nothing.
+    ///
+    /// Otherwise (several distinct blobs, other backends) authorization and
+    /// every blob's claim share one transaction that commits all of them or
+    /// none, and a lost connection retries the whole block with the same
+    /// attempt ID.
     ///
     /// A separate function, not inline in the caller: see
     /// [`Self::persist_registered_blobs`].
+    #[allow(clippy::too_many_arguments)]
     async fn register_preupload(
         &self,
         invocation: &Invocation,
@@ -2796,15 +2805,13 @@ where
         spaces: &[SpaceId],
         blobs: &[(SpaceId, Hash)],
         attempt_id: &str,
+        autocommit: bool,
     ) -> Result<Vec<(SpaceId, Hash, i64)>, TxError<B, K>>
     where
         B: StorageSetup,
     {
-        if self.candidate_conn.uses_preparatory_autocommit() {
-            // Authorization statements are reads that recover and retry once
-            // after a lost connection, without counting as writes; the
-            // registration statement is idempotent for this attempt ID and
-            // retried once by `preparatory_query_one`.
+        if autocommit {
+            debug_assert!(blobs.len() <= 1, "one statement claims at most one blob");
             authorize_mutation_preupload::<_, B, K>(
                 &self.candidate_conn.preparatory_reads(),
                 invocation,
@@ -2822,7 +2829,7 @@ where
                 blobs,
                 attempt_id,
                 spaces,
-                |statement| self.candidate_conn.preparatory_query_one(statement),
+                |statement| self.candidate_conn.preparatory_write(statement),
             )
             .await?);
         }
