@@ -23,6 +23,7 @@
 
 use super::*;
 use crate::config::OwnerAuthorityExpiry;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::future::Future;
 use tinycloud_core::{
@@ -38,13 +39,15 @@ use tinycloud_core::{
         sea_query::{Func, Query},
         DbErr,
     },
-    types::Resource,
+    types::{Ability, Resource},
     util::Capability,
 };
 
 /// Bump when classification rules change: `unknown` rows written by an
 /// older version are classified again on their next use.
-pub(super) const CLASSIFIER_VERSION: i32 = 2;
+pub(super) const CLASSIFIER_VERSION: i32 = 3;
+/// Ability that lets an owner hold a policy root through the register grant.
+const REGISTER_ABILITY: &str = "tinycloud.policy/register";
 /// Owner-first rows examined per capability (step 1).
 const OWNER_FIRST_ROWS: u64 = 64;
 /// Listing page size.
@@ -222,6 +225,10 @@ pub struct Classification {
     /// Whether this classification is stored, rather than computed for this
     /// request after its write failed.
     pub persisted: bool,
+    /// Found by the register grant (rules 1–5 in the docs). Set only for the
+    /// registration that computed it; never persisted, so a stored row is
+    /// always `false`.
+    pub register_grant: bool,
 }
 
 impl Classification {
@@ -241,6 +248,7 @@ impl Classification {
             authority_expires_at: None,
             closure: Vec::new(),
             persisted: false,
+            register_grant: false,
         }
     }
 
@@ -255,6 +263,7 @@ impl Classification {
                 authority_expires_at: None,
                 closure: Vec::new(),
                 persisted: false,
+                register_grant: false,
             },
             Ok(closure) if closure.is_empty() => Self {
                 state: BindingState::RootAuthority,
@@ -262,6 +271,7 @@ impl Classification {
                 authority_expires_at: None,
                 closure: Vec::new(),
                 persisted: false,
+                register_grant: false,
             },
             Ok(closure) => {
                 let authority_expires_at = min_expiry(&closure);
@@ -275,6 +285,7 @@ impl Classification {
                     authority_expires_at,
                     closure: closure.iter().map(|node| (node.id, node.depth)).collect(),
                     persisted: false,
+                    register_grant: false,
                 }
             }
         }
@@ -282,6 +293,15 @@ impl Classification {
 
     fn unknown(reason: UnknownReason) -> Self {
         Self::from_selection(Err(reason), OffsetDateTime::UNIX_EPOCH)
+    }
+
+    /// A closure found by the register grant. Its state follows the root
+    /// expiry like any closure: `BoundUncapped` means the root outlives D.
+    fn from_register_grant(closure: Vec<ClosureNode>, root_expiry: OffsetDateTime) -> Self {
+        Self {
+            register_grant: true,
+            ..Self::from_selection(Ok(closure), root_expiry)
+        }
     }
 
     fn from_row(row: &policy_v3_owner_binding::Model) -> Result<Self, &'static str> {
@@ -299,6 +319,7 @@ impl Classification {
                 .transpose()?,
             closure: Vec::new(),
             persisted: true,
+            register_grant: false,
         })
     }
 }
@@ -657,16 +678,129 @@ pub(super) async fn select_owner_authority<C: ConnectionTrait>(
     Ok(Ok(closure))
 }
 
-/// Classify a registration at `at` for the given root expiry.
+/// Register-grant route (rules 1–5 in the docs): the root's whole authority is a
+/// delegation D from the space owner P to `owner_did`, carrying
+/// `tinycloud.policy/register` on exactly `<S>/policy/<h>`, where `h` is the
+/// template digest of the root's policy. Returns D's closure, which is `{D}`.
+/// Rule 6 (the root expires no later than D) is decided by the caller.
+async fn select_register_grant<C: ConnectionTrait>(
+    conn: &C,
+    owner_did: &str,
+    capabilities: &[Capability],
+    policy: &Value,
+    at: OffsetDateTime,
+    issued_before: Option<OffsetDateTime>,
+    root_expiry: OffsetDateTime,
+) -> Result<Option<Vec<ClosureNode>>, SelectionUnavailable> {
+    // Rule 3: one policy space S; its owner P is the root authority.
+    let Some(space_id) = capabilities.iter().find_map(|cap| cap.resource.space()) else {
+        return Ok(None);
+    };
+    let issuer = space_id.did().as_str().to_owned();
+    let space = space_id.to_string();
+    if !capabilities
+        .iter()
+        .all(|cap| rooted_at_space(cap, &space, &issuer))
+    {
+        return Ok(None);
+    }
+    let Some(digest) = register_template_digest_hex(policy) else {
+        return Ok(None);
+    };
+    let Ok(ability) = Ability::try_from(REGISTER_ABILITY.to_owned()) else {
+        return Ok(None);
+    };
+    let Ok(resource) = format!("{space}/policy/{digest}").parse::<Resource>() else {
+        return Ok(None);
+    };
+    // Rule 2: D carries the register right on exactly the template resource.
+    let scope = Condition::all()
+        .add(abilities::Column::Resource.eq(resource.to_string()))
+        .add(abilities::Column::Ability.eq(ability.clone()));
+    let rows = candidate_rows(
+        conn,
+        owner_did,
+        Some(std::slice::from_ref(&issuer)),
+        Some(scope),
+        at,
+        issued_before,
+        MAX_OWNER_AUTHORITY_ROWS,
+    )
+    .await
+    .map_err(|_| SelectionUnavailable)?;
+    let register = Capability {
+        resource,
+        ability,
+        caveats: Default::default(),
+    };
+    let mut first = None;
+    for row in rows.into_iter().filter(|row| !is_policy_fact_row(row)) {
+        // Rule 3: D is issued by P. The owner cannot grant itself the root.
+        if !did_principal_matches(&row.delegator, &issuer)
+            || did_principal_matches(&row.delegator, owner_did)
+        {
+            continue;
+        }
+        let closure = match authority_graph::load_closure(conn, &[row.id]).await {
+            Ok(closure) => closure,
+            Err(ChainTraversalError::LimitExceeded) => continue,
+            Err(ChainTraversalError::Db(_)) => return Err(SelectionUnavailable),
+        };
+        // Rule 4: D has no parents, so its closure is exactly {D}.
+        if closure.len() != 1 || closure[0].id != row.id {
+            continue;
+        }
+        // Rule 5: the owner holds D at `at`, and D is unrevoked.
+        match invocation_model::authorize_holder(
+            conn,
+            owner_did,
+            std::slice::from_ref(&register),
+            &[row.id.to_cid(0x55)],
+            at,
+        )
+        .await
+        {
+            Ok(()) => {
+                if covers(min_expiry(&closure), root_expiry) {
+                    return Ok(Some(closure));
+                }
+                if first.is_none() {
+                    first = Some(closure);
+                }
+            }
+            Err(InvocationModelError::Db(_)) => return Err(SelectionUnavailable),
+            Err(_) => {}
+        }
+    }
+    Ok(first)
+}
+
+/// Whether `capability` is rooted at the policy space `space` owned by
+/// `issuer`: a space capability on `space`, or a network owned by `issuer`.
+fn rooted_at_space(capability: &Capability, space: &str, issuer: &str) -> bool {
+    if let Some(cap_space) = capability.resource.space() {
+        return cap_space.to_string() == space;
+    }
+    if let Resource::Other(uri) = &capability.resource {
+        if let Ok(network) = uri.as_str().parse::<NetworkId>() {
+            return did_principal_matches(network.owner_did(), issuer);
+        }
+    }
+    false
+}
+
+/// Classify a registration at `at` for the given root expiry. Ordinary
+/// selection runs first; the register grant only when it finds no authority.
 pub(super) async fn classify<C: ConnectionTrait>(
     conn: &C,
     owner_did: &str,
     capabilities: &[Capability],
+    policy: &Value,
     at: OffsetDateTime,
     issued_before: Option<OffsetDateTime>,
     root_expiry: OffsetDateTime,
 ) -> Result<Classification, SelectionUnavailable> {
-    let selection = select_owner_authority(
+    match select_owner_authority(
         conn,
         owner_did,
         capabilities,
@@ -674,8 +808,26 @@ pub(super) async fn classify<C: ConnectionTrait>(
         issued_before,
         root_expiry,
     )
-    .await?;
-    Ok(Classification::from_selection(selection, root_expiry))
+    .await?
+    {
+        Ok(closure) => Ok(Classification::from_selection(Ok(closure), root_expiry)),
+        Err(reason) => Ok(
+            match select_register_grant(
+                conn,
+                owner_did,
+                capabilities,
+                policy,
+                at,
+                issued_before,
+                root_expiry,
+            )
+            .await?
+            {
+                Some(closure) => Classification::from_register_grant(closure, root_expiry),
+                None => Classification::from_selection(Err(reason), root_expiry),
+            },
+        ),
+    }
 }
 
 /// Write a classification: the binding row first, then its closure.
@@ -1299,18 +1451,26 @@ impl PolicyV3Runtime {
                 mode,
             ));
         }
+        let policy: Value = serde_json::from_slice(&registration.policy_bytes)
+            .map_err(|_| "policy-registration-corrupt")?;
         // As the mint check always has: the authority the owner held when
         // it registered, revoked as of now.
         let mut classification = classify(
             &self.conn,
             &registration.owner_did,
             &root.0.capabilities,
+            &policy,
             registered_at,
             Some(registered_at),
             root_expiry,
         )
         .await
         .map_err(|_| "policy-owner-authority-unavailable")?;
+        // Design rule 6 in the background: a register-grant root that outlives
+        // its grant is unknown in both modes, never bound uncapped.
+        if classification.register_grant && classification.state == BindingState::BoundUncapped {
+            classification = Classification::unknown(UnknownReason::OutlivesAuthority);
+        }
         match mode {
             // Legacy roots longer than the cap are counted, never refused.
             RegisteredMode::Backfill if !lifetime_allowed => {

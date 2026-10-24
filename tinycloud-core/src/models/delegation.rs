@@ -173,6 +173,11 @@ pub enum DelegationError {
     PolicyRootRequiresConjunctiveSession,
     #[error("policy-descendant-fact-invalid")]
     PolicyDescendantFactInvalid,
+    /// A `tinycloud.policy/*` ability is only honoured as a parentless grant
+    /// from the space owner. A delegation with parents that carries one is
+    /// refused, so register grants are always root delegations.
+    #[error("policy-register-grant-must-be-parentless")]
+    PolicyAbilityRequiresNoParents,
     /// W1: child caveats are not a subset of the parent's caveats — the
     /// child dropped, widened, or replaced a constrained-statements caveat
     /// the parent carried (audit P0 finding 1). Maps to the spec rejection
@@ -376,6 +381,17 @@ async fn validate_with<C: ConnectionTrait>(
         )
     }) {
         return Err(DelegationError::KeyDeleteNotDelegable.into());
+    }
+    // A `tinycloud.policy/*` grant is only honoured parentless, from the
+    // space owner. A child that carries one is refused here, before any
+    // parent-based authorization runs.
+    if !delegation.parents.is_empty()
+        && delegation
+            .capabilities
+            .iter()
+            .any(|c| c.ability.to_string().starts_with("tinycloud.policy/"))
+    {
+        return Err(DelegationError::PolicyAbilityRequiresNoParents.into());
     }
 
     // get caps which rely on delegated caps
@@ -1793,6 +1809,33 @@ mod tests {
             validate(&db, &info).await,
             Err(Error::InvalidDelegation(
                 DelegationError::KeyDeleteNotDelegable
+            ))
+        ));
+    }
+
+    /// A child delegation carrying a `tinycloud.policy/*` ability is refused
+    /// with the policy code before any parent is consulted: the cited parent
+    /// does not exist, and the delegation has no other violation.
+    #[tokio::test]
+    async fn child_policy_grant_is_refused_before_parent_check() {
+        let db = database().await;
+        let parent = crate::hash::hash(b"policy-grant-child-parent");
+        let resource = format!(
+            "tinycloud:{}:default/policy/{}",
+            KEY_OWNER.trim_start_matches("did:"),
+            "ab".repeat(32)
+        );
+        let info = key_grant_info(KEY_OWNER, &resource, "tinycloud.policy/register", &[parent]);
+        assert!(matches!(
+            validate_with(&db, &info, false, true).await,
+            Err(Error::InvalidDelegation(
+                DelegationError::PolicyAbilityRequiresNoParents
+            ))
+        ));
+        assert!(matches!(
+            validate(&db, &info).await,
+            Err(Error::InvalidDelegation(
+                DelegationError::PolicyAbilityRequiresNoParents
             ))
         ));
     }

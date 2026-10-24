@@ -236,6 +236,12 @@
       "urn": "tinycloud.vfs/delete",
       "service": "tinycloud.vfs",
       "status": "reserved"
+    },
+    {
+      "urn": "tinycloud.policy/register",
+      "service": "tinycloud.policy",
+      "status": "active",
+      "notes": "TC-1718: never invoked. Presented in a delegation from a policy space owner to its owner, on exactly <space>/policy/<h>, to authorize holding a policy root whose template digest is <h>. Checked by policy registration (owner_authority select_register_grant), not by /invoke dispatch. Must be granted explicitly: no wildcard (`*`) or registry action implies it."
     }
   ]
 }

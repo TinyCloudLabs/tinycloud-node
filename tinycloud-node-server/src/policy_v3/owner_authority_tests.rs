@@ -769,17 +769,51 @@ impl Harness {
         })
     }
 
-    /// Register a policy over the content whose roots span `root`, signed
-    /// by the policy owner.
-    pub async fn register(&self, root: Window) -> anyhow::Result<(Status, String, Registered)> {
-        let owner_did = self.owner.did().to_owned();
-        let policy = signed_policy(
+    /// The policy over the content whose roots span `root`, signed by the
+    /// policy owner. Each build draws a fresh `shareId`, so each build has
+    /// its own template digest.
+    pub fn build_policy(&self, root: Window) -> Value {
+        signed_policy(
             &self.owner,
             &self.vector,
             &self.content_resource.to_string(),
             &self.network,
             &root,
-        );
+        )
+    }
+
+    /// Set `policyId` and `signature` on `policy` as the policy owner. The
+    /// `policyId` is a hash of the unsigned policy, so a changed `createdAt`
+    /// needs re-signing.
+    pub fn sign_policy(&self, mut policy: Value) -> Value {
+        let mut unsigned = policy.clone();
+        unsigned.as_object_mut().unwrap().remove("policyId");
+        unsigned.as_object_mut().unwrap().remove("signature");
+        let mut preimage = POLICY_V2_SCHEMA.as_bytes().to_vec();
+        preimage.push(0);
+        preimage.extend_from_slice(&canonical_json_value(&unsigned));
+        policy["policyId"] = json!(format!("pol_{}", base32_lower(&Sha256::digest(&preimage))));
+        policy["signature"]["value"] = json!(encode_config(
+            self.owner.keypair().sign(&Sha256::digest(preimage)),
+            URL_SAFE_NO_PAD
+        ));
+        policy
+    }
+
+    /// Register a policy over the content whose roots span `root`, signed
+    /// by the policy owner.
+    pub async fn register(&self, root: Window) -> anyhow::Result<(Status, String, Registered)> {
+        let policy = self.build_policy(root);
+        self.register_policy(root, policy).await
+    }
+
+    /// Submit a policy from `build_policy` with roots spanning `root`.
+    pub async fn register_policy(
+        &self,
+        root: Window,
+        policy: Value,
+    ) -> anyhow::Result<(Status, String, Registered)> {
+        let owner_did = self.owner.did().to_owned();
         let policy_bytes = canonical_json_value(&policy);
         let policy_cid = Cid::new_v1(
             0x55,
@@ -2806,8 +2840,19 @@ async fn revoking_the_owner_grant_ends_admitted_sessions(backend: Backend) -> an
     let session = h.mint_ok(&policy).await?;
     let (status, body) = h.read(&session).await?;
     assert_eq!((status, body.as_slice()), (Status::Ok, CONTENT));
-    let (_, decrypt_before) = h.decrypt(&session).await?;
-    assert_ne!(decrypt_before, REVOKED);
+    // The request body is empty on purpose: the route checks the owner
+    // authority before it parses the body, so a malformed-body 400 here shows
+    // the session passed the check, and the same request is a 403 after the
+    // revoke below.
+    let (decrypt_status_before, decrypt_before) = h.decrypt(&session).await?;
+    assert_eq!(
+        (
+            decrypt_status_before,
+            decrypt_before.starts_with("decrypt request body is malformed")
+        ),
+        (Status::BadRequest, true),
+        "decrypt before: {decrypt_before}"
+    );
     let (status, body, reader, child) = h.reshare(&session).await?;
     assert_eq!(status, Status::Ok, "{body}");
     let child = child.unwrap();
@@ -3694,3 +3739,379 @@ async fn postgres_policy_read_latency_gate() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn register_grant_round_trips_through_siwe_recap() -> anyhow::Result<()> {
+    let org = Signer::pkh();
+    let space = SpaceId::new(org.did().parse::<DIDBuf>()?, "org".parse()?);
+    let policy_hash = "ab".repeat(32);
+    let resource = space.to_resource("policy".parse()?, Some(policy_hash.parse()?), None, None);
+    let grants = [(resource.to_string(), "tinycloud.policy/register")];
+    let audience = Signer::key();
+    let encoded = org.delegate(
+        audience.did(),
+        &grants,
+        Window::until(now() + Duration::days(1)),
+        &[],
+    )?;
+    let (decoded, _) = TinyCloudDelegation::decode(&encoded)?;
+    let info = tinycloud_core::util::DelegationInfo::try_from(decoded)?;
+    let [capability] = info.capabilities.as_slice() else {
+        anyhow::bail!("expected one capability, got {:?}", info.capabilities);
+    };
+    assert_eq!(capability.ability.to_string(), "tinycloud.policy/register");
+    let tinycloud_resource = capability
+        .resource
+        .tinycloud_resource()
+        .ok_or_else(|| anyhow::anyhow!("resource is not a tinycloud resource"))?;
+    assert_eq!(tinycloud_resource.service().as_str(), "policy");
+    assert_eq!(tinycloud_resource.to_string(), resource.to_string());
+    Ok(())
+}
+
+const REGISTER: &str = "tinycloud.policy/register";
+
+/// The space owner grants the policy owner `tinycloud.policy/register` on
+/// `<content space>/policy/<digest>`, delegated for `window`.
+async fn grant_register(h: &Harness, digest: &str, window: Window) -> anyhow::Result<String> {
+    let resource =
+        h.content_space
+            .clone()
+            .to_resource("policy".parse()?, Some(digest.parse()?), None, None);
+    h.import(h.space_owner.delegate(
+        h.owner.did(),
+        &[(resource.to_string(), REGISTER)],
+        window,
+        &[],
+    )?)
+    .await
+}
+
+fn template_digest(policy: &Value) -> anyhow::Result<String> {
+    register_template_digest_hex(policy)
+        .ok_or_else(|| anyhow::anyhow!("policy has no template digest"))
+}
+
+/// A register grant from the space owner, naming the template digest of
+/// the policy, authorises the policy owner with no ordinary owner grant.
+async fn register_grant_authorizes_the_owner_for_its_template(
+    backend: Backend,
+) -> anyhow::Result<()> {
+    let Some(h) = Harness::with_boot(
+        backend,
+        Shape::KeySession,
+        "register_grant_authorizes_the_owner_for_its_template",
+        enforce_boot(),
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let policy = h.build_policy(policy_window());
+    let grant = grant_register(
+        &h,
+        &template_digest(&policy)?,
+        Window::until(now() + Duration::days(2)),
+    )
+    .await?;
+    let (status, body, registered) = h.register_policy(policy_window(), policy).await?;
+    assert_eq!(status, Status::Ok, "{body}");
+    let binding = h.binding(&registered.policy_cid).await?.expect("binding");
+    assert_eq!(binding.state, "bound");
+    assert_eq!(h.closure(&registered.policy_cid).await?, vec![grant]);
+    Ok(())
+}
+on_both_backends!(register_grant_authorizes_the_owner_for_its_template);
+
+/// A register grant on another template digest does not
+/// authorise this policy.
+async fn register_grant_must_name_this_template(backend: Backend) -> anyhow::Result<()> {
+    let Some(h) = Harness::with_boot(
+        backend,
+        Shape::KeySession,
+        "register_grant_must_name_this_template",
+        enforce_boot(),
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let policy = h.build_policy(policy_window());
+    grant_register(
+        &h,
+        &"cd".repeat(32),
+        Window::until(now() + Duration::days(2)),
+    )
+    .await?;
+    let (status, body, registered) = h.register_policy(policy_window(), policy).await?;
+    assert_eq!(
+        (status, body.as_str()),
+        (Status::Forbidden, "policy-owner-not-authorized")
+    );
+    assert_eq!(h.binding(&registered.policy_cid).await?, None);
+    Ok(())
+}
+on_both_backends!(register_grant_must_name_this_template);
+
+/// A revoked register grant does not authorise the policy.
+async fn revoked_register_grant_does_not_authorize(backend: Backend) -> anyhow::Result<()> {
+    let Some(h) = Harness::with_boot(
+        backend,
+        Shape::KeySession,
+        "revoked_register_grant_does_not_authorize",
+        enforce_boot(),
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let policy = h.build_policy(policy_window());
+    let grant = grant_register(
+        &h,
+        &template_digest(&policy)?,
+        Window::until(now() + Duration::days(2)),
+    )
+    .await?;
+    h.revoke(&h.space_owner, &grant).await?;
+    let (status, body, registered) = h.register_policy(policy_window(), policy).await?;
+    assert_eq!(
+        (status, body.as_str()),
+        (Status::Forbidden, "policy-owner-not-authorized")
+    );
+    assert_eq!(h.binding(&registered.policy_cid).await?, None);
+    Ok(())
+}
+on_both_backends!(revoked_register_grant_does_not_authorize);
+
+/// A root that outlives the register grant is refused in both
+/// modes, because the grant cannot cover the root's lifetime.
+async fn register_grant_refuses_roots_outliving_it(h: &Harness) -> anyhow::Result<()> {
+    let policy = h.build_policy(policy_window());
+    grant_register(
+        h,
+        &template_digest(&policy)?,
+        Window::until(now() + Duration::hours(1)),
+    )
+    .await?;
+    let (status, body, registered) = h.register_policy(policy_window(), policy).await?;
+    assert_eq!(
+        (status, body.as_str()),
+        (Status::Forbidden, "policy-root-outlives-register-grant")
+    );
+    assert_eq!(h.binding(&registered.policy_cid).await?, None);
+    Ok(())
+}
+
+async fn register_grant_outlives_check_runs_in_both_modes(backend: Backend) -> anyhow::Result<()> {
+    let Some(h) = Harness::with_boot(
+        backend,
+        Shape::KeySession,
+        "register_grant_outlives_check_runs_in_both_modes",
+        enforce_boot(),
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    register_grant_refuses_roots_outliving_it(&h).await?;
+    let Some(h) = Harness::new(
+        backend,
+        Shape::KeySession,
+        "register_grant_outlives_check_runs_in_both_modes",
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    register_grant_refuses_roots_outliving_it(&h).await?;
+    Ok(())
+}
+on_both_backends!(register_grant_outlives_check_runs_in_both_modes);
+
+/// The authority a register grant gives lasts until the grant
+/// expires: the policy is bound until then, and its use is refused after.
+async fn register_grant_authority_ends_with_the_grant(backend: Backend) -> anyhow::Result<()> {
+    let Some(h) = Harness::with_boot(
+        backend,
+        Shape::KeySession,
+        "register_grant_authority_ends_with_the_grant",
+        enforce_boot(),
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let expiry = now() + Duration::seconds(12);
+    let policy = h.build_policy(Window::until(expiry));
+    let grant = grant_register(&h, &template_digest(&policy)?, Window::until(expiry)).await?;
+    let (status, body, registered) = h.register_policy(Window::until(expiry), policy).await?;
+    assert_eq!(status, Status::Ok, "{body}");
+    let binding = h.binding(&registered.policy_cid).await?.expect("binding");
+    assert_eq!(binding.state, "bound");
+    assert_eq!(
+        binding.authority_expires_at.as_deref(),
+        Some(format_time(expiry).as_str())
+    );
+    assert_eq!(h.closure(&registered.policy_cid).await?, vec![grant]);
+    let session = h.mint_ok(&registered).await?;
+    assert_eq!(h.read(&session).await?.0, Status::Ok);
+    tokio::time::sleep(
+        (expiry - OffsetDateTime::now_utc()).unsigned_abs() + std::time::Duration::from_secs(1),
+    )
+    .await;
+    let (status, body) = h.read(&session).await?;
+    assert_eq!(status, Status::Forbidden);
+    assert_eq!(text(&body), "policy-session-expired");
+    let (status, body) = h.challenge(&registered).await;
+    assert_eq!((status, body.as_str()), (Status::Forbidden, "root-expired"));
+    Ok(())
+}
+on_both_backends!(register_grant_authority_ends_with_the_grant);
+
+/// A registration whose grant is revoked is
+/// re-classified against the grant that remains. A shorter grant cannot cover
+/// the root, so the registration is unknown (outlives-authority): the answer a
+/// fresh registration gets.
+async fn register_grant_reclassification_refuses_outliving_roots(
+    backend: Backend,
+) -> anyhow::Result<()> {
+    let Some(h) = Harness::with_boot(
+        backend,
+        Shape::KeySession,
+        "register_grant_reclassification_refuses_outliving_roots",
+        enforce_boot(),
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let root = Window::until(now() + Duration::hours(1));
+    let policy = h.build_policy(root);
+    let digest = template_digest(&policy)?;
+    let long = grant_register(&h, &digest, Window::until(now() + Duration::days(2))).await?;
+    let _short = grant_register(&h, &digest, Window::until(now() + Duration::minutes(30))).await?;
+    let (status, body, registered) = h.register_policy(root, policy.clone()).await?;
+    assert_eq!(status, Status::Ok, "{body}");
+    assert_eq!(h.closure(&registered.policy_cid).await?, vec![long.clone()]);
+    h.revoke(&h.space_owner, &long).await?;
+    h.forget_binding(&registered.policy_cid).await?;
+    let _ = h.challenge(&registered).await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    let binding = loop {
+        if let Some(row) = h
+            .binding(&registered.policy_cid)
+            .await?
+            .filter(|row| row.classifier_version > 0)
+        {
+            break row;
+        }
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "no background classification stored"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    assert_eq!(binding.state, "unknown");
+    assert_eq!(
+        binding.unknown_reason.as_deref(),
+        Some("outlives-authority")
+    );
+    // Same template digest (createdAt, expiresAt, policyId and signature sit
+    // outside it), different policyId: a second registration of this template.
+    let mut fresh = policy.clone();
+    fresh["createdAt"] = json!(format_time(now() - Duration::minutes(5)));
+    let fresh = h.sign_policy(fresh);
+    let (status, body, _) = h.register_policy(root, fresh).await?;
+    assert_eq!(
+        (status, body.as_str()),
+        (Status::Forbidden, "policy-root-outlives-register-grant")
+    );
+    Ok(())
+}
+on_both_backends!(register_grant_reclassification_refuses_outliving_roots);
+
+/// The re-classification in backfill mode:
+/// the remaining grant cannot cover the
+/// root, so the stored answer is unknown (outlives-authority), never bound
+/// uncapped. Backfill has no mode-level mapping, so only the background check
+/// keeps this honest.
+async fn register_grant_background_refuses_outliving_roots_in_backfill(
+    backend: Backend,
+) -> anyhow::Result<()> {
+    let Some(h) = Harness::new(
+        backend,
+        Shape::KeySession,
+        "register_grant_background_refuses_outliving_roots_in_backfill",
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let root = Window::until(now() + Duration::hours(1));
+    let policy = h.build_policy(root);
+    let digest = template_digest(&policy)?;
+    let long = grant_register(&h, &digest, Window::until(now() + Duration::days(2))).await?;
+    let _short = grant_register(&h, &digest, Window::until(now() + Duration::minutes(30))).await?;
+    let (status, body, registered) = h.register_policy(root, policy).await?;
+    assert_eq!(status, Status::Ok, "{body}");
+    h.revoke(&h.space_owner, &long).await?;
+    h.forget_binding(&registered.policy_cid).await?;
+    let _ = h.challenge(&registered).await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    let binding = loop {
+        if let Some(row) = h
+            .binding(&registered.policy_cid)
+            .await?
+            .filter(|row| row.classifier_version > 0)
+        {
+            break row;
+        }
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "no background classification stored"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    assert_eq!(binding.state, "unknown");
+    assert_eq!(
+        binding.unknown_reason.as_deref(),
+        Some("outlives-authority")
+    );
+    Ok(())
+}
+on_both_backends!(register_grant_background_refuses_outliving_roots_in_backfill);
+
+/// A delegation with parents may not carry a `tinycloud.policy/*`
+/// ability: the register grant must be a root delegation.
+async fn register_grant_must_be_parentless(backend: Backend) -> anyhow::Result<()> {
+    let Some(h) = Harness::new(
+        backend,
+        Shape::KeySession,
+        "register_grant_must_be_parentless",
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let parent = h.grant_owner(policy_window()).await?;
+    let resource = h.content_space.clone().to_resource(
+        "policy".parse()?,
+        Some("ab".repeat(32).parse()?),
+        None,
+        None,
+    );
+    let audience = Signer::key();
+    let child = h.owner.delegate(
+        audience.did(),
+        &[(resource.to_string(), REGISTER)],
+        policy_window(),
+        &[parent.parse::<Cid>()?],
+    )?;
+    let (status, body) = h.delegate(child).await;
+    assert!(
+        status != Status::Ok && body.contains("policy-register-grant-must-be-parentless"),
+        "{status} {body}"
+    );
+    Ok(())
+}
+on_both_backends!(register_grant_must_be_parentless);

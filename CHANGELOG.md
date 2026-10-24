@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Release notes
+
+- **Policy registration accepts a register grant.** A policy owner with no ordinary owner-first or general-window delegation for a root is authorised when the space owner delegates `tinycloud.policy/register` on `<space>/policy/<digest>`, where `digest` is the template digest of the policy. The grant must be a root delegation, must be unrevoked and in its validity window, and must outlive the root; a root that outlives the grant is refused with `policy-root-outlives-register-grant` in both modes. `/delegate` refuses any delegation with parents that carries a `tinycloud.policy/*` ability. Classifier version 3; no database migration. Details: TC-1718.
+
 ### Changes
 - Added `sql_store` settings, validation, and manifest format and timestamp rules; `enabled = true` refuses to start (no uploader in this build).
 
