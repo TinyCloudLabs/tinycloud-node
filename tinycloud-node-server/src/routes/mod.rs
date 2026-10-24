@@ -2363,6 +2363,16 @@ async fn invoke_impl(
                 if let TxStoreError::KvTooManyMutations { .. } = &e {
                     return Err(too_many_mutations().into());
                 }
+                if let TxStoreError::KvCandidateUnavailable = &e {
+                    // The attempted blob cannot be committed: its durable
+                    // registration expired or a prior DELETE is in flight.
+                    // No KV write landed; retry with a fresh invocation.
+                    return Err((
+                        Status::ServiceUnavailable,
+                        format!("{UNAVAILABLE_RETRYABLE}: {e}"),
+                    )
+                        .into());
+                }
                 if let TxStoreError::Tx(TxError::ReadAudit(error)) = &e {
                     return Err(read_audit_failure(Service::Kv, error).into());
                 }
@@ -13066,6 +13076,7 @@ mod tests {
                 epoch: Set(tinycloud_core::hash::hash(b"tc908-foreign-epoch")),
                 epoch_seq: Set(1),
                 value: Set(tinycloud_core::hash::hash(b"foreign secret")),
+                generation: Set(0),
                 metadata: Set(Metadata(Default::default())),
                 deleted: Set(false),
             }

@@ -48,7 +48,12 @@ An existing pause continues to block legacy writes under `xyz.tinycloud.tinychat
 
 Reads, chat keys, cursors, credentials, and other spaces retain their existing behavior. Frozen ordinary KV put/delete returns HTTP 409. The core guard also rejects internal legacy cleanup. The pause survives a node restart; only an exact generation-checked release removes it.
 
-The durable guard remains locked by protected KV mutation transactions through storage persistence and commit. PostgreSQL row locking and SQLite writer serialization retain their existing behavior. Failed guard reads fail closed. Existing snapshot keys remain protected after the legacy pause is released.
+The durable guard is acquired before a protected KV upload starts and stays locked through storage persistence and commit or abort. A freeze acknowledgement therefore drains writes already uploading; a later writer is refused before uploading. If a writer stalls, the freeze attempt fails after 30 seconds rather than acknowledging an incomplete drain. PostgreSQL row locking and SQLite writer serialization retain their existing behavior. Failed guard reads fail closed. Existing snapshot keys remain protected after the legacy pause is released.
+
+The acknowledgement covers DB commit or rollback and the end of any protected
+upload, not physical orphan reclamation. Cleanup of a rolled-back write may
+finish afterward; it can only delete and refund an unreferenced, hash-fenced
+blob, never change committed KV rows or upload new data.
 
 ## Deployment compatibility
 
