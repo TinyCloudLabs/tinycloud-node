@@ -188,7 +188,7 @@ fn parse_sha256(value: &str) -> Result<[u8; 32], SqlStoreError> {
 
 /// `bytes first-last/total`.
 fn parse_content_range(value: &str) -> Result<(u64, u64, u64), SqlStoreError> {
-    let bad = || SqlStoreError::Backend("s3 returned an invalid content range".into());
+    let bad = || SqlStoreError::Backend(format!("s3 returned an invalid content range {value:?}"));
     let rest = value.strip_prefix("bytes ").ok_or_else(bad)?;
     let (bounds, total) = rest.split_once('/').ok_or_else(bad)?;
     let (first, last) = bounds.split_once('-').ok_or_else(bad)?;
@@ -378,6 +378,11 @@ impl SqlObjectStore for S3SqlObjectStore {
             .map_err(|_| SqlStoreError::Backend("s3 get body failed".into()))?
             .into_bytes()
             .to_vec();
+        // A range that selects a byte always returns at least one: an empty
+        // answer means the object is empty, whatever header came with it.
+        if data.is_empty() {
+            return Ok(None);
+        }
         match content_range {
             Some(value) => {
                 let (first, last, total) = parse_content_range(&value)?;
