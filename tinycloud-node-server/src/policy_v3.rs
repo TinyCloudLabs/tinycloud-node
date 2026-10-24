@@ -1462,6 +1462,9 @@ async fn authorize_delivery_inner(
     }) {
         return Err((Status::Conflict, "delivery-authorization-replayed".into()));
     }
+    // The request's own `expiresAt` is checked before anything costs a token
+    // or a fetch: a malformed, expired or too distant value is refused here.
+    delivery_request_expiry(&request.expires_at, OffsetDateTime::now_utc()).ok_or_else(invalid)?;
     // The links API limits reads per client address and the node reads from
     // one: a request that reaches the fetch first passes the per-invoker and
     // node-wide limits. Nothing was fetched, opened or stored for a request
@@ -1526,7 +1529,6 @@ async fn authorize_delivery_inner(
     if !v3_registration_is_live(&registration, now) {
         return Err((Status::Forbidden, "delivery-authorization-invalid".into()));
     }
-    delivery_request_expiry(&request.expires_at, now).ok_or_else(invalid)?;
     let (envelope, _, actions) =
         v3_envelope_delivery_projection(&envelope_value, &registration, delivery, &request)
             .map_err(|_| (Status::Forbidden, "delivery-authorization-invalid".into()))?;
@@ -8603,6 +8605,15 @@ mod tests {
         success_request: &'a DeliveryAuthorizationRequest,
         success_body: &'a str,
         log: &'a CapturedLog,
+        second: Holder<'a>,
+    }
+
+    /// A key that invokes under a delegation of its own.
+    #[derive(Clone, Copy)]
+    struct Holder<'a> {
+        cid: &'a tinycloud_auth::ipld_core::cid::Cid,
+        jwk: &'a JWK,
+        did: &'a str,
     }
 
     impl MatrixContext<'_> {
@@ -8618,6 +8629,24 @@ mod tests {
             nonce: &str,
             body: String,
         ) -> anyhow::Result<(Status, String, Option<String>)> {
+            self.post_as(self.first_holder(), nonce, body).await
+        }
+
+        fn first_holder(&self) -> Holder<'_> {
+            Holder {
+                cid: self.sender_cid,
+                jwk: self.jwk,
+                did: self.holder_did,
+            }
+        }
+
+        /// POST as `holder`, who invokes under their own delegation.
+        async fn post_as(
+            &self,
+            holder: Holder<'_>,
+            nonce: &str,
+            body: String,
+        ) -> anyhow::Result<(Status, String, Option<String>)> {
             use tinycloud_auth::{
                 authorization::{make_invocation, InvocationOptions},
                 siwe_recap::Ability as RecapAbility,
@@ -8627,12 +8656,12 @@ mod tests {
                     self.resource.clone(),
                     ["tinycloud.kv/get".parse::<RecapAbility>()?],
                 )],
-                self.sender_cid,
-                self.jwk,
+                holder.cid,
+                holder.jwk,
                 &format!(
                     "{}#{}",
-                    self.holder_did,
-                    self.holder_did.trim_start_matches("did:key:")
+                    holder.did,
+                    holder.did.trim_start_matches("did:key:")
                 ),
                 (OffsetDateTime::now_utc() + Duration::seconds(45)).unix_timestamp() as f64,
                 InvocationOptions {
@@ -8700,6 +8729,18 @@ mod tests {
             share_url: String,
             expires_at: String,
         ) -> anyhow::Result<(Status, String, Option<String>)> {
+            self.send_as(self.first_holder(), n, share_url, expires_at)
+                .await
+        }
+
+        /// As [`Self::send`], invoking as `holder`.
+        async fn send_as(
+            &self,
+            holder: Holder<'_>,
+            n: u8,
+            share_url: String,
+            expires_at: String,
+        ) -> anyhow::Result<(Status, String, Option<String>)> {
             let mut request = DeliveryAuthorizationRequest {
                 share_url,
                 recipient_email: "alice@example.test".into(),
@@ -8710,7 +8751,8 @@ mod tests {
             };
             request.request_body_digest = delivery_request_digest(&request)
                 .map_err(|_| anyhow::anyhow!("matrix request digest"))?;
-            self.post_full(
+            self.post_as(
+                holder,
                 &format!("slice5-matrix-{n}"),
                 serde_json::to_string(&request)?,
             )
@@ -8944,7 +8986,7 @@ mod tests {
             ctx.deliver(
                 20 + n as u8,
                 label,
-                at_link(&link_id(11 + n)),
+                built.href.replace(ts::LINK_ID, &link_id(11 + n)),
                 invalid,
                 &mut bodies,
             )
@@ -9003,7 +9045,40 @@ mod tests {
             fetches + 2,
             "a refused request does not reach the fetcher"
         );
-        assert_eq!(limiter.take_refusals(), vec![(Scope::Invoker, 3)]);
+        // A refusal logs nothing by itself; the aggregated line comes from
+        // `report()`.
+        let log_text = |ctx: &MatrixContext<'_>| String::from_utf8(ctx.log.0.lock().clone());
+        assert!(!log_text(&ctx)?.contains("delivery_rate_limited"));
+        // The limit is the invoker's own: another invoker with its own
+        // delegation is admitted while the first is refused.
+        for n in 0..2_u8 {
+            let (status, body, _) = ctx
+                .send_as(ctx.second, 56 + n, at_link(&link_id(1)), expires_at.clone())
+                .await?;
+            assert_eq!(
+                (status, body.as_str()),
+                (Status::NotFound, "delivery-link-unavailable"),
+                "the second invoker reaches the fetch"
+            );
+            bodies.push(body);
+        }
+        assert_eq!(ctx.links.fetch_count(), fetches + 4);
+        // The first invoker is still refused.
+        let (status, body, _) = ctx
+            .send(58, at_link(&link_id(1)), expires_at.clone())
+            .await?;
+        assert_eq!(
+            (status, body.as_str()),
+            (Status::TooManyRequests, "delivery-rate-limited")
+        );
+        bodies.push(body);
+        assert!(!log_text(&ctx)?.contains("delivery_rate_limited"));
+        assert_eq!(limiter.report(), vec![(Scope::Invoker, 4)]);
+        assert_eq!(
+            log_text(&ctx)?.matches("delivery_rate_limited").count(),
+            1,
+            "one aggregated line"
+        );
         // The node-wide cap answers the same way.
         limiter.set_limits(110, 110, 1);
         ctx.deliver(
@@ -9024,7 +9099,7 @@ mod tests {
         let seconds: u64 = retry_after.expect("Retry-After").parse()?;
         assert!((1..=60).contains(&seconds), "{seconds}");
         bodies.push(body);
-        assert_eq!(ctx.links.fetch_count(), fetches + 3);
+        assert_eq!(ctx.links.fetch_count(), fetches + 5);
         assert_eq!(limiter.take_refusals(), vec![(Scope::Global, 1)]);
         // A request refused before the fetch step costs no token: a link the
         // grammar refuses, over and over, never trips the limit.
@@ -9040,6 +9115,60 @@ mod tests {
             .await?;
         }
         assert!(limiter.take_refusals().is_empty());
+
+        // A request whose `expiresAt` is malformed, expired or more than five
+        // minutes ahead is refused before the limiter: no fetch, no token
+        // from the invoker's bucket and none from the node-wide window.
+        let late = ts::millis(OffsetDateTime::now_utc() - Duration::minutes(1));
+        let far = ts::millis(OffsetDateTime::now_utc() + Duration::minutes(10));
+        let whole_second = format!("{}Z", &expires_at[..19]);
+        for (limits, first_valid) in [((20, 1, 110), 83_u8), ((110, 110, 1), 90_u8)] {
+            limiter.set_limits(limits.0, limits.1, limits.2);
+            let fetches = ctx.links.fetch_count();
+            for (n, (label, bad)) in [
+                ("malformed", whole_second.clone()),
+                ("expired", late.clone()),
+                ("too far ahead", far.clone()),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                ctx.deliver_expiring(
+                    first_valid - 3 + n as u8,
+                    label,
+                    at_link(&link_id(1)),
+                    bad,
+                    invalid,
+                    &mut bodies,
+                )
+                .await?;
+            }
+            assert_eq!(ctx.links.fetch_count(), fetches, "no fetch");
+            assert_eq!(limiter.tracked_invokers(), 0, "no bucket was created");
+            assert!(limiter.take_refusals().is_empty());
+            // The one token and the one node-wide slot are still there.
+            ctx.deliver(
+                first_valid,
+                "the one admitted request",
+                at_link(&link_id(1)),
+                not_found,
+                &mut bodies,
+            )
+            .await?;
+            assert_eq!(ctx.links.fetch_count(), fetches + 1);
+            let (status, body, _) = ctx
+                .send(first_valid + 1, at_link(&link_id(1)), expires_at.clone())
+                .await?;
+            assert_eq!(
+                (status, body.as_str()),
+                (Status::TooManyRequests, "delivery-rate-limited")
+            );
+            bodies.push(body);
+            assert_eq!(limiter.take_refusals().len(), 1);
+        }
+
+        // The rest of the flow sends its own requests from this invoker.
+        limiter.set_limits(1000, 1000, 1000);
 
         // Nothing that was logged, answered or stored holds the key or the
         // link. The one place the link appears is the receipt's own
@@ -9616,7 +9745,7 @@ mod tests {
                 nonce: Some("tc470-sender-content".into()),
                 facts: Some(vec![]),
                 proof: vec![],
-                attenuation: sender_capabilities,
+                attenuation: sender_capabilities.clone(),
             }
             .sign(Algorithm::EdDSA, &content_owner_jwk)?,
         ))
@@ -9636,6 +9765,54 @@ mod tests {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("missing sender delegation cid"))?
             .parse()?;
+
+        // A second holder with the same authority: two invokers for the
+        // limit that is kept per invoker.
+        let second_holder_key = tinycloud_core::libp2p::identity::ed25519::Keypair::generate();
+        let second_holder_did = did(&second_holder_key);
+        let second_holder_jwk = JWK::from(Params::OKP(OctetParams {
+            curve: "Ed25519".to_owned(),
+            public_key: Base64urlUInt(second_holder_key.public().to_bytes().to_vec()),
+            private_key: Some(Base64urlUInt(second_holder_key.secret().as_ref().to_vec())),
+        }));
+        let second_sender_response = client
+            .post("/delegate")
+            .header(rocket::http::Header::new(
+                "Authorization",
+                TinyCloudDelegation::Ucan(Box::new(
+                    Payload {
+                        issuer: content_owner_vm.parse()?,
+                        audience: second_holder_did.parse()?,
+                        not_before: Some(NumericDate::try_from_seconds(
+                            issued.unix_timestamp() as f64
+                        )?),
+                        expiration: NumericDate::try_from_seconds(expires.unix_timestamp() as f64)?,
+                        nonce: Some("slice5-second-sender-content".into()),
+                        facts: Some(vec![]),
+                        proof: vec![],
+                        attenuation: sender_capabilities,
+                    }
+                    .sign(Algorithm::EdDSA, &content_owner_jwk)?,
+                ))
+                .encode()?,
+            ))
+            .dispatch()
+            .await;
+        let second_sender_status = second_sender_response.status();
+        let second_sender_body = second_sender_response
+            .into_string()
+            .await
+            .unwrap_or_default();
+        assert_eq!(
+            second_sender_status,
+            Status::Ok,
+            "second sender /delegate: {second_sender_body}"
+        );
+        let second_sender_cid: tinycloud_auth::ipld_core::cid::Cid =
+            serde_json::from_str::<Value>(&second_sender_body)?["cid"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("missing second sender delegation cid"))?
+                .parse()?;
 
         // A session the space owner delegated to may own a policy over what
         // that delegation covers, as the Share and CLI owners do.
@@ -10124,6 +10301,11 @@ mod tests {
             success_request: &delivery_request,
             success_body: &delivery_body,
             log: &captured_log,
+            second: Holder {
+                cid: &second_sender_cid,
+                jwk: &second_holder_jwk,
+                did: &second_holder_did,
+            },
         }))
         .await?;
 

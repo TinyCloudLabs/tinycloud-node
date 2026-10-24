@@ -44,7 +44,8 @@ cap on fetches in any 60 seconds (`share_email.links_fetch_global_per_minute`,
 default 90, at most 110: the links API allows 120 reads a minute per client
 address). A request over either limit is answered `429 delivery-rate-limited`
 with `Retry-After` before anything is fetched; only requests that reach the
-fetch count against the limits.
+fetch count against the limits. The per-invoker limit is kept for each invoker;
+the node-wide limit is shared by all invokers.
 
 Each links API read is signed with the node identity key (`TinyCloud-Read-Auth`).
 An operator reads the node's DID from `GET /info`, field `nodeId`, and lists it

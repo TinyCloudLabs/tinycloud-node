@@ -391,6 +391,12 @@ fn a_clock_off_by_more_than_a_minute_is_counted_and_logged_once_a_minute() {
 
 #[test]
 fn the_threshold_is_sixty_seconds_exclusive() {
+    // Every test that can reach the skew log line installs a subscriber
+    // first: tracing caches whether a call site is enabled from the thread
+    // that reaches it first, so a thread without one would turn the line off
+    // for the thread that captures it.
+    let captured = Captured::default();
+    let _subscriber = captured.install();
     let skew = ClockSkew::default();
     let node = at("2026-10-24T12:00:00.000Z");
     let t0 = Instant::now();

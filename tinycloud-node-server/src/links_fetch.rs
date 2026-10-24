@@ -66,7 +66,9 @@ impl LinksOrigin {
             || url.query().is_some()
             || url.fragment().is_some()
             || url.port() == Some(0)
-            || url.host_str().is_none_or(str::is_empty)
+            || url
+                .host_str()
+                .is_none_or(|host| host.is_empty() || host.ends_with('.'))
             || url.origin().ascii_serialization() != value
         {
             return Err(INVALID);
@@ -76,13 +78,13 @@ impl LinksOrigin {
 
     /// Parse and check the host against the address scope without any
     /// lookup: an IP literal in a refused class and `localhost` names fail.
-    /// `resolve` answers with the host's addresses (`None` when it cannot);
+    /// `lookup` answers with the host's addresses (`None` when it cannot);
     /// when given, every answer must be permitted. A failed lookup is not an
     /// error here: the fetch vets the addresses again on every request.
     pub fn validate(
         value: &str,
         allow_private: bool,
-        resolve: Option<&HostResolver<'_>>,
+        lookup: Option<&HostResolver<'_>>,
     ) -> Result<Self, &'static str> {
         const PRIVATE: &str = "share email links_origin is a private, loopback, link-local or CGNAT address; set links_origin_allow_private to use one";
         let origin = Self::parse(value)?;
@@ -100,9 +102,9 @@ impl LinksOrigin {
             if !allow_private && (host == "localhost" || host.ends_with(".localhost")) {
                 return Err(PRIVATE);
             }
-            if let Some(resolve) = resolve {
+            if let Some(lookup) = lookup {
                 let port = origin.url.port_or_known_default().unwrap_or(443);
-                if let Some(addresses) = resolve(host, port) {
+                if let Some(addresses) = lookup(host, port) {
                     if addresses.iter().any(|ip| !scope.permits(*ip)) {
                         return Err(PRIVATE);
                     }

@@ -452,6 +452,26 @@ fn the_configured_origin_is_exactly_https_host_and_port() {
 }
 
 #[test]
+fn a_trailing_dot_after_the_host_is_not_the_canonical_origin() {
+    for bad in [
+        "https://api.tinycloud.xyz.",
+        "https://api.tinycloud.xyz.:8443",
+        "https://links.example.org.",
+        "https://api.tinycloud.xyz..",
+    ] {
+        assert!(LinksOrigin::parse(bad).is_err(), "{bad}");
+        assert!(LinksOrigin::validate(bad, false, None).is_err(), "{bad}");
+        assert!(LinksOrigin::validate(bad, true, None).is_err(), "{bad}");
+    }
+    assert_eq!(
+        LinksOrigin::parse("https://api.tinycloud.xyz")
+            .unwrap()
+            .audience(),
+        "https://api.tinycloud.xyz"
+    );
+}
+
+#[test]
 fn private_hosts_are_refused_unless_the_self_host_flag_is_set() {
     for host in [
         "https://127.0.0.1",
@@ -653,6 +673,10 @@ mod signed_reads {
 
     #[tokio::test]
     async fn a_redirect_is_not_followed_and_the_header_goes_to_no_other_host() {
+        // The fixed test clock is far from the server's `Date`: this test
+        // reaches the skew log line, so it captures like the tests that read it.
+        let captured = Captured::default();
+        let _log = captured.install();
         let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let location = format!("https://{}/v1/links/{ID}", target.local_addr().unwrap());
         let rig = signed(

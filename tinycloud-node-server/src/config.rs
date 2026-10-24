@@ -2884,6 +2884,23 @@ mod tests {
     }
 
     #[test]
+    fn links_origin_with_a_trailing_dot_is_refused_at_load() {
+        for origin in [
+            "https://api.tinycloud.xyz.",
+            "https://links.example.org.:8443",
+        ] {
+            for allow_private in [false, true] {
+                let config = ShareEmailConfig {
+                    links_origin: origin.into(),
+                    links_origin_allow_private: allow_private,
+                    ..ShareEmailConfig::default()
+                };
+                assert!(config.validate_links_origin().is_err(), "{origin}");
+            }
+        }
+    }
+
+    #[test]
     fn links_origin_host_that_resolves_to_a_private_address_is_refused() {
         let config = |allow_private| ShareEmailConfig {
             links_origin: "https://links.example.org".into(),
