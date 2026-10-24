@@ -406,6 +406,7 @@ impl DbSqlManifest {
             )
             .filter(object_pk(db, obj)?)
             .filter(object::Column::State.eq(ObjectState::Uploaded.as_str()))
+            .filter(object::Column::Format.eq(required_format(obj.kind())))
             .exec(txn)
             .await?
             .rows_affected;
@@ -771,6 +772,39 @@ mod tests {
         assert!(lost(publish_segment(&m, &f2, 6, 11, "back", CID).await).is_some());
         assert!(lost(publish_segment(&m, &f2, 6, 12, "same", CID).await).is_some());
         assert_eq!(m.current(&DB).await.unwrap().unwrap(), f2);
+    }
+
+    async fn segment_from_must_follow_base_seq(m: DbSqlManifest) {
+        let f = first(&m, &Lineage::random(), 5).await;
+        // from_seq = base_seq + 2 skips one sequence number: the CAS loses and the object stays uploaded.
+        let skipped = seg(&f.lineage, 5, 7, 9, "skip");
+        assert!(lost(publish_segment(&m, &f, 7, 9, "skip", CID).await).is_some());
+        assert_eq!(state_of(&m, &skipped).await, ObjectState::Uploaded);
+        assert_eq!(m.current(&DB).await.unwrap().unwrap(), f);
+        // from_seq = base_seq + 1 is the only accepted start.
+        let PublishOutcome::Published(next) = publish_segment(&m, &f, 6, 7, "next", CID).await
+        else {
+            panic!("base_seq + 1 segment lost");
+        };
+        assert_eq!((next.revision, next.last_seq, next.base_seq), (1, 7, 5));
+    }
+
+    async fn object_state_flip_checks_the_format(m: DbSqlManifest) {
+        let key = snap(&Lineage::random(), 5, "flip");
+        record(&m, &key).await;
+        // Corrupt the stored format behind the manifest's back.
+        object::Entity::update_many()
+            .col_expr(object::Column::Format, Expr::value("wal-cum-v1"))
+            .filter(object::Column::Key.eq(key.as_str()))
+            .exec(&m.db)
+            .await
+            .unwrap();
+        assert!(matches!(
+            m.publish_cas(&DB, None, publish(PublishKind::Snapshot, &key, CID))
+                .await,
+            Err(SqlStoreError::ObjectNotUploaded)
+        ));
+        assert!(m.current(&DB).await.unwrap().is_none());
     }
 
     async fn stale_epoch_lineage_and_revision_are_rejected(m: DbSqlManifest) {
@@ -1289,5 +1323,7 @@ CREATE TRIGGER tc1836_fail_manifest_readback BEFORE UPDATE ON sql_store_manifest
         object_format_must_match_its_kind,
         created_at_is_stored_canonically,
         revive_restarts_the_orphan_clock,
+        segment_from_must_follow_base_seq,
+        object_state_flip_checks_the_format,
     );
 }

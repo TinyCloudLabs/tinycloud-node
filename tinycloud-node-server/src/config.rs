@@ -1127,7 +1127,7 @@ pub struct SqlStoreConfig {
     /// Minimum time between snapshots of one database.
     #[serde(default = "default_sql_store_snapshot_min_interval_secs")]
     pub snapshot_min_interval_secs: u64,
-    /// Bytes the uploader may send per UTC day, across all databases.
+    /// Bytes the uploader may send for one database per UTC day. Captures over the budget are shed, not queued.
     #[serde(default = "default_sql_store_daily_upload_byte_budget")]
     pub daily_upload_byte_budget: ByteUnit,
     /// Disk bytes the local upload spool may hold. Writes are shed before the spool would exceed this.
@@ -1253,7 +1253,7 @@ impl SqlStoreConfig {
             return Ok(());
         }
         if is_mysql_database(database) {
-            return Err("sql_store does not support MySQL databases");
+            return Err("sql_store supports PostgreSQL and SQLite control databases");
         }
         if self
             .spaces
@@ -2140,7 +2140,7 @@ mod tests {
         );
         assert_eq!(
             enabled.validate_for_database("mysql://localhost/tinycloud"),
-            Err("sql_store does not support MySQL databases")
+            Err("sql_store supports PostgreSQL and SQLite control databases")
         );
         let bad_space = SqlStoreConfig {
             enabled: true,
