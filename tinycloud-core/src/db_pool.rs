@@ -276,46 +276,6 @@ impl RecoveringConnection {
         self.scope_local_timeout(transaction).await
     }
 
-    /// Whether PostgreSQL's autocommit preparatory path (TC-735) applies:
-    /// authorization is one read statement and registration one write
-    /// statement, each its own autocommit statement with no `BEGIN`/`COMMIT`.
-    ///
-    /// False where a transaction is required: other backends (SQLite reserves
-    /// its writer at `BEGIN`), and [`StatementTimeoutMode::Local`], which
-    /// scopes the timeout to a transaction with `SET LOCAL`.
-    pub(crate) fn uses_preparatory_autocommit(&self) -> bool {
-        self.conn.get_database_backend() == DatabaseBackend::Postgres
-            && !matches!(
-                self.statement_timeouts,
-                Some(timeouts)
-                    if timeouts.mode == StatementTimeoutMode::Local && timeouts.is_enabled()
-            )
-    }
-
-    /// Run the one registration statement of the autocommit preparatory path.
-    /// It is a write: it is never retried here, and a connection-class failure
-    /// is recorded and marks the request as having possibly written, so the
-    /// route reports it as an unknown outcome, as for any write statement.
-    /// A statement dropped before its result arrives is marked the same way.
-    /// A success is not marked: it only claimed candidate blobs, never a
-    /// user-visible KV write, and a later failure before the KV transaction
-    /// began stays retryable.
-    pub(crate) async fn preparatory_write(
-        &self,
-        stmt: Statement,
-    ) -> Result<Option<QueryResult>, DbErr> {
-        let in_flight = InFlightWrite::arm(true);
-        let result = self.conn.query_one(stmt).await;
-        in_flight.disarm();
-        if let Err(error) = &result {
-            if is_connection_error(error) {
-                self.lost("preparatory_register", error, false);
-                note_write_may_have_applied();
-            }
-        }
-        result
-    }
-
     /// The outcome of the one retry. It is never retried again, but a
     /// connection lost again is still recorded.
     fn retried<T>(&self, operation: &'static str, result: Result<T, DbErr>) -> Result<T, DbErr> {
@@ -325,84 +285,6 @@ impl RecoveringConnection {
             }
         }
         result
-    }
-}
-
-/// The pool as the autocommit preparatory path reads it (TC-735): the
-/// authorization reads. Each is retried once after a connection-class failure
-/// and recorded like [`RecoveringConnection::begin_preparatory`]'s `BEGIN`,
-/// and none counts as a write for [`track_writes`]. [`RecoveringConnection`]
-/// itself infers read-only from the statement text and treats the
-/// authorization snapshot's many CTEs as a possible write, so it is not used
-/// for these reads. Only pure reads are accepted: any statement with a write
-/// keyword, and every `execute`, is refused rather than run.
-pub(crate) struct PreparatoryReads<'a>(&'a RecoveringConnection);
-
-impl RecoveringConnection {
-    pub(crate) fn preparatory_reads(&self) -> PreparatoryReads<'_> {
-        PreparatoryReads(self)
-    }
-}
-
-/// A `SELECT` or `WITH` statement with no write keyword anywhere in it.
-pub(crate) fn is_pure_read(sql: &str) -> bool {
-    let Some(tokens) = tokens(sql) else {
-        return false;
-    };
-    let is_word = |token: Option<&Token<'_>>, keyword: &str| matches!(token, Some(Token::Word(word)) if word.eq_ignore_ascii_case(keyword));
-    (is_word(tokens.first(), "SELECT") || is_word(tokens.first(), "WITH"))
-        && !tokens.iter().any(|token| {
-            matches!(token, Token::Word(word)
-                if WRITE_KEYWORDS.iter().any(|keyword| word.eq_ignore_ascii_case(keyword)))
-        })
-}
-
-fn not_a_pure_read() -> DbErr {
-    DbErr::Custom("the preparatory read view only runs pure reads".to_owned())
-}
-
-#[async_trait::async_trait]
-impl ConnectionTrait for PreparatoryReads<'_> {
-    fn get_database_backend(&self) -> DatabaseBackend {
-        self.0.conn.get_database_backend()
-    }
-
-    async fn execute(&self, _stmt: Statement) -> Result<ExecResult, DbErr> {
-        Err(not_a_pure_read())
-    }
-
-    async fn execute_unprepared(&self, _sql: &str) -> Result<ExecResult, DbErr> {
-        Err(not_a_pure_read())
-    }
-
-    async fn query_one(&self, stmt: Statement) -> Result<Option<QueryResult>, DbErr> {
-        if !is_pure_read(&stmt.sql) {
-            return Err(not_a_pure_read());
-        }
-        self.0
-            .run("preparatory_read", true, || {
-                self.0.conn.query_one(stmt.clone())
-            })
-            .await
-    }
-
-    async fn query_all(&self, stmt: Statement) -> Result<Vec<QueryResult>, DbErr> {
-        if !is_pure_read(&stmt.sql) {
-            return Err(not_a_pure_read());
-        }
-        self.0
-            .run("preparatory_read", true, || {
-                self.0.conn.query_all(stmt.clone())
-            })
-            .await
-    }
-
-    fn support_returning(&self) -> bool {
-        self.0.conn.support_returning()
-    }
-
-    fn is_mock_connection(&self) -> bool {
-        self.0.conn.is_mock_connection()
     }
 }
 
@@ -1013,19 +895,6 @@ pub fn track_writes<F: Future>(operation: F) -> impl Future<Output = (F::Output,
 
 fn note_write_may_have_applied() {
     let _ = WRITE_MAY_HAVE_APPLIED.try_with(|flag| flag.set(true));
-}
-
-/// Run `operation` without its writes counting toward [`track_writes`]: after
-/// it, the flag is what it was before. For cleanup of candidate metadata, which
-/// is never a user-visible write, so a failure that came before any KV
-/// transaction began is still reported as safe to retry.
-pub(crate) async fn untracked_writes<F: Future>(operation: F) -> F::Output {
-    let before = WRITE_MAY_HAVE_APPLIED.try_with(std::cell::Cell::get);
-    let output = operation.await;
-    if let Ok(before) = before {
-        let _ = WRITE_MAY_HAVE_APPLIED.try_with(|flag| flag.set(before));
-    }
-    output
 }
 
 /// Record a write statement's result for [`track_writes`].

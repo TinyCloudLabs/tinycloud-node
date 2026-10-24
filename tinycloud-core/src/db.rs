@@ -2456,12 +2456,11 @@ where
         let mut attempt_bytes = [0u8; 16];
         OsRng.fill_bytes(&mut attempt_bytes);
         let attempt_id = hex::encode(attempt_bytes);
-        // Registration and authorization finish before any blob can be
-        // persisted. A transaction-path retry after a lost connection uses
-        // exactly the same attempt ID, so it cannot duplicate or steal another
-        // writer. SQLite's preparatory write follows sequence→writer→BEGIN and
+        // Registration and authorization commit before any blob can be
+        // persisted. Retrying an uncertain preparatory COMMIT uses exactly the
+        // same attempt ID, so it cannot duplicate or steal another writer.
+        // SQLite's preparatory write follows sequence→writer→BEGIN and
         // releases every guard before an ordinary upload.
-        let autocommit = blobs.len() <= 1 && self.candidate_conn.uses_preparatory_autocommit();
         let mut retried = false;
         let blobs = loop {
             let _sequence = if self.writer_lock.is_some() {
@@ -2487,15 +2486,12 @@ where
                 &sequence_spaces,
                 &blobs,
                 &attempt_id,
-                autocommit,
             ))
             .await;
             match prepared {
                 Ok(generations) => break generations,
-                // The transaction path retries its whole block once, with the
-                // same attempt ID. The autocommit path never retries its write.
                 Err(TxError::Db(error))
-                    if !autocommit && !retried && crate::db_pool::is_connection_error(&error) =>
+                    if !retried && crate::db_pool::is_connection_error(&error) =>
                 {
                     retried = true;
                 }
@@ -2756,16 +2752,10 @@ where
         if result.is_err() && !blobs.is_empty() {
             // The failed transaction (including any hash locks) has ended.
             // A commit error may be outcome-unknown: the candidate fence and
-            // committed-reference check distinguish that from an orphan. The
-            // cleanup only touches candidate metadata, so it does not turn a
-            // failure before any KV transaction began into an unknown outcome.
-            if let Err(error) = crate::db_pool::untracked_writes(crate::kv_orphans::refund_failed(
-                &self.conn,
-                &self.storage,
-                &blobs,
-                &attempt_id,
-            ))
-            .await
+            // committed-reference check distinguish that from an orphan.
+            if let Err(error) =
+                crate::kv_orphans::refund_failed(&self.conn, &self.storage, &blobs, &attempt_id)
+                    .await
             {
                 tracing::warn!(
                     ?error,
@@ -2780,23 +2770,16 @@ where
     /// any bytes reach the store. The commit transaction still repeats
     /// authorization under the sequence lock.
     ///
-    /// With `autocommit` (PostgreSQL, at most one distinct blob) there is no
-    /// `BEGIN`/`COMMIT`: authorization is one pure read, retried once after a
-    /// lost connection, and registration is one write statement that also
-    /// checks every invocation space exists, so an unhosted space is refused
-    /// with the same `SpaceNotFound`, after authorization and before any
-    /// upload, as the separate COUNT it replaces. The registration is a write:
-    /// it is not retried, and a lost connection around it is an unknown
-    /// outcome. A single statement claims the one blob or nothing.
-    ///
-    /// Otherwise (several distinct blobs, other backends) authorization and
-    /// every blob's claim share one transaction that commits all of them or
-    /// none, and a lost connection retries the whole block with the same
-    /// attempt ID.
+    /// One preparatory transaction authorizes the invocation and claims every
+    /// distinct blob, committing all claims or none; a lost connection retries
+    /// the whole block with the same attempt ID. On PostgreSQL each claim
+    /// statement also checks that every space the invocation names exists, so
+    /// an unhosted space is refused with the same `SpaceNotFound`, after
+    /// authorization and before any upload, as the separate COUNT it replaces.
+    /// Without a blob to claim, and on other backends, that COUNT still runs.
     ///
     /// A separate function, not inline in the caller: see
     /// [`Self::persist_registered_blobs`].
-    #[allow(clippy::too_many_arguments)]
     async fn register_preupload(
         &self,
         invocation: &Invocation,
@@ -2805,35 +2788,13 @@ where
         spaces: &[SpaceId],
         blobs: &[(SpaceId, Hash)],
         attempt_id: &str,
-        autocommit: bool,
     ) -> Result<Vec<(SpaceId, Hash, i64)>, TxError<B, K>>
     where
         B: StorageSetup,
     {
-        if autocommit {
-            debug_assert!(blobs.len() <= 1, "one statement claims at most one blob");
-            authorize_mutation_preupload::<_, B, K>(
-                &self.candidate_conn.preparatory_reads(),
-                invocation,
-                mode,
-                now,
-                spaces,
-                self.delegated_sql_caveats,
-                blobs.is_empty(),
-            )
-            .await?;
-            if blobs.is_empty() {
-                return Ok(Vec::new());
-            }
-            return Ok(crate::kv_orphans::register_candidates_postgres(
-                blobs,
-                attempt_id,
-                spaces,
-                |statement| self.candidate_conn.preparatory_write(statement),
-            )
-            .await?);
-        }
         let tx = self.candidate_conn.begin_preparatory().await?;
+        let claim_checks_hosting =
+            !blobs.is_empty() && tx.get_database_backend() == DbBackend::Postgres;
         authorize_mutation_preupload::<_, B, K>(
             &tx,
             invocation,
@@ -2841,13 +2802,13 @@ where
             now,
             spaces,
             self.delegated_sql_caveats,
-            true,
+            !claim_checks_hosting,
         )
         .await?;
         let generations = if blobs.is_empty() {
             Vec::new()
         } else {
-            crate::kv_orphans::register_candidates(&tx, blobs, attempt_id).await?
+            crate::kv_orphans::register_candidates_hosted(&tx, blobs, attempt_id, spaces).await?
         };
         tx.commit().await?;
         Ok(generations)

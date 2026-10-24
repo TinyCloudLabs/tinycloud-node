@@ -70,11 +70,10 @@ pub async fn register_candidates<C: ConnectionTrait>(
 /// PostgreSQL registration: one statement per distinct blob, each run by
 /// `query`. The ledger upsert serializes registration against deletion; a
 /// deleting fence returns no row, so no caller starts an upload. One
-/// statement claims its blob or nothing. Several blobs are all-or-nothing only
-/// if `query` runs inside one transaction; the autocommit caller passes a
-/// single blob. The runner decides whether a failed statement is retried:
-/// every row is keyed by the attempt ID, so a second run writes nothing new.
-pub(crate) async fn register_candidates_postgres<F, Fut>(
+/// statement claims its blob or nothing; several blobs commit together only
+/// if `query` runs them inside one transaction. Every row is keyed by the
+/// attempt ID, so a second run of a statement writes nothing new.
+async fn register_candidates_postgres<F, Fut>(
     blobs: &[(SpaceId, Hash)],
     attempt_id: &str,
     hosted_spaces: &[SpaceId],
@@ -143,12 +142,14 @@ where
     Ok(generations)
 }
 
-/// [`register_candidates`] for PostgreSQL's one-statement preparatory path
-/// (TC-735). With `hosted_spaces` non-empty, every registration statement
-/// writes nothing unless each listed space exists, and reports
-/// [`is_space_not_hosted`] otherwise, so an unhosted space is refused before
-/// any bytes reach the store without a separate COUNT round trip. Other
-/// backends ignore it: their callers check hosting in the same transaction.
+/// [`register_candidates`] that, on PostgreSQL, also checks hosting (TC-735).
+/// With `hosted_spaces` non-empty, every registration statement writes nothing
+/// unless each listed space exists, and reports [`is_space_not_hosted`]
+/// otherwise, so an unhosted space is refused before any bytes reach the store
+/// without a separate COUNT round trip. The caller runs the claims of one
+/// invocation in one transaction, so they commit together or not at all. Other
+/// backends ignore `hosted_spaces`: their callers count hosted spaces
+/// themselves.
 pub async fn register_candidates_hosted<C: ConnectionTrait>(
     conn: &C,
     blobs: &[(SpaceId, Hash)],

@@ -754,21 +754,6 @@ mod tests {
     use std::sync::Arc;
     use time::OffsetDateTime;
 
-    /// The pre-upload authorization read (TC-735) runs through a pool view that
-    /// accepts only pure reads; the snapshot must be one, and a statement that
-    /// writes must not be.
-    #[test]
-    fn snapshot_query_is_a_pure_read_for_the_preparatory_view() {
-        for roots in [vec![hash(b"a")], vec![hash(b"a"), hash(b"b")]] {
-            let sql = DbBackend::Postgres.build(&snapshot_query(&roots)).sql;
-            assert!(crate::db_pool::is_pure_read(&sql), "refused: {sql}");
-        }
-        assert!(!crate::db_pool::is_pure_read(
-            "WITH x AS (INSERT INTO t VALUES (1) RETURNING 1) SELECT * FROM x"
-        ));
-        assert!(!crate::db_pool::is_pure_read("UPDATE t SET a = 1"));
-    }
-
     async fn counted_database() -> (DatabaseConnection, Arc<AtomicUsize>) {
         let mut db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
             .await
