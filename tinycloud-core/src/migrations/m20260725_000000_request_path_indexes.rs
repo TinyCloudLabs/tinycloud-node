@@ -543,6 +543,8 @@ mod tests {
                 epoch: Set(epoch_id),
                 epoch_seq: Set(i),
                 value: Set(hash(format!("tc282-value-{i}").as_bytes())),
+                // The column is omitted; it defaults to zero.
+                generation: sea_orm::ActiveValue::NotSet,
                 metadata: Set(Metadata(BTreeMap::new())),
             }
             .insert(db)
