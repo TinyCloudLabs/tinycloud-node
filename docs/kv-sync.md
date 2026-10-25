@@ -129,3 +129,145 @@ cursor.
 
 Read audit records every poll. Poll on demand, or no more often than every
 60 seconds.
+
+## Write ordering and blob recovery
+
+KV puts stage and authorize content before upload. A short preparatory
+transaction checks authorization and hosting, then commits an active
+`(space, content hash, generation)` fence and a separate claim for each
+writer. The first generation is zero and keeps the bare-hash
+storage key; a generation above zero is allocated only after a prior
+generation's physical deletion is confirmed. Ordinary writes release every
+pooled connection and database lock before S3 or filesystem I/O. A
+four-minute upload deadline stays below the five-minute DB-clock GC grace.
+After upload, an ordinary writer takes the per-space sequence guard, starts
+a fresh commit transaction and takes
+the DB sequence lock; it verifies its own active claim, then rechecks
+authorization and conditional-write preconditions. The guards stay through
+commit, so `seq` and sync cursors remain commit-ordered even when same-space
+uploads finish out of order. An unauthorized write uploads nothing.
+
+For a single node process, each `(space, hash, generation)` serializes its
+physical existence check, upload or deletion, and quota settlement without
+holding a database connection. Filesystem memory staging writes into a
+same-directory temporary file and atomically renames only complete bytes to
+the hash key. A process crash can leave an incomplete stage; startup counts
+its physical bytes, and the hash candidate's GC pass removes and refunds it.
+SQLite preparatory writes reserve the database writer before authorization
+reads, so a separate collector connection cannot invalidate the read snapshot.
+
+Protected legacy meeting paths are the TC-1260 exception: the durable freeze
+row and its pooled transaction remain locked across upload until commit or
+abort. A freeze acknowledgement drains earlier uploads; a later protected
+write is refused before upload. A stalled writer causes the freeze attempt
+to fail after 30 seconds rather than acknowledge an incomplete drain.
+
+Before upload, a lost pooled connection retries the preparatory transaction
+with the same attempt ID. The registration is idempotent; neither an upload
+nor a committed write is replayed on an uncertain outcome. A missing claim
+or a fence already deleting returns a retryable error, never a reference to
+a potentially removed object.
+
+A lost connection during the preparatory transaction that survives its retry
+answers 503 `unavailable_retryable`. The claims are idempotent per attempt ID
+and hold only candidate metadata, so no committed KV write can be affected.
+
+On PostgreSQL each claim statement also checks that every space the invocation
+names is hosted, so an unhosted space is refused after authorization and
+before any upload without a separate query. The claims of all distinct blobs
+in one put share that one preparatory transaction, which commits every claim
+or none, so no partial claim is left for the collector.
+
+A failed upload, precondition or database write removes only its own claim.
+If another claim or a current or historical KV reference exists, it leaves
+the shared generation's blob alone. Otherwise it commits a `deleting` fence
+and byte entitlement, releases the DB connection, then deletes that
+generation's object. A writer seeing `deleting` cannot deduplicate or
+upload over it. Only confirmed physical absence refunds the per-process
+quota exactly once; only then is the fence retired and the next generation
+made available. Each delete targets the storage key of its own generation,
+so even a delayed second delete cannot remove a later committed generation.
+A lost DELETE response or a crash mid-delete leaves the fence for
+idempotent GC retry. Reads get the generation from their existing KV lookup,
+without another database query; generation zero reads the bare key. A
+rolled-back binary cannot read records with generation above zero, which
+can occur after a failed upload is collected and its content is saved again.
+
+The collector runs every 60 seconds, aging attempts after five minutes by
+DB time and draining eligible work in batches of 256. On S3 startup the
+same object-listing snapshot reconstructs both `SpaceSizes` and which
+`deleting` fences counted physical bytes; a deletion before the listing
+needs no refund, while a deletion afterward refunds once. Orphans present
+at restart count until GC. Quota is conservative physical accounting,
+**not commit-only accounting**: pending uploads and crash leftovers can
+temporarily over-count. `SpaceSizes` remains in-memory and per process; other
+nodes' writes and deletes do not synchronize it. Globally exact multi-node
+accounting requires a separate shared byte ledger (TC-1162).
+
+A put waits for the per-space sequence lock after its upload. The upload
+deadline (240 seconds) does not cover that wait. If the wait outlasts the
+five-minute grace, the collector can reclaim the claim and the commit answers
+503 `unavailable_retryable`; nothing is stored for that attempt, and a retry
+stores the content under the next generation.
+
+## Recovery after deploying generation-keyed blobs
+
+A forward fix is the default. An image rollback alone cannot boot: a binary
+without this change refuses to start while the migration row
+`m20261023_010000_kv_orphan_candidates` is recorded in `seaql_migrations`.
+Take a named full database backup (a PlanetScale backup or branch) before the
+deployment. Never run a binary without this change and one with it against the
+same database at the same time.
+
+What a binary without this change does with the data this change writes, once
+it is made to start:
+
+- It reads every record at the bare hash key. A record with `generation` above
+  zero is stored at `hash@N`, so it is reported as missing.
+- When it overwrites a key whose `current_kv.generation` is above zero, it
+  does not update that column. After the return to this change the key reads
+  as missing until the column is repaired.
+- It does not run the claim collector, so the claim tables stop being
+  maintained.
+
+Emergency path, available only while no record has `generation` above zero.
+Stop the node and run it as one `psql` script with `-v ON_ERROR_STOP=1`. The
+script raises, and changes nothing, when such a record exists:
+
+```sql
+BEGIN;
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM current_kv WHERE generation > 0)
+     OR EXISTS (SELECT 1 FROM kv_write WHERE generation > 0) THEN
+    RAISE EXCEPTION 'generation > 0 rows exist: forward fix only';
+  END IF;
+END $$;
+DELETE FROM seaql_migrations
+  WHERE version = 'm20261023_010000_kv_orphan_candidates';
+DROP TABLE kv_orphan_attempt, kv_orphan_candidate, kv_blob_generation;
+COMMIT;
+```
+
+The `generation` columns stay. Dropping the tables abandons pending deletions:
+the objects they named are not deleted, which leaks objects and loses no data.
+Deleting only the history row and keeping the tables is also supported: the
+binary without this change starts, and the return to this change applies the
+migration again over the retained tables. A deleting fence retained across such
+a window is closed by the collector without deleting a blob that a committed
+write references.
+
+On the return to this change the migration is applied again, then run the
+repair statement. It changes only rows whose generation differs from their
+write and is safe to run every time:
+
+```sql
+UPDATE current_kv c
+SET generation = w.generation
+FROM kv_write w
+WHERE w.space = c.space AND w.key = c.key AND w.invocation = c.invocation
+  AND c.generation <> w.generation AND NOT c.deleted;
+```
+
+The migration can be applied again over its own tables and rows on PostgreSQL
+and SQLite. On MySQL its indexes are created without a guard, so it cannot.
