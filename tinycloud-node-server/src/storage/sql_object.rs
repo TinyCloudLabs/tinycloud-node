@@ -1026,7 +1026,7 @@ mod tests {
         use tinycloud_auth::resource::{SpaceId, SPACE_ID_PREFIX};
         use tinycloud_core::hash::hash;
 
-        use super::super::s3::{kv_object_key, KV_SCAN_PREFIX};
+        use super::super::s3::{S3BlockStore, KV_SCAN_PREFIX};
 
         assert_eq!(KV_SCAN_PREFIX, SPACE_ID_PREFIX);
         let space: SpaceId =
@@ -1034,9 +1034,14 @@ mod tests {
                 .parse()
                 .unwrap();
         assert!(space.to_string().starts_with(SPACE_ID_PREFIX));
-        let key = kv_object_key(&space, &hash(b"block"));
+        let digest = hash(b"block");
+        let key = S3BlockStore::key_for(&space, &digest, 0);
         assert!(key.starts_with(KV_SCAN_PREFIX), "{key}");
         assert!(key.starts_with(&format!("{space}/")));
+        assert!(!key.contains('@'), "{key}");
+        let next_key = S3BlockStore::key_for(&space, &digest, 7);
+        assert!(next_key.starts_with(KV_SCAN_PREFIX), "{next_key}");
+        assert_eq!(next_key, format!("{key}@7"));
         // SQL objects live outside the scanned prefix.
         assert!(!KEY_ROOT.starts_with(KV_SCAN_PREFIX));
     }

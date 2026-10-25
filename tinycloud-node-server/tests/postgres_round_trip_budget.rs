@@ -129,36 +129,49 @@ use tokio::{
 };
 
 /// Round trips allowed per flow; see the module docs. Each invocation's
-/// transaction-scoped authorization snapshot now fetches edges, delegations,
-/// abilities and revocations in one tagged query (TC-735); capability checks
-/// and connection-release pings are unchanged. Measured on PostgreSQL:
+/// transaction-scoped authorization snapshot fetches edges, delegations,
+/// abilities and revocations in one tagged query (TC-735, #302); capability
+/// checks and connection-release pings are part of each flow's count. Measured
+/// on PostgreSQL before the pre-persist write path:
 ///
-/// - sign-in 71 = peer key 0 + host `/delegate` 18 + session `/delegate` 19
-///   + account-space SQL write 34;
-/// - kv put 35;
-/// - kv get 16, including the read-audit commit.
-///
-/// TC-1274: each epoch-writing commit (both `/delegate`s and the kv put)
-/// gained one round trip, the `epoch_head` cache write, which replaces the
-/// head anti-join over the space's whole history (measured on main: 75, 37,
-/// 22; with the cache: 77, 38, 22).
+/// - sign-in 71 = peer key 0 plus host `/delegate` 18 plus session
+///   `/delegate` 19 plus account-space SQL write 34, including TC-1274's
+///   `epoch_head` cache write on each epoch-writing commit;
+/// - kv get 16, including its durable read-audit commit.
 ///
 /// TC-1274: a batch of 100 `kv/get` or `kv/metadata` capabilities is one
-/// `current_kv` lookup per space, so it costs what a single kv get costs
-/// (measured before the batching: 216 round trips and 98 `current_kv`
-/// statements for the 98 distinct keys the fixture asks for). The flows also
-/// check the responses against the fixture, and the test fails if a batch
-/// reads `current_kv` in more than one statement.
+/// `current_kv` lookup per space, so it costs what a single kv get costs. The
+/// flows also check the responses against the fixture, and the test fails if a
+/// batch reads `current_kv` in more than one statement.
 ///
-/// TC-735: the one-statement authorization snapshot (#302) removes six trips
-/// from sign-in and from every read invocation (kv get and both batches:
-/// main alone is 77 and 22) and three from kv put (main alone: 38).
-const BUDGETS: [(&str, u64); 5] = [
+/// KV PUT is 42: 35 round trips for the put itself (31 statements and pings,
+/// with #302 and the `epoch_head` cache write) plus seven around the upload:
+/// the preparatory transaction's `BEGIN`, its authorization graph read, the
+/// candidate-and-attempt claim CTE (which also checks that every invocation
+/// space is hosted) and its `COMMIT`; the preparatory connection's release
+/// ping; the joined active-fence/own-attempt lock that excludes GC after
+/// upload; and the successful-commit CTE that retires the attempt and an
+/// already referenced last fence. A failed last attempt persists a deleting
+/// fence until physical absence is confirmed. SQLite and MySQL use the
+/// equivalent guarded multi-statement paths rather than the PostgreSQL-only
+/// CTEs.
+///
+/// Multi-write puts (a multipart `kv/put` of several keys, one invocation):
+/// the two-key rows use the same request shape, so they differ only in how
+/// many distinct blobs the keys hold. Each distinct blob adds its registration
+/// statement, its fence lock and its finish; every key adds its own
+/// precondition read and write rows. All claims of one put share one
+/// preparatory transaction.
+///
+/// Each value is the count measured on PostgreSQL in CI, used as a ceiling.
+const BUDGETS: [(&str, u64); 7] = [
     ("sign-in", 71),
-    ("kv put", 35),
+    ("kv put", 42),
     ("kv get", 16),
     ("kv batch get", 16),
     ("kv batch head", 16),
+    ("kv put 2 blobs", 48),
+    ("kv put 1 blob 2 keys", 45),
 ];
 
 /// Full sign-in plus put plus get rounds run before the measured one.
@@ -431,24 +444,28 @@ impl FrontendParser {
 /// route tests): the server receives the last one, the node never sees a
 /// reply to it, and the connection is reset. Armed for `times` connections.
 #[derive(Clone, Default)]
-struct Cut(Arc<Mutex<Armed>>);
+struct Cut(Arc<parking_lot::Mutex<Armed>>);
 
 /// The markers still to match, in order, and how many connections to cut.
 type Armed = Option<(Vec<Vec<u8>>, usize)>;
 
 impl Cut {
     fn arm(&self, markers: &[&[u8]], times: usize) {
-        *self.0.lock().unwrap() = Some((markers.iter().map(|m| m.to_vec()).collect(), times));
+        *self.0.lock() = Some((markers.iter().map(|m| m.to_vec()).collect(), times));
     }
 
     fn armed(&self) -> bool {
-        self.0.lock().unwrap().is_some()
+        self.0.lock().is_some()
+    }
+
+    fn disarm(&self) {
+        *self.0.lock() = None;
     }
 
     /// Advance a connection's `progress` through the armed markers over
     /// `bytes`; whether the connection must now be cut.
     fn observe(&self, progress: &mut usize, bytes: &[u8]) -> bool {
-        let mut armed = self.0.lock().unwrap();
+        let mut armed = self.0.lock();
         let Some((markers, times)) = armed.as_mut() else {
             *progress = 0;
             return false;
@@ -956,7 +973,85 @@ async fn round(node: &Node, account: &Account, out: &mut Vec<Measured>) -> Resul
         read.as_bytes() == KV_VALUE,
         "kv get returned {read:?}, not the value just put"
     );
+    multi_write_puts(node, &session, out).await?;
     batch_reads(node, &session, out).await?;
+    Ok(())
+}
+
+/// TC-735: one invocation writing two keys is a multipart `kv/put` batch. Its
+/// pre-upload registration, fence lock and finish run once per DISTINCT blob
+/// (three round trips each), whatever the number of keys. Two keys holding
+/// different bytes are two blobs; two keys holding the same bytes are one.
+fn multipart_put(keys: &[String], values: &[&[u8]]) -> (ContentType, Vec<u8>) {
+    let boundary = "tc735-multi-write-boundary";
+    let mut body = Vec::new();
+    for (key, value) in keys.iter().zip(values) {
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"{key}\"\r\n\
+                 Content-Type: application/octet-stream\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(value);
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    (
+        ContentType::new("multipart", "form-data").with_params(("boundary", boundary)),
+        body,
+    )
+}
+
+async fn multi_write_puts(node: &Node, session: &Session, out: &mut Vec<Measured>) -> Result<()> {
+    let distinct = vec!["multi/distinct-a".to_owned(), "multi/distinct-b".to_owned()];
+    let (content_type, body) = multipart_put(
+        &distinct,
+        &[b"tc735 multi-write blob a", b"tc735 multi-write blob b"],
+    );
+    expect_ok(
+        "kv put 2 blobs",
+        node.measure(
+            "kv put 2 blobs",
+            "POST /invoke kv/put x2 (two blobs)",
+            node.client
+                .post("/invoke")
+                .header(Header::new(
+                    "Authorization",
+                    batch_invocation(session, "tinycloud.kv/put", &distinct)?,
+                ))
+                .header(content_type)
+                .body(body),
+            out,
+        )
+        .await?,
+    )?;
+
+    let same = vec!["multi/same-a".to_owned(), "multi/same-b".to_owned()];
+    let (content_type, body) = multipart_put(
+        &same,
+        &[
+            b"tc735 multi-write shared blob",
+            b"tc735 multi-write shared blob",
+        ],
+    );
+    expect_ok(
+        "kv put 1 blob 2 keys",
+        node.measure(
+            "kv put 1 blob 2 keys",
+            "POST /invoke kv/put x2 (one blob)",
+            node.client
+                .post("/invoke")
+                .header(Header::new(
+                    "Authorization",
+                    batch_invocation(session, "tinycloud.kv/put", &same)?,
+                ))
+                .header(content_type)
+                .body(body),
+            out,
+        )
+        .await?,
+    )?;
     Ok(())
 }
 
@@ -1667,11 +1762,13 @@ async fn postgres_write_routes_tell_retryable_failures_from_unknown_outcomes() {
         let (status, body, _) = kv_put(&node, &session, "tc1054/warm").await?;
         ensure!(status == Status::Ok, "warm-up put: {status} {body}");
 
-        // KV put: no connection survives BEGIN, so nothing was written.
+        // KV put's preparatory BEGIN retries once in the recovering pool and
+        // once around the idempotent preparation (two attempts each). Exhaust
+        // both layers before asserting the public retryable response.
         node.settle().await?;
-        cut.arm(&[b"BEGIN"], 2);
+        cut.arm(&[b"BEGIN"], 4);
         let (status, body, retry_after) = kv_put(&node, &session, "tc1054/retryable").await?;
-        ensure!(!cut.armed(), "both BEGIN attempts were cut");
+        ensure!(!cut.armed(), "all preparatory BEGIN attempts were cut");
         ensure!(
             status == Status::ServiceUnavailable && body.starts_with("unavailable_retryable:"),
             "kv put before any write: {status} {body}"
@@ -1782,6 +1879,196 @@ async fn postgres_write_routes_tell_retryable_failures_from_unknown_outcomes() {
         .await
         .expect("drop the isolated schema");
     result.expect("route outcomes");
+}
+
+/// TC-735: a KV put's preparatory `BEGIN` is retried a bounded number of times
+/// (two in the recovering pool, around two passes of the preparatory block),
+/// and only while the `BEGIN` itself fails. Once a statement of the commit
+/// transaction has run, a lost connection is an unknown outcome and nothing is
+/// retried: a put that retried would answer 200.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_kv_put_begin_retry_is_bounded_and_never_follows_a_statement() {
+    let Some(url) =
+        postgres_test_url("postgres_kv_put_begin_retry_is_bounded_and_never_follows_a_statement")
+    else {
+        return;
+    };
+    let admin = Database::connect(url.as_str())
+        .await
+        .expect("connect to PostgreSQL");
+    let schema = format!(
+        "tc735_begin_{}_{}",
+        std::process::id(),
+        time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+    );
+    admin
+        .execute(Statement::from_string(
+            DbBackend::Postgres,
+            format!("CREATE SCHEMA {schema}"),
+        ))
+        .await
+        .expect("create the isolated schema");
+    let cut = Cut::default();
+    let (node, _datadir) = start_node(&url, &schema, cut.clone(), None)
+        .await
+        .expect("start the node");
+
+    let result = async {
+        let account = Account::new(43)?;
+        let session = sign_in(&node, &account).await?;
+        let (status, body, _) = kv_put(&node, &session, "tc735/warm").await?;
+        ensure!(status == Status::Ok, "warm-up put: {status} {body}");
+
+        // Five BEGIN cuts are armed, but a put makes four attempts at most, so
+        // one cut is still armed after it answers.
+        node.settle().await?;
+        cut.arm(&[b"BEGIN"], 5);
+        let (status, body, _) = kv_put(&node, &session, "tc735/bounded").await?;
+        ensure!(
+            cut.armed(),
+            "a fifth BEGIN was attempted: the retry is not bounded"
+        );
+        ensure!(
+            status == Status::ServiceUnavailable && body.starts_with("unavailable_retryable:"),
+            "kv put whose BEGIN never succeeded: {status} {body}"
+        );
+        cut.disarm();
+
+        // Cut a statement inside the commit transaction (the fence lock that
+        // follows the upload): the put is not retried.
+        node.settle().await?;
+        cut.arm(&[b"FOR UPDATE OF fence"], 1);
+        let (status, body, retry_after) = kv_put(&node, &session, "tc735/after-statement").await?;
+        ensure!(!cut.armed(), "the fence lock statement was cut");
+        ensure!(
+            status == Status::InternalServerError && body.starts_with("outcome_unknown:"),
+            "kv put after a statement of its transaction ran: {status} {body}"
+        );
+        ensure!(
+            retry_after.is_none(),
+            "no Retry-After on outcome_unknown: {retry_after:?}"
+        );
+        Ok(())
+    }
+    .await;
+    node.pool().close().await;
+    admin
+        .execute(Statement::from_string(
+            DbBackend::Postgres,
+            format!("DROP SCHEMA {schema} CASCADE"),
+        ))
+        .await
+        .expect("drop the isolated schema");
+    result.expect("begin retry bounds");
+}
+
+/// TC-735: a two-blob put whose later-registered blob has a pending deletion is
+/// refused with 503 and claims nothing. The earlier blob keeps no claim, fence
+/// or ledger row, so the claims share the preparatory transaction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_two_blob_put_with_a_pending_deletion_claims_nothing() {
+    let Some(url) =
+        postgres_test_url("postgres_two_blob_put_with_a_pending_deletion_claims_nothing")
+    else {
+        return;
+    };
+    let admin = Database::connect(url.as_str())
+        .await
+        .expect("connect to PostgreSQL");
+    let schema = format!(
+        "tc735_claims_{}_{}",
+        std::process::id(),
+        time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+    );
+    admin
+        .execute(Statement::from_string(
+            DbBackend::Postgres,
+            format!("CREATE SCHEMA {schema}"),
+        ))
+        .await
+        .expect("create the isolated schema");
+    let (node, _datadir) = start_node(&url, &schema, Cut::default(), None)
+        .await
+        .expect("start the node");
+
+    let result = async {
+        let account = Account::new(44)?;
+        let session = sign_in(&node, &account).await?;
+        let (status, body, _) = kv_put(&node, &session, "tc735/warm").await?;
+        ensure!(status == Status::Ok, "warm-up put: {status} {body}");
+
+        let (one, two): (&[u8], &[u8]) = (b"route two-blob first", b"route two-blob second");
+        let (early, late) = if tinycloud_core::hash::hash(one) < tinycloud_core::hash::hash(two) {
+            (one, two)
+        } else {
+            (two, one)
+        };
+        let space = account.space.to_string();
+        let early_hash = Vec::<u8>::from(tinycloud_core::hash::hash(early));
+        let late_hash = Vec::<u8>::from(tinycloud_core::hash::hash(late));
+        let pool = node.pool();
+        tinycloud_core::sea_orm::sqlx::query(
+            "INSERT INTO kv_blob_generation (space, value, generation) VALUES ($1, $2, 0)",
+        )
+        .bind(&space)
+        .bind(&late_hash)
+        .execute(pool)
+        .await?;
+        tinycloud_core::sea_orm::sqlx::query(
+            "INSERT INTO kv_orphan_candidate
+                (space, value, generation, created_at, deleting_at, deletion_bytes)
+             VALUES ($1, $2, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 1)",
+        )
+        .bind(&space)
+        .bind(&late_hash)
+        .execute(pool)
+        .await?;
+
+        let keys = vec![
+            "tc735/pending-early".to_owned(),
+            "tc735/pending-late".to_owned(),
+        ];
+        let (content_type, multipart) = multipart_put(&keys, &[early, late]);
+        let (status, body, _) = dispatch(
+            node.client
+                .post("/invoke")
+                .header(Header::new(
+                    "Authorization",
+                    batch_invocation(&session, "tinycloud.kv/put", &keys)?,
+                ))
+                .header(content_type)
+                .body(multipart),
+        )
+        .await;
+        ensure!(
+            status == Status::ServiceUnavailable && body.starts_with("unavailable_retryable:"),
+            "two-blob put with a pending deletion: {status} {body}"
+        );
+        for table in [
+            "kv_orphan_attempt",
+            "kv_orphan_candidate",
+            "kv_blob_generation",
+        ] {
+            let rows: i64 = tinycloud_core::sea_orm::sqlx::query_scalar(&format!(
+                "SELECT count(*) FROM {table} WHERE value = $1"
+            ))
+            .bind(&early_hash)
+            .fetch_one(pool)
+            .await?;
+            ensure!(rows == 0, "{table} kept {rows} row(s) for the earlier blob");
+        }
+        Ok(())
+    }
+    .await;
+    node.pool().close().await;
+    admin
+        .execute(Statement::from_string(
+            DbBackend::Postgres,
+            format!("DROP SCHEMA {schema} CASCADE"),
+        ))
+        .await
+        .expect("drop the isolated schema");
+    result.expect("two-blob put with a pending deletion");
 }
 
 /// The `postgres` object of `/info`: exactly the two counters.

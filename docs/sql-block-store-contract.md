@@ -503,7 +503,7 @@ traits plus an in-memory implementation for tests):
 
 Migration `m20261021_000000_sql_store_manifest`. Other pending migrations:
 #374 adds `m20261020_000000_current_kv_key_c_index`; #301 (TC-735) carries
-`m20261017_020000_kv_orphan_candidates`. SeaORM applies out-of-order
+`m20261023_010000_kv_orphan_candidates`. SeaORM applies out-of-order
 versions; none touches these tables. Rules from #341 / #343 / #374:
 
 - `CREATE TABLE IF NOT EXISTS` for both tables; **no foreign keys** (an FK to

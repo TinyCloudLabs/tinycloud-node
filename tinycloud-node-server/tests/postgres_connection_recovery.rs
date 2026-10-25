@@ -800,6 +800,118 @@ async fn postgres_requests_survive_one_stale_pooled_connection() {
     fixture.drop_schema().await;
 }
 
+/// Ordinary KV writes begin with an idempotent preparatory transaction.
+/// A stale idle connection must not produce an orphan or prevent the write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_ordinary_put_recovers_stale_connection_without_orphan() {
+    let Some(url) = postgres_url("postgres_ordinary_put_recovers_stale_connection_without_orphan")
+    else {
+        return;
+    };
+    let mut fixture = Fixture::new("candidate", &url, None).await;
+    fixture.fill_pool().await;
+    let victim = fixture.order_idle_queue(0).await;
+    fixture.terminate(&BTreeSet::from([victim])).await;
+    let before = fixture.stats();
+    fixture
+        .put("after/preflight/stale")
+        .await
+        .expect("ordinary write survives stale pooled connection");
+    let recovered = delta(before, fixture.stats());
+    assert_eq!(
+        (recovered.losses, recovered.retries),
+        (1, 1),
+        "{recovered:?}"
+    );
+    assert_eq!(fixture.row_count("kv_orphan_candidate").await, 0);
+    assert_eq!(fixture.row_count("kv_orphan_attempt").await, 0);
+    fixture.get("after/preflight/stale").await.unwrap();
+    fixture.drop_schema().await;
+}
+
+/// A protected write crosses the durable freeze row before storage.persist.
+/// Losing an idle pooled connection must not bypass that fence or strand its
+/// candidate; the resulting KV remains readable after the recovered commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_protected_preupload_fence_survives_stale_connection() {
+    let Some(url) = postgres_url("postgres_protected_preupload_fence_survives_stale_connection")
+    else {
+        return;
+    };
+    let mut fixture = Fixture::new("protected", &url, None).await;
+    fixture.fill_pool().await;
+    let victim = fixture.order_idle_queue(0).await;
+    fixture.terminate(&BTreeSet::from([victim])).await;
+    let before = fixture.stats();
+    let key = "xyz.tinycloud.tinychat/connectors/fireflies/transcript/stale-pool";
+    fixture
+        .put(key)
+        .await
+        .expect("protected put survives reconnect");
+    fixture.get(key).await.expect("committed blob is readable");
+    let recovered = delta(before, fixture.stats());
+    assert_eq!(
+        (recovered.losses, recovered.retries),
+        (1, 1),
+        "{recovered:?}"
+    );
+    assert_eq!(fixture.row_count("kv_orphan_candidate").await, 0);
+    fixture.drop_schema().await;
+}
+
+/// A dead backend during the protected row lock rolls back that transaction.
+/// Because storage has not run yet, the invocation can acquire a fresh
+/// transaction, retake the fence, then upload and commit exactly once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_preupload_freeze_lock_recovers_a_lost_transaction() {
+    let Some(url) = postgres_url("postgres_preupload_freeze_lock_recovers_a_lost_transaction")
+    else {
+        return;
+    };
+    let mut fixture = Fixture::new("guardloss", &url, None).await;
+    fixture
+        .admin
+        .execute_unprepared(&format!(
+            "CREATE SEQUENCE {schema}.kill_once; \
+             CREATE FUNCTION {schema}.kill_guard_once() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN \
+               IF nextval('{schema}.kill_once') = 1 THEN \
+                 PERFORM pg_terminate_backend(pg_backend_pid()); \
+               END IF; \
+               RETURN NEW; \
+             END $$; \
+             CREATE TRIGGER kill_guard_once BEFORE INSERT ON {schema}.meeting_legacy_write_guard \
+             FOR EACH ROW EXECUTE FUNCTION {schema}.kill_guard_once()",
+            schema = fixture.schema
+        ))
+        .await
+        .unwrap();
+    let key = "xyz.tinycloud.tinychat/connectors/fireflies/transcript/guard-loss";
+    fixture
+        .put(key)
+        .await
+        .expect("retry preupload transaction after dead guard connection");
+    fixture
+        .get(key)
+        .await
+        .expect("only committed value survives");
+    let killed = fixture
+        .admin
+        .query_one(Statement::from_string(
+            DbBackend::Postgres,
+            format!("SELECT last_value AS n FROM {}.kill_once", fixture.schema),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<i64>("", "n")
+        .unwrap();
+    assert_eq!(killed, 2, "row lock was retried exactly once");
+    assert_eq!(fixture.row_count("kv_write").await, 2); // seed plus this put
+    assert_eq!(fixture.row_count("kv_orphan_candidate").await, 0);
+    fixture.drop_schema().await;
+}
+
 /// A network cut: a proxy resets every client connection while idle (EOF/RST,
 /// no FATAL message). Requests still succeed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
