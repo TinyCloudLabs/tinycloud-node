@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Changes
+- Read audit: a batch commit that does not complete within 10 seconds is failed as a retryable 503 (`unavailable_retryable`) and its database connection is closed and its pool slot freed, instead of being returned to the pool, so the audit queue keeps draining; records whose readers have gone are skipped on the next batch as before. No read's data is returned without a committed record. The timeout is logged as `Read audit batch timed out` (`error_class = "read_audit_batch_timeout"`: batch size, elapsed and timeout in ms) and counted in `tinycloud_read_audit_batch_timeout_total`; log-shipper classification of the new warning follows. Details: TC-2035.
+
 ## [1.23.0] - 2026-10-25
 
 ### Release notes

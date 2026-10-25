@@ -9909,6 +9909,7 @@ dependencies = [
  "ryu-js",
  "sea-orm",
  "sea-orm-migration",
+ "sea-query-binder",
  "serde",
  "serde_ipld_dagcbor 0.3.0",
  "serde_json",

@@ -116,10 +116,22 @@ struct PipelineStats {
     last_failure_class: std::sync::Mutex<&'static str>,
     /// Reads whose pipeline was gone when they queued or waited.
     stopped: AtomicU64,
+    /// Batches whose commit did not finish within `batch_timeout_ms`
+    /// (TC-2035); also counted in `failed_batches`.
+    timed_out_batches: AtomicU64,
+    /// The bound on one batch's commit, in ms.
+    batch_timeout_ms: AtomicU64,
     epoch: Instant,
     /// Test-only fault: this pipeline's next batch commit panics.
     #[cfg(test)]
     panic_next_batch: std::sync::atomic::AtomicBool,
+    /// Test-only fault: this pipeline's next batch commit never starts.
+    #[cfg(test)]
+    hang_next_batch: std::sync::atomic::AtomicBool,
+    /// Test-only fault: this pipeline's next batch commits, then its result
+    /// is never delivered (a lost response).
+    #[cfg(test)]
+    hang_after_persist: std::sync::atomic::AtomicBool,
 }
 
 impl Default for PipelineStats {
@@ -136,9 +148,15 @@ impl Default for PipelineStats {
             last_queue_wait_ms: AtomicU64::new(0),
             last_failure_class: std::sync::Mutex::new("other"),
             stopped: AtomicU64::new(0),
+            timed_out_batches: AtomicU64::new(0),
+            batch_timeout_ms: AtomicU64::new(BATCH_COMMIT_TIMEOUT.as_millis() as u64),
             epoch: Instant::now(),
             #[cfg(test)]
             panic_next_batch: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            hang_next_batch: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            hang_after_persist: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -183,6 +201,9 @@ pub struct ReadAuditHealth {
     pub last_queue_wait_ms: u64,
     /// Reads answered `Stopped` because the pipeline was gone.
     pub stopped: u64,
+    /// Batches abandoned because their commit did not finish in time; each is
+    /// also in `failed_batches`.
+    pub timed_out_batches: u64,
     /// The drain is gone: nothing will ever commit a record again.
     pub drain_stopped: bool,
 }
@@ -190,6 +211,17 @@ pub struct ReadAuditHealth {
 /// A batch in flight longer than this (the commit, plus the SQLite writer-lock
 /// wait) is reported (TC-1317).
 const SLOW_BATCH: Duration = Duration::from_secs(5);
+/// The bound on one batch's commit, from its connection acquire to its result
+/// (TC-2035). A commit that does not finish is failed as a retryable error and
+/// its connection is closed, so the drain moves on to the next batch.
+///
+/// It is below [`DEFAULT_READ_AUDIT_WAIT`], so a read that queued behind the
+/// stuck batch is still waiting when the next batch forms, and below
+/// [`STALLED_BATCH`], so the stalled-drain warning fires only if this bound
+/// itself fails to end a batch (for example a SQLite writer-lock wait, which
+/// it does not cover). It is above [`SLOW_BATCH`] and well above a healthy
+/// commit, which is one statement.
+const BATCH_COMMIT_TIMEOUT: Duration = Duration::from_secs(10);
 /// A batch in flight longer than this, or a queue that waited longer than
 /// [`STALLED_QUEUE_WAIT`] with no batch completing, is a stalled drain.
 const STALLED_BATCH: Duration = Duration::from_secs(30);
@@ -242,6 +274,14 @@ impl ReadAuditPipeline {
     pub(crate) fn set_wait(&self, wait: Duration) {
         self.wait_ms
             .store(wait.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// Bound one batch's commit. Tests only: they cannot wait ten seconds.
+    #[cfg(test)]
+    pub(crate) fn set_batch_timeout(&self, timeout: Duration) {
+        self.stats
+            .batch_timeout_ms
+            .store(timeout.as_millis() as u64, Ordering::Relaxed);
     }
 
     /// Hold every batch before it is committed until the guard drops.
@@ -319,6 +359,7 @@ fn health(stats: &PipelineStats, sender: &mpsc::Sender<Command>) -> ReadAuditHea
         in_flight_batch_age_ms: stats.in_flight_age().as_millis() as u64,
         last_queue_wait_ms: stats.last_queue_wait_ms.load(Ordering::Relaxed),
         stopped: stats.stopped.load(Ordering::Relaxed),
+        timed_out_batches: stats.timed_out_batches.load(Ordering::Relaxed),
         drain_stopped: sender.is_closed(),
     }
 }
@@ -508,13 +549,29 @@ async fn commit_batch(
             if stats.panic_next_batch.swap(false, Ordering::SeqCst) {
                 panic!("injected read-audit batch panic");
             }
-            persist_batch(conn, &batch).await
+            #[cfg(test)]
+            if stats.hang_next_batch.swap(false, Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
+            let persisted = persist_batch(conn, &batch).await;
+            #[cfg(test)]
+            if stats.hang_after_persist.swap(false, Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
+            persisted
         },
     ));
+    // A commit that does not finish in time fails this batch's waiters as
+    // retryable, like a transient database error, and drops the commit
+    // future; dropping it closes the connection it holds (TC-2035).
+    let limit = Duration::from_millis(stats.batch_timeout_ms.load(Ordering::Relaxed));
+    let began = Instant::now();
     // A panic fails this batch's waiters; the drain goes on (TC-1317).
-    let result = match futures::FutureExt::catch_unwind(persisted).await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => {
+    let result = match tokio::time::timeout(limit, futures::FutureExt::catch_unwind(persisted))
+        .await
+    {
+        Ok(Ok(Ok(()))) => Ok(()),
+        Ok(Ok(Err(error))) => {
             let class = transient_error_class(&error).unwrap_or("other");
             *stats
                 .last_failure_class
@@ -522,12 +579,28 @@ async fn commit_batch(
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = class;
             Err(batch_error(error))
         }
-        Err(_) => {
+        Ok(Err(_)) => {
             *stats
                 .last_failure_class
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = "panic";
             Err(ReadAuditError::Failed("read audit batch panicked".into()))
+        }
+        Err(_) => {
+            *stats
+                .last_failure_class
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = "read_audit_batch_timeout";
+            stats.timed_out_batches.fetch_add(1, Ordering::Relaxed);
+            // Counts and durations only: never a key or an identifier.
+            tracing::warn!(
+                error_class = "read_audit_batch_timeout",
+                batch_size = batch.len(),
+                elapsed_ms = began.elapsed().as_millis() as u64,
+                timeout_ms = limit.as_millis() as u64,
+                "Read audit batch timed out"
+            );
+            Err(ReadAuditError::Unavailable)
         }
     };
     let snapshot = metrics.snapshot();
@@ -2422,5 +2495,286 @@ mod tests {
             .expect("the drain survives")
             .unwrap();
         assert!(committed(&conn, 1).await);
+    }
+
+    // TC-2035: a commit that never returns must not stop the drain.
+
+    /// A batch whose commit never returns is failed as retryable once the
+    /// bound passes, never confirmed, and the next read commits.
+    #[tokio::test]
+    async fn tc2035_a_commit_that_never_returns_fails_retryably_and_the_drain_moves_on() {
+        let (_directory, conn, pipeline) = file_pipeline().await;
+        pipeline.set_batch_timeout(Duration::from_millis(200));
+        pipeline.stats.hang_next_batch.store(true, Ordering::SeqCst);
+
+        let started = Instant::now();
+        let outcome = bounded(&pipeline, 0).await;
+        assert_eq!(outcome, Err(ReadAuditError::Unavailable));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "answered at the commit bound, not the read wait"
+        );
+        assert!(!committed(&conn, 0).await);
+        let health = pipeline.health();
+        assert_eq!((health.timed_out_batches, health.failed_batches), (1, 1));
+        assert_eq!(health.in_flight_batch_age_ms, 0);
+
+        bounded(&pipeline, 1)
+            .await
+            .expect("a later read in the same pipeline commits");
+        assert!(committed(&conn, 1).await);
+        assert_eq!(pipeline.health().timed_out_batches, 1);
+    }
+
+    /// Records queued behind a batch that hangs are skipped once their
+    /// waiters are gone, when the next batch forms after the timeout.
+    #[tokio::test]
+    async fn tc2035_abandoned_records_behind_a_hung_batch_are_skipped_after_the_timeout() {
+        let (_directory, conn, pipeline) = file_pipeline().await;
+        pipeline.set_wait(Duration::from_millis(100));
+        pipeline.set_batch_timeout(Duration::from_secs(2));
+        pipeline.stats.hang_next_batch.store(true, Ordering::SeqCst);
+
+        // Record 0 forms the batch that hangs; its waiter gives up.
+        assert_eq!(bounded(&pipeline, 0).await, Err(ReadAuditError::Busy));
+        until(|| pipeline.health().queue_depth == 0).await;
+        // Records 1-5 queue behind it and their waiters give up too.
+        for index in 1..=5 {
+            assert_eq!(bounded(&pipeline, index).await, Err(ReadAuditError::Busy));
+        }
+        assert_eq!(pipeline.health().queue_depth, 5);
+        assert_eq!(pipeline.health().abandoned, 0, "the drain is stuck");
+
+        until(|| pipeline.health().abandoned == 5).await;
+        assert_eq!(pipeline.health().timed_out_batches, 1);
+        for index in 0..=5 {
+            assert!(!committed(&conn, index).await, "record {index}");
+        }
+
+        pipeline.set_wait(DEFAULT_READ_AUDIT_WAIT);
+        bounded(&pipeline, 6).await.expect("the drain recovered");
+        assert!(committed(&conn, 6).await);
+    }
+
+    /// A PostgreSQL server that completes every connection's startup and then
+    /// never answers, and what it saw of its sockets.
+    struct BlackHole {
+        port: u16,
+        accepted: Arc<AtomicU64>,
+        closed: Arc<AtomicU64>,
+    }
+
+    async fn black_hole() -> BlackHole {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicU64::new(0));
+        let closed = Arc::new(AtomicU64::new(0));
+        let (seen_accepted, seen_closed) = (accepted.clone(), closed.clone());
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                seen_accepted.fetch_add(1, Ordering::SeqCst);
+                let closed = seen_closed.clone();
+                tokio::spawn(async move {
+                    let mut length = [0u8; 4];
+                    if stream.read_exact(&mut length).await.is_ok() {
+                        // The startup message, then AuthenticationOk and
+                        // ReadyForQuery. Nothing after that is ever answered.
+                        let mut startup = vec![0u8; (u32::from_be_bytes(length) as usize) - 4];
+                        let _ = stream.read_exact(&mut startup).await;
+                        let _ = stream
+                            .write_all(&[b'R', 0, 0, 0, 8, 0, 0, 0, 0, b'Z', 0, 0, 0, 5, b'I'])
+                            .await;
+                        let mut sink = [0u8; 4096];
+                        while matches!(stream.read(&mut sink).await, Ok(read) if read > 0) {}
+                    }
+                    closed.fetch_add(1, Ordering::SeqCst);
+                });
+            }
+        });
+        BlackHole {
+            port,
+            accepted,
+            closed,
+        }
+    }
+
+    /// A one-connection pool (so a leaked slot is visible) to `server`, with
+    /// that connection already open.
+    async fn black_hole_pool(server: &BlackHole) -> sea_orm::sqlx::PgPool {
+        use sea_orm::sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
+
+        PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(2))
+            .test_before_acquire(false)
+            .connect_with(
+                PgConnectOptions::new()
+                    .host("127.0.0.1")
+                    .port(server.port)
+                    .username("audit")
+                    .database("audit")
+                    .ssl_mode(PgSslMode::Disable),
+            )
+            .await
+            .expect("the black hole completes the startup")
+    }
+
+    /// A batch whose connection stalls (the server never answers) times out,
+    /// and the stalled connection is closed and its pool slot freed rather
+    /// than returned: the pool, limited to one connection, serves the next
+    /// acquire on a new socket, and the drain keeps going.
+    #[tokio::test]
+    async fn tc2035_a_stalled_connection_is_closed_and_its_pool_slot_freed() {
+        let server = black_hole().await;
+        let pool = black_hole_pool(&server).await;
+        let conn = sea_orm::SqlxPostgresConnector::from_sqlx_postgres_pool(pool.clone());
+        let pipeline = ReadAuditPipeline::start(RecoveringConnection::new(conn), None);
+        pipeline.set_batch_timeout(Duration::from_millis(300));
+        assert_eq!((pool.size(), pool.num_idle()), (1, 1));
+        assert_eq!(server.accepted.load(Ordering::SeqCst), 1);
+
+        assert_eq!(
+            bounded(&pipeline, 0).await,
+            Err(ReadAuditError::Unavailable)
+        );
+        let health = pipeline.health();
+        assert_eq!((health.timed_out_batches, health.failed_batches), (1, 1));
+        // The slot is free again, not held by a connection waiting for a
+        // reply that never comes.
+        assert_eq!((pool.size(), pool.num_idle()), (0, 0));
+        until(|| server.closed.load(Ordering::SeqCst) == 1).await;
+
+        // A following acquire against the (otherwise healthy) server opens a
+        // new connection within the one-connection limit.
+        let fresh = tokio::time::timeout(PATIENCE, pool.acquire())
+            .await
+            .expect("acquire must not hang")
+            .expect("the freed slot serves a new connection");
+        assert_eq!(pool.size(), 1);
+        assert_eq!(server.accepted.load(Ordering::SeqCst), 2);
+        // Not released: the pool's release ping would wait on this server
+        // for ever, which is why the batch's connection is discarded.
+        drop(fresh.detach());
+        assert_eq!(pool.size(), 0);
+        until(|| server.closed.load(Ordering::SeqCst) == 2).await;
+
+        // The drain went on: the next batch opens a connection, stalls,
+        // times out, and closes it as well.
+        assert_eq!(
+            bounded(&pipeline, 1).await,
+            Err(ReadAuditError::Unavailable)
+        );
+        assert_eq!(pipeline.health().timed_out_batches, 2);
+        assert_eq!(pool.size(), 0);
+        until(|| server.closed.load(Ordering::SeqCst) == 3).await;
+        assert_eq!(server.accepted.load(Ordering::SeqCst), 3);
+    }
+
+    /// A batch that did commit but whose result never arrived is failed like
+    /// any timed-out batch (its read got no data), and the client's retry of
+    /// the same record leaves exactly the rows a single commit would: no
+    /// duplicates, no gaps. The same batch persisted twice is also a no-op.
+    async fn assert_timed_out_commit_is_idempotent(conn: DatabaseConnection) {
+        let parent = crate::hash::hash(b"timeout-parent");
+        insert_parent_delegation(&conn, parent).await;
+        let get = ability("tinycloud.kv/get");
+        let first = rich_record(
+            "timeout-1",
+            "did:key:timeout",
+            vec![(
+                resource("tinycloud:did:key:ne-delegator:files/kv/a"),
+                get.clone(),
+            )],
+            vec![parent],
+        );
+        let second = rich_record(
+            "timeout-2",
+            "did:key:timeout-other",
+            vec![(resource("tinycloud:did:key:ne-delegator:files/kv/b"), get)],
+            vec![parent],
+        );
+        // `enqueue` consumes a record; rebuild the same one by content.
+        let again = |record: &ReadAuditRecord| ReadAuditRecord {
+            id: record.id,
+            invoker: record.invoker.clone(),
+            issued_at: OffsetDateTime::now_utc(),
+            serialization: record.serialization.clone(),
+            abilities: record.abilities.clone(),
+            parents: record.parents.clone(),
+        };
+
+        let pipeline = ReadAuditPipeline::start(conn.clone(), None);
+        pipeline.set_batch_timeout(Duration::from_secs(3));
+        pipeline
+            .stats
+            .hang_after_persist
+            .store(true, Ordering::SeqCst);
+        let outcome = tokio::time::timeout(PATIENCE, pipeline.enqueue(again(&first)))
+            .await
+            .expect("the timed-out batch's waiter must be answered");
+        assert_eq!(outcome, Err(ReadAuditError::Unavailable));
+        // The statement had committed: over-audit, never a lost record.
+        assert_eq!(
+            audit_row_sets(&conn).await,
+            expected_rows(std::slice::from_ref(&first))
+        );
+
+        tokio::time::timeout(PATIENCE, pipeline.enqueue(again(&second)))
+            .await
+            .expect("the drain moved on")
+            .unwrap();
+        // The client's retry of the timed-out read, and a repeat of the
+        // other one.
+        for record in [&first, &second] {
+            tokio::time::timeout(PATIENCE, pipeline.enqueue(again(record)))
+                .await
+                .expect("the drain answers")
+                .unwrap();
+        }
+        let expected = expected_rows(&[again(&first), again(&second)]);
+        assert_eq!(audit_row_sets(&conn).await, expected);
+        // Raw counts, in case the sets hide duplicates the schema allowed.
+        assert_eq!(invocation::Entity::find().count(&conn).await.unwrap(), 2);
+        assert_eq!(
+            invoked_abilities::Entity::find()
+                .count(&conn)
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            parent_delegations::Entity::find()
+                .count(&conn)
+                .await
+                .unwrap(),
+            2
+        );
+
+        // The same batch persisted twice directly: still a no-op.
+        let batch = vec![command(again(&first)), command(again(&second))];
+        let recovering = RecoveringConnection::new(conn.clone());
+        persist_batch(&recovering, &batch).await.unwrap();
+        persist_batch(&recovering, &batch).await.unwrap();
+        assert_eq!(audit_row_sets(&conn).await, expected);
+        assert_eq!(invocation::Entity::find().count(&conn).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn tc2035_a_timed_out_commit_is_idempotent_on_retry() {
+        let (_directory, conn, _pipeline) = file_pipeline().await;
+        assert_timed_out_commit_is_idempotent(conn).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn postgres_read_audit_timed_out_commit_is_idempotent_on_retry() {
+        use crate::test_support::PostgresTestSchema;
+
+        const TEST: &str = "postgres_read_audit_timed_out_commit_is_idempotent_on_retry";
+        let Some(schema) = PostgresTestSchema::new(TEST).await else {
+            return;
+        };
+        assert_timed_out_commit_is_idempotent(schema.conn.clone()).await;
     }
 }
