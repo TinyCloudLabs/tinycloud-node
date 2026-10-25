@@ -222,6 +222,7 @@ impl Signer {
 
     fn siwe_message(
         &self,
+        scheme: Option<&str>,
         uri: &str,
         nonce: &str,
         issued_at: OffsetDateTime,
@@ -232,7 +233,7 @@ impl Signer {
             anyhow::bail!("not a did:pkh signer");
         };
         Ok(Message {
-            scheme: Some("https".parse()?),
+            scheme: scheme.map(|scheme| scheme.parse()).transpose()?,
             domain: "tc1423.test".parse()?,
             address: *address,
             statement: None,
@@ -251,6 +252,19 @@ impl Signer {
     /// An encoded delegation to `audience`.
     pub fn delegate(
         &self,
+        audience: &str,
+        grants: &[(String, &str)],
+        window: Window,
+        proofs: &[Cid],
+    ) -> anyhow::Result<String> {
+        self.delegate_with_scheme(Some("https"), audience, grants, window, proofs)
+    }
+
+    /// As [`Signer::delegate`], with the SIWE `scheme` of a did:pkh signer
+    /// (`None`: absent).
+    pub fn delegate_with_scheme(
+        &self,
+        scheme: Option<&str>,
         audience: &str,
         grants: &[(String, &str)],
         window: Window,
@@ -283,6 +297,7 @@ impl Signer {
                     );
                 }
                 let message = recap.build_message(self.siwe_message(
+                    scheme,
                     audience,
                     &nonce,
                     window.not_before,
@@ -328,6 +343,7 @@ impl Signer {
             Self::Pkh { .. } => {
                 anyhow::ensure!(proofs.is_empty(), "SIWE fixtures carry no proofs");
                 let message = self.siwe_message(
+                    Some("https"),
                     &format!("ucan:{cid}"),
                     &unique("tc1423revoke"),
                     now(),
@@ -409,6 +425,16 @@ pub(super) struct Harness {
 
 impl Harness {
     pub async fn new(backend: Backend, shape: Shape, test: &str) -> anyhow::Result<Option<Self>> {
+        Self::new_with(backend, shape, test, |_| {}).await
+    }
+
+    /// As [`Harness::new`], with `configure` applied to the node config.
+    pub async fn new_with(
+        backend: Backend,
+        shape: Shape,
+        test: &str,
+        configure: impl FnOnce(&mut crate::config::Config),
+    ) -> anyhow::Result<Option<Self>> {
         let Some(db) = TestDatabase::new(backend, test).await? else {
             return Ok(None);
         };
@@ -432,7 +458,7 @@ impl Harness {
             None,
         );
         let network = format!("urn:tinycloud:encryption:{}:mainnet", space_owner.did());
-        let client = Self::boot_app(&db, &vector, &issuer).await?;
+        let client = Self::boot_app(&db, &vector, &issuer, configure).await?;
         let harness = Self {
             client,
             _db: db,
@@ -456,10 +482,20 @@ impl Harness {
         self._db.url()
     }
 
+    /// Boots another app on this harness's database with `configure` applied
+    /// to the node config, and returns the boot error if there is one.
+    pub async fn boot_again(
+        &self,
+        configure: impl FnOnce(&mut crate::config::Config),
+    ) -> anyhow::Result<Client> {
+        Self::boot_app(&self._db, &self.vector, &self.issuer, configure).await
+    }
+
     async fn boot_app(
         db: &TestDatabase,
         vector: &Value,
         issuer: &tinycloud_core::libp2p::identity::ed25519::Keypair,
+        configure: impl FnOnce(&mut crate::config::Config),
     ) -> anyhow::Result<Client> {
         let mut config = crate::config::Config::default();
         config.storage.datadir = db.datadir().into();
@@ -480,6 +516,7 @@ impl Harness {
             .to_owned();
         config.share_email.issuer_public_key =
             Some(encode_config(issuer.public().to_bytes(), URL_SAFE_NO_PAD));
+        configure(&mut config);
         let figment = Figment::from(rocket::Config {
             address: "127.0.0.1".parse()?,
             log_level: rocket::config::LogLevel::Off,

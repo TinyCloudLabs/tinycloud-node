@@ -1936,7 +1936,7 @@ mod tests {
     #[tokio::test]
     async fn owner_invokes_own_key_without_parents() {
         let db = empty_db().await;
-        let resource = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/tinychat");
+        let resource = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/docs/tinychat");
         let capability = caveat_capability(
             &resource,
             "tinycloud.encryption/key.create",
@@ -1958,7 +1958,7 @@ mod tests {
     #[tokio::test]
     async fn key_prefix_is_not_invocable_even_by_owner() {
         let db = empty_db().await;
-        let resource = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/tinychat/");
+        let resource = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/docs/tinychat/");
         let capability = caveat_capability(
             &resource,
             "tinycloud.encryption/key.create",
@@ -1986,7 +1986,7 @@ mod tests {
     #[tokio::test]
     async fn non_owner_key_invocation_without_parents_is_refused() {
         let db = empty_db().await;
-        let resource = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/tinychat");
+        let resource = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/docs/tinychat");
         let capability = caveat_capability(
             &resource,
             "tinycloud.encryption/key.create",
@@ -2047,7 +2047,7 @@ mod tests {
             );
         }
         assert_eq!(
-            skipped, 2,
+            skipped, 4,
             "URI-invalid key identifiers in MALFORMED_KEY_IDS"
         );
     }
@@ -2068,8 +2068,8 @@ mod tests {
         }
         let prefix_grant = crate::hash::hash(b"owner-prefix-grant");
         let key_grant = crate::hash::hash(b"middle-exact-key-grant");
-        let prefix = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/foo/");
-        let key = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/foo/x");
+        let prefix = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/docs/foo/");
+        let key = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/docs/foo/x");
         for (id, delegator, delegatee, resource) in [
             (prefix_grant, KEY_OWNER, KEY_MIDDLE, prefix.as_str()),
             (key_grant, KEY_MIDDLE, KEY_OTHER, key.as_str()),
@@ -2120,7 +2120,7 @@ mod tests {
         .await
         .expect("chained exact-key grant admits its key");
 
-        let sibling = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/foobar/x");
+        let sibling = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/docs/foobar/x");
         let capability =
             caveat_capability(&sibling, "tinycloud.encryption/decrypt", Caveats::default());
         let err = crate::models::invocation::authorize_holder(
@@ -2141,6 +2141,175 @@ mod tests {
         );
     }
 
+    /// The owner invoking an `apps/` key under its own namespace needs no parents.
+    #[tokio::test]
+    async fn owner_invokes_own_app_key_without_parents() {
+        let db = empty_db().await;
+        let resource = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/tinychat/x");
+        let capability = caveat_capability(
+            &resource,
+            "tinycloud.encryption/key.create",
+            Caveats::default(),
+        );
+        crate::models::invocation::authorize_holder(
+            &db,
+            KEY_OWNER,
+            &[capability],
+            &[],
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .expect("owner is root authority for own app keys");
+    }
+
+    /// An `apps/` prefix is refused as an invocation target, including for its owner.
+    #[tokio::test]
+    async fn app_key_prefix_is_not_invocable_even_by_owner() {
+        let db = empty_db().await;
+        let resource = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/tinychat/");
+        let capability = caveat_capability(
+            &resource,
+            "tinycloud.encryption/key.create",
+            Caveats::default(),
+        );
+        let err = crate::models::invocation::authorize_holder(
+            &db,
+            KEY_OWNER,
+            &[capability],
+            &[],
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                Error::InvalidInvocation(InvocationError::EncryptionPrefixNotInvocable)
+            ),
+            "unexpected rejection: {err:?}"
+        );
+    }
+
+    /// An `apps/` key invoked by a principal that does not own it must cite parents.
+    #[tokio::test]
+    async fn non_owner_app_key_invocation_without_parents_is_refused() {
+        let db = empty_db().await;
+        let resource = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/tinychat/x");
+        let capability = caveat_capability(
+            &resource,
+            "tinycloud.encryption/key.create",
+            Caveats::default(),
+        );
+        let err = crate::models::invocation::authorize_holder(
+            &db,
+            KEY_OTHER,
+            &[capability],
+            &[],
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                Error::InvalidInvocation(InvocationError::MissingParents)
+            ),
+            "unexpected rejection: {err:?}"
+        );
+    }
+
+    /// An owner-issued `apps/foo/` prefix grant, re-delegated for one exact key,
+    /// admits an invocation of that key and refuses the key of an app id that
+    /// only shares its text.
+    #[tokio::test]
+    async fn chained_app_key_grant_admits_exact_key_and_refuses_sibling_app() {
+        const KEY_MIDDLE: &str = "did:pkh:eip155:1:0x0000000000000000000000000000000000000001";
+        let db = empty_db().await;
+        for actor_id in [KEY_OWNER, KEY_MIDDLE, KEY_OTHER] {
+            actor::ActiveModel {
+                id: Set(actor_id.to_string()),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+        }
+        let prefix_grant = crate::hash::hash(b"owner-app-prefix-grant");
+        let key_grant = crate::hash::hash(b"middle-exact-app-key-grant");
+        let prefix = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/foo/");
+        let key = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/foo/x");
+        for (id, delegator, delegatee, resource) in [
+            (prefix_grant, KEY_OWNER, KEY_MIDDLE, prefix.as_str()),
+            (key_grant, KEY_MIDDLE, KEY_OTHER, key.as_str()),
+        ] {
+            delegation::ActiveModel {
+                id: Set(id),
+                delegator: Set(delegator.to_string()),
+                delegatee: Set(delegatee.to_string()),
+                expiry: Set(None),
+                issued_at: Set(None),
+                not_before: Set(None),
+                facts: Set(None),
+                serialization: Set(id.as_ref().to_vec()),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+            abilities::ActiveModel {
+                delegation: Set(id),
+                resource: Set(resource.parse().unwrap()),
+                ability: Set("tinycloud.encryption/decrypt"
+                    .to_string()
+                    .try_into()
+                    .unwrap()),
+                caveats: Set(Caveats::default()),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+        }
+        parent_delegations::ActiveModel {
+            parent: Set(prefix_grant),
+            child: Set(key_grant),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        let capability =
+            caveat_capability(&key, "tinycloud.encryption/decrypt", Caveats::default());
+        crate::models::invocation::authorize_holder(
+            &db,
+            KEY_OTHER,
+            &[capability],
+            &[key_grant.to_cid(0x55)],
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .expect("chained exact-key grant admits its app key");
+
+        for sibling in ["apps/foobar/x", "apps/foo.bar/x", "apps/foo/y"] {
+            let sibling = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/{sibling}");
+            let capability =
+                caveat_capability(&sibling, "tinycloud.encryption/decrypt", Caveats::default());
+            let err = crate::models::invocation::authorize_holder(
+                &db,
+                KEY_OTHER,
+                &[capability],
+                &[key_grant.to_cid(0x55)],
+                OffsetDateTime::now_utc(),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(
+                    &err,
+                    Error::InvalidInvocation(InvocationError::UnauthorizedAction(_, _))
+                ),
+                "{sibling}: unexpected rejection: {err:?}"
+            );
+        }
+    }
+
     /// Persists one terminal grant (`disableSubDelegation: true`) from KEY_OWNER to KEY_OTHER.
     async fn terminal_grant_db() -> (sea_orm::DatabaseConnection, Hash, String) {
         let db = empty_db().await;
@@ -2153,7 +2322,7 @@ mod tests {
             .unwrap();
         }
         let parent = crate::hash::hash(b"terminal-grant-invocation");
-        let prefix = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/foo/");
+        let prefix = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/docs/foo/");
         delegation::ActiveModel {
             id: Set(parent),
             delegator: Set(KEY_OWNER.to_string()),
@@ -2184,7 +2353,7 @@ mod tests {
         .insert(&db)
         .await
         .unwrap();
-        let key = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/apps/foo/x");
+        let key = format!("urn:tinycloud:encryption:{KEY_OWNER}:default/docs/foo/x");
         (db, parent, key)
     }
 

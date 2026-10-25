@@ -27,8 +27,11 @@ use crate::util::InvocationInfo;
 
 use super::backend::{validate_receiver_public_key, KeyBackend, KeyBackendError};
 use super::canonical::{canonical_hash, canonical_json_bytes, hash_hex};
+use super::deletion_ledger::DeletionLedger;
 use super::key_id::{self, EncryptionResource, KeyLocation};
-use super::keys::{canonical_key_urn, network_of, DEFAULT_KEY_CAP_PER_NETWORK};
+use super::keys::{
+    canonical_key_urn, network_of, DEFAULT_KEY_CAP_PER_APP_PREFIX, DEFAULT_KEY_CAP_PER_NETWORK,
+};
 use super::network_id::NetworkId;
 use super::protocol::{
     DecryptFacts, DecryptInvocation, DecryptRequestBody, DecryptResponseBody, KeyAdminFacts,
@@ -156,6 +159,7 @@ fn check_alg_and_version(
 fn key_denial_outcome(err: &EncryptionServiceError) -> &'static str {
     match err {
         EncryptionServiceError::KeyBlocked => "denied:key-blocked",
+        EncryptionServiceError::KeyDeleted => "denied:key-deleted",
         EncryptionServiceError::KeyNotFound => "denied:key-not-found",
         EncryptionServiceError::KeyUnwrapFailed(_) => "denied:key-unwrap",
         EncryptionServiceError::NetworkNotActive(_) | EncryptionServiceError::NetworkNotFound => {
@@ -211,8 +215,8 @@ pub enum EncryptionServiceError {
     Base64(&'static str),
     #[error("node response signing failed: {0}")]
     Signing(String),
-    #[error("deletable_unavailable: deletable keys are not available in this release")]
-    DeletableUnavailable,
+    #[error("key_deleted: the key has been deleted")]
+    KeyDeleted,
     #[error("key_exists: a key already exists at this path")]
     KeyExists,
     #[error("key_not_found: no key exists at this path")]
@@ -227,16 +231,29 @@ pub enum EncryptionServiceError {
     CorruptKeyRow,
     #[error("key_path_invalid: {0}")]
     KeyPathInvalid(String),
+    #[error("owner_only: {0}")]
+    OwnerOnly(String),
+    #[error("deletion_ledger_unavailable: {0}")]
+    DeletionLedger(String),
+    #[error("key_not_deletable: only keys under apps/ can be deleted")]
+    KeyNotDeletable,
+    #[error("{0} key rows under apps/ are not deletable keys; list them with: SELECT network_id, key_path, kind FROM encryption_network_key WHERE (key_path = 'apps' OR substr(key_path, 1, 5) = 'apps/') AND kind <> 'deletable'")]
+    StrayAppKeyRows(u64),
 }
 
 pub struct EncryptionService {
     pub(super) db: RecoveringConnection,
-    node_did: String,
+    pub(super) node_did: String,
     node_keypair: Option<Keypair>,
     pub(super) backend: Arc<dyn KeyBackend>,
     invocation_ttl_seconds: i64,
     pub(super) sqlite_writer_lock: Option<Arc<tokio::sync::Mutex<()>>>,
     pub(super) key_cap_per_network: u64,
+    pub(super) deletion_ledger: Option<Arc<DeletionLedger>>,
+    pub(super) key_cap_per_app_prefix: u64,
+    /// Makes the next key delete fail around its commit.
+    #[cfg(test)]
+    pub(super) delete_faults: super::key_delete::DeleteFaults,
 }
 
 #[derive(Debug, Clone)]
@@ -266,6 +283,10 @@ impl EncryptionService {
             invocation_ttl_seconds: DEFAULT_INVOCATION_TTL_SECONDS,
             sqlite_writer_lock: None,
             key_cap_per_network: DEFAULT_KEY_CAP_PER_NETWORK,
+            deletion_ledger: None,
+            #[cfg(test)]
+            delete_faults: Default::default(),
+            key_cap_per_app_prefix: DEFAULT_KEY_CAP_PER_APP_PREFIX,
         }
     }
 
@@ -283,6 +304,10 @@ impl EncryptionService {
             invocation_ttl_seconds: DEFAULT_INVOCATION_TTL_SECONDS,
             sqlite_writer_lock: None,
             key_cap_per_network: DEFAULT_KEY_CAP_PER_NETWORK,
+            deletion_ledger: None,
+            #[cfg(test)]
+            delete_faults: Default::default(),
+            key_cap_per_app_prefix: DEFAULT_KEY_CAP_PER_APP_PREFIX,
         }
     }
 
@@ -293,6 +318,18 @@ impl EncryptionService {
 
     pub fn with_key_cap_per_network(mut self, cap: u64) -> Self {
         self.key_cap_per_network = cap;
+        self
+    }
+
+    /// The append-only ledger every key deletion is recorded in before it
+    /// commits. Without one, deletes are refused.
+    pub fn with_deletion_ledger(mut self, ledger: Option<Arc<DeletionLedger>>) -> Self {
+        self.deletion_ledger = ledger;
+        self
+    }
+
+    pub fn with_key_cap_per_app_prefix(mut self, cap: u64) -> Self {
+        self.key_cap_per_app_prefix = cap;
         self
     }
 
@@ -1037,20 +1074,22 @@ impl EncryptionService {
             DecryptTarget::Key { loc, .. } => {
                 // Network and key state are read inside `unwrap_named_key`,
                 // after reservation and immediately before unwrap.
-                let (key_version, symmetric) =
-                    match self.unwrap_named_key(loc, &wrapped_key_bytes).await {
-                        Ok(unwrapped) => unwrapped,
-                        Err(err) => {
-                            self.record_native_audit(
-                                invocation,
-                                target,
-                                &facts,
-                                key_denial_outcome(&err),
-                            )
-                            .await?;
-                            return Err(err);
-                        }
-                    };
+                let (key_version, symmetric) = match self
+                    .unwrap_named_key(loc, &wrapped_key_bytes, body.key_version)
+                    .await
+                {
+                    Ok(unwrapped) => unwrapped,
+                    Err(err) => {
+                        self.record_native_audit(
+                            invocation,
+                            target,
+                            &facts,
+                            key_denial_outcome(&err),
+                        )
+                        .await?;
+                        return Err(err);
+                    }
+                };
                 if key_version != body.key_version || key_version != facts.key_version {
                     self.record_native_audit(invocation, target, &facts, "denied:key-version")
                         .await?;
@@ -1165,7 +1204,18 @@ impl EncryptionService {
         nonce: &str,
         exp: i64,
     ) -> Result<(), EncryptionServiceError> {
-        let nonce_expires_at = OffsetDateTime::from_unix_timestamp(exp)
+        self.consume_nonce_until(requester_did, nonce, exp).await
+    }
+
+    /// Records `(requester_did, nonce)` as used until `expires_at` (unix
+    /// seconds). A second insert of the same pair is `NonceReplay`.
+    pub(super) async fn consume_nonce_until(
+        &self,
+        requester_did: &str,
+        nonce: &str,
+        expires_at: i64,
+    ) -> Result<(), EncryptionServiceError> {
+        let nonce_expires_at = OffsetDateTime::from_unix_timestamp(expires_at)
             .unwrap_or_else(|_| OffsetDateTime::now_utc())
             .format(&Rfc3339)
             .unwrap_or_else(|_| now_rfc3339());

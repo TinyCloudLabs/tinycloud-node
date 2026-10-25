@@ -43,6 +43,33 @@ struct NodeArgs {
     command: NodeCommand,
 }
 
+#[derive(Debug, Args)]
+struct DeletionLedgerArgs {
+    #[command(subcommand)]
+    command: DeletionLedgerCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum DeletionLedgerCommand {
+    /// Re-apply the deletion ledger to the database (seed NULL, state
+    /// `deleted`). Idempotent.
+    Replay(ReplayArgs),
+}
+
+#[derive(Debug, Args)]
+struct ReplayArgs {
+    /// Base config file to load (the database comes from its storage section).
+    #[arg(long)]
+    config: Option<PathBuf>,
+
+    /// Ledger file; defaults to `encryption_network.deletion_ledger_path`.
+    #[arg(long)]
+    ledger: Option<PathBuf>,
+
+    #[command(flatten)]
+    json: JsonArgs,
+}
+
 #[derive(Debug, Subcommand)]
 enum NodeCommand {
     Service(ServiceArgs),
@@ -56,6 +83,8 @@ enum NodeCommand {
     /// Remote HTTPS via the tinycloud.link tunnel relay (requires an
     /// existing `link enable`d name).
     Tunnel(TunnelArgs),
+    /// The append-only ledger of deleted encryption keys.
+    DeletionLedger(DeletionLedgerArgs),
 }
 
 #[derive(Debug, Args)]
@@ -221,6 +250,7 @@ fn run_node(args: NodeArgs) -> Result<()> {
         NodeCommand::Key(args) => run_key(args.command),
         NodeCommand::Link(args) => run_link(args.command),
         NodeCommand::Tunnel(args) => run_tunnel(args.command),
+        NodeCommand::DeletionLedger(args) => run_deletion_ledger(args.command),
     }
 }
 
@@ -306,6 +336,41 @@ fn run_service(command: ServiceCommand) -> Result<()> {
             emit_json(&status, args.json)
         }
     }
+}
+
+/// Re-apply the deletion ledger to the node database: every key the ledger
+/// names is set to `deleted` with no seed. Run it as the first step of any
+/// database restore, before the node starts.
+fn run_deletion_ledger(command: DeletionLedgerCommand) -> Result<()> {
+    match command {
+        DeletionLedgerCommand::Replay(args) => block_on(replay_deletion_ledger(args)),
+    }
+}
+
+async fn replay_deletion_ledger(args: ReplayArgs) -> Result<()> {
+    let config_path = args
+        .config
+        .unwrap_or_else(|| runtime::serve_profile_config_path(Profile::default_for_host()));
+    let figment = runtime::serve_config_figment(&config_path)?;
+    let config = crate::resolve_runtime_config(&figment.extract::<crate::config::Config>()?)?;
+    let ledger = args
+        .ledger
+        .or_else(|| config.encryption_network.deletion_ledger_path.clone())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no deletion ledger: pass --ledger or set encryption_network.deletion_ledger_path"
+            )
+        })?;
+    let db = crate::connect_database(&config).await?;
+    let report = tinycloud_core::encryption_network::deletion_ledger::replay(&db, &ledger).await?;
+    emit_json(&report, args.json.json)?;
+    if report.refused > 0 {
+        anyhow::bail!(
+            "the ledger has {} key entr(ies) that are not valid keys; every valid entry was applied",
+            report.refused
+        );
+    }
+    Ok(())
 }
 
 fn emit_json<T: serde::Serialize>(value: &T, json: bool) -> Result<()> {
