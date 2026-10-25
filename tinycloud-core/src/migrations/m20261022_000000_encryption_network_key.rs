@@ -149,7 +149,7 @@ mod tests {
         Migrator::up(&db, None).await.expect("second up is a no-op");
         Migrator::down(&db, Some(1)).await.expect("down");
         Migrator::up(&db, None).await.expect("up after down");
-        key_row("net", "apps/app-one/key")
+        key_row("net", "docs/app-one/key")
             .insert(&db)
             .await
             .expect("insert after reapply");
@@ -158,13 +158,13 @@ mod tests {
     #[tokio::test]
     async fn key_row_round_trips_with_null_sealed_seed() {
         let db = fresh_db().await;
-        key_row("net", "apps/app-one/key")
+        key_row("net", "docs/app-one/key")
             .insert(&db)
             .await
             .expect("insert");
         let row = encryption_network_key::Entity::find_by_id((
             "net".to_string(),
-            "apps/app-one/key".to_string(),
+            "docs/app-one/key".to_string(),
         ))
         .one(&db)
         .await
@@ -253,7 +253,7 @@ mod tests {
         ))
         .await
         .expect("audit insert without key_path after re-apply");
-        key_row("net", "apps/app-one/key")
+        key_row("net", "docs/app-one/key")
             .insert(db)
             .await
             .expect("key row insert after re-apply");
@@ -280,14 +280,14 @@ mod tests {
     #[tokio::test]
     async fn up_is_a_no_op_when_table_and_column_already_exist() {
         let db = fresh_db().await;
-        key_row("net", "apps/app-one/key")
+        key_row("net", "docs/app-one/key")
             .insert(&db)
             .await
             .expect("insert key row");
         db.execute(Statement::from_string(
             DbBackend::Sqlite,
             "INSERT INTO encryption_audit (request_hash, requester, network_id, node_id, outcome, decided_at, key_path) \
-             VALUES ('h3', 'did:key:z6MkRequester', 'default', 'did:key:z6MkNode', 'allowed', '2026-10-22T00:00:00Z', 'apps/app-one/key')"
+             VALUES ('h3', 'did:key:z6MkRequester', 'default', 'did:key:z6MkNode', 'allowed', '2026-10-22T00:00:00Z', 'docs/app-one/key')"
                 .to_string(),
         ))
         .await
@@ -301,7 +301,7 @@ mod tests {
 
         let key = encryption_network_key::Entity::find_by_id((
             "net".to_string(),
-            "apps/app-one/key".to_string(),
+            "docs/app-one/key".to_string(),
         ))
         .one(&db)
         .await
@@ -313,6 +313,6 @@ mod tests {
             .await
             .expect("query")
             .expect("audit row survives");
-        assert_eq!(audit.key_path, Some("apps/app-one/key".to_string()));
+        assert_eq!(audit.key_path, Some("docs/app-one/key".to_string()));
     }
 }

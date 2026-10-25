@@ -100,6 +100,13 @@ cors = true
     ## POST /invoke. Keep off until named keys are live on OpenKey.
     ## Env: TINYCLOUD_ENCRYPTION_NETWORK__NAMED_KEYS_V1
     # named_keys_v1 = false
+    ## Append-only file, outside the database, that records every deleted key
+    ## (one JSON line: networkId, keyPath, keyVersion, deletedAt). Required
+    ## while `named_keys_v1` is on; an absolute path on durable storage that is
+    ## backed up separately from the database. A restore re-applies it with
+    ## `tinycloud node deletion-ledger replay`.
+    ## Env: TINYCLOUD_ENCRYPTION_NETWORK__DELETION_LEDGER_PATH
+    # deletion_ledger_path = "/var/lib/tinycloud/deletion-ledger.jsonl"
 
 [global.sql]
     ## Accept the `tables` / `columns` / `readOnly` caveat form on
