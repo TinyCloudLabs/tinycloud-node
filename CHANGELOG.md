@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Added the SQL object store backends for S3 (conditional create with a startup probe and a check-then-create fallback) and the filesystem (atomic no-clobber create), with the contract rules in `docs/sql-block-store-contract.md` section 12. The S3 block store's start-up size scan lists the `tinycloud:` key prefix only. Details: TC-1491.
+
 ## [1.24.0] - 2026-10-25
 
 - KV puts persist content-addressed blobs before taking the per-space sequence lock, and committed `kv/sync` cursors stay ordered. A preparatory transaction authorizes the write and claims every distinct blob under a durable attempt, committing all claims or none; on PostgreSQL each claim statement also checks that the invocation's spaces are hosted. Uploads hold no pooled database connection, transaction or lock. Protected legacy meeting writes keep their pre-upload freeze barrier, which waits for commit or abort and fails after 30 seconds if stalled (TC-1260).

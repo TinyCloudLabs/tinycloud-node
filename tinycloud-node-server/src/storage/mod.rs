@@ -1,6 +1,7 @@
 pub mod file_system;
 pub mod s3;
 pub mod size;
+pub mod sql_object;
 
 use tinycloud_auth::resource::SpaceId;
 use tinycloud_core::hash::Hash;
