@@ -1,0 +1,1108 @@
+//! Object stores for the private SQL namespace `sql/v1/` (TC-1491 contract,
+//! sections 3, 6 and 11.8).
+//!
+//! Both backends implement [`SqlObjectStore`] and share one rule: an object is
+//! created at most once and never replaced. A key names its content (it ends
+//! in the SHA-256 of the bytes), so a second creator of the same key either
+//! stores identical bytes (`AlreadyPresent`) or finds different ones
+//! (`Conflict`); nothing is ever overwritten.
+//!
+//! * [`S3SqlObjectStore`] writes into the block store's bucket, key as is,
+//!   with a conditional create (`If-None-Match: *`). [`S3SqlObjectStore::probe`]
+//!   checks at startup whether the provider honours the header and selects
+//!   the write mode; without it the store checks, then creates.
+//! * [`FsSqlObjectStore`] writes below `{datadir}/sql-store`: the body goes to
+//!   a temporary file in the target directory, is fsynced, and is published
+//!   with a hard link, which fails instead of replacing an existing file.
+
+use std::{
+    collections::HashMap,
+    fmt,
+    fs::{File, OpenOptions},
+    future::Future,
+    io::{ErrorKind, Read, Seek, SeekFrom, Write},
+    path::{Component, Path, PathBuf},
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    time::Duration,
+};
+
+use async_trait::async_trait;
+use aws_sdk_s3::{
+    error::{ProvideErrorMetadata, SdkError},
+    operation::{
+        get_object::GetObjectError, head_object::HeadObjectError, put_object::PutObjectError,
+    },
+    primitives::ByteStream,
+    Client,
+};
+use sha2::{Digest, Sha256};
+use tinycloud_core::{
+    sql::store::{
+        key::KEY_ROOT, object::sha256, ObjectKey, ObjectMeta, ObjectRange, PutOutcome,
+        SqlObjectStore, SqlStoreError,
+    },
+    storage::ByteRangeSpec,
+};
+
+use super::s3::{new_client, S3BlockConfig};
+
+/// Tracing target of everything the SQL store logs.
+const LOG_TARGET: &str = "tinycloud::sql_store";
+
+/// How `put_if_absent` creates an object on S3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteMode {
+    /// One conditional PUT (`If-None-Match: *`); the provider refuses to
+    /// replace an existing object.
+    Conditional,
+    /// HEAD, then an unconditional PUT when the object is absent.
+    CheckThenWrite,
+}
+
+impl WriteMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Conditional => "conditional",
+            Self::CheckThenWrite => "check_then_write",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S3
+// ---------------------------------------------------------------------------
+
+/// Key of the object the startup probe writes. It is never deleted.
+const PROBE_KEY: &str = "sql/v1/_probe/v1";
+const PROBE_BODY: &[u8] = b"tinycloud sql store probe v1";
+/// A conditional PUT that loses a race with an in-flight conditional PUT of
+/// the same key may be answered 409; it is retried.
+const CONFLICT_RETRIES: u32 = 5;
+
+pub struct S3SqlObjectStore {
+    client: Client,
+    bucket: String,
+    mode: WriteMode,
+    /// Per-key gates: creators of one key in this process go one at a time.
+    gates: Gates,
+}
+
+type Gates = Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>;
+
+fn lock_gates(gates: &Gates) -> MutexGuard<'_, HashMap<String, Arc<tokio::sync::Mutex<()>>>> {
+    gates.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A key's gate, removed from the map when the last holder or waiter lets go,
+/// including when its future is dropped part-way.
+struct GateGuard<'a> {
+    gates: &'a Gates,
+    key: &'a str,
+    gate: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl<'a> GateGuard<'a> {
+    fn new(gates: &'a Gates, key: &'a str) -> Self {
+        let gate = lock_gates(gates).entry(key.to_owned()).or_default().clone();
+        Self { gates, key, gate }
+    }
+
+    async fn lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.gate.lock().await
+    }
+}
+
+impl Drop for GateGuard<'_> {
+    fn drop(&mut self) {
+        let mut gates = lock_gates(self.gates);
+        // The map holds one reference and this guard one; any other is a waiter.
+        if Arc::strong_count(&self.gate) == 2 {
+            gates.remove(self.key);
+        }
+    }
+}
+
+/// The status and error code of a response.
+struct Answer {
+    status: Option<u16>,
+    code: Option<String>,
+}
+
+impl Answer {
+    fn of<E: ProvideErrorMetadata>(error: &SdkError<E>) -> Self {
+        Self {
+            status: status(error),
+            code: ProvideErrorMetadata::code(error).map(str::to_owned),
+        }
+    }
+}
+
+impl fmt::Display for Answer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.status {
+            Some(status) => write!(f, "status {status}")?,
+            None => write!(f, "status none")?,
+        }
+        write!(f, ", code {}", self.code.as_deref().unwrap_or("none"))
+    }
+}
+
+/// What one PUT of the probe or of an object came back as.
+enum PutResult {
+    Created,
+    /// 412: the object exists, the condition was honoured.
+    PreconditionFailed(Answer),
+    /// 409 ConditionalRequestConflict: another conditional write of the key
+    /// is in flight.
+    InFlight(Answer),
+    /// The provider does not implement the header (501, NotImplemented).
+    Unsupported(Answer),
+    Failed(SqlStoreError),
+}
+
+fn status<E>(error: &SdkError<E>) -> Option<u16> {
+    error.raw_response().map(|r| r.status().as_u16())
+}
+
+/// Which stage failed, without the message or URL (they can carry the key).
+fn failure_kind<E>(error: &SdkError<E>) -> &'static str {
+    match error {
+        SdkError::ConstructionFailure(_) => "construction",
+        SdkError::TimeoutError(_) => "timeout",
+        SdkError::DispatchFailure(f) if f.is_timeout() => "dispatch timeout",
+        SdkError::DispatchFailure(f) if f.is_io() => "dispatch io",
+        SdkError::DispatchFailure(f) if f.is_user() => "dispatch user",
+        SdkError::DispatchFailure(_) => "dispatch",
+        SdkError::ResponseError(_) => "response",
+        SdkError::ServiceError(_) => "service",
+        _ => "other",
+    }
+}
+
+fn backend<E: ProvideErrorMetadata>(op: &str, error: &SdkError<E>) -> SqlStoreError {
+    let status = status(error).map_or_else(|| "none".to_owned(), |s| s.to_string());
+    let code = ProvideErrorMetadata::code(error).unwrap_or("none");
+    let mut cause = String::new();
+    if let SdkError::DispatchFailure(failure) = error {
+        let mut source = failure
+            .as_connector_error()
+            .map(|e| e as &dyn std::error::Error);
+        while let Some(error) = source {
+            cause.push_str(&format!(": {error}"));
+            source = error.source();
+        }
+    }
+    SqlStoreError::Backend(format!(
+        "s3 {op} failed ({}, status {status}, code {code}){cause}",
+        failure_kind(error)
+    ))
+}
+
+fn classify_put<T>(result: Result<T, SdkError<PutObjectError>>) -> PutResult {
+    let error = match result {
+        Ok(_) => return PutResult::Created,
+        Err(error) => error,
+    };
+    let answer = Answer::of(&error);
+    match (answer.status, answer.code.as_deref()) {
+        (Some(412), _) | (_, Some("PreconditionFailed")) => PutResult::PreconditionFailed(answer),
+        (Some(409), Some("ConditionalRequestConflict")) => PutResult::InFlight(answer),
+        // Only 501 and NotImplemented mean the header is not supported; any
+        // other status, 400 included, is a failure.
+        (Some(501), _) | (_, Some("NotImplemented")) => PutResult::Unsupported(answer),
+        _ => PutResult::Failed(backend("put", &error)),
+    }
+}
+
+async fn put_object(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    body: Vec<u8>,
+    conditional: bool,
+) -> PutResult {
+    let sha = hex::encode(sha256(&body));
+    let request = client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .metadata("sha256", sha)
+        .body(ByteStream::from(body));
+    let request = if conditional {
+        request.if_none_match("*")
+    } else {
+        request
+    };
+    classify_put(request.send().await)
+}
+
+/// Decide the write mode from the answers to two conditional PUTs of one key,
+/// and name the answer that decided it. The second answering 412 means the
+/// provider honours the condition; the second succeeding, or an answer of 501
+/// or NotImplemented, means it does not. A first 412 (the probe object exists
+/// from an earlier start) already shows the condition is honoured. Any other
+/// answer is an error.
+async fn probe_with<F, Fut>(mut put: F) -> Result<(WriteMode, String), SqlStoreError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = PutResult>,
+{
+    for attempt in 0..2 {
+        match put().await {
+            PutResult::PreconditionFailed(answer) | PutResult::InFlight(answer) => {
+                return Ok((WriteMode::Conditional, answer.to_string()))
+            }
+            PutResult::Unsupported(answer) => {
+                return Ok((WriteMode::CheckThenWrite, answer.to_string()))
+            }
+            PutResult::Created if attempt == 1 => {
+                return Ok((WriteMode::CheckThenWrite, "created".to_owned()))
+            }
+            PutResult::Created => {}
+            PutResult::Failed(error) => return Err(error),
+        }
+    }
+    unreachable!("the second probe request always returns")
+}
+
+/// An existing object is the one being created when length and SHA-256 agree.
+fn same_object(meta: &ObjectMeta, key: &ObjectKey, len: u64) -> Result<PutOutcome, SqlStoreError> {
+    if meta.bytes == len && &meta.sha256 == key.sha256() {
+        Ok(PutOutcome::AlreadyPresent)
+    } else {
+        Err(SqlStoreError::Conflict)
+    }
+}
+
+/// The first and last byte `range` selects in an object of `total` bytes,
+/// clamped to the object; `None` when it selects no byte.
+fn select_range(range: ByteRangeSpec, total: u64) -> Option<(u64, u64)> {
+    let last = total.checked_sub(1)?;
+    match range {
+        ByteRangeSpec::Inclusive { start, end } if start <= end && start < total => {
+            Some((start, end.min(last)))
+        }
+        ByteRangeSpec::From { start } if start < total => Some((start, last)),
+        ByteRangeSpec::Suffix { length } if length > 0 => Some((total - length.min(total), last)),
+        _ => None,
+    }
+}
+
+fn parse_sha256(value: &str) -> Result<[u8; 32], SqlStoreError> {
+    hex::decode(value)
+        .ok()
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        .ok_or_else(|| SqlStoreError::Backend("s3 object has an invalid sha256 metadata".into()))
+}
+
+/// `bytes first-last/total`.
+fn parse_content_range(value: &str) -> Result<(u64, u64, u64), SqlStoreError> {
+    let bad = || SqlStoreError::Backend(format!("s3 returned an invalid content range {value:?}"));
+    let rest = value.strip_prefix("bytes ").ok_or_else(bad)?;
+    let (bounds, total) = rest.split_once('/').ok_or_else(bad)?;
+    let (first, last) = bounds.split_once('-').ok_or_else(bad)?;
+    let first: u64 = first.parse().map_err(|_| bad())?;
+    let last: u64 = last.parse().map_err(|_| bad())?;
+    let total: u64 = total.parse().map_err(|_| bad())?;
+    if first > last || last >= total {
+        return Err(bad());
+    }
+    Ok((first, last, total))
+}
+
+impl S3SqlObjectStore {
+    /// A store over the block store's bucket and client settings, with the
+    /// write mode chosen by [`Self::probe`].
+    pub async fn open(config: &S3BlockConfig) -> Result<Self, SqlStoreError> {
+        let client = new_client(config).await;
+        let mode = Self::probe(&client, &config.bucket).await?;
+        Ok(Self::new(client, config.bucket.clone(), mode))
+    }
+
+    /// A store with the given write mode and no probe request.
+    pub async fn open_with_mode(config: &S3BlockConfig, mode: WriteMode) -> Self {
+        Self::new(new_client(config).await, config.bucket.clone(), mode)
+    }
+
+    pub fn new(client: Client, bucket: String, mode: WriteMode) -> Self {
+        Self {
+            client,
+            bucket,
+            mode,
+            gates: Mutex::default(),
+        }
+    }
+
+    pub fn mode(&self) -> WriteMode {
+        self.mode
+    }
+
+    pub fn client(&self) -> &Client {
+        &self.client
+    }
+
+    pub fn bucket(&self) -> &str {
+        &self.bucket
+    }
+
+    /// Write a fixed small body to `sql/v1/_probe/v1` with `If-None-Match: *`
+    /// twice. A 412 on the second request means the provider honours
+    /// conditional writes; a second success, or an answer of 501 or
+    /// NotImplemented for the header, selects the check-then-create mode.
+    /// Any other failure, any other status included, is an error, not a
+    /// fallback. The object stays. The mode and the deciding answer's status
+    /// and code are logged once.
+    pub async fn probe(client: &Client, bucket: &str) -> Result<WriteMode, SqlStoreError> {
+        let (mode, answer) =
+            probe_with(|| put_object(client, bucket, PROBE_KEY, PROBE_BODY.to_vec(), true)).await?;
+        tracing::info!(
+            target: LOG_TARGET,
+            mode = mode.as_str(),
+            answer = %answer,
+            "sql object store write mode"
+        );
+        Ok(mode)
+    }
+
+    async fn existing_matches(
+        &self,
+        key: &ObjectKey,
+        len: u64,
+    ) -> Result<PutOutcome, SqlStoreError> {
+        match self.head(key).await? {
+            Some(meta) => same_object(&meta, key, len),
+            None => Err(SqlStoreError::Backend(
+                "s3 object is missing after the create was refused".into(),
+            )),
+        }
+    }
+
+    async fn create_conditionally(
+        &self,
+        key: &ObjectKey,
+        body: Vec<u8>,
+    ) -> Result<PutOutcome, SqlStoreError> {
+        let len = body.len() as u64;
+        for attempt in 0..=CONFLICT_RETRIES {
+            match put_object(&self.client, &self.bucket, key.as_str(), body.clone(), true).await {
+                PutResult::Created => return Ok(PutOutcome::Created),
+                PutResult::PreconditionFailed(_) => return self.existing_matches(key, len).await,
+                PutResult::InFlight(_) => {
+                    tokio::time::sleep(Duration::from_millis(100 * (u64::from(attempt) + 1))).await
+                }
+                PutResult::Unsupported(answer) => {
+                    return Err(SqlStoreError::Backend(format!("s3 put failed ({answer})")))
+                }
+                PutResult::Failed(error) => return Err(error),
+            }
+        }
+        Err(SqlStoreError::Backend(
+            "s3 conditional create stayed in conflict".into(),
+        ))
+    }
+
+    async fn check_then_create(
+        &self,
+        key: &ObjectKey,
+        body: Vec<u8>,
+    ) -> Result<PutOutcome, SqlStoreError> {
+        let len = body.len() as u64;
+        match self.head(key).await? {
+            Some(meta) => same_object(&meta, key, len),
+            None => match put_object(&self.client, &self.bucket, key.as_str(), body, false).await {
+                PutResult::Created => Ok(PutOutcome::Created),
+                PutResult::Failed(error) => Err(error),
+                _ => Err(SqlStoreError::Backend("s3 put was refused".into())),
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl SqlObjectStore for S3SqlObjectStore {
+    async fn put_if_absent(
+        &self,
+        key: &ObjectKey,
+        body: Vec<u8>,
+    ) -> Result<PutOutcome, SqlStoreError> {
+        if &sha256(&body) != key.sha256() {
+            return Err(SqlStoreError::BodyMismatch);
+        }
+        // Creators of one key in this process go one at a time.
+        let gate = GateGuard::new(&self.gates, key.as_str());
+        let _held = gate.lock().await;
+        match self.mode {
+            WriteMode::Conditional => self.create_conditionally(key, body).await,
+            WriteMode::CheckThenWrite => self.check_then_create(key, body).await,
+        }
+    }
+
+    async fn get_range(
+        &self,
+        key: &ObjectKey,
+        range: ByteRangeSpec,
+    ) -> Result<Option<ObjectRange>, SqlStoreError> {
+        // Shapes that select nothing in any object need no request.
+        match range {
+            ByteRangeSpec::Inclusive { start, end } if start > end => return Ok(None),
+            ByteRangeSpec::Suffix { length: 0 } => return Ok(None),
+            _ => {}
+        }
+        let output = match self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key.as_str())
+            .range(range.to_http_value())
+            .send()
+            .await
+        {
+            Ok(output) => output,
+            Err(error) => {
+                if matches!(error.as_service_error(), Some(GetObjectError::NoSuchKey(_)))
+                    || status(&error) == Some(416)
+                    || ProvideErrorMetadata::code(&error) == Some("InvalidRange")
+                {
+                    return Ok(None);
+                }
+                return Err(backend("get", &error));
+            }
+        };
+        let content_range = output.content_range().map(str::to_owned);
+        let data = output
+            .body
+            .collect()
+            .await
+            .map_err(|_| SqlStoreError::Backend("s3 get body failed".into()))?
+            .into_bytes()
+            .to_vec();
+        // A range that selects a byte always returns at least one: an empty
+        // answer means the object is empty, whatever header came with it.
+        if data.is_empty() {
+            return Ok(None);
+        }
+        match content_range {
+            Some(value) => {
+                let (first, last, total) = parse_content_range(&value)?;
+                if data.len() as u64 != last - first + 1 {
+                    return Err(SqlStoreError::Backend(
+                        "s3 get body does not match its range".into(),
+                    ));
+                }
+                Ok(Some(ObjectRange {
+                    total_size: total,
+                    start: first,
+                    data,
+                }))
+            }
+            // A provider that ignored the header sent the whole object.
+            None => {
+                let total = data.len() as u64;
+                Ok(select_range(range, total).map(|(first, last)| ObjectRange {
+                    total_size: total,
+                    start: first,
+                    data: data[first as usize..=last as usize].to_vec(),
+                }))
+            }
+        }
+    }
+
+    async fn head(&self, key: &ObjectKey) -> Result<Option<ObjectMeta>, SqlStoreError> {
+        let output = match self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(key.as_str())
+            .send()
+            .await
+        {
+            Ok(output) => output,
+            Err(error) => {
+                if matches!(error.as_service_error(), Some(HeadObjectError::NotFound(_))) {
+                    return Ok(None);
+                }
+                return Err(backend("head", &error));
+            }
+        };
+        let bytes = u64::try_from(output.content_length().unwrap_or_default())
+            .map_err(|_| SqlStoreError::Backend("s3 object has a negative length".into()))?;
+        let sha = output
+            .metadata()
+            .and_then(|metadata| metadata.get("sha256"))
+            .ok_or_else(|| SqlStoreError::Backend("s3 object has no sha256 metadata".into()))?;
+        Ok(Some(ObjectMeta {
+            bytes,
+            sha256: parse_sha256(sha)?,
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Filesystem
+// ---------------------------------------------------------------------------
+
+/// Chunk size for hashing an existing file.
+const HASH_CHUNK: usize = 1 << 20;
+/// Prefix of the temporary files a create writes next to its target. No key
+/// component can start with it (a `.` in a key is always followed by two hex
+/// digits).
+const TEMP_PREFIX: &str = ".tmp-";
+
+pub struct FsSqlObjectStore {
+    root: PathBuf,
+}
+
+/// `path` made absolute against the current directory, lexically: `.` and
+/// repeated separators are removed, nothing is read from the filesystem.
+fn absolute_path(path: &Path) -> Result<PathBuf, SqlStoreError> {
+    std::path::absolute(path)
+        .map_err(|_| SqlStoreError::Invalid("the SQL store root cannot be made absolute"))
+}
+
+/// Refuse a SQL store root the node must not use: one that is equal to,
+/// inside, or a parent of the KV block-store root. Both paths are made
+/// absolute (relative to the current directory) and compared as written; they
+/// must be free of `..` components, and nothing is read from the filesystem.
+pub fn check_fs_root(root: &Path, blocks_root: &Path) -> Result<(), SqlStoreError> {
+    if cfg!(windows) {
+        return Err(SqlStoreError::Invalid(
+            "the filesystem SQL store is not supported on this platform",
+        ));
+    }
+    let root = absolute_path(root)?;
+    let blocks_root = absolute_path(blocks_root)?;
+    for path in [&root, &blocks_root] {
+        if path.components().any(|c| matches!(c, Component::ParentDir)) {
+            return Err(SqlStoreError::Invalid(
+                "the SQL store root and the block store root must not contain .. components",
+            ));
+        }
+    }
+    if root == blocks_root {
+        return Err(SqlStoreError::Invalid(
+            "the SQL store root must differ from the block store root",
+        ));
+    }
+    if root.starts_with(&blocks_root) {
+        return Err(SqlStoreError::Invalid(
+            "the SQL store root must not be inside the block store root",
+        ));
+    }
+    if blocks_root.starts_with(&root) {
+        return Err(SqlStoreError::Invalid(
+            "the SQL store root must not contain the block store root",
+        ));
+    }
+    Ok(())
+}
+
+fn io_error(op: &str, error: &std::io::Error) -> SqlStoreError {
+    // The kind only: a path would put keys in logs.
+    SqlStoreError::Backend(format!("filesystem {op} failed ({:?})", error.kind()))
+}
+
+/// The file of `key` below `root`. Each component must be an ordinary file
+/// name and the result must stay under `root`.
+fn resolve_path(root: &Path, key: &str) -> Result<PathBuf, SqlStoreError> {
+    let invalid = || SqlStoreError::Invalid("key is not a valid store path");
+    if !key.starts_with(KEY_ROOT) {
+        return Err(invalid());
+    }
+    let mut path = root.to_path_buf();
+    for part in key.split('/') {
+        if part.is_empty()
+            || part == "."
+            || part == ".."
+            || part.starts_with(TEMP_PREFIX)
+            || part.contains(['\\', '\0'])
+        {
+            return Err(invalid());
+        }
+        path.push(part);
+    }
+    if path == root || !path.starts_with(root) {
+        return Err(invalid());
+    }
+    Ok(path)
+}
+
+fn sync_dir(dir: &Path) -> Result<(), SqlStoreError> {
+    File::open(dir)
+        .and_then(|d| d.sync_all())
+        .map_err(|e| io_error("directory sync", &e))
+}
+
+/// Create the directories from `root` down to `dir`. Each new directory and
+/// its parent are fsynced; for a directory that already exists its parent is
+/// fsynced too, so the whole chain is durable before the object is reported
+/// created, whoever made the directories.
+fn create_dirs(root: &Path, dir: &Path) -> Result<(), SqlStoreError> {
+    let relative = dir
+        .strip_prefix(root)
+        .map_err(|_| SqlStoreError::Invalid("key is not a valid store path"))?;
+    let mut current = root.to_path_buf();
+    for part in relative.components() {
+        let parent = current.clone();
+        current.push(part);
+        match std::fs::create_dir(&current) {
+            Ok(()) => {
+                sync_dir(&current)?;
+                sync_dir(&parent)?;
+            }
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => sync_dir(&parent)?,
+            Err(e) => return Err(io_error("create directory", &e)),
+        }
+    }
+    Ok(())
+}
+
+/// Removes its file on drop, in every outcome of a create.
+struct TempFile(PathBuf);
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn hash_file(file: &mut File) -> Result<[u8; 32], SqlStoreError> {
+    let mut hasher = Sha256::new();
+    let mut chunk = vec![0u8; HASH_CHUNK];
+    loop {
+        let n = file.read(&mut chunk).map_err(|e| io_error("read", &e))?;
+        if n == 0 {
+            return Ok(hasher.finalize().into());
+        }
+        hasher.update(&chunk[..n]);
+    }
+}
+
+fn fs_head(path: &Path) -> Result<Option<ObjectMeta>, SqlStoreError> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(io_error("open", &e)),
+    };
+    let metadata = file.metadata().map_err(|e| io_error("stat", &e))?;
+    if !metadata.is_file() {
+        return Err(SqlStoreError::Backend(
+            "filesystem entry is not a file".into(),
+        ));
+    }
+    Ok(Some(ObjectMeta {
+        bytes: metadata.len(),
+        sha256: hash_file(&mut file)?,
+    }))
+}
+
+fn fs_put(
+    path: &Path,
+    root: &Path,
+    sha: &[u8; 32],
+    body: &[u8],
+) -> Result<PutOutcome, SqlStoreError> {
+    let dir = path
+        .parent()
+        .ok_or(SqlStoreError::Invalid("key is not a valid store path"))?;
+    create_dirs(root, dir)?;
+    let temp = TempFile(dir.join(format!(
+        "{TEMP_PREFIX}{}",
+        hex::encode(rand::random::<[u8; 16]>())
+    )));
+    {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp.0)
+            .map_err(|e| io_error("create temp file", &e))?;
+        file.write_all(body)
+            .and_then(|()| file.sync_all())
+            .map_err(|e| io_error("write temp file", &e))?;
+    }
+    let outcome = match std::fs::hard_link(&temp.0, path) {
+        Ok(()) => Ok(PutOutcome::Created),
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => match fs_head(path)? {
+            Some(meta) if meta.bytes == body.len() as u64 && &meta.sha256 == sha => {
+                Ok(PutOutcome::AlreadyPresent)
+            }
+            Some(_) => Err(SqlStoreError::Conflict),
+            None => Err(SqlStoreError::Backend(
+                "filesystem object is missing after the link was refused".into(),
+            )),
+        },
+        Err(e) => Err(io_error("link", &e)),
+    };
+    let synced = sync_dir(dir);
+    // The temporary file is removed when `temp` drops, after the sync.
+    match outcome {
+        Ok(outcome) => synced.map(|()| outcome),
+        Err(error) => Err(error),
+    }
+}
+
+fn fs_get_range(path: &Path, range: ByteRangeSpec) -> Result<Option<ObjectRange>, SqlStoreError> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(io_error("open", &e)),
+    };
+    let metadata = file.metadata().map_err(|e| io_error("stat", &e))?;
+    if !metadata.is_file() {
+        return Err(SqlStoreError::Backend(
+            "filesystem entry is not a file".into(),
+        ));
+    }
+    let total = metadata.len();
+    let Some((first, last)) = select_range(range, total) else {
+        return Ok(None);
+    };
+    let len = usize::try_from(last - first + 1)
+        .map_err(|_| SqlStoreError::Invalid("range does not fit in memory"))?;
+    let mut data = vec![0u8; len];
+    file.seek(SeekFrom::Start(first))
+        .and_then(|_| file.read_exact(&mut data))
+        .map_err(|e| io_error("read", &e))?;
+    Ok(Some(ObjectRange {
+        total_size: total,
+        start: first,
+        data,
+    }))
+}
+
+async fn blocking<T, F>(work: F) -> Result<T, SqlStoreError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, SqlStoreError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|_| SqlStoreError::Backend("filesystem task failed".into()))?
+}
+
+impl FsSqlObjectStore {
+    /// Open the store at `root` (`{datadir}/sql-store`), creating it if
+    /// needed, after [`check_fs_root`] against the KV block-store root.
+    pub fn open(root: PathBuf, blocks_root: &Path) -> Result<Self, SqlStoreError> {
+        check_fs_root(&root, blocks_root)?;
+        let root = absolute_path(&root)?;
+        std::fs::create_dir_all(&root).map_err(|e| io_error("create root", &e))?;
+        sync_dir(&root)?;
+        if let Some(parent) = root.parent() {
+            sync_dir(parent)?;
+        }
+        Ok(Self { root })
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// The file an object is stored in.
+    pub fn path_for(&self, key: &ObjectKey) -> Result<PathBuf, SqlStoreError> {
+        resolve_path(&self.root, key.as_str())
+    }
+}
+
+#[async_trait]
+impl SqlObjectStore for FsSqlObjectStore {
+    async fn put_if_absent(
+        &self,
+        key: &ObjectKey,
+        body: Vec<u8>,
+    ) -> Result<PutOutcome, SqlStoreError> {
+        if &sha256(&body) != key.sha256() {
+            return Err(SqlStoreError::BodyMismatch);
+        }
+        let path = self.path_for(key)?;
+        let root = self.root.clone();
+        let sha = *key.sha256();
+        blocking(move || fs_put(&path, &root, &sha, &body)).await
+    }
+
+    async fn get_range(
+        &self,
+        key: &ObjectKey,
+        range: ByteRangeSpec,
+    ) -> Result<Option<ObjectRange>, SqlStoreError> {
+        let path = self.path_for(key)?;
+        blocking(move || fs_get_range(&path, range)).await
+    }
+
+    async fn head(&self, key: &ObjectKey) -> Result<Option<ObjectMeta>, SqlStoreError> {
+        let path = self.path_for(key)?;
+        blocking(move || fs_head(&path)).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[cfg(not(windows))]
+    #[test]
+    fn fs_root_must_be_outside_the_block_store() {
+        let blocks = Path::new("/data/blocks");
+        for ok in [
+            "/data/sql-store",
+            "/data/blocks2",
+            "/sql-store",
+            "/data/sql/store",
+        ] {
+            assert!(check_fs_root(Path::new(ok), blocks).is_ok(), "{ok}");
+        }
+        for bad in [
+            "/data/blocks",
+            "/data/blocks/",
+            "/data/blocks/sql-store",
+            "/data",
+            "/",
+            "/data/../data/sql-store",
+        ] {
+            assert!(check_fs_root(Path::new(bad), blocks).is_err(), "{bad}");
+        }
+        assert!(check_fs_root(
+            Path::new("/data/sql-store"),
+            Path::new("/data/../data/blocks")
+        )
+        .is_err());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn relative_roots_are_made_absolute_before_the_check() {
+        // The default layout: `./data` for the data directory and the blocks.
+        let blocks = Path::new("./data/blocks");
+        for ok in [
+            "./data/sql-store",
+            "data/sql-store",
+            "sql-store",
+            "./data/blocks2",
+        ] {
+            assert!(check_fs_root(Path::new(ok), blocks).is_ok(), "{ok}");
+        }
+        for bad in [
+            "data/blocks",
+            "./data/blocks",
+            "./data/blocks/sql-store",
+            "data/blocks/sql-store",
+            "./data",
+            "data",
+            "",
+        ] {
+            assert!(check_fs_root(Path::new(bad), blocks).is_err(), "{bad:?}");
+        }
+        // A relative root against an absolute block store root, and the reverse.
+        let cwd = std::env::current_dir().unwrap();
+        assert!(check_fs_root(Path::new("sql-store"), &cwd.join("blocks")).is_ok());
+        assert!(check_fs_root(Path::new("blocks/sql-store"), &cwd.join("blocks")).is_err());
+        assert!(check_fs_root(&cwd.join("blocks/sql-store"), Path::new("blocks")).is_err());
+    }
+
+    #[test]
+    fn resolved_paths_stay_under_the_root() {
+        let root = Path::new("/var/tmp/sql-store");
+        let ok = resolve_path(root, "sql/v1/a/b/c/snap/x").unwrap();
+        assert_eq!(ok, root.join("sql/v1/a/b/c/snap/x"));
+        for bad in [
+            "",
+            "sql/v1/",
+            "sql/v1/../../etc/passwd",
+            "sql/v1/a/./b",
+            "sql/v1//a",
+            "sql/v1/a/",
+            "/etc/passwd",
+            "../sql/v1/a",
+            "sql/v1/a\\b",
+            "sql/v1/a\0b",
+            "sql/v1/a/.tmp-0011",
+            "other/v1/a",
+        ] {
+            assert!(resolve_path(root, bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn range_selection_matches_byte_range_spec() {
+        let edges = [0u64, 1, 2, 4, 5, 6, 9, 10, 11];
+        let mut specs = Vec::new();
+        for &a in &edges {
+            specs.push(ByteRangeSpec::From { start: a });
+            specs.push(ByteRangeSpec::Suffix { length: a });
+            for &b in &edges {
+                specs.push(ByteRangeSpec::Inclusive { start: a, end: b });
+            }
+        }
+        for total in [0u64, 1, 2, 5, 10] {
+            for spec in &specs {
+                assert_eq!(
+                    select_range(*spec, total),
+                    spec.resolve(total).map(|r| (r.start(), r.end())),
+                    "{spec:?} of {total}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn content_ranges_are_parsed_strictly() {
+        assert_eq!(
+            parse_content_range("bytes 10-19/300").unwrap(),
+            (10, 19, 300)
+        );
+        assert_eq!(parse_content_range("bytes 0-0/1").unwrap(), (0, 0, 1));
+        for bad in [
+            "",
+            "bytes */300",
+            "bytes 10-19/*",
+            "bytes 19-10/300",
+            "bytes 0-300/300",
+            "10-19/300",
+            "bytes 10/300",
+        ] {
+            assert!(parse_content_range(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    fn scripted(answers: Vec<PutResult>) -> (Result<(WriteMode, String), SqlStoreError>, usize) {
+        let calls = AtomicUsize::new(0);
+        let answers = Mutex::new(answers.into_iter());
+        let result = futures::executor::block_on(probe_with(|| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            let next = answers
+                .lock()
+                .unwrap()
+                .next()
+                .expect("probe asked too often");
+            async move { next }
+        }));
+        (result, calls.load(Ordering::SeqCst))
+    }
+
+    fn answer(status: u16, code: &str) -> Answer {
+        Answer {
+            status: Some(status),
+            code: Some(code.to_owned()),
+        }
+    }
+
+    #[test]
+    fn probe_selects_the_write_mode_from_the_second_answer() {
+        use PutResult::*;
+        let refused = || PreconditionFailed(answer(412, "PreconditionFailed"));
+        let unsupported = || Unsupported(answer(501, "NotImplemented"));
+        let (mode, calls) = scripted(vec![Created, refused()]);
+        let (mode, decided_by) = mode.unwrap();
+        assert_eq!((mode, calls), (WriteMode::Conditional, 2));
+        assert_eq!(decided_by, "status 412, code PreconditionFailed");
+        // An object left by an earlier start answers the first request.
+        let (mode, calls) = scripted(vec![refused()]);
+        assert_eq!((mode.unwrap().0, calls), (WriteMode::Conditional, 1));
+        let (mode, calls) = scripted(vec![Created, Created]);
+        let (mode, decided_by) = mode.unwrap();
+        assert_eq!((mode, calls), (WriteMode::CheckThenWrite, 2));
+        assert_eq!(decided_by, "created");
+        let (mode, calls) = scripted(vec![unsupported()]);
+        let (mode, decided_by) = mode.unwrap();
+        assert_eq!((mode, calls), (WriteMode::CheckThenWrite, 1));
+        assert_eq!(decided_by, "status 501, code NotImplemented");
+        let (mode, calls) = scripted(vec![Created, unsupported()]);
+        assert_eq!((mode.unwrap().0, calls), (WriteMode::CheckThenWrite, 2));
+    }
+
+    #[test]
+    fn probe_failure_is_an_error_not_a_fallback() {
+        use PutResult::*;
+        let failure = || Failed(SqlStoreError::Backend("down".into()));
+        let (mode, calls) = scripted(vec![failure()]);
+        assert!(matches!(mode, Err(SqlStoreError::Backend(_))));
+        assert_eq!(calls, 1);
+        let (mode, _) = scripted(vec![Created, failure()]);
+        assert!(matches!(mode, Err(SqlStoreError::Backend(_))));
+    }
+
+    #[test]
+    fn kv_keys_start_with_the_scan_prefix() {
+        use tinycloud_auth::resource::{SpaceId, SPACE_ID_PREFIX};
+        use tinycloud_core::hash::hash;
+
+        use super::super::s3::{S3BlockStore, KV_SCAN_PREFIX};
+
+        assert_eq!(KV_SCAN_PREFIX, SPACE_ID_PREFIX);
+        let space: SpaceId =
+            "tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:default"
+                .parse()
+                .unwrap();
+        assert!(space.to_string().starts_with(SPACE_ID_PREFIX));
+        let digest = hash(b"block");
+        let key = S3BlockStore::key_for(&space, &digest, 0);
+        assert!(key.starts_with(KV_SCAN_PREFIX), "{key}");
+        assert!(key.starts_with(&format!("{space}/")));
+        assert!(!key.contains('@'), "{key}");
+        let next_key = S3BlockStore::key_for(&space, &digest, 7);
+        assert!(next_key.starts_with(KV_SCAN_PREFIX), "{next_key}");
+        assert_eq!(next_key, format!("{key}@7"));
+        // SQL objects live outside the scanned prefix.
+        assert!(!KEY_ROOT.starts_with(KV_SCAN_PREFIX));
+    }
+
+    #[tokio::test]
+    async fn cancelled_creates_leave_no_gate_behind() {
+        // A server that accepts connections and never answers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepter = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        let client = Client::from_conf(
+            aws_sdk_s3::Config::builder()
+                .behavior_version(super::super::s3::behavior_version())
+                .region(aws_sdk_s3::config::Region::new("us-east-1"))
+                .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                    "id", "secret", None, None, "test",
+                ))
+                .endpoint_url(format!("http://{addr}"))
+                .force_path_style(true)
+                .http_client(super::super::s3::http_client())
+                .build(),
+        );
+        let body = b"abc".to_vec();
+        let key = ObjectKey::snapshot(
+            &tinycloud_core::sql::store::DbRef {
+                space: "tinycloud:s",
+                db_id: "d",
+            },
+            &tinycloud_core::sql::store::Lineage::random(),
+            1,
+            &sha256(&body),
+        )
+        .unwrap();
+        for mode in [WriteMode::Conditional, WriteMode::CheckThenWrite] {
+            let store = S3SqlObjectStore::new(client.clone(), "bucket".into(), mode);
+            tokio::time::timeout(Duration::from_secs(30), async {
+                // One creator holds the gate in its request, one waits for it;
+                // both are dropped by their timeouts.
+                let first = tokio::time::timeout(
+                    Duration::from_millis(300),
+                    store.put_if_absent(&key, body.clone()),
+                );
+                let second = tokio::time::timeout(
+                    Duration::from_millis(300),
+                    store.put_if_absent(&key, body.clone()),
+                );
+                let (first, second) = tokio::join!(first, second);
+                assert!(
+                    first.is_err() && second.is_err(),
+                    "the server never answers"
+                );
+            })
+            .await
+            .expect("the cancelled creates did not return");
+            assert!(lock_gates(&store.gates).is_empty(), "{mode:?}");
+        }
+        accepter.abort();
+    }
+}

@@ -31,6 +31,7 @@ pub mod m20261018_000000_epoch_head;
 pub mod m20261020_000000_current_kv_key_c_index;
 pub mod m20261021_000000_sql_store_manifest;
 pub mod m20261022_000000_encryption_network_key;
+pub mod m20261023_010000_kv_orphan_candidates;
 
 pub struct Migrator;
 
@@ -70,6 +71,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261020_000000_current_kv_key_c_index::Migration),
             Box::new(m20261021_000000_sql_store_manifest::Migration),
             Box::new(m20261022_000000_encryption_network_key::Migration),
+            Box::new(m20261023_010000_kv_orphan_candidates::Migration),
         ]
     }
 }
