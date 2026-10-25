@@ -808,12 +808,21 @@ jobs:
           TINYCLOUD_SHARE_EMAIL__TRUST_BUNDLE_BASE64: ${{ secrets.PROD_TINYCLOUD_SHARE_TRUST_BUNDLE_BASE64 }}
           TINYCLOUD_SHARE_EMAIL__POSTGRES_TLS__SSLMODE: verify-full
           TINYCLOUD_KEYS__TYPE: Dstack
+          TINYCLOUD_ENCRYPTION_NETWORK__NAMED_KEYS_V1: ${{ inputs.named_keys_v1 }}
         run: |
           set -euo pipefail
           IMAGE="$(sed -n -E 's/^    image: (ghcr.io\/tinycloudlabs\/tinycloud-node(:[^[:space:]]+|@sha256:[0-9a-f]{64}))$/\1/p' docker-compose.dstack-postgres.yaml)"
           if [ "$(printf '%s\n' "${IMAGE}" | awk 'NF { count += 1 } END { print count + 0 }')" != "1" ]; then
             echo "::error::Expected exactly one resolved TinyCloud Node image for runtime preflight"
             exit 1
+          fi
+          # TC-1777: validate the same named-keys gate and ledger path the sealed
+          # deployment will carry. The path is read from the compose being deployed
+          # (absent from the pre-N0 rollback compose, where it is not passed).
+          LEDGER_PATH="$(sed -n -E 's/^      TINYCLOUD_ENCRYPTION_NETWORK__DELETION_LEDGER_PATH: ([^[:space:]]+)$/\1/p' docker-compose.dstack-postgres.yaml)"
+          ledger_args=()
+          if [ -n "${LEDGER_PATH}" ]; then
+            ledger_args=(-e "TINYCLOUD_ENCRYPTION_NETWORK__DELETION_LEDGER_PATH=${LEDGER_PATH}")
           fi
           docker run --rm --network none --read-only --cap-drop ALL \
             --security-opt no-new-privileges \
@@ -823,6 +832,8 @@ jobs:
             -e TINYCLOUD_SHARE_EMAIL__TRUST_BUNDLE_BASE64 \
             -e TINYCLOUD_SHARE_EMAIL__POSTGRES_TLS__SSLMODE \
             -e TINYCLOUD_KEYS__TYPE \
+            -e TINYCLOUD_ENCRYPTION_NETWORK__NAMED_KEYS_V1 \
+            ${ledger_args[@]+"${ledger_args[@]}"} \
             "${IMAGE}" --validate-config
 
       # TC-959: only env_keys/encrypted_env may change here. Never copy the
