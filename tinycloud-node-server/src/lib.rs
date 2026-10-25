@@ -29,6 +29,8 @@ pub mod auth_guards;
 pub mod authorization;
 pub mod cli;
 pub mod config;
+pub mod delivery_limiter;
+pub mod delivery_link;
 pub mod dstack;
 pub mod egress;
 pub mod epoch_head_backfill;
@@ -36,6 +38,8 @@ pub mod hooks;
 pub mod invocation_replay;
 pub mod issuer_set;
 pub mod link;
+pub mod links_fetch;
+pub mod links_read_auth;
 pub mod node_control;
 pub mod policy_v3;
 pub mod prometheus;
@@ -581,6 +585,14 @@ pub fn resolve_runtime_config(tinycloud_config: &Config) -> Result<Config> {
         .validate_for_v2_database(resolved.storage.database())
         .map_err(|error| anyhow::anyhow!(error))?;
     resolved.share_email.credential_issuer_set()?;
+    resolved
+        .share_email
+        .validate_links_origin()
+        .map_err(|error| anyhow::anyhow!(error))?;
+    resolved
+        .share_email
+        .validate_links_fetch_limits()
+        .map_err(|error| anyhow::anyhow!(error))?;
     Ok(resolved)
 }
 
@@ -872,7 +884,21 @@ pub async fn app_with_control(
         PolicyV3Runtime::new(seed_conn.clone(), key_setup.node_did(), key_setup.clone())
             .with_sqlite_writer_lock(tinycloud.sqlite_writer_lock());
     if tinycloud_config.share_email.enabled {
-        policy_v3_runtime = policy_v3_runtime.with_delivery(&tinycloud_config.share_email)?;
+        let links_origin =
+            links_fetch::LinksOrigin::parse(&tinycloud_config.share_email.links_origin)
+                .map_err(|error| anyhow::anyhow!(error))?;
+        let links = Arc::new(
+            links_fetch::ApiLinkFetcher::new(
+                egress_policy.clone(),
+                links_origin,
+                tinycloud_config.share_email.links_origin_allow_private,
+            )
+            // Every read is signed with the node identity key, the key that
+            // signs the delivery admission.
+            .with_read_signer(links_read_auth::ReadSigner::new(key_setup.clone())),
+        );
+        policy_v3_runtime =
+            policy_v3_runtime.with_delivery(&tinycloud_config.share_email, links)?;
     }
     // The pinned issuer set is built (and every set-load rule applied) whether
     // or not share-email is enabled; a violation stops the node from starting.
@@ -880,6 +906,7 @@ pub async fn app_with_control(
     if !credential_issuers.is_empty() {
         policy_v3_runtime = policy_v3_runtime.with_credential_issuers(credential_issuers);
     }
+    let delivery_fetch_limiter = policy_v3_runtime.fetch_limiter().clone();
 
     #[cfg(feature = "duckdb")]
     let duckdb_service = DuckDbService::new(
@@ -932,6 +959,16 @@ pub async fn app_with_control(
                 let shutdown = rocket.shutdown();
                 Box::pin(async move {
                     tokio::spawn(egress::run_refresh(policy, shutdown));
+                })
+            }
+        }))
+        .attach(AdHoc::on_liftoff("delivery-rate-limit-report", {
+            let limiter = delivery_fetch_limiter.clone();
+            move |rocket| {
+                let limiter = limiter.clone();
+                let shutdown = rocket.shutdown();
+                Box::pin(async move {
+                    tokio::spawn(delivery_limiter::run_report(limiter, shutdown));
                 })
             }
         }))
