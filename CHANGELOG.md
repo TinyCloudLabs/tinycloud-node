@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+## [1.23.0] - 2026-10-25
+
+### Release notes
+
+- **Share email authorizes from a short link.** `POST /policy/v3/deliveries/authorize` takes the short link only; the node reads the record from the links API (`share_email.links_origin`), signs each read (`TinyCloud-Read-Auth`) and signs delivery admission v1. The old long-link URL forms are not accepted. Deploy order: links API, OpenCredentials witness, node, Share composer, CLI. Details: TC-1737.
+- **Log sidecar error caps.** Request events with status 400 and above are capped per minute per sidecar instance, with one `errors_dropped` event per class per minute. Details: TC-1843.
+- **SQL local durability.** File-backed SQL databases run `PRAGMA synchronous = FULL` by default (`[global.storage.sql] synchronous`), and a write is checked against the storage budget before commit. Details: TC-1491.
+- No database migration since 1.22.0.
+
 ### Changes
 - Added `sql_store` settings, validation, and manifest format and timestamp rules; `enabled = true` refuses to start (no uploader in this build).
 
