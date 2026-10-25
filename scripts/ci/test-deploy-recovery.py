@@ -125,6 +125,7 @@ elif name=='node':
     names=[line.split('=',1)[0] for line in Path('.phala-prod.env').read_text().splitlines()]
     assert 'BETTERSTACK_SOURCE_TOKEN' in names and 'QUOTA_BILLING_ADMIN_SECRET' not in names
     data=json.loads(state.read_text()); data['values']['env_names']=names; state.write_text(json.dumps(data))
+    sealed=dict(row.split('=',1) for row in Path('.phala-prod.env').read_text().splitlines()); event('sealed-named-keys-v1='+sealed.get('NAMED_KEYS_V1','<absent>'))
     if args[-1]=='--check':
         event('whitelist-check')
         # What sync.mjs does when the CVM's allowed_envs names a variable the sealed file lacks.
@@ -279,6 +280,7 @@ class RecoveryTests(unittest.TestCase):
                 env["PHALA_ENV_NODE_STATS_READ_TOKEN"] = stats_token
                 if stats_token and stats_token != canary: CANARIES.append(stats_token)
             if missing_billing: env.pop("QUOTA_BILLING_ADMIN_SECRET")
+            env["PHALA_ENV_NAMED_KEYS_V1"] = inputs.get("named_keys_v1", "false")
             context = {"github.event_name": event, "github.ref": ref, "job.success": True,
                        **{"inputs." + key: (value == "true" if value in ("true", "false") else value) for key, value in inputs.items()}}
             logs = ""
@@ -558,6 +560,28 @@ class RecoveryTests(unittest.TestCase):
         self.assertFalse(result["success"])
         self.assertNotIn("cvm-deploy", result["events"])
         self.assertEqual(result["compose"], N0)
+
+    def test_named_keys_gate_is_sealed_as_a_literal_flag_beside_the_ssh_keys(self):
+        # TC-1777: the flip is a workflow input, so the sealed file (the only CVM env source)
+        # carries the flag and keeps DSTACK_AUTHORIZED_KEYS on every dispatch.
+        for value in ("false", "true"):
+            with self.subTest(value=value):
+                result = self.run_deploy(changes={"named_keys_v1": value})
+                self.assertTrue(result["success"])
+                self.assertEqual(result["env_names"].count("NAMED_KEYS_V1"), 1)
+                self.assertEqual(result["env_names"].count("DSTACK_AUTHORIZED_KEYS"), 1)
+                sealed = {event for event in result["events"] if event.startswith("sealed-named-keys-v1=")}
+                self.assertEqual(sealed, {"sealed-named-keys-v1=" + value})
+
+    def test_named_keys_gate_other_than_true_or_false_is_refused_before_the_file(self):
+        for value in ("", "TRUE", "1", "yes", "maybe", "true "):
+            with self.subTest(value=value):
+                refused = self.run_deploy(changes={"named_keys_v1": value})
+                self.assertFalse(refused["success"])
+                self.assertEqual(refused["events"].count("cvm-deploy"), 0, "A bad flag must fail before the CVM mutation")
+                self.assertNotIn("whitelist-check", refused["events"], "The sealed file must not be written first")
+                if value:
+                    self.assertIn("::error::named_keys_v1 must be exactly true or false", refused["logs"])
 
     def test_last_restart_precedes_health_inventory_and_quota(self):
         result = self.run_deploy(N0, {"rollback_pre_n0": "true", "rollback_privacy_mode": "keep-json-file"}, approved_privacy="keep-json-file")
