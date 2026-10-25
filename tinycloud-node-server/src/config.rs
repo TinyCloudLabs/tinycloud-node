@@ -123,6 +123,26 @@ pub struct ShareEmailConfig {
     pub node_audience: String,
     #[serde(default = "default_share_return_origin")]
     pub return_origin: String,
+    /// The links API the node reads a share record from for a delivery
+    /// authorization: exactly `https://host[:port]`. The link never names an
+    /// API origin; this is the only source. Validated when the configuration
+    /// loads, and the node refuses to start with an invalid value.
+    #[serde(default = "default_share_links_origin")]
+    pub links_origin: String,
+    /// For a self-hosted links API on a private network: permit a
+    /// `links_origin` whose host is, or resolves to, a private, loopback,
+    /// link-local or CGNAT address.
+    #[serde(default)]
+    pub links_origin_allow_private: bool,
+    /// Links fetches one authenticated invoker may start in a minute (a burst
+    /// of five, then refilled at this rate). A request over it is answered
+    /// `429 delivery-rate-limited` before any fetch.
+    #[serde(default = "default_links_fetch_per_invoker_per_minute")]
+    pub links_fetch_per_invoker_per_minute: u32,
+    /// Links fetches the node starts in any 60 seconds, for all invokers; kept
+    /// below the links API's per-address read allowance.
+    #[serde(default = "default_links_fetch_global_per_minute")]
+    pub links_fetch_global_per_minute: u32,
     /// The only browser origin allowed to call the node's share-email API.
     /// This is deliberately a list so the deployed value is visible in the
     /// configuration and cannot accidentally become a wildcard.
@@ -209,6 +229,15 @@ fn default_share_node_audience() -> String {
 fn default_share_return_origin() -> String {
     "https://share.tinycloud.xyz".to_owned()
 }
+fn default_share_links_origin() -> String {
+    "https://api.tinycloud.xyz".to_owned()
+}
+fn default_links_fetch_per_invoker_per_minute() -> u32 {
+    crate::delivery_limiter::DEFAULT_PER_INVOKER_PER_MINUTE
+}
+fn default_links_fetch_global_per_minute() -> u32 {
+    crate::delivery_limiter::DEFAULT_GLOBAL_PER_MINUTE
+}
 fn default_share_allowed_origins() -> Vec<String> {
     vec![default_share_return_origin()]
 }
@@ -279,6 +308,11 @@ impl Default for ShareEmailConfig {
             target_origin: default_share_target_origin(),
             node_audience: default_share_node_audience(),
             return_origin: default_share_return_origin(),
+            links_origin: default_share_links_origin(),
+            links_origin_allow_private: false,
+            links_fetch_per_invoker_per_minute:
+                crate::delivery_limiter::DEFAULT_PER_INVOKER_PER_MINUTE,
+            links_fetch_global_per_minute: crate::delivery_limiter::DEFAULT_GLOBAL_PER_MINUTE,
             allowed_origins: default_share_allowed_origins(),
             node_signing_kid: default_share_node_signing_kid(),
             invitation_kid: default_share_invitation_kid(),
@@ -306,6 +340,54 @@ impl Default for ShareEmailConfig {
 }
 
 impl ShareEmailConfig {
+    /// The links fetch limits: each at least 1, the node-wide one at most 110
+    /// (the links API allows 120 reads a minute per client address). Checked
+    /// when the configuration loads; the node does not start otherwise.
+    pub fn validate_links_fetch_limits(&self) -> Result<(), &'static str> {
+        crate::delivery_limiter::validate_limits(
+            self.links_fetch_per_invoker_per_minute,
+            self.links_fetch_global_per_minute,
+        )
+    }
+
+    /// The links origin checks, run whenever the configuration loads: the
+    /// value must be exactly `https://host[:port]`, and its host must not be a
+    /// private, loopback, link-local or CGNAT address unless
+    /// `links_origin_allow_private` is set. When delivery is enabled the host
+    /// is also resolved here and every answer is checked the same way; a
+    /// failed lookup does not stop the start, because every fetch vets the
+    /// address it connects to.
+    pub fn validate_links_origin(&self) -> Result<crate::links_fetch::LinksOrigin, &'static str> {
+        self.validate_links_origin_with(&|host, port| {
+            if !self.enabled {
+                return None;
+            }
+            let host = host.to_owned();
+            let (sender, receiver) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = sender.send(
+                    std::net::ToSocketAddrs::to_socket_addrs(&(host.as_str(), port))
+                        .map(|addresses| addresses.map(|address| address.ip()).collect::<Vec<_>>()),
+                );
+            });
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .ok()?
+                .ok()
+        })
+    }
+
+    fn validate_links_origin_with(
+        &self,
+        resolve: &dyn Fn(&str, u16) -> Option<Vec<std::net::IpAddr>>,
+    ) -> Result<crate::links_fetch::LinksOrigin, &'static str> {
+        crate::links_fetch::LinksOrigin::validate(
+            &self.links_origin,
+            self.links_origin_allow_private,
+            Some(resolve),
+        )
+    }
+
     /// The issuer pin checks for the legacy single issuer. They run whenever
     /// `issuer_public_key` is set, whether or not `enabled` is on: the key is
     /// used by policy/v3 credential admission either way.
@@ -825,6 +907,16 @@ fn is_postgres_database(database: &str) -> bool {
     database.starts_with("postgres://") || database.starts_with("postgresql://")
 }
 
+fn is_supported_sql_store_database(database: &str) -> bool {
+    let scheme = database
+        .split_once(':')
+        .map_or(database, |(scheme, _)| scheme);
+    matches!(
+        scheme.to_ascii_lowercase().as_str(),
+        "postgres" | "postgresql" | "sqlite"
+    )
+}
+
 fn database_has_query(database: &str, expected_key: &str, expected_value: &str) -> bool {
     let Some((_, query)) = database.split_once('?') else {
         return false;
@@ -1138,6 +1230,21 @@ pub struct SqlStoreConfig {
     pub spaces: Vec<String>,
     #[serde(default)]
     pub retention: SqlStoreRetentionConfig,
+    /// Seconds to keep draining pending uploads at shutdown.
+    #[serde(default = "default_sql_store_drain_secs")]
+    pub drain_secs: u64,
+    /// Maximum number of concurrent PostgreSQL operations the uploader may run (1 to 4).
+    #[serde(default = "default_sql_store_pg_concurrency")]
+    pub pg_concurrency: u32,
+    /// Minimum time between snapshots of one database.
+    #[serde(default = "default_sql_store_snapshot_min_interval_secs")]
+    pub snapshot_min_interval_secs: u64,
+    /// Bytes the uploader may upload for one database per UTC day. Captures over the budget are shed, not queued.
+    #[serde(default = "default_sql_store_daily_upload_byte_budget")]
+    pub daily_upload_byte_budget: ByteUnit,
+    /// Disk bytes the local upload spool may hold. Captures are shed before the spool would exceed this.
+    #[serde(default = "default_sql_store_spool_cap")]
+    pub spool_cap: ByteUnit,
 }
 
 /// History window per tier id (`free`, `paid`, ...). Absent keeps everything.
@@ -1169,6 +1276,26 @@ fn default_sql_store_orphan_after_secs() -> u64 {
     24 * 60 * 60
 }
 
+fn default_sql_store_drain_secs() -> u64 {
+    8
+}
+
+fn default_sql_store_pg_concurrency() -> u32 {
+    2
+}
+
+fn default_sql_store_snapshot_min_interval_secs() -> u64 {
+    15 * 60
+}
+
+fn default_sql_store_daily_upload_byte_budget() -> ByteUnit {
+    ByteUnit::Gibibyte(2)
+}
+
+fn default_sql_store_spool_cap() -> ByteUnit {
+    ByteUnit::Gibibyte(1)
+}
+
 impl Default for SqlStoreConfig {
     fn default() -> Self {
         Self {
@@ -1181,6 +1308,11 @@ impl Default for SqlStoreConfig {
             enforce_backlog_cap: false,
             spaces: Vec::new(),
             retention: SqlStoreRetentionConfig::default(),
+            drain_secs: default_sql_store_drain_secs(),
+            pg_concurrency: default_sql_store_pg_concurrency(),
+            snapshot_min_interval_secs: default_sql_store_snapshot_min_interval_secs(),
+            daily_upload_byte_budget: default_sql_store_daily_upload_byte_budget(),
+            spool_cap: default_sql_store_spool_cap(),
         }
     }
 }
@@ -1207,7 +1339,42 @@ impl SqlStoreConfig {
         if self.spaces.iter().any(|space| space.trim().is_empty()) {
             return Err("sql_store.spaces must not contain an empty space ID");
         }
+        if self.drain_secs < 1 {
+            return Err("sql_store.drain_secs must be at least 1");
+        }
+        if !(1..=4).contains(&self.pg_concurrency) {
+            return Err("sql_store.pg_concurrency must be between 1 and 4");
+        }
+        if self.snapshot_min_interval_secs < 1 {
+            return Err("sql_store.snapshot_min_interval_secs must be at least 1");
+        }
+        if self.daily_upload_byte_budget.as_u64() == 0 {
+            return Err("sql_store.daily_upload_byte_budget must be greater than 0");
+        }
+        if self.spool_cap < self.upload_bytes {
+            return Err("sql_store.spool_cap must be at least sql_store.upload_bytes");
+        }
         Ok(())
+    }
+
+    /// Checks that need the database backend and the space list. Runs only
+    /// when `enabled`. An enabled store is refused after these checks, because
+    /// this build has no uploader.
+    pub fn validate_for_database(&self, database: &str) -> Result<(), &'static str> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if !is_supported_sql_store_database(database) {
+            return Err("sql_store supports PostgreSQL and SQLite control databases");
+        }
+        if self
+            .spaces
+            .iter()
+            .any(|space| !matches!(space.parse::<tinycloud_auth::resource::SpaceId>(), Ok(id) if id.to_string() == *space))
+        {
+            return Err("sql_store.spaces must contain only canonical space IDs");
+        }
+        Err("sql_store is not available in this build")
     }
 
     pub fn upload_policy(&self) -> tinycloud_core::sql::store::UploadPolicy {
@@ -2016,6 +2183,14 @@ mod tests {
         assert!(config.delegated_caveats_enforced);
     }
 
+    /// A space ID in the canonical form that `validate_for_database` accepts.
+    fn canonical_fixture() -> String {
+        format!("tinycloud:pkh:eip155:1:0x{}:default", "ab".repeat(20))
+            .parse::<tinycloud_auth::resource::SpaceId>()
+            .unwrap()
+            .to_string()
+    }
+
     #[test]
     fn sql_store_parses_from_toml_and_fills_defaults() {
         let config: SqlStoreConfig = toml::from_str(
@@ -2084,12 +2259,130 @@ mod tests {
                 ..config.clone()
             };
             assert!(disabled.validate().is_ok());
-            assert!(crate::resolve_runtime_config(&Config {
-                sql_store: config,
+            let refused = crate::resolve_runtime_config(&Config {
+                sql_store: config.clone(),
                 ..Config::default()
             })
-            .is_err());
+            .unwrap_err();
+            assert_eq!(refused.to_string(), config.validate().unwrap_err());
         }
+    }
+
+    #[test]
+    fn sql_store_new_settings_parse_and_are_bounded() {
+        let config: SqlStoreConfig = toml::from_str(
+            r#"
+            enabled = true
+            drain_secs = 3
+            pg_concurrency = 4
+            snapshot_min_interval_secs = 600
+            daily_upload_byte_budget = "3 GiB"
+            spool_cap = "2 GiB"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.drain_secs, 3);
+        assert_eq!(config.pg_concurrency, 4);
+        assert_eq!(config.snapshot_min_interval_secs, 600);
+        assert_eq!(config.daily_upload_byte_budget, ByteUnit::Gibibyte(3));
+        assert_eq!(config.spool_cap, ByteUnit::Gibibyte(2));
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn sql_store_new_setting_defaults_and_pg_concurrency_floor() {
+        let defaults = SqlStoreConfig::default();
+        assert_eq!(defaults.drain_secs, 8);
+        assert_eq!(defaults.pg_concurrency, 2);
+        assert_eq!(defaults.snapshot_min_interval_secs, 900);
+        assert_eq!(defaults.daily_upload_byte_budget, ByteUnit::Gibibyte(2));
+        assert_eq!(defaults.spool_cap, ByteUnit::Gibibyte(1));
+        let floor = SqlStoreConfig {
+            enabled: true,
+            pg_concurrency: 1,
+            ..SqlStoreConfig::default()
+        };
+        assert!(floor.validate().is_ok());
+    }
+
+    #[test]
+    fn sql_store_new_settings_are_bounded_when_enabled() {
+        let mutations: [fn(&mut SqlStoreConfig); 6] = [
+            |c| c.drain_secs = 0,
+            |c| c.pg_concurrency = 0,
+            |c| c.pg_concurrency = 5,
+            |c| c.snapshot_min_interval_secs = 0,
+            |c| c.daily_upload_byte_budget = ByteUnit::Byte(0),
+            |c| c.spool_cap = ByteUnit::Mebibyte(4),
+        ];
+        for mutate in mutations {
+            let mut config = SqlStoreConfig {
+                enabled: true,
+                ..SqlStoreConfig::default()
+            };
+            mutate(&mut config);
+            assert!(config.validate().is_err());
+        }
+        let disabled = SqlStoreConfig {
+            drain_secs: 0,
+            ..SqlStoreConfig::default()
+        };
+        assert!(disabled.validate().is_ok());
+    }
+
+    #[test]
+    fn sql_store_refuses_enable_mysql_and_non_canonical_spaces() {
+        let postgres = "postgres://localhost/tinycloud";
+        let enabled = SqlStoreConfig {
+            enabled: true,
+            spaces: vec![canonical_fixture()],
+            ..SqlStoreConfig::default()
+        };
+        for database in [
+            postgres,
+            "postgresql://localhost/tinycloud",
+            "sqlite:./data/caps.db",
+        ] {
+            assert_eq!(
+                enabled.validate_for_database(database),
+                Err("sql_store is not available in this build"),
+                "{database}"
+            );
+        }
+        for database in [
+            "mysql://localhost/tinycloud",
+            "MYSQL://localhost/tinycloud",
+            "mysql:tinycloud",
+        ] {
+            assert_eq!(
+                enabled.validate_for_database(database),
+                Err("sql_store supports PostgreSQL and SQLite control databases"),
+                "{database}"
+            );
+        }
+        let lowercase = format!("tinycloud:pkh:eip155:1:0x{}:default", "ab".repeat(20));
+        let chain_id = format!("tinycloud:pkh:eip155:01:0x{}:default", "ab".repeat(20));
+        for space in [
+            "tinycloud:pkh:eip155:1:0xab://default".to_owned(),
+            lowercase,
+            chain_id,
+        ] {
+            let bad_space = SqlStoreConfig {
+                enabled: true,
+                spaces: vec![space.clone()],
+                ..SqlStoreConfig::default()
+            };
+            assert_eq!(
+                bad_space.validate_for_database(postgres),
+                Err("sql_store.spaces must contain only canonical space IDs"),
+                "{space}"
+            );
+        }
+        let disabled = SqlStoreConfig {
+            spaces: vec!["not a space".to_owned()],
+            ..SqlStoreConfig::default()
+        };
+        assert!(disabled.validate_for_database(postgres).is_ok());
     }
 
     /// TC-1274: a running backfill needs a positive rate and progress
@@ -2791,5 +3084,121 @@ mod tests {
             config.validate_for_v2_database("postgresql://user:password@db.example/share"),
             Err("share email PostgreSQL requires sslmode=verify-full")
         );
+    }
+
+    #[test]
+    fn links_origin_defaults_to_the_public_api_and_reads_from_configuration() {
+        let defaults = ShareEmailConfig::default();
+        assert_eq!(defaults.links_origin, "https://api.tinycloud.xyz");
+        assert!(!defaults.links_origin_allow_private);
+        assert!(defaults.validate_links_origin().is_ok());
+
+        let empty: ShareEmailConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(empty.links_origin, "https://api.tinycloud.xyz");
+        assert!(!empty.links_origin_allow_private);
+        let set: ShareEmailConfig = serde_json::from_value(serde_json::json!({
+            "links_origin": "https://links.example.org:8443",
+            "links_origin_allow_private": true,
+        }))
+        .unwrap();
+        assert_eq!(set.links_origin, "https://links.example.org:8443");
+        assert!(set.links_origin_allow_private);
+    }
+
+    #[test]
+    fn links_origin_must_be_https_host_and_port_and_a_public_host() {
+        let with = |origin: &str, allow_private: bool| ShareEmailConfig {
+            links_origin: origin.into(),
+            links_origin_allow_private: allow_private,
+            ..ShareEmailConfig::default()
+        };
+        for refused in [
+            "",
+            "http://api.tinycloud.xyz",
+            "https://api.tinycloud.xyz/",
+            "https://api.tinycloud.xyz/v1",
+            "https://api.tinycloud.xyz?x=1",
+            "https://api.tinycloud.xyz#x",
+            "https://user@api.tinycloud.xyz",
+            "https://127.0.0.1",
+            "https://10.1.2.3:8443",
+            "https://169.254.169.254",
+            "https://100.64.0.1",
+            "https://[::1]",
+            "https://localhost",
+        ] {
+            assert!(
+                with(refused, false).validate_links_origin().is_err(),
+                "{refused}"
+            );
+        }
+        // The self-host flag admits a private host, never a malformed value.
+        assert!(with("https://10.1.2.3:8443", true)
+            .validate_links_origin()
+            .is_ok());
+        assert!(with("https://localhost", true)
+            .validate_links_origin()
+            .is_ok());
+        assert!(with("https://10.1.2.3/v1", true)
+            .validate_links_origin()
+            .is_err());
+        assert!(with("http://10.1.2.3", true)
+            .validate_links_origin()
+            .is_err());
+    }
+
+    #[test]
+    fn links_origin_with_a_trailing_dot_is_refused_at_load() {
+        for origin in [
+            "https://api.tinycloud.xyz.",
+            "https://links.example.org.:8443",
+        ] {
+            for allow_private in [false, true] {
+                let config = ShareEmailConfig {
+                    links_origin: origin.into(),
+                    links_origin_allow_private: allow_private,
+                    ..ShareEmailConfig::default()
+                };
+                assert!(config.validate_links_origin().is_err(), "{origin}");
+            }
+        }
+    }
+
+    #[test]
+    fn links_origin_host_that_resolves_to_a_private_address_is_refused() {
+        let config = |allow_private| ShareEmailConfig {
+            links_origin: "https://links.example.org".into(),
+            links_origin_allow_private: allow_private,
+            ..ShareEmailConfig::default()
+        };
+        let private = |_: &str, _: u16| Some(vec!["10.0.0.9".parse().unwrap()]);
+        let mixed = |_: &str, _: u16| {
+            Some(vec![
+                "93.184.216.34".parse().unwrap(),
+                "169.254.169.254".parse().unwrap(),
+            ])
+        };
+        let public = |_: &str, _: u16| Some(vec!["93.184.216.34".parse().unwrap()]);
+        assert!(config(false).validate_links_origin_with(&private).is_err());
+        assert!(config(false).validate_links_origin_with(&mixed).is_err());
+        assert!(config(false).validate_links_origin_with(&public).is_ok());
+        assert!(config(true).validate_links_origin_with(&private).is_ok());
+    }
+
+    #[test]
+    fn the_node_refuses_to_start_with_an_invalid_links_origin() {
+        let mut config = Config::default();
+        assert!(crate::resolve_runtime_config(&config).is_ok());
+        for invalid in [
+            "http://api.tinycloud.xyz",
+            "https://api.tinycloud.xyz/links",
+            "https://127.0.0.1",
+        ] {
+            config.share_email.links_origin = invalid.into();
+            assert!(crate::resolve_runtime_config(&config).is_err(), "{invalid}");
+        }
+        config.share_email.links_origin = "https://127.0.0.1".into();
+        config.share_email.links_origin_allow_private = true;
+        assert!(crate::resolve_runtime_config(&config).is_ok());
     }
 }

@@ -119,6 +119,7 @@ async fn tc1132_mixed_dns_exposes_only_vetted_addresses_to_reqwest() {
         host: destination.url().host_str().unwrap().to_owned(),
         denied,
         addresses: destination.addresses,
+        scope: destination.scope,
         policy,
     };
     let addresses: Vec<_> = resolver
