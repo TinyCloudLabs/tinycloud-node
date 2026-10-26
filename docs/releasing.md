@@ -96,6 +96,21 @@ serves without it, so its migration never builds it on a non-empty table and
 never fails the boot over it. It logs a typed warning and keeps serving; an
 index built later is picked up by the planner with no restart.
 
+### Verify out-of-band indexes after every node deploy (TC-2062)
+
+Because these indexes are performance-only, a missing one raises no error: the
+node boots, serves and logs one warning, and the affected queries stay slow. Run
+this read-only check after **every** node deploy, on the PlanetScale primary:
+
+```sql
+SELECT c.relname, i.indisvalid, i.indisready, i.indislive FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid WHERE c.relname IN ('idx_current_kv_space_deleted_key_c','idx_kv_write_space_value');
+```
+
+Expect **two rows, every flag `t`**. A missing row, or any `f`, is fixed with
+the statement in that index's own section below (build, or drop and redo for an
+invalid one), **before the next deploy**. Add a row to the `IN (...)` list
+whenever a section here introduces another operator-built index.
+
 ### `idx_current_kv_space_deleted_key_c` (TC-1274, `m20261020_000000_current_kv_key_c_index`)
 
 Ships in the release after 1.21.2. It lets the KV list range select seek on
