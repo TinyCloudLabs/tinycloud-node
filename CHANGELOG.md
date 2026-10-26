@@ -4,6 +4,7 @@
 
 ### Changes
 - The share delivery authorization route logs the check that refused a request (a fixed reason name only). Details: TC-2047
+- A decrypt request makes one fewer read of its encryption network row: the sealed key is read together with the state check instead of in a separate lookup. Details: TC-2062
 
 ## [1.25.4] - 2026-10-26
 
