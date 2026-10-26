@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Changes
+- Every 5xx response is logged with its route template and status. Details: TC-2073
 - The share delivery authorization route logs the check that refused a request (a fixed reason name only). Details: TC-2047
 
 ## [1.25.4] - 2026-10-26
