@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+## [1.25.1] - 2026-10-26
+
+- No code changes since 1.25.0. This release lets a production deploy turn on named keys with the deploy input `named_keys_v1` (the deployment guard needs a newer revision than the one running).
+
 ## [1.25.0] - 2026-10-26
 
 - Encryption: `POST /encryption/networks/<network>/key-actions/delete` (served when `named_keys_v1` is on) deletes one key under `apps/` (`keyPath` without a trailing `/`) or every key under `apps/<app id>/` (`keyPath` with one). The network owner signs the request: a UCAN invocation (with `nbf`) for a `did:key` owner, a SIWE CACAO for a `did:pkh` owner, valid for at most 300 seconds and usable once. The response is `{ keyPath, state, deleted, alreadyDeleted, count }`; a deterministic key answers 409 `key_not_deletable`. A deleted key keeps its path with state `deleted` and no seed. Details: TC-1777.
