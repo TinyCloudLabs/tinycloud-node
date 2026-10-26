@@ -96,6 +96,14 @@ serves without it, so its migration never builds it on a non-empty table and
 never fails the boot over it. It logs a typed warning and keeps serving; an
 index built later is picked up by the planner with no restart.
 
+### Gate: out-of-band steps before a node release (TC-2062)
+
+Before a node release whose `docs/releasing.md` lists an out-of-band step (an
+operator-built index, or a database plan or size change), the release record
+must show that step's validity query output (the `SELECT` in its section), or
+the release waits. An out-of-band prerequisite listed only in a ticket or a
+note is not a gate.
+
 ### Verify out-of-band indexes after every node deploy (TC-2062)
 
 Because these indexes are performance-only, a missing one raises no error: the
