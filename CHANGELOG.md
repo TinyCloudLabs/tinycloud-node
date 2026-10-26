@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Changes
+- The share delivery authorization route logs the check that refused a request (a fixed reason name only). Details: TC-2047
+
 ## [1.25.4] - 2026-10-26
 
 ### Changes

@@ -1413,16 +1413,39 @@ pub async fn authorize_delivery(
         })
 }
 
+/// Log the check that refused a delivery authorization and return the answer
+/// unchanged. The line holds a fixed reason name and the status and nothing
+/// else: never a link, key, address, DID, identifier or error text.
+fn refuse(reason: &'static str, status: Status, body: &str) -> (Status, String) {
+    tracing::warn!(
+        error_class = "delivery_refused",
+        reason,
+        status = status.code,
+        "delivery authorization refused"
+    );
+    (status, body.to_owned())
+}
+
+/// As [`refuse`] for a storage failure, whose answer carries the error's own
+/// text (unchanged) while the log line does not.
+fn refuse_db(reason: &'static str, error: impl std::fmt::Display) -> (Status, String) {
+    let (status, body) = db_error(error);
+    refuse(reason, status, &body)
+}
+
 async fn authorize_delivery_inner(
     request: DeliveryBody,
     runtime: &PolicyV3Runtime,
     invocation: AuthHeaderGetter<InvocationInfo>,
     retry_after: &mut Option<u64>,
 ) -> Result<Json<Value>, (Status, String)> {
-    let delivery = runtime
-        .delivery
-        .as_ref()
-        .ok_or((Status::ServiceUnavailable, "delivery-unavailable".into()))?;
+    let delivery = runtime.delivery.as_ref().ok_or_else(|| {
+        refuse(
+            "runtime_delivery_none",
+            Status::ServiceUnavailable,
+            "delivery-unavailable",
+        )
+    })?;
     invocation_model::verify_and_authorize(
         &runtime.conn,
         &invocation.0 .0,
@@ -1430,41 +1453,46 @@ async fn authorize_delivery_inner(
     )
     .await
     .map_err(|_| {
-        (
+        refuse(
+            "invocation_unauthorized",
             Status::Unauthorized,
-            "delivery-authorization-invalid".into(),
+            "delivery-authorization-invalid",
         )
     })?;
     let request = request.0;
-    let invalid = || {
-        (
-            Status::BadRequest,
-            "delivery-authorization-invalid".to_owned(),
-        )
-    };
-    if delivery_request_digest(&request).as_deref() != Ok(request.request_body_digest.as_str())
-        || decode_config(&request.jti, URL_SAFE_NO_PAD)
-            .ok()
-            .is_none_or(|value| value.len() != 16)
+    let invalid =
+        |reason: &'static str| refuse(reason, Status::BadRequest, "delivery-authorization-invalid");
+    if delivery_request_digest(&request).as_deref() != Ok(request.request_body_digest.as_str()) {
+        return Err(invalid("request_digest_mismatch"));
+    }
+    if decode_config(&request.jti, URL_SAFE_NO_PAD)
+        .ok()
+        .is_none_or(|value| value.len() != 16)
     {
-        return Err(invalid());
+        return Err(invalid("jti_length"));
     }
     // Only the short `v=4` form on the share path, at the configured share
     // origin. The link is never logged or echoed from here on.
-    let link = ShortLink::parse(&request.share_url, &delivery.return_origin).ok_or_else(invalid)?;
+    let link = ShortLink::parse(&request.share_url, &delivery.return_origin)
+        .ok_or_else(|| invalid("share_url_not_short_form"))?;
     let sender_key_did = invocation.0 .0.invoker.as_str();
     let replay = share_invitation_authorization_jti::Entity::find_by_id(request.jti.clone())
         .one(&runtime.conn)
         .await
-        .map_err(db_error)?;
+        .map_err(|error| refuse_db("db_error_jti_lookup", error))?;
     if replay.as_ref().is_some_and(|existing| {
         !delivery_replay_request_matches(existing, &request, sender_key_did)
     }) {
-        return Err((Status::Conflict, "delivery-authorization-replayed".into()));
+        return Err(refuse(
+            "replay_request_mismatch",
+            Status::Conflict,
+            "delivery-authorization-replayed",
+        ));
     }
     // The request's own `expiresAt` is checked before anything costs a token
     // or a fetch: a malformed, expired or too distant value is refused here.
-    delivery_request_expiry(&request.expires_at, OffsetDateTime::now_utc()).ok_or_else(invalid)?;
+    delivery_request_expiry(&request.expires_at, OffsetDateTime::now_utc())
+        .ok_or_else(|| invalid("expiry_invalid"))?;
     // The links API limits reads per client address and the node reads from
     // one: a request that reaches the fetch first passes the per-invoker and
     // node-wide limits. Nothing was fetched, opened or stored for a request
@@ -1474,6 +1502,8 @@ async fn authorize_delivery_inner(
         .check(sender_key_did, std::time::Instant::now())
     {
         *retry_after = Some(refused.retry_after_secs);
+        // Reported by the limiter's own aggregated line (one per scope per
+        // minute); a line per refused request would be an unbounded flood.
         return Err((Status::TooManyRequests, "delivery-rate-limited".to_owned()));
     }
     // One read of the record, no retries, no other source. The API's 404 and
@@ -1484,40 +1514,54 @@ async fn authorize_delivery_inner(
         .fetch(link.id())
         .await
         .map_err(|error| match error {
-            LinkFetchError::NotFound => (Status::NotFound, "delivery-link-unavailable".to_owned()),
-            LinkFetchError::Unavailable => (
-                Status::ServiceUnavailable,
-                "delivery-links-unavailable".to_owned(),
+            LinkFetchError::NotFound => refuse(
+                "links_not_found",
+                Status::NotFound,
+                "delivery-link-unavailable",
             ),
-            LinkFetchError::RecordHeaderInvalid => invalid(),
+            LinkFetchError::Unavailable => refuse(
+                "links_unavailable",
+                Status::ServiceUnavailable,
+                "delivery-links-unavailable",
+            ),
+            LinkFetchError::RecordHeaderInvalid => invalid("links_record_header_invalid"),
         })?;
     let now = OffsetDateTime::now_utc();
-    let opened = open_link_record(&link, &fetched, now).map_err(|_| invalid())?;
+    let opened =
+        open_link_record(&link, &fetched, now).map_err(|_| invalid("record_open_failed"))?;
     // The envelope is the plaintext of the record, in its canonical form.
-    let envelope_value: Value = serde_json::from_slice(&opened.plaintext).map_err(|_| invalid())?;
+    let envelope_value: Value =
+        serde_json::from_slice(&opened.plaintext).map_err(|_| invalid("envelope_not_json"))?;
     if canonical_json_value(&envelope_value) != opened.plaintext {
-        return Err(invalid());
+        return Err(invalid("envelope_not_canonical"));
     }
     let policy_cid = envelope_value
         .get("policyCid")
         .and_then(Value::as_str)
-        .ok_or_else(invalid)?;
+        .ok_or_else(|| invalid("policy_cid_missing"))?;
     let registration = policy_v3_registration::Entity::find_by_id(policy_cid.to_owned())
         .one(&runtime.conn)
         .await
-        .map_err(db_error)?
-        .ok_or((Status::NotFound, "delivery-authorization-invalid".into()))?;
+        .map_err(|error| refuse_db("db_error_registration", error))?
+        .ok_or_else(|| {
+            refuse(
+                "registration_not_found",
+                Status::NotFound,
+                "delivery-authorization-invalid",
+            )
+        })?;
     // The link cannot outlive the share, and one key issued the record, signed
     // the envelope and owns the registration.
     let share_expires = parse_time(&registration.expires_at).map_err(|_| {
-        (
+        refuse(
+            "registration_expiry_unparsable",
             Status::Forbidden,
-            "delivery-authorization-invalid".to_owned(),
+            "delivery-authorization-invalid",
         )
     })?;
     opened
         .within_share_expiry(share_expires)
-        .map_err(|_| invalid())?;
+        .map_err(|_| invalid("share_expiry"))?;
     opened
         .bind_issuer(
             envelope_value
@@ -1525,17 +1569,20 @@ async fn authorize_delivery_inner(
                 .and_then(Value::as_str),
             &registration.owner_did,
         )
-        .map_err(|_| invalid())?;
+        .map_err(|_| invalid("issuer_binding"))?;
+    let forbidden =
+        |reason: &'static str| refuse(reason, Status::Forbidden, "delivery-authorization-invalid");
     if !v3_registration_is_live(&registration, now) {
-        return Err((Status::Forbidden, "delivery-authorization-invalid".into()));
+        return Err(forbidden("registration_not_live"));
     }
     let (envelope, _, actions) =
         v3_envelope_delivery_projection(&envelope_value, &registration, delivery, &request)
-            .map_err(|_| (Status::Forbidden, "delivery-authorization-invalid".into()))?;
+            .map_err(|_| forbidden("envelope_projection_failed"))?;
     if !normal_invocation_allows_v3_delivery(&invocation.0 .0, envelope) {
-        return Err((
+        return Err(refuse(
+            "invocation_not_allowed",
             Status::Unauthorized,
-            "delivery-authorization-invalid".into(),
+            "delivery-authorization-invalid",
         ));
     }
     for cid in [
@@ -1545,26 +1592,26 @@ async fn authorize_delivery_inner(
         let root = policy_v3_root::Entity::find_by_id(cid.to_owned())
             .one(&runtime.conn)
             .await
-            .map_err(db_error)?
-            .ok_or((Status::Forbidden, "delivery-authorization-invalid".into()))?;
+            .map_err(|error| refuse_db("db_error_root", error))?
+            .ok_or_else(|| forbidden("root_missing"))?;
         validate_root_liveness(&runtime.conn, &root, cid, &runtime.node_did, now, true)
             .await
-            .map_err(|_| (Status::Forbidden, "delivery-authorization-invalid".into()))?;
+            .map_err(|_| forbidden("root_not_live"))?;
     }
     let resource = envelope
         .get("contentSource")
         .and_then(Value::as_object)
         .and_then(|value| value.get("kvResource"))
         .and_then(Value::as_str)
-        .ok_or((Status::Forbidden, "delivery-authorization-invalid".into()))?;
+        .ok_or_else(|| forbidden("content_resource_missing"))?;
     let policy = envelope
         .get("policy")
         .and_then(Value::as_object)
-        .ok_or((Status::Forbidden, "delivery-authorization-invalid".into()))?;
+        .ok_or_else(|| forbidden("policy_missing"))?;
     let share_expires_at = envelope
         .get("expiry")
         .and_then(Value::as_str)
-        .ok_or((Status::Forbidden, "delivery-authorization-invalid".into()))?;
+        .ok_or_else(|| forbidden("envelope_expiry_missing"))?;
     let credential_type = policy
         .get("credentialRequirement")
         .and_then(Value::as_object)
@@ -1572,12 +1619,12 @@ async fn authorize_delivery_inner(
         .and_then(Value::as_object)
         .and_then(|credential_type| credential_type.get("id"))
         .and_then(Value::as_str)
-        .ok_or((Status::Forbidden, "delivery-authorization-invalid".into()))?;
+        .ok_or_else(|| forbidden("credential_type_missing"))?;
     if !v3_delivery_terms_allowed(envelope, &actions, sender_key_did, &registration.owner_did) {
-        return Err((Status::Forbidden, "delivery-authorization-invalid".into()));
+        return Err(forbidden("delivery_terms_not_allowed"));
     }
     if share_expires_at != registration.expires_at {
-        return Err((Status::Forbidden, "delivery-authorization-invalid".into()));
+        return Err(forbidden("envelope_expiry_mismatch"));
     }
     // Digests and ids only: no link, no key, no recipient.
     let binding_json = serde_json::json!({
@@ -1598,6 +1645,10 @@ async fn authorize_delivery_inner(
         sender_key_did,
         audience: &delivery.invitation_origin,
     };
+    let replayed =
+        |reason: &'static str| refuse(reason, Status::Conflict, "delivery-authorization-replayed");
+    let signing_failed =
+        |(status, body): (Status, String)| refuse("receipt_signing_failed", status, &body);
     let _writer = match &runtime.sqlite_writer_lock {
         Some(lock) => Some(lock.lock().await),
         None => None,
@@ -1607,7 +1658,7 @@ async fn authorize_delivery_inner(
         None => share_invitation_authorization_jti::Entity::find_by_id(request.jti.clone())
             .one(&runtime.conn)
             .await
-            .map_err(db_error)?,
+            .map_err(|error| refuse_db("db_error_jti_relookup", error))?,
     };
     if let Some(existing) = replay {
         if !delivery_replay_request_matches(&existing, &request, sender_key_did)
@@ -1617,23 +1668,25 @@ async fn authorize_delivery_inner(
             || !parse_time(&existing.issued_at)
                 .is_ok_and(|issued_at| format_time(issued_at) == existing.issued_at)
         {
-            return Err((Status::Conflict, "delivery-authorization-replayed".into()));
+            return Err(replayed("replay_binding_mismatch"));
         }
         let receipt = build_delivery_authorization_receipt(
             &source,
             &existing.issued_at,
             &signer,
             &runtime.node_did,
-        )?;
+        )
+        .map_err(signing_failed)?;
         if receipt.authorization_digest != existing.authorization_digest {
-            return Err((Status::Conflict, "delivery-authorization-replayed".into()));
+            return Err(replayed("replay_digest_mismatch"));
         }
         return Ok(Json(receipt.value));
     }
 
     let issued_at = format_time(now);
     let receipt =
-        build_delivery_authorization_receipt(&source, &issued_at, &signer, &runtime.node_did)?;
+        build_delivery_authorization_receipt(&source, &issued_at, &signer, &runtime.node_did)
+            .map_err(signing_failed)?;
     let insert = share_invitation_authorization_jti::ActiveModel {
         jti: Set(request.jti.clone()),
         authorization_digest: Set(receipt.authorization_digest.clone()),
@@ -1654,23 +1707,30 @@ async fn authorize_delivery_inner(
     let existing = share_invitation_authorization_jti::Entity::find_by_id(request.jti.clone())
         .one(&runtime.conn)
         .await
-        .map_err(db_error)?
-        .ok_or((Status::InternalServerError, "delivery-unavailable".into()))?;
+        .map_err(|error| refuse_db("db_error_jti_recovery", error))?
+        .ok_or_else(|| {
+            refuse(
+                "jti_insert_unrecovered",
+                Status::InternalServerError,
+                "delivery-unavailable",
+            )
+        })?;
     if !delivery_replay_request_matches(&existing, &request, sender_key_did)
         || existing.binding_json != binding_json
         || existing.expires_at != request.expires_at
         || existing.consumed_at.is_none()
     {
-        return Err((Status::Conflict, "delivery-authorization-replayed".into()));
+        return Err(replayed("replay_recovered_binding_mismatch"));
     }
     let recovered = build_delivery_authorization_receipt(
         &source,
         &existing.issued_at,
         &signer,
         &runtime.node_did,
-    )?;
+    )
+    .map_err(signing_failed)?;
     if recovered.authorization_digest != existing.authorization_digest {
-        return Err((Status::Conflict, "delivery-authorization-replayed".into()));
+        return Err(replayed("replay_recovered_digest_mismatch"));
     }
     Ok(Json(recovered.value))
 }
@@ -8591,6 +8651,7 @@ mod tests {
         Unauthorized,
     }
 
+    #[derive(Clone, Copy)]
     struct MatrixContext<'a> {
         client: &'a rocket::local::asynchronous::Client,
         resource: &'a ResourceId,
@@ -9206,6 +9267,134 @@ mod tests {
             assert!(!text.contains(link.as_str()), "{what} holds the link");
         }
         assert!(!log.is_empty(), "the capture saw log output");
+        Ok(())
+    }
+
+    /// A refused delivery authorization logs one `delivery_refused` line that
+    /// names the check and holds no link, address, identifier or DID; the
+    /// answer is the same as without the line.
+    async fn delivery_refusal_reasons(ctx: MatrixContext<'_>) -> anyhow::Result<()> {
+        use crate::delivery_link::test_support as ts;
+        ctx.client
+            .rocket()
+            .state::<PolicyV3Runtime>()
+            .unwrap()
+            .fetch_limiter()
+            .set_limits(1000, 1000, 1000);
+        const INVALID: &str = "delivery-authorization-invalid";
+        let mut bodies = vec![];
+        let valid_url = ctx.success_request.share_url.clone();
+        let jti = |n: u8| encode_config([100 + n; 16], URL_SAFE_NO_PAD);
+        let host = ts::ORIGIN.trim_start_matches("https://");
+        let key = ts::b64(&ts::TEST_KEY);
+        let forbidden_in_line = |extra_jti: &str| {
+            vec![
+                host.to_owned(),
+                "/s/".to_owned(),
+                ts::LINK_ID.to_owned(),
+                key.clone(),
+                extra_jti.to_owned(),
+                "alice@example.test".to_owned(),
+                "did:".to_owned(),
+            ]
+        };
+        let refusal_line = |before: usize, reason: &str, status: Status, jti: &str| {
+            let log = String::from_utf8(ctx.log.0.lock()[before..].to_vec()).unwrap();
+            let lines: Vec<&str> = log
+                .lines()
+                .filter(|line| line.contains("delivery_refused"))
+                .collect();
+            assert_eq!(lines.len(), 1, "{reason}: exactly one line in {log}");
+            let line = lines[0];
+            assert!(
+                line.contains(&format!("reason={reason:?}")),
+                "{reason}: {line}"
+            );
+            assert!(
+                line.contains(&format!("status={}", status.code)),
+                "{reason}: {line}"
+            );
+            for secret in forbidden_in_line(jti) {
+                assert!(!line.contains(&secret), "{reason}: line holds {secret}");
+            }
+        };
+        let mark = || ctx.log.0.lock().len();
+
+        // The request body's digest does not match its fields.
+        let mut request = DeliveryAuthorizationRequest {
+            share_url: valid_url.clone(),
+            recipient_email: "alice@example.test".into(),
+            document_name: "document.txt".into(),
+            jti: jti(140),
+            expires_at: ts::millis(OffsetDateTime::now_utc() + Duration::minutes(4)),
+            request_body_digest: String::new(),
+        };
+        request.request_body_digest = delivery_request_digest(&request)
+            .map_err(|_| anyhow::anyhow!("refusal request digest"))?;
+        request.request_body_digest.replace_range(..1, "_");
+        let before = mark();
+        let (status, body) = ctx
+            .post("tc2047-digest", serde_json::to_string(&request)?)
+            .await?;
+        assert_eq!((status, body.as_str()), (Status::BadRequest, INVALID));
+        refusal_line(before, "request_digest_mismatch", status, &request.jti);
+
+        // A link that is not the short form.
+        let before = mark();
+        ctx.deliver(
+            141,
+            "retired link form",
+            valid_url.replace("#v=4", "#v=3"),
+            (Status::BadRequest, INVALID),
+            &mut bodies,
+        )
+        .await?;
+        refusal_line(
+            before,
+            "share_url_not_short_form",
+            Status::BadRequest,
+            &jti(141),
+        );
+
+        // An `expiresAt` already past.
+        let before = mark();
+        ctx.deliver_expiring(
+            142,
+            "expired request",
+            valid_url.clone(),
+            ts::millis(OffsetDateTime::now_utc() - Duration::minutes(1)),
+            (Status::BadRequest, INVALID),
+            &mut bodies,
+        )
+        .await?;
+        refusal_line(before, "expiry_invalid", Status::BadRequest, &jti(142));
+
+        // A record whose envelope names a policy nobody registered.
+        let mut unregistered = ctx.envelope.clone();
+        unregistered["policyCid"] =
+            Value::String("bafkreibbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into());
+        let built = ts::build(
+            &canonical_json_value(&unregistered),
+            ctx.owner_key,
+            ctx.link_expires,
+        );
+        let link_id = format!("{}55", "2".repeat(24));
+        ctx.links.put(&link_id, &built);
+        let before = mark();
+        ctx.deliver(
+            143,
+            "unknown registration",
+            built.href.replace(ts::LINK_ID, &link_id),
+            (Status::NotFound, INVALID),
+            &mut bodies,
+        )
+        .await?;
+        refusal_line(
+            before,
+            "registration_not_found",
+            Status::NotFound,
+            &jti(143),
+        );
         Ok(())
     }
 
@@ -10287,7 +10476,7 @@ mod tests {
         // The node's error table, and the rule that neither the link nor its
         // key reaches a log line, a response body or a stored row. It runs as
         // a boxed future of its own so this test's stack frame stays small.
-        Box::pin(delivery_error_matrix(MatrixContext {
+        let matrix_context = MatrixContext {
             client: &client,
             resource: &content_resource,
             sender_cid: &sender_cid,
@@ -10306,8 +10495,10 @@ mod tests {
                 jwk: &second_holder_jwk,
                 did: &second_holder_did,
             },
-        }))
-        .await?;
+        };
+        Box::pin(delivery_error_matrix(matrix_context)).await?;
+        // Each refusal logs the check that refused it, as a fixed reason.
+        Box::pin(delivery_refusal_reasons(matrix_context)).await?;
 
         if std::env::var("TC498_EMIT_DELIVERY_RECEIPT").as_deref() == Ok("1") {
             let request = delivery_receipt["request"].clone();
