@@ -1161,6 +1161,146 @@ async fn session_delegator_revokes_its_sub_delegation_with_grantless_proof() -> 
     Ok(())
 }
 
+/// Owner -> session -> recipient: `(session_grant, sub_delegation)`, the
+/// shared shape of the refusal tests below.
+async fn session_sub_delegation(
+    fixture: &KvSyncFixture,
+    session_did: &str,
+    recipient_did: &str,
+    session_grant_expiry: OffsetDateTime,
+) -> Result<(Hash, Hash)> {
+    let owner_did = fixture.space.did().to_string();
+    let session_grant = fixture
+        .grant(
+            "refusal-session-grant",
+            &owner_did,
+            session_did,
+            &[("notes/", "tinycloud.kv/get")],
+            None,
+            Some(session_grant_expiry),
+            &[],
+        )
+        .await?;
+    let sub_delegation = fixture
+        .grant(
+            "refusal-sub-delegation",
+            session_did,
+            recipient_did,
+            &[("notes/", "tinycloud.kv/get")],
+            None,
+            Some(whole_seconds_from_now(1800)),
+            &[session_grant],
+        )
+        .await?;
+    Ok((session_grant, sub_delegation))
+}
+
+/// The recipient of D presents D itself as its proof. D grants no revoke, so
+/// the proof is Ungranted and only the recipient's own party authority is
+/// left, which excludes revoking what it received.
+#[tokio::test]
+async fn recipient_presenting_the_target_as_its_proof_cannot_revoke_it() -> Result<()> {
+    let fixture = scoped_fixture().await?;
+    let (_session, _session_vm, session_did) = registered_key(&fixture).await?;
+    let (recipient, recipient_vm, recipient_did) = registered_key(&fixture).await?;
+    let (_, sub_delegation) = session_sub_delegation(
+        &fixture,
+        &session_did,
+        &recipient_did,
+        whole_seconds_from_now(3600),
+    )
+    .await?;
+    let header = fixture.signed_scope_token(
+        &recipient,
+        &recipient_vm,
+        &recipient_did,
+        &format!("urn:cid:{}", sub_delegation.to_cid(0x55)),
+        "tinycloud.delegation/revoke",
+        whole_seconds_from_now(3600),
+        &[sub_delegation.to_cid(0x55)],
+    )?;
+    fixture.assert_scope_denied(sub_delegation, header).await
+}
+
+/// The delegator's own session proof has expired, so the proof is Denied, not
+/// Ungranted: the with-proof form is refused. The proofless form, which needs
+/// no proof, still works for the same signer.
+#[tokio::test]
+async fn delegator_presenting_an_expired_proof_cannot_revoke_with_it() -> Result<()> {
+    let fixture = scoped_fixture().await?;
+    let (session, session_vm, session_did) = registered_key(&fixture).await?;
+    let (_recipient, _recipient_vm, recipient_did) = registered_key(&fixture).await?;
+    let (session_grant, sub_delegation) = session_sub_delegation(
+        &fixture,
+        &session_did,
+        &recipient_did,
+        whole_seconds_from_now(-60),
+    )
+    .await?;
+    let with_proof = fixture.signed_scope_token(
+        &session,
+        &session_vm,
+        &session_did,
+        &format!("urn:cid:{}", sub_delegation.to_cid(0x55)),
+        "tinycloud.delegation/revoke",
+        whole_seconds_from_now(3600),
+        &[session_grant.to_cid(0x55)],
+    )?;
+    fixture
+        .assert_scope_denied(sub_delegation, with_proof)
+        .await?;
+
+    let proofless = fixture.signed_scope_token(
+        &session,
+        &session_vm,
+        &session_did,
+        &format!("urn:cid:{}", sub_delegation.to_cid(0x55)),
+        "tinycloud.delegation/revoke",
+        whole_seconds_from_now(3600),
+        &[],
+    )?;
+    assert_revoked_ok(&fixture, sub_delegation, proofless).await
+}
+
+/// The space owner presents a valid proof that grants no revoke for a
+/// delegation it did not issue. Ungranted carries only party authority, and
+/// the owner is not the delegator, so the revocation is refused.
+#[tokio::test]
+async fn owner_with_a_grantless_proof_cannot_revoke_a_delegation_it_did_not_issue() -> Result<()> {
+    let fixture = scoped_fixture().await?;
+    let (_session, _session_vm, session_did) = registered_key(&fixture).await?;
+    let (_recipient, _recipient_vm, recipient_did) = registered_key(&fixture).await?;
+    let (_, sub_delegation) = session_sub_delegation(
+        &fixture,
+        &session_did,
+        &recipient_did,
+        whole_seconds_from_now(3600),
+    )
+    .await?;
+    let owner_did = fixture.space.did().to_string();
+    let owner_proof = fixture
+        .grant(
+            "refusal-owner-grantless-proof",
+            &session_did,
+            &owner_did,
+            &[("notes/", "tinycloud.kv/get")],
+            None,
+            Some(whole_seconds_from_now(3600)),
+            &[],
+        )
+        .await?;
+    let header = fixture.signed_scope_token(
+        &fixture.owner,
+        &fixture.owner_vm,
+        &owner_did,
+        &format!("urn:cid:{}", sub_delegation.to_cid(0x55)),
+        "tinycloud.delegation/revoke",
+        whole_seconds_from_now(3600),
+        &[owner_proof.to_cid(0x55)],
+    )?;
+    fixture.assert_scope_denied(sub_delegation, header).await
+}
+
 /// POST `/delegate` and return the status, body and receipt CID.
 async fn activate(fixture: &KvSyncFixture, header: String) -> (Status, String, Option<Hash>) {
     let response = fixture
