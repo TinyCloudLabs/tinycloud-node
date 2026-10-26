@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+## [1.25.7] - 2026-10-26
+
+### Changes
+- Version bump only, no code changes. Details: TC-2062
+
 ## [1.25.6] - 2026-10-26
 
 ### Changes
