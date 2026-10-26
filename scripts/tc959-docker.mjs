@@ -89,6 +89,13 @@ export function assertCapture(events, fields) {
         assert.equal(typeof event.write_may_have_applied, 'boolean');
         allowed = [...base, 'event_code', 'status', 'code', 'service', 'route', 'elapsed_ms', 'failure_kind', 'write_may_have_applied'];
         if ('db_hash' in event) { assert.equal(typeof event.db_hash, 'string'); assert.match(event.db_hash, new RegExp(fields?.db_hash?.regex ?? '^[0-9a-f]{64}$')); allowed.push('db_hash'); }
+      } else if (event.event === 'node_warning' && event.event_code === 'chain_guard_slow_wait') {
+        // TC-2076: the individual slow chain-guard wait; no event_count, exactly kind, elapsed_ms, guards and suppressed, each held to its fields.json type and range.
+        assert.ok(fields?.kind?.values.includes(event.kind));
+        assert.ok(Number.isSafeInteger(event.elapsed_ms) && event.elapsed_ms >= 0);
+        assert.ok(Number.isSafeInteger(event.guards) && event.guards >= 0 && event.guards <= (fields?.guards?.max ?? 10000));
+        assert.ok(Number.isSafeInteger(event.suppressed) && event.suppressed >= 0 && event.suppressed <= (fields?.suppressed?.max ?? 100000));
+        allowed = [...base, 'event_code', 'kind', 'elapsed_ms', 'guards', 'suppressed'];
       } else if (event.event === 'node_warning' && event.event_code === 'errors_dropped') {
         // TC-1843: the shipper's dropped-count event; exactly class, dropped and window_s beyond the common fields, no event_count.
         assert.ok(fields?.class?.values.includes(event.class));

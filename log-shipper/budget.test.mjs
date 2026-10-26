@@ -82,7 +82,7 @@ test('diagnostic storm reserve covers every code at both severity levels', () =>
 });
 
 test('the 5xx diagnostic is an individual event: not an aggregated code, and its representative is worst-valid (TC-1840)', () => {
-  assert.deepEqual(INDIVIDUAL_EVENT_CODES, ['db_failure_5xx']);
+  assert.deepEqual(INDIVIDUAL_EVENT_CODES, ['db_failure_5xx', 'chain_guard_slow_wait']);
   assert.ok(nodeSchema.fields.event_code.values.includes('db_failure_5xx'));
   assert.equal(calculateBudget({ requestsPerMinute: 0 }).diagnosticEventsPerMinute, (nodeSchema.fields.event_code.values.length - INDIVIDUAL_EVENT_CODES.length - SHIPPER_EVENT_CODES.length) * 2);
   assert.notEqual(representativeEvents.diagnostic.event_code, 'db_failure_5xx');
@@ -103,7 +103,7 @@ test('the dropped-count event is emitted by the shipper: not an aggregated code,
   const row = representativeEvents.errorsDropped;
   assert.deepEqual(Object.keys(row).sort(), ['class', 'dropped', 'event', 'event_code', 'level', 'svc', 'ts', 'window_s']);
   assert.equal(row.event_code, 'errors_dropped');
-  assert.equal(row.class, 'ingress_request_5xx');
+  assert.equal(row.class, 'chain_guard_slow_wait');
   assert.ok(nodeSchema.fields.class.values.includes(row.class));
   assert.equal(row.dropped, nodeSchema.fields.dropped.max);
   assert.equal(row.window_s, 60);
@@ -126,7 +126,8 @@ test('capped classes: worst case is cap x worst-valid bytes x 43,200 minutes plu
     assert.equal(budget.cappedClasses.ingress_request_5xx.bytes30Days, CAPPED_CLASSES.ingress_request_5xx.capPerMinute * bytes('ingress') * 43200);
     assert.equal(budget.cappedClasses.node_request_4xx.bytes30Days, CAPPED_CLASSES.node_request_4xx.capPerMinute * bytes('node') * 43200);
     assert.equal(budget.cappedClasses.ingress_request_4xx.bytes30Days, CAPPED_CLASSES.ingress_request_4xx.capPerMinute * bytes('ingress') * 43200);
-    assert.equal(budget.droppedCountBytes30Days, 5 * bytes('errorsDropped') * 43200);
+    assert.equal(budget.cappedClasses.chain_guard_slow_wait.bytes30Days, CAPPED_CLASSES.chain_guard_slow_wait.capPerMinute * bytes('chainGuard') * 43200);
+    assert.equal(budget.droppedCountBytes30Days, 6 * bytes('errorsDropped') * 43200);
     assert.equal(budget.cappedReserveBytes30Days, budget.cappedEventBytes30Days + budget.droppedCountBytes30Days);
     assert.equal(budget.cappedEventBytes30Days, Object.values(budget.cappedClasses).reduce((sum, row) => sum + row.bytes30Days, 0));
     assert.equal(budget.cappedAllocationBytes, CAPPED_ALLOCATION_BYTES);
@@ -136,17 +137,33 @@ test('capped classes: worst case is cap x worst-valid bytes x 43,200 minutes plu
     assert.equal(budget.totalBytes30Days, budget.requestBytes30Days + budget.diagnosticReserveBytes30Days);
     assert.equal(budget.totalWithCappedBytes30Days, budget.totalBytes30Days + budget.cappedReserveBytes30Days);
   }
-  // The figures quoted in the runbook: 10 per minute for each 5xx class, 3 per minute for each 4xx class.
-  assert.deepEqual(Object.entries(CAPPED_CLASSES).map(([name, row]) => [name, row.capPerMinute]), [['db_failure_5xx', 10], ['node_request_5xx', 10], ['ingress_request_5xx', 10], ['node_request_4xx', 3], ['ingress_request_4xx', 3]]);
+  // The figures quoted in the runbook: 10 per minute for each 5xx class, 2 per minute for each 4xx class, 1 per minute for chain_guard_slow_wait.
+  assert.deepEqual(Object.entries(CAPPED_CLASSES).map(([name, row]) => [name, row.capPerMinute]), [['db_failure_5xx', 10], ['node_request_5xx', 10], ['ingress_request_5xx', 10], ['node_request_4xx', 2], ['ingress_request_4xx', 2], ['chain_guard_slow_wait', 1]]);
   const ndjson = calculateBudget({ requestsPerMinute: 0 });
-  assert.equal(ndjson.cappedClasses.node_request_4xx.bytes30Days, 3 * 439 * 43200);
-  assert.equal(ndjson.cappedClasses.ingress_request_4xx.bytes30Days, 3 * 223 * 43200);
-  assert.equal(ndjson.cappedEventBytes30Days, (10 * (402 + 439 + 223) + 3 * (439 + 223)) * 43200);
-  assert.equal(ndjson.cappedEventBytes30Days, 545_443_200);
-  assert.equal(ndjson.droppedCountBytes30Days, 39_960_000);
-  assert.equal(ndjson.cappedReserveBytes30Days, 585_403_200);
+  assert.equal(ndjson.cappedClasses.node_request_4xx.bytes30Days, 2 * 439 * 43200);
+  assert.equal(ndjson.cappedClasses.ingress_request_4xx.bytes30Days, 2 * 223 * 43200);
+  assert.equal(ndjson.cappedEventBytes30Days, (10 * (402 + 439 + 223) + 2 * (439 + 223) + 205) * 43200);
+  assert.equal(ndjson.cappedEventBytes30Days, 525_700_800);
+  assert.equal(ndjson.droppedCountBytes30Days, 48_470_400);
+  assert.equal(ndjson.cappedReserveBytes30Days, 574_171_200);
   // The 4xx cap is the largest whole number that fits: one more per minute per 4xx class exceeds the reserve.
   assert.ok(ndjson.cappedReserveBytes30Days + (439 + 223) * 43200 > CAPPED_ALLOCATION_BYTES);
+});
+
+test('chain_guard_slow_wait is an individual event with a worst-valid representative and its own cap (TC-2076)', () => {
+  assert.ok(nodeSchema.fields.event_code.values.includes('chain_guard_slow_wait'));
+  assert.ok(nodeSchema.fields.class.values.includes('chain_guard_slow_wait'));
+  assert.notEqual(representativeEvents.diagnostic.event_code, 'chain_guard_slow_wait');
+  const row = representativeEvents.chainGuard;
+  assert.deepEqual(Object.keys(row).sort(), ['elapsed_ms', 'event', 'event_code', 'guards', 'kind', 'level', 'suppressed', 'svc', 'ts']);
+  assert.equal(row.event_code, 'chain_guard_slow_wait');
+  assert.equal(row.kind, 'exclusive');
+  assert.ok(nodeSchema.fields.kind.values.includes(row.kind));
+  assert.equal(row.elapsed_ms, nodeSchema.fields.elapsed_ms.max);
+  assert.equal(row.guards, nodeSchema.fields.guards.max);
+  assert.equal(row.suppressed, nodeSchema.fields.suppressed.max);
+  assert.equal(calculateBudget({ requestsPerMinute: 0 }).eventBytes.chainGuard, serializedEventBytes(row, 'ndjson'));
+  assert.deepEqual(CAPPED_CLASSES.chain_guard_slow_wait, { capPerMinute: 1, representative: 'chainGuard' });
 });
 
 test('invalid numeric budgets fail rather than hiding impossible volume', () => {

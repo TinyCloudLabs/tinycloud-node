@@ -4,7 +4,7 @@ import { pathToFileURL } from 'node:url';
 const schema = JSON.parse(readFileSync(new URL('./fields.json', import.meta.url), 'utf8')).services['tinycloud-node'];
 const longest = values => values.reduce((chosen, value) => Buffer.byteLength(value) > Buffer.byteLength(chosen) ? value : chosen, '');
 /** Event codes that ship as individual events, outside the count reducer (TC-1840). */
-export const INDIVIDUAL_EVENT_CODES = Object.freeze(['db_failure_5xx']);
+export const INDIVIDUAL_EVENT_CODES = Object.freeze(['db_failure_5xx', 'chain_guard_slow_wait']);
 /** Event codes the shipper emits itself; no node log line maps to them (TC-1843). */
 export const SHIPPER_EVENT_CODES = Object.freeze(['errors_dropped']);
 const aggregatedCodes = schema.fields.event_code.values.filter(code => !INDIVIDUAL_EVENT_CODES.includes(code) && !SHIPPER_EVENT_CODES.includes(code));
@@ -28,13 +28,17 @@ export const CAPPED_ALLOCATION_BYTES = 600_000_000;
  * worst-valid event in representativeEvents used for the size arithmetic (its status is three digits, as in 4xx).
  * The 4xx cap is the largest whole number that keeps the worst case, including one dropped-count event per class
  * per minute, within CAPPED_ALLOCATION_BYTES: 3 (a cap of 4 gives 614,001,600 bytes).
+ * chain_guard_slow_wait (TC-2076) is the node's slow chain-guard wait warning. The node already limits itself to one line
+ * per second per process and each line carries `suppressed`; the shipper keeps one per minute and errors_dropped counts
+ * the rest. NOTE: with this class the worst case exceeds CAPPED_ALLOCATION_BYTES; see the PR (draft) for the open question.
  */
 export const CAPPED_CLASSES = Object.freeze({
   db_failure_5xx: Object.freeze({ capPerMinute: 10, representative: 'dbFailure' }),
   node_request_5xx: Object.freeze({ capPerMinute: 10, representative: 'node' }),
   ingress_request_5xx: Object.freeze({ capPerMinute: 10, representative: 'ingress' }),
-  node_request_4xx: Object.freeze({ capPerMinute: 3, representative: 'node' }),
-  ingress_request_4xx: Object.freeze({ capPerMinute: 3, representative: 'ingress' }),
+  node_request_4xx: Object.freeze({ capPerMinute: 2, representative: 'node' }),
+  ingress_request_4xx: Object.freeze({ capPerMinute: 2, representative: 'ingress' }),
+  chain_guard_slow_wait: Object.freeze({ capPerMinute: 1, representative: 'chainGuard' }),
 });
 
 const common = { level: 'info', ts: '9999-12-31T23:59:59.999Z' };
@@ -66,6 +70,10 @@ export const representativeEvents = Object.freeze({
     level: 'warn', ts: common.ts, event: 'node_warning', svc: 'api', event_code: INDIVIDUAL_EVENT_CODES[0], status: 599,
     code: longest(schema.fields.code.values), service: longest(schema.fields.service.values), route: request.route,
     elapsed_ms: schema.fields.elapsed_ms.max, failure_kind: longest(schema.fields.failure_kind.values), write_may_have_applied: false, db_hash: 'f'.repeat(64),
+  }),
+  chainGuard: Object.freeze({
+    level: 'warn', ts: common.ts, event: 'node_warning', svc: 'api', event_code: 'chain_guard_slow_wait',
+    kind: longest(schema.fields.kind.values), elapsed_ms: schema.fields.elapsed_ms.max, guards: schema.fields.guards.max, suppressed: schema.fields.suppressed.max,
   }),
   errorsDropped: Object.freeze({
     level: 'warn', ts: common.ts, event: 'node_warning', svc: 'api', event_code: SHIPPER_EVENT_CODES[0],

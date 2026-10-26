@@ -70,6 +70,9 @@ export function buildConfig({ sinkUri = 'https://s2795437.us-west-2a.betterstack
     .replaceAll('__DB_FAILURE_CODES__', JSON.stringify(schema.fields.code.values))
     .replaceAll('__DB_FAILURE_SERVICES__', JSON.stringify(schema.fields.service.values))
     .replaceAll('__DB_FAILURE_KINDS__', JSON.stringify(schema.fields.failure_kind.values))
+    .replaceAll('__CHAIN_GUARD_KINDS__', JSON.stringify(schema.fields.kind.values))
+    .replaceAll('__CHAIN_GUARDS_MAX__', String(schema.fields.guards.max))
+    .replaceAll('__CHAIN_SUPPRESSED_MAX__', String(schema.fields.suppressed.max))
     .replace('__ROUTE_ALIASES__', JSON.stringify(aliases))
     .replace('__DIAGNOSTICS__', JSON.stringify(diagnostics.exact))
     .replace('__PREFIX_DIAGNOSTICS__', Object.entries(diagnostics.prefix).sort(([a], [b]) => a.length - b.length).map(([prefix, code]) => `if starts_with(msg, ${JSON.stringify(prefix)}) { code = ${JSON.stringify(code)} }`).join('\n'));
@@ -141,7 +144,8 @@ if !includes(${JSON.stringify(schema.fields.reason.values)}, reason) { reason = 
         node_request_4xx: `.event == "node_request" && ${status4xx}`,
         ingress_request_4xx: `.event == "ingress_request" && ${status4xx}`,
         db_failure_5xx: '.event == "node_warning" && .event_code == "db_failure_5xx"',
-        diagnostic: '(.event == "node_warning" && .event_code != "db_failure_5xx") || .event == "node_error"',
+        chain_guard_slow_wait: '.event == "node_warning" && .event_code == "chain_guard_slow_wait"',
+        diagnostic: '(.event == "node_warning" && .event_code != "db_failure_5xx" && .event_code != "chain_guard_slow_wait") || .event == "node_error"',
       } },
       ...Object.fromEntries(Object.entries(CAPPED_CLASSES).map(([name, { capPerMinute }]) => [capName(name), capTransform(name, capPerMinute)])),
       diagnostic_reduce: { type: 'reduce', inputs: ['event_route.diagnostic'], group_by: ['event', 'event_code', 'level', 'svc'], end_every_period_ms: 60000, expire_after_ms: 75000, flush_period_ms: 1000, merge_strategies: { event_count: 'sum', ts: 'discard' } },

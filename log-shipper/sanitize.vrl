@@ -44,6 +44,27 @@ if label == "tinycloud-node" {
       if has_db_hash { db_event.db_hash = db_hash }
     }
   }
+  # TC-2076: the node's slow chain-guard wait warning (at most one per second per process) ships as an individual
+  # event. The input must carry exactly the declared keys (the message, event and the four fields) with the
+  # declared types, enum value and ranges. Anything else leaves chain_event null and the line falls back to the
+  # unclassified count below; the shipped object is built from literals and the validated values only.
+  chain_event = null
+  if target == "tinycloud::chain_guard" && level == "warn" && msg == "chain guard wait exceeded the slow-wait threshold" && f.event == "chain_guard_slow_wait" {
+    chain_kind = string(f.kind) ?? ""
+    chain_elapsed = f.elapsed_ms
+    chain_guards = f.guards
+    chain_suppressed = f.suppressed
+    chain_ok = length(f) == 6 && includes(__CHAIN_GUARD_KINDS__, chain_kind) && is_integer(chain_elapsed) && is_integer(chain_guards) && is_integer(chain_suppressed)
+    if chain_ok {
+      chain_elapsed = int!(chain_elapsed)
+      chain_guards = int!(chain_guards)
+      chain_suppressed = int!(chain_suppressed)
+      chain_ok = chain_elapsed >= 0 && chain_elapsed <= 9007199254740991 && chain_guards >= 0 && chain_guards <= __CHAIN_GUARDS_MAX__ && chain_suppressed >= 0 && chain_suppressed <= __CHAIN_SUPPRESSED_MAX__
+    }
+    if chain_ok {
+      chain_event = {"event": "node_warning", "svc": "api", "level": "warn", "event_code": "chain_guard_slow_wait", "kind": chain_kind, "elapsed_ms": chain_elapsed, "guards": chain_guards, "suppressed": chain_suppressed}
+    }
+  }
   if target == "tinycloud::request" && level == "info" && msg == "request" {
     method = string!(f.method)
     if includes(["TRACE", "CONNECT"], method) { method = "<other>" }
@@ -70,6 +91,8 @@ if label == "tinycloud-node" {
     if match(space, r'^[0-9a-f]{64}$') { out.space_hash = space }
   } else if is_object(db_event) {
     out = db_event
+  } else if is_object(chain_event) {
+    out = chain_event
   } else {
     if !includes(["warn", "error"], level) { abort }
     code = "unclassified"

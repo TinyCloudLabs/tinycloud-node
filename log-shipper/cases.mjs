@@ -41,8 +41,9 @@ const capShapes = {
   db_failure_5xx: n => ({ level: 'warn', ts: timestamp, event: 'node_warning', svc: 'api', event_code: 'db_failure_5xx', status: 503, code: 'sql_busy', service: 'sql', route: '/invoke', elapsed_ms: n, failure_kind: 'lock_wait', write_may_have_applied: false }),
   node_request_4xx: n => ({ level: 'info', ts: timestamp, event: 'node_request', svc: 'api', method: 'POST', route: '/invoke', status: 404, latency_us: n }),
   ingress_request_4xx: n => ({ level: 'info', ts: timestamp, event: 'ingress_request', svc: 'ingress', method: 'GET', route: '/healthz', status: 429, request_time_seconds: n + 0.5 }),
+  chain_guard_slow_wait: n => ({ level: 'warn', ts: timestamp, event: 'node_warning', svc: 'api', event_code: 'chain_guard_slow_wait', kind: 'shared', elapsed_ms: n, guards: 3, suppressed: 0 }),
 };
-const capSeq = { node_request_5xx: n => `.latency_us == ${n}`, ingress_request_5xx: n => `.request_time_seconds == ${n}.5`, db_failure_5xx: n => `.elapsed_ms == ${n}`, node_request_4xx: n => `.latency_us == ${n}`, ingress_request_4xx: n => `.request_time_seconds == ${n}.5` };
+const capSeq = { node_request_5xx: n => `.latency_us == ${n}`, ingress_request_5xx: n => `.request_time_seconds == ${n}.5`, db_failure_5xx: n => `.elapsed_ms == ${n}`, node_request_4xx: n => `.latency_us == ${n}`, ingress_request_4xx: n => `.request_time_seconds == ${n}.5`, chain_guard_slow_wait: n => `.elapsed_ms == ${n}` };
 const capNames = Object.keys(CAPPED_CLASSES);
 const capOf = name => CAPPED_CLASSES[name].capPerMinute;
 const uncappedCount = 5 * Math.max(...capNames.map(capOf));
@@ -86,6 +87,13 @@ const capCases = [
   })),
 ];
 const unclassifiedKeys = ['event', 'event_code', 'event_count', 'level', 'svc', 'ts'];
+// TC-2076: the node's slow chain-guard wait warning (target, message and fields as emitted by tinycloud-core). It ships
+// as an individual event with exactly the four declared fields; any deviation falls back to the unclassified count.
+const chainMessage = 'chain guard wait exceeded the slow-wait threshold';
+export const chainGuard = (fields = {}, extra = {}) => ({ timestamp, level: 'WARN', target: 'tinycloud::chain_guard', ...extra, fields: { message: chainMessage, event: 'chain_guard_slow_wait', kind: 'shared', elapsed_ms: 612, guards: 3, suppressed: 0, ...fields } });
+const chainShipped = ['elapsed_ms', 'event', 'event_code', 'guards', 'kind', 'level', 'suppressed', 'svc', 'ts'];
+const chainFallback = (name, fields, extra) => check(name, envelope(chainGuard(fields, extra)), `.event == "node_warning" && .event_code == "unclassified" && .event_count == 1 && ${keysAre(['event', 'event_code', 'event_count', 'level', 'svc', 'ts'])}`);
+
 export const vectorTests = [
   check('INFO node request validates as a safe individual event', envelope(nodeRequest()), '.event == "node_request" && .svc == "api" && .method == "POST" && .route == "/invoke" && .status == 200 && .latency_us == 1234'),
   check('unmatched request keeps fixed sentinel', envelope(nodeRequest({ route: '<unmatched>', status: 404, latency_us: 0 })), '.event == "node_request" && .route == "<unmatched>" && .status == 404 && .latency_us == 0'),
@@ -193,6 +201,27 @@ export const vectorTests = [
   check('node request carrying errors_dropped fields ships none of them', envelope(nodeRequest({ status: 503, event_code: 'errors_dropped', class: 'node_request_5xx', dropped: 7, window_s: 60 })), `.event == "node_request" && .status == 503 && ${keysAre(['event', 'latency_us', 'level', 'method', 'route', 'status', 'svc', 'ts'])}`),
   check('ingress request carrying errors_dropped fields ships none of them', envelope(ingressRequest({ status: 502, event_code: 'errors_dropped', class: 'ingress_request_5xx', dropped: 7, window_s: 60 }), 'tinycloud-ingress'), `.event == "ingress_request" && .status == 502 && ${keysAre(['event', 'level', 'method', 'request_time_seconds', 'route', 'status', 'svc', 'ts'])}`),
   ...[['dropped', 3], ['class', 'node_request_5xx'], ['window_s', 60]].map(([key, value]) => dbFallback(`node 5xx diagnostic with an extra ${key} field falls back to unclassified, never a dropped-count event`, { [key]: value })),
+  // TC-2076: chain_guard_slow_wait ships as an individual event with exactly its fields.
+  check('chain-guard slow wait ships exactly its fields as an individual event', envelope(chainGuard()), `.event == "node_warning" && .svc == "api" && .level == "warn" && .event_code == "chain_guard_slow_wait" && .kind == "shared" && .elapsed_ms == 612 && .guards == 3 && .suppressed == 0 && !exists(.event_count) && ${keysAre(chainShipped)}`),
+  check('chain-guard slow wait ships the exclusive kind', envelope(chainGuard({ kind: 'exclusive', suppressed: 41 })), `.event_code == "chain_guard_slow_wait" && .kind == "exclusive" && .suppressed == 41 && ${keysAre(chainShipped)}`),
+  ...[[0, 0, 0], [9007199254740991, 10000, 100000]].map(([elapsed_ms, guards, suppressed]) => check(`chain-guard slow wait ships the range limits ${elapsed_ms}, ${guards}, ${suppressed}`, envelope(chainGuard({ elapsed_ms, guards, suppressed })), `.event_code == "chain_guard_slow_wait" && .elapsed_ms == ${elapsed_ms} && .guards == ${guards} && .suppressed == ${suppressed} && ${keysAre(chainShipped)}`)),
+  check('chain-guard slow wait discards span, spans and envelope extras', envelope({ ...chainGuard(), span: { key: canary, space: canary }, spans: [{ request_id: canary }], filename: canary, thread_id: canary }), `.event_code == "chain_guard_slow_wait" && ${keysAre(chainShipped)}`),
+  ...[['not an enum value', 'Shared'], ['padded', 'shared '], ['free text', canary], ['empty', ''], ['a number', 1], ['null', null]].map(([label, kind]) => chainFallback(`chain-guard slow wait with a kind that is ${label} falls back to unclassified`, { kind })),
+  ...[['negative', -1], ['a string', '612'], ['a float', 1.5], ['above the safe integer range', 9007199254740992], ['null', null]].map(([label, elapsed_ms]) => chainFallback(`chain-guard slow wait with an elapsed_ms that is ${label} falls back to unclassified`, { elapsed_ms })),
+  ...[['negative', -1], ['above range', 10001], ['a string', '3'], ['a float', 1.5], ['null', null]].map(([label, guards]) => chainFallback(`chain-guard slow wait with a guards value that is ${label} falls back to unclassified`, { guards })),
+  ...[['negative', -1], ['above range', 100001], ['a string', '0'], ['a float', 0.5], ['null', null]].map(([label, suppressed]) => chainFallback(`chain-guard slow wait with a suppressed value that is ${label} falls back to unclassified`, { suppressed })),
+  ...['kind', 'elapsed_ms', 'guards', 'suppressed', 'event', 'message'].map(key => chainFallback(`chain-guard slow wait missing ${key} falls back to unclassified`, { [key]: undefined })),
+  ...[['key', canary], ['space', 'tinycloud:pkh:eip155:1:0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef:default'], ['did', 'did:pkh:eip155:1:0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef'], ['count', 3], ['dropped', 3], ['class', 'chain_guard_slow_wait'], ['empty', null]].map(([key, value]) => chainFallback(`chain-guard slow wait with an extra ${key} field falls back to unclassified`, { [key]: value })),
+  ...[['a different event', 'chain_guard_other'], ['a different case', 'CHAIN_GUARD_SLOW_WAIT'], ['free text', canary], ['null', null], ['a number', 7]].map(([label, event]) => chainFallback(`chain-guard slow wait with an event that is ${label} falls back to unclassified`, { event })),
+  ...[['a suffix', `${chainMessage}: ${canary}`], ['a different case', chainMessage.toUpperCase()], ['free text', canary]].map(([label, message]) => chainFallback(`chain-guard slow wait with a message that is ${label} falls back to unclassified`, { message })),
+  chainFallback('chain-guard slow wait on the request target falls back to unclassified', {}, { target: 'tinycloud::request' }),
+  chainFallback('chain-guard slow wait on the core target falls back to unclassified', {}, { target: 'tinycloud_core::db' }),
+  chainFallback('chain-guard slow wait on a dependency target falls back to unclassified', {}, { target: 'dependency' }),
+  chainFallback('chain-guard slow wait on a target that only starts like the guard target falls back to unclassified', {}, { target: 'tinycloud::chain_guard_extra' }),
+  check('chain-guard slow wait at error level is a plain unclassified error', envelope(chainGuard({}, { level: 'ERROR' })), `.event == "node_error" && .event_code == "unclassified" && .event_count == 1 && ${keysAre(unclassifiedKeys)}`),
+  reject('chain-guard slow wait at info level is not an individual event', envelope(chainGuard({}, { level: 'INFO' }))),
+  check('chain-guard slow wait with SQL, ids and message-like text in extra fields ships none of it', envelope({ ...chainGuard({ sql: `SELECT ${canary}`, key: canary, space_id: 'tinycloud:pkh:eip155:1:0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef:default', did: 'did:pkh:eip155:1:0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef' }), span: { key: canary } }), `.event == "node_warning" && .event_code == "unclassified" && .event_count == 1 && ${keysAre(unclassifiedKeys)} && !contains(encode_json(.), "SELECT") && !contains(encode_json(.), "did:") && !contains(encode_json(.), "tinycloud:")`),
+  check('node request carrying chain-guard fields ships none of them', envelope(nodeRequest({ event: 'chain_guard_slow_wait', kind: 'shared', guards: 3, suppressed: 0, elapsed_ms: 612 })), `.event == "node_request" && ${keysAre(['event', 'latency_us', 'level', 'method', 'route', 'status', 'svc', 'ts'])}`),
 ];
 
 /** Exercise the actual routed boundary, not just pre-profile sanitization. */
@@ -264,5 +293,24 @@ export function requestProfileTests(profile) {
       no_outputs_from: capNames.map(name => `cap_${name}`),
       outputs: [{ extract_from: 'event_route.request', expected_event_count: 1, conditions: [{ type: 'vrl', source: `assert!(.${condition})` }] }],
     })),
+    // TC-2076: chain_guard_slow_wait routes as an individual event into its own cap, never into the count reducer.
+    {
+      name: `${profile}: chain-guard slow wait routes as an individual event, never into the count reducer`,
+      inputs: [{ insert_at: 'logship_gate', type: 'log', log_fields: logFields(envelope(chainGuard())) }],
+      no_outputs_from: ['event_route.diagnostic', 'event_route.request', ...capNames.filter(name => name !== 'chain_guard_slow_wait').map(name => `event_route.${name}`)],
+      outputs: [{ extract_from: 'event_route.chain_guard_slow_wait', conditions: [{ type: 'vrl', source: `assert!(.event_code == "chain_guard_slow_wait" && .elapsed_ms == 612 && .kind == "shared")\nassert!(${keysAre(chainShipped)})\nassert!(${safe})` }] }],
+    },
+    {
+      name: `${profile}: chain-guard slow wait reaches only the chain_guard_slow_wait cap`,
+      inputs: [{ insert_at: 'logship_gate', type: 'log', log_fields: logFields(envelope(chainGuard())) }],
+      no_outputs_from: ['event_route.request', ...capNames.filter(other => other !== 'chain_guard_slow_wait').map(other => `cap_${other}`)],
+      outputs: [{ extract_from: 'cap_chain_guard_slow_wait', expected_event_count: 1, conditions: [{ type: 'vrl', source: `assert!(.event_code == "chain_guard_slow_wait" && .elapsed_ms == 612)\nassert!(${keysAre(chainShipped)})\nassert!(${safe})` }] }],
+    },
+    {
+      name: `${profile}: invalid chain-guard slow wait is counted as unclassified, never an individual event`,
+      inputs: [{ insert_at: 'logship_gate', type: 'log', log_fields: logFields(envelope(chainGuard({ kind: canary, key: canary }))) }],
+      no_outputs_from: ['event_route.chain_guard_slow_wait', 'event_route.request'],
+      outputs: [{ extract_from: 'event_route.diagnostic', conditions: [{ type: 'vrl', source: `assert!(.event_count == 1 && .event_code == "unclassified")\nassert!(${keysAre(['event', 'event_code', 'event_count', 'level', 'svc', 'ts'])})\nassert!(${safe})` }] }],
+    },
   ];
 }
