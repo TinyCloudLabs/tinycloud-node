@@ -118,11 +118,6 @@ impl LinksOrigin {
         self.url.join(&format!("v1/links/{}", id.as_str())).ok()
     }
 
-    /// Bind a links read to this configured origin, never a caller-supplied host.
-    pub(crate) fn contains(&self, url: &Url) -> bool {
-        url.scheme() == "https" && url.origin() == self.url.origin()
-    }
-
     /// The API instance as the contract writes its audience: the origin,
     /// `https://host[:port]`.
     pub(crate) fn audience(&self) -> String {
@@ -227,7 +222,7 @@ impl LinkRecordFetcher for ApiLinkFetcher {
             .ok_or(LinkFetchError::Unavailable)?;
         let destination = self
             .policy
-            .resolve_links_origin(&self.origin, &url, self.scope)
+            .resolve_url_scoped(&url, self.scope)
             .await
             .map_err(|_| LinkFetchError::Unavailable)?;
         let mut request = egress::get(
