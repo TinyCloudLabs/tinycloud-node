@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+## [1.25.2] - 2026-10-26
+
+- No code changes since 1.25.1. Prepared so that named keys can be turned off with the deploy input `named_keys_v1` without a rebuild.
+
 ## [1.25.1] - 2026-10-26
 
 - No code changes since 1.25.0. This release lets a production deploy turn on named keys with the deploy input `named_keys_v1` (the deployment guard needs a newer revision than the one running).
