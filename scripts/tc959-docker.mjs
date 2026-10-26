@@ -393,7 +393,7 @@ export async function main(args = process.argv.slice(2)) {
       assert.equal(service.ports[0].host_ip ?? '0.0.0.0', '0.0.0.0');
     }
     phase = 'compose_mounts';
-    assert.deepEqual(production.tinycloud.volumes.map(value => [value.type, value.source, value.target]), [['bind', '/var/run/dstack.sock', '/var/run/dstack.sock']]);
+    assert.deepEqual(production.tinycloud.volumes.map(value => [value.type, value.source, value.target]), [['bind', '/var/run/dstack.sock', '/var/run/dstack.sock'], ['volume', 'deletion-ledger', '/var/lib/tinycloud/ledger']]);
     assert.deepEqual(production['dstack-ingress'].volumes.map(value => [value.type, value.source, value.target]).sort((a, b) => a[2].localeCompare(b[2])), [['volume', 'cert-data', '/etc/letsencrypt'], ['bind', '/var/run/dstack.sock', '/var/run/dstack.sock']]);
     phase = 'compose_networks';
     assert.deepEqual(Object.keys(production.tinycloud.networks), ['default']);
