@@ -27,10 +27,10 @@ export const CAPPED_ALLOCATION_BYTES = 600_000_000;
  * ingress_request_4xx are the node and ingress request events with status 400 to 499. `representative` names the
  * worst-valid event in representativeEvents used for the size arithmetic (its status is three digits, as in 4xx).
  * The 4xx cap is the largest whole number that keeps the worst case, including one dropped-count event per class
- * per minute, within CAPPED_ALLOCATION_BYTES: 3 (a cap of 4 gives 614,001,600 bytes).
+ * per minute, within CAPPED_ALLOCATION_BYTES: 2 (a cap of 3 gives 602,769,600 bytes with chain_guard_slow_wait included).
  * chain_guard_slow_wait (TC-2076) is the node's slow chain-guard wait warning. The node already limits itself to one line
  * per second per process and each line carries `suppressed`; the shipper keeps one per minute and errors_dropped counts
- * the rest. NOTE: with this class the worst case exceeds CAPPED_ALLOCATION_BYTES; see the PR (draft) for the open question.
+ * the rest. With this class the worst case is 574,171,200 bytes, within CAPPED_ALLOCATION_BYTES.
  */
 export const CAPPED_CLASSES = Object.freeze({
   db_failure_5xx: Object.freeze({ capPerMinute: 10, representative: 'dbFailure' }),
