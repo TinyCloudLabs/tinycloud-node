@@ -100,6 +100,11 @@ if name=='docker':
         print(os.environ['OCI_REVISION'] if 'revision' in args[-1] else os.environ['OCI_LABEL'])
     elif args[0]=='run':
         assert args[-1]=='--validate-config' and 'none' in args and '--read-only' in args; event('sealed-preflight')
+        passed = dict(a.split('=', 1) if '=' in a else (a, os.environ.get(a, '')) for a in (args[i + 1] for i, x in enumerate(args) if x == '-e'))
+        event('preflight-named-keys=' + passed.get('TINYCLOUD_ENCRYPTION_NETWORK__NAMED_KEYS_V1', '<absent>') + ' ledger=' + passed.get('TINYCLOUD_ENCRYPTION_NETWORK__DELETION_LEDGER_PATH', '<absent>'))
+        # Stands for the node's startup rule: named keys on needs an absolute deletion ledger path.
+        if passed.get('TINYCLOUD_ENCRYPTION_NETWORK__NAMED_KEYS_V1') == 'true' and not passed.get('TINYCLOUD_ENCRYPTION_NETWORK__DELETION_LEDGER_PATH', '').startswith('/'):
+            print('encryption_network.deletion_ledger_path is required when named_keys_v1 is on', file=sys.stderr); sys.exit(1)
     elif args[0]=='compose':
         assert args[-2:]==['config','--quiet']; assert Path('.phala-prod.env').stat().st_mode & 0o777==0o600
     else: raise SystemExit('Unexpected Docker boundary')
@@ -125,6 +130,7 @@ elif name=='node':
     names=[line.split('=',1)[0] for line in Path('.phala-prod.env').read_text().splitlines()]
     assert 'BETTERSTACK_SOURCE_TOKEN' in names and 'QUOTA_BILLING_ADMIN_SECRET' not in names
     data=json.loads(state.read_text()); data['values']['env_names']=names; state.write_text(json.dumps(data))
+    sealed=dict(row.split('=',1) for row in Path('.phala-prod.env').read_text().splitlines()); event('sealed-named-keys-v1='+sealed.get('NAMED_KEYS_V1','<absent>'))
     if args[-1]=='--check':
         event('whitelist-check')
         # What sync.mjs does when the CVM's allowed_envs names a variable the sealed file lacks.
@@ -279,6 +285,8 @@ class RecoveryTests(unittest.TestCase):
                 env["PHALA_ENV_NODE_STATS_READ_TOKEN"] = stats_token
                 if stats_token and stats_token != canary: CANARIES.append(stats_token)
             if missing_billing: env.pop("QUOTA_BILLING_ADMIN_SECRET")
+            env["PHALA_ENV_NAMED_KEYS_V1"] = inputs.get("named_keys_v1", "false")
+            env["TINYCLOUD_ENCRYPTION_NETWORK__NAMED_KEYS_V1"] = inputs.get("named_keys_v1", "false")
             context = {"github.event_name": event, "github.ref": ref, "job.success": True,
                        **{"inputs." + key: (value == "true" if value in ("true", "false") else value) for key, value in inputs.items()}}
             logs = ""
@@ -558,6 +566,62 @@ class RecoveryTests(unittest.TestCase):
         self.assertFalse(result["success"])
         self.assertNotIn("cvm-deploy", result["events"])
         self.assertEqual(result["compose"], N0)
+
+    def test_named_keys_gate_is_sealed_as_a_literal_flag_beside_the_ssh_keys(self):
+        # TC-1777: the flip is a workflow input, so the sealed file (the only CVM env source)
+        # carries the flag and keeps DSTACK_AUTHORIZED_KEYS on every dispatch.
+        for value in ("false", "true"):
+            with self.subTest(value=value):
+                result = self.run_deploy(changes={"named_keys_v1": value})
+                self.assertTrue(result["success"])
+                self.assertEqual(result["env_names"].count("NAMED_KEYS_V1"), 1)
+                self.assertEqual(result["env_names"].count("DSTACK_AUTHORIZED_KEYS"), 1)
+                sealed = {event for event in result["events"] if event.startswith("sealed-named-keys-v1=")}
+                self.assertEqual(sealed, {"sealed-named-keys-v1=" + value})
+
+    def test_named_keys_gate_other_than_true_or_false_is_refused_before_the_file(self):
+        for value in ("", "TRUE", "1", "yes", "maybe", "true "):
+            with self.subTest(value=value):
+                refused = self.run_deploy(changes={"named_keys_v1": value})
+                self.assertFalse(refused["success"])
+                self.assertEqual(refused["events"].count("cvm-deploy"), 0, "A bad flag must fail before the CVM mutation")
+                self.assertNotIn("whitelist-check", refused["events"], "The sealed file must not be written first")
+                if value:
+                    self.assertIn("::error::named_keys_v1 must be exactly true or false", refused["logs"])
+
+    def run_preflight(self, compose, named_keys):
+        # Only the preflight step, against the fake docker: the compose it reads is the test input.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); binaries = root / "bin"; binaries.mkdir()
+            binary = binaries / "docker"; binary.write_text(CLI); binary.chmod(0o700)
+            (root / "docker-compose.dstack-postgres.yaml").write_bytes(compose)
+            state = root / "state"; state.write_text(json.dumps({"events": [], "values": {}}))
+            env = {"PATH": str(binaries) + ":" + str(Path(sys.executable).parent) + ":/usr/bin:/bin", "TEST_STATE": str(state),
+                   "TINYCLOUD_ENCRYPTION_NETWORK__NAMED_KEYS_V1": named_keys}
+            result = subprocess.run(["bash", "--noprofile", "--norc", "-e", "-c", shell_for_step("Preflight sealed runtime configuration")],
+                                    cwd=root, env=env, capture_output=True, text=True)
+            return result.returncode, json.loads(state.read_text())["events"], result.stdout + result.stderr
+
+    def test_preflight_validates_the_named_keys_gate_with_the_composed_ledger_path(self):
+        ledger = "/var/lib/tinycloud/ledger/deletions.jsonl"
+        for value in ("false", "true"):
+            with self.subTest(value=value):
+                result = self.run_deploy(changes={"named_keys_v1": value})
+                self.assertTrue(result["success"])
+                self.assertIn(f"preflight-named-keys={value} ledger={ledger}", result["events"])
+
+    def test_preflight_refuses_the_gate_without_a_ledger_path_only_when_it_is_on(self):
+        no_path = CURRENT.replace(b"      TINYCLOUD_ENCRYPTION_NETWORK__DELETION_LEDGER_PATH: /var/lib/tinycloud/ledger/deletions.jsonl\n", b"")
+        self.assertNotEqual(no_path, CURRENT)
+        code, events, logs = self.run_preflight(no_path, "false")
+        self.assertEqual(code, 0, "Gate off without a path must keep passing")
+        self.assertIn("preflight-named-keys=false ledger=<absent>", events)
+        code, events, logs = self.run_preflight(no_path, "true")
+        self.assertNotEqual(code, 0, "Gate on without a ledger path must fail the preflight")
+        self.assertIn("preflight-named-keys=true ledger=<absent>", events)
+        self.assertIn("deletion_ledger_path is required", logs)
+        code, events, logs = self.run_preflight(CURRENT, "true")
+        self.assertEqual(code, 0, "Gate on with the composed ledger path must pass")
 
     def test_last_restart_precedes_health_inventory_and_quota(self):
         result = self.run_deploy(N0, {"rollback_pre_n0": "true", "rollback_privacy_mode": "keep-json-file"}, approved_privacy="keep-json-file")

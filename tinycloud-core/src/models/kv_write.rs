@@ -16,6 +16,8 @@ pub struct Model {
     pub epoch: Hash,
     pub epoch_seq: i64,
     pub value: Hash,
+    #[sea_orm(default_value = 0)]
+    pub generation: i64,
     pub metadata: Metadata,
 }
 

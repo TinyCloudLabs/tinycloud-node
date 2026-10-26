@@ -17,6 +17,7 @@ pub mod events;
 pub mod failure_diagnostic;
 pub mod hash;
 pub mod keys;
+pub mod kv_orphans;
 pub mod kv_sync;
 pub mod manifest;
 pub mod meeting_legacy_guard;

@@ -81,6 +81,8 @@ ryu-js = "0.2.2"
 # canonicalization. Replaces the hand-coded subset that only composed a
 # narrow Latin precomposed-pair table.
 unicode-normalization = "0.1"
+# App ids are bound to the ASCII (punycode) form of a host name.
+idna = "1"
 
 [dev-dependencies]
 sea-orm = { version = "1.1", features = ["runtime-tokio-rustls", "sqlx-sqlite"] }
