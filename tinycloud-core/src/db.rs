@@ -39,7 +39,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tinycloud_auth::multihash_codetable::MultihashDigest;
 use tinycloud_auth::{
     authorization::{make_invocation, EncodingError, InvocationOptions, TinyCloudDelegation},
-    identity::{canonicalize_did, did_principal_matches},
+    identity::{canonicalize_did, did_principal_matches, principal_did},
     ipld_core::cid::Cid,
     resource::{Path, SpaceId},
 };
@@ -114,6 +114,11 @@ pub enum AccountDelegationQueryError {
     Db(#[from] DbErr),
     #[error("delegation query invocation is not authorized")]
     Unauthorized,
+    /// The `issued` cursor is not one minted for this invoker and filters.
+    /// Also the answer to any malformed cursor, so a cursor from another
+    /// invoker or filter cannot be told apart from garbage.
+    #[error("invalid delegation query cursor")]
+    InvalidCursor,
 }
 
 /// TC-409: which trust mode an invocation entered `invoke_with_options_mode`
@@ -851,6 +856,11 @@ where
         )
         .await
         .map_err(|_| AccountDelegationQueryError::Unauthorized)?;
+        if matches!(query.direction, DelegationQueryDirection::Issued) {
+            let invoker = issued_query_principal(invocation)
+                .ok_or(AccountDelegationQueryError::Unauthorized)?;
+            return issued_delegations_page(&self.conn, &invoker, query).await;
+        }
         let principal = account_query_principal(&self.conn, invocation)
             .await?
             .ok_or(AccountDelegationQueryError::Unauthorized)?;
@@ -880,99 +890,18 @@ where
                 continue;
             }
 
-            let mut grouped: std::collections::BTreeMap<
-                String,
-                Vec<(String, crate::types::Caveats)>,
-            > = std::collections::BTreeMap::new();
-            for ability in abilities {
-                grouped
-                    .entry(ability.resource.to_string())
-                    .or_default()
-                    .push((ability.ability.to_string(), ability.caveats));
-            }
-            if let Some(space_filter) = query.space.as_deref() {
-                let matches_space = grouped.keys().any(|resource| {
-                    resource
-                        .parse::<Resource>()
-                        .ok()
-                        .and_then(|resource| resource.space().cloned())
-                        .map(|space| {
-                            space.to_string() == space_filter
-                                || space.name().as_str() == space_filter
-                        })
-                        .unwrap_or(false)
-                });
-                if !matches_space {
-                    continue;
-                }
-            }
-            let resources = grouped
-                .into_iter()
-                .map(|(resource, mut entries)| {
-                    entries.sort_by(|left, right| {
-                        left.0.cmp(&right.0).then_with(|| {
-                            serde_json::to_string(&left.1)
-                                .unwrap_or_default()
-                                .cmp(&serde_json::to_string(&right.1).unwrap_or_default())
-                        })
-                    });
-                    DelegationResource {
-                        resource,
-                        actions: entries.iter().map(|entry| entry.0.clone()).collect(),
-                        caveats: entries.into_iter().map(|entry| entry.1).collect(),
-                    }
-                })
-                .collect();
-
-            let lifecycle = ancestor_state.lifecycle(delegation.id, now)?;
-            let status_matches = match query.status {
-                None => true,
-                Some(DelegationQueryStatus::Active) => lifecycle.status == "active",
-                Some(DelegationQueryStatus::Pending) => lifecycle.status == "pending",
-                Some(DelegationQueryStatus::Expired) => lifecycle.status == "expired",
-                Some(DelegationQueryStatus::Revoked) => {
-                    matches!(lifecycle.status, "revoked" | "ancestor_revoked")
-                }
-                Some(DelegationQueryStatus::AncestorRevoked) => {
-                    lifecycle.status == "ancestor_revoked"
-                }
-            };
-            if !status_matches {
+            let Some(record) = build_account_record(
+                delegation,
+                abilities,
+                &ancestor_state,
+                now,
+                direction,
+                query,
+            )?
+            else {
                 continue;
-            }
-
-            let cid = delegation.id.to_cid(0x55).to_string();
-            let mut parents = ancestor_state
-                .parents
-                .get(&delegation.id)
-                .cloned()
-                .unwrap_or_default();
-            parents.sort_by(|left, right| left.as_ref().cmp(right.as_ref()));
-            parents.dedup();
-            records.push(AccountDelegationRecord {
-                cid,
-                direction: direction.to_string(),
-                delegator_did: delegation.delegator,
-                delegate_did: delegation.delegatee,
-                resources,
-                parents: parents
-                    .into_iter()
-                    .map(|parent| parent.to_cid(0x55).to_string())
-                    .collect(),
-                issued_at: delegation.issued_at,
-                not_before: delegation.not_before,
-                expires_at: delegation.expiry,
-                status: lifecycle.status.to_string(),
-                revoked_at: lifecycle
-                    .direct_revocation
-                    .as_ref()
-                    .and_then(|row| row.revoked_at),
-                revoked_by: lifecycle
-                    .direct_revocation
-                    .as_ref()
-                    .map(|row| row.revoker.clone()),
-                revoked_ancestor_cid: lifecycle.revoked_ancestor_cid,
-            });
+            };
+            records.push(record);
         }
 
         records.sort_by(|left, right| {
@@ -4931,6 +4860,39 @@ async fn account_query_principal<C: ConnectionTrait>(
         .then_some(principal))
 }
 
+/// Principal of a `direction: "issued"` query (TC-2132): the invoker itself.
+///
+/// Exactly one `tinycloud.delegation/list` capability on
+/// `<invoker DID>/delegation` (empty path, query and fragment) and no proof.
+/// Nothing about the account graph is consulted, so the result can only ever
+/// be the invoker's own rows. The did:pkh-only [`account_query_principal`]
+/// used by the other directions is a separate path and is not affected.
+fn issued_query_principal(invocation: &crate::util::InvocationInfo) -> Option<String> {
+    if !invocation.parents.is_empty() {
+        return None;
+    }
+    let [capability] = invocation.capabilities.as_slice() else {
+        return None;
+    };
+    if capability.ability.as_ref().as_ref() != "tinycloud.delegation/list" {
+        return None;
+    }
+    let Resource::TinyCloud(resource) = &capability.resource else {
+        return None;
+    };
+    if resource.service().as_str() != "delegation"
+        || resource
+            .path()
+            .is_some_and(|path| !path.as_str().is_empty())
+        || resource.query().is_some()
+        || resource.fragment().is_some()
+    {
+        return None;
+    }
+    let invoker = principal_did(&invocation.invoker).ok()?;
+    (principal_did(resource.space().did().as_str()).ok()? == invoker).then_some(invoker)
+}
+
 const MAX_ACCOUNT_SESSION_NODES: usize = 256;
 const ACCOUNT_SESSION_DELEGATION_PAGE_SIZE: u64 = 512;
 const MAX_ACCOUNT_ANCESTOR_NODES: usize = 4096;
@@ -5097,6 +5059,175 @@ impl AccountAncestorState {
             revoked_ancestor_cid: None,
         })
     }
+}
+
+/// Rows of `invoker`'s own delegations after `after`, in `id` order: a seek on
+/// `idx_delegation_delegator (delegator, id)` that reads at most `limit + 1`
+/// rows and never sorts.
+fn issued_delegation_select(
+    invoker: &str,
+    after: Option<Hash>,
+    limit: u64,
+) -> sea_orm::Select<delegation::Entity> {
+    let mut select = delegation::Entity::find()
+        .filter(delegation::Column::Delegator.eq(invoker))
+        .order_by_asc(delegation::Column::Id)
+        .limit(limit + 1);
+    if let Some(id) = after {
+        select = select.filter(delegation::Column::Id.gt(id));
+    }
+    select
+}
+
+/// One page of the delegations `invoker` issued. Work is bounded by `limit`:
+/// one indexed scan of at most `limit + 1` rows, then abilities and ancestor
+/// state for the page's rows only. `status` and `space` filter the scanned
+/// rows, so a page can be short or empty while `next_cursor` is still set;
+/// only a missing `next_cursor` ends the listing.
+async fn issued_delegations_page<C: ConnectionTrait>(
+    db: &C,
+    invoker: &str,
+    query: &DelegationQuery,
+) -> Result<DelegationQueryPage, AccountDelegationQueryError> {
+    let after = query
+        .decoded_issued_cursor(invoker)
+        .map_err(|_| AccountDelegationQueryError::InvalidCursor)?;
+    let limit = query.limit.unwrap_or(50).clamp(1, 100) as usize;
+    let mut rows = issued_delegation_select(invoker, after, limit as u64)
+        .all(db)
+        .await?;
+    let has_more = rows.len() > limit;
+    rows.truncate(limit);
+    let Some(last) = rows.last().map(|row| row.id) else {
+        return Ok(DelegationQueryPage {
+            schema_version: 2,
+            items: Vec::new(),
+            next_cursor: None,
+        });
+    };
+    let next_cursor = has_more.then(|| query.encode_issued_cursor(invoker, last));
+    let ability_rows = rows.load_many(abilities::Entity, db).await?;
+    let roots = rows.iter().map(|row| row.id).collect::<Vec<_>>();
+    let ancestor_state = load_account_ancestor_state(db, &roots).await?;
+    let now = OffsetDateTime::now_utc();
+    let mut items = Vec::new();
+    for (delegation, ability_rows) in rows.into_iter().zip(ability_rows) {
+        if let Some(record) = build_account_record(
+            delegation,
+            ability_rows,
+            &ancestor_state,
+            now,
+            "granted",
+            query,
+        )? {
+            items.push(record);
+        }
+    }
+    Ok(DelegationQueryPage {
+        schema_version: 2,
+        items,
+        next_cursor,
+    })
+}
+
+/// Group one delegation's abilities, apply the `space` and `status` filters
+/// and compute its lifecycle. `None` when a filter excludes the row.
+fn build_account_record(
+    delegation: delegation::Model,
+    ability_rows: Vec<abilities::Model>,
+    ancestor_state: &AccountAncestorState,
+    now: OffsetDateTime,
+    direction: &str,
+    query: &DelegationQuery,
+) -> Result<Option<AccountDelegationRecord>, DbErr> {
+    let mut grouped: std::collections::BTreeMap<String, Vec<(String, crate::types::Caveats)>> =
+        std::collections::BTreeMap::new();
+    for ability in ability_rows {
+        grouped
+            .entry(ability.resource.to_string())
+            .or_default()
+            .push((ability.ability.to_string(), ability.caveats));
+    }
+    if let Some(space_filter) = query.space.as_deref() {
+        let matches_space = grouped.keys().any(|resource| {
+            resource
+                .parse::<Resource>()
+                .ok()
+                .and_then(|resource| resource.space().cloned())
+                .map(|space| {
+                    space.to_string() == space_filter || space.name().as_str() == space_filter
+                })
+                .unwrap_or(false)
+        });
+        if !matches_space {
+            return Ok(None);
+        }
+    }
+    let resources = grouped
+        .into_iter()
+        .map(|(resource, mut entries)| {
+            entries.sort_by(|left, right| {
+                left.0.cmp(&right.0).then_with(|| {
+                    serde_json::to_string(&left.1)
+                        .unwrap_or_default()
+                        .cmp(&serde_json::to_string(&right.1).unwrap_or_default())
+                })
+            });
+            DelegationResource {
+                resource,
+                actions: entries.iter().map(|entry| entry.0.clone()).collect(),
+                caveats: entries.into_iter().map(|entry| entry.1).collect(),
+            }
+        })
+        .collect();
+
+    let lifecycle = ancestor_state.lifecycle(delegation.id, now)?;
+    let status_matches = match query.status {
+        None => true,
+        Some(DelegationQueryStatus::Active) => lifecycle.status == "active",
+        Some(DelegationQueryStatus::Pending) => lifecycle.status == "pending",
+        Some(DelegationQueryStatus::Expired) => lifecycle.status == "expired",
+        Some(DelegationQueryStatus::Revoked) => {
+            matches!(lifecycle.status, "revoked" | "ancestor_revoked")
+        }
+        Some(DelegationQueryStatus::AncestorRevoked) => lifecycle.status == "ancestor_revoked",
+    };
+    if !status_matches {
+        return Ok(None);
+    }
+
+    let cid = delegation.id.to_cid(0x55).to_string();
+    let mut parents = ancestor_state
+        .parents
+        .get(&delegation.id)
+        .cloned()
+        .unwrap_or_default();
+    parents.sort_by(|left, right| left.as_ref().cmp(right.as_ref()));
+    parents.dedup();
+    Ok(Some(AccountDelegationRecord {
+        cid,
+        direction: direction.to_string(),
+        delegator_did: delegation.delegator,
+        delegate_did: delegation.delegatee,
+        resources,
+        parents: parents
+            .into_iter()
+            .map(|parent| parent.to_cid(0x55).to_string())
+            .collect(),
+        issued_at: delegation.issued_at,
+        not_before: delegation.not_before,
+        expires_at: delegation.expiry,
+        status: lifecycle.status.to_string(),
+        revoked_at: lifecycle
+            .direct_revocation
+            .as_ref()
+            .and_then(|row| row.revoked_at),
+        revoked_by: lifecycle
+            .direct_revocation
+            .as_ref()
+            .map(|row| row.revoker.clone()),
+        revoked_ancestor_cid: lifecycle.revoked_ancestor_cid,
+    }))
 }
 
 async fn load_account_ancestor_state<C: ConnectionTrait>(
@@ -7991,6 +8122,396 @@ mod test {
             "per-DID pagination must not sort pages: {plan:?}"
         );
     }
+
+    // ── TC-2132: `direction: "issued"` ─────────────────────────────────────
+
+    /// Records every statement a query runs and how many rows it returned.
+    struct RecordingConn<'a> {
+        inner: &'a sea_orm::DatabaseConnection,
+        log: tokio::sync::Mutex<Vec<(String, usize)>>,
+    }
+
+    impl<'a> RecordingConn<'a> {
+        fn new(inner: &'a sea_orm::DatabaseConnection) -> Self {
+            Self {
+                inner,
+                log: Default::default(),
+            }
+        }
+
+        async fn statements(&self) -> Vec<(String, usize)> {
+            self.log.lock().await.clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ConnectionTrait for RecordingConn<'_> {
+        fn get_database_backend(&self) -> DbBackend {
+            self.inner.get_database_backend()
+        }
+
+        async fn execute(&self, stmt: Statement) -> Result<sea_orm::ExecResult, DbErr> {
+            self.inner.execute(stmt).await
+        }
+
+        async fn execute_unprepared(&self, sql: &str) -> Result<sea_orm::ExecResult, DbErr> {
+            self.inner.execute_unprepared(sql).await
+        }
+
+        async fn query_one(&self, stmt: Statement) -> Result<Option<sea_orm::QueryResult>, DbErr> {
+            let sql = stmt.sql.clone();
+            let row = self.inner.query_one(stmt).await?;
+            self.log
+                .lock()
+                .await
+                .push((sql, usize::from(row.is_some())));
+            Ok(row)
+        }
+
+        async fn query_all(&self, stmt: Statement) -> Result<Vec<sea_orm::QueryResult>, DbErr> {
+            let sql = stmt.sql.clone();
+            let rows = self.inner.query_all(stmt).await?;
+            self.log.lock().await.push((sql, rows.len()));
+            Ok(rows)
+        }
+
+        fn support_returning(&self) -> bool {
+            self.inner.support_returning()
+        }
+
+        fn is_mock_connection(&self) -> bool {
+            self.inner.is_mock_connection()
+        }
+    }
+
+    /// Insert `count` delegations issued by `issuer`, each with one ability.
+    /// Returns their ids in `id` order.
+    async fn seed_issued(
+        db: &sea_orm::DatabaseConnection,
+        issuer: &str,
+        count: usize,
+    ) -> Vec<Hash> {
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set};
+
+        for did in [issuer, "did:key:tc2132-recipient"] {
+            if actor::Entity::find_by_id(did)
+                .one(db)
+                .await
+                .unwrap()
+                .is_none()
+            {
+                actor::ActiveModel {
+                    id: Set(did.to_string()),
+                }
+                .insert(db)
+                .await
+                .unwrap();
+            }
+        }
+        let now = OffsetDateTime::now_utc();
+        let ids = (0..count)
+            .map(|n| crate::hash::hash(format!("tc2132-{issuer}-{n}").as_bytes()))
+            .collect::<Vec<_>>();
+        for chunk in ids.chunks(100) {
+            delegation::Entity::insert_many(chunk.iter().map(|id| delegation::ActiveModel {
+                id: Set(*id),
+                delegator: Set(issuer.to_string()),
+                delegatee: Set("did:key:tc2132-recipient".to_string()),
+                expiry: Set(Some(now + time::Duration::hours(1))),
+                issued_at: Set(Some(now)),
+                not_before: Set(None),
+                facts: Set(None),
+                serialization: Set(id.as_ref().to_vec()),
+            }))
+            .exec(db)
+            .await
+            .unwrap();
+            abilities::Entity::insert_many(chunk.iter().map(|id| abilities::ActiveModel {
+                resource: Set("tinycloud:pkh:eip155:1:0x0000000000000000000000000000000000000001:files/kv/docs"
+                    .parse()
+                    .unwrap()),
+                ability: Set("tinycloud.kv/get".to_string().try_into().unwrap()),
+                delegation: Set(*id),
+                caveats: Set(Default::default()),
+            }))
+            .exec(db)
+            .await
+            .unwrap();
+        }
+        let mut ids = ids;
+        ids.sort();
+        ids
+    }
+
+    fn issued_query(limit: u16, cursor: Option<String>) -> DelegationQuery {
+        DelegationQuery {
+            direction: DelegationQueryDirection::Issued,
+            limit: Some(limit),
+            cursor,
+            ..Default::default()
+        }
+    }
+
+    fn cids(ids: &[Hash]) -> Vec<String> {
+        ids.iter().map(|id| id.to_cid(0x55).to_string()).collect()
+    }
+
+    #[tokio::test]
+    async fn issued_pages_visit_every_row_once_and_end() {
+        let db = get_db().await.unwrap();
+        let issuer = "did:key:tc2132-issuer-a";
+        let mine = seed_issued(&db.conn, issuer, 25).await;
+        seed_issued(&db.conn, "did:key:tc2132-issuer-b", 7).await;
+
+        let mut seen = Vec::new();
+        let mut sizes = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = issued_delegations_page(&db.conn, issuer, &issued_query(10, cursor))
+                .await
+                .unwrap();
+            sizes.push(page.items.len());
+            seen.extend(page.items.into_iter().map(|item| item.cid));
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(sizes, [10, 10, 5]);
+        assert_eq!(seen, cids(&mine), "every row once, in id order");
+
+        // Exactly two full pages: the second is the last, no empty third page.
+        let db = get_db().await.unwrap();
+        let mine = seed_issued(&db.conn, issuer, 20).await;
+        let first = issued_delegations_page(&db.conn, issuer, &issued_query(10, None))
+            .await
+            .unwrap();
+        assert_eq!(first.items.len(), 10);
+        let second =
+            issued_delegations_page(&db.conn, issuer, &issued_query(10, first.next_cursor))
+                .await
+                .unwrap();
+        assert_eq!(
+            second
+                .items
+                .iter()
+                .map(|i| i.cid.clone())
+                .collect::<Vec<_>>(),
+            cids(&mine[10..])
+        );
+        assert!(second.next_cursor.is_none());
+        assert!(second.items.iter().all(|item| item.direction == "granted"));
+    }
+
+    #[tokio::test]
+    async fn issued_status_filter_reaches_every_match_in_bounded_queries() {
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set};
+
+        let db = get_db().await.unwrap();
+        let issuer = "did:key:tc2132-issuer-a";
+        let mine = seed_issued(&db.conn, issuer, 1000).await;
+        let revoked = mine.iter().step_by(10).copied().collect::<Vec<_>>();
+        for id in &revoked {
+            revocation::ActiveModel {
+                id: Set(crate::hash::hash(
+                    format!("tc2132-revocation-{id:?}").as_bytes(),
+                )),
+                revoker: Set(issuer.to_string()),
+                revoked: Set(*id),
+                serialization: Set(id.as_ref().to_vec()),
+                revoked_at: Set(Some(OffsetDateTime::now_utc())),
+            }
+            .insert(&db.conn)
+            .await
+            .unwrap();
+        }
+
+        let recording = RecordingConn::new(&db.conn);
+        let mut found = Vec::new();
+        let mut pages = 0;
+        let mut cursor = None;
+        loop {
+            let query = DelegationQuery {
+                status: Some(DelegationQueryStatus::Revoked),
+                ..issued_query(50, cursor)
+            };
+            let page = issued_delegations_page(&recording, issuer, &query)
+                .await
+                .unwrap();
+            pages += 1;
+            assert!(page.items.len() <= 50);
+            assert!(page.items.iter().all(|item| item.status == "revoked"));
+            found.extend(page.items.into_iter().map(|item| item.cid));
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        let mut expected = cids(&revoked);
+        expected.sort();
+        found.sort();
+        assert_eq!(found, expected, "every matching row once");
+        assert_eq!(pages, 20, "1000 rows scanned 50 at a time");
+        let statements = recording.statements().await;
+        assert!(
+            statements.len() <= pages * 8,
+            "bounded queries per page: {} statements over {pages} pages",
+            statements.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn issued_page_reads_at_most_limit_plus_one_delegation_rows_on_the_index() {
+        let db = get_db().await.unwrap();
+        let issuer = "did:key:tc2132-issuer-a";
+        let mine = seed_issued(&db.conn, issuer, 120).await;
+        // Many other issuers: none of their rows may be read.
+        for other in 0..20 {
+            seed_issued(&db.conn, &format!("did:key:tc2132-other-{other}"), 100).await;
+        }
+
+        let limit = 10u16;
+        let recording = RecordingConn::new(&db.conn);
+        let page = issued_delegations_page(&recording, issuer, &issued_query(limit, None))
+            .await
+            .unwrap();
+        assert_eq!(
+            page.items.iter().map(|i| i.cid.clone()).collect::<Vec<_>>(),
+            cids(&mine[..limit as usize])
+        );
+        let statements = recording.statements().await;
+        let delegation_reads = statements
+            .iter()
+            .filter(|(sql, _)| sql.contains("FROM \"delegation\""))
+            .collect::<Vec<_>>();
+        let (scan_sql, scan_rows) = delegation_reads[0];
+        assert!(
+            scan_sql.contains("\"delegator\" = ") && scan_sql.contains("LIMIT"),
+            "{scan_sql}"
+        );
+        assert_eq!(*scan_rows, limit as usize + 1);
+        for (sql, _) in &delegation_reads[1..] {
+            assert!(
+                sql.contains("WHERE \"delegation\".\"id\" IN") && !sql.contains("\"delegator\" ="),
+                "only the page's ancestors may be loaded: {sql}"
+            );
+        }
+        let delegation_rows: usize = delegation_reads.iter().map(|(_, rows)| rows).sum();
+        assert!(
+            delegation_rows <= 2 * limit as usize + 1,
+            "{delegation_rows} delegation rows read for a page of {limit}"
+        );
+        assert!(
+            statements.iter().all(|(sql, _)| {
+                !sql.contains("\"delegatee\" IN") && !sql.contains("\"delegatee\" =")
+            }),
+            "no account-wide delegator-or-delegatee load"
+        );
+
+        let cursor = DelegationQuery::default().encode_issued_cursor(issuer, mine[40]);
+        let after = DelegationQuery {
+            cursor: Some(cursor),
+            ..issued_query(limit, None)
+        };
+        let decoded = after.decoded_issued_cursor(issuer).unwrap();
+        for after_id in [None, decoded] {
+            let mut statement =
+                issued_delegation_select(issuer, after_id, limit as u64).build(DbBackend::Sqlite);
+            statement.sql = format!("EXPLAIN QUERY PLAN {}", statement.sql);
+            let plan = db
+                .conn
+                .query_all(statement)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| row.try_get::<String>("", "detail").unwrap())
+                .collect::<Vec<_>>();
+            assert!(
+                plan.iter()
+                    .any(|line| line.contains("idx_delegation_delegator")
+                        && line.contains("delegator=?")),
+                "must seek the delegator index: {plan:?}"
+            );
+            assert!(
+                plan.iter().all(|line| !line.contains("TEMP B-TREE")),
+                "must not sort: {plan:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn issued_cursor_is_bound_to_invoker_and_filters_and_never_looked_up() {
+        let db = get_db().await.unwrap();
+        let a = "did:key:tc2132-issuer-a";
+        let b = "did:key:tc2132-issuer-b";
+        let mine = seed_issued(&db.conn, a, 5).await;
+        let theirs = seed_issued(&db.conn, b, 5).await;
+
+        let first = issued_delegations_page(&db.conn, a, &issued_query(2, None))
+            .await
+            .unwrap();
+        let cursor = first.next_cursor.unwrap();
+        let b_first = issued_delegations_page(&db.conn, b, &issued_query(2, None))
+            .await
+            .unwrap();
+        let b_cursor = b_first.next_cursor.unwrap();
+
+        let invalid = |result: Result<DelegationQueryPage, AccountDelegationQueryError>| {
+            matches!(result, Err(AccountDelegationQueryError::InvalidCursor))
+        };
+        // Another invoker's cursor, another filter's cursor, the legacy CID
+        // cursor and plain garbage are the same error.
+        for bad in [
+            b_cursor,
+            DelegationQuery::encode_cursor(&theirs[0].to_cid(0x55).to_string()),
+            DelegationQuery::encode_cursor("garbage"),
+        ] {
+            assert!(invalid(
+                issued_delegations_page(&db.conn, a, &issued_query(2, Some(bad))).await
+            ));
+        }
+        let other_filter = DelegationQuery {
+            status: Some(DelegationQueryStatus::Active),
+            ..issued_query(2, Some(cursor.clone()))
+        };
+        assert!(invalid(
+            issued_delegations_page(&db.conn, a, &other_filter).await
+        ));
+        let other_space = DelegationQuery {
+            space: Some("files".to_string()),
+            ..issued_query(2, Some(cursor.clone()))
+        };
+        assert!(invalid(
+            issued_delegations_page(&db.conn, a, &other_space).await
+        ));
+
+        // Same invoker and filter: continues after the last scanned row.
+        let second = issued_delegations_page(&db.conn, a, &issued_query(2, Some(cursor)))
+            .await
+            .unwrap();
+        assert_eq!(
+            second
+                .items
+                .iter()
+                .map(|i| i.cid.clone())
+                .collect::<Vec<_>>(),
+            cids(&mine[2..4])
+        );
+
+        // A well-formed key is only a position among the invoker's rows: a key
+        // that is another issuer's row, or no row at all, never changes the
+        // kind of answer (no existence oracle).
+        let template = DelegationQuery::default();
+        for key in [theirs[0], crate::hash::hash(b"tc2132-no-such-row")] {
+            let query = issued_query(2, Some(template.encode_issued_cursor(a, key)));
+            let page = issued_delegations_page(&db.conn, a, &query).await.unwrap();
+            assert!(page.items.iter().all(|item| item.delegator_did == a
+                && mine
+                    .iter()
+                    .any(|id| id.to_cid(0x55).to_string() == item.cid)));
+        }
+    }
+
     #[tokio::test]
     async fn sqlite_account_cursor_index_migration_recovers_after_index_drop() {
         use sea_orm_migration::{MigrationTrait, SchemaManager};

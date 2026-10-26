@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Changes
+- `POST /delegation/query` accepts `direction: "issued"` to list the delegations the calling key issued. Details: TC-2132
+
 ## [1.25.7] - 2026-10-26
 
 ### Changes
