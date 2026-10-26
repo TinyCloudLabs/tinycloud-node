@@ -15,6 +15,16 @@ use std::future::Future;
 
 const CLOSE_ON_DROP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long the ping that tests a released connection may take (TinyCloud patch, TC-2035).
+///
+/// A connection whose statement future was dropped mid-flight (a caller's timeout, a cancelled
+/// request) is still owed that statement's reply, and the release ping waits for it. If the peer
+/// never answers (a stalled proxy or socket), that wait has no bound of its own, so the ping, the
+/// socket and the pool permit are held for good. Past this bound the connection is closed hard
+/// and its permit released, so the pool opens a replacement. Overridable per pool with
+/// `PoolOptions::release_ping_timeout`.
+pub(super) const RELEASE_PING_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// A connection managed by a [`Pool`][crate::pool::Pool].
 ///
 /// Will be returned to the pool on-drop.
@@ -311,14 +321,25 @@ impl<DB: Database> Floating<DB, Live<DB>> {
         // returned to the pool; also of course, if it was dropped due to an error
         // this is simply a band-aid as SQLx-next connections should be able
         // to recover from cancellations
-        if let Err(error) = self.raw.ping().await {
+        let ping_timeout = self.guard.pool.options.release_ping_timeout;
+        let pinged = match crate::rt::timeout(ping_timeout, self.raw.ping()).await {
+            Ok(pinged) => pinged,
+            Err(_) => Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the release ping did not answer in time",
+            ))),
+        };
+        if let Err(error) = pinged {
             tracing::warn!(
                 %error,
                 "error occurred while testing the connection on-release",
             );
 
-            // Connection is broken, don't try to gracefully close.
-            self.close_hard().await;
+            // Connection is broken, don't try to gracefully close. This also covers a ping that
+            // did not answer within `release_ping_timeout`. The close is bounded too: on timeout
+            // the future, and with it the connection and the pool permit, is dropped, which
+            // closes the socket and releases the permit.
+            let _ = crate::rt::timeout(CLOSE_ON_DROP_TIMEOUT, self.close_hard()).await;
             false
         } else {
             // if the connection is still viable, release it to the pool
