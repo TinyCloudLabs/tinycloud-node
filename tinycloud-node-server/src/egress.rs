@@ -1,4 +1,5 @@
 //! Outbound webhook destination policy. This does not enable network DID resolution.
+use crate::links_fetch::LinksOrigin;
 use crate::{config::Config, BlockConfig};
 use reqwest::{
     dns::{Addrs, Resolve, Resolving},
@@ -226,8 +227,16 @@ impl EgressPolicy {
         }
     }
 
-    fn permits_ip_in(&self, ip: IpAddr, denied: &HashSet<IpAddr>, scope: AddressScope) -> bool {
-        if denied.contains(&ip) || embedded_v4(ip).any(|v4| denied.contains(&IpAddr::V4(v4))) {
+    fn permits_ip_in(
+        &self,
+        ip: IpAddr,
+        denied: &HashSet<IpAddr>,
+        scope: AddressScope,
+        deny_set_exempt: bool,
+    ) -> bool {
+        if !deny_set_exempt
+            && (denied.contains(&ip) || embedded_v4(ip).any(|v4| denied.contains(&IpAddr::V4(v4))))
+        {
             return false;
         }
         let forbidden = Self::forbidden(ip)
@@ -242,12 +251,15 @@ impl EgressPolicy {
         ips: impl Iterator<Item = IpAddr>,
         port: u16,
         scope: AddressScope,
+        deny_set_exempt: bool,
     ) -> Result<Vec<SocketAddr>, EgressError> {
         let deny = self.send_lease().await?;
         let mut addresses = Vec::new();
         for ip in ips {
             let address = SocketAddr::new(ip, port);
-            if self.permits_ip_in(ip, &deny.addresses, scope) && !addresses.contains(&address) {
+            if self.permits_ip_in(ip, &deny.addresses, scope, deny_set_exempt)
+                && !addresses.contains(&address)
+            {
                 addresses.push(address);
             }
         }
@@ -272,19 +284,45 @@ impl EgressPolicy {
         url: &Url,
         scope: AddressScope,
     ) -> Result<VettedDestination, EgressError> {
+        self.resolve_url_scoped_inner(url, scope, false).await
+    }
+
+    /// Only a typed, operator-configured links origin may bypass overlap with
+    /// internal service addresses; all special-use address checks still apply.
+    pub(crate) async fn resolve_links_origin(
+        &self,
+        origin: &LinksOrigin,
+        url: &Url,
+        scope: AddressScope,
+    ) -> Result<VettedDestination, EgressError> {
+        if !origin.contains(url) {
+            return Err(EgressError::Forbidden);
+        }
+        self.resolve_url_scoped_inner(url, scope, true).await
+    }
+
+    async fn resolve_url_scoped_inner(
+        &self,
+        url: &Url,
+        scope: AddressScope,
+        deny_set_exempt: bool,
+    ) -> Result<VettedDestination, EgressError> {
         self.ensure_fresh().await?;
         let host = url.host_str().ok_or(EgressError::Forbidden)?;
         let port = url.port_or_known_default().ok_or(EgressError::Forbidden)?;
         let addresses = if let Ok(ip) = host.trim_matches(['[', ']']).parse() {
-            self.permitted(std::iter::once(ip), port, scope).await?
+            self.permitted(std::iter::once(ip), port, scope, deny_set_exempt)
+                .await?
         } else {
             let ips = self.lookup_bounded(host).await?;
-            self.permitted(ips.into_iter(), port, scope).await?
+            self.permitted(ips.into_iter(), port, scope, deny_set_exempt)
+                .await?
         };
         Ok(VettedDestination {
             url: url.clone(),
             addresses: addresses.into(),
             scope,
+            deny_set_exempt,
         })
     }
 
@@ -411,7 +449,7 @@ fn embedded_v4(ip: IpAddr) -> impl Iterator<Item = Ipv4Addr> {
 
 /// Which special-use addresses a destination may use. Every scope refuses
 /// unspecified, multicast, reserved, documentation and similar classes and the
-/// operator's internal endpoints.
+/// operator's internal endpoints (except the configured links origin).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AddressScope {
     /// Public addresses only.
@@ -443,6 +481,7 @@ pub struct VettedDestination {
     url: Url,
     addresses: Arc<[SocketAddr]>,
     scope: AddressScope,
+    deny_set_exempt: bool,
 }
 
 impl VettedDestination {
@@ -466,6 +505,7 @@ struct PolicyResolver {
     addresses: Arc<[SocketAddr]>,
     scope: AddressScope,
     policy: Arc<EgressPolicy>,
+    deny_set_exempt: bool,
     denied: Arc<HashSet<IpAddr>>,
 }
 
@@ -475,6 +515,7 @@ impl Resolve for PolicyResolver {
         let addresses = self.addresses.clone();
         let denied = self.denied.clone();
         let scope = self.scope;
+        let deny_set_exempt = self.deny_set_exempt;
         let matches = name.as_str() == self.host;
         Box::pin(async move {
             if !matches {
@@ -484,7 +525,9 @@ impl Resolve for PolicyResolver {
             }
             let mut vetted = (0..addresses.len())
                 .map(move |index| addresses[index])
-                .filter(move |address| policy.permits_ip_in(address.ip(), &denied, scope));
+                .filter(move |address| {
+                    policy.permits_ip_in(address.ip(), &denied, scope, deny_set_exempt)
+                });
             let first = vetted.next().ok_or(EgressError::Forbidden)?;
             Ok(Box::new(std::iter::once(first).chain(vetted)) as Addrs)
         })
@@ -614,11 +657,14 @@ fn pinned_client(
     denied: &Arc<HashSet<IpAddr>>,
     timeout: Duration,
 ) -> Result<(Client, Url), SendError> {
-    if !destination
-        .addresses
-        .iter()
-        .any(|address| policy.permits_ip_in(address.ip(), denied, destination.scope))
-    {
+    if !destination.addresses.iter().any(|address| {
+        policy.permits_ip_in(
+            address.ip(),
+            denied,
+            destination.scope,
+            destination.deny_set_exempt,
+        )
+    }) {
         return Err(EgressError::Forbidden.into());
     }
     let host = destination
@@ -648,6 +694,7 @@ fn pinned_client(
             addresses: destination.addresses,
             scope: destination.scope,
             policy: policy.clone(),
+            deny_set_exempt: destination.deny_set_exempt,
             denied: denied.clone(),
         }))
         .build()?;

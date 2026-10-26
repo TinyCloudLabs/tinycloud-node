@@ -149,6 +149,12 @@ lazy_static! {
         "Reads answered read_audit_busy because their audit record was not committed in time."
     )
     .unwrap();
+    /// Read-audit batches abandoned at the commit bound (TC-2035).
+    pub static ref READ_AUDIT_BATCH_TIMEOUTS: IntCounter = register_int_counter!(
+        "tinycloud_read_audit_batch_timeout_total",
+        "Read-audit commit batches abandoned because their commit did not finish within its bound."
+    )
+    .unwrap();
     /// Reads answered as stopped because the read-audit drain was gone.
     pub static ref READ_AUDIT_STOPPED: IntCounter = register_int_counter!(
         "tinycloud_read_audit_stopped_total",
@@ -277,6 +283,10 @@ pub fn observe_read_audit(
             .inc_by(now.failed_batches.saturating_sub(previous.failed_batches));
         READ_AUDIT_ABANDONED.inc_by(now.abandoned.saturating_sub(previous.abandoned));
         READ_AUDIT_BUSY.inc_by(now.busy.saturating_sub(previous.busy));
+        READ_AUDIT_BATCH_TIMEOUTS.inc_by(
+            now.timed_out_batches
+                .saturating_sub(previous.timed_out_batches),
+        );
         READ_AUDIT_STOPPED.inc_by(now.stopped.saturating_sub(previous.stopped));
         READ_AUDIT_QUEUE_DEPTH.set(now.queue_depth as i64);
         READ_AUDIT_IN_FLIGHT_MS.set(now.in_flight_batch_age_ms as i64);
