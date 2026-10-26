@@ -238,16 +238,10 @@ impl RecoveringConnection {
     /// statement whose effect or result depends on whether it already ran:
     /// the replay guard's `INSERT ... ON CONFLICT DO NOTHING` reports a
     /// conflict as a replay, so it must not be retried.
-    ///
-    /// If the returned future is dropped before the statement's result
-    /// arrives (a caller's timeout), its connection is closed and its pool
-    /// slot freed instead of being returned to the pool: a released
-    /// connection is pinged, and the ping waits for the abandoned
-    /// statement's reply, which never comes on a stalled connection (TC-2035).
     pub async fn execute_idempotent(&self, stmt: Statement) -> Result<ExecResult, DbErr> {
         let started = Instant::now();
         let in_flight = InFlightWrite::arm(true);
-        let result = match self.execute_discarding_on_cancel(stmt.clone()).await {
+        let result = match self.conn.execute(stmt.clone()).await {
             Err(error) if is_connection_error(&error) && !self.within_retry_window(started) => {
                 self.lost("execute_idempotent", &error, false);
                 Err(error)
@@ -257,10 +251,7 @@ impl RecoveringConnection {
                 if let Some(recovery) = &self.recovery {
                     recovery.idempotent_retries.fetch_add(1, Ordering::Relaxed);
                 }
-                self.retried(
-                    "execute_idempotent",
-                    self.execute_discarding_on_cancel(stmt).await,
-                )
+                self.retried("execute_idempotent", self.conn.execute(stmt).await)
             }
             result => result,
         };
@@ -269,22 +260,20 @@ impl RecoveringConnection {
         result
     }
 
-    /// [`ConnectionTrait::execute`], except that on PostgreSQL a future
-    /// dropped before its result arrives closes the connection it was using.
-    ///
-    /// sqlx returns a dropped statement's connection to the pool, which pings
-    /// it first; the ping waits for the statement's reply, so a connection
-    /// that never answers is held (with its pool slot) with no bound.
-    async fn execute_discarding_on_cancel(&self, stmt: Statement) -> Result<ExecResult, DbErr> {
-        #[cfg(feature = "postgres")]
-        if matches!(self.conn, DatabaseConnection::SqlxPostgresPoolConnection(_)) {
-            return execute_postgres_discarding_on_cancel(
-                self.conn.get_postgres_connection_pool(),
-                stmt,
-            )
-            .await;
-        }
-        self.conn.execute(stmt).await
+    /// Pre-upload authorization and orphan registration share one connection.
+    /// Reserve SQLite's database writer before authorization reads, just like
+    /// the other write paths: a separate collector connection must not commit
+    /// after our snapshot and turn registration into SQLITE_BUSY_SNAPSHOT.
+    /// This transaction changes only retryable candidate metadata and commits
+    /// before blob persistence, so its uncertain outcome cannot mean a
+    /// user-visible KV write committed.
+    pub(crate) async fn begin_preparatory(&self) -> Result<DatabaseTransaction, DbErr> {
+        let transaction = self
+            .run("begin_preparatory", true, || {
+                crate::db::begin_write_transaction(&self.conn, None)
+            })
+            .await?;
+        self.scope_local_timeout(transaction).await
     }
 
     /// The outcome of the one retry. It is never retried again, but a
@@ -833,50 +822,6 @@ impl Future for KeepConnection {
     fn poll(self: Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
         std::task::Poll::Ready(Ok(true))
     }
-}
-
-/// Run `stmt` the way sea-orm's PostgreSQL `execute` does (same acquire,
-/// bind and error mapping), but on a connection that is closed, not
-/// released, if this future is dropped before the statement's result
-/// arrives (TC-2035).
-///
-/// A released connection is pinged by sqlx before it re-enters the pool, and
-/// the ping first reads the abandoned statement's reply. On a connection
-/// that never answers, that task, the connection and its pool slot are held
-/// for good. `detach` frees the slot at once and the dropped socket closes.
-#[cfg(feature = "postgres")]
-async fn execute_postgres_discarding_on_cancel(
-    pool: &sea_orm::sqlx::PgPool,
-    stmt: Statement,
-) -> Result<ExecResult, DbErr> {
-    use sea_orm::{error::ConnAcquireErr, sqlx::pool::PoolConnection, sqlx::Postgres};
-
-    struct DiscardOnDrop(Option<PoolConnection<Postgres>>);
-    impl Drop for DiscardOnDrop {
-        fn drop(&mut self) {
-            if let Some(connection) = self.0.take() {
-                drop(connection.detach());
-            }
-        }
-    }
-
-    let values = stmt
-        .values
-        .unwrap_or_else(|| sea_orm::sea_query::Values(Vec::new()));
-    let query = sea_orm::sqlx::query_with(&stmt.sql, sea_query_binder::SqlxValues(values));
-    let connection = pool.acquire().await.map_err(|error| match error {
-        SqlxError::PoolTimedOut => DbErr::ConnectionAcquire(ConnAcquireErr::Timeout),
-        SqlxError::PoolClosed => DbErr::ConnectionAcquire(ConnAcquireErr::ConnectionClosed),
-        error => DbErr::Conn(RuntimeErr::SqlxError(error)),
-    })?;
-    let mut held = DiscardOnDrop(Some(connection));
-    let connection = held.0.as_mut().expect("connection held until released");
-    let result = query.execute(&mut **connection).await;
-    // The result arrived: release the connection to the pool as usual.
-    drop(held.0.take());
-    result
-        .map(ExecResult::from)
-        .map_err(|error| DbErr::Exec(RuntimeErr::SqlxError(error)))
 }
 
 /// Whether `error` means the connection it ran on is gone, so the statement

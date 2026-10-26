@@ -79,3 +79,44 @@ test runtime, require it in CI, and otherwise print an explicit local skip.
 They use SELECT-only statements and test raw BEGIN/SAVEPOINT through SQLx and
 SeaORM, validation, success/failure, awaited commit/rollback, and acquisition
 timeout/closed-pool failure. MySQL has no integration-test server in this suite.
+
+## Bounded release ping (TC-2035)
+
+### Why
+
+sqlx returns a dropped connection to the pool through
+`Floating::return_to_pool`, which pings it first. A connection whose statement
+future was dropped mid-flight (a caller's timeout, a cancelled request) still
+owes that statement's reply, and the ping waits for it. If the peer never
+answers (a stalled proxy or socket), nothing bounds that wait: the spawned
+release task, the socket and the pool permit are held for good. The read-audit
+drain hit this: a batch commit that never returned stopped the drain, and
+dropping its future from a timeout would have held the pool slot instead.
+
+### The delta
+
+- `src/pool/connection.rs`: `RELEASE_PING_TIMEOUT` (5 s). In
+  `Floating::return_to_pool`, the release ping runs under
+  `crate::rt::timeout(self.guard.pool.options.release_ping_timeout, ..)`. A
+  timeout is handled like a failed ping: `warn!` log, then `close_hard()`, itself
+  bounded by `CLOSE_ON_DROP_TIMEOUT` (on that timeout the future is dropped, which
+  closes the socket and releases the permit). The pool opens a replacement on
+  the next acquire; the permit is released on every path.
+- `src/pool/options.rs`: `PoolOptions::release_ping_timeout(Duration)` and a
+  `release_ping_timeout` field (default `RELEASE_PING_TIMEOUT`, copied in `Clone`
+  and `new`). The node leaves the default; a test shortens it for one pool.
+
+### Effect
+
+Pool-wide. Any released connection whose ping does not answer within the bound is
+closed instead of held. A live server finishing a long dropped statement is no
+longer waited for; closing the socket makes the server abort it.
+
+### Re-applying on a vendor bump
+
+Re-apply the two hunks above to the new `pool/connection.rs` (the ping in
+`return_to_pool`, and the new const) and `pool/options.rs` (the field, `Clone`,
+`new`, the setter). The regression is
+`read_audit::tests::tc2035_a_stalled_connection_is_closed_and_its_pool_slot_freed`
+in `tinycloud-core`, which uses a listener that never answers after startup. Drop
+this patch when upstream bounds the release ping.

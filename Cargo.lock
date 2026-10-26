@@ -9896,6 +9896,7 @@ dependencies = [
  "hex",
  "hkdf",
  "hmac 0.12.1",
+ "idna",
  "iri-string",
  "k256",
  "libc",
@@ -9909,7 +9910,6 @@ dependencies = [
  "ryu-js",
  "sea-orm",
  "sea-orm-migration",
- "sea-query-binder",
  "serde",
  "serde_ipld_dagcbor 0.3.0",
  "serde_json",
@@ -9933,7 +9933,7 @@ dependencies = [
 
 [[package]]
 name = "tinycloud-node"
-version = "1.23.0"
+version = "1.25.2"
 dependencies = [
  "aes-gcm",
  "anyhow",

@@ -2601,13 +2601,15 @@ mod tests {
     }
 
     /// A one-connection pool (so a leaked slot is visible) to `server`, with
-    /// that connection already open.
+    /// that connection already open. The release-ping bound is shortened from
+    /// its 5 s default so the test is fast; it is a per-pool option.
     async fn black_hole_pool(server: &BlackHole) -> sea_orm::sqlx::PgPool {
         use sea_orm::sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
 
         PgPoolOptions::new()
             .max_connections(1)
             .acquire_timeout(Duration::from_secs(2))
+            .release_ping_timeout(Duration::from_millis(300))
             .test_before_acquire(false)
             .connect_with(
                 PgConnectOptions::new()
@@ -2621,10 +2623,12 @@ mod tests {
             .expect("the black hole completes the startup")
     }
 
-    /// A batch whose connection stalls (the server never answers) times out,
-    /// and the stalled connection is closed and its pool slot freed rather
-    /// than returned: the pool, limited to one connection, serves the next
-    /// acquire on a new socket, and the drain keeps going.
+    /// A batch whose connection stalls (the server never answers) fails
+    /// within the commit bound as retryable. The stalled connection's release
+    /// ping is then bounded too: its socket is closed and its pool permit
+    /// freed within the commit bound plus the ping bound, instead of being
+    /// held for ever, so the one-connection pool serves the next acquire on a
+    /// new socket, and the drain keeps going.
     #[tokio::test]
     async fn tc2035_a_stalled_connection_is_closed_and_its_pool_slot_freed() {
         let server = black_hole().await;
@@ -2635,16 +2639,20 @@ mod tests {
         assert_eq!((pool.size(), pool.num_idle()), (1, 1));
         assert_eq!(server.accepted.load(Ordering::SeqCst), 1);
 
+        let started = Instant::now();
         assert_eq!(
             bounded(&pipeline, 0).await,
             Err(ReadAuditError::Unavailable)
         );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "answered at the commit bound"
+        );
         let health = pipeline.health();
         assert_eq!((health.timed_out_batches, health.failed_batches), (1, 1));
-        // The slot is free again, not held by a connection waiting for a
-        // reply that never comes.
-        assert_eq!((pool.size(), pool.num_idle()), (0, 0));
-        until(|| server.closed.load(Ordering::SeqCst) == 1).await;
+        // The permit and socket recover once the release ping's bound passes.
+        until(|| pool.size() == 0 && server.closed.load(Ordering::SeqCst) == 1).await;
+        assert_eq!(pool.num_idle(), 0);
 
         // A following acquire against the (otherwise healthy) server opens a
         // new connection within the one-connection limit.
@@ -2654,11 +2662,10 @@ mod tests {
             .expect("the freed slot serves a new connection");
         assert_eq!(pool.size(), 1);
         assert_eq!(server.accepted.load(Ordering::SeqCst), 2);
-        // Not released: the pool's release ping would wait on this server
-        // for ever, which is why the batch's connection is discarded.
-        drop(fresh.detach());
-        assert_eq!(pool.size(), 0);
-        until(|| server.closed.load(Ordering::SeqCst) == 2).await;
+        // A connection released with nothing in flight is pinged too, and this
+        // server never answers: the same bound closes it.
+        drop(fresh);
+        until(|| pool.size() == 0 && server.closed.load(Ordering::SeqCst) == 2).await;
 
         // The drain went on: the next batch opens a connection, stalls,
         // times out, and closes it as well.
@@ -2667,7 +2674,7 @@ mod tests {
             Err(ReadAuditError::Unavailable)
         );
         assert_eq!(pipeline.health().timed_out_batches, 2);
-        assert_eq!(pool.size(), 0);
+        until(|| pool.size() == 0).await;
         until(|| server.closed.load(Ordering::SeqCst) == 3).await;
         assert_eq!(server.accepted.load(Ordering::SeqCst), 3);
     }
