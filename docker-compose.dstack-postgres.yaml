@@ -28,6 +28,7 @@ services:
       - "8000:8000"
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock
+      - deletion-ledger:/var/lib/tinycloud/ledger
     environment:
       TINYCLOUD_KEYS_TYPE: Dstack
       TINYCLOUD_STORAGE_DATABASE: "${DATABASE_URL}"
@@ -91,6 +92,12 @@ services:
       TINYCLOUD_QUOTA_URL: "${TINYCLOUD_QUOTA_URL}"
       TINYCLOUD_ADMIN_SECRET: "${TINYCLOUD_ADMIN_SECRET}"
       NODE_STATS_READ_TOKEN: "${NODE_STATS_READ_TOKEN:-}"
+      # TC-1777: named-keys release gate. Set by the docker.yml named_keys_v1
+      # workflow input (default false); never hand-edit the CVM env.
+      TINYCLOUD_ENCRYPTION_NETWORK__NAMED_KEYS_V1: "${NAMED_KEYS_V1:-false}"
+      # Append-only record of deleted keys, on the deletion-ledger volume so it
+      # survives container replacement. Required by the node while the gate is on.
+      TINYCLOUD_ENCRYPTION_NETWORK__DELETION_LEDGER_PATH: /var/lib/tinycloud/ledger/deletions.jsonl
       ROCKET_ADDRESS: "0.0.0.0"
       ROCKET_MAX_BLOCKING: "1024"
 
@@ -180,6 +187,7 @@ services:
 
 volumes:
   cert-data:
+  deletion-ledger:
 
 networks:
   logship:

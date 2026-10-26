@@ -503,7 +503,7 @@ traits plus an in-memory implementation for tests):
 
 Migration `m20261021_000000_sql_store_manifest`. Other pending migrations:
 #374 adds `m20261020_000000_current_kv_key_c_index`; #301 (TC-735) carries
-`m20261017_020000_kv_orphan_candidates`. SeaORM applies out-of-order
+`m20261023_010000_kv_orphan_candidates`. SeaORM applies out-of-order
 versions; none touches these tables. Rules from #341 / #343 / #374:
 
 - `CREATE TABLE IF NOT EXISTS` for both tables; **no foreign keys** (an FK to
@@ -698,3 +698,29 @@ These keys sit under `[sql_store]`. They are checked at boot only when `enabled 
 
 PR A tests: `object_format_must_match_its_kind`, `segment_from_must_follow_base_seq` and `object_state_flip_checks_the_format` (11.1); `created_at_is_stored_canonically`, `created_at_out_of_range_is_invalid_not_a_panic` and `revive_restarts_the_orphan_clock` (11.2); `sql_store_refuses_enable_mysql_and_non_canonical_spaces` (11.3); `sql_store_defaults_match_the_contract`, `sql_store_new_setting_defaults_and_pg_concurrency_floor`, `sql_store_new_settings_parse_and_are_bounded`, `sql_store_settings_are_checked_only_when_enabled` and `sql_store_new_settings_are_bounded_when_enabled` (11.4). The manifest tests run against SQLite and PostgreSQL.
 
+## 12. Object store backends
+
+Slice 1b PR B adds the two backends of the object store trait in `tinycloud-node-server/src/storage/sql_object.rs`. Neither is started by the node yet.
+
+### 12.1 S3
+
+- The store uses the block store's bucket and client settings. The object key is the key of section 3.1, unchanged. The object carries its lowercase hex SHA-256 as user metadata `sha256`.
+- A body that does not hash to the key is refused with `BodyMismatch` before any request is sent.
+- In conditional mode an object is created with one PUT carrying `If-None-Match: *`. A 412 answer is accepted only after a HEAD shows the stored object has the same length and the same `sha256` metadata (`AlreadyPresent`); any other stored object gives `Conflict`. A stored object without the metadata is a backend error, never a match.
+- The startup probe writes a fixed small body to `sql/v1/_probe/v1` twice with `If-None-Match: *`. A 412 on the second request selects conditional mode. A second success, or a 501 or NotImplemented answer for the header, selects check-then-create mode. Any other failure, any other status included, is an error and the store does not start. The result is logged once at info level (target `tinycloud::sql_store`) with the mode and the status and code of the answer that decided it. The probe object is not deleted.
+- In check-then-create mode the store sends a HEAD first. An absent object is created with an unconditional PUT; an existing one is compared as above. Creators of one key in one process run one at a time in both modes; creators in different processes can each report `Created` for the same key in check-then-create mode, and each stores the bytes the key names.
+- In conditional mode a 409 `ConditionalRequestConflict` answer (another conditional write of the key is in flight) is retried up to 5 times; any other status is a backend error with its status and code.
+
+### 12.2 Filesystem
+
+- The root is `{datadir}/sql-store`. A relative root or block store root is made absolute against the current directory first (a lexical step that reads nothing from the filesystem; `..` components are refused). Boot then refuses a root that is equal to, inside, or a parent of the block store root. The filesystem store is not supported on Windows.
+- The path of an object is the root joined with its key. Every key component must be an ordinary file name, and the resulting path must stay under the root.
+- A create writes the body to a `.tmp-` file in the target directory, fsyncs it, and publishes it with a hard link, which fails instead of replacing an existing file. An existing file with the same length and SHA-256 gives `AlreadyPresent`, any other gives `Conflict`. The directory is fsynced and the temporary file is removed in every outcome. Each new directory and its parent are fsynced when created, and the parent of a directory that already exists is fsynced too. A leftover temporary file does not affect a later create.
+
+### 12.3 Ranges and head
+
+Both backends answer a range as the in-memory store does: the range is resolved against the object size and clamped to it, and a range that selects no byte (start at or beyond the end, an inverted range, a zero-length suffix, any range of an empty object) and a missing object both give `None`. `head` returns the length and SHA-256; the filesystem store hashes the file in bounded chunks.
+
+### 12.4 KV size scan
+
+The S3 block store's start-up size scan lists objects with the prefix `tinycloud:`. Space ids start with `tinycloud:`, and only keys whose part before the last `/` is a space id count towards a space, so the computed sizes are the same as for a scan of the whole bucket and `sql/v1/` objects are not listed.

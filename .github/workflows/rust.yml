@@ -332,6 +332,12 @@ jobs:
         (set -a; . "$TC887_RUN_DIR/harness.env"; set +a
          cargo test --locked -p tinycloud-node --test s3_block_store -- --ignored)
 
+    - name: SQL object store (against the harness MinIO)
+      timeout-minutes: 10
+      run: |
+        (set -a; . "$TC887_RUN_DIR/harness.env"; set +a
+         cargo test --locked -p tinycloud-node --test sql_object_store -- --ignored)
+
     - name: Harness logs
       if: failure()
       run: |

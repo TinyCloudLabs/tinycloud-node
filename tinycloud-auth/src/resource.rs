@@ -281,9 +281,12 @@ pub enum ResourceCheckError {
     DoesNotExtendPath,
 }
 
+/// The text every space id string starts with.
+pub const SPACE_ID_PREFIX: &str = "tinycloud:";
+
 impl fmt::Display for SpaceId {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "tinycloud:{}:{}", self.suffix(), self.name)
+        write!(f, "{}{}:{}", SPACE_ID_PREFIX, self.suffix(), self.name)
     }
 }
 

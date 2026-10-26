@@ -69,6 +69,11 @@ on:
         required: true
         type: boolean
         default: true
+      named_keys_v1:
+        description: 'Turn on named keys (TC-1777): sets NAMED_KEYS_V1 in the sealed Phala env. false keeps the routes off.'
+        required: false
+        type: boolean
+        default: false
       image_version:
         description: 'Image version without leading v. Builds must match the selected crate; digest promotions must match the recorded image version (rollback_image_version when supplied).'
         required: false
@@ -686,9 +691,10 @@ jobs:
           reviewed = native + '@sha256:4bdae4fc232d886bb56bfbce4ec62ed4b8fb4e1369a01f6afb73d06dd68c188f'
           # TC-959: main's N0 compose (#349 c33c2302…) with the 95m ingress body
           # cap (raw d95bfb70…), the TC-1274 + TC-1317 + TC-1482 + c_index + TC-1840 + TC-1843 Vector config and the
-          # optional TC-1482 NODE_STATS_READ_TOKEN env line and the TC-950 pool of 10 (raw 192dfb7e…),
+          # optional TC-1482 NODE_STATS_READ_TOKEN env line, the TC-950 pool of 10 and the TC-1777 named-keys gate
+          # env lines + deletion-ledger volume (raw 298ea356…; 192dfb7e… before TC-1777),
           # its single node digest normalized to 64 zeros.
-          n0_template_hash = '8df7e0f258f6e343d7683b1bd538291a64f6365d8174e7bfe2bf25dfa68160b3'
+          n0_template_hash = 'c9bcbea9dac90fc2b74d8439146596ba802796a211d1b6d65aeda2286d7ed028'
           node_pin = re.compile(rb'(?m)^    image: ghcr\.io/tinycloudlabs/tinycloud-node@sha256:([0-9a-f]{64})$')
           def n0_template(raw):
               pins = list(node_pin.finditer(raw))
@@ -802,12 +808,21 @@ jobs:
           TINYCLOUD_SHARE_EMAIL__TRUST_BUNDLE_BASE64: ${{ secrets.PROD_TINYCLOUD_SHARE_TRUST_BUNDLE_BASE64 }}
           TINYCLOUD_SHARE_EMAIL__POSTGRES_TLS__SSLMODE: verify-full
           TINYCLOUD_KEYS__TYPE: Dstack
+          TINYCLOUD_ENCRYPTION_NETWORK__NAMED_KEYS_V1: ${{ inputs.named_keys_v1 }}
         run: |
           set -euo pipefail
           IMAGE="$(sed -n -E 's/^    image: (ghcr.io\/tinycloudlabs\/tinycloud-node(:[^[:space:]]+|@sha256:[0-9a-f]{64}))$/\1/p' docker-compose.dstack-postgres.yaml)"
           if [ "$(printf '%s\n' "${IMAGE}" | awk 'NF { count += 1 } END { print count + 0 }')" != "1" ]; then
             echo "::error::Expected exactly one resolved TinyCloud Node image for runtime preflight"
             exit 1
+          fi
+          # TC-1777: validate the same named-keys gate and ledger path the sealed
+          # deployment will carry. The path is read from the compose being deployed
+          # (absent from the pre-N0 rollback compose, where it is not passed).
+          LEDGER_PATH="$(sed -n -E 's/^      TINYCLOUD_ENCRYPTION_NETWORK__DELETION_LEDGER_PATH: ([^[:space:]]+)$/\1/p' docker-compose.dstack-postgres.yaml)"
+          ledger_args=()
+          if [ -n "${LEDGER_PATH}" ]; then
+            ledger_args=(-e "TINYCLOUD_ENCRYPTION_NETWORK__DELETION_LEDGER_PATH=${LEDGER_PATH}")
           fi
           docker run --rm --network none --read-only --cap-drop ALL \
             --security-opt no-new-privileges \
@@ -817,6 +832,8 @@ jobs:
             -e TINYCLOUD_SHARE_EMAIL__TRUST_BUNDLE_BASE64 \
             -e TINYCLOUD_SHARE_EMAIL__POSTGRES_TLS__SSLMODE \
             -e TINYCLOUD_KEYS__TYPE \
+            -e TINYCLOUD_ENCRYPTION_NETWORK__NAMED_KEYS_V1 \
+            ${ledger_args[@]+"${ledger_args[@]}"} \
             "${IMAGE}" --validate-config
 
       # TC-959: only env_keys/encrypted_env may change here. Never copy the
@@ -953,6 +970,7 @@ jobs:
           PHALA_ENV_CERTBOT_EMAIL: ${{ secrets.PROD_TINYCLOUD_CERTBOT_EMAIL }}
           PHALA_ENV_BETTERSTACK_SOURCE_TOKEN: ${{ secrets.PROD_TINYCLOUD_BETTERSTACK_SOURCE_TOKEN }}
           PHALA_ENV_SQL_IDENTITY_FENCE: ${{ inputs.sql_identity_fence }}
+          PHALA_ENV_NAMED_KEYS_V1: ${{ inputs.named_keys_v1 }}
         # Update the existing prod CVM (name: tinycloud-node) in the
         # Tiny Cloud workspace. The PHALA_CLOUD_API_KEY secret is
         # workspace-scoped and must be issued from that workspace.
@@ -978,6 +996,7 @@ jobs:
             PHALA_ENV_CERTBOT_EMAIL
             PHALA_ENV_BETTERSTACK_SOURCE_TOKEN
             PHALA_ENV_SQL_IDENTITY_FENCE
+            PHALA_ENV_NAMED_KEYS_V1
           )
 
           for var in "${required_vars[@]}"; do
@@ -990,6 +1009,13 @@ jobs:
               exit 1
             fi
           done
+
+          # TC-1777: the named-keys gate is written into the sealed env as-is,
+          # so anything but a literal true/false is refused before it is written.
+          if [ "${PHALA_ENV_NAMED_KEYS_V1}" != "true" ] && [ "${PHALA_ENV_NAMED_KEYS_V1}" != "false" ]; then
+            echo "::error::named_keys_v1 must be exactly true or false"
+            exit 1
+          fi
 
           # Optional (TC-1482): the same single-line rule, but absence is allowed.
           if [[ "${PHALA_ENV_NODE_STATS_READ_TOKEN:-}" == *$'\n'* || "${PHALA_ENV_NODE_STATS_READ_TOKEN:-}" == *$'\r'* ]]; then
@@ -1035,6 +1061,7 @@ jobs:
             printf 'CERTBOT_EMAIL=%s\n' "$PHALA_ENV_CERTBOT_EMAIL"
             printf 'BETTERSTACK_SOURCE_TOKEN=%s\n' "$PHALA_ENV_BETTERSTACK_SOURCE_TOKEN"
             printf 'SQL_IDENTITY_FENCE=%s\n' "$PHALA_ENV_SQL_IDENTITY_FENCE"
+            printf 'NAMED_KEYS_V1=%s\n' "$PHALA_ENV_NAMED_KEYS_V1"
             # TC-1482: optional. Unset keeps the node starting with
             # GET /admin/stats disabled (404); never written empty.
             if [ -n "${PHALA_ENV_NODE_STATS_READ_TOKEN:-}" ]; then
