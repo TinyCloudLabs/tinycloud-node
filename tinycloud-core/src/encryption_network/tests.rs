@@ -456,6 +456,60 @@ async fn decrypt_authorized_accepts_session_invoker() {
 }
 
 #[tokio::test]
+async fn decrypt_authorized_reads_the_network_row_once() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let mut db = fresh_db().await;
+    let network_reads = Arc::new(AtomicUsize::new(0));
+    let counter = network_reads.clone();
+    db.set_metric_callback(move |info| {
+        if info.statement.sql.contains(r#"FROM "encryption_network" "#) {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    let svc = make_service(db);
+    let net = network_id();
+    let descriptor = svc
+        .create_one_of_one_network(CreateNetworkRequest {
+            name: NETWORK_NAME.to_string(),
+            owner_did: owner_did(),
+            threshold: Threshold::one_of_one(),
+        })
+        .await
+        .unwrap();
+    let ctx = make_client_request(&descriptor.public_encryption_key);
+    let (_, body_value) = build_body(&ctx, &net);
+    let facts = serde_json::to_value(DecryptFacts {
+        ty: DECRYPT_REQUEST_TYPE.to_string(),
+        target_node: NODE_DID.to_string(),
+        network_id: net.clone(),
+        body_hash: canonical_hash(&body_value),
+        encrypted_symmetric_key_hash: canonical_hash(&Value::String(
+            STANDARD.encode(&ctx.wrapped_key),
+        )),
+        receiver_public_key_hash: canonical_hash(&Value::String(
+            STANDARD.encode(&ctx.receiver_pub),
+        )),
+        key_path: None,
+        alg: ALG_X25519_AES256GCM.to_string(),
+        key_version: 1,
+    })
+    .unwrap();
+    let invocation = build_session_invocation_info(&net, DECRYPT_ACTION, vec![facts], NODE_DID);
+
+    network_reads.store(0, Ordering::SeqCst);
+    svc.decrypt_authorized(
+        &crate::encryption_network::DecryptTarget::Root(net.clone()),
+        &invocation,
+        &body_value,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(network_reads.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn decrypt_authorized_rejects_audience_mismatch() {
     let svc = make_service(fresh_db().await);
     let net = network_id();
