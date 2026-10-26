@@ -100,6 +100,29 @@ test('capture accepts the dropped-count event with exactly class, dropped and wi
   assert.throws(() => assertCapture([{ ...ingress, event_code: 'errors_dropped' }], fields));
 });
 
+test('capture accepts the slow chain-guard wait with exactly its four typed fields and its dropped-count class (TC-2076)', () => {
+  const fields = JSON.parse(readFileSync(new URL('../log-shipper/fields.json', import.meta.url), 'utf8')).services['tinycloud-node'].fields;
+  const chain = { ts: request.ts, level: 'warn', event: 'node_warning', svc: 'api', event_code: 'chain_guard_slow_wait', kind: 'shared', elapsed_ms: 612, guards: 3, suppressed: 0 };
+  assert.doesNotThrow(() => assertCapture([chain], fields));
+  assert.doesNotThrow(() => assertCapture([{ ...chain, kind: 'exclusive', elapsed_ms: Number.MAX_SAFE_INTEGER, guards: 10000, suppressed: 100000 }], fields));
+  for (const bad of [
+    { event_count: 1 }, { message: 'TC959_SYNTHETIC' }, { key: 'TC959_SYNTHETIC' }, { status: 503 },
+    { kind: 'Shared' }, { kind: 'shared ' }, { kind: null }, { kind: 1 },
+    { elapsed_ms: -1 }, { elapsed_ms: '612' }, { elapsed_ms: 1.5 }, { elapsed_ms: Number.MAX_SAFE_INTEGER + 1 },
+    { guards: -1 }, { guards: 10001 }, { guards: '3' }, { guards: 1.5 },
+    { suppressed: -1 }, { suppressed: 100001 }, { suppressed: '0' }, { suppressed: null },
+    { level: 'error' }, { svc: 'ingress' }, { event: 'node_error' },
+  ]) {
+    assert.throws(() => assertCapture([{ ...chain, ...bad }], fields), JSON.stringify(bad));
+  }
+  for (const key of ['kind', 'elapsed_ms', 'guards', 'suppressed']) {
+    const { [key]: removed, ...partial } = chain;
+    assert.throws(() => assertCapture([partial], fields), `missing ${key}`);
+  }
+  const dropped = { ts: request.ts, level: 'warn', event: 'node_warning', svc: 'api', event_code: 'errors_dropped', class: 'chain_guard_slow_wait', dropped: 59, window_s: 60 };
+  assert.doesNotThrow(() => assertCapture([dropped], fields));
+});
+
 const hosted = { GITHUB_ACTIONS: 'true', RUNNER_ENVIRONMENT: 'github-hosted', RUNNER_OS: 'Linux', GITHUB_RUN_ID: '12345', GITHUB_RUN_ATTEMPT: '1', RUNNER_TEMP: '/home/runner/work/_temp' };
 test('CI guard rejects local and self-hosted Docker before any daemon operation', () => {
   assert.doesNotThrow(() => assertHostedRunner(hosted));

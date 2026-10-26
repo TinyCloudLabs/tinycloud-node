@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { buildConfig } from '../scripts/tc959-logship.mjs';
 import { assertCapture } from '../scripts/tc959-docker.mjs';
 import { CAPPED_CLASSES, CAP_WINDOW_SECONDS } from './budget.mjs';
-import { nodeRequest, ingressRequest, dbFailure } from './cases.mjs';
+import { nodeRequest, ingressRequest, dbFailure, chainGuard } from './cases.mjs';
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const capOf = name => CAPPED_CLASSES[name].capPerMinute;
@@ -53,6 +53,7 @@ export async function checkCaps(vector) {
       db_failure_5xx: n => frame(dbFailure({ elapsed_ms: n })),
       node_request_4xx: n => frame(nodeRequest({ status: 404, latency_us: n })),
       ingress_request_4xx: n => frame(ingressRequest({ status: 429, request_time: n / 1000 }), 'tinycloud-ingress'),
+      chain_guard_slow_wait: n => frame(chainGuard({ elapsed_ms: n })),
     };
     const inRange = (status, low) => status >= low && status < low + 100;
     const shipped = name => events.filter(event => ({
@@ -61,10 +62,12 @@ export async function checkCaps(vector) {
       db_failure_5xx: event.event_code === 'db_failure_5xx',
       node_request_4xx: event.event === 'node_request' && inRange(event.status, 400),
       ingress_request_4xx: event.event === 'ingress_request' && inRange(event.status, 400),
+      chain_guard_slow_wait: event.event_code === 'chain_guard_slow_wait',
     })[name]);
     const sequence = (name, event) => ({
       node_request_5xx: event.latency_us, node_request_4xx: event.latency_us, db_failure_5xx: event.elapsed_ms,
       ingress_request_5xx: Math.round(event.request_time_seconds * 1000), ingress_request_4xx: Math.round(event.request_time_seconds * 1000),
+      chain_guard_slow_wait: event.elapsed_ms,
     })[name];
 
     // Window 1: every class over its cap by a different amount, plus slow requests below status 400 that no cap may touch.
@@ -117,6 +120,21 @@ export async function checkCaps(vector) {
     for (const name of ['node_request_5xx', 'db_failure_5xx', 'node_request_4xx']) {
       assert.equal(shipped(name).filter(event => sequence(name, event) > 2000).length, capOf(name), `${name} ships its full cap again in the third window`);
     }
+
+    // Window 4 (TC-2076): chain_guard_slow_wait is held to one per window. Four more than the cap are dropped and counted,
+    // and the dropped-count event carries the 21-character class name unchanged; the other classes stay silent.
+    assert.equal(capOf('chain_guard_slow_wait'), 1);
+    await send(Array.from({ length: capOf('chain_guard_slow_wait') + 4 }, (_, index) => kinds.chain_guard_slow_wait(3000 + index + 1)));
+    await waitFor(() => dropEvents().length >= 12, CAP_WINDOW_SECONDS + 30);
+    await sleep(3000);
+    assert.equal(dropEvents().length, 12, 'only chain_guard_slow_wait reports in the fourth window');
+    const fourth = dropEvents()[11];
+    assert.equal(fourth.class, 'chain_guard_slow_wait');
+    assert.equal(fourth.dropped, 4);
+    assert.equal(fourth.window_s, CAP_WINDOW_SECONDS);
+    assert.deepEqual(Object.keys(fourth).sort(), ['class', 'dropped', 'event', 'event_code', 'level', 'svc', 'ts', 'window_s']);
+    assert.deepEqual(shipped('chain_guard_slow_wait').map(event => sequence('chain_guard_slow_wait', event)), [3001], 'the first chain_guard_slow_wait event ships, in order, with the same fields');
+    assert.deepEqual(Object.keys(shipped('chain_guard_slow_wait')[0]).sort(), ['elapsed_ms', 'event', 'event_code', 'guards', 'kind', 'level', 'suppressed', 'svc', 'ts']);
 
     const schema = JSON.parse(await readFile(new URL('./fields.json', import.meta.url), 'utf8'));
     assertCapture(events, schema.services['tinycloud-node'].fields);
