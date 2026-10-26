@@ -4868,10 +4868,22 @@ async fn account_query_principal<C: ConnectionTrait>(
 /// be the invoker's own rows. The did:pkh-only [`account_query_principal`]
 /// used by the other directions is a separate path and is not affected.
 fn issued_query_principal(invocation: &crate::util::InvocationInfo) -> Option<String> {
-    if !invocation.parents.is_empty() {
+    issued_principal(
+        &invocation.capabilities,
+        &invocation.invoker,
+        !invocation.parents.is_empty(),
+    )
+}
+
+fn issued_principal(
+    capabilities: &[crate::util::Capability],
+    invoker: &str,
+    has_proof: bool,
+) -> Option<String> {
+    if has_proof {
         return None;
     }
-    let [capability] = invocation.capabilities.as_slice() else {
+    let [capability] = capabilities else {
         return None;
     };
     if capability.ability.as_ref().as_ref() != "tinycloud.delegation/list" {
@@ -4889,7 +4901,7 @@ fn issued_query_principal(invocation: &crate::util::InvocationInfo) -> Option<St
     {
         return None;
     }
-    let invoker = principal_did(&invocation.invoker).ok()?;
+    let invoker = principal_did(invoker).ok()?;
     (principal_did(resource.space().did().as_str()).ok()? == invoker).then_some(invoker)
 }
 
@@ -8510,6 +8522,127 @@ mod test {
                     .iter()
                     .any(|id| id.to_cid(0x55).to_string() == item.cid)));
         }
+    }
+
+    /// A page of three issuer rows, the first of which has `ancestors` linked
+    /// as a chain (`parents` = a chain, one level per ancestor) or, when
+    /// `wide`, as that many direct parents.
+    async fn issued_page_with_ancestors(
+        ancestors: usize,
+        wide: bool,
+    ) -> (
+        Vec<Hash>,
+        Result<DelegationQueryPage, AccountDelegationQueryError>,
+    ) {
+        use sea_orm::ActiveValue::Set;
+
+        let db = get_db().await.unwrap();
+        let issuer = "did:key:tc2132-issuer-a";
+        let mine = seed_issued(&db.conn, issuer, 3).await;
+        let chain = seed_issued(&db.conn, "did:key:tc2132-ancestors", ancestors).await;
+        let mut links = Vec::new();
+        for (index, ancestor) in chain.iter().enumerate() {
+            let child = if wide || index == 0 {
+                mine[0]
+            } else {
+                chain[index - 1]
+            };
+            links.push((*ancestor, child));
+        }
+        for chunk in links.chunks(500) {
+            parent_delegations::Entity::insert_many(chunk.iter().map(|(parent, child)| {
+                parent_delegations::ActiveModel {
+                    parent: Set(*parent),
+                    child: Set(*child),
+                }
+            }))
+            .exec(&db.conn)
+            .await
+            .unwrap();
+        }
+        let page = issued_delegations_page(&db.conn, issuer, &issued_query(10, None)).await;
+        (mine, page)
+    }
+
+    /// The ancestor walk allows 64 levels: the row plus 63 ancestors passes,
+    /// one more fails the whole page (no partial page), as on the account path.
+    #[tokio::test]
+    async fn issued_page_fails_whole_when_an_ancestor_chain_exceeds_the_depth_cap() {
+        let (mine, page) = issued_page_with_ancestors(63, false).await;
+        let page = page.expect("a chain at the cap passes");
+        assert_eq!(page.items.len(), 3);
+        assert_eq!(page.items[0].cid, mine[0].to_cid(0x55).to_string());
+        assert_eq!(page.items[0].parents.len(), 1);
+
+        let (_, page) = issued_page_with_ancestors(64, false).await;
+        assert!(
+            matches!(&page, Err(AccountDelegationQueryError::Db(DbErr::Custom(reason)))
+                if reason == "account-ancestor-graph-depth-limit-exceeded"),
+            "{page:?}"
+        );
+    }
+
+    /// The ancestor graph allows 4096 nodes including the page's rows.
+    #[tokio::test]
+    async fn issued_page_fails_whole_when_the_ancestor_graph_exceeds_the_node_cap() {
+        // 3 page rows + 4093 parents = 4096 nodes.
+        let (_, page) = issued_page_with_ancestors(4093, true).await;
+        assert_eq!(page.expect("a graph at the cap passes").items.len(), 3);
+
+        let (_, page) = issued_page_with_ancestors(4094, true).await;
+        assert!(
+            matches!(&page, Err(AccountDelegationQueryError::Db(DbErr::Custom(reason)))
+                if reason == "account-ancestor-graph-node-limit-exceeded"),
+            "{page:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn issued_page_lists_a_did_pkh_issuers_own_rows() {
+        let db = get_db().await.unwrap();
+        let pkh = "did:pkh:eip155:1:0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266";
+        let mine = seed_issued(&db.conn, pkh, 4).await;
+        seed_issued(&db.conn, "did:key:tc2132-issuer-b", 4).await;
+        let page = issued_delegations_page(&db.conn, pkh, &issued_query(10, None))
+            .await
+            .unwrap();
+        assert_eq!(
+            page.items.iter().map(|i| i.cid.clone()).collect::<Vec<_>>(),
+            cids(&mine)
+        );
+    }
+
+    #[test]
+    fn issued_principal_accepts_a_did_pkh_invoker_for_its_own_did_only() {
+        let capability = |did: &str| crate::util::Capability {
+            resource: Resource::TinyCloud(
+                SpaceId::new(did.parse::<DIDBuf>().unwrap(), "default".parse().unwrap())
+                    .to_resource("delegation".parse().unwrap(), None, None, None),
+            ),
+            ability: "tinycloud.delegation/list".to_string().try_into().unwrap(),
+            caveats: Default::default(),
+        };
+        let lower = "did:pkh:eip155:1:0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266";
+        let checksum = "did:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
+        let other = "did:pkh:eip155:1:0x70997970c51812dc3a010c7d01b50e0d17dc79c8";
+
+        // The address spelling does not matter; the result is the canonical
+        // (checksummed) form that delegations store as their delegator.
+        for resource_did in [lower, checksum] {
+            assert_eq!(
+                issued_principal(&[capability(resource_did)], &format!("{lower}#x"), false),
+                Some(checksum.to_string())
+            );
+        }
+        assert_eq!(issued_principal(&[capability(other)], lower, false), None);
+        assert_eq!(issued_principal(&[capability(lower)], other, false), None);
+        // A proof, or a second capability, is refused even for the own DID.
+        assert_eq!(issued_principal(&[capability(lower)], lower, true), None);
+        assert_eq!(
+            issued_principal(&[capability(lower), capability(lower)], lower, false),
+            None
+        );
+        assert_eq!(issued_principal(&[], lower, false), None);
     }
 
     #[tokio::test]

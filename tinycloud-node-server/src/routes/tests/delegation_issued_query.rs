@@ -20,6 +20,7 @@ use tinycloud_auth::{
 use tinycloud_core::{
     hash::Hash,
     models::{abilities, actor, delegation},
+    relationships::parent_delegations,
     sea_orm::{ActiveModelTrait, ActiveValue::Set},
     types::DelegationQuery,
 };
@@ -76,6 +77,30 @@ impl Agent {
             facts: Some(Vec::<serde_json::Value>::new()),
             proof: proofs,
             attenuation: capabilities,
+        }
+        .sign(self.jwk.get_algorithm().unwrap_or_default(), &self.jwk)?
+        .encode()?)
+    }
+
+    /// A header carrying several `(resource, ability)` capabilities.
+    fn header_with(&self, capabilities: &[(&Resource, &str)], nonce: &str) -> Result<String> {
+        let mut attenuation = Capabilities::new();
+        for (resource, ability) in capabilities {
+            attenuation.with_action(
+                resource.to_string().parse()?,
+                ability.parse::<UcanAbility>()?,
+                [std::collections::BTreeMap::<String, serde_json::Value>::new()],
+            );
+        }
+        Ok(Payload {
+            issuer: self.vm.parse::<DIDURLBuf>()?,
+            audience: self.did.parse::<DIDBuf>()?,
+            not_before: None,
+            expiration: NumericDate::try_from_seconds(4_102_444_800.0)?,
+            nonce: Some(nonce.to_string()),
+            facts: Some(Vec::<serde_json::Value>::new()),
+            proof: Vec::new(),
+            attenuation,
         }
         .sign(self.jwk.get_algorithm().unwrap_or_default(), &self.jwk)?
         .encode()?)
@@ -156,6 +181,32 @@ impl Fixture {
         .insert(&self.conn)
         .await?;
         Ok(id)
+    }
+
+    /// Give `child` a chain of `count` ancestors, one level each.
+    async fn ancestors(&self, tag: &str, child: Hash, count: usize) -> Result<()> {
+        let issuer = "did:key:zIssuedAncestors";
+        let mut child = child;
+        for n in 0..count {
+            let parent = self
+                .delegation(
+                    &format!("{tag}-ancestor-{n}"),
+                    issuer,
+                    issuer,
+                    1_700_000_000,
+                    kv_resource(issuer, "notes")?,
+                    "tinycloud.kv/get",
+                )
+                .await?;
+            parent_delegations::ActiveModel {
+                parent: Set(parent),
+                child: Set(child),
+            }
+            .insert(&self.conn)
+            .await?;
+            child = parent;
+        }
+        Ok(())
     }
 }
 
@@ -692,3 +743,168 @@ async fn issued_query_feature_is_advertised_by_info() -> Result<()> {
     );
     Ok(())
 }
+
+/// The ancestor walk allows 64 levels: a page whose row has 63 ancestors
+/// passes, one with 64 fails whole with the same 503 as the account path.
+#[tokio::test]
+async fn issued_deep_ancestor_chain_is_the_same_503_as_the_account_path() -> Result<()> {
+    let fixture = Fixture::new().await?;
+    let (at_cap, over_cap, holder) = (Agent::new()?, Agent::new()?, Agent::new()?);
+    let wallet = "did:pkh:eip155:1:0x1111111111111111111111111111111111111111";
+    let recipient = "did:key:zIssuedRecipient";
+    for did in [
+        at_cap.did.as_str(),
+        over_cap.did.as_str(),
+        holder.did.as_str(),
+        wallet,
+        recipient,
+        "did:key:zIssuedAncestors",
+    ] {
+        fixture.actor(did).await?;
+    }
+    for (agent, depth) in [(&at_cap, 63), (&over_cap, 64)] {
+        for name in ["shallow", "deep"] {
+            let id = fixture
+                .delegation(
+                    &format!("{}-{name}", agent.did),
+                    &agent.did,
+                    recipient,
+                    1_700_000_000,
+                    kv_resource(&agent.did, "notes")?,
+                    "tinycloud.kv/get",
+                )
+                .await?;
+            if name == "deep" {
+                fixture
+                    .ancestors(&format!("issued-{depth}"), id, depth)
+                    .await?;
+            }
+        }
+    }
+    // The account path over the same depth: a wallet row with 64 ancestors.
+    let control = SpaceId::new(wallet.parse::<DIDBuf>()?, "control".parse()?);
+    let list_resource =
+        Resource::TinyCloud(control.to_resource("delegation".parse()?, None, None, None));
+    let session = fixture
+        .delegation(
+            "deep-session",
+            wallet,
+            &holder.did,
+            1_700_000_100,
+            list_resource.clone(),
+            "tinycloud.delegation/list",
+        )
+        .await?;
+    let wallet_row = fixture
+        .delegation(
+            "deep-wallet-row",
+            wallet,
+            recipient,
+            1_700_000_000,
+            kv_resource(wallet, "notes")?,
+            "tinycloud.kv/get",
+        )
+        .await?;
+    fixture.ancestors("account-64", wallet_row, 64).await?;
+    let fixture = fixture.serve().await?;
+    let issued = serde_json::json!({ "direction": "issued" });
+
+    let (status, text) = fixture
+        .query(
+            at_cap.header(&at_cap.list_resource(&at_cap.did)?, "at-cap", vec![])?,
+            issued.clone(),
+        )
+        .await;
+    assert_eq!(status, Status::Ok, "{text}");
+    assert_eq!(page_cids(&text)?.len(), 2);
+
+    let over = fixture
+        .query(
+            over_cap.header(&over_cap.list_resource(&over_cap.did)?, "over-cap", vec![])?,
+            issued,
+        )
+        .await;
+    assert_eq!(over.0, Status::ServiceUnavailable, "{}", over.1);
+    assert_eq!(over.1, "Delegation query unavailable");
+    assert!(!over.1.contains("items"), "no partial page");
+
+    let account = fixture
+        .query(
+            holder.header(&list_resource, "account", vec![session.to_cid(0x55)])?,
+            serde_json::json!({ "direction": "all" }),
+        )
+        .await;
+    assert_eq!(account, over, "the account path answers the same");
+    Ok(())
+}
+
+#[tokio::test]
+async fn issued_refuses_extra_capabilities_and_query_or_fragment_resources() -> Result<()> {
+    let fixture = Fixture::new().await?;
+    let a = Agent::new()?;
+    fixture.actor(&a.did).await?;
+    let fixture = fixture.serve().await?;
+    let issued = serde_json::json!({ "direction": "issued" });
+    let own = a.list_resource(&a.did)?;
+    let space = SpaceId::new(a.did.parse::<DIDBuf>()?, "agent".parse()?);
+    let with_query = Resource::TinyCloud(space.clone().to_resource(
+        "delegation".parse()?,
+        None,
+        Some("scope=limited".parse()?),
+        None,
+    ));
+    let with_fragment = Resource::TinyCloud(space.to_resource(
+        "delegation".parse()?,
+        None,
+        None,
+        Some("limited".parse()?),
+    ));
+
+    let (status, text) = fixture
+        .query(
+            a.header_with(&[(&own, "tinycloud.delegation/list")], "control")?,
+            issued.clone(),
+        )
+        .await;
+    assert_eq!(status, Status::Ok, "one capability passes: {text}");
+
+    for (label, header) in [
+        (
+            "list plus status",
+            a.header_with(
+                &[
+                    (&own, "tinycloud.delegation/list"),
+                    (&own, "tinycloud.delegation/status"),
+                ],
+                "plus-status",
+            )?,
+        ),
+        (
+            "list plus list on a second resource",
+            a.header_with(
+                &[
+                    (&own, "tinycloud.delegation/list"),
+                    (&with_query, "tinycloud.delegation/list"),
+                ],
+                "plus-resource",
+            )?,
+        ),
+        (
+            "query on the resource",
+            a.header_with(&[(&with_query, "tinycloud.delegation/list")], "query")?,
+        ),
+        (
+            "fragment on the resource",
+            a.header_with(&[(&with_fragment, "tinycloud.delegation/list")], "fragment")?,
+        ),
+    ] {
+        let (status, text) = fixture.query(header, issued.clone()).await;
+        assert_eq!(status, Status::Forbidden, "{label}: {text}");
+    }
+    Ok(())
+}
+
+// A did:pkh invoker cannot be signed for in this harness (a wallet signs a
+// SIWE message, not a UCAN). `issued_principal_accepts_a_did_pkh_invoker_for_its_own_did_only`
+// and `issued_page_lists_a_did_pkh_issuers_own_rows` in `tinycloud-core`
+// cover it.
