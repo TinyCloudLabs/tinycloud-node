@@ -174,6 +174,92 @@ a binary rollback also needs
 `DELETE FROM seaql_migrations WHERE version = 'm20261020_000000_current_kv_key_c_index';`
 first. The migration's `down` keeps the index.
 
+### `idx_kv_write_space_value` (TC-2062, `m20261026_000000_kv_write_space_value_index`)
+
+The blob reference probe that ends every KV write carrying a blob
+(`finish_candidates`, `kv_orphans.rs`) asks whether `kv_write` has a row for
+`(space, value, generation)`. No index contains `value`, so without this index
+the probe reads every `kv_write` row of the space and filters. In production
+(PlanetScale Insights, 2026-10-26) that statement was about 20% of database
+execution time, at about 14.7k rows read per call. With the index it is one
+index-only lookup. **Performance-only:** the node boots and serves without the
+index, and blob-carrying KV writes stay slow until it exists. When it is
+missing on a non-empty `kv_write`, the node logs `kv_write_value_index_missing`
+(WARN) and keeps serving.
+
+**Run step 1 BEFORE the deploy that carries this migration.** The statement
+can also be run now, on the running release: the planner uses the index as soon
+as it is valid, with no restart.
+
+1. On the PlanetScale primary, as the role that owns `kv_write`, **outside any
+   transaction** (the console, or `psql` without `BEGIN`; never through the node
+   or a migration runner). Lift the console's statement timeout for the
+   session first:
+
+   ```sql
+   SET statement_timeout = 0;
+   CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_kv_write_space_value ON kv_write (space, value, generation);
+   ```
+
+   Writes to `kv_write` continue during the build. It waits for transactions
+   that were open when it started, so it can sit in "waiting for old
+   transactions" while one is open; it does not block them. Every later insert
+   into `kv_write` maintains one more index entry. Size and time scale with the
+   row count of `kv_write`: about 152 bytes per row (measured with 73-character
+   space ids and 34-byte values) and about 4.6 µs per row. Measured locally on an
+   unthrottled PostgreSQL 14: 6.3 s for 1,360,000 rows, 198 MB. As an estimate,
+   not a measurement of production: 10 million rows is about 1.5 GB and 1 minute
+   on that setup, so expect several times that on the primary. The build's WAL
+   is replicated to the replicas.
+
+2. Check the result. All three columns must be `t`:
+
+   ```sql
+   SELECT i.indisvalid, i.indisready, i.indislive FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid WHERE c.relname = 'idx_kv_write_space_value';
+   ```
+
+3. If the build was cancelled or failed, the index is left INVALID, and
+   `IF NOT EXISTS` would skip it. Drop it and redo step 1:
+
+   ```sql
+   DROP INDEX CONCURRENTLY IF EXISTS idx_kv_write_space_value;
+   ```
+
+4. Deploy the node. At boot the migration reads `pg_index` for that exact name
+   and **never takes a lock on `kv_write` for a build and never fails the boot
+   over the index**:
+   - a valid, ready, live btree of that name on `kv_write` with columns
+     `space, value, generation`, ascending, default operator classes, each in
+     its column's own collation, no predicate, expression or INCLUDE: **no DDL,
+     no lock, no warning**, and the index keeps its OID;
+   - no such index and `kv_write` **empty** (a fresh or test database): the
+     migration builds it, which is instant;
+   - no such index and `kv_write` **not empty**: nothing is built. The node logs
+     one `kv_write_value_index_missing` warning, boots and serves, and the
+     migration is recorded as applied. Run step 1 whenever convenient; a restart
+     is not needed;
+   - the right shape but INVALID, not ready or not live (a failed or still
+     running `CREATE INDEX CONCURRENTLY`): one `kv_write_value_index_invalid`
+     warning. The index is left alone. If no build is running, follow step 3
+     and redo step 1;
+   - the name with another shape (another column list or order, DESC, another
+     operator class or collation, INCLUDE, a predicate, another table, or a
+     non-index relation): one `kv_write_value_index_wrong_shape` error-level
+     log. The object is left alone and the node serves. Run
+     `DROP INDEX CONCURRENTLY IF EXISTS idx_kv_write_space_value;` and then
+     step 1.
+
+   The log text is constant (no key, space or value; production logs are
+   public, TC-961), so look for the event name in the node's own container log.
+
+Rollback: `DROP INDEX CONCURRENTLY IF EXISTS idx_kv_write_space_value;` is safe
+at any time; the reference probe goes back to reading the space's rows, and
+nothing else uses the index. A node image from before this migration refuses to
+start while `seaql_migrations` lists a migration it does not ship, so a binary
+rollback also needs
+`DELETE FROM seaql_migrations WHERE version = 'm20261026_000000_kv_write_space_value_index';`
+first. The migration's `down` keeps the index.
+
 ## Promoting to production (main-only)
 
 Production is built and promoted **only from `main`** (TC-940, 2026-10-13).

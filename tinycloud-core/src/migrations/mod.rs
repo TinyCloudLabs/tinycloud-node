@@ -32,6 +32,7 @@ pub mod m20261020_000000_current_kv_key_c_index;
 pub mod m20261021_000000_sql_store_manifest;
 pub mod m20261022_000000_encryption_network_key;
 pub mod m20261023_010000_kv_orphan_candidates;
+pub mod m20261026_000000_kv_write_space_value_index;
 
 pub struct Migrator;
 
@@ -72,6 +73,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261021_000000_sql_store_manifest::Migration),
             Box::new(m20261022_000000_encryption_network_key::Migration),
             Box::new(m20261023_010000_kv_orphan_candidates::Migration),
+            Box::new(m20261026_000000_kv_write_space_value_index::Migration),
         ]
     }
 }
