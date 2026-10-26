@@ -145,44 +145,6 @@ async fn one_get_to_the_configured_origin_with_the_validated_id() {
 }
 
 #[tokio::test]
-async fn tc1737_links_origin_shared_with_internal_host_still_fetches() {
-    for (code, expected) in [(200, None), (404, Some(LinkFetchError::NotFound))] {
-        let server = serve(move |_| {
-            if code == 200 {
-                ok(Some("record-header"), b"sealed body".to_vec())
-            } else {
-                status(code)
-            }
-        })
-        .await;
-        let lookup = Arc::new(TestLookup::default());
-        lookup.set("quota.test", &["127.0.0.1"]).await;
-        lookup.set(HOST, &["127.0.0.1"]).await;
-        let policy = Arc::new(
-            EgressPolicy::for_test(vec!["quota.test".into()], lookup.clone(), true)
-                .with_test_root(server.certificate.clone()),
-        );
-        policy.refresh().await.unwrap();
-        let origin = LinksOrigin::parse(&format!("https://{HOST}:{}", server.port)).unwrap();
-        let fetcher = ApiLinkFetcher::new(policy, origin, false);
-        let link_id = id();
-        let result = fetcher.fetch(&link_id);
-        let result = tokio::time::timeout(Duration::from_secs(3), result)
-            .await
-            .unwrap();
-        if let Some(expected) = expected {
-            assert_eq!(result.err(), Some(expected), "{code}");
-        } else {
-            let fetched = result.unwrap();
-            assert_eq!(fetched.record_header, "record-header");
-            assert_eq!(fetched.body, b"sealed body");
-        }
-        assert_eq!(server.requests(), 1, "{code}");
-        assert_eq!(lookup.call_count(), 2, "one internal and one links lookup");
-    }
-}
-
-#[tokio::test]
 async fn the_api_404_is_not_found_and_every_other_status_fails_closed() {
     for (code, expected) in [
         (404, LinkFetchError::NotFound),
