@@ -709,13 +709,29 @@ impl Fairing for TracingFairing {
             "request"
         );
         if status >= 500 {
-            if let Some(line) = telemetry
+            let classified = match telemetry
                 .context
                 .failure()
                 .and_then(|note| DatabaseFailureLine::new(note, status, route, elapsed))
             {
-                line.emit();
-            }
+                Some(line) => {
+                    line.emit();
+                    true
+                }
+                None => false,
+            };
+            // Every 5xx leaves one line, whatever produced it (TC-2073). Its
+            // fields are fixed vocabulary, the status and the route template;
+            // `classified` says the database diagnostic line above was
+            // emitted for the same request.
+            tracing::warn!(
+                target: REQUEST_LOG_TARGET,
+                error_class = "http_5xx",
+                status,
+                route,
+                classified,
+                "request answered with a 5xx"
+            );
         }
         if crate::prometheus::enabled() {
             crate::prometheus::REQUEST_HISTOGRAM
@@ -1051,6 +1067,7 @@ mod tests {
         let events: Vec<Value> = output
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
+            .filter(|event: &Value| event["fields"]["error_class"] != "http_5xx")
             .collect();
         assert_eq!(events.len(), 2, "one line per failing request: {output}");
         let allowed = |with_db: bool| -> Vec<&str> {
@@ -1286,6 +1303,7 @@ mod tests {
         let events: Vec<Value> = output
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
+            .filter(|event: &Value| event["fields"]["error_class"] != "http_5xx")
             .collect();
         assert_eq!(
             events.len(),
@@ -1302,6 +1320,235 @@ mod tests {
             assert!(fields["elapsed_ms"].is_u64(), "{path}: {fields}");
             assert_eq!(fields.get("db_hash").is_some(), has_hash, "{path}");
             assert_eq!(fields.as_object().unwrap().len(), 8 + usize::from(has_hash));
+        }
+    }
+
+    #[rocket::get("/tc2073-plain-500")]
+    fn plain_500() -> (Status, &'static str) {
+        (Status::InternalServerError, "body-that-must-not-be-logged")
+    }
+
+    #[rocket::get("/tc2073-item/<_id>")]
+    fn item_503(_id: &str) -> (Status, &'static str) {
+        (Status::ServiceUnavailable, "no")
+    }
+
+    #[rocket::get("/tc2073-not-found")]
+    fn answered_404() -> (Status, &'static str) {
+        (Status::NotFound, "no")
+    }
+
+    /// The `http_5xx` events of `output`, which is JSON lines.
+    fn http_5xx_events(output: &str) -> Vec<Value> {
+        output
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|event| event["fields"]["error_class"] == "http_5xx")
+            .collect()
+    }
+
+    #[rocket::get("/tc2073-space/<_space>/key/<_key>")]
+    fn space_key_500(_space: &str, _key: &str) -> (Status, &'static str) {
+        (Status::InternalServerError, "no")
+    }
+
+    /// An `http_5xx` line holds exactly the allowlisted fields and the
+    /// layer's own `timestamp`, `level` and `target`; nothing else.
+    fn assert_allowed_http_5xx_line(event: &Value) {
+        let keys = |value: &Value| -> Vec<String> {
+            let mut keys: Vec<String> = value.as_object().unwrap().keys().cloned().collect();
+            keys.sort_unstable();
+            keys
+        };
+        assert_eq!(keys(event), ["fields", "level", "target", "timestamp"]);
+        assert_eq!(
+            keys(&event["fields"]),
+            ["classified", "error_class", "message", "route", "status"],
+            "{event}"
+        );
+        assert_eq!(event["level"], "WARN");
+        assert_eq!(event["target"], REQUEST_LOG_TARGET);
+        assert!(event["fields"]["status"].as_u64().unwrap() >= 500);
+        assert!(event["fields"]["classified"].is_boolean());
+    }
+
+    async fn client_for_5xx_tests() -> Client {
+        let routes: Vec<_> = rocket::routes![
+            plain_500,
+            item_503,
+            space_key_500,
+            answered_404,
+            known,
+            failing_with_db,
+            failing_without_note
+        ]
+        .into_iter()
+        .map(instrument_route)
+        .collect();
+        Client::tracked(
+            rocket::build()
+                .mount("/", routes)
+                .attach(disabled_fairing()),
+        )
+        .await
+        .expect("valid rocket instance")
+    }
+
+    /// TC-2073: a 5xx no emitter classified still leaves exactly one line,
+    /// with the route template, the status and `classified=false`; the
+    /// response is the route's.
+    #[tokio::test]
+    async fn an_unclassified_5xx_logs_one_http_5xx_line() {
+        let captured = Captured::default();
+        let _subscriber = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .json()
+                .with_writer(captured.clone())
+                .with_max_level(Level::WARN)
+                .finish(),
+        );
+        let client = client_for_5xx_tests().await;
+        let response = client.get("/tc2073-plain-500").dispatch().await;
+        assert_eq!(response.status(), Status::InternalServerError);
+        assert_eq!(
+            response.into_string().await.unwrap(),
+            "body-that-must-not-be-logged"
+        );
+
+        let output = String::from_utf8(captured.0.lock().clone()).unwrap();
+        let events = http_5xx_events(&output);
+        assert_eq!(events.len(), 1, "{output}");
+        assert_eq!(output.lines().count(), 1, "no other warning: {output}");
+        assert_allowed_http_5xx_line(&events[0]);
+        let fields = &events[0]["fields"];
+        assert_eq!(fields["status"], 500);
+        assert_eq!(fields["route"], "/tc2073-plain-500");
+        assert_eq!(fields["classified"], false);
+        assert!(!output.contains("body-that-must-not-be-logged"));
+    }
+
+    /// A database failure answered with a 5xx keeps its own line and the
+    /// `http_5xx` line says it was classified; a 5xx whose note does not
+    /// match the status is not.
+    #[tokio::test]
+    async fn a_database_failure_5xx_also_logs_http_5xx_as_classified() {
+        let captured = Captured::default();
+        let _subscriber = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .json()
+                .with_writer(captured.clone())
+                .with_max_level(Level::WARN)
+                .finish(),
+        );
+        let client = client_for_5xx_tests().await;
+        let response = client.get("/tc1796-with-db").dispatch().await;
+        assert_eq!(response.status(), Status::ServiceUnavailable);
+        let response = client.get("/tc1796-no-note").dispatch().await;
+        assert_eq!(response.status(), Status::ServiceUnavailable);
+
+        let output = String::from_utf8(captured.0.lock().clone()).unwrap();
+        let all: Vec<Value> = output
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let diagnostics: Vec<&Value> = all
+            .iter()
+            .filter(|event| event["fields"]["code"] == "unavailable_retryable")
+            .collect();
+        assert_eq!(diagnostics.len(), 1, "the existing line is kept: {output}");
+        let events = http_5xx_events(&output);
+        assert_eq!(events.len(), 2, "one per 5xx: {output}");
+        for event in &events {
+            assert_allowed_http_5xx_line(event);
+        }
+        assert_eq!(events[0]["fields"]["route"], "/tc1796-with-db");
+        assert_eq!(events[0]["fields"]["classified"], true);
+        assert_eq!(events[1]["fields"]["route"], "/tc1796-no-note");
+        assert_eq!(events[1]["fields"]["classified"], false);
+    }
+
+    /// Successes and client errors leave no `http_5xx` line, and no 5xx line
+    /// holds the raw path or query.
+    #[tokio::test]
+    async fn http_5xx_lines_are_for_5xx_only_and_carry_the_route_template() {
+        let captured = Captured::default();
+        let _subscriber = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .json()
+                .with_writer(captured.clone())
+                .with_max_level(Level::WARN)
+                .finish(),
+        );
+        let client = client_for_5xx_tests().await;
+        assert_eq!(
+            client.get("/tc286-known").dispatch().await.status(),
+            Status::Ok
+        );
+        assert_eq!(
+            client.get("/tc2073-not-found").dispatch().await.status(),
+            Status::NotFound
+        );
+        assert_eq!(
+            client.get("/no-such-route").dispatch().await.status(),
+            Status::NotFound
+        );
+        assert!(captured.0.lock().is_empty(), "no line for a 2xx or a 4xx");
+
+        // Path parameters shaped like a space id and a key name, a query, and
+        // credential headers: each 5xx answer leaves exactly one line, with
+        // the template and the allowed fields only.
+        const SPACE: &str =
+            "tinycloud:pkh:eip155:1:0x1234567890123456789012345678901234567890:SECRET-SPACE";
+        for _ in 0..2 {
+            let response = client
+                .get(format!(
+                    "/tc2073-space/{SPACE}/key/SECRET-KEY-NAME?ticket=SECRET-QUERY"
+                ))
+                .header(rocket::http::Header::new(
+                    "Authorization",
+                    "Bearer SECRET-HEADER",
+                ))
+                .dispatch()
+                .await;
+            assert_eq!(response.status(), Status::InternalServerError);
+        }
+        let response = client
+            .get("/tc2073-item/SECRET-ID-did:pkh:0xabc?ticket=SECRET-QUERY")
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::ServiceUnavailable);
+        let output = String::from_utf8(captured.0.lock().clone()).unwrap();
+        let events = http_5xx_events(&output);
+        assert_eq!(events.len(), 3, "one per 5xx response: {output}");
+        assert_eq!(output.lines().count(), 3, "and nothing else: {output}");
+        for event in &events {
+            assert_allowed_http_5xx_line(event);
+        }
+        let routes: Vec<&Value> = events
+            .iter()
+            .map(|event| &event["fields"]["route"])
+            .collect();
+        assert_eq!(
+            routes,
+            [
+                "/tc2073-space/<_space>/key/<_key>",
+                "/tc2073-space/<_space>/key/<_key>",
+                "/tc2073-item/<_id>"
+            ]
+        );
+        for secret in [
+            "SECRET-SPACE",
+            "SECRET-KEY-NAME",
+            "SECRET-ID",
+            "SECRET-QUERY",
+            "SECRET-HEADER",
+            "Bearer",
+            "did:pkh",
+            "tinycloud:pkh",
+            "0xabc",
+            "0x1234",
+        ] {
+            assert!(!output.contains(secret), "{secret} in {output}");
         }
     }
 }

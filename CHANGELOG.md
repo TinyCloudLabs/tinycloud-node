@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Changes
+- Every 5xx response is logged with its route template and status. Details: TC-2073
+- The share delivery authorization route logs the check that refused a request (a fixed reason name only). Details: TC-2047
 - KV writes that carry a blob: the final reference check now has an index to use. Migration `m20261026_000000_kv_write_space_value_index` expects `idx_kv_write_space_value` on `kv_write (space, value, generation)` on PostgreSQL. It never builds the index on a non-empty table and never fails the boot: it logs `kv_write_value_index_missing`, `kv_write_value_index_invalid` or `kv_write_value_index_wrong_shape` and keeps serving. Build the index with `CREATE INDEX CONCURRENTLY` before the deploy (`docs/releasing.md`, section `idx_kv_write_space_value`). Details: TC-2062.
 
 ## [1.25.4] - 2026-10-26
