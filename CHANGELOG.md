@@ -4,6 +4,8 @@
 
 ## [1.25.4] - 2026-10-26
 
+### Changes
+- Read audit: a batch commit that does not complete within 10 seconds is failed as a retryable 503 (`unavailable_retryable`) so the audit queue keeps draining; records whose readers have gone are skipped on the next batch as before. No read's data is returned without a committed record. The timeout is logged as `Read audit batch timed out` (`error_class = "read_audit_batch_timeout"`: batch size, elapsed and timeout in ms) and counted in `tinycloud_read_audit_batch_timeout_total`; log-shipper classification of the new warning follows. Database pool: a released connection whose health ping does not answer within 5 seconds is now closed and its slot freed, instead of being held with no bound (vendored `sqlx-core`, `vendor/sqlx-core/PATCH.md`). Details: TC-2035.
 - Share email: the links origin is vetted against the internal-endpoint deny-set again (restores the vetting before 1.25.3). Details: TC-1737
 
 ## [1.25.3] - 2026-10-26
