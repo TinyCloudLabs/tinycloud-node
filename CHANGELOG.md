@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Changes
+- Every 5xx response is logged with its route template and status. Details: TC-2073
+
 ## [1.25.4] - 2026-10-26
 
 ### Changes
