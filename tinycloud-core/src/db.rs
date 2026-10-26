@@ -91,6 +91,94 @@ type ExclusiveChainGuard = tokio::sync::OwnedRwLockWriteGuard<()>;
 /// Shared chain guard: held by invocations, which only read chain state.
 type SharedChainGuard = tokio::sync::OwnedRwLockReadGuard<()>;
 
+/// A chain-guard acquisition that waits longer than this is logged (TC-2075).
+const CHAIN_GUARD_SLOW_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+/// At most one slow-wait line per this interval per process.
+const CHAIN_GUARD_SLOW_WAIT_LOG_INTERVAL_MS: u64 = 1000;
+/// Target of the slow-wait line.
+const CHAIN_GUARD_LOG_TARGET: &str = "tinycloud::chain_guard";
+
+/// Allows one slow-wait line per interval and counts the lines it withheld.
+struct SlowWaitLimiter {
+    /// Millisecond stamp of the last emitted line; `u64::MAX` before the first.
+    last_emit_ms: AtomicU64,
+    suppressed: AtomicU64,
+}
+
+impl SlowWaitLimiter {
+    const fn new() -> Self {
+        Self {
+            last_emit_ms: AtomicU64::new(u64::MAX),
+            suppressed: AtomicU64::new(0),
+        }
+    }
+
+    /// `Some(n)`: emit now; `n` lines were withheld since the last emission.
+    /// `None`: withhold this one.
+    fn admit(&self, now_ms: u64) -> Option<u64> {
+        loop {
+            let last = self.last_emit_ms.load(Ordering::Relaxed);
+            if last != u64::MAX
+                && now_ms.saturating_sub(last) < CHAIN_GUARD_SLOW_WAIT_LOG_INTERVAL_MS
+            {
+                self.suppressed.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+            if self
+                .last_emit_ms
+                .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                return Some(self.suppressed.swap(0, Ordering::Relaxed));
+            }
+        }
+    }
+}
+
+static CHAIN_GUARD_SLOW_WAIT_LIMITER: SlowWaitLimiter = SlowWaitLimiter::new();
+
+static PROCESS_START: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
+
+fn process_millis() -> u64 {
+    PROCESS_START.elapsed().as_millis() as u64
+}
+
+/// One warning per second per process for a chain-guard wait above
+/// [`CHAIN_GUARD_SLOW_WAIT`]. Fixed vocabulary only: no key, space, DID or
+/// request data (TC-961, TC-1796, TC-2073).
+fn log_slow_chain_guard_wait(kind: &'static str, elapsed: std::time::Duration, guards: usize) {
+    if elapsed <= CHAIN_GUARD_SLOW_WAIT {
+        return;
+    }
+    emit_slow_chain_guard_wait(
+        &CHAIN_GUARD_SLOW_WAIT_LIMITER,
+        process_millis(),
+        kind,
+        elapsed,
+        guards,
+    );
+}
+
+fn emit_slow_chain_guard_wait(
+    limiter: &SlowWaitLimiter,
+    now_ms: u64,
+    kind: &'static str,
+    elapsed: std::time::Duration,
+    guards: usize,
+) {
+    if let Some(suppressed) = limiter.admit(now_ms) {
+        tracing::warn!(
+            target: CHAIN_GUARD_LOG_TARGET,
+            event = "chain_guard_slow_wait",
+            kind,
+            elapsed_ms = elapsed.as_millis() as u64,
+            guards = guards as u64,
+            suppressed,
+            "chain guard wait exceeded the slow-wait threshold"
+        );
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PendingWebhookDelivery {
     pub id: String,
@@ -1665,11 +1753,13 @@ where
         for lock in locks {
             guards.push(lock.write_owned().await);
         }
+        let elapsed = guard_wait_start.elapsed();
         crate::telemetry::observe_stage(
             crate::telemetry::InvocationStage::ChainGuardWait,
             crate::telemetry::StageOutcome::Ok,
-            guard_wait_start.elapsed(),
+            elapsed,
         );
+        log_slow_chain_guard_wait("exclusive", elapsed, guards.len());
         guards
     }
 
@@ -1706,11 +1796,13 @@ where
         for lock in locks {
             guards.push(lock.read_owned().await);
         }
+        let elapsed = guard_wait_start.elapsed();
         crate::telemetry::observe_stage(
             crate::telemetry::InvocationStage::ChainGuardWait,
             crate::telemetry::StageOutcome::Ok,
-            guard_wait_start.elapsed(),
+            elapsed,
         );
+        log_slow_chain_guard_wait("shared", elapsed, guards.len());
         guards
     }
 
@@ -8754,6 +8846,202 @@ mod test {
             .await
             .expect("sorted key order must prevent a multi-chain lock-order inversion");
         }
+    }
+
+    /// TC-2075: the slow-wait line is process-global and rate limited, so the
+    /// tests that read it take this lock and reset the limiter first.
+    static SLOW_WAIT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[derive(Debug)]
+    struct CapturedEvent {
+        target: String,
+        level: tracing::Level,
+        fields: std::collections::BTreeMap<String, String>,
+    }
+
+    #[derive(Clone, Default)]
+    struct EventCapture(Arc<std::sync::Mutex<Vec<CapturedEvent>>>);
+
+    struct FieldRecorder<'a>(&'a mut std::collections::BTreeMap<String, String>);
+
+    impl tracing::field::Visit for FieldRecorder<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EventCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            // Migrations and other crates log on this thread too; the tests
+            // read only the chain-guard target.
+            if event.metadata().target() != CHAIN_GUARD_LOG_TARGET {
+                return;
+            }
+            let mut fields = std::collections::BTreeMap::new();
+            event.record(&mut FieldRecorder(&mut fields));
+            self.0.lock().unwrap().push(CapturedEvent {
+                target: event.metadata().target().to_string(),
+                level: *event.metadata().level(),
+                fields,
+            });
+        }
+    }
+
+    fn capture_events() -> (EventCapture, tracing::subscriber::DefaultGuard) {
+        use tracing_subscriber::layer::SubscriberExt;
+        let capture = EventCapture::default();
+        let guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
+        (capture, guard)
+    }
+
+    fn reset_slow_wait_limiter() {
+        CHAIN_GUARD_SLOW_WAIT_LIMITER
+            .last_emit_ms
+            .store(u64::MAX, Ordering::Relaxed);
+        CHAIN_GUARD_SLOW_WAIT_LIMITER
+            .suppressed
+            .store(0, Ordering::Relaxed);
+    }
+
+    fn assert_slow_wait_line_is_allowlisted(event: &CapturedEvent, kind: &str, guards: u64) {
+        assert_eq!(event.target, "tinycloud::chain_guard");
+        assert_eq!(event.level, tracing::Level::WARN);
+        // Exactly this vocabulary: no key, space, DID, hash or request data.
+        let names: Vec<&str> = event.fields.keys().map(String::as_str).collect();
+        assert_eq!(
+            names,
+            [
+                "elapsed_ms",
+                "event",
+                "guards",
+                "kind",
+                "message",
+                "suppressed"
+            ]
+        );
+        assert_eq!(event.fields["event"], "chain_guard_slow_wait");
+        assert_eq!(
+            event.fields["message"],
+            "chain guard wait exceeded the slow-wait threshold"
+        );
+        assert_eq!(event.fields["kind"], kind);
+        assert_eq!(event.fields["guards"], guards.to_string());
+        assert_eq!(event.fields["suppressed"], "0");
+        assert!(
+            event.fields["elapsed_ms"].parse::<u64>().unwrap() >= 500,
+            "elapsed_ms is the integer wait, got {:?}",
+            event.fields["elapsed_ms"]
+        );
+    }
+
+    /// A shared acquire queued behind a held exclusive guard (or the reverse)
+    /// for `hold`, returning what was logged.
+    async fn contended_chain_guard_wait(
+        shared_waits: bool,
+        hold: std::time::Duration,
+    ) -> Vec<CapturedEvent> {
+        let _serial = SLOW_WAIT_TEST_LOCK.lock().await;
+        reset_slow_wait_limiter();
+        let (capture, _subscriber) = capture_events();
+        let db = get_db().await.unwrap();
+        let keys = vec![
+            crate::hash::hash(b"tc2075-guard-a"),
+            crate::hash::hash(b"tc2075-guard-b"),
+        ];
+
+        let (waiter, held_exclusive, held_shared);
+        if shared_waits {
+            held_exclusive = Some(
+                db.acquire_exclusive_chain_guards_for_keys(keys.clone())
+                    .await,
+            );
+            held_shared = None;
+            let db = db.clone();
+            waiter =
+                tokio::spawn(
+                    async move { drop(db.acquire_shared_chain_guards_for_keys(keys).await) },
+                );
+        } else {
+            held_exclusive = None;
+            held_shared = Some(db.acquire_shared_chain_guards_for_keys(keys.clone()).await);
+            let db = db.clone();
+            waiter = tokio::spawn(async move {
+                drop(db.acquire_exclusive_chain_guards_for_keys(keys).await)
+            });
+        }
+        tokio::time::sleep(hold).await;
+        drop(held_exclusive);
+        drop(held_shared);
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("the waiter is released with the guard")
+            .unwrap();
+
+        let events = std::mem::take(&mut *capture.0.lock().unwrap());
+        events
+    }
+
+    #[tokio::test]
+    async fn chain_guard_slow_shared_wait_logs_one_allowlisted_line() {
+        let events = contended_chain_guard_wait(true, std::time::Duration::from_millis(600)).await;
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_slow_wait_line_is_allowlisted(&events[0], "shared", 2);
+    }
+
+    #[tokio::test]
+    async fn chain_guard_slow_exclusive_wait_logs_one_allowlisted_line() {
+        let events = contended_chain_guard_wait(false, std::time::Duration::from_millis(600)).await;
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_slow_wait_line_is_allowlisted(&events[0], "exclusive", 2);
+    }
+
+    #[tokio::test]
+    async fn chain_guard_wait_below_the_threshold_logs_nothing() {
+        for shared_waits in [true, false] {
+            let events =
+                contended_chain_guard_wait(shared_waits, std::time::Duration::from_millis(150))
+                    .await;
+            assert!(events.is_empty(), "{events:?}");
+        }
+    }
+
+    #[test]
+    fn chain_guard_slow_wait_lines_are_limited_to_one_per_second() {
+        let (capture, _subscriber) = capture_events();
+        let limiter = SlowWaitLimiter::new();
+        let wait = std::time::Duration::from_millis(900);
+        let emit = |now_ms: u64| emit_slow_chain_guard_wait(&limiter, now_ms, "shared", wait, 3);
+
+        emit(10_000);
+        // A burst inside the interval, up to its last millisecond.
+        for now_ms in [10_001, 10_400, 10_999, 10_999] {
+            emit(now_ms);
+        }
+        assert_eq!(capture.0.lock().unwrap().len(), 1);
+        assert_eq!(capture.0.lock().unwrap()[0].fields["suppressed"], "0");
+
+        // The next line reports what the burst withheld, then the count resets.
+        emit(11_000);
+        emit(11_500);
+        emit(12_000);
+        let events = capture.0.lock().unwrap();
+        let suppressed: Vec<&str> = events
+            .iter()
+            .map(|event| event.fields["suppressed"].as_str())
+            .collect();
+        assert_eq!(suppressed, ["0", "4", "1"]);
     }
 
     #[tokio::test]
