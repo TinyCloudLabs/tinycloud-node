@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.25.0] - 2026-10-26
+
 - Encryption: `POST /encryption/networks/<network>/key-actions/delete` (served when `named_keys_v1` is on) deletes one key under `apps/` (`keyPath` without a trailing `/`) or every key under `apps/<app id>/` (`keyPath` with one). The network owner signs the request: a UCAN invocation (with `nbf`) for a `did:key` owner, a SIWE CACAO for a `did:pkh` owner, valid for at most 300 seconds and usable once. The response is `{ keyPath, state, deleted, alreadyDeleted, count }`; a deterministic key answers 409 `key_not_deletable`. A deleted key keeps its path with state `deleted` and no seed. Details: TC-1777.
 - Configuration: adds `[global.encryption_network] deletion_ledger_path`, required while `named_keys_v1` is on. Every delete operation is appended to this file before the database commit and settled after it. At every start the node replays the file onto the database before serving the key routes; if the file cannot be opened or replayed the key routes stay off and the node logs `deletion_ledger_open_failed` or `deletion_ledger_replay_failed`. `tinycloud node deletion-ledger replay` applies the file to a restored database. Details: TC-1777.
 - Encryption: a deletion ledger append whose write or fsync fails is cut back to the file's length before it. The node image contains `/var/lib/tinycloud/ledger`, owned by uid 1000 with mode 0700. Details: TC-1777.
