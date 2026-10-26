@@ -2,11 +2,14 @@
 
 ## [Unreleased]
 
+## [1.25.4] - 2026-10-26
+
 - Share email: the links origin is vetted against the internal-endpoint deny-set again (restores the vetting before 1.25.3). Details: TC-1737
 
 ## [1.25.3] - 2026-10-26
 
 - A share invitation can read its link record when the links host resolves to the same addresses as another configured service. Details: TC-1737.
+
 ## [1.25.2] - 2026-10-26
 
 - No code changes since 1.25.1. Prepared so that named keys can be turned off with the deploy input `named_keys_v1` without a rebuild.
