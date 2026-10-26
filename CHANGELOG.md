@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Changes
+- `current_kv` key lookups no longer filter on the deleted flag in SQL; deleted rows are still excluded from results. Details: TC-2062
+
 ## [1.25.4] - 2026-10-26
 
 ### Changes

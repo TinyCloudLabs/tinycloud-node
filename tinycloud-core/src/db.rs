@@ -4632,15 +4632,19 @@ impl KvReadLookup {
 /// The live rows of `keys` in `space`, by key, in one statement (PostgreSQL
 /// `key = ANY($2)`) or one per `KV_LOOKUP_CHUNK` keys (SQLite `IN` lists).
 /// A key with no live row is absent from the map.
+///
+/// The statement does not filter on `deleted`: `(space, key)` is the primary
+/// key, so it returns at most one row per key and the predicate only gave the
+/// planner a reason to read the space's rows through another index instead of
+/// seeking the named keys (TC-2062). Tombstoned rows are dropped here instead.
 async fn get_kv_entities<C: ConnectionTrait>(
     db: &C,
     space_id: &SpaceId,
     keys: &[&Path],
 ) -> Result<HashMap<String, current_kv::Model>, DbErr> {
-    let live = || {
+    let in_space = || {
         current_kv::Entity::find()
             .filter(current_kv::Column::Space.eq(SpaceIdWrap(space_id.clone())))
-            .filter(current_kv::Column::Deleted.eq(false))
     };
     let rows = match db.get_database_backend() {
         DbBackend::Postgres => {
@@ -4648,7 +4652,7 @@ async fn get_kv_entities<C: ConnectionTrait>(
                 .iter()
                 .map(|key| key.as_str().to_owned())
                 .collect::<Vec<_>>();
-            live()
+            in_space()
                 .filter(Expr::cust_with_values(
                     r#""current_kv"."key" = ANY($1)"#,
                     [keys],
@@ -4660,7 +4664,7 @@ async fn get_kv_entities<C: ConnectionTrait>(
             let mut rows = Vec::new();
             for chunk in keys.chunks(KV_LOOKUP_CHUNK) {
                 rows.extend(
-                    live()
+                    in_space()
                         .filter(
                             current_kv::Column::Key
                                 .is_in(chunk.iter().map(|key| crate::types::Path((*key).clone()))),
@@ -4674,6 +4678,7 @@ async fn get_kv_entities<C: ConnectionTrait>(
     };
     Ok(rows
         .into_iter()
+        .filter(|row| !row.deleted)
         .map(|row| (row.key.0.as_str().to_owned(), row))
         .collect())
 }
@@ -7435,6 +7440,94 @@ mod test {
         let caps = vec![(space, "kv", "tinycloud.kv/get", &keys[0]); 2];
         let mut lookup = KvReadLookup::fetch(&db.conn, &caps).await;
         assert!(lookup.entity(&db.conn, space, &keys[0]).await.is_err());
+    }
+
+    /// TC-2062: `get_kv_entities` no longer filters `deleted` in SQL. A
+    /// tombstoned key must still read as absent through every path of the
+    /// batched read: `kv/get` and `kv/metadata`, a batch of live, deleted and
+    /// absent keys, a batch of deleted keys only, and the lone-capability
+    /// point lookup that bypasses the batch. (`kv/list` and `kv/sync` do not
+    /// use this lookup.) The expected rows are spelled out, not taken from
+    /// the point lookup, so both paths changing together would still fail.
+    async fn assert_tombstoned_keys_read_as_absent(conn: &sea_orm::DatabaseConnection) {
+        let fixture = seed_kv_lookup_fixture(conn).await;
+        for (space, universe) in &fixture {
+            // The fixture really holds tombstones: they are rows, `deleted`.
+            let stored = current_kv::Entity::find()
+                .filter(current_kv::Column::Space.eq(SpaceIdWrap(space.clone())))
+                .all(conn)
+                .await
+                .unwrap();
+            assert_eq!(stored.iter().filter(|row| row.deleted).count(), 10);
+            assert_eq!(stored.iter().filter(|row| !row.deleted).count(), 30);
+
+            for ability in ["tinycloud.kv/get", "tinycloud.kv/metadata"] {
+                // Live, deleted and absent keys together (50 keys).
+                let caps = universe
+                    .iter()
+                    .map(|key| (space, "kv", ability, key))
+                    .collect::<Vec<_>>();
+                let mut lookup = KvReadLookup::fetch(conn, &caps).await;
+                let mut live = 0;
+                for key in universe {
+                    let found = lookup.entity(conn, space, key).await.unwrap();
+                    if key.as_str().starts_with("live/") {
+                        let row = found.unwrap_or_else(|| panic!("{ability}: {key} is live"));
+                        assert!(!row.deleted && row.key.0 == *key, "{ability}: {key}");
+                        live += 1;
+                    } else {
+                        assert_eq!(found, None, "{ability}: {key} is not live");
+                    }
+                }
+                assert_eq!(live, 30);
+
+                // Deleted keys only: the batch returns nothing.
+                let dead = universe
+                    .iter()
+                    .filter(|key| key.as_str().starts_with("dead/"))
+                    .collect::<Vec<_>>();
+                let caps = dead
+                    .iter()
+                    .map(|key| (space, "kv", ability, *key))
+                    .collect::<Vec<_>>();
+                let mut lookup = KvReadLookup::fetch(conn, &caps).await;
+                for key in &dead {
+                    assert_eq!(lookup.entity(conn, space, key).await.unwrap(), None);
+                }
+
+                // A lone capability: the point lookup, no batch.
+                let single = [(space, "kv", ability, dead[0])];
+                let mut lookup = KvReadLookup::fetch(conn, &single).await;
+                assert_eq!(lookup.entity(conn, space, dead[0]).await.unwrap(), None);
+            }
+
+            // The map `get_kv_entities` builds holds exactly the live keys.
+            let all = universe.iter().collect::<Vec<_>>();
+            let found = get_kv_entities(conn, space, &all).await.unwrap();
+            let mut keys = found.keys().cloned().collect::<Vec<_>>();
+            keys.sort();
+            let expected = (0..30).map(|i| format!("live/{i:02}")).collect::<Vec<_>>();
+            assert_eq!(keys, expected);
+            assert!(found.values().all(|row| !row.deleted));
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_tombstoned_keys_read_as_absent_in_the_batched_lookup() {
+        let db = get_db().await.unwrap();
+        assert_tombstoned_keys_read_as_absent(&db.conn).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_tombstoned_keys_read_as_absent_in_the_batched_lookup() {
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_tombstoned_keys_read_as_absent_in_the_batched_lookup",
+        )
+        .await
+        else {
+            return;
+        };
+        assert_tombstoned_keys_read_as_absent(&fixture.conn).await;
     }
 
     #[tokio::test]
