@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+## [1.25.6] - 2026-10-26
+
+### Changes
+- Version bump only, no code changes: a release that descends from 1.25.5 so the production database move can redeploy the same code. Details: TC-2062
+
 ## [1.25.5] - 2026-10-26
 
 ### Changes
