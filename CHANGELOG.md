@@ -3,6 +3,22 @@
 ## [Unreleased]
 
 ### Changes
+- A chain-guard wait longer than 500 ms is logged once per second with its kind and duration. Details: TC-2075
+
+## [1.25.7] - 2026-10-26
+
+### Changes
+- Version bump only, no code changes. Details: TC-2062
+
+## [1.25.6] - 2026-10-26
+
+### Changes
+- Version bump only, no code changes. Details: TC-2062
+
+## [1.25.5] - 2026-10-26
+
+### Changes
+- Every 5xx response is logged with its route template and status. Details: TC-2073
 - The share delivery authorization route logs the check that refused a request (a fixed reason name only). Details: TC-2047
 - A decrypt request makes one fewer read of its encryption network row: the sealed key is read together with the state check instead of in a separate lookup. Details: TC-2062
 
