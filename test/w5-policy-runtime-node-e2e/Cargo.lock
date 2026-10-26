@@ -8433,6 +8433,7 @@ dependencies = [
  "hex",
  "hkdf",
  "hmac 0.12.1",
+ "idna",
  "k256",
  "libc",
  "libp2p",
@@ -8466,7 +8467,7 @@ dependencies = [
 
 [[package]]
 name = "tinycloud-node"
-version = "1.22.0"
+version = "1.25.2"
 dependencies = [
  "aes-gcm",
  "anyhow",

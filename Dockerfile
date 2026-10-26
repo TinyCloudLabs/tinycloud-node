@@ -53,6 +53,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cp /app/target/release/tinycloud /app/tinycloud
 RUN addgroup -g 1000 tinycloud && adduser -u 1000 -G tinycloud -s /bin/sh -D tinycloud
 RUN mkdir -p /scratch-tmp && chmod 1777 /scratch-tmp
+# Directory for the deletion ledger (`deletion_ledger_path`), owned by the
+# runtime user so a named volume mounted here is writable by it.
+RUN mkdir -p /var/lib/tinycloud/ledger && chown 1000:1000 /var/lib/tinycloud/ledger && chmod 700 /var/lib/tinycloud/ledger
 
 # Runtime stage
 FROM ${RUNTIME_BASE} AS runtime
@@ -61,6 +64,7 @@ COPY --from=builder /etc/passwd /etc/passwd
 COPY --from=builder /etc/group /etc/group
 COPY --from=builder --chown=tinycloud:tinycloud /app/tinycloud /tinycloud
 COPY --from=builder --chown=tinycloud:tinycloud /app/data ./data
+COPY --from=builder --chown=tinycloud:tinycloud /var/lib/tinycloud/ledger /var/lib/tinycloud/ledger
 COPY ./tinycloud.toml ./
 COPY --from=builder /scratch-tmp /tmp
 USER tinycloud:tinycloud

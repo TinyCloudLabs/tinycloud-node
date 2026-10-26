@@ -50,7 +50,7 @@ fn value(n: usize) -> Vec<u8> {
 async fn put(store: &S3BlockStore, space: &SpaceId, data: &[u8]) -> Result<Hash, S3StoreError> {
     let mut staged = HashBuffer::new(Vec::new());
     staged.write_all(data).await.unwrap();
-    ImmutableWriteStore::<MemoryStaging>::persist(store, space, staged).await
+    ImmutableWriteStore::<MemoryStaging>::persist(store, space, staged, 0).await
 }
 
 #[tokio::test]
@@ -65,14 +65,17 @@ async fn remove_deletes_the_block_and_releases_its_size() -> Result<()> {
     );
 
     ensure!(
-        store.remove(&space, &removed).await? == Some(()),
+        store.remove(&space, &removed, 0).await? == Some(()),
         "remove of a stored block"
     );
     ensure!(
-        !store.contains(&space, &removed).await?,
+        !store.contains(&space, &removed, 0).await?,
         "object still exists"
     );
-    ensure!(store.contains(&space, &kept).await?, "other block removed");
+    ensure!(
+        store.contains(&space, &kept, 0).await?,
+        "other block removed"
+    );
     ensure!(
         store.total_size(&space).await? == Some(17),
         "size drops by the removed block's length"
@@ -80,13 +83,13 @@ async fn remove_deletes_the_block_and_releases_its_size() -> Result<()> {
 
     // Removing again, or removing a block never stored, is a no-op.
     ensure!(
-        store.remove(&space, &removed).await?.is_none(),
+        store.remove(&space, &removed, 0).await?.is_none(),
         "second remove"
     );
     let mut unstored = HashBuffer::new(Vec::new());
     unstored.write_all(b"never stored").await?;
     ensure!(
-        store.remove(&space, &unstored.hash()).await?.is_none(),
+        store.remove(&space, &unstored.hash(), 0).await?.is_none(),
         "absent block"
     );
     ensure!(

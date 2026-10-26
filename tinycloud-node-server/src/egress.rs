@@ -226,11 +226,12 @@ impl EgressPolicy {
         }
     }
 
-    fn permits_ip(&self, ip: IpAddr, denied: &HashSet<IpAddr>) -> bool {
+    fn permits_ip_in(&self, ip: IpAddr, denied: &HashSet<IpAddr>, scope: AddressScope) -> bool {
         if denied.contains(&ip) || embedded_v4(ip).any(|v4| denied.contains(&IpAddr::V4(v4))) {
             return false;
         }
-        let forbidden = Self::forbidden(ip).is_some();
+        let forbidden = Self::forbidden(ip)
+            .is_some_and(|class| scope == AddressScope::PublicOnly || !is_private_class(class));
         #[cfg(test)]
         let forbidden = forbidden && !(self.allow_loopback && ip.is_loopback());
         !forbidden
@@ -240,12 +241,13 @@ impl EgressPolicy {
         &self,
         ips: impl Iterator<Item = IpAddr>,
         port: u16,
+        scope: AddressScope,
     ) -> Result<Vec<SocketAddr>, EgressError> {
         let deny = self.send_lease().await?;
         let mut addresses = Vec::new();
         for ip in ips {
             let address = SocketAddr::new(ip, port);
-            if self.permits_ip(ip, &deny.addresses) && !addresses.contains(&address) {
+            if self.permits_ip_in(ip, &deny.addresses, scope) && !addresses.contains(&address) {
                 addresses.push(address);
             }
         }
@@ -259,18 +261,30 @@ impl EgressPolicy {
     /// Resolve once, filter each address, and bind the result to this URL's host.
     /// Literal hosts are checked here because reqwest bypasses DNS for them.
     pub async fn resolve_url(&self, url: &Url) -> Result<VettedDestination, EgressError> {
+        self.resolve_url_scoped(url, AddressScope::PublicOnly).await
+    }
+
+    /// As [`Self::resolve_url`], with the address scope the destination is
+    /// vetted under. The scope is bound to the result and applied again at
+    /// connect time; the internal-endpoint deny-set applies under every scope.
+    pub async fn resolve_url_scoped(
+        &self,
+        url: &Url,
+        scope: AddressScope,
+    ) -> Result<VettedDestination, EgressError> {
         self.ensure_fresh().await?;
         let host = url.host_str().ok_or(EgressError::Forbidden)?;
         let port = url.port_or_known_default().ok_or(EgressError::Forbidden)?;
         let addresses = if let Ok(ip) = host.trim_matches(['[', ']']).parse() {
-            self.permitted(std::iter::once(ip), port).await?
+            self.permitted(std::iter::once(ip), port, scope).await?
         } else {
             let ips = self.lookup_bounded(host).await?;
-            self.permitted(ips.into_iter(), port).await?
+            self.permitted(ips.into_iter(), port, scope).await?
         };
         Ok(VettedDestination {
             url: url.clone(),
             addresses: addresses.into(),
+            scope,
         })
     }
 
@@ -395,10 +409,40 @@ fn embedded_v4(ip: IpAddr) -> impl Iterator<Item = Ipv4Addr> {
     values.into_iter().flatten()
 }
 
+/// Which special-use addresses a destination may use. Every scope refuses
+/// unspecified, multicast, reserved, documentation and similar classes and the
+/// operator's internal endpoints.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AddressScope {
+    /// Public addresses only.
+    PublicOnly,
+    /// Public addresses and the private, loopback, link-local and CGNAT
+    /// classes, for an operator-configured destination on a private network.
+    AllowPrivate,
+}
+
+impl AddressScope {
+    /// Whether an address is allowed under this scope, before any
+    /// internal-endpoint deny-set. For configuration checks without a lookup
+    /// policy; every connection is vetted again by the policy.
+    pub fn permits(self, ip: IpAddr) -> bool {
+        EgressPolicy::forbidden(ip)
+            .is_none_or(|class| self == Self::AllowPrivate && is_private_class(class))
+    }
+}
+
+fn is_private_class(class: &str) -> bool {
+    matches!(
+        class,
+        "private" | "loopback" | "link_local" | "cgnat" | "unique_local" | "site_local"
+    )
+}
+
 /// A single lookup's vetted addresses. No caller can insert unvetted addresses.
 pub struct VettedDestination {
     url: Url,
     addresses: Arc<[SocketAddr]>,
+    scope: AddressScope,
 }
 
 impl VettedDestination {
@@ -420,6 +464,7 @@ impl VettedDestination {
 struct PolicyResolver {
     host: String,
     addresses: Arc<[SocketAddr]>,
+    scope: AddressScope,
     policy: Arc<EgressPolicy>,
     denied: Arc<HashSet<IpAddr>>,
 }
@@ -429,6 +474,7 @@ impl Resolve for PolicyResolver {
         let policy = self.policy.clone();
         let addresses = self.addresses.clone();
         let denied = self.denied.clone();
+        let scope = self.scope;
         let matches = name.as_str() == self.host;
         Box::pin(async move {
             if !matches {
@@ -438,7 +484,7 @@ impl Resolve for PolicyResolver {
             }
             let mut vetted = (0..addresses.len())
                 .map(move |index| addresses[index])
-                .filter(move |address| policy.permits_ip(address.ip(), &denied));
+                .filter(move |address| policy.permits_ip_in(address.ip(), &denied, scope));
             let first = vetted.next().ok_or(EgressError::Forbidden)?;
             Ok(Box::new(std::iter::once(first).chain(vetted)) as Addrs)
         })
@@ -538,46 +584,13 @@ impl EgressRequest {
             return Err(error);
         }
         let lease = self.policy.send_lease().await?;
-        if !self
-            .destination
-            .addresses
-            .iter()
-            .any(|address| self.policy.permits_ip(address.ip(), &lease.addresses))
-        {
-            return Err(EgressError::Forbidden.into());
-        }
-        let host = self
-            .destination
-            .url
-            .host_str()
-            .ok_or(EgressError::Forbidden)?
-            .to_owned();
-        #[cfg(not(test))]
-        let https_only = true;
-        #[cfg(test)]
-        let https_only = !(self.policy.allow_loopback && self.destination.is_loopback());
-        let builder = Client::builder()
-            .no_proxy()
-            .https_only(https_only)
-            .redirect(redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(2))
-            .timeout(self.timeout);
-        #[cfg(test)]
-        let builder = self
-            .policy
-            .roots
-            .iter()
-            .cloned()
-            .fold(builder, |builder, root| builder.add_root_certificate(root));
-        let client = builder
-            .dns_resolver(Arc::new(PolicyResolver {
-                host,
-                addresses: self.destination.addresses,
-                policy: self.policy.clone(),
-                denied: lease.addresses.clone(),
-            }))
-            .build()?;
-        let mut request = client.post(self.destination.url).headers(self.headers);
+        let (client, url) = pinned_client(
+            &self.policy,
+            self.destination,
+            &lease.addresses,
+            self.timeout,
+        )?;
+        let mut request = client.post(url).headers(self.headers);
         if let Some(body) = self.body {
             request = request.body(body);
         }
@@ -587,6 +600,196 @@ impl EgressRequest {
             .await;
         drop(lease);
         result.map_err(SendError::Transport)
+    }
+}
+
+/// The one place a client is built for a vetted destination: no proxy, no
+/// redirects, `https` only, a two-second connect bound, and a resolver that
+/// answers only with the addresses vetted by the destination's single lookup,
+/// so the socket connects to a vetted address and TLS verifies the URL's host
+/// name. The caller holds the read lease the deny-set was taken from.
+fn pinned_client(
+    policy: &Arc<EgressPolicy>,
+    destination: VettedDestination,
+    denied: &Arc<HashSet<IpAddr>>,
+    timeout: Duration,
+) -> Result<(Client, Url), SendError> {
+    if !destination
+        .addresses
+        .iter()
+        .any(|address| policy.permits_ip_in(address.ip(), denied, destination.scope))
+    {
+        return Err(EgressError::Forbidden.into());
+    }
+    let host = destination
+        .url
+        .host_str()
+        .ok_or(EgressError::Forbidden)?
+        .to_owned();
+    #[cfg(not(test))]
+    let https_only = true;
+    #[cfg(test)]
+    let https_only = !(policy.allow_loopback && destination.is_loopback());
+    let builder = Client::builder()
+        .no_proxy()
+        .https_only(https_only)
+        .redirect(redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(timeout);
+    #[cfg(test)]
+    let builder = policy
+        .roots
+        .iter()
+        .cloned()
+        .fold(builder, |builder, root| builder.add_root_certificate(root));
+    let client = builder
+        .dns_resolver(Arc::new(PolicyResolver {
+            host,
+            addresses: destination.addresses,
+            scope: destination.scope,
+            policy: policy.clone(),
+            denied: denied.clone(),
+        }))
+        .build()?;
+    Ok((client, destination.url))
+}
+
+/// A failed bounded GET. Transport errors carry no URL.
+#[derive(Debug, thiserror::Error)]
+pub enum GetError {
+    #[error(transparent)]
+    Policy(#[from] EgressError),
+    #[error("outbound request failed")]
+    Transport(reqwest::Error),
+    #[error("invalid request header")]
+    Header,
+    #[error("outbound request timed out")]
+    Timeout,
+    #[error("response body exceeds the byte cap")]
+    BodyTooLarge,
+}
+
+impl From<SendError> for GetError {
+    fn from(error: SendError) -> Self {
+        match error {
+            SendError::Policy(error) => Self::Policy(error),
+            SendError::Transport(error) => Self::Transport(error.without_url()),
+            SendError::HeaderName(_) | SendError::HeaderValue(_) => Self::Header,
+            SendError::Timeout => Self::Timeout,
+        }
+    }
+}
+
+/// A bounded GET response. The body is read only for a success status.
+pub struct GetResponse {
+    pub status: reqwest::StatusCode,
+    pub headers: HeaderMap,
+    pub body: Vec<u8>,
+}
+
+/// A target-bound GET request: one attempt, no body, the same pinned,
+/// redirect-free, proxy-free client as [`post`]. One deadline covers the
+/// connection, the response headers and the whole body, and the body is read
+/// chunk by chunk against a hard byte cap, never buffered past it.
+pub struct EgressGet {
+    policy: Arc<EgressPolicy>,
+    destination: VettedDestination,
+    timeout: Duration,
+    max_body_bytes: usize,
+    headers: HeaderMap,
+    error: Option<GetError>,
+}
+
+/// Prepare a GET to exactly the URL carried by the vetted destination. The
+/// response body is refused as soon as it exceeds `max_body_bytes`.
+pub fn get(
+    policy: Arc<EgressPolicy>,
+    destination: VettedDestination,
+    timeout: Duration,
+    max_body_bytes: usize,
+) -> EgressGet {
+    EgressGet {
+        policy,
+        destination,
+        timeout,
+        max_body_bytes,
+        headers: HeaderMap::new(),
+        error: None,
+    }
+}
+
+impl EgressGet {
+    /// Set a header without exposing or changing the target URL.
+    pub fn header(mut self, name: &'static str, value: impl AsRef<str>) -> Self {
+        if self.error.is_none() {
+            match (
+                HeaderName::from_bytes(name.as_bytes()),
+                HeaderValue::from_str(value.as_ref()),
+            ) {
+                (Ok(name), Ok(value)) => {
+                    self.headers.insert(name, value);
+                }
+                _ => self.error = Some(GetError::Header),
+            }
+        }
+        self
+    }
+
+    /// Recheck the bound destination and keep refresh from invalidating it
+    /// until the response headers arrive. Cancellation releases the lease.
+    pub async fn send(self) -> Result<GetResponse, GetError> {
+        let deadline = Instant::now() + self.timeout;
+        tokio::time::timeout_at(deadline, self.fetch(deadline))
+            .await
+            .map_err(|_| GetError::Timeout)?
+    }
+
+    async fn fetch(self, deadline: Instant) -> Result<GetResponse, GetError> {
+        if let Some(error) = self.error {
+            return Err(error);
+        }
+        let cap = self.max_body_bytes;
+        let lease = self.policy.send_lease().await?;
+        let (client, url) = pinned_client(
+            &self.policy,
+            self.destination,
+            &lease.addresses,
+            self.timeout,
+        )?;
+        let sent = client
+            .get(url)
+            .headers(self.headers)
+            .timeout(deadline.saturating_duration_since(Instant::now()))
+            .send()
+            .await;
+        drop(lease);
+        let mut response = sent.map_err(|error| GetError::Transport(error.without_url()))?;
+        let status = response.status();
+        let headers = response.headers().clone();
+        let mut body = Vec::new();
+        if status.is_success() {
+            if response
+                .content_length()
+                .is_some_and(|length| length > cap as u64)
+            {
+                return Err(GetError::BodyTooLarge);
+            }
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|error| GetError::Transport(error.without_url()))?
+            {
+                if chunk.len() > cap - body.len() {
+                    return Err(GetError::BodyTooLarge);
+                }
+                body.extend_from_slice(&chunk);
+            }
+        }
+        Ok(GetResponse {
+            status,
+            headers,
+            body,
+        })
     }
 }
 

@@ -29,6 +29,8 @@ pub mod auth_guards;
 pub mod authorization;
 pub mod cli;
 pub mod config;
+pub mod delivery_limiter;
+pub mod delivery_link;
 pub mod dstack;
 pub mod egress;
 pub mod epoch_head_backfill;
@@ -36,6 +38,8 @@ pub mod hooks;
 pub mod invocation_replay;
 pub mod issuer_set;
 pub mod link;
+pub mod links_fetch;
+pub mod links_read_auth;
 pub mod node_control;
 pub mod policy_v3;
 pub mod prometheus;
@@ -257,7 +261,7 @@ use routes::{
     create_signed_kv_url, delegate, delegation_query, delegation_status,
     encryption::{
         block_encryption_key, create_encryption_key, create_network as create_encryption_network,
-        decrypt as encryption_decrypt, describe_encryption_key,
+        decrypt as encryption_decrypt, delete_encryption_key, describe_encryption_key,
         get_network as get_encryption_network, public_encryption_key,
         revoke_network as revoke_encryption_network, unblock_encryption_key,
         well_known_network as encryption_well_known,
@@ -565,6 +569,10 @@ pub fn resolve_runtime_config(tinycloud_config: &Config) -> Result<Config> {
         .validate()
         .map_err(anyhow::Error::msg)?;
     resolved.sql_store.validate().map_err(anyhow::Error::msg)?;
+    resolved
+        .encryption_network
+        .validate()
+        .map_err(anyhow::Error::msg)?;
     tracing::RequestIdOrigins::new(&resolved.log.request_id_first_party_origins)
         .map_err(anyhow::Error::msg)?;
     resolved.storage.resolve();
@@ -581,6 +589,14 @@ pub fn resolve_runtime_config(tinycloud_config: &Config) -> Result<Config> {
         .validate_for_v2_database(resolved.storage.database())
         .map_err(|error| anyhow::anyhow!(error))?;
     resolved.share_email.credential_issuer_set()?;
+    resolved
+        .share_email
+        .validate_links_origin()
+        .map_err(|error| anyhow::anyhow!(error))?;
+    resolved
+        .share_email
+        .validate_links_fetch_limits()
+        .map_err(|error| anyhow::anyhow!(error))?;
     Ok(resolved)
 }
 
@@ -593,6 +609,7 @@ fn named_key_routes() -> Vec<Route> {
         public_encryption_key,
         block_encryption_key,
         unblock_encryption_key,
+        delete_encryption_key,
     ]
 }
 
@@ -696,20 +713,6 @@ pub async fn app_with_control(
     if tinycloud_config.did_resolution.network_methods {
         ::tracing::warn!("network DID resolution enabled: did:web/did:tz fetches use the unhardened ssi client (TC-1080)");
     }
-
-    let routes = production_routes(tinycloud_config.encryption_network.named_keys_v1);
-    #[cfg(feature = "tc-bench-v1")]
-    let mut routes = routes;
-
-    #[cfg(feature = "tc-bench-v1")]
-    routes.extend(rocket::routes![
-        tc_bench_auth_verify,
-        tc_bench_kv_put,
-        tc_bench_kv_get,
-        tc_bench_block_put,
-        tc_bench_block_get,
-        tc_bench_health,
-    ]);
 
     let key_setup: StaticSecret =
         match resolve_keys(&tinycloud_config.keys, &tinycloud_config.tee).await? {
@@ -817,9 +820,23 @@ pub async fn app_with_control(
         encryption_backend,
     );
 
+    // Migrate before opening S3: its one bucket listing both reconstructs
+    // SpaceSizes and records which in-flight DELETE fences were counted.
+    // Object sizes come from that listing; a separate HEAD afterwards could
+    // observe a DELETE in progress. The boot migration is bounded by
+    // `lock_timeout`; the second pass in `new_with_encryption` finds the
+    // history current, then runs the CID-alias backfill with the column key
+    // before any request is served.
+    tinycloud_core::db::migrate(&database_connection).await?;
+    let deleting_fences = tinycloud_core::kv_orphans::deleting_fences(&database_connection).await?;
+    let block_store: BlockStores = match &tinycloud_config.storage.blocks {
+        Either::A(s3) => Either::A(s3.open_with_deleting(&deleting_fences).await?),
+        Either::B(local) => Either::B(local.open().await?),
+    };
+    let orphan_store = block_store.clone();
     let tinycloud = TinyCloud::new_with_encryption(
         database_connection,
-        tinycloud_config.storage.blocks.open().await?,
+        block_store,
         key_setup.setup(()).await?,
         Some(webhook_encryption.clone()),
     )
@@ -830,8 +847,90 @@ pub async fn app_with_control(
     tinycloud.set_read_audit_wait(Duration::from_millis(
         tinycloud_config.database.read_audit_wait_ms,
     ));
-    let encryption_service =
-        encryption_service.with_sqlite_writer_lock(tinycloud.sqlite_writer_lock());
+    let mut named_keys_enabled = tinycloud_config.encryption_network.named_keys_v1;
+    let deletion_ledger = match tinycloud_config
+        .encryption_network
+        .deletion_ledger_path
+        .as_deref()
+        .map(tinycloud_core::encryption_network::deletion_ledger::DeletionLedger::open)
+        .transpose()
+    {
+        Ok(ledger) => ledger.map(Arc::new),
+        Err(error) => {
+            named_keys_enabled = false;
+            ::tracing::error!(
+                event = "deletion_ledger_open_failed",
+                error_kind = error.kind(),
+                "deletion ledger could not be opened: the named-key routes are off"
+            );
+            None
+        }
+    };
+    let encryption_service = encryption_service
+        .with_sqlite_writer_lock(tinycloud.sqlite_writer_lock())
+        .with_deletion_ledger(deletion_ledger.clone());
+    // Runs after the migrations: a key row under `apps/` that is not a
+    // deletable key stops the node from starting.
+    tinycloud_core::encryption_network::keys::ensure_no_deterministic_app_keys(&seed_conn).await?;
+    // The deletion ledger is replayed onto the database before any route is
+    // served, so a delete that a restore or a crash left out is applied
+    // first. If the replay fails the named-key routes stay off (as with
+    // `named_keys_v1` off) and the rest of the node serves.
+    // (`named_keys_enabled` is false if the ledger could not be opened.)
+    if let Some(ledger) = &deletion_ledger {
+        match ledger.replay_at_start(&seed_conn).await {
+            Ok(report) => {
+                if ledger.dropped_tail_bytes() > 0 || report.applied > 0 || report.torn_tail {
+                    ::tracing::warn!(
+                        event = "deletion_ledger_replayed",
+                        operations = report.operations,
+                        aborted_operations = report.aborted_operations,
+                        applied = report.applied,
+                        not_deletable = report.not_deletable,
+                        newer_version = report.newer_version,
+                        dropped_tail_bytes = ledger.dropped_tail_bytes(),
+                        torn_tail = report.torn_tail,
+                        "deletion ledger replayed at start"
+                    );
+                }
+            }
+            Err(error) => {
+                named_keys_enabled = false;
+                ::tracing::error!(
+                    event = "deletion_ledger_replay_failed",
+                    error_kind = error.kind(),
+                    "deletion ledger replay failed: the named-key routes are off"
+                );
+            }
+        }
+    }
+    let tinycloud = tinycloud.with_named_keys(named_keys_enabled);
+    let figment_named_keys_off;
+    let config = if named_keys_enabled == tinycloud_config.encryption_network.named_keys_v1 {
+        config
+    } else {
+        figment_named_keys_off =
+            config
+                .clone()
+                .merge(rocket::figment::providers::Serialized::global(
+                    "encryption_network.named_keys_v1",
+                    false,
+                ));
+        &figment_named_keys_off
+    };
+    let routes = production_routes(named_keys_enabled);
+    #[cfg(feature = "tc-bench-v1")]
+    let mut routes = routes;
+
+    #[cfg(feature = "tc-bench-v1")]
+    routes.extend(rocket::routes![
+        tc_bench_auth_verify,
+        tc_bench_kv_put,
+        tc_bench_kv_get,
+        tc_bench_block_put,
+        tc_bench_block_get,
+        tc_bench_health,
+    ]);
     let database_artifact_repository: Arc<dyn DatabaseArtifactRepository> =
         Arc::new(SizeTrackingArtifactRepository::new(
             Arc::new(node_artifact_repository(&tinycloud)),
@@ -872,7 +971,21 @@ pub async fn app_with_control(
         PolicyV3Runtime::new(seed_conn.clone(), key_setup.node_did(), key_setup.clone())
             .with_sqlite_writer_lock(tinycloud.sqlite_writer_lock());
     if tinycloud_config.share_email.enabled {
-        policy_v3_runtime = policy_v3_runtime.with_delivery(&tinycloud_config.share_email)?;
+        let links_origin =
+            links_fetch::LinksOrigin::parse(&tinycloud_config.share_email.links_origin)
+                .map_err(|error| anyhow::anyhow!(error))?;
+        let links = Arc::new(
+            links_fetch::ApiLinkFetcher::new(
+                egress_policy.clone(),
+                links_origin,
+                tinycloud_config.share_email.links_origin_allow_private,
+            )
+            // Every read is signed with the node identity key, the key that
+            // signs the delivery admission.
+            .with_read_signer(links_read_auth::ReadSigner::new(key_setup.clone())),
+        );
+        policy_v3_runtime =
+            policy_v3_runtime.with_delivery(&tinycloud_config.share_email, links)?;
     }
     // The pinned issuer set is built (and every set-load rule applied) whether
     // or not share-email is enabled; a violation stops the node from starting.
@@ -880,6 +993,7 @@ pub async fn app_with_control(
     if !credential_issuers.is_empty() {
         policy_v3_runtime = policy_v3_runtime.with_credential_issuers(credential_issuers);
     }
+    let delivery_fetch_limiter = policy_v3_runtime.fetch_limiter().clone();
 
     #[cfg(feature = "duckdb")]
     let duckdb_service = DuckDbService::new(
@@ -918,6 +1032,8 @@ pub async fn app_with_control(
     )?;
     spawn_webhook_dispatcher(webhook_dispatcher);
 
+    let orphan_conn = seed_conn.clone();
+
     // TC-326: capture handles for the telemetry DB sampler before `tinycloud`
     // is moved into Rocket-managed state below.
     let telemetry_enabled = tinycloud_config.telemetry.enabled;
@@ -932,6 +1048,16 @@ pub async fn app_with_control(
                 let shutdown = rocket.shutdown();
                 Box::pin(async move {
                     tokio::spawn(egress::run_refresh(policy, shutdown));
+                })
+            }
+        }))
+        .attach(AdHoc::on_liftoff("delivery-rate-limit-report", {
+            let limiter = delivery_fetch_limiter.clone();
+            move |rocket| {
+                let limiter = limiter.clone();
+                let shutdown = rocket.shutdown();
+                Box::pin(async move {
+                    tokio::spawn(delivery_limiter::run_report(limiter, shutdown));
                 })
             }
         }))
@@ -975,6 +1101,33 @@ pub async fn app_with_control(
                 })
             },
         ))
+        .attach(AdHoc::on_liftoff("kv-orphan-cleanup", move |rocket| {
+            let conn = orphan_conn.clone();
+            let store = orphan_store.clone();
+            let shutdown = rocket.shutdown();
+            Box::pin(async move {
+                tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+                    tokio::pin!(shutdown);
+                    loop {
+                        tokio::select! {
+                            _ = interval.tick() => {
+                                let result = tokio::select! {
+                                    result = tinycloud_core::kv_orphans::drain_candidates_for_interval(
+                                        &conn, &store, tinycloud_core::kv_orphans::ORPHAN_GRACE,
+                                    ) => result,
+                                    _ = &mut shutdown => break,
+                                };
+                                if let Err(error) = result {
+                                    ::tracing::warn!(%error, "KV orphan collection failed");
+                                }
+                            }
+                            _ = &mut shutdown => break,
+                        }
+                    }
+                });
+            })
+        }))
         .manage(tinycloud)
         .manage(node_public_keys)
         .manage(sql_service);
@@ -1326,7 +1479,7 @@ mod production_route_tests {
         );
     }
 
-    /// The five key routes are mounted only with `named_keys_v1` on; the
+    /// The six key routes are mounted only with `named_keys_v1` on; the
     /// network routes are mounted either way.
     #[test]
     fn named_key_routes_are_mounted_only_when_named_keys_are_on() {
@@ -1337,7 +1490,7 @@ mod production_route_tests {
                 .collect()
         };
         let key_routes = describe(named_key_routes());
-        assert_eq!(key_routes.len(), 5, "{key_routes:?}");
+        assert_eq!(key_routes.len(), 6, "{key_routes:?}");
         let off = describe(production_routes(false));
         let on = describe(production_routes(true));
         for route in &key_routes {
@@ -1354,7 +1507,7 @@ mod production_route_tests {
             assert!(off.contains(&route), "missing while off: {route}");
             assert!(on.contains(&route), "missing while on: {route}");
         }
-        assert_eq!(on.len(), off.len() + 5);
+        assert_eq!(on.len(), off.len() + 6);
     }
 }
 

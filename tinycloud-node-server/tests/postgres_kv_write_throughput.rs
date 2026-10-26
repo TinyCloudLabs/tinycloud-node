@@ -54,7 +54,8 @@ use tinycloud_core::sea_orm::{
 };
 use tinycloud_core::storage::memory::{MemoryStaging, MemoryStore};
 use tinycloud_core::storage::{
-    HashBuffer, ImmutableReadStore, ImmutableWriteStore, StorageConfig, StorageSetup,
+    HashBuffer, ImmutableDeleteStore, ImmutableReadStore, ImmutableWriteStore, StorageConfig,
+    StorageSetup, StoreSize,
 };
 use tinycloud_core::types::{Metadata, SpaceIdWrap};
 use tinycloud_core::{SpaceDatabase, TxError, TxStoreError};
@@ -73,6 +74,7 @@ type Db<B> = SpaceDatabase<DatabaseConnection, B, StaticSecret>;
 trait BenchStore:
     ImmutableWriteStore<MemoryStaging, Error: Send + Sync>
     + ImmutableReadStore<Error: Send + Sync, Readable: Send>
+    + ImmutableDeleteStore<Error: Send + Sync>
     + StorageSetup<Error: Send + Sync>
     + Clone
     + Send
@@ -84,6 +86,7 @@ trait BenchStore:
 impl<B> BenchStore for B where
     B: ImmutableWriteStore<MemoryStaging, Error: Send + Sync>
         + ImmutableReadStore<Error: Send + Sync, Readable: Send>
+        + ImmutableDeleteStore<Error: Send + Sync>
         + StorageSetup<Error: Send + Sync>
         + Clone
         + Send
@@ -187,6 +190,8 @@ struct CellReport {
     attempted: usize,
     ok: usize,
     wall: Duration,
+    started_at: time::OffsetDateTime,
+    ended_at: time::OffsetDateTime,
     p50: Duration,
     p95: Duration,
     errors: BTreeMap<String, (usize, String)>,
@@ -327,6 +332,7 @@ async fn run_cell<B: BenchStore>(
         batches.push(batch);
     }
 
+    let started_at = time::OffsetDateTime::now_utc();
     let start = Instant::now();
     let handles = batches
         .into_iter()
@@ -366,6 +372,7 @@ async fn run_cell<B: BenchStore>(
         }
     }
     let wall = start.elapsed();
+    let ended_at = time::OffsetDateTime::now_utc();
     latencies.sort_unstable();
 
     let spaces = owners.iter().map(|o| o.space.clone()).collect::<Vec<_>>();
@@ -377,6 +384,8 @@ async fn run_cell<B: BenchStore>(
         attempted: latencies.len(),
         ok,
         wall,
+        started_at,
+        ended_at,
         p50: percentile(&latencies, 50),
         p95: percentile(&latencies, 95),
         errors,
@@ -403,9 +412,9 @@ fn print_table(store: &str, reports: &[CellReport]) {
     println!();
     println!(
         "| layout | concurrency | puts | ok | errors | ok ops/s | p50 ms | p95 ms | \
-         event_order rows | dup (space,seq) groups | error kinds |"
+         event_order rows | dup (space,seq) groups | UTC start | UTC end | error kinds |"
     );
-    println!("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|");
+    println!("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|");
     for r in reports {
         let error_count = r.attempted - r.ok;
         let kinds = if r.errors.is_empty() {
@@ -418,7 +427,7 @@ fn print_table(store: &str, reports: &[CellReport]) {
                 .join("; ")
         };
         println!(
-            "| {} | {} | {} | {} | {} | {:.1} | {:.2} | {:.2} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {:.1} | {:.2} | {:.2} | {} | {} | {} | {} | {} |",
             r.layout.label(),
             r.concurrency,
             r.attempted,
@@ -429,6 +438,8 @@ fn print_table(store: &str, reports: &[CellReport]) {
             ms(r.p95),
             r.event_rows,
             r.duplicate_seq_groups,
+            r.started_at,
+            r.ended_at,
             kinds,
         );
     }
@@ -512,6 +523,127 @@ async fn postgres_kv_write_throughput() {
 
     let reports = exercise.expect("TC-732 benchmark harness failed");
     print_table(&store, &reports);
+}
+
+/// Exercise the real S3 delete/accounting path for a rolled-back upload.
+/// The regular benchmark intentionally has no failed writes.
+#[tokio::test]
+#[ignore = "manual PG16 + S3 integration test"]
+async fn postgres_s3_orphan_cleanup_reclaims_space_usage() {
+    let database_url = std::env::var("TINYCLOUD_TEST_POSTGRES_URL").unwrap();
+    let config: S3BlockConfig = serde_json::from_value(serde_json::json!({
+        "bucket": std::env::var("TC732_BENCH_S3_BUCKET").unwrap(),
+        "endpoint": std::env::var("TC732_BENCH_S3_ENDPOINT").unwrap(),
+    }))
+    .unwrap();
+    let store: S3BlockStore = config.open().await.unwrap();
+    let admin = Database::connect(ConnectOptions::new(database_url.clone()))
+        .await
+        .unwrap();
+    let schema = format!(
+        "tc735gc_{}_{}",
+        std::process::id(),
+        time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+    );
+    admin
+        .execute(Statement::from_string(
+            DbBackend::Postgres,
+            format!("CREATE SCHEMA {schema}"),
+        ))
+        .await
+        .unwrap();
+    let mut options = ConnectOptions::new(database_url);
+    options.set_schema_search_path(schema.clone());
+    let conn = Database::connect(options).await.unwrap();
+    let _db = SpaceDatabase::new(
+        conn.clone(),
+        store.clone(),
+        StaticSecret::new(vec![0; 32]).unwrap(),
+    )
+    .await
+    .unwrap();
+    let owner = Owner::generate().unwrap();
+    store.create(&owner.space).await.unwrap();
+    let mut stage = HashBuffer::new(Vec::new());
+    stage.write_all(b"tc735-orphan-cleanup").await.unwrap();
+    let hash = stage.hash();
+    let first = tinycloud_core::kv_orphans::register_candidates(
+        &conn,
+        &[(owner.space.clone(), hash)],
+        "crashed",
+    )
+    .await
+    .unwrap();
+    assert_eq!(first[0].2, 0, "the first upload uses the bare key");
+    assert_eq!(
+        ImmutableWriteStore::<MemoryStaging>::persist(&store, &owner.space, stage, first[0].2)
+            .await
+            .unwrap(),
+        hash
+    );
+    assert_eq!(store.total_size(&owner.space).await.unwrap(), Some(20));
+    assert_eq!(
+        tinycloud_core::kv_orphans::collect_candidates(&conn, &store, 1, time::Duration::ZERO,)
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(!store
+        .contains(&owner.space, &hash, first[0].2)
+        .await
+        .unwrap());
+    assert_eq!(store.total_size(&owner.space).await.unwrap(), Some(0));
+    // Simulate a known failure whose object removal succeeded but whose
+    // candidate-row deletion did not commit. A later GC pass must not debit
+    // the physical-byte counter a second time.
+    let mut failed = HashBuffer::new(Vec::new());
+    failed.write_all(b"tc735-known-failure").await.unwrap();
+    let failed_hash = failed.hash();
+    let candidate = [(owner.space.clone(), failed_hash)];
+    let failed_attempt =
+        tinycloud_core::kv_orphans::register_candidates(&conn, &candidate, "known-failure")
+            .await
+            .unwrap();
+    ImmutableWriteStore::<MemoryStaging>::persist(
+        &store,
+        &owner.space,
+        failed,
+        failed_attempt[0].2,
+    )
+    .await
+    .unwrap();
+    tinycloud_core::kv_orphans::refund_failed(&conn, &store, &failed_attempt, "known-failure")
+        .await
+        .unwrap();
+    assert_eq!(store.total_size(&owner.space).await.unwrap(), Some(0));
+    let retry =
+        tinycloud_core::kv_orphans::register_candidates(&conn, &candidate, "retry-after-delete")
+            .await
+            .unwrap();
+    assert_eq!(
+        retry[0].2, 1,
+        "confirmed deletion advances storage generation"
+    );
+    assert_eq!(
+        tinycloud_core::kv_orphans::collect_candidates(&conn, &store, 1, time::Duration::ZERO,)
+            .await
+            .unwrap(),
+        0,
+        "the stale candidate has no physical object left to remove"
+    );
+    assert!(!store
+        .contains(&owner.space, &failed_hash, retry[0].2)
+        .await
+        .unwrap());
+    assert_eq!(store.total_size(&owner.space).await.unwrap(), Some(0));
+    conn.close().await.unwrap();
+    admin
+        .execute(Statement::from_string(
+            DbBackend::Postgres,
+            format!("DROP SCHEMA {schema} CASCADE"),
+        ))
+        .await
+        .unwrap();
 }
 
 async fn run_matrix<B: BenchStore>(
