@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Changes
+- A chain-guard wait longer than 500 ms is logged once per second with its kind and duration. Details: TC-2075
+
 ## [1.25.7] - 2026-10-26
 
 ### Changes
