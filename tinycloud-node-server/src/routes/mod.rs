@@ -142,7 +142,8 @@ pub const SQL_BUSY_RETRY_AFTER_SECS: u32 = 5;
 /// write began (TC-1274).
 pub const REQUEST_TIMEOUT: &str = "request_timeout";
 /// The whole body of a [`REQUEST_TIMEOUT`] response.
-pub const REQUEST_TIMEOUT_BODY: &str = "request_timeout: no change was applied; retry the request";
+pub const REQUEST_TIMEOUT_BODY: &str =
+    "request_timeout: no change was applied; retry the request with a new signature";
 /// Body prefix of a `503` whose read's audit record was not committed within
 /// the read-audit wait bound (TC-1317); `Retry-After` is
 /// [`SQL_BUSY_RETRY_AFTER_SECS`], since the audit queue is backlogged.

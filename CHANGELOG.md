@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- The 503 body of a request that reached its deadline reads "request_timeout: no change was applied; retry the request with a new signature". Details: TC-1997.
+
 ## [1.25.2] - 2026-10-26
 
 - No code changes since 1.25.1. Prepared so that named keys can be turned off with the deploy input `named_keys_v1` without a rebuild.
