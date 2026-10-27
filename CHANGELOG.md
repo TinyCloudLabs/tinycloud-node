@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Changes
+- A delegator may revoke a delegation it issued when its session proof grants no revoke. Details: TC-2132
+
 ## [1.25.8] - 2026-10-26
 
 ### Changes

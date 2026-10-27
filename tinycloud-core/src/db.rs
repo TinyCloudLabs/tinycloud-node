@@ -2227,7 +2227,8 @@ where
             revocation::ControlProofDecision::Scoped(control) => {
                 control.authorizes_target(&target, &delegation, &abilities)
             }
-            revocation::ControlProofDecision::Denied => false,
+            revocation::ControlProofDecision::Ungranted
+            | revocation::ControlProofDecision::Denied => false,
         };
         if !authorized {
             return Ok(None);
