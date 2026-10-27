@@ -444,10 +444,21 @@ impl EncryptionService {
         &self,
         network_id: &NetworkId,
     ) -> Result<NetworkDescriptor, EncryptionServiceError> {
-        let model = encryption_network::Entity::find_by_id(network_id.to_string())
+        Ok(self.load_network(network_id).await?.0)
+    }
+
+    /// One `encryption_network` lookup, returning the descriptor together with
+    /// the row's sealed private key so a caller that needs both reads the row
+    /// once.
+    async fn load_network(
+        &self,
+        network_id: &NetworkId,
+    ) -> Result<(NetworkDescriptor, Option<Vec<u8>>), EncryptionServiceError> {
+        let mut model = encryption_network::Entity::find_by_id(network_id.to_string())
             .one(&self.db)
             .await?
             .ok_or(EncryptionServiceError::NetworkNotFound)?;
+        let sealed_private_key = model.sealed_private_key.take();
 
         let members = encryption_network_member::Entity::find()
             .filter(encryption_network_member::Column::NetworkId.eq(network_id.to_string()))
@@ -466,7 +477,7 @@ impl EncryptionService {
         let backend =
             KeyBackendKind::parse(&model.key_backend).unwrap_or(KeyBackendKind::LocalOneOfOne);
 
-        Ok(NetworkDescriptor {
+        let descriptor = NetworkDescriptor {
             network_id: network_id.clone(),
             owner_did: model.owner_did,
             name: model.name,
@@ -482,7 +493,8 @@ impl EncryptionService {
             key_backend: backend,
             created_at: model.created_at,
             updated_at: model.updated_at,
-        })
+        };
+        Ok((descriptor, sealed_private_key))
     }
 
     pub async fn get_network_by_name(
@@ -980,7 +992,7 @@ impl EncryptionService {
             .ok_or(EncryptionServiceError::Unauthorized)?;
         check_decrypt_scope(target, &cap.resource.to_string(), &body, &facts)?;
 
-        let descriptor = self.get_network(network_id).await?;
+        let (descriptor, sealed_private_key) = self.load_network(network_id).await?;
         match descriptor.state {
             NetworkState::Active => {}
             NetworkState::Revoked => {
@@ -1048,13 +1060,12 @@ impl EncryptionService {
 
         let (key_version, symmetric) = match target {
             DecryptTarget::Root(_) => {
-                let network_row = encryption_network::Entity::find_by_id(network_id.to_string())
-                    .one(&self.db)
-                    .await?
-                    .ok_or(EncryptionServiceError::NetworkNotFound)?;
-                let sealed_private_key = network_row.sealed_private_key.as_deref().ok_or(
-                    EncryptionServiceError::Backend(KeyBackendError::SealedKeyMissing),
-                )?;
+                let sealed_private_key =
+                    sealed_private_key
+                        .as_deref()
+                        .ok_or(EncryptionServiceError::Backend(
+                            KeyBackendError::SealedKeyMissing,
+                        ))?;
                 let symmetric = self
                     .backend
                     .unwrap(sealed_private_key, &wrapped_key_bytes)

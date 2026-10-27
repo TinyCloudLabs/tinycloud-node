@@ -3,8 +3,14 @@
 ## [Unreleased]
 
 ### Changes
-- A chain-guard wait longer than 500 ms is logged once per second with its kind and duration. Details: TC-2075
 - A delegator may revoke a delegation it issued when its session proof grants no revoke. Details: TC-2132
+
+## [1.25.8] - 2026-10-26
+
+### Changes
+- A chain-guard wait longer than 500 ms is logged once per second with its kind and duration. Details: TC-2075
+- A decrypt request makes one fewer read of its encryption network row: the sealed key is read together with the state check instead of in a separate lookup. Details: TC-2062
+- KV writes that carry a blob: the final reference check now has an index to use. Migration `m20261026_000000_kv_write_space_value_index` expects `idx_kv_write_space_value` on `kv_write (space, value, generation)` on PostgreSQL. It never builds the index on a non-empty table and never fails the boot: it logs `kv_write_value_index_missing`, `kv_write_value_index_invalid` or `kv_write_value_index_wrong_shape` and keeps serving. Build the index with `CREATE INDEX CONCURRENTLY` before the deploy (`docs/releasing.md`, section `idx_kv_write_space_value`). Details: TC-2062.
 
 ## [1.25.7] - 2026-10-26
 
