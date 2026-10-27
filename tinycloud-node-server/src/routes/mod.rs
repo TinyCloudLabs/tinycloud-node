@@ -319,6 +319,7 @@ fn build_info(
         "encryption",
         "kv-sync-v1",
         "kv-sync-root",
+        "delegation-issued-query-v1",
     ]);
     #[cfg(feature = "dstack")]
     features.push("tee");
@@ -660,6 +661,13 @@ pub async fn delegation_query(
             tinycloud_core::db::AccountDelegationQueryError::Unauthorized => (
                 Status::Forbidden,
                 "Delegation query proof is not authorized".to_string(),
+            ),
+            tinycloud_core::db::AccountDelegationQueryError::InvalidCursor => (
+                Status::BadRequest,
+                format!(
+                    "Invalid delegation query: {}",
+                    tinycloud_core::types::DelegationQueryValidationError::InvalidCursor
+                ),
             ),
             tinycloud_core::db::AccountDelegationQueryError::Db(_) => (
                 Status::ServiceUnavailable,
@@ -4279,6 +4287,7 @@ async fn verify_auth_admitted(
 
 #[cfg(test)]
 mod tests {
+    mod delegation_issued_query;
     mod encryption_keys;
     mod key_delete;
     mod revocation_scope;

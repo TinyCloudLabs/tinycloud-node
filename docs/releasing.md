@@ -539,6 +539,8 @@ its branch policy before any workflow that names it runs.
      Compare `features` with the previous release (1.20.1 reports `kv`,
      `delegation`, `sharing`, `sql`, `hooks`, `signed-urls`, `encryption`,
      `kv-sync-v1`, `kv-sync-root`, `tee`).
+     A release that includes TC-2132 also reports `delegation-issued-query-v1`;
+     without it `POST /delegation/query` answers `direction: "issued"` with 400.
    - Every PostgreSQL connection got its TCP keepalive options (TC-1054,
      1.20.5 on). The production logs are private, so this is read from
      `/info`, which carries two counts (no hosts or errors):
