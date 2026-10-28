@@ -1291,3 +1291,82 @@ async fn tc2192_legacy_mutable_source_preserves_wrapped_key_rotation() -> anyhow
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn tc2192_refused_direct_mixed_decrypt_delete_leaves_kv_unchanged() -> anyhow::Result<()> {
+    use tinycloud_auth::{
+        siwe_recap::Ability,
+        ssi::{claims::jwt::NumericDate, ucan::Payload},
+        ucan_capabilities_object::Capabilities,
+    };
+    use tinycloud_core::encryption_network::canonical::canonical_hash;
+
+    let share = ShareDecrypt::with_source(None, "immutable").await?;
+    let before = share.h.read(&share.session).await?;
+    assert_eq!(before, (Status::Ok, b"tc-1423-content".to_vec()));
+    // Delete is independently authorized, but is not part of this policy
+    // session or the direct decrypt endpoint's contract.
+    let delete_grant = share
+        .h
+        .import(share.h.space_owner.delegate(
+            share.h.holder.did(),
+            &[(share.h.content_resource.to_string(), "tinycloud.kv/del")],
+            Window::until(now() + Duration::hours(1)),
+            &[],
+        )?)
+        .await?;
+    let mut attenuation = Capabilities::<Value>::new();
+    for (resource, ability) in [
+        (share.leaf(), KEY_DECRYPT),
+        (share.h.content_resource.to_string(), "tinycloud.kv/del"),
+    ] {
+        attenuation.with_action(
+            resource.parse()?,
+            ability.parse::<Ability>()?,
+            [std::collections::BTreeMap::<String, Value>::new()],
+        );
+    }
+    let body = share.body();
+    let mut facts = body.clone();
+    facts
+        .as_object_mut()
+        .unwrap()
+        .remove("encryptedSymmetricKey");
+    facts.as_object_mut().unwrap().remove("receiverPublicKey");
+    facts["bodyHash"] = json!(canonical_hash(&body));
+    let Signer::Key { jwk, vm, .. } = &share.h.holder else {
+        unreachable!()
+    };
+    let at = now();
+    let authorization = Payload {
+        issuer: vm.parse()?,
+        audience: share.h.node_did().parse()?,
+        not_before: Some(NumericDate::try_from_seconds(at.unix_timestamp() as f64)?),
+        expiration: NumericDate::try_from_seconds(
+            (at + Duration::seconds(30)).unix_timestamp() as f64
+        )?,
+        nonce: Some(unique("tc2192mixeddecrypt")),
+        facts: Some(vec![facts]),
+        proof: vec![session_cid(&share.session)?, delete_grant.parse()?],
+        attenuation,
+    }
+    .sign(Algorithm::EdDSA, jwk)?
+    .encode()?;
+    let (status, response, _) = answer(
+        share
+            .h
+            .client
+            .post(format!("/encryption/networks/{}/decrypt", share.h.network))
+            .header(ContentType::JSON)
+            .header(Header::new("Authorization", authorization))
+            .body(body.to_string()),
+    )
+    .await;
+    assert_eq!(status, Status::Forbidden, "{response}");
+    assert_eq!(
+        share.h.read(&share.session).await?,
+        before,
+        "a refused direct decrypt must not execute its bundled KV delete",
+    );
+    Ok(())
+}

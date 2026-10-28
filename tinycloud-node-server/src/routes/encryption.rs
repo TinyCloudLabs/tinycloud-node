@@ -174,33 +174,13 @@ pub async fn decrypt(
     tinycloud: &State<TinyCloud>,
     policy_v3: &State<crate::policy_v3::PolicyV3Runtime>,
 ) -> Result<Json<DecryptResponseBody>, (Status, String)> {
-    let invocation = authorization.0;
-    let invocation_info = invocation.0.clone();
-    verify_auth(
-        "server.encryption.decrypt.auth",
-        invocation,
-        tinycloud,
-        service.node_did(),
-    )
-    .await?;
-    // Same policy gate as `/invoke`: a policy-session chain must still be
-    // live (roots, session, descendants) to decrypt through this route.
-    policy_v3
-        .authorize_invocation(
-            tinycloud,
-            &invocation_info,
-            Some(&body),
-            time::OffsetDateTime::now_utc(),
-        )
-        .await
-        .map_err(|error| (Status::Forbidden, error.to_string()))?;
-
     let net: NetworkId =
         network_id
             .parse()
             .map_err(|e: tinycloud_core::encryption_network::NetworkIdError| {
                 (Status::BadRequest, e.to_string())
             })?;
+    let network = net.to_string();
     let body = body.into_inner();
     if body.get("keyPath").is_some() {
         return Err((
@@ -209,10 +189,60 @@ pub async fn decrypt(
                 .to_string(),
         ));
     }
-    let target = tinycloud_core::encryption_network::DecryptTarget::Root(net.clone());
+    let invocation_info = &authorization.0 .0;
+    let capability = match invocation_info.capabilities.as_slice() {
+        [capability]
+            if capability.ability.as_ref().as_ref()
+                == tinycloud_core::encryption_network::DECRYPT_ACTION =>
+        {
+            capability
+        }
+        _ => {
+            return Err((
+                Status::Forbidden,
+                "direct decrypt requires exactly one decrypt capability".into(),
+            ));
+        }
+    };
+    if capability.resource.to_string() != network {
+        return Err(map_service_err(EncryptionServiceError::NetworkMismatch));
+    }
+    if invocation_info.invocation.payload().audience != service.node_did() {
+        return Err(map_service_err(EncryptionServiceError::AudienceMismatch));
+    }
+    // Authorization must be read-only: `verify_auth` invokes every submitted
+    // capability and could commit a KV mutation before a later refusal.
+    let now = time::OffsetDateTime::now_utc();
+    let auth_start = Instant::now();
+    let auth_result = tinycloud.authorize_invocation(invocation_info, now).await;
+    crate::prometheus::observe_span(
+        "server.encryption.decrypt.auth",
+        if auth_result.is_ok() { "ok" } else { "error" },
+        auth_start.elapsed(),
+    );
+    auth_result.map_err(|error| match &error {
+        tinycloud_core::models::invocation::Error::Db(db_error) => super::database_failure(
+            tinycloud_core::failure_diagnostic::Service::Other,
+            db_error,
+            false,
+            error.to_string(),
+        ),
+        _ => (Status::Unauthorized, error.to_string()),
+    })?;
+    // Same policy gate as `/invoke`: a policy-session chain must still be
+    // live (roots, session, descendants) to decrypt through this route.
+    policy_v3
+        .authorize_invocation(tinycloud, invocation_info, Some(&body), now)
+        .await
+        .map_err(|error| (Status::Forbidden, error.to_string()))?;
+
+    if body.get("networkId").and_then(serde_json::Value::as_str) != Some(network.as_str()) {
+        return Err(map_service_err(EncryptionServiceError::NetworkMismatch));
+    }
+    let target = tinycloud_core::encryption_network::DecryptTarget::Root(net);
     let decrypt_start = Instant::now();
     let decrypt_result = service
-        .decrypt_authorized(&target, &invocation_info, &body)
+        .decrypt_authorized(&target, invocation_info, &body)
         .await;
     crate::prometheus::observe_span(
         "server.encryption.decrypt_authorized",

@@ -5,6 +5,7 @@
 ### Changes
 - PolicyV3 decrypt checks the authoritative registered `contentSource`, never caller metadata: the capability resource, owner-qualified `encryptionNetwork` and optional `encryptionKeyPath` must match exactly. Every path-scoped Share source, whether mutable or immutable, requires a registered `encryptedSymmetricKeyDigestHex` (SHA-256 of the base64-decoded wrapped key) and binds that digest and `keyVersion` at use-time, before decrypt. Sources without `encryptionKeyPath` retain their existing mode-dependent key binding. A copied `exact` selector cannot authorize a descendant or sibling resource. Details: TC-2192
 - Path-scoped Share policy sessions (`contentSource.encryptionKeyPath = share/<shareId>`) are minted with `remainingRedelegationDepth = 0`, preventing re-delegation. Policies without that field retain depth 8 and their existing delegation behavior; ordinary delegations are unchanged. Details: TC-2192
+- Direct network decrypt accepts exactly one decrypt capability for the route's network and authorizes it without executing an invocation. Route/key-path, registered-source and route/body network checks precede decrypt, so a refused mixed decrypt/delete request cannot commit its bundled KV delete. Details: TC-2192
 
 ## [1.25.11] - 2026-10-28
 
