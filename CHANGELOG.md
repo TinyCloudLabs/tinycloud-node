@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- PolicyV3 share policies support an exact named-key decrypt capability at `:default/share/<shareId>` when `contentSource.encryptionKeyPath` is `share/<shareId>`. Existing sources without that field retain their network-level decrypt capability.
+
 ## [1.25.9] - 2026-10-27
 
 ### Changes

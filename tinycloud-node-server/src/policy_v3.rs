@@ -27,6 +27,8 @@ use tinycloud_auth::{
     resource::{ResourceId, SpaceId},
 };
 use tinycloud_core::{
+    encryption_network::key_id::{self, EncryptionResource},
+    encryption_network::NetworkId,
     events::{Delegation, SerializedEvent},
     hash::hash,
     keys::StaticSecret,
@@ -4540,6 +4542,7 @@ fn registration_projections(policy: &Value) -> Result<RegistrationProjections, (
         "kvResource",
         "selector",
         "encryptionNetwork",
+        "encryptionKeyPath",
         "encryptedSymmetricKeyDigestHex",
         "keyVersion",
         "mode",
@@ -4589,7 +4592,25 @@ fn registration_projections(policy: &Value) -> Result<RegistrationProjections, (
         .get("encryptionNetwork")
         .and_then(Value::as_str)
         .ok_or((Status::BadRequest, "content-source-invalid".into()))?;
-    validate_policy_encryption_resource(encryption_network)?;
+    validate_policy_encryption_network(encryption_network)?;
+    let encryption_resource = if let Some(key_path) = source.get("encryptionKeyPath") {
+        let share_id = source.get("shareId").and_then(Value::as_str).unwrap();
+        let expected_path = format!("share/{share_id}");
+        let network = encryption_network
+            .parse::<NetworkId>()
+            .map_err(|_| (Status::BadRequest, "content-source-invalid".into()))?;
+        let leaf = format!("{encryption_network}/{expected_path}");
+        if key_path.as_str() != Some(expected_path.as_str())
+            || network.name() != "default"
+            || network.to_string() != encryption_network
+            || !matches!(key_id::parse(&leaf), Ok(EncryptionResource::Key(_)))
+        {
+            return Err((Status::BadRequest, "content-source-invalid".into()));
+        }
+        leaf
+    } else {
+        encryption_network.to_owned()
+    };
 
     let capabilities = object
         .get("capabilityCeiling")
@@ -4664,10 +4685,20 @@ fn registration_projections(policy: &Value) -> Result<RegistrationProjections, (
                     .get("resource")
                     .and_then(Value::as_str)
                     .ok_or((Status::BadRequest, "capability-invalid".into()))?;
-                validate_policy_encryption_resource(resource)?;
+                if source.contains_key("encryptionKeyPath") {
+                    validate_policy_encryption_resource(resource)?;
+                } else {
+                    validate_policy_encryption_network(resource)?;
+                }
                 if cap.get("action").and_then(Value::as_str) != Some("tinycloud.encryption/decrypt")
                 {
                     return Err((Status::BadRequest, "capability-invalid".into()));
+                }
+                if source.contains_key("encryptionKeyPath") && resource != encryption_resource {
+                    return Err((
+                        Status::Forbidden,
+                        "content-source-capability-mismatch".into(),
+                    ));
                 }
                 if attenuation
                     .insert(
@@ -4684,7 +4715,7 @@ fn registration_projections(policy: &Value) -> Result<RegistrationProjections, (
                     "path": resource,
                     "actions": ["tinycloud.encryption/decrypt"],
                 }));
-                saw_source_encryption |= resource == encryption_network;
+                saw_source_encryption |= resource == encryption_resource;
             }
             _ => return Err((Status::BadRequest, "capability-invalid".into())),
         }
@@ -4785,6 +4816,16 @@ fn parse_policy_kv_resource(value: &str) -> Result<(String, String), (Status, St
 }
 
 fn validate_policy_encryption_resource(value: &str) -> Result<(), (Status, String)> {
+    if validate_policy_encryption_network(value).is_ok()
+        || matches!(key_id::parse(value), Ok(EncryptionResource::Key(_)))
+    {
+        Ok(())
+    } else {
+        Err((Status::BadRequest, "encryption-resource-invalid".into()))
+    }
+}
+
+fn validate_policy_encryption_network(value: &str) -> Result<(), (Status, String)> {
     let rest = value
         .strip_prefix("urn:tinycloud:encryption:")
         .ok_or((Status::BadRequest, "encryption-resource-invalid".into()))?;
@@ -11520,6 +11561,131 @@ mod tests {
             original.native_projection_hash_hex,
             changed.native_projection_hash_hex
         );
+    }
+
+    #[test]
+    fn share_key_policy_projects_only_its_exact_decrypt_leaf() {
+        let vector: Value = serde_json::from_str(include_str!(
+            "../test-fixtures/tc-405-compact-authorization.json"
+        ))
+        .unwrap();
+        let legacy = &vector["policy"]["value"];
+        let legacy_projection = registration_projections(legacy).unwrap();
+        let legacy_network = legacy["contentSource"]["encryptionNetwork"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            legacy_projection.attenuation[legacy_network],
+            json!({"tinycloud.encryption/decrypt": [{}]})
+        );
+        assert!(validate_requested_policy_capabilities(
+            &[legacy["capabilityCeiling"][1].clone()],
+            legacy["capabilityCeiling"].as_array().unwrap(),
+        )
+        .is_ok());
+        let mut legacy_leaf = legacy.clone();
+        legacy_leaf["capabilityCeiling"][1]["resource"] =
+            json!(format!("{legacy_network}/share/share-405-vector"));
+        assert!(registration_projections(&legacy_leaf).is_err());
+
+        let mut policy = legacy.clone();
+        let owner = policy["ownerDid"].as_str().unwrap().to_owned();
+        let root = format!("urn:tinycloud:encryption:{owner}:default");
+        let leaf = format!("{root}/share/share-405-vector");
+        policy["contentSource"]["encryptionNetwork"] = json!(root);
+        policy["contentSource"]["encryptionKeyPath"] = json!("share/share-405-vector");
+        policy["capabilityCeiling"][1]["resource"] = json!(leaf);
+
+        let projection = registration_projections(&policy).expect("exact share key projects");
+        let mut delegated_owner = policy.clone();
+        delegated_owner["ownerDid"] = json!("did:key:zDelegatedPolicyOwner");
+        assert!(registration_projections(&delegated_owner).is_ok());
+        assert_eq!(
+            projection.attenuation[&leaf],
+            json!({"tinycloud.encryption/decrypt": [{}]})
+        );
+        let requested = json!({
+            "kind": "encryption",
+            "resource": leaf,
+            "action": "tinycloud.encryption/decrypt"
+        });
+        assert!(validate_requested_policy_capabilities(
+            &[requested],
+            policy["capabilityCeiling"].as_array().unwrap(),
+        )
+        .is_ok());
+
+        for (case, resource) in [
+            ("root default", root.clone()),
+            ("other share", format!("{root}/share/other")),
+            ("other path", format!("{root}/secrets/share-405-vector")),
+            ("app key", format!("{root}/apps/example/secret")),
+            ("network prefix", format!("{root}/share/")),
+        ] {
+            let mut changed = policy.clone();
+            changed["capabilityCeiling"][1]["resource"] = json!(resource);
+            assert!(
+                registration_projections(&changed).is_err(),
+                "accepted {case} as the source decrypt capability"
+            );
+            let requested = json!({
+                "kind": "encryption",
+                "resource": resource,
+                "action": "tinycloud.encryption/decrypt"
+            });
+            assert!(
+                validate_requested_policy_capabilities(
+                    &[requested],
+                    policy["capabilityCeiling"].as_array().unwrap(),
+                )
+                .is_err(),
+                "accepted {case} under the exact share ceiling"
+            );
+        }
+        let mut extra_root = policy.clone();
+        extra_root["capabilityCeiling"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "kind": "encryption",
+                "resource": root,
+                "action": "tinycloud.encryption/decrypt"
+            }));
+        assert!(registration_projections(&extra_root).is_err());
+
+        let wrong_network = format!("urn:tinycloud:encryption:{owner}:other");
+        for (case, network, path) in [
+            (
+                "wrong owner",
+                "urn:tinycloud:encryption:did:key:zOther:default",
+                "share/share-405-vector",
+            ),
+            (
+                "wrong network",
+                wrong_network.as_str(),
+                "share/share-405-vector",
+            ),
+            ("leaf as network", leaf.as_str(), "share/share-405-vector"),
+            ("wrong source path", root.as_str(), "share/other"),
+            (
+                "nested source path",
+                root.as_str(),
+                "share/share-405-vector/child",
+            ),
+            (
+                "encoded source path",
+                root.as_str(),
+                "share/share%2d405-vector",
+            ),
+        ] {
+            let mut changed = policy.clone();
+            changed["contentSource"]["encryptionNetwork"] = json!(network);
+            changed["contentSource"]["encryptionKeyPath"] = json!(path);
+            assert!(
+                registration_projections(&changed).is_err(),
+                "accepted {case}"
+            );
+        }
     }
 
     #[tokio::test]
