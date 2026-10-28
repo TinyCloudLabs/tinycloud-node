@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+## [1.25.11] - 2026-10-28
+
+### Changes
+- Version bump only for the authorized named-key production recovery. Details: TC-2177
+
 ## [1.25.10] - 2026-10-28
 
 ### Changes
