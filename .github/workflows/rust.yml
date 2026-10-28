@@ -133,8 +133,10 @@ jobs:
     # The workspace suite does not enable tinycloud-core's DuckDB feature.
     # Run its unit tests with that feature so SQL/DuckDB identity parity is
     # checked in CI as well as through the excluded W5 wire-test crate.
+    # A cold bundled DuckDB build took 11m52s before tests began in PR #473;
+    # the prior 15m cap stopped it after 1,082 passing core tests, during integration tests.
     - name: Run DuckDB-enabled core tests
-      timeout-minutes: 15
+      timeout-minutes: 20
       run: cargo test -p tinycloud-core --features duckdb
 
     - name: Run DuckDB policy and request telemetry through node binaries
