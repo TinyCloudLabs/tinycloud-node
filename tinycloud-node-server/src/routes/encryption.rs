@@ -186,7 +186,12 @@ pub async fn decrypt(
     // Same policy gate as `/invoke`: a policy-session chain must still be
     // live (roots, session, descendants) to decrypt through this route.
     policy_v3
-        .authorize_invocation(tinycloud, &invocation_info, time::OffsetDateTime::now_utc())
+        .authorize_invocation(
+            tinycloud,
+            &invocation_info,
+            Some(&body),
+            time::OffsetDateTime::now_utc(),
+        )
         .await
         .map_err(|error| (Status::Forbidden, error.to_string()))?;
 

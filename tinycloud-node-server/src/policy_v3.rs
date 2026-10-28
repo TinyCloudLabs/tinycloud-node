@@ -379,10 +379,13 @@ impl PolicyV3Runtime {
         Ok(())
     }
 
+    /// Authorize a policy-session invocation against its registered policy.
+    /// Decrypt callers must supply the request body before any key release.
     pub async fn authorize_invocation(
         &self,
         tinycloud: &crate::TinyCloud,
         invocation: &InvocationInfo,
+        decrypt_body: Option<&Value>,
         now: OffsetDateTime,
     ) -> Result<bool, &'static str> {
         if invocation.parents.len() != 1 {
@@ -434,7 +437,7 @@ impl PolicyV3Runtime {
         if !capabilities_are_contained(&invocation.capabilities, &immediate.0.capabilities) {
             return Err("policy-invocation-capability-widening");
         }
-        let (row, session) = self
+        let (row, session, policy) = self
             .validate_policy_chain(tinycloud, invocation.parents[0])
             .await?;
         let payload = invocation.invocation.payload();
@@ -544,6 +547,7 @@ impl PolicyV3Runtime {
             }
             validate_root_liveness(&self.conn, &root, &root_cid, &self.node_did, now, true).await?;
         }
+        validate_registered_decrypt_source(&policy, invocation, decrypt_body)?;
         Ok(true)
     }
 
@@ -584,7 +588,7 @@ impl PolicyV3Runtime {
         &self,
         tinycloud: &crate::TinyCloud,
         start: tinycloud_auth::ipld_core::cid::Cid,
-    ) -> Result<(policy_v3_session::Model, Delegation), &'static str> {
+    ) -> Result<(policy_v3_session::Model, Delegation, Value), &'static str> {
         let mut current_cid = start;
         let mut child: Option<Delegation> = None;
         let mut visited = std::collections::HashSet::new();
@@ -643,7 +647,7 @@ impl PolicyV3Runtime {
                         .await
                         .map_err(|_| "policy-registration-unavailable")?
                         .ok_or("policy-registration-missing")?;
-                validate_registration_projection(&registration)
+                let policy = validate_registration_projection(&registration)
                     .map_err(|_| "policy-registration-projection-mismatch")?;
                 let proofs = event
                     .0
@@ -675,7 +679,7 @@ impl PolicyV3Runtime {
                         return Err("policy-session-capability-widening");
                     }
                 }
-                return Ok((index, event));
+                return Ok((index, event, policy));
             }
             if event.0.parents.len() != 1 {
                 return Err("policy-session-parent-count-invalid");
@@ -874,6 +878,14 @@ fn capabilities_are_contained(
                     ceiling.ability.as_ref().as_ref(),
                     candidate.ability.as_ref().as_ref(),
                 )
+                // A copied selector is not authority for a descendant of an
+                // exact resource, even if the caveat itself is unchanged.
+                && ceiling.caveats.0.values().all(|value| {
+                    value.get("type").and_then(Value::as_str)
+                        != Some("xyz.tinycloud.resource/selector")
+                        || value.get("kind").and_then(Value::as_str) != Some("exact")
+                        || candidate.resource == ceiling.resource
+                })
                 && tinycloud_core::policy_capability::selector_caveats_contain(
                     &ceiling.caveats.0,
                     &candidate.caveats.0,
@@ -881,6 +893,82 @@ fn capabilities_are_contained(
                 .unwrap_or(candidate.caveats == ceiling.caveats)
         })
     })
+}
+
+fn validate_registered_decrypt_source(
+    policy: &Value,
+    invocation: &InvocationInfo,
+    body: Option<&Value>,
+) -> Result<(), &'static str> {
+    use subtle::ConstantTimeEq;
+    const MISMATCH: &str = "policy-decrypt-content-source-mismatch";
+    let mut decrypts = invocation
+        .capabilities
+        .iter()
+        .filter(|capability| {
+            capability.ability.as_ref().as_ref()
+                == tinycloud_core::encryption_network::DECRYPT_ACTION
+        })
+        .peekable();
+    if decrypts.peek().is_none() {
+        return Ok(());
+    }
+    // `policy` comes from the validated registration bytes, never request
+    // facts or caller-supplied contentSource metadata.
+    let source = policy.get("contentSource").ok_or(MISMATCH)?;
+    let body = body.ok_or(MISMATCH)?;
+    let network = source
+        .get("encryptionNetwork")
+        .and_then(Value::as_str)
+        .ok_or(MISMATCH)?;
+    let key_path = source.get("encryptionKeyPath").and_then(Value::as_str);
+    for capability in decrypts {
+        let resource = capability.resource.to_string();
+        let matches_source = match key_path {
+            Some(path) => {
+                resource
+                    .strip_prefix(network)
+                    .and_then(|suffix| suffix.strip_prefix('/'))
+                    == Some(path)
+            }
+            None => resource == network,
+        };
+        if !matches_source {
+            return Err(MISMATCH);
+        }
+    }
+    // Network equality also binds the owner DID; a delegated policy owner
+    // need not be the owner of the source's encryption network.
+    if body.get("networkId").and_then(Value::as_str) != Some(network)
+        || body.get("keyPath").and_then(Value::as_str) != key_path
+    {
+        return Err(MISMATCH);
+    }
+    // Every path-scoped Share binds its registered key, including mutable
+    // content. Legacy sources retain their existing mode-dependent behavior.
+    if key_path.is_some() || source.get("mode").and_then(Value::as_str) == Some("immutable") {
+        if body.get("keyVersion").and_then(Value::as_u64)
+            != source.get("keyVersion").and_then(Value::as_u64)
+        {
+            return Err(MISMATCH);
+        }
+        let digest = source
+            .get("encryptedSymmetricKeyDigestHex")
+            .and_then(Value::as_str)
+            .ok_or(MISMATCH)?;
+        let mut expected = [0_u8; 32];
+        hex::decode_to_slice(digest, &mut expected).map_err(|_| MISMATCH)?;
+        let wrapped = base64::decode(
+            body.get("encryptedSymmetricKey")
+                .and_then(Value::as_str)
+                .ok_or(MISMATCH)?,
+        )
+        .map_err(|_| MISMATCH)?;
+        if !bool::from(Sha256::digest(&wrapped)[..].ct_eq(&expected)) {
+            return Err(MISMATCH);
+        }
+    }
+    Ok(())
 }
 
 async fn validate_persisted_root(
@@ -2567,7 +2655,17 @@ pub async fn mint(
             Value::String(presentation_jti_digest),
         );
     }
-    facts.insert("remainingRedelegationDepth".to_owned(), Value::from(8_u64));
+    // Only path-scoped Share sources are terminal sessions. Other policy
+    // profiles retain their existing descendant-delegation contract.
+    let depth = if registered_policy["contentSource"]
+        .get("encryptionKeyPath")
+        .is_some()
+    {
+        0_u64
+    } else {
+        8_u64
+    };
+    facts.insert("remainingRedelegationDepth".to_owned(), Value::from(depth));
     let not_before = now.unix_timestamp();
     let expires = session_expiry(
         now,
@@ -4565,6 +4663,8 @@ fn registration_projections(policy: &Value) -> Result<RegistrationProjections, (
         )
         || source.get("mode").and_then(Value::as_str) == Some("immutable")
             && source.get("initialCiphertextDigestHex").is_none()
+        || source.contains_key("encryptionKeyPath")
+            && !source.contains_key("encryptedSymmetricKeyDigestHex")
     {
         return Err((Status::BadRequest, "content-source-invalid".into()));
     }

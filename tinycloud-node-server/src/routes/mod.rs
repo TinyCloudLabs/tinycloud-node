@@ -442,7 +442,7 @@ pub async fn create_signed_kv_url(
     // 60 s, and the ticket never outlives it, so a revoked policy stops new
     // signed URLs here and existing ones within a minute.
     policy_v3
-        .authorize_invocation(tinycloud, &invocation_info, OffsetDateTime::now_utc())
+        .authorize_invocation(tinycloud, &invocation_info, None, OffsetDateTime::now_utc())
         .await
         .map_err(|error| (Status::Forbidden, error.to_string()))?;
     let mint_start = Instant::now();
@@ -1828,14 +1828,6 @@ async fn invoke_impl(
         // before another capability runs.
         kv_sync_target(&admitted.invocation().0.capabilities)?;
 
-        // Policy-session invocations use the same admitted invocation as every
-        // other data-plane request. The policy runtime only classifies and
-        // verifies the special S0 edge; the ordinary graph remains authoritative.
-        let policy_session_invocation = policy_v3
-            .authorize_invocation(tinycloud, &admitted.invocation().0, now)
-            .await
-            .map_err(|error| (Status::Forbidden, error.to_string()))?;
-
         let decrypt_network = admitted
             .invocation()
             .0
@@ -1864,6 +1856,10 @@ async fn invoke_impl(
             let body = read_json_body(data, "request_too_large").await?;
             let body = serde_json::from_str(&body)
                 .map_err(|error| (Status::BadRequest, error.to_string()))?;
+            let policy_session_invocation = policy_v3
+                .authorize_invocation(tinycloud, &admitted.invocation().0, Some(&body), now)
+                .await
+                .map_err(|error| (Status::Forbidden, error.to_string()))?;
             tinycloud
                 .authorize_invocation(&admitted.invocation().0, now)
                 .await
@@ -1901,6 +1897,12 @@ async fn invoke_impl(
                 verified.response,
             ))));
         }
+        // Policy-session invocations use the same admitted invocation as every
+        // other data-plane request; the ordinary graph remains authoritative.
+        let policy_session_invocation = policy_v3
+            .authorize_invocation(tinycloud, &admitted.invocation().0, None, now)
+            .await
+            .map_err(|error| (Status::Forbidden, error.to_string()))?;
 
         // Owner usage read (TC-626): an invocation made only of
         // `tinycloud.space/info` returns the space's storage usage, the
