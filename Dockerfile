@@ -16,6 +16,7 @@ COPY ./rust-toolchain.toml ./
 COPY ./tinycloud-node-server/ ./tinycloud-node-server/
 COPY ./tinycloud-auth/ ./tinycloud-auth/
 COPY ./tinycloud-core/ ./tinycloud-core/
+COPY ./tinycloud-threshold/ ./tinycloud-threshold/
 COPY ./tinycloud-sdk-rs/ ./tinycloud-sdk-rs/
 COPY ./tinycloud-sdk-wasm/ ./tinycloud-sdk-wasm/
 COPY ./tinycloud-verifier-wasm/ ./tinycloud-verifier-wasm/
