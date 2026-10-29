@@ -25,6 +25,14 @@ pub mod ibe;
 pub mod identity;
 pub mod ids;
 mod poly;
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "Crate-private dealing helpers await DKG/reshare callers."
+    )
+)]
+pub mod seal;
 
 pub use context::{AuthorizedDerivation, KeyContext};
 pub use derive::*;
@@ -32,6 +40,7 @@ pub use error::{CombineError, Error, ShareError};
 pub use ibe::*;
 pub use identity::IbeIdentity;
 pub use ids::*;
+pub use seal::{CeremonyHpkePublicKey, CeremonyHpkeSecretKey, SealedDealing};
 
 #[cfg(test)]
 mod checkpoint;

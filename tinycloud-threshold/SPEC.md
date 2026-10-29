@@ -190,6 +190,10 @@ Secrets that must become unrecoverable, and when:
 
 Public ciphertext transcripts may be kept once the matching recipient keys are unrecoverable. In memory the crate zeroizes on drop and avoids hidden copies (blst `Copy` types are wiped explicitly where they hold secrets); `ZeroizeOnDrop` is an in-memory operation; durable storage is handled by integration. Durable erasure, snapshots, swap and core dumps are gate A's acceptance (§12).
 
+The `seal` module's lifecycle behavior covers only accessible owned storage. `CeremonyHpkeSecretKey` clears its owned 32-byte array on explicit zeroization or drop. Internal plaintext/candidate buffers use `Zeroizing`, including error paths; a successful seal transfers ciphertext out of that buffer. Opened plaintext is returned in `Zeroizing<Vec<u8>>`. The borrowed sealing input belongs to the caller and is not cleared by the module.
+
+HPKE 0.12's `PrivateKey`, `AeadCtxS` and `AeadCtxR` are opaque dependency-managed values. This owned-buffer description makes no claim about zeroization of their internal storage.
+
 ### 3.12 Activation boundary (contract fixed now; durable state record is integration)
 
 An owner signature on a new certificate is **not** an erasure trigger. Transition states:
