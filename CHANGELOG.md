@@ -2,17 +2,21 @@
 
 ## [Unreleased]
 
-### Changes
 - PolicyV3 decrypt checks the authoritative registered `contentSource`, never caller metadata: the capability resource, owner-qualified `encryptionNetwork` and optional `encryptionKeyPath` must match exactly. Every path-scoped Share source, whether mutable or immutable, requires a registered `encryptedSymmetricKeyDigestHex` (SHA-256 of the base64-decoded wrapped key) and binds that digest and `keyVersion` at use-time, before decrypt. Legacy immutable sources use their signed canonical wire digest, while older digest-less policies retain prior behavior; mutable legacy sources retain wrapped-key rotation. A copied `exact` selector cannot authorize a descendant or sibling resource. Details: TC-2192
 - Path-scoped Share policy sessions (`contentSource.encryptionKeyPath = share/<shareId>`) are minted with `remainingRedelegationDepth = 0`, preventing re-delegation. Policies without that field retain depth 8 and their existing delegation behavior; ordinary delegations are unchanged. Details: TC-2192
 - Direct network decrypt accepts exactly one decrypt capability for the route's network and authorizes it without executing an invocation. Route/key-path, registered-source and route/body network checks precede decrypt, so a refused mixed decrypt/delete request cannot commit its bundled KV delete. Details: TC-2192
-- Hook SSE subscriptions emit an authorized `ready` control event and close after broadcast lag. Successful SQL and DuckDB writes publish notifications keyed by the signed invocation CID; reads and failed writes emit none, and webhook enqueue remains independent. Details: TC-2207
-- Fresh SQL artifacts use a full checkpoint directly instead of attempting an unavailable WAL-delta update. Details: TC-2207
+
+## [1.25.13] - 2026-10-29
+
+### Changes
+- Sign-in makes 71 database round trips instead of 73: the node now creates missing database artifacts directly. Details: TC-2214
 
 ## [1.25.12] - 2026-10-29
 
 ### Changes
 - Version bump for Node hooks and SQL notification improvements. Details: TC-2207
+- Hook SSE subscriptions emit an authorized `ready` control event and close after broadcast lag. Successful SQL and DuckDB writes publish notifications keyed by the signed invocation CID; reads and failed writes emit none, and webhook enqueue remains independent. Details: TC-2207
+- Fresh SQL artifacts use a full checkpoint directly instead of attempting an unavailable WAL-delta update. Details: TC-2207
 
 ## [1.25.11] - 2026-10-28
 
