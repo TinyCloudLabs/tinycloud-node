@@ -16,6 +16,7 @@ rand_core = "0.6"
 thiserror = "2"
 
 [dev-dependencies]
+ed25519-dalek = "=2.2.0"
 proptest = "1.6"
 rand_chacha = "0.3"
 serde = { version = "1", features = ["derive"] }
