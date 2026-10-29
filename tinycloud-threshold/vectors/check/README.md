@@ -45,6 +45,13 @@ current named record set, field widths, literal metadata and additional-field
 rules. That shape is a vector-format contract, not a general test-count policy.
 Expected cryptographic output bytes are not part of the schema.
 
+The Pedersen derivation message is the SPEC literal `706564657273656e2d68`
+(`pedersen-h`). Hashing uses compiled SPEC DSTs, and pairing inputs are checked
+against independently constructed points. `constants.test.ts` runs real-CLI
+rejection cases for alternate labels with matching points, all five DSTs,
+row-local DST copies, both pairing inputs, the identity prefix and the three
+S0.1 tagged-hash domains, using in-memory documents.
+
 `protocol.test.ts` uses independently chosen identities, scalar shares,
 transport keys and randomizers. It covers point/scalar encodings, request
 bindings, both share equations, duplicate members, binding precedence,

@@ -1,4 +1,4 @@
-import { DST } from './protocol.ts';
+import { DST, PEDERSEN_H_MESSAGE } from './protocol.ts';
 
 type Parser<T> = (value: unknown, path: string) => T;
 type Parsed<P> = P extends Parser<infer T> ? T : never;
@@ -38,7 +38,7 @@ const thresholdInputs = object({
 });
 const cases = {
   h1_custom_dst: object({ name: literal('h1_custom_dst'), operation: literal('hash_g1'), inputs: object({ message: hexField(100), dst: literal(DST.h1) }), outputs: object({ point: h48 }) }),
-  pedersen_h: object({ name: literal('pedersen_h'), operation: literal('hash_g2'), inputs: object({ message: hexField(10), dst: literal(DST.pedersen_h) }), outputs: object({ point: h96 }) }),
+  pedersen_h: object({ name: literal('pedersen_h'), operation: literal('hash_g2'), inputs: object({ message: literal(PEDERSEN_H_MESSAGE), dst: literal(DST.pedersen_h) }), outputs: object({ point: h96 }) }),
   h3_scalar_r: object({ name: literal('h3_scalar_r'), operation: literal('h3'), inputs: object({ message: hexField(64) }), outputs: object({ scalar: h32 }) }),
   h2_gt: object({ name: literal('h2_gt'), operation: literal('h2'), inputs: object({ message: hexField(576) }), outputs: object({ bytes: h32 }) }),
   h4_sigma: object({ name: literal('h4_sigma'), operation: literal('h4'), inputs: object({ message: h32 }), outputs: object({ bytes: h32 }) }),
