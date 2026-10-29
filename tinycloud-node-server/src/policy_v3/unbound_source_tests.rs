@@ -1,9 +1,9 @@
 //! TC-2242: a new Policy/v3 registration must bind its content source to one
 //! share key. A registration without `encryptionKeyPath` (mutable or
-//! immutable) or an immutable one without `encryptedSymmetricKeyDigestHex` is
-//! refused at the registration route and stores nothing. A registration that
-//! is already stored keeps validating, so links minted before the refusal
-//! still open.
+//! immutable), or without `encryptedSymmetricKeyDigestHex` (path-bound,
+//! mutable or immutable), is refused at the registration route and stores
+//! nothing. A registration that is already stored keeps validating, so links
+//! minted before the refusal still open.
 
 use super::test_harness::*;
 use super::*;
@@ -270,9 +270,8 @@ async fn an_exact_path_bound_registration_succeeds_and_admits_only_its_leaf(
         );
     }
 
-    // The key digest is only the immutable source's rule: a mutable source
-    // bound to its key path registers without one.
-    let (source, leaf) = bound_source(&h, "mutable", None);
+    // A mutable source bound to its key path registers, with its digest.
+    let (source, leaf) = bound_source(&h, "mutable", Some(&"aa".repeat(32)));
     grant_owner_key(&h, &leaf).await?;
     let (status, body, _) = h.register_source(policy_window(), source, &leaf).await?;
     assert_eq!(status, Status::Ok, "{body}");
@@ -287,6 +286,28 @@ async fn an_exact_path_bound_registration_succeeds_and_admits_only_its_leaf(
     assert_refused_and_unstored(&h, outcome, KEY_PATH_REQUIRED, rows).await
 }
 on_both_backends!(an_exact_path_bound_registration_succeeds_and_admits_only_its_leaf);
+
+/// The key digest is required of every path-bound source, mutable or
+/// immutable: a mutable source bound to its key path without
+/// `encryptedSymmetricKeyDigestHex` is refused, and nothing is stored.
+async fn a_path_bound_mutable_source_without_the_key_digest_is_refused(
+    backend: Backend,
+) -> anyhow::Result<()> {
+    let Some((h, _ledger)) = boot(
+        backend,
+        "a_path_bound_mutable_source_without_the_key_digest_is_refused",
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let (source, leaf) = bound_source(&h, "mutable", None);
+    grant_owner_key(&h, &leaf).await?;
+    let before = h.stored_rows().await?;
+    let outcome = h.register_source(policy_window(), source, &leaf).await?;
+    assert_refused_and_unstored(&h, outcome, KEY_DIGEST_REQUIRED, before).await
+}
+on_both_backends!(a_path_bound_mutable_source_without_the_key_digest_is_refused);
 
 /// The refusal reads the content source only: a policy whose credential
 /// requirement is not an email proof is refused for the same three shapes, and

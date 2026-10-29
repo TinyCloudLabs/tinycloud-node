@@ -4533,9 +4533,10 @@ struct RegistrationProjections {
 }
 
 /// A new registration's content source names the one share key it opens
-/// (`encryptionKeyPath`) and, when immutable, that key's digest. This runs
-/// only when a registration is stored; `registration_projections` also
-/// validates stored registrations, which keep their original shape.
+/// (`encryptionKeyPath`) and that key's digest (`encryptedSymmetricKeyDigestHex`),
+/// mutable or immutable. This runs only when a registration is stored;
+/// `registration_projections` also validates stored registrations, which keep
+/// their original shape.
 fn require_bound_content_source(policy: &Value) -> Result<(), (Status, String)> {
     let source = policy
         .get("contentSource")
@@ -4547,9 +4548,7 @@ fn require_bound_content_source(policy: &Value) -> Result<(), (Status, String)> 
             "content-source-key-path-required".into(),
         ));
     }
-    if source.get("mode").and_then(Value::as_str) == Some("immutable")
-        && !source.contains_key("encryptedSymmetricKeyDigestHex")
-    {
+    if !source.contains_key("encryptedSymmetricKeyDigestHex") {
         return Err((
             Status::BadRequest,
             "content-source-key-digest-required".into(),
