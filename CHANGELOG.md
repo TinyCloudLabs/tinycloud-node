@@ -5,6 +5,7 @@
 ### Changes
 - Hook SSE subscriptions emit an authorized `ready` control event and close after broadcast lag. Successful SQL and DuckDB writes publish notifications keyed by the signed invocation CID; reads and failed writes emit none, and webhook enqueue remains independent. Details: TC-2207
 - Fresh SQL artifacts use a full checkpoint directly instead of attempting an unavailable WAL-delta update. Details: TC-2207
+- New Policy/v3 registrations must name their share key (`encryptionKeyPath`) and, for immutable content, its digest; registrations already stored are unchanged. Details: TC-2242
 
 ## [1.25.12] - 2026-10-29
 

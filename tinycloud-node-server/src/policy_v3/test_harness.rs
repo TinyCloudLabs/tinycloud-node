@@ -656,7 +656,10 @@ impl Harness {
     }
 
     /// Register a policy over the content whose roots span `root`, signed
-    /// by the policy owner.
+    /// by the policy owner. TC-2242: the policy has no `encryptionKeyPath`, a
+    /// shape the route refuses for a new registration, so it is stored as a
+    /// registration that predates the refusal. The tests built on it are
+    /// about what a stored registration does.
     pub async fn register(&self, root: Window) -> anyhow::Result<(Status, String, Registered)> {
         let owner_did = self.owner.did().to_owned();
         let projection = self.vector["policyProjection"].clone();
@@ -797,26 +800,17 @@ impl Harness {
             .await;
         anyhow::ensure!(binding.status() == Status::Ok, "enforcer binding");
         let binding: Value = binding.into_json().await.unwrap();
-        let response = self
-            .client
-            .post("/policy/v3/policies")
-            .header(ContentType::JSON)
-            .body(
-                json!({
-                    "policyCid": policy_cid,
-                    "policy": policy,
-                    "policyRoot": policy_root,
-                    "enforcementRoot": enforcement_root,
-                    "contentSourceDigestHex": projections.content_source_digest_hex,
-                    "nativeProjectionHashHex": projections.native_projection_hash_hex,
-                    "attestedEnforcerBinding": binding,
-                })
-                .to_string(),
-            )
-            .dispatch()
-            .await;
-        let status = response.status();
-        let body = response.into_string().await.unwrap_or_default();
+        let registration = json!({
+            "policyCid": policy_cid,
+            "policy": policy,
+            "policyRoot": policy_root,
+            "enforcementRoot": enforcement_root,
+            "contentSourceDigestHex": projections.content_source_digest_hex,
+            "nativeProjectionHashHex": projections.native_projection_hash_hex,
+            "attestedEnforcerBinding": binding,
+        });
+        let stored = Self::store_registration_on(&self.client, registration).await?;
+        let (status, body) = (Status::Ok, serde_json::to_string(&stored)?);
         Ok((
             status,
             body,
@@ -1283,5 +1277,380 @@ impl Harness {
         let status = response.status();
         let body = response.into_string().await.unwrap_or_default();
         Ok((status, body))
+    }
+}
+
+/// TC-2242: registrations over a content source the test chooses, and a
+/// stored registration that skips the new-registration boundary.
+impl Harness {
+    /// The `default` network of the content space's owner, the only network a
+    /// path-bound share key can live on.
+    pub fn default_network(&self) -> String {
+        format!(
+            "urn:tinycloud:encryption:{}:default",
+            self.space_owner.did()
+        )
+    }
+
+    /// The request body of `POST /policy/v3/policies` over `content_source`,
+    /// whose ceiling grants decrypt on `decrypt_resource`, signed by the
+    /// policy owner with roots spanning `root`.
+    pub async fn registration_request(
+        &self,
+        root: Window,
+        content_source: Value,
+        decrypt_resource: &str,
+    ) -> anyhow::Result<(Value, Registered)> {
+        self.registration_request_for(
+            root,
+            content_source,
+            decrypt_resource,
+            self.vector["policyProjection"].clone(),
+        )
+        .await
+    }
+
+    /// As [`Harness::registration_request`], for a policy whose
+    /// `credentialRequirement` is `requirement`.
+    pub async fn registration_request_for(
+        &self,
+        root: Window,
+        content_source: Value,
+        decrypt_resource: &str,
+        requirement: Value,
+    ) -> anyhow::Result<(Value, Registered)> {
+        let owner_did = self.owner.did().to_owned();
+        let created = (now() - Duration::seconds(60)).min(root.not_before);
+        let mut policy = json!({
+            "schema": POLICY_V2_SCHEMA,
+            "policyId": "pending",
+            "ownerDid": owner_did,
+            "createdAt": format_time(created),
+            "expiresAt": format_time(root.expiry + Duration::hours(1)),
+            "contentSource": content_source,
+            "capabilityCeiling": [
+                {
+                    "kind": "kv",
+                    "resource": self.content_resource.to_string(),
+                    "selector": "exact",
+                    "actions": [KV_GET, KV_METADATA],
+                },
+                {
+                    "kind": "encryption",
+                    "resource": decrypt_resource,
+                    "action": DECRYPT,
+                },
+            ],
+            "credentialRequirement": requirement,
+            "signature": {"suite": "Ed25519", "signerDid": owner_did, "value": ""}
+        });
+        let mut unsigned = policy.clone();
+        unsigned.as_object_mut().unwrap().remove("policyId");
+        unsigned.as_object_mut().unwrap().remove("signature");
+        let mut preimage = POLICY_V2_SCHEMA.as_bytes().to_vec();
+        preimage.push(0);
+        preimage.extend_from_slice(&canonical_json_value(&unsigned));
+        policy["policyId"] = json!(format!("pol_{}", base32_lower(&Sha256::digest(&preimage))));
+        policy["signature"]["value"] = json!(encode_config(
+            self.owner.keypair().sign(&Sha256::digest(preimage)),
+            URL_SAFE_NO_PAD
+        ));
+        let policy_cid = Cid::new_v1(
+            0x55,
+            tinycloud_auth::multihash_codetable::Code::Sha2_256
+                .digest(&canonical_json_value(&policy)),
+        )
+        .to_string();
+        let projections =
+            registration_projections(&policy).map_err(|(_, error)| anyhow::anyhow!(error))?;
+        let digest = policy_digest_hex(&policy).map_err(|(_, error)| anyhow::anyhow!(error))?;
+        let common = json!({
+            "ownerDid": owner_did,
+            "policyId": policy["policyId"],
+            "policyDigestHex": digest,
+            "policyCid": policy_cid,
+            "contentSourceDigestHex": projections.content_source_digest_hex,
+            "capabilityCeilingHashHex": projections.capability_ceiling_hash_hex,
+            "nativeProjectionHashHex": projections.native_projection_hash_hex,
+            "nodeAudience": self.node_did(),
+        });
+        let Signer::Key { keypair, vm, .. } = &self.owner else {
+            unreachable!()
+        };
+        let root_authorization =
+            |audience: &str, role: &str, mode: &str, enforcer: Option<&str>| {
+                let mut facts = common.as_object().unwrap().clone();
+                facts.insert("role".into(), json!(role));
+                facts.insert("mode".into(), json!(mode));
+                if let Some(enforcer) = enforcer {
+                    facts.insert("enforcerDid".into(), json!(enforcer));
+                }
+                let header = json!({
+                    "alg": "EdDSA",
+                    "jwk": {
+                        "alg": "EdDSA",
+                        "crv": "Ed25519",
+                        "kty": "OKP",
+                        "x": encode_config(keypair.public().to_bytes(), URL_SAFE_NO_PAD),
+                    },
+                    "typ": "JWT",
+                    "ucv": "0.10.0",
+                });
+                let payload = json!({
+                    "att": projections.attenuation.clone(),
+                    "aud": audience,
+                    "exp": root.expiry.unix_timestamp(),
+                    "fct": [Value::Object(facts)],
+                    "iss": vm,
+                    "nbf": root.not_before.unix_timestamp(),
+                    "nnc": unique(&format!("tc-2242-{role}-")),
+                    "prf": [],
+                });
+                let protected = encode_config(canonical_json_value(&header), URL_SAFE_NO_PAD);
+                let payload = encode_config(canonical_json_value(&payload), URL_SAFE_NO_PAD);
+                let signing_input = format!("{protected}.{payload}");
+                format!(
+                    "{signing_input}.{}",
+                    encode_config(keypair.sign(signing_input.as_bytes()), URL_SAFE_NO_PAD)
+                )
+            };
+        let policy_root = root_authorization(
+            &format!("did:tinycloud:policy:{digest}"),
+            "policy-authority",
+            "policy-source",
+            None,
+        );
+        let enforcement_root = root_authorization(
+            self.enforcer.did(),
+            "policy-enforcement",
+            "conditional-mint",
+            Some(self.enforcer.did()),
+        );
+        let policy_root_cid = decode_root(&policy_root)
+            .map_err(|(_, error)| anyhow::anyhow!(error))?
+            .0;
+        let enforcement_root_cid = decode_root(&enforcement_root)
+            .map_err(|(_, error)| anyhow::anyhow!(error))?
+            .0;
+        let binding = self
+            .client
+            .post("/policy/v3/enforcer-bindings")
+            .header(ContentType::JSON)
+            .body(
+                json!({"rootExpiresAt": format_time(root.expiry), "enforcerDid": self.enforcer.did()})
+                    .to_string(),
+            )
+            .dispatch()
+            .await;
+        anyhow::ensure!(binding.status() == Status::Ok, "enforcer binding");
+        let binding: Value = binding.into_json().await.unwrap();
+        Ok((
+            json!({
+                "policyCid": policy_cid,
+                "policy": policy,
+                "policyRoot": policy_root,
+                "enforcementRoot": enforcement_root,
+                "contentSourceDigestHex": projections.content_source_digest_hex,
+                "nativeProjectionHashHex": projections.native_projection_hash_hex,
+                "attestedEnforcerBinding": binding,
+            }),
+            Registered {
+                policy_cid,
+                policy_root_cid,
+                enforcement_root_cid,
+            },
+        ))
+    }
+
+    /// Register over `content_source` through the HTTP route.
+    pub async fn register_source(
+        &self,
+        root: Window,
+        content_source: Value,
+        decrypt_resource: &str,
+    ) -> anyhow::Result<(Status, String, Registered)> {
+        let requirement = self.vector["policyProjection"].clone();
+        self.register_source_for(root, content_source, decrypt_resource, requirement)
+            .await
+    }
+
+    /// As [`Harness::register_source`], for a policy whose
+    /// `credentialRequirement` is `requirement`.
+    pub async fn register_source_for(
+        &self,
+        root: Window,
+        content_source: Value,
+        decrypt_resource: &str,
+        requirement: Value,
+    ) -> anyhow::Result<(Status, String, Registered)> {
+        let (body, registered) = self
+            .registration_request_for(root, content_source, decrypt_resource, requirement)
+            .await?;
+        let (status, body) = self.post_registration(body).await;
+        Ok((status, body, registered))
+    }
+
+    /// `POST /policy/v3/policies` with a registration request.
+    pub async fn post_registration(&self, body: Value) -> (Status, String) {
+        let response = self
+            .client
+            .post("/policy/v3/policies")
+            .header(ContentType::JSON)
+            .body(body.to_string())
+            .dispatch()
+            .await;
+        let status = response.status();
+        (status, response.into_string().await.unwrap_or_default())
+    }
+
+    /// A requirement for a credential that is not an email proof, over the
+    /// same issuer.
+    pub fn non_email_requirement(&self) -> Value {
+        let mut requirement = self.vector["policyProjection"].clone();
+        requirement["credentialType"] = json!({"id": "opencredentials.domain/v1", "version": 1});
+        requirement["profile"] = json!({"id": "tinycloud.domain-proof/v1", "version": 1});
+        requirement["requirementDigest"] = json!(canonical_digest_base64url(&json!("tc-2242-req")));
+        requirement["descriptorDigest"] = json!(canonical_digest_base64url(&json!("tc-2242-desc")));
+        requirement
+    }
+
+    /// Store a registration request as the node did before the
+    /// new-registration boundary refused unbound content sources: the same
+    /// writes as the route, without its checks. The stand-in for a row that
+    /// is already in the database.
+    pub async fn store_registration(&self, body: Value) -> anyhow::Result<()> {
+        Self::store_registration_on(&self.client, body).await?;
+        Ok(())
+    }
+
+    /// As [`Harness::store_registration`], on any booted app, answering what
+    /// the route answers. Like the route, it records the spaces of the roots
+    /// in the request's telemetry.
+    pub async fn store_registration_on(
+        client: &Client,
+        body: Value,
+    ) -> anyhow::Result<RegisterResponse> {
+        let request: RegisterRequest = serde_json::from_value(body)?;
+        let runtime = client.rocket().state::<PolicyV3Runtime>().unwrap();
+        let tinycloud = client.rocket().state::<crate::TinyCloud>().unwrap();
+        let projections = registration_projections(&request.policy)
+            .map_err(|(_, error)| anyhow::anyhow!(error))?;
+        let (policy_root_cid, policy_root) =
+            decode_root(&request.policy_root).map_err(|(_, error)| anyhow::anyhow!(error))?;
+        let (enforcement_root_cid, enforcement_root) =
+            decode_root(&request.enforcement_root).map_err(|(_, error)| anyhow::anyhow!(error))?;
+        for root in [&policy_root, &enforcement_root] {
+            for space in root.0.spaces() {
+                tinycloud_core::request_telemetry::observe_space(space);
+            }
+        }
+        let at = OffsetDateTime::now_utc();
+        let binding = validate_attested_enforcer_binding(
+            &request.attested_enforcer_binding,
+            fact(&enforcement_root.0.delegation, "enforcerDid").unwrap(),
+            &runtime.node_did,
+            enforcement_root.0.expiry.unwrap(),
+            at,
+        )
+        .map_err(|(_, error)| anyhow::anyhow!(error))?;
+        let policy_status = initial_status_checkpoint(
+            runtime,
+            &policy_root_cid,
+            "policy-authority",
+            &policy_root.0,
+            at,
+        )
+        .map_err(|(_, error)| anyhow::anyhow!(error))?;
+        let enforcement_status = initial_status_checkpoint(
+            runtime,
+            &enforcement_root_cid,
+            "policy-enforcement",
+            &enforcement_root.0,
+            at,
+        )
+        .map_err(|(_, error)| anyhow::anyhow!(error))?;
+        let registration = policy_v3_registration::ActiveModel {
+            policy_cid: Set(request.policy_cid.clone()),
+            policy_bytes: Set(canonical_json_value(&request.policy)),
+            policy_digest_hex: Set(
+                policy_digest_hex(&request.policy).map_err(|(_, error)| anyhow::anyhow!(error))?
+            ),
+            owner_did: Set(request.policy["ownerDid"].as_str().unwrap().to_owned()),
+            policy_root_cid: Set(policy_root_cid.clone()),
+            enforcement_root_cid: Set(enforcement_root_cid.clone()),
+            content_source_digest_hex: Set(projections.content_source_digest_hex),
+            native_projection_hash_hex: Set(projections.native_projection_hash_hex),
+            attested_enforcer_binding_bytes: Set(binding),
+            registered_at: Set(format_time(at)),
+            expires_at: Set(root_expiry(&request.policy_root).unwrap()),
+        };
+        let root_delegations = vec![
+            decode_delegation(&request.policy_root).map_err(|(_, error)| anyhow::anyhow!(error))?,
+            decode_delegation(&request.enforcement_root)
+                .map_err(|(_, error)| anyhow::anyhow!(error))?,
+        ];
+        let sequence_spaces = root_delegations
+            .iter()
+            .flat_map(|delegation| delegation.0.spaces().cloned())
+            .collect::<Vec<_>>();
+        let _sequence_guards = tinycloud
+            .acquire_space_sequence_guards(&sequence_spaces)
+            .await;
+        let _writer = match &runtime.sqlite_writer_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+        let txn = tinycloud_core::db::begin_write_transaction(&runtime.conn, None).await?;
+        let written = register_policy_writes(
+            &txn,
+            tinycloud,
+            &sequence_spaces,
+            root_delegations,
+            registration,
+            &request.policy_cid,
+            [
+                (
+                    policy_root_cid.clone(),
+                    "policy-authority",
+                    request.policy_root.into_bytes(),
+                    policy_status,
+                ),
+                (
+                    enforcement_root_cid.clone(),
+                    "policy-enforcement",
+                    request.enforcement_root.into_bytes(),
+                    enforcement_status,
+                ),
+            ],
+        )
+        .await;
+        match written {
+            Ok(()) => txn.commit().await?,
+            Err((status, error)) => {
+                let _ = txn.rollback().await;
+                anyhow::bail!("store registration: {status} {error}");
+            }
+        }
+        Ok(RegisterResponse {
+            policy_cid: request.policy_cid,
+            policy_root_cid,
+            enforcement_root_cid,
+        })
+    }
+
+    /// Rows in `policy_v3_registration`, `policy_v3_root` and the delegation
+    /// graph.
+    pub async fn stored_rows(&self) -> anyhow::Result<(u64, u64, u64)> {
+        use tinycloud_core::sea_orm::{EntityTrait, PaginatorTrait};
+        let runtime = self.client.rocket().state::<PolicyV3Runtime>().unwrap();
+        Ok((
+            policy_v3_registration::Entity::find()
+                .count(&runtime.conn)
+                .await?,
+            policy_v3_root::Entity::find().count(&runtime.conn).await?,
+            delegation_model::Entity::find()
+                .count(&runtime.conn)
+                .await?,
+        ))
     }
 }

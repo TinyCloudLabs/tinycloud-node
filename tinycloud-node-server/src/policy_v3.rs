@@ -2039,6 +2039,9 @@ pub async fn register_policy(
         }
         return Err((Status::Conflict, "policy-registration-conflict".into()));
     }
+    // A registration the node already stores answered above. A new one must
+    // bind its content source to one share key.
+    require_bound_content_source(&request.policy)?;
 
     let now = OffsetDateTime::now_utc();
     let policy_status = initial_status_checkpoint(
@@ -4527,6 +4530,32 @@ struct RegistrationProjections {
     capability_ceiling_hash_hex: String,
     native_projection_hash_hex: String,
     attenuation: Value,
+}
+
+/// A new registration's content source names the one share key it opens
+/// (`encryptionKeyPath`) and, when immutable, that key's digest. This runs
+/// only when a registration is stored; `registration_projections` also
+/// validates stored registrations, which keep their original shape.
+fn require_bound_content_source(policy: &Value) -> Result<(), (Status, String)> {
+    let source = policy
+        .get("contentSource")
+        .and_then(Value::as_object)
+        .ok_or((Status::BadRequest, "content-source-invalid".into()))?;
+    if !source.contains_key("encryptionKeyPath") {
+        return Err((
+            Status::BadRequest,
+            "content-source-key-path-required".into(),
+        ));
+    }
+    if source.get("mode").and_then(Value::as_str) == Some("immutable")
+        && !source.contains_key("encryptedSymmetricKeyDigestHex")
+    {
+        return Err((
+            Status::BadRequest,
+            "content-source-key-digest-required".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn registration_projections(policy: &Value) -> Result<RegistrationProjections, (Status, String)> {
@@ -10225,28 +10254,44 @@ mod tests {
                 &StaticSecret::new(vec![29; 32]).unwrap(),
             )),
         );
-        let register_request = client
-            .post("/policy/v3/policies")
-            .header(ContentType::JSON)
-            .body(
-                json!({
-                    "policyCid": policy_cid,
-                    "policy": policy,
-                    "policyRoot": policy_root_authorization,
-                    "enforcementRoot": enforcement_root_authorization,
-                    "contentSourceDigestHex": projections.content_source_digest_hex,
-                    "nativeProjectionHashHex": projections.native_projection_hash_hex,
-                    "attestedEnforcerBinding": live_binding,
-                })
-                .to_string(),
-            );
-        let register_response = tinycloud_core::request_telemetry::scope(
-            telemetry.clone(),
-            register_request.dispatch(),
-        )
-        .await;
-        let register_status = register_response.status();
-        let register_body = register_response.into_string().await.unwrap_or_default();
+        let registration = json!({
+            "policyCid": policy_cid,
+            "policy": policy,
+            "policyRoot": policy_root_authorization,
+            "enforcementRoot": enforcement_root_authorization,
+            "contentSourceDigestHex": projections.content_source_digest_hex,
+            "nativeProjectionHashHex": projections.native_projection_hash_hex,
+            "attestedEnforcerBinding": live_binding,
+        });
+        let (register_status, register_body) = if policy_owner == PolicyOwner::Unauthorized {
+            let register_response = tinycloud_core::request_telemetry::scope(
+                telemetry.clone(),
+                client
+                    .post("/policy/v3/policies")
+                    .header(ContentType::JSON)
+                    .body(registration.to_string())
+                    .dispatch(),
+            )
+            .await;
+            (
+                register_response.status(),
+                register_response.into_string().await.unwrap_or_default(),
+            )
+        } else {
+            // TC-2242: this policy has no `encryptionKeyPath`, a shape the
+            // route refuses for a new registration. What follows is about a
+            // registration that is already stored, so it is stored as one.
+            // Boxed: this test's future is already near the test thread's stack.
+            let stored = tinycloud_core::request_telemetry::scope(
+                telemetry.clone(),
+                Box::pin(super::test_harness::Harness::store_registration_on(
+                    &client,
+                    registration,
+                )),
+            )
+            .await?;
+            (Status::Ok, serde_json::to_string(&stored)?)
+        };
         if policy_owner == PolicyOwner::Unauthorized {
             assert_eq!(
                 register_status,
@@ -11901,3 +11946,7 @@ mod registration_probe_tests;
 #[cfg(test)]
 #[path = "policy_v3/delivery_admission_tests.rs"]
 mod delivery_admission_tests;
+
+#[cfg(test)]
+#[path = "policy_v3/unbound_source_tests.rs"]
+mod unbound_source_tests;
