@@ -134,11 +134,11 @@ use tokio::{
 /// checks and connection-release pings are part of each flow's count. Measured
 /// on PostgreSQL before the pre-persist write path:
 ///
-/// - sign-in 73 = peer key 0 plus host `/delegate` 18 plus session
-///   `/delegate` 19 plus account-space SQL write 34, including TC-1274's
-///   `epoch_head` cache write on each epoch-writing commit, plus 2 for the
-///   post-commit `hook_subscription` SELECT and release ping on the
-///   account-space SQL write (Sam-approved 2026-10-29; follow-up TC-2214);
+/// - sign-in 71 = peer key 0 plus host `/delegate` 18 plus session
+///   `/delegate` 19 plus account-space SQL write 34, including the `epoch_head`
+///   cache writes and post-commit `hook_subscription` SELECT and release ping.
+///   The hook lookup runs asynchronously and can fall outside the measured
+///   window, so a run may print 2 fewer. Details: TC-2214
 /// - kv get 16, including its durable read-audit commit.
 ///
 /// TC-1274: a batch of 100 `kv/get` or `kv/metadata` capabilities is one
@@ -165,9 +165,9 @@ use tokio::{
 /// precondition read and write rows. All claims of one put share one
 /// preparatory transaction.
 ///
-/// Each value is the count measured on PostgreSQL in CI, used as a ceiling.
+/// Full-flow ceilings, including asynchronous sign-in work. Details: TC-2214
 const BUDGETS: [(&str, u64); 7] = [
-    ("sign-in", 73),
+    ("sign-in", 71),
     ("kv put", 42),
     ("kv get", 16),
     ("kv batch get", 16),
