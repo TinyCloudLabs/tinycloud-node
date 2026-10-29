@@ -160,17 +160,12 @@ pub(crate) fn seal_dealing(
     if ciphertext_len > CIPHERTEXT_CAP {
         return Err(Error::LimitExceeded);
     }
-    let public = <HpkeKem as Kem>::PublicKey::from_bytes(&public.0)
-        .map_err(|_| Error::InvalidHpkeKey)?;
+    let public =
+        <HpkeKem as Kem>::PublicKey::from_bytes(&public.0).map_err(|_| Error::InvalidHpkeKey)?;
     let info = context.info();
     let mut buffer = Zeroizing::new(Vec::with_capacity(ciphertext_len));
     buffer.extend_from_slice(plaintext);
-    let (enc, tag) = hpke::single_shot_seal_in_place_detached::<
-        HpkeAead,
-        HpkeKdf,
-        HpkeKem,
-        _,
-    >(
+    let (enc, tag) = hpke::single_shot_seal_in_place_detached::<HpkeAead, HpkeKdf, HpkeKem, _>(
         &OpModeS::Base,
         &public,
         &info,
@@ -287,10 +282,8 @@ mod tests {
 
     #[test]
     fn rfc9180_appendix_a2_1_base_suite() {
-        let vector: Value = serde_json::from_str(include_str!(
-            "../vectors/v1/hpke-rfc9180-a2-1.json"
-        ))
-        .unwrap();
+        let vector: Value =
+            serde_json::from_str(include_str!("../vectors/v1/hpke-rfc9180-a2-1.json")).unwrap();
         let case = &vector["cases"][0];
         let input = &case["inputs"];
         let output = &case["outputs"];
@@ -300,8 +293,8 @@ mod tests {
         assert_eq!(input["aead_id"], 3);
         let (_sk_e, pk_e) = HpkeKem::derive_keypair(&bytes(input, "ikmE"));
         let (sk_r, pk_r) = HpkeKem::derive_keypair(&bytes(input, "ikmR"));
-        assert_eq!(pk_e.to_bytes().as_slice(), bytes(output, "pkEm"));
-        assert_eq!(pk_r.to_bytes().as_slice(), bytes(output, "pkRm"));
+        assert_eq!(&*pk_e.to_bytes(), bytes(output, "pkEm"));
+        assert_eq!(&*pk_r.to_bytes(), bytes(output, "pkRm"));
         let mut rng = FixedIkm {
             bytes: bytes(input, "ikmE").try_into().unwrap(),
             consumed: false,
@@ -315,14 +308,10 @@ mod tests {
         )
         .unwrap();
         assert!(rng.consumed);
-        assert_eq!(enc.to_bytes().as_slice(), bytes(output, "enc"));
-        let mut receiver = hpke::setup_receiver::<HpkeAead, HpkeKdf, HpkeKem>(
-            &OpModeR::Base,
-            &sk_r,
-            &enc,
-            &info,
-        )
-        .unwrap();
+        assert_eq!(&*enc.to_bytes(), bytes(output, "enc"));
+        let mut receiver =
+            hpke::setup_receiver::<HpkeAead, HpkeKdf, HpkeKem>(&OpModeR::Base, &sk_r, &enc, &info)
+                .unwrap();
         let encryptions = output["encryptions"].as_array().unwrap();
         let mut sequence = 0;
         for kat in encryptions {
@@ -355,7 +344,9 @@ mod tests {
             let expected = bytes(kat, "value");
             let mut sender_value = Zeroizing::new(vec![0; expected.len()]);
             let mut receiver_value = Zeroizing::new(vec![0; expected.len()]);
-            sender.export(&bytes(kat, "context"), &mut sender_value).unwrap();
+            sender
+                .export(&bytes(kat, "context"), &mut sender_value)
+                .unwrap();
             receiver
                 .export(&bytes(kat, "context"), &mut receiver_value)
                 .unwrap();
@@ -368,12 +359,14 @@ mod tests {
             bytes: bytes(input, "ikmE").try_into().unwrap(),
             consumed: false,
         };
-        let (enc, tag) = hpke::single_shot_seal_in_place_detached::<
-            HpkeAead,
-            HpkeKdf,
-            HpkeKem,
-            _,
-        >(&OpModeS::Base, &pk_r, &info, &mut plaintext, &bytes(kat, "aad"), &mut rng)
+        let (enc, tag) = hpke::single_shot_seal_in_place_detached::<HpkeAead, HpkeKdf, HpkeKem, _>(
+            &OpModeS::Base,
+            &pk_r,
+            &info,
+            &mut plaintext,
+            &bytes(kat, "aad"),
+            &mut rng,
+        )
         .unwrap();
         let mut joined = plaintext.to_vec();
         joined.extend_from_slice(&tag.to_bytes());
@@ -401,7 +394,12 @@ mod tests {
         fn zeroized_on_drop<T: Zeroize + ZeroizeOnDrop>(_: &T) {}
         zeroized_on_drop(&secret);
         let sealed = seal_dealing(&public, &context(), b"private dealing", &mut rng).unwrap();
-        assert_eq!(open_dealing(&secret, &context(), &sealed).unwrap().as_slice(), b"private dealing");
+        assert_eq!(
+            open_dealing(&secret, &context(), &sealed)
+                .unwrap()
+                .as_slice(),
+            b"private dealing"
+        );
         assert!(open_dealing(&other_secret, &context(), &sealed).is_err());
         secret.zeroize();
         assert!(open_dealing(&secret, &context(), &sealed).is_err());
@@ -448,7 +446,10 @@ mod tests {
         let mut commitments = ctx;
         commitments.commitment_hash[0] ^= 1;
         for changed in [ceremony, round, sender, recipient, commitments] {
-            assert!(open_dealing(&secret, &changed, &sealed).is_err(), "{changed:?}");
+            assert!(
+                open_dealing(&secret, &changed, &sealed).is_err(),
+                "{changed:?}"
+            );
         }
         assert!(open_dealing(&other_secret, &ctx, &sealed).is_err());
     }
@@ -508,17 +509,29 @@ mod tests {
         }
         let mut trailing = wire.clone();
         trailing.push(0);
-        assert!(matches!(SealedDealing::decode(&trailing), Err(Error::InvalidEncoding)));
+        assert!(matches!(
+            SealedDealing::decode(&trailing),
+            Err(Error::InvalidEncoding)
+        ));
         let mut version = wire.clone();
         version[0] = 2;
-        assert!(matches!(SealedDealing::decode(&version), Err(Error::InvalidEncoding)));
+        assert!(matches!(
+            SealedDealing::decode(&version),
+            Err(Error::InvalidEncoding)
+        ));
         let mut oversized_length = wire.clone();
         oversized_length[33..37].copy_from_slice(&u32::MAX.to_be_bytes());
-        assert!(matches!(SealedDealing::decode(&oversized_length), Err(Error::LimitExceeded)));
+        assert!(matches!(
+            SealedDealing::decode(&oversized_length),
+            Err(Error::LimitExceeded)
+        ));
         let mut short_tag = wire[..37].to_vec();
         short_tag[33..37].copy_from_slice(&15u32.to_be_bytes());
         short_tag.extend_from_slice(&[0; 15]);
-        assert!(matches!(SealedDealing::decode(&short_tag), Err(Error::InvalidLength)));
+        assert!(matches!(
+            SealedDealing::decode(&short_tag),
+            Err(Error::InvalidLength)
+        ));
         for size in [0, 65_483] {
             let plaintext = Zeroizing::new(vec![0x5a; size]);
             let sealed = seal_dealing(&public, &ctx, &plaintext, &mut rng).unwrap();
@@ -529,7 +542,10 @@ mod tests {
             seal_dealing(&public, &ctx, &vec![0; 65_484], &mut rng),
             Err(Error::LimitExceeded)
         ));
-        assert!(matches!(SealedDealing::decode(&vec![0; 65_537]), Err(Error::LimitExceeded)));
+        assert!(matches!(
+            SealedDealing::decode(&vec![0; 65_537]),
+            Err(Error::LimitExceeded)
+        ));
     }
 
     #[test]
@@ -550,18 +566,31 @@ mod tests {
         let tag = AeadTag::<HpkeAead>::from_bytes(tag).unwrap();
         let mut direct = Zeroizing::new(b"bound dealing".to_vec());
         let mut direct_rng = ChaCha20Rng::from_seed([0x38; 32]);
-        let (expected_enc, expected_tag) = hpke::single_shot_seal_in_place_detached::<HpkeAead, HpkeKdf, HpkeKem, _>(
-            &OpModeS::Base, &pk, &direct_info, &mut direct, &[0x22; 32], &mut direct_rng,
-        ).unwrap();
-        assert_eq!(expected_enc.to_bytes().as_slice(), sealed.enc);
+        let (expected_enc, expected_tag) =
+            hpke::single_shot_seal_in_place_detached::<HpkeAead, HpkeKdf, HpkeKem, _>(
+                &OpModeS::Base,
+                &pk,
+                &direct_info,
+                &mut direct,
+                &[0x22; 32],
+                &mut direct_rng,
+            )
+            .unwrap();
+        assert_eq!(&*expected_enc.to_bytes(), sealed.enc);
         assert_eq!(expected_tag.to_bytes(), tag.to_bytes());
         assert_eq!(direct.as_slice(), body);
         let mut other_ctx = ctx;
         other_ctx.recipient = MemberIndex::new(3).unwrap();
         let mut rng = ChaCha20Rng::from_seed([0x38; 32]);
-        let for_other = seal_dealing(&other_public, &other_ctx, b"bound dealing", &mut rng).unwrap();
+        let for_other =
+            seal_dealing(&other_public, &other_ctx, b"bound dealing", &mut rng).unwrap();
         assert_ne!(sealed.ciphertext, for_other.ciphertext);
-        assert_eq!(open_dealing(&other_secret, &other_ctx, &for_other).unwrap().as_slice(), b"bound dealing");
+        assert_eq!(
+            open_dealing(&other_secret, &other_ctx, &for_other)
+                .unwrap()
+                .as_slice(),
+            b"bound dealing"
+        );
         assert!(open_dealing(&secret, &ctx, &for_other).is_err());
         let mut other_ceremony = ctx;
         other_ceremony.ceremony_digest[0] ^= 1;
@@ -569,7 +598,7 @@ mod tests {
         let other = seal_dealing(&public, &other_ceremony, b"bound dealing", &mut rng).unwrap();
         assert_ne!(sealed.ciphertext, other.ciphertext);
         assert!(open_dealing(&secret, &ctx, &other).is_err());
-        assert_eq!(enc.to_bytes().as_slice(), sealed.enc);
+        assert_eq!(&*enc.to_bytes(), sealed.enc);
     }
 
     proptest::proptest! {
