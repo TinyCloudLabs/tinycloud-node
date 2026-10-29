@@ -50,6 +50,9 @@ pub enum ShareError {
 /// Combining never interprets mixed-context inputs as member faults.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CombineError {
+    /// Raw entries exceed twice the current member count; no member is blamed.
+    #[error("too many supplied share entries")]
+    TooManyShares,
     #[error("request context mismatch")]
     ContextMismatch,
     #[error("mixed share contexts")]
