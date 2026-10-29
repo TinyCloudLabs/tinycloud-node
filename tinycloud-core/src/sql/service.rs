@@ -927,7 +927,7 @@ impl SqlService {
         // adding a database page. Full spaces replace checkpoint + WAL, but
         // must also bound the resulting image against the durable charge:
         // live state can include partial writes from an earlier failed request.
-        let wal = if growth != GrowthPolicy::Forbid {
+        let wal = if growth != GrowthPolicy::Forbid && expected != ArtifactExpectation::Absent {
             handle.wal().await?
         } else {
             None
