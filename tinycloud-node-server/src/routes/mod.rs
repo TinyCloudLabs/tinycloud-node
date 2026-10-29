@@ -2701,6 +2701,9 @@ async fn handle_sql_invoke(
             .into());
     }
     request_cancel::set_stage(request_cancel::Stage::Other);
+    // Retain the signed invocation identity before admission is consumed;
+    // allocate its textual event epoch only for supported database writes.
+    let event_hash = admitted.invocation().content_hash();
     // The statements profile for this request comes from the invocation's
     // own SQL capabilities. The validated delegation chain supplies a
     // profile only when those capabilities carry none; see
@@ -2753,7 +2756,7 @@ async fn handle_sql_invoke(
     // boundary; `verify_auth_admitted` uses the admitted core entry point so this
     // shared SQL/DuckDB authorization path does not re-run signature
     // verification a second time.
-    let auth_result = verify_auth_admitted("server.sql.auth", admitted, tinycloud).await?;
+    verify_auth_admitted("server.sql.auth", admitted, tinycloud).await?;
     let constrained = resolve_sql_profile(own_profiles, tinycloud, &parent_cids).await?;
     // TC-1791: with the node setting on, the effective caveat is the
     // intersection over every stored delegation on the cited chain; the
@@ -2946,28 +2949,34 @@ async fn handle_sql_invoke(
         }
     })?;
 
-    if let Some(epoch) = auth_result
-        .commits
-        .get(space)
-        .map(|commit| commit.rev.to_cid(0x55).to_string())
+    // SQL execution has completed successfully above. Reads have no supported
+    // write targets and failed execution returned before reaching this point.
+    // SQL has no KV commit epoch, so identify notifications by this admitted
+    // signed invocation rather than fabricating a KV commit.
+    if response
+        .write_targets
+        .iter()
+        .any(|target| matches!(target, TouchedTables::Supported(tables) if !tables.is_empty()))
     {
         if let Ok(timestamp) = OffsetDateTime::now_utc().format(&Rfc3339) {
+            let event_epoch = event_hash.to_cid(0x55).to_string();
             let events = database_write_events(
                 &space_id,
                 "sql",
                 path,
                 &actor,
-                &epoch,
+                &event_epoch,
                 &timestamp,
                 &response.write_targets,
             );
-
-            spawn_database_hook_delivery(
-                tinycloud.inner().clone(),
-                hook_runtime.inner().clone(),
-                events,
-                "server.sql.enqueue_hooks",
-            );
+            if !events.is_empty() {
+                spawn_database_hook_delivery(
+                    tinycloud.inner().clone(),
+                    hook_runtime.inner().clone(),
+                    events,
+                    "server.sql.enqueue_hooks",
+                );
+            }
         }
     }
 
@@ -3693,6 +3702,9 @@ async fn handle_duckdb_invoke(
             .into());
     }
     request_cancel::set_stage(request_cancel::Stage::Other);
+    // Retain the signed invocation identity before admission is consumed;
+    // allocate its textual event epoch only for supported database writes.
+    let event_hash = admitted.invocation().content_hash();
     let caveats: Option<DuckDbCaveats> = parse_caveat_fact(
         admitted
             .invocation()
@@ -3709,7 +3721,7 @@ async fn handle_duckdb_invoke(
     // envelope was verified once at admission; only authorization,
     // revocation, caveat containment, and signed-time validity are
     // re-checked here.
-    let auth_result = verify_auth_admitted("server.duckdb.auth", admitted, tinycloud).await?;
+    verify_auth_admitted("server.duckdb.auth", admitted, tinycloud).await?;
 
     let (space, path, ability) = select_database_scope(duckdb_caps, "duckdb")?;
     // Keep the logical path separate from any legacy physical artifact name.
@@ -3849,28 +3861,33 @@ async fn handle_duckdb_invoke(
         }
     })?;
 
-    if let Some(epoch) = auth_result
-        .commits
-        .get(space)
-        .map(|commit| commit.rev.to_cid(0x55).to_string())
+    // DuckDB execution has completed successfully above. Reads have no
+    // supported write targets and failures returned before reaching this point.
+    // DuckDB has no KV commit epoch, so use this admitted signed invocation.
+    if response
+        .write_targets
+        .iter()
+        .any(|target| matches!(target, TouchedTables::Supported(tables) if !tables.is_empty()))
     {
         if let Ok(timestamp) = OffsetDateTime::now_utc().format(&Rfc3339) {
+            let event_epoch = event_hash.to_cid(0x55).to_string();
             let events = database_write_events(
                 &space_id,
                 "duckdb",
                 path,
                 &actor,
-                &epoch,
+                &event_epoch,
                 &timestamp,
                 &response.write_targets,
             );
-
-            spawn_database_hook_delivery(
-                tinycloud.inner().clone(),
-                hook_runtime.inner().clone(),
-                events,
-                "server.duckdb.enqueue_hooks",
-            );
+            if !events.is_empty() {
+                spawn_database_hook_delivery(
+                    tinycloud.inner().clone(),
+                    hook_runtime.inner().clone(),
+                    events,
+                    "server.duckdb.enqueue_hooks",
+                );
+            }
         }
     }
 
@@ -3958,6 +3975,7 @@ fn spawn_database_hook_delivery(
     events: Vec<WriteEvent>,
     span: &'static str,
 ) {
+    publish_database_hook_events(&hook_runtime, &events);
     rocket::tokio::spawn(async move {
         let enqueue_start = Instant::now();
         let enqueue_result = enqueue_database_webhook_deliveries(&tinycloud, &events).await;
@@ -3977,10 +3995,7 @@ fn spawn_database_hook_delivery(
                 error_class = "database",
                 "database write committed but webhook enqueue failed"
             );
-            return;
         }
-
-        publish_database_hook_events(&hook_runtime, &events);
     });
 }
 
@@ -5128,6 +5143,52 @@ mod tests {
         );
         assert_eq!(third.ability, "tinycloud.sql/write");
         assert_eq!(third.event_index, 2);
+    }
+
+    #[tokio::test]
+    async fn database_hook_sse_publish_survives_webhook_enqueue_failure() -> Result<()> {
+        use tinycloud_core::sea_orm::ConnectionTrait;
+
+        let tempdir = TempDir::new()?;
+        let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string())).await?;
+        let storage = NodeFileSystemConfig::new(tempdir.path()).open().await?;
+        let tinycloud = TinyCloud::new(
+            db.clone().into(),
+            Either::B(storage),
+            StaticSecret::new(vec![0u8; 32]).unwrap(),
+        )
+        .await?;
+        db.execute_unprepared("DROP TABLE hook_subscription")
+            .await?;
+
+        let events = database_write_events(
+            "tinycloud:space",
+            "sql",
+            Some("main.db"),
+            "did:key:actor",
+            "epoch",
+            "2026-01-01T00:00:00Z",
+            &[TouchedTables::supported(vec!["users".to_string()])],
+        );
+        assert_eq!(events.len(), 1);
+        assert!(
+            enqueue_database_webhook_deliveries(&tinycloud, &events)
+                .await
+                .is_err(),
+            "the test database makes durable webhook enqueue fail"
+        );
+
+        let hook_runtime = HookRuntime::new(HooksConfig::default(), [7u8; 32]);
+        let mut receiver = hook_runtime.bus().subscribe();
+        spawn_database_hook_delivery(
+            tinycloud,
+            hook_runtime,
+            events.clone(),
+            "test.sql.enqueue_hooks",
+        );
+        let received = timeout(Duration::from_secs(1), receiver.recv()).await??;
+        assert_eq!(received.id, events[0].id);
+        Ok(())
     }
 
     #[tokio::test]
@@ -8303,7 +8364,7 @@ mod tests {
     ) -> rocket::Rocket<rocket::Build> {
         let conn = setup.replay_db.clone();
         let rocket = rocket::build()
-            .mount("/", rocket::routes![invoke])
+            .mount("/", rocket::routes![invoke, hooks::hook_events])
             .attach(crate::tracing::TracingFairing::for_test(
                 &Config::default().log.tracing,
             ))
@@ -9000,6 +9061,147 @@ mod tests {
             published.push(what);
         }
         assert_eq!(published.len(), 3);
+        Ok(())
+    }
+    #[tokio::test]
+    async fn authorized_sql_invoke_publishes_write_on_hook_sse() -> Result<()> {
+        use crate::hooks::{HookSubscription, HookTicketClaims};
+        use rocket::data::ByteUnit;
+        use rocket::http::{ContentType, Header, Status};
+        use rocket::local::asynchronous::Client;
+
+        let setup = metered_sql_http_setup("tc2207-sql-hook-sse").await?;
+        let space = setup.space.to_string();
+        let read_auth = sql_invocation_header(
+            &setup,
+            "tinycloud.sql/read",
+            "urn:uuid:tc2207-sql-hook-sse-read",
+        )?;
+        let write_auth = sql_invocation_header(
+            &setup,
+            "tinycloud.sql/write",
+            "urn:uuid:tc2207-sql-hook-sse-write",
+        )?;
+        let failed_write_auth = sql_invocation_header(
+            &setup,
+            "tinycloud.sql/write",
+            "urn:uuid:tc2207-sql-hook-sse-failed-write",
+        )?;
+        let write_invocation = tinycloud_core::events::Invocation::from_header_ser::<
+            tinycloud_core::events::TinyCloudInvocation,
+        >(&write_auth)
+        .map_err(anyhow::Error::msg)?;
+        let write_cid = write_invocation.content_hash().to_cid(0x55).to_string();
+        let hooks = HookRuntime::new(HooksConfig::default(), [9u8; 32]);
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let ticket = hooks
+            .sign_ticket(&HookTicketClaims {
+                v: 2,
+                sub: setup
+                    .verification_method
+                    .split('#')
+                    .next()
+                    .expect("verification method has a DID")
+                    .to_string(),
+                scopes: vec![HookSubscription {
+                    space: space.clone(),
+                    service: "sql".to_string(),
+                    path_prefix: Some("main".to_string()),
+                    abilities: vec!["tinycloud.sql/write".to_string()],
+                }],
+                iat: now,
+                exp: now + 30,
+                parent_exp: now + 30,
+                authorizing_delegations: Vec::new(),
+            })
+            .map_err(anyhow::Error::msg)?;
+
+        let client = Client::tracked(metered_sql_rocket(setup, ByteUnit::Byte(u64::MAX))).await?;
+        rocket::tokio::time::pause();
+        let stream = client
+            .get(format!("/hooks/events?ticket={ticket}"))
+            .dispatch()
+            .await;
+        assert_eq!(stream.status(), Status::Ok);
+
+        let read = client
+            .post("/invoke")
+            .header(Header::new("Authorization", read_auth))
+            .header(ContentType::JSON)
+            .body(serde_json::to_string(&SqlRequest::Query {
+                sql: "SELECT label FROM labels".to_string(),
+                params: Vec::new(),
+                max_rows: None,
+                max_bytes: None,
+            })?)
+            .dispatch()
+            .await;
+        assert_eq!(read.status(), Status::Ok);
+
+        let write = client
+            .post("/invoke")
+            .header(Header::new("Authorization", write_auth))
+            .header(ContentType::JSON)
+            .body(serde_json::to_string(&SqlRequest::Execute {
+                sql: "INSERT INTO labels (label, val) VALUES ('hook-event', 1)".to_string(),
+                params: Vec::new(),
+                schema: None,
+            })?)
+            .dispatch()
+            .await;
+        assert_eq!(
+            write.status(),
+            Status::Ok,
+            "{}",
+            write.into_string().await.unwrap_or_default()
+        );
+
+        let failed_write = client
+            .post("/invoke")
+            .header(Header::new("Authorization", failed_write_auth))
+            .header(ContentType::JSON)
+            .body(serde_json::to_string(&SqlRequest::Execute {
+                sql: "INSERT INTO labels (label, val) VALUES ('alpha', 2)".to_string(),
+                params: Vec::new(),
+                schema: None,
+            })?)
+            .dispatch()
+            .await;
+        assert_ne!(
+            failed_write.status(),
+            Status::Ok,
+            "duplicate primary key must fail"
+        );
+
+        let body_future = stream.into_string();
+        rocket::tokio::pin!(body_future);
+        let advance = async {
+            for _ in 0..30 {
+                rocket::tokio::task::yield_now().await;
+                rocket::tokio::time::advance(Duration::from_secs(1)).await;
+            }
+        };
+        let (body, ()) = rocket::tokio::join!(&mut body_future, advance);
+        let body = body.unwrap_or_default();
+        assert_eq!(
+            body.matches("event:write\n").count(),
+            1,
+            "only the successful SQL write emits a hook event"
+        );
+        let write = body
+            .find("event:write\n")
+            .expect("an authorized SQL INSERT reaches the hook SSE stream");
+        let write_data = body[write..]
+            .lines()
+            .find_map(|line| line.strip_prefix("data:").map(str::trim_start))
+            .expect("write event contains JSON data");
+        let event: crate::hooks::WriteEvent = serde_json::from_str(write_data)?;
+        assert_eq!(event.space, space);
+        assert_eq!(event.service, "sql");
+        assert_eq!(event.database_path.as_deref(), Some("main"));
+        assert_eq!(event.table_name.as_deref(), Some("labels"));
+        assert_eq!(event.epoch, write_cid);
+        assert_eq!(event.id, format!("{}:0", event.epoch));
         Ok(())
     }
 
