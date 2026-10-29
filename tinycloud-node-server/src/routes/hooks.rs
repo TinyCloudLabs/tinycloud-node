@@ -1159,8 +1159,10 @@ mod tests {
 
     #[tokio::test]
     async fn hook_stream_closes_when_broadcast_receiver_lags() -> Result<()> {
-        let mut config = HooksConfig::default();
-        config.sse_broadcast_capacity = 1;
+        let config = HooksConfig {
+            sse_broadcast_capacity: 1,
+            ..HooksConfig::default()
+        };
         let hooks = HookRuntime::new(config, [7u8; 32]);
         let (_tempdir, tinycloud) = test_tinycloud().await?;
         let client = rocket::local::asynchronous::Client::tracked(
