@@ -358,6 +358,11 @@ pub async fn hook_events<'r>(
 
     let stream = EventStream! {
         let _lease = lease;
+        // `receiver` was subscribed only after ticket and authority checks above.
+        if rocket::tokio::time::Instant::now() >= stream_deadline {
+            return;
+        }
+        yield Event::json(&serde_json::json!({"type": "ready"})).event("ready");
         let deadline_sleep = rocket::tokio::time::sleep_until(stream_deadline);
         rocket::tokio::pin!(deadline_sleep);
 
@@ -377,7 +382,7 @@ pub async fn hook_events<'r>(
                             }
                         }
                         Err(rocket::tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                            continue;
+                            break;
                         }
                         Err(rocket::tokio::sync::broadcast::error::RecvError::Closed) => {
                             break;
@@ -1072,6 +1077,159 @@ mod tests {
                 "queued events must not be emitted after the ticket deadline"
             );
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hook_stream_emits_ready_before_queued_write_events() -> Result<()> {
+        let hooks = test_hook_runtime();
+        let (_tempdir, tinycloud) = test_tinycloud().await?;
+        let client = rocket::local::asynchronous::Client::tracked(
+            rocket::build()
+                .mount("/", rocket::routes![hook_events])
+                .manage(hooks.clone())
+                .manage(tinycloud),
+        )
+        .await?;
+        rocket::tokio::time::pause();
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let ticket = hooks
+            .sign_ticket(&HookTicketClaims {
+                v: 2,
+                sub: "did:key:subscriber".to_string(),
+                scopes: vec![HookSubscription {
+                    space: "tinycloud:space".to_string(),
+                    service: "kv".to_string(),
+                    path_prefix: None,
+                    abilities: Vec::new(),
+                }],
+                iat: now,
+                exp: now + 1,
+                parent_exp: now + 1,
+                authorizing_delegations: Vec::new(),
+            })
+            .map_err(anyhow::Error::msg)?;
+
+        let response = client
+            .get(format!("/hooks/events?ticket={ticket}"))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        hooks.bus().publish(crate::hooks::WriteEvent {
+            event_type: "write".to_string(),
+            id: "epoch:1".to_string(),
+            space: "tinycloud:space".to_string(),
+            service: "kv".to_string(),
+            ability: "tinycloud.kv/put".to_string(),
+            path: Some("documents/1".to_string()),
+            database_path: None,
+            table_name: None,
+            actor: "did:key:actor".to_string(),
+            epoch: "epoch".to_string(),
+            event_index: 1,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+        });
+
+        let body_future = response.into_string();
+        rocket::tokio::pin!(body_future);
+        let advance = async {
+            rocket::tokio::task::yield_now().await;
+            rocket::tokio::time::advance(Duration::from_secs(2)).await;
+        };
+        let (body, ()) = rocket::tokio::join!(&mut body_future, advance);
+        let body = body.unwrap_or_default();
+
+        let ready = body
+            .find("event:ready\ndata:{\"type\":\"ready\"}\n\n")
+            .expect("the authorized stream starts with a ready control event");
+        let write = body
+            .find("event:write\n")
+            .expect("the prequeued write event is delivered");
+        assert!(ready < write, "ready precedes write: {body}");
+
+        let write_data = body[write..]
+            .lines()
+            .find_map(|line| line.strip_prefix("data:").map(str::trim_start))
+            .expect("write event contains JSON data");
+        let event: crate::hooks::WriteEvent = serde_json::from_str(write_data)?;
+        assert_eq!(event.id, "epoch:1");
+        assert_eq!(event.event_type, "write");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hook_stream_closes_when_broadcast_receiver_lags() -> Result<()> {
+        let config = HooksConfig {
+            sse_broadcast_capacity: 1,
+            ..HooksConfig::default()
+        };
+        let hooks = HookRuntime::new(config, [7u8; 32]);
+        let (_tempdir, tinycloud) = test_tinycloud().await?;
+        let client = rocket::local::asynchronous::Client::tracked(
+            rocket::build()
+                .mount("/", rocket::routes![hook_events])
+                .manage(hooks.clone())
+                .manage(tinycloud),
+        )
+        .await?;
+        rocket::tokio::time::pause();
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let ticket = hooks
+            .sign_ticket(&HookTicketClaims {
+                v: 2,
+                sub: "did:key:subscriber".to_string(),
+                scopes: vec![HookSubscription {
+                    space: "tinycloud:space".to_string(),
+                    service: "kv".to_string(),
+                    path_prefix: None,
+                    abilities: Vec::new(),
+                }],
+                iat: now,
+                exp: now + 1,
+                parent_exp: now + 1,
+                authorizing_delegations: Vec::new(),
+            })
+            .map_err(anyhow::Error::msg)?;
+
+        let response = client
+            .get(format!("/hooks/events?ticket={ticket}"))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        for index in 1..=2 {
+            hooks.bus().publish(crate::hooks::WriteEvent {
+                event_type: "write".to_string(),
+                id: format!("epoch:{index}"),
+                space: "tinycloud:space".to_string(),
+                service: "kv".to_string(),
+                ability: "tinycloud.kv/put".to_string(),
+                path: Some(format!("documents/{index}")),
+                database_path: None,
+                table_name: None,
+                actor: "did:key:actor".to_string(),
+                epoch: "epoch".to_string(),
+                event_index: index,
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+            });
+        }
+
+        let body_future = response.into_string();
+        rocket::tokio::pin!(body_future);
+        let advance = async {
+            rocket::tokio::task::yield_now().await;
+            rocket::tokio::time::advance(Duration::from_secs(2)).await;
+        };
+        let (body, ()) = rocket::tokio::join!(&mut body_future, advance);
+        let body = body.unwrap_or_default();
+
+        assert!(
+            body.contains("event:ready\ndata:{\"type\":\"ready\"}\n\n"),
+            "authorized stream emits readiness before closing: {body}"
+        );
+        assert!(
+            !body.contains("event:write\n"),
+            "a lagged stream closes rather than skipping missing writes: {body}"
+        );
         Ok(())
     }
 
