@@ -337,7 +337,8 @@ fn build_info(
         in_tee: tee.inner().is_some(),
         quota_url: quota_cache.quota_url().map(|s| s.to_string()),
         did_resolution: DidResolutionInfo {
-            network_methods: tinycloud_core::did_resolution::policy().network_methods,
+            // Always false: the node resolves only allow-listed methods. Kept for /info wire compatibility.
+            network_methods: false,
             refused_total: tinycloud_core::did_resolution::refused_total(),
         },
         // Two relaxed atomic loads: `/info` is public and polled.
