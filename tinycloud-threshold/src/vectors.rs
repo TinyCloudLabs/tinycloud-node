@@ -49,7 +49,7 @@ fn primitives() -> Value {
         .iter()
         .map(|s| json!({"member":s.index().get(),"scalar":hex::encode(s.scalar.to_bytes())}))
         .collect();
-    let encrypted_shares:Vec<_>=issued.iter().map(|s|json!({"member":s.index().get(),"encoded":hex::encode(s.encode()),"c1":hex::encode(s.c1.encode()),"c2":hex::encode(s.c2.encode()),"c3":hex::encode(s.c3.encode()),"signing_preimage":hex::encode(s.signing_preimage(&req))})).collect();
+    let encrypted_shares:Vec<_>=issued.iter().map(|s|json!({"member":s.index().get(),"encoded":hex::encode(s.encode()),"c1":hex::encode(s.c1.encode()),"c2":hex::encode(s.c2.encode()),"c3":hex::encode(s.c3.encode()),"signing_preimage":hex::encode(s.signing_preimage(&req).unwrap())})).collect();
     let mut bad_share = issued[0].clone();
     bad_share.c3 = bad_share.c3.add(&G1::generator());
     let mut wrong_context = issued[0].clone();

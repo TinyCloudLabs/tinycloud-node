@@ -255,13 +255,18 @@ impl EncryptedKeyShare {
         })
     }
     /// Tagged 32-byte preimage for a node-key signature; request digest is explicit.
-    pub fn signing_preimage(&self, req: &DecryptRequest) -> Vec<u8> {
+    /// Returns `ContextMismatch` if the supplied request differs from the issued request.
+    pub fn signing_preimage(&self, req: &DecryptRequest) -> Result<Vec<u8>, Error> {
+        let request_digest = req.digest();
+        if self.request_digest != *request_digest.as_bytes() {
+            return Err(Error::ContextMismatch);
+        }
         let mut e = Encoder::new();
-        e.fixed(req.digest().as_bytes());
+        e.fixed(request_digest.as_bytes());
         e.fixed(req.certificate.as_bytes());
         e.u16(self.member.get());
         e.fixed(&self.encode());
-        dst::tagged_hash(dst::DECRYPT_SHARE, &e.finish()).to_vec()
+        Ok(dst::tagged_hash(dst::DECRYPT_SHARE, &e.finish()).to_vec())
     }
     fn matches(&self, ctx: &KeyContext, req: &DecryptRequest) -> bool {
         self.context_digest == ctx.digest()

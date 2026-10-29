@@ -90,6 +90,39 @@ fn setup(
 }
 
 #[test]
+fn signing_preimage_rejects_changed_record_nonce() {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../vectors/v1/primitives.json")).unwrap();
+    let threshold = fixture["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|case| case["name"] == "threshold_2of3")
+        .unwrap();
+    let request_bytes = hex::decode(threshold["inputs"]["request"].as_str().unwrap()).unwrap();
+    let request = DecryptRequest::decode(&request_bytes).unwrap();
+    let response = &threshold["outputs"]["encrypted_shares"][0];
+    let share =
+        EncryptedKeyShare::decode(&hex::decode(response["encoded"].as_str().unwrap()).unwrap())
+            .unwrap();
+    let expected = hex::decode(response["signing_preimage"].as_str().unwrap()).unwrap();
+    assert_eq!(share.signing_preimage(&request), Ok(expected));
+
+    let mut changed = request_bytes;
+    let last_nonce = changed.len() - 49;
+    changed[last_nonce] ^= 1;
+    let other_request = DecryptRequest::decode(&changed).unwrap();
+    assert_eq!(other_request.context_digest, request.context_digest);
+    assert_eq!(other_request.tpk, request.tpk);
+    assert_ne!(other_request.identity().nonce(), request.identity().nonce());
+    assert_ne!(share.request_digest, *other_request.digest().as_bytes());
+    assert_eq!(
+        share.signing_preimage(&other_request),
+        Err(Error::ContextMismatch)
+    );
+}
+
+#[test]
 fn checkpoint_2of3() {
     let (public, shares, tsk, req, issued) = setup(11);
     assert_eq!(public.context().threshold(), Threshold::new(2, 3).unwrap());
@@ -312,8 +345,8 @@ fn both_share_equations_and_deduplication() {
         Err(ShareError::ContextMismatch)
     );
     assert_ne!(
-        issued[0].signing_preimage(&req),
-        issued[1].signing_preimage(&req)
+        issued[0].signing_preimage(&req).unwrap(),
+        issued[1].signing_preimage(&req).unwrap()
     );
 }
 
