@@ -690,6 +690,32 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn certificate_rejects_wrong_owner_signature() {
+        let signers = Signers::new();
+        let (cert, _) = genesis(&signers);
+        let non_owner = Signers::did(9);
+        let preimage = cert.body.owner_statement();
+        let wrong_owner = SignedCertificate {
+            body: cert.body.clone(),
+            owner_signature: signers.sign(&non_owner, &preimage),
+        };
+        signers
+            .verify(&non_owner, &preimage, &wrong_owner.owner_signature)
+            .unwrap();
+        assert!(matches!(
+            verify_certificate(&signers.anchor(), &wrong_owner, &signers),
+            Err(CertError::InvalidSignature)
+        ));
+
+        let mut tampered = sign(cert.body.clone(), &signers);
+        tampered.owner_signature[0] ^= 1;
+        assert!(matches!(
+            verify_certificate(&signers.anchor(), &tampered, &signers),
+            Err(CertError::InvalidSignature)
+        ));
+    }
+
+    #[test]
     fn decoded_certificate_invariants_apply_before_verified_contexts_exist() {
         let signers = Signers::new();
         let (cert, _) = genesis(&signers);
