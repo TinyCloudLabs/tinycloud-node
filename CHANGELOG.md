@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Changes
+- Hook SSE subscriptions emit an authorized `ready` control event and close after broadcast lag. Successful SQL and DuckDB writes publish notifications keyed by the signed invocation CID; reads and failed writes emit none, and webhook enqueue remains independent. Details: TC-2207
+
 ## [1.25.11] - 2026-10-28
 
 ### Changes
