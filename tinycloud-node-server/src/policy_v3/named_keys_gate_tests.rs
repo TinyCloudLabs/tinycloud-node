@@ -7,6 +7,7 @@
 use super::test_harness::*;
 use super::*;
 use rocket::http::{ContentType, Header};
+use serde_json::json;
 use tinycloud_core::encryption_network::{CreateNetworkRequest, EncryptionService, Threshold};
 
 const NAMED_KEYS_UNAVAILABLE: &str =
@@ -862,3 +863,590 @@ async fn siwe_app_grants_need_an_https_or_absent_scheme(backend: Backend) -> any
     Ok(())
 }
 on_both_backends!(siwe_app_grants_need_an_https_or_absent_scheme);
+
+const TC2192_KEY_PATH: &str = "share/tc-2192";
+
+#[derive(Clone, Copy)]
+enum SourceDigest {
+    RawWrappedBytes,
+    LegacyWire,
+    Missing,
+}
+
+struct ShareDecrypt {
+    h: Harness,
+    session: String,
+    public_key: Vec<u8>,
+    wrapped: Vec<u8>,
+    receiver: x25519_dalek::StaticSecret,
+    key_path: Option<&'static str>,
+    _ledger: tempfile::TempDir,
+}
+
+impl ShareDecrypt {
+    async fn new() -> anyhow::Result<Self> {
+        Self::with_source(Some(TC2192_KEY_PATH), "immutable").await
+    }
+
+    async fn with_source(key_path: Option<&'static str>, mode: &str) -> anyhow::Result<Self> {
+        let digest_format = if key_path.is_some() {
+            SourceDigest::RawWrappedBytes
+        } else {
+            SourceDigest::LegacyWire
+        };
+        Self::with_source_digest(key_path, mode, digest_format).await
+    }
+
+    async fn with_source_digest(
+        key_path: Option<&'static str>,
+        mode: &str,
+        digest_format: SourceDigest,
+    ) -> anyhow::Result<Self> {
+        use tinycloud_core::encryption_network::{
+            backend::wrap_to_public_key, canonical::canonical_hash, key_id::KeyLocation,
+        };
+        let ledger = tempfile::tempdir()?;
+        let mut h = Harness::new_with(Backend::Sqlite, Shape::KeySession, "tc2192", |config| {
+            config.encryption_network.named_keys_v1 = true;
+            config.encryption_network.deletion_ledger_path =
+                Some(ledger.path().join("deletion-ledger.jsonl"));
+        })
+        .await?
+        .expect("SQLite harness");
+        h.network = format!("urn:tinycloud:encryption:{}:default", h.space_owner.did());
+        let service = h.client.rocket().state::<EncryptionService>().unwrap();
+        let network = service
+            .create_one_of_one_network(CreateNetworkRequest {
+                name: "default".into(),
+                owner_did: h.space_owner.did().into(),
+                threshold: Threshold::one_of_one(),
+            })
+            .await?;
+        let public_key = if let Some(path) = key_path {
+            service
+                .create_key(&KeyLocation::new(&network.network_id, path)?, false)
+                .await?
+                .public_encryption_key
+        } else {
+            network.public_encryption_key
+        };
+        let wrapped = wrap_to_public_key(&public_key, &[0xCD; 32])?;
+        let leaf = match key_path {
+            Some(path) => format!("{}/{path}", h.network),
+            None => h.network.clone(),
+        };
+        let mut grants = h.owner_grants();
+        grants[2].0 = leaf.clone();
+        h.grant_owner_with(&grants, Window::until(now() + Duration::days(2)))
+            .await?;
+        let (status, body, registered) = h
+            .register_with(policy_window(), |policy| {
+                policy["contentSource"]["shareId"] = json!("tc-2192");
+                policy["contentSource"]["mode"] = json!(mode);
+                if let Some(path) = key_path {
+                    policy["contentSource"]["encryptionKeyPath"] = json!(path);
+                }
+                let digest = match digest_format {
+                    SourceDigest::RawWrappedBytes => Some(hex::encode(Sha256::digest(&wrapped))),
+                    SourceDigest::LegacyWire => {
+                        Some(canonical_hash(&json!(base64::encode(&wrapped))))
+                    }
+                    SourceDigest::Missing => None,
+                };
+                match digest {
+                    Some(digest) => {
+                        policy["contentSource"]["encryptedSymmetricKeyDigestHex"] = json!(digest);
+                    }
+                    None => {
+                        policy["contentSource"]
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("encryptedSymmetricKeyDigestHex");
+                    }
+                }
+                policy["capabilityCeiling"][1]["resource"] = json!(leaf);
+            })
+            .await?;
+        anyhow::ensure!(status == Status::Ok, "register Share: {status} {body}");
+        let session = h.mint_ok(&registered).await?;
+        Ok(Self {
+            h,
+            session,
+            public_key,
+            wrapped,
+            receiver: x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng),
+            key_path,
+            _ledger: ledger,
+        })
+    }
+
+    fn body(&self) -> Value {
+        use tinycloud_core::encryption_network::{canonical::canonical_hash, DECRYPT_REQUEST_TYPE};
+        let wrapped = json!(base64::encode(&self.wrapped));
+        let receiver = json!(base64::encode(
+            x25519_dalek::PublicKey::from(&self.receiver).as_bytes()
+        ));
+        let mut body = json!({
+            "type": DECRYPT_REQUEST_TYPE,
+            "targetNode": self.h.node_did(),
+            "networkId": self.h.network,
+            "alg": tinycloud_core::encryption_network::types::ALG_X25519_AES256GCM,
+            "keyVersion": 1,
+            "encryptedSymmetricKeyHash": canonical_hash(&wrapped),
+            "encryptedSymmetricKey": wrapped,
+            "receiverPublicKeyHash": canonical_hash(&receiver),
+            "receiverPublicKey": receiver,
+        });
+        if let Some(path) = self.key_path {
+            body["keyPath"] = json!(path);
+        }
+        body
+    }
+
+    async fn invoke(
+        &self,
+        resource: &str,
+        body: &Value,
+        extra_attenuation: Option<Value>,
+        metadata: Value,
+    ) -> anyhow::Result<(Status, String)> {
+        self.invoke_at("/invoke", resource, body, extra_attenuation, metadata)
+            .await
+    }
+
+    async fn invoke_at(
+        &self,
+        route: &str,
+        resource: &str,
+        body: &Value,
+        extra_attenuation: Option<Value>,
+        metadata: Value,
+    ) -> anyhow::Result<(Status, String)> {
+        use tinycloud_auth::{
+            siwe_recap::Ability,
+            ssi::{claims::jwt::NumericDate, ucan::Payload},
+            ucan_capabilities_object::Capabilities,
+        };
+        use tinycloud_core::encryption_network::canonical::canonical_hash;
+        let mut attenuation: Capabilities<Value> =
+            serde_json::from_value(extra_attenuation.unwrap_or_else(|| json!({})))?;
+        attenuation.with_action(
+            resource.parse()?,
+            KEY_DECRYPT.parse::<Ability>()?,
+            [std::collections::BTreeMap::<String, Value>::new()],
+        );
+        let mut facts = body.clone();
+        facts
+            .as_object_mut()
+            .unwrap()
+            .remove("encryptedSymmetricKey");
+        facts.as_object_mut().unwrap().remove("receiverPublicKey");
+        facts["bodyHash"] = json!(canonical_hash(body));
+        let Signer::Key { jwk, vm, .. } = &self.h.holder else {
+            unreachable!()
+        };
+        let at = now();
+        let authorization = Payload {
+            issuer: vm.parse()?,
+            audience: self.h.node_did().parse()?,
+            not_before: Some(NumericDate::try_from_seconds(at.unix_timestamp() as f64)?),
+            expiration: NumericDate::try_from_seconds(
+                (at + Duration::seconds(30)).unix_timestamp() as f64,
+            )?,
+            nonce: Some(unique("tc2192decrypt")),
+            facts: Some(vec![facts, metadata]),
+            proof: vec![session_cid(&self.session)?],
+            attenuation,
+        }
+        .sign(Algorithm::EdDSA, jwk)?
+        .encode()?;
+        let (status, body, _) = answer(
+            self.h
+                .client
+                .post(route)
+                .header(ContentType::JSON)
+                .header(Header::new("Authorization", authorization))
+                .body(body.to_string()),
+        )
+        .await;
+        Ok((status, body))
+    }
+
+    fn leaf(&self) -> String {
+        match self.key_path {
+            Some(path) => format!("{}/{path}", self.h.network),
+            None => self.h.network.clone(),
+        }
+    }
+}
+
+#[tokio::test]
+async fn tc2192_legacy_immutable_share_decrypt_uses_signed_wire_digest() -> anyhow::Result<()> {
+    use tinycloud_core::encryption_network::{
+        backend::wrap_to_public_key, canonical::canonical_hash,
+    };
+    let share = ShareDecrypt::with_source(None, "immutable").await?;
+    let original = share.body();
+    let (status, response) = share
+        .invoke(&share.leaf(), &original, None, Value::Null)
+        .await?;
+    assert_eq!(status, Status::Ok, "{response}");
+    let response: Value = serde_json::from_str(&response)?;
+    let wrapped = base64::decode(response["wrappedKey"].as_str().unwrap())?;
+    let (ephemeral, sealed) = wrapped.split_at(32);
+    let peer = x25519_dalek::PublicKey::from(<[u8; 32]>::try_from(ephemeral)?);
+    let shared = share.receiver.diffie_hellman(&peer);
+    assert_eq!(
+        tinycloud_core::encryption::ColumnEncryption::new(*shared.as_bytes())
+            .decrypt_strict(sealed)?,
+        vec![0xCD; 32],
+    );
+
+    let other = wrap_to_public_key(&share.public_key, &[0xEF; 32])?;
+    let mut changed = original;
+    changed["encryptedSymmetricKey"] = json!(base64::encode(&other));
+    changed["encryptedSymmetricKeyHash"] = json!(canonical_hash(&changed["encryptedSymmetricKey"]));
+    let (status, response) = share
+        .invoke(&share.leaf(), &changed, None, Value::Null)
+        .await?;
+    assert_eq!(status, Status::Forbidden, "{response}");
+    assert_eq!(response, "policy-decrypt-content-source-mismatch");
+    Ok(())
+}
+
+#[tokio::test]
+async fn tc2192_legacy_immutable_source_without_digest_remains_compatible() -> anyhow::Result<()> {
+    let share = ShareDecrypt::with_source_digest(None, "immutable", SourceDigest::Missing).await?;
+    let (status, response) = share
+        .invoke(&share.leaf(), &share.body(), None, Value::Null)
+        .await?;
+    assert_eq!(status, Status::Ok, "{response}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn tc2192_immutable_share_decrypt_binds_registered_source() -> anyhow::Result<()> {
+    assert_registered_source_binding(ShareDecrypt::new().await?, "/invoke").await
+}
+
+#[tokio::test]
+async fn tc2192_mutable_share_decrypt_binds_registered_source() -> anyhow::Result<()> {
+    assert_registered_source_binding(
+        ShareDecrypt::with_source(Some(TC2192_KEY_PATH), "mutable").await?,
+        "/invoke",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn tc2192_direct_decrypt_binds_registered_source_before_release() -> anyhow::Result<()> {
+    let share = ShareDecrypt::with_source(None, "immutable").await?;
+    let route = format!("/encryption/networks/{}/decrypt", share.h.network);
+    assert_registered_source_binding(share, &route).await
+}
+
+async fn assert_registered_source_binding(share: ShareDecrypt, route: &str) -> anyhow::Result<()> {
+    use tinycloud_core::encryption_network::{
+        backend::wrap_to_public_key, canonical::canonical_hash,
+    };
+    let original = share.body();
+    let mut different_key = original.clone();
+    let other = wrap_to_public_key(&share.public_key, &[0xEF; 32])?;
+    different_key["encryptedSymmetricKey"] = json!(base64::encode(&other));
+    different_key["encryptedSymmetricKeyHash"] =
+        json!(canonical_hash(&different_key["encryptedSymmetricKey"]));
+    let mut different_version = original.clone();
+    different_version["keyVersion"] = json!(2);
+    for (label, body, metadata) in [
+        ("digest", different_key.clone(), Value::Null),
+        ("version", different_version, Value::Null),
+        (
+            "caller source override",
+            different_key,
+            json!({
+                "contentSource": {
+                    "mode": "mutable",
+                    "encryptedSymmetricKeyDigestHex": hex::encode(Sha256::digest(&other)),
+                    "keyVersion": 1,
+                },
+            }),
+        ),
+    ] {
+        let (status, response) = share
+            .invoke_at(route, &share.leaf(), &body, None, metadata)
+            .await?;
+        assert_eq!(status, Status::Forbidden, "{label}: {response}");
+        assert_eq!(
+            response, "policy-decrypt-content-source-mismatch",
+            "{label}"
+        );
+    }
+    let (status, response) = share
+        .invoke_at(route, &share.leaf(), &original, None, Value::Null)
+        .await?;
+    assert_eq!(status, Status::Ok, "{response}");
+    let response: Value = serde_json::from_str(&response)?;
+    let wrapped = base64::decode(response["wrappedKey"].as_str().unwrap())?;
+    let (ephemeral, sealed) = wrapped.split_at(32);
+    let peer = x25519_dalek::PublicKey::from(<[u8; 32]>::try_from(ephemeral)?);
+    let shared = share.receiver.diffie_hellman(&peer);
+    assert_eq!(
+        tinycloud_core::encryption::ColumnEncryption::new(*shared.as_bytes())
+            .decrypt_strict(sealed)?,
+        vec![0xCD; 32],
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn tc2192_share_owner_path_and_exact_resources_are_checked_before_decrypt(
+) -> anyhow::Result<()> {
+    let share = ShareDecrypt::new().await?;
+    let original = share.body();
+    for (field, value) in [
+        (
+            "networkId",
+            format!("urn:tinycloud:encryption:{}:default", share.h.owner.did()),
+        ),
+        (
+            "networkId",
+            format!(
+                "urn:tinycloud:encryption:{}:other",
+                share.h.space_owner.did()
+            ),
+        ),
+        ("keyPath", "share/other".into()),
+        ("keyPath", format!("{TC2192_KEY_PATH}/child")),
+    ] {
+        let mut body = original.clone();
+        body[field] = json!(value);
+        let (status, response) = share
+            .invoke(&share.leaf(), &body, None, Value::Null)
+            .await?;
+        assert_eq!(status, Status::Forbidden, "{field}: {response}");
+        assert_eq!(
+            response, "policy-decrypt-content-source-mismatch",
+            "{field}"
+        );
+    }
+    for resource in [
+        share.h.network.clone(),
+        format!("{}/share/other", share.h.network),
+        format!("{}/child", share.leaf()),
+        format!(
+            "urn:tinycloud:encryption:{}:default/{TC2192_KEY_PATH}",
+            share.h.owner.did()
+        ),
+    ] {
+        let (status, response) = share
+            .invoke(&resource, &original, None, Value::Null)
+            .await?;
+        assert_eq!(status, Status::Forbidden, "{resource}: {response}");
+        assert_eq!(response, "policy-invocation-capability-widening");
+    }
+    // A copied exact caveat must not authorize a different KV resource, even
+    // when bundled with a valid decrypt that would otherwise return a key.
+    for suffix in ["/child", "-sibling"] {
+        let kv = json!({
+            "kind": "kv",
+            "resource": share.h.content_resource.to_string(),
+            "selector": "exact",
+            "actions": ["tinycloud.kv/get"],
+        });
+        let attenuation = attenuation_for_policy_capabilities(&[kv])
+            .map_err(|(_, error)| anyhow::anyhow!(error))?;
+        let exact = share.h.content_resource.to_string();
+        let mut changed = attenuation.as_object().unwrap().clone();
+        let caveats = changed.remove(&exact).unwrap();
+        changed.insert(format!("{exact}{suffix}"), caveats);
+        // Keep the original selector value, not a newly attenuated selector.
+        let (status, response) = share
+            .invoke(
+                &share.leaf(),
+                &original,
+                Some(Value::Object(changed)),
+                Value::Null,
+            )
+            .await?;
+        assert_eq!(status, Status::Forbidden, "{suffix}: {response}");
+        assert_eq!(response, "policy-invocation-capability-widening");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn tc2192_share_cannot_redelegate_but_unrelated_policy_still_can() -> anyhow::Result<()> {
+    let share = ShareDecrypt::new().await?;
+    let session = decode_delegation(&share.session).map_err(|(_, error)| anyhow::anyhow!(error))?;
+    assert_eq!(profile_depth(&session.0.delegation), Some(0));
+    let (status, body, _, child) = share.h.reshare(&share.session).await?;
+    assert_eq!(status, Status::Forbidden, "{body}");
+    assert_eq!(body, "policy-session-descendant-invalid");
+    assert!(child.is_none());
+    let h = Harness::new(Backend::Sqlite, Shape::KeySession, "tc2192-unrelated")
+        .await?
+        .unwrap();
+    h.grant_owner(Window::until(now() + Duration::days(2)))
+        .await?;
+    let registered = h.register_ok(policy_window()).await?;
+    let session = h.mint_ok(&registered).await?;
+    let event = decode_delegation(&session).map_err(|(_, error)| anyhow::anyhow!(error))?;
+    assert_eq!(profile_depth(&event.0.delegation), Some(8));
+    let (status, body, reader, child) = h.reshare(&session).await?;
+    assert_eq!(status, Status::Ok, "{body}");
+    assert_eq!(
+        h.read_as(&reader, child.unwrap()).await?,
+        (Status::Ok, "tc-1423-content".into()),
+    );
+    Ok(())
+}
+
+#[test]
+fn tc2192_path_scoped_sources_require_a_digest_in_both_modes() {
+    let vector: Value = serde_json::from_str(include_str!(
+        "../../test-fixtures/tc-405-compact-authorization.json"
+    ))
+    .unwrap();
+    for mode in ["immutable", "mutable"] {
+        let mut policy = vector["policy"]["value"].clone();
+        policy["contentSource"]["mode"] = json!(mode);
+        policy["contentSource"]
+            .as_object_mut()
+            .unwrap()
+            .remove("encryptedSymmetricKeyDigestHex");
+        assert!(registration_projections(&policy).is_ok(), "legacy {mode}");
+        let owner = policy["ownerDid"].as_str().unwrap();
+        let network = format!("urn:tinycloud:encryption:{owner}:default");
+        let path = format!(
+            "share/{}",
+            policy["contentSource"]["shareId"].as_str().unwrap()
+        );
+        policy["contentSource"]["encryptionNetwork"] = json!(network);
+        policy["contentSource"]["encryptionKeyPath"] = json!(path);
+        policy["capabilityCeiling"][1]["resource"] = json!(format!("{network}/{path}"));
+        assert_eq!(
+            registration_projections(&policy).err(),
+            Some((Status::BadRequest, "content-source-invalid".into())),
+            "{mode} accepted a path-scoped source without a digest",
+        );
+        policy["contentSource"]["encryptedSymmetricKeyDigestHex"] = json!("aa".repeat(32));
+        assert!(
+            registration_projections(&policy).is_ok(),
+            "{mode} with digest"
+        );
+    }
+}
+
+#[tokio::test]
+async fn tc2192_legacy_mutable_source_preserves_wrapped_key_rotation() -> anyhow::Result<()> {
+    use tinycloud_core::encryption_network::{
+        backend::wrap_to_public_key, canonical::canonical_hash,
+    };
+    let share = ShareDecrypt::with_source(None, "mutable").await?;
+    let mut body = share.body();
+    body["encryptedSymmetricKey"] = json!(base64::encode(wrap_to_public_key(
+        &share.public_key,
+        &[0xCD; 32]
+    )?));
+    body["encryptedSymmetricKeyHash"] = json!(canonical_hash(&body["encryptedSymmetricKey"]));
+    // This fresh wrap has a different digest from the registration but is
+    // still permitted for a mutable source without encryptionKeyPath.
+    assert_ne!(
+        body["encryptedSymmetricKey"],
+        share.body()["encryptedSymmetricKey"],
+    );
+    let (status, response) = share
+        .invoke(&share.leaf(), &body, None, Value::Null)
+        .await?;
+    assert_eq!(status, Status::Ok, "{response}");
+    let response: Value = serde_json::from_str(&response)?;
+    let wrapped = base64::decode(response["wrappedKey"].as_str().unwrap())?;
+    let (ephemeral, sealed) = wrapped.split_at(32);
+    let peer = x25519_dalek::PublicKey::from(<[u8; 32]>::try_from(ephemeral)?);
+    let shared = share.receiver.diffie_hellman(&peer);
+    assert_eq!(
+        tinycloud_core::encryption::ColumnEncryption::new(*shared.as_bytes())
+            .decrypt_strict(sealed)?,
+        vec![0xCD; 32],
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn tc2192_refused_direct_mixed_decrypt_delete_leaves_kv_unchanged() -> anyhow::Result<()> {
+    use tinycloud_auth::{
+        siwe_recap::Ability,
+        ssi::{claims::jwt::NumericDate, ucan::Payload},
+        ucan_capabilities_object::Capabilities,
+    };
+    use tinycloud_core::encryption_network::canonical::canonical_hash;
+
+    let share = ShareDecrypt::with_source(None, "immutable").await?;
+    let before = share.h.read(&share.session).await?;
+    assert_eq!(before, (Status::Ok, b"tc-1423-content".to_vec()));
+    // Delete is independently authorized, but is not part of this policy
+    // session or the direct decrypt endpoint's contract.
+    let delete_grant = share
+        .h
+        .import(share.h.space_owner.delegate(
+            share.h.holder.did(),
+            &[(share.h.content_resource.to_string(), "tinycloud.kv/del")],
+            Window::until(now() + Duration::hours(1)),
+            &[],
+        )?)
+        .await?;
+    let mut attenuation = Capabilities::<Value>::new();
+    for (resource, ability) in [
+        (share.leaf(), KEY_DECRYPT),
+        (share.h.content_resource.to_string(), "tinycloud.kv/del"),
+    ] {
+        attenuation.with_action(
+            resource.parse()?,
+            ability.parse::<Ability>()?,
+            [std::collections::BTreeMap::<String, Value>::new()],
+        );
+    }
+    let body = share.body();
+    let mut facts = body.clone();
+    facts
+        .as_object_mut()
+        .unwrap()
+        .remove("encryptedSymmetricKey");
+    facts.as_object_mut().unwrap().remove("receiverPublicKey");
+    facts["bodyHash"] = json!(canonical_hash(&body));
+    let Signer::Key { jwk, vm, .. } = &share.h.holder else {
+        unreachable!()
+    };
+    let at = now();
+    let authorization = Payload {
+        issuer: vm.parse()?,
+        audience: share.h.node_did().parse()?,
+        not_before: Some(NumericDate::try_from_seconds(at.unix_timestamp() as f64)?),
+        expiration: NumericDate::try_from_seconds(
+            (at + Duration::seconds(30)).unix_timestamp() as f64
+        )?,
+        nonce: Some(unique("tc2192mixeddecrypt")),
+        facts: Some(vec![facts]),
+        proof: vec![session_cid(&share.session)?, delete_grant.parse()?],
+        attenuation,
+    }
+    .sign(Algorithm::EdDSA, jwk)?
+    .encode()?;
+    let (status, response, _) = answer(
+        share
+            .h
+            .client
+            .post(format!("/encryption/networks/{}/decrypt", share.h.network))
+            .header(ContentType::JSON)
+            .header(Header::new("Authorization", authorization))
+            .body(body.to_string()),
+    )
+    .await;
+    assert_eq!(status, Status::Forbidden, "{response}");
+    assert_eq!(
+        share.h.read(&share.session).await?,
+        before,
+        "a refused direct decrypt must not execute its bundled KV delete",
+    );
+    Ok(())
+}

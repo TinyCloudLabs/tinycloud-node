@@ -395,6 +395,7 @@ pub(super) struct Registered {
     pub policy_cid: String,
     pub policy_root_cid: String,
     pub enforcement_root_cid: String,
+    pub requested_capabilities: Vec<Value>,
 }
 
 /// Which principal owns the content space, and who owns the policy.
@@ -661,6 +662,15 @@ impl Harness {
     /// registration that predates the refusal. The tests built on it are
     /// about what a stored registration does.
     pub async fn register(&self, root: Window) -> anyhow::Result<(Status, String, Registered)> {
+        self.register_with(root, |_| {}).await
+    }
+
+    /// Register after configuring the source and ceiling, before signing either.
+    pub async fn register_with(
+        &self,
+        root: Window,
+        configure: impl FnOnce(&mut Value),
+    ) -> anyhow::Result<(Status, String, Registered)> {
         let owner_did = self.owner.did().to_owned();
         let projection = self.vector["policyProjection"].clone();
         let created = (now() - Duration::seconds(60)).min(root.not_before);
@@ -699,6 +709,9 @@ impl Harness {
             "credentialRequirement": projection,
             "signature": {"suite": "Ed25519", "signerDid": owner_did, "value": ""}
         });
+        configure(&mut policy);
+        let mut requested_capabilities = self.requested();
+        requested_capabilities[1]["resource"] = policy["capabilityCeiling"][1]["resource"].clone();
         let mut unsigned = policy.clone();
         unsigned.as_object_mut().unwrap().remove("policyId");
         unsigned.as_object_mut().unwrap().remove("signature");
@@ -818,6 +831,7 @@ impl Harness {
                 policy_cid,
                 policy_root_cid,
                 enforcement_root_cid,
+                requested_capabilities,
             },
         ))
     }
@@ -838,7 +852,7 @@ impl Harness {
                 json!({
                     "policyCid": policy.policy_cid,
                     "recipientDid": self.holder.did(),
-                    "requestedCapabilities": self.requested(),
+                    "requestedCapabilities": policy.requested_capabilities,
                 })
                 .to_string(),
             )
@@ -933,7 +947,7 @@ impl Harness {
             "credentialDigest": encode_config(Sha256::digest(compact.as_bytes()), URL_SAFE_NO_PAD),
             "requirementDigest": self.vector["requirementDigest"],
             "descriptorDigest": self.vector["policyProjection"]["descriptorDigest"],
-            "requestedCapabilities": self.requested(),
+            "requestedCapabilities": policy.requested_capabilities,
             "issuedAt": format_time(OffsetDateTime::now_utc()),
             "expiresAt": format_time(OffsetDateTime::now_utc() + Duration::seconds(45)),
             "signature": {"suite": "Ed25519", "signerDid": holder, "value": ""}
