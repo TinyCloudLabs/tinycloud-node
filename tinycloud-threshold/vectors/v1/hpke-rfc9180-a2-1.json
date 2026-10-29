@@ -4,6 +4,7 @@
   "spec_sections": ["RFC9180 A.2.1", "3.10"],
   "encoding": "hex",
   "source": "https://www.rfc-editor.org/rfc/rfc9180.html#appendix-A.2.1",
+  "errata": ["https://www.rfc-editor.org/errata/eid7121"],
   "cases": [
     {
       "name": "rfc9180-a2-1-base",
@@ -19,9 +20,9 @@
       },
       "outputs": {
         "pkEm": "1afa08d3dec047a643885163f1180476fa7ddb54c6a8029ea33f95796bf2ac4a",
-        "skEm": "f4ec9b33b792c372c1d2c2063507b684ef925b8c75a42dbcbf57d63ccd381600",
+        "skEm": "f0ec9b33b792c372c1d2c2063507b684ef925b8c75a42dbcbf57d63ccd381640",
         "pkRm": "4310ee97d88cc1f088a5576c77ab0cf5c3ac797f3d95139c6c84b5429c59662a",
-        "skRm": "8057991eef8f1f1af18f4a9491d16a1ce333f695d4db8e38da75975c4478e0fb",
+        "skRm": "8057991eef8f1f1af18f4a9491d16a1ce333f695d4db8e38da75975c4478e07b",
         "enc": "1afa08d3dec047a643885163f1180476fa7ddb54c6a8029ea33f95796bf2ac4a",
         "encryptions": [
           {

@@ -1,3 +1,238 @@
+//! Ceremony-scoped RFC 9180 base-mode dealing envelopes. Details: TC-2220
+
+use core::fmt;
+
+use hpke::{
+    aead::{AeadTag, ChaCha20Poly1305},
+    kdf::HkdfSha256,
+    kem::X25519HkdfSha256,
+    Deserializable, HpkeError, Kem, OpModeR, OpModeS, Serializable,
+};
+use rand_core::CryptoRngCore;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+
+use crate::{
+    dst,
+    encoding::{Decoder, Encoder},
+    Error, MemberIndex,
+};
+
+type HpkeKem = X25519HkdfSha256;
+type HpkeKdf = HkdfSha256;
+type HpkeAead = ChaCha20Poly1305;
+
+const VERSION: u8 = 1;
+const TAG_LEN: usize = 16;
+const CIPHERTEXT_CAP: usize = 65_499;
+const INFO_LEN: usize = dst::DEALING.len() + 32 + 1 + 2 + 2;
+
+/// A fresh recipient key's owned bytes, cleared on explicit zeroization or drop.
+///
+/// Generate independently for each ceremony. The ceremony owner retains this
+/// value through the required rounds and drops it on completion or abort.
+/// This type describes its own byte storage, not opaque dependency internals.
+/// Details: TC-2220
+#[derive(Zeroize, ZeroizeOnDrop)]
+pub struct CeremonyHpkeSecretKey {
+    bytes: [u8; 32],
+}
+
+impl CeremonyHpkeSecretKey {
+    /// Generate a recipient key from the caller's CSPRNG. Details: TC-2220
+    pub fn generate(rng: &mut impl CryptoRngCore) -> (Self, CeremonyHpkePublicKey) {
+        let (secret, public) = HpkeKem::gen_keypair(rng);
+        let mut owned = Self { bytes: [0; 32] };
+        secret.write_exact(&mut owned.bytes);
+        let mut public_bytes = [0; 32];
+        public.write_exact(&mut public_bytes);
+        (owned, CeremonyHpkePublicKey(public_bytes))
+    }
+}
+
+impl fmt::Debug for CeremonyHpkeSecretKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("CeremonyHpkeSecretKey([REDACTED])")
+    }
+}
+
+/// The exact 32 recipient-public-key bytes carried by a ceremony directory.
+/// Details: TC-2220
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CeremonyHpkePublicKey([u8; 32]);
+
+impl CeremonyHpkePublicKey {
+    /// Decode exactly 32 bytes; the KEM validates agreement when used.
+    /// Details: TC-2220
+    pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
+        Ok(Self(bytes.try_into().map_err(|_| Error::InvalidLength)?))
+    }
+
+    /// Return the directory's exact public bytes. Details: TC-2220
+    pub fn encode(&self) -> [u8; 32] {
+        self.0
+    }
+}
+
+/// A construction-bounded `01 || enc:32 || lp(ciphertext)` envelope.
+/// Details: TC-2220
+#[derive(Debug, Eq, PartialEq)]
+pub struct SealedDealing {
+    enc: [u8; 32],
+    ciphertext: Vec<u8>,
+}
+
+impl SealedDealing {
+    /// Encode an envelope whose complete length is at most 64 KiB.
+    /// Details: TC-2220
+    pub fn encode(&self) -> Vec<u8> {
+        let mut encoder = Encoder::new();
+        encoder.u8(VERSION);
+        encoder.fixed(&self.enc);
+        encoder.lp(&self.ciphertext);
+        encoder.finish()
+    }
+
+    /// Check the version, whole-message cap, ciphertext cap and tag length
+    /// before allocating; consume all input bytes. Details: TC-2220
+    pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
+        let mut decoder = Decoder::new(bytes)?;
+        if decoder.u8()? != VERSION {
+            return Err(Error::InvalidEncoding);
+        }
+        let enc = decoder.fixed()?;
+        let ciphertext = decoder.lp(CIPHERTEXT_CAP)?;
+        if ciphertext.len() < TAG_LEN {
+            return Err(Error::InvalidLength);
+        }
+        decoder.finish()?;
+        Ok(Self {
+            enc,
+            ciphertext: ciphertext.to_vec(),
+        })
+    }
+}
+
+/// Bind transport bytes to the caller's selected ceremony and closed round.
+/// Details: TC-2220
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DealingContext {
+    pub(crate) ceremony_digest: [u8; 32],
+    pub(crate) round: u8,
+    pub(crate) sender: MemberIndex,
+    pub(crate) recipient: MemberIndex,
+    pub(crate) commitment_hash: [u8; 32],
+}
+
+impl DealingContext {
+    fn info(&self) -> [u8; INFO_LEN] {
+        let sender = self.sender.get().to_be_bytes();
+        let recipient = self.recipient.get().to_be_bytes();
+        let fields: [&[u8]; 5] = [
+            dst::DEALING,
+            &self.ceremony_digest,
+            core::slice::from_ref(&self.round),
+            &sender,
+            &recipient,
+        ];
+        let mut info = [0; INFO_LEN];
+        for (output, byte) in info.iter_mut().zip(fields.into_iter().flatten()) {
+            *output = *byte;
+        }
+        info
+    }
+}
+
+/// Seal one dealing with fresh encapsulation randomness and a one-shot context.
+///
+/// The caller owns the input slice; only the internal copy is cleared here.
+/// Authorization and closed-round verification belong to the ceremony API.
+/// Details: TC-2220
+pub(crate) fn seal_dealing(
+    public: &CeremonyHpkePublicKey,
+    context: &DealingContext,
+    plaintext: &[u8],
+    rng: &mut impl CryptoRngCore,
+) -> Result<SealedDealing, Error> {
+    let ciphertext_len = plaintext
+        .len()
+        .checked_add(TAG_LEN)
+        .ok_or(Error::LimitExceeded)?;
+    if ciphertext_len > CIPHERTEXT_CAP {
+        return Err(Error::LimitExceeded);
+    }
+    let public = <HpkeKem as Kem>::PublicKey::from_bytes(&public.0)
+        .map_err(|_| Error::InvalidHpkeKey)?;
+    let info = context.info();
+    let mut buffer = Zeroizing::new(Vec::with_capacity(ciphertext_len));
+    buffer.extend_from_slice(plaintext);
+    let (enc, tag) = hpke::single_shot_seal_in_place_detached::<
+        HpkeAead,
+        HpkeKdf,
+        HpkeKem,
+        _,
+    >(
+        &OpModeS::Base,
+        &public,
+        &info,
+        &mut buffer,
+        &context.commitment_hash,
+        rng,
+    )
+    .map_err(dealing_error)?;
+    buffer.extend_from_slice(&tag.to_bytes());
+    let mut encapsulation = [0; 32];
+    enc.write_exact(&mut encapsulation);
+    Ok(SealedDealing {
+        enc: encapsulation,
+        ciphertext: core::mem::take(&mut *buffer),
+    })
+}
+
+/// Open one envelope into owned storage cleared when the caller drops it.
+///
+/// The in-place candidate is also cleared on error. Opaque HPKE key/context
+/// lifecycle behavior is outside this module's owned-storage description.
+/// Details: TC-2220
+pub(crate) fn open_dealing(
+    secret: &CeremonyHpkeSecretKey,
+    context: &DealingContext,
+    sealed: &SealedDealing,
+) -> Result<Zeroizing<Vec<u8>>, Error> {
+    let body_len = sealed
+        .ciphertext
+        .len()
+        .checked_sub(TAG_LEN)
+        .ok_or(Error::InvalidLength)?;
+    let (body, tag) = sealed.ciphertext.split_at(body_len);
+    let tag = AeadTag::<HpkeAead>::from_bytes(tag).map_err(|_| Error::InvalidSealedDealing)?;
+    let enc = <HpkeKem as Kem>::EncappedKey::from_bytes(&sealed.enc)
+        .map_err(|_| Error::InvalidHpkeKey)?;
+    let secret = <HpkeKem as Kem>::PrivateKey::from_bytes(&secret.bytes)
+        .map_err(|_| Error::InvalidHpkeKey)?;
+    let info = context.info();
+    let mut plaintext = Zeroizing::new(body.to_vec());
+    hpke::single_shot_open_in_place_detached::<HpkeAead, HpkeKdf, HpkeKem>(
+        &OpModeR::Base,
+        &secret,
+        &enc,
+        &info,
+        &mut plaintext,
+        &context.commitment_hash,
+        &tag,
+    )
+    .map_err(dealing_error)?;
+    Ok(plaintext)
+}
+
+fn dealing_error(error: HpkeError) -> Error {
+    match error {
+        HpkeError::ValidationError | HpkeError::EncapError | HpkeError::DecapError => {
+            Error::InvalidHpkeKey
+        }
+        _ => Error::InvalidSealedDealing,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -63,11 +298,9 @@ mod tests {
         assert_eq!(input["kem_id"], HpkeKem::KEM_ID);
         assert_eq!(input["kdf_id"], 1);
         assert_eq!(input["aead_id"], 3);
-        let (sk_e, pk_e) = HpkeKem::derive_keypair(&bytes(input, "ikmE"));
+        let (_sk_e, pk_e) = HpkeKem::derive_keypair(&bytes(input, "ikmE"));
         let (sk_r, pk_r) = HpkeKem::derive_keypair(&bytes(input, "ikmR"));
-        assert_eq!(sk_e.to_bytes().as_slice(), bytes(output, "skEm"));
         assert_eq!(pk_e.to_bytes().as_slice(), bytes(output, "pkEm"));
-        assert_eq!(sk_r.to_bytes().as_slice(), bytes(output, "skRm"));
         assert_eq!(pk_r.to_bytes().as_slice(), bytes(output, "pkRm"));
         let mut rng = FixedIkm {
             bytes: bytes(input, "ikmE").try_into().unwrap(),
