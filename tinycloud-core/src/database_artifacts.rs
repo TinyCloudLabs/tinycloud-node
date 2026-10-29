@@ -3,7 +3,7 @@ use sea_orm::{
     sea_query::{Expr, Func},
     ActiveModelTrait,
     ActiveValue::Set,
-    ColumnTrait, DbErr, EntityTrait, QueryFilter, QuerySelect,
+    ColumnTrait, DbErr, EntityTrait, QueryFilter, QuerySelect, SqlErr,
 };
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
@@ -72,8 +72,8 @@ impl ArtifactExpectation {
     }
 
     /// Reject before touching durable state when the base is already known to
-    /// differ. The atomic check is the `WHERE` clause on the update itself;
-    /// this only turns the common case into a precise error.
+    /// differ. The atomic check is the update's `WHERE` clause or, for `Absent`,
+    /// the create's primary key. Details: TC-2214
     fn check(&self, existing: Option<(i64, &str)>) -> Result<(), DatabaseArtifactError> {
         let conflict = match (self, existing) {
             (Self::Any, _) => false,
@@ -953,27 +953,33 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         } else {
             BulkScope::Pool(self.conn.clone())
         };
-        // Only the metadata the CAS and the shrink warning need: reading the
-        // stored checkpoint back would move it a second time.
-        let existing = database_artifact::Entity::find_by_id((
-            service.to_string(),
-            space.to_string(),
-            name.to_string(),
-        ))
-        .select_only()
-        .column(database_artifact::Column::Revision)
-        .column(database_artifact::Column::SizeBytes)
-        .column(database_artifact::Column::CheckpointContentHash)
-        .into_tuple::<(i64, i64, String)>()
-        .one(&scope)
-        .await?
-        .map(
-            |(revision, size_bytes, checkpoint_content_hash)| CurrentArtifact {
-                revision,
-                size_bytes,
-                checkpoint_content_hash,
-            },
-        );
+        // For Absent, the primary key on the create below asserts absence
+        // atomically. Details: TC-2214
+        let existing = if expected == ArtifactExpectation::Absent {
+            None
+        } else {
+            // Only the metadata the CAS and the shrink warning need: reading the
+            // stored checkpoint back would move it a second time.
+            database_artifact::Entity::find_by_id((
+                service.to_string(),
+                space.to_string(),
+                name.to_string(),
+            ))
+            .select_only()
+            .column(database_artifact::Column::Revision)
+            .column(database_artifact::Column::SizeBytes)
+            .column(database_artifact::Column::CheckpointContentHash)
+            .into_tuple::<(i64, i64, String)>()
+            .one(&scope)
+            .await?
+            .map(
+                |(revision, size_bytes, checkpoint_content_hash)| CurrentArtifact {
+                    revision,
+                    size_bytes,
+                    checkpoint_content_hash,
+                },
+            )
+        };
 
         expected.check(
             existing
@@ -1100,7 +1106,19 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
                     delta_size_bytes: Set(0),
                 }
                 .insert(&scope)
-                .await?;
+                .await
+                .map_err(|error| {
+                    // For this table the composite primary key is the only unique
+                    // constraint; translate a unique violation only for this Absent
+                    // INSERT. Details: TC-2214
+                    if expected == ArtifactExpectation::Absent
+                        && matches!(error.sql_err(), Some(SqlErr::UniqueConstraintViolation(_)))
+                    {
+                        DatabaseArtifactError::StaleLineage
+                    } else {
+                        error.into()
+                    }
+                })?;
             }
         }
 
@@ -1449,6 +1467,172 @@ mod tests {
             .unwrap();
         assert_eq!(loaded.revision, 1);
         assert_eq!(loaded.payload, vec![1; 4096]);
+    }
+
+    #[tokio::test]
+    async fn postgres_absent_create_refuses_an_existing_or_racing_row() {
+        use sea_orm::{ConnectionTrait, DbBackend, Statement, TransactionTrait};
+        use std::time::Duration;
+
+        let Some(fixture) = crate::test_support::PostgresTestSchema::migrated_through(
+            "postgres_absent_create_refuses_an_existing_or_racing_row",
+            None,
+        )
+        .await
+        else {
+            return;
+        };
+        let repo = SeaOrmDatabaseArtifactRepository::new(fixture.conn.clone());
+        let competitor = fixture.connect(1).await;
+        let tx = competitor.begin().await.unwrap();
+        let pid: i32 = tx
+            .query_one(Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT pg_backend_pid()",
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get_by_index(0)
+            .unwrap();
+        let payload = vec![7; 4096];
+        let content_hash = hash(&payload).to_cid(0x55).to_string();
+        let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
+        let winner = database_artifact::ActiveModel {
+            service: Set("sql".to_string()),
+            space: Set("space".to_string()),
+            name: Set("main".to_string()),
+            revision: Set(1),
+            content_hash: Set(content_hash.clone()),
+            payload: Set(payload.clone()),
+            size_bytes: Set(payload.len() as i64),
+            backend: Set("storage.database".to_string()),
+            storage_mode: Set("database-blob".to_string()),
+            created_at: Set(now.clone()),
+            updated_at: Set(now),
+            checkpoint_size_bytes: Set(payload.len() as i64),
+            checkpoint_content_hash: Set(content_hash),
+            delta_payload: Set(None),
+            delta_content_hash: Set(None),
+            delta_size_bytes: Set(0),
+        }
+        .insert(&tx)
+        .await
+        .unwrap();
+        let saver = repo.clone();
+        let mut save = tokio::spawn(async move {
+            saver
+                .save(
+                    "sql",
+                    "space",
+                    "main",
+                    vec![0; 8],
+                    ArtifactExpectation::Absent,
+                )
+                .await
+        });
+        let blocked = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if fixture
+                    .conn
+                    .query_one(Statement::from_sql_and_values(
+                        DbBackend::Postgres,
+                        "SELECT pid FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
+                        [pid.into()],
+                    ))
+                    .await?
+                    .is_some()
+                {
+                    return Ok::<_, DbErr>(());
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        let committed = tx.commit().await;
+        let result = tokio::time::timeout(Duration::from_secs(10), &mut save).await;
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                save.abort();
+                let _ = save.await;
+                panic!("artifact save did not finish after competitor release: {error}");
+            }
+        };
+        committed.unwrap();
+        blocked
+            .expect("save must wait for the uncommitted creator")
+            .unwrap();
+        let result = result.unwrap();
+        assert!(
+            matches!(result, Err(DatabaseArtifactError::StaleLineage)),
+            "expected StaleLineage after the competing create committed, got {result:?}"
+        );
+        let stored = database_artifact::Entity::find_by_id((
+            "sql".to_string(),
+            "space".to_string(),
+            "main".to_string(),
+        ))
+        .one(&fixture.conn)
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(stored, winner);
+        let loaded = repo
+            .read_all("sql", "space", "main")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.revision, 1);
+        assert_eq!(loaded.payload, payload);
+        assert_eq!(
+            repo.load_meta("sql", "space", "main")
+                .await
+                .unwrap()
+                .unwrap(),
+            ArtifactMeta {
+                revision: winner.revision,
+                size_bytes: winner.size_bytes,
+                content_hash: winner.content_hash,
+                checkpoint_content_hash: winner.checkpoint_content_hash,
+                checkpoint_size_bytes: winner.checkpoint_size_bytes,
+                delta_content_hash: winner.delta_content_hash,
+                delta_size_bytes: winner.delta_size_bytes,
+                updated_at: winner.updated_at,
+                storage_mode: winner.storage_mode,
+                backend: winner.backend,
+            }
+        );
+
+        repo.save("sql", "space", "empty", vec![], ArtifactExpectation::Any)
+            .await
+            .unwrap();
+        let empty_before = repo.load_meta("sql", "space", "empty").await.unwrap();
+        let result = repo
+            .save(
+                "sql",
+                "space",
+                "empty",
+                vec![9; 8],
+                ArtifactExpectation::Absent,
+            )
+            .await;
+        assert!(
+            matches!(result, Err(DatabaseArtifactError::StaleLineage)),
+            "expected StaleLineage for an existing zero-byte row, got {result:?}"
+        );
+        assert_eq!(
+            repo.load_meta("sql", "space", "empty").await.unwrap(),
+            empty_before
+        );
+        let empty = repo
+            .read_all("sql", "space", "empty")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(empty.revision, 1);
+        assert_eq!(empty.payload, Vec::<u8>::new());
+        competitor.close().await.unwrap();
     }
 
     #[tokio::test]
