@@ -8805,7 +8805,7 @@ mod tests {
 
     #[tokio::test]
     async fn policy_v2_admits_v3_account_and_v4_accountless_receivers() -> anyhow::Result<()> {
-        run_policy_v2_flow(PolicyOwner::SpaceOwner).await
+        Box::pin(run_policy_v2_flow(PolicyOwner::SpaceOwner)).await
     }
 
     /// The real Share and CLI shape: the policy owner is a session key the
@@ -8813,7 +8813,7 @@ mod tests {
     /// space owner revokes that delegation, no new session can be minted.
     #[tokio::test]
     async fn policy_owner_may_be_a_session_the_space_owner_delegated_to() -> anyhow::Result<()> {
-        run_policy_v2_flow(PolicyOwner::DelegatedSession).await
+        Box::pin(run_policy_v2_flow(PolicyOwner::DelegatedSession)).await
     }
 
     /// The policy owner signs a valid, self-consistent policy over content in
@@ -8821,7 +8821,7 @@ mod tests {
     /// Registration must refuse it, so no session can ever read the bytes.
     #[tokio::test]
     async fn policy_registration_requires_the_owner_to_hold_what_it_grants() -> anyhow::Result<()> {
-        run_policy_v2_flow(PolicyOwner::Unauthorized).await
+        Box::pin(run_policy_v2_flow(PolicyOwner::Unauthorized)).await
     }
 
     #[derive(Clone, Copy, PartialEq, Eq)]

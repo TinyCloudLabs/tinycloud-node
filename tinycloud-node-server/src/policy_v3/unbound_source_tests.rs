@@ -5,12 +5,15 @@
 //! nothing. A registration that is already stored keeps validating, so links
 //! minted before the refusal still open.
 
+use super::named_keys_gate_tests::ShareDecrypt;
 use super::test_harness::*;
 use super::*;
 use serde_json::json;
 
 const KEY_PATH_REQUIRED: &str = "content-source-key-path-required";
-const KEY_DIGEST_REQUIRED: &str = "content-source-key-digest-required";
+/// What the registration's own validation answers for a path-bound source
+/// without its key digest, before the new-registration check runs.
+const CONTENT_SOURCE_INVALID: &str = "content-source-invalid";
 const KV_GET: &str = "tinycloud.kv/get";
 const DECRYPT: &str = "tinycloud.encryption/decrypt";
 
@@ -174,14 +177,14 @@ async fn unbound_content_sources_are_refused_and_nothing_is_stored(
 
     // [c] An immutable source bound to its key path, without the key digest.
     let outcome = h.register_source(policy_window(), bound, &leaf).await?;
-    assert_refused_and_unstored(&h, outcome, KEY_DIGEST_REQUIRED, before).await
+    assert_refused_and_unstored(&h, outcome, CONTENT_SOURCE_INVALID, before).await
 }
 on_both_backends!(unbound_content_sources_are_refused_and_nothing_is_stored);
 
 /// A registration stored before the refusal keeps opening: the same pathless
 /// source is refused as a new registration, and once stored it answers a
-/// challenge, mints, reads, passes the decrypt gate, and a replay of the
-/// identical registration is still accepted.
+/// challenge, mints, reads, and a replay of the identical registration is
+/// still accepted.
 async fn a_stored_legacy_registration_still_opens(backend: Backend) -> anyhow::Result<()> {
     let Some((h, _ledger)) = boot(backend, "a_stored_legacy_registration_still_opens").await?
     else {
@@ -215,11 +218,6 @@ async fn a_stored_legacy_registration_still_opens(backend: Backend) -> anyhow::R
         (status, text(&content)),
         (Status::Ok, "tc-1423-content".to_owned())
     );
-    // The decrypt route admits the invocation (a policy refusal would be a
-    // `403` naming the policy); it stops at the empty request body.
-    let (status, answer) = h.decrypt(&session).await?;
-    assert_ne!(status, Status::Unauthorized, "{answer}");
-    assert!(!answer.contains("policy"), "{answer}");
 
     let replay = h
         .client
@@ -305,7 +303,7 @@ async fn a_path_bound_mutable_source_without_the_key_digest_is_refused(
     grant_owner_key(&h, &leaf).await?;
     let before = h.stored_rows().await?;
     let outcome = h.register_source(policy_window(), source, &leaf).await?;
-    assert_refused_and_unstored(&h, outcome, KEY_DIGEST_REQUIRED, before).await
+    assert_refused_and_unstored(&h, outcome, CONTENT_SOURCE_INVALID, before).await
 }
 on_both_backends!(a_path_bound_mutable_source_without_the_key_digest_is_refused);
 
@@ -332,7 +330,7 @@ async fn a_non_email_target_is_refused_the_same_way(backend: Backend) -> anyhow:
     for (source, decrypt, reason) in [
         (pathless, network.as_str(), KEY_PATH_REQUIRED),
         (mutable, network.as_str(), KEY_PATH_REQUIRED),
-        (no_digest, no_digest_leaf.as_str(), KEY_DIGEST_REQUIRED),
+        (no_digest, no_digest_leaf.as_str(), CONTENT_SOURCE_INVALID),
     ] {
         let outcome = h
             .register_source_for(policy_window(), source, decrypt, requirement.clone())
@@ -348,3 +346,23 @@ async fn a_non_email_target_is_refused_the_same_way(backend: Backend) -> anyhow:
     Ok(())
 }
 on_both_backends!(a_non_email_target_is_refused_the_same_way);
+
+/// A registration stored before the refusal still decrypts: a legacy pathless
+/// Share source opens through `/invoke` with a well-formed decrypt body, while
+/// the same shape is refused as a new registration.
+#[tokio::test]
+async fn a_stored_legacy_registration_still_decrypts() -> anyhow::Result<()> {
+    let share = ShareDecrypt::with_source(None, "immutable").await?;
+    let h = &share.h;
+    let network = h.network.clone();
+    let source = content_source(h, &network, "immutable", None, Some(&"aa".repeat(32)));
+    let before = h.stored_rows().await?;
+    let outcome = h.register_source(policy_window(), source, &network).await?;
+    assert_refused_and_unstored(h, outcome, KEY_PATH_REQUIRED, before).await?;
+
+    let (status, response) = share
+        .invoke(&share.leaf(), &share.body(), None, Value::Null)
+        .await?;
+    assert_eq!(status, Status::Ok, "{response}");
+    Ok(())
+}

@@ -657,10 +657,7 @@ impl Harness {
     }
 
     /// Register a policy over the content whose roots span `root`, signed
-    /// by the policy owner. TC-2242: the policy has no `encryptionKeyPath`, a
-    /// shape the route refuses for a new registration, so it is stored as a
-    /// registration that predates the refusal. The tests built on it are
-    /// about what a stored registration does.
+    /// by the policy owner.
     pub async fn register(&self, root: Window) -> anyhow::Result<(Status, String, Registered)> {
         self.register_with(root, |_| {}).await
     }
@@ -822,8 +819,19 @@ impl Harness {
             "nativeProjectionHashHex": projections.native_projection_hash_hex,
             "attestedEnforcerBinding": binding,
         });
-        let stored = Self::store_registration_on(&self.client, registration).await?;
-        let (status, body) = (Status::Ok, serde_json::to_string(&stored)?);
+        // TC-2242: the route refuses a source without `encryptionKeyPath` for a
+        // new registration. The tests that register one are about what a
+        // stored registration does, so it is stored as one; path-bound
+        // sources still go through the route.
+        let (status, body) = if registration["policy"]["contentSource"]
+            .get("encryptionKeyPath")
+            .is_none()
+        {
+            let stored = Self::store_registration_on(&self.client, registration).await?;
+            (Status::Ok, serde_json::to_string(&stored)?)
+        } else {
+            self.post_registration(registration).await
+        };
         Ok((
             status,
             body,
@@ -1375,8 +1383,17 @@ impl Harness {
                 .digest(&canonical_json_value(&policy)),
         )
         .to_string();
+        // A source the registration's own validation refuses (such as a
+        // path-bound one without its digest) has no projections. The route
+        // refuses it before it reads these fields, so placeholders stand in
+        // and the request still reaches that refusal.
         let projections =
-            registration_projections(&policy).map_err(|(_, error)| anyhow::anyhow!(error))?;
+            registration_projections(&policy).unwrap_or_else(|_| RegistrationProjections {
+                content_source_digest_hex: "00".repeat(32),
+                capability_ceiling_hash_hex: "00".repeat(32),
+                native_projection_hash_hex: "00".repeat(32),
+                attenuation: json!({}),
+            });
         let digest = policy_digest_hex(&policy).map_err(|(_, error)| anyhow::anyhow!(error))?;
         let common = json!({
             "ownerDid": owner_did,
@@ -1472,6 +1489,11 @@ impl Harness {
                 policy_cid,
                 policy_root_cid,
                 enforcement_root_cid,
+                requested_capabilities: {
+                    let mut requested = self.requested();
+                    requested[1]["resource"] = json!(decrypt_resource);
+                    requested
+                },
             },
         ))
     }
