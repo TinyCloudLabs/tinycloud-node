@@ -2,14 +2,17 @@
 
 ## [Unreleased]
 
+## [1.25.13] - 2026-10-29
+
 ### Changes
-- Hook SSE subscriptions emit an authorized `ready` control event and close after broadcast lag. Successful SQL and DuckDB writes publish notifications keyed by the signed invocation CID; reads and failed writes emit none, and webhook enqueue remains independent. Details: TC-2207
-- Fresh SQL artifacts use a full checkpoint directly instead of attempting an unavailable WAL-delta update. Details: TC-2207
+- Sign-in makes 71 database round trips instead of 73: the node now creates missing database artifacts directly. Details: TC-2214
 
 ## [1.25.12] - 2026-10-29
 
 ### Changes
 - Version bump for Node hooks and SQL notification improvements. Details: TC-2207
+- Hook SSE subscriptions emit an authorized `ready` control event and close after broadcast lag. Successful SQL and DuckDB writes publish notifications keyed by the signed invocation CID; reads and failed writes emit none, and webhook enqueue remains independent. Details: TC-2207
+- Fresh SQL artifacts use a full checkpoint directly instead of attempting an unavailable WAL-delta update. Details: TC-2207
 
 ## [1.25.11] - 2026-10-28
 
