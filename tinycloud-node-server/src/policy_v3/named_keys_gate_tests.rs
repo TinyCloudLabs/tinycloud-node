@@ -866,6 +866,13 @@ on_both_backends!(siwe_app_grants_need_an_https_or_absent_scheme);
 
 const TC2192_KEY_PATH: &str = "share/tc-2192";
 
+#[derive(Clone, Copy)]
+enum SourceDigest {
+    RawWrappedBytes,
+    LegacyWire,
+    Missing,
+}
+
 struct ShareDecrypt {
     h: Harness,
     session: String,
@@ -882,8 +889,21 @@ impl ShareDecrypt {
     }
 
     async fn with_source(key_path: Option<&'static str>, mode: &str) -> anyhow::Result<Self> {
+        let digest_format = if key_path.is_some() {
+            SourceDigest::RawWrappedBytes
+        } else {
+            SourceDigest::LegacyWire
+        };
+        Self::with_source_digest(key_path, mode, digest_format).await
+    }
+
+    async fn with_source_digest(
+        key_path: Option<&'static str>,
+        mode: &str,
+        digest_format: SourceDigest,
+    ) -> anyhow::Result<Self> {
         use tinycloud_core::encryption_network::{
-            backend::wrap_to_public_key, key_id::KeyLocation,
+            backend::wrap_to_public_key, canonical::canonical_hash, key_id::KeyLocation,
         };
         let ledger = tempfile::tempdir()?;
         let mut h = Harness::new_with(Backend::Sqlite, Shape::KeySession, "tc2192", |config| {
@@ -926,8 +946,24 @@ impl ShareDecrypt {
                 if let Some(path) = key_path {
                     policy["contentSource"]["encryptionKeyPath"] = json!(path);
                 }
-                policy["contentSource"]["encryptedSymmetricKeyDigestHex"] =
-                    json!(hex::encode(Sha256::digest(&wrapped)));
+                let digest = match digest_format {
+                    SourceDigest::RawWrappedBytes => Some(hex::encode(Sha256::digest(&wrapped))),
+                    SourceDigest::LegacyWire => {
+                        Some(canonical_hash(&json!(base64::encode(&wrapped))))
+                    }
+                    SourceDigest::Missing => None,
+                };
+                match digest {
+                    Some(digest) => {
+                        policy["contentSource"]["encryptedSymmetricKeyDigestHex"] = json!(digest);
+                    }
+                    None => {
+                        policy["contentSource"]
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("encryptedSymmetricKeyDigestHex");
+                    }
+                }
                 policy["capabilityCeiling"][1]["resource"] = json!(leaf);
             })
             .await?;
@@ -1042,6 +1078,50 @@ impl ShareDecrypt {
             None => self.h.network.clone(),
         }
     }
+}
+
+#[tokio::test]
+async fn tc2192_legacy_immutable_share_decrypt_uses_signed_wire_digest() -> anyhow::Result<()> {
+    use tinycloud_core::encryption_network::{
+        backend::wrap_to_public_key, canonical::canonical_hash,
+    };
+    let share = ShareDecrypt::with_source(None, "immutable").await?;
+    let original = share.body();
+    let (status, response) = share
+        .invoke(&share.leaf(), &original, None, Value::Null)
+        .await?;
+    assert_eq!(status, Status::Ok, "{response}");
+    let response: Value = serde_json::from_str(&response)?;
+    let wrapped = base64::decode(response["wrappedKey"].as_str().unwrap())?;
+    let (ephemeral, sealed) = wrapped.split_at(32);
+    let peer = x25519_dalek::PublicKey::from(<[u8; 32]>::try_from(ephemeral)?);
+    let shared = share.receiver.diffie_hellman(&peer);
+    assert_eq!(
+        tinycloud_core::encryption::ColumnEncryption::new(*shared.as_bytes())
+            .decrypt_strict(sealed)?,
+        vec![0xCD; 32],
+    );
+
+    let other = wrap_to_public_key(&share.public_key, &[0xEF; 32])?;
+    let mut changed = original;
+    changed["encryptedSymmetricKey"] = json!(base64::encode(&other));
+    changed["encryptedSymmetricKeyHash"] = json!(canonical_hash(&changed["encryptedSymmetricKey"]));
+    let (status, response) = share
+        .invoke(&share.leaf(), &changed, None, Value::Null)
+        .await?;
+    assert_eq!(status, Status::Forbidden, "{response}");
+    assert_eq!(response, "policy-decrypt-content-source-mismatch");
+    Ok(())
+}
+
+#[tokio::test]
+async fn tc2192_legacy_immutable_source_without_digest_remains_compatible() -> anyhow::Result<()> {
+    let share = ShareDecrypt::with_source_digest(None, "immutable", SourceDigest::Missing).await?;
+    let (status, response) = share
+        .invoke(&share.leaf(), &share.body(), None, Value::Null)
+        .await?;
+    assert_eq!(status, Status::Ok, "{response}");
+    Ok(())
 }
 
 #[tokio::test]

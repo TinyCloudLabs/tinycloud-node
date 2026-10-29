@@ -944,27 +944,41 @@ fn validate_registered_decrypt_source(
     {
         return Err(MISMATCH);
     }
-    // Every path-scoped Share binds its registered key, including mutable
-    // content. Legacy sources retain their existing mode-dependent behavior.
-    if key_path.is_some() || source.get("mode").and_then(Value::as_str) == Some("immutable") {
+    // Path-scoped shares bind raw wrapped bytes and always require a digest.
+    // Legacy immutable sources use the signed wire digest when present; older
+    // digest-less policies retain their prior readable behavior.
+    let immutable = source.get("mode").and_then(Value::as_str) == Some("immutable");
+    if key_path.is_some() || immutable {
         if body.get("keyVersion").and_then(Value::as_u64)
             != source.get("keyVersion").and_then(Value::as_u64)
         {
             return Err(MISMATCH);
         }
-        let digest = source
+        if let Some(digest) = source
             .get("encryptedSymmetricKeyDigestHex")
             .and_then(Value::as_str)
-            .ok_or(MISMATCH)?;
-        let mut expected = [0_u8; 32];
-        hex::decode_to_slice(digest, &mut expected).map_err(|_| MISMATCH)?;
-        let wrapped = base64::decode(
-            body.get("encryptedSymmetricKey")
-                .and_then(Value::as_str)
-                .ok_or(MISMATCH)?,
-        )
-        .map_err(|_| MISMATCH)?;
-        if !bool::from(Sha256::digest(&wrapped)[..].ct_eq(&expected)) {
+        {
+            let mut expected = [0_u8; 32];
+            hex::decode_to_slice(digest, &mut expected).map_err(|_| MISMATCH)?;
+            let actual = if key_path.is_some() {
+                let wrapped = base64::decode(
+                    body.get("encryptedSymmetricKey")
+                        .and_then(Value::as_str)
+                        .ok_or(MISMATCH)?,
+                )
+                .map_err(|_| MISMATCH)?;
+                Sha256::digest(&wrapped)
+            } else {
+                let wrapped = body.get("encryptedSymmetricKey").ok_or(MISMATCH)?;
+                if !wrapped.is_string() {
+                    return Err(MISMATCH);
+                }
+                Sha256::digest(canonical_json_value(wrapped))
+            };
+            if !bool::from(actual[..].ct_eq(&expected)) {
+                return Err(MISMATCH);
+            }
+        } else if key_path.is_some() {
             return Err(MISMATCH);
         }
     }
