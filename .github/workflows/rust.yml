@@ -27,6 +27,44 @@ env:
 # crates for wasm32-unknown-unknown — is now a real, unconditional step in the
 # `build` job.
 jobs:
+  threshold:
+    name: threshold (crate, policy, primitive checker)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_TARGET_DIR: target/threshold
+      PROPTEST_CASES: "1024"
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@1.97.1
+      with:
+        components: clippy, rustfmt
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      with:
+        shared-key: threshold-1.97.1
+        workspaces: . -> target/threshold
+    - name: Run the complete threshold crate suite
+      run: cargo test --locked -p tinycloud-threshold --release
+    - name: Install pinned cargo-deny
+      run: |
+        set -euo pipefail
+        tool_dir="${RUNNER_TEMP}/threshold-cargo-deny"
+        mkdir -p "${tool_dir}"
+        curl --fail --location --silent --show-error \
+          https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz \
+          --output "${tool_dir}/cargo-deny.tar.gz"
+        echo "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f  ${tool_dir}/cargo-deny.tar.gz" | sha256sum --check -
+        tar -xzf "${tool_dir}/cargo-deny.tar.gz" --strip-components=1 -C "${tool_dir}"
+        echo "${tool_dir}" >> "${GITHUB_PATH}"
+    - name: Check threshold dependency policy
+      run: cargo deny --manifest-path tinycloud-threshold/Cargo.toml --locked --config tinycloud-threshold/deny.toml check licenses bans advisories sources
+    - uses: oven-sh/setup-bun@v2
+      with:
+        bun-version: "1.4.4"
+    - name: Run the independent primitive checker
+      working-directory: tinycloud-threshold/vectors/check
+      run: bun install --frozen-lockfile && bun run check
+
   build:
     name: build (workspace)
     runs-on: ubuntu-latest
