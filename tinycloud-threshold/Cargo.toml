@@ -1,0 +1,23 @@
+[package]
+name = "tinycloud-threshold"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.97.1"
+license-file = "../LICENSE.md"
+publish = false
+description = "Context-bound threshold key derivation and identity-based key wrapping"
+
+[dependencies]
+blst = "=0.3.16"
+sha2 = "0.10"
+zeroize = { version = "1.8", features = ["derive"] }
+subtle = "2.6"
+rand_core = "0.6"
+thiserror = "2"
+
+[dev-dependencies]
+proptest = "1.6"
+rand_chacha = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
