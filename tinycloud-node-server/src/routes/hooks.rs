@@ -109,7 +109,7 @@ async fn authorize_hook_request(
     );
     let admitted = admitted?;
     let policy_session = policy_v3
-        .authorize_invocation(tinycloud, &admitted.invocation().0, now)
+        .authorize_invocation(tinycloud, &admitted.invocation().0, None, now)
         .await
         .map_err(|error| (Status::Forbidden, error.to_string()))?;
     Ok(VerifiedHookInvocation {
