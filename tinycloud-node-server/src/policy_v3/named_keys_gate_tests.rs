@@ -873,8 +873,8 @@ enum SourceDigest {
     Missing,
 }
 
-struct ShareDecrypt {
-    h: Harness,
+pub(super) struct ShareDecrypt {
+    pub(super) h: Harness,
     session: String,
     public_key: Vec<u8>,
     wrapped: Vec<u8>,
@@ -888,7 +888,10 @@ impl ShareDecrypt {
         Self::with_source(Some(TC2192_KEY_PATH), "immutable").await
     }
 
-    async fn with_source(key_path: Option<&'static str>, mode: &str) -> anyhow::Result<Self> {
+    pub(super) async fn with_source(
+        key_path: Option<&'static str>,
+        mode: &str,
+    ) -> anyhow::Result<Self> {
         let digest_format = if key_path.is_some() {
             SourceDigest::RawWrappedBytes
         } else {
@@ -980,7 +983,7 @@ impl ShareDecrypt {
         })
     }
 
-    fn body(&self) -> Value {
+    pub(super) fn body(&self) -> Value {
         use tinycloud_core::encryption_network::{canonical::canonical_hash, DECRYPT_REQUEST_TYPE};
         let wrapped = json!(base64::encode(&self.wrapped));
         let receiver = json!(base64::encode(
@@ -1003,7 +1006,7 @@ impl ShareDecrypt {
         body
     }
 
-    async fn invoke(
+    pub(super) async fn invoke(
         &self,
         resource: &str,
         body: &Value,
@@ -1072,7 +1075,7 @@ impl ShareDecrypt {
         Ok((status, body))
     }
 
-    fn leaf(&self) -> String {
+    pub(super) fn leaf(&self) -> String {
         match self.key_path {
             Some(path) => format!("{}/{path}", self.h.network),
             None => self.h.network.clone(),
