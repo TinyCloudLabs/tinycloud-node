@@ -1927,7 +1927,7 @@ mod share_security_fairing_tests {
     fn non_share_preflight() {}
 
     #[tokio::test]
-    async fn chromium_policy_admission_preflight_allows_authorization() {
+    async fn policy_admission_preflight_keeps_security_headers() {
         let client = Client::tracked(
             rocket::build()
                 .mount(
