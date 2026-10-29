@@ -1,0 +1,17 @@
+{
+  "name": "tinycloud-threshold-vector-checker",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "bun test --timeout 30000 && bun run typecheck && bun run vectors",
+    "typecheck": "tsc --noEmit",
+    "vectors": "bun cli.ts"
+  },
+  "dependencies": {
+    "@noble/curves": "2.4.0"
+  },
+  "devDependencies": {
+    "@types/bun": "1.3.1",
+    "typescript": "5.9.3"
+  }
+}
