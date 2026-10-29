@@ -1,7 +1,7 @@
 import { bls12_381 as bls } from '@noble/curves/bls12-381.js';
 import { parseVectors, vector, type VectorCase } from './schema.ts';
 import {
-  ProtocolError, DST, bytes, hex, be, scalar, g1, g2, h1, h3, xmd, pairing, encodeGT,
+  ProtocolError, DST, PEDERSEN_H_MESSAGE, bytes, hex, be, scalar, g1, g2, h1, h3, xmd, pairing, encodeGT,
   decodeIdentity, encodeIdentity, decodeContext, encodeContext, contextDigest,
   decodeRequest, encodeRequest, requestDigest, encodeShare, signingPreimage,
   verifyShare, combine, wrap, unwrap, type Keyset,
@@ -80,10 +80,10 @@ export function checkVectors(input: unknown): CheckReport {
     try {
       switch (c.operation) {
         case 'hash_g1':
-          same('H1', hex(bls.G1.hashToCurve(bytes(c.inputs.message), { DST: c.inputs.dst }).toBytes()), c.outputs.point);
+          same('H1', hex(h1(bytes(c.inputs.message)).toBytes()), c.outputs.point);
           break;
         case 'hash_g2':
-          same('Pedersen h', hex(bls.G2.hashToCurve(bytes(c.inputs.message), { DST: c.inputs.dst }).toBytes()), c.outputs.point);
+          same('Pedersen h', hex(bls.G2.hashToCurve(bytes(PEDERSEN_H_MESSAGE), { DST: DST.pedersen_h }).toBytes()), c.outputs.point);
           break;
         case 'h3': same('H3', hex(be(h3(bytes(c.inputs.message)), 32)), c.outputs.scalar); break;
         case 'h2': same('H2', hex(xmd(bytes(c.inputs.message), DST.h2, 32)), c.outputs.bytes); break;
@@ -93,7 +93,7 @@ export function checkVectors(input: unknown): CheckReport {
           const b = c.name === 'pairing_generators' ? bls.G2.Point.BASE : bls.G2.Point.BASE.multiply(7n);
           same('pairing input G1', hex(a.toBytes()), c.inputs.g1);
           same('pairing input G2', hex(b.toBytes()), c.inputs.g2);
-          same('reduced pairing GT', hex(encodeGT(pairing(g1(bytes(c.inputs.g1)), g2(bytes(c.inputs.g2))))), c.outputs.gt);
+          same('reduced pairing GT', hex(encodeGT(pairing(a, b))), c.outputs.gt);
           break;
         }
         case 'fullident': {

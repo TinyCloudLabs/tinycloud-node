@@ -11,6 +11,7 @@ export const DST = {
   pedersen_h: 'TC-THRESHOLD-V1-PEDERSEN-H_BLS12381G2_XMD:SHA-256_SSWU_RO_',
   h2: 'TC-THRESHOLD-V1-IBE-H2', h3: 'TC-THRESHOLD-V1-IBE-H3', h4: 'TC-THRESHOLD-V1-IBE-H4',
 };
+export const PEDERSEN_H_MESSAGE = '706564657273656e2d68';
 const PREFIX = 'TC-THRESHOLD-V1-IBE-ID-ENC';
 const encoder = new TextEncoder();
 const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
