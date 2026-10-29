@@ -435,7 +435,6 @@ mod tests {
     async fn kv_put_and_metadata_etags_carry_no_transform() {
         let client = Client::tracked(crate::attach_response_fairings(
             rocket::build().mount("/", routes![mutation_response, metadata_response]),
-            "https://share.tinycloud.xyz".into(),
         ))
         .await
         .unwrap();

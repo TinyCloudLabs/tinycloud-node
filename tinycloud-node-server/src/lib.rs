@@ -1256,13 +1256,7 @@ pub async fn app_with_control(
         rocket
     };
 
-    let share_allowed_origin = tinycloud_config
-        .share_email
-        .allowed_origins
-        .first()
-        .cloned()
-        .unwrap_or_else(|| tinycloud_config.share_email.return_origin.clone());
-    let rocket = attach_response_fairings(rocket, share_allowed_origin);
+    let rocket = attach_response_fairings(rocket);
 
     if tinycloud_config.cors {
         Ok(rocket.attach(cors_fairing()))
@@ -1275,9 +1269,9 @@ pub async fn app_with_control(
 ///
 /// [`no_transform_fairing`] runs after [`share_security_fairing`] because that
 /// fairing replaces `Cache-Control` on the share paths.
-fn attach_response_fairings(rocket: Rocket<Build>, share_allowed_origin: String) -> Rocket<Build> {
+fn attach_response_fairings(rocket: Rocket<Build>) -> Rocket<Build> {
     rocket
-        .attach(share_security_fairing(share_allowed_origin))
+        .attach(share_security_fairing())
         .attach(retry_after_fairing())
         .attach(no_transform_fairing())
 }
@@ -1374,9 +1368,12 @@ fn retry_after_fairing() -> AdHoc {
 fn cors_fairing() -> AdHoc {
     AdHoc::on_response("CORS", |request, resp| {
         Box::pin(async move {
-            if is_mounted_share_path(request.uri().path().as_str()) {
-                return;
-            }
+            // No `/policy/v3/` handler authenticates with cookies or ambient
+            // credentials (Authorization header, signed invocations, or public
+            // endpoints), so these paths get the same wildcard CORS as
+            // `/invoke`, minus `Allow-Credentials`, which a wildcard origin
+            // cannot use anyway (TC-2192).
+            let is_policy_path = is_mounted_share_path(request.uri().path().as_str());
             resp.set_header(Header::new("Access-Control-Allow-Origin", "*"));
             resp.set_header(Header::new(
                 // allow these methods for requests
@@ -1393,7 +1390,9 @@ fn cors_fairing() -> AdHoc {
                 "Access-Control-Allow-Headers",
                 "*, Authorization, X-Request-Id",
             ));
-            resp.set_header(Header::new("Access-Control-Allow-Credentials", "true"));
+            if !is_policy_path {
+                resp.set_header(Header::new("Access-Control-Allow-Credentials", "true"));
+            }
             if request.method() == Method::Options {
                 // only meaningful on a preflight response; lets the browser
                 // skip the OPTIONS round trip on subsequent requests
@@ -1406,24 +1405,13 @@ fn cors_fairing() -> AdHoc {
     })
 }
 
-fn share_security_fairing(share_allowed_origin: String) -> AdHoc {
+fn share_security_fairing() -> AdHoc {
     AdHoc::on_response("share-email-security-headers", move |request, response| {
-        let share_allowed_origin = share_allowed_origin.clone();
         Box::pin(async move {
             if is_mounted_share_path(request.uri().path().as_str()) {
                 response.set_header(Header::new("Cache-Control", "no-store"));
                 response.set_header(Header::new("X-Content-Type-Options", "nosniff"));
                 response.set_header(Header::new("Referrer-Policy", "no-referrer"));
-                response.set_header(Header::new(
-                    "Access-Control-Allow-Origin",
-                    share_allowed_origin,
-                ));
-                response.set_header(Header::new("Access-Control-Allow-Methods", "GET, POST"));
-                response.set_header(Header::new(
-                    "Access-Control-Allow-Headers",
-                    "Content-Type, Authorization, X-Request-Id",
-                ));
-                response.set_header(Header::new("Access-Control-Expose-Headers", "X-Request-Id"));
             }
         })
     })
@@ -1946,7 +1934,7 @@ mod share_security_fairing_tests {
                     "/",
                     routes![policy_admission_preflight, non_share_preflight],
                 )
-                .attach(share_security_fairing("https://share.tinycloud.xyz".into())),
+                .attach(share_security_fairing()),
         )
         .await
         .expect("valid Rocket instance");
@@ -1965,37 +1953,20 @@ mod share_security_fairing_tests {
 
             assert_eq!(response.status(), rocket::http::Status::Ok, "{path}");
             assert_eq!(
-                response.headers().get_one("Access-Control-Allow-Origin"),
-                Some("https://share.tinycloud.xyz"),
+                response.headers().get_one("Cache-Control"),
+                Some("no-store"),
                 "{path}"
             );
-            let methods: std::collections::BTreeSet<_> = response
-                .headers()
-                .get_one("Access-Control-Allow-Methods")
-                .unwrap()
-                .split(',')
-                .map(str::trim)
-                .collect();
-            assert_eq!(methods, std::collections::BTreeSet::from(["GET", "POST"]));
-            let allowed = response
-                .headers()
-                .get_one("Access-Control-Allow-Headers")
-                .unwrap()
-                .to_ascii_lowercase();
-            let allowed: std::collections::BTreeSet<_> =
-                allowed.split(',').map(str::trim).collect();
             assert_eq!(
-                allowed,
-                std::collections::BTreeSet::from(
-                    ["authorization", "content-type", "x-request-id",]
-                )
+                response.headers().get_one("X-Content-Type-Options"),
+                Some("nosniff"),
+                "{path}"
             );
-            assert!(response
-                .headers()
-                .get_one("Access-Control-Expose-Headers")
-                .unwrap()
-                .split(',')
-                .any(|name| name.trim().eq_ignore_ascii_case("x-request-id")));
+            assert_eq!(
+                response.headers().get_one("Referrer-Policy"),
+                Some("no-referrer"),
+                "{path}"
+            );
         }
     }
 
@@ -2007,7 +1978,7 @@ mod share_security_fairing_tests {
                     "/",
                     routes![policy_admission_preflight, non_share_preflight],
                 )
-                .attach(share_security_fairing("https://share.tinycloud.xyz".into())),
+                .attach(share_security_fairing()),
         )
         .await
         .expect("valid Rocket instance");
@@ -2045,7 +2016,7 @@ mod cors_fairing_tests {
         Client::tracked(
             rocket::build()
                 .mount("/", routes![util_routes::cors, invoke])
-                .attach(share_security_fairing("https://share.tinycloud.xyz".into()))
+                .attach(share_security_fairing())
                 .attach(cors_fairing()),
         )
         .await
@@ -2101,7 +2072,7 @@ mod cors_fairing_tests {
     }
 
     #[tokio::test]
-    async fn max_age_is_not_sent_on_actual_or_share_responses() {
+    async fn max_age_is_not_sent_on_actual_responses() {
         let client = client().await;
 
         let response = client
@@ -2119,7 +2090,7 @@ mod cors_fairing_tests {
             .get_one("Access-Control-Max-Age")
             .is_none());
 
-        // the share fairing owns /policy/v3/* and is left untouched
+        // `/policy/v3/*` gets the generic CORS policy, same as `/invoke`
         let response = client
             .options("/policy/v3/challenges")
             .header(Header::new("Origin", "https://share.tinycloud.xyz"))
@@ -2128,12 +2099,110 @@ mod cors_fairing_tests {
             .await;
         assert_eq!(
             response.headers().get_one("Access-Control-Allow-Origin"),
-            Some("https://share.tinycloud.xyz")
+            Some("*")
         );
-        assert!(response
-            .headers()
-            .get_one("Access-Control-Max-Age")
-            .is_none());
+        assert_eq!(
+            response.headers().get_one("Access-Control-Max-Age"),
+            Some("7200")
+        );
+    }
+
+    #[post("/policy/v3/enforcer-bindings")]
+    fn enforcer_bindings() {}
+
+    #[post("/policy/v3/challenges")]
+    fn challenges() {}
+
+    /// Like [`client`], plus real `POST` handlers under `/policy/v3/`.
+    async fn policy_client() -> Client {
+        Client::tracked(
+            rocket::build()
+                .mount(
+                    "/",
+                    routes![util_routes::cors, invoke, enforcer_bindings, challenges],
+                )
+                .attach(share_security_fairing())
+                .attach(cors_fairing()),
+        )
+        .await
+        .expect("valid Rocket instance")
+    }
+
+    fn assert_policy_cors(response: &rocket::local::asynchronous::LocalResponse<'_>, what: &str) {
+        let headers = response.headers();
+        assert_eq!(
+            headers.get_one("Access-Control-Allow-Origin"),
+            Some("*"),
+            "{what}"
+        );
+        assert!(
+            headers
+                .get_one("Access-Control-Allow-Credentials")
+                .is_none(),
+            "{what}: credentials must not be allowed"
+        );
+        assert_eq!(headers.get_one("Cache-Control"), Some("no-store"), "{what}");
+        assert_eq!(
+            headers.get_one("X-Content-Type-Options"),
+            Some("nosniff"),
+            "{what}"
+        );
+        assert_eq!(
+            headers.get_one("Referrer-Policy"),
+            Some("no-referrer"),
+            "{what}"
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_v3_preflight_and_post_match_invoke_for_any_origin() {
+        let client = policy_client().await;
+        for origin in ["https://tinycloud.chat", "tauri://localhost"] {
+            for path in ["/policy/v3/enforcer-bindings", "/policy/v3/challenges"] {
+                let response = client
+                    .options(path)
+                    .header(Header::new("Origin", origin))
+                    .header(Header::new("Access-Control-Request-Method", "POST"))
+                    .header(Header::new(
+                        "Access-Control-Request-Headers",
+                        "authorization,content-type,x-request-id",
+                    ))
+                    .dispatch()
+                    .await;
+                assert_eq!(response.status(), Status::Ok, "{origin} {path}");
+                assert_policy_cors(&response, &format!("preflight {origin} {path}"));
+                let headers = response.headers();
+                assert_eq!(
+                    headers.get_one("Access-Control-Max-Age"),
+                    Some("7200"),
+                    "{origin} {path}"
+                );
+                let allowed = headers
+                    .get_one("Access-Control-Allow-Headers")
+                    .unwrap()
+                    .to_ascii_lowercase();
+                let allowed: std::collections::BTreeSet<_> =
+                    allowed.split(',').map(str::trim).collect();
+                assert_eq!(
+                    allowed,
+                    std::collections::BTreeSet::from(["*", "authorization", "x-request-id"]),
+                    "{origin} {path}"
+                );
+                assert!(headers
+                    .get_one("Access-Control-Allow-Methods")
+                    .unwrap()
+                    .split(',')
+                    .any(|m| m.trim() == "POST"));
+
+                let response = client
+                    .post(path)
+                    .header(Header::new("Origin", origin))
+                    .dispatch()
+                    .await;
+                assert_eq!(response.status(), Status::Ok, "{origin} {path}");
+                assert_policy_cors(&response, &format!("POST {origin} {path}"));
+            }
+        }
     }
 }
 
@@ -2531,28 +2600,25 @@ mod no_transform_fairing_tests {
     }
 
     async fn client() -> Client {
-        Client::tracked(attach_response_fairings(
-            rocket::build().mount(
-                "/",
-                routes![
-                    etag_only,
-                    etag_private,
-                    etag_no_store,
-                    etag_two_headers,
-                    etag_already,
-                    etag_empty_cache_control,
-                    etag_not_modified,
-                    etag_precondition_failed,
-                    plain,
-                    plain_cache,
-                    share_path_etag,
-                    share_path_plain,
-                    kv,
-                    signed,
-                ],
-            ),
-            "https://share.tinycloud.xyz".into(),
-        ))
+        Client::tracked(attach_response_fairings(rocket::build().mount(
+            "/",
+            routes![
+                etag_only,
+                etag_private,
+                etag_no_store,
+                etag_two_headers,
+                etag_already,
+                etag_empty_cache_control,
+                etag_not_modified,
+                etag_precondition_failed,
+                plain,
+                plain_cache,
+                share_path_etag,
+                share_path_plain,
+                kv,
+                signed,
+            ],
+        )))
         .await
         .expect("valid Rocket instance")
     }

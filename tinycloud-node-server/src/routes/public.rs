@@ -445,18 +445,15 @@ mod tests {
     /// and gain `no-transform`; the list has no ETag and is unchanged.
     #[tokio::test]
     async fn public_etag_responses_add_no_transform_and_keep_cache_policy() -> anyhow::Result<()> {
-        let client = Client::tracked(crate::attach_response_fairings(
-            rocket::build().mount(
-                "/",
-                rocket::routes![
-                    public_etag_full,
-                    public_etag_not_modified,
-                    public_etag_metadata,
-                    public_list
-                ],
-            ),
-            "https://share.tinycloud.xyz".into(),
-        ))
+        let client = Client::tracked(crate::attach_response_fairings(rocket::build().mount(
+            "/",
+            rocket::routes![
+                public_etag_full,
+                public_etag_not_modified,
+                public_etag_metadata,
+                public_list
+            ],
+        )))
         .await?;
         for (path, status) in [
             ("/etag-full", Status::Ok),
