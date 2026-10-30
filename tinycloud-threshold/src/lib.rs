@@ -21,6 +21,7 @@ pub mod context;
 #[allow(unsafe_code)]
 pub mod curve;
 pub mod derive;
+pub mod dkg;
 pub mod dst;
 mod encoding;
 pub mod error;
@@ -50,6 +51,12 @@ pub use cert::{
 };
 pub use context::{AuthorizedDerivation, KeyContext};
 pub use derive::*;
+pub use dkg::{
+    dkg_initial_transcript, dkg_start, dkg_verify_transcript, AfterBarrier, DisqualifyReason,
+    DkgAnswered, DkgAnswers, DkgAwaitingBarrier, DkgComplained, DkgComplaints, DkgDeal, DkgDealt,
+    DkgExtracting, DkgExtractionComplaints, DkgFeldman, DkgMessage, DkgOutput, DkgReconstructing,
+    DkgReconstruction, DkgRoundRecord, DkgTranscript,
+};
 pub use error::{CertError, CombineError, Error, ShareError, SignatureError};
 pub use fault::{verify_fault_proof, FaultProof, FaultVerdict, NotAFaultReason};
 pub use ibe::*;
@@ -59,5 +66,7 @@ pub use seal::{CeremonyHpkePublicKey, CeremonyHpkeSecretKey, SealedDealing};
 
 #[cfg(test)]
 mod checkpoint;
+#[cfg(test)]
+mod dkg_relay;
 #[cfg(test)]
 mod vectors;
