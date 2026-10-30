@@ -10094,6 +10094,7 @@ name = "tinycloud-threshold"
 version = "0.1.0"
 dependencies = [
  "blst",
+ "ed25519-dalek",
  "hex",
  "proptest",
  "rand_chacha 0.3.1",
