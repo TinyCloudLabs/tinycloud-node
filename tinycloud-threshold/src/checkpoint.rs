@@ -123,6 +123,97 @@ fn signing_preimage_rejects_changed_record_nonce() {
 }
 
 #[test]
+fn p3_combine_accepts_exact_raw_limit() {
+    let (public, _, tsk, req, issued) = setup(11);
+    let repeated: [EncryptedKeyShare; 6] =
+        std::array::from_fn(|i| issued[i % issued.len()].clone());
+    let aggregate = combine(&public, &req, &repeated).unwrap();
+    let key = decrypt_derived_key(&aggregate, &tsk, &public, &req).unwrap();
+    let data = DataKey::new([0x42; 32]);
+    let ciphertext = wrap_key(
+        public.master_public_key(),
+        req.identity(),
+        &data,
+        &mut ChaCha20Rng::from_seed([12; 32]),
+    )
+    .unwrap();
+    assert_eq!(
+        unwrap_key(&key, req.identity(), &ciphertext)
+            .unwrap()
+            .as_bytes(),
+        data.as_bytes()
+    );
+}
+
+#[test]
+fn p3_combine_counts_duplicate_members_once_at_limit() {
+    let (public, _, _, req, issued) = setup(11);
+    let repeated: [EncryptedKeyShare; 6] = std::array::from_fn(|_| issued[0].clone());
+    assert!(matches!(
+        combine(&public, &req, &repeated),
+        Err(CombineError::NotEnoughShares)
+    ));
+}
+
+#[test]
+fn p3_combine_rejects_above_raw_limit() {
+    let (public, _, _, req, issued) = setup(11);
+    for share in &issued {
+        assert_eq!(verify_share(&public, &req, share), Ok(()));
+    }
+    let too_many: [EncryptedKeyShare; 7] =
+        std::array::from_fn(|i| issued[i % issued.len()].clone());
+    let result = combine(&public, &req, &too_many);
+    let maximum = 2 * usize::from(public.context().threshold().n());
+    assert!(
+        result.is_err(),
+        "combine accepted {} raw entries above 2*n={maximum}",
+        too_many.len()
+    );
+    assert_eq!(result.err(), Some(CombineError::TooManyShares));
+}
+
+#[test]
+fn p3_combine_limit_precedes_context_and_share_checks() {
+    let (public, _, _, req, issued) = setup(11);
+    let mut too_many: [EncryptedKeyShare; 7] =
+        std::array::from_fn(|i| issued[i % issued.len()].clone());
+    let mut other_request = req.clone();
+    other_request.context_digest[0] ^= 1;
+    assert_eq!(
+        combine(&public, &other_request, &too_many).unwrap_err(),
+        CombineError::TooManyShares
+    );
+    too_many[6].context_digest[0] ^= 1;
+    assert_eq!(
+        combine(&public, &req, &too_many).unwrap_err(),
+        CombineError::TooManyShares
+    );
+    too_many[6].context_digest[0] ^= 1;
+    too_many[6].c3 = G1::identity();
+    assert_eq!(
+        combine(&public, &req, &too_many).unwrap_err(),
+        CombineError::TooManyShares
+    );
+}
+
+#[test]
+fn p3_verify_share_rejects_canonical_identity_c3_mutation() {
+    let (public, _, _, req, issued) = setup(11);
+    assert_eq!(verify_share(&public, &req, &issued[0]), Ok(()));
+    assert!(!issued[0].c3.is_identity());
+    let mut changed = issued[0].clone();
+    changed.c3 = G1::identity();
+    let changed = EncryptedKeyShare::decode(&changed.encode()).unwrap();
+    assert_eq!(
+        verify_share(&public, &req, &changed),
+        Err(ShareError::Invalid {
+            member: issued[0].index()
+        })
+    );
+}
+
+#[test]
 fn checkpoint_2of3() {
     let (public, shares, tsk, req, issued) = setup(11);
     assert_eq!(public.context().threshold(), Threshold::new(2, 3).unwrap());
