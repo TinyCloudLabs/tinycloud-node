@@ -859,6 +859,10 @@ redacted!(
 
 /// The outcome of consuming the common closed R5. Details: TC-2220
 #[derive(Debug)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Returned once per ceremony and moved immediately; variants mirror the R5 outcome."
+)]
 pub enum AfterBarrier {
     /// No extraction fault or upheld R5 complaint. Details: TC-2220
     Finished(CandidateShare, DkgOutput),

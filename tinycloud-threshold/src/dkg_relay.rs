@@ -1001,9 +1001,11 @@ fn selective_r4_reaches_the_common_barrier_and_is_reconstructed() {
     assert_eq!(run.transcript.rounds.len(), 6);
 }
 
+type Mutation = fn(&mut Outbox);
+
 #[test]
 fn bad_missing_and_malformed_r4_are_extraction_faults() {
-    let cases: [(&str, fn(&mut Outbox)); 5] = [
+    let cases: [(&str, Mutation); 5] = [
         ("bad", |out| {
             let forged = vanishing_feldman(&out.payload(3), &[]);
             out.replace(3, &forged);
@@ -1412,7 +1414,7 @@ fn closed_rounds_reject_wrong_signers_cohorts_and_signatures() {
     let mut rng = f.member_rng(1);
     let (_, message) = dkg_start(&f.ceremony, idx(1), f.secret(1), &mut rng).unwrap();
     let genuine = f.sign(1, &message);
-    assert!(close_for::<DkgDeal>(&f, &f.ceremony, 1, &h0, &[genuine.clone()]).is_ok());
+    assert!(close_for::<DkgDeal>(&f, &f.ceremony, 1, &h0, std::slice::from_ref(&genuine)).is_ok());
 
     let mut wrong_signer = genuine.clone();
     wrong_signer.signature = f
