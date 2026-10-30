@@ -29,6 +29,14 @@ pub mod ibe;
 pub mod identity;
 pub mod ids;
 mod poly;
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "Crate-private dealing helpers await DKG/reshare callers."
+    )
+)]
+pub mod seal;
 
 pub use activation::{
     activation_preimage, readiness_preimage, verify_activation, ReadinessReceipt, ReadyQuorum,
@@ -47,6 +55,7 @@ pub use fault::{verify_fault_proof, FaultProof, FaultVerdict, NotAFaultReason};
 pub use ibe::*;
 pub use identity::IbeIdentity;
 pub use ids::*;
+pub use seal::{CeremonyHpkePublicKey, CeremonyHpkeSecretKey, SealedDealing};
 
 #[cfg(test)]
 mod checkpoint;

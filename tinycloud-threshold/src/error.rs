@@ -34,6 +34,10 @@ pub enum Error {
     DegenerateRandomness,
     #[error("invalid IBE ciphertext")]
     InvalidCiphertext,
+    #[error("invalid HPKE key")]
+    InvalidHpkeKey,
+    #[error("invalid sealed dealing")]
+    InvalidSealedDealing,
     #[error("derived key does not match the request")]
     InvalidDerivedKey,
     #[error("invalid signature")]
