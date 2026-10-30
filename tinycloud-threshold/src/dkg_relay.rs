@@ -1280,7 +1280,8 @@ fn local_recipient_key_and_context_are_checked_before_any_randomness() {
         &current,
         CeremonyKind::Reshare,
         Threshold::new(2, 3).unwrap(),
-        12,
+        // Seed 11 matches the genesis fixture, so the reshare keeps its mpk.
+        11,
     );
     assert!(matches!(
         dkg_start(&reshare, idx(1), f.secret(1), &mut rng),
