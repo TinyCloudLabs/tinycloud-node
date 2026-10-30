@@ -141,6 +141,16 @@ describe('R1–R3 and QUAL', () => {
     expect(code(() => run(s, alone))).toBe('InvalidRound');
     expect(code(() => run(s, alone.slice(0, 2)))).toBe('InvalidRound');
   });
+  for (const length of [0, 15]) {
+    test(`a ${length}-byte sealed ciphertext makes the deal malformed and changes QUAL`, () => {
+      const out = run(s, replace(s, 1, 2, msg(2, deal(s.dealers[1]!.C, members, 64, 2, { 3: length }))));
+      expect(out.disqualified).toEqual([{ member: 2, reason: 'MalformedDeal' }]);
+      expectPublic(out, s, [1, 3]);
+    });
+  }
+  test('a tag-only 16-byte sealed ciphertext is well formed', () => {
+    expect(run(s, replace(s, 1, 2, msg(2, deal(s.dealers[1]!.C, members, 64, 2, { 3: 16 })))).disqualified).toEqual([]);
+  });
   test('rules 5–8 apply in order', () => {
     const two = replace(replace(s, 2, 2, msg(2, complaints([1]))), 2, 3, msg(3, complaints([1])));
     expect(run(s, replace(two, 3, 1)).disqualified).toEqual([{ member: 1, reason: 'Complaints' }]);

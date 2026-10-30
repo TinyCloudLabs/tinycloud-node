@@ -44,8 +44,11 @@ records, using `ceremony.ts` for the S0.2 layer. Check order:
    An abort (`InsufficientQualified`, `InsufficientRecovery`) must be the last
    record; missing or additional records are `InvalidRound`.
 
-Conditions SPEC describes without naming an error use the defaults in
-`DEFAULT_ERROR` (`ceremony.ts`), ruled by Naomi on 2026-10-30.
+Per SPEC "Verifier conformance", outcomes (accept/reject, QUAL or D, mpk,
+commitments, public shares, excluded dealers) are normative; error codes and
+their precedence are informative. Conditions SPEC describes without naming an
+error use the defaults in `DEFAULT_ERROR` (`ceremony.ts`), ruled by Naomi on
+2026-10-30.
 
 `testkit.ts` builds signed transcripts from the published fixture seeds in
 `../v1/cert-core.json`, with payload encoders written separately from the
@@ -53,12 +56,14 @@ decoders; expected outputs are computed in the scalar domain. `dkg.test.ts` and
 `reshare.test.ts` cover every disqualification/exclusion reason and its
 precedence, extraction and reconstruction, identity rejections, caps, entry
 checks and strict signatures. `probes.ts` and `transcript-corruption.test.ts`
-flip one byte in each field class of every committed record and require the
-ordered reason; re-signed flips reach the rule-level outcome.
+flip one byte in each field class of every committed record and pin the
+checker-order reason codes (informative); re-signed flips reach the rule-level
+outcome.
 `transcript-vectors.test.ts` perturbs expected outputs and runs the real CLI.
 
 The checker does not open sealed dealings (it holds no recipient keys); a
-sealed dealing is decoded by layout only, per Naomi's 2026-10-30 ruling.
+sealed dealing is decoded by layout, and a ciphertext shorter than the 16-byte
+AEAD tag makes that R1 malformed (SPEC S0.3 appendix).
 `s02.test.ts` runs the `../v1/cert-core.json` certificate, ceremony and
 closed-round records through the same S0.2 layer and covers the §3.9
 decoded-certificate rules.

@@ -114,6 +114,13 @@ describe('exclusion reasons', () => {
     const one = replace(s, 2, COHORT_RECIPIENTS, 2, recipient(2, complaints([1])));
     expect(run(s, replace(one, 3, COHORT_DEALERS, 1, dealer(1, values([[3, 1n]])))).excluded).toEqual([{ member: 1, reason: 'InvalidAnswer' }]);
   });
+  for (const length of [0, 15]) {
+    test(`a ${length}-byte sealed ciphertext makes the deal malformed and changes D`, () => {
+      const out = run(s, replace(s, 1, COHORT_DEALERS, 1, dealer(1, deal(commitmentsOf(s.dealings[0]!), recipients(s), 32, 1, { 4: length }))));
+      expect(out.excluded).toEqual([{ member: 1, reason: 'MalformedDeal' }]);
+      expectOutput(out, s, [2, 3]);
+    });
+  }
   test('fewer than t dealers is InsufficientQualified; record count must be 3', () => {
     const alone = s.rounds.map((r, k) => k === 0 ? r.filter(d => d.index === 1) : r);
     expect(code(() => run(s, alone))).toBe('InsufficientQualified');
@@ -128,8 +135,9 @@ describe('entry checks', () => {
     const variant = (kind: number, spec: Partial<CeremonySpec>, t2 = 3, n2 = 4) => code(() => run(reshareSetup('entry', 2, 3, t2, n2, kind, spec)));
     expect(variant(1, { current: undefined, epoch: 0n })).toBe('InvalidCeremony');
     expect(variant(4, { rekey: 1n })).toBe('InvalidCeremony');
-    expect(variant(2, { current: new Uint8Array(32) })).toBe('ContextMismatch');
-    expect(variant(2, { current: undefined })).toBe('ContextMismatch');
+    // Owner ruling (TC-2223): authorized against the pinned certificate, a stale or absent digest is InvalidCeremony.
+    expect(variant(2, { current: new Uint8Array(32) })).toBe('InvalidCeremony');
+    expect(variant(2, { current: undefined })).toBe('InvalidCeremony');
     expect(variant(2, { epoch: 2n })).toBe('InvalidCeremony');
     expect(variant(2, { rekey: 1n })).toBe('InvalidCeremony');
     expect(variant(3, {}, 3, 3)).toBe('InvalidCeremony');

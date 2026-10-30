@@ -160,7 +160,7 @@ Preconditions: an `AuthorizedCeremony` of kind `genesis` (§3.8 step 0 applies t
 **`verify_certificate(anchor, signed, verifier)` → `VerifiedCertificate`:**
 - owner DID = `anchor.expected_owner` and network = `anchor.network` (an otherwise valid self-signed certificate naming another owner is rejected);
 - the owner signature verifies through the injected verifier (principle 2's allow-list lives behind it, in tinycloud-auth);
-- validation of the **decoded** object, not just of constructors: 2 ≤ t ≤ n ≤ 16; genesis t ≥ 2; indices 1..=n, distinct, sorted; member DIDs distinct (no weighted membership); commitments length t; commitment[0] = mpk; commitment[t−1] ≠ identity; every evaluated public share valid and non-identity; field combinations: genesis ⇒ no previous digest, no previous mpk, epoch 0, re-key counter 0; reshare successor ⇒ previous digest, no previous mpk; re-key ⇒ previous digest and previous mpk.
+- validation of the **decoded** object, not just of constructors: 2 ≤ t ≤ n ≤ 16; genesis t ≥ 2; indices 1..=n, distinct, sorted; member DIDs distinct (no weighted membership); commitments length t; commitment[0] = mpk; commitment[t−1] ≠ identity; every evaluated public share valid and non-identity; field combinations: genesis ⇒ no previous digest, no previous mpk, epoch 0, re-key counter 0, genesis t = t and n ≥ 2t−1 (§3.0 genesis budget); reshare successor ⇒ previous digest, no previous mpk; re-key ⇒ previous digest and previous mpk, previous mpk ≠ mpk and re-key counter ≥ 1; every successor (previous digest present) ⇒ epoch ≥ 1 and re-key counter ≤ epoch.
 
 **`verify_successor(pinned: &VerifiedCertificate, next, verifier)`:** same owner and network (re-checked against the anchor); next.previous digest = pinned digest; epoch = pinned + 1 (checked); and either (reshare/refresh) the same mpk, re-key counter and genesis t, or (re-key) re-key counter + 1, previous mpk = pinned mpk, new mpk, genesis t = new t. Rollback and alternate lineages are rejected relative to the pinned certificate; which certificate is pinned as current comes from the trusted log head (gate B), not from the crate.
 
@@ -236,6 +236,10 @@ S0.4 adds the §3.8 redistribution for reshare and refresh: dealer and recipient
 
 The dealer remains test-only. Durable storage/retirement and node-runtime integration are separate slices. The crate remains an unwired workspace member.
 
+## Verifier conformance
+
+Two verifiers of the same raw transcript or certificate conform when they agree on the **outcome**: accept or reject; QUAL (genesis) or D (redistribution); the final mpk, commitments and public shares; and which dealers are disqualified or excluded. These outcomes are normative. Typed error codes, reason codes and the order in which checks run (and so which code a multiply-defective input reports) are informative; an implementation may report a different code for an input it rejects, provided it rejects it.
+
 ## S0.2 canonical byte appendix
 
 All integers below are unsigned big-endian. `lp(x)` is `len(x):u32 || x`; strings use exact UTF-8 without normalization. `option(x)` is `00` when absent or `01 || x` when present; other markers are rejected. Symbolic tag names refer to the literal domain strings in §3.3, and `TH` is defined in §3.2.
@@ -309,7 +313,7 @@ The canonical certificate body is:
 
 The certificate digest is `TH(NETWORK_CERT, body)`. The owner signs `TH(CERT_STATEMENT, certificate_digest:32)`.
 
-Certificates contain no HPKE keys. The commitment count equals `t`; the constant equals `mpk`; constant/top coefficients and evaluated public shares are non-identity. Genesis has absent predecessor fields and zero counters. A pinned successor has the exact previous digest and checked `epoch+1`. Reshare/refresh preserve `mpk`, `rekey` and `genesis_t`; re-key changes `mpk`, names the previous `mpk`, increments `rekey` and sets `genesis_t` to the new `t`.
+Certificates contain no HPKE keys. The commitment count equals `t`; the constant equals `mpk`; constant/top coefficients and evaluated public shares are non-identity. Genesis has absent predecessor fields, zero counters, `genesis_t = t` and `n >= 2t-1`. Any certificate with a previous digest has `epoch >= 1` and `rekey <= epoch`. A pinned successor has the exact previous digest and checked `epoch+1`. Reshare/refresh preserve `mpk`, `rekey` and `genesis_t`; re-key changes `mpk` (previous `mpk` ≠ `mpk`), names the previous `mpk`, has `rekey >= 1`, increments `rekey` and sets `genesis_t` to the new `t`.
 
 Verification uses the caller's expected owner/network. The caller's authorization-log integration selects the current pinned certificate. Candidate binding checks transcript and member index, then `scalar*g2` against the certificate's evaluated public share.
 
@@ -395,7 +399,7 @@ R5 extraction   = 01 || count:u16 || [(dealer:u16 || s:32 || s′:32)]
 R6 values       = 01 || count:u16 || [(dealer:u16 || s:32 || s′:32)]
 ```
 
-`sealed_dealing` is the §3.10 envelope `01 || enc:32 || lp(ciphertext)`. Every count is at most 16 and is checked before allocation; index lists are strictly increasing member indices 1..=16; point coefficients are canonical G2 encodings and individual coefficients may be the identity (§3.2 role table); scalars are canonical. Trailing bytes and other versions are rejected. A payload that fails this decoding is *malformed*.
+`sealed_dealing` is the §3.10 envelope `01 || enc:32 || lp(ciphertext)`; the ciphertext is at least 16 bytes (the AEAD tag), and a shorter one makes that R1 malformed. Every count is at most 16 and is checked before allocation; index lists are strictly increasing member indices 1..=16; point coefficients are canonical G2 encodings and individual coefficients may be the identity (§3.2 role table); scalars are canonical. Trailing bytes and other versions are rejected. A payload that fails this decoding is *malformed*.
 
 ### Classifying a round
 
@@ -446,7 +450,7 @@ This appendix records the byte layouts and deterministic rules that members and 
 
 ### Authorization and refresh
 
-Every entry point (`reshare_deal`, `reshare_start_receiver`, `reshare_verify_transcript`) first requires an `AuthorizedCeremony` of kind reshare or refresh (`InvalidCeremony` otherwise) whose current-certificate digest equals the supplied `VerifiedCertificate` (`ContextMismatch` otherwise). Refresh additionally requires t′ = t, n′ = n and a directory whose index→DID map equals the current certificate's members (`InvalidCeremony` otherwise). A dealer's `KeyShare` must carry the current certificate's key context (`ContextMismatch`). A recipient's ceremony key must derive the directory key at its index (`ContextMismatch`; unknown index `InvalidIndex`). These checks precede any randomness, opening or emitted message.
+Every entry point (`reshare_deal`, `reshare_start_receiver`, `reshare_verify_transcript`) first requires an `AuthorizedCeremony` of kind reshare or refresh (`InvalidCeremony` otherwise) authorized against the pinned current certificate: its current-certificate digest must be present and equal the supplied `VerifiedCertificate` (`InvalidCeremony` otherwise, for a stale or absent digest). Refresh additionally requires t′ = t, n′ = n and a directory whose index→DID map equals the current certificate's members (`InvalidCeremony` otherwise). A dealer's `KeyShare` must carry the current certificate's key context (`ContextMismatch`). A recipient's ceremony key must derive the directory key at its index (`ContextMismatch`; unknown index `InvalidIndex`). These checks precede any randomness, opening or emitted message.
 
 ### Initial link and transcript
 

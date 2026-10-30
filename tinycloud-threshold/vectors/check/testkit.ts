@@ -113,11 +113,12 @@ export function signedCertificate(c: CertificateSpec, signer = OWNER): Statement
 }
 
 // --- Payloads ------------------------------------------------------------------------
-const sealed = (dealer: number, recipient: number, plaintext: number) =>
-  concat(be(1n, 1), new Uint8Array(32).fill(dealer), lp(new Uint8Array(plaintext + 16).fill(recipient)));
-export function deal(commitments: readonly G2[], recipients: readonly number[], plaintext = 64, dealer = 1): Bytes {
+const sealed = (dealer: number, recipient: number, ciphertext: number) =>
+  concat(be(1n, 1), new Uint8Array(32).fill(dealer), lp(new Uint8Array(ciphertext).fill(recipient)));
+/** R1 deal; each sealed ciphertext is plaintext + 16 tag bytes unless `short` overrides recipient → ciphertext length. */
+export function deal(commitments: readonly G2[], recipients: readonly number[], plaintext = 64, dealer = 1, short: Record<number, number> = {}): Bytes {
   return concat(be(1n, 1), be(BigInt(commitments.length), 2), ...commitments.map(p => p.toBytes()),
-    be(BigInt(recipients.length), 2), ...recipients.map(j => concat(be(BigInt(j), 2), lp(sealed(dealer, j, plaintext)))));
+    be(BigInt(recipients.length), 2), ...recipients.map(j => concat(be(BigInt(j), 2), lp(sealed(dealer, j, short[j] ?? plaintext + 16)))));
 }
 export function complaints(dealers: readonly number[]): Bytes {
   return concat(be(1n, 1), be(BigInt(dealers.length), 2), ...dealers.map(i => be(BigInt(i), 2)));

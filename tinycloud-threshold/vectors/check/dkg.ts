@@ -23,8 +23,10 @@ export function decodeDeal(payload: Bytes): { commitments: G2[]; recipients: num
   const recipients: number[] = [];
   for (let k = listCount(r), last = 0; k > 0; k--) {
     last = memberIndex(r, last);
-    // §3.10 sealed dealing envelope: 01 || enc:32 || lp(ciphertext), decoded by layout only.
-    const sealed = new Reader(r.field(65536)); sealed.version(); sealed.take(32); sealed.field(65536); sealed.end();
+    // §3.10 sealed dealing envelope: 01 || enc:32 || lp(ciphertext); the ciphertext holds at least the 16-byte AEAD tag.
+    const sealed = new Reader(r.field(65536)); sealed.version(); sealed.take(32);
+    if (sealed.field(65536).length < 16) fail('InvalidEncoding');
+    sealed.end();
     recipients.push(last);
   }
   r.end();

@@ -23,9 +23,10 @@ export const LIMIT = { members: 16, did: 256, signature: 512, message: 65536, tr
  * Typed errors for conditions SPEC describes but does not name. Every entry is
  * a default ruled by Naomi on 2026-10-30 (TC-2223); SPEC- and vector-named
  * codes (LimitExceeded, InvalidRound for record counts and round transitions,
- * InvalidCeremony for kind/refresh, ContextMismatch for certificate binding,
- * IdentityPoint, InsufficientQualified, InsufficientRecovery,
- * UnsupportedFaultBudget, InvalidEncoding for decoders) are used literally.
+ * InvalidCeremony for kind/refresh/current-digest, IdentityPoint,
+ * InsufficientQualified, InsufficientRecovery, UnsupportedFaultBudget,
+ * InvalidEncoding for decoders) are used literally. Per SPEC "Verifier
+ * conformance", outcomes are normative and these codes are informative.
  */
 export const DEFAULT_ERROR = {
   /** Owner or member signature fails strict RFC 8032 verification, or the DID has no key. */
@@ -44,11 +45,12 @@ export const DEFAULT_ERROR = {
   genesisFields: 'InvalidCeremony',
   /** Successor ceremony epoch is not the checked current epoch + 1, or the re-key counter changes. */
   successorGeneration: 'InvalidCeremony',
-  /** Reshare/refresh ceremony without a current-certificate digest. */
-  absentCurrent: 'ContextMismatch',
   /** Current certificate owner/network differs from the anchor. */
   certificateAnchor: 'InvalidCertificate',
-  /** Certificate commitment[0] ≠ mpk, genesis t outside 2..=16, or predecessor-field combination. */
+  /**
+   * Certificate commitment[0] ≠ mpk, genesis t outside 2..=16, or a §3.9 field combination:
+   * genesis counters/predecessors/genesis_t = t; successor epoch ≥ 1, rekey ≤ epoch; re-key mpk change, rekey ≥ 1.
+   */
   certificateFields: 'InvalidEncoding',
   /** Reshare B′_0 differs from the current mpk. */
   reshareMpk: 'ContextMismatch',
@@ -159,8 +161,14 @@ export function decodeCertificate(body: Bytes): Omit<Certificate, 'publicShares'
   if (!commitments[0]!.equals(mpk)) fail(DEFAULT_ERROR.certificateFields);
   if (commitments[t - 1]!.equals(G2_ZERO)) fail('IdentityPoint');
   const previousMpk = previousMpkBytes ? g2(previousMpkBytes) : undefined;
-  // §3.9 field combinations: genesis has neither predecessor field and zero counters; re-key has both.
-  if (!previous && (previousMpk || epoch !== 0n || rekey !== 0n)) fail(DEFAULT_ERROR.certificateFields);
+  // §3.9 field combinations.
+  if (!previous) {
+    if (previousMpk || epoch !== 0n || rekey !== 0n || genesisT !== t) fail(DEFAULT_ERROR.certificateFields);
+    if (n < 2 * t - 1) fail('UnsupportedFaultBudget');
+  } else {
+    if (epoch < 1n || rekey > epoch) fail(DEFAULT_ERROR.certificateFields);
+    if (previousMpk && (previousMpk.equals(mpk) || rekey < 1n)) fail(DEFAULT_ERROR.certificateFields);
+  }
   return {
     network, owner, rekey, epoch, genesisT, t, n, members, mpk, commitments, transcript,
     ...(previous ? { previous } : {}), ...(previousMpk ? { previousMpk } : {}), digest: tagged(TAG.networkCert, body),

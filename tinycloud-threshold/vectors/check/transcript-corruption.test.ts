@@ -10,7 +10,7 @@ const docs = { dkg: loadDoc('dkg-genesis.json'), reshare: loadDoc('reshare.json'
 const cli = new URL('./cli.ts', import.meta.url).pathname;
 
 for (const [kind, doc] of Object.entries(docs)) {
-  describe(`${kind}: raw one-byte corruptions are rejected with the SPEC-ordered reason`, () => {
+  describe(`${kind}: checker-order reason codes for raw one-byte corruptions (informative; rejection is normative)`, () => {
     for (const c of doc.cases) {
       test(c.name, () => {
         const base = inputOf(c), mismatches: string[] = [];
