@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.25.13](https://github.com/TinyCloudLabs/tinycloud-node/compare/v0.0.1...v1.25.13) - 2026-10-30
+
+### Fixed
+
+- *(policy-v3)* refuse new registrations with an unbound content source ([#485](https://github.com/TinyCloudLabs/tinycloud-node/pull/485))
+
+### Other
+
+- bind Share decrypt to registered named keys ([#481](https://github.com/TinyCloudLabs/tinycloud-node/pull/481))
+
 - Recheck hook ticket delegation revocation when event streams open and use
   literal segment-prefix matching for hook subscriptions.
 
