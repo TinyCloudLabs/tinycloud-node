@@ -496,7 +496,7 @@ A dealer answers in R3 only when its R1 passes the public checks and carries its
 
 ### Scope
 
-Completion requires the §3.0 owner relay to close each round once and deliver every conforming member's message, and at least t old dealers that pass the rules above. Faulty old dealers within the secrecy budget can still leave fewer than t valid dealers; the ceremony then refuses with `InsufficientQualified`. The protocol does not implement reliable broadcast. Redistribution does not erase anything: old shares remain valid for the old certificate until integration erases them (§3.11, §3.12); old and new shares carry different key contexts and are refused together by `verify_share` and `combine`.
+Completion requires the §3.0 owner relay to close each round once and deliver every conforming member's message, and at least t old dealers that pass the rules above. Faulty old dealers within the secrecy budget can still leave fewer than t valid dealers; the ceremony then refuses with `InsufficientQualified`. Completion also does not hold if a selected dealer can read other dealers' R1 before its own R1 is closed and acts with a new member: it can then choose a dealing that passes every check but makes a new public share the identity, and every recipient and the verifier refuse with `IdentityPoint` without attributing a dealer; this affects completion only, and the current epoch stays in force. The protocol does not implement reliable broadcast. Redistribution does not erase anything: old shares remain valid for the old certificate until integration erases them (§3.11, §3.12); old and new shares carry different key contexts and are refused together by `verify_share` and `combine`.
 
 ### In-memory lifecycle
 

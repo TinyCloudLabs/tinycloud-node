@@ -576,6 +576,12 @@ pub(crate) fn agreed(run: &Run, receivers: &[u16]) -> ReshareOutput {
     );
     assert_eq!(verified.dealers.len(), usize::from(run.fixture.old_t()));
     for j in receivers {
+        let outcome = &run.outcomes[j];
+        assert!(
+            outcome.is_ok(),
+            "receiver {j}: {:?}",
+            outcome.as_ref().err()
+        );
         let (candidate, output) = run.outcomes[j].as_ref().unwrap();
         assert_eq!(view(output), view(&verified), "receiver {j}");
         assert_eq!(candidate.index(), idx(*j));
@@ -1420,6 +1426,38 @@ fn r2_naming_a_dealer_outside_the_old_cohort_supplies_no_complaints() {
 }
 
 #[test]
+fn r2_naming_an_old_dealer_above_the_new_cohort_size_counts() {
+    // Old 3-of-5 to new 3-of-4: dealer indices are bounded by the old n = 5,
+    // so recipient 1's complaint against dealer 5 counts and is answered.
+    let (current, shares) = dealer_genesis(3, 5);
+    let f = fixture_on(current, shares, Reshare, 3, 4, 0xbe, &[1, 2, 3, 4]);
+    let run = run_with(f, |out| match out.round() {
+        1 => {
+            out.order(&[5, 1, 2, 3, 4]);
+            let forged = bad_dealing(out, 5, 1);
+            out.replace(5, &forged);
+        }
+        2 => assert_eq!(
+            ReshareComplaints::decode(&out.payload(1)).unwrap().dealers,
+            dealers(&[5])
+        ),
+        _ => {}
+    });
+    let published = ReshareAnswers::decode(run.answers[&5].as_ref().unwrap()).unwrap();
+    assert_eq!(
+        published
+            .answers
+            .iter()
+            .map(|(j, _)| *j)
+            .collect::<Vec<_>>(),
+        dealers(&[1])
+    );
+    let output = agreed(&run, &[1, 2, 3, 4]);
+    assert!(output.excluded.is_empty());
+    assert_eq!(output.dealers, dealers(&[5, 1, 2]));
+}
+
+#[test]
 fn relay_omitted_complaint_fails_only_the_affected_receiver() {
     // Failure scenario outside the trusted-relay liveness model.
     let run = run(Reshare, 2, 3, 0xa0, |out| match out.round() {
@@ -1878,6 +1916,109 @@ fn retry_under_a_new_ceremony_cannot_reuse_an_earlier_dealing() {
     assert_eq!(run.answers[&1].as_ref().unwrap().as_slice(), &EMPTY_ANSWERS);
     let output = agreed(&run, &[1, 2, 3]);
     assert_eq!(output.excluded, excluded(&[(1, ExcludeReason::Complaints)]));
+    assert_eq!(output.dealers, dealers(&[2, 3]));
+}
+
+/// A test DID verifier that also accepts `signature || 00`, modelling a
+/// signature scheme with more than one valid encoding of one statement.
+struct Malleable(Signers);
+impl DidSignatureVerifier for Malleable {
+    fn verify(&self, signer: &Did, message: &[u8], signature: &[u8]) -> Result<(), SignatureError> {
+        match signature {
+            [inner @ .., 0] if inner.len() == 64 => self.0.verify(signer, message, inner),
+            _ => self.0.verify(signer, message, signature),
+        }
+    }
+}
+
+/// Retransmit a member's first message with an alternate valid signature encoding.
+fn alternate_signature(out: &mut Outbox, member: u16) {
+    let key = out.key(member);
+    let mut copy = out
+        .messages
+        .iter()
+        .find(|m| sender(m) == key)
+        .cloned()
+        .unwrap();
+    copy.signature.push(0);
+    out.messages.push(copy);
+}
+
+#[test]
+fn different_signature_encoding_is_not_equivocation() {
+    // Dealer 1 (R1, R3) and recipient 2 (R2) retransmit with another signature
+    // encoding. Recipient 2 needs dealer 1's answer, so a retransmitted R2
+    // counted as conflicting would also drop its complaint.
+    let verifier = Malleable(Signers::new());
+    let run = drive(fixture(Reshare, 2, 3, 0xbb), &verifier, |out| {
+        if out.round() == 1 {
+            let forged = bad_dealing(out, 1, 2);
+            out.replace(1, &forged);
+        }
+        let member = if out.round() == 2 { 2 } else { 1 };
+        alternate_signature(out, member);
+    });
+    for record in &run.transcript.rounds {
+        assert_eq!(record.messages.len(), 4);
+    }
+    let verified = reshare_verify_transcript(
+        &run.fixture.ceremony,
+        &run.fixture.current,
+        &run.transcript,
+        &verifier,
+    )
+    .unwrap();
+    assert!(verified.excluded.is_empty());
+    assert_eq!(verified.dealers, dealers(&[1, 2]));
+    for j in [1, 2, 3] {
+        let outcome = &run.outcomes[&j];
+        assert!(
+            outcome.is_ok(),
+            "receiver {j}: {:?}",
+            outcome.as_ref().err()
+        );
+        assert_eq!(view(&outcome.as_ref().unwrap().1), view(&verified));
+    }
+    let published = ReshareAnswers::decode(run.answers[&1].as_ref().unwrap()).unwrap();
+    assert_eq!(
+        published
+            .answers
+            .iter()
+            .map(|(j, _)| *j)
+            .collect::<Vec<_>>(),
+        dealers(&[2])
+    );
+}
+
+#[test]
+fn dealer_answers_only_for_its_accepted_commitments() {
+    // A dealer that dealt twice in one ceremony (a retry without the
+    // integration marker): the owner closes R1 with the second dealing while
+    // the answering state holds the first polynomial. It publishes no answers
+    // and is excluded with MissingAnswer.
+    let run = run(Reshare, 2, 3, 0xbc, |out| match out.round() {
+        1 => {
+            let payload = {
+                let f = out.fixture();
+                let mut rng = ChaCha20Rng::from_seed([0xbd; 32]);
+                let (_, second) =
+                    reshare_deal(&f.ceremony, &f.current, &f.shares[&1], &mut rng).unwrap();
+                second.body()[41..].to_vec()
+            };
+            out.replace(1, &payload);
+        }
+        2 => out.replace(3, &complaints(&[1])),
+        _ => {}
+    });
+    for j in 1..=2 {
+        assert!(r2_dealers(&run, j).is_empty(), "recipient {j}");
+    }
+    assert_eq!(run.answers[&1].as_ref().unwrap().as_slice(), &EMPTY_ANSWERS);
+    let output = agreed(&run, &[1, 2, 3]);
+    assert_eq!(
+        output.excluded,
+        excluded(&[(1, ExcludeReason::MissingAnswer)])
+    );
     assert_eq!(output.dealers, dealers(&[2, 3]));
 }
 
