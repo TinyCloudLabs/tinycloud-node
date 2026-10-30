@@ -30,6 +30,7 @@ pub mod ibe;
 pub mod identity;
 pub mod ids;
 mod poly;
+pub mod reshare;
 pub mod seal;
 
 pub use activation::{
@@ -55,11 +56,18 @@ pub use fault::{verify_fault_proof, FaultProof, FaultVerdict, NotAFaultReason};
 pub use ibe::*;
 pub use identity::IbeIdentity;
 pub use ids::*;
+pub use reshare::{
+    reshare_deal, reshare_initial_transcript, reshare_start_receiver, reshare_verify_transcript,
+    ExcludeReason, ReshareAnswers, ReshareComplained, ReshareComplaints, ReshareDeal,
+    ReshareDealer, ReshareMessage, ReshareOutput, ReshareReceiving, ReshareTranscript,
+};
 pub use seal::{CeremonyHpkePublicKey, CeremonyHpkeSecretKey, SealedDealing};
 
 #[cfg(test)]
 mod checkpoint;
 #[cfg(test)]
 mod dkg_relay;
+#[cfg(test)]
+mod reshare_relay;
 #[cfg(test)]
 mod vectors;
