@@ -690,3 +690,148 @@ fn checkpoint_2of3_dkg() {
     assert!(keys.windows(2).all(|p| p[0] == p[1]));
     println!("5. PASS: each DKG share verified; pairs {{1,2}}, {{1,3}}, {{2,3}} derived the same key and unwrapped the data key");
 }
+
+/// Same checkpoint name filter: a real DKG genesis redistributed to 3-of-4,
+/// then a refused redistribution below t valid dealers. Details: TC-2221
+#[test]
+fn checkpoint_2of3_reshare() {
+    use crate::ceremony::{CeremonyKind, Decode};
+    use crate::reshare::{ReshareAnswers, ReshareComplaints};
+    use crate::reshare_relay::{
+        agreed, bad_dealing, fixture_on, install, public_shares_interpolate_to_mpk, refused,
+        run_with, unwraps_through_every_subset, wrapped,
+    };
+    use std::collections::BTreeMap;
+
+    let dkg = crate::dkg_relay::honest(2, 3, 0x73);
+    let output = crate::dkg_relay::agreed(&dkg, &[1, 2, 3]);
+    let crate::dkg_relay::Run {
+        fixture, outcomes, ..
+    } = dkg;
+    let anchor = fixture.signers.anchor();
+    let body = CertificateBody::genesis(
+        &anchor,
+        &fixture.ceremony,
+        &output.public,
+        &output.transcript_hash,
+    )
+    .unwrap();
+    let genesis = verify_certificate(
+        &anchor,
+        &crate::cert::tests::sign(body, &fixture.signers),
+        &fixture.signers,
+    )
+    .unwrap();
+    let shares: BTreeMap<u16, KeyShare> = outcomes
+        .into_iter()
+        .map(|(i, o)| (i, KeyShare::bind(o.unwrap().0, &genesis).unwrap()))
+        .collect();
+    let mpk = genesis.public_key_set().master_public_key().encode();
+    let (data, ct) = wrapped(&genesis, "records/reshare", 0x73);
+    println!(
+        "1. PASS: signed 2-of-3 genesis DKG bound to its certificate; data key wrapped under mpk {}",
+        hex::encode(&mpk[..8])
+    );
+
+    let f = fixture_on(
+        genesis,
+        shares.into_values(),
+        CeremonyKind::Reshare,
+        3,
+        4,
+        0x74,
+        &[1, 2, 3, 4],
+    );
+    let mut complaint = Vec::new();
+    let run = run_with(f, |out| match out.round() {
+        1 => {
+            let forged = bad_dealing(out, 2, 4);
+            out.replace(2, &forged);
+        }
+        2 => {
+            complaint = ReshareComplaints::decode(&out.payload(4)).unwrap().dealers;
+        }
+        _ => {}
+    });
+    assert_eq!(complaint, vec![MemberIndex::new(2).unwrap()]);
+    let answers = ReshareAnswers::decode(run.answers[&2].as_ref().unwrap()).unwrap();
+    assert_eq!(answers.answers.len(), 1);
+    let reshared = agreed(&run, &[1, 2, 3, 4]);
+    assert_eq!(reshared.public.master_public_key().encode(), mpk);
+    assert!(reshared.excluded.is_empty());
+    public_shares_interpolate_to_mpk(&reshared.public);
+    println!(
+        "2. PASS: signed redistribution 2-of-3 -> 3-of-4 closed R1-R3; dealer 2's bad value to recipient 4 drew one complaint and one valid answer; recipients 1-4 and reshare_verify_transcript agree on dealers {:?}, commitments, unchanged mpk and transcript hash {}",
+        reshared.dealers.iter().map(|i| i.get()).collect::<Vec<_>>(),
+        hex::encode(reshared.transcript_hash.as_bytes())
+    );
+
+    let next = install(run, &reshared);
+    assert_eq!(next.cert.key_context().epoch(), Epoch::new(1));
+    assert_eq!(next.cert.key_context().threshold(), Threshold::new(3, 4).unwrap());
+    println!("3. PASS: owner-signed successor certificate verified against the pinned genesis; all four candidates bound at epoch 1");
+    assert_eq!(
+        unwraps_through_every_subset(&next.cert, &next.shares, "records/reshare", &data, &ct, 0x75),
+        4
+    );
+    println!("4. PASS: each of the four 3-member subsets derived the key and unwrapped the data key wrapped under the genesis mpk; two shares returned NotEnoughShares");
+
+    let old = &next.previous;
+    let mut rng = ChaCha20Rng::from_seed([0x76; 32]);
+    let tsk = TransportSecretKey::generate(&mut rng);
+    let old_context = old.current.key_context();
+    let new_context = next.cert.key_context();
+    let old_req = DecryptRequest::new(
+        &old_context,
+        identity(&old_context, "records/reshare"),
+        tsk.public_key(),
+    )
+    .unwrap();
+    let new_req = DecryptRequest::new(
+        &new_context,
+        identity(&new_context, "records/reshare"),
+        tsk.public_key(),
+    )
+    .unwrap();
+    let old_issued = issue_share(&old.shares[&1], &authorize(old_req), &mut rng).unwrap();
+    let new_issued = issue_share(&next.shares[&1], &authorize(new_req.clone()), &mut rng).unwrap();
+    assert_eq!(
+        verify_share(next.cert.public_key_set(), &new_req, &old_issued),
+        Err(ShareError::ContextMismatch)
+    );
+    assert!(matches!(
+        combine(next.cert.public_key_set(), &new_req, &[new_issued, old_issued]),
+        Err(CombineError::MixedContexts)
+    ));
+    println!("5. PASS: an old-epoch share returned ContextMismatch against the new key set and MixedContexts in a new combine; old shares stay valid for the old certificate until integration erases them");
+
+    let shares: Vec<KeyShare> = next.shares.into_values().collect();
+    let f = fixture_on(
+        next.cert,
+        shares,
+        CeremonyKind::Reshare,
+        2,
+        3,
+        0x77,
+        &[1, 2, 3],
+    );
+    let refused_run = run_with(f, |out| {
+        if out.round() == 1 {
+            out.remove(3);
+            out.remove(4);
+        }
+    });
+    refused(&refused_run, &[1, 2, 3], Error::InsufficientQualified);
+    assert_eq!(
+        unwraps_through_every_subset(
+            &refused_run.fixture.current,
+            &refused_run.fixture.shares,
+            "records/reshare",
+            &data,
+            &ct,
+            0x78
+        ),
+        4
+    );
+    println!("6. PASS: with dealers 3 and 4 withholding R1, only 2 < t = 3 valid dealers remained; every recipient and the verifier returned InsufficientQualified and the 3-of-4 epoch still derived and unwrapped");
+}
