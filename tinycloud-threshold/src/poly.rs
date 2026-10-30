@@ -16,7 +16,6 @@ pub(crate) fn lagrange(
     Ok(numerator.mul(&denominator.inverse()?))
 }
 
-#[cfg(test)]
 pub(crate) fn evaluate(coefficients: &[Scalar], x: &Scalar) -> Scalar {
     coefficients
         .iter()
