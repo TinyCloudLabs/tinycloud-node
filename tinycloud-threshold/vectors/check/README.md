@@ -34,7 +34,7 @@ records, using `ceremony.ts` for the S0.2 layer. Check order:
    `UnsupportedFaultBudget`.
 3. Redistribution only: the current certificate (decode, anchor, owner
    signature, evaluated public shares), then ceremony/certificate binding
-   (`ContextMismatch`), successor epoch/re-key and refresh shape.
+   (`InvalidCeremony`), successor epoch/re-key and refresh shape.
 4. Each present record k as closed round k from the start link H0: closure
    ceremony/round/previous hash, owner closure signature, each envelope
    (decode, ceremony/round, signer in its signed cohort, strict RFC 8032

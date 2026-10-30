@@ -103,6 +103,8 @@ describe('§3.9 decoded-certificate rules on synthetic certificates', () => {
     expect(verifyCert(signedCertificate({ t: 2, n: 3, coefficients, epoch: 1n, rekey: 1n, previous, previousMpk: times(G2_BASE, 11n) }))).toBe('InvalidEncoding');
     expect(verifyCert(signedCertificate({ t: 2, n: 3, coefficients, epoch: 1n, rekey: 0n, previous, previousMpk: rotated }))).toBe('InvalidEncoding');
     expect(verifyCert(signedCertificate({ t: 2, n: 3, coefficients, epoch: 1n, rekey: 1n, previous, previousMpk: rotated }))).toBe('ok');
+    expect(verifyCert(signedCertificate({ t: 2, n: 3, coefficients, genesisT: 3, epoch: 1n, rekey: 1n, previous, previousMpk: rotated }))).toBe('InvalidEncoding');
+    expect(verifyCert(signedCertificate({ t: 3, n: 4, coefficients: [11n, 13n, 17n], epoch: 1n, rekey: 1n, previous, previousMpk: rotated }))).toBe('UnsupportedFaultBudget');
   });
   test('anchor, signature cap and signer', () => {
     const good = signedCertificate({ t: 2, n: 3, coefficients });

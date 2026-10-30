@@ -49,7 +49,7 @@ export const DEFAULT_ERROR = {
   certificateAnchor: 'InvalidCertificate',
   /**
    * Certificate commitment[0] ≠ mpk, genesis t outside 2..=16, or a §3.9 field combination:
-   * genesis counters/predecessors/genesis_t = t; successor epoch ≥ 1, rekey ≤ epoch; re-key mpk change, rekey ≥ 1.
+   * genesis counters/predecessors/genesis_t = t; successor epoch ≥ 1, rekey ≤ epoch; re-key mpk change, rekey ≥ 1, genesis_t = t.
    */
   certificateFields: 'InvalidEncoding',
   /** Reshare B′_0 differs from the current mpk. */
@@ -167,7 +167,10 @@ export function decodeCertificate(body: Bytes): Omit<Certificate, 'publicShares'
     if (n < 2 * t - 1) fail('UnsupportedFaultBudget');
   } else {
     if (epoch < 1n || rekey > epoch) fail(DEFAULT_ERROR.certificateFields);
-    if (previousMpk && (previousMpk.equals(mpk) || rekey < 1n)) fail(DEFAULT_ERROR.certificateFields);
+    if (previousMpk) {
+      if (previousMpk.equals(mpk) || rekey < 1n || genesisT !== t) fail(DEFAULT_ERROR.certificateFields);
+      if (n < 2 * t - 1) fail('UnsupportedFaultBudget');
+    }
   }
   return {
     network, owner, rekey, epoch, genesisT, t, n, members, mpk, commitments, transcript,
