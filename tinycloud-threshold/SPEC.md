@@ -219,7 +219,7 @@ All integer fields below are big-endian. `lp` is u32 length followed by bytes.
 - No S0.1 public decoder consumes a member list; lists introduced in later slices use the §3.2 sorted/count rules.
 - An availability budget counts all unavailable ready signers, including dishonest claims: `q - b >= t′`. All four ready holders in 3-of-4 support one unavailable holder, not two. `WithOutageBudget(0)` is not accepted.
 
-## Implemented surface through S0.2
+## Implemented surface through S0.3
 
 S0.1 implements §§3.1–3.6 and the typed parameters in §3.0. S0.2 adds the authenticated-context boundaries in §3.0, the certificate and fault-proof APIs in §3.9, and the receipt/activation verification in §3.12:
 
@@ -230,7 +230,9 @@ S0.1 implements §§3.1–3.6 and the typed parameters in §3.0. S0.2 adds the a
 - Fault verification checks certificate context, request/share binding and the member signature before classifying a failed share equation.
 - Readiness and activation APIs construct the defined preimages and verify every supplied receipt signature before quorum evaluation, receipt hashing or sorting.
 
-The dealer remains test-only. DKG and redistribution round implementations in §§3.7–3.8, HPKE dealings in §3.10, durable storage/retirement and node-runtime integration are separate slices. The crate remains an unwired workspace member.
+S0.3 adds the §3.10 sealed dealings with ceremony-scoped recipient keys and the §3.7 genesis DKG: consume-self member states over owner-closed rounds R1–R6, and `dkg_verify_transcript`, which recomputes the outcome from the raw signed round records. Its byte layouts and deterministic rules are in the S0.3 genesis DKG appendix below.
+
+The dealer remains test-only. Redistribution rounds in §3.8, durable storage/retirement and node-runtime integration are separate slices. The crate remains an unwired workspace member.
 
 ## S0.2 canonical byte appendix
 
@@ -351,3 +353,87 @@ activation.bytes = TH(ACTIVATE,
 The owner signs exactly those 32 activation bytes. Unlike ceremony/closure statements, activation `SignedStatement.bytes` already contains the domain-separated signing preimage rather than a raw body.
 
 The default quorum is all `n` holders. `WithOutageBudget(b)` requires `b > 0` and checked `q = t+b <= n`; at least `q` unique verified members must be ready. The budget includes all unavailable ready signers. Receipts are signed installation statements; durable storage, monotonic activation state and retirement remain integration operations.
+
+## S0.3 genesis DKG appendix
+
+This appendix records the byte layouts and deterministic rules that members and `dkg_verify_transcript` apply to §3.7. Integers are unsigned big-endian; `lp`, `TH`, point and scalar encodings are as in §3.2 and the S0.2 appendix. Rounds are numbered R1 = 1 through R6 = 6. Every DKG message uses the S0.2 member envelope with cohort `1` (authorized recipients); genesis has no dealer cohort.
+
+### Initial link and transcript
+
+```text
+H0 = TH("TC-THRESHOLD-V1-DKG-START", authorized_ceremony_digest:32)
+```
+
+`dkg_initial_transcript(c)` returns `H0`. The tag is specific to this link and is not part of the §3.3 table; it is distinct from, and not a prefix of, every §3.3 tag. Closed R1 names `H0` as its previous hash; each later round names the S0.2 transcript update of the round before it. The DKG transcript hash is the transcript update after closed R5, or after closed R6 when R6 is required.
+
+Each member transition first requires the closed round's authorized-ceremony digest, round number and previous hash to equal the values the consuming state holds; otherwise it returns `InvalidRound` before reading any message.
+
+`DkgTranscript` is the list of raw round records: the exact owner closure (body and signature) and the exact member statements in owner order. `dkg_verify_transcript` first sums the byte lengths of every closure body, closure signature, member envelope and member signature and returns `LimitExceeded` above 4194304 bytes, before any signature check. It then verifies R1–R5 as closed rounds, verifies R6 exactly when the R5 rules require it, and rejects missing or additional records with `InvalidRound`. It derives the outcome from the authenticated records only.
+
+### Pedersen generator and dealing context
+
+`h = hash_to_curve_G2("pedersen-h", PEDERSEN_H DST)` as in §3.3. The commitment-vector hash used as HPKE AAD is:
+
+```text
+TH(COMMITMENTS, t:u16 || C_0:96 || … || C_(t−1):96)
+```
+
+HPKE `info` is `DEALING || authorized_ceremony_digest:32 || 01 || dealer:u16 || recipient:u16`. The sealed plaintext is exactly `s_ij:32 || s′_ij:32`, both canonical scalars.
+
+Dealers draw randomness in this order: the t coefficients of f_i (constant first), then the t coefficients of f′_i, each as 64 bytes reduced mod r and redrawn if zero; then one HPKE encapsulation per recipient in index order.
+
+### Payloads
+
+```text
+R1 deal         = 01 || t:u16 || [C_k:96]  || n:u16 || [(recipient:u16 || lp(sealed_dealing))]
+R2 complaints   = 01 || count:u16 || [dealer:u16]
+R3 answers      = 01 || count:u16 || [(recipient:u16 || s:32 || s′:32)]
+R4 feldman      = 01 || t:u16 || [A_k:96]
+R5 extraction   = 01 || count:u16 || [(dealer:u16 || s:32 || s′:32)]
+R6 values       = 01 || count:u16 || [(dealer:u16 || s:32 || s′:32)]
+```
+
+`sealed_dealing` is the §3.10 envelope `01 || enc:32 || lp(ciphertext)`. Every count is at most 16 and is checked before allocation; index lists are strictly increasing member indices 1..=16; point coefficients are canonical G2 encodings and individual coefficients may be the identity (§3.2 role table); scalars are canonical. Trailing bytes and other versions are rejected. A payload that fails this decoding is *malformed*.
+
+### Classifying a round
+
+Within a closed round, authenticated messages are grouped by sender. Messages with byte-identical envelopes are one message regardless of their signature bytes. Two messages from one sender with different envelope bytes are *conflicting*; this compares the signed content, including malformed payloads. A sender with no message is *missing*.
+
+### R1–R3 and QUAL
+
+For each member index i, in this order, the first applicable reason disqualifies dealer i:
+
+1. `MissingDeal`: no R1 from i.
+2. `Equivocated { round: 1 }`: conflicting R1.
+3. `MalformedDeal`: R1 is malformed, has a commitment count other than t, or its recipient list is not exactly 1..=n.
+4. `Equivocated { round: 2 }`: conflicting R2 from i.
+5. `Equivocated { round: 3 }`: conflicting R3 from i.
+6. `Complaints`: at least t distinct complainers counted against i (below).
+7. `InvalidAnswer`: i's decoded R3 contains any answer that fails `s·g2 + s′·h = Σ_k j^k·C_ik` at its recipient j, whether or not that answer was required.
+8. `MissingAnswer`: a required answer is absent: i's R3 is missing or malformed, or omits a required recipient.
+
+R2 counting: a complaint by j against i counts once per distinct j, only from a non-conflicting, decodable R2 whose dealer indices are all at most n, and never when j = i. A malformed R2 supplies no complaints; a conflicting R2 supplies no complaints and disqualifies its sender as a dealer under rule 4. The required answers for dealer i are exactly the counted complainers against i.
+
+R3 rules: an R3 is used only if it decodes and all recipient indices are at most n; otherwise it is malformed. A missing or malformed R3 disqualifies i only when i has required answers. A valid answer that was not required is ignored and creates no complaint. A valid required answer replaces the complainer's private pair from i.
+
+QUAL is every dealer not disqualified, fixed after closed R3. If |QUAL| < t the ceremony returns `InsufficientQualified`. A member that lacks a Pedersen-valid pair from some QUAL dealer after R3 returns `LocalShareUnavailable`; this only arises when a member's own complaint is absent from closed R2.
+
+Members complain in R2 about every dealer whose valid R1 dealing to them fails to open, decode or satisfy the Pedersen relation. A dealer answers in R3 every counted complaint against it when its own R1 was accepted. Every member sends R2 and R3, possibly empty.
+
+### R4–R6 and output
+
+For each i in QUAL, an *extraction fault* is a missing, conflicting or malformed R4, or an R4 whose coefficient count is not t. R4 from a sender outside QUAL is ignored.
+
+Every member sends R5, possibly empty, listing each other QUAL dealer i whose valid R4 fails `s_ij·g2 = Σ_k j^k·A_ik` for its own pair. An R5 entry by sender j against dealer i is *upheld* when i ≠ j, i is in QUAL without an extraction fault, the pair satisfies the Pedersen relation for C_i at j, and the Feldman relation for A_i at j fails. Other entries are ignored. Missing, malformed and conflicting R5 messages count as empty lists. No member finishes before consuming closed R5.
+
+The *reconstructed* set is the extraction faults plus every dealer with an upheld R5 entry. If it is empty the ceremony finishes after R5. Otherwise every member sends R6 with its Pedersen-valid pair for each reconstructed dealer, and the ceremony finishes after R6. For each reconstructed dealer i, the values used are those from non-conflicting, decodable R6 messages whose entry for i satisfies the Pedersen relation at the sender index; the t lowest sender indices are interpolated to the coefficients of f_i, and A_ik = a_ik·g2 replaces i's published vector. Dealer i stays in QUAL. Fewer than t such values return `InsufficientRecovery`. Missing, malformed and conflicting R6 messages contribute no values.
+
+Output: A_k = Σ_{i∈QUAL} A_ik; mpk = A_0; pk_j = Σ_k j^k·A_k; identity mpk, A_(t−1) or pk_j is rejected (§3.2). The member's candidate scalar is Σ_{i∈QUAL} s_ij using R3 replacements. `DkgOutput` carries the public material, QUAL, the disqualification reasons, the reconstructed set and the transcript hash.
+
+### Scope
+
+Agreement among members and the verifier relies on the §3.0 owner relay closing each round once and delivering every conforming member's message. Round equivocation compares conflicting authenticated message content from the same sender; a different signature encoding alone is not equivocation. A relay that omits or substitutes messages produces the failure outcomes above, not agreement; the protocol does not implement reliable broadcast.
+
+### In-memory lifecycle
+
+`CeremonyHpkeSecretKey` is dropped when R1 has been processed. Polynomial coefficients are dropped when R4 has been produced. Received private pairs remain in the state until the member finishes after R5 or R6. States are consumed by each transition, so an error drops the state; scalars clear their storage on drop and states have redacted `Debug`. The caller's RNG state and any durable copies are outside this crate (§3.11).

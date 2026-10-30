@@ -47,6 +47,16 @@ impl CeremonyHpkeSecretKey {
         public.write_exact(&mut public_bytes);
         (owned, CeremonyHpkePublicKey(public_bytes))
     }
+
+    /// Derive this ceremony recipient's public key. Details: TC-2220
+    pub(crate) fn public_key(&self) -> Result<CeremonyHpkePublicKey, Error> {
+        let secret = <HpkeKem as Kem>::PrivateKey::from_bytes(&self.bytes)
+            .map_err(|_| Error::InvalidHpkeKey)?;
+        let public = HpkeKem::sk_to_pk(&secret);
+        let mut public_bytes = [0; 32];
+        public.write_exact(&mut public_bytes);
+        Ok(CeremonyHpkePublicKey(public_bytes))
+    }
 }
 
 impl fmt::Debug for CeremonyHpkeSecretKey {
@@ -625,5 +635,12 @@ mod tests {
             proptest::prop_assert_eq!(&decoded.ciphertext, &ciphertext);
             proptest::prop_assert_eq!(decoded.encode(), wire);
         }
+    }
+
+    #[test]
+    fn secret_public_key_matches_generated_recipient() {
+        let mut rng = ChaCha20Rng::from_seed([0x39; 32]);
+        let (secret, public) = CeremonyHpkeSecretKey::generate(&mut rng);
+        assert_eq!(secret.public_key(), Ok(public));
     }
 }

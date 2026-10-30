@@ -98,7 +98,6 @@ macro_rules! scalar_binary {
 }
 
 impl Scalar {
-    #[cfg(test)]
     pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
         let bytes: &[u8; 32] = bytes.try_into().map_err(|_| Error::InvalidLength)?;
         let mut out = Self(blst_scalar::default());
@@ -113,7 +112,6 @@ impl Scalar {
     }
 
     /// The returned secret bytes must be guarded by their caller.
-    #[cfg(test)]
     pub(crate) fn to_bytes(&self) -> [u8; 32] {
         let mut out = [0; 32];
         // SAFETY: exactly 32 writable bytes; canonical initialized scalar.
@@ -162,7 +160,6 @@ impl Scalar {
         bool::from(self.0.b.ct_eq(&[0; 32]))
     }
 
-    #[cfg(test)]
     scalar_binary!(add, blst_fr_add);
     scalar_binary!(sub, blst_fr_sub);
     scalar_binary!(mul, blst_fr_mul);
@@ -379,7 +376,6 @@ pub(crate) fn hash_g1(msg: &[u8], dst: &[u8]) -> G1 {
     }
     out
 }
-#[cfg(test)]
 pub(crate) fn hash_g2(msg: &[u8], dst: &[u8]) -> G2 {
     let mut out = G2::identity();
     // SAFETY: readable pointer-length pairs, no augmentation, initialized output.

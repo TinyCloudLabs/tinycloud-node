@@ -52,6 +52,12 @@ pub enum Error {
     NotEnoughReady,
     #[error("candidate does not match certificate")]
     CandidateMismatch,
+    #[error("fewer than t qualified dealers")]
+    InsufficientQualified,
+    #[error("fewer than t valid reconstruction values")]
+    InsufficientRecovery,
+    #[error("no valid private value from a qualified dealer")]
+    LocalShareUnavailable,
 }
 
 /// Verification distinguishes context selection from a member's share equation.

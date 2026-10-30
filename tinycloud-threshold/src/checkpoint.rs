@@ -589,3 +589,104 @@ proptest! {
         if let Ok(v)=IbeCiphertext::decode(&c) { prop_assert_eq!(v.encode(),c); }
     }
 }
+
+/// Same checkpoint name filter, driven by real signed DKG candidates. Details: TC-2220
+#[test]
+fn checkpoint_2of3_dkg() {
+    use crate::ceremony::Decode;
+    use crate::dkg::{DkgFeldman, DkgOutput};
+    use crate::dkg_relay::{agreed, members, run, sum, vanishing_feldman, Run};
+
+    let mut constants = Vec::new();
+    let dkg = run(2, 3, 0x71, |out| {
+        if out.round() == 4 {
+            constants = (1..=3)
+                .map(|i| DkgFeldman::decode(&out.payload(i)).unwrap().commitments[0].encode())
+                .collect();
+            let forged = vanishing_feldman(&out.payload(3), &[1]);
+            out.replace(3, &forged);
+        }
+    });
+    let output: DkgOutput = agreed(&dkg, &[1, 2, 3]);
+    assert_eq!(dkg.transcript.rounds.len(), 6);
+    println!(
+        "1. PASS: signed 2-of-3 genesis DKG closed R1-R6; members 1, 2, 3 and dkg_verify_transcript agree on QUAL, commitments, mpk and transcript hash {}",
+        hex::encode(output.transcript_hash.as_bytes())
+    );
+    assert!(dkg.reconstruct.values().all(|r| *r));
+    assert_eq!(output.qual, members(&[1, 2, 3]));
+    assert_eq!(output.reconstructed, members(&[3]));
+    assert!(output.disqualified.is_empty());
+    println!("2. PASS: dealer 3's R4 passed only member 1; every member waited for the common closed R5, and R6 recovered dealer 3, which stayed in QUAL");
+    assert_eq!(
+        output.public.master_public_key().encode(),
+        sum(constants.iter().copied())
+    );
+    println!("3. PASS: mpk equals the sum of all three dealers' committed constants, including dealer 3's recovered contribution");
+
+    let Run {
+        fixture, outcomes, ..
+    } = dkg;
+    let anchor = fixture.signers.anchor();
+    let body = CertificateBody::genesis(
+        &anchor,
+        &fixture.ceremony,
+        &output.public,
+        &output.transcript_hash,
+    )
+    .unwrap();
+    let cert = verify_certificate(
+        &anchor,
+        &crate::cert::tests::sign(body, &fixture.signers),
+        &fixture.signers,
+    )
+    .unwrap();
+    let shares: Vec<KeyShare> = outcomes
+        .into_values()
+        .map(|outcome| KeyShare::bind(outcome.unwrap().0, &cert).unwrap())
+        .collect();
+    assert_eq!(shares.len(), 3);
+    println!("4. PASS: owner-signed genesis certificate verified under the anchor; all three DKG candidate shares bound to it");
+
+    let mut rng = ChaCha20Rng::from_seed([0x72; 32]);
+    let tsk = TransportSecretKey::generate(&mut rng);
+    let req = DecryptRequest::new(
+        &cert.key_context(),
+        identity(&cert.key_context(), "records/dkg"),
+        tsk.public_key(),
+    )
+    .unwrap();
+    let auth = authorize(req.clone());
+    let issued: Vec<_> = shares
+        .iter()
+        .map(|s| issue_share(s, &auth, &mut rng).unwrap())
+        .collect();
+    for share in &issued {
+        verify_share(cert.public_key_set(), &req, share).unwrap();
+    }
+    let data = DataKey::new([0x24; 32]);
+    let ct = wrap_key(
+        cert.public_key_set().master_public_key(),
+        req.identity(),
+        &data,
+        &mut rng,
+    )
+    .unwrap();
+    let mut keys = Vec::new();
+    for (a, b) in [(0, 1), (0, 2), (1, 2)] {
+        let encrypted = combine(
+            cert.public_key_set(),
+            &req,
+            &[issued[a].clone(), issued[b].clone()],
+        )
+        .unwrap();
+        let key = decrypt_derived_key(&encrypted, &tsk, cert.public_key_set(), &req).unwrap();
+        assert_eq!(
+            unwrap_key(&key, req.identity(), &ct).unwrap().as_bytes(),
+            data.as_bytes()
+        );
+        keys.push(key.key.encode());
+    }
+    assert!(keys.windows(2).all(|p| p[0] == p[1]));
+    println!("5. PASS: each DKG share verified; pairs {{1,2}}, {{1,3}}, {{2,3}} derived the same key and unwrapped the data key");
+}
