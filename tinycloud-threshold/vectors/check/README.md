@@ -86,3 +86,131 @@ Development dependencies are TypeScript 5.9.3 (Apache-2.0), `@types/bun` 1.3.1,
 read from the npm registry metadata for those exact versions.
 
 Details: TC-2219
+
+## Certificate-core checker portion
+
+The default `bun run vectors` now checks both module-relative inputs:
+`../v1/primitives.json` and `../v1/cert-core.json`. An explicit path checks
+only that document:
+
+```sh
+bun run vectors /absolute/path/to/cert-core.json
+```
+
+The existing frozen-install / `bun run check` entry runs all test files,
+typechecking and both real CLI paths. No dependency versions changed.
+
+`cert-schema.ts` defines the current named certificate document shape.
+`certificates.ts` computes canonical certificate and ceremony encodings,
+tagged hashes, Ed25519 signatures, public-share commitment evaluations,
+lineage, authenticated closed rounds, readiness/activation and fault verdicts.
+`cert-vectors.ts` executes the operations and compares every declared output
+or computed error. Format metadata, tags, bounds and role constants come from
+compiled definitions, not fixture metadata.
+
+All 17 explicit synthetic-DID seed/public-key mappings are independently
+checked with noble Ed25519. These labels form a test signing-key directory;
+the checker does not resolve production DIDs. Certificates require the
+external owner/network anchor, owner signature, canonical member directory,
+commitments and pinned lineage. The checker evaluates public shares from the
+input commitments rather than using expected public shares.
+
+Reference lookup indexes only independently recomputed hashes of input
+bodies. It returns certificates and ceremonies only after verification.
+Expected-output digests are comparison values, never reference authority.
+Unresolved, ambiguous and unanchored references are rejected. Record order
+does not establish trust.
+
+### Fixture-only omitted-anchor conventions
+
+For `stale-ceremony-predecessor`, `inputs.pinned_predecessor` selects the
+independently verified certificate and its external anchor. The body's
+encoded current digest does not select a predecessor; it must equal that
+explicit pin. The declared stale current value is therefore checked against
+the pin, not used as a fallback.
+
+For `genuine-old-response-after-rekey`, the inline certificate is
+canonical-decoded to locate its previous digest. That digest must resolve to
+an independently verified predecessor. The checker inherits only that
+predecessor's rooted external anchor, verifies the inline successor's owner,
+network, lineage and signature, then uses its verified current context.
+The candidate body's owner/network do not establish an anchor.
+
+These are disclosed cross-record conventions for this fixture, not production
+trust or freshness defaults. No trusted-log freshness input is invented.
+`certificate-anchors.test.ts` exercises both conventions and the absence of
+candidate-owner or first-record fallbacks.
+
+### Round, activation and fault boundaries
+
+Closed-round checking authenticates each exact member envelope under its
+signed cohort and directory without fallback, preserves raw payloads and
+owner order, verifies the closure, and computes its recursive transcript hash.
+The owner relay is trusted; this is not consensus or a freshness mechanism.
+Opaque inner payloads are retained, not interpreted as DKG phase outcomes.
+
+Activation checks every receipt signature, including surplus receipts, before
+counting, receipt hashing or sorting. Receipts encode as
+`01 || index:u16be || lp(signature)` and hash under READY. Their 32-byte hashes
+sort in binary lexicographic order. Readiness and activation signatures remain
+signed claims, not proofs of possession or durable installation.
+
+Fault checking first requires a verified certificate, matching amended
+request/share bindings and the member signature. Only then do the two share
+equations determine `Fault(member)` versus `NotAFault(ValidShare)`. Context,
+helper or signature failures do not attribute an equation fault.
+
+### Chosen single-byte CLI probes
+
+Each probe uses an in-memory clone and the real CLI through `/dev/stdin`;
+the producer file is not rewritten. Offsets below are zero-based decoded
+field-byte offsets; each substitution is checked to change exactly one byte.
+Offsets are decimal; byte values and XOR masks in the table are hexadecimal.
+
+| Record | Field / byte basis | Changed decision |
+| --- | --- | --- |
+| genesis-2of3 | outputs.digest[31] XOR 01 | Computed digest comparison |
+| reshare-3of4 | outputs.digest[31] XOR 01 | Computed digest comparison |
+| rekey-2of3 | outputs.digest[31] XOR 01 | Computed digest comparison |
+| ceremony-epoch-0 | outputs.digest[31] XOR 01 | Computed authorization comparison |
+| ceremony-epoch-1 | outputs.digest[31] XOR 01 | Computed authorization comparison |
+| ceremony-epoch-2 | outputs.digest[31] XOR 01 | Computed authorization comparison |
+| closed-round-1 | outputs.transcript_hash[31] XOR 01 | Computed recursive hash comparison |
+| activate-all-2of3 | inputs.receipts[0].receipt_hash[31] XOR 01 | Computed receipt hash comparison |
+| duplicate-member-did | inputs.body[143], 31 to 32 | Decoder succeeds instead of declared error |
+| trailing-certificate-byte | error UTF-8[0] XOR 01 | Schema-only error-label probe |
+| stale-ceremony-predecessor | inputs.body[0] XOR 01 | Actual error becomes InvalidEncoding |
+| signed-valid-share | outputs.signing_preimage[31] XOR 01 | Computed signing hash comparison |
+| signed-bad-share | outputs.signing_preimage[31] XOR 01 | Computed signing hash comparison |
+| genuine-old-response-after-rekey | inputs.owner_signature[0] XOR 01 | NotAFault reason becomes InvalidSignature |
+| activation-under-quorum | inputs.receipts[0].signature[0] XOR 01 | InvalidReadiness before counting |
+| activation-zero-budget | budget encoded u16be[1] XOR 01 | Budget becomes 1; activation succeeds |
+| activation-budget-overflow | inputs.candidate[31] XOR 01 | UnresolvedReference before budget evaluation |
+| activation-duplicate-member | inputs.candidate[31] XOR 01 | UnresolvedReference before duplicate evaluation |
+
+The trailing-byte row also has a separate valid-body substitution proving its
+actual expected-error comparison. Overflow and duplicate rows additionally
+substitute a valid budget and unique receipts, respectively, proving semantic
+success disagrees with their declared errors. Their one-byte reference probes
+are not direct repairs of the budget or duplicated signature. No arbitrary
+bit-flip assertion is made.
+
+Independent behavior tests also cover external anchors, canonical boundaries,
+lineage, cohort selection, signature-before-quorum ordering and fault-check
+precedence. Constant-substitution tests cover all eight tags, fixed format
+metadata and alternate-domain matching signatures/outputs.
+
+### Certificate portion provenance and scope
+
+This portion uses the immutable certificate JSON, the approved Rust-free
+byte-layout inventory and its two clarified cross-reference conventions,
+existing independently written checker utilities, and the
+[noble-curves 2.4.0 API README](https://github.com/paulmillr/noble-curves/blob/2.4.0/README.md).
+No Rust source/tests/diffs, dependency implementation or other threshold
+implementation was consulted.
+
+This is certificate-core checking only. DKG/resharing execution and transcript
+outcome recomputation, and full S0.5 completion, remain outside this portion.
+Producer API execution is distinct from this independent checker execution.
+
+Details: TC-2223
