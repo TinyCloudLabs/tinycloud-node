@@ -93,7 +93,7 @@ export function signedCeremony(c: CeremonySpec, signer = OWNER): Statement {
 }
 export interface CertificateSpec {
   network?: string; owner?: string; rekey?: bigint; epoch?: bigint; genesisT?: number; t: number; n: number;
-  coefficients: bigint[]; transcript?: Bytes; previous?: Bytes; previousMpk?: G2;
+  coefficients: bigint[]; mpk?: G2; transcript?: Bytes; previous?: Bytes; previousMpk?: G2;
 }
 export function certificateBody(c: CertificateSpec): Bytes {
   const commitments = c.coefficients.map(a => times(G2_BASE, a));
@@ -101,7 +101,7 @@ export function certificateBody(c: CertificateSpec): Bytes {
     be(1n, 1), lp(enc.encode(c.network ?? NETWORK)), lp(enc.encode(c.owner ?? OWNER)), be(c.rekey ?? 0n, 8), be(c.epoch ?? 0n, 8),
     be(BigInt(c.genesisT ?? c.t), 2), be(BigInt(c.t), 2), be(BigInt(c.n), 2), be(BigInt(c.n), 2),
     ...Array.from({ length: c.n }, (_, k) => concat(be(BigInt(k + 1), 2), lp(enc.encode(did(k + 1))))),
-    commitments[0]!.toBytes(), be(BigInt(commitments.length), 2), ...commitments.map(p => p.toBytes()),
+    (c.mpk ?? commitments[0]!).toBytes(), be(BigInt(commitments.length), 2), ...commitments.map(p => p.toBytes()),
     c.transcript ?? new Uint8Array(32).fill(7),
     c.previous ? concat(be(1n, 1), c.previous) : be(0n, 1),
     c.previousMpk ? concat(be(1n, 1), c.previousMpk.toBytes()) : be(0n, 1),

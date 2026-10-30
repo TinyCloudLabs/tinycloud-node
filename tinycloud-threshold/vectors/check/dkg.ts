@@ -1,7 +1,7 @@
 import { bls12_381 as bls } from '@noble/curves/bls12-381.js';
 import { DST, PEDERSEN_H_MESSAGE, ProtocolError, Reader, bytes, g2, scalar, tagged, type Bytes, type G2 } from './protocol.ts';
 import {
-  COHORT, KIND, TAG, authorizeCeremony, checkTranscriptSize, classify, evaluate, fail, listCount,
+  COHORT, DEFAULT_ERROR, KIND, TAG, authorizeCeremony, checkTranscriptSize, classify, evaluate, fail, listCount,
   memberIndex, mul, verifyChain, type Anchor, type Authenticated, type Ceremony, type Classified, type RoundRecord,
   type Statement, type Verifier,
 } from './ceremony.ts';
@@ -96,7 +96,8 @@ export function dkgInitialTranscript(ceremonyDigest: Bytes): Bytes { return tagg
 /** Genesis-only ceremony rules (S0.2 appendix and §3.0 budget). */
 export function authorizeGenesis(anchor: Anchor, statement: Statement, verify: Verifier): Ceremony {
   const c = authorizeCeremony(anchor, statement, verify);
-  if (c.kind !== KIND.genesis || c.current || c.rekey !== 0n || c.epoch !== 0n) fail('InvalidCeremony');
+  if (c.kind !== KIND.genesis) fail('InvalidCeremony');
+  if (c.current || c.rekey !== 0n || c.epoch !== 0n) fail(DEFAULT_ERROR.genesisFields);
   if (c.n < 2 * c.t - 1) fail('UnsupportedFaultBudget');
   return c;
 }

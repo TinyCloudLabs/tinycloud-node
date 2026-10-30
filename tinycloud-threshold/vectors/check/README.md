@@ -58,8 +58,10 @@ ordered reason; re-signed flips reach the rule-level outcome.
 `transcript-vectors.test.ts` perturbs expected outputs and runs the real CLI.
 
 The checker does not open sealed dealings (it holds no recipient keys); a
-sealed dealing is decoded by layout only, as SPEC requires of the public
-verifier.
+sealed dealing is decoded by layout only, per Naomi's 2026-10-30 ruling.
+`s02.test.ts` runs the `../v1/cert-core.json` certificate, ceremony and
+closed-round records through the same S0.2 layer and covers the §3.9
+decoded-certificate rules.
 
 ## Computations
 

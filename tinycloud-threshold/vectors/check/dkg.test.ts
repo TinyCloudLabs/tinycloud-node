@@ -2,11 +2,11 @@ import { describe, expect, test } from 'bun:test';
 import { ed25519 } from '@noble/curves/ed25519.js';
 import { R, be, concat, tagged, type Bytes } from './protocol.ts';
 import { dkgVerifyTranscript, type DkgOutput } from './dkg.ts';
-import type { RoundRecord, Statement } from './ceremony.ts';
+import { ed25519Verifier, type RoundRecord, type Statement } from './ceremony.ts';
 import {
-  ANCHOR, COHORT_DEALERS, COHORT_RECIPIENTS, G2_BASE, H, alternateSignature, at, code, complaints, deal, did, dkgSetup,
-  SEEDS, expectedDkg, feldman, flip, g2hex, nonCanonicalR, nonCanonicalS, pair, pairs, seal, signedCeremony, times, verify,
-  type DkgSetup, type Draft,
+  ANCHOR, COHORT_DEALERS, COHORT_RECIPIENTS, G2_BASE, H, NETWORK, OWNER, SEEDS, alternateSignature, at, ceremonyBody, code,
+  complaints, deal, did, dkgSetup, expectedDkg, feldman, flip, g2hex, nonCanonicalR, nonCanonicalS, pair, pairs, seal, sign,
+  signedCeremony, times, verify, type DkgSetup, type Draft,
 } from './testkit.ts';
 
 function records(s: DkgSetup, rounds: Draft[][] = s.rounds): RoundRecord[] { return seal(s.digest, s.start, rounds).records; }
@@ -141,6 +141,15 @@ describe('R1–R3 and QUAL', () => {
     expect(code(() => run(s, alone))).toBe('InvalidRound');
     expect(code(() => run(s, alone.slice(0, 2)))).toBe('InvalidRound');
   });
+  test('rules 5–8 apply in order', () => {
+    const two = replace(replace(s, 2, 2, msg(2, complaints([1]))), 2, 3, msg(3, complaints([1])));
+    expect(run(s, replace(two, 3, 1)).disqualified).toEqual([{ member: 1, reason: 'Complaints' }]);
+    expect(run(s, replace(two, 3, 1, msg(1, pairs([[2, 1n, 1n]])))).disqualified).toEqual([{ member: 1, reason: 'Complaints' }]);
+    expect(run(s, replace(two, 3, 1, msg(1, pairs([])), msg(1, pairs([[2, ...pair(s.dealers[0]!, 2)]])))).disqualified)
+      .toEqual([{ member: 1, reason: 'Equivocated', round: 3 }]);
+    const one = replace(s, 2, 2, msg(2, complaints([1])));
+    expect(run(s, replace(one, 3, 1, msg(1, pairs([[3, 1n, 1n]])))).disqualified).toEqual([{ member: 1, reason: 'InvalidAnswer' }]);
+  });
 });
 
 describe('R4–R6 extraction and reconstruction', () => {
@@ -167,10 +176,14 @@ describe('R4–R6 extraction and reconstruction', () => {
     expect(out.reconstructed).toEqual([3]);
     expectPublic(out, s, members);
   });
-  test('R5 entries that are Pedersen-invalid, self-directed or Feldman-valid are ignored', () => {
+  test('R5 entries that are self-directed, Pedersen-invalid or against a Feldman-valid dealer are not upheld', () => {
+    const wrong = replace(s, 4, 3, msg(3, feldman([s.dealers[2]!.A[0]!, s.dealers[2]!.A[1]!.add(G2_BASE)])));
     const [x, y] = pair(s.dealers[2]!, 1);
-    for (const entry of [[3, x, (y + 1n) % R], [1, ...pair(s.dealers[0]!, 1)], [3, x, y]] as const) {
-      const rounds = replace(s, 5, 1, msg(1, pairs([entry])));
+    for (const rounds of [
+      replace(wrong, 5, 3, msg(3, pairs([[3, ...pair(s.dealers[2]!, 3)]]))),
+      replace(wrong, 5, 1, msg(1, pairs([[3, x, (y + 1n) % R]]))),
+      replace(s, 5, 1, msg(1, pairs([[3, x, y]]))),
+    ]) {
       expect(run(s, rounds).reconstructed).toEqual([]);
       expect(code(() => run(s, [...rounds, r6(s, [3])]))).toBe('InvalidRound');
     }
@@ -210,10 +223,17 @@ describe('ceremony, round structure and limits', () => {
     expect(verifyWith(signedCeremony({ kind: 1, t: 2, n: 3, owner: did(1) }, did(1)), [])).toBe('InvalidCeremony');
     expect(verifyWith(signedCeremony({ kind: 2, t: 2, n: 3, current: new Uint8Array(32), epoch: 1n }), [])).toBe('InvalidCeremony');
     expect(verifyWith(signedCeremony({ kind: 1, t: 2, n: 3, epoch: 1n }), [])).toBe('InvalidCeremony');
+    expect(verifyWith(signedCeremony({ kind: 1, t: 2, n: 3, rekey: 1n }), [])).toBe('InvalidCeremony');
+    expect(verifyWith(signedCeremony({ kind: 1, t: 2, n: 3, current: new Uint8Array(32) }), [])).toBe('InvalidCeremony');
     expect(verifyWith(signedCeremony({ kind: 1, t: 3, n: 4 }), [])).toBe('UnsupportedFaultBudget');
     expect(verifyWith({ ...s.ceremony, signature: flip(s.ceremony.signature, 0) }, [])).toBe('InvalidSignature');
     expect(verifyWith({ ...s.ceremony, body: concat(s.ceremony.body, be(0n, 1)) }, [])).toBe('InvalidEncoding');
     expect(verifyWith(signedCeremony({ kind: 1, t: 2, n: 3, directory: [{ index: 1, did: did(1) }, { index: 2, did: did(1) }, { index: 3, did: did(3) }] }), [])).toBe('InvalidEncoding');
+    expect(verifyWith(signedCeremony({ kind: 1, t: 2, n: 3, directory: [{ index: 1, did: did(1) }, { index: 2, did: did(2) }, { index: 4, did: did(4) }] }), [])).toBe('InvalidEncoding');
+    const marker = ceremonyBody({ kind: 1, t: 2, n: 3 });
+    marker[34 + 4 + NETWORK.length + 4 + OWNER.length] = 2;
+    expect(verifyWith({ body: marker, signature: sign(OWNER, tagged('TC-THRESHOLD-V1-CEREMONY-AUTH', marker)) }, [])).toBe('InvalidEncoding');
+    expect(verifyWith({ ...s.ceremony, signature: new Uint8Array(513) }, [])).toBe('InvalidEncoding');
   });
   test('record count, closure binding and ordered-list commitment', () => {
     const rs = records(s);
@@ -237,10 +257,16 @@ describe('ceremony, round structure and limits', () => {
     expect(ed25519.verify(zip215Only, preimage, ed25519.getPublicKey(SEEDS.get(did(1))!), { zip215: true })).toBe(true);
     expect(verify(did(1), preimage, zip215Only)).toBe(false);
     expect(code(() => at2({ ...msg(1, complaints([2])), signature: (m: Bytes, signer: string) => nonCanonicalR(signer, m) }))).toBe('InvalidSignature');
+    const identityKey = new Uint8Array(32); identityKey[0] = 1;
+    const smallOrder = concat(ed25519.Point.BASE.multiply(5n).toBytes(), new Uint8Array([5, ...new Uint8Array(31)]));
+    expect(ed25519.verify(smallOrder, preimage, identityKey, { zip215: true })).toBe(true);
+    expect(ed25519Verifier(new Map([['small', identityKey]]))('small', preimage, smallOrder)).toBe(false);
   });
   test('per-message and signature caps', () => {
     expect(code(() => run(s, replace(s, 2, 1, msg(1, new Uint8Array(65536)))))).toBe('InvalidEncoding');
     expect(code(() => run(s, replace(s, 2, 1, { ...msg(1, complaints([])), signature: () => new Uint8Array(513) })))).toBe('InvalidEncoding');
+    const rs = records(s);
+    expect(code(() => dkgVerifyTranscript(ANCHOR, s.ceremony, [{ ...rs[0]!, closure: { ...rs[0]!.closure, signature: new Uint8Array(513) } }, ...rs.slice(1)], verify))).toBe('InvalidEncoding');
   });
   test('the 4 MiB transcript bound is checked before the ceremony and any signature', () => {
     const garbage = (size: number): RoundRecord => ({ closure: { body: new Uint8Array(98), signature: new Uint8Array(64) }, messages: [{ body: new Uint8Array(size), signature: new Uint8Array(0) }] });

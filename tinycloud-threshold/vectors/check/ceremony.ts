@@ -22,23 +22,34 @@ export const LIMIT = { members: 16, did: 256, signature: 512, message: 65536, tr
 /**
  * Typed errors for conditions SPEC describes but does not name. Every entry is
  * a default ruled by Naomi on 2026-10-30 (TC-2223); SPEC- and vector-named
- * codes (LimitExceeded, InvalidRound for record counts, InvalidCeremony,
- * ContextMismatch, IdentityPoint, InsufficientQualified, InsufficientRecovery,
+ * codes (LimitExceeded, InvalidRound for record counts and round transitions,
+ * InvalidCeremony for kind/refresh, ContextMismatch for certificate binding,
+ * IdentityPoint, InsufficientQualified, InsufficientRecovery,
  * UnsupportedFaultBudget, InvalidEncoding for decoders) are used literally.
  */
 export const DEFAULT_ERROR = {
   /** Owner or member signature fails strict RFC 8032 verification, or the DID has no key. */
   signature: 'InvalidSignature',
-  /** Closure body non-canonical, or names another ceremony/round/previous hash/ordered list. */
+  /** Closure body non-canonical, or its ordered-list hash differs from the messages. */
   closure: 'InvalidRound',
   /** Member envelope names another ceremony or round. */
   envelopeBinding: 'InvalidRound',
   /** Envelope cohort/index does not resolve in the signed cohort. */
   signer: 'InvalidIndex',
+  /** Envelope over 64 KiB or any signature over 512 bytes. */
+  cap: 'InvalidEncoding',
   /** Ceremony owner/network differs from the anchor. */
   ceremonyAnchor: 'InvalidCeremony',
+  /** Genesis ceremony with a current digest or non-zero counters. */
+  genesisFields: 'InvalidCeremony',
+  /** Successor ceremony epoch is not the checked current epoch + 1, or the re-key counter changes. */
+  successorGeneration: 'InvalidCeremony',
+  /** Reshare/refresh ceremony without a current-certificate digest. */
+  absentCurrent: 'ContextMismatch',
   /** Current certificate owner/network differs from the anchor. */
   certificateAnchor: 'InvalidCertificate',
+  /** Certificate commitment[0] ≠ mpk, genesis t outside 2..=16, or predecessor-field combination. */
+  certificateFields: 'InvalidEncoding',
   /** Reshare B′_0 differs from the current mpk. */
   reshareMpk: 'ContextMismatch',
 } as const;
@@ -107,7 +118,7 @@ export function decodeCeremony(body: Bytes): Ceremony {
 export function authorizeCeremony(anchor: Anchor, statement: Statement, verify: Verifier): Ceremony {
   const c = decodeCeremony(statement.body);
   if (c.owner !== anchor.owner || c.network !== anchor.network) fail(DEFAULT_ERROR.ceremonyAnchor);
-  if (statement.signature.length > LIMIT.signature) fail('InvalidEncoding');
+  if (statement.signature.length > LIMIT.signature) fail(DEFAULT_ERROR.cap);
   if (!verify(anchor.owner, c.digest, statement.signature)) fail(DEFAULT_ERROR.signature);
   return c;
 }
@@ -142,13 +153,14 @@ export function decodeCertificate(body: Bytes): Omit<Certificate, 'publicShares'
   const transcript = r.take(32), previous = option(r, 32), previousMpkBytes = option(r, 96);
   r.end();
   checkDirectory(t, n, members);
-  if (genesisT < 2 || genesisT > LIMIT.members || commitmentCount !== t) fail('InvalidEncoding');
+  if (commitmentCount !== t) fail('InvalidEncoding');
+  if (genesisT < 2 || genesisT > LIMIT.members) fail(DEFAULT_ERROR.certificateFields);
   const mpk = g2(mpkBytes), commitments = commitmentBytes.map(b => g2(b, true));
-  if (!commitments[0]!.equals(mpk)) fail('InvalidEncoding');
+  if (!commitments[0]!.equals(mpk)) fail(DEFAULT_ERROR.certificateFields);
   if (commitments[t - 1]!.equals(G2_ZERO)) fail('IdentityPoint');
   const previousMpk = previousMpkBytes ? g2(previousMpkBytes) : undefined;
   // §3.9 field combinations: genesis has neither predecessor field and zero counters; re-key has both.
-  if (!previous && (previousMpk || epoch !== 0n || rekey !== 0n)) fail('InvalidEncoding');
+  if (!previous && (previousMpk || epoch !== 0n || rekey !== 0n)) fail(DEFAULT_ERROR.certificateFields);
   return {
     network, owner, rekey, epoch, genesisT, t, n, members, mpk, commitments, transcript,
     ...(previous ? { previous } : {}), ...(previousMpk ? { previousMpk } : {}), digest: tagged(TAG.networkCert, body),
@@ -157,7 +169,7 @@ export function decodeCertificate(body: Bytes): Omit<Certificate, 'publicShares'
 export function verifyCertificate(anchor: Anchor, statement: Statement, verify: Verifier): Certificate {
   const c = decodeCertificate(statement.body);
   if (c.owner !== anchor.owner || c.network !== anchor.network) fail(DEFAULT_ERROR.certificateAnchor);
-  if (statement.signature.length > LIMIT.signature) fail('InvalidEncoding');
+  if (statement.signature.length > LIMIT.signature) fail(DEFAULT_ERROR.cap);
   if (!verify(anchor.owner, tagged(TAG.certStatement, c.digest), statement.signature)) fail(DEFAULT_ERROR.signature);
   const publicShares = c.members.map(m => evaluate(c.commitments, m.index));
   if (publicShares.some(p => p.equals(G2_ZERO))) fail('IdentityPoint');
@@ -171,12 +183,6 @@ export function orderedListHash(messages: readonly Statement[]): Bytes {
 }
 export function transcriptUpdate(previous: Bytes, closure: Statement): Bytes {
   return tagged(TAG.transcript, concat(previous, lp(closure.body), lp(closure.signature)));
-}
-export function encodeClosure(ceremony: Bytes, round: number, listHash: Bytes, previous: Bytes): Bytes {
-  return concat(be(1n, 1), ceremony, be(BigInt(round), 1), listHash, previous);
-}
-export function encodeEnvelope(ceremony: Bytes, round: number, cohort: number, index: number, payload: Bytes): Bytes {
-  return concat(be(1n, 1), ceremony, be(BigInt(round), 1), be(BigInt(cohort), 1), be(BigInt(index), 2), lp(payload));
 }
 
 export const COHORT = { recipients: 1, dealers: 2 } as const;
@@ -194,14 +200,14 @@ export function verifyClosedRound(ceremony: Bytes, round: number, previous: Byte
   const body = record.closure.body;
   if (body.length !== 98 || body[0] !== 1) fail(DEFAULT_ERROR.closure);
   if (!equal(body.slice(1, 33), ceremony) || body[33] !== round || !equal(body.slice(66, 98), previous)) fail(DEFAULT_ERROR.closure);
-  if (record.closure.signature.length > LIMIT.signature) fail('InvalidEncoding');
+  if (record.closure.signature.length > LIMIT.signature) fail(DEFAULT_ERROR.cap);
   if (!verify(owner, tagged(TAG.roundClose, body), record.closure.signature)) fail(DEFAULT_ERROR.signature);
   const messages = record.messages.map(m => {
     const r = new Reader(m.body); r.version();
     const digest = r.take(32), envelopeRound = Number(r.int(1)), cohort = Number(r.int(1)), index = Number(r.int(2));
-    const payload = r.field(LIMIT.message);
+    const payload = r.field(LIMIT.message); // the whole-envelope cap in Reader binds first
     r.end();
-    if (m.signature.length > LIMIT.signature) fail('InvalidEncoding');
+    if (m.signature.length > LIMIT.signature) fail(DEFAULT_ERROR.cap);
     if (!equal(digest, ceremony) || envelopeRound !== round) fail(DEFAULT_ERROR.envelopeBinding);
     const signer = cohorts[cohort]?.get(index);
     if (signer === undefined) fail(DEFAULT_ERROR.signer);

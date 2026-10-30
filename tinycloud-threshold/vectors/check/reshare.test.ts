@@ -105,6 +105,15 @@ describe('exclusion reasons', () => {
     expect(run(s, complaintsAsDealers).excluded).toEqual([]);
     expect(code(() => run(s, replace(s, 2, COHORT_DEALERS, 4, dealer(4, complaints([])))))).toBe('InvalidIndex');
   });
+  test('rules 4–7 apply in order', () => {
+    let three = s.rounds;
+    for (const j of [1, 2, 3]) three = replace(three, 2, COHORT_RECIPIENTS, j, recipient(j, complaints([1])));
+    expect(run(s, replace(three, 3, COHORT_DEALERS, 1, dealer(1, values([])), dealer(1, values([[2, value(s, 1, 2)]])))).excluded)
+      .toEqual([{ member: 1, reason: 'Equivocated', round: 3 }]);
+    expect(run(s, replace(three, 3, COHORT_DEALERS, 1, dealer(1, values([[2, 1n]])))).excluded).toEqual([{ member: 1, reason: 'Complaints' }]);
+    const one = replace(s, 2, COHORT_RECIPIENTS, 2, recipient(2, complaints([1])));
+    expect(run(s, replace(one, 3, COHORT_DEALERS, 1, dealer(1, values([[3, 1n]])))).excluded).toEqual([{ member: 1, reason: 'InvalidAnswer' }]);
+  });
   test('fewer than t dealers is InsufficientQualified; record count must be 3', () => {
     const alone = s.rounds.map((r, k) => k === 0 ? r.filter(d => d.index === 1) : r);
     expect(code(() => run(s, alone))).toBe('InsufficientQualified');

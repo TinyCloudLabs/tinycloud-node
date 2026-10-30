@@ -28,8 +28,9 @@ export function authorizeRedistribution(anchor: Anchor, statement: Statement, ce
   const c = authorizeCeremony(anchor, statement, verify);
   if (c.kind !== KIND.reshare && c.kind !== KIND.refresh) fail('InvalidCeremony');
   const current = verifyCertificate(anchor, certificate, verify);
-  if (!c.current || !equal(c.current, current.digest)) fail('ContextMismatch');
-  if (current.epoch === 0xffffffffffffffffn || c.epoch !== current.epoch + 1n || c.rekey !== current.rekey) fail('InvalidCeremony');
+  if (!c.current) fail(DEFAULT_ERROR.absentCurrent);
+  if (!equal(c.current, current.digest)) fail('ContextMismatch');
+  if (current.epoch === 0xffffffffffffffffn || c.epoch !== current.epoch + 1n || c.rekey !== current.rekey) fail(DEFAULT_ERROR.successorGeneration);
   if (c.kind === KIND.refresh && (c.t !== current.t || c.n !== current.n || c.directory.some((d, k) => d.did !== current.members[k]!.did))) fail('InvalidCeremony');
   return { ceremony: c, current };
 }
