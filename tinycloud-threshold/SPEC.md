@@ -190,6 +190,10 @@ Secrets that must become unrecoverable, and when:
 
 Public ciphertext transcripts may be kept once the matching recipient keys are unrecoverable. In memory the crate zeroizes on drop and avoids hidden copies (blst `Copy` types are wiped explicitly where they hold secrets); `ZeroizeOnDrop` is an in-memory operation; durable storage is handled by integration. Durable erasure, snapshots, swap and core dumps are gate A's acceptance (§12).
 
+The `seal` module's lifecycle behavior covers only accessible owned storage. `CeremonyHpkeSecretKey` clears its owned 32-byte array on explicit zeroization or drop. Internal plaintext/candidate buffers use `Zeroizing`, including error paths; a successful seal transfers ciphertext out of that buffer. Opened plaintext is returned in `Zeroizing<Vec<u8>>`. The borrowed sealing input belongs to the caller and is not cleared by the module.
+
+HPKE 0.12's `PrivateKey`, `AeadCtxS` and `AeadCtxR` are opaque dependency-managed values. This owned-buffer description makes no claim about zeroization of their internal storage.
+
 ### 3.12 Activation boundary (contract fixed now; durable state record is integration)
 
 An owner signature on a new certificate is **not** an erasure trigger. Transition states:
@@ -215,6 +219,135 @@ All integer fields below are big-endian. `lp` is u32 length followed by bytes.
 - No S0.1 public decoder consumes a member list; lists introduced in later slices use the §3.2 sorted/count rules.
 - An availability budget counts all unavailable ready signers, including dishonest claims: `q - b >= t′`. All four ready holders in 3-of-4 support one unavailable holder, not two. `WithOutageBudget(0)` is not accepted.
 
-## Implemented surface
+## Implemented surface through S0.2
 
-S0.1 implements §§3.1–3.6 and the typed parameters in §3.0. §§3.7–3.12 specify later slices and integration contracts; no ceremony, certificate, activation, storage or node-runtime implementation is included here. `KeyContext` and `KeyShare` have no public constructor in S0.1. The dealer is test-only.
+S0.1 implements §§3.1–3.6 and the typed parameters in §3.0. S0.2 adds the authenticated-context boundaries in §3.0, the certificate and fault-proof APIs in §3.9, and the receipt/activation verification in §3.12:
+
+- `TrustAnchor` and the injected `DidSignatureVerifier` establish the owner/network and signature inputs.
+- `AuthorizedCeremony` verifies owner-authorized genesis and successor statements. `ClosedRound<M>` verifies the signed member envelopes, owner closure, ordered-message commitment and previous transcript hash.
+- `verify_certificate` validates decoded certificate fields and the external anchor. `verify_successor` checks a pinned predecessor and generation/lineage fields.
+- `VerifiedCertificate` supplies `KeyContext` and `PublicKeySet`; `KeyShare::bind` checks a candidate's transcript, member index and scalar against that certificate's public share. Candidate scalar construction remains crate-private.
+- Fault verification checks certificate context, request/share binding and the member signature before classifying a failed share equation.
+- Readiness and activation APIs construct the defined preimages and verify every supplied receipt signature before quorum evaluation, receipt hashing or sorting.
+
+The dealer remains test-only. DKG and redistribution round implementations in §§3.7–3.8, HPKE dealings in §3.10, durable storage/retirement and node-runtime integration are separate slices. The crate remains an unwired workspace member.
+
+## S0.2 canonical byte appendix
+
+All integers below are unsigned big-endian. `lp(x)` is `len(x):u32 || x`; strings use exact UTF-8 without normalization. `option(x)` is `00` when absent or `01 || x` when present; other markers are rejected. Symbolic tag names refer to the literal domain strings in §3.3, and `TH` is defined in §3.2.
+
+Directory indices are contiguous `1..=n`, strictly increasing, with distinct node DIDs within each directory. Thresholds satisfy `2 <= t <= n <= 16`. DIDs contain 1..=256 bytes; network URNs contain 1..=1024 bytes. Signatures are at most 512 bytes, each message at most 65536 bytes, and ordered round/transcript inputs at most 4194304 bytes. Decoding checks lengths before allocation and rejects trailing bytes. Point encodings and role rules remain those of §3.2.
+
+### Owner-authorized ceremony
+
+The canonical authorization body is:
+
+```text
+01 || kind:u8 || ceremony_id:32 || lp(network) || lp(owner)
+   || option(current_certificate_digest:32)
+   || t:u16 || n:u16 || rekey:u64 || epoch:u64 || count:u16
+   || [(index:u16 || lp(node_DID) || ceremony_HPKE_public_key:32)]
+```
+
+Kinds are genesis `1`, reshare `2`, refresh `3`, and re-key `4`. The owner signs `TH(CEREMONY_AUTH, body)`; those same 32 bytes are the authorized-ceremony digest. The raw `SignedStatement.bytes` contains the canonical body, with its signature stored separately.
+
+Genesis has no current certificate, zero counters and `n >= 2t-1`. A successor names the exact externally pinned certificate and uses checked `epoch+1`; re-key also uses checked `rekey+1` and the genesis parameter budget. Other successor kinds preserve the re-key counter. Owner and network match the supplied anchor.
+
+### Member envelope and closed round
+
+The canonical member envelope is:
+
+```text
+01 || authorized_ceremony_digest:32 || round:u8 || cohort:u8
+   || index:u16 || lp(payload)
+```
+
+The member signs `TH(CEREMONY_MSG, exact envelope)`. Cohort `1` identifies authorized recipients; cohort `2` identifies current-certificate dealers. Resolve the index and DID only in the signed cohort, with no fallback. Genesis/re-key use recipients only. Reshare/refresh consumers apply the phase roles: R1/R3 old dealers and R2 new recipients. A member in both cohorts has distinct signed roles.
+
+After validating the canonical outer envelope, ceremony/round/cohort/member and signature, a closed round retains the exact raw `SignedStatement` and the inner payload's `Result<M, Error>`. Authenticated malformed inner payloads, byte-identical retransmissions and distinct messages from one sender remain in owner order for later phase-specific handling.
+
+The ordered message-list encoding and hash are:
+
+```text
+ordered_list = count:u16 || [lp(exact member envelope) || lp(member signature)]
+ordered_message_list_hash = TH(TRANSCRIPT, ordered_list)
+```
+
+The list preserves owner order; it is not sorted by member. The canonical owner-closure body is:
+
+```text
+01 || authorized_ceremony_digest:32 || round:u8
+   || ordered_message_list_hash:32 || previous_transcript_hash:32
+```
+
+The owner signs `TH(ROUND_CLOSE, exact closure body)`. Closure verification checks the supplied previous hash, ceremony, round and ordered-list commitment. The transcript update is:
+
+```text
+TH(TRANSCRIPT,
+   previous_hash:32 || lp(exact closure body) || lp(owner closure signature))
+```
+
+The trusted owner-relay model in §3.0 applies.
+
+### Certificate body and candidate binding
+
+The canonical certificate body is:
+
+```text
+01 || lp(network) || lp(owner) || rekey:u64 || epoch:u64
+   || genesis_t:u16 || t:u16 || n:u16 || member_count:u16
+   || [(index:u16 || lp(node_DID))]
+   || mpk:96 || commitment_count:u16
+   || [commitment:96 in ascending polynomial degree]
+   || transcript_hash:32 || option(previous_certificate_digest:32)
+   || option(previous_mpk:96)
+```
+
+The certificate digest is `TH(NETWORK_CERT, body)`. The owner signs `TH(CERT_STATEMENT, certificate_digest:32)`.
+
+Certificates contain no HPKE keys. The commitment count equals `t`; the constant equals `mpk`; constant/top coefficients and evaluated public shares are non-identity. Genesis has absent predecessor fields and zero counters. A pinned successor has the exact previous digest and checked `epoch+1`. Reshare/refresh preserve `mpk`, `rekey` and `genesis_t`; re-key changes `mpk`, names the previous `mpk`, increments `rekey` and sets `genesis_t` to the new `t`.
+
+Verification uses the caller's expected owner/network. The caller's authorization-log integration selects the current pinned certificate. Candidate binding checks transcript and member index, then `scalar*g2` against the certificate's evaluated public share.
+
+### Signed response and fault classification
+
+The S0.1 amended 259-byte share and signing body remain unchanged:
+
+```text
+share = 01 || member:u16 || context_digest:32 || request_digest:32
+           || c1:48 || c2:96 || c3:48
+preimage = TH(DECRYPT_SHARE,
+              request_digest:32 || certificate_digest:32 || member:u16 || encode(share))
+```
+
+`EncryptedKeyShare::signing_preimage` returns `Result<Vec<u8>, Error>` and requires equality between the stored and supplied request digests before computing the signing hash. A mismatch returns `ContextMismatch`. Fault verification maps certificate-context, binding/helper or signature failures to `NotAFault` before algebra; only a correctly bound, member-signed response that fails a share equation yields `Fault(member)`.
+
+### Readiness receipts and activation
+
+The readiness signing preimage is:
+
+```text
+TH(READY,
+   candidate_certificate_digest:32 || transcript_hash:32
+   || index:u16 || candidate_public_share:96)
+```
+
+The canonical signed receipt and its hash are:
+
+```text
+receipt = 01 || index:u16 || lp(signature)
+receipt_hash = TH(READY, exact receipt encoding)
+```
+
+`verify_activation` rejects duplicate/nonmember indices and verifies **every** supplied node signature against the exact candidate/transcript/index/public-share readiness preimage before quorum evaluation, receipt hashing or sorting. Duplicate indices or repeated signatures add no vote.
+
+Sort the resulting 32-byte receipt hashes in binary lexicographic order, independent of input order:
+
+```text
+activation.bytes = TH(ACTIVATE,
+                      candidate_certificate_digest:32 || concatenated_sorted_receipt_hashes)
+```
+
+The owner signs exactly those 32 activation bytes. Unlike ceremony/closure statements, activation `SignedStatement.bytes` already contains the domain-separated signing preimage rather than a raw body.
+
+The default quorum is all `n` holders. `WithOutageBudget(b)` requires `b > 0` and checked `q = t+b <= n`; at least `q` unique verified members must be ready. The budget includes all unavailable ready signers. Receipts are signed installation statements; durable storage, monotonic activation state and retirement remain integration operations.
