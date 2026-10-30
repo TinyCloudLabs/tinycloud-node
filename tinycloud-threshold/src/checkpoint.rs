@@ -768,10 +768,20 @@ fn checkpoint_2of3_reshare() {
 
     let next = install(run, &reshared);
     assert_eq!(next.cert.key_context().epoch(), Epoch::new(1));
-    assert_eq!(next.cert.key_context().threshold(), Threshold::new(3, 4).unwrap());
+    assert_eq!(
+        next.cert.key_context().threshold(),
+        Threshold::new(3, 4).unwrap()
+    );
     println!("3. PASS: owner-signed successor certificate verified against the pinned genesis; all four candidates bound at epoch 1");
     assert_eq!(
-        unwraps_through_every_subset(&next.cert, &next.shares, "records/reshare", &data, &ct, 0x75),
+        unwraps_through_every_subset(
+            &next.cert,
+            &next.shares,
+            "records/reshare",
+            &data,
+            &ct,
+            0x75
+        ),
         4
     );
     println!("4. PASS: each of the four 3-member subsets derived the key and unwrapped the data key wrapped under the genesis mpk; two shares returned NotEnoughShares");
@@ -800,7 +810,11 @@ fn checkpoint_2of3_reshare() {
         Err(ShareError::ContextMismatch)
     );
     assert!(matches!(
-        combine(next.cert.public_key_set(), &new_req, &[new_issued, old_issued]),
+        combine(
+            next.cert.public_key_set(),
+            &new_req,
+            &[new_issued, old_issued]
+        ),
         Err(CombineError::MixedContexts)
     ));
     println!("5. PASS: an old-epoch share returned ContextMismatch against the new key set and MixedContexts in a new combine; old shares stay valid for the old certificate until integration erases them");

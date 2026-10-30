@@ -27,8 +27,8 @@ use crate::{
     checkpoint::{authorize, identity},
     curve::{Scalar, G2},
     derive::{
-        combine, decrypt_derived_key, issue_share, verify_share, DecryptRequest,
-        EncryptedKeyShare, KeyShare, TransportSecretKey,
+        combine, decrypt_derived_key, issue_share, verify_share, DecryptRequest, EncryptedKeyShare,
+        KeyShare, TransportSecretKey,
     },
     dkg::{dkg_initial_transcript, DkgRoundRecord},
     dkg_relay::commitment_hash,
@@ -132,7 +132,8 @@ pub(crate) fn dealer_genesis(t: u16, n: u16) -> (VerifiedCertificate, Vec<KeySha
     )
     .unwrap();
     let transcript = TranscriptHash::new([51; 32]);
-    let body = CertificateBody::genesis(&signers.anchor(), &ceremony, &public, &transcript).unwrap();
+    let body =
+        CertificateBody::genesis(&signers.anchor(), &ceremony, &public, &transcript).unwrap();
     let cert = verify_certificate(
         &signers.anchor(),
         &crate::cert::tests::sign(body, &signers),
@@ -452,8 +453,12 @@ pub(crate) fn drive<V: DidSignatureVerifier>(
     let mut receivers = BTreeMap::new();
     let mut r2 = Vec::new();
     for j in 1..=fixture.n() {
-        let started =
-            reshare_start_receiver(&fixture.ceremony, &fixture.current, idx(j), fixture.secret(j));
+        let started = reshare_start_receiver(
+            &fixture.ceremony,
+            &fixture.current,
+            idx(j),
+            fixture.secret(j),
+        );
         match started.and_then(|s| s.complain(&closed1)) {
             Ok((state, message)) => {
                 assert_eq!(message.round(), 2);
@@ -565,7 +570,10 @@ pub(crate) fn agreed(run: &Run, receivers: &[u16]) -> ReshareOutput {
             .master_public_key()
             .encode()
     );
-    assert_eq!(verified.public.threshold(), run.fixture.ceremony.threshold());
+    assert_eq!(
+        verified.public.threshold(),
+        run.fixture.ceremony.threshold()
+    );
     assert_eq!(verified.dealers.len(), usize::from(run.fixture.old_t()));
     for j in receivers {
         let (candidate, output) = run.outcomes[j].as_ref().unwrap();
@@ -630,7 +638,11 @@ pub(crate) fn install(run: Run, output: &ReshareOutput) -> Next {
 }
 
 /// Wrap a fixed data key to `path` under the certificate's master key.
-pub(crate) fn wrapped(cert: &VerifiedCertificate, path: &str, seed: u8) -> ([u8; 32], IbeCiphertext) {
+pub(crate) fn wrapped(
+    cert: &VerifiedCertificate,
+    path: &str,
+    seed: u8,
+) -> ([u8; 32], IbeCiphertext) {
     let context = cert.key_context();
     let data = [seed; 32];
     let ct = wrap_key(
@@ -872,7 +884,14 @@ fn genuine_2of3_to_3of4_preserves_the_master_key_and_binds_every_candidate() {
     let next = install(run, &output);
     assert_eq!(next.cert.key_context().epoch().get(), 1);
     assert_eq!(
-        unwraps_through_every_subset(&next.cert, &next.shares, "records/reshare", &data, &ct, 0x82),
+        unwraps_through_every_subset(
+            &next.cert,
+            &next.shares,
+            "records/reshare",
+            &data,
+            &ct,
+            0x82
+        ),
         4
     );
 }
@@ -933,7 +952,14 @@ fn dkg_genesis_reshare_chain_keeps_the_master_key_through_refresh() {
             Threshold::new(t, n).unwrap()
         );
         assert_eq!(
-            unwraps_through_every_subset(&next.cert, &next.shares, "records/chain", &data, &ct, seed),
+            unwraps_through_every_subset(
+                &next.cert,
+                &next.shares,
+                "records/chain",
+                &data,
+                &ct,
+                seed
+            ),
             subsets
         );
         current = next.cert;
@@ -1051,7 +1077,15 @@ fn within_the_secrecy_budget_but_below_t_valid_dealers_refuses_and_keeps_the_old
     let first = honest(Reshare, 3, 4, 0x8e);
     let output = agreed(&first, &[1, 2, 3, 4]);
     let next = install(first, &output);
-    let f = fixture_on(next.cert, next.shares.into_values(), Reshare, 2, 3, 0x8f, &[1, 2, 3]);
+    let f = fixture_on(
+        next.cert,
+        next.shares.into_values(),
+        Reshare,
+        2,
+        3,
+        0x8f,
+        &[1, 2, 3],
+    );
     let run = run_with(f, |out| {
         if out.round() == 1 {
             out.remove(3);
@@ -1102,12 +1136,12 @@ fn a_member_of_both_cohorts_signs_distinct_roles() {
         .unwrap();
     // did 1 cannot speak for recipient coordinate 1.
     let h0 = reshare_initial_transcript(&f.ceremony);
-    let bytes =
-        ceremony_message_body(&f.ceremony, 1, Recipients, idx(1), &EMPTY_ANSWERS).unwrap();
+    let bytes = ceremony_message_body(&f.ceremony, 1, Recipients, idx(1), &EMPTY_ANSWERS).unwrap();
     let forged = SignedStatement {
-        signature: f
-            .signers
-            .sign(&Signers::did(1), &ceremony_message_preimage(&bytes).unwrap()),
+        signature: f.signers.sign(
+            &Signers::did(1),
+            &ceremony_message_preimage(&bytes).unwrap(),
+        ),
         bytes,
     };
     assert!(matches!(
@@ -1180,7 +1214,11 @@ fn one_recipient_bad_value_is_replaced_by_a_valid_answer() {
     assert_eq!(output.dealers, dealers(&[1, 2]));
     let published = ReshareAnswers::decode(run.answers[&1].as_ref().unwrap()).unwrap();
     assert_eq!(
-        published.answers.iter().map(|(j, _)| *j).collect::<Vec<_>>(),
+        published
+            .answers
+            .iter()
+            .map(|(j, _)| *j)
+            .collect::<Vec<_>>(),
         dealers(&[2])
     );
 }
@@ -1196,7 +1234,10 @@ fn invalid_answer_excludes_the_dealer_and_the_next_dealer_is_selected() {
         _ => {}
     });
     let output = agreed(&run, &[1, 2, 3]);
-    assert_eq!(output.excluded, excluded(&[(1, ExcludeReason::InvalidAnswer)]));
+    assert_eq!(
+        output.excluded,
+        excluded(&[(1, ExcludeReason::InvalidAnswer)])
+    );
     assert_eq!(output.dealers, dealers(&[2, 3]));
 }
 
@@ -1211,7 +1252,10 @@ fn missing_r3_excludes_only_with_required_answers() {
         _ => {}
     });
     let output = agreed(&run, &[1, 2, 3]);
-    assert_eq!(output.excluded, excluded(&[(1, ExcludeReason::MissingAnswer)]));
+    assert_eq!(
+        output.excluded,
+        excluded(&[(1, ExcludeReason::MissingAnswer)])
+    );
     assert_eq!(output.dealers, dealers(&[2, 3]));
 }
 
@@ -1226,7 +1270,10 @@ fn malformed_r3_excludes_only_with_required_answers() {
         _ => {}
     });
     let output = agreed(&run, &[1, 2, 3]);
-    assert_eq!(output.excluded, excluded(&[(1, ExcludeReason::MissingAnswer)]));
+    assert_eq!(
+        output.excluded,
+        excluded(&[(1, ExcludeReason::MissingAnswer)])
+    );
     assert_eq!(output.dealers, dealers(&[2, 3]));
 }
 
@@ -1238,7 +1285,10 @@ fn invalid_unsolicited_answer_excludes_its_dealer() {
         }
     });
     let output = agreed(&run, &[1, 2, 3]);
-    assert_eq!(output.excluded, excluded(&[(2, ExcludeReason::InvalidAnswer)]));
+    assert_eq!(
+        output.excluded,
+        excluded(&[(2, ExcludeReason::InvalidAnswer)])
+    );
     assert_eq!(output.dealers, dealers(&[1, 3]));
 }
 
@@ -1288,7 +1338,10 @@ fn r3_naming_a_recipient_outside_the_new_cohort_is_malformed() {
         _ => {}
     });
     let output = agreed(&run, &[1, 2, 3]);
-    assert_eq!(output.excluded, excluded(&[(1, ExcludeReason::MissingAnswer)]));
+    assert_eq!(
+        output.excluded,
+        excluded(&[(1, ExcludeReason::MissingAnswer)])
+    );
     assert_eq!(output.dealers, dealers(&[2, 3]));
 }
 
@@ -1341,7 +1394,11 @@ fn duplicate_complaints_count_once() {
     });
     let published = ReshareAnswers::decode(run.answers[&1].as_ref().unwrap()).unwrap();
     assert_eq!(
-        published.answers.iter().map(|(j, _)| *j).collect::<Vec<_>>(),
+        published
+            .answers
+            .iter()
+            .map(|(j, _)| *j)
+            .collect::<Vec<_>>(),
         dealers(&[4, 5])
     );
     let output = agreed(&run, &[1, 2, 3, 4, 5]);
@@ -1441,7 +1498,10 @@ fn missing_and_equivocated_r1_exclude() {
         }
     });
     let output = agreed(&missing, &[1, 2, 3]);
-    assert_eq!(output.excluded, excluded(&[(1, ExcludeReason::MissingDeal)]));
+    assert_eq!(
+        output.excluded,
+        excluded(&[(1, ExcludeReason::MissingDeal)])
+    );
     assert_eq!(output.dealers, dealers(&[2, 3]));
 
     let equivocated = run(Reshare, 2, 3, 0xa8, |out| {
@@ -1486,7 +1546,10 @@ fn dealers_are_the_first_t_in_closed_round_order() {
     });
     let output = agreed(&skipped, &[1, 2, 3]);
     assert_eq!(output.dealers, dealers(&[1, 2]));
-    assert_eq!(output.excluded, excluded(&[(3, ExcludeReason::MalformedDeal)]));
+    assert_eq!(
+        output.excluded,
+        excluded(&[(3, ExcludeReason::MalformedDeal)])
+    );
 }
 
 // --------------------------------------------------------- wrong cohorts
@@ -1505,7 +1568,10 @@ fn wrong_cohort_r1_is_ignored_without_blame() {
         }
     });
     let output = agreed(&run, &[1, 2, 3]);
-    assert_eq!(output.excluded, excluded(&[(1, ExcludeReason::MissingDeal)]));
+    assert_eq!(
+        output.excluded,
+        excluded(&[(1, ExcludeReason::MissingDeal)])
+    );
     assert_eq!(output.dealers, dealers(&[2, 3]));
 }
 
@@ -1541,7 +1607,10 @@ fn wrong_cohort_r3_is_ignored_without_blame() {
         _ => {}
     });
     let output = agreed(&run, &[1, 2, 3]);
-    assert_eq!(output.excluded, excluded(&[(1, ExcludeReason::MissingAnswer)]));
+    assert_eq!(
+        output.excluded,
+        excluded(&[(1, ExcludeReason::MissingAnswer)])
+    );
     assert_eq!(output.dealers, dealers(&[2, 3]));
 }
 
@@ -1681,7 +1750,9 @@ fn transitions_refuse_other_ceremonies_rounds_and_histories() {
     };
     let receiver =
         |j: u16| reshare_start_receiver(&f.ceremony, &f.current, idx(j), f.secret(j)).unwrap();
-    let r1: Vec<_> = (1..=3).map(|i| f.sign(Current, i, &deal(&f, i).1)).collect();
+    let r1: Vec<_> = (1..=3)
+        .map(|i| f.sign(Current, i, &deal(&f, i).1))
+        .collect();
     let closed1 = close_for::<ReshareDeal>(&f, &f.ceremony, 1, &h0, &r1).unwrap();
     let other_r1: Vec<_> = (1..=3)
         .map(|i| other.sign(Current, i, &deal(&other, i).1))
@@ -1710,9 +1781,14 @@ fn transitions_refuse_other_ceremonies_rounds_and_histories() {
         receiver(1).complain(&rebased),
         Err(Error::InvalidRound)
     ));
-    let dkg_link =
-        close_for::<ReshareDeal>(&f, &f.ceremony, 1, &dkg_initial_transcript(&f.ceremony), &r1)
-            .unwrap();
+    let dkg_link = close_for::<ReshareDeal>(
+        &f,
+        &f.ceremony,
+        1,
+        &dkg_initial_transcript(&f.ceremony),
+        &r1,
+    )
+    .unwrap();
     assert!(matches!(
         receiver(1).complain(&dkg_link),
         Err(Error::InvalidRound)
@@ -1751,7 +1827,13 @@ fn transitions_refuse_other_ceremonies_rounds_and_histories() {
         Err(Error::InvalidRound)
     ));
     let r3: Vec<_> = (1..=3)
-        .map(|i| f.sign(Current, i, &deal(&f, i).0.answer(&closed1, &closed2).unwrap()))
+        .map(|i| {
+            f.sign(
+                Current,
+                i,
+                &deal(&f, i).0.answer(&closed1, &closed2).unwrap(),
+            )
+        })
         .collect();
     let skipped3 =
         close_for::<ReshareAnswers>(&f, &f.ceremony, 3, &closed1.transcript_hash(), &r3).unwrap();
@@ -1776,8 +1858,13 @@ fn transitions_refuse_other_ceremonies_rounds_and_histories() {
 fn retry_under_a_new_ceremony_cannot_reuse_an_earlier_dealing() {
     let earlier = fixture(Reshare, 2, 3, 0xb6);
     let mut rng = earlier.member_rng(1);
-    let (_, message) =
-        reshare_deal(&earlier.ceremony, &earlier.current, &earlier.shares[&1], &mut rng).unwrap();
+    let (_, message) = reshare_deal(
+        &earlier.ceremony,
+        &earlier.current,
+        &earlier.shares[&1],
+        &mut rng,
+    )
+    .unwrap();
     let earlier_payload = message.body()[41..].to_vec();
     let run = run(Reshare, 2, 3, 0xb7, |out| {
         if out.round() == 1 {
@@ -1808,7 +1895,10 @@ fn verifier_recomputes_from_authenticated_records_only() {
     let f = &run.fixture;
     let verify =
         |t: &ReshareTranscript| reshare_verify_transcript(&f.ceremony, &f.current, t, &f.signers);
-    assert_eq!(verify(&run.transcript).unwrap().transcript_hash, output.transcript_hash);
+    assert_eq!(
+        verify(&run.transcript).unwrap().transcript_hash,
+        output.transcript_hash
+    );
     let mut tampered = run.transcript.clone();
     tampered.rounds[1].messages[0].signature[0] ^= 1;
     assert!(verify(&tampered).is_err());
@@ -1822,10 +1912,13 @@ fn verifier_recomputes_from_authenticated_records_only() {
     extra.rounds.push(run.transcript.rounds[2].clone());
     assert_eq!(verify(&extra).err(), Some(Error::InvalidRound));
     let other = fixture(Reshare, 2, 3, 0xb9);
-    assert!(
-        reshare_verify_transcript(&other.ceremony, &other.current, &run.transcript, &f.signers)
-            .is_err()
-    );
+    assert!(reshare_verify_transcript(
+        &other.ceremony,
+        &other.current,
+        &run.transcript,
+        &f.signers
+    )
+    .is_err());
     let (newer, _) = newer_certificate(f);
     assert_eq!(
         reshare_verify_transcript(&f.ceremony, &newer, &run.transcript, &f.signers).err(),

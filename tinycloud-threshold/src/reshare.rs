@@ -276,11 +276,11 @@ impl Public {
         }
         let old = current.key_context().threshold();
         if c.kind() == CeremonyKind::Refresh {
-            let same_directory = c
-                .recipients()
+            let same_directory = c.recipients().iter().map(|r| (r.index, &r.node)).eq(current
+                .body()
+                .members()
                 .iter()
-                .map(|r| (r.index, &r.node))
-                .eq(current.body().members().iter().map(|m| (m.index, &m.node)));
+                .map(|m| (m.index, &m.node)));
             if c.threshold() != old || !same_directory {
                 return Err(Error::InvalidCeremony);
             }
@@ -319,7 +319,10 @@ impl Public {
         let threshold = self.threshold();
         deal.commitments.len() == usize::from(threshold.t())
             && deal.commitments.first() == Some(pk)
-            && deal.commitments.last().is_some_and(|top| !top.is_identity())
+            && deal
+                .commitments
+                .last()
+                .is_some_and(|top| !top.is_identity())
             && deal
                 .dealings
                 .iter()
@@ -850,10 +853,7 @@ mod tests {
         }
         assert_eq!(bytes, expected);
         assert_eq!(ReshareAnswers::decode(&bytes).unwrap().encode(), bytes);
-        assert_eq!(
-            ReshareAnswers::decode(&[1, 0, 0]).unwrap().answers.len(),
-            0
-        );
+        assert_eq!(ReshareAnswers::decode(&[1, 0, 0]).unwrap().answers.len(), 0);
         rejects_every_truncation_and_trailing_byte::<ReshareAnswers>(&bytes);
 
         let mut noncanonical = expected.clone();
