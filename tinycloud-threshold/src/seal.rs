@@ -626,4 +626,11 @@ mod tests {
             proptest::prop_assert_eq!(decoded.encode(), wire);
         }
     }
+
+    #[test]
+    fn secret_public_key_matches_generated_recipient() {
+        let mut rng = ChaCha20Rng::from_seed([0x39; 32]);
+        let (secret, public) = CeremonyHpkeSecretKey::generate(&mut rng);
+        assert_eq!(secret.public_key(), Ok(public));
+    }
 }
