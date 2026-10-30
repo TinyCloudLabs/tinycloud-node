@@ -5,7 +5,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use proptest::prelude::*;
 use rand_chacha::ChaCha20Rng;
 use rand_core::{CryptoRng, RngCore, SeedableRng};
 use serde_json::{json, Value};
@@ -941,6 +940,66 @@ fn valid_unsolicited_answer_is_ignored() {
 }
 
 #[test]
+fn r2_naming_a_dealer_outside_the_cohort_supplies_no_complaints() {
+    // Member 3's R2 names dealer 1 and index 4 > n. The list is out of cohort,
+    // so it creates no required answer and dealer 1's missing R3 is harmless.
+    let run = run(2, 3, 0x5c, |out| match out.round() {
+        2 => out.replace(
+            3,
+            &DkgComplaints {
+                dealers: vec![idx(1), idx(4)],
+            }
+            .encode(),
+        ),
+        3 => out.remove(1),
+        _ => {}
+    });
+    let output = agreed(&run, &[1, 2, 3]);
+    assert_eq!(output.qual, members(&[1, 2, 3]));
+    assert!(output.disqualified.is_empty());
+}
+
+#[test]
+fn r3_naming_a_recipient_outside_the_cohort_is_malformed() {
+    // Dealer 2 publishes an unrequested R3 entry for index 4 > n: malformed,
+    // and without required answers it does not disqualify. Dealer 1 answers
+    // member 3's complaint validly but adds an index-4 entry: malformed, so the
+    // required answer counts as absent.
+    let run = run(2, 3, 0x5d, |out| match out.round() {
+        2 => out.replace(
+            3,
+            &DkgComplaints {
+                dealers: vec![idx(1)],
+            }
+            .encode(),
+        ),
+        3 => {
+            let mut answers = DkgAnswers::decode(&out.payload(1)).unwrap();
+            assert_eq!(answers.answers.len(), 1);
+            answers.answers.push((idx(4), pair(5, 6)));
+            out.replace(1, &answers.encode());
+            let unrequested = DkgAnswers {
+                answers: vec![(idx(4), pair(5, 6))],
+            };
+            out.replace(2, &unrequested.encode());
+        }
+        _ => {}
+    });
+    // Assert the verifier's outcome directly, so a counted out-of-cohort entry
+    // fails here as a disqualification mismatch rather than inside a helper.
+    assert_eq!(
+        run.verify().map(|o| o.disqualified),
+        Ok(BTreeMap::from([(idx(1), DisqualifyReason::MissingAnswer)]))
+    );
+    let output = agreed(&run, &[1, 2, 3]);
+    assert_eq!(
+        output.disqualified,
+        BTreeMap::from([(idx(1), DisqualifyReason::MissingAnswer)])
+    );
+    assert_eq!(output.qual, members(&[2, 3]));
+}
+
+#[test]
 fn relay_omitted_complaint_fails_only_the_affected_member() {
     // Failure scenario outside the trusted-relay liveness model.
     let run = run(2, 3, 0x40, |out| match out.round() {
@@ -1408,6 +1467,29 @@ fn transitions_refuse_other_ceremonies_rounds_and_histories() {
 }
 
 #[test]
+fn transitions_refuse_a_foreign_ceremony_closure_on_this_history() {
+    // Same owner, round and previous link (this ceremony's H0); only the
+    // authorized-ceremony digest differs.
+    let f = fixture(2, 3, 0x5a);
+    let other = fixture(2, 3, 0x5b);
+    let h0 = dkg_initial_transcript(&f.ceremony);
+    let other_r1: Vec<_> = (1..=3)
+        .map(|i| {
+            let mut rng = other.member_rng(i);
+            let (_, m) = dkg_start(&other.ceremony, idx(i), other.secret(i), &mut rng).unwrap();
+            other.sign(i, &m)
+        })
+        .collect();
+    let foreign = close_for::<DkgDeal>(&other, &other.ceremony, 1, &h0, &other_r1).unwrap();
+    assert_eq!(foreign.previous_hash(), h0);
+    assert_eq!(foreign.round(), 1);
+    assert_ne!(foreign.ceremony_digest(), f.ceremony.digest());
+    let mut rng = f.member_rng(1);
+    let (state, _) = dkg_start(&f.ceremony, idx(1), f.secret(1), &mut rng).unwrap();
+    assert!(matches!(state.complain(&foreign), Err(Error::InvalidRound)));
+}
+
+#[test]
 fn closed_rounds_reject_wrong_signers_cohorts_and_signatures() {
     let f = fixture(2, 3, 0x53);
     let h0 = dkg_initial_transcript(&f.ceremony);
@@ -1594,36 +1676,71 @@ fn misbehave(out: &mut Outbox, m: u16, behaviour: u8, target: u16) {
     }
 }
 
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(12))]
+/// The `misbehave` model has 15 behaviours per faulty member.
+const BEHAVIOURS: u8 = 15;
+/// Fixed fixture seeds; each shape is enumerated under both.
+const ENUMERATION_SEEDS: [u8; 2] = [0x01, 0x9c];
 
-    #[test]
-    fn within_budget_fault_patterns_finish_with_identical_outcomes(
-        shape in 0usize..2,
-        seed in any::<u8>(),
-        behaviours in proptest::collection::vec(0u8..15, 2),
-    ) {
-        let (t, n) = [(2u16, 3u16), (3, 5)][shape];
-        let honest_members: Vec<u16> = (1..=n - (t - 1)).collect();
-        let faulty: Vec<u16> = (n - (t - 1) + 1..=n).collect();
-        let mut constants_seen = BTreeMap::new();
-        let run = run(t, n, seed, |out| {
-            if out.round() == 4 {
-                constants(out, &mut constants_seen);
+// Coverage: the enumeration below runs every behaviour assignment of the
+// in-tree `misbehave` model to the last t−1 members, for 2-of-3 and 3-of-5,
+// under two fixed seeds: 2 × (15 + 15 × 15) = 480 ceremonies. It covers this
+// model only, with honest messages always delivered by the relay; it is not a
+// claim about arbitrary faulty behaviour, other seeds or other parameters.
+
+/// One within-budget run: faulty members are the last t−1 indices; every honest
+/// member and the verifier agree, honest dealers stay in QUAL, and mpk is the sum
+/// of the QUAL dealers' committed constants.
+fn within_budget_agreement(t: u16, n: u16, seed: u8, behaviours: &[u8]) {
+    let honest_members: Vec<u16> = (1..=n - (t - 1)).collect();
+    let faulty: Vec<u16> = (n - (t - 1) + 1..=n).collect();
+    assert_eq!(faulty.len(), behaviours.len());
+    let mut constants_seen = BTreeMap::new();
+    let run = run(t, n, seed, |out| {
+        if out.round() == 4 {
+            constants(out, &mut constants_seen);
+        }
+        for (m, behaviour) in faulty.iter().zip(behaviours) {
+            misbehave(out, *m, *behaviour, 1);
+        }
+    });
+    let output = agreed(&run, &honest_members);
+    let faulty_set = members(&faulty);
+    assert!(
+        members(&honest_members).is_subset(&output.qual),
+        "{behaviours:?}"
+    );
+    assert!(
+        output.disqualified.keys().all(|i| faulty_set.contains(i)),
+        "{behaviours:?}"
+    );
+    assert!(
+        output.reconstructed.is_subset(&faulty_set),
+        "{behaviours:?}"
+    );
+    assert_eq!(
+        output.public.master_public_key().encode(),
+        genuine_mpk(&constants_seen, &output.qual),
+        "{behaviours:?}"
+    );
+}
+
+#[test]
+fn every_within_budget_fault_pattern_finishes_with_identical_outcomes_2of3() {
+    for seed in ENUMERATION_SEEDS {
+        for behaviour in 0..BEHAVIOURS {
+            within_budget_agreement(2, 3, seed, &[behaviour]);
+        }
+    }
+}
+
+#[test]
+fn every_within_budget_fault_pattern_finishes_with_identical_outcomes_3of5() {
+    for seed in ENUMERATION_SEEDS {
+        for first in 0..BEHAVIOURS {
+            for second in 0..BEHAVIOURS {
+                within_budget_agreement(3, 5, seed, &[first, second]);
             }
-            for (k, m) in faulty.iter().enumerate() {
-                misbehave(out, *m, behaviours[k], 1);
-            }
-        });
-        let output = agreed(&run, &honest_members);
-        let faulty_set = members(&faulty);
-        prop_assert!(members(&honest_members).is_subset(&output.qual));
-        prop_assert!(output.disqualified.keys().all(|i| faulty_set.contains(i)));
-        prop_assert!(output.reconstructed.is_subset(&faulty_set));
-        prop_assert_eq!(
-            output.public.master_public_key().encode(),
-            genuine_mpk(&constants_seen, &output.qual)
-        );
+        }
     }
 }
 
