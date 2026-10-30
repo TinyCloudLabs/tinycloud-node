@@ -219,7 +219,7 @@ All integer fields below are big-endian. `lp` is u32 length followed by bytes.
 - No S0.1 public decoder consumes a member list; lists introduced in later slices use the §3.2 sorted/count rules.
 - An availability budget counts all unavailable ready signers, including dishonest claims: `q - b >= t′`. All four ready holders in 3-of-4 support one unavailable holder, not two. `WithOutageBudget(0)` is not accepted.
 
-## Implemented surface through S0.3
+## Implemented surface through S0.4
 
 S0.1 implements §§3.1–3.6 and the typed parameters in §3.0. S0.2 adds the authenticated-context boundaries in §3.0, the certificate and fault-proof APIs in §3.9, and the receipt/activation verification in §3.12:
 
@@ -232,7 +232,9 @@ S0.1 implements §§3.1–3.6 and the typed parameters in §3.0. S0.2 adds the a
 
 S0.3 adds the §3.10 sealed dealings with ceremony-scoped recipient keys and the §3.7 genesis DKG: consume-self member states over owner-closed rounds R1–R6, and `dkg_verify_transcript`, which recomputes the outcome from the raw signed round records. Its byte layouts and deterministic rules are in the S0.3 genesis DKG appendix below.
 
-The dealer remains test-only. Redistribution rounds in §3.8, durable storage/retirement and node-runtime integration are separate slices. The crate remains an unwired workspace member.
+S0.4 adds the §3.8 redistribution for reshare and refresh: dealer and recipient consume-self states over owner-closed rounds R1–R3, and `reshare_verify_transcript`. The output is a candidate for the successor certificate. Its byte layouts and deterministic rules are in the S0.4 redistribution appendix below.
+
+The dealer remains test-only. Durable storage/retirement and node-runtime integration are separate slices. The crate remains an unwired workspace member.
 
 ## S0.2 canonical byte appendix
 
@@ -437,3 +439,65 @@ Agreement among members and the verifier relies on the §3.0 owner relay closing
 ### In-memory lifecycle
 
 `CeremonyHpkeSecretKey` is dropped when R1 has been processed. Polynomial coefficients are dropped when R4 has been produced. Received private pairs remain in the state until the member finishes after R5 or R6. States are consumed by each transition, so an error drops the state; scalars clear their storage on drop and states have redacted `Debug`. The caller's RNG state and any durable copies are outside this crate (§3.11).
+
+## S0.4 redistribution appendix
+
+This appendix records the byte layouts and deterministic rules that members and `reshare_verify_transcript` apply to §3.8 for ceremony kinds reshare (`2`) and refresh (`3`). Integers are unsigned big-endian; `lp`, `TH`, point and scalar encodings are as in §3.2 and the S0.2 appendix. Rounds are numbered R1 = 1 through R3 = 3. Dealers are the members of the pinned current certificate (cohort `2`); recipients are the authorized directory (cohort `1`). R1 and R3 count only cohort-`2` envelopes and R2 counts only cohort-`1` envelopes; an authenticated envelope under the other cohort is ignored for that round and attributes nothing to either role. A node in both cohorts signs each role separately.
+
+### Authorization and refresh
+
+Every entry point (`reshare_deal`, `reshare_start_receiver`, `reshare_verify_transcript`) first requires an `AuthorizedCeremony` of kind reshare or refresh (`InvalidCeremony` otherwise) whose current-certificate digest equals the supplied `VerifiedCertificate` (`ContextMismatch` otherwise). Refresh additionally requires t′ = t, n′ = n and a directory whose index→DID map equals the current certificate's members (`InvalidCeremony` otherwise). A dealer's `KeyShare` must carry the current certificate's key context (`ContextMismatch`). A recipient's ceremony key must derive the directory key at its index (`ContextMismatch`; unknown index `InvalidIndex`). These checks precede any randomness, opening or emitted message.
+
+### Initial link and transcript
+
+```text
+H0 = TH("TC-THRESHOLD-V1-RESHARE-START", authorized_ceremony_digest:32)
+```
+
+`reshare_initial_transcript(c)` returns `H0` for both reshare and refresh; the authorized-ceremony digest binds the kind. The label is distinct from, and not a prefix of, every §3.3 tag and the DKG start label. Closed R1 names `H0`; R2 and R3 name the S0.2 transcript update of the preceding round. The redistribution transcript hash is the update after closed R3. Each transition checks the closed round's ceremony digest, round number and previous hash before reading any message (`InvalidRound`).
+
+`ReshareTranscript` holds exactly three raw round records. `reshare_verify_transcript` sums every closure and member byte length and signature length first and returns `LimitExceeded` above 4194304 bytes before any signature check; missing or additional records return `InvalidRound`.
+
+### Dealing
+
+Dealer i samples g_i of degree t′−1 with g_i(0) = s_i and coefficients 1..t′−1 drawn in order as 64 bytes reduced mod r, redrawn if zero; then one HPKE encapsulation per recipient in index order. It publishes B_ik = b_ik·g2 for k = 0..t′−1.
+
+```text
+R1 deal       = 01 || t′:u16 || [B_k:96] || n′:u16 || [(recipient:u16 || lp(sealed_dealing))]
+R2 complaints = 01 || count:u16 || [dealer:u16]
+R3 answers    = 01 || count:u16 || [(recipient:u16 || value:32)]
+```
+
+R1 and R2 reuse the genesis R1/R2 layouts. HPKE `info` is `DEALING || authorized_ceremony_digest:32 || 01 || dealer:u16 || recipient:u16`; AAD is `TH(COMMITMENTS, t′:u16 || B_0 || … || B_(t′−1))`; the sealed plaintext is exactly the canonical scalar g_i(j):32. Counts are at most 16 and checked before allocation; index lists are strictly increasing; trailing bytes and other versions are rejected. A payload that fails decoding is *malformed*. Messages with byte-identical envelopes are one message; different envelopes from one sender in one round are *conflicting*.
+
+### Exclusion and dealer selection
+
+R1 *public checks* for dealer i: a single non-conflicting decodable R1, exactly t′ coefficients, B_i0 = pk_i of the current certificate, B_i,t′−1 ≠ identity, and recipient entries exactly 1..=n′.
+
+A complaint by recipient j against dealer i counts once per distinct j, only from a non-conflicting, decodable R2 whose dealer indices are all at most n. Malformed and conflicting R2 supply no complaints and have no effect on the sender's dealer role. Required answers for i are its counted complainers.
+
+An R3 is used only if it is non-conflicting, decodes and names recipients at most n′; otherwise it is malformed. For each dealer i, the first applicable reason excludes it:
+
+1. `MissingDeal`: no R1 from i.
+2. `Equivocated { round: 1 }`: conflicting R1.
+3. `MalformedDeal`: R1 fails the public checks.
+4. `Equivocated { round: 3 }`: conflicting R3.
+5. `Complaints`: at least t′ distinct counted complainers.
+6. `InvalidAnswer`: any answer in i's decoded R3 fails g·g2 = Σ_k j^k·B_ik at its recipient j, required or not.
+7. `MissingAnswer`: a required answer is absent (R3 missing, malformed, or omitting a complainer).
+
+A valid answer that was not required is ignored. A valid required answer replaces the complainer's value from i. D is the first t dealers, in order of each dealer's first R1 message in the owner's closed list, that are not excluded; fewer than t return `InsufficientQualified` and the current epoch stays in force.
+
+A dealer answers in R3 only when its R1 passes the public checks and carries its own commitment vector, and it has fewer than t′ counted complainers; with t′ or more it publishes an empty answer list, so it never publishes t′ points of g_i. Every dealer sends R3 and every recipient sends R2, possibly empty.
+
+### Output
+
+λ_i = λ_i^D over the old indices in D. B′_k = Σ_{i∈D} λ_i·B_ik; B′_0 must equal the current mpk and B′_(t′−1) and every pk′_j must be non-identity. Recipient j's candidate scalar is Σ_{i∈D} λ_i·g_i(j) with R3 replacements; a recipient without a valid value from some dealer in D returns `LocalShareUnavailable`, which only arises when its own complaint is absent from closed R2. `ReshareOutput` carries the public material, D in selection order, the exclusion reasons and the transcript hash. The candidate belongs to the successor certificate (`CertificateBody::successor`, epoch + 1) and is usable only after `KeyShare::bind`.
+
+### Scope
+
+Completion requires the §3.0 owner relay to close each round once and deliver every conforming member's message, and at least t old dealers that pass the rules above. Faulty old dealers within the secrecy budget can still leave fewer than t valid dealers; the ceremony then refuses with `InsufficientQualified`. The protocol does not implement reliable broadcast. Redistribution does not erase anything: old shares remain valid for the old certificate until integration erases them (§3.11, §3.12); old and new shares carry different key contexts and are refused together by `verify_share` and `combine`.
+
+### In-memory lifecycle
+
+`ReshareDealer` holds g_i until `answer` consumes it. `ReshareReceiving` holds the ceremony recipient key until `complain` consumes it; `ReshareComplained` holds the opened values until `finish` consumes it. Scalars clear their storage on drop and every state has redacted `Debug`. The dealer's `KeyShare`, the caller's RNG state and any durable copies are outside this crate (§3.11).
