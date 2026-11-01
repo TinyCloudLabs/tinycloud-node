@@ -87,10 +87,11 @@ echo "refused: $(cat "$scratch/refused.out")"
 
 step "Backup once, exactly as the compose service runs; nothing is written to the container's own filesystem"
 docker run --name "$run_id-backup" "${backup_args[@]}" "$image"
-changes=$(docker diff "$run_id-backup")
+# `--init` (compose `init: true`) bind-mounts Docker's own /sbin/docker-init; that is the only change allowed.
+changes=$(docker diff "$run_id-backup" | grep -v -x -e 'C /sbin' -e 'A /sbin/docker-init' || true)
 [ -z "$changes" ] || fail "the container filesystem changed: $changes"
 docker rm "$run_id-backup" >/dev/null
-echo "docker diff: (no changes)"
+echo "docker diff: no changes besides Docker's /sbin/docker-init mount"
 
 step "Restore drill: newest object -> scratch dir, schema, counts, last entry, byte-for-byte sample"
 sh "$here/ledger-restore-drill.sh" --expect "$scratch/sample.jsonl"
