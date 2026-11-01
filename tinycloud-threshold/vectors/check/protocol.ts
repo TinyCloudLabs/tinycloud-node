@@ -35,7 +35,7 @@ export function be(value: bigint, length: number): Bytes {
   return bytes(value.toString(16).padStart(length * 2, '0'));
 }
 function integer(b: Bytes): bigint { return b.length ? BigInt(`0x${hex(b)}`) : 0n; }
-function lp(b: Bytes): Bytes { return concat(be(BigInt(b.length), 4), b); }
+export function lp(b: Bytes): Bytes { return concat(be(BigInt(b.length), 4), b); }
 function equal(a: Bytes, b: Bytes): boolean { return a.length === b.length && a.every((v, i) => v === b[i]); }
 function sha256(b: Bytes): Bytes { return new Uint8Array(createHash('sha256').update(b).digest()); }
 export function tagged(tag: string, body: Bytes): Bytes { return sha256(concat(lp(encoder.encode(tag)), body)); }
@@ -96,7 +96,7 @@ export function encodeGT(gt: GT): Bytes {
   return concat(...coefficients.map(c => be(c, 48)));
 }
 
-class Reader {
+export class Reader {
   private offset = 0;
   constructor(private readonly input: Bytes) {
     if (input.length > 65536) throw new ProtocolError('InvalidEncoding');
@@ -111,8 +111,8 @@ class Reader {
     if (length > cap) throw new ProtocolError('InvalidEncoding');
     return this.take(length);
   }
-  text(): string {
-    const b = this.field(1024);
+  text(cap = 1024): string {
+    const b = this.field(cap);
     if (b.length === 0) throw new ProtocolError('InvalidEncoding');
     try { return decoder.decode(b); } catch { throw new ProtocolError('InvalidEncoding'); }
   }

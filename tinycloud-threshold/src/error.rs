@@ -52,6 +52,12 @@ pub enum Error {
     NotEnoughReady,
     #[error("candidate does not match certificate")]
     CandidateMismatch,
+    #[error("fewer than t qualified dealers")]
+    InsufficientQualified,
+    #[error("fewer than t valid reconstruction values")]
+    InsufficientRecovery,
+    #[error("no valid private value from a qualified dealer")]
+    LocalShareUnavailable,
 }
 
 /// Verification distinguishes context selection from a member's share equation.
@@ -66,6 +72,9 @@ pub enum ShareError {
 /// Combining never interprets mixed-context inputs as member faults.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CombineError {
+    /// Raw entries exceed twice the current member count; no member is blamed.
+    #[error("too many supplied share entries")]
+    TooManyShares,
     #[error("request context mismatch")]
     ContextMismatch,
     #[error("mixed share contexts")]
