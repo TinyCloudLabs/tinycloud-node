@@ -19,6 +19,8 @@ The crate is a workspace member with `publish = false`. No other workspace crate
 
 The §3.6 request-digest amendment is explicit in SPEC.md. It makes an identity or transport-key transplant a context mismatch before share equations are evaluated.
 
+`combine` accepts at most `2*n` raw share entries, where `n` is the validated current member count. Duplicates count toward this limit. An oversized input returns `CombineError::TooManyShares`, naming no member, before request/share binding checks or algebra. Within the limit, the existing binding-first checks and member deduplication remain unchanged.
+
 ## Checks
 
 Use the workspace's pinned Rust 1.97.1 toolchain:
