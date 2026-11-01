@@ -34,8 +34,24 @@ pub enum Error {
     DegenerateRandomness,
     #[error("invalid IBE ciphertext")]
     InvalidCiphertext,
+    #[error("invalid HPKE key")]
+    InvalidHpkeKey,
+    #[error("invalid sealed dealing")]
+    InvalidSealedDealing,
     #[error("derived key does not match the request")]
     InvalidDerivedKey,
+    #[error("invalid signature")]
+    InvalidSignature,
+    #[error("invalid ceremony")]
+    InvalidCeremony,
+    #[error("invalid round")]
+    InvalidRound,
+    #[error("invalid readiness receipt")]
+    InvalidReadiness,
+    #[error("not enough ready holders")]
+    NotEnoughReady,
+    #[error("candidate does not match certificate")]
+    CandidateMismatch,
 }
 
 /// Verification distinguishes context selection from a member's share equation.
@@ -50,6 +66,9 @@ pub enum ShareError {
 /// Combining never interprets mixed-context inputs as member faults.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CombineError {
+    /// Raw entries exceed twice the current member count; no member is blamed.
+    #[error("too many supplied share entries")]
+    TooManyShares,
     #[error("request context mismatch")]
     ContextMismatch,
     #[error("mixed share contexts")]
@@ -58,4 +77,28 @@ pub enum CombineError {
     Invalid { member: MemberIndex },
     #[error("not enough distinct shares")]
     NotEnoughShares,
+}
+
+/// Failure reported by the caller's DID signature verifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum SignatureError {
+    #[error("invalid signature")]
+    Invalid,
+}
+
+/// Certificate validation against an external anchor and pinned predecessor.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CertError {
+    #[error(transparent)]
+    Invalid(#[from] Error),
+    #[error("certificate anchor mismatch")]
+    AnchorMismatch,
+    #[error("invalid certificate signature")]
+    InvalidSignature,
+    #[error("invalid certificate lineage")]
+    InvalidLineage,
+    #[error("invalid certificate members")]
+    InvalidMembers,
+    #[error("invalid certificate commitments")]
+    InvalidCommitments,
 }
