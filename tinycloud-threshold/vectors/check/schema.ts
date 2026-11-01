@@ -1,18 +1,18 @@
 import { DST, PEDERSEN_H_MESSAGE } from './protocol.ts';
 
-type Parser<T> = (value: unknown, path: string) => T;
-type Parsed<P> = P extends Parser<infer T> ? T : never;
-function invalid(path: string): never { throw new Error(`schema: ${path}`); }
-function literal<const T extends string | number>(expected: T): Parser<T> {
+export type Parser<T> = (value: unknown, path: string) => T;
+export type Parsed<P> = P extends Parser<infer T> ? T : never;
+export function invalid(path: string): never { throw new Error(`schema: ${path}`); }
+export function literal<const T extends string | number>(expected: T): Parser<T> {
   return (v, p) => v === expected ? expected : invalid(p);
 }
-function hexField(length: number): Parser<string> {
+export function hexField(length: number): Parser<string> {
   return (v, p) => typeof v === 'string' && v.length === length * 2 && /^[0-9a-f]+$/.test(v) ? v : invalid(p);
 }
-function intField(min: number, max: number): Parser<number> {
+export function intField(min: number, max: number): Parser<number> {
   return (v, p) => typeof v === 'number' && Number.isInteger(v) && v >= min && v <= max ? v : invalid(p);
 }
-function object<S extends Record<string, Parser<unknown>>>(shape: S): Parser<{ [K in keyof S]: Parsed<S[K]> }> {
+export function object<S extends Record<string, Parser<unknown>>>(shape: S): Parser<{ [K in keyof S]: Parsed<S[K]> }> {
   return (v, p) => {
     if (!v || typeof v !== 'object' || Array.isArray(v)) return invalid(p);
     const input = v as Record<string, unknown>;
@@ -22,7 +22,7 @@ function object<S extends Record<string, Parser<unknown>>>(shape: S): Parser<{ [
     return result as { [K in keyof S]: Parsed<S[K]> };
   };
 }
-function array<T>(parse: Parser<T>, length: number): Parser<T[]> {
+export function array<T>(parse: Parser<T>, length: number): Parser<T[]> {
   return (v, p) => {
     if (!Array.isArray(v) || v.length !== length) return invalid(p);
     return v.map((x: unknown, i) => parse(x, `${p}[${i}]`));
