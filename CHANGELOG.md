@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Existing path-scoped shares continue to open across wrapped-key digest encodings. Details: TC-2192
+
 ## [1.25.14] - 2026-10-29
 
 ### Changes
