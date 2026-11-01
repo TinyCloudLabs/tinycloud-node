@@ -142,6 +142,7 @@ export async function main(args = process.argv.slice(2)) {
     DATABASE_URL: 'sqlite:/data/caps.db?mode=rwc', S3_BUCKET: 'tc959-synthetic', S3_ENDPOINT: 'http://127.0.0.1:9', AWS_KEY: 'TC959_SYNTHETIC_KEY', AWS_SECRET: 'TC959_SYNTHETIC_SECRET', AWS_REGION: 'us-east-1',
     SQL_IDENTITY_FENCE: 'false', SHARE_TRUST_BUNDLE_BASE64: Buffer.from('{}').toString('base64'), TINYCLOUD_QUOTA_URL: '', TINYCLOUD_ADMIN_SECRET: 'TC959_SYNTHETIC_ADMIN',
     CLOUDFLARE_API_TOKEN: 'TC959_SYNTHETIC_DNS', DSTACK_GATEWAY_DOMAIN: 'invalid.test', CERTBOT_EMAIL: 'email@example.test', BETTERSTACK_SOURCE_TOKEN: token, TINYCLOUD_LOGSHIP_PROFILE: 'errors_slow',
+    NODE_BACKUP_R2_ENDPOINT: 'http://127.0.0.1:9', NODE_BACKUP_R2_ACCESS_KEY_ID: 'TC959_SYNTHETIC_BACKUP_KEY', NODE_BACKUP_R2_SECRET_ACCESS_KEY: 'TC959_SYNTHETIC_BACKUP_SECRET', NODE_BACKUP_AGE_RECIPIENT: 'age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq',
   };
   const command = (binary, args, { final = false, optional = false, timeout = 15000 } = {}) => {
     if (!final) checkTime();

@@ -721,9 +721,10 @@ jobs:
           # TC-959: main's N0 compose (#349 c33c2302…) with the 95m ingress body
           # cap (raw d95bfb70…), the TC-1274 + TC-1317 + TC-1482 + c_index + TC-1840 + TC-1843 Vector config and the
           # optional TC-1482 NODE_STATS_READ_TOKEN env line, the TC-950 pool of 10 and the TC-1777 named-keys gate
-          # env lines + deletion-ledger volume (raw 298ea356…; 192dfb7e… before TC-1777),
+          # env lines + deletion-ledger volume, and the TC-887 ledger-backup sidecar pinned by digest
+          # (raw 81412971…; 298ea356… before TC-887; 192dfb7e… before TC-1777),
           # its single node digest normalized to 64 zeros.
-          n0_template_hash = 'c9bcbea9dac90fc2b74d8439146596ba802796a211d1b6d65aeda2286d7ed028'
+          n0_template_hash = '0d57efc103654fe3ec361680bdd0f264d4a9db111b1a48e970f28980f4805bbc'
           node_pin = re.compile(rb'(?m)^    image: ghcr\.io/tinycloudlabs/tinycloud-node@sha256:([0-9a-f]{64})$')
           def n0_template(raw):
               pins = list(node_pin.finditer(raw))
@@ -1000,6 +1001,11 @@ jobs:
           PHALA_ENV_BETTERSTACK_SOURCE_TOKEN: ${{ secrets.PROD_TINYCLOUD_BETTERSTACK_SOURCE_TOKEN }}
           PHALA_ENV_SQL_IDENTITY_FENCE: ${{ inputs.sql_identity_fence }}
           PHALA_ENV_NAMED_KEYS_V1: ${{ inputs.named_keys_v1 }}
+          # TC-887: the deletion-ledger backup sidecar (deploy/ledger-backup/README.md).
+          PHALA_ENV_NODE_BACKUP_R2_ENDPOINT: ${{ secrets.PROD_TINYCLOUD_NODE_BACKUP_R2_ENDPOINT }}
+          PHALA_ENV_NODE_BACKUP_R2_ACCESS_KEY_ID: ${{ secrets.PROD_TINYCLOUD_NODE_BACKUP_R2_ACCESS_KEY_ID }}
+          PHALA_ENV_NODE_BACKUP_R2_SECRET_ACCESS_KEY: ${{ secrets.PROD_TINYCLOUD_NODE_BACKUP_R2_SECRET_ACCESS_KEY }}
+          PHALA_ENV_NODE_BACKUP_AGE_RECIPIENT: ${{ secrets.PROD_TINYCLOUD_NODE_BACKUP_AGE_RECIPIENT }}
         # Update the existing prod CVM (name: tinycloud-node) in the
         # Tiny Cloud workspace. The PHALA_CLOUD_API_KEY secret is
         # workspace-scoped and must be issued from that workspace.
@@ -1026,6 +1032,10 @@ jobs:
             PHALA_ENV_BETTERSTACK_SOURCE_TOKEN
             PHALA_ENV_SQL_IDENTITY_FENCE
             PHALA_ENV_NAMED_KEYS_V1
+            PHALA_ENV_NODE_BACKUP_R2_ENDPOINT
+            PHALA_ENV_NODE_BACKUP_R2_ACCESS_KEY_ID
+            PHALA_ENV_NODE_BACKUP_R2_SECRET_ACCESS_KEY
+            PHALA_ENV_NODE_BACKUP_AGE_RECIPIENT
           )
 
           for var in "${required_vars[@]}"; do
@@ -1045,6 +1055,20 @@ jobs:
             echo "::error::named_keys_v1 must be exactly true or false"
             exit 1
           fi
+
+          # TC-887: the CVM may hold only the age PUBLIC recipient. Refuse an
+          # identity (private key) or anything else before it is written.
+          case "${PHALA_ENV_NODE_BACKUP_AGE_RECIPIENT}" in
+            AGE-SECRET-KEY-*)
+              echo "::error::NODE_BACKUP_AGE_RECIPIENT is a private key; only the age1... public recipient may be sealed"
+              exit 1
+              ;;
+            age1*) ;;
+            *)
+              echo "::error::NODE_BACKUP_AGE_RECIPIENT must be an age1... public recipient"
+              exit 1
+              ;;
+          esac
 
           # Optional (TC-1482): the same single-line rule, but absence is allowed.
           if [[ "${PHALA_ENV_NODE_STATS_READ_TOKEN:-}" == *$'\n'* || "${PHALA_ENV_NODE_STATS_READ_TOKEN:-}" == *$'\r'* ]]; then
@@ -1091,6 +1115,10 @@ jobs:
             printf 'BETTERSTACK_SOURCE_TOKEN=%s\n' "$PHALA_ENV_BETTERSTACK_SOURCE_TOKEN"
             printf 'SQL_IDENTITY_FENCE=%s\n' "$PHALA_ENV_SQL_IDENTITY_FENCE"
             printf 'NAMED_KEYS_V1=%s\n' "$PHALA_ENV_NAMED_KEYS_V1"
+            printf 'NODE_BACKUP_R2_ENDPOINT=%s\n' "$PHALA_ENV_NODE_BACKUP_R2_ENDPOINT"
+            printf 'NODE_BACKUP_R2_ACCESS_KEY_ID=%s\n' "$PHALA_ENV_NODE_BACKUP_R2_ACCESS_KEY_ID"
+            printf 'NODE_BACKUP_R2_SECRET_ACCESS_KEY=%s\n' "$PHALA_ENV_NODE_BACKUP_R2_SECRET_ACCESS_KEY"
+            printf 'NODE_BACKUP_AGE_RECIPIENT=%s\n' "$PHALA_ENV_NODE_BACKUP_AGE_RECIPIENT"
             # TC-1482: optional. Unset keeps the node starting with
             # GET /admin/stats disabled (404); never written empty.
             if [ -n "${PHALA_ENV_NODE_STATS_READ_TOKEN:-}" ]; then

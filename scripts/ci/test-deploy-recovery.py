@@ -217,7 +217,7 @@ class SafeResult(unittest.TextTestResult):
 class RecoveryTests(unittest.TestCase):
     def run_deploy(self, compose=CURRENT, changes=None, *, fail_at="", artifact_error="", authority="node-override",
                    missing_billing=False, missing_authorization=False, approved_privacy="", event="workflow_dispatch", stats_token=None,
-                   allowed_stats=False,
+                   allowed_stats=False, backup_recipient=None,
                    ref="refs/heads/main", oci_label=None, oci_revision=None, build_digest="", releases=RELEASED, running=REVISION, order=None):
         inputs = {"deploy_phala": "true", "authorize_quota_values": "true", "image_version": "1.20.6",
                   "deploy_image_digest": DIGEST, "rollback_image_version": "1.20.6", "rollback_image_revision": REVISION,
@@ -287,6 +287,8 @@ class RecoveryTests(unittest.TestCase):
             if missing_billing: env.pop("QUOTA_BILLING_ADMIN_SECRET")
             env["PHALA_ENV_NAMED_KEYS_V1"] = inputs.get("named_keys_v1", "false")
             env["TINYCLOUD_ENCRYPTION_NETWORK__NAMED_KEYS_V1"] = inputs.get("named_keys_v1", "false")
+            # TC-887: the sealed recipient must look like an age public key; the canary does not.
+            env["PHALA_ENV_NODE_BACKUP_AGE_RECIPIENT"] = backup_recipient if backup_recipient is not None else "age1" + "q" * 58
             context = {"github.event_name": event, "github.ref": ref, "job.success": True,
                        **{"inputs." + key: (value == "true" if value in ("true", "false") else value) for key, value in inputs.items()}}
             logs = ""
@@ -364,6 +366,25 @@ class RecoveryTests(unittest.TestCase):
                 accepted = self.run_deploy(stats_token=value)
                 self.assertTrue(accepted["success"], "A token of at least 32 bytes must be accepted")
                 self.assertEqual(accepted["env_names"].count("NODE_STATS_READ_TOKEN"), 1)
+
+    def test_backup_recipient_must_be_a_public_age_key_and_is_checked_before_the_file(self):
+        # TC-887: the CVM may hold only the age public recipient, never the identity.
+        identity = "AGE-SECRET-KEY-1" + secrets.token_hex(29).upper()
+        CANARIES.append(identity)
+        for label, value, message in (
+                ("an identity", identity, "::error::NODE_BACKUP_AGE_RECIPIENT is a private key; only the age1... public recipient may be sealed"),
+                ("an ssh key", "ssh-ed25519 AAAAC3Nza", "::error::NODE_BACKUP_AGE_RECIPIENT must be an age1... public recipient")):
+            with self.subTest(label):
+                refused = self.run_deploy(backup_recipient=value)
+                self.assertFalse(refused["success"])
+                self.assertIn(message, refused["logs"])
+                self.assertEqual(refused["events"].count("cvm-deploy"), 0, "A refused recipient must fail before the CVM mutation")
+                self.assertEqual(refused["env_names"], [], "The sealed file must not be written first")
+                self.assertNotIn(identity, refused["logs"] + refused["summary"], "The identity leaked")
+        sealed = self.run_deploy()
+        self.assertTrue(sealed["success"])
+        for name in ("NODE_BACKUP_R2_ENDPOINT", "NODE_BACKUP_R2_ACCESS_KEY_ID", "NODE_BACKUP_R2_SECRET_ACCESS_KEY", "NODE_BACKUP_AGE_RECIPIENT"):
+            self.assertEqual(sealed["env_names"].count(name), 1, name)
 
     def test_deleted_stats_token_secret_fails_closed_once_the_name_is_allowed(self):
         # TC-1482: after the first deploy with the token, `allowed_envs` on the CVM contains

@@ -583,6 +583,34 @@ its branch policy before any workflow that names it runs.
    line).
    Details: `test/probe/README.md`.
 
+### Deletion-ledger backup sidecar (TC-887): compose hash change
+
+The `ledger-backup` service in `docker-compose.dstack-postgres.yaml` backs up
+the named-keys deletion ledger, the only data that exists solely on the CVM
+disk (`deploy/ledger-backup/README.md`). It **changes the compose hash**, so
+it reaches production with the next release promotion, like any compose
+change. It goes live in its own booked window, never as a side effect of an
+unrelated release:
+
+- Merge it only once the window is booked. From the merge on, every deploy
+  through `docker.yml` (release promotion, same-image recovery and the pre-N0
+  rollback, which share the deploy step) needs the four `production`
+  environment secrets below. Without them the deploy step stops with
+  `Missing required GitHub secret for Phala deploy: NODE_BACKUP_…` before any
+  CVM change.
+- `PROD_TINYCLOUD_NODE_BACKUP_R2_ENDPOINT`, `PROD_TINYCLOUD_NODE_BACKUP_R2_ACCESS_KEY_ID`,
+  `PROD_TINYCLOUD_NODE_BACKUP_R2_SECRET_ACCESS_KEY` (a key scoped to the
+  `tinycloud-node-backups` bucket only) and `PROD_TINYCLOUD_NODE_BACKUP_AGE_RECIPIENT`
+  map to the sealed `NODE_BACKUP_R2_ENDPOINT`, `NODE_BACKUP_R2_ACCESS_KEY_ID`,
+  `NODE_BACKUP_R2_SECRET_ACCESS_KEY` and `NODE_BACKUP_AGE_RECIPIENT`. The
+  bucket name is in the compose.
+- The deploy step refuses, with a constant message, a recipient that is an age
+  identity (`AGE-SECRET-KEY-…`) or anything but an `age1…` public recipient,
+  before it writes the sealed file.
+- The sidecar image is pinned by digest in the compose. Changing the sidecar
+  means a new digest from the `ledger-backup` workflow's `image` job, a new
+  template hash here and in `docker.yml`, and the fixture copy.
+
 ### Main release with N0 log shipping (one dispatch)
 
 Ships a main release on #309's log sidecar compose. Before dispatching,
@@ -610,8 +638,8 @@ Before any CVM mutation the workflow requires:
 
 - the main compose, with its one node digest replaced by 64 zeros, to hash
   to the reviewed N0 template
-  **`c9bcbea9dac90fc2b74d8439146596ba802796a211d1b6d65aeda2286d7ed028`**
-  (raw `298ea356adf8d5e562557ab18bd3f5d8cdb816de82b1eaf6e6e50bf888e22765` normalized; before the TC-1777 named-keys gate env lines (`TINYCLOUD_ENCRYPTION_NETWORK__NAMED_KEYS_V1`, `…__DELETION_LEDGER_PATH`) and the `deletion-ledger` volume the template was `8df7e0f2…`, raw `192dfb7e407fa591d4f0232b95e43a41a85dd18add1d4976e70ebdbff5ddebca`; before the TC-1843 per-minute caps on 4xx and 5xx request events and on the 5xx diagnostic, and the `errors_dropped` event (the dropped count), in the Vector config the template was `7c3456dc…`, raw `d0e72bde…`; before the TC-1840 `db_failure_5xx` event (the node's 5xx diagnostic line shipped as an individual event) in the Vector config the template was `c91e5b7a…`, raw `99013c40…`; before the TC-950 pool of 10 (`TINYCLOUD_DATABASE__MAX_CONNECTIONS` 15 to 10) the template was `79469f97…`, raw `32a002ef…`; before the three `current_kv_c_index_*` warning codes in the Vector config (TC-1274 `current_kv` C-index migration) the template was `87b5d12a…`, raw `d1fcd665…`; before the optional TC-1482 `NODE_STATS_READ_TOKEN` env line and the TC-1482 route in the Vector config the template was `7fabba70…`, raw `1228d81927fc0a3fbba85745103e77b3112606f5d314d15974d400b222409350`: the 1.21.0 compose
+  **`0d57efc103654fe3ec361680bdd0f264d4a9db111b1a48e970f28980f4805bbc`**
+  (raw `81412971fdc38bca4f3f3b56d69d205a4455fc1ad716c062cee1450d6241f8e6` normalized; before the TC-887 `ledger-backup` sidecar (pinned by digest, with its `NODE_BACKUP_*` env lines) the template was `c9bcbea9…`, raw `298ea356adf8d5e562557ab18bd3f5d8cdb816de82b1eaf6e6e50bf888e22765`; before the TC-1777 named-keys gate env lines (`TINYCLOUD_ENCRYPTION_NETWORK__NAMED_KEYS_V1`, `…__DELETION_LEDGER_PATH`) and the `deletion-ledger` volume the template was `8df7e0f2…`, raw `192dfb7e407fa591d4f0232b95e43a41a85dd18add1d4976e70ebdbff5ddebca`; before the TC-1843 per-minute caps on 4xx and 5xx request events and on the 5xx diagnostic, and the `errors_dropped` event (the dropped count), in the Vector config the template was `7c3456dc…`, raw `d0e72bde…`; before the TC-1840 `db_failure_5xx` event (the node's 5xx diagnostic line shipped as an individual event) in the Vector config the template was `c91e5b7a…`, raw `99013c40…`; before the TC-950 pool of 10 (`TINYCLOUD_DATABASE__MAX_CONNECTIONS` 15 to 10) the template was `79469f97…`, raw `32a002ef…`; before the three `current_kv_c_index_*` warning codes in the Vector config (TC-1274 `current_kv` C-index migration) the template was `87b5d12a…`, raw `d1fcd665…`; before the optional TC-1482 `NODE_STATS_READ_TOKEN` env line and the TC-1482 route in the Vector config the template was `7fabba70…`, raw `1228d81927fc0a3fbba85745103e77b3112606f5d314d15974d400b222409350`: the 1.21.0 compose
   `d95bfb707871c1d626c4a8f2b8d32d354103edbb5077847c6a21fe5f7f6cfa50`, template
   `51f8e9e9…`, with only the embedded Vector config regenerated for TC-1274's,
   TC-1317's and TC-1482's route and warning codes (TC-1274 and TC-1317 were template `7fabba70…`, raw `1228d819…`); TC-1274 alone was template `00938226…`, raw
@@ -705,8 +733,8 @@ gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref main \
 
 The served/OCI identity remains **1.20.6-dstack / e18578ff9162986ddd813259c60f73866e3e60d1**.
 With the template lock on main this redeploys exactly main's raw compose
-`298ea356adf8d5e562557ab18bd3f5d8cdb816de82b1eaf6e6e50bf888e22765`
-(the 1.21.0 compose `d95bfb70…` with the TC-1274, TC-1317, TC-1482, `current_kv_c_index_*`, `db_failure_5xx`, the 4xx and 5xx caps and `errors_dropped` Vector config, the optional TC-1482 `NODE_STATS_READ_TOKEN` env line, the TC-950 pool of 10, and the TC-1777 `NAMED_KEYS_V1` gate env lines with the `deletion-ledger` volume), whatever digest
+`81412971fdc38bca4f3f3b56d69d205a4455fc1ad716c062cee1450d6241f8e6`
+(the 1.21.0 compose `d95bfb70…` with the TC-1274, TC-1317, TC-1482, `current_kv_c_index_*`, `db_failure_5xx`, the 4xx and 5xx caps and `errors_dropped` Vector config, the optional TC-1482 `NODE_STATS_READ_TOKEN` env line, the TC-950 pool of 10, the TC-1777 `NAMED_KEYS_V1` gate env lines with the `deletion-ledger` volume, and the TC-887 `ledger-backup` sidecar), whatever digest
 main's template currently pins. It is not a rollback of a
 later release across a schema migration. Current pre-N0 tag/pinned
 equivalents are separately hash-checked; arbitrary same-image config
