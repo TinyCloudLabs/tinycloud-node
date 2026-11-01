@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## [1.25.15] - 2026-11-01
+
+### Changes
+- `/policy/v3/*` responses carry the same CORS headers as `/invoke` (`Access-Control-Allow-Origin: *`, the same allowed methods and headers, a 7200 s preflight `Max-Age`), for every origin, without `Access-Control-Allow-Credentials`. These paths no longer use the single `shareEmail` allowed origin and its fixed `GET, POST` method list; they keep `Cache-Control: no-store`, `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`. With `cors = false` they now carry no CORS headers, like every other route. Details: TC-2192 (#490)
+- Internal, not reachable over HTTP: `tinycloud-threshold` bounds raw combine inputs (TC-2219, #491), gains a genesis DKG over owner-closed rounds with its test vector (TC-2220, #492; no route, no `/info` feature, and `tinycloud-node` does not depend on the crate), and its certificate-core vectors have a checker (TC-2223, #489).
+- CI only: the workspace test job is split and the PR Docker build caches its cargo mounts (#495).
+
 ## [1.25.14] - 2026-10-29
 
 ### Changes
