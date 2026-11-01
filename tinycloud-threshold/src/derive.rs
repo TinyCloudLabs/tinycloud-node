@@ -348,11 +348,17 @@ pub struct EncryptedDerivedKey {
 }
 
 /// Verifies every input, counts each member once, then uses the lowest t indices.
+/// Refuses more than `2 * n` entries, including duplicates, before context checks
+/// or algebra, where `n` is the validated current member count.
 pub fn combine(
     public: &PublicKeySet,
     req: &DecryptRequest,
     shares: &[EncryptedKeyShare],
 ) -> Result<EncryptedDerivedKey, CombineError> {
+    let maximum = usize::from(public.context.threshold().n()).saturating_mul(2);
+    if shares.len() > maximum {
+        return Err(CombineError::TooManyShares);
+    }
     if !req.matches(&public.context) {
         return Err(CombineError::ContextMismatch);
     }

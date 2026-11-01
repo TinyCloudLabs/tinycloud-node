@@ -1,14 +1,21 @@
 import { readFileSync } from 'node:fs';
 import { checkVectors } from './vectors.ts';
+import { checkCertificateVectors } from './cert-vectors.ts';
 import { checkTranscripts, transcriptKind } from './transcripts.ts';
 
-const defaults = ['../v1/primitives.json', '../v1/dkg-genesis.json', '../v1/reshare.json'].map(p => new URL(p, import.meta.url));
+const defaults = ['../v1/primitives.json', '../v1/cert-core.json', '../v1/dkg-genesis.json', '../v1/reshare.json'].map(p => new URL(p, import.meta.url));
 
 function check(input: unknown) {
   if (transcriptKind(input) !== undefined) {
     const report = checkTranscripts(input);
     for (const name of report.passed) console.log(`PASS ${name}`);
     console.log(`${report.kind === 'dkg' ? 'DKG' : 'Reshare'} transcripts: ${report.passed.length}/${report.passed.length}`);
+    return;
+  }
+  if (input && typeof input === 'object' && 'suite' in input && input.suite === 'TC-THRESHOLD-V1') {
+    const report = checkCertificateVectors(input);
+    for (const name of report.passed) console.log(`PASS ${name}`);
+    console.log(`Certificate vectors: ${report.passed.length}/${report.passed.length}; signing keys: ${report.signingKeys}`);
     return;
   }
   const report = checkVectors(input);

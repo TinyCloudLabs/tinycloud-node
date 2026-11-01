@@ -111,8 +111,8 @@ export class Reader {
     if (length > cap) throw new ProtocolError('InvalidEncoding');
     return this.take(length);
   }
-  text(): string {
-    const b = this.field(1024);
+  text(cap = 1024): string {
+    const b = this.field(cap);
     if (b.length === 0) throw new ProtocolError('InvalidEncoding');
     try { return decoder.decode(b); } catch { throw new ProtocolError('InvalidEncoding'); }
   }

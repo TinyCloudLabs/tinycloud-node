@@ -22,7 +22,7 @@ export function object<S extends Record<string, Parser<unknown>>>(shape: S): Par
     return result as { [K in keyof S]: Parsed<S[K]> };
   };
 }
-function array<T>(parse: Parser<T>, length: number): Parser<T[]> {
+export function array<T>(parse: Parser<T>, length: number): Parser<T[]> {
   return (v, p) => {
     if (!Array.isArray(v) || v.length !== length) return invalid(p);
     return v.map((x: unknown, i) => parse(x, `${p}[${i}]`));

@@ -327,6 +327,35 @@ jobs:
             type=raw,value=edge,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
             type=raw,value=latest,enable=${{ github.event_name != 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v') }}
 
+      # Pull requests only: keep the Dockerfile's `--mount=type=cache` dirs
+      # (cargo registry, /app/target) between pushes of the same PR. On a hosted
+      # runner those mounts start empty and are never part of the exported layer
+      # cache, so the cargo-chef cook layer caches nothing and every PR push
+      # rebuilt all dependencies plus the app in release. The cache is restored
+      # from actions/cache, injected into BuildKit here, and extracted again
+      # after the build. The Dockerfile, the image, the target and every
+      # push / tag / release / dispatch path are unchanged. A PR's cache is
+      # private to that PR (and main), so the first push of a PR is still cold.
+      - name: Restore cargo build mounts (pull requests)
+        if: github.event_name == 'pull_request'
+        id: cargo_mounts
+        uses: actions/cache@v4
+        with:
+          path: docker-cache-mounts
+          # One entry per commit, restored from the newest earlier one: a run
+          # whose layers were all cached from main compiles nothing and would
+          # otherwise freeze an empty cache under a fixed key.
+          key: docker-pr-cargo-mounts-${{ github.sha }}
+          restore-keys: docker-pr-cargo-mounts-
+
+      - name: Inject cargo build mounts into BuildKit (pull requests)
+        if: github.event_name == 'pull_request'
+        uses: reproducible-containers/buildkit-cache-dance@1b8ab18fbda5ad3646e3fcc9ed9dd41ce2f297b4 # v3.3.2
+        with:
+          dockerfile: Dockerfile
+          cache-dir: docker-cache-mounts
+          skip-extraction: ${{ steps.cargo_mounts.outputs.cache-hit }}
+
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
