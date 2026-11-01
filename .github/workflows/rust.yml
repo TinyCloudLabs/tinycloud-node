@@ -96,9 +96,13 @@ jobs:
       run: cargo build -p tinycloud-sdk-wasm -p tinycloud-verifier-wasm --target wasm32-unknown-unknown
 
   test:
-    name: test (workspace, PostgreSQL-backed)
+    name: test (workspace, PostgreSQL-backed, ${{ matrix.group }})
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [unit, integration-a-o, integration-rest, duckdb]
     services:
       postgres:
         image: postgres:16-alpine
@@ -136,7 +140,11 @@ jobs:
     - name: Cache Rust dependencies
       uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
       with:
-        shared-key: rust-1.97.1-test-default-duckdb
+        # The three default-feature legs share the cache the single job used
+        # (warm on every PR); the DuckDB leg has its own, because the bundled
+        # DuckDB build is the 12 minute one and must never be lost to another
+        # leg winning the save race.
+        shared-key: ${{ matrix.group == 'duckdb' && 'rust-1.97.1-test-duckdb' || 'rust-1.97.1-test-default-duckdb' }}
         workspaces: . -> target
         save-if: ${{ github.ref == 'refs/heads/main' }}
     - name: Assert PostgreSQL is reachable
@@ -149,6 +157,7 @@ jobs:
         sudo -n iptables -w -L OUTPUT -n >/dev/null
 
     - name: Assert the PostgreSQL regressions still exist
+      if: matrix.group == 'integration-a-o'
       run: |
         set -euo pipefail
         # `|| true` so a zero match reaches the explicit check below rather
@@ -164,9 +173,34 @@ jobs:
     # The five postgres_* regressions run as part of this suite, against the
     # service container above. tinycloud-core's other ~300 tests — which no CI
     # job had ever executed — run here too.
-    - name: Run the workspace test suite
+    #
+    # The old step ran `cargo test --workspace`. That is exactly the four steps
+    # below, which partition cargo's own default targets (lib unit tests, bin
+    # unit tests, integration tests, doc tests) while keeping `--workspace` so
+    # feature unification and the built artifacts are identical:
+    #   unit              --lib
+    #   integration-a-o   --bins, --test '[a-o]*', then --doc
+    #   integration-rest  --test '[!a-o]*'  (the complement of [a-o]*, so any
+    #                     new integration test lands in exactly one leg)
+    - name: Run the workspace unit tests
+      if: matrix.group == 'unit'
       timeout-minutes: 25
-      run: cargo test --workspace
+      run: cargo test --workspace --lib
+
+    - name: Run the workspace bin and integration tests (a-o)
+      if: matrix.group == 'integration-a-o'
+      timeout-minutes: 25
+      run: cargo test --workspace --bins --test '[a-o]*'
+
+    - name: Run the workspace doc tests
+      if: matrix.group == 'integration-a-o'
+      timeout-minutes: 25
+      run: cargo test --workspace --doc
+
+    - name: Run the workspace integration tests (everything outside a-o)
+      if: matrix.group == 'integration-rest'
+      timeout-minutes: 25
+      run: cargo test --workspace --test '[!a-o]*'
 
     # The workspace suite does not enable tinycloud-core's DuckDB feature.
     # Run its unit tests with that feature so SQL/DuckDB identity parity is
@@ -174,10 +208,12 @@ jobs:
     # A cold bundled DuckDB build took 11m52s before tests began in PR #473;
     # the prior 15m cap stopped it after 1,082 passing core tests, during integration tests.
     - name: Run DuckDB-enabled core tests
+      if: matrix.group == 'duckdb'
       timeout-minutes: 20
       run: cargo test -p tinycloud-core --features duckdb
 
     - name: Run DuckDB policy and request telemetry through node binaries
+      if: matrix.group == 'duckdb'
       timeout-minutes: 15
       run: cargo test -p tinycloud-node --features duckdb --test request_telemetry_authenticated --test duckdb_diagnostics_policy --test duckdb_offline_policy --test space_size_restart
 
@@ -189,6 +225,24 @@ jobs:
       if: failure()
       run: |
         psql "${TINYCLOUD_TEST_POSTGRES_URL}" -c "SELECT pid, datname, state, wait_event_type, wait_event, left(query, 200) AS query, pg_blocking_pids(pid) AS blocked_by FROM pg_stat_activity WHERE pid <> pg_backend_pid() ORDER BY pid;" || true
+
+  # The test job above is a matrix so its groups run in parallel (it used to be
+  # one serial job, ~26 min). This job keeps the old check name as the single
+  # verdict: it fails unless every leg succeeded, so nothing that looks for the
+  # old name can go green on a partial run.
+  test-gate:
+    name: test (workspace, PostgreSQL-backed)
+    needs: [test]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+    - name: Require every test leg to have succeeded
+      env:
+        TEST_RESULT: ${{ needs.test.result }}
+      run: |
+        echo "test matrix result: ${TEST_RESULT}"
+        [ "${TEST_RESULT}" = "success" ]
 
   clippy:
     name: clippy (workspace)
