@@ -171,6 +171,11 @@ pub enum DbConnectionEvent {
     Revalidated,
     /// That ping failed and the connection was closed.
     RevalidationFailed,
+    /// A whole `/delegate` or `/invoke` authorization operation that lost
+    /// its connection before any write was run once more (TC-2346).
+    OperationRetried,
+    /// That retried operation succeeded.
+    OperationRetrySucceeded,
 }
 
 impl DbConnectionEvent {
@@ -180,6 +185,8 @@ impl DbConnectionEvent {
             Self::Retried => "retried",
             Self::Revalidated => "revalidated",
             Self::RevalidationFailed => "revalidation_failed",
+            Self::OperationRetried => "operation_retried",
+            Self::OperationRetrySucceeded => "operation_retry_succeeded",
         }
     }
 }

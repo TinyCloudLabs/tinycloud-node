@@ -47,19 +47,20 @@ use tinycloud_core::duckdb::{
 use tinycloud_core::{
     admission::AdmissionError,
     database_migration,
-    db_pool::{classify_failure, track_writes, TransientFailure},
+    db_pool::{classify_failure, track_writes, track_writes_retrying, TransientFailure},
     encryption_network::EncryptionService,
     events::Invocation,
     failure_diagnostic::{
         failure_kind, FailureCode, FailureNote, Service, KIND_READ_AUDIT_BUSY, KIND_REQUEST_TIMEOUT,
     },
+    keys::Secrets,
     models::{
         hook_delivery, hook_subscription, invocation as invocation_model, kv_delete, kv_write,
     },
     request_cancel,
     sea_orm::{ColumnTrait, DbErr, EntityTrait, QueryFilter, QueryOrder},
     sql::{CaveatArm, SqlAuthority, SqlCaveats, SqlError, SqlRequest, SqlService},
-    storage::{HashBuffer, ImmutableReadStore, ImmutableStaging},
+    storage::{HashBuffer, ImmutableReadStore, ImmutableStaging, StorageSetup},
     types::{Ability, DelegationQuery, DelegationQueryPage, Metadata, Resource},
     util::{Capability, DelegationInfo, InvocationInfo, RevocationInfo},
     write_hooks::{
@@ -219,6 +220,14 @@ fn database_failure(
         db_hash: None,
     });
     (status, body)
+}
+
+/// The database error inside a [`TxError`], for [`track_writes_retrying`].
+fn tx_database_error<S: StorageSetup, K: Secrets>(error: &TxError<S, K>) -> Option<&DbErr> {
+    match error {
+        TxError::Db(error) | TxError::EpochInsert(error) => Some(error),
+        _ => None,
+    }
 }
 
 /// `/invoke` failure: plain text for everything except storage rejections,
@@ -695,7 +704,15 @@ pub async fn delegate(
                 .with_label_values(&["delegate"])
                 .start_timer()
         });
-        let (res, write_may_have_applied) = track_writes(tinycloud.delegate(d.0)).await;
+        // One retry of the whole operation after a connection lost before
+        // any write (TC-2346); see `track_writes_retrying`.
+        let delegation = d.0;
+        let (res, write_may_have_applied) = track_writes_retrying(
+            "delegate",
+            || tinycloud.delegate(delegation.clone()),
+            tx_database_error,
+        )
+        .await;
         let res = res
             .map_err(|e| match &e {
                 TxError::Db(error) | TxError::EpochInsert(error) => {
@@ -4278,9 +4295,16 @@ async fn verify_auth_admitted(
     tinycloud: &State<TinyCloud>,
 ) -> Result<TransactResult, (Status, String)> {
     let start = Instant::now();
-    let result = tinycloud
-        .invoke_admitted::<BlockStage>(invocation, HashMap::new())
-        .await
+    let (result, _) = track_writes_retrying(
+        "authorize_invocation",
+        || tinycloud.invoke_admitted::<BlockStage>(invocation.clone(), HashMap::new()),
+        |error| match error {
+            TxStoreError::Tx(error) => tx_database_error(error),
+            _ => None,
+        },
+    )
+    .await;
+    let result = result
         // Authorization records only the invocation; the operation it
         // authorizes has not run, so a database failure here is retryable.
         .map_err(|e| match &e {
@@ -4307,6 +4331,7 @@ mod tests {
     mod delegation_issued_query;
     mod encryption_keys;
     mod key_delete;
+    mod operation_retry;
     mod revocation_scope;
 
     use super::*;

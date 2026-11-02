@@ -70,6 +70,8 @@ pub const KIND_REQUEST_TIMEOUT: &str = "request_timeout";
 /// [`FailureNote::kind`] of a read whose audit record was not confirmed in
 /// time.
 pub const KIND_READ_AUDIT_BUSY: &str = "read_audit_busy";
+/// [`failure_kind`] of a lost connection that is not an `io` error.
+pub const KIND_CONNECTION_LOST: &str = "connection_lost";
 
 impl FailureNote {
     /// A wait that gave up with `503` before any write began. `kind` is a
@@ -113,10 +115,10 @@ pub fn failure_kind(error: &DbErr) -> &'static str {
             SqlxError::Database(database) => match database.code().as_deref() {
                 Some("57014") => "statement_timeout",
                 Some("40001" | "40P01") => "serialization",
-                _ if is_connection_error(error) => "connection_lost",
+                _ if is_connection_error(error) => KIND_CONNECTION_LOST,
                 _ => "other",
             },
-            _ if is_connection_error(error) => "connection_lost",
+            _ if is_connection_error(error) => KIND_CONNECTION_LOST,
             _ => "other",
         },
         _ => "other",

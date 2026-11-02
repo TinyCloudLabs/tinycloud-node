@@ -24,8 +24,10 @@ use time::OffsetDateTime;
 /// `Deserialize`, and no way to construct one except [`Self::admit`] — a
 /// caller without a validly-signed, in-window, in-lifetime-cap invocation
 /// cannot produce a value of this type, so it cannot be forged, decoded
-/// from a request body, or reused across requests.
-#[derive(Debug)]
+/// from a request body, or reused across requests. A clone is the same
+/// verified value, used again within the request that admitted it (the one
+/// retry of a lost connection, TC-2346); it verifies nothing.
+#[derive(Debug, Clone)]
 pub struct AdmittedInvocation(Invocation);
 
 #[derive(Debug, thiserror::Error)]
