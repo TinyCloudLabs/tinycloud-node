@@ -121,6 +121,11 @@ impl RecoveringConnection {
         self
     }
 
+    /// The window set by [`Self::with_retry_window`], if any.
+    pub fn retry_window(&self) -> Option<Duration> {
+        self.retry_window
+    }
+
     /// Whether an attempt that started at `started` and lost its connection
     /// may be retried.
     fn within_retry_window(&self, started: Instant) -> bool {
@@ -936,11 +941,18 @@ const OPERATION_RETRY_DELAY_MS: std::ops::RangeInclusive<u64> = 100..=300;
 /// failure is returned as it is. It is the only retry: the second run is
 /// never retried (TC-2346).
 ///
+/// `retry_window` is the pool's TC-1054 retry window
+/// ([`RecoveringConnection::retry_window`]). A first run that took longer
+/// than it to fail (a keepalive or `TCP_USER_TIMEOUT` expiry found the loss)
+/// is not retried, so the request does not pay a second detection; the skip
+/// is logged and counted. `None` never skips.
+///
 /// `db_error` names the database error inside the operation's own error
 /// type, or `None` for an error that is not one. Returns the last run's
 /// result and its tracker flag, for [`classify_failure`].
 pub async fn track_writes_retrying<T, E, F, Fut>(
     operation: &'static str,
+    retry_window: Option<Duration>,
     mut attempt: F,
     db_error: impl Fn(&E) -> Option<&DbErr>,
 ) -> (Result<T, E>, bool)
@@ -948,7 +960,9 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, E>>,
 {
+    let started = Instant::now();
     let (result, applied) = track_writes(attempt()).await;
+    let elapsed = started.elapsed();
     let error_class = match &result {
         Err(error) if !applied => db_error(error)
             .filter(|error| matches!(failure_kind(error), KIND_CONNECTION_LOST | KIND_IO))
@@ -958,6 +972,17 @@ where
     let Some(error_class) = error_class else {
         return (result, applied);
     };
+    if retry_window.is_some_and(|window| elapsed > window) {
+        observe_db_connection_event(DbConnectionEvent::OperationRetrySkippedSlow);
+        tracing::warn!(
+            operation,
+            error_class,
+            elapsed_ms = elapsed.as_millis() as u64,
+            retry_window_ms = retry_window.map_or(0, |window| window.as_millis() as u64),
+            "not retrying operation: its first run took longer than the retry window to fail"
+        );
+        return (result, applied);
+    }
     observe_db_connection_event(DbConnectionEvent::OperationRetried);
     // Never the statement text or its values (TC-961).
     tracing::warn!(
@@ -1906,6 +1931,7 @@ mod tests {
         let started = Instant::now();
         let (result, _) = track_writes_retrying(
             "test",
+            None,
             || async {
                 if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
                     // A read that found its connection dead; no write was sent.
@@ -1946,6 +1972,7 @@ mod tests {
         let attempts = std::sync::atomic::AtomicUsize::new(0);
         let (result, _) = track_writes_retrying(
             "test",
+            None,
             || async {
                 if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
                     return Err(io_lost());
@@ -1980,6 +2007,7 @@ mod tests {
                 let attempts = std::sync::atomic::AtomicUsize::new(0);
                 let (result, applied) = track_writes_retrying(
                     "test",
+                    None,
                     || async {
                         attempts.fetch_add(1, Ordering::SeqCst);
                         match how {
@@ -2017,6 +2045,7 @@ mod tests {
         let attempts = std::sync::atomic::AtomicUsize::new(0);
         let (result, applied) = track_writes_retrying(
             "test",
+            None,
             || async {
                 attempts.fetch_add(1, Ordering::SeqCst);
                 Err::<(), _>(lost())
@@ -2057,6 +2086,7 @@ mod tests {
             let mut failure = Some(failure);
             let (result, applied) = track_writes_retrying(
                 "test",
+                None,
                 || {
                     attempts.fetch_add(1, Ordering::SeqCst);
                     let failure = failure.take().expect("one attempt");
@@ -2071,6 +2101,44 @@ mod tests {
             assert!(result.is_err());
             assert!(!applied);
             assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    /// TC-2346: a failure that took longer than the TC-1054 retry window to
+    /// detect (a keepalive or `TCP_USER_TIMEOUT` expiry) is not retried, so
+    /// the request does not pay a second detection; one found within the
+    /// window, or with no window, is.
+    #[tokio::test]
+    async fn tc2346_a_failure_detected_after_the_retry_window_is_not_retried() {
+        let window = Some(Duration::from_millis(100));
+        let slow = Duration::from_millis(300);
+        for error in [io_lost as fn() -> DbErr, lost] {
+            for (detected_after, retry_window, expected_attempts) in [
+                (Duration::ZERO, window, 2),
+                (slow, window, 1),
+                (slow, None, 2),
+                (slow, Some(Duration::from_secs(10)), 2),
+            ] {
+                let attempts = std::sync::atomic::AtomicUsize::new(0);
+                let (result, applied) = track_writes_retrying(
+                    "test",
+                    retry_window,
+                    || async {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(detected_after).await;
+                        Err::<(), _>(error())
+                    },
+                    |error: &DbErr| Some(error),
+                )
+                .await;
+                assert!(result.is_err());
+                assert!(!applied);
+                assert_eq!(
+                    attempts.load(Ordering::SeqCst),
+                    expected_attempts,
+                    "detected after {detected_after:?}, window {retry_window:?}"
+                );
+            }
         }
     }
 }

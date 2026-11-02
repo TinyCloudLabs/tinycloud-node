@@ -280,6 +280,7 @@ async fn a_loss_after_the_delegation_transaction_began_is_not_retried_and_stays_
 
     let (result, applied) = track_writes_retrying(
         "delegate",
+        None,
         || {
             attempts.fetch_add(1, Ordering::SeqCst);
             let delegation = delegation.clone();
@@ -315,6 +316,7 @@ async fn other_database_failures_are_not_retried() -> Result<()> {
         let attempts = AtomicUsize::new(0);
         let (result, applied) = track_writes_retrying(
             "delegate",
+            None,
             || {
                 attempts.fetch_add(1, Ordering::SeqCst);
                 async move { Err::<TransactResult, Failure>(TxError::Db(failure())) }
@@ -330,6 +332,7 @@ async fn other_database_failures_are_not_retried() -> Result<()> {
     let attempts = AtomicUsize::new(0);
     let (result, _) = track_writes_retrying(
         "delegate",
+        None,
         || {
             attempts.fetch_add(1, Ordering::SeqCst);
             async { Err::<TransactResult, Failure>(TxError::SpaceNotFound) }

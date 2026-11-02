@@ -1622,6 +1622,7 @@ async fn postgres_delegate_is_retried_once_after_a_loss_before_any_write() {
     let db = fixture.db.clone();
     let (result, applied) = track_writes_retrying(
         "delegate",
+        fixture.conn.retry_window(),
         || {
             attempts.fetch_add(1, Ordering::SeqCst);
             let (db, delegation) = (db.clone(), delegation.clone());
@@ -1665,6 +1666,7 @@ async fn postgres_delegate_is_not_retried_after_its_transaction_began() {
     let db = fixture.db.clone();
     let (result, applied) = track_writes_retrying(
         "delegate",
+        fixture.conn.retry_window(),
         || {
             attempts.fetch_add(1, Ordering::SeqCst);
             let (db, delegation) = (db.clone(), delegation.clone());

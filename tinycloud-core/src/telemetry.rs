@@ -176,6 +176,9 @@ pub enum DbConnectionEvent {
     OperationRetried,
     /// That retried operation succeeded.
     OperationRetrySucceeded,
+    /// An operation that qualified for its retry was not retried because
+    /// its first run took longer than the retry window to fail (TC-2346).
+    OperationRetrySkippedSlow,
 }
 
 impl DbConnectionEvent {
@@ -187,6 +190,7 @@ impl DbConnectionEvent {
             Self::RevalidationFailed => "revalidation_failed",
             Self::OperationRetried => "operation_retried",
             Self::OperationRetrySucceeded => "operation_retry_succeeded",
+            Self::OperationRetrySkippedSlow => "operation_retry_skipped_slow",
         }
     }
 }

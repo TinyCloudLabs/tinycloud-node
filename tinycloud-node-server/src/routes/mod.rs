@@ -709,6 +709,7 @@ pub async fn delegate(
         let delegation = d.0;
         let (res, write_may_have_applied) = track_writes_retrying(
             "delegate",
+            tinycloud.connection().retry_window(),
             || tinycloud.delegate(delegation.clone()),
             tx_database_error,
         )
@@ -4297,6 +4298,7 @@ async fn verify_auth_admitted(
     let start = Instant::now();
     let (result, write_may_have_applied) = track_writes_retrying(
         "authorize_invocation",
+        tinycloud.connection().retry_window(),
         || tinycloud.invoke_admitted::<BlockStage>(&invocation, HashMap::new()),
         |error| match error {
             TxStoreError::Tx(error) => tx_database_error(error),
