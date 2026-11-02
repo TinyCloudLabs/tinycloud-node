@@ -185,6 +185,46 @@ services:
         max-size: 10m
         max-file: '3'
 
+  # TC-887: the deletion ledger is the only data that exists solely on this
+  # CVM's disk (Phala keeps no copy of it). This sidecar snapshots it without
+  # a lock (whole lines, re-checked against the live file), encrypts it to an
+  # age PUBLIC recipient and uploads it to R2 every 300 s when it changed, and
+  # at least daily. The plaintext copy lives only in the tmpfs; the volume is
+  # read-only here. See deploy/ledger-backup/README.md.
+  ledger-backup:
+    image: ghcr.io/tinycloudlabs/tinycloud-node-ledger-backup@sha256:596961bb2a07034885b51bc78df324a08825c251a57341eae7ac2213aba70320
+    restart: unless-stopped
+    init: true
+    user: 1000:1000
+    read_only: true
+    cap_drop:
+    - ALL
+    security_opt:
+    - no-new-privileges:true
+    mem_limit: 96m
+    memswap_limit: 96m
+    cpus: 0.25
+    depends_on:
+    - tinycloud
+    volumes:
+    - deletion-ledger:/var/lib/tinycloud/ledger:ro
+    tmpfs:
+    - /tmp:rw,noexec,nosuid,size=32m,uid=1000,gid=1000,mode=0700
+    environment:
+      NODE_BACKUP_R2_ENDPOINT: "${NODE_BACKUP_R2_ENDPOINT:?seal the R2 endpoint of the ledger backup bucket}"
+      NODE_BACKUP_R2_BUCKET: tinycloud-node-backups
+      NODE_BACKUP_R2_ACCESS_KEY_ID: "${NODE_BACKUP_R2_ACCESS_KEY_ID:?seal the bucket-only R2 access key id}"
+      NODE_BACKUP_R2_SECRET_ACCESS_KEY: "${NODE_BACKUP_R2_SECRET_ACCESS_KEY:?seal the bucket-only R2 secret access key}"
+      NODE_BACKUP_AGE_RECIPIENT: "${NODE_BACKUP_AGE_RECIPIENT:?seal the age1... PUBLIC recipient; never the identity}"
+      BACKUP_INTERVAL_SECONDS: "300"
+      BACKUP_UNCHANGED_UPLOAD_SECONDS: "86400"
+      BACKUP_RETRY_SECONDS: "60"
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'
+
 volumes:
   cert-data:
   deletion-ledger:

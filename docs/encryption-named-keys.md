@@ -163,7 +163,9 @@ the node serves. A failed append that could not be cut back logs
 
 The node image contains the directory `/var/lib/tinycloud/ledger`, owned by
 uid 1000 (the node's user) with mode 0700; a volume mounted there is writable
-by the node.
+by the node. In the production compose a `ledger-backup` sidecar reads that
+volume (read-only, without the lock) and keeps encrypted copies of the ledger
+off the CVM (`deploy/ledger-backup/README.md`).
 
 At every start, before any route is served, the node replays the ledger onto
 the database (as `tinycloud node deletion-ledger replay` does) and closes each

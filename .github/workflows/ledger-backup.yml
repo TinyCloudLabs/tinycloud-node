@@ -1,0 +1,148 @@
+name: ledger-backup
+
+# TC-887: the deletion-ledger backup sidecar (deploy/ledger-backup/).
+# - scripts: the backup loop and the restore drill against an S3 stub,
+#   including a node appending while the backup copies.
+# - image: builds the sidecar from this revision; same-repository runs publish
+#   it to GHCR as :<revision>, labelled with the sha256 of its sources.
+# - pinned: the image docker-compose.dstack-postgres.yaml pins must carry this
+#   revision's sidecar sources, and passes backup + restore drill end to end in
+#   a container against MinIO.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'deploy/ledger-backup/**'
+      - 'docker-compose.dstack-postgres.yaml'
+      - 'scripts/at-rest-harness/harness.sh'
+      - '.github/workflows/ledger-backup.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'deploy/ledger-backup/**'
+      - 'docker-compose.dstack-postgres.yaml'
+      - 'scripts/at-rest-harness/harness.sh'
+      - '.github/workflows/ledger-backup.yml'
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/tinycloudlabs/tinycloud-node-ledger-backup
+  # The files the image is built from; their sha256 is the image's source label.
+  SOURCES: deploy/ledger-backup/Dockerfile deploy/ledger-backup/ledger-backup.sh
+
+jobs:
+  scripts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install age
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq age
+      - name: Backup loop and restore drill against an S3 stub
+        env:
+          LEDGER_BACKUP_TEST_REQUIRE: '1'
+          LEDGER_BACKUP_TEST_TMP: ${{ runner.temp }}
+        run: node --test deploy/ledger-backup/ledger-backup.test.mjs
+
+  image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Source label
+        id: source
+        run: |
+          set -euo pipefail
+          echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(cat $SOURCES | sha256sum | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build (and publish for same-repository runs)
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: deploy/ledger-backup/Dockerfile
+          platforms: linux/amd64
+          provenance: false
+          push: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+          tags: ${{ env.IMAGE }}:${{ steps.source.outputs.revision }}
+          labels: |
+            org.opencontainers.image.revision=${{ steps.source.outputs.revision }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            xyz.tinycloud.ledger-backup.sources-sha256=${{ steps.source.outputs.sha256 }}
+      - name: Report the image
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          SOURCES_SHA256: ${{ steps.source.outputs.sha256 }}
+        run: |
+          echo "Built ${IMAGE}@${DIGEST} (sources sha256 ${SOURCES_SHA256})" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  pinned:
+    needs: scripts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Read the pinned image from the production compose
+        id: pin
+        run: |
+          set -euo pipefail
+          images=$(sed -n -E 's/^    image: (ghcr\.io\/tinycloudlabs\/tinycloud-node-ledger-backup@sha256:[0-9a-f]{64})$/\1/p' docker-compose.dstack-postgres.yaml)
+          [ "$(printf '%s\n' "$images" | awk 'NF { n += 1 } END { print n + 0 }')" = 1 ] \
+            || { echo "::error::docker-compose.dstack-postgres.yaml must pin exactly one ${IMAGE}@sha256 image"; exit 1; }
+          echo "image=$images" >> "$GITHUB_OUTPUT"
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: The pinned image is built from this revision's sidecar sources
+        env:
+          PINNED: ${{ steps.pin.outputs.image }}
+        run: |
+          set -euo pipefail
+          docker pull --quiet "$PINNED"
+          label=$(docker image inspect --format '{{ index .Config.Labels "xyz.tinycloud.ledger-backup.sources-sha256" }}' "$PINNED")
+          here=$(cat $SOURCES | sha256sum | cut -d ' ' -f 1)
+          [ "$label" = "$here" ] || { echo "::error::The pinned image was built from other sidecar sources (label ${label}, this revision ${here}). Pin the digest the image job publishes for this revision."; exit 1; }
+          echo "Pinned ${PINNED}: sources sha256 ${here}, built at revision $(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$PINNED")" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Install age
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq age
+      - name: Fetch the pinned MinIO (sha256-verified)
+        env:
+          TC887_BIN_DIR: ${{ runner.temp }}/bin
+        run: bash scripts/at-rest-harness/harness.sh bins
+      - name: Backup and restore drill with the pinned image against MinIO
+        env:
+          MINIO_BIN: ${{ runner.temp }}/bin/minio
+          PINNED: ${{ steps.pin.outputs.image }}
+        run: bash deploy/ledger-backup/ci-e2e.sh "$PINNED"

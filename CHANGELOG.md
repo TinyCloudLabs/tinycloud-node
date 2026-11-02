@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Changes
+- Production compose: a `ledger-backup` sidecar backs up the named-keys deletion ledger, the only data that exists solely on the CVM disk. It reads the `deletion-ledger` volume read-only and without a lock, keeps whole lines re-checked against the live file, encrypts them with `age` to a public recipient and uploads them to the R2 bucket `tinycloud-node-backups` every 300 s when the ledger changed and at least daily. `deploy/ledger-backup/ledger-restore-drill.sh` decrypts the newest backup into a scratch directory and checks it. This changes the compose hash (N0 template lock in `docker.yml` and the fixture move with it), and every `docker.yml` deploy now needs the `PROD_TINYCLOUD_NODE_BACKUP_*` secrets (`NODE_BACKUP_R2_ENDPOINT`, `NODE_BACKUP_R2_ACCESS_KEY_ID`, `NODE_BACKUP_R2_SECRET_ACCESS_KEY`, `NODE_BACKUP_AGE_RECIPIENT`); the node itself is unchanged. Details: TC-887
+
 ## [1.25.15] - 2026-11-01
 
 ### Changes
