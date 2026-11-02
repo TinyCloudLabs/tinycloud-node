@@ -17,8 +17,9 @@ duckdb = ["dep:arrow", "dep:duckdb"]
 # dev-dependency so their own tests can assert exactly-once verification.
 verification-count-test-hook = []
 # TC-887: `at_rest::FixedKeyProvider`, a deterministic test key provider.
-# Never part of a production build; downstream crates enable it only on their
-# `tinycloud-core` dev-dependency.
+# TC-2346: `db_pool::fault`, connection-loss injection for route tests. Both
+# are inert without a test that uses them. Never part of a production build;
+# downstream crates enable it only on their `tinycloud-core` dev-dependency.
 test-util = []
 
 tokio = [

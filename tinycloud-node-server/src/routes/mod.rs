@@ -230,6 +230,27 @@ fn tx_database_error<S: StorageSetup, K: Secrets>(error: &TxError<S, K>) -> Opti
     }
 }
 
+/// The response to a failed `/delegate`.
+fn delegation_failure<S: StorageSetup, K: Secrets>(
+    error: &TxError<S, K>,
+    write_may_have_applied: bool,
+) -> (Status, String)
+where
+    S::Error: std::fmt::Display,
+    K::Error: std::fmt::Display,
+{
+    match error {
+        TxError::Db(db) | TxError::EpochInsert(db) => database_failure(
+            Service::Other,
+            db,
+            write_may_have_applied,
+            error.to_string(),
+        ),
+        TxError::SpaceNotFound => (Status::NotFound, error.to_string()),
+        _ => (Status::Unauthorized, error.to_string()),
+    }
+}
+
 /// `/invoke` failure: plain text for everything except storage rejections,
 /// which carry the structured TC-619 JSON body.
 #[derive(Debug)]
@@ -715,13 +736,7 @@ pub async fn delegate(
         )
         .await;
         let res = res
-            .map_err(|e| match &e {
-                TxError::Db(error) | TxError::EpochInsert(error) => {
-                    database_failure(Service::Other, error, write_may_have_applied, e.to_string())
-                }
-                TxError::SpaceNotFound => (Status::NotFound, e.to_string()),
-                _ => (Status::Unauthorized, e.to_string()),
-            })
+            .map_err(|e| delegation_failure(&e, write_may_have_applied))
             .and_then(|result: TransactResult| {
                 let TransactResult {
                     commits,

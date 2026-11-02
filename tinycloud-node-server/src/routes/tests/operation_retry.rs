@@ -95,19 +95,6 @@ async fn stored_delegations(fixture: &KvSyncFixture) -> u64 {
         .unwrap()
 }
 
-/// The route's own mapping of a failed delegation.
-fn answered(error: &Failure, write_may_have_applied: bool) -> (Status, String) {
-    match error {
-        TxError::Db(db) | TxError::EpochInsert(db) => database_failure(
-            tinycloud_core::failure_diagnostic::Service::Other,
-            db,
-            write_may_have_applied,
-            error.to_string(),
-        ),
-        _ => panic!("not a database failure: {error}"),
-    }
-}
-
 // ---- Through the route -------------------------------------------------
 
 #[tokio::test]
@@ -251,9 +238,9 @@ async fn a_parent_revoked_during_the_retry_wait_refuses_the_retried_invocation()
     let plan = Plan::new(2, lost);
     let query = tc1791_query("SELECT 1");
     let revoker = async {
-        // Revoke once both failures are in, while the delay before the
-        // retry (at least 100 ms) is running.
-        while plan.injected() < 2 {
+        // Revoke as soon as the first failure is in: the two failures and the
+        // delay before the retry (at least 100 ms) all still lie ahead.
+        while plan.injected() < 1 {
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
         fixture.revoke("tc2346-revoke-parent", parent).await
@@ -299,7 +286,7 @@ async fn a_loss_after_the_delegation_transaction_began_is_not_retried_and_stays_
     assert!(applied, "a read-write transaction began");
     assert_eq!(attempts.load(Ordering::SeqCst), 1);
     assert_eq!(stored_delegations(&fixture).await, 1);
-    let (status, body) = answered(&error, applied);
+    let (status, body) = delegation_failure(&error, applied);
     assert_eq!(status, Status::InternalServerError);
     assert!(body.starts_with(OUTCOME_UNKNOWN), "{body}");
     Ok(())
@@ -359,4 +346,34 @@ async fn an_authorization_failure_reports_the_trackers_verdict() {
     let (status, body) = authorization_failure("server.sql.auth", &error, false);
     assert_eq!(status, Status::ServiceUnavailable);
     assert!(body.starts_with(UNAVAILABLE_RETRYABLE), "{body}");
+}
+
+/// A mutating invocation (a `kv/del` beside the SQL read) reaches the same
+/// authorization step. Its read-write transaction began and the connection
+/// was then lost, so the delete may have applied: `outcome_unknown`, not a
+/// retry and not a safe `503`. The mutating path retries a lost `BEGIN`
+/// itself once, so the loss is injected twice.
+#[tokio::test]
+async fn a_mutating_invocation_that_lost_its_connection_after_begin_is_outcome_unknown(
+) -> Result<()> {
+    let fixture = fixture().await?;
+    // The key the delete targets exists, so authorization reaches the
+    // transaction instead of refusing a missing key.
+    fixture.owner_write("notes/x", Some(b"value")).await?;
+    let sql = fixture
+        .resource_in(&fixture.space, "sql", "db")?
+        .to_string();
+    let kv = fixture.kv_resource("notes/x")?.to_string();
+    let header =
+        fixture.owner_invocation(&[(sql, "tinycloud.sql/read"), (kv, "tinycloud.kv/del")])?;
+    let plan = Plan::new(0, lost).after_begin(2);
+
+    let reply = plan
+        .scope(fixture.invoke_json(header, &tc1791_query("SELECT 1")))
+        .await?;
+
+    assert_eq!(plan.injected(), 2, "the loss reached the transaction");
+    assert_eq!(reply.status, Status::InternalServerError, "{}", reply.body);
+    assert!(reply.body.starts_with(OUTCOME_UNKNOWN), "{}", reply.body);
+    Ok(())
 }

@@ -616,6 +616,9 @@ impl TransactionTrait for RecoveringConnection {
             .await?;
         if access_mode != Some(AccessMode::ReadOnly) {
             note_write_may_have_applied();
+            if let Some(error) = fault::take_after_begin() {
+                return Err(error);
+            }
         }
         self.scope_local_timeout(transaction).await
     }
@@ -943,9 +946,11 @@ const OPERATION_RETRY_DELAY_MS: std::ops::RangeInclusive<u64> = 100..=300;
 ///
 /// `retry_window` is the pool's TC-1054 retry window
 /// ([`RecoveringConnection::retry_window`]). A first run that took longer
-/// than it to fail (a keepalive or `TCP_USER_TIMEOUT` expiry found the loss)
-/// is not retried, so the request does not pay a second detection; the skip
-/// is logged and counted. `None` never skips.
+/// than it to fail is not retried: usually a keepalive or `TCP_USER_TIMEOUT`
+/// expiry found the loss, and the request would pay a second detection (the
+/// whole run is timed, so a run slowed by a lock wait is skipped too, which
+/// only means fewer retries). The skip is logged and counted. `None` never
+/// skips.
 ///
 /// `db_error` names the database error inside the operation's own error
 /// type, or `None` for an error that is not one. Returns the last run's
@@ -1071,6 +1076,7 @@ pub mod fault {
     #[derive(Clone)]
     pub struct Plan {
         remaining: Arc<AtomicU32>,
+        after_begin: Arc<AtomicU32>,
         injected: Arc<AtomicU32>,
         error: fn() -> DbErr,
     }
@@ -1079,9 +1085,18 @@ pub mod fault {
         pub fn new(count: u32, error: fn() -> DbErr) -> Self {
             Self {
                 remaining: Arc::new(AtomicU32::new(count)),
+                after_begin: Arc::default(),
                 injected: Arc::default(),
                 error,
             }
+        }
+
+        /// Also fail the next `count` read-write transactions right after
+        /// their `BEGIN` succeeded: the transaction began on the server and
+        /// the connection is then lost, so a write may have applied.
+        pub fn after_begin(self, count: u32) -> Self {
+            self.after_begin.store(count, Ordering::SeqCst);
+            self
         }
 
         /// How many failures have been injected so far.
@@ -1113,6 +1128,25 @@ pub mod fault {
         .ok()
         .flatten()
     }
+
+    /// The failure to inject right after a read-write `BEGIN` succeeded, if
+    /// a plan asks for one ([`Plan::after_begin`]).
+    pub(super) fn take_after_begin() -> Option<DbErr> {
+        if super::WRITE_MAY_HAVE_APPLIED.try_with(|_| ()).is_err() {
+            return None;
+        }
+        PLAN.try_with(|plan| {
+            plan.after_begin
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .ok()
+                .map(|_| {
+                    plan.injected.fetch_add(1, Ordering::SeqCst);
+                    (plan.error)()
+                })
+        })
+        .ok()
+        .flatten()
+    }
 }
 
 #[cfg(not(feature = "test-util"))]
@@ -1121,6 +1155,11 @@ mod fault {
 
     #[inline(always)]
     pub(super) fn take(_retryable: bool) -> Option<DbErr> {
+        None
+    }
+
+    #[inline(always)]
+    pub(super) fn take_after_begin() -> Option<DbErr> {
         None
     }
 }
