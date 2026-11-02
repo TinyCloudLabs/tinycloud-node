@@ -72,6 +72,8 @@ pub const KIND_REQUEST_TIMEOUT: &str = "request_timeout";
 pub const KIND_READ_AUDIT_BUSY: &str = "read_audit_busy";
 /// [`failure_kind`] of a lost connection that is not an `io` error.
 pub const KIND_CONNECTION_LOST: &str = "connection_lost";
+/// [`failure_kind`] of a socket error (reset, timeout, broken pipe).
+pub const KIND_IO: &str = "io";
 
 impl FailureNote {
     /// A wait that gave up with `503` before any write began. `kind` is a
@@ -111,7 +113,7 @@ pub fn failure_kind(error: &DbErr) -> &'static str {
         | DbErr::Query(RuntimeErr::SqlxError(sqlx)) => match sqlx {
             SqlxError::PoolTimedOut => "pool_timeout",
             SqlxError::PoolClosed => "pool_closed",
-            SqlxError::Io(_) => "io",
+            SqlxError::Io(_) => KIND_IO,
             SqlxError::Database(database) => match database.code().as_deref() {
                 Some("57014") => "statement_timeout",
                 Some("40001" | "40P01") => "serialization",

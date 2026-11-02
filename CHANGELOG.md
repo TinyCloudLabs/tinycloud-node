@@ -3,7 +3,7 @@
 ## [Unreleased]
 
 ### Changes
-- `/delegate` and the authorization step of `/invoke` (SQL, DuckDB and `space/info`) run their operation once more, after a jittered 100 to 300 ms, when it failed with a lost database connection (`connection_lost`, not `io`) and the write tracker shows no write began or may have applied. A second loss answers the same `503 unavailable_retryable` as before; an outcome-unknown `500` is never retried. New `tinycloud_db_connection_events_total` events `operation_retried` and `operation_retry_succeeded`. Details: TC-2346
+- `/delegate` and the authorization step of `/invoke` (SQL, DuckDB and `space/info`) run their operation once more, after a jittered 100 to 300 ms, when it failed with a lost database connection or a socket error (`connection_lost` or `io`) and the write tracker shows no write began or may have applied. A second loss answers the same `503 unavailable_retryable` as before; an outcome-unknown `500` is never retried. The authorization step now also reports `outcome_unknown` (`500`) when a mutating invocation lost its connection after its transaction began, instead of always a safe `503`. New `tinycloud_db_connection_events_total` events `operation_retried` and `operation_retry_succeeded`. Details: TC-2346
 
 ## [1.25.15] - 2026-11-01
 

@@ -1,8 +1,13 @@
 //! TC-2346: `/delegate` and the `/invoke` authorization step run their whole
 //! operation once more after a connection lost before any write, and never
-//! otherwise. The operations are the real ones (`SpaceDatabase::delegate`,
-//! `invoke_admitted`) on SQLite; the lost connection is injected as the
-//! failure of an attempt, since SQLite has no connection to lose.
+//! otherwise.
+//!
+//! The route tests go through the Rocket client. SQLite has no connection to
+//! lose, so a `fault::Plan` fails the pool wrapper's next two retryable
+//! statements of the operation (the statement and its own retry), which is
+//! what a burst does; the loss then travels through the real wrapper, write
+//! tracker, route and error mapping. The operation tests call
+//! `track_writes_retrying` with the real operation and an injected failure.
 
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -16,7 +21,8 @@ use tinycloud_auth::{
     ucan_capabilities_object::Capabilities,
 };
 use tinycloud_core::{
-    events::{Delegation, TinyCloudInvocation},
+    db_pool::fault::Plan,
+    events::Delegation,
     models::delegation as delegation_model,
     sea_orm::{
         error::{RuntimeErr, SqlxError},
@@ -31,6 +37,13 @@ fn lost() -> DbErr {
     DbErr::Query(RuntimeErr::SqlxError(SqlxError::WorkerCrashed))
 }
 
+/// A reset socket, as the pool reports it.
+fn reset() -> DbErr {
+    DbErr::Query(RuntimeErr::SqlxError(SqlxError::Io(std::io::Error::from(
+        std::io::ErrorKind::ConnectionReset,
+    ))))
+}
+
 async fn fixture() -> Result<KvSyncFixture> {
     KvSyncFixture::new_with(|rocket| rocket).await
 }
@@ -43,8 +56,9 @@ fn tinycloud(fixture: &KvSyncFixture) -> &TinyCloud {
         .expect("TinyCloud is managed")
 }
 
-/// An owner-signed delegation of `kv/get` to the fixture's device.
-fn owner_delegation(fixture: &KvSyncFixture, nonce: &str) -> Result<Delegation> {
+/// An owner-signed delegation of `kv/get` to the fixture's device, as the
+/// `Authorization` header carries it.
+fn owner_delegation_header(fixture: &KvSyncFixture, nonce: &str) -> Result<String> {
     let mut caps = Capabilities::new();
     caps.with_action(
         fixture.kv_resource("notes/")?.as_uri(),
@@ -65,8 +79,13 @@ fn owner_delegation(fixture: &KvSyncFixture, nonce: &str) -> Result<Delegation> 
         fixture.owner.get_algorithm().unwrap_or_default(),
         &fixture.owner,
     )?;
-    let header = TinyCloudDelegation::Ucan(Box::new(ucan)).encode()?;
-    Ok(Delegation::from_header_ser::<TinyCloudDelegation>(&header)?)
+    Ok(TinyCloudDelegation::Ucan(Box::new(ucan)).encode()?)
+}
+
+fn owner_delegation(fixture: &KvSyncFixture, nonce: &str) -> Result<Delegation> {
+    Ok(Delegation::from_header_ser::<TinyCloudDelegation>(
+        &owner_delegation_header(fixture, nonce)?,
+    )?)
 }
 
 async fn stored_delegations(fixture: &KvSyncFixture) -> u64 {
@@ -89,37 +108,167 @@ fn answered(error: &Failure, write_may_have_applied: bool) -> (Status, String) {
     }
 }
 
+// ---- Through the route -------------------------------------------------
+
 #[tokio::test]
-async fn a_delegation_that_lost_its_connection_before_any_write_is_stored_once_by_the_retry(
-) -> Result<()> {
+async fn delegate_route_retries_a_connection_lost_before_any_write_and_stores_once() -> Result<()> {
+    use rocket::http::Header;
     let fixture = fixture().await?;
-    let tinycloud = tinycloud(&fixture);
-    let delegation = owner_delegation(&fixture, "tc2346-a")?;
-    let attempts = AtomicUsize::new(0);
+    let header = owner_delegation_header(&fixture, "tc2346-route-delegate")?;
+    let plan = Plan::new(2, lost);
 
-    let (result, _) = track_writes_retrying(
-        "delegate",
-        || {
-            let first = attempts.fetch_add(1, Ordering::SeqCst) == 0;
-            let delegation = delegation.clone();
-            async move {
-                if first {
-                    // The lookup before the transaction found its connection dead.
-                    return Err(TxError::Db(lost()));
-                }
-                tinycloud.delegate(delegation).await
-            }
-        },
-        tx_database_error,
-    )
-    .await;
+    let response = plan
+        .scope(
+            fixture
+                .client
+                .post("/delegate")
+                .header(Header::new("Authorization", header))
+                .dispatch(),
+        )
+        .await;
 
-    let result = result.map_err(|error| anyhow::anyhow!("{error}"))?;
-    assert!(!result.delegation_cids.is_empty());
-    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    let status = response.status();
+    let body = response.into_string().await.unwrap_or_default();
+    assert_eq!(status, Status::Ok, "{body}");
+    assert_eq!(plan.injected(), 2, "the loss reached the operation");
     assert_eq!(stored_delegations(&fixture).await, 1);
     Ok(())
 }
+
+#[tokio::test]
+async fn delegate_route_retries_a_reset_socket_before_any_write() -> Result<()> {
+    use rocket::http::Header;
+    let fixture = fixture().await?;
+    let header = owner_delegation_header(&fixture, "tc2346-route-delegate-io")?;
+    let plan = Plan::new(2, reset);
+
+    let response = plan
+        .scope(
+            fixture
+                .client
+                .post("/delegate")
+                .header(Header::new("Authorization", header))
+                .dispatch(),
+        )
+        .await;
+
+    let status = response.status();
+    let body = response.into_string().await.unwrap_or_default();
+    assert_eq!(status, Status::Ok, "{body}");
+    assert_eq!(plan.injected(), 2);
+    assert_eq!(stored_delegations(&fixture).await, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn delegate_route_answers_the_safe_503_when_the_retry_is_lost_too() -> Result<()> {
+    use rocket::http::Header;
+    let fixture = fixture().await?;
+    let header = owner_delegation_header(&fixture, "tc2346-route-delegate-twice")?;
+    // The first run's statement and its retry, then the second run's too.
+    let plan = Plan::new(4, lost);
+
+    let response = plan
+        .scope(
+            fixture
+                .client
+                .post("/delegate")
+                .header(Header::new("Authorization", header))
+                .dispatch(),
+        )
+        .await;
+
+    let status = response.status();
+    let body = response.into_string().await.unwrap_or_default();
+    assert_eq!(status, Status::ServiceUnavailable, "{body}");
+    assert!(body.starts_with(UNAVAILABLE_RETRYABLE), "{body}");
+    assert_eq!(plan.injected(), 4, "two runs, no third");
+    assert_eq!(stored_delegations(&fixture).await, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn sql_invoke_route_retries_the_authorization_after_a_lost_connection() -> Result<()> {
+    let fixture = fixture().await?;
+    let plan = Plan::new(2, lost);
+
+    let reply = plan
+        .scope(fixture.owner_sql("db", tc1791_query("SELECT 1")))
+        .await?;
+
+    assert_eq!(reply.status, Status::Ok, "{}", reply.body);
+    assert_eq!(plan.injected(), 2, "the loss reached the authorization");
+    Ok(())
+}
+
+#[tokio::test]
+async fn sql_invoke_route_answers_the_safe_503_when_the_retry_is_lost_too() -> Result<()> {
+    let fixture = fixture().await?;
+    let plan = Plan::new(4, lost);
+
+    let reply = plan
+        .scope(fixture.owner_sql("db", tc1791_query("SELECT 1")))
+        .await?;
+
+    assert_eq!(reply.status, Status::ServiceUnavailable, "{}", reply.body);
+    assert!(
+        reply.body.starts_with(UNAVAILABLE_RETRYABLE),
+        "{}",
+        reply.body
+    );
+    assert_eq!(plan.injected(), 4);
+    Ok(())
+}
+
+/// The retry re-runs authorization against the current state: a parent
+/// revoked while the first run was failing and the delay was running is
+/// refused, not served from the first run's view.
+#[tokio::test]
+async fn a_parent_revoked_during_the_retry_wait_refuses_the_retried_invocation() -> Result<()> {
+    let fixture = fixture().await?;
+    let owner = fixture.space.did().to_string();
+    let parent = fixture
+        .grant(
+            "tc2346-parent",
+            &owner,
+            &fixture.device_did(),
+            &[("db", "tinycloud.sql/read")],
+            None,
+            Some(whole_seconds_from_now(3600)),
+            &[],
+        )
+        .await?;
+    let invoke = || -> Result<String> {
+        fixture.device_invocation_in(&[(&fixture.space, "db", "tinycloud.sql/read")], &[parent])
+    };
+
+    // Control: the chain authorizes the read.
+    let control = fixture
+        .invoke_json(invoke()?, &tc1791_query("SELECT 1"))
+        .await?;
+    assert_eq!(control.status, Status::Ok, "{}", control.body);
+
+    let plan = Plan::new(2, lost);
+    let query = tc1791_query("SELECT 1");
+    let revoker = async {
+        // Revoke once both failures are in, while the delay before the
+        // retry (at least 100 ms) is running.
+        while plan.injected() < 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        fixture.revoke("tc2346-revoke-parent", parent).await
+    };
+    let (reply, revoked) =
+        tokio::join!(plan.scope(fixture.invoke_json(invoke()?, &query)), revoker);
+    revoked?;
+    let reply = reply?;
+
+    assert_eq!(plan.injected(), 2);
+    assert_eq!(reply.status, Status::Unauthorized, "{}", reply.body);
+    Ok(())
+}
+
+// ---- The operation and its error mapping ------------------------------
 
 #[tokio::test]
 async fn a_loss_after_the_delegation_transaction_began_is_not_retried_and_stays_outcome_unknown(
@@ -156,40 +305,11 @@ async fn a_loss_after_the_delegation_transaction_began_is_not_retried_and_stays_
 }
 
 #[tokio::test]
-async fn a_loss_on_the_retry_too_answers_the_safe_503_without_a_third_attempt() -> Result<()> {
-    let fixture = fixture().await?;
-    let attempts = AtomicUsize::new(0);
-
-    let (result, applied) = track_writes_retrying(
-        "delegate",
-        || {
-            attempts.fetch_add(1, Ordering::SeqCst);
-            async { Err::<TransactResult, Failure>(TxError::Db(lost())) }
-        },
-        tx_database_error,
-    )
-    .await;
-
-    assert_eq!(attempts.load(Ordering::SeqCst), 2);
-    assert!(!applied);
-    let (status, body) = answered(&result.unwrap_err(), applied);
-    assert_eq!(status, Status::ServiceUnavailable);
-    assert!(body.starts_with(UNAVAILABLE_RETRYABLE), "{body}");
-    assert_eq!(stored_delegations(&fixture).await, 0);
-    Ok(())
-}
-
-#[tokio::test]
-async fn io_and_other_database_failures_are_not_retried() -> Result<()> {
-    use std::io;
+async fn other_database_failures_are_not_retried() -> Result<()> {
     let failures: [fn() -> DbErr; 3] = [
-        || {
-            DbErr::Query(RuntimeErr::SqlxError(SqlxError::Io(io::Error::from(
-                io::ErrorKind::ConnectionReset,
-            ))))
-        },
         || DbErr::Conn(RuntimeErr::SqlxError(SqlxError::PoolTimedOut)),
         || DbErr::Custom("constraint".into()),
+        || DbErr::Query(RuntimeErr::SqlxError(SqlxError::RowNotFound)),
     ];
     for failure in failures {
         let attempts = AtomicUsize::new(0);
@@ -222,59 +342,18 @@ async fn io_and_other_database_failures_are_not_retried() -> Result<()> {
     Ok(())
 }
 
+/// A mutating invocation that began its transaction and then lost its
+/// connection may have been applied: `outcome_unknown`, not a safe `503`.
+/// An authorization that wrote nothing stays a safe `503`.
 #[tokio::test]
-async fn an_authorization_that_lost_its_connection_before_any_write_runs_again_once() -> Result<()>
-{
-    use tinycloud_core::models::invocation as invocation_model;
+async fn an_authorization_failure_reports_the_trackers_verdict() {
+    let error = TxStoreError::Tx(TxError::Db(lost()));
 
-    let fixture = fixture().await?;
-    let tinycloud = tinycloud(&fixture);
-    let (header, _) = tc409_root_invocation(
-        &fixture.owner,
-        &fixture.owner_vm,
-        "kv",
-        "tinycloud.kv/get",
-        Some("probe"),
-        "urn:uuid:tc2346-invoke",
-    )?;
-    let admitted = AdmittedInvocation::admit(
-        Invocation::from_header_ser::<TinyCloudInvocation>(&header)?,
-        3_600,
-    )
-    .await?;
-    let attempts = AtomicUsize::new(0);
+    let (status, body) = authorization_failure("server.sql.auth", &error, true);
+    assert_eq!(status, Status::InternalServerError);
+    assert!(body.starts_with(OUTCOME_UNKNOWN), "{body}");
 
-    let (result, _) = track_writes_retrying(
-        "authorize_invocation",
-        || {
-            let first = attempts.fetch_add(1, Ordering::SeqCst) == 0;
-            let admitted = admitted.clone();
-            async move {
-                if first {
-                    return Err(TxStoreError::Tx(TxError::Db(lost())));
-                }
-                tinycloud
-                    .invoke_admitted::<BlockStage>(admitted, HashMap::new())
-                    .await
-            }
-        },
-        |error| match error {
-            TxStoreError::Tx(error) => tx_database_error(error),
-            _ => None,
-        },
-    )
-    .await;
-
-    assert!(
-        result.is_ok(),
-        "{:?}",
-        result.err().map(|error| error.to_string())
-    );
-    assert_eq!(attempts.load(Ordering::SeqCst), 2);
-    let recorded = invocation_model::Entity::find()
-        .count(&fixture.conn)
-        .await
-        .unwrap();
-    assert_eq!(recorded, 1, "the invocation was recorded once");
-    Ok(())
+    let (status, body) = authorization_failure("server.sql.auth", &error, false);
+    assert_eq!(status, Status::ServiceUnavailable);
+    assert!(body.starts_with(UNAVAILABLE_RETRYABLE), "{body}");
 }

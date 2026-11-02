@@ -4295,9 +4295,9 @@ async fn verify_auth_admitted(
     tinycloud: &State<TinyCloud>,
 ) -> Result<TransactResult, (Status, String)> {
     let start = Instant::now();
-    let (result, _) = track_writes_retrying(
+    let (result, write_may_have_applied) = track_writes_retrying(
         "authorize_invocation",
-        || tinycloud.invoke_admitted::<BlockStage>(invocation.clone(), HashMap::new()),
+        || tinycloud.invoke_admitted::<BlockStage>(&invocation, HashMap::new()),
         |error| match error {
             TxStoreError::Tx(error) => tx_database_error(error),
             _ => None,
@@ -4305,18 +4305,7 @@ async fn verify_auth_admitted(
     )
     .await;
     let result = result
-        // Authorization records only the invocation; the operation it
-        // authorizes has not run, so a database failure here is retryable.
-        .map_err(|e| match &e {
-            TxStoreError::Tx(TxError::Db(error) | TxError::EpochInsert(error)) => {
-                database_failure(auth_service(span), error, false, e.to_string())
-            }
-            TxStoreError::Tx(TxError::ReadAudit(error)) => {
-                read_audit_failure(auth_service(span), error)
-            }
-            TxStoreError::Tx(TxError::SpaceNotFound) => (Status::NotFound, e.to_string()),
-            _ => (Status::Unauthorized, e.to_string()),
-        })
+        .map_err(|e| authorization_failure(span, &e, write_may_have_applied))
         .map(|(tx_result, _)| tx_result);
     crate::prometheus::observe_span(
         span,
@@ -4324,6 +4313,31 @@ async fn verify_auth_admitted(
         start.elapsed(),
     );
     result
+}
+
+/// The response to a failed authorization step of `/invoke`. A read-only
+/// invocation records its audit last and begins no read-write transaction,
+/// so a database failure there is a safe `503`; one that began a
+/// transaction (a mutating invocation) and lost its connection afterwards
+/// is `outcome_unknown` (`write_may_have_applied`, from [`track_writes`]).
+fn authorization_failure(
+    span: &'static str,
+    error: &TxStoreError<BlockStores, BlockStage, tinycloud_core::keys::StaticSecret>,
+    write_may_have_applied: bool,
+) -> (Status, String) {
+    match error {
+        TxStoreError::Tx(TxError::Db(db) | TxError::EpochInsert(db)) => database_failure(
+            auth_service(span),
+            db,
+            write_may_have_applied,
+            error.to_string(),
+        ),
+        TxStoreError::Tx(TxError::ReadAudit(error)) => {
+            read_audit_failure(auth_service(span), error)
+        }
+        TxStoreError::Tx(TxError::SpaceNotFound) => (Status::NotFound, error.to_string()),
+        _ => (Status::Unauthorized, error.to_string()),
+    }
 }
 
 #[cfg(test)]

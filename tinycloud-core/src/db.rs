@@ -1,3 +1,6 @@
+use crate::admission::{sealed, AdmittedInput};
+// The unit tests below name it through `super::*`.
+#[cfg(test)]
 use crate::admission::AdmittedInvocation;
 use crate::db_pool::RecoveringConnection;
 use crate::encryption::ColumnEncryption;
@@ -2216,7 +2219,7 @@ where
     /// cannot construct one.
     pub async fn invoke_admitted<S>(
         &self,
-        invocation: AdmittedInvocation,
+        invocation: impl AdmittedInput,
         inputs: InvocationInputs<S::Writable>,
     ) -> Result<(TransactResult, Vec<InvocationOutcome<B::Readable>>), TxStoreError<B, S, K>>
     where
@@ -2230,7 +2233,7 @@ where
 
     pub async fn invoke_with_options_admitted<S>(
         &self,
-        invocation: AdmittedInvocation,
+        invocation: impl AdmittedInput,
         inputs: InvocationInputs<S::Writable>,
         options: KvInvokeOptions,
     ) -> Result<(TransactResult, Vec<InvocationOutcome<B::Readable>>), TxStoreError<B, S, K>>
@@ -2240,7 +2243,7 @@ where
         S::Writable: 'static + Unpin,
     {
         self.invoke_with_options_mode(
-            invocation.into_invocation(),
+            sealed::Sealed::into_invocation(invocation),
             inputs,
             options,
             InvokeMode::Admitted,

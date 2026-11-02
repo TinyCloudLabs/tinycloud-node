@@ -40,7 +40,7 @@ pub mod types;
 pub mod util;
 pub mod write_hooks;
 
-pub use admission::{AdmissionError, AdmittedInvocation};
+pub use admission::{AdmissionError, AdmittedInput, AdmittedInvocation};
 pub use db::{
     Commit, DelegationStatus, InvocationOutcome, KvBatchReadItem, KvBatchReadValue,
     KvInvokeOptions, KvPrecondition, SpaceDatabase, TransactResult, TxError, TxStoreError,

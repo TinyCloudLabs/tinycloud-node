@@ -24,10 +24,11 @@ use time::OffsetDateTime;
 /// `Deserialize`, and no way to construct one except [`Self::admit`] — a
 /// caller without a validly-signed, in-window, in-lifetime-cap invocation
 /// cannot produce a value of this type, so it cannot be forged, decoded
-/// from a request body, or reused across requests. A clone is the same
-/// verified value, used again within the request that admitted it (the one
-/// retry of a lost connection, TC-2346); it verifies nothing.
-#[derive(Debug, Clone)]
+/// from a request body, or reused across requests. Not `Clone`: the core
+/// `*_admitted` entry points also take `&AdmittedInvocation`
+/// ([`AdmittedInput`]), so a caller that must run one more than once (the
+/// retry of a lost connection, TC-2346) lends it instead of copying it.
+#[derive(Debug)]
 pub struct AdmittedInvocation(Invocation);
 
 #[derive(Debug, thiserror::Error)]
@@ -79,17 +80,42 @@ impl AdmittedInvocation {
     pub fn invocation(&self) -> &Invocation {
         &self.0
     }
+}
 
-    /// Hand the verified invocation to a core admitted entry point
-    /// (`invocation::process_admitted`, `invocation::authorize_admitted`),
-    /// or the durable replay insert. Crate-private: outside
-    /// `tinycloud-core`, the only way to use an `AdmittedInvocation` is to
-    /// pass it whole to one of the `*_admitted` APIs exposed on
-    /// [`crate::db::SpaceDatabase`].
-    pub(crate) fn into_invocation(self) -> Invocation {
+pub(crate) mod sealed {
+    use crate::events::Invocation;
+
+    pub trait Sealed {
+        /// Hand the verified invocation to a core admitted entry point
+        /// (`invocation::process_admitted`, `invocation::authorize_admitted`),
+        /// moved out of an owned [`AdmittedInvocation`](super::AdmittedInvocation)
+        /// or copied out of a borrowed one. Crate-private: outside
+        /// `tinycloud-core`, the only way to use an `AdmittedInvocation` is
+        /// to pass it, or a reference to it, to one of the `*_admitted` APIs
+        /// exposed on [`crate::db::SpaceDatabase`].
+        fn into_invocation(self) -> Invocation;
+    }
+}
+
+/// What the core `*_admitted` entry points accept: an
+/// [`AdmittedInvocation`] (consumed) or a reference to one (the verified
+/// invocation is copied, not re-verified). Sealed: only these two types
+/// implement it, so nothing else can pass for admitted.
+pub trait AdmittedInput: sealed::Sealed {}
+
+impl sealed::Sealed for AdmittedInvocation {
+    fn into_invocation(self) -> Invocation {
         self.0
     }
 }
+
+impl sealed::Sealed for &AdmittedInvocation {
+    fn into_invocation(self) -> Invocation {
+        self.0.clone()
+    }
+}
+
+impl<T: sealed::Sealed> AdmittedInput for T {}
 
 /// TC-409 acceptance: a deterministic, opt-in hook that counts cryptographic
 /// envelope verifications for a single, explicitly-armed invocation

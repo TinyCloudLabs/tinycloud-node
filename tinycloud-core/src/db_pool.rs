@@ -58,7 +58,7 @@ use sea_orm::{
 use rand::Rng;
 
 use crate::{
-    failure_diagnostic::{failure_kind, KIND_CONNECTION_LOST},
+    failure_diagnostic::{failure_kind, KIND_CONNECTION_LOST, KIND_IO},
     telemetry::{observe_db_connection_event, DbConnectionEvent},
 };
 
@@ -183,12 +183,20 @@ impl RecoveringConnection {
         Fut: Future<Output = Result<T, DbErr>>,
     {
         let started = Instant::now();
-        match attempt().await {
+        let first = match fault::take(retryable) {
+            Some(error) => Err(error),
+            None => attempt().await,
+        };
+        match first {
             Err(error) if is_connection_error(&error) => {
                 let retrying = retryable && self.within_retry_window(started);
                 self.lost(operation, &error, retrying);
                 if retrying {
-                    self.retried(operation, attempt().await)
+                    let second = match fault::take(true) {
+                        Some(error) => Err(error),
+                        None => attempt().await,
+                    };
+                    self.retried(operation, second)
                 } else {
                     Err(error)
                 }
@@ -213,12 +221,22 @@ impl RecoveringConnection {
         let write = retry.is_none();
         let in_flight = InFlightWrite::arm(write);
         let started = Instant::now();
-        let result = match attempt(stmt).await {
+        let first = match fault::take(retry.is_some()) {
+            Some(error) => Err(error),
+            None => attempt(stmt).await,
+        };
+        let result = match first {
             Err(error) if is_connection_error(&error) => {
                 let retry = retry.filter(|_| self.within_retry_window(started));
                 self.lost(operation, &error, retry.is_some());
                 match retry {
-                    Some(stmt) => self.retried(operation, attempt(stmt).await),
+                    Some(stmt) => {
+                        let second = match fault::take(true) {
+                            Some(error) => Err(error),
+                            None => attempt(stmt).await,
+                        };
+                        self.retried(operation, second)
+                    }
                     None => Err(error),
                 }
             }
@@ -899,22 +917,24 @@ pub fn track_writes<F: Future>(operation: F) -> impl Future<Output = (F::Output,
 }
 
 /// The delay before [`track_writes_retrying`] runs its one retry, jittered
-/// so the requests of one connection-loss burst do not return together. It
-/// is long enough for the pool's re-validation to have closed the dead
-/// connections ([`PoolRecovery`]): every acquisition after a loss pings the
-/// idle connections released before it.
+/// so the requests of one connection-loss burst do not return together.
 const OPERATION_RETRY_DELAY_MS: std::ops::RangeInclusive<u64> = 100..=300;
 
 /// [`track_writes`] around `attempt`, which is run once more when the first
-/// run failed with a lost connection ([`KIND_CONNECTION_LOST`]: not `io`,
-/// whose reply may have been lost; not a statement timeout, a serialization
-/// failure or pool exhaustion) and the tracker proves no write can have
-/// taken effect: no read-write transaction began and no write statement
-/// succeeded or lost its connection. The retry waits a jittered 100 to
-/// 300 ms and runs the whole operation again on a pool whose idle
-/// connections are re-validated ([`PoolRecovery`]), so it never reuses the
-/// dead one. It is the only retry: a failure of the second run is returned
-/// as it is, and it is never retried again (TC-2346).
+/// run failed with a lost connection ([`KIND_CONNECTION_LOST`] or
+/// [`KIND_IO`]; not a statement timeout, a serialization failure or pool
+/// exhaustion) and the tracker proves no write can have taken effect: no
+/// read-write transaction began and no write statement succeeded or lost
+/// its connection. That proof is what makes `io` safe: a lost reply only
+/// matters for a write, and a write that lost its connection is already
+/// tracked as possibly applied. The retry waits a jittered 100 to 300 ms
+/// and runs the whole operation again. It never reuses the connection that
+/// failed (sqlx pings a connection when it is released and closes it if the
+/// ping fails), and after a loss the pool pings the idle connections
+/// released before it ([`PoolRecovery`]). Best effort: a connection that
+/// died after its release ping can still be handed out, and then the second
+/// failure is returned as it is. It is the only retry: the second run is
+/// never retried (TC-2346).
 ///
 /// `db_error` names the database error inside the operation's own error
 /// type, or `None` for an error that is not one. Returns the last run's
@@ -931,7 +951,7 @@ where
     let (result, applied) = track_writes(attempt()).await;
     let error_class = match &result {
         Err(error) if !applied => db_error(error)
-            .filter(|error| failure_kind(error) == KIND_CONNECTION_LOST)
+            .filter(|error| matches!(failure_kind(error), KIND_CONNECTION_LOST | KIND_IO))
             .map(|error| connection_error_class(error).unwrap_or("other")),
         _ => None,
     };
@@ -996,6 +1016,87 @@ impl Drop for InFlightWrite {
         if self.armed {
             note_write_may_have_applied();
         }
+    }
+}
+
+/// Fault injection for the tests of what an operation does when its
+/// connection is lost (TC-2346). SQLite has no connection to lose, so a
+/// test scopes a [`fault::Plan`] around a request: while the request runs
+/// inside [`track_writes`], its next read-only statements and `BEGIN`s fail
+/// with the plan's error, as they would on a dead connection, and pass
+/// through the pool wrapper's own retry policy and the write tracker like
+/// any real loss. Never part of a production build (`test-util`).
+#[cfg(feature = "test-util")]
+pub mod fault {
+    use std::future::Future;
+    use std::sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc,
+    };
+
+    use sea_orm::DbErr;
+
+    tokio::task_local! {
+        static PLAN: Plan;
+    }
+
+    /// Fails the next `count` read-only statements or `BEGIN`s, then passes
+    /// everything through. Two failures defeat the pool wrapper's one
+    /// statement retry, so the operation itself fails.
+    #[derive(Clone)]
+    pub struct Plan {
+        remaining: Arc<AtomicU32>,
+        injected: Arc<AtomicU32>,
+        error: fn() -> DbErr,
+    }
+
+    impl Plan {
+        pub fn new(count: u32, error: fn() -> DbErr) -> Self {
+            Self {
+                remaining: Arc::new(AtomicU32::new(count)),
+                injected: Arc::default(),
+                error,
+            }
+        }
+
+        /// How many failures have been injected so far.
+        pub fn injected(&self) -> u32 {
+            self.injected.load(Ordering::SeqCst)
+        }
+
+        /// Run `future` with this plan in force.
+        pub async fn scope<F: Future>(&self, future: F) -> F::Output {
+            PLAN.scope(self.clone(), future).await
+        }
+    }
+
+    /// The next injected failure, if a plan is in force, the caller is inside
+    /// [`super::track_writes`] and `retryable` (a read or a `BEGIN`).
+    pub(super) fn take(retryable: bool) -> Option<DbErr> {
+        if !retryable || super::WRITE_MAY_HAVE_APPLIED.try_with(|_| ()).is_err() {
+            return None;
+        }
+        PLAN.try_with(|plan| {
+            plan.remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .ok()
+                .map(|_| {
+                    plan.injected.fetch_add(1, Ordering::SeqCst);
+                    (plan.error)()
+                })
+        })
+        .ok()
+        .flatten()
+    }
+}
+
+#[cfg(not(feature = "test-util"))]
+mod fault {
+    use sea_orm::DbErr;
+
+    #[inline(always)]
+    pub(super) fn take(_retryable: bool) -> Option<DbErr> {
+        None
     }
 }
 
@@ -1831,8 +1932,37 @@ mod tests {
         );
     }
 
+    fn io_lost() -> DbErr {
+        DbErr::Query(RuntimeErr::SqlxError(SqlxError::Io(io::Error::from(
+            io::ErrorKind::ConnectionReset,
+        ))))
+    }
+
+    /// TC-2346: an `io` failure before any write is retried like a lost
+    /// connection; the tracker is what proves the lost reply was not a write's.
+    #[tokio::test]
+    async fn tc2346_io_before_any_write_is_retried_once() {
+        let conn = sqlite().await;
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let (result, _) = track_writes_retrying(
+            "test",
+            || async {
+                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err(io_lost());
+                }
+                conn.execute_unprepared(WRITE_ACTOR).await.map(|_| ())
+            },
+            |error: &DbErr| Some(error),
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(actor_rows(&conn).await, 1, "the effect landed once");
+    }
+
     /// TC-2346 (b): once a read-write transaction began, or a write may have
-    /// applied, a lost connection is never retried, and the tracker still says so.
+    /// applied, a lost connection (or an `io` failure) is never retried, and
+    /// the tracker still says so.
     #[tokio::test]
     async fn tc2346_a_loss_after_a_write_may_have_applied_is_not_retried() {
         enum Applied {
@@ -1840,41 +1970,43 @@ mod tests {
             WriteAcknowledged,
             WriteLostItsConnection,
         }
-        for (how, rows) in [
-            (Applied::TransactionBegan, 0),
-            (Applied::WriteAcknowledged, 1),
-            (Applied::WriteLostItsConnection, 0),
-        ] {
-            let conn = sqlite().await;
-            let attempts = std::sync::atomic::AtomicUsize::new(0);
-            let (result, applied) = track_writes_retrying(
-                "test",
-                || async {
-                    attempts.fetch_add(1, Ordering::SeqCst);
-                    match how {
-                        Applied::TransactionBegan => {
-                            conn.begin().await.unwrap().rollback().await.unwrap();
+        for error in [lost as fn() -> DbErr, io_lost] {
+            for (how, rows) in [
+                (Applied::TransactionBegan, 0),
+                (Applied::WriteAcknowledged, 1),
+                (Applied::WriteLostItsConnection, 0),
+            ] {
+                let conn = sqlite().await;
+                let attempts = std::sync::atomic::AtomicUsize::new(0);
+                let (result, applied) = track_writes_retrying(
+                    "test",
+                    || async {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        match how {
+                            Applied::TransactionBegan => {
+                                conn.begin().await.unwrap().rollback().await.unwrap();
+                            }
+                            Applied::WriteAcknowledged => {
+                                conn.execute_unprepared(WRITE_ACTOR).await.unwrap();
+                            }
+                            Applied::WriteLostItsConnection => {
+                                note_write_outcome::<()>(&Err(error()));
+                            }
                         }
-                        Applied::WriteAcknowledged => {
-                            conn.execute_unprepared(WRITE_ACTOR).await.unwrap();
-                        }
-                        Applied::WriteLostItsConnection => {
-                            note_write_outcome::<()>(&Err(lost()));
-                        }
-                    }
-                    Err::<(), _>(lost())
-                },
-                |error: &DbErr| Some(error),
-            )
-            .await;
-            assert!(result.is_err());
-            assert!(applied);
-            assert_eq!(attempts.load(Ordering::SeqCst), 1);
-            assert_eq!(actor_rows(&conn).await, rows);
-            assert_eq!(
-                classify_failure(&result.unwrap_err(), applied),
-                Some(TransientFailure::OutcomeUnknown)
-            );
+                        Err::<(), _>(error())
+                    },
+                    |error: &DbErr| Some(error),
+                )
+                .await;
+                assert!(result.is_err());
+                assert!(applied);
+                assert_eq!(attempts.load(Ordering::SeqCst), 1);
+                assert_eq!(actor_rows(&conn).await, rows);
+                assert_eq!(
+                    classify_failure(&result.unwrap_err(), applied),
+                    Some(TransientFailure::OutcomeUnknown)
+                );
+            }
         }
     }
 
@@ -1900,10 +2032,10 @@ mod tests {
         );
     }
 
-    /// TC-2346 (d): only a lost connection is retried. An `io` error (the
-    /// reply may have been lost), a statement timeout, a serialization
-    /// failure, pool exhaustion, any other database error and a lock-wait
-    /// refusal (not a database error at all) are returned as they are.
+    /// TC-2346 (d): only a lost connection or `io` is retried. A statement
+    /// timeout, a serialization failure, pool exhaustion, any other database
+    /// error and a lock-wait refusal (not a database error at all) are
+    /// returned as they are.
     #[tokio::test]
     async fn tc2346_other_failures_are_not_retried() {
         enum Failure {
@@ -1911,9 +2043,6 @@ mod tests {
             LockWait,
         }
         let failures = [
-            Failure::Db(DbErr::Query(RuntimeErr::SqlxError(SqlxError::Io(
-                io::Error::from(io::ErrorKind::ConnectionReset),
-            )))),
             Failure::Db(DbErr::Query(RuntimeErr::SqlxError(sqlstate("57014")))),
             Failure::Db(DbErr::Query(RuntimeErr::SqlxError(sqlstate("40001")))),
             Failure::Db(DbErr::Query(RuntimeErr::SqlxError(sqlstate("40P01")))),
