@@ -182,7 +182,13 @@ fn read_audit_failure(
 ///   so it may have been applied.
 ///   The client must read the state back before deciding to retry;
 ///   re-sending the identical signed request is answered 409 (replay
-///   protection), except a delegation, which is idempotent.
+///   protection) if the write committed, except a delegation, which is
+///   idempotent. A KV put or delete spends its replay row in its own
+///   transaction (TC-2375): if that rolled back, the identical request
+///   applies when re-sent, so read the state back first. A KV write
+///   refused by its precondition commits only the replay row, and its
+///   request is answered 409 from then on. Other services spend the row
+///   before their write.
 /// - `500` with the error otherwise.
 ///
 /// `write_may_have_applied` comes from [`track_writes`] around the operation.
@@ -1371,6 +1377,7 @@ fn kv_invoke_options_for_capabilities_with_cursor(
         list_limit,
         list_cursor,
         kv_sync: None,
+        replay: None,
     })
 }
 
@@ -2109,7 +2116,7 @@ async fn invoke_impl(
 
         let put_caps = kv_put_capabilities(&admitted.invocation().0);
         let is_multipart_request = is_multipart(&headers);
-        let kv_options = kv_invoke_options(
+        let mut kv_options = kv_invoke_options(
             &admitted.invocation().0,
             &mut headers,
             is_multipart_request,
@@ -2216,7 +2223,18 @@ async fn invoke_impl(
                 .map_err(|error| (Status::Forbidden, error.to_string()))?;
         }
         let inputs = inputs_result?;
-        if policy_session_invocation {
+        // TC-2375: a KV write spends its replay row in its own transaction,
+        // so a write that rolls back leaves the signed request retryable. A
+        // read has no such transaction and spends the row up front.
+        let write_spends_replay = !tinycloud_core::kv_mutation_keys(admitted.invocation()).is_empty();
+        if write_spends_replay {
+            let reservation = if policy_session_invocation {
+                InvocationReplayCache::invoker_nonce_reservation(admitted.invocation(), 60)?
+            } else {
+                InvocationReplayCache::reservation(&admitted, config.invocation.max_lifetime_secs)
+            };
+            kv_options.replay = Some(reservation);
+        } else if policy_session_invocation {
             invocation_replay_cache
                 .check_and_insert_invoker_nonce(admitted.invocation(), 60)
                 .await?;
@@ -2255,6 +2273,9 @@ async fn invoke_impl(
         );
         let res = match invoke_result {
             Ok((tx_result, mut outcomes)) => {
+                if write_spends_replay {
+                    crate::prometheus::observe_replay_insert(true);
+                }
                 // Server-side successful-validation site: the invocation passed
                 // its time window (and everything else), so record how much
                 // validity remained.
@@ -2396,6 +2417,10 @@ async fn invoke_impl(
                             OffsetDateTime::now_utc(),
                         ),
                     );
+                }
+                if let TxStoreError::InvocationReplayed = &e {
+                    crate::prometheus::observe_replay_insert(false);
+                    return Err(crate::invocation_replay::InvocationReplayError::Duplicate.into());
                 }
                 if let TxStoreError::KvSyncResetRequired(reason) = &e {
                     return Err(kv_sync::kv_sync_reset_required(*reason).into());

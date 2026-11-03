@@ -58,6 +58,49 @@ impl InvocationReplayCache {
         self
     }
 
+    /// The replay row an admitted invocation spends, with the same key and
+    /// clamped retention as [`Self::check_and_insert`], for a write that spends
+    /// it in its own transaction (TC-2375, [`KvInvokeOptions::replay`]).
+    ///
+    /// [`KvInvokeOptions::replay`]: tinycloud_core::KvInvokeOptions::replay
+    pub fn reservation(
+        invocation: &AdmittedInvocation,
+        max_lifetime_secs: u64,
+    ) -> invocation_replay::Model {
+        let invocation = invocation.invocation();
+        invocation_replay::Model {
+            content_hash: invocation.content_hash(),
+            expires_at: invocation_expires_at(
+                invocation,
+                OffsetDateTime::now_utc(),
+                max_lifetime_secs,
+            ),
+        }
+    }
+
+    /// [`Self::reservation`] for a policy-session invocation, keyed by
+    /// invoker and nonce as [`Self::check_and_insert_invoker_nonce`] is.
+    pub fn invoker_nonce_reservation(
+        invocation: &Invocation,
+        max_lifetime_secs: u64,
+    ) -> Result<invocation_replay::Model, InvocationReplayError> {
+        let nonce = invocation
+            .0
+            .invocation
+            .payload()
+            .nonce
+            .as_ref()
+            .ok_or(InvocationReplayError::MissingNonce)?;
+        Ok(invocation_replay::Model {
+            content_hash: invoker_nonce_key(&invocation.0.invoker, nonce),
+            expires_at: invocation_expires_at(
+                invocation,
+                OffsetDateTime::now_utc(),
+                max_lifetime_secs,
+            ),
+        })
+    }
+
     /// Record an admitted invocation in the durable replay table.
     ///
     /// TC-409: the parameter type is `&AdmittedInvocation`, not a bare
