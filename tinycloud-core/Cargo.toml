@@ -87,6 +87,9 @@ ryu-js = "0.2.2"
 unicode-normalization = "0.1"
 # App ids are bound to the ASCII (punycode) form of a host name.
 idna = "1"
+reqwest = { version = "0.11", features = ["json"] }
+bs58 = "0.5"
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 sea-orm = { version = "1.1", features = ["runtime-tokio-rustls", "sqlx-sqlite"] }

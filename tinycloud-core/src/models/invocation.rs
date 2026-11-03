@@ -129,6 +129,8 @@ pub enum InvocationError {
     /// Code: `encryption-prefix-not-invocable`.
     #[error("encryption-prefix-not-invocable")]
     EncryptionPrefixNotInvocable,
+    #[error(transparent)]
+    Registry(#[from] crate::registry_admission::RegistryError),
 }
 
 impl InvocationError {

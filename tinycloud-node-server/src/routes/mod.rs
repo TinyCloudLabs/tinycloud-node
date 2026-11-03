@@ -242,6 +242,19 @@ fn tx_database_error<S: StorageSetup, K: Secrets>(error: &TxError<S, K>) -> Opti
     }
 }
 
+pub(crate) fn registry_failure(
+    error: tinycloud_core::registry_admission::RegistryError,
+) -> (Status, String) {
+    use tinycloud_core::registry_admission::RegistryError;
+    (
+        match error {
+            RegistryError::Denied => Status::Forbidden,
+            RegistryError::Unavailable => Status::ServiceUnavailable,
+        },
+        error.to_string(),
+    )
+}
+
 /// The response to a failed `/delegate`.
 fn delegation_failure<S: StorageSetup, K: Secrets>(
     error: &TxError<S, K>,
@@ -252,6 +265,7 @@ where
     K::Error: std::fmt::Display,
 {
     match error {
+        TxError::Registry(error) => registry_failure(*error),
         TxError::Db(db) | TxError::EpochInsert(db) => database_failure(
             Service::Other,
             db,
@@ -532,6 +546,10 @@ pub async fn signed_kv_get(
     );
     let ticket = load_result?;
     let (space_id, key) = validate_signed_kv_ticket(&ticket)?;
+    tinycloud
+        .check_registry_space(&space_id, false)
+        .await
+        .map_err(registry_failure)?;
 
     let range = range.and_then(|range| {
         if if_range_allows_range(
@@ -2002,6 +2020,8 @@ async fn invoke_impl(
                 };
                 (Status::Unauthorized, message)
             })?;
+        tinycloud.check_registry_capabilities(&admitted.invocation().0.capabilities)
+            .await.map_err(registry_failure)?;
         for space in admitted.invocation().0.spaces() {
             tinycloud_core::request_telemetry::observe_space(space);
         }
@@ -4521,6 +4541,7 @@ async fn verify_auth(
                     read_audit_failure(auth_service(span), error)
                 }
                 TxStoreError::Tx(TxError::SpaceNotFound) => (Status::NotFound, e.to_string()),
+                TxStoreError::Tx(TxError::Registry(error)) => registry_failure(*error),
                 _ => (Status::Unauthorized, e.to_string()),
             }
             .into()
@@ -4599,6 +4620,7 @@ fn authorization_failure(
             read_audit_failure(auth_service(span), error)
         }
         TxStoreError::Tx(TxError::SpaceNotFound) => (Status::NotFound, error.to_string()),
+        TxStoreError::Tx(TxError::Registry(error)) => registry_failure(*error),
         _ => (Status::Unauthorized, error.to_string()),
     }
 }

@@ -282,6 +282,7 @@ pub struct SpaceDatabase<C, B, S> {
     sql_sizes: SqlSizes,
     delegated_sql_caveats: bool,
     named_keys: bool,
+    registry: Option<Arc<crate::registry_admission::RegistryAdmission>>,
     revocation_chain_locks: ChainLockRegistry,
     kv_object_locks: KvObjectLockRegistry,
     space_sequence_locks: SpaceSequenceLockRegistry,
@@ -396,6 +397,8 @@ pub enum TxError<S: StorageSetup, K: Secrets> {
     Encryption(#[from] crate::encryption::EncryptionError),
     #[error("delegation-chain-traversal-limit-exceeded")]
     ChainTraversalLimitExceeded,
+    #[error(transparent)]
+    Registry(#[from] crate::registry_admission::RegistryError),
     /// The read's audit record was not confirmed; its data was not returned
     /// (TC-1317).
     #[error(transparent)]
@@ -734,6 +737,7 @@ where
             sql_sizes: SqlSizes::default(),
             delegated_sql_caveats: false,
             named_keys: false,
+            registry: None,
             revocation_chain_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             kv_object_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             space_sequence_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -947,6 +951,76 @@ impl<C, B, K> SpaceDatabase<C, B, K> {
         self.renewal_identity.as_ref()
     }
 
+    /// Enable current signed-registry hosting authorization. Unset by default.
+    pub fn with_registry_admission(
+        mut self,
+        registry: Option<Arc<crate::registry_admission::RegistryAdmission>>,
+    ) -> Self {
+        self.registry = registry;
+        self
+    }
+
+    /// Check hosting authority separately from the ordinary capability proof.
+    pub async fn check_registry_capabilities(
+        &self,
+        caps: &[crate::util::Capability],
+    ) -> Result<(), crate::registry_admission::RegistryError> {
+        if let Some(registry) = &self.registry {
+            registry.authorize_capabilities(caps).await?;
+        }
+        Ok(())
+    }
+
+    /// Hosting authority for direct, public, and ticket-bound data paths.
+    pub async fn check_registry_space(
+        &self,
+        space: &SpaceId,
+        write: bool,
+    ) -> Result<(), crate::registry_admission::RegistryError> {
+        if let Some(registry) = &self.registry {
+            registry.authorize_space(space, write).await?;
+        }
+        Ok(())
+    }
+
+    /// The hosting admission policy, present only when explicitly configured.
+    pub fn registry_admission(&self) -> Option<&crate::registry_admission::RegistryAdmission> {
+        self.registry.as_deref()
+    }
+
+    /// Raw encryption uses its own registered destination, not space membership.
+    pub async fn check_registry_encryption(
+        &self,
+        owner: &str,
+    ) -> Result<(), crate::registry_admission::RegistryError> {
+        if let Some(registry) = &self.registry {
+            registry.authorize_encryption(owner).await?;
+        }
+        Ok(())
+    }
+
+    async fn registry_registration_spaces(
+        &self,
+        events: &[Event],
+    ) -> Result<Option<HashSet<SpaceId>>, crate::registry_admission::RegistryError> {
+        let Some(registry) = &self.registry else {
+            return Ok(None);
+        };
+        let mut spaces = None;
+        for event in events {
+            if let Event::Delegation(delegation) = event {
+                spaces.get_or_insert_with(HashSet::new).extend(
+                    registry
+                        .registration_spaces(&delegation.0.capabilities)
+                        .await?,
+                );
+            }
+        }
+        Ok(spaces)
+    }
+}
+
+impl<C, B, K> SpaceDatabase<C, B, K> {
     /// Exposes the node's capability database for projections that are
     /// committed alongside ordinary delegation/revocation writes.
     pub fn connection(&self) -> &C {
@@ -1131,6 +1205,9 @@ where
                 .into(),
             );
         }
+        self.check_registry_capabilities(&invocation.capabilities)
+            .await
+            .map_err(invocation::InvocationError::from)?;
         verify_invocation_authorization(
             &self.conn,
             invocation,
@@ -1164,6 +1241,9 @@ where
                 .into(),
             );
         }
+        self.check_registry_capabilities(&invocation_info.capabilities)
+            .await
+            .map_err(invocation::InvocationError::from)?;
         let roots = invocation_info
             .parents
             .iter()
@@ -1866,6 +1946,9 @@ where
         space_id: &SpaceId,
         key: &Path,
     ) -> Result<Option<(Metadata, Hash, Content<B::Readable>)>, EitherError<DbErr, B::Error>> {
+        self.check_registry_space(space_id, false)
+            .await
+            .map_err(|e| EitherError::A(DbErr::Custom(e.to_string())))?;
         get_kv(&self.conn, &self.storage, space_id, key).await
     }
 
@@ -1876,6 +1959,9 @@ where
         range: ByteRangeSpec,
     ) -> Result<Option<(Metadata, Hash, RangeRead<B::Readable>)>, EitherError<DbErr, B::Error>>
     {
+        self.check_registry_space(space_id, false)
+            .await
+            .map_err(|e| EitherError::A(DbErr::Custom(e.to_string())))?;
         let Some(entry) = get_kv_entity(&self.conn, space_id, key)
             .await
             .map_err(EitherError::A)?
@@ -1904,6 +1990,9 @@ where
         space_id: &SpaceId,
         key: &Path,
     ) -> Result<Option<(Metadata, Hash)>, DbErr> {
+        self.check_registry_space(space_id, false)
+            .await
+            .map_err(|e| DbErr::Custom(e.to_string()))?;
         metadata_with_hash(&self.conn, space_id, key).await
     }
 
@@ -1912,6 +2001,9 @@ where
         space_id: &SpaceId,
         key: &Path,
     ) -> Result<Option<Metadata>, DbErr> {
+        self.check_registry_space(space_id, false)
+            .await
+            .map_err(|e| DbErr::Custom(e.to_string()))?;
         metadata(&self.conn, space_id, key).await
     }
 
@@ -1920,6 +2012,9 @@ where
         space_id: &SpaceId,
         prefix: &Path,
     ) -> Result<Vec<Path>, DbErr> {
+        self.check_registry_space(space_id, false)
+            .await
+            .map_err(|e| DbErr::Custom(e.to_string()))?;
         list(&self.conn, space_id, prefix).await
     }
 
@@ -1934,6 +2029,9 @@ where
         limit: usize,
         after: Option<&Path>,
     ) -> Result<(Vec<Path>, bool, Option<Path>), DbErr> {
+        self.check_registry_space(space_id, false)
+            .await
+            .map_err(|e| DbErr::Custom(e.to_string()))?;
         list_direct_children_bounded(&self.conn, space_id, prefix, limit, after).await
     }
 }
@@ -2143,6 +2241,7 @@ where
         events: Vec<Event>,
         verified: &PreVerified,
     ) -> Result<TransactResult, TxError<B, K>> {
+        let registry_spaces = self.registry_registration_spaces(&events).await?;
         let spaces = sequence_spaces(&self.conn, &events).await?;
         let _sequence_guards = self.acquire_space_sequence_guards(&spaces).await;
         let _writer = match &self.writer_lock {
@@ -2164,6 +2263,7 @@ where
             self.delegated_sql_caveats,
             self.named_keys,
             verified,
+            registry_spaces.as_ref(),
         )
         .await?;
 
@@ -2359,10 +2459,13 @@ where
         // we begin the transaction, skip the write entirely. Correctness does
         // not depend on this check — transact() handles the idempotent case
         // atomically via DelegationRegistration::Existing inside the txn.
-        match delegation::Entity::find_by_id(retained_hash)
-            .one(&self.conn)
-            .await
-        {
+        match if self.registry.is_none() {
+            delegation::Entity::find_by_id(retained_hash)
+                .one(&self.conn)
+                .await
+        } else {
+            Ok(None)
+        } {
             Ok(Some(_)) if !renewal_lease => {
                 // The content-addressed row authenticates these exact signed bytes.
                 for space in delegation.0.spaces() {
@@ -2458,21 +2561,24 @@ where
                 ));
             }
         }
+        let events: Vec<_> = delegations
+            .into_iter()
+            .map(|delegation| Event::Delegation(Box::new(delegation)))
+            .collect();
+        let registry_spaces = self.registry_registration_spaces(&events).await?;
         transact_verified(
             tx,
             &self.storage,
             &self.secrets,
             self.renewal_identity.as_ref(),
-            delegations
-                .into_iter()
-                .map(|delegation| Event::Delegation(Box::new(delegation)))
-                .collect(),
+            events,
             self.encryption.as_ref(),
             None,
             &[],
             self.delegated_sql_caveats,
             self.named_keys,
             verified,
+            registry_spaces.as_ref(),
         )
         .await
     }
@@ -2804,6 +2910,9 @@ where
             )
             .into());
         }
+        self.check_registry_capabilities(&invocation.0.capabilities)
+            .await
+            .map_err(TxError::from)?;
         // TC-732: a `kv/sync` invocation must be exactly one capability on a
         // KV resource (the root resource is the whole-space feed); anything
         // else is rejected before any work.
@@ -3307,6 +3416,7 @@ where
                 &sequence_spaces,
                 self.delegated_sql_caveats,
                 self.named_keys,
+                None,
             )
             .await?;
 
@@ -4500,6 +4610,7 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
     sequence_locks_held: &[SpaceId],
     delegated_sql_caveats: bool,
     named_keys: bool,
+    registry_spaces: Option<&HashSet<SpaceId>>,
 ) -> Result<TransactResult, TxError<S, K>> {
     transact_verified(
         db,
@@ -4513,6 +4624,7 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
         delegated_sql_caveats,
         named_keys,
         &PreVerified::default(),
+        registry_spaces,
     )
     .await
 }
@@ -4533,6 +4645,7 @@ pub(crate) async fn transact_verified<C: ConnectionTrait, S: StorageSetup, K: Se
     delegated_sql_caveats: bool,
     named_keys: bool,
     verified: &PreVerified,
+    registry_spaces: Option<&HashSet<SpaceId>>,
 ) -> Result<TransactResult, TxError<S, K>> {
     // for each event, get the hash and the relevent space(s)
     let event_hashes = events
@@ -4546,7 +4659,18 @@ pub(crate) async fn transact_verified<C: ConnectionTrait, S: StorageSetup, K: Se
     // this one: that is what makes `seq` commit-ordered on PostgreSQL.
     // A lock this transaction already holds is not asked for again (on
     // PostgreSQL that would only be a re-entrant no-op round-trip).
-    let event_spaces = event_spaces(db, &event_hashes).await?;
+    let mut event_spaces = event_spaces(db, &event_hashes).await?;
+    let mut registry_skipped = Vec::new();
+    if let Some(served) = registry_spaces {
+        event_spaces.retain(|space, _| {
+            if served.contains(space) {
+                true
+            } else {
+                registry_skipped.push(space.clone());
+                false
+            }
+        });
+    }
     crate::kv_sync::lock_space_sequences_not_held(db, event_spaces.keys(), sequence_locks_held)
         .await?;
     let renewal_seed = secrets.renewal_seed();
@@ -4653,6 +4777,14 @@ pub(crate) async fn transact_verified<C: ConnectionTrait, S: StorageSetup, K: Se
                 ) =>
             {
                 Some(d.0.capabilities.iter().filter_map(|c| {
+                    if let Some(served) = registry_spaces {
+                        return c
+                            .resource
+                            .space()
+                            .filter(|space| served.contains(*space))
+                            .cloned()
+                            .map(SpaceIdWrap);
+                    }
                     match (&c.resource, c.ability.as_ref().as_ref()) {
                         (Resource::TinyCloud(r), "tinycloud.space/host")
                             if r.path().is_none()
@@ -4773,6 +4905,8 @@ pub(crate) async fn transact_verified<C: ConnectionTrait, S: StorageSetup, K: Se
         }
         (event_spaces, vec![])
     };
+    let mut skipped_spaces = skipped_spaces;
+    skipped_spaces.extend(registry_skipped);
 
     // If all spaces were filtered out, we still process delegations below
     // but skip epoch/event ordering creation

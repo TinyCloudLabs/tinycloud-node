@@ -917,7 +917,21 @@ pub async fn app_with_control(
     .await?
     .with_sql_sizes(sql_sizes.clone())
     .with_delegated_sql_caveats(tinycloud_config.sql.delegated_caveats_enforced)
-    .with_named_keys(tinycloud_config.encryption_network.named_keys_v1);
+    .with_named_keys(tinycloud_config.encryption_network.named_keys_v1)
+    .with_registry_admission(
+        tinycloud_config
+            .spaces
+            .registry_v2
+            .as_deref()
+            .map(|origin| {
+                tinycloud_core::registry_admission::RegistryAdmission::new(
+                    origin,
+                    key_setup.node_did(),
+                )
+                .map(Arc::new)
+            })
+            .transpose()?,
+    );
     let renewer_epoch = tinycloud
         .renewal_identity()
         .map(|identity| identity.epoch)

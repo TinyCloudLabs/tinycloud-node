@@ -1602,6 +1602,10 @@ pub struct Tracing {
 pub struct SpacesConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowlist: Option<SpaceAllowListService>,
+    /// Explicit registry v2 origin. When set, current owner-signed membership
+    /// authorizes hosting and data mode; ordinary capability checks still apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry_v2: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
