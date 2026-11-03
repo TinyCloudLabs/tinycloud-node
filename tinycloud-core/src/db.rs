@@ -1,4 +1,4 @@
-use crate::admission::AdmittedInvocation;
+use crate::admission::{sealed, AdmittedInput, AdmittedInvocation};
 use crate::db_pool::RecoveringConnection;
 use crate::encryption::ColumnEncryption;
 use crate::events::{
@@ -211,8 +211,9 @@ pub enum AccountDelegationQueryError {
 
 /// TC-409: which trust mode an invocation entered `invoke_with_options_mode`
 /// under, and therefore which `Event` variant (and how much duplicate
-/// verification work) it produces. `Admitted` is only reachable by consuming
-/// an `AdmittedInvocation`, obtainable only from `AdmittedInvocation::admit`.
+/// verification work) it produces. `Admitted` is only reachable from an
+/// `AdmittedInvocation` (owned, or borrowed by the read-only authorization
+/// step), obtainable only from `AdmittedInvocation::admit`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InvokeMode {
     /// Untyped public entry point: signature verification runs during
@@ -2211,12 +2212,15 @@ where
     /// once by `AdmittedInvocation::admit`. Skips only that duplicate
     /// signature check downstream; authorization, revocation, caveat
     /// containment, and signed-time validity are still re-checked against
-    /// the current database state. This is the sole way to reach
-    /// `Event::AdmittedInvocation` — a caller without an `AdmittedInvocation`
-    /// cannot construct one.
+    /// the current database state. With `Event::AdmittedInvocation` it is
+    /// the way to reach this trust mode — a caller without an
+    /// `AdmittedInvocation` cannot construct one. Takes the value or, for
+    /// the read-only authorization step that its retry of a lost connection
+    /// runs again (TC-2346), a reference to it. A mutating invocation goes
+    /// through [`Self::invoke_with_options_admitted`], which only consumes.
     pub async fn invoke_admitted<S>(
         &self,
-        invocation: AdmittedInvocation,
+        invocation: impl AdmittedInput,
         inputs: InvocationInputs<S::Writable>,
     ) -> Result<(TransactResult, Vec<InvocationOutcome<B::Readable>>), TxStoreError<B, S, K>>
     where
@@ -2224,10 +2228,18 @@ where
         S: ImmutableStaging,
         S::Writable: 'static + Unpin,
     {
-        self.invoke_with_options_admitted(invocation, inputs, KvInvokeOptions::default())
-            .await
+        self.invoke_with_options_mode(
+            sealed::Sealed::into_invocation(invocation),
+            inputs,
+            KvInvokeOptions::default(),
+            InvokeMode::Admitted,
+        )
+        .await
     }
 
+    /// [`Self::invoke_admitted`] with `options`, for the mutating KV path:
+    /// it consumes the `AdmittedInvocation`, so a write cannot be run twice
+    /// from one admitted value.
     pub async fn invoke_with_options_admitted<S>(
         &self,
         invocation: AdmittedInvocation,
@@ -2240,7 +2252,7 @@ where
         S::Writable: 'static + Unpin,
     {
         self.invoke_with_options_mode(
-            invocation.into_invocation(),
+            sealed::Sealed::into_invocation(invocation),
             inputs,
             options,
             InvokeMode::Admitted,

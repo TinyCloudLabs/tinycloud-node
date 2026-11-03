@@ -47,19 +47,20 @@ use tinycloud_core::duckdb::{
 use tinycloud_core::{
     admission::AdmissionError,
     database_migration,
-    db_pool::{classify_failure, track_writes, TransientFailure},
+    db_pool::{classify_failure, track_writes, track_writes_retrying, TransientFailure},
     encryption_network::EncryptionService,
     events::Invocation,
     failure_diagnostic::{
         failure_kind, FailureCode, FailureNote, Service, KIND_READ_AUDIT_BUSY, KIND_REQUEST_TIMEOUT,
     },
+    keys::Secrets,
     models::{
         hook_delivery, hook_subscription, invocation as invocation_model, kv_delete, kv_write,
     },
     request_cancel,
     sea_orm::{ColumnTrait, DbErr, EntityTrait, QueryFilter, QueryOrder},
     sql::{CaveatArm, SqlAuthority, SqlCaveats, SqlError, SqlRequest, SqlService},
-    storage::{HashBuffer, ImmutableReadStore, ImmutableStaging},
+    storage::{HashBuffer, ImmutableReadStore, ImmutableStaging, StorageSetup},
     types::{Ability, DelegationQuery, DelegationQueryPage, Metadata, Resource},
     util::{Capability, DelegationInfo, InvocationInfo, RevocationInfo},
     write_hooks::{
@@ -219,6 +220,35 @@ fn database_failure(
         db_hash: None,
     });
     (status, body)
+}
+
+/// The database error inside a [`TxError`], for [`track_writes_retrying`].
+fn tx_database_error<S: StorageSetup, K: Secrets>(error: &TxError<S, K>) -> Option<&DbErr> {
+    match error {
+        TxError::Db(error) | TxError::EpochInsert(error) => Some(error),
+        _ => None,
+    }
+}
+
+/// The response to a failed `/delegate`.
+fn delegation_failure<S: StorageSetup, K: Secrets>(
+    error: &TxError<S, K>,
+    write_may_have_applied: bool,
+) -> (Status, String)
+where
+    S::Error: std::fmt::Display,
+    K::Error: std::fmt::Display,
+{
+    match error {
+        TxError::Db(db) | TxError::EpochInsert(db) => database_failure(
+            Service::Other,
+            db,
+            write_may_have_applied,
+            error.to_string(),
+        ),
+        TxError::SpaceNotFound => (Status::NotFound, error.to_string()),
+        _ => (Status::Unauthorized, error.to_string()),
+    }
 }
 
 /// `/invoke` failure: plain text for everything except storage rejections,
@@ -695,15 +725,18 @@ pub async fn delegate(
                 .with_label_values(&["delegate"])
                 .start_timer()
         });
-        let (res, write_may_have_applied) = track_writes(tinycloud.delegate(d.0)).await;
+        // One retry of the whole operation after a connection lost before
+        // any write (TC-2346); see `track_writes_retrying`.
+        let delegation = d.0;
+        let (res, write_may_have_applied) = track_writes_retrying(
+            "delegate",
+            tinycloud.connection().retry_window(),
+            || tinycloud.delegate(delegation.clone()),
+            tx_database_error,
+        )
+        .await;
         let res = res
-            .map_err(|e| match &e {
-                TxError::Db(error) | TxError::EpochInsert(error) => {
-                    database_failure(Service::Other, error, write_may_have_applied, e.to_string())
-                }
-                TxError::SpaceNotFound => (Status::NotFound, e.to_string()),
-                _ => (Status::Unauthorized, e.to_string()),
-            })
+            .map_err(|e| delegation_failure(&e, write_may_have_applied))
             .and_then(|result: TransactResult| {
                 let TransactResult {
                     commits,
@@ -4278,21 +4311,18 @@ async fn verify_auth_admitted(
     tinycloud: &State<TinyCloud>,
 ) -> Result<TransactResult, (Status, String)> {
     let start = Instant::now();
-    let result = tinycloud
-        .invoke_admitted::<BlockStage>(invocation, HashMap::new())
-        .await
-        // Authorization records only the invocation; the operation it
-        // authorizes has not run, so a database failure here is retryable.
-        .map_err(|e| match &e {
-            TxStoreError::Tx(TxError::Db(error) | TxError::EpochInsert(error)) => {
-                database_failure(auth_service(span), error, false, e.to_string())
-            }
-            TxStoreError::Tx(TxError::ReadAudit(error)) => {
-                read_audit_failure(auth_service(span), error)
-            }
-            TxStoreError::Tx(TxError::SpaceNotFound) => (Status::NotFound, e.to_string()),
-            _ => (Status::Unauthorized, e.to_string()),
-        })
+    let (result, write_may_have_applied) = track_writes_retrying(
+        "authorize_invocation",
+        tinycloud.connection().retry_window(),
+        || tinycloud.invoke_admitted::<BlockStage>(&invocation, HashMap::new()),
+        |error| match error {
+            TxStoreError::Tx(error) => tx_database_error(error),
+            _ => None,
+        },
+    )
+    .await;
+    let result = result
+        .map_err(|e| authorization_failure(span, &e, write_may_have_applied))
         .map(|(tx_result, _)| tx_result);
     crate::prometheus::observe_span(
         span,
@@ -4302,11 +4332,37 @@ async fn verify_auth_admitted(
     result
 }
 
+/// The response to a failed authorization step of `/invoke`. A read-only
+/// invocation records its audit last and begins no read-write transaction,
+/// so a database failure there is a safe `503`; one that began a
+/// transaction (a mutating invocation) and lost its connection afterwards
+/// is `outcome_unknown` (`write_may_have_applied`, from [`track_writes`]).
+fn authorization_failure(
+    span: &'static str,
+    error: &TxStoreError<BlockStores, BlockStage, tinycloud_core::keys::StaticSecret>,
+    write_may_have_applied: bool,
+) -> (Status, String) {
+    match error {
+        TxStoreError::Tx(TxError::Db(db) | TxError::EpochInsert(db)) => database_failure(
+            auth_service(span),
+            db,
+            write_may_have_applied,
+            error.to_string(),
+        ),
+        TxStoreError::Tx(TxError::ReadAudit(error)) => {
+            read_audit_failure(auth_service(span), error)
+        }
+        TxStoreError::Tx(TxError::SpaceNotFound) => (Status::NotFound, error.to_string()),
+        _ => (Status::Unauthorized, error.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     mod delegation_issued_query;
     mod encryption_keys;
     mod key_delete;
+    mod operation_retry;
     mod revocation_scope;
 
     use super::*;

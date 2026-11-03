@@ -1728,9 +1728,11 @@ async fn kv_put(
 /// failure before any write as `503 unavailable_retryable` with
 /// `Retry-After`, and one after the `COMMIT` was sent as `500
 /// outcome_unknown` without it, through the real node and its pool. The
-/// proxy cuts a connection: both `BEGIN` attempts (the one retry
-/// included), or a `COMMIT` that the server receives and commits but whose
-/// reply never arrives.
+/// proxy cuts a connection: both `BEGIN` attempts of a KV put (the one retry
+/// included), all four of a delegation (its operation is run once more after
+/// a loss before any write, TC-2346, so both runs lose both attempts), or a
+/// `COMMIT` that the server receives and commits but whose reply never
+/// arrives.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_write_routes_tell_retryable_failures_from_unknown_outcomes() {
     let Some(url) =
@@ -1809,17 +1811,18 @@ async fn postgres_write_routes_tell_retryable_failures_from_unknown_outcomes() {
             "reading back finds the committed put: {status} {read}"
         );
 
-        // Delegation: no connection survives BEGIN.
+        // Delegation: no connection survives BEGIN. Two attempts per run (the
+        // pool's one retry included), and the route runs the operation twice.
         let retryable = authorization(&new_session(&account)?.delegation_header)?;
         node.settle().await?;
-        cut.arm(&[b"BEGIN"], 2);
+        cut.arm(&[b"BEGIN"], 4);
         let (status, body, retry_after) = dispatch(
             node.client
                 .post("/delegate")
                 .header(Header::new("Authorization", retryable)),
         )
         .await;
-        ensure!(!cut.armed(), "both BEGIN attempts were cut");
+        ensure!(!cut.armed(), "all four BEGIN attempts were cut");
         ensure!(
             status == Status::ServiceUnavailable && body.starts_with("unavailable_retryable:"),
             "delegate before any write: {status} {body}"
@@ -1881,6 +1884,87 @@ async fn postgres_write_routes_tell_retryable_failures_from_unknown_outcomes() {
         .await
         .expect("drop the isolated schema");
     result.expect("route outcomes");
+}
+
+/// The stored delegation rows of the node's schema.
+async fn stored_delegations(node: &Node) -> Result<i64> {
+    Ok(
+        tinycloud_core::sea_orm::sqlx::query_scalar::<_, i64>("SELECT count(*) FROM delegation")
+            .fetch_one(node.pool())
+            .await?,
+    )
+}
+
+/// TC-2346: when no connection survives the first run's `BEGIN` (the
+/// attempt and the pool's one retry are both cut), nothing was written, so
+/// the route runs the delegation once more and answers `200`. The
+/// delegation is stored once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_delegate_is_retried_when_no_connection_survives_its_first_begin() {
+    let Some(url) = postgres_test_url(
+        "postgres_delegate_is_retried_when_no_connection_survives_its_first_begin",
+    ) else {
+        return;
+    };
+    let admin = Database::connect(url.as_str())
+        .await
+        .expect("connect to PostgreSQL");
+    let schema = format!(
+        "tc2346_routes_{}_{}",
+        std::process::id(),
+        time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+    );
+    admin
+        .execute(Statement::from_string(
+            DbBackend::Postgres,
+            format!("CREATE SCHEMA {schema}"),
+        ))
+        .await
+        .expect("create the isolated schema");
+    let cut = Cut::default();
+    let (node, _datadir) = start_node(&url, &schema, cut.clone(), None)
+        .await
+        .expect("start the node");
+
+    let result = async {
+        let account = Account::new(44)?;
+        sign_in(&node, &account).await?;
+        let before = stored_delegations(&node).await?;
+
+        let header = authorization(&new_session(&account)?.delegation_header)?;
+        node.settle().await?;
+        cut.arm(&[b"BEGIN"], 2);
+        let (status, body, _) = dispatch(
+            node.client
+                .post("/delegate")
+                .header(Header::new("Authorization", header)),
+        )
+        .await;
+        ensure!(
+            !cut.armed(),
+            "both BEGIN attempts of the first run were cut"
+        );
+        ensure!(
+            status == Status::Ok,
+            "delegate retried after a loss before any write: {status} {body}"
+        );
+        let after = stored_delegations(&node).await?;
+        ensure!(
+            after == before + 1,
+            "the delegation is stored once: {before} rows before, {after} after"
+        );
+        Ok(())
+    }
+    .await;
+    node.pool().close().await;
+    admin
+        .execute(Statement::from_string(
+            DbBackend::Postgres,
+            format!("DROP SCHEMA {schema} CASCADE"),
+        ))
+        .await
+        .expect("drop the isolated schema");
+    result.expect("delegate retry");
 }
 
 /// TC-735: a KV put's preparatory `BEGIN` is retried a bounded number of times

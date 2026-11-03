@@ -170,7 +170,8 @@ pub(crate) async fn process_internal<C: ConnectionTrait>(
 /// then the full authorization graph, caveat containment, revocation
 /// ordering, chain limits, and persistence proceed unchanged. Reachable
 /// only via `Event::AdmittedInvocation`, which is itself only constructed
-/// from a consumed `AdmittedInvocation` — this function does not, and
+/// from an `AdmittedInvocation` (consumed, or copied from a reference by the
+/// read-only authorization step) — this function does not, and
 /// must not, accept a bare invocation from any other caller.
 pub(crate) async fn process_admitted<C: ConnectionTrait>(
     db: &C,
