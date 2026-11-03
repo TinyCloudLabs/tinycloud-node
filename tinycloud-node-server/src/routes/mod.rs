@@ -182,7 +182,13 @@ fn read_audit_failure(
 ///   so it may have been applied.
 ///   The client must read the state back before deciding to retry;
 ///   re-sending the identical signed request is answered 409 (replay
-///   protection), except a delegation, which is idempotent.
+///   protection) if the write committed, except a delegation, which is
+///   idempotent. A KV put or delete spends its replay row in its own
+///   transaction (TC-2375): if that rolled back, the identical request
+///   applies when re-sent, so read the state back first. A KV write
+///   refused by its precondition commits only the replay row, and its
+///   request is answered 409 from then on. Other services spend the row
+///   before their write.
 /// - `500` with the error otherwise.
 ///
 /// `write_may_have_applied` comes from [`track_writes`] around the operation.

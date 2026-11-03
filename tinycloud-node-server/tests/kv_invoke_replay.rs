@@ -189,9 +189,9 @@ async fn replay_row_follows_the_write(client: &Client) -> Result<()> {
         "replay of a commit: {status} {body}"
     );
 
-    // A put refused by its precondition rolls back, and takes the replay row
-    // with it: the exact same signed request, sent again without the
-    // precondition, is not a replay.
+    // A put refused by its precondition commits only its replay row: a
+    // leaked failed request, with the unsigned precondition header dropped,
+    // cannot be reused to write a different body.
     let second = signed(&session, "tinycloud.kv/put", "replay/a")?;
     let (status, body) = send(client, &second, b"two", &[("If-None-Match", "*")]).await?;
     ensure!(
@@ -200,13 +200,14 @@ async fn replay_row_follows_the_write(client: &Client) -> Result<()> {
     );
     let (status, body) = send(client, &second, b"two", &[]).await?;
     ensure!(
-        status == Status::Ok,
-        "the same request after a rolled-back write: {status} {body}"
-    );
-    let (status, body) = send(client, &second, b"two", &[]).await?;
-    ensure!(
         status == Status::Conflict,
-        "replay after the retry: {status} {body}"
+        "the same request after a refused precondition: {status} {body}"
+    );
+    let read = signed(&session, "tinycloud.kv/get", "replay/a")?;
+    let (status, body) = send(client, &read, b"", &[]).await?;
+    ensure!(
+        status == Status::Ok && body == "one",
+        "readback after the refused write: {status} {body}"
     );
 
     // Identical requests racing each other (past the early refusal) commit

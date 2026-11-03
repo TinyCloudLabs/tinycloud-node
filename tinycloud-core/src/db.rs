@@ -2727,6 +2727,15 @@ where
                         current.as_ref().map(|entry| entry.value),
                     );
                     if !matches {
+                        // The precondition rides unsigned beside the signed
+                        // invocation. Commit the transaction so the replay
+                        // row alone is spent: a leaked refused request
+                        // cannot be resent without it to write another
+                        // value. A commit failure is the transaction's own
+                        // error (rolled back, retryable).
+                        if options.replay.is_some() {
+                            tx.commit().await?;
+                        }
                         return Err(TxStoreError::KvPreconditionFailed);
                     }
                 }
