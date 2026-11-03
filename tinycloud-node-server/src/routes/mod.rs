@@ -9701,6 +9701,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tc2389_unauthorized_kv_put_response_is_independent_of_hosting() -> Result<()> {
+        use rocket::http::{ContentType, Header};
+        use rocket::local::asynchronous::Client;
+        use tinycloud_core::{
+            models::space as space_model,
+            sea_orm::{ActiveModelTrait, ActiveValue::Set},
+            types::SpaceIdWrap,
+        };
+
+        let mut setup = metered_sql_http_setup("tc2389-same-target").await?;
+        let target = tinycloud_auth::resource::SpaceId::new(
+            setup.space.did().to_owned(),
+            "toggled-quota".parse()?,
+        );
+        let quota = QuotaCache::new(None, None);
+        quota.set_limit(&target, 1024).await;
+        setup.resource = target.clone().to_resource(
+            "kv".parse::<Service>()?,
+            Some("denied".parse::<AuthPath>()?),
+            None,
+            None,
+        );
+        // The same signed invocation is sent in both states; a refused
+        // invocation does not consume its nonce.
+        let header = sql_invocation_header(&setup, "tinycloud.kv/put", "tc2389-same-target")?;
+        let db = setup.replay_db.clone();
+        let client = Client::tracked(metered_sql_rocket_with_quota(setup, quota)).await?;
+
+        let send = |multipart: bool| {
+            let request = client
+                .post("/invoke")
+                .header(Header::new("Authorization", header.clone()));
+            let request = if multipart {
+                request
+                    .header(
+                        ContentType::parse_flexible("multipart/form-data; boundary=tc2389")
+                            .expect("valid multipart content type"),
+                    )
+                    .body(
+                        "--tc2389\r\nContent-Disposition: form-data; name=\"denied\"\r\n\r\none body\r\n--tc2389--\r\n",
+                    )
+            } else {
+                request.body("one body")
+            };
+            async move {
+                let response = request.dispatch().await;
+                let status = response.status();
+                let content_type = response.content_type();
+                let body = response.into_string().await.unwrap_or_default();
+                (status, content_type, body)
+            }
+        };
+
+        let unhosted = [send(false).await, send(true).await];
+        space_model::ActiveModel {
+            id: Set(SpaceIdWrap(target.clone())),
+        }
+        .insert(&db)
+        .await?;
+        let hosted = [send(false).await, send(true).await];
+
+        assert_eq!(
+            unhosted[0].0,
+            rocket::http::Status::Unauthorized,
+            "{unhosted:?}"
+        );
+        assert_eq!(unhosted, hosted, "response must not depend on hosting");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn sql_read_at_or_over_limit_returns_200() -> Result<()> {
         use rocket::data::ByteUnit;
         use rocket::http::{ContentType, Header, Status};
