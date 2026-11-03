@@ -17,6 +17,30 @@ use tinycloud_auth::{
     resource::SpaceId,
 };
 
+/// Why a revocation refused a request, as a stable machine-readable code
+/// (TC-2381). The human text of the refusal is unchanged; clients switch on
+/// this instead of matching it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RevocationCode {
+    /// The delegation the invocation cites is itself revoked.
+    DelegationRevoked,
+    /// A direct parent of the delegation being invoked or registered is
+    /// revoked.
+    ParentRevoked,
+    /// A higher ancestor is revoked.
+    AncestorRevoked,
+}
+
+impl RevocationCode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DelegationRevoked => "delegation_revoked",
+            Self::ParentRevoked => "parent_revoked",
+            Self::AncestorRevoked => "ancestor_revoked",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
 #[sea_orm(table_name = "revocation")]
 pub struct Model {
@@ -193,6 +217,94 @@ pub(crate) async fn first_revoked_ancestor<C: ConnectionTrait>(
         }
     }
     Ok(None)
+}
+
+/// Whether `target`, `start` or any ancestor of `start` is revoked, in either
+/// store, read in one statement (TC-2381).
+///
+/// A delegation is revoked by a row in the generic `revocation` table (under
+/// every persisted equivalent CID, as in [`is_revoked`]) or, for a Policy/v3
+/// root, by `policy_v3_root.revoked_at` / `revocation_bytes`. The
+/// `RootRevocation/v1` route writes only the latter, so the generic table alone
+/// reports such a root and its descendants active. A root counts as revoked
+/// when the server would refuse it as `root-revoked`.
+///
+/// `policy_v3_root.root_cid` is the text CID of the root's content hash, which
+/// SQL cannot derive from the binary hashes of the alias table, so the policy
+/// side matches the CIDs of the chain and `target` themselves; a root is keyed
+/// by that CID, and `target` is the CID a caller names.
+///
+/// A chain past the traversal budget still reports a revoked `target` as
+/// revoked and is otherwise [`ChainTraversalError::LimitExceeded`].
+pub(crate) async fn chain_revoked<C: ConnectionTrait>(
+    db: &C,
+    target: &Hash,
+    start: &Hash,
+) -> Result<bool, ChainTraversalError> {
+    let mut ids = match ancestor_chain_ids(db, start).await {
+        Ok(ids) => ids,
+        Err(ChainTraversalError::LimitExceeded) => {
+            return if any_revoked(db, &[*target]).await? {
+                Ok(true)
+            } else {
+                Err(ChainTraversalError::LimitExceeded)
+            };
+        }
+        Err(error) => return Err(error),
+    };
+    ids.push(*target);
+    ids.sort_by(|left, right| left.as_ref().cmp(right.as_ref()));
+    ids.dedup();
+    Ok(any_revoked(db, &ids).await?)
+}
+
+/// One `SELECT 1 WHERE EXISTS(generic) OR EXISTS(policy root)` over `ids`.
+async fn any_revoked<C: ConnectionTrait>(db: &C, ids: &[Hash]) -> Result<bool, DbErr> {
+    use delegation_cid_alias::{Column as AliasColumn, Entity as AliasEntity};
+    let canonical = Query::select()
+        .column(AliasColumn::Canonical)
+        .from(AliasEntity)
+        .cond_where(
+            Condition::any()
+                .add(Expr::col(AliasColumn::Id).is_in(ids.iter().copied()))
+                .add(Expr::col(AliasColumn::Canonical).is_in(ids.iter().copied())),
+        )
+        .to_owned();
+    let equivalents = Query::select()
+        .column(AliasColumn::Id)
+        .from(AliasEntity)
+        .and_where(Expr::col(AliasColumn::Canonical).in_subquery(canonical))
+        .to_owned();
+    let generic = Query::select()
+        .expr(Expr::value(1))
+        .from(Entity)
+        .cond_where(
+            Condition::any()
+                .add(Expr::col((Entity, Column::Revoked)).is_in(ids.iter().copied()))
+                .add(Expr::col((Entity, Column::Revoked)).in_subquery(equivalents)),
+        )
+        .to_owned();
+    let policy = Query::select()
+        .expr(Expr::value(1))
+        .from(policy_v3_root::Entity)
+        .and_where(
+            Expr::col(policy_v3_root::Column::RootCid)
+                .is_in(ids.iter().map(|id| id.to_cid(0x55).to_string())),
+        )
+        .cond_where(
+            Condition::any()
+                .add(Expr::col(policy_v3_root::Column::RevokedAt).is_not_null())
+                .add(Expr::col(policy_v3_root::Column::RevocationBytes).is_not_null()),
+        )
+        .to_owned();
+    let statement = Query::select()
+        .expr(Expr::value(1))
+        .cond_where(Expr::exists(generic).or(Expr::exists(policy)))
+        .to_owned();
+    Ok(db
+        .query_one(db.get_database_backend().build(&statement))
+        .await?
+        .is_some())
 }
 
 pub(crate) async fn ancestor_chain_ids<C: ConnectionTrait>(
