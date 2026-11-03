@@ -2731,8 +2731,10 @@ where
                         // invocation. Commit the transaction so the replay
                         // row alone is spent: a leaked refused request
                         // cannot be resent without it to write another
-                        // value. A commit failure is the transaction's own
-                        // error (rolled back, retryable).
+                        // value. A failed commit is the transaction's own
+                        // database error: it may or may not have committed
+                        // (a lost reply), so the route reports it as an
+                        // unknown outcome and the caller reads back first.
                         if options.replay.is_some() {
                             tx.commit().await?;
                         }
