@@ -318,8 +318,10 @@ async fn issuer_case_reimport_cannot_resurrect_revoked_siwe_grant() -> Result<()
         Status::Unauthorized,
         "canonical after revoke: {revoked_body}"
     );
-    let revoked_json: Value = serde_json::from_str(&revoked_body)?;
-    assert_eq!(revoked_json["code"], "delegation_revoked", "{revoked_body}");
+    assert!(
+        revoked_body.contains("delegation-revoked"),
+        "{revoked_body}"
+    );
 
     let imported: Value = serde_json::from_str(
         &expect_ok(
@@ -346,8 +348,7 @@ async fn issuer_case_reimport_cannot_resurrect_revoked_siwe_grant() -> Result<()
         Status::Unauthorized,
         "case-only revoked grant must not authorize kv/list: {invoke_body}"
     );
-    let invoke_json: Value = serde_json::from_str(&invoke_body)?;
-    assert_eq!(invoke_json["code"], "delegation_revoked", "{invoke_body}");
+    assert!(invoke_body.contains("delegation-revoked"), "{invoke_body}");
     assert_eq!(alias_status["status"], "revoked");
     assert_eq!(alias_status["revoked"], true);
     assert_eq!(

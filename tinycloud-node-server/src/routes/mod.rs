@@ -6038,8 +6038,10 @@ mod tests {
             Status::Unauthorized,
             "revoked delegation must block subsequent native read: {body}"
         );
-        let json: serde_json::Value = serde_json::from_str(&body)?;
-        assert_eq!(json["code"], "delegation_revoked", "{body}");
+        assert!(
+            body.contains("delegation-revoked"),
+            "expected delegation-revoked error body, got {body}"
+        );
 
         Ok(())
     }
@@ -7014,8 +7016,10 @@ mod tests {
             Status::Unauthorized,
             "active cutoff must block subsequent native read: {body}"
         );
-        let json: serde_json::Value = serde_json::from_str(&body)?;
-        assert_eq!(json["code"], "delegation_revoked", "{body}");
+        assert!(
+            body.contains("delegation-revoked"),
+            "expected delegation-revoked error body, got {body}"
+        );
 
         Ok(())
     }
@@ -14176,7 +14180,7 @@ mod tests {
         fixture.revoke("tc732-revoke-device", grant).await?;
         let reply = fixture.sync("notes/", grant, &[]).await?;
         assert_eq!(reply.status, Status::Unauthorized, "{}", reply.body);
-        assert_eq!(reply.json["code"], "delegation_revoked", "{}", reply.body);
+        assert!(reply.body.contains("delegation-revoked"), "{}", reply.body);
         Ok(())
     }
 

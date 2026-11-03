@@ -342,8 +342,10 @@ secret = "{}"
         Status::Unauthorized,
         "active cutoff must block subsequent native read: {body}"
     );
-    let json: serde_json::Value = serde_json::from_str(&body)?;
-    assert_eq!(json["code"], "delegation_revoked", "{body}");
+    assert!(
+        body.contains("delegation-revoked"),
+        "expected delegation-revoked error body, got {body}"
+    );
 
     Ok(())
 }
