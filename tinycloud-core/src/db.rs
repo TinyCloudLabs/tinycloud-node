@@ -305,6 +305,14 @@ pub struct KvInvokeOptions {
     /// Parameters of a `tinycloud.kv/sync` request (TC-732). `None` reads the
     /// first page at the default limit.
     pub kv_sync: Option<crate::kv_sync::KvSyncRequest>,
+    /// The invocation-replay row of a KV write (TC-2375). It is inserted in
+    /// the write's own transaction, so a write that rolls back releases it
+    /// and the same signed request can be sent again; one that commits keeps
+    /// it, and the same request is then a replay
+    /// ([`TxStoreError::InvocationReplayed`]). Ignored by an invocation with
+    /// no KV mutation (see [`kv_mutation_keys`]), which has no such
+    /// transaction.
+    pub replay: Option<invocation_replay::Model>,
 }
 
 #[derive(Debug, Clone)]
@@ -398,6 +406,10 @@ where
     KvCandidateUnavailable,
     #[error("KV precondition failed")]
     KvPreconditionFailed,
+    /// The invocation's replay row exists: it, or an identical request that
+    /// committed, was already spent (TC-2375).
+    #[error("duplicate invocation")]
+    InvocationReplayed,
     #[error("KV response is {size} bytes, exceeding the requested limit of {limit} bytes")]
     KvResponseTooLarge { size: u64, limit: u64 },
     /// A `tinycloud.kv/list` cursor names a key outside the listed prefix.
@@ -2375,22 +2387,7 @@ where
         // invocation-vs-invocation exclusion, which the revocation-ordering
         // invariant never depended on.
         let _chain_guards = self.acquire_shared_chain_guards_for_keys(lock_keys).await;
-        let mutation_keys = invocation
-            .0
-            .capabilities
-            .iter()
-            .filter_map(|cap| {
-                let resource = cap.resource.tinycloud_resource()?;
-                let ability =
-                    crate::policy_capability::resolve_alias(cap.ability.as_ref().as_ref());
-                if resource.service().as_str() != "kv"
-                    || !matches!(ability, "tinycloud.kv/put" | "tinycloud.kv/del")
-                {
-                    return None;
-                }
-                Some((resource.space().clone(), resource.path()?.clone()))
-            })
-            .collect::<Vec<_>>();
+        let mutation_keys = kv_mutation_keys(&invocation);
         if mutation_keys.len() > KV_MAX_MUTATIONS_PER_INVOCATION {
             return Err(TxStoreError::KvTooManyMutations {
                 count: mutation_keys.len(),
@@ -2673,6 +2670,22 @@ where
                             error.into()
                         }
                     })?;
+            }
+            // TC-2375: spend the replay row in this transaction, first among
+            // its statements after the locks, so every later refusal or lost
+            // connection rolls it back with the write.
+            if let Some(row) = options.replay.clone() {
+                let inserted = invocation_replay::Entity::insert(row.into_active_model())
+                    .on_conflict(
+                        OnConflict::column(invocation_replay::Column::ContentHash)
+                            .do_nothing()
+                            .to_owned(),
+                    )
+                    .exec_without_returning(&tx)
+                    .await?;
+                if inserted == 0 {
+                    return Err(TxStoreError::InvocationReplayed);
+                }
             }
             // The sequence lock precedes every precondition read under READ
             // COMMITTED, including when an upload was prepared concurrently.
@@ -3310,6 +3323,27 @@ type KvSyncTarget = (SpaceId, Path, Resource);
 /// no `kv/sync`. A root resource is canonicalized to an empty prefix and a
 /// pathless `kv` resource, so cursors, authority, and retention describe one
 /// stable whole-space feed regardless of `{space}/kv` vs `{space}/kv/`.
+/// The `(space, path)` of every KV put or delete the invocation carries: what
+/// makes `/invoke` run it in a write transaction (and, with
+/// [`KvInvokeOptions::replay`], spend its replay row there).
+pub fn kv_mutation_keys(invocation: &Invocation) -> Vec<(SpaceId, Path)> {
+    invocation
+        .0
+        .capabilities
+        .iter()
+        .filter_map(|cap| {
+            let resource = cap.resource.tinycloud_resource()?;
+            let ability = crate::policy_capability::resolve_alias(cap.ability.as_ref().as_ref());
+            if resource.service().as_str() != "kv"
+                || !matches!(ability, "tinycloud.kv/put" | "tinycloud.kv/del")
+            {
+                return None;
+            }
+            Some((resource.space().clone(), resource.path()?.clone()))
+        })
+        .collect()
+}
+
 fn kv_sync_target(
     invocation: &crate::util::InvocationInfo,
 ) -> Result<Option<KvSyncTarget>, &'static str> {
