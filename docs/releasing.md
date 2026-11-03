@@ -703,7 +703,8 @@ before deployment. The 1.25.13 to 1.25.17 migration-tree diff is empty, so that
 rollback remains eligible; older releases with a different migration tree do
 not. This is a conservative compatibility check, not a substitute for checking
 other stored-data compatibility. Before dispatch, verify the digest and OCI
-labels against the successful image-build summary for the named release.
+labels against the `Deployment image:` line in the summary of the successful
+run that deployed that release.
 
 The one-line `rollback_reason` must be 12–300 characters: the first character
 is an ASCII letter or digit; later characters may be ASCII letters or digits,
