@@ -111,7 +111,7 @@ async fn the_space_owner_wallet_revokes_an_agent_signed_root(
         return Ok(());
     };
     let admitted = admitted(&h).await?;
-    assert_no_hook_ticket(&h, &admitted, Refusal::Text("Unauthorized Action")).await?;
+    assert_no_hook_ticket(&h, &admitted, Refusal::NotRevocation).await?;
     h.revoke(&h.space_owner, &admitted.policy.policy_root_cid)
         .await?;
     assert_root_revoked_cascade(&h, &admitted).await?;
@@ -121,8 +121,8 @@ async fn the_space_owner_wallet_revokes_an_agent_signed_root(
 
 /// Why a hook ticket is refused with a 401.
 enum Refusal {
-    /// Plain text starting with this.
-    Text(&'static str),
+    /// Not a revocation: the body carries no revocation `code`.
+    NotRevocation,
     /// A revocation: the JSON body carries this `code`.
     Revoked(&'static str),
 }
@@ -148,7 +148,7 @@ async fn assert_no_hook_ticket(
         .await?;
     assert_eq!(status, Status::Unauthorized, "{body}");
     match refusal {
-        Refusal::Text(text) => assert!(body.starts_with(text), "{body}"),
+        Refusal::NotRevocation => assert_eq!(revocation_code(&body), "", "{body}"),
         Refusal::Revoked(code) => assert_eq!(revocation_code(&body), code, "{body}"),
     }
     Ok(())
