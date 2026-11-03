@@ -2,7 +2,10 @@
 
 ## [Unreleased]
 
+## [1.25.16] - 2026-11-02
+
 ### Changes
+- Node database restore guidance now preserves the existing disk and deletion ledger when restoring from a PlanetScale backup. Details: TC-887 (#500)
 - `/delegate` and the authorization step of `/invoke` (SQL, DuckDB and `space/info`) run their operation once more, after a jittered 100 to 300 ms, when it failed with a lost database connection or a socket error (`connection_lost` or `io`) and the write tracker shows no write began or may have applied. A first run that took longer than `database.retry_window_ms` to fail (a keepalive or `TCP_USER_TIMEOUT` detection) is not retried. A second loss answers the same `503 unavailable_retryable` as before; an outcome-unknown `500` is never retried. The authorization step now also reports `outcome_unknown` (`500`) when a mutating invocation lost its connection after its transaction began, instead of always a safe `503`. New `tinycloud_db_connection_events_total` events `operation_retried`, `operation_retry_succeeded` and `operation_retry_skipped_slow`. Details: TC-2346
 - The log shipper maps the two operation-retry warnings (`retrying operation after a lost database connection`, `not retrying operation: its first run took longer than the retry window to fail`) to the event codes `db_operation_retried` and `db_operation_retry_skipped_slow`, instead of `unclassified`. Like every classified diagnostic, they ship the code and count only.
   - **N0 compose.** The embedded Vector configuration is regenerated for the two codes, so the reviewed N0 compose template changes to `9d0cd8a2…` (raw `d703d69b…`; `docs/releasing.md`, `.github/workflows/docker.yml`). Details: TC-2346
