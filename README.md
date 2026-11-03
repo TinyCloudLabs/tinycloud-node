@@ -271,10 +271,43 @@ The following common options are available:
 | storage.staging     | TINYCLOUD_STORAGE_STAGING     | Set the mode of content staging, options are "Memory" and "FileSystem"     |
 | keys.type           | TINYCLOUD_KEYS_TYPE           | Set the type of host key store, options are "Static"                       |
 | spaces.allowlist    | TINYCLOUD_SPACES_ALLOWLIST    | Set the URL of an allowlist service for gating the creation of Space Peers |
+| spaces.registry_v2  | TINYCLOUD_SPACES__REGISTRY_V2 | Optional signed registry v2 origin for current per-space hosting authorization and read/write mode |
 | telemetry.enabled   | TINYCLOUD_TELEMETRY__ENABLED  | Enable Prometheus latency metrics on the configured Prometheus port        |
 | column_encryption.strict | TINYCLOUD_COLUMN_ENCRYPTION__STRICT | Require authenticated envelopes for recorded legacy columns; default `false`. Recorded v2 columns always require v2. |
 | (n/a)               | ROCKET_MAX_BLOCKING           | Set Rocket's blocking-thread-pool cap (default 512). Note the `ROCKET_` prefix, not `TINYCLOUD_` — Rocket builds its tokio runtime from its own Figment before TinyCloud's config is loaded, so `TINYCLOUD_MAX_BLOCKING` is silently ignored for this setting |
 | (n/a)               | NODE_STATS_READ_TOKEN         | Bearer token for the read-only `GET /admin/stats` (TC-1482). Unset, blank, shorter than 32 bytes, or equal to `TINYCLOUD_ADMIN_SECRET` disables the route (`404`). Generate it with `openssl rand -hex 32` (64 hex characters). Separate from `TINYCLOUD_ADMIN_SECRET`, which it does not replace and which does not open it. Secret: set it in the deployment secret store, never in `tinycloud.toml` or a committed env file. See [Admin stats](#admin-stats-get-adminstats) |
+
+### Signed registry v2 hosting
+
+Enable registry-based hosting explicitly on a node:
+
+```toml
+[global.spaces]
+registry_v2 = "http://127.0.0.1:48100"
+```
+
+Use an exact HTTPS origin, without a trailing slash or path. HTTP is accepted
+only for loopback `127.0.0.1` or `[::1]` lab origins. The node fetches
+`/v2/locations/<ownerKey>` and independently verifies the current owner-signed
+v2 record. EOA lookup uses the EIP-55 address independently of chain; Ed25519
+owners use their exact `did:key`.
+
+The signed space membership must list this node's DID. A listed read-only
+replica supports hosting/session registration and reads; ordinary data mutations
+require read-write membership. These checks also apply to previously hosted
+spaces, public and signed-URL reads, and hook streams. Missing or unavailable
+authorization is refused on a configured node. When `registry_v2` is unset,
+existing hosting and onboarding behavior is unchanged.
+
+Ordinary signatures, delegation chains, capability scopes, and revocation checks
+still apply. A valid data/session grant can activate a listed replica without a
+separate per-node hosting SIWE. A mixed grant is retained as its complete signed
+proof, but `/delegate` activates only this node's listed data spaces; its response
+keeps `cid`, `activated`, and `skipped`. Raw encryption-network grants and requests
+use the separately signed `encryptionNode` destination. Encryption-only
+registration returns a CID without activating an unlisted data space.
+
+Details: TC-2481
 
 ### Database Config
 
