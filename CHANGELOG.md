@@ -3,7 +3,7 @@
 ## [Unreleased]
 
 ### Changes
-- A KV put or delete on `/invoke` records its invocation-replay row in the write's own transaction instead of before it. A write that rolls back (a lost connection before `COMMIT`, a failed `If-None-Match`/`If-Match` precondition, a refused authorization) no longer spends the signed request, so the identical request can be sent again; a write that commits still answers the same request `409`, and identical requests racing each other commit once. Reads, decrypt and `space/info` are unchanged. A replayed write is now refused after its upload is staged rather than before it. Details: TC-2375
+- A KV put or delete on `/invoke` records its invocation-replay row in the write's own transaction instead of before it. A write that rolls back (a lost connection before `COMMIT`, a refused authorization) no longer spends the signed request, so the identical request can be sent again. A write refused by its `If-None-Match`/`If-Match` precondition (`412`) commits only the replay row, so that request answers `409` from then on and cannot be resent without the unsigned header. A write that commits still answers the same request `409`, and identical requests racing each other commit once. Reads, decrypt and `space/info` are unchanged. A replayed write is now refused after its upload is staged rather than before it. Details: TC-2375
 
 ## [1.25.16] - 2026-11-02
 
