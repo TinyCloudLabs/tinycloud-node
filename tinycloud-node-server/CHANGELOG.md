@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.25.16](https://github.com/TinyCloudLabs/tinycloud-node/compare/v0.0.1...v1.25.16) - 2026-11-03
+
+### Fixed
+
+- *(invoke)* spend a KV write's replay row inside the write transaction ([#504](https://github.com/TinyCloudLabs/tinycloud-node/pull/504))
+
+### Other
+
+- Typed revocation codes and Policy/v3 root status ([#506](https://github.com/TinyCloudLabs/tinycloud-node/pull/506))
+- check authorization before quota accounting ([#503](https://github.com/TinyCloudLabs/tinycloud-node/pull/503))
+
 - Recheck hook ticket delegation revocation when event streams open and use
   literal segment-prefix matching for hook subscriptions.
 
