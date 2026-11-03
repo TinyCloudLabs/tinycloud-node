@@ -680,9 +680,60 @@ strict descendant of the running production revision").
 3. Read the digest and labels of the new `X.Y.Z-dstack` image, then use the
    promotion command above with that digest, version and revision.
 
-A rollback of such a change follows the same path: a revert plus a new
-release. The same-image recovery command below is for the reviewed 1.20.6
-image only and is refused once a later release is running.
+A rollback of a compose-only change still follows the same path: revert plus a
+new release. To restore an earlier node image while retaining the current N0
+compose, use the explicit audited rollback below. The same-image recovery
+command below is for the reviewed 1.20.6 image only and is refused once a later
+release is running.
+
+### Audited rollback to a prior N0 release
+
+Use this only when the earlier image is compatible with the production
+database and stored data. `rollback_release=true` requires the current
+reviewed N0 compose, a named digest, matching OCI version/revision labels, the
+matching `vX.Y.Z` tag and crate version, and a target revision that is a
+strict ancestor of the currently running image. The normal guard still
+requires the running revision to be an ancestor of dispatched `main`; do not
+set `allow_non_descendant`.
+
+The workflow also requires the migration source tree under
+`tinycloud-core/src/migrations` to be identical at the target and running
+revisions. A target missing migrations present in the running binary is refused
+before deployment. The 1.25.13 to 1.25.17 migration-tree diff is empty, so that
+rollback remains eligible; older releases with a different migration tree do
+not. This is a conservative compatibility check, not a substitute for checking
+other stored-data compatibility. Before dispatch, verify the digest and OCI
+labels against the `Deployment image:` line in the summary of the successful
+run that deployed that release.
+
+The one-line `rollback_reason` must be 12–300 characters: the first character
+is an ASCII letter or digit; later characters may be ASCII letters or digits,
+spaces, or `. , ; : ( ) / _ + -`. It is retained in the workflow inputs and
+run summary with the digest, version and revision. The explicit quota
+authorization is still required for each dispatch. Keep
+`rollback_pre_n0=false` and `rollback_privacy_mode=unselected`; this does not
+use the captured 1.20.6 compose rollback.
+
+Example using the recorded 1.25.13 image, when it is an ancestor of the
+currently running release:
+
+```sh
+gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref main \
+  -f deploy_phala=true \
+  -f authorize_quota_values=true \
+  -f rollback_release=true \
+  -f rollback_reason="Incident: restore the last known-good node release" \
+  -f image_version=1.25.13 \
+  -f deploy_image_digest=sha256:55c26f455f793cb3d23d1675db566d7ecf4020c3156028ee61190c8e14d59be3 \
+  -f rollback_image_version=1.25.13 \
+  -f rollback_image_revision=50b0986a969af818a658ec92461cce7007e3b0a1 \
+  -f sql_identity_fence=false \
+  -f named_keys_v1=true \
+  -f include_duckdb=false \
+  -f allow_non_descendant=false \
+  -f rollback_pre_n0=false \
+  -f rollback_privacy_mode=unselected
+```
 
 ### Emergency same-image recovery (12c)
 
