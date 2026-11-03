@@ -165,15 +165,18 @@ use tokio::{
 /// precondition read and write rows. All claims of one put share one
 /// preparatory transaction.
 ///
-/// Full-flow ceilings, including asynchronous sign-in work. Details: TC-2214
+/// Full-flow ceilings, including asynchronous sign-in work. Details: TC-2214.
+/// Quota-aware KV puts include the TC-2389 `/invoke` `authorize_admitted`
+/// check before quota/hosting lookup (`WITH RECURSIVE "proof_roots"`); its
+/// net round trip is included in the put ceilings. Fusion follow-up: TC-2426.
 const BUDGETS: [(&str, u64); 7] = [
     ("sign-in", 71),
-    ("kv put", 42),
+    ("kv put", 43),
     ("kv get", 16),
     ("kv batch get", 16),
     ("kv batch head", 16),
-    ("kv put 2 blobs", 48),
-    ("kv put 1 blob 2 keys", 45),
+    ("kv put 2 blobs", 49),
+    ("kv put 1 blob 2 keys", 46),
 ];
 
 /// Full sign-in plus put plus get rounds run before the measured one.

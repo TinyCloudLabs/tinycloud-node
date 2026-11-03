@@ -2135,6 +2135,22 @@ async fn invoke_impl(
                 .collect::<Vec<_>>()
         });
 
+        // Authorization runs before any quota or hosting lookup, so the
+        // response does not depend on the target's state or quota. A failure
+        // takes the node's existing authorization-failure response.
+        if !put_caps.is_empty() {
+            tinycloud
+                .authorize_admitted(&admitted, OffsetDateTime::now_utc())
+                .await
+                .map_err(|error| {
+                    authorization_failure(
+                        "server.signed_kv.auth",
+                        &TxStoreError::Tx(error.into()),
+                        false,
+                    )
+                })?;
+        }
+
         let stage_inputs_start = Instant::now();
         let inputs_result: Result<KvInputMap, InvokeError> = async {
             match (data, put_caps.as_slice(), is_multipart_request) {
@@ -9527,6 +9543,231 @@ mod tests {
                 "account": {"usedBytes": 500, "limitBytes": 1000, "plan": "free"},
             })
         );
+        Ok(())
+    }
+    #[tokio::test]
+    async fn tc2389_quota_space_existence_is_not_disclosed_before_kv_authorization() -> Result<()> {
+        use rocket::http::{Header, Status};
+        use rocket::local::asynchronous::Client;
+
+        let mut setup = metered_sql_http_setup("tc2389-unhosted-space").await?;
+        let target_space = tinycloud_auth::resource::SpaceId::new(
+            setup.space.did().to_owned(),
+            "unhosted-quota".parse()?,
+        );
+        let quota = QuotaCache::new(None, None);
+        quota.set_limit(&target_space, 1024).await;
+        setup.resource = target_space.clone().to_resource(
+            "kv".parse::<Service>()?,
+            Some("allowed".parse::<AuthPath>()?),
+            None,
+            None,
+        );
+        let header = sql_invocation_header(&setup, "tinycloud.kv/put", "tc2389-unhosted-quota")?;
+        let client = Client::tracked(metered_sql_rocket_with_quota(setup, quota)).await?;
+
+        let response = client
+            .post("/invoke")
+            .header(Header::new("Authorization", header))
+            .body("one body")
+            .dispatch()
+            .await;
+        let status = response.status();
+        let body = response.into_string().await.unwrap_or_default();
+        assert_eq!(
+            status,
+            Status::Unauthorized,
+            "authorization should precede the existence result: {body}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tc2389_quota_kv_put_authorization_matrix() -> Result<()> {
+        use rocket::http::{ContentType, Header, Status};
+        use rocket::local::asynchronous::Client;
+        use tinycloud_core::{
+            models::abilities,
+            sea_orm::{ActiveModelTrait, ActiveValue::Set},
+            types::Caveats,
+        };
+
+        let mut setup = metered_sql_http_setup("tc2389-matrix").await?;
+        let hosted = setup.space.clone();
+        let unhosted = tinycloud_auth::resource::SpaceId::new(
+            setup.space.did().to_owned(),
+            "unhosted-quota".parse()?,
+        );
+        let quota = QuotaCache::new(None, None);
+        // The hosted space has no limit, so its unauthorized response is the
+        // node's pre-existing one; only the unhosted target is quota-limited.
+        quota.set_limit(&unhosted, 1024).await;
+
+        let mut requests = Vec::new();
+        for multipart in [false, true] {
+            for (label, space) in [("hosted", &hosted), ("unhosted", &unhosted)] {
+                for auth in ["allowed", "denied"] {
+                    setup.resource = space.clone().to_resource(
+                        "kv".parse::<Service>()?,
+                        Some(auth.parse::<AuthPath>()?),
+                        None,
+                        None,
+                    );
+                    if auth == "allowed" && !multipart {
+                        abilities::ActiveModel {
+                            delegation: Set(setup.parent_cid.into()),
+                            resource: Set(Resource::TinyCloud(setup.resource.clone())),
+                            ability: Set(
+                                Ability::try_from("tinycloud.kv/put".to_string()).unwrap()
+                            ),
+                            caveats: Set(Caveats(Default::default())),
+                        }
+                        .insert(&setup.replay_db)
+                        .await?;
+                    }
+                    let nonce = format!("tc2389-{multipart}-{label}-{auth}");
+                    requests.push((
+                        multipart,
+                        label,
+                        auth,
+                        sql_invocation_header(&setup, "tinycloud.kv/put", &nonce)?,
+                    ));
+                }
+            }
+        }
+        let client = Client::tracked(metered_sql_rocket_with_quota(setup, quota)).await?;
+
+        let mut denied = Vec::new();
+        for (multipart, label, auth, header) in requests {
+            let mut request = client
+                .post("/invoke")
+                .header(Header::new("Authorization", header));
+            request = if multipart {
+                request
+                    .header(
+                        ContentType::parse_flexible("multipart/form-data; boundary=tc2389")
+                            .expect("valid multipart content type"),
+                    )
+                    .body(format!(
+                        "--tc2389\r\nContent-Disposition: form-data; name=\"{auth}\"\r\n\r\none body\r\n--tc2389--\r\n"
+                    ))
+            } else {
+                request.body("one body")
+            };
+            let response = request.dispatch().await;
+            let status = response.status();
+            let body = response.into_string().await.unwrap_or_default();
+            match (label, auth) {
+                ("hosted", "allowed") => {
+                    // Authorization passed and the hosted space cleared the
+                    // quota check. The harness block store has no directory
+                    // for the hosted space, so the staged write then fails
+                    // with a filesystem error; that is the known
+                    // post-authorization outcome pinned here.
+                    assert!(
+                        body.contains("No such file or directory")
+                            && !body.contains("Unauthorized Action"),
+                        "hosted+authorized (multipart={multipart}): {status} {body}"
+                    )
+                }
+                ("unhosted", "allowed") => assert_eq!(
+                    status,
+                    Status::NotFound,
+                    "unhosted+authorized (multipart={multipart}): {body}"
+                ),
+                _ => denied.push((multipart, label, status, body)),
+            }
+        }
+        assert_eq!(denied.len(), 4);
+        // The message echoes only the caller's own requested resource, so
+        // compare it with the space name masked.
+        let masked = |body: &str, space: &tinycloud_auth::resource::SpaceId| {
+            body.replace(&space.to_string(), "<space>")
+        };
+        for pair in denied.chunks(2) {
+            let [(_, _, hosted_status, hosted_body), (_, _, unhosted_status, unhosted_body)] = pair
+            else {
+                unreachable!()
+            };
+            assert_eq!(*hosted_status, Status::Unauthorized, "{denied:?}");
+            assert_eq!(hosted_status, unhosted_status, "{denied:?}");
+            assert_eq!(
+                masked(hosted_body, &hosted),
+                masked(unhosted_body, &unhosted),
+                "{denied:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tc2389_unauthorized_kv_put_response_is_independent_of_hosting() -> Result<()> {
+        use rocket::http::{ContentType, Header};
+        use rocket::local::asynchronous::Client;
+        use tinycloud_core::{
+            models::space as space_model,
+            sea_orm::{ActiveModelTrait, ActiveValue::Set},
+            types::SpaceIdWrap,
+        };
+
+        let mut setup = metered_sql_http_setup("tc2389-same-target").await?;
+        let target = tinycloud_auth::resource::SpaceId::new(
+            setup.space.did().to_owned(),
+            "toggled-quota".parse()?,
+        );
+        let quota = QuotaCache::new(None, None);
+        quota.set_limit(&target, 1024).await;
+        setup.resource = target.clone().to_resource(
+            "kv".parse::<Service>()?,
+            Some("denied".parse::<AuthPath>()?),
+            None,
+            None,
+        );
+        // The same signed invocation is sent in both states; a refused
+        // invocation does not consume its nonce.
+        let header = sql_invocation_header(&setup, "tinycloud.kv/put", "tc2389-same-target")?;
+        let db = setup.replay_db.clone();
+        let client = Client::tracked(metered_sql_rocket_with_quota(setup, quota)).await?;
+
+        let send = |multipart: bool| {
+            let request = client
+                .post("/invoke")
+                .header(Header::new("Authorization", header.clone()));
+            let request = if multipart {
+                request
+                    .header(
+                        ContentType::parse_flexible("multipart/form-data; boundary=tc2389")
+                            .expect("valid multipart content type"),
+                    )
+                    .body(
+                        "--tc2389\r\nContent-Disposition: form-data; name=\"denied\"\r\n\r\none body\r\n--tc2389--\r\n",
+                    )
+            } else {
+                request.body("one body")
+            };
+            async move {
+                let response = request.dispatch().await;
+                let status = response.status();
+                let content_type = response.content_type();
+                let body = response.into_string().await.unwrap_or_default();
+                (status, content_type, body)
+            }
+        };
+
+        let unhosted = [send(false).await, send(true).await];
+        space_model::ActiveModel {
+            id: Set(SpaceIdWrap(target.clone())),
+        }
+        .insert(&db)
+        .await?;
+        let hosted = [send(false).await, send(true).await];
+
+        assert_eq!(
+            unhosted[0].0,
+            rocket::http::Status::Unauthorized,
+            "{unhosted:?}"
+        );
+        assert_eq!(unhosted, hosted, "response must not depend on hosting");
         Ok(())
     }
 
