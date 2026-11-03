@@ -59,6 +59,11 @@ has a JSON body `{"code": ..., "error": ...}`. `code` is `delegation_revoked` (t
 grant itself), `parent_revoked` (its direct parent) or `ancestor_revoked` (a
 higher ancestor); `error` keeps the text, such as `delegation-revoked: <cid>`.
 Switch on `code`, not on the text.
+An exact repeat of a `/delegate` request for a CID already stored is an
+idempotent acknowledgement, not a new grant. It can return `200` with empty
+`activated` and `skipped` lists even after revocation; it does not reactivate
+the delegation, and subsequent use still fails with the applicable revocation
+code.
 
 After a generic revocation of a root, `GET /policy/v3/status/<root>` returns
 `state: revoked` over the last signed checkpoint, whose own `state` stays
