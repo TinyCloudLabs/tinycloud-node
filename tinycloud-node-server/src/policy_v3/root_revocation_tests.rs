@@ -58,7 +58,8 @@ async fn assert_root_revoked_cascade(h: &Harness, admitted: &Admitted) -> anyhow
     // check, so a revoked root surfaces as the core ancestor revocation.
     let (status, body) = h.decrypt(&admitted.session).await?;
     assert_eq!(status, Status::Unauthorized, "{body}");
-    assert!(body.starts_with("delegation-ancestor-revoked"), "{body}");
+    // The session's direct parent is the revoked root.
+    assert_eq!(revocation_code(&body), "parent_revoked", "{body}");
     assert_eq!(
         h.read_as(&admitted.reader, admitted.child).await?,
         (Status::Forbidden, ROOT_REVOKED.to_owned())
@@ -110,12 +111,28 @@ async fn the_space_owner_wallet_revokes_an_agent_signed_root(
         return Ok(());
     };
     let admitted = admitted(&h).await?;
-    assert_no_hook_ticket(&h, &admitted, "Unauthorized Action").await?;
+    assert_no_hook_ticket(&h, &admitted, Refusal::Text("Unauthorized Action")).await?;
     h.revoke(&h.space_owner, &admitted.policy.policy_root_cid)
         .await?;
     assert_root_revoked_cascade(&h, &admitted).await?;
     // Now the chain check refuses it first.
-    assert_no_hook_ticket(&h, &admitted, "delegation-ancestor-revoked").await
+    assert_no_hook_ticket(&h, &admitted, Refusal::Revoked("parent_revoked")).await
+}
+
+/// Why a hook ticket is refused with a 401.
+enum Refusal {
+    /// Plain text starting with this.
+    Text(&'static str),
+    /// A revocation: the JSON body carries this `code`.
+    Revoked(&'static str),
+}
+
+/// The `code` of a revocation refusal body, empty if it has none.
+fn revocation_code(body: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|body| body["code"].as_str().map(str::to_owned))
+        .unwrap_or_default()
 }
 
 /// Policy sessions hold only kv and decrypt, so a hook ticket over one is
@@ -124,13 +141,16 @@ async fn the_space_owner_wallet_revokes_an_agent_signed_root(
 async fn assert_no_hook_ticket(
     h: &Harness,
     admitted: &Admitted,
-    refusal: &str,
+    refusal: Refusal,
 ) -> anyhow::Result<()> {
     let (status, body) = h
         .hook_ticket(&[session_cid(&admitted.session)?.to_string()])
         .await?;
     assert_eq!(status, Status::Unauthorized, "{body}");
-    assert!(body.starts_with(refusal), "{body}");
+    match refusal {
+        Refusal::Text(text) => assert!(body.starts_with(text), "{body}"),
+        Refusal::Revoked(code) => assert_eq!(revocation_code(&body), code, "{body}"),
+    }
     Ok(())
 }
 on_both_backends!(the_space_owner_wallet_revokes_an_agent_signed_root);

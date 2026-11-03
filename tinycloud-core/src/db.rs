@@ -908,20 +908,44 @@ where
 
     /// Check the persisted revocation state for cited delegations and every
     /// ancestor, without re-admitting the invocation that minted a ticket.
-    pub async fn delegation_chains_unrevoked(&self, roots: &[Cid]) -> Result<bool, DbErr> {
+    /// `None` when none is revoked; otherwise the stable code of the most
+    /// specific revocation: a cited delegation itself, else a direct parent of
+    /// one, else a higher ancestor (TC-2381).
+    pub async fn delegation_chains_revocation(
+        &self,
+        roots: &[Cid],
+    ) -> Result<Option<revocation::RevocationCode>, DbErr> {
+        use revocation::RevocationCode;
         let roots = roots.iter().copied().map(Hash::from).collect::<Vec<_>>();
         if roots.is_empty() {
-            return Ok(true);
+            return Ok(None);
         }
+        // The shared traversal budget covers every cited root together.
         let chain_ids = revocation::ancestor_chain_ids_for_roots(&self.conn, &roots)
             .await
             .map_err(|error| DbErr::Custom(error.to_string()))?;
+        let parents = parent_delegations::Entity::find()
+            .filter(parent_delegations::Column::Child.is_in(roots.iter().copied()))
+            .all(&self.conn)
+            .await?
+            .into_iter()
+            .map(|link| link.parent)
+            .collect::<HashSet<_>>();
+        let mut found = None;
         for id in chain_ids {
-            if revocation::is_revoked(&self.conn, &id).await? {
-                return Ok(false);
+            if !revocation::is_revoked(&self.conn, &id).await? {
+                continue;
+            }
+            if roots.contains(&id) {
+                return Ok(Some(RevocationCode::DelegationRevoked));
+            }
+            if parents.contains(&id) {
+                found = Some(RevocationCode::ParentRevoked);
+            } else if found.is_none() {
+                found = Some(RevocationCode::AncestorRevoked);
             }
         }
-        Ok(true)
+        Ok(found)
     }
 
     /// Load and reparse a delegation from its exact signed Authorization
@@ -2203,20 +2227,9 @@ where
             return Ok(None);
         }
 
-        if revocation::is_revoked(&self.conn, &target).await? {
-            return Ok(Some(DelegationStatus::Revoked));
-        }
-        match revocation::first_revoked_ancestor(&self.conn, &delegation.id).await {
-            Ok(Some(_)) => return Ok(Some(DelegationStatus::Revoked)),
-            Ok(None) => {}
-            Err(revocation::ChainTraversalError::LimitExceeded) => {
-                return Ok(Some(DelegationStatus::Unavailable));
-            }
-            Err(revocation::ChainTraversalError::Db(error)) => return Err(error.into()),
-        }
-        // TC-2381: a Policy/v3 root revoked over `RootRevocation/v1` is
-        // recorded in `policy_v3_root`, not in the generic table.
-        match revocation::policy_root_revoked(&self.conn, &target, &delegation.id).await {
+        // One read joins the generic revocation table (with its CID aliases)
+        // and `policy_v3_root` over the target and its whole ancestor chain.
+        match revocation::chain_revoked(&self.conn, &target, &delegation.id).await {
             Ok(true) => return Ok(Some(DelegationStatus::Revoked)),
             Ok(false) => {}
             Err(revocation::ChainTraversalError::LimitExceeded) => {

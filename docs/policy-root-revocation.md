@@ -53,8 +53,9 @@ owner listing where the node offers it. The status reads both the generic
 revocation record and the policy root record, so a root revoked over either
 route, and its descendants, report `revoked`.
 
-On `/invoke` and `/delegate`, a `401` refusal caused by a revocation has a JSON
-body `{"code": ..., "error": ...}`. `code` is `delegation_revoked` (the cited
+On `/invoke`, `/delegate`, `/signed/kv`, the encryption network and key routes
+(including decrypt) and the hooks routes, a `401` refusal caused by a revocation
+has a JSON body `{"code": ..., "error": ...}`. `code` is `delegation_revoked` (the cited
 grant itself), `parent_revoked` (its direct parent) or `ancestor_revoked` (a
 higher ancestor); `error` keeps the text, such as `delegation-revoked: <cid>`.
 Switch on `code`, not on the text.

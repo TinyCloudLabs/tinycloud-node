@@ -219,54 +219,90 @@ pub(crate) async fn first_revoked_ancestor<C: ConnectionTrait>(
     Ok(None)
 }
 
-/// Whether `target`, `start` or any ancestor of `start` (under every persisted
-/// equivalent CID) is a Policy/v3 root that has been revoked in
-/// `policy_v3_root` (TC-2381).
+/// Whether `target`, `start` or any ancestor of `start` is revoked, in either
+/// store, read in one statement (TC-2381).
 ///
-/// The `RootRevocation/v1` route records a root revocation only there, not
-/// in the generic `revocation` table, so the generic checks alone report the
-/// root and its descendants active. A root counts as revoked when the server
-/// would refuse it as `root-revoked`: `revoked_at` or `revocation_bytes` set.
-pub(crate) async fn policy_root_revoked<C: ConnectionTrait>(
+/// A delegation is revoked by a row in the generic `revocation` table (under
+/// every persisted equivalent CID, as in [`is_revoked`]) or, for a Policy/v3
+/// root, by `policy_v3_root.revoked_at` / `revocation_bytes`. The
+/// `RootRevocation/v1` route writes only the latter, so the generic table alone
+/// reports such a root and its descendants active. A root counts as revoked
+/// when the server would refuse it as `root-revoked`.
+///
+/// `policy_v3_root.root_cid` is the text CID of the root's content hash, which
+/// SQL cannot derive from the binary hashes of the alias table, so the policy
+/// side matches the CIDs of the chain and `target` themselves; a root is keyed
+/// by that CID, and `target` is the CID a caller names.
+///
+/// A chain past the traversal budget still reports a revoked `target` as
+/// revoked and is otherwise [`ChainTraversalError::LimitExceeded`].
+pub(crate) async fn chain_revoked<C: ConnectionTrait>(
     db: &C,
     target: &Hash,
     start: &Hash,
 ) -> Result<bool, ChainTraversalError> {
-    use delegation_cid_alias::{Column as AliasColumn, Entity as AliasEntity};
-    let mut ids = ancestor_chain_ids(db, start).await?;
+    let mut ids = match ancestor_chain_ids(db, start).await {
+        Ok(ids) => ids,
+        Err(ChainTraversalError::LimitExceeded) => {
+            return if any_revoked(db, &[*target]).await? {
+                Ok(true)
+            } else {
+                Err(ChainTraversalError::LimitExceeded)
+            };
+        }
+        Err(error) => return Err(error),
+    };
     ids.push(*target);
     ids.sort_by(|left, right| left.as_ref().cmp(right.as_ref()));
     ids.dedup();
+    Ok(any_revoked(db, &ids).await?)
+}
 
-    let canonicals = AliasEntity::find()
-        .filter(AliasColumn::Id.is_in(ids.iter().copied()))
-        .all(db)
-        .await?
-        .into_iter()
-        .map(|alias| alias.canonical);
-    let mut names = ids.clone();
-    names.extend(canonicals);
-    let equivalents = AliasEntity::find()
-        .filter(AliasColumn::Canonical.is_in(names.iter().copied()))
-        .all(db)
-        .await?
-        .into_iter()
-        .map(|alias| alias.id);
-    names.extend(equivalents);
-    names.sort_by(|left, right| left.as_ref().cmp(right.as_ref()));
-    names.dedup();
-
-    Ok(policy_v3_root::Entity::find()
-        .filter(
-            policy_v3_root::Column::RootCid
-                .is_in(names.iter().map(|id| id.to_cid(0x55).to_string())),
-        )
-        .filter(
+/// One `SELECT 1 WHERE EXISTS(generic) OR EXISTS(policy root)` over `ids`.
+async fn any_revoked<C: ConnectionTrait>(db: &C, ids: &[Hash]) -> Result<bool, DbErr> {
+    use delegation_cid_alias::{Column as AliasColumn, Entity as AliasEntity};
+    let canonical = Query::select()
+        .column(AliasColumn::Canonical)
+        .from(AliasEntity)
+        .cond_where(
             Condition::any()
-                .add(policy_v3_root::Column::RevokedAt.is_not_null())
-                .add(policy_v3_root::Column::RevocationBytes.is_not_null()),
+                .add(Expr::col(AliasColumn::Id).is_in(ids.iter().copied()))
+                .add(Expr::col(AliasColumn::Canonical).is_in(ids.iter().copied())),
         )
-        .one(db)
+        .to_owned();
+    let equivalents = Query::select()
+        .column(AliasColumn::Id)
+        .from(AliasEntity)
+        .and_where(Expr::col(AliasColumn::Canonical).in_subquery(canonical))
+        .to_owned();
+    let generic = Query::select()
+        .expr(Expr::value(1))
+        .from(Entity)
+        .cond_where(
+            Condition::any()
+                .add(Expr::col((Entity, Column::Revoked)).is_in(ids.iter().copied()))
+                .add(Expr::col((Entity, Column::Revoked)).in_subquery(equivalents)),
+        )
+        .to_owned();
+    let policy = Query::select()
+        .expr(Expr::value(1))
+        .from(policy_v3_root::Entity)
+        .and_where(
+            Expr::col(policy_v3_root::Column::RootCid)
+                .is_in(ids.iter().map(|id| id.to_cid(0x55).to_string())),
+        )
+        .cond_where(
+            Condition::any()
+                .add(Expr::col(policy_v3_root::Column::RevokedAt).is_not_null())
+                .add(Expr::col(policy_v3_root::Column::RevocationBytes).is_not_null()),
+        )
+        .to_owned();
+    let statement = Query::select()
+        .expr(Expr::value(1))
+        .cond_where(Expr::exists(generic).or(Expr::exists(policy)))
+        .to_owned();
+    Ok(db
+        .query_one(db.get_database_backend().build(&statement))
         .await?
         .is_some())
 }

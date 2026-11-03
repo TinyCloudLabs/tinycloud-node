@@ -481,7 +481,7 @@ pub async fn create_signed_kv_url(
     runtime: &State<SignedUrlRuntime>,
     tinycloud: &State<TinyCloud>,
     policy_v3: &State<crate::policy_v3::PolicyV3Runtime>,
-) -> Result<Json<SignedKvUrlResponse>, (Status, String)> {
+) -> Result<Json<SignedKvUrlResponse>, InvokeError> {
     let invocation_info = invocation.0 .0.clone();
     verify_auth("server.signed_kv.auth", invocation.0, tinycloud).await?;
     // Same policy gate as `/invoke`. A policy-session invocation lives at most
@@ -4335,22 +4335,28 @@ async fn verify_auth(
     span: &'static str,
     invocation: Invocation,
     tinycloud: &State<TinyCloud>,
-) -> Result<TransactResult, (Status, String)> {
+) -> Result<TransactResult, InvokeError> {
     let start = Instant::now();
     let result = tinycloud
         .invoke::<BlockStage>(invocation, HashMap::new())
         .await
         // Authorization records only the invocation; the operation it
         // authorizes has not run, so a database failure here is retryable.
-        .map_err(|e| match &e {
-            TxStoreError::Tx(TxError::Db(error) | TxError::EpochInsert(error)) => {
-                database_failure(auth_service(span), error, false, e.to_string())
+        .map_err(|e| {
+            if let Some(code) = e.revocation_code() {
+                return InvokeError::Revoked(code, e.to_string());
             }
-            TxStoreError::Tx(TxError::ReadAudit(error)) => {
-                read_audit_failure(auth_service(span), error)
+            match &e {
+                TxStoreError::Tx(TxError::Db(error) | TxError::EpochInsert(error)) => {
+                    database_failure(auth_service(span), error, false, e.to_string())
+                }
+                TxStoreError::Tx(TxError::ReadAudit(error)) => {
+                    read_audit_failure(auth_service(span), error)
+                }
+                TxStoreError::Tx(TxError::SpaceNotFound) => (Status::NotFound, e.to_string()),
+                _ => (Status::Unauthorized, e.to_string()),
             }
-            TxStoreError::Tx(TxError::SpaceNotFound) => (Status::NotFound, e.to_string()),
-            _ => (Status::Unauthorized, e.to_string()),
+            .into()
         })
         .map(|(tx_result, _)| tx_result);
     crate::prometheus::observe_span(
@@ -6032,10 +6038,8 @@ mod tests {
             Status::Unauthorized,
             "revoked delegation must block subsequent native read: {body}"
         );
-        assert!(
-            body.contains("delegation-revoked"),
-            "expected delegation-revoked error body, got {body}"
-        );
+        let json: serde_json::Value = serde_json::from_str(&body)?;
+        assert_eq!(json["code"], "delegation_revoked", "{body}");
 
         Ok(())
     }
@@ -7010,10 +7014,8 @@ mod tests {
             Status::Unauthorized,
             "active cutoff must block subsequent native read: {body}"
         );
-        assert!(
-            body.contains("delegation-revoked"),
-            "expected delegation-revoked error body, got {body}"
-        );
+        let json: serde_json::Value = serde_json::from_str(&body)?;
+        assert_eq!(json["code"], "delegation_revoked", "{body}");
 
         Ok(())
     }
@@ -14174,7 +14176,7 @@ mod tests {
         fixture.revoke("tc732-revoke-device", grant).await?;
         let reply = fixture.sync("notes/", grant, &[]).await?;
         assert_eq!(reply.status, Status::Unauthorized, "{}", reply.body);
-        assert!(reply.body.contains("delegation-revoked"), "{}", reply.body);
+        assert_eq!(reply.json["code"], "delegation_revoked", "{}", reply.body);
         Ok(())
     }
 

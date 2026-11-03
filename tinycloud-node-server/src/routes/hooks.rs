@@ -1,3 +1,4 @@
+use super::InvokeError;
 use crate::{
     authorization::AuthHeaderGetter,
     config::Config,
@@ -91,13 +92,14 @@ async fn authorize_hook_request(
     tinycloud: &TinyCloud,
     policy_v3: &PolicyV3Runtime,
     config: &Config,
-) -> Result<VerifiedHookInvocation, (Status, String)> {
+) -> Result<VerifiedHookInvocation, InvokeError> {
     let capabilities = &invocation.0.capabilities;
     if capabilities.is_empty() || !capabilities.iter().all(is_hook_capability) {
         return Err((
             Status::Forbidden,
             "hooks requests may only invoke tinycloud.hooks capabilities".to_string(),
-        ));
+        )
+            .into());
     }
     let now = OffsetDateTime::now_utc();
     let start = Instant::now();
@@ -123,7 +125,7 @@ async fn authorize_admitted(
     tinycloud: &TinyCloud,
     config: &Config,
     now: OffsetDateTime,
-) -> Result<AdmittedInvocation, (Status, String)> {
+) -> Result<AdmittedInvocation, InvokeError> {
     let admitted = AdmittedInvocation::admit(invocation, config.invocation.max_lifetime_secs)
         .await
         .map_err(|error| (Status::Unauthorized, error.to_string()))?;
@@ -133,7 +135,10 @@ async fn authorize_admitted(
     tinycloud
         .authorize_admitted(&admitted, now)
         .await
-        .map_err(|error| (Status::Unauthorized, error.to_string()))?;
+        .map_err(|error| match error.revocation_code() {
+            Some(code) => InvokeError::Revoked(code, error.to_string()),
+            None => (Status::Unauthorized, error.to_string()).into(),
+        })?;
     Ok(admitted)
 }
 
@@ -156,7 +161,7 @@ pub async fn create_hook_ticket(
     policy_v3: &State<PolicyV3Runtime>,
     replay: &State<InvocationReplayCache>,
     config: &State<Config>,
-) -> Result<Json<HookTicketResponse>, (Status, String)> {
+) -> Result<Json<HookTicketResponse>, InvokeError> {
     let invocation = authorize_hook_request(
         "server.hooks.ticket.auth",
         invocation.0,
@@ -321,7 +326,7 @@ pub async fn hook_events<'r>(
     ticket: &'r str,
     hooks: &'r State<HookRuntime>,
     tinycloud: &'r State<TinyCloud>,
-) -> Result<HookEventStream<EventStream![Event + 'r]>, (Status, String)> {
+) -> Result<HookEventStream<EventStream![Event + 'r]>, InvokeError> {
     let claims = hooks
         .verify_ticket(ticket)
         .map_err(|e| (Status::Unauthorized, e))?;
@@ -330,26 +335,33 @@ pub async fn hook_events<'r>(
             tinycloud_core::request_telemetry::observe_space(&space);
         }
     }
+    let revoked = std::sync::Mutex::new(None);
     let stream_deadline = hook_stream_deadline(
         &claims,
         hooks.config().max_ticket_ttl_seconds,
         || async {
-            if tinycloud
-                .delegation_chains_unrevoked(&claims.authorizing_delegations)
+            match tinycloud
+                .delegation_chains_revocation(&claims.authorizing_delegations)
                 .await
                 .map_err(|error| (Status::InternalServerError, error.to_string()))?
             {
-                Ok(())
-            } else {
-                Err((
-                    Status::Unauthorized,
-                    "hook ticket authority revoked".to_string(),
-                ))
+                None => Ok(()),
+                Some(code) => {
+                    *revoked.lock().unwrap() = Some(code);
+                    Err((
+                        Status::Unauthorized,
+                        "hook ticket authority revoked".to_string(),
+                    ))
+                }
             }
         },
         OffsetDateTime::now_utc,
     )
-    .await?;
+    .await
+    .map_err(|(status, message)| match *revoked.lock().unwrap() {
+        Some(code) => InvokeError::Revoked(code, message),
+        None => InvokeError::Text(status, message),
+    })?;
     let lease = hooks
         .try_acquire_stream()
         .map_err(|e| (Status::TooManyRequests, e))?;
@@ -446,7 +458,7 @@ pub async fn create_webhook(
     replay: &State<InvocationReplayCache>,
     config: &State<Config>,
     egress: &State<std::sync::Arc<EgressPolicy>>,
-) -> Result<Json<HookWebhookResponse>, (Status, String)> {
+) -> Result<Json<HookWebhookResponse>, InvokeError> {
     let invocation = authorize_hook_request(
         "server.hooks.webhook_register.auth",
         invocation.0,
@@ -460,7 +472,8 @@ pub async fn create_webhook(
         return Err((
             Status::Forbidden,
             "webhook scope is not authorized".to_string(),
-        ));
+        )
+            .into());
     }
     // Resolve the callback host only for an authorized caller.
     let (callback_url, _) = validate_webhook_callback_url(&request.callback_url, egress)
@@ -475,7 +488,8 @@ pub async fn create_webhook(
         return Err((
             Status::TooManyRequests,
             "webhook subscription limit reached for space".to_string(),
-        ));
+        )
+            .into());
     }
     invocation.consume(replay, config).await?;
 
@@ -506,7 +520,7 @@ pub async fn create_webhook(
         .await
         .map_err(|e| (Status::InternalServerError, e.to_string()))?;
 
-    webhook_response_from_model(&saved).map(Json)
+    Ok(webhook_response_from_model(&saved).map(Json)?)
 }
 
 #[get("/hooks/webhooks?<query..>")]
@@ -517,7 +531,7 @@ pub async fn list_webhooks(
     policy_v3: &State<PolicyV3Runtime>,
     replay: &State<InvocationReplayCache>,
     config: &State<Config>,
-) -> Result<Json<Vec<HookWebhookResponse>>, (Status, String)> {
+) -> Result<Json<Vec<HookWebhookResponse>>, InvokeError> {
     let invocation = authorize_hook_request(
         "server.hooks.webhook_list.auth",
         invocation.0,
@@ -539,7 +553,8 @@ pub async fn list_webhooks(
         return Err((
             Status::Forbidden,
             "webhook scope is not authorized".to_string(),
-        ));
+        )
+            .into());
     }
     invocation.consume(replay, config).await?;
 
@@ -572,6 +587,7 @@ pub async fn list_webhooks(
         .map(|row| webhook_response_from_model(&row))
         .collect::<Result<Vec<_>, _>>()
         .map(Json)
+        .map_err(InvokeError::from)
 }
 
 #[delete("/hooks/webhooks/<subscription_id>")]
@@ -582,7 +598,7 @@ pub async fn delete_webhook(
     policy_v3: &State<PolicyV3Runtime>,
     replay: &State<InvocationReplayCache>,
     config: &State<Config>,
-) -> Result<Status, (Status, String)> {
+) -> Result<Status, InvokeError> {
     // Authenticate before the lookup so an unauthenticated caller cannot probe
     // which subscription ids exist.
     let invocation = authorize_hook_request(
@@ -616,7 +632,7 @@ pub async fn delete_webhook(
             .map_err(|e| (Status::InternalServerError, e.to_string()))?,
     };
     if !is_hook_action_authorized(&invocation, &requested_scope, "tinycloud.hooks/unregister") {
-        return Err(not_found());
+        return Err(not_found().into());
     }
     invocation.consume(replay, config).await?;
 
@@ -2952,6 +2968,8 @@ mod tests {
             )
             .await;
         assert_eq!(status, Status::Unauthorized, "{body}");
+        let body: serde_json::Value = serde_json::from_str(&body)?;
+        assert_eq!(body["code"], "delegation_revoked");
         Ok(())
     }
 
@@ -3014,10 +3032,9 @@ mod tests {
             .dispatch()
             .await;
         assert_eq!(response.status(), Status::Unauthorized);
-        assert_eq!(
-            response.into_string().await.as_deref(),
-            Some("hook ticket authority revoked")
-        );
+        let body: serde_json::Value =
+            serde_json::from_str(&response.into_string().await.unwrap_or_default())?;
+        assert_eq!(body["code"], "delegation_revoked");
         Ok(())
     }
 
@@ -3137,10 +3154,9 @@ mod tests {
             .dispatch()
             .await;
         assert_eq!(response.status(), Status::Unauthorized);
-        assert_eq!(
-            response.into_string().await.as_deref(),
-            Some("hook ticket authority revoked")
-        );
+        let body: serde_json::Value =
+            serde_json::from_str(&response.into_string().await.unwrap_or_default())?;
+        assert_eq!(body["code"], "parent_revoked");
         Ok(())
     }
 
@@ -3353,5 +3369,74 @@ mod tests {
         ids.sort_unstable();
         assert_eq!(ids, ["exact", "nested"]);
         Ok(())
+    }
+
+    /// TC-2381: a revoked grant is refused on every hooks route with the
+    /// stable `delegation_revoked` code.
+    async fn revoke_session_proof(fixture: &HookRouteFixture) -> Result<()> {
+        use tinycloud_core::{
+            models::revocation,
+            sea_orm::{ActiveModelTrait, ActiveValue::Set},
+        };
+        revocation::ActiveModel {
+            id: Set(tinycloud_core::hash::hash(b"tc2381-revoke-hooks")),
+            revoker: Set(did_of(&fixture.owner.1).to_string()),
+            revoked: Set(Hash::from(fixture.session_proof)),
+            serialization: Set(b"tc2381-revoke-hooks".to_vec()),
+            revoked_at: Set(Some(OffsetDateTime::now_utc())),
+        }
+        .insert(&fixture.db)
+        .await?;
+        Ok(())
+    }
+
+    fn assert_delegation_revoked(status: Status, body: &str) -> Result<()> {
+        assert_eq!(status, Status::Unauthorized, "{body}");
+        let json: serde_json::Value = serde_json::from_str(body)?;
+        assert_eq!(json["code"], "delegation_revoked", "{body}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn webhook_register_under_a_revoked_grant_is_delegation_revoked() -> Result<()> {
+        let fixture =
+            hook_route_fixture(&[("hooks", "kv/documents", "tinycloud.hooks/register")]).await?;
+        let claim = [(
+            fixture.hooks("kv/documents")?,
+            &["tinycloud.hooks/register"][..],
+        )];
+        revoke_session_proof(&fixture).await?;
+        let (status, body) = fixture
+            .register(fixture.session_header(&claim)?, &fixture.space)
+            .await;
+        assert_delegation_revoked(status, &body)
+    }
+
+    #[tokio::test]
+    async fn webhook_list_under_a_revoked_grant_is_delegation_revoked() -> Result<()> {
+        let fixture =
+            hook_route_fixture(&[("hooks", "kv/documents", "tinycloud.hooks/list")]).await?;
+        let claim = [(
+            fixture.hooks("kv/documents")?,
+            &["tinycloud.hooks/list"][..],
+        )];
+        revoke_session_proof(&fixture).await?;
+        let (status, body) = fixture.list(fixture.session_header(&claim)?).await;
+        assert_delegation_revoked(status, &body)
+    }
+
+    #[tokio::test]
+    async fn webhook_unregister_under_a_revoked_grant_is_delegation_revoked() -> Result<()> {
+        let fixture =
+            hook_route_fixture(&[("hooks", "kv/documents", "tinycloud.hooks/unregister")]).await?;
+        let claim = [(
+            fixture.hooks("kv/documents")?,
+            &["tinycloud.hooks/unregister"][..],
+        )];
+        revoke_session_proof(&fixture).await?;
+        let (status, body) = fixture
+            .unregister(fixture.session_header(&claim)?, "some-subscription")
+            .await;
+        assert_delegation_revoked(status, &body)
     }
 }

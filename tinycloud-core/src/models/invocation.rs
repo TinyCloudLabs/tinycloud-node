@@ -70,6 +70,16 @@ pub enum Error {
     InvalidInvocation(#[from] InvocationError),
 }
 
+impl Error {
+    /// The stable code of a revocation refusal, `None` for any other error.
+    pub fn revocation_code(&self) -> Option<super::revocation::RevocationCode> {
+        match self {
+            Self::InvalidInvocation(error) => error.revocation_code(),
+            Self::Db(_) => None,
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum InvocationError {
     #[error("Invocation expired or not yet valid")]
