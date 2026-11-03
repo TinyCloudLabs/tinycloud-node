@@ -874,7 +874,6 @@ jobs:
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
               output.write(f'n0_configuration_verified={str(n0_configuration).lower()}\n')
               output.write(f'rollback_pre_n0_verified={str(rollback).lower()}\n')
-              output.write(f'rollback_release_verified={str(release_rollback).lower()}\n')
           if rollback:
               message = f'Rollback privacy: {mode}; no deletion of existing log files is requested.'
               print(message)
