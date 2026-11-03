@@ -86,6 +86,18 @@ def step_enabled(name, context):
         return context["job.success"]
     return enabled(condition, context)
 
+def input_env_for_step(name, inputs):
+    block = SOURCE.split("      - name: " + name + "\n", 1)[1].split("\n      - name:", 1)[0]
+    if "        env:\n" not in block:
+        return {}
+    env_block = block.split("        env:\n", 1)[1].split("\n        run:", 1)[0]
+    return {
+        match[1]: inputs.get(match[2], "")
+        for match in re.finditer(r"(?m)^          ([A-Z0-9_]+): \$\{\{ inputs\.([a-z0-9_]+) \}\}$", env_block)
+    }
+
+
+
 
 CLI = r'''#!/usr/bin/env python3
 import json, os, sys
@@ -221,7 +233,9 @@ class RecoveryTests(unittest.TestCase):
                    ref="refs/heads/main", oci_label=None, oci_revision=None, build_digest="", releases=RELEASED, running=REVISION, order=None):
         inputs = {"deploy_phala": "true", "authorize_quota_values": "true", "image_version": "1.20.6",
                   "deploy_image_digest": DIGEST, "rollback_image_version": "1.20.6", "rollback_image_revision": REVISION,
-                  "rollback_pre_n0": "false", "rollback_privacy_mode": "unselected", "sql_identity_fence": "false"}
+                  "rollback_pre_n0": "false", "rollback_privacy_mode": "unselected", "rollback_release": "false",
+                  "rollback_reason": "", "allow_non_descendant": "false", "named_keys_v1": "false",
+                  "sql_identity_fence": "false"}
         inputs.update(changes or {})
         if missing_authorization:
             inputs.pop("authorize_quota_values", None)
@@ -304,6 +318,7 @@ class RecoveryTests(unittest.TestCase):
                     if name == "Restore storage quota overrides": context["steps.quotas.outcome"] = "skipped"
                     continue
                 env.update({"EXPECTED": selected.get("version", inputs["image_version"]), "IMAGE_REVISION": selected.get("revision", REVISION)})
+                env.update(input_env_for_step(name, inputs))
                 result = subprocess.run(["bash", "--noprofile", "--norc", "-e", "-c", script], cwd=root, env=env, capture_output=True, text=True)
                 logs += result.stdout + result.stderr
                 if name == "Restore storage quota overrides": context["steps.quotas.outcome"] = "success" if result.returncode == 0 else "failure"
@@ -452,6 +467,62 @@ class RecoveryTests(unittest.TestCase):
                 if not ok:
                     self.assertNotIn("cvm-deploy", result["events"])
                     self.assertEqual(result["compose"], N0)
+
+    def test_audited_n0_rollback_requires_reason_and_a_strictly_older_release(self):
+        releases = {"1.20.6": (REVISION, "1.20.6"), "1.21.0": (RELEASE_REVISION, "1.21.0")}
+        reason = "Incident: restore the last known-good node release"
+        prior = {"rollback_release": "true", "rollback_reason": reason, "image_version": "1.20.6",
+                 "deploy_image_digest": DIGEST, "rollback_image_version": "1.20.6",
+                 "rollback_image_revision": REVISION}
+        accepted = self.run_deploy(N0, prior, running=RELEASE_REVISION, releases=releases)
+        self.assertTrue(accepted["success"], accepted["logs"])
+        self.assertEqual(accepted["compose"], N0)
+        self.assertIn(f"version 1.20.6-dstack; revision {REVISION}", accepted["summary"])
+        self.assertIn(f"@{DIGEST}", accepted["summary"])
+        self.assertIn(reason, accepted["summary"])
+
+        unrelated_revision = "8" * 40
+        unrelated_releases = {**releases, "1.20.5": (unrelated_revision, "1.20.5")}
+        rejected_cases = (
+            ("missing reason", {**prior, "rollback_reason": ""}, RELEASE_REVISION, releases, ORDER,
+             "rollback_reason"),
+            ("multiline reason", {**prior, "rollback_reason": reason + "\nforged"}, RELEASE_REVISION, releases, ORDER,
+             "single-line ASCII reason"),
+            ("reason without rollback mode", {**prior, "rollback_release": "false",
+             "image_version": "1.21.0", "deploy_image_digest": RELEASE_DIGEST,
+             "rollback_image_version": "1.21.0", "rollback_image_revision": RELEASE_REVISION},
+             REVISION, releases, ORDER, "rollback_reason"),
+            ("pre-N0 rollback mode", {**prior, "rollback_pre_n0": "true"},
+             RELEASE_REVISION, releases, ORDER, "cannot use rollback_pre_n0"),
+            ("non-ancestor target", {**prior, "image_version": "1.21.0",
+             "deploy_image_digest": RELEASE_DIGEST, "rollback_image_version": "1.21.0",
+             "rollback_image_revision": RELEASE_REVISION},
+             REVISION, releases, ORDER, "older release"),
+            ("unrelated released image", {**prior, "image_version": "1.20.5",
+             "deploy_image_digest": "sha256:" + "d" * 64, "rollback_image_version": "1.20.5",
+             "rollback_image_revision": unrelated_revision},
+             RELEASE_REVISION, unrelated_releases, ORDER, "older release"),
+            ("unrecorded image", {**prior, "image_version": "1.20.5",
+             "deploy_image_digest": "sha256:" + "d" * 64, "rollback_image_version": "1.20.5",
+             "rollback_image_revision": unrelated_revision},
+             RELEASE_REVISION, releases, ORDER, "Rollback release tag mismatch"),
+            ("ancestry bypass", {**prior, "allow_non_descendant": "true"},
+             RELEASE_REVISION, releases, ORDER, "allow_non_descendant"),
+            ("missing digest", {**prior, "deploy_image_digest": ""},
+             RELEASE_REVISION, releases, ORDER, "digest"),
+        )
+        for name, changes, running, known_releases, order, message in rejected_cases:
+            with self.subTest(name=name):
+                refused = self.run_deploy(N0, changes, running=running, releases=known_releases, order=order)
+                self.assertFalse(refused["success"], refused["logs"])
+                self.assertNotIn("cvm-deploy", refused["events"])
+                self.assertEqual(refused["compose"], N0)
+                self.assertIn(message, refused["logs"])
+        not_n0 = self.run_deploy(PRE_N0_TEMPLATE, prior, running=RELEASE_REVISION, releases=releases)
+        self.assertFalse(not_n0["success"], not_n0["logs"])
+        self.assertIn("only for the reviewed N0 compose", not_n0["logs"])
+        self.assertNotIn("cvm-deploy", not_n0["events"])
+        self.assertEqual(not_n0["compose"], PRE_N0_TEMPLATE)
 
     def test_same_image_recovery_refuses_an_older_image_than_running(self):
         for compose in (PRE_N0_TEMPLATE, N0):
@@ -681,6 +752,7 @@ class RecoveryTests(unittest.TestCase):
     def test_documented_recovery_rollback_and_release_commands(self):
         text = (ROOT / "docs/releasing.md").read_text()
         for heading, count, compose in (("### Emergency same-image recovery (12c)", 1, CURRENT),
+                                        ("### Audited rollback to a prior N0 release", 1, N0),
                                         ("### TC-1302 captured pre-N0 rollback", 2, CURRENT),
                                         ("### Main release with N0 log shipping (one dispatch)", 1, N0)):
             self.assertTrue(heading in text, "Copy-paste recovery contract is missing")
@@ -694,10 +766,19 @@ class RecoveryTests(unittest.TestCase):
                 self.assertEqual(tokens[tokens.index("--ref") + 1], "main")
                 inputs = dict(tokens[index + 1].split("=", 1) for index, value in enumerate(tokens) if value == "-f")
                 mode = inputs.get("rollback_privacy_mode", "")
-                result = self.run_deploy(compose, inputs, approved_privacy=mode)
-                self.assertTrue(result["success"], "Documented command failed actual input validation")
+                rollback_args = {}
+                if heading == "### Audited rollback to a prior N0 release":
+                    rollback_args = {
+                        "releases": {"1.25.13": ("50b0986a969af818a658ec92461cce7007e3b0a1", "1.25.13"),
+                                     "1.25.17": (RELEASE_REVISION, "1.25.17")},
+                        "running": RELEASE_REVISION,
+                        "order": ["50b0986a969af818a658ec92461cce7007e3b0a1", RELEASE_REVISION],
+                    }
+                result = self.run_deploy(compose, inputs, approved_privacy=mode, **rollback_args)
+                self.assertTrue(result["success"], f"{heading}: {result['logs']}")
                 inputs.pop("authorize_quota_values")
-                denied = self.run_deploy(compose, inputs, missing_authorization=True, approved_privacy=mode)
+                denied = self.run_deploy(compose, inputs, missing_authorization=True,
+                                         approved_privacy=mode, **rollback_args)
                 self.assertFalse(denied["success"])
                 self.assertEqual(denied["events"], [])
 
