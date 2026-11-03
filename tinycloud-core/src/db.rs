@@ -372,7 +372,7 @@ pub enum TxError<S: StorageSetup, K: Secrets> {
     #[error(transparent)]
     InvalidDelegation(#[from] delegation::DelegationError),
     #[error(transparent)]
-    InvalidInvocation(#[from] invocation::InvocationError),
+    InvalidInvocation(invocation::InvocationError),
     #[error(transparent)]
     InvalidRevocation(#[from] revocation::RevocationError),
     #[error(transparent)]
@@ -4408,10 +4408,19 @@ impl<S: StorageSetup, K: Secrets> From<delegation::Error> for TxError<S, K> {
     }
 }
 
+impl<S: StorageSetup, K: Secrets> From<invocation::InvocationError> for TxError<S, K> {
+    fn from(error: invocation::InvocationError) -> Self {
+        match error {
+            invocation::InvocationError::Registry(error) => Self::Registry(error),
+            error => Self::InvalidInvocation(error),
+        }
+    }
+}
+
 impl<S: StorageSetup, K: Secrets> From<invocation::Error> for TxError<S, K> {
     fn from(e: invocation::Error) -> Self {
         match e {
-            invocation::Error::InvalidInvocation(e) => Self::InvalidInvocation(e),
+            invocation::Error::InvalidInvocation(e) => e.into(),
             invocation::Error::Db(e) => Self::Db(e),
         }
     }
@@ -4694,9 +4703,9 @@ pub(crate) async fn transact_verified<C: ConnectionTrait, S: StorageSetup, K: Se
     }
 
     // ── Atomic delegation registration ──────────────────────────────────────
-    // Register all delegations inside this transaction before any epoch rows
-    // are written. This is the authoritative New/Existing decision; the
-    // outcome determines which delegations participate in epoch construction.
+    // Verify and register signed bytes before any local activation effects.
+    // CID registration is global; registry admission can activate another
+    // space later without changing those bytes.
     let mut registered: HashMap<Hash, delegation::DelegationRegistration> = HashMap::new();
     for (hash, event) in &event_hashes {
         if let Event::Delegation(d) = event {
@@ -4742,9 +4751,37 @@ pub(crate) async fn transact_verified<C: ConnectionTrait, S: StorageSetup, K: Se
         }
     }
 
-    // Exclude Existing delegations from epoch construction: they were already
-    // registered in a prior committed transaction and must not create new
-    // epoch, epoch_order, or event_order rows.
+    let mut activated_delegations: HashMap<SpaceId, HashSet<Hash>> = HashMap::new();
+    if registry_spaces.is_some() && !event_spaces.is_empty() {
+        let retained: Vec<_> = registered
+            .values()
+            .filter_map(|registration| match registration {
+                delegation::DelegationRegistration::Existing(hash) => Some(*hash),
+                delegation::DelegationRegistration::New(_) => None,
+            })
+            .collect();
+        if !retained.is_empty() {
+            for (space, event) in event_order::Entity::find()
+                .select_only()
+                .columns([event_order::Column::Space, event_order::Column::Event])
+                .filter(event_order::Column::Event.is_in(retained))
+                .filter(
+                    event_order::Column::Space.is_in(event_spaces.keys().cloned().map(SpaceIdWrap)),
+                )
+                .into_tuple::<(SpaceIdWrap, Hash)>()
+                .all(db)
+                .await?
+            {
+                activated_delegations
+                    .entry(space.0)
+                    .or_default()
+                    .insert(event);
+            }
+        }
+    }
+
+    // An existing CID participates only in currently admitted spaces where
+    // it has never been activated. Repeated registration appends no epochs.
     let event_spaces: HashMap<SpaceId, Vec<&(Hash, Event)>> = event_spaces
         .into_iter()
         .filter_map(|(space, events)| {
@@ -4756,6 +4793,10 @@ pub(crate) async fn transact_verified<C: ConnectionTrait, S: StorageSetup, K: Se
                             registered.get(hash),
                             Some(delegation::DelegationRegistration::New(_))
                         )
+                        || (registry_spaces.is_some()
+                            && !activated_delegations
+                                .get(&space)
+                                .is_some_and(|events| events.contains(hash)))
                 })
                 .collect();
             if eligible.is_empty() {
@@ -4766,7 +4807,8 @@ pub(crate) async fn transact_verified<C: ConnectionTrait, S: StorageSetup, K: Se
         })
         .collect();
 
-    // Only New delegations may trigger new space row creation.
+    // Registry hosting may activate retained grants as membership expands.
+    // Unconfigured onboarding still requires a new explicit hosting grant.
     let mut new_spaces = event_hashes
         .iter()
         .filter_map(|(hash, e)| match e {
@@ -4774,14 +4816,19 @@ pub(crate) async fn transact_verified<C: ConnectionTrait, S: StorageSetup, K: Se
                 if matches!(
                     registered.get(hash),
                     Some(delegation::DelegationRegistration::New(_))
-                ) =>
+                ) || registry_spaces.is_some() =>
             {
                 Some(d.0.capabilities.iter().filter_map(|c| {
                     if let Some(served) = registry_spaces {
                         return c
                             .resource
                             .space()
-                            .filter(|space| served.contains(*space))
+                            .filter(|space| {
+                                served.contains(*space)
+                                    && !activated_delegations
+                                        .get(*space)
+                                        .is_some_and(|events| events.contains(hash))
+                            })
                             .cloned()
                             .map(SpaceIdWrap);
                     }

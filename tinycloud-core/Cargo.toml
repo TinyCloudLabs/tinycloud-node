@@ -89,7 +89,6 @@ unicode-normalization = "0.1"
 idna = "1"
 reqwest = { version = "0.11", features = ["json"] }
 bs58 = "0.5"
-ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 sea-orm = { version = "1.1", features = ["runtime-tokio-rustls", "sqlx-sqlite"] }

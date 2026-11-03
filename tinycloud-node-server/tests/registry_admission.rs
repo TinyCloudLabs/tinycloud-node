@@ -417,6 +417,84 @@ async fn mixed_grant_activates_only_data_member_and_encryption_grant_keeps_cid()
 }
 
 #[tokio::test]
+async fn retained_mixed_grant_activates_new_membership_once() -> Result<()> {
+    let registry = Registry::new().await?;
+    let node = Node::new(Some(&registry), 52).await?;
+    let wallet = Wallet::new()?;
+    wallet.publish(&registry, &[&node], None, Some(&node), 1)?;
+    let session = wallet.session(true)?;
+    let header = authorization(&session.delegation_header);
+    let cid = json!(session.delegation_cid.to_string());
+    let space = json!([wallet.space.to_string()]);
+
+    let (status, body) = node.delegate(&header).await;
+    assert_eq!(status, Status::Ok, "{body}");
+    assert_eq!(body["cid"], cid);
+    assert_eq!(body["activated"], json!([]));
+    assert_eq!(body["skipped"], space);
+    assert_eq!(node.count("space").await?, 0);
+    assert_eq!(node.count("epoch").await?, 0);
+    assert_eq!(node.count("event_order").await?, 0);
+
+    wallet.publish(
+        &registry,
+        &[&node],
+        Some((&node, "read-write")),
+        Some(&node),
+        2,
+    )?;
+    let (status, body) = node.delegate(&header).await;
+    assert_eq!(status, Status::Ok, "{body}");
+    assert_eq!(body["cid"], cid);
+    assert_eq!(body["activated"], space);
+    assert_eq!(body["skipped"], json!([]));
+    assert_eq!(node.count("space").await?, 1);
+    assert_eq!(node.count("delegation").await?, 1);
+    assert_eq!(
+        node.invoke(&session, "tinycloud.kv/put", "TEST retained grant")
+            .await?
+            .0,
+        Status::Ok
+    );
+    assert_eq!(
+        node.invoke(&session, "tinycloud.kv/get", "").await?,
+        (Status::Ok, "TEST retained grant".into())
+    );
+    let tables = ["epoch", "epoch_order", "event_order", "kv_write"];
+    let mut counts = Vec::new();
+    for table in tables {
+        counts.push(node.count(table).await?);
+    }
+
+    let (status, body) = node.delegate(&header).await;
+    assert_eq!(status, Status::Ok, "{body}");
+    assert_eq!(body["cid"], cid);
+    assert_eq!(body["activated"], json!([]));
+    assert_eq!(body["skipped"], json!([]));
+    assert_eq!(node.count("delegation").await?, 1);
+    for (table, expected) in tables.into_iter().zip(&counts) {
+        assert_eq!(node.count(table).await?, *expected, "{table}");
+    }
+
+    wallet.publish(&registry, &[&node], None, Some(&node), 3)?;
+    let (status, body) = node.delegate(&header).await;
+    assert_eq!(status, Status::Ok, "{body}");
+    assert_eq!(body["cid"], cid);
+    assert_eq!(body["activated"], json!([]));
+    assert_eq!(body["skipped"], space);
+    assert_eq!(
+        node.invoke(&session, "tinycloud.kv/put", "excluded")
+            .await?
+            .0,
+        Status::Forbidden
+    );
+    for (table, expected) in tables.into_iter().zip(&counts) {
+        assert_eq!(node.count(table).await?, *expected, "{table}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn unconfigured_node_retains_host_onboarding() -> Result<()> {
     let node = Node::new(None, 47).await?;
     let wallet = Wallet::new()?;
@@ -606,7 +684,7 @@ async fn mixed_grant_decrypts_only_on_encryption_destination_without_data_replic
         .client
         .post(format!("/encryption/networks/{network}/decrypt"))
         .header(rocket::http::ContentType::JSON)
-        .header(Header::new("Authorization", header))
+        .header(Header::new("Authorization", header.clone()))
         .body(body.to_string())
         .dispatch()
         .await;
@@ -616,9 +694,21 @@ async fn mixed_grant_decrypts_only_on_encryption_destination_without_data_replic
     let peer = PublicKey::from(<[u8; 32]>::try_from(&sealed[..32])?);
     let shared = receiver.diffie_hellman(&peer);
     assert_eq!(
-        tinycloud_core::ColumnEncryption::new(*shared.as_bytes()).decrypt_strict(&sealed[32..])?,
+        tinycloud_core::ColumnEncryption::new(*shared.as_bytes()).decrypt_legacy(&sealed[32..])?,
         expected
     );
+    assert_eq!(encryption.count("space").await?, 0);
+    assert_eq!(encryption.count("kv_write").await?, 0);
+    registry.set(axum::http::StatusCode::SERVICE_UNAVAILABLE, "{}".into());
+    let response = encryption
+        .client
+        .post(format!("/encryption/networks/{network}/decrypt"))
+        .header(rocket::http::ContentType::JSON)
+        .header(Header::new("Authorization", header))
+        .body(body.to_string())
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::ServiceUnavailable);
     assert_eq!(encryption.count("space").await?, 0);
     assert_eq!(encryption.count("kv_write").await?, 0);
     Ok(())

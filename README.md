@@ -307,6 +307,12 @@ keeps `cid`, `activated`, and `skipped`. Raw encryption-network grants and reque
 use the separately signed `encryptionNode` destination. Encryption-only
 registration returns a CID without activating an unlisted data space.
 
+Re-registering the same still-valid grant after membership expands activates
+newly admitted spaces without changing its CID or signed proof. Repeating that
+registration after activation does not append duplicate epochs or events.
+Registry unavailability returns HTTP `503`, including direct decrypt and hook
+authorization; it is not reported as invalid agent credentials.
+
 Details: TC-2481
 
 ### Database Config

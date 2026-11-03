@@ -37,7 +37,9 @@ use tinycloud_core::encryption_network::{
     NetworkDescriptor, NetworkId, Threshold, WellKnownRecord, KEY_BLOCK_ACTION, KEY_CREATE_ACTION,
     KEY_UNBLOCK_ACTION, NETWORK_CREATE_ACTION, NETWORK_REVOKE_ACTION,
 };
-use tinycloud_core::{events::Invocation, util::InvocationInfo, TxError, TxStoreError};
+use tinycloud_core::{
+    events::Invocation, models::invocation, util::InvocationInfo, TxError, TxStoreError,
+};
 
 #[derive(Debug, Deserialize)]
 pub struct CreateNetworkBody {
@@ -245,12 +247,15 @@ pub async fn decrypt(
             return InvokeError::Revoked(code, error.to_string());
         }
         match &error {
-            tinycloud_core::models::invocation::Error::Db(db_error) => super::database_failure(
+            invocation::Error::Db(db_error) => super::database_failure(
                 tinycloud_core::failure_diagnostic::Service::Other,
                 db_error,
                 false,
                 error.to_string(),
             ),
+            invocation::Error::InvalidInvocation(invocation::InvocationError::Registry(error)) => {
+                super::registry_failure(*error)
+            }
             _ => (Status::Unauthorized, error.to_string()),
         }
         .into()

@@ -2095,6 +2095,9 @@ async fn invoke_impl(
                 .authorize_invocation(&admitted.invocation().0, now)
                 .await
                 .map_err(|error| match error {
+                    invocation_model::Error::InvalidInvocation(
+                        invocation_model::InvocationError::Registry(error),
+                    ) => registry_failure(error),
                     invocation_model::Error::Db(db) => database_failure(
                         Service::Other, &db, false, db.to_string(),
                     ),
@@ -2444,6 +2447,9 @@ async fn invoke_impl(
                 .authorize_admitted(&admitted, OffsetDateTime::now_utc())
                 .await
                 .map_err(|error| match error {
+                    invocation_model::Error::InvalidInvocation(
+                        invocation_model::InvocationError::Registry(error),
+                    ) => registry_failure(error),
                     invocation_model::Error::Db(db) => database_failure(
                         Service::Kv, &db, false, db.to_string(),
                     ),
@@ -2670,6 +2676,9 @@ async fn invoke_impl(
                 }
                 if let TxStoreError::Tx(TxError::ReadAudit(error)) = &e {
                     return Err(read_audit_failure(Service::Kv, error).into());
+                }
+                if let TxStoreError::Tx(TxError::Registry(error)) = &e {
+                    return Err(registry_failure(*error).into());
                 }
                 if let TxStoreError::Tx(TxError::Db(error) | TxError::EpochInsert(error)) = &e {
                     return Err(
