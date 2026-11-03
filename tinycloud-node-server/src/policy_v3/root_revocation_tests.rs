@@ -334,3 +334,54 @@ async fn the_json_route_keeps_its_signer_and_enforcer_rules(
     Ok(())
 }
 on_both_backends!(the_json_route_keeps_its_signer_and_enforcer_rules);
+
+/// TC-2381: a root revoked over the JSON `RootRevocation/v1` route lives only
+/// in `policy_v3_root.revoked_at`. `/delegation/status` reports it revoked
+/// (not active) for the root and for a session issued under it, and still
+/// shows nothing to a caller who may not see the grant.
+async fn a_json_revoked_root_reports_revoked_status(backend: Backend) -> anyhow::Result<()> {
+    let Some(h) = Harness::new(
+        backend,
+        Shape::PkhSession,
+        "a_json_revoked_root_reports_revoked_status",
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let admitted = admitted(&h).await?;
+    let root = admitted.policy.policy_root_cid.clone();
+    let session = session_cid(&admitted.session)?.to_string();
+
+    // The root's signer sees the root; the holder sees its own session.
+    let views = [(&h.owner, &root), (&h.holder, &session)];
+    for (viewer, cid) in views {
+        let status = h.delegation_status(viewer, cid).await?;
+        assert_eq!(status["status"], json!("active"), "before revoke: {status}");
+        assert_eq!(status["active"], json!(true), "{status}");
+        assert_eq!(status["revoked"], json!(false), "{status}");
+    }
+
+    let (status, body) = h
+        .revoke_root_json(&h.owner, &root, POLICY_AUTHORITY)
+        .await?;
+    assert_eq!(status, Status::Ok, "{body}");
+    // The revocation is in the policy projection only.
+    assert_eq!(h.root_status(&root).await["state"], json!("revoked"));
+
+    for (viewer, cid) in views {
+        let status = h.delegation_status(viewer, cid).await?;
+        assert_eq!(status["status"], json!("revoked"), "{cid}: {status}");
+        assert_eq!(status["revoked"], json!(true), "{status}");
+        assert_eq!(status["active"], json!(false), "{status}");
+        assert_eq!(status["exists"], json!(true), "{status}");
+    }
+
+    // A caller who may not see the grant learns nothing about its state.
+    let stranger = Signer::key();
+    let status = h.delegation_status(&stranger, &root).await?;
+    assert_eq!(status["status"], json!("not_found"), "{status}");
+    assert_eq!(status["revoked"], json!(false), "{status}");
+    Ok(())
+}
+on_both_backends!(a_json_revoked_root_reports_revoked_status);

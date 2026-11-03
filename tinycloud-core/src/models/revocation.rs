@@ -17,6 +17,30 @@ use tinycloud_auth::{
     resource::SpaceId,
 };
 
+/// Why a revocation refused a request, as a stable machine-readable code
+/// (TC-2381). The human text of the refusal is unchanged; clients switch on
+/// this instead of matching it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RevocationCode {
+    /// The delegation the invocation cites is itself revoked.
+    DelegationRevoked,
+    /// A direct parent of the delegation being invoked or registered is
+    /// revoked.
+    ParentRevoked,
+    /// A higher ancestor is revoked.
+    AncestorRevoked,
+}
+
+impl RevocationCode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DelegationRevoked => "delegation_revoked",
+            Self::ParentRevoked => "parent_revoked",
+            Self::AncestorRevoked => "ancestor_revoked",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
 #[sea_orm(table_name = "revocation")]
 pub struct Model {
@@ -193,6 +217,58 @@ pub(crate) async fn first_revoked_ancestor<C: ConnectionTrait>(
         }
     }
     Ok(None)
+}
+
+/// Whether `target`, `start` or any ancestor of `start` (under every persisted
+/// equivalent CID) is a Policy/v3 root that has been revoked in
+/// `policy_v3_root` (TC-2381).
+///
+/// The `RootRevocation/v1` route records a root revocation only there, not
+/// in the generic `revocation` table, so the generic checks alone report the
+/// root and its descendants active. A root counts as revoked when the server
+/// would refuse it as `root-revoked`: `revoked_at` or `revocation_bytes` set.
+pub(crate) async fn policy_root_revoked<C: ConnectionTrait>(
+    db: &C,
+    target: &Hash,
+    start: &Hash,
+) -> Result<bool, ChainTraversalError> {
+    use delegation_cid_alias::{Column as AliasColumn, Entity as AliasEntity};
+    let mut ids = ancestor_chain_ids(db, start).await?;
+    ids.push(*target);
+    ids.sort_by(|left, right| left.as_ref().cmp(right.as_ref()));
+    ids.dedup();
+
+    let canonicals = AliasEntity::find()
+        .filter(AliasColumn::Id.is_in(ids.iter().copied()))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|alias| alias.canonical);
+    let mut names = ids.clone();
+    names.extend(canonicals);
+    let equivalents = AliasEntity::find()
+        .filter(AliasColumn::Canonical.is_in(names.iter().copied()))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|alias| alias.id);
+    names.extend(equivalents);
+    names.sort_by(|left, right| left.as_ref().cmp(right.as_ref()));
+    names.dedup();
+
+    Ok(policy_v3_root::Entity::find()
+        .filter(
+            policy_v3_root::Column::RootCid
+                .is_in(names.iter().map(|id| id.to_cid(0x55).to_string())),
+        )
+        .filter(
+            Condition::any()
+                .add(policy_v3_root::Column::RevokedAt.is_not_null())
+                .add(policy_v3_root::Column::RevocationBytes.is_not_null()),
+        )
+        .one(db)
+        .await?
+        .is_some())
 }
 
 pub(crate) async fn ancestor_chain_ids<C: ConnectionTrait>(

@@ -98,6 +98,9 @@ pub enum InvocationError {
     DelegationAncestorRevoked {
         ancestor_cid: String,
         invoked_cid: String,
+        /// A direct parent of the invoked delegation is among the revoked
+        /// ancestors (TC-2381); it only selects the stable revocation code.
+        direct_parent: bool,
     },
     #[error("delegation-chain-traversal-limit-exceeded")]
     ChainTraversalLimitExceeded,
@@ -115,6 +118,22 @@ pub enum InvocationError {
     /// Code: `encryption-prefix-not-invocable`.
     #[error("encryption-prefix-not-invocable")]
     EncryptionPrefixNotInvocable,
+}
+
+impl InvocationError {
+    /// The stable code of a revocation refusal, `None` for any other error.
+    pub fn revocation_code(&self) -> Option<super::revocation::RevocationCode> {
+        use super::revocation::RevocationCode;
+        match self {
+            Self::DelegationRevoked(_) => Some(RevocationCode::DelegationRevoked),
+            Self::DelegationAncestorRevoked {
+                direct_parent: true,
+                ..
+            } => Some(RevocationCode::ParentRevoked),
+            Self::DelegationAncestorRevoked { .. } => Some(RevocationCode::AncestorRevoked),
+            _ => None,
+        }
+    }
 }
 
 pub(crate) async fn process<C: ConnectionTrait>(
@@ -463,6 +482,7 @@ async fn validate_capabilities<C: ConnectionTrait>(
                     return Err(InvocationError::DelegationAncestorRevoked {
                         ancestor_cid,
                         invoked_cid: p.id.to_cid(0x55).to_string(),
+                        direct_parent: graph.has_revoked_parent(&p.id),
                     }
                     .into());
                 }

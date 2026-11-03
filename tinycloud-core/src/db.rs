@@ -379,6 +379,17 @@ pub enum TxError<S: StorageSetup, K: Secrets> {
     ReadAudit(#[from] crate::read_audit::ReadAuditError),
 }
 
+impl<S: StorageSetup, K: Secrets> TxError<S, K> {
+    /// The stable code when a revocation refused the request (TC-2381).
+    pub fn revocation_code(&self) -> Option<revocation::RevocationCode> {
+        match self {
+            Self::InvalidInvocation(error) => error.revocation_code(),
+            Self::InvalidDelegation(error) => error.revocation_code(),
+            _ => None,
+        }
+    }
+}
+
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum TxStoreError<B, S, K>
@@ -430,6 +441,22 @@ where
     /// The presented `tinycloud.kv/retain` grant is refused.
     #[error("kv/sync retention grant refused: {}", .0.as_str())]
     KvSyncRetentionRefused(crate::kv_sync::KvSyncRetentionError),
+}
+
+impl<B, S, K> TxStoreError<B, S, K>
+where
+    B: ImmutableReadStore + ImmutableWriteStore<S> + StorageSetup,
+    S: ImmutableStaging,
+    S::Writable: 'static + Unpin,
+    K: Secrets,
+{
+    /// The stable code when a revocation refused the request (TC-2381).
+    pub fn revocation_code(&self) -> Option<revocation::RevocationCode> {
+        match self {
+            Self::Tx(error) => error.revocation_code(),
+            _ => None,
+        }
+    }
 }
 
 impl<B, S, K> From<DbErr> for TxStoreError<B, S, K>
@@ -2182,6 +2209,16 @@ where
         match revocation::first_revoked_ancestor(&self.conn, &delegation.id).await {
             Ok(Some(_)) => return Ok(Some(DelegationStatus::Revoked)),
             Ok(None) => {}
+            Err(revocation::ChainTraversalError::LimitExceeded) => {
+                return Ok(Some(DelegationStatus::Unavailable));
+            }
+            Err(revocation::ChainTraversalError::Db(error)) => return Err(error.into()),
+        }
+        // TC-2381: a Policy/v3 root revoked over `RootRevocation/v1` is
+        // recorded in `policy_v3_root`, not in the generic table.
+        match revocation::policy_root_revoked(&self.conn, &target, &delegation.id).await {
+            Ok(true) => return Ok(Some(DelegationStatus::Revoked)),
+            Ok(false) => {}
             Err(revocation::ChainTraversalError::LimitExceeded) => {
                 return Ok(Some(DelegationStatus::Unavailable));
             }

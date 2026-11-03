@@ -56,6 +56,7 @@ use tinycloud_core::{
     keys::Secrets,
     models::{
         hook_delivery, hook_subscription, invocation as invocation_model, kv_delete, kv_write,
+        revocation::RevocationCode,
     },
     request_cancel,
     sea_orm::{ColumnTrait, DbErr, EntityTrait, QueryFilter, QueryOrder},
@@ -257,12 +258,16 @@ where
     }
 }
 
-/// `/invoke` failure: plain text for everything except storage rejections,
-/// which carry the structured TC-619 JSON body.
+/// `/invoke` and `/delegate` failure: plain text for everything except
+/// storage rejections, which carry the structured TC-619 JSON body, and
+/// revocation refusals, which carry a stable `code` (TC-2381).
 #[derive(Debug)]
 pub enum InvokeError {
     Text(Status, String),
     Storage(StorageRejection),
+    /// A `401` whose JSON body is `{"code": <code>, "error": <message>}`; the
+    /// message is the unchanged human text of the refusal.
+    Revoked(RevocationCode, String),
 }
 
 impl From<(Status, String)> for InvokeError {
@@ -288,6 +293,11 @@ impl<'r> rocket::response::Responder<'r, 'static> for InvokeError {
         match self {
             Self::Text(status, message) => (status, message).respond_to(request),
             Self::Storage(rejection) => rejection.respond_to(request),
+            Self::Revoked(code, message) => (
+                Status::Unauthorized,
+                Json(serde_json::json!({ "code": code.as_str(), "error": message })),
+            )
+                .respond_to(request),
         }
     }
 }
@@ -718,13 +728,13 @@ pub async fn delegate(
     req_span: TracingSpan,
     tinycloud: &State<TinyCloud>,
     policy_v3: &State<crate::policy_v3::PolicyV3Runtime>,
-) -> Result<Json<DelegateResponse>, (Status, String)> {
+) -> Result<Json<DelegateResponse>, InvokeError> {
     let action_label = "delegation";
     let span = info_span!(parent: &req_span.0, "delegate", action = %action_label);
     // Instrumenting async block to handle yielding properly
     async move {
         if let Err(reason) = policy_v3.ordinary_admission_allowed(tinycloud, &d.0).await {
-            return Err((Status::Forbidden, reason.to_string()));
+            return Err((Status::Forbidden, reason.to_string()).into());
         }
         let timer = crate::prometheus::enabled().then(|| {
             crate::prometheus::AUTHORIZED_INVOKE_HISTOGRAM
@@ -742,7 +752,10 @@ pub async fn delegate(
         )
         .await;
         let res = res
-            .map_err(|e| delegation_failure(&e, write_may_have_applied))
+            .map_err(|e| match e.revocation_code() {
+                Some(code) => InvokeError::Revoked(code, e.to_string()),
+                None => delegation_failure(&e, write_may_have_applied).into(),
+            })
             .and_then(|result: TransactResult| {
                 let TransactResult {
                     commits,
@@ -767,7 +780,10 @@ pub async fn delegate(
                     })
                     .map(|h| h.to_cid(0x55).to_string())
                     .ok_or_else(|| {
-                        (Status::Unauthorized, "Delegation not committed".to_string())
+                        InvokeError::from((
+                            Status::Unauthorized,
+                            "Delegation not committed".to_string(),
+                        ))
                     })?;
 
                 Ok(Json(DelegateResponse {
@@ -2143,7 +2159,7 @@ async fn invoke_impl(
                 .authorize_admitted(&admitted, OffsetDateTime::now_utc())
                 .await
                 .map_err(|error| {
-                    authorization_failure(
+                    authorization_refusal(
                         "server.signed_kv.auth",
                         &TxStoreError::Tx(error.into()),
                         false,
@@ -2465,6 +2481,9 @@ async fn invoke_impl(
                         database_failure(Service::Kv, error, write_may_have_applied, e.to_string())
                             .into()
                     );
+                }
+                if let Some(code) = e.revocation_code() {
+                    return Err(InvokeError::Revoked(code, e.to_string()));
                 }
                 Err((
                     match &e {
@@ -4350,7 +4369,7 @@ async fn verify_auth_admitted(
     span: &'static str,
     invocation: AdmittedInvocation,
     tinycloud: &State<TinyCloud>,
-) -> Result<TransactResult, (Status, String)> {
+) -> Result<TransactResult, InvokeError> {
     let start = Instant::now();
     let (result, write_may_have_applied) = track_writes_retrying(
         "authorize_invocation",
@@ -4363,7 +4382,7 @@ async fn verify_auth_admitted(
     )
     .await;
     let result = result
-        .map_err(|e| authorization_failure(span, &e, write_may_have_applied))
+        .map_err(|e| authorization_refusal(span, &e, write_may_have_applied))
         .map(|(tx_result, _)| tx_result);
     crate::prometheus::observe_span(
         span,
@@ -4371,6 +4390,19 @@ async fn verify_auth_admitted(
         start.elapsed(),
     );
     result
+}
+
+/// [`authorization_failure`], with a revocation refusal carrying its stable
+/// code (TC-2381).
+fn authorization_refusal(
+    span: &'static str,
+    error: &TxStoreError<BlockStores, BlockStage, tinycloud_core::keys::StaticSecret>,
+    write_may_have_applied: bool,
+) -> InvokeError {
+    match error.revocation_code() {
+        Some(code) => InvokeError::Revoked(code, error.to_string()),
+        None => authorization_failure(span, error, write_may_have_applied).into(),
+    }
 }
 
 /// The response to a failed authorization step of `/invoke`. A read-only
@@ -4404,6 +4436,7 @@ mod tests {
     mod encryption_keys;
     mod key_delete;
     mod operation_retry;
+    mod revocation_codes;
     mod revocation_scope;
 
     use super::*;
