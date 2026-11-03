@@ -696,9 +696,19 @@ strict ancestor of the currently running image. The normal guard still
 requires the running revision to be an ancestor of dispatched `main`; do not
 set `allow_non_descendant`.
 
-The one-line `rollback_reason` (12–300 printable ASCII characters) is retained
-in the workflow inputs and run summary with the digest, version and revision.
-The explicit quota authorization is still required for each dispatch. Keep
+The workflow also requires the migration source tree under
+`tinycloud-core/src/migrations` to be identical at the target and running
+revisions. A target missing migrations present in the running binary is refused
+before deployment. The 1.25.13 to 1.25.17 migration-tree diff is empty, so that
+rollback remains eligible; older releases with a different migration tree do
+not. This is a conservative compatibility check, not a substitute for checking
+other stored-data compatibility.
+
+The one-line `rollback_reason` must be 12–300 characters: the first character
+is an ASCII letter or digit; later characters may be ASCII letters or digits,
+spaces, or `. , ; : ( ) / _ + -`. It is retained in the workflow inputs and
+run summary with the digest, version and revision. The explicit quota
+authorization is still required for each dispatch. Keep
 `rollback_pre_n0=false` and `rollback_privacy_mode=unselected`; this does not
 use the captured 1.20.6 compose rollback.
 

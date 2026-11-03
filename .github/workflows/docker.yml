@@ -782,10 +782,10 @@ jobs:
                   raise SystemExit(refuse)
               tag_commit = git('rev-parse', '--verify', '--quiet', f'refs/tags/v{label[1]}^{{commit}}').strip()
               if tag_commit != revision:
-                  raise SystemExit(f'::error::Rollback release tag mismatch: expected {revision}, got {tag_commit or "missing"}')
+                  raise SystemExit('::error::Image tag does not resolve to the labeled release revision')
               crate = re.search(r'(?m)^version = "([^"]*)"$', git('show', f'{revision}:tinycloud-node-server/Cargo.toml'))
               if not crate or crate[1] != label[1]:
-                  raise SystemExit('::error::Rollback image crate version does not match its release tag')
+                  raise SystemExit('::error::Image crate version does not match its release tag')
 
           def require_release():
               require_recorded_release()
@@ -797,6 +797,12 @@ jobs:
               if (not re.fullmatch(r'[0-9a-f]{40}', running) or revision == running
                       or not is_ancestor(revision, running)):
                   raise SystemExit('::error::Rollback target must be a strictly older released ancestor of the running image')
+              migration_diff = subprocess.run(
+                  ['git', 'diff', '--quiet', revision, running, '--', 'tinycloud-core/src/migrations'],
+                  capture_output=True,
+              )
+              if migration_diff.returncode != 0:
+                  raise SystemExit('::error::Rollback target migration sources differ from the running image; database compatibility is not established')
 
           def is_ancestor(older, newer):
               return subprocess.run(['git', 'merge-base', '--is-ancestor', older, newer], capture_output=True).returncode == 0

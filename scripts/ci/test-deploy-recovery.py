@@ -127,6 +127,8 @@ elif name=='git':
         order=json.loads(os.environ['TEST_ORDER'])
         ok=args[2] in order and args[3] in order and order.index(args[2])<=order.index(args[3])
         sys.exit(0 if ok else 1)
+    elif args[:2]==['diff','--quiet'] and args[-2:]==['--','tinycloud-core/src/migrations']:
+        sys.exit(1 if os.environ['TEST_MIGRATION_DIFF']=='true' else 0)
     elif args[:3]==['rev-parse','--verify','--quiet'] and len(args)==4:
         tag=args[3]; assert tag.startswith('refs/tags/v') and tag.endswith('^{commit}')
         release=releases.get(tag[len('refs/tags/v'):-len('^{commit}')])
@@ -229,7 +231,7 @@ class SafeResult(unittest.TextTestResult):
 class RecoveryTests(unittest.TestCase):
     def run_deploy(self, compose=CURRENT, changes=None, *, fail_at="", artifact_error="", authority="node-override",
                    missing_billing=False, missing_authorization=False, approved_privacy="", event="workflow_dispatch", stats_token=None,
-                   allowed_stats=False,
+                   allowed_stats=False, migration_diff=False,
                    ref="refs/heads/main", oci_label=None, oci_revision=None, build_digest="", releases=RELEASED, running=REVISION, order=None):
         inputs = {"deploy_phala": "true", "authorize_quota_values": "true", "image_version": "1.20.6",
                   "deploy_image_digest": DIGEST, "rollback_image_version": "1.20.6", "rollback_image_revision": REVISION,
@@ -291,7 +293,8 @@ class RecoveryTests(unittest.TestCase):
                         # Production maps both from PROD_TINYCLOUD_QUOTA_URL: billing's base URL.
                         "QUOTA_BILLING_URL": BILLING_URL, "PHALA_ENV_TINYCLOUD_QUOTA_URL": BILLING_URL, "TEST_RELEASES": json.dumps(releases),
                         "TEST_GUARD_MESSAGE": GUARD_MESSAGE,
-                        "TEST_ORDER": json.dumps(order or ORDER)})
+                        "TEST_ORDER": json.dumps(order or ORDER),
+                        "TEST_MIGRATION_DIFF": str(migration_diff).lower()})
             if running: env["RUNNING_REVISION"] = running
             if allowed_stats: env["TEST_ALLOWED_ENVS"] = "NODE_STATS_READ_TOKEN"
             if stats_token == ADMIN_VALUE: stats_token = canary
@@ -474,11 +477,28 @@ class RecoveryTests(unittest.TestCase):
         prior = {"rollback_release": "true", "rollback_reason": reason, "image_version": "1.20.6",
                  "deploy_image_digest": DIGEST, "rollback_image_version": "1.20.6",
                  "rollback_image_revision": REVISION}
-        accepted = self.run_deploy(N0, prior, running=RELEASE_REVISION, releases=releases)
+        previous_revision = "50b0986a969af818a658ec92461cce7007e3b0a1"
+        current_revision = "6ac29ed847ea691da8963fd6e71c9364c7bafba8"
+        previous_digest = "sha256:55c26f455f793cb3d23d1675db566d7ecf4020c3156028ee61190c8e14d59be3"
+        deployed_releases = {
+            "1.25.13": (previous_revision, "1.25.13"),
+            "1.25.17": (current_revision, "1.25.17"),
+        }
+        deployed_order = [previous_revision, current_revision]
+        rollback_12513 = {
+            "rollback_release": "true",
+            "rollback_reason": reason,
+            "image_version": "1.25.13",
+            "deploy_image_digest": previous_digest,
+            "rollback_image_version": "1.25.13",
+            "rollback_image_revision": previous_revision,
+        }
+        accepted = self.run_deploy(
+            N0, rollback_12513, running=current_revision, releases=deployed_releases, order=deployed_order)
         self.assertTrue(accepted["success"], accepted["logs"])
-        self.assertEqual(accepted["compose"], N0)
-        self.assertIn(f"version 1.20.6-dstack; revision {REVISION}", accepted["summary"])
-        self.assertIn(f"@{DIGEST}", accepted["summary"])
+        self.assertEqual(accepted["compose"], N0.replace(DIGEST.encode(), previous_digest.encode()))
+        self.assertIn(f"version 1.25.13-dstack; revision {previous_revision}", accepted["summary"])
+        self.assertIn(f"@{previous_digest}", accepted["summary"])
         self.assertIn(reason, accepted["summary"])
 
         unrelated_revision = "8" * 40
@@ -488,6 +508,14 @@ class RecoveryTests(unittest.TestCase):
              "rollback_reason"),
             ("multiline reason", {**prior, "rollback_reason": reason + "\nforged"}, RELEASE_REVISION, releases, ORDER,
              "single-line ASCII reason"),
+            ("short reason", {**prior, "rollback_reason": "bad"}, RELEASE_REVISION, releases, ORDER,
+             "12-300 character"),
+            ("long reason", {**prior, "rollback_reason": "x" * 301}, RELEASE_REVISION, releases, ORDER,
+             "12-300 character"),
+            ("unsupported punctuation", {**prior, "rollback_reason": "Incident #510 should be denied"},
+             RELEASE_REVISION, releases, ORDER, "12-300 character"),
+            ("trimmed reason", {**prior, "rollback_reason": " " + reason}, RELEASE_REVISION, releases, ORDER,
+             "12-300 character"),
             ("reason without rollback mode", {**prior, "rollback_release": "false",
              "image_version": "1.21.0", "deploy_image_digest": RELEASE_DIGEST,
              "rollback_image_version": "1.21.0", "rollback_image_revision": RELEASE_REVISION},
@@ -505,11 +533,18 @@ class RecoveryTests(unittest.TestCase):
             ("unrecorded image", {**prior, "image_version": "1.20.5",
              "deploy_image_digest": "sha256:" + "d" * 64, "rollback_image_version": "1.20.5",
              "rollback_image_revision": unrelated_revision},
-             RELEASE_REVISION, releases, ORDER, "Rollback release tag mismatch"),
-            ("ancestry bypass", {**prior, "allow_non_descendant": "true"},
-             RELEASE_REVISION, releases, ORDER, "allow_non_descendant"),
+             RELEASE_REVISION, releases, ORDER, "Image tag does not resolve"),
+            ("same revision as running", {
+                **rollback_12513,
+                "image_version": "1.25.17",
+                "deploy_image_digest": RELEASE_DIGEST,
+                "rollback_image_version": "1.25.17",
+                "rollback_image_revision": current_revision,
+            }, current_revision, deployed_releases, deployed_order, "strictly older"),
+            ("rollback privacy mode", {**prior, "rollback_privacy_mode": "keep-json-file"},
+             RELEASE_REVISION, releases, ORDER, "rollback_privacy_mode"),
             ("missing digest", {**prior, "deploy_image_digest": ""},
-             RELEASE_REVISION, releases, ORDER, "digest"),
+             RELEASE_REVISION, releases, ORDER, "exact image digest"),
         )
         for name, changes, running, known_releases, order, message in rejected_cases:
             with self.subTest(name=name):
@@ -518,11 +553,27 @@ class RecoveryTests(unittest.TestCase):
                 self.assertNotIn("cvm-deploy", refused["events"])
                 self.assertEqual(refused["compose"], N0)
                 self.assertIn(message, refused["logs"])
+        not_main = self.run_deploy(
+            N0, prior, ref="refs/heads/feature", running=RELEASE_REVISION, releases=releases)
+        self.assertFalse(not_main["success"], not_main["logs"])
+        self.assertIn("main dispatch", not_main["logs"])
+        self.assertNotIn("cvm-deploy", not_main["events"])
+        not_phala = self.run_deploy(
+            N0, {**prior, "deploy_phala": "false"}, running=RELEASE_REVISION, releases=releases)
+        self.assertFalse(not_phala["success"], not_phala["logs"])
+        self.assertIn("Phala deployment", not_phala["logs"])
+        self.assertNotIn("cvm-deploy", not_phala["events"])
         not_n0 = self.run_deploy(PRE_N0_TEMPLATE, prior, running=RELEASE_REVISION, releases=releases)
         self.assertFalse(not_n0["success"], not_n0["logs"])
         self.assertIn("only for the reviewed N0 compose", not_n0["logs"])
         self.assertNotIn("cvm-deploy", not_n0["events"])
         self.assertEqual(not_n0["compose"], PRE_N0_TEMPLATE)
+        migration_incompatible = self.run_deploy(
+            N0, prior, running=RELEASE_REVISION, releases=releases, migration_diff=True)
+        self.assertFalse(migration_incompatible["success"], migration_incompatible["logs"])
+        self.assertIn("migration sources differ from the running image", migration_incompatible["logs"])
+        self.assertNotIn("cvm-deploy", migration_incompatible["events"])
+        self.assertEqual(migration_incompatible["compose"], N0)
 
     def test_same_image_recovery_refuses_an_older_image_than_running(self):
         for compose in (PRE_N0_TEMPLATE, N0):

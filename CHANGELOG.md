@@ -2,7 +2,7 @@
 
 ## [Unreleased]
 ### Changes
-- Deploys: the workflow supports an explicit, reason-recorded rollback to an earlier released dstack image on the unchanged N0 compose; it checks image labels, release tag and ancestry while preserving the normal forward-release guard.
+- Deploys: the workflow supports an explicit, reason-recorded rollback to an earlier released dstack image on the unchanged N0 compose. It checks image labels, release tag, ancestry, and identical migration sources while preserving the normal forward-release guard.
 
 ## [1.25.17] - 2026-11-03
 
