@@ -327,7 +327,7 @@ pub enum SqlError {
     Busy(SqlBusyStage),
     /// The request deadline was reached before the request's write began, so
     /// nothing was applied (TC-1274).
-    #[error("request_timeout: no change was applied; retry the request")]
+    #[error("request_timeout: no change was applied; retry the request with a new signature")]
     RequestTimeout,
 }
 
