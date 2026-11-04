@@ -1585,13 +1585,10 @@ fn verify_did_key_signature(
     {
         return Err(());
     }
-    let encoded = signer.as_str().strip_prefix("did:key:").ok_or(())?;
-    let (_, bytes) = tinycloud_auth::ipld_core::cid::multibase::decode(encoded).map_err(|_| ())?;
-    let key_bytes = match bytes.as_slice() {
-        [0xed, 0x01, rest @ ..] if rest.len() == 32 => rest,
-        _ => return Err(()),
-    };
-    let key = tinycloud_core::libp2p::identity::ed25519::PublicKey::try_from_bytes(key_bytes)
+    // Bounded decode: length is checked before base58, and only the Ed25519 multicodec is accepted.
+    let key_bytes = tinycloud_auth::share_email_evidence::did_key_public_key(signer.as_str())
+        .map_err(|_| ())?;
+    let key = tinycloud_core::libp2p::identity::ed25519::PublicKey::try_from_bytes(&key_bytes)
         .map_err(|_| ())?;
     let signature = decode_config(&proof.signature, URL_SAFE_NO_PAD).map_err(|_| ())?;
     if signature.len() != 64 {

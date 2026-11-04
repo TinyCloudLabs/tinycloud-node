@@ -154,6 +154,10 @@ fn verify_eip191(
     if signature.len() != 65 {
         return Err(super::AuthorityError::SchemaInvalid);
     }
+    // Only an eip155 did:pkh names an EVM address to compare against the recovered key.
+    tinycloud_auth::identity::parse_pkh_did(&artifact.issuer_did)
+        .map_err(|_| super::AuthorityError::SchemaInvalid)?
+        .ok_or(super::AuthorityError::SchemaInvalid)?;
     let recovery = match signature[64] {
         27 | 28 => RecoveryId::try_from(signature[64] - 27),
         0 | 1 => RecoveryId::try_from(signature[64]),
@@ -316,5 +320,57 @@ mod tests {
                 "{name} must not bypass signature verification"
             );
         }
+    }
+
+    #[test]
+    fn eip191_issuer_must_be_an_eip155_pkh_before_recovery() {
+        let artifact = |issuer: &str| PolicyDelegation {
+            schema: "xyz.tinycloud.policy/enforcement-delegation/v1".to_owned(),
+            role: DelegationRole::PolicySessionRoot,
+            delegation_cid: "placeholder".to_owned(),
+            issuer_did: issuer.to_owned(),
+            audience_did: issuer.to_owned(),
+            capabilities: Vec::new(),
+            proof_cids: Vec::new(),
+            not_before: "2026-07-19T00:00:00Z".to_owned(),
+            expires_at: "2026-07-19T00:05:00Z".to_owned(),
+            delegation_mode: super::super::DelegationMode::Attenuable,
+            facts: std::collections::BTreeMap::new(),
+            signature: DelegationSignature {
+                suite: EIP191_SUITE.to_owned(),
+                value: String::new(),
+            },
+        };
+        // A real secp256k1 signature over the preimage `verify_eip191` checks. Recovery
+        // succeeds for it, so only the issuer-namespace check can refuse a non-eip155 issuer.
+        let signing_key = k256::ecdsa::SigningKey::from_slice(&[0x11; 32]).unwrap();
+        let public = signing_key.verifying_key().to_encoded_point(false);
+        let address = hex::encode(&Keccak256::digest(&public.as_bytes()[1..])[12..]);
+        let digest = Sha256::digest([ROOT_DOMAIN, b"unsigned".as_slice()].concat());
+        let mut preimage = b"\x19Ethereum Signed Message:\n32".to_vec();
+        preimage.extend_from_slice(&digest);
+        let hash = Keccak256::digest(preimage);
+        let (sig, recovery) = signing_key.sign_prehash_recoverable(&hash).unwrap();
+        let mut signature = [0u8; 65];
+        signature[..64].copy_from_slice(&sig.to_bytes());
+        signature[64] = recovery.to_byte();
+        // Positive control: the same signature verifies under an eip155 issuer.
+        assert!(verify_eip191(
+            &artifact(&format!("did:pkh:eip155:1:0x{address}")),
+            b"unsigned",
+            &signature
+        )
+        .is_ok());
+        // Same signer address under a non-eip155 issuer: refused by the namespace check.
+        assert!(matches!(
+            verify_eip191(
+                &artifact(&format!(
+                    "did:pkh:solana:4sGjMW1sUnHzSxGspuhpqLDx6wiyjNtZ:0x{address}"
+                )),
+                b"unsigned",
+                &signature
+            ),
+            Err(super::super::AuthorityError::SchemaInvalid)
+        ));
     }
 }
