@@ -944,9 +944,9 @@ fn validate_registered_decrypt_source(
     {
         return Err(MISMATCH);
     }
-    // Path-scoped shares bind raw wrapped bytes and always require a digest.
-    // Legacy immutable sources use the signed wire digest when present; older
-    // digest-less policies retain their prior readable behavior.
+    // Path-scoped sources accept both the raw wrapped-byte digest and the
+    // legacy CLI digest of the canonical base64 string. Legacy immutable
+    // pathless sources keep their signed wire-digest behavior.
     let immutable = source.get("mode").and_then(Value::as_str) == Some("immutable");
     if key_path.is_some() || immutable {
         if body.get("keyVersion").and_then(Value::as_u64)
@@ -960,22 +960,26 @@ fn validate_registered_decrypt_source(
         {
             let mut expected = [0_u8; 32];
             hex::decode_to_slice(digest, &mut expected).map_err(|_| MISMATCH)?;
-            let actual = if key_path.is_some() {
-                let wrapped = base64::decode(
-                    body.get("encryptedSymmetricKey")
-                        .and_then(Value::as_str)
-                        .ok_or(MISMATCH)?,
-                )
-                .map_err(|_| MISMATCH)?;
-                Sha256::digest(&wrapped)
+            let wrapped = body.get("encryptedSymmetricKey").ok_or(MISMATCH)?;
+            if !wrapped.is_string() {
+                return Err(MISMATCH);
+            }
+            let matches = if key_path.is_some() {
+                let encoded = wrapped.as_str().ok_or(MISMATCH)?;
+                let decoded = base64::decode(encoded).map_err(|_| MISMATCH)?;
+                let raw_digest = Sha256::digest(&decoded);
+                let mut wire_hasher = Sha256::new();
+                wire_hasher.update(b"\"");
+                wire_hasher.update(encoded.as_bytes());
+                wire_hasher.update(b"\"");
+                let wire_digest = wire_hasher.finalize();
+                bool::from(raw_digest[..].ct_eq(&expected))
+                    | bool::from(wire_digest[..].ct_eq(&expected))
             } else {
-                let wrapped = body.get("encryptedSymmetricKey").ok_or(MISMATCH)?;
-                if !wrapped.is_string() {
-                    return Err(MISMATCH);
-                }
-                Sha256::digest(canonical_json_value(wrapped))
+                let wire_digest = Sha256::digest(canonical_json_value(wrapped));
+                bool::from(wire_digest[..].ct_eq(&expected))
             };
-            if !bool::from(actual[..].ct_eq(&expected)) {
+            if !matches {
                 return Err(MISMATCH);
             }
         } else if key_path.is_some() {
