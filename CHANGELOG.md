@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 ### Changes
+- Add an offline Rust DCAP verifier with measured KMS/deployment policy and isolated, HPKE-based replica root export plus a memory-scoped import API. No serving-node identity, database, deployment, or CVM configuration changes. See `docs/attested-root-transfer.md`.
 - Deploys: the workflow supports an explicit, reason-recorded rollback to an earlier released dstack image on the unchanged N0 compose. It checks image labels, release tag, ancestry, and identical migration sources while preserving the normal forward-release guard.
 
 ## [1.25.17] - 2026-11-03

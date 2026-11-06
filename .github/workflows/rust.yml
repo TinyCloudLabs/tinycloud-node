@@ -27,6 +27,23 @@ env:
 # crates for wasm32-unknown-unknown — is now a real, unconditional step in the
 # `build` job.
 jobs:
+  attested-transfer:
+    name: attested transfer (offline vectors and CLI)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@1.97.1
+      with:
+        components: clippy, rustfmt
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      with:
+        shared-key: attested-transfer-1.97.1
+    - name: Run offline quote, policy, HPKE, and guest-agent CLI tests
+      run: cargo test --locked -p tinycloud-attestation -p tinycloud-root-transfer
+    - name: Check transfer crate lints
+      run: cargo clippy --locked -p tinycloud-attestation -p tinycloud-root-transfer --all-targets -- -D warnings
+
   threshold:
     name: threshold (crate, policy, primitive checker)
     runs-on: ubuntu-latest

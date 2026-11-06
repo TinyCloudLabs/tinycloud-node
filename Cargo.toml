@@ -9,6 +9,8 @@ members = [
     "tinycloud-sdk-rs",
     "tinycloud-core",
     "tinycloud-threshold",
+    "tinycloud-attestation",
+    "tinycloud-root-transfer",
     "dependencies/siwe",
     "dependencies/siwe-recap",
     "dependencies/cacao",

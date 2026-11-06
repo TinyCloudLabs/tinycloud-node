@@ -1,0 +1,32 @@
+[package]
+name = "tinycloud-root-transfer"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+license-file = "../LICENSE.md"
+rust-version = "1.97.1"
+[dependencies]
+anyhow = "1.0"
+blake3 = { version = "1.8", features = ["zeroize"] }
+bs58 = "0.5"
+clap = { version = "4.5", features = ["derive"] }
+ed25519-dalek = { version = "2.1", features = ["zeroize"] }
+dcap-qvl = { version = "=0.7.0", default-features = false, features = ["std", "ring", "default-x509"] }
+hex = "0.4"
+hpke = { version = "0.12", default-features = false, features = ["std", "x25519"] }
+rand = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tinycloud-attestation = { path = "../tinycloud-attestation" }
+zeroize = { version = "1.8", features = ["derive"] }
+# Enable zeroize-on-drop in HPKE's private key and cipher implementations.
+x25519-dalek = { version = "2.0", default-features = false, features = ["static_secrets", "zeroize"] }
+aes = { version = "0.8", features = ["zeroize"] }
+aes-gcm = { version = "0.10", features = ["zeroize"] }
+ghash = { version = "0.5", features = ["zeroize"] }
+polyval = { version = "0.6", features = ["zeroize"] }
+
+[dev-dependencies]
+tempfile = "3.20"

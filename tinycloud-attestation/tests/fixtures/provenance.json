@@ -1,0 +1,21 @@
+{
+  "fixture": "dstack-tdx-quote.json",
+  "source": "TinyCloudLabs/registry packages/location-registry/scripts/fixtures/dstack-tdx-quote.json",
+  "reference_verifier": "packages/location-registry/scripts/verify-dstack-attestation.mjs",
+  "reference_tests": "packages/location-registry/scripts/verify-dstack-attestation.test.mjs",
+  "sha256": "16f6849f546933368d630d050acb5e07236c5069d03d3128fbad85f4543d6d7b",
+  "copy": "Unmodified recorded fixture; no live collateral or endpoints used.",
+  "recorded_verification_time": 1789432200,
+  "report_data": "64 bytes of 0x42, not a root-import public-key binding",
+  "key_provider": {"name": "none", "id": ""},
+  "ordering": "app-id and compose-hash before boot-mr-done; key-provider after boot-mr-done and before system-ready",
+  "real_evidence": "Intel DCAP quote chain, recorded collateral, authenticated REPORTDATA, RTMR3 replay, quote/collateral corruption rejection, collateral freshness rejection",
+  "synthetic_evidence": "Private policy-only report bodies in src/tests.rs, including KMS-bearing event logs; these are not signed quotes and cannot pass public verification",
+  "missing_vector": "A real quote with the intended KMS SPKI identity, pinned reviewed measurements, and root-import HPKE public-key REPORTDATA binding; required before real transfer acceptance",
+  "provider_source": {
+    "repository": "Dstack-TEE/dstack",
+    "revision": "43f69f41cc546423f9f73fc48b16f8cf19053cbc",
+    "locations": ["dstack-util/src/system_setup.rs:886-889", "dstack-util/src/system_setup.rs:1345-1349", "dstack-util/src/system_setup.rs:1370-1382", "dstack-types/src/lib.rs:261-266"],
+    "kms_id": "Lowercase hex of x509_parser X509Certificate.public_key().raw, i.e. DER SubjectPublicKeyInfo of KMS root CA; not URL, app ID, provider label, or a hash"
+  }
+}

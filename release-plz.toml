@@ -100,3 +100,13 @@ publish = false
 name = "tinycloud-threshold"
 release = false
 publish = false
+
+[[package]]
+name = "tinycloud-attestation"
+release = false
+publish = false
+
+[[package]]
+name = "tinycloud-root-transfer"
+release = false
+publish = false
