@@ -95,7 +95,9 @@ describe('§3.9 decoded-certificate rules on synthetic certificates', () => {
   test('owner rulings: genesis genesis_t and budget; successor epoch and counter; re-key mpk and counter', () => {
     const previous = new Uint8Array(32).fill(1), rotated = times(G2_BASE, 5n);
     expect(verifyCert(signedCertificate({ t: 2, n: 3, coefficients, genesisT: 3 }))).toBe('InvalidEncoding');
-    expect(verifyCert(signedCertificate({ t: 3, n: 4, coefficients: [11n, 13n, 17n] }))).toBe('UnsupportedFaultBudget');
+    expect(verifyCert(signedCertificate({ t: 3, n: 4, coefficients: [11n, 13n, 17n] }))).toBe('ok');
+    expect(verifyCert(signedCertificate({ t: 3, n: 3, coefficients: [11n, 13n, 17n] }))).toBe('UnsupportedFaultBudget');
+    expect(verifyCert(signedCertificate({ t: 4, n: 5, coefficients: [11n, 13n, 17n, 19n] }))).toBe('UnsupportedFaultBudget');
     expect(verifyCert(signedCertificate({ t: 3, n: 4, coefficients: [11n, 13n, 17n], epoch: 1n, previous }))).toBe('ok');
     expect(verifyCert(signedCertificate({ t: 2, n: 3, coefficients, epoch: 0n, previous }))).toBe('InvalidEncoding');
     expect(verifyCert(signedCertificate({ t: 2, n: 3, coefficients, epoch: 1n, rekey: 2n, previous }))).toBe('InvalidEncoding');
@@ -104,7 +106,8 @@ describe('§3.9 decoded-certificate rules on synthetic certificates', () => {
     expect(verifyCert(signedCertificate({ t: 2, n: 3, coefficients, epoch: 1n, rekey: 0n, previous, previousMpk: rotated }))).toBe('InvalidEncoding');
     expect(verifyCert(signedCertificate({ t: 2, n: 3, coefficients, epoch: 1n, rekey: 1n, previous, previousMpk: rotated }))).toBe('ok');
     expect(verifyCert(signedCertificate({ t: 2, n: 3, coefficients, genesisT: 3, epoch: 1n, rekey: 1n, previous, previousMpk: rotated }))).toBe('InvalidEncoding');
-    expect(verifyCert(signedCertificate({ t: 3, n: 4, coefficients: [11n, 13n, 17n], epoch: 1n, rekey: 1n, previous, previousMpk: rotated }))).toBe('UnsupportedFaultBudget');
+    expect(verifyCert(signedCertificate({ t: 3, n: 4, coefficients: [11n, 13n, 17n], epoch: 1n, rekey: 1n, previous, previousMpk: rotated }))).toBe('ok');
+    expect(verifyCert(signedCertificate({ t: 3, n: 3, coefficients: [11n, 13n, 17n], epoch: 1n, rekey: 1n, previous, previousMpk: rotated }))).toBe('UnsupportedFaultBudget');
   });
   test('anchor, signature cap and signer', () => {
     const good = signedCertificate({ t: 2, n: 3, coefficients });

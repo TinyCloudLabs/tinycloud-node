@@ -23,6 +23,7 @@ test('committed transcript documents compute every named case', () => {
   expect(checkTranscripts(dkg).passed).toEqual([
     'genesis_2of3', 'genesis_2of3_selective_extraction', 'genesis_3of5_two_faulty',
     'genesis_3of5_answers_and_disqualification', 'insufficient_reconstruction_values', 'insufficient_qualified_dealers',
+    'genesis_3of4_one_faulty',
   ]);
   expect(checkTranscripts(reshare).passed).toEqual([
     'reshare_2of3_to_3of4', 'refresh_2of3_answered_complaint', 'reshare_wrong_constant', 'reshare_t_prime_complaints', 'reshare_insufficient_dealers',
@@ -73,7 +74,7 @@ test('real CLI checks all committed documents by default and a transcript docume
   const all = run();
   expect(all.exitCode).toBe(0);
   expect(all.stdout.toString()).toContain('Primitive vectors: 18/18');
-  expect(all.stdout.toString()).toContain('DKG transcripts: 6/6');
+  expect(all.stdout.toString()).toContain('DKG transcripts: 7/7');
   expect(all.stdout.toString()).toContain('Reshare transcripts: 5/5');
   const one = run(new URL('../v1/reshare.json', import.meta.url).pathname);
   expect(one.exitCode).toBe(0);

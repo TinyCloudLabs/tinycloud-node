@@ -47,6 +47,12 @@ describe('honest genesis', () => {
     expect(out.reconstructed).toEqual([]);
     expect(out.transcriptHash).toEqual(seal(s.digest, s.start, s.rounds).hash);
   });
+  test('3-of-4 output matches scalar-domain expectation', () => {
+    const s = dkgSetup('honest-3of4', 3, 4), out = run(s);
+    expectPublic(out, s, [1, 2, 3, 4]);
+    expect(out.disqualified).toEqual([]);
+    expect(out.reconstructed).toEqual([]);
+  });
   test('byte-identical retransmissions and a second valid signature on one envelope are one message', () => {
     const s = dkgSetup('retransmit', 2, 3);
     const twice = s.rounds.map((round, k) => k === 1 ? [...round, round[1]!, { ...round[1]!, signature: (m: Bytes, signer: string) => alternateSignature(signer, m) }] : round);
@@ -235,7 +241,11 @@ describe('ceremony, round structure and limits', () => {
     expect(verifyWith(signedCeremony({ kind: 1, t: 2, n: 3, epoch: 1n }), [])).toBe('InvalidCeremony');
     expect(verifyWith(signedCeremony({ kind: 1, t: 2, n: 3, rekey: 1n }), [])).toBe('InvalidCeremony');
     expect(verifyWith(signedCeremony({ kind: 1, t: 2, n: 3, current: new Uint8Array(32) }), [])).toBe('InvalidCeremony');
-    expect(verifyWith(signedCeremony({ kind: 1, t: 3, n: 4 }), [])).toBe('UnsupportedFaultBudget');
+    expect(verifyWith(signedCeremony({ kind: 1, t: 4, n: 5 }), [])).toBe('UnsupportedFaultBudget');
+    expect(verifyWith(signedCeremony({ kind: 1, t: 3, n: 3 }), [])).toBe('UnsupportedFaultBudget');
+    // 3-of-4 passes the budget and is refused only for its missing rounds, like 2-of-3.
+    expect(verifyWith(signedCeremony({ kind: 1, t: 3, n: 4 }), [])).toBe(verifyWith(signedCeremony({ kind: 1, t: 2, n: 3 }), []));
+    expect(verifyWith(signedCeremony({ kind: 1, t: 3, n: 4 }), [])).not.toBe('UnsupportedFaultBudget');
     expect(verifyWith({ ...s.ceremony, signature: flip(s.ceremony.signature, 0) }, [])).toBe('InvalidSignature');
     expect(verifyWith({ ...s.ceremony, body: concat(s.ceremony.body, be(0n, 1)) }, [])).toBe('InvalidEncoding');
     expect(verifyWith(signedCeremony({ kind: 1, t: 2, n: 3, directory: [{ index: 1, did: did(1) }, { index: 2, did: did(1) }, { index: 3, did: did(3) }] }), [])).toBe('InvalidEncoding');
