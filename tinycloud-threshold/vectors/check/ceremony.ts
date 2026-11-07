@@ -96,6 +96,10 @@ function checkDirectory(t: number, n: number, entries: { index: number; did: str
   if (entries.some((e, k) => e.index !== k + 1)) fail('InvalidEncoding');
   if (new Set(entries.map(e => e.did)).size !== n) fail('InvalidEncoding');
 }
+/** §3.0 genesis budget: n >= 2t-1 (t-1 faulty members) or exactly 3-of-4 (one faulty member). */
+export function checkGenesisShape(t: number, n: number) {
+  if (n < 2 * t - 1 && !(t === 3 && n === 4)) fail('UnsupportedFaultBudget');
+}
 
 export const KIND = { genesis: 1, reshare: 2, refresh: 3, rekey: 4 } as const;
 export interface Ceremony {
@@ -164,12 +168,12 @@ export function decodeCertificate(body: Bytes): Omit<Certificate, 'publicShares'
   // §3.9 field combinations.
   if (!previous) {
     if (previousMpk || epoch !== 0n || rekey !== 0n || genesisT !== t) fail(DEFAULT_ERROR.certificateFields);
-    if (n < 2 * t - 1) fail('UnsupportedFaultBudget');
+    checkGenesisShape(t, n);
   } else {
     if (epoch < 1n || rekey > epoch) fail(DEFAULT_ERROR.certificateFields);
     if (previousMpk) {
       if (previousMpk.equals(mpk) || rekey < 1n || genesisT !== t) fail(DEFAULT_ERROR.certificateFields);
-      if (n < 2 * t - 1) fail('UnsupportedFaultBudget');
+      checkGenesisShape(t, n);
     }
   }
   return {

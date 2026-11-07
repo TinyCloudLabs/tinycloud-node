@@ -1,7 +1,7 @@
 import { bls12_381 as bls } from '@noble/curves/bls12-381.js';
 import { DST, PEDERSEN_H_MESSAGE, ProtocolError, Reader, bytes, g2, scalar, tagged, type Bytes, type G2 } from './protocol.ts';
 import {
-  COHORT, DEFAULT_ERROR, KIND, TAG, authorizeCeremony, checkTranscriptSize, classify, evaluate, fail, listCount,
+  COHORT, DEFAULT_ERROR, KIND, TAG, authorizeCeremony, checkGenesisShape, checkTranscriptSize, classify, evaluate, fail, listCount,
   memberIndex, mul, verifyChain, type Anchor, type Authenticated, type Ceremony, type Classified, type RoundRecord,
   type Statement, type Verifier,
 } from './ceremony.ts';
@@ -100,7 +100,7 @@ export function authorizeGenesis(anchor: Anchor, statement: Statement, verify: V
   const c = authorizeCeremony(anchor, statement, verify);
   if (c.kind !== KIND.genesis) fail('InvalidCeremony');
   if (c.current || c.rekey !== 0n || c.epoch !== 0n) fail(DEFAULT_ERROR.genesisFields);
-  if (c.n < 2 * c.t - 1) fail('UnsupportedFaultBudget');
+  checkGenesisShape(c.t, c.n);
   return c;
 }
 

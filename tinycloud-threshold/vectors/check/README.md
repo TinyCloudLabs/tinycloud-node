@@ -30,8 +30,8 @@ records, using `ceremony.ts` for the S0.2 layer. Check order:
 1. Byte-length sum of every closure body/signature and member envelope/signature
    above 4194304 → `LimitExceeded`, before any decoding or signature.
 2. Ceremony statement: decode (`InvalidEncoding`), owner/network against the
-   anchor, owner signature, kind and generation rules; genesis `n < 2t−1` →
-   `UnsupportedFaultBudget`.
+   anchor, owner signature, kind and generation rules; a genesis shape other
+   than `n >= 2t−1` or exactly 3-of-4 → `UnsupportedFaultBudget`.
 3. Redistribution only: the current certificate (decode, anchor, owner
    signature, evaluated public shares), then ceremony/certificate binding
    (`InvalidCeremony`), successor epoch/re-key and refresh shape.
