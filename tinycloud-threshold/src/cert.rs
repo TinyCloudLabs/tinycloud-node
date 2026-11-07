@@ -764,6 +764,23 @@ pub(crate) mod tests {
         for length in 0..cert.body.encode().len() {
             assert!(CertificateBody::decode(&cert.body.encode()[..length]).is_err());
         }
+        // Genesis budget on decoded bytes: 3-of-4 is admitted, 3-of-3 is not.
+        let mut three_of_four = cert.body.clone();
+        three_of_four.public = material(11, Threshold::new(3, 4).unwrap()).0;
+        three_of_four.genesis_t = 3;
+        three_of_four.members.push(CertMember {
+            index: MemberIndex::new(4).unwrap(),
+            node: Signers::did(4),
+        });
+        let decoded = CertificateBody::decode(&three_of_four.encode()).unwrap();
+        assert_eq!(decoded.encode(), three_of_four.encode());
+        let mut three_of_three = cert.body.clone();
+        three_of_three.public = material(11, Threshold::new(3, 3).unwrap()).0;
+        three_of_three.genesis_t = 3;
+        assert_eq!(
+            CertificateBody::decode(&three_of_three.encode()).err(),
+            Some(Error::UnsupportedFaultBudget)
+        );
         let mut impostor = cert.body.clone();
         impostor.owner = Signers::did(9);
         assert!(matches!(

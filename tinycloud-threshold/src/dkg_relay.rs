@@ -620,17 +620,57 @@ fn genuine_2of3_completes_with_every_member_and_the_verifier_agreeing() {
 }
 
 #[test]
-fn genesis_3of4_is_refused_before_any_dealing() {
-    let (signers, statement) = statement(3, 4, 0x32);
-    assert!(matches!(
-        AuthorizedCeremony::verify_genesis(&signers.anchor(), &statement, &signers),
-        Err(Error::UnsupportedFaultBudget)
-    ));
+fn genuine_3of4_completes_with_every_member_and_the_verifier_agreeing() {
+    let run = honest(3, 4, 0x32);
+    let output = agreed(&run, &[1, 2, 3, 4]);
+    assert_eq!(output.qual, members(&[1, 2, 3, 4]));
+    assert!(output.disqualified.is_empty());
+    assert!(output.reconstructed.is_empty());
+    assert_eq!(run.transcript.rounds.len(), 5);
+    assert_eq!(output.public.threshold(), Threshold::new(3, 4).unwrap());
+    assert_eq!(output.public.commitments().count(), 3);
+}
+
+#[test]
+fn genesis_outside_the_budget_is_refused_before_any_dealing() {
+    for (t, n) in [(2, 2), (3, 3), (4, 4), (4, 5), (4, 6), (5, 8)] {
+        let (signers, statement) = statement(t, n, 0x32);
+        assert!(
+            matches!(
+                AuthorizedCeremony::verify_genesis(&signers.anchor(), &statement, &signers),
+                Err(Error::UnsupportedFaultBudget)
+            ),
+            "{t}-of-{n}"
+        );
+    }
+}
+
+#[test]
+fn three_of_four_with_one_faulty_member_recovers_the_committed_master_key() {
+    // Member 4 is faulty. Its R4 vector passes only its own check, so honest
+    // members 1-3 complain in R5; it then withholds R6, and the three honest
+    // values recover its committed contribution.
+    let mut constants_seen = BTreeMap::new();
+    let run = run(3, 4, 0x3b, |out| match out.round() {
+        4 => {
+            constants(out, &mut constants_seen);
+            let forged = vanishing_feldman(&out.payload(4), &[4]);
+            out.replace(4, &forged);
+        }
+        6 => out.remove(4),
+        _ => {}
+    });
+    let output = agreed(&run, &[1, 2, 3]);
+    assert_eq!(output.qual, members(&[1, 2, 3, 4]));
+    assert!(output.disqualified.is_empty());
+    assert_eq!(output.reconstructed, members(&[4]));
     assert_eq!(
-        Threshold::new(3, 4).unwrap().check_genesis_budget(),
-        Err(Error::UnsupportedFaultBudget)
+        output.public.master_public_key().encode(),
+        genuine_mpk(&constants_seen, &output.qual)
     );
-    assert_eq!(Threshold::new(3, 5).unwrap().check_genesis_budget(), Ok(()));
+    for i in [1, 2, 3] {
+        assert!(run.reconstruct[&i]);
+    }
 }
 
 #[test]
@@ -1682,18 +1722,20 @@ const BEHAVIOURS: u8 = 15;
 const ENUMERATION_SEEDS: [u8; 2] = [0x01, 0x9c];
 
 // Coverage: the enumeration below runs every behaviour assignment of the
-// in-tree `misbehave` model to the last t−1 members, for 2-of-3 and 3-of-5,
-// under two fixed seeds: 2 × (15 + 15 × 15) = 480 ceremonies. It covers this
+// in-tree `misbehave` model to the last f members, where f is the genesis
+// fault budget: t−1 for 2-of-3 and 3-of-5, and 1 for 3-of-4. Under two fixed
+// seeds that is 2 × (15 + 15 + 15 × 15) = 510 ceremonies. It covers this
 // model only, with honest messages always delivered by the relay; it is not a
 // claim about arbitrary faulty behaviour, other seeds or other parameters.
 
-/// One within-budget run: faulty members are the last t−1 indices; every honest
-/// member and the verifier agree, honest dealers stay in QUAL, and mpk is the sum
-/// of the QUAL dealers' committed constants.
+/// One within-budget run: faulty members are the last `behaviours.len()`
+/// indices; every honest member and the verifier agree, honest dealers stay in
+/// QUAL, and mpk is the sum of the QUAL dealers' committed constants.
 fn within_budget_agreement(t: u16, n: u16, seed: u8, behaviours: &[u8]) {
-    let honest_members: Vec<u16> = (1..=n - (t - 1)).collect();
-    let faulty: Vec<u16> = (n - (t - 1) + 1..=n).collect();
-    assert_eq!(faulty.len(), behaviours.len());
+    let f = behaviours.len() as u16;
+    assert!(f < t && n - f >= t, "{t}-of-{n} with {f} faulty");
+    let honest_members: Vec<u16> = (1..=n - f).collect();
+    let faulty: Vec<u16> = (n - f + 1..=n).collect();
     let mut constants_seen = BTreeMap::new();
     let run = run(t, n, seed, |out| {
         if out.round() == 4 {
@@ -1729,6 +1771,15 @@ fn every_within_budget_fault_pattern_finishes_with_identical_outcomes_2of3() {
     for seed in ENUMERATION_SEEDS {
         for behaviour in 0..BEHAVIOURS {
             within_budget_agreement(2, 3, seed, &[behaviour]);
+        }
+    }
+}
+
+#[test]
+fn every_within_budget_fault_pattern_finishes_with_identical_outcomes_3of4() {
+    for seed in ENUMERATION_SEEDS {
+        for behaviour in 0..BEHAVIOURS {
+            within_budget_agreement(3, 4, seed, &[behaviour]);
         }
     }
 }
@@ -1860,6 +1911,14 @@ fn vectors() -> Value {
             out.remove(3);
         }
     });
+    let three_of_four = run(3, 4, 0x67, |out| match out.round() {
+        4 => {
+            let forged = vanishing_feldman(&out.payload(4), &[4]);
+            out.replace(4, &forged);
+        }
+        6 => out.remove(4),
+        _ => {}
+    });
     let cases = vec![
         case("genesis_2of3", "All members follow the protocol; R5 is empty and no R6 round exists.", &honest_run),
         case("genesis_2of3_selective_extraction", "Dealer 3's R4 vector passes only member 1's check; member 2's R5 complaint leads to R6 reconstruction of dealer 3.", &selective),
@@ -1867,6 +1926,7 @@ fn vectors() -> Value {
         case("genesis_3of5_answers_and_disqualification", "Dealer 1's bad value to member 2 is answered; dealer 4 sends two R1 messages; dealer 5 does not answer member 1's complaint.", &answers),
         case("insufficient_reconstruction_values", "Only member 1 sends R6 for faulted dealer 3.", &insufficient),
         case("insufficient_qualified_dealers", "Only dealer 1 publishes R1.", &unqualified),
+        case("genesis_3of4_one_faulty", "Dealer 4's R4 passes only its own check; members 1-3 complain in R5; member 4 sends no R6 and members 1-3 reconstruct dealer 4.", &three_of_four),
     ];
     let signers: Vec<_> = (0..=5u8)
         .map(|i| {
@@ -1882,7 +1942,7 @@ fn vectors() -> Value {
         "suite": "BLS12-381 G2 Pedersen/Feldman GJKR New-DKG; RFC 9180 base mode DHKEM(X25519, HKDF-SHA256)/HKDF-SHA256/ChaCha20-Poly1305 dealings; Ed25519 test signatures",
         "spec_sections": ["3.2", "3.3", "3.7", "3.10", "S0.3 DKG appendix"],
         "encoding": "hex; statements are exact signed bytes; scalars 32-byte big-endian; G2 96-byte compressed",
-        "seeds": {"ceremonies": [0x61, 0x62, 0x63, 0x64, 0x65, 0x66]},
+        "seeds": {"ceremonies": [0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67]},
         "dst": {
             "dkg_start": String::from_utf8_lossy(DKG_START),
             "pedersen_h": String::from_utf8_lossy(dst::PEDERSEN_H),

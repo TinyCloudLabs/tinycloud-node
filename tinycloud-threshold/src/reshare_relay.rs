@@ -661,8 +661,9 @@ pub(crate) fn wrapped(
     (data, ct)
 }
 
-/// Every t-subset of the shares derives the key and unwraps `ct`; t−1 shares
-/// return `NotEnoughShares`. Returns the number of subsets exercised.
+/// Every t-subset of the shares derives the key and unwraps `ct`; every
+/// (t−1)-subset returns `NotEnoughShares`. Returns the number of t-subsets
+/// exercised.
 pub(crate) fn unwraps_through_every_subset(
     cert: &VerifiedCertificate,
     shares: &BTreeMap<u16, KeyShare>,
@@ -704,10 +705,21 @@ pub(crate) fn unwraps_through_every_subset(
         );
         subsets += 1;
     }
-    assert!(matches!(
-        combine(cert.public_key_set(), &req, &issued[..t - 1]),
-        Err(CombineError::NotEnoughShares)
-    ));
+    for mask in 0u32..(1u32 << issued.len()) {
+        if mask.count_ones() as usize != t - 1 {
+            continue;
+        }
+        let selected: Vec<EncryptedKeyShare> = issued
+            .iter()
+            .enumerate()
+            .filter(|(k, _)| mask & (1u32 << k) != 0)
+            .map(|(_, s)| s.clone())
+            .collect();
+        assert!(matches!(
+            combine(cert.public_key_set(), &req, &selected),
+            Err(CombineError::NotEnoughShares)
+        ));
+    }
     subsets
 }
 
@@ -881,11 +893,6 @@ fn genuine_2of3_to_3of4_preserves_the_master_key_and_binds_every_candidate() {
         assert_eq!(answers.as_ref().unwrap().as_slice(), &EMPTY_ANSWERS);
     }
     public_shares_interpolate_to_mpk(&output.public);
-    // 3-of-4 is reachable by redistribution although genesis refuses it.
-    assert_eq!(
-        Threshold::new(3, 4).unwrap().check_genesis_budget(),
-        Err(Error::UnsupportedFaultBudget)
-    );
     let (data, ct) = wrapped(&run.fixture.current, "records/reshare", 0x81);
     let next = install(run, &output);
     assert_eq!(next.cert.key_context().epoch().get(), 1);
@@ -902,10 +909,14 @@ fn genuine_2of3_to_3of4_preserves_the_master_key_and_binds_every_candidate() {
     );
 }
 
-#[test]
-fn dkg_genesis_reshare_chain_keeps_the_master_key_through_refresh() {
-    let dkg = crate::dkg_relay::honest(2, 3, 0x83);
-    let genesis_output = crate::dkg_relay::agreed(&dkg, &[1, 2, 3]);
+/// A real signed DKG genesis of `genesis` shape, then each redistribution step
+/// in turn: the master key is unchanged, every successor certificate binds every
+/// candidate, and every t-subset of each generation unwraps one record.
+fn dkg_genesis_chain(genesis: (u16, u16), seed: u8, steps: &[(CeremonyKind, u16, u16, u8)]) {
+    let (t, n) = genesis;
+    let all: Vec<u16> = (1..=n).collect();
+    let dkg = crate::dkg_relay::honest(t, n, seed);
+    let genesis_output = crate::dkg_relay::agreed(&dkg, &all);
     let crate::dkg_relay::Run {
         fixture: dkg_fixture,
         outcomes,
@@ -930,18 +941,13 @@ fn dkg_genesis_reshare_chain_keeps_the_master_key_through_refresh() {
         .map(|(i, o)| (i, KeyShare::bind(o.unwrap().0, &genesis).unwrap()))
         .collect();
     let mpk = genesis.public_key_set().master_public_key().encode();
-    let (data, ct) = wrapped(&genesis, "records/chain", 0x84);
+    let (data, ct) = wrapped(&genesis, "records/chain", seed.wrapping_add(1));
     assert_eq!(
-        unwraps_through_every_subset(&genesis, &held, "records/chain", &data, &ct, 0x84),
-        3
+        unwraps_through_every_subset(&genesis, &held, "records/chain", &data, &ct, seed),
+        subsets(t, n)
     );
     let mut current = genesis;
-    let steps = [
-        (Reshare, 3u16, 4u16, 0x85u8, 4usize),
-        (Reshare, 2, 3, 0x86, 3),
-        (Refresh, 2, 3, 0x87, 3),
-    ];
-    for (kind, t, n, seed, subsets) in steps {
+    for &(kind, t, n, seed) in steps {
         let epoch = current.key_context().epoch().get();
         let dids: Vec<u8> = (1..=n as u8).collect();
         let f = fixture_on(current, held.into_values(), kind, t, n, seed, &dids);
@@ -966,11 +972,44 @@ fn dkg_genesis_reshare_chain_keeps_the_master_key_through_refresh() {
                 &ct,
                 seed
             ),
-            subsets
+            subsets(t, n)
         );
         current = next.cert;
         held = next.shares;
     }
+}
+
+/// The number of t-subsets of n members.
+fn subsets(t: u16, n: u16) -> usize {
+    (0u32..(1u32 << n))
+        .filter(|mask| mask.count_ones() == u32::from(t))
+        .count()
+}
+
+#[test]
+fn dkg_genesis_reshare_chain_keeps_the_master_key_through_refresh() {
+    dkg_genesis_chain(
+        (2, 3),
+        0x83,
+        &[
+            (Reshare, 3, 4, 0x85),
+            (Reshare, 2, 3, 0x86),
+            (Refresh, 2, 3, 0x87),
+        ],
+    );
+}
+
+#[test]
+fn dkg_genesis_3of4_reshares_to_2of3_and_back_keeping_the_master_key() {
+    dkg_genesis_chain(
+        (3, 4),
+        0x8a,
+        &[
+            (Reshare, 2, 3, 0x8c),
+            (Reshare, 3, 4, 0x8d),
+            (Refresh, 3, 4, 0x8e),
+        ],
+    );
 }
 
 #[test]
