@@ -1,5 +1,5 @@
-//! Encryption at rest (TC-887). Nothing in the node calls this module yet; it
-//! is switched off until the key-continuity gate exists.
+//! Encryption at rest (TC-887): the TCE1 envelope, the keyring, and the
+//! view storage reads of the node's at-rest state. Off unless configured.
 
 mod envelope;
 mod hierarchy;
@@ -13,6 +13,7 @@ mod stream;
 mod testing;
 #[cfg(test)]
 mod tests;
+mod view;
 
 pub use envelope::{
     ciphertext_len, format_version, open, plaintext_len, seal, BlobIdentity, EnvelopeError, Header,
@@ -27,3 +28,4 @@ pub use testing::FixedKeyProvider;
 
 pub use keyring::{AtRestKeyring, KeyringConfig, KeyringState};
 pub use store::{AtRestStore, KeyMirror};
+pub use view::{AtRestMode, AtRestSource, AtRestView};

@@ -73,6 +73,7 @@ use tinycloud_core::{
 
 pub mod admin;
 pub mod admin_stats;
+pub mod at_rest;
 pub mod attestation;
 pub mod encryption;
 pub mod hooks;
@@ -337,6 +338,18 @@ pub struct NodeInfo {
     /// when the node's database is not PostgreSQL.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub postgres: Option<PostgresInfo>,
+    /// Encryption at rest (TC-887): omitted unless the node is configured
+    /// for it. Details at `/at-rest/status`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub at_rest: Option<AtRestInfo>,
+}
+
+#[derive(Serialize)]
+pub struct AtRestInfo {
+    pub mode: &'static str,
+    /// `locked` means encrypted data is unavailable until recovery.
+    pub state: &'static str,
+    pub encrypting: bool,
 }
 
 /// Process-wide PostgreSQL connection counters in [`NodeInfo`].
@@ -354,6 +367,7 @@ fn build_info(
     encryption: &State<EncryptionService>,
     config: &State<crate::config::Config>,
     database: Option<&tinycloud_core::RecoveringConnection>,
+    at_rest: Option<&crate::at_rest::AtRestRuntime>,
 ) -> NodeInfo {
     #[allow(unused_mut)]
     let mut features = vec!["kv", "delegation", "sharing", "sql"];
@@ -396,6 +410,13 @@ fn build_info(
                 sockets_configured: sqlx_core::net::tcp_keepalive::sockets_configured(),
                 connections_opened: crate::postgres_connections_opened(),
             }),
+        at_rest: at_rest
+            .filter(|r| r.keyring().is_some())
+            .map(|r| AtRestInfo {
+                mode: r.mode_name(),
+                state: r.state_name(),
+                encrypting: r.encrypting(),
+            }),
     }
 }
 
@@ -425,8 +446,16 @@ pub fn info(
     encryption: &State<EncryptionService>,
     config: &State<crate::config::Config>,
     pool: NodePool<'_>,
+    at_rest: crate::at_rest::AtRestState<'_>,
 ) -> Json<NodeInfo> {
-    Json(build_info(tee, quota_cache, encryption, config, pool.0))
+    Json(build_info(
+        tee,
+        quota_cache,
+        encryption,
+        config,
+        pool.0,
+        at_rest.0,
+    ))
 }
 
 #[get("/version")]
@@ -436,8 +465,16 @@ pub fn version(
     encryption: &State<EncryptionService>,
     config: &State<crate::config::Config>,
     pool: NodePool<'_>,
+    at_rest: crate::at_rest::AtRestState<'_>,
 ) -> Json<NodeInfo> {
-    Json(build_info(tee, quota_cache, encryption, config, pool.0))
+    Json(build_info(
+        tee,
+        quota_cache,
+        encryption,
+        config,
+        pool.0,
+        at_rest.0,
+    ))
 }
 
 #[allow(clippy::let_unit_value)]

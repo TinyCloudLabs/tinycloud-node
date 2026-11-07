@@ -25,6 +25,7 @@ use std::{
 };
 
 pub mod allow_list;
+pub mod at_rest;
 pub mod auth_guards;
 pub mod authorization;
 pub mod cli;
@@ -257,6 +258,10 @@ use routes::tc_bench::{
 use routes::{
     admin::{delete_quota, get_quota, get_usage, list_quotas, set_quota},
     admin_stats::get_stats,
+    at_rest::{
+        at_rest_escrow, at_rest_escrow_record, at_rest_recovery, at_rest_recovery_share,
+        at_rest_status,
+    },
     attestation::attestation,
     create_signed_kv_url, delegate, delegation_query, delegation_status,
     encryption::{
@@ -641,6 +646,11 @@ fn production_routes(named_keys_v1: bool) -> Vec<Route> {
         public_kv_list,
         public_kv_options,
         attestation,
+        at_rest_status,
+        at_rest_escrow,
+        at_rest_escrow_record,
+        at_rest_recovery,
+        at_rest_recovery_share,
         set_quota,
         delete_quota,
         get_quota,
@@ -774,6 +784,9 @@ pub async fn app_with_control(
                         })
                     }
                     Err(e) => {
+                        // TC-887: at-rest must not boot as non-TEE when it
+                        // can't tell; that would skip its TEE checks.
+                        at_rest::refuse_unknown_tee(&tinycloud_config.at_rest, &e)?;
                         ::tracing::warn!("dstack socket available but get_info failed: {}", e);
                         None
                     }
@@ -819,6 +832,10 @@ pub async fn app_with_control(
         node_keypair,
         encryption_backend,
     );
+
+    // TC-887: at-rest state, before block storage opens so storage can hold
+    // it; the keyring is installed after migrations (`at_rest::setup`).
+    let at_rest_runtime = at_rest::AtRestRuntime::new(&tinycloud_config.at_rest);
 
     // Migrate before opening S3: its one bucket listing both reconstructs
     // SpaceSizes and records which in-flight DELETE fences were counted.
@@ -946,6 +963,19 @@ pub async fn app_with_control(
     // space in the table one (existing byte counts are kept).
     let seeded_spaces = tinycloud.seed_store_sizes().await?;
     ::tracing::info!(spaces = seeded_spaces, "seeded block-store space sizes");
+    // TC-887: at-rest keys (after migrations). Off unless configured; an
+    // `encrypt`/`strict` mode whose escrow gate fails stops the boot here.
+    at_rest::setup(
+        &at_rest_runtime,
+        &tinycloud_config.at_rest,
+        &tinycloud_config.storage,
+        key_setup.as_bytes(),
+        seed_conn.clone(),
+        tinycloud.sqlite_writer_lock(),
+        tee_context.as_ref(),
+    )
+    .await?;
+    at_rest_runtime.spawn_gate_retry(std::time::Duration::from_secs(30));
     #[cfg(feature = "tc-bench-v1")]
     let bench_state = BenchState::new(
         &tinycloud_config.tc_bench,
@@ -1144,6 +1174,7 @@ pub async fn app_with_control(
         .manage(egress_policy)
         .manage(rate_limiter)
         .manage(tee_context)
+        .manage(at_rest_runtime)
         .manage(encryption_service)
         .manage(policy_v3_runtime)
         .manage(seed_conn.clone())
