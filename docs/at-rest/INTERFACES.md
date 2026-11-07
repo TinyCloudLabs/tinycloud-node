@@ -1,9 +1,9 @@
 # Encryption at rest: interfaces (TC-887)
 
-> **Status (TC-887):** on `main` today: the envelope, key types, `DataKeyProvider` and the
-> harness. Not on `main` yet: key continuity (`docs/at-rest-escrow.md`, `at_rest::keyring`,
-> node wiring) and sealed KV storage (§7). They land with PRs #325–#327 and #329/#333/#336
-> (#336: the S3 store seals KV blocks).
+> **Status (TC-887):** the envelope, key types, `DataKeyProvider`, the keyring
+> (`at_rest::keyring`), the node wiring (`docs/at-rest-escrow.md`) and the storage view
+> (`at_rest::{AtRestMode, AtRestView, AtRestSource}`) are in. Sealed KV storage (§7) and sealed
+> SQL artifacts follow; until both seal, the node refuses `encrypt` and `strict`.
 
 Normative interface and format for `tinycloud_core::at_rest` and the node's sealed KV block
 storage. Plan: TC-887 (encryption at rest inside the TEE). Key continuity and escrow:
@@ -69,6 +69,10 @@ pub trait DataKeyProvider: Send + Sync {
     fn object_name_key(&self) -> Result<ObjectNameKey, DataKeyError>;
 }
 
+/// Runs `f` as work under the invoke write lock: providers make no key-store
+/// writes there; a key that would need creating or restoring is `NotPrepared`.
+pub async fn write_locked<F: Future>(f: F) -> F::Output;
+
 #[derive(Debug, thiserror::Error)]
 pub enum DataKeyError {
     /// Node booted locked (W cannot unseal ARK). Callers map to HTTP 503.
@@ -81,6 +85,9 @@ pub enum DataKeyError {
     /// PG/S3/unwrap failure (incl. a wrapped DEK failing AEAD). Opaque, no key bytes.
     #[error("data key backend: {0}")]
     Backend(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// A key needed creating or restoring inside `write_locked`. Callers map to 503.
+    #[error("the space's data key was not prepared before the write lock")]
+    NotPrepared,
 }
 ```
 
