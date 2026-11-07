@@ -135,9 +135,12 @@ async fn authorize_admitted(
     tinycloud
         .authorize_admitted(&admitted, now)
         .await
-        .map_err(|error| match error.revocation_code() {
-            Some(code) => InvokeError::Revoked(code, error.to_string()),
-            None => (Status::Unauthorized, error.to_string()).into(),
+        .map_err(|error| {
+            super::authorization_refusal(
+                "server.hooks.auth",
+                &tinycloud_core::db::TxStoreError::Tx(error.into()),
+                false,
+            )
         })?;
     Ok(admitted)
 }
@@ -2589,6 +2592,29 @@ mod tests {
             )
             .await;
         assert_eq!(status, Status::NoContent);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tc2514_hook_list_authorization_database_failure_is_retryable() -> Result<()> {
+        let fixture =
+            hook_route_fixture(&[("hooks", "kv/documents", "tinycloud.hooks/list")]).await?;
+        let claim = [(
+            fixture.hooks("kv/documents")?,
+            &["tinycloud.hooks/list"][..],
+        )];
+        let (status, body) = fixture.list(fixture.session_header(&claim)?).await;
+        assert_eq!(status, Status::Ok, "{body}");
+
+        // Fail the first authorization-graph lookup, before the policy gate,
+        // replay insertion, or subscription query can run.
+        fixture.db.clone().close().await?;
+        let (status, body) = fixture.list(fixture.session_header(&claim)?).await;
+        assert_eq!(status, Status::ServiceUnavailable, "{body}");
+        assert!(
+            body.starts_with(super::super::UNAVAILABLE_RETRYABLE),
+            "{body}"
+        );
         Ok(())
     }
 
