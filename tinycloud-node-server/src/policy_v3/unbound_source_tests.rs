@@ -17,24 +17,35 @@ const CONTENT_SOURCE_INVALID: &str = "content-source-invalid";
 const KV_GET: &str = "tinycloud.kv/get";
 const DECRYPT: &str = "tinycloud.encryption/decrypt";
 
-/// A node with named keys on, which a path-bound share key needs: the owner
-/// of the policy is granted decrypt on the key itself. The ledger directory
-/// lives as long as the harness.
+/// A node with named keys on, which a path-bound share key needs, and the
+/// space owner's `default` network, where a registration records the share
+/// key: the owner of the policy is granted decrypt on the key itself. The
+/// ledger directory lives as long as the harness.
 pub(super) async fn boot(
     backend: Backend,
     test: &str,
 ) -> anyhow::Result<Option<(Harness, tempfile::TempDir)>> {
+    use tinycloud_core::encryption_network::{CreateNetworkRequest, Threshold};
     let ledger = tempfile::tempdir()?;
     let path = ledger.path().join("deletion-ledger.jsonl");
     let named_keys = move |config: &mut crate::config::Config| {
         config.encryption_network.named_keys_v1 = true;
         config.encryption_network.deletion_ledger_path = Some(path);
     };
-    Ok(
-        Harness::new_with(backend, Shape::KeySession, test, named_keys)
-            .await?
-            .map(|h| (h, ledger)),
-    )
+    let Some(h) = Harness::new_with(backend, Shape::KeySession, test, named_keys).await? else {
+        return Ok(None);
+    };
+    h.client
+        .rocket()
+        .state::<EncryptionService>()
+        .expect("encryption service")
+        .create_one_of_one_network(CreateNetworkRequest {
+            name: "default".into(),
+            owner_did: h.space_owner.did().into(),
+            threshold: Threshold::one_of_one(),
+        })
+        .await?;
+    Ok(Some((h, ledger)))
 }
 
 /// The policy owner holds kv reads and decrypt on `key`.

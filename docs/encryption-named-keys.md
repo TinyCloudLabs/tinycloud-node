@@ -51,6 +51,26 @@ reused.
 - A `deleted` deletable row is reused: new seed, state `active`, `keyVersion` + 1.
 - A `deleted` deterministic row answers `key_deleted` (403).
 
+### Share keys recorded by a policy registration
+
+A Policy/v3 registration (`POST /policy/v3/policies`) whose `contentSource`
+names `encryptionKeyPath` `share/<shareId>` records that key on the source's
+`default` network in the registration's own transaction, under the network
+row lock, so a publisher encrypts to the public key and never calls create.
+The registration already requires its owner to hold `decrypt` on that exact
+key as the network owner or through the owner's own delegations (a policy
+session is never that authority).
+
+- A missing key is created as `create` would (`keyVersion` 1, state
+  `active`) and counts toward the same per-network limit. At the limit the
+  registration answers 403 `key_limit_exceeded` and stores nothing.
+- An existing key is left as it is, whatever its state: a `blocked` key stays
+  blocked.
+- The network must exist and be active (`network_not_found` 404,
+  `network_not_active` 409); otherwise nothing is stored.
+- A registration the node already stores answers as before and records
+  nothing.
+
 ## State guards
 
 Create, block and unblock run under the network row lock. Block and unblock
