@@ -27,12 +27,16 @@ use std::{
     time::Instant,
 };
 use tinycloud_auth::resource::{SpaceId, SPACE_ID_PREFIX};
-use tinycloud_core::{hash::Hash, storage::*};
+use tinycloud_core::{
+    at_rest::{plaintext_len, SEALED_NAME_PREFIX},
+    hash::Hash,
+    storage::*,
+};
 use tokio_util::bytes::Bytes;
 
 #[cfg(test)]
 use super::TestPause;
-use super::{file_system, size::SpaceSizes, BlobGenerationKey, BlobOperationLocks};
+use super::{file_system, sealed, size::SpaceSizes, BlobGenerationKey, BlobOperationLocks};
 use tokio::sync::Mutex;
 #[cfg(test)]
 use tokio::sync::Notify;
@@ -113,7 +117,7 @@ impl S3BlockConfig {
 impl StorageSetup for S3BlockStore {
     type Error = std::convert::Infallible;
     async fn create(&self, space: &SpaceId) -> Result<(), Self::Error> {
-        self.sizes.init_size(space.clone()).await;
+        self.sizes.init_size(space.clone(), None).await;
         Ok(())
     }
 }
@@ -193,7 +197,8 @@ impl S3BlockStore {
                 }
             }
         }
-        let sizes = acc.into();
+        let sealed = sealed_sizes(&client, &config.bucket).await?;
+        let sizes = SpaceSizes::from_scan(acc, sealed);
         Ok(S3BlockStore {
             client,
             bucket: config.bucket.clone(),
@@ -226,10 +231,10 @@ impl S3BlockStore {
     }
 
     async fn increment_size(&self, space: &SpaceId, size: u64) {
-        self.sizes.increment_size(space, size).await;
+        self.sizes.increment_size(space, None, size).await;
     }
     async fn decrement_size(&self, space: &SpaceId, size: u64) {
-        self.sizes.decrement_size(space, size).await;
+        self.sizes.decrement_size(space, None, size).await;
     }
 
     async fn put_if_absent<F, Fut, G>(
@@ -307,6 +312,36 @@ impl S3BlockStore {
     }
 }
 
+/// Plaintext bytes per space tag of the sealed objects (`v1/{space_tag}/…`,
+/// TC-887), from a second listing restricted to that prefix: the KV listing
+/// above only sees legacy names.
+async fn sealed_sizes(client: &Client, bucket: &str) -> Result<HashMap<String, u64>, S3Error> {
+    let mut pages = client
+        .list_objects_v2()
+        .bucket(bucket)
+        .prefix(SEALED_NAME_PREFIX)
+        .into_paginator()
+        .send();
+    let mut sealed: HashMap<String, u64> = HashMap::new();
+    let mut invalid = sealed::InvalidLengthLog::default();
+    while let Some(page) = pages.try_next().await.map_err(S3Error::from)? {
+        for content in page.contents() {
+            let Some(tag) = content.key().and_then(sealed::sealed_tag) else {
+                continue;
+            };
+            let size = content.size().unwrap_or_default().max(0) as u64;
+            let plaintext = plaintext_len(size).unwrap_or_else(|| {
+                invalid.record(size);
+                0
+            });
+            let total = sealed.entry(tag.to_owned()).or_insert(0);
+            *total = total.saturating_add(plaintext);
+        }
+    }
+    invalid.finish();
+    Ok(sealed)
+}
+
 /// An object body as a `futures` byte stream (`ByteStream` itself only
 /// offers `try_next`).
 pub type BodyStream = Pin<Box<dyn Stream<Item = Result<Bytes, IoError>> + Send + Sync>>;
@@ -333,6 +368,8 @@ pub enum S3StoreError {
     Length(#[from] std::num::TryFromIntError),
     #[error("invalid S3 Content-Range response: {0}")]
     InvalidContentRange(String),
+    #[error(transparent)]
+    AtRest(#[from] sealed::AtRestStoreError),
 }
 
 impl From<S3Error> for S3StoreError {
@@ -649,10 +686,10 @@ impl ImmutableDeleteStore for S3BlockStore {
 impl StoreSize for S3BlockStore {
     type Error = S3StoreError;
     async fn total_size(&self, space: &SpaceId) -> Result<Option<u64>, Self::Error> {
-        Ok(self.sizes.get_size(space).await)
+        Ok(self.sizes.get_size(space, None).await)
     }
     async fn init_size(&self, space: &SpaceId) -> Result<u64, Self::Error> {
-        Ok(self.sizes.init_size(space.clone()).await)
+        Ok(self.sizes.init_size(space.clone(), None).await)
     }
 }
 

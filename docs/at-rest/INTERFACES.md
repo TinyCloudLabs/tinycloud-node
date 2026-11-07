@@ -281,6 +281,14 @@ pub fn sealed_object_name(nk: &ObjectNameKey, space: &str, hash: &Hash) -> Strin
 back to plaintext. Whether a blob is legacy is decided by the caller from the name or the
 column, before any bytes are read.
 
+**Generation suffix.** A KV blob lifetime is `(space, content hash, generation)` (TC-735): the
+legacy name of generation `N > 0` is `{space}/{b64url(digest)}@N`, generation 0 has no suffix.
+The sealed name follows the same rule: `sealed_object_name(nk, space, hash)` plus `@N` for
+`N > 0`. The suffix is appended outside the HMAC, so the HMAC inputs (and the KAT vectors) are
+unchanged, and the AEAD identity (`BlobIdentity::KvBlock { space, content_hash }`) does not
+include the generation. On disk the sealed name is the path `v1/{space_tag}/{object_tag}[@N]`
+under the block directory.
+
 ## 6. Test helper
 `at_rest::FixedKeyProvider` — in-memory `DataKeyProvider` with fixed DEKs per
 (space, dek_id) and a `locked()` constructor. No persistence. **Compiled only under
@@ -301,9 +309,15 @@ redacted.
   the object-name key is unlocked (lazily, per lookup), so the first quota check after an unlock
   counts legacy + sealed. While locked, a space reports legacy bytes only (writes are 503 then).
   A sealed object with an invalid TCE1 length counts 0 bytes; the warning is rate-limited and
-  carries only the length.
-- **Errors:** at-rest causes map explicitly to 503 (keys unavailable / key store) or 500
-  (integrity, unsupported, legacy refused in strict) on `/invoke` and the KV GET routes. The
-  general "store error → 401" catch-all is tracked separately (TC-1347).
+  carries only the length. The S3 boot scan lists `v1/` separately from the KV prefix; the FS
+  scan reads `{blocks}/v1/` (not a DID directory). A `.tc-stage-` file under `v1/` is charged its
+  stored bytes, like a stage in a space directory. Seeding a hosted space's entry (TC-1578) never
+  resets or hides the bytes counted under its tag.
+- **Errors:** at-rest causes map explicitly to 503 (keys unavailable, key store unavailable, key
+  not prepared) or 500 (integrity, unsupported, legacy refused in strict, inconsistent key store)
+  on `/invoke` and the KV GET routes (signed and public). Bodies carry reason codes only; backend
+  detail goes to the server log. Integrity and unsupported failures are logged (typed,
+  rate-limited, named by the sealed name only), including ones that abort a response
+  mid-stream. The general "store error → 401" catch-all is tracked separately (TC-1347).
 - **Reserved names:** The key-continuity key mirror lives under `_tc/` in the block bucket (`datadir/at-rest` on
   FS). The block boot scan skips it.
