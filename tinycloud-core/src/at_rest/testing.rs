@@ -79,6 +79,10 @@ impl DataKeyProvider for FixedKeyProvider {
         ))
     }
 
+    async fn prepare_read(&self, _space: &str) -> Result<(), DataKeyError> {
+        Ok(())
+    }
+
     fn object_name_key(&self) -> Result<ObjectNameKey, DataKeyError> {
         if self.locked {
             return Err(DataKeyError::Locked);
