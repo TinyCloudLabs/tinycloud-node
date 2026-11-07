@@ -566,6 +566,12 @@ mod tests {
     }
 
     #[test]
+    fn production_compose_passes() {
+        let yaml = include_str!("../../docker-compose.dstack-postgres.yaml");
+        assert_eq!(images(yaml).unwrap().len(), 4);
+    }
+
+    #[test]
     fn duplicate_json_keys_are_refused_at_any_depth() {
         let yaml = format!("services:\\n  w:\\n    image: a@sha256:{}\\n", digest());
         for doc in [
