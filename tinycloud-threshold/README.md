@@ -54,7 +54,7 @@ TC_THRESHOLD_REGEN_VECTORS=1 cargo test -p tinycloud-threshold primitive_vectors
 
 `vectors/v1/cert-core.json` contains 18 certificate, lineage, share-binding, fault and activation cases. The certificate vector test replays these cases through the verification APIs with real test signatures.
 
-`vectors/v1/dkg-genesis.json` contains six genesis DKG transcripts from fixed seeds: the signed ceremony statement, the initial transcript link, every owner closure and member message, and either the recomputed QUAL, disqualification reasons, reconstructed dealers, commitments, public shares and transcript hash, or the expected error. It lists the Ed25519 test keys for its DIDs. `dkg_vectors_regenerate_byte_for_byte_and_replay` regenerates the file in memory, compares its complete bytes and replays every case through `dkg_verify_transcript`. To update it deliberately:
+`vectors/v1/dkg-genesis.json` contains seven genesis DKG transcripts from fixed seeds, including a 3-of-4 genesis with one faulty member: the signed ceremony statement, the initial transcript link, every owner closure and member message, and either the recomputed QUAL, disqualification reasons, reconstructed dealers, commitments, public shares and transcript hash, or the expected error. It lists the Ed25519 test keys for its DIDs. `dkg_vectors_regenerate_byte_for_byte_and_replay` regenerates the file in memory, compares its complete bytes and replays every case through `dkg_verify_transcript`. To update it deliberately:
 
 ```sh
 TC_THRESHOLD_REGEN_VECTORS=1 cargo test -p tinycloud-threshold dkg_vectors_regenerate_byte_for_byte_and_replay

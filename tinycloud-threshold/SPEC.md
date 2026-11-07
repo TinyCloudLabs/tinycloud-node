@@ -14,11 +14,20 @@ Section numbers track the approved TinyCloud plan. §§3.1–3.6 are frozen for 
 
 | Operation | Allowed parameters | Required outcome within budget | Refused |
 |---|---|---|---|
-| Genesis DKG (GJKR New-DKG) | 2 ≤ t ≤ n ≤ 16 **and n ≥ 2t−1**; f = t−1 | Every participating conforming member and the public verifier finish with the same QUAL, commitments and transcript outcome | n < 2t−1 → `Error::UnsupportedFaultBudget`. Example: 3-of-4 genesis is refused. There is no separate, smaller f in slice 0. |
+| Genesis DKG (GJKR New-DKG) | 2 ≤ t ≤ n ≤ 16 and either **n ≥ 2t−1** with f = t−1, or **exactly 3-of-4** (t = 3, n = 4) with f = 1 | Every participating conforming member and the public verifier finish with the same QUAL, commitments and transcript outcome | Any other shape → `Error::UnsupportedFaultBudget`; for example 3-of-3, 4-of-5 and 4-of-6 genesis are refused. |
 | Reshare / refresh | Old cohort (t, n) from the verified certificate; new 2 ≤ t′ ≤ n′ ≤ 16; the model permits ≤ t−1 faulty old **and** ≤ t′−1 faulty new members; completion needs ≥ t old members with valid dealings | mpk unchanged; honest new members' shares consistent with the public commitments | t′ < 2; fewer than t valid dealers → abort, old epoch stays in force |
 | Threshold decryption | t shares of one key context | Correct key for any t honest shares; each bad share attributed | Mixed contexts refused before any algebra (§3.6) |
 
-Reshare pins every dealer constant B_i0 to the old public share pk_i before evaluation. For selected old indices D, the weighted constants satisfy Σ λ_i^D·pk_i = mpk. A new cohort need not satisfy the genesis inequality; it must still supply t′ valid decryption shares. The complaint/answer extension and deterministic first-t dealer selection are TinyCloud protocol choices; Wong–Wang–Wing assume conforming new receivers.
+**3-of-4 genesis.** The general rule n ≥ 2t−1 lets a genesis tolerate t−1 faulty members. A 3-of-4 genesis instead assumes that **at most one of the four members is faulty or compromised** during the ceremony (f = 1); the same assumption applies to a 3-of-4 re-key, which runs the same ceremony. The rounds and rules are unchanged, and every count (complaints, QUAL, R6 values) still uses t = 3. It holds because n − f ≥ t: a change to a dealer's R4 vector is a polynomial of degree at most 2, so if it passes the Feldman checks of all three honest members it is zero; any other change draws an R5 complaint, and the dealer's committed contribution is reconstructed from the three honest R6 values. Within that assumption:
+
+- one member cannot learn, choose or bias the master key, and it holds one share where three are needed to derive;
+- genesis completes with one member absent or misbehaving: the three honest dealers stay in QUAL and supply the t R6 values;
+- decryption needs three valid shares, so it continues with one member unavailable; with one member unavailable and a second returning bad shares it stops, and the bad share is attributed (§3.6);
+- resharing or refreshing the 3-of-4 network needs three valid old dealers, so it tolerates one absent or faulty old member.
+
+It does not hold beyond that assumption: two colluding members in a 3-of-4 genesis can make every honest check pass while setting a master key they know, which is the construction the n ≥ 2t−1 rule excludes. After a genesis completed within the assumption, two members together hold two shares and still cannot derive keys.
+
+Reshare pins every dealer constant B_i0 to the old public share pk_i before evaluation. For selected old indices D, the weighted constants satisfy Σ λ_i^D·pk_i = mpk. A new cohort need not satisfy the genesis budget; it must still supply t′ valid decryption shares. The complaint/answer extension and deterministic first-t dealer selection are TinyCloud protocol choices; Wong–Wang–Wing assume conforming new receivers.
 
 **Raw inputs, authenticated contexts, node-asserted contexts.** Secret-releasing functions never take raw inputs alone.
 
@@ -121,7 +130,7 @@ unwrap(k: &DerivedKey, expected_id, (U, V, W)):
 
 ### 3.7 Genesis DKG: GJKR New-DKG (normative; implemented in S0.3)
 
-Preconditions: an `AuthorizedCeremony` of kind `genesis` (§3.8 step 0 applies to genesis too) whose parameters satisfy §3.0's genesis budget (n ≥ 2t−1); each member's ceremony-scoped HPKE key from that context. Generators g2 and h in G2.
+Preconditions: an `AuthorizedCeremony` of kind `genesis` (§3.8 step 0 applies to genesis too) whose parameters satisfy §3.0's genesis budget (n ≥ 2t−1, or exactly 3-of-4); each member's ceremony-scoped HPKE key from that context. Generators g2 and h in G2.
 
 **Rounds.** Every round is a `ClosedRound`: the owner's signed closure over (authorized-ceremony digest, round number, TH of the ordered message list, previous transcript hash). Members process only closed rounds and only messages signed by authorized members for that ceremony and round.
 
@@ -260,7 +269,7 @@ The canonical authorization body is:
 
 Kinds are genesis `1`, reshare `2`, refresh `3`, and re-key `4`. The owner signs `TH(CEREMONY_AUTH, body)`; those same 32 bytes are the authorized-ceremony digest. The raw `SignedStatement.bytes` contains the canonical body, with its signature stored separately.
 
-Genesis has no current certificate, zero counters and `n >= 2t-1`. A successor names the exact externally pinned certificate and uses checked `epoch+1`; re-key also uses checked `rekey+1` and the genesis parameter budget. Other successor kinds preserve the re-key counter. Owner and network match the supplied anchor.
+Genesis has no current certificate, zero counters and a §3.0 genesis shape (`n >= 2t-1`, or exactly `t = 3, n = 4`). A successor names the exact externally pinned certificate and uses checked `epoch+1`; re-key also uses checked `rekey+1` and the genesis parameter budget. Other successor kinds preserve the re-key counter. Owner and network match the supplied anchor.
 
 ### Member envelope and closed round
 
