@@ -1,0 +1,4 @@
+services:
+  web: #     image: nginx:latest     x-hide: '
+    image: ghcr.io/x/node@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    #'
