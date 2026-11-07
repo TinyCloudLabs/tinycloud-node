@@ -113,7 +113,7 @@ async fn authorize_hook_request(
     let policy_session = policy_v3
         .authorize_invocation(tinycloud, &admitted.invocation().0, None, now)
         .await
-        .map_err(|error| (Status::Forbidden, error.to_string()))?;
+        .map_err(crate::policy_v3::authorization_failure)?;
     Ok(VerifiedHookInvocation {
         admitted,
         policy_session,

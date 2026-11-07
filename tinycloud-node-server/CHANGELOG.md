@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Preserve database failures during delegation and authorization lookups as
+  server errors, using `503 unavailable_retryable` for transient failures
+  before any data-plane write instead of an authorization refusal (TC-2514).
+
 - Recheck hook ticket delegation revocation when event streams open and use
   literal segment-prefix matching for hook subscriptions.
 

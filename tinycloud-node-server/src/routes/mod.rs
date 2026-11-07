@@ -198,7 +198,7 @@ fn read_audit_failure(
 /// line per failed request (TC-1796): the `service` it served, the failure
 /// kind of `error`, and the code of the answer. The database in use is not
 /// known here, so the record has no database reference.
-fn database_failure(
+pub(crate) fn database_failure(
     service: Service,
     error: &DbErr,
     write_may_have_applied: bool,
@@ -490,7 +490,7 @@ pub async fn create_signed_kv_url(
     policy_v3
         .authorize_invocation(tinycloud, &invocation_info, None, OffsetDateTime::now_utc())
         .await
-        .map_err(|error| (Status::Forbidden, error.to_string()))?;
+        .map_err(crate::policy_v3::authorization_failure)?;
     let mint_start = Instant::now();
     let mint_result = mint_signed_kv_url(
         &invocation_info,
@@ -715,6 +715,16 @@ pub async fn delegation_query(
                     tinycloud_core::types::DelegationQueryValidationError::InvalidCursor
                 ),
             ),
+            tinycloud_core::db::AccountDelegationQueryError::Db(error)
+                if tinycloud_core::db_pool::is_transient_error(&error) =>
+            {
+                database_failure(
+                    Service::Other,
+                    &error,
+                    false,
+                    "Delegation query unavailable".to_string(),
+                )
+            }
             tinycloud_core::db::AccountDelegationQueryError::Db(_) => (
                 Status::ServiceUnavailable,
                 "Delegation query unavailable".to_string(),
@@ -733,9 +743,10 @@ pub async fn delegate(
     let span = info_span!(parent: &req_span.0, "delegate", action = %action_label);
     // Instrumenting async block to handle yielding properly
     async move {
-        if let Err(reason) = policy_v3.ordinary_admission_allowed(tinycloud, &d.0).await {
-            return Err((Status::Forbidden, reason.to_string()).into());
-        }
+        policy_v3
+            .ordinary_admission_allowed(tinycloud, &d.0)
+            .await
+            .map_err(crate::policy_v3::authorization_failure)?;
         let timer = crate::prometheus::enabled().then(|| {
             crate::prometheus::AUTHORIZED_INVOKE_HISTOGRAM
                 .with_label_values(&["delegate"])
@@ -1915,11 +1926,16 @@ async fn invoke_impl(
             let policy_session_invocation = policy_v3
                 .authorize_invocation(tinycloud, &admitted.invocation().0, Some(&body), now)
                 .await
-                .map_err(|error| (Status::Forbidden, error.to_string()))?;
+                .map_err(crate::policy_v3::authorization_failure)?;
             tinycloud
                 .authorize_invocation(&admitted.invocation().0, now)
                 .await
-                .map_err(|error| (Status::Forbidden, error.to_string()))?;
+                .map_err(|error| match error {
+                    invocation_model::Error::Db(db) => database_failure(
+                        Service::Other, &db, false, db.to_string(),
+                    ),
+                    _ => (Status::Forbidden, error.to_string()),
+                })?;
             encryption
                 .validate_authorized_decrypt_request(&target, &admitted.invocation().0, &body)
                 .await
@@ -1958,7 +1974,7 @@ async fn invoke_impl(
         let policy_session_invocation = policy_v3
             .authorize_invocation(tinycloud, &admitted.invocation().0, None, now)
             .await
-            .map_err(|error| (Status::Forbidden, error.to_string()))?;
+            .map_err(crate::policy_v3::authorization_failure)?;
 
         // Owner usage read (TC-626): an invocation made only of
         // `tinycloud.space/info` returns the space's storage usage, the
@@ -2252,7 +2268,12 @@ async fn invoke_impl(
             tinycloud
                 .authorize_admitted(&admitted, OffsetDateTime::now_utc())
                 .await
-                .map_err(|error| (Status::Forbidden, error.to_string()))?;
+                .map_err(|error| match error {
+                    invocation_model::Error::Db(db) => database_failure(
+                        Service::Kv, &db, false, db.to_string(),
+                    ),
+                    _ => (Status::Forbidden, error.to_string()),
+                })?;
         }
         let inputs = inputs_result?;
         // TC-2375: a KV write spends its replay row in its own transaction,

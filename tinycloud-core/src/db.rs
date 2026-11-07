@@ -951,22 +951,25 @@ where
     /// Load and reparse a delegation from its exact signed Authorization
     /// bytes. The relational row is returned only so callers can compare all
     /// projections against the signed source of truth.
+    /// Database failures retain their `DbErr` source so callers can distinguish
+    /// an unavailable lookup from invalid signed bytes.
     pub async fn load_signed_delegation(
         &self,
         cid: tinycloud_auth::ipld_core::cid::Cid,
-    ) -> Result<Option<(delegation::Model, Delegation)>, String> {
+    ) -> Result<Option<(delegation::Model, Delegation)>, Box<dyn std::error::Error + Send + Sync>>
+    {
         let Some(row) = delegation::Entity::find_by_id(Hash::from(cid))
             .one(&self.conn)
-            .await
-            .map_err(|error| error.to_string())?
+            .await?
         else {
             return Ok(None);
         };
-        let bytes = crate::encryption::maybe_decrypt(self.encryption.as_ref(), &row.serialization)
-            .map_err(|error| error.to_string())?;
-        let event = decode_stored_delegation(bytes).map_err(|error| error.to_string())?;
+        let bytes = crate::encryption::maybe_decrypt(self.encryption.as_ref(), &row.serialization)?;
+        let delegation = TinyCloudDelegation::from_bytes(&bytes)?;
+        let info = DelegationInfo::try_from(delegation)?;
+        let event = SerializedEvent(info, bytes);
         if event.content_hash() != row.id || event.content_hash() != Hash::from(cid) {
-            return Err("delegation-signed-bytes-mismatch".to_string());
+            return Err("delegation-signed-bytes-mismatch".into());
         }
         Ok(Some((row, event)))
     }
@@ -1007,7 +1010,10 @@ where
             self.delegated_sql_caveats,
         )
         .await
-        .map_err(|_| AccountDelegationQueryError::Unauthorized)?;
+        .map_err(|error| match error {
+            invocation::Error::Db(error) => AccountDelegationQueryError::Db(error),
+            invocation::Error::InvalidInvocation(_) => AccountDelegationQueryError::Unauthorized,
+        })?;
         if matches!(query.direction, DelegationQueryDirection::Issued) {
             let invoker = issued_query_principal(invocation)
                 .ok_or(AccountDelegationQueryError::Unauthorized)?;
