@@ -310,7 +310,7 @@ impl SegmentCipher {
         let mut aad = ctx;
         aad.extend_from_slice(header.as_bytes());
         Self {
-            cipher: Aes256Gcm::new(k_obj.as_ref().into()),
+            cipher: Aes256Gcm::new((&*k_obj).into()),
             aad,
             segments: header.segment_count(),
         }

@@ -33,6 +33,11 @@ impl DataKey {
         }
     }
 
+    /// Take key bytes already in a zeroizing buffer, with no plain copy.
+    pub(crate) fn from_zeroizing(id: DekId, bytes: Zeroizing<[u8; 32]>) -> Self {
+        Self { id, bytes }
+    }
+
     pub fn id(&self) -> DekId {
         self.id
     }
@@ -58,6 +63,11 @@ pub struct ObjectNameKey(Zeroizing<[u8; 32]>);
 impl ObjectNameKey {
     pub fn new(bytes: [u8; 32]) -> Self {
         Self(Zeroizing::new(bytes))
+    }
+
+    /// Take key bytes already in a zeroizing buffer, with no plain copy.
+    pub(crate) fn from_zeroizing(bytes: Zeroizing<[u8; 32]>) -> Self {
+        Self(bytes)
     }
 
     pub(crate) fn bytes(&self) -> &[u8; 32] {
