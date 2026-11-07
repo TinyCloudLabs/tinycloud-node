@@ -207,6 +207,127 @@ async fn sql_invoke_route_answers_the_safe_503_when_the_retry_is_lost_too() -> R
     Ok(())
 }
 
+/// A database loss while loading a valid session's immediate delegation is
+/// not an authorization refusal, for either a read or a write.
+#[tokio::test]
+async fn tc2514_delegation_lookup_failure_is_retryable() -> Result<()> {
+    let fixture = fixture().await?;
+    fixture.owner_write("notes/x", Some(b"value")).await?;
+    let mut get_grant = None;
+
+    for (path, action) in [
+        ("notes/", "tinycloud.kv/list"),
+        ("notes/x", "tinycloud.kv/get"),
+        ("notes/x", "tinycloud.kv/metadata"),
+        ("notes/x", "tinycloud.kv/put"),
+        ("notes/x", "tinycloud.kv/del"),
+    ] {
+        let grant = fixture
+            .signed_root_grant(action, action, whole_seconds_from_now(3600), false)
+            .await?;
+        if action == "tinycloud.kv/get" {
+            get_grant = Some(grant);
+        }
+        let plan = Plan::new(4, lost);
+        // Preflight runs before the route's write-tracking boundary. Scope
+        // the existing fault injector around that lookup as well.
+        let (reply, applied) = plan
+            .scope(track_writes(fixture.dispatch(
+                fixture.device_invocation(&[(path, action)], grant)?,
+                &[],
+            )))
+            .await;
+        assert_eq!(
+            reply.status,
+            Status::ServiceUnavailable,
+            "{action}: {}",
+            reply.body
+        );
+        assert!(
+            reply.body.starts_with(UNAVAILABLE_RETRYABLE),
+            "{action}: {}",
+            reply.body
+        );
+        assert_eq!(plan.injected(), 2, "{action}: stop at the failed lookup");
+        assert!(!applied, "{action}: preflight must not write");
+    }
+
+    // The session remains usable after the connection recovers.
+    let grant = get_grant.expect("the get session was exercised");
+    let reply = fixture
+        .dispatch(
+            fixture.device_invocation(&[("notes/x", "tinycloud.kv/get")], grant)?,
+            &[],
+        )
+        .await;
+    assert_eq!(reply.status, Status::Ok, "{}", reply.body);
+    assert_eq!(reply.body, "value");
+
+    fixture.revoke("tc2514-revoked-session", grant).await?;
+    let denied = fixture
+        .dispatch(
+            fixture.device_invocation(&[("notes/x", "tinycloud.kv/get")], grant)?,
+            &[],
+        )
+        .await;
+    assert_eq!(denied.status, Status::Unauthorized, "{}", denied.body);
+    Ok(())
+}
+
+#[tokio::test]
+async fn tc2514_account_query_authorization_lookup_failure_is_retryable() -> Result<()> {
+    use rocket::http::{ContentType, Header};
+    use tinycloud_core::sea_orm::{ActiveModelTrait, Set};
+    let fixture =
+        KvSyncFixture::new_with(|rocket| rocket.mount("/", rocket::routes![delegation_query]))
+            .await?;
+    let account = SpaceId::new(
+        "did:pkh:eip155:1:0x1111111111111111111111111111111111111111".parse()?,
+        "account".parse()?,
+    );
+    tinycloud_core::models::actor::ActiveModel {
+        id: Set(account.did().to_string()),
+    }
+    .insert(&fixture.conn)
+    .await?;
+    let grant = fixture
+        .grant_in(
+            "tc2514-account",
+            account.did().as_str(),
+            &fixture.device_did(),
+            &[(&account, "", "tinycloud.delegation/list")],
+            None,
+            Some(whole_seconds_from_now(3600)),
+            &[],
+        )
+        .await?;
+    let header =
+        fixture.device_invocation_in(&[(&account, "", "tinycloud.delegation/list")], &[grant])?;
+    let request = || {
+        fixture
+            .client
+            .post("/delegation/query")
+            .header(Header::new("Authorization", header.clone()))
+            .header(ContentType::JSON)
+            .body(r#"{"direction":"received"}"#)
+            .dispatch()
+    };
+    let healthy = request().await;
+    let status = healthy.status();
+    let body = healthy.into_string().await.unwrap_or_default();
+    assert_eq!(status, Status::Ok, "{body}");
+
+    // Close the pool so the authorization graph's first query fails, before
+    // account discovery or page loading can run.
+    fixture.conn.clone().close().await?;
+    let response = request().await;
+    let status = response.status();
+    let body = response.into_string().await.unwrap_or_default();
+    assert_eq!(status, Status::ServiceUnavailable, "{body}");
+    assert!(body.starts_with(UNAVAILABLE_RETRYABLE), "{body}");
+    Ok(())
+}
+
 /// The retry re-runs authorization against the current state: a parent
 /// revoked while the first run was failing and the delay was running is
 /// refused, not served from the first run's view.

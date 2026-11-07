@@ -243,7 +243,7 @@ pub async fn decrypt(
     policy_v3
         .authorize_invocation(tinycloud, invocation_info, Some(&body), now)
         .await
-        .map_err(|error| (Status::Forbidden, error.to_string()))?;
+        .map_err(crate::policy_v3::authorization_failure)?;
 
     if body.get("networkId").and_then(serde_json::Value::as_str) != Some(network.as_str()) {
         return Err(map_service_err(EncryptionServiceError::NetworkMismatch).into());
