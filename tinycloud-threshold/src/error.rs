@@ -20,7 +20,7 @@ pub enum Error {
     InvalidIndex,
     #[error("threshold must satisfy 2 <= t <= n <= 16")]
     InvalidThreshold,
-    #[error("genesis requires n >= 2t-1")]
+    #[error("genesis requires n >= 2t-1 or exactly 3-of-4")]
     UnsupportedFaultBudget,
     #[error("counter overflow")]
     CounterOverflow,

@@ -49,10 +49,14 @@ impl Threshold {
         self.n
     }
 
-    /// Require the additional genesis-DKG condition `n >= 2t - 1`.
+    /// Require a supported genesis-DKG shape: `n >= 2t - 1`, tolerating
+    /// `t - 1` faulty members, or exactly 3-of-4, tolerating one.
     ///
     /// A threshold valid for resharing need not satisfy this condition.
     pub fn check_genesis_budget(&self) -> Result<(), Error> {
+        if (self.t, self.n) == (3, 4) {
+            return Ok(());
+        }
         let required = self
             .t
             .checked_sub(1)
@@ -194,13 +198,21 @@ mod tests {
             for t in 2..=n {
                 let threshold = Threshold::new(t, n).unwrap();
                 assert_eq!((threshold.t(), threshold.n()), (t, n));
-                assert_eq!(threshold.check_genesis_budget().is_ok(), n >= 2 * t - 1);
+                assert_eq!(
+                    threshold.check_genesis_budget().is_ok(),
+                    n >= 2 * t - 1 || (t, n) == (3, 4),
+                    "{t}-of-{n}"
+                );
             }
         }
-        assert_eq!(
-            Threshold::new(3, 4).unwrap().check_genesis_budget(),
-            Err(Error::UnsupportedFaultBudget)
-        );
+        assert_eq!(Threshold::new(3, 4).unwrap().check_genesis_budget(), Ok(()));
+        for (t, n) in [(2, 2), (3, 3), (4, 4), (4, 5), (4, 6), (5, 8), (9, 16)] {
+            assert_eq!(
+                Threshold::new(t, n).unwrap().check_genesis_budget(),
+                Err(Error::UnsupportedFaultBudget),
+                "{t}-of-{n}"
+            );
+        }
         assert_eq!(Threshold::new(3, 5).unwrap().check_genesis_budget(), Ok(()));
     }
 
