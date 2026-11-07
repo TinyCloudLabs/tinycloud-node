@@ -602,6 +602,11 @@ pub fn resolve_runtime_config(tinycloud_config: &Config) -> Result<Config> {
         .share_email
         .validate_links_fetch_limits()
         .map_err(|error| anyhow::anyhow!(error))?;
+    // TC-887: a missing, malformed or misplaced at-rest root key fails the
+    // preflight, as it would fail the boot. The node root isn't read here.
+    at_rest::Roots::resolve(&resolved.at_rest, &[], |name| {
+        std::env::var_os(name).map(|v| v.to_string_lossy().into_owned())
+    })?;
     Ok(resolved)
 }
 
