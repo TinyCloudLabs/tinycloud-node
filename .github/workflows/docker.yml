@@ -765,10 +765,10 @@ jobs:
           # cap (raw d95bfb70…), the TC-1274 + TC-1317 + TC-1482 + c_index + TC-1840 + TC-1843 Vector config and the
           # optional TC-1482 NODE_STATS_READ_TOKEN env line, the TC-950 pool of 10 and the TC-1777 named-keys gate
           # env lines + deletion-ledger volume, the TC-2346 operation-retry warning codes and the TC-2917
-          # storage-headroom event in the Vector config
-          # (raw 5419a6fb…; d703d69b… before TC-2917, 298ea356… before TC-2346, 192dfb7e… before TC-1777),
-          # its single node digest normalized to 64 zeros.
-          n0_template_hash = '90841a34e6ea5b581374f50abe70e580496e6814bc83f61f20fd4c9e090e5d51'
+          # storage-headroom event in the Vector config, and the TC-887 at-rest env lines
+          # (raw 1a6566c7…; 5419a6fb… before TC-887, d703d69b… before TC-2917, 298ea356… before TC-2346,
+          # 192dfb7e… before TC-1777), its single node digest normalized to 64 zeros.
+          n0_template_hash = 'b3061225b6a54675b7e0967c256b2f7d0fcf1f91b1d71239c31dd798ff7e1eb1'
           node_pin = re.compile(rb'(?m)^    image: ghcr\.io/tinycloudlabs/tinycloud-node@sha256:([0-9a-f]{64})$')
           def n0_template(raw):
               pins = list(node_pin.finditer(raw))
@@ -925,6 +925,10 @@ jobs:
           TINYCLOUD_SHARE_EMAIL__POSTGRES_TLS__SSLMODE: verify-full
           TINYCLOUD_KEYS__TYPE: Dstack
           TINYCLOUD_ENCRYPTION_NETWORK__NAMED_KEYS_V1: ${{ inputs.named_keys_v1 }}
+          # TC-887: the at-rest root the sealed deployment will carry; the
+          # node refuses a missing or malformed key, so the preflight does too.
+          TINYCLOUD_AT_REST__ROOT_SOURCE: env
+          TINYCLOUD_AT_REST_ROOT_KEY: ${{ secrets.PROD_TINYCLOUD_AT_REST_ROOT_KEY }}
         run: |
           set -euo pipefail
           IMAGE="$(sed -n -E 's/^    image: (ghcr.io\/tinycloudlabs\/tinycloud-node(:[^[:space:]]+|@sha256:[0-9a-f]{64}))$/\1/p' docker-compose.dstack-postgres.yaml)"
@@ -949,6 +953,8 @@ jobs:
             -e TINYCLOUD_SHARE_EMAIL__POSTGRES_TLS__SSLMODE \
             -e TINYCLOUD_KEYS__TYPE \
             -e TINYCLOUD_ENCRYPTION_NETWORK__NAMED_KEYS_V1 \
+            -e TINYCLOUD_AT_REST__ROOT_SOURCE \
+            -e TINYCLOUD_AT_REST_ROOT_KEY \
             ${ledger_args[@]+"${ledger_args[@]}"} \
             "${IMAGE}" --validate-config
 
@@ -1087,6 +1093,7 @@ jobs:
           PHALA_ENV_BETTERSTACK_SOURCE_TOKEN: ${{ secrets.PROD_TINYCLOUD_BETTERSTACK_SOURCE_TOKEN }}
           PHALA_ENV_SQL_IDENTITY_FENCE: ${{ inputs.sql_identity_fence }}
           PHALA_ENV_NAMED_KEYS_V1: ${{ inputs.named_keys_v1 }}
+          PHALA_ENV_AT_REST_ROOT_KEY: ${{ secrets.PROD_TINYCLOUD_AT_REST_ROOT_KEY }}
         # Update the existing prod CVM (name: tinycloud-node) in the
         # Tiny Cloud workspace. The PHALA_CLOUD_API_KEY secret is
         # workspace-scoped and must be issued from that workspace.
@@ -1113,6 +1120,7 @@ jobs:
             PHALA_ENV_BETTERSTACK_SOURCE_TOKEN
             PHALA_ENV_SQL_IDENTITY_FENCE
             PHALA_ENV_NAMED_KEYS_V1
+            PHALA_ENV_AT_REST_ROOT_KEY
           )
 
           for var in "${required_vars[@]}"; do
@@ -1130,6 +1138,14 @@ jobs:
           # so anything but a literal true/false is refused before it is written.
           if [ "${PHALA_ENV_NAMED_KEYS_V1}" != "true" ] && [ "${PHALA_ENV_NAMED_KEYS_V1}" != "false" ]; then
             echo "::error::named_keys_v1 must be exactly true or false"
+            exit 1
+          fi
+
+          # TC-887: the at-rest root key is the standard base64 of 32 bytes
+          # (44 characters). Refuse anything else before it is written; the
+          # message never contains the value.
+          if ! [[ "${PHALA_ENV_AT_REST_ROOT_KEY}" =~ ^[A-Za-z0-9+/]{43}=$ ]]; then
+            echo "::error::AT_REST_ROOT_KEY must be the standard base64 of 32 bytes"
             exit 1
           fi
 
@@ -1178,6 +1194,7 @@ jobs:
             printf 'BETTERSTACK_SOURCE_TOKEN=%s\n' "$PHALA_ENV_BETTERSTACK_SOURCE_TOKEN"
             printf 'SQL_IDENTITY_FENCE=%s\n' "$PHALA_ENV_SQL_IDENTITY_FENCE"
             printf 'NAMED_KEYS_V1=%s\n' "$PHALA_ENV_NAMED_KEYS_V1"
+            printf 'AT_REST_ROOT_KEY=%s\n' "$PHALA_ENV_AT_REST_ROOT_KEY"
             # TC-1482: optional. Unset keeps the node starting with
             # GET /admin/stats disabled (404); never written empty.
             if [ -n "${PHALA_ENV_NODE_STATS_READ_TOKEN:-}" ]; then

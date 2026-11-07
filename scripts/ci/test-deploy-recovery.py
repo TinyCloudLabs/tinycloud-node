@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Run actual workflow Bash against offline CLI/HTTP boundaries only."""
+import base64
 import hashlib
 import json
 from pathlib import Path
@@ -231,7 +232,7 @@ class SafeResult(unittest.TextTestResult):
 class RecoveryTests(unittest.TestCase):
     def run_deploy(self, compose=CURRENT, changes=None, *, fail_at="", artifact_error="", authority="node-override",
                    missing_billing=False, missing_authorization=False, approved_privacy="", event="workflow_dispatch", stats_token=None,
-                   allowed_stats=False, migration_diff=False,
+                   allowed_stats=False, migration_diff=False, at_rest_key=None,
                    ref="refs/heads/main", oci_label=None, oci_revision=None, build_digest="", releases=RELEASED, running=REVISION, order=None):
         inputs = {"deploy_phala": "true", "authorize_quota_values": "true", "image_version": "1.20.6",
                   "deploy_image_digest": DIGEST, "rollback_image_version": "1.20.6", "rollback_image_revision": REVISION,
@@ -304,6 +305,12 @@ class RecoveryTests(unittest.TestCase):
             if missing_billing: env.pop("QUOTA_BILLING_ADMIN_SECRET")
             env["PHALA_ENV_NAMED_KEYS_V1"] = inputs.get("named_keys_v1", "false")
             env["TINYCLOUD_ENCRYPTION_NETWORK__NAMED_KEYS_V1"] = inputs.get("named_keys_v1", "false")
+            # TC-887: a valid at-rest root key unless a test supplies another; withheld like every secret.
+            if at_rest_key is None:
+                at_rest_key = base64.b64encode(secrets.token_bytes(32)).decode()
+            if at_rest_key: CANARIES.append(at_rest_key)
+            env["PHALA_ENV_AT_REST_ROOT_KEY"] = at_rest_key
+            env["TINYCLOUD_AT_REST_ROOT_KEY"] = at_rest_key
             context = {"github.event_name": event, "github.ref": ref, "job.success": True,
                        **{"inputs." + key: (value == "true" if value in ("true", "false") else value) for key, value in inputs.items()}}
             logs = ""
@@ -328,6 +335,7 @@ class RecoveryTests(unittest.TestCase):
                 if result.returncode != 0: context["job.success"] = False
             report = summary.read_text() if summary.exists() else ""
             self.assertNotIn(canary, logs + report, "Sealed canary leaked")
+            if at_rest_key: self.assertNotIn(at_rest_key, logs + report, "At-rest root key leaked")
             self.assertFalse((root / ".phala-prod.env").exists(), "Sealed env was not cleaned")
             return {"success": context["job.success"], "events": json.loads(state.read_text())["events"],
                     "compose": compose_path.read_bytes(), "summary": report, "logs": logs,
@@ -710,6 +718,18 @@ class RecoveryTests(unittest.TestCase):
                 self.assertNotIn("whitelist-check", refused["events"], "The sealed file must not be written first")
                 if value:
                     self.assertIn("::error::named_keys_v1 must be exactly true or false", refused["logs"])
+
+    def test_at_rest_root_key_other_than_32_bytes_of_base64_is_refused_before_the_file(self):
+        good = base64.b64encode(bytes(range(32))).decode()
+        for value in ("", "x" * 44, good[:-1], good + "\n", good + "A", base64.urlsafe_b64encode(b"\xfb" * 32).decode(),
+                      base64.b64encode(bytes(31)).decode()):
+            with self.subTest(length=len(value)):
+                refused = self.run_deploy(at_rest_key=value)
+                self.assertFalse(refused["success"])
+                self.assertEqual(refused["events"].count("cvm-deploy"), 0, "A bad key must fail before the CVM mutation")
+                self.assertNotIn("whitelist-check", refused["events"], "The sealed file must not be written first")
+                if value:
+                    self.assertNotIn(value.strip(), refused["logs"])
 
     def run_preflight(self, compose, named_keys):
         # Only the preflight step, against the fake docker: the compose it reads is the test input.
