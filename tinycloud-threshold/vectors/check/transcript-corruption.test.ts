@@ -3,7 +3,7 @@ import { bytes, hex } from './protocol.ts';
 import { dkgVerifyTranscript } from './dkg.ts';
 import { reshareVerifyTranscript } from './reshare.ts';
 import { verifierOf } from './transcripts.ts';
-import { clone, inputOf, loadDoc, probes, verifyInput, type DocCase, type TranscriptInput } from './probes.ts';
+import { AUTHORIZATION_REFUSALS, clone, inputOf, loadDoc, probes, verifyInput, type DocCase, type TranscriptInput } from './probes.ts';
 import { draftsOf, flip, seal, type Draft } from './testkit.ts';
 
 const docs = { dkg: loadDoc('dkg-genesis.json'), rekey: loadDoc('dkg-rekey.json'), reshare: loadDoc('reshare.json') };
@@ -45,7 +45,8 @@ describe('re-signed one-byte payload corruptions reach the rule-level reason', (
   const reshare = (name: string) => docs.reshare.cases.find(c => c.name === name)!;
   const rekey = (name: string) => docs.rekey.cases.find(c => c.name === name)!;
   test('resealing unmodified drafts reproduces every committed record byte for byte', () => {
-    for (const c of [...docs.dkg.cases, ...docs.rekey.cases, ...docs.reshare.cases]) {
+    // An authorization refusal attaches the honest transcript of another statement, sealed under that statement's digest.
+    for (const c of [...docs.dkg.cases, ...docs.rekey.cases, ...docs.reshare.cases].filter(x => !('error' in x && AUTHORIZATION_REFUSALS.has(x.error)))) {
       const x = inputOf(c), { digest, start } = startOf(c);
       expect(reseal(x, start, digest, () => {}).records.map(r => hex(r.closure.signature))).toEqual(x.records.map(r => hex(r.closure.signature)));
     }

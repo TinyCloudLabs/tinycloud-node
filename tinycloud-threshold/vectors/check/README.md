@@ -59,10 +59,12 @@ current certificate. `dkgVerifyTranscript(anchor, statement, records, verify, pi
 is the one DKG entry point: without `pinned` the ceremony must be a genesis, with the
 pinned current certificate it must be a re-key, and every other kind, or either kind at
 the other call shape, is `InvalidCeremony`. `authorizeRekey` (`dkg.ts`) checks the owner
-signature and anchor, kind 4, the pinned certificate (decode, anchor, owner signature,
-evaluated public shares), the statement's current digest equal to the pinned digest, the
-checked successor `epoch` and `rekey`, and then the §3.0 genesis budget for the *new*
-threshold (`UnsupportedFaultBudget`), all before any record is read. Rounds, cohorts
+signature and anchor of the statement, the pinned certificate (decode, anchor, owner
+signature, evaluated public shares; verified as soon as it is received, so no statement
+is judged against an unverified certificate), kind 4, the statement's current digest
+equal to the pinned digest, the checked successor `epoch` and `rekey`, and then the §3.0
+genesis budget for the *new* threshold (`UnsupportedFaultBudget`), all before any record
+is read. Rounds, cohorts
 (recipients only; a cohort-2 envelope does not resolve and is refused), H0 label, QUAL,
 R4–R6 and output are the unchanged genesis code. An output whose master key equals the
 pinned one is refused (SPEC names no code; `DEFAULT_ERROR.rekeyMpk`, informative).
@@ -117,6 +119,34 @@ previous certificates, every receipt and the activation of every `chain.json` ca
 must be rejected, with several distinct reasons), perturb every declared output, and run
 the real CLI on edited committed documents for each record class (exit code 1 and the
 failing case name on stderr).
+
+### Refusal cases of `dkg-rekey.json`
+
+`../v1/dkg-rekey.json` has 14 cases: seven honest or round-level cases (`rekey_*`,
+`insufficient_*`) followed by seven refusals whose expected result is an `error` and no
+`outputs`: `rekey_3of3_outside_the_genesis_budget` and `rekey_4of5_outside_the_genesis_budget`
+(`UnsupportedFaultBudget`), and `rekey_names_another_current_certificate`,
+`rekey_counter_not_incremented`, `rekey_skips_an_epoch`,
+`genesis_statement_presented_as_rekey` and `rekey_transcript_under_another_generation`
+(`InvalidCeremony`). The checker decides all of them from the statement bytes and
+`inputs.current_certificate` alone; attached rounds are never read when authorization
+fails (an honest transcript sealed under another statement's digest is attached to four of
+them on purpose). `ceremony_digest` and `initial_transcript` are functions of the
+statement bytes and are recomputed and compared for every case, including refusals;
+members and threshold are compared only when the statement decodes.
+
+`rekey-refusals.test.ts` writes the seven expected codes itself (not read from the
+document), recomputes them, decodes each statement to show the defect its name gives, runs
+the real CLI to show the computed code, and edits one byte of each case: statement
+unsigned (`InvalidSignature`) and re-signed (the declared digests become stale), pinned
+certificate body and signature, and every kind of attached record (the refusal and its
+code are unchanged, since no record is read). Repairing exactly the defect and re-signing
+reaches the next rule: the first three statements become the honest `rekey_2of3`
+statement byte for byte and its transcript is then accepted (and a byte of an attached
+round then decides `InvalidSignature`); the later-generation case is accepted under the
+certificate its statement names; the two budget refusals pass the budget when `t` is
+lowered and then lack rounds (`InvalidRound`). `cli-kit.ts` holds the shared helpers that
+edit a clone of a committed document and run the real CLI on it.
 
 `testkit.ts` builds signed transcripts from the published fixture seeds in
 `../v1/cert-core.json`, with payload encoders written separately from the

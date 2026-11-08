@@ -743,7 +743,7 @@ pub(crate) mod tests {
             bytes[threshold_offset + 2..threshold_offset + 4].copy_from_slice(&n.to_be_bytes());
             assert!(CertificateBody::decode(&bytes).is_err());
         }
-        for mutation in 0..9 {
+        for mutation in 0..8 {
             let mut body = cert.body.clone();
             match mutation {
                 0 => body.members.swap(0, 1),
@@ -753,8 +753,7 @@ pub(crate) mod tests {
                 4 => body.public.commitments[1] = G2::identity(),
                 5 => body.epoch = Epoch::new(1),
                 6 => body.rekey = RekeyCounter::new(1),
-                7 => body.genesis_t = 1,
-                _ => body.previous_mpk = Some(body.public.mpk.clone()),
+                _ => body.genesis_t = 1,
             }
             assert!(CertificateBody::decode(&body.encode()).is_err());
         }
@@ -791,6 +790,42 @@ pub(crate) mod tests {
             verify_certificate(&signers.anchor(), &sign(impostor, &signers), &signers),
             Err(CertError::AnchorMismatch)
         ));
+    }
+
+    #[test]
+    fn a_rekey_must_change_the_master_key_at_every_certificate_layer() {
+        let signers = Signers::new();
+        let (prev, _) = genesis(&signers);
+        let threshold = Threshold::new(2, 3).unwrap();
+        let (valid, _, ceremony) = successor(&signers, &prev, CeremonyKind::Rekey, threshold, 12);
+        assert_ne!(valid.body.public.mpk, prev.body.public.mpk);
+        verify_successor(&prev, &valid, &signers).unwrap();
+        let kept = prev.body.public.clone();
+        assert_eq!(kept.mpk, prev.body.public.mpk);
+
+        // Building: the successor constructor refuses a re-key output that keeps mpk.
+        assert_eq!(
+            CertificateBody::successor(&prev, &ceremony, &kept, &TranscriptHash::new([53; 32]))
+                .err(),
+            Some(Error::ContextMismatch)
+        );
+
+        // Decoding: a re-key body naming its own master key as the previous one.
+        let mut body = valid.body.clone();
+        body.public = kept.clone();
+        assert_eq!(
+            CertificateBody::decode(&body.encode()).err(),
+            Some(Error::InvalidEncoding)
+        );
+
+        // Pinned succession: every other re-key field is correct, only mpk is kept.
+        assert_eq!(body.previous_mpk, Some(prev.body.public.mpk.clone()));
+        assert_eq!(body.rekey, prev.body.rekey.checked_next().unwrap());
+        assert_eq!(body.genesis_t, body.public.threshold.t());
+        assert_eq!(
+            verify_successor(&prev, &sign(body, &signers), &signers).err(),
+            Some(CertError::InvalidLineage)
+        );
     }
 
     #[test]

@@ -109,11 +109,13 @@ export function authorizeGenesis(anchor: Anchor, statement: Statement, verify: V
 /**
  * Re-key ceremony rules (S0.5 appendix): kind 4 pinned to the verified current certificate, the checked
  * successor epoch and re-key counter, and the §3.0 genesis budget for the new threshold, all before any dealing.
+ * The pinned certificate is verified as soon as the entry point receives it, so no statement (of any kind) is
+ * judged against an unverified certificate.
  */
 export function authorizeRekey(anchor: Anchor, statement: Statement, certificate: Statement, verify: Verifier): { ceremony: Ceremony; current: Certificate } {
   const c = authorizeCeremony(anchor, statement, verify);
-  if (c.kind !== KIND.rekey) fail('InvalidCeremony');
   const current = verifyCertificate(anchor, certificate, verify);
+  if (c.kind !== KIND.rekey) fail('InvalidCeremony');
   if (!c.current || !equal(c.current, current.digest)) fail('InvalidCeremony');
   const max = 0xffffffffffffffffn;
   if (current.epoch === max || c.epoch !== current.epoch + 1n || current.rekey === max || c.rekey !== current.rekey + 1n) fail(DEFAULT_ERROR.successorGeneration);

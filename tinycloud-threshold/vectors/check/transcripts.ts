@@ -1,4 +1,4 @@
-import { DST, bytes, hex } from './protocol.ts';
+import { DST, bytes, hex, tagged } from './protocol.ts';
 import { TAG, decodeCeremony, type Anchor, type Statement } from './ceremony.ts';
 import { dkgInitialTranscript, dkgVerifyTranscript } from './dkg.ts';
 import { reshareInitialTranscript, reshareVerifyTranscript } from './reshare.ts';
@@ -83,11 +83,16 @@ function checkDkgCases(kind: 'dkg' | 'rekey', input: unknown): TranscriptReport 
         ? { body: bytes(c.inputs.current_certificate.body), signature: bytes(c.inputs.current_certificate.owner_signature) } : undefined;
       const result = outcome(() => dkgVerifyTranscript(anchor, statementOf(c.inputs.ceremony), recordsOf(c.inputs.rounds), verify, pinned));
       same('computed error', 'error' in result ? result.error : null, 'error' in c ? c.error : null);
-      const ceremony = decodeCeremony(bytes(c.inputs.ceremony.body));
-      same('ceremony digest', hex(ceremony.digest), c.inputs.ceremony_digest);
-      same('initial transcript', hex(dkgInitialTranscript(ceremony.digest)), c.inputs.initial_transcript);
-      same('ceremony members', ceremony.n, c.inputs.members);
-      same('ceremony threshold', ceremony.t, c.inputs.threshold);
+      // The digest and H0 are functions of the statement bytes, so they are compared even when authorization fails.
+      const digest = tagged(TAG.ceremonyAuth, bytes(c.inputs.ceremony.body));
+      same('ceremony digest', hex(digest), c.inputs.ceremony_digest);
+      same('initial transcript', hex(dkgInitialTranscript(digest)), c.inputs.initial_transcript);
+      // Member count and threshold need the decoded statement; an undecodable one is already decided by the computed error.
+      const ceremony = outcome(() => decodeCeremony(bytes(c.inputs.ceremony.body)));
+      if ('value' in ceremony) {
+        same('ceremony members', ceremony.value.n, c.inputs.members);
+        same('ceremony threshold', ceremony.value.t, c.inputs.threshold);
+      }
       if ('value' in result && 'outputs' in c) {
         const o = result.value;
         same('qual', o.qual, c.outputs.qual);

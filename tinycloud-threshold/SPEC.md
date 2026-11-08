@@ -534,7 +534,7 @@ A re-key replaces the master key. It runs the §3.7 GJKR New-DKG unchanged: the 
 
 **Entry points.** `dkg_start` and `dkg_verify_transcript` accept kinds `genesis` and `re-key` and refuse every other kind with `InvalidCeremony`. Redistribution entry points keep refusing re-key with `InvalidCeremony`.
 
-**Output.** The output is a candidate for the successor certificate (S0.2 appendix): `epoch + 1`, `rekey + 1`, `genesis_t = t`, the previous digest, and the previous `mpk` named in the body. An output whose master key equals the pinned master key is refused (the certificate would not be a re-key); the probability of that is negligible. Reshares and refreshes after a re-key preserve the new master key, the new re-key counter and the new `genesis_t`.
+**Output.** The output is a candidate for the successor certificate (S0.2 appendix): `epoch + 1`, `rekey + 1`, `genesis_t = t`, the previous digest, and the previous `mpk` named in the body. An output whose master key equals the pinned master key is refused (the certificate would not be a re-key); the probability of that is negligible. The Rust crate refuses it in the certificate layer (`CertificateBody::successor`, the decoded-body rules and `verify_successor`); the independent checker refuses it in `dkgVerifyTranscript`, before any certificate exists. The layer, and the error code each reports, are informative: both reject. Reshares and refreshes after a re-key preserve the new master key, the new re-key counter and the new `genesis_t`.
 
 ### Chain
 

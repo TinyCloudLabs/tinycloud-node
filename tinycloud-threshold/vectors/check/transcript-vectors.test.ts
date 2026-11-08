@@ -76,7 +76,7 @@ test('real CLI checks all six committed documents by default and a transcript do
   expect(all.stdout.toString()).toContain('Primitive vectors: 18/18');
   expect(all.stdout.toString()).toContain('DKG transcripts: 7/7');
   expect(all.stdout.toString()).toContain('Reshare transcripts: 5/5');
-  expect(all.stdout.toString()).toContain('Re-key transcripts: 7/7');
+  expect(all.stdout.toString()).toContain('Re-key transcripts: 14/14');
   expect(all.stdout.toString()).toContain('Chain transcripts: 8/8');
   const one = run(new URL('../v1/reshare.json', import.meta.url).pathname);
   expect(one.exitCode).toBe(0);

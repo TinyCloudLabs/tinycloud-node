@@ -30,7 +30,7 @@ jobs:
   threshold:
     name: threshold (crate, policy, primitive checker)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
     env:
       CARGO_TARGET_DIR: target/threshold
       PROPTEST_CASES: "1024"

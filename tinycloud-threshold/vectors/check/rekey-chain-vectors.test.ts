@@ -1,29 +1,17 @@
 // The committed ../v1/dkg-rekey.json and ../v1/chain.json: schema, dispatch, comparison of every declared
 // field with computation, and one-byte corruptions of every record kind rejected by the checker and the real CLI.
 import { describe, expect, test } from 'bun:test';
-import { readFileSync } from 'node:fs';
 import { code } from './testkit.ts';
 import { checkTranscripts, parseTranscriptDocument, transcriptKind } from './transcripts.ts';
 import { checkChain, chainInputOf, parseChainDocument, type ChainFile } from './chain-vectors.ts';
 import { chainOrder, verifyChainStep } from './chain.ts';
 import { chainProbes, cloneChain } from './chain-probes.ts';
 import { verifierOf } from './transcript-common.ts';
+import { editDoc, hexFlip, loadJson, runCli, type Loose } from './cli-kit.ts';
 
-const load = (file: string): unknown => JSON.parse(readFileSync(new URL(`../v1/${file}`, import.meta.url), 'utf8'));
+const load = loadJson;
 const rekey = load('dkg-rekey.json'), chain = load('chain.json'), genesis = load('dkg-genesis.json'), reshare = load('reshare.json');
-const cli = new URL('./cli.ts', import.meta.url).pathname;
-
-/** Loose view of a committed document, used only to apply targeted edits to a clone (the checker re-validates it). */
-interface Loose { cases: { name: string; operation?: string; inputs: Record<string, any>; outputs: Record<string, any>; error?: string }[]; dst: Record<string, unknown>; spec_sections: string[]; [k: string]: unknown }
-function edit(doc: unknown, change: (d: Loose) => void): unknown {
-  const view = structuredClone(doc) as Loose;
-  change(view);
-  return view;
-}
-const hexFlip = (v: unknown, byte = 0) => typeof v === 'string' ? v.slice(0, byte * 2 + 1) + ((parseInt(v[byte * 2 + 1]!, 16) ^ 1).toString(16)) + v.slice(byte * 2 + 2) : '';
-function runCli(doc: unknown) {
-  return Bun.spawnSync([process.execPath, cli, '/dev/stdin'], { env: process.env, stdin: Buffer.from(JSON.stringify(doc)), stdout: 'pipe', stderr: 'pipe', timeout: 60000 });
-}
+const edit = editDoc;
 
 describe('dispatch and schema', () => {
   test('transcriptKind separates the four transcript documents, the chain marker deciding first', () => {
@@ -31,12 +19,12 @@ describe('dispatch and schema', () => {
     expect(transcriptKind({ spec_sections: ['S0.3 DKG appendix', 'S0.5 re-key appendix', 'S0.5 chain appendix'] })).toBe('chain');
     expect(transcriptKind({ spec_sections: ['3.2'] })).toBeUndefined();
     expect(transcriptKind({})).toBeUndefined();
-    expect(parseTranscriptDocument(rekey).cases.length).toBe(7);
+    expect(parseTranscriptDocument(rekey).cases.length).toBe(14);
     expect(parseTranscriptDocument(chain).cases.length).toBe(8);
   });
   test('the re-key document is the genesis document plus the pinned certificate of every case', () => {
-    expect(() => checkTranscripts(edit(rekey, d => { delete d.cases[0]!.inputs.current_certificate; }))).toThrow('schema:');
-    expect(() => checkTranscripts(edit(genesis, d => { d.cases[0]!.inputs.current_certificate = d.cases[0]!.inputs.ceremony; }))).toThrow('schema:');
+    expect(() => checkTranscripts(edit(rekey, d => { Reflect.deleteProperty(d.cases[0]!.inputs, 'current_certificate'); }))).toThrow('schema:');
+    expect(() => checkTranscripts(edit(genesis, d => { d.cases[0]!.inputs.current_certificate = { body: 'aa', owner_signature: 'bb' }; }))).toThrow('schema:');
     // A re-key transcript under the genesis marker, and a genesis transcript under the re-key marker, are not either document.
     expect(() => checkTranscripts(edit(rekey, d => { d.spec_sections = ['3.2', '3.3', '3.7', '3.10', 'S0.3 DKG appendix']; }))).toThrow('schema:');
     expect(() => checkTranscripts(edit(genesis, d => { d.spec_sections = ['3.2', '3.3', '3.7', '3.9', '3.10', 'S0.3 DKG appendix', 'S0.5 re-key appendix']; }))).toThrow('schema:');
@@ -56,7 +44,7 @@ describe('dispatch and schema', () => {
         (d: Loose) => { d.cases[0]!.error = 'InvalidRound'; },
         (d: Loose) => { d.cases[0]!.inputs.extra = 1; },
         (d: Loose) => { d.cases[0]!.inputs.quorum = 'threshold'; },
-        (d: Loose) => { delete d.cases[0]!.inputs.previous_certificate; },
+        (d: Loose) => { Reflect.deleteProperty(d.cases[0]!.inputs, 'previous_certificate'); },
         (d: Loose) => { d.cases[0]!.inputs.activation.body = d.cases[0]!.inputs.activation.body + '00'; },
         (d: Loose) => { d.cases[0]!.inputs.receipts = []; },
         (d: Loose) => { d.cases[0]!.outputs.ceremony = { qual: [1] }; },
@@ -77,6 +65,8 @@ describe('committed documents compute every named case', () => {
     expect(checkTranscripts(rekey).passed).toEqual([
       'rekey_2of3', 'rekey_2of3_selective_extraction', 'rekey_3of5_two_faulty', 'rekey_3of5_answers_and_disqualification',
       'insufficient_reconstruction_values', 'insufficient_qualified_dealers', 'rekey_3of4_one_faulty',
+      'rekey_3of3_outside_the_genesis_budget', 'rekey_4of5_outside_the_genesis_budget', 'rekey_names_another_current_certificate',
+      'rekey_counter_not_incremented', 'rekey_skips_an_epoch', 'genesis_statement_presented_as_rekey', 'rekey_transcript_under_another_generation',
     ]);
     expect(checkTranscripts(chain).passed).toEqual([
       'chain_0_genesis_2of3', 'chain_1_reshare_3of4', 'chain_2_reshare_2of3', 'chain_3_refresh_2of3',
@@ -91,7 +81,7 @@ describe('every declared field is compared with computation', () => {
       ['mpk', o => { o.mpk = hexFlip(o.mpk); }],
       ['transcript hash', o => { o.transcript_hash = hexFlip(o.transcript_hash); }],
       ['commitments', o => { o.commitments[1] = hexFlip(o.commitments[1]); }],
-      ['public shares', o => { o.public_shares[2].point = hexFlip(o.public_shares[2].point); }],
+      ['public shares', o => { o.public_shares[2]!.point = hexFlip(o.public_shares[2]!.point); }],
       ['qual', o => { o.qual = [1, 2]; }],
       ['disqualified', o => { o.disqualified = [{ member: 4, reason: 'MissingDeal' }]; }],
       ['reconstructed', o => { o.reconstructed = [2]; }],
@@ -114,7 +104,7 @@ describe('every declared field is compared with computation', () => {
       ['members', 4, o => { o.members = 3; }],
       ['mpk', 4, o => { o.mpk = hexFlip(o.mpk); }],
       ['commitments', 4, o => { o.commitments[1] = hexFlip(o.commitments[1]); }],
-      ['public shares', 4, o => { o.public_shares[3].point = hexFlip(o.public_shares[3].point); }],
+      ['public shares', 4, o => { o.public_shares[3]!.point = hexFlip(o.public_shares[3]!.point); }],
       ['transcript hash', 4, o => { o.transcript_hash = hexFlip(o.transcript_hash); }],
       ['certificate digest', 4, o => { o.certificate_digest = hexFlip(o.certificate_digest); }],
       ['activation', 4, o => { o.activation = hexFlip(o.activation, 31); }],
@@ -181,7 +171,7 @@ describe('the real CLI exits nonzero for an edited committed vector', () => {
     ['activation signature byte', 4, d => { d.cases[4]!.inputs.activation.signature = hexFlip(d.cases[4]!.inputs.activation.signature); }],
     ['output mpk', 4, d => { d.cases[4]!.outputs.mpk = hexFlip(d.cases[4]!.outputs.mpk); }],
     ['output epoch', 1, d => { d.cases[1]!.outputs.epoch = 2; }],
-    ['output ceremony outcome', 1, d => { d.cases[1]!.outputs.ceremony.dealers = [2, 3]; }],
+    ['output ceremony outcome', 1, d => { d.cases[1]!.outputs.ceremony = { dealers: [2, 3] }; }],
   ];
   for (const [label, index, change] of chainEdits) {
     test(`chain.json: ${label}`, () => {

@@ -750,6 +750,133 @@ fn output_json(o: &DkgOutput) -> Value {
     })
 }
 
+fn current_json(signers: &Signers, current: &VerifiedCertificate) -> Value {
+    let body = current.body();
+    json!({
+        "body": hex::encode(body.encode()),
+        "owner_signature": hex::encode(signers.sign(&current.anchor().expected_owner, &body.owner_statement())),
+    })
+}
+
+fn rounds_json(rounds: &[DkgRoundRecord]) -> Value {
+    json!(rounds
+        .iter()
+        .map(|r| json!({
+            "closure": hex_statement(&r.closure),
+            "messages": r.messages.iter().map(hex_statement).collect::<Vec<_>>(),
+        }))
+        .collect::<Vec<_>>())
+}
+
+/// A refused ceremony: the signed statement and the certificate it is checked
+/// against, with the rounds a relay might have attached. The expected error is
+/// whatever the real authorization path returns for exactly these bytes.
+#[allow(clippy::too_many_arguments)]
+fn refusal(
+    name: &str,
+    description: &str,
+    signers: &Signers,
+    statement: &SignedStatement,
+    current: &VerifiedCertificate,
+    rounds: &[DkgRoundRecord],
+) -> Value {
+    let decoded = CeremonyStatement::decode(&statement.bytes).unwrap();
+    let digest = dst::tagged_hash(dst::CEREMONY_AUTH, &statement.bytes);
+    let inputs = json!({
+        "threshold": decoded.threshold.t(),
+        "members": decoded.threshold.n(),
+        "ceremony": hex_statement(statement),
+        "ceremony_digest": hex::encode(digest),
+        "initial_transcript": hex::encode(dst::tagged_hash(DKG_START, &digest)),
+        "rounds": rounds_json(rounds),
+        "current_certificate": current_json(signers, current),
+    });
+    let error =
+        replay(Setup::Rekey, signers, &inputs).expect_err("refusal vectors must be refused");
+    json!({"name": name, "description": description, "operation": "dkg_verify_transcript", "inputs": inputs, "error": format!("{error:?}")})
+}
+
+fn refusals(honest: &Run) -> Vec<Value> {
+    let f = &honest.fixture;
+    let signers = &f.signers;
+    let current = f.current.as_ref().unwrap();
+    let rounds = &honest.transcript.rounds;
+    let body = CeremonyStatement::decode(&f.statement.bytes).unwrap();
+    let edited = |change: &dyn Fn(&mut CeremonyStatement)| {
+        let mut changed = body.clone();
+        change(&mut changed);
+        signers.statement(&changed)
+    };
+    let (other_generation, _, _) = crate::cert::tests::successor(
+        signers,
+        current,
+        CeremonyKind::Reshare,
+        Threshold::new(2, 3).unwrap(),
+        // Seed 11 keeps the test-dealer master key.
+        11,
+    );
+    let other_generation =
+        crate::cert::verify_successor(current, &other_generation, signers).unwrap();
+    vec![
+        refusal(
+            "rekey_3of3_outside_the_genesis_budget",
+            "F1: a 3-of-3 re-key is outside the genesis fault budget and is refused before any record is read.",
+            signers,
+            &rekey_statement(signers, current, 3, 3, 0x9a),
+            current,
+            &[],
+        ),
+        refusal(
+            "rekey_4of5_outside_the_genesis_budget",
+            "F1: a 4-of-5 re-key is outside the genesis fault budget and is refused before any record is read.",
+            signers,
+            &rekey_statement(signers, current, 4, 5, 0x9b),
+            current,
+            &[],
+        ),
+        refusal(
+            "rekey_names_another_current_certificate",
+            "F4: the owner-signed statement names a current-certificate digest other than the pinned one; the honest transcript is attached and ignored.",
+            signers,
+            &edited(&|b| b.current = Some(CertDigest::new([7; 32]))),
+            current,
+            rounds,
+        ),
+        refusal(
+            "rekey_counter_not_incremented",
+            "F4: the statement keeps the pinned re-key counter instead of its checked successor.",
+            signers,
+            &edited(&|b| b.rekey = current.key_context().rekey()),
+            current,
+            rounds,
+        ),
+        refusal(
+            "rekey_skips_an_epoch",
+            "F4: the statement names epoch + 2.",
+            signers,
+            &edited(&|b| b.epoch = Epoch::new(2)),
+            current,
+            rounds,
+        ),
+        refusal(
+            "genesis_statement_presented_as_rekey",
+            "F4: a genesis statement is not a re-key and is refused against a pinned certificate.",
+            signers,
+            &genesis_statement(signers, 2, 3, 0x9c),
+            current,
+            &[],
+        ),
+        refusal(
+            "rekey_transcript_under_another_generation",
+            "F6: the honest transcript and statement are checked against a later generation of the same network; the statement names the older certificate.",
+            signers,
+            &f.statement,
+            &other_generation,
+            rounds,
+        ),
+    ]
+}
+
 fn case(name: &str, description: &str, run: &Run) -> Value {
     let mut inputs = json!({
         "threshold": run.fixture.t(),
@@ -763,11 +890,7 @@ fn case(name: &str, description: &str, run: &Run) -> Value {
         })).collect::<Vec<_>>(),
     });
     if let Some(current) = &run.fixture.current {
-        let body = current.body();
-        inputs["current_certificate"] = json!({
-            "body": hex::encode(body.encode()),
-            "owner_signature": hex::encode(run.fixture.signers.sign(&current.anchor().expected_owner, &body.owner_statement())),
-        });
+        inputs["current_certificate"] = current_json(&run.fixture.signers, current);
     }
     match run.verify() {
         Ok(output) => {
@@ -859,6 +982,10 @@ fn vectors(setup: Setup) -> Value {
         case("insufficient_qualified_dealers", "Only dealer 1 publishes R1.", &unqualified),
         case(&format!("{kind}_3of4_one_faulty"), "Dealer 4's R4 passes only its own check; members 1-3 complain in R5; member 4 sends no R6 and members 1-3 reconstruct dealer 4.", &three_of_four),
     ];
+    let mut cases = cases;
+    if setup == Setup::Rekey {
+        cases.extend(refusals(&honest_run));
+    }
     let ceremony_seeds = [0x61u8, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67].map(seed);
     let signers: Vec<_> = (0..=5u8)
         .map(|i| {
@@ -895,6 +1022,59 @@ fn vectors(setup: Setup) -> Value {
     })
 }
 
+/// Replay one case from its published bytes alone: authorize the ceremony the
+/// way a node would, then recompute the transcript outcome.
+fn replay(setup: Setup, signers: &Signers, inputs: &Value) -> Result<Value, Error> {
+    let bytes = |v: &Value| hex::decode(v.as_str().unwrap()).unwrap();
+    let statement = |v: &Value| SignedStatement {
+        bytes: bytes(&v["body"]),
+        signature: bytes(&v["signature"]),
+    };
+    let ceremony = match setup {
+        Setup::Genesis => {
+            assert!(inputs.get("current_certificate").is_none());
+            AuthorizedCeremony::verify_genesis(
+                &signers.anchor(),
+                &statement(&inputs["ceremony"]),
+                signers,
+            )?
+        }
+        Setup::Rekey => {
+            let current = verify_certificate(
+                &signers.anchor(),
+                &SignedCertificate {
+                    body: CertificateBody::decode(&bytes(&inputs["current_certificate"]["body"]))?,
+                    owner_signature: bytes(&inputs["current_certificate"]["owner_signature"]),
+                },
+                signers,
+            )
+            .unwrap();
+            AuthorizedCeremony::verify_for(&current, &statement(&inputs["ceremony"]), signers)?
+        }
+    };
+    assert_eq!(
+        dkg_initial_transcript(&ceremony).as_bytes().to_vec(),
+        bytes(&inputs["initial_transcript"])
+    );
+    let transcript = DkgTranscript {
+        rounds: inputs["rounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| DkgRoundRecord {
+                closure: statement(&r["closure"]),
+                messages: r["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(statement)
+                    .collect(),
+            })
+            .collect(),
+    };
+    dkg_verify_transcript(&ceremony, &transcript, signers).map(|output| output_json(&output))
+}
+
 /// Regenerate the document, compare it byte for byte with the published file,
 /// then replay every case from the published bytes alone.
 fn dkg_vector_file(setup: Setup, name: &str) {
@@ -911,63 +1091,15 @@ fn dkg_vector_file(setup: Setup, name: &str) {
 
     let file: Value = serde_json::from_str(&published).unwrap();
     let signers = Signers::new();
-    let bytes = |v: &Value| hex::decode(v.as_str().unwrap()).unwrap();
-    let statement = |v: &Value| SignedStatement {
-        bytes: bytes(&v["body"]),
-        signature: bytes(&v["signature"]),
-    };
     for case in file["cases"].as_array().unwrap() {
-        let inputs = &case["inputs"];
-        let ceremony = match setup {
-            Setup::Genesis => {
-                assert!(inputs.get("current_certificate").is_none());
-                AuthorizedCeremony::verify_genesis(
-                    &signers.anchor(),
-                    &statement(&inputs["ceremony"]),
-                    &signers,
-                )
-                .unwrap()
-            }
-            Setup::Rekey => {
-                let current = verify_certificate(
-                    &signers.anchor(),
-                    &SignedCertificate {
-                        body: CertificateBody::decode(&bytes(
-                            &inputs["current_certificate"]["body"],
-                        ))
-                        .unwrap(),
-                        owner_signature: bytes(&inputs["current_certificate"]["owner_signature"]),
-                    },
-                    &signers,
-                )
-                .unwrap();
-                AuthorizedCeremony::verify_for(&current, &statement(&inputs["ceremony"]), &signers)
-                    .unwrap()
-            }
-        };
-        assert_eq!(
-            dkg_initial_transcript(&ceremony).as_bytes().to_vec(),
-            bytes(&inputs["initial_transcript"])
-        );
-        let transcript = DkgTranscript {
-            rounds: inputs["rounds"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|r| DkgRoundRecord {
-                    closure: statement(&r["closure"]),
-                    messages: r["messages"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .map(statement)
-                        .collect(),
-                })
-                .collect(),
-        };
-        match dkg_verify_transcript(&ceremony, &transcript, &signers) {
-            Ok(output) => assert_eq!(output_json(&output), case["outputs"], "{}", case["name"]),
-            Err(error) => assert_eq!(format!("{error:?}"), case["error"].as_str().unwrap()),
+        match replay(setup, &signers, &case["inputs"]) {
+            Ok(outputs) => assert_eq!(outputs, case["outputs"], "{}", case["name"]),
+            Err(error) => assert_eq!(
+                format!("{error:?}"),
+                case["error"].as_str().unwrap(),
+                "{}",
+                case["name"]
+            ),
         }
     }
 }
