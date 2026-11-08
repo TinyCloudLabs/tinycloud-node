@@ -141,8 +141,7 @@ authenticated `did:web:issuer.credentials.org` verification method, and that
 `nextIssuer.kid` equals that method ID and the `kid` the witness signs into
 credential headers. Record the evidence and verifier output with the rotation
 change. If the witness cannot publish this key and chain, or Phala cannot
-provide the app ID/domain and independent root authentication, stop; do not
-pin a key.
+provide the app ID and independent root authentication, stop; do not pin a key.
 
 This node change only accepts the next pin. It does not make a rotated key
 usable end to end. Before activation, coordinate changes to the OpenCredentials
@@ -182,15 +181,19 @@ For the production dstack node, `TINYCLOUD_KEYS_TYPE=Dstack`; its primary key
 comes from dstack `GetKey`, and the invitation key is derived from that key
 with `derive_key("tinycloud/share-email/invitation-signing")`. It is not the
 raw primary public key. If the dstack application identity or primary-key path
-changes, read the resulting `nodeInvitationPublicKey` and `nodeKeyVersion` from
+changes, read `shareInvitationPublicKey` and `nodeDid` from
 `GET /.well-known/tinycloud/node-keys` on the authenticated, attested node.
-Update those public descriptor fields in the trust bundle and verify the
+Copy `shareInvitationPublicKey` into the trust bundle's
+`nodeInvitationPublicKey`; recheck the enforcer DID against `nodeDid`. The
+endpoint does not publish a key version. Choose and review `nodeKeyVersion`,
+then set `nodeInvitationKid` to
+`<nodeAudience>#invitation-key-<nodeKeyVersion>` in the bundle. Verify the
 node's startup configuration; startup refuses a descriptor/key mismatch.
 Never put a secret in the bundle. The
-`export-share-invitation-descriptor` binary reads
-`PROD_TINYCLOUD_KEYS_SECRET` and is for static-key deployments only; it
-hard-codes `<nodeAudience>#invitation-key-1` and version `1`, so changing
-those values for a static-key node requires updating and reviewing the
-exporter. Recheck `nodeAudience`, `nodeEnabled`, and the enforcer DID binding
-in the separately signed authority material. An issuer-key overlap alone does
-not change the invitation key or its version.
+`export-share-invitation-descriptor` binary reads `TINYCLOUD_KEYS_SECRET`
+(the workflow supplies `PROD_TINYCLOUD_KEYS_SECRET`) and is for static-key
+deployments only; it hard-codes `<nodeAudience>#invitation-key-1` and version
+`1`, so changing those values for a static-key node requires updating and
+reviewing the exporter. Recheck `nodeAudience` and `nodeEnabled` in the
+separately signed authority material. An issuer-key overlap alone does not
+change the invitation key or its version.
