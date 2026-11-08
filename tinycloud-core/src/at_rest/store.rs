@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use base64::Engine;
 use sea_orm::{
-    sea_query::OnConflict, ActiveValue::Set, ColumnTrait, DbErr, EntityTrait, PaginatorTrait,
-    QueryFilter, QueryOrder, QuerySelect, TransactionTrait,
+    sea_query::OnConflict, ActiveValue::Set, ColumnTrait, DbErr, EntityTrait, IntoActiveModel,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -191,6 +191,25 @@ impl MirroredDek {
     }
 }
 
+/// One `at_rest_key` change for [`AtRestStore::apply_key_changes`].
+pub(crate) enum KeyChange {
+    /// Insert unless the generation exists.
+    Insert(at_rest_key::Model),
+    /// Replace a generation's seal (under this node's W).
+    Reseal {
+        generation: i32,
+        w_label: String,
+        sealed: Vec<u8>,
+    },
+    /// Replace a generation's chain, or drop it (`None`): only for repairing
+    /// a chain that is missing or doesn't open, with the newer ARK in hand,
+    /// or for a stale chain on the newest generation.
+    Chain {
+        generation: i32,
+        chain: Option<Vec<u8>>,
+    },
+}
+
 /// Row access. On SQLite, writes take the node's shared writer lock.
 #[derive(Clone)]
 pub struct AtRestStore {
@@ -254,21 +273,48 @@ impl AtRestStore {
         )
     }
 
-    /// Replace a generation's seal (after recovery under a new W).
-    pub async fn reseal_key(
-        &self,
-        generation: i32,
-        w_label: &str,
-        sealed: Vec<u8>,
-    ) -> Result<(), DbErr> {
+    /// Apply one load's or re-seal's row changes in a single transaction:
+    /// either every change lands or none does.
+    pub(crate) async fn apply_key_changes(&self, changes: Vec<KeyChange>) -> Result<(), DbErr> {
+        if changes.is_empty() {
+            return Ok(());
+        }
         let _w = self.writer().await;
-        at_rest_key::Entity::update_many()
-            .col_expr(at_rest_key::Column::WLabel, w_label.into())
-            .col_expr(at_rest_key::Column::Sealed, sealed.into())
-            .filter(at_rest_key::Column::Generation.eq(generation))
-            .exec(&self.db)
-            .await
-            .map(|_| ())
+        let tx = self.db.begin().await?;
+        for change in changes {
+            match change {
+                KeyChange::Insert(row) => ignore_conflict(
+                    at_rest_key::Entity::insert(row.into_active_model())
+                        .on_conflict(
+                            OnConflict::column(at_rest_key::Column::Generation)
+                                .do_nothing()
+                                .to_owned(),
+                        )
+                        .exec(&tx)
+                        .await,
+                )?,
+                KeyChange::Reseal {
+                    generation,
+                    w_label,
+                    sealed,
+                } => {
+                    at_rest_key::Entity::update_many()
+                        .col_expr(at_rest_key::Column::WLabel, w_label.into())
+                        .col_expr(at_rest_key::Column::Sealed, sealed.into())
+                        .filter(at_rest_key::Column::Generation.eq(generation))
+                        .exec(&tx)
+                        .await?;
+                }
+                KeyChange::Chain { generation, chain } => {
+                    at_rest_key::Entity::update_many()
+                        .col_expr(at_rest_key::Column::Chain, chain.into())
+                        .filter(at_rest_key::Column::Generation.eq(generation))
+                        .exec(&tx)
+                        .await?;
+                }
+            }
+        }
+        tx.commit().await
     }
 
     /// Write generation `row.generation` and the chain that lets it open
@@ -310,33 +356,6 @@ impl AtRestStore {
         }
         tx.commit().await?;
         Ok(true)
-    }
-
-    /// Replace a generation's chain. Only for repairing a chain that is
-    /// missing or doesn't open, with the newer ARK in hand.
-    pub async fn set_chain(&self, generation: i32, chain: Vec<u8>) -> Result<(), DbErr> {
-        let _w = self.writer().await;
-        at_rest_key::Entity::update_many()
-            .col_expr(at_rest_key::Column::Chain, chain.into())
-            .filter(at_rest_key::Column::Generation.eq(generation))
-            .exec(&self.db)
-            .await
-            .map(|_| ())
-    }
-
-    /// Drop a generation's chain: the newest generation has no successor,
-    /// so a chain there is stale (a restored or garbage row).
-    pub async fn clear_chain(&self, generation: i32) -> Result<(), DbErr> {
-        let _w = self.writer().await;
-        at_rest_key::Entity::update_many()
-            .col_expr(
-                at_rest_key::Column::Chain,
-                sea_orm::sea_query::Expr::value(Option::<Vec<u8>>::None),
-            )
-            .filter(at_rest_key::Column::Generation.eq(generation))
-            .exec(&self.db)
-            .await
-            .map(|_| ())
     }
 
     /// Any escrow row at all (sealed material that must block provisioning).
