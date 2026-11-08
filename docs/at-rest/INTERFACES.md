@@ -419,6 +419,9 @@ operation (`with_at_rest`), and the node's repository declares `SealPath::SqlArt
   plaintext and need no key), so a row without a tag is accepted only if it has no sealed part, or
   if its only sealed part is a checkpoint under a delta mode `off` wrote; a row with any other
   sealed part and no tag fails as integrity.
+  Whether a row has a WAL is the authenticated metadata's answer (`delta_content_hash`): a
+  streamed read reads `delta_payload` only when the metadata names one, and `open_row` refuses
+  a stored WAL column that disagrees with it, missing or extra (`AtRestIntegrity { part: "wal" }`).
   **Not protected:** a whole-row rollback, i.e. replacing the row with an older, valid,
   self-consistent snapshot of itself (parts, metadata and tag all from the same earlier
   revision), opens. So do rows with no tag: legacy parts are unauthenticated, as in §5, including

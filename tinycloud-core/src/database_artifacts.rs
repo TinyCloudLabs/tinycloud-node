@@ -1270,24 +1270,27 @@ pub async fn open_row(
         keys,
     )
     .await?;
-    let wal = match row.delta_payload {
-        Some(delta) => Some(
+    // Whether there is a WAL is the authenticated metadata's answer; a
+    // stored column that disagrees is a tampered row, never a smaller or a
+    // larger database.
+    let wal = match (row.delta_content_hash.as_deref(), row.delta_payload) {
+        (Some(delta_hash), Some(delta)) => Some(
             open_whole(
                 &key,
                 ArtifactPart::Wal,
                 row.delta_encoding,
                 delta,
-                PartBinding::wal(
-                    &key,
-                    row.revision,
-                    &row.checkpoint_content_hash,
-                    row.delta_content_hash.as_deref().unwrap_or_default(),
-                ),
+                PartBinding::wal(&key, row.revision, &row.checkpoint_content_hash, delta_hash),
                 keys,
             )
             .await?,
         ),
-        None => None,
+        (None, None) => None,
+        _ => {
+            return Err(DatabaseArtifactError::AtRestIntegrity {
+                part: ArtifactPart::Wal.as_str(),
+            })
+        }
     };
     Ok((checkpoint, wal))
 }
@@ -3859,6 +3862,83 @@ mod tests {
                 open_row(row, Some(keys().as_ref())).await,
                 Err(DatabaseArtifactError::AtRestIntegrity { part: "manifest" })
             ));
+        }
+    }
+
+    /// The authenticated metadata says whether the row has a WAL delta; the
+    /// stored column must agree. Clearing only the WAL bytes, or storing WAL
+    /// bytes on a row whose metadata has none, leaves a valid manifest: a
+    /// streamed read follows the metadata, and the whole-row read refuses.
+    #[tokio::test]
+    async fn a_wal_column_that_disagrees_with_the_authenticated_metadata_fails_integrity() {
+        let conn = sqlite_conn().await;
+        let (repo, _source) = at_rest_repo(&conn, AtRestMode::Encrypt);
+        let checkpoint = database_bytes(SQLITE_HEADER, 70_000, 41);
+        repo.save(
+            "sql",
+            "space",
+            "main",
+            checkpoint,
+            ArtifactExpectation::Absent,
+        )
+        .await
+        .unwrap();
+        repo.save_delta(
+            "sql",
+            "space",
+            "main",
+            database_bytes(WAL_HEADER, 9_000, 42),
+            ArtifactExpectation::Any,
+        )
+        .await
+        .unwrap();
+        let lone = database_bytes(SQLITE_HEADER, 70_000, 43);
+        repo.save(
+            "sql",
+            "lone",
+            "main",
+            lone.clone(),
+            ArtifactExpectation::Absent,
+        )
+        .await
+        .unwrap();
+        let stray_wal = stored_row(&conn, "space", "main")
+            .await
+            .unwrap()
+            .delta_payload;
+        for (space, wal) in [("space", None), ("lone", stray_wal)] {
+            rewrite_row(&conn, space, "main", |update| {
+                update.col_expr(
+                    database_artifact::Column::DeltaPayload,
+                    Expr::value(wal.clone()),
+                )
+            })
+            .await;
+            let (cold, _source) = at_rest_repo(&conn, AtRestMode::Encrypt);
+            if space == "space" {
+                let error = read_error(&cold, space, "main").await;
+                assert!(
+                    matches!(
+                        error,
+                        DatabaseArtifactError::AtRestIntegrity { part: "wal" }
+                    ),
+                    "{space}, streamed: {error:?}"
+                );
+            } else {
+                // A streamed read follows the metadata: it serves the
+                // authenticated checkpoint and never reads the stray bytes.
+                assert_eq!(hydrate(&cold, space, "main").await, (lone.clone(), None));
+            }
+            let row = stored_row(&conn, space, "main").await.unwrap();
+            let opened = open_row(row, Some(keys().as_ref())).await;
+            assert!(
+                matches!(
+                    opened,
+                    Err(DatabaseArtifactError::AtRestIntegrity { part: "wal" })
+                ),
+                "{space}, whole row: {:?}",
+                opened.map(|(checkpoint, wal)| (checkpoint.len(), wal.map(|wal| wal.len())))
+            );
         }
     }
 
