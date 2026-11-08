@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use base64::Engine as _;
 use sea_orm::{
-    ColumnTrait, ConnectOptions, Database, DatabaseConnection, EntityTrait, IntoActiveModel,
-    QueryFilter,
+    ColumnTrait, ConnectOptions, ConnectionTrait, Database, DatabaseConnection, EntityTrait,
+    IntoActiveModel, QueryFilter,
 };
 use sea_orm_migration::MigratorTrait;
 use tinycloud_at_rest_escrow::{wrap_share, EscrowBundle, HolderRecipient, SharePayload};
@@ -1755,21 +1755,60 @@ fn unescrowed() -> KeyringConfig {
     }
 }
 
+async fn open_with_previous(
+    db: &DatabaseConnection,
+    mirror: &Arc<MemoryMirror>,
+    root: &[u8],
+    previous_root: &[u8],
+    config: KeyringConfig,
+) -> Result<AtRestKeyring, AtRestError> {
+    AtRestKeyring::open_with_previous_root(
+        AtRestStore::new(db.clone()),
+        mirror.clone(),
+        root,
+        Some(previous_root),
+        config,
+    )
+    .await
+}
+
 async fn open_after_root_change(
     db: &DatabaseConnection,
     mirror: &Arc<MemoryMirror>,
     root: &[u8],
     previous_root: &[u8],
 ) -> AtRestKeyring {
-    AtRestKeyring::open_with_previous_root(
-        AtRestStore::new(db.clone()),
-        mirror.clone(),
-        root,
-        Some(previous_root),
-        unescrowed(),
-    )
-    .await
-    .unwrap()
+    open_with_previous(db, mirror, root, previous_root, unescrowed())
+        .await
+        .unwrap()
+}
+
+async fn stored_keys(db: &DatabaseConnection) -> Vec<at_rest_key::Model> {
+    AtRestStore::new(db.clone()).keys().await.unwrap()
+}
+
+async fn mirrored_keys(mirror: &MemoryMirror) -> Vec<at_rest_key::Model> {
+    mirrored_rows(mirror, false).await.unwrap()
+}
+
+/// How many of `rows` open under `root`'s W.
+fn opening_under(rows: &[at_rest_key::Model], root: &[u8]) -> usize {
+    let w = WrapKey::derive(root);
+    rows.iter()
+        .filter(|r| {
+            let id = ark_id_of(r).unwrap();
+            open_ark(&w, &r.sealed, &id, r.generation as u32, &r.w_label).is_ok()
+        })
+        .count()
+}
+
+/// Put the `at_rest_key` table back to `rows`, like a database restore.
+async fn restore_keys(db: &DatabaseConnection, rows: &[at_rest_key::Model]) {
+    at_rest_key::Entity::delete_many().exec(db).await.unwrap();
+    at_rest_key::Entity::insert_many(rows.iter().cloned().map(|r| r.into_active_model()))
+        .exec(db)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -1833,4 +1872,148 @@ async fn a_previous_root_that_opens_nothing_leaves_the_keys_locked() {
     let k = open_after_root_change(&db, &mirror, &ROOT, &NEW_ROOT).await;
     assert_eq!(k.state(), KeyringState::Unlocked);
     assert_eq!(at_rest_key::Entity::find().all(&db).await.unwrap(), before);
+}
+
+/// A database restored to before a re-seal still holds rows sealed under
+/// the previous root, while the mirror holds them under the current one.
+/// The boot unlocks through the mirror and must store and mirror every row
+/// under the current root, never the restored seal.
+#[tokio::test]
+async fn a_database_restored_to_before_a_reseal_is_sealed_under_the_current_root() {
+    let (db, mirror) = (db().await, Arc::new(MemoryMirror::default()));
+    let k = open(&db, &mirror, &ROOT, unescrowed()).await.unwrap();
+    let dek = k.current_key("space-a").await.unwrap();
+    assert_eq!(k.rotate_ark().await.unwrap(), 2);
+    drop(k);
+    let before_reseal = stored_keys(&db).await;
+
+    drop(open_after_root_change(&db, &mirror, &NEW_ROOT, &ROOT).await);
+    assert_eq!(opening_under(&mirrored_keys(&mirror).await, &NEW_ROOT), 2);
+    restore_keys(&db, &before_reseal).await;
+
+    let k = open_after_root_change(&db, &mirror, &NEW_ROOT, &ROOT).await;
+    assert_eq!(k.state(), KeyringState::Unlocked);
+    drop(k);
+    let mirrored = mirrored_keys(&mirror).await;
+    assert_eq!(mirrored.len(), 2);
+    assert_eq!(
+        opening_under(&mirrored, &NEW_ROOT),
+        2,
+        "every mirrored ARK row must open under the current root"
+    );
+    assert_eq!(
+        opening_under(&stored_keys(&db).await, &NEW_ROOT),
+        2,
+        "every stored ARK row must open under the current root"
+    );
+    let k = open(&db, &mirror, &NEW_ROOT, unescrowed()).await.unwrap();
+    assert_eq!(k.state(), KeyringState::Unlocked, "the current root alone");
+    assert_eq!(
+        k.key("space-a", DekId::new(1)).await.unwrap().bytes(),
+        dek.bytes()
+    );
+    drop(k);
+    let k = open(&db, &mirror, &ROOT, unescrowed()).await.unwrap();
+    assert_eq!(k.state(), KeyringState::Locked, "the previous root alone");
+    drop(k);
+
+    // The same restore with a mirror that can't take the re-sealed rows:
+    // the boot fails, even with mirror writes otherwise optional, and the
+    // next boot with a writable mirror converges.
+    restore_keys(&db, &before_reseal).await;
+    mirror.set_read_only(true);
+    let off = KeyringConfig {
+        require_mirror: false,
+        ..unescrowed()
+    };
+    match open(&db, &mirror, &NEW_ROOT, off.clone()).await {
+        Ok(k) => panic!(
+            "re-sealed boot reported {:?} with the mirror unwritten",
+            k.state()
+        ),
+        Err(AtRestError::Mirror(why)) => assert!(why.contains("retry the boot"), "{why}"),
+        Err(e) => panic!("unexpected error: {e}"),
+    }
+    mirror.set_read_only(false);
+    let k = open(&db, &mirror, &NEW_ROOT, off).await.unwrap();
+    assert_eq!(k.state(), KeyringState::Unlocked);
+    drop(k);
+    assert_eq!(opening_under(&stored_keys(&db).await, &NEW_ROOT), 2);
+    assert_eq!(opening_under(&mirrored_keys(&mirror).await, &NEW_ROOT), 2);
+}
+
+/// A re-seal that fails part way leaves every generation as it was.
+#[tokio::test]
+async fn a_reseal_that_fails_part_way_changes_no_generation() {
+    let (db, mirror) = (db().await, Arc::new(MemoryMirror::default()));
+    let k = open(&db, &mirror, &ROOT, unescrowed()).await.unwrap();
+    assert_eq!(k.rotate_ark().await.unwrap(), 2);
+    drop(k);
+    db.execute_unprepared(
+        "CREATE TRIGGER fail_generation_2 BEFORE UPDATE ON at_rest_key \
+         WHEN NEW.generation = 2 BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+    )
+    .await
+    .unwrap();
+
+    let result = open_with_previous(&db, &mirror, &NEW_ROOT, &ROOT, unescrowed()).await;
+    assert!(matches!(result, Err(AtRestError::Store(_))));
+    let rows = stored_keys(&db).await;
+    assert_eq!(
+        (opening_under(&rows, &ROOT), opening_under(&rows, &NEW_ROOT)),
+        (2, 0),
+        "(under the old root, under the new root) after a failed re-seal"
+    );
+    assert_eq!(opening_under(&mirrored_keys(&mirror).await, &ROOT), 2);
+
+    db.execute_unprepared("DROP TRIGGER fail_generation_2;")
+        .await
+        .unwrap();
+    let k = open_after_root_change(&db, &mirror, &NEW_ROOT, &ROOT).await;
+    assert_eq!(k.state(), KeyringState::Unlocked);
+    assert_eq!(opening_under(&stored_keys(&db).await, &NEW_ROOT), 2);
+}
+
+/// Re-sealing under a new root must reach the mirror whatever
+/// `require_mirror` says; a later boot rewrites it once it is writable.
+#[tokio::test]
+async fn a_reseal_fails_until_the_mirror_takes_it_and_a_later_boot_converges() {
+    let (db, mirror) = (db().await, Arc::new(MemoryMirror::default()));
+    let k = open(&db, &mirror, &ROOT, unescrowed()).await.unwrap();
+    let dek = k.current_key("space-a").await.unwrap();
+    assert_eq!(k.rotate_ark().await.unwrap(), 2);
+    drop(k);
+    mirror.set_read_only(true);
+    let off = KeyringConfig {
+        require_mirror: false,
+        ..unescrowed()
+    };
+
+    match open_with_previous(&db, &mirror, &NEW_ROOT, &ROOT, off.clone()).await {
+        Ok(k) => panic!(
+            "re-seal reported {:?} with the mirror still under the previous root",
+            k.state()
+        ),
+        Err(AtRestError::Mirror(why)) => assert!(
+            why.contains("re-sealed") && why.contains("retry the boot"),
+            "{why}"
+        ),
+        Err(e) => panic!("unexpected error: {e}"),
+    }
+    assert_eq!(opening_under(&mirrored_keys(&mirror).await, &ROOT), 2);
+
+    mirror.set_read_only(false);
+    let k = open_with_previous(&db, &mirror, &NEW_ROOT, &ROOT, off.clone())
+        .await
+        .unwrap();
+    assert_eq!(k.state(), KeyringState::Unlocked);
+    assert_eq!(
+        k.key("space-a", DekId::new(1)).await.unwrap().bytes(),
+        dek.bytes()
+    );
+    drop(k);
+    assert_eq!(opening_under(&mirrored_keys(&mirror).await, &NEW_ROOT), 2);
+    assert_eq!(opening_under(&stored_keys(&db).await, &NEW_ROOT), 2);
+    let k = open(&db, &mirror, &ROOT, off).await.unwrap();
+    assert_eq!(k.state(), KeyringState::Locked);
 }

@@ -23,8 +23,8 @@ use super::hierarchy::{
 };
 use super::store::{
     ark_mirror_name, dek_mirror_name, escrow_mirror_name, record_mirror_name, retired_mirror_name,
-    AtRestStore, KeyMirror, MirrorObjectTooLarge, MirroredArk, MirroredDek, MirroredRetired,
-    ARK_MIRROR_PREFIX, MIRROR_PREFIX, RETIRED_MIRROR_PREFIX,
+    AtRestStore, KeyChange, KeyMirror, MirrorObjectTooLarge, MirroredArk, MirroredDek,
+    MirroredRetired, ARK_MIRROR_PREFIX, MIRROR_PREFIX, RETIRED_MIRROR_PREFIX,
 };
 use super::{in_write_lock, DataKey, DataKeyError, DataKeyProvider, DekId, ObjectNameKey};
 use crate::models::{at_rest_escrow, at_rest_key, space_data_key};
@@ -52,7 +52,9 @@ pub struct KeyringConfig {
     /// Whether mirror writes at boot and after recovery must succeed. True
     /// once keys may seal data (mode other than `off`); with it false, a
     /// mirror that can't be written is logged and the database alone serves,
-    /// so mirror contents never stop a node that encrypts nothing.
+    /// so mirror contents never stop a node that encrypts nothing. A boot
+    /// that re-seals stored ARK rows under this root needs the mirror either
+    /// way.
     pub require_mirror: bool,
     /// `at_rest.escrow.allow_resplit_before_verify`: let a holder change
     /// replace the root key at boot, but only while nothing is pinned, no
@@ -480,12 +482,14 @@ fn unlock_under_w(
 }
 
 /// Store what `resolve_chain` chose: insert generations the database lacks, and
-/// update the seal or chain of those it has. Every row was authenticated.
+/// update the seal or chain of those it has, all in one transaction. Every row
+/// was authenticated.
 async fn persist_chosen(
     store: &AtRestStore,
     db: &[at_rest_key::Model],
     chosen: &[at_rest_key::Model],
 ) -> Result<(), AtRestError> {
+    let mut changes = Vec::new();
     for row in chosen {
         match db.iter().find(|d| d.generation == row.generation) {
             None => {
@@ -493,19 +497,21 @@ async fn persist_chosen(
                     generation = row.generation,
                     "at-rest ARK row was missing from the database; restored an authenticated copy from the mirror"
                 );
-                store.insert_key(row.clone()).await?;
+                changes.push(KeyChange::Insert(row.clone()));
             }
             Some(d) if d.ark_id == row.ark_id => {
                 if d.sealed != row.sealed || d.w_label != row.w_label {
-                    store
-                        .reseal_key(row.generation, &row.w_label, row.sealed.clone())
-                        .await?;
+                    changes.push(KeyChange::Reseal {
+                        generation: row.generation,
+                        w_label: row.w_label.clone(),
+                        sealed: row.sealed.clone(),
+                    });
                 }
                 if d.chain != row.chain {
-                    match &row.chain {
-                        Some(chain) => store.set_chain(row.generation, chain.clone()).await?,
-                        None => store.clear_chain(row.generation).await?,
-                    }
+                    changes.push(KeyChange::Chain {
+                        generation: row.generation,
+                        chain: row.chain.clone(),
+                    });
                 }
             }
             Some(_) => {
@@ -515,7 +521,15 @@ async fn persist_chosen(
             }
         }
     }
-    Ok(())
+    Ok(store.apply_key_changes(changes).await?)
+}
+
+/// Whether `row`'s seal opens under `w`.
+fn opens_under(w: &WrapKey, row: &at_rest_key::Model) -> bool {
+    let (Ok(id), Ok(g)) = (ark_id_of(row), u32::try_from(row.generation)) else {
+        return false;
+    };
+    open_ark(w, &row.sealed, &id, g, &row.w_label).is_ok()
 }
 
 /// Mirrored ARK rows, unauthenticated. Junk objects (not JSON, a newer
@@ -634,10 +648,13 @@ impl AtRestKeyring {
 
     /// [`Self::open`] for a node whose root changed. When the rows don't open
     /// under `root` but do open under `previous_root`, every ARK generation
-    /// is re-sealed under `root` (database and mirror) and the keys unlock.
-    /// Nothing below the ARK changes: chains, DEK wraps and object names stay
-    /// as they are. Rows that already open under `root` ignore
-    /// `previous_root`; rows that open under neither leave the node locked.
+    /// is re-sealed under `root` (database rows in one transaction, then the
+    /// mirror) and the keys unlock. If the mirror can't take the re-sealed
+    /// rows the boot fails, whatever `require_mirror` says; retrying under
+    /// `root` finishes it. Nothing below the ARK changes: chains, DEK wraps
+    /// and object names stay as they are. Rows that already open under
+    /// `root` ignore `previous_root`; rows that open under neither leave the
+    /// node locked.
     pub async fn open_with_previous_root(
         store: AtRestStore,
         mirror: Arc<dyn KeyMirror>,
@@ -752,16 +769,23 @@ impl AtRestKeyring {
         if let Some((mut chosen, keys)) = unlock_under_w(&self.w, db.len() as u32, &cands)? {
             // Only chains and ARK ids come from the chosen rows. Seal bytes
             // are never taken from the mirror: a generation the database has
-            // keeps its own seal, and one it lacks gets a fresh seal under W.
+            // keeps its own seal if it opens under W, and every other
+            // generation gets a fresh seal under W. A database seal that
+            // doesn't open under W (a database restored to before a re-seal,
+            // unlocked here through the mirror) is never stored or mirrored
+            // again: that would hand the keys back to the other root.
+            let mut resealed = false;
             for row in chosen.iter_mut() {
-                match db.iter().find(|d| d.generation == row.generation) {
-                    Some(d) if d.ark_id == row.ark_id => {
+                let g = row.generation as u32;
+                let stored = db.iter().find(|d| d.generation == row.generation);
+                match stored {
+                    Some(d) if d.ark_id != row.ark_id => {} // persist_chosen refuses this
+                    Some(d) if opens_under(&self.w, d) => {
                         row.sealed = d.sealed.clone();
                         row.w_label = d.w_label.clone();
                     }
-                    Some(_) => {} // persist_chosen refuses this
-                    None => {
-                        let g = row.generation as u32;
+                    _ => {
+                        resealed |= stored.is_some();
                         let gen = &keys.gens[&g];
                         row.sealed = seal_ark(&self.w, &gen.ark, &gen.ark_id, g);
                         row.w_label = W_LABEL.into();
@@ -769,10 +793,13 @@ impl AtRestKeyring {
                 }
             }
             persist_chosen(&self.store, &db, &chosen).await?;
-            for row in self.store.keys().await? {
-                self.mirror_soft(Self::mirror_row(&*self.mirror, &row).await)?;
-            }
+            self.mirror_keys(resealed).await?;
             *self.phase.write() = Phase::Unlocked(Arc::new(keys));
+            if resealed {
+                tracing::warn!(
+                    "at-rest keys stored under another root were re-sealed under the current root"
+                );
+            }
             return Ok(());
         }
         if let Some(previous) = &self.previous_w {
@@ -786,9 +813,7 @@ impl AtRestKeyring {
                     row.w_label = W_LABEL.into();
                 }
                 persist_chosen(&self.store, &db, &chosen).await?;
-                for row in self.store.keys().await? {
-                    self.mirror_soft(Self::mirror_row(&*self.mirror, &row).await)?;
-                }
+                self.mirror_keys(true).await?;
                 *self.phase.write() = Phase::Unlocked(Arc::new(keys));
                 tracing::warn!(
                     generations = chosen.len(),
@@ -829,6 +854,37 @@ impl AtRestKeyring {
             != Some(body.as_slice())
         {
             mirror.put(&name, body).await.map_err(mirror_err)?;
+        }
+        Ok(())
+    }
+
+    /// Mirror the stored ARK rows; one that doesn't open under this root's
+    /// W is never mirrored. After rows were re-sealed under this root
+    /// (`resealed`), every write must succeed whatever `require_mirror`
+    /// says: a mirror left under another root would let that root unlock
+    /// and seal the keys back to itself. The database is already re-sealed
+    /// then, so the next boot under this root opens it and rewrites the
+    /// mirror.
+    async fn mirror_keys(&self, resealed: bool) -> Result<(), AtRestError> {
+        for row in self.store.keys().await? {
+            if !opens_under(&self.w, &row) {
+                tracing::warn!(
+                    generation = row.generation,
+                    "not mirroring an at-rest ARK row that does not open under this node's root"
+                );
+                continue;
+            }
+            let written = Self::mirror_row(&*self.mirror, &row).await;
+            if !resealed {
+                self.mirror_soft(written)?;
+                continue;
+            }
+            written.map_err(|e| match e {
+                AtRestError::Mirror(why) => AtRestError::Mirror(format!(
+                    "the database's at-rest keys are re-sealed under this node's root, but their block-store copy is not ({why}); retry the boot"
+                )),
+                other => other,
+            })?;
         }
         Ok(())
     }
@@ -1604,9 +1660,7 @@ impl AtRestKeyring {
             row.w_label = W_LABEL.into();
         }
         persist_chosen(&self.store, &db, &chosen).await?;
-        for row in self.store.keys().await? {
-            self.mirror_soft(Self::mirror_row(&*self.mirror, &row).await)?;
-        }
+        self.mirror_keys(false).await?;
         *self.phase.write() = Phase::Unlocked(Arc::new(keys));
         tracing::warn!(
             generation = bundle.generation,
