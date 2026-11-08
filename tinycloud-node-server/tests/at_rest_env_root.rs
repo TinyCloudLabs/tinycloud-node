@@ -94,6 +94,29 @@ async fn an_env_root_boots_refuses_and_changes_without_losing_keys() {
     assert_eq!(s["root_fingerprint"], fingerprint(&a));
     assert!(!s.to_string().contains(&a));
     drop(client);
+    // The node took the key out of the process environment, and with a key
+    // present it turned core dumps off.
+    assert!(std::env::var_os(ROOT_KEY).is_none());
+    #[cfg(target_os = "linux")]
+    {
+        assert_eq!(unsafe { libc::prctl(libc::PR_GET_DUMPABLE) }, 0);
+        let mut limit = libc::rlimit {
+            rlim_cur: 1,
+            rlim_max: 1,
+        };
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut limit) }, 0);
+        assert_eq!(limit.rlim_cur, 0);
+    }
+
+    // A declared TEE whose guest agent is absent: the TEE checks can't run,
+    // so the node refuses rather than booting as if there were no TEE.
+    set_env(Some(&a), None);
+    std::env::set_var("TINYCLOUD_TEE_MODE", "dstack");
+    std::env::set_var("DSTACK_SIMULATOR_ENDPOINT", "/nonexistent/dstack.sock");
+    let err = refused(dir.path(), env_root.clone()).await;
+    std::env::remove_var("TINYCLOUD_TEE_MODE");
+    std::env::remove_var("DSTACK_SIMULATOR_ENDPOINT");
+    assert!(err.contains("TEE"), "{err}");
 
     // Another key alone doesn't open them: refused, never booted locked.
     set_env(Some(&b), None);
@@ -123,6 +146,8 @@ async fn an_env_root_boots_refuses_and_changes_without_losing_keys() {
     set_env(Some(&b), None);
     let err = refused(dir.path(), json!({"escrow_none": true})).await;
     assert!(err.contains("root_source is \"escrow\""), "{err}");
+    // Each boot takes the variables out of the environment; set them again.
+    set_env(Some(&b), None);
     let err = refused(
         dir.path(),
         json!({"root_source": "env", "escrow_none": true}),
