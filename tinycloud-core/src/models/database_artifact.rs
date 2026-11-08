@@ -27,6 +27,10 @@ pub struct Model {
     pub payload_encoding: Option<i16>,
     /// How `delta_payload` is stored, like `payload_encoding`.
     pub delta_encoding: Option<i16>,
+    /// The row's manifest tag: a TCE1 seal of nothing, bound to the row's
+    /// revision, hashes, sizes, encodings and whether it has a delta
+    /// (`docs/at-rest/INTERFACES.md` §8). `NULL` on rows mode `off` wrote.
+    pub manifest: Option<Vec<u8>>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

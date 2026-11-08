@@ -297,7 +297,7 @@ UPDATE database_artifact SET checkpoint_part_id=$4,delta_part_id=NULL,
  revision=$5,content_hash=$6,checkpoint_content_hash=$6,size_bytes=$7,
  checkpoint_size_bytes=$7,payload=''::bytea,delta_payload=NULL,
  delta_content_hash=NULL,delta_size_bytes=0,storage_mode='checkpoint-parts-v1',
- payload_encoding=NULL,delta_encoding=NULL,
+ payload_encoding=NULL,delta_encoding=NULL,manifest=NULL,
  layout_generation=layout_generation+1,updated_at=$8
 WHERE service=$1 AND space=$2 AND name=$3 AND revision=$9 AND checkpoint_content_hash=$10
  AND EXISTS(SELECT 1 FROM ready)"#
@@ -342,9 +342,10 @@ FROM ready ON CONFLICT DO NOTHING"#
             updated_at: now,
             storage_mode: "checkpoint-parts-v1".into(),
             backend: "storage.database".into(),
-            // Parts are plaintext (TC-887).
+            // Parts are plaintext and carry no at-rest manifest tag (TC-887).
             payload_encoding: None,
             delta_encoding: None,
+            manifest: None,
         })
     }
 
