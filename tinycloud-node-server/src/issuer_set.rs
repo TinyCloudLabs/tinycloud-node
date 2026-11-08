@@ -53,6 +53,10 @@ pub enum IssuerSetError {
         "issuer set entry {index}: notBefore is after notAfter, or retiredAt is before notBefore"
     )]
     EmptyWindow { index: usize },
+    #[error("issuer overlap requires an enabled legacy issuer")]
+    OverlapMissingLegacy,
+    #[error("issuer overlap end time has already passed")]
+    ExpiredOverlapEnd,
 }
 
 /// One configured issuer, as written in configuration (camelCase, matching the
@@ -175,16 +179,41 @@ impl IssuerSet {
         Ok(set)
     }
 
-    /// Loads the set and adds the legacy single issuer as one more entry. A
-    /// legacy `kid` that also appears in the explicit list is a duplicate.
+    /// Loads the set and adds the legacy single issuer as one more entry.
     pub fn load_with_legacy(
         configured: &[CredentialIssuerConfig],
         legacy: Option<&IssuerKey>,
     ) -> Result<Self, IssuerSetError> {
+        Self::load_with_legacy_not_after(configured, legacy, None)
+    }
+
+    /// Loads a key-rotation overlap. The legacy key receives a hard verification
+    /// deadline; a past deadline is invalid rather than silently disabling trust
+    /// at startup.
+    pub fn load_with_legacy_not_after(
+        configured: &[CredentialIssuerConfig],
+        legacy: Option<&IssuerKey>,
+        not_after: Option<&str>,
+    ) -> Result<Self, IssuerSetError> {
+        let index = configured.len();
+        let not_after = not_after
+            .map(|text| {
+                parse_utc(text).ok_or(IssuerSetError::Time {
+                    index,
+                    field: "notAfter",
+                })
+            })
+            .transpose()?;
+        if not_after.is_some_and(|stop| stop <= OffsetDateTime::now_utc()) {
+            return Err(IssuerSetError::ExpiredOverlapEnd);
+        }
         let mut set = Self::load(configured)?;
+        if not_after.is_some() && !legacy.is_some_and(|key| key.enabled) {
+            return Err(IssuerSetError::OverlapMissingLegacy);
+        }
         if let Some(key) = legacy.filter(|key| key.enabled) {
-            let entry = IssuerSetEntry::from_legacy(key);
-            let index = configured.len();
+            let mut entry = IssuerSetEntry::from_legacy(key);
+            entry.not_after = not_after;
             if !did_is_canonical(&entry.issuer_did) {
                 return Err(IssuerSetError::IssuerDid { index });
             }

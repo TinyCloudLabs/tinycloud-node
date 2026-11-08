@@ -89,3 +89,69 @@ Share must emit the generic OpenCredentials origin before it removes or
 rotates its legacy bundle. Node validates this contract before
 advertising share-email readiness, so a missing, malformed, mismatched, or
 fixture bundle fails closed.
+
+## Issuer-key rotation with a bounded overlap
+
+The existing single-key bundle remains valid. To rotate the issuer while
+preserving verification of credentials already in flight, keep the current
+issuer in `issuerDid`, `issuerKid`, `issuerPublicKey` and
+`issuerKeyVersion`, then add:
+
+- `nextIssuer`: one `CredentialIssuerConfig` for the same
+  `did:web:issuer.credentials.org`, with a distinct `kid` and public key,
+  `alg: "EdDSA"`, the existing email VCT and both existing email profiles;
+- `issuerNotAfter`: a UTC RFC 3339 timestamp ending the current key's trust.
+
+The next key's `notBefore` must be no later than `issuerNotAfter`. The node
+accepts either pinned key before the end time and refuses the old key at or
+after it. The end time is mandatory; an unbounded same-DID overlap, a duplicate
+key or `kid`, an invalid timestamp, or an already-expired end makes startup
+and `--validate-config` fail closed.
+
+### Verify a new issuer key
+
+Do not add a key copied only from a DID document, HTTPS response, or `GetKey`
+response. Obtain from Phala the exact witness application ID and key domain,
+the complete dstack `GetKey` result including its `signature_chain`, and the
+KMS root public key/SPKI with its attestation or independently verifiable
+publication. Verify the app-key claim over the returned public key and its
+application ID/domain, then verify the KMS signature over the app-key claim
+using that independently authenticated KMS root. Verify that the resulting
+32-byte Ed25519 public key is the witness DID document's
+`did:web:issuer.credentials.org` verification method, obtained through a
+Phala-attested or RA-TLS-verified channel. Record the evidence and verifier
+output with the rotation change. If Phala cannot provide the app ID/domain,
+complete chain, or independent root authentication, stop; do not pin the key.
+
+### Seal, deploy, and remove the overlap
+
+1. Review the public key and bundle diff. Keep the current issuer fields
+   unchanged; add the verified next issuer and a fixed UTC `issuerNotAfter`
+   chosen with enough time for every consumer to receive the new key. The
+   overlap must be operationally bounded, not extended by default.
+2. Compactly serialize the exact JSON and base64-encode it without line
+   wrapping. Put that exact value in
+   `PROD_TINYCLOUD_SHARE_TRUST_BUNDLE_BASE64` through the normal secret-change
+   process. Never put the bundle value in a PR, workflow log, or chat. Run
+   `--validate-config` and the issuer-verification tests against the reviewed
+   artifact before release.
+3. The Share producer, browser verifier, and any other bundle consumer must
+   be updated to accept `nextIssuer` and the bounded overlap before this
+   bundle is activated. Their current single-key strict parsers reject these
+   fields; this Node change alone is not an end-to-end rotation.
+4. Before `issuerNotAfter`, publish a second reviewed bundle that promotes the
+   next key into the top-level `issuerKid`, `issuerPublicKey`, and
+   `issuerKeyVersion` fields, and removes `nextIssuer` and `issuerNotAfter`.
+   Update every consumer to the same single-key bundle, verify configuration
+   and credential checks, then allow the old key's deadline to pass. Do not
+   leave an expired overlap in the bundle: it intentionally prevents startup.
+
+If the node's own `GetKey("tinycloud/keys/primary")` output changes, derive
+`nodeInvitationPublicKey` from that production key using the existing node
+key-provider procedure; do not generate or substitute a key. Set
+`nodeKeyVersion` to the version associated with that public key and set
+`nodeInvitationKid` to
+`<nodeAudience>#invitation-key-<nodeKeyVersion>`. Recheck `nodeAudience`,
+`nodeEnabled`, and the enforcer DID binding in the separately signed authority
+material. The issuer-key overlap itself does not change the node invitation
+key or node key version.

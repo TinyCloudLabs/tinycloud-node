@@ -12,6 +12,7 @@ use serde_with::{
     serde_as, FromInto,
 };
 use std::{fs, path::PathBuf, time::Duration};
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tinycloud_core::db_pool::{StatementTimeoutMode, StatementTimeouts};
 use tinycloud_core::keys::StaticSecret;
 use tinycloud_core::sql::DdlPolicy;
@@ -164,11 +165,15 @@ pub struct ShareEmailConfig {
     pub issuer_key_version: u64,
     #[serde(default)]
     pub issuer_public_key: Option<String>,
+    /// Hard stop for the legacy issuer while a same-DID next key overlaps.
+    /// Must be paired with exactly one same-DID `credential_issuers` entry.
+    #[serde(default)]
+    pub issuer_not_after: Option<String>,
     /// The pinned per-policy issuer set (TC-1452): the explicit entries, each
     /// `{issuerDid, kid, alg, publicKey, vcts, profiles, notBefore, retiredAt?,
     /// notAfter?}`. The legacy single issuer above, when its public key is
-    /// set, joins as one more entry. A violation of a set-load rule stops the
-    /// node from starting. Nothing here is fetched or resolved.
+    /// set, joins as one more entry. A same-DID second key requires an explicit
+    /// future `issuer_not_after`.
     #[serde(default)]
     pub credential_issuers: Vec<crate::issuer_set::CredentialIssuerConfig>,
     /// Operator-delivered owner-signed authority material. A missing or
@@ -322,6 +327,7 @@ impl Default for ShareEmailConfig {
             issuer_kid: default_share_issuer_kid(),
             issuer_key_version: default_share_issuer_key_version(),
             issuer_public_key: None,
+            issuer_not_after: None,
             credential_issuers: Vec::new(),
             authority_material_path: None,
             trust_bundle_path: None,
@@ -408,12 +414,49 @@ impl ShareEmailConfig {
     }
 
     /// Builds the pinned issuer set: the explicit `credential_issuers` plus the
-    /// legacy single issuer as one entry. Applies every set-load rule; the
-    /// caller refuses to start on an error.
+    /// legacy single issuer as one entry. A same-DID additional key is allowed
+    /// only with a future hard stop for the legacy key.
     pub fn credential_issuer_set(&self) -> anyhow::Result<crate::issuer_set::IssuerSet> {
         use anyhow::Context as _;
         self.validate_issuer_pin()
             .map_err(|error| anyhow::anyhow!(error))?;
+        let same_did: Vec<_> = self
+            .credential_issuers
+            .iter()
+            .filter(|entry| entry.issuer_did == self.issuer_did)
+            .collect();
+        let legacy_not_after = match (self.issuer_not_after.as_deref(), same_did.as_slice()) {
+            (None, []) => None,
+            (Some(end), [next]) => {
+                let end_time = parse_config_utc(end)
+                    .ok_or_else(|| anyhow::anyhow!("issuer overlap end must be UTC RFC 3339"))?;
+                if end_time <= OffsetDateTime::now_utc() {
+                    anyhow::bail!("issuer overlap end time has already passed");
+                }
+                let next_start = parse_config_utc(&next.not_before)
+                    .ok_or_else(|| anyhow::anyhow!("next issuer notBefore must be UTC RFC 3339"))?;
+                if next_start > end_time
+                    || next.retired_at.is_some()
+                    || next.not_after.is_some()
+                    || next.vcts != [self.issuer_vct.clone()]
+                    || next.profiles.len() != 2
+                    || !next
+                        .profiles
+                        .iter()
+                        .any(|profile| profile == "tinycloud.email-proof/v1")
+                    || !next
+                        .profiles
+                        .iter()
+                        .any(|profile| profile == "tinycloud.email-domain-proof/v1")
+                {
+                    anyhow::bail!("issuer overlap entry is invalid");
+                }
+                Some(end)
+            }
+            _ => anyhow::bail!(
+                "same-DID issuer overlap requires exactly one next key and a bounded end"
+            ),
+        };
         let legacy = self
             .issuer_public_key
             .as_deref()
@@ -433,8 +476,12 @@ impl ShareEmailConfig {
                 ))
             })
             .transpose()?;
-        crate::issuer_set::IssuerSet::load_with_legacy(&self.credential_issuers, legacy.as_ref())
-            .context("credential issuer set is invalid")
+        crate::issuer_set::IssuerSet::load_with_legacy_not_after(
+            &self.credential_issuers,
+            legacy.as_ref(),
+            legacy_not_after,
+        )
+        .context("credential issuer set is invalid")
     }
 
     pub fn resolve_trust_bundle(&self) -> Result<Self, &'static str> {
@@ -466,6 +513,10 @@ impl ShareEmailConfig {
         resolved.issuer_kid = bundle.issuer_kid;
         resolved.issuer_key_version = bundle.issuer_key_version as u64;
         resolved.issuer_public_key = Some(bundle.issuer_public_key);
+        resolved.issuer_not_after = bundle.issuer_not_after;
+        if let Some(next_issuer) = bundle.next_issuer {
+            resolved.credential_issuers.push(next_issuer);
+        }
         Ok(resolved)
     }
 
@@ -644,6 +695,14 @@ impl ShareEmailConfig {
     }
 }
 
+fn parse_config_utc(text: &str) -> Option<OffsetDateTime> {
+    if !text.ends_with('Z') {
+        return None;
+    }
+    let parsed = OffsetDateTime::parse(text, &Rfc3339).ok()?;
+    parsed.offset().is_utc().then_some(parsed)
+}
+
 #[derive(Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
 #[serde(rename_all = "camelCase")]
@@ -669,6 +728,10 @@ struct ShareEmailTrustBundle {
     issuer_public_key: String,
     issuer_key_version: u32,
     issuer_enabled: bool,
+    #[serde(default)]
+    issuer_not_after: Option<String>,
+    #[serde(default)]
+    next_issuer: Option<crate::issuer_set::CredentialIssuerConfig>,
 }
 
 impl ShareEmailTrustBundle {
@@ -677,6 +740,37 @@ impl ShareEmailTrustBundle {
             && canonical_https_origin_with_optional_port(&self.share_origin);
         let fixture_node_origin = allows_hermetic_fixture()
             && canonical_https_origin_with_optional_port(&self.node_origin);
+        let overlap_valid = match (self.issuer_not_after.as_deref(), self.next_issuer.as_ref()) {
+            (None, None) => true,
+            (Some(end), Some(next)) => {
+                let end_time = parse_config_utc(end);
+                let next_start = parse_config_utc(&next.not_before);
+                end_time.is_some_and(|end| end > OffsetDateTime::now_utc())
+                    && next_start
+                        .zip(end_time)
+                        .is_some_and(|(start, end)| start <= end)
+                    && next.issuer_did == self.issuer_did
+                    && next.kid != self.issuer_kid
+                    && canonical_kid_matches(&next.kid, &next.issuer_did)
+                    && next.alg == "EdDSA"
+                    && next.vcts.len() == 1
+                    && next.vcts[0] == self.issuer_vct
+                    && next.profiles.len() == 2
+                    && next
+                        .profiles
+                        .iter()
+                        .any(|v| v == "tinycloud.email-proof/v1")
+                    && next
+                        .profiles
+                        .iter()
+                        .any(|v| v == "tinycloud.email-domain-proof/v1")
+                    && next.retired_at.is_none()
+                    && next.not_after.is_none()
+                    && canonical_key(&next.public_key)
+                    && next.public_key != self.issuer_public_key
+            }
+            _ => false,
+        };
         if self.version != "tinycloud.share-email-trust-bundle/v1"
             || (!fixture_origin && self.share_origin != "https://share.tinycloud.xyz")
             || self.return_origin != self.share_origin
@@ -705,6 +799,7 @@ impl ShareEmailTrustBundle {
             || !self.issuer_enabled
             || !canonical_key(&self.node_invitation_public_key)
             || !canonical_key(&self.issuer_public_key)
+            || !overlap_valid
             || (!allows_hermetic_fixture() && self.contains_fixture_material())
         {
             return Err("share email trust bundle is inconsistent");
@@ -775,6 +870,10 @@ impl ShareEmailTrustBundle {
             || contains_placeholder(&self.email_origin)
             || is_fixture_public_key(&self.node_invitation_public_key)
             || is_fixture_public_key(&self.issuer_public_key)
+            || self
+                .next_issuer
+                .as_ref()
+                .is_some_and(|next| is_fixture_public_key(&next.public_key))
     }
 }
 
@@ -2605,6 +2704,190 @@ mod tests {
             .expect("trust bundle write");
         config.trust_bundle_path = Some(file.path().display().to_string());
         file
+    }
+
+    fn overlap_bundle(
+        config: &ShareEmailConfig,
+        old_not_after: &str,
+        next_public_key: &str,
+    ) -> serde_json::Value {
+        let mut bundle = bundle_document(config);
+        bundle["issuerNotAfter"] = serde_json::json!(old_not_after);
+        bundle["nextIssuer"] = serde_json::json!({
+            "issuerDid": "did:web:issuer.credentials.org",
+            "kid": "did:web:issuer.credentials.org#email-signing-key-2",
+            "alg": "EdDSA",
+            "publicKey": next_public_key,
+            "vcts": ["opencredentials.email/v1"],
+            "profiles": ["tinycloud.email-proof/v1", "tinycloud.email-domain-proof/v1"],
+            "notBefore": "2026-10-01T00:00:00Z",
+            "retiredAt": null,
+            "notAfter": null
+        });
+        bundle
+    }
+
+    #[cfg(not(feature = "mounted-fixture"))]
+    #[test]
+    fn trust_bundle_accepts_legacy_single_key_unchanged_and_bounded_same_did_overlap() {
+        let old_config = enabled_config();
+        let mut old_only = old_config.clone();
+        let _old_file = install_bundle(&mut old_only);
+        assert!(old_only.resolve_trust_bundle().is_ok());
+
+        let next_key = ed25519_dalek::SigningKey::from_bytes(&[9; 32])
+            .verifying_key()
+            .to_bytes();
+        let next_key = base64::encode_config(next_key, URL_SAFE_NO_PAD);
+        let mut overlap = old_config;
+        let bundle = overlap_bundle(&overlap, "2030-01-01T00:00:00Z", &next_key);
+        let file = NamedTempFile::new().expect("temporary trust bundle");
+        fs::write(file.path(), serde_json::to_vec(&bundle).unwrap()).expect("trust bundle write");
+        overlap.trust_bundle_path = Some(file.path().display().to_string());
+
+        let resolved = overlap.resolve_trust_bundle().expect("bounded overlap");
+        let set = resolved
+            .credential_issuer_set()
+            .expect("overlap issuer set");
+        assert_eq!(set.len(), 2);
+        let old = set
+            .resolve_pinned_issuer(
+                "did:web:issuer.credentials.org",
+                "did:web:issuer.credentials.org#email-signing-key-1",
+            )
+            .expect("old issuer");
+        let next = set
+            .resolve_pinned_issuer(
+                "did:web:issuer.credentials.org",
+                "did:web:issuer.credentials.org#email-signing-key-2",
+            )
+            .expect("next issuer");
+        assert!(old.not_after.is_some());
+        assert!(next.not_after.is_none());
+        let end = parse_config_utc("2030-01-01T00:00:00Z").unwrap();
+        assert_eq!(
+            old.check_now(end),
+            Err(crate::issuer_set::IssuerWindowError::Stopped)
+        );
+        assert!(next.check_now(end).is_ok());
+        let preflight = Config {
+            share_email: overlap,
+            ..Config::default()
+        };
+        assert!(
+            crate::resolve_runtime_config(&preflight).is_ok(),
+            "valid bounded overlap must pass the same preflight used at startup"
+        );
+    }
+
+    #[cfg(not(feature = "mounted-fixture"))]
+    #[test]
+    fn trust_bundle_rejects_unbounded_expired_malformed_and_duplicate_overlap_keys() {
+        let config = enabled_config();
+        let next_key = ed25519_dalek::SigningKey::from_bytes(&[9; 32])
+            .verifying_key()
+            .to_bytes();
+        let next_key = base64::encode_config(next_key, URL_SAFE_NO_PAD);
+        let next_entry = || {
+            serde_json::json!({
+                "issuerDid": "did:web:issuer.credentials.org",
+                "kid": "did:web:issuer.credentials.org#email-signing-key-2",
+                "alg": "EdDSA",
+                "publicKey": next_key,
+                "vcts": ["opencredentials.email/v1"],
+                "profiles": ["tinycloud.email-proof/v1", "tinycloud.email-domain-proof/v1"],
+                "notBefore": "2026-10-01T00:00:00Z",
+                "retiredAt": null,
+                "notAfter": null
+            })
+        };
+        let mut duplicate_key = next_entry();
+        duplicate_key["publicKey"] =
+            serde_json::json!("AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA");
+        let mut duplicate_kid = next_entry();
+        duplicate_kid["kid"] =
+            serde_json::json!("did:web:issuer.credentials.org#email-signing-key-1");
+        let mut wrong_did = next_entry();
+        wrong_did["issuerDid"] = serde_json::json!("did:web:other.example");
+        wrong_did["kid"] = serde_json::json!("did:web:other.example#email-signing-key-2");
+        let mut after_end = next_entry();
+        after_end["notBefore"] = serde_json::json!("2031-01-01T00:00:00Z");
+        let mut malformed = next_entry();
+        malformed["publicKey"] = serde_json::json!("AQID");
+        let mut next_expiry = next_entry();
+        next_expiry["notAfter"] = serde_json::json!("2031-01-01T00:00:00Z");
+
+        let cases = [
+            ("overlap without end", None, Some(next_entry())),
+            ("end without next key", Some("2030-01-01T00:00:00Z"), None),
+            (
+                "expired overlap",
+                Some("2000-01-01T00:00:00Z"),
+                Some(next_entry()),
+            ),
+            ("malformed end", Some("not-a-time"), Some(next_entry())),
+            (
+                "duplicate public key",
+                Some("2030-01-01T00:00:00Z"),
+                Some(duplicate_key),
+            ),
+            (
+                "duplicate kid",
+                Some("2030-01-01T00:00:00Z"),
+                Some(duplicate_kid),
+            ),
+            (
+                "different DID",
+                Some("2030-01-01T00:00:00Z"),
+                Some(wrong_did),
+            ),
+            (
+                "empty overlap window",
+                Some("2030-01-01T00:00:00Z"),
+                Some(after_end),
+            ),
+            (
+                "next key has another end",
+                Some("2030-01-01T00:00:00Z"),
+                Some(next_expiry),
+            ),
+            (
+                "malformed key",
+                Some("2030-01-01T00:00:00Z"),
+                Some(malformed),
+            ),
+        ];
+        for (label, end, next) in cases {
+            let mut bundle = bundle_document(&config);
+            if let Some(end) = end {
+                bundle["issuerNotAfter"] = serde_json::json!(end);
+            }
+            if let Some(next) = next {
+                bundle["nextIssuer"] = next;
+            }
+            let file = NamedTempFile::new().expect("temporary trust bundle");
+            fs::write(file.path(), serde_json::to_vec(&bundle).unwrap())
+                .expect("trust bundle write");
+            let mut candidate = config.clone();
+            candidate.trust_bundle_path = Some(file.path().display().to_string());
+            assert!(
+                candidate
+                    .resolve_trust_bundle()
+                    .and_then(|resolved| resolved
+                        .credential_issuer_set()
+                        .map_err(|_| "issuer set invalid"))
+                    .is_err(),
+                "{label}"
+            );
+            let preflight = Config {
+                share_email: candidate,
+                ..Config::default()
+            };
+            assert!(
+                crate::resolve_runtime_config(&preflight).is_err(),
+                "{label}"
+            );
+        }
     }
 
     #[tokio::test]
