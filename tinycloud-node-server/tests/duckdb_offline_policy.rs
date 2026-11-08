@@ -286,7 +286,7 @@ async fn safe_controls(root: &Path) {
         .unwrap();
     drop(fixture);
 
-    let items = migration::offline_inventory(&metadata, &datadir)
+    let items = migration::offline_inventory(&metadata, &datadir, None)
         .await
         .unwrap();
     assert_eq!(items.len(), 1);
@@ -323,7 +323,7 @@ async fn safe_controls(root: &Path) {
     drop(reopened);
     persist_snapshot(&metadata, &path).await;
     std::fs::remove_file(&path).unwrap();
-    let items = migration::offline_inventory(&metadata, &datadir)
+    let items = migration::offline_inventory(&metadata, &datadir, None)
         .await
         .unwrap();
     assert_eq!(items.len(), 1);
@@ -379,7 +379,7 @@ async fn unsafe_controls(root: &Path) {
             .unwrap();
         assert_eq!(copied, 0, "source audit must finish before copying any DDL");
         drop(fixture);
-        let error = migration::offline_inventory(&metadata, &datadir)
+        let error = migration::offline_inventory(&metadata, &datadir, None)
             .await
             .unwrap_err();
         assert!(!error.to_string().contains(definition));
@@ -400,7 +400,7 @@ async fn unsafe_controls(root: &Path) {
         }
         persist_snapshot(&metadata, &path).await;
         std::fs::remove_file(&path).unwrap();
-        migration::offline_inventory(&metadata, &datadir)
+        migration::offline_inventory(&metadata, &datadir, None)
             .await
             .expect_err("unsafe durable snapshot must be rejected");
         let output = cli(

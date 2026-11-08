@@ -1,11 +1,49 @@
-//! Test-only key provider. Compiled only for this crate's tests or with the
+//! Test-only key provider and at-rest source. Compiled only for this crate's tests or with the
 //! `test-util` feature, which downstream crates enable on their
 //! `tinycloud-core` dev-dependency only.
 
 use super::key::{DataKey, DekId, ObjectNameKey};
 use super::provider::{DataKeyError, DataKeyProvider};
+use super::view::{AtRestMode, AtRestSource, AtRestView};
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
+use std::sync::{Arc, Mutex};
+
+/// Test-only [`AtRestSource`]: a view the test sets, and may change between
+/// operations the way a node's mode, gate and keys do.
+pub struct TestAtRestSource(Mutex<AtRestView>);
+
+impl TestAtRestSource {
+    pub fn new(
+        mode: AtRestMode,
+        encrypting: bool,
+        provider: Option<Arc<dyn DataKeyProvider>>,
+    ) -> Arc<Self> {
+        Arc::new(Self(Mutex::new(AtRestView {
+            mode,
+            encrypting,
+            provider,
+        })))
+    }
+
+    /// Switch the mode and gate; the keys stay.
+    pub fn set(&self, mode: AtRestMode, encrypting: bool) {
+        let mut view = self.0.lock().expect("not poisoned");
+        view.mode = mode;
+        view.encrypting = encrypting;
+    }
+
+    /// Swap the keys, e.g. for a locked provider.
+    pub fn set_provider(&self, provider: Option<Arc<dyn DataKeyProvider>>) {
+        self.0.lock().expect("not poisoned").provider = provider;
+    }
+}
+
+impl AtRestSource for TestAtRestSource {
+    fn view(&self) -> AtRestView {
+        self.0.lock().expect("not poisoned").clone()
+    }
+}
 
 /// Deterministic in-memory provider for tests. Not for production: every key
 /// is derived from a public seed.

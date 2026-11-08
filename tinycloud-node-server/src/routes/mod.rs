@@ -4291,6 +4291,7 @@ fn duckdb_error_to_status(err: &DuckDbError) -> Status {
         DuckDbError::ExportError(_) => Status::InternalServerError,
         DuckDbError::ImportError(_) => Status::InternalServerError,
         DuckDbError::Internal(_) => Status::InternalServerError,
+        DuckDbError::Unavailable => Status::ServiceUnavailable,
     }
 }
 

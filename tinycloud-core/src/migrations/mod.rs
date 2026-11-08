@@ -44,6 +44,7 @@ pub mod m20261117_000000_hook_subscription_headers;
 
 pub mod m20261117_000000_renewal_switch;
 pub mod m20261118_000000_at_rest_keys;
+pub mod m20261118_010000_artifact_payload_encoding;
 
 pub struct Migrator;
 
@@ -93,6 +94,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261117_000000_hook_subscription_headers::Migration),
             Box::new(m20261117_000000_renewal_switch::Migration),
             Box::new(m20261118_000000_at_rest_keys::Migration),
+            Box::new(m20261118_010000_artifact_payload_encoding::Migration),
         ]
     }
 }
