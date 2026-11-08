@@ -130,7 +130,7 @@ impl Roots {
     /// Refuses: `root_source = "env"` without a valid key; a malformed value
     /// (never ignored); a root key with `root_source = "escrow"`; a previous
     /// root equal to the current one.
-    pub fn resolve(
+    pub fn read(
         config: &AtRestConfig,
         node_root: &[u8],
         env: impl Fn(&str) -> Option<String>,
@@ -431,12 +431,12 @@ impl AtRestSource for AtRestRuntime {
 
 /// Phase two, after migrations ran: open the keyring and run the gate.
 /// `node_root` is the node's own root; the env roots come from the process
-/// environment ([`Roots::resolve`]).
+/// environment ([`Roots::read`]).
 ///
 /// Refuses (an error, so the node does not start):
 /// - `mode` other than `off` while storage has no seal path
 ///   ([`AtRestRuntime::declare_seal_path`]);
-/// - a missing, malformed or misplaced root key ([`Roots::resolve`]);
+/// - a missing, malformed or misplaced root key ([`Roots::read`]);
 /// - `root_source = "env"` together with any escrow setting;
 /// - in a TEE, escrow recipients or a pin that are not literal values in
 ///   the measured compose ([`check_measured_escrow`]), and for
@@ -457,7 +457,7 @@ pub async fn setup(
     tee: Option<&TeeContext>,
 ) -> Result<()> {
     let escrow = &config.escrow;
-    let roots = Roots::resolve(config, node_root, |name| {
+    let roots = Roots::read(config, node_root, |name| {
         std::env::var_os(name).map(|v| v.to_string_lossy().into_owned())
     })?;
     if !enabled(config) {
@@ -828,7 +828,7 @@ mod tests {
                     .map(|(_, v)| v.clone())
             }
         };
-        let roots = Roots::resolve(
+        let roots = Roots::read(
             &env_config(),
             &node_root,
             env(vec![(ROOT_KEY_ENV, key_b64(0))]),
@@ -838,7 +838,7 @@ mod tests {
             roots.root(&node_root),
             RootKey::parse(&key_b64(0)).unwrap().bytes()
         );
-        let roots = Roots::resolve(&AtRestConfig::default(), &node_root, env(vec![])).unwrap();
+        let roots = Roots::read(&AtRestConfig::default(), &node_root, env(vec![])).unwrap();
         assert_eq!(roots.root(&node_root), &node_root[..]);
 
         let refused = [
@@ -863,13 +863,13 @@ mod tests {
         for (config, pairs) in refused {
             let shown = format!("{pairs:?}");
             assert!(
-                Roots::resolve(&config, &node_root, env(pairs)).is_err(),
+                Roots::read(&config, &node_root, env(pairs)).is_err(),
                 "{shown}"
             );
         }
         // Moving from an env root to the node root: the env key becomes the
         // previous root.
-        let roots = Roots::resolve(
+        let roots = Roots::read(
             &AtRestConfig::default(),
             &node_root,
             env(vec![(PREVIOUS_ROOT_KEY_ENV, key_b64(0))]),
