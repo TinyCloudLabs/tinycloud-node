@@ -64,7 +64,7 @@ pub const PRODUCTION_OS_IMAGE_HASHES: &[&str] =
 /// both KV block storage and SQL artifacts ([`SealPath`]). `--validate-config`
 /// decides the seal-path refusal from this; startup checks that the seal
 /// paths storage actually declared agree with it.
-pub const STORAGE_SEALS_EVERY_WRITE: bool = false;
+pub const STORAGE_SEALS_EVERY_WRITE: bool = true;
 
 /// The root variables as read from the process environment, held only in
 /// zeroizing buffers. Debug is redacted.
