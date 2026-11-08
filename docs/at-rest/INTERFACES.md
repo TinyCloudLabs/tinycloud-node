@@ -2,8 +2,8 @@
 
 > **Status (TC-887):** the envelope, key types, `DataKeyProvider`, the keyring
 > (`at_rest::keyring`), the node wiring (`docs/at-rest-escrow.md`), the storage view
-> (`at_rest::{AtRestMode, AtRestView, AtRestSource}`) and sealed SQL artifacts (§8) are in.
-> Sealed KV storage (§7) follows; until both seal, the node refuses `encrypt` and `strict`.
+> (`at_rest::{AtRestMode, AtRestView, AtRestSource}`), sealed KV storage (§7) and sealed SQL
+> artifacts (§8) are in. Both declare their seal path, so `encrypt` and `strict` can be configured.
 
 Normative interface and format for `tinycloud_core::at_rest` and the node's sealed KV block
 storage. Plan: TC-887 (encryption at rest inside the TEE). Key continuity and escrow:
