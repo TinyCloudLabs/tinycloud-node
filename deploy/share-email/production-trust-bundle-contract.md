@@ -116,13 +116,17 @@ keeps only its `key`, discarding the signature chain; that is not evidence for
 the Ed25519 issuer key. The witness must first support publishing the issuer's
 Ed25519 public key and the complete chain that actually attests that key.
 
-For that publication, obtain from Phala the exact witness application ID from
-trusted registration (not the witness's own `/Info`), the `GetKey` algorithm
-and domain, the complete signed result, and the KMS root `k256Pubkey` from
-`DstackKms.kmsInfo()`. This is a secp256k1 public key, not SPKI. Authenticate
-that root independently against Phala's attestation or signed publication.
-Verify signatures using the dstack guest API's exact versioned specification
-(`https://github.com/Dstack-TEE/dstack/blob/next/docs/guest-api-v1.md`). For
+Obtain the witness's signed `GetKey` result and its request inputs from the
+witness publication: for v0, record `path`, `purpose` and `algorithm` (only
+`purpose` is included in the signed claim); for v1, record `algorithm` and
+`domain`. Obtain the exact witness application ID from Phala's trusted
+registration (not the witness's own `/Info`) and the KMS root `k256Pubkey`
+from `DstackKms.kmsInfo()`. This is a secp256k1 public key, not SPKI.
+Authenticate that root independently against Phala's attestation or signed
+publication. Verify signatures using the dstack guest API's exact versioned
+specification
+(`https://github.com/Dstack-TEE/dstack/blob/next/docs/guest-api-v0.md`,
+`https://github.com/Dstack-TEE/dstack/blob/next/docs/guest-api-v1.md`). For
 v1, verify the app-root signature over the length-prefixed fields
 `LP("dstack-guest-v1-key-claim") || LP(algorithm) || LP(domain) || LP(public_key)`;
 then verify the KMS signature over
@@ -174,16 +178,19 @@ Before an older image can be started, restore the previous single-key bundle
 and verify its configuration; treat credentials/policies issued with the new
 key as unavailable on that image until a compatible forward release is live.
 
-The node invitation key is derived from the production `TINYCLOUD_KEYS_SECRET`
-using `derive_key("tinycloud/share-email/invitation-signing")`; it is not the
-raw `GetKey("tinycloud/keys/primary")` public key. If the production primary
-secret changes, export the descriptor with the built
-`export-share-invitation-descriptor` binary in an authorized environment where
-`TINYCLOUD_KEYS_SECRET` is injected without being logged. The current binary
-hard-codes `nodeInvitationKid` to
-`<nodeAudience>#invitation-key-1` and `nodeKeyVersion` to `1`, so a version
-change also requires updating and reviewing that exporter. Copy its public
-descriptor fields into the trust bundle; never copy the secret. Recheck
-`nodeAudience`, `nodeEnabled`, and the enforcer DID binding in the separately
-signed authority material. The issuer-key overlap itself does not change the
-node invitation key or node key version.
+For the production dstack node, `TINYCLOUD_KEYS_TYPE=Dstack`; its primary key
+comes from dstack `GetKey`, and the invitation key is derived from that key
+with `derive_key("tinycloud/share-email/invitation-signing")`. It is not the
+raw primary public key. If the dstack application identity or primary-key path
+changes, read the resulting `nodeInvitationPublicKey` and `nodeKeyVersion` from
+`GET /.well-known/tinycloud/node-keys` on the authenticated, attested node.
+Update those public descriptor fields in the trust bundle and verify the
+node's startup configuration; startup refuses a descriptor/key mismatch.
+Never put a secret in the bundle. The
+`export-share-invitation-descriptor` binary reads
+`PROD_TINYCLOUD_KEYS_SECRET` and is for static-key deployments only; it
+hard-codes `<nodeAudience>#invitation-key-1` and version `1`, so changing
+those values for a static-key node requires updating and reviewing the
+exporter. Recheck `nodeAudience`, `nodeEnabled`, and the enforcer DID binding
+in the separately signed authority material. An issuer-key overlap alone does
+not change the invitation key or its version.
