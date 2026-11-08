@@ -89,6 +89,41 @@ pub enum BlobIdentity<'a> {
         checkpoint_content_hash: &'a str,
         delta_content_hash: &'a str,
     },
+    /// A SQL artifact row's manifest: what the row says it holds. Sealed over
+    /// an empty plaintext, so the blob is a key-bound tag over these fields
+    /// (`docs/at-rest/INTERFACES.md` §8).
+    SqlManifest {
+        service: &'a str,
+        space: &'a str,
+        name: &'a str,
+        revision: i64,
+        content_hash: &'a str,
+        size_bytes: i64,
+        checkpoint: SqlManifestPart<'a>,
+        delta: Option<SqlManifestPart<'a>>,
+    },
+}
+
+/// One stored part of a SQL artifact as its manifest records it.
+#[derive(Clone, Copy, Debug)]
+pub struct SqlManifestPart<'a> {
+    /// Of the plaintext.
+    pub content_hash: &'a str,
+    /// Of the plaintext.
+    pub size_bytes: i64,
+    /// The part's encoding column, `None` = legacy plaintext.
+    pub encoding: Option<i16>,
+}
+
+impl SqlManifestPart<'_> {
+    fn push(&self, out: &mut Vec<u8>) {
+        push_lp(out, self.content_hash.as_bytes());
+        push_lp(out, &self.size_bytes.to_be_bytes());
+        match self.encoding {
+            None => push_lp(out, &[]),
+            Some(encoding) => push_lp(out, &encoding.to_be_bytes()),
+        }
+    }
 }
 
 pub(crate) fn push_lp(out: &mut Vec<u8>, field: &[u8]) {
@@ -139,6 +174,32 @@ impl BlobIdentity<'_> {
                 push_lp(&mut c, &revision.to_be_bytes());
                 push_lp(&mut c, checkpoint_content_hash.as_bytes());
                 push_lp(&mut c, delta_content_hash.as_bytes());
+            }
+            Self::SqlManifest {
+                service,
+                space,
+                name,
+                revision,
+                content_hash,
+                size_bytes,
+                checkpoint,
+                delta,
+            } => {
+                push_lp(&mut c, b"sql-manifest");
+                push_lp(&mut c, service.as_bytes());
+                push_lp(&mut c, space.as_bytes());
+                push_lp(&mut c, name.as_bytes());
+                push_lp(&mut c, &revision.to_be_bytes());
+                push_lp(&mut c, content_hash.as_bytes());
+                push_lp(&mut c, &size_bytes.to_be_bytes());
+                checkpoint.push(&mut c);
+                match delta {
+                    None => push_lp(&mut c, &[0]),
+                    Some(delta) => {
+                        push_lp(&mut c, &[1]);
+                        delta.push(&mut c);
+                    }
+                }
             }
         }
         c

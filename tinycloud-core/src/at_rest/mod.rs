@@ -17,7 +17,7 @@ mod view;
 
 pub use envelope::{
     ciphertext_len, format_version, open, plaintext_len, seal, BlobIdentity, EnvelopeError, Header,
-    HEADER_LEN, SEGMENT_LEN, TAG_LEN,
+    SqlManifestPart, HEADER_LEN, SEGMENT_LEN, TAG_LEN,
 };
 pub use key::{DataKey, DekId, ObjectNameKey};
 pub use names::{sealed_object_name, space_tag, PayloadEncoding, SEALED_NAME_PREFIX};

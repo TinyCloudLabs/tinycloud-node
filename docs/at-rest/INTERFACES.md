@@ -109,7 +109,12 @@ pub enum BlobIdentity<'a> {                      // what the ciphertext is bound
                     checkpoint_content_hash: &'a str, checkpoint_size_bytes: u64 },
     SqlWal        { service: &'a str, space: &'a str, name: &'a str, revision: i64,
                     checkpoint_content_hash: &'a str, delta_content_hash: &'a str },
+    SqlManifest   { service: &'a str, space: &'a str, name: &'a str, revision: i64,
+                    content_hash: &'a str, size_bytes: i64,
+                    checkpoint: SqlManifestPart<'a>, delta: Option<SqlManifestPart<'a>> },
 }
+pub struct SqlManifestPart<'a> { pub content_hash: &'a str, pub size_bytes: i64,
+                                 pub encoding: Option<i16> }   // §8
 
 /// Parsed, validated 64-byte header (unknown version/alg/flags/padding refused).
 pub struct Header { /* raw bytes, dek_id, plaintext_len */ }
@@ -228,10 +233,13 @@ Header, 64 bytes, all integers big-endian:
 Context (identity) bytes, every variable field `u32 BE len ‖ bytes`:
 ```
 ctx = lp("tinycloud/at-rest/v1") ‖ lp(purpose) ‖ lp(field_1) ‖ … ‖ lp(field_n)
-purpose ∈ {"kv-block","sql-checkpoint","sql-wal"}
+purpose ∈ {"kv-block","sql-checkpoint","sql-wal","sql-manifest"}
 kv-block:       space, content_hash (multihash bytes)
 sql-checkpoint: service, space, name, checkpoint_content_hash, u64 BE checkpoint_size_bytes
 sql-wal:        service, space, name, i64 BE revision, checkpoint_content_hash, delta_content_hash
+sql-manifest:   service, space, name, i64 BE revision, content_hash, i64 BE size_bytes,
+                part(checkpoint), then [0x00] (no delta) or [0x01], part(delta)
+part(p):        p.content_hash, i64 BE p.size_bytes, p.encoding (empty = NULL, else i16 BE)
 ```
 Keys and nonces:
 ```
@@ -330,14 +338,22 @@ redacted.
   preupload transaction (TC-735) authorized it and checked its spaces are hosted, and before any
   upload, sequence or writer lock, or transaction: written spaces get their current data key
   (created if new), spaces a `kv/get` reads in the transaction get any data key the database lost
-  restored from its authenticated mirror (never created). A refused request therefore creates no
-  data key or mirror object; no separate pre-authorization is needed (the preupload transaction
-  already authorizes before any key work). Work under the writer lock (a `kv/get` in a writing
-  invocation, the upload of a protected legacy meeting path) runs in `at_rest::write_locked`,
-  where the provider only looks keys up and a key that would need creating or restoring is
-  `NotPrepared` (503), never a key-store write that would wait on the lock the request holds.
-  Read-only invocations and the KV GET routes hold no writer lock, so a key the database lost is
-  restored on first use there.
+  restored from its authenticated mirror (never created). A request refused by its authorization
+  or hosting checks therefore creates no data key or mirror object; no separate pre-authorization
+  is needed (the preupload transaction already authorizes before any key work). Work under the
+  writer lock (a `kv/get` in a writing invocation, the upload of a protected legacy meeting path)
+  runs in `at_rest::write_locked`, where the provider only looks keys up and a key that would
+  need creating or restoring is `NotPrepared` (503), never a key-store write that would wait on
+  the lock the request holds. Read-only invocations and the KV GET routes hold no writer lock, so
+  a key the database lost is restored on first use there.
+- **Accepted residual (late refusals prepare keys):** a refusal that comes after the spaces were
+  prepared, in the write's own transaction (a failed `If-Match`/`If-None-Match` precondition, 412,
+  or a replayed invocation, 409), can leave a new data key and its mirror object for a space it
+  wrote nothing to. It is the key that space's first write would create; nothing is sealed under it.
+- **Accepted residual (generation not in the AEAD identity):** a block's AAD binds its space and
+  content hash but not its `@N` generation (§5), so a sealed object of one generation opens in
+  place of another generation of the same block. Every generation holds the same plaintext (the
+  content hash), so only same-content replay is possible.
 - **Accepted residual (linkability during the transition):** in `encrypt`, a read of a
   legacy-only block asks for the sealed name first, then the legacy name (`strict` probes the legacy
   name to answer "legacy refused"). A storage provider's access logs can therefore link a
@@ -356,14 +372,25 @@ redacted.
   FS). The block boot scan skips it.
 
 ## 8. SQL artifacts
-Every durable SQL and DuckDB byte is a `database_artifact` row: `payload` (the checkpoint) and
-`delta_payload` (the WAL delta). `SeaOrmDatabaseArtifactRepository` seals and opens them; it
-reads a fresh `AtRestView` per operation (`with_at_rest`), and the node's repository declares
-`SealPath::SqlArtifacts`.
-- **Columns:** `payload_encoding` and `delta_encoding` (SMALLINT, `NULL` = legacy plaintext; §5),
-  migration `m20261107_010000_artifact_payload_encoding`. Each is written with its part: a full
+External authoritative payloads are sealed: the durable copy of each SQL and DuckDB database is a
+`database_artifact` row, `payload` (the checkpoint) and `delta_payload` (the WAL delta).
+`SeaOrmDatabaseArtifactRepository` seals and opens them; it reads a fresh `AtRestView` per
+operation (`with_at_rest`), and the node's repository declares `SealPath::SqlArtifacts`.
+- **Local working files are not sealed (known limitation, a later phase).** Local working files
+  (SQL and DuckDB working and cache files, upload staging, exports) rely on the CVM's encrypted
+  storage; operators without a TEE must protect the node's local paths, swap and file-level
+  backups themselves (for example, `node.sh`'s `data.tar.gz` is not encrypted). They are: KV
+  ingress staging (`TempFileSystemStage`, a `NamedTempFile` in the system temp directory,
+  `tinycloud-node-server/src/storage/file_system.rs`); the SQL and DuckDB working databases and
+  WAL files under `{datadir}/sql` and `{datadir}/duckdb`, and the hydration staging files a cold
+  read writes beside them (`CacheFileSink` in `database_artifacts.rs`, `sql/service.rs`,
+  `sql/database.rs`, `duckdb/database.rs`).
+- **Columns:** `payload_encoding` and `delta_encoding` (SMALLINT, `NULL` = legacy plaintext; §5)
+  and `manifest` (BLOB/BYTEA, `NULL` = no tag), migration
+  `m20261107_010000_artifact_payload_encoding`. Each encoding is written with its part: a full
   save sets `payload_encoding` and clears the delta with its `delta_encoding`; a delta save sets
-  `delta_encoding` only, so a legacy checkpoint can carry a sealed delta.
+  `delta_encoding` only, so a legacy checkpoint can carry a sealed delta. Every save rewrites
+  `manifest`.
 - **Plaintext metadata:** `size_bytes`, `checkpoint_size_bytes`, `delta_size_bytes` and the three
   content hashes stay those of the plaintext database file. They are part of the identity (§4),
   and quota (`SqlSizes`) and the SQL growth check read them unchanged. Accepted residual: as
@@ -373,24 +400,54 @@ reads a fresh `AtRestView` per operation (`with_at_rest`), and the node's reposi
   delta_content_hash }`, where `revision` is the row revision the delta was written at (always the
   row's current revision). A part moved to another row, space, name, revision or checkpoint is
   an integrity failure.
-- **Stored length and reads:** a TCE1 part stores `ciphertext_len(size)` bytes. The streamed read
-  slices the stored bytes (`substr`, 4 MiB) and opens them one 64 KiB segment at a time
-  (`SegmentOpener`); the content hashes are checked over the plaintext, and sinks receive
-  plaintext, so the cache sink still checks the SQLite/DuckDB file header. At most one segment is
-  buffered beyond what the sink keeps.
+- **Manifest (what the row holds, authenticated):** the part identities alone don't say which
+  parts a row must have. A checkpoint opens whatever the revision and whether or not a delta
+  belongs with it, so someone who can write the table could drop a sealed delta (clear the delta
+  columns, reset the unkeyed `content_hash` and `size_bytes`) and a cold read would serve the
+  checkpoint alone, silently losing committed rows. So every sealed save also stores a tag in
+  `manifest`: a TCE1 seal of an empty plaintext under the space's current data key with
+  `SqlManifest { service, space, name, revision, content_hash, size_bytes, checkpoint:
+  (checkpoint_content_hash, checkpoint_size_bytes, payload_encoding), delta: None | Some(
+  (delta_content_hash, delta_size_bytes, delta_encoding)) }` (§4). That is a keyed MAC over the
+  row's manifest, 80 bytes, naming its data key in its header like any sealed part, so it survives
+  key rotation. A full save writes it with `delta: None`, a delta save with the delta; both
+  rewrite it in the same `UPDATE` as the parts. Every read (`read_chunks`, and `open_row` for the
+  offline tool) checks it before any part reaches the sink: a dropped or added delta, a part or
+  metadata from another revision, a changed revision, or a changed encoding fails as integrity
+  (`AtRestIntegrity { part: "manifest" }`, 500), never a partial read. Unknown or invalid
+  encoding columns keep their own errors. Mode `off` writes no tag and clears it (its writes stay
+  plaintext and need no key), so a row without a tag is accepted only if it has no sealed part, or
+  if its only sealed part is a checkpoint under a delta mode `off` wrote; a row with any other
+  sealed part and no tag fails as integrity.
+  **Not protected:** a whole-row rollback, i.e. replacing the row with an older, valid,
+  self-consistent snapshot of itself (parts, metadata and tag all from the same earlier
+  revision), opens. So do rows with no tag: legacy parts are unauthenticated, as in §5, including
+  a delta written in mode `off` over a sealed checkpoint (`strict` refuses that legacy delta).
+- **Stored length and reads:** a TCE1 part stores exactly `ciphertext_len(size)` bytes. The
+  streamed read slices the stored bytes (`substr`, 4 MiB) and opens them one 64 KiB segment at a
+  time (`SegmentOpener`); the last slice of a sealed part asks for one byte past that length, so
+  bytes appended to the part, or a part cut short, fail as integrity. The content hashes are
+  checked over the plaintext, and sinks receive plaintext, so the cache sink still checks the
+  SQLite/DuckDB file header. At most one segment is buffered beyond what the sink keeps.
 - **Writes:** mode `off` stores plaintext exactly as before. Any other mode seals with
   `provider.current_key(space)` or fails (`AtRestUnavailable`), never plaintext. `current_key`
   runs before the SQLite writer lock, since it may create the space's key; sealing runs in
   `spawn_blocking`.
 - **Errors:** keys locked, missing or the encrypt gate closed → 503 (`SqlError::Unavailable`,
   `DuckDbError::Unavailable`). `UnknownKey`, a malformed header, a header length that disagrees
-  with the row, and any AEAD failure → 500 integrity; `Unsupported` (header or column `2..=9`) →
-  500 "upgrade the node"; a legacy part in `strict` → 500. A sealed part whose column says `NULL`
-  fails the plaintext hash; it is never served.
+  with the row, a stored length that disagrees with it, a manifest tag that doesn't match the row
+  (or is missing where one is required), and any AEAD failure → 500 integrity; `Unsupported`
+  (header or column `2..=9`) → 500 "upgrade the node"; a legacy part in `strict` → 500. A sealed
+  part whose column says `NULL` fails the manifest check; it is never served.
+- **Accepted residual (legacy injection in `encrypt`):** someone who can write the table can
+  replace a row with legacy plaintext parts and no tag (any content, with matching hashes), and
+  `encrypt` serves it, as it serves any legacy row. `strict` (after the backfill) refuses it.
 - **Offline tool:** `tinycloud-sql-identity offline-fingerprint` has no keys and refuses sealed
-  rows (`database_migration::offline_inventory` takes the provider).
+  rows (`database_migration::offline_inventory` takes the provider). `open_row` checks the
+  manifest tag first, like a streamed read.
 - **Rollback:** a build without this change ignores the columns. It cannot hydrate a sealed part
-  (the file-header check fails), and a full save it makes over a sealed row without reading it
-  (DuckDB `import_db`) leaves `payload_encoding = 1` on plaintext, which this build then refuses
-  as integrity. Roll back below this change only with no sealed rows; a row an older build
-  overwrote that way needs its `payload_encoding` set back to `NULL`.
+  (the file-header check fails), and a save it makes over a sealed row without reading it
+  (DuckDB `import_db`) leaves `payload_encoding = 1` on plaintext and a `manifest` tag for the
+  previous contents, which this build then refuses as integrity. Roll back below this change only
+  with no sealed rows; a row an older build overwrote that way needs its encoding columns and
+  `manifest` set back to `NULL`.

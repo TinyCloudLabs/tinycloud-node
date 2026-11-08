@@ -69,6 +69,7 @@ async fn cli_fence_dry_run_apply_set_verify_clear() {
         delta_size_bytes: Set(0),
         payload_encoding: NotSet,
         delta_encoding: NotSet,
+        manifest: NotSet,
     })
     .exec_without_returning(&conn)
     .await

@@ -144,6 +144,64 @@
    "ciphertext_len": 95,
    "ciphertext_sha256": "af0a95ae37ccd587377d67752de78e73c6828a33e16eb007ae5786d5005bc572",
    "ciphertext": "5443453101010000ffffffff000000000000000f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f100000000000000000000000db56826432a30e8d1a00143f51d2ae1665783c299e727a22eeb3d49167eb78"
+  },
+  {
+   "name": "sql-manifest-with-delta",
+   "dek": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+   "dek_id": 3,
+   "salt": "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+   "identity": {
+    "purpose": "sql-manifest",
+    "service": "sqlite",
+    "space": "tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:default",
+    "name": "notes",
+    "revision": 42,
+    "content_hash": "bafkreiexamplelogical",
+    "size_bytes": 200015,
+    "checkpoint": {
+     "content_hash": "bafkreiexamplecheckpoint",
+     "size_bytes": 200000,
+     "encoding": 1
+    },
+    "delta": {
+     "content_hash": "bafkreiexampledelta",
+     "size_bytes": 15,
+     "encoding": 1
+    }
+   },
+   "plaintext": {
+    "hex": ""
+   },
+   "ciphertext_len": 80,
+   "ciphertext_sha256": "d77adb435f71f7b87704741fb48f983cbe28b917f3804d306ed5de7f5d65b79d",
+   "ciphertext": "5443453101010000000000030000000000000000404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f1000000000000000000000002ae1a3d4c56ca5101f2eff282f84acde"
+  },
+  {
+   "name": "sql-manifest-no-delta",
+   "dek": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+   "dek_id": 3,
+   "salt": "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+   "identity": {
+    "purpose": "sql-manifest",
+    "service": "sqlite",
+    "space": "tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:default",
+    "name": "notes",
+    "revision": 41,
+    "content_hash": "bafkreiexamplecheckpoint",
+    "size_bytes": 200000,
+    "checkpoint": {
+     "content_hash": "bafkreiexamplecheckpoint",
+     "size_bytes": 200000,
+     "encoding": null
+    },
+    "delta": null
+   },
+   "plaintext": {
+    "hex": ""
+   },
+   "ciphertext_len": 80,
+   "ciphertext_sha256": "784d9c44867981b528e5d0756bebc51d60382f31ee17775e28d1e9fec6b05b50",
+   "ciphertext": "5443453101010000000000030000000000000000404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f100000000000000000000000bff95f7c1fe0275697e77f181a65b3d4"
   }
  ],
  "object_names": [

@@ -302,10 +302,12 @@ async fn offline_fingerprint<C: ConnectionTrait>(
         name.to_owned(),
     ))
     .select_only()
-    .columns(
-        Column::iter()
-            .filter(|column| !matches!(column, Column::PayloadEncoding | Column::DeltaEncoding)),
-    );
+    .columns(Column::iter().filter(|column| {
+        !matches!(
+            column,
+            Column::PayloadEncoding | Column::DeltaEncoding | Column::Manifest
+        )
+    }));
     for column in [Column::PayloadEncoding, Column::DeltaEncoding] {
         select = if encoded {
             select.column(column)
@@ -313,6 +315,14 @@ async fn offline_fingerprint<C: ConnectionTrait>(
             select.expr_as(Expr::value(Option::<i16>::None), column.as_str())
         };
     }
+    select = if encoded {
+        select.column(Column::Manifest)
+    } else {
+        select.expr_as(
+            Expr::value(Option::<Vec<u8>>::None),
+            Column::Manifest.as_str(),
+        )
+    };
     let row = select
         .into_model::<database_artifact::Model>()
         .one(conn)
@@ -1512,6 +1522,7 @@ mod tests {
             delta_size_bytes: Set(0),
             payload_encoding: Set(None),
             delta_encoding: Set(None),
+            manifest: Set(None),
         };
         let legacy = |space: &str, name: &str| database_legacy_artifact::ActiveModel {
             service: Set("sql".into()),
@@ -1733,6 +1744,7 @@ mod tests {
                     delta_size_bytes: Set(0),
                     payload_encoding: Set(None),
                     delta_encoding: Set(None),
+                    manifest: Set(None),
                 }
             }))
             .exec(conn)
@@ -1995,6 +2007,7 @@ mod tests {
             delta_size_bytes: Set(0),
             payload_encoding: Set(None),
             delta_encoding: Set(None),
+            manifest: Set(None),
         }
         .insert(&conn)
         .await
@@ -2129,6 +2142,7 @@ mod tests {
             delta_size_bytes: Set(0),
             payload_encoding: Set(None),
             delta_encoding: Set(None),
+            manifest: Set(None),
         }
     }
 

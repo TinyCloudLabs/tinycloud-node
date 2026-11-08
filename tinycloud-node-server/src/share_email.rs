@@ -2933,6 +2933,7 @@ mod tests {
             delta_size_bytes: Set(0),
             payload_encoding: Set(None),
             delta_encoding: Set(None),
+            manifest: Set(None),
         }
         .insert(&conn)
         .await
