@@ -12,7 +12,7 @@ use serde_with::{
     serde_as, FromInto,
 };
 use std::{fs, path::PathBuf, time::Duration};
-use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+use time::OffsetDateTime;
 use tinycloud_core::db_pool::{StatementTimeoutMode, StatementTimeouts};
 use tinycloud_core::keys::StaticSecret;
 use tinycloud_core::sql::DdlPolicy;
@@ -428,12 +428,12 @@ impl ShareEmailConfig {
         let legacy_not_after = match (self.issuer_not_after.as_deref(), same_did.as_slice()) {
             (None, []) => None,
             (Some(end), [next]) => {
-                let end_time = parse_config_utc(end)
+                let end_time = crate::issuer_set::parse_utc(end)
                     .ok_or_else(|| anyhow::anyhow!("issuer overlap end must be UTC RFC 3339"))?;
                 if end_time <= OffsetDateTime::now_utc() {
                     anyhow::bail!("issuer overlap end time has already passed");
                 }
-                let next_start = parse_config_utc(&next.not_before)
+                let next_start = crate::issuer_set::parse_utc(&next.not_before)
                     .ok_or_else(|| anyhow::anyhow!("next issuer notBefore must be UTC RFC 3339"))?;
                 if next_start > end_time
                     || next.retired_at.is_some()
@@ -695,14 +695,6 @@ impl ShareEmailConfig {
     }
 }
 
-fn parse_config_utc(text: &str) -> Option<OffsetDateTime> {
-    if !text.ends_with('Z') {
-        return None;
-    }
-    let parsed = OffsetDateTime::parse(text, &Rfc3339).ok()?;
-    parsed.offset().is_utc().then_some(parsed)
-}
-
 #[derive(Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
 #[serde(rename_all = "camelCase")]
@@ -743,8 +735,8 @@ impl ShareEmailTrustBundle {
         let overlap_valid = match (self.issuer_not_after.as_deref(), self.next_issuer.as_ref()) {
             (None, None) => true,
             (Some(end), Some(next)) => {
-                let end_time = parse_config_utc(end);
-                let next_start = parse_config_utc(&next.not_before);
+                let end_time = crate::issuer_set::parse_utc(end);
+                let next_start = crate::issuer_set::parse_utc(&next.not_before);
                 end_time.is_some_and(|end| end > OffsetDateTime::now_utc())
                     && next_start
                         .zip(end_time)
@@ -2740,7 +2732,7 @@ mod tests {
             .to_bytes();
         let next_key = base64::encode_config(next_key, URL_SAFE_NO_PAD);
         let mut overlap = old_config;
-        let bundle = overlap_bundle(&overlap, "2030-01-01T00:00:00Z", &next_key);
+        let bundle = overlap_bundle(&overlap, "2100-01-01T00:00:00Z", &next_key);
         let file = NamedTempFile::new().expect("temporary trust bundle");
         fs::write(file.path(), serde_json::to_vec(&bundle).unwrap()).expect("trust bundle write");
         overlap.trust_bundle_path = Some(file.path().display().to_string());
@@ -2764,7 +2756,7 @@ mod tests {
             .expect("next issuer");
         assert!(old.not_after.is_some());
         assert!(next.not_after.is_none());
-        let end = parse_config_utc("2030-01-01T00:00:00Z").unwrap();
+        let end = crate::issuer_set::parse_utc("2100-01-01T00:00:00Z").unwrap();
         assert_eq!(
             old.check_now(end),
             Err(crate::issuer_set::IssuerWindowError::Stopped)
@@ -2811,15 +2803,15 @@ mod tests {
         wrong_did["issuerDid"] = serde_json::json!("did:web:other.example");
         wrong_did["kid"] = serde_json::json!("did:web:other.example#email-signing-key-2");
         let mut after_end = next_entry();
-        after_end["notBefore"] = serde_json::json!("2031-01-01T00:00:00Z");
+        after_end["notBefore"] = serde_json::json!("2101-01-01T00:00:00Z");
         let mut malformed = next_entry();
         malformed["publicKey"] = serde_json::json!("AQID");
         let mut next_expiry = next_entry();
-        next_expiry["notAfter"] = serde_json::json!("2031-01-01T00:00:00Z");
+        next_expiry["notAfter"] = serde_json::json!("2101-01-01T00:00:00Z");
 
         let cases = [
             ("overlap without end", None, Some(next_entry())),
-            ("end without next key", Some("2030-01-01T00:00:00Z"), None),
+            ("end without next key", Some("2100-01-01T00:00:00Z"), None),
             (
                 "expired overlap",
                 Some("2000-01-01T00:00:00Z"),
@@ -2828,32 +2820,32 @@ mod tests {
             ("malformed end", Some("not-a-time"), Some(next_entry())),
             (
                 "duplicate public key",
-                Some("2030-01-01T00:00:00Z"),
+                Some("2100-01-01T00:00:00Z"),
                 Some(duplicate_key),
             ),
             (
                 "duplicate kid",
-                Some("2030-01-01T00:00:00Z"),
+                Some("2100-01-01T00:00:00Z"),
                 Some(duplicate_kid),
             ),
             (
                 "different DID",
-                Some("2030-01-01T00:00:00Z"),
+                Some("2100-01-01T00:00:00Z"),
                 Some(wrong_did),
             ),
             (
                 "empty overlap window",
-                Some("2030-01-01T00:00:00Z"),
+                Some("2100-01-01T00:00:00Z"),
                 Some(after_end),
             ),
             (
                 "next key has another end",
-                Some("2030-01-01T00:00:00Z"),
+                Some("2100-01-01T00:00:00Z"),
                 Some(next_expiry),
             ),
             (
                 "malformed key",
-                Some("2030-01-01T00:00:00Z"),
+                Some("2100-01-01T00:00:00Z"),
                 Some(malformed),
             ),
         ];

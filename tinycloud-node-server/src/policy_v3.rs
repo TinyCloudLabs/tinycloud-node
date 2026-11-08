@@ -7691,8 +7691,8 @@ mod tests {
             old_key.public().to_bytes(),
         );
         let mut next_config = issuer_config(issuer_did, "email-signing-key-2", &next_key);
-        next_config.not_before = "2029-12-31T23:00:00Z".into();
-        let end = "2030-01-01T00:05:00Z";
+        next_config.not_before = "2099-12-31T23:00:00Z".into();
+        let end = "2100-01-01T00:05:00Z";
         let old_only = IssuerSet::from_legacy(&old_issuer);
         let new_only = IssuerSet::load(std::slice::from_ref(&next_config)).unwrap();
         let overlap = IssuerSet::load_with_legacy_not_after(
@@ -7702,8 +7702,8 @@ mod tests {
         )
         .unwrap();
 
-        let issued = parse_time("2030-01-01T00:01:00Z").unwrap();
-        let before_end = parse_time("2030-01-01T00:04:59Z").unwrap();
+        let issued = parse_time("2100-01-01T00:01:00Z").unwrap();
+        let before_end = parse_time("2100-01-01T00:04:59Z").unwrap();
         let at_end = parse_time(end).unwrap();
         let old_fixture = {
             let mut fixture = SetFixture::new(issuer_did, Some(&old_kid), DOMAIN_PROFILE);

@@ -348,7 +348,7 @@ fn parse_entry(
 
 /// RFC 3339, UTC, written with a literal `Z`. Offsets such as `+00:00` and a
 /// lowercase `z` are refused so one instant has one spelling.
-fn parse_utc(text: &str) -> Option<OffsetDateTime> {
+pub(crate) fn parse_utc(text: &str) -> Option<OffsetDateTime> {
     if !text.ends_with('Z') {
         return None;
     }
