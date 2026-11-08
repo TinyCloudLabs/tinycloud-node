@@ -728,6 +728,13 @@ impl AuthGraphSnapshot {
         ordered
     }
 
+    /// Whether a direct parent of `start` is revoked.
+    pub(crate) fn has_revoked_parent(&self, start: &Hash) -> bool {
+        self.parents
+            .get(start)
+            .is_some_and(|parents| parents.iter().any(|parent| self.revoked.contains(parent)))
+    }
+
     /// First revoked strict ancestor of `start`, as a CID string.
     pub(crate) fn first_revoked_ancestor(&self, start: &Hash) -> Option<String> {
         self.chain_ids_from(start)

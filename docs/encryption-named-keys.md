@@ -173,6 +173,8 @@ the node logs the event `deletion_ledger_open_failed` or
 `deletion_ledger_replay_failed` with an `error_kind`, and the rest of the node
 serves.
 
+**When restoring the node DB from a PlanetScale backup, keep the node's existing disk (and its ledger) in place and boot normally, so the ledger replay re-shreds keys deleted after the backup. Never restore the DB onto a fresh disk without the ledger unless you accept that later deletions are undone.**
+
 Before restoring a database, stop the node and disable its automatic restart.
 After the restore, before the node starts, run
 `tinycloud node deletion-ledger replay [--config <file>] [--ledger <file>]`. It

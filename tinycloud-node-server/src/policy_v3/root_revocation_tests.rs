@@ -58,7 +58,8 @@ async fn assert_root_revoked_cascade(h: &Harness, admitted: &Admitted) -> anyhow
     // check, so a revoked root surfaces as the core ancestor revocation.
     let (status, body) = h.decrypt(&admitted.session).await?;
     assert_eq!(status, Status::Unauthorized, "{body}");
-    assert!(body.starts_with("delegation-ancestor-revoked"), "{body}");
+    // The session's direct parent is the revoked root.
+    assert_eq!(revocation_code(&body), "parent_revoked", "{body}");
     assert_eq!(
         h.read_as(&admitted.reader, admitted.child).await?,
         (Status::Forbidden, ROOT_REVOKED.to_owned())
@@ -110,12 +111,28 @@ async fn the_space_owner_wallet_revokes_an_agent_signed_root(
         return Ok(());
     };
     let admitted = admitted(&h).await?;
-    assert_no_hook_ticket(&h, &admitted, "Unauthorized Action").await?;
+    assert_no_hook_ticket(&h, &admitted, Refusal::NotRevocation).await?;
     h.revoke(&h.space_owner, &admitted.policy.policy_root_cid)
         .await?;
     assert_root_revoked_cascade(&h, &admitted).await?;
     // Now the chain check refuses it first.
-    assert_no_hook_ticket(&h, &admitted, "delegation-ancestor-revoked").await
+    assert_no_hook_ticket(&h, &admitted, Refusal::Revoked("parent_revoked")).await
+}
+
+/// Why a hook ticket is refused with a 401.
+enum Refusal {
+    /// Not a revocation: the body carries no revocation `code`.
+    NotRevocation,
+    /// A revocation: the JSON body carries this `code`.
+    Revoked(&'static str),
+}
+
+/// The `code` of a revocation refusal body, empty if it has none.
+fn revocation_code(body: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|body| body["code"].as_str().map(str::to_owned))
+        .unwrap_or_default()
 }
 
 /// Policy sessions hold only kv and decrypt, so a hook ticket over one is
@@ -124,13 +141,16 @@ async fn the_space_owner_wallet_revokes_an_agent_signed_root(
 async fn assert_no_hook_ticket(
     h: &Harness,
     admitted: &Admitted,
-    refusal: &str,
+    refusal: Refusal,
 ) -> anyhow::Result<()> {
     let (status, body) = h
         .hook_ticket(&[session_cid(&admitted.session)?.to_string()])
         .await?;
     assert_eq!(status, Status::Unauthorized, "{body}");
-    assert!(body.starts_with(refusal), "{body}");
+    match refusal {
+        Refusal::NotRevocation => assert_eq!(revocation_code(&body), "", "{body}"),
+        Refusal::Revoked(code) => assert_eq!(revocation_code(&body), code, "{body}"),
+    }
     Ok(())
 }
 on_both_backends!(the_space_owner_wallet_revokes_an_agent_signed_root);
@@ -334,3 +354,54 @@ async fn the_json_route_keeps_its_signer_and_enforcer_rules(
     Ok(())
 }
 on_both_backends!(the_json_route_keeps_its_signer_and_enforcer_rules);
+
+/// TC-2381: a root revoked over the JSON `RootRevocation/v1` route lives only
+/// in `policy_v3_root.revoked_at`. `/delegation/status` reports it revoked
+/// (not active) for the root and for a session issued under it, and still
+/// shows nothing to a caller who may not see the grant.
+async fn a_json_revoked_root_reports_revoked_status(backend: Backend) -> anyhow::Result<()> {
+    let Some(h) = Harness::new(
+        backend,
+        Shape::PkhSession,
+        "a_json_revoked_root_reports_revoked_status",
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let admitted = admitted(&h).await?;
+    let root = admitted.policy.policy_root_cid.clone();
+    let session = session_cid(&admitted.session)?.to_string();
+
+    // The root's signer sees the root; the holder sees its own session.
+    let views = [(&h.owner, &root), (&h.holder, &session)];
+    for (viewer, cid) in views {
+        let status = h.delegation_status(viewer, cid).await?;
+        assert_eq!(status["status"], json!("active"), "before revoke: {status}");
+        assert_eq!(status["active"], json!(true), "{status}");
+        assert_eq!(status["revoked"], json!(false), "{status}");
+    }
+
+    let (status, body) = h
+        .revoke_root_json(&h.owner, &root, POLICY_AUTHORITY)
+        .await?;
+    assert_eq!(status, Status::Ok, "{body}");
+    // The revocation is in the policy projection only.
+    assert_eq!(h.root_status(&root).await["state"], json!("revoked"));
+
+    for (viewer, cid) in views {
+        let status = h.delegation_status(viewer, cid).await?;
+        assert_eq!(status["status"], json!("revoked"), "{cid}: {status}");
+        assert_eq!(status["revoked"], json!(true), "{status}");
+        assert_eq!(status["active"], json!(false), "{status}");
+        assert_eq!(status["exists"], json!(true), "{status}");
+    }
+
+    // A caller who may not see the grant learns nothing about its state.
+    let stranger = Signer::key();
+    let status = h.delegation_status(&stranger, &root).await?;
+    assert_eq!(status["status"], json!("not_found"), "{status}");
+    assert_eq!(status["revoked"], json!(false), "{status}");
+    Ok(())
+}
+on_both_backends!(a_json_revoked_root_reports_revoked_status);

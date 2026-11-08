@@ -14,7 +14,7 @@ pub use tinycloud_auth::{
     resource::{Path, SpaceId},
 };
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SerializedEvent<T>(pub T, pub(crate) Vec<u8>);
 
 #[non_exhaustive]

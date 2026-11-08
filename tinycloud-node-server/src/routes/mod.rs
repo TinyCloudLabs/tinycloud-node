@@ -47,19 +47,21 @@ use tinycloud_core::duckdb::{
 use tinycloud_core::{
     admission::AdmissionError,
     database_migration,
-    db_pool::{classify_failure, track_writes, TransientFailure},
+    db_pool::{classify_failure, track_writes, track_writes_retrying, TransientFailure},
     encryption_network::EncryptionService,
     events::Invocation,
     failure_diagnostic::{
         failure_kind, FailureCode, FailureNote, Service, KIND_READ_AUDIT_BUSY, KIND_REQUEST_TIMEOUT,
     },
+    keys::Secrets,
     models::{
         hook_delivery, hook_subscription, invocation as invocation_model, kv_delete, kv_write,
+        revocation::RevocationCode,
     },
     request_cancel,
     sea_orm::{ColumnTrait, DbErr, EntityTrait, QueryFilter, QueryOrder},
     sql::{CaveatArm, SqlAuthority, SqlCaveats, SqlError, SqlRequest, SqlService},
-    storage::{HashBuffer, ImmutableReadStore, ImmutableStaging},
+    storage::{HashBuffer, ImmutableReadStore, ImmutableStaging, StorageSetup},
     types::{Ability, DelegationQuery, DelegationQueryPage, Metadata, Resource},
     util::{Capability, DelegationInfo, InvocationInfo, RevocationInfo},
     write_hooks::{
@@ -181,7 +183,13 @@ fn read_audit_failure(
 ///   so it may have been applied.
 ///   The client must read the state back before deciding to retry;
 ///   re-sending the identical signed request is answered 409 (replay
-///   protection), except a delegation, which is idempotent.
+///   protection) if the write committed, except a delegation, which is
+///   idempotent. A KV put or delete spends its replay row in its own
+///   transaction (TC-2375): if that rolled back, the identical request
+///   applies when re-sent, so read the state back first. A KV write
+///   refused by its precondition commits only the replay row, and its
+///   request is answered 409 from then on. Other services spend the row
+///   before their write.
 /// - `500` with the error otherwise.
 ///
 /// `write_may_have_applied` comes from [`track_writes`] around the operation.
@@ -190,7 +198,7 @@ fn read_audit_failure(
 /// line per failed request (TC-1796): the `service` it served, the failure
 /// kind of `error`, and the code of the answer. The database in use is not
 /// known here, so the record has no database reference.
-fn database_failure(
+pub(crate) fn database_failure(
     service: Service,
     error: &DbErr,
     write_may_have_applied: bool,
@@ -221,12 +229,45 @@ fn database_failure(
     (status, body)
 }
 
-/// `/invoke` failure: plain text for everything except storage rejections,
-/// which carry the structured TC-619 JSON body.
+/// The database error inside a [`TxError`], for [`track_writes_retrying`].
+fn tx_database_error<S: StorageSetup, K: Secrets>(error: &TxError<S, K>) -> Option<&DbErr> {
+    match error {
+        TxError::Db(error) | TxError::EpochInsert(error) => Some(error),
+        _ => None,
+    }
+}
+
+/// The response to a failed `/delegate`.
+fn delegation_failure<S: StorageSetup, K: Secrets>(
+    error: &TxError<S, K>,
+    write_may_have_applied: bool,
+) -> (Status, String)
+where
+    S::Error: std::fmt::Display,
+    K::Error: std::fmt::Display,
+{
+    match error {
+        TxError::Db(db) | TxError::EpochInsert(db) => database_failure(
+            Service::Other,
+            db,
+            write_may_have_applied,
+            error.to_string(),
+        ),
+        TxError::SpaceNotFound => (Status::NotFound, error.to_string()),
+        _ => (Status::Unauthorized, error.to_string()),
+    }
+}
+
+/// `/invoke` and `/delegate` failure: plain text for everything except
+/// storage rejections, which carry the structured TC-619 JSON body, and
+/// revocation refusals, which carry a stable `code` (TC-2381).
 #[derive(Debug)]
 pub enum InvokeError {
     Text(Status, String),
     Storage(StorageRejection),
+    /// A `401` whose JSON body is `{"code": <code>, "error": <message>}`; the
+    /// message is the unchanged human text of the refusal.
+    Revoked(RevocationCode, String),
 }
 
 impl From<(Status, String)> for InvokeError {
@@ -252,6 +293,11 @@ impl<'r> rocket::response::Responder<'r, 'static> for InvokeError {
         match self {
             Self::Text(status, message) => (status, message).respond_to(request),
             Self::Storage(rejection) => rejection.respond_to(request),
+            Self::Revoked(code, message) => (
+                Status::Unauthorized,
+                Json(serde_json::json!({ "code": code.as_str(), "error": message })),
+            )
+                .respond_to(request),
         }
     }
 }
@@ -435,7 +481,7 @@ pub async fn create_signed_kv_url(
     runtime: &State<SignedUrlRuntime>,
     tinycloud: &State<TinyCloud>,
     policy_v3: &State<crate::policy_v3::PolicyV3Runtime>,
-) -> Result<Json<SignedKvUrlResponse>, (Status, String)> {
+) -> Result<Json<SignedKvUrlResponse>, InvokeError> {
     let invocation_info = invocation.0 .0.clone();
     verify_auth("server.signed_kv.auth", invocation.0, tinycloud).await?;
     // Same policy gate as `/invoke`. A policy-session invocation lives at most
@@ -444,7 +490,7 @@ pub async fn create_signed_kv_url(
     policy_v3
         .authorize_invocation(tinycloud, &invocation_info, None, OffsetDateTime::now_utc())
         .await
-        .map_err(|error| (Status::Forbidden, error.to_string()))?;
+        .map_err(crate::policy_v3::authorization_failure)?;
     let mint_start = Instant::now();
     let mint_result = mint_signed_kv_url(
         &invocation_info,
@@ -669,6 +715,16 @@ pub async fn delegation_query(
                     tinycloud_core::types::DelegationQueryValidationError::InvalidCursor
                 ),
             ),
+            tinycloud_core::db::AccountDelegationQueryError::Db(error)
+                if tinycloud_core::db_pool::is_transient_error(&error) =>
+            {
+                database_failure(
+                    Service::Other,
+                    &error,
+                    false,
+                    "Delegation query unavailable".to_string(),
+                )
+            }
             tinycloud_core::db::AccountDelegationQueryError::Db(_) => (
                 Status::ServiceUnavailable,
                 "Delegation query unavailable".to_string(),
@@ -682,27 +738,34 @@ pub async fn delegate(
     req_span: TracingSpan,
     tinycloud: &State<TinyCloud>,
     policy_v3: &State<crate::policy_v3::PolicyV3Runtime>,
-) -> Result<Json<DelegateResponse>, (Status, String)> {
+) -> Result<Json<DelegateResponse>, InvokeError> {
     let action_label = "delegation";
     let span = info_span!(parent: &req_span.0, "delegate", action = %action_label);
     // Instrumenting async block to handle yielding properly
     async move {
-        if let Err(reason) = policy_v3.ordinary_admission_allowed(tinycloud, &d.0).await {
-            return Err((Status::Forbidden, reason.to_string()));
-        }
+        policy_v3
+            .ordinary_admission_allowed(tinycloud, &d.0)
+            .await
+            .map_err(crate::policy_v3::authorization_failure)?;
         let timer = crate::prometheus::enabled().then(|| {
             crate::prometheus::AUTHORIZED_INVOKE_HISTOGRAM
                 .with_label_values(&["delegate"])
                 .start_timer()
         });
-        let (res, write_may_have_applied) = track_writes(tinycloud.delegate(d.0)).await;
+        // One retry of the whole operation after a connection lost before
+        // any write (TC-2346); see `track_writes_retrying`.
+        let delegation = d.0;
+        let (res, write_may_have_applied) = track_writes_retrying(
+            "delegate",
+            tinycloud.connection().retry_window(),
+            || tinycloud.delegate(delegation.clone()),
+            tx_database_error,
+        )
+        .await;
         let res = res
-            .map_err(|e| match &e {
-                TxError::Db(error) | TxError::EpochInsert(error) => {
-                    database_failure(Service::Other, error, write_may_have_applied, e.to_string())
-                }
-                TxError::SpaceNotFound => (Status::NotFound, e.to_string()),
-                _ => (Status::Unauthorized, e.to_string()),
+            .map_err(|e| match e.revocation_code() {
+                Some(code) => InvokeError::Revoked(code, e.to_string()),
+                None => delegation_failure(&e, write_may_have_applied).into(),
             })
             .and_then(|result: TransactResult| {
                 let TransactResult {
@@ -728,7 +791,10 @@ pub async fn delegate(
                     })
                     .map(|h| h.to_cid(0x55).to_string())
                     .ok_or_else(|| {
-                        (Status::Unauthorized, "Delegation not committed".to_string())
+                        InvokeError::from((
+                            Status::Unauthorized,
+                            "Delegation not committed".to_string(),
+                        ))
                     })?;
 
                 Ok(Json(DelegateResponse {
@@ -1338,6 +1404,7 @@ fn kv_invoke_options_for_capabilities_with_cursor(
         list_limit,
         list_cursor,
         kv_sync: None,
+        replay: None,
     })
 }
 
@@ -1859,11 +1926,16 @@ async fn invoke_impl(
             let policy_session_invocation = policy_v3
                 .authorize_invocation(tinycloud, &admitted.invocation().0, Some(&body), now)
                 .await
-                .map_err(|error| (Status::Forbidden, error.to_string()))?;
+                .map_err(crate::policy_v3::authorization_failure)?;
             tinycloud
                 .authorize_invocation(&admitted.invocation().0, now)
                 .await
-                .map_err(|error| (Status::Forbidden, error.to_string()))?;
+                .map_err(|error| match error {
+                    invocation_model::Error::Db(db) => database_failure(
+                        Service::Other, &db, false, db.to_string(),
+                    ),
+                    _ => (Status::Forbidden, error.to_string()),
+                })?;
             encryption
                 .validate_authorized_decrypt_request(&target, &admitted.invocation().0, &body)
                 .await
@@ -1902,7 +1974,7 @@ async fn invoke_impl(
         let policy_session_invocation = policy_v3
             .authorize_invocation(tinycloud, &admitted.invocation().0, None, now)
             .await
-            .map_err(|error| (Status::Forbidden, error.to_string()))?;
+            .map_err(crate::policy_v3::authorization_failure)?;
 
         // Owner usage read (TC-626): an invocation made only of
         // `tinycloud.space/info` returns the space's storage usage, the
@@ -2076,7 +2148,7 @@ async fn invoke_impl(
 
         let put_caps = kv_put_capabilities(&admitted.invocation().0);
         let is_multipart_request = is_multipart(&headers);
-        let kv_options = kv_invoke_options(
+        let mut kv_options = kv_invoke_options(
             &admitted.invocation().0,
             &mut headers,
             is_multipart_request,
@@ -2094,6 +2166,22 @@ async fn invoke_impl(
                 .map(|(_, path)| path.clone())
                 .collect::<Vec<_>>()
         });
+
+        // Authorization runs before any quota or hosting lookup, so the
+        // response does not depend on the target's state or quota. A failure
+        // takes the node's existing authorization-failure response.
+        if !put_caps.is_empty() {
+            tinycloud
+                .authorize_admitted(&admitted, OffsetDateTime::now_utc())
+                .await
+                .map_err(|error| {
+                    authorization_refusal(
+                        "server.signed_kv.auth",
+                        &TxStoreError::Tx(error.into()),
+                        false,
+                    )
+                })?;
+        }
 
         let stage_inputs_start = Instant::now();
         let inputs_result: Result<KvInputMap, InvokeError> = async {
@@ -2180,10 +2268,26 @@ async fn invoke_impl(
             tinycloud
                 .authorize_admitted(&admitted, OffsetDateTime::now_utc())
                 .await
-                .map_err(|error| (Status::Forbidden, error.to_string()))?;
+                .map_err(|error| match error {
+                    invocation_model::Error::Db(db) => database_failure(
+                        Service::Kv, &db, false, db.to_string(),
+                    ),
+                    _ => (Status::Forbidden, error.to_string()),
+                })?;
         }
         let inputs = inputs_result?;
-        if policy_session_invocation {
+        // TC-2375: a KV write spends its replay row in its own transaction,
+        // so a write that rolls back leaves the signed request retryable. A
+        // read has no such transaction and spends the row up front.
+        let write_spends_replay = !tinycloud_core::kv_mutation_keys(admitted.invocation()).is_empty();
+        if write_spends_replay {
+            let reservation = if policy_session_invocation {
+                InvocationReplayCache::invoker_nonce_reservation(admitted.invocation(), 60)?
+            } else {
+                InvocationReplayCache::reservation(&admitted, config.invocation.max_lifetime_secs)
+            };
+            kv_options.replay = Some(reservation);
+        } else if policy_session_invocation {
             invocation_replay_cache
                 .check_and_insert_invoker_nonce(admitted.invocation(), 60)
                 .await?;
@@ -2222,6 +2326,9 @@ async fn invoke_impl(
         );
         let res = match invoke_result {
             Ok((tx_result, mut outcomes)) => {
+                if write_spends_replay {
+                    crate::prometheus::observe_replay_insert(true);
+                }
                 // Server-side successful-validation site: the invocation passed
                 // its time window (and everything else), so record how much
                 // validity remained.
@@ -2364,6 +2471,10 @@ async fn invoke_impl(
                         ),
                     );
                 }
+                if let TxStoreError::InvocationReplayed = &e {
+                    crate::prometheus::observe_replay_insert(false);
+                    return Err(crate::invocation_replay::InvocationReplayError::Duplicate.into());
+                }
                 if let TxStoreError::KvSyncResetRequired(reason) = &e {
                     return Err(kv_sync::kv_sync_reset_required(*reason).into());
                 }
@@ -2391,6 +2502,9 @@ async fn invoke_impl(
                         database_failure(Service::Kv, error, write_may_have_applied, e.to_string())
                             .into()
                     );
+                }
+                if let Some(code) = e.revocation_code() {
+                    return Err(InvokeError::Revoked(code, e.to_string()));
                 }
                 Err((
                     match &e {
@@ -4242,22 +4356,28 @@ async fn verify_auth(
     span: &'static str,
     invocation: Invocation,
     tinycloud: &State<TinyCloud>,
-) -> Result<TransactResult, (Status, String)> {
+) -> Result<TransactResult, InvokeError> {
     let start = Instant::now();
     let result = tinycloud
         .invoke::<BlockStage>(invocation, HashMap::new())
         .await
         // Authorization records only the invocation; the operation it
         // authorizes has not run, so a database failure here is retryable.
-        .map_err(|e| match &e {
-            TxStoreError::Tx(TxError::Db(error) | TxError::EpochInsert(error)) => {
-                database_failure(auth_service(span), error, false, e.to_string())
+        .map_err(|e| {
+            if let Some(code) = e.revocation_code() {
+                return InvokeError::Revoked(code, e.to_string());
             }
-            TxStoreError::Tx(TxError::ReadAudit(error)) => {
-                read_audit_failure(auth_service(span), error)
+            match &e {
+                TxStoreError::Tx(TxError::Db(error) | TxError::EpochInsert(error)) => {
+                    database_failure(auth_service(span), error, false, e.to_string())
+                }
+                TxStoreError::Tx(TxError::ReadAudit(error)) => {
+                    read_audit_failure(auth_service(span), error)
+                }
+                TxStoreError::Tx(TxError::SpaceNotFound) => (Status::NotFound, e.to_string()),
+                _ => (Status::Unauthorized, e.to_string()),
             }
-            TxStoreError::Tx(TxError::SpaceNotFound) => (Status::NotFound, e.to_string()),
-            _ => (Status::Unauthorized, e.to_string()),
+            .into()
         })
         .map(|(tx_result, _)| tx_result);
     crate::prometheus::observe_span(
@@ -4276,23 +4396,20 @@ async fn verify_auth_admitted(
     span: &'static str,
     invocation: AdmittedInvocation,
     tinycloud: &State<TinyCloud>,
-) -> Result<TransactResult, (Status, String)> {
+) -> Result<TransactResult, InvokeError> {
     let start = Instant::now();
-    let result = tinycloud
-        .invoke_admitted::<BlockStage>(invocation, HashMap::new())
-        .await
-        // Authorization records only the invocation; the operation it
-        // authorizes has not run, so a database failure here is retryable.
-        .map_err(|e| match &e {
-            TxStoreError::Tx(TxError::Db(error) | TxError::EpochInsert(error)) => {
-                database_failure(auth_service(span), error, false, e.to_string())
-            }
-            TxStoreError::Tx(TxError::ReadAudit(error)) => {
-                read_audit_failure(auth_service(span), error)
-            }
-            TxStoreError::Tx(TxError::SpaceNotFound) => (Status::NotFound, e.to_string()),
-            _ => (Status::Unauthorized, e.to_string()),
-        })
+    let (result, write_may_have_applied) = track_writes_retrying(
+        "authorize_invocation",
+        tinycloud.connection().retry_window(),
+        || tinycloud.invoke_admitted::<BlockStage>(&invocation, HashMap::new()),
+        |error| match error {
+            TxStoreError::Tx(error) => tx_database_error(error),
+            _ => None,
+        },
+    )
+    .await;
+    let result = result
+        .map_err(|e| authorization_refusal(span, &e, write_may_have_applied))
         .map(|(tx_result, _)| tx_result);
     crate::prometheus::observe_span(
         span,
@@ -4302,11 +4419,51 @@ async fn verify_auth_admitted(
     result
 }
 
+/// [`authorization_failure`], with a revocation refusal carrying its stable
+/// code (TC-2381).
+fn authorization_refusal(
+    span: &'static str,
+    error: &TxStoreError<BlockStores, BlockStage, tinycloud_core::keys::StaticSecret>,
+    write_may_have_applied: bool,
+) -> InvokeError {
+    match error.revocation_code() {
+        Some(code) => InvokeError::Revoked(code, error.to_string()),
+        None => authorization_failure(span, error, write_may_have_applied).into(),
+    }
+}
+
+/// The response to a failed authorization step of `/invoke`. A read-only
+/// invocation records its audit last and begins no read-write transaction,
+/// so a database failure there is a safe `503`; one that began a
+/// transaction (a mutating invocation) and lost its connection afterwards
+/// is `outcome_unknown` (`write_may_have_applied`, from [`track_writes`]).
+fn authorization_failure(
+    span: &'static str,
+    error: &TxStoreError<BlockStores, BlockStage, tinycloud_core::keys::StaticSecret>,
+    write_may_have_applied: bool,
+) -> (Status, String) {
+    match error {
+        TxStoreError::Tx(TxError::Db(db) | TxError::EpochInsert(db)) => database_failure(
+            auth_service(span),
+            db,
+            write_may_have_applied,
+            error.to_string(),
+        ),
+        TxStoreError::Tx(TxError::ReadAudit(error)) => {
+            read_audit_failure(auth_service(span), error)
+        }
+        TxStoreError::Tx(TxError::SpaceNotFound) => (Status::NotFound, error.to_string()),
+        _ => (Status::Unauthorized, error.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     mod delegation_issued_query;
     mod encryption_keys;
     mod key_delete;
+    mod operation_retry;
+    mod revocation_codes;
     mod revocation_scope;
 
     use super::*;
@@ -9446,6 +9603,231 @@ mod tests {
                 "account": {"usedBytes": 500, "limitBytes": 1000, "plan": "free"},
             })
         );
+        Ok(())
+    }
+    #[tokio::test]
+    async fn tc2389_quota_space_existence_is_not_disclosed_before_kv_authorization() -> Result<()> {
+        use rocket::http::{Header, Status};
+        use rocket::local::asynchronous::Client;
+
+        let mut setup = metered_sql_http_setup("tc2389-unhosted-space").await?;
+        let target_space = tinycloud_auth::resource::SpaceId::new(
+            setup.space.did().to_owned(),
+            "unhosted-quota".parse()?,
+        );
+        let quota = QuotaCache::new(None, None);
+        quota.set_limit(&target_space, 1024).await;
+        setup.resource = target_space.clone().to_resource(
+            "kv".parse::<Service>()?,
+            Some("allowed".parse::<AuthPath>()?),
+            None,
+            None,
+        );
+        let header = sql_invocation_header(&setup, "tinycloud.kv/put", "tc2389-unhosted-quota")?;
+        let client = Client::tracked(metered_sql_rocket_with_quota(setup, quota)).await?;
+
+        let response = client
+            .post("/invoke")
+            .header(Header::new("Authorization", header))
+            .body("one body")
+            .dispatch()
+            .await;
+        let status = response.status();
+        let body = response.into_string().await.unwrap_or_default();
+        assert_eq!(
+            status,
+            Status::Unauthorized,
+            "authorization should precede the existence result: {body}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tc2389_quota_kv_put_authorization_matrix() -> Result<()> {
+        use rocket::http::{ContentType, Header, Status};
+        use rocket::local::asynchronous::Client;
+        use tinycloud_core::{
+            models::abilities,
+            sea_orm::{ActiveModelTrait, ActiveValue::Set},
+            types::Caveats,
+        };
+
+        let mut setup = metered_sql_http_setup("tc2389-matrix").await?;
+        let hosted = setup.space.clone();
+        let unhosted = tinycloud_auth::resource::SpaceId::new(
+            setup.space.did().to_owned(),
+            "unhosted-quota".parse()?,
+        );
+        let quota = QuotaCache::new(None, None);
+        // The hosted space has no limit, so its unauthorized response is the
+        // node's pre-existing one; only the unhosted target is quota-limited.
+        quota.set_limit(&unhosted, 1024).await;
+
+        let mut requests = Vec::new();
+        for multipart in [false, true] {
+            for (label, space) in [("hosted", &hosted), ("unhosted", &unhosted)] {
+                for auth in ["allowed", "denied"] {
+                    setup.resource = space.clone().to_resource(
+                        "kv".parse::<Service>()?,
+                        Some(auth.parse::<AuthPath>()?),
+                        None,
+                        None,
+                    );
+                    if auth == "allowed" && !multipart {
+                        abilities::ActiveModel {
+                            delegation: Set(setup.parent_cid.into()),
+                            resource: Set(Resource::TinyCloud(setup.resource.clone())),
+                            ability: Set(
+                                Ability::try_from("tinycloud.kv/put".to_string()).unwrap()
+                            ),
+                            caveats: Set(Caveats(Default::default())),
+                        }
+                        .insert(&setup.replay_db)
+                        .await?;
+                    }
+                    let nonce = format!("tc2389-{multipart}-{label}-{auth}");
+                    requests.push((
+                        multipart,
+                        label,
+                        auth,
+                        sql_invocation_header(&setup, "tinycloud.kv/put", &nonce)?,
+                    ));
+                }
+            }
+        }
+        let client = Client::tracked(metered_sql_rocket_with_quota(setup, quota)).await?;
+
+        let mut denied = Vec::new();
+        for (multipart, label, auth, header) in requests {
+            let mut request = client
+                .post("/invoke")
+                .header(Header::new("Authorization", header));
+            request = if multipart {
+                request
+                    .header(
+                        ContentType::parse_flexible("multipart/form-data; boundary=tc2389")
+                            .expect("valid multipart content type"),
+                    )
+                    .body(format!(
+                        "--tc2389\r\nContent-Disposition: form-data; name=\"{auth}\"\r\n\r\none body\r\n--tc2389--\r\n"
+                    ))
+            } else {
+                request.body("one body")
+            };
+            let response = request.dispatch().await;
+            let status = response.status();
+            let body = response.into_string().await.unwrap_or_default();
+            match (label, auth) {
+                ("hosted", "allowed") => {
+                    // Authorization passed and the hosted space cleared the
+                    // quota check. The harness block store has no directory
+                    // for the hosted space, so the staged write then fails
+                    // with a filesystem error; that is the known
+                    // post-authorization outcome pinned here.
+                    assert!(
+                        body.contains("No such file or directory")
+                            && !body.contains("Unauthorized Action"),
+                        "hosted+authorized (multipart={multipart}): {status} {body}"
+                    )
+                }
+                ("unhosted", "allowed") => assert_eq!(
+                    status,
+                    Status::NotFound,
+                    "unhosted+authorized (multipart={multipart}): {body}"
+                ),
+                _ => denied.push((multipart, label, status, body)),
+            }
+        }
+        assert_eq!(denied.len(), 4);
+        // The message echoes only the caller's own requested resource, so
+        // compare it with the space name masked.
+        let masked = |body: &str, space: &tinycloud_auth::resource::SpaceId| {
+            body.replace(&space.to_string(), "<space>")
+        };
+        for pair in denied.chunks(2) {
+            let [(_, _, hosted_status, hosted_body), (_, _, unhosted_status, unhosted_body)] = pair
+            else {
+                unreachable!()
+            };
+            assert_eq!(*hosted_status, Status::Unauthorized, "{denied:?}");
+            assert_eq!(hosted_status, unhosted_status, "{denied:?}");
+            assert_eq!(
+                masked(hosted_body, &hosted),
+                masked(unhosted_body, &unhosted),
+                "{denied:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tc2389_unauthorized_kv_put_response_is_independent_of_hosting() -> Result<()> {
+        use rocket::http::{ContentType, Header};
+        use rocket::local::asynchronous::Client;
+        use tinycloud_core::{
+            models::space as space_model,
+            sea_orm::{ActiveModelTrait, ActiveValue::Set},
+            types::SpaceIdWrap,
+        };
+
+        let mut setup = metered_sql_http_setup("tc2389-same-target").await?;
+        let target = tinycloud_auth::resource::SpaceId::new(
+            setup.space.did().to_owned(),
+            "toggled-quota".parse()?,
+        );
+        let quota = QuotaCache::new(None, None);
+        quota.set_limit(&target, 1024).await;
+        setup.resource = target.clone().to_resource(
+            "kv".parse::<Service>()?,
+            Some("denied".parse::<AuthPath>()?),
+            None,
+            None,
+        );
+        // The same signed invocation is sent in both states; a refused
+        // invocation does not consume its nonce.
+        let header = sql_invocation_header(&setup, "tinycloud.kv/put", "tc2389-same-target")?;
+        let db = setup.replay_db.clone();
+        let client = Client::tracked(metered_sql_rocket_with_quota(setup, quota)).await?;
+
+        let send = |multipart: bool| {
+            let request = client
+                .post("/invoke")
+                .header(Header::new("Authorization", header.clone()));
+            let request = if multipart {
+                request
+                    .header(
+                        ContentType::parse_flexible("multipart/form-data; boundary=tc2389")
+                            .expect("valid multipart content type"),
+                    )
+                    .body(
+                        "--tc2389\r\nContent-Disposition: form-data; name=\"denied\"\r\n\r\none body\r\n--tc2389--\r\n",
+                    )
+            } else {
+                request.body("one body")
+            };
+            async move {
+                let response = request.dispatch().await;
+                let status = response.status();
+                let content_type = response.content_type();
+                let body = response.into_string().await.unwrap_or_default();
+                (status, content_type, body)
+            }
+        };
+
+        let unhosted = [send(false).await, send(true).await];
+        space_model::ActiveModel {
+            id: Set(SpaceIdWrap(target.clone())),
+        }
+        .insert(&db)
+        .await?;
+        let hosted = [send(false).await, send(true).await];
+
+        assert_eq!(
+            unhosted[0].0,
+            rocket::http::Status::Unauthorized,
+            "{unhosted:?}"
+        );
+        assert_eq!(unhosted, hosted, "response must not depend on hosting");
         Ok(())
     }
 
