@@ -1,6 +1,30 @@
 # Changelog
 
 ## [Unreleased]
+### Changes
+- Deploys: the workflow supports an explicit, reason-recorded rollback to an earlier released dstack image on the unchanged N0 compose. It checks image labels, release tag, ancestry, and identical migration sources while preserving the normal forward-release guard.
+
+## [1.25.17] - 2026-11-03
+
+### Changes
+- A KV put or delete on `/invoke` records its invocation-replay row in the write's own transaction instead of before it. A write that rolls back (a lost connection before `COMMIT`, a refused authorization) no longer spends the signed request, so the identical request can be sent again. A write refused by its `If-None-Match`/`If-Match` precondition (`412`) commits only the replay row, so that request answers `409` from then on and cannot be resent without the unsigned header. A write that commits still answers the same request `409`, and identical requests racing each other commit once. Reads, decrypt and `space/info` are unchanged. A replayed write is now refused after its upload is staged rather than before it. Details: TC-2375
+- KV put authorization now runs before quota and hosting checks. Details: TC-2389 (#503)
+- Revocation refusals carry stable machine-readable codes, and delegation status reports Policy/v3 root revocation. Details: TC-2381 (#506)
+
+## [1.25.16] - 2026-11-02
+
+### Changes
+- Node database restore guidance now preserves the existing disk and deletion ledger when restoring from a PlanetScale backup. Details: TC-887 (#500)
+- `/delegate` and the authorization step of `/invoke` (SQL, DuckDB and `space/info`) run their operation once more, after a jittered 100 to 300 ms, when it failed with a lost database connection or a socket error (`connection_lost` or `io`) and the write tracker shows no write began or may have applied. A first run that took longer than `database.retry_window_ms` to fail (a keepalive or `TCP_USER_TIMEOUT` detection) is not retried. A second loss answers the same `503 unavailable_retryable` as before; an outcome-unknown `500` is never retried. The authorization step now also reports `outcome_unknown` (`500`) when a mutating invocation lost its connection after its transaction began, instead of always a safe `503`. New `tinycloud_db_connection_events_total` events `operation_retried`, `operation_retry_succeeded` and `operation_retry_skipped_slow`. Details: TC-2346
+- The log shipper maps the two operation-retry warnings (`retrying operation after a lost database connection`, `not retrying operation: its first run took longer than the retry window to fail`) to the event codes `db_operation_retried` and `db_operation_retry_skipped_slow`, instead of `unclassified`. Like every classified diagnostic, they ship the code and count only.
+  - **N0 compose.** The embedded Vector configuration is regenerated for the two codes, so the reviewed N0 compose template changes to `9d0cd8a2…` (raw `d703d69b…`; `docs/releasing.md`, `.github/workflows/docker.yml`). Details: TC-2346
+
+## [1.25.15] - 2026-11-01
+
+### Changes
+- `/policy/v3/*` responses carry the same CORS headers as `/invoke` (`Access-Control-Allow-Origin: *`, the same allowed methods and headers, a 7200 s preflight `Max-Age`), for every origin, without `Access-Control-Allow-Credentials`. These paths no longer use the single `shareEmail` allowed origin and its fixed `GET, POST` method list; they keep `Cache-Control: no-store`, `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`. With `cors = false` they now carry no CORS headers, like every other route. Details: TC-2192 (#490)
+- Internal, not reachable over HTTP: `tinycloud-threshold` bounds raw combine inputs (TC-2219, #491), gains a genesis DKG over owner-closed rounds with its test vector (TC-2220, #492; no route, no `/info` feature, and `tinycloud-node` does not depend on the crate), and its certificate-core vectors have a checker (TC-2223, #489).
+- CI only: the workspace test job is split and the PR Docker build caches its cargo mounts (#495).
 
 ## [1.25.14] - 2026-10-29
 

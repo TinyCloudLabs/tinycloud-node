@@ -610,8 +610,8 @@ Before any CVM mutation the workflow requires:
 
 - the main compose, with its one node digest replaced by 64 zeros, to hash
   to the reviewed N0 template
-  **`c9bcbea9dac90fc2b74d8439146596ba802796a211d1b6d65aeda2286d7ed028`**
-  (raw `298ea356adf8d5e562557ab18bd3f5d8cdb816de82b1eaf6e6e50bf888e22765` normalized; before the TC-1777 named-keys gate env lines (`TINYCLOUD_ENCRYPTION_NETWORK__NAMED_KEYS_V1`, `…__DELETION_LEDGER_PATH`) and the `deletion-ledger` volume the template was `8df7e0f2…`, raw `192dfb7e407fa591d4f0232b95e43a41a85dd18add1d4976e70ebdbff5ddebca`; before the TC-1843 per-minute caps on 4xx and 5xx request events and on the 5xx diagnostic, and the `errors_dropped` event (the dropped count), in the Vector config the template was `7c3456dc…`, raw `d0e72bde…`; before the TC-1840 `db_failure_5xx` event (the node's 5xx diagnostic line shipped as an individual event) in the Vector config the template was `c91e5b7a…`, raw `99013c40…`; before the TC-950 pool of 10 (`TINYCLOUD_DATABASE__MAX_CONNECTIONS` 15 to 10) the template was `79469f97…`, raw `32a002ef…`; before the three `current_kv_c_index_*` warning codes in the Vector config (TC-1274 `current_kv` C-index migration) the template was `87b5d12a…`, raw `d1fcd665…`; before the optional TC-1482 `NODE_STATS_READ_TOKEN` env line and the TC-1482 route in the Vector config the template was `7fabba70…`, raw `1228d81927fc0a3fbba85745103e77b3112606f5d314d15974d400b222409350`: the 1.21.0 compose
+  **`9d0cd8a22369b8339f584c54f42b676df731838876c1739a1938776d4ad5f468`**
+  (raw `d703d69b033c1ad4c9b247141f7ba214df45e1ffec5517596a3c572ea91495c3` normalized; before the TC-2346 `db_operation_retried` and `db_operation_retry_skipped_slow` warning codes in the Vector config the template was `c9bcbea9…`, raw `298ea356…`; before the TC-1777 named-keys gate env lines (`TINYCLOUD_ENCRYPTION_NETWORK__NAMED_KEYS_V1`, `…__DELETION_LEDGER_PATH`) and the `deletion-ledger` volume the template was `8df7e0f2…`, raw `192dfb7e407fa591d4f0232b95e43a41a85dd18add1d4976e70ebdbff5ddebca`; before the TC-1843 per-minute caps on 4xx and 5xx request events and on the 5xx diagnostic, and the `errors_dropped` event (the dropped count), in the Vector config the template was `7c3456dc…`, raw `d0e72bde…`; before the TC-1840 `db_failure_5xx` event (the node's 5xx diagnostic line shipped as an individual event) in the Vector config the template was `c91e5b7a…`, raw `99013c40…`; before the TC-950 pool of 10 (`TINYCLOUD_DATABASE__MAX_CONNECTIONS` 15 to 10) the template was `79469f97…`, raw `32a002ef…`; before the three `current_kv_c_index_*` warning codes in the Vector config (TC-1274 `current_kv` C-index migration) the template was `87b5d12a…`, raw `d1fcd665…`; before the optional TC-1482 `NODE_STATS_READ_TOKEN` env line and the TC-1482 route in the Vector config the template was `7fabba70…`, raw `1228d81927fc0a3fbba85745103e77b3112606f5d314d15974d400b222409350`: the 1.21.0 compose
   `d95bfb707871c1d626c4a8f2b8d32d354103edbb5077847c6a21fe5f7f6cfa50`, template
   `51f8e9e9…`, with only the embedded Vector config regenerated for TC-1274's,
   TC-1317's and TC-1482's route and warning codes (TC-1274 and TC-1317 were template `7fabba70…`, raw `1228d819…`); TC-1274 alone was template `00938226…`, raw
@@ -680,9 +680,60 @@ strict descendant of the running production revision").
 3. Read the digest and labels of the new `X.Y.Z-dstack` image, then use the
    promotion command above with that digest, version and revision.
 
-A rollback of such a change follows the same path: a revert plus a new
-release. The same-image recovery command below is for the reviewed 1.20.6
-image only and is refused once a later release is running.
+A rollback of a compose-only change still follows the same path: revert plus a
+new release. To restore an earlier node image while retaining the current N0
+compose, use the explicit audited rollback below. The same-image recovery
+command below is for the reviewed 1.20.6 image only and is refused once a later
+release is running.
+
+### Audited rollback to a prior N0 release
+
+Use this only when the earlier image is compatible with the production
+database and stored data. `rollback_release=true` requires the current
+reviewed N0 compose, a named digest, matching OCI version/revision labels, the
+matching `vX.Y.Z` tag and crate version, and a target revision that is a
+strict ancestor of the currently running image. The normal guard still
+requires the running revision to be an ancestor of dispatched `main`; do not
+set `allow_non_descendant`.
+
+The workflow also requires the migration source tree under
+`tinycloud-core/src/migrations` to be identical at the target and running
+revisions. A target missing migrations present in the running binary is refused
+before deployment. The 1.25.13 to 1.25.17 migration-tree diff is empty, so that
+rollback remains eligible; older releases with a different migration tree do
+not. This is a conservative compatibility check, not a substitute for checking
+other stored-data compatibility. Before dispatch, verify the digest and OCI
+labels against the `Deployment image:` line in the summary of the successful
+run that deployed that release.
+
+The one-line `rollback_reason` must be 12–300 characters: the first character
+is an ASCII letter or digit; later characters may be ASCII letters or digits,
+spaces, or `. , ; : ( ) / _ + -`. It is retained in the workflow inputs and
+run summary with the digest, version and revision. The explicit quota
+authorization is still required for each dispatch. Keep
+`rollback_pre_n0=false` and `rollback_privacy_mode=unselected`; this does not
+use the captured 1.20.6 compose rollback.
+
+Example using the recorded 1.25.13 image, when it is an ancestor of the
+currently running release:
+
+```sh
+gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref main \
+  -f deploy_phala=true \
+  -f authorize_quota_values=true \
+  -f rollback_release=true \
+  -f rollback_reason="Incident: restore the last known-good node release" \
+  -f image_version=1.25.13 \
+  -f deploy_image_digest=sha256:55c26f455f793cb3d23d1675db566d7ecf4020c3156028ee61190c8e14d59be3 \
+  -f rollback_image_version=1.25.13 \
+  -f rollback_image_revision=50b0986a969af818a658ec92461cce7007e3b0a1 \
+  -f sql_identity_fence=false \
+  -f named_keys_v1=true \
+  -f include_duckdb=false \
+  -f allow_non_descendant=false \
+  -f rollback_pre_n0=false \
+  -f rollback_privacy_mode=unselected
+```
 
 ### Emergency same-image recovery (12c)
 
@@ -705,8 +756,8 @@ gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref main \
 
 The served/OCI identity remains **1.20.6-dstack / e18578ff9162986ddd813259c60f73866e3e60d1**.
 With the template lock on main this redeploys exactly main's raw compose
-`298ea356adf8d5e562557ab18bd3f5d8cdb816de82b1eaf6e6e50bf888e22765`
-(the 1.21.0 compose `d95bfb70…` with the TC-1274, TC-1317, TC-1482, `current_kv_c_index_*`, `db_failure_5xx`, the 4xx and 5xx caps and `errors_dropped` Vector config, the optional TC-1482 `NODE_STATS_READ_TOKEN` env line, the TC-950 pool of 10, and the TC-1777 `NAMED_KEYS_V1` gate env lines with the `deletion-ledger` volume), whatever digest
+`d703d69b033c1ad4c9b247141f7ba214df45e1ffec5517596a3c572ea91495c3`
+(the 1.21.0 compose `d95bfb70…` with the TC-1274, TC-1317, TC-1482, `current_kv_c_index_*`, `db_failure_5xx`, the 4xx and 5xx caps, `errors_dropped` and TC-2346 `db_operation_retried` / `db_operation_retry_skipped_slow` Vector config, the optional TC-1482 `NODE_STATS_READ_TOKEN` env line, the TC-950 pool of 10, and the TC-1777 `NAMED_KEYS_V1` gate env lines with the `deletion-ledger` volume), whatever digest
 main's template currently pins. It is not a rollback of a
 later release across a schema migration. Current pre-N0 tag/pinned
 equivalents are separately hash-checked; arbitrary same-image config

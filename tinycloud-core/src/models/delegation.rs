@@ -198,6 +198,18 @@ pub enum DelegationError {
     AppIdNotBound,
 }
 
+impl DelegationError {
+    /// The stable code of a revocation refusal, `None` for any other error.
+    pub fn revocation_code(&self) -> Option<super::revocation::RevocationCode> {
+        use super::revocation::RevocationCode;
+        match self {
+            Self::ParentRevoked(_) => Some(RevocationCode::ParentRevoked),
+            Self::AncestorRevoked { .. } => Some(RevocationCode::AncestorRevoked),
+            _ => None,
+        }
+    }
+}
+
 /// Verify, validate, and register a delegation inside the caller's transaction.
 ///
 /// Returns `New` when the exact serialization was inserted (and actors,

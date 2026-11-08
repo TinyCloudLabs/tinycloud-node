@@ -611,6 +611,22 @@ impl Proxy {
         self.cut_after
             .send_replace(Some(markers.iter().map(|m| m.to_vec()).collect()));
     }
+
+    /// [`Self::cut_after_forwarding`] for the first `times` connections that
+    /// forward `marker`: each is re-armed as soon as the previous one fires.
+    fn cut_after_forwarding_times(&self, marker: &[u8], times: usize) {
+        self.cut_after_forwarding(marker);
+        let cut_after = Arc::clone(&self.cut_after);
+        let marker = marker.to_vec();
+        tokio::spawn(async move {
+            for _ in 1..times {
+                while cut_after.borrow().is_some() {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                cut_after.send_replace(Some(vec![marker.clone()]));
+            }
+        });
+    }
 }
 
 async fn pipe(
@@ -1101,6 +1117,103 @@ async fn postgres_kv_put_with_a_lost_commit_reply_has_an_unknown_outcome() {
     fixture.drop_schema().await;
 }
 
+/// TC-2375: a KV put spends its replay row in its own transaction. A put
+/// that fails after the row was inserted (here a trigger refuses its
+/// `kv_write` row) rolls both back, so the same signed invocation, sent again
+/// with the same row, writes; once it commits, the same row is a replay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_kv_put_rolled_back_mid_transaction_releases_its_replay_row() {
+    use tinycloud_core::models::invocation_replay;
+    use tinycloud_core::{KvInvokeOptions, TxStoreError};
+
+    let Some(url) =
+        postgres_url("postgres_kv_put_rolled_back_mid_transaction_releases_its_replay_row")
+    else {
+        return;
+    };
+    let mut fixture = Fixture::new("replayrollback", &url, None).await;
+    fixture.warm().await;
+    fixture.settle().await;
+
+    let key: Path = "tc2375/rolled-back".parse().unwrap();
+    let nonce = fixture.nonce();
+    let invocation = fixture
+        .owner
+        .invocation("tinycloud.kv/put", &key, &nonce)
+        .unwrap();
+    let options = KvInvokeOptions {
+        replay: Some(invocation_replay::Model {
+            content_hash: invocation.content_hash(),
+            expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+        }),
+        ..KvInvokeOptions::default()
+    };
+    let inputs = |fixture: &Fixture| {
+        let mut inputs = HashMap::new();
+        inputs.insert(
+            (fixture.owner.space.clone(), key.clone()),
+            (
+                Metadata(BTreeMap::new()),
+                HashBuffer::new(b"tc2375 value".to_vec()),
+            ),
+        );
+        inputs
+    };
+
+    let schema = fixture.schema.clone();
+    for statement in [
+        format!(
+            "CREATE FUNCTION {schema}.tc2375_refuse() RETURNS trigger LANGUAGE plpgsql AS \
+             $$ BEGIN RAISE EXCEPTION 'tc2375 refused'; END $$"
+        ),
+        format!(
+            "CREATE TRIGGER tc2375_refuse BEFORE INSERT ON {schema}.kv_write \
+             FOR EACH ROW EXECUTE FUNCTION {schema}.tc2375_refuse()"
+        ),
+    ] {
+        fixture
+            .admin
+            .execute_unprepared(&statement)
+            .await
+            .expect("install the failing trigger");
+    }
+    let refused = fixture
+        .db
+        .invoke_with_options::<MemoryStaging>(invocation.clone(), inputs(&fixture), options.clone())
+        .await;
+    assert!(
+        matches!(refused, Err(TxStoreError::Tx(_))),
+        "the put must fail inside its transaction"
+    );
+    fixture
+        .admin
+        .execute_unprepared(&format!("DROP TRIGGER tc2375_refuse ON {schema}.kv_write"))
+        .await
+        .expect("remove the failing trigger");
+
+    // Rolled back: the same invocation and row write.
+    fixture
+        .db
+        .invoke_with_options::<MemoryStaging>(invocation.clone(), inputs(&fixture), options.clone())
+        .await
+        .unwrap_or_else(|error| panic!("the retry of a rolled-back write: {error}"));
+    // Committed: now it is a replay, and nothing else is written.
+    match fixture
+        .db
+        .invoke_with_options::<MemoryStaging>(invocation, inputs(&fixture), options)
+        .await
+    {
+        Err(TxStoreError::InvocationReplayed) => {}
+        Err(other) => panic!("expected a replay, got {other}"),
+        Ok(_) => panic!("a committed write's invocation was accepted twice"),
+    }
+    fixture
+        .get("tc2375/rolled-back")
+        .await
+        .expect("written once");
+    fixture.drop_schema().await;
+}
+
 /// With no loss, the acquire hook never pings; after one loss it re-validates
 /// the connections that predate it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1553,6 +1666,129 @@ async fn postgres_read_audit_statement_survives_a_stale_connection() {
     assert!(
         !audit_hits.is_empty(),
         "no position put the dead connection under the read-audit statement"
+    );
+    fixture.drop_schema().await;
+}
+
+/// The database error inside a delegation's failure, as the route reads it.
+fn delegation_db_error(
+    error: &tinycloud_core::TxError<tinycloud_core::storage::memory::MemoryStore, StaticSecret>,
+) -> Option<&tinycloud_core::sea_orm::DbErr> {
+    match error {
+        tinycloud_core::TxError::Db(error) | tinycloud_core::TxError::EpochInsert(error) => {
+            Some(error)
+        }
+        _ => None,
+    }
+}
+
+/// The bytes a delegation's id travels as in a bound statement parameter.
+fn id_marker(delegation: &Delegation) -> Vec<u8> {
+    match tinycloud_core::sea_orm::Value::from(delegation.content_hash()) {
+        tinycloud_core::sea_orm::Value::Bytes(Some(bytes)) => *bytes,
+        other => panic!("a hash is bound as bytes, not {other:?}"),
+    }
+}
+
+/// TC-2346: a connection that is lost on the delegation's lookup and on that
+/// statement's own retry (a burst, not one stale connection) before any
+/// write fails the first run of the operation. The operation is run once more
+/// and succeeds, and the delegation is stored once. The loss is a real reset
+/// socket from a proxy, which the pool reports as `io`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_delegate_is_retried_once_after_a_loss_before_any_write() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tinycloud_core::db_pool::track_writes_retrying;
+
+    let Some(url) = postgres_url("postgres_delegate_is_retried_once_after_a_loss_before_any_write")
+    else {
+        return;
+    };
+    let proxy = Proxy::start(upstream_addr(&url)).await;
+    let mut fixture = Fixture::new("oprety", &url, Some(proxy.addr)).await;
+    fixture.warm().await;
+    fixture.settle().await;
+    let key: Path = "tc2346/retry".parse().unwrap();
+    let nonce = fixture.nonce();
+    let delegation = fixture.owner.delegation(&key, &nonce).unwrap();
+    // The lookup `SELECT ... WHERE id = $1` of the first run, then of its
+    // statement retry; the second run's lookup passes.
+    proxy.cut_after_forwarding_times(&id_marker(&delegation), 2);
+
+    let attempts = AtomicUsize::new(0);
+    let db = fixture.db.clone();
+    let (result, applied) = track_writes_retrying(
+        "delegate",
+        fixture.conn.retry_window(),
+        || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            let (db, delegation) = (db.clone(), delegation.clone());
+            async move { db.delegate(delegation).await }
+        },
+        delegation_db_error,
+    )
+    .await;
+
+    assert!(result.is_ok(), "{:?}", result.err().map(|e| e.to_string()));
+    assert_eq!(attempts.load(Ordering::SeqCst), 2, "one retry");
+    assert!(applied, "the second run wrote");
+    assert_eq!(fixture.row_count("delegation").await, 1);
+    fixture.drop_schema().await;
+}
+
+/// TC-2346: a delegation whose `COMMIT` reached the server but whose reply
+/// was lost is stored, and is not run again: its failure is
+/// `outcome_unknown`, whose existing mapping is a 500 with no retry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_delegate_is_not_retried_after_its_transaction_began() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tinycloud_core::db_pool::{classify_failure, track_writes_retrying, TransientFailure};
+
+    let Some(url) = postgres_url("postgres_delegate_is_not_retried_after_its_transaction_began")
+    else {
+        return;
+    };
+    let proxy = Proxy::start(upstream_addr(&url)).await;
+    let mut fixture = Fixture::new("opnore", &url, Some(proxy.addr)).await;
+    fixture.warm().await;
+    fixture.settle().await;
+    let key: Path = "tc2346/no-retry".parse().unwrap();
+    let nonce = fixture.nonce();
+    let delegation = fixture.owner.delegation(&key, &nonce).unwrap();
+    // The first connection that carries this delegation's id and then its
+    // `COMMIT` (a background read-audit batch commits too, without the id).
+    proxy.cut_after_forwarding_in_order(&[&id_marker(&delegation), b"COMMIT"]);
+
+    let attempts = AtomicUsize::new(0);
+    let db = fixture.db.clone();
+    let (result, applied) = track_writes_retrying(
+        "delegate",
+        fixture.conn.retry_window(),
+        || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            let (db, delegation) = (db.clone(), delegation.clone());
+            async move { db.delegate(delegation).await }
+        },
+        delegation_db_error,
+    )
+    .await;
+
+    let error = match result {
+        Err(tinycloud_core::TxError::Db(error)) => error,
+        Err(other) => panic!("expected a database error, got {other}"),
+        Ok(_) => panic!("the COMMIT's reply was lost"),
+    };
+    assert!(is_connection_error(&error), "{error:?}");
+    assert!(applied, "the transaction began");
+    assert_eq!(attempts.load(Ordering::SeqCst), 1, "no retry");
+    assert_eq!(
+        classify_failure(&error, applied),
+        Some(TransientFailure::OutcomeUnknown)
+    );
+    assert_eq!(
+        fixture.row_count("delegation").await,
+        1,
+        "the delegation committed, once"
     );
     fixture.drop_schema().await;
 }

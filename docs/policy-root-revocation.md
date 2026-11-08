@@ -49,7 +49,21 @@ gets `403 root-revocation-issuer-invalid`.
 ## Confirming a revocation
 
 Confirm on the CID you revoked, with `POST /delegation/status`, or with the
-owner listing where the node offers it.
+owner listing where the node offers it. The status reads both the generic
+revocation record and the policy root record, so a root revoked over either
+route, and its descendants, report `revoked`.
+
+On `/invoke`, `/delegate`, `/signed/kv`, the encryption network and key routes
+(including decrypt) and the hooks routes, a `401` refusal caused by a revocation
+has a JSON body `{"code": ..., "error": ...}`. `code` is `delegation_revoked` (the cited
+grant itself), `parent_revoked` (its direct parent) or `ancestor_revoked` (a
+higher ancestor); `error` keeps the text, such as `delegation-revoked: <cid>`.
+Switch on `code`, not on the text.
+An exact repeat of a `/delegate` request for a CID already stored is an
+idempotent acknowledgement, not a new grant. It can return `200` with empty
+`activated` and `skipped` lists even after revocation; it does not reactivate
+the delegation, and subsequent use still fails with the applicable revocation
+code.
 
 After a generic revocation of a root, `GET /policy/v3/status/<root>` returns
 `state: revoked` over the last signed checkpoint, whose own `state` stays

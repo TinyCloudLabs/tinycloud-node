@@ -1,4 +1,4 @@
-use crate::admission::AdmittedInvocation;
+use crate::admission::{sealed, AdmittedInput, AdmittedInvocation};
 use crate::db_pool::RecoveringConnection;
 use crate::encryption::ColumnEncryption;
 use crate::events::{
@@ -211,8 +211,9 @@ pub enum AccountDelegationQueryError {
 
 /// TC-409: which trust mode an invocation entered `invoke_with_options_mode`
 /// under, and therefore which `Event` variant (and how much duplicate
-/// verification work) it produces. `Admitted` is only reachable by consuming
-/// an `AdmittedInvocation`, obtainable only from `AdmittedInvocation::admit`.
+/// verification work) it produces. `Admitted` is only reachable from an
+/// `AdmittedInvocation` (owned, or borrowed by the read-only authorization
+/// step), obtainable only from `AdmittedInvocation::admit`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InvokeMode {
     /// Untyped public entry point: signature verification runs during
@@ -304,6 +305,14 @@ pub struct KvInvokeOptions {
     /// Parameters of a `tinycloud.kv/sync` request (TC-732). `None` reads the
     /// first page at the default limit.
     pub kv_sync: Option<crate::kv_sync::KvSyncRequest>,
+    /// The invocation-replay row of a KV write (TC-2375). It is inserted in
+    /// the write's own transaction, so a write that rolls back releases it
+    /// and the same signed request can be sent again; one that commits keeps
+    /// it, and the same request is then a replay
+    /// ([`TxStoreError::InvocationReplayed`]). Ignored by an invocation with
+    /// no KV mutation (see [`kv_mutation_keys`]), which has no such
+    /// transaction.
+    pub replay: Option<invocation_replay::Model>,
 }
 
 #[derive(Debug, Clone)]
@@ -370,6 +379,17 @@ pub enum TxError<S: StorageSetup, K: Secrets> {
     ReadAudit(#[from] crate::read_audit::ReadAuditError),
 }
 
+impl<S: StorageSetup, K: Secrets> TxError<S, K> {
+    /// The stable code when a revocation refused the request (TC-2381).
+    pub fn revocation_code(&self) -> Option<revocation::RevocationCode> {
+        match self {
+            Self::InvalidInvocation(error) => error.revocation_code(),
+            Self::InvalidDelegation(error) => error.revocation_code(),
+            _ => None,
+        }
+    }
+}
+
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum TxStoreError<B, S, K>
@@ -397,6 +417,10 @@ where
     KvCandidateUnavailable,
     #[error("KV precondition failed")]
     KvPreconditionFailed,
+    /// The invocation's replay row exists: it, or an identical request that
+    /// committed, was already spent (TC-2375).
+    #[error("duplicate invocation")]
+    InvocationReplayed,
     #[error("KV response is {size} bytes, exceeding the requested limit of {limit} bytes")]
     KvResponseTooLarge { size: u64, limit: u64 },
     /// A `tinycloud.kv/list` cursor names a key outside the listed prefix.
@@ -417,6 +441,22 @@ where
     /// The presented `tinycloud.kv/retain` grant is refused.
     #[error("kv/sync retention grant refused: {}", .0.as_str())]
     KvSyncRetentionRefused(crate::kv_sync::KvSyncRetentionError),
+}
+
+impl<B, S, K> TxStoreError<B, S, K>
+where
+    B: ImmutableReadStore + ImmutableWriteStore<S> + StorageSetup,
+    S: ImmutableStaging,
+    S::Writable: 'static + Unpin,
+    K: Secrets,
+{
+    /// The stable code when a revocation refused the request (TC-2381).
+    pub fn revocation_code(&self) -> Option<revocation::RevocationCode> {
+        match self {
+            Self::Tx(error) => error.revocation_code(),
+            _ => None,
+        }
+    }
 }
 
 impl<B, S, K> From<DbErr> for TxStoreError<B, S, K>
@@ -868,41 +908,68 @@ where
 
     /// Check the persisted revocation state for cited delegations and every
     /// ancestor, without re-admitting the invocation that minted a ticket.
-    pub async fn delegation_chains_unrevoked(&self, roots: &[Cid]) -> Result<bool, DbErr> {
+    /// `None` when none is revoked; otherwise the stable code of the most
+    /// specific revocation: a cited delegation itself, else a direct parent of
+    /// one, else a higher ancestor (TC-2381).
+    pub async fn delegation_chains_revocation(
+        &self,
+        roots: &[Cid],
+    ) -> Result<Option<revocation::RevocationCode>, DbErr> {
+        use revocation::RevocationCode;
         let roots = roots.iter().copied().map(Hash::from).collect::<Vec<_>>();
         if roots.is_empty() {
-            return Ok(true);
+            return Ok(None);
         }
+        // The shared traversal budget covers every cited root together.
         let chain_ids = revocation::ancestor_chain_ids_for_roots(&self.conn, &roots)
             .await
             .map_err(|error| DbErr::Custom(error.to_string()))?;
+        let parents = parent_delegations::Entity::find()
+            .filter(parent_delegations::Column::Child.is_in(roots.iter().copied()))
+            .all(&self.conn)
+            .await?
+            .into_iter()
+            .map(|link| link.parent)
+            .collect::<HashSet<_>>();
+        let mut found = None;
         for id in chain_ids {
-            if revocation::is_revoked(&self.conn, &id).await? {
-                return Ok(false);
+            if !revocation::is_revoked(&self.conn, &id).await? {
+                continue;
+            }
+            if roots.contains(&id) {
+                return Ok(Some(RevocationCode::DelegationRevoked));
+            }
+            if parents.contains(&id) {
+                found = Some(RevocationCode::ParentRevoked);
+            } else if found.is_none() {
+                found = Some(RevocationCode::AncestorRevoked);
             }
         }
-        Ok(true)
+        Ok(found)
     }
 
     /// Load and reparse a delegation from its exact signed Authorization
     /// bytes. The relational row is returned only so callers can compare all
     /// projections against the signed source of truth.
+    /// Database failures retain their `DbErr` source so callers can distinguish
+    /// an unavailable lookup from invalid signed bytes.
     pub async fn load_signed_delegation(
         &self,
         cid: tinycloud_auth::ipld_core::cid::Cid,
-    ) -> Result<Option<(delegation::Model, Delegation)>, String> {
+    ) -> Result<Option<(delegation::Model, Delegation)>, Box<dyn std::error::Error + Send + Sync>>
+    {
         let Some(row) = delegation::Entity::find_by_id(Hash::from(cid))
             .one(&self.conn)
-            .await
-            .map_err(|error| error.to_string())?
+            .await?
         else {
             return Ok(None);
         };
-        let bytes = crate::encryption::maybe_decrypt(self.encryption.as_ref(), &row.serialization)
-            .map_err(|error| error.to_string())?;
-        let event = decode_stored_delegation(bytes).map_err(|error| error.to_string())?;
+        let bytes = crate::encryption::maybe_decrypt(self.encryption.as_ref(), &row.serialization)?;
+        let delegation = TinyCloudDelegation::from_bytes(&bytes)?;
+        let info = DelegationInfo::try_from(delegation)?;
+        let event = SerializedEvent(info, bytes);
         if event.content_hash() != row.id || event.content_hash() != Hash::from(cid) {
-            return Err("delegation-signed-bytes-mismatch".to_string());
+            return Err("delegation-signed-bytes-mismatch".into());
         }
         Ok(Some((row, event)))
     }
@@ -943,7 +1010,10 @@ where
             self.delegated_sql_caveats,
         )
         .await
-        .map_err(|_| AccountDelegationQueryError::Unauthorized)?;
+        .map_err(|error| match error {
+            invocation::Error::Db(error) => AccountDelegationQueryError::Db(error),
+            invocation::Error::InvalidInvocation(_) => AccountDelegationQueryError::Unauthorized,
+        })?;
         if matches!(query.direction, DelegationQueryDirection::Issued) {
             let invoker = issued_query_principal(invocation)
                 .ok_or(AccountDelegationQueryError::Unauthorized)?;
@@ -2163,12 +2233,11 @@ where
             return Ok(None);
         }
 
-        if revocation::is_revoked(&self.conn, &target).await? {
-            return Ok(Some(DelegationStatus::Revoked));
-        }
-        match revocation::first_revoked_ancestor(&self.conn, &delegation.id).await {
-            Ok(Some(_)) => return Ok(Some(DelegationStatus::Revoked)),
-            Ok(None) => {}
+        // One read joins the generic revocation table (with its CID aliases)
+        // and `policy_v3_root` over the target and its whole ancestor chain.
+        match revocation::chain_revoked(&self.conn, &target, &delegation.id).await {
+            Ok(true) => return Ok(Some(DelegationStatus::Revoked)),
+            Ok(false) => {}
             Err(revocation::ChainTraversalError::LimitExceeded) => {
                 return Ok(Some(DelegationStatus::Unavailable));
             }
@@ -2211,12 +2280,15 @@ where
     /// once by `AdmittedInvocation::admit`. Skips only that duplicate
     /// signature check downstream; authorization, revocation, caveat
     /// containment, and signed-time validity are still re-checked against
-    /// the current database state. This is the sole way to reach
-    /// `Event::AdmittedInvocation` — a caller without an `AdmittedInvocation`
-    /// cannot construct one.
+    /// the current database state. With `Event::AdmittedInvocation` it is
+    /// the way to reach this trust mode — a caller without an
+    /// `AdmittedInvocation` cannot construct one. Takes the value or, for
+    /// the read-only authorization step that its retry of a lost connection
+    /// runs again (TC-2346), a reference to it. A mutating invocation goes
+    /// through [`Self::invoke_with_options_admitted`], which only consumes.
     pub async fn invoke_admitted<S>(
         &self,
-        invocation: AdmittedInvocation,
+        invocation: impl AdmittedInput,
         inputs: InvocationInputs<S::Writable>,
     ) -> Result<(TransactResult, Vec<InvocationOutcome<B::Readable>>), TxStoreError<B, S, K>>
     where
@@ -2224,10 +2296,18 @@ where
         S: ImmutableStaging,
         S::Writable: 'static + Unpin,
     {
-        self.invoke_with_options_admitted(invocation, inputs, KvInvokeOptions::default())
-            .await
+        self.invoke_with_options_mode(
+            sealed::Sealed::into_invocation(invocation),
+            inputs,
+            KvInvokeOptions::default(),
+            InvokeMode::Admitted,
+        )
+        .await
     }
 
+    /// [`Self::invoke_admitted`] with `options`, for the mutating KV path:
+    /// it consumes the `AdmittedInvocation`, so a write cannot be run twice
+    /// from one admitted value.
     pub async fn invoke_with_options_admitted<S>(
         &self,
         invocation: AdmittedInvocation,
@@ -2240,7 +2320,7 @@ where
         S::Writable: 'static + Unpin,
     {
         self.invoke_with_options_mode(
-            invocation.into_invocation(),
+            sealed::Sealed::into_invocation(invocation),
             inputs,
             options,
             InvokeMode::Admitted,
@@ -2363,22 +2443,7 @@ where
         // invocation-vs-invocation exclusion, which the revocation-ordering
         // invariant never depended on.
         let _chain_guards = self.acquire_shared_chain_guards_for_keys(lock_keys).await;
-        let mutation_keys = invocation
-            .0
-            .capabilities
-            .iter()
-            .filter_map(|cap| {
-                let resource = cap.resource.tinycloud_resource()?;
-                let ability =
-                    crate::policy_capability::resolve_alias(cap.ability.as_ref().as_ref());
-                if resource.service().as_str() != "kv"
-                    || !matches!(ability, "tinycloud.kv/put" | "tinycloud.kv/del")
-                {
-                    return None;
-                }
-                Some((resource.space().clone(), resource.path()?.clone()))
-            })
-            .collect::<Vec<_>>();
+        let mutation_keys = kv_mutation_keys(&invocation);
         if mutation_keys.len() > KV_MAX_MUTATIONS_PER_INVOCATION {
             return Err(TxStoreError::KvTooManyMutations {
                 count: mutation_keys.len(),
@@ -2662,6 +2727,22 @@ where
                         }
                     })?;
             }
+            // TC-2375: spend the replay row in this transaction, first among
+            // its statements after the locks, so every later refusal or lost
+            // connection rolls it back with the write.
+            if let Some(row) = options.replay.clone() {
+                let inserted = invocation_replay::Entity::insert(row.into_active_model())
+                    .on_conflict(
+                        OnConflict::column(invocation_replay::Column::ContentHash)
+                            .do_nothing()
+                            .to_owned(),
+                    )
+                    .exec_without_returning(&tx)
+                    .await?;
+                if inserted == 0 {
+                    return Err(TxStoreError::InvocationReplayed);
+                }
+            }
             // The sequence lock precedes every precondition read under READ
             // COMMITTED, including when an upload was prepared concurrently.
             // SQLite already holds its single-writer lock at BEGIN, preventing a
@@ -2702,6 +2783,17 @@ where
                         current.as_ref().map(|entry| entry.value),
                     );
                     if !matches {
+                        // The precondition rides unsigned beside the signed
+                        // invocation. Commit the transaction so the replay
+                        // row alone is spent: a leaked refused request
+                        // cannot be resent without it to write another
+                        // value. A failed commit is the transaction's own
+                        // database error: it may or may not have committed
+                        // (a lost reply), so the route reports it as an
+                        // unknown outcome and the caller reads back first.
+                        if options.replay.is_some() {
+                            tx.commit().await?;
+                        }
                         return Err(TxStoreError::KvPreconditionFailed);
                     }
                 }
@@ -3298,6 +3390,27 @@ type KvSyncTarget = (SpaceId, Path, Resource);
 /// no `kv/sync`. A root resource is canonicalized to an empty prefix and a
 /// pathless `kv` resource, so cursors, authority, and retention describe one
 /// stable whole-space feed regardless of `{space}/kv` vs `{space}/kv/`.
+/// The `(space, path)` of every KV put or delete the invocation carries: what
+/// makes `/invoke` run it in a write transaction (and, with
+/// [`KvInvokeOptions::replay`], spend its replay row there).
+pub fn kv_mutation_keys(invocation: &Invocation) -> Vec<(SpaceId, Path)> {
+    invocation
+        .0
+        .capabilities
+        .iter()
+        .filter_map(|cap| {
+            let resource = cap.resource.tinycloud_resource()?;
+            let ability = crate::policy_capability::resolve_alias(cap.ability.as_ref().as_ref());
+            if resource.service().as_str() != "kv"
+                || !matches!(ability, "tinycloud.kv/put" | "tinycloud.kv/del")
+            {
+                return None;
+            }
+            Some((resource.space().clone(), resource.path()?.clone()))
+        })
+        .collect()
+}
+
 fn kv_sync_target(
     invocation: &crate::util::InvocationInfo,
 ) -> Result<Option<KvSyncTarget>, &'static str> {

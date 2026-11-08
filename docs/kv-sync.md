@@ -117,7 +117,7 @@ never implied.
 | Status | Body | When |
 |---|---|---|
 | 400 | text | More than one capability; a sync resource that is not a KV resource or has a query/fragment; `x-tinycloud-limit` outside 1–1000; a cursor that is not a cursor (empty, longer than 4096 characters, or not base64url); a retention header that is not a CID. |
-| 401 | text, e.g. `delegation-revoked: ...` | The caller is not authorized, including a revoked or expired grant. Checked before the cursor is opened, so an unauthorized caller never sees 410. |
+| 401 | text, or for a revocation `{"code":"delegation_revoked\|parent_revoked\|ancestor_revoked","error":"delegation-revoked: ..."}` | The caller is not authorized, including a revoked or expired grant. A revocation carries a stable `code`: the cited grant itself, its direct parent, or a higher ancestor; `error` is the unchanged text. Checked before the cursor is opened, so an unauthorized caller never sees 410. |
 | 403 | `{"error":{"code":"RETENTION_GRANT_REFUSED","reason":"<reason>"}}` | The retention grant is refused. Reasons: `retention-grant-not-found`, `retention-grant-holder-mismatch`, `retention-grant-revoked`, `retention-grant-ancestor-revoked`, `retention-grant-not-yet-valid`, `retention-grant-expired`, `retention-grant-not-covering`. The sync is not served without retention. |
 | 410 | `{"error":{"code":"RESET_REQUIRED","reason":"cursor-invalid"}}` | The cursor was not minted by this node for this space and prefix, or is from an older cursor version. |
 | 410 | `{"error":{"code":"RESET_REQUIRED","reason":"position-unknown"}}` | The cursor names a position this space does not have, for example after the node was restored from a backup. |

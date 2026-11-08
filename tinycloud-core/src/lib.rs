@@ -40,10 +40,11 @@ pub mod types;
 pub mod util;
 pub mod write_hooks;
 
-pub use admission::{AdmissionError, AdmittedInvocation};
+pub use admission::{AdmissionError, AdmittedInput, AdmittedInvocation};
 pub use db::{
-    Commit, DelegationStatus, InvocationOutcome, KvBatchReadItem, KvBatchReadValue,
-    KvInvokeOptions, KvPrecondition, SpaceDatabase, TransactResult, TxError, TxStoreError,
+    kv_mutation_keys, Commit, DelegationStatus, InvocationOutcome, KvBatchReadItem,
+    KvBatchReadValue, KvInvokeOptions, KvPrecondition, SpaceDatabase, TransactResult, TxError,
+    TxStoreError,
 };
 pub use db_pool::RecoveringConnection;
 pub use encryption::ColumnEncryption;
