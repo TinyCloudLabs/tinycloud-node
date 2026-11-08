@@ -154,19 +154,22 @@ export function verifyClosedRound(ceremony: VerifiedCeremony, closure: Bytes, ow
   const context = r.take(32), closedRound = Number(r.int(1)), listHash = r.take(32), prior = r.take(32); r.end();
   if (!equal(context, ceremony.digest) || closedRound !== round || !equal(prior, previous) || previous.length !== 32 || messages.length > 65535) throw new ProtocolError('InvalidCeremony');
   let total = 2;
-  const authenticated = messages.map(message => {
+  // S0.4: reshare/refresh rounds authenticate both signed cohorts and ignore the one outside the round's role
+  // (R1/R3 old dealers, R2 new recipients). Genesis/re-key sign only as recipients.
+  const successor = ceremony.body.kind === 2 || ceremony.body.kind === 3;
+  const role = !successor ? 1 : round === 2 ? 1 : round === 1 || round === 3 ? 2 : undefined;
+  const authenticated = messages.flatMap(message => {
     total += 8 + message.body.length + message.signature.length;
     if (total > 4194304 || message.signature.length > 512) throw new ProtocolError('InvalidEncoding');
     const m = new Reader(message.body); m.version();
     const digest = m.take(32), messageRound = Number(m.int(1)), cohort = Number(m.int(1)), index = Number(m.int(2)), payload = m.field(65536); m.end();
     if (!equal(digest, context) || messageRound !== round || (cohort !== 1 && cohort !== 2)) throw new ProtocolError('InvalidCeremony');
-    const successor = ceremony.body.kind === 2 || ceremony.body.kind === 3;
-    if ((!successor && cohort !== 1) || (successor && ((round === 1 || round === 3) ? cohort !== 2 : round === 2 && cohort !== 1))) throw new ProtocolError('InvalidCeremony');
+    if (!successor && cohort !== 1) throw new ProtocolError('InvalidCeremony');
     const members = cohort === 1 ? ceremony.body.recipients : ceremony.previous?.body.members;
     const member = members?.find(entry => entry.index === index);
     if (!member) throw new ProtocolError('InvalidCeremony');
     if (!signatureValid(keys, member.did, message.signature, tagged(CERT_TAGS.message, message.body))) throw new ProtocolError('InvalidSignature');
-    return { ...message, payload };
+    return role === undefined || cohort === role ? [{ ...message, payload }] : [];
   });
   const ordered = concat(be(BigInt(messages.length), 2), ...messages.flatMap(m => [lp(m.body), lp(m.signature)]));
   if (!equal(tagged(CERT_TAGS.transcript, ordered), listHash)) throw new ProtocolError('InvalidCeremony');
