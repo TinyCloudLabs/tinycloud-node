@@ -1059,6 +1059,8 @@ fn unavailable_kind(err: &DatabaseArtifactError) -> Option<&'static str> {
     match err {
         DatabaseArtifactError::Db(error) if is_transient_error(error) => Some(failure_kind(error)),
         DatabaseArtifactError::ArtifactChanged => Some("artifact_changed"),
+        // No class of its own: the diagnostic classes are a fixed set.
+        DatabaseArtifactError::AtRestUnavailable => Some("other"),
         _ => None,
     }
 }
@@ -1121,6 +1123,10 @@ fn artifact_error_to_sql(err: DatabaseArtifactError) -> SqlError {
             );
             SqlError::Unavailable
         }
+        // At-rest keys locked or the encrypt gate closed (TC-887): nothing
+        // was written, so a later request may succeed. Integrity, unsupported
+        // format and strict-mode refusals stay `Internal` below.
+        DatabaseArtifactError::AtRestUnavailable => SqlError::Unavailable,
         err => SqlError::Internal(err.to_string()),
     }
 }
@@ -2696,6 +2702,154 @@ mod tests {
             }
             other => panic!("expected query response, got {other:?}"),
         }
+    }
+
+    /// TC-887: in `encrypt` mode the durable copy of a SQL database (its
+    /// checkpoint and its WAL delta) holds no SQLite bytes and no row data,
+    /// and a cold cache hydrates the same rows from it. Without usable keys
+    /// a read or a write answers `Unavailable` (503) and stores nothing.
+    #[tokio::test]
+    async fn sealed_sql_database_hydrates_a_cold_cache() {
+        use crate::at_rest::{AtRestMode, DataKeyProvider, FixedKeyProvider, TestAtRestSource};
+        use crate::models::database_artifact;
+        use sea_orm::EntityTrait;
+
+        let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
+            .await
+            .unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        let keys: Arc<dyn DataKeyProvider> = Arc::new(FixedKeyProvider::new([9; 32]));
+        let source = TestAtRestSource::new(AtRestMode::Encrypt, true, Some(keys));
+        let repo = Arc::new(
+            SeaOrmDatabaseArtifactRepository::new(db.clone()).with_at_rest(source.clone()),
+        );
+        let space = test_space_id("sql-sealed");
+        let marker = "tc887-sealed-row-marker";
+        let query = || SqlRequest::Query {
+            sql: "SELECT name FROM items ORDER BY id".to_string(),
+            params: Vec::new(),
+            max_rows: None,
+            max_bytes: None,
+        };
+
+        let cache_one = TempDir::new().unwrap();
+        let service = SqlService::new(
+            cache_one.path().to_string_lossy().to_string(),
+            0,
+            repo.clone(),
+        );
+        for (sql, ability) in [
+            (
+                "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL)".to_string(),
+                "tinycloud.sql/schema",
+            ),
+            (
+                format!("INSERT INTO items (name) VALUES ('{marker}')"),
+                "tinycloud.sql/admin",
+            ),
+        ] {
+            service
+                .execute(
+                    &space,
+                    "main",
+                    SqlRequest::Execute {
+                        schema: None,
+                        sql,
+                        params: Vec::new(),
+                    },
+                    None,
+                    ability.to_string(),
+                )
+                .await
+                .unwrap();
+        }
+        drop(service);
+
+        let row = database_artifact::Entity::find()
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.storage_mode, "checkpoint+wal");
+        assert_eq!(
+            (row.payload_encoding, row.delta_encoding),
+            (Some(1), Some(1))
+        );
+        for stored in [&row.payload, row.delta_payload.as_ref().unwrap()] {
+            assert!(!stored.starts_with(SQLITE_MAGIC));
+            assert!(!stored
+                .windows(marker.len())
+                .any(|window| window == marker.as_bytes()));
+        }
+
+        let cache_two = TempDir::new().unwrap();
+        let recreated = SqlService::new(
+            cache_two.path().to_string_lossy().to_string(),
+            0,
+            repo.clone(),
+        );
+        let result = recreated
+            .execute(
+                &space,
+                "main",
+                query(),
+                None,
+                "tinycloud.sql/read".to_string(),
+            )
+            .await
+            .unwrap();
+        match result.response {
+            SqlResponse::Query(rows) => {
+                assert_eq!(rows.rows, vec![vec![SqlValue::Text(marker.to_string())]]);
+            }
+            other => panic!("expected query response, got {other:?}"),
+        }
+        drop(recreated);
+
+        // Locked keys: the sealed database is not served.
+        source.set_provider(Some(Arc::new(FixedKeyProvider::new([9; 32]).locked())));
+        let cache_three = TempDir::new().unwrap();
+        let locked = SqlService::new(
+            cache_three.path().to_string_lossy().to_string(),
+            0,
+            repo.clone(),
+        );
+        let read = locked
+            .execute(
+                &space,
+                "main",
+                query(),
+                None,
+                "tinycloud.sql/read".to_string(),
+            )
+            .await;
+        assert!(matches!(read, Err(SqlError::Unavailable)), "{read:?}");
+        // The gate closed: a new database's first write is refused, not
+        // stored as plaintext.
+        source.set(AtRestMode::Encrypt, false);
+        let write = locked
+            .execute(
+                &space,
+                "fresh",
+                SqlRequest::Execute {
+                    schema: None,
+                    sql: "CREATE TABLE t (id INTEGER)".to_string(),
+                    params: Vec::new(),
+                },
+                None,
+                "tinycloud.sql/schema".to_string(),
+            )
+            .await;
+        assert!(matches!(write, Err(SqlError::Unavailable)), "{write:?}");
+        assert_eq!(
+            database_artifact::Entity::find()
+                .all(&db)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "nothing stored for the refused write"
+        );
     }
 
     #[test]

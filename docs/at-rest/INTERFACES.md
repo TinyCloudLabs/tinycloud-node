@@ -1,9 +1,9 @@
 # Encryption at rest: interfaces (TC-887)
 
 > **Status (TC-887):** the envelope, key types, `DataKeyProvider`, the keyring
-> (`at_rest::keyring`), the node wiring (`docs/at-rest-escrow.md`) and the storage view
-> (`at_rest::{AtRestMode, AtRestView, AtRestSource}`) are in. Sealed KV storage (§7) and sealed
-> SQL artifacts follow; until both seal, the node refuses `encrypt` and `strict`.
+> (`at_rest::keyring`), the node wiring (`docs/at-rest-escrow.md`), the storage view
+> (`at_rest::{AtRestMode, AtRestView, AtRestSource}`) and sealed SQL artifacts (§8) are in.
+> Sealed KV storage (§7) follows; until both seal, the node refuses `encrypt` and `strict`.
 
 Normative interface and format for `tinycloud_core::at_rest` and the node's sealed KV block
 storage. Plan: TC-887 (encryption at rest inside the TEE). Key continuity and escrow:
@@ -354,3 +354,43 @@ redacted.
   stored bytes at boot like a stage in a space directory.
 - **Reserved names:** The key-continuity key mirror lives under `_tc/` in the block bucket (`datadir/at-rest` on
   FS). The block boot scan skips it.
+
+## 8. SQL artifacts
+Every durable SQL and DuckDB byte is a `database_artifact` row: `payload` (the checkpoint) and
+`delta_payload` (the WAL delta). `SeaOrmDatabaseArtifactRepository` seals and opens them; it
+reads a fresh `AtRestView` per operation (`with_at_rest`), and the node's repository declares
+`SealPath::SqlArtifacts`.
+- **Columns:** `payload_encoding` and `delta_encoding` (SMALLINT, `NULL` = legacy plaintext; §5),
+  migration `m20261107_010000_artifact_payload_encoding`. Each is written with its part: a full
+  save sets `payload_encoding` and clears the delta with its `delta_encoding`; a delta save sets
+  `delta_encoding` only, so a legacy checkpoint can carry a sealed delta.
+- **Plaintext metadata:** `size_bytes`, `checkpoint_size_bytes`, `delta_size_bytes` and the three
+  content hashes stay those of the plaintext database file. They are part of the identity (§4),
+  and quota (`SqlSizes`) and the SQL growth check read them unchanged. Accepted residual: as
+  before, anyone who can read the table sees each database's size and content hash.
+- **Identity:** checkpoint `SqlCheckpoint { service, space, name, checkpoint_content_hash,
+  checkpoint_size_bytes }`; delta `SqlWal { service, space, name, revision, checkpoint_content_hash,
+  delta_content_hash }`, where `revision` is the row revision the delta was written at (always the
+  row's current revision). A part moved to another row, space, name, revision or checkpoint is
+  an integrity failure.
+- **Stored length and reads:** a TCE1 part stores `ciphertext_len(size)` bytes. The streamed read
+  slices the stored bytes (`substr`, 4 MiB) and opens them one 64 KiB segment at a time
+  (`SegmentOpener`); the content hashes are checked over the plaintext, and sinks receive
+  plaintext, so the cache sink still checks the SQLite/DuckDB file header. At most one segment is
+  buffered beyond what the sink keeps.
+- **Writes:** mode `off` stores plaintext exactly as before. Any other mode seals with
+  `provider.current_key(space)` or fails (`AtRestUnavailable`), never plaintext. `current_key`
+  runs before the SQLite writer lock, since it may create the space's key; sealing runs in
+  `spawn_blocking`.
+- **Errors:** keys locked, missing or the encrypt gate closed → 503 (`SqlError::Unavailable`,
+  `DuckDbError::Unavailable`). `UnknownKey`, a malformed header, a header length that disagrees
+  with the row, and any AEAD failure → 500 integrity; `Unsupported` (header or column `2..=9`) →
+  500 "upgrade the node"; a legacy part in `strict` → 500. A sealed part whose column says `NULL`
+  fails the plaintext hash; it is never served.
+- **Offline tool:** `tinycloud-sql-identity offline-fingerprint` has no keys and refuses sealed
+  rows (`database_migration::offline_inventory` takes the provider).
+- **Rollback:** a build without this change ignores the columns. It cannot hydrate a sealed part
+  (the file-header check fails), and a full save it makes over a sealed row without reading it
+  (DuckDB `import_db`) leaves `payload_encoding = 1` on plaintext, which this build then refuses
+  as integrity. Roll back below this change only with no sealed rows; a row an older build
+  overwrote that way needs its `payload_encoding` set back to `NULL`.

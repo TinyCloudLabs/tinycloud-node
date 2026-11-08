@@ -34,6 +34,7 @@ pub mod m20261022_000000_encryption_network_key;
 pub mod m20261023_010000_kv_orphan_candidates;
 pub mod m20261026_000000_kv_write_space_value_index;
 pub mod m20261107_000000_at_rest_keys;
+pub mod m20261107_010000_artifact_payload_encoding;
 
 pub struct Migrator;
 
@@ -76,6 +77,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261023_010000_kv_orphan_candidates::Migration),
             Box::new(m20261026_000000_kv_write_space_value_index::Migration),
             Box::new(m20261107_000000_at_rest_keys::Migration),
+            Box::new(m20261107_010000_artifact_payload_encoding::Migration),
         ]
     }
 }

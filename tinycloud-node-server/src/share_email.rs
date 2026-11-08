@@ -2931,6 +2931,8 @@ mod tests {
             delta_payload: Set(None),
             delta_content_hash: Set(None),
             delta_size_bytes: Set(0),
+            payload_encoding: Set(None),
+            delta_encoding: Set(None),
         }
         .insert(&conn)
         .await

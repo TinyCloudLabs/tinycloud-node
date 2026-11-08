@@ -456,6 +456,25 @@ proptest! {
     }
 
     #[test]
+    fn pushed_slices_open_like_the_whole_buffer(
+        len in edge_len(),
+        seed: u64,
+        sizes in prop::collection::vec(1usize..70_000, 1..6),
+    ) {
+        let k = key(2, 5);
+        let h = hash(b"push");
+        let pt = bytes(len, seed);
+        let ct = seal(&k, &kv(&h), pt.clone()).unwrap();
+        prop_assert_eq!(push_open(&k, &kv(&h), &ct, &sizes).unwrap(), pt);
+        // Cut short anywhere, or one byte too long, it never opens.
+        let cut = (seed as usize) % ct.len();
+        prop_assert!(push_open(&k, &kv(&h), &ct[..cut], &sizes).is_err());
+        let mut long = ct.clone();
+        long.push(0);
+        prop_assert!(push_open(&k, &kv(&h), &long, &sizes).is_err());
+    }
+
+    #[test]
     fn length_inverse(p in 0u64..(1u64 << 44), c in 0u64..(1u64 << 44)) {
         prop_assert_eq!(plaintext_len(ciphertext_len(p).unwrap()), Some(p));
         if let Some(q) = plaintext_len(c) {
@@ -505,6 +524,32 @@ proptest! {
         prop_assert!(open(&k, &kv(&h), ct.clone()).is_err());
         prop_assert!(stream_open(&k, &kv(&h), &ct).is_err());
     }
+}
+
+/// Opens `ct` through [`SegmentOpener`], pushing slices of the cycled
+/// `sizes`.
+fn push_open(
+    k: &DataKey,
+    id: &BlobIdentity<'_>,
+    ct: &[u8],
+    sizes: &[usize],
+) -> Result<Vec<u8>, EnvelopeError> {
+    let header = Header::parse(ct)?;
+    let mut opener = SegmentOpener::new(k, id, &header)?;
+    let mut out = Vec::new();
+    let mut rest = &ct[HEADER_LEN..];
+    for size in sizes.iter().cycle() {
+        if rest.is_empty() {
+            break;
+        }
+        let (mut slice, tail) = rest.split_at((*size).min(rest.len()));
+        rest = tail;
+        while let Some(plain) = opener.push(&mut slice)? {
+            out.extend_from_slice(plain);
+        }
+    }
+    opener.finish()?;
+    Ok(out)
 }
 
 #[test]

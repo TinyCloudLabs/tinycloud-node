@@ -104,7 +104,10 @@ async fn race(competitor: Competitor, begin: Begin) -> (Result<(), DbErr>, bool)
         match competitor {
             Competitor::GatedReplayInsert | Competitor::GatedArtifactSave => (
                 crate::node_replay_cache(&node),
-                Box::new(crate::node_artifact_repository(&node)),
+                Box::new(crate::node_artifact_repository(
+                    &node,
+                    &crate::at_rest::AtRestRuntime::new(&crate::config::AtRestConfig::default()),
+                )),
             ),
             _ => (
                 InvocationReplayCache::new(node.connection().clone()),

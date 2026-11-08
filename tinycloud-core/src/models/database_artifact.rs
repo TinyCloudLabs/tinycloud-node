@@ -22,6 +22,11 @@ pub struct Model {
     pub delta_payload: Option<Vec<u8>>,
     pub delta_content_hash: Option<String>,
     pub delta_size_bytes: i64,
+    /// How `payload` is stored: `NULL` legacy plaintext, `1` TCE1
+    /// (`at_rest::PayloadEncoding`).
+    pub payload_encoding: Option<i16>,
+    /// How `delta_payload` is stored, like `payload_encoding`.
+    pub delta_encoding: Option<i16>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
