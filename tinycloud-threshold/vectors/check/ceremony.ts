@@ -97,8 +97,11 @@ function checkDirectory(t: number, n: number, entries: { index: number; did: str
   if (new Set(entries.map(e => e.did)).size !== n) fail('InvalidEncoding');
 }
 /** §3.0 genesis budget: n >= 2t-1 (t-1 faulty members) or exactly 3-of-4 (one faulty member). */
+export function isGenesisShape(t: number, n: number): boolean {
+  return n >= 2 * t - 1 || (t === 3 && n === 4);
+}
 export function checkGenesisShape(t: number, n: number) {
-  if (n < 2 * t - 1 && !(t === 3 && n === 4)) fail('UnsupportedFaultBudget');
+  if (!isGenesisShape(t, n)) fail('UnsupportedFaultBudget');
 }
 
 export const KIND = { genesis: 1, reshare: 2, refresh: 3, rekey: 4 } as const;

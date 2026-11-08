@@ -1,6 +1,7 @@
 import { ed25519 } from '@noble/curves/ed25519.js';
 import { bls12_381 as bls } from '@noble/curves/bls12-381.js';
 import { Reader, ProtocolError, be, bytes, concat, hex, lp, tagged, g2, decodeRequest, decodeShare, contextDigest, requestDigest, signingPreimage, verifyShare, type Bytes, type G2, type Keyset } from './protocol.ts';
+import { isGenesisShape } from './ceremony.ts';
 
 export const CERT_TAGS = {
   activation: 'TC-THRESHOLD-V1-ACTIVATE', ceremony: 'TC-THRESHOLD-V1-CEREMONY-AUTH',
@@ -95,7 +96,7 @@ export function decodeCertificate(encoded: Bytes): CertificateBody {
     const c: CertificateBody = { network, owner, rekey, epoch, genesisThreshold, threshold, members, mpk, commitments, transcript: r.take(32), previous: readOption(r, 32), previousMpk: readOption(r, 96) };
     r.end();
     g2(mpk); commitments.forEach(p => g2(p, true)); g2(commitments[threshold - 1]!);
-    if (!equal(mpk, commitments[0]!) || (!c.previous && (c.previousMpk || epoch !== 0n || rekey !== 0n || genesisThreshold !== threshold || n < 2 * threshold - 1))) throw new ProtocolError('InvalidEncoding');
+    if (!equal(mpk, commitments[0]!) || (!c.previous && (c.previousMpk || epoch !== 0n || rekey !== 0n || genesisThreshold !== threshold || !isGenesisShape(threshold, n)))) throw new ProtocolError('InvalidEncoding');
     publicShares(c);
     if (!equal(encodeCertificate(c), encoded)) throw new ProtocolError('InvalidEncoding');
     return c;
@@ -115,7 +116,7 @@ export function verifyCertificate(encoded: Bytes, signature: Bytes, anchor: Anch
     const p = previous.body;
     if (previous.anchor.owner !== anchor.owner || previous.anchor.network !== anchor.network || !c.previous || !equal(c.previous, previous.digest) || p.epoch === MAX_U64 || c.epoch !== p.epoch + 1n) invalid();
     if (c.previousMpk) {
-      if (!equal(c.previousMpk, p.mpk) || equal(c.mpk, p.mpk) || p.rekey === MAX_U64 || c.rekey !== p.rekey + 1n || c.genesisThreshold !== c.threshold || c.members.length < 2 * c.threshold - 1) invalid();
+      if (!equal(c.previousMpk, p.mpk) || equal(c.mpk, p.mpk) || p.rekey === MAX_U64 || c.rekey !== p.rekey + 1n || c.genesisThreshold !== c.threshold || !isGenesisShape(c.threshold, c.members.length)) invalid();
     } else if (!equal(c.mpk, p.mpk) || c.rekey !== p.rekey || c.genesisThreshold !== p.genesisThreshold) invalid();
   }
   return { body: c, encoded, signature, digest, ownerPreimage, anchor: { ...anchor }, keyset: { mpk: g2(c.mpk), publicShares: publicShares(c), context: { network: c.network, rekey: c.rekey, epoch: c.epoch, certificate: digest, threshold: c.threshold, members: c.members.length } } };
@@ -137,11 +138,11 @@ export function authorizeCeremony(encoded: Bytes, signature: Bytes, anchor: Anch
   const c = decodeCeremony(encoded), invalid = () => { throw new ProtocolError('InvalidCeremony'); };
   if (c.owner !== anchor.owner || c.network !== anchor.network) invalid();
   if (c.kind === 1) {
-    if (previous || c.current || c.epoch !== 0n || c.rekey !== 0n || c.recipients.length < 2 * c.threshold - 1) invalid();
+    if (previous || c.current || c.epoch !== 0n || c.rekey !== 0n || !isGenesisShape(c.threshold, c.recipients.length)) invalid();
   } else {
     if (!previous || !c.current || !equal(c.current, previous.digest) || previous.anchor.owner !== anchor.owner || previous.anchor.network !== anchor.network || previous.body.epoch === MAX_U64 || c.epoch !== previous.body.epoch + 1n) invalid();
     if (c.kind === 4) {
-      if (previous!.body.rekey === MAX_U64 || c.rekey !== previous!.body.rekey + 1n || c.recipients.length < 2 * c.threshold - 1) invalid();
+      if (previous!.body.rekey === MAX_U64 || c.rekey !== previous!.body.rekey + 1n || !isGenesisShape(c.threshold, c.recipients.length)) invalid();
     } else if (c.rekey !== previous!.body.rekey) invalid();
   }
   const digest = tagged(CERT_TAGS.ceremony, encoded);
