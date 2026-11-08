@@ -113,11 +113,13 @@ and `--validate-config` fail closed.
 Do not add a key copied only from a DID document, HTTPS response, or `GetKey`
 response. Obtain from Phala the exact witness application ID and key domain,
 the complete dstack `GetKey` result including its `signature_chain`, and the
-KMS root public key/SPKI with its attestation or independently verifiable
-publication. Verify the app-key claim over the returned public key and its
-application ID/domain, then verify the KMS signature over the app-key claim
-using that independently authenticated KMS root. Verify that the resulting
-32-byte Ed25519 public key is the witness DID document's
+KMS root SPKI from `DstackKms.kmsInfo().k256Pubkey`. Authenticate that root
+independently against Phala's attestation or signed publication; do not trust a
+root fetched only from the same unauthenticated endpoint as `GetKey`. Verify
+the app-key claim over the raw returned public key and its application
+ID/domain, then verify the KMS signature over that claim using the
+independently authenticated root. Verify that the resulting 32-byte Ed25519
+public key is the witness DID document's
 `did:web:issuer.credentials.org` verification method, obtained through a
 Phala-attested or RA-TLS-verified channel. Record the evidence and verifier
 output with the rotation change. If Phala cannot provide the app ID/domain,
