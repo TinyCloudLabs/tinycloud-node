@@ -402,6 +402,8 @@ node can fix a CVM whose `allowed_envs` already lists `DSTACK_AUTHORIZED_KEYS`:
   the at-rest TEE checks, which run at boot inside the CVM.
 - Once `AT_REST_ROOT_KEY` is in `allowed_envs` it must be present on every deploy and
   rollback, like every allowed name.
+- Local working files (SQL/DuckDB working and cache files, upload staging, exports) stay
+  plaintext and rely on the CVM's encrypted disk until P1b (TC-2543).
 
 ### `NODE_STATS_READ_TOKEN` (TC-1482): compose hash change
 
