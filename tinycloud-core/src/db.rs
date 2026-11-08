@@ -2458,6 +2458,8 @@ where
         let mut stages = HashMap::new();
         let mut ops = Vec::new();
         let mut write_hashes = HashMap::new();
+        // Spaces whose blocks a `kv/get` reads inside the transaction.
+        let mut read_spaces = Vec::new();
         // for each capability being invoked
         for cap in invocation.0.capabilities.iter() {
             match cap.resource.tinycloud_resource().and_then(|r| {
@@ -2499,6 +2501,7 @@ where
                         version: None,
                     });
                 }
+                Some((space, "kv", "tinycloud.kv/get", _)) => read_spaces.push(space.clone()),
                 _ => {}
             }
         }
@@ -2659,6 +2662,15 @@ where
                     }
                 }
             };
+            // TC-887: a block store with per-space state (at-rest data keys)
+            // prepares the spaces this invocation reads and writes here:
+            // after the preupload transaction authorized it and checked its
+            // spaces are hosted, so a refused request prepares (creates)
+            // nothing, and before any upload, write lock or transaction.
+            // Under those the store only looks keys up (`write_locked`).
+            if self.storage.prepares() {
+                self.prepare_storage::<S>(&read_spaces, &blobs).await?;
+            }
             // TC-1260: protected legacy paths hold their `lock_writer`
             // transaction across upload. Freeze ACK must wait
             // until such an in-flight write commits or aborts. Ordinary paths
@@ -2684,13 +2696,19 @@ where
                 None
             };
             if !blobs.is_empty() {
-                self.persist_registered_blobs::<S>(
+                let persisted = self.persist_registered_blobs::<S>(
                     std::mem::take(&mut stages),
                     &write_hashes,
                     &blobs,
                     upload_deadline,
-                )
-                .await?;
+                );
+                // A protected upload runs under the writer lock and its
+                // transaction: the store makes no key-store writes there.
+                if protected {
+                    crate::at_rest::write_locked(persisted).await?;
+                } else {
+                    persisted.await?;
+                }
             }
             // PG sequence guards are taken after upload. SQLite takes them
             // before its writer mutex and BEGIN. The protected SQLite writer
@@ -2929,6 +2947,44 @@ where
         Ok(generations)
     }
 
+    /// TC-887: let the block store prepare every space a writing invocation
+    /// reads blocks of (`kv/get`, inside its transaction) and writes, before
+    /// the upload, write lock and transaction (see
+    /// [`ImmutableReadStore::prepares`]). Called only after the preupload
+    /// transaction authorized the invocation and found its spaces hosted.
+    ///
+    /// A separate function, not inline in the commit future: see
+    /// [`Self::persist_registered_blobs`].
+    async fn prepare_storage<S>(
+        &self,
+        read_spaces: &[SpaceId],
+        blobs: &[(SpaceId, Hash, i64)],
+    ) -> Result<(), TxStoreError<B, S, K>>
+    where
+        B: ImmutableWriteStore<S> + ImmutableReadStore + ImmutableDeleteStore,
+        S: ImmutableStaging,
+        S::Writable: 'static + Unpin,
+    {
+        let mut read = read_spaces.iter().collect::<Vec<_>>();
+        read.sort_unstable();
+        read.dedup();
+        for space in read {
+            self.storage
+                .prepare_read(space)
+                .await
+                .map_err(TxStoreError::StoreRead)?;
+        }
+        // `blobs` is sorted by space.
+        let mut written = blobs.iter().map(|(space, _, _)| space).collect::<Vec<_>>();
+        written.dedup();
+        for space in written {
+            ImmutableWriteStore::<S>::prepare_write(&self.storage, space)
+                .await
+                .map_err(TxStoreError::StoreWrite)?;
+        }
+        Ok(())
+    }
+
     /// Upload staged KV blobs under their registered generations before any
     /// sequence lock or KV transaction.
     ///
@@ -3008,13 +3064,14 @@ where
         }) {
             match cap {
                 (space, "kv", "tinycloud.kv/get", path) => {
-                    let data =
-                        get_kv(tx, &self.storage, space, path)
-                            .await
-                            .map_err(|e| match e {
-                                EitherError::A(e) => TxStoreError::Tx(e.into()),
-                                EitherError::B(e) => TxStoreError::StoreRead(e),
-                            })?;
+                    // Under the write lock: the store only looks keys up
+                    // here (the space was prepared before the lock).
+                    let data = crate::at_rest::write_locked(get_kv(tx, &self.storage, space, path))
+                        .await
+                        .map_err(|e| match e {
+                            EitherError::A(e) => TxStoreError::Tx(e.into()),
+                            EitherError::B(e) => TxStoreError::StoreRead(e),
+                        })?;
                     if let (Some(limit), Some((_, _, content))) =
                         (options.max_response_bytes, data.as_ref())
                     {
@@ -6518,6 +6575,288 @@ mod test {
             self.inner.cleanup_stages(space, hash, generation).await
         }
     }
+    /// Records, for each storage hook, whether the SQLite writer lock was free
+    /// and whether it ran inside `at_rest::write_locked`:
+    /// (hook, writer lock free, inside `write_locked`).
+    type HookLog = Arc<parking_lot::Mutex<Vec<(&'static str, bool, bool)>>>;
+    #[derive(Clone, Default)]
+    struct LockProbeStore {
+        inner: MemoryStore,
+        lock: Arc<std::sync::OnceLock<Arc<tokio::sync::Mutex<()>>>>,
+        log: HookLog,
+    }
+    impl LockProbeStore {
+        fn record(&self, hook: &'static str) {
+            let free = self.lock.get().expect("lock installed").try_lock().is_ok();
+            let scoped = crate::at_rest::in_write_lock();
+            self.log.lock().push((hook, free, scoped));
+        }
+        fn take(&self) -> Vec<(&'static str, bool, bool)> {
+            std::mem::take(&mut *self.log.lock())
+        }
+    }
+    #[async_trait::async_trait]
+    impl StorageSetup for LockProbeStore {
+        type Error = std::io::Error;
+        async fn create(&self, space: &SpaceId) -> Result<(), Self::Error> {
+            self.inner.create(space).await
+        }
+    }
+    #[async_trait::async_trait]
+    impl ImmutableReadStore for LockProbeStore {
+        type Error = std::io::Error;
+        type Readable = futures::io::Cursor<Vec<u8>>;
+        async fn contains(
+            &self,
+            space: &SpaceId,
+            hash: &Hash,
+            generation: i64,
+        ) -> Result<bool, Self::Error> {
+            self.inner.contains(space, hash, generation).await
+        }
+        fn prepares(&self) -> bool {
+            true
+        }
+        async fn prepare_read(&self, _space: &SpaceId) -> Result<(), Self::Error> {
+            self.record("prepare_read");
+            Ok(())
+        }
+        async fn read(
+            &self,
+            space: &SpaceId,
+            hash: &Hash,
+            generation: i64,
+        ) -> Result<Option<Content<Self::Readable>>, Self::Error> {
+            self.record("read");
+            self.inner.read(space, hash, generation).await
+        }
+        async fn read_range(
+            &self,
+            space: &SpaceId,
+            hash: &Hash,
+            generation: i64,
+            range: crate::storage::ByteRangeSpec,
+        ) -> Result<Option<crate::storage::RangeRead<Self::Readable>>, Self::Error> {
+            self.inner.read_range(space, hash, generation, range).await
+        }
+    }
+    #[async_trait::async_trait]
+    impl ImmutableWriteStore<crate::storage::memory::MemoryStaging> for LockProbeStore {
+        type Error = std::io::Error;
+        async fn prepare_write(&self, _space: &SpaceId) -> Result<(), Self::Error> {
+            self.record("prepare_write");
+            Ok(())
+        }
+        async fn persist(
+            &self,
+            space: &SpaceId,
+            stage: HashBuffer<Vec<u8>>,
+            generation: i64,
+        ) -> Result<Hash, Self::Error> {
+            self.record("persist");
+            self.inner.persist(space, stage, generation).await
+        }
+    }
+    #[async_trait::async_trait]
+    impl ImmutableDeleteStore for LockProbeStore {
+        type Error = std::io::Error;
+        async fn remove(
+            &self,
+            space: &SpaceId,
+            hash: &Hash,
+            generation: i64,
+        ) -> Result<Option<()>, Self::Error> {
+            self.inner.remove(space, hash, generation).await
+        }
+        async fn cleanup_stages(
+            &self,
+            space: &SpaceId,
+            hash: &Hash,
+            generation: i64,
+        ) -> Result<(), Self::Error> {
+            self.inner.cleanup_stages(space, hash, generation).await
+        }
+    }
+
+    /// A node-made invocation of `caps` (`(space, path, ability)`), as
+    /// [`SpaceDatabase::invoke_internal_kv_put`] builds one.
+    fn internal_test_invocation(caps: &[(&SpaceId, &Path, &str)]) -> Invocation {
+        let jwk = JWK::generate_ed25519().unwrap();
+        let did = DID_METHODS.generate(&jwk, "key").unwrap().to_string();
+        let verification_method = format!("{did}#{}", did.rsplit(':').next().unwrap());
+        let delegation = tinycloud_auth::ipld_core::cid::Cid::new_v1(
+            0x55,
+            tinycloud_auth::multihash_codetable::Code::Blake3_256.digest(b"prepare-probe"),
+        );
+        let signed = make_invocation(
+            caps.iter()
+                .map(|(space, path, ability)| {
+                    (
+                        (*space).clone().to_resource(
+                            "kv".parse().unwrap(),
+                            Some((*path).clone()),
+                            None,
+                            None,
+                        ),
+                        vec![ability.parse().unwrap()],
+                    )
+                })
+                .collect::<Vec<_>>(),
+            &delegation,
+            &jwk,
+            &verification_method,
+            (OffsetDateTime::now_utc() + time::Duration::minutes(5)).unix_timestamp() as f64,
+            InvocationOptions {
+                proof: Some(vec![]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let encoded = signed.encode().unwrap().into_bytes();
+        crate::events::SerializedEvent(
+            crate::util::InvocationInfo::try_from(signed).unwrap(),
+            encoded,
+        )
+    }
+
+    /// TC-887 invariant: a block store's own database writes (creating or
+    /// restoring a space's at-rest data key) happen only in `prepare_read`
+    /// and `prepare_write`, which run after the preupload transaction
+    /// authorized the invocation and found its spaces hosted, with the SQLite
+    /// writer lock free and outside `at_rest::write_locked`. Work under the
+    /// writer lock (a `kv/get` in a writing invocation, a protected legacy
+    /// upload) runs inside `write_locked`, where key providers only look keys
+    /// up. A key-store write under the lock would deadlock a SQLite node. A
+    /// refused invocation prepares nothing.
+    #[tokio::test]
+    async fn storage_prepares_spaces_after_authorization_and_before_the_writer_lock() {
+        use crate::storage::memory::MemoryStaging;
+        use futures::io::AsyncWriteExt;
+        let directory = tempfile::tempdir().unwrap();
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("probe.sqlite").display()
+        );
+        let storage = LockProbeStore::default();
+        let db = SpaceDatabase::new(
+            Database::connect(url).await.unwrap(),
+            storage.clone(),
+            StaticSecret::new(vec![0; 32]).unwrap(),
+        )
+        .await
+        .unwrap();
+        let lock = db
+            .sqlite_writer_lock()
+            .expect("a SQLite file node has a writer lock");
+        assert!(storage.lock.set(lock).is_ok());
+        let stage = |bytes: &'static [u8]| async move {
+            let mut stage = HashBuffer::new(Vec::new());
+            stage.write_all(bytes).await.unwrap();
+            stage
+        };
+
+        let unhosted = test_space_id("prepare-probe-unhosted");
+        let refused = db
+            .invoke_internal_kv_put::<MemoryStaging>(
+                unhosted,
+                "probe/value".parse().unwrap(),
+                Metadata(Default::default()),
+                stage(b"refused").await,
+                None,
+            )
+            .await;
+        assert!(
+            matches!(refused, Err(TxStoreError::Tx(TxError::SpaceNotFound))),
+            "an unhosted space is refused"
+        );
+        assert!(
+            storage.take().is_empty(),
+            "a refused invocation prepares nothing"
+        );
+
+        let space = test_space_id("prepare-probe");
+        space::ActiveModel {
+            id: Set(SpaceIdWrap(space.clone())),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+
+        // An ordinary put uploads lock-free, outside `write_locked`.
+        let a: Path = "probe/a".parse().unwrap();
+        let put = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            db.invoke_internal_kv_put::<MemoryStaging>(
+                space.clone(),
+                a.clone(),
+                Metadata(Default::default()),
+                stage(b"a").await,
+                None,
+            ),
+        )
+        .await
+        .expect("kv put must not hang");
+        assert!(put.is_ok());
+        assert_eq!(
+            storage.take(),
+            vec![("prepare_write", true, false), ("persist", true, false)]
+        );
+
+        // A protected legacy put uploads under the writer lock, write-locked.
+        let legacy: Path = "xyz.tinycloud.tinychat/connectors/fireflies/transcript/probe"
+            .parse()
+            .unwrap();
+        db.invoke_internal_kv_put::<MemoryStaging>(
+            space.clone(),
+            legacy,
+            Metadata(Default::default()),
+            stage(b"legacy").await,
+            None,
+        )
+        .await
+        .map_err(|e| e.to_string())
+        .unwrap();
+        assert_eq!(
+            storage.take(),
+            vec![("prepare_write", true, false), ("persist", false, true)]
+        );
+
+        // A get beside a put: the read space is prepared too, and the get
+        // reads under the writer lock, write-locked.
+        let b: Path = "probe/b".parse().unwrap();
+        let invocation = internal_test_invocation(&[
+            (&space, &a, "tinycloud.kv/get"),
+            (&space, &b, "tinycloud.kv/put"),
+        ]);
+        let mut inputs = HashMap::new();
+        inputs.insert(
+            (space.clone(), b.clone()),
+            (Metadata(Default::default()), stage(b"b").await),
+        );
+        let (_, outcomes) = db
+            .invoke_with_options_mode::<MemoryStaging>(
+                invocation,
+                inputs,
+                KvInvokeOptions::default(),
+                InvokeMode::Internal,
+            )
+            .await
+            .map_err(|e| e.to_string())
+            .unwrap();
+        assert!(outcomes
+            .iter()
+            .any(|o| matches!(o, InvocationOutcome::KvRead(Some(_)))));
+        assert_eq!(
+            storage.take(),
+            vec![
+                ("prepare_read", true, false),
+                ("prepare_write", true, false),
+                ("persist", true, false),
+                ("read", false, true),
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn legacy_freeze_ack_waits_for_actual_in_flight_kv_storage_and_commit() {
         use crate::storage::memory::MemoryStaging;
