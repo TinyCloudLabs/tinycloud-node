@@ -733,7 +733,7 @@ cmd_test() {
       rc=4
     elif [[ "$CHECK_OUTCOME" == "${want[$check]}" ]]; then
       if [[ "$CHECK_OUTCOME" == red ]]; then
-        annotate notice "$label RED as expected: $label data is plaintext at rest"
+        annotate notice "$label RED as expected: $label data is not sealed and authenticated at rest"
       else
         annotate notice "$label $kind check GREEN as expected"
       fi
@@ -741,13 +741,13 @@ cmd_test() {
       annotate error "$label $kind check UNEXPECTEDLY PASSED under expect $check=red: the at-rest property holds for $label; expect $check=green and update CI"
       ((rc == 4)) || rc=3
     else
-      annotate error "$label $kind check still RED ($label data is plaintext at rest) but expected $check=green"
+      annotate error "$label $kind check still RED ($label data is not sealed and authenticated at rest) but expected $check=green"
       ((rc == 4)) || rc=3
     fi
   done
   if ((rc == 0)); then
     if [[ "$kind" == red && "${want[kv]}" == red && "${want[sql]}" == red ]]; then
-      annotate notice "RED as expected: both TC-887 RED checks report plaintext at rest (KV and SQL)"
+      annotate notice "RED as expected: both TC-887 RED checks report data not sealed at rest (KV and SQL)"
     else
       annotate notice "$kind checks as expected (kv=${want[kv]}, sql=${want[sql]})"
     fi
