@@ -602,12 +602,25 @@ pub fn resolve_runtime_config(tinycloud_config: &Config) -> Result<Config> {
         .share_email
         .validate_links_fetch_limits()
         .map_err(|error| anyhow::anyhow!(error))?;
-    // TC-887: a missing, malformed or misplaced at-rest root key fails the
-    // preflight, as it would fail the boot. The node root isn't read here.
-    at_rest::Roots::read(&resolved.at_rest, &[], |name| {
-        std::env::var_os(name).map(|v| v.to_string_lossy().into_owned())
-    })?;
     Ok(resolved)
+}
+
+/// The at-rest part of `--validate-config`: the same [`at_rest::check_config`]
+/// the node runs at startup, with the root variables `main` took
+/// ([`at_rest::RootEnv::take`]). It opens no key, database or socket, so the
+/// guest agent counts as absent: with a TEE indicated, at-rest is refused
+/// here, because its TEE checks run only at boot inside the TEE.
+pub fn validate_at_rest(tinycloud_config: &Config, root_env: &at_rest::RootEnv) -> Result<()> {
+    let roots = at_rest::Roots::read(&tinycloud_config.at_rest, &[], root_env)?;
+    at_rest::check_config(
+        &tinycloud_config.at_rest,
+        &roots,
+        at_rest::STORAGE_SEALS_EVERY_WRITE,
+        at_rest::TeeState {
+            indicated: dstack_indication(&tinycloud_config.tee),
+            present: false,
+        },
+    )
 }
 
 /// The named-key routes. Mounted only while `named_keys_v1` is on, so with it
@@ -687,6 +700,9 @@ pub async fn app_with_control(
     tinycloud_config: &Config,
     control: Option<ControlPlaneHandle>,
 ) -> Result<Rocket<Build>> {
+    // TC-887: the at-rest root variables, out of the environment before
+    // anything else reads it (`main` already took them; tests haven't).
+    let root_env = at_rest::RootEnv::for_boot()?;
     let tinycloud_config = resolve_runtime_config(tinycloud_config)?;
     let request_id_origins =
         tracing::RequestIdOrigins::new(&tinycloud_config.log.request_id_first_party_origins)
@@ -975,9 +991,11 @@ pub async fn app_with_control(
         &tinycloud_config.at_rest,
         &tinycloud_config.storage,
         key_setup.as_bytes(),
+        &root_env,
         seed_conn.clone(),
         tinycloud.sqlite_writer_lock(),
         tee_context.as_ref(),
+        dstack_indication(&tinycloud_config.tee),
     )
     .await?;
     at_rest_runtime.spawn_gate_retry(std::time::Duration::from_secs(30));

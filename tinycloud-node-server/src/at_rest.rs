@@ -24,7 +24,7 @@ use std::sync::{Arc, OnceLock};
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use sha2::Digest as _;
-use tinycloud_at_rest_escrow::compose::{AppCompose, RECIPIENTS_ENV, VERIFIED_FP_ENV};
+use tinycloud_at_rest_escrow::compose::{AppCompose, EnvSetting, RECIPIENTS_ENV, VERIFIED_FP_ENV};
 use tinycloud_at_rest_escrow::{Efp, HolderRecipient, RecipientPolicy};
 use tinycloud_core::{
     at_rest::{
@@ -58,6 +58,123 @@ const SSH_KEYS_ENV: &str = "DSTACK_AUTHORIZED_KEYS";
 pub const PRODUCTION_OS_IMAGE_HASHES: &[&str] =
     &["8db40cb23008d6213668b5816702d100b37b859a8a5bfd18d938ae3a1b3715bd"];
 
+/// Whether this build's storage seals every write when at-rest is set up:
+/// both KV block storage and SQL artifacts ([`SealPath`]). `--validate-config`
+/// decides the seal-path refusal from this; startup checks that the seal
+/// paths storage actually declared agree with it.
+pub const STORAGE_SEALS_EVERY_WRITE: bool = false;
+
+/// The root variables as read from the process environment, held only in
+/// zeroizing buffers. Debug is redacted.
+#[derive(Default)]
+pub struct RootEnv {
+    current: Option<Zeroizing<String>>,
+    previous: Option<Zeroizing<String>>,
+}
+
+impl std::fmt::Debug for RootEnv {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RootEnv")
+            .field("current", &self.current.is_some())
+            .field("previous", &self.previous.is_some())
+            .finish()
+    }
+}
+
+/// [`RootEnv::take`] in `main`, before the config loader and any other
+/// thread start; the node takes it from here at boot.
+static STASHED_ROOT_ENV: std::sync::Mutex<Option<RootEnv>> = std::sync::Mutex::new(None);
+
+impl RootEnv {
+    /// Explicit values (tests, and callers that already hold them).
+    pub fn new(current: Option<Zeroizing<String>>, previous: Option<Zeroizing<String>>) -> Self {
+        Self { current, previous }
+    }
+
+    /// Takes [`ROOT_KEY_ENV`] and [`PREVIOUS_ROOT_KEY_ENV`] out of the process
+    /// environment: copies each value into a zeroizing buffer, overwrites the
+    /// environment's own bytes, and unsets the variable, so neither the
+    /// config loader nor `/proc/<pid>/environ` sees it again. With either set,
+    /// it also turns core dumps off for the process (Linux: not dumpable,
+    /// core size limit 0), and refuses if that fails.
+    ///
+    /// Call it before other threads run where possible (`main` does): it
+    /// writes the environment.
+    pub fn take() -> Result<Self> {
+        let env = Self {
+            current: take_var(ROOT_KEY_ENV),
+            previous: take_var(PREVIOUS_ROOT_KEY_ENV),
+        };
+        if env.current.is_some() || env.previous.is_some() {
+            disable_core_dumps()?;
+        }
+        Ok(env)
+    }
+
+    /// Keeps `self` for [`Self::for_boot`].
+    pub fn stash(self) {
+        *STASHED_ROOT_ENV.lock().unwrap_or_else(|p| p.into_inner()) = Some(self);
+    }
+
+    /// The stashed root variables if `main` took them, else [`Self::take`].
+    pub fn for_boot() -> Result<Self> {
+        match STASHED_ROOT_ENV
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        {
+            Some(env) => Ok(env),
+            None => Self::take(),
+        }
+    }
+}
+
+fn take_var(name: &str) -> Option<Zeroizing<String>> {
+    use std::os::unix::ffi::OsStringExt as _;
+    let raw = Zeroizing::new(std::env::var_os(name)?.into_vec());
+    // The environment block holds its own copy: overwrite it, then unset.
+    if let Ok(c_name) = std::ffi::CString::new(name) {
+        // SAFETY: getenv returns NUL-terminated memory owned by the
+        // environment; we only overwrite the value's own bytes before
+        // unsetting it. `main` calls this before other threads start.
+        unsafe {
+            let value = libc::getenv(c_name.as_ptr());
+            if !value.is_null() {
+                std::ptr::write_bytes(value, 0, libc::strlen(value));
+            }
+        }
+    }
+    std::env::remove_var(name);
+    // A value that isn't UTF-8 isn't a key; keep a stand-in that fails to
+    // parse rather than a lossy copy of the bytes.
+    let mut value = Zeroizing::new(String::new());
+    match std::str::from_utf8(&raw) {
+        Ok(text) => value.push_str(text),
+        Err(_) => value.push('\u{fffd}'),
+    }
+    Some(value)
+}
+
+fn disable_core_dumps() -> Result<()> {
+    #[cfg(target_os = "linux")]
+    // SAFETY: plain syscalls on this process with valid arguments.
+    unsafe {
+        ensure!(
+            libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) == 0,
+            "could not turn off core dumps (prctl PR_SET_DUMPABLE)"
+        );
+        let none = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        ensure!(
+            libc::setrlimit(libc::RLIMIT_CORE, &none) == 0,
+            "could not turn off core dumps (RLIMIT_CORE)"
+        );
+    }
+    Ok(())
+}
+
 /// An operator-supplied at-rest root: exactly 32 bytes. Debug is redacted;
 /// only [`Self::fingerprint`] is ever logged.
 pub struct RootKey(Zeroizing<[u8; 32]>);
@@ -65,7 +182,8 @@ pub struct RootKey(Zeroizing<[u8; 32]>);
 impl RootKey {
     /// Standard base64 with padding (44 characters, canonical) of 32 bytes.
     /// A trailing newline is ignored; anything else is refused, as is a key
-    /// of one repeated byte (a placeholder, not a key).
+    /// of one repeated byte (a placeholder, not a key). Decoding and the
+    /// canonical check use fixed zeroizing buffers, no heap copies.
     pub fn parse(value: &str) -> Result<Self> {
         let value = value
             .strip_suffix("\r\n")
@@ -75,17 +193,17 @@ impl RootKey {
             value.len() == 44,
             "must be the standard base64 of exactly 32 bytes (44 characters)"
         );
-        let bytes = Zeroizing::new(
-            base64::decode_config(value, base64::STANDARD)
-                .map_err(|_| anyhow!("is not standard base64"))?,
-        );
-        let key: [u8; 32] = bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| anyhow!("does not decode to exactly 32 bytes"))?;
-        let key = Zeroizing::new(key);
+        // 44 characters decode to at most 33 bytes.
+        let mut decoded = Zeroizing::new([0u8; 33]);
+        let len = base64::decode_config_slice(value, base64::STANDARD, &mut decoded[..])
+            .map_err(|_| anyhow!("is not standard base64"))?;
+        ensure!(len == 32, "does not decode to exactly 32 bytes");
+        let mut key = Zeroizing::new([0u8; 32]);
+        key.copy_from_slice(&decoded[..32]);
+        let mut encoded = Zeroizing::new([0u8; 44]);
+        base64::encode_config_slice(key.as_slice(), base64::STANDARD, &mut encoded[..]);
         ensure!(
-            *base64::encode_config(key.as_slice(), base64::STANDARD) == *value,
+            encoded.as_slice() == value.as_bytes(),
             "is not canonical standard base64"
         );
         ensure!(
@@ -101,8 +219,9 @@ impl RootKey {
 
     /// `hex(SHA-256("tinycloud/at-rest/root-fingerprint/v1" ‖ key))[..16]`:
     /// names the key in logs and `/at-rest/status`, and can be computed
-    /// offline (`(printf '<label>'; base64 -d) | sha256sum`). Reveals
-    /// nothing about a random 32-byte key.
+    /// offline (`(printf '<label>'; base64 -d) | sha256sum`). It identifies a
+    /// key, it doesn't authenticate one, and equal fingerprints show that
+    /// two deployments share a root.
     pub fn fingerprint(&self) -> String {
         let mut h = sha2::Sha256::new();
         h.update(b"tinycloud/at-rest/root-fingerprint/v1");
@@ -126,22 +245,19 @@ pub struct Roots {
 }
 
 impl Roots {
-    /// Reads [`ROOT_KEY_ENV`] and [`PREVIOUS_ROOT_KEY_ENV`] through `env`.
+    /// Parses the root variables taken by [`RootEnv::take`].
     /// Refuses: `root_source = "env"` without a valid key; a malformed value
     /// (never ignored); a root key with `root_source = "escrow"`; a previous
     /// root equal to the current one.
-    pub fn read(
-        config: &AtRestConfig,
-        node_root: &[u8],
-        env: impl Fn(&str) -> Option<String>,
-    ) -> Result<Self> {
-        let read = |name: &str| -> Result<Option<RootKey>> {
-            env(name)
-                .map(|v| RootKey::parse(&v).with_context(|| format!("{name} is invalid")))
+    pub fn read(config: &AtRestConfig, node_root: &[u8], env: &RootEnv) -> Result<Self> {
+        let read = |name: &str, value: &Option<Zeroizing<String>>| -> Result<Option<RootKey>> {
+            value
+                .as_ref()
+                .map(|v| RootKey::parse(v).with_context(|| format!("{name} is invalid")))
                 .transpose()
         };
-        let current = read(ROOT_KEY_ENV)?;
-        let previous = read(PREVIOUS_ROOT_KEY_ENV)?;
+        let current = read(ROOT_KEY_ENV, &env.current)?;
+        let previous = read(PREVIOUS_ROOT_KEY_ENV, &env.previous)?;
         let env_root = match (config.root_source, current) {
             (AtRestRootSource::Env, Some(key)) => Some(key),
             (AtRestRootSource::Env, None) => {
@@ -168,6 +284,72 @@ impl Roots {
     /// The root the keyring seals the ARK under.
     pub fn root<'a>(&'a self, node_root: &'a [u8]) -> &'a [u8] {
         self.env.as_ref().map_or(node_root, RootKey::bytes)
+    }
+}
+
+/// Whether, and why, the node is meant to run in a dstack TEE, and whether
+/// its guest agent answered.
+#[derive(Debug, Clone, Copy)]
+pub struct TeeState<'a> {
+    /// What indicates a TEE (TEE mode, key type, a socket), if anything.
+    pub indicated: Option<&'a str>,
+    /// The guest agent's Info was read (the node has a TEE context).
+    pub present: bool,
+}
+
+/// The at-rest checks that need no key store, database, block store or
+/// guest-agent measurement. Startup runs them before opening the keyring,
+/// and `--validate-config` runs the same function, so the preflight refuses
+/// whatever these refuse at boot. `storage_seals`: whether storage seals
+/// every write (startup: the declared seal paths; validation:
+/// [`STORAGE_SEALS_EVERY_WRITE`]).
+pub fn check_config(
+    config: &AtRestConfig,
+    roots: &Roots,
+    storage_seals: bool,
+    tee: TeeState<'_>,
+) -> Result<()> {
+    let escrow = &config.escrow;
+    if !enabled(config) {
+        ensure!(
+            roots.previous.is_none(),
+            "{PREVIOUS_ROOT_KEY_ENV} is set but at-rest is not configured; remove it"
+        );
+        return Ok(());
+    }
+    if config.mode != AtRestMode::Off && !storage_seals {
+        bail!(
+            "at_rest.mode = \"{}\" is refused: this build's storage has no at-rest seal path, so nothing would be encrypted; use mode = \"off\"",
+            mode_name(config.mode)
+        );
+    }
+    if config.escrow_none && !escrow.recipients.is_empty() {
+        bail!("set at_rest.escrow.recipients or at_rest.escrow_none, not both");
+    }
+    if config.root_source == AtRestRootSource::Env
+        && (config.escrow_none || *escrow != AtRestEscrowConfig::default())
+    {
+        bail!("at_rest.root_source = \"env\" has no escrow: remove at_rest.escrow and at_rest.escrow_none");
+    }
+    if let (Some(hint), false) = (tee.indicated, tee.present) {
+        bail!(
+            "refusing to start: {hint} indicates a dstack TEE, but its guest agent's Info is not available here, so the at-rest TEE checks can't run (they run at boot inside the TEE)"
+        );
+    }
+    if tee.present && config.escrow_none {
+        bail!("at_rest.escrow_none is only for self-hosted Static-root nodes; a TEE node must escrow its key");
+    }
+    if tee.present && escrow.allow_software {
+        bail!("at_rest.escrow.allow_software is refused inside a TEE: escrow holders must use hardware keys");
+    }
+    Ok(())
+}
+
+fn mode_name(mode: AtRestMode) -> &'static str {
+    match mode {
+        AtRestMode::Off => "off",
+        AtRestMode::Encrypt => "encrypt",
+        AtRestMode::Strict => "strict",
     }
 }
 
@@ -430,14 +612,15 @@ impl AtRestSource for AtRestRuntime {
 }
 
 /// Phase two, after migrations ran: open the keyring and run the gate.
-/// `node_root` is the node's own root; the env roots come from the process
-/// environment ([`Roots::read`]).
+/// `node_root` is the node's own root; the env roots come from `root_env`
+/// ([`RootEnv::take`]); `tee_indicated` is what marks this host as a dstack
+/// TEE, if anything.
 ///
 /// Refuses (an error, so the node does not start):
-/// - `mode` other than `off` while storage has no seal path
+/// - everything [`check_config`] refuses (the same checks as
+///   `--validate-config`), with the seal paths storage declared
 ///   ([`AtRestRuntime::declare_seal_path`]);
 /// - a missing, malformed or misplaced root key ([`Roots::read`]);
-/// - `root_source = "env"` together with any escrow setting;
 /// - in a TEE, escrow recipients or a pin that are not literal values in
 ///   the measured compose ([`check_measured_escrow`]), and for
 ///   `root_source = "env"` the checks in [`check_tee_env_root`];
@@ -447,45 +630,35 @@ impl AtRestSource for AtRestRuntime {
 ///
 /// An escrow node that boots **locked** starts anyway, with encryption
 /// unavailable, so two holders can recover it.
+#[allow(clippy::too_many_arguments)]
 pub async fn setup(
     runtime: &AtRestRuntime,
     config: &AtRestConfig,
     storage: &Storage,
     node_root: &[u8],
+    root_env: &RootEnv,
     db: RecoveringConnection,
     sqlite_writer_lock: Option<Arc<tokio::sync::Mutex<()>>>,
     tee: Option<&TeeContext>,
+    tee_indicated: Option<&str>,
 ) -> Result<()> {
     let escrow = &config.escrow;
-    let roots = Roots::read(config, node_root, |name| {
-        std::env::var_os(name).map(|v| v.to_string_lossy().into_owned())
-    })?;
+    let roots = Roots::read(config, node_root, root_env)?;
+    ensure!(
+        runtime.has_seal_path() == STORAGE_SEALS_EVERY_WRITE,
+        "at-rest: the seal paths storage declared don't match this build (STORAGE_SEALS_EVERY_WRITE)"
+    );
+    check_config(
+        config,
+        &roots,
+        runtime.has_seal_path(),
+        TeeState {
+            indicated: tee_indicated,
+            present: tee.is_some(),
+        },
+    )?;
     if !enabled(config) {
-        ensure!(
-            roots.previous.is_none(),
-            "{PREVIOUS_ROOT_KEY_ENV} is set but at-rest is not configured; remove it"
-        );
         return Ok(());
-    }
-    if config.mode != AtRestMode::Off && !runtime.has_seal_path() {
-        bail!(
-            "at_rest.mode = \"{}\" is refused: this build's storage has no at-rest seal path, so nothing would be encrypted; use mode = \"off\"",
-            runtime.mode_name()
-        );
-    }
-    if config.escrow_none && !escrow.recipients.is_empty() {
-        bail!("set at_rest.escrow.recipients or at_rest.escrow_none, not both");
-    }
-    if config.root_source == AtRestRootSource::Env
-        && (config.escrow_none || *escrow != AtRestEscrowConfig::default())
-    {
-        bail!("at_rest.root_source = \"env\" has no escrow: remove at_rest.escrow and at_rest.escrow_none");
-    }
-    if tee.is_some() && config.escrow_none {
-        bail!("at_rest.escrow_none is only for self-hosted Static-root nodes; a TEE node must escrow its key");
-    }
-    if tee.is_some() && escrow.allow_software {
-        bail!("at_rest.escrow.allow_software is refused inside a TEE: escrow holders must use hardware keys");
     }
     // In a TEE every at-rest configuration is checked against the measured
     // compose and, for an env root, the OS image.
@@ -559,11 +732,18 @@ pub async fn setup(
                     reason = %refusal,
                     "at-rest keys unlocked; the escrow gate is not satisfied yet"
                 ),
-                (mode, Ok(_)) => ::tracing::info!(
-                    ?mode,
-                    root_source = runtime.root_source_name(),
-                    "at-rest encryption enabled"
-                ),
+                (mode, Ok(_)) => {
+                    ::tracing::info!(
+                        ?mode,
+                        root_source = runtime.root_source_name(),
+                        "at-rest encryption enabled"
+                    );
+                    if tee.is_none() {
+                        ::tracing::warn!(
+                            "at-rest encryption seals KV blocks and SQL artifacts in external storage; local working, cache, staging and export files stay plaintext on this host (no TEE): protect the data directory, swap and file backups"
+                        );
+                    }
+                }
                 (mode, Err(refusal)) => {
                     bail!("at_rest.mode = {mode:?} is refused: {refusal}")
                 }
@@ -690,8 +870,11 @@ fn measured_compose(app_compose: &str, compose_hash: &str) -> Result<AppCompose>
 /// - the measured compose sets [`ROOT_SOURCE_ENV`] to the literal `env`, so
 ///   the attested compose shows that the at-rest root comes from the
 ///   environment;
-/// - neither root key is a literal in the measured compose (the compose is
-///   public; the keys come only from the encrypted environment);
+/// - every setting of either root key, in every service, is exactly one
+///   plain reference to a variable of the encrypted environment (`${NAME}`,
+///   or `${NAME:?message}` / `${NAME?message}`, which fail when unset): never
+///   a literal, a default or alternate value, a pass-through or anything
+///   else docker compose would expand (the compose is public);
 /// - the measured app-compose does not allow [`SSH_KEYS_ENV`] (SSH into the
 ///   CVM would expose the key);
 /// - the guest agent reports a production OS image
@@ -720,12 +903,21 @@ pub fn check_measured_env_root(app_compose: &str, compose_hash: &str) -> Result<
         _ => bail!("the measured compose must set {ROOT_SOURCE_ENV} to the literal value env"),
     }
     for key in [ROOT_KEY_ENV, PREVIOUS_ROOT_KEY_ENV] {
-        // Interpolated (`${...}`) or absent is what we want; a literal value
-        // would publish the key in the compose.
-        ensure!(
-            !matches!(compose.literal_env(key), Ok(Some(_))),
-            "{key} must come from the encrypted environment, not a literal in the compose"
-        );
+        // A compose this reader can't read is refused, never assumed safe.
+        for setting in compose.env_settings(key).with_context(|| {
+            format!("{key}: the measured compose's environment could not be read")
+        })? {
+            let plain = match &setting {
+                EnvSetting::Value { value, .. } => is_plain_env_reference(value),
+                EnvSetting::FromRuntime { .. } => false,
+            };
+            // The message never quotes the value: it may hold a key.
+            ensure!(
+                plain,
+                "service {:?} must set {key} to a plain reference to the encrypted environment (${{NAME}}); it must come from the encrypted environment, not a literal, a default or a pass-through in the compose",
+                setting.service()
+            );
+        }
     }
     let doc: serde_json::Value = serde_json::from_str(app_compose)?;
     let allows_ssh = doc
@@ -737,6 +929,32 @@ pub fn check_measured_env_root(app_compose: &str, compose_hash: &str) -> Result<
         "the measured app-compose allows {SSH_KEYS_ENV} (SSH into the CVM)"
     );
     Ok(())
+}
+
+/// `${NAME}`, `${NAME:?message}` or `${NAME?message}` and nothing else: one
+/// braced reference to a variable name, with at most an error message for
+/// when it is unset (the message can't expand anything).
+fn is_plain_env_reference(value: &str) -> bool {
+    let Some(inner) = value
+        .strip_prefix("${")
+        .and_then(|rest| rest.strip_suffix('}'))
+    else {
+        return false;
+    };
+    let name_len = inner
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(inner.len());
+    let (name, rest) = inner.split_at(name_len);
+    let valid_name = name
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+    let message = rest.strip_prefix(":?").or_else(|| rest.strip_prefix('?'));
+    valid_name
+        && match message {
+            None => rest.is_empty(),
+            Some(message) => !message.contains(['$', '{', '}']),
+        }
 }
 
 #[cfg(test)]
@@ -821,24 +1039,25 @@ mod tests {
     fn roots_refuse_a_missing_misplaced_or_malformed_key() {
         let node_root = [5u8; 64];
         let env = |pairs: Vec<(&'static str, String)>| {
-            move |name: &str| {
+            let get = |name: &str| {
                 pairs
                     .iter()
                     .find(|(k, _)| *k == name)
-                    .map(|(_, v)| v.clone())
-            }
+                    .map(|(_, v)| Zeroizing::new(v.clone()))
+            };
+            RootEnv::new(get(ROOT_KEY_ENV), get(PREVIOUS_ROOT_KEY_ENV))
         };
         let roots = Roots::read(
             &env_config(),
             &node_root,
-            env(vec![(ROOT_KEY_ENV, key_b64(0))]),
+            &env(vec![(ROOT_KEY_ENV, key_b64(0))]),
         )
         .unwrap();
         assert_eq!(
             roots.root(&node_root),
             RootKey::parse(&key_b64(0)).unwrap().bytes()
         );
-        let roots = Roots::read(&AtRestConfig::default(), &node_root, env(vec![])).unwrap();
+        let roots = Roots::read(&AtRestConfig::default(), &node_root, &env(vec![])).unwrap();
         assert_eq!(roots.root(&node_root), &node_root[..]);
 
         let refused = [
@@ -863,7 +1082,7 @@ mod tests {
         for (config, pairs) in refused {
             let shown = format!("{pairs:?}");
             assert!(
-                Roots::read(&config, &node_root, env(pairs)).is_err(),
+                Roots::read(&config, &node_root, &env(pairs)).is_err(),
                 "{shown}"
             );
         }
@@ -872,7 +1091,7 @@ mod tests {
         let roots = Roots::read(
             &AtRestConfig::default(),
             &node_root,
-            env(vec![(PREVIOUS_ROOT_KEY_ENV, key_b64(0))]),
+            &env(vec![(PREVIOUS_ROOT_KEY_ENV, key_b64(0))]),
         )
         .unwrap();
         assert_eq!(roots.root(&node_root), &node_root[..]);
@@ -890,6 +1109,78 @@ mod tests {
             ),
         }))
         .unwrap()
+    }
+
+    /// An app-compose with the `tinycloud` service (environment `env`) and an
+    /// optional second service (environment `other_env`).
+    fn two_service_compose(env: &str, other_env: Option<&str>) -> String {
+        let digest = "a".repeat(64);
+        let other = other_env.map_or(String::new(), |e| {
+            format!("  other:\n    image: o@sha256:{digest}\n    environment:\n{e}")
+        });
+        serde_json::to_string(&serde_json::json!({
+            "manifest_version": 2,
+            "runner": "docker-compose",
+            "allowed_envs": ["K", "P"],
+            "docker_compose_file": format!(
+                "services:\n  tinycloud:\n    image: n@sha256:{digest}\n    environment:\n{env}{other}"
+            ),
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_root_key_in_the_compose_is_only_ever_a_plain_reference_to_the_encrypted_env() {
+        let source = format!("      {ROOT_SOURCE_ENV}: env\n");
+        // Throwaway values, never real keys.
+        let (k, p) = (key_b64(11), key_b64(12));
+        let accepted = [
+            format!("{source}      {ROOT_KEY_ENV}: ${{K}}\n"),
+            format!("{source}      {ROOT_KEY_ENV}: \"${{K:?seal the key}}\"\n"),
+            format!("{source}      {ROOT_KEY_ENV}: ${{K?seal the key}}\n"),
+            format!(
+                "{source}      {ROOT_KEY_ENV}: ${{K}}\n      {PREVIOUS_ROOT_KEY_ENV}: ${{P}}\n"
+            ),
+            format!("      - {ROOT_SOURCE_ENV}=env\n      - {ROOT_KEY_ENV}=${{K}}\n"),
+        ];
+        for env in &accepted {
+            let doc = two_service_compose(env, None);
+            check_measured_env_root(&doc, &hash(&doc)).unwrap_or_else(|e| panic!("{env:?}: {e:#}"));
+        }
+        let refused = [
+            // A default publishes the real key in the measured compose.
+            (format!("{source}      {ROOT_KEY_ENV}: ${{UNSET:-{k}}}\n"), None),
+            (format!("{source}      {ROOT_KEY_ENV}: ${{UNSET-{k}}}\n"), None),
+            (format!("{source}      {ROOT_KEY_ENV}: ${{K}}\n      {PREVIOUS_ROOT_KEY_ENV}: ${{UNSET:-{p}}}\n"), None),
+            (format!("{source}      {ROOT_KEY_ENV}: ${{K:+{k}}}\n"), None),
+            // Not exactly one braced reference.
+            (format!("{source}      {ROOT_KEY_ENV}: $K\n"), None),
+            (format!("{source}      {ROOT_KEY_ENV}: x${{K}}\n"), None),
+            (format!("{source}      {ROOT_KEY_ENV}: ${{K}}${{P}}\n"), None),
+            (format!("{source}      {ROOT_KEY_ENV}: ${{K:?${{P}}}}\n"), None),
+            // Passed through from the runtime environment, or empty.
+            (format!("{source}      - {ROOT_KEY_ENV}\n"), None),
+            (format!("{source}      {ROOT_KEY_ENV}:\n"), None),
+            // A literal key in a second service.
+            (
+                format!("{source}      {ROOT_KEY_ENV}: ${{K}}\n"),
+                Some(format!("      {ROOT_KEY_ENV}: {k}\n")),
+            ),
+            (
+                format!("{source}      {ROOT_KEY_ENV}: ${{K}}\n"),
+                Some(format!("      {PREVIOUS_ROOT_KEY_ENV}: {p}\n")),
+            ),
+        ];
+        for (env, other) in refused {
+            let doc = two_service_compose(&env, other.as_deref());
+            let err = check_measured_env_root(&doc, &hash(&doc));
+            assert!(err.is_err(), "accepted {env:?} / {other:?}");
+            let shown = format!("{:#}", err.unwrap_err());
+            assert!(
+                !shown.contains(&k) && !shown.contains(&p),
+                "error shows a key: {shown}"
+            );
+        }
     }
 
     #[test]
