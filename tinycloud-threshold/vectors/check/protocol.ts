@@ -36,7 +36,7 @@ export function be(value: bigint, length: number): Bytes {
 }
 function integer(b: Bytes): bigint { return b.length ? BigInt(`0x${hex(b)}`) : 0n; }
 export function lp(b: Bytes): Bytes { return concat(be(BigInt(b.length), 4), b); }
-function equal(a: Bytes, b: Bytes): boolean { return a.length === b.length && a.every((v, i) => v === b[i]); }
+export function equal(a: Bytes, b: Bytes): boolean { return a.length === b.length && a.every((v, i) => v === b[i]); }
 function sha256(b: Bytes): Bytes { return new Uint8Array(createHash('sha256').update(b).digest()); }
 export function tagged(tag: string, body: Bytes): Bytes { return sha256(concat(lp(encoder.encode(tag)), body)); }
 

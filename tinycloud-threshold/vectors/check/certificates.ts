@@ -1,6 +1,7 @@
 import { ed25519 } from '@noble/curves/ed25519.js';
 import { bls12_381 as bls } from '@noble/curves/bls12-381.js';
 import { Reader, ProtocolError, be, bytes, concat, hex, lp, tagged, g2, decodeRequest, decodeShare, contextDigest, requestDigest, signingPreimage, verifyShare, type Bytes, type G2, type Keyset } from './protocol.ts';
+import { isGenesisShape } from './ceremony.ts';
 
 export const CERT_TAGS = {
   activation: 'TC-THRESHOLD-V1-ACTIVATE', ceremony: 'TC-THRESHOLD-V1-CEREMONY-AUTH',
@@ -95,7 +96,7 @@ export function decodeCertificate(encoded: Bytes): CertificateBody {
     const c: CertificateBody = { network, owner, rekey, epoch, genesisThreshold, threshold, members, mpk, commitments, transcript: r.take(32), previous: readOption(r, 32), previousMpk: readOption(r, 96) };
     r.end();
     g2(mpk); commitments.forEach(p => g2(p, true)); g2(commitments[threshold - 1]!);
-    if (!equal(mpk, commitments[0]!) || (!c.previous && (c.previousMpk || epoch !== 0n || rekey !== 0n || genesisThreshold !== threshold || n < 2 * threshold - 1))) throw new ProtocolError('InvalidEncoding');
+    if (!equal(mpk, commitments[0]!) || (!c.previous && (c.previousMpk || epoch !== 0n || rekey !== 0n || genesisThreshold !== threshold || !isGenesisShape(threshold, n)))) throw new ProtocolError('InvalidEncoding');
     publicShares(c);
     if (!equal(encodeCertificate(c), encoded)) throw new ProtocolError('InvalidEncoding');
     return c;
@@ -115,7 +116,7 @@ export function verifyCertificate(encoded: Bytes, signature: Bytes, anchor: Anch
     const p = previous.body;
     if (previous.anchor.owner !== anchor.owner || previous.anchor.network !== anchor.network || !c.previous || !equal(c.previous, previous.digest) || p.epoch === MAX_U64 || c.epoch !== p.epoch + 1n) invalid();
     if (c.previousMpk) {
-      if (!equal(c.previousMpk, p.mpk) || equal(c.mpk, p.mpk) || p.rekey === MAX_U64 || c.rekey !== p.rekey + 1n || c.genesisThreshold !== c.threshold || c.members.length < 2 * c.threshold - 1) invalid();
+      if (!equal(c.previousMpk, p.mpk) || equal(c.mpk, p.mpk) || p.rekey === MAX_U64 || c.rekey !== p.rekey + 1n || c.genesisThreshold !== c.threshold || !isGenesisShape(c.threshold, c.members.length)) invalid();
     } else if (!equal(c.mpk, p.mpk) || c.rekey !== p.rekey || c.genesisThreshold !== p.genesisThreshold) invalid();
   }
   return { body: c, encoded, signature, digest, ownerPreimage, anchor: { ...anchor }, keyset: { mpk: g2(c.mpk), publicShares: publicShares(c), context: { network: c.network, rekey: c.rekey, epoch: c.epoch, certificate: digest, threshold: c.threshold, members: c.members.length } } };
@@ -137,11 +138,11 @@ export function authorizeCeremony(encoded: Bytes, signature: Bytes, anchor: Anch
   const c = decodeCeremony(encoded), invalid = () => { throw new ProtocolError('InvalidCeremony'); };
   if (c.owner !== anchor.owner || c.network !== anchor.network) invalid();
   if (c.kind === 1) {
-    if (previous || c.current || c.epoch !== 0n || c.rekey !== 0n || c.recipients.length < 2 * c.threshold - 1) invalid();
+    if (previous || c.current || c.epoch !== 0n || c.rekey !== 0n || !isGenesisShape(c.threshold, c.recipients.length)) invalid();
   } else {
     if (!previous || !c.current || !equal(c.current, previous.digest) || previous.anchor.owner !== anchor.owner || previous.anchor.network !== anchor.network || previous.body.epoch === MAX_U64 || c.epoch !== previous.body.epoch + 1n) invalid();
     if (c.kind === 4) {
-      if (previous!.body.rekey === MAX_U64 || c.rekey !== previous!.body.rekey + 1n || c.recipients.length < 2 * c.threshold - 1) invalid();
+      if (previous!.body.rekey === MAX_U64 || c.rekey !== previous!.body.rekey + 1n || !isGenesisShape(c.threshold, c.recipients.length)) invalid();
     } else if (c.rekey !== previous!.body.rekey) invalid();
   }
   const digest = tagged(CERT_TAGS.ceremony, encoded);
@@ -153,19 +154,22 @@ export function verifyClosedRound(ceremony: VerifiedCeremony, closure: Bytes, ow
   const context = r.take(32), closedRound = Number(r.int(1)), listHash = r.take(32), prior = r.take(32); r.end();
   if (!equal(context, ceremony.digest) || closedRound !== round || !equal(prior, previous) || previous.length !== 32 || messages.length > 65535) throw new ProtocolError('InvalidCeremony');
   let total = 2;
-  const authenticated = messages.map(message => {
+  // S0.4: reshare/refresh rounds authenticate both signed cohorts and ignore the one outside the round's role
+  // (R1/R3 old dealers, R2 new recipients). Genesis/re-key sign only as recipients.
+  const successor = ceremony.body.kind === 2 || ceremony.body.kind === 3;
+  const role = !successor ? 1 : round === 2 ? 1 : round === 1 || round === 3 ? 2 : undefined;
+  const authenticated = messages.flatMap(message => {
     total += 8 + message.body.length + message.signature.length;
     if (total > 4194304 || message.signature.length > 512) throw new ProtocolError('InvalidEncoding');
     const m = new Reader(message.body); m.version();
     const digest = m.take(32), messageRound = Number(m.int(1)), cohort = Number(m.int(1)), index = Number(m.int(2)), payload = m.field(65536); m.end();
     if (!equal(digest, context) || messageRound !== round || (cohort !== 1 && cohort !== 2)) throw new ProtocolError('InvalidCeremony');
-    const successor = ceremony.body.kind === 2 || ceremony.body.kind === 3;
-    if ((!successor && cohort !== 1) || (successor && ((round === 1 || round === 3) ? cohort !== 2 : round === 2 && cohort !== 1))) throw new ProtocolError('InvalidCeremony');
+    if (!successor && cohort !== 1) throw new ProtocolError('InvalidCeremony');
     const members = cohort === 1 ? ceremony.body.recipients : ceremony.previous?.body.members;
     const member = members?.find(entry => entry.index === index);
     if (!member) throw new ProtocolError('InvalidCeremony');
     if (!signatureValid(keys, member.did, message.signature, tagged(CERT_TAGS.message, message.body))) throw new ProtocolError('InvalidSignature');
-    return { ...message, payload };
+    return role === undefined || cohort === role ? [{ ...message, payload }] : [];
   });
   const ordered = concat(be(BigInt(messages.length), 2), ...messages.flatMap(m => [lp(m.body), lp(m.signature)]));
   if (!equal(tagged(CERT_TAGS.transcript, ordered), listHash)) throw new ProtocolError('InvalidCeremony');
