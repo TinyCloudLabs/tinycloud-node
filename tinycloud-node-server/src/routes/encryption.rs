@@ -781,7 +781,7 @@ fn map_key_service_err(err: EncryptionServiceError) -> (Status, String) {
     }
 }
 
-fn map_service_err(err: EncryptionServiceError) -> (Status, String) {
+pub(crate) fn map_service_err(err: EncryptionServiceError) -> (Status, String) {
     let status = match err {
         EncryptionServiceError::NetworkNotFound => Status::NotFound,
         EncryptionServiceError::NetworkAlreadyExists => Status::Conflict,

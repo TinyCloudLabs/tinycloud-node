@@ -884,7 +884,7 @@ pub(super) struct ShareDecrypt {
 }
 
 impl ShareDecrypt {
-    async fn new() -> anyhow::Result<Self> {
+    pub(super) async fn new() -> anyhow::Result<Self> {
         Self::with_source(Some(TC2192_KEY_PATH), "immutable").await
     }
 
@@ -925,9 +925,11 @@ impl ShareDecrypt {
                 threshold: Threshold::one_of_one(),
             })
             .await?;
+        // A share key is never created by the publisher: it encrypts to the
+        // public key, and the registration below records the key.
         let public_key = if let Some(path) = key_path {
             service
-                .create_key(&KeyLocation::new(&network.network_id, path)?, false)
+                .public_key(&KeyLocation::new(&network.network_id, path)?)
                 .await?
                 .public_encryption_key
         } else {

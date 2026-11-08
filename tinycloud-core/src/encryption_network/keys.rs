@@ -261,6 +261,34 @@ impl EncryptionService {
         }
     }
 
+    /// Records the deterministic key at `loc` inside the caller's write
+    /// transaction, as `key.create` would, for a caller that has already
+    /// authorized it. A missing row is created under the network row lock and
+    /// the key caps; an existing row is left as it is, whatever its state, so a
+    /// blocked key stays blocked. The network must be active. A deletable key
+    /// path is refused: its seed is made only by `key.create`.
+    pub async fn record_deterministic_key_in(
+        &self,
+        tx: &DatabaseTransaction,
+        loc: &KeyLocation,
+    ) -> Result<(), EncryptionServiceError> {
+        if loc.kind() != KeyKind::Deterministic {
+            return Err(EncryptionServiceError::KeyPathInvalid(
+                "only a deterministic key is recorded here".to_string(),
+            ));
+        }
+        let network = network_of(loc)?;
+        match self.create_key_in(tx, &network, loc).await? {
+            CreateStep::Inserted(_) | CreateStep::Existing(_) => Ok(()),
+            // A deterministic row is never reinstalled. The network row lock
+            // (PostgreSQL) or the writer lock (SQLite) serializes key writes,
+            // so a lost insert race means another writer bypassed them.
+            CreateStep::Reinstalled(_) | CreateStep::Raced => {
+                Err(EncryptionServiceError::KeyExists)
+            }
+        }
+    }
+
     async fn create_key_in(
         &self,
         tx: &DatabaseTransaction,

@@ -27,8 +27,8 @@ use tinycloud_auth::{
     resource::{ResourceId, SpaceId},
 };
 use tinycloud_core::{
-    encryption_network::key_id::{self, EncryptionResource},
-    encryption_network::NetworkId,
+    encryption_network::key_id::{self, EncryptionResource, KeyLocation},
+    encryption_network::{EncryptionService, EncryptionServiceError, NetworkId},
     events::{Delegation, SerializedEvent},
     hash::hash,
     keys::StaticSecret,
@@ -2048,6 +2048,7 @@ pub async fn register_policy(
     request: Json<RegisterRequest>,
     runtime: &State<PolicyV3Runtime>,
     tinycloud: &State<crate::TinyCloud>,
+    encryption: &State<EncryptionService>,
 ) -> Result<Json<RegisterResponse>, (Status, String)> {
     let request = request.into_inner();
     let policy_bytes = canonical_json(&request.policy)?;
@@ -2142,8 +2143,10 @@ pub async fn register_policy(
         return Err((Status::Conflict, "policy-registration-conflict".into()));
     }
     // A registration the node already stores answered above. A new one must
-    // bind its content source to one share key.
+    // bind its content source to one share key, which the node records in
+    // the registration's transaction.
     require_bound_content_source(&request.policy)?;
+    let share_key = share_key_location(&request.policy)?;
 
     let now = OffsetDateTime::now_utc();
     let policy_status = initial_status_checkpoint(
@@ -2225,6 +2228,15 @@ pub async fn register_policy(
         roots,
     )
     .await;
+    // The owner was shown above to hold decrypt on this exact key, so the
+    // registration records it; a full key limit refuses the registration.
+    let written = match written {
+        Ok(()) => encryption
+            .record_deterministic_key_in(&txn, &share_key)
+            .await
+            .map_err(share_key_error),
+        Err(err) => Err(err),
+    };
     match written {
         Ok(()) => txn.commit().await.map_err(db_error)?,
         Err(err) => {
@@ -4666,6 +4678,28 @@ fn require_bound_content_source(policy: &Value) -> Result<(), (Status, String)> 
         ));
     }
     Ok(())
+}
+
+/// The share key a new registration's content source names, as
+/// `registration_projections` validated it: `<encryptionNetwork>/<encryptionKeyPath>`.
+fn share_key_location(policy: &Value) -> Result<KeyLocation, (Status, String)> {
+    let source = policy.get("contentSource");
+    let field = |name| source.and_then(|s| s.get(name)).and_then(Value::as_str);
+    let (Some(network), Some(path)) = (field("encryptionNetwork"), field("encryptionKeyPath"))
+    else {
+        return Err((Status::BadRequest, "content-source-invalid".into()));
+    };
+    match key_id::parse(&format!("{network}/{path}")) {
+        Ok(EncryptionResource::Key(loc)) => Ok(loc),
+        _ => Err((Status::BadRequest, "content-source-invalid".into())),
+    }
+}
+
+fn share_key_error(err: EncryptionServiceError) -> (Status, String) {
+    match err {
+        EncryptionServiceError::Db(err) => db_error(err),
+        other => crate::routes::encryption::map_service_err(other),
+    }
 }
 
 fn registration_projections(policy: &Value) -> Result<RegistrationProjections, (Status, String)> {
@@ -12066,3 +12100,7 @@ mod delivery_admission_tests;
 #[cfg(test)]
 #[path = "policy_v3/unbound_source_tests.rs"]
 mod unbound_source_tests;
+
+#[cfg(test)]
+#[path = "policy_v3/share_key_record_tests.rs"]
+mod share_key_record_tests;
