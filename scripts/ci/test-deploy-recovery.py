@@ -310,7 +310,6 @@ class RecoveryTests(unittest.TestCase):
                 at_rest_key = base64.b64encode(secrets.token_bytes(32)).decode()
             if at_rest_key: CANARIES.append(at_rest_key)
             env["PHALA_ENV_AT_REST_ROOT_KEY"] = at_rest_key
-            env["TINYCLOUD_AT_REST_ROOT_KEY"] = at_rest_key
             context = {"github.event_name": event, "github.ref": ref, "job.success": True,
                        **{"inputs." + key: (value == "true" if value in ("true", "false") else value) for key, value in inputs.items()}}
             logs = ""
@@ -697,15 +696,15 @@ class RecoveryTests(unittest.TestCase):
         self.assertNotIn("cvm-deploy", result["events"])
         self.assertEqual(result["compose"], N0)
 
-    def test_named_keys_gate_is_sealed_as_a_literal_flag_beside_the_ssh_keys(self):
+    def test_named_keys_gate_is_sealed_as_a_literal_flag_and_no_ssh_keys(self):
         # TC-1777: the flip is a workflow input, so the sealed file (the only CVM env source)
-        # carries the flag and keeps DSTACK_AUTHORIZED_KEYS on every dispatch.
+        # carries the flag. TC-887: an env at-rest root refuses SSH keys, so none are sealed.
         for value in ("false", "true"):
             with self.subTest(value=value):
                 result = self.run_deploy(changes={"named_keys_v1": value})
                 self.assertTrue(result["success"])
                 self.assertEqual(result["env_names"].count("NAMED_KEYS_V1"), 1)
-                self.assertEqual(result["env_names"].count("DSTACK_AUTHORIZED_KEYS"), 1)
+                self.assertEqual(result["env_names"].count("DSTACK_AUTHORIZED_KEYS"), 0)
                 sealed = {event for event in result["events"] if event.startswith("sealed-named-keys-v1=")}
                 self.assertEqual(sealed, {"sealed-named-keys-v1=" + value})
 
@@ -721,8 +720,12 @@ class RecoveryTests(unittest.TestCase):
 
     def test_at_rest_root_key_other_than_32_bytes_of_base64_is_refused_before_the_file(self):
         good = base64.b64encode(bytes(range(32))).decode()
+        alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+        # The last data character of a canonical 32-byte encoding carries two zero bits; set one.
+        noncanonical = good[:42] + alphabet[alphabet.index(good[42]) | 1] + "="
         for value in ("", "x" * 44, good[:-1], good + "\n", good + "A", base64.urlsafe_b64encode(b"\xfb" * 32).decode(),
-                      base64.b64encode(bytes(31)).decode()):
+                      base64.b64encode(bytes(31)).decode(), base64.b64encode(bytes(32)).decode(),
+                      base64.b64encode(b"\x07" * 32).decode(), noncanonical):
             with self.subTest(length=len(value)):
                 refused = self.run_deploy(at_rest_key=value)
                 self.assertFalse(refused["success"])
