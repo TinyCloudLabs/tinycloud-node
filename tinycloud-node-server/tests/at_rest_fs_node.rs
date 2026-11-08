@@ -4,9 +4,8 @@
 //! An `off` node on the same code stores them as before.
 //!
 //! The node boots `encrypt` only once every store that writes data declares
-//! a seal path (blocks and SQL artifacts), so the `encrypt` tests here are
-//! ignored until the SQL artifact seal path lands; `at_rest_fs_store.rs`
-//! covers the same behaviour below the app meanwhile.
+//! a seal path (blocks and SQL artifacts); `at_rest_fs_store.rs` covers the
+//! same behaviour below the app.
 
 use std::path::{Path as FsPath, PathBuf};
 
@@ -236,7 +235,6 @@ fn values() -> Vec<(String, String)> {
 /// space creates the space's data key, which must happen before the
 /// invocation's write lock and transaction (`prepare_write`), not inside them.
 #[tokio::test]
-#[ignore = "needs the SQL artifact seal path too (TC-887)"]
 async fn an_encrypting_filesystem_node_seals_kv_values_and_serves_plaintext() -> Result<()> {
     tokio::time::timeout(std::time::Duration::from_secs(120), encrypting_node())
         .await
@@ -321,7 +319,6 @@ async fn an_off_node_still_stores_plaintext_under_legacy_names() -> Result<()> {
 /// An invocation the node refuses (spaces it does not host) creates no data
 /// key and no mirror object.
 #[tokio::test]
-#[ignore = "needs the SQL artifact seal path too (TC-887)"]
 async fn a_refused_put_creates_no_data_key_or_mirror_object() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let client = node(dir.path(), json!({"mode": "encrypt", "escrow_none": true})).await?;
@@ -360,7 +357,6 @@ async fn a_refused_put_creates_no_data_key_or_mirror_object() -> Result<()> {
 /// there, is refused by authorization before any key work: no data key and
 /// no mirror object for the space.
 #[tokio::test]
-#[ignore = "needs the SQL artifact seal path too (TC-887)"]
 async fn an_unauthorized_put_to_a_hosted_space_creates_no_data_key() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let client = node(dir.path(), json!({"mode": "encrypt", "escrow_none": true})).await?;
@@ -391,7 +387,6 @@ async fn an_unauthorized_put_to_a_hosted_space_creates_no_data_key() -> Result<(
 /// before the lock, so the request completes instead of waiting on the lock
 /// it holds.
 #[tokio::test]
-#[ignore = "needs the SQL artifact seal path too (TC-887)"]
 async fn a_mixed_read_and_delete_after_losing_the_data_key_row_completes() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let at_rest = json!({"mode": "encrypt", "escrow_none": true});
