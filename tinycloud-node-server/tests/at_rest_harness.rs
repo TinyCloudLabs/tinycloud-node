@@ -29,8 +29,13 @@
 //! exact typed schema, carry no raw key, identity, fingerprint or marker, and
 //! hold key material that authenticates under the harness's Static root (see
 //! [`key_mirror`]).
+//!
+//! The SQL RED check also reads every artifact row cold with keys it
+//! re-derives from its root and the mirrors: the manifest tag and every part
+//! must authenticate, and the parts must decode to a SQLite database holding
+//! exactly the rows written (see [`sql_cold_read_findings`]).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write;
 use std::time::Duration;
 
@@ -2126,6 +2131,45 @@ mod key_mirror {
         policy: Policy,
     ) -> Vec<String> {
         let mut findings = Vec::new();
+        let (arks, docs, keys) = read_snapshot(label, objects, root, spaces, policy, &mut findings);
+        for (what, doc) in &docs {
+            findings.extend(secret_findings(what, doc, &keys.secrets));
+        }
+        for block in blocks {
+            findings.extend(block_secret_findings(label, block, &keys.secrets));
+            findings.extend(salt_findings(label, block, &keys.secrets));
+        }
+        if policy.encrypt {
+            require_mirrors(label, blocks, puts, spaces, &arks, &keys, &mut findings);
+        }
+        findings
+    }
+
+    /// The DEKs of `spaces` whose mirrors in `objects` authenticate under the
+    /// harness's `root`, re-derived as [`check_snapshot`] does (its findings
+    /// are that check's to report).
+    pub fn recover_keys(
+        label: &str,
+        objects: &[ObjectRef],
+        root: &[u8],
+        spaces: &[String],
+        policy: Policy,
+    ) -> Recovered {
+        read_snapshot(label, objects, root, spaces, policy, &mut Vec::new()).2
+    }
+
+    /// Parses and authenticates the `_tc/` objects of one snapshot: the
+    /// ARK documents, every document with its label, and what
+    /// authentication recovered.
+    #[allow(clippy::type_complexity)]
+    fn read_snapshot(
+        label: &str,
+        objects: &[ObjectRef],
+        root: &[u8],
+        spaces: &[String],
+        policy: Policy,
+        findings: &mut Vec<String>,
+    ) -> (Vec<ArkDoc>, Vec<(String, Value)>, Recovered) {
         let mut arks: Vec<ArkDoc> = Vec::new();
         let mut deks: Vec<DekDoc> = Vec::new();
         let mut bundles: Vec<BundleDoc> = Vec::new();
@@ -2166,30 +2210,24 @@ mod key_mirror {
             };
             let (encoded, halves): (&[&str], &[&str]) = match kind {
                 Kind::Ark { generation, ark_id } => {
-                    strict::<StrictArk>(&what, "MirroredArk", object.body, &mut findings);
+                    strict::<StrictArk>(&what, "MirroredArk", object.body, findings);
                     arks.extend(ark_doc(
                         &what,
                         object.key,
                         map,
                         (generation, ark_id),
-                        &mut findings,
+                        findings,
                     ));
                     (&["ark_id", "sealed", "chain"], &[])
                 }
                 Kind::Dek { tag, dek_id } => {
-                    strict::<StrictDek>(&what, "MirroredDek", object.body, &mut findings);
-                    deks.extend(dek_doc(
-                        &what,
-                        object.key,
-                        map,
-                        (tag, dek_id),
-                        &mut findings,
-                    ));
+                    strict::<StrictDek>(&what, "MirroredDek", object.body, findings);
+                    deks.extend(dek_doc(&what, object.key, map, (tag, dek_id), findings));
                     (&["wrapped"], &[])
                 }
                 Kind::Escrow { efp } => {
-                    strict::<StrictBundle>(&what, "EscrowBundle", object.body, &mut findings);
-                    bundles.extend(bundle_doc(&what, object.key, map, efp, &mut findings));
+                    strict::<StrictBundle>(&what, "EscrowBundle", object.body, findings);
+                    bundles.extend(bundle_doc(&what, object.key, map, efp, findings));
                     (
                         &[
                             "ark_id",
@@ -2202,8 +2240,8 @@ mod key_mirror {
                     )
                 }
                 Kind::Record { efp } => {
-                    strict::<StrictRecord>(&what, "VerificationRecord", object.body, &mut findings);
-                    records.extend(record_doc(&what, object.key, map, efp, &mut findings));
+                    strict::<StrictRecord>(&what, "VerificationRecord", object.body, findings);
+                    records.extend(record_doc(&what, object.key, map, efp, findings));
                     (&["efp", "ark_id", "canary_fp", "mac"], &[])
                 }
             };
@@ -2211,26 +2249,9 @@ mod key_mirror {
             docs.push((what, doc));
         }
         let keys = authenticate(
-            label,
-            root,
-            spaces,
-            &arks,
-            &deks,
-            &bundles,
-            &records,
-            &mut findings,
+            label, root, spaces, &arks, &deks, &bundles, &records, findings,
         );
-        for (what, doc) in &docs {
-            findings.extend(secret_findings(what, doc, &keys.secrets));
-        }
-        for block in blocks {
-            findings.extend(block_secret_findings(label, block, &keys.secrets));
-            findings.extend(salt_findings(label, block, &keys.secrets));
-        }
-        if policy.encrypt {
-            require_mirrors(label, blocks, puts, spaces, &arks, &keys, &mut findings);
-        }
-        findings
+        (arks, docs, keys)
     }
 
     /// An authenticated DEK of one space.
@@ -2780,6 +2801,8 @@ struct SqlRun {
     markers: [String; 2],
     /// Bytes of the smaller 64 KiB value; every payload and delta holds one.
     big_len: usize,
+    /// The `probe` rows the writes leave, in `id` order.
+    expected: Vec<String>,
     spaces: Vec<SqlSpace>,
 }
 
@@ -2835,9 +2858,12 @@ async fn sql_run(harness: &Harness) -> Result<SqlRun> {
         sql_reached_postgres(&space)?;
         spaces.push(space);
     }
+    let [big0, big1] = big;
+    let [marker0, marker1] = markers.clone();
     Ok(SqlRun {
         markers,
         big_len,
+        expected: vec![marker0, big0, marker1, big1],
         spaces,
     })
 }
@@ -3048,13 +3074,17 @@ async fn red_kv_blocks_are_sealed_in_minio() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
-#[ignore = "TC-887 RED: plaintext at rest until S3/S4"]
-async fn red_sql_artifacts_are_sealed_in_postgres() -> Result<()> {
-    let harness = Harness::connect().await?;
-    let run = sql_run(&harness).await?;
+/// The findings for each stored `database_artifact` row: the plaintext
+/// heuristics (file magic, markers, compressibility, size floor).
+async fn sql_row_findings(
+    rows: &[database_artifact::Model],
+    markers: &[String],
+    big_len: usize,
+    keys: &dyn tinycloud_core::at_rest::DataKeyProvider,
+    expected: &[String],
+) -> Result<Vec<String>> {
     let mut findings = Vec::new();
-    for row in run.spaces.iter().flat_map(|space| &space.rows) {
+    for row in rows {
         let id = row_id(row);
         if row.payload.starts_with(SQLITE_MAGIC) {
             findings.push(format!(
@@ -3080,7 +3110,7 @@ async fn red_sql_artifacts_are_sealed_in_postgres() -> Result<()> {
             ("delta_payload", row.delta_payload.as_ref()),
         ] {
             let Some(bytes) = bytes else { continue };
-            for marker in &run.markers {
+            for marker in markers {
                 if let Some(offset) = find(bytes, marker.as_bytes()) {
                     findings.push(format!(
                         "{id}.{column} contains the plaintext marker {marker:?} at byte {offset}"
@@ -3091,11 +3121,145 @@ async fn red_sql_artifacts_are_sealed_in_postgres() -> Result<()> {
             check_size_floor(
                 &format!("{id}.{column}"),
                 bytes.len(),
-                run.big_len,
+                big_len,
                 &mut findings,
             );
         }
+        findings.extend(sql_cold_read_findings(row, keys, expected).await?);
     }
+    Ok(findings)
+}
+
+/// An authenticated cold read of one row, as a node hydrating it would,
+/// but with the keys the harness re-derived: every part must be sealed
+/// (TCE1 encodings and a manifest tag), the row must open with
+/// `database_artifacts::open_row` (manifest tag, each part's AEAD and exact
+/// length), and the checkpoint plus WAL must be a SQLite database that
+/// passes `PRAGMA integrity_check` and whose `probe` rows are exactly
+/// `expected` (each harness space holds only the harness database), so a
+/// dropped delta can't pass.
+async fn sql_cold_read_findings(
+    row: &database_artifact::Model,
+    keys: &dyn tinycloud_core::at_rest::DataKeyProvider,
+    expected: &[String],
+) -> Result<Vec<String>> {
+    let id = row_id(row);
+    if row.payload_encoding != Some(1)
+        || (row.delta_payload.is_some() && row.delta_encoding != Some(1))
+        || row.manifest.is_none()
+    {
+        return Ok(vec![format!(
+            "{id} is not sealed at rest (payload_encoding {:?}, delta_encoding {:?}, manifest tag {})",
+            row.payload_encoding,
+            row.delta_encoding,
+            if row.manifest.is_some() { "present" } else { "absent" }
+        )]);
+    }
+    let (checkpoint, wal) =
+        match tinycloud_core::database_artifacts::open_row(row.clone(), Some(keys)).await {
+            Ok(parts) => parts,
+            Err(e) => {
+                return Ok(vec![format!(
+                    "{id}: a cold read with the harness-derived keys does not authenticate: {e}"
+                )])
+            }
+        };
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("cold.db");
+    std::fs::write(&path, &checkpoint)?;
+    if let Some(wal) = &wal {
+        std::fs::write(dir.path().join("cold.db-wal"), wal)?;
+    }
+    let opened = rusqlite::Connection::open(&path).and_then(|db| {
+        let check: String = db.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
+        let mut select = db.prepare("SELECT secret FROM probe ORDER BY id")?;
+        let rows = select
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok((check, rows))
+    });
+    Ok(match opened {
+        Err(e) => vec![format!(
+            "{id}: authenticates, but its checkpoint and WAL are not a readable SQLite database \
+             with the harness's probe table: {e}"
+        )],
+        Ok((check, _)) if check != "ok" => vec![format!(
+            "{id}: authenticates, but PRAGMA integrity_check says {check:?}"
+        )],
+        Ok((_, rows)) if rows != expected => vec![format!(
+            "{id}: authenticates, but holds {} probe row(s), not the {} the harness wrote",
+            rows.len(),
+            expected.len()
+        )],
+        Ok(_) => Vec::new(),
+    })
+}
+
+/// The DEKs the harness re-derived from its root and the mirrors, as the
+/// key provider a cold read opens sealed SQL artifacts with. Read-only:
+/// it never creates a key.
+struct HarnessKeys(BTreeMap<String, Vec<key_mirror::SpaceDek>>);
+
+#[async_trait::async_trait]
+impl tinycloud_core::at_rest::DataKeyProvider for HarnessKeys {
+    async fn current_key(
+        &self,
+        _space: &str,
+    ) -> Result<tinycloud_core::at_rest::DataKey, tinycloud_core::at_rest::DataKeyError> {
+        Err(tinycloud_core::at_rest::DataKeyError::Locked)
+    }
+
+    async fn key(
+        &self,
+        space: &str,
+        dek_id: tinycloud_core::at_rest::DekId,
+    ) -> Result<tinycloud_core::at_rest::DataKey, tinycloud_core::at_rest::DataKeyError> {
+        self.0
+            .get(space)
+            .and_then(|deks| deks.iter().find(|d| d.dek_id == dek_id.get()))
+            .map(|d| tinycloud_core::at_rest::DataKey::new(dek_id, d.key))
+            .ok_or(tinycloud_core::at_rest::DataKeyError::UnknownKey { dek_id })
+    }
+
+    async fn prepare_read(
+        &self,
+        _space: &str,
+    ) -> Result<(), tinycloud_core::at_rest::DataKeyError> {
+        Ok(())
+    }
+
+    fn object_name_key(
+        &self,
+    ) -> Result<tinycloud_core::at_rest::ObjectNameKey, tinycloud_core::at_rest::DataKeyError> {
+        Err(tinycloud_core::at_rest::DataKeyError::Locked)
+    }
+}
+
+#[tokio::test]
+#[ignore = "TC-887 RED: plaintext at rest until S3/S4"]
+async fn red_sql_artifacts_are_sealed_in_postgres() -> Result<()> {
+    let harness = Harness::connect().await?;
+    let run = sql_run(&harness).await?;
+    let rows: Vec<database_artifact::Model> = run
+        .spaces
+        .iter()
+        .flat_map(|space| space.rows.iter().cloned())
+        .collect();
+    // The keys come from the mirrors in the bucket, authenticated under the
+    // harness's own root, never from the node.
+    let control = harness.control_objects().await?;
+    let keys = HarnessKeys(
+        key_mirror::recover_keys(
+            "sql",
+            &object_refs(&control),
+            &harness.root,
+            &harness.known_spaces()?,
+            harness.policy,
+        )
+        .deks,
+    );
+    let mut findings =
+        sql_row_findings(&rows, &run.markers, run.big_len, &keys, &run.expected).await?;
     for a in &run.spaces[0].rows {
         let b = run.spaces[1]
             .rows
@@ -5111,5 +5275,139 @@ fn selftest_base32_secret_before_other_characters() -> Result<()> {
         "a base32 secret before another character was missed:\n{}",
         missed.join("\n")
     );
+    Ok(())
+}
+
+/// A real SQLite database saved as the node saves one, sealed: the artifact
+/// repository in `encrypt` stores a checkpoint holding the first write
+/// (`markers[0]`, `big[0]`), then a WAL delta holding the second. Returns the
+/// stored row and the keys it was sealed under.
+async fn sealed_sql_row(
+    markers: &[String; 2],
+    big: &[String; 2],
+) -> Result<(
+    database_artifact::Model,
+    std::sync::Arc<dyn tinycloud_core::at_rest::DataKeyProvider>,
+)> {
+    use tinycloud_core::{
+        at_rest::{AtRestMode, DataKeyProvider, FixedKeyProvider, TestAtRestSource},
+        database_artifacts::{
+            ArtifactExpectation, DatabaseArtifactRepository, SeaOrmDatabaseArtifactRepository,
+        },
+        RecoveringConnection,
+    };
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("probe.db");
+    let db = rusqlite::Connection::open(&path)?;
+    db.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))?;
+    db.query_row("PRAGMA wal_autocheckpoint = 0", [], |_| Ok(()))?;
+    db.execute(
+        "CREATE TABLE probe (id INTEGER PRIMARY KEY, secret TEXT NOT NULL)",
+        [],
+    )?;
+    let insert = "INSERT INTO probe (secret) VALUES (?1)";
+    db.execute(insert, [&markers[0]])?;
+    db.execute(insert, [&big[0]])?;
+    db.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+    let checkpoint = std::fs::read(&path)?;
+    db.execute(insert, [&markers[1]])?;
+    db.execute(insert, [&big[1]])?;
+    let wal = std::fs::read(dir.path().join("probe.db-wal"))?;
+    drop(db);
+
+    let url = format!("sqlite://{}?mode=rwc", dir.path().join("caps.db").display());
+    let conn = RecoveringConnection::new(Database::connect(url).await?);
+    tinycloud_core::db::migrate(&conn).await?;
+    let keys: std::sync::Arc<dyn DataKeyProvider> =
+        std::sync::Arc::new(FixedKeyProvider::new([7; 32]));
+    let repo = SeaOrmDatabaseArtifactRepository::new(conn.clone()).with_at_rest(
+        TestAtRestSource::new(AtRestMode::Encrypt, true, Some(keys.clone())),
+    );
+    let space = "tinycloud:key:harness-selftest:default";
+    repo.save(
+        "sql",
+        space,
+        SQL_DATABASE,
+        checkpoint,
+        ArtifactExpectation::Absent,
+    )
+    .await?;
+    repo.save_delta("sql", space, SQL_DATABASE, wal, ArtifactExpectation::Any)
+        .await?;
+    let row = database_artifact::Entity::find()
+        .one(&conn)
+        .await?
+        .context("the sealed artifact row")?;
+    ensure!(
+        row.payload_encoding == Some(1) && row.delta_encoding == Some(1),
+        "harness self-test: the fixture row is not sealed"
+    );
+    Ok((row, keys))
+}
+
+/// The SQL check must catch what a payload heuristic can't: a sealed row
+/// whose parts were extended with random bytes, or whose WAL delta was
+/// dropped (delta columns cleared, the unkeyed hash and size reset), still
+/// looks like ciphertext. Each must give the SQL check a finding (RED); the
+/// untouched row gives none.
+#[tokio::test]
+async fn selftest_sql_check_flags_appended_and_omitted_sealed_parts() -> Result<()> {
+    let markers = [marker("SQL-WRITE1"), marker("SQL-WRITE2")];
+    let big = [
+        repeated(&markers[0], BIG_VALUE_LEN),
+        repeated(&markers[1], BIG_VALUE_LEN),
+    ];
+    let big_len = big[0].len().min(big[1].len());
+    let (row, keys) = sealed_sql_row(&markers, &big).await?;
+    let expected = [
+        markers[0].clone(),
+        big[0].clone(),
+        markers[1].clone(),
+        big[1].clone(),
+    ];
+    let findings = sql_row_findings(
+        std::slice::from_ref(&row),
+        &markers,
+        big_len,
+        keys.as_ref(),
+        &expected,
+    )
+    .await?;
+    ensure!(
+        findings.is_empty(),
+        "the untouched sealed row has findings: {findings:?}"
+    );
+    type Edit = fn(&mut database_artifact::Model);
+    let cases: [(&str, Edit); 3] = [
+        ("random bytes appended to the checkpoint", |row| {
+            row.payload.extend(random_bytes(4096))
+        }),
+        ("random bytes appended to the delta", |row| {
+            row.delta_payload
+                .as_mut()
+                .expect("the fixture has a delta")
+                .extend(random_bytes(4096))
+        }),
+        ("the delta dropped", |row| {
+            row.delta_payload = None;
+            row.delta_encoding = None;
+            row.delta_content_hash = None;
+            row.delta_size_bytes = 0;
+            row.content_hash = row.checkpoint_content_hash.clone();
+            row.size_bytes = row.checkpoint_size_bytes;
+            row.storage_mode = "database-blob".into();
+        }),
+    ];
+    for (what, edit) in cases {
+        let mut tampered = row.clone();
+        edit(&mut tampered);
+        let findings =
+            sql_row_findings(&[tampered], &markers, big_len, keys.as_ref(), &expected).await?;
+        ensure!(
+            !findings.is_empty(),
+            "{what}: the SQL check found nothing, so it would report GREEN"
+        );
+        println!("{what}: {findings:?}");
+    }
     Ok(())
 }
