@@ -69,10 +69,10 @@ exits 0 only if every check matches:
 | 4 | a check errored: compile failure, harness failure, a precondition (`harness no-op`/`harness gap`) or a node error, i.e. not a RED finding (per check; wins over 3) |
 
 Defaults: `test green` expects `kv=green,sql=green`. `test red` expects
-`kv=red,sql=red`, or `kv=green,sql=red` if the run was started with
-`TC887_AT_REST_MODE=encrypt` or `strict`, because S3 seals KV before S4 seals
-SQL. When S4 lands, the SQL default flips to green (`default_expect` in
-`harness.sh`). CI runs `test red --expect red` until S3 lands.
+`kv=red,sql=red`, or `kv=green,sql=green` if the run was started with
+`TC887_AT_REST_MODE=encrypt` or `strict` (KV blocks and SQL artifacts both
+seal). CI runs both: a plaintext leg with `--expect red` and an encrypt leg
+(root from the environment) with `--expect green`.
 
 ## At-rest mode
 
@@ -83,11 +83,15 @@ the top of `harness.sh`:
 |---|---|
 | `TC887_AT_REST_MODE` (`off`/`encrypt`/`strict`) | `TINYCLOUD_AT_REST__MODE` |
 | `TC887_AT_REST_ESCROW_NONE` (`true`/`false`: the Static self-host acknowledgement that no escrow exists, plan §5) | `TINYCLOUD_AT_REST__ESCROW_NONE` |
+| `TC887_AT_REST_ROOT_SOURCE` (`escrow`/`env`) | `TINYCLOUD_AT_REST__ROOT_SOURCE`; with `env`, also `TINYCLOUD_AT_REST_ROOT_KEY` from a per-run key in `secrets/at-rest-root-key` |
 
-If either is unset, the harness sets nothing and the node runs its default
-(today: no encryption at rest). Other values are refused before anything
-starts. The simplest encrypting node is the harness's Static root plus
-`TC887_AT_REST_MODE=encrypt TC887_AT_REST_ESCROW_NONE=true`.
+If one is unset, the harness sets nothing for it and the node runs its default
+(no encryption at rest). Other values are refused before anything starts. The
+checks re-derive the key hierarchy from the root the node seals under: the
+Static node root, or with `env` the per-run root key (`TC887_NODE_ROOT_FILE`
+and `TC887_NODE_ROOT_ENCODING` in `harness.env`). Simplest encrypting nodes:
+`TC887_AT_REST_MODE=encrypt` with `TC887_AT_REST_ESCROW_NONE=true`, or with
+`TC887_AT_REST_ROOT_SOURCE=env`.
 
 ## Checks
 
