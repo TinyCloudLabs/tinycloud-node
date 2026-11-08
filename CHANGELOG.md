@@ -4,6 +4,7 @@
 ### Changes
 - Deploys: the workflow supports an explicit, reason-recorded rollback to an earlier released dstack image on the unchanged N0 compose. It checks image labels, release tag, ancestry, and identical migration sources while preserving the normal forward-release guard.
 - A new Policy/v3 registration records the share key its content source names (`share/<shareId>` on the owner's `default` network) in the registration's transaction, so publishing a share needs no `tinycloud.encryption/key.create` grant: the publisher encrypts to the key's public key and registers. A missing key is created at `keyVersion` 1 and counts toward the network's key limit; at the limit the registration answers 403 `key_limit_exceeded` and stores nothing. An existing key keeps its state. The registration now also requires the source's network to exist and be active. Docs: `docs/encryption-named-keys.md`. Details: TC-2525
+- Share-email issuer trust bundles can pin one next key for the same issuer DID during an explicit UTC overlap window. The legacy key stops at `issuerNotAfter`; malformed, duplicate, unbounded or expired overlaps fail startup and `--validate-config`. Existing single-key bundles remain unchanged. This is node-side trust support only: the OpenCredentials witness and js-sdk policy contract must also support key rotation before activation. Older node images reject overlap fields; restore the previous single-key bundle before rollback. See `deploy/share-email/production-trust-bundle-contract.md`.
 
 ## [1.25.17] - 2026-11-03
 

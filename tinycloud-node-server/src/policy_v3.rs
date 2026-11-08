@@ -7604,6 +7604,15 @@ mod tests {
             credential: &Value,
             set: &IssuerSet,
         ) -> Result<VerifiedOpenCredential, (Status, String)> {
+            self.verify_at(credential, set, self.issued + Duration::seconds(30))
+        }
+
+        fn verify_at(
+            &self,
+            credential: &Value,
+            set: &IssuerSet,
+            now: OffsetDateTime,
+        ) -> Result<VerifiedOpenCredential, (Status, String)> {
             let projection = validate_policy_credential_requirement(&self.projection_value)?;
             verify_opencredentials_credential(
                 credential,
@@ -7611,7 +7620,7 @@ mod tests {
                 projection,
                 set,
                 self.holder,
-                self.issued + Duration::seconds(30),
+                now,
             )
         }
 
@@ -7663,6 +7672,134 @@ mod tests {
 
     fn forbidden(code: &str) -> Option<(Status, String)> {
         Some((Status::Forbidden, code.into()))
+    }
+
+    #[test]
+    fn bounded_issuer_overlap_verifies_only_pinned_keys_until_deadline() {
+        let issuer_did = "did:web:issuer.credentials.org";
+        let old_key = keypair();
+        let next_key = keypair();
+        let wrong_key = keypair();
+        let other_did_key = keypair();
+        let old_kid = format!("{issuer_did}#email-signing-key-1");
+        let next_kid = format!("{issuer_did}#email-signing-key-2");
+        let old_issuer = tinycloud_auth::share_email_evidence::IssuerKey::new(
+            issuer_did,
+            "opencredentials.email/v1",
+            1,
+            old_kid.clone(),
+            old_key.public().to_bytes(),
+        );
+        let mut next_config = issuer_config(issuer_did, "email-signing-key-2", &next_key);
+        next_config.not_before = "2099-12-31T23:00:00Z".into();
+        let end = "2100-01-01T00:05:00Z";
+        let old_only = IssuerSet::from_legacy(&old_issuer);
+        let new_only = IssuerSet::load(std::slice::from_ref(&next_config)).unwrap();
+        let overlap = IssuerSet::load_with_legacy_not_after(
+            std::slice::from_ref(&next_config),
+            Some(&old_issuer),
+            Some(end),
+        )
+        .unwrap();
+
+        let issued = parse_time("2100-01-01T00:01:00Z").unwrap();
+        let before_end = parse_time("2100-01-01T00:04:59Z").unwrap();
+        let at_end = parse_time(end).unwrap();
+        let old_fixture = {
+            let mut fixture = SetFixture::new(issuer_did, Some(&old_kid), DOMAIN_PROFILE);
+            fixture.issued = issued;
+            fixture
+        };
+        let new_fixture = {
+            let mut fixture = SetFixture::new(issuer_did, Some(&next_kid), DOMAIN_PROFILE);
+            fixture.issued = issued;
+            fixture
+        };
+        let old_credential = old_fixture.mint(
+            &old_key,
+            json!({"alg": "EdDSA", "kid": old_kid.clone()}),
+            &old_kid,
+        );
+        let new_credential = new_fixture.mint(
+            &next_key,
+            json!({"alg": "EdDSA", "typ": "vc+sd-jwt", "kid": next_kid.clone()}),
+            &next_kid,
+        );
+
+        assert!(old_fixture
+            .verify_at(&old_credential, &old_only, before_end)
+            .is_ok());
+        assert_eq!(
+            new_fixture
+                .verify_at(&new_credential, &old_only, before_end)
+                .err(),
+            forbidden("credential-issuer-untrusted")
+        );
+        assert!(new_fixture
+            .verify_at(&new_credential, &new_only, before_end)
+            .is_ok());
+        assert_eq!(
+            old_fixture
+                .verify_at(&old_credential, &new_only, before_end)
+                .err(),
+            forbidden("credential-issuer-untrusted")
+        );
+        assert!(old_fixture
+            .verify_at(&old_credential, &overlap, before_end)
+            .is_ok());
+        assert!(new_fixture
+            .verify_at(&new_credential, &overlap, before_end)
+            .is_ok());
+        assert_eq!(
+            old_fixture
+                .verify_at(&old_credential, &overlap, at_end)
+                .err(),
+            forbidden("credential-issuer-stopped")
+        );
+        assert!(new_fixture
+            .verify_at(&new_credential, &overlap, at_end)
+            .is_ok());
+
+        let unknown_kid = format!("{issuer_did}#unknown");
+        let unknown_fixture = SetFixture::new(issuer_did, Some(&unknown_kid), DOMAIN_PROFILE);
+        let unknown = unknown_fixture.mint(
+            &next_key,
+            json!({"alg": "EdDSA", "typ": "vc+sd-jwt", "kid": unknown_kid.clone()}),
+            &unknown_kid,
+        );
+        assert_eq!(
+            unknown_fixture
+                .verify_at(&unknown, &overlap, before_end)
+                .err(),
+            forbidden("credential-issuer-untrusted")
+        );
+
+        let wrong_signature = old_fixture.mint(
+            &wrong_key,
+            json!({"alg": "EdDSA", "kid": old_kid.clone()}),
+            &old_kid,
+        );
+        assert_eq!(
+            old_fixture
+                .verify_at(&wrong_signature, &overlap, before_end)
+                .err(),
+            forbidden("credential-signature-invalid")
+        );
+
+        let other_did = "did:web:other.credentials.org";
+        let other_kid = format!("{other_did}#email-signing-key-1");
+        let other_fixture = SetFixture::new(other_did, Some(&other_kid), DOMAIN_PROFILE);
+        let other_credential = other_fixture.mint(
+            &other_did_key,
+            json!({"alg": "EdDSA", "typ": "vc+sd-jwt", "kid": other_kid.clone()}),
+            &other_kid,
+        );
+        assert_eq!(
+            other_fixture
+                .verify_at(&other_credential, &overlap, before_end)
+                .err(),
+            forbidden("credential-issuer-untrusted")
+        );
     }
 
     #[test]
