@@ -11,8 +11,8 @@ use sea_orm::{
     sea_query::{Expr, Query},
     ActiveModelTrait,
     ActiveValue::Set,
-    ColumnTrait, ConnectionTrait, DatabaseConnection, DbErr, EntityTrait, QueryFilter, QuerySelect,
-    TransactionTrait,
+    ColumnTrait, ConnectionTrait, DatabaseConnection, DbErr, EntityTrait, IdenStatic, Iterable,
+    QueryFilter, QuerySelect, TransactionTrait,
 };
 use sea_orm_migration::SchemaManager;
 use serde::{Deserialize, Serialize};
@@ -284,22 +284,39 @@ async fn fingerprint<C: ConnectionTrait>(
 /// Reads artifact bytes only for an explicitly designated local snapshot.
 /// Production-facing inventory, apply, report, and verify never call this.
 /// A part sealed at rest is opened with `keys`; without them it is refused,
-/// never fingerprinted as ciphertext.
+/// never fingerprinted as ciphertext. `encoded` says whether the snapshot
+/// has the encoding columns; one taken before them holds only plaintext.
 async fn offline_fingerprint<C: ConnectionTrait>(
     conn: &C,
     datadir: &Path,
     service: &str,
     space: &str,
     name: &str,
+    encoded: bool,
     keys: Option<&dyn DataKeyProvider>,
 ) -> Result<Option<ArtifactFingerprint>, MigrationError> {
-    let row = database_artifact::Entity::find_by_id((
+    use database_artifact::Column;
+    let mut select = database_artifact::Entity::find_by_id((
         service.to_owned(),
         space.to_owned(),
         name.to_owned(),
     ))
-    .one(conn)
-    .await?;
+    .select_only()
+    .columns(
+        Column::iter()
+            .filter(|column| !matches!(column, Column::PayloadEncoding | Column::DeltaEncoding)),
+    );
+    for column in [Column::PayloadEncoding, Column::DeltaEncoding] {
+        select = if encoded {
+            select.column(column)
+        } else {
+            select.expr_as(Expr::value(Option::<i16>::None), column.as_str())
+        };
+    }
+    let row = select
+        .into_model::<database_artifact::Model>()
+        .one(conn)
+        .await?;
     let temp = tempfile::tempdir()?;
     let suffix = if service == "sql" { ".db" } else { ".duckdb" };
     let path = temp.path().join(format!("artifact{suffix}"));
@@ -359,6 +376,9 @@ pub async fn offline_inventory(
     keys: Option<&dyn DataKeyProvider>,
 ) -> Result<Vec<InventoryItem>, MigrationError> {
     let mut items = inventory(conn, datadir).await?;
+    let encoded = SchemaManager::new(conn)
+        .has_column("database_artifact", "payload_encoding")
+        .await?;
     for item in &mut items {
         item.offline_fingerprint = offline_fingerprint(
             conn,
@@ -366,6 +386,7 @@ pub async fn offline_inventory(
             &item.service,
             &item.space,
             &item.physical_name,
+            encoded,
             keys,
         )
         .await?;
@@ -1415,6 +1436,7 @@ mod tests {
                 "sql",
                 "space",
                 "sealed",
+                true,
                 Some(keys.as_ref())
             )
             .await
@@ -1422,13 +1444,13 @@ mod tests {
             Some(expected.clone())
         );
         assert!(matches!(
-            offline_fingerprint(&conn, &datadir, "sql", "space", "sealed", None).await,
+            offline_fingerprint(&conn, &datadir, "sql", "space", "sealed", true, None).await,
             Err(MigrationError::SealedArtifact(
                 DatabaseArtifactError::AtRestUnavailable
             ))
         ));
         assert_eq!(
-            offline_fingerprint(&conn, &datadir, "sql", "space", "legacy", None)
+            offline_fingerprint(&conn, &datadir, "sql", "space", "legacy", true, None)
                 .await
                 .unwrap(),
             Some(expected)
