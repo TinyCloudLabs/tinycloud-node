@@ -93,8 +93,10 @@ struct Harness {
     s3: aws_sdk_s3::Client,
     bucket: String,
     pg: DatabaseConnection,
-    /// The node's Static root (`TINYCLOUD_KEYS__SECRET`, base64url): the
-    /// test re-derives the at-rest key hierarchy from it. Never printed.
+    /// The root that seals the at-rest keys: the node's Static root
+    /// (`TINYCLOUD_KEYS__SECRET`, base64url) or, with `root_source = "env"`,
+    /// `TINYCLOUD_AT_REST_ROOT_KEY` (standard base64). The test re-derives
+    /// the at-rest key hierarchy from it. Never printed.
     root: Vec<u8>,
     /// Every space any check signed in to on this harness, one per line.
     spaces_log: std::path::PathBuf,
@@ -122,7 +124,9 @@ impl Harness {
                 state["at_rest"]["mode"].as_str(),
                 Some("encrypt" | "strict")
             ),
-            escrow_none: state["at_rest"]["escrow_none"] == true,
+            // An env root has no escrow either: no bundle or record may exist.
+            escrow_none: state["at_rest"]["escrow_none"] == true
+                || state["at_rest"]["root_source"] == "env",
         };
         let env_file = state["env_file"]
             .as_str()
@@ -170,9 +174,15 @@ impl Harness {
         let root_file = var("TC887_NODE_ROOT_FILE")?;
         let root = std::fs::read_to_string(&root_file)
             .with_context(|| format!("read the node root file {root_file}"))?;
-        // The decode error could quote secret bytes; don't pass it on.
-        let root = base64::decode_config(root.trim(), base64::URL_SAFE_NO_PAD)
-            .map_err(|_| anyhow!("{root_file} does not hold unpadded base64url"))?;
+        // `harness.sh up` names the encoding of the root it wrote. The decode
+        // error could quote secret bytes; don't pass it on.
+        let config = match env.get("TC887_NODE_ROOT_ENCODING").map(String::as_str) {
+            None | Some("base64url") => base64::URL_SAFE_NO_PAD,
+            Some("base64") => base64::STANDARD,
+            Some(other) => bail!("unknown TC887_NODE_ROOT_ENCODING {other:?}"),
+        };
+        let root = base64::decode_config(root.trim(), config)
+            .map_err(|_| anyhow!("{root_file} does not hold the root in its encoding"))?;
         ensure!(
             root.len() >= 32,
             "{root_file}: the node root is shorter than 32 bytes"
