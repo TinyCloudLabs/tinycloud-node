@@ -683,7 +683,7 @@ pub(crate) mod tests {
     #[test]
     fn ceremony_decoding_checks_budget_directory_and_canonical_bytes() {
         let signers = Signers::new();
-        let invalid_budget = signers.body(CeremonyKind::Genesis, Threshold::new(3, 4).unwrap());
+        let invalid_budget = signers.body(CeremonyKind::Genesis, Threshold::new(4, 5).unwrap());
         assert!(matches!(
             AuthorizedCeremony::verify_genesis(
                 &signers.anchor(),
@@ -692,6 +692,13 @@ pub(crate) mod tests {
             ),
             Err(Error::UnsupportedFaultBudget)
         ));
+        let three_of_four = signers.body(CeremonyKind::Genesis, Threshold::new(3, 4).unwrap());
+        assert!(AuthorizedCeremony::verify_genesis(
+            &signers.anchor(),
+            &signers.statement(&three_of_four),
+            &signers
+        )
+        .is_ok());
         let body = signers.body(CeremonyKind::Genesis, Threshold::new(2, 3).unwrap());
         assert_eq!(
             CeremonyStatement::decode(&body.encode()).unwrap().encode(),
