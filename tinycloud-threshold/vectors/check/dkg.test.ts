@@ -6,17 +6,12 @@ import { ed25519Verifier, type RoundRecord, type Statement } from './ceremony.ts
 import {
   ANCHOR, COHORT_DEALERS, COHORT_RECIPIENTS, G2_BASE, H, NETWORK, OWNER, SEEDS, alternateSignature, at, ceremonyBody, code,
   complaints, deal, did, dkgSetup, expectedDkg, feldman, flip, g2hex, nonCanonicalR, nonCanonicalS, pair, pairs, seal, sign,
-  signedCeremony, times, verify, type DkgSetup, type Draft,
+  signedCeremony, times, verify, msg, r6, replace, withDealer, type DkgSetup, type Draft,
 } from './testkit.ts';
 
 function records(s: DkgSetup, rounds: Draft[][] = s.rounds): RoundRecord[] { return seal(s.digest, s.start, rounds).records; }
 function run(s: DkgSetup, rounds: Draft[][] = s.rounds, ceremony: Statement = s.ceremony): DkgOutput {
   return dkgVerifyTranscript(ANCHOR, ceremony, records(s, rounds), verify);
-}
-const msg = (index: number, payload: Bytes): Draft => ({ cohort: COHORT_RECIPIENTS, index, payload });
-/** Replaces sender `index`'s message(s) in round `r` (1-based) with the given drafts. */
-function replace(from: DkgSetup | Draft[][], r: number, index: number, ...drafts: Draft[]): Draft[][] {
-  return (Array.isArray(from) ? from : from.rounds).map((round, k) => k + 1 !== r ? round : [...round.filter(d => d.index !== index), ...drafts]);
 }
 function expectPublic(out: DkgOutput, s: DkgSetup, qual: number[]) {
   const e = expectedDkg(s.dealers, qual, s.n);
@@ -24,19 +19,6 @@ function expectPublic(out: DkgOutput, s: DkgSetup, qual: number[]) {
   expect(out.commitments.map(g2hex)).toEqual(e.commitments);
   expect(g2hex(out.mpk)).toBe(e.commitments[0]!);
   expect(out.publicShares.map(g2hex)).toEqual(e.publicShares);
-}
-/** Every member's R6 with its Pedersen-valid pair for each reconstructed dealer. */
-function r6(s: DkgSetup, dealers: number[], senders = s.dealers.map(d => d.index)): Draft[] {
-  return senders.map(j => msg(j, pairs(dealers.map(i => [i, ...pair(s.dealers[i - 1]!, j)] as const))));
-}
-/** Rebuilds dealer i with explicit coefficient vectors and regenerates its R1 and R4. */
-function withDealer(s: DkgSetup, i: number, a: bigint[], b: bigint[]): DkgSetup {
-  const d = { index: i, a, b, C: a.map((x, k) => times(G2_BASE, x).add(times(H, b[k]!))), A: a.map(x => times(G2_BASE, x)) };
-  const dealers = s.dealers.map(x => x.index === i ? d : x), members = dealers.map(x => x.index);
-  const next = { ...s, dealers };
-  next.rounds = replace(next, 1, i, msg(i, deal(d.C, members, 64, i)));
-  next.rounds = replace(next, 4, i, msg(i, feldman(d.A)));
-  return next;
 }
 
 describe('honest genesis', () => {

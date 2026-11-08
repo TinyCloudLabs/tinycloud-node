@@ -30,7 +30,7 @@ jobs:
   threshold:
     name: threshold (crate, policy, primitive checker)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     env:
       CARGO_TARGET_DIR: target/threshold
       PROPTEST_CASES: "1024"
@@ -61,7 +61,7 @@ jobs:
     - uses: oven-sh/setup-bun@v2
       with:
         bun-version: "1.4.4"
-    - name: Run the independent primitive checker
+    - name: Run the independent vector checker over every committed document
       working-directory: tinycloud-threshold/vectors/check
       run: bun install --frozen-lockfile && bun run check
 

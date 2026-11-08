@@ -5,15 +5,15 @@ import { bytes, type Bytes } from './protocol.ts';
 import { decodeCeremony, decodeCertificate, type RoundRecord, type Statement } from './ceremony.ts';
 import { dkgVerifyTranscript } from './dkg.ts';
 import { reshareVerifyTranscript } from './reshare.ts';
-import { parseTranscriptDocument, recordsOf, statementOf, verifierOf, type DkgFile, type ReshareFile } from './transcripts.ts';
+import { parseCeremonyDocument, recordsOf, statementOf, transcriptKind, verifierOf, type DkgFile, type RekeyFile, type ReshareFile } from './transcripts.ts';
 import { code } from './testkit.ts';
 
 export interface TranscriptInput { ceremony: Statement; certificate?: Statement; records: RoundRecord[] }
 export interface Probe { record: string; field: string; offset: number; mask: number; expected: string; apply: (x: TranscriptInput) => void }
-export type Doc = DkgFile | ReshareFile;
+export type Doc = DkgFile | RekeyFile | ReshareFile;
 export type DocCase = Doc['cases'][number];
 export function loadDoc(file: string): Doc {
-  return parseTranscriptDocument(JSON.parse(readFileSync(new URL(`../v1/${file}`, import.meta.url), 'utf8')));
+  return parseCeremonyDocument(JSON.parse(readFileSync(new URL(`../v1/${file}`, import.meta.url), 'utf8')));
 }
 
 export function inputOf(c: DocCase): TranscriptInput {
@@ -28,9 +28,9 @@ export function clone(x: TranscriptInput): TranscriptInput {
 }
 export function verifyInput(doc: Doc, x: TranscriptInput): string {
   const verify = verifierOf(doc);
-  return code(() => x.certificate
-    ? reshareVerifyTranscript(doc.anchor, x.ceremony, x.certificate, x.records, verify)
-    : dkgVerifyTranscript(doc.anchor, x.ceremony, x.records, verify));
+  return code(() => transcriptKind(doc) === 'reshare'
+    ? reshareVerifyTranscript(doc.anchor, x.ceremony, x.certificate!, x.records, verify)
+    : dkgVerifyTranscript(doc.anchor, x.ceremony, x.records, verify, x.certificate));
 }
 
 function at(record: string, field: string, select: (x: TranscriptInput) => Bytes, offset: number, mask: number, expected: string): Probe {

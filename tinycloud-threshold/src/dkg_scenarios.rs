@@ -1221,4 +1221,3 @@ fn every_within_budget_fault_pattern_finishes_with_identical_outcomes_3of5() {
         }
     }
 }
-
