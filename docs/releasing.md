@@ -381,6 +381,28 @@ a bare HTTPS origin. The preflight also accepts that origin with the
 or CR/LF fails it. The quota steps take only its host and port and
 call billing's fixed `/api/admin/storage-comp/` path; no URL is printed.
 
+### At-rest root from the environment: manual gate (TC-887)
+
+The compose sets `TINYCLOUD_AT_REST__ROOT_SOURCE: env`, and the deploy seals
+`AT_REST_ROOT_KEY` from the `production` secret `PROD_TINYCLOUD_AT_REST_ROOT_KEY`.
+It seals no `DSTACK_AUTHORIZED_KEYS`, because the node refuses to boot with an env
+root while the measured app-compose allows SSH keys. Neither the preflight nor the
+node can fix a CVM whose `allowed_envs` already lists `DSTACK_AUTHORIZED_KEYS`:
+
+- **Before the first deploy of this compose, an operator removes
+  `DSTACK_AUTHORIZED_KEYS` from the CVM's `allowed_envs` at the CVM level (TC-2520).**
+  Until then the deploy fails at the `allowed_envs` check (the sealed file lacks an
+  allowed name), before the CVM is changed. Check it with
+  `phala cvms get tinycloud-node --json | jq .allowed_envs` (or the platform API).
+- The CVM must run a production OS image whose hash the node pins
+  (`PRODUCTION_OS_IMAGE_HASHES` in `tinycloud-node-server/src/at_rest.rs`).
+- The deploy checks the key's format before writing the sealed file (canonical
+  standard base64 of 32 bytes, not all one byte). The preflight's
+  `--validate-config` does not see the key: with a dstack TEE indicated it can't run
+  the at-rest TEE checks, which run at boot inside the CVM.
+- Once `AT_REST_ROOT_KEY` is in `allowed_envs` it must be present on every deploy and
+  rollback, like every allowed name.
+
 ### `NODE_STATS_READ_TOKEN` (TC-1482): compose hash change
 
 `docker-compose.dstack-postgres.yaml` passes the optional bearer for the

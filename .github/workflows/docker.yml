@@ -919,10 +919,6 @@ jobs:
           TINYCLOUD_SHARE_EMAIL__POSTGRES_TLS__SSLMODE: verify-full
           TINYCLOUD_KEYS__TYPE: Dstack
           TINYCLOUD_ENCRYPTION_NETWORK__NAMED_KEYS_V1: ${{ inputs.named_keys_v1 }}
-          # TC-887: the at-rest root the sealed deployment will carry; the
-          # node refuses a missing or malformed key, so the preflight does too.
-          TINYCLOUD_AT_REST__ROOT_SOURCE: env
-          TINYCLOUD_AT_REST_ROOT_KEY: ${{ secrets.PROD_TINYCLOUD_AT_REST_ROOT_KEY }}
         run: |
           set -euo pipefail
           IMAGE="$(sed -n -E 's/^    image: (ghcr.io\/tinycloudlabs\/tinycloud-node(:[^[:space:]]+|@sha256:[0-9a-f]{64}))$/\1/p' docker-compose.dstack-postgres.yaml)"
@@ -947,10 +943,13 @@ jobs:
             -e TINYCLOUD_SHARE_EMAIL__POSTGRES_TLS__SSLMODE \
             -e TINYCLOUD_KEYS__TYPE \
             -e TINYCLOUD_ENCRYPTION_NETWORK__NAMED_KEYS_V1 \
-            -e TINYCLOUD_AT_REST__ROOT_SOURCE \
-            -e TINYCLOUD_AT_REST_ROOT_KEY \
             ${ledger_args[@]+"${ledger_args[@]}"} \
             "${IMAGE}" --validate-config
+          # TC-887: the at-rest root is not passed here. With a dstack TEE
+          # indicated (TINYCLOUD_KEYS__TYPE above) and no guest agent in this
+          # container, --validate-config refuses at-rest: its TEE checks run
+          # only at boot inside the CVM. The key's format is checked in the
+          # deploy step before the sealed file is written.
 
       # TC-959: only env_keys/encrypted_env may change here. Never copy the
       # precedent's raw-response logs or its unguarded compose_hash retry.
@@ -1135,11 +1134,21 @@ jobs:
             exit 1
           fi
 
-          # TC-887: the at-rest root key is the standard base64 of 32 bytes
-          # (44 characters). Refuse anything else before it is written; the
-          # message never contains the value.
+          # TC-887: the at-rest root key is the canonical standard base64 of
+          # 32 bytes (44 characters) that are not all one byte, exactly as the
+          # node requires. Refuse anything else before it is written; the
+          # messages never contain the value.
           if ! [[ "${PHALA_ENV_AT_REST_ROOT_KEY}" =~ ^[A-Za-z0-9+/]{43}=$ ]]; then
             echo "::error::AT_REST_ROOT_KEY must be the standard base64 of 32 bytes"
+            exit 1
+          fi
+          if ! printf '%s' "$PHALA_ENV_AT_REST_ROOT_KEY" | python3 -c '
+          import base64, sys
+          text = sys.stdin.read()
+          key = base64.b64decode(text, validate=True)
+          sys.exit(0 if len(key) == 32 and base64.b64encode(key).decode() == text and len(set(key)) > 1 else 1)
+          ' >/dev/null 2>&1; then
+            echo "::error::AT_REST_ROOT_KEY must be canonical base64 of 32 bytes that are not all the same"
             exit 1
           fi
 
@@ -1194,11 +1203,13 @@ jobs:
             if [ -n "${PHALA_ENV_NODE_STATS_READ_TOKEN:-}" ]; then
               printf 'NODE_STATS_READ_TOKEN=%s\n' "$PHALA_ENV_NODE_STATS_READ_TOKEN"
             fi
-            # SSH public keys authorized on the CVM (checked into the repo,
-            # see dstack-authorized-keys). The Phala Cloud pre-launch script
-            # writes DSTACK_AUTHORIZED_KEYS to /home/root/.ssh/authorized_keys
-            # at boot, enabling `phala ssh tinycloud-node`.
-            printf 'DSTACK_AUTHORIZED_KEYS=%s\n' "$(cat dstack-authorized-keys)"
+            # TC-887: no DSTACK_AUTHORIZED_KEYS. A node with an at-rest root
+            # from the environment refuses to boot when the measured
+            # app-compose allows SSH keys, so this deploy seals none. A CVM
+            # whose allowed_envs still lists DSTACK_AUTHORIZED_KEYS fails the
+            # allowed_envs check below until that name is removed at the CVM
+            # level first (docs/releasing.md, "At-rest root from the
+            # environment: manual gate").
           } > .phala-prod.env
 
           # Validate complete env names/whitelist before any CVM mutation.
