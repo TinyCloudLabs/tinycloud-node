@@ -401,6 +401,10 @@ impl CertificateBody {
     pub fn owner_statement(&self) -> Vec<u8> {
         dst::tagged_hash(dst::CERT_STATEMENT, self.digest().as_bytes()).to_vec()
     }
+    /// Threshold of the genesis or re-key ceremony that created this master key. Details: TC-2223
+    pub fn genesis_t(&self) -> u16 {
+        self.genesis_t
+    }
     /// Ordered node identity directory. Details: TC-2222
     pub fn members(&self) -> &[CertMember] {
         &self.members

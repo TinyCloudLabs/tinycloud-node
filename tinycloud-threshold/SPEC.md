@@ -27,7 +27,7 @@ Section numbers track the approved TinyCloud plan. §§3.1–3.6 are frozen for 
 
 It does not hold beyond that assumption: two colluding members in a 3-of-4 genesis can make every honest check pass while setting a master key they know, which is the construction the n ≥ 2t−1 rule excludes. This two-colluder case is outside the model and is not detected; it is an accepted residual of the 3-of-4 shape. After a genesis completed within the assumption, two members together hold two shares and still cannot derive keys.
 
-**3-of-4 re-key.** Certificate verification (§3.9) and ceremony authorization accept a 3-of-4 re-key under the same one-faulty-member assumption, but a re-key ceremony is not executable yet: the DKG accepts only `genesis` ceremonies and refuses any other kind with `Error::InvalidCeremony`. An executable re-key path is tracked separately.
+**3-of-4 re-key.** A re-key is a fresh genesis-style DKG under an owner-authorized ceremony of kind `re-key` (§3.8 step 6, S0.5 appendix), with the same rounds, rules and fault budget as genesis; a 3-of-4 re-key is therefore accepted under the same one-faulty-member assumption as a 3-of-4 genesis, and every other re-key shape must satisfy the genesis budget above (`Error::UnsupportedFaultBudget` otherwise). The re-key ceremony is pinned to the current certificate, uses no old share and changes mpk; the certificate layer (§3.9) accepts its successor under the re-key lineage rules.
 
 Reshare pins every dealer constant B_i0 to the old public share pk_i before evaluation. For selected old indices D, the weighted constants satisfy Σ λ_i^D·pk_i = mpk. A new cohort need not satisfy the genesis budget; it must still supply t′ valid decryption shares. The complaint/answer extension and deterministic first-t dealer selection are TinyCloud protocol choices; Wong–Wang–Wing assume conforming new receivers.
 
@@ -130,9 +130,9 @@ unwrap(k: &DerivedKey, expected_id, (U, V, W)):
 - **Combine:** context check on every share first (mixed contexts → `CombineError::MixedContexts`; this check is unconditional, independently of the final pairing result). Each share verified individually; duplicates by member counted once; needs ≥ t; uses the t lowest indices. C_j = Σ λ_i^S·c_{j,i}.
 - **Decrypt key:** k = C3 − tsk·C1. Accept only if k ≠ identity and e(k, g2) = e(H1(id), mpk). Returns `DerivedKey { identity, key context digest, k }`. This final check checks the key against id and mpk; context and authorization checks run separately first.
 
-### 3.7 Genesis DKG: GJKR New-DKG (normative; implemented in S0.3)
+### 3.7 Genesis and re-key DKG: GJKR New-DKG (normative; implemented in S0.3, re-key in S0.5)
 
-Preconditions: an `AuthorizedCeremony` of kind `genesis` (§3.8 step 0 applies to genesis too) whose parameters satisfy §3.0's genesis budget (n ≥ 2t−1, or exactly 3-of-4); each member's ceremony-scoped HPKE key from that context. Generators g2 and h in G2.
+Preconditions: an `AuthorizedCeremony` of kind `genesis`, or of kind `re-key` pinned to the current certificate (S0.5 appendix); §3.8 step 0 applies to both. Its parameters satisfy §3.0's genesis budget (n ≥ 2t−1, or exactly 3-of-4); each member's ceremony-scoped HPKE key from that context. Generators g2 and h in G2.
 
 **Rounds.** Every round is a `ClosedRound`: the owner's signed closure over (authorized-ceremony digest, round number, TH of the ordered message list, previous transcript hash). Members process only closed rounds and only messages signed by authorized members for that ceremony and round.
 
@@ -231,7 +231,7 @@ All integer fields below are big-endian. `lp` is u32 length followed by bytes.
 - No S0.1 public decoder consumes a member list; lists introduced in later slices use the §3.2 sorted/count rules.
 - An availability budget counts all unavailable ready signers, including dishonest claims: `q - b >= t′`. All four ready holders in 3-of-4 support one unavailable holder, not two. `WithOutageBudget(0)` is not accepted.
 
-## Implemented surface through S0.4
+## Implemented surface through S0.5
 
 S0.1 implements §§3.1–3.6 and the typed parameters in §3.0. S0.2 adds the authenticated-context boundaries in §3.0, the certificate and fault-proof APIs in §3.9, and the receipt/activation verification in §3.12:
 
@@ -245,6 +245,8 @@ S0.1 implements §§3.1–3.6 and the typed parameters in §3.0. S0.2 adds the a
 S0.3 adds the §3.10 sealed dealings with ceremony-scoped recipient keys and the §3.7 genesis DKG: consume-self member states over owner-closed rounds R1–R6, and `dkg_verify_transcript`, which recomputes the outcome from the raw signed round records. Its byte layouts and deterministic rules are in the S0.3 genesis DKG appendix below.
 
 S0.4 adds the §3.8 redistribution for reshare and refresh: dealer and recipient consume-self states over owner-closed rounds R1–R3, and `reshare_verify_transcript`. The output is a candidate for the successor certificate. Its byte layouts and deterministic rules are in the S0.4 redistribution appendix below.
+
+S0.5 runs the §3.7 DKG under a `re-key` ceremony (`dkg_start` and `dkg_verify_transcript` accept kinds `genesis` and `re-key` and refuse reshare and refresh with `InvalidCeremony`), executes the full genesis → reshare → reshare → refresh → re-key chain with real ceremonies, certificates, readiness receipts and activation, and freezes the chain and re-key vectors described in the S0.5 appendix.
 
 The dealer remains test-only. Durable storage/retirement and node-runtime integration are separate slices. The crate remains an unwired workspace member.
 
@@ -517,3 +519,29 @@ Completion requires the §3.0 owner relay to close each round once and deliver e
 ### In-memory lifecycle
 
 `ReshareDealer` holds g_i until `answer` consumes it. `ReshareReceiving` holds the ceremony recipient key until `complain` consumes it; `ReshareComplained` holds the opened values until `finish` consumes it. Scalars clear their storage on drop and every state has redacted `Debug`. The dealer's `KeyShare`, the caller's RNG state and any durable copies are outside this crate (§3.11).
+
+## S0.5 re-key and chain appendix
+
+### Re-key ceremony
+
+A re-key replaces the master key. It runs the §3.7 GJKR New-DKG unchanged: the S0.3 appendix's payload layouts, deterministic rules, QUAL, R4–R6 extraction and reconstruction, output rules and in-memory lifecycle apply with "genesis" read as "genesis or re-key". Only the authorization and the certificate it produces differ.
+
+**Authorization.** The ceremony is checked against the externally pinned current certificate exactly as every successor is (S0.2 appendix): kind `4`; the current-certificate digest present and equal to the pinned digest; `epoch` the checked successor of the pinned epoch; `rekey` the checked successor of the pinned re-key counter; owner and network equal to the anchor; the owner signature valid. The genesis fault budget of §3.0 (`n >= 2t-1`, or exactly `t = 3, n = 4`) applies to the new threshold, independently of the old one; a shape outside it returns `Error::UnsupportedFaultBudget` before any dealing. The recipient directory is chosen freely by the owner: new members need not be members of the current certificate. A ceremony of kind `genesis` is not a re-key and a re-key statement is not a genesis; each verifier entry point refuses the other with `InvalidCeremony`.
+
+**Participants.** Every member of the directory deals, complains and reconstructs as in genesis; the signed cohort of every member envelope is `1` (recipients). A cohort-`2` envelope is refused, because no current dealer takes part: a re-key uses no old share and no old member is asked to release one. The old generation stays in force until the new certificate is activated (§3.12).
+
+**Initial link.** `H0 = TH("TC-THRESHOLD-V1-DKG-START", authorized_ceremony_digest:32)`, the same label as genesis. The ceremony digest binds the kind, the pinned certificate, both counters and the directory, so a genesis transcript never verifies under a re-key ceremony and a re-key transcript never verifies under a genesis ceremony (`InvalidRound`: the closed round names another ceremony digest).
+
+**Entry points.** `dkg_start` and `dkg_verify_transcript` accept kinds `genesis` and `re-key` and refuse every other kind with `InvalidCeremony`. Redistribution entry points keep refusing re-key with `InvalidCeremony`.
+
+**Output.** The output is a candidate for the successor certificate (S0.2 appendix): `epoch + 1`, `rekey + 1`, `genesis_t = t`, the previous digest, and the previous `mpk` named in the body. An output whose master key equals the pinned master key is refused (the certificate would not be a re-key); the probability of that is negligible. Reshares and refreshes after a re-key preserve the new master key, the new re-key counter and the new `genesis_t`.
+
+### Chain
+
+A chain of generations is: genesis; then any sequence of reshare, refresh and re-key ceremonies, each pinned to the previous generation's activated certificate. After every ceremony: the successor certificate verifies from the pinned predecessor; every candidate binds to it; every t-subset of its shares derives the same key for a record wrapped under the same master key; records wrapped under an earlier master key do not unwrap (`InvalidCiphertext`); the retired generation's shares are refused in the new context (`ContextMismatch` when issuing or verifying, `MixedContexts` when combining, `CandidateMismatch` when bound as a candidate); readiness receipts from every holder and the owner's activation verify under the default all-holders quorum, while `t′` receipts alone, receipts for another candidate and an activation over another receipt set do not.
+
+### Frozen vectors
+
+`vectors/v1/dkg-rekey.json` has the shape of `dkg-genesis.json` with `"spec_sections"` naming `S0.5 re-key appendix`, and each case adds `inputs.current_certificate`, the signed pinned certificate (`body` and `owner_signature`, as in `reshare.json`). The cases mirror the genesis cases under a re-key ceremony; names begin `rekey_` (`insufficient_*` keep their names).
+
+`vectors/v1/chain.json` has one case per generation, in chain order, with operation `chain_step`. A case's inputs are the signed ceremony statement and its digest, the initial transcript link, every owner closure and member message, `previous_certificate` (absent for genesis, otherwise the previous case's `certificate`), the candidate `certificate` (`body` and `owner_signature`), one readiness receipt (`member`, `signature`) per holder, `quorum` `all_holders` and the owner's `activation` statement (`body` is the exact 32-byte activation preimage). The outputs are the recomputed kind, epoch, re-key counter, genesis t, threshold, members, mpk, commitments, public shares, transcript hash, certificate digest, activation preimage and the ceremony outcome (`qual` and `reconstructed` for genesis and re-key, `dealers` for reshare and refresh). A verifier recomputes the ceremony outcome from the transcript (S0.3 or S0.4 rules), rebuilds the certificate body from that outcome and the pinned predecessor, requires it to equal the supplied body byte for byte, verifies the owner signature and lineage (S0.2 appendix), verifies every receipt and the activation, and compares its own results with the outputs; it never takes an output field as input to its decision.
