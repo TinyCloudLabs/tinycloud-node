@@ -2017,3 +2017,51 @@ async fn a_reseal_fails_until_the_mirror_takes_it_and_a_later_boot_converges() {
     let k = open(&db, &mirror, &ROOT, off).await.unwrap();
     assert_eq!(k.state(), KeyringState::Locked);
 }
+
+/// Whether the mirror must take the rows is the mirror's own state, not the
+/// boot's: after a re-seal whose mirror write failed, the database is already
+/// under the new root, and every later boot stays refused while the mirror
+/// still holds rows under another root and can't be rewritten.
+#[tokio::test]
+async fn a_boot_after_a_failed_reseal_stays_refused_until_the_mirror_is_rewritten() {
+    let (db, mirror) = (db().await, Arc::new(MemoryMirror::default()));
+    let k = open(&db, &mirror, &ROOT, unescrowed()).await.unwrap();
+    assert_eq!(k.rotate_ark().await.unwrap(), 2);
+    drop(k);
+    mirror.set_read_only(true);
+    let off = KeyringConfig {
+        require_mirror: false,
+        ..unescrowed()
+    };
+    assert!(matches!(
+        open_with_previous(&db, &mirror, &NEW_ROOT, &ROOT, off.clone()).await,
+        Err(AtRestError::Mirror(_))
+    ));
+    assert_eq!(opening_under(&stored_keys(&db).await, &NEW_ROOT), 2);
+
+    for boot in ["second boot", "third boot"] {
+        match open_with_previous(&db, &mirror, &NEW_ROOT, &ROOT, off.clone()).await {
+            Ok(k) => panic!(
+                "{boot} reported {:?} with the mirror still under the previous root",
+                k.state()
+            ),
+            Err(AtRestError::Mirror(why)) => assert!(why.contains("retry the boot"), "{why}"),
+            Err(e) => panic!("{boot}: unexpected error: {e}"),
+        }
+        assert_eq!(opening_under(&mirrored_keys(&mirror).await, &ROOT), 2);
+    }
+
+    mirror.set_read_only(false);
+    let k = open_with_previous(&db, &mirror, &NEW_ROOT, &ROOT, off.clone())
+        .await
+        .unwrap();
+    assert_eq!(k.state(), KeyringState::Unlocked);
+    drop(k);
+    assert_eq!(opening_under(&mirrored_keys(&mirror).await, &NEW_ROOT), 2);
+    assert_eq!(opening_under(&mirrored_keys(&mirror).await, &ROOT), 0);
+    // Converged: a mirror that can't be written no longer stops a node
+    // whose mirror already holds only rows under its root.
+    mirror.set_read_only(true);
+    let k = open(&db, &mirror, &NEW_ROOT, off).await.unwrap();
+    assert_eq!(k.state(), KeyringState::Unlocked);
+}

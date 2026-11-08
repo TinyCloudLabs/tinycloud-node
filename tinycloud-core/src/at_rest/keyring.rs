@@ -53,8 +53,9 @@ pub struct KeyringConfig {
     /// once keys may seal data (mode other than `off`); with it false, a
     /// mirror that can't be written is logged and the database alone serves,
     /// so mirror contents never stop a node that encrypts nothing. A boot
-    /// that re-seals stored ARK rows under this root needs the mirror either
-    /// way.
+    /// that re-seals stored ARK rows under this root, or that finds a
+    /// mirrored ARK object not sealed under this root, needs the mirror
+    /// either way.
     pub require_mirror: bool,
     /// `at_rest.escrow.allow_resplit_before_verify`: let a holder change
     /// replace the root key at boot, but only while nothing is pinned, no
@@ -650,11 +651,12 @@ impl AtRestKeyring {
     /// under `root` but do open under `previous_root`, every ARK generation
     /// is re-sealed under `root` (database rows in one transaction, then the
     /// mirror) and the keys unlock. If the mirror can't take the re-sealed
-    /// rows the boot fails, whatever `require_mirror` says; retrying under
-    /// `root` finishes it. Nothing below the ARK changes: chains, DEK wraps
-    /// and object names stay as they are. Rows that already open under
-    /// `root` ignore `previous_root`; rows that open under neither leave the
-    /// node locked.
+    /// rows the boot fails, whatever `require_mirror` says, and so does every
+    /// later boot while the mirror still holds them under another root;
+    /// a boot under `root` with a writable mirror finishes it. Nothing below
+    /// the ARK changes: chains, DEK wraps and object names stay as they are.
+    /// Rows that already open under `root` ignore `previous_root`; rows that
+    /// open under neither leave the node locked.
     pub async fn open_with_previous_root(
         store: AtRestStore,
         mirror: Arc<dyn KeyMirror>,
@@ -858,14 +860,42 @@ impl AtRestKeyring {
         Ok(())
     }
 
+    /// Whether the mirror holds an ARK object this root can't vouch for: one
+    /// that can't be read or parsed, or that doesn't open under this root's
+    /// W. Such a mirror may still unlock under another root, so it must be
+    /// rewritten before the keys count as unlocked. A mirror that can't be
+    /// listed can't be checked, and counts as such.
+    async fn mirror_needs_rewrite(&self) -> bool {
+        let Ok(names) = self.mirror.list(ARK_MIRROR_PREFIX).await else {
+            return true;
+        };
+        for name in names {
+            let bytes = match get_capped(&*self.mirror, &name).await {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => continue,
+                Err(_) => return true,
+            };
+            let row = serde_json::from_slice::<MirroredArk>(&bytes)
+                .ok()
+                .and_then(|m| m.into_row().ok());
+            if !row.is_some_and(|row| opens_under(&self.w, &row)) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Mirror the stored ARK rows; one that doesn't open under this root's
-    /// W is never mirrored. After rows were re-sealed under this root
-    /// (`resealed`), every write must succeed whatever `require_mirror`
-    /// says: a mirror left under another root would let that root unlock
-    /// and seal the keys back to itself. The database is already re-sealed
-    /// then, so the next boot under this root opens it and rewrites the
-    /// mirror.
+    /// W is never mirrored. Every write must succeed, whatever
+    /// `require_mirror` says, after rows were re-sealed under this root
+    /// (`resealed`) or while the mirror holds any ARK object that doesn't
+    /// open under this root ([`Self::mirror_needs_rewrite`]): a mirror left
+    /// under another root would let that root unlock and seal the keys back
+    /// to itself. That is the mirror's state, not this boot's, so a boot
+    /// after a re-seal whose mirror write failed stays refused until the
+    /// mirror is rewritten.
     async fn mirror_keys(&self, resealed: bool) -> Result<(), AtRestError> {
+        let strict = resealed || self.mirror_needs_rewrite().await;
         for row in self.store.keys().await? {
             if !opens_under(&self.w, &row) {
                 tracing::warn!(
@@ -875,7 +905,7 @@ impl AtRestKeyring {
                 continue;
             }
             let written = Self::mirror_row(&*self.mirror, &row).await;
-            if !resealed {
+            if !strict {
                 self.mirror_soft(written)?;
                 continue;
             }
