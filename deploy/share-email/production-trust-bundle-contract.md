@@ -89,3 +89,111 @@ Share must emit the generic OpenCredentials origin before it removes or
 rotates its legacy bundle. Node validates this contract before
 advertising share-email readiness, so a missing, malformed, mismatched, or
 fixture bundle fails closed.
+
+## Issuer-key rotation with a bounded overlap
+
+The existing single-key bundle remains valid. To rotate the issuer while
+preserving verification of credentials already in flight, keep the current
+issuer in `issuerDid`, `issuerKid`, `issuerPublicKey` and
+`issuerKeyVersion`, then add:
+
+- `nextIssuer`: one `CredentialIssuerConfig` for the same
+  `did:web:issuer.credentials.org`, with a distinct `kid` and public key,
+  `alg: "EdDSA"`, the existing email VCT and both existing email profiles;
+- `issuerNotAfter`: a UTC RFC 3339 timestamp ending the current key's trust.
+
+The next key's `notBefore` must be no later than `issuerNotAfter`. The node
+accepts either pinned key before the end time and refuses the old key at or
+after it. The end time is mandatory; an unbounded same-DID overlap, a duplicate
+key or `kid`, an invalid timestamp, or an already-expired end makes startup
+and `--validate-config` fail closed.
+
+### Verify a new issuer key
+
+Do not add a key copied only from a DID document, HTTPS response, or `GetKey`
+response. The production witness currently requests the v0 `/GetKey` key and
+keeps only its `key`, discarding the signature chain; that is not evidence for
+the Ed25519 issuer key. The witness must first support publishing the issuer's
+Ed25519 public key and the complete chain that actually attests that key.
+
+Obtain the witness's signed `GetKey` result and its request inputs from the
+witness publication: for v0, record `path`, `purpose` and `algorithm` (only
+`purpose` is included in the signed claim); for v1, record `algorithm` and
+`domain`. Obtain the exact witness application ID from Phala's trusted
+registration (not the witness's own `/Info`) and the KMS root `k256Pubkey`
+from `DstackKms.kmsInfo()`. This is a secp256k1 public key, not SPKI.
+Authenticate that root independently against Phala's attestation or signed
+publication. Verify signatures using the dstack guest API's exact versioned
+specification
+(`https://github.com/Dstack-TEE/dstack/blob/next/docs/guest-api-v0.md`,
+`https://github.com/Dstack-TEE/dstack/blob/next/docs/guest-api-v1.md`). For
+v1, verify the app-root signature over the length-prefixed fields
+`LP("dstack-guest-v1-key-claim") || LP(algorithm) || LP(domain) || LP(public_key)`;
+then verify the KMS signature over
+`"dstack-kms-issued:" || app_id || compressed_33_byte_app_root_pubkey` using
+the authenticated root. For v0, verify the app-root signature over
+`purpose || ":" || lowercase_hex(public_key)`, and verify the KMS signature
+over `"dstack-kms-issued:" || app_id || compressed_33_byte_app_root_pubkey`
+using the same independent root. Follow the exact versioned dstack signature
+specification; do not infer one version's message from the other. Finally
+verify that the resulting 32-byte Ed25519 key is the key in the witness's
+authenticated `did:web:issuer.credentials.org` verification method, and that
+`nextIssuer.kid` equals that method ID and the `kid` the witness signs into
+credential headers. Record the evidence and verifier output with the rotation
+change. If the witness cannot publish this key and chain, or Phala cannot
+provide the app ID and independent root authentication, stop; do not pin a key.
+
+This node change only accepts the next pin. It does not make a rotated key
+usable end to end. Before activation, coordinate changes to the OpenCredentials
+witness (key selection/publication and credential JWT `kid`/`typ`), its strict
+trust-bundle schema, and the js-sdk policy creator: policies currently pin the
+existing issuer `kid`, and the node enforces that pin. Existing content-addressed
+policies cannot be rewritten in place. Confirm the rotation behavior for old
+policies and newly created policies with those owners before setting a deadline.
+
+### Seal, deploy, and remove the overlap
+
+1. Review the public key and bundle diff. Keep the current issuer fields
+   unchanged; add the verified next issuer and a fixed UTC `issuerNotAfter`
+   chosen with enough time for every consumer to receive the new key. The
+   overlap must be operationally bounded, not extended by default.
+2. Compactly serialize the exact JSON and base64-encode it without line
+   wrapping. Put that exact value in
+   `PROD_TINYCLOUD_SHARE_TRUST_BUNDLE_BASE64` through the normal secret-change
+   process. Never put the bundle value in a PR, workflow log, or chat. Run
+   `--validate-config` and the issuer-verification tests against the reviewed
+   artifact before release.
+3. Before `issuerNotAfter`, publish a second reviewed bundle that promotes the
+   next key into the top-level `issuerKid`, `issuerPublicKey`, and
+   `issuerKeyVersion` fields, and removes `nextIssuer` and `issuerNotAfter`.
+   Update the witness and consumers to the same single-key bundle and verify
+   configuration, credential issuance, and verification. Do not leave an
+   expired overlap in the bundle: it intentionally prevents startup.
+
+During an overlap, images built before this node change reject the new fields.
+The rollback workflow reuses the configured trust-bundle secret, so reverting
+to such an image while the overlap bundle is installed will fail startup.
+Before an older image can be started, restore the previous single-key bundle
+and verify its configuration; treat credentials/policies issued with the new
+key as unavailable on that image until a compatible forward release is live.
+
+For the production dstack node, `TINYCLOUD_KEYS_TYPE=Dstack`; its primary key
+comes from dstack `GetKey`, and the invitation key is derived from that key
+with `derive_key("tinycloud/share-email/invitation-signing")`. It is not the
+raw primary public key. If the dstack application identity or primary-key path
+changes, read `shareInvitationPublicKey` and `nodeDid` from
+`GET /.well-known/tinycloud/node-keys` on the authenticated, attested node.
+Copy `shareInvitationPublicKey` into the trust bundle's
+`nodeInvitationPublicKey`; recheck the enforcer DID against `nodeDid`. The
+endpoint does not publish a key version. Choose and review `nodeKeyVersion`,
+then set `nodeInvitationKid` to
+`<nodeAudience>#invitation-key-<nodeKeyVersion>` in the bundle. Verify the
+node's startup configuration; startup refuses a descriptor/key mismatch.
+Never put a secret in the bundle. The
+`export-share-invitation-descriptor` binary reads `TINYCLOUD_KEYS_SECRET`
+(the workflow supplies `PROD_TINYCLOUD_KEYS_SECRET`) and is for static-key
+deployments only; it hard-codes `<nodeAudience>#invitation-key-1` and version
+`1`, so changing those values for a static-key node requires updating and
+reviewing the exporter. Recheck `nodeAudience` and `nodeEnabled` in the
+separately signed authority material. An issuer-key overlap alone does not
+change the invitation key or its version.
