@@ -969,7 +969,8 @@ pub async fn app_with_control(
     )
     .with_wait_bounds(tinycloud_config.storage.sql.wait_bounds())
     .with_durability(tinycloud_config.storage.sql.durability())
-    .with_ddl_policy(tinycloud_config.storage.sql.ddl_requires_schema);
+    .with_ddl_policy(tinycloud_config.storage.sql.ddl_requires_schema)
+    .with_retry_policy(seed_conn.retry_policy());
 
     let mut policy_v3_runtime =
         PolicyV3Runtime::new(seed_conn.clone(), key_setup.node_did(), key_setup.clone())

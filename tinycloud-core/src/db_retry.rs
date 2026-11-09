@@ -297,6 +297,15 @@ pub async fn with_overload_signal<F: Future>(signal: Arc<OverloadSignal>, future
     ISOLATED.scope(signal, future).await
 }
 
+/// Run `future` under `signal`: how a task spawned by an operation carries
+/// the overload signal in force at its spawn.
+pub(crate) async fn within_overload<F: Future>(
+    signal: Arc<OverloadSignal>,
+    future: F,
+) -> F::Output {
+    ISOLATED.scope(signal, future).await
+}
+
 /// Stamp the signal in force (a request timeout, pool timeout or statement
 /// timeout was observed).
 pub fn stamp_overload(class: &'static str) {
@@ -607,6 +616,75 @@ mod tests {
             assert!(result.is_err());
             assert!(applied);
             assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[derive(Debug)]
+    struct ServerError(&'static str);
+
+    impl std::fmt::Display for ServerError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "server error {}", self.0)
+        }
+    }
+
+    impl std::error::Error for ServerError {}
+
+    impl sea_orm::sqlx::error::DatabaseError for ServerError {
+        fn message(&self) -> &str {
+            "server error"
+        }
+
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            Some(std::borrow::Cow::Borrowed(self.0))
+        }
+
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+
+        fn kind(&self) -> sea_orm::sqlx::error::ErrorKind {
+            sea_orm::sqlx::error::ErrorKind::Other
+        }
+    }
+
+    /// A statement timeout (57014), a serialization failure (40001), a
+    /// deadlock (40P01) and a unique violation (23505) are the server's
+    /// answers, not lost connections: under an enabled policy each runs once
+    /// and is returned, and nothing is reported as possibly applied.
+    #[tokio::test(start_paused = true)]
+    async fn server_refusals_are_not_retried_under_an_enabled_policy() {
+        assert!(policy().is_some(), "the policy and its budget are on");
+        for code in ["57014", "40001", "40P01", "23505"] {
+            for wrap in [
+                (|e| DbErr::Query(RuntimeErr::SqlxError(e))) as fn(SqlxError) -> DbErr,
+                |e| DbErr::Exec(RuntimeErr::SqlxError(e)),
+            ] {
+                let attempts = AtomicUsize::new(0);
+                let (result, applied) = run(Replay::Never, policy(), &attempts, |_| {
+                    Err(wrap(SqlxError::Database(Box::new(ServerError(code)))))
+                })
+                .await;
+                assert!(result.is_err(), "{code}");
+                assert!(!applied, "{code}");
+                assert_eq!(attempts.load(Ordering::SeqCst), 1, "{code}: no retry");
+                // The idempotent path does not retry them either.
+                let attempts = AtomicUsize::new(0);
+                let (result, _) = run(Replay::IdempotentStatement, policy(), &attempts, |_| {
+                    Err(wrap(SqlxError::Database(Box::new(ServerError(code)))))
+                })
+                .await;
+                assert!(result.is_err(), "{code}");
+                assert_eq!(attempts.load(Ordering::SeqCst), 1, "{code}: idempotent");
+            }
         }
     }
 

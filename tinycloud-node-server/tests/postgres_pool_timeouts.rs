@@ -965,8 +965,9 @@ async fn blackhole_idle_connections_fail_fast_and_recover() {
 /// database's operation lock (TC-1054 exp 4; 1.20.4 hung 156 s). Every
 /// connection streaming the large artifact is black-holed. The attempt
 /// fails after one detection (test keepalive detects in about 3 s) and is not
-/// retried: hydration runs outside a retry owner. The request ends with a
-/// retryable `Unavailable`. The lock is
+/// retried: only the metadata read of a hydration has a retry owner, and the
+/// payload reads do not. The request ends with a retryable `Unavailable`.
+/// The lock is
 /// released, so the next request on the database hydrates and succeeds;
 /// another database is served throughout.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

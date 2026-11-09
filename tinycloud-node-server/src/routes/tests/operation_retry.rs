@@ -9,7 +9,7 @@
 //! tests call `retry_owner` with the real operation and an injected failure.
 
 use std::future::Future;
-use tinycloud_core::db_retry::{isolate_overload, retry_owner, Replay};
+use tinycloud_core::db_retry::{isolate_overload, retry_owner, Replay, RetryPolicy};
 
 /// Run `future` under `plan` with an overload signal of its own, so a
 /// request timeout in another test never suppresses this test's retry.
@@ -394,7 +394,7 @@ async fn a_loss_after_the_delegation_transaction_began_is_not_retried_and_stays_
 
     let (result, applied) = retry_owner(
         "delegate",
-        None,
+        Some(RetryPolicy::new(std::time::Duration::from_secs(10))),
         Replay::Never,
         || {
             attempts.fetch_add(1, Ordering::SeqCst);
@@ -431,7 +431,7 @@ async fn other_database_failures_are_not_retried() -> Result<()> {
         let attempts = AtomicUsize::new(0);
         let (result, applied) = retry_owner(
             "delegate",
-            None,
+            Some(RetryPolicy::new(std::time::Duration::from_secs(10))),
             Replay::Never,
             || {
                 attempts.fetch_add(1, Ordering::SeqCst);
@@ -448,7 +448,7 @@ async fn other_database_failures_are_not_retried() -> Result<()> {
     let attempts = AtomicUsize::new(0);
     let (result, _) = retry_owner(
         "delegate",
-        None,
+        Some(RetryPolicy::new(std::time::Duration::from_secs(10))),
         Replay::Never,
         || {
             attempts.fetch_add(1, Ordering::SeqCst);

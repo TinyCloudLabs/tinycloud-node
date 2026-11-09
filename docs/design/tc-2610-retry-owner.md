@@ -147,8 +147,8 @@ The tracker is a boolean that any read-write `BEGIN` sets, so it cannot distingu
 from an uncertain `COMMIT`. Resolution: `IdempotentStatement` is valid only for a single autocommit statement.
 The owner enforces it with a second task-local flag `COMMIT_UNKNOWN`, set by `begin*` on any explicit
 transaction (the same place `note_write_may_have_applied` is called today). If `COMMIT_UNKNOWN` is set during an
-`IdempotentStatement` attempt, the owner refuses to retry, treats it as `Replay::Never`, and in debug builds
-so an explicit transaction inside an idempotent attempt, including one whose `COMMIT`
+`IdempotentStatement` attempt, the owner refuses to retry (as `Replay::Never` would), so an explicit transaction
+inside an idempotent attempt, including one whose `COMMIT`
 is lost, is never replayed. Condition 2 is relaxed only for an autocommit write that lost its connection.
 Only user: `read_audit.rs:643`.
 
@@ -217,12 +217,19 @@ after commit. The routes call sites (`routes/mod.rs` ≈758 and ≈4401) already
 - Hooks (`write_hooks.rs`): subscription matching and delivery-row writes run inside the invoking transaction;
   not owners. Delivery itself (network) never runs in the attempt: only the delivery row is written in-tx
   (TC-2614 webhook lease relies on this).
-- share_email (`bridge.rs`, `state.rs`): each top-level `conn.begin()` method becomes the attempt closure of its own
-  `retry_owner(Replay::Never)` (no email send inside it) where it is a top-level entry; helpers `*_in_transaction` stay owner-free.
-  Previously these got a free `BEGIN` retry; now they get a whole-operation retry only when nothing committed.
-- encryption_network (`keys.rs`, `key_delete.rs`, `deletion_ledger.rs`): same pattern. The attempt closure must
-  contain the whole `begin_write_transaction` → body → `commit()`. Anything done with a key or the network before
-  commit must be repeatable. TC-2611 builds on `retry_owner` and the `Replay` marker; it adds no retry of its own.
+- KV reads (`/invoke` get, list, metadata, sync): `invoke_read_admitted` is the attempt of
+  `retry_owner(Replay::Never)`. The read audit is its last step, so a run that fails before it recorded nothing and
+  an audit failure is not a database error, so it is never retried: one audit record per successful read.
+  KV puts and deletes are not retried; they fail once and the client sends them again.
+- SQL hydration: the metadata read that starts a cold hydration (`load_meta`) is the attempt of its own
+  `retry_owner(Replay::Never)`, inside the hydration task. Payload reads, the cache sink, the actor and the
+  saves are outside it. `run_locked` and the cold-hydration entry refuse to run inside an attempt.
+- Read-audit batches and the webhook dispatcher's two reads are owners (`IdempotentStatement` for the audit statement).
+- share_email (`bridge.rs`, `state.rs`) and encryption_network (`keys.rs`, `key_delete.rs`,
+  `deletion_ledger.rs`) transactions are not owners: their errors are mapped to storage errors that do not carry
+  the database error, and some bodies handle key material. Their `BEGIN` is no longer retried by the pool wrapper;
+  a lost connection returns the storage error and the caller sends the request again. Adopting the owner there
+  means keeping the database error visible and moving non-database work out of the attempt.
 - Background tasks with no request deadline: `policy` has no deadline condition; condition 4 is skipped.
 
 ## Tests (each TC-128 category)
