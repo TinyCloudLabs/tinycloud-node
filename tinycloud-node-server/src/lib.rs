@@ -391,9 +391,11 @@ pub async fn connect_database(tinycloud_config: &Config) -> Result<RecoveringCon
         connect_opts
             .sqlx_logging_level(STATEMENT_LOG_LEVEL)
             .sqlx_slow_statements_logging_settings(STATEMENT_LOG_LEVEL, SLOW_STATEMENT_THRESHOLD);
-        return Ok(RecoveringConnection::new(
-            Database::connect(connect_opts).await?,
-        ));
+        return Ok(
+            RecoveringConnection::new(Database::connect(connect_opts).await?).with_retry_window(
+                Duration::from_millis(tinycloud_config.database.retry_window_ms),
+            ),
+        );
     }
     let mut connect_opts = ConnectOptions::from(database);
     connect_opts
@@ -421,9 +423,11 @@ pub async fn connect_database(tinycloud_config: &Config) -> Result<RecoveringCon
     connect_opts
         .sqlx_logging_level(STATEMENT_LOG_LEVEL)
         .sqlx_slow_statements_logging_settings(STATEMENT_LOG_LEVEL, SLOW_STATEMENT_THRESHOLD);
-    Ok(RecoveringConnection::new(
-        Database::connect(connect_opts).await?,
-    ))
+    Ok(
+        RecoveringConnection::new(Database::connect(connect_opts).await?).with_retry_window(
+            Duration::from_millis(tinycloud_config.database.retry_window_ms),
+        ),
+    )
 }
 
 static POSTGRES_CONNECTIONS_OPENED: AtomicU64 = AtomicU64::new(0);

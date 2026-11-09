@@ -485,6 +485,10 @@ impl SqlService {
         F: FnOnce(SqlService) -> Fut + Send + 'static,
         Fut: Future<Output = Result<T, SqlError>> + Send + 'static,
     {
+        // The operation task outlives this future if it is dropped, so it
+        // never runs inside a retry attempt (TC-2610).
+        crate::db_retry::refuse_in_retry_attempt("sql_operation_task")
+            .map_err(|error| SqlError::Internal(error.to_string()))?;
         let service = self.clone();
         let task = request_cancel::within(request_cancel::current(), async move {
             let _guard = guard;

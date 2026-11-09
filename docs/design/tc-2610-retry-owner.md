@@ -154,17 +154,17 @@ Only user: `read_audit.rs:643`.
 
 ### Nested owners and the budget
 
-The owner installs a task-local `OwnerState { retries_left: Cell<u8> = 1 }`. A `retry_owner` entered while one
-is active runs its attempt once under the outer tracker and never retries; the outer owner decides. Total
-retries across outer and inner calls is therefore at most one. Nested use is a guard against accidental
-stacking, not a feature: an inner owner has no retry of its own.
+The owner installs a task-local marker for its whole run. A `retry_owner` entered while it is set runs its
+attempt once under the outer tracker and never retries; the outer owner decides. Total retries across outer
+and inner calls is therefore at most one. Nested use is a guard against accidental stacking, not a feature:
+an inner owner has no retry of its own.
 
 ### Cancellation boundary: cancel-safe attempts only
 
-Dropping attempt 2 on budget expiry only helps if the attempt owns no work that outlives its future. Two paths
-do: `SqlService::run_locked` (`sql/service.rs:478-505`) runs its operation on a `tokio::spawn`ed task that
-continues if the awaiting future is dropped (TC-1274, by design: hydration, the actor statement and the durable
-save must finish), and the artifact save task at `database_artifacts.rs:1523`. Selected guarantee:
+Dropping attempt 2 on budget expiry only helps if the attempt owns no work that outlives its future. The
+production path that does is `SqlService::run_locked` (`sql/service.rs`), which runs its operation on a
+`tokio::spawn`ed task that continues if the awaiting future is dropped (TC-1274, by design: hydration, the
+actor statement and the durable save must finish). Selected guarantee:
 **prohibit wrapping detached or non-cancellable paths; a retry attempt is cancel-safe by construction.**
 
 - Cancel-safe means: when its future is dropped, no task, statement chain or lock of the attempt keeps running
@@ -172,18 +172,19 @@ save must finish), and the artifact save task at `database_artifacts.rs:1523`. S
   the connection back to the pool after it finishes. `InFlightWrite` records it, so the owner returns the
   flag as may-have-applied and the client gets `outcome_unknown`, never a safe retry.)
 - Wrapped today: `tinycloud.delegate(..)` and `invoke_admitted(..)` (authorization reads, `begin`, writes
-  and `commit` on the caller's task, no spawn). `/invoke` SQL execution, `persist_write`, `run_locked` and the
-  artifact save are NOT wrapped and keep `track_writes` only.
-- Structural check, so a later change cannot silently break it: a task-local `ATTEMPT_SCOPE` is set while a
-  `retry_owner` attempt runs. The two detached-spawn sites call `db_pool::refuse_in_retry_attempt(site)` first.
-  Inside an attempt scope it returns an error (`SqlError::Internal` / `DbErr::Custom`, class `other`, not
-  retryable); outside, it is a no-op. Wrapping a detached path is rejected at the first call.
+  and `commit` on the caller's task, no spawn), read-audit batches, and the two webhook dispatcher reads.
+  `/invoke` SQL execution, `persist_write`, `run_locked` and the KV write path are NOT wrapped and keep
+  `track_writes` only.
+- Structural check, so a later change cannot silently break it: a task-local marker is set while a
+  `retry_owner` runs. `run_locked` calls `db_retry::refuse_in_retry_attempt(site)` first. Inside a retry
+  owner it returns an error (`SqlError::Internal`, class `other`, not retryable); outside, it is a no-op.
+  Wrapping a detached path is rejected at the first call.
 - Attempt 1 is subject to the same rule, so both attempts have identical semantics.
 
 Tests: (a) attempt 2 hangs past the remaining budget (tokio paused time): `retry_owner` returns attempt 1's error,
 and a second statement the attempt would have issued after the pause never executes (counter stays 0), proving
 the future stopped; with an `InFlightWrite` armed in attempt 2 the returned flag is true. (b) `retry_owner`
-around a closure that reaches `run_locked` (and, separately, the artifact save) gets the refusal error and
+around a closure that calls `refuse_in_retry_attempt` (as `run_locked` does) gets the refusal error and
 does not spawn (no task running afterwards, checked via a drop-guard counter), and is not retried.
 
 ### Attempt scope: DB operation only
