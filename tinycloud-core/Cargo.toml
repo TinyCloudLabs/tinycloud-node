@@ -76,6 +76,10 @@ k256 = "0.13"
 hkdf = "0.12"
 hmac = "0.12"
 zeroize = "1"
+# TC-887: at-rest key hierarchy and escrow.
+lru = "0.12"
+parking_lot = "0.12"
+tinycloud-at-rest-escrow = { path = "../tinycloud-at-rest-escrow" }
 prometheus = { version = "0.13.0", features = ["process"] }
 ryu-js = "0.2.2"
 # W1 (audit P1): full Unicode NFC normalization for policy capability path
@@ -91,4 +95,6 @@ async-std = { version = "1", features = ["attributes"] }
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = "0.3"
 iri-string.workspace = true
+# Holder-side decryption of escrow shares in the at-rest keyring tests.
+age = { version = "=0.12.1", default-features = false, features = ["armor"] }
 proptest = "1"
