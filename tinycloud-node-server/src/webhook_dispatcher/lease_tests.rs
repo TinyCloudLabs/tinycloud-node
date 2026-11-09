@@ -272,60 +272,195 @@ async fn released_lease_is_claimable_at_once_and_stale_release_is_refused() -> R
     Ok(())
 }
 
+// Send boundary. A claim with `Duration::ZERO` is expired as soon as it is made.
+
+async fn request_count(seen: &Arc<std::sync::Mutex<Vec<String>>>) -> usize {
+    // Let any in-flight request land before counting.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    seen.lock().unwrap().len()
+}
+
+async fn row(db: &DatabaseConnection, id: &str) -> hook_delivery::Model {
+    hook_delivery::Entity::find_by_id(id.to_string())
+        .one(db)
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn expired_and_reclaimed_lease_does_not_send_or_mark() -> Result<()> {
+    let (_tempdir, tinycloud, db, encryption) = setup().await?;
+    let (callback_url, seen) = callback_server().await?;
+    insert_deliveries(&db, &encryption, &callback_url, 1).await?;
+    let stale = tinycloud
+        .claim_due_webhook_deliveries(1, Duration::ZERO)
+        .await?
+        .remove(0);
+    let current = tinycloud
+        .claim_due_webhook_deliveries(1, LEASE)
+        .await?
+        .remove(0);
+
+    let mut sent = false;
+    dispatcher(&tinycloud, &encryption)?
+        .dispatch_delivery(stale, &mut HashMap::new(), &mut sent)
+        .await?;
+
+    assert!(!sent);
+    assert_eq!(request_count(&seen).await, 0, "no callback was sent");
+    let after = row(&db, &current.id).await;
+    assert_eq!(after.status, HOOK_DELIVERY_STATUS_PENDING);
+    assert_eq!(after.attempts, 0);
+    assert!(
+        tinycloud
+            .mark_webhook_delivery_delivered(&current.id, &current.lease_token, 1)
+            .await?,
+        "the current holder's lease was left intact"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn expired_unreclaimed_lease_does_not_send_and_is_claimable_again() -> Result<()> {
+    let (_tempdir, tinycloud, db, encryption) = setup().await?;
+    let (callback_url, seen) = callback_server().await?;
+    insert_deliveries(&db, &encryption, &callback_url, 1).await?;
+    let stale = tinycloud
+        .claim_due_webhook_deliveries(1, Duration::ZERO)
+        .await?
+        .remove(0);
+
+    let mut sent = false;
+    dispatcher(&tinycloud, &encryption)?
+        .dispatch_delivery(stale.clone(), &mut HashMap::new(), &mut sent)
+        .await?;
+
+    assert!(!sent);
+    assert_eq!(request_count(&seen).await, 0, "no callback was sent");
+    assert_eq!(
+        row(&db, &stale.id).await.status,
+        HOOK_DELIVERY_STATUS_PENDING
+    );
+    let again = tinycloud.claim_due_webhook_deliveries(1, LEASE).await?;
+    assert_eq!(again.len(), 1);
+    assert_eq!(again[0].id, stale.id);
+    Ok(())
+}
+
+#[tokio::test]
+async fn live_lease_sends_once_and_renews() -> Result<()> {
+    let (_tempdir, tinycloud, db, encryption) = setup().await?;
+    let (callback_url, seen) = callback_server().await?;
+    insert_deliveries(&db, &encryption, &callback_url, 1).await?;
+    let claimed = tinycloud
+        .claim_due_webhook_deliveries(1, LEASE)
+        .await?
+        .remove(0);
+
+    let mut sent = false;
+    dispatcher(&tinycloud, &encryption)?
+        .dispatch_delivery(claimed.clone(), &mut HashMap::new(), &mut sent)
+        .await?;
+
+    assert!(sent);
+    assert_eq!(request_count(&seen).await, 1);
+    let after = row(&db, &claimed.id).await;
+    assert_eq!(after.status, HOOK_DELIVERY_STATUS_DELIVERED);
+    assert_eq!(after.attempts, 1);
+    Ok(())
+}
+
+/// PostgreSQL fixture: `pools` separate pools over one fresh schema. Gated
+/// like the other PostgreSQL-backed tests: skips locally, panics on GitHub
+/// Actions if the database URL is missing.
+struct PostgresFixture {
+    admin: DatabaseConnection,
+    setup: DatabaseConnection,
+    schema: String,
+    pools: Vec<TinyCloud>,
+    _tempdir: TempDir,
+}
+
+impl PostgresFixture {
+    async fn new(test: &str, pools: usize, deliveries: usize) -> Result<Option<Self>> {
+        let Some(url) = crate::test_support::postgres_test_url(test) else {
+            return Ok(None);
+        };
+        let admin = Database::connect(ConnectOptions::new(url.clone())).await?;
+        let schema = format!(
+            "tc2614_lease_{}_{}",
+            std::process::id(),
+            OffsetDateTime::now_utc().unix_timestamp_nanos() % 1_000_000_000_000
+        );
+        admin
+            .execute_unprepared(&format!("CREATE SCHEMA {schema}"))
+            .await?;
+        let encryption = ColumnEncryption::new([9u8; 32]);
+        let tempdir = TempDir::new()?;
+        let mut tinyclouds = Vec::new();
+        for _ in 0..pools {
+            let mut pool_url = reqwest::Url::parse(&url)?;
+            pool_url
+                .query_pairs_mut()
+                .append_pair("options", &format!("-c search_path={schema}"));
+            let mut config = crate::config::Config::default();
+            config.storage.database = Some(pool_url.to_string());
+            config.database.max_connections = 8;
+            let conn = crate::connect_database(&config).await?;
+            let storage = NodeFileSystemConfig::new(tempdir.path()).open().await?;
+            tinyclouds.push(
+                TinyCloud::new_with_encryption(
+                    conn,
+                    Either::B(storage),
+                    StaticSecret::new(vec![0u8; 32]).unwrap(),
+                    Some(encryption.clone()),
+                )
+                .await?,
+            );
+        }
+        let mut setup_options = ConnectOptions::new(url);
+        setup_options
+            .max_connections(2)
+            .sqlx_logging(false)
+            .set_schema_search_path(schema.clone());
+        let setup = Database::connect(setup_options).await?;
+        insert_deliveries(&setup, &encryption, "http://127.0.0.1:9/hooks", deliveries).await?;
+        Ok(Some(Self {
+            admin,
+            setup,
+            schema,
+            pools: tinyclouds,
+            _tempdir: tempdir,
+        }))
+    }
+
+    async fn drop_schema(self) -> Result<()> {
+        drop(self.pools);
+        self.setup.close().await?;
+        self.admin
+            .execute_unprepared(&format!("DROP SCHEMA {} CASCADE", self.schema))
+            .await?;
+        Ok(())
+    }
+}
+
 /// Two dispatchers on separate PostgreSQL pools (real concurrent connections).
-/// Gated like the other PostgreSQL-backed tests: skips locally, panics on
-/// GitHub Actions if the database URL is missing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn postgres_two_pools_claim_each_delivery_once_and_refuse_stale_marks() -> Result<()> {
     use std::collections::BTreeSet;
 
-    let Some(url) = crate::test_support::postgres_test_url(
+    let Some(fixture) = PostgresFixture::new(
         "postgres_two_pools_claim_each_delivery_once_and_refuse_stale_marks",
-    ) else {
+        2,
+        40,
+    )
+    .await?
+    else {
         return Ok(());
     };
-    let admin = Database::connect(ConnectOptions::new(url.clone())).await?;
-    let schema = format!(
-        "tc2614_lease_{}_{}",
-        std::process::id(),
-        OffsetDateTime::now_utc().unix_timestamp_nanos() % 1_000_000_000_000
-    );
-    admin
-        .execute_unprepared(&format!("CREATE SCHEMA {schema}"))
-        .await?;
 
-    let encryption = ColumnEncryption::new([9u8; 32]);
-    let tempdir = TempDir::new()?;
-    let mut pools = Vec::new();
-    for _ in 0..2 {
-        let mut pool_url = reqwest::Url::parse(&url)?;
-        pool_url
-            .query_pairs_mut()
-            .append_pair("options", &format!("-c search_path={schema}"));
-        let mut config = crate::config::Config::default();
-        config.storage.database = Some(pool_url.to_string());
-        config.database.max_connections = 8;
-        let conn = crate::connect_database(&config).await?;
-        let storage = NodeFileSystemConfig::new(tempdir.path()).open().await?;
-        pools.push(
-            TinyCloud::new_with_encryption(
-                conn,
-                Either::B(storage),
-                StaticSecret::new(vec![0u8; 32]).unwrap(),
-                Some(encryption.clone()),
-            )
-            .await?,
-        );
-    }
-    let mut setup_options = ConnectOptions::new(url.clone());
-    setup_options
-        .max_connections(2)
-        .sqlx_logging(false)
-        .set_schema_search_path(schema.clone());
-    let setup = Database::connect(setup_options).await?;
-    insert_deliveries(&setup, &encryption, "http://127.0.0.1:9/hooks", 40).await?;
-
-    let (first, second) = (pools[0].clone(), pools[1].clone());
+    let (first, second) = (fixture.pools[0].clone(), fixture.pools[1].clone());
     let claim_a = tokio::spawn(async move { first.claim_due_webhook_deliveries(40, LEASE).await });
     let claim_b = tokio::spawn(async move { second.claim_due_webhook_deliveries(40, LEASE).await });
     let (claimed_a, claimed_b) = (claim_a.await??, claim_b.await??);
@@ -335,8 +470,11 @@ async fn postgres_two_pools_claim_each_delivery_once_and_refuse_stale_marks() ->
     assert_eq!(ids_a.len() + ids_b.len(), 40, "every delivery is claimed");
 
     // A stale mark after a re-claim by the other pool is refused.
-    setup
-        .execute_unprepared("UPDATE hook_delivery SET lease_expires_at = '2000-01-01T00:00:00Z' WHERE id = 'delivery_00'")
+    fixture
+        .setup
+        .execute_unprepared(
+            "UPDATE hook_delivery SET lease_expires_at = '2000-01-01T00:00:00Z' WHERE id = 'delivery_00'",
+        )
         .await?;
     let holder = claimed_a
         .iter()
@@ -344,26 +482,74 @@ async fn postgres_two_pools_claim_each_delivery_once_and_refuse_stale_marks() ->
         .find(|d| d.id == "delivery_00")
         .unwrap()
         .clone();
-    let reclaimed = pools[1]
+    let reclaimed = fixture.pools[1]
         .claim_due_webhook_deliveries(40, LEASE)
         .await?
         .remove(0);
     assert_eq!(reclaimed.id, holder.id);
     assert!(
-        !pools[0]
+        !fixture.pools[0]
             .mark_webhook_delivery_delivered(&holder.id, &holder.lease_token, 1)
             .await?
     );
     assert!(
-        pools[1]
+        fixture.pools[1]
             .mark_webhook_delivery_delivered(&reclaimed.id, &reclaimed.lease_token, 1)
             .await?
     );
 
-    drop(pools);
-    setup.close().await?;
-    admin
-        .execute_unprepared(&format!("DROP SCHEMA {schema} CASCADE"))
+    fixture.drop_schema().await
+}
+
+/// The send-boundary renew on PostgreSQL: a live lease renews, an expired
+/// one does not, and neither does a lease another pool has re-claimed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_send_boundary_renew_requires_a_live_current_lease() -> Result<()> {
+    let Some(fixture) = PostgresFixture::new(
+        "postgres_send_boundary_renew_requires_a_live_current_lease",
+        2,
+        2,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let (a, b) = (&fixture.pools[0], &fixture.pools[1]);
+
+    // Live lease: renews.
+    let mut claimed = a.claim_due_webhook_deliveries(2, LEASE).await?;
+    claimed.sort_by(|x, y| x.id.cmp(&y.id));
+    let (live, expired) = (claimed.remove(0), claimed.remove(0));
+    assert!(
+        a.renew_webhook_delivery_lease(&live.id, &live.lease_token, LEASE)
+            .await?
+    );
+
+    // Expired, not re-claimed: refused, and claimable again.
+    fixture
+        .setup
+        .execute_unprepared(&format!(
+            "UPDATE hook_delivery SET lease_expires_at = '2000-01-01T00:00:00Z' WHERE id = '{}'",
+            expired.id
+        ))
         .await?;
-    Ok(())
+    assert!(
+        !a.renew_webhook_delivery_lease(&expired.id, &expired.lease_token, LEASE)
+            .await?
+    );
+
+    // Expired and re-claimed by the other pool: the stale holder is refused
+    // and the new holder is untouched.
+    let reclaimed = b.claim_due_webhook_deliveries(2, LEASE).await?.remove(0);
+    assert_eq!(reclaimed.id, expired.id);
+    assert!(
+        !a.renew_webhook_delivery_lease(&expired.id, &expired.lease_token, LEASE)
+            .await?
+    );
+    assert!(
+        b.renew_webhook_delivery_lease(&reclaimed.id, &reclaimed.lease_token, LEASE)
+            .await?
+    );
+
+    fixture.drop_schema().await
 }

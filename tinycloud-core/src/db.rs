@@ -1240,6 +1240,29 @@ where
         Ok(result.rows_affected == 1)
     }
 
+    /// Extends a claimed delivery's lease to `extend` from now. Succeeds only
+    /// while `lease_token` is still the row's current lease, the lease has not
+    /// expired and the delivery is open; returns `false`, changing nothing,
+    /// otherwise.
+    pub async fn renew_webhook_delivery_lease(
+        &self,
+        delivery_id: &str,
+        lease_token: &str,
+        extend: std::time::Duration,
+    ) -> Result<bool, DbErr> {
+        let now = OffsetDateTime::now_utc();
+        let result = hook_delivery::Entity::update_many()
+            .col_expr(
+                webhook_lease_expires_column(),
+                Expr::value(webhook_lease_timestamp(now + extend)),
+            )
+            .filter(webhook_lease_held(delivery_id, lease_token))
+            .filter(Expr::col(webhook_lease_expires_column()).gt(webhook_lease_timestamp(now)))
+            .exec(&self.conn)
+            .await?;
+        Ok(result.rows_affected == 1)
+    }
+
     /// Marks a claimed delivery delivered. Returns `false`, changing nothing,
     /// when `lease_token` is no longer the row's current lease.
     pub async fn mark_webhook_delivery_delivered(

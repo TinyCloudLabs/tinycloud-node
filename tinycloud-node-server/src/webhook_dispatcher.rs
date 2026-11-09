@@ -221,6 +221,19 @@ impl WebhookDispatcher {
             }
         };
 
+        // Send boundary: confirm this worker still holds a live lease and
+        // restart it for the send. Fails closed: a lease that expired (and
+        // possibly went to another dispatcher) during the preparation above
+        // means no send and no mark; the row is left to whoever holds it.
+        let renewed = self
+            .tinycloud
+            .renew_webhook_delivery_lease(&claim.id, &claim.token, self.timeout + LEASE_MARGIN)
+            .await
+            .context("renewing webhook delivery lease")?;
+        if !renewed {
+            tracing::warn!("webhook delivery send skipped: lease no longer held");
+            return Ok(());
+        }
         // Past this point the callback may have been sent, so the lease stays
         // held until a mark or its expiry.
         *sent = true;
