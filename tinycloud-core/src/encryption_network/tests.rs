@@ -2502,9 +2502,17 @@ async fn wrap_versions_are_independent_on_native_root_and_named_decrypt() {
                 };
                 let invocation =
                     build_session_invocation_for(&resource, DECRYPT_ACTION, vec![facts], NODE_DID);
-                svc.validate_authorized_decrypt_request(&target, &invocation, &body_value)
-                    .await
-                    .unwrap();
+                let preflight = svc
+                    .validate_authorized_decrypt_request(&target, &invocation, &body_value)
+                    .await;
+                if require_v2 && incoming == KeyWrapVersion::V1 {
+                    assert!(matches!(
+                        preflight,
+                        Err(EncryptionServiceError::KeyUnwrapFailed(_))
+                    ));
+                } else {
+                    preflight.unwrap();
+                }
                 let result = svc
                     .decrypt_authorized(&target, &invocation, &body_value)
                     .await;

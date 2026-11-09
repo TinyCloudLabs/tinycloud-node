@@ -1020,6 +1020,7 @@ impl EncryptionService {
         let wrapped =
             decode_base64(&body.encrypted_symmetric_key).map_err(EncryptionServiceError::Base64)?;
         check_wrapped_algorithm(&body.alg, &wrapped)?;
+        self.check_key_wrap_policy(&wrapped)?;
         let receiver_hash = canonical_hash(&Value::String(body.receiver_public_key.clone()));
         let key_hash = canonical_hash(&Value::String(body.encrypted_symmetric_key.clone()));
         if receiver_hash != body.receiver_public_key_hash

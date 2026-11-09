@@ -40,8 +40,16 @@ pub(super) async fn setup() -> Result<(KvSyncFixture, String)> {
 /// mounting is covered by `policy_v3::named_keys_gate_tests`. What this
 /// setting changes here is what `/delegate` and `/invoke` accept.
 async fn setup_with(named_keys: bool) -> Result<(KvSyncFixture, String)> {
+    setup_with_reader_policy(named_keys, false).await
+}
+
+async fn setup_with_reader_policy(
+    named_keys: bool,
+    require_v2: bool,
+) -> Result<(KvSyncFixture, String)> {
     let mut config = Config::default();
     config.encryption_network.named_keys_v1 = named_keys;
+    config.encryption_network.key_wrap_require_v2 = require_v2;
     let fixture = KvSyncFixture::new_configured(config, |rocket| {
         rocket
             .mount(
@@ -1906,6 +1914,66 @@ async fn replayed_named_key_decrypt_is_a_conflict() -> Result<()> {
     )?;
     let (status, text) = invoke(&fixture, &auth, &body).await;
     assert_eq!(status, Status::Ok, "{text}");
+    let (status, text) = invoke(&fixture, &auth, &body).await;
+    assert_eq!(status, Status::Conflict, "{text}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn encryption_network_required_wrap_policy_preserves_invoke_nonce() -> Result<()> {
+    use tinycloud_core::encryption_network::backend::{
+        wrap_to_public_key_with_context, KeyWrapContext, KeyWrapPurpose, KeyWrapVersion,
+    };
+
+    let (fixture, network) = setup_with_reader_policy(true, true).await?;
+    let replay = &fixture
+        .client
+        .rocket()
+        .state::<ReplayDb>()
+        .expect("replay database is managed")
+        .0;
+    let before = tc341_replay_row_count(replay).await?;
+    let public = root_public_key(&fixture, &network).await;
+    let mut case = DecryptCase::wrapped_to(&public);
+    let (body, facts) = decrypt_request(&fixture, &network, &case, None);
+    let auth = invocation(
+        &fixture,
+        &fixture.node_did,
+        &[(network.as_str(), DECRYPT_ACTION)],
+        vec![facts],
+    )?;
+    let (status, text) = invoke(&fixture, &auth, &body).await;
+    assert_eq!(status, Status::Forbidden, "{text}");
+    assert_eq!(tc341_replay_row_count(replay).await?, before);
+
+    case.wrapped = wrap_to_public_key_with_context(
+        &public,
+        &case.symmetric,
+        &KeyWrapContext {
+            purpose: KeyWrapPurpose::NetworkKey,
+            network_id: &network,
+            key_path: "",
+            key_version: 1,
+            metadata: None,
+        },
+        KeyWrapVersion::V2,
+    )?;
+    let (mut body, mut facts) = decrypt_request(&fixture, &network, &case, None);
+    body["alg"] = json!(KeyWrapVersion::V2.alg());
+    facts["alg"] = body["alg"].clone();
+    facts["bodyHash"] = json!(canonical_hash(&body));
+    let auth = invocation(
+        &fixture,
+        &fixture.node_did,
+        &[(network.as_str(), DECRYPT_ACTION)],
+        vec![facts],
+    )?;
+    let (status, text) = invoke(&fixture, &auth, &body).await;
+    assert_eq!(status, Status::Ok, "{text}");
+    let response: Value = serde_json::from_str(&text)?;
+    let wrapped = base64::decode(response["wrappedKey"].as_str().expect("wrappedKey"))?;
+    assert_eq!(case.open(&wrapped), case.symmetric);
+    assert_eq!(tc341_replay_row_count(replay).await?, before + 1);
     let (status, text) = invoke(&fixture, &auth, &body).await;
     assert_eq!(status, Status::Conflict, "{text}");
     Ok(())

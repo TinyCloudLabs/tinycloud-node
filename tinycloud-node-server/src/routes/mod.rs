@@ -4499,6 +4499,8 @@ mod tests {
     #[allow(dead_code)]
     struct LedgerDir(TempDir);
 
+    struct ReplayDb(tinycloud_core::sea_orm::DatabaseConnection);
+
     fn manage_tc405_test_state(
         rocket: rocket::Rocket<rocket::Build>,
         conn: tinycloud_core::sea_orm::DatabaseConnection,
@@ -4517,7 +4519,12 @@ mod tests {
         .expect("deletion ledger");
         let encryption =
             EncryptionService::new_with_node_keypair(conn.clone(), secret.node_keypair(), backend)
-                .with_deletion_ledger(Some(std::sync::Arc::new(ledger)));
+                .with_deletion_ledger(Some(std::sync::Arc::new(ledger)))
+                .with_key_wrap_require_v2(
+                    rocket
+                        .state::<Config>()
+                        .is_some_and(|config| config.encryption_network.key_wrap_require_v2),
+                );
 
         rocket
             .manage(crate::policy_v3::PolicyV3Runtime::new(
@@ -11116,6 +11123,7 @@ mod tests {
             .manage(None::<crate::tee::TeeContext>)
             .manage(config)
             .manage(QuotaCache::new(None, None))
+            .manage(ReplayDb(replay_db.clone()))
             .manage(InvocationReplayCache::new(replay_db))
             .manage(hook_runtime)
             .manage(BlockStage::from(crate::config::StagingStorage::Memory));
