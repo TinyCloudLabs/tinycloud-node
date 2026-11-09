@@ -11,6 +11,8 @@ use sea_orm_migration::MigratorTrait;
 
 use crate::encryption::ColumnEncryption;
 use crate::encryption_network::backend::LocalOneOfOneBackend;
+use crate::encryption_network::delete_auth::{DeleteTarget, VerifiedOwnerDelete};
+use crate::encryption_network::deletion_ledger::DeletionLedger;
 use crate::encryption_network::network_id::NetworkId;
 use crate::encryption_network::service::{
     CreateNetworkRequest, EncryptionService, EncryptionServiceError,
@@ -167,6 +169,51 @@ async fn create_repairs_a_half_created_network_in_place() {
         svc.create_one_of_one_network(request()).await,
         Err(EncryptionServiceError::NetworkAlreadyExists)
     ));
+}
+
+#[tokio::test]
+async fn revoking_a_half_created_network_is_not_found_and_leaves_it_repairable() {
+    let db = fresh_db().await;
+    let svc = service(db.clone());
+    let id = insert_half_created(&db, &svc).await;
+
+    assert!(matches!(
+        svc.revoke_network(&id).await,
+        Err(EncryptionServiceError::NetworkNotFound)
+    ));
+    let row = encryption_network::Entity::find_by_id(id.to_string())
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.state, "active");
+
+    let repaired = svc.create_one_of_one_network(request()).await.unwrap();
+    assert_eq!(repaired.state, NetworkState::Active);
+}
+
+#[tokio::test]
+async fn deleting_keys_on_a_half_created_network_is_network_not_found() {
+    let db = fresh_db().await;
+    let dir = tempfile::tempdir().unwrap();
+    let ledger = Arc::new(DeletionLedger::open(&dir.path().join("ledger.jsonl")).unwrap());
+    let svc = service(db.clone()).with_deletion_ledger(Some(ledger));
+    let id = insert_half_created(&db, &svc).await;
+    let verified = VerifiedOwnerDelete {
+        owner: OWNER.to_string(),
+        nonce: "nonce-0001".to_string(),
+        exp: 0,
+        auth_cid: "cid".to_string(),
+    };
+
+    for path in ["apps/one/key", "apps/one/"] {
+        let target = DeleteTarget::parse(&id, path).unwrap();
+        let result = svc.delete_keys(&id, &target, &verified).await;
+        assert!(
+            matches!(result, Err(EncryptionServiceError::NetworkNotFound)),
+            "{path}: {result:?}"
+        );
+    }
 }
 
 /// Concurrent creates and repairs on PostgreSQL: exactly one writer wins and

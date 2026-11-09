@@ -708,6 +708,9 @@ impl EncryptionService {
             .one(&self.db)
             .await?
             .ok_or(EncryptionServiceError::NetworkNotFound)?;
+        if is_half_created(&self.db, &existing).await? {
+            return Err(EncryptionServiceError::NetworkNotFound);
+        }
 
         let mut active: encryption_network::ActiveModel = existing.into();
         active.state = Set(NetworkState::Revoked.as_str().to_string());
@@ -1607,6 +1610,22 @@ pub(super) fn now_rfc3339() -> String {
     OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+}
+
+/// An active network row with no member, left by an earlier create. Every
+/// lookup answers it as a missing network until a create completes it.
+pub(super) async fn is_half_created<C: sea_orm::ConnectionTrait>(
+    db: &C,
+    row: &encryption_network::Model,
+) -> Result<bool, DbErr> {
+    if row.state != NetworkState::Active.as_str() {
+        return Ok(false);
+    }
+    let members = encryption_network_member::Entity::find()
+        .filter(encryption_network_member::Column::NetworkId.eq(row.network_id.clone()))
+        .count(db)
+        .await?;
+    Ok(members == 0)
 }
 
 pub(super) fn is_unique_violation(err: &DbErr) -> bool {
