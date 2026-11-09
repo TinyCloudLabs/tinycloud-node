@@ -15,6 +15,22 @@ type WebhookMac = Hmac<Sha256>;
 const PRIMARY_SECRET_KEY_ID: &str = "primary";
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 const DISPATCH_BATCH_SIZE: u64 = 32;
+/// Added to the callback timeout to size a delivery lease.
+const LEASE_MARGIN: Duration = Duration::from_secs(60);
+
+/// A claimed delivery: its id and the lease token every mark must carry.
+struct Claim {
+    id: String,
+    token: String,
+}
+
+/// A mark that finds its lease gone (expired and re-claimed, or already
+/// settled) is refused by the database; nothing about the request is logged.
+fn log_if_stale(applied: bool) {
+    if !applied {
+        tracing::warn!("webhook delivery mark refused: lease no longer held");
+    }
+}
 
 #[derive(Clone)]
 pub struct WebhookDispatcher {
@@ -43,16 +59,23 @@ impl WebhookDispatcher {
     }
 
     pub async fn dispatch_due_once(&self) -> Result<()> {
-        let deliveries = self
-            .tinycloud
-            .list_due_webhook_deliveries(DISPATCH_BATCH_SIZE)
-            .await
-            .context("loading due webhook deliveries")?;
-
         // TC-991: re-derived once per subscription per pass and never carried across passes,
         // so a revocation or expiry applies by the next pass.
         let mut authority = HashMap::<String, bool>::new();
-        for delivery in deliveries {
+        // Claim one delivery at a time so each lease starts when its send
+        // starts and only has to cover that one send.
+        let lease = self.timeout + LEASE_MARGIN;
+        for _ in 0..DISPATCH_BATCH_SIZE {
+            let Some(delivery) = self
+                .tinycloud
+                .claim_due_webhook_deliveries(1, lease)
+                .await
+                .context("claiming due webhook deliveries")?
+                .into_iter()
+                .next()
+            else {
+                break;
+            };
             if self
                 .dispatch_delivery(delivery, &mut authority)
                 .await
@@ -71,9 +94,13 @@ impl WebhookDispatcher {
         authority: &mut HashMap<String, bool>,
     ) -> Result<()> {
         let current_attempt = delivery.attempts + 1;
+        let claim = Claim {
+            id: delivery.id.clone(),
+            token: delivery.lease_token.clone(),
+        };
 
         if !delivery.subscription_active {
-            self.record_terminal_failure(delivery.id, current_attempt, "subscription inactive")
+            self.record_terminal_failure(&claim, current_attempt, "subscription inactive")
                 .await?;
             return Ok(());
         }
@@ -105,18 +132,14 @@ impl WebhookDispatcher {
             }
         };
         if !authorized {
-            self.record_terminal_failure(
-                delivery.id,
-                current_attempt,
-                "subscription authority lapsed",
-            )
-            .await?;
+            self.record_terminal_failure(&claim, current_attempt, "subscription authority lapsed")
+                .await?;
             return Ok(());
         }
 
         if delivery.secret_key_id != PRIMARY_SECRET_KEY_ID {
             self.record_terminal_failure(
-                delivery.id,
+                &claim,
                 current_attempt,
                 &format!(
                     "unsupported webhook secret key id {}",
@@ -131,7 +154,7 @@ impl WebhookDispatcher {
             Ok(secret) => secret,
             Err(error) => {
                 self.record_terminal_failure(
-                    delivery.id,
+                    &claim,
                     current_attempt,
                     &format!("secret decryption failed: {error}"),
                 )
@@ -150,11 +173,11 @@ impl WebhookDispatcher {
             Ok((_, destination)) => destination,
             Err(error) => {
                 if error.is_retryable() {
-                    self.record_retryable_failure(delivery.id, current_attempt, error.to_string())
+                    self.record_retryable_failure(&claim, current_attempt, error.to_string())
                         .await?;
                 } else {
                     self.record_terminal_failure(
-                        delivery.id,
+                        &claim,
                         current_attempt,
                         &format!("callback URL rejected: {error}"),
                     )
@@ -175,14 +198,16 @@ impl WebhookDispatcher {
             .await
         {
             Ok(response) if response.status().is_success() => {
-                self.tinycloud
-                    .mark_webhook_delivery_delivered(&delivery.id, current_attempt)
+                let applied = self
+                    .tinycloud
+                    .mark_webhook_delivery_delivered(&claim.id, &claim.token, current_attempt)
                     .await
                     .context("marking webhook delivery delivered")?;
+                log_if_stale(applied);
             }
             Ok(response) => {
                 self.record_retryable_failure(
-                    delivery.id,
+                    &claim,
                     current_attempt,
                     format!("callback returned {}", response.status()),
                 )
@@ -190,11 +215,11 @@ impl WebhookDispatcher {
             }
             Err(error) => {
                 if error.is_retryable() {
-                    self.record_retryable_failure(delivery.id, current_attempt, error.to_string())
+                    self.record_retryable_failure(&claim, current_attempt, error.to_string())
                         .await?;
                 } else {
                     self.record_terminal_failure(
-                        delivery.id,
+                        &claim,
                         current_attempt,
                         &format!("callback URL rejected: {error}"),
                     )
@@ -208,37 +233,50 @@ impl WebhookDispatcher {
 
     async fn record_terminal_failure(
         &self,
-        delivery_id: String,
+        claim: &Claim,
         attempts: i64,
         error: &str,
     ) -> Result<()> {
-        self.tinycloud
-            .mark_webhook_delivery_failed(&delivery_id, attempts, None, error.to_string(), true)
+        let applied = self
+            .tinycloud
+            .mark_webhook_delivery_failed(
+                &claim.id,
+                &claim.token,
+                attempts,
+                None,
+                error.to_string(),
+                true,
+            )
             .await
             .context("marking webhook delivery dead-letter")?;
+        log_if_stale(applied);
         Ok(())
     }
 
     async fn record_retryable_failure(
         &self,
-        delivery_id: String,
+        claim: &Claim,
         attempts: i64,
         error: String,
     ) -> Result<()> {
         let next_attempt_number = attempts + 1;
         if next_attempt_number > self.max_attempts {
-            self.tinycloud
-                .mark_webhook_delivery_failed(&delivery_id, attempts, None, error, true)
+            let applied = self
+                .tinycloud
+                .mark_webhook_delivery_failed(&claim.id, &claim.token, attempts, None, error, true)
                 .await
                 .context("marking exhausted webhook delivery dead-letter")?;
+            log_if_stale(applied);
             return Ok(());
         }
 
         let next_attempt_at =
             OffsetDateTime::now_utc() + retry_delay_for_attempt(next_attempt_number);
-        self.tinycloud
+        let applied = self
+            .tinycloud
             .mark_webhook_delivery_failed(
-                &delivery_id,
+                &claim.id,
+                &claim.token,
                 attempts,
                 Some(next_attempt_at),
                 error,
@@ -246,6 +284,7 @@ impl WebhookDispatcher {
             )
             .await
             .context("marking webhook delivery for retry")?;
+        log_if_stale(applied);
         Ok(())
     }
 }
@@ -1172,3 +1211,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod lease_tests;
