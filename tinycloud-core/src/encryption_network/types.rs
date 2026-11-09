@@ -17,6 +17,9 @@ pub enum NetworkState {
     Rotating,
     Revoked,
     Failed,
+    /// An active row with no member, left by a create that did not finish.
+    /// Derived on read; never stored.
+    Incomplete,
 }
 
 impl NetworkState {
@@ -28,6 +31,7 @@ impl NetworkState {
             NetworkState::Rotating => "rotating",
             NetworkState::Revoked => "revoked",
             NetworkState::Failed => "failed",
+            NetworkState::Incomplete => "incomplete",
         }
     }
 

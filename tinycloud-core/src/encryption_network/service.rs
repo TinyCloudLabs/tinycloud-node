@@ -9,13 +9,17 @@
 use std::sync::Arc;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, DbErr, EntityTrait, QueryFilter};
+use sea_orm::{
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseTransaction, DbErr, EntityTrait,
+    PaginatorTrait, QueryFilter,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tinycloud_auth::identity::did_principal_matches;
 
+use crate::db::begin_write_transaction;
 use crate::db_pool::RecoveringConnection;
 use crate::hash::hash;
 use crate::keys::{public_key_to_did_key, Keypair, PublicKey};
@@ -254,6 +258,16 @@ pub struct EncryptionService {
     /// Makes the next key delete fail around its commit.
     #[cfg(test)]
     pub(super) delete_faults: super::key_delete::DeleteFaults,
+    #[cfg(test)]
+    pub(super) create_faults: CreateFaults,
+}
+
+/// Makes the next network create fail after the numbered insert (0 = never),
+/// once.
+#[cfg(test)]
+#[derive(Default)]
+pub(super) struct CreateFaults {
+    pub(super) fail_after_stage: std::sync::atomic::AtomicU8,
 }
 
 #[derive(Debug, Clone)]
@@ -286,6 +300,8 @@ impl EncryptionService {
             deletion_ledger: None,
             #[cfg(test)]
             delete_faults: Default::default(),
+            #[cfg(test)]
+            create_faults: Default::default(),
             key_cap_per_app_prefix: DEFAULT_KEY_CAP_PER_APP_PREFIX,
         }
     }
@@ -307,6 +323,8 @@ impl EncryptionService {
             deletion_ledger: None,
             #[cfg(test)]
             delete_faults: Default::default(),
+            #[cfg(test)]
+            create_faults: Default::default(),
             key_cap_per_app_prefix: DEFAULT_KEY_CAP_PER_APP_PREFIX,
         }
     }
@@ -354,14 +372,45 @@ impl EncryptionService {
         let network_id = NetworkId::new(req.owner_did.clone(), req.name.clone())
             .map_err(|e| EncryptionServiceError::InvalidBody(format!("invalid network id: {e}")))?;
 
+        // Key generation touches no database row and may call the key
+        // backend, so it runs before the transaction opens.
+        let generated = self.backend.generate()?;
+
+        let tx = begin_write_transaction(&self.db, None).await?;
+        // Every outcome ends the transaction here, so the locks it holds are
+        // released before this call returns.
+        match self
+            .create_network_in(&tx, &network_id, &req, generated)
+            .await
+        {
+            Ok(descriptor) => {
+                tx.commit().await?;
+                Ok(descriptor)
+            }
+            Err(err) => {
+                let _ = tx.rollback().await;
+                Err(err)
+            }
+        }
+    }
+
+    /// Network, member and ceremony rows for a new network, all inside the
+    /// caller's transaction. A network row left without its member by an
+    /// earlier create is completed in place instead of refused as a duplicate.
+    async fn create_network_in(
+        &self,
+        tx: &DatabaseTransaction,
+        network_id: &NetworkId,
+        req: &CreateNetworkRequest,
+        generated: super::backend::GeneratedKey,
+    ) -> Result<NetworkDescriptor, EncryptionServiceError> {
         // Reject duplicates up-front so callers see a clear error instead of a
         // generic unique-constraint failure.
-        if encryption_network::Entity::find_by_id(network_id.to_string())
-            .one(&self.db)
+        if let Some(existing) = encryption_network::Entity::find_by_id(network_id.to_string())
+            .one(tx)
             .await?
-            .is_some()
         {
-            return Err(EncryptionServiceError::NetworkAlreadyExists);
+            return self.repair_network_in(tx, network_id, existing).await;
         }
 
         let now = now_rfc3339();
@@ -377,13 +426,13 @@ impl EncryptionService {
             completed_at: Set(None),
             failure: Set(None),
         }
-        .insert(&self.db)
+        .insert(tx)
         .await?;
+        self.create_fault_point(1)?;
 
-        let generated = self.backend.generate()?;
         let transcript = hash_hex(&generated.public_key);
 
-        let model = encryption_network::ActiveModel {
+        encryption_network::ActiveModel {
             network_id: Set(network_id.to_string()),
             owner_did: Set(network_id.owner_did().to_string()),
             name: Set(req.name.clone()),
@@ -397,8 +446,10 @@ impl EncryptionService {
             sealed_private_key: Set(Some(generated.sealed_private_key)),
             created_at: Set(now.clone()),
             updated_at: Set(now.clone()),
-        };
-        model.insert(&self.db).await?;
+        }
+        .insert(tx)
+        .await?;
+        self.create_fault_point(2)?;
 
         encryption_network_member::ActiveModel {
             network_id: Set(network_id.to_string()),
@@ -407,24 +458,25 @@ impl EncryptionService {
             share_index: Set(0),
             joined_at: Set(now.clone()),
         }
-        .insert(&self.db)
+        .insert(tx)
         .await?;
+        self.create_fault_point(3)?;
 
         let mut ceremony_active: encryption_ceremony::ActiveModel =
-            encryption_ceremony::Entity::find_by_id(ceremony_id.clone())
-                .one(&self.db)
+            encryption_ceremony::Entity::find_by_id(ceremony_id)
+                .one(tx)
                 .await?
                 .ok_or(EncryptionServiceError::NetworkNotFound)?
                 .into();
         ceremony_active.state = Set("completed".to_string());
         ceremony_active.transcript_hash = Set(Some(transcript));
         ceremony_active.completed_at = Set(Some(now.clone()));
-        ceremony_active.update(&self.db).await?;
+        ceremony_active.update(tx).await?;
 
         Ok(NetworkDescriptor {
             network_id: network_id.clone(),
             owner_did: network_id.owner_did().to_string(),
-            name: req.name,
+            name: req.name.clone(),
             members: vec![NetworkMemberDescriptor {
                 node_id: self.node_did.clone(),
                 role: "primary".to_string(),
@@ -438,6 +490,92 @@ impl EncryptionService {
             created_at: now.clone(),
             updated_at: now,
         })
+    }
+
+    /// Completes an active network row that has no member, keeping its key.
+    /// Any other existing network is a duplicate.
+    async fn repair_network_in(
+        &self,
+        tx: &DatabaseTransaction,
+        network_id: &NetworkId,
+        existing: encryption_network::Model,
+    ) -> Result<NetworkDescriptor, EncryptionServiceError> {
+        let has_member = encryption_network_member::Entity::find()
+            .filter(encryption_network_member::Column::NetworkId.eq(network_id.to_string()))
+            .count(tx)
+            .await?
+            > 0;
+        let ours = existing.key_backend == self.backend.kind().as_str()
+            && existing.sealed_private_key.is_some();
+        if has_member || existing.state != NetworkState::Active.as_str() || !ours {
+            return Err(EncryptionServiceError::NetworkAlreadyExists);
+        }
+
+        let now = now_rfc3339();
+        encryption_network_member::ActiveModel {
+            network_id: Set(network_id.to_string()),
+            node_id: Set(self.node_did.clone()),
+            role: Set("primary".to_string()),
+            share_index: Set(0),
+            joined_at: Set(now.clone()),
+        }
+        .insert(tx)
+        .await?;
+
+        let transcript = hash_hex(&existing.public_key);
+        let unfinished = encryption_ceremony::Entity::find()
+            .filter(encryption_ceremony::Column::NetworkId.eq(network_id.to_string()))
+            .filter(encryption_ceremony::Column::State.eq("started"))
+            .all(tx)
+            .await?;
+        for ceremony in unfinished {
+            let mut active: encryption_ceremony::ActiveModel = ceremony.into();
+            active.state = Set("completed".to_string());
+            active.transcript_hash = Set(Some(transcript.clone()));
+            active.completed_at = Set(Some(now.clone()));
+            active.update(tx).await?;
+        }
+
+        Ok(NetworkDescriptor {
+            network_id: network_id.clone(),
+            owner_did: existing.owner_did,
+            name: existing.name,
+            members: vec![NetworkMemberDescriptor {
+                node_id: self.node_did.clone(),
+                role: "primary".to_string(),
+            }],
+            threshold: Threshold {
+                n: existing.threshold_n,
+                t: existing.threshold_t,
+            },
+            state: NetworkState::Active,
+            public_encryption_key: existing.public_key,
+            alg: existing.alg,
+            key_version: existing.key_version,
+            key_backend: self.backend.kind(),
+            created_at: existing.created_at,
+            updated_at: existing.updated_at,
+        })
+    }
+
+    /// Test hook: fails the create after the numbered insert.
+    fn create_fault_point(&self, stage: u8) -> Result<(), EncryptionServiceError> {
+        #[cfg(test)]
+        if self
+            .create_faults
+            .fail_after_stage
+            .compare_exchange(
+                stage,
+                0,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            return Err(DbErr::Custom(format!("injected failure after insert {stage}")).into());
+        }
+        let _ = stage;
+        Ok(())
     }
 
     pub async fn get_network(
@@ -460,7 +598,7 @@ impl EncryptionService {
             .ok_or(EncryptionServiceError::NetworkNotFound)?;
         let sealed_private_key = model.sealed_private_key.take();
 
-        let members = encryption_network_member::Entity::find()
+        let members: Vec<NetworkMemberDescriptor> = encryption_network_member::Entity::find()
             .filter(encryption_network_member::Column::NetworkId.eq(network_id.to_string()))
             .all(&self.db)
             .await?
@@ -471,9 +609,14 @@ impl EncryptionService {
             })
             .collect();
 
-        let state = NetworkState::parse(&model.state).ok_or_else(|| {
+        let mut state = NetworkState::parse(&model.state).ok_or_else(|| {
             EncryptionServiceError::InvalidBody(format!("unknown network state: {}", model.state))
         })?;
+        // A network row without its member was left half-created by an older
+        // create. It is reported as such and is never used as active.
+        if state == NetworkState::Active && members.is_empty() {
+            state = NetworkState::Incomplete;
+        }
         let backend =
             KeyBackendKind::parse(&model.key_backend).unwrap_or(KeyBackendKind::LocalOneOfOne);
 

@@ -12,7 +12,7 @@ use sea_orm::{
 };
 
 use crate::db::begin_write_transaction;
-use crate::models::{encryption_network, encryption_network_key};
+use crate::models::{encryption_network, encryption_network_key, encryption_network_member};
 
 use super::backend::{KeyBackendError, KeySeed};
 use super::key_id::{app_id_of, is_apps_path, EncryptionResource, KeyKind, KeyLocation};
@@ -146,6 +146,15 @@ async fn load_active_network<C: ConnectionTrait>(
     }
     if row.state != NetworkState::Active.as_str() {
         return Err(EncryptionServiceError::NetworkNotActive(row.state));
+    }
+    let members = encryption_network_member::Entity::find()
+        .filter(encryption_network_member::Column::NetworkId.eq(network.to_string()))
+        .count(db)
+        .await?;
+    if members == 0 {
+        return Err(EncryptionServiceError::NetworkNotActive(
+            NetworkState::Incomplete.as_str().to_string(),
+        ));
     }
     Ok(row)
 }
