@@ -4,7 +4,7 @@ BLS12-381 identity-based wrapping of 32-byte data keys and context-bound encrypt
 
 The crate is a workspace member with `publish = false`. No other workspace crate depends on it; the node server remains the default member. Release-plz neither releases nor publishes it.
 
-## Implemented surface through S0.4
+## Implemented surface through S0.5
 
 - Bounded, canonical scalar, point, identity, ciphertext, request and share encodings.
 - Boneh–Franklin FullIdent wrapping and unwrapping with the TinyCloud domains in [SPEC.md](SPEC.md).
@@ -15,8 +15,9 @@ The crate is a workspace member with `publish = false`. No other workspace crate
 - Externally anchored certificates, pinned succession and certificate-bound candidate shares.
 - Signed response fault classification, readiness receipts and all-holder or explicit outage-budget activation verification.
 - Ceremony-scoped RFC 9180 sealed dealings.
-- Genesis DKG (GJKR New-DKG) over owner-closed rounds: consume-self member states for dealing, complaints, answers, Feldman extraction, the common R5 round and R6 reconstruction, and `dkg_verify_transcript`, which recomputes the outcome from the raw signed round records.
+- Genesis and re-key DKG (GJKR New-DKG) over owner-closed rounds, the re-key under an owner-authorized `re-key` ceremony pinned to the current certificate with the genesis fault budget: consume-self member states for dealing, complaints, answers, Feldman extraction, the common R5 round and R6 reconstruction, and `dkg_verify_transcript`, which recomputes the outcome from the raw signed round records.
 - Redistribution for reshare and refresh over owner-closed rounds R1–R3: Feldman dealings from the current certificate's members to an authorized cohort with a new threshold, complaints and answers, deterministic selection of the first t eligible dealers, and `reshare_verify_transcript`. The master public key is unchanged; the output is a candidate for the successor certificate.
+- A real-ceremony chain test: genesis 2-of-3, reshare to 3-of-4 and back to 2-of-3, refresh, re-key, and further reshares and re-keys, with a certificate, readiness receipts and activation at every generation and each retired generation's shares refused in the next context.
 
 `VerifiedCertificate` supplies `KeyContext` and `PublicKeySet`; `KeyShare::bind` validates a candidate against its certificate. Raw candidate-scalar construction remains crate-private, and the dealer exists only under `#[cfg(test)]`. Redistribution does not erase earlier shares; old and new shares carry different key contexts. Durable storage, retirement and node-runtime paths remain separate slices. Their contracts and the implemented canonical byte layouts are recorded in [SPEC.md](SPEC.md).
 
@@ -38,7 +39,7 @@ PROPTEST_CASES=1024 cargo test --locked -p tinycloud-threshold --release
 cargo deny --manifest-path tinycloud-threshold/Cargo.toml --locked --config tinycloud-threshold/deny.toml check licenses bans advisories sources
 ```
 
-The `threshold` job in `.github/workflows/rust.yml` runs the full release suite, the explicitly selected cargo-deny policy and the independent primitive checker. Workspace test, build, formatting and clippy jobs also include this member.
+The `threshold` job in `.github/workflows/rust.yml` runs the full release suite, the explicitly selected cargo-deny policy and the independent vector checker over every committed vector document. Workspace test, build, formatting and clippy jobs also include this member.
 
 The `checkpoint_2of3` filter runs three checkpoints: the test-dealer checkpoint prints nine executed outcomes, `checkpoint_2of3_dkg` prints five outcomes for a signed 2-of-3 DKG with one reconstructed dealer, its certificate binding and threshold derivation, and `checkpoint_2of3_reshare` prints six outcomes for a DKG genesis redistributed to 3-of-4 and a refused redistribution below t valid dealers. Required RFC tests are separately named `rfc9380_appendix_j_g1_sswu_ro`, `rfc9380_appendix_j_g2_sswu_ro` and `rfc9380_appendix_k1_expand_xmd_sha256`.
 
@@ -64,6 +65,18 @@ TC_THRESHOLD_REGEN_VECTORS=1 cargo test -p tinycloud-threshold dkg_vectors_regen
 
 ```sh
 TC_THRESHOLD_REGEN_VECTORS=1 cargo test -p tinycloud-threshold reshare_vectors_regenerate_byte_for_byte_and_replay
+```
+
+`vectors/v1/dkg-rekey.json` contains the seven genesis cases again under a `re-key` ceremony pinned to a signed current certificate: the same transcript fields plus `current_certificate`, and the recomputed outcome or expected error. `rekey_dkg_vectors_regenerate_byte_for_byte_and_replay` regenerates and compares it and replays every case through `dkg_verify_transcript`. To update it deliberately:
+
+```sh
+TC_THRESHOLD_REGEN_VECTORS=1 cargo test -p tinycloud-threshold rekey_dkg_vectors_regenerate_byte_for_byte_and_replay
+```
+
+`vectors/v1/chain.json` contains one case per generation of the real chain (genesis 2-of-3, reshare 3-of-4, reshare 2-of-3, refresh, re-key 3-of-4, reshare 2-of-3, re-key 2-of-3, reshare 3-of-4): the ceremony transcript, the owner certificate chained to its predecessor, every readiness receipt and the owner activation, with the recomputed ceremony outcome, certificate digest and activation preimage. `chain_vectors_regenerate_byte_for_byte_and_replay` regenerates the file by running the chain, compares its complete bytes and replays every case from the published bytes. To update it deliberately:
+
+```sh
+TC_THRESHOLD_REGEN_VECTORS=1 cargo test -p tinycloud-threshold chain_vectors_regenerate_byte_for_byte_and_replay
 ```
 
 ## Dependencies and licence

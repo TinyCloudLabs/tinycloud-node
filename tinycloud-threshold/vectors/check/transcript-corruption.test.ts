@@ -3,10 +3,10 @@ import { bytes, hex } from './protocol.ts';
 import { dkgVerifyTranscript } from './dkg.ts';
 import { reshareVerifyTranscript } from './reshare.ts';
 import { verifierOf } from './transcripts.ts';
-import { clone, inputOf, loadDoc, probes, verifyInput, type DocCase, type TranscriptInput } from './probes.ts';
+import { AUTHORIZATION_REFUSALS, clone, inputOf, loadDoc, probes, verifyInput, type DocCase, type TranscriptInput } from './probes.ts';
 import { draftsOf, flip, seal, type Draft } from './testkit.ts';
 
-const docs = { dkg: loadDoc('dkg-genesis.json'), reshare: loadDoc('reshare.json') };
+const docs = { dkg: loadDoc('dkg-genesis.json'), rekey: loadDoc('dkg-rekey.json'), reshare: loadDoc('reshare.json') };
 const cli = new URL('./cli.ts', import.meta.url).pathname;
 
 for (const [kind, doc] of Object.entries(docs)) {
@@ -43,8 +43,10 @@ function startOf(c: DocCase) {
 describe('re-signed one-byte payload corruptions reach the rule-level reason', () => {
   const dkg = (name: string) => docs.dkg.cases.find(c => c.name === name)!;
   const reshare = (name: string) => docs.reshare.cases.find(c => c.name === name)!;
+  const rekey = (name: string) => docs.rekey.cases.find(c => c.name === name)!;
   test('resealing unmodified drafts reproduces every committed record byte for byte', () => {
-    for (const c of [...docs.dkg.cases, ...docs.reshare.cases]) {
+    // An authorization refusal attaches the honest transcript of another statement, sealed under that statement's digest.
+    for (const c of [...docs.dkg.cases, ...docs.rekey.cases, ...docs.reshare.cases].filter(x => !('error' in x && AUTHORIZATION_REFUSALS.has(x.error)))) {
       const x = inputOf(c), { digest, start } = startOf(c);
       expect(reseal(x, start, digest, () => {}).records.map(r => hex(r.closure.signature))).toEqual(x.records.map(r => hex(r.closure.signature)));
     }
@@ -59,6 +61,20 @@ describe('re-signed one-byte payload corruptions reach the rule-level reason', (
     const quiet = reseal(x, start, digest, r => payloadFlip(r, 2, 1, 2, () => 0));
     expect(hex(dkgVerifyTranscript(docs.dkg.anchor, quiet.ceremony, quiet.records, verify).mpk.toBytes())).toBe(c.outputs.mpk);
     expect(verifyInput(docs.dkg, reseal(x, start, digest, r => payloadFlip(r, 4, 1, 1, () => 3 + 95)))).toBe('InvalidRound');
+  });
+  test('re-key: dealer 1 commitment byte → MalformedDeal; R2 version byte → no complaint; R4 byte → extraction fault needs R6', () => {
+    const c = rekey('rekey_2of3'), x = inputOf(c), { digest, start } = startOf(c), verify = verifierOf(docs.rekey);
+    const run = (y: TranscriptInput) => dkgVerifyTranscript(docs.rekey.anchor, y.ceremony, y.records, verify, y.certificate);
+    const malformed = run(reseal(x, start, digest, r => payloadFlip(r, 1, 1, 1, () => 3 + 95)));
+    expect(malformed.disqualified).toEqual([{ member: 1, reason: 'MalformedDeal' }]);
+    expect(malformed.qual).toEqual([2, 3]);
+    if (!('outputs' in c)) throw new Error('rekey_2of3 is a success vector');
+    expect(hex(run(reseal(x, start, digest, r => payloadFlip(r, 2, 1, 2, () => 0))).mpk.toBytes())).toBe(c.outputs.mpk);
+    expect(verifyInput(docs.rekey, reseal(x, start, digest, r => payloadFlip(r, 4, 1, 1, () => 3 + 95)))).toBe('InvalidRound');
+  });
+  test('re-key: corrupting the upheld R5 pair leaves nothing to reconstruct, so the R6 record is extra', () => {
+    const c = rekey('rekey_2of3_selective_extraction'), x = inputOf(c), { digest, start } = startOf(c);
+    expect(verifyInput(docs.rekey, reseal(x, start, digest, r => payloadFlip(r, 5, 1, 2, p => p.length - 1)))).toBe('InvalidRound');
   });
   test('genesis: corrupting the upheld R5 pair leaves nothing to reconstruct, so the R6 record is extra', () => {
     const c = dkg('genesis_2of3_selective_extraction'), x = inputOf(c), { digest, start } = startOf(c);

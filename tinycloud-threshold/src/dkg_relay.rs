@@ -15,7 +15,9 @@ use crate::{
         AuthorizedCeremony, CeremonyKind, CeremonyRecipient, CeremonyStatement, ClosedRound,
         Decode, DidSignatureVerifier, MemberCohort, SignedStatement,
     },
-    cert::{verify_certificate, CandidateShare, CertificateBody},
+    cert::{
+        verify_certificate, CandidateShare, CertificateBody, SignedCertificate, VerifiedCertificate,
+    },
     curve::{hash_g2, Scalar, G2},
     dkg::*,
     dst,
@@ -38,25 +40,75 @@ pub(crate) fn pair(value: u64, blinding: u64) -> SharePair {
     }
 }
 
-/// Owner, member DIDs, Ed25519 dev keys and a genesis ceremony with real recipient keys.
+/// Which owner-authorized ceremony kind a scenario runs under. Both use the
+/// same GJKR rounds and genesis budget; a re-key is pinned to a certificate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Setup {
+    Genesis,
+    Rekey,
+}
+
+/// Owner, member DIDs, Ed25519 dev keys and a genesis or re-key ceremony with
+/// real recipient keys.
 pub(crate) struct Fixture {
     pub(crate) signers: Signers,
     pub(crate) ceremony: AuthorizedCeremony,
     pub(crate) statement: SignedStatement,
+    /// The pinned certificate a re-key ceremony succeeds; absent at genesis.
+    pub(crate) current: Option<VerifiedCertificate>,
     pub(crate) seed: u8,
 }
 
-pub(crate) fn statement(t: u16, n: u16, seed: u8) -> (Signers, SignedStatement) {
-    let signers = Signers::new();
+/// Recipient directory with HPKE keys regenerated from `seed`.
+fn recipients(n: u16, seed: u8) -> Vec<CeremonyRecipient> {
     let mut rng = ChaCha20Rng::from_seed([seed; 32]);
-    let recipients = (1..=n)
+    (1..=n)
         .map(|i| CeremonyRecipient {
             index: idx(i),
             node: Signers::did(i as u8),
             hpke_public_key: CeremonyHpkeSecretKey::generate(&mut rng).1.encode(),
         })
-        .collect();
-    let body = CeremonyStatement {
+        .collect()
+}
+
+/// A re-key statement succeeding `current`, recipients did 1..=n.
+pub(crate) fn rekey_statement(
+    signers: &Signers,
+    current: &VerifiedCertificate,
+    t: u16,
+    n: u16,
+    seed: u8,
+) -> SignedStatement {
+    let context = current.key_context();
+    signers.statement(&CeremonyStatement {
+        kind: CeremonyKind::Rekey,
+        id: CeremonyId::new([seed; 32]),
+        network: signers.anchor().network,
+        owner: Signers::did(0),
+        current: Some(current.digest()),
+        threshold: Threshold::new(t, n).unwrap(),
+        rekey: context.rekey().checked_next().unwrap(),
+        epoch: context.epoch().checked_next().unwrap(),
+        recipients: recipients(n, seed),
+    })
+}
+
+/// A re-key ceremony pinned to `current`, as a node would authorize it.
+pub(crate) fn rekey_fixture_on(current: &VerifiedCertificate, t: u16, n: u16, seed: u8) -> Fixture {
+    let signers = Signers::new();
+    let statement = rekey_statement(&signers, current, t, n, seed);
+    let ceremony = AuthorizedCeremony::verify_for(current, &statement, &signers).unwrap();
+    Fixture {
+        signers,
+        ceremony,
+        statement,
+        current: Some(current.clone()),
+        seed,
+    }
+}
+
+pub(crate) fn genesis_statement(signers: &Signers, t: u16, n: u16, seed: u8) -> SignedStatement {
+    signers.statement(&CeremonyStatement {
         kind: CeremonyKind::Genesis,
         id: CeremonyId::new([seed; 32]),
         network: signers.anchor().network,
@@ -65,20 +117,54 @@ pub(crate) fn statement(t: u16, n: u16, seed: u8) -> (Signers, SignedStatement) 
         threshold: Threshold::new(t, n).unwrap(),
         rekey: RekeyCounter::new(0),
         epoch: Epoch::new(0),
-        recipients,
-    };
-    let signed = signers.statement(&body);
-    (signers, signed)
+        recipients: recipients(n, seed),
+    })
 }
 
-pub(crate) fn fixture(t: u16, n: u16, seed: u8) -> Fixture {
-    let (signers, statement) = statement(t, n, seed);
-    let ceremony =
-        AuthorizedCeremony::verify_genesis(&signers.anchor(), &statement, &signers).unwrap();
+/// Statement for `setup`; a re-key succeeds the 2-of-3 test-dealer genesis.
+pub(crate) fn statement_in(
+    setup: Setup,
+    t: u16,
+    n: u16,
+    seed: u8,
+) -> (Signers, SignedStatement, Option<VerifiedCertificate>) {
+    let signers = Signers::new();
+    match setup {
+        Setup::Genesis => {
+            let signed = genesis_statement(&signers, t, n, seed);
+            (signers, signed, None)
+        }
+        Setup::Rekey => {
+            let (current, _) = crate::cert::tests::genesis(&signers);
+            let signed = rekey_statement(&signers, &current, t, n, seed);
+            (signers, signed, Some(current))
+        }
+    }
+}
+
+/// Verify the statement as the ceremony of its setup, the way a node would.
+pub(crate) fn authorize(
+    setup: Setup,
+    signers: &Signers,
+    statement: &SignedStatement,
+) -> Result<AuthorizedCeremony, Error> {
+    match setup {
+        Setup::Genesis => AuthorizedCeremony::verify_genesis(&signers.anchor(), statement, signers),
+        Setup::Rekey => {
+            let (current, _) = crate::cert::tests::genesis(signers);
+            AuthorizedCeremony::verify_for(&current, statement, signers)
+        }
+    }
+}
+
+pub(crate) fn fixture_in(setup: Setup, t: u16, n: u16, seed: u8) -> Fixture {
+    let (signers, statement, current) = statement_in(setup, t, n, seed);
+    let ceremony = authorize(setup, &signers, &statement).unwrap();
     Fixture {
         signers,
         ceremony,
         statement,
+        current,
         seed,
     }
 }
@@ -385,10 +471,24 @@ pub(crate) fn drive<V: DidSignatureVerifier>(
     }
 }
 
-pub(crate) fn run(t: u16, n: u16, seed: u8, tamper: impl FnMut(&mut Outbox)) -> Run {
-    let fixture = fixture(t, n, seed);
+pub(crate) fn run_in(
+    setup: Setup,
+    t: u16,
+    n: u16,
+    seed: u8,
+    tamper: impl FnMut(&mut Outbox),
+) -> Run {
+    let fixture = fixture_in(setup, t, n, seed);
     let signers = Signers::new();
     drive(fixture, &signers, tamper)
+}
+
+pub(crate) fn run(t: u16, n: u16, seed: u8, tamper: impl FnMut(&mut Outbox)) -> Run {
+    run_in(Setup::Genesis, t, n, seed, tamper)
+}
+
+pub(crate) fn honest_in(setup: Setup, t: u16, n: u16, seed: u8) -> Run {
+    run_in(setup, t, n, seed, |_| {})
 }
 
 pub(crate) fn honest(t: u16, n: u16, seed: u8) -> Run {
@@ -545,7 +645,7 @@ pub(crate) fn vanishing_feldman(payload: &[u8], roots: &[u16]) -> Vec<u8> {
     feldman.encode()
 }
 
-fn constants(out: &Outbox, into: &mut BTreeMap<u16, [u8; 96]>) {
+pub(crate) fn constants(out: &Outbox, into: &mut BTreeMap<u16, [u8; 96]>) {
     for i in 1..=out.fixture().n() {
         if out.has(i) {
             let feldman = DkgFeldman::decode(&out.payload(i)).unwrap();
@@ -601,1198 +701,14 @@ fn counting() -> CountingRng {
     }
 }
 
-// ---------------------------------------------------------------- completion
-
-#[test]
-fn genuine_2of3_completes_with_every_member_and_the_verifier_agreeing() {
-    let run = honest(2, 3, 0x31);
-    let output = agreed(&run, &[1, 2, 3]);
-    assert_eq!(output.qual, members(&[1, 2, 3]));
-    assert!(output.disqualified.is_empty());
-    assert!(output.reconstructed.is_empty());
-    assert_eq!(run.transcript.rounds.len(), 5);
-    assert!(run.reconstruct.values().all(|r| !r));
-    assert_eq!(output.public.threshold(), Threshold::new(2, 3).unwrap());
-    let mut sorted = output.public.commitments().collect::<Vec<_>>();
-    assert_eq!(sorted.len(), 2);
-    sorted.dedup();
-    assert_eq!(sorted.len(), 2);
+mod genesis_scenarios {
+    const SETUP: super::Setup = super::Setup::Genesis;
+    include!("dkg_scenarios.rs");
 }
 
-#[test]
-fn genuine_3of4_completes_with_every_member_and_the_verifier_agreeing() {
-    let run = honest(3, 4, 0x32);
-    let output = agreed(&run, &[1, 2, 3, 4]);
-    assert_eq!(output.qual, members(&[1, 2, 3, 4]));
-    assert!(output.disqualified.is_empty());
-    assert!(output.reconstructed.is_empty());
-    assert_eq!(run.transcript.rounds.len(), 5);
-    assert_eq!(output.public.threshold(), Threshold::new(3, 4).unwrap());
-    assert_eq!(output.public.commitments().count(), 3);
-}
-
-#[test]
-fn genesis_outside_the_budget_is_refused_before_any_dealing() {
-    for (t, n) in [(2, 2), (3, 3), (4, 4), (4, 5), (4, 6), (5, 8)] {
-        let (signers, statement) = statement(t, n, 0x32);
-        assert!(
-            matches!(
-                AuthorizedCeremony::verify_genesis(&signers.anchor(), &statement, &signers),
-                Err(Error::UnsupportedFaultBudget)
-            ),
-            "{t}-of-{n}"
-        );
-    }
-}
-
-#[test]
-fn three_of_four_with_one_faulty_member_recovers_the_committed_master_key() {
-    // Member 4 is faulty. Its R4 vector passes only its own check, so honest
-    // members 1-3 complain in R5; it then withholds R6, and the three honest
-    // values recover its committed contribution.
-    let mut constants_seen = BTreeMap::new();
-    let run = run(3, 4, 0x3b, |out| match out.round() {
-        4 => {
-            constants(out, &mut constants_seen);
-            let forged = vanishing_feldman(&out.payload(4), &[4]);
-            out.replace(4, &forged);
-        }
-        6 => out.remove(4),
-        _ => {}
-    });
-    let output = agreed(&run, &[1, 2, 3]);
-    assert_eq!(output.qual, members(&[1, 2, 3, 4]));
-    assert!(output.disqualified.is_empty());
-    assert_eq!(output.reconstructed, members(&[4]));
-    assert_eq!(
-        output.public.master_public_key().encode(),
-        genuine_mpk(&constants_seen, &output.qual)
-    );
-    for i in [1, 2, 3] {
-        assert!(run.reconstruct[&i]);
-    }
-}
-
-#[test]
-fn three_of_five_with_two_faulty_members_recovers_the_committed_master_key() {
-    // Members 4 and 5 are faulty. Dealer 5 publishes a Feldman vector that
-    // passes only at indices 4 and 5; member 4 files a false R5 complaint
-    // against honest dealer 1; both withhold R6.
-    let mut constants_seen = BTreeMap::new();
-    let run = run(3, 5, 0x33, |out| match out.round() {
-        4 => {
-            constants(out, &mut constants_seen);
-            let forged = vanishing_feldman(&out.payload(5), &[4, 5]);
-            out.replace(5, &forged);
-        }
-        5 => {
-            let complaint = DkgExtractionComplaints {
-                complaints: vec![(idx(1), pair(11, 12))],
-            };
-            out.replace(4, &complaint.encode());
-        }
-        6 => {
-            out.remove(4);
-            out.remove(5);
-        }
-        _ => {}
-    });
-    let output = agreed(&run, &[1, 2, 3]);
-    assert_eq!(output.qual, members(&[1, 2, 3, 4, 5]));
-    assert!(output.disqualified.is_empty());
-    assert_eq!(output.reconstructed, members(&[5]));
-    assert_eq!(
-        output.public.master_public_key().encode(),
-        genuine_mpk(&constants_seen, &output.qual)
-    );
-    for i in [1, 2, 3] {
-        assert!(run.reconstruct[&i]);
-    }
-}
-
-#[test]
-fn one_recipient_bad_private_value_is_replaced_by_a_valid_answer() {
-    let mut answer = None;
-    let run = run(2, 3, 0x34, |out| match out.round() {
-        1 => {
-            let forged = bad_dealing(out, 1, 2);
-            out.replace(1, &forged);
-        }
-        2 => assert_eq!(
-            DkgComplaints::decode(&out.payload(2)).unwrap().dealers,
-            vec![idx(1)]
-        ),
-        3 => answer = Some(DkgAnswers::decode(&out.payload(1)).unwrap()),
-        _ => {}
-    });
-    let output = agreed(&run, &[1, 2, 3]);
-    assert_eq!(output.qual, members(&[1, 2, 3]));
-    assert!(output.disqualified.is_empty());
-    let answer = answer.unwrap();
-    assert_eq!(answer.answers.len(), 1);
-    assert_eq!(answer.answers[0].0, idx(2));
-}
-
-// ------------------------------------------------------------ R2/R3 rulings
-
-#[test]
-fn false_complaint_is_refuted_by_a_valid_answer() {
-    let run = run(2, 3, 0x35, |out| {
-        if out.round() == 2 {
-            out.replace(
-                3,
-                &DkgComplaints {
-                    dealers: vec![idx(1)],
-                }
-                .encode(),
-            );
-        }
-    });
-    let output = agreed(&run, &[1, 2, 3]);
-    assert_eq!(output.qual, members(&[1, 2, 3]));
-}
-
-#[test]
-fn t_distinct_complainers_disqualify_even_with_valid_answers() {
-    let run = run(2, 3, 0x36, |out| {
-        if out.round() == 1 {
-            let forged = bad_dealing(out, 3, 1);
-            out.replace(3, &forged);
-            let forged = bad_dealing(out, 3, 2);
-            out.replace(3, &forged);
-        }
-    });
-    let output = agreed(&run, &[1, 2, 3]);
-    assert_eq!(output.qual, members(&[1, 2]));
-    assert_eq!(
-        output.disqualified,
-        BTreeMap::from([(idx(3), DisqualifyReason::Complaints)])
-    );
-}
-
-#[test]
-fn duplicate_complaints_count_once() {
-    // t = 3: two distinct complainers, one retransmitting, stay below t.
-    let run = run(3, 5, 0x37, |out| {
-        if out.round() == 2 {
-            let complaint = DkgComplaints {
-                dealers: vec![idx(1)],
-            }
-            .encode();
-            out.replace(4, &complaint);
-            out.replace(5, &complaint);
-            out.duplicate(4);
-            out.duplicate(4);
-        }
-    });
-    let output = agreed(&run, &[1, 2, 3, 4, 5]);
-    assert_eq!(output.qual, members(&[1, 2, 3, 4, 5]));
-}
-
-#[test]
-fn self_complaints_are_ignored() {
-    // Dealer 3 sends member 1 a bad value and complains against itself. With
-    // the self-complaint counted, two complainers would reach t = 2.
-    let run = run(2, 3, 0x38, |out| match out.round() {
-        1 => {
-            let forged = bad_dealing(out, 3, 1);
-            out.replace(3, &forged);
-        }
-        2 => out.replace(
-            3,
-            &DkgComplaints {
-                dealers: vec![idx(3)],
-            }
-            .encode(),
-        ),
-        _ => {}
-    });
-    let output = agreed(&run, &[1, 2, 3]);
-    assert_eq!(output.qual, members(&[1, 2, 3]));
-}
-
-#[test]
-fn malformed_r2_supplies_no_complaints() {
-    // A well-formed complaint with a trailing byte is malformed: it creates no
-    // required answer, so dealer 1's missing R3 does not disqualify it.
-    let run = run(2, 3, 0x39, |out| match out.round() {
-        2 => {
-            let mut malformed = DkgComplaints {
-                dealers: vec![idx(1)],
-            }
-            .encode();
-            malformed.push(0);
-            out.replace(3, &malformed);
-        }
-        3 => out.remove(1),
-        _ => {}
-    });
-    let output = agreed(&run, &[1, 2, 3]);
-    assert_eq!(output.qual, members(&[1, 2, 3]));
-}
-
-#[test]
-fn conflicting_r2_content_is_equivocation_even_when_malformed() {
-    let run = run(3, 5, 0x3a, |out| {
-        if out.round() == 2 {
-            out.replace(5, &[1, 0]);
-            out.push(5, &[1, 0, 1]);
-            out.replace(4, &[1, 0, 1, 0]);
-            out.duplicate(4);
-        }
-    });
-    let output = agreed(&run, &[1, 2, 3, 4]);
-    assert_eq!(
-        output.disqualified,
-        BTreeMap::from([(idx(5), DisqualifyReason::Equivocated { round: 2 })])
-    );
-    assert_eq!(output.qual, members(&[1, 2, 3, 4]));
-}
-
-/// Retransmit a member's first message with an alternate valid signature encoding.
-fn alternate_signature(out: &mut Outbox, member: u16) {
-    let mut copy = out
-        .messages
-        .iter()
-        .find(|m| sender(m) == member)
-        .cloned()
-        .unwrap();
-    copy.signature.push(0);
-    out.messages.push(copy);
-}
-
-#[test]
-fn different_signature_encoding_is_not_equivocation() {
-    let verifier = Malleable(Signers::new());
-    let run = drive(fixture(2, 3, 0x3b), &verifier, |out| {
-        if out.round() <= 3 {
-            alternate_signature(out, 3);
-        }
-    });
-    assert_eq!(run.transcript.rounds[0].messages.len(), 4);
-    let verified =
-        dkg_verify_transcript(&run.fixture.ceremony, &run.transcript, &verifier).unwrap();
-    assert_eq!(verified.qual, members(&[1, 2, 3]));
-    assert!(verified.disqualified.is_empty());
-    for i in [1, 2, 3] {
-        assert_eq!(view(&run.outcomes[&i].as_ref().unwrap().1), view(&verified));
-    }
-
-    let changed = drive(fixture(2, 3, 0x3b), &verifier, |out| {
-        if out.round() == 1 {
-            let forged = bad_dealing(out, 3, 2);
-            out.push(3, &forged);
-        }
-    });
-    let verified =
-        dkg_verify_transcript(&changed.fixture.ceremony, &changed.transcript, &verifier).unwrap();
-    assert_eq!(
-        verified.disqualified,
-        BTreeMap::from([(idx(3), DisqualifyReason::Equivocated { round: 1 })])
-    );
-}
-
-#[test]
-fn missing_r3_disqualifies_only_with_required_answers() {
-    let run = run(2, 3, 0x3c, |out| match out.round() {
-        2 => out.replace(
-            3,
-            &DkgComplaints {
-                dealers: vec![idx(1)],
-            }
-            .encode(),
-        ),
-        3 => {
-            out.remove(1);
-            out.remove(2);
-        }
-        _ => {}
-    });
-    let output = agreed(&run, &[1, 2, 3]);
-    assert_eq!(
-        output.disqualified,
-        BTreeMap::from([(idx(1), DisqualifyReason::MissingAnswer)])
-    );
-    assert_eq!(output.qual, members(&[2, 3]));
-}
-
-#[test]
-fn malformed_r3_disqualifies_only_with_required_answers() {
-    let run = run(2, 3, 0x3d, |out| match out.round() {
-        2 => out.replace(
-            3,
-            &DkgComplaints {
-                dealers: vec![idx(1)],
-            }
-            .encode(),
-        ),
-        3 => {
-            for dealer in [1, 2] {
-                let mut malformed = out.payload(dealer);
-                malformed.push(0);
-                out.replace(dealer, &malformed);
-            }
-        }
-        _ => {}
-    });
-    let output = agreed(&run, &[1, 2, 3]);
-    assert_eq!(
-        output.disqualified,
-        BTreeMap::from([(idx(1), DisqualifyReason::MissingAnswer)])
-    );
-    assert_eq!(output.qual, members(&[2, 3]));
-}
-
-#[test]
-fn invalid_unsolicited_answer_disqualifies_its_dealer() {
-    let run = run(2, 3, 0x3e, |out| {
-        if out.round() == 3 {
-            let answer = DkgAnswers {
-                answers: vec![(idx(3), pair(5, 6))],
-            };
-            out.replace(2, &answer.encode());
-        }
-    });
-    let output = agreed(&run, &[1, 2, 3]);
-    assert_eq!(
-        output.disqualified,
-        BTreeMap::from([(idx(2), DisqualifyReason::InvalidAnswer)])
-    );
-    assert_eq!(output.qual, members(&[1, 3]));
-}
-
-#[test]
-fn valid_unsolicited_answer_is_ignored() {
-    let mut deal = Vec::new();
-    let run = run(2, 3, 0x3f, |out| match out.round() {
-        1 => deal = out.payload(2),
-        3 => {
-            let answer = DkgAnswers {
-                answers: vec![(idx(3), opened(out.fixture(), &deal, 2, 3))],
-            };
-            out.replace(2, &answer.encode());
-        }
-        _ => {}
-    });
-    let output = agreed(&run, &[1, 2, 3]);
-    assert_eq!(output.qual, members(&[1, 2, 3]));
-    assert!(output.disqualified.is_empty());
-}
-
-#[test]
-fn r2_naming_a_dealer_outside_the_cohort_supplies_no_complaints() {
-    // Member 3's R2 names dealer 1 and index 4 > n. The list is out of cohort,
-    // so it creates no required answer and dealer 1's missing R3 is harmless.
-    let run = run(2, 3, 0x5c, |out| match out.round() {
-        2 => out.replace(
-            3,
-            &DkgComplaints {
-                dealers: vec![idx(1), idx(4)],
-            }
-            .encode(),
-        ),
-        3 => out.remove(1),
-        _ => {}
-    });
-    let output = agreed(&run, &[1, 2, 3]);
-    assert_eq!(output.qual, members(&[1, 2, 3]));
-    assert!(output.disqualified.is_empty());
-}
-
-#[test]
-fn r3_naming_a_recipient_outside_the_cohort_is_malformed() {
-    // Dealer 2 publishes an unrequested R3 entry for index 4 > n: malformed,
-    // and without required answers it does not disqualify. Dealer 1 answers
-    // member 3's complaint validly but adds an index-4 entry: malformed, so the
-    // required answer counts as absent.
-    let run = run(2, 3, 0x5d, |out| match out.round() {
-        2 => out.replace(
-            3,
-            &DkgComplaints {
-                dealers: vec![idx(1)],
-            }
-            .encode(),
-        ),
-        3 => {
-            let mut answers = DkgAnswers::decode(&out.payload(1)).unwrap();
-            assert_eq!(answers.answers.len(), 1);
-            answers.answers.push((idx(4), pair(5, 6)));
-            out.replace(1, &answers.encode());
-            let unrequested = DkgAnswers {
-                answers: vec![(idx(4), pair(5, 6))],
-            };
-            out.replace(2, &unrequested.encode());
-        }
-        _ => {}
-    });
-    // Assert the verifier's outcome directly, so a counted out-of-cohort entry
-    // fails here as a disqualification mismatch rather than inside a helper.
-    assert_eq!(
-        run.verify().map(|o| o.disqualified),
-        Ok(BTreeMap::from([(idx(1), DisqualifyReason::MissingAnswer)]))
-    );
-    let output = agreed(&run, &[1, 2, 3]);
-    assert_eq!(
-        output.disqualified,
-        BTreeMap::from([(idx(1), DisqualifyReason::MissingAnswer)])
-    );
-    assert_eq!(output.qual, members(&[2, 3]));
-}
-
-#[test]
-fn relay_omitted_complaint_fails_only_the_affected_member() {
-    // Failure scenario outside the trusted-relay liveness model.
-    let run = run(2, 3, 0x40, |out| match out.round() {
-        1 => {
-            let forged = bad_dealing(out, 1, 2);
-            out.replace(1, &forged);
-        }
-        2 => out.remove(2),
-        _ => {}
-    });
-    assert!(matches!(
-        run.outcomes[&2],
-        Err(Error::LocalShareUnavailable)
-    ));
-    let output = agreed(&run, &[1, 3]);
-    assert_eq!(output.qual, members(&[1, 2, 3]));
-}
-
-// ------------------------------------------------- R4, barrier and R6 rules
-
-#[test]
-fn selective_r4_reaches_the_common_barrier_and_is_reconstructed() {
-    let mut constants_seen = BTreeMap::new();
-    let mut r5 = BTreeMap::new();
-    let run = run(2, 3, 0x41, |out| match out.round() {
-        4 => {
-            constants(out, &mut constants_seen);
-            let forged = vanishing_feldman(&out.payload(3), &[1]);
-            out.replace(3, &forged);
-        }
-        5 => {
-            for i in 1..=3 {
-                r5.insert(
-                    i,
-                    DkgExtractionComplaints::decode(&out.payload(i))
-                        .unwrap()
-                        .complaints
-                        .len(),
-                );
-            }
-        }
-        _ => {}
-    });
-    // Member 1's own check passed; member 2 complained. Both waited for the
-    // same closed R5 and both entered R6.
-    assert_eq!(r5, BTreeMap::from([(1, 0), (2, 1), (3, 0)]));
-    assert_eq!(
-        run.reconstruct,
-        BTreeMap::from([(1, true), (2, true), (3, true)])
-    );
-    let output = agreed(&run, &[1, 2, 3]);
-    assert_eq!(output.qual, members(&[1, 2, 3]));
-    assert_eq!(output.reconstructed, members(&[3]));
-    assert_eq!(
-        output.public.master_public_key().encode(),
-        genuine_mpk(&constants_seen, &output.qual)
-    );
-    assert_eq!(run.transcript.rounds.len(), 6);
-}
-
-type Mutation = fn(&mut Outbox);
-
-#[test]
-fn bad_missing_and_malformed_r4_are_extraction_faults() {
-    let cases: [(&str, Mutation); 5] = [
-        ("bad", |out| {
-            let forged = vanishing_feldman(&out.payload(3), &[]);
-            out.replace(3, &forged);
-        }),
-        ("missing", |out| out.remove(3)),
-        ("trailing byte", |out| {
-            let mut p = out.payload(3);
-            p.push(0);
-            out.replace(3, &p);
-        }),
-        ("wrong length", |out| {
-            let mut f = DkgFeldman::decode(&out.payload(3)).unwrap();
-            f.commitments.pop();
-            out.replace(3, &f.encode());
-        }),
-        ("invalid point", |out| {
-            let mut p = out.payload(3);
-            p[3 + 95] ^= 1;
-            out.replace(3, &p);
-        }),
-    ];
-    for (name, mutate) in cases {
-        let mut constants_seen = BTreeMap::new();
-        let run = run(2, 3, 0x42, |out| {
-            if out.round() == 4 {
-                constants(out, &mut constants_seen);
-                mutate(out);
-            }
-        });
-        let output = agreed(&run, &[1, 2, 3]);
-        assert_eq!(output.qual, members(&[1, 2, 3]), "{name}");
-        assert_eq!(output.reconstructed, members(&[3]), "{name}");
-        assert_eq!(
-            output.public.master_public_key().encode(),
-            genuine_mpk(&constants_seen, &output.qual),
-            "{name}"
-        );
-    }
-}
-
-#[test]
-fn r1_equivocation_disqualifies_but_r4_equivocation_reconstructs() {
-    let mut constants_seen = BTreeMap::new();
-    let run = run(3, 5, 0x43, |out| match out.round() {
-        1 => {
-            let second = bad_dealing(out, 5, 1);
-            out.push(5, &second);
-        }
-        4 => {
-            constants(out, &mut constants_seen);
-            let second = vanishing_feldman(&out.payload(4), &[]);
-            out.push(4, &second);
-        }
-        _ => {}
-    });
-    let output = agreed(&run, &[1, 2, 3]);
-    assert_eq!(
-        output.disqualified,
-        BTreeMap::from([(idx(5), DisqualifyReason::Equivocated { round: 1 })])
-    );
-    assert_eq!(output.qual, members(&[1, 2, 3, 4]));
-    assert_eq!(output.reconstructed, members(&[4]));
-    assert_eq!(
-        output.public.master_public_key().encode(),
-        genuine_mpk(&constants_seen, &output.qual)
-    );
-}
-
-#[test]
-fn every_member_sends_r5_and_an_empty_barrier_finishes() {
-    let mut r5 = Vec::new();
-    let run = run(2, 3, 0x44, |out| {
-        if out.round() == 5 {
-            for i in 1..=3 {
-                r5.push(DkgExtractionComplaints::decode(&out.payload(i)).unwrap());
-            }
-            assert_eq!(out.messages.len(), 3);
-        }
-    });
-    assert!(r5.iter().all(|r| r.complaints.is_empty()));
-    let output = agreed(&run, &[1, 2, 3]);
-    assert!(output.reconstructed.is_empty());
-    assert_eq!(run.transcript.rounds.len(), 5);
-}
-
-#[test]
-fn missing_or_malformed_r5_counts_as_an_empty_list() {
-    let reference = agreed(&honest(2, 3, 0x45), &[1, 2, 3]);
-    for malformed in [false, true] {
-        let run = run(2, 3, 0x45, |out| {
-            if out.round() == 5 {
-                if malformed {
-                    out.replace(2, &[1, 0]);
-                } else {
-                    out.remove(2);
-                }
-            }
-        });
-        let output = agreed(&run, &[1, 2, 3]);
-        assert!(output.reconstructed.is_empty());
-        assert_eq!(output.qual, reference.qual);
-        assert_eq!(
-            output.public.master_public_key().encode(),
-            reference.public.master_public_key().encode()
-        );
-    }
-}
-
-#[test]
-fn false_extraction_complaints_are_refuted() {
-    // Member 3 complains against dealer 1 with (a) a Pedersen-invalid pair
-    // and (b) its genuine, Feldman-valid pair; neither triggers R6.
-    for genuine in [false, true] {
-        let mut deal = Vec::new();
-        let run = run(2, 3, 0x46, |out| match out.round() {
-            1 => deal = out.payload(1),
-            5 => {
-                let value = if genuine {
-                    opened(out.fixture(), &deal, 1, 3)
-                } else {
-                    pair(5, 6)
-                };
-                let complaint = DkgExtractionComplaints {
-                    complaints: vec![(idx(1), value)],
-                };
-                out.replace(3, &complaint.encode());
-            }
-            _ => {}
-        });
-        let output = agreed(&run, &[1, 2, 3]);
-        assert!(output.reconstructed.is_empty());
-        assert!(run.reconstruct.values().all(|r| !r));
-    }
-}
-
-#[test]
-fn corrupt_dealer_withholding_its_r6_is_recovered_and_kept() {
-    let mut constants_seen = BTreeMap::new();
-    let run = run(2, 3, 0x47, |out| match out.round() {
-        4 => {
-            constants(out, &mut constants_seen);
-            let forged = vanishing_feldman(&out.payload(3), &[]);
-            out.replace(3, &forged);
-        }
-        6 => out.remove(3),
-        _ => {}
-    });
-    let output = agreed(&run, &[1, 2]);
-    assert_eq!(output.qual, members(&[1, 2, 3]));
-    assert_eq!(output.reconstructed, members(&[3]));
-    assert_eq!(
-        output.public.master_public_key().encode(),
-        genuine_mpk(&constants_seen, &output.qual)
-    );
-}
-
-#[test]
-fn invalid_or_equivocated_r6_values_do_not_count() {
-    // Dealer 3 is faulted; member 2 equivocates in R6 and member 3 sends an
-    // invalid value. Only member 1's value is valid, below t = 2.
-    let run = run(2, 3, 0x48, |out| match out.round() {
-        4 => {
-            let forged = vanishing_feldman(&out.payload(3), &[]);
-            out.replace(3, &forged);
-        }
-        6 => {
-            let changed = DkgReconstruction {
-                values: vec![(idx(3), pair(1, 2))],
-            };
-            out.push(2, &changed.encode());
-            out.replace(3, &changed.encode());
-        }
-        _ => {}
-    });
-    for i in [1, 2, 3] {
-        assert!(matches!(run.outcomes[&i], Err(Error::InsufficientRecovery)));
-    }
-    assert!(matches!(run.verify(), Err(Error::InsufficientRecovery)));
-}
-
-#[test]
-fn insufficient_valid_r6_values_abort_with_a_typed_error() {
-    let run = run(2, 3, 0x49, |out| match out.round() {
-        4 => {
-            let forged = vanishing_feldman(&out.payload(3), &[]);
-            out.replace(3, &forged);
-        }
-        6 => {
-            out.remove(2);
-            out.remove(3);
-        }
-        _ => {}
-    });
-    for i in [1, 2, 3] {
-        assert!(matches!(run.outcomes[&i], Err(Error::InsufficientRecovery)));
-    }
-    assert!(matches!(run.verify(), Err(Error::InsufficientRecovery)));
-}
-
-#[test]
-fn fewer_than_t_qualified_dealers_abort_with_a_typed_error() {
-    let run = run(2, 3, 0x4a, |out| {
-        if out.round() == 1 {
-            out.remove(2);
-            out.remove(3);
-        }
-    });
-    for i in [1, 2, 3] {
-        assert!(matches!(
-            run.outcomes[&i],
-            Err(Error::InsufficientQualified)
-        ));
-    }
-    assert_eq!(run.transcript.rounds.len(), 3);
-    assert!(matches!(run.verify(), Err(Error::InsufficientQualified)));
-}
-
-#[test]
-fn missing_and_malformed_r1_disqualify() {
-    let missing = run(3, 5, 0x4b, |out| {
-        if out.round() == 1 {
-            out.remove(4);
-            let mut truncated = out.payload(5);
-            truncated.pop();
-            out.replace(5, &truncated);
-        }
-    });
-    let output = agreed(&missing, &[1, 2, 3]);
-    assert_eq!(
-        output.disqualified,
-        BTreeMap::from([
-            (idx(4), DisqualifyReason::MissingDeal),
-            (idx(5), DisqualifyReason::MalformedDeal)
-        ])
-    );
-    let malformed = run(3, 5, 0x4c, |out| {
-        if out.round() == 1 {
-            let mut deal = DkgDeal::decode(&out.payload(5)).unwrap();
-            deal.commitments.pop();
-            out.replace(5, &deal.encode());
-            let mut deal = DkgDeal::decode(&out.payload(4)).unwrap();
-            deal.dealings.pop();
-            out.replace(4, &deal.encode());
-        }
-    });
-    let output = agreed(&malformed, &[1, 2, 3]);
-    assert_eq!(
-        output.disqualified,
-        BTreeMap::from([
-            (idx(4), DisqualifyReason::MalformedDeal),
-            (idx(5), DisqualifyReason::MalformedDeal)
-        ])
-    );
-}
-
-// --------------------------------------------- authorization and state binding
-
-#[test]
-fn local_recipient_key_and_context_are_checked_before_any_randomness() {
-    let f = fixture(2, 3, 0x50);
-    let mut rng = counting();
-    assert!(matches!(
-        dkg_start(&f.ceremony, idx(1), f.secret(2), &mut rng),
-        Err(Error::ContextMismatch)
-    ));
-    assert!(matches!(
-        dkg_start(&f.ceremony, idx(4), f.secret(1), &mut rng),
-        Err(Error::InvalidIndex)
-    ));
-    let signers = Signers::new();
-    let (current, _) = crate::cert::tests::genesis(&signers);
-    let (_, _, reshare) = crate::cert::tests::successor(
-        &signers,
-        &current,
-        CeremonyKind::Reshare,
-        Threshold::new(2, 3).unwrap(),
-        // Seed 11 matches the genesis fixture, so the reshare keeps its mpk.
-        11,
-    );
-    assert!(matches!(
-        dkg_start(&reshare, idx(1), f.secret(1), &mut rng),
-        Err(Error::InvalidCeremony)
-    ));
-    assert_eq!(rng.draws, 0);
-    let (state, message) = dkg_start(&f.ceremony, idx(1), f.secret(1), &mut rng).unwrap();
-    assert!(rng.draws > 0);
-    assert_eq!(message.round(), 1);
-    assert_eq!(format!("{state:?}"), "DkgDealt([REDACTED])");
-}
-
-fn close_for<M: Decode>(
-    f: &Fixture,
-    ceremony: &AuthorizedCeremony,
-    round: u8,
-    previous: &TranscriptHash,
-    messages: &[SignedStatement],
-) -> Result<ClosedRound<M>, Error> {
-    let bytes = round_closure_body(ceremony, round, previous, messages)?;
-    let closure = SignedStatement {
-        signature: f.signers.sign(
-            &f.signers.anchor().expected_owner,
-            &round_closure_preimage(&bytes)?,
-        ),
-        bytes,
-    };
-    ClosedRound::<M>::verify(ceremony, round, previous, &closure, messages, &f.signers)
-}
-
-#[test]
-fn transitions_refuse_other_ceremonies_rounds_and_histories() {
-    let f = fixture(2, 3, 0x51);
-    let other = fixture(2, 3, 0x52);
-    let h0 = dkg_initial_transcript(&f.ceremony);
-    let start = |i: u16| {
-        let mut rng = f.member_rng(i);
-        dkg_start(&f.ceremony, idx(i), f.secret(i), &mut rng).unwrap()
-    };
-    let r1: Vec<_> = (1..=3).map(|i| f.sign(i, &start(i).1)).collect();
-    let closed1 = close_for::<DkgDeal>(&f, &f.ceremony, 1, &h0, &r1).unwrap();
-
-    // Another authorized ceremony, its own correct history.
-    let other_r1: Vec<_> = (1..=3)
-        .map(|i| {
-            let mut rng = other.member_rng(i);
-            let (_, m) = dkg_start(&other.ceremony, idx(i), other.secret(i), &mut rng).unwrap();
-            other.sign(i, &m)
-        })
-        .collect();
-    let foreign = close_for::<DkgDeal>(
-        &other,
-        &other.ceremony,
-        1,
-        &dkg_initial_transcript(&other.ceremony),
-        &other_r1,
-    )
-    .unwrap();
-    assert!(matches!(
-        start(1).0.complain(&foreign),
-        Err(Error::InvalidRound)
-    ));
-    // The same messages are not accepted under this ceremony's closure.
-    assert!(close_for::<DkgDeal>(&f, &f.ceremony, 1, &h0, &other_r1).is_err());
-
-    // Correct ceremony, wrong previous link.
-    let rebased =
-        close_for::<DkgDeal>(&f, &f.ceremony, 1, &TranscriptHash::new([9; 32]), &r1).unwrap();
-    assert!(matches!(
-        start(1).0.complain(&rebased),
-        Err(Error::InvalidRound)
-    ));
-
-    // A round-2 closure presented to the round-1 transition.
-    let empty = DkgComplaints { dealers: vec![] }.encode();
-    let r2_as_deal: Vec<_> = (1..=3)
-        .map(|i| {
-            let bytes =
-                ceremony_message_body(&f.ceremony, 2, MemberCohort::Recipients, idx(i), &empty)
-                    .unwrap();
-            let preimage = crate::ceremony::ceremony_message_preimage(&bytes).unwrap();
-            SignedStatement {
-                signature: f.signers.sign(&Signers::did(i as u8), &preimage),
-                bytes,
-            }
-        })
-        .collect();
-    let wrong_round = close_for::<DkgDeal>(&f, &f.ceremony, 2, &h0, &r2_as_deal).unwrap();
-    assert!(matches!(
-        start(1).0.complain(&wrong_round),
-        Err(Error::InvalidRound)
-    ));
-
-    // Later phase: R3 chained to R1 instead of R2.
-    let mut states = BTreeMap::new();
-    for i in 1..=3u16 {
-        states.insert(i, start(i).0);
-    }
-    let mut complained = BTreeMap::new();
-    let mut r2 = Vec::new();
-    for (i, s) in states {
-        let (s, m) = s.complain(&closed1).unwrap();
-        r2.push(f.sign(i, &m));
-        complained.insert(i, s);
-    }
-    let closed2 =
-        close_for::<DkgComplaints>(&f, &f.ceremony, 2, &closed1.transcript_hash(), &r2).unwrap();
-    let mut r3 = Vec::new();
-    let mut answered = BTreeMap::new();
-    for (i, s) in complained {
-        let (s, m) = s.answer(&closed2).unwrap();
-        r3.push(f.sign(i, &m));
-        answered.insert(i, s);
-    }
-    let skipped =
-        close_for::<DkgAnswers>(&f, &f.ceremony, 3, &closed1.transcript_hash(), &r3).unwrap();
-    let state = answered.remove(&1).unwrap();
-    assert!(matches!(state.extract(&skipped), Err(Error::InvalidRound)));
-    let chained =
-        close_for::<DkgAnswers>(&f, &f.ceremony, 3, &closed2.transcript_hash(), &r3).unwrap();
-    assert!(answered.remove(&2).unwrap().extract(&chained).is_ok());
-}
-
-#[test]
-fn transitions_refuse_a_foreign_ceremony_closure_on_this_history() {
-    // Same owner, round and previous link (this ceremony's H0); only the
-    // authorized-ceremony digest differs.
-    let f = fixture(2, 3, 0x5a);
-    let other = fixture(2, 3, 0x5b);
-    let h0 = dkg_initial_transcript(&f.ceremony);
-    let other_r1: Vec<_> = (1..=3)
-        .map(|i| {
-            let mut rng = other.member_rng(i);
-            let (_, m) = dkg_start(&other.ceremony, idx(i), other.secret(i), &mut rng).unwrap();
-            other.sign(i, &m)
-        })
-        .collect();
-    let foreign = close_for::<DkgDeal>(&other, &other.ceremony, 1, &h0, &other_r1).unwrap();
-    assert_eq!(foreign.previous_hash(), h0);
-    assert_eq!(foreign.round(), 1);
-    assert_ne!(foreign.ceremony_digest(), f.ceremony.digest());
-    let mut rng = f.member_rng(1);
-    let (state, _) = dkg_start(&f.ceremony, idx(1), f.secret(1), &mut rng).unwrap();
-    assert!(matches!(state.complain(&foreign), Err(Error::InvalidRound)));
-}
-
-#[test]
-fn closed_rounds_reject_wrong_signers_cohorts_and_signatures() {
-    let f = fixture(2, 3, 0x53);
-    let h0 = dkg_initial_transcript(&f.ceremony);
-    let mut rng = f.member_rng(1);
-    let (_, message) = dkg_start(&f.ceremony, idx(1), f.secret(1), &mut rng).unwrap();
-    let genuine = f.sign(1, &message);
-    assert!(close_for::<DkgDeal>(&f, &f.ceremony, 1, &h0, std::slice::from_ref(&genuine)).is_ok());
-
-    let mut wrong_signer = genuine.clone();
-    wrong_signer.signature = f
-        .signers
-        .sign(&Signers::did(2), &message.signing_preimage());
-    assert!(matches!(
-        close_for::<DkgDeal>(&f, &f.ceremony, 1, &h0, &[wrong_signer]),
-        Err(Error::InvalidSignature)
-    ));
-    let mut flipped = genuine.clone();
-    flipped.signature[0] ^= 1;
-    assert!(matches!(
-        close_for::<DkgDeal>(&f, &f.ceremony, 1, &h0, &[flipped]),
-        Err(Error::InvalidSignature)
-    ));
-    let mut current_cohort = genuine.clone();
-    current_cohort.bytes[34] = MemberCohort::Current as u8;
-    current_cohort.signature = f.signers.sign(
-        &Signers::did(1),
-        &crate::ceremony::ceremony_message_preimage(&current_cohort.bytes).unwrap(),
-    );
-    assert!(close_for::<DkgDeal>(&f, &f.ceremony, 1, &h0, &[current_cohort]).is_err());
-}
-
-// -------------------------------------------------------- public verifier
-
-#[test]
-fn verifier_recomputes_from_authenticated_records_only() {
-    let run = run(2, 3, 0x54, |out| {
-        if out.round() == 4 {
-            let forged = vanishing_feldman(&out.payload(2), &[]);
-            out.replace(2, &forged);
-        }
-    });
-    let output = agreed(&run, &[1, 2, 3]);
-    assert_eq!(output.reconstructed, members(&[2]));
-
-    let mut tampered = DkgTranscript {
-        rounds: run.transcript.rounds.clone(),
-    };
-    tampered.rounds[1].messages[0].signature[0] ^= 1;
-    assert!(dkg_verify_transcript(&run.fixture.ceremony, &tampered, &run.fixture.signers).is_err());
-
-    let mut swapped = DkgTranscript {
-        rounds: run.transcript.rounds.clone(),
-    };
-    swapped.rounds.swap(2, 3);
-    assert!(dkg_verify_transcript(&run.fixture.ceremony, &swapped, &run.fixture.signers).is_err());
-
-    let other = fixture(2, 3, 0x55);
-    assert!(dkg_verify_transcript(&other.ceremony, &run.transcript, &run.fixture.signers).is_err());
-
-    let mut missing_r6 = DkgTranscript {
-        rounds: run.transcript.rounds.clone(),
-    };
-    missing_r6.rounds.pop();
-    assert!(matches!(
-        dkg_verify_transcript(&run.fixture.ceremony, &missing_r6, &run.fixture.signers),
-        Err(Error::InvalidRound)
-    ));
-
-    let plain = honest(2, 3, 0x56);
-    let mut extra = DkgTranscript {
-        rounds: plain.transcript.rounds.clone(),
-    };
-    extra.rounds.push(run.transcript.rounds[5].clone());
-    assert!(matches!(
-        dkg_verify_transcript(&plain.fixture.ceremony, &extra, &plain.fixture.signers),
-        Err(Error::InvalidRound)
-    ));
-}
-
-struct Refusing;
-impl DidSignatureVerifier for Refusing {
-    fn verify(&self, _: &Did, _: &[u8], _: &[u8]) -> Result<(), SignatureError> {
-        panic!("size bound must precede signature verification")
-    }
-}
-
-#[test]
-fn transcript_bound_of_4_mib_precedes_verification() {
-    let f = fixture(2, 3, 0x57);
-    let record = |copies: usize| DkgRoundRecord {
-        closure: SignedStatement {
-            bytes: vec![0; 98],
-            signature: vec![0; 64],
-        },
-        messages: vec![
-            SignedStatement {
-                bytes: vec![0; 65_536],
-                signature: vec![0; 64],
-            };
-            copies
-        ],
-    };
-    // 64 × (65 536 + 64) + 98 + 64 bytes exceeds 4 194 304.
-    let over = DkgTranscript {
-        rounds: vec![record(64)],
-    };
-    assert!(matches!(
-        dkg_verify_transcript(&f.ceremony, &over, &Refusing),
-        Err(Error::LimitExceeded)
-    ));
-    let split = DkgTranscript {
-        rounds: vec![record(32), record(32)],
-    };
-    assert!(matches!(
-        dkg_verify_transcript(&f.ceremony, &split, &Refusing),
-        Err(Error::LimitExceeded)
-    ));
-    let under = DkgTranscript {
-        rounds: vec![record(63)],
-    };
-    let result = dkg_verify_transcript(&f.ceremony, &under, &f.signers);
-    assert!(result.is_err());
-    assert!(!matches!(result, Err(Error::LimitExceeded)));
-}
-
-// ----------------------------------------------------- within-budget property
-
-fn misbehave(out: &mut Outbox, m: u16, behaviour: u8, target: u16) {
-    let present = out.has(m);
-    match (out.round(), behaviour) {
-        (1, 1) => out.remove(m),
-        (1, 2) if present => {
-            let mut p = out.payload(m);
-            p.pop();
-            out.replace(m, &p);
-        }
-        (1, 3) if present => {
-            let second = bad_dealing(out, m, target);
-            out.push(m, &second);
-        }
-        (1, 4) | (1, 5) if present => {
-            let forged = bad_dealing(out, m, target);
-            out.replace(m, &forged);
-        }
-        (2, 6) => out.replace(
-            m,
-            &DkgComplaints {
-                dealers: vec![idx(target)],
-            }
-            .encode(),
-        ),
-        (2, 7) => out.push(m, &[1, 0, 1, 0, target as u8]),
-        (3, 5) => out.remove(m),
-        (3, 8) => out.replace(
-            m,
-            &DkgAnswers {
-                answers: vec![(idx(target), pair(5, 6))],
-            }
-            .encode(),
-        ),
-        (4, 9) if present => {
-            let forged = vanishing_feldman(&out.payload(m), &[m]);
-            out.replace(m, &forged);
-        }
-        (4, 10) => out.remove(m),
-        (4, 11) if present => {
-            let mut p = out.payload(m);
-            p.push(0);
-            out.replace(m, &p);
-        }
-        (4, 12) if present => {
-            let second = vanishing_feldman(&out.payload(m), &[]);
-            out.push(m, &second);
-        }
-        (5, 13) => out.replace(
-            m,
-            &DkgExtractionComplaints {
-                complaints: vec![(idx(target), pair(5, 6))],
-            }
-            .encode(),
-        ),
-        (6, 13) | (5, 14) | (6, 14) => out.remove(m),
-        _ => {}
-    }
-}
-
-/// The `misbehave` model has 15 behaviours per faulty member.
-const BEHAVIOURS: u8 = 15;
-/// Fixed fixture seeds; each shape is enumerated under both.
-const ENUMERATION_SEEDS: [u8; 2] = [0x01, 0x9c];
-
-// Coverage: the enumeration below runs every behaviour assignment of the
-// in-tree `misbehave` model to the last f members, where f is the genesis
-// fault budget: t−1 for 2-of-3 and 3-of-5, and 1 for 3-of-4. Under two fixed
-// seeds that is 2 × (15 + 15 + 15 × 15) = 510 ceremonies. It covers this
-// model only, with honest messages always delivered by the relay; it is not a
-// claim about arbitrary faulty behaviour, other seeds or other parameters.
-
-/// One within-budget run: faulty members are the last `behaviours.len()`
-/// indices; every honest member and the verifier agree, honest dealers stay in
-/// QUAL, and mpk is the sum of the QUAL dealers' committed constants.
-fn within_budget_agreement(t: u16, n: u16, seed: u8, behaviours: &[u8]) {
-    let f = behaviours.len() as u16;
-    assert!(f < t && n - f >= t, "{t}-of-{n} with {f} faulty");
-    let honest_members: Vec<u16> = (1..=n - f).collect();
-    let faulty: Vec<u16> = (n - f + 1..=n).collect();
-    let mut constants_seen = BTreeMap::new();
-    let run = run(t, n, seed, |out| {
-        if out.round() == 4 {
-            constants(out, &mut constants_seen);
-        }
-        for (m, behaviour) in faulty.iter().zip(behaviours) {
-            misbehave(out, *m, *behaviour, 1);
-        }
-    });
-    let output = agreed(&run, &honest_members);
-    let faulty_set = members(&faulty);
-    assert!(
-        members(&honest_members).is_subset(&output.qual),
-        "{behaviours:?}"
-    );
-    assert!(
-        output.disqualified.keys().all(|i| faulty_set.contains(i)),
-        "{behaviours:?}"
-    );
-    assert!(
-        output.reconstructed.is_subset(&faulty_set),
-        "{behaviours:?}"
-    );
-    assert_eq!(
-        output.public.master_public_key().encode(),
-        genuine_mpk(&constants_seen, &output.qual),
-        "{behaviours:?}"
-    );
-}
-
-#[test]
-fn every_within_budget_fault_pattern_finishes_with_identical_outcomes_2of3() {
-    for seed in ENUMERATION_SEEDS {
-        for behaviour in 0..BEHAVIOURS {
-            within_budget_agreement(2, 3, seed, &[behaviour]);
-        }
-    }
-}
-
-#[test]
-fn every_within_budget_fault_pattern_finishes_with_identical_outcomes_3of4() {
-    for seed in ENUMERATION_SEEDS {
-        for behaviour in 0..BEHAVIOURS {
-            within_budget_agreement(3, 4, seed, &[behaviour]);
-        }
-    }
-}
-
-#[test]
-fn every_within_budget_fault_pattern_finishes_with_identical_outcomes_3of5() {
-    for seed in ENUMERATION_SEEDS {
-        for first in 0..BEHAVIOURS {
-            for second in 0..BEHAVIOURS {
-                within_budget_agreement(3, 5, seed, &[first, second]);
-            }
-        }
-    }
+mod rekey_scenarios {
+    const SETUP: super::Setup = super::Setup::Rekey;
+    include!("dkg_scenarios.rs");
 }
 
 // ------------------------------------------------------------------ vectors
@@ -1834,8 +750,135 @@ fn output_json(o: &DkgOutput) -> Value {
     })
 }
 
-fn case(name: &str, description: &str, run: &Run) -> Value {
+fn current_json(signers: &Signers, current: &VerifiedCertificate) -> Value {
+    let body = current.body();
+    json!({
+        "body": hex::encode(body.encode()),
+        "owner_signature": hex::encode(signers.sign(&current.anchor().expected_owner, &body.owner_statement())),
+    })
+}
+
+fn rounds_json(rounds: &[DkgRoundRecord]) -> Value {
+    json!(rounds
+        .iter()
+        .map(|r| json!({
+            "closure": hex_statement(&r.closure),
+            "messages": r.messages.iter().map(hex_statement).collect::<Vec<_>>(),
+        }))
+        .collect::<Vec<_>>())
+}
+
+/// A refused ceremony: the signed statement and the certificate it is checked
+/// against, with the rounds a relay might have attached. The expected error is
+/// whatever the real authorization path returns for exactly these bytes.
+#[allow(clippy::too_many_arguments)]
+fn refusal(
+    name: &str,
+    description: &str,
+    signers: &Signers,
+    statement: &SignedStatement,
+    current: &VerifiedCertificate,
+    rounds: &[DkgRoundRecord],
+) -> Value {
+    let decoded = CeremonyStatement::decode(&statement.bytes).unwrap();
+    let digest = dst::tagged_hash(dst::CEREMONY_AUTH, &statement.bytes);
     let inputs = json!({
+        "threshold": decoded.threshold.t(),
+        "members": decoded.threshold.n(),
+        "ceremony": hex_statement(statement),
+        "ceremony_digest": hex::encode(digest),
+        "initial_transcript": hex::encode(dst::tagged_hash(DKG_START, &digest)),
+        "rounds": rounds_json(rounds),
+        "current_certificate": current_json(signers, current),
+    });
+    let error =
+        replay(Setup::Rekey, signers, &inputs).expect_err("refusal vectors must be refused");
+    json!({"name": name, "description": description, "operation": "dkg_verify_transcript", "inputs": inputs, "error": format!("{error:?}")})
+}
+
+fn refusals(honest: &Run) -> Vec<Value> {
+    let f = &honest.fixture;
+    let signers = &f.signers;
+    let current = f.current.as_ref().unwrap();
+    let rounds = &honest.transcript.rounds;
+    let body = CeremonyStatement::decode(&f.statement.bytes).unwrap();
+    let edited = |change: &dyn Fn(&mut CeremonyStatement)| {
+        let mut changed = body.clone();
+        change(&mut changed);
+        signers.statement(&changed)
+    };
+    let (other_generation, _, _) = crate::cert::tests::successor(
+        signers,
+        current,
+        CeremonyKind::Reshare,
+        Threshold::new(2, 3).unwrap(),
+        // Seed 11 keeps the test-dealer master key.
+        11,
+    );
+    let other_generation =
+        crate::cert::verify_successor(current, &other_generation, signers).unwrap();
+    vec![
+        refusal(
+            "rekey_3of3_outside_the_genesis_budget",
+            "F1: a 3-of-3 re-key is outside the genesis fault budget and is refused before any record is read.",
+            signers,
+            &rekey_statement(signers, current, 3, 3, 0x9a),
+            current,
+            &[],
+        ),
+        refusal(
+            "rekey_4of5_outside_the_genesis_budget",
+            "F1: a 4-of-5 re-key is outside the genesis fault budget and is refused before any record is read.",
+            signers,
+            &rekey_statement(signers, current, 4, 5, 0x9b),
+            current,
+            &[],
+        ),
+        refusal(
+            "rekey_names_another_current_certificate",
+            "F4: the owner-signed statement names a current-certificate digest other than the pinned one; the honest transcript is attached and ignored.",
+            signers,
+            &edited(&|b| b.current = Some(CertDigest::new([7; 32]))),
+            current,
+            rounds,
+        ),
+        refusal(
+            "rekey_counter_not_incremented",
+            "F4: the statement keeps the pinned re-key counter instead of its checked successor.",
+            signers,
+            &edited(&|b| b.rekey = current.key_context().rekey()),
+            current,
+            rounds,
+        ),
+        refusal(
+            "rekey_skips_an_epoch",
+            "F4: the statement names epoch + 2.",
+            signers,
+            &edited(&|b| b.epoch = Epoch::new(2)),
+            current,
+            rounds,
+        ),
+        refusal(
+            "genesis_statement_presented_as_rekey",
+            "F4: a genesis statement is not a re-key and is refused against a pinned certificate.",
+            signers,
+            &genesis_statement(signers, 2, 3, 0x9c),
+            current,
+            &[],
+        ),
+        refusal(
+            "rekey_transcript_under_another_generation",
+            "F6: the honest transcript and statement are checked against a later generation of the same network; the statement names the older certificate.",
+            signers,
+            &f.statement,
+            &other_generation,
+            rounds,
+        ),
+    ]
+}
+
+fn case(name: &str, description: &str, run: &Run) -> Value {
+    let mut inputs = json!({
         "threshold": run.fixture.t(),
         "members": run.fixture.n(),
         "ceremony": hex_statement(&run.fixture.statement),
@@ -1846,6 +889,9 @@ fn case(name: &str, description: &str, run: &Run) -> Value {
             "messages": r.messages.iter().map(hex_statement).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
     });
+    if let Some(current) = &run.fixture.current {
+        inputs["current_certificate"] = current_json(&run.fixture.signers, current);
+    }
     match run.verify() {
         Ok(output) => {
             json!({"name": name, "description": description, "operation": "dkg_verify_transcript", "inputs": inputs, "outputs": output_json(&output)})
@@ -1856,15 +902,23 @@ fn case(name: &str, description: &str, run: &Run) -> Value {
     }
 }
 
-fn vectors() -> Value {
-    let honest_run = honest(2, 3, 0x61);
-    let selective = run(2, 3, 0x62, |out| {
+fn vectors(setup: Setup) -> Value {
+    let seed = |genesis: u8| match setup {
+        Setup::Genesis => genesis,
+        Setup::Rekey => genesis + 0x30,
+    };
+    let kind = match setup {
+        Setup::Genesis => "genesis",
+        Setup::Rekey => "rekey",
+    };
+    let honest_run = honest_in(setup, 2, 3, seed(0x61));
+    let selective = run_in(setup, 2, 3, seed(0x62), |out| {
         if out.round() == 4 {
             let forged = vanishing_feldman(&out.payload(3), &[1]);
             out.replace(3, &forged);
         }
     });
-    let two_faulty = run(3, 5, 0x63, |out| match out.round() {
+    let two_faulty = run_in(setup, 3, 5, seed(0x63), |out| match out.round() {
         4 => {
             let forged = vanishing_feldman(&out.payload(5), &[4, 5]);
             out.replace(5, &forged);
@@ -1882,7 +936,7 @@ fn vectors() -> Value {
         }
         _ => {}
     });
-    let answers = run(3, 5, 0x64, |out| match out.round() {
+    let answers = run_in(setup, 3, 5, seed(0x64), |out| match out.round() {
         1 => {
             let forged = bad_dealing(out, 1, 2);
             out.replace(1, &forged);
@@ -1894,7 +948,7 @@ fn vectors() -> Value {
         3 => out.remove(5),
         _ => {}
     });
-    let insufficient = run(2, 3, 0x65, |out| match out.round() {
+    let insufficient = run_in(setup, 2, 3, seed(0x65), |out| match out.round() {
         4 => {
             let forged = vanishing_feldman(&out.payload(3), &[]);
             out.replace(3, &forged);
@@ -1905,13 +959,13 @@ fn vectors() -> Value {
         }
         _ => {}
     });
-    let unqualified = run(2, 3, 0x66, |out| {
+    let unqualified = run_in(setup, 2, 3, seed(0x66), |out| {
         if out.round() == 1 {
             out.remove(2);
             out.remove(3);
         }
     });
-    let three_of_four = run(3, 4, 0x67, |out| match out.round() {
+    let three_of_four = run_in(setup, 3, 4, seed(0x67), |out| match out.round() {
         4 => {
             let forged = vanishing_feldman(&out.payload(4), &[4]);
             out.replace(4, &forged);
@@ -1920,14 +974,19 @@ fn vectors() -> Value {
         _ => {}
     });
     let cases = vec![
-        case("genesis_2of3", "All members follow the protocol; R5 is empty and no R6 round exists.", &honest_run),
-        case("genesis_2of3_selective_extraction", "Dealer 3's R4 vector passes only member 1's check; member 2's R5 complaint leads to R6 reconstruction of dealer 3.", &selective),
-        case("genesis_3of5_two_faulty", "Dealer 5's R4 passes only at members 4 and 5; member 4 files an invalid R5 complaint; members 4 and 5 send no R6.", &two_faulty),
-        case("genesis_3of5_answers_and_disqualification", "Dealer 1's bad value to member 2 is answered; dealer 4 sends two R1 messages; dealer 5 does not answer member 1's complaint.", &answers),
+        case(&format!("{kind}_2of3"), "All members follow the protocol; R5 is empty and no R6 round exists.", &honest_run),
+        case(&format!("{kind}_2of3_selective_extraction"), "Dealer 3's R4 vector passes only member 1's check; member 2's R5 complaint leads to R6 reconstruction of dealer 3.", &selective),
+        case(&format!("{kind}_3of5_two_faulty"), "Dealer 5's R4 passes only at members 4 and 5; member 4 files an invalid R5 complaint; members 4 and 5 send no R6.", &two_faulty),
+        case(&format!("{kind}_3of5_answers_and_disqualification"), "Dealer 1's bad value to member 2 is answered; dealer 4 sends two R1 messages; dealer 5 does not answer member 1's complaint.", &answers),
         case("insufficient_reconstruction_values", "Only member 1 sends R6 for faulted dealer 3.", &insufficient),
         case("insufficient_qualified_dealers", "Only dealer 1 publishes R1.", &unqualified),
-        case("genesis_3of4_one_faulty", "Dealer 4's R4 passes only its own check; members 1-3 complain in R5; member 4 sends no R6 and members 1-3 reconstruct dealer 4.", &three_of_four),
+        case(&format!("{kind}_3of4_one_faulty"), "Dealer 4's R4 passes only its own check; members 1-3 complain in R5; member 4 sends no R6 and members 1-3 reconstruct dealer 4.", &three_of_four),
     ];
+    let mut cases = cases;
+    if setup == Setup::Rekey {
+        cases.extend(refusals(&honest_run));
+    }
+    let ceremony_seeds = [0x61u8, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67].map(seed);
     let signers: Vec<_> = (0..=5u8)
         .map(|i| {
             json!({
@@ -1940,9 +999,12 @@ fn vectors() -> Value {
     json!({
         "format_version": 1,
         "suite": "BLS12-381 G2 Pedersen/Feldman GJKR New-DKG; RFC 9180 base mode DHKEM(X25519, HKDF-SHA256)/HKDF-SHA256/ChaCha20-Poly1305 dealings; Ed25519 test signatures",
-        "spec_sections": ["3.2", "3.3", "3.7", "3.10", "S0.3 DKG appendix"],
+        "spec_sections": match setup {
+            Setup::Genesis => json!(["3.2", "3.3", "3.7", "3.10", "S0.3 DKG appendix"]),
+            Setup::Rekey => json!(["3.2", "3.3", "3.7", "3.9", "3.10", "S0.3 DKG appendix", "S0.5 re-key appendix"]),
+        },
         "encoding": "hex; statements are exact signed bytes; scalars 32-byte big-endian; G2 96-byte compressed",
-        "seeds": {"ceremonies": [0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67]},
+        "seeds": {"ceremonies": ceremony_seeds},
         "dst": {
             "dkg_start": String::from_utf8_lossy(DKG_START),
             "pedersen_h": String::from_utf8_lossy(dst::PEDERSEN_H),
@@ -1960,10 +1022,67 @@ fn vectors() -> Value {
     })
 }
 
-#[test]
-fn dkg_vectors_regenerate_byte_for_byte_and_replay() {
-    let encoded = format!("{}\n", serde_json::to_string_pretty(&vectors()).unwrap());
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("vectors/v1/dkg-genesis.json");
+/// Replay one case from its published bytes alone: authorize the ceremony the
+/// way a node would, then recompute the transcript outcome.
+fn replay(setup: Setup, signers: &Signers, inputs: &Value) -> Result<Value, Error> {
+    let bytes = |v: &Value| hex::decode(v.as_str().unwrap()).unwrap();
+    let statement = |v: &Value| SignedStatement {
+        bytes: bytes(&v["body"]),
+        signature: bytes(&v["signature"]),
+    };
+    let ceremony = match setup {
+        Setup::Genesis => {
+            assert!(inputs.get("current_certificate").is_none());
+            AuthorizedCeremony::verify_genesis(
+                &signers.anchor(),
+                &statement(&inputs["ceremony"]),
+                signers,
+            )?
+        }
+        Setup::Rekey => {
+            let current = verify_certificate(
+                &signers.anchor(),
+                &SignedCertificate {
+                    body: CertificateBody::decode(&bytes(&inputs["current_certificate"]["body"]))?,
+                    owner_signature: bytes(&inputs["current_certificate"]["owner_signature"]),
+                },
+                signers,
+            )
+            .unwrap();
+            AuthorizedCeremony::verify_for(&current, &statement(&inputs["ceremony"]), signers)?
+        }
+    };
+    assert_eq!(
+        dkg_initial_transcript(&ceremony).as_bytes().to_vec(),
+        bytes(&inputs["initial_transcript"])
+    );
+    let transcript = DkgTranscript {
+        rounds: inputs["rounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| DkgRoundRecord {
+                closure: statement(&r["closure"]),
+                messages: r["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(statement)
+                    .collect(),
+            })
+            .collect(),
+    };
+    dkg_verify_transcript(&ceremony, &transcript, signers).map(|output| output_json(&output))
+}
+
+/// Regenerate the document, compare it byte for byte with the published file,
+/// then replay every case from the published bytes alone.
+fn dkg_vector_file(setup: Setup, name: &str) {
+    let encoded = format!(
+        "{}\n",
+        serde_json::to_string_pretty(&vectors(setup)).unwrap()
+    );
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(name);
     if std::env::var("TC_THRESHOLD_REGEN_VECTORS").as_deref() == Ok("1") {
         std::fs::write(&path, &encoded).unwrap();
     }
@@ -1972,44 +1091,27 @@ fn dkg_vectors_regenerate_byte_for_byte_and_replay() {
 
     let file: Value = serde_json::from_str(&published).unwrap();
     let signers = Signers::new();
-    let bytes = |v: &Value| hex::decode(v.as_str().unwrap()).unwrap();
-    let statement = |v: &Value| SignedStatement {
-        bytes: bytes(&v["body"]),
-        signature: bytes(&v["signature"]),
-    };
     for case in file["cases"].as_array().unwrap() {
-        let inputs = &case["inputs"];
-        let ceremony = AuthorizedCeremony::verify_genesis(
-            &signers.anchor(),
-            &statement(&inputs["ceremony"]),
-            &signers,
-        )
-        .unwrap();
-        assert_eq!(
-            dkg_initial_transcript(&ceremony).as_bytes().to_vec(),
-            bytes(&inputs["initial_transcript"])
-        );
-        let transcript = DkgTranscript {
-            rounds: inputs["rounds"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|r| DkgRoundRecord {
-                    closure: statement(&r["closure"]),
-                    messages: r["messages"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .map(statement)
-                        .collect(),
-                })
-                .collect(),
-        };
-        match dkg_verify_transcript(&ceremony, &transcript, &signers) {
-            Ok(output) => assert_eq!(output_json(&output), case["outputs"], "{}", case["name"]),
-            Err(error) => assert_eq!(format!("{error:?}"), case["error"].as_str().unwrap()),
+        match replay(setup, &signers, &case["inputs"]) {
+            Ok(outputs) => assert_eq!(outputs, case["outputs"], "{}", case["name"]),
+            Err(error) => assert_eq!(
+                format!("{error:?}"),
+                case["error"].as_str().unwrap(),
+                "{}",
+                case["name"]
+            ),
         }
     }
+}
+
+#[test]
+fn dkg_vectors_regenerate_byte_for_byte_and_replay() {
+    dkg_vector_file(Setup::Genesis, "vectors/v1/dkg-genesis.json");
+}
+
+#[test]
+fn rekey_dkg_vectors_regenerate_byte_for_byte_and_replay() {
+    dkg_vector_file(Setup::Rekey, "vectors/v1/dkg-rekey.json");
 }
 
 #[test]

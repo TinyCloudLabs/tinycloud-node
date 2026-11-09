@@ -1,4 +1,10 @@
-//! Genesis GJKR New-DKG over owner-closed rounds. Details: TC-2220
+//! GJKR New-DKG over owner-closed rounds, for genesis and for re-key. Details: TC-2220
+//!
+//! A re-key is a fresh genesis-style DKG: the same rounds, rules and fault
+//! budget, run under a re-key `AuthorizedCeremony` pinned to the current
+//! certificate. It uses no old share and produces a new master key. The
+//! ceremony digest binds the kind, so a genesis transcript never verifies under
+//! a re-key ceremony or the reverse.
 //!
 //! Members consume owner-closed rounds in a fixed order through consume-self
 //! states; `dkg_verify_transcript` applies the same public rules to the
@@ -511,7 +517,7 @@ struct Public {
 
 impl Public {
     fn new(c: &AuthorizedCeremony) -> Result<Self, Error> {
-        if c.kind() != CeremonyKind::Genesis {
+        if !matches!(c.kind(), CeremonyKind::Genesis | CeremonyKind::Rekey) {
             return Err(Error::InvalidCeremony);
         }
         c.threshold().check_genesis_budget()?;
@@ -870,7 +876,7 @@ pub enum AfterBarrier {
     Reconstruct(DkgReconstructing, DkgMessage),
 }
 
-/// Validate the genesis context and local recipient key, then deal R1. Details: TC-2220
+/// Validate the genesis or re-key context and local recipient key, then deal R1. Details: TC-2220
 pub fn dkg_start(
     c: &AuthorizedCeremony,
     me: MemberIndex,
