@@ -7,6 +7,24 @@ are refused.
 A key is named by `urn:tinycloud:encryption:<owner>:<network>/<path>`. A prefix
 grant is the same URN with one trailing `/`.
 
+## Key-wrap formats
+
+Root and named keys accept both `x25519-aes256gcm/v1` wraps and TCW2
+`x25519-hkdf-aes256gcm/v2` wraps. Network and key descriptors keep the v1
+algorithm identifier because their key material supports either format.
+Request `alg` identifies the incoming wrap; response `alg` identifies the
+returned receiver wrap independently.
+
+`[global.encryption_network] key_wrap_v2 = false` keeps response writes on v1.
+Set it to `true` (or `TINYCLOUD_ENCRYPTION_NETWORK__KEY_WRAP_V2=true`) only when
+receiving clients support v2. The flag does not restrict either read format.
+TCW2 uses X25519, HKDF-SHA256 and AES-256-GCM with a canonical authenticated
+header binding the recipient, purpose, network, exact key path, key version
+and string metadata. Receiver wraps use empty metadata. Key version is checked
+against the network or named-key row before opening.
+
+Details: TC-2518
+
 ## Key paths
 
 A path is 1 to 8 segments of `[a-z0-9][a-z0-9._-]{0,63}` joined by `/`, at most

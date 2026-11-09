@@ -77,6 +77,9 @@ pub struct Config {
 pub struct EncryptionNetworkConfig {
     #[serde(default)]
     pub named_keys_v1: bool,
+    /// Select v2 response wraps; requests in either format are always accepted.
+    #[serde(default)]
+    pub key_wrap_v2: bool,
     #[serde(default)]
     pub deletion_ledger_path: Option<std::path::PathBuf>,
 }
@@ -2237,6 +2240,16 @@ mod tests {
     }
 
     #[test]
+    fn encryption_network_wrap_v2_is_default_off_and_opt_in() {
+        assert!(!Config::default().encryption_network.key_wrap_v2);
+        let default: EncryptionNetworkConfig = toml::from_str("").unwrap();
+        assert!(!default.key_wrap_v2);
+        let enabled: EncryptionNetworkConfig = toml::from_str("key_wrap_v2 = true").unwrap();
+        assert!(enabled.key_wrap_v2);
+        assert!(enabled.validate().is_ok());
+    }
+
+    #[test]
     fn deletion_ledger_path_is_required_while_named_keys_are_on() {
         let off: EncryptionNetworkConfig = toml::from_str("").unwrap();
         assert!(off.validate().is_ok());
@@ -2259,6 +2272,7 @@ mod tests {
         for bad in ["", "ledger.jsonl", "/var/lib/", "/a/../b"] {
             let config = EncryptionNetworkConfig {
                 named_keys_v1: false,
+                key_wrap_v2: false,
                 deletion_ledger_path: Some(bad.into()),
             };
             assert!(config.validate().is_err(), "{bad:?}");

@@ -6,8 +6,16 @@
 //! random seed, sealed the same way. Future threshold backends must avoid
 //! ever assembling the full network private key.
 
+use std::collections::BTreeMap;
+
+use aes_gcm::{
+    aead::{Aead, KeyInit, Payload},
+    Aes256Gcm, Nonce,
+};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use hkdf::Hkdf;
 use rand::{rngs::OsRng, RngCore};
+use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use thiserror::Error;
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -15,7 +23,8 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::encryption::{ColumnEncryption, EncryptionError};
 
-use super::types::ALG_X25519_AES256GCM;
+use super::network_id::NetworkId;
+use super::types::{ALG_X25519_AES256GCM, ALG_X25519_HKDF_AES256GCM};
 
 #[derive(Debug, Error)]
 pub enum KeyBackendError {
@@ -43,6 +52,285 @@ pub struct GeneratedKey {
     pub alg: String,
 }
 
+/// Wire format selected for newly written wraps; readers accept both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyWrapVersion {
+    V1,
+    V2,
+}
+
+impl KeyWrapVersion {
+    /// Algorithm identifier describing this wrap's bytes.
+    pub fn alg(self) -> &'static str {
+        match self {
+            Self::V1 => ALG_X25519_AES256GCM,
+            Self::V2 => ALG_X25519_HKDF_AES256GCM,
+        }
+    }
+}
+
+/// Intended recipient role, authenticated in a v2 wrap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum KeyWrapPurpose {
+    NetworkKey,
+    ReceiverKey,
+}
+
+/// Authoritative context for a v2 wrap. `None` metadata authenticates the
+/// carried map without comparing an outer map (the node has no payload).
+#[derive(Debug, Clone, Copy)]
+pub struct KeyWrapContext<'a> {
+    pub purpose: KeyWrapPurpose,
+    pub network_id: &'a str,
+    pub key_path: &'a str,
+    pub key_version: i64,
+    pub metadata: Option<&'a BTreeMap<String, String>>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WrapHeader {
+    v: u32,
+    alg: String,
+    kdf: String,
+    aead: String,
+    salt: String,
+    ephemeral_public_key: String,
+    recipient_public_key: String,
+    purpose: KeyWrapPurpose,
+    network_id: String,
+    key_path: String,
+    key_version: i64,
+    metadata: BTreeMap<String, String>,
+}
+
+const WRAP_V2_MAGIC: &[u8; 4] = b"TCW2";
+const WRAP_V2_INFO: &[u8] = b"tinycloud.encryption.key-wrap/v2";
+const MAX_WRAP_HEADER: usize = 64 * 1024;
+
+// JSON.stringify uses UTF-16 key order. Keep this separate from the existing
+// invocation canonicalizer, whose historical ordering must not change.
+fn canonical_header_bytes(value: &serde_json::Value) -> Vec<u8> {
+    fn write(value: &serde_json::Value, out: &mut Vec<u8>) {
+        if let serde_json::Value::Object(map) = value {
+            let mut entries: Vec<_> = map.iter().collect();
+            entries.sort_unstable_by(|(a, _), (b, _)| a.encode_utf16().cmp(b.encode_utf16()));
+            out.push(b'{');
+            for (index, (key, value)) in entries.into_iter().enumerate() {
+                if index != 0 {
+                    out.push(b',');
+                }
+                serde_json::to_writer(&mut *out, key).expect("JSON string serialization");
+                out.push(b':');
+                write(value, out);
+            }
+            out.push(b'}');
+        } else {
+            serde_json::to_writer(out, value).expect("JSON value serialization");
+        }
+    }
+    let mut out = Vec::new();
+    write(value, &mut out);
+    out
+}
+
+/// Identifies a wrap without falling back after the v2 magic is recognized.
+pub fn wrapped_key_version(wrapped: &[u8]) -> KeyWrapVersion {
+    if wrapped.starts_with(WRAP_V2_MAGIC) {
+        KeyWrapVersion::V2
+    } else {
+        KeyWrapVersion::V1
+    }
+}
+
+fn valid_context(context: &KeyWrapContext<'_>) -> bool {
+    (1..=9_007_199_254_740_991).contains(&context.key_version)
+        && (context.network_id.is_empty()
+            || context
+                .network_id
+                .parse::<NetworkId>()
+                .is_ok_and(|network| network.to_string() == context.network_id))
+}
+
+fn decode_header_key(encoded: &str) -> Result<[u8; 32], KeyBackendError> {
+    let bytes = STANDARD
+        .decode(encoded)
+        .map_err(|_| KeyBackendError::InvalidWrappedKey)?;
+    if STANDARD.encode(&bytes) != encoded {
+        return Err(KeyBackendError::InvalidWrappedKey);
+    }
+    bytes
+        .try_into()
+        .map_err(|_| KeyBackendError::InvalidWrappedKey)
+}
+
+fn wrap_cipher(
+    shared: &[u8; 32],
+    salt: &[u8; 32],
+    ephemeral: &[u8; 32],
+    recipient: &[u8; 32],
+) -> Aes256Gcm {
+    let mut info = [0u8; WRAP_V2_INFO.len() + 64];
+    info[..WRAP_V2_INFO.len()].copy_from_slice(WRAP_V2_INFO);
+    info[WRAP_V2_INFO.len()..WRAP_V2_INFO.len() + 32].copy_from_slice(ephemeral);
+    info[WRAP_V2_INFO.len() + 32..].copy_from_slice(recipient);
+    let mut key = Zeroizing::new([0u8; 32]);
+    Hkdf::<Sha256>::new(Some(salt), shared)
+        .expand(&info, key.as_mut_slice())
+        .expect("32 bytes is a valid HKDF-SHA256 output length");
+    Aes256Gcm::new_from_slice(key.as_slice()).expect("32-byte AES-256 key")
+}
+
+/// Wrap to a network or receiver using the selected wire format.
+pub fn wrap_to_public_key_with_context(
+    recipient_public_key: &[u8],
+    plaintext: &[u8],
+    context: &KeyWrapContext<'_>,
+    version: KeyWrapVersion,
+) -> Result<Vec<u8>, KeyBackendError> {
+    if version == KeyWrapVersion::V1 {
+        return wrap_to_public_key(recipient_public_key, plaintext);
+    }
+    let ephemeral = StaticSecret::random_from_rng(OsRng);
+    let mut salt = [0u8; 32];
+    let mut nonce = [0u8; 12];
+    OsRng.fill_bytes(&mut salt);
+    OsRng.fill_bytes(&mut nonce);
+    wrap_v2_with_material(
+        recipient_public_key,
+        plaintext,
+        context,
+        &ephemeral,
+        &salt,
+        &nonce,
+    )
+}
+
+fn wrap_v2_with_material(
+    recipient_public_key: &[u8],
+    plaintext: &[u8],
+    context: &KeyWrapContext<'_>,
+    ephemeral: &StaticSecret,
+    salt: &[u8; 32],
+    nonce: &[u8; 12],
+) -> Result<Vec<u8>, KeyBackendError> {
+    if !valid_context(context) {
+        return Err(KeyBackendError::InvalidWrappedKey);
+    }
+    let recipient_bytes: [u8; 32] = recipient_public_key
+        .try_into()
+        .map_err(|_| KeyBackendError::InvalidPublicKey)?;
+    let recipient = PublicKey::from(recipient_bytes);
+    let ephemeral_public = PublicKey::from(ephemeral);
+    let shared = ephemeral.diffie_hellman(&recipient);
+    if !shared.was_contributory() {
+        return Err(KeyBackendError::NonContributory);
+    }
+    let header = WrapHeader {
+        v: 2,
+        alg: ALG_X25519_HKDF_AES256GCM.into(),
+        kdf: "hkdf-sha256".into(),
+        aead: "aes-256-gcm".into(),
+        salt: STANDARD.encode(salt),
+        ephemeral_public_key: STANDARD.encode(ephemeral_public.as_bytes()),
+        recipient_public_key: STANDARD.encode(recipient_public_key),
+        purpose: context.purpose,
+        network_id: context.network_id.into(),
+        key_path: context.key_path.into(),
+        key_version: context.key_version,
+        metadata: context.metadata.cloned().unwrap_or_default(),
+    };
+    let value = serde_json::to_value(header).map_err(|_| KeyBackendError::InvalidWrappedKey)?;
+    let header_bytes = canonical_header_bytes(&value);
+    if header_bytes.len() > MAX_WRAP_HEADER {
+        return Err(KeyBackendError::InvalidWrappedKey);
+    }
+    let mut frame = Vec::with_capacity(8 + header_bytes.len() + 12 + plaintext.len() + 16);
+    frame.extend_from_slice(WRAP_V2_MAGIC);
+    frame.extend_from_slice(&(header_bytes.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&header_bytes);
+    let cipher = wrap_cipher(
+        shared.as_bytes(),
+        salt,
+        ephemeral_public.as_bytes(),
+        &recipient_bytes,
+    );
+    let encrypted = cipher
+        .encrypt(
+            &Nonce::from(*nonce),
+            Payload {
+                msg: plaintext,
+                aad: &frame,
+            },
+        )
+        .map_err(|e| KeyBackendError::Aead(e.to_string()))?;
+    frame.extend_from_slice(nonce);
+    frame.extend_from_slice(&encrypted);
+    Ok(frame)
+}
+
+/// Open either wire format, checking all supplied v2 context before decrypting.
+pub fn open_wrapped_key(
+    secret: &StaticSecret,
+    wrapped: &[u8],
+    context: &KeyWrapContext<'_>,
+) -> Result<Vec<u8>, KeyBackendError> {
+    if wrapped_key_version(wrapped) == KeyWrapVersion::V1 {
+        return unwrap_with_secret(secret, wrapped);
+    }
+    if wrapped.len() < 8 || !valid_context(context) {
+        return Err(KeyBackendError::InvalidWrappedKey);
+    }
+    let length = u32::from_be_bytes(wrapped[4..8].try_into().expect("four-byte length")) as usize;
+    if length > MAX_WRAP_HEADER || wrapped.len() < 8 + length + 12 + 16 {
+        return Err(KeyBackendError::InvalidWrappedKey);
+    }
+    let end = 8 + length;
+    let header: WrapHeader =
+        serde_json::from_slice(&wrapped[8..end]).map_err(|_| KeyBackendError::InvalidWrappedKey)?;
+    let value = serde_json::to_value(&header).map_err(|_| KeyBackendError::InvalidWrappedKey)?;
+    if canonical_header_bytes(&value) != wrapped[8..end]
+        || header.v != 2
+        || header.alg != ALG_X25519_HKDF_AES256GCM
+        || header.kdf != "hkdf-sha256"
+        || header.aead != "aes-256-gcm"
+        || header.purpose != context.purpose
+        || header.network_id != context.network_id
+        || header.key_path != context.key_path
+        || header.key_version != context.key_version
+        || context
+            .metadata
+            .is_some_and(|metadata| metadata != &header.metadata)
+    {
+        return Err(KeyBackendError::InvalidWrappedKey);
+    }
+    let salt = decode_header_key(&header.salt)?;
+    let ephemeral = decode_header_key(&header.ephemeral_public_key)?;
+    let recipient = decode_header_key(&header.recipient_public_key)?;
+    let actual_recipient = PublicKey::from(secret);
+    if recipient != *actual_recipient.as_bytes() {
+        return Err(KeyBackendError::InvalidWrappedKey);
+    }
+    let shared = secret.diffie_hellman(&PublicKey::from(ephemeral));
+    if !shared.was_contributory() {
+        return Err(KeyBackendError::NonContributory);
+    }
+    let cipher = wrap_cipher(shared.as_bytes(), &salt, &ephemeral, &recipient);
+    cipher
+        .decrypt(
+            &Nonce::from(
+                <[u8; 12]>::try_from(&wrapped[end..end + 12])
+                    .map_err(|_| KeyBackendError::InvalidWrappedKey)?,
+            ),
+            Payload {
+                msg: &wrapped[end + 12..],
+                aad: &wrapped[..end],
+            },
+        )
+        .map_err(|e| KeyBackendError::Aead(e.to_string()))
+}
+
 /// Trait implemented by network key backends.
 ///
 /// `unwrap` returns the raw symmetric key after decrypting the wrapped key with
@@ -58,12 +346,15 @@ pub trait KeyBackend: Send + Sync {
         &self,
         sealed_private_key: &[u8],
         wrapped_key: &[u8],
+        context: &KeyWrapContext<'_>,
     ) -> Result<Vec<u8>, KeyBackendError>;
 
     fn rewrap(
         &self,
         symmetric_key: &[u8],
         receiver_public_key: &[u8],
+        context: &KeyWrapContext<'_>,
+        version: KeyWrapVersion,
     ) -> Result<Vec<u8>, KeyBackendError>;
 
     /// Unseal the network private key. A failure here is a backend fault,
@@ -91,6 +382,7 @@ pub trait KeyBackend: Send + Sync {
         canonical_urn: &str,
         seed: Option<&KeySeed>,
         wrapped_key: &[u8],
+        context: &KeyWrapContext<'_>,
     ) -> Result<Vec<u8>, KeyBackendError>;
 
     /// A fresh 32-byte seed from the OS CSPRNG, with its sealed form for
@@ -263,11 +555,12 @@ impl KeyBackend for LocalOneOfOneBackend {
         &self,
         sealed_private_key: &[u8],
         wrapped_key: &[u8],
+        context: &KeyWrapContext<'_>,
     ) -> Result<Vec<u8>, KeyBackendError> {
         let secret = self
             .open_network_secret(sealed_private_key)
             .map_err(|_| KeyBackendError::SealedKeyUnreadable)?;
-        unwrap_with_secret(&secret, wrapped_key)
+        open_wrapped_key(&secret, wrapped_key, context)
     }
 
     fn derive_named_public_key(
@@ -286,9 +579,10 @@ impl KeyBackend for LocalOneOfOneBackend {
         canonical_urn: &str,
         seed: Option<&KeySeed>,
         wrapped_key: &[u8],
+        context: &KeyWrapContext<'_>,
     ) -> Result<Vec<u8>, KeyBackendError> {
         let secret = named_key_secret(network_secret.as_bytes(), canonical_urn, seed);
-        unwrap_with_secret(&secret, wrapped_key)
+        open_wrapped_key(&secret, wrapped_key, context)
     }
 
     fn generate_seed(&self) -> Result<(KeySeed, Vec<u8>), KeyBackendError> {
@@ -311,8 +605,10 @@ impl KeyBackend for LocalOneOfOneBackend {
         &self,
         symmetric_key: &[u8],
         receiver_public_key: &[u8],
+        context: &KeyWrapContext<'_>,
+        version: KeyWrapVersion,
     ) -> Result<Vec<u8>, KeyBackendError> {
-        wrap_to_public_key(receiver_public_key, symmetric_key)
+        wrap_to_public_key_with_context(receiver_public_key, symmetric_key, context, version)
     }
 }
 
@@ -324,13 +620,325 @@ mod tests {
         ColumnEncryption::new([7u8; 32])
     }
 
+    fn legacy_context() -> KeyWrapContext<'static> {
+        KeyWrapContext {
+            purpose: KeyWrapPurpose::NetworkKey,
+            network_id: "",
+            key_path: "",
+            key_version: 1,
+            metadata: None,
+        }
+    }
+
+    fn wrap_context<'a>(
+        metadata: &'a std::collections::BTreeMap<String, String>,
+    ) -> KeyWrapContext<'a> {
+        KeyWrapContext {
+            purpose: KeyWrapPurpose::NetworkKey,
+            network_id: "urn:tinycloud:encryption:did:key:z6Mk:default",
+            key_path: "docs/alpha",
+            key_version: 1,
+            metadata: Some(metadata),
+        }
+    }
+
+    #[test]
+    fn v2_wrap_binds_context_and_both_public_keys() {
+        let metadata = std::collections::BTreeMap::from([
+            ("contentType".into(), "text/plain".into()),
+            ("\u{10000}".into(), "non-BMP".into()),
+            ("\u{e000}".into(), "BMP".into()),
+        ]);
+        let empty = std::collections::BTreeMap::new();
+        let context = wrap_context(&metadata);
+        let secret = StaticSecret::from([9u8; 32]);
+        let public = PublicKey::from(&secret);
+        let wrapped = wrap_to_public_key_with_context(
+            public.as_bytes(),
+            &[0x42; 32],
+            &context,
+            KeyWrapVersion::V2,
+        )
+        .unwrap();
+        assert!(wrapped.starts_with(b"TCW2"));
+        assert_eq!(
+            open_wrapped_key(&secret, &wrapped, &context).unwrap(),
+            [0x42; 32]
+        );
+        for wrong in [
+            KeyWrapContext {
+                purpose: KeyWrapPurpose::ReceiverKey,
+                ..context
+            },
+            KeyWrapContext {
+                network_id: "urn:tinycloud:encryption:did:key:z6Mk:other",
+                ..context
+            },
+            KeyWrapContext {
+                key_path: "docs/beta",
+                ..context
+            },
+            KeyWrapContext {
+                key_version: 2,
+                ..context
+            },
+            KeyWrapContext {
+                metadata: Some(&empty),
+                ..context
+            },
+        ] {
+            assert!(open_wrapped_key(&secret, &wrapped, &wrong).is_err());
+        }
+        assert!(open_wrapped_key(&StaticSecret::from([8u8; 32]), &wrapped, &context).is_err());
+        // The node authenticates carried metadata without an outer payload to compare.
+        assert!(open_wrapped_key(
+            &secret,
+            &wrapped,
+            &KeyWrapContext {
+                metadata: None,
+                ..context
+            }
+        )
+        .is_ok());
+        assert!(
+            wrap_to_public_key_with_context(&[0; 32], &[1; 32], &context, KeyWrapVersion::V2)
+                .is_err()
+        );
+        for key_version in [0, -1, 9_007_199_254_740_992] {
+            let invalid = KeyWrapContext {
+                key_version,
+                ..context
+            };
+            assert!(wrap_to_public_key_with_context(
+                public.as_bytes(),
+                &[1; 32],
+                &invalid,
+                KeyWrapVersion::V2
+            )
+            .is_err());
+        }
+    }
+
+    fn replace_v2_header(wrapped: &[u8], mutate: impl FnOnce(&mut serde_json::Value)) -> Vec<u8> {
+        let length = u32::from_be_bytes(wrapped[4..8].try_into().unwrap()) as usize;
+        let mut header: serde_json::Value =
+            serde_json::from_slice(&wrapped[8..8 + length]).unwrap();
+        mutate(&mut header);
+        let bytes = canonical_header_bytes(&header);
+        let mut changed = b"TCW2".to_vec();
+        changed.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+        changed.extend_from_slice(&bytes);
+        changed.extend_from_slice(&wrapped[8 + length..]);
+        changed
+    }
+
+    #[test]
+    fn v2_rejects_tampering_noncanonical_and_truncated_frames() {
+        use serde_json::json;
+        let metadata = std::collections::BTreeMap::new();
+        let context = wrap_context(&metadata);
+        let secret = StaticSecret::from([9u8; 32]);
+        let wrapped = wrap_to_public_key_with_context(
+            PublicKey::from(&secret).as_bytes(),
+            &[0x42; 32],
+            &context,
+            KeyWrapVersion::V2,
+        )
+        .unwrap();
+        for (field, value) in [
+            ("v", json!(3)),
+            ("alg", json!("x25519-aes256gcm/v1")),
+            ("kdf", json!("other")),
+            ("aead", json!("other")),
+            ("purpose", json!("receiver-key")),
+            ("networkId", json!("other")),
+            ("keyPath", json!("docs/beta")),
+            ("keyVersion", json!(2)),
+            ("metadata", json!({"different": "value"})),
+            ("salt", json!(STANDARD.encode([3; 32]))),
+            ("ephemeralPublicKey", json!(STANDARD.encode([0; 32]))),
+            ("recipientPublicKey", json!(STANDARD.encode([3; 32]))),
+            ("extra", json!(true)),
+            ("v", json!("2")),
+            ("keyVersion", json!(0)),
+            ("keyVersion", json!(-1)),
+            ("keyVersion", json!(1.5)),
+            ("keyVersion", json!(9_007_199_254_740_992i64)),
+            ("metadata", json!({"bad": 1})),
+            ("metadata", json!([])),
+            ("salt", json!("not-base64")),
+            ("salt", json!(STANDARD.encode([1; 31]))),
+            ("ephemeralPublicKey", json!(STANDARD.encode([1; 31]))),
+            ("recipientPublicKey", json!(STANDARD.encode([1; 31]))),
+            (
+                "ephemeralPublicKey",
+                json!(STANDARD.encode(PublicKey::from(&StaticSecret::from([7; 32])).as_bytes())),
+            ),
+        ] {
+            let changed = replace_v2_header(&wrapped, |header| header[field] = value);
+            assert!(
+                open_wrapped_key(&secret, &changed, &context).is_err(),
+                "{field}"
+            );
+        }
+        let carried_metadata = replace_v2_header(&wrapped, |header| {
+            header["metadata"] = json!({"carried": "changed"})
+        });
+        let node_context = KeyWrapContext {
+            metadata: None,
+            ..context
+        };
+        assert!(open_wrapped_key(&secret, &carried_metadata, &node_context).is_err());
+        for field in ["metadata", "salt", "keyVersion", "purpose"] {
+            let changed = replace_v2_header(&wrapped, |header| {
+                header.as_object_mut().unwrap().remove(field);
+            });
+            assert!(
+                open_wrapped_key(&secret, &changed, &context).is_err(),
+                "missing {field}"
+            );
+        }
+        for length in 4..wrapped.len() {
+            assert!(
+                open_wrapped_key(&secret, &wrapped[..length], &context).is_err(),
+                "{length}"
+            );
+        }
+        let mut oversized = b"TCW2".to_vec();
+        oversized.extend_from_slice(&65537u32.to_be_bytes());
+        assert!(open_wrapped_key(&secret, &oversized, &context).is_err());
+        let header_len = u32::from_be_bytes(wrapped[4..8].try_into().unwrap()) as usize;
+        let mut noncanonical = wrapped.clone();
+        noncanonical.insert(8, b' ');
+        noncanonical[4..8].copy_from_slice(&((header_len + 1) as u32).to_be_bytes());
+        assert!(open_wrapped_key(&secret, &noncanonical, &context).is_err());
+        for index in [8 + header_len, wrapped.len() - 1] {
+            let mut changed = wrapped.clone();
+            changed[index] ^= 1;
+            assert!(open_wrapped_key(&secret, &changed, &context).is_err());
+        }
+    }
+
+    #[test]
+    fn v2_writes_use_fresh_material_and_v1_stays_available() {
+        let metadata = BTreeMap::new();
+        let context = wrap_context(&metadata);
+        let secret = StaticSecret::from([9; 32]);
+        let public = PublicKey::from(&secret);
+        let first = wrap_to_public_key_with_context(
+            public.as_bytes(),
+            &[1; 32],
+            &context,
+            KeyWrapVersion::V2,
+        )
+        .unwrap();
+        let second = wrap_to_public_key_with_context(
+            public.as_bytes(),
+            &[1; 32],
+            &context,
+            KeyWrapVersion::V2,
+        )
+        .unwrap();
+        let parse = |frame: &[u8]| {
+            let length = u32::from_be_bytes(frame[4..8].try_into().unwrap()) as usize;
+            (
+                serde_json::from_slice::<serde_json::Value>(&frame[8..8 + length]).unwrap(),
+                frame[8 + length..8 + length + 12].to_vec(),
+            )
+        };
+        let (first_header, first_nonce) = parse(&first);
+        let (second_header, second_nonce) = parse(&second);
+        assert_ne!(first_header["salt"], second_header["salt"]);
+        assert_ne!(
+            first_header["ephemeralPublicKey"],
+            second_header["ephemeralPublicKey"]
+        );
+        assert_ne!(first_nonce, second_nonce);
+        let legacy = wrap_to_public_key_with_context(
+            public.as_bytes(),
+            &[1; 32],
+            &context,
+            KeyWrapVersion::V1,
+        )
+        .unwrap();
+        assert_eq!(legacy[32], 1);
+        assert_eq!(
+            open_wrapped_key(&secret, &legacy, &context).unwrap(),
+            [1; 32]
+        );
+    }
+
+    #[test]
+    fn shared_key_wrap_vectors_open_and_reemit() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/key-wrap-v2.json")).unwrap();
+        for vector in fixture["vectors"].as_array().unwrap() {
+            let decode = |field: &str| STANDARD.decode(vector[field].as_str().unwrap()).unwrap();
+            let secret =
+                StaticSecret::from(<[u8; 32]>::try_from(decode("recipientPrivateKey")).unwrap());
+            let ephemeral =
+                StaticSecret::from(<[u8; 32]>::try_from(decode("ephemeralPrivateKey")).unwrap());
+            let metadata = serde_json::from_value(vector["context"]["metadata"].clone()).unwrap();
+            let context = KeyWrapContext {
+                purpose: serde_json::from_value(vector["purpose"].clone()).unwrap(),
+                network_id: vector["context"]["networkId"].as_str().unwrap(),
+                key_path: vector["context"]["keyPath"].as_str().unwrap(),
+                key_version: vector["context"]["keyVersion"].as_i64().unwrap(),
+                metadata: Some(&metadata),
+            };
+            assert_eq!(
+                PublicKey::from(&secret).as_bytes().as_slice(),
+                decode("recipientPublicKey")
+            );
+            assert_eq!(
+                PublicKey::from(&ephemeral).as_bytes().as_slice(),
+                decode("ephemeralPublicKey")
+            );
+            let wrapped = decode("wrappedKey");
+            let plaintext = decode("plaintext");
+            assert_eq!(
+                open_wrapped_key(&secret, &wrapped, &context).unwrap(),
+                plaintext,
+                "{}",
+                vector["name"]
+            );
+            let nonce: [u8; 12] = decode("nonce").try_into().unwrap();
+            let emitted = if vector["version"] == 2 {
+                wrap_v2_with_material(
+                    PublicKey::from(&secret).as_bytes(),
+                    &plaintext,
+                    &context,
+                    &ephemeral,
+                    &decode("salt").try_into().unwrap(),
+                    &nonce,
+                )
+                .unwrap()
+            } else {
+                let shared = ephemeral.diffie_hellman(&PublicKey::from(&secret));
+                let cipher = Aes256Gcm::new_from_slice(shared.as_bytes()).unwrap();
+                let mut frame = PublicKey::from(&ephemeral).as_bytes().to_vec();
+                frame.push(1);
+                frame.extend_from_slice(&nonce);
+                frame.extend_from_slice(
+                    &cipher
+                        .encrypt(&Nonce::from(nonce), plaintext.as_slice())
+                        .unwrap(),
+                );
+                frame
+            };
+            assert_eq!(emitted, wrapped, "{}", vector["name"]);
+        }
+    }
+
     #[test]
     fn generate_and_unwrap_round_trip() {
         let backend = LocalOneOfOneBackend::new(seal_key());
         let gk = backend.generate().unwrap();
         let symmetric = [0xABu8; 32];
         let wrapped = wrap_to_public_key(&gk.public_key, &symmetric).unwrap();
-        let recovered = backend.unwrap(&gk.sealed_private_key, &wrapped).unwrap();
+        let recovered = backend
+            .unwrap(&gk.sealed_private_key, &wrapped, &legacy_context())
+            .unwrap();
         assert_eq!(recovered, symmetric);
     }
 
@@ -341,7 +949,14 @@ mod tests {
 
         let receiver_secret = StaticSecret::random_from_rng(OsRng);
         let receiver_pub = PublicKey::from(&receiver_secret);
-        let rewrapped = backend.rewrap(&symmetric, receiver_pub.as_bytes()).unwrap();
+        let rewrapped = backend
+            .rewrap(
+                &symmetric,
+                receiver_pub.as_bytes(),
+                &legacy_context(),
+                KeyWrapVersion::V1,
+            )
+            .unwrap();
         let recovered = unwrap_with_secret(&receiver_secret, &rewrapped).unwrap();
         assert_eq!(recovered, symmetric);
     }
@@ -353,13 +968,22 @@ mod tests {
         let wrapped = wrap_to_public_key(&gk.public_key, &[1u8; 32]).unwrap();
         let mut corrupted = gk.sealed_private_key.clone();
         corrupted[5] ^= 0xFF;
-        assert!(backend.unwrap(&corrupted, &wrapped).is_err());
+        assert!(backend
+            .unwrap(&corrupted, &wrapped, &legacy_context())
+            .is_err());
     }
 
     #[test]
     fn rejects_short_receiver_pubkey() {
         let backend = LocalOneOfOneBackend::new(seal_key());
-        let err = backend.rewrap(&[0u8; 32], &[1u8; 10]).unwrap_err();
+        let err = backend
+            .rewrap(
+                &[0u8; 32],
+                &[1u8; 10],
+                &legacy_context(),
+                KeyWrapVersion::V1,
+            )
+            .unwrap_err();
         assert!(matches!(err, KeyBackendError::InvalidPublicKey));
     }
 
@@ -515,14 +1139,16 @@ mod tests {
         let symmetric = [0x5Au8; 32];
         let wrapped = wrap_to_public_key(&named_pub, &symmetric).unwrap();
         let recovered = backend
-            .unwrap_named(&network, KAT_URN_NOTES, None, &wrapped)
+            .unwrap_named(&network, KAT_URN_NOTES, None, &wrapped, &legacy_context())
             .unwrap();
         assert_eq!(recovered, symmetric);
         // Wrapped to the notes key: a sibling key and the root key cannot open it.
         assert!(backend
-            .unwrap_named(&network, KAT_URN_A, None, &wrapped)
+            .unwrap_named(&network, KAT_URN_A, None, &wrapped, &legacy_context())
             .is_err());
-        assert!(backend.unwrap(&gk.sealed_private_key, &wrapped).is_err());
+        assert!(backend
+            .unwrap(&gk.sealed_private_key, &wrapped, &legacy_context())
+            .is_err());
     }
 
     #[test]
@@ -541,21 +1167,41 @@ mod tests {
         let wrapped = wrap_to_public_key(&public, &symmetric).unwrap();
         assert_eq!(
             backend
-                .unwrap_named(&network, KAT_URN_NOTES, Some(&opened), &wrapped)
+                .unwrap_named(
+                    &network,
+                    KAT_URN_NOTES,
+                    Some(&opened),
+                    &wrapped,
+                    &legacy_context()
+                )
                 .unwrap(),
             symmetric
         );
         // Another seed, no seed, another URN and the network key cannot open it.
         assert!(backend
-            .unwrap_named(&network, KAT_URN_NOTES, Some(&other_seed), &wrapped)
+            .unwrap_named(
+                &network,
+                KAT_URN_NOTES,
+                Some(&other_seed),
+                &wrapped,
+                &legacy_context()
+            )
             .is_err());
         assert!(backend
-            .unwrap_named(&network, KAT_URN_NOTES, None, &wrapped)
+            .unwrap_named(&network, KAT_URN_NOTES, None, &wrapped, &legacy_context())
             .is_err());
         assert!(backend
-            .unwrap_named(&network, KAT_URN_A, Some(&seed), &wrapped)
+            .unwrap_named(
+                &network,
+                KAT_URN_A,
+                Some(&seed),
+                &wrapped,
+                &legacy_context()
+            )
             .is_err());
-        assert!(backend.unwrap(&gk.sealed_private_key, &wrapped).is_err());
+        assert!(backend
+            .unwrap(&gk.sealed_private_key, &wrapped, &legacy_context())
+            .is_err());
         // The same URN with and without a seed names different keys.
         assert_ne!(
             public,
