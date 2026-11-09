@@ -1242,6 +1242,20 @@ mod tests {
     }
 
     #[test]
+    fn the_production_compose_passes_the_env_root_boot_check() {
+        // The measured app-compose dstack builds from this file, once the
+        // CVM no longer allows SSH keys.
+        let doc = serde_json::to_string(&serde_json::json!({
+            "manifest_version": 2,
+            "runner": "docker-compose",
+            "allowed_envs": ["AT_REST_ROOT_KEY", "DATABASE_URL"],
+            "docker_compose_file": include_str!("../../docker-compose.dstack-postgres.yaml"),
+        }))
+        .unwrap();
+        check_measured_env_root(&doc, &hash(&doc)).unwrap();
+    }
+
+    #[test]
     fn an_env_root_runs_only_on_a_production_os_image() {
         let doc = env_root_compose(
             &format!("      {ROOT_SOURCE_ENV}: env\n      {ROOT_KEY_ENV}: ${{K}}\n"),

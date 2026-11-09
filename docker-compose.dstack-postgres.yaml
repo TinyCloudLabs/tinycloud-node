@@ -74,8 +74,8 @@ services:
       # entrypoint cannot work here) and a dstack deployment uploads only
       # this compose file (so there is no host path to bind-mount from).
       #
-      # Seal the base64 of the reviewed trust-bundle.production.json — the
-      # same bytes share-api serves — into the CVM's encrypted environment as
+      # Seal the base64 of the reviewed trust-bundle.production.json (the
+      # same bytes share-api serves) into the CVM's encrypted environment as
       # SHARE_TRUST_BUNDLE_BASE64. Same variable name and same wire form
       # share-api already uses, so one sealed value feeds both services and
       # cannot drift between them.
@@ -98,6 +98,16 @@ services:
       # Append-only record of deleted keys, on the deletion-ledger volume so it
       # survives container replacement. Required by the node while the gate is on.
       TINYCLOUD_ENCRYPTION_NETWORK__DELETION_LEDGER_PATH: /var/lib/tinycloud/ledger/deletions.jsonl
+      # TC-887: encryption at rest, with the root that seals the at-rest keys
+      # taken from the encrypted environment (docs/at-rest-escrow.md, "Root
+      # from the environment"). The node refuses to start if the key is
+      # missing or malformed. Mode "off" provisions and checks the keys
+      # without encrypting; encrypting is a reviewed change of the mode to
+      # "encrypt". Keep this file printable ASCII: the node reads it, as
+      # measured, with a strict parser.
+      TINYCLOUD_AT_REST__ROOT_SOURCE: env
+      TINYCLOUD_AT_REST__MODE: "off"
+      TINYCLOUD_AT_REST_ROOT_KEY: "${AT_REST_ROOT_KEY:?seal the at-rest root key}"
       ROCKET_ADDRESS: "0.0.0.0"
       ROCKET_MAX_BLOCKING: "1024"
 

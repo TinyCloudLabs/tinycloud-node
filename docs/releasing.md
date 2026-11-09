@@ -381,6 +381,30 @@ a bare HTTPS origin. The preflight also accepts that origin with the
 or CR/LF fails it. The quota steps take only its host and port and
 call billing's fixed `/api/admin/storage-comp/` path; no URL is printed.
 
+### At-rest root from the environment: manual gate (TC-887)
+
+The compose sets `TINYCLOUD_AT_REST__ROOT_SOURCE: env`, and the deploy seals
+`AT_REST_ROOT_KEY` from the `production` secret `PROD_TINYCLOUD_AT_REST_ROOT_KEY`.
+It seals no `DSTACK_AUTHORIZED_KEYS`, because the node refuses to boot with an env
+root while the measured app-compose allows SSH keys. Neither the preflight nor the
+node can fix a CVM whose `allowed_envs` already lists `DSTACK_AUTHORIZED_KEYS`:
+
+- **Before the first deploy of this compose, an operator removes
+  `DSTACK_AUTHORIZED_KEYS` from the CVM's `allowed_envs` at the CVM level (TC-2520).**
+  Until then the deploy fails at the `allowed_envs` check (the sealed file lacks an
+  allowed name), before the CVM is changed. Check it with
+  `phala cvms get tinycloud-node --json | jq .allowed_envs` (or the platform API).
+- The CVM must run a production OS image whose hash the node pins
+  (`PRODUCTION_OS_IMAGE_HASHES` in `tinycloud-node-server/src/at_rest.rs`).
+- The deploy checks the key's format before writing the sealed file (canonical
+  standard base64 of 32 bytes, not all one byte). The preflight's
+  `--validate-config` does not see the key: with a dstack TEE indicated it can't run
+  the at-rest TEE checks, which run at boot inside the CVM.
+- Once `AT_REST_ROOT_KEY` is in `allowed_envs` it must be present on every deploy and
+  rollback, like every allowed name.
+- Local working files (SQL/DuckDB working and cache files, upload staging, exports) stay
+  plaintext and rely on the CVM's encrypted disk until P1b (TC-2543).
+
 ### `NODE_STATS_READ_TOKEN` (TC-1482): compose hash change
 
 `docker-compose.dstack-postgres.yaml` passes the optional bearer for the
@@ -610,8 +634,8 @@ Before any CVM mutation the workflow requires:
 
 - the main compose, with its one node digest replaced by 64 zeros, to hash
   to the reviewed N0 template
-  **`9d0cd8a22369b8339f584c54f42b676df731838876c1739a1938776d4ad5f468`**
-  (raw `d703d69b033c1ad4c9b247141f7ba214df45e1ffec5517596a3c572ea91495c3` normalized; before the TC-2346 `db_operation_retried` and `db_operation_retry_skipped_slow` warning codes in the Vector config the template was `c9bcbea9…`, raw `298ea356…`; before the TC-1777 named-keys gate env lines (`TINYCLOUD_ENCRYPTION_NETWORK__NAMED_KEYS_V1`, `…__DELETION_LEDGER_PATH`) and the `deletion-ledger` volume the template was `8df7e0f2…`, raw `192dfb7e407fa591d4f0232b95e43a41a85dd18add1d4976e70ebdbff5ddebca`; before the TC-1843 per-minute caps on 4xx and 5xx request events and on the 5xx diagnostic, and the `errors_dropped` event (the dropped count), in the Vector config the template was `7c3456dc…`, raw `d0e72bde…`; before the TC-1840 `db_failure_5xx` event (the node's 5xx diagnostic line shipped as an individual event) in the Vector config the template was `c91e5b7a…`, raw `99013c40…`; before the TC-950 pool of 10 (`TINYCLOUD_DATABASE__MAX_CONNECTIONS` 15 to 10) the template was `79469f97…`, raw `32a002ef…`; before the three `current_kv_c_index_*` warning codes in the Vector config (TC-1274 `current_kv` C-index migration) the template was `87b5d12a…`, raw `d1fcd665…`; before the optional TC-1482 `NODE_STATS_READ_TOKEN` env line and the TC-1482 route in the Vector config the template was `7fabba70…`, raw `1228d81927fc0a3fbba85745103e77b3112606f5d314d15974d400b222409350`: the 1.21.0 compose
+  **`6cc584f651bfcfb329a655b5facb6b527b7137c80a89f7348af2e77b0085bebc`**
+  (raw `eef0594db537e70ba388685b259229374d86f4225f6d2f141860abddfc5cd5d2` normalized; before the TC-887 at-rest env lines (`TINYCLOUD_AT_REST__ROOT_SOURCE`, `TINYCLOUD_AT_REST__MODE`, `TINYCLOUD_AT_REST_ROOT_KEY`) and the ASCII-only trust-bundle comment the template was `9d0cd8a2…`, raw `d703d69b…`; before the TC-2346 `db_operation_retried` and `db_operation_retry_skipped_slow` warning codes in the Vector config the template was `c9bcbea9…`, raw `298ea356…`; before the TC-1777 named-keys gate env lines (`TINYCLOUD_ENCRYPTION_NETWORK__NAMED_KEYS_V1`, `…__DELETION_LEDGER_PATH`) and the `deletion-ledger` volume the template was `8df7e0f2…`, raw `192dfb7e407fa591d4f0232b95e43a41a85dd18add1d4976e70ebdbff5ddebca`; before the TC-1843 per-minute caps on 4xx and 5xx request events and on the 5xx diagnostic, and the `errors_dropped` event (the dropped count), in the Vector config the template was `7c3456dc…`, raw `d0e72bde…`; before the TC-1840 `db_failure_5xx` event (the node's 5xx diagnostic line shipped as an individual event) in the Vector config the template was `c91e5b7a…`, raw `99013c40…`; before the TC-950 pool of 10 (`TINYCLOUD_DATABASE__MAX_CONNECTIONS` 15 to 10) the template was `79469f97…`, raw `32a002ef…`; before the three `current_kv_c_index_*` warning codes in the Vector config (TC-1274 `current_kv` C-index migration) the template was `87b5d12a…`, raw `d1fcd665…`; before the optional TC-1482 `NODE_STATS_READ_TOKEN` env line and the TC-1482 route in the Vector config the template was `7fabba70…`, raw `1228d81927fc0a3fbba85745103e77b3112606f5d314d15974d400b222409350`: the 1.21.0 compose
   `d95bfb707871c1d626c4a8f2b8d32d354103edbb5077847c6a21fe5f7f6cfa50`, template
   `51f8e9e9…`, with only the embedded Vector config regenerated for TC-1274's,
   TC-1317's and TC-1482's route and warning codes (TC-1274 and TC-1317 were template `7fabba70…`, raw `1228d819…`); TC-1274 alone was template `00938226…`, raw
@@ -828,8 +852,8 @@ gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref main \
 
 The served/OCI identity remains **1.20.6-dstack / e18578ff9162986ddd813259c60f73866e3e60d1**.
 With the template lock on main this redeploys exactly main's raw compose
-`d703d69b033c1ad4c9b247141f7ba214df45e1ffec5517596a3c572ea91495c3`
-(the 1.21.0 compose `d95bfb70…` with the TC-1274, TC-1317, TC-1482, `current_kv_c_index_*`, `db_failure_5xx`, the 4xx and 5xx caps, `errors_dropped` and TC-2346 `db_operation_retried` / `db_operation_retry_skipped_slow` Vector config, the optional TC-1482 `NODE_STATS_READ_TOKEN` env line, the TC-950 pool of 10, and the TC-1777 `NAMED_KEYS_V1` gate env lines with the `deletion-ledger` volume), whatever digest
+`eef0594db537e70ba388685b259229374d86f4225f6d2f141860abddfc5cd5d2`
+(the 1.21.0 compose `d95bfb70…` with the TC-1274, TC-1317, TC-1482, `current_kv_c_index_*`, `db_failure_5xx`, the 4xx and 5xx caps, `errors_dropped` and TC-2346 `db_operation_retried` / `db_operation_retry_skipped_slow` Vector config, the optional TC-1482 `NODE_STATS_READ_TOKEN` env line, the TC-950 pool of 10, the TC-1777 `NAMED_KEYS_V1` gate env lines with the `deletion-ledger` volume, and the TC-887 at-rest env lines), whatever digest
 main's template currently pins. It is not a rollback of a
 later release across a schema migration. Current pre-N0 tag/pinned
 equivalents are separately hash-checked; arbitrary same-image config
