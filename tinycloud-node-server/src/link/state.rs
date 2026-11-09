@@ -40,6 +40,8 @@ pub const TLS_KEY_FILE: &str = "key.pem";
 pub const TLS_CERT_FILE: &str = "cert.pem";
 pub const TLS_CURRENT_LINK: &str = "current";
 const TLS_GENERATION_PREFIX: &str = "gen-";
+/// Prefix of the temp symlink `private_file::temp_path` derives for `current`.
+const TLS_STAGED_LINK_PREFIX: &str = ".current.tmp-";
 pub const LISTENER_STATE_FILE: &str = "listener-state.json";
 pub const TUNNEL_STATE_FILE: &str = "tunnel-state.json";
 pub const LOCK_FILE: &str = "state.lock";
@@ -272,6 +274,9 @@ fn create_private_dir(path: &Path) -> Result<()> {
 /// Atomically point `link` at `target` (a name relative to `link`'s directory).
 #[cfg(unix)]
 fn publish_symlink(target: &str, staged: &Path, link: &Path) -> Result<()> {
+    // `staged` is a name this process chose; a leftover from a crashed
+    // publish (same pid and counter) is ours to replace.
+    let _ = fs::remove_file(staged);
     std::os::unix::fs::symlink(target, staged)
         .with_context(|| format!("failed to create {}", staged.display()))?;
     if let Err(err) = fs::rename(staged, link) {
@@ -298,7 +303,10 @@ fn remove_stale_tls_files(paths: &LinkPaths, keep: &str) {
         let path = entry.path();
         if name.starts_with(TLS_GENERATION_PREFIX) && name != keep {
             let _ = fs::remove_dir_all(&path);
-        } else if name == TLS_KEY_FILE || name == TLS_CERT_FILE {
+        } else if name == TLS_KEY_FILE
+            || name == TLS_CERT_FILE
+            || name.starts_with(TLS_STAGED_LINK_PREFIX)
+        {
             let _ = fs::remove_file(&path);
         }
     }
@@ -672,6 +680,23 @@ mod tests {
         assert!(!paths.tls_dir.join(TLS_CERT_FILE).exists());
     }
 
+    #[::core::prelude::v1::test]
+    fn publish_survives_a_stale_staged_link_and_removes_leftovers() {
+        let tmp = tempdir().unwrap();
+        let paths = LinkPaths::from_data_root(tmp.path());
+        ensure_link_dirs(&paths).unwrap();
+        let current = paths.tls_dir.join(TLS_CURRENT_LINK);
+        let staged = paths.tls_dir.join(".current.tmp-stale");
+        std::os::unix::fs::symlink("gen-missing", &staged).unwrap();
+        // Same name as the one a new publish would choose.
+        publish_symlink("gen-a", &staged, &current).unwrap();
+        assert_eq!(fs::read_link(&current).unwrap().to_str(), Some("gen-a"));
+
+        let leftover = paths.tls_dir.join(".current.tmp-old");
+        std::os::unix::fs::symlink("gen-x", &leftover).unwrap();
+        write_tls_material(&paths, "KEY", "CERT").unwrap();
+        assert!(fs::symlink_metadata(&leftover).is_err());
+    }
     #[::core::prelude::v1::test]
     fn generation_directory_is_private() {
         let tmp = tempdir().unwrap();

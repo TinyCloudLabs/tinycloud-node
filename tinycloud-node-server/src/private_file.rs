@@ -54,7 +54,7 @@ fn write_file_atomic_with(
     let dir = parent_dir(path);
     let tmp = temp_path(dir, path);
     let result = (|| -> Result<()> {
-        let mut file = create_with_mode(&tmp, mode)
+        let mut file = create_replacing_stale(&tmp, mode)
             .with_context(|| format!("failed to create {}", tmp.display()))?;
         apply_mode_and_owner(&file, mode, owner)
             .with_context(|| format!("failed to prepare {}", tmp.display()))?;
@@ -100,6 +100,18 @@ fn parent_dir(path: &Path) -> &Path {
     match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
+    }
+}
+
+/// Create the temp file; a leftover with the same name (a crashed earlier
+/// write whose pid and counter recur) is ours to replace.
+fn create_replacing_stale(tmp: &Path, mode: u32) -> std::io::Result<fs::File> {
+    match create_with_mode(tmp, mode) {
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            fs::remove_file(tmp)?;
+            create_with_mode(tmp, mode)
+        }
+        other => other,
     }
 }
 
@@ -273,5 +285,15 @@ mod tests {
         assert!(res.is_err());
         assert_eq!(fs::read(&path).unwrap(), b"previous");
         assert_eq!(entries(tmp.path()), vec!["owned"]);
+    }
+
+    #[test]
+    fn stale_temp_with_the_same_name_does_not_fail_the_write() {
+        let tmp = tempdir().unwrap();
+        let stale = tmp.path().join(".secret.tmp-1-1");
+        fs::write(&stale, b"leftover").unwrap();
+        let file = create_replacing_stale(&stale, 0o600).unwrap();
+        assert_eq!(file.metadata().unwrap().len(), 0);
+        assert_eq!(mode(&stale), 0o600);
     }
 }
