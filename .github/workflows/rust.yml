@@ -373,17 +373,21 @@ jobs:
   # containers). MinIO/mc are pinned community releases whose sha256 is pinned
   # in harness.sh; PostgreSQL is the runner image's own native install. The
   # green checks prove KV puts land in MinIO and SQL writes land in
-  # database_artifact (checkpoint and WAL delta). The RED checks assert
-  # encryption at rest; until TC-887 S3/S4 land, the step passes only if both
-  # fail with their "TC-887 RED:" findings (`--expect red`), and fails loudly
-  # if they error or unexpectedly pass. When S3 lands, start the harness with
-  # the at-rest mode set and expect `kv=green,sql=red`; when S4 lands, `green`.
+  # database_artifact (checkpoint and WAL delta). The TC-887 checks run in two
+  # legs: plaintext (the default node) must find plaintext (`--expect red`,
+  # failing loudly if a check errors or unexpectedly passes), and encrypt (mode
+  # encrypt, root from the environment) must find KV blocks and SQL artifacts
+  # sealed (`--expect green`).
   at-rest-harness:
-    name: at-rest harness (native PostgreSQL + MinIO)
+    name: at-rest harness (native PostgreSQL + MinIO, ${{ matrix.at_rest }})
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        at_rest: [plaintext, encrypt]
     steps:
     - name: Checkout TinyCloud repository
       uses: actions/checkout@v4
@@ -399,7 +403,7 @@ jobs:
       with:
         shared-key: rust-1.97.1-at-rest-harness
         workspaces: . -> target
-        save-if: ${{ github.ref == 'refs/heads/main' }}
+        save-if: ${{ github.ref == 'refs/heads/main' && matrix.at_rest == 'plaintext' }}
 
     - name: Harness paths
       run: |
@@ -413,26 +417,36 @@ jobs:
       run: bash scripts/at-rest-harness/harness.sh bins
 
     - name: Start the harness (native PostgreSQL, MinIO, tinycloud-node)
+      env:
+        TC887_AT_REST_MODE: ${{ matrix.at_rest == 'encrypt' && 'encrypt' || '' }}
+        TC887_AT_REST_ROOT_SOURCE: ${{ matrix.at_rest == 'encrypt' && 'env' || '' }}
       run: bash scripts/at-rest-harness/harness.sh up
 
     - name: Harness checks (writes reach MinIO and PostgreSQL)
       run: bash scripts/at-rest-harness/harness.sh test green "$TC887_STATE"
 
-    - name: TC-887 RED checks (must be RED until S3/S4)
-      run: bash scripts/at-rest-harness/harness.sh test red --expect red "$TC887_STATE"
+    - name: TC-887 checks (RED when plaintext, GREEN when encrypting)
+      run: >-
+        bash scripts/at-rest-harness/harness.sh test red
+        --expect ${{ matrix.at_rest == 'encrypt' && 'green' || 'red' }} "$TC887_STATE"
 
+    # These write their own objects into the harness bucket, so they run
+    # after the checks above, and in one leg only (they don't use the node).
     - name: S3 block store (against the harness MinIO)
+      if: matrix.at_rest == 'plaintext'
       run: |
         (set -a; . "$TC887_RUN_DIR/harness.env"; set +a
          cargo test --locked -p tinycloud-node --test s3_block_store -- --ignored)
 
     - name: S3 block store with encryption at rest (against the harness MinIO)
+      if: matrix.at_rest == 'plaintext'
       timeout-minutes: 10
       run: |
         (set -a; . "$TC887_RUN_DIR/harness.env"; set +a
          cargo test --locked -p tinycloud-node --test at_rest_s3_store -- --ignored)
 
     - name: SQL object store (against the harness MinIO)
+      if: matrix.at_rest == 'plaintext'
       timeout-minutes: 10
       run: |
         (set -a; . "$TC887_RUN_DIR/harness.env"; set +a

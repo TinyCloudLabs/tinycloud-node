@@ -735,6 +735,78 @@ gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref main \
   -f rollback_privacy_mode=unselected
 ```
 
+### Rolling back across TC-887 (at-rest schema)
+
+The release that carries TC-887 runs two migrations at boot, even with at-rest
+mode `off`: `m20261107_000000_at_rest_keys` creates the empty tables
+`at_rest_key`, `at_rest_escrow` and `space_data_key`, and
+`m20261107_010000_artifact_payload_encoding` adds the nullable columns
+`payload_encoding`, `delta_encoding` and `manifest` to `database_artifact`. No
+existing row is rewritten. An image from before TC-887 (1.25.17 or older)
+refuses to start on that database ("Migration file of version
+'m20261107_000000_at_rest_keys' is missing, this migration has been applied but
+its file is missing"), so a rollback needs the schema step below first.
+
+It applies only to a database the TC-887 release ran in mode `off`: the guard
+refuses, and changes nothing, if any at-rest key row exists or any artifact
+carries an encoding or a manifest. Once a node has sealed data, rolling back to
+an image that can't open it is not supported.
+
+The audited `rollback_release` dispatch refuses this target ("Rollback target
+migration sources differ from the running image"), so this is an operator
+procedure with a short outage, not a workflow dispatch.
+
+1. Stop the node. A running TC-887 node reads the columns this step drops, and
+   the older image can't start until it has run.
+2. Check the schema before (expect both versions listed, and three tables):
+
+   ```sql
+   SELECT version FROM seaql_migrations WHERE version LIKE 'm20261107_%' ORDER BY 1;
+   SELECT to_regclass('at_rest_key'), to_regclass('at_rest_escrow'), to_regclass('space_data_key');
+   ```
+
+3. Run this as one transaction (`psql -v ON_ERROR_STOP=1 -f`):
+
+   ```sql
+   BEGIN;
+   DO $$
+   BEGIN
+     IF EXISTS (SELECT 1 FROM at_rest_key)
+        OR EXISTS (SELECT 1 FROM at_rest_escrow)
+        OR EXISTS (SELECT 1 FROM space_data_key)
+        OR EXISTS (SELECT 1 FROM database_artifact
+                   WHERE payload_encoding IS NOT NULL
+                      OR delta_encoding IS NOT NULL
+                      OR manifest IS NOT NULL) THEN
+       RAISE EXCEPTION 'at-rest key material or sealed artifacts exist: this database cannot be rolled back this way';
+     END IF;
+   END $$;
+   DROP TABLE space_data_key;
+   DROP TABLE at_rest_escrow;
+   DROP TABLE at_rest_key;
+   ALTER TABLE database_artifact
+     DROP COLUMN manifest,
+     DROP COLUMN delta_encoding,
+     DROP COLUMN payload_encoding;
+   DELETE FROM seaql_migrations
+    WHERE version IN ('m20261107_000000_at_rest_keys',
+                      'm20261107_010000_artifact_payload_encoding');
+   COMMIT;
+   ```
+
+   The guard scans `database_artifact` without reading payloads; the column
+   drops change only the catalog.
+4. Check the schema after: the two queries in step 2 return no rows and three
+   NULLs, and `SELECT column_name FROM information_schema.columns WHERE
+   table_name = 'database_artifact' AND column_name IN ('payload_encoding',
+   'delta_encoding', 'manifest');` returns no rows. The schema then matches the
+   older release's (`pg_dump --schema-only` showed no difference in the TC-887
+   compatibility check).
+5. Start the older image. It serves the existing KV and SQL data unchanged.
+
+Upgrading again later needs nothing: the TC-887 release re-runs both
+migrations on boot and recreates the empty tables and NULL columns.
+
 ### Emergency same-image recovery (12c)
 
 After the combined workflow is reviewed/landed and a named operator has fresh

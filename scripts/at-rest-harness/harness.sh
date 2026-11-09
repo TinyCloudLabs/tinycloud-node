@@ -39,14 +39,19 @@ MC_URL=https://github.com/minio/mc/releases/download/$MC_RELEASE/mc.linux-amd64.
 #   TC887_AT_REST_MODE        -> TINYCLOUD_AT_REST__MODE         (off|encrypt|strict)
 #   TC887_AT_REST_ESCROW_NONE -> TINYCLOUD_AT_REST__ESCROW_NONE  (true|false: the Static
 #                                self-host acknowledgement that no escrow exists, plan §5)
-# Unset: the harness sets nothing and the node runs its default (today: no
-# encryption at rest). Simplest encrypting node: Static root (always, here) +
-# TC887_AT_REST_MODE=encrypt + TC887_AT_REST_ESCROW_NONE=true. With mode
-# encrypt/strict, `test red` defaults to expecting kv=green,sql=red: S3 seals
-# KV before S4 seals SQL. When S4 lands, flip the SQL default to green
-# (default_expect below).
+#   TC887_AT_REST_ROOT_SOURCE -> TINYCLOUD_AT_REST__ROOT_SOURCE  (escrow|env). With env,
+#                                `up` also generates a per-run root key (standard base64
+#                                of 32 bytes) into secrets/at-rest-root-key and passes it
+#                                as TINYCLOUD_AT_REST_ROOT_KEY; the checks derive from it.
+# Unset: the harness sets nothing and the node runs its default (no encryption
+# at rest). Simplest encrypting nodes: TC887_AT_REST_MODE=encrypt with either
+# TC887_AT_REST_ESCROW_NONE=true (Static node root) or
+# TC887_AT_REST_ROOT_SOURCE=env. With mode encrypt/strict, `test red` defaults
+# to expecting both checks green (default_expect below).
 AT_REST_MODE_VAR=TINYCLOUD_AT_REST__MODE
 AT_REST_ESCROW_NONE_VAR=TINYCLOUD_AT_REST__ESCROW_NONE
+AT_REST_ROOT_SOURCE_VAR=TINYCLOUD_AT_REST__ROOT_SOURCE
+AT_REST_ROOT_KEY_VAR=TINYCLOUD_AT_REST_ROOT_KEY
 # ---------------------------------------------------------------------------
 
 BUCKET=tinycloud-blocks
@@ -251,10 +256,13 @@ cmd_up() {
   command -v python3 >/dev/null || die "python3 is required"
   command -v curl >/dev/null || die "curl is required"
   local at_rest_mode=${TC887_AT_REST_MODE:-} at_rest_escrow_none=${TC887_AT_REST_ESCROW_NONE:-}
+  local at_rest_root_source=${TC887_AT_REST_ROOT_SOURCE:-}
   [[ -z "$at_rest_mode" ]] || valid_mode "$at_rest_mode" \
     || die "TC887_AT_REST_MODE must be off, encrypt or strict"
   [[ -z "$at_rest_escrow_none" ]] || valid_bool "$at_rest_escrow_none" \
     || die "TC887_AT_REST_ESCROW_NONE must be true or false"
+  [[ -z "$at_rest_root_source" ]] || [[ "$at_rest_root_source" =~ ^(escrow|env)$ ]] \
+    || die "TC887_AT_REST_ROOT_SOURCE must be escrow or env"
   cmd_bins
 
   local pg_bin
@@ -295,13 +303,22 @@ cmd_up() {
   # Recorded by every write_state call, including a failed up's.
   export STATE_PG_BIN=$pg_bin STATE_NODE_BIN=$node_bin STATE_PG_PORT=$pg_port \
     STATE_MINIO_PORT=$minio_port STATE_CONSOLE_PORT=$console_port STATE_NODE_PORT=$node_port \
-    STATE_AT_REST_MODE=$at_rest_mode STATE_AT_REST_ESCROW_NONE=$at_rest_escrow_none
+    STATE_AT_REST_MODE=$at_rest_mode STATE_AT_REST_ESCROW_NONE=$at_rest_escrow_none \
+    STATE_AT_REST_ROOT_SOURCE=$at_rest_root_source
 
   # Per-run secrets: generated here, kept in 0600 files, never on argv.
   random_hex | secret_file "$run/secrets/pg-password"
   printf 'tc887%s\n' "$(python3 -c 'import secrets; print(secrets.token_hex(8))')" | secret_file "$run/secrets/minio-user"
   random_hex | secret_file "$run/secrets/minio-password"
   python3 -c 'import secrets; print(secrets.token_urlsafe(32))' | secret_file "$run/secrets/node-static-secret"
+  # The root the at-rest keys are sealed under, and how the checks decode it.
+  local root_file=$run/secrets/node-static-secret root_encoding=base64url at_rest_root_key=
+  if [[ "$at_rest_root_source" == env ]]; then
+    python3 -c 'import base64, secrets; print(base64.b64encode(secrets.token_bytes(32)).decode())' \
+      | secret_file "$run/secrets/at-rest-root-key"
+    root_file=$run/secrets/at-rest-root-key root_encoding=base64
+    at_rest_root_key=$(<"$root_file")
+  fi
   local pg_password minio_user minio_password node_secret
   pg_password=$(<"$run/secrets/pg-password")
   minio_user=$(<"$run/secrets/minio-user")
@@ -322,7 +339,8 @@ TC887_S3_BUCKET=$BUCKET
 TC887_S3_REGION=$REGION
 TC887_S3_ACCESS_KEY_ID=$minio_user
 TC887_S3_SECRET_ACCESS_KEY=$minio_password
-TC887_NODE_ROOT_FILE=$run/secrets/node-static-secret
+TC887_NODE_ROOT_FILE=$root_file
+TC887_NODE_ROOT_ENCODING=$root_encoding
 TC887_SPACES_LOG=$run/spaces.log
 TC887_PUTS_LOG=$run/puts.log
 TC887_BOOT_SNAPSHOT=$run/boot-snapshot
@@ -360,6 +378,14 @@ EOF
   if [[ -n "$at_rest_escrow_none" ]]; then
     printf '%s=%s\n' "$AT_REST_ESCROW_NONE_VAR" "$at_rest_escrow_none" >>"$run/node.env"
     log "at-rest: $AT_REST_ESCROW_NONE_VAR=$at_rest_escrow_none"
+  fi
+  if [[ -n "$at_rest_root_source" ]]; then
+    printf '%s=%s\n' "$AT_REST_ROOT_SOURCE_VAR" "$at_rest_root_source" >>"$run/node.env"
+    log "at-rest: $AT_REST_ROOT_SOURCE_VAR=$at_rest_root_source"
+  fi
+  if [[ -n "$at_rest_root_key" ]]; then
+    printf '%s=%s\n' "$AT_REST_ROOT_KEY_VAR" "$at_rest_root_key" >>"$run/node.env"
+    log "at-rest: $AT_REST_ROOT_KEY_VAR set from secrets/at-rest-root-key"
   fi
   printf '[global]\nlog_level = "normal"\n' >"$run/tinycloud.toml"
   write_state "$run" starting
@@ -467,7 +493,8 @@ write_state() {
     NODE_PID=$UP_NODE_PID NODE_START=$UP_NODE_START \
     BIN_DIR=$BIN_DIR MINIO_RELEASE=$MINIO_RELEASE MC_RELEASE=$MC_RELEASE \
     BUCKET=$BUCKET REGION=$REGION PG_USER=$PG_USER PG_DB=$PG_DB \
-    AT_REST_MODE_VAR=$AT_REST_MODE_VAR AT_REST_ESCROW_NONE_VAR=$AT_REST_ESCROW_NONE_VAR python3 - <<'PY'
+    AT_REST_MODE_VAR=$AT_REST_MODE_VAR AT_REST_ESCROW_NONE_VAR=$AT_REST_ESCROW_NONE_VAR \
+    AT_REST_ROOT_SOURCE_VAR=$AT_REST_ROOT_SOURCE_VAR python3 - <<'PY'
 import json, os, datetime
 e = os.environ
 run = e["RUN"]
@@ -488,8 +515,10 @@ state = {
     "at_rest": {
         "mode": text("STATE_AT_REST_MODE"),
         "escrow_none": {"true": True, "false": False}.get(e.get("STATE_AT_REST_ESCROW_NONE", "")),
+        "root_source": text("STATE_AT_REST_ROOT_SOURCE"),
         "mode_var": e["AT_REST_MODE_VAR"],
         "escrow_none_var": e["AT_REST_ESCROW_NONE_VAR"],
+        "root_source_var": e["AT_REST_ROOT_SOURCE_VAR"],
     },
     "node": {
         "pid": num("NODE_PID"),
@@ -630,8 +659,8 @@ default_expect() {
   local kind=$1 check=$2 state=$3
   [[ "$kind" == green ]] && { echo green; return; }
   case $(state_get "$state" at_rest.mode) in
-    # S3 seals KV before S4 seals SQL; flip sql to green when S4 lands.
-    encrypt|strict) [[ "$check" == kv ]] && echo green || echo red ;;
+    # Both KV blocks and SQL artifacts seal once a mode encrypts.
+    encrypt|strict) echo green ;;
     *) echo red ;;
   esac
 }
@@ -704,7 +733,7 @@ cmd_test() {
       rc=4
     elif [[ "$CHECK_OUTCOME" == "${want[$check]}" ]]; then
       if [[ "$CHECK_OUTCOME" == red ]]; then
-        annotate notice "$label RED as expected: $label data is plaintext at rest"
+        annotate notice "$label RED as expected: $label data is not sealed and authenticated at rest"
       else
         annotate notice "$label $kind check GREEN as expected"
       fi
@@ -712,13 +741,13 @@ cmd_test() {
       annotate error "$label $kind check UNEXPECTEDLY PASSED under expect $check=red: the at-rest property holds for $label; expect $check=green and update CI"
       ((rc == 4)) || rc=3
     else
-      annotate error "$label $kind check still RED ($label data is plaintext at rest) but expected $check=green"
+      annotate error "$label $kind check still RED ($label data is not sealed and authenticated at rest) but expected $check=green"
       ((rc == 4)) || rc=3
     fi
   done
   if ((rc == 0)); then
     if [[ "$kind" == red && "${want[kv]}" == red && "${want[sql]}" == red ]]; then
-      annotate notice "RED as expected: both TC-887 RED checks report plaintext at rest (KV and SQL)"
+      annotate notice "RED as expected: both TC-887 RED checks report data not sealed at rest (KV and SQL)"
     else
       annotate notice "$kind checks as expected (kv=${want[kv]}, sql=${want[sql]})"
     fi
