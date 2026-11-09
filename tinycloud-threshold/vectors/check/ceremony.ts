@@ -14,6 +14,8 @@ export const TAG = {
   dealing: 'TC-THRESHOLD-V1-DEALING',
   dkgStart: 'TC-THRESHOLD-V1-DKG-START',
   reshareStart: 'TC-THRESHOLD-V1-RESHARE-START',
+  ready: 'TC-THRESHOLD-V1-READY',
+  activate: 'TC-THRESHOLD-V1-ACTIVATE',
 } as const;
 
 /** SPEC §3.2 caps and the S0.2 appendix ordered-input bound. */
@@ -54,6 +56,14 @@ export const DEFAULT_ERROR = {
   certificateFields: 'InvalidEncoding',
   /** Reshare B′_0 differs from the current mpk. */
   reshareMpk: 'ContextMismatch',
+  /** Re-key output master key equals the pinned master key (S0.5: refused; SPEC names no code, informative). */
+  rekeyMpk: 'InvalidCeremony',
+  /** Chain step: the supplied certificate is not the body rebuilt from the recomputed ceremony outcome and the pinned predecessor. */
+  certificateOutcome: 'InvalidCertificate',
+  /** Chain step: the certificate does not satisfy the lineage rules of its ceremony kind against the pinned predecessor. */
+  lineage: 'InvalidCertificate',
+  /** Chain order: a step's previous certificate is not the previous step's activated certificate. */
+  chainOrder: 'InvalidCertificate',
 } as const;
 
 export function fail(code: string): never { throw new ProtocolError(code); }

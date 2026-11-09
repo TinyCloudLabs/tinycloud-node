@@ -61,7 +61,7 @@ jobs:
     - uses: oven-sh/setup-bun@v2
       with:
         bun-version: "1.4.4"
-    - name: Run the independent primitive checker
+    - name: Run the independent vector checker over every committed document
       working-directory: tinycloud-threshold/vectors/check
       run: bun install --frozen-lockfile && bun run check
 
