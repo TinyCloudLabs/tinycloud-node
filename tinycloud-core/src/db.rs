@@ -1217,6 +1217,29 @@ where
             })
     }
 
+    /// Gives a claimed delivery back without changing its state, so it is
+    /// claimable again at once. Returns `false`, changing nothing, when
+    /// `lease_token` is no longer the row's current lease.
+    pub async fn release_webhook_delivery_lease(
+        &self,
+        delivery_id: &str,
+        lease_token: &str,
+    ) -> Result<bool, DbErr> {
+        let result = hook_delivery::Entity::update_many()
+            .col_expr(
+                webhook_lease_token_column(),
+                Expr::value(Option::<String>::None),
+            )
+            .col_expr(
+                webhook_lease_expires_column(),
+                Expr::value(Option::<String>::None),
+            )
+            .filter(webhook_lease_held(delivery_id, lease_token))
+            .exec(&self.conn)
+            .await?;
+        Ok(result.rows_affected == 1)
+    }
+
     /// Marks a claimed delivery delivered. Returns `false`, changing nothing,
     /// when `lease_token` is no longer the row's current lease.
     pub async fn mark_webhook_delivery_delivered(

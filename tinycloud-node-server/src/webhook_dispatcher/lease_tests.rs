@@ -234,6 +234,44 @@ async fn expired_lease_is_claimed_again() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn released_lease_is_claimable_at_once_and_stale_release_is_refused() -> Result<()> {
+    let (_tempdir, tinycloud, db, encryption) = setup().await?;
+    insert_deliveries(&db, &encryption, "http://127.0.0.1:9/hooks", 1).await?;
+
+    let first = tinycloud
+        .claim_due_webhook_deliveries(1, LEASE)
+        .await?
+        .remove(0);
+    assert!(
+        !tinycloud
+            .release_webhook_delivery_lease(&first.id, "not-the-token")
+            .await?
+    );
+    assert!(tinycloud
+        .claim_due_webhook_deliveries(1, LEASE)
+        .await?
+        .is_empty());
+
+    assert!(
+        tinycloud
+            .release_webhook_delivery_lease(&first.id, &first.lease_token)
+            .await?
+    );
+    let second = tinycloud
+        .claim_due_webhook_deliveries(1, LEASE)
+        .await?
+        .remove(0);
+    assert_eq!(second.id, first.id);
+    assert!(
+        !tinycloud
+            .mark_webhook_delivery_delivered(&first.id, &first.lease_token, 1)
+            .await?,
+        "the released holder can no longer mark"
+    );
+    Ok(())
+}
+
 /// Two dispatchers on separate PostgreSQL pools (real concurrent connections).
 /// Gated like the other PostgreSQL-backed tests: skips locally, panics on
 /// GitHub Actions if the database URL is missing.

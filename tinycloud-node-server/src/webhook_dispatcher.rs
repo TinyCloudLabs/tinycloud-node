@@ -65,33 +65,67 @@ impl WebhookDispatcher {
         // Claim one delivery at a time so each lease starts when its send
         // starts and only has to cover that one send.
         let lease = self.timeout + LEASE_MARGIN;
+        let mut unsent = Vec::<Claim>::new();
+        let mut claim_error = None;
         for _ in 0..DISPATCH_BATCH_SIZE {
-            let Some(delivery) = self
+            let delivery = match self
                 .tinycloud
                 .claim_due_webhook_deliveries(1, lease)
                 .await
-                .context("claiming due webhook deliveries")?
-                .into_iter()
-                .next()
-            else {
-                break;
+                .context("claiming due webhook deliveries")
+            {
+                Ok(claimed) => match claimed.into_iter().next() {
+                    Some(delivery) => delivery,
+                    None => break,
+                },
+                Err(error) => {
+                    claim_error = Some(error);
+                    break;
+                }
             };
+            let claim = Claim {
+                id: delivery.id.clone(),
+                token: delivery.lease_token.clone(),
+            };
+            let mut sent = false;
             if self
-                .dispatch_delivery(delivery, &mut authority)
+                .dispatch_delivery(delivery, &mut authority, &mut sent)
                 .await
                 .is_err()
             {
                 tracing::warn!("webhook delivery attempt failed");
+                if !sent {
+                    unsent.push(claim);
+                }
             }
         }
 
-        Ok(())
+        // An attempt that failed before any send did not deliver: give its
+        // delivery back so the next pass retries it without waiting for the
+        // lease to expire. Held until here so this pass does not reclaim it.
+        for claim in unsent {
+            if self
+                .tinycloud
+                .release_webhook_delivery_lease(&claim.id, &claim.token)
+                .await
+                .is_err()
+            {
+                tracing::warn!("webhook delivery lease release failed");
+            }
+        }
+
+        match claim_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
+    /// `sent` is set once the callback request is about to go out.
     async fn dispatch_delivery(
         &self,
         delivery: tinycloud_core::db::PendingWebhookDelivery,
         authority: &mut HashMap<String, bool>,
+        sent: &mut bool,
     ) -> Result<()> {
         let current_attempt = delivery.attempts + 1;
         let claim = Claim {
@@ -187,6 +221,9 @@ impl WebhookDispatcher {
             }
         };
 
+        // Past this point the callback may have been sent, so the lease stays
+        // held until a mark or its expiry.
+        *sent = true;
         match egress::post(self.egress.clone(), destination, self.timeout)
             .header("Content-Type", "application/json")
             .header("X-TinyCloud-Delivery-Id", &delivery.id)
