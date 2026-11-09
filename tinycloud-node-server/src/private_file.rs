@@ -51,8 +51,18 @@ fn write_file_atomic_with(
     owner: Option<(u32, u32)>,
     write: impl FnOnce(&mut fs::File) -> std::io::Result<()>,
 ) -> Result<()> {
+    write_via_temp(path, &temp_path(parent_dir(path), path), mode, owner, write)
+}
+
+fn write_via_temp(
+    path: &Path,
+    tmp: &Path,
+    mode: u32,
+    owner: Option<(u32, u32)>,
+    write: impl FnOnce(&mut fs::File) -> std::io::Result<()>,
+) -> Result<()> {
     let dir = parent_dir(path);
-    let tmp = temp_path(dir, path);
+    let tmp = tmp.to_path_buf();
     let result = (|| -> Result<()> {
         let mut file = create_replacing_stale(&tmp, mode)
             .with_context(|| format!("failed to create {}", tmp.display()))?;
@@ -121,6 +131,7 @@ fn create_with_mode(path: &Path, mode: u32) -> std::io::Result<fs::File> {
     fs::OpenOptions::new()
         .write(true)
         .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW)
         .mode(mode)
         .open(path)
 }
@@ -309,5 +320,31 @@ mod tests {
         let file = create_replacing_stale(&stale, 0o600).unwrap();
         assert_eq!(file.metadata().unwrap().len(), 0);
         assert_eq!(mode(&stale), 0o600);
+    }
+
+    #[test]
+    fn symlink_at_the_temp_name_is_replaced_not_followed() {
+        use std::os::unix::fs::symlink;
+        let outside = tempdir().unwrap();
+        let sentinel = outside.path().join("sentinel");
+        fs::write(&sentinel, b"untouched").unwrap();
+        fs::set_permissions(&sentinel, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let tmp = tempdir().unwrap();
+        let dest = tmp.path().join("secret");
+        let temp = tmp.path().join(".secret.tmp-1-1");
+        symlink(&sentinel, &temp).unwrap();
+
+        write_via_temp(&dest, &temp, 0o640, None, |f| f.write_all(b"new")).unwrap();
+
+        assert_eq!(fs::read(&dest).unwrap(), b"new");
+        assert_eq!(mode(&dest), 0o640);
+        assert!(!fs::symlink_metadata(&dest)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(fs::symlink_metadata(&temp).is_err(), "temp name is gone");
+        assert_eq!(fs::read(&sentinel).unwrap(), b"untouched");
+        assert_eq!(mode(&sentinel), 0o644);
     }
 }
