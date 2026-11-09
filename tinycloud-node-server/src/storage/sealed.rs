@@ -300,6 +300,43 @@ pub fn sealed_tag(key: &str) -> Option<&str> {
     }
 }
 
+/// Whether writing invocations must prepare their spaces before the write
+/// lock: whenever keys are set up (sealed blocks may then be read or
+/// written, in any mode).
+pub fn prepares(view: &AtRestView) -> bool {
+    view.provider.is_some()
+}
+
+/// Gets a space ready for sealed reads before the invocation's write lock and
+/// transaction: puts back any data key the database lost, so a read inside
+/// the transaction only looks keys up. Never creates a key.
+pub async fn prepare_read(view: &AtRestView, space: &SpaceId) -> Result<(), AtRestStoreError> {
+    match &view.provider {
+        Some(provider) => Ok(provider.prepare_read(&space.to_string()).await?),
+        None => Ok(()),
+    }
+}
+
+/// Gets a space ready for sealed writes before any upload and before the
+/// invocation's write lock and transaction: creates (or loads) the space's
+/// current data key, so `persist` never writes key rows under the lock.
+/// Errors fail the request before anything is uploaded (503 while keys are
+/// locked or the gate is closed).
+pub async fn prepare_write(view: &AtRestView, space: &SpaceId) -> Result<(), AtRestStoreError> {
+    if view.mode == AtRestMode::Off {
+        return Ok(());
+    }
+    if !view.encrypting {
+        return Err(AtRestStoreError::Unavailable("encryption is not enabled"));
+    }
+    let provider = view
+        .provider
+        .as_ref()
+        .ok_or(AtRestStoreError::Unavailable("at-rest keys are not set up"))?;
+    provider.current_key(&space.to_string()).await?;
+    Ok(())
+}
+
 /// Where a new block is written.
 pub enum WriteTarget {
     Legacy,

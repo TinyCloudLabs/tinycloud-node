@@ -319,5 +319,31 @@ redacted.
   detail goes to the server log. Integrity and unsupported failures are logged (typed,
   rate-limited, named by the sealed name only), including ones that abort a response
   mid-stream. The general "store error → 401" catch-all is tracked separately (TC-1347).
+- **Prepare before the write lock:** a writing invocation's spaces are prepared after the
+  preupload transaction (TC-735) authorized it and checked its spaces are hosted, and before any
+  upload, sequence or writer lock, or transaction: written spaces get their current data key
+  (created if new), spaces a `kv/get` reads in the transaction get any data key the database lost
+  restored from its authenticated mirror (never created). A refused request therefore creates no
+  data key or mirror object; no separate pre-authorization is needed (the preupload transaction
+  already authorizes before any key work). Work under the writer lock (a `kv/get` in a writing
+  invocation, the upload of a protected legacy meeting path) runs in `at_rest::write_locked`,
+  where the provider only looks keys up and a key that would need creating or restoring is
+  `NotPrepared` (503), never a key-store write that would wait on the lock the request holds.
+  Read-only invocations and the KV GET routes hold no writer lock, so a key the database lost is
+  restored on first use there.
+- **Accepted residual (linkability during the transition):** in `encrypt`, a read of a
+  legacy-only block asks for the sealed name first, then the legacy name (`strict` probes the legacy
+  name to answer "legacy refused"). A storage provider's access logs can therefore link a
+  `space_tag` to its space id (and an object tag to its content hash) for every space read before
+  the backfill, for the life of the object-name key.
+- **Downgrade window until `strict`:** legacy objects are served without a hash check. In `off` or
+  `encrypt`, someone who can write the bucket and delete sealed objects can serve any bytes under the
+  legacy names they know. `strict` (after the backfill) closes this.
+- **Removal (orphan collection, TC-735):** `remove` deletes both copies of the generation, the
+  sealed name and the legacy name, and `cleanup_stages` reclaims incomplete stages beside both.
+  While keys are set up but locked the sealed name cannot be computed, so both refuse (503) and the
+  collector retries later; a sealed object is never left behind unnamed while its candidate is
+  retired. On disk a crashed sealed write leaves `v1/{space_tag}/.tc-stage-{object}-*`, charged its
+  stored bytes at boot like a stage in a space directory.
 - **Reserved names:** The key-continuity key mirror lives under `_tc/` in the block bucket (`datadir/at-rest` on
   FS). The block boot scan skips it.

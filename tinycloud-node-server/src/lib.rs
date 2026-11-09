@@ -867,10 +867,12 @@ pub async fn app_with_control(
     // before any request is served.
     tinycloud_core::db::migrate(&database_connection).await?;
     let deleting_fences = tinycloud_core::kv_orphans::deleting_fences(&database_connection).await?;
-    let block_store: BlockStores = match &tinycloud_config.storage.blocks {
+    let mut block_store: BlockStores = match &tinycloud_config.storage.blocks {
         Either::A(s3) => Either::A(s3.open_with_deleting(&deleting_fences).await?),
         Either::B(local) => Either::B(local.open().await?),
     };
+    // TC-887: before the orphan collector's clone, so it names sealed copies.
+    storage::attach_at_rest(&mut block_store, &at_rest_runtime);
     let orphan_store = block_store.clone();
     let tinycloud = TinyCloud::new_with_encryption(
         database_connection,
