@@ -138,7 +138,7 @@ The optional `offline-fingerprint --local-snapshot` command reads full artifact 
 
 Merge into `Codex/roman/rollback-meeting-node-20260915` with a **merge commit** that retains the running production revision as an ancestor. Do not squash, rebase or force-update this release line: `docker.yml` checks `git merge-base --is-ancestor` before deployment.
 
-After the reviewed release-line merge and `docker.yml` `workflow_dispatch` build (`deploy_phala=false`, `include_duckdb=false`, `image_version=1.20.0`), export `TC780_N3_DIGEST=sha256:<full build digest>` and `TC780_MERGED_REVISION=<full merged commit SHA>` from the completed build, then pin both in the record below. The repository variable `TC780_CUTOVER_READY=true` permits the dispatch; keep it true through the rollback window. Before step 2, a repository administrator must apply a temporary GitHub ruleset to `refs/heads/Codex/roman/rollback-meeting-node-20260915` that restricts updates and force pushes; the release owner must hold the merge queue and reserve `docker.yml` dispatches for this cutover. Record the ruleset ID and remove it only after the cutover or rollback observation window. Check the remote HEAD against the pinned N3 revision immediately before stopping the old node and again before step 7. A changed ref aborts the cutover. Do not deploy yet.
+After the reviewed release-line merge and `docker.yml` `workflow_dispatch` build (`deploy_phala=false`, `include_duckdb=false`, `image_version=1.20.0`), export `TC780_N3_DIGEST=sha256:<full build digest>` and `TC780_MERGED_REVISION=<full merged commit SHA>` from the completed build, then pin both in the record below. The repository variable `TC780_CUTOVER_READY=true` still permits that dispatch: the workflow run executes the release line's own `docker.yml`, whose jobs gate on it, so keep it true through the rollback window even though `docker.yml` on `main` no longer reads it. This runbook's guard snippets additionally require the repository variable `TC780_ROLLBACK_ARMED=true`; it arms only this procedure's safety checks, so set it when the cutover begins and delete it once the rollback window closes. Before step 2, a repository administrator must apply a temporary GitHub ruleset to `refs/heads/Codex/roman/rollback-meeting-node-20260915` that restricts updates and force pushes; the release owner must hold the merge queue and reserve `docker.yml` dispatches for this cutover. Record the ruleset ID and remove it only after the cutover or rollback observation window. Check the remote HEAD against the pinned N3 revision immediately before stopping the old node and again before step 7. A changed ref aborts the cutover. Do not deploy yet.
 
 ```sh
 (
@@ -225,11 +225,12 @@ SQL
 
 Record measured `pg_restore` and index-build times, migration results, boot log and signed smoke outputs. Retain the encrypted pre-outage dump and private inventory reports for drift comparison; destroy the restored local snapshot after approval. The artifact metadata CSV is sensitive; protect and delete it after cutover. The local `--network none` image check uses a dummy PostgreSQL URL with the same TLS shape; `--validate-config` does no database I/O. The deployment workflow validates its own configured secret.
 
-Before step 2, confirm the dispatch gate and frozen release ref. These checks must pass again immediately before step 7:
+Before step 2, confirm the runbook arming variable, the release line's dispatch gate and the frozen release ref. These checks must pass again immediately before step 7:
 
 ```sh
 (
   set -euo pipefail
+  test "$(gh api repos/TinyCloudLabs/tinycloud-node/actions/variables/TC780_ROLLBACK_ARMED --jq .value)" = true
   test "$(gh api repos/TinyCloudLabs/tinycloud-node/actions/variables/TC780_CUTOVER_READY --jq .value)" = true
   revision="$(jq -er '.n3_revision' ./tc780-private/record.json)"
   test "$(git ls-remote origin refs/heads/Codex/roman/rollback-meeting-node-20260915 | cut -f1)" = "$revision"
@@ -323,6 +324,7 @@ Stop exactly the `tinycloud` compose service on the CVM and drain active request
 ```sh
 (
   set -euo pipefail
+  test "$(gh api repos/TinyCloudLabs/tinycloud-node/actions/variables/TC780_ROLLBACK_ARMED --jq .value)" = true
   test "$(gh api repos/TinyCloudLabs/tinycloud-node/actions/variables/TC780_CUTOVER_READY --jq .value)" = true
   test "$(git ls-remote origin refs/heads/Codex/roman/rollback-meeting-node-20260915 | cut -f1)" = "$(jq -er '.n3_revision' ./tc780-private/record.json)"
   jq --argjson deadline "$(($(date +%s) + 1200))" '. + {outage_deadline_epoch:$deadline,phase:"stopping"}' \
@@ -442,6 +444,7 @@ Deploy with the **config fence off**. The step-6 durable metadata fence holds SQ
   revision="$(jq -er '.n3_revision' ./tc780-private/record.json)"
   deadline="$(jq -er '.outage_deadline_epoch' ./tc780-private/record.json)"
   test "$(date +%s)" -lt "$deadline"
+  test "$(gh api repos/TinyCloudLabs/tinycloud-node/actions/variables/TC780_ROLLBACK_ARMED --jq .value)" = true
   test "$(gh api repos/TinyCloudLabs/tinycloud-node/actions/variables/TC780_CUTOVER_READY --jq .value)" = true
   test "$(git ls-remote origin refs/heads/Codex/roman/rollback-meeting-node-20260915 | cut -f1)" = "$revision"
   before="$(gh run list -R TinyCloudLabs/tinycloud-node --workflow docker.yml --branch Codex/roman/rollback-meeting-node-20260915 --event workflow_dispatch --limit 1 --json databaseId --jq '.[0].databaseId // 0')"
