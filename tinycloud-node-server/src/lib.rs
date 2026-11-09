@@ -553,9 +553,16 @@ fn node_replay_cache(tinycloud: &TinyCloud) -> InvocationReplayCache {
         .with_sqlite_writer_lock(tinycloud.sqlite_writer_lock())
 }
 
-fn node_artifact_repository(tinycloud: &TinyCloud) -> SeaOrmDatabaseArtifactRepository {
+/// The node's artifact repository. It seals SQL and DuckDB artifacts by the
+/// node's at-rest state, so building it declares that seal path (TC-887).
+fn node_artifact_repository(
+    tinycloud: &TinyCloud,
+    at_rest: &Arc<at_rest::AtRestRuntime>,
+) -> SeaOrmDatabaseArtifactRepository {
+    at_rest.declare_seal_path(at_rest::SealPath::SqlArtifacts);
     SeaOrmDatabaseArtifactRepository::new(tinycloud.connection().clone())
         .with_sqlite_writer_lock(tinycloud.sqlite_writer_lock())
+        .with_at_rest(at_rest.clone())
 }
 
 pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
@@ -973,7 +980,7 @@ pub async fn app_with_control(
     ]);
     let database_artifact_repository: Arc<dyn DatabaseArtifactRepository> =
         Arc::new(SizeTrackingArtifactRepository::new(
-            Arc::new(node_artifact_repository(&tinycloud)),
+            Arc::new(node_artifact_repository(&tinycloud, &at_rest_runtime)),
             sql_sizes.clone(),
         ));
 
@@ -1885,7 +1892,10 @@ mod sqlite_tuning_tests {
         .await
         .unwrap();
         // Exercise the production repository wiring as well as its write path.
-        let repository = node_artifact_repository(&node);
+        let repository = node_artifact_repository(
+            &node,
+            &at_rest::AtRestRuntime::new(&config::AtRestConfig::default()),
+        );
         let actor_id = "did:key:artifact-snapshot-fixture";
         actor::ActiveModel {
             id: Set(actor_id.to_owned()),

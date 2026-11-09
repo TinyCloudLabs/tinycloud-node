@@ -1669,22 +1669,29 @@ async fn a_pinned_escrow_is_never_re_split() {
     );
 }
 
+/// Rolls back from the newest applied migration down to and including the
+/// one that creates the key tables, whatever was added after it.
+async fn down_through_key_tables(db: &DatabaseConnection) -> Result<(), sea_orm::DbErr> {
+    let applied = crate::migrations::Migrator::get_applied_migrations(db).await?;
+    let at = applied
+        .iter()
+        .position(|m| m.name() == "m20261107_000000_at_rest_keys")
+        .expect("the key tables' migration is applied");
+    crate::migrations::Migrator::down(db, Some((applied.len() - at) as u32)).await
+}
+
 #[tokio::test]
 async fn migration_down_refuses_to_drop_keys() {
     let (db, mirror, h) = (db().await, Arc::new(MemoryMirror::default()), holders());
     open(&db, &mirror, &ROOT, config(&h, None)).await.unwrap();
-    assert!(crate::migrations::Migrator::down(&db, Some(1))
-        .await
-        .is_err());
+    assert!(down_through_key_tables(&db).await.is_err());
     assert_eq!(at_rest_key::Entity::find().all(&db).await.unwrap().len(), 1);
     at_rest_escrow::Entity::delete_many()
         .exec(&db)
         .await
         .unwrap();
     at_rest_key::Entity::delete_many().exec(&db).await.unwrap();
-    crate::migrations::Migrator::down(&db, Some(1))
-        .await
-        .unwrap();
+    down_through_key_tables(&db).await.unwrap();
     assert!(at_rest_key::Entity::find().all(&db).await.is_err());
 }
 

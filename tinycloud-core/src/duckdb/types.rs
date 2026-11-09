@@ -477,6 +477,10 @@ pub enum DuckDbError {
     ImportError(String),
     #[error("Internal error: {0}")]
     Internal(String),
+    /// At-rest keys the durable artifact needs are unavailable now (TC-887);
+    /// nothing was written. Answered 503.
+    #[error("Database temporarily unavailable")]
+    Unavailable,
 }
 
 #[cfg(test)]

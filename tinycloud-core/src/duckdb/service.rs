@@ -659,10 +659,13 @@ fn duckdb_wal_path(path: &Path) -> PathBuf {
     PathBuf::from(format!("{}.wal", path.display()))
 }
 
-/// `DuckDbError` has no retryable-unavailable variant (adding one would reach
-/// every route mapping), so an exhausted `ArtifactChanged` stays `Internal`.
+/// An exhausted `ArtifactChanged` stays `Internal`, as before. Unavailable
+/// at-rest keys (TC-887) are `Unavailable`: nothing was written or read.
 fn artifact_error_to_duckdb(err: DatabaseArtifactError) -> DuckDbError {
-    DuckDbError::Internal(err.to_string())
+    match err {
+        DatabaseArtifactError::AtRestUnavailable => DuckDbError::Unavailable,
+        err => DuckDbError::Internal(err.to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -1086,6 +1089,101 @@ mod tests {
             hydrated_path.exists(),
             "durable artifact should hydrate cache"
         );
+    }
+
+    /// TC-887: a sealed DuckDB artifact holds no DuckDB bytes or row data,
+    /// a cold cache hydrates and exports the plaintext database, and locked
+    /// keys answer `Unavailable` (503) rather than serving anything.
+    #[tokio::test]
+    async fn sealed_duckdb_artifact_hydrates_a_cold_cache() {
+        use crate::at_rest::{AtRestMode, DataKeyProvider, FixedKeyProvider, TestAtRestSource};
+        use crate::models::database_artifact;
+        use sea_orm::EntityTrait;
+
+        let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
+            .await
+            .unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        let keys: Arc<dyn DataKeyProvider> = Arc::new(FixedKeyProvider::new([5; 32]));
+        let source = TestAtRestSource::new(AtRestMode::Encrypt, true, Some(keys));
+        let repo = Arc::new(
+            SeaOrmDatabaseArtifactRepository::new(db.clone()).with_at_rest(source.clone()),
+        );
+        let space = test_space_id("duckdb-sealed");
+        let marker = "tc887-sealed-duckdb-marker";
+        let query = || DuckDbRequest::Query {
+            sql: "SELECT name FROM events ORDER BY id".to_string(),
+            params: Vec::new(),
+        };
+
+        let cache_one = TempDir::new().unwrap();
+        service(&cache_one, repo.clone())
+            .execute(
+                &space,
+                "analytics",
+                DuckDbRequest::Execute {
+                    schema: Some(vec![
+                        "CREATE TABLE events (id INTEGER, name VARCHAR)".to_string()
+                    ]),
+                    sql: format!("INSERT INTO events VALUES (1, '{marker}')"),
+                    params: Vec::new(),
+                },
+                None,
+                "tinycloud.duckdb/write".to_string(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let row = database_artifact::Entity::find()
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.payload_encoding, Some(1));
+        assert!(row.payload.starts_with(b"TCE1"));
+        assert_ne!(row.payload.get(8..12), Some(&b"DUCK"[..]));
+        assert!(!row
+            .payload
+            .windows(marker.len())
+            .any(|window| window == marker.as_bytes()));
+
+        let cache_two = TempDir::new().unwrap();
+        let recreated = service(&cache_two, repo.clone());
+        let result = recreated
+            .execute(
+                &space,
+                "analytics",
+                query(),
+                None,
+                "tinycloud.duckdb/read".to_string(),
+                false,
+            )
+            .await
+            .unwrap();
+        match result.response {
+            DuckDbResponse::Query(rows) => {
+                assert_eq!(rows.rows, vec![vec![DuckDbValue::Text(marker.to_string())]]);
+            }
+            other => panic!("expected query response, got {other:?}"),
+        }
+        let exported = recreated.export(&space, "analytics").await.unwrap();
+        assert_eq!(exported.get(8..12), Some(&b"DUCK"[..]));
+        drop(recreated);
+
+        source.set_provider(Some(Arc::new(FixedKeyProvider::new([5; 32]).locked())));
+        let cache_three = TempDir::new().unwrap();
+        let read = service(&cache_three, repo)
+            .execute(
+                &space,
+                "analytics",
+                query(),
+                None,
+                "tinycloud.duckdb/read".to_string(),
+                false,
+            )
+            .await;
+        assert!(matches!(read, Err(DuckDbError::Unavailable)), "{read:?}");
     }
 
     #[tokio::test]

@@ -203,6 +203,25 @@ fn with_identity<T>(i: &serde_json::Value, f: impl FnOnce(&BlobIdentity<'_>) -> 
             checkpoint_content_hash: s(i, "checkpoint_content_hash"),
             delta_content_hash: s(i, "delta_content_hash"),
         },
+        "sql-manifest" => {
+            fn part(p: &serde_json::Value) -> SqlManifestPart<'_> {
+                SqlManifestPart {
+                    content_hash: p["content_hash"].as_str().unwrap(),
+                    size_bytes: p["size_bytes"].as_i64().unwrap(),
+                    encoding: p["encoding"].as_i64().map(|e| i16::try_from(e).unwrap()),
+                }
+            }
+            BlobIdentity::SqlManifest {
+                service: s(i, "service"),
+                space: s(i, "space"),
+                name: s(i, "name"),
+                revision: i["revision"].as_i64().unwrap(),
+                content_hash: s(i, "content_hash"),
+                size_bytes: i["size_bytes"].as_i64().unwrap(),
+                checkpoint: part(&i["checkpoint"]),
+                delta: (!i["delta"].is_null()).then(|| part(&i["delta"])),
+            }
+        }
         p => panic!("unknown purpose {p}"),
     };
     f(&id)
@@ -257,7 +276,7 @@ fn s<'a>(v: &'a serde_json::Value, k: &str) -> &'a str {
 #[test]
 fn known_answer_vectors_match_independent_reference() {
     let v = vectors();
-    assert_eq!(v.vectors.len(), 8);
+    assert_eq!(v.vectors.len(), 10);
     for t in &v.vectors {
         let k = DataKey::new(DekId::new(t.dek_id), arr32(&t.dek));
         let pt = vector_plaintext(t);
@@ -456,6 +475,25 @@ proptest! {
     }
 
     #[test]
+    fn pushed_slices_open_like_the_whole_buffer(
+        len in edge_len(),
+        seed: u64,
+        sizes in prop::collection::vec(1usize..70_000, 1..6),
+    ) {
+        let k = key(2, 5);
+        let h = hash(b"push");
+        let pt = bytes(len, seed);
+        let ct = seal(&k, &kv(&h), pt.clone()).unwrap();
+        prop_assert_eq!(push_open(&k, &kv(&h), &ct, &sizes).unwrap(), pt);
+        // Cut short anywhere, or one byte too long, it never opens.
+        let cut = (seed as usize) % ct.len();
+        prop_assert!(push_open(&k, &kv(&h), &ct[..cut], &sizes).is_err());
+        let mut long = ct.clone();
+        long.push(0);
+        prop_assert!(push_open(&k, &kv(&h), &long, &sizes).is_err());
+    }
+
+    #[test]
     fn length_inverse(p in 0u64..(1u64 << 44), c in 0u64..(1u64 << 44)) {
         prop_assert_eq!(plaintext_len(ciphertext_len(p).unwrap()), Some(p));
         if let Some(q) = plaintext_len(c) {
@@ -505,6 +543,32 @@ proptest! {
         prop_assert!(open(&k, &kv(&h), ct.clone()).is_err());
         prop_assert!(stream_open(&k, &kv(&h), &ct).is_err());
     }
+}
+
+/// Opens `ct` through [`SegmentOpener`], pushing slices of the cycled
+/// `sizes`.
+fn push_open(
+    k: &DataKey,
+    id: &BlobIdentity<'_>,
+    ct: &[u8],
+    sizes: &[usize],
+) -> Result<Vec<u8>, EnvelopeError> {
+    let header = Header::parse(ct)?;
+    let mut opener = SegmentOpener::new(k, id, &header)?;
+    let mut out = Vec::new();
+    let mut rest = &ct[HEADER_LEN..];
+    for size in sizes.iter().cycle() {
+        if rest.is_empty() {
+            break;
+        }
+        let (mut slice, tail) = rest.split_at((*size).min(rest.len()));
+        rest = tail;
+        while let Some(plain) = opener.push(&mut slice)? {
+            out.extend_from_slice(plain);
+        }
+    }
+    opener.finish()?;
+    Ok(out)
 }
 
 #[test]
@@ -684,6 +748,89 @@ fn ciphertext_is_bound_to_its_identity() {
             );
             assert!(is_integrity(stream_open(&k, &b, &ct)));
         }
+    }
+}
+
+/// A SQL manifest tag opens only under the exact manifest it was sealed for:
+/// every field, the presence of the delta, and each part's encoding count.
+#[test]
+fn a_sql_manifest_is_bound_to_every_field() {
+    let k = key(1, 6);
+    let part = |hash, size, encoding| SqlManifestPart {
+        content_hash: hash,
+        size_bytes: size,
+        encoding,
+    };
+    let manifest = |revision, size_bytes, checkpoint, delta| BlobIdentity::SqlManifest {
+        service: "sql",
+        space: SPACE,
+        name: "db",
+        revision,
+        content_hash: "logical",
+        size_bytes,
+        checkpoint,
+        delta,
+    };
+    let ckpt = part("c1", 10, Some(1));
+    let delta = part("d1", 5, Some(1));
+    let good = manifest(2, 15, ckpt, Some(delta));
+    let bad = [
+        manifest(3, 15, ckpt, Some(delta)),
+        manifest(2, 16, ckpt, Some(delta)),
+        manifest(2, 15, ckpt, None),
+        manifest(2, 15, part("c2", 10, Some(1)), Some(delta)),
+        manifest(2, 15, part("c1", 11, Some(1)), Some(delta)),
+        manifest(2, 15, part("c1", 10, None), Some(delta)),
+        manifest(2, 15, ckpt, Some(part("d2", 5, Some(1)))),
+        manifest(2, 15, ckpt, Some(part("d1", 6, Some(1)))),
+        manifest(2, 15, ckpt, Some(part("d1", 5, None))),
+        BlobIdentity::SqlManifest {
+            service: "sql",
+            space: SPACE,
+            name: "db2",
+            revision: 2,
+            content_hash: "logical",
+            size_bytes: 15,
+            checkpoint: ckpt,
+            delta: Some(delta),
+        },
+        BlobIdentity::SqlManifest {
+            service: "duckdb",
+            space: SPACE,
+            name: "db",
+            revision: 2,
+            content_hash: "logical",
+            size_bytes: 15,
+            checkpoint: ckpt,
+            delta: Some(delta),
+        },
+        BlobIdentity::SqlManifest {
+            service: "sql",
+            space: SPACE,
+            name: "db",
+            revision: 2,
+            content_hash: "other",
+            size_bytes: 15,
+            checkpoint: ckpt,
+            delta: Some(delta),
+        },
+        BlobIdentity::SqlWal {
+            service: "sql",
+            space: SPACE,
+            name: "db",
+            revision: 2,
+            checkpoint_content_hash: "c1",
+            delta_content_hash: "d1",
+        },
+    ];
+    let tag = seal(&k, &good, Vec::new()).unwrap();
+    assert_eq!(tag.len() as u64, ciphertext_len(0).unwrap());
+    assert_eq!(open(&k, &good, tag.clone()).unwrap(), Vec::<u8>::new());
+    for b in bad {
+        assert!(
+            matches!(open(&k, &b, tag.clone()), Err(EnvelopeError::Integrity)),
+            "{good:?} opened as {b:?}"
+        );
     }
 }
 

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use sea_orm::{
     sea_query::{Expr, Func},
@@ -8,6 +10,11 @@ use sea_orm::{
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::{
+    at_rest::{
+        self, AtRestMode, AtRestSource, AtRestView, BlobIdentity, DataKey, DataKeyError,
+        DataKeyProvider, EnvelopeError, Header, PayloadEncoding, SegmentOpener, SqlManifestPart,
+        HEADER_LEN,
+    },
     db_pool::BulkScope,
     hash::{hash, Blake3Hasher},
     models::database_artifact,
@@ -129,6 +136,75 @@ pub enum DatabaseArtifactError {
     /// the bytes; the message is the sink's own.
     #[error("{0}")]
     Sink(String),
+    /// The at-rest keys a sealed write or read needs are not available now:
+    /// locked, the encrypt gate closed, or the key store failed. Nothing was
+    /// written and nothing was read as plaintext. Callers answer 503.
+    #[error("database artifact at-rest keys are unavailable")]
+    AtRestUnavailable,
+    /// A sealed part did not open: tampered, truncated, moved from another
+    /// artifact, revision or space, or naming a key its space never had.
+    /// Never read as legacy plaintext. Callers answer 500.
+    #[error("database artifact {part} failed its at-rest integrity check")]
+    AtRestIntegrity { part: &'static str },
+    /// A part stored in a later at-rest format than this build reads. The
+    /// marker is unauthenticated, so this fails closed exactly like an
+    /// integrity failure. Callers answer 500.
+    #[error("database artifact {part} uses unsupported at-rest format version {version}; upgrade the node")]
+    AtRestUnsupported { part: &'static str, version: u8 },
+    /// A legacy plaintext part read in `strict` mode. Callers answer 500.
+    #[error("database artifact {part} is legacy plaintext, which strict at-rest mode refuses")]
+    LegacyPlaintextRefused { part: &'static str },
+}
+
+/// A key-store failure while reading a sealed part. A key the space never
+/// had is an integrity failure of the part; anything else means the keys
+/// are unavailable now.
+fn read_key_error(part: ArtifactPart, error: DataKeyError) -> DatabaseArtifactError {
+    key_error_at(part.as_str(), error)
+}
+
+/// [`read_key_error`] for a sealed item named `role`.
+fn key_error_at(role: &'static str, error: DataKeyError) -> DatabaseArtifactError {
+    match error {
+        DataKeyError::UnknownKey { .. } => {
+            tracing::error!(
+                role,
+                "Sealed database artifact names a data key its space does not have"
+            );
+            DatabaseArtifactError::AtRestIntegrity { part: role }
+        }
+        error => {
+            tracing::warn!(role, %error, "At-rest keys unavailable for a sealed database artifact");
+            DatabaseArtifactError::AtRestUnavailable
+        }
+    }
+}
+
+/// An envelope failure on a sealed part: `Unsupported` keeps its operator
+/// message, everything else is an integrity failure. Both fail closed.
+fn envelope_error(part: ArtifactPart, error: EnvelopeError) -> DatabaseArtifactError {
+    envelope_error_at(part.as_str(), error)
+}
+
+/// [`envelope_error`] for a sealed item named `role`.
+fn envelope_error_at(role: &'static str, error: EnvelopeError) -> DatabaseArtifactError {
+    match error {
+        EnvelopeError::Unsupported { version } => {
+            tracing::error!(
+                role,
+                version,
+                "Database artifact uses an unsupported at-rest format; upgrade the node"
+            );
+            DatabaseArtifactError::AtRestUnsupported {
+                part: role,
+                version,
+            }
+        }
+        error => {
+            tracing::error!(role, %error, "Database artifact failed its at-rest integrity check");
+            DatabaseArtifactError::AtRestIntegrity { part: role }
+        }
+    }
 }
 
 /// The stored metadata of one artifact row: everything but the payload bytes.
@@ -138,11 +214,12 @@ pub enum DatabaseArtifactError {
 /// or a size comparison needs, and what [`DatabaseArtifactRepository::read_chunks`]
 /// pins a streamed read to.
 ///
-/// Shape note for at-rest encoding (TC-887): sizes and hashes here describe the
-/// STORED bytes, which today are the plain database file. An encoding column
-/// (`payload_encoding`) would be added to this struct, and chunking would keep
-/// applying to the stored (encoded) bytes, so decoding belongs in the sink.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// At rest (TC-887): sizes and hashes here describe the PLAINTEXT database
+/// file whatever the encoding, so quota and growth checks read them as
+/// before; they are also part of what a sealed part is bound to. A TCE1 part
+/// stores `at_rest::ciphertext_len(size)` bytes, which the streamed read
+/// slices and decodes before hashing.
+#[derive(Debug, Clone, PartialEq, Eq, sea_orm::FromQueryResult)]
 pub struct ArtifactMeta {
     pub revision: i64,
     pub size_bytes: i64,
@@ -154,6 +231,13 @@ pub struct ArtifactMeta {
     pub updated_at: String,
     pub storage_mode: String,
     pub backend: String,
+    /// How `payload` is stored (`at_rest::PayloadEncoding::from_column`).
+    pub payload_encoding: Option<i16>,
+    /// How `delta_payload` is stored.
+    pub delta_encoding: Option<i16>,
+    /// The row's manifest tag (80 bytes when present): checked before any
+    /// part is read (`docs/at-rest/INTERFACES.md` §8).
+    pub manifest: Option<Vec<u8>>,
 }
 
 impl ArtifactMeta {
@@ -616,9 +700,10 @@ pub trait DatabaseArtifactRepository: Send + Sync {
     /// the caller must discard what the sink received. Prefer [`read_artifact`],
     /// which also handles the restart.
     ///
-    /// TC-887: chunking applies to the STORED bytes; an encoded payload would
-    /// be decoded by the sink (or a decoding wrapper around it), and the
-    /// hashes verified here would be the stored-bytes hashes.
+    /// TC-887: chunking applies to the STORED bytes. A TCE1 part is decoded
+    /// as it streams, one 64 KiB segment at a time, so the sink receives and
+    /// the hashes cover the plaintext database file. Whether a part is
+    /// sealed comes from its encoding column, never from its bytes.
     async fn read_chunks(
         &self,
         service: &str,
@@ -678,6 +763,9 @@ struct CurrentArtifact {
 pub struct SeaOrmDatabaseArtifactRepository {
     conn: crate::db_pool::RecoveringConnection,
     sqlite_writer_lock: Option<std::sync::Arc<tokio::sync::Mutex<()>>>,
+    /// The node's at-rest state, read per operation; `None` is mode `off`
+    /// with no keys.
+    at_rest: Option<Arc<dyn AtRestSource>>,
     /// Test-only rendezvous seam (see [`wait_at_race_barrier`]) that lets two
     /// writers read the same base revision before either commits, so the
     /// full-checkpoint CAS conflict path can be exercised deterministically.
@@ -690,8 +778,49 @@ impl SeaOrmDatabaseArtifactRepository {
         Self {
             conn: conn.into(),
             sqlite_writer_lock: None,
+            at_rest: None,
             #[cfg(test)]
             race_barrier: None,
+        }
+    }
+
+    /// Seal and open parts by the node's at-rest state (TC-887). Mode `off`
+    /// stores plaintext exactly as without it; any other mode seals every
+    /// part it writes or fails the write, never falling back to plaintext.
+    pub fn with_at_rest(mut self, source: Arc<dyn AtRestSource>) -> Self {
+        self.at_rest = Some(source);
+        self
+    }
+
+    fn at_rest_view(&self) -> AtRestView {
+        self.at_rest
+            .as_ref()
+            .map_or_else(AtRestView::off, |source| source.view())
+    }
+
+    /// The key a write in `space` seals with, or `None` in mode `off`.
+    ///
+    /// Runs before the SQLite writer lock: `current_key` may create the
+    /// space's data key, which writes the key store, and the key store
+    /// takes that lock on SQLite.
+    async fn write_key(&self, space: &str) -> Result<Option<DataKey>, DatabaseArtifactError> {
+        let view = self.at_rest_view();
+        if view.mode == AtRestMode::Off {
+            return Ok(None);
+        }
+        let provider = match view.provider {
+            Some(provider) if view.encrypting => provider,
+            _ => {
+                tracing::warn!("Database artifact write refused: at-rest encryption is not on");
+                return Err(DatabaseArtifactError::AtRestUnavailable);
+            }
+        };
+        match provider.current_key(space).await {
+            Ok(key) => Ok(Some(key)),
+            Err(error) => {
+                tracing::warn!(%error, "Database artifact write refused: no at-rest data key");
+                Err(DatabaseArtifactError::AtRestUnavailable)
+            }
         }
     }
 
@@ -726,44 +855,532 @@ impl SeaOrmDatabaseArtifactRepository {
     }
 }
 
+#[derive(Clone, Copy)]
 struct ArtifactKey<'a> {
     service: &'a str,
     space: &'a str,
     name: &'a str,
 }
 
+/// What one stored part's TCE1 ciphertext is bound to
+/// (`docs/at-rest/INTERFACES.md` §4): the row's key and the part's plaintext
+/// hash and size, and for a WAL the revision that wrote it and the checkpoint
+/// it applies to. A part moved to another row, revision or checkpoint does
+/// not open. Owned, so sealing can run off the async runtime.
+enum PartBinding {
+    Checkpoint {
+        service: String,
+        space: String,
+        name: String,
+        content_hash: String,
+        size_bytes: u64,
+    },
+    Wal {
+        service: String,
+        space: String,
+        name: String,
+        revision: i64,
+        checkpoint_content_hash: String,
+        delta_content_hash: String,
+    },
+}
+
+impl PartBinding {
+    fn checkpoint(key: &ArtifactKey<'_>, content_hash: &str, size_bytes: i64) -> Self {
+        Self::Checkpoint {
+            service: key.service.to_owned(),
+            space: key.space.to_owned(),
+            name: key.name.to_owned(),
+            content_hash: content_hash.to_owned(),
+            size_bytes: u64::try_from(size_bytes).unwrap_or(0),
+        }
+    }
+
+    fn wal(
+        key: &ArtifactKey<'_>,
+        revision: i64,
+        checkpoint_content_hash: &str,
+        delta_content_hash: &str,
+    ) -> Self {
+        Self::Wal {
+            service: key.service.to_owned(),
+            space: key.space.to_owned(),
+            name: key.name.to_owned(),
+            revision,
+            checkpoint_content_hash: checkpoint_content_hash.to_owned(),
+            delta_content_hash: delta_content_hash.to_owned(),
+        }
+    }
+
+    /// The binding of `part` of the row `meta` describes.
+    fn of(key: &ArtifactKey<'_>, meta: &ArtifactMeta, part: ArtifactPart) -> Self {
+        match part {
+            ArtifactPart::Checkpoint => Self::checkpoint(
+                key,
+                &meta.checkpoint_content_hash,
+                meta.checkpoint_size_bytes,
+            ),
+            ArtifactPart::Wal => Self::wal(
+                key,
+                meta.revision,
+                &meta.checkpoint_content_hash,
+                meta.delta_content_hash.as_deref().unwrap_or_default(),
+            ),
+        }
+    }
+
+    fn identity(&self) -> BlobIdentity<'_> {
+        match self {
+            Self::Checkpoint {
+                service,
+                space,
+                name,
+                content_hash,
+                size_bytes,
+            } => BlobIdentity::SqlCheckpoint {
+                service,
+                space,
+                name,
+                checkpoint_content_hash: content_hash,
+                checkpoint_size_bytes: *size_bytes,
+            },
+            Self::Wal {
+                service,
+                space,
+                name,
+                revision,
+                checkpoint_content_hash,
+                delta_content_hash,
+            } => BlobIdentity::SqlWal {
+                service,
+                space,
+                name,
+                revision: *revision,
+                checkpoint_content_hash,
+                delta_content_hash,
+            },
+        }
+    }
+}
+
+/// A row's manifest (`docs/at-rest/INTERFACES.md` §8): its revision, logical
+/// hash and size, and for each part it holds the plaintext hash, size and
+/// encoding. A sealed write stores a tag for it in `manifest` (a TCE1 seal
+/// of nothing under this identity, so a key-bound MAC); a read checks the
+/// tag before any part. A dropped delta, a part or metadata from another
+/// revision, or a changed encoding then fails as integrity instead of
+/// reading as some other database.
+struct RowManifest<'a> {
+    key: ArtifactKey<'a>,
+    revision: i64,
+    content_hash: &'a str,
+    size_bytes: i64,
+    checkpoint: SqlManifestPart<'a>,
+    delta: Option<SqlManifestPart<'a>>,
+}
+
+impl<'a> RowManifest<'a> {
+    fn of_meta(key: ArtifactKey<'a>, meta: &'a ArtifactMeta) -> Self {
+        Self {
+            key,
+            revision: meta.revision,
+            content_hash: &meta.content_hash,
+            size_bytes: meta.size_bytes,
+            checkpoint: SqlManifestPart {
+                content_hash: &meta.checkpoint_content_hash,
+                size_bytes: meta.checkpoint_size_bytes,
+                encoding: meta.payload_encoding,
+            },
+            delta: meta
+                .delta_content_hash
+                .as_deref()
+                .map(|content_hash| SqlManifestPart {
+                    content_hash,
+                    size_bytes: meta.delta_size_bytes,
+                    encoding: meta.delta_encoding,
+                }),
+        }
+    }
+
+    fn of_row(row: &'a database_artifact::Model) -> Self {
+        Self {
+            key: ArtifactKey {
+                service: &row.service,
+                space: &row.space,
+                name: &row.name,
+            },
+            revision: row.revision,
+            content_hash: &row.content_hash,
+            size_bytes: row.size_bytes,
+            checkpoint: SqlManifestPart {
+                content_hash: &row.checkpoint_content_hash,
+                size_bytes: row.checkpoint_size_bytes,
+                encoding: row.payload_encoding,
+            },
+            delta: row
+                .delta_content_hash
+                .as_deref()
+                .map(|content_hash| SqlManifestPart {
+                    content_hash,
+                    size_bytes: row.delta_size_bytes,
+                    encoding: row.delta_encoding,
+                }),
+        }
+    }
+
+    fn identity(&self) -> BlobIdentity<'_> {
+        BlobIdentity::SqlManifest {
+            service: self.key.service,
+            space: self.key.space,
+            name: self.key.name,
+            revision: self.revision,
+            content_hash: self.content_hash,
+            size_bytes: self.size_bytes,
+            checkpoint: self.checkpoint,
+            delta: self.delta,
+        }
+    }
+
+    /// The tag a sealed write stores with the row.
+    fn seal(&self, key: &DataKey) -> Result<Vec<u8>, DatabaseArtifactError> {
+        // `seal` refuses only a plaintext past the TCE1 limit; this one is empty.
+        at_rest::seal(key, &self.identity(), Vec::new())
+            .map_err(|_| DatabaseArtifactError::PayloadTooLarge(0))
+    }
+
+    /// Checks the row's stored `tag` against this manifest, before any part
+    /// is read. Only mode `off` writes a row without a tag: one with no
+    /// sealed part, or a delta written in `off` over a sealed checkpoint (that
+    /// legacy delta is as unauthenticated as any legacy part, and `strict`
+    /// refuses it). Any other row without a tag fails as integrity.
+    async fn verify(
+        &self,
+        tag: Option<&[u8]>,
+        keys: Option<&dyn DataKeyProvider>,
+    ) -> Result<(), DatabaseArtifactError> {
+        const ROLE: &str = "manifest";
+        // An unknown or invalid encoding keeps its own error.
+        let checkpoint = PayloadEncoding::from_column(self.checkpoint.encoding)
+            .map_err(|error| envelope_error(ArtifactPart::Checkpoint, error))?;
+        let delta = self
+            .delta
+            .map(|delta| {
+                PayloadEncoding::from_column(delta.encoding)
+                    .map_err(|error| envelope_error(ArtifactPart::Wal, error))
+            })
+            .transpose()?;
+        let Some(tag) = tag else {
+            return match (checkpoint, delta) {
+                (PayloadEncoding::LegacyPlaintext, None)
+                | (_, Some(PayloadEncoding::LegacyPlaintext)) => Ok(()),
+                _ => {
+                    tracing::error!(
+                        role = ROLE,
+                        "Database artifact has sealed parts but no manifest tag"
+                    );
+                    Err(DatabaseArtifactError::AtRestIntegrity { part: ROLE })
+                }
+            };
+        };
+        let Some(keys) = keys else {
+            tracing::warn!(
+                role = ROLE,
+                "Sealed database artifact read with no at-rest keys configured"
+            );
+            return Err(DatabaseArtifactError::AtRestUnavailable);
+        };
+        let header = Header::parse(tag).map_err(|error| envelope_error_at(ROLE, error))?;
+        let data_key = keys
+            .key(self.key.space, header.dek_id())
+            .await
+            .map_err(|error| key_error_at(ROLE, error))?;
+        let opened = at_rest::open(&data_key, &self.identity(), tag.to_vec())
+            .map_err(|error| envelope_error_at(ROLE, error))?;
+        if !opened.is_empty() {
+            return Err(envelope_error_at(ROLE, EnvelopeError::Integrity));
+        }
+        Ok(())
+    }
+}
+
+/// Room for sealing a part of `len` plaintext bytes in place.
+fn sealed_capacity(len: usize) -> Result<usize, DatabaseArtifactError> {
+    at_rest::ciphertext_len(len as u64)
+        .ok()
+        .and_then(|stored| usize::try_from(stored).ok())
+        .ok_or(DatabaseArtifactError::PayloadTooLarge(len as u64))
+}
+
+/// Seal one part off the async runtime (a checkpoint can be tens of MiB).
+/// `plaintext` should already have [`sealed_capacity`], so sealing in place
+/// neither reallocates nor copies.
+async fn seal_part(
+    key: DataKey,
+    binding: PartBinding,
+    plaintext: Vec<u8>,
+) -> Result<Vec<u8>, DatabaseArtifactError> {
+    let len = plaintext.len() as u64;
+    tokio::task::spawn_blocking(move || at_rest::seal(&key, &binding.identity(), plaintext))
+        .await
+        .map_err(|error| DatabaseArtifactError::Backend(error.to_string()))?
+        // `seal` refuses only a plaintext past the TCE1 size limit.
+        .map_err(|_| DatabaseArtifactError::PayloadTooLarge(len))
+}
+
+/// Turns one part's stored bytes into its plaintext as they stream. Legacy
+/// plaintext passes through; a TCE1 part is opened one authenticated 64 KiB
+/// segment at a time, so at most one segment is buffered. What it hands on
+/// is what the sink receives and the content hash covers.
+enum PartDecoder {
+    Plain,
+    /// Collecting the 64-byte header, which names the data key.
+    Header {
+        header: Vec<u8>,
+        provider: Arc<dyn DataKeyProvider>,
+        binding: PartBinding,
+        plaintext_len: u64,
+    },
+    Sealed(Box<SegmentOpener>),
+}
+
+impl PartDecoder {
+    async fn feed(
+        &mut self,
+        part: ArtifactPart,
+        space: &str,
+        mut stored: &[u8],
+        hasher: &mut Blake3Hasher,
+        sink: &mut dyn ArtifactSink,
+    ) -> Result<(), DatabaseArtifactError> {
+        if let Self::Header {
+            header,
+            provider,
+            binding,
+            plaintext_len,
+        } = self
+        {
+            let take = (HEADER_LEN - header.len()).min(stored.len());
+            header.extend_from_slice(&stored[..take]);
+            stored = &stored[take..];
+            if header.len() < HEADER_LEN {
+                return Ok(());
+            }
+            let parsed = Header::parse(header).map_err(|error| envelope_error(part, error))?;
+            // The row's plaintext size is part of the stored length already
+            // read; a header that disagrees is refused before any key lookup.
+            // The segments authenticate the header either way.
+            if parsed.plaintext_len() != *plaintext_len {
+                return Err(envelope_error(part, EnvelopeError::Integrity));
+            }
+            let key = provider
+                .key(space, parsed.dek_id())
+                .await
+                .map_err(|error| read_key_error(part, error))?;
+            let opener = SegmentOpener::new(&key, &binding.identity(), &parsed)
+                .map_err(|error| envelope_error(part, error))?;
+            *self = Self::Sealed(Box::new(opener));
+        }
+        match self {
+            Self::Plain => {
+                hasher.update(stored);
+                sink.write(stored).await
+            }
+            Self::Sealed(opener) => {
+                while let Some(plain) = opener
+                    .push(&mut stored)
+                    .map_err(|error| envelope_error(part, error))?
+                {
+                    // An empty part is one empty segment; like a legacy
+                    // empty part, the sink sees no write.
+                    if !plain.is_empty() {
+                        hasher.update(plain);
+                        sink.write(plain).await?;
+                    }
+                }
+                Ok(())
+            }
+            Self::Header { .. } => Ok(()),
+        }
+    }
+
+    /// Every stored byte was fed: a sealed part must have opened completely.
+    fn finish(&self, part: ArtifactPart) -> Result<(), DatabaseArtifactError> {
+        match self {
+            Self::Plain => Ok(()),
+            Self::Header { .. } => Err(envelope_error(part, EnvelopeError::Integrity)),
+            Self::Sealed(opener) => opener.finish().map_err(|error| envelope_error(part, error)),
+        }
+    }
+}
+
+/// The plaintext of one whole stored part, for [`open_row`].
+async fn open_whole(
+    key: &ArtifactKey<'_>,
+    part: ArtifactPart,
+    encoding: Option<i16>,
+    stored: Vec<u8>,
+    binding: PartBinding,
+    keys: Option<&dyn DataKeyProvider>,
+) -> Result<Vec<u8>, DatabaseArtifactError> {
+    match PayloadEncoding::from_column(encoding).map_err(|error| envelope_error(part, error))? {
+        PayloadEncoding::LegacyPlaintext => Ok(stored),
+        PayloadEncoding::Tce1 => {
+            let Some(keys) = keys else {
+                return Err(DatabaseArtifactError::AtRestUnavailable);
+            };
+            let header = Header::parse(&stored).map_err(|error| envelope_error(part, error))?;
+            let data_key = keys
+                .key(key.space, header.dek_id())
+                .await
+                .map_err(|error| read_key_error(part, error))?;
+            at_rest::open(&data_key, &binding.identity(), stored)
+                .map_err(|error| envelope_error(part, error))
+        }
+    }
+}
+
+/// The plaintext checkpoint and WAL of a whole stored row, for the offline
+/// tool that inspects designated local snapshots (the node itself only
+/// streams). Legacy parts come back as stored. The row's manifest tag is
+/// checked first, as on a streamed read; sealed parts need `keys` and are
+/// opened and authenticated, or the call fails: ciphertext is never
+/// returned as a database file.
+pub async fn open_row(
+    row: database_artifact::Model,
+    keys: Option<&dyn DataKeyProvider>,
+) -> Result<(Vec<u8>, Option<Vec<u8>>), DatabaseArtifactError> {
+    RowManifest::of_row(&row)
+        .verify(row.manifest.as_deref(), keys)
+        .await?;
+    let key = ArtifactKey {
+        service: &row.service,
+        space: &row.space,
+        name: &row.name,
+    };
+    let checkpoint = open_whole(
+        &key,
+        ArtifactPart::Checkpoint,
+        row.payload_encoding,
+        row.payload,
+        PartBinding::checkpoint(
+            &key,
+            &row.checkpoint_content_hash,
+            row.checkpoint_size_bytes,
+        ),
+        keys,
+    )
+    .await?;
+    // Whether there is a WAL is the authenticated metadata's answer; a
+    // stored column that disagrees is a tampered row, never a smaller or a
+    // larger database.
+    let wal = match (row.delta_content_hash.as_deref(), row.delta_payload) {
+        (Some(delta_hash), Some(delta)) => Some(
+            open_whole(
+                &key,
+                ArtifactPart::Wal,
+                row.delta_encoding,
+                delta,
+                PartBinding::wal(&key, row.revision, &row.checkpoint_content_hash, delta_hash),
+                keys,
+            )
+            .await?,
+        ),
+        (None, None) => None,
+        _ => {
+            return Err(DatabaseArtifactError::AtRestIntegrity {
+                part: ArtifactPart::Wal.as_str(),
+            })
+        }
+    };
+    Ok((checkpoint, wal))
+}
+
 impl SeaOrmDatabaseArtifactRepository {
-    /// Stream one payload column into `sink`, hash it, and return its CID.
+    /// Stream one payload column into `sink`, decode and hash it, and return
+    /// the plaintext's CID.
     async fn read_part(
         &self,
         key: &ArtifactKey<'_>,
         meta: &ArtifactMeta,
         part: ArtifactPart,
-        size_bytes: i64,
-        expected_hash: &str,
+        view: &AtRestView,
         sink: &mut dyn ArtifactSink,
     ) -> Result<String, DatabaseArtifactError> {
-        let column = match part {
-            ArtifactPart::Checkpoint => database_artifact::Column::Payload,
-            ArtifactPart::Wal => database_artifact::Column::DeltaPayload,
+        let (column, size_bytes, expected_hash, encoding) = match part {
+            ArtifactPart::Checkpoint => (
+                database_artifact::Column::Payload,
+                meta.checkpoint_size_bytes,
+                meta.checkpoint_content_hash.as_str(),
+                meta.payload_encoding,
+            ),
+            ArtifactPart::Wal => (
+                database_artifact::Column::DeltaPayload,
+                meta.delta_size_bytes,
+                meta.delta_content_hash.as_deref().unwrap_or_default(),
+                meta.delta_encoding,
+            ),
         };
-        let expected_len = u64::try_from(size_bytes).unwrap_or(0);
+        let plaintext_len = u64::try_from(size_bytes).unwrap_or(0);
+        // Legacy or sealed is the column's answer, decided before any byte.
+        let mut decoder = match PayloadEncoding::from_column(encoding)
+            .map_err(|error| envelope_error(part, error))?
+        {
+            PayloadEncoding::LegacyPlaintext if !view.legacy_readable() => {
+                tracing::error!(
+                    role = part.as_str(),
+                    "Legacy plaintext database artifact refused in strict at-rest mode"
+                );
+                return Err(DatabaseArtifactError::LegacyPlaintextRefused {
+                    part: part.as_str(),
+                });
+            }
+            PayloadEncoding::LegacyPlaintext => PartDecoder::Plain,
+            PayloadEncoding::Tce1 => {
+                let Some(provider) = view.provider.clone() else {
+                    tracing::warn!(
+                        role = part.as_str(),
+                        "Sealed database artifact read with no at-rest keys configured"
+                    );
+                    return Err(DatabaseArtifactError::AtRestUnavailable);
+                };
+                PartDecoder::Header {
+                    header: Vec::with_capacity(HEADER_LEN),
+                    provider,
+                    binding: PartBinding::of(key, meta, part),
+                    plaintext_len,
+                }
+            }
+        };
+        // A sealed part stores exactly `ciphertext_len(size)` bytes. Its last
+        // slice asks for one byte more: bytes appended past that length, or
+        // a part cut short, fail as integrity.
+        let sealed = !matches!(decoder, PartDecoder::Plain);
+        let expected_len = if sealed {
+            at_rest::ciphertext_len(plaintext_len).map_err(|error| envelope_error(part, error))?
+        } else {
+            plaintext_len
+        };
         // An artifact that fits the base-timeout budget is one slice per part:
         // no extra round trips for the common small database.
-        // Gated on the part's own size as well, so inconsistent metadata
-        // can never ask for a slice past the budget.
-        let budget = BASE_TIMEOUT_PAYLOAD_BYTES as i64;
-        let slice_bytes = if meta.size_bytes <= budget && size_bytes <= budget {
+        // Gated on the part's own stored size as well, so inconsistent
+        // metadata can never ask for a slice past the budget.
+        let budget = BASE_TIMEOUT_PAYLOAD_BYTES as u64;
+        let slice_bytes = if meta.size_bytes <= budget as i64 && expected_len <= budget {
             expected_len.max(1)
         } else {
             ARTIFACT_CHUNK_BYTES as u64
         };
         let mut hasher = Blake3Hasher::new();
         sink.begin_part(part).await?;
-        sink.size_hint(part, expected_len);
+        sink.size_hint(part, plaintext_len);
         let mut offset = 0_u64;
         while offset < expected_len {
             let len = (expected_len - offset).min(slice_bytes);
+            let ask = if sealed && offset + len == expected_len {
+                len + 1
+            } else {
+                len
+            };
             // `substr` is 1-based and takes int4 on PostgreSQL.
             let start = i32::try_from(offset + 1)
                 .map_err(|_| DatabaseArtifactError::PayloadTooLarge(expected_len))?;
@@ -773,7 +1390,7 @@ impl SeaOrmDatabaseArtifactRepository {
                     Func::cust("substr")
                         .arg(Expr::col(column))
                         .arg(start)
-                        .arg(len as i32),
+                        .arg(ask as i32),
                 )
                 .filter(database_artifact::Column::Service.eq(key.service))
                 .filter(database_artifact::Column::Space.eq(key.space))
@@ -792,16 +1409,28 @@ impl SeaOrmDatabaseArtifactRepository {
             };
             let slice = slice.unwrap_or_default();
             if slice.len() as u64 != len {
+                if sealed {
+                    tracing::error!(
+                        role = part.as_str(),
+                        expected = expected_len,
+                        "Sealed database artifact part is not its sealed length"
+                    );
+                    return Err(DatabaseArtifactError::AtRestIntegrity {
+                        part: part.as_str(),
+                    });
+                }
                 return Err(DatabaseArtifactError::SizeMismatch {
                     part: part.as_str(),
                     expected: expected_len,
                     actual: offset + slice.len() as u64,
                 });
             }
-            hasher.update(&slice);
-            sink.write(&slice).await?;
+            decoder
+                .feed(part, key.space, &slice, &mut hasher, sink)
+                .await?;
             offset += len;
         }
+        decoder.finish(part)?;
         let actual = hasher.finalize().to_cid(0x55).to_string();
         if actual != expected_hash {
             return Err(DatabaseArtifactError::HashMismatch {
@@ -822,7 +1451,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         name: &str,
     ) -> Result<Option<ArtifactMeta>, DatabaseArtifactError> {
         use database_artifact::Column;
-        let row = database_artifact::Entity::find_by_id((
+        Ok(database_artifact::Entity::find_by_id((
             service.to_string(),
             space.to_string(),
             name.to_string(),
@@ -838,45 +1467,12 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         .column(Column::UpdatedAt)
         .column(Column::StorageMode)
         .column(Column::Backend)
-        .into_tuple::<(
-            i64,
-            i64,
-            String,
-            String,
-            i64,
-            Option<String>,
-            i64,
-            String,
-            String,
-            String,
-        )>()
+        .column(Column::PayloadEncoding)
+        .column(Column::DeltaEncoding)
+        .column(Column::Manifest)
+        .into_model::<ArtifactMeta>()
         .one(&self.conn)
-        .await?;
-        Ok(row.map(
-            |(
-                revision,
-                size_bytes,
-                content_hash,
-                checkpoint_content_hash,
-                checkpoint_size_bytes,
-                delta_content_hash,
-                delta_size_bytes,
-                updated_at,
-                storage_mode,
-                backend,
-            )| ArtifactMeta {
-                revision,
-                size_bytes,
-                content_hash,
-                checkpoint_content_hash,
-                checkpoint_size_bytes,
-                delta_content_hash,
-                delta_size_bytes,
-                updated_at,
-                storage_mode,
-                backend,
-            },
-        ))
+        .await?)
     }
 
     async fn read_chunks(
@@ -892,27 +1488,19 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
             space,
             name,
         };
+        // One view for both parts: the mode and keys a read sees. The
+        // manifest tag is checked before any byte reaches the sink.
+        let view = self.at_rest_view();
+        RowManifest::of_meta(key, meta)
+            .verify(meta.manifest.as_deref(), view.provider.as_deref())
+            .await?;
         let checkpoint = self
-            .read_part(
-                &key,
-                meta,
-                ArtifactPart::Checkpoint,
-                meta.checkpoint_size_bytes,
-                &meta.checkpoint_content_hash,
-                sink,
-            )
+            .read_part(&key, meta, ArtifactPart::Checkpoint, &view, sink)
             .await?;
         let logical = match &meta.delta_content_hash {
             Some(delta_hash) => {
-                self.read_part(
-                    &key,
-                    meta,
-                    ArtifactPart::Wal,
-                    meta.delta_size_bytes,
-                    delta_hash,
-                    sink,
-                )
-                .await?;
+                self.read_part(&key, meta, ArtifactPart::Wal, &view, sink)
+                    .await?;
                 hash(format!("{checkpoint}:{delta_hash}").as_bytes())
                     .to_cid(0x55)
                     .to_string()
@@ -933,13 +1521,37 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         payload: Vec<u8>,
         expected: ArtifactExpectation,
     ) -> Result<DatabaseArtifact, DatabaseArtifactError> {
+        // Before the writer lock: preparing the space's key may write the
+        // key store, which takes that lock on SQLite.
+        let data_key = self.write_key(space).await?;
+        let size_bytes = i64::try_from(payload.len())
+            .map_err(|_| DatabaseArtifactError::PayloadTooLarge(payload.len() as u64))?;
+        // Hash and size stay those of the plaintext, sealed or not.
+        let content_hash = hash(&payload).to_cid(0x55).to_string();
+        let (stored, encoding) = match &data_key {
+            None => (payload.clone(), PayloadEncoding::LegacyPlaintext),
+            Some(data_key) => {
+                let mut plaintext = Vec::with_capacity(sealed_capacity(payload.len())?);
+                plaintext.extend_from_slice(&payload);
+                let binding = PartBinding::checkpoint(
+                    &ArtifactKey {
+                        service,
+                        space,
+                        name,
+                    },
+                    &content_hash,
+                    size_bytes,
+                );
+                (
+                    seal_part(data_key.clone(), binding, plaintext).await?,
+                    PayloadEncoding::Tce1,
+                )
+            }
+        };
         let _writer = match &self.sqlite_writer_lock {
             Some(lock) => Some(lock.lock().await),
             None => None,
         };
-        let size_bytes = i64::try_from(payload.len())
-            .map_err(|_| DatabaseArtifactError::PayloadTooLarge(payload.len() as u64))?;
-        let content_hash = hash(&payload).to_cid(0x55).to_string();
         let now = OffsetDateTime::now_utc()
             .format(&Rfc3339)
             .expect("current timestamps should format as RFC3339");
@@ -948,7 +1560,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         // the pool's base statement timeout allows, so its write runs under
         // the bulk one (TC-1054). Smaller ones, like every delta, fit the
         // base timeout and pay no extra round trip.
-        let scope = if payload.len() > BASE_TIMEOUT_PAYLOAD_BYTES {
+        let scope = if stored.len() > BASE_TIMEOUT_PAYLOAD_BYTES {
             self.conn.begin_bulk().await?
         } else {
             BulkScope::Pool(self.conn.clone())
@@ -1007,6 +1619,29 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
             .as_ref()
             .map(|model| model.revision + 1)
             .unwrap_or(1);
+        // The new row's manifest tag when sealing; mode `off` clears it.
+        let manifest = data_key
+            .as_ref()
+            .map(|data_key| {
+                RowManifest {
+                    key: ArtifactKey {
+                        service,
+                        space,
+                        name,
+                    },
+                    revision,
+                    content_hash: &content_hash,
+                    size_bytes,
+                    checkpoint: SqlManifestPart {
+                        content_hash: &content_hash,
+                        size_bytes,
+                        encoding: encoding.to_column(),
+                    },
+                    delta: None,
+                }
+                .seal(data_key)
+            })
+            .transpose()?;
 
         // Barrier seam (tests only): lets a second writer observe the same base
         // revision before either commits, exercising the CAS conflict path.
@@ -1030,9 +1665,10 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
                         database_artifact::Column::ContentHash,
                         Expr::value(content_hash.clone()),
                     )
+                    .col_expr(database_artifact::Column::Payload, Expr::value(stored))
                     .col_expr(
-                        database_artifact::Column::Payload,
-                        Expr::value(payload.clone()),
+                        database_artifact::Column::PayloadEncoding,
+                        Expr::value(encoding.to_column()),
                     )
                     .col_expr(
                         database_artifact::Column::SizeBytes,
@@ -1070,6 +1706,11 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
                         database_artifact::Column::DeltaSizeBytes,
                         Expr::value(0_i64),
                     )
+                    .col_expr(
+                        database_artifact::Column::DeltaEncoding,
+                        Expr::value(Option::<i16>::None),
+                    )
+                    .col_expr(database_artifact::Column::Manifest, Expr::value(manifest))
                     .filter(database_artifact::Column::Service.eq(service))
                     .filter(database_artifact::Column::Space.eq(space))
                     .filter(database_artifact::Column::Name.eq(name))
@@ -1093,7 +1734,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
                     name: Set(name.to_string()),
                     revision: Set(revision),
                     content_hash: Set(content_hash.clone()),
-                    payload: Set(payload.clone()),
+                    payload: Set(stored),
                     size_bytes: Set(size_bytes),
                     backend: Set("storage.database".to_string()),
                     storage_mode: Set("database-blob".to_string()),
@@ -1104,6 +1745,9 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
                     delta_payload: Set(None),
                     delta_content_hash: Set(None),
                     delta_size_bytes: Set(0),
+                    payload_encoding: Set(encoding.to_column()),
+                    delta_encoding: Set(None),
+                    manifest: Set(manifest),
                 }
                 .insert(&scope)
                 .await
@@ -1147,6 +1791,9 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         payload: Vec<u8>,
         expected: ArtifactExpectation,
     ) -> Result<DeltaSave, DatabaseArtifactError> {
+        // Before the writer lock: preparing the space's key may write the
+        // key store, which takes that lock on SQLite.
+        let data_key = self.write_key(space).await?;
         let _writer = match &self.sqlite_writer_lock {
             Some(lock) => Some(lock.lock().await),
             None => None,
@@ -1160,7 +1807,8 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         .column(database_artifact::Column::Revision)
         .column(database_artifact::Column::CheckpointSizeBytes)
         .column(database_artifact::Column::CheckpointContentHash)
-        .into_tuple::<(i64, i64, String)>()
+        .column(database_artifact::Column::PayloadEncoding)
+        .into_tuple::<(i64, i64, String, Option<i16>)>()
         .one(&self.conn)
         .await?
         .ok_or(DatabaseArtifactError::MissingCheckpoint)?;
@@ -1183,6 +1831,60 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
             .checked_add(delta_size_bytes)
             .ok_or(DatabaseArtifactError::PayloadTooLarge(u64::MAX))?;
         let revision = existing.0 + 1;
+        // Hash and size above stay those of the plaintext; the sealed WAL is
+        // bound to the revision it is written at and the checkpoint it
+        // applies to.
+        let (stored, encoding) = match &data_key {
+            None => (payload, PayloadEncoding::LegacyPlaintext),
+            Some(data_key) => {
+                let mut plaintext = payload;
+                plaintext.reserve_exact(sealed_capacity(plaintext.len())? - plaintext.len());
+                let binding = PartBinding::wal(
+                    &ArtifactKey {
+                        service,
+                        space,
+                        name,
+                    },
+                    revision,
+                    &existing.2,
+                    &delta_content_hash,
+                );
+                (
+                    seal_part(data_key.clone(), binding, plaintext).await?,
+                    PayloadEncoding::Tce1,
+                )
+            }
+        };
+        // The row's new manifest tag when sealing; mode `off` clears it. Its
+        // checkpoint fields are the columns read above (the update below is
+        // pinned to that revision and checkpoint hash); a checkpoint whose
+        // stored size or encoding disagrees still fails its own read checks.
+        let manifest = data_key
+            .as_ref()
+            .map(|data_key| {
+                RowManifest {
+                    key: ArtifactKey {
+                        service,
+                        space,
+                        name,
+                    },
+                    revision,
+                    content_hash: &logical_content_hash,
+                    size_bytes,
+                    checkpoint: SqlManifestPart {
+                        content_hash: &existing.2,
+                        size_bytes: existing.1,
+                        encoding: existing.3,
+                    },
+                    delta: Some(SqlManifestPart {
+                        content_hash: &delta_content_hash,
+                        size_bytes: delta_size_bytes,
+                        encoding: encoding.to_column(),
+                    }),
+                }
+                .seal(data_key)
+            })
+            .transpose()?;
         let now = OffsetDateTime::now_utc()
             .format(&Rfc3339)
             .expect("current timestamps should format as RFC3339");
@@ -1191,15 +1893,19 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
             .col_expr(database_artifact::Column::Revision, Expr::value(revision))
             .col_expr(
                 database_artifact::Column::ContentHash,
-                Expr::value(logical_content_hash),
+                Expr::value(logical_content_hash.clone()),
             )
             .col_expr(
                 database_artifact::Column::DeltaPayload,
-                Expr::value(Some(payload)),
+                Expr::value(Some(stored)),
+            )
+            .col_expr(
+                database_artifact::Column::DeltaEncoding,
+                Expr::value(encoding.to_column()),
             )
             .col_expr(
                 database_artifact::Column::DeltaContentHash,
-                Expr::value(Some(delta_content_hash)),
+                Expr::value(Some(delta_content_hash.clone())),
             )
             .col_expr(
                 database_artifact::Column::DeltaSizeBytes,
@@ -1214,6 +1920,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
                 Expr::value("checkpoint+wal"),
             )
             .col_expr(database_artifact::Column::UpdatedAt, Expr::value(now))
+            .col_expr(database_artifact::Column::Manifest, Expr::value(manifest))
             .filter(database_artifact::Column::Service.eq(service))
             .filter(database_artifact::Column::Space.eq(space))
             .filter(database_artifact::Column::Name.eq(name))
@@ -1515,6 +2222,9 @@ mod tests {
             delta_payload: Set(None),
             delta_content_hash: Set(None),
             delta_size_bytes: Set(0),
+            payload_encoding: Set(None),
+            delta_encoding: Set(None),
+            manifest: Set(None),
         }
         .insert(&tx)
         .await
@@ -1601,6 +2311,9 @@ mod tests {
                 updated_at: winner.updated_at,
                 storage_mode: winner.storage_mode,
                 backend: winner.backend,
+                payload_encoding: None,
+                delta_encoding: None,
+                manifest: None,
             }
         );
 
@@ -1860,8 +2573,10 @@ mod tests {
 
         let seen = statements.lock().unwrap().clone();
         assert_eq!(seen.len(), 2, "{seen:?}");
+        // The encoding columns are metadata; the payload columns are not.
         assert!(
-            seen.iter().all(|sql| !sql.contains("payload")),
+            seen.iter()
+                .all(|sql| !sql.contains("\"payload\"") && !sql.contains("\"delta_payload\"")),
             "a metadata read must not touch payload columns: {seen:?}"
         );
 
@@ -2466,5 +3181,1014 @@ mod tests {
                 sink.checkpoint.capacity()
             );
         }
+    }
+
+    // ---- sealed at rest (TC-887) ----
+
+    use crate::at_rest::{
+        ciphertext_len, AtRestMode, DataKeyProvider, FixedKeyProvider, TestAtRestSource,
+    };
+
+    const SQLITE_HEADER: &[u8] = b"SQLite format 3\0";
+    const WAL_HEADER: &[u8] = &[0x37, 0x7f, 0x06, 0x82, 0, 0x2d, 0xe2, 0x18];
+    const MARKER: &[u8] = b"tc887-sql-artifact-marker";
+
+    fn keys() -> Arc<dyn DataKeyProvider> {
+        Arc::new(FixedKeyProvider::new([7; 32]))
+    }
+
+    /// A database-shaped part: the engine's file header, then filler with a
+    /// marker in it.
+    fn database_bytes(header: &[u8], len: usize, seed: u8) -> Vec<u8> {
+        let mut out = bytes(len, seed);
+        out[..header.len()].copy_from_slice(header);
+        out[100..100 + MARKER.len()].copy_from_slice(MARKER);
+        out
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+
+    fn cid(bytes: &[u8]) -> String {
+        hash(bytes).to_cid(0x55).to_string()
+    }
+
+    async fn sqlite_conn() -> DatabaseConnection {
+        let mut options = ConnectOptions::new("sqlite::memory:".to_string());
+        options.max_connections(1);
+        let conn = Database::connect(options).await.unwrap();
+        Migrator::up(&conn, None).await.unwrap();
+        conn
+    }
+
+    fn at_rest_repo(
+        conn: &DatabaseConnection,
+        mode: AtRestMode,
+    ) -> (SeaOrmDatabaseArtifactRepository, Arc<TestAtRestSource>) {
+        let source = TestAtRestSource::new(mode, mode != AtRestMode::Off, Some(keys()));
+        let repo = SeaOrmDatabaseArtifactRepository::new(conn.clone()).with_at_rest(source.clone());
+        (repo, source)
+    }
+
+    /// The stored row, payload bytes included.
+    async fn stored_row(
+        conn: &DatabaseConnection,
+        space: &str,
+        name: &str,
+    ) -> Option<database_artifact::Model> {
+        database_artifact::Entity::find_by_id(("sql".to_owned(), space.to_owned(), name.to_owned()))
+            .one(conn)
+            .await
+            .unwrap()
+    }
+
+    /// Overwrite the stored parts of `space/name` with `row`'s, the way
+    /// someone with write access to the database could.
+    async fn put_parts(
+        conn: &DatabaseConnection,
+        space: &str,
+        name: &str,
+        row: &database_artifact::Model,
+    ) {
+        use database_artifact::Column;
+        database_artifact::Entity::update_many()
+            .col_expr(Column::Payload, Expr::value(row.payload.clone()))
+            .col_expr(Column::PayloadEncoding, Expr::value(row.payload_encoding))
+            .col_expr(Column::DeltaPayload, Expr::value(row.delta_payload.clone()))
+            .col_expr(Column::DeltaEncoding, Expr::value(row.delta_encoding))
+            .filter(Column::Service.eq("sql"))
+            .filter(Column::Space.eq(space))
+            .filter(Column::Name.eq(name))
+            .exec(conn)
+            .await
+            .unwrap();
+    }
+
+    /// Reads `space/name` into a cache sink that checks the real file headers,
+    /// as hydration does, and publishes it.
+    async fn hydrate(
+        repo: &SeaOrmDatabaseArtifactRepository,
+        space: &str,
+        name: &str,
+    ) -> (Vec<u8>, Option<Vec<u8>>) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sink = CacheFileSink::new(
+            "sql",
+            format!("{space}/{name}"),
+            dir.path().join("main.db"),
+            dir.path().join("main.db-wal"),
+            |head| head.starts_with(SQLITE_HEADER),
+            |head| head.starts_with(WAL_HEADER),
+        );
+        read_artifact(repo, "sql", space, name, &mut sink)
+            .await
+            .unwrap()
+            .expect("the artifact exists");
+        sink.commit().await.unwrap();
+        (
+            std::fs::read(dir.path().join("main.db")).unwrap(),
+            std::fs::read(dir.path().join("main.db-wal")).ok(),
+        )
+    }
+
+    /// A read that must fail; whatever the sink staged is gone afterwards.
+    async fn read_error(
+        repo: &SeaOrmDatabaseArtifactRepository,
+        space: &str,
+        name: &str,
+    ) -> DatabaseArtifactError {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sink = cache_sink(dir.path());
+        let error = read_artifact(repo, "sql", space, name, &mut sink)
+            .await
+            .expect_err("must not read");
+        drop(sink);
+        assert!(
+            dir_names(dir.path()).is_empty(),
+            "{error:?}: staged bytes left"
+        );
+        error
+    }
+
+    /// Saves a multi-MiB checkpoint and a WAL delta sealed, and checks what
+    /// reached the database and what a hydration gets back. The read is
+    /// sliced at 4 MiB, which never falls on a 64 KiB segment boundary of
+    /// the stored (ciphertext) bytes.
+    async fn assert_sealed_round_trip(
+        repo: &SeaOrmDatabaseArtifactRepository,
+        conn: &DatabaseConnection,
+    ) {
+        let checkpoint = database_bytes(SQLITE_HEADER, 2 * CHUNK + 70_001, 1);
+        let wal = database_bytes(WAL_HEADER, 200_003, 2);
+        repo.save(
+            "sql",
+            "space",
+            "main",
+            checkpoint.clone(),
+            ArtifactExpectation::Absent,
+        )
+        .await
+        .unwrap();
+        let saved = repo
+            .save_delta(
+                "sql",
+                "space",
+                "main",
+                wal.clone(),
+                ArtifactExpectation::Any,
+            )
+            .await
+            .unwrap();
+        assert_eq!(saved.delta_size_bytes, wal.len() as i64);
+
+        let row = stored_row(conn, "space", "main").await.unwrap();
+        assert_eq!(
+            (row.payload_encoding, row.delta_encoding),
+            (Some(1), Some(1))
+        );
+        let delta = row.delta_payload.as_deref().unwrap();
+        for (stored, plain) in [(&row.payload[..], &checkpoint), (delta, &wal)] {
+            assert!(stored.starts_with(b"TCE1"));
+            assert!(!stored.starts_with(SQLITE_HEADER) && !stored.starts_with(WAL_HEADER));
+            assert!(!contains(stored, MARKER), "plaintext reached the database");
+            assert_eq!(
+                stored.len() as u64,
+                ciphertext_len(plain.len() as u64).unwrap()
+            );
+        }
+        // Sizes and hashes stay those of the plaintext: quota, growth checks
+        // and lineage read them unchanged.
+        assert_eq!(row.checkpoint_size_bytes, checkpoint.len() as i64);
+        assert_eq!(row.delta_size_bytes, wal.len() as i64);
+        assert_eq!(row.size_bytes, (checkpoint.len() + wal.len()) as i64);
+        assert_eq!(row.checkpoint_content_hash, cid(&checkpoint));
+        assert_eq!(row.delta_content_hash, Some(cid(&wal)));
+        let meta = repo
+            .load_meta("sql", "space", "main")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(meta.size_bytes, (checkpoint.len() + wal.len()) as i64);
+        assert_eq!(
+            (meta.payload_encoding, meta.delta_encoding),
+            (Some(1), Some(1))
+        );
+
+        assert_eq!(
+            hydrate(repo, "space", "main").await,
+            (checkpoint, Some(wal))
+        );
+    }
+
+    #[tokio::test]
+    async fn sealed_parts_hold_no_plaintext_and_hydrate_exactly() {
+        let conn = sqlite_conn().await;
+        let (repo, source) = at_rest_repo(&conn, AtRestMode::Encrypt);
+        assert_sealed_round_trip(&repo, &conn).await;
+
+        // Sealed parts are read whenever the keys exist, in every mode.
+        let expected = hydrate(&repo, "space", "main").await;
+        for mode in [AtRestMode::Off, AtRestMode::Strict] {
+            source.set(mode, false);
+            assert_eq!(hydrate(&repo, "space", "main").await, expected, "{mode:?}");
+        }
+
+        // An empty database seals and reads back as empty.
+        source.set(AtRestMode::Encrypt, true);
+        repo.save("sql", "space", "empty", vec![], ArtifactExpectation::Any)
+            .await
+            .unwrap();
+        let row = stored_row(&conn, "space", "empty").await.unwrap();
+        assert_eq!(row.payload_encoding, Some(1));
+        assert_eq!(row.payload.len() as u64, ciphertext_len(0).unwrap());
+        let mut sink = MemorySink::default();
+        read_artifact(&repo, "sql", "space", "empty", &mut sink)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(sink.checkpoint.is_empty() && sink.wal.is_none());
+    }
+
+    #[tokio::test]
+    async fn postgres_sealed_parts_round_trip_and_refuse_a_moved_part() {
+        let Some(fixture) = crate::test_support::PostgresTestSchema::migrated_through(
+            "postgres_sealed_parts_round_trip_and_refuse_a_moved_part",
+            None,
+        )
+        .await
+        else {
+            return;
+        };
+        let (repo, _source) = at_rest_repo(&fixture.conn, AtRestMode::Encrypt);
+        assert_sealed_round_trip(&repo, &fixture.conn).await;
+
+        // The same database saved in another space: equal hash and size, but
+        // its ciphertext does not open as this space's.
+        let checkpoint = database_bytes(SQLITE_HEADER, 2 * CHUNK + 70_001, 1);
+        repo.save("sql", "other", "main", checkpoint, ArtifactExpectation::Any)
+            .await
+            .unwrap();
+        let mut moved = stored_row(&fixture.conn, "space", "main").await.unwrap();
+        moved.payload = stored_row(&fixture.conn, "other", "main")
+            .await
+            .unwrap()
+            .payload;
+        put_parts(&fixture.conn, "space", "main", &moved).await;
+        assert!(matches!(
+            read_error(&repo, "space", "main").await,
+            DatabaseArtifactError::AtRestIntegrity { part: "checkpoint" }
+        ));
+    }
+
+    #[tokio::test]
+    async fn off_writes_plaintext_and_legacy_parts_read_unless_strict() {
+        let conn = sqlite_conn().await;
+        let (repo, source) = at_rest_repo(&conn, AtRestMode::Off);
+        let checkpoint = database_bytes(SQLITE_HEADER, 70_000, 3);
+        let wal = database_bytes(WAL_HEADER, 5_000, 4);
+
+        // Mode `off` stores the bytes as given, keys or not.
+        repo.save(
+            "sql",
+            "space",
+            "main",
+            checkpoint.clone(),
+            ArtifactExpectation::Any,
+        )
+        .await
+        .unwrap();
+        let row = stored_row(&conn, "space", "main").await.unwrap();
+        assert_eq!(row.payload, checkpoint);
+        assert_eq!((row.payload_encoding, row.delta_encoding), (None, None));
+
+        // In `encrypt` a legacy checkpoint still reads, and a new WAL delta
+        // on top of it is sealed on its own.
+        source.set(AtRestMode::Encrypt, true);
+        assert_eq!(
+            hydrate(&repo, "space", "main").await,
+            (checkpoint.clone(), None)
+        );
+        repo.save_delta(
+            "sql",
+            "space",
+            "main",
+            wal.clone(),
+            ArtifactExpectation::Any,
+        )
+        .await
+        .unwrap();
+        let row = stored_row(&conn, "space", "main").await.unwrap();
+        assert_eq!(row.payload, checkpoint);
+        assert_eq!((row.payload_encoding, row.delta_encoding), (None, Some(1)));
+        assert_eq!(
+            hydrate(&repo, "space", "main").await,
+            (checkpoint.clone(), Some(wal.clone()))
+        );
+
+        // `strict` refuses the legacy checkpoint instead of serving it.
+        source.set(AtRestMode::Strict, true);
+        assert!(matches!(
+            read_error(&repo, "space", "main").await,
+            DatabaseArtifactError::LegacyPlaintextRefused { part: "checkpoint" }
+        ));
+        // A full save seals it, and the delta it replaces goes with it.
+        repo.save(
+            "sql",
+            "space",
+            "main",
+            checkpoint.clone(),
+            ArtifactExpectation::Any,
+        )
+        .await
+        .unwrap();
+        let row = stored_row(&conn, "space", "main").await.unwrap();
+        assert_eq!((row.payload_encoding, row.delta_encoding), (Some(1), None));
+        assert_eq!(hydrate(&repo, "space", "main").await, (checkpoint, None));
+
+        // Back in `off`, a full save over a sealed row is plaintext again.
+        source.set(AtRestMode::Off, false);
+        repo.save(
+            "sql",
+            "space",
+            "main",
+            wal.clone(),
+            ArtifactExpectation::Any,
+        )
+        .await
+        .unwrap();
+        let row = stored_row(&conn, "space", "main").await.unwrap();
+        assert_eq!((row.payload.clone(), row.payload_encoding), (wal, None));
+    }
+
+    #[tokio::test]
+    async fn without_unlocked_keys_writes_fail_and_change_nothing() {
+        let conn = sqlite_conn().await;
+        let (repo, source) = at_rest_repo(&conn, AtRestMode::Off);
+        let checkpoint = database_bytes(SQLITE_HEADER, 9_000, 5);
+        repo.save(
+            "sql",
+            "space",
+            "main",
+            checkpoint.clone(),
+            ArtifactExpectation::Any,
+        )
+        .await
+        .unwrap();
+        let before = stored_row(&conn, "space", "main").await.unwrap();
+
+        let locked: Arc<dyn DataKeyProvider> = Arc::new(FixedKeyProvider::new([7; 32]).locked());
+        for (mode, encrypting, provider) in [
+            // The gate is closed: the mode asks for sealing, nothing can seal.
+            (AtRestMode::Encrypt, false, Some(keys())),
+            (AtRestMode::Strict, false, Some(keys())),
+            // No keyring at all.
+            (AtRestMode::Encrypt, true, None),
+            // The keys are locked.
+            (AtRestMode::Encrypt, true, Some(locked.clone())),
+        ] {
+            source.set(mode, encrypting);
+            source.set_provider(provider);
+            let case = format!("{mode:?} encrypting={encrypting}");
+            assert!(
+                matches!(
+                    repo.save(
+                        "sql",
+                        "space",
+                        "new",
+                        checkpoint.clone(),
+                        ArtifactExpectation::Any
+                    )
+                    .await,
+                    Err(DatabaseArtifactError::AtRestUnavailable)
+                ),
+                "{case}"
+            );
+            assert!(stored_row(&conn, "space", "new").await.is_none(), "{case}");
+            assert!(
+                matches!(
+                    repo.save(
+                        "sql",
+                        "space",
+                        "main",
+                        checkpoint.clone(),
+                        ArtifactExpectation::Any
+                    )
+                    .await,
+                    Err(DatabaseArtifactError::AtRestUnavailable)
+                ),
+                "{case}"
+            );
+            assert!(
+                matches!(
+                    repo.save_delta(
+                        "sql",
+                        "space",
+                        "main",
+                        vec![1; 64],
+                        ArtifactExpectation::Any
+                    )
+                    .await,
+                    Err(DatabaseArtifactError::AtRestUnavailable)
+                ),
+                "{case}"
+            );
+            assert_eq!(
+                stored_row(&conn, "space", "main").await.unwrap(),
+                before,
+                "{case}: the row is untouched"
+            );
+        }
+
+        // A sealed row is not served while its keys are locked or absent.
+        source.set(AtRestMode::Encrypt, true);
+        source.set_provider(Some(keys()));
+        repo.save(
+            "sql",
+            "space",
+            "sealed",
+            checkpoint,
+            ArtifactExpectation::Any,
+        )
+        .await
+        .unwrap();
+        for provider in [Some(locked), None] {
+            source.set_provider(provider);
+            assert!(matches!(
+                read_error(&repo, "space", "sealed").await,
+                DatabaseArtifactError::AtRestUnavailable
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn tampered_or_moved_sealed_parts_are_integrity_errors() {
+        let conn = sqlite_conn().await;
+        let (repo, _source) = at_rest_repo(&conn, AtRestMode::Encrypt);
+        let checkpoint = database_bytes(SQLITE_HEADER, 3 * 65_536 + 17, 6);
+        let wal = database_bytes(WAL_HEADER, 40_000, 7);
+        for (space, name) in [("space", "main"), ("other", "main"), ("space", "copy")] {
+            repo.save(
+                "sql",
+                space,
+                name,
+                checkpoint.clone(),
+                ArtifactExpectation::Any,
+            )
+            .await
+            .unwrap();
+        }
+        repo.save_delta(
+            "sql",
+            "space",
+            "main",
+            wal.clone(),
+            ArtifactExpectation::Any,
+        )
+        .await
+        .unwrap();
+        let good = stored_row(&conn, "space", "main").await.unwrap();
+        let other_space = stored_row(&conn, "other", "main").await.unwrap().payload;
+        let other_name = stored_row(&conn, "space", "copy").await.unwrap().payload;
+
+        let tampered = |edit: &dyn Fn(&mut database_artifact::Model)| {
+            let mut row = good.clone();
+            edit(&mut row);
+            row
+        };
+        let flip = |bytes: &mut Vec<u8>, at: usize| bytes[at] ^= 1;
+        type Expect = fn(&DatabaseArtifactError) -> bool;
+        let cases: Vec<(&str, database_artifact::Model, Expect)> = vec![
+            (
+                "checkpoint byte flipped in its second segment",
+                tampered(&|row| flip(&mut row.payload, 64 + 65_536 + 16 + 5)),
+                |e| {
+                    matches!(
+                        e,
+                        DatabaseArtifactError::AtRestIntegrity { part: "checkpoint" }
+                    )
+                },
+            ),
+            (
+                "checkpoint header flipped",
+                tampered(&|row| flip(&mut row.payload, 30)),
+                |e| {
+                    matches!(
+                        e,
+                        DatabaseArtifactError::AtRestIntegrity { part: "checkpoint" }
+                    )
+                },
+            ),
+            (
+                "wal byte flipped",
+                tampered(&|row| flip(row.delta_payload.as_mut().unwrap(), 1_000)),
+                |e| matches!(e, DatabaseArtifactError::AtRestIntegrity { part: "wal" }),
+            ),
+            (
+                "checkpoint of the same database in another space",
+                tampered(&|row| row.payload = other_space.clone()),
+                |e| {
+                    matches!(
+                        e,
+                        DatabaseArtifactError::AtRestIntegrity { part: "checkpoint" }
+                    )
+                },
+            ),
+            (
+                "checkpoint of the same database under another name",
+                tampered(&|row| row.payload = other_name.clone()),
+                |e| {
+                    matches!(
+                        e,
+                        DatabaseArtifactError::AtRestIntegrity { part: "checkpoint" }
+                    )
+                },
+            ),
+            (
+                "a later format generation",
+                tampered(&|row| row.payload_encoding = Some(2)),
+                |e| {
+                    matches!(
+                        e,
+                        DatabaseArtifactError::AtRestUnsupported {
+                            part: "checkpoint",
+                            version: 2
+                        }
+                    )
+                },
+            ),
+            (
+                "an invalid encoding",
+                tampered(&|row| row.delta_encoding = Some(0)),
+                |e| matches!(e, DatabaseArtifactError::AtRestIntegrity { part: "wal" }),
+            ),
+            (
+                // Claiming legacy never turns ciphertext into data: the
+                // manifest binds each part's encoding.
+                "sealed bytes marked legacy",
+                tampered(&|row| row.payload_encoding = None),
+                |e| {
+                    matches!(
+                        e,
+                        DatabaseArtifactError::AtRestIntegrity { part: "manifest" }
+                    )
+                },
+            ),
+        ];
+        for (what, row, expected) in cases {
+            put_parts(&conn, "space", "main", &row).await;
+            let error = read_error(&repo, "space", "main").await;
+            assert!(expected(&error), "{what}: {error:?}");
+        }
+        put_parts(&conn, "space", "main", &good).await;
+        assert_eq!(
+            hydrate(&repo, "space", "main").await,
+            (checkpoint, Some(wal.clone()))
+        );
+
+        // The same WAL saved again at the next revision: the older revision's
+        // ciphertext does not open in its place.
+        repo.save_delta("sql", "space", "main", wal, ArtifactExpectation::Any)
+            .await
+            .unwrap();
+        let mut replayed = stored_row(&conn, "space", "main").await.unwrap();
+        assert_eq!(replayed.revision, good.revision + 1);
+        replayed.delta_payload = good.delta_payload.clone();
+        put_parts(&conn, "space", "main", &replayed).await;
+        let error = read_error(&repo, "space", "main").await;
+        assert!(
+            matches!(
+                error,
+                DatabaseArtifactError::AtRestIntegrity { part: "wal" }
+            ),
+            "{error:?}"
+        );
+    }
+
+    /// Sets `edit`'s columns on `space/name` directly, the way someone with
+    /// write access to the database could.
+    async fn rewrite_row(
+        conn: &DatabaseConnection,
+        space: &str,
+        name: &str,
+        edit: impl FnOnce(
+            sea_orm::UpdateMany<database_artifact::Entity>,
+        ) -> sea_orm::UpdateMany<database_artifact::Entity>,
+    ) {
+        use database_artifact::Column;
+        let update = edit(database_artifact::Entity::update_many())
+            .filter(Column::Service.eq("sql"))
+            .filter(Column::Space.eq(space))
+            .filter(Column::Name.eq(name))
+            .exec(conn)
+            .await
+            .unwrap();
+        assert_eq!(update.rows_affected, 1);
+    }
+
+    /// The WAL delta of a sealed row is dropped in the database: delta
+    /// columns cleared, the unkeyed logical hash and size reset to the
+    /// checkpoint's, revision kept. A cold read must fail as integrity, never
+    /// hand back the checkpoint alone (which would silently lose the rows the
+    /// delta committed).
+    #[tokio::test]
+    async fn a_dropped_wal_delta_fails_integrity_instead_of_a_partial_read() {
+        for mode in [AtRestMode::Encrypt, AtRestMode::Strict] {
+            let conn = sqlite_conn().await;
+            let (repo, _source) = at_rest_repo(&conn, mode);
+            let checkpoint = database_bytes(SQLITE_HEADER, 70_000, 21);
+            let wal = database_bytes(WAL_HEADER, 9_000, 22);
+            repo.save(
+                "sql",
+                "space",
+                "main",
+                checkpoint.clone(),
+                ArtifactExpectation::Absent,
+            )
+            .await
+            .unwrap();
+            repo.save_delta("sql", "space", "main", wal, ArtifactExpectation::Any)
+                .await
+                .unwrap();
+            let row = stored_row(&conn, "space", "main").await.unwrap();
+            assert_eq!(row.revision, 2);
+            rewrite_row(&conn, "space", "main", |update| {
+                use database_artifact::Column;
+                update
+                    .col_expr(Column::DeltaPayload, Expr::value(Option::<Vec<u8>>::None))
+                    .col_expr(Column::DeltaEncoding, Expr::value(Option::<i16>::None))
+                    .col_expr(
+                        Column::DeltaContentHash,
+                        Expr::value(Option::<String>::None),
+                    )
+                    .col_expr(Column::DeltaSizeBytes, Expr::value(0_i64))
+                    .col_expr(Column::ContentHash, Expr::value(cid(&checkpoint)))
+                    .col_expr(Column::SizeBytes, Expr::value(checkpoint.len() as i64))
+                    .col_expr(Column::StorageMode, Expr::value("database-blob"))
+            })
+            .await;
+            // A cold read: a repository that never saw the row.
+            let (cold, _source) = at_rest_repo(&conn, mode);
+            let error = read_error(&cold, "space", "main").await;
+            assert!(
+                matches!(
+                    error,
+                    DatabaseArtifactError::AtRestIntegrity { part: "manifest" }
+                ),
+                "{mode:?}: {error:?}"
+            );
+            // Clearing the manifest tag as well makes it a row with a sealed
+            // part and no tag, which only a tampered row is.
+            rewrite_row(&conn, "space", "main", |update| {
+                update.col_expr(
+                    database_artifact::Column::Manifest,
+                    Expr::value(Option::<Vec<u8>>::None),
+                )
+            })
+            .await;
+            let error = read_error(&cold, "space", "main").await;
+            assert!(
+                matches!(
+                    error,
+                    DatabaseArtifactError::AtRestIntegrity { part: "manifest" }
+                ),
+                "{mode:?}, no tag: {error:?}"
+            );
+            // The offline whole-row read refuses it too.
+            let row = stored_row(&conn, "space", "main").await.unwrap();
+            assert!(matches!(
+                open_row(row, Some(keys().as_ref())).await,
+                Err(DatabaseArtifactError::AtRestIntegrity { part: "manifest" })
+            ));
+        }
+    }
+
+    /// The authenticated metadata says whether the row has a WAL delta; the
+    /// stored column must agree. Clearing only the WAL bytes, or storing WAL
+    /// bytes on a row whose metadata has none, leaves a valid manifest: a
+    /// streamed read follows the metadata, and the whole-row read refuses.
+    #[tokio::test]
+    async fn a_wal_column_that_disagrees_with_the_authenticated_metadata_fails_integrity() {
+        let conn = sqlite_conn().await;
+        let (repo, _source) = at_rest_repo(&conn, AtRestMode::Encrypt);
+        let checkpoint = database_bytes(SQLITE_HEADER, 70_000, 41);
+        repo.save(
+            "sql",
+            "space",
+            "main",
+            checkpoint,
+            ArtifactExpectation::Absent,
+        )
+        .await
+        .unwrap();
+        repo.save_delta(
+            "sql",
+            "space",
+            "main",
+            database_bytes(WAL_HEADER, 9_000, 42),
+            ArtifactExpectation::Any,
+        )
+        .await
+        .unwrap();
+        let lone = database_bytes(SQLITE_HEADER, 70_000, 43);
+        repo.save(
+            "sql",
+            "lone",
+            "main",
+            lone.clone(),
+            ArtifactExpectation::Absent,
+        )
+        .await
+        .unwrap();
+        let stray_wal = stored_row(&conn, "space", "main")
+            .await
+            .unwrap()
+            .delta_payload;
+        for (space, wal) in [("space", None), ("lone", stray_wal)] {
+            rewrite_row(&conn, space, "main", |update| {
+                update.col_expr(
+                    database_artifact::Column::DeltaPayload,
+                    Expr::value(wal.clone()),
+                )
+            })
+            .await;
+            let (cold, _source) = at_rest_repo(&conn, AtRestMode::Encrypt);
+            if space == "space" {
+                let error = read_error(&cold, space, "main").await;
+                assert!(
+                    matches!(
+                        error,
+                        DatabaseArtifactError::AtRestIntegrity { part: "wal" }
+                    ),
+                    "{space}, streamed: {error:?}"
+                );
+            } else {
+                // A streamed read follows the metadata: it serves the
+                // authenticated checkpoint and never reads the stray bytes.
+                assert_eq!(hydrate(&cold, space, "main").await, (lone.clone(), None));
+            }
+            let row = stored_row(&conn, space, "main").await.unwrap();
+            let opened = open_row(row, Some(keys().as_ref())).await;
+            assert!(
+                matches!(
+                    opened,
+                    Err(DatabaseArtifactError::AtRestIntegrity { part: "wal" })
+                ),
+                "{space}, whole row: {:?}",
+                opened.map(|(checkpoint, wal)| (checkpoint.len(), wal.map(|wal| wal.len())))
+            );
+        }
+    }
+
+    /// Parts and revisions from another point of the row's history do not
+    /// read in place of the current ones.
+    #[tokio::test]
+    async fn a_part_or_revision_from_another_revision_fails_integrity() {
+        let conn = sqlite_conn().await;
+        let (repo, _source) = at_rest_repo(&conn, AtRestMode::Encrypt);
+        let first = database_bytes(SQLITE_HEADER, 70_000, 31);
+        let second = database_bytes(SQLITE_HEADER, 80_000, 32);
+        repo.save(
+            "sql",
+            "space",
+            "main",
+            first.clone(),
+            ArtifactExpectation::Absent,
+        )
+        .await
+        .unwrap();
+        let old = stored_row(&conn, "space", "main").await.unwrap();
+        repo.save_delta(
+            "sql",
+            "space",
+            "main",
+            database_bytes(WAL_HEADER, 4_000, 33),
+            ArtifactExpectation::Any,
+        )
+        .await
+        .unwrap();
+        repo.save(
+            "sql",
+            "space",
+            "main",
+            second.clone(),
+            ArtifactExpectation::Any,
+        )
+        .await
+        .unwrap();
+        let current = stored_row(&conn, "space", "main").await.unwrap();
+        assert_eq!((old.revision, current.revision), (1, 3));
+
+        // Revision 1's checkpoint and its metadata, at revision 3.
+        rewrite_row(&conn, "space", "main", |update| {
+            use database_artifact::Column;
+            update
+                .col_expr(Column::Payload, Expr::value(old.payload.clone()))
+                .col_expr(Column::ContentHash, Expr::value(old.content_hash.clone()))
+                .col_expr(
+                    Column::CheckpointContentHash,
+                    Expr::value(old.checkpoint_content_hash.clone()),
+                )
+                .col_expr(Column::SizeBytes, Expr::value(old.size_bytes))
+                .col_expr(
+                    Column::CheckpointSizeBytes,
+                    Expr::value(old.checkpoint_size_bytes),
+                )
+        })
+        .await;
+        let error = read_error(&repo, "space", "main").await;
+        assert!(
+            matches!(
+                error,
+                DatabaseArtifactError::AtRestIntegrity { part: "manifest" }
+            ),
+            "older checkpoint: {error:?}"
+        );
+
+        // The current parts under another revision number.
+        put_parts(&conn, "space", "main", &current).await;
+        rewrite_row(&conn, "space", "main", |update| {
+            use database_artifact::Column;
+            update
+                .col_expr(
+                    Column::ContentHash,
+                    Expr::value(current.content_hash.clone()),
+                )
+                .col_expr(
+                    Column::CheckpointContentHash,
+                    Expr::value(current.checkpoint_content_hash.clone()),
+                )
+                .col_expr(Column::SizeBytes, Expr::value(current.size_bytes))
+                .col_expr(
+                    Column::CheckpointSizeBytes,
+                    Expr::value(current.checkpoint_size_bytes),
+                )
+                .col_expr(Column::Revision, Expr::value(7_i64))
+        })
+        .await;
+        let error = read_error(&repo, "space", "main").await;
+        assert!(
+            matches!(
+                error,
+                DatabaseArtifactError::AtRestIntegrity { part: "manifest" }
+            ),
+            "another revision: {error:?}"
+        );
+        rewrite_row(&conn, "space", "main", |update| {
+            update.col_expr(database_artifact::Column::Revision, Expr::value(3_i64))
+        })
+        .await;
+        assert_eq!(hydrate(&repo, "space", "main").await, (second, None));
+    }
+
+    /// Rows written in mode `off`, and legacy rows from before encryption,
+    /// carry nothing sealed and still read: legacy parts in `off` and
+    /// `encrypt`, a legacy checkpoint under a sealed delta, and a sealed
+    /// checkpoint under a delta written in `off`.
+    #[tokio::test]
+    async fn legacy_and_off_rows_still_read() {
+        let conn = sqlite_conn().await;
+        let (repo, source) = at_rest_repo(&conn, AtRestMode::Off);
+        let checkpoint = database_bytes(SQLITE_HEADER, 70_000, 41);
+        let wal = database_bytes(WAL_HEADER, 6_000, 42);
+        repo.save(
+            "sql",
+            "space",
+            "legacy",
+            checkpoint.clone(),
+            ArtifactExpectation::Absent,
+        )
+        .await
+        .unwrap();
+        repo.save_delta(
+            "sql",
+            "space",
+            "legacy",
+            wal.clone(),
+            ArtifactExpectation::Any,
+        )
+        .await
+        .unwrap();
+        let both = (checkpoint.clone(), Some(wal.clone()));
+        for (mode, encrypting) in [(AtRestMode::Off, false), (AtRestMode::Encrypt, true)] {
+            source.set(mode, encrypting);
+            assert_eq!(hydrate(&repo, "space", "legacy").await, both, "{mode:?}");
+        }
+
+        // A legacy checkpoint, then a delta sealed in `encrypt`.
+        source.set(AtRestMode::Off, false);
+        repo.save(
+            "sql",
+            "space",
+            "mixed",
+            checkpoint.clone(),
+            ArtifactExpectation::Absent,
+        )
+        .await
+        .unwrap();
+        source.set(AtRestMode::Encrypt, true);
+        repo.save_delta(
+            "sql",
+            "space",
+            "mixed",
+            wal.clone(),
+            ArtifactExpectation::Any,
+        )
+        .await
+        .unwrap();
+        assert_eq!(hydrate(&repo, "space", "mixed").await, both);
+        source.set(AtRestMode::Off, false);
+        assert_eq!(hydrate(&repo, "space", "mixed").await, both);
+
+        // A sealed checkpoint, then a delta written in `off`.
+        source.set(AtRestMode::Encrypt, true);
+        repo.save(
+            "sql",
+            "space",
+            "back",
+            checkpoint.clone(),
+            ArtifactExpectation::Absent,
+        )
+        .await
+        .unwrap();
+        source.set(AtRestMode::Off, false);
+        repo.save_delta(
+            "sql",
+            "space",
+            "back",
+            wal.clone(),
+            ArtifactExpectation::Any,
+        )
+        .await
+        .unwrap();
+        let row = stored_row(&conn, "space", "back").await.unwrap();
+        assert_eq!((row.payload_encoding, row.delta_encoding), (Some(1), None));
+        for (mode, encrypting) in [(AtRestMode::Off, false), (AtRestMode::Encrypt, true)] {
+            source.set(mode, encrypting);
+            assert_eq!(hydrate(&repo, "space", "back").await, both, "{mode:?}");
+        }
+    }
+
+    /// A sealed part stores exactly `ciphertext_len(size)` bytes: bytes
+    /// appended to it, or a part cut short, are integrity failures.
+    #[tokio::test]
+    async fn a_sealed_part_of_the_wrong_stored_length_fails_integrity() {
+        let conn = sqlite_conn().await;
+        let (repo, _source) = at_rest_repo(&conn, AtRestMode::Encrypt);
+        let checkpoint = database_bytes(SQLITE_HEADER, 70_000, 51);
+        let wal = database_bytes(WAL_HEADER, 5_000, 52);
+        repo.save(
+            "sql",
+            "space",
+            "main",
+            checkpoint.clone(),
+            ArtifactExpectation::Absent,
+        )
+        .await
+        .unwrap();
+        repo.save_delta(
+            "sql",
+            "space",
+            "main",
+            wal.clone(),
+            ArtifactExpectation::Any,
+        )
+        .await
+        .unwrap();
+        let good = stored_row(&conn, "space", "main").await.unwrap();
+        type Edit = fn(&mut database_artifact::Model);
+        let edits: [(&str, &str, Edit); 3] = [
+            ("bytes appended to the checkpoint", "checkpoint", |row| {
+                row.payload.extend_from_slice(&[0x5a; 37])
+            }),
+            ("bytes appended to the wal", "wal", |row| {
+                row.delta_payload.as_mut().unwrap().push(0)
+            }),
+            ("checkpoint cut short", "checkpoint", |row| {
+                row.payload.pop();
+            }),
+        ];
+        for (what, part, edit) in edits {
+            let mut row = good.clone();
+            edit(&mut row);
+            put_parts(&conn, "space", "main", &row).await;
+            let error = read_error(&repo, "space", "main").await;
+            assert!(
+                matches!(&error, DatabaseArtifactError::AtRestIntegrity { part: p } if *p == part),
+                "{what}: {error:?}"
+            );
+            let error = open_row(row, Some(keys().as_ref())).await.unwrap_err();
+            assert!(
+                matches!(&error, DatabaseArtifactError::AtRestIntegrity { part: p } if *p == part),
+                "{what}, whole row: {error:?}"
+            );
+        }
+        put_parts(&conn, "space", "main", &good).await;
+        assert_eq!(
+            hydrate(&repo, "space", "main").await,
+            (checkpoint, Some(wal))
+        );
     }
 }

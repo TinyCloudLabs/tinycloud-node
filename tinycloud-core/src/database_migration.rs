@@ -11,14 +11,16 @@ use sea_orm::{
     sea_query::{Expr, Query},
     ActiveModelTrait,
     ActiveValue::Set,
-    ColumnTrait, ConnectionTrait, DatabaseConnection, DbErr, EntityTrait, QueryFilter, QuerySelect,
-    TransactionTrait,
+    ColumnTrait, ConnectionTrait, DatabaseConnection, DbErr, EntityTrait, IdenStatic, Iterable,
+    QueryFilter, QuerySelect, TransactionTrait,
 };
 use sea_orm_migration::SchemaManager;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
+    at_rest::DataKeyProvider,
+    database_artifacts::{open_row, DatabaseArtifactError},
     database_identity::{legacy_duckdb_name, legacy_sql_name, logical_name},
     models::{
         abilities, database_alias, database_artifact, database_identity_fence,
@@ -50,6 +52,8 @@ pub enum MigrationError {
     Io(#[from] std::io::Error),
     #[error("checkpoint failed: {0}")]
     Checkpoint(String),
+    #[error("artifact is sealed at rest and could not be opened: {0}")]
+    SealedArtifact(#[source] DatabaseArtifactError),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -279,26 +283,59 @@ async fn fingerprint<C: ConnectionTrait>(
 
 /// Reads artifact bytes only for an explicitly designated local snapshot.
 /// Production-facing inventory, apply, report, and verify never call this.
+/// A part sealed at rest is opened with `keys`; without them it is refused,
+/// never fingerprinted as ciphertext. `encoded` says whether the snapshot
+/// has the encoding columns; one taken before them holds only plaintext.
 async fn offline_fingerprint<C: ConnectionTrait>(
     conn: &C,
     datadir: &Path,
     service: &str,
     space: &str,
     name: &str,
+    encoded: bool,
+    keys: Option<&dyn DataKeyProvider>,
 ) -> Result<Option<ArtifactFingerprint>, MigrationError> {
-    let row = database_artifact::Entity::find_by_id((
+    use database_artifact::Column;
+    let mut select = database_artifact::Entity::find_by_id((
         service.to_owned(),
         space.to_owned(),
         name.to_owned(),
     ))
-    .one(conn)
-    .await?;
+    .select_only()
+    .columns(Column::iter().filter(|column| {
+        !matches!(
+            column,
+            Column::PayloadEncoding | Column::DeltaEncoding | Column::Manifest
+        )
+    }));
+    for column in [Column::PayloadEncoding, Column::DeltaEncoding] {
+        select = if encoded {
+            select.column(column)
+        } else {
+            select.expr_as(Expr::value(Option::<i16>::None), column.as_str())
+        };
+    }
+    select = if encoded {
+        select.column(Column::Manifest)
+    } else {
+        select.expr_as(
+            Expr::value(Option::<Vec<u8>>::None),
+            Column::Manifest.as_str(),
+        )
+    };
+    let row = select
+        .into_model::<database_artifact::Model>()
+        .one(conn)
+        .await?;
     let temp = tempfile::tempdir()?;
     let suffix = if service == "sql" { ".db" } else { ".duckdb" };
     let path = temp.path().join(format!("artifact{suffix}"));
     if let Some(row) = row {
-        std::fs::write(&path, row.payload)?;
-        if let Some(delta) = row.delta_payload {
+        let (payload, delta) = open_row(row, keys)
+            .await
+            .map_err(MigrationError::SealedArtifact)?;
+        std::fs::write(&path, payload)?;
+        if let Some(delta) = delta {
             let wal = if service == "sql" {
                 format!("{}-wal", path.display())
             } else {
@@ -341,11 +378,17 @@ async fn offline_fingerprint<C: ConnectionTrait>(
 /// local snapshot. The caller must enforce that boundary before invoking it.
 /// DuckDB snapshots undergo the same locked native policy and stored-code audit
 /// as node connections, while retaining the offline tool's native memory default.
+/// `keys` opens artifacts sealed at rest; with `None` a sealed artifact is an
+/// error.
 pub async fn offline_inventory(
     conn: &DatabaseConnection,
     datadir: &Path,
+    keys: Option<&dyn DataKeyProvider>,
 ) -> Result<Vec<InventoryItem>, MigrationError> {
     let mut items = inventory(conn, datadir).await?;
+    let encoded = SchemaManager::new(conn)
+        .has_column("database_artifact", "payload_encoding")
+        .await?;
     for item in &mut items {
         item.offline_fingerprint = offline_fingerprint(
             conn,
@@ -353,6 +396,8 @@ pub async fn offline_inventory(
             &item.service,
             &item.space,
             &item.physical_name,
+            encoded,
+            keys,
         )
         .await?;
     }
@@ -1345,6 +1390,83 @@ mod tests {
 
     use sea_orm::QueryTrait;
 
+    /// TC-887: the offline tool fingerprints the database a sealed row holds
+    /// when it has keys, and refuses the row without them instead of reading
+    /// ciphertext as a database.
+    #[tokio::test]
+    async fn offline_fingerprint_opens_sealed_rows_only_with_keys() {
+        use crate::at_rest::{AtRestMode, DataKeyProvider, FixedKeyProvider, TestAtRestSource};
+        use crate::database_artifacts::{
+            ArtifactExpectation, DatabaseArtifactRepository, SeaOrmDatabaseArtifactRepository,
+        };
+        use crate::migrations::Migrator;
+        use sea_orm_migration::MigratorTrait;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("source.db");
+        rusqlite::Connection::open(&file)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE items (id INTEGER PRIMARY KEY, body TEXT);
+                 INSERT INTO items (body) VALUES ('a'), ('b');",
+            )
+            .unwrap();
+        let payload = std::fs::read(&file).unwrap();
+        let expected = fingerprint_sqlite(&file).unwrap();
+
+        let conn = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&conn, None).await.unwrap();
+        let keys: Arc<dyn DataKeyProvider> = Arc::new(FixedKeyProvider::new([3; 32]));
+        SeaOrmDatabaseArtifactRepository::new(conn.clone())
+            .with_at_rest(TestAtRestSource::new(
+                AtRestMode::Encrypt,
+                true,
+                Some(keys.clone()),
+            ))
+            .save(
+                "sql",
+                "space",
+                "sealed",
+                payload.clone(),
+                ArtifactExpectation::Any,
+            )
+            .await
+            .unwrap();
+        SeaOrmDatabaseArtifactRepository::new(conn.clone())
+            .save("sql", "space", "legacy", payload, ArtifactExpectation::Any)
+            .await
+            .unwrap();
+
+        let datadir = dir.path().join("data");
+        assert_eq!(
+            offline_fingerprint(
+                &conn,
+                &datadir,
+                "sql",
+                "space",
+                "sealed",
+                true,
+                Some(keys.as_ref())
+            )
+            .await
+            .unwrap(),
+            Some(expected.clone())
+        );
+        assert!(matches!(
+            offline_fingerprint(&conn, &datadir, "sql", "space", "sealed", true, None).await,
+            Err(MigrationError::SealedArtifact(
+                DatabaseArtifactError::AtRestUnavailable
+            ))
+        ));
+        assert_eq!(
+            offline_fingerprint(&conn, &datadir, "sql", "space", "legacy", true, None)
+                .await
+                .unwrap(),
+            Some(expected)
+        );
+    }
+
     #[test]
     fn production_inventory_queries_never_select_artifact_payloads() {
         for backend in [
@@ -1398,6 +1520,9 @@ mod tests {
             delta_payload: Set(None),
             delta_content_hash: Set(None),
             delta_size_bytes: Set(0),
+            payload_encoding: Set(None),
+            delta_encoding: Set(None),
+            manifest: Set(None),
         };
         let legacy = |space: &str, name: &str| database_legacy_artifact::ActiveModel {
             service: Set("sql".into()),
@@ -1617,6 +1742,9 @@ mod tests {
                     delta_payload: Set(None),
                     delta_content_hash: Set(None),
                     delta_size_bytes: Set(0),
+                    payload_encoding: Set(None),
+                    delta_encoding: Set(None),
+                    manifest: Set(None),
                 }
             }))
             .exec(conn)
@@ -1877,6 +2005,9 @@ mod tests {
             delta_payload: Set(None),
             delta_content_hash: Set(None),
             delta_size_bytes: Set(0),
+            payload_encoding: Set(None),
+            delta_encoding: Set(None),
+            manifest: Set(None),
         }
         .insert(&conn)
         .await
@@ -2009,6 +2140,9 @@ mod tests {
             delta_payload: Set(None),
             delta_content_hash: Set(None),
             delta_size_bytes: Set(0),
+            payload_encoding: Set(None),
+            delta_encoding: Set(None),
+            manifest: Set(None),
         }
     }
 

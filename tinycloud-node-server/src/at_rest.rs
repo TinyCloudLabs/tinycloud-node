@@ -6,9 +6,10 @@
 //! [`setup`] after migrations installs the keyring.
 //!
 //! Storage declares its seal paths ([`AtRestRuntime::declare_seal_path`]):
-//! block storage when it is attached ([`crate::storage::attach_at_rest`]).
-//! Until every seal path is declared, `setup` refuses every mode but `off`
-//! and `encrypting()` is always false.
+//! block storage when it is attached ([`crate::storage::attach_at_rest`]),
+//! and SQL and DuckDB artifacts in `node_artifact_repository`. Until every
+//! seal path is declared, `setup` refuses every mode but `off` and
+//! `encrypting()` is always false.
 //!
 //! With the default config (`mode = "off"`, `root_source = "escrow"`, no
 //! recipients, no `escrow_none`) nothing is set up: no key reads, no rows, no
@@ -63,7 +64,7 @@ pub const PRODUCTION_OS_IMAGE_HASHES: &[&str] =
 /// both KV block storage and SQL artifacts ([`SealPath`]). `--validate-config`
 /// decides the seal-path refusal from this; startup checks that the seal
 /// paths storage actually declared agree with it.
-pub const STORAGE_SEALS_EVERY_WRITE: bool = false;
+pub const STORAGE_SEALS_EVERY_WRITE: bool = true;
 
 /// The root variables as read from the process environment, held only in
 /// zeroizing buffers. Debug is redacted.
@@ -363,8 +364,8 @@ pub enum SealPath {
     SqlArtifacts,
 }
 
-/// At-rest state shared by the routes, `/info` and block storage. Rocket
-/// manages it as `Arc<AtRestRuntime>`.
+/// At-rest state shared by the routes, `/info`, block storage and the SQL
+/// artifact repository. Rocket manages it as `Arc<AtRestRuntime>`.
 ///
 /// The contract for the storage seal paths (TC-887): mode `off` behaves
 /// exactly as without at-rest. Otherwise writes are sealed only while
