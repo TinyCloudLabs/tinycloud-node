@@ -96,6 +96,31 @@ serves without it, so its migration never builds it on a non-empty table and
 never fails the boot over it. It logs a typed warning and keeps serving; an
 index built later is picked up by the planner with no restart.
 
+### Column encryption cutover (TC-2682)
+
+Before changing stored values, stop writers and take a **fresh, consistent
+backup**. Record the matching release and key configuration. Use the v2 column
+release and its corresponding maintenance tooling.
+
+Keep this order:
+
+1. Re-encrypt **every format-0 cell** to bound v2 under the correct purpose ring,
+   setting its `*_format=2` in the **same UPDATE** as the ciphertext. Verify that
+   no format-0 cells remain in the affected columns.
+2. Remove the legacy v1 storage key from the serving column and webhook rings.
+   The serving API must support constructing these rings without that key
+   before proceeding.
+3. **Only then** enable `[global.column_encryption] strict = true`
+   (`TINYCLOUD_COLUMN_ENCRYPTION__STRICT=true`). Verify startup, reads and writes
+   before resuming writers.
+
+Keep strict mode off until the first two steps are complete. Enabling it while
+format-0 plaintext remains can fail startup during legacy-record checks.
+
+Treat this as a **one-way cutover**. For rollback, stop the service and restore
+the fresh pre-cutover backup with its matching prior release and key
+configuration. Do not use a binary-only rollback on the converted database.
+
 ### Gate: out-of-band steps before a node release (TC-2062)
 
 Before a node release whose `docs/releasing.md` lists an out-of-band step (an
@@ -662,6 +687,9 @@ forward paths; an image that cannot validate config fails before restart.
 The same general quota authority/reconciliation gate runs after the final
 env operation plus version/ingress health, before ancillary Policy probes.
 The downstream watcher cannot skip quota restoration.
+
+For column encryption cutovers, use the backup-based rollback in
+[Column encryption cutover](#column-encryption-cutover-tc-2682).
 
 ### A compose-only change ships as a release
 
