@@ -228,6 +228,77 @@ pub async fn get_info() -> Result<InfoResponse> {
     .context("parsing Info response")
 }
 
+/// What the guest agent's `/Info` reports about the running CVM, for the
+/// at-rest boot checks.
+pub struct MeasuredInfo {
+    /// The `app-compose.json` this CVM was launched with
+    /// (`tcb_info.app_compose`). The caller checks it against `compose_hash`.
+    pub app_compose: Result<String>,
+    /// The OS image hash, from `os_image_hash` at the top level, in
+    /// `tcb_info` or in `vm_config` (each a JSON string or object). An error
+    /// when none has it or two disagree.
+    pub os_image_hash: Result<String>,
+}
+
+pub async fn get_measured_info() -> Result<MeasuredInfo> {
+    let info = get_json(&socket_path(), "/Info")
+        .await
+        .context("dstack Info request")?;
+    Ok(MeasuredInfo {
+        app_compose: app_compose_from_info(&info),
+        os_image_hash: os_image_hash_from_info(&info),
+    })
+}
+
+/// `info[field]` as a JSON object; the guest agent sends some objects as
+/// JSON-encoded strings.
+fn json_field(info: &serde_json::Value, field: &str) -> Result<Option<serde_json::Value>> {
+    Ok(match info.get(field) {
+        Some(serde_json::Value::String(s)) => Some(
+            serde_json::from_str(s).with_context(|| format!("dstack Info {field} is not JSON"))?,
+        ),
+        Some(other) => Some(other.clone()),
+        None => None,
+    })
+}
+
+fn app_compose_from_info(info: &serde_json::Value) -> Result<String> {
+    let tcb =
+        json_field(info, "tcb_info")?.ok_or_else(|| anyhow!("dstack Info has no tcb_info"))?;
+    tcb.get("app_compose")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow!("dstack Info tcb_info has no app_compose"))
+}
+
+fn os_image_hash_from_info(info: &serde_json::Value) -> Result<String> {
+    let mut found: Option<String> = None;
+    let places = [
+        Some(info.clone()),
+        json_field(info, "tcb_info")?,
+        json_field(info, "vm_config")?,
+    ];
+    for place in places.into_iter().flatten() {
+        let Some(value) = place.get("os_image_hash") else {
+            continue;
+        };
+        let hash = value
+            .as_str()
+            .filter(|h| !h.is_empty())
+            .ok_or_else(|| anyhow!("dstack Info os_image_hash is not a non-empty string"))?
+            .to_ascii_lowercase();
+        match &found {
+            Some(seen) if *seen != hash => {
+                return Err(anyhow!(
+                    "dstack Info reports two different os_image_hash values"
+                ))
+            }
+            _ => found = Some(hash),
+        }
+    }
+    found.ok_or_else(|| anyhow!("dstack Info has no os_image_hash"))
+}
+
 /// Check whether the dstack socket is reachable.
 pub fn is_available() -> bool {
     std::path::Path::new(&socket_path()).exists()
@@ -326,6 +397,43 @@ pub(crate) mod stub {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_compose_comes_from_tcb_info_as_a_string_or_an_object() {
+        let tcb =
+            serde_json::json!({"mrtd": "00", "app_compose": "{\"runner\":\"docker-compose\"}"});
+        let as_string = serde_json::json!({"app_id": "a", "tcb_info": tcb.to_string()});
+        let as_object = serde_json::json!({"app_id": "a", "tcb_info": tcb});
+        for info in [as_string, as_object] {
+            assert_eq!(
+                app_compose_from_info(&info).unwrap(),
+                "{\"runner\":\"docker-compose\"}"
+            );
+        }
+        assert!(app_compose_from_info(&serde_json::json!({"app_id": "a"})).is_err());
+        assert!(app_compose_from_info(&serde_json::json!({"tcb_info": "{}"})).is_err());
+    }
+
+    #[test]
+    fn the_os_image_hash_must_be_reported_once_or_consistently() {
+        let h = "AB".repeat(32);
+        let vm_config = serde_json::json!({ "os_image_hash": h, "cpu_count": 2 }).to_string();
+        for info in [
+            serde_json::json!({ "os_image_hash": h }),
+            serde_json::json!({ "tcb_info": { "os_image_hash": h } }),
+            serde_json::json!({ "vm_config": vm_config }),
+            serde_json::json!({ "os_image_hash": h, "vm_config": vm_config }),
+        ] {
+            assert_eq!(os_image_hash_from_info(&info).unwrap(), "ab".repeat(32));
+        }
+        for info in [
+            serde_json::json!({ "app_id": "a" }),
+            serde_json::json!({ "os_image_hash": "" }),
+            serde_json::json!({ "os_image_hash": h, "tcb_info": { "os_image_hash": "cd" } }),
+        ] {
+            assert!(os_image_hash_from_info(&info).is_err(), "{info}");
+        }
+    }
 
     #[tokio::test]
     async fn get_quote_sends_exactly_64_bytes_of_report_data() {

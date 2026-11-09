@@ -10468,6 +10468,7 @@ name = "tinycloud-node"
 version = "1.25.17"
 dependencies = [
  "aes-gcm",
+ "age",
  "anyhow",
  "async-trait",
  "aws-config",
@@ -10492,6 +10493,7 @@ dependencies = [
  "lazy_static",
  "libc",
  "libp2p-identity",
+ "lru 0.12.5",
  "multer",
  "native-tls",
  "opentelemetry",
@@ -10530,6 +10532,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tikv-jemallocator",
  "time",
+ "tinycloud-at-rest-escrow",
  "tinycloud-auth",
  "tinycloud-core",
  "tinycloud-sdk-wasm",
@@ -10546,6 +10549,7 @@ dependencies = [
  "uuid",
  "x25519-dalek",
  "x509-parser 0.16.0",
+ "zeroize",
 ]
 
 [[package]]

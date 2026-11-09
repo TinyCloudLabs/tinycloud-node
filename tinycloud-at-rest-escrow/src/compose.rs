@@ -360,20 +360,21 @@ impl AppCompose {
             .collect()
     }
 
-    /// The literal value of `key` in the services' `environment`, if set.
-    ///
-    /// Refused: a value that docker compose would interpolate (`$`), a key
-    /// passed through from the runtime environment (`- KEY` or `KEY:`
-    /// with no value), and different values in different services.
-    pub fn literal_env(&self, key: &str) -> Result<Option<String>> {
-        let mut found: Option<String> = None;
+    /// Every setting of `key` in the services' `environment`, one per service
+    /// that sets it (`KEY: value`, or `- KEY=value` in list form). A value
+    /// that is empty or a YAML null, and a list entry without `=`, pass the
+    /// variable through from the runtime environment: [`EnvSetting::FromRuntime`].
+    /// Errors (never quoting a value): a non-string setting, a key set twice
+    /// in one service, an environment that is not a mapping or list.
+    pub fn env_settings(&self, key: &str) -> Result<Vec<EnvSetting>> {
+        let mut settings = Vec::new();
         for (service, fields) in services(&self.top)? {
             let service = escape(service);
             let value = match get(fields, "environment") {
                 None => None,
                 Some(Node::Map(env)) => match get(env, key) {
                     None => None,
-                    Some(Node::Scalar(v)) => Some(v.clone()),
+                    Some(Node::Scalar(v)) => Some(Some(v.clone())),
                     Some(_) => {
                         return err(format!("service {service:?} sets {key} to a non-string"))
                     }
@@ -387,16 +388,12 @@ impl AppCompose {
                             ));
                         };
                         let (k, v) = match item.split_once('=') {
-                            Some((k, v)) => (k, Some(v)),
+                            Some((k, v)) => (k, Some(v.to_owned())),
                             None => (item.as_str(), None),
                         };
                         if k == key {
                             ensure!(value.is_none(), "service {service:?} sets {key} twice");
-                            value = Some(v.map(str::to_owned).ok_or_else(|| {
-                                EscrowError::Compose(format!(
-                                    "service {service:?} passes {key} through from the runtime environment; it must be a literal value"
-                                ))
-                            })?);
+                            value = Some(v);
                         }
                     }
                     value
@@ -410,10 +407,32 @@ impl AppCompose {
             let Some(value) = value else { continue };
             // Empty or a YAML 1.2 null (any spelling docker compose reads as
             // null) passes the variable through from the runtime.
-            ensure!(
-                !matches!(value.as_str(), "" | "~" | "null" | "Null" | "NULL"),
-                "service {service:?} passes {key} through from the runtime environment; it must be a literal value"
-            );
+            settings.push(match value {
+                Some(v) if !matches!(v.as_str(), "" | "~" | "null" | "Null" | "NULL") => {
+                    EnvSetting::Value { service, value: v }
+                }
+                _ => EnvSetting::FromRuntime { service },
+            });
+        }
+        Ok(settings)
+    }
+
+    /// The literal value of `key` in the services' `environment`, if set.
+    ///
+    /// Refused: a value that docker compose would interpolate (`$`), a key
+    /// passed through from the runtime environment (`- KEY` or `KEY:`
+    /// with no value), and different values in different services.
+    pub fn literal_env(&self, key: &str) -> Result<Option<String>> {
+        let mut found: Option<String> = None;
+        for setting in self.env_settings(key)? {
+            let (service, value) = match setting {
+                EnvSetting::FromRuntime { service } => {
+                    return err(format!(
+                        "service {service:?} passes {key} through from the runtime environment; it must be a literal value"
+                    ))
+                }
+                EnvSetting::Value { service, value } => (service, value),
+            };
             ensure!(
                 !value.contains('$'),
                 "service {service:?} sets {key} by interpolation; it must be a literal value"
@@ -424,6 +443,24 @@ impl AppCompose {
             }
         }
         Ok(found)
+    }
+}
+
+/// One service's setting of an environment variable ([`AppCompose::env_settings`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnvSetting {
+    /// `KEY: value` or `- KEY=value`, exactly as written (before docker
+    /// compose interpolation). `service` is escaped for display.
+    Value { service: String, value: String },
+    /// The variable is passed through from the runtime environment.
+    FromRuntime { service: String },
+}
+
+impl EnvSetting {
+    pub fn service(&self) -> &str {
+        match self {
+            Self::Value { service, .. } | Self::FromRuntime { service } => service,
+        }
     }
 }
 

@@ -60,6 +60,8 @@ pub struct Config {
     pub encryption_network: EncryptionNetworkConfig,
     #[serde(default)]
     pub sql: SqlConfig,
+    #[serde(default)]
+    pub at_rest: AtRestConfig,
 }
 
 /// Release gates for the encryption network routes. `named_keys_v1`
@@ -109,6 +111,62 @@ impl EncryptionNetworkConfig {
 pub struct SqlConfig {
     #[serde(default)]
     pub delegated_caveats_enforced: bool,
+}
+
+/// Encryption at rest (TC-887). Off by default; see `docs/at-rest-escrow.md`.
+#[derive(Serialize, Deserialize, Debug, Default, Clone, Hash, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AtRestConfig {
+    /// `off` writes plaintext; `encrypt` and `strict` are refused at boot
+    /// unless the at-rest gate passes.
+    #[serde(default)]
+    pub mode: AtRestMode,
+    /// Where the root that seals the at-rest root key comes from.
+    #[serde(default)]
+    pub root_source: AtRestRootSource,
+    #[serde(default)]
+    pub escrow: AtRestEscrowConfig,
+    /// Self-hosted Static-root nodes only: acknowledge that no escrow exists,
+    /// so losing the root loses encrypted data. Refused inside a TEE.
+    #[serde(default)]
+    pub escrow_none: bool,
+}
+
+pub use tinycloud_core::at_rest::AtRestMode;
+
+/// The root under which the node seals its at-rest root key (ARK).
+#[derive(Serialize, Deserialize, Debug, Default, Clone, Copy, Hash, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AtRestRootSource {
+    /// The node's own root key, with the escrow gate: `encrypt` and `strict`
+    /// need a verified escrow (or `escrow_none` on a self-hosted node).
+    #[default]
+    Escrow,
+    /// A 32-byte key from the environment (`TINYCLOUD_AT_REST_ROOT_KEY`,
+    /// standard base64). No escrow: whoever holds the key and the stored
+    /// key rows can open the ARK. See `docs/at-rest-escrow.md`.
+    Env,
+}
+
+#[derive(Serialize, Deserialize, Debug, Default, Clone, Hash, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AtRestEscrowConfig {
+    /// Exactly three holders. Setting them provisions the at-rest root key
+    /// and its escrow bundle at boot, even with `mode = "off"`.
+    #[serde(default)]
+    pub recipients: Vec<tinycloud_at_rest_escrow::HolderRecipient>,
+    /// The escrow fingerprint a ceremony verified (`tinycloud-at-rest record-efp`).
+    #[serde(default)]
+    pub verified_fp: Option<String>,
+    /// Accept X25519 software-key holders (tests and self-host only).
+    #[serde(default)]
+    pub allow_software: bool,
+    /// Before the escrow ceremony only: let a corrected holder list re-split
+    /// the escrow at boot. The node allows it only while no fingerprint is
+    /// pinned, the escrow was never verified, and no data key was ever made;
+    /// otherwise a holder change still refuses the boot.
+    #[serde(default)]
+    pub allow_resplit_before_verify: bool,
 }
 
 /// Production exact-email composition.  The capability remains unavailable
