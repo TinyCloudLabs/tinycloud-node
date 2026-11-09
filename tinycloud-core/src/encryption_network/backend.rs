@@ -395,6 +395,10 @@ pub trait KeyBackend: Send + Sync {
     fn open_seed(&self, sealed_seed: &[u8]) -> Result<KeySeed, KeyBackendError>;
 }
 
+fn valid_v1_ephemeral_prefix(public: &[u8]) -> bool {
+    !public.starts_with(WRAP_V2_MAGIC)
+}
+
 /// X25519 ECIES-style key wrap backed by AES-256-GCM. Used both for wrapping to
 /// the network public key (client side) and to the receiver public key (decrypt
 /// response).
@@ -409,8 +413,13 @@ pub fn wrap_to_public_key(
     recipient_array.copy_from_slice(recipient_public_key);
     let recipient = PublicKey::from(recipient_array);
 
-    let ephemeral = StaticSecret::random_from_rng(OsRng);
-    let ephemeral_pub = PublicKey::from(&ephemeral);
+    let (ephemeral, ephemeral_pub) = loop {
+        let ephemeral = StaticSecret::random_from_rng(OsRng);
+        let public = PublicKey::from(&ephemeral);
+        if valid_v1_ephemeral_prefix(public.as_bytes()) {
+            break (ephemeral, public);
+        }
+    };
     let shared = ephemeral.diffie_hellman(&recipient);
     if !shared.was_contributory() {
         return Err(KeyBackendError::NonContributory);
@@ -529,7 +538,7 @@ impl KeyBackend for LocalOneOfOneBackend {
         &self,
         sealed_private_key: &[u8],
     ) -> Result<StaticSecret, KeyBackendError> {
-        let opened = Zeroizing::new(self.seal.decrypt(sealed_private_key)?);
+        let opened = Zeroizing::new(self.seal.decrypt_strict(sealed_private_key)?);
         if opened.len() != 32 {
             return Err(KeyBackendError::InvalidSealedKey);
         }
@@ -639,6 +648,64 @@ mod tests {
             key_path: "docs/alpha",
             key_version: 1,
             metadata: Some(metadata),
+        }
+    }
+
+    #[test]
+    fn v1_ephemeral_prefix_excludes_v2_magic() {
+        let mut public = [0u8; 32];
+        public[..4].copy_from_slice(b"TCW2");
+        assert!(!valid_v1_ephemeral_prefix(&public));
+        public[3] = b'1';
+        assert!(valid_v1_ephemeral_prefix(&public));
+        let recipient = StaticSecret::from([9u8; 32]);
+        let wrapped =
+            wrap_to_public_key(PublicKey::from(&recipient).as_bytes(), &[42; 32]).unwrap();
+        assert!(valid_v1_ephemeral_prefix(&wrapped[..32]));
+        assert_eq!(unwrap_with_secret(&recipient, &wrapped).unwrap(), [42; 32]);
+    }
+
+    #[test]
+    fn network_secrets_require_sealed_storage_and_new_seals_are_versioned() {
+        let backend = LocalOneOfOneBackend::new(seal_key());
+        assert!(backend.open_network_secret(&[7u8; 32]).is_err());
+        let generated = backend.generate().unwrap();
+        assert_eq!(generated.sealed_private_key[0], 0x01);
+        assert!(backend
+            .open_network_secret(&generated.sealed_private_key)
+            .is_ok());
+        let (_, seed) = backend.generate_seed().unwrap();
+        assert_eq!(seed[0], 0x01);
+        assert!(backend.open_seed(&seed).is_ok());
+    }
+
+    #[test]
+    fn malformed_surrogates_are_rejected_at_header_parse_boundary() {
+        let metadata = BTreeMap::from([("key".into(), "value".into())]);
+        let secret = StaticSecret::from([9u8; 32]);
+        let context = wrap_context(&metadata);
+        let wrapped = wrap_to_public_key_with_context(
+            PublicKey::from(&secret).as_bytes(),
+            &[42; 32],
+            &context,
+            KeyWrapVersion::V2,
+        )
+        .unwrap();
+        let length = u32::from_be_bytes(wrapped[4..8].try_into().unwrap()) as usize;
+        let header = std::str::from_utf8(&wrapped[8..8 + length]).unwrap();
+        for surrogate in [r#""\ud800""#, r#""\udfff""#] {
+            for original in [r#""key""#, r#""value""#, r#""docs/alpha""#] {
+                let malformed = header.replace(original, surrogate);
+                assert!(serde_json::from_str::<WrapHeader>(&malformed).is_err());
+                let mut frame = WRAP_V2_MAGIC.to_vec();
+                frame.extend_from_slice(&(malformed.len() as u32).to_be_bytes());
+                frame.extend_from_slice(malformed.as_bytes());
+                frame.extend_from_slice(&wrapped[8 + length..]);
+                assert!(matches!(
+                    open_wrapped_key(&secret, &frame, &context),
+                    Err(KeyBackendError::InvalidWrappedKey)
+                ));
+            }
         }
     }
 

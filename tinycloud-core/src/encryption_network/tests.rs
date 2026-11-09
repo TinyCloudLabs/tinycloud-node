@@ -2407,15 +2407,46 @@ async fn postgres_key_writes_wait_for_the_network_row_lock() {
 }
 
 #[tokio::test]
+async fn plaintext_stored_network_secret_is_refused() {
+    use crate::models::encryption_network;
+    let db = fresh_db().await;
+    let svc = make_service(db.clone());
+    create_network(&svc).await;
+    let net = network_id();
+    let secret = X25519StaticSecret::from([7u8; 32]);
+    let mut row: encryption_network::ActiveModel =
+        encryption_network::Entity::find_by_id(net.to_string())
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap()
+            .into();
+    row.public_key = Set(PublicKey::from(&secret).as_bytes().to_vec());
+    row.sealed_private_key = Set(Some(secret.as_bytes().to_vec()));
+    row.update(&db).await.unwrap();
+    let ctx = make_client_request(PublicKey::from(&secret).as_bytes());
+    let (_, body) = build_body(&ctx, &net);
+    let invocation = build_invocation(&net, &body, &ctx, |_| {});
+    assert!(matches!(
+        svc.decrypt(&net, &invocation, &body).await,
+        Err(EncryptionServiceError::Backend(
+            super::backend::KeyBackendError::SealedKeyUnreadable
+        ))
+    ));
+}
+
+#[tokio::test]
 async fn wrap_versions_are_independent_on_native_root_and_named_decrypt() {
     use super::backend::{
         open_wrapped_key, wrap_to_public_key_with_context, KeyWrapContext, KeyWrapPurpose,
         KeyWrapVersion,
     };
-    for writer_v2 in [false, true] {
+    for (writer_v2, require_v2) in [(false, false), (true, false), (false, true), (true, true)] {
         for incoming in [KeyWrapVersion::V1, KeyWrapVersion::V2] {
             for path in ["", "docs/alpha", "apps/notes/alpha"] {
-                let svc = make_service(fresh_db().await).with_key_wrap_v2(writer_v2);
+                let svc = make_service(fresh_db().await)
+                    .with_key_wrap_v2(writer_v2)
+                    .with_key_wrap_require_v2(require_v2);
                 create_network(&svc).await;
                 let net = network_id();
                 let public = if path.is_empty() {
@@ -2474,11 +2505,17 @@ async fn wrap_versions_are_independent_on_native_root_and_named_decrypt() {
                 svc.validate_authorized_decrypt_request(&target, &invocation, &body_value)
                     .await
                     .unwrap();
-                let response = svc
+                let result = svc
                     .decrypt_authorized(&target, &invocation, &body_value)
-                    .await
-                    .unwrap()
-                    .response;
+                    .await;
+                if require_v2 && incoming == KeyWrapVersion::V1 {
+                    assert!(matches!(
+                        result,
+                        Err(EncryptionServiceError::KeyUnwrapFailed(_))
+                    ));
+                    continue;
+                }
+                let response = result.unwrap().response;
                 let output_version = if writer_v2 {
                     KeyWrapVersion::V2
                 } else {
@@ -2511,9 +2548,11 @@ async fn standalone_decrypt_reads_both_versions_and_uses_writer_flag() {
         open_wrapped_key, wrap_to_public_key_with_context, KeyWrapContext, KeyWrapPurpose,
         KeyWrapVersion,
     };
-    for writer_v2 in [false, true] {
+    for (writer_v2, require_v2) in [(false, false), (true, false), (false, true), (true, true)] {
         for incoming in [KeyWrapVersion::V1, KeyWrapVersion::V2] {
-            let svc = make_service(fresh_db().await).with_key_wrap_v2(writer_v2);
+            let svc = make_service(fresh_db().await)
+                .with_key_wrap_v2(writer_v2)
+                .with_key_wrap_require_v2(require_v2);
             create_network(&svc).await;
             let net = network_id();
             let public = svc.get_network(&net).await.unwrap().public_encryption_key;
@@ -2536,7 +2575,15 @@ async fn standalone_decrypt_reads_both_versions_and_uses_writer_flag() {
             let inv = build_invocation(&net, &body_value, &ctx, |inv| {
                 inv.facts.alg = incoming.alg().into()
             });
-            let response = svc.decrypt(&net, &inv, &body_value).await.unwrap().response;
+            let result = svc.decrypt(&net, &inv, &body_value).await;
+            if require_v2 && incoming == KeyWrapVersion::V1 {
+                assert!(matches!(
+                    result,
+                    Err(EncryptionServiceError::KeyUnwrapFailed(_))
+                ));
+                continue;
+            }
+            let response = result.unwrap().response;
             assert_eq!(
                 response.alg,
                 if writer_v2 {

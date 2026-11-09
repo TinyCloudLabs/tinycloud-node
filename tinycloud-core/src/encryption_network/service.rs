@@ -269,6 +269,7 @@ pub struct EncryptionService {
     pub(super) backend: Arc<dyn KeyBackend>,
     invocation_ttl_seconds: i64,
     key_wrap_version: KeyWrapVersion,
+    key_wrap_require_v2: bool,
     pub(super) sqlite_writer_lock: Option<Arc<tokio::sync::Mutex<()>>>,
     pub(super) key_cap_per_network: u64,
     pub(super) deletion_ledger: Option<Arc<DeletionLedger>>,
@@ -304,6 +305,7 @@ impl EncryptionService {
             backend,
             invocation_ttl_seconds: DEFAULT_INVOCATION_TTL_SECONDS,
             key_wrap_version: KeyWrapVersion::V1,
+            key_wrap_require_v2: false,
             sqlite_writer_lock: None,
             key_cap_per_network: DEFAULT_KEY_CAP_PER_NETWORK,
             deletion_ledger: None,
@@ -326,6 +328,7 @@ impl EncryptionService {
             backend,
             invocation_ttl_seconds: DEFAULT_INVOCATION_TTL_SECONDS,
             key_wrap_version: KeyWrapVersion::V1,
+            key_wrap_require_v2: false,
             sqlite_writer_lock: None,
             key_cap_per_network: DEFAULT_KEY_CAP_PER_NETWORK,
             deletion_ledger: None,
@@ -335,7 +338,7 @@ impl EncryptionService {
         }
     }
 
-    /// Select v2 for response wraps only. Both request formats remain readable.
+    /// Select v2 for response wraps only, independently of request policy.
     pub fn with_key_wrap_v2(mut self, enabled: bool) -> Self {
         self.key_wrap_version = if enabled {
             KeyWrapVersion::V2
@@ -343,6 +346,21 @@ impl EncryptionService {
             KeyWrapVersion::V1
         };
         self
+    }
+
+    /// Require v2 incoming network-key wraps without restricting receiver responses.
+    pub fn with_key_wrap_require_v2(mut self, enabled: bool) -> Self {
+        self.key_wrap_require_v2 = enabled;
+        self
+    }
+
+    fn check_key_wrap_policy(&self, wrapped: &[u8]) -> Result<(), EncryptionServiceError> {
+        if self.key_wrap_require_v2 && wrapped_key_version(wrapped) != KeyWrapVersion::V2 {
+            return Err(EncryptionServiceError::KeyUnwrapFailed(
+                KeyBackendError::InvalidWrappedKey,
+            ));
+        }
+        Ok(())
     }
 
     pub fn with_sqlite_writer_lock(mut self, lock: Option<Arc<tokio::sync::Mutex<()>>>) -> Self {
@@ -846,6 +864,7 @@ impl EncryptionService {
             decode_base64(&body.encrypted_symmetric_key).map_err(EncryptionServiceError::Base64)?;
         check_receiver_public_key(&receiver_key_bytes)?;
         check_wrapped_algorithm(&body.alg, &wrapped_key_bytes)?;
+        self.check_key_wrap_policy(&wrapped_key_bytes)?;
 
         let expected_receiver_hash =
             canonical_hash(&Value::String(body.receiver_public_key.clone()));
@@ -1076,6 +1095,7 @@ impl EncryptionService {
         let wrapped_key_bytes =
             decode_base64(&body.encrypted_symmetric_key).map_err(EncryptionServiceError::Base64)?;
         check_wrapped_algorithm(&body.alg, &wrapped_key_bytes)?;
+        self.check_key_wrap_policy(&wrapped_key_bytes)?;
 
         let expected_receiver_hash =
             canonical_hash(&Value::String(body.receiver_public_key.clone()));
