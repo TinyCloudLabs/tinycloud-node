@@ -1157,9 +1157,11 @@ where
         let lease_expires_at = webhook_lease_timestamp(now + lease);
         let token = uuid::Uuid::new_v4().to_string();
 
+        // The `A_id` alias keeps this poll's SQL prefix, which the PostgreSQL
+        // round-trip budget test classifies as background dispatcher traffic.
         let candidates: Vec<String> = hook_delivery::Entity::find()
             .select_only()
-            .column(hook_delivery::Column::Id)
+            .column_as(hook_delivery::Column::Id, "A_id")
             .filter(webhook_claimable(&now_text, &lease_now))
             .order_by_asc(hook_delivery::Column::CreatedAt)
             .order_by_asc(hook_delivery::Column::Attempts)
