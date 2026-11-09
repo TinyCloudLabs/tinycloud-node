@@ -360,8 +360,12 @@ Deselecting this repository doesn't stop those repositories from using the
 key. A production-only Phala key that is stored only in this environment
 closes that gap.
 
-`TC780_CUTOVER_READY` stays a repository variable: the build jobs, which have
-no environment, read it too. `GITHUB_TOKEN` is the automatic token.
+`TC780_CUTOVER_READY` is a repository variable kept for the TC-780 rollback
+runbook only: the frozen release line
+`Codex/roman/rollback-meeting-node-20260915` still gates its `docker.yml`
+jobs on it. The `docker.yml` on `main` no longer reads it; delete it once
+the rollback window closes (the runbook has its own `TC780_ROLLBACK_ARMED`
+check). `GITHUB_TOKEN` is the automatic token.
 
 The quota steps send `PROD_TINYCLOUD_ADMIN_SECRET` to billing's
 `/api/admin/storage-comp/:space_id` as well as to the node's admin API.
