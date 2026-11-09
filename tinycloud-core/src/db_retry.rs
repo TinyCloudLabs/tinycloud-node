@@ -458,6 +458,15 @@ where
                 );
                 return (result, first_applied);
             }
+            if overload.is_suppressing() {
+                observe_db_connection_event(DbConnectionEvent::OperationRetrySkippedOverload);
+                tracing::warn!(
+                    operation,
+                    error_class,
+                    "not retrying operation: retries are suppressed after a database overload signal"
+                );
+                return (result, first_applied);
+            }
             let second_state = Arc::new(WriteState::default());
             let second = tokio::time::timeout(
                 remaining,
@@ -1168,5 +1177,29 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(spawned.load(Ordering::SeqCst), 0, "nothing was spawned");
         assert_eq!(attempts.load(Ordering::SeqCst), 1, "and it is not retried");
+    }
+
+    /// An overload stamp that lands while the owner sleeps its backoff stops
+    /// the second attempt: the first error is returned and nothing runs
+    /// again.
+    #[tokio::test(start_paused = true)]
+    async fn a_stamp_during_the_backoff_prevents_the_second_attempt() {
+        let clock = ManualClock::default();
+        let signal = OverloadSignal::new(clock.clone(), OVERLOAD_SUPPRESS);
+        clock.set(1_000);
+        let attempts = AtomicUsize::new(0);
+        let owner = run_with(&signal, Replay::Never, &attempts);
+        let stamp = async {
+            // The backoff is at least 100 ms.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            signal.stamp("pool_timeout");
+        };
+
+        let ((result, applied), ()) = tokio::join!(owner, stamp);
+
+        assert!(matches!(result, Err(DbErr::Query(_))), "{result:?}");
+        assert!(!applied);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1, "attempt 2 never ran");
+        assert!(signal.is_suppressing());
     }
 }

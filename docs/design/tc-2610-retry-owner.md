@@ -224,6 +224,9 @@ after commit. The routes call sites (`routes/mod.rs` ≈758 and ≈4401) already
 - SQL hydration: the metadata read that starts a cold hydration (`load_meta`) is the attempt of its own
   `retry_owner(Replay::Never)`, inside the hydration task. Payload reads, the cache sink, the actor and the
   saves are outside it. `run_locked` and the cold-hydration entry refuse to run inside an attempt.
+  The retry applies per metadata read: a cold request can make several (the artifact restart loop and the
+  hydration attempts each read the metadata), each with its own single retry, each needing its own connection
+  loss and each subject to the overload signal.
 - Read-audit batches and the webhook dispatcher's two reads are owners (`IdempotentStatement` for the audit statement).
 - share_email (`bridge.rs`, `state.rs`) and encryption_network (`keys.rs`, `key_delete.rs`,
   `deletion_ledger.rs`) transactions are not owners: their errors are mapped to storage errors that do not carry
