@@ -65,11 +65,16 @@ impl<'a> RowBinding<'a> {
     }
 }
 
+struct ReadKeys {
+    v2: BTreeMap<u8, Aes256Gcm>,
+    legacy_v1: Option<Aes256Gcm>,
+}
+
 /// Selected write generation and shared read keys. Debug never exposes keys.
 #[derive(Clone)]
 pub struct ColumnEncryption {
     write_kid: u8,
-    keys: Arc<BTreeMap<u8, Aes256Gcm>>,
+    keys: Arc<ReadKeys>,
     strict: bool,
 }
 
@@ -105,6 +110,7 @@ impl ColumnEncryption {
     /// a separately supplied old key for v1 reads.
     pub fn for_purpose(root: [u8; 32], legacy_key: [u8; 32], purpose: EncryptionPurpose) -> Self {
         let root = Zeroizing::new(root);
+        let legacy_key = Zeroizing::new(legacy_key);
         let info: &[u8] = match purpose {
             EncryptionPurpose::Columns => b"tinycloud/columns",
             EncryptionPurpose::Webhooks => b"tinycloud/hooks/webhook-secrets",
@@ -113,7 +119,19 @@ impl ColumnEncryption {
         Hkdf::<Sha256>::new(Some(b"tinycloud/column-encryption/v2"), root.as_ref())
             .expand(info, derived.as_mut())
             .expect("32-byte HKDF output");
-        Self::with_keys(1, [(0, legacy_key), (1, *derived)]).expect("distinct key generations")
+        Self {
+            write_kid: 1,
+            keys: Arc::new(ReadKeys {
+                v2: BTreeMap::from([(
+                    1,
+                    Aes256Gcm::new_from_slice(derived.as_ref()).expect("valid 32-byte key"),
+                )]),
+                legacy_v1: Some(
+                    Aes256Gcm::new_from_slice(legacy_key.as_ref()).expect("valid 32-byte key"),
+                ),
+            }),
+            strict: false,
+        }
     }
 
     /// Require authenticated envelopes even in the recorded legacy namespace.
@@ -146,7 +164,10 @@ impl ColumnEncryption {
         }
         Ok(Self {
             write_kid,
-            keys: Arc::new(ciphers),
+            keys: Arc::new(ReadKeys {
+                v2: ciphers,
+                legacy_v1: None,
+            }),
             strict: false,
         })
     }
@@ -156,7 +177,7 @@ impl ColumnEncryption {
     }
 
     pub fn has_key(&self, kid: u8) -> bool {
-        self.keys.contains_key(&kid)
+        self.keys.v2.contains_key(&kid)
     }
 
     /// Select a different writer while retaining every read key and read policy.
@@ -185,13 +206,21 @@ impl ColumnEncryption {
     ) -> Vec<u8> {
         let header = [VERSION_KEYRING, self.write_kid];
         let aad = binding.aad(self.write_kid);
-        Self::seal(&self.keys[&self.write_kid], plaintext, nonce, &header, &aad)
+        Self::seal(
+            &self.keys.v2[&self.write_kid],
+            plaintext,
+            nonce,
+            &header,
+            &aad,
+        )
     }
 
     /// Explicit unchanged v1 encoding for existing client and seal protocols.
+    /// Requires a generation-zero protocol key, not a serving purpose ring.
     pub fn encrypt_legacy(&self, plaintext: &[u8]) -> Vec<u8> {
         let cipher = self
             .keys
+            .v2
             .get(&0)
             .expect("legacy wire encryption requires generation zero");
         let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
@@ -277,10 +306,15 @@ impl ColumnEncryption {
         if data.len() < header_len + 12 + 16 {
             return Err(EncryptionError::TooShort);
         }
-        let cipher = self
-            .keys
-            .get(&kid)
-            .ok_or(EncryptionError::MissingKey(kid))?;
+        let cipher = if header_len == 1 {
+            self.keys
+                .legacy_v1
+                .as_ref()
+                .or_else(|| self.keys.v2.get(&0))
+        } else {
+            self.keys.v2.get(&kid)
+        }
+        .ok_or(EncryptionError::MissingKey(kid))?;
         let nonce_bytes: [u8; 12] = data[header_len..header_len + 12]
             .try_into()
             .expect("validated nonce length");
@@ -422,6 +456,18 @@ mod tests {
                     .unwrap(),
                 b"old value"
             );
+        }
+    }
+
+    #[test]
+    fn purpose_keyrings_only_use_the_legacy_key_for_v1() {
+        let old_v2 = ColumnEncryption::new([7; 32]).encrypt(b"old key", binding());
+        for purpose in [EncryptionPurpose::Columns, EncryptionPurpose::Webhooks] {
+            let ring = ColumnEncryption::for_purpose([8; 32], [7; 32], purpose);
+            for format in [FORMAT_LEGACY, FORMAT_V2] {
+                assert!(ring.decrypt_recorded(&old_v2, binding(), format).is_err());
+            }
+            assert!(ring.for_kid(0).is_err());
         }
     }
 
