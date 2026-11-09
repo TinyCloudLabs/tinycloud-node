@@ -2,8 +2,9 @@
 //!
 //! Layout (all under `dataPath/link/`):
 //!   - `state.json`          — {name, serviceUrl, sequence, lastLanIps, certNotAfter, bind, tunnelEnabled, tunnelServiceUrl}
-//!   - `tls/key.pem`         — CSR private key (0600)
-//!   - `tls/cert.pem`        — signed cert chain from the service (0600)
+//!   - `tls/current`         — symlink to the active generation directory
+//!   - `tls/gen-*/key.pem`   — CSR private key (0600)
+//!   - `tls/gen-*/cert.pem`  — signed cert chain from the service (0600)
 //!   - `listener-state.json` — last-observed LAN TLS listener bind result (see `ListenerState`)
 //!   - `tunnel-state.json`   — last-observed tunnel connection state (see `TunnelRuntimeState`)
 //!   - `state.lock`          — advisory lock guarding `state.json`'s sequence counter
@@ -37,6 +38,8 @@ pub const STATE_FILE: &str = "state.json";
 pub const TLS_DIR: &str = "tls";
 pub const TLS_KEY_FILE: &str = "key.pem";
 pub const TLS_CERT_FILE: &str = "cert.pem";
+pub const TLS_CURRENT_LINK: &str = "current";
+const TLS_GENERATION_PREFIX: &str = "gen-";
 pub const LISTENER_STATE_FILE: &str = "listener-state.json";
 pub const TUNNEL_STATE_FILE: &str = "tunnel-state.json";
 pub const LOCK_FILE: &str = "state.lock";
@@ -124,8 +127,9 @@ impl LinkPaths {
     pub fn from_data_root(data_root: &Path) -> Self {
         let root = data_root.join(LINK_DIR);
         let tls_dir = root.join(TLS_DIR);
-        let key_path = tls_dir.join(TLS_KEY_FILE);
-        let cert_path = tls_dir.join(TLS_CERT_FILE);
+        let current_dir = tls_dir.join(TLS_CURRENT_LINK);
+        let key_path = current_dir.join(TLS_KEY_FILE);
+        let cert_path = current_dir.join(TLS_CERT_FILE);
         let state_path = root.join(STATE_FILE);
         let listener_state_path = root.join(LISTENER_STATE_FILE);
         let tunnel_state_path = root.join(TUNNEL_STATE_FILE);
@@ -171,11 +175,133 @@ pub fn write_state(paths: &LinkPaths, state: &LinkState) -> Result<()> {
     write_private_file(&paths.state_path, &rendered)
 }
 
+/// Publish `key_pem` and `cert_pem` as one pair.
+///
+/// Both files are written (atomically, 0600) into a fresh generation
+/// directory under `tls/`; the `tls/current` symlink is then renamed to point
+/// at it. A reader that resolves `current` once sees either the previous pair
+/// or the new pair, never a key from one and a certificate from the other.
+/// A crash before the swap leaves the previous pair active and an unreferenced
+/// generation directory, which the next publish removes.
 pub fn write_tls_material(paths: &LinkPaths, key_pem: &str, cert_pem: &str) -> Result<()> {
+    use crate::private_file::{sync_dir, temp_path};
+
     ensure_link_dirs(paths)?;
-    write_private_file(&paths.key_path, key_pem.as_bytes())?;
-    write_private_file(&paths.cert_path, cert_pem.as_bytes())?;
+    let generation = new_generation_name();
+    let generation_dir = paths.tls_dir.join(&generation);
+    create_private_dir(&generation_dir)?;
+    write_private_file(&generation_dir.join(TLS_KEY_FILE), key_pem.as_bytes())?;
+    write_private_file(&generation_dir.join(TLS_CERT_FILE), cert_pem.as_bytes())?;
+    sync_dir(&generation_dir)?;
+
+    let current = paths.tls_dir.join(TLS_CURRENT_LINK);
+    let staged = temp_path(&paths.tls_dir, &current);
+    publish_symlink(&generation, &staged, &current)?;
+    sync_dir(&paths.tls_dir)?;
+
+    remove_stale_tls_files(paths, &generation);
     Ok(())
+}
+
+/// Read the published key and certificate from one generation.
+///
+/// Falls back to the pre-generation layout (`tls/key.pem`, `tls/cert.pem`)
+/// when no pair has been published yet.
+pub fn read_tls_material(paths: &LinkPaths) -> Result<(String, String)> {
+    let current = paths.tls_dir.join(TLS_CURRENT_LINK);
+    let mut attempts = 0;
+    loop {
+        let target = match fs::read_link(&current) {
+            Ok(target) => Some(target),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => {
+                return Err(err).with_context(|| format!("failed to read {}", current.display()))
+            }
+        };
+        let dir = match &target {
+            Some(target) => paths.tls_dir.join(target),
+            None => paths.tls_dir.clone(),
+        };
+        match read_pair(&dir) {
+            Ok(pair) => return Ok(pair),
+            Err(err) => {
+                // A publish may have swapped `current` and removed the
+                // generation we resolved; retry against the new one.
+                attempts += 1;
+                let moved = fs::read_link(&current).ok() != target;
+                if !moved || attempts >= 3 {
+                    return Err(err);
+                }
+            }
+        }
+    }
+}
+
+fn read_pair(dir: &Path) -> Result<(String, String)> {
+    let key_path = dir.join(TLS_KEY_FILE);
+    let cert_path = dir.join(TLS_CERT_FILE);
+    let key_pem = fs::read_to_string(&key_path)
+        .with_context(|| format!("failed to read {}", key_path.display()))?;
+    let cert_pem = fs::read_to_string(&cert_path)
+        .with_context(|| format!("failed to read {}", cert_path.display()))?;
+    Ok((key_pem, cert_pem))
+}
+
+fn new_generation_name() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    format!("{TLS_GENERATION_PREFIX}{nanos:x}-{}", std::process::id())
+}
+
+#[cfg(unix)]
+fn create_private_dir(path: &Path) -> Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(path)
+        .with_context(|| format!("failed to create {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn create_private_dir(path: &Path) -> Result<()> {
+    fs::create_dir(path).with_context(|| format!("failed to create {}", path.display()))
+}
+
+/// Atomically point `link` at `target` (a name relative to `link`'s directory).
+#[cfg(unix)]
+fn publish_symlink(target: &str, staged: &Path, link: &Path) -> Result<()> {
+    std::os::unix::fs::symlink(target, staged)
+        .with_context(|| format!("failed to create {}", staged.display()))?;
+    if let Err(err) = fs::rename(staged, link) {
+        let _ = fs::remove_file(staged);
+        return Err(err).with_context(|| format!("failed to publish {}", link.display()));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn publish_symlink(_target: &str, _staged: &Path, _link: &Path) -> Result<()> {
+    anyhow::bail!("TLS pair publication requires a unix platform")
+}
+
+/// Best-effort removal of superseded generations, leftover temp links and the
+/// pre-generation `key.pem`/`cert.pem`. The new pair is already published, so
+/// failures here are harmless.
+fn remove_stale_tls_files(paths: &LinkPaths, keep: &str) {
+    let Ok(entries) = fs::read_dir(&paths.tls_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let path = entry.path();
+        if name.starts_with(TLS_GENERATION_PREFIX) && name != keep {
+            let _ = fs::remove_dir_all(&path);
+        } else if name == TLS_KEY_FILE || name == TLS_CERT_FILE {
+            let _ = fs::remove_file(&path);
+        }
+    }
 }
 
 pub fn remove_link_dir(paths: &LinkPaths) -> Result<()> {
@@ -190,26 +316,10 @@ pub fn default_service_url() -> String {
     DEFAULT_SERVICE_URL.to_string()
 }
 
-/// Write `contents` to `path` with mode `0600` from the moment the file is
-/// created — no separate `chmod` call, so there is no window where the file
-/// exists with the platform-default (typically world-readable) permissions.
-#[cfg(unix)]
+/// Write `contents` to `path` atomically with mode `0600` (see
+/// [`crate::private_file`]).
 fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
-    use std::{io::Write, os::unix::fs::OpenOptionsExt};
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-        .with_context(|| format!("failed to open {}", path.display()))?;
-    file.write_all(contents)
-        .with_context(|| format!("failed to write {}", path.display()))
-}
-
-#[cfg(not(unix))]
-fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
-    fs::write(path, contents).with_context(|| format!("failed to write {}", path.display()))
+    crate::private_file::write_private_file_atomic(path, contents)
 }
 
 /// Observed bind result for the LAN TLS listener, written by `serve` and read
@@ -488,6 +598,89 @@ mod tests {
         assert_eq!(
             state.effective_tunnel_service_url(),
             "https://staging.tinycloud.link"
+        );
+    }
+
+    fn gen_dirs(paths: &LinkPaths) -> Vec<String> {
+        let mut v: Vec<String> = fs::read_dir(&paths.tls_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(TLS_GENERATION_PREFIX))
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[::core::prelude::v1::test]
+    fn tls_pair_is_read_from_one_generation_and_old_ones_are_removed() {
+        let tmp = tempdir().unwrap();
+        let paths = LinkPaths::from_data_root(tmp.path());
+        write_tls_material(&paths, "KEY-1", "CERT-1").unwrap();
+        write_tls_material(&paths, "KEY-2", "CERT-2").unwrap();
+
+        assert_eq!(
+            read_tls_material(&paths).unwrap(),
+            ("KEY-2".to_string(), "CERT-2".to_string())
+        );
+        assert_eq!(fs::read_to_string(&paths.key_path).unwrap(), "KEY-2");
+        assert_eq!(fs::read_to_string(&paths.cert_path).unwrap(), "CERT-2");
+        assert_eq!(gen_dirs(&paths).len(), 1);
+    }
+
+    #[::core::prelude::v1::test]
+    fn interrupted_publish_leaves_previous_pair_active() {
+        let tmp = tempdir().unwrap();
+        let paths = LinkPaths::from_data_root(tmp.path());
+        write_tls_material(&paths, "KEY-1", "CERT-1").unwrap();
+
+        // A publish that died after writing the new key but before the swap.
+        let orphan = paths.tls_dir.join("gen-orphan");
+        fs::create_dir(&orphan).unwrap();
+        fs::write(orphan.join(TLS_KEY_FILE), "KEY-2").unwrap();
+
+        assert_eq!(
+            read_tls_material(&paths).unwrap(),
+            ("KEY-1".to_string(), "CERT-1".to_string())
+        );
+
+        write_tls_material(&paths, "KEY-3", "CERT-3").unwrap();
+        assert_eq!(
+            read_tls_material(&paths).unwrap(),
+            ("KEY-3".to_string(), "CERT-3".to_string())
+        );
+        assert_eq!(gen_dirs(&paths).len(), 1, "orphan generation is removed");
+    }
+
+    #[::core::prelude::v1::test]
+    fn legacy_flat_layout_is_read_then_replaced_by_a_generation() {
+        let tmp = tempdir().unwrap();
+        let paths = LinkPaths::from_data_root(tmp.path());
+        ensure_link_dirs(&paths).unwrap();
+        fs::write(paths.tls_dir.join(TLS_KEY_FILE), "OLD-KEY").unwrap();
+        fs::write(paths.tls_dir.join(TLS_CERT_FILE), "OLD-CERT").unwrap();
+        assert_eq!(
+            read_tls_material(&paths).unwrap(),
+            ("OLD-KEY".to_string(), "OLD-CERT".to_string())
+        );
+
+        write_tls_material(&paths, "KEY", "CERT").unwrap();
+        assert_eq!(
+            read_tls_material(&paths).unwrap(),
+            ("KEY".to_string(), "CERT".to_string())
+        );
+        assert!(!paths.tls_dir.join(TLS_KEY_FILE).exists());
+        assert!(!paths.tls_dir.join(TLS_CERT_FILE).exists());
+    }
+
+    #[::core::prelude::v1::test]
+    fn generation_directory_is_private() {
+        let tmp = tempdir().unwrap();
+        let paths = LinkPaths::from_data_root(tmp.path());
+        write_tls_material(&paths, "KEY", "CERT").unwrap();
+        let dir = paths.tls_dir.join(&gen_dirs(&paths)[0]);
+        assert_eq!(
+            fs::metadata(dir).unwrap().permissions().mode() & 0o777,
+            0o700
         );
     }
 }

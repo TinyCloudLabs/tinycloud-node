@@ -62,6 +62,7 @@ pub mod share_v2 {
         }
     }
 }
+pub mod private_file;
 pub mod signed_urls;
 pub mod storage;
 pub mod tee;
