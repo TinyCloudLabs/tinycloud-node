@@ -132,6 +132,7 @@ impl RequestCancel {
                     deadline_ms = self.budget.as_millis() as u64,
                     "Request deadline exceeded"
                 );
+                crate::db_retry::stamp_overload("request_timeout");
                 true
             }
             Err(state) => state == CUT,

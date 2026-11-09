@@ -47,7 +47,8 @@ use tinycloud_core::duckdb::{
 use tinycloud_core::{
     admission::AdmissionError,
     database_migration,
-    db_pool::{classify_failure, track_writes, track_writes_retrying, TransientFailure},
+    db_pool::{classify_failure, track_writes, TransientFailure},
+    db_retry::{retry_owner, Replay},
     encryption_network::EncryptionService,
     events::Invocation,
     failure_diagnostic::{
@@ -229,7 +230,7 @@ pub(crate) fn database_failure(
     (status, body)
 }
 
-/// The database error inside a [`TxError`], for [`track_writes_retrying`].
+/// The database error inside a [`TxError`], for [`retry_owner`].
 fn tx_database_error<S: StorageSetup, K: Secrets>(error: &TxError<S, K>) -> Option<&DbErr> {
     match error {
         TxError::Db(error) | TxError::EpochInsert(error) => Some(error),
@@ -752,12 +753,13 @@ pub async fn delegate(
                 .with_label_values(&["delegate"])
                 .start_timer()
         });
-        // One retry of the whole operation after a connection lost before
-        // any write (TC-2346); see `track_writes_retrying`.
+        // One retry of the whole database operation after a connection
+        // lost before any write (TC-2610); see `retry_owner`.
         let delegation = d.0;
-        let (res, write_may_have_applied) = track_writes_retrying(
+        let (res, write_may_have_applied) = retry_owner(
             "delegate",
-            tinycloud.connection().retry_window(),
+            tinycloud.connection().retry_policy(),
+            Replay::Never,
             || tinycloud.delegate(delegation.clone()),
             tx_database_error,
         )
@@ -2314,10 +2316,39 @@ async fn invoke_impl(
                 "tinycloud.kv/put" | "tinycloud.kv/del" | "tinycloud.kv/delete"
             )
         });
-        let (invoke_result, write_may_have_applied) = track_writes(
-            tinycloud.invoke_with_options_admitted::<BlockStage>(admitted, inputs, kv_options),
-        )
-        .await;
+        // A read (no KV mutation, no staged input, no replay row) is one
+        // cancel-safe database operation whose read audit is its last step,
+        // so a lost connection before that step is retried once by the retry
+        // owner. A put or delete is never replayed: it fails once and the
+        // client sends it again.
+        let retryable_read = !kv_mutates
+            && inputs.is_empty()
+            && kv_options.replay.is_none()
+            && tinycloud_core::kv_mutation_keys(admitted.invocation()).is_empty();
+        let (invoke_result, write_may_have_applied) = if retryable_read {
+            retry_owner(
+                "kv_read",
+                tinycloud.connection().retry_policy(),
+                Replay::Never,
+                || {
+                    tinycloud.invoke_read_admitted::<BlockStage>(
+                        &admitted,
+                        HashMap::new(),
+                        kv_options.clone(),
+                    )
+                },
+                |error| match error {
+                    TxStoreError::Tx(error) => tx_database_error(error),
+                    _ => None,
+                },
+            )
+            .await
+        } else {
+            track_writes(tinycloud.invoke_with_options_admitted::<BlockStage>(
+                admitted, inputs, kv_options,
+            ))
+            .await
+        };
         let write_may_have_applied = kv_mutates && write_may_have_applied;
         crate::prometheus::observe_span(
             "server.kv.invoke",
@@ -4398,9 +4429,10 @@ async fn verify_auth_admitted(
     tinycloud: &State<TinyCloud>,
 ) -> Result<TransactResult, InvokeError> {
     let start = Instant::now();
-    let (result, write_may_have_applied) = track_writes_retrying(
+    let (result, write_may_have_applied) = retry_owner(
         "authorize_invocation",
-        tinycloud.connection().retry_window(),
+        tinycloud.connection().retry_policy(),
+        Replay::Never,
         || tinycloud.invoke_admitted::<BlockStage>(&invocation, HashMap::new()),
         |error| match error {
             TxStoreError::Tx(error) => tx_database_error(error),
@@ -11077,7 +11109,9 @@ mod tests {
                 .join(space.name().as_str()),
         )?;
         let tinycloud = TinyCloud::new(
-            db.clone().into(),
+            tinycloud_core::RecoveringConnection::new(db.clone()).with_retry_window(
+                std::time::Duration::from_millis(config.database.retry_window_ms),
+            ),
             Either::B(storage),
             StaticSecret::new(vec![0u8; 32]).unwrap(),
         )

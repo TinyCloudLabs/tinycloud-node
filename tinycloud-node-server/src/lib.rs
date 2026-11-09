@@ -391,9 +391,11 @@ pub async fn connect_database(tinycloud_config: &Config) -> Result<RecoveringCon
         connect_opts
             .sqlx_logging_level(STATEMENT_LOG_LEVEL)
             .sqlx_slow_statements_logging_settings(STATEMENT_LOG_LEVEL, SLOW_STATEMENT_THRESHOLD);
-        return Ok(RecoveringConnection::new(
-            Database::connect(connect_opts).await?,
-        ));
+        return Ok(
+            RecoveringConnection::new(Database::connect(connect_opts).await?).with_retry_window(
+                Duration::from_millis(tinycloud_config.database.retry_window_ms),
+            ),
+        );
     }
     let mut connect_opts = ConnectOptions::from(database);
     connect_opts
@@ -421,9 +423,11 @@ pub async fn connect_database(tinycloud_config: &Config) -> Result<RecoveringCon
     connect_opts
         .sqlx_logging_level(STATEMENT_LOG_LEVEL)
         .sqlx_slow_statements_logging_settings(STATEMENT_LOG_LEVEL, SLOW_STATEMENT_THRESHOLD);
-    Ok(RecoveringConnection::new(
-        Database::connect(connect_opts).await?,
-    ))
+    Ok(
+        RecoveringConnection::new(Database::connect(connect_opts).await?).with_retry_window(
+            Duration::from_millis(tinycloud_config.database.retry_window_ms),
+        ),
+    )
 }
 
 static POSTGRES_CONNECTIONS_OPENED: AtomicU64 = AtomicU64::new(0);
@@ -965,7 +969,8 @@ pub async fn app_with_control(
     )
     .with_wait_bounds(tinycloud_config.storage.sql.wait_bounds())
     .with_durability(tinycloud_config.storage.sql.durability())
-    .with_ddl_policy(tinycloud_config.storage.sql.ddl_requires_schema);
+    .with_ddl_policy(tinycloud_config.storage.sql.ddl_requires_schema)
+    .with_retry_policy(seed_conn.retry_policy());
 
     let mut policy_v3_runtime =
         PolicyV3Runtime::new(seed_conn.clone(), key_setup.node_did(), key_setup.clone())

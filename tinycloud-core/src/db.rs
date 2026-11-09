@@ -2328,6 +2328,34 @@ where
         .await
     }
 
+    /// [`Self::invoke_with_options_admitted`] for an invocation with no KV
+    /// mutation (`kv/get`, `kv/list`, `kv/metadata`, `kv/sync`), which lends
+    /// the admitted value so the caller's retry owner
+    /// ([`crate::db_retry::retry_owner`]) can run it again after a lost
+    /// connection. The read audit is the last step: a run that fails before
+    /// it has recorded nothing, and a run whose audit step fails is not a
+    /// database error, so it is never retried. A mutating invocation must use
+    /// [`Self::invoke_with_options_admitted`], which consumes the value.
+    pub async fn invoke_read_admitted<S>(
+        &self,
+        invocation: impl AdmittedInput,
+        inputs: InvocationInputs<S::Writable>,
+        options: KvInvokeOptions,
+    ) -> Result<(TransactResult, Vec<InvocationOutcome<B::Readable>>), TxStoreError<B, S, K>>
+    where
+        B: ImmutableWriteStore<S> + ImmutableReadStore + ImmutableDeleteStore,
+        S: ImmutableStaging,
+        S::Writable: 'static + Unpin,
+    {
+        let invocation = sealed::Sealed::into_invocation(invocation);
+        debug_assert!(
+            kv_mutation_keys(&invocation).is_empty(),
+            "invoke_read_admitted is for invocations with no KV mutation"
+        );
+        self.invoke_with_options_mode(invocation, inputs, options, InvokeMode::Admitted)
+            .await
+    }
+
     pub async fn invoke_with_options<S>(
         &self,
         invocation: Invocation,
@@ -2544,13 +2572,12 @@ where
         OsRng.fill_bytes(&mut attempt_bytes);
         let attempt_id = hex::encode(attempt_bytes);
         // Registration and authorization commit before any blob can be
-        // persisted. Retrying an uncertain preparatory COMMIT uses exactly the
-        // same attempt ID, so the claim is recorded once and no other
-        // writer's claim is affected.
+        // persisted. A failure of the preparatory transaction is returned
+        // as it is: its commit may have been applied, so it is never
+        // replayed here (TC-2610).
         // SQLite's preparatory write follows sequence→writer→BEGIN and
         // releases every guard before an ordinary upload.
-        let mut retried = false;
-        let blobs = loop {
+        let blobs = {
             let _sequence = if self.writer_lock.is_some() {
                 self.acquire_space_sequence_guards(&sequence_spaces).await
             } else {
@@ -2577,12 +2604,7 @@ where
             ))
             .await;
             match prepared {
-                Ok(generations) => break generations,
-                Err(TxError::Db(error))
-                    if !retried && crate::db_pool::is_connection_error(&error) =>
-                {
-                    retried = true;
-                }
+                Ok(generations) => generations,
                 Err(TxError::Db(error)) if crate::kv_orphans::is_candidate_unavailable(&error) => {
                     return Err(TxStoreError::KvCandidateUnavailable);
                 }
@@ -2613,49 +2635,32 @@ where
             let begin_mutation = || {
                 let legacy_spaces = &legacy_spaces;
                 async move {
-                    // Retrying a lost BEGIN or freeze lock is safe before
-                    // any KV transaction body or COMMIT has run.
-                    let mut retried = false;
-                    loop {
-                        let begin_start = Instant::now();
-                        let tx_result = self.begin_graph_transaction().await;
-                        crate::telemetry::observe_stage(
-                            crate::telemetry::InvocationStage::DbTxBegin,
-                            crate::telemetry::StageOutcome::from(tx_result.is_ok()),
-                            begin_start.elapsed(),
-                        );
-                        let tx = match tx_result {
-                            Ok(tx) => tx,
-                            Err(error)
-                                if !retried && crate::db_pool::is_connection_error(&error) =>
-                            {
-                                retried = true;
-                                continue;
+                    let begin_start = Instant::now();
+                    let tx_result = self.begin_graph_transaction().await;
+                    crate::telemetry::observe_stage(
+                        crate::telemetry::InvocationStage::DbTxBegin,
+                        crate::telemetry::StageOutcome::from(tx_result.is_ok()),
+                        begin_start.elapsed(),
+                    );
+                    let tx = match tx_result {
+                        Ok(tx) => tx,
+                        Err(error) => return Err(TxStoreError::Tx(TxError::Db(error))),
+                    };
+                    let locked: Result<bool, DbErr> = async {
+                        // Protected legacy writes take the durable freeze
+                        // row before uploading and hold it through commit.
+                        for space in legacy_spaces {
+                            if crate::meeting_legacy_guard::lock_writer(&tx, space).await? {
+                                return Ok(true);
                             }
-                            Err(error) => return Err(TxStoreError::Tx(TxError::Db(error))),
-                        };
-                        let locked: Result<bool, DbErr> = async {
-                            // Protected legacy writes take the durable freeze
-                            // row before uploading and hold it through commit.
-                            for space in legacy_spaces {
-                                if crate::meeting_legacy_guard::lock_writer(&tx, space).await? {
-                                    return Ok(true);
-                                }
-                            }
-                            Ok(false)
                         }
-                        .await;
-                        match locked {
-                            Ok(false) => break Ok(tx),
-                            Ok(true) => break Err(TxStoreError::LegacyMeetingFrozen),
-                            Err(error)
-                                if !retried && crate::db_pool::is_connection_error(&error) =>
-                            {
-                                retried = true;
-                                drop(tx);
-                            }
-                            Err(error) => break Err(error.into()),
-                        }
+                        Ok(false)
+                    }
+                    .await;
+                    match locked {
+                        Ok(false) => Ok(tx),
+                        Ok(true) => Err(TxStoreError::LegacyMeetingFrozen),
+                        Err(error) => Err(error.into()),
                     }
                 }
             };

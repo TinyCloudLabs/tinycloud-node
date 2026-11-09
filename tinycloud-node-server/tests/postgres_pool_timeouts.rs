@@ -963,10 +963,11 @@ async fn blackhole_idle_connections_fail_fast_and_recover() {
 
 /// (b, c) A connection that dies mid-hydration, while the request holds its
 /// database's operation lock (TC-1054 exp 4; 1.20.4 hung 156 s). Every
-/// connection streaming the large artifact is black-holed. The first attempt
-/// fails within the retry window (test keepalive detects in about 3 s, the
-/// default window is 10 s), so the read is retried once; the retry is cut
-/// too, and the request ends with a retryable `Unavailable`. The lock is
+/// connection streaming the large artifact is black-holed. The attempt
+/// fails after one detection (test keepalive detects in about 3 s) and is not
+/// retried: only the metadata read of a hydration has a retry owner, and the
+/// payload reads do not. The request ends with a retryable `Unavailable`.
+/// The lock is
 /// released, so the next request on the database hydrates and succeeds;
 /// another database is served throughout.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -975,8 +976,8 @@ async fn blackhole_mid_hydration_releases_the_database_lock() {
         return;
     };
     let (elapsed, cut) = mid_hydration_blackhole(&url, "bhlock", |_| {}).await;
-    assert_eq!(cut, 2, "the attempt and its one retry were each cut");
-    // Two detections (about 3 s each), never a third from a nested retry.
+    assert_eq!(cut, 1, "the attempt was cut once and not retried");
+    // One detection (about 3 s), never a second.
     assert!(elapsed < Duration::from_secs(9), "{elapsed:?}");
 }
 

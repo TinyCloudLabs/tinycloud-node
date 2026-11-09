@@ -640,7 +640,15 @@ async fn persist_batch(conn: &RecoveringConnection, batch: &[Command]) -> Result
             // keys fixed by the batch, and the readers wait only for "the
             // rows exist", so running it again after a lost connection is a
             // no-op if the first run committed (TC-951).
-            return conn.execute_idempotent(statement).await.map(|_| ());
+            let (result, _) = crate::db_retry::retry_owner(
+                "read_audit_batch",
+                conn.retry_policy(),
+                crate::db_retry::Replay::IdempotentStatement,
+                || conn.execute(statement.clone()),
+                |error: &DbErr| Some(error),
+            )
+            .await;
+            return result.map(|_| ());
         }
     }
     let tx = conn.begin().await?;
@@ -1133,9 +1141,11 @@ mod tests {
         conn: &'a DatabaseConnection,
         batch: &'a [Command],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), DbErr>> + Send + 'a>> {
-        Box::pin(
-            async move { persist_batch(&RecoveringConnection::new(conn.clone()), batch).await },
-        )
+        Box::pin(async move {
+            let pool = RecoveringConnection::new(conn.clone())
+                .with_retry_window(std::time::Duration::from_secs(10));
+            persist_batch(&pool, batch).await
+        })
     }
 
     fn persist_in_transaction<'a>(
@@ -2058,7 +2068,11 @@ mod tests {
             persist_in_transaction(conn, &[command(committed_read(parent))])
                 .await
                 .unwrap();
-            let pipeline = ReadAuditPipeline::start(schema_pool(TEST, conn, 4).await, None);
+            let pipeline = ReadAuditPipeline::start(
+                RecoveringConnection::new(schema_pool(TEST, conn, 4).await)
+                    .with_retry_window(Duration::from_secs(10)),
+                None,
+            );
             pipeline.set_wait(COMMIT_TEST_WAIT);
             let locks = schema_pool(TEST, conn, 2).await;
 
