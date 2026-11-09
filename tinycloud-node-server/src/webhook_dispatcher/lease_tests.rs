@@ -233,3 +233,99 @@ async fn expired_lease_is_claimed_again() -> Result<()> {
     assert_ne!(again[0].lease_token, first.lease_token);
     Ok(())
 }
+
+/// Two dispatchers on separate PostgreSQL pools (real concurrent connections).
+/// Gated like the other PostgreSQL-backed tests: skips locally, panics on
+/// GitHub Actions if the database URL is missing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_two_pools_claim_each_delivery_once_and_refuse_stale_marks() -> Result<()> {
+    use std::collections::BTreeSet;
+
+    let Some(url) = crate::test_support::postgres_test_url(
+        "postgres_two_pools_claim_each_delivery_once_and_refuse_stale_marks",
+    ) else {
+        return Ok(());
+    };
+    let admin = Database::connect(ConnectOptions::new(url.clone())).await?;
+    let schema = format!(
+        "tc2614_lease_{}_{}",
+        std::process::id(),
+        OffsetDateTime::now_utc().unix_timestamp_nanos() % 1_000_000_000_000
+    );
+    admin
+        .execute_unprepared(&format!("CREATE SCHEMA {schema}"))
+        .await?;
+
+    let encryption = ColumnEncryption::new([9u8; 32]);
+    let tempdir = TempDir::new()?;
+    let mut pools = Vec::new();
+    for _ in 0..2 {
+        let mut pool_url = reqwest::Url::parse(&url)?;
+        pool_url
+            .query_pairs_mut()
+            .append_pair("options", &format!("-c search_path={schema}"));
+        let mut config = crate::config::Config::default();
+        config.storage.database = Some(pool_url.to_string());
+        config.database.max_connections = 8;
+        let conn = crate::connect_database(&config).await?;
+        let storage = NodeFileSystemConfig::new(tempdir.path()).open().await?;
+        pools.push(
+            TinyCloud::new_with_encryption(
+                conn,
+                Either::B(storage),
+                StaticSecret::new(vec![0u8; 32]).unwrap(),
+                Some(encryption.clone()),
+            )
+            .await?,
+        );
+    }
+    let mut setup_options = ConnectOptions::new(url.clone());
+    setup_options
+        .max_connections(2)
+        .sqlx_logging(false)
+        .set_schema_search_path(schema.clone());
+    let setup = Database::connect(setup_options).await?;
+    insert_deliveries(&setup, &encryption, "http://127.0.0.1:9/hooks", 40).await?;
+
+    let (first, second) = (pools[0].clone(), pools[1].clone());
+    let claim_a = tokio::spawn(async move { first.claim_due_webhook_deliveries(40, LEASE).await });
+    let claim_b = tokio::spawn(async move { second.claim_due_webhook_deliveries(40, LEASE).await });
+    let (claimed_a, claimed_b) = (claim_a.await??, claim_b.await??);
+    let ids_a: BTreeSet<_> = claimed_a.iter().map(|d| d.id.clone()).collect();
+    let ids_b: BTreeSet<_> = claimed_b.iter().map(|d| d.id.clone()).collect();
+    assert!(ids_a.is_disjoint(&ids_b), "a delivery was claimed twice");
+    assert_eq!(ids_a.len() + ids_b.len(), 40, "every delivery is claimed");
+
+    // A stale mark after a re-claim by the other pool is refused.
+    setup
+        .execute_unprepared("UPDATE hook_delivery SET lease_expires_at = '2000-01-01T00:00:00Z' WHERE id = 'delivery_00'")
+        .await?;
+    let holder = claimed_a
+        .iter()
+        .chain(claimed_b.iter())
+        .find(|d| d.id == "delivery_00")
+        .unwrap()
+        .clone();
+    let reclaimed = pools[1]
+        .claim_due_webhook_deliveries(40, LEASE)
+        .await?
+        .remove(0);
+    assert_eq!(reclaimed.id, holder.id);
+    assert!(
+        !pools[0]
+            .mark_webhook_delivery_delivered(&holder.id, &holder.lease_token, 1)
+            .await?
+    );
+    assert!(
+        pools[1]
+            .mark_webhook_delivery_delivered(&reclaimed.id, &reclaimed.lease_token, 1)
+            .await?
+    );
+
+    drop(pools);
+    setup.close().await?;
+    admin
+        .execute_unprepared(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await?;
+    Ok(())
+}
