@@ -152,9 +152,8 @@ async fn load_active_network<C: ConnectionTrait>(
         .count(db)
         .await?;
     if members == 0 {
-        return Err(EncryptionServiceError::NetworkNotActive(
-            NetworkState::Incomplete.as_str().to_string(),
-        ));
+        // Half-created by an older create: it answers as a missing network.
+        return Err(EncryptionServiceError::NetworkNotFound);
     }
     Ok(row)
 }

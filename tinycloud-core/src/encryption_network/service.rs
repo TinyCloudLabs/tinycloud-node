@@ -389,8 +389,38 @@ impl EncryptionService {
             }
             Err(err) => {
                 let _ = tx.rollback().await;
-                Err(err)
+                match err {
+                    EncryptionServiceError::Db(ref db_err) if is_unique_violation(db_err) => {
+                        self.settle_create_conflict(&network_id, err).await
+                    }
+                    other => Err(other),
+                }
             }
+        }
+    }
+
+    /// A unique violation inside create or repair means another writer inserted
+    /// one of these rows first. If the network is now complete, that writer
+    /// won and this call is a duplicate, as on a plain re-create. Otherwise the
+    /// conflict is real and its error is returned.
+    async fn settle_create_conflict(
+        &self,
+        network_id: &NetworkId,
+        err: EncryptionServiceError,
+    ) -> Result<NetworkDescriptor, EncryptionServiceError> {
+        let network_exists = encryption_network::Entity::find_by_id(network_id.to_string())
+            .one(&self.db)
+            .await?
+            .is_some();
+        let has_member = encryption_network_member::Entity::find()
+            .filter(encryption_network_member::Column::NetworkId.eq(network_id.to_string()))
+            .count(&self.db)
+            .await?
+            > 0;
+        if network_exists && has_member {
+            Err(EncryptionServiceError::NetworkAlreadyExists)
+        } else {
+            Err(err)
         }
     }
 
@@ -609,13 +639,14 @@ impl EncryptionService {
             })
             .collect();
 
-        let mut state = NetworkState::parse(&model.state).ok_or_else(|| {
+        let state = NetworkState::parse(&model.state).ok_or_else(|| {
             EncryptionServiceError::InvalidBody(format!("unknown network state: {}", model.state))
         })?;
         // A network row without its member was left half-created by an older
-        // create. It is reported as such and is never used as active.
+        // create. It answers as a missing network, so a caller creates it
+        // again and the create completes it. It is never used as active.
         if state == NetworkState::Active && members.is_empty() {
-            state = NetworkState::Incomplete;
+            return Err(EncryptionServiceError::NetworkNotFound);
         }
         let backend =
             KeyBackendKind::parse(&model.key_backend).unwrap_or(KeyBackendKind::LocalOneOfOne);

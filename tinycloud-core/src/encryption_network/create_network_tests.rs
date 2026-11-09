@@ -18,6 +18,7 @@ use crate::encryption_network::service::{
 use crate::encryption_network::types::{NetworkState, Threshold};
 use crate::migrations::Migrator;
 use crate::models::{encryption_ceremony, encryption_network, encryption_network_member};
+use crate::test_support::PostgresTestSchema;
 
 const NODE_DID: &str = "did:key:z6MkNodeTest";
 const OWNER: &str = "did:key:z6MkOwnerTest";
@@ -117,18 +118,23 @@ async fn insert_half_created(db: &DatabaseConnection, svc: &EncryptionService) -
 }
 
 #[tokio::test]
-async fn half_created_network_is_reported_incomplete_not_active() {
+async fn half_created_network_answers_as_missing_and_is_not_used_as_active() {
     let db = fresh_db().await;
     let svc = service(db.clone());
     let id = insert_half_created(&db, &svc).await;
 
-    let descriptor = svc.get_network(&id).await.unwrap();
-    assert_eq!(descriptor.state, NetworkState::Incomplete);
-    assert!(descriptor.members.is_empty());
-
-    // The name lookup reports the same state.
-    let by_name = svc.get_network_by_name("default", None).await.unwrap();
-    assert_eq!(by_name.state, NetworkState::Incomplete);
+    assert!(matches!(
+        svc.get_network(&id).await,
+        Err(EncryptionServiceError::NetworkNotFound)
+    ));
+    assert!(matches!(
+        svc.get_network_by_name("default", None).await,
+        Err(EncryptionServiceError::NetworkNotFound)
+    ));
+    assert!(matches!(
+        svc.get_network_by_name("default", Some(OWNER)).await,
+        Err(EncryptionServiceError::NetworkNotFound)
+    ));
 }
 
 #[tokio::test]
@@ -161,4 +167,67 @@ async fn create_repairs_a_half_created_network_in_place() {
         svc.create_one_of_one_network(request()).await,
         Err(EncryptionServiceError::NetworkAlreadyExists)
     ));
+}
+
+/// Concurrent creates and repairs on PostgreSQL: exactly one writer wins and
+/// every other one is answered as a duplicate, never a raw key violation.
+#[tokio::test]
+async fn concurrent_creates_and_repairs_on_postgres_leave_one_winner() {
+    let Some(schema) = PostgresTestSchema::new("concurrent_network_create").await else {
+        return;
+    };
+    for round in 0..5 {
+        for half_created in [false, true] {
+            let name = format!("net{round}{half_created}");
+            let req = |n: &str| CreateNetworkRequest {
+                name: n.to_string(),
+                owner_did: OWNER.to_string(),
+                threshold: Threshold::one_of_one(),
+            };
+            let services: Vec<_> = (0..4).map(|_| service(schema.conn.clone())).collect();
+            if half_created {
+                let id = NetworkId::new(OWNER.to_string(), name.clone()).unwrap();
+                let generated = services[0].backend.generate().unwrap();
+                encryption_network::ActiveModel {
+                    network_id: Set(id.to_string()),
+                    owner_did: Set(OWNER.to_string()),
+                    name: Set(name.clone()),
+                    alg: Set(generated.alg),
+                    key_version: Set(1),
+                    public_key: Set(generated.public_key),
+                    state: Set("active".to_string()),
+                    threshold_n: Set(1),
+                    threshold_t: Set(1),
+                    key_backend: Set(services[0].backend.kind().as_str().to_string()),
+                    sealed_private_key: Set(Some(generated.sealed_private_key)),
+                    created_at: Set("2026-01-01T00:00:00Z".to_string()),
+                    updated_at: Set("2026-01-01T00:00:00Z".to_string()),
+                }
+                .insert(&schema.conn)
+                .await
+                .unwrap();
+            }
+            let results = futures::future::join_all(
+                services
+                    .iter()
+                    .map(|svc| svc.create_one_of_one_network(req(&name))),
+            )
+            .await;
+            let won = results.iter().filter(|r| r.is_ok()).count();
+            assert_eq!(won, 1, "{name}: {results:?}");
+            for r in results.iter().filter(|r| r.is_err()) {
+                assert!(
+                    matches!(r, Err(EncryptionServiceError::NetworkAlreadyExists)),
+                    "{name}: {r:?}"
+                );
+            }
+            let id = NetworkId::new(OWNER.to_string(), name.clone()).unwrap();
+            let members = encryption_network_member::Entity::find()
+                .filter(encryption_network_member::Column::NetworkId.eq(id.to_string()))
+                .count(&schema.conn)
+                .await
+                .unwrap();
+            assert_eq!(members, 1, "{name}");
+        }
+    }
 }
