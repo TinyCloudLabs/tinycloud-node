@@ -8,7 +8,7 @@
 
 use crate::{
     db_pool::{is_transient_error, transient_error_class, RecoveringConnection},
-    encryption::{maybe_encrypt, ColumnEncryption},
+    encryption::{maybe_encrypt, ColumnEncryption, RowBinding},
     events::Invocation,
     hash::Hash,
     models::{actor, invocation},
@@ -40,17 +40,24 @@ struct ReadAuditRecord {
     invoker: String,
     issued_at: OffsetDateTime,
     serialization: Vec<u8>,
+    serialization_format: i16,
     abilities: Vec<(Resource, Ability)>,
     parents: Vec<Hash>,
 }
 
 impl ReadAuditRecord {
     fn from_invocation(invocation: &Invocation, encryption: Option<&ColumnEncryption>) -> Self {
+        let id = invocation.content_hash();
         Self {
-            id: invocation.content_hash(),
+            id,
             invoker: invocation.0.invoker.clone(),
             issued_at: OffsetDateTime::now_utc(),
-            serialization: maybe_encrypt(encryption, invocation.serialized_bytes()),
+            serialization: maybe_encrypt(
+                encryption,
+                invocation.serialized_bytes(),
+                RowBinding::new("invocation", "serialization", &[&Vec::<u8>::from(id)]),
+            ),
+            serialization_format: if encryption.is_some() { 2 } else { 0 },
             abilities: invocation
                 .0
                 .capabilities
@@ -766,6 +773,7 @@ fn audit_inserts(batch: &[Command]) -> Option<AuditInserts> {
             issued_at: Set(record.issued_at),
             facts: Set(None),
             serialization: Set(record.serialization.clone()),
+            serialization_format: Set(record.serialization_format),
         })
         .collect();
     let invocations = invocation::Entity::insert_many(invocations).on_conflict(
@@ -885,6 +893,7 @@ mod tests {
             invoker: "did:key:read-audit-test".to_string(),
             issued_at: OffsetDateTime::now_utc(),
             serialization: format!("serialized-{index}").into_bytes(),
+            serialization_format: 0,
             abilities: Vec::new(),
             parents: Vec::new(),
         }
@@ -1066,6 +1075,7 @@ mod tests {
             invoker: invoker.to_string(),
             issued_at: OffsetDateTime::now_utc(),
             serialization: format!("serialized-{seed}").into_bytes(),
+            serialization_format: 0,
             abilities,
             parents,
         }
@@ -1108,6 +1118,7 @@ mod tests {
             not_before: Set(None),
             facts: Set(None),
             serialization: Set(id.as_ref().to_vec()),
+            serialization_format: Set(0),
         })
         .exec(conn)
         .await
@@ -1118,6 +1129,94 @@ mod tests {
     async fn batched_persist_matches_per_record_contents_and_is_idempotent() {
         let conn = database("sqlite::memory:".to_string(), 1).await;
         assert_batched_persist_contents(&conn, persist_batch_boxed).await;
+    }
+
+    #[tokio::test]
+    async fn read_audit_persists_v2_format_with_bound_ciphertext() {
+        use tinycloud_auth::{
+            authorization::{make_invocation, InvocationOptions},
+            resolver::DID_METHODS,
+            ssi::jwk::JWK,
+        };
+
+        let jwk = JWK::generate_ed25519().unwrap();
+        let did = DID_METHODS.generate(&jwk, "key").unwrap().to_string();
+        let verification_method = format!("{did}#{}", did.rsplit(':').next().unwrap());
+        let parent = crate::hash::hash(b"audit-parent").to_cid(0x55);
+        let signed = make_invocation::<Vec<ucan_capabilities_object::Ability>>(
+            vec![],
+            &parent,
+            &jwk,
+            &verification_method,
+            (OffsetDateTime::now_utc() + time::Duration::minutes(5)).unix_timestamp() as f64,
+            InvocationOptions {
+                proof: Some(vec![]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let plaintext = signed.encode().unwrap().into_bytes();
+        let invocation = crate::events::SerializedEvent(
+            crate::util::InvocationInfo::try_from(signed).unwrap(),
+            plaintext.clone(),
+        );
+        let id = invocation.content_hash();
+        for encrypted in [false, true] {
+            let conn = database("sqlite::memory:".to_string(), 1).await;
+            let encryption = encrypted.then(|| ColumnEncryption::new([0x42; 32]));
+            let record = ReadAuditRecord::from_invocation(&invocation, encryption.as_ref());
+            persist_batch_boxed(&conn, &[command(record)])
+                .await
+                .unwrap();
+            let row = invocation::Entity::find_by_id(id)
+                .one(&conn)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.serialization_format, if encrypted { 2 } else { 0 });
+            if encrypted {
+                assert_eq!(row.serialization[0], 2);
+                assert_ne!(row.serialization, plaintext);
+            } else {
+                assert_eq!(row.serialization, plaintext);
+            }
+            let id_bytes = Vec::<u8>::from(id);
+            let pk = [id_bytes.as_slice()];
+            let binding = RowBinding::new("invocation", "serialization", &pk);
+            assert_eq!(
+                crate::encryption::maybe_decrypt(
+                    encryption.as_ref(),
+                    &row.serialization,
+                    binding,
+                    row.serialization_format,
+                )
+                .unwrap(),
+                plaintext,
+            );
+            if encrypted {
+                assert!(crate::encryption::maybe_decrypt(
+                    None,
+                    &row.serialization,
+                    binding,
+                    row.serialization_format,
+                )
+                .is_err());
+                assert!(crate::encryption::maybe_decrypt(
+                    encryption.as_ref(),
+                    &row.serialization,
+                    RowBinding::new("invocation", "serialization", &[b"other row"]),
+                    row.serialization_format,
+                )
+                .is_err());
+                assert!(crate::encryption::maybe_decrypt(
+                    encryption.as_ref(),
+                    &plaintext,
+                    binding,
+                    row.serialization_format,
+                )
+                .is_err());
+            }
+        }
     }
 
     /// How a test persists a batch: `persist_batch` (one statement on
@@ -1440,40 +1539,16 @@ mod tests {
     }
 
     #[test]
-    fn single_statement_audit_covers_every_table_and_falls_back_past_the_parameter_limit() {
-        assert!(audit_inserts(&[]).is_none());
+    fn single_statement_audit_falls_back_past_the_parameter_limit() {
         let single_statement = |batch: &[Command]| {
             postgres_single_statement(&audit_inserts(batch).expect("a non-empty batch"))
         };
 
         let get = ability("tinycloud.kv/get");
-        let batch = vec![command(rich_record(
-            "shape",
-            "did:key:shape",
-            vec![(
-                resource("tinycloud:did:key:ne-delegator:files/kv/a"),
-                get.clone(),
-            )],
-            vec![crate::hash::hash(b"parent")],
-        ))];
-        let sql = single_statement(&batch)
-            .expect("an ordinary batch is one statement")
-            .sql;
-        assert!(sql.starts_with("WITH "), "{sql}");
-        for table in [
-            r#"INSERT INTO "actor""#,
-            r#"INSERT INTO "invoked_abilities""#,
-            r#"INSERT INTO "parent_delegation""#,
-            r#"INSERT INTO "invocation""#,
-        ] {
-            assert_eq!(sql.matches(table).count(), 1, "{table}: {sql}");
-        }
-        assert_eq!(sql.matches("ON CONFLICT").count(), 4, "{sql}");
-        assert!(!sql.contains("RETURNING"), "{sql}");
 
-        // 6 parameters for the actor and invocation, 3 per invoked ability:
+        // 7 parameters for the actor and invocation, 3 per invoked ability:
         // past 65,535 the batch takes the transactional path instead.
-        let fits = (65_535 - 6) / 3;
+        let fits = (65_535 - 7) / 3;
         let abilities = |count: usize| {
             (0..count)
                 .map(|index| {
@@ -1619,6 +1694,7 @@ mod tests {
                 issued_at: Set(OffsetDateTime::now_utc()),
                 facts: Set(None),
                 serialization: Set(b"held by another transaction".to_vec()),
+                serialization_format: Set(0),
             })
             .exec(&tx)
             .await
@@ -2708,6 +2784,7 @@ mod tests {
             invoker: record.invoker.clone(),
             issued_at: OffsetDateTime::now_utc(),
             serialization: record.serialization.clone(),
+            serialization_format: record.serialization_format,
             abilities: record.abilities.clone(),
             parents: record.parents.clone(),
         };

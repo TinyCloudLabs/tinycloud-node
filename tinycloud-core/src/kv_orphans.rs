@@ -2798,6 +2798,7 @@ mod tests {
             issued_at: sea_orm::ActiveValue::Set(time::OffsetDateTime::now_utc()),
             facts: sea_orm::ActiveValue::Set(None),
             serialization: sea_orm::ActiveValue::Set(vec![1]),
+            serialization_format: Default::default(),
         })
         .exec(&fixture.conn)
         .await

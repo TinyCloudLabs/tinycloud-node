@@ -5228,6 +5228,7 @@ mod tests {
         abilities: &[&str],
     ) -> hook_subscription::Model {
         hook_subscription::Model {
+            encrypted_secret_format: 0,
             id: id.to_string(),
             subscriber_did: "did:key:test".to_string(),
             space_id: space.to_string(),
@@ -5906,6 +5907,7 @@ mod tests {
             not_before: Set(None),
             facts: Set(None),
             serialization: Set(b"w1-rocket-http-parent".to_vec()),
+            serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
         }
         .insert(&conn)
         .await?;
@@ -6155,6 +6157,7 @@ mod tests {
             not_before: Set(None),
             facts: Set(None),
             serialization: Set(b"w1-malformed-fact-parent".to_vec()),
+            serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
         }
         .insert(&conn)
         .await?;
@@ -6535,6 +6538,7 @@ mod tests {
                 not_before: Set(None),
                 facts: Set(None),
                 serialization: Set(serialization),
+                serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
             }
             .insert(&conn)
             .await?;
@@ -6914,6 +6918,7 @@ mod tests {
             not_before: Set(None),
             facts: Set(Some(Facts(facts))),
             serialization: Set(br#"{"policyId":"pol_w5_email_domain","terminal":true}"#.to_vec()),
+            serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
         }
         .insert(&conn)
         .await?;
@@ -7119,6 +7124,7 @@ mod tests {
             not_before: Set(None),
             facts: Set(None),
             serialization: Set(b"parent-delegation-bytes".to_vec()),
+            serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
         }
         .insert(&conn)
         .await?;
@@ -7354,6 +7360,7 @@ mod tests {
                 not_before: Set(None),
                 facts: Set(None),
                 serialization: Set(bytes.to_vec()),
+                serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
             }
             .insert(&conn)
             .await?;
@@ -7367,6 +7374,7 @@ mod tests {
             not_before: Set(None),
             facts: Set(None),
             serialization: Set(child_serialization),
+            serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
         }
         .insert(&conn)
         .await?;
@@ -7380,6 +7388,7 @@ mod tests {
             not_before: Set(None),
             facts: Set(None),
             serialization: Set(b"status-expired".to_vec()),
+            serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
         }
         .insert(&conn)
         .await?;
@@ -7450,6 +7459,7 @@ mod tests {
                 not_before: Set(None),
                 facts: Set(None),
                 serialization: Set(bytes.to_vec()),
+                serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
             }
             .insert(&conn)
             .await?;
@@ -7591,6 +7601,7 @@ mod tests {
                 not_before: Set(not_before),
                 facts: Set(None),
                 serialization: Set(bytes.to_vec()),
+                serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
             }
             .insert(&conn)
             .await?;
@@ -7640,6 +7651,7 @@ mod tests {
             not_before: Set(None),
             facts: Set(None),
             serialization: Set(b"foreign-account-record".to_vec()),
+            serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
         }
         .insert(&conn)
         .await?;
@@ -8061,6 +8073,7 @@ mod tests {
                 not_before: Set(None),
                 facts: Set(None),
                 serialization: Set(ser.as_bytes().to_vec()),
+                serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
             }
             .insert(&conn)
             .await?;
@@ -8396,6 +8409,7 @@ mod tests {
             not_before: Set(None),
             facts: Set(None),
             serialization: Set(name.as_bytes().to_vec()),
+            serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
         }
         .insert(&conn)
         .await?;
@@ -11752,6 +11766,7 @@ mod tests {
                 not_before: Set(not_before),
                 facts: Set(None),
                 serialization: Set(label.as_bytes().to_vec()),
+                serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
             }
             .insert(&self.conn)
             .await?;
@@ -12577,6 +12592,7 @@ mod tests {
                 not_before: Set(None),
                 facts: Set(None),
                 serialization: Set(label.as_bytes().to_vec()),
+                serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
             }
             .insert(&self.conn)
             .await?;
@@ -15885,6 +15901,7 @@ mod tests {
             let (callback_url, receiver) = f43_callback_server().await?;
             hook_subscription::Entity::insert(hook_subscription::ActiveModel::from(
                 hook_subscription::Model {
+                    encrypted_secret_format: 2,
                     id: id.to_string(),
                     subscriber_did: subscriber,
                     space_id: f.space.to_string(),
@@ -15892,8 +15909,14 @@ mod tests {
                     path_prefix: Some("documents".to_string()),
                     abilities_json: None,
                     callback_url,
-                    encrypted_secret: ColumnEncryption::new(F43_WEBHOOK_KEY)
-                        .encrypt(b"webhook-secret"),
+                    encrypted_secret: ColumnEncryption::new(F43_WEBHOOK_KEY).encrypt(
+                        b"webhook-secret",
+                        tinycloud_core::encryption::RowBinding::new(
+                            "hook_subscription",
+                            "encrypted_secret",
+                            &[id.as_bytes()],
+                        ),
+                    ),
                     secret_key_id: "primary".to_string(),
                     active: true,
                     created_at: rfc3339(OffsetDateTime::now_utc()),

@@ -77,6 +77,7 @@ mod tests {
             abilities_json: None,
             callback_url: "https://hooks.example/callback".to_string(),
             encrypted_secret: vec![1, 2, 3],
+            encrypted_secret_format: 0,
             secret_key_id: "primary".to_string(),
             active,
             created_at: "2026-04-09T00:00:00Z".to_string(),
@@ -109,7 +110,10 @@ mod tests {
                 subscription("sub_c", "tinycloud:space-b", "did:key:b", true),
                 subscription("sub_d", "tinycloud:space-b", "did:key:b", false),
             ]
-            .map(hook_subscription::ActiveModel::from),
+            .map(|model| hook_subscription::ActiveModel {
+                encrypted_secret_format: Default::default(),
+                ..hook_subscription::ActiveModel::from(model)
+            }),
         )
         .exec(&db)
         .await

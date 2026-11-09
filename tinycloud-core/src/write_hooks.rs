@@ -300,6 +300,7 @@ mod tests {
                     not_before: Set(None),
                     facts: Set(None),
                     serialization: Set(vec![]),
+                    serialization_format: Set(0),
                 }
                 .insert(db)
                 .await
@@ -338,6 +339,7 @@ mod tests {
                     )]))
                 })),
                 serialization: Set(vec![]),
+                serialization_format: Set(0),
             }
             .insert(db)
             .await
@@ -469,6 +471,7 @@ mod tests {
             ),
             callback_url: "https://example.com/hooks".to_string(),
             encrypted_secret: vec![1, 2, 3],
+            encrypted_secret_format: 0,
             secret_key_id: "primary".to_string(),
             active: true,
             created_at: "2026-04-09T00:00:00Z".to_string(),

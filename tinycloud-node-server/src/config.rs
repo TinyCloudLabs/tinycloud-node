@@ -59,7 +59,16 @@ pub struct Config {
     #[serde(default)]
     pub encryption_network: EncryptionNetworkConfig,
     #[serde(default)]
+    pub column_encryption: ColumnEncryptionConfig,
+    #[serde(default)]
     pub sql: SqlConfig,
+}
+
+/// Recorded column reads may require encrypted storage when explicitly enabled.
+#[derive(Serialize, Deserialize, Debug, Default, Clone, Hash, PartialEq, Eq)]
+pub struct ColumnEncryptionConfig {
+    #[serde(default)]
+    pub strict: bool,
 }
 
 /// Release gates for the encryption network routes. `named_keys_v1`
@@ -2143,6 +2152,64 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn column_encryption_strict_defaults_off_and_accepts_opt_in() {
+        assert!(!Config::default().column_encryption.strict);
+        assert!(
+            !serde_json::from_str::<ColumnEncryptionConfig>("{}")
+                .unwrap()
+                .strict
+        );
+        assert!(
+            serde_json::from_str::<ColumnEncryptionConfig>(r#"{"strict":true}"#)
+                .unwrap()
+                .strict
+        );
+    }
+
+    #[test]
+    fn storage_keyrings_separate_purposes_and_apply_strict_mode() {
+        use tinycloud_core::encryption::RowBinding;
+
+        let root = tinycloud_core::keys::StaticSecret::new(vec![7; 32]).unwrap();
+        let binding = RowBinding::new("hook_subscription", "encrypted_secret", &[b"hook"]);
+        let config = Config::default();
+        let (columns, webhooks) = crate::storage_keyrings(&root, &config.column_encryption);
+        let sealed = columns.encrypt(b"stored bytes", binding);
+        assert!(webhooks.decrypt_recorded(&sealed, binding, 2).is_err());
+        let legacy_seed = tinycloud_core::ColumnEncryption::for_purpose(
+            root.derive_key(b"tinycloud/hooks/webhook-secrets"),
+            root.derive_key(b"tinycloud/hooks/webhook-secrets"),
+            tinycloud_core::encryption::EncryptionPurpose::Columns,
+        );
+        assert!(legacy_seed.decrypt_recorded(&sealed, binding, 2).is_err());
+        let sealed = webhooks.encrypt(b"stored bytes", binding);
+        assert!(columns.decrypt_recorded(&sealed, binding, 2).is_err());
+        let legacy = tinycloud_core::ColumnEncryption::new(
+            root.derive_key(b"tinycloud/hooks/webhook-secrets"),
+        )
+        .encrypt_legacy(b"legacy bytes");
+        for ring in [&columns, &webhooks] {
+            assert_eq!(
+                ring.decrypt_recorded(&legacy, binding, 0).unwrap(),
+                b"legacy bytes"
+            );
+            assert_eq!(
+                ring.decrypt_recorded(b"plaintext", binding, 0).unwrap(),
+                b"plaintext"
+            );
+        }
+        let (columns, webhooks) =
+            crate::storage_keyrings(&root, &ColumnEncryptionConfig { strict: true });
+        for ring in [&columns, &webhooks] {
+            assert!(ring.decrypt_recorded(b"plaintext", binding, 0).is_err());
+            assert_eq!(
+                ring.decrypt_recorded(&legacy, binding, 0).unwrap(),
+                b"legacy bytes"
+            );
+        }
+    }
 
     /// TC-1581: `[global.storage.sql] ddl_requires_schema` defaults to
     /// `enforce` and accepts only `off`, `log` and `enforce`.

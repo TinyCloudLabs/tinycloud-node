@@ -19,11 +19,85 @@ impl MigrationTrait for Migration {
         manager
             .create_table(schema.create_table_from_entity(epoch::Entity))
             .await?;
+        // Freeze signed-record tables at their original shape. Their recorded
+        // formats are added by the same later migration on installs and upgrades.
         manager
-            .create_table(schema.create_table_from_entity(delegation::Entity))
+            .create_table(
+                Table::create()
+                    .table(delegation::Entity)
+                    .col(
+                        ColumnDef::new(delegation::Column::Id)
+                            .binary()
+                            .not_null()
+                            .unique_key()
+                            .primary_key(),
+                    )
+                    .col(
+                        ColumnDef::new(delegation::Column::Delegator)
+                            .string()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(delegation::Column::Delegatee)
+                            .string()
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(delegation::Column::Expiry).timestamp_with_time_zone())
+                    .col(ColumnDef::new(delegation::Column::IssuedAt).timestamp_with_time_zone())
+                    .col(ColumnDef::new(delegation::Column::NotBefore).timestamp_with_time_zone())
+                    .col(ColumnDef::new(delegation::Column::Facts).json())
+                    .col(
+                        ColumnDef::new(delegation::Column::Serialization)
+                            .binary()
+                            .not_null(),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .from(delegation::Entity, delegation::Column::Delegator)
+                            .to(actor::Entity, actor::Column::Id),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .from(delegation::Entity, delegation::Column::Delegatee)
+                            .to(actor::Entity, actor::Column::Id),
+                    )
+                    .to_owned(),
+            )
             .await?;
         manager
-            .create_table(schema.create_table_from_entity(invocation::Entity))
+            .create_table(
+                Table::create()
+                    .table(invocation::Entity)
+                    .col(
+                        ColumnDef::new(invocation::Column::Id)
+                            .binary()
+                            .not_null()
+                            .unique_key()
+                            .primary_key(),
+                    )
+                    .col(
+                        ColumnDef::new(invocation::Column::Invoker)
+                            .string()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(invocation::Column::IssuedAt)
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(invocation::Column::Facts).json())
+                    .col(
+                        ColumnDef::new(invocation::Column::Serialization)
+                            .binary()
+                            .not_null(),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .from(invocation::Entity, invocation::Column::Invoker)
+                            .to(actor::Entity, actor::Column::Id),
+                    )
+                    .to_owned(),
+            )
             .await?;
         // Keep the initial schema at its historical shape. Additive columns
         // belong in later migrations so both clean installs and upgrades run

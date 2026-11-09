@@ -188,6 +188,7 @@ pub struct PendingWebhookDelivery {
     pub attempts: i64,
     pub callback_url: String,
     pub encrypted_secret: Vec<u8>,
+    pub encrypted_secret_format: i16,
     pub secret_key_id: String,
     pub subscription_active: bool,
     pub subscriber_did: String,
@@ -964,7 +965,16 @@ where
         else {
             return Ok(None);
         };
-        let bytes = crate::encryption::maybe_decrypt(self.encryption.as_ref(), &row.serialization)?;
+        let bytes = crate::encryption::maybe_decrypt(
+            self.encryption.as_ref(),
+            &row.serialization,
+            crate::encryption::RowBinding::new(
+                "delegation",
+                "serialization",
+                &[&Vec::<u8>::from(row.id)],
+            ),
+            row.serialization_format,
+        )?;
         let delegation = TinyCloudDelegation::from_bytes(&bytes)?;
         let info = DelegationInfo::try_from(delegation)?;
         let event = SerializedEvent(info, bytes);
@@ -1126,6 +1136,7 @@ where
                             attempts: delivery.attempts,
                             callback_url: subscription.callback_url,
                             encrypted_secret: subscription.encrypted_secret,
+                            encrypted_secret_format: subscription.encrypted_secret_format,
                             secret_key_id: subscription.secret_key_id,
                             subscription_active: subscription.active,
                             subscriber_did: subscription.subscriber_did,
@@ -4949,11 +4960,19 @@ async fn get_valid_delegations<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                 && del.not_before.map(|n| n <= now).unwrap_or(true)
                 && ability.iter().any(|a| a.resource.space() == Some(space_id))
             {
-                let serialization =
-                    match crate::encryption::maybe_decrypt(encryption, &del.serialization) {
-                        Ok(s) => s,
-                        Err(e) => return Some(Err(TxError::Encryption(e))),
-                    };
+                let serialization = match crate::encryption::maybe_decrypt(
+                    encryption,
+                    &del.serialization,
+                    crate::encryption::RowBinding::new(
+                        "delegation",
+                        "serialization",
+                        &[&Vec::<u8>::from(del.id)],
+                    ),
+                    del.serialization_format,
+                ) {
+                    Ok(s) => s,
+                    Err(e) => return Some(Err(TxError::Encryption(e))),
+                };
                 Some(
                     decode_stored_delegation(serialization)
                         .map(|event| (del.id, event))
@@ -5599,11 +5618,19 @@ async fn get_filtered_delegations<C: ConnectionTrait, S: StorageSetup, K: Secret
                 }
             }
 
-            let serialization =
-                match crate::encryption::maybe_decrypt(encryption, &del.serialization) {
-                    Ok(s) => s,
-                    Err(e) => return Some(Err(TxError::Encryption(e))),
-                };
+            let serialization = match crate::encryption::maybe_decrypt(
+                encryption,
+                &del.serialization,
+                crate::encryption::RowBinding::new(
+                    "delegation",
+                    "serialization",
+                    &[&Vec::<u8>::from(del.id)],
+                ),
+                del.serialization_format,
+            ) {
+                Ok(s) => s,
+                Err(e) => return Some(Err(TxError::Encryption(e))),
+            };
             Some(
                 decode_stored_delegation(serialization)
                     .map(|event| (del.id, event))
@@ -5666,7 +5693,16 @@ async fn get_delegation_chain<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
             .all(db)
             .await?;
 
-        let serialization = crate::encryption::maybe_decrypt(encryption, &del.serialization)?;
+        let serialization = crate::encryption::maybe_decrypt(
+            encryption,
+            &del.serialization,
+            crate::encryption::RowBinding::new(
+                "delegation",
+                "serialization",
+                &[&Vec::<u8>::from(del.id)],
+            ),
+            del.serialization_format,
+        )?;
         chain.push(decode_stored_delegation(serialization)?);
 
         // Move to the first parent (if any) to continue the chain
@@ -7255,6 +7291,7 @@ mod test {
                 issued_at: Set(OffsetDateTime::now_utc()),
                 facts: Set(None),
                 serialization: Set(vec![index as u8]),
+                serialization_format: Set(0),
             }
             .insert(conn)
             .await
@@ -7440,6 +7477,7 @@ mod test {
             issued_at: Set(OffsetDateTime::now_utc()),
             facts: Set(None),
             serialization: Set(vec![6]),
+            serialization_format: Set(0),
         }
         .insert(&db.conn)
         .await
@@ -7969,6 +8007,7 @@ mod test {
             not_before: Set(None),
             facts: Set(None),
             serialization: Set(b"race-parent".to_vec()),
+            serialization_format: Set(0),
         }
         .insert(&db.conn)
         .await
@@ -7984,6 +8023,7 @@ mod test {
             not_before: Set(None),
             facts: Set(None),
             serialization: Set(b"race-child".to_vec()),
+            serialization_format: Set(0),
         }
         .insert(&db.conn)
         .await
@@ -8079,6 +8119,7 @@ mod test {
                     not_before: Set(None),
                     facts: Set(None),
                     serialization: Set(id.as_ref().to_vec()),
+                    serialization_format: Set(0),
                 }
                 .insert(&db.conn)
                 .await
@@ -8119,6 +8160,7 @@ mod test {
             not_before: Set(None),
             facts: Set(None),
             serialization: Set(later_id.as_ref().to_vec()),
+            serialization_format: Set(0),
         }
         .insert(&db.conn)
         .await
@@ -8185,6 +8227,7 @@ mod test {
                 not_before: Set(None),
                 facts: Set(None),
                 serialization: Set(control_id.as_ref().to_vec()),
+                serialization_format: Set(0),
             }
             .insert(&db.conn)
             .await
@@ -8214,6 +8257,7 @@ mod test {
                     not_before: Set(None),
                     facts: Set(None),
                     serialization: Set(id.as_ref().to_vec()),
+                    serialization_format: Set(0),
                 }
                 .insert(&db.conn)
                 .await
@@ -8242,6 +8286,7 @@ mod test {
                 not_before: Set(None),
                 facts: Set(None),
                 serialization: Set(later_id.as_ref().to_vec()),
+                serialization_format: Set(0),
             }
             .insert(&db.conn)
             .await
@@ -8440,6 +8485,7 @@ mod test {
                 not_before: Set(None),
                 facts: Set(None),
                 serialization: Set(id.as_ref().to_vec()),
+                serialization_format: Set(0),
             }))
             .exec(db)
             .await
@@ -8933,6 +8979,7 @@ mod test {
                     not_before: Set(None),
                     facts: Set(None),
                     serialization: Set(id.as_ref().to_vec()),
+                    serialization_format: Set(0),
                 });
                 for ability_index in 0..6 {
                     let (resource, ability) = if delegation_index == 0 && ability_index == 0 {
@@ -8969,6 +9016,7 @@ mod test {
             not_before: Set(None),
             facts: Set(None),
             serialization: Set(later_id.as_ref().to_vec()),
+            serialization_format: Set(0),
         });
         ability_rows.push(abilities::ActiveModel {
             resource: Set(format!("tinycloud:{principal_suffix}:default/delegation")
@@ -9040,6 +9088,7 @@ mod test {
                 not_before: Set(None),
                 facts: Set(None),
                 serialization: Set(id.as_ref().to_vec()),
+                serialization_format: Set(0),
             }
             .insert(&db.conn)
             .await
@@ -9142,6 +9191,7 @@ mod test {
                 not_before: Set(None),
                 facts: Set(None),
                 serialization: Set(id.as_ref().to_vec()),
+                serialization_format: Set(0),
             }
             .insert(&db.conn)
             .await
@@ -9193,6 +9243,7 @@ mod test {
             not_before: Set(None),
             facts: Set(None),
             serialization: Set(label.as_bytes().to_vec()),
+            serialization_format: Set(0),
         }
         .insert(&db.conn)
         .await
@@ -10210,6 +10261,7 @@ mod test {
             not_before: Set(None),
             facts: Set(None),
             serialization: Set(hash.as_ref().to_vec()),
+            serialization_format: Set(0),
         }
         .insert(db)
         .await
@@ -10304,6 +10356,7 @@ mod test {
             not_before: Set(None),
             facts: Set(None),
             serialization: Set(hash.as_ref().to_vec()),
+            serialization_format: Set(0),
         })
         .on_conflict(
             OnConflict::column(delegation::Column::Id)
@@ -10373,6 +10426,7 @@ mod test {
                 not_before: Set(None),
                 facts: Set(None),
                 serialization: Set(ser.clone()),
+                serialization_format: Set(0),
             }
             .insert(&tx)
             .await
@@ -10401,6 +10455,7 @@ mod test {
             not_before: Set(None),
             facts: Set(None),
             serialization: Set(ser),
+            serialization_format: Set(0),
         })
         .on_conflict(
             OnConflict::column(delegation::Column::Id)
@@ -10452,6 +10507,7 @@ mod test {
             not_before: Set(None),
             facts: Set(None),
             serialization: Set(ser),
+            serialization_format: Set(0),
         };
 
         let tx = db.conn.begin().await.unwrap();
@@ -10524,6 +10580,7 @@ mod test {
             not_before: Set(None),
             facts: Set(None),
             serialization: Set(retained_hash.as_ref().to_vec()),
+            serialization_format: Set(0),
         })
         .on_conflict(
             OnConflict::column(delegation::Column::Id)
@@ -10746,6 +10803,7 @@ mod test {
             not_before: Set(None),
             facts: Set(None),
             serialization: Set(hash.as_ref().to_vec()),
+            serialization_format: Set(0),
         })
         .on_conflict(
             OnConflict::column(delegation::Column::Id)
@@ -10848,6 +10906,7 @@ mod test {
                 abilities_json: None,
                 callback_url: "https://example.com/hook".to_string(),
                 encrypted_secret: vec![0u8; 4],
+                encrypted_secret_format: 0,
                 secret_key_id: "kid".to_string(),
                 active: true,
                 created_at: rfc3339(OffsetDateTime::now_utc()),
@@ -11135,6 +11194,7 @@ mod test {
             not_before: Set(not_before),
             facts: Set(None),
             serialization: Set(label.as_bytes().to_vec()),
+            serialization_format: Set(0),
         }
         .insert(db)
         .await
@@ -12280,6 +12340,7 @@ mod test {
                 abilities_json: None,
                 callback_url: format!("https://example.com/{id}"),
                 encrypted_secret: Vec::new(),
+                encrypted_secret_format: 0,
                 secret_key_id: "primary".to_string(),
                 active: true,
                 created_at: id.to_string(),

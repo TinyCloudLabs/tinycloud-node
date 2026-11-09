@@ -91,6 +91,7 @@ async fn persist_grant(
         not_before: Set(None),
         facts: Set(None),
         serialization: Set(format!("tc119-test-row:{ability}").into_bytes()),
+        serialization_format: Set(0),
     }
     .insert(conn)
     .await?;

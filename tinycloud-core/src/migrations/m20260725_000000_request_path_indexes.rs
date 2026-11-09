@@ -296,7 +296,7 @@ mod tests {
     use crate::types::{Ability, Caveats, Metadata, Resource, SpaceIdWrap};
     use sea_orm::{
         ActiveModelTrait, ActiveValue::Set, ConnectOptions, Database, DbBackend, DbConn, DbErr,
-        EntityTrait, PaginatorTrait, QueryResult, Statement,
+        EntityTrait, PaginatorTrait, QueryResult, QuerySelect, Statement,
     };
     use sea_orm_migration::MigratorTrait;
     use std::collections::BTreeMap;
@@ -434,7 +434,7 @@ mod tests {
         let target_delegation = hash(b"tc282-target-delegation");
         for i in 0..300i64 {
             let id = hash(format!("tc282-delegation-{i}").as_bytes());
-            delegation::ActiveModel {
+            delegation::Entity::insert(delegation::ActiveModel {
                 id: Set(id),
                 delegator: Set(format!("did:key:delegator-{i}")),
                 delegatee: Set(format!("did:key:delegatee-{i}")),
@@ -443,8 +443,9 @@ mod tests {
                 not_before: Set(None),
                 facts: Set(None),
                 serialization: Set(id.as_ref().to_vec()),
-            }
-            .insert(db)
+                serialization_format: Default::default(),
+            })
+            .exec(db)
             .await?;
 
             abilities::ActiveModel {
@@ -476,7 +477,7 @@ mod tests {
             .insert(db)
             .await?;
         }
-        delegation::ActiveModel {
+        delegation::Entity::insert(delegation::ActiveModel {
             id: Set(target_delegation),
             delegator: Set("did:key:target-delegator".to_string()),
             delegatee: Set("did:key:target-delegatee".to_string()),
@@ -485,8 +486,9 @@ mod tests {
             not_before: Set(None),
             facts: Set(None),
             serialization: Set(target_delegation.as_ref().to_vec()),
-        }
-        .insert(db)
+            serialization_format: Default::default(),
+        })
+        .exec(db)
         .await?;
         abilities::ActiveModel {
             resource: Set(Resource::from_str("urn:tc282:target-resource").unwrap()),
@@ -553,7 +555,7 @@ mod tests {
 
         // hook_delivery + hook_subscription
         for i in 0..300i64 {
-            hook_subscription::ActiveModel {
+            hook_subscription::Entity::insert(hook_subscription::ActiveModel {
                 id: Set(format!("tc282-sub-{i}")),
                 subscriber_did: Set("did:key:actor".to_string()),
                 space_id: Set(if i % 2 == 0 {
@@ -566,11 +568,12 @@ mod tests {
                 abilities_json: Set(None),
                 callback_url: Set(format!("https://example.test/{i}")),
                 encrypted_secret: Set(vec![0u8; 8]),
+                encrypted_secret_format: Default::default(),
                 secret_key_id: Set("key-1".to_string()),
                 active: Set(i % 5 != 0),
                 created_at: Set(OffsetDateTime::now_utc().to_string()),
-            }
-            .insert(db)
+            })
+            .exec(db)
             .await?;
 
             hook_delivery::ActiveModel {
@@ -848,7 +851,15 @@ mod tests {
         }
 
         // Sanity check: seeding actually produced the volumes we assumed.
-        assert_eq!(delegation::Entity::find().count(&db).await.unwrap(), 301);
+        assert_eq!(
+            delegation::Entity::find()
+                .select_only()
+                .column(delegation::Column::Id)
+                .count(&db)
+                .await
+                .unwrap(),
+            301
+        );
     }
 
     /// TC-319: `transact` now computes the next per-space sequence with one

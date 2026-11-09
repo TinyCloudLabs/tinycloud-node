@@ -60,39 +60,61 @@ pub(crate) fn canonical_hash(serialization: &[u8]) -> Result<Hash, DbErr> {
     Ok(hash(&canonical))
 }
 
-/// Validate one indexed encrypted record on every boot, including after the
-/// backfill is complete. A completed index must not permit keyless restarts.
+/// Validate indexed encrypted and plaintext records on every boot, including
+/// after the backfill is complete, so keyless and strict restarts stay checked.
 async fn validate_encryption<C: ConnectionTrait>(
     db: &C,
     encryption: Option<&ColumnEncryption>,
 ) -> Result<(), DbErr> {
-    let Some((id, stored)) = delegation::Entity::find()
-        .select_only()
-        .column(delegation::Column::Id)
-        .column(delegation::Column::Serialization)
-        .join_rev(JoinType::InnerJoin, Relation::Delegation.def())
-        .filter(Column::Encrypted.eq(true))
-        .into_tuple::<(Hash, Vec<u8>)>()
-        .one(db)
-        .await?
-    else {
-        return Ok(());
-    };
-    let encryption = encryption.ok_or_else(|| {
-        DbErr::Custom(
-            "delegation CID alias backfill: encrypted delegation requires a column encryption key"
-                .into(),
-        )
-    })?;
-    let plaintext = encryption
-        .decrypt(&stored)
-        .map_err(|_| DbErr::Custom("delegation CID alias backfill: decryption failed".into()))?;
-    if hash(&plaintext) != id {
-        return Err(DbErr::Custom(
-            "delegation CID alias backfill: plaintext content hash does not match stored ID".into(),
-        ));
+    for encrypted in [true, false] {
+        let Some((id, stored, format)) = delegation::Entity::find()
+            .select_only()
+            .column(delegation::Column::Id)
+            .column(delegation::Column::Serialization)
+            .column(delegation::Column::SerializationFormat)
+            .join_rev(JoinType::InnerJoin, Relation::Delegation.def())
+            .filter(Column::Encrypted.eq(encrypted))
+            .into_tuple::<(Hash, Vec<u8>, i16)>()
+            .one(db)
+            .await?
+        else {
+            continue;
+        };
+        let plaintext = stored_plaintext(encryption, id, &stored, format)?;
+        if hash(&plaintext) != id {
+            return Err(DbErr::Custom(
+                "delegation CID alias backfill: plaintext content hash does not match stored ID"
+                    .into(),
+            ));
+        }
     }
     Ok(())
+}
+
+fn stored_plaintext<'a>(
+    encryption: Option<&ColumnEncryption>,
+    id: Hash,
+    stored: &'a [u8],
+    format: i16,
+) -> Result<Cow<'a, [u8]>, DbErr> {
+    let encrypted = matches!(stored.first(), Some(0x01 | 0x02));
+    if encryption.is_none() {
+        if encrypted || format != 0 {
+            return Err(DbErr::Custom(
+                "delegation CID alias backfill: encrypted delegation requires a column encryption key"
+                    .into(),
+            ));
+        }
+        return Ok(Cow::Borrowed(stored));
+    }
+    maybe_decrypt(
+        encryption,
+        stored,
+        crate::encryption::RowBinding::new("delegation", "serialization", &[&Vec::<u8>::from(id)]),
+        format,
+    )
+    .map(Cow::Owned)
+    .map_err(|_| DbErr::Custom("delegation CID alias backfill: decryption failed".into()))
 }
 
 /// Backfill only persisted delegations with no alias, in bounded keyset pages.
@@ -100,7 +122,7 @@ async fn validate_encryption<C: ConnectionTrait>(
 /// aliases written by this call. Encrypted rows require the configured key;
 /// decryption, plaintext content-hash, and decoder failures abort startup.
 /// Original IDs, serializations, proof edges, and revocation targets are never
-/// updated. Completed restarts validate only one indexed encrypted record.
+/// updated. Completed restarts validate indexed encrypted and plaintext records.
 pub(crate) async fn backfill<C: ConnectionTrait>(
     db: &C,
     encryption: Option<&ColumnEncryption>,
@@ -130,6 +152,7 @@ pub(crate) async fn backfill<C: ConnectionTrait>(
             .select_only()
             .column(delegation::Column::Id)
             .column(delegation::Column::Serialization)
+            .column(delegation::Column::SerializationFormat)
             .filter(
                 Expr::exists(
                     Query::select()
@@ -148,28 +171,14 @@ pub(crate) async fn backfill<C: ConnectionTrait>(
         if let Some(id) = after {
             query = query.filter(delegation::Column::Id.gt(id));
         }
-        let rows = query.into_tuple::<(Hash, Vec<u8>)>().all(db).await?;
+        let rows = query.into_tuple::<(Hash, Vec<u8>, i16)>().all(db).await?;
         if rows.is_empty() {
             return validate_encryption(db, encryption).await;
         }
 
         let mut aliases = Vec::with_capacity(rows.len());
-        for (id, stored) in rows {
-            // This is ColumnEncryption's version marker. Borrow legacy
-            // plaintext instead of copying it through the passthrough helper.
-            let serialization = if stored.first() == Some(&0x01) {
-                let encryption = encryption.ok_or_else(|| {
-                    DbErr::Custom(
-                        "delegation CID alias backfill: encrypted delegation requires a column encryption key"
-                            .into(),
-                    )
-                })?;
-                Cow::Owned(maybe_decrypt(Some(encryption), &stored).map_err(|_| {
-                    DbErr::Custom("delegation CID alias backfill: decryption failed".into())
-                })?)
-            } else {
-                Cow::Borrowed(stored.as_slice())
-            };
+        for (id, stored, format) in rows {
+            let serialization = stored_plaintext(encryption, id, &stored, format)?;
             if hash(serialization.as_ref()) != id {
                 return Err(DbErr::Custom(
                     "delegation CID alias backfill: plaintext content hash does not match stored ID"
@@ -179,7 +188,7 @@ pub(crate) async fn backfill<C: ConnectionTrait>(
             aliases.push(ActiveModel {
                 id: Set(id),
                 canonical: Set(canonical_hash(serialization.as_ref())?),
-                encrypted: Set(stored.first() == Some(&0x01)),
+                encrypted: Set(matches!(stored.first(), Some(0x01 | 0x02))),
             });
             after = Some(id);
         }
@@ -228,6 +237,7 @@ mod tests {
             not_before: Set(None),
             facts: Set(None),
             serialization: Set(serialization),
+            serialization_format: Set(0),
         }
         .insert(db)
         .await
@@ -249,7 +259,7 @@ mod tests {
         let encryption = ColumnEncryption::new([0x42; 32]);
         let serialization = ucan_serialization();
         let id = hash(&serialization);
-        let stored = encryption.encrypt(&serialization);
+        let stored = encryption.encrypt_legacy(&serialization);
         insert_delegation(&db, id, stored.clone()).await;
 
         backfill(&db, Some(&encryption)).await.unwrap();
@@ -285,7 +295,7 @@ mod tests {
         insert_delegation(
             &db,
             hash(&serialization),
-            encryption.encrypt(&serialization),
+            encryption.encrypt_legacy(&serialization),
         )
         .await;
 
@@ -293,6 +303,97 @@ mod tests {
         let wrong = ColumnEncryption::new([0x43; 32]);
         assert!(backfill(&db, Some(&wrong)).await.is_err());
         assert_eq!(Entity::find().count(&db).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn recorded_v2_backfill_rejects_plaintext_and_legacy_ciphertext() {
+        let encryption = ColumnEncryption::new([0x42; 32]);
+        let serialization = ucan_serialization();
+        for stored in [
+            serialization.clone(),
+            encryption.encrypt_legacy(&serialization),
+        ] {
+            let db = database().await;
+            let id = hash(&serialization);
+            insert_delegation(&db, id, stored).await;
+            delegation::Entity::update_many()
+                .col_expr(delegation::Column::SerializationFormat, Expr::value(2))
+                .exec(&db)
+                .await
+                .unwrap();
+            assert!(backfill(&db, Some(&encryption)).await.is_err());
+            assert!(backfill(&db, None).await.is_err());
+            assert_eq!(Entity::find().count(&db).await.unwrap(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn v2_backfill_preserves_binding_and_records_encrypted_alias() {
+        let encryption = ColumnEncryption::new([0x42; 32]);
+        let serialization = ucan_serialization();
+        let id = hash(&serialization);
+        let stored = encryption.encrypt(
+            &serialization,
+            crate::encryption::RowBinding::new(
+                "delegation",
+                "serialization",
+                &[&Vec::<u8>::from(id)],
+            ),
+        );
+        let db = database().await;
+        insert_delegation(&db, id, stored.clone()).await;
+        delegation::Entity::update_many()
+            .col_expr(delegation::Column::SerializationFormat, Expr::value(2))
+            .exec(&db)
+            .await
+            .unwrap();
+        backfill(&db, Some(&encryption)).await.unwrap();
+        assert!(
+            Entity::find_by_id(id)
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap()
+                .encrypted
+        );
+        assert!(backfill(&db, None).await.is_err());
+        assert_eq!(
+            delegation::Entity::find_by_id(id)
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap()
+                .serialization,
+            stored,
+        );
+        let compatibility = database().await;
+        insert_delegation(&compatibility, id, stored.clone()).await;
+        backfill(&compatibility, Some(&encryption)).await.unwrap();
+        assert!(
+            Entity::find_by_id(id)
+                .one(&compatibility)
+                .await
+                .unwrap()
+                .unwrap()
+                .encrypted
+        );
+
+        let moved = database().await;
+        insert_delegation(&moved, hash(b"other row"), stored).await;
+        assert!(backfill(&moved, Some(&encryption)).await.is_err());
+        assert_eq!(Entity::find().count(&moved).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn strict_backfill_refuses_legacy_plaintext() {
+        let db = database().await;
+        let serialization = ucan_serialization();
+        insert_delegation(&db, hash(&serialization), serialization).await;
+        let encryption = ColumnEncryption::new([0x42; 32]).with_strict(true);
+        assert!(backfill(&db, Some(&encryption)).await.is_err());
+        assert_eq!(Entity::find().count(&db).await.unwrap(), 0);
+        backfill(&db, None).await.unwrap();
+        assert!(backfill(&db, Some(&encryption)).await.is_err());
     }
 
     #[tokio::test]
@@ -380,7 +481,18 @@ mod tests {
         }
         copy_records!(actor::Entity);
         copy_records!(space::Entity);
-        copy_records!(delegation::Entity);
+        let delegations = delegation::Entity::find()
+            .from_raw_sql(Statement::from_string(
+                sea_orm::DbBackend::Sqlite,
+                "SELECT *, 0 AS serialization_format FROM delegation",
+            ))
+            .all(&old)
+            .await
+            .unwrap();
+        delegation::Entity::insert_many(delegations.into_iter().map(|row| row.into_active_model()))
+            .exec(&fixture.conn)
+            .await
+            .unwrap();
         copy_records!(abilities::Entity);
         copy_records!(parent_delegations::Entity);
         copy_records!(revocation::Entity);

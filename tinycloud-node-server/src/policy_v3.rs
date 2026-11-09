@@ -7067,6 +7067,7 @@ mod tests {
             not_before: Set(Some(now)),
             facts: Set(None),
             serialization: Set(authorization.as_bytes().to_vec()),
+            serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
         }
         .insert(&runtime.conn)
         .await?;
