@@ -238,13 +238,27 @@ mod tests {
 
     #[test]
     fn requested_mode_is_exact_regardless_of_umask() {
+        // umask is process-wide, so the restrictive umask is applied in a
+        // child process running `umask_child`, not in this test process.
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "private_file::tests::umask_child", "--nocapture"])
+            .env("PRIVATE_FILE_UMASK_CHILD", "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "child with umask 077 failed");
+    }
+
+    /// Body of the subprocess above; a no-op in the normal test run.
+    #[test]
+    fn umask_child() {
+        if std::env::var_os("PRIVATE_FILE_UMASK_CHILD").is_none() {
+            return;
+        }
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("shared");
-        // SAFETY: umask is process-wide; restored immediately after the write.
-        let old = unsafe { libc::umask(0o077) };
-        let res = write_file_atomic(&path, b"x", 0o640, None);
-        unsafe { libc::umask(old) };
-        res.unwrap();
+        // SAFETY: this process exists only to run this test.
+        unsafe { libc::umask(0o077) };
+        write_file_atomic(&path, b"x", 0o640, None).unwrap();
         assert_eq!(mode(&path), 0o640);
     }
 
