@@ -4461,6 +4461,7 @@ fn authorization_failure(
 mod tests {
     mod delegation_issued_query;
     mod encryption_keys;
+    mod encryption_network_create;
     mod key_delete;
     mod operation_retry;
     mod revocation_codes;
